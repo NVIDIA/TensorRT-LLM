@@ -113,7 +113,10 @@ def fused_attention(q, k, v, sm_scale, o_buf=None, l_buf=None, m_buf=None):
     shape = (q.shape[0] * q.shape[1], q.shape[2])
     L = torch.empty(shape, device=q.device, dtype=torch.float32) if l_buf is None else l_buf
     m = torch.empty(shape, device=q.device, dtype=torch.float32) if m_buf is None else m_buf
+
     num_warps = 4 if Lk <= 64 else 8
+    # Adjust num_stages for limited resource cases.
+    num_stages = 2 if torch.cuda.get_device_capability() >= (8, 0) else 1
 
     fused_attention_kernel[grid](
         o, L, m,
@@ -125,7 +128,7 @@ def fused_attention(q, k, v, sm_scale, o_buf=None, l_buf=None, m_buf=None):
         BLOCK_N=BLOCK,
         BLOCK_DMODEL=Lk,
         num_warps=num_warps,
-        num_stages=2,
+        num_stages=num_stages,
     )
 
     return o

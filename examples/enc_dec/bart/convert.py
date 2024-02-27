@@ -15,6 +15,7 @@ from transformers import (AutoModelForSeq2SeqLM, MBartForConditionalGeneration,
                           VisionEncoderDecoderModel)
 
 from tensorrt_llm._utils import str_dtype_to_torch, torch_to_numpy
+from tensorrt_llm.runtime.lora_manager import LoraConfig
 
 LOGGER = logging.getLogger(__name__)
 
@@ -111,6 +112,51 @@ def split_and_convert_process(key, val, factor, saved_dir):
 
 
 def convert_checkpoint(args):
+    # LoRA
+    encoder_hf_modules_to_trtllm_modules = {
+        "q_proj": "attn_q",
+        "v_proj": "attn_v",
+    }  # encoder lora modules on bart
+
+    encoder_trtllm_modules_to_hf_modules = {
+        "attn_q": "q_proj",
+        "attn_v": "v_proj",
+    }
+
+    decoder_hf_modules_to_trtllm_modules = {
+        "q_proj": ["attn_q", "cross_attn_q"],
+        "v_proj": ["attn_v", "cross_attn_v"],
+    }  # decoder lora modules on bart
+
+    decoder_trtllm_modules_to_hf_modules = {
+        "attn_q": "q_proj",
+        "attn_v": "v_proj",
+        "cross_attn_q": "q_proj",
+        "cross_attn_v": "v_proj",
+    }
+
+    encoder_lora_config = LoraConfig.from_hf(
+        args.hf_lora_dir, encoder_hf_modules_to_trtllm_modules,
+        encoder_trtllm_modules_to_hf_modules)
+    decoder_lora_config = LoraConfig.from_hf(
+        args.hf_lora_dir, decoder_hf_modules_to_trtllm_modules,
+        decoder_trtllm_modules_to_hf_modules)
+
+    args.encoder_lora_target_modules = encoder_lora_config.lora_target_modules
+    args.decoder_lora_target_modules = decoder_lora_config.lora_target_modules
+    args.encoder_max_lora_rank = 0
+    args.decoder_max_lora_rank = 0
+    if encoder_lora_config.is_valid:
+        args.encoder_max_lora_rank = encoder_lora_config.adapter_config['r']
+    if decoder_lora_config.is_valid:
+        args.decoder_max_lora_rank = decoder_lora_config.adapter_config['r']
+    # the lora checkpoint might finetune the embedding
+    args.encoder_vocab_size = encoder_lora_config.vocab_size
+    args.decoder_vocab_size = decoder_lora_config.vocab_size
+
+    args.encoder_lora_config = encoder_lora_config
+    args.decoder_lora_config = decoder_lora_config
+
     saved_dir = Path(args.output_dir) / f"tp{args.inference_tensor_para_size}"
     saved_dir.mkdir(parents=True, exist_ok=True)
 
@@ -131,6 +177,13 @@ def convert_checkpoint(args):
     config["decoder"]["rescale_before_lm_head"] = str(False)
     config['decoder']['has_model_final_layernorm'] = str(
         args.nougat or isinstance(model, MBartForConditionalGeneration))
+    config["decoder"]["max_lora_rank"] = str(args.decoder_max_lora_rank)
+    config["decoder"]["lora_target_modules"] = str(
+        args.decoder_lora_target_modules)
+    config["decoder"]["hf_modules_to_trtllm_modules"] = str(
+        decoder_hf_modules_to_trtllm_modules)
+    config["decoder"]["trtllm_modules_to_hf_modules"] = str(
+        decoder_trtllm_modules_to_hf_modules)
 
     if args.nougat:
         # These flags are true for mbart decoders, but missing in HF config
@@ -155,6 +208,14 @@ def convert_checkpoint(args):
         # mBART has final layernorm, BART does not
         config['encoder']['has_model_final_layernorm'] = str(
             isinstance(model, MBartForConditionalGeneration))
+
+    config["encoder"]["max_lora_rank"] = str(args.encoder_max_lora_rank)
+    config["encoder"]["lora_target_modules"] = str(
+        args.encoder_lora_target_modules)
+    config["encoder"]["hf_modules_to_trtllm_modules"] = str(
+        encoder_hf_modules_to_trtllm_modules)
+    config["encoder"]["trtllm_modules_to_hf_modules"] = str(
+        encoder_trtllm_modules_to_hf_modules)
 
     # add additional config
     for key, val in extra_configs.items():
@@ -208,6 +269,7 @@ if __name__ == "__main__":
                         default="float32",
                         choices=["float32", "float16",
                                  "bfloat16"])  # TODO: test support for bf16?
+    parser.add_argument("--hf_lora_dir", type=str, default=None)
     parser.add_argument("--nougat",
                         action="store_true",
                         help="Model which uses vision encoder + mbart decoder")

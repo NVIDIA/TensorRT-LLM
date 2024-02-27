@@ -347,6 +347,7 @@ class SamplingConfig:
     top_p_reset_ids: Optional[int] = field(default=None)
 
     length_penalty: Union[float, torch.Tensor] = field(default=1.0)
+    early_stopping: Union[int, torch.Tensor] = field(default=1)
     repetition_penalty: Union[float, torch.Tensor] = field(default=1.0)
     min_length: Union[int, torch.Tensor] = field(default=1)
     presence_penalty: Union[float, torch.Tensor] = field(default=0.0)
@@ -573,14 +574,8 @@ class GenerationSession(object):
         expected_tensor_names += ['cache_indirection']
 
         if self.paged_kv_cache:
-            expected_tensor_names += [
-                f'kv_cache_block_pointers_{i}'
-                for i in range(self.first_layer, self.last_layer)
-            ]
-            expected_tensor_names += [
-                f'host_kv_cache_block_pointers_{i}'
-                for i in range(self.first_layer, self.last_layer)
-            ]
+            expected_tensor_names += [f'kv_cache_block_pointers']
+            expected_tensor_names += [f'host_kv_cache_block_pointers']
         else:
             expected_tensor_names += [
                 f'past_key_value_{i}'
@@ -596,10 +591,7 @@ class GenerationSession(object):
                 'sequence_length', 'context_lengths', 'host_request_types',
                 'host_past_key_value_lengths', 'host_sink_token_length'
             ]
-            expected_tensor_names += [
-                f'host_max_attention_window_size_{i}'
-                for i in range(self.first_layer, self.last_layer)
-            ]
+            expected_tensor_names += [f'host_max_attention_window_sizes']
             if model_config.remove_input_padding:
                 expected_tensor_names.append('host_context_lengths')
         else:
@@ -637,8 +629,27 @@ class GenerationSession(object):
 
         self.lora_target_modules = model_config.lora_target_modules
 
+        # In current design, q_lora_params, k_lora_params and v_lora_params should be all enabled or all disabled at the same time.
+        # However, there are some cases that the lora modules only contain one or two of them, so we use zero tensor to fill the missing ones.
+        self.missing_qkv_modules = []
+        if self.lora_target_modules is not None:
+            if any(x in self.lora_target_modules
+                   for x in ["attn_q", "attn_k", "attn_v"]):
+                for lora_module in ["attn_q", "attn_k", "attn_v"]:
+                    if lora_module not in self.lora_target_modules:
+                        self.missing_qkv_modules.append(lora_module)
+            if any(x in self.lora_target_modules
+                   for x in ["cross_attn_q", "cross_attn_k", "cross_attn_v"]):
+                for lora_module in [
+                        "cross_attn_q", "cross_attn_k", "cross_attn_v"
+                ]:
+                    if lora_module not in self.lora_target_modules:
+                        self.missing_qkv_modules.append(lora_module)
+
         if model_config.lora_plugin:
-            for lora_module in self.lora_target_modules:
+
+            for lora_module in (self.lora_target_modules +
+                                self.missing_qkv_modules):
                 expected_tensor_names += [
                     f'{lora_module}_lora_ranks_{i}'
                     for i in range(self.first_layer, self.last_layer)
@@ -852,6 +863,11 @@ class GenerationSession(object):
                                               dtype=torch.float32)
         self.length_penalty = self.host_length_penalty.to(self.device)
 
+        self.host_early_stopping = torch.full([batch_size],
+                                              scfg.early_stopping,
+                                              dtype=torch.int32)
+        self.early_stopping = self.host_early_stopping.to(self.device)
+
         if isinstance(scfg.presence_penalty, torch.Tensor):
             assert scfg.presence_penalty.dtype == torch.float32, f"scfg.presence_penalty.dtype ({scfg.presence_penalty.dtype}) must be torch.float32"
             assert scfg.presence_penalty.shape[
@@ -916,9 +932,9 @@ class GenerationSession(object):
                 batch_size, scfg.num_beams, self.top_k, self.top_p,
                 self.temperature, self.repetition_penalty,
                 self.presence_penalty, self.frequency_penalty, self.min_length,
-                self.host_length_penalty, self.beam_search_diversity_rate,
-                self.random_seed, self.top_p_decay, self.top_p_min,
-                self.top_p_reset_ids)
+                self.host_length_penalty, self.host_early_stopping,
+                self.beam_search_diversity_rate, self.random_seed,
+                self.top_p_decay, self.top_p_min, self.top_p_reset_ids)
 
         assert scfg.end_id is not None, "end_id cannot be none"
         assert scfg.pad_id is not None, 'pad_id cannot be none'
@@ -1134,11 +1150,10 @@ class GenerationSession(object):
             logger.debug(
                 "The max_attention_window_size is not set, we will use max_seq_length by default."
             )
-            self.host_max_attention_window_sizes = [
-                torch.ones(
-                    (1, ), dtype=torch.int32) * self.max_attention_window_size
-                for i in range(self.num_layers)
-            ]
+            self.host_max_attention_window_sizes = torch.ones(
+                (self.num_layers, ),
+                dtype=torch.int32) * self.max_attention_window_size
+
         elif isinstance(max_attention_window_size, int):
             if max_attention_window_size > self.max_seq_length:
                 logger.warning(
@@ -1147,11 +1162,10 @@ class GenerationSession(object):
                 )
             self.max_attention_window_size = min(max_attention_window_size,
                                                  self.max_seq_length)
-            self.host_max_attention_window_sizes = [
-                torch.ones(
-                    (1, ), dtype=torch.int32) * self.max_attention_window_size
-                for i in range(self.num_layers)
-            ]
+            self.host_max_attention_window_sizes = torch.ones(
+                (self.num_layers, ),
+                dtype=torch.int32) * self.max_attention_window_size
+
         elif isinstance(max_attention_window_size, torch.Tensor):
             self.max_attention_window_size = int(
                 torch.max(max_attention_window_size).item())
@@ -1168,12 +1182,9 @@ class GenerationSession(object):
                     "Note that num_layers = num_total_layers // pipeline_parallelism_size."
                 )
                 assert False
-            self.host_max_attention_window_sizes = [
-                torch.minimum(
-                    max_attention_window_size.to(torch.int32)[i],
-                    torch.IntTensor([self.max_seq_length]))
-                for i in range(self.num_layers)
-            ]
+            self.host_max_attention_window_sizes = torch.minimum(
+                max_attention_window_size.to(torch.int32),
+                torch.IntTensor([self.max_seq_length] * self.num_layers))
         else:
             assert False, "invalid max_attention_window_size!"
 
@@ -1319,7 +1330,8 @@ class GenerationSession(object):
             for idx in range(self.num_layers):
                 layer_idx = idx + self.first_layer
 
-                for lora_module in self.lora_target_modules:
+                for lora_module in (self.lora_target_modules +
+                                    self.missing_qkv_modules):
                     lora_ranks_ = []
                     lora_ptrs_ = []
                     for batch_idx in range(batch_size):
@@ -1438,17 +1450,12 @@ class GenerationSession(object):
             add_tensor(prompt_vocab_size, 'prompt_vocab_size')
 
         if self.paged_kv_cache:
-            for idx in range(self.num_layers):
-                layer_idx = idx + self.first_layer
-                buffer = kv_cache_block_pointers[idx].contiguous()
-                shape = kv_cache_block_pointers[idx].shape
-                shape = [shape[0] * shape[1], *shape[2:]]
-                add_tensor_with_shape(buffer,
-                                      f'kv_cache_block_pointers_{layer_idx}',
-                                      shape)
-                add_tensor_with_shape(
-                    host_kv_cache_block_pointers[idx],
-                    f'host_kv_cache_block_pointers_{layer_idx}', shape)
+            buffer = kv_cache_block_pointers.contiguous()
+            shape = kv_cache_block_pointers.shape
+            shape = [shape[0], shape[1] * shape[2], *shape[3:]]
+            add_tensor_with_shape(buffer, f'kv_cache_block_pointers', shape)
+            add_tensor_with_shape(host_kv_cache_block_pointers,
+                                  f'host_kv_cache_block_pointers', shape)
 
         batch_size = context_lengths.shape[0]
         if not self.paged_kv_cache:
@@ -1508,11 +1515,9 @@ class GenerationSession(object):
             add_tensor_with_shape(self.host_sink_token_length,
                                   'host_sink_token_length', (1, ))
             add_tensor(host_request_types, 'host_request_types')
-            for idx in range(self.first_layer, self.last_layer):
-                add_tensor_with_shape(
-                    self.host_max_attention_window_sizes[idx -
-                                                         self.first_layer],
-                    f'host_max_attention_window_size_{idx}', (1, ))
+            add_tensor_with_shape(self.host_max_attention_window_sizes,
+                                  f'host_max_attention_window_sizes',
+                                  (self.num_layers, ))
             if self.remove_input_padding:
                 add_tensor(host_context_lengths, 'host_context_lengths')
         else:
@@ -1523,7 +1528,8 @@ class GenerationSession(object):
 
         if self.use_lora_plugin:
             for idx in range(self.num_layers):
-                for lora_module in self.lora_target_modules:
+                for lora_module in (self.lora_target_modules +
+                                    self.missing_qkv_modules):
                     layer_idx = idx + self.first_layer
                     lora_ranks = f'{lora_module}_lora_ranks_{layer_idx}'
                     add_tensor(self.buffer[lora_ranks], lora_ranks)
@@ -1639,16 +1645,12 @@ class GenerationSession(object):
                 add_tensor(cross_attention_mask, 'cross_attention_mask')
 
         if self.paged_kv_cache:
-            for idx in range(self.num_layers):
-                layer_idx = idx + self.first_layer
-                shape = kv_cache_block_pointers[idx].shape
-                shape = [shape[0] * shape[1], *shape[2:]]
-                add_tensor_with_shape(kv_cache_block_pointers[idx],
-                                      f'kv_cache_block_pointers_{layer_idx}',
-                                      shape)
-                add_tensor_with_shape(
-                    host_kv_cache_block_pointers[idx],
-                    f'host_kv_cache_block_pointers_{layer_idx}', shape)
+            shape = kv_cache_block_pointers.shape
+            shape = [shape[0], shape[1] * shape[2], *shape[3:]]
+            add_tensor_with_shape(kv_cache_block_pointers,
+                                  f'kv_cache_block_pointers', shape)
+            add_tensor_with_shape(host_kv_cache_block_pointers,
+                                  f'host_kv_cache_block_pointers', shape)
 
         if prompt_embedding_table is not None:
             add_tensor(prompt_embedding_table, 'prompt_embedding_table')
@@ -1718,11 +1720,9 @@ class GenerationSession(object):
                                   (batch_size * beam_width, ))
             add_tensor_with_shape(self.host_sink_token_length,
                                   'host_sink_token_length', (1, ))
-            for idx in range(self.first_layer, self.last_layer):
-                add_tensor_with_shape(
-                    self.host_max_attention_window_sizes[idx -
-                                                         self.first_layer],
-                    f'host_max_attention_window_size_{idx}', (1, ))
+            add_tensor_with_shape(self.host_max_attention_window_sizes,
+                                  f'host_max_attention_window_sizes',
+                                  (self.num_layers, ))
             if self.remove_input_padding:
                 add_tensor(host_context_lengths_local, 'host_context_lengths')
         else:
@@ -1734,7 +1734,8 @@ class GenerationSession(object):
         if self.use_lora_plugin:
             for idx in range(self.num_layers):
                 layer_idx = idx + self.first_layer
-                for lora_module in self.lora_target_modules:
+                for lora_module in (self.lora_target_modules +
+                                    self.missing_qkv_modules):
                     lora_ranks = f'{lora_module}_lora_ranks_{layer_idx}'
                     add_tensor(self.buffer[lora_ranks], lora_ranks)
                     lora_module = f'{lora_module}_lora_weights_pointers_{layer_idx}'
@@ -1898,8 +1899,9 @@ class GenerationSession(object):
             final_output_ids = self.gather_tree(
                 self.sequence_length_buffer, self.output_ids, self.parent_ids,
                 self.end_ids, context_lengths, self.cum_log_probs,
-                *beam_hyps_args, self.finished, self.length_penalty, batch_size,
-                beam_width, self.max_seq_length, scfg.use_beam_hyps)
+                *beam_hyps_args, self.finished, self.length_penalty,
+                self.early_stopping, batch_size, beam_width,
+                self.max_seq_length, scfg.use_beam_hyps)
 
         # Communicate ranks in Pipeline Parallelism
         if self.mapping.has_pp():
@@ -2200,11 +2202,10 @@ class GenerationSession(object):
             attention_mask = model_inputs.get('attention_mask', None)
 
             if self.paged_kv_cache:
-                host_kv_cache_block_pointers = self.kv_cache_manager.get_pointer_arrays(
+                host_kv_cache_block_pointers = self.kv_cache_manager.get_block_pointers(
                     1)
-                kv_cache_block_pointers = [
-                    x.to('cuda') for x in host_kv_cache_block_pointers
-                ]
+                kv_cache_block_pointers = host_kv_cache_block_pointers.to(
+                    'cuda')
 
             ctx_tensors = self._get_context_shape_buffer(
                 input_ids, context_lengths, host_context_lengths, position_ids,
@@ -2337,11 +2338,10 @@ class GenerationSession(object):
                         self.kv_cache_manager.step([False] * batch_size)
                 else:
                     self.kv_cache_manager.step([False] * batch_size)
-                host_kv_cache_block_pointers = self.kv_cache_manager.get_pointer_arrays(
+                host_kv_cache_block_pointers = self.kv_cache_manager.get_block_pointers(
                     beam_width)
-                kv_cache_block_pointers = [
-                    x.to('cuda') for x in host_kv_cache_block_pointers
-                ]
+                kv_cache_block_pointers = host_kv_cache_block_pointers.to(
+                    'cuda')
 
             next_context = self.runtime.context_1 if step % 2 else self.runtime.context_0
             next_step_tensors = self._get_next_step_shape_buffer(

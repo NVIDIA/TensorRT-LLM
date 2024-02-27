@@ -428,7 +428,7 @@ public:
         , mStaticEmulatedTimeoutMs(staticEmulatedTimeoutMs)
         , mActiveCount(0)
     {
-        ReturnBatchManagerStatsCallback iterationDataCallback = [this, &logIterationData](std::string const& log)
+        ReturnBatchManagerStatsCallback iterationDataCallback = [this, logIterationData](std::string const& log)
         {
             if (logIterationData)
             {
@@ -563,16 +563,18 @@ public:
                 {
                     auto numNewWorkItems = static_cast<int64_t>(rval.size());
                     comm.bcast(&numNewWorkItems, 1, mpi::MpiType::kINT64, 0);
-
-                    std::vector<int64_t> packed;
-                    for (auto const& ir : rval)
+                    if (numNewWorkItems > 0)
                     {
-                        auto vpacked = ir->serialize();
-                        packed.push_back(static_cast<int64_t>(vpacked.size()));
-                        packed.insert(
-                            packed.end(), std::move_iterator(vpacked.begin()), std::move_iterator(vpacked.end()));
+                        std::vector<int64_t> packed;
+                        for (auto const& ir : rval)
+                        {
+                            auto vpacked = ir->serialize();
+                            packed.push_back(static_cast<int64_t>(vpacked.size()));
+                            packed.insert(
+                                packed.end(), std::move_iterator(vpacked.begin()), std::move_iterator(vpacked.end()));
+                        }
+                        comm.bcast(packed, 0);
                     }
-                    comm.bcast(packed, 0);
                 }
             }
             else
@@ -791,7 +793,7 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
         recorder->report();
         recorder->writeOpMetricsToCsv();
         // Send terminateReqId to terminate servers on all ranks
-        // Sever on rank 0 will broadcast the terminate signal to other servers on multi-GPU cases
+        // Server on rank 0 will broadcast the terminate signal to other servers on multi-GPU cases
         gptServer->enqueue(std::make_shared<InferenceRequest>(terminateReqId));
     }
     // Wait until benchmarking is done and batch manager is terminated

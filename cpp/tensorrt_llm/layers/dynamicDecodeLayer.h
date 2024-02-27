@@ -75,6 +75,7 @@ public:
         // omlineBeamSearchLayer
         std::optional<std::vector<float>> beam_search_diversity_rate;
         std::optional<std::vector<float>> length_penalty;
+        std::optional<std::vector<int>> early_stopping;
 
         std::optional<bool> normalize_log_probs;
     };

@@ -22,21 +22,6 @@ import torch
 from tensorrt_llm._utils import torch_to_numpy
 
 
-def cpu_map_location(storage, loc):
-    return storage.cpu()
-
-
-def gpu_map_location(storage, loc):
-    if loc.startswith("cuda"):
-        training_gpu_idx = int(loc.split(":")[1])
-        inference_gpu_idx = training_gpu_idx % torch.cuda.device_count()
-        return storage.cuda(inference_gpu_idx)
-    elif loc.startswith("cpu"):
-        return storage.cpu()
-    else:
-        raise ValueError(f"Not handled {loc}")
-
-
 def save_val(val, dir, key, tp_num=None):
     suffix = "bin" if tp_num is None else f"{tp_num}.bin"
     val.tofile(dir / f"model.{key}.{suffix}")

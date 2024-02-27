@@ -35,35 +35,42 @@ namespace kernels
 // After we collect `beam_width` beams, we will sort them by their norm_scores.
 struct BeamHypotheses
 {
-    int* output_ids_tgt = nullptr;
-    int* sequence_lengths_tgt = nullptr;
-    float* cum_log_probs = nullptr;     // cum_log
-    float* normed_scores = nullptr;     // cum_log / (length**length_penalty)
-    float* log_probs = nullptr;         // log probs of each generated token
-    float* min_normed_scores = nullptr; // record the min normed scores for each batch
-    int* num_beams = nullptr;           // the number of finished beams we collect
-    bool* is_done = nullptr;
+    // TODO: simplify the pointers
+    // Pointers initialized in function prepareOutputs in gptDecoder.cpp
+    bool* is_done{nullptr};             // [batchSize], whether the batch is finished
+    const int* input_lengths{nullptr};  // [batchSize]
+    float* cum_log_probs{nullptr};      // [batchSize, 2 * beamWidth], outputs.cum_log_probs->template getPtr<float>()
+    float* log_probs{nullptr};          // [batchSize, 2 * beamWidth, maxSeqLen], not used?
+    float* min_normed_scores{nullptr};  // [batchSize], worst normed scores for each batch
+    float* normed_scores{nullptr};      // [batchSize, 2 * beamWidth], cum_log / (length ^ length_penalty)
+    int* num_beams{nullptr};            // [batchSize], count of finished beams for each batch
+    int* output_ids_tgt{nullptr};       // [batchSize, 2 * beamWidth, maxSeqLen],
+    int* sequence_lengths_tgt{nullptr}; // [batchSize, 2 * beamWidth], different from sequence_lengths_src
 
-    // Used to set inputs
-    const int* output_ids_src;
-    const int** output_ids_src_ptr;
-    const int* parent_ids_src;
-    const int** parent_ids_src_ptr;
-    const int* sequence_lengths_src;
-    const int* end_ids;
-    const float* log_probs_src;
-    const int* input_lengths;
+    // Pointers initialized in function invokeSoftMax in onlineBeamSearchLayer.cu
+    const int* end_ids{nullptr};             // get from SoftmaxParams
+    const int* output_ids_src{nullptr};      // for gatherTree
+    const int* parent_ids_src{nullptr};      // for gatherTree
+    const int** output_ids_src_ptr{nullptr}; // get from BeamSearchOutputParams for reading
+    const int** parent_ids_src_ptr{nullptr}; // get from BeamSearchOutputParams for reading
+    float* log_probs_src{nullptr};           // get from outputs.output_log_probs
+    int* sequence_lengths_src{nullptr};      // get from BeamSearchOutputParams
+    // For reading in function invokeTopkSoftMax but reading and writing in function invokeUpdate
+    int** output_ids_tgt_ptr{nullptr}; // get from BeamSearchOutputParams for writing
+    int** parent_ids_tgt_ptr{nullptr}; // get from BeamSearchOutputParams for writing
 
-    // some variables for kernels
-    int step;
-    int ite;
-    int batch_size;
-    int local_batch_size;
-    int max_seq_len;
-    float* length_penalties;
-
-    bool early_stopping = true;
-    bool is_return_normed_score = true; // return normed_cum_log_probs or cum_log_probs
+    // Other scalar values and buffers
+    int batch_size{0};
+    int beam_width{0};
+    int ite{0};
+    int local_batch_size{0};
+    int max_seq_len{0};
+    int step{0}; // useless in online version of beam search
+    int vocab_size{0};
+    float* diversity_rates{nullptr};
+    float* length_penalties{nullptr};
+    int* early_stoppings{nullptr};
+    bool is_return_normed_score{true}; // return normed_cum_log_probs or cum_log_probs
 };
 
 template <typename T>

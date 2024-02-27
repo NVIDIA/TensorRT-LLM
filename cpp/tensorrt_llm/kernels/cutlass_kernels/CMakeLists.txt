@@ -57,9 +57,17 @@ endif()
 
 file(GLOB_RECURSE CU_INSTANTIATIONS ${CMAKE_CURRENT_BINARY_DIR}/*.cu)
 
-add_library(cutlass_src OBJECT ${SRC_CPP} ${SRC_CU} ${CU_INSTANTIATIONS})
-set_property(TARGET cutlass_src PROPERTY POSITION_INDEPENDENT_CODE ON)
-set_property(TARGET cutlass_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+add_library(cutlass_src_pre_hopper STATIC ${SRC_CPP} ${SRC_CU})
+set_property(TARGET cutlass_src_pre_hopper PROPERTY POSITION_INDEPENDENT_CODE
+                                                    ON)
+set_property(TARGET cutlass_src_pre_hopper PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS
+                                                    ON)
+
+add_library(cutlass_src_hopper STATIC ${CU_INSTANTIATIONS})
+set_property(TARGET cutlass_src_hopper PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_property(TARGET cutlass_src_hopper PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
+add_dependencies(cutlass_src_hopper cutlass_src_pre_hopper)
 
 # Note - we deliberately do not include 90a PTX (even when 9.0+PTX is
 # specified). This is because sm_90a has arch conditional instructions that are
@@ -70,15 +78,21 @@ if("9.0" IN_LIST TORCH_CUDA_ARCH_LIST
    OR TORCH_CUDA_ARCH_LIST STREQUAL "Auto")
   message(STATUS "MANUALLY APPENDING FLAG TO COMPILE FOR SM_90a.")
   target_compile_options(
-    cutlass_src
+    cutlass_src_pre_hopper
+    PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_90a,code=sm_90a>)
+  target_compile_options(
+    cutlass_src_hopper
     PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_90a,code=sm_90a>)
 
   # Hopper kernels require cuda lib for TMA APIs
-  target_link_libraries(cutlass_src PRIVATE CUDA::cuda_driver)
+  target_link_libraries(cutlass_src_pre_hopper PRIVATE CUDA::cuda_driver)
+  target_link_libraries(cutlass_src_hopper PRIVATE CUDA::cuda_driver)
 
   # No kernels should be parsed, unless hopper is specified. This is a build
   # time improvement
-  target_compile_definitions(cutlass_src
+  target_compile_definitions(cutlass_src_pre_hopper
+                             PRIVATE COMPILE_HOPPER_MIXED_INPUT_GEMMS)
+  target_compile_definitions(cutlass_src_hopper
                              PRIVATE COMPILE_HOPPER_MIXED_INPUT_GEMMS)
 endif()
 
@@ -87,5 +101,9 @@ endif()
 # compilation output.
 if(NOT WIN32)
   target_compile_options(
-    cutlass_src PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wno-psabi>)
+    cutlass_src_pre_hopper
+    PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wno-psabi>)
+  target_compile_options(
+    cutlass_src_hopper
+    PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wno-psabi>)
 endif()

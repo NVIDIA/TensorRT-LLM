@@ -46,8 +46,8 @@ public:
         std::optional<FloatType> beamSearchDiversityRate = std::nullopt,
         std::optional<FloatType> repetitionPenalty = std::nullopt,
         std::optional<FloatType> presencePenalty = std::nullopt,
-        std::optional<FloatType> frequencyPenalty = std::nullopt,
-        std::optional<FloatType> lengthPenalty = std::nullopt);
+        std::optional<FloatType> frequencyPenalty = std::nullopt, std::optional<FloatType> lengthPenalty = std::nullopt,
+        std::optional<SizeType> earlyStopping = std::nullopt);
 
     ~SamplingConfig();
 
@@ -65,6 +65,7 @@ public:
     [[nodiscard]] std::optional<FloatType> getPresencePenalty() const;
     [[nodiscard]] std::optional<FloatType> getFrequencyPenalty() const;
     [[nodiscard]] std::optional<FloatType> getLengthPenalty() const;
+    [[nodiscard]] std::optional<SizeType> getEarlyStopping() const;
 
 private:
     SizeType mBeamWidth;
@@ -81,6 +82,7 @@ private:
     std::optional<FloatType> mPresencePenalty;
     std::optional<FloatType> mFrequencyPenalty;
     std::optional<FloatType> mLengthPenalty;
+    std::optional<SizeType> mEarlyStopping;
 };
 
 /// @brief  Configuration that controls the outputs of a Result

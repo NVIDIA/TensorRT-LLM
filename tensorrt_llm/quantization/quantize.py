@@ -5,6 +5,7 @@ from .layers import (Int8SmoothQuantLinear, Int8SmoothQuantRowLinear,
                      WeightOnlyGroupwiseQuantColumnLinear,
                      WeightOnlyGroupwiseQuantRowLinear,
                      WeightOnlyQuantColumnLinear, WeightOnlyQuantRowLinear)
+from .mode import W4A8_AWQ, W4A16_AWQ
 
 
 def weight_only_quantize(model,
@@ -58,7 +59,7 @@ def weight_only_quantize(model,
 
 def weight_only_groupwise_quantize(model,
                                    quant_mode,
-                                   quant_algo='W4A16_AWQ',
+                                   quant_algo=W4A16_AWQ,
                                    group_size=128,
                                    pre_quant_scale=False,
                                    zero=False,
@@ -89,7 +90,7 @@ def weight_only_groupwise_quantize(model,
                     pre_quant_scale=pre_quant_scale,
                     zero=zero,
                     bias=module.bias is not None,
-                    use_w4a8_awq=quant_algo == "W4A8_AWQ",
+                    use_w4a8_awq=quant_algo == W4A8_AWQ,
                     dtype=module.dtype,
                     tp_group=module.tp_group,
                     tp_size=module.tp_size,
@@ -104,7 +105,7 @@ def weight_only_groupwise_quantize(model,
                     pre_quant_scale=pre_quant_scale,
                     zero=zero,
                     bias=module.bias is not None,
-                    use_w4a8_awq=quant_algo == "W4A8_AWQ",
+                    use_w4a8_awq=quant_algo == W4A8_AWQ,
                     dtype=module.dtype,
                     tp_group=module.tp_group,
                     tp_size=module.tp_size)
@@ -150,7 +151,7 @@ def smooth_quantize_ootb(model,
 
 
 def smooth_quantize_plugin(model, quant_mode):
-    for layer in model.transformer.layers:
+    for layer_idx, layer in enumerate(model.transformer.layers):
         config = layer.config
 
         assert hasattr(layer,
@@ -171,7 +172,8 @@ def smooth_quantize_plugin(model, quant_mode):
         dense_bias = layer.attention.dense.bias is not None
         head_size = config.head_size if hasattr(config, 'head_size') else None
         layer.attention = SmoothQuantAttention(
-            config.hidden_size,
+            layer_idx=layer_idx,
+            hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             attention_head_size=head_size,

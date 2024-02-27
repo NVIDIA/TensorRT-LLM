@@ -939,6 +939,7 @@ class TestSmoothQuant(unittest.TestCase):
 
         # instantiate full gpt model before isolating its attention module
         tensorrt_llm_gpt = tensorrt_llm.quantization.layers.SmoothQuantAttention(
+            layer_idx=0,
             hidden_size=hidden_size,
             num_attention_heads=num_heads,
             max_position_embeddings=n_positions,

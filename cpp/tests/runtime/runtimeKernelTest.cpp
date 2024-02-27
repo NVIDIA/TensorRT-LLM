@@ -21,6 +21,7 @@
 #include "tensorrt_llm/common/stlUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include <NvInferRuntime.h>
@@ -257,6 +258,47 @@ TEST_F(RuntimeKernelTest, TransposeWithInputOffset)
     }
 }
 
+TEST_F(RuntimeKernelTest, InclusiveScan)
+{
+    std::vector<SizeType> inputHost(10000);
+    std::vector<SizeType> expectedOutput(10000);
+    tc::stl_utils::inclusiveScan(inputHost.begin(), inputHost.end(), expectedOutput.begin());
+
+    auto input = mManager->copyFrom(inputHost, MemoryType::kGPU);
+    auto output = mManager->gpu(input->getSize(), input->getDataType());
+
+    kernels::invokeInclusiveSum(*output, *input, *mManager, *mStream);
+
+    auto outputHost = mManager->copyFrom(*output, MemoryType::kCPU);
+    auto* outputHostPtr = bufferCast<SizeType>(*outputHost);
+
+    for (std::size_t i = 0; i < expectedOutput.size(); ++i)
+    {
+        EXPECT_EQ(expectedOutput[i], outputHostPtr[i]) << "Error at index " << i;
+    }
+}
+
+TEST_F(RuntimeKernelTest, InclusiveScanTmp)
+{
+    std::vector<SizeType> inputHost(10000);
+    std::vector<SizeType> expectedOutput(10000);
+    tc::stl_utils::inclusiveScan(inputHost.begin(), inputHost.end(), expectedOutput.begin());
+
+    auto input = mManager->copyFrom(inputHost, MemoryType::kGPU);
+    auto output = mManager->gpu(input->getSize(), input->getDataType());
+    auto tmp = mManager->emptyBuffer(MemoryType::kGPU);
+
+    kernels::invokeInclusiveSum(*output, *tmp, *input, *mStream);
+
+    auto outputHost = mManager->copyFrom(*output, MemoryType::kCPU);
+    auto* outputHostPtr = bufferCast<SizeType>(*outputHost);
+
+    for (std::size_t i = 0; i < expectedOutput.size(); ++i)
+    {
+        EXPECT_EQ(expectedOutput[i], outputHostPtr[i]) << "Error at index " << i;
+    }
+}
+
 TEST_F(RuntimeKernelTest, BuildTokenMask)
 {
     SizeType constexpr batchSize{7};
@@ -444,10 +486,11 @@ TEST_F(RuntimeKernelTest, CopyPackedInputToOutput)
     mManager->setZero(*inputOffsets);
     kernels::invokeInclusiveSum(*ITensor::slice(inputOffsets, 1), *inputLengths, *mManager, *mStream);
     auto inputOffsetsHost2 = mManager->copyFrom(*inputOffsets, MemoryType::kCPU);
+    auto* inputOffsetsHost2Ptr = bufferCast<SizeType>(*inputOffsetsHost2);
 
     for (std::size_t b = 0; b < inputOffsetsHost.size(); ++b)
     {
-        EXPECT_EQ(inputOffsetsHost[b], inputOffsetsHost[b]) << "Error at index " << b;
+        EXPECT_EQ(inputOffsetsHost[b], inputOffsetsHost2Ptr[b]) << "Error at index " << b;
     }
 
     kernels::invokeCopyPackedInputToOutput(*outputIds, *inputIds, *inputOffsets, maxInputLength, padId, *mStream);
@@ -558,10 +601,11 @@ TEST_F(RuntimeKernelTest, CopyPackedInputToOutputTransposed)
     mManager->setZero(*inputOffsets);
     kernels::invokeInclusiveSum(*ITensor::slice(inputOffsets, 1), *inputLengths, *mManager, *mStream);
     auto inputOffsetsHost2 = mManager->copyFrom(*inputOffsets, MemoryType::kCPU);
+    auto* inputOffsetsHost2Ptr = bufferCast<SizeType>(*inputOffsetsHost2);
 
     for (std::size_t b = 0; b < inputOffsetsHost.size(); ++b)
     {
-        EXPECT_EQ(inputOffsetsHost[b], inputOffsetsHost[b]) << "Error at index " << b;
+        EXPECT_EQ(inputOffsetsHost[b], inputOffsetsHost2Ptr[b]) << "Error at index " << b;
     }
 
     kernels::invokeCopyPackedInputToOutputTransposed(

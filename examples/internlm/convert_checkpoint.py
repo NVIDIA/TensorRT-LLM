@@ -777,16 +777,16 @@ class QkvWeightHelper:
             self._qkv_weights[i] = {}
         self._qkv_weights[i][tag] = weight
 
-    def is_qkv_prepared(self, layer_id):
-        if layer_id not in self._qkv_weights:
+    def is_qkv_prepared(self, layer_idx):
+        if layer_idx not in self._qkv_weights:
             return False
-        weights = self._qkv_weights[layer_id]
+        weights = self._qkv_weights[layer_idx]
         return 'q' in weights and 'k' in weights and 'v' in weights
 
-    def split_qkv_weights(self, layer_id):
-        if not self.is_qkv_prepared(layer_id):
+    def split_qkv_weights(self, layer_idx):
+        if not self.is_qkv_prepared(layer_idx):
             return None
-        weights = self._qkv_weights.pop(layer_id)  # to prevent memory leak.
+        weights = self._qkv_weights.pop(layer_idx)  # to prevent memory leak.
         q, k, v = (torch.tensor(weights[t]) for t in ['q', 'k', 'v'])
 
         if not self.is_mha:

@@ -141,6 +141,7 @@ This release of TensorRT-LLM contains the following examples:
 | Skywork    |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | StarCoder  |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | T5         |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
+| Whisper    |   Y   |   Y   |   Y   |   .   |    .    |   Y   |   Y   |     .     |     .      |
 
 
 ## Technical Detail: The `QuantMode` Flags

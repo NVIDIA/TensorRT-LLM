@@ -31,9 +31,10 @@ public:
         th::optional<th::Tensor> runtime_top_p_opt, th::optional<th::Tensor> temperature_opt,
         th::optional<th::Tensor> repetition_penalty_opt, th::optional<th::Tensor> presence_penalty_opt,
         th::optional<th::Tensor> frequency_penalty_opt, th::optional<th::Tensor> min_length_opt,
-        th::optional<th::Tensor> length_penalty_opt, th::optional<th::Tensor> beam_search_diversity_rate_opt,
-        th::optional<th::Tensor> random_seed_opt, th::optional<th::Tensor> top_p_decay_opt,
-        th::optional<th::Tensor> top_p_min_opt, th::optional<th::Tensor> top_p_reset_ids_opt)
+        th::optional<th::Tensor> length_penalty_opt, th::optional<th::Tensor> early_stopping_opt,
+        th::optional<th::Tensor> beam_search_diversity_rate_opt, th::optional<th::Tensor> random_seed_opt,
+        th::optional<th::Tensor> top_p_decay_opt, th::optional<th::Tensor> top_p_min_opt,
+        th::optional<th::Tensor> top_p_reset_ids_opt)
         = 0;
 
     virtual void forward(th::Tensor& logits, // (batch_size, beam_width, hidden_size)
@@ -72,9 +73,10 @@ public:
         th::optional<th::Tensor> runtime_top_p_opt, th::optional<th::Tensor> temperature_opt,
         th::optional<th::Tensor> repetition_penalty_opt, th::optional<th::Tensor> presence_penalty_opt,
         th::optional<th::Tensor> frequency_penalty_opt, th::optional<th::Tensor> min_length_opt,
-        th::optional<th::Tensor> length_penalty_opt, th::optional<th::Tensor> beam_search_diversity_rate_opt,
-        th::optional<th::Tensor> random_seed_opt, th::optional<th::Tensor> top_p_decay_opt,
-        th::optional<th::Tensor> top_p_min_opt, th::optional<th::Tensor> top_p_reset_ids_opt) override;
+        th::optional<th::Tensor> length_penalty_opt, th::optional<th::Tensor> early_stopping_opt,
+        th::optional<th::Tensor> beam_search_diversity_rate_opt, th::optional<th::Tensor> random_seed_opt,
+        th::optional<th::Tensor> top_p_decay_opt, th::optional<th::Tensor> top_p_min_opt,
+        th::optional<th::Tensor> top_p_reset_ids_opt) override;
 
     void forward(th::Tensor& logits, // (batch_size, beam_width, hidden_size)
         int step, int max_input_length, int max_attention_window, int sink_token_length, uint64_t ite,
@@ -118,9 +120,10 @@ public:
         th::optional<th::Tensor> runtime_top_p_opt, th::optional<th::Tensor> temperature_opt,
         th::optional<th::Tensor> repetition_penalty_opt, th::optional<th::Tensor> presence_penalty_opt,
         th::optional<th::Tensor> frequency_penalty_opt, th::optional<th::Tensor> min_length_opt,
-        th::optional<th::Tensor> length_penalty_opt, th::optional<th::Tensor> beam_search_diversity_rate_opt,
-        th::optional<th::Tensor> random_seed_opt, th::optional<th::Tensor> top_p_decay_opt,
-        th::optional<th::Tensor> top_p_min_opt, th::optional<th::Tensor> top_p_reset_ids_opt);
+        th::optional<th::Tensor> length_penalty_opt, th::optional<th::Tensor> early_stopping_opt,
+        th::optional<th::Tensor> beam_search_diversity_rate_opt, th::optional<th::Tensor> random_seed_opt,
+        th::optional<th::Tensor> top_p_decay_opt, th::optional<th::Tensor> top_p_min_opt,
+        th::optional<th::Tensor> top_p_reset_ids_opt);
 
     th::Tensor forward(th::Tensor logits, // (batch_size, beam_width, vocab_size)
         int64_t step, int64_t max_input_length, int64_t max_attention_window, int64_t sink_token_length, int64_t ite,

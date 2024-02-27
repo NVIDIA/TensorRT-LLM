@@ -103,11 +103,12 @@ void FtDynamicDecode<T>::setup(size_t batch_size, size_t beam_width, th::optiona
     th::optional<th::Tensor> runtime_top_p_opt, th::optional<th::Tensor> temperature_opt,
     th::optional<th::Tensor> repetition_penalty_opt, th::optional<th::Tensor> presence_penalty_opt,
     th::optional<th::Tensor> frequency_penalty_opt, th::optional<th::Tensor> min_length_opt,
-    th::optional<th::Tensor> length_penalty_opt, th::optional<th::Tensor> beam_search_diversity_rate_opt,
-    th::optional<th::Tensor> random_seed_opt, th::optional<th::Tensor> top_p_decay_opt,
-    th::optional<th::Tensor> top_p_min_opt, th::optional<th::Tensor> top_p_reset_ids_opt)
+    th::optional<th::Tensor> length_penalty_opt, th::optional<th::Tensor> early_stopping_opt,
+    th::optional<th::Tensor> beam_search_diversity_rate_opt, th::optional<th::Tensor> random_seed_opt,
+    th::optional<th::Tensor> top_p_decay_opt, th::optional<th::Tensor> top_p_min_opt,
+    th::optional<th::Tensor> top_p_reset_ids_opt)
 {
-    // unused: length_penalty_opt, beam_search_diversity_rate_opt
+    // unused: length_penalty_opt, beam_search_diversity_rate_opt, early_stopping_opt
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     dynamic_decode_layer_->setStream(stream);
@@ -127,6 +128,7 @@ void FtDynamicDecode<T>::setup(size_t batch_size, size_t beam_width, th::optiona
     safeInsert(top_p_reset_ids_opt, setupParams.top_p_reset_ids);
     safeInsert(beam_search_diversity_rate_opt, setupParams.beam_search_diversity_rate);
     safeInsert(length_penalty_opt, setupParams.length_penalty);
+    safeInsert(early_stopping_opt, setupParams.early_stopping);
 
     dynamic_decode_layer_->setup(batch_size, beam_width, nullptr, setupParams);
 }
@@ -211,13 +213,13 @@ void FtDynamicDecode<T>::forward(th::Tensor& logits, // (batch_size, beam_width,
     dynamic_decode_layer_->forward(outputParams, forwardParams);
     if (finished_sum_host)
     {
+        TLLM_CUDA_CHECK(::cudaStreamSynchronize(dynamic_decode_layer_->getStream()));
         int32_t finished_sum = 0;
         for (int32_t bi = 0; bi < local_batch_size; ++bi)
         {
             finished_sum += finished_sum_host[bi];
         }
         auto const numToFinish = outputParams.finished->size();
-        TLLM_CUDA_CHECK(::cudaStreamSynchronize(dynamic_decode_layer_->getStream()));
         auto should_stop_accessor = should_stop.accessor<bool, 1>();
         should_stop_accessor[0] = numToFinish == finished_sum;
     }
@@ -259,9 +261,10 @@ void DynamicDecodeOp::setup(int64_t batch_size, int64_t beam_width, th::optional
     th::optional<th::Tensor> runtime_top_p_opt, th::optional<th::Tensor> temperature_opt,
     th::optional<th::Tensor> repetition_penalty_opt, th::optional<th::Tensor> presence_penalty_opt,
     th::optional<th::Tensor> frequency_penalty_opt, th::optional<th::Tensor> min_length_opt,
-    th::optional<th::Tensor> length_penalty_opt, th::optional<th::Tensor> beam_search_diversity_rate_opt,
-    th::optional<th::Tensor> random_seed_opt, th::optional<th::Tensor> top_p_decay_opt,
-    th::optional<th::Tensor> top_p_min_opt, th::optional<th::Tensor> top_p_reset_ids_opt)
+    th::optional<th::Tensor> length_penalty_opt, th::optional<th::Tensor> early_stopping_opt,
+    th::optional<th::Tensor> beam_search_diversity_rate_opt, th::optional<th::Tensor> random_seed_opt,
+    th::optional<th::Tensor> top_p_decay_opt, th::optional<th::Tensor> top_p_min_opt,
+    th::optional<th::Tensor> top_p_reset_ids_opt)
 {
     // TODO: Revise DynamicDecodeLayer and make the decode arguments consistent.
     CHECK_OPTIONAL_CPU_INPUT(runtime_top_k_opt, torch::kInt32);
@@ -273,6 +276,7 @@ void DynamicDecodeOp::setup(int64_t batch_size, int64_t beam_width, th::optional
     CHECK_OPTIONAL_CPU_INPUT(frequency_penalty_opt, torch::kFloat);
     CHECK_OPTIONAL_CPU_INPUT(min_length_opt, torch::kInt32);
     CHECK_OPTIONAL_CPU_INPUT(length_penalty_opt, torch::kFloat);
+    CHECK_OPTIONAL_CPU_INPUT(early_stopping_opt, torch::kInt32);
     CHECK_OPTIONAL_CPU_INPUT(beam_search_diversity_rate_opt, torch::kFloat);
     CHECK_OPTIONAL_CPU_INPUT(random_seed_opt, torch::kInt64);
     CHECK_OPTIONAL_INPUT(top_p_decay_opt, torch::kFloat);
@@ -281,8 +285,8 @@ void DynamicDecodeOp::setup(int64_t batch_size, int64_t beam_width, th::optional
 
     dynamic_decode_->setup(static_cast<size_t>(batch_size), static_cast<size_t>(beam_width), runtime_top_k_opt,
         runtime_top_p_opt, temperature_opt, repetition_penalty_opt, presence_penalty_opt, frequency_penalty_opt,
-        min_length_opt, length_penalty_opt, beam_search_diversity_rate_opt, random_seed_opt, top_p_decay_opt,
-        top_p_min_opt, top_p_reset_ids_opt);
+        min_length_opt, length_penalty_opt, early_stopping_opt, beam_search_diversity_rate_opt, random_seed_opt,
+        top_p_decay_opt, top_p_min_opt, top_p_reset_ids_opt);
 }
 
 th::Tensor DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max_input_length,

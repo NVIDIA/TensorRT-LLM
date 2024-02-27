@@ -191,22 +191,27 @@ std::vector<Tensor> symmetric_quantize_helper(
     int8_t* unprocessed_quantized_weight_ptr = get_ptr<int8_t>(unprocessed_quantized_weight);
     int8_t* processed_quantized_weight_ptr = get_ptr<int8_t>(processed_quantized_weight);
 
+    // TODO(dastokes) This should be removed if Grouped GEMM is updated to not need interleaved input
+    bool force_interleave = weight.dim() == 3;
+
     if (weight.scalar_type() == at::ScalarType::Float)
     {
         symmetric_quantize<float, float>(processed_quantized_weight_ptr, unprocessed_quantized_weight_ptr,
-            get_ptr<float>(scales), get_ptr<const float>(weight), {num_experts, num_rows, num_cols}, ft_quant_type);
+            get_ptr<float>(scales), get_ptr<const float>(weight), {num_experts, num_rows, num_cols}, ft_quant_type,
+            force_interleave);
     }
     else if (weight.scalar_type() == at::ScalarType::Half)
     {
         symmetric_quantize<half, half>(processed_quantized_weight_ptr, unprocessed_quantized_weight_ptr,
-            get_ptr<half>(scales), get_ptr<const half>(weight), {num_experts, num_rows, num_cols}, ft_quant_type);
+            get_ptr<half>(scales), get_ptr<const half>(weight), {num_experts, num_rows, num_cols}, ft_quant_type,
+            force_interleave);
     }
 #ifdef ENABLE_BF16
     else if (weight.scalar_type() == at::ScalarType::BFloat16)
     {
         symmetric_quantize<__nv_bfloat16, __nv_bfloat16>(processed_quantized_weight_ptr,
             unprocessed_quantized_weight_ptr, get_ptr<__nv_bfloat16>(scales), get_ptr<const __nv_bfloat16>(weight),
-            {num_experts, num_rows, num_cols}, ft_quant_type);
+            {num_experts, num_rows, num_cols}, ft_quant_type, force_interleave);
     }
 #endif
     else

@@ -35,6 +35,7 @@ from ..models.modeling_utils import optimize_model
 from ..network import net_guard
 from ..plugin import PluginConfig, add_plugin_argument
 from ..quantization import QuantMode
+from ..quantization.mode import FP8, W4A8_AWQ, W4A16, W4A16_AWQ, W8A16
 from ..runtime.engine import Engine, EngineConfig
 from ..version import __version__
 
@@ -138,13 +139,10 @@ def parse_arguments():
     return args
 
 
-def build_model(model: PretrainedModel,
-                build_config: BuildConfig,
-                use_refit: bool = False) -> Engine:
+def build_model(model: PretrainedModel, build_config: BuildConfig) -> Engine:
     builder = Builder()
     builder_config = builder.create_builder_config(
         precision=model.config.dtype,
-        use_refit=use_refit,
         int8=(model.config.quant_mode.has_act_or_weight_quant()
               and not model.config.quant_mode.has_per_group_scaling())
         or model.config.quant_mode.has_int8_kv_cache(),
@@ -249,11 +247,11 @@ def build(build_config: BuildConfig,
         if weight_only_precision == 'int4':
             model_config.quant_mode = QuantMode.use_weight_only(
                 use_int4_weights=True)
-            model_config.quant_kwargs['quant_algo'] = 'W4A16'
+            model_config.quant_kwargs['quant_algo'] = W4A16
         else:
             model_config.quant_mode = QuantMode.use_weight_only(
                 use_int4_weights=False)
-            model_config.quant_kwargs['quant_algo'] = 'W8A16'
+            model_config.quant_kwargs['quant_algo'] = W8A16
 
     assert rank < model_config.mapping.world_size
     architecture = model_config.architecture
@@ -280,14 +278,13 @@ def build(build_config: BuildConfig,
             logger.warning(
                 f"Cannot find {model_path}. Use dummy model weights.")
 
-    is_checkpoint_pruned = getattr(rank_config, 'is_pruned', False)
     if weights is not None:
         preprocess_weights(weights, rank_config)
-        model.load(weights, is_checkpoint_pruned)
+        model.load(weights)
 
     if model.config.quant_kwargs[
-            'quant_algo'] == 'FP8' or model.config.quant_kwargs[
-                'kv_cache_quant_algo'] == 'FP8':
+            'quant_algo'] == FP8 or model.config.quant_kwargs[
+                'kv_cache_quant_algo'] == FP8:
         build_config.strongly_typed = True
 
     if hasattr(model.config, 'max_medusa_token_len'):
@@ -296,7 +293,7 @@ def build(build_config: BuildConfig,
     use_fused_mlp = kwargs.pop('use_fused_mlp', False)
     model = optimize_model(model, use_fused_mlp=use_fused_mlp)
 
-    return build_model(model, build_config, use_refit=is_checkpoint_pruned)
+    return build_model(model, build_config)
 
 
 def preprocess_weights(
@@ -306,33 +303,53 @@ def preprocess_weights(
     kv_cache_quant_algo = model_config.quant_kwargs['kv_cache_quant_algo']
 
     # INT4_AWQ
-    if quant_algo == 'W4A8_AWQ' or quant_algo == 'W4A16_AWQ':
+    if quant_algo == W4A8_AWQ or quant_algo == W4A16_AWQ:
         preprocessor = torch.ops.trtllm.preprocess_weights_for_mixed_gemm
         for name, param in weights.items():
-            if 'weight' in name and param.dtype == torch.int8:
+            if name.endswith('weight') and param.dtype == torch.int8:
                 weights[name] = preprocessor(param.T.contiguous(),
                                              torch.quint4x2).view(torch.float16)
-            if 'weights_scaling_factor' in name:
+            if name.endswith('weights_scaling_factor'):
                 weights[name] = param.T.contiguous().to(
                     str_dtype_to_torch(model_config.dtype))
-            if 'prequant_scaling_factor' in name:
+            if name.endswith('prequant_scaling_factor'):
                 weights[name] = param.reshape(1, -1)
             if model_config.mapping.tp_rank > 0:
-                if 'attention.dense.bias' in name or 'mlp.proj.bias' in name:
+                if name.endswith('attention.dense.bias') or name.endswith(
+                        'mlp.proj.bias'):
                     weights[name] = torch.zeros_like(param)
+
+        if quant_algo == W4A8_AWQ:
+            for name in list(weights):
+                if name.endswith('weights_scaling_factor'):
+                    activation_scaling_factor = weights.pop(
+                        name.replace('weights_scaling_factor',
+                                     'activation_scaling_factor'))
+                    weights_scaling_factor_2 = weights.pop(
+                        name.replace('weights_scaling_factor',
+                                     'weights_scaling_factor_2'))
+                    weights[name] /= weights_scaling_factor_2
+                    weights[name.replace(
+                        'weights_scaling_factor',
+                        'prequant_scaling_factor')] /= activation_scaling_factor
+                    weights[name.replace(
+                        'weights_scaling_factor', 'alpha'
+                    )] = activation_scaling_factor * weights_scaling_factor_2
+
     # FP8
-    elif quant_algo == 'FP8':
+    elif quant_algo == FP8:
         for name, param in weights.items():
             if name.endswith('weight') and param.dtype == torch.int8:
                 weights[name] = param.view(torch.float8_e4m3fn)
         # lm_head is not quantized to FP8
-        assert weights['lm_head.weight'].dtype == str_dtype_to_torch(
-            model_config.dtype)
+        if "lm_head.weight" in weights:
+            assert weights['lm_head.weight'].dtype == str_dtype_to_torch(
+                model_config.dtype)
         weights.pop('lm_head.weights_scaling_factor', None)
         weights.pop('lm_head.activation_scaling_factor', None)
 
     # Weight only 4bit
-    elif quant_algo == 'W4A16':
+    elif quant_algo == W4A16:
         for name in list(weights):
             if any([
                     _name in name for _name in [
@@ -348,7 +365,7 @@ def preprocess_weights(
                     '.weight', '.per_channel_scale')] = torch_weight_scales
 
     # Weight only 8bit
-    elif quant_algo == 'W8A16':
+    elif quant_algo == W8A16:
         for name in list(weights):
             if any([
                     _name in name for _name in [
@@ -364,7 +381,7 @@ def preprocess_weights(
                     '.weight', '.per_channel_scale')] = torch_weight_scales
 
     # FP8 kv_cache_scaling_factor is always 1.0
-    if kv_cache_quant_algo == 'FP8':
+    if kv_cache_quant_algo == FP8:
         for name, param in weights.items():
             if name.endswith('kv_cache_scaling_factor'):
                 weights[name] = torch.tensor([1.0], dtype=torch.float32)

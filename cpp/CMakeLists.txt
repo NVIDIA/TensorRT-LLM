@@ -182,7 +182,7 @@ if(ENABLE_MULTI_DEVICE EQUAL 1)
   find_library(NCCL_LIB nccl HINTS ${NCCL_LIB_DIR})
 endif()
 
-get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_SOURCE_DIR} PATH)
+get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR} PATH)
 
 set(3RDPARTY_DIR ${TRT_LLM_ROOT_DIR}/3rdparty)
 include_directories(

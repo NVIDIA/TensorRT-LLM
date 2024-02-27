@@ -172,6 +172,11 @@ void MpiComm::allgather(const void* sendbuf, void* recvbuf, int count, MpiType d
     MPICHECK(MPI_Allgather(sendbuf, count, getMpiDtype(dtype), recvbuf, count, getMpiDtype(dtype), mComm));
 }
 
+void MpiComm::mprobe(int source, int tag, MPI_Message* msg, MPI_Status* status) const
+{
+    MPICHECK(MPI_Mprobe(source, tag, mComm, msg, status));
+}
+
 int MpiComm::getRank() const
 {
     int rank = 0;

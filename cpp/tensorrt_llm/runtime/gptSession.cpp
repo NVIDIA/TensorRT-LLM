@@ -23,7 +23,6 @@
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/customAllReduceUtils.h"
 #include "tensorrt_llm/common/stringUtils.h"
-#include "tensorrt_llm/kernels/decodingKernels.h"
 #include "tensorrt_llm/runtime/gptDecoderBatch.h"
 #include "tensorrt_llm/runtime/ipcUtils.h"
 #include "tensorrt_llm/runtime/ncclCommunicator.h"
@@ -189,29 +188,20 @@ void GptSession::createKvCacheManager(SizeType batchSize, SizeType beamWidth, Si
         kvDtype = mModelConfig.getDataType();
     }
 
-    auto const maxNumTokens
-        = bmkv::KVCacheManager::getMaxNumTokens(kvCacheConfig, kvDtype, mModelConfig, mWorldConfig, getBufferManager());
-    TLLM_LOG_INFO("Using %d tokens in paged KV cache.", maxNumTokens);
-    auto const maxNumBlocks = tc::ceilDiv(maxNumTokens, tokensPerBlock);
+    auto const maxNumBlocks = bmkv::KVCacheManager::calculateMaxNumBlocks(
+        kvCacheConfig, kvDtype, mModelConfig, mWorldConfig, getBufferManager());
 
-    SizeType sinkTokensInLastBlock = sinkTokenLength % tokensPerBlock;
-    SizeType bubbleLen = sinkTokensInLastBlock != 0 ? tokensPerBlock - sinkTokensInLastBlock : 0;
-    auto maxBlocksPerSeq = tc::ceilDiv(maxAttentionWindow + bubbleLen, tokensPerBlock);
     // If beamWidth > 1, use one more block for each sequence in the paged kv cache to avoid dropping the needed
     // tokens, when enabling cyclic kv cache.
     auto const useOneMoreBlock = beamWidth > 1 && maxSequenceLength > maxAttentionWindow;
-    if (useOneMoreBlock)
-    {
-        maxBlocksPerSeq += 1;
-    }
 
     auto const localNbLayers = mModelConfig.getNbLayers(mWorldConfig.getPipelineParallelism());
     auto const nbKvHeads = mModelConfig.getNbKvHeads();
     auto const sizePerHead = mModelConfig.getSizePerHead();
-    bool enableBlockReuse{false};
+    bool constexpr enableBlockReuse{false};
     mKvCacheManager = std::make_shared<bmkv::KVCacheManager>(localNbLayers, nbKvHeads, sizePerHead, tokensPerBlock,
-        maxNumBlocks, batchSize, beamWidth, maxBlocksPerSeq, maxAttentionWindow, sinkTokenLength, useOneMoreBlock,
-        kvDtype, mRuntime->getStreamPtr(), enableBlockReuse, kvCacheConfig.useUvm);
+        maxNumBlocks, batchSize, beamWidth, maxAttentionWindow, sinkTokenLength, useOneMoreBlock, kvDtype,
+        mRuntime->getStreamPtr(), enableBlockReuse, kvCacheConfig.useUvm);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -335,12 +325,14 @@ void GptSession::setup(Config const& sessionConfig)
         createCustomAllReduceWorkspace(mMicroBatchConfig.genBatchSize, maxBeamWidth, maxSequenceLength);
     }
 
+    auto* kvCacheManager = mModelConfig.usePagedKvCache() ? mKvCacheManager.get() : nullptr;
+
     for (auto& buffers : mBuffers)
     {
         // we don't know maxInputLength yet and ignore it for pre-allocation
         buffers->generationConfig = RuntimeBuffers::GenerationConfig{
             mMicroBatchConfig.genBatchSize, maxBeamWidth, 0, maxAttentionWindow, sinkTokenLength, maxSequenceLength};
-        buffers->reshape(mModelConfig, mWorldConfig);
+        buffers->reshape(kvCacheManager, mModelConfig, mWorldConfig);
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -684,6 +676,8 @@ void GptSession::generateBatched(std::vector<GenerationOutput>& microBatchesOutp
     TLLM_CHECK(numMicroBatches <= mMicroBatchConfig.numGenBatches);
     SizeType const beamWidth{samplingConfig.beamWidth};
 
+    auto* kvCacheManager = mModelConfig.usePagedKvCache() ? mKvCacheManager.get() : nullptr;
+
     // Initialize and reshape buffers
     for (auto microBatchId = 0; microBatchId < numMicroBatches; ++microBatchId)
     {
@@ -691,7 +685,7 @@ void GptSession::generateBatched(std::vector<GenerationOutput>& microBatchesOutp
         auto& buffers = *mBuffers.at(microBatchId);
         buffers.initFromInput(*microBatchInputs.ids, microBatchInputs.lengths, microBatchInputs.packed, beamWidth,
             mDecoderMaxAttentionWindow, mDecoderSinkTokenLength, mDecoderMaxSequenceLength, manager);
-        buffers.reshape(mModelConfig, mWorldConfig);
+        buffers.reshape(kvCacheManager, mModelConfig, mWorldConfig);
         buffers.reset(manager);
     }
 
@@ -745,8 +739,6 @@ void GptSession::generateBatched(std::vector<GenerationOutput>& microBatchesOutp
             instance.clear();
         }
     }
-
-    auto kvCacheManager = mModelConfig.usePagedKvCache() ? mKvCacheManager.get() : nullptr;
 
     auto const profileContext = !kProfileMbIdxs.empty() && kProfileMbIdxs.count(0) > 0;
     if (profileContext)

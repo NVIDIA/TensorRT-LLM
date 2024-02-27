@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/cudaAllocator.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/decodingInput.h"
 #include "tensorrt_llm/runtime/decodingMode.h"
@@ -24,7 +23,6 @@
 #include "tensorrt_llm/runtime/samplingConfig.h"
 #include <curand_kernel.h>
 
-#include <cstdint>
 #include <memory>
 
 #include <NvInferRuntime.h>

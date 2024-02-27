@@ -302,6 +302,8 @@ public:
     void allgather(const void* sendbuf, void* recvbuf, int count, MpiType dtype) const;
     void barrier() const;
 
+    void mprobe(int source, int tag, MPI_Message* msg, MPI_Status* status) const;
+
     bool operator==(MpiComm const& rhs) const
     {
         return mComm == rhs.mComm;

@@ -6,7 +6,7 @@ In this example, we will introduce the usage of the PluginGen tool and demonstra
 
 
 To use the feature, you need a Triton version posterior to the [d0c35b3](https://github.com/openai/triton/commit/d0c35b3b7d6badf0c0d56a821dddab7ace73b4de) commit
-and this example has been tested on the [b43c28f](https://github.com/openai/triton/tree/b43c28fdd7a2f95b2e87180cba5d984732120d5c) commit.
+and this example has been tested on the [d4644d6](https://github.com/openai/triton/tree/d4644d6cb3ae674e1f15932cac1f28104795744f) commit.
 
 ## Introduction to the PluginGen Toolkit
 
@@ -49,14 +49,14 @@ In this section, we will demonstrate the integration of the Fused Attention kern
 
 ### Pre-Stage: Install Triton with a Specific Version
 
-In case the Triton AOT tool's update breaks compatibility, we recommend installing a specific version of Triton. The commit we tested is [b43c28f](https://github.com/openai/triton/tree/b43c28fdd7a2f95b2e87180cba5d984732120d5c).
+In case the Triton AOT tool's update breaks compatibility, we recommend installing a specific version of Triton. The commit we tested is [d4644d6](https://github.com/openai/triton/tree/d4644d6cb3ae674e1f15932cac1f28104795744f).
 
 Install Triton with the following commands:
 
 ```sh
 git clone https://github.com/openai/triton
 cd triton/python/
-pip install cmake && pip install -e .
+pip install cmake && pip install .
 cd -
 ```
 

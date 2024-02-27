@@ -217,7 +217,8 @@ class TestBloom(unittest.TestCase):
                                            dtype=torch.int32).cuda()
         ctx_host_past_key_value_lengths = torch.tensor([0] * batch_size,
                                                        dtype=torch.int32)
-        host_max_attention_window_sizes = torch.tensor([total_length],
+        host_max_attention_window_sizes = torch.tensor([total_length] *
+                                                       bloom_config.n_layer,
                                                        dtype=torch.int32)
         host_sink_token_length = torch.tensor([0], dtype=torch.int32)
 
@@ -263,16 +264,20 @@ class TestBloom(unittest.TestCase):
 
         ctx_shape = {k: v.shape for k, v in ctx_buffer.items()}
 
+        ctx_shape.update(
+            {f'host_max_attention_window_sizes': (bloom_config.n_layer, )})
+        ctx_buffer.update({
+            f'host_max_attention_window_sizes':
+            host_max_attention_window_sizes
+        })
+
         for i in range(bloom_config.n_layer):
             shape = (batch_size, 2, bloom_config.n_head, 0,
                      bloom_config.hidden_size // bloom_config.n_head)
             past_buffer = torch.zeros((1, ),
                                       dtype=str_dtype_to_torch(dtype),
                                       device='cuda')
-            ctx_shape.update({
-                f'past_key_value_{i}': shape,
-                f'host_max_attention_window_size_{i}': (1, ),
-            })
+            ctx_shape.update({f'past_key_value_{i}': shape})
             shape = (batch_size, 2, bloom_config.n_head, seq_len,
                      bloom_config.hidden_size // bloom_config.n_head)
             ctx_buffer.update({
@@ -282,8 +287,6 @@ class TestBloom(unittest.TestCase):
                 torch.zeros(shape,
                             dtype=str_dtype_to_torch(dtype),
                             device='cuda'),
-                f'host_max_attention_window_size_{i}':
-                host_max_attention_window_sizes,
             })
 
         context = runtime.ctx_context
@@ -320,8 +323,6 @@ class TestBloom(unittest.TestCase):
         gen_host_past_key_value_lengths = torch.tensor([seq_len + step - 1] *
                                                        batch_size,
                                                        dtype=torch.int32)
-        gen_host_max_attention_window_sizes = torch.tensor([total_length],
-                                                           dtype=torch.int32)
         gen_host_sink_token_length = torch.tensor([0], dtype=torch.int32)
         step1_buffer = {
             'input_ids': gen_id,
@@ -345,19 +346,19 @@ class TestBloom(unittest.TestCase):
 
         step1_shape = {k: v.shape for k, v in step1_buffer.items()}
 
+        step1_shape.update(
+            {f'host_max_attention_window_sizes': (bloom_config.n_layer, )})
+        step1_buffer.update({
+            f'host_max_attention_window_sizes':
+            host_max_attention_window_sizes
+        })
+
         for i in range(bloom_config.n_layer):
             shape = (batch_size, 2, bloom_config.n_head, seq_len,
                      bloom_config.hidden_size // bloom_config.n_head)
-            step1_shape.update({
-                f'past_key_value_{i}': shape,
-                f'host_max_attention_window_size_{i}': (1, ),
-            })
-            step1_buffer.update({
-                f'past_key_value_{i}':
-                ctx_buffer[f'present_key_value_{i}'],
-                f'host_max_attention_window_size_{i}':
-                host_max_attention_window_sizes,
-            })
+            step1_shape.update({f'past_key_value_{i}': shape})
+            step1_buffer.update(
+                {f'past_key_value_{i}': ctx_buffer[f'present_key_value_{i}']})
 
         context = runtime.context_1
         runtime._set_shape(context, step1_shape)

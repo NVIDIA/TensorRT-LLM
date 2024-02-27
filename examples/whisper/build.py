@@ -60,6 +60,17 @@ def parse_arguments():
                         choices=[
                             "large-v3",
                             "large-v2",
+                            "medium",
+                            "small",
+                            "base",
+                            "tiny",
+                            "medium.en",
+                            "small.en",
+                            "base.en",
+                            "tiny.en",
+                            "distil-large-v2",
+                            "distil-medium.en",
+                            "distil-small.en",
                         ])
     parser.add_argument('--quantize_dir', type=str, default="quantize/1-gpu")
     parser.add_argument('--dtype',
@@ -225,7 +236,7 @@ def build_encoder(model, args):
         network.plugin_config.set_context_fmha(ContextFMHAType.enabled)
     if args.remove_input_padding:
         network.plugin_config.enable_remove_input_padding()
-    if args.use_weight_only:
+    if use_gemm_woq_plugin:
         network.plugin_config.set_weight_only_quant_matmul_plugin(
             dtype=args.dtype)
 
@@ -335,7 +346,7 @@ def build_decoder(model, args):
         network.plugin_config.set_context_fmha(ContextFMHAType.enabled)
     if args.remove_input_padding:
         network.plugin_config.enable_remove_input_padding()
-    if args.use_weight_only:
+    if use_gemm_woq_plugin:
         network.plugin_config.set_weight_only_quant_matmul_plugin(
             dtype=args.dtype)
 

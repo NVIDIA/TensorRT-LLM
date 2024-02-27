@@ -34,6 +34,7 @@ class PhiDecoderLayer(Module):
                                          dtype=config.dtype)
 
         self.attention = Attention(
+            layer_idx=layer_idx,
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
             rotary_embedding_percentage=config.partial_rotary_factor,
@@ -44,14 +45,16 @@ class PhiDecoderLayer(Module):
             attention_mask_type=AttentionMaskType.causal,
             bias=True,
             tp_group=tp_group,
-            tp_size=tp_size)
+            tp_size=tp_size,
+            quant_mode=config.quant_mode)
 
         self.mlp = MLP(hidden_size=config.hidden_size,
                        ffn_hidden_size=config.intermediate_size,
                        hidden_act=config.hidden_act,
                        dtype=config.dtype,
                        tp_group=tp_group,
-                       tp_size=tp_size)
+                       tp_size=tp_size,
+                       quant_mode=config.quant_mode)
 
     def forward(
         self,

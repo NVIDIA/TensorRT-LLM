@@ -14,9 +14,6 @@
  * limitations under the License.
  */
 
-#include <algorithm>
-#include <random>
-
 #include <gmock/gmock-matchers.h>
 #include <gtest/gtest.h>
 
@@ -26,6 +23,8 @@
 #include "tensorrt_llm/runtime/gptModelConfig.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
+
+#include <algorithm>
 
 using namespace tensorrt_llm::runtime;
 
@@ -181,7 +180,7 @@ void verifyResults(BufferManager& manager, GptDecoderBatch const& decoder,
 void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig> const& samplingConfigs,
     SizeType maxBeamWidth, bool computeLogProbs, bool normalizeLogProbs)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     SizeType constexpr tensorParallelism{1};
     SizeType constexpr pipelineParallelism{1};
     SizeType constexpr localRank{0};
@@ -298,7 +297,7 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig> con
 void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingConfig> const& samplingConfigs,
     SizeType maxBeamWidth, bool computeLogProbs)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     SizeType constexpr tensorParallelism{1};
     SizeType constexpr pipelineParallelism{1};
     SizeType constexpr localRank{0};
@@ -417,7 +416,7 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
     SizeType maxBeamWidth, std::vector<SizeType> const& generatedTokensPerSteps,
     std::vector<SizeType> const& acceptedTokensPerStep, SizeType maxGeneratedTokensPerStep)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     TLLM_CHECK(maxBeamWidth == 1);
 

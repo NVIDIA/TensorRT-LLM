@@ -1,5 +1,6 @@
 import pickle  # nosec B403
 import socket
+import sys
 import threading
 import time
 from concurrent.futures import Future
@@ -71,7 +72,8 @@ class MpiSession:
     def _start(self):
         assert not self.mpi_pool, 'MPI session already started'
 
-        self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers)
+        self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
+                                        path=sys.path)
 
     @property
     def async_enabled(self) -> bool:
@@ -83,7 +85,8 @@ class MpiSession:
     def _start_mpi_pool(self):
         assert not self.mpi_pool, 'MPI session already started'
 
-        self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers)
+        self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
+                                        path=sys.path)
 
     def __del__(self):
         self.shutdown()

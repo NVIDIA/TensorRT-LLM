@@ -20,10 +20,7 @@
 #include <gtest/gtest.h>
 
 #include "tensorrt_llm/common/cudaAllocator.h"
-#include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/tensor.h"
-#include "tensorrt_llm/common/tensorConversion.h"
-#include "tensorrt_llm/kernels/decodingKernels.h"
 #include "tensorrt_llm/layers/dynamicDecodeLayer.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"

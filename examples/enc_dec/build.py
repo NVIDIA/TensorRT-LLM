@@ -260,6 +260,13 @@ def parse_arguments(component):
         help=
         'Skip building encoder for nougat model. Encoder is not an LLM in nougat'
     )
+    parser.add_argument(
+        '--use_lora_plugin',
+        nargs='?',
+        const=None,
+        default=False,
+        choices=['float16', 'float32', 'bfloat16'],
+        help='Activates the lora plugin which enables embedding sharing.')
 
     # parse cmdline args
     args = parser.parse_args()
@@ -279,7 +286,7 @@ def parse_arguments(component):
 
     plugins_args = [
         'use_bert_attention_plugin', 'use_gpt_attention_plugin',
-        'use_gemm_plugin', 'use_lookup_plugin'
+        'use_gemm_plugin', 'use_lora_plugin', 'use_lookup_plugin'
     ]
     for plugin_arg in plugins_args:
         if getattr(args, plugin_arg) is None:
@@ -347,7 +354,8 @@ def build_rank_engine(builder: Builder,
             use_parallel_embedding=args.use_parallel_embedding,
             embedding_sharding_dim=args.embedding_sharding_dim,
             mapping=mapping,
-            fp16_clamping=fp16_clamping)
+            fp16_clamping=fp16_clamping,
+            max_lora_rank=args.max_lora_rank if args.use_lora_plugin else 0)
     elif args.component == 'decoder':
         tllm_model = tensorrt_llm.models.DecoderModel(
             num_layers=args.n_layer,
@@ -378,6 +386,7 @@ def build_rank_engine(builder: Builder,
             mlp_type=args.mlp_type,
             use_parallel_embedding=args.use_parallel_embedding,
             embedding_sharding_dim=args.embedding_sharding_dim,
+            max_lora_rank=args.max_lora_rank if args.use_lora_plugin else 0,
             mapping=mapping,
             rescale_before_lm_head=args.rescale_before_lm_head,
             dtype=dtype,
@@ -424,6 +433,8 @@ def build_rank_engine(builder: Builder,
     if args.use_lookup_plugin:
         # Use the plugin for the embedding parallelism and sharding
         network.plugin_config.set_lookup_plugin(dtype=args.dtype)
+    if args.use_lora_plugin:
+        network.plugin_config.set_lora_plugin(dtype=args.use_lora_plugin)
     if args.world_size > 1:
         network.plugin_config.set_nccl_plugin(args.dtype,
                                               args.use_custom_all_reduce)
@@ -439,6 +450,8 @@ def build_rank_engine(builder: Builder,
                 max_input_len=args.max_encoder_input_len,
                 prompt_embedding_table_size=args.
                 max_prompt_embedding_table_size,
+                lora_target_modules=args.lora_target_modules
+                if args.use_lora_plugin else None,
             )
         elif args.component == 'decoder':
             inputs = tllm_model.prepare_inputs(
@@ -448,7 +461,10 @@ def build_rank_engine(builder: Builder,
                 max_new_tokens=args.max_output_len,
                 max_encoder_input_len=args.max_encoder_input_len,
                 gather_context_logits=args.gather_context_logits,
-                gather_generation_logits=args.gather_generation_logits)
+                gather_generation_logits=args.gather_generation_logits,
+                lora_target_modules=args.lora_target_modules
+                if args.use_lora_plugin else None,
+            )
 
         tllm_model(*inputs)
 
@@ -511,7 +527,14 @@ def build(rank, args):
             gather_generation_logits=args.gather_generation_logits,
             max_prompt_embedding_table_size=(
                 args.max_prompt_embedding_table_size
-                if args.component == 'encoder' else 0))
+                if args.component == 'encoder' else 0),
+            lora_target_modules=args.lora_target_modules
+            if args.use_lora_plugin else None,
+            hf_modules_to_trtllm_modules=args.hf_modules_to_trtllm_modules
+            if args.use_lora_plugin else None,
+            trtllm_modules_to_hf_modules=args.trtllm_modules_to_hf_modules
+            if args.use_lora_plugin else None,
+        )
 
         engine_name = get_engine_name(args.engine_name, args.dtype,
                                       args.tp_size, args.pp_size, cur_rank)

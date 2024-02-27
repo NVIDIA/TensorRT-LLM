@@ -53,6 +53,7 @@ struct XQAParams
     // almost copy from GPTAttentionPluginCommon.
     // maybe use one struct for parameters in GPTAttentionPluginCommon and share the same here.
     int32_t generation_input_length;
+    int32_t layer_idx = 0;
     int32_t num_q_heads = 0;
     int32_t num_kv_heads = 0;
     int32_t head_size = 0;

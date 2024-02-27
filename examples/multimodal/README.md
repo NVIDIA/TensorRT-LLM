@@ -4,6 +4,8 @@ This document shows how to run multimodal pipelines with TensorRT-LLM, e.g. from
 
 Multimodal models' LLM part has an additional parameter `--max_multimodal_len` compared to LLM-only build commands. Under the hood, `max_multimodal_len` and `max_prompt_embedding_table_size` are effectively the same concept, i.e., prepended/concatenated embeddings (either multimodal feature embeddings or prompt tuning embeddings) to the LLM input embeddings. The multimodal features from the visual encoder of shape `[batch_size, num_visual_features, visual_hidden_dim]` is flattened as `[batch_size * num_visual_features, visual_hidden_dim]` and passed like a prompt embedding table.
 
+We first describe how to run each model on a single GPU. We then provide general guidelines on using tensor parallelism for LLM part of the pipeline.
+
 ## BLIP2-T5
 
 1. Download Huggingface weights and convert original checkpoint to TRT-LLM checkpoint format
@@ -129,7 +131,7 @@ OPT pipeline needs few minor changes from T5 pipeline
     The built OPT engines lie in `trt_engines/${MODEL_NAME}/int4_weightonly/1-gpu`.
     You should use this directory as `--llm_engine_dir` argument to `run.py`
 
-    **NOTE:** INT8/INT4 option is not supported for BLIP2-T5, because quantization support has not be
+    **NOTE:** INT8/INT4 option is not supported for BLIP2-T5, because quantization support has not been
           added for encoder-decoder models yet.
 
 ## LLaVA
@@ -153,7 +155,6 @@ OPT pipeline needs few minor changes from T5 pipeline
     trtllm-build \
         --checkpoint_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu \
         --output_dir trt_engines/${MODEL_NAME}/fp16/1-gpu \
-        --gpt_attention_plugin float16 \
         --gemm_plugin float16 \
         --max_batch_size 1 \
         --max_input_len 2048 \
@@ -191,7 +192,6 @@ OPT pipeline needs few minor changes from T5 pipeline
     trtllm-build \
         --checkpoint_dir tmp/trt_models/${MODEL_NAME}/int4_weightonly/1-gpu \
         --output_dir trt_engines/${MODEL_NAME}/int4_weightonly/1-gpu \
-        --gpt_attention_plugin float16 \
         --gemm_plugin float16 \
         --max_batch_size 1 \
         --max_input_len 924 \
@@ -201,6 +201,10 @@ OPT pipeline needs few minor changes from T5 pipeline
 
     The built engines lie in `trt_engines/${MODEL_NAME}/int4_weightonly/1-gpu`.
     You should use this directory as `--llm_engine_dir` argument to `run.py`
+
+6. One can use LLaVA with other quantization options, like SmoothQuant and INT4 AWQ, that are supported by LLaMA.
+   Instructions in [../llama/README.md](../llama/README.md) to enable SmoothQuant and INT4 AWQ can be re-used to generate
+   quantized TRT engines for LLM component of LLaVA.
 
 ## Nougat
 
@@ -248,4 +252,43 @@ OPT pipeline needs few minor changes from T5 pipeline
         --visual_engine_dir visual_engines/${MODEL_NAME} \
         --llm_engine_dir trt_engines/${MODEL_NAME}/1-gpu/bfloat16/tp1 \
         --nougat
+    ```
+
+## Enabling tensor parallelism for multi-GPU
+
+The LLM part of the pipeline can be run on multiple GPUs using tensor parallelism.
+The visual encoder will be replicated on each GPU and operate in a data parallel fashion.
+
+To enable tensor parallelism, both weight conversion step (from Huggingface to FT format)
+and engine building step should use additional arguments. Finally `run.py` should be prefixed
+with `mpirun -n NUM_GPUS --allow-run-as-root`.
+
+The full set of commands to enable 2-way tensor parallelism for LLaVA is:
+
+    ```bash
+    export MODEL_NAME="llava-1.5-7b-hf"
+
+    python ../llama/convert_checkpoint.py \
+        --model_dir tmp/hf_models/${MODEL_NAME} \
+        --output_dir tmp/trt_models/${MODEL_NAME}/fp16/2-gpu \
+        --dtype float16 --tp_size 2
+
+    trtllm-build \
+        --checkpoint_dir tmp/trt_models/${MODEL_NAME}/fp16/2-gpu \
+        --output_dir trt_engines/${MODEL_NAME}/fp16/2-gpu \
+        --gemm_plugin float16 \
+        --max_batch_size 1 \
+        --max_input_len 2048 \
+        --max_output_len 512 \
+        --max_multimodal_len 576
+
+    python build_visual_engine.py --model_name ${MODEL_NAME} --model_path tmp/hf_models/${MODEL_NAME}
+
+    mpirun -n 2 --allow-run-as-root \
+        python run.py \
+        --max_new_tokens 30 \
+        --hf_model_dir tmp/hf_models/${MODEL_NAME} \
+        --visual_engine_dir visual_engines/${MODEL_NAME} \
+        --llm_engine_dir trt_engines/${MODEL_NAME}/fp16/2-gpu \
+        --decoder_llm
     ```

@@ -36,8 +36,8 @@ class GPTAttentionPluginCommon : public BasePlugin
 public:
     GPTAttentionPluginCommon() = delete;
 
-    GPTAttentionPluginCommon(int num_heads, int num_kv_heads, int head_size, int unidirectional, float q_scaling,
-        tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
+    GPTAttentionPluginCommon(int layer_idx, int num_heads, int num_kv_heads, int head_size, int unidirectional,
+        float q_scaling, tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
         int rotary_embedding_dim, // for RoPE. Use 0 for non-RoPE
         float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
         float rotary_embedding_scale, int rotary_embedding_max_positions, int tp_size, int tp_rank, // for ALiBi
@@ -213,6 +213,7 @@ protected:
 
     const std::string mLayerName;
 
+    int mLayerIdx;
     int mNumHeads;
     int mNumKVHeads;
     int mHeadSize;

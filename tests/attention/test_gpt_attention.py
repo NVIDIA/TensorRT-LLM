@@ -569,6 +569,7 @@ class TestFunctional(unittest.TestCase):
                     context_lengths=context_lengths_tensor,
                     cache_indirection=cache_indirection_tensor,
                     host_request_types=host_request_types_tensor,
+                    layer_idx=0,
                     num_heads=num_heads,
                     num_kv_heads=num_kv_heads,
                     hidden_size_per_head=head_size,
@@ -1019,7 +1020,7 @@ class TestFunctional(unittest.TestCase):
             pointer_array = None
             if paged_kv_cache:
                 # Get arrays of pointers to the "pages" of KV values
-                pointer_array = manager.get_pointer_arrays(beam_width)[0]
+                pointer_array = manager.get_block_pointers(beam_width)[0]
 
             if step == 0:
                 host_request_types = torch.tensor([0] * batch_size,

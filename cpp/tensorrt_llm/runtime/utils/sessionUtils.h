@@ -64,6 +64,8 @@ void insertTensorVector(StringPtrMap<ITensor>& map, std::string const& key, std:
 void insertTensorSlices(
     StringPtrMap<ITensor>& map, std::string const& key, ITensor::SharedPtr const& tensor, SizeType indexOffset);
 
+void printTensorMap(std::ostream& stream, StringPtrMap<ITensor> const& map);
+
 void setRawPointers(ITensor& pointers, ITensor::SharedPtr const& input, int32_t pointersSlot, int32_t inputSlot);
 
 void setRawPointers(ITensor& pointers, ITensor::SharedPtr const& input);

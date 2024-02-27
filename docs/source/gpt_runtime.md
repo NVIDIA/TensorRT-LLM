@@ -398,7 +398,11 @@ sequences. If both `topK` and `topP` are zero, greedy search is performed.
    penalized by a factor that depends on `1.f / (length ^ lengthPenalty)`). The
    default is value `0.f`. The parameter `lengthPenalty` may be renamed to
    `beamSearchLengthPenalty` in a future release,
-
+ * `earlyStopping`, a integer value that controls whether the generation process
+   finishes once `beamWidth` sentences are generated (end up with end_token).
+   Default value 1 means earlyStopping is enabled, value 0 means earlyStopping
+   is disable, other values  means the generation process is depended on
+   `length_penalty`.
 The `beamWidth` parameter is a scalar value. It means that in this release of
 TensorRT-LLM, it is not possible to specify a different width for each input
 sequence. This limitation is likely to be removed in a future release.

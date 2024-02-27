@@ -29,7 +29,7 @@ from transformers import (AutoConfig, AutoModelForSeq2SeqLM, AutoTokenizer,
 import tensorrt_llm
 from tensorrt_llm import logger
 from tensorrt_llm._utils import torch_to_numpy, trt_dtype_to_torch
-from tensorrt_llm.runtime import ModelConfig, SamplingConfig
+from tensorrt_llm.runtime import LoraManager, ModelConfig, SamplingConfig
 
 
 def get_engine_name(model, dtype, tp_size, pp_size, rank):
@@ -61,6 +61,7 @@ def read_config(config_path: Path):
     plugin_config = config['plugin_config']
     use_gpt_attention_plugin = plugin_config["gpt_attention_plugin"]
     remove_input_padding = plugin_config["remove_input_padding"]
+    use_lora_plugin = plugin_config["lora_plugin"]
     tp_size = builder_config['tensor_parallel']
     pp_size = builder_config['pipeline_parallel']
     gpus_per_node = builder_config['gpus_per_node']
@@ -112,7 +113,14 @@ def read_config(config_path: Path):
         dtype=dtype,
         gather_context_logits=gather_context_logits,
         gather_generation_logits=gather_generation_logits,
-        max_prompt_embedding_table_size=max_prompt_embedding_table_size)
+        max_prompt_embedding_table_size=max_prompt_embedding_table_size,
+        lora_plugin=use_lora_plugin,
+        lora_target_modules=builder_config.get('lora_target_modules'),
+        hf_modules_to_trtllm_modules=builder_config.get(
+            'hf_modules_to_trtllm_modules'),
+        trtllm_modules_to_hf_modules=builder_config.get(
+            'trtllm_modules_to_hf_modules'),
+    )
 
     return model_config, tp_size, pp_size, gpus_per_node, dtype
 
@@ -137,16 +145,23 @@ def parse_arguments():
     parser.add_argument("--compare_hf_fp32",
                         help="Compare results with HuggingFace FP32",
                         action='store_true')
+    parser.add_argument('--lora_dir', type=str, default=None)
+    parser.add_argument('--lora_task_uids', type=str, default=None, nargs="+")
     return parser.parse_args()
 
 
 class TRTLLMEncDecModel:
 
-    def __init__(self,
-                 engine_name,
-                 engine_dir,
-                 debug_mode=False,
-                 skip_encoder=False):
+    def __init__(
+        self,
+        engine_name,
+        engine_dir,
+        lora_dir=None,
+        lora_task_uids=None,
+        debug_mode=False,
+        skip_encoder=False,
+        stream: torch.cuda.Stream = None,
+    ):
         # in multi-node setup, it's important to set_device at the very beginning so .to('cuda') refers to current device
         # accordingly, all input & output tensors should be moved to current device
         # otherwise, it's default to 'cuda:0'
@@ -155,6 +170,14 @@ class TRTLLMEncDecModel:
         torch.cuda.set_device(device_id)
         self.device = torch.cuda.current_device()
         self.skip_encoder = skip_encoder
+        self.lora_task_uids = lora_task_uids
+
+        # when enc-dec runs by itself, stream can be None and we create new stream here
+        # when enc-dec has to run as a component in a bigger workflow (e.g., multimodal), earlier components in the workflow may have results in its stream, which we should pass that stream in to avoid unnecessary stream sync
+        self.stream = stream
+        if self.stream is None:
+            self.stream = torch.cuda.Stream(self.device)
+        torch.cuda.set_stream(self.stream)
 
         engine_dir = Path(engine_dir)
 
@@ -198,6 +221,19 @@ class TRTLLMEncDecModel:
             # session setup
             self.encoder_session = tensorrt_llm.runtime.Session.from_serialized_engine(
                 encoder_engine_buffer)
+
+            # encoder lora manager setup
+            if self.encoder_model_config.lora_plugin:
+                self.encoder_lora_manager = LoraManager()
+                # TODO: this is only for bart
+                self.encoder_lora_manager.load_from_hf_bart(
+                    component='encoder',
+                    model_dirs=[lora_dir],
+                    model_config=self.encoder_model_config,
+                    runtime_mapping=self.encoder_runtime_mapping,
+                )
+            else:
+                self.encoder_lora_manager = None
         else:
             self.encoder_model_config, self.encoder_runtime_mapping, encoder_engine_buffer = None, None, None
             self.nccl_comm, self.encoder_session = None, None
@@ -209,18 +245,36 @@ class TRTLLMEncDecModel:
             decoder_engine_buffer,
             self.decoder_runtime_mapping,
             debug_mode=debug_mode)
-        self.stream = torch.cuda.current_stream().cuda_stream
+
+        # decoder lora manager setup
+        if self.decoder_model_config.lora_plugin:
+            self.decoder_lora_manager = LoraManager()
+            # TODO: this is only for bart
+            self.decoder_lora_manager.load_from_hf_bart(
+                component='decoder',
+                model_dirs=[lora_dir],
+                model_config=self.decoder_model_config,
+                runtime_mapping=self.decoder_runtime_mapping,
+            )
+        else:
+            self.decoder_lora_manager = None
 
     @classmethod
     def from_engine(cls,
                     engine_name,
                     engine_dir,
+                    lora_dir=None,
+                    lora_task_uids=None,
                     debug_mode=False,
-                    skip_encoder=False):
+                    skip_encoder=False,
+                    stream=None):
         return cls(engine_name,
                    engine_dir,
+                   lora_dir,
+                   lora_task_uids,
                    debug_mode=debug_mode,
-                   skip_encoder=skip_encoder)
+                   skip_encoder=skip_encoder,
+                   stream=stream)
 
     def process_input(self,
                       input_ids,
@@ -323,6 +377,47 @@ class TRTLLMEncDecModel:
             dtype=hidden_states_dtype('max_input_length'),
             device=self.device).contiguous()
 
+        if self.encoder_model_config.lora_plugin and self.encoder_lora_manager is not None:
+            missing_qkv_modules = []
+            if any(x in self.encoder_model_config.lora_target_modules
+                   for x in ["attn_q", "attn_k", "attn_v"]):
+                for lora_module in ["attn_q", "attn_k", "attn_v"]:
+                    if lora_module not in self.encoder_model_config.lora_target_modules:
+                        missing_qkv_modules.append(lora_module)
+
+            for layer_idx in range(self.encoder_model_config.num_layers):
+                for lora_module in (
+                        self.encoder_model_config.lora_target_modules +
+                        missing_qkv_modules):
+                    lora_ranks = []
+                    lora_ptrs = []
+                    for batch_idx in range(input_ids.shape[0]):
+                        lora_uid = self.lora_task_uids[batch_idx]
+                        if lora_uid is not None and lora_uid != "-1" and self.encoder_lora_manager.uid_to_low_ranks(
+                                lora_uid)[layer_idx][lora_module] != 0:
+                            lora_ranks.append(
+                                self.encoder_lora_manager.uid_to_low_ranks(
+                                    lora_uid)[layer_idx][lora_module])
+                            lora_ptrs.append(
+                                self.encoder_lora_manager.
+                                lora_weights_pointers_list[layer_idx][lora_uid]
+                                [lora_module])
+                        else:
+                            lora_ranks.append(0)
+                            lora_ptrs.append([0, 0])
+                    inputs.update({
+                        f'{lora_module}_lora_ranks_{layer_idx}':
+                        torch.IntTensor(lora_ranks),
+                    })
+                    inputs.update({
+                        f'{lora_module}_lora_weights_pointers_{layer_idx}':
+                        torch.LongTensor(lora_ptrs),
+                    })
+            inputs.update({
+                'host_request_types':
+                torch.IntTensor([0] * input_ids.shape[0]).to('cpu'),
+            })
+
         # Note: runtime.Session's run() method will set input/output tensor address, here we only need to provide tensor shape
         self.encoder_session.set_shapes(inputs)
 
@@ -358,10 +453,10 @@ class TRTLLMEncDecModel:
         # -------------------------------------------
 
         # TRT session run
-        ok = self.encoder_session.run(inputs, outputs, self.stream)
-
+        # Note: need cuda stream ID, not a torch Stream
+        ok = self.encoder_session.run(inputs, outputs, self.stream.cuda_stream)
         assert ok, "Runtime execution failed"
-        torch.cuda.synchronize()
+        self.stream.synchronize()
 
         # Tensor Parallelism is handled by model/engine definition
         # But we need to broadcast among PP group at the end of encoder's Pipeline Parallelism
@@ -491,8 +586,9 @@ class TRTLLMEncDecModel:
             num_beams,
             max_attention_window_size=None,
             encoder_max_input_length=encoder_max_input_length,
+            lora_manager=self.decoder_lora_manager,
+            lora_uids=self.lora_task_uids,
         )
-        torch.cuda.synchronize()
 
         output = self.decoder_session.decode(
             decoder_input_ids,
@@ -502,7 +598,6 @@ class TRTLLMEncDecModel:
             encoder_input_lengths=encoder_input_lengths,
             return_dict=return_dict,
             cross_attention_mask=cross_attention_mask)
-        torch.cuda.synchronize()
 
         return output
 
@@ -652,8 +747,12 @@ if __name__ == "__main__":
                 T5ForConditionalGeneration, BartForConditionalGeneration,
                 MBartForConditionalGeneration), 'Unsupported model!'
 
+            if args.lora_dir is not None:
+                from peft import PeftModel
+                hf_model = PeftModel.from_pretrained(
+                    hf_model, args.lora_dir).to('cuda').eval()
+
             tik = time.time()
-            # breakpoint()
             hf_gen_output = hf_model.generate(
                 input_ids=input_ids,
                 decoder_input_ids=decoder_input_ids,
@@ -695,6 +794,8 @@ if __name__ == "__main__":
     # TRT-LLM runtime
     tllm_model = TRTLLMEncDecModel.from_engine(args.engine_name,
                                                args.engine_dir,
+                                               args.lora_dir,
+                                               args.lora_task_uids,
                                                debug_mode=args.debug_mode)
 
     return_dict = False  # when set return_dict=True, get outputs by key

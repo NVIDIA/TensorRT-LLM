@@ -36,11 +36,11 @@ class Module(object):
         unique_name = current_net._module_call_stack.get_mod_name(self)
         with current_net._module_call_stack.call_stack_mgr() as stack:
             stack.append(unique_name)
-            start_layer_id = current_net.trt_network.num_layers
+            start_layer_idx = current_net.trt_network.num_layers
             output = self.forward(*args, **kwargs)
-            end_layer_id = current_net.trt_network.num_layers
+            end_layer_idx = current_net.trt_network.num_layers
             current_net._module_call_stack.set_layer_range(
-                self, range(start_layer_id, end_layer_id))
+                self, range(start_layer_idx, end_layer_idx))
             return output
 
     def __getattr__(self, name):
@@ -110,11 +110,7 @@ class Module(object):
                 memo.add(module)
                 yield name, module
 
-    def _named_members(self,
-                       get_members_fn,
-                       prefix='',
-                       recurse=True,
-                       with_cls=False):
+    def _named_members(self, get_members_fn, prefix='', recurse=True):
         memo = set()
         modules = self.named_modules(prefix=prefix) if recurse else [(prefix,
                                                                       self)]
@@ -125,10 +121,7 @@ class Module(object):
                     continue
                 memo.add(v)
                 name = module_prefix + ('.' if module_prefix else '') + k
-                if with_cls:
-                    yield name, module.__class__, v
-                else:
-                    yield name, v
+                yield name, v
 
     def parameter(self, recurse=True):
         for name, param in self.named_parameters():
@@ -138,14 +131,6 @@ class Module(object):
         gen = self._named_members(lambda module: module._parameters.items(),
                                   prefix=prefix,
                                   recurse=recurse)
-        for elem in gen:
-            yield elem
-
-    def named_parameters_with_cls(self, prefix='', recurse=True):
-        gen = self._named_members(lambda module: module._parameters.items(),
-                                  prefix=prefix,
-                                  recurse=recurse,
-                                  with_cls=True)
         for elem in gen:
             yield elem
 

@@ -37,6 +37,11 @@ class LoraConfig(object):
         "mlp_h_to_4h": 5,
         "mlp_4h_to_h": 6,
         "mlp_gate": 7,
+        "cross_attn_qkv": 8,
+        "cross_attn_q": 9,
+        "cross_attn_k": 10,
+        "cross_attn_v": 11,
+        "cross_attn_dense": 12,
     }
 
     def __init__(self,
@@ -54,9 +59,14 @@ class LoraConfig(object):
         self.adapter_config = adapter_config
         self.tokenizer_config = tokenizer_config
         self.hf_lora_target_modules = lora_target_modules
-        self.lora_target_modules = [
-            hf_modules_to_trtllm_modules[m] for m in lora_target_modules
-        ]
+        self.lora_target_modules = []
+        # lora_target_modules[m] can ba either a string or a list of strings
+        for m in lora_target_modules:
+            trtllm_module = hf_modules_to_trtllm_modules[m]
+            if isinstance(trtllm_module, list):
+                self.lora_target_modules.extend(trtllm_module)
+            else:
+                self.lora_target_modules.append(trtllm_module)
         self.is_valid = is_valid
         self.has_tokenizer = has_tokenizer
         self.lm_head_weight = lm_head_weight
@@ -388,6 +398,188 @@ class LoraManager(object):
                         # not split
                         t_out = lora_model[
                             f"{prefix}.{layer_idx}.mlp.down_proj.lora_B.weight"]
+
+                    t_in = t_in.cuda().contiguous()
+                    t_out = t_out.cuda().contiguous()
+                    scale = float(hf_config["lora_alpha"] / hf_config["r"])
+                    t_out = t_out * scale
+                    t_in = t_in.float().to(str_dtype_to_torch(dtype))
+                    t_out = t_out.float().to(str_dtype_to_torch(dtype))
+                    self._lora_weights_pointers_list[layer_idx][uid].update(
+                        {lora_module: [t_in.data_ptr(),
+                                       t_out.data_ptr()]})
+
+                    assert t_in.shape[0] == int(hf_config["r"])
+                    self._lora_uid_to_low_ranks[uid][layer_idx][
+                        lora_module] = int(hf_config["r"])
+
+                    # prevent torch free this buffer
+                    self._lora_weights.append(t_in)
+                    self._lora_weights.append(t_out)
+                    self._lora_cpp_weights[uid].append(
+                        torch.concatenate([t_in.flatten(),
+                                           t_out.flatten()]))
+                    self._lora_weight_config[uid].append(
+                        np.array([
+                            LoraConfig.LORA_MODULE_IDS[lora_module], layer_idx,
+                            int(hf_config['r'])
+                        ],
+                                 dtype=np.int32))
+
+        del lora_model
+
+    def load_from_hf_bart(self, component, model_dirs, model_config,
+                          runtime_mapping):
+        '''
+        lora config of https://huggingface.co/sooolee/bart-large-cnn-samsum-lora
+        {
+            "base_model_name_or_path": "facebook/bart-large-cnn",
+            "bias": "none",
+            "fan_in_fan_out": false,
+            "inference_mode": true,
+            "init_lora_weights": true,
+            "lora_alpha": 32,
+            "lora_dropout": 0.05,
+            "modules_to_save": null,
+            "peft_type": "LORA",
+            "r": 8,
+            "target_modules": [
+                "q_proj",
+                "v_proj"
+            ],
+            "task_type": "SEQ_2_SEQ_LM"
+        }
+
+        For encoder, the trtllm target_modules are
+            ['attn_q', 'attn_v']
+
+        For decoder, the trtllm target_modules are
+            ['attn_q', 'cross_attn_q',
+             'attn_v', 'cross_attn_v']
+
+        keys in adapter_model.bin:
+            base_model.model.model.encoder.layers.0.self_attn.v_proj.lora_A.weight torch.Size([8, 1024])
+            base_model.model.model.encoder.layers.0.self_attn.v_proj.lora_B.weight torch.Size([1024, 8])
+            base_model.model.model.encoder.layers.0.self_attn.q_proj.lora_A.weight torch.Size([8, 1024])
+            base_model.model.model.encoder.layers.0.self_attn.q_proj.lora_B.weight torch.Size([1024, 8])
+            base_model.model.model.encoder.layers.1.self_attn.v_proj.lora_A.weight torch.Size([8, 1024])
+            ...
+            base_model.model.model.encoder.layers.11.self_attn.q_proj.lora_B.weight torch.Size([1024, 8])
+            base_model.model.model.decoder.layers.0.self_attn.v_proj.lora_A.weight torch.Size([8, 1024])
+            base_model.model.model.decoder.layers.0.self_attn.v_proj.lora_B.weight torch.Size([1024, 8])
+            base_model.model.model.decoder.layers.0.self_attn.q_proj.lora_A.weight torch.Size([8, 1024])
+            base_model.model.model.decoder.layers.0.self_attn.q_proj.lora_B.weight torch.Size([1024, 8])
+            base_model.model.model.decoder.layers.0.encoder_attn.v_proj.lora_A.weight torch.Size([8, 1024])
+            base_model.model.model.decoder.layers.0.encoder_attn.v_proj.lora_B.weight torch.Size([1024, 8])
+            base_model.model.model.decoder.layers.0.encoder_attn.q_proj.lora_A.weight torch.Size([8, 1024])
+            base_model.model.model.decoder.layers.0.encoder_attn.q_proj.lora_B.weight torch.Size([1024, 8])
+            base_model.model.model.decoder.layers.1.self_attn.v_proj.lora_A.weight torch.Size([8, 1024])
+            base_model.model.model.decoder.layers.1.self_attn.v_proj.lora_B.weight torch.Size([1024, 8])
+            ...
+            base_model.model.model.decoder.layers.11.encoder_attn.q_proj.lora_A.weight torch.Size([8, 1024])
+            base_model.model.model.decoder.layers.11.encoder_attn.q_proj.lora_B.weight torch.Size([1024, 8])
+        '''
+        tp_size = runtime_mapping.tp_size
+        tp_rank = runtime_mapping.tp_rank
+
+        lora_hf_configs = [{}]
+        ranks = [0]
+        uids = ["-1"]
+        for i, model_dir in enumerate(model_dirs):
+            with open(f"{model_dir}/adapter_config.json", 'r') as f:
+                config = json.load(f)
+                lora_hf_configs.append(config)
+                ranks.append(config["r"])
+                uids.append(str(i))
+        new_model_dirs = [""] + model_dirs
+
+        # Note: lora_target_modules are trtllm_modules
+        # encoder: ['attn_q', 'attn_v']
+        # decoder: ['attn_q', 'cross_attn_q', 'attn_v', 'cross_attn_v']
+        lora_target_modules = model_config.lora_target_modules
+        dtype = model_config.dtype
+
+        # In current design, q_lora_params, k_lora_params and v_lora_params should be all enabled or all disabled at the same time.
+        # However, BART lora modules only contain two of them, so we use zero tensor to fill the missing ones.
+        missing_qkv_modules = []
+        if any(x in lora_target_modules
+               for x in ["attn_q", "attn_k", "attn_v"]):
+            for lora_module in ["attn_q", "attn_k", "attn_v"]:
+                if lora_module not in lora_target_modules:
+                    missing_qkv_modules.append(lora_module)
+        if any(x in lora_target_modules
+               for x in ["cross_attn_q", "cross_attn_k", "cross_attn_v"]):
+            for lora_module in ["cross_attn_q", "cross_attn_k", "cross_attn_v"]:
+                if lora_module not in lora_target_modules:
+                    missing_qkv_modules.append(lora_module)
+
+        self._lora_weights_pointers_list = [
+            {} for _ in range(model_config.num_layers)
+        ]
+
+        for uid, rank, model_dir, hf_config in zip(uids, ranks, new_model_dirs,
+                                                   lora_hf_configs):
+            if uid not in self._lora_cpp_weights:
+                self._lora_cpp_weights[uid] = []
+            if uid not in self._lora_weight_config:
+                self._lora_weight_config[uid] = []
+
+            if model_dir != "":
+                lora_model = torch.load(f"{model_dir}/adapter_model.bin")
+            else:
+                lora_model = None
+
+            self._lora_uid_to_low_ranks[uid] = []
+            for layer_idx in range(model_config.num_layers):
+                self._lora_weights_pointers_list[layer_idx].update({uid: {}})
+
+                self._lora_uid_to_low_ranks[uid].append({})
+
+                prefix = f"base_model.model.model.{component}.layers"
+
+                for lora_module in (lora_target_modules + missing_qkv_modules):
+                    # fill missing q / k / v weights with zero tensors
+                    if lora_module in missing_qkv_modules:
+                        if uid == "-1":
+                            self._lora_uid_to_low_ranks[uid][layer_idx][
+                                lora_module] = 0
+                            continue
+                        # not split
+                        t_in = torch.zeros(rank, model_config.hidden_size)
+                        # split by column
+                        t_out = torch.zeros(model_config.hidden_size, rank)
+                        assert t_out.shape[0] % tp_size == 0
+                        t_out = torch.split(t_out,
+                                            t_out.shape[0] // tp_size,
+                                            dim=0)[tp_rank].contiguous()
+                    else:
+                        if uid == "-1" or model_config.trtllm_modules_to_hf_modules[
+                                lora_module] not in hf_config[
+                                    "target_modules"]:  # BART: q_proj, v_proj
+                            self._lora_uid_to_low_ranks[uid][layer_idx][
+                                lora_module] = 0
+                            continue
+
+                        if lora_module == "attn_q" or lora_module == "attn_k" or lora_module == "attn_v":
+                            name = f"{prefix}.{layer_idx}.{lora_module.replace('attn_', 'self_attn.')}_proj"
+                            # not split
+                            t_in = lora_model[f"{name}.lora_A.weight"]
+                            # split by column
+                            t_out = lora_model[f"{name}.lora_B.weight"]
+                            assert t_out.shape[0] % tp_size == 0
+                            t_out = torch.split(t_out,
+                                                t_out.shape[0] // tp_size,
+                                                dim=0)[tp_rank].contiguous()
+                        elif lora_module == "cross_attn_q" or lora_module == "cross_attn_k" or lora_module == "cross_attn_v":
+                            name = f"{prefix}.{layer_idx}.{lora_module.replace('cross_attn_', 'encoder_attn.')}_proj"
+                            # not split
+                            t_in = lora_model[f"{name}.lora_A.weight"]
+                            # split by column
+                            t_out = lora_model[f"{name}.lora_B.weight"]
+                            assert t_out.shape[0] % tp_size == 0
+                            t_out = torch.split(t_out,
+                                                t_out.shape[0] // tp_size,
+                                                dim=0)[tp_rank].contiguous()
 
                     t_in = t_in.cuda().contiguous()
                     t_out = t_out.cuda().contiguous()

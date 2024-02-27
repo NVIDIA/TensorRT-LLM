@@ -37,6 +37,7 @@
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
 #include "tensorrt_llm/runtime/gptSession.h"
+#include "tensorrt_llm/runtime/memoryCounters.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
 
 namespace py = pybind11;
@@ -232,7 +233,8 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_readwrite("top_p_min", &tr::SamplingConfig::topPMin)
         .def_readwrite("top_p_reset_ids", &tr::SamplingConfig::topPResetIds)
         .def_readwrite("beam_search_diversity_rate", &tr::SamplingConfig::beamSearchDiversityRate)
-        .def_readwrite("length_penalty", &tr::SamplingConfig::lengthPenalty);
+        .def_readwrite("length_penalty", &tr::SamplingConfig::lengthPenalty)
+        .def_readwrite("early_stopping", &tr::SamplingConfig::earlyStopping);
 
     py::class_<tr::GptJsonConfig>(m, "GptJsonConfig")
         .def(py::init<std::string, std::string, std::string, SizeType, SizeType, tr::GptModelConfig>(), py::arg("name"),
@@ -302,6 +304,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
     tensorNames.attr("RUNTIME_TOP_K") = py::str(tb::inference_request::kRuntimeTopKTensorName);
     tensorNames.attr("RUNTIME_TOP_P") = py::str(tb::inference_request::kRuntimeTopPTensorName);
     tensorNames.attr("LENGTH_PENALTY") = py::str(tb::inference_request::kLengthPenaltyTensorName);
+    tensorNames.attr("EARLY_STOPPING") = py::str(tb::inference_request::kEarlyStoppingTensorName);
     tensorNames.attr("REPETITION_PENALTY") = py::str(tb::inference_request::kRepetitionPenaltyTensorName);
     tensorNames.attr("MIN_LENGTH") = py::str(tb::inference_request::kMinLengthTensorName);
     tensorNames.attr("PRESENCE_PENALTY") = py::str(tb::inference_request::kPresencePenaltyTensorName);
@@ -342,4 +345,11 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_readwrite("decoding_mode", &tb::TrtGptModelOptionalParams::decodingMode);
 
     tpb::GptManager::initBindings(m);
+
+    py::class_<tr::MemoryCounters>(m, "MemoryCounters")
+        .def_static("instance", &tr::MemoryCounters::getInstance, py::return_value_policy::reference)
+        .def_property_readonly("gpu", &tr::MemoryCounters::getGpu)
+        .def_property_readonly("cpu", &tr::MemoryCounters::getCpu)
+        .def_property_readonly("pinned", &tr::MemoryCounters::getPinned)
+        .def_property_readonly("uvm", &tr::MemoryCounters::getUVM);
 }

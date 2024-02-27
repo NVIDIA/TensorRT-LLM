@@ -16,6 +16,7 @@
 
 #include "tensorrt_llm/runtime/gptDecoder.h"
 
+#include "tensorrt_llm/common/cudaAllocator.h"
 #include "tensorrt_llm/common/tensorConversion.h"
 #include "tensorrt_llm/kernels/decodingKernels.h"
 #include "tensorrt_llm/layers/dynamicDecodeLayer.h"
@@ -81,6 +82,7 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
 
     setupParams.beam_search_diversity_rate = samplingConfig.beamSearchDiversityRate;
     setupParams.length_penalty = samplingConfig.lengthPenalty;
+    setupParams.early_stopping = samplingConfig.earlyStopping;
 
     auto const batchSlotsPtr = batchSlots.has_value() ? bufferCast<SizeType>(*(batchSlots.value())) : nullptr;
     mDynamicDecodeLayer->setup(batchSize, samplingConfig.beamWidth, batchSlotsPtr, setupParams);
@@ -174,7 +176,7 @@ template <typename T>
 typename tl::DynamicDecodeLayer<T>::OutputParams prepareOutputs(
     DecodingOutput& output, DecodingInput::TensorPtr const& inputLengths, DecodingOutput::TensorPtr& logProbsTiled)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     typename tl::DynamicDecodeLayer<T>::OutputParams outputParams(tcc::toTllmTensor(*output.ids));
 
     outputParams.newTokens = tcc::toTllmTensor(*output.newTokens);
@@ -261,7 +263,7 @@ typename tl::DynamicDecodeLayer<T>::OutputParams prepareOutputs(
 template <typename T>
 bool GptDecoder<T>::forward(DecodingOutput& output, DecodingInput const& input)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto forwardParams = prepareInputs<T>(input);
     auto outputParams = prepareOutputs<T>(output, input.lengths, mLogProbsTiled);
     auto const maxBatchSize = input.maxBatchSize;
@@ -309,7 +311,7 @@ bool GptDecoder<T>::forward(DecodingOutput& output, DecodingInput const& input)
 template <typename T>
 void GptDecoder<T>::forwardAsync(DecodingOutput& output, DecodingInput const& input)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto forwardParams = prepareInputs<T>(input);
     auto outputParams = prepareOutputs<T>(output, input.lengths, mLogProbsTiled);
 
@@ -321,7 +323,7 @@ template <typename T>
 void GptDecoder<T>::gatherTree(ITensor& finalOutputIds, DecodingOutput const& decodingOutput,
     DecodingInput const& decodingInput, BufferManager const& manager)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto const& finalOutputIdsShape = finalOutputIds.getShape();
     auto const& decodingOutputIdsShape = decodingOutput.ids->getShape();
     auto const batchSize = finalOutputIdsShape.d[0];
@@ -355,7 +357,7 @@ void GptDecoder<T>::gatherTree(ITensor& finalOutputIds, DecodingOutput const& de
     beamHypotheses.length_penalties
         = nullptr; // TODO (bhsueh) should set length penalties, this should be a gpu tensor When it is set as
                    // nullptr, the kernel will use default value (1.0f) automatically.
-
+    beamHypotheses.early_stoppings = nullptr; // TODO (wili), similar as length_penalties
     beamHypotheses.output_ids_tgt = bufferCast<TokenIdType>(*decodingOutput.beamHypotheses.outputIdsTgt);
     beamHypotheses.sequence_lengths_tgt = bufferCast<SizeType>(*decodingOutput.beamHypotheses.sequenceLengthsTgt);
     beamHypotheses.cum_log_probs = bufferCast<float>(*decodingOutput.beamHypotheses.cumLogProbs);
@@ -381,7 +383,7 @@ void GptDecoder<T>::gatherTree(ITensor& finalOutputIds, DecodingOutput const& de
         batchSize, stream.get());
     sync_check_cuda_error();
 
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 namespace tensorrt_llm::runtime
@@ -394,7 +396,7 @@ void IGptDecoder::acceptDraftTokensByIds(ITensor const& targetTokenIds, ITensor 
     ITensor const& contextLengths, ITensor const& numDraftTokens, ITensor& sequenceLengths, ITensor const& finishedVec,
     ITensor& finishedFinal, ITensor& finishedSum, ITensor const& batchSlots, BufferManager::CudaStreamPtr const& stream)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto const finishedVecShape = finishedVec.getShape();
     auto const maxBatchSize = finishedVecShape.d[1];
@@ -439,7 +441,7 @@ void IGptDecoder::acceptDraftTokensByIds(ITensor const& targetTokenIds, ITensor 
 
     sync_check_cuda_error();
 
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 void IGptDecoder::acceptDraftTokensByLogits(ITensor& draftLogits, ITensor const& targetLogits, ITensor& draftProbs,
@@ -447,7 +449,7 @@ void IGptDecoder::acceptDraftTokensByLogits(ITensor& draftLogits, ITensor const&
     SizeType vocabSize, SizeType vocabSizePadded, bool useRandomAcceptThreshold, float randomAcceptThreshold,
     curandState_t* curandState, BufferManager::CudaStreamPtr const& stream)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto const draftLogitsShape = draftLogits.getShape();
     auto const maxBatchSize = draftLogitsShape.d[0];
@@ -488,5 +490,5 @@ void IGptDecoder::acceptDraftTokensByLogits(ITensor& draftLogits, ITensor const&
 
     sync_check_cuda_error();
 
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
