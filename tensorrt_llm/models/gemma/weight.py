@@ -595,7 +595,6 @@ def load_from_hf_gemma(tensorrt_llm_llama: 'GemmaForCausalLM',
                                    ((0, pad_width), (0, 0)),
                                    'constant',
                                    constant_values=0))
-                    # v_ = torch_to_numpy(numpy_to_torch(v) * np.sqrt(2048.0))
                     weights['lm_head.weight'] = split(v, mapping.tp_size,
                                                       mapping.tp_rank)
 
@@ -603,7 +602,7 @@ def load_from_hf_gemma(tensorrt_llm_llama: 'GemmaForCausalLM',
                 v = split(v, mapping.tp_size, mapping.tp_rank,
                           tensorrt_llm_llama.config.embedding_sharding_dim)
             if mapping.is_first_pp_rank():
-                weights['transformer.vocab_embedding.weight'] = torch_to_numpy(numpy_to_torch(v).to(torch.float32) * np.sqrt(2048.0))
+                weights['transformer.vocab_embedding.weight'] = torch_to_numpy(numpy_to_torch(v).to(torch.float32) * np.sqrt(tensorrt_llm_llama.config.hidden_size))
         elif 'model.norm.weight' in k:
             if mapping.is_last_pp_rank():
                 weights['transformer.ln_f.weight'] = torch_to_numpy(numpy_to_torch(v) + 1.0)
