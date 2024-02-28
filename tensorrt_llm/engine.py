@@ -157,7 +157,7 @@ class AsyncLLMEngine:
         for _ in range(max_num_sequences):
             if len(self.requests) == 0:
                 break
-            fetched.append(self.requests.pop())
+            fetched.append(self.requests.pop(0))
         return fetched
 
     def _handle_response_callback(self, req_id: int,

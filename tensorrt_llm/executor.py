@@ -492,7 +492,7 @@ class ParallelGenerationExecutor(GenerationExecutor):
             # the MPIPoolExecutor will always submit the same input to every worker, sometimes they arrive at slightly different time
             while len(self._requests) == 0:
                 time.sleep(0.05)
-            fetched.append(self._requests.pop())
+            fetched.append(self._requests.pop(0))
 
         return fetched
 
