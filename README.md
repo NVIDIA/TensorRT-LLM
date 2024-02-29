@@ -422,12 +422,14 @@ For example: `mpirun -n 1 python3 examples/gpt/build.py ...`
   - Add example for multimodal models (BLIP with OPT or T5, LlaVA)
 * Features
   - Chunked context support (see docs/source/gpt_attention.md#chunked-context)
-  - Medusa decoding support
+  - LoRA support for C++ runtime (see docs/source/lora.md)
+  - Medusa decoding support (see examples/medusa/README.md)
     - The support is limited to Python runtime for Ampere or newer GPUs with fp16 and bf16 accuracy, and the `temperature` parameter of sampling configuration should be 0
-  - StreamingLLM support for LLaMA
+  - StreamingLLM support for LLaMA (see docs/source/gpt_attention.md#streamingllm)
+  - Support for batch manager to return logits from context and/or generation phases
+    - Include support in the Triton backend
   - Support AWQ and GPTQ for QWEN
   - Support ReduceScatter plugin
-  - The batch manager can now return logits from context and generation phases
   - Support for combining `repetition_penalty` and `presence_penalty` #274
   - Support for `frequency_penalty` #275
   - OOTB functionality support:
@@ -441,15 +443,14 @@ For example: `mpirun -n 1 python3 examples/gpt/build.py ...`
   - Baichuan
     - P-tuning support
     - INT4-AWQ and INT4-GPTQ support
-  - Decoder Iteration-level Profiling Improvements
+  - Decoder iteration-level profiling improvements
   - Add `masked_select` and `cumsum` function for modeling
   - Smooth Quantization support for ChatGLM2-6B / ChatGLM3-6B / ChatGLM2-6B-32K
-  - Support for returning context and/or generation logits in the Triton backend
   - Add Weight-Only Support To Whisper #794, thanks to the contribution from @Eddie-Wang1120
   - Support FP16 fMHA on NVIDIA V100 GPU
 * API
   - Add a set of High-level APIs for end-to-end generation tasks (see examples/high-level-api/README.md)
-  - **[BREAKING CHANGES]** Migrate models to the new build workflow, including LLaMA, Mistral, Mixtral, InternLM, ChatGLM, Falcon, GPT-J, GPT-NeoX, Medusa, MPT, Baichuan and Phi.
+  - **[BREAKING CHANGES]** Migrate models to the new build workflow, including LLaMA, Mistral, Mixtral, InternLM, ChatGLM, Falcon, GPT-J, GPT-NeoX, Medusa, MPT, Baichuan and Phi (see docs/source/new_workflow.md)
   - **[BREAKING CHANGES]** Deprecate `LayerNorm` and `RMSNorm` plugins and removed corresponding build parameters
   - **[BREAKING CHANGES]** Remove optional parameter `maxNumSequences` for GPT manager
 * Bug fixes
@@ -464,26 +465,24 @@ For example: `mpirun -n 1 python3 examples/gpt/build.py ...`
   - Fix INT8 GEMM shape #935
   - Minor bug fixes
 * Performance
+  - **[BREAKING CHANGES]** Increase default `freeGpuMemoryFraction` parameter from 0.85 to 0.9 for higher throughput
+  - **[BREAKING CHANGES]** Disable `enable_trt_overlap` argument for GPT manager by default
   - Performance optimization of beam search kernel
-  - Increase default `freeGpuMemoryFraction` parameter from 0.85 to 0.9 for higher throughput
   - Add bfloat16 and paged kv cache support for optimized generation MQA/GQA kernels
   - Custom AllReduce plugins performance optimization
   - Top-P sampling performance optimization
   - LoRA performance optimization
-  - Disable `enable_trt_overlap` argument for GPT manager by default
   - Custom allreduce performance optimization by introducing a ping-pong buffer to avoid an extra synchronization cost
   - Integrate XQA kernels for GPT-J (beamWidth=4)
 * Documentation
   - Batch manager arguments documentation updates
-  - Typo fix #739
-  - Refine TensorRT-LLM backend readme structure #133
   - Add documentation for best practices for tuning the performance of TensorRT-LLM (See docs/source/perf_best_practices.md)
   - Add documentation for Falcon AWQ support (See examples/falcon/README.md)
   - Update to the `docs/source/new_workflow.md` documentation
-  - Add documentation for LoRA (see docs/source/lora.md)
   - Update AWQ INT4 weight only quantization documentation for GPT-J
   - Add blog: Speed up inference with SOTA quantization techniques in TRT-LLM
-  - A bunch of documentation fixes for the new building workflow
+  - Refine TensorRT-LLM backend README structure #133
+  - Typo fix #739
 
 #### For history change log, please see [CHANGELOG.md](./CHANGELOG.md).
 
