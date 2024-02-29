@@ -108,6 +108,8 @@ struct Multihead_attention_params_base
     int max_attention_window_size = 0;
     // Cyclic kv cache capacity (used to get the cyclic kv cache position for new tokens)
     int cyclic_attention_window_size = 0;
+    // Length of the sink token in KV cache
+    int sink_token_length = 0;
     // The number of heads (H).
     int num_heads = 0;
     // Controls MHA/MQA/GQA
@@ -122,6 +124,8 @@ struct Multihead_attention_params_base
     RotaryScalingType rotary_embedding_scale_type = RotaryScalingType::kNONE;
     float rotary_embedding_scale = 0.0f;
     int rotary_embedding_max_positions = 0;
+    // Position shift for streamingllm
+    bool position_shift_enabled = false;
     // The current timestep. TODO Check that do we only this param in cross attention?
     int timestep = 0;
     // The current timestep of each sentences (support different timestep for different sentences)
@@ -222,13 +226,13 @@ using Cross_multihead_attention_params = Multihead_attention_params<T, true>;
 
 #define DECLARE_MMHA_NORMAL_AND_PAGED(T)                                                                               \
     void masked_multihead_attention(const Masked_multihead_attention_params<T>& params,                                \
-        const KVBlockArray& block_array, const cudaStream_t& stream);                                                  \
+        const KVBlockArray& block_array, const KVLinearBuffer& shift_k_cache, const cudaStream_t& stream);             \
     void masked_multihead_attention(const Masked_multihead_attention_params<T>& params,                                \
-        const KVLinearBuffer& kv_cache_buffer, const cudaStream_t& stream);                                            \
+        const KVLinearBuffer& kv_cache_buffer, const KVLinearBuffer& shift_k_cache, const cudaStream_t& stream);       \
     void masked_multihead_attention(const Cross_multihead_attention_params<T>& params,                                 \
-        const KVBlockArray& block_array, const cudaStream_t& stream);                                                  \
+        const KVBlockArray& block_array, const KVLinearBuffer& shift_k_cache, const cudaStream_t& stream);             \
     void masked_multihead_attention(const Cross_multihead_attention_params<T>& params,                                 \
-        const KVLinearBuffer& kv_cache_buffer, const cudaStream_t& stream);
+        const KVLinearBuffer& kv_cache_buffer, const KVLinearBuffer& shift_k_cache, const cudaStream_t& stream);
 DECLARE_MMHA_NORMAL_AND_PAGED(float);
 DECLARE_MMHA_NORMAL_AND_PAGED(uint16_t);
 #ifdef ENABLE_BF16

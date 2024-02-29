@@ -44,10 +44,8 @@ Example usage:
 """
 
 import argparse
-import json
 import os
 import random
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -57,7 +55,7 @@ from tqdm import tqdm
 from transformers import (AutoModel, AutoModelForCausalLM,
                           AutoModelForSeq2SeqLM, AutoTokenizer,
                           GenerationConfig)
-from utils import load_tokenizer
+from utils import load_tokenizer, read_model_name
 
 import tensorrt_llm
 from tensorrt_llm.runtime import ModelRunner
@@ -77,12 +75,6 @@ RAND_SEED = 1234
 
 def get_choices():
     return ["A", "B", "C", "D"]
-
-
-def read_model_name_from_config(config_path: Path):
-    with open(config_path, "r") as f:
-        config = json.load(f)
-    return config["builder_config"]["name"]
 
 
 def get_subcategories():
@@ -245,12 +237,8 @@ def get_tokenizer(ckpt_path, max_seq_len):
 
 class Pipeline:
 
-    def __init__(self,
-                 tokenizer,
-                 model,
-                 pad_id,
-                 end_id,
-                 max_attention_window_size=2048):
+    def __init__(self, tokenizer, model, pad_id, end_id,
+                 max_attention_window_size):
         self.tokenizer = tokenizer
         self.model = model
         self.pad_id = pad_id
@@ -259,7 +247,7 @@ class Pipeline:
 
     def __call__(self, prompt):
         # Run the model in batch size 1 and beam size 1
-        inputs = self.tokenizer.encode(prompt, return_tensors="pt")
+        inputs = self.tokenizer.encode(prompt, return_tensors="pt").squeeze(0)
         batch_input_ids = [inputs]
 
         # For multi-choice tasks like MMLU, we don't need to adjust following parameters
@@ -267,7 +255,7 @@ class Pipeline:
         top_k = 1
         top_p = 0.0
 
-        input_lengths = [x.size(1) for x in batch_input_ids]
+        input_lengths = [x.size(0) for x in batch_input_ids]
 
         with torch.no_grad():
             if isinstance(self.model, nn.Module):
@@ -278,7 +266,7 @@ class Pipeline:
                     for l in input_lengths
                 ]
                 batch_input_ids = [
-                    torch.cat([pad, x.squeeze(0)])
+                    torch.cat([pad, x])
                     for x, pad in zip(batch_input_ids, paddings)
                 ]
                 batch_input_ids = torch.stack(batch_input_ids)
@@ -378,8 +366,7 @@ def main():
     cat_cors = {cat: [] for cat in get_categories()}
 
     model_ckpt_path = args.hf_model_dir
-    model_name = read_model_name_from_config(
-        Path(args.engine_dir) / "config.json")
+    model_name = read_model_name(args.engine_dir)
     tokenizer, pad_id, end_id = load_tokenizer(model_ckpt_path,
                                                model_name=model_name)
     if args.test_trt_llm:
@@ -407,7 +394,8 @@ def main():
             model.generation_config = GenerationConfig.from_pretrained(
                 args.hf_model_dir, trust_remote_code=True)
 
-    pipeline = Pipeline(tokenizer, model, pad_id, end_id)
+    pipeline = Pipeline(tokenizer, model, pad_id, end_id,
+                        args.max_attention_window_size)
 
     for subject in tqdm(subjects):
         dev_df = pd.read_csv(os.path.join(args.data_dir, "dev",

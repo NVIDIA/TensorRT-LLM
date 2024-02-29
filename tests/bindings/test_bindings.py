@@ -1,5 +1,6 @@
 import inspect
 import json
+import pickle
 import tempfile
 from pathlib import Path
 
@@ -235,6 +236,7 @@ def test_world_config():
     assert world_config.pipeline_parallelism == pipeline_parallelism
     assert world_config.rank == rank
     assert world_config.gpus_per_node == gpus_per_node
+    assert world_config.gpus_per_group == gpus_per_node
     assert world_config.size == tensor_parallelism * pipeline_parallelism
     assert world_config.is_pipeline_parallel
     assert world_config.is_tensor_parallel
@@ -247,6 +249,17 @@ def test_world_config():
     assert world_config.pipeline_parallelism == 1
     assert world_config.gpus_per_node == gpus_per_node
     assert world_config.rank == 0
+
+    gpus_per_group = gpus_per_node // 2
+    device_ids = list(gpus_per_group + x for x in range(gpus_per_group))
+    assert max(device_ids) < gpus_per_node
+    world_config = _tb.WorldConfig(rank=rank,
+                                   gpus_per_node=gpus_per_node,
+                                   device_ids=device_ids)
+    assert world_config.gpus_per_node == gpus_per_node
+    assert world_config.gpus_per_group == gpus_per_group
+    assert world_config.rank == rank
+    assert world_config.device == rank + gpus_per_group
 
 
 def test_sampling_config():
@@ -265,6 +278,7 @@ def test_sampling_config():
     check_empty_then_set("min_length", size_t_array)
     check_empty_then_set("repetition_penalty", float_array)
     check_empty_then_set("presence_penalty", float_array)
+    check_empty_then_set("frequency_penalty", float_array)
     check_empty_then_set("top_k", size_t_array)
     check_empty_then_set("top_p", float_array)
     check_empty_then_set("random_seed", size_t_array)
@@ -328,6 +342,7 @@ def test_gpt_json_config():
             "use_custom_all_reduce": False,
             "use_context_fmha_for_generation": False,
             "use_paged_context_fmha": False,
+            "lora_plugin": False,
         }
     }
 
@@ -376,7 +391,9 @@ def test_llm_request():
         "embedding_bias": torch.tensor((10, 10)),
         "stop_words_list": torch.tensor((10, 10)),
         "bad_words_list": torch.tensor((10, 10)),
-        "return_log_probs": True
+        "return_log_probs": True,
+        "return_context_logits": False,
+        "return_generation_logits": False
     }
     llm_request = _tb.LlmRequest(**kwargs)
 
@@ -496,6 +513,10 @@ def test_inference_request():
     ir.presence_penalty = data_tensor
     assert torch.equal(ir.presence_penalty, data_tensor)
 
+    assert ir.frequency_penalty is None
+    ir.frequency_penalty = data_tensor
+    assert torch.equal(ir.frequency_penalty, data_tensor)
+
     assert ir.prompt_embedding_table is None
     ir.prompt_embedding_table = data_tensor
     assert torch.equal(ir.prompt_embedding_table, data_tensor)
@@ -503,6 +524,14 @@ def test_inference_request():
     assert ir.prompt_vocab_size is None
     ir.prompt_vocab_size = data_tensor
     assert torch.equal(ir.prompt_vocab_size, data_tensor)
+
+    assert ir.lora_weights is None
+    ir.lora_weights = data_tensor
+    assert torch.equal(ir.lora_weights, data_tensor)
+
+    assert ir.lora_config is None
+    ir.lora_config = data_tensor
+    assert torch.equal(ir.lora_config, data_tensor)
 
     assert ir.random_seed is None
     ir.random_seed = data_tensor
@@ -532,16 +561,25 @@ def test_inference_request():
     ir.temperature = data_tensor
     assert torch.equal(ir.temperature, data_tensor)
 
+    serialized = pickle.dumps(ir)
+    deserialized = pickle.loads(serialized)
+
+    assert isinstance(deserialized, _tb.InferenceRequest)
+    assert deserialized.request_id == ir.request_id
+    assert deserialized.is_streaming == ir.is_streaming
+    assert torch.equal(deserialized.input_ids, ir.input_ids)
+
 
 def test_trt_gpt_model_optional_params():
     opt_params = _tb.TrtGptModelOptionalParams()
 
-    kv_cache_config = _tb.KvCacheConfig(10, 10, 0.5, False)
+    kv_cache_config = _tb.KvCacheConfig(10, 10, 0, 0.5, False)
     opt_params.kv_cache_config = kv_cache_config
     assert opt_params.kv_cache_config.free_gpu_memory_fraction == kv_cache_config.free_gpu_memory_fraction
 
-    opt_params.max_num_sequences = 10
-    assert opt_params.max_num_sequences == 10
-
     opt_params.enable_trt_overlap = True
     assert opt_params.enable_trt_overlap
+
+    assert opt_params.device_ids is None
+    opt_params.device_ids = [0, 1]
+    assert opt_params.device_ids == [0, 1]

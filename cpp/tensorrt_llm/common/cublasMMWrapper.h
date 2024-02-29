@@ -112,9 +112,9 @@ public:
     void setWorkspace(void* workspace);
 
     void setFP32GemmConfig();
-    void setFP16GemmConfig();
+    void setFP16GemmConfig(cudaDataType_t outputType = CUDA_R_16F);
 #ifdef ENABLE_BF16
-    void setBF16GemmConfig();
+    void setBF16GemmConfig(cudaDataType_t outputType = CUDA_R_16BF);
 #endif
 #ifdef ENABLE_FP8
     void setFP8GemmConfig(cudaDataType_t outputType = CUDA_R_16F);

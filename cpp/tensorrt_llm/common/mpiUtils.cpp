@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,8 +15,14 @@
  */
 
 #include "tensorrt_llm/common/mpiUtils.h"
-#include "mpi.h"
+
+#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/runtime/common.h"
+
+#include <csignal>
+#include <mpi.h>
+#include <mutex>
 #include <type_traits>
 
 // We rely on SizeType being int32_t in some places with weak type checking,
@@ -30,17 +36,20 @@ namespace tensorrt_llm::mpi
 MPI_Datatype getMpiDtype(MpiType dtype)
 {
     static const std::unordered_map<MpiType, MPI_Datatype> dtype_map{
-        {MPI_TYPE_BYTE, MPI_BYTE},
-        {MPI_TYPE_CHAR, MPI_CHAR},
-        {MPI_TYPE_INT, MPI_INT},
-        {MPI_TYPE_FLOAT, MPI_FLOAT},
-        {MPI_TYPE_DOUBLE, MPI_DOUBLE},
-        {MPI_TYPE_INT64_T, MPI_INT64_T},
-        {MPI_TYPE_INT32_T, MPI_INT32_T},
-        {MPI_TYPE_UINT64_T, MPI_UINT64_T},
-        {MPI_TYPE_UINT32_T, MPI_UINT32_T},
-        {MPI_TYPE_UNSIGNED_LONG_LONG, MPI_UNSIGNED_LONG_LONG},
-        {MPI_TYPE_SIZETYPE, MPI_INT32_T},
+
+        {MpiType::kBYTE, MPI_BYTE},
+        {MpiType::kHALF, MPI_UINT16_T},
+        {MpiType::kFLOAT, MPI_FLOAT},
+        {MpiType::kDOUBLE, MPI_DOUBLE},
+        {MpiType::kBOOL, MPI_C_BOOL},
+        {MpiType::kINT8, MPI_INT8_T},
+        {MpiType::kUINT8, MPI_UINT8_T},
+        {MpiType::kINT32, MPI_INT32_T},
+        {MpiType::kUINT32, MPI_UINT32_T},
+        {MpiType::kINT64, MPI_INT64_T},
+        {MpiType::kUINT64, MPI_UINT64_T},
+        {MpiType::kFP8, MPI_UINT8_T},
+        {MpiType::kBF16, MPI_UINT16_T},
     };
     return dtype_map.at(dtype);
 }
@@ -48,117 +57,180 @@ MPI_Datatype getMpiDtype(MpiType dtype)
 MPI_Op getMpiOp(MpiOp op)
 {
     static const std::unordered_map<MpiOp, MPI_Op> op_map{
-        {MPI_OP_NULLOP, MPI_OP_NULL},
-        {MPI_OP_MAX, MPI_MAX},
-        {MPI_OP_MIN, MPI_MIN},
-        {MPI_OP_SUM, MPI_SUM},
-        {MPI_OP_PROD, MPI_PROD},
-        {MPI_OP_LAND, MPI_LAND},
-        {MPI_OP_BAND, MPI_BAND},
-        {MPI_OP_LOR, MPI_LOR},
-        {MPI_OP_BOR, MPI_BOR},
-        {MPI_OP_LXOR, MPI_LXOR},
-        {MPI_OP_BXOR, MPI_BXOR},
-        {MPI_OP_MINLOC, MPI_MINLOC},
-        {MPI_OP_MAXLOC, MPI_MAXLOC},
-        {MPI_OP_REPLACE, MPI_REPLACE},
+        {MpiOp::NULLOP, MPI_OP_NULL},
+        {MpiOp::MAX, MPI_MAX},
+        {MpiOp::MIN, MPI_MIN},
+        {MpiOp::SUM, MPI_SUM},
+        {MpiOp::PROD, MPI_PROD},
+        {MpiOp::LAND, MPI_LAND},
+        {MpiOp::BAND, MPI_BAND},
+        {MpiOp::LOR, MPI_LOR},
+        {MpiOp::BOR, MPI_BOR},
+        {MpiOp::LXOR, MPI_LXOR},
+        {MpiOp::BXOR, MPI_BXOR},
+        {MpiOp::MINLOC, MPI_MINLOC},
+        {MpiOp::MAXLOC, MPI_MAXLOC},
+        {MpiOp::REPLACE, MPI_REPLACE},
     };
     return op_map.at(op);
 }
 
-void initialize(int* argc, char*** argv)
+namespace
 {
-    MPICHECK(MPI_Init(argc, argv));
-}
 
-void finalize()
-{
-    MPICHECK(MPI_Finalize());
-}
+bool mpiInitialized = false;
+std::mutex mpiMutex;
 
-bool isInitialized()
-{
-    int mpi_initialized = 0;
-    MPICHECK(MPI_Initialized(&mpi_initialized));
-    return static_cast<bool>(mpi_initialized);
-}
+} // namespace
 
-void initThread(int* argc, char*** argv, MpiThreadSupport required, int* provided)
+void initialize(MpiThreadSupport threadMode)
 {
-    switch (required)
+    std::lock_guard<std::mutex> lk(mpiMutex);
+    if (mpiInitialized)
     {
-    case THREAD_SINGLE: MPICHECK(MPI_Init_thread(argc, argv, MPI_THREAD_SINGLE, provided)); break;
-    case THREAD_FUNNELED: MPICHECK(MPI_Init_thread(argc, argv, MPI_THREAD_FUNNELED, provided)); break;
-    case THREAD_SERIALIZED: MPICHECK(MPI_Init_thread(argc, argv, MPI_THREAD_SERIALIZED, provided)); break;
-    case THREAD_MULTIPLE: MPICHECK(MPI_Init_thread(argc, argv, MPI_THREAD_MULTIPLE, provided)); break;
-    default: break;
+        return;
     }
+
+    int initialized = 0;
+    TLLM_MPI_CHECK(MPI_Initialized(&initialized));
+    if (!initialized)
+    {
+        TLLM_LOG_INFO("Initializing MPI with thread mode %d", threadMode);
+        int providedMode;
+        auto requiredMode = static_cast<int>(threadMode);
+        MPICHECK(MPI_Init_thread(nullptr, nullptr, requiredMode, &providedMode));
+        TLLM_CHECK_WITH_INFO(providedMode >= requiredMode, "MPI_Init_thread failed");
+        std::atexit([]() { MPI_Finalize(); });
+
+        auto previousHandler = std::signal(SIGABRT, [](int signal) { MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE); });
+        TLLM_CHECK_WITH_INFO(previousHandler != SIG_ERR, "Signal handler setup failed");
+    }
+
+    mpiInitialized = true;
 }
 
-int getCommWorldRank()
+void MpiComm::barrier() const
 {
-    int rank = 0;
-    MPICHECK(MPI_Comm_rank(MPI_COMM_WORLD, &rank));
-    return rank;
+    MPICHECK(MPI_Barrier(mComm));
 }
 
-int getCommWorldSize()
-{
-    int world_size = 1;
-    MPICHECK(MPI_Comm_size(MPI_COMM_WORLD, &world_size));
-    return world_size;
-}
-
-void barrier(MpiComm comm)
-{
-    MPICHECK(MPI_Barrier(comm.group));
-}
-
-void barrier()
-{
-    MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
-}
-
-std::shared_ptr<MpiRequest> bcast_async(void* buffer, size_t size, MpiType dtype, int root, MpiComm comm)
+std::shared_ptr<MpiRequest> MpiComm::bcastAsync(void* buffer, size_t size, MpiType dtype, int root) const
 {
     std::shared_ptr<MpiRequest> r = std::make_shared<MpiRequest>();
-    MPICHECK(MPI_Ibcast(buffer, size, getMpiDtype(dtype), root, comm.group, &r->mRequest));
+    MPICHECK(MPI_Ibcast(buffer, size, getMpiDtype(dtype), root, mComm, &r->mRequest));
     return r;
 }
 
-void bcast(void* buffer, size_t size, MpiType dtype, int root, MpiComm comm)
+void MpiComm::bcast(void* buffer, size_t size, MpiType dtype, int root) const
 {
-    MPICHECK(MPI_Bcast(buffer, size, getMpiDtype(dtype), root, comm.group));
+    MPICHECK(MPI_Bcast(buffer, size, getMpiDtype(dtype), root, mComm));
 }
 
-void bcast(std::vector<int64_t>& packed, int root, MpiComm comm)
+void MpiComm::bcast(std::vector<int64_t>& packed, int root) const
 {
     int64_t nWords1;
-    if (getCommWorldRank() == root)
+    auto const rank = getRank();
+    if (rank == root)
     {
         nWords1 = static_cast<int64_t>(packed.size());
     }
-    bcast(&nWords1, 1, MPI_TYPE_INT64_T, root, comm);
-    if (getCommWorldRank() != root)
+    auto const mpiInt64 = MpiTypeConverter<int64_t>::value;
+    bcast(&nWords1, 1, mpiInt64, root);
+    if (rank != root)
     {
         packed.resize(nWords1);
     }
-    bcast(packed.data(), packed.size(), MPI_TYPE_INT64_T, root, comm);
+    bcast(packed.data(), packed.size(), mpiInt64, root);
 }
 
-void comm_split(MpiComm comm, int color, int key, MpiComm* newcomm)
+void MpiComm::send(void const* buffer, size_t size, MpiType dtype, int dest, int tag) const
 {
-    MPICHECK(MPI_Comm_split(comm.group, color, key, &newcomm->group));
+    MPICHECK(MPI_Send(buffer, size, getMpiDtype(dtype), dest, tag, mComm));
 }
 
-void allreduce(const void* sendbuf, void* recvbuf, int count, MpiType dtype, MpiOp op, MpiComm comm)
+MPI_Status MpiComm::recv(void* buffer, size_t size, MpiType dtype, int source, int tag) const
 {
-    MPICHECK(MPI_Allreduce(sendbuf, recvbuf, count, getMpiDtype(dtype), getMpiOp(op), comm.group));
+    MPI_Status status{};
+    MPICHECK(MPI_Recv(buffer, size, getMpiDtype(dtype), source, tag, mComm, &status));
+    return status;
 }
 
-void allgather(const void* sendbuf, void* recvbuf, int count, MpiType dtype, MpiComm comm)
+MpiComm MpiComm::split(int color, int key) const
 {
-    MPICHECK(MPI_Allgather(sendbuf, count, getMpiDtype(dtype), recvbuf, count, getMpiDtype(dtype), comm.group));
+    MPI_Comm splitComm;
+    MPICHECK(MPI_Comm_split(mComm, color, key, &splitComm));
+    return MpiComm{splitComm, true};
+}
+
+void MpiComm::allreduce(const void* sendbuf, void* recvbuf, int count, MpiType dtype, MpiOp op) const
+{
+    MPICHECK(MPI_Allreduce(sendbuf, recvbuf, count, getMpiDtype(dtype), getMpiOp(op), mComm));
+}
+
+void MpiComm::allgather(const void* sendbuf, void* recvbuf, int count, MpiType dtype) const
+{
+    MPICHECK(MPI_Allgather(sendbuf, count, getMpiDtype(dtype), recvbuf, count, getMpiDtype(dtype), mComm));
+}
+
+int MpiComm::getRank() const
+{
+    int rank = 0;
+    MPICHECK(MPI_Comm_rank(mComm, &rank));
+    return rank;
+}
+
+int MpiComm::getSize() const
+{
+    int world_size = 1;
+    MPICHECK(MPI_Comm_size(mComm, &world_size));
+    return world_size;
+}
+
+MpiComm const& MpiComm::world()
+{
+    static MpiComm commWorld{MPI_COMM_WORLD, false};
+    return commWorld;
+}
+
+MpiComm& MpiComm::session()
+{
+    static MpiComm commSession{world(), false};
+    return commSession;
+}
+
+MpiComm::MpiComm(MPI_Comm g, bool freeComm)
+    : mComm{g}
+    , mFreeComm{freeComm}
+{
+    TLLM_CHECK(mComm != MPI_COMM_NULL);
+    if (g == MPI_COMM_WORLD)
+    {
+        initialize();
+    }
+}
+
+MpiComm::~MpiComm() noexcept
+{
+    if (mFreeComm && mComm && MPI_Comm_free(&mComm) != MPI_SUCCESS)
+    {
+        TLLM_LOG_ERROR("MPI_Comm_free failed");
+    }
+}
+
+MpiComm::MpiComm(MpiComm&& comm) noexcept
+    : mComm{comm.mComm}
+    , mFreeComm{comm.mFreeComm}
+{
+    comm.mFreeComm = false;
+}
+
+MpiComm& MpiComm::operator=(MpiComm&& comm) noexcept
+{
+    this->~MpiComm();
+    mComm = comm.mComm;
+    mFreeComm = comm.mFreeComm;
+    comm.mFreeComm = false;
+    return *this;
 }
 
 } // namespace tensorrt_llm::mpi

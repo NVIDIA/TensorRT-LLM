@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -39,19 +39,19 @@ public:
 
     SizeType beamWidth;
 
-    OptVec<FloatType> temperature; // [1] or [batch_size] on cpu
-    OptVec<SizeType> minLength;    // [1] or [batch_size] on cpu
-    // repetitionPenalty and presencePenalty are mutually exclusive.
+    OptVec<FloatType> temperature;       // [1] or [batch_size] on cpu
+    OptVec<SizeType> minLength;          // [1] or [batch_size] on cpu
     OptVec<FloatType> repetitionPenalty; // [1] or [batch_size] on cpu
     OptVec<FloatType> presencePenalty;   // [1] or [batch_size] on cpu
+    OptVec<FloatType> frequencyPenalty;  // [1] or [batch_size] on cpu
 
     // sampling layers
-    OptVec<SizeType> topK;                 // [1] or [batch_size] on cpu
-    OptVec<FloatType> topP;                // [1] or [batch_size] on cpu
-    OptVec<unsigned long long> randomSeed; // [1] or [batch_size] on cpu
-    OptVec<FloatType> topPDecay;           // [batch_size], must between [0, 1]
-    OptVec<FloatType> topPMin;             // [batch_size], must between [0, 1]
-    OptVec<SizeType> topPResetIds;         // [batch_size]
+    OptVec<SizeType> topK;         // [1] or [batch_size] on cpu
+    OptVec<FloatType> topP;        // [1] or [batch_size] on cpu
+    OptVec<uint64_t> randomSeed;   // [1] or [batch_size] on cpu
+    OptVec<FloatType> topPDecay;   // [batch_size], must between [0, 1]
+    OptVec<FloatType> topPMin;     // [batch_size], must between [0, 1]
+    OptVec<SizeType> topPResetIds; // [batch_size]
 
     // beam search layer
     OptVec<FloatType> beamSearchDiversityRate;
@@ -59,6 +59,8 @@ public:
 
     // speculative decoding
     OptVec<FloatType> draftAcceptanceThreshold;
+
+    std::optional<bool> normalizeLogProbs;
 };
 
 } // namespace tensorrt_llm::runtime

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -65,7 +65,8 @@ class TestGPT(unittest.TestCase):
                                   batch_size, input_len, output_len, fp16,
                                   gpt_attention_plugin, tensor_parallel,
                                   apply_query_key_layer_scaling,
-                                  gather_all_token_logits):
+                                  gather_context_logits,
+                                  gather_generation_logits):
         num_layers = gpt_config.n_layer
         num_heads = gpt_config.n_head
         hidden_size = gpt_config.n_embd
@@ -89,12 +90,13 @@ class TestGPT(unittest.TestCase):
                                              tp_size=tensor_parallel),
                 apply_query_key_layer_scaling=apply_query_key_layer_scaling)
             inputs = tensorrt_llm_gpt.prepare_inputs(
-                batch_size,
-                input_len,
-                output_len,
+                max_batch_size=batch_size,
+                max_input_len=input_len,
+                max_seq_len=input_len + output_len,
                 use_cache=True,
                 max_beam_width=1,
-                gather_all_token_logits=gather_all_token_logits)
+                gather_context_logits=gather_context_logits,
+                gather_generation_logits=gather_generation_logits)
             load_from_hf_gpt(tensorrt_llm_gpt,
                              hf_gpt,
                              dtype="float16" if fp16 else "float32")
@@ -125,7 +127,8 @@ class TestGPT(unittest.TestCase):
                                   enable_remove_input_padding=False,
                                   enable_paged_kv_cache=False,
                                   tokens_per_block=128,
-                                  gather_all_token_logits=False):
+                                  gather_context_logits=False,
+                                  gather_generation_logits=False):
         mapping = tensorrt_llm.Mapping(world_size, rank, tp_size=world_size)
 
         runtime = None
@@ -140,10 +143,12 @@ class TestGPT(unittest.TestCase):
                 timing_cache='model.cache',
                 tensor_parallel=world_size,  # TP only
                 use_refit=use_refit,
-                gather_all_token_logits=gather_all_token_logits,
+                gather_context_logits=gather_context_logits,
+                gather_generation_logits=gather_generation_logits,
                 strongly_typed=fp16,
             )
             network = builder.create_network()
+            network.plugin_config.to_legacy_setting()
             if use_plugin:
                 network.plugin_config.set_gpt_attention_plugin(dtype)
             if fast_building:
@@ -158,7 +163,8 @@ class TestGPT(unittest.TestCase):
                                            batch_size, input_len, output_len,
                                            fp16, use_plugin, world_size,
                                            apply_query_key_layer_scaling,
-                                           gather_all_token_logits)
+                                           gather_context_logits,
+                                           gather_generation_logits)
 
             engine_buffer = builder.build_engine(network, builder_config)
             runtime = tensorrt_llm.runtime.generation._Runtime(
@@ -394,7 +400,7 @@ class TestGPT(unittest.TestCase):
             product([False, True], [False, True], [False, True], [
                 ContextFMHAType.disabled, ContextFMHAType.enabled,
                 ContextFMHAType.enabled_with_fp32_acc
-            ], [False, True], [False, True], [False, True]))
+            ], [False, True], [False, True], [False, True], [False, True]))
 
         return test_cases
 
@@ -402,17 +408,14 @@ class TestGPT(unittest.TestCase):
     def test_gpt_plugin(self, use_refit, fast_building,
                         apply_query_key_layer_scaling, context_fmha_type,
                         enable_remove_input_padding, enable_paged_kv_cache,
-                        gather_all_token_logits):
+                        gather_context_logits, gather_generation_logits):
         # inflight batching mode only works with remove_input_padding and paged_kv_cache
-        use_in_flight_batching = enable_remove_input_padding and enable_paged_kv_cache and not gather_all_token_logits
+        use_in_flight_batching = enable_remove_input_padding and enable_paged_kv_cache and not (
+            gather_context_logits or gather_generation_logits)
 
         # Skip tests that are not supported in pre-ampere architecture
         if getSMVersion() < 80:
-            if context_fmha_type == ContextFMHAType.enabled:
-                pytest.skip(
-                    "ContextFMHAType is not supported in pre-ampere architecture"
-                )
-            elif context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
+            if context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
                 pytest.skip(
                     "ContextFMHAType with fp32 acc is not supported in pre-ampere architecture"
                 )
@@ -441,7 +444,7 @@ class TestGPT(unittest.TestCase):
             use_plugin, batch_size, seq_len, max_length, use_refit,
             fast_building, apply_query_key_layer_scaling, context_fmha_type,
             enable_remove_input_padding, enable_paged_kv_cache,
-            tokens_per_block, gather_all_token_logits)
+            tokens_per_block, gather_context_logits, gather_generation_logits)
         key_value_cache_buffers = []
         value_cache_buffers = []
         head_size = gpt_config.n_embd // gpt_config.n_head
@@ -504,7 +507,7 @@ class TestGPT(unittest.TestCase):
             kv_cache_manager = KVCacheManager(key_value_cache_buffers, blocks,
                                               tokens_per_block,
                                               max_blocks_per_seq, total_length,
-                                              beam_width)
+                                              0, beam_width)
 
             # Add sequences to the manager
             for bi in range(batch_size):
@@ -524,6 +527,7 @@ class TestGPT(unittest.TestCase):
                        cache_indirection,
                        host_past_key_value_lengths,
                        host_max_attention_window_sizes,
+                       host_sink_token_length,
                        sequence_length=None,
                        host_context_lengths=None):
 
@@ -536,6 +540,7 @@ class TestGPT(unittest.TestCase):
                 'cache_indirection': cache_indirection,
                 'host_past_key_value_lengths': host_past_key_value_lengths,
                 'sequence_length': sequence_length,
+                'host_sink_token_length': host_sink_token_length,
             }
 
             assert host_request_types is not None
@@ -613,14 +618,14 @@ class TestGPT(unittest.TestCase):
                 return ref[:, -1, :]
 
             if enable_remove_input_padding:
-                ctx_ids = ctx_ids.view([1, batch_size * seq_len])
-                ctx_position_ids = ctx_position_ids.view(
-                    [1, batch_size * seq_len])
+                ctx_ids = ctx_ids.view([batch_size * seq_len])
+                ctx_position_ids = ctx_position_ids.view([batch_size * seq_len])
                 ctx_last_token_ids = torch.cumsum(ctx_last_token_ids,
                                                   dim=0).int()
 
             host_max_attention_window_sizes = torch.tensor([total_length],
                                                            dtype=torch.int32)
+            host_sink_token_length = torch.tensor([0], dtype=torch.int32)
 
             host_context_lengths = ctx_context_lengths.cpu(
             ) if enable_remove_input_padding else None
@@ -642,11 +647,12 @@ class TestGPT(unittest.TestCase):
                 cache_indirection=cache_indirections[0],
                 host_past_key_value_lengths=host_past_key_value_lengths,
                 host_max_attention_window_sizes=host_max_attention_window_sizes,
+                host_sink_token_length=host_sink_token_length,
                 sequence_length=sequence_length,
                 host_context_lengths=host_context_lengths,
                 host_request_types=host_request_types)
 
-            if gather_all_token_logits:
+            if gather_context_logits:
                 np.testing.assert_allclose(ref.cpu().numpy().flatten(),
                                            res.cpu().numpy().flatten(),
                                            atol=1e-1)
@@ -682,8 +688,8 @@ class TestGPT(unittest.TestCase):
                 return ref
 
             if enable_remove_input_padding:
-                gen_ids = gen_ids.view([1, batch_size])
-                gen_position_ids = gen_position_ids.view([1, batch_size])
+                gen_ids = gen_ids.view([batch_size])
+                gen_position_ids = gen_position_ids.view([batch_size])
                 gen_last_token_ids = torch.ones_like(
                     gen_context_lengths).int().cuda()
                 gen_last_token_ids = torch.cumsum(gen_last_token_ids,
@@ -694,6 +700,7 @@ class TestGPT(unittest.TestCase):
                                                        dtype=torch.int32)
             host_max_attention_window_sizes = torch.tensor([seq_len + step],
                                                            dtype=torch.int32)
+            host_sink_token_length = torch.tensor([0], dtype=torch.int32)
 
             host_context_lengths = gen_context_lengths.cpu(
             ) if enable_remove_input_padding else None
@@ -712,6 +719,7 @@ class TestGPT(unittest.TestCase):
                 cache_indirection=cache_indirections[1],
                 host_past_key_value_lengths=host_past_key_value_lengths,
                 host_max_attention_window_sizes=host_max_attention_window_sizes,
+                host_sink_token_length=host_sink_token_length,
                 sequence_length=sequence_length,
                 host_context_lengths=host_context_lengths,
                 host_request_types=host_request_types)
@@ -744,7 +752,7 @@ class TestGPT(unittest.TestCase):
             ],
                                   dim=0)
 
-            input_ids = input_ids.view((1, -1))
+            input_ids = input_ids.view((-1, ))
 
             ctx_position_ids = torch.tensor(
                 range(seq_len), dtype=torch.int32).reshape(
@@ -755,7 +763,7 @@ class TestGPT(unittest.TestCase):
                     (-1, ))).int().cuda() * seq_len
             position_ids = torch.cat(
                 [ctx_position_ids.view((-1, )), gen_position_ids], dim=0).view(
-                    (1, -1))
+                    (-1, ))
 
             input_lengths = torch.tensor([seq_len] * num_context_input +
                                          [1] * num_generation_input,
@@ -769,6 +777,8 @@ class TestGPT(unittest.TestCase):
 
             host_max_attention_window_sizes = torch.tensor([total_length],
                                                            dtype=torch.int32)
+
+            host_sink_token_length = torch.tensor([0], dtype=torch.int32)
 
             context_lengths = torch.tensor([seq_len] * batch_size,
                                            dtype=torch.int32).cuda()
@@ -793,6 +803,7 @@ class TestGPT(unittest.TestCase):
                 cache_indirection=cache_indirections[0],
                 host_past_key_value_lengths=host_past_key_value_lengths,
                 host_max_attention_window_sizes=host_max_attention_window_sizes,
+                host_sink_token_length=host_sink_token_length,
                 sequence_length=sequence_length,
                 host_context_lengths=host_context_lengths,
                 host_request_types=host_request_types,
@@ -841,7 +852,8 @@ class TestGPT(unittest.TestCase):
             log_level, dtype, world_size, rank, gpt_config, hf_gpt, model,
             use_plugin, batch_size, seq_len, max_new_tokens, use_refit)
 
-        model_config = ModelConfig(vocab_size=gpt_config.vocab_size,
+        model_config = ModelConfig(max_batch_size=batch_size,
+                                   vocab_size=gpt_config.vocab_size,
                                    num_layers=gpt_config.n_layer,
                                    num_heads=gpt_config.n_head,
                                    num_kv_heads=gpt_config.n_head,

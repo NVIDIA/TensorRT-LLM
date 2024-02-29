@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,21 +27,28 @@ from build_engines_utils import run_command, wincopy
 import build as _egb  # isort:skip
 
 
-def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, world_size, *args):
+def build_engine(
+    weight_dir: _pl.Path,
+    engine_dir: _pl.Path,
+    world_size,
+    *args,
+    max_input_len=256,
+    max_output_len=128,
+):
     args = [
         '--log_level=error',
         '--model_dir',
         str(weight_dir),
         '--output_dir',
         str(engine_dir),
-        '--max_batch_size=256',
-        '--max_input_len=40',
-        '--max_output_len=20',
+        '--max_batch_size=64',
+        f'--max_input_len={max_input_len}',
+        f'--max_output_len={max_output_len}',
         '--max_beam_width=2',
         '--builder_opt=0',
         f'--world_size={world_size}',
     ] + list(args)
-    print("Running: " + " ".join(args))
+    print("Running: build " + " ".join(args))
     _egb.run_build(args)
 
 
@@ -108,8 +115,10 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
     weight_dir = models_dir / 'c-model' / model_name
     engine_dir = models_dir / 'rt_engine' / model_name
 
-    print("\nConverting to fp32")
     tp_pp_dir = f"tp{tp_size}-pp{pp_size}-gpu"
+    tp_dir = f"{world_size}-gpu"
+
+    print("\nConverting to fp32")
     fp32_weight_dir = weight_dir / 'fp32'
     _egc.run_conversion(
         _egc.ProgArgs(in_file=str(hf_dir),
@@ -118,7 +127,6 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
                       tensor_parallelism=tp_size))
 
     print("\nBuilding fp32 engines")
-    tp_dir = f"{world_size}-gpu"
     fp32_weight_dir_x_gpu = fp32_weight_dir / tp_dir
     build_engine(fp32_weight_dir_x_gpu, engine_dir / 'fp32-default' / tp_pp_dir,
                  tp_size, '--dtype=float32')
@@ -147,26 +155,41 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
                  '--remove_input_padding')
     # this engine can be use for in-flight batching
     ifb_args = [
-        '--dtype=float16', '--use_gpt_attention_plugin=float16',
-        '--remove_input_padding', '--paged_kv_cache',
-        '--enable_context_fmha_fp32_acc', '--max_num_tokens=10000',
-        '--use_paged_context_fmha', '--max_draft_len=5'
+        '--dtype=float16',
+        '--use_gpt_attention_plugin=float16',
+        '--remove_input_padding',
+        '--paged_kv_cache',
+        '--enable_context_fmha_fp32_acc',
+        '--max_num_tokens=10000',
+        '--use_paged_context_fmha',
     ]
     build_engine(fp16_weight_dir_x_gpu,
                  engine_dir / 'fp16-plugin-packed-paged' / tp_pp_dir, tp_size,
+                 '--max_draft_len=5', *ifb_args)
+    build_engine(fp16_weight_dir_x_gpu,
+                 engine_dir / 'fp16-plugin-packed-paged-in128' / tp_pp_dir,
+                 tp_size,
+                 max_input_len=128,
                  *ifb_args)
+
     # We build almost the same engine twice. But this engine has gather_all_token_logits
     # to extract logits from python runtime and uses context FMHA for generation to match draft model executions,
     # which uses context FMHA for draft tokens prediction.
-    # gather_all_token_logits is not supported in C++ runtime yet.
+    # Currently the gather_all_token_logits is not supported with target model of speculative decoding
     build_engine(fp16_weight_dir_x_gpu,
                  engine_dir / 'fp16-plugin-packed-paged-gather' / tp_pp_dir,
-                 tp_size, '--gather_all_token_logits',
-                 '--use_context_fmha_for_generation', *ifb_args)
+                 tp_size, '--gather_all_token_logits', *ifb_args)
+    # '--use_context_fmha_for_generation', *ifb_args) # Commented out because of `--use_context_fmha_for_generation` has bugs now: https://nvbugspro.nvidia.com/bug/4476681
     build_engine(
         fp16_weight_dir_x_gpu, engine_dir /
         'fp16-plugin-packed-paged-context-fmha-for-gen' / tp_pp_dir, tp_size,
-        '--use_context_fmha_for_generation', *ifb_args)
+        '--use_context_fmha_for_generation', '--max_draft_len=5', *ifb_args)
+
+    # build engine with lora enabled
+    build_engine(fp16_weight_dir_x_gpu,
+                 engine_dir / "fp16-plugin-packed-paged-lora" / tp_pp_dir,
+                 tp_size, '--use_lora_plugin=float16',
+                 '--lora_target_modules=attn_qkv', *ifb_args)
 
     if has_safetensor:
         _pl.Path(str(safetensor_file) + ".bak").rename(safetensor_file)

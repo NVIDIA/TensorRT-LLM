@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -89,7 +89,14 @@ def parse_arguments():
                         type=float,
                         default="0",
                         help=('Specify Top-P value of decoding.'))
-
+    parser.add_argument(
+        '--profiling_verbosity',
+        type=str,
+        default='layer_names_only',
+        choices=['layer_names_only', 'detailed', 'none'],
+        help=
+        'The profiling verbosity for the generated TRT engine. Set to detailed can inspect tactic choices and kernel parameters.'
+    )
     parser.add_argument(
         '--log_level',
         type=str,
@@ -180,6 +187,10 @@ def parse_arguments():
         help=
         'Quick sanity check with num_layer=1; will be silently ignored if --engine_dir is specified.'
     )
+    parser.add_argument('--strongly_typed',
+                        default=False,
+                        action='store_true',
+                        help='This option will reduce the building time.')
 
     parser.add_argument('--csv',
                         default=False,
@@ -226,7 +237,13 @@ def parse_arguments():
         help=
         "The number of gpus to be used for inference, only used when --build_only and --serial_build is specified"
     )
-
+    parser.add_argument(
+        '--debug_memory',
+        default=False,
+        action='store_true',
+        help=
+        "Check the estimated memory usage against the total GPU memory. Raise error if the estimated memory requirement is bigger than the total GPU memory"
+        "Warning: only GPT model family is supported for now")
     return parser.parse_args()
 
 
@@ -240,7 +257,6 @@ def main(args):
     from bert_benchmark import BERTBenchmark
     from enc_dec_benchmark import EncDecBenchmark
     from gpt_benchmark import GPTBenchmark
-    from mem_monitor import MemoryMonitor
 
     import tensorrt_llm
     from tensorrt_llm.logger import logger
@@ -270,6 +286,13 @@ def main(args):
         rank = tensorrt_llm.mpi_rank()
         world_size = tensorrt_llm.mpi_world_size()
 
+    # TODO: Re-enable memory monitor for multi-gpu benchmarks.
+    # Current Mem Monitor will cause benchmark script hang
+    # because MPI does not work well with multiprocessing.
+    disable_mem_monitor = world_size > 1
+    if not disable_mem_monitor:
+        from mem_monitor import MemoryMonitor
+
     benchmark_profiler = None
     if args.model in get_allowed_models(benchmark_type="gpt"):
         benchmark_profiler = BenchmarkProfiler()
@@ -292,6 +315,8 @@ def main(args):
     benchmarker.print_report_header(args.csv,
                                     benchmark_profiler=benchmark_profiler)
     for config in benchmarker.get_config():
+        if isinstance(benchmarker, GPTBenchmark):
+            benchmarker.check_memory(config, raise_exception=args.debug_memory)
         try:
             inputs = benchmarker.prepare_inputs(config)
         except torch.cuda.OutOfMemoryError as e:
@@ -303,8 +328,9 @@ def main(args):
         torch.cuda.empty_cache()
         latencies = []
 
-        memory_monitor = MemoryMonitor()
-        memory_monitor.start()
+        if not disable_mem_monitor:
+            memory_monitor = MemoryMonitor()
+            memory_monitor.start()
 
         iter_idx = 0
         try:
@@ -334,16 +360,31 @@ def main(args):
             )
 
         except Exception as e:
-            print("Found exception during benchmarking", e.with_traceback())
-            memory_monitor.kill()
+            logger.error("Found exception during benchmarking",
+                         e.with_traceback())
+            if not disable_mem_monitor:
+                memory_monitor.kill()
             raise e
 
-        memory_monitor.stop()
-        _, peak_gpu_used = memory_monitor.get_peak_memory_usage("GiB")
-        peak_gpu_used = round(peak_gpu_used, 3)
+        if not disable_mem_monitor:
+            memory_monitor.stop()
+            _, peak_gpu_used = memory_monitor.get_peak_memory_usage("GiB")
+            peak_gpu_used = round(peak_gpu_used, 3)
+        else:
+            peak_gpu_used = 0.0
+
         if benchmark_profiler is not None:
             benchmark_profiler.add_aux_info('iter_count', iter_idx)
             benchmark_profiler.stop()
+
+        # Print latencies to make it easier to check perf stability.
+        if len(latencies) <= 20:
+            latencies_str = str(latencies)
+        else:
+            latencies_str = ("[" + ", ".join([str(l) for l in latencies[:10]]) +
+                             "..." +
+                             ", ".join([str(l) for l in latencies[-10:]]) + "]")
+        logger.info(f"Latencies: {latencies_str}")
 
         latency = round(sum(latencies) / iter_idx, 3)
         latencies.sort()

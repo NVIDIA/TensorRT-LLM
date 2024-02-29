@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -204,7 +204,7 @@ __global__ void computeAttentionMask(AttentionMaskDataType* attentionMask, const
         case AttentionMaskType::BIDIRECTIONALGLM:
             // clang-format off
             isValid = (colIdx < seqLength - 1) ||
-                      (rowIdx == maxSeqLength - 1 && colIdx == maxSeqLength - 1);
+                      (rowIdx == seqLength - 1 && colIdx == seqLength - 1);
             // clang-format on
             // seq_length==4, max_seq_len==5
             // 1 1 1 1 0

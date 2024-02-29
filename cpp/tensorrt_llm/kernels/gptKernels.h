@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -83,6 +83,8 @@ struct BuildDecoderInfoParams
     // The kv cache capacity.
     // We will apply the limited_length_causal mask when there are not enough kv cache.
     int attentionWindowSize;
+    // The number of sink tokens in the kv cache.
+    int sinkTokenLength;
     // The number of tokens in total. It's \sum_{ii=0}^{batchSize} seqLengths[ii].
     int numTokens;
     // The type of attention.

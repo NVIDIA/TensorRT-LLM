@@ -28,6 +28,7 @@ using tensorrt_llm::common::bf16hmul2;
 using tensorrt_llm::common::bf16hmul;
 using tensorrt_llm::common::bf16hadd2;
 using tensorrt_llm::common::float22bf162;
+using tensorrt_llm::common::hsub2;
 #endif
 
 namespace tensorrt_llm
@@ -48,7 +49,7 @@ struct __align__(16) Float4_
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-struct __align__(32) Float8_
+struct __align__(16) Float8_
 {
     float2 x;
     float2 y;
@@ -333,6 +334,32 @@ struct packed_type<float, 8>
 {
     using type = Float8_;
 };
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ uint32_t sub(uint32_t a, uint32_t b)
+{
+    uint32_t c;
+    asm volatile("sub.f16x2 %0, %1, %2;\n" : "=r"(c) : "r"(a), "r"(b));
+    return c;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ __nv_bfloat162 sub(__nv_bfloat162 a, __nv_bfloat162 b)
+{
+    return hsub2(a, b);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ float2 sub(float2 a, float2 b)
+{
+    float2 c;
+    c.x = a.x - b.x;
+    c.y = a.y - b.y;
+    return c;
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -1835,6 +1862,14 @@ inline __device__ __nv_bfloat16 mul(__nv_bfloat16 a, __nv_bfloat16 b)
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <>
+inline __device__ float mul(float a, __nv_bfloat16 b)
+{
+    return mul<float>(a, __bfloat162float(b));
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <>
 inline __device__ __nv_bfloat162 mul(__nv_bfloat162 a, __nv_bfloat162 b)
 {
     return bf16hmul2(a, b);
@@ -2510,7 +2545,19 @@ inline __device__ float update_rotary_base(
 {
     const float b = (scale * kv_seq_len / max_positions) - (scale - 1);
     const float p = static_cast<float>(embed_dim) / (embed_dim - 2);
-    return base * pow(b, p);
+    return base * __powf(b, p);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ float2 update_dynamic_scaling_rotary(float base, float scale, const int kv_seq_len,
+    const int max_positions, const int embed_dim, const bool dynamic_scaling)
+{
+    const float b = kv_seq_len * __fdividef(scale, max_positions) - (scale - 1);
+    const float p = __fdividef(embed_dim, embed_dim - 2);
+    const float updated_base = dynamic_scaling ? base * __powf(b, p) : base;
+    const float updated_scale = dynamic_scaling ? 1.0f : scale;
+    return {updated_base, updated_scale};
 }
 
 inline __device__ void update_rotary_base_n_scale(float& base, float& scale, RotaryScalingType const scale_type,
@@ -2534,8 +2581,8 @@ inline __device__ void update_rotary_base_n_scale(float& base, float& scale, Rot
 inline __device__ float2 rotary_embedding_coefficient(
     const int zid, const int rot_embed_dim, const float base, const float scale, const float t_step)
 {
-    const float inv_freq = (t_step * scale) / pow(base, zid / (float) rot_embed_dim);
-    return {cos(inv_freq), sin(inv_freq)};
+    const float inv_freq = float(t_step * scale) / powf(base, zid / (float) rot_embed_dim);
+    return {cosf(inv_freq), sinf(inv_freq)};
 }
 
 inline __device__ float2 rotary_embedding_transform(const float2 v, const float2 coef)
@@ -2627,6 +2674,30 @@ inline __device__ void apply_rotary_embedding(
     const auto coef1 = rotary_embedding_coefficient(4 * tid + 2, rot_embed_dim, base, scale, t_step);
     q_.y = rotary_embedding_transform(q_.y, coef1);
     k_.y = rotary_embedding_transform(k_.y, coef1);
+}
+
+inline __device__ void apply_rotary_embedding(
+    Float8_& q, Float8_& k, int tid, int rot_embed_dim, float base, float scale, int t_step)
+{
+    if (8 * tid >= rot_embed_dim)
+    {
+        return;
+    }
+
+    Float8_& q_ = *reinterpret_cast<Float8_*>(&q);
+    Float8_& k_ = *reinterpret_cast<Float8_*>(&k);
+    const auto coef0 = rotary_embedding_coefficient(8 * tid, rot_embed_dim, base, scale, t_step);
+    q_.x = rotary_embedding_transform(q_.x, coef0);
+    k_.x = rotary_embedding_transform(k_.x, coef0);
+    const auto coef1 = rotary_embedding_coefficient(8 * tid + 2, rot_embed_dim, base, scale, t_step);
+    q_.y = rotary_embedding_transform(q_.y, coef1);
+    k_.y = rotary_embedding_transform(k_.y, coef1);
+    const auto coef2 = rotary_embedding_coefficient(8 * tid + 4, rot_embed_dim, base, scale, t_step);
+    q_.z = rotary_embedding_transform(q_.z, coef2);
+    k_.z = rotary_embedding_transform(k_.z, coef2);
+    const auto coef3 = rotary_embedding_coefficient(8 * tid + 6, rot_embed_dim, base, scale, t_step);
+    q_.w = rotary_embedding_transform(q_.w, coef3);
+    k_.w = rotary_embedding_transform(k_.w, coef3);
 }
 
 inline __device__ void apply_rotary_embedding(
@@ -2821,6 +2892,207 @@ inline __device__ void apply_rotary_embedding(
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+inline __device__ void apply_rotary_embedding(uint16_t& q, uint16_t q_pair, uint16_t& k, uint16_t k_pair, int tid0,
+    int tid1, // not used
+    int rot_embed_dim, float base, float scale, int t_step, int first_half)
+{
+    const float2 coef = rotary_embedding_coefficient(tid0, rot_embed_dim, base, scale, t_step);
+    float cos = coef.x;
+    float sin = coef.y;
+    float q_, k_;
+    if (first_half)
+    {
+        q_ = sub(mul<float>(cos, q), mul<float>(sin, q_pair));
+        k_ = sub(mul<float>(cos, k), mul<float>(sin, k_pair));
+    }
+    else
+    {
+        q_ = add(mul<float>(cos, q), mul<float>(sin, q_pair));
+        k_ = add(mul<float>(cos, k), mul<float>(sin, k_pair));
+    }
+    q = float_to_half(q_);
+    k = float_to_half(k_);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ void apply_rotary_embedding(uint32_t& q, uint32_t q_pair, uint32_t& k, uint32_t k_pair, int tid0,
+    int tid1, int rot_embed_dim, float base, float scale, int t_step, int first_half)
+{
+    const float2 coef0 = rotary_embedding_coefficient(tid0, rot_embed_dim, base, scale, t_step);
+    const float2 coef1 = rotary_embedding_coefficient(tid1, rot_embed_dim, base, scale, t_step);
+    float2 cos = make_float2(coef0.x, coef1.x);
+    float2 sin = make_float2(coef0.y, coef1.y);
+    float2 q_, k_;
+    if (first_half)
+    {
+        q_ = sub(mul<float2>(cos, q), mul<float2>(sin, q_pair));
+        k_ = sub(mul<float2>(cos, k), mul<float2>(sin, k_pair));
+    }
+    else
+    {
+        q_ = add(mul<float2>(cos, q), mul<float2>(sin, q_pair));
+        k_ = add(mul<float2>(cos, k), mul<float2>(sin, k_pair));
+    }
+    q = float2_to_half2(q_);
+    k = float2_to_half2(k_);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ void apply_rotary_embedding(__nv_bfloat16& q, __nv_bfloat16 q_pair, __nv_bfloat16& k,
+    __nv_bfloat16 k_pair, int tid0,
+    int tid1, // not used
+    int rot_embed_dim, float base, float scale, int t_step, int first_half)
+{
+    const float2 coef = rotary_embedding_coefficient(tid0, rot_embed_dim, base, scale, t_step);
+    float cos = coef.x;
+    float sin = coef.y;
+    float q_, k_;
+    if (first_half)
+    {
+        q_ = sub(mul<float>(cos, q), mul<float>(sin, q_pair));
+        k_ = sub(mul<float>(cos, k), mul<float>(sin, k_pair));
+    }
+    else
+    {
+        q_ = add(mul<float>(cos, q), mul<float>(sin, q_pair));
+        k_ = add(mul<float>(cos, k), mul<float>(sin, k_pair));
+    }
+    q = __float2bfloat16(q_);
+    k = __float2bfloat16(k_);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ void apply_rotary_embedding(__nv_bfloat162& q, __nv_bfloat162 q_pair, __nv_bfloat162& k,
+    __nv_bfloat162 k_pair, int tid0, int tid1, int rot_embed_dim, float base, float scale, int t_step, int first_half)
+{
+    const float2 coef0 = rotary_embedding_coefficient(tid0, rot_embed_dim, base, scale, t_step);
+    const float2 coef1 = rotary_embedding_coefficient(tid1, rot_embed_dim, base, scale, t_step);
+    float2 cos = make_float2(coef0.x, coef1.x);
+    float2 sin = make_float2(coef0.y, coef1.y);
+    float2 q_, k_;
+    if (first_half)
+    {
+        q_ = sub(mul<float2>(cos, q), mul<float2>(sin, q_pair));
+        k_ = sub(mul<float2>(cos, k), mul<float2>(sin, k_pair));
+    }
+    else
+    {
+        q_ = add(mul<float2>(cos, q), mul<float2>(sin, q_pair));
+        k_ = add(mul<float2>(cos, k), mul<float2>(sin, k_pair));
+    }
+    q = float22bf162(q_);
+    k = float22bf162(k_);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ void apply_rotary_embedding(float& q, float q_pair, float& k, float k_pair, int tid0,
+    int tid1, // not used
+    int rot_embed_dim, float base, float scale, int t_step, int first_half)
+{
+    const float2 coef = rotary_embedding_coefficient(tid0, rot_embed_dim, base, scale, t_step);
+    float cos = coef.x;
+    float sin = coef.y;
+    if (first_half)
+    {
+        q = sub(mul<float>(cos, q), mul<float>(sin, q_pair));
+        k = sub(mul<float>(cos, k), mul<float>(sin, k_pair));
+    }
+    else
+    {
+        q = add(mul<float>(cos, q), mul<float>(sin, q_pair));
+        k = add(mul<float>(cos, k), mul<float>(sin, k_pair));
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ void apply_rotary_embedding(float2& q, float2 q_pair, float2& k, float2 k_pair, int tid0, int tid1,
+    int rot_embed_dim, float base, float scale, int t_step, int first_half)
+{
+    const float2 coef0 = rotary_embedding_coefficient(tid0, rot_embed_dim, base, scale, t_step);
+    const float2 coef1 = rotary_embedding_coefficient(tid1, rot_embed_dim, base, scale, t_step);
+    float2 cos = make_float2(coef0.x, coef1.x);
+    float2 sin = make_float2(coef0.y, coef1.y);
+    if (first_half)
+    {
+        q = sub(mul<float2>(cos, q), mul<float2>(sin, q_pair));
+        k = sub(mul<float2>(cos, k), mul<float2>(sin, k_pair));
+    }
+    else
+    {
+        q = add(mul<float2>(cos, q), mul<float2>(sin, q_pair));
+        k = add(mul<float2>(cos, k), mul<float2>(sin, k_pair));
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename Vec_type, typename Packed_type, typename T>
+inline __device__ void apply_rotary_embedding_gptneox(Vec_type& q, Vec_type& k, int tidx, int rotary_embedding_dim,
+    float rotary_embedding_base, float rotary_embedding_scale, int t_step, bool first_half)
+{
+    // 32 threads: each hold VEC_SIZE elements (half)
+    Vec_type q_pair, k_pair;
+    constexpr int VEC_SIZE = sizeof(Vec_type) / sizeof(Packed_type);
+    constexpr int PACKED_ELT_SIZE = sizeof(Packed_type) / sizeof(T);
+    if constexpr (sizeof(Vec_type) == 2)
+    {
+        reinterpret_cast<uint16_t&>(q_pair) = __shfl_xor_sync(0xffffffff, reinterpret_cast<uint16_t&>(q), 16);
+        reinterpret_cast<uint16_t&>(k_pair) = __shfl_xor_sync(0xffffffff, reinterpret_cast<uint16_t&>(k), 16);
+    }
+    else if constexpr (sizeof(Vec_type) == 4)
+    {
+        reinterpret_cast<unsigned int&>(q_pair) = __shfl_xor_sync(0xffffffff, reinterpret_cast<unsigned int&>(q), 16);
+        reinterpret_cast<unsigned int&>(k_pair) = __shfl_xor_sync(0xffffffff, reinterpret_cast<unsigned int&>(k), 16);
+    }
+    else if constexpr (sizeof(Vec_type) >= 8)
+    {
+#pragma unroll
+        for (int vec_id = 0; vec_id < sizeof(Vec_type) / 8; vec_id++)
+        {
+            reinterpret_cast<unsigned long*>(&q_pair)[vec_id]
+                = __shfl_xor_sync(0xffffffff, reinterpret_cast<unsigned long*>(&q)[vec_id], 16);
+            reinterpret_cast<unsigned long*>(&k_pair)[vec_id]
+                = __shfl_xor_sync(0xffffffff, reinterpret_cast<unsigned long*>(&k)[vec_id], 16);
+        }
+    }
+
+    const int half_rotary_dim = rotary_embedding_dim / 2;
+
+#pragma unroll
+    for (int elt_id = 0; elt_id < VEC_SIZE; elt_id++)
+    {
+        // Pack two elements for calculation (only one if each the thread only gets one element)
+        // Assume the head size (or rotary embedding) is multiple of 8.
+        const int rotary_emd_pos0_id
+            = (tidx * VEC_SIZE * PACKED_ELT_SIZE + elt_id * PACKED_ELT_SIZE + 0 - int(!first_half) * half_rotary_dim)
+            * 2;
+        const int rotary_emd_pos1_id
+            = (tidx * VEC_SIZE * PACKED_ELT_SIZE + elt_id * PACKED_ELT_SIZE + 1 - int(!first_half) * half_rotary_dim)
+            * 2;
+
+        const bool valid_rotary_pos = rotary_emd_pos1_id < rotary_embedding_dim;
+
+        Packed_type q_ = reinterpret_cast<Packed_type*>(&q)[elt_id];
+        Packed_type q_pair_ = reinterpret_cast<Packed_type*>(&q_pair)[elt_id];
+        Packed_type k_ = reinterpret_cast<Packed_type*>(&k)[elt_id];
+        Packed_type k_pair_ = reinterpret_cast<Packed_type*>(&k_pair)[elt_id];
+
+        apply_rotary_embedding(q_, q_pair_, k_, k_pair_, rotary_emd_pos0_id, rotary_emd_pos1_id, rotary_embedding_dim,
+            rotary_embedding_base, rotary_embedding_scale, t_step, first_half);
+
+        if (valid_rotary_pos)
+        {
+            reinterpret_cast<Packed_type*>(&q)[elt_id] = q_;
+            reinterpret_cast<Packed_type*>(&k)[elt_id] = k_;
+        }
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline __device__ void convert_from_float(float* dst, float src)
@@ -2961,15 +3233,13 @@ inline __device__ void convert_from_float(Float8_* dst, Float8_ src)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename A>
-inline __device__ typename packed_type<float, num_elems<A>::value>::type convert_to_float(A u)
+inline __device__ Float8_ convert_to_float(Float8_ u)
 {
-    return {};
+    return u;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <>
 inline __device__ float4 convert_to_float(float4 u)
 {
     return u;
@@ -2977,7 +3247,6 @@ inline __device__ float4 convert_to_float(float4 u)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <>
 inline __device__ float2 convert_to_float(float2 u)
 {
     return u;
@@ -2985,7 +3254,6 @@ inline __device__ float2 convert_to_float(float2 u)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <>
 inline __device__ float convert_to_float(float u)
 {
     return u;
@@ -2993,7 +3261,6 @@ inline __device__ float convert_to_float(float u)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <>
 inline __device__ Float8_ convert_to_float(uint4 u)
 {
     Float8_ f8;
@@ -3006,7 +3273,6 @@ inline __device__ Float8_ convert_to_float(uint4 u)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <>
 inline __device__ float4 convert_to_float(uint2 u)
 {
     float4 ret;
@@ -3021,7 +3287,6 @@ inline __device__ float4 convert_to_float(uint2 u)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <>
 inline __device__ float2 convert_to_float(uint32_t u)
 {
     return half2_to_float2(u);
@@ -3029,11 +3294,45 @@ inline __device__ float2 convert_to_float(uint32_t u)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <>
 inline __device__ float convert_to_float(half u)
 {
     return static_cast<float>(u);
 }
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#ifdef ENABLE_BF16
+inline __device__ Float8_ convert_to_float(bf16_8_t u)
+{
+    Float8_ f8;
+    f8.x = bf1622float2(u.x);
+    f8.y = bf1622float2(u.y);
+    f8.z = bf1622float2(u.z);
+    f8.w = bf1622float2(u.w);
+    return f8;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ float4 convert_to_float(bf16_4_t u)
+{
+    float4 ret;
+    float2 f2x = bf1622float2(u.x);
+    float2 f2y = bf1622float2(u.y);
+    ret.x = f2x.x;
+    ret.y = f2x.y;
+    ret.z = f2y.x;
+    ret.w = f2y.y;
+    return ret;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ float2 convert_to_float(__nv_bfloat162 u)
+{
+    return bf1622float2(u);
+}
+#endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

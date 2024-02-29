@@ -27,32 +27,33 @@ namespace layers
 class BaseLayer
 {
 public:
-    BaseLayer(cudaStream_t stream, tensorrt_llm::common::IAllocator* allocator, bool is_free_buffer_after_forward,
-        cudaDeviceProp* cuda_device_prop = nullptr)
-        : stream_(stream)
-        , allocator_(allocator)
-        , cuda_device_prop_(cuda_device_prop)
-        , is_free_buffer_after_forward_(is_free_buffer_after_forward){};
+    BaseLayer(cudaStream_t stream, std::shared_ptr<tensorrt_llm::common::IAllocator> allocator,
+        cudaDeviceProp* prop = nullptr)
+        : mStream(stream)
+        , mAllocator(std::move(allocator))
+        , mCudaDeviceProp(prop)
+    {
+    }
+
     virtual ~BaseLayer() = default;
 
     virtual cudaStream_t getStream()
     {
-        return stream_;
+        return mStream;
     }
 
     virtual void setStream(cudaStream_t stream)
     {
-        stream_ = stream;
+        mStream = stream;
     }
 
 protected:
     // device environments
-    cudaStream_t stream_;
-    tensorrt_llm::common::IAllocator* allocator_;
-    cudaDeviceProp* cuda_device_prop_ = nullptr;
+    cudaStream_t mStream;
+    std::shared_ptr<tensorrt_llm::common::IAllocator> mAllocator;
+    cudaDeviceProp* mCudaDeviceProp = nullptr;
 
-    bool is_free_buffer_after_forward_;
-    bool is_allocate_buffer_ = false; // TODO to be deprecated
+    bool mIsAllocateBuffer = false; // TODO to be deprecated
 };
 
 } // namespace layers

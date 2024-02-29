@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -57,7 +57,7 @@ private:
             bufferCast<int32_t>(*this->mTopPIdValsDevice), bufferCast<int32_t>(*this->mEndOffsetsDevice),
             bufferCast<int32_t>(*this->mBeginOffsetsDevice), this->mCurandStatesDevice, params.batchSize,
             params.vocabSize, nullptr, this->mMaxTopP, bufferCast<float>(*this->mTopPsDevice), this->mStream->get(),
-            nullptr);
+            nullptr, nullptr);
         return workspaceSize;
     }
 
@@ -77,9 +77,9 @@ private:
             bufferCast<int32_t>(*this->mTopPIdValsDevice), bufferCast<int32_t>(*this->mEndOffsetsDevice),
             bufferCast<int32_t>(*this->mBeginOffsetsDevice), this->mCurandStatesDevice, params.batchSize,
             params.vocabSize, nullptr, this->mMaxTopP, bufferCast<float>(*this->mTopPsDevice), this->mStream->get(),
-            nullptr);
+            nullptr, nullptr);
 
-        // Perform batched TopK sampling
+        // Perform batched TopP sampling
         tk::invokeTopPInitialize(bufferCast<int32_t>(*this->mTopPIdValsDevice),
             bufferCast<int32_t>(*this->mEndOffsetsDevice), bufferCast<int32_t>(*this->mBeginOffsetsDevice),
             params.batchSize, params.vocabSize, this->mStream->get());
@@ -100,7 +100,7 @@ private:
             bufferCast<int32_t>(*this->mEndOffsetsDevice), bufferCast<int32_t>(*this->mBeginOffsetsDevice),
             this->mCurandStatesDevice, params.batchSize, params.vocabSize, bufferCast<int32_t>(*this->mEndIdsDevice),
             this->mMaxTopP, hasDiffRuntimeArgs ? bufferCast<float>(*this->mTopPsDevice) : nullptr, this->mStream->get(),
-            bufferCast<bool>(*this->mSkipDecodeDevice));
+            bufferCast<bool>(*this->mSkipDecodeDevice), bufferCast<int32_t>(*this->mBatchSlots));
     }
 };
 

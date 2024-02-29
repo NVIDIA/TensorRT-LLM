@@ -8,7 +8,7 @@ TensorRT-LLM
 [![python](https://img.shields.io/badge/python-3.10.12-green)](https://www.python.org/downloads/release/python-31012/)
 [![cuda](https://img.shields.io/badge/cuda-12.2-green)](https://developer.nvidia.com/cuda-downloads)
 [![trt](https://img.shields.io/badge/TRT-9.2-green)](https://developer.nvidia.com/tensorrt)
-[![version](https://img.shields.io/badge/release-0.7.1-green)](./setup.py)
+[![version](https://img.shields.io/badge/release-0.8.0-green)](./setup.py)
 [![license](https://img.shields.io/badge/license-Apache%202-blue)](./LICENSE)
 
 [Architecture](./docs/source/architecture.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Results](./docs/source/performance.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Examples](./examples/)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Documentation](./docs/source/)
@@ -17,14 +17,9 @@ TensorRT-LLM
 <div align="left">
 
 ## Latest News
+* [2024/02/06] [🚀 Speed up inference with SOTA quantization techniques in TRT-LLM](./docs/source/blogs/quantization-in-TRT-LLM.md)
+* [2024/01/30] [ New **XQA-kernel** provides **2.4x more Llama-70B throughput** within the same latency budget](./docs/source/blogs/XQA-kernel.md)
 * [2023/12/04] [**Falcon-180B** on a **single H200** GPU with INT4 AWQ, and **6.7x faster Llama-70B** over A100](./docs/source/blogs/Falcon180B-H200.md)
-
-<img src="./docs/source/blogs/media/Falcon180B-H200_H200vA100.png" alt="H200 TPS" width="400" height="auto">
-
-H200 with INT4 AWQ, runs Falcon-180B on a _single_ GPU.
-
-H200 is now 2.4x faster on Llama-70B with recent improvements to TensorRT-LLM GQA; up to 6.7x faster than A100.
-
 * [2023/11/27] [SageMaker LMI now supports TensorRT-LLM - improves throughput by 60%, compared to previous version](https://aws.amazon.com/blogs/machine-learning/boost-inference-performance-for-llms-with-new-amazon-sagemaker-containers/)
 * [2023/11/13] [H200 achieves nearly 12,000 tok/sec on Llama2-13B](./docs/source/blogs/H200launch.md)
 * [2023/10/22] [🚀 RAG on Windows using TensorRT-LLM and LlamaIndex 🦙](https://github.com/NVIDIA/trt-llm-rag-windows#readme)
@@ -43,26 +38,31 @@ H200 is now 2.4x faster on Llama-70B with recent improvements to TensorRT-LLM GQ
 
 ## Table of Contents
 
-- [TensorRT-LLM Overview](#tensorrt-llm-overview)
-- [Installation](#installation)
-- [Quick Start](#quick-start)
-- [Support Matrix](#support-matrix)
-  - [Devices](#devices)
-  - [Precision](#precision)
-  - [Key Features](#key-features)
-  - [Models](#models)
-- [Performance](#performance)
-- [Advanced Topics](#advanced-topics)
-  - [Quantization](#quantization)
-  - [In-flight Batching](#in-flight-batching)
-  - [Attention](#attention)
-  - [Graph Rewriting](#graph-rewriting)
-  - [Benchmark](#benchmark)
-- [Troubleshooting](#troubleshooting)
-- [Release notes](#release-notes)
-  - [Change Log](#change-log)
-  - [Known Issues](#known-issues)
-  - [Report Issues](#report-issues)
+- [TensorRT-LLM](#tensorrt-llm)
+  - [Latest News](#latest-news)
+  - [Table of Contents](#table-of-contents)
+  - [TensorRT-LLM Overview](#tensorrt-llm-overview)
+  - [Installation](#installation)
+  - [Quick Start](#quick-start)
+  - [Support Matrix](#support-matrix)
+    - [Devices](#devices)
+    - [Precision](#precision)
+    - [Key Features](#key-features)
+    - [Models](#models)
+  - [Performance](#performance)
+  - [Advanced Topics](#advanced-topics)
+    - [Quantization](#quantization)
+    - [In-flight Batching](#in-flight-batching)
+    - [Attention](#attention)
+    - [Graph Rewriting](#graph-rewriting)
+    - [Benchmark](#benchmark)
+  - [Troubleshooting](#troubleshooting)
+  - [Release notes](#release-notes)
+    - [Change Log](#change-log)
+      - [Versions 0.8.0](#versions-080)
+      - [For history change log, please see CHANGELOG.md.](#for-history-change-log-please-see-changelogmd)
+    - [Known Issues](#known-issues)
+    - [Report Issues](#report-issues)
 
 ## TensorRT-LLM Overview
 
@@ -108,23 +108,37 @@ concepts used in TensorRT-LLM, we recommend you to read the following
 
 ## Installation
 
-The documentation for installing TensorRT-LLM can be found
-[here](./docs/source/installation.md). An image of a Docker container with
-TensorRT-LLM and its Triton Inference Server Backend will be made available
-soon.
+After installing the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit),
+please run the following commands to install TensorRT-LLM for x86_64 users.
 
-The remaining commands in that document must be executed from the TensorRT-LLM
-container.
+```bash
+# Obtain and start the basic docker image environment.
+docker run --rm --runtime=nvidia --gpus all --entrypoint /bin/bash -it nvidia/cuda:12.1.0-devel-ubuntu22.04
 
-*For Windows installation, see [`Windows`](windows/README.md).*
+# Install dependencies, TensorRT-LLM requires Python 3.10
+apt-get update && apt-get -y install python3.10 python3-pip openmpi-bin libopenmpi-dev
+
+# Install the latest stable version (corresponding to the release branch) of TensorRT-LLM.
+pip3 install tensorrt_llm -U --extra-index-url https://pypi.nvidia.com
+
+# Check installation
+python3 -c "import tensorrt_llm"
+```
+
+For developers who have the best performance requirements, debugging needs, or use the aarch64 architecture,
+please refer to the instructions for [building from source code](docs/source/build_from_source.md).
+
+For Windows installation, see [`Windows`](windows/README.md).
 
 ## Quick Start
+
+Please be sure to complete the [installation steps](#installation) before proceeding with the following steps.
 
 To create a TensorRT engine for an existing model, there are 3 steps:
 
 1. Download pre-trained weights,
 2. Build a fully-optimized engine of the model,
-3. Deploy the engine.
+3. Deploy the engine, in other words, run the fully-optimized model.
 
 The following sections show how to use TensorRT-LLM to run the
 [BLOOM-560m](https://huggingface.co/bigscience/bloom-560m) model.
@@ -157,12 +171,11 @@ python convert_checkpoint.py --model_dir ./bloom/560M/ \
                 --output_dir ./bloom/560M/trt_ckpt/fp16/1-gpu/
 # May need to add trtllm-build to PATH, export PATH=/usr/local/bin:$PATH
 trtllm-build --checkpoint_dir ./bloom/560M/trt_ckpt/fp16/1-gpu/ \
-                --use_gemm_plugin float16 \
-                --use_gpt_attention_plugin float16 \
+                --gemm_plugin float16 \
                 --output_dir ./bloom/560M/trt_engines/fp16/1-gpu/
 ```
 
-See the BLOOM [example](examples/bloom) for more details and options regarding the `build.py` script.
+See the BLOOM [example](examples/bloom) for more details and options regarding the `trtllm-build` command.
 
 ***3. Run***
 
@@ -180,6 +193,8 @@ More details about the script and how to run the BLOOM model can be found in
 the example [folder](examples/bloom). Many more [models](#models) than BLOOM
 are implemented in TensorRT-LLM. They can be found in the
 [examples](./examples/) directory.
+
+Beyond local execution, you can also use the NVIDIA Triton Inference Server to create a production-ready deployment of your LLM as described in this [blog](https://developer.nvidia.com/blog/optimizing-inference-on-llms-with-tensorrt-llm-now-publicly-available/).
 
 ## Support Matrix
 
@@ -206,13 +221,17 @@ Lovelace architectures. Certain limitations may, however, apply.
 Various numerical precisions are supported in TensorRT-LLM. The support for
 some of those numerical features require specific architectures:
 
-|                     | FP32 | FP16 | BF16 | FP8  | INT8 | INT4 |
-| :------------------ | :--- | :--- | :--- | :--- | :--- | :--- |
-| Volta (SM70)        | Y    | Y    | N    | N    | Y    | Y    |
-| Turing (SM75)       | Y    | Y    | N    | N    | Y    | Y    |
-| Ampere (SM80, SM86) | Y    | Y    | Y    | N    | Y    | Y    |
-| Ada-Lovelace (SM89) | Y    | Y    | Y    | Y    | Y    | Y    |
-| Hopper (SM90)       | Y    | Y    | Y    | Y    | Y    | Y    |
+|                     | FP32 | FP16 | BF16 | FP8  | INT8  | INT4  |
+| :------------------ | :--- | :--- | :--- | :--- | :---- | :---- |
+| Volta (SM70)        | Y    | Y    | N    | N    | Y (1) | Y (2) |
+| Turing (SM75)       | Y    | Y    | N    | N    | Y (1) | Y (2) |
+| Ampere (SM80, SM86) | Y    | Y    | Y    | N    | Y     | Y (3) |
+| Ada-Lovelace (SM89) | Y    | Y    | Y    | Y    | Y     | Y     |
+| Hopper (SM90)       | Y    | Y    | Y    | Y    | Y     | Y     |
+
+(1) INT8 SmoothQuant is not supported on SM70 and SM75.<br>
+(2) INT4 AWQ and GPTQ are not supported on SM < 80.<br>
+(3) INT4 AWQ and GPTQ with FP8 activations require SM >= 89.
 
 In this release of TensorRT-LLM, the support for FP8 and quantized data types
 (INT8 or INT4) is not implemented for all the models. See the
@@ -248,7 +267,7 @@ The list of supported models is:
 
 * [Baichuan](examples/baichuan)
 * [BART](examples/enc_dec)
-* [Bert](examples/bert)
+* [BERT](examples/bert)
 * [Blip2](examples/blip2)
 * [BLOOM](examples/bloom)
 * [ChatGLM](examples/chatglm)
@@ -267,8 +286,10 @@ The list of supported models is:
 * [MPT](examples/mpt)
 * [mT5](examples/enc_dec)
 * [OPT](examples/opt)
+* [Phi-1.5/Phi-2](examples/phi)
 * [Qwen](examples/qwen)
 * [Replit Code](examples/mpt)
+* [RoBERTa](examples/bert)
 * [SantaCoder](examples/gpt)
 * [StarCoder](examples/gpt)
 * [T5](examples/enc_dec)
@@ -278,6 +299,15 @@ Note: [Encoder-Decoder](examples/enc_dec/) provides general encoder-decoder
 functionality that supports many encoder-decoder models such as T5 family, BART family, Whisper family, NMT family, etc. We
 unroll the exact model names in the list above to let users find specific
 models easier.
+
+The list of supported multi-modal models is:
+
+* [BLIP2 w/ OPT-2.7B](examples/multimodal)
+* [BLIP2 w/ T5-XL](examples/multimodal)
+* [LLaVA-v1.5-7B](examples/multimodal)
+* [Nougat family](examples/multimodal) Nougat-small, Nougat-base
+
+Note: Multi-modal provides general multi-modal functionality that supports many multi-modal architectures such as BLIP family, LLaVA family, etc. We unroll the exact model names in the list above to let users find specific models easier.
 
 ## Performance
 
@@ -337,7 +367,7 @@ however, that it is recommended to use the C++ version.
 ```
 may happen. One possible solution is to reduce the amount of memory needed by
 reducing the maximum batch size, input and output lengths. Another option is to
-enable plugins, for example: `--use_gpt_attention_plugin`.
+enable plugins, for example: `--gpt_attention_plugin`.
 
 * MPI + Slurm
 
@@ -375,49 +405,90 @@ For example: `mpirun -n 1 python3 examples/gpt/build.py ...`
 
 ## Release notes
 
-  * TensorRT-LLM requires TensorRT 9.2 and 23.10 containers.
+  * TensorRT-LLM requires TensorRT 9.2 and 23.12 containers.
 
 ### Change Log
 
-#### Versions 0.7.0 / 0.7.1
+#### Versions 0.8.0
 
-* Models
-  - BART and mBART support in encoder-decoder models
-  - FairSeq Neural Machine Translation (NMT) family
-  - Mixtral-8x7B model
-    - Support weight loading for HuggingFace Mixtral model
-  - OpenAI Whisper
-  - Mixture of Experts support
-  - MPT - Int4 AWQ / SmoothQuant support
-  - Baichuan FP8 quantization support
+* Model Support
+  - Phi-1.5/2.0
+  - Mamba support (see examples/mamba/README.md)
+    - The support is limited to beam width = 1 and single-node single-GPU
+  - Nougat support (see examples/multimodal/README.md#nougat)
+  - Qwen-VL support (see examples/qwenvl/README.md)
+  - RoBERTa support, thanks to the contribution from @erenup
+  - Skywork model support
+  - Add example for multimodal models (BLIP with OPT or T5, LlaVA)
 * Features
-  - [Preview] Speculative decoding
-  - Add Python binding for `GptManager`
-  - Add a Python class `ModelRunnerCpp` that wraps C++ `gptSession`
-  - System prompt caching
-  - Enable split-k for weight-only cutlass kernels
-  - FP8 KV cache support for XQA kernel
-  - New Python builder API and `trtllm-build` command(already applied to [blip2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/blip2) and [OPT](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/opt#3-build-tensorrt-engines) )
-  - Support `StoppingCriteria` and `LogitsProcessor` in Python generate API (thanks to the contribution from @zhang-ge-hao)
-  - fMHA support for chunked attention and paged kv cache
+  - Chunked context support (see docs/source/gpt_attention.md#chunked-context)
+  - LoRA support for C++ runtime (see docs/source/lora.md)
+  - Medusa decoding support (see examples/medusa/README.md)
+    - The support is limited to Python runtime for Ampere or newer GPUs with fp16 and bf16 accuracy, and the `temperature` parameter of sampling configuration should be 0
+  - StreamingLLM support for LLaMA (see docs/source/gpt_attention.md#streamingllm)
+  - Support for batch manager to return logits from context and/or generation phases
+    - Include support in the Triton backend
+  - Support AWQ and GPTQ for QWEN
+  - Support ReduceScatter plugin
+  - Support for combining `repetition_penalty` and `presence_penalty` #274
+  - Support for `frequency_penalty` #275
+  - OOTB functionality support:
+    - Baichuan
+    - InternLM
+    - Qwen
+    - BART
+  - LLaMA
+    - Support enabling INT4-AWQ along with FP8 KV Cache
+    - Support BF16 for weight-only plugin
+  - Baichuan
+    - P-tuning support
+    - INT4-AWQ and INT4-GPTQ support
+  - Decoder iteration-level profiling improvements
+  - Add `masked_select` and `cumsum` function for modeling
+  - Smooth Quantization support for ChatGLM2-6B / ChatGLM3-6B / ChatGLM2-6B-32K
+  - Add Weight-Only Support To Whisper #794, thanks to the contribution from @Eddie-Wang1120
+  - Support FP16 fMHA on NVIDIA V100 GPU
+* API
+  - Add a set of High-level APIs for end-to-end generation tasks (see examples/high-level-api/README.md)
+  - **[BREAKING CHANGES]** Migrate models to the new build workflow, including LLaMA, Mistral, Mixtral, InternLM, ChatGLM, Falcon, GPT-J, GPT-NeoX, Medusa, MPT, Baichuan and Phi (see docs/source/new_workflow.md)
+  - **[BREAKING CHANGES]** Deprecate `LayerNorm` and `RMSNorm` plugins and removed corresponding build parameters
+  - **[BREAKING CHANGES]** Remove optional parameter `maxNumSequences` for GPT manager
 * Bug fixes
-  - Fix tokenizer usage in quantize.py #288, thanks to the contribution from @0xymoro
-  - Fix LLaMa with LoRA error #637
-  - Fix LLaMA GPTQ failure #580
-  - Fix Python binding for InferenceRequest issue #528
-  - Fix CodeLlama SQ accuracy issue #453
+  - Fix the first token being abnormal issue when `--gather_all_token_logits` is enabled #639
+  - Fix LLaMA with LoRA enabled build failure #673
+  - Fix InternLM SmoothQuant build failure #705
+  - Fix Bloom int8_kv_cache functionality  #741
+  - Fix crash in `gptManagerBenchmark` #649
+  - Fix Blip2 build error #695
+  - Add pickle support for `InferenceRequest` #701
+  - Fix Mixtral-8x7b build failure with custom_all_reduce #825
+  - Fix INT8 GEMM shape #935
+  - Minor bug fixes
 * Performance
-  - MMHA optimization for MQA and GQA
-  - LoRA optimization: cutlass grouped gemm
-  - Optimize Hopper warp specialized kernels
-  - Optimize AllReduce for parallel attention on Falcon and GPT-J
-  - Enable split-k for weight-only cutlass kernel when SM>=75
+  - **[BREAKING CHANGES]** Increase default `freeGpuMemoryFraction` parameter from 0.85 to 0.9 for higher throughput
+  - **[BREAKING CHANGES]** Disable `enable_trt_overlap` argument for GPT manager by default
+  - Performance optimization of beam search kernel
+  - Add bfloat16 and paged kv cache support for optimized generation MQA/GQA kernels
+  - Custom AllReduce plugins performance optimization
+  - Top-P sampling performance optimization
+  - LoRA performance optimization
+  - Custom allreduce performance optimization by introducing a ping-pong buffer to avoid an extra synchronization cost
+  - Integrate XQA kernels for GPT-J (beamWidth=4)
 * Documentation
-  - Add [documentation for new builder workflow](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/new_workflow.md)
+  - Batch manager arguments documentation updates
+  - Add documentation for best practices for tuning the performance of TensorRT-LLM (See docs/source/perf_best_practices.md)
+  - Add documentation for Falcon AWQ support (See examples/falcon/README.md)
+  - Update to the `docs/source/new_workflow.md` documentation
+  - Update AWQ INT4 weight only quantization documentation for GPT-J
+  - Add blog: Speed up inference with SOTA quantization techniques in TRT-LLM
+  - Refine TensorRT-LLM backend README structure #133
+  - Typo fix #739
 
 #### For history change log, please see [CHANGELOG.md](./CHANGELOG.md).
 
 ### Known Issues
+
+  * On windows, running context FMHA plugin with FP16 accumulation on LLaMA, Mistral and Phi models suffers from poor accuracy and the resulting inference output may be garbled. The suggestion to workaround these is to enable FP32 accumulation when building the models, i.e. passing the options `--context_fmha disable --context_fmha_fp32_acc enable` to `trtllm-build` command as a work-around, and this should be fixed in the next version
 
   * The hang reported in issue
     [#149](https://github.com/triton-inference-server/tensorrtllm_backend/issues/149)

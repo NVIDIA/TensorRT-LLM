@@ -20,6 +20,7 @@ from transformers.pytorch_utils import Conv1D
 import tensorrt_llm
 from tensorrt_llm import logger
 from tensorrt_llm.quantization import QuantMode
+from tensorrt_llm.models.llama.utils import iterate_shard_files, load_state_dict  #TODO: move the utils to common dir shared by models
 # isort: on
 
 
@@ -157,10 +158,14 @@ def reorder_torch_qkv_weight_or_bias(v, model, is_bias=False):
 def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_dir', type=Path, default=None)
-    parser.add_argument('--world_size',
+    parser.add_argument('--tp_size',
                         type=int,
                         default=1,
-                        help='world size, only support tensor parallelism now')
+                        help='N-way tensor parallelism size')
+    parser.add_argument('--pp_size',
+                        type=int,
+                        default=1,
+                        help='N-way pipeline parallelism size')
     parser.add_argument('--dtype',
                         type=str,
                         default='float16',
@@ -206,11 +211,10 @@ def parse_arguments():
         help=
         'Try to reduce the engine size by sharing the embedding lookup table between two layers.'
         'Note: the flag might not take effect when the criteria are not met.')
-    parser.add_argument(
-        '--output_dir',
-        type=Path,
-        default='baichuan_tllm_checkpoint',
-        help='The path to save the baichuan TensorRT-LLM checkpoint')
+    parser.add_argument('--output_dir',
+                        type=Path,
+                        default='tllm_checkpoint',
+                        help='The path to save the TensorRT-LLM checkpoint')
     parser.add_argument(
         "--smoothquant",
         "-sq",
@@ -445,10 +449,9 @@ def get_tllm_linear_weight(weight,
                            plugin_weight_only_quant_type=torch.int8):
     results = {}
     if use_weight_only:
-        v = weight.t().contiguous()
-
+        v = weight.cpu().t().contiguous()
         processed_torch_weights, torch_weight_scales = \
-            torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+            torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                 v, plugin_weight_only_quant_type)
         results[prefix + 'weight'] = processed_torch_weights
         results[prefix + 'per_channel_scale'] = torch_weight_scales
@@ -478,7 +481,7 @@ def add_tllm_weight(
             raise ValueError(
                 f'Invalid configuration, got quant_mode={quant_mode}')
         processed_torch_weights, torch_weight_scales = \
-            torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+            torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                 param.t().contiguous(), quant_dtype)
         weights[name] = processed_torch_weights
         scale_name = name.replace('.weight', '.per_channel_scale')
@@ -638,7 +641,7 @@ def convert_hf_bloom(hf_bloom,
                      plugin_weight_only_quant_type=torch.int8,
                      use_smooth_quant=False,
                      bloom_qkv_param={},
-                     smooth_act_range=None,
+                     act_range=None,
                      smoother=None,
                      per_channel=False,
                      per_token=False,
@@ -669,7 +672,7 @@ def convert_hf_bloom(hf_bloom,
             qkv_weight = qkv_weight.reshape(hidden_size, 3, hidden_size)
             int8_weights = generate_int8(
                 qkv_weight,
-                smooth_act_range.get(
+                act_range.get(
                     (tllm_prex + 'self_attention.query_key_value').replace(
                         ".layers.", ".h.")),
                 is_qkv=True)
@@ -699,14 +702,20 @@ def convert_hf_bloom(hf_bloom,
                                        bias, use_weight_only,
                                        plugin_weight_only_quant_type))
         if int8_kv_cache:
+            qkv_weight = qkv_weight.reshape(hidden_size, 3, hidden_size)
+
+            int8_weights = generate_int8(
+                qkv_weight,
+                act_range.get(
+                    (tllm_prex + 'self_attention.query_key_value').replace(
+                        ".layers.", ".h.")),
+                is_qkv=True)
+
             kv_cache_weights = {}
 
             kv_cache_weights[
-                tllm_prex + 'attention.kv_orig_quant_scale'] = torch.from_numpy(
-                    np.array([1.0 / int8_weights['scale_y_quant_orig']],
-                             dtype=np.float32)).contiguous()
-            kv_cache_weights[
-                tllm_prex + 'attention.kv_quant_orig_scale'] = torch.from_numpy(
+                tllm_prex +
+                'attention.kv_cache_scaling_factor'] = torch.from_numpy(
                     np.array([int8_weights['scale_y_quant_orig']],
                              dtype=np.float32)).contiguous()
             weights.update(kv_cache_weights)
@@ -716,9 +725,8 @@ def convert_hf_bloom(hf_bloom,
             attn_dense_weight = attn_dense_weight.t()
             int8_weights = generate_int8(
                 attn_dense_weight,
-                smooth_act_range.get(
-                    (tllm_prex + 'self_attention.dense').replace(
-                        ".layers.", ".h.")))
+                act_range.get((tllm_prex + 'self_attention.dense').replace(
+                    ".layers.", ".h.")))
 
             weights.update(
                 get_tllm_linear_sq_weight(
@@ -755,7 +763,7 @@ def convert_hf_bloom(hf_bloom,
             mlp_fc_weight = mlp_fc_weight.t()
             int8_weights = generate_int8(
                 mlp_fc_weight,
-                smooth_act_range.get((tllm_prex + 'mlp.dense_h_to_4h').replace(
+                act_range.get((tllm_prex + 'mlp.dense_h_to_4h').replace(
                     ".layers.", ".h.")))
 
             weights.update(
@@ -789,7 +797,7 @@ def convert_hf_bloom(hf_bloom,
             mlp_proj_weight = mlp_proj_weight.t()
             int8_weights = generate_int8(
                 mlp_proj_weight,
-                smooth_act_range.get((tllm_prex + 'mlp.dense_4h_to_h').replace(
+                act_range.get((tllm_prex + 'mlp.dense_4h_to_h').replace(
                     ".layers.", ".h.")))
 
             weights.update(
@@ -837,10 +845,10 @@ def convert_hf_bloom(hf_bloom,
                                                     dim=0)
 
     if not use_parallel_embedding:
-        weights['transformer.embedding.weight'] = embed_w
+        weights['transformer.vocab_embedding.weight'] = embed_w
     else:
         assert hf_bloom.config.vocab_size % tensor_parallel == 0
-        weights['transformer.embedding.weight'] = split_matrix_tp(
+        weights['transformer.vocab_embedding.weight'] = split_matrix_tp(
             embed_w, tensor_parallel, rank, dim=sharding_dim)
 
     embed_f_w, embed_f_b = get_weight_and_bias(
@@ -866,8 +874,8 @@ def rename_hf_to_tllm(name: str):
         if not name.startswith('transformer.'):
             name = f'transformer.{name}'
     elif 'word_embeddings.' in name:
-        name = name.replace('word_embeddings', 'embedding')
-    if name.startswith(('ln_embed.', 'embedding.', 'ln_f.')):
+        name = name.replace('word_embeddings', 'vocab_embedding')
+    if name.startswith(('ln_embed.', 'vocab_embedding.', 'ln_f.')):
         name = f'transformer.{name}'
 
     # Parameter names in layers
@@ -906,7 +914,7 @@ def convert_from_hf_checkpoint(
     plugin_weight_only_quant_type: torch.dtype = torch.int8,
     use_smooth_quant: bool = False,
     bloom_qkv_param: Optional[Dict] = None,
-    smooth_act_range: Optional[Any] = None,
+    act_range: Optional[Any] = None,
     smoother: Optional[Any] = None,
     per_channel: bool = False,
     per_token: bool = False,
@@ -940,14 +948,9 @@ def convert_from_hf_checkpoint(
     def is_bias(_name):
         return 'bias' in _name
 
-    # Load examples/common/utils.py
-    import sys
-    sys.path.append(str(Path(__file__).parent.parent))
-    from common import utils
-
-    for model_file in utils.iterate_shard_files(model_dir, tp_rank):
+    for model_file in iterate_shard_files(model_dir, tp_rank):
         logger.debug(f'Loading file {str(model_file)}...')
-        model_params = utils.load_state_dict(model_file, dtype=dtype)
+        model_params = load_state_dict(model_file, dtype=dtype)
         for name, param in model_params.items():
             logger.debug(f'Converting weight {name}...')
             tllm_name = rename_hf_to_tllm(name)
@@ -1008,12 +1011,12 @@ def convert_from_hf_checkpoint(
 
 def do_convert_from_ckpt(args):
     return (args.model_dir.exists() and args.smoothquant is None
-            and not args.use_weight_only)
+            and not args.use_weight_only and not args.int8_kv_cache)
 
 
-def convert(worker_rank, args, convert_args):
+def convert(worker_rank, world_size, args, convert_args):
     convert_from_ckpt = do_convert_from_ckpt(args)
-    for rank in range(worker_rank, args.world_size, args.workers):
+    for rank in range(worker_rank, world_size, args.workers):
         if convert_from_ckpt:
             weights = convert_from_hf_checkpoint(rank=rank, **convert_args)
         else:
@@ -1024,17 +1027,42 @@ def convert(worker_rank, args, convert_args):
 
 def main():
     # TODO(qijun): Currently, the convert script depends on a torch op:
-    # torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix,
+    # torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix,
     # which is included in tensorrt_llm Python package. Otherwise, the convert
     # script does not need to import tensorrt_llm. Will remove it after reimplementing
     # the op with PyTorch.
     print(tensorrt_llm.__version__)
 
     args = parse_arguments()
+    world_size = args.tp_size * args.pp_size
+    assert args.pp_size == 1, "Pipeline parallelism is not supported."
+
     logger.set_level(args.log_level)
     tik = time.time()
 
     args.output_dir.mkdir(exist_ok=True, parents=True)
+
+    quant_algo = None
+    plugin_weight_only_quant_type = None
+    if args.use_weight_only and args.weight_only_precision == 'int8':
+        plugin_weight_only_quant_type = torch.int8
+        quant_algo = 'W8A16'
+    elif args.use_weight_only and args.weight_only_precision == 'int4':
+        plugin_weight_only_quant_type = torch.quint4x2
+        quant_algo = 'W4A16'
+    elif args.smoothquant:
+        if args.per_channel and args.per_token:
+            quant_algo = 'W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN'
+        elif args.per_channel and not args.per_token:
+            quant_algo = 'W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN'
+        elif not args.per_channel and args.per_token:
+            quant_algo = 'W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN'
+        else:
+            quant_algo = 'W8A8_SQ_PER_TENSOR_PLUGIN'
+
+    kv_cache_quant_algo = None
+    if args.int8_kv_cache:
+        kv_cache_quant_algo = 'INT8'
 
     hf_config = BloomConfig.from_pretrained(args.model_dir)
     config = {
@@ -1050,21 +1078,20 @@ def main():
         'hidden_act': 'gelu',
         'intermediate_size': hf_config.hidden_size * 4,
         'quantization': {
-            'use_weight_only': args.use_weight_only,
-            'weight_only_precision': args.weight_only_precision,
-            'int8_kv_cache': args.int8_kv_cache,
-            'use_smooth_quant': args.smoothquant is not None,
-            'per_channel': args.smoothquant is not None and args.per_channel,
-            'per_token': args.smoothquant is not None and args.per_token,
+            'quant_algo': quant_algo,
+            'kv_cache_quant_algo': kv_cache_quant_algo,
         },
         'mapping': {
-            'world_size': args.world_size,
-            'tp_size': args.world_size,
+            'world_size': world_size,
+            'tp_size': args.tp_size,
+            'pp_size': args.pp_size,
         },
         'use_parallel_embedding': args.use_parallel_embedding,
         'embedding_sharding_dim': args.embedding_sharding_dim,
         'share_embedding_table': args.use_embedding_sharing,
     }
+    if args.smoothquant:
+        config['quantization']['sq_use_plugin'] = True
 
     with (args.output_dir / 'config.json').open('w') as f:
         json.dump(config, f, indent=4)
@@ -1074,11 +1101,10 @@ def main():
     convert_from_ckpt = do_convert_from_ckpt(args)
     if not convert_from_ckpt:
         logger.info(f'Convert by using model')
-        hf_bloom = BloomForCausalLM.from_pretrained(
-            args.model_dir,
-            torch_dtype="auto",
-            device_map="auto" if not args.use_weight_only else None,
-            trust_remote_code=True)
+        hf_bloom = BloomForCausalLM.from_pretrained(args.model_dir,
+                                                    torch_dtype="auto",
+                                                    device_map="auto",
+                                                    trust_remote_code=True)
     else:
         logger.info(f'Convert by using checkpoint')
         hf_bloom = None
@@ -1087,12 +1113,11 @@ def main():
     bloom_qkv_param = {}
     bloom_smoother = {}
 
-    if args.smoothquant is not None:
+    if args.smoothquant is not None or args.int8_kv_cache:
         os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get(
             "TOKENIZERS_PARALLELISM", "false")
         from datasets import load_dataset
         dataset = load_dataset("lambada", split="validation", cache_dir=None)
-
         act_range = capture_activation_range(
             hf_bloom, BloomTokenizerFast.from_pretrained(args.model_dir),
             dataset)
@@ -1100,15 +1125,8 @@ def main():
             smooth_bloom_model(hf_bloom, act_range, args.smoothquant,
                                bloom_qkv_param, bloom_smoother)
 
-    if args.weight_only_precision == 'int8':
-        plugin_weight_only_quant_type = torch.int8
-    elif args.weight_only_precision == 'int4':
-        plugin_weight_only_quant_type = torch.quint4x2
-    else:
-        plugin_weight_only_quant_type = None
-
     convert_args = dict(
-        tensor_parallel=args.world_size,
+        tensor_parallel=args.tp_size,
         dtype=args.dtype,
         use_weight_only=args.use_weight_only,
         plugin_weight_only_quant_type=plugin_weight_only_quant_type,
@@ -1116,7 +1134,7 @@ def main():
         sharding_dim=args.embedding_sharding_dim,
         share_embedding_table=args.use_embedding_sharing,
         use_smooth_quant=args.smoothquant,
-        smooth_act_range=act_range,
+        act_range=act_range,
         bloom_qkv_param=bloom_qkv_param,
         smoother=bloom_smoother,
         per_channel=args.per_channel,
@@ -1129,13 +1147,15 @@ def main():
         convert_args['hf_bloom'] = hf_bloom
 
     if args.workers == 1:
-        convert(0, args, convert_args)
+        convert(0, world_size, args, convert_args)
     else:
-        if args.workers > args.world_size:
-            args.workers = args.world_size
+        if args.workers > world_size:
+            args.workers = world_size
         logger.info(f'Convert checkpoint using {args.workers} workers.')
         import torch.multiprocessing as mp
-        mp.spawn(convert, nprocs=args.workers, args=(args, convert_args))
+        mp.spawn(convert,
+                 nprocs=args.workers,
+                 args=(world_size, args, convert_args))
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))

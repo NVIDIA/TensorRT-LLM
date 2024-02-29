@@ -2,7 +2,8 @@ import argparse
 import json
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor, wait
+import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import safetensors
 import torch
@@ -14,10 +15,14 @@ import tensorrt_llm
 def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_dir', type=str, default=None)
-    parser.add_argument('--world_size',
+    parser.add_argument('--tp_size',
                         type=int,
                         default=1,
-                        help='world size, only support tensor parallelism now')
+                        help='N-way tensor parallelism size')
+    parser.add_argument('--pp_size',
+                        type=int,
+                        default=1,
+                        help='N-way pipeline parallelism size')
     parser.add_argument('--dtype',
                         type=str,
                         default='float16',
@@ -63,9 +68,6 @@ def parse_arguments():
         help=
         'Try to reduce the engine size by sharing the embedding lookup table between two layers.'
         'Note: the flag might not take effect when the criteria are not met.')
-    parser.add_argument('--use_prompt_tuning',
-                        action="store_true",
-                        default=False)
     parser.add_argument('--output_dir',
                         type=str,
                         default='tllm_checkpoint',
@@ -134,7 +136,7 @@ def get_tllm_linear_weight(weight,
     if use_weight_only:
         v = weight.t().contiguous()
         processed_torch_weights, torch_weight_scales = \
-            torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+            torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                 v, plugin_weight_only_quant_type)
         results[prefix + 'weight'] = processed_torch_weights
         results[prefix + 'per_channel_scale'] = torch_weight_scales
@@ -247,15 +249,14 @@ def convert_hf_opt(hf_model,
                                                     dim=0)
 
     if not use_parallel_embedding:
-        weights['transformer.embedding.vocab_embedding.weight'] = embed_w
+        weights['transformer.vocab_embedding.weight'] = embed_w
     else:
         assert hf_model.config.vocab_size % tensor_parallel == 0
-        weights[
-            'transformer.embedding.vocab_embedding.weight'] = split_matrix_tp(
-                embed_w, tensor_parallel, rank, dim=sharding_dim)
+        weights['transformer.vocab_embedding.weight'] = split_matrix_tp(
+            embed_w, tensor_parallel, rank, dim=sharding_dim)
 
     embed_p = get_weight(model_params, 'model.decoder.embed_positions', dtype)
-    weights['transformer.embedding.position_embedding.weight'] = embed_p[2:, :]
+    weights['transformer.position_embedding.weight'] = embed_p[2:, :]
 
     if do_layer_norm_before:
         ln_f_w, ln_f_b = get_weight_and_bias(model_params,
@@ -272,12 +273,15 @@ def convert_hf_opt(hf_model,
 
 if __name__ == '__main__':
     # TODO(qijun): Currently, the convert script depends on a torch op:
-    # torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix,
+    # torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix,
     # which is included in tensorrt_llm Python package. Otherwise, the convert
     # script does not need to import tensorrt_llm. Will remove it after reimplementing
     # the op with PyTorch.
     print(tensorrt_llm.__version__)
     args = parse_arguments()
+    world_size = args.tp_size * args.pp_size
+    assert args.pp_size == 1, "Pipeline parallelism is not supported."
+
     tik = time.time()
 
     if not os.path.exists(args.output_dir):
@@ -290,10 +294,18 @@ if __name__ == '__main__':
         args.use_embedding_sharing = False
         args.use_parallel_embedding = False
 
+    quant_algo = None
+    plugin_weight_only_quant_type = None
+    if args.use_weight_only and args.weight_only_precision == 'int8':
+        plugin_weight_only_quant_type = torch.int8
+        quant_algo = "W8A16"
+    elif args.use_weight_only and args.weight_only_precision == 'int4':
+        plugin_weight_only_quant_type = torch.quint4x2
+        quant_algo = "W4A16"
+
     config = {
         'architecture': hf_config.architectures[0],
         'dtype': args.dtype,
-        'logits_dtype': 'float32',
         'num_hidden_layers': hf_config.num_hidden_layers,
         'num_attention_heads': hf_config.num_attention_heads,
         'hidden_size': hf_config.hidden_size,
@@ -302,33 +314,27 @@ if __name__ == '__main__':
         'max_position_embeddings': hf_config.max_position_embeddings,
         'hidden_act': hf_config.activation_function,
         'quantization': {
-            'use_weight_only': args.use_weight_only,
-            'weight_only_precision': args.weight_only_precision,
+            'quant_algo': quant_algo
         },
         'mapping': {
-            'world_size': args.world_size,
-            'tp_size': args.world_size,
+            'world_size': world_size,
+            'tp_size': args.tp_size,
+            'pp_size': args.pp_size,
         },
         'use_parallel_embedding': args.use_parallel_embedding,
         'embedding_sharding_dim': args.embedding_sharding_dim,
         'share_embedding_table': args.use_embedding_sharing,
         'do_layer_norm_before': hf_config.do_layer_norm_before,
-        'use_prompt_tuning': args.use_prompt_tuning,
     }
 
     with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
         json.dump(config, f, indent=4)
 
-    if args.weight_only_precision == 'int8':
-        plugin_weight_only_quant_type = torch.int8
-    elif args.weight_only_precision == 'int4':
-        plugin_weight_only_quant_type = torch.quint4x2
-
     def covert_and_save(rank):
         weights = convert_hf_opt(
             hf_model,
             rank,
-            args.world_size,
+            world_size,
             dtype=args.dtype,
             use_weight_only=args.use_weight_only,
             plugin_weight_only_quant_type=plugin_weight_only_quant_type,
@@ -339,15 +345,23 @@ if __name__ == '__main__':
             weights, os.path.join(args.output_dir, f'rank{rank}.safetensors'))
 
     if args.workers == 1:
-        for rank in range(args.world_size):
+        for rank in range(world_size):
             covert_and_save(rank)
     else:
         with ThreadPoolExecutor(max_workers=args.workers) as p:
             futures = [
-                p.submit(covert_and_save, rank)
-                for rank in range(args.world_size)
+                p.submit(covert_and_save, rank) for rank in range(world_size)
             ]
-            wait(futures)
+            exceptions = []
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    traceback.print_exc()
+                    exceptions.append(e)
+            assert len(
+                exceptions
+            ) == 0, "Checkpoint conversion failed, please check error log."
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))

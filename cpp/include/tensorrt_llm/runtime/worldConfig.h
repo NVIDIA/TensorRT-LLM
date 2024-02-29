@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,14 +30,8 @@ public:
     static SizeType constexpr kDefaultGpusPerNode = 8;
 
     explicit WorldConfig(SizeType tensorParallelism = 1, SizeType pipelineParallelism = 1, SizeType rank = 0,
-        SizeType gpusPerNode = kDefaultGpusPerNode, std::vector<SizeType> deviceIds = {})
-        : mTensorParallelism{tensorParallelism}
-        , mPipelineParallelism{pipelineParallelism}
-        , mRank{rank}
-        , mGpusPerNode{gpusPerNode}
-        , mDeviceIds{deviceIds}
-    {
-    }
+        SizeType gpusPerNode = kDefaultGpusPerNode,
+        std::optional<std::vector<SizeType>> const& deviceIds = std::nullopt);
 
     [[nodiscard]] SizeType constexpr getSize() const noexcept
     {
@@ -74,13 +68,14 @@ public:
         return mGpusPerNode;
     }
 
+    [[nodiscard]] SizeType getGpusPerGroup() const noexcept
+    {
+        return static_cast<SizeType>(mDeviceIds.size());
+    }
+
     [[nodiscard]] SizeType getDevice() const noexcept
     {
-        if (mDeviceIds.size())
-        {
-            return mDeviceIds[mRank % mGpusPerNode];
-        }
-        return mRank % mGpusPerNode;
+        return mDeviceIds[mRank % getGpusPerGroup()];
     }
 
     [[nodiscard]] SizeType constexpr getPipelineParallelRank() const noexcept
@@ -111,17 +106,12 @@ public:
 
     [[nodiscard]] std::vector<SizeType> getPipelineParallelGroup() const;
 
-    static bool validConfig(nvinfer1::ILogger& logger, SizeType tensorParallelism, SizeType pipelineParallelism);
-
-    static WorldConfig mpi(nvinfer1::ILogger& logger, SizeType gpusPerNode = kDefaultGpusPerNode,
-        std::optional<SizeType> tensorParallelism = std::nullopt,
-        std::optional<SizeType> pipelineParallelism = std::nullopt,
-        std::optional<std::vector<SizeType>> userSpecifiedDeviceIds = std::nullopt);
+    static bool validConfig(SizeType tensorParallelism, SizeType pipelineParallelism);
 
     static WorldConfig mpi(SizeType gpusPerNode = kDefaultGpusPerNode,
         std::optional<SizeType> tensorParallelism = std::nullopt,
         std::optional<SizeType> pipelineParallelism = std::nullopt,
-        std::optional<std::vector<SizeType>> userSpecifiedDeviceIds = std::nullopt);
+        std::optional<std::vector<SizeType>> const& deviceIds = std::nullopt);
 
 private:
     SizeType mTensorParallelism;

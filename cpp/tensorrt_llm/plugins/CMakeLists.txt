@@ -34,8 +34,6 @@ set(PLUGIN_LISTS
     gptAttentionCommon
     gptAttentionPlugin
     identityPlugin
-    layernormPlugin
-    rmsnormPlugin
     gemmPlugin
     smoothQuantGemmPlugin
     quantizePerTokenPlugin
@@ -46,7 +44,8 @@ set(PLUGIN_LISTS
     weightOnlyQuantMatmulPlugin
     lookupPlugin
     loraPlugin
-    mixtureOfExperts)
+    mixtureOfExperts
+    selectiveScanPlugin)
 
 foreach(PLUGIN_ITER ${PLUGIN_LISTS})
   include_directories(${PLUGIN_ITER})
@@ -68,7 +67,7 @@ list(APPEND PLUGIN_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/api/tllmPlugin.cpp")
 # ################################# SHARED LIBRARY
 # ##############################################################################
 
-if(MSVC)
+if(WIN32)
   set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS 1)
 endif()
 
@@ -92,7 +91,7 @@ set_target_properties(
              LIBRARY_OUTPUT_DIRECTORY "${TRT_OUT_DIR}"
              RUNTIME_OUTPUT_DIRECTORY "${TRT_OUT_DIR}")
 
-if(MSVC)
+if(WIN32)
   set_target_properties(
     ${PLUGIN_SHARED_TARGET}
     PROPERTIES LINK_FLAGS "/DEF:${PLUGIN_EXPORT_DEF} ${UNDEFINED_FLAG}")
@@ -101,7 +100,7 @@ else()
     ${PLUGIN_SHARED_TARGET}
     PROPERTIES
       LINK_FLAGS
-      "-Wl,--exclude-libs,ALL -Wl,--version-script=${PLUGIN_EXPORT_MAP} ${UNDEFINED_FLAG}"
+      "-Wl,--exclude-libs,ALL -Wl,--version-script=${PLUGIN_EXPORT_MAP} -Wl,-rpath,'$ORIGIN' ${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}"
   )
 endif()
 
@@ -118,7 +117,8 @@ target_link_libraries(
   ${CUDNN_LIB}
   nvinfer
   ${CUDA_DRV_LIB}
+  ${CUDA_RT_LIB}
   ${CMAKE_DL_LIBS}
   ${MPI_C_LIBRARIES}
   ${NCCL_LIB}
-  ${STATIC_TARGET})
+  ${SHARED_TARGET})

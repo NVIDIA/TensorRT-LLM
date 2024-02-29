@@ -45,7 +45,11 @@ LayernormQuantizationPlugin::LayernormQuantizationPlugin(const void* data, size_
     read(d, mUseDiffOfSquares);
     read(d, mDynActScaling);
     read(d, mType);
-    TLLM_CHECK(d == a + length);
+    TLLM_CHECK_WITH_INFO(d == a + length,
+        "Expected length (%d) != real length (%d). This is often "
+        "caused by using different TensorRT-LLM version to build "
+        "engine and run engine.",
+        (int) length, (int) (d - a));
 }
 
 // IPluginV2DynamicExt Methods

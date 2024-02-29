@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -39,8 +39,8 @@ public:
     StatefulGptDecoder(std::size_t vocabSize, std::size_t vocabSizePadded, CudaStreamPtr stream);
 
     //! Setup the decoder before calling `forward()`
-    void setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxAttentionWindow, SizeType maxSequenceLength,
-        SizeType maxTokensPerStep, nvinfer1::DataType dtype) override;
+    void setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxAttentionWindow, SizeType sinkTokenLength,
+        SizeType maxSequenceLength, SizeType maxTokensPerStep, nvinfer1::DataType dtype) override;
 
     //! @brief Initialize the decoder with new batch of inputs.
     void newBatch(
@@ -98,8 +98,8 @@ public:
     }
 
 private:
-    void reshapeBuffers(
-        SizeType batchSize, SizeType beamWidth, SizeType mMaxAttentionWindow, SizeType maxSequenceLength);
+    void reshapeBuffers(SizeType batchSize, SizeType beamWidth, SizeType mMaxAttentionWindow, SizeType mSinkTokenLength,
+        SizeType maxSequenceLength);
 
 private:
     std::size_t const mVocabSize;
@@ -118,5 +118,6 @@ private:
     SizeType mNbSteps;
     SizeType mMaxSequenceLength{};
     SizeType mMaxAttentionWindow{};
+    SizeType mSinkTokenLength{};
 };
 } // namespace tensorrt_llm::runtime

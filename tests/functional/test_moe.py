@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,8 +19,11 @@ import unittest
 
 import numpy as np
 import pytest
-import tensorrt as trt
+
+# isort: off
 import torch
+import tensorrt as trt
+# isort: on
 from parameterized import parameterized
 from polygraphy.backend.trt import CreateConfig, EngineFromNetwork, TrtRunner
 
@@ -61,7 +64,7 @@ def quant_dequant(weights, quant_mode):
         return weights
     # use the test version `_symmetric_...` to get the non-interleaved weights
     type = torch.quint4x2 if quant_mode.is_int4_weight_only() else torch.int8
-    quant_weights, _, torch_weight_scales = torch.ops.fastertransformer._symmetric_quantize_last_axis_of_batched_matrix(
+    quant_weights, _, torch_weight_scales = torch.ops.trtllm._symmetric_quantize_last_axis_of_batched_matrix(
         weights.T.cpu().contiguous(), type)
 
     # Unpack the int4s int int8s
@@ -462,7 +465,7 @@ class TestFunctional(unittest.TestCase):
                                               2).contiguous().cpu()
             type = torch.quint4x2 if quant_mode.is_int4_weight_only(
             ) else torch.int8
-            processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+            processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                 torch_transpose, type)
             # Change the shape to what moe expects without touching the underlying format
             weight.value = np.ascontiguousarray(

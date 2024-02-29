@@ -16,6 +16,10 @@
  */
 #include "recvPlugin.h"
 
+#include "tensorrt_llm/common/mpiUtils.h"
+
+#include <nccl.h>
+
 using namespace nvinfer1;
 using tensorrt_llm::plugins::RecvPluginCreator;
 using tensorrt_llm::plugins::RecvPlugin;
@@ -37,7 +41,11 @@ RecvPlugin::RecvPlugin(const void* data, size_t length)
     const char *d = reinterpret_cast<const char*>(data), *a = d;
     read(d, mType);
     read(d, mSrcRank);
-    TLLM_CHECK(d == a + length);
+    TLLM_CHECK_WITH_INFO(d == a + length,
+        "Expected length (%d) != real length (%d). This is often "
+        "caused by using different TensorRT-LLM version to build "
+        "engine and run engine.",
+        (int) length, (int) (d - a));
 }
 
 // IPluginV2DynamicExt Methods
@@ -119,13 +127,8 @@ int RecvPlugin::initialize() noexcept
     {
         return 0;
     }
-    int myRank, nRanks;
-    MPICHECK(MPI_Comm_rank(MPI_COMM_WORLD, &myRank));
-    MPICHECK(MPI_Comm_size(MPI_COMM_WORLD, &nRanks));
-
     ncclUniqueId id;
-    MPI_Status status;
-    MPICHECK(MPI_Recv(&id, sizeof(id), MPI_BYTE, mSrcRank, 0, MPI_COMM_WORLD, &status));
+    COMM_SESSION.recv(id, mSrcRank, 0);
     NCCLCHECK(ncclCommInitRank(&mComm, 2, id, 1));
     return 0;
 }

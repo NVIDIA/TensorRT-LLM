@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -49,6 +49,11 @@ public:
         return mPinned;
     }
 
+    [[nodiscard]] SizeType getUVM() const
+    {
+        return mUVM;
+    }
+
     [[nodiscard]] DiffType getGpuDiff() const
     {
         return mGpuDiff;
@@ -62,6 +67,11 @@ public:
     [[nodiscard]] DiffType getPinnedDiff() const
     {
         return mPinnedDiff;
+    }
+
+    [[nodiscard]] DiffType getUVMDiff() const
+    {
+        return mUVMDiff;
     }
 
     template <MemoryType T>
@@ -82,6 +92,11 @@ public:
         {
             mPinned += size;
             mPinnedDiff = sizeDiff;
+        }
+        else if constexpr (T == MemoryType::kUVM)
+        {
+            mUVM += size;
+            mUVMDiff = sizeDiff;
         }
         else
         {
@@ -110,6 +125,11 @@ public:
             mPinned -= std::min(size, mPinned);
             mPinnedDiff = sizeDiff;
         }
+        else if constexpr (T == MemoryType::kUVM)
+        {
+            mUVM -= std::min(size, mUVM);
+            mUVMDiff = sizeDiff;
+        }
         else
         {
             TLLM_THROW("Unknown memory type: %s", MemoryTypeString<T>::value);
@@ -120,6 +140,7 @@ public:
 
     static MemoryCounters& getInstance()
     {
+        static thread_local MemoryCounters mInstance;
         return mInstance;
     }
 
@@ -127,12 +148,11 @@ public:
 
     static std::string bytesToString(DiffType bytes, int precision = 2);
 
-    std::string toString() const;
+    [[nodiscard]] std::string toString() const;
 
 private:
-    SizeType mGpu{}, mCpu{}, mPinned{};
-    DiffType mGpuDiff{}, mCpuDiff{}, mPinnedDiff{};
-    static thread_local MemoryCounters mInstance;
+    SizeType mGpu{}, mCpu{}, mPinned{}, mUVM{};
+    DiffType mGpuDiff{}, mCpuDiff{}, mPinnedDiff{}, mUVMDiff{};
 };
 
 } // namespace tensorrt_llm::runtime

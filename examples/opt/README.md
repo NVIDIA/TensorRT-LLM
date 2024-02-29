@@ -69,7 +69,7 @@ python3 convert_checkpoint.py --model_dir ./opt-2.7b \
 # OPT-66B
 python3 convert_checkpoint.py --model_dir ./opt-66b \
                 --dtype float16 \
-                --world_size 4 \
+                --tp_size 4 \
                 --output_dir ./opt/66B/trt_ckpt/fp16/4-gpu/ \
                 --workers 2
 ```
@@ -79,8 +79,7 @@ python3 convert_checkpoint.py --model_dir ./opt-66b \
 ```bash
 # OPT-125M
 trtllm-build --checkpoint_dir ./opt/125M/trt_ckpt/fp16/1-gpu/ \
-                --use_gemm_plugin float16 \
-                --use_gpt_attention_plugin float16 \
+                --gemm_plugin float16 \
                 --max_batch_size 8 \
                 --max_input_len 924 \
                 --max_output_len 100 \
@@ -88,8 +87,7 @@ trtllm-build --checkpoint_dir ./opt/125M/trt_ckpt/fp16/1-gpu/ \
 
 # OPT-350M
 trtllm-build --checkpoint_dir ./opt/350M/trt_ckpt/fp16/1-gpu/ \
-                --use_gemm_plugin float16 \
-                --use_gpt_attention_plugin float16 \
+                --gemm_plugin float16 \
                 --max_batch_size 8 \
                 --max_input_len 924 \
                 --max_output_len 100 \
@@ -97,8 +95,7 @@ trtllm-build --checkpoint_dir ./opt/350M/trt_ckpt/fp16/1-gpu/ \
 
 # OPT-2.7B
 trtllm-build --checkpoint_dir ./opt/2.7B/trt_ckpt/fp16/1-gpu/ \
-                --use_gemm_plugin float16 \
-                --use_gpt_attention_plugin float16 \
+                --gemm_plugin float16 \
                 --max_batch_size 8 \
                 --max_input_len 924 \
                 --max_output_len 100 \
@@ -106,8 +103,7 @@ trtllm-build --checkpoint_dir ./opt/2.7B/trt_ckpt/fp16/1-gpu/ \
 
 # OPT-66B
 trtllm-build --checkpoint_dir ./opt/66B/trt_ckpt/fp16/4-gpu/ \
-                --use_gemm_plugin float16 \
-                --use_gpt_attention_plugin float16 \
+                --gemm_plugin float16 \
                 --max_batch_size 8 \
                 --max_input_len 924 \
                 --max_output_len 100 \
@@ -168,15 +164,15 @@ mpirun -n 4 --allow-run-as-root \
 
 You can enable the FMHA kernels for OPT by adding `--enable_context_fmha` to the invocation of `trtllm-build`. Note that it is disabled by default because of possible accuracy issues due to the use of Flash Attention.
 
-If you find that the default fp16 accumulation (`--enable_context_fmha`) cannot meet the requirement, you can try to enable fp32 accumulation by adding `--enable_context_fmha_fp32_acc`. However, it is expected to see performance drop.
+If you find that the default fp16 accumulation (`--enable_context_fmha`) cannot meet the requirement, you can try to enable fp32 accumulation by adding `--context_fmha_fp32_acc enable`. However, it is expected to see performance drop.
 
-Note `--enable_context_fmha` / `--enable_context_fmha_fp32_acc` has to be used together with `--use_gpt_attention_plugin float16`.
+Note `--context_fmha enable` / `--context_fmha_fp32_acc enable` has to be used together with `--gpt_attention_plugin float16`.
 
 ## Tensor Parallelism for Embedding Lookup Table.
 Since the embedding lookup table can be several gigabytes in size. We can distribute this weight across multiple GPUs in order to reduce the memory consumption per GPU.
 
 ### 1. Enable this feature
-To enable this feature, add the flag `--use_parallel_embedding` to `build.py`.
+To enable this feature, add the flag `--use_parallel_embedding` to `trtllm-build`.
 
 ### 2. Choose the dimension for tensor parallelism
 
@@ -188,7 +184,7 @@ Assume the size of embedding lookup table is (vocab\_size \* hidden\_size), we c
 python3 convert_checkpoint.py --model_dir ./opt-125m \
                 --dtype float16 \
                 --output_dir ./opt/125M/trt_ckpt/fp16/2-gpu/ \
-                --world_size 2 \
+                --tp_size 2 \
                 --use_parallel_embedding \
                 --embedding_sharding_dim 1
 ```
@@ -202,14 +198,13 @@ Meanwhile, we provide a lookup plugin to support tensor parallelism on vocab\_si
 python3 convert_checkpoint.py --model_dir ./opt-125m \
                 --dtype float16 \
                 --output_dir ./opt/125M/trt_ckpt/fp16/2-gpu/ \
-                --world_size 2 \
+                --tp_size 2 \
                 --use_parallel_embedding \
                 --embedding_sharding_dim 0
 
 trtllm-build --checkpoint_dir ./opt/125M/trt_ckpt/fp16/2-gpu/ \
-                --use_gemm_plugin float16 \
-                --use_gpt_attention_plugin float16 \
-                --use_lookup_plugin float16 \
+                --gemm_plugin float16 \
+                --lookup_plugin float16 \
                 --max_batch_size 8 \
                 --max_input_len 924 \
                 --max_output_len 100 \
@@ -230,8 +225,7 @@ mpirun -n 2 --allow-run-as-root \
 
 ```Bash
 trtllm-build --checkpoint_dir ./opt/125M/trt_ckpt/fp16/2-gpu/ \
-                --use_gemm_plugin float16 \
-                --use_gpt_attention_plugin float16 \
+                --gemm_plugin float16 \
                 --max_batch_size 8 \
                 --max_input_len 924 \
                 --max_output_len 100 \

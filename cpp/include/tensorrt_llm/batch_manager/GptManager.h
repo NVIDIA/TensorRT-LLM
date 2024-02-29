@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,15 +17,13 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/BatchManager.h"
-#include "tensorrt_llm/batch_manager/batchScheduler.h"
 #include "tensorrt_llm/batch_manager/callbacks.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/batch_manager/schedulerPolicy.h"
 #include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
+
 #include <atomic>
-#include <cstdlib>
 #include <filesystem>
-#include <functional>
-#include <map>
 #include <optional>
 
 namespace nvinfer1
@@ -74,6 +72,8 @@ public:
 
     BatchManagerErrorCode_t shutdown();
 
+    SizeType getNumActiveRequests();
+
     virtual ~GptManager();
 
 protected:
@@ -83,7 +83,7 @@ protected:
 
 private:
     SizeType getMaxInputLen() const;
-    SizeType getMaxOutputLen() const;
+    SizeType getMaxSequenceLen() const;
     SizeType getMaxNumSequences() const;
 
     void validateLlmRequest(LlmRequest& newReq) const;

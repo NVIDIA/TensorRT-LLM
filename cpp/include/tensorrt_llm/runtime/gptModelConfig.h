@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/loraModule.h"
 #include <NvInferRuntime.h>
 
 namespace tensorrt_llm::runtime
@@ -32,13 +33,14 @@ public:
         kGlm = 1, // https://github.com/THUDM/GLM and https://github.com/THUDM/ChatGLM-6B
     };
 
-    constexpr explicit GptModelConfig(
+    explicit GptModelConfig(
         SizeType vocabSize, SizeType nbLayers, SizeType nbHeads, SizeType hiddenSize, nvinfer1::DataType dtype)
         : mVocabSize(vocabSize)
         , mNbLayers(nbLayers)
         , mNbHeads(nbHeads)
         , mNbKvHeads(nbHeads)
         , mHiddenSize(hiddenSize)
+        , mSizePerHead(mHiddenSize / mNbHeads)
         , mDataType(dtype)
         , mUseGptAttentionPlugin(false)
         , mInputPacked{false}
@@ -48,7 +50,7 @@ public:
         , mMaxBatchSize(0)
         , mMaxBeamWidth(0)
         , mMaxInputLen(0)
-        , mMaxOutputLen(0)
+        , mMaxSequenceLen(0)
         , mMaxNumTokens(std::nullopt)
         , mComputeContextLogits(false)
         , mComputeGenerationLogits(false)
@@ -58,6 +60,8 @@ public:
         , mMaxDraftLen(0)
         , mUseContextFMHAForGeneration(false)
         , mPagedContextFMHA(false)
+        , mUseLoraPlugin(false)
+        , mMlpHiddenSize(0)
     {
     }
 
@@ -99,7 +103,12 @@ public:
 
     [[nodiscard]] SizeType constexpr getSizePerHead() const noexcept
     {
-        return mHiddenSize / mNbHeads;
+        return mSizePerHead;
+    }
+
+    void constexpr setSizePerHead(SizeType sizePerHead) noexcept
+    {
+        mSizePerHead = sizePerHead;
     }
 
     [[nodiscard]] nvinfer1::DataType constexpr getDataType() const noexcept
@@ -192,14 +201,14 @@ public:
         mMaxInputLen = maxInputLen;
     }
 
-    [[nodiscard]] SizeType constexpr getMaxOutputLen() const noexcept
+    [[nodiscard]] SizeType constexpr getMaxSequenceLen() const noexcept
     {
-        return mMaxOutputLen;
+        return mMaxSequenceLen;
     }
 
-    void constexpr setMaxOutputLen(SizeType maxOutputLen) noexcept
+    void constexpr setMaxSequenceLen(SizeType maxSequenceLen) noexcept
     {
-        mMaxOutputLen = maxOutputLen;
+        mMaxSequenceLen = maxSequenceLen;
     }
 
     [[nodiscard]] std::optional<SizeType> constexpr getMaxNumTokens() const noexcept
@@ -302,12 +311,53 @@ public:
         return mPagedContextFMHA;
     }
 
+    [[nodiscard]] bool constexpr useLoraPlugin() const noexcept
+    {
+        return mUseLoraPlugin;
+    }
+
+    void constexpr useLoraPlugin(bool useLoraPlugin) noexcept
+    {
+        mUseLoraPlugin = useLoraPlugin;
+    }
+
+    std::vector<LoraModule> const& getLoraModules() const noexcept
+    {
+        return mLoraModules;
+    }
+
+    void setLoraModules(std::vector<LoraModule> const& loraModules) noexcept
+    {
+        mLoraModules = loraModules;
+    }
+
+    [[nodiscard]] SizeType constexpr getMlpHiddenSize() const noexcept
+    {
+        return mMlpHiddenSize;
+    }
+
+    void constexpr setMlpHiddenSize(SizeType mlpHiddenSize) noexcept
+    {
+        mMlpHiddenSize = mlpHiddenSize;
+    }
+
+    [[nodiscard]] SizeType constexpr getMaxLoraRank() const noexcept
+    {
+        return mMaxLoraRank;
+    }
+
+    void constexpr setMaxLoraRank(SizeType maxLoraRank) noexcept
+    {
+        mMaxLoraRank = maxLoraRank;
+    }
+
 private:
     SizeType mVocabSize;
     SizeType mNbLayers;
     SizeType mNbHeads;
     SizeType mNbKvHeads;
     SizeType mHiddenSize;
+    SizeType mSizePerHead;
     nvinfer1::DataType mDataType;
     bool mUseGptAttentionPlugin;
     bool mInputPacked;
@@ -317,7 +367,7 @@ private:
     SizeType mMaxBatchSize;
     SizeType mMaxBeamWidth;
     SizeType mMaxInputLen;
-    SizeType mMaxOutputLen;
+    SizeType mMaxSequenceLen;
     std::optional<SizeType> mMaxNumTokens;
 
     bool mComputeContextLogits;
@@ -330,6 +380,10 @@ private:
 
     bool mUseContextFMHAForGeneration;
     bool mPagedContextFMHA;
-};
 
+    bool mUseLoraPlugin;
+    std::vector<LoraModule> mLoraModules;
+    SizeType mMlpHiddenSize;
+    SizeType mMaxLoraRank;
+};
 } // namespace tensorrt_llm::runtime

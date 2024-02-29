@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,16 +31,16 @@ namespace tcc = tensorrt_llm::common::conversion;
 using namespace tensorrt_llm::runtime;
 
 template <typename T>
-GptDecoder<T>::GptDecoder(size_t vocabSize, size_t vocabSizePadded, CudaStreamPtr const& stream)
+GptDecoder<T>::GptDecoder(size_t maxBatchSize, size_t vocabSize, size_t vocabSizePadded, CudaStreamPtr const& stream)
     : mManager{stream}
-    , mAllocator{mManager}
 {
-    bool isFreeBufferAfterForward{false};
     cudaDeviceProp prop;
     tc::check_cuda_error(cudaGetDeviceProperties(&prop, 0));
 
+    auto allocator = std::make_shared<common::CudaAllocator>(mManager);
+
     mDynamicDecodeLayer = std::make_shared<tensorrt_llm::layers::DynamicDecodeLayer<T>>(
-        vocabSize, vocabSizePadded, stream->get(), &mAllocator, isFreeBufferAfterForward, &prop);
+        maxBatchSize, vocabSize, vocabSizePadded, stream->get(), std::move(allocator), &prop);
 
     auto constexpr nvFloatType = TRTDataType<float>::value;
     mLogProbsTiled = mManager.emptyTensor(MemoryType::kGPU, nvFloatType);
@@ -53,12 +53,14 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
 
     typename layers::DynamicDecodeLayer<T>::SetupParams setupParams;
 
-    setupParams.random_seed = samplingConfig.randomSeed;
+    setupParams.randomSeed = samplingConfig.randomSeed;
 
     setupParams.repetition_penalty = samplingConfig.repetitionPenalty;
     setupParams.presence_penalty = samplingConfig.presencePenalty;
+    setupParams.frequency_penalty = samplingConfig.frequencyPenalty;
     setupParams.temperature = samplingConfig.temperature;
     setupParams.min_length = samplingConfig.minLength;
+    setupParams.normalize_log_probs = samplingConfig.normalizeLogProbs;
 
     // signed to unsigned
     if (samplingConfig.topK)
@@ -75,7 +77,7 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
     setupParams.beam_search_diversity_rate = samplingConfig.beamSearchDiversityRate;
     setupParams.length_penalty = samplingConfig.lengthPenalty;
 
-    mDynamicDecodeLayer->setup(batchSize, samplingConfig.beamWidth, setupParams);
+    mDynamicDecodeLayer->setup(batchSize, samplingConfig.beamWidth, nullptr, setupParams);
 
     mLogProbsTiled->reshape(
         ITensor::makeShape({maxSequenceLength, static_cast<SizeType>(batchSize), samplingConfig.beamWidth}));
@@ -100,7 +102,8 @@ typename tl::DynamicDecodeLayer<T>::ForwardParams prepareInputs(DecodingInput co
 
     auto constexpr ite = 0; // no pipeline parallelism
     typename tl::DynamicDecodeLayer<T>::ForwardParams forwardParams{input.step, ite, input.maxLength,
-        input.maxAttentionWindow, input.batchSize, tcc::toTllmTensor(*input.logits), tcc::toTllmTensor(*input.endIds)};
+        input.maxAttentionWindow, input.sinkTokenLength, input.maxBatchSize, tcc::toTllmTensor(*input.logits),
+        tcc::toTllmTensor(*input.endIds)};
 
     if (input.cacheIndirection)
     {

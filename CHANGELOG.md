@@ -1,5 +1,41 @@
 # Change Log
 
+## Versions 0.7.0 / 0.7.1
+
+* Models
+  - BART and mBART support in encoder-decoder models
+  - FairSeq Neural Machine Translation (NMT) family
+  - Mixtral-8x7B model
+    - Support weight loading for HuggingFace Mixtral model
+  - OpenAI Whisper
+  - Mixture of Experts support
+  - MPT - Int4 AWQ / SmoothQuant support
+  - Baichuan FP8 quantization support
+* Features
+  - [Preview] Speculative decoding
+  - Add Python binding for `GptManager`
+  - Add a Python class `ModelRunnerCpp` that wraps C++ `gptSession`
+  - System prompt caching
+  - Enable split-k for weight-only cutlass kernels
+  - FP8 KV cache support for XQA kernel
+  - New Python builder API and `trtllm-build` command(already applied to [blip2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/blip2) and [OPT](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/opt#3-build-tensorrt-engines) )
+  - Support `StoppingCriteria` and `LogitsProcessor` in Python generate API (thanks to the contribution from @zhang-ge-hao)
+  - fMHA support for chunked attention and paged kv cache
+* Bug fixes
+  - Fix tokenizer usage in quantize.py #288, thanks to the contribution from @0xymoro
+  - Fix LLaMa with LoRA error #637
+  - Fix LLaMA GPTQ failure #580
+  - Fix Python binding for InferenceRequest issue #528
+  - Fix CodeLlama SQ accuracy issue #453
+* Performance
+  - MMHA optimization for MQA and GQA
+  - LoRA optimization: cutlass grouped gemm
+  - Optimize Hopper warp specialized kernels
+  - Optimize AllReduce for parallel attention on Falcon and GPT-J
+  - Enable split-k for weight-only cutlass kernel when SM>=75
+* Documentation
+  - Add [documentation for new builder workflow](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/new_workflow.md)
+
 ## Versions 0.6.0 / 0.6.1
 
   * Models

@@ -341,31 +341,30 @@ Tensor pack_int8_tensor_to_packed_int4(Tensor weight)
 
 // Utility methods that may be useful for preprocessing weights in torch.
 static auto symmetric_quantize_last_axis_of_batched_matrix
-    = torch::RegisterOperators("fastertransformer::symmetric_quantize_last_axis_of_batched_matrix",
+    = torch::RegisterOperators("trtllm::symmetric_quantize_last_axis_of_batched_matrix",
         &torch_ext::symmetric_quantize_last_axis_of_batched_matrix);
 
 static auto preprocess_weights_for_mixed_gemm = torch::RegisterOperators(
-    "fastertransformer::preprocess_weights_for_mixed_gemm", &torch_ext::preprocess_weights_for_mixed_gemm);
+    "trtllm::preprocess_weights_for_mixed_gemm", &torch_ext::preprocess_weights_for_mixed_gemm);
 
 static auto unpack_int4_packed_tensor_to_int8 = torch::RegisterOperators(
-    "fastertransformer::unpack_int4_packed_tensor_to_int8", &torch_ext::unpack_int4_packed_tensor_to_int8);
+    "trtllm::unpack_int4_packed_tensor_to_int8", &torch_ext::unpack_int4_packed_tensor_to_int8);
 
-static auto pack_int8_tensor_to_packed_int4 = torch::RegisterOperators(
-    "fastertransformer::pack_int8_tensor_to_packed_int4", &torch_ext::pack_int8_tensor_to_packed_int4);
+static auto pack_int8_tensor_to_packed_int4
+    = torch::RegisterOperators("trtllm::pack_int8_tensor_to_packed_int4", &torch_ext::pack_int8_tensor_to_packed_int4);
 
 // Utility methods exposed purely for unit tests in torch.
 static auto _symmetric_quantize_last_axis_of_batched_matrix
-    = torch::RegisterOperators("fastertransformer::_symmetric_quantize_last_axis_of_batched_matrix",
+    = torch::RegisterOperators("trtllm::_symmetric_quantize_last_axis_of_batched_matrix",
         &torch_ext::_symmetric_quantize_last_axis_of_batched_matrix);
 
-static auto add_bias_and_interleave_int4s = torch::RegisterOperators(
-    "fastertransformer::_add_bias_and_interleave_int4s", &torch_ext::add_bias_and_interleave_int4s);
+static auto add_bias_and_interleave_int4s
+    = torch::RegisterOperators("trtllm::_add_bias_and_interleave_int4s", &torch_ext::add_bias_and_interleave_int4s);
 
-static auto add_bias_and_interleave_int8s = torch::RegisterOperators(
-    "fastertransformer::_add_bias_and_interleave_int8s", &torch_ext::add_bias_and_interleave_int8s);
+static auto add_bias_and_interleave_int8s
+    = torch::RegisterOperators("trtllm::_add_bias_and_interleave_int8s", &torch_ext::add_bias_and_interleave_int8s);
 
-static auto permute_B_rows_for_mixed_gemm = torch::RegisterOperators(
-    "fastertransformer::_permute_B_rows_for_mixed_gemm", &torch_ext::permute_B_rows_for_mixed_gemm);
+static auto permute_B_rows_for_mixed_gemm
+    = torch::RegisterOperators("trtllm::_permute_B_rows_for_mixed_gemm", &torch_ext::permute_B_rows_for_mixed_gemm);
 
-static auto subbyte_transpose
-    = torch::RegisterOperators("fastertransformer::_subbyte_transpose", &torch_ext::subbyte_transpose);
+static auto subbyte_transpose = torch::RegisterOperators("trtllm::_subbyte_transpose", &torch_ext::subbyte_transpose);

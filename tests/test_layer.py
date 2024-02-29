@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,7 +22,7 @@ import pytest
 import torch
 import tensorrt as trt
 # isort: on
-from functional.torch_ref import attention_qkvpacked_ref
+from functional.torch_ref import attention_qkvpacked_ref, mamba_ref
 from parameterized import parameterized
 from polygraphy.backend.trt import (CreateConfig, EngineFromNetwork, Profile,
                                     TrtRunner)
@@ -162,9 +162,7 @@ class TestLayer(unittest.TestCase):
                              param.args[1])
 
     @parameterized.expand([[tensorrt_llm.layers.GatedMLP, 'float32'],
-                           [tensorrt_llm.layers.FusedGatedMLP, 'float32'],
-                           [tensorrt_llm.layers.GatedMLP, 'fp8'],
-                           [tensorrt_llm.layers.FusedGatedMLP, 'fp8']],
+                           [tensorrt_llm.layers.GatedMLP, 'fp8']],
                           name_func=_gated_mlp_custom_id)
     def test_gated_mlp(self, ClsMLP, qformat):
         if getSMVersion() < 89 and qformat == 'fp8':
@@ -258,18 +256,24 @@ class TestLayer(unittest.TestCase):
                                    **kwargs)
 
     @parameterized.expand([["float32", False], ["float32", True],
-                           ["bfloat16", False], ["bfloat16", True]])
-    def test_linear(self, dtype, use_plugin):
+                           ["float16", False], ["float16", True],
+                           ["float16", True, "float32"], ["bfloat16", False],
+                           ["bfloat16", True], ["bfloat16", True, "float32"]])
+    def test_linear(self, dtype, use_plugin, output_dtype=None):
         # Skip tests that are not supported on V100
         if getSMVersion() < 80:
             if dtype == 'bfloat16':
                 pytest.skip(
                     "bfloat16 is not supported in pre-ampere architecture")
 
+        if output_dtype is None:
+            output_dtype = dtype
+
         # test data
         torch.manual_seed(0)
-        x_data = torch.randn(128, 20, dtype=str_dtype_to_torch(dtype))
-        m = torch.nn.Linear(20, 30, dtype=str_dtype_to_torch(dtype))
+        torch_dtype = str_dtype_to_torch(dtype)
+        x_data = torch.randn(128, 20, dtype=torch_dtype)
+        m = torch.nn.Linear(20, 30, dtype=torch.float32)
 
         # construct trt network
         builder = tensorrt_llm.Builder()
@@ -284,27 +288,32 @@ class TestLayer(unittest.TestCase):
 
             gm = tensorrt_llm.layers.Linear(20, 30, dtype=dtype)
 
-            gm.weight.value = torch_to_numpy(m.weight.detach().cpu())
-            gm.bias.value = torch_to_numpy(m.bias.detach().cpu())
+            gm.weight.value = torch_to_numpy(
+                m.weight.to(torch_dtype).detach().cpu())
+            gm.bias.value = torch_to_numpy(
+                m.bias.to(torch_dtype).detach().cpu())
             output = gm.forward(x).trt_tensor
             output.name = 'output'
+            output.dtype = tensorrt_llm.str_dtype_to_trt(output_dtype)
             network.mark_output(output)
 
         # trt run
         build_engine = EngineFromNetwork(
             (builder.trt_builder, net.trt_network),
-            CreateConfig(bf16=dtype == "bfloat16",
+            CreateConfig(fp16=dtype == "float16",
+                         bf16=dtype == "bfloat16",
                          precision_constraints="obey"))
         with TrtRunner(build_engine) as runner:
             outputs = runner.infer(feed_dict={'x': x_data})
 
         # pytorch run
         with torch.no_grad():
-            ref = m(x_data)
+            ref = m(x_data.to(torch.float32)).to(
+                str_dtype_to_torch(output_dtype))
 
         # The absolute tolerance for bfloat16 is increased marginally because
         # a single value (out of 4000) breaks tolerance on a 4090 linux/windows.
-        atols = {"float32": 1e-6, "bfloat16": 1.03 * 1e-2}
+        atols = {"float32": 1e-6, "float16": 1e-2, "bfloat16": 1.6e-2}
 
         # compare diff
         np.testing.assert_allclose(ref.to(torch.float32).cpu().numpy(),
@@ -649,15 +658,30 @@ class TestLayer(unittest.TestCase):
                                    outputs['output'],
                                    atol=1e-6)
 
+    # The activation memory usage baseline is acquired by `session.engine.device_memory_size` and hardcoded here since it shouldn't change much across platforms if we fused mha successfully.
     @parameterized.expand([
-        (12, 512, 16, 64, 'float16', PositionEmbeddingType.alibi, False),
-        (128, 128, 12, 32, 'float16', PositionEmbeddingType.alibi, True),
-        (1, 200, 8, 128, 'float32', PositionEmbeddingType.alibi, False),
-        (48, 30, 24, 80, 'float32', PositionEmbeddingType.alibi, True),
+        (
+            12, 512, 16, 64, 'float16', PositionEmbeddingType.alibi, False,
+            402653184
+        ),  # TRT has gpu buffer management issues with fmha + alibi, so the baseline here is tested w./o. fused mha.
+        (128, 128, 12, 32, 'float16', PositionEmbeddingType.alibi, True,
+         201326592),
+        (1, 200, 8, 128, 'float32', PositionEmbeddingType.alibi, False,
+         5017600),
+        (48, 30, 24, 80, 'float32', PositionEmbeddingType.alibi, True,
+         55296000),
+        (12, 512, 16, 64, 'float16', PositionEmbeddingType.learned_absolute,
+         False, 88113152),
+        (128, 128, 12, 32, 'float16', PositionEmbeddingType.learned_absolute,
+         True, 88866816),
+        (1, 200, 8, 128, 'float32', PositionEmbeddingType.learned_absolute,
+         False, 5017600),
+        (48, 30, 24, 80, 'float32', PositionEmbeddingType.learned_absolute,
+         True, 55296000),
         (2, 128, 4, 64, 'float16', PositionEmbeddingType.learned_absolute, True,
-         True),
+         35588608, True),
         (2, 128, 4, 64, 'float32', PositionEmbeddingType.learned_absolute, True,
-         True),
+         36833280, True),
     ])
     def test_attention(self,
                        batch_size,
@@ -667,6 +691,7 @@ class TestLayer(unittest.TestCase):
                        dtype,
                        pos_emb_type,
                        causal_mask,
+                       act_mem_baseline=None,
                        use_plugin=False):
 
         hidden_size = head_num * head_size
@@ -698,6 +723,7 @@ class TestLayer(unittest.TestCase):
             # single tensor since we only have 1 layer here.
             host_max_attention_window_sizes = torch.tensor([max_seq_len],
                                                            dtype=torch.int32)
+            host_sink_token_length = torch.tensor([0], dtype=torch.int32)
 
             sequence_length = torch.full([batch_size],
                                          seq_len,
@@ -741,6 +767,7 @@ class TestLayer(unittest.TestCase):
         # construct trt network
         builder = tensorrt_llm.Builder()
         net = builder.create_network()
+        net.plugin_config.to_legacy_setting()
         if use_plugin:
             net.plugin_config.gpt_attention_plugin = dtype
         with tensorrt_llm.net_guard(net):
@@ -774,6 +801,10 @@ class TestLayer(unittest.TestCase):
                     name='host_max_attention_window_sizes',
                     shape=tuple(host_max_attention_window_sizes.shape),
                     dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+                host_sink_token_length_tensor = Tensor(
+                    name='host_sink_token_length',
+                    shape=tuple(host_sink_token_length.shape),
+                    dtype=tensorrt_llm.str_dtype_to_trt('int32'))
                 cache_indirection_tensor = Tensor(
                     name='cache_indirection',
                     shape=tuple(cache_indirection.shape),
@@ -806,6 +837,7 @@ class TestLayer(unittest.TestCase):
                         host_past_key_value_lengths_tensor,
                         host_max_attention_window_sizes=
                         host_max_attention_window_sizes_tensor,
+                        host_sink_token_length=host_sink_token_length_tensor,
                         cache_indirection=cache_indirection_tensor),
                     attention_params=AttentionParams(
                         sequence_length=sequence_length_tensor,
@@ -826,6 +858,17 @@ class TestLayer(unittest.TestCase):
         engine_buffer = builder.build_engine(net, builder_config)
         session = tensorrt_llm.runtime.Session.from_serialized_engine(
             engine_buffer)
+        act_mem = session.engine.device_memory_size
+
+        # TRT doesn't support context fmha in pre-turing architecture.
+        if act_mem_baseline != None and getSMVersion() >= 75:
+            if not pos_emb_type.is_alibi():
+                # TRT has gpu buffer management issues with fmha + alibi.
+                assert act_mem < act_mem_baseline * (1 + 0.1)
+            assert act_mem > act_mem_baseline * (
+                1 - 0.1
+            ), f"The mr activation memory usage is better than baseline, please update the test_attention in test_layer.py. The outdated baseline is {act_mem_baseline}, and the new baseline is {act_mem}."
+
         stream = torch.cuda.current_stream().cuda_stream
 
         if use_plugin:
@@ -836,6 +879,7 @@ class TestLayer(unittest.TestCase):
                 'host_past_key_value_lengths': host_past_key_value_lengths,
                 'host_max_attention_window_sizes':
                 host_max_attention_window_sizes,
+                'host_sink_token_length': host_sink_token_length,
                 'context_lengths': context_lengths,
                 'host_request_types': host_request_types,
                 'cache_indirection': cache_indirection
@@ -886,6 +930,205 @@ class TestLayer(unittest.TestCase):
                                    trt_output.cpu().numpy(),
                                    atol=a_tol,
                                    verbose=True)
+
+    @parameterized.expand([
+        (1, 16, 1024, 16, 'context', 'float32'),
+        (1, 16, 1024, 16, 'context', 'float16'),
+        (1, 16, 1024, 16, 'context', 'bfloat16'),
+        (1, 1, 1024, 16, 'generation', 'float32'),
+        (1, 1, 1024, 16, 'generation', 'float16'),
+        (1, 1, 1024, 16, 'generation', 'bfloat16'),
+    ])
+    def test_mamba(self, batch_size, seq_len, d_model, d_state, req_type,
+                   dtype):
+
+        # Skip tests that are not supported in pre-ampere architecture
+        if getSMVersion() < 80:
+            if dtype == 'bfloat16':
+                pytest.skip(
+                    "bfloat16 is not supported in pre-ampere architecture")
+
+        # configs
+        device = "cuda"
+        d_conv = 4
+        expand = 2
+        dt_rank = "auto"
+        conv_bias = True
+        bias = False
+        d_inner = int(expand * d_model)
+        seqlen_offset = 0 if req_type == 'context' else seq_len
+
+        # test data
+        torch_dtype = str_dtype_to_torch(dtype)
+        mean = 0.0
+        std_dev = 0.1 if dtype == "float32" else 0.05
+
+        hidden_states = torch.empty(size=[batch_size, seq_len, d_model],
+                                    dtype=torch_dtype,
+                                    device=device)
+        hidden_states.normal_(mean, std_dev)
+        if req_type == 'context':
+            conv_state = torch.zeros(size=[batch_size, d_inner, d_conv - 1],
+                                     dtype=torch_dtype,
+                                     device=device)
+        else:
+            conv_state = torch.randn(size=[batch_size, d_inner, d_conv - 1],
+                                     dtype=torch_dtype,
+                                     device=device)
+        if req_type == 'context':
+            ssm_state = torch.empty(size=[batch_size, d_inner, d_state],
+                                    device=device)
+        else:
+            ssm_state = torch.randn(size=[batch_size, d_inner, d_state],
+                                    device=device)
+        host_request_types = torch.tensor([0 if req_type == 'context' else 1] *
+                                          batch_size,
+                                          dtype=torch.int32)
+        output = torch.zeros(size=[batch_size, seq_len, d_model],
+                             dtype=torch_dtype,
+                             device=device)
+        present_conv_state = torch.zeros(size=[batch_size, d_inner, d_conv - 1],
+                                         dtype=torch_dtype,
+                                         device=device)
+
+        hidden_states_ref = hidden_states.detach().clone()
+        if req_type == 'context':
+            conv_state_ref = torch.zeros(size=[batch_size, d_inner, d_conv],
+                                         dtype=torch_dtype,
+                                         device=device).detach()
+        else:
+            conv_state_ref = torch.concat(
+                (torch.zeros(size=[batch_size, d_inner, 1],
+                             dtype=torch_dtype,
+                             device=device), conv_state),
+                dim=2).detach().clone()
+        ssm_state_ref = ssm_state.detach().clone()
+
+        # get torch layer
+        mamba_torch = mamba_ref(d_model,
+                                d_state,
+                                d_conv,
+                                expand,
+                                dt_rank,
+                                conv_bias,
+                                bias,
+                                device=device,
+                                dtype=torch_dtype)
+
+        # init weights
+        for module in mamba_torch.modules():
+            if isinstance(module, (torch.nn.Linear, torch.nn.Conv1d)):
+                if module.bias is not None:
+                    torch.nn.init.normal_(module.bias, std=std_dev)
+                torch.nn.init.normal_(module.weight, std=std_dev)
+        A = -torch.rand(d_inner, d_state, device=device) - 1.0
+        D = torch.randn(d_inner, device=device)
+        dt_bias = torch.rand(d_inner, device=device) - 4.0
+        mamba_torch.A.data = A.detach().clone()
+        mamba_torch.D.data = D.detach().clone()
+        mamba_torch.dt_proj.bias.data = dt_bias.detach().clone()
+
+        # construct trt network
+        builder = tensorrt_llm.Builder()
+        net = builder.create_network()
+        with tensorrt_llm.net_guard(net):
+            hidden_states_tensor = Tensor(
+                name='hidden_states',
+                shape=hidden_states.shape,
+                dtype=tensorrt_llm.str_dtype_to_trt(dtype))
+            conv_state_tensor = Tensor(
+                name='conv_state',
+                shape=conv_state.shape,
+                dtype=tensorrt_llm.str_dtype_to_trt(dtype))
+            ssm_state_tensor = Tensor(
+                name='ssm_state',
+                shape=ssm_state.shape,
+                dtype=tensorrt_llm.str_dtype_to_trt('float32'))
+            host_request_types_tensor = Tensor(
+                name='host_request_types',
+                shape=host_request_types.shape,
+                dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+            mamba_layer = tensorrt_llm.layers.Mamba(d_model=d_model,
+                                                    d_state=d_state,
+                                                    d_conv=d_conv,
+                                                    expand=expand,
+                                                    dt_rank=dt_rank,
+                                                    conv_bias=conv_bias,
+                                                    bias=bias,
+                                                    dtype=dtype)
+            mamba_layer.A.value = torch_to_numpy(A.detach().cpu())
+            mamba_layer.D.value = torch_to_numpy(D.detach().cpu())
+            mamba_layer.dt_bias.value = torch_to_numpy(dt_bias.detach().cpu())
+            mamba_layer.in_proj.weight.value = torch_to_numpy(
+                mamba_torch.in_proj.weight.detach().cpu())
+            mamba_layer.out_proj.weight.value = torch_to_numpy(
+                mamba_torch.out_proj.weight.detach().cpu())
+            if bias:
+                mamba_layer.in_proj.bias.value = torch_to_numpy(
+                    mamba_torch.in_proj.bias.detach().cpu())
+                mamba_layer.out_proj.bias.value = torch_to_numpy(
+                    mamba_torch.out_proj.bias.detach().cpu())
+            mamba_layer.conv1d.weight.value = torch_to_numpy(
+                mamba_torch.conv1d.weight.detach().unsqueeze(3).cpu())
+            if conv_bias:
+                mamba_layer.conv1d.bias.value = torch_to_numpy(
+                    mamba_torch.conv1d.bias.detach().cpu())
+            mamba_layer.x_proj.weight.value = torch_to_numpy(
+                mamba_torch.x_proj.weight.detach().cpu())
+            mamba_layer.dt_proj.weight.value = torch_to_numpy(
+                mamba_torch.dt_proj.weight.detach().cpu())
+
+            outputs = mamba_layer(hidden_states_tensor, conv_state_tensor,
+                                  ssm_state_tensor, host_request_types_tensor)
+            net._mark_output(outputs[0],
+                             'output',
+                             dtype=tensorrt_llm.str_dtype_to_trt(dtype))
+            net._mark_output(outputs[1],
+                             'present_conv_state',
+                             dtype=tensorrt_llm.str_dtype_to_trt(dtype))
+            net._mark_output(outputs[2],
+                             'present_ssm_state',
+                             dtype=tensorrt_llm.str_dtype_to_trt('float32'))
+
+        # trt run
+        inputs = {
+            'hidden_states': hidden_states,
+            'conv_state': conv_state,
+            'ssm_state': ssm_state,
+            'host_request_types': host_request_types
+        }
+        outputs = {
+            'output': output,
+            'present_conv_state': present_conv_state,
+            'present_ssm_state': ssm_state,
+        }
+
+        stream = torch.cuda.current_stream()
+        builder_config = builder.create_builder_config(name='mamba',
+                                                       precision=dtype)
+        engine = builder.build_engine(net, builder_config)
+        session = tensorrt_llm.runtime.Session.from_serialized_engine(engine)
+        session.run(inputs=inputs, outputs=outputs, stream=stream.cuda_stream)
+
+        # pytorch run
+        out_ref, conv_state_ref, ssm_state_ref = mamba_torch(
+            hidden_states_ref, conv_state_ref, ssm_state_ref, seqlen_offset)
+
+        dtype_atol = {"float16": 5e-3, "float32": 2e-3, "bfloat16": 5e-2}
+        np.testing.assert_allclose(
+            out_ref.detach().to(torch.float32).cpu().numpy(),
+            outputs['output'].to(torch.float32).cpu().numpy(),
+            atol=dtype_atol[dtype])
+
+        np.testing.assert_allclose(
+            conv_state_ref[:, :, 1:].detach().to(torch.float32).cpu().numpy(),
+            outputs['present_conv_state'].to(torch.float32).cpu().numpy(),
+            atol=dtype_atol[dtype])
+
+        np.testing.assert_allclose(
+            ssm_state_ref.detach().to(torch.float32).cpu().numpy(),
+            outputs['present_ssm_state'].to(torch.float32).cpu().numpy(),
+            atol=dtype_atol[dtype])
 
 
 if __name__ == '__main__':

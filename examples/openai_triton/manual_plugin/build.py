@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -42,6 +42,7 @@ def build_engine(builder: Builder, builder_config: BuilderConfig,
     # Module -> Network
     network = builder.create_network()
     network.trt_network.name = engine_name
+    network.plugin_config.to_legacy_setting()
     with net_guard(network):
         # Prepare
         inputs = layer.prepare_inputs(args.max_batch_size, args.max_seq_len)
@@ -67,7 +68,8 @@ def build(args):
     builder_config = builder.create_builder_config(
         name=LAYER_NAME,
         precision=args.dtype,
-        timing_cache=args.timing_cache if cache is None else cache)
+        timing_cache=args.timing_cache if cache is None else cache,
+        profiling_verbosity=args.profiling_verbosity)
 
     engine_name = get_engine_name(args.head_size, args.dtype)
     engine = build_engine(builder, builder_config, engine_name, args)
@@ -104,6 +106,14 @@ if __name__ == '__main__':
         default='model.cache',
         help='The path of to read timing cache from, will be ignored '
         'if the file does not exist')
+    parser.add_argument(
+        '--profiling_verbosity',
+        type=str,
+        default='layer_names_only',
+        choices=['layer_names_only', 'detailed', 'none'],
+        help=
+        'The profiling verbosity for the generated TRT engine. Set to detailed can inspect tactic choices and kernel parameters.'
+    )
     parser.add_argument('--log_level', type=str, default='info')
     parser.add_argument(
         '--output_dir',

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Optional
+from typing import List
 
 import tensorrt as trt
 
@@ -41,7 +41,7 @@ def MLPFactory(hidden_size,
                tp_size=1,
                tp_rank=0,
                quant_mode=QuantMode(0),
-               instance_id: int = 0):
+               max_lora_rank=None):
     if moe_config.has_moe():
         return MOE(moe_config,
                    hidden_size,
@@ -52,62 +52,19 @@ def MLPFactory(hidden_size,
                    tp_group,
                    tp_size,
                    tp_rank,
-                   quant_mode=quant_mode)
+                   quant_mode=quant_mode,
+                   max_lora_rank=max_lora_rank)
     MLPClass = GatedMLP if is_gated_activation(hidden_act) else MLP
     hidden_act = non_gated_version(hidden_act)
-    return MLPClass(hidden_size, ffn_hidden_size, hidden_act, bias, dtype,
-                    tp_group, tp_size, quant_mode, instance_id)
-
-
-class GPTEmbedding(Module):
-
-    def __init__(self,
-                 vocab_size,
-                 hidden_size,
-                 max_position_embeddings,
-                 position_embedding_type=PositionEmbeddingType.learned_absolute,
-                 dtype=None,
-                 use_prompt_tuning=False,
-                 tensor_parallel=1,
-                 tensor_parallel_group=None,
-                 sharding_dim=0,
-                 tp_rank=None,
-                 instance_id: int = 0):
-        super().__init__()
-        self.max_position_embeddings = max_position_embeddings
-        self.position_embedding_type = position_embedding_type
-        self.use_prompt_tuning = use_prompt_tuning
-
-        EmbeddingCls = PromptTuningEmbedding if use_prompt_tuning else Embedding
-        self.vocab_embedding = EmbeddingCls(vocab_size,
-                                            hidden_size,
-                                            dtype=dtype,
-                                            tp_size=tensor_parallel,
-                                            tp_group=tensor_parallel_group,
-                                            sharding_dim=sharding_dim,
-                                            tp_rank=tp_rank,
-                                            instance_id=instance_id)
-
-        if self.position_embedding_type == PositionEmbeddingType.learned_absolute:
-            self.position_embedding = Embedding(max_position_embeddings,
-                                                hidden_size,
-                                                dtype=dtype)
-
-    def forward(self,
-                input_ids,
-                position_ids,
-                prompt_embedding_table=None,
-                prompt_tasks=None,
-                prompt_vocab_size=None,
-                workspace: Optional[Tensor] = None):
-        args = []
-        if self.use_prompt_tuning:
-            args = [prompt_embedding_table, prompt_tasks, prompt_vocab_size]
-        x = self.vocab_embedding(input_ids, *args, workspace=workspace)
-        if self.position_embedding_type == PositionEmbeddingType.learned_absolute:
-            x = x + self.position_embedding(position_ids)
-
-        return x
+    return MLPClass(hidden_size,
+                    ffn_hidden_size,
+                    hidden_act,
+                    bias,
+                    dtype,
+                    tp_group,
+                    tp_size,
+                    quant_mode,
+                    max_lora_rank=max_lora_rank)
 
 
 class GPTDecoderLayer(Module):
@@ -130,10 +87,11 @@ class GPTDecoderLayer(Module):
                  bias=True,
                  num_kv_heads=None,
                  moe_config: MoeConfig = MoeConfig(),
+                 use_auto_parallel=False,
                  tp_group=None,
                  tp_size=1,
                  tp_rank=0,
-                 instance_id: int = 0):
+                 max_lora_rank=None):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
@@ -165,9 +123,10 @@ class GPTDecoderLayer(Module):
             bias=bias,
             tp_group=tp_group,
             tp_size=tp_size,
+            use_auto_parallel=use_auto_parallel,
             tp_rank=tp_rank,
             quant_mode=quant_mode,
-            instance_id=2 * instance_id)
+            max_lora_rank=max_lora_rank)
 
         if inter_size is None:
             inter_size = hidden_size * 4
@@ -182,7 +141,7 @@ class GPTDecoderLayer(Module):
                               tp_size=tp_size,
                               tp_rank=tp_rank,
                               quant_mode=quant_mode,
-                              instance_id=2 * instance_id + 1)
+                              max_lora_rank=max_lora_rank)
         self.post_layernorm = LayerNorm(normalized_shape=hidden_size,
                                         dtype=dtype)
 
@@ -192,7 +151,6 @@ class GPTDecoderLayer(Module):
                 use_cache=False,
                 kv_cache_params=None,
                 attention_params=None,
-                workspace=None,
                 lora_layer_params=None):
 
         assert isinstance(hidden_states, Tensor)
@@ -206,7 +164,6 @@ class GPTDecoderLayer(Module):
                                           use_cache=use_cache,
                                           kv_cache_params=kv_cache_params,
                                           attention_params=attention_params,
-                                          workspace=workspace,
                                           lora_layer_params=lora_layer_params)
 
         if use_cache:
@@ -217,7 +174,7 @@ class GPTDecoderLayer(Module):
         residual = hidden_states
         hidden_states = self.post_layernorm(hidden_states)
 
-        hidden_states = self.mlp(hidden_states, workspace=workspace)
+        hidden_states = self.mlp(hidden_states)
 
         hidden_states = residual + hidden_states
 
@@ -237,6 +194,7 @@ class GPTModel(Module):
                  max_position_embeddings,
                  dtype=None,
                  mapping=Mapping(),
+                 use_auto_parallel=False,
                  apply_query_key_layer_scaling=False,
                  position_embedding_type=PositionEmbeddingType.learned_absolute,
                  rotary_embedding_percentage=1.0,
@@ -249,24 +207,26 @@ class GPTModel(Module):
                  use_prompt_tuning=False,
                  use_parallel_embedding=False,
                  embedding_sharding_dim=0,
-                 moe_config=MoeConfig()):
+                 moe_config=MoeConfig(),
+                 max_lora_rank=None):
         super().__init__()
         self.mapping = mapping
+        self.use_prompt_tuning = use_prompt_tuning
+        self.position_embedding_type = position_embedding_type
 
-        self.embedding = GPTEmbedding(
+        EmbeddingCls = PromptTuningEmbedding if use_prompt_tuning else Embedding
+        self.vocab_embedding = EmbeddingCls(
             vocab_size,
             hidden_size,
-            max_position_embeddings,
-            position_embedding_type,
             dtype=dtype,
-            use_prompt_tuning=use_prompt_tuning,
-            tensor_parallel=mapping.tp_size if use_parallel_embedding else 1,
-            tensor_parallel_group=mapping.tp_group
-            if use_parallel_embedding else None,
+            tp_size=mapping.tp_size if use_parallel_embedding else 1,
+            tp_group=mapping.tp_group if use_parallel_embedding else None,
             sharding_dim=embedding_sharding_dim,
-            tp_rank=mapping.tp_rank,
-            instance_id=2 * num_layers,
-        )
+            tp_rank=mapping.tp_rank)
+        if position_embedding_type == PositionEmbeddingType.learned_absolute:
+            self.position_embedding = Embedding(max_position_embeddings,
+                                                hidden_size,
+                                                dtype=dtype)
 
         self.layers = ModuleList([
             GPTDecoderLayer(
@@ -286,11 +246,12 @@ class GPTModel(Module):
                 tp_group=mapping.tp_group,
                 tp_size=mapping.tp_size,
                 tp_rank=mapping.tp_rank,
+                use_auto_parallel=use_auto_parallel,
                 inter_size=inter_size,
                 bias=bias,
                 quant_mode=quant_mode,
-                instance_id=i,
                 moe_config=moe_config,
+                max_lora_rank=max_lora_rank,
             ) for i in range(num_layers)
         ])
 
@@ -306,15 +267,14 @@ class GPTModel(Module):
                 prompt_embedding_table=None,
                 prompt_tasks=None,
                 prompt_vocab_size=None,
-                workspace=None,
                 lora_params=None):
 
-        hidden_states = self.embedding(input_ids,
-                                       position_ids,
-                                       prompt_embedding_table,
-                                       prompt_tasks,
-                                       prompt_vocab_size,
-                                       workspace=workspace)
+        args = [prompt_embedding_table, prompt_tasks, prompt_vocab_size
+                ] if self.use_prompt_tuning else []
+        hidden_states = self.vocab_embedding(input_ids, *args)
+        if self.position_embedding_type == PositionEmbeddingType.learned_absolute:
+            hidden_states = hidden_states + self.position_embedding(
+                position_ids)
 
         kv_cache_params.fill_none_tensor_list(len(self.layers))
 
@@ -341,11 +301,12 @@ class GPTModel(Module):
                     host_past_key_value_lengths=kv_cache_params.
                     host_past_key_value_lengths,
                     host_max_attention_window_sizes=max_attention_window_size,
+                    host_sink_token_length=kv_cache_params.
+                    host_sink_token_length,
                     kv_cache_block_pointers=[pointer],
                     host_kv_cache_block_pointers=[host_pointer],
                     cache_indirection=kv_cache_params.cache_indirection),
                 attention_params=attention_params,
-                workspace=workspace,
                 lora_layer_params=lora_layer_params)
 
             if use_cache:
@@ -371,6 +332,7 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
                  dtype,
                  logits_dtype='float32',
                  mapping=Mapping(),
+                 use_auto_parallel=False,
                  apply_query_key_layer_scaling=False,
                  position_embedding_type=PositionEmbeddingType.learned_absolute,
                  rotary_embedding_percentage=1.0,
@@ -384,7 +346,8 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
                  use_parallel_embedding=False,
                  embedding_sharding_dim=0,
                  moe_config=MoeConfig(),
-                 share_embedding_table=False):
+                 share_embedding_table=False,
+                 max_lora_rank=None):
 
         if isinstance(dtype, str):
             self._kv_dtype = str_dtype_to_trt(dtype)
@@ -428,6 +391,7 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
             max_position_embeddings=max_position_embeddings,
             dtype=dtype,
             mapping=mapping,
+            use_auto_parallel=use_auto_parallel,
             apply_query_key_layer_scaling=apply_query_key_layer_scaling,
             position_embedding_type=position_embedding_type,
             rotary_embedding_percentage=rotary_embedding_percentage,
@@ -441,12 +405,13 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
             use_parallel_embedding=use_parallel_embedding,
             embedding_sharding_dim=embedding_sharding_dim,
             moe_config=moe_config,
+            max_lora_rank=max_lora_rank,
         )
         vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
 
         share_weight = None
         if share_embedding_table:
-            share_weight = self.embedding.vocab_embedding.weight
+            share_weight = self.vocab_embedding.weight
         self.lm_head = ColumnLinear(hidden_size,
                                     vocab_size_padded,
                                     bias=False,
@@ -467,15 +432,13 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
                 prompt_embedding_table=None,
                 prompt_tasks=None,
                 prompt_vocab_size=None,
-                workspace=None,
                 lora_params=None):
 
         hidden_states = super().forward(input_ids, position_ids, use_cache,
                                         attention_mask, kv_cache_params,
                                         attention_params,
                                         prompt_embedding_table, prompt_tasks,
-                                        prompt_vocab_size, workspace,
-                                        lora_params)
+                                        prompt_vocab_size, lora_params)
 
         if use_cache:
             hidden_states, presents = hidden_states
@@ -489,7 +452,7 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
         lm_logits.mark_output('logits', self._logits_dtype)
 
         if use_cache:
-            if default_net().plugin_config.paged_kv_cache == False:
+            if not default_net().plugin_config.paged_kv_cache:
                 for i, present in enumerate(presents):
                     present.mark_output(f'present_key_value_{i}',
                                         self._kv_dtype)
@@ -500,12 +463,13 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
     def prepare_inputs(self,
                        max_batch_size,
                        max_input_len,
-                       max_new_tokens,
+                       max_seq_len,
                        use_cache,
                        max_beam_width: int = 1,
                        max_num_tokens: int = None,
                        prompt_embedding_table_size: int = 0,
-                       gather_all_token_logits: bool = False,
+                       gather_context_logits: bool = False,
+                       gather_generation_logits: bool = False,
                        max_draft_len: int = 0,
                        lora_target_modules: List[str] = None):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
@@ -531,7 +495,7 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
             max_batch_size=max_batch_size,
             max_beam_width=max_beam_width,
             max_input_len=max_input_len,
-            max_new_tokens=max_new_tokens,
+            max_seq_len=max_seq_len,
             num_kv_heads=num_heads_kv,
             head_size=head_size,
             num_layers=self._num_layers,
@@ -544,7 +508,8 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
             use_custom_all_reduce=use_custom_all_reduce,
             paged_kv_cache=paged_kv_cache,
             tokens_per_block=tokens_per_block,
-            gather_all_token_logits=gather_all_token_logits,
+            gather_context_logits=gather_context_logits,
+            gather_generation_logits=gather_generation_logits,
             mapping=self.mapping,
             max_num_tokens=max_num_tokens,
             prompt_embedding_table_size=prompt_embedding_table_size,
@@ -564,6 +529,7 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
                     'host_past_key_value_lengths'],
                 host_max_attention_window_sizes=model_inputs[
                     'host_max_attention_window_sizes'],
+                host_sink_token_length=model_inputs['host_sink_token_length'],
                 kv_cache_block_pointers=model_inputs[
                     'kv_cache_block_pointers_list'],
                 host_kv_cache_block_pointers=model_inputs[
@@ -579,7 +545,6 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
             model_inputs['prompt_embedding_table'],
             model_inputs['tasks'],
             model_inputs['prompt_vocab_size'],
-            model_inputs['all_reduce_workspace'],
             LoraParams(
                 model_inputs['lora_ranks'],
                 model_inputs['lora_weights_pointers'],

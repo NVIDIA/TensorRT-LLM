@@ -1,5 +1,7 @@
 import json as _json
+import os
 import pathlib as _pl
+import sys
 import time as _time
 import typing as _tp
 
@@ -9,6 +11,9 @@ from binding_test_utils import *
 
 import tensorrt_llm.bindings as _tb
 
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.util import getSMVersion
+
 
 @pytest.mark.parametrize("variant, results_file", [
     ("fp16-plugin-packed-paged",
@@ -17,6 +22,10 @@ import tensorrt_llm.bindings as _tb
 def test_gpt_manager(variant, results_file, llm_root: _pl.Path,
                      resource_path: _pl.Path, engine_path: _pl.Path,
                      data_path: _pl.Path, llm_model_root):
+    if getSMVersion() < 80:
+        pytest.skip(
+            "ContextFMHAType with fp32 acc is not supported in pre-ampere architecture"
+        )
     model_dir = "gpt2"
     tp_size = 1
     pp_size = 1
@@ -84,7 +93,7 @@ def test_gpt_manager(variant, results_file, llm_root: _pl.Path,
     remaining_requests = len(given_input)
     for i, (req, length) in enumerate(zip(given_input, given_input_lengths)):
         ir = _tb.InferenceRequest(i)
-        ir.input_ids = _tor.tensor([req[:length].tolist()], dtype=_tor.int32)
+        ir.input_ids = _tor.tensor(req[:length].tolist(), dtype=_tor.int32)
         ir.max_new_tokens = _tor.tensor([[length + max_new_tokens]],
                                         dtype=_tor.int32)
         ir.end_id = _tor.tensor([end_id], dtype=_tor.int32)

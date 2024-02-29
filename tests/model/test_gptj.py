@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,7 +34,7 @@ from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-from examples.gptj.weight import load_from_hf_gpt_j
+from examples.gptj.convert_checkpoint import convert_hf_gptj  # isort:skip
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.util import getSMVersion
@@ -54,43 +54,52 @@ class TestGPTJ(unittest.TestCase):
             tensorrt_llm._utils.str_dtype_to_torch(dtype)).eval()
         return gpt_config, hf_gpt
 
-    def _gen_tensorrt_llm_network(self, network, hf_gpt, gpt_config, batch_size,
-                                  beam_width, input_len, output_len, fp16,
-                                  tensor_parallel):
-        num_layers = gpt_config.n_layer
-        num_heads = gpt_config.n_head
-        hidden_size = gpt_config.n_embd
-        vocab_size = gpt_config.vocab_size
-        hidden_act = gpt_config.activation_function
-        n_positions = gpt_config.n_positions
-        rotary_dim = gpt_config.rotary_dim
+    def _gen_tensorrt_llm_network(self, network: tensorrt_llm.Network,
+                                  hf_gpt: GPTJForCausalLM,
+                                  gpt_config: GPTJConfig, dtype: str,
+                                  batch_size: int, beam_width: int,
+                                  input_len: int, output_len: int,
+                                  tensor_parallel: int, rank: int):
+        config = {
+            "architecture": "GPTJForCausalLM",
+            "dtype": dtype,
+            "logits_dtype": "float32",
+            "num_hidden_layers": gpt_config.num_hidden_layers,
+            "num_attention_heads": gpt_config.num_attention_heads,
+            "hidden_size": gpt_config.hidden_size,
+            "vocab_size": gpt_config.vocab_size,
+            "position_embedding_type": "rope_gptj",
+            "max_position_embeddings": 2048,
+            "hidden_act": "gelu",
+            "quantization": {
+                "quant_algo": None,
+            },
+            "mapping": {
+                "world_size": tensor_parallel,
+                "tp_size": tensor_parallel
+            },
+            "rotary_dim": 64
+        }
+        config = tensorrt_llm.models.PretrainedConfig.from_dict(config)
+        config.set_rank(rank)
+        weights = convert_hf_gptj(hf_gpt,
+                                  gpt_config,
+                                  config.mapping,
+                                  dtype=dtype)
+        trtllm_model = tensorrt_llm.models.GPTJForCausalLM(config)
+        trtllm_model.load(weights)
 
         with net_guard(network):
-            kv_dtype = trt.float16 if fp16 else trt.float32
             # Initialize model
-            tensorrt_llm_gpt = tensorrt_llm.models.GPTJForCausalLM(
-                num_layers=num_layers,
-                num_heads=num_heads,
-                hidden_size=hidden_size,
-                vocab_size=vocab_size,
-                hidden_act=hidden_act,
-                max_position_embeddings=n_positions,
-                rotary_dim=rotary_dim,
-                dtype=kv_dtype,
-                mapping=tensorrt_llm.Mapping(world_size=tensor_parallel,
-                                             tp_size=tensor_parallel),
-            )
-            inputs = tensorrt_llm_gpt.prepare_inputs(batch_size,
-                                                     input_len,
-                                                     output_len,
-                                                     use_cache=True,
-                                                     max_beam_width=beam_width)
-            load_from_hf_gpt_j(tensorrt_llm_gpt, hf_gpt, fp16=fp16)
-
+            network.set_named_parameters(trtllm_model.named_parameters())
+            inputs = trtllm_model.prepare_inputs(max_batch_size=batch_size,
+                                                 max_input_len=input_len,
+                                                 max_seq_len=input_len +
+                                                 output_len,
+                                                 use_cache=True,
+                                                 max_beam_width=beam_width)
             # Prepare
-            network.set_named_parameters(tensorrt_llm_gpt.named_parameters())
-
-            tensorrt_llm_gpt(*inputs)
+            trtllm_model(**inputs)
 
         return network
 
@@ -114,7 +123,6 @@ class TestGPTJ(unittest.TestCase):
 
         runtime = None
         builder = Builder()
-        fp16 = (dtype == 'float16')
 
         with tempfile.TemporaryDirectory() as tmpdirname:
 
@@ -124,9 +132,10 @@ class TestGPTJ(unittest.TestCase):
                 timing_cache='model.cache',
                 tensor_parallel=world_size,  # TP only
                 use_refit=use_refit,
-                strongly_typed=fp16,
+                strongly_typed=(dtype == "float16"),
             )
             network = builder.create_network()
+            network.plugin_config.to_legacy_setting()
             if use_attention_plugin:
                 network.plugin_config.set_gpt_attention_plugin(dtype)
             if use_ln_gemm_plugin:
@@ -135,9 +144,9 @@ class TestGPTJ(unittest.TestCase):
                 network.plugin_config.enable_remove_input_padding()
             network.plugin_config.set_context_fmha(context_fmha_flag)
 
-            self._gen_tensorrt_llm_network(network, hf_gpt, gpt_config,
+            self._gen_tensorrt_llm_network(network, hf_gpt, gpt_config, dtype,
                                            batch_size, beam_width, input_len,
-                                           output_len, fp16, world_size)
+                                           output_len, world_size, rank)
 
             engine_buffer = builder.build_engine(network, builder_config)
             assert engine_buffer is not None
@@ -163,11 +172,7 @@ class TestGPTJ(unittest.TestCase):
 
         # Skip tests that are not supported in pre-ampere architecture
         if getSMVersion() < 80:
-            if context_fmha_flag == ContextFMHAType.enabled:
-                pytest.skip(
-                    "ContextFMHAType is not supported in pre-ampere architecture"
-                )
-            elif context_fmha_flag == ContextFMHAType.enabled_with_fp32_acc:
+            if context_fmha_flag == ContextFMHAType.enabled_with_fp32_acc:
                 pytest.skip(
                     "ContextFMHAType with fp32 acc is not supported in pre-ampere architecture"
                 )
@@ -228,6 +233,7 @@ class TestGPTJ(unittest.TestCase):
                        cache_indirection,
                        host_past_key_value_lengths,
                        host_max_attention_window_sizes,
+                       host_sink_token_length,
                        sequence_length,
                        host_context_lengths=None):
 
@@ -240,6 +246,7 @@ class TestGPTJ(unittest.TestCase):
                 'cache_indirection': cache_indirection,
                 'host_past_key_value_lengths': host_past_key_value_lengths,
                 'sequence_length': sequence_length,
+                'host_sink_token_length': host_sink_token_length,
             }
             for i in range(gpt_config.n_layer):
                 ctx_buffer[f'past_key_value_{i}'] = key_value_cache_buffers[i]
@@ -309,9 +316,8 @@ class TestGPTJ(unittest.TestCase):
             ctx_last_token_ids = ctx_context_lengths.clone()
 
             if enable_remove_input_padding:
-                ctx_ids = ctx_ids.view([1, batch_size * seq_len])
-                ctx_position_ids = ctx_position_ids.view(
-                    [1, batch_size * seq_len])
+                ctx_ids = ctx_ids.view([batch_size * seq_len])
+                ctx_position_ids = ctx_position_ids.view([batch_size * seq_len])
                 ctx_last_token_ids = torch.cumsum(ctx_last_token_ids,
                                                   dim=0).int()
 
@@ -321,6 +327,7 @@ class TestGPTJ(unittest.TestCase):
                                                        dtype=torch.int32)
             host_max_attention_window_sizes = torch.tensor([total_seq_len],
                                                            dtype=torch.int32)
+            host_sink_token_length = torch.tensor([0], dtype=torch.int32)
 
             host_context_lengths = ctx_context_lengths.cpu(
             ) if enable_remove_input_padding else None
@@ -334,6 +341,7 @@ class TestGPTJ(unittest.TestCase):
                 cache_indirection=cache_indirections[0],
                 host_past_key_value_lengths=host_past_key_value_lengths,
                 host_max_attention_window_sizes=host_max_attention_window_sizes,
+                host_sink_token_length=host_sink_token_length,
                 sequence_length=sequence_length_buffer,
                 host_context_lengths=host_context_lengths,
                 host_request_types=host_request_types)
@@ -382,14 +390,14 @@ class TestGPTJ(unittest.TestCase):
                 hf_outputs = hf_gpt.forward(
                     step1_id,
                     past_key_values=hf_outputs.past_key_values,
-                    position_ids=gen_position_ids,
+                    position_ids=gen_position_ids.to(torch.int64),
                     use_cache=True)
             torch.cuda.synchronize()
             ref = hf_outputs.logits[:, -1, :]
 
             if enable_remove_input_padding:
-                step1_id = step1_id.view([1, batch_size])
-                gen_position_ids = gen_position_ids.view([1, batch_size])
+                step1_id = step1_id.view([batch_size])
+                gen_position_ids = gen_position_ids.view([batch_size])
                 gen_last_token_ids = torch.ones_like(
                     gen_context_lengths).int().cuda()
                 gen_last_token_ids = torch.cumsum(gen_last_token_ids,
@@ -400,6 +408,8 @@ class TestGPTJ(unittest.TestCase):
 
             host_max_attention_window_sizes = torch.tensor([total_seq_len],
                                                            dtype=torch.int32)
+
+            host_sink_token_length = torch.tensor([0], dtype=torch.int32)
 
             host_request_types = torch.tensor([1] * batch_size,
                                               dtype=torch.int32).cpu()
@@ -419,6 +429,7 @@ class TestGPTJ(unittest.TestCase):
                 cache_indirection=cache_indirections[1],
                 host_past_key_value_lengths=host_past_key_value_lengths,
                 host_max_attention_window_sizes=host_max_attention_window_sizes,
+                host_sink_token_length=host_sink_token_length,
                 sequence_length=sequence_length_buffer,
                 host_context_lengths=host_context_lengths,
                 host_request_types=host_request_types)

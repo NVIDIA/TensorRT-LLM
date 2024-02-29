@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -65,7 +65,6 @@ def set_peer_access(mapping: Mapping, enabled: bool = True):
 
 class IpcMemory():
 
-    IPC_BUFFERS_SIZE = 50331648
     IPC_BARRIERS_SIZE_PER_GPU = 25 * 4  # Max all reduce blocks * sizeof(float)
 
     def __init__(self, mapping, size):

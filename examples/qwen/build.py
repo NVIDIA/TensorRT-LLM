@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,9 +23,11 @@ import torch.multiprocessing as mp
 import tensorrt as trt
 # isort: on
 from transformers import AutoConfig, AutoModelForCausalLM
-from weight import load_from_ft, load_from_hf_qwen
+from weight import (load_from_awq_qwen, load_from_ft, load_from_gptq_qwen,
+                    load_from_hf_qwen)
 
 import tensorrt_llm
+from tensorrt_llm._common import check_max_num_tokens
 from tensorrt_llm._utils import str_dtype_to_trt
 from tensorrt_llm.builder import Builder
 from tensorrt_llm.logger import logger
@@ -38,7 +40,6 @@ from tensorrt_llm.quantization import QuantMode
 MODEL_NAME = "qwen"
 
 import onnx
-import tensorrt as trt
 from onnx import TensorProto, helper
 
 now_dir = os.path.dirname(os.path.abspath(__file__))
@@ -126,6 +127,7 @@ def parse_arguments():
     parser.add_argument('--pp_size', type=int, default=1)
     parser.add_argument('--hf_model_dir', type=str, default=None)
     parser.add_argument('--ft_dir_path', type=str, default=None)
+    parser.add_argument("--quant_ckpt_path", type=str, default=None)
     parser.add_argument('--dtype',
                         type=str,
                         default='float16',
@@ -136,6 +138,14 @@ def parse_arguments():
         default='model.cache',
         help=
         'The path of to read timing cache from, will be ignored if the file does not exist'
+    )
+    parser.add_argument(
+        '--profiling_verbosity',
+        type=str,
+        default='layer_names_only',
+        choices=['layer_names_only', 'detailed', 'none'],
+        help=
+        'The profiling verbosity for the generated TRT engine. Set to detailed can inspect tactic choices and kernel parameters.'
     )
     parser.add_argument('--log_level',
                         type=str,
@@ -152,7 +162,7 @@ def parse_arguments():
     parser.add_argument('--n_positions', type=int, default=2048)
     parser.add_argument('--n_embd', type=int, default=4096)
     parser.add_argument('--n_head', type=int, default=32)
-    parser.add_argument('--n_kv_head', type=int, default=None)
+    parser.add_argument('--n_kv_head', type=int, default=32)
     parser.add_argument('--inter_size', type=int, default=11008)
     parser.add_argument('--hidden_act', type=str, default='silu')
     parser.add_argument('--max_batch_size', type=int, default=2)
@@ -164,12 +174,12 @@ def parse_arguments():
     parser.add_argument('--use_gpt_attention_plugin',
                         nargs='?',
                         type=str,
-                        default="float16",
+                        default=None,
                         choices=['float16', 'bfloat16', 'float32', None])
     parser.add_argument('--use_gemm_plugin',
                         nargs='?',
                         type=str,
-                        default="float16",
+                        default=None,
                         choices=['float16', 'bfloat16', 'float32', None])
     parser.add_argument('--parallel_build', default=False, action='store_true')
     parser.add_argument('--enable_context_fmha',
@@ -228,6 +238,12 @@ def parse_arguments():
         'By default, we use a single static scaling factor to scale weights in the int4 range. '
         'per_group chooses at run time, and for each group, a custom scaling factor. '
         'The flag is built for GPTQ/AWQ quantization.')
+    parser.add_argument(
+        "--group_size",
+        type=int,
+        default=128,
+        help="group size used in gptq/awq quantization.",
+    )
 
     parser.add_argument(
         '--use_weight_only',
@@ -242,11 +258,16 @@ def parse_arguments():
         type=str,
         nargs='?',
         default='int8',
-        choices=['int8', 'int4'],
+        choices=['int8', 'int4', 'int4_awq', 'int4_gptq'],
         help=
         'Define the precision for the weights when using weight-only quantization.'
         'You must also use --use_weight_only for that argument to have an impact.'
     )
+    parser.add_argument(
+        '--quantize_lm_head',
+        default=False,
+        action="store_true",
+        help='Quantize lm_head weights as well when using int4_awq.')
     parser.add_argument(
         '--use_inflight_batching',
         action="store_true",
@@ -268,7 +289,9 @@ def parse_arguments():
         '--max_num_tokens',
         type=int,
         default=None,
-        help='Define the max number of tokens supported by the engine')
+        help=
+        'Define the max number of tokens supported by the engine, note that it takes no effect if --remove_input_padding is not set'
+    )
 
     parser.add_argument(
         '--int8_kv_cache',
@@ -306,6 +329,18 @@ def parse_arguments():
         action='store_true',
         help=
         'Activates latency-optimized algorithm for all-reduce instead of NCCL.')
+    parser.add_argument(
+        '--max_prompt_embedding_table_size',
+        type=int,
+        default=0,
+        help='Setting to a value > 0 enables support for prompt tuning.')
+    parser.add_argument(
+        '--use_lookup_plugin',
+        nargs='?',
+        const=None,
+        default=False,
+        choices=['float16', 'float32', 'bfloat16'],
+        help="Activates the lookup plugin which enables embedding sharing.")
 
     args = parser.parse_args()
     assert not (
@@ -346,7 +381,7 @@ def parse_arguments():
                 use_int4_weights=True)
         else:
             args.quant_mode = QuantMode.use_weight_only(
-                args.weight_only_precision == 'int4')
+                use_int4_weights=(args.weight_only_precision == 'int4'))
     else:
         args.quant_mode = QuantMode(0)
 
@@ -369,7 +404,7 @@ def parse_arguments():
         args.hidden_act = "silu"
         args.kv_channels = hf_config.kv_channels
         args.rotary_emb_base = hf_config.rotary_emb_base
-    assert args.use_gpt_attention_plugin is not None, "QWen must use gpt attention plugin"
+
     if args.n_kv_head is not None and args.n_kv_head != args.n_head:
         assert (args.n_head % args.n_kv_head) == 0, \
             "MQA/GQA requires the number of heads to be divisible by the number of K/V heads."
@@ -379,8 +414,19 @@ def parse_arguments():
 
     assert args.pp_size * args.tp_size == args.world_size
 
-    if args.max_num_tokens is not None:
-        assert args.enable_context_fmha
+    if args.weight_only_precision == 'int4_awq' and args.quantize_lm_head:
+        if args.vocab_size % 64 != 0:
+            args.vocab_size = int((args.vocab_size + 63) / 64) * 64
+            logger.info("To use awq we pad vocab_size to {}.".format(
+                args.vocab_size))
+
+    args.max_num_tokens = check_max_num_tokens(
+        max_num_tokens=args.max_num_tokens,
+        max_batch_size=args.max_batch_size,
+        max_input_len=args.max_input_len,
+        remove_input_padding=args.remove_input_padding,
+        enable_context_fmha=args.enable_context_fmha,
+        tokens_per_block=args.tokens_per_block)
 
     assert (math.log2(args.tokens_per_block).is_integer()
             ), "tokens_per_block must be power of 2"
@@ -425,15 +471,18 @@ def build_rank_engine(builder: Builder,
         use_parallel_embedding=args.use_parallel_embedding,
         embedding_sharding_dim=args.embedding_sharding_dim,
         quant_mode=args.quant_mode,
+        use_prompt_tuning=args.max_prompt_embedding_table_size > 0,
     )
     quantize_kwargs = {}
+    use_gemm_woq_plugin = args.use_gemm_plugin and args.use_weight_only
     if args.use_smooth_quant or args.use_weight_only:
         if args.weight_only_precision == 'int4_awq':
+            exclude_modules = ['lm_head'] if not args.quantize_lm_head else []
             quantize_kwargs = {
                 "group_size": args.group_size,
                 "zero": False,
                 "pre_quant_scale": True,
-                "exclude_modules": [],
+                "exclude_modules": exclude_modules,
             }
         elif args.weight_only_precision == 'int4_gptq':
             quantize_kwargs = {
@@ -444,7 +493,19 @@ def build_rank_engine(builder: Builder,
     tensorrt_llm_qwen = quantize_model(tensorrt_llm_qwen, args.quant_mode,
                                        **quantize_kwargs)
     ft_dir_path = args.ft_dir_path
-    if args.hf_model_dir is not None and \
+    if args.per_group:
+        if args.weight_only_precision == 'int4_awq':
+            load_from_awq_qwen(tensorrt_llm_qwen=tensorrt_llm_qwen,
+                               quant_ckpt_path=args.quant_ckpt_path,
+                               quantize_lm_head=args.quantize_lm_head,
+                               mapping=mapping,
+                               dtype=args.dtype)
+        else:
+            load_from_gptq_qwen(tensorrt_llm_qwen=tensorrt_llm_qwen,
+                                quant_ckpt_path=args.quant_ckpt_path,
+                                mapping=mapping,
+                                dtype=args.dtype)
+    elif args.hf_model_dir is not None and \
         (ft_dir_path is None or not os.path.exists(ft_dir_path)):
         logger.info(f'Loading HF QWen ... from {args.hf_model_dir}')
         tik = time.time()
@@ -467,7 +528,8 @@ def build_rank_engine(builder: Builder,
                           kv_channels=args.kv_channels,
                           rotary_emb_base=args.rotary_emb_base,
                           dtype=args.dtype,
-                          multi_query_mode=multi_query_mode)
+                          multi_query_mode=multi_query_mode,
+                          use_gemm_woq_plugin=use_gemm_woq_plugin)
         del hf_qwen
     elif ft_dir_path is not None:
         dir_path = ft_dir_path
@@ -476,7 +538,8 @@ def build_rank_engine(builder: Builder,
                      dir_path,
                      mapping,
                      dtype=args.dtype,
-                     multi_query_mode=multi_query_mode)
+                     multi_query_mode=multi_query_mode,
+                     use_gemm_woq_plugin=use_gemm_woq_plugin)
     else:
         raise ValueError(
             "You must specify either --hf_model_dir or --ft_dir_path")
@@ -484,6 +547,7 @@ def build_rank_engine(builder: Builder,
     # Module -> Network
     network = builder.create_network()
     network.trt_network.name = engine_name
+    network.plugin_config.to_legacy_setting()
     if args.use_gpt_attention_plugin:
         network.plugin_config.set_gpt_attention_plugin(
             dtype=args.use_gpt_attention_plugin)
@@ -501,7 +565,7 @@ def build_rank_engine(builder: Builder,
     if args.enable_context_fmha_fp32_acc:
         network.plugin_config.set_context_fmha(
             ContextFMHAType.enabled_with_fp32_acc)
-    if args.use_weight_only:
+    if args.use_weight_only and args.use_gemm_plugin:
         if args.per_group:
             network.plugin_config.set_weight_only_groupwise_quant_matmul_plugin(
                 dtype='float16')
@@ -516,6 +580,8 @@ def build_rank_engine(builder: Builder,
 
     if args.paged_kv_cache:
         network.plugin_config.enable_paged_kv_cache(args.tokens_per_block)
+    if args.use_lookup_plugin:
+        network.plugin_config.set_lookup_plugin(dtype=args.dtype)
 
     with net_guard(network):
         # Prepare
@@ -525,10 +591,11 @@ def build_rank_engine(builder: Builder,
         inputs = tensorrt_llm_qwen.prepare_inputs(
             max_batch_size=args.max_batch_size,
             max_input_len=args.max_input_len,
-            max_new_tokens=args.max_output_len,
+            max_seq_len=args.max_input_len + args.max_output_len,
             use_cache=True,
             max_beam_width=args.max_beam_width,
             max_num_tokens=args.max_num_tokens,
+            prompt_embedding_table_size=args.max_prompt_embedding_table_size,
         )
         tensorrt_llm_qwen(*inputs)
         if args.enable_debug_output:
@@ -568,17 +635,24 @@ def build(rank, args):
         # skip other ranks if parallel_build is enabled
         if args.parallel_build and cur_rank != rank:
             continue
-        int8_trt_flag = args.quant_mode.has_act_or_weight_quant() or (
-            not args.paged_kv_cache and args.quant_mode.has_int8_kv_cache())
+        # NOTE: int8 flag is required to be true when INT8 tensors are exposed to TRT
+        # TRT-LLM has INT8 I/O when act/weights are quantized without group-scaling (AWQ, GPTQ)
+        # OR INT8 KV cache is set to contiguous (without paged KV cache enabled).
+        int8_trt_flag = (args.quant_mode.has_act_or_weight_quant()
+                         and not args.quant_mode.has_per_group_scaling()) or (
+                             not args.paged_kv_cache
+                             and args.quant_mode.has_int8_kv_cache())
         builder_config = builder.create_builder_config(
             name=MODEL_NAME,
             precision=args.dtype,
             timing_cache=args.timing_cache if cache is None else cache,
+            profiling_verbosity=args.profiling_verbosity,
             tensor_parallel=args.tp_size,
             pipeline_parallel=args.pp_size,
             parallel_build=args.parallel_build,
             num_layers=args.n_layer,
             num_heads=args.n_head,
+            num_kv_heads=args.n_kv_head,
             hidden_size=args.n_embd,
             vocab_size=args.vocab_size,
             hidden_act=args.hidden_act,
@@ -592,7 +666,10 @@ def build(rank, args):
             fp8=args.quant_mode.has_fp8_qdq(),
             quant_mode=args.quant_mode,
             strongly_typed=args.strongly_typed,
-            opt_level=args.builder_opt)
+            opt_level=args.builder_opt,
+            max_prompt_embedding_table_size=args.
+            max_prompt_embedding_table_size,
+        )
         engine_name = get_engine_name(MODEL_NAME, args.dtype, args.tp_size,
                                       args.pp_size, cur_rank)
         engine = build_rank_engine(builder, builder_config, engine_name,
