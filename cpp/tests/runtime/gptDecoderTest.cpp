@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -40,6 +40,7 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
     SizeType constexpr nbLayers{2};
     SizeType constexpr nbHeads{16};
     SizeType constexpr hiddenSize{1024};
+    SizeType constexpr batchSize{4};
     GptModelConfig modelConfig{vocabSize, nbLayers, nbHeads, hiddenSize, dtype};
     modelConfig.useGptAttentionPlugin(false);
 
@@ -48,15 +49,15 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
 
     // create decoder
     auto const vocabSizePadded = modelConfig.getVocabSizePadded(worldConfig.getSize());
-    auto decoder = IGptDecoder::create(modelConfig.getDataType(), vocabSize, vocabSizePadded, streamPtr);
+    auto decoder = IGptDecoder::create(modelConfig.getDataType(), batchSize, vocabSize, vocabSizePadded, streamPtr);
     ASSERT_TRUE(static_cast<bool>(decoder));
 
     // setup decoder
     auto const beamWidth = samplingConfig.beamWidth;
-    SizeType constexpr batchSize{4};
 
     SizeType constexpr maxInputLength{8};
     SizeType constexpr maxNewTokens{2};
+    SizeType constexpr sinkTokenLength{0};
     auto constexpr maxSeqLength = maxInputLength + maxNewTokens;
     decoder->setup(samplingConfig, batchSize, maxSeqLength);
 
@@ -70,7 +71,7 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
     auto endIds
         = std::shared_ptr(manager.copyFrom(endIdsVec, ITensor::makeShape({batchSize, beamWidth}), MemoryType::kGPU));
 
-    DecodingInput inputs{maxInputLength, maxSeqLength, batchSize, logits, endIds};
+    DecodingInput inputs{maxInputLength, maxSeqLength, sinkTokenLength, batchSize, logits, endIds};
     std::vector<std::int32_t> sequenceLimitLengthsVec(batchSize, maxSeqLength);
     inputs.sequenceLimitLength
         = manager.copyFrom(sequenceLimitLengthsVec, ITensor::makeShape({batchSize}), MemoryType::kGPU);
@@ -174,7 +175,7 @@ TEST_P(ParamTest, Test)
     testDecoder(dtype, samplingConfig);
 }
 
-INSTANTIATE_TEST_SUITE_P(GptDecoderTest, ParamTest,
+INSTANTIATE_TEST_SUITE_P(DecoderTest, ParamTest,
     testing::Combine(testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kHALF), testing::Values(1, 3)),
     [](const testing::TestParamInfo<ParamTest::ParamType>& info)
     {

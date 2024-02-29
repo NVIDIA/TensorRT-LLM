@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,6 +19,7 @@ from pathlib import Path
 
 import torch
 import torch.multiprocessing as mp
+from run import get_engine_name
 
 import tensorrt_llm
 from tensorrt_llm._utils import str_dtype_to_trt
@@ -30,13 +31,6 @@ from tensorrt_llm.network import net_guard
 from t5.weight import parse_t5_config, load_from_hf_t5, load_from_binary_t5  # isort:skip
 from bart.weight import parse_bart_config, load_from_binary_bart  # isort:skip
 from nmt.weight import parse_nmt_config, load_from_binary_nmt  # isort:skip
-
-
-def get_engine_name(model, dtype, tp_size, pp_size, rank):
-    if pp_size == 1:
-        return '{}_{}_tp{}_rank{}.engine'.format(model, dtype, tp_size, rank)
-    return '{}_{}_tp{}_pp{}_rank{}.engine'.format(model, dtype, tp_size,
-                                                  pp_size, rank)
 
 
 def serialize_engine(engine, path):
@@ -51,6 +45,7 @@ def serialize_engine(engine, path):
 
 def parse_config(ini_file, component, args):
     config = configparser.ConfigParser()
+    assert ini_file.exists(), f"Missing config file {ini_file}"
     config.read(ini_file)
     model_type = config.get('structure', 'model_type')
     args.model_type = model_type
@@ -113,7 +108,14 @@ def parse_arguments(component):
         help=
         'The path of to read timing cache from, will be ignored if the file does not exist'
     )
-
+    parser.add_argument(
+        '--profiling_verbosity',
+        type=str,
+        default='layer_names_only',
+        choices=['layer_names_only', 'detailed', 'none'],
+        help=
+        'The profiling verbosity for the generated TRT engine. Set to detailed can inspect tactic choices and kernel parameters.'
+    )
     parser.add_argument('--model_type',
                         type=str,
                         choices=['t5', 'bart', 'nmt'],
@@ -174,26 +176,6 @@ def parse_arguments(component):
         "Activates GEMM plugin. You can specify the plugin dtype or leave blank to use the model dtype."
     )
     parser.add_argument(
-        '--use_layernorm_plugin',
-        nargs='?',
-        const=None,
-        type=str,
-        default=False,
-        choices=['float16', 'float32', 'bfloat16'],
-        help=
-        "Activates layernorm plugin. You can specify the plugin dtype or leave blank to use the model dtype."
-    )
-    parser.add_argument(
-        '--use_rmsnorm_plugin',
-        nargs='?',
-        const=None,
-        type=str,
-        default=False,
-        choices=['float16', 'float32', 'bfloat16'],
-        help=
-        "Activates rmsnorm plugin. You can specify the plugin dtype or leave blank to use the model dtype."
-    )
-    parser.add_argument(
         '--use_lookup_plugin',
         nargs='?',
         const=None,
@@ -213,6 +195,14 @@ def parse_arguments(component):
         default=None,
         help=
         'Seed to use when initializing the random number generator for torch.')
+    parser.add_argument(
+        '--max_prompt_embedding_table_size',
+        '--max_multimodal_len',
+        type=int,
+        default=0,
+        help=
+        'Setting to a value > 0 enables support for prompt tuning or multimodal input.'
+    )
     parser.add_argument(
         '--use_parallel_embedding',
         action="store_true",
@@ -242,10 +232,35 @@ def parse_arguments(component):
         help=
         'This option is introduced with trt 9.1.0.1+ and will reduce the building time significantly for fp8.'
     )
+    parser.add_argument(
+        '--gather_all_token_logits',
+        action='store_true',
+        default=False,
+        help='Enable both gather_context_logits and gather_generation_logits')
+    parser.add_argument('--gather_context_logits',
+                        action='store_true',
+                        default=False,
+                        help='Gather context logits')
+    parser.add_argument('--gather_generation_logits',
+                        action='store_true',
+                        default=False,
+                        help='Gather generation logits')
+    parser.add_argument(
+        '--skip_encoder',
+        '--nougat',
+        default=False,
+        action="store_true",
+        help=
+        'Skip building encoder for nougat model. Encoder is not an LLM in nougat'
+    )
 
     # parse cmdline args
     args = parser.parse_args()
     logger.set_level(args.log_level)
+
+    if component == 'encoder' and args.skip_encoder:
+        # Skip further processing
+        return args
 
     # parse model config and add to args
     if args.weight_dir is not None:
@@ -257,8 +272,7 @@ def parse_arguments(component):
 
     plugins_args = [
         'use_bert_attention_plugin', 'use_gpt_attention_plugin',
-        'use_gemm_plugin', 'use_layernorm_plugin', 'use_rmsnorm_plugin',
-        'use_lookup_plugin'
+        'use_gemm_plugin', 'use_lookup_plugin'
     ]
     for plugin_arg in plugins_args:
         if getattr(args, plugin_arg) is None:
@@ -267,8 +281,12 @@ def parse_arguments(component):
             )
             setattr(args, plugin_arg, args.dtype)
 
-    if args.dtype == 'bfloat16':
+    if args.dtype == 'bfloat16' and not args.model_type in ['bart']:
         assert args.use_gemm_plugin, "Please use gemm plugin when dtype is bfloat16"
+
+    if args.gather_all_token_logits:
+        args.gather_context_logits = True
+        args.gather_generation_logits = True
 
     return args
 
@@ -319,6 +337,7 @@ def build_rank_engine(builder: Builder,
             hidden_act=args.hidden_act,
             mlp_type=args.mlp_type,
             dtype=dtype,
+            use_prompt_tuning=args.max_prompt_embedding_table_size > 0,
             use_parallel_embedding=args.use_parallel_embedding,
             embedding_sharding_dim=args.embedding_sharding_dim,
             mapping=mapping)
@@ -380,6 +399,7 @@ def build_rank_engine(builder: Builder,
     # Module -> Network
     network = builder.create_network()
     network.trt_network.name = engine_name
+    network.plugin_config.to_legacy_setting()
     if args.use_bert_attention_plugin:
         network.plugin_config.set_bert_attention_plugin(
             dtype=args.use_bert_attention_plugin)
@@ -388,11 +408,6 @@ def build_rank_engine(builder: Builder,
             dtype=args.use_gpt_attention_plugin)
     if args.use_gemm_plugin:
         network.plugin_config.set_gemm_plugin(dtype=args.use_gemm_plugin)
-    if args.use_layernorm_plugin:
-        network.plugin_config.set_layernorm_plugin(
-            dtype=args.use_layernorm_plugin)
-    if args.use_rmsnorm_plugin:
-        network.plugin_config.set_rmsnorm_plugin(dtype=args.use_rmsnorm_plugin)
     if args.enable_qk_half_accum:
         network.plugin_config.enable_qk_half_accum()
     if args.remove_input_padding:
@@ -411,17 +426,20 @@ def build_rank_engine(builder: Builder,
         # Forward
         if args.component == 'encoder':
             inputs = tllm_model.prepare_inputs(
-                args.max_batch_size,
-                args.max_encoder_input_len,
+                max_batch_size=args.max_batch_size,
+                max_input_len=args.max_encoder_input_len,
+                prompt_embedding_table_size=args.
+                max_prompt_embedding_table_size,
             )
         elif args.component == 'decoder':
             inputs = tllm_model.prepare_inputs(
-                args.max_batch_size,
-                args.max_beam_width,
-                args.max_decoder_input_len,
-                args.max_output_len,
-                args.max_encoder_input_len,
-            )
+                max_batch_size=args.max_batch_size,
+                max_beam_width=args.max_beam_width,
+                max_decoder_input_len=args.max_decoder_input_len,
+                max_new_tokens=args.max_output_len,
+                max_encoder_input_len=args.max_encoder_input_len,
+                gather_context_logits=args.gather_context_logits,
+                gather_generation_logits=args.gather_generation_logits)
 
         tllm_model(*inputs)
 
@@ -457,6 +475,7 @@ def build(rank, args):
             precision=args.dtype,
             timing_cache=component_dir /
             args.timing_cache if cache is None else cache,
+            profiling_verbosity=args.profiling_verbosity,
             tensor_parallel=args.tp_size,
             pipeline_parallel=args.pp_size,
             gpus_per_node=args.gpus_per_node,
@@ -478,7 +497,12 @@ def build(rank, args):
             cross_attention=(args.component == 'decoder'),
             has_position_embedding=args.has_position_embedding,
             has_token_type_embedding=args.has_token_type_embedding,
-            strongly_typed=args.strongly_typed)
+            strongly_typed=args.strongly_typed,
+            gather_context_logits=args.gather_context_logits,
+            gather_generation_logits=args.gather_generation_logits,
+            max_prompt_embedding_table_size=(
+                args.max_prompt_embedding_table_size
+                if args.component == 'encoder' else 0))
 
         engine_name = get_engine_name(args.engine_name, args.dtype,
                                       args.tp_size, args.pp_size, cur_rank)
@@ -507,6 +531,20 @@ def build(rank, args):
 def run_build(component):
     assert component == 'encoder' or component == 'decoder', 'Unsupported component!'
     args = parse_arguments(component)
+
+    # special handling in prompt tuning / multimodal cases
+    if args.max_prompt_embedding_table_size > 0:
+        if component == 'decoder' and args.skip_encoder:
+            # for Nougat-like structure that only uses the decoder of enc-dec, encoder_output length equals to multimodal length, so max_encoder_input_len == max_encoder_output_len == max_multimodal_len == max_prompt_embedding_table_size MUST hold.
+            args.max_encoder_input_len = args.max_prompt_embedding_table_size
+            logger.warning(
+                "Forcing max_encoder_input_len equal to max_prompt_embedding_table_size"
+            )
+        # otherwise, e.g. for BLIP2-T5, the entire enc-dec is used, so multimodal length (visual output length) and encoder_output length (LLM input length) are two different things
+
+    if component == 'encoder' and args.skip_encoder:
+        logger.warning("Skipping build of encoder for Nougat model")
+        return
     args.component = component
 
     if args.random_seed is not None:

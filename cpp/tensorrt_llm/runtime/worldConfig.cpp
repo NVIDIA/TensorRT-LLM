@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,130 +17,79 @@
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/common/stringUtils.h"
-#include "tensorrt_llm/runtime/tllmLogger.h"
-#include "tensorrt_llm/runtime/utils/multiDeviceUtils.h"
 
 #include <algorithm>
-#include <csignal>
-#include <cstdlib>
-#include <mpi.h>
-#include <mutex>
 #include <numeric>
+#include <set>
 
 using namespace tensorrt_llm::runtime;
 namespace tc = tensorrt_llm::common;
 
-namespace
+WorldConfig::WorldConfig(SizeType tensorParallelism, SizeType pipelineParallelism, SizeType rank, SizeType gpusPerNode,
+    std::optional<std::vector<SizeType>> const& deviceIds)
+    : mTensorParallelism{tensorParallelism}
+    , mPipelineParallelism{pipelineParallelism}
+    , mRank{rank}
+    , mGpusPerNode{gpusPerNode}
+    , mDeviceIds{deviceIds.value_or(std::vector<SizeType>(mGpusPerNode))}
 {
+    auto const numDevices = mDeviceIds.size();
+    TLLM_CHECK(numDevices > 0);
 
-bool mpiInitialized = false;
-std::mutex mpiMutex;
-
-void initMpi(nvinfer1::ILogger& logger, int threadMode = MPI_THREAD_FUNNELED)
-{
-    std::lock_guard<std::mutex> lk(mpiMutex);
-    if (mpiInitialized)
+    if (!deviceIds.has_value())
     {
-        return;
+        mDeviceIds.resize(mGpusPerNode);
+        std::iota(mDeviceIds.begin(), mDeviceIds.end(), 0);
+    }
+    else
+    {
+        // total number is at most mGpusPerNode
+        TLLM_CHECK_WITH_INFO(static_cast<SizeType>(numDevices) <= mGpusPerNode,
+            "Number of device IDs %zu is greater than GPUs per node %d", numDevices, mGpusPerNode);
+
+        // all deviceIds is within the range
+        TLLM_CHECK(*std::max_element(mDeviceIds.begin(), mDeviceIds.end()) < mGpusPerNode);
+        TLLM_CHECK(*std::min_element(mDeviceIds.begin(), mDeviceIds.end()) >= 0);
+
+        // all ids are unique
+        std::set<SizeType> const deviceIdSet(mDeviceIds.begin(), mDeviceIds.end());
+        TLLM_CHECK_WITH_INFO(
+            deviceIdSet.size() == numDevices, "Device IDs are not unique %zu != %zu", deviceIdSet.size(), numDevices);
+
+        // log a warning if device ids are not contiguous
+        if (std::adjacent_find(deviceIdSet.begin(), deviceIdSet.end(), [](auto x, auto y) { return y - x != 1; })
+            != deviceIdSet.end())
+        {
+            TLLM_LOG_WARNING("The user specified device IDs are not contiguous!");
+        }
+        TLLM_LOG_INFO("Using user-specified devices: %s", tc::arr2str(mDeviceIds.data(), numDevices).c_str());
     }
 
-    int initialized = 0;
-    TLLM_MPI_CHECK(MPI_Initialized(&initialized));
-    if (!initialized)
-    {
-        logger.log(
-            nvinfer1::ILogger::Severity::kINFO, tc::fmtstr("Initializing MPI with thread mode %d", threadMode).c_str());
-        int providedMode;
-        TLLM_MPI_CHECK(MPI_Init_thread(nullptr, nullptr, threadMode, &providedMode));
-        TLLM_CHECK_WITH_INFO(providedMode >= threadMode, "MPI_Init_thread failed");
-        std::atexit([]() { MPI_Finalize(); });
-
-        auto previousHandler = std::signal(SIGABRT, [](int signal) { MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE); });
-        TLLM_CHECK_WITH_INFO(previousHandler != SIG_ERR, "Signal handler setup failed");
-    }
-
-    mpiInitialized = true;
+    TLLM_CHECK(mTensorParallelism > 0);
+    TLLM_CHECK(mPipelineParallelism > 0);
 }
 
-} // namespace
-
-bool WorldConfig::validConfig(nvinfer1::ILogger& logger, SizeType tensorParallelism, SizeType pipelineParallelism)
+bool WorldConfig::validConfig(SizeType tensorParallelism, SizeType pipelineParallelism)
 {
-    initMpi(logger);
-
-    int mpiSize;
-    TLLM_MPI_CHECK(MPI_Comm_size(MPI_COMM_WORLD, &mpiSize));
+    auto const mpiSize = COMM_SESSION.getSize();
     return mpiSize == tensorParallelism * pipelineParallelism;
 }
 
-WorldConfig WorldConfig::mpi(nvinfer1::ILogger& logger, SizeType gpusPerNode, std::optional<SizeType> tensorParallelism,
-    std::optional<SizeType> pipelineParallelism, std::optional<std::vector<SizeType>> userSpecifiedDeviceIds)
+WorldConfig WorldConfig::mpi(SizeType gpusPerNode, std::optional<SizeType> tensorParallelism,
+    std::optional<SizeType> pipelineParallelism, std::optional<std::vector<SizeType>> const& deviceIds)
 {
-    initMpi(logger);
-
-    int mpiSize, mpiRank;
-    TLLM_MPI_CHECK(MPI_Comm_size(MPI_COMM_WORLD, &mpiSize));
-    TLLM_MPI_CHECK(MPI_Comm_rank(MPI_COMM_WORLD, &mpiRank));
-    logger.log(nvinfer1::ILogger::Severity::kINFO, tc::fmtstr("MPI size: %d, rank: %d", mpiSize, mpiRank).c_str());
-
+    auto& comm = COMM_SESSION;
+    auto const mpiSize = comm.getSize();
+    auto const mpiRank = comm.getRank();
+    TLLM_LOG_INFO("MPI size: %d, rank: %d", mpiSize, mpiRank);
     auto pp = pipelineParallelism.value_or(1);
     auto tp = tensorParallelism.value_or(mpiSize / pp);
     TLLM_CHECK(mpiSize == tp * pp);
-    // Pass the user-specified device lists to the WorldConfig. Otherwise create a default list of device ids.
-    std::vector<SizeType> deviceIds(mpiSize);
-    std::iota(deviceIds.begin(), deviceIds.end(), 0);
 
-    if (userSpecifiedDeviceIds)
-    {
-        TLLM_CHECK(static_cast<SizeType>(userSpecifiedDeviceIds.value().size()) == tp * pp);
-        deviceIds = userSpecifiedDeviceIds.value();
-
-        // For user provided device list, verify:
-        // 1) total number is smaller than the total cuda-visible device counts
-        // 2) all deviceIds is within the range
-        // 3) All ids are unique
-        // 4) if the deviceIds are contiguous, and throw a warning if not
-        TLLM_CHECK((gpusPerNode >= static_cast<SizeType>(deviceIds.size()))
-            && (gpusPerNode > *std::max_element(deviceIds.begin(), deviceIds.end()))
-            && *std::min_element(deviceIds.begin(), deviceIds.end()) >= 0);
-        gpusPerNode = deviceIds.size();
-        auto it = std::unique(deviceIds.begin(), deviceIds.end());
-        TLLM_CHECK(std::distance(deviceIds.begin(), it) == gpusPerNode);
-        std::sort(deviceIds.begin(), deviceIds.end());
-
-        // If the deviceIds are not contiguous, throw a warning
-        bool isContiguous = true;
-        for (SizeType i = 1; i < static_cast<SizeType>(deviceIds.size()); ++i)
-        {
-            if (deviceIds[i] != deviceIds[i - 1] + 1)
-            {
-                isContiguous = false;
-                break;
-            }
-        }
-        if (!isContiguous)
-        {
-            logger.log(nvinfer1::ILogger::Severity::kWARNING, "The user specified device IDs are not contiguous!");
-        }
-
-        std::stringstream ss;
-        ss << "Using user-specificed devices: [";
-        for (auto& id : deviceIds)
-        {
-            ss << id << ",";
-        }
-        ss << "]";
-        logger.log(nvinfer1::ILogger::Severity::kINFO, ss.str().c_str());
-    }
     return WorldConfig{tp, pp, mpiRank, gpusPerNode, deviceIds};
-}
-
-WorldConfig WorldConfig::mpi(SizeType gpusPerNode, std::optional<SizeType> tensorParallelism,
-    std::optional<SizeType> pipelineParallelism, std::optional<std::vector<SizeType>> userSpecifiedDeviceIds)
-{
-    TllmLogger logger{};
-    return mpi(logger, gpusPerNode, tensorParallelism, pipelineParallelism, userSpecifiedDeviceIds);
 }
 
 std::vector<SizeType> WorldConfig::getPipelineParallelGroup() const

@@ -1198,6 +1198,43 @@ inline __device__ __host__ constexpr unsigned threads_per_key()
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Specialized launch bounds for certain cases, which helps increase occupancy.
+// Keep other cases untouched as there might be register spilling.
+
+template <typename T, typename Tcache, unsigned THREADS_PER_BLOCK, unsigned Dh_MAX, bool DO_CROSS_ATTENTION,
+    bool HAS_BEAMS, bool POS_SHIFT>
+struct Launch_bounds_config
+{
+    // By default, we will not use launch bounds.
+    static constexpr int MAX_THREADS_PER_BLOCK = 0;
+    static constexpr int MIN_BLOCKS_PER_SM = 0;
+};
+
+template <>
+struct Launch_bounds_config<uint16_t, __nv_fp8_e4m3, 256u, 64u, false, false, false>
+{
+    static constexpr int MAX_THREADS_PER_BLOCK = 256u;
+    static constexpr int MIN_BLOCKS_PER_SM = 4u;
+};
+
+// Llama with FP8 KV Cache.
+template <>
+struct Launch_bounds_config<uint16_t, __nv_fp8_e4m3, 256u, 128u, false, false, false>
+{
+    static constexpr int MAX_THREADS_PER_BLOCK = 256u;
+    static constexpr int MIN_BLOCKS_PER_SM = 4u;
+};
+
+// GPTJ With Beam Searching and FP8 KV Cache.
+template <>
+struct Launch_bounds_config<uint16_t, __nv_fp8_e4m3, 256u, 256u, false, true, false>
+{
+    static constexpr int MAX_THREADS_PER_BLOCK = 256u;
+    static constexpr int MIN_BLOCKS_PER_SM = 3u;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 inline __device__ constexpr uint32_t shfl_mask(int threads)
 {
     assert(threads <= 32);
@@ -1227,8 +1264,12 @@ template <
     typename T,
     // The type of the cache.
     typename Tcache,
+    // The type of the shift key cache.
+    typename TKcache,
     // Type of struct containing KV cache
     typename KVCacheBuffer,
+    // Type of struct containing K cache to read past keys
+    typename KCacheBuffer,
     // The hidden dimension per head.
     unsigned Dh,
     // The number of threads in a threadblock.
@@ -1239,6 +1280,10 @@ template <
     bool HAS_BEAMS,
     // Whether enable multi-block mode for long-sequence-length.
     bool DO_MULTI_BLOCK = false,
+    // Whether enable position shift for streamingllm
+    bool POS_SHIFT = false,
+    // Whether compute implicit relative attention bias on the fly.
+    bool IMPLICIT_REL_ATTN_BIAS = false,
     // The number of threads per key.
     unsigned THREADS_PER_KEY = threads_per_key<T, dh_max(Dh)>(),
     // The number of threads per value.
@@ -1247,15 +1292,24 @@ template <
     // Set it default to 4 for higher occupancy (by reducing registers usage).
     unsigned K_LOOP_UNROLL = 4,
     // The unroll factor for loading from V cache.
-    unsigned V_LOOP_UNROLL = 8>
-__global__ void masked_multihead_attention_kernel(
-    Multihead_attention_params<T, DO_CROSS_ATTENTION> params, KVCacheBuffer kvCacheBuffer)
+    unsigned V_LOOP_UNROLL = 8,
+    // Launch bounds
+    unsigned MAX_THEADS_PER_BLOCK
+    = Launch_bounds_config<T, Tcache, THREADS_PER_BLOCK, dh_max(Dh), DO_CROSS_ATTENTION, HAS_BEAMS, POS_SHIFT>()
+          .MAX_THREADS_PER_BLOCK,
+    unsigned MIN_BLOCKS_PER_SM
+    = Launch_bounds_config<T, Tcache, THREADS_PER_BLOCK, dh_max(Dh), DO_CROSS_ATTENTION, HAS_BEAMS, POS_SHIFT>()
+          .MIN_BLOCKS_PER_SM>
+__global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) masked_multihead_attention_kernel(
+    Multihead_attention_params<T, DO_CROSS_ATTENTION> params, KVCacheBuffer kvCacheBuffer, KCacheBuffer pastKCache)
 {
 
     using Tk = typename kernel_type_t<T>::Type;
     // Use 8bit cache.
-    static constexpr bool ENABLE_8BITS_CACHE = sizeof(Tcache) == 1;
+    static constexpr bool ENABLE_8BITS_K_CACHE = sizeof(TKcache) == 1;
+    static constexpr bool ENABLE_8BITS_KV_CACHE = sizeof(Tcache) == 1;
     // FP8 KV Cache.
+    static constexpr bool FP8_K_CACHE = std::is_same<TKcache, __nv_fp8_e4m3>::value;
     static constexpr bool FP8_KV_CACHE = std::is_same<Tcache, __nv_fp8_e4m3>::value;
     // INT8 KV Cache.
     static constexpr bool INT8_KV_CACHE = std::is_same<Tcache, int8_t>::value;
@@ -1270,12 +1324,16 @@ __global__ void masked_multihead_attention_kernel(
     constexpr bool IS_Dh_MAX = Dh == Dh_MAX;
     static_assert(Dh_MAX >= WARP_SIZE);
     static_assert(Dh_MAX >= Dh);
+    // Only instantiate few head sizes for implicit relative attention bias in order to save compilation time.
+    static_assert(!IMPLICIT_REL_ATTN_BIAS || Dh == 32 || Dh == 64 || Dh == 128);
 
     // The maximum sequence length in the cyclic kv_cache, i.e., an upper bound on L.
     // Note that the maximum sequence length supported by the model might be greater than this.
     // Note max_attention_window_size is maximum of cyclic_attention_window_size among all layers.
     // By default, you can assume that they are the same.
     const auto cyclic_kv_cache_len = static_cast<unsigned>(params.cyclic_attention_window_size);
+    // The number of sink tokens in kv cache to support streamingllm
+    const auto sink_token_len = static_cast<unsigned>(params.sink_token_length);
     // The current timestep (including paddings).
     // It is only used to calculate the smem stride.
     const auto timestep = static_cast<unsigned>(DO_MULTI_BLOCK ? params.timesteps_per_block : params.timestep);
@@ -1335,7 +1393,7 @@ __global__ void masked_multihead_attention_kernel(
     // The type of queries and keys for the math in the Q*K^T product.
     using K_vec_k = typename K_vec_k_<T, K_VEC_SIZE>::Type;
     // Only used when key cache is quantized to 8 bits.
-    using K_vec_m = typename packed_type<Tcache, num_elems<K_vec_k>::value>::type;
+    using K_vec_m = typename packed_type<TKcache, num_elems<K_vec_k>::value>::type;
 #ifdef MMHA_USE_FP32_ACCUM_FOR_FMA
     using K_vec_accum = typename Qk_vec_accum_fp32_<K_vec_k>::Type;
 #else
@@ -1409,10 +1467,10 @@ __global__ void masked_multihead_attention_kernel(
 
     // Do we have a relative attention bias?
     bool has_relative_attention_bias = params.relative_attention_bias != nullptr;
+    // IMPLICIT_REL_ATTN_BIAS:
     // Compute relative attention bias on the fly, with relative attention table [head_num/TP, num_buckets] passed in.
     // num_buckets passed as relative_attention_bias_stride, max_distance passed as params.max_distance
     // this is a common optimization for both self attention and cross attention
-    const bool implicit_rel_attn_bias = params.max_distance != 0 && has_relative_attention_bias;
     int relative_attention_bias_stride
         = params.relative_attention_bias_stride; // num_buckets might be modified below, save it beforehand
     int max_distance = params.max_distance;
@@ -1424,7 +1482,12 @@ __global__ void masked_multihead_attention_kernel(
         : (params.length_per_sample ? (params.length_per_sample[batch_beam_idx] - 1) : static_cast<int>(timestep));
     // We will use cyclic kv cache when it exceeds the limit.
     // The length position for storing new key and value.
-    const int cyclic_tlength = tlength % cyclic_kv_cache_len;
+    const int cyclic_tlength = kvCacheBuffer.getKVTokenIdx(tlength);
+    // When enable cyclic kv cache and one more block mode, we need to shift the index to the actual index in the
+    // sequence. Otherwise, if the token is not the sink token, we need to add the bubblen length to the index.
+    const bool enable_use_seq_idx_kv = kvCacheBuffer.mEnableOneMoreBlock && tlength > cyclic_kv_cache_len;
+    const int shift_for_cyclic_kv = (enable_use_seq_idx_kv) ? tlength - cyclic_kv_cache_len : kvCacheBuffer.mBubbleLen;
+    const int shift_for_cyclic_k = (enable_use_seq_idx_kv) ? tlength - cyclic_kv_cache_len : pastKCache.mBubbleLen;
     // The actual kv cache length.
     // tlength is the past length actually.
     const int kv_loop_length = min(tlength, cyclic_kv_cache_len);
@@ -1433,6 +1496,8 @@ __global__ void masked_multihead_attention_kernel(
     // as context kv cache might be overwritten by the new kv cache
     const int beam0_context_length
         = HAS_BEAMS && tlength > cyclic_kv_cache_len ? 0 : params.input_lengths[batch_beam_idx];
+    // The position of the current timestep, and it is used to apply the position embedding
+    const int current_pos_idx = (!POS_SHIFT || DO_CROSS_ATTENTION) ? tlength : kv_loop_length;
 
     // The offset in the Q and K buffer also accounts for the batch.
     const auto qk_vec_idx = tidx * QK_VEC_SIZE;
@@ -1443,25 +1508,29 @@ __global__ void masked_multihead_attention_kernel(
 
     // Quant/Dequant scales for 8bits kv cache.
     using T_scale = typename kv_cache_scale_type_t<T, Tcache>::Type;
-    T_scale kv_scale_orig_quant, kv_scale_quant_orig;
-    const float kv_scale_quant_orig_f = (ENABLE_8BITS_CACHE ? params.kv_scale_quant_orig[0] : 1.0f);
-    convert_from_float(&kv_scale_quant_orig, kv_scale_quant_orig_f);
-    convert_from_float(&kv_scale_orig_quant, (ENABLE_8BITS_CACHE ? params.kv_scale_orig_quant[0] : 1.0f));
+    T_scale kv_scale_orig_quant, k_scale_quant_orig;
+    const float k_scale_quant_orig_f = (ENABLE_8BITS_K_CACHE ? params.kv_scale_quant_orig[0] : 1.0f);
+    const float kv_scale_quant_orig_f = (ENABLE_8BITS_KV_CACHE ? params.kv_scale_quant_orig[0] : 1.0f);
+    convert_from_float(&k_scale_quant_orig, k_scale_quant_orig_f);
+    convert_from_float(&kv_scale_orig_quant, (ENABLE_8BITS_KV_CACHE ? params.kv_scale_orig_quant[0] : 1.0f));
 
     // Up to QK_VECS_PER_Dh_MAX threads load Q and K + the bias values for the current timestep.
     // Trigger the loads from the Q and K buffers.
     Qk_vec_k q, k, q_bias, k_bias;
+    // key without position embedding
+    Qk_vec_k k_wo_pos;
     zero(q);
     zero(k);
     zero(q_bias);
     zero(k_bias);
+    zero(k_wo_pos);
     float rotary_embedding_base = params.rotary_embedding_base;
     float rotary_embedding_scale = params.rotary_embedding_scale;
     if (is_valid_qk_vec)
     {
         mmha::update_rotary_base_n_scale(rotary_embedding_base, rotary_embedding_scale,
             params.rotary_embedding_scale_type, params.rotary_embedding_dim, params.rotary_embedding_max_positions,
-            tlength);
+            current_pos_idx);
         // Query
         // The stride between tokens. We may be able to always use params.stride.
         uint32_t q_stride = params.stride ? static_cast<uint32_t>(params.stride) : (num_heads * Dh);
@@ -1553,6 +1622,7 @@ __global__ void masked_multihead_attention_kernel(
             vec_conversion<Qk_vec_k, Qk_vec_m>(*reinterpret_cast<const Qk_vec_m*>(
                 &params.ia3_key_weights[tensorrt_llm::common::flat_index2(ia3_ti_hi, qk_vec_idx, Dh)])));
     }
+    k_wo_pos = k;
 
     // Note we have no paddings in KV cache now.
     switch (params.position_embedding_type)
@@ -1569,12 +1639,12 @@ __global__ void masked_multihead_attention_kernel(
         if (HANDLE_KV)
         {
             apply_rotary_embedding(q, k, tidx, params.rotary_embedding_dim, params.rotary_embedding_base,
-                params.rotary_embedding_scale, tlength);
+                params.rotary_embedding_scale, current_pos_idx);
         }
         else
         {
             apply_rotary_embedding(q, tidx, params.rotary_embedding_dim, params.rotary_embedding_base,
-                params.rotary_embedding_scale, tlength);
+                params.rotary_embedding_scale, current_pos_idx);
         }
         break;
     }
@@ -1613,14 +1683,14 @@ __global__ void masked_multihead_attention_kernel(
                 mmha::vec_from_smem_transpose(k, k_smem_, transpose_idx, smem_pitch);
 
                 mmha::apply_rotary_embedding(q, k, transpose_idx / tidx_factor, params.rotary_embedding_dim,
-                    rotary_embedding_base, rotary_embedding_scale, tlength);
+                    rotary_embedding_base, rotary_embedding_scale, current_pos_idx);
 
                 mmha::write_smem_transpose(k, k_smem_, transpose_idx, smem_pitch);
             }
             else
             {
                 mmha::apply_rotary_embedding(q, transpose_idx / tidx_factor, params.rotary_embedding_dim,
-                    rotary_embedding_base, rotary_embedding_scale, tlength);
+                    rotary_embedding_base, rotary_embedding_scale, current_pos_idx);
             }
             mmha::write_smem_transpose(q, q_smem_, transpose_idx, smem_pitch);
         }
@@ -1648,7 +1718,7 @@ __global__ void masked_multihead_attention_kernel(
 
         // Store the Q values to shared memory.
 #ifdef MMHA_FP8_SCALE_Q_INSTEAD_OF_K
-        if constexpr (FP8_KV_CACHE)
+        if constexpr (FP8_K_CACHE)
         {
             // There are many more elements from K than elements from Q so we pre-scale Q instead
             // of scaling all the elements from K. It helps reduce the number of ops.
@@ -1656,7 +1726,7 @@ __global__ void masked_multihead_attention_kernel(
             zero(scaled_q);
             if (is_valid_qk_vec)
             {
-                scaled_q = mul<Qk_vec_k, Tk, Qk_vec_k>(kv_scale_quant_orig, q);
+                scaled_q = mul<Qk_vec_k, Tk, Qk_vec_k>(k_scale_quant_orig, q);
             }
             reinterpret_cast<Qk_vec_k*>(&q_smem[qk_vec_idx])[0] = scaled_q;
         }
@@ -1672,7 +1742,14 @@ __global__ void masked_multihead_attention_kernel(
         // Store the K values to shared memory.
         // We store K values from shared memory to global memory
         //  when the target position of K cache in global memory has been accessed (in the case of cyclic kv cache)
-        reinterpret_cast<Qk_vec_k*>(&k_smem[qk_vec_idx])[0] = k;
+        if (POS_SHIFT && !DO_CROSS_ATTENTION)
+        {
+            reinterpret_cast<Qk_vec_k*>(&k_smem[qk_vec_idx])[0] = k_wo_pos;
+        }
+        else
+        {
+            reinterpret_cast<Qk_vec_k*>(&k_smem[qk_vec_idx])[0] = k;
+        }
 
         // Compute \sum_i Q[i] * K^T[i] for the current timestep.
         qk = dot<Qk_vec_accum, Qk_vec_k>(q, k);
@@ -1698,7 +1775,7 @@ __global__ void masked_multihead_attention_kernel(
     if (has_relative_attention_bias)
     {
         // "hi" is unsigned, subtracting int from unsigned int causes underflow. Cast to int
-        int64_t offset = implicit_rel_attn_bias
+        int64_t offset = IMPLICIT_REL_ATTN_BIAS
             ? ((int64_t) hi * relative_attention_bias_stride - tlength)
             : ((int64_t) hi * relative_attention_bias_stride + tlength) * relative_attention_bias_stride;
         relative_attention_bias_ptr = &params.relative_attention_bias[offset];
@@ -1765,9 +1842,6 @@ __global__ void masked_multihead_attention_kernel(
     constexpr unsigned UNROLLED_K_PER_WARP = K_PER_WARP * K_LOOP_UNROLL;
     // The number of unrolled keys per ieration.
     constexpr unsigned UNROLLED_K_PER_ITER = K_PER_ITER * K_LOOP_UNROLL;
-
-    // Base pointer for the row of pointers to k cache blocks
-    void** k_cache_base_row_ptr = reinterpret_cast<void**>(kvCacheBuffer.getRowPtr(KVIdxType::K_IDX, batch_beam_idx));
 
     const auto timesteps_per_block = static_cast<unsigned>(params.timesteps_per_block);
 
@@ -1840,13 +1914,24 @@ __global__ void masked_multihead_attention_kernel(
                 // Dh OOB values will be handled by zero_q.
                 // Seq OOB values will be masked out when storing back to smem.
                 auto const jj = min(k_idx.y + k_vec_i * K_ELTS_PER_CHUNK, Dh - K_VEC_SIZE);
-                const int valid_time_now = min(time_now + k_loop * K_PER_ITER, context_length - 1);
+                int valid_time_now = min(time_now + k_loop * K_PER_ITER, context_length - 1);
+                if (POS_SHIFT && valid_time_now >= sink_token_len)
+                {
+                    // If one more block mode is enabled, we use the index in sequence as tokenIdx.
+                    // Otherwise, we need to add the bubble length to the index
+                    valid_time_now += shift_for_cyclic_k;
+                    if (enable_use_seq_idx_kv)
+                    {
+                        // Convert the token index in sequence to token index in K cache.
+                        valid_time_now = pastKCache.getKVTokenIdx(valid_time_now);
+                    }
+                }
                 const int seqIdx = batch_idx * beam_width;
 
                 // Base pointer to k cache block for beam's batch
-                Tcache* k_cache_batch = reinterpret_cast<Tcache*>(kvCacheBuffer.getKBlockPtr(seqIdx, valid_time_now));
+                TKcache* k_cache_batch = reinterpret_cast<TKcache*>(pastKCache.getKBlockPtr(seqIdx, valid_time_now));
 
-                int inBlockIdx = kvCacheBuffer.getKVLocalIdx(valid_time_now, hi_kv, Dh, jj);
+                int inBlockIdx = pastKCache.getKVLocalIdx(valid_time_now, hi_kv, Dh, jj);
                 k_vec_cache[k_loop][k_vec_i] = *reinterpret_cast<const K_vec_m*>(&k_cache_batch[inBlockIdx]);
             }
         }
@@ -1870,7 +1955,7 @@ __global__ void masked_multihead_attention_kernel(
             // Is it active?
             const bool is_active = local_time_now < context_length;
 
-            if (implicit_rel_attn_bias)
+            if constexpr (IMPLICIT_REL_ATTN_BIAS)
             {
                 // Compute bias value on the fly (See bert_preprocess_kernels.cu::buildRelativeAttentionBias)
                 int relative_buckets = 0;
@@ -1904,16 +1989,16 @@ __global__ void masked_multihead_attention_kernel(
             // Note that dot will convert 8bit vec to the accumulation data type (float by default).
             float qk_ = 0.f;
 #ifdef MMHA_FP8_SCALE_Q_INSTEAD_OF_K
-            if constexpr (FP8_KV_CACHE)
+            if constexpr (FP8_K_CACHE)
             {
                 qk_ = Qk_dot<T, THREADS_PER_KEY>::dot(q_vec, k_vec) * params.inv_sqrt_dh;
             }
             else
 #endif // MMHA_FP8_SCALE_Q_INSTEAD_OF_K
             {
-                if constexpr (ENABLE_8BITS_CACHE)
+                if constexpr (ENABLE_8BITS_K_CACHE)
                 {
-                    qk_ = Qk_dot<T, THREADS_PER_KEY>::scale_dot(q_vec, k_vec, kv_scale_quant_orig_f)
+                    qk_ = Qk_dot<T, THREADS_PER_KEY>::scale_dot(q_vec, k_vec, k_scale_quant_orig_f)
                         * params.inv_sqrt_dh;
                 }
                 else
@@ -1975,20 +2060,31 @@ __global__ void masked_multihead_attention_kernel(
             for (int k_vec_i = 0; k_vec_i < K_VECS_PER_THREAD; ++k_vec_i)
             {
                 const int jj = min(k_idx.y + k_vec_i * K_ELTS_PER_CHUNK, Dh - K_VEC_SIZE);
-                const int valid_time_now = min(time_now, kv_loop_length - 1);
+                int valid_time_now = min(time_now, kv_loop_length - 1);
                 int beam_offset = beam_indices[valid_time_now];
+                if (POS_SHIFT && valid_time_now >= sink_token_len)
+                {
+                    // If one more block mode is enabled, we use the index in sequence as tokenIdx.
+                    // Otherwise, we need to add the bubble length to the index
+                    valid_time_now += shift_for_cyclic_k;
+                    if (enable_use_seq_idx_kv)
+                    {
+                        // Convert the token index in sequence to token index in K cache.
+                        valid_time_now = pastKCache.getKVTokenIdx(valid_time_now);
+                    }
+                }
                 const int seqIdx = batch_idx * beam_width + beam_offset;
                 // Base pointer to k cache block for beam's batch, before offsetting with indirection buffer
-                Tcache* k_cache_batch = reinterpret_cast<Tcache*>(kvCacheBuffer.getKBlockPtr(seqIdx, valid_time_now));
+                TKcache* k_cache_batch = reinterpret_cast<TKcache*>(pastKCache.getKBlockPtr(seqIdx, valid_time_now));
 
-                int inBlockIdx = kvCacheBuffer.getKVLocalIdx(valid_time_now, hi_kv, Dh, jj);
+                int inBlockIdx = pastKCache.getKVLocalIdx(valid_time_now, hi_kv, Dh, jj);
                 k_vec[k_vec_i] = (*reinterpret_cast<const K_vec_m*>(&k_cache_batch[inBlockIdx]));
             }
 
             // Is it active?
             const bool is_active = time_now >= context_length && time_now < kv_loop_length;
 
-            if (implicit_rel_attn_bias)
+            if constexpr (IMPLICIT_REL_ATTN_BIAS)
             {
                 // Compute bias value on the fly (See bert_preprocess_kernels.cu::buildRelativeAttentionBias)
                 int relative_buckets = 0;
@@ -2024,16 +2120,16 @@ __global__ void masked_multihead_attention_kernel(
             // Note that dot will convert 8bit vec to the accumulation data type (float by default).
             float qk_ = 0.f;
 #ifdef MMHA_FP8_SCALE_Q_INSTEAD_OF_K
-            if constexpr (FP8_KV_CACHE)
+            if constexpr (FP8_K_CACHE)
             {
                 qk_ = Qk_dot<T, THREADS_PER_KEY>::dot(q_vec, k_vec) * params.inv_sqrt_dh;
             }
             else
 #endif // MMHA_FP8_SCALE_Q_INSTEAD_OF_K
             {
-                if constexpr (ENABLE_8BITS_CACHE)
+                if constexpr (ENABLE_8BITS_K_CACHE)
                 {
-                    qk_ = Qk_dot<T, THREADS_PER_KEY>::scale_dot(q_vec, k_vec, kv_scale_quant_orig_f)
+                    qk_ = Qk_dot<T, THREADS_PER_KEY>::scale_dot(q_vec, k_vec, k_scale_quant_orig_f)
                         * params.inv_sqrt_dh;
                 }
                 else
@@ -2126,7 +2222,7 @@ __global__ void masked_multihead_attention_kernel(
         // The base pointer for the value in the cache buffer.
         Tcache* k_cache = reinterpret_cast<Tcache*>(kvCacheBuffer.getKBlockPtr(batch_beam_idx, cyclic_tlength));
 
-        if constexpr (ENABLE_8BITS_CACHE)
+        if constexpr (ENABLE_8BITS_KV_CACHE)
         {
             store_8bits_kv_cache_vec(reinterpret_cast<Tcache*>(k_cache), k_vec, inBlockIdx, kv_scale_orig_quant);
         }
@@ -2224,12 +2320,6 @@ __global__ void masked_multihead_attention_kernel(
     const auto vo = v_idx.x;
     // The hidden dimensions computed by this particular thread.
     const auto vi = v_idx.y;
-    // Base pointer for the row of pointers to v cache blocks
-    void** v_cache_base_row_ptr = reinterpret_cast<void**>(kvCacheBuffer.getRowPtr(KVIdxType::V_IDX, batch_beam_idx));
-    // Base pointer for the row of pointers to v cache blocks for beam's batch, before offsetting with indirection
-    // buffer
-    void** v_cache_batch_row_ptr
-        = reinterpret_cast<void**>(kvCacheBuffer.getRowPtr(KVIdxType::V_IDX, batch_idx * beam_width));
 
     // The number of values processed per iteration of the loop.
     constexpr unsigned V_PER_ITER{THREADS_PER_BLOCK / THREADS_PER_VALUE};
@@ -2293,6 +2383,17 @@ __global__ void masked_multihead_attention_kernel(
                 // Fetch offset based on cache_indir when beam sampling
                 int time_idx = ti + v_loop * V_PER_ITER + (MULTI_BLOCK_FLAG ? c_tile_times_timesteps_per_block : 0);
                 time_idx = min(time_idx, kv_loop_length - 1);
+                if (POS_SHIFT && time_idx >= sink_token_len)
+                {
+                    // If one more block mode is enabled, we use the index in sequence as tokenIdx.
+                    // Otherwise, we need to add the bubble length to the index
+                    time_idx += shift_for_cyclic_kv;
+                    if (enable_use_seq_idx_kv)
+                    {
+                        // Convert the token index in sequence to token index in V cache.
+                        time_idx = kvCacheBuffer.getKVTokenIdx(time_idx);
+                    }
+                }
                 int rowIdx = batch_idx * beam_width;
 
                 const int inBlockIdx = kvCacheBuffer.getKVLocalIdx(time_idx, hi_kv, Dh, vi);
@@ -2339,6 +2440,18 @@ __global__ void masked_multihead_attention_kernel(
                     }
                     int rowIdx = batch_idx * beam_width + beam_indices[time_idx];
 
+                    if (POS_SHIFT && time_idx >= sink_token_len)
+                    {
+                        // If one more block mode is enabled, we use the index in sequence as tokenIdx.
+                        // Otherwise, we need to add the bubble length to the index
+                        time_idx += shift_for_cyclic_kv;
+                        if (enable_use_seq_idx_kv)
+                        {
+                            // Convert the token index in sequence to token index in V cache.
+                            time_idx = kvCacheBuffer.getKVTokenIdx(time_idx);
+                        }
+                    }
+
                     const int inBlockIdx = kvCacheBuffer.getKVLocalIdx(time_idx, hi_kv, Dh, vi);
                     // The base pointer for the value in the cache buffer.
                     Tcache* v_cache_batch = reinterpret_cast<Tcache*>(kvCacheBuffer.getVBlockPtr(rowIdx, time_idx));
@@ -2362,10 +2475,9 @@ __global__ void masked_multihead_attention_kernel(
     // One group of threads computes the product(s) for the current timestep.
     if (vo == kv_loop_length % V_PER_ITER && is_valid_vi && (!MULTI_BLOCK_FLAG || (c_tile == ctile_idx)))
     {
-        const int tokenIdx = cyclic_tlength;
-        const int inBlockIdx = kvCacheBuffer.getKVLocalIdx(tokenIdx, hi_kv, Dh, vi);
+        const int inBlockIdx = kvCacheBuffer.getKVLocalIdx(cyclic_tlength, hi_kv, Dh, vi);
         // The base pointer for the value in the cache buffer.
-        Tcache* v_cache_base = reinterpret_cast<Tcache*>(kvCacheBuffer.getBlockPtr(v_cache_base_row_ptr, tokenIdx));
+        Tcache* v_cache_base = reinterpret_cast<Tcache*>(kvCacheBuffer.getVBlockPtr(batch_beam_idx, cyclic_tlength));
 
         V_vec_k v;
         if (DO_CROSS_ATTENTION)
@@ -2414,7 +2526,7 @@ __global__ void masked_multihead_attention_kernel(
         // For MQA/GQA mode, write only with the first Q head of each group per KV head.
         if (hi == (hi_kv * qhead_per_kv))
         {
-            if (ENABLE_8BITS_CACHE)
+            if (ENABLE_8BITS_KV_CACHE)
             {
                 store_8bits_kv_cache_vec(v_cache_base, v, inBlockIdx, kv_scale_orig_quant);
             }

@@ -1,15 +1,45 @@
 import json
 import os
+import re
+import tempfile
 from pathlib import Path
 
 import numpy as np
 import torch
+import yaml
 
-from .._utils import (_str_to_np_dict, fromfile, numpy_to_torch,
-                      str_dtype_to_torch)
+from .._utils import str_dtype_to_torch, torch_to_numpy, unpack_nemo_ckpt
+
+
+def get_all_nemo_lora_weights(num_layers, lora_weights):
+    layer_weights = [{} for _ in range(2 * num_layers)]
+    adapter_key = "self_attention.adapter_layer.lora_kqv_adapter"
+    layer_pattern = re.compile(r'.*\.layers\.([0-9]+)\..*')
+    for key, weights in lora_weights.items():
+        if adapter_key in key:
+            if key.endswith('linear_in.weight'):
+                inout = 'in'
+            elif key.endswith('linear_out.weight'):
+                inout = 'out'
+            else:
+                continue
+            m = layer_pattern.match(key)
+            layer_idx = int(m.group(1))
+            layer_weights[layer_idx][inout] = weights
+    return layer_weights
 
 
 class LoraConfig(object):
+    LORA_MODULE_IDS = {
+        "attn_qkv": 0,
+        "attn_q": 1,
+        "attn_k": 2,
+        "attn_v": 3,
+        "attn_dense": 4,
+        "mlp_h_to_4h": 5,
+        "mlp_4h_to_h": 6,
+        "mlp_gate": 7,
+    }
 
     def __init__(self,
                  hf_lora_dir: str = None,
@@ -17,9 +47,11 @@ class LoraConfig(object):
                  tokenizer_config: dict = {},
                  lora_target_modules: list = [],
                  is_valid: bool = False,
+                 has_tokenizer: bool = False,
                  lm_head_weight=None,
                  embedding_weight=None,
-                 hf_modules_to_trtllm_modules: dict = {}):
+                 hf_modules_to_trtllm_modules: dict = {},
+                 trtllm_modules_to_hf_modules: dict = {}):
         self.hf_lora_dir = hf_lora_dir
         self.adapter_config = adapter_config
         self.tokenizer_config = tokenizer_config
@@ -28,18 +60,23 @@ class LoraConfig(object):
             hf_modules_to_trtllm_modules[m] for m in lora_target_modules
         ]
         self.is_valid = is_valid
+        self.has_tokenizer = has_tokenizer
         self.lm_head_weight = lm_head_weight
         self.embedding_weight = embedding_weight
         self.vocab_size, self.hidden_size = self.lm_head_weight.shape if self.lm_head_weight is not None else (
             0, 0)
+        self.hf_modules_to_trtllm_modules = hf_modules_to_trtllm_modules
+        self.trtllm_modules_to_hf_modules = trtllm_modules_to_hf_modules
 
     @classmethod
-    def from_hf(cls, hf_lora_dir, hf_modules_to_trtllm_modules):
+    def from_hf(cls, hf_lora_dir, hf_modules_to_trtllm_modules,
+                trtllm_modules_to_hf_modules):
         lora_target_modules = {}
         adapter_config = None
         tokenizer_config = None
         hf_lora_dir = hf_lora_dir
         is_valid = True
+        has_tokenizer = True
 
         if os.path.exists(f"{hf_lora_dir}/adapter_config.json"):
             with open(f"{hf_lora_dir}/adapter_config.json") as f:
@@ -52,10 +89,11 @@ class LoraConfig(object):
             with open(f"{hf_lora_dir}/tokenizer_config.json") as f:
                 tokenizer_config = json.load(f)
         else:
-            is_valid = False
+            has_tokenizer = False
 
         lm_head_weight = None
         embedding_weight = None
+
         if os.path.exists(f"{hf_lora_dir}/adapter_model.bin"):
             lora_weight = torch.load(f"{hf_lora_dir}/adapter_model.bin")
 
@@ -69,8 +107,9 @@ class LoraConfig(object):
                         "base_model.model.model.embed_tokens.weight"]
 
         return cls(hf_lora_dir, adapter_config, tokenizer_config,
-                   lora_target_modules, is_valid, lm_head_weight,
-                   embedding_weight, hf_modules_to_trtllm_modules)
+                   lora_target_modules, is_valid, has_tokenizer, lm_head_weight,
+                   embedding_weight, hf_modules_to_trtllm_modules,
+                   trtllm_modules_to_hf_modules)
 
 
 class LoraManager(object):
@@ -111,6 +150,8 @@ class LoraManager(object):
         self._lora_uid_to_low_ranks = {}
         self._lora_weights = []
         self._lora_weights_pointers_list = []
+        self._lora_cpp_weights = {}
+        self._lora_weight_config = {}
 
     def load_from_ckpt(self, model_dir, model_config, runtime_mapping,
                        ckpt_source):
@@ -121,74 +162,95 @@ class LoraManager(object):
         else:
             assert False, f"LoraManager does not support source {ckpt_source}"
 
-    def load_from_nemo(self, model_dir, model_config, runtime_mapping):
-        '''
-        Load lora modules, could be move to client side
-        '''
-        self._model_config = model_config
-        model_dir = Path(model_dir)
-
-        with open(model_dir / "lora_weights.json", 'r') as f:
-            config = json.load(f)
-        lora_config = config['lora_config']
-        for key in lora_config['lora_kqv_adapter']:
-            self._lora_uid_to_key[lora_config['lora_kqv_adapter'][key]
-                                  ['key']] = key
-
+    def load_from_nemo(self, model_files, model_config, runtime_mapping):
+        tp_size = runtime_mapping.tp_size
+        tp_rank = runtime_mapping.tp_rank
         lora_target_modules = model_config.lora_target_modules
         dtype = model_config.dtype
 
-        for layer_idx in range(model_config.num_layers):
-            self._lora_weights_pointers_list.append({})
+        uids = ["-1"]
+        for i in range(len(model_files)):
+            uids.append(str(i))
+        model_files = [""] + model_files
 
-            for uid, key in self._lora_uid_to_key.items():
+        for uid, model_file in zip(uids, model_files):
+            if uid not in self._lora_cpp_weights:
+                self._lora_cpp_weights[uid] = []
+            if uid not in self._lora_weight_config:
+                self._lora_weight_config[uid] = []
+
+            if model_file != "":
+                with tempfile.TemporaryDirectory() as unpack_out_dir:
+                    unpack_out_dir = Path(unpack_out_dir)
+                    unpack_nemo_ckpt(model_file, unpack_out_dir)
+
+                    model_weights_ckpt = "model_weights.ckpt"
+                    with open(unpack_out_dir / "model_config.yaml") as f:
+                        yaml.full_load(f)
+                    weight_path = unpack_out_dir / model_weights_ckpt
+                    nemo_weights = torch.load(
+                        weight_path,
+                        map_location=lambda storage, loc: storage.cpu())
+
+                all_lora_weights = get_all_nemo_lora_weights(
+                    model_config.num_layers, nemo_weights)
+            else:
+                all_lora_weights = None
+                nemo_weights = None
+
+            self._lora_uid_to_low_ranks[uid] = []
+            for layer_idx in range(model_config.num_layers):
+                self._lora_weights_pointers_list.append({})
                 self._lora_weights_pointers_list[layer_idx].update({uid: {}})
-                low_rank = int(lora_config['lora_kqv_adapter'][key]['low_rank'])
+
+                self._lora_uid_to_low_ranks[uid].append({})
 
                 for lora_module in lora_target_modules:
-                    if uid not in self._lora_uid_to_low_ranks:
-                        self._lora_uid_to_low_ranks.update(
-                            {uid: [{} for _ in range(model_config.num_layers)]})
-                    self._lora_uid_to_low_ranks[uid][layer_idx][
-                        lora_module] = low_rank
+                    if uid == "-1" or lora_module != "attn_qkv" or all_lora_weights is None:
+                        self._lora_uid_to_low_ranks[uid][layer_idx][
+                            lora_module] = 0
+                        continue
 
-                    prefix = f"model.model.language_model.encoder.layers.{layer_idx}.self_attention.adapter_layer.lora_kqv_adapter.{key}"
-                    t_in = numpy_to_torch(
-                        np.ascontiguousarray(
-                            fromfile(
-                                model_dir, f'{prefix}.linear_in.weight.bin',
-                                [model_config.hidden_size, low_rank],
-                                _str_to_np_dict['bfloat16']).transpose(
-                                    1,
-                                    0))).cuda()  # t_in: [low_rank, hidden_size]
+                    if lora_module == "attn_qkv":
+                        t_in = all_lora_weights[layer_idx]["in"]
+                        t_out = all_lora_weights[layer_idx]["out"]
+                        assert t_out.shape[0] % tp_size == 0
+                        t_out = torch.split(t_out,
+                                            t_out.shape[0] // tp_size,
+                                            dim=0)[tp_rank].contiguous()
+                    else:
+                        t_in = None
+                        t_out = None
 
-                    t_out = numpy_to_torch(
-                        np.ascontiguousarray(
-                            fromfile(model_dir,
-                                     f'{prefix}.linear_out.weight.bin',
-                                     [low_rank, model_config.hidden_size * 3],
-                                     _str_to_np_dict['bfloat16']).transpose(
-                                         1, 0))).cuda(
-                                         )  # t_in: [hidden_size * 3, low_rank]
-                    t_in = t_in.float().to(str_dtype_to_torch(dtype))
-                    t_out = t_out.float().to(str_dtype_to_torch(dtype))
+                    if t_in is not None and t_out is not None:
+                        t_in = t_in.cuda().to(
+                            str_dtype_to_torch(dtype)).contiguous()
+                        t_out = t_out.cuda().to(
+                            str_dtype_to_torch(dtype)).contiguous()
+                        rank = t_in.shape[0]
+                        self._lora_weights_pointers_list[layer_idx][uid].update(
+                            {lora_module: [t_in.data_ptr(),
+                                           t_out.data_ptr()]})
+                        self._lora_uid_to_low_ranks[uid][layer_idx][
+                            lora_module] = int(rank)
 
-                    self._lora_weights_pointers_list[layer_idx][uid].update({
-                        lora_module: [
-                            t_in.contiguous().data_ptr(),
-                            t_out.contiguous().data_ptr()
-                        ]
-                    })
+                        # prevent torch free this buffer
+                        self._lora_weights.append(t_in)
+                        self._lora_weights.append(t_out)
+                        self._lora_cpp_weights[uid].append(
+                            torch.concatenate([t_in.flatten(),
+                                               t_out.flatten()]))
+                        self._lora_weight_config[uid].append(
+                            np.array([
+                                LoraConfig.LORA_MODULE_IDS[lora_module],
+                                layer_idx,
+                                int(rank)
+                            ],
+                                     dtype=np.int32))
 
-                    self._lora_weights.append(t_in)
-                    self._lora_weights.append(t_out)
+            del nemo_weights
 
-            if "-1" not in self._lora_uid_to_low_ranks:
-                self._lora_uid_to_low_ranks.update(
-                    {"-1": [{} for _ in range(model_config.num_layers)]})
-            self._lora_uid_to_low_ranks["-1"][layer_idx][lora_module] = 0
-
-    def load_from_hf(self, model_dir, model_config, runtime_mapping):
+    def load_from_hf(self, model_dirs, model_config, runtime_mapping):
         '''
         lora config of https://huggingface.co/hfl/chinese-alpaca-2-lora-7b
         {
@@ -239,18 +301,33 @@ class LoraManager(object):
         '''
         tp_size = runtime_mapping.tp_size
         tp_rank = runtime_mapping.tp_rank
-        lora_model = torch.load(f"{model_dir}/adapter_model.bin")
 
-        with open(f"{model_dir}/adapter_config.json", 'r') as f:
-            hf_config = json.load(f)
+        lora_hf_configs = [{}]
+        ranks = [0]
+        uids = ["-1"]
+        for i, model_dir in enumerate(model_dirs):
+            with open(f"{model_dir}/adapter_config.json", 'r') as f:
+                config = json.load(f)
+                lora_hf_configs.append(config)
+                ranks.append(config["r"])
+                uids.append(str(i))
+        new_model_dirs = [""] + model_dirs
 
         lora_target_modules = model_config.lora_target_modules
         dtype = model_config.dtype
 
-        ranks = [0, hf_config["r"]]
-        uids = ["-1", "0"]  # TODO should be lora from some config
+        for uid, rank, model_dir, hf_config in zip(uids, ranks, new_model_dirs,
+                                                   lora_hf_configs):
+            if uid not in self._lora_cpp_weights:
+                self._lora_cpp_weights[uid] = []
+            if uid not in self._lora_weight_config:
+                self._lora_weight_config[uid] = []
 
-        for uid, rank in zip(uids, ranks):
+            if model_dir != "":
+                lora_model = torch.load(f"{model_dir}/adapter_model.bin")
+            else:
+                lora_model = None
+
             self._lora_uid_to_low_ranks[uid] = []
             for layer_idx in range(model_config.num_layers):
                 self._lora_weights_pointers_list.append({})
@@ -260,7 +337,8 @@ class LoraManager(object):
 
                 prefix = "base_model.model.model.layers"
                 for lora_module in lora_target_modules:
-                    if uid == "-1":
+                    if uid == "-1" or model_config.trtllm_modules_to_hf_modules[
+                            lora_module] not in hf_config["target_modules"]:
                         self._lora_uid_to_low_ranks[uid][layer_idx][
                             lora_module] = 0
                         continue
@@ -326,6 +404,8 @@ class LoraManager(object):
 
                     t_in = t_in.cuda().contiguous()
                     t_out = t_out.cuda().contiguous()
+                    scale = float(hf_config["lora_alpha"] / hf_config["r"])
+                    t_out = t_out * scale
                     t_in = t_in.float().to(str_dtype_to_torch(dtype))
                     t_out = t_out.float().to(str_dtype_to_torch(dtype))
                     self._lora_weights_pointers_list[layer_idx][uid].update(
@@ -339,7 +419,58 @@ class LoraManager(object):
                     # prevent torch free this buffer
                     self._lora_weights.append(t_in)
                     self._lora_weights.append(t_out)
+                    self._lora_cpp_weights[uid].append(
+                        torch.concatenate([t_in.flatten(),
+                                           t_out.flatten()]))
+                    self._lora_weight_config[uid].append(
+                        np.array([
+                            LoraConfig.LORA_MODULE_IDS[lora_module], layer_idx,
+                            int(hf_config['r'])
+                        ],
+                                 dtype=np.int32))
+
         del lora_model
+
+    def save_lora_weights_to_bin(self, out_dir):
+
+        def save_val(val, dir, key, tp_num=None, write_npy=False):
+            ext = "npy" if write_npy else "bin"
+            suffix = ext if tp_num is None else f"{tp_num}.{ext}"
+            if write_npy:
+                np.save(dir / f"model.{key}.{suffix}", val)
+            else:
+                val.tofile(dir / f"model.{key}.{suffix}")
+
+        if isinstance(out_dir, str):
+            out_dir_path = Path(out_dir)
+        elif isinstance(out_dir, Path):
+            out_dir_path = out_dir
+        else:
+            assert False
+        for uid in self._lora_cpp_weights:
+            if uid == '-1':
+                continue
+
+            all_weights = np.expand_dims(
+                np.stack([
+                    torch_to_numpy(w.flatten().contiguous())
+                    for w in self._lora_cpp_weights[uid]
+                ]), 0)
+            all_configs = np.expand_dims(
+                np.stack(self._lora_weight_config[uid]), 0)
+
+            uid_path = out_dir_path / f"{uid}"
+            uid_path.mkdir(parents=True, exist_ok=True)
+            save_val(all_weights,
+                     uid_path,
+                     "lora_weights",
+                     tp_num=None,
+                     write_npy=True)
+            save_val(all_configs,
+                     uid_path,
+                     "lora_config",
+                     tp_num=None,
+                     write_npy=True)
 
     def uid_to_key(self, uid: str):
         assert isinstance(uid, str)

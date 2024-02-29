@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,7 +16,6 @@ import operator
 
 from ._common import default_net
 from .logger import logger
-from .parameter import Parameter
 
 
 class Module(object):
@@ -37,21 +36,28 @@ class Module(object):
         unique_name = current_net._module_call_stack.get_mod_name(self)
         with current_net._module_call_stack.call_stack_mgr() as stack:
             stack.append(unique_name)
-            return self.forward(*args, **kwargs)
+            start_layer_id = current_net.trt_network.num_layers
+            output = self.forward(*args, **kwargs)
+            end_layer_id = current_net.trt_network.num_layers
+            current_net._module_call_stack.set_layer_range(
+                self, range(start_layer_id, end_layer_id))
+            return output
 
     def __getattr__(self, name):
         parameters = self.__dict__.get('_parameters')
-        if name in parameters:
+        if parameters is not None and name in parameters:
             return parameters[name]
 
         modules = self.__dict__.get('_modules')
-        if name in modules:
+        if modules is not None and name in modules:
             return modules[name]
 
         raise AttributeError("'{}' object has no attribute '{}'".format(
             type(self).__name__, name))
 
     def __setattr__(self, name, value) -> None:
+        from .parameter import Parameter
+
         # Improved module setattr to handle one edge case:
         # attribute could be first set to None and later reset to Parameter / Module class
 

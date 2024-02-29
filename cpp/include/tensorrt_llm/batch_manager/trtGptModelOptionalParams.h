@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +21,7 @@
 #include "tensorrt_llm/runtime/common.h"
 
 #include <optional>
+#include <vector>
 
 namespace tensorrt_llm::batch_manager
 {
@@ -33,19 +34,23 @@ public:
     using SizeType = tensorrt_llm::runtime::SizeType;
 
     explicit TrtGptModelOptionalParams(KvCacheConfig const& kvCacheConfig = KvCacheConfig{},
-        std::optional<SizeType> maxNumSequences = std::nullopt, bool enableTrtOverlap = true,
-        std::optional<std::vector<SizeType>> userSpecifiedDeviceIds = std::nullopt)
+        bool enableTrtOverlap = false, std::optional<std::vector<SizeType>> const& deviceIds = std::nullopt,
+        bool normalizeLogProbs = true, bool logIterationData = false, bool enableChunkedContext = false)
         : kvCacheConfig{kvCacheConfig}
-        , maxNumSequences{maxNumSequences}
         , enableTrtOverlap{enableTrtOverlap}
-        , userSpecifiedDeviceIds(userSpecifiedDeviceIds)
+        , deviceIds(deviceIds)
+        , normalizeLogProbs{normalizeLogProbs}
+        , logIterationData{logIterationData}
+        , enableChunkedContext{enableChunkedContext}
     {
     }
 
     KvCacheConfig kvCacheConfig;
-    std::optional<SizeType> maxNumSequences;
     bool enableTrtOverlap;
-    std::optional<std::vector<SizeType>> userSpecifiedDeviceIds;
+    std::optional<std::vector<SizeType>> deviceIds;
+    bool normalizeLogProbs;
+    bool logIterationData;
+    bool enableChunkedContext;
 };
 
 } // namespace tensorrt_llm::batch_manager

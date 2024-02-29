@@ -49,16 +49,6 @@ static const struct TmaKernelMetaInfo
 } sTmaMetaInfo[] = {{32, 64, 256}, {64, 64, 256}, {128, 64, 128}, {256, 64, 64}};
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-
-// meta info for tma warp-specialized kernels that supports paged kv cache
-static const struct TmaPagedKVKernelMetaInfo
-{
-    unsigned int mD;
-    unsigned int mQStep;
-    unsigned int mKVStep;
-} sTmaPagedKVMetaInfo[] = {{32, 64, 128}, {64, 64, 128}, {128, 64, 128}, {256, 64, 64}};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
 // Base Class
 
 template <typename TKernelMeta, typename TKernelParam>
@@ -252,7 +242,6 @@ public:
     virtual void run(
         Fused_multihead_attention_params_v2& params, Launch_params& launch_params, cudaStream_t stream) const
     {
-
         bool forceUnroll = launch_params.force_unroll;
         if (!forceUnroll && !launch_params.ignore_b1opt && mSM >= kSM_80)
         {
@@ -349,8 +338,19 @@ public:
             {
                 unroll = (params.s + kernelMeta.mUnrollStep - 1) / kernelMeta.mUnrollStep;
             }
+
+            if (mSM == kSM_70)
+            {
+                if (kernelMeta.mSharedMemBytes >= 48 * 1024)
+                {
+                    cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, kernelMeta.mSharedMemBytes);
+                }
+                cuErrCheck(mDriver.cuLaunchKernel(func, params.h, params.b, unroll, kernelMeta.mThreadsPerCTA, 1, 1,
+                               kernelMeta.mSharedMemBytes, stream, kernelParams, nullptr),
+                    mDriver);
+            }
             // on Hopper non-flash-attention, we still launch blocks (h, b, steps)
-            if (mSM == kSM_90 && !launch_params.flash_attention)
+            else if (mSM == kSM_90 && !launch_params.flash_attention)
             {
                 cuErrCheck(mDriver.cuLaunchKernel(func, params.h, params.b, unroll, kernelMeta.mThreadsPerCTA, 1, 1,
                                kernelMeta.mSharedMemBytes, stream, kernelParams, nullptr),

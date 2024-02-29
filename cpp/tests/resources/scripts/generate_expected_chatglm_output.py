@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,22 +14,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
-from pathlib import Path
+import shutil as _shutil
+from pathlib import Path as _Path
 
 import numpy as np
 import torch
 import transformers
 
 import tensorrt_llm
-from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime import (ChatGLMGenerationSession, GenerationSession,
                                   ModelConfig, SamplingConfig)
-from tensorrt_llm.runtime.model_runner import get_engine_name
+from tensorrt_llm.runtime.engine import Engine
 
 import run  # isort:skip
 
-resources_dir = Path(
+resources_dir = _Path(
     __file__).parent.parent.parent.parent.parent / "examples/chatglm"
 
 
@@ -38,13 +37,13 @@ def generate(model_name, batch_size, beam_width):
     print("generate expected %s output BatchSize=%d, BeamWidth=%d" %
           (model_name, batch_size, beam_width))
 
-    engine_dir = Path(__file__).parent.parent / f"models/rt_engine/{model_name}"
-    tokenizer_dir = resources_dir / model_name
+    engine_dir = _Path(
+        __file__).parent.parent / f"models/rt_engine/{model_name}"
     args = run.parse_arguments([
         '--engine_dir',
         str(engine_dir),
         '--tokenizer_dir',
-        str(tokenizer_dir),
+        str(resources_dir / model_name),
         '--max_output_len',
         str(1024),
         '--num_beams',
@@ -53,44 +52,63 @@ def generate(model_name, batch_size, beam_width):
         "What's new between ChatGLM3-6B and ChatGLM2-6B?",
         "Could you introduce NVIDIA Corporation for me?",
     ])
-
     args.random_seed = 1
-    if batch_size == 1:
-        args.input_text = args.input_text[:1]
-    elif batch_size > 2:
-        args.input_text += args.input_text[0] * (batch_size - 2)
 
     tensorrt_llm.logger.set_level(args.log_level)
 
-    config_path = Path(args.engine_dir) / 'config.json'
-    with open(config_path, 'r') as f:
-        config = json.load(f)
-    assert (config['builder_config']['name'] == model_name)
-    dtype = config['builder_config']['precision']
-    config['builder_config']['max_batch_size']
-    max_input_len = config['builder_config']['max_input_len']
-    max_output_len = config['builder_config']['max_output_len']
-    config['builder_config']['max_beam_width']
-    remove_input_padding = config['builder_config']['remove_input_padding']
-    use_gpt_attention_plugin = config['plugin_config']['gpt_attention_plugin']
-    world_size = config['builder_config']['tensor_parallel']
-    assert world_size == tensorrt_llm.mpi_world_size(
-    ), f'Engine world size ({world_size}) != Runtime world size ({tensorrt_llm.mpi_world_size()})'
+    if batch_size == 1:
+        args.input_text = args.input_text[:1]
+    else:
+        args.input_text += args.input_text[0] * (batch_size - 2)
 
     runtime_rank = tensorrt_llm.mpi_rank()
-    runtime_mapping = tensorrt_llm.Mapping(
-        world_size,
-        runtime_rank,
-        tp_size=world_size,
+    engine = Engine.from_dir(engine_dir, runtime_rank)
+    pretrained_config = engine.config.pretrained_config
+    build_config = engine.config.build_config
+    plugin_config = build_config.plugin_config
+
+    tp_size = pretrained_config.mapping.tp_size
+    num_heads = pretrained_config.num_attention_heads // tp_size
+    num_kv_heads = pretrained_config.num_key_value_heads
+    num_kv_heads = (num_kv_heads + tp_size - 1) // tp_size
+    hidden_size = pretrained_config.hidden_size // tp_size
+
+    model_config = ModelConfig(
+        max_batch_size=build_config.max_batch_size,
+        vocab_size=pretrained_config.vocab_size,
+        num_layers=pretrained_config.num_hidden_layers,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        hidden_size=hidden_size,
+        gpt_attention_plugin=bool(
+            build_config.plugin_config.gpt_attention_plugin),
+        remove_input_padding=build_config.plugin_config.remove_input_padding,
+        paged_kv_cache=build_config.plugin_config.paged_kv_cache,
+        tokens_per_block=build_config.plugin_config.tokens_per_block,
+        quant_mode=pretrained_config.quant_mode,
+        gather_context_logits=build_config.gather_context_logits,
+        gather_generation_logits=build_config.gather_generation_logits,
+        dtype=pretrained_config.dtype,
+        max_prompt_embedding_table_size=build_config.
+        max_prompt_embedding_table_size,
     )
+    max_input_len = build_config.max_input_len
+    max_output_len = build_config.max_output_len
+    remove_input_padding = plugin_config.remove_input_padding
+    use_gpt_attention_plugin = plugin_config.gpt_attention_plugin
+
+    assert pretrained_config.architecture == 'ChatGLMForCausalLM'
+    chatglm_version = pretrained_config.chatglm_version
+    assert chatglm_version == model_name.split('_')[0]
+
+    runtime_mapping = pretrained_config.mapping
+    runtime_mapping.world_size == tensorrt_llm.mpi_world_size()
     torch.cuda.set_device(runtime_rank % runtime_mapping.gpus_per_node)
 
-    engine_name = get_engine_name(model_name,
-                                  dtype=dtype,
-                                  tp_size=world_size,
-                                  pp_size=1,
-                                  rank=runtime_rank)
-    serialize_path = Path(args.engine_dir) / engine_name
+    # fix remained error in chatglm_6b, hope to remove this in the future
+    if model_name == "chatglm_6b":
+        _shutil.copy(resources_dir / "tokenization_chatglm.py",
+                     args.tokenizer_dir)
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         args.tokenizer_dir, trust_remote_code=True)
@@ -99,8 +117,7 @@ def generate(model_name, batch_size, beam_width):
     if model_name in ["glm_10b"]:
         sop_id = tokenizer.sop_token_id
         eop_id = tokenizer.eop_token_id
-    input_text = args.input_text
-    tokenized = tokenizer(input_text,
+    tokenized = tokenizer(args.input_text,
                           return_tensors="pt",
                           padding=True,
                           return_length=True)
@@ -123,8 +140,7 @@ def generate(model_name, batch_size, beam_width):
         max_input_len_real += 1
 
     if remove_input_padding:
-        input_ids_no_padding = torch.zeros(1,
-                                           torch.sum(input_lengths),
+        input_ids_no_padding = torch.zeros(torch.sum(input_lengths),
                                            dtype=torch.int32)
         lengths_acc = torch.cumsum(
             torch.cat([torch.IntTensor([0]), input_lengths]),
@@ -132,7 +148,7 @@ def generate(model_name, batch_size, beam_width):
         )
         for i in range(len(input_ids)):
             input_ids_no_padding[
-                0, lengths_acc[i]:lengths_acc[i + 1]] = torch.IntTensor(
+                lengths_acc[i]:lengths_acc[i + 1]] = torch.IntTensor(
                     input_ids[i,
                               max_input_len - input_lengths[i]:max_input_len])
 
@@ -152,32 +168,17 @@ def generate(model_name, batch_size, beam_width):
                 i, :len(sample[nPadding:])] = sample[nPadding:]
         input_ids = input_ids_padding_right
 
-    model_config = ModelConfig(
-        vocab_size=config['builder_config']['vocab_size'],
-        num_layers=config['builder_config']['num_layers'],
-        num_heads=config['builder_config']['num_heads'] // world_size,
-        num_kv_heads=config['builder_config']['num_kv_heads'] // world_size,
-        hidden_size=config['builder_config']['hidden_size'] // world_size,
-        gpt_attention_plugin=use_gpt_attention_plugin,
-        remove_input_padding=config['builder_config']['remove_input_padding'],
-        model_name=model_name,
-        paged_kv_cache=config['builder_config']['paged_kv_cache'],
-        quant_mode=QuantMode(config['builder_config']['quant_mode']),
-        dtype=dtype,
-    )
-
     sampling_config = SamplingConfig(
         end_id=eop_id if model_name in ["glm_10b"] else end_id,
         pad_id=pad_id,
-        num_beams=args.num_beams,
+        num_beams=beam_width,
         temperature=args.temperature,
         top_k=args.top_k,
         top_p=args.top_p,
     )
     sampling_config.random_seed = args.random_seed
 
-    with open(serialize_path, 'rb') as f:
-        engine_buffer = f.read()
+    engine_buffer = engine.engine
 
     if model_name in ["chatglm_6b", "glm_10b"]:
         session = ChatGLMGenerationSession
@@ -190,7 +191,7 @@ def generate(model_name, batch_size, beam_width):
     )
 
     decoder.setup(
-        len(input_text),
+        len(args.input_text),
         max_input_len,
         max_output_len,
         beam_width,
@@ -207,9 +208,9 @@ def generate(model_name, batch_size, beam_width):
     output_ids = output["output_ids"]
     output["sequence_lengths"]
 
-    data_path = Path(__file__).parent.parent / "data" / model_name
+    data_path = _Path(__file__).parent.parent / "data" / model_name
     data_path.mkdir(parents=True, exist_ok=True)
-    nBS, nBM = input_ids.size(0), args.num_beams
+    nBS, nBM = input_ids.size(0), beam_width
     np.save(
         str(data_path) + "/inputId-BS%d-BM%d.npy" % (nBS, nBM),
         input_ids.detach().cpu().numpy())
@@ -228,6 +229,7 @@ def generate(model_name, batch_size, beam_width):
 
 
 if __name__ == '__main__':
+
     generate("chatglm_6b", batch_size=1, beam_width=1)
     generate("chatglm2_6b", batch_size=1, beam_width=1)
     generate("chatglm2_6b", batch_size=2, beam_width=1)
@@ -235,4 +237,5 @@ if __name__ == '__main__':
     generate("chatglm3_6b", batch_size=1, beam_width=1)
     generate("chatglm3_6b", batch_size=2, beam_width=1)
     generate("chatglm3_6b", batch_size=1, beam_width=2)
-    print("Done.")
+
+    print("Done")

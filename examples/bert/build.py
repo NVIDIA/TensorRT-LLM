@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,15 +20,18 @@ from collections import OrderedDict
 import torch
 import tensorrt as trt
 # isort: on
-from transformers import BertConfig, BertForQuestionAnswering, BertModel
+
+from transformers import BertConfig, BertForQuestionAnswering, BertForSequenceClassification, BertModel  # isort:skip
+from transformers import RobertaConfig, RobertaForQuestionAnswering, RobertaForSequenceClassification, RobertaModel  # isort:skip
+
+from weight import (load_from_hf_cls_model, load_from_hf_model,
+                    load_from_hf_qa_model)
 
 import tensorrt_llm
 from tensorrt_llm.builder import Builder
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
-
-from weight import load_from_hf_bert, load_from_hf_qa_bert  # isort:skip
 
 
 def get_engine_name(model, dtype, tp_size, rank):
@@ -47,6 +50,14 @@ def parse_arguments():
                         default='float16',
                         choices=['float16', 'float32'])
     parser.add_argument('--timing_cache', type=str, default='model.cache')
+    parser.add_argument(
+        '--profiling_verbosity',
+        type=str,
+        default='layer_names_only',
+        choices=['layer_names_only', 'detailed', 'none'],
+        help=
+        'The profiling verbosity for the generated TRT engine. Set to detailed can inspect tactic choices and kernel parameters.'
+    )
     parser.add_argument('--log_level', type=str, default='info')
     parser.add_argument('--vocab_size', type=int, default=51200)
     parser.add_argument('--n_labels', type=int, default=2)
@@ -71,12 +82,6 @@ def parse_arguments():
                         type=str,
                         default=False,
                         choices=['float16', 'float32'])
-    parser.add_argument('--use_layernorm_plugin',
-                        nargs='?',
-                        const='float16',
-                        type=str,
-                        default=False,
-                        choices=['float16', 'float32'])
     parser.add_argument('--enable_qk_half_accum',
                         default=False,
                         action='store_true')
@@ -86,13 +91,16 @@ def parse_arguments():
     parser.add_argument('--enable_context_fmha_fp32_acc',
                         default=False,
                         action='store_true')
-    parser.add_argument(
-        '--model',
-        default=tensorrt_llm.models.BertModel.__name__,
-        choices=[
-            tensorrt_llm.models.BertModel.__name__,
-            tensorrt_llm.models.BertForQuestionAnswering.__name__
-        ])
+    parser.add_argument('--model',
+                        default='BertModel',
+                        choices=[
+                            'BertModel',
+                            'BertForQuestionAnswering',
+                            'BertForSequenceClassification',
+                            'RobertaModel',
+                            'RobertaForQuestionAnswering',
+                            'RobertaForSequenceClassification',
+                        ])
     return parser.parse_args()
 
 
@@ -112,13 +120,19 @@ if __name__ == '__main__':
         name=args.model,
         precision=args.dtype,
         timing_cache=args.timing_cache,
+        profiling_verbosity=args.profiling_verbosity,
         tensor_parallel=args.world_size,  # TP only
         max_batch_size=args.max_batch_size,
         max_input_len=args.max_input_len,
     )
     # Initialize model
 
-    bert_config = BertConfig(
+    if 'Roberta' in args.model:
+        model_type = 'Roberta'
+    else:
+        model_type = 'Bert'
+
+    bert_config = globals()[f'{model_type}Config'](
         vocab_size=args.vocab_size,
         hidden_size=args.n_embd,
         num_hidden_layers=args.n_layer,
@@ -130,8 +144,9 @@ if __name__ == '__main__':
     )
 
     output_name = 'hidden_states'
-    if args.model == tensorrt_llm.models.BertModel.__name__:
-        hf_bert = BertModel(bert_config, add_pooling_layer=False)
+    if args.model == 'BertModel' or args.model == 'RobertaModel':
+        hf_bert = globals()[f'{model_type}Model'](bert_config,
+                                                  add_pooling_layer=False)
         tensorrt_llm_bert = tensorrt_llm.models.BertModel(
             num_layers=bert_config.num_hidden_layers,
             num_heads=bert_config.num_attention_heads,
@@ -140,11 +155,13 @@ if __name__ == '__main__':
             hidden_act=bert_config.hidden_act,
             max_position_embeddings=bert_config.max_position_embeddings,
             type_vocab_size=bert_config.type_vocab_size,
+            pad_token_id=bert_config.pad_token_id,
+            is_roberta=(model_type == 'Roberta'),
             mapping=Mapping(world_size=args.world_size,
                             rank=args.rank,
                             tp_size=args.world_size),  # TP only
             dtype=trt_dtype)
-        load_from_hf_bert(
+        load_from_hf_model(
             tensorrt_llm_bert,
             hf_bert,
             bert_config,
@@ -153,8 +170,8 @@ if __name__ == '__main__':
             fp16=(args.dtype == 'float16'),
         )
 
-    elif args.model == tensorrt_llm.models.BertForQuestionAnswering.__name__:
-        hf_bert = BertForQuestionAnswering(bert_config)
+    elif args.model == 'BertForQuestionAnswering' or args.model == 'RobertaForQuestionAnswering':
+        hf_bert = globals()[f'{model_type}ForQuestionAnswering'](bert_config)
         tensorrt_llm_bert = tensorrt_llm.models.BertForQuestionAnswering(
             num_layers=bert_config.num_hidden_layers,
             num_heads=bert_config.num_attention_heads,
@@ -163,13 +180,43 @@ if __name__ == '__main__':
             hidden_act=bert_config.hidden_act,
             max_position_embeddings=bert_config.max_position_embeddings,
             type_vocab_size=bert_config.type_vocab_size,
+            pad_token_id=bert_config.pad_token_id,
+            is_roberta=(model_type == 'Roberta'),
             num_labels=args.
             n_labels,  # TODO: this might just need to be a constant
             mapping=Mapping(world_size=args.world_size,
                             rank=args.rank,
                             tp_size=args.world_size),  # TP only
             dtype=trt_dtype)
-        load_from_hf_qa_bert(
+        load_from_hf_qa_model(
+            tensorrt_llm_bert,
+            hf_bert,
+            bert_config,
+            rank=args.rank,
+            tensor_parallel=args.world_size,
+            fp16=(args.dtype == 'float16'),
+        )
+        output_name = 'logits'
+    elif args.model == 'BertForSequenceClassification' or args.model == 'RobertaForSequenceClassification':
+        hf_bert = globals()[f'{model_type}ForSequenceClassification'](
+            bert_config).cuda().to(torch_dtype).eval()
+        tensorrt_llm_bert = tensorrt_llm.models.BertForSequenceClassification(
+            num_layers=bert_config.num_hidden_layers,
+            num_heads=bert_config.num_attention_heads,
+            hidden_size=bert_config.hidden_size,
+            vocab_size=bert_config.vocab_size,
+            hidden_act=bert_config.hidden_act,
+            max_position_embeddings=bert_config.max_position_embeddings,
+            type_vocab_size=bert_config.type_vocab_size,
+            pad_token_id=bert_config.pad_token_id,
+            is_roberta=(model_type == 'Roberta'),
+            num_labels=args.
+            n_labels,  # TODO: this might just need to be a constant
+            mapping=Mapping(world_size=args.world_size,
+                            rank=args.rank,
+                            tp_size=args.world_size),  # TP only
+            dtype=trt_dtype)
+        load_from_hf_cls_model(
             tensorrt_llm_bert,
             hf_bert,
             bert_config,
@@ -183,14 +230,12 @@ if __name__ == '__main__':
 
     # Module -> Network
     network = builder.create_network()
+    network.plugin_config.to_legacy_setting()
     if args.use_bert_attention_plugin:
         network.plugin_config.set_bert_attention_plugin(
             dtype=args.use_bert_attention_plugin)
     if args.use_gemm_plugin:
         network.plugin_config.set_gemm_plugin(dtype=args.use_gemm_plugin)
-    if args.use_layernorm_plugin:
-        network.plugin_config.set_layernorm_plugin(
-            dtype=args.use_layernorm_plugin)
     if args.enable_qk_half_accum:
         network.plugin_config.enable_qk_half_accum()
     assert not (args.enable_context_fmha and args.enable_context_fmha_fp32_acc)

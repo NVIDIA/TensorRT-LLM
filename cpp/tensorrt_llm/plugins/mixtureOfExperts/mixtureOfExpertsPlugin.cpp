@@ -119,7 +119,11 @@ MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(
 
     init();
     mPluginProfiler->deserialize(d, mDims, mGemmId);
-    TLLM_CHECK(d == a + length);
+    TLLM_CHECK_WITH_INFO(d == a + length,
+        "Expected length (%d) != real length (%d). This is often "
+        "caused by using different TensorRT-LLM version to build "
+        "engine and run engine.",
+        (int) length, (int) (d - a));
 }
 
 void MixtureOfExpertsPlugin::serialize(void* buffer) const noexcept
@@ -318,8 +322,14 @@ auto MixtureOfExpertsPlugin::setupWorkspace(void* base_ptr, int num_tokens) cons
 
 int MixtureOfExpertsPlugin::getNumTokens(const nvinfer1::PluginTensorDesc* input_tensors) const
 {
-    int num_sequences = input_tensors[getInputTensorIndex()].dims.d[0];
-    int num_tokens = num_sequences * input_tensors[getInputTensorIndex()].dims.d[1];
+    int ndim = input_tensors[getInputTensorIndex()].dims.nbDims;
+    TLLM_CHECK_WITH_INFO(
+        3 == ndim || 2 == ndim, "hidden_state dimension should be either 2 [b*s, hidden], or 3 [b, s, hidden]");
+    int num_tokens = input_tensors[getInputTensorIndex()].dims.d[0];
+    if (ndim == 3)
+    {
+        num_tokens *= input_tensors[getInputTensorIndex()].dims.d[1];
+    }
     return num_tokens;
 }
 

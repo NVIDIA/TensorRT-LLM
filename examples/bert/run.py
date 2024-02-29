@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,7 +23,6 @@ import tensorrt as trt
 
 import tensorrt_llm
 from tensorrt_llm import logger
-from tensorrt_llm.models import BertForQuestionAnswering, BertModel
 from tensorrt_llm.runtime import Session, TensorInfo
 
 from build import get_engine_name  # isort:skip
@@ -106,9 +105,13 @@ if __name__ == '__main__':
                                 device='cuda')
             for t in output_info
         }
-        if (model_name == BertModel.__name__):
+        if (model_name == 'BertModel' or model_name == 'RobertaModel'):
             output_name = 'hidden_states'
-        elif (model_name == BertForQuestionAnswering.__name__):
+        elif (model_name == 'BertForQuestionAnswering'
+              or model_name == 'RobertaForQuestionAnswering'):
+            output_name = 'logits'
+        elif (model_name == 'BertForSequenceClassification'
+              or model_name == 'RobertaForSequenceClassification'):
             output_name = 'logits'
         else:
             assert False, f"Unknown BERT model {model_name}"

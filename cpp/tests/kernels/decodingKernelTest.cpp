@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -223,7 +223,7 @@ public:
         auto targetLogitsPtr = bufferCast<T>(*mTargetLogits);
         auto refTargetLogitsPtr = bufferCast<T>(*mRefTargetLogits);
 
-        tk::invokeCurandInitialize(mCurandStates, batchSize, seed, this->mStream->get());
+        tk::invokeCurandInitialize(mCurandStates, nullptr, batchSize, seed, this->mStream->get());
 
         // Init number of draft tokens
         for (SizeType bi = 0; bi < batchSize; ++bi)

@@ -15,7 +15,8 @@ repos:
     rev: v4.1.0
     hooks:
     -   id: check-added-large-files
-        exclude: 'cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/'
+        exclude: |
+            (?x)^(.*cubin.cpp)$
     -   id: check-merge-conflict
     -   id: check-symlinks
     -   id: detect-private-key
@@ -45,4 +46,5 @@ repos:
         args:
         - --skip=".git,3rdparty"
         - --exclude-file=examples/whisper/tokenizer.py
-        - --ignore-words-list=rouge,inout,atleast,strat
+        - --ignore-words-list=rouge,inout,atleast,strat,nd
+        exclude: 'tests/llm-test-defs/turtle/test_input_files'

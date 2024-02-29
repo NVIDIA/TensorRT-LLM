@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,29 +21,25 @@ from transformers import AutoTokenizer, T5Tokenizer
 
 import tensorrt_llm
 
+# TODO(enweiz): Update for refactored models
 DEFAULT_HF_MODEL_DIRS = {
-    'baichuan': 'baichuan-inc/Baichuan-13B-Chat',
-    'bloom': 'bigscience/bloom-560m',
-    'chatglm_6b': 'THUDM/chatglm-6b',
-    'chatglm2_6b': 'THUDM/chatglm2-6b',
-    'chatglm2_6b_32k': 'THUDM/chatglm2-6b-32k',
-    'chatglm3_6b': 'THUDM/chatglm3-6b',
-    'chatglm3_6b_base': 'THUDM/chatglm3-6b-base',
-    'chatglm3_6b_32k': 'THUDM/chatglm3-6b-32k',
-    'falcon': 'tiiuae/falcon-rw-1b',
-    'glm_10b': 'THUDM/glm-10b',
+    'BaichuanForCausalLM': 'baichuan-inc/Baichuan-13B-Chat',
+    'BloomForCausalLM': 'bigscience/bloom-560m',
+    'ChatGLMForCausalLM': 'THUDM/chatglm3-6b',
+    'FalconForCausalLM': 'tiiuae/falcon-rw-1b',
     'gpt': 'gpt2-medium',
-    'gptj': 'EleutherAI/gpt-j-6b',
-    'gptneox': 'EleutherAI/gpt-neox-20b',
-    'internlm': 'internlm/internlm-chat-7b',
-    'llama': 'meta-llama/Llama-2-7b-hf',
-    'mpt': 'mosaicml/mpt-7b',
-    'opt': 'facebook/opt-350m',
+    'GPTJForCausalLM': 'EleutherAI/gpt-j-6b',
+    'GPTNeoXForCausalLM': 'EleutherAI/gpt-neox-20b',
+    'InternLMForCausalLM': 'internlm/internlm-chat-7b',
+    'LlamaForCausalLM': 'meta-llama/Llama-2-7b-hf',
+    'MPTForCausalLM': 'mosaicml/mpt-7b',
+    'PhiForCausalLM': 'microsoft/phi-2',
+    'OPTForCausalLM': 'facebook/opt-350m',
     'qwen': 'Qwen/Qwen-7B',
 }
 
 DEFAULT_PROMPT_TEMPLATES = {
-    'internlm':
+    'InternLMForCausalLM':
     "<|User|>:{input_text}<eoh>\n<|Bot|>:",
     'qwen':
     "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{input_text}<|im_end|>\n<|im_start|>assistant\n",
@@ -51,15 +47,19 @@ DEFAULT_PROMPT_TEMPLATES = {
 
 
 def read_model_name(engine_dir: str):
-    engine_version = tensorrt_llm.builder.get_engine_version(engine_dir)
+    engine_version = tensorrt_llm.runtime.engine.get_engine_version(engine_dir)
 
     with open(Path(engine_dir) / "config.json", 'r') as f:
         config = json.load(f)
 
     if engine_version is None:
-        return config['builder_config']['name']
+        return config['builder_config']['name'], None
 
-    return config['pretrained_config']['architecture']
+    model_arch = config['pretrained_config']['architecture']
+    model_version = None
+    if model_arch == 'ChatGLMForCausalLM':
+        model_version = config['pretrained_config']['chatglm_version']
+    return model_arch, model_version
 
 
 def throttle_generator(generator, stream_interval):
@@ -74,6 +74,7 @@ def throttle_generator(generator, stream_interval):
 def load_tokenizer(tokenizer_dir: Optional[str] = None,
                    vocab_file: Optional[str] = None,
                    model_name: str = 'gpt',
+                   model_version: Optional[str] = None,
                    tokenizer_type: Optional[str] = None):
     if vocab_file is None:
         use_fast = True
@@ -106,7 +107,7 @@ def load_tokenizer(tokenizer_dir: Optional[str] = None,
             end_id = tokenizer.im_end_id
         else:
             raise Exception(f"unknown chat format: {chat_format}")
-    elif model_name == 'glm_10b':
+    elif model_name == 'ChatGLMForCausalLM' and model_version == 'glm':
         pad_id = tokenizer.pad_token_id
         end_id = tokenizer.eop_token_id
     else:

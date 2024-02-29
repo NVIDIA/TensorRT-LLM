@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +20,7 @@ import tensorrt as trt
 
 from ..functional import Tensor
 from ..mapping import Mapping
+from ..plugin import current_all_reduce_helper
 
 
 class GenerationMixin:
@@ -30,7 +31,7 @@ class GenerationMixin:
                                       remove_input_padding: bool,
                                       paged_kv_cache: bool) -> bool:
         res = False
-        if use_gpt_attention_plugin == False or use_gemm_plugin == False:
+        if not use_gpt_attention_plugin or not use_gemm_plugin:
             use_in_flight_batching = use_gpt_attention_plugin and remove_input_padding and paged_kv_cache
             res = not use_in_flight_batching
         return res
@@ -44,7 +45,7 @@ class GenerationMixin:
                                  max_batch_size,
                                  max_beam_width,
                                  max_input_len,
-                                 max_new_tokens,
+                                 max_seq_len,
                                  num_kv_heads,
                                  head_size,
                                  num_layers,
@@ -57,18 +58,16 @@ class GenerationMixin:
                                  mapping=Mapping(),
                                  use_cache=True):
 
-        max_len = max_input_len + max_new_tokens
-
         default_range = GenerationMixin.default_range
         bb_range_cxt = default_range(max_batch_size)
         bb_range_gen = default_range(max_batch_size * max_beam_width)
         _bs_range = default_range(max_batch_size)
         _beam_width_range = default_range(max_beam_width)
-        _max_len_range = default_range(max_len)
+        _max_len_range = default_range(max_seq_len)
         _mask_len_ctx = default_range(max_input_len)
-        _mask_len_gen = default_range(max_len, 1)
         _kv_cache_range_ctx = [0, 0, 0]
-        _kv_cache_range_gen = default_range(max_len)
+        _kv_cache_range_gen = default_range(max_seq_len, -1)
+        _kv_cache_range = default_range(max_seq_len)
 
         enable_two_optimization_profiles = GenerationMixin.has_two_optimization_profiles(
             use_gpt_attention_plugin, use_gemm_plugin, remove_input_padding,
@@ -78,9 +77,9 @@ class GenerationMixin:
             bs_range = [_bs_range, _bs_range]
             beam_width_range = [_beam_width_range, _beam_width_range]
             max_len_range = [_max_len_range, _max_len_range]
-            mask_len_range = [_mask_len_ctx, _mask_len_gen]
+            mask_len_range = [_mask_len_ctx, _max_len_range]
             if use_gpt_attention_plugin:
-                kv_cache_range = [_kv_cache_range_gen, _kv_cache_range_gen]
+                kv_cache_range = [_kv_cache_range, _kv_cache_range]
             else:
                 kv_cache_range = [_kv_cache_range_ctx, _kv_cache_range_gen]
         else:
@@ -88,8 +87,8 @@ class GenerationMixin:
             bs_range = [_bs_range]
             beam_width_range = [_beam_width_range]
             max_len_range = [_max_len_range]
-            mask_len_range = [_mask_len_gen]
-            kv_cache_range = [_kv_cache_range_gen]
+            mask_len_range = [_max_len_range]
+            kv_cache_range = [_kv_cache_range]
 
         num_kv_heads = (num_kv_heads + mapping.tp_size - 1) // mapping.tp_size
         layers_range = mapping.pp_layers(num_layers)
@@ -131,19 +130,6 @@ class GenerationMixin:
                             math.ceil(kv_cache_range[1][2] / tokens_per_block)
                         ]
                     ]
-                    blocks_range = [
-                        [
-                            bb_range[0][0] * max_blocks_per_seq_range[0][0],
-                            bb_range[0][1] * max_blocks_per_seq_range[0][1],
-                            bb_range[0][2] * max_blocks_per_seq_range[0][2]
-                        ],
-                        [
-                            bb_range[1][0] * max_blocks_per_seq_range[1][0],
-                            bb_range[1][1] * max_blocks_per_seq_range[1][1],
-                            bb_range[1][2] * max_blocks_per_seq_range[1][2]
-                        ],
-                    ]
-
                     max_blocks_per_seq_range = [[
                         x for x in max_blocks_per_seq_range[0]
                     ], [x for x in max_blocks_per_seq_range[1]]]
@@ -153,26 +139,10 @@ class GenerationMixin:
                         math.ceil(kv_cache_range[0][1] / tokens_per_block),
                         math.ceil(kv_cache_range[0][2] / tokens_per_block)
                     ]]
-                    blocks_range = [[
-                        bb_range[0][0] * max_blocks_per_seq_range[0][0],
-                        bb_range[0][1] * max_blocks_per_seq_range[0][1],
-                        bb_range[0][2] * max_blocks_per_seq_range[0][2]
-                    ]]
-
                     max_blocks_per_seq_range = [[
                         x for x in max_blocks_per_seq_range[0]
                     ]]
 
-                kv_dim_range = OrderedDict([
-                    ('blocks', blocks_range),
-                    ('kv', [2, 2] if enable_two_optimization_profiles else [2]),
-                    ('num_heads', [num_kv_heads, num_kv_heads]
-                     if enable_two_optimization_profiles else [num_kv_heads]),
-                    ('tokens_per_block', [tokens_per_block, tokens_per_block] if
-                     enable_two_optimization_profiles else [tokens_per_block]),
-                    ('head_size', [head_size, head_size]
-                     if enable_two_optimization_profiles else [head_size]),
-                ])
                 for i in layers_range:
                     kv_cache_block_pointers = Tensor(
                         name=f'kv_cache_block_pointers_{i}',
@@ -204,6 +174,7 @@ class GenerationMixin:
         host_context_lengths = None
         host_past_key_value_lengths = None
         host_max_attention_window_sizes = None
+        host_sink_token_length = None
         attention_mask = None
         cache_indirection = None
         host_request_types = None
@@ -271,6 +242,15 @@ class GenerationMixin:
                 host_max_attention_window_sizes.append(
                     host_max_attention_window_tensor)
 
+            host_sink_token_length = Tensor(
+                name='host_sink_token_length',
+                dtype=trt.int32,
+                shape=[1],
+                dim_range=OrderedDict([
+                    ('scalar',
+                     [1, 1] if enable_two_optimization_profiles else [1])
+                ]))
+
         if use_cache:
             cache_indirection = Tensor(
                 name='cache_indirection',
@@ -288,6 +268,7 @@ class GenerationMixin:
             'sequence_length': sequence_length,
             'host_past_key_value_lengths': host_past_key_value_lengths,
             'host_max_attention_window_sizes': host_max_attention_window_sizes,
+            'host_sink_token_length': host_sink_token_length,
             'past_key_value': past_key_value,
             'cache_indirection': cache_indirection,
             'kv_cache_block_pointers_list': kv_cache_block_pointers_list,
@@ -302,7 +283,7 @@ class GenerationMixin:
                              max_batch_size,
                              max_beam_width,
                              max_input_len,
-                             max_new_tokens,
+                             max_seq_len,
                              num_kv_heads,
                              head_size,
                              num_layers,
@@ -313,7 +294,8 @@ class GenerationMixin:
                              use_custom_all_reduce=False,
                              paged_kv_cache=False,
                              tokens_per_block=64,
-                             gather_all_token_logits=False,
+                             gather_context_logits=False,
+                             gather_generation_logits=False,
                              dtype=None,
                              num_heads=None,
                              mapping=Mapping(),
@@ -325,6 +307,7 @@ class GenerationMixin:
                              max_draft_len=0):
 
         default_range = GenerationMixin.default_range
+        last_token_range = [1, max_draft_len + 1, max_draft_len + 1]
         bb_range_cxt = default_range(max_batch_size)
         bb_range_gen = default_range(max_batch_size * max_beam_width)
         bbd_range_ctx = [
@@ -336,73 +319,67 @@ class GenerationMixin:
             for i in range(len(bb_range_gen))
         ]
         inlen_range_cxt = default_range(max_input_len)
-        inlen_range_gen = [1, 1, 1]
-
-        if max_num_tokens is None:
-            num_tokens_range_ctx = default_range(max_input_len * max_batch_size)
-            num_tokens_range_gen = default_range(max_batch_size *
-                                                 max_beam_width)
-        else:
-            num_tokens_range_ctx = default_range(max_num_tokens)
-            num_tokens_range_gen = default_range(max_num_tokens)
+        inlen_range_gen = [1, 1, max_draft_len + 1]
 
         enable_two_optimization_profiles = GenerationMixin.has_two_optimization_profiles(
             use_gpt_attention_plugin, use_gemm_plugin, remove_input_padding,
             paged_kv_cache)
+        if max_num_tokens is None:
+            max_num_tokens = max(
+                max_input_len * max_batch_size,
+                max_beam_width * (max_draft_len + 1) * max_batch_size)
         if enable_two_optimization_profiles:
             bb_range = [bb_range_cxt, bb_range_gen]
             bbd_range = [bbd_range_ctx, bbd_range_gen]
             inlen_range = [inlen_range_cxt, inlen_range_gen]
+            position_ids_inlen_range = [inlen_range_cxt, [1, 1, 1]]
+            num_tokens_range_ctx = default_range(max_num_tokens)
+            num_tokens_range_gen = default_range(
+                max_batch_size * (max_draft_len + 1) * max_beam_width)
             num_tokens_range = [num_tokens_range_ctx, num_tokens_range_gen]
+            last_token_range = [last_token_range, last_token_range]
         else:
             bb_range = [bb_range_gen]
             bbd_range = [bbd_range_gen]
+            last_token_range = [last_token_range]
             inlen_range = [[1, 1, max_input_len]]
-            if max_num_tokens is None:
-                num_tokens_range = [[
-                    1, max_batch_size * max_beam_width,
-                    max(max_input_len * max_batch_size,
-                        max_beam_width * max_batch_size)
-                ]]
-            else:
-                num_tokens_range = [num_tokens_range_ctx]
+            position_ids_inlen_range = [[1, 1, max_input_len]]
+            num_tokens_range = [[
+                1, max_batch_size * max_beam_width, max_num_tokens
+            ]]
+        position_ids_num_tokens_range = num_tokens_range
 
         input_ids = None
         position_ids = None
         hidden_states = None
         if remove_input_padding:
             if mapping.is_first_pp_rank():
-                input_ids = Tensor(
-                    name='input_ids',
-                    dtype=trt.int32,
-                    shape=[1, -1],
-                    dim_range=OrderedDict([
-                        ('batch_size_fake',
-                         [1, 1] if enable_two_optimization_profiles else [1]),
-                        ('num_tokens', num_tokens_range),
-                    ]))
+                input_ids = Tensor(name='input_ids',
+                                   dtype=trt.int32,
+                                   shape=[-1],
+                                   dim_range=OrderedDict([
+                                       ('num_tokens', num_tokens_range),
+                                   ]))
                 if position_encoding_2d:
                     position_ids = Tensor(
                         name='position_ids',
                         dtype=trt.int32,
-                        shape=[1, 2, -1],
+                        shape=[2, -1],
                         dim_range=OrderedDict([
-                            ('batch_size_fake', [1, 1]
-                             if enable_two_optimization_profiles else [1]),
                             ('2', [2, 2]
                              if enable_two_optimization_profiles else [2]),
-                            ('num_tokens', num_tokens_range),
+                            ('position_ids_num_tokens_range',
+                             position_ids_num_tokens_range),
                         ]),
                     )
                 else:
                     position_ids = Tensor(
                         name='position_ids',
                         dtype=trt.int32,
-                        shape=[1, -1],
+                        shape=[-1],
                         dim_range=OrderedDict([
-                            ('batch_size_fake', [1, 1]
-                             if enable_two_optimization_profiles else [1]),
-                            ('num_tokens', num_tokens_range),
+                            ('position_ids_num_tokens_range',
+                             position_ids_num_tokens_range),
                         ]),
                     )
             else:
@@ -411,10 +388,8 @@ class GenerationMixin:
                 hidden_states = Tensor(
                     name='hidden_states_input',
                     dtype=dtype,
-                    shape=[1, -1, head_size * num_heads],
+                    shape=[-1, head_size * num_heads],
                     dim_range=OrderedDict([
-                        ('batch_size_fake',
-                         [1, 1] if enable_two_optimization_profiles else [1]),
                         ('num_tokens', num_tokens_range),
                         ('hidden_size',
                          [head_size * num_heads, head_size *
@@ -440,7 +415,8 @@ class GenerationMixin:
                             ('batch_size_beam_width', bb_range),
                             ('2', [2, 2]
                              if enable_two_optimization_profiles else [2]),
-                            ('input_len', inlen_range),
+                            ('position_ids_inlen_range',
+                             position_ids_inlen_range),
                         ]),
                     )
                 else:
@@ -450,7 +426,8 @@ class GenerationMixin:
                         shape=[-1, -1],
                         dim_range=OrderedDict([
                             ('batch_size_beam_width', bb_range),
-                            ('input_len', inlen_range),
+                            ('position_ids_inlen_range',
+                             position_ids_inlen_range),
                         ]),
                     )
             else:
@@ -469,18 +446,9 @@ class GenerationMixin:
                          [head_size * num_heads]),
                     ]))
 
-        all_reduce_workspace = None
         if use_custom_all_reduce and mapping.tp_size > 1:
-            # 3 (= buffer + signals_in + signals_out)
-            workspace_size = 3 * mapping.tp_size
-            all_reduce_workspace = Tensor(
-                name='all_reduce_workspace',
-                dtype=trt.int64,
-                shape=[workspace_size],
-                dim_range=OrderedDict([
-                    ('all_reduce_size', [workspace_size, workspace_size]
-                     if enable_two_optimization_profiles else [workspace_size])
-                ]))
+            current_all_reduce_helper().set_workspace_tensor(
+                mapping, enable_two_optimization_profiles)
 
         prompt_embedding_table = None
         tasks = None
@@ -506,15 +474,12 @@ class GenerationMixin:
                      if enable_two_optimization_profiles else [hidden_size]),
                 ]))
             if remove_input_padding:
-                tasks = Tensor(
-                    name='tasks',
-                    dtype=trt.int32,
-                    shape=[1, -1],
-                    dim_range=OrderedDict([
-                        ('batch_size_fake',
-                         [1, 1] if enable_two_optimization_profiles else [1]),
-                        ('input_len_task', num_tokens_range),
-                    ]))
+                tasks = Tensor(name='tasks',
+                               dtype=trt.int32,
+                               shape=[-1],
+                               dim_range=OrderedDict([
+                                   ('input_len_task', num_tokens_range),
+                               ]))
             else:
                 tasks = Tensor(
                     name='tasks',
@@ -573,15 +538,26 @@ class GenerationMixin:
                 lora_ranks.append(lora_rank_dict)
 
         last_token_ids = None
-        if mapping.is_last_pp_rank() and not gather_all_token_logits:
-            last_token_ids = Tensor(
-                name='last_token_ids',
-                dtype=trt.int32,
-                shape=[-1],
-                dim_range=OrderedDict([
-                    ('batch_size_last_token_ids', bbd_range),
-                ]),
-            )
+        if mapping.is_last_pp_rank() and not gather_context_logits:
+            if not remove_input_padding and max_draft_len > 0:
+                last_token_ids = Tensor(
+                    name='last_token_ids',
+                    dtype=trt.int32,
+                    shape=[-1, -1],
+                    dim_range=OrderedDict([
+                        ('batch_size_beam_width', bb_range),
+                        ('last_token_ids', last_token_range),
+                    ]),
+                )
+            else:
+                last_token_ids = Tensor(
+                    name='last_token_ids',
+                    dtype=trt.int32,
+                    shape=[-1],
+                    dim_range=OrderedDict([
+                        ('batch_size_last_token_ids', bbd_range),
+                    ]),
+                )
 
         basic_inputs = {
             'input_ids': input_ids,
@@ -591,20 +567,19 @@ class GenerationMixin:
             'prompt_embedding_table': prompt_embedding_table,
             'tasks': tasks,
             'prompt_vocab_size': prompt_vocab_size,
-            'all_reduce_workspace': all_reduce_workspace,
             'lora_ranks': lora_ranks,
             'lora_weights_pointers': lora_weights_pointers,
         }
 
         attention_inputs = self.prepare_attention_inputs(
-            max_batch_size,
-            max_beam_width,
-            max_input_len,
-            max_new_tokens,
-            num_kv_heads,
-            head_size,
-            num_layers,
-            kv_dtype,
+            max_batch_size=max_batch_size,
+            max_beam_width=max_beam_width,
+            max_input_len=max_input_len,
+            max_seq_len=max_seq_len,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            num_layers=num_layers,
+            kv_dtype=kv_dtype,
             remove_input_padding=remove_input_padding,
             use_gpt_attention_plugin=use_gpt_attention_plugin,
             use_gemm_plugin=use_gemm_plugin,

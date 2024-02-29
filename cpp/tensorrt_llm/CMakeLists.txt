@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -16,10 +16,6 @@ set(TARGET_NAME tensorrt_llm)
 set(SHARED_TARGET ${TARGET_NAME})
 set(SHARED_TARGET
     ${SHARED_TARGET}
-    PARENT_SCOPE)
-set(STATIC_TARGET ${TARGET_NAME}_static)
-set(STATIC_TARGET
-    ${STATIC_TARGET}
     PARENT_SCOPE)
 set(API_INCLUDE_DIR ${PROJECT_SOURCE_DIR}/include)
 
@@ -109,6 +105,29 @@ else()
   endif()
 endif()
 
+find_package(Threads REQUIRED)
+target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE Threads::Threads)
+
+if(NOT WIN32)
+  if(USE_CXX11_ABI)
+    add_custom_command(
+      OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/.check_symbol"
+      COMMAND nm -C $<TARGET_FILE:${BATCH_MANAGER_TARGET}> | grep -q
+              'std::__cxx11::'
+      DEPENDS ${BATCH_MANAGER_TARGET})
+  else()
+    add_custom_command(
+      OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/.check_symbol"
+      COMMAND nm -C $<TARGET_FILE:${BATCH_MANAGER_TARGET}> | grep -qv
+              'std::__cxx11::'
+      DEPENDS ${BATCH_MANAGER_TARGET})
+  endif()
+  add_custom_target(check_symbol
+                    DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/.check_symbol")
+else()
+  add_custom_target(check_symbol)
+endif()
+
 set(TRTLLM_LINK_LIBS
     ${CUBLAS_LIB}
     ${CUBLASLT_LIB}
@@ -120,42 +139,45 @@ set(TRTLLM_LINK_LIBS
     common_src
     kernels_src
     layers_src
-    runtime_src
-    ${BATCH_MANAGER_TARGET})
+    runtime_src)
 
-# ################################# SHARED LIBRARY
-# ##############################################################################
+if(NOT WIN32) # Unix-like compilers
+  set(UNDEFINED_FLAG "-Wl,--no-undefined")
+  set(AS_NEEDED_FLAG "-Wl,--as-needed")
+else() # Windows
+  set(UNDEFINED_FLAG "")
+  set(AS_NEEDED_FLAG "")
+endif()
 
 set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
 add_library(${SHARED_TARGET} SHARED)
 
 set_target_properties(
-  ${SHARED_TARGET} PROPERTIES CXX_STANDARD "17" CXX_STANDARD_REQUIRED "YES"
-                              CXX_EXTENSIONS "NO")
+  ${SHARED_TARGET}
+  PROPERTIES CXX_STANDARD "17" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
+             LINK_FLAGS "${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
 
-if(NOT MSVC) # Unix-like compilers
-  set(UNDEFINED_FLAG "-Wl,--no-undefined")
-else() # MSVC
-  set(UNDEFINED_FLAG "")
+target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
+
+if(WIN32)
+  target_link_libraries(${SHARED_TARGET}
+                        PUBLIC $<TARGET_FILE:${BATCH_MANAGER_TARGET}>)
+  set_target_properties(
+    ${SHARED_TARGET} PROPERTIES LINK_FLAGS
+                                "/WHOLEARCHIVE:${BATCH_MANAGER_TARGET}")
+else()
+  # Assume everything else is like gcc
+  target_link_libraries(
+    ${SHARED_TARGET}
+    PRIVATE "-Wl,--whole-archive" $<TARGET_FILE:${BATCH_MANAGER_TARGET}>
+            "-Wl,--no-whole-archive")
 endif()
 
-target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS}
-                                              ${UNDEFINED_FLAG})
-
-# ################################# STATIC LIBRARY
-# ##############################################################################
-
-add_library(${STATIC_TARGET} STATIC)
-
-set_target_properties(
-  ${STATIC_TARGET} PROPERTIES CXX_STANDARD "17" CXX_STANDARD_REQUIRED "YES"
-                              CXX_EXTENSIONS "NO" POSITION_INDEPENDENT_CODE ON)
-
-target_link_libraries(${STATIC_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
+add_dependencies(${SHARED_TARGET} check_symbol)
 
 # Cyclic dependency of batch manager on TRT-LLM
-target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE ${STATIC_TARGET})
+target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE ${SHARED_TARGET})
 
 if(BUILD_PYT)
   add_subdirectory(thop)

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@
 #include <random>
 
 #include "tensorrt_llm/kernels/decodingCommon.h"
-#include "tensorrt_llm/kernels/samplingPenaltyKernels.h"
+#include "tensorrt_llm/kernels/penaltyKernels.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
 #include "tensorrt_llm/kernels/samplingTopPKernels.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
@@ -83,7 +83,6 @@ bool checkResult(std::string name, T* out, T* ref, size_t size)
 
     size_t failures = 0;
     float relativeGap = 0.0f;
-    ;
 
     for (size_t i = 0; i < size; ++i)
     {
@@ -192,6 +191,7 @@ struct SamplingKernelTestParam
     uint32_t topK;
     float topP;
     int32_t outputLen;
+    bool normalizeLogProbs = false;
 
     SamplingKernelTestParam& setBatchSize(int32_t bs)
     {
@@ -253,15 +253,16 @@ protected:
         throw std::logic_error("Not implemented");
     }
 
-    void allocateBuffers(int32_t batchSize, int32_t vocabSize, int32_t maxSeqLen, int32_t outputLen);
+    void allocateBuffers(
+        int32_t batchSize, int32_t maxBatchSize, int32_t vocabSize, int32_t maxSeqLen, int32_t outputLen);
 
-    void setupBuffers(int32_t batchSize, int32_t vocabSize, int32_t maxSeqLen, int32_t outputLen, int32_t topK,
-        float topP, bool useSkipDecode, bool hasDiffRuntimeArgs, std::mt19937& gen,
+    void setupBuffers(int32_t batchSize, int32_t maxBatchSize, int32_t vocabSize, int32_t maxSeqLen, int32_t outputLen,
+        int32_t topK, float topP, bool useSkipDecode, bool hasDiffRuntimeArgs, std::mt19937& gen,
         std::uniform_int_distribution<>& endIdsDistr);
 
-    void verifyCurrentStep(int32_t batchSize, int32_t vocabSize, int32_t maxSeqLen, int32_t step, bool greedySearch,
-        bool useSkipDecode, bool hasDiffRuntimeArgs, std::vector<tensorrt_llm::kernels::FinishedState>& refFinished,
-        std::vector<int32_t>& refSeqLength,
+    void verifyCurrentStep(int32_t batchSize, int32_t maxBatchSize, int32_t vocabSize, int32_t maxSeqLen, int32_t step,
+        bool greedySearch, bool useSkipDecode, bool hasDiffRuntimeArgs,
+        std::vector<tensorrt_llm::kernels::FinishedState>& refFinished, std::vector<int32_t>& refSeqLength,
         const std::vector<tensorrt_llm::kernels::FinishedState>& finishedCurrentStep);
 
 private:
@@ -308,6 +309,8 @@ protected:
 
     TensorPtr mSkipDecodeHost;
     TensorPtr mSkipDecodeDevice;
+
+    TensorPtr mBatchSlots;
 
     TensorPtr mExpectedCumLogProbsHost;
 

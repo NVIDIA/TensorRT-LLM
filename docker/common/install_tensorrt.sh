@@ -3,10 +3,10 @@
 set -ex
 
 TRT_VER="9.2.0.5"
-CUDA_VER="12.2"
+CUDA_VER="12.3"
 CUDNN_VER="8.9.4.25-1+cuda12.2"
-NCCL_VER="2.18.3-1+cuda12.2"
-CUBLAS_VER="12.2.5.6-1"
+NCCL_VER="2.19.3-1+cuda12.3"
+CUBLAS_VER="12.3.4.1-1"
 
 for i in "$@"; do
     case $i in

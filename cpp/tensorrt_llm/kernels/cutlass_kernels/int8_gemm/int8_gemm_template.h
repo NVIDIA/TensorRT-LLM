@@ -265,7 +265,7 @@ void dispatchGemmToCutlass(const int8_t* A, const int8_t* B, tk::QuantMode quant
     switch (gemmConfig.tile_config)
     {
     case tkc::CutlassTileConfig::CtaShape128x64x64_WarpShape64x32x64:
-        dispatchGemmConfig<T, arch, cutlass::gemm::GemmShape<128, 128, 64>, cutlass::gemm::GemmShape<64, 32, 64>>(A, B,
+        dispatchGemmConfig<T, arch, cutlass::gemm::GemmShape<128, 64, 64>, cutlass::gemm::GemmShape<64, 32, 64>>(A, B,
             quantOption, alphaCol, alphaRow, C, m, n, k, gemmConfig, workspace, workspaceBytes, stream, occupancy);
         break;
     case tkc::CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64:

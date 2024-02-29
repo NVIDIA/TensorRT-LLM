@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,11 +16,8 @@
 
 #include "tensorrt_llm/runtime/ncclCommunicator.h"
 
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/runtime/utils/multiDeviceUtils.h"
-
-#include <NvInferRuntime.h>
-#include <mpi.h>
-#include <type_traits>
 
 #if ENABLE_MULTI_DEVICE
 #include <nccl.h>
@@ -31,99 +28,73 @@ using namespace tensorrt_llm::runtime;
 namespace
 {
 #if ENABLE_MULTI_DEVICE
-//! \brief For converting a C++ data type to a Nccl data type.
-template <typename T>
-struct NcclDataType
-{
-};
 
-template <>
-struct NcclDataType<half>
+ncclDataType_t toNcclType(nvinfer1::DataType dataType)
 {
-    static constexpr auto value = ncclDataType_t::ncclHalf;
-};
-
-template <>
-struct NcclDataType<float>
-{
-    static constexpr auto value = ncclDataType_t::ncclFloat;
-};
-
-template <>
-struct NcclDataType<std::uint8_t>
-{
-    static constexpr auto value = ncclDataType_t::ncclUint8;
-};
-
-template <>
-struct NcclDataType<std::int32_t>
-{
-    static constexpr auto value = ncclDataType_t::ncclInt32;
-};
+    switch (dataType)
+    {
+    case nvinfer1::DataType::kFLOAT: return ncclFloat32;
+    case nvinfer1::DataType::kHALF: return ncclHalf;
+    case nvinfer1::DataType::kINT8: return ncclInt8;
+    case nvinfer1::DataType::kINT32: return ncclInt32;
+    case nvinfer1::DataType::kUINT8: return ncclUint8;
+    case nvinfer1::DataType::kINT64: return ncclInt64;
+    case nvinfer1::DataType::kFP8: return ncclUint8;
+#if ENABLE_BF16
+    case nvinfer1::DataType::kBF16: return ncclBfloat16;
+#endif // ENABLE_BF16
+    default: TLLM_THROW("Unsupported data type: %d", static_cast<int>(dataType));
+    }
+}
 #endif // ENABLE_MULTI_DEVICE
 } // namespace
 
-template <typename T>
-void NcclCommunicator::send(T* sendbuff, size_t count, int peer, CudaStream const& stream) const
+void NcclCommunicator::send(
+    void const* sendbuff, size_t count, nvinfer1::DataType dataType, int peer, CudaStream const& stream) const
 {
 #if ENABLE_MULTI_DEVICE
-    auto datatype = NcclDataType<std::remove_cv_t<T>>::value;
-    TLLM_NCCL_CHECK(ncclSend(sendbuff, count, datatype, peer, mComm, stream.get()));
+    TLLM_NCCL_CHECK(ncclSend(sendbuff, count, toNcclType(dataType), peer, mComm, stream.get()));
 #else
     TLLM_THROW("Multi device support is disabled.");
 #endif // ENABLE_MULTI_DEVICE
 }
 
-template void NcclCommunicator::send(std::uint8_t*, size_t, int, CudaStream const&) const;
-template void NcclCommunicator::send(std::int32_t*, size_t, int, CudaStream const&) const;
-template void NcclCommunicator::send(std::uint8_t const*, size_t, int, CudaStream const&) const;
-template void NcclCommunicator::send(std::int32_t const*, size_t, int, CudaStream const&) const;
-template void NcclCommunicator::send(float const*, size_t, int, CudaStream const&) const;
-
-template <typename T>
-void NcclCommunicator::receive(T* sendbuff, size_t count, int peer, CudaStream const& stream) const
+void NcclCommunicator::receive(
+    void* sendbuff, size_t count, nvinfer1::DataType dataType, int peer, CudaStream const& stream) const
 {
 #if ENABLE_MULTI_DEVICE
-    auto datatype = NcclDataType<std::remove_cv_t<T>>::value;
-    TLLM_NCCL_CHECK(ncclRecv(sendbuff, count, datatype, peer, mComm, stream.get()));
+    TLLM_NCCL_CHECK(ncclRecv(sendbuff, count, toNcclType(dataType), peer, mComm, stream.get()));
 #else
     TLLM_THROW("Multi device support is disabled.");
 #endif // ENABLE_MULTI_DEVICE
 }
 
-template void NcclCommunicator::receive(std::uint8_t*, size_t, int, CudaStream const&) const;
-template void NcclCommunicator::receive(std::int32_t*, size_t, int, CudaStream const&) const;
-template void NcclCommunicator::receive(float*, size_t, int, CudaStream const&) const;
-
-std::shared_ptr<NcclCommunicator> NcclCommunicator::createPipelineComm(WorldConfig const& worldConfig)
+ncclComm_t NcclCommunicator::createComm(int worldSize, int rank, mpi::MpiComm const& mpiComm)
 {
 #if ENABLE_MULTI_DEVICE
-    int const myRank = worldConfig.getRank();
-    int const worldSize = worldConfig.getSize();
 
     ncclUniqueId id;
-    if (myRank == 0)
+    if (rank == 0)
     {
         ncclGetUniqueId(&id);
-        for (auto peer = 1; peer < worldSize; ++peer)
-        {
-            TLLM_MPI_CHECK(MPI_Send(&id, sizeof(id), MPI_BYTE, peer, 0, MPI_COMM_WORLD));
-        }
     }
-    else
-    {
-        auto constexpr peer = 0;
-        MPI_Status status;
-        TLLM_MPI_CHECK(MPI_Recv(&id, sizeof(id), MPI_BYTE, peer, 0, MPI_COMM_WORLD, &status));
-    }
-
-    auto pipelineComm = std::make_shared<NcclCommunicator>();
-    TLLM_NCCL_CHECK(ncclCommInitRank(&pipelineComm->mComm, worldSize, id, myRank));
-
-    return pipelineComm;
+    mpiComm.bcast(id, 0);
+    ncclComm_t comm;
+    TLLM_NCCL_CHECK(ncclCommInitRank(&comm, worldSize, id, rank));
+    return comm;
 #else
     // Python runtime requires instantiation of a communicator even though it may never be used to enable
     // pipeline parallel code-path. To enable this, have an empty communicator with uninitialized state.
     return nullptr;
+#endif // ENABLE_MULTI_DEVICE
+}
+
+NcclCommunicator::~NcclCommunicator()
+{
+#if ENABLE_MULTI_DEVICE
+    if (mComm && ncclCommDestroy(mComm) != ncclSuccess)
+    {
+        TLLM_LOG_WARNING("Failed to destroy NCCL communicator.");
+    }
 #endif // ENABLE_MULTI_DEVICE
 }

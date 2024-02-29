@@ -16,6 +16,11 @@
  */
 #include "sendPlugin.h"
 
+#include "tensorrt_llm/common/mpiUtils.h"
+
+#include <cassert>
+#include <nccl.h>
+
 using namespace nvinfer1;
 using tensorrt_llm::plugins::SendPluginCreator;
 using tensorrt_llm::plugins::SendPlugin;
@@ -37,7 +42,11 @@ SendPlugin::SendPlugin(const void* data, size_t length)
     const char *d = reinterpret_cast<const char*>(data), *a = d;
     read(d, mType);
     read(d, mTgtRank);
-    TLLM_CHECK(d == a + length);
+    TLLM_CHECK_WITH_INFO(d == a + length,
+        "Expected length (%d) != real length (%d). This is often "
+        "caused by using different TensorRT-LLM version to build "
+        "engine and run engine.",
+        (int) length, (int) (d - a));
 }
 
 // IPluginV2DynamicExt Methods
@@ -119,13 +128,10 @@ int SendPlugin::initialize() noexcept
     {
         return 0;
     }
-    int myRank, nRanks;
-    MPICHECK(MPI_Comm_rank(MPI_COMM_WORLD, &myRank));
-    MPICHECK(MPI_Comm_size(MPI_COMM_WORLD, &nRanks));
 
     ncclUniqueId id;
     ncclGetUniqueId(&id);
-    MPICHECK(MPI_Send(&id, sizeof(id), MPI_BYTE, mTgtRank, 0, MPI_COMM_WORLD));
+    COMM_SESSION.send(id, mTgtRank, 0);
     NCCLCHECK(ncclCommInitRank(&mComm, 2, id, 0));
     return 0;
 }

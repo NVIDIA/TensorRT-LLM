@@ -1,0 +1,2 @@
+mamba-ssm==1.1.1
+causal-conv1d==1.1.1 # 1.1.2 needs torch 2.2, while TRT-LLM sticks to pre 2.2

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -124,6 +124,7 @@ class BaseBenchmark(object):
         report_dict["model_name"] = self.model_name
         report_dict["world_size"] = self.world_size
         report_dict["precision"] = self.dtype
+        report_dict["quantization"] = str(self.quant_mode)
         report_dict["compute_cap"] = "sm" + get_compute_cap()
         return report_dict
 

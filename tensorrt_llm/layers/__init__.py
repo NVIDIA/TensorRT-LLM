@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,6 +25,7 @@ from .mlp import MLP, FusedGatedMLP, GatedMLP
 from .moe import MOE, MoeConfig
 from .normalization import GroupNorm, LayerNorm, RmsNorm
 from .pooling import AvgPool2d
+from .ssm import Mamba, MambaParameters
 
 __all__ = [
     'LayerNorm',
@@ -55,4 +56,6 @@ __all__ = [
     'LoraRuntimeParams',
     'MOE',
     'MoeConfig',
+    'Mamba',
+    'MambaParameters',
 ]

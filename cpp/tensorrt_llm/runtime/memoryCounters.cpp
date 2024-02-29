@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -45,8 +45,6 @@ std::string doubleBytesToString(double bytes, int precision)
 
 namespace tensorrt_llm::runtime
 {
-thread_local MemoryCounters MemoryCounters::mInstance;
-
 std::string MemoryCounters::bytesToString(SizeType bytes, int precision)
 {
     return doubleBytesToString(static_cast<double>(bytes), precision);

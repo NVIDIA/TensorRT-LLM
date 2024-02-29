@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -54,11 +54,16 @@ py::object GptManager::enter()
 
 void GptManager::exit(py::handle type, py::handle value, py::handle traceback)
 {
+    shutdown();
+}
+
+void GptManager::shutdown()
+{
     // NOTE: we must release the GIL here. GptManager has spawned a thread for the execution loop. That thread must be
     // able to do forward progress for the shutdown process to succeed. It takes the GIL during its callbacks, so
     // we release it now. Note that we shouldn't do anything related to python objects after that.
     py::gil_scoped_release release;
-    shutdown();
+    tb::GptManager::shutdown();
 }
 
 tb::GetInferenceRequestsCallback callbackAdapter(GetInferenceRequestsCallback callback)
@@ -101,7 +106,8 @@ void GptManager::initBindings(py::module_& m)
             py::arg("return_batch_manager_stats_cb") = nullptr,
             py::arg_v("optional_params", tb::TrtGptModelOptionalParams(), "TrtGptModelOptionalParams"),
             py::arg("terminate_req_id") = std::nullopt)
-        .def("shutdown", &GptManager::exit)
+
+        .def("shutdown", &GptManager::shutdown)
         .def("__enter__", &GptManager::enter)
         .def("__exit__", &GptManager::exit);
 }

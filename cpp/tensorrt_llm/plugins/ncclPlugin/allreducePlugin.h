@@ -16,13 +16,11 @@
  */
 #pragma once
 
-#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
+
 #include <cassert>
 #include <memory>
-#include <mpi.h>
-#include <nccl.h>
 #include <set>
 #include <string>
 #include <vector>
@@ -70,7 +68,7 @@ public:
     bool isCustomAllReduceSuported(int ranks_per_node) const noexcept;
 
 private:
-    kernels::AllReduceStrategyType selectImplementation(size_t messageSize, int worldSize) const noexcept;
+    static kernels::AllReduceStrategyType selectImplementation(size_t messageSize, int worldSize) noexcept;
     const std::string mLayerName;
     std::set<int> mGroup;
     nvinfer1::DataType mType;

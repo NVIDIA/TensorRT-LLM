@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,7 +20,6 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
-#include "tensorrt_llm/runtime/tllmBuffers.h"
 
 #include <optional>
 #include <utility>
@@ -46,7 +45,7 @@ public:
     // In GenerationInput, tasks expected shape is [batchSize]
     // For context requests with non-packed inputs, expected shape is [batchSize, 1]
     // For generation requests with non-packed inputs, expected shape is [batchSize*beamWidth] for generation requests.
-    // For packed inputs, expected shape is [1, packedLength] (note that ifb currently doesn't support non-packed
+    // For packed inputs, expected shape is [packedLength] (note that ifb currently doesn't support non-packed
     // inputs)
     TensorPtr tasks;
     TensorPtr vocabSize; // [1], on gpu

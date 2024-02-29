@@ -61,8 +61,8 @@ void invokeFinalize(int* outputIds, int* sequenceLengths, float* cumLogProbs, fl
 
 void invokeInitializeOutput(int* outputIds, const int* endIds, int batchBeam, int maxSeqLen, cudaStream_t stream);
 
-void invokeCopyNextStepIds(int* nextStepIds, int** outputIdsPtr, const int* sequenceLengths, int batchSize,
-    int beamWidth, int maxSeqLen, cudaStream_t stream);
+void invokeCopyNextStepIds(int* nextStepIds, int** outputIdsPtr, const int* sequenceLengths, const int* batchSlots,
+    int batchSize, int beamWidth, int maxSeqLen, cudaStream_t stream);
 
 //! \brief Accepts or rejects draft tokens based on the equality of draft and target tokens
 //! for speculative decoding. Target token is accepted if targetToken == draftToken.
@@ -122,7 +122,7 @@ void acceptDraftTokensByLogits(T* draftLogits, T* targetLogits, T* draftProbs, T
     cudaStream_t stream);
 
 void invokeTransposeLogProbs(float* output_log_probs, float* output_log_probs_tiled, const int* sequence_lengths,
-    int batch_size, int beam_width, int max_seq_len, cudaStream_t stream);
+    const int* batchSlots, int batch_size, int beam_width, int max_seq_len, cudaStream_t stream);
 
 void invokeAcceptTokens(const int* draft_tokens, const int* target_tokens, const int* context_lengths,
     const int* nums_draft_tokens, int* sequence_lengths, const bool* finished, bool* finished_final, int* finished_sum,

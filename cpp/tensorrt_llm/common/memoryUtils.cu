@@ -152,23 +152,23 @@ template void cudaH2Dcpy(unsigned int* tgt, const unsigned int* src, size_t size
 template void cudaH2Dcpy(int8_t* tgt, const int8_t* src, size_t size);
 
 template <typename T>
-void cudaD2Dcpy(T* tgt, const T* src, const size_t size)
+void cudaD2Dcpy(T* tgt, const T* src, const size_t size, cudaStream_t stream)
 {
-    check_cuda_error(cudaMemcpy(tgt, src, sizeof(T) * size, cudaMemcpyDeviceToDevice));
+    check_cuda_error(cudaMemcpyAsync(tgt, src, sizeof(T) * size, cudaMemcpyDeviceToDevice, stream));
 }
 
-template void cudaD2Dcpy(float* tgt, const float* src, size_t size);
-template void cudaD2Dcpy(half* tgt, const half* src, size_t size);
+template void cudaD2Dcpy(float* tgt, const float* src, size_t size, cudaStream_t stream);
+template void cudaD2Dcpy(half* tgt, const half* src, size_t size, cudaStream_t stream);
 #ifdef ENABLE_BF16
-template void cudaD2Dcpy(__nv_bfloat16* tgt, const __nv_bfloat16* src, size_t size);
+template void cudaD2Dcpy(__nv_bfloat16* tgt, const __nv_bfloat16* src, size_t size, cudaStream_t stream);
 #endif
-template void cudaD2Dcpy(int* tgt, const int* src, size_t size);
-template void cudaD2Dcpy(bool* tgt, const bool* src, size_t size);
-template void cudaD2Dcpy(int8_t* tgt, const int8_t* src, size_t size);
+template void cudaD2Dcpy(int* tgt, const int* src, size_t size, cudaStream_t stream);
+template void cudaD2Dcpy(bool* tgt, const bool* src, size_t size, cudaStream_t stream);
+template void cudaD2Dcpy(int8_t* tgt, const int8_t* src, size_t size, cudaStream_t stream);
 #ifdef ENABLE_FP8
-template void cudaD2Dcpy(__nv_fp8_e4m3* tgt, const __nv_fp8_e4m3* src, size_t size);
+template void cudaD2Dcpy(__nv_fp8_e4m3* tgt, const __nv_fp8_e4m3* src, size_t size, cudaStream_t stream);
 #endif
-template void cudaD2Dcpy(unsigned long long* tgt, const unsigned long long* src, size_t size);
+template void cudaD2Dcpy(unsigned long long* tgt, const unsigned long long* src, size_t size, cudaStream_t stream);
 
 template <typename T_OUT, typename T_IN>
 __global__ void cudaCast(T_OUT* dst, T_IN* src, const size_t size)
@@ -227,6 +227,7 @@ template void cudaAutoCpy(int8_t* tgt, const int8_t* src, size_t size, cudaStrea
 template void cudaAutoCpy(uint8_t* tgt, const uint8_t* src, size_t size, cudaStream_t stream);
 template void cudaAutoCpy(uint32_t* tgt, const uint32_t* src, size_t size, cudaStream_t stream);
 template void cudaAutoCpy(unsigned long long* tgt, const unsigned long long* src, size_t size, cudaStream_t stream);
+template void cudaAutoCpy(unsigned long* tgt, const unsigned long* src, size_t size, cudaStream_t stream);
 template void cudaAutoCpy(char* tgt, const char* src, size_t size, cudaStream_t stream);
 
 template void cudaAutoCpy(float const** tgt, float const* const* src, size_t size, cudaStream_t stream);
@@ -858,6 +859,48 @@ bool invokeCheckRange(const T* buffer, const size_t size, T min, T max, bool* d_
 
 template bool invokeCheckRange<int>(
     const int* buffer, const size_t size, int min, int max, bool* d_within_range, cudaStream_t stream);
+
+/*
+ *  Determine the total workspace size based on a vector containing multiple variable sizes.
+ */
+size_t calcAlignedSize(const std::vector<size_t>& sizes, const size_t ALIGN_BYTES)
+{
+    const size_t ALIGN_MASK = ~(ALIGN_BYTES - 1);
+    // Check ALIGN_BYTES is a power of 2
+    assert((ALIGN_BYTES & (ALIGN_BYTES - 1)) == 0);
+
+    size_t total = 0;
+    for (auto sz : sizes)
+    {
+        total += (sz + ALIGN_BYTES - 1) & ALIGN_MASK;
+    }
+
+    // We add extra "ALIGN_BYTES - 1" bytes in case the start address passed to the function calcAlignedPointers() is
+    // not aligned.
+    return total + ALIGN_BYTES - 1;
+}
+
+/*
+ * Given the address of the workspace and the vector containing multiple variable sizes, calculate the start addresses
+ * of each variable.
+ */
+void calcAlignedPointers(
+    std::vector<void*>& outPtrs, const void* p, const std::vector<size_t>& sizes, size_t ALIGN_BYTES)
+{
+    const size_t ALIGN_MASK = ~(ALIGN_BYTES - 1);
+    // Check ALIGN_BYTES is a power of 2
+    assert((ALIGN_BYTES & (ALIGN_BYTES - 1)) == 0);
+
+    // In case the start address is not aligned
+    char* ptr = reinterpret_cast<char*>((reinterpret_cast<size_t>(p) + ALIGN_BYTES - 1) & ALIGN_MASK);
+
+    outPtrs.reserve(sizes.size());
+    for (auto sz : sizes)
+    {
+        outPtrs.push_back(ptr);
+        ptr += (sz + ALIGN_BYTES - 1) & ALIGN_MASK;
+    }
+}
 
 } // namespace common
 } // namespace tensorrt_llm

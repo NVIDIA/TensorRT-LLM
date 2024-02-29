@@ -84,7 +84,7 @@ public:
         , sm(sm_)
     {
         TLLM_CHECK_WITH_INFO(
-            (sm == kSM_80 || sm == kSM_86 || sm == kSM_89 || sm == kSM_90), "Unsupported architecture");
+            (sm == kSM_70 || sm == kSM_80 || sm == kSM_86 || sm == kSM_89 || sm == kSM_90), "Unsupported architecture");
         TLLM_CHECK_WITH_INFO((mDataType == DATA_TYPE_FP16 || mDataType == DATA_TYPE_BF16), "Unsupported data type");
 
         pagedKVXmmaKernel = getPagedKVXMMAKernelsV2(mDataType, sm);
@@ -117,8 +117,8 @@ public:
         const float scale_bmm2 = 1.f;
 
         Data_type scale_type = mLaunchParams.force_fp32_acc ? DATA_TYPE_FP32 : mDataType;
-        // Use specialized ws kernels on Hopper for cases without alibi.
-        if (mLaunchParams.useKernelWithoutAlibi)
+        // Use exp2f optimization for warp-specialized ws kernels on Hopper.
+        if (mLaunchParams.useBase2ExpTrick)
         {
             // The kernel adopts the log2f optimziation.
             constexpr float kLog2e = 1.4426950408889634074; // log_2(e) = M_LOG2E
@@ -144,7 +144,7 @@ public:
         mTotalSeqLen = total_seqlen;
 
         // alibi.
-        if (has_alibi)
+        if (has_alibi && sm > kSM_70)
         {
             params.has_alibi = true;
             params.alibi_params = AlibiParams(mNumHeads, s_kv, tp_size, tp_rank, scale_after_alibi);
@@ -160,10 +160,17 @@ public:
         // Hopper: fallback to original fmha_v2 when head_size <= 64 and seq_len <= 256
         mLaunchParams.set_default_kernel_selection_params();
 
+        const bool isSm70 = (sm == kSM_70);
         const bool isSm90 = (sm == kSM_90);
         const bool isSm8x = (sm == kSM_86 || sm == kSM_89);
         const bool isSm80 = (sm == kSM_80);
-        if (isSm90 && mHeadSize <= 64 && s <= 256)
+        if (isSm70)
+        {
+            mLaunchParams.flash_attention = true;
+            mLaunchParams.force_unroll = true;          // need more profile
+            mLaunchParams.useKernelWithoutAlibi = true; // Volta do not support alibi
+        }
+        else if (isSm90 && mHeadSize <= 64 && s <= 256)
         {
             mLaunchParams.flash_attention = false;
             // get max sequence length for non-flash-attentio
@@ -207,11 +214,16 @@ public:
         {
             // Use specialized ws kernels for cases without alibi.
             mLaunchParams.useKernelWithoutAlibi = true;
+            // Enable exp2f optimization (which helps improve performance).
+            //    - note that this is not compatible with alibi bias due to the accuracy issues.
+            //    - only hopper warp-specialized kernels have this optimization.
+            mLaunchParams.useBase2ExpTrick = true;
         }
 
         // Sliding_window_causal mask.
         if (s > sliding_window_size && mLaunchParams.attention_mask_type == ContextAttentionMaskType::CAUSAL)
         {
+            TLLM_CHECK_WITH_INFO(!isSm70, "Sliding window attention is not supported for FMHA on Volta");
             mLaunchParams.attention_mask_type = ContextAttentionMaskType::SLIDING_WINDOW_CAUSAL;
         }
 
@@ -229,7 +241,6 @@ public:
         // Determine launch parameters.
         mLaunchParams.set_default_kernel_selection_params();
 
-        TLLM_CHECK_WITH_INFO(tokens_per_kv_block >= 128, "FMHA with paged kv cache needs tokens_per_block >= 128 !");
         // Needed by TMA descriptors.
         mLaunchParams.blocks_per_context_sequence = blocks_per_context_sequence;
 
@@ -278,6 +289,10 @@ public:
         {
             // Use specialized ws kernels for cases without alibi.
             mLaunchParams.useKernelWithoutAlibi = true;
+            // Enable exp2f optimization (which helps improve performance).
+            //    - note that this is not compatible with alibi bias due to the accuracy issues.
+            //    - only hopper warp-specialized kernels have this optimization.
+            mLaunchParams.useBase2ExpTrick = true;
         }
 
         // Sliding_window_causal mask.
@@ -393,12 +408,12 @@ public:
         const uint32_t d_groups = d_in_bytes > 128 ? d_in_bytes / 128 : 1;
 
         uint32_t q_step = 0, kv_step = 0;
-        for (unsigned int i = 0u; i < sizeof(sTmaPagedKVMetaInfo) / sizeof(sTmaPagedKVMetaInfo[0]); ++i)
+        for (unsigned int i = 0u; i < sizeof(sTmaMetaInfo) / sizeof(sTmaMetaInfo[0]); ++i)
         {
-            if (sTmaPagedKVMetaInfo[i].mD == mPagedKVParams.d)
+            if (sTmaMetaInfo[i].mD == mPagedKVParams.d)
             {
-                q_step = sTmaPagedKVMetaInfo[i].mQStep;
-                kv_step = sTmaPagedKVMetaInfo[i].mKVStep;
+                q_step = sTmaMetaInfo[i].mQStep;
+                kv_step = sTmaMetaInfo[i].mKVStep;
                 break;
             }
         }
@@ -454,18 +469,24 @@ public:
 
         // Paged KV
         // Per batch tensor size.
+        uint32_t tokens_per_block = uint32_t(mPagedKVParams.paged_kv_cache.mTokensPerBlock);
         uint32_t tensor_size_kv[4];
         tensor_size_kv[3] = 1;
         tensor_size_kv[2] = mPagedKVParams.h_kv;
-        tensor_size_kv[1] = mPagedKVParams.paged_kv_cache.mTokensPerBlock;
+        tensor_size_kv[1] = tokens_per_block;
         tensor_size_kv[0] = mPagedKVParams.d;
 
         // Box size for k and v.
         uint32_t box_size_kv[4];
         box_size_kv[3] = 1;
         box_size_kv[2] = 1;
-        box_size_kv[1] = kv_step;
+        box_size_kv[1] = std::min(tokens_per_block, kv_step);
         box_size_kv[0] = mPagedKVParams.d / d_groups;
+
+        TLLM_CHECK_WITH_INFO(
+            tokens_per_block % 2 == 0, "FMHA with paged kv cache needs tokens_per_block to be power of 2 !");
+        mPagedKVParams.blocks_per_tma_load = std::max(1, int32_t(kv_step / tokens_per_block));
+        mPagedKVParams.blocks_per_tma_load_log2 = log2(mPagedKVParams.blocks_per_tma_load);
 
         // Stride size in bytes.
         uint64_t tensor_stride_kv[3];
@@ -474,21 +495,17 @@ public:
         tensor_stride_kv[2] = tensor_size_kv[2] * tensor_stride_kv[1];
 
         // 2 stands for k, and v blocks.
-        // We only need to prepare as many tma descriptos as the number of paged kv blocks for context.
+        TLLM_CHECK_WITH_INFO(
+            mPagedKVParams.paged_kv_cache.mMaxBlocksPerSeq == mLaunchParams.blocks_per_context_sequence,
+            "Mismatching blocks_per_sequence for the paged kv FMHA.");
         for (int block_idx = 0; block_idx < mPagedKVParams.b * 2 * mLaunchParams.blocks_per_context_sequence;
              block_idx++)
         {
-            int block_ptr_idx = int(block_idx / mLaunchParams.blocks_per_context_sequence)
-                    * mPagedKVParams.paged_kv_cache.mMaxBlocksPerSeq
-                + (block_idx % mLaunchParams.blocks_per_context_sequence);
             paged_kv_tma_descriptor.set_tma_desctriptor(
-                reinterpret_cast<char*>(mLaunchParams.paged_kv_block_ptrs[block_ptr_idx]), cudaTmaDescFormat::F16_RN,
+                reinterpret_cast<char*>(mLaunchParams.paged_kv_block_ptrs[block_idx]), cudaTmaDescFormat::F16_RN,
                 cudaTmaDescInterleave::INTERLEAVE_DISABLED, swizzle_mode, cudaTmaDescPromotion::PROMOTION_DISABLED,
                 tensor_size_kv, tensor_stride_kv, traversal_stride, box_size_kv, oob_fill, fp32_to_tf32, block_idx);
         }
-
-        // set mMaxBlocksPerSeq to the number of blocks needed for context.
-        mPagedKVParams.paged_kv_cache.mMaxBlocksPerSeq = mLaunchParams.blocks_per_context_sequence;
 
         paged_kv_tma_descriptor.copy_to_device(mPagedKVParams.tma_desc_paged_kv, stream);
     }
@@ -535,9 +552,13 @@ public:
         const KVBlockArray pagedKVCache, const void* cuQSeqlenPtr, const void* cuKVSeqlenPtr, void* outputPtr,
         cudaStream_t stream)
     {
+        KVBlockArrayForContextFMHA pagedKVCacheForContextMHA;
+        pagedKVCacheForContextMHA = KVBlockArrayForContextFMHA(pagedKVCache.mMaxSeqs, pagedKVCache.mMaxBlocksPerSeq,
+            pagedKVCache.mTokensPerBlock, mPagedKVParams.h_kv * mPagedKVParams.d * sizeof(half));
+        pagedKVCacheForContextMHA.data = pagedKVCache.data;
         mPagedKVParams.q_ptr = qPtr;
         mPagedKVParams.tma_desc_paged_kv = reinterpret_cast<cudaTmaDesc*>(pagedKVTmaDesc);
-        mPagedKVParams.paged_kv_cache = pagedKVCache;
+        mPagedKVParams.paged_kv_cache = pagedKVCacheForContextMHA;
         mPagedKVParams.o_ptr = outputPtr;
         mPagedKVParams.cu_q_seqlens = reinterpret_cast<const int*>(cuQSeqlenPtr);
         mPagedKVParams.cu_seqlens = reinterpret_cast<const int*>(cuKVSeqlenPtr);
@@ -662,7 +683,12 @@ bool FusedMHARunnerV2::isValid(int s) const
 // static function to check if fmha is supported when building plugins
 bool MHARunner::fmha_supported(const int headSize, const int sm)
 {
-    if (sm == kSM_80 || sm == kSM_86 || sm == kSM_89)
+    if (sm == kSM_70)
+    {
+        return (headSize == 32 || headSize == 40 || headSize == 64 || headSize == 80 || headSize == 128
+            || headSize == 160 || headSize == 256);
+    }
+    else if (sm == kSM_80 || sm == kSM_86 || sm == kSM_89)
     {
         return (headSize == 16 || headSize == 32 || headSize == 40 || headSize == 64 || headSize == 80
             || headSize == 128 || headSize == 160 || headSize == 256);

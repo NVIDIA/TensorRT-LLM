@@ -126,7 +126,7 @@ def load_from_binary_bart(tllm_model: Union[DecoderModel, EncoderModel],
 
     # only load word / pos emb and emb layernorm to first PP rank
     if mapping.is_first_pp_rank():
-        wte = fromfile('model.shared.weight',
+        wte = fromfile(f'model.{component}.embed_tokens.weight',
                        shape=[args.vocab_size, -1],
                        split=False)
 

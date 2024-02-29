@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@
 namespace tensorrt_llm::runtime
 {
 
-void setPeerAccess(WorldConfig worldConfig, bool enable)
+void setPeerAccess(WorldConfig const& worldConfig, bool enable)
 {
     const auto srcNode = worldConfig.getTensorParallelRank();
 
@@ -50,7 +50,7 @@ void setPeerAccess(WorldConfig worldConfig, bool enable)
     }
 }
 
-IpcMemory::IpcMemory(WorldConfig worldConfig, std::size_t bufferSize)
+IpcMemory::IpcMemory(WorldConfig const& worldConfig, std::size_t bufferSize)
     : mWorldConfig(worldConfig)
     , mCommPtrs(worldConfig.getTensorParallelism())
     , mBufferSize(bufferSize)
@@ -68,10 +68,9 @@ void IpcMemory::allocateIpcMemory()
 
     const auto tpRank = mWorldConfig.getTensorParallelRank();
     const auto ppRank = mWorldConfig.getPipelineParallelRank();
-    mpi::MpiComm comm;
-    mpi::comm_split(MPI_COMM_WORLD, ppRank, tpRank, &comm);
+    auto const comm = COMM_SESSION.split(ppRank, tpRank);
     std::vector<char> serialHandles(CUDA_IPC_HANDLE_SIZE * mWorldConfig.getTensorParallelism(), 0);
-    mpi::allgather(&localHandle.reserved, serialHandles.data(), CUDA_IPC_HANDLE_SIZE, mpi::MPI_TYPE_BYTE, comm);
+    comm.allgather(&localHandle.reserved, serialHandles.data(), CUDA_IPC_HANDLE_SIZE, mpi::MpiType::kBYTE);
 
     std::vector<cudaIpcMemHandle_t> handles(mWorldConfig.getTensorParallelism());
     for (size_t i = 0; i < handles.size(); ++i)

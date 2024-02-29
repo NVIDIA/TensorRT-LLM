@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -165,12 +165,16 @@ void testTransposeBatch4dPaged(bool multiQueryMode, bool int8KVCache, bool fp8KV
     constexpr int32_t maxSeqLen{2 * seqLen};
     constexpr int32_t dimsPerHead{256};
     constexpr int32_t blockSizeBytes = tokensPerBlock * dimsPerHead * sizeof(T_DST);
+    constexpr int32_t maxAttentionWindow = maxSeqLen;
+    constexpr int32_t sinkTokenLen{0};
+    constexpr int32_t onlyKorV{false};
 
     TLLM_CHECK_WITH_INFO(batchSize <= maxSeq, "Batch size is larger than max number of allowed sequence");
     TLLM_CHECK_WITH_INFO(headsNum * seqLen <= maxBlocksPerSeq * tokensPerBlock,
         "Total amount of tokens is less than max amount of tokens is cache per sequence");
 
-    KVBlockArray blockArray(maxSeq, maxBlocksPerSeq, tokensPerBlock, dimsPerHead * headsNum * sizeof(T_DST));
+    KVBlockArray blockArray(maxSeq, maxBlocksPerSeq, tokensPerBlock, dimsPerHead * headsNum * sizeof(T_DST),
+        maxAttentionWindow, sinkTokenLen, onlyKorV);
 
     // Allocate for pointer array
     const auto pointerArrayElts = maxSeq * maxBlocksPerSeq;
@@ -276,8 +280,12 @@ void testTransposeBatch4dContiguous(bool multiQueryMode, bool int8KVCache, bool 
     constexpr int32_t seqLen{16};
     constexpr int32_t maxSeqLen{2 * seqLen};
     constexpr int32_t dimsPerHead{256};
+    constexpr int32_t maxAttentionWindow = maxSeqLen;
+    constexpr int32_t sinkTokenLen{0};
+    constexpr int32_t onlyKorV{false};
 
-    KVLinearBuffer kvLinearBuffer(batchSize, 1, maxSeqLen, dimsPerHead * headsNum * sizeof(T_DST));
+    KVLinearBuffer kvLinearBuffer(
+        batchSize, 1, maxSeqLen, dimsPerHead * headsNum * sizeof(T_DST), maxAttentionWindow, sinkTokenLen, onlyKorV);
 
     // Allocate for kv cache pool
     const auto kvPoolElts = 2 * batchSize * maxSeqLen * dimsPerHead * headsNum;

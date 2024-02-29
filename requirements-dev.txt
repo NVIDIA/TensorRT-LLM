@@ -6,10 +6,11 @@ graphviz
 mypy
 parameterized
 pre-commit
+pybind11
 pybind11-stubgen
-pynvml>=11.5.0
 pytest-cov
 pytest-forked
 pytest-xdist
 rouge_score
 typing-extensions==4.8.0
+bandit==1.7.7

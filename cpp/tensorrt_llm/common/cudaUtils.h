@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,7 +28,15 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#ifndef _WIN32 // Linux
+#include <sys/sysinfo.h>
+#endif         // not WIN32
 #include <vector>
+#ifdef _WIN32  // Windows
+#include <windows.h>
+#undef ERROR   // A Windows header file defines ERROR as 0, but it's used in our logger.h enum. Logging breaks without
+               // this undef.
+#endif         // WIN32
 
 namespace tensorrt_llm::common
 {
@@ -271,11 +279,36 @@ inline int getDeviceCount()
 
 /// Get the memory info
 /// \return The free and total amount of memory in bytes
-inline std::tuple<size_t, size_t> getDeviceMemoryInfo()
+inline std::tuple<size_t, size_t> getDeviceMemoryInfo(const bool useUvm)
 {
-    size_t free, total;
-    check_cuda_error(cudaMemGetInfo(&free, &total));
-    return {free, total};
+    if (useUvm)
+    {
+        size_t freeSysmem, totalSysmem;
+#ifndef _WIN32 // Linux
+        struct sysinfo info;
+        sysinfo(&info);
+        totalSysmem = info.totalram * info.mem_unit;
+        freeSysmem = info.freeram * info.mem_unit;
+#else  // Windows
+        MEMORYSTATUSEX memInfo;
+        memInfo.dwLength = sizeof(memInfo);
+        GlobalMemoryStatusEx(&memInfo);
+        totalSysmem = memInfo.ullTotalPhys;
+        freeSysmem = memInfo.ullAvailPhys;
+#endif // WIN32
+
+        TLLM_LOG_INFO("Using UVM based system memory for KV cache, total memory %0.2f GB, available memory %0.2f GB",
+            ((double) totalSysmem / 1e9), ((double) freeSysmem / 1e9));
+        return {freeSysmem, totalSysmem};
+    }
+    else
+    {
+        size_t free, total;
+        check_cuda_error(cudaMemGetInfo(&free, &total));
+        TLLM_LOG_DEBUG("Using GPU memory for KV cache, total memory %0.2f GB, available memory %0.2f GB",
+            ((double) total / 1e9), ((double) free / 1e9));
+        return {free, total};
+    }
 }
 
 inline int getMultiProcessorCount()
@@ -303,6 +336,11 @@ inline size_t divUp(const T1& a, const T2& n)
     size_t tmp_a = static_cast<size_t>(a);
     size_t tmp_n = static_cast<size_t>(n);
     return (tmp_a + tmp_n - 1) / tmp_n;
+}
+
+inline int roundUp(int a, int n)
+{
+    return divUp(a, n) * n;
 }
 
 template <typename T, typename U, typename = std::enable_if_t<std::is_integral<T>::value>,

@@ -1,0 +1,2 @@
+# Please do not modify the configuration, otherwise it will affect the release.
+skips: ['B311', 'B112', 'B101', 'B303', 'B110', 'B604', 'B602', 'B603']
