@@ -46,15 +46,19 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../../architecture.html">TensorRT-LLM Architecture</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../gpt_runtime.html">C++ GPT Runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../batch_manager.html">The Batch Manager in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../inference_request.html">Inference Request</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../gpt_attention.html">Multi-head, Multi-query and Group-query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../precision.html">Numerical Precision</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../installation.html">TensorRT-LLM Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../build_from_source.html">Build from Source</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../performance.html">Performance of TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../2023-05-19-how-to-debug.html">How to debug</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../2023-05-17-how-to-add-a-new-model.html">How to add a new model</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../memory.html">Memory Usage of TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../new_workflow.html">New Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../perf_best_practices.html">Best Practices for Tuning the Performance of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../performance_analysis.html">Performance Analysis of TensorRT-LLM</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Python API</span></p>
 <ul>
@@ -74,6 +78,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
 </ul>
 
         </div>
@@ -101,7 +106,7 @@
            <div itemprop="articleBody">
              
   <h1>Source code for tensorrt_llm.models.enc_dec.model</h1><div class="highlight"><pre>
-<span></span><span class="c1"># SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION &amp; AFFILIATES. All rights reserved.</span>
+<span></span><span class="c1"># SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION &amp; AFFILIATES. All rights reserved.</span>
 <span class="c1"># SPDX-License-Identifier: Apache-2.0</span>
 <span class="c1">#</span>
 <span class="c1"># Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);</span>
@@ -131,11 +136,12 @@
                                  <span class="n">AttentionParams</span><span class="p">,</span> <span class="n">BertAttention</span><span class="p">,</span> <span class="n">ColumnLinear</span><span class="p">,</span>
                                  <span class="n">Conv1d</span><span class="p">,</span> <span class="n">Embedding</span><span class="p">,</span> <span class="n">FusedGatedMLP</span><span class="p">,</span> <span class="n">GatedMLP</span><span class="p">,</span>
                                  <span class="n">GroupNorm</span><span class="p">,</span> <span class="n">KeyValueCacheParams</span><span class="p">,</span> <span class="n">LayerNorm</span><span class="p">,</span>
-                                 <span class="n">RmsNorm</span><span class="p">)</span>
+                                 <span class="n">PromptTuningEmbedding</span><span class="p">,</span> <span class="n">RmsNorm</span><span class="p">)</span>
 <span class="kn">from</span> <span class="nn">tensorrt_llm.mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
 <span class="kn">from</span> <span class="nn">tensorrt_llm.models.generation_mixin</span> <span class="kn">import</span> <span class="n">GenerationMixin</span>
 <span class="kn">from</span> <span class="nn">tensorrt_llm.module</span> <span class="kn">import</span> <span class="n">Module</span><span class="p">,</span> <span class="n">ModuleList</span>
 <span class="kn">from</span> <span class="nn">tensorrt_llm.parameter</span> <span class="kn">import</span> <span class="n">Parameter</span>
+<span class="kn">from</span> <span class="nn">tensorrt_llm.plugin.plugin</span> <span class="kn">import</span> <span class="n">current_all_reduce_helper</span>
 
 <span class="n">layernorm_map</span> <span class="o">=</span> <span class="p">{</span>
     <span class="n">LayerNormType</span><span class="o">.</span><span class="n">LayerNorm</span><span class="p">:</span> <span class="n">LayerNorm</span><span class="p">,</span>
@@ -163,6 +169,7 @@
                  <span class="n">layernorm_eps</span><span class="o">=</span><span class="mf">1e-5</span><span class="p">,</span>
                  <span class="n">layernorm_type</span><span class="o">=</span><span class="n">LayerNormType</span><span class="o">.</span><span class="n">LayerNorm</span><span class="p">,</span>
                  <span class="n">dtype</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                 <span class="n">use_prompt_tuning</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                  <span class="n">use_parallel_embedding</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                  <span class="n">embedding_sharding_dim</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
                  <span class="n">mapping</span><span class="o">=</span><span class="n">Mapping</span><span class="p">()):</span>
@@ -170,8 +177,10 @@
 
         <span class="bp">self</span><span class="o">.</span><span class="n">layernorm_type</span> <span class="o">=</span> <span class="n">layernorm_type</span>
         <span class="n">ln_type</span> <span class="o">=</span> <span class="n">layernorm_map</span><span class="p">[</span><span class="n">layernorm_type</span><span class="p">]</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">use_prompt_tuning</span> <span class="o">=</span> <span class="n">use_prompt_tuning</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">vocab_embedding</span> <span class="o">=</span> <span class="n">Embedding</span><span class="p">(</span>
+        <span class="n">EmbeddingCls</span> <span class="o">=</span> <span class="n">PromptTuningEmbedding</span> <span class="k">if</span> <span class="n">use_prompt_tuning</span> <span class="k">else</span> <span class="n">Embedding</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">vocab_embedding</span> <span class="o">=</span> <span class="n">EmbeddingCls</span><span class="p">(</span>
             <span class="n">vocab_size</span><span class="p">,</span>
             <span class="n">hidden_size</span><span class="p">,</span>
             <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
@@ -218,12 +227,23 @@
         <span class="c1"># Note: embedding offset in BART is not considered as a standard. For the specific case,</span>
         <span class="c1"># we just need to shrink its position embedding table by [offset:] during weight loading</span>
 
-    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">,</span> <span class="n">position_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">token_type_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                <span class="n">input_ids</span><span class="p">,</span>
+                <span class="n">position_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">token_type_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">prompt_embedding_table</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">prompt_tasks</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">prompt_vocab_size</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
         <span class="c1"># position_ids and token_type_ids are provided inputs</span>
         <span class="c1"># and should not be formulated determinisitically</span>
 
-        <span class="n">x</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">vocab_embedding</span><span class="p">(</span><span class="n">input_ids</span><span class="p">)</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">embedding_scale</span>
-
+        <span class="n">ptuning_args</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_prompt_tuning</span><span class="p">:</span>
+            <span class="n">ptuning_args</span> <span class="o">=</span> <span class="p">[</span>
+                <span class="n">prompt_embedding_table</span><span class="p">,</span> <span class="n">prompt_tasks</span><span class="p">,</span> <span class="n">prompt_vocab_size</span>
+            <span class="p">]</span>
+        <span class="n">x</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">vocab_embedding</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="o">*</span>
+                                 <span class="n">ptuning_args</span><span class="p">)</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">embedding_scale</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">register_network_output</span><span class="p">(</span><span class="s1">&#39;word_embeddings&#39;</span><span class="p">,</span> <span class="n">x</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">position_embedding</span><span class="p">:</span>
@@ -271,9 +291,7 @@
         <span class="c1"># e.g. BART post, T5 pre</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">layernorm_position</span> <span class="o">=</span> <span class="n">layernorm_position</span>
 
-        <span class="c1"># Note: q_scaling convention in TRT-LLM plugin is 1.f / (q_scaling * sqrt(head_size))</span>
-        <span class="c1"># if don&#39;t want q_scaling, use 1/sqrt(head_size) to cancel</span>
-        <span class="c1"># e.g. BART false, T5 false</span>
+        <span class="c1"># e.g. BART q_scaling = 1.f, T5 q_scaling = 1.f/sqrt(head_size)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">attention</span> <span class="o">=</span> <span class="n">BertAttention</span><span class="p">(</span>
             <span class="n">hidden_size</span><span class="p">,</span>
             <span class="n">num_attention_heads</span><span class="p">,</span>
@@ -317,7 +335,6 @@
                 <span class="n">hidden_states</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
                 <span class="n">attention_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">input_lengths</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">all_reduce_workspace</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">max_input_length</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
         <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">)</span>
 
@@ -330,7 +347,6 @@
         <span class="n">attention_output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span>
                                           <span class="n">attention_mask</span><span class="o">=</span><span class="n">attention_mask</span><span class="p">,</span>
                                           <span class="n">input_lengths</span><span class="o">=</span><span class="n">input_lengths</span><span class="p">,</span>
-                                          <span class="n">workspace</span><span class="o">=</span><span class="n">all_reduce_workspace</span><span class="p">,</span>
                                           <span class="n">max_input_length</span><span class="o">=</span><span class="n">max_input_length</span><span class="p">)</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">register_network_output</span><span class="p">(</span><span class="s1">&#39;attention_output&#39;</span><span class="p">,</span> <span class="n">attention_output</span><span class="p">)</span>
@@ -346,7 +362,7 @@
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">layernorm_position</span> <span class="o">==</span> <span class="n">LayerNormPositionType</span><span class="o">.</span><span class="n">pre_layernorm</span><span class="p">:</span>
             <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mlp_layernorm</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
 
-        <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="n">workspace</span><span class="o">=</span><span class="n">all_reduce_workspace</span><span class="p">)</span>
+        <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">register_network_output</span><span class="p">(</span><span class="s1">&#39;mlp_output&#39;</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">)</span>
 
@@ -390,9 +406,7 @@
         <span class="c1"># e.g. BART post, T5 pre</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">layernorm_position</span> <span class="o">=</span> <span class="n">layernorm_position</span>
 
-        <span class="c1"># Note: q_scaling convention in TRT-LLM plugin is 1.f / (q_scaling * sqrt(head_size))</span>
-        <span class="c1"># if don&#39;t want q_scaling, use 1/sqrt(head_size) to cancel</span>
-        <span class="c1"># e.g. BART false, T5 false</span>
+        <span class="c1"># e.g. BART q_scaling = 1.f, T5 q_scaling = 1.f/sqrt(head_size)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">self_attention</span> <span class="o">=</span> <span class="n">Attention</span><span class="p">(</span>
             <span class="n">hidden_size</span><span class="p">,</span>
             <span class="n">num_attention_heads</span><span class="p">,</span>
@@ -417,11 +431,13 @@
                                                 <span class="n">eps</span><span class="o">=</span><span class="n">layernorm_eps</span><span class="p">,</span>
                                                 <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
 
-        <span class="c1"># self attn uses MMHA, mask is always causal triangular</span>
+        <span class="c1"># Note: self attn uses MMHA, mask is always causal triangular</span>
         <span class="c1"># cross attn has two scenarios:</span>
         <span class="c1"># - in context phase, all ones mask, same as padding type</span>
         <span class="c1"># - in generation phase, same causal triangular mask as MMHA</span>
         <span class="c1"># - context phase special handling is done in plugin by resetting mask type</span>
+        <span class="c1">#</span>
+        <span class="c1"># e.g. BART q_scaling = 1.f, T5 q_scaling = 1.f/sqrt(head_size)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">cross_attention</span> <span class="o">=</span> <span class="n">Attention</span><span class="p">(</span>
             <span class="n">hidden_size</span><span class="p">,</span>
             <span class="n">num_attention_heads</span><span class="p">,</span>
@@ -469,10 +485,10 @@
                 <span class="n">hidden_states</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
                 <span class="n">encoder_output</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                 <span class="n">attention_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">cross_attention_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">use_cache</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                 <span class="n">kv_cache_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">attention_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">all_reduce_workspace</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+                <span class="n">attention_params</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
         <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="n">encoder_output</span><span class="p">:</span>
@@ -489,8 +505,7 @@
             <span class="n">attention_mask</span><span class="o">=</span><span class="n">attention_mask</span><span class="p">,</span>
             <span class="n">use_cache</span><span class="o">=</span><span class="n">use_cache</span><span class="p">,</span>
             <span class="n">kv_cache_params</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="p">,</span>
-            <span class="n">attention_params</span><span class="o">=</span><span class="n">attention_params</span><span class="p">,</span>
-            <span class="n">workspace</span><span class="o">=</span><span class="n">all_reduce_workspace</span><span class="p">)</span>
+            <span class="n">attention_params</span><span class="o">=</span><span class="n">attention_params</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
             <span class="n">attention_output</span><span class="p">,</span> <span class="n">presents_self</span> <span class="o">=</span> <span class="n">attention_output</span>
@@ -510,12 +525,11 @@
 
         <span class="n">attention_output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">cross_attention</span><span class="p">(</span>
             <span class="n">hidden_states</span><span class="o">=</span><span class="n">hidden_states</span><span class="p">,</span>
-            <span class="n">attention_mask</span><span class="o">=</span><span class="n">attention_mask</span><span class="p">,</span>
+            <span class="n">attention_mask</span><span class="o">=</span><span class="n">cross_attention_mask</span><span class="p">,</span>
             <span class="n">encoder_output</span><span class="o">=</span><span class="n">encoder_output</span><span class="p">,</span>
             <span class="n">use_cache</span><span class="o">=</span><span class="n">use_cache</span><span class="p">,</span>
             <span class="n">kv_cache_params</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="p">,</span>
-            <span class="n">attention_params</span><span class="o">=</span><span class="n">attention_params</span><span class="p">,</span>
-            <span class="n">workspace</span><span class="o">=</span><span class="n">all_reduce_workspace</span><span class="p">)</span>
+            <span class="n">attention_params</span><span class="o">=</span><span class="n">attention_params</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
             <span class="n">attention_output</span><span class="p">,</span> <span class="n">presents_cross</span> <span class="o">=</span> <span class="n">attention_output</span>
@@ -533,7 +547,7 @@
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">layernorm_position</span> <span class="o">==</span> <span class="n">LayerNormPositionType</span><span class="o">.</span><span class="n">pre_layernorm</span><span class="p">:</span>
             <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mlp_layernorm</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
 
-        <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="n">workspace</span><span class="o">=</span><span class="n">all_reduce_workspace</span><span class="p">)</span>
+        <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">register_network_output</span><span class="p">(</span><span class="s1">&#39;mlp_output&#39;</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">)</span>
 
         <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">residual</span> <span class="o">+</span> <span class="n">hidden_states</span>
@@ -577,6 +591,7 @@
                  <span class="n">hidden_act</span><span class="o">=</span><span class="s2">&quot;relu&quot;</span><span class="p">,</span>
                  <span class="n">mlp_type</span><span class="o">=</span><span class="n">MLPType</span><span class="o">.</span><span class="n">MLP</span><span class="p">,</span>
                  <span class="n">residual_scaling</span><span class="o">=</span><span class="mf">1.0</span><span class="p">,</span>
+                 <span class="n">use_prompt_tuning</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                  <span class="n">use_parallel_embedding</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                  <span class="n">embedding_sharding_dim</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
                  <span class="n">mapping</span><span class="o">=</span><span class="n">Mapping</span><span class="p">()):</span>
@@ -625,6 +640,7 @@
                 <span class="n">layernorm_eps</span><span class="o">=</span><span class="n">layernorm_eps</span><span class="p">,</span>
                 <span class="n">layernorm_type</span><span class="o">=</span><span class="n">layernorm_type</span><span class="p">,</span>
                 <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+                <span class="n">use_prompt_tuning</span><span class="o">=</span><span class="n">use_prompt_tuning</span><span class="p">,</span>
                 <span class="n">use_parallel_embedding</span><span class="o">=</span><span class="n">use_parallel_embedding</span><span class="p">,</span>
                 <span class="n">embedding_sharding_dim</span><span class="o">=</span><span class="n">embedding_sharding_dim</span><span class="p">,</span>
                 <span class="n">mapping</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="p">)</span>
@@ -667,24 +683,28 @@
                 <span class="n">position_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">token_type_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">hidden_states</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">all_reduce_workspace</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">max_input_length</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+                <span class="n">max_input_length</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">prompt_embedding_table</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">prompt_tasks</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">prompt_vocab_size</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">attention_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
 
         <span class="c1"># In PP, layer 0 has ids as inputs, all other layers have hidden_states as inputs</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_first_pp_rank</span><span class="p">():</span>
             <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">embedding</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="n">position_ids</span><span class="p">,</span>
-                                           <span class="n">token_type_ids</span><span class="p">)</span>
+                                           <span class="n">token_type_ids</span><span class="p">,</span>
+                                           <span class="n">prompt_embedding_table</span><span class="p">,</span> <span class="n">prompt_tasks</span><span class="p">,</span>
+                                           <span class="n">prompt_vocab_size</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">register_network_output</span><span class="p">(</span><span class="s1">&#39;embedding_layer_output&#39;</span><span class="p">,</span>
                                          <span class="n">hidden_states</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">recv</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">prev_pp_rank</span><span class="p">())</span>
 
         <span class="k">for</span> <span class="n">encoder_layer</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_layers</span><span class="p">:</span>
-            <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">encoder_layer</span><span class="p">(</span>
-                <span class="n">hidden_states</span><span class="o">=</span><span class="n">hidden_states</span><span class="p">,</span>
-                <span class="n">input_lengths</span><span class="o">=</span><span class="n">input_lengths</span><span class="p">,</span>
-                <span class="n">all_reduce_workspace</span><span class="o">=</span><span class="n">all_reduce_workspace</span><span class="p">,</span>
-                <span class="n">max_input_length</span><span class="o">=</span><span class="n">max_input_length</span><span class="p">)</span>
+            <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">encoder_layer</span><span class="p">(</span><span class="n">hidden_states</span><span class="o">=</span><span class="n">hidden_states</span><span class="p">,</span>
+                                          <span class="n">attention_mask</span><span class="o">=</span><span class="n">attention_mask</span><span class="p">,</span>
+                                          <span class="n">input_lengths</span><span class="o">=</span><span class="n">input_lengths</span><span class="p">,</span>
+                                          <span class="n">max_input_length</span><span class="o">=</span><span class="n">max_input_length</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_last_pp_rank</span><span class="p">():</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">has_model_final_layernorm</span><span class="p">:</span>
@@ -699,7 +719,10 @@
 
 <div class="viewcode-block" id="EncoderModel.prepare_inputs">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.EncoderModel.prepare_inputs">[docs]</a>
-    <span class="k">def</span> <span class="nf">prepare_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">max_batch_size</span><span class="p">,</span> <span class="n">max_input_len</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">prepare_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                       <span class="n">max_batch_size</span><span class="p">,</span>
+                       <span class="n">max_input_len</span><span class="p">,</span>
+                       <span class="n">prompt_embedding_table_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&#39;&#39;&#39;@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the</span>
 <span class="sd">            ranges of the dimensions of when using TRT dynamic shapes.</span>
 
@@ -721,39 +744,36 @@
         <span class="n">use_custom_all_reduce</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">(</span>
         <span class="p">)</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">use_custom_all_reduce</span>
 
+        <span class="n">attention_mask</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="k">if</span> <span class="n">remove_input_padding</span><span class="p">:</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_first_pp_rank</span><span class="p">():</span>
                 <span class="n">input_ids</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
                     <span class="n">name</span><span class="o">=</span><span class="s2">&quot;input_ids&quot;</span><span class="p">,</span>
                     <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
-                    <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">],</span>
-                    <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;batch_size_fake&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">1</span><span class="p">]),</span>
-                                           <span class="p">(</span><span class="s2">&quot;num_tokens&quot;</span><span class="p">,</span> <span class="p">[</span><span class="n">num_tokens_range</span><span class="p">])]),</span>
+                    <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                    <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s2">&quot;num_tokens&quot;</span><span class="p">,</span> <span class="p">[</span><span class="n">num_tokens_range</span><span class="p">])]),</span>
                 <span class="p">)</span>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">has_position_embedding</span><span class="p">:</span>
                     <span class="n">position_ids</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
                         <span class="n">name</span><span class="o">=</span><span class="s1">&#39;position_ids&#39;</span><span class="p">,</span>
                         <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
-                        <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">],</span>
-                        <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;batch_size_fake&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">1</span><span class="p">]),</span>
-                                               <span class="p">(</span><span class="s1">&#39;num_tokens&#39;</span><span class="p">,</span>
+                        <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                        <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;num_tokens&#39;</span><span class="p">,</span>
                                                 <span class="p">[</span><span class="n">num_tokens_range</span><span class="p">])]),</span>
                     <span class="p">)</span>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">has_token_type_embedding</span><span class="p">:</span>
                     <span class="n">token_type_ids</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
                         <span class="n">name</span><span class="o">=</span><span class="s1">&#39;token_type_ids&#39;</span><span class="p">,</span>
                         <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
-                        <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">],</span>
-                        <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;batch_size_fake&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">1</span><span class="p">]),</span>
-                                               <span class="p">(</span><span class="s1">&#39;num_tokens&#39;</span><span class="p">,</span>
+                        <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                        <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;num_tokens&#39;</span><span class="p">,</span>
                                                 <span class="p">[</span><span class="n">num_tokens_range</span><span class="p">])]),</span>
                     <span class="p">)</span>
             <span class="k">else</span><span class="p">:</span>
                 <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;hidden_states_input&#39;</span><span class="p">,</span>
                                        <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_dtype</span><span class="p">,</span>
-                                       <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">hidden_size</span><span class="p">],</span>
+                                       <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">hidden_size</span><span class="p">],</span>
                                        <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
-                                           <span class="p">(</span><span class="s1">&#39;batch_size_fake&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">1</span><span class="p">]),</span>
                                            <span class="p">(</span><span class="s1">&#39;num_tokens&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">num_tokens_range</span><span class="p">]),</span>
                                            <span class="p">(</span><span class="s1">&#39;hidden_size&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">hidden_size</span><span class="p">]),</span>
                                        <span class="p">]))</span>
@@ -792,17 +812,20 @@
                                            <span class="p">(</span><span class="s1">&#39;hidden_size&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">hidden_size</span><span class="p">]),</span>
                                        <span class="p">]))</span>
 
-        <span class="n">all_reduce_workspace</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">bert_attention_plugin</span><span class="p">:</span>
+                <span class="n">attention_mask</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
+                    <span class="n">name</span><span class="o">=</span><span class="s1">&#39;attention_mask&#39;</span><span class="p">,</span>
+                    <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                    <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                    <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
+                        <span class="p">(</span><span class="s1">&#39;batch_size&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">bs_range</span><span class="p">]),</span>
+                        <span class="p">(</span><span class="s1">&#39;input_len&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">inlen_range</span><span class="p">]),</span>
+                    <span class="p">]),</span>
+                <span class="p">)</span>
+
         <span class="k">if</span> <span class="n">use_custom_all_reduce</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
-            <span class="c1"># 3 (= buffer + signals_in + signals_out)</span>
-            <span class="n">workspace_size</span> <span class="o">=</span> <span class="mi">3</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span>
-            <span class="n">all_reduce_workspace</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;all_reduce_workspace&#39;</span><span class="p">,</span>
-                                          <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int64</span><span class="p">,</span>
-                                          <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="n">workspace_size</span><span class="p">],</span>
-                                          <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
-                                              <span class="p">(</span><span class="s1">&#39;all_reduce_size&#39;</span><span class="p">,</span>
-                                               <span class="p">[</span><span class="n">workspace_size</span><span class="p">])</span>
-                                          <span class="p">]))</span>
+            <span class="n">current_all_reduce_helper</span><span class="p">()</span><span class="o">.</span><span class="n">set_workspace_tensor</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
 
         <span class="n">input_lengths</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
             <span class="n">name</span><span class="o">=</span><span class="s2">&quot;input_lengths&quot;</span><span class="p">,</span>
@@ -817,8 +840,45 @@
             <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s2">&quot;max_input_length&quot;</span><span class="p">,</span> <span class="p">[</span><span class="n">inlen_range</span><span class="p">])]),</span>
         <span class="p">)</span>
 
+        <span class="n">prompt_embedding_table</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">tasks</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">prompt_vocab_size</span> <span class="o">=</span> <span class="kc">None</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_first_pp_rank</span><span class="p">()</span> <span class="ow">and</span> <span class="n">prompt_embedding_table_size</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="n">p_embedding_range</span> <span class="o">=</span> <span class="p">[[</span>
+                <span class="mi">1</span><span class="p">,</span> <span class="n">prompt_embedding_table_size</span> <span class="o">//</span> <span class="mi">2</span><span class="p">,</span> <span class="n">prompt_embedding_table_size</span>
+            <span class="p">]]</span>
+
+            <span class="n">prompt_embedding_table</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;prompt_embedding_table&#39;</span><span class="p">,</span>
+                                            <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_dtype</span><span class="p">,</span>
+                                            <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">hidden_size</span><span class="p">],</span>
+                                            <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
+                                                <span class="p">(</span><span class="s1">&#39;prompt_embedding_table_size&#39;</span><span class="p">,</span>
+                                                 <span class="n">p_embedding_range</span><span class="p">),</span>
+                                                <span class="p">(</span><span class="s1">&#39;hidden_size&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">hidden_size</span><span class="p">]),</span>
+                                            <span class="p">]))</span>
+            <span class="k">if</span> <span class="n">remove_input_padding</span><span class="p">:</span>
+                <span class="n">tasks</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;tasks&#39;</span><span class="p">,</span>
+                               <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                               <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                               <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;input_len_task&#39;</span><span class="p">,</span>
+                                                       <span class="p">[</span><span class="n">num_tokens_range</span><span class="p">])]))</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">tasks</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;tasks&#39;</span><span class="p">,</span>
+                               <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                               <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">],</span>
+                               <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
+                                   <span class="p">(</span><span class="s1">&#39;batch_size_beam_width&#39;</span><span class="p">,</span> <span class="n">bs_range</span><span class="p">),</span>
+                                   <span class="p">(</span><span class="s1">&#39;broadcast_dim&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">1</span><span class="p">]),</span>
+                               <span class="p">]))</span>
+            <span class="n">prompt_vocab_size</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;prompt_vocab_size&#39;</span><span class="p">,</span>
+                                       <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                                       <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span>
+                                       <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;size&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">1</span><span class="p">])]))</span>
+
         <span class="k">return</span> <span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="n">input_lengths</span><span class="p">,</span> <span class="n">position_ids</span><span class="p">,</span> <span class="n">token_type_ids</span><span class="p">,</span>
-                <span class="n">hidden_states</span><span class="p">,</span> <span class="n">all_reduce_workspace</span><span class="p">,</span> <span class="n">max_input_length</span><span class="p">)</span></div>
+                <span class="n">hidden_states</span><span class="p">,</span> <span class="n">max_input_length</span><span class="p">,</span> <span class="n">prompt_embedding_table</span><span class="p">,</span> <span class="n">tasks</span><span class="p">,</span>
+                <span class="n">prompt_vocab_size</span><span class="p">,</span> <span class="n">attention_mask</span><span class="p">)</span></div>
 </div>
 
 
@@ -983,18 +1043,15 @@
                 <span class="n">token_type_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">use_cache</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                 <span class="n">attention_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">cross_attention_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">last_token_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">kv_cache_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">attention_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">hidden_states</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">all_reduce_workspace</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+                <span class="n">hidden_states</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_first_pp_rank</span><span class="p">():</span>
             <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">decoder_input_ids</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">)</span>
-
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_last_pp_rank</span><span class="p">():</span>
-            <span class="k">assert</span> <span class="n">last_token_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;Expecting last token ids to be not None&quot;</span>
 
         <span class="c1"># In PP, layer 0 has ids as inputs, all other layers have hidden_states as inputs</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_first_pp_rank</span><span class="p">():</span>
@@ -1017,15 +1074,17 @@
                 <span class="n">hidden_states</span><span class="p">,</span>
                 <span class="n">encoder_output</span><span class="o">=</span><span class="n">encoder_output</span><span class="p">,</span>
                 <span class="n">attention_mask</span><span class="o">=</span><span class="n">attention_mask</span><span class="p">,</span>
+                <span class="n">cross_attention_mask</span><span class="o">=</span><span class="n">cross_attention_mask</span><span class="p">,</span>
                 <span class="n">use_cache</span><span class="o">=</span><span class="n">use_cache</span><span class="p">,</span>
                 <span class="n">kv_cache_params</span><span class="o">=</span><span class="n">KeyValueCacheParams</span><span class="p">(</span>
                     <span class="n">past_key_value</span><span class="o">=</span><span class="n">past</span><span class="p">,</span>
                     <span class="n">host_past_key_value_lengths</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
                     <span class="n">host_past_key_value_lengths</span><span class="p">,</span>
                     <span class="n">host_max_attention_window_sizes</span><span class="o">=</span><span class="n">max_attention_window_size</span><span class="p">,</span>
+                    <span class="n">host_sink_token_length</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
+                    <span class="n">host_sink_token_length</span><span class="p">,</span>
                     <span class="n">cache_indirection</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span><span class="n">cache_indirection</span><span class="p">),</span>
-                <span class="n">attention_params</span><span class="o">=</span><span class="n">attention_params</span><span class="p">,</span>
-                <span class="n">all_reduce_workspace</span><span class="o">=</span><span class="n">all_reduce_workspace</span><span class="p">)</span>
+                <span class="n">attention_params</span><span class="o">=</span><span class="n">attention_params</span><span class="p">)</span>
 
             <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
                 <span class="n">presents_self</span><span class="p">,</span> <span class="n">presents_cross</span> <span class="o">=</span> <span class="n">hidden_states</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="n">hidden_states</span><span class="p">[</span>
@@ -1039,12 +1098,11 @@
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">has_model_final_layernorm</span><span class="p">:</span>
                 <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">final_layernorm</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
 
-            <span class="c1"># [bs, seq, hidden_size] or [1, num_tokens, hidden_size] -&gt; [bs, hidden_size]</span>
+            <span class="c1"># [bs, seq, hidden_size] or [num_tokens, hidden_size] -&gt; [bs, hidden_size]</span>
             <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">gather_last_token_logits</span><span class="p">(</span>
                 <span class="n">hidden_states</span><span class="p">,</span> <span class="n">last_token_ids</span><span class="p">,</span>
                 <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">remove_input_padding</span><span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">register_network_output</span><span class="p">(</span><span class="s1">&#39;decoder_gather_last_logits&#39;</span><span class="p">,</span>
-                                         <span class="n">hidden_states</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">register_network_output</span><span class="p">(</span><span class="s1">&#39;logits_before_lmhead&#39;</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">)</span>
 
             <span class="c1"># Rescale output before projecting on vocab (for T5)</span>
             <span class="c1"># See https://github.com/huggingface/transformers/blob/0b192de1f353b0e04dad4813e02e2c672de077be/src/transformers/models/t5/modeling_t5.py#L1769-L1772</span>
@@ -1065,8 +1123,9 @@
             <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">present</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">pp_layers</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">total_num_layers</span><span class="p">),</span>
                                   <span class="n">presents</span><span class="p">):</span>
                 <span class="n">present</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">mark_output</span><span class="p">(</span><span class="sa">f</span><span class="s1">&#39;present_key_value_</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_kv_dtype</span><span class="p">)</span>
-                <span class="n">present</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">mark_output</span><span class="p">(</span><span class="sa">f</span><span class="s1">&#39;cross_present_key_value_</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">,</span>
-                                       <span class="bp">self</span><span class="o">.</span><span class="n">_kv_dtype</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gpt_attention_plugin</span><span class="p">:</span>
+                    <span class="n">present</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">mark_output</span><span class="p">(</span><span class="sa">f</span><span class="s1">&#39;cross_present_key_value_</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">,</span>
+                                           <span class="bp">self</span><span class="o">.</span><span class="n">_kv_dtype</span><span class="p">)</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_last_pp_rank</span><span class="p">():</span>
                 <span class="k">return</span> <span class="p">(</span><span class="n">lm_logits</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">presents</span><span class="p">))</span>
             <span class="k">return</span> <span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">presents</span><span class="p">))</span>
@@ -1085,6 +1144,8 @@
         <span class="n">max_decoder_input_len</span><span class="p">,</span>
         <span class="n">max_new_tokens</span><span class="p">,</span>
         <span class="n">max_encoder_input_len</span><span class="p">,</span>
+        <span class="n">gather_context_logits</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+        <span class="n">gather_generation_logits</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
     <span class="p">):</span>
 <span class="w">        </span><span class="sd">&#39;&#39;&#39;@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the</span>
 <span class="sd">            ranges of the dimensions of when using TRT dynamic shapes.</span>
@@ -1139,6 +1200,7 @@
         <span class="n">sequence_length</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="n">host_past_key_value_lengths</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="n">attention_mask</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">cross_attention_mask</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="n">use_gpt_attention_plugin</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">(</span>
         <span class="p">)</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gpt_attention_plugin</span>
         <span class="n">remove_input_padding</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">remove_input_padding</span>
@@ -1150,18 +1212,16 @@
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_first_pp_rank</span><span class="p">():</span>
                 <span class="n">input_ids</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;input_ids&#39;</span><span class="p">,</span>
                                    <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
-                                   <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                                   <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
                                    <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
-                                       <span class="p">(</span><span class="s1">&#39;batch_size_fake&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">1</span><span class="p">]),</span>
                                        <span class="p">(</span><span class="s1">&#39;decoder_num_tokens&#39;</span><span class="p">,</span>
                                         <span class="p">[</span><span class="n">decoder_num_tokens_range</span><span class="p">]),</span>
                                    <span class="p">]))</span>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">has_position_embedding</span><span class="p">:</span>
                     <span class="n">position_ids</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;position_ids&#39;</span><span class="p">,</span>
                                           <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
-                                          <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                                          <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
                                           <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
-                                              <span class="p">(</span><span class="s1">&#39;batch_size_fake&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">1</span><span class="p">]),</span>
                                               <span class="p">(</span><span class="s1">&#39;decoder_num_tokens&#39;</span><span class="p">,</span>
                                                <span class="p">[</span><span class="n">decoder_num_tokens_range</span><span class="p">]),</span>
                                           <span class="p">]))</span>
@@ -1169,17 +1229,15 @@
                     <span class="n">token_type_ids</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
                         <span class="n">name</span><span class="o">=</span><span class="s1">&#39;token_type_ids&#39;</span><span class="p">,</span>
                         <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
-                        <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">],</span>
-                        <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;batch_size_fake&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">1</span><span class="p">]),</span>
-                                               <span class="p">(</span><span class="s1">&#39;decoder_num_tokens&#39;</span><span class="p">,</span>
+                        <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                        <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;decoder_num_tokens&#39;</span><span class="p">,</span>
                                                 <span class="p">[</span><span class="n">decoder_num_tokens_range</span><span class="p">])]),</span>
                     <span class="p">)</span>
             <span class="k">else</span><span class="p">:</span>
                 <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;hidden_states_input&#39;</span><span class="p">,</span>
                                        <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_dtype</span><span class="p">,</span>
-                                       <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">],</span>
+                                       <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">],</span>
                                        <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
-                                           <span class="p">(</span><span class="s1">&#39;batch_size_fake&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">1</span><span class="p">]),</span>
                                            <span class="p">(</span><span class="s1">&#39;decoder_num_tokens&#39;</span><span class="p">,</span>
                                             <span class="p">[</span><span class="n">decoder_num_tokens_range</span><span class="p">]),</span>
                                            <span class="p">(</span><span class="s1">&#39;hidden_size&#39;</span><span class="p">,</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">]),</span>
@@ -1240,9 +1298,8 @@
             <span class="n">encoder_output</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
                 <span class="n">name</span><span class="o">=</span><span class="s2">&quot;encoder_output&quot;</span><span class="p">,</span>
                 <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_dtype</span><span class="p">,</span>
-                <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_hidden_size</span><span class="p">],</span>
+                <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_hidden_size</span><span class="p">],</span>
                 <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
-                    <span class="p">(</span><span class="s2">&quot;batch_size_fake&quot;</span><span class="p">,</span> <span class="p">[</span><span class="mi">1</span><span class="p">]),</span>
                     <span class="p">(</span><span class="s2">&quot;encoder_num_tokens&quot;</span><span class="p">,</span> <span class="p">[</span><span class="n">encoder_num_tokens_range</span><span class="p">]),</span>
                     <span class="p">(</span><span class="s2">&quot;encoder_hidden_size&quot;</span><span class="p">,</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">encoder_hidden_size</span><span class="p">]),</span>
                 <span class="p">]),</span>
@@ -1302,7 +1359,7 @@
                                         <span class="p">]))</span>
 
         <span class="n">last_token_ids</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_last_pp_rank</span><span class="p">():</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_last_pp_rank</span><span class="p">()</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">gather_context_logits</span><span class="p">:</span>
             <span class="n">last_token_ids</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
                 <span class="n">name</span><span class="o">=</span><span class="s2">&quot;last_token_ids&quot;</span><span class="p">,</span>
                 <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
@@ -1322,6 +1379,17 @@
                 <span class="p">]),</span>
             <span class="p">)</span>
 
+            <span class="n">cross_attention_mask</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
+                <span class="n">name</span><span class="o">=</span><span class="s1">&#39;cross_attention_mask&#39;</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
+                    <span class="p">(</span><span class="s1">&#39;batch_size_beam_width&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">bb_range</span><span class="p">]),</span>
+                    <span class="p">(</span><span class="s1">&#39;query_len&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">1</span><span class="p">]),</span>
+                    <span class="p">(</span><span class="s1">&#39;encoder_input_len&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">encoder_input_len_range</span><span class="p">]),</span>
+                <span class="p">]),</span>
+            <span class="p">)</span>
+
         <span class="n">cache_indirection</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
             <span class="n">name</span><span class="o">=</span><span class="s1">&#39;cache_indirection&#39;</span><span class="p">,</span>
             <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
@@ -1333,20 +1401,14 @@
             <span class="p">]),</span>
         <span class="p">)</span>
 
-        <span class="n">all_reduce_workspace</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="k">if</span> <span class="n">use_custom_all_reduce</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
-            <span class="c1"># 3 (= buffer + signals_in + signals_out)</span>
-            <span class="n">workspace_size</span> <span class="o">=</span> <span class="mi">3</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span>
-            <span class="n">all_reduce_workspace</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;all_reduce_workspace&#39;</span><span class="p">,</span>
-                                          <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int64</span><span class="p">,</span>
-                                          <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="n">workspace_size</span><span class="p">],</span>
-                                          <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
-                                              <span class="p">(</span><span class="s1">&#39;all_reduce_size&#39;</span><span class="p">,</span>
-                                               <span class="p">[</span><span class="n">workspace_size</span><span class="p">])</span>
-                                          <span class="p">]))</span>
+            <span class="n">current_all_reduce_helper</span><span class="p">()</span><span class="o">.</span><span class="n">set_workspace_tensor</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
 
         <span class="n">layers_range</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">pp_layers</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">total_num_layers</span><span class="p">)</span>
 
+        <span class="n">host_max_attention_window_sizes</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">host_sink_token_length</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="k">if</span> <span class="n">use_gpt_attention_plugin</span><span class="p">:</span>
             <span class="n">host_max_attention_window_sizes</span> <span class="o">=</span> <span class="p">[]</span>
             <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">layers_range</span><span class="p">:</span>
@@ -1357,6 +1419,11 @@
                     <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;scalar&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">1</span><span class="p">])]))</span>
                 <span class="n">host_max_attention_window_sizes</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
                     <span class="n">host_attention_window_size_tensor</span><span class="p">)</span>
+            <span class="n">host_sink_token_length</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;host_sink_token_length&#39;</span><span class="p">,</span>
+                                            <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                                            <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span>
+                                            <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;scalar&#39;</span><span class="p">,</span>
+                                                                    <span class="p">[</span><span class="mi">1</span><span class="p">])]))</span>
 
         <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">layers_range</span><span class="p">:</span>
             <span class="n">kv_dim_range</span> <span class="o">=</span> <span class="n">OrderedDict</span><span class="p">([</span>
@@ -1371,19 +1438,23 @@
                         <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="n">num_kv_heads</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">head_size</span><span class="p">],</span>
                         <span class="n">dim_range</span><span class="o">=</span><span class="n">kv_dim_range</span><span class="p">)</span>
 
-            <span class="n">cross_kv_dim_range</span> <span class="o">=</span> <span class="n">OrderedDict</span><span class="p">([</span>
-                <span class="p">(</span><span class="s1">&#39;batch_size_beam_width&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">bb_range</span><span class="p">]),</span>
-                <span class="p">(</span><span class="s1">&#39;kv&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">2</span><span class="p">]),</span>
-                <span class="p">(</span><span class="s1">&#39;cross_num_heads&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">encoder_num_kv_heads</span><span class="p">]),</span>
-                <span class="p">(</span><span class="s1">&#39;cross_past_key_len&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">encoder_input_len_range</span><span class="p">]),</span>
-                <span class="p">(</span><span class="s1">&#39;cross_head_size&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">encoder_head_size</span><span class="p">]),</span>
-            <span class="p">])</span>
-            <span class="n">cross_kv</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
-                <span class="n">name</span><span class="o">=</span><span class="sa">f</span><span class="s1">&#39;cross_past_key_value_</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">,</span>
-                <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_kv_dtype</span><span class="p">,</span>
-                <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="n">encoder_num_kv_heads</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">encoder_head_size</span><span class="p">],</span>
-                <span class="n">dim_range</span><span class="o">=</span><span class="n">cross_kv_dim_range</span><span class="p">)</span>
-            <span class="n">past_key_value</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">kv</span><span class="p">,</span> <span class="n">cross_kv</span><span class="p">))</span>
+            <span class="k">if</span> <span class="n">use_gpt_attention_plugin</span><span class="p">:</span>
+                <span class="n">cross_kv_dim_range</span> <span class="o">=</span> <span class="n">OrderedDict</span><span class="p">([</span>
+                    <span class="p">(</span><span class="s1">&#39;batch_size_beam_width&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">bb_range</span><span class="p">]),</span>
+                    <span class="p">(</span><span class="s1">&#39;kv&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">2</span><span class="p">]),</span>
+                    <span class="p">(</span><span class="s1">&#39;cross_num_heads&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">encoder_num_kv_heads</span><span class="p">]),</span>
+                    <span class="p">(</span><span class="s1">&#39;cross_past_key_len&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">encoder_input_len_range</span><span class="p">]),</span>
+                    <span class="p">(</span><span class="s1">&#39;cross_head_size&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">encoder_head_size</span><span class="p">]),</span>
+                <span class="p">])</span>
+                <span class="n">cross_kv</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
+                    <span class="n">name</span><span class="o">=</span><span class="sa">f</span><span class="s1">&#39;cross_past_key_value_</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">,</span>
+                    <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_kv_dtype</span><span class="p">,</span>
+                    <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="n">encoder_num_kv_heads</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">encoder_head_size</span><span class="p">],</span>
+                    <span class="n">dim_range</span><span class="o">=</span><span class="n">cross_kv_dim_range</span><span class="p">)</span>
+                <span class="n">past_key_value</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">kv</span><span class="p">,</span> <span class="n">cross_kv</span><span class="p">))</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="c1"># use encoder_output directly, no need to save cross_past_key_value</span>
+                <span class="n">past_key_value</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">kv</span><span class="p">,</span> <span class="p">))</span>
 
             <span class="c1"># TODO: Remove this when TRT fix the named dimension</span>
             <span class="k">if</span> <span class="ow">not</span> <span class="n">remove_input_padding</span><span class="p">:</span>
@@ -1396,6 +1467,7 @@
                 <span class="n">past_key_value</span><span class="o">=</span><span class="n">past_key_value</span><span class="p">,</span>
                 <span class="n">host_past_key_value_lengths</span><span class="o">=</span><span class="n">host_past_key_value_lengths</span><span class="p">,</span>
                 <span class="n">host_max_attention_window_sizes</span><span class="o">=</span><span class="n">host_max_attention_window_sizes</span><span class="p">,</span>
+                <span class="n">host_sink_token_length</span><span class="o">=</span><span class="n">host_sink_token_length</span><span class="p">,</span>
                 <span class="n">cache_indirection</span><span class="o">=</span><span class="n">cache_indirection</span><span class="p">)</span>
 
             <span class="n">attention_params</span> <span class="o">=</span> <span class="n">AttentionParams</span><span class="p">(</span>
@@ -1409,8 +1481,8 @@
             <span class="p">)</span>
 
         <span class="k">return</span> <span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="n">encoder_output</span><span class="p">,</span> <span class="n">position_ids</span><span class="p">,</span> <span class="n">token_type_ids</span><span class="p">,</span> <span class="kc">True</span><span class="p">,</span>
-                <span class="n">attention_mask</span><span class="p">,</span> <span class="n">last_token_ids</span><span class="p">,</span> <span class="n">kv_cache_params</span><span class="p">,</span>
-                <span class="n">attention_params</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">all_reduce_workspace</span><span class="p">)</span></div>
+                <span class="n">attention_mask</span><span class="p">,</span> <span class="n">cross_attention_mask</span><span class="p">,</span> <span class="n">last_token_ids</span><span class="p">,</span>
+                <span class="n">kv_cache_params</span><span class="p">,</span> <span class="n">attention_params</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">)</span></div>
 </div>
 
 
@@ -1450,7 +1522,7 @@
 
 <div class="viewcode-block" id="WhisperEncoder.forward">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.WhisperEncoder.forward">[docs]</a>
-    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">input_lengths</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
 
         <span class="n">x</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">conv1</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
         <span class="n">x</span> <span class="o">=</span> <span class="n">gelu</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
@@ -1460,9 +1532,9 @@
         <span class="n">x</span> <span class="o">=</span> <span class="n">x</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">positional_embedding</span><span class="o">.</span><span class="n">value</span>
 
         <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">x</span>
-
         <span class="k">for</span> <span class="n">encoder_layer</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_layers</span><span class="p">:</span>
-            <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">encoder_layer</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+            <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">encoder_layer</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span>
+                                          <span class="n">input_lengths</span><span class="o">=</span><span class="n">input_lengths</span><span class="p">)</span>
 
         <span class="n">x</span> <span class="o">=</span> <span class="n">hidden_states</span>
         <span class="n">x</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">ln_post</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
@@ -1484,7 +1556,13 @@
                        <span class="p">(</span><span class="s2">&quot;feature_dim&quot;</span><span class="p">,</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">n_mels</span><span class="p">]),</span>
                        <span class="p">(</span><span class="s2">&quot;feature_len_range&quot;</span><span class="p">,</span> <span class="p">[</span><span class="mi">3000</span><span class="p">]),</span>
                    <span class="p">]))</span>
-        <span class="k">return</span> <span class="p">(</span><span class="n">x</span><span class="p">)</span></div>
+        <span class="n">input_lengths</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
+            <span class="n">name</span><span class="o">=</span><span class="s2">&quot;input_lengths&quot;</span><span class="p">,</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+            <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+            <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s2">&quot;batch_size&quot;</span><span class="p">,</span> <span class="p">[</span><span class="n">bs_range</span><span class="p">])]),</span>
+        <span class="p">)</span>
+        <span class="k">return</span> <span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">input_lengths</span><span class="p">)</span></div>
 </div>
 
 </pre></div>

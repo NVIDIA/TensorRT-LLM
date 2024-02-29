@@ -22,7 +22,7 @@
     <link rel="index" title="Index" href="genindex.html" />
     <link rel="search" title="Search" href="search.html" />
     <link rel="next" title="How to debug" href="2023-05-19-how-to-debug.html" />
-    <link rel="prev" title="TensorRT-LLM Installation" href="installation.html" /> 
+    <link rel="prev" title="Build from Source" href="build_from_source.html" /> 
 </head>
 
 <body class="wy-body-for-nav"> 
@@ -49,21 +49,24 @@
 <li class="toctree-l1"><a class="reference internal" href="architecture.html">TensorRT-LLM Architecture</a></li>
 <li class="toctree-l1"><a class="reference internal" href="gpt_runtime.html">C++ GPT Runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="batch_manager.html">The Batch Manager in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="inference_request.html">Inference Request</a></li>
 <li class="toctree-l1"><a class="reference internal" href="gpt_attention.html">Multi-head, Multi-query and Group-query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="precision.html">Numerical Precision</a></li>
-<li class="toctree-l1"><a class="reference internal" href="installation.html">TensorRT-LLM Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="build_from_source.html">Build from Source</a></li>
 <li class="toctree-l1 current"><a class="current reference internal" href="#">Performance of TensorRT-LLM</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="#methodology">Methodology</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#peak-throughput">Peak Throughput</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#h200-gpus-fp8">H200 GPUs (FP8)</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#h100-gpus-fp8">H100 GPUs (FP8)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#l40s-gpus-fp8">L40S GPUs (FP8)<sup>*</sup></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#l40s-gpus-fp8">L40S GPUs (FP8)</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#a100-gpus-fp16">A100 GPUs (FP16)</a></li>
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="#low-latency">Low Latency<sup>**</sup></a><ul>
-<li class="toctree-l3"><a class="reference internal" href="#id1">H100 GPUs (FP8)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#id2">L40S GPUs (FP8)</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#id3">A100 GPUs (FP16)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id1">H200 GPUs (FP8)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id2">H100 GPUs (FP8)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id3">L40S GPUs (FP8)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id4">A100 GPUs (FP16)</a></li>
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="#known-issues">Known Issues</a><ul>
@@ -74,7 +77,7 @@
 <li class="toctree-l3"><a class="reference internal" href="#building-the-tensorrt-llm-container">Building the TensorRT-LLM Container</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="#id4">Methodology</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#id5">Methodology</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="#engine-building-setups">Engine Building Setups</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#running-on-a100">Running on A100</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#reproducing-first-token-latency">Reproducing First Token Latency</a></li>
@@ -87,13 +90,13 @@
 </ul>
 </li>
 <li class="toctree-l3"><a class="reference internal" href="#llama2-7b">Llama2-7b</a><ul>
-<li class="toctree-l4"><a class="reference internal" href="#id5">Throughput Benchmark</a></li>
-<li class="toctree-l4"><a class="reference internal" href="#id6">First Token Latency Benchmark</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id6">Throughput Benchmark</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id7">First Token Latency Benchmark</a></li>
 </ul>
 </li>
 <li class="toctree-l3"><a class="reference internal" href="#llama2-70b">Llama2-70b</a><ul>
-<li class="toctree-l4"><a class="reference internal" href="#id7">Throughput Benchmark</a></li>
-<li class="toctree-l4"><a class="reference internal" href="#id8">First Token Latency Benchmark</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id8">Throughput Benchmark</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id9">First Token Latency Benchmark</a></li>
 </ul>
 </li>
 <li class="toctree-l3"><a class="reference internal" href="#falcon-180b">Falcon-180B</a></li>
@@ -106,6 +109,9 @@
 <li class="toctree-l1"><a class="reference internal" href="graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="memory.html">Memory Usage of TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="new_workflow.html">New Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="perf_best_practices.html">Best Practices for Tuning the Performance of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="performance_analysis.html">Performance Analysis of TensorRT-LLM</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Python API</span></p>
 <ul>
@@ -125,6 +131,7 @@
 <li class="toctree-l1"><a class="reference internal" href="blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
 </ul>
 
         </div>
@@ -167,7 +174,191 @@ described in the benchmarks <a class="reference external" href="https://github.c
 <h2>Peak Throughput<a class="headerlink" href="#peak-throughput" title="Link to this heading"></a></h2>
 <p>The below tables provide reference data at large batch sizes, representing
 high throughput offline tasks.</p>
-<p>This data has been updated for v0.6.1, unless specified.</p>
+<p>All data was generated using version 0.8.0</p>
+<section id="h200-gpus-fp8">
+<h3>H200 GPUs (FP8)<a class="headerlink" href="#h200-gpus-fp8" title="Link to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Model</p></th>
+<th class="head text-left"><p>Batch Size</p></th>
+<th class="head text-left"><p>TP (1)</p></th>
+<th class="head text-left"><p>Input Length</p></th>
+<th class="head text-left"><p>Output Length</p></th>
+<th class="head text-right"><p>Throughput (out tok/s/GPU)</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p>GPT-J 6B</p></td>
+<td class="text-left"><p>1024</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-right"><p>29,168</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>GPT-J 6B</p></td>
+<td class="text-left"><p>120</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-right"><p>9,472</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>GPT-J 6B</p></td>
+<td class="text-left"><p>64</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-right"><p>2,961</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>GPT-J 6B</p></td>
+<td class="text-left"><p>64</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-right"><p>4,149</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-right"><p></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Mistral 7B</p></td>
+<td class="text-left"><p>896</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-right"><p>20,569</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Mistral 7B</p></td>
+<td class="text-left"><p>120</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-right"><p>8,968</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Mistral 7B</p></td>
+<td class="text-left"><p>84</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-right"><p>2,450</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Mistral 7B</p></td>
+<td class="text-left"><p>56</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-right"><p>3,868</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-right"><p></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>LLaMA 7B</p></td>
+<td class="text-left"><p>896</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-right"><p>20,548</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>LLaMA 7B</p></td>
+<td class="text-left"><p>120</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-right"><p>8,343</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>LLaMA 7B</p></td>
+<td class="text-left"><p>84</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-right"><p>2,429</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>LLaMA 7B</p></td>
+<td class="text-left"><p>56</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-right"><p>3,530</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-right"><p></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>LLaMA 70B</p></td>
+<td class="text-left"><p>512</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-right"><p>3,844</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>LLaMA 70B</p></td>
+<td class="text-left"><p>512</p></td>
+<td class="text-left"><p>2</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-right"><p>4,008</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>LLaMA 70B</p></td>
+<td class="text-left"><p>64</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-right"><p>421</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>LLaMA 70B</p></td>
+<td class="text-left"><p>64</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-right"><p>1,461</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-right"><p></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Falcon 180B</p></td>
+<td class="text-left"><p>1024</p></td>
+<td class="text-left"><p>4</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-right"><p>1,116</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Falcon 180B</p></td>
+<td class="text-left"><p>1024</p></td>
+<td class="text-left"><p>4</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-right"><p>990</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Falcon 180B</p></td>
+<td class="text-left"><p>64</p></td>
+<td class="text-left"><p>4</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-right"><p>118</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Falcon 180B</p></td>
+<td class="text-left"><p>64</p></td>
+<td class="text-left"><p>4</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-right"><p>269</p></td>
+</tr>
+</tbody>
+</table>
+</section>
 <section id="h100-gpus-fp8">
 <h3>H100 GPUs (FP8)<a class="headerlink" href="#h100-gpus-fp8" title="Link to this heading"></a></h3>
 <table class="docutils align-default">
@@ -186,28 +377,28 @@ high throughput offline tasks.</p>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>128</p></td>
 <td class="text-left"><p>128</p></td>
-<td class="text-right"><p>26,150</p></td>
+<td class="text-right"><p>27,357</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>GPT-J 6B</p></td>
 <td class="text-left"><p>120</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>128</p></td>
 <td class="text-left"><p>2048</p></td>
-<td class="text-right"><p>8,011</p></td>
+<td class="text-right"><p>7,831</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p>GPT-J 6B</p></td>
 <td class="text-left"><p>64</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>2048</p></td>
 <td class="text-left"><p>128</p></td>
-<td class="text-right"><p>2,551</p></td>
+<td class="text-right"><p>2,661</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>GPT-J 6B</p></td>
 <td class="text-left"><p>64</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>2048</p></td>
 <td class="text-left"><p>2048</p></td>
-<td class="text-right"><p>3,327</p></td>
+<td class="text-right"><p>3,409</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p></p></td>
 <td class="text-left"><p></p></td>
@@ -216,33 +407,33 @@ high throughput offline tasks.</p>
 <td class="text-left"><p></p></td>
 <td class="text-right"><p></p></td>
 </tr>
-<tr class="row-odd"><td class="text-left"><p>LLaMA 7B</p></td>
-<td class="text-left"><p>768</p></td>
+<tr class="row-odd"><td class="text-left"><p>Mistral 7B</p></td>
+<td class="text-left"><p>896</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>128</p></td>
 <td class="text-left"><p>128</p></td>
-<td class="text-right"><p>19,694</p></td>
+<td class="text-right"><p>20,517</p></td>
 </tr>
-<tr class="row-even"><td class="text-left"><p>LLaMA 7B</p></td>
-<td class="text-left"><p>112</p></td>
+<tr class="row-even"><td class="text-left"><p>Mistral 7B</p></td>
+<td class="text-left"><p>120</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>128</p></td>
 <td class="text-left"><p>2048</p></td>
-<td class="text-right"><p>6,818</p></td>
+<td class="text-right"><p>8,619</p></td>
 </tr>
-<tr class="row-odd"><td class="text-left"><p>LLaMA 7B</p></td>
-<td class="text-left"><p>80</p></td>
+<tr class="row-odd"><td class="text-left"><p>Mistral 7B</p></td>
+<td class="text-left"><p>64</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>2048</p></td>
 <td class="text-left"><p>128</p></td>
-<td class="text-right"><p>2,244</p></td>
+<td class="text-right"><p>2,438</p></td>
 </tr>
-<tr class="row-even"><td class="text-left"><p>LLaMA 7B</p></td>
-<td class="text-left"><p>48</p></td>
+<tr class="row-even"><td class="text-left"><p>Mistral 7B</p></td>
+<td class="text-left"><p>56</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>2048</p></td>
 <td class="text-left"><p>2048</p></td>
-<td class="text-right"><p>2,740</p></td>
+<td class="text-right"><p>3,733</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p></p></td>
 <td class="text-left"><p></p></td>
@@ -251,33 +442,33 @@ high throughput offline tasks.</p>
 <td class="text-left"><p></p></td>
 <td class="text-right"><p></p></td>
 </tr>
-<tr class="row-even"><td class="text-left"><p>LLaMA 70B</p></td>
-<td class="text-left"><p>1024</p></td>
-<td class="text-left"><p>2</p></td>
+<tr class="row-even"><td class="text-left"><p>LLaMA 7B</p></td>
+<td class="text-left"><p>896</p></td>
+<td class="text-left"><p>1</p></td>
 <td class="text-left"><p>128</p></td>
 <td class="text-left"><p>128</p></td>
-<td class="text-right"><p>2,657</p></td>
+<td class="text-right"><p>20,241</p></td>
 </tr>
-<tr class="row-odd"><td class="text-left"><p>LLaMA 70B</p></td>
-<td class="text-left"><p>480</p></td>
-<td class="text-left"><p>4</p></td>
+<tr class="row-odd"><td class="text-left"><p>LLaMA 7B</p></td>
+<td class="text-left"><p>120</p></td>
+<td class="text-left"><p>1</p></td>
 <td class="text-left"><p>128</p></td>
 <td class="text-left"><p>2048</p></td>
-<td class="text-right"><p>1,486</p></td>
+<td class="text-right"><p>6,922</p></td>
 </tr>
-<tr class="row-even"><td class="text-left"><p>LLaMA 70B</p></td>
-<td class="text-left"><p>96</p></td>
-<td class="text-left"><p>2</p></td>
-<td class="text-left"><p>2048</p></td>
-<td class="text-left"><p>128</p></td>
-<td class="text-right"><p>306</p></td>
-</tr>
-<tr class="row-odd"><td class="text-left"><p>LLaMA 70B</p></td>
+<tr class="row-even"><td class="text-left"><p>LLaMA 7B</p></td>
 <td class="text-left"><p>64</p></td>
-<td class="text-left"><p>2</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-right"><p>2,170</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>LLaMA 7B</p></td>
+<td class="text-left"><p>56</p></td>
+<td class="text-left"><p>1</p></td>
 <td class="text-left"><p>2048</p></td>
 <td class="text-left"><p>2048</p></td>
-<td class="text-right"><p>547</p></td>
+<td class="text-right"><p>2,816</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p></p></td>
 <td class="text-left"><p></p></td>
@@ -286,40 +477,74 @@ high throughput offline tasks.</p>
 <td class="text-left"><p></p></td>
 <td class="text-right"><p></p></td>
 </tr>
-<tr class="row-odd"><td class="text-left"><p>Falcon 180B</p></td>
+<tr class="row-odd"><td class="text-left"><p>LLaMA 70B</p></td>
 <td class="text-left"><p>1024</p></td>
+<td class="text-left"><p>2</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-right"><p>3,269</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>LLaMA 70B</p></td>
+<td class="text-left"><p>512</p></td>
+<td class="text-left"><p>4</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-right"><p>2,718</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>LLaMA 70B</p></td>
+<td class="text-left"><p>96</p></td>
+<td class="text-left"><p>2</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-right"><p>347</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>LLaMA 70B</p></td>
+<td class="text-left"><p>64</p></td>
+<td class="text-left"><p>2</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-right"><p>1,020</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-right"><p></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Falcon 180B</p></td>
+<td class="text-left"><p>512</p></td>
 <td class="text-left"><p>4</p></td>
 <td class="text-left"><p>128</p></td>
 <td class="text-left"><p>128</p></td>
-<td class="text-right"><p>987</p></td>
+<td class="text-right"><p>1,048</p></td>
 </tr>
-<tr class="row-even"><td class="text-left"><p>Falcon 180B</p></td>
+<tr class="row-odd"><td class="text-left"><p>Falcon 180B</p></td>
 <td class="text-left"><p>1024</p></td>
 <td class="text-left"><p>8</p></td>
 <td class="text-left"><p>128</p></td>
 <td class="text-left"><p>2048</p></td>
-<td class="text-right"><p>724</p></td>
-</tr>
-<tr class="row-odd"><td class="text-left"><p>Falcon 180B</p></td>
-<td class="text-left"><p>64</p></td>
-<td class="text-left"><p>4</p></td>
-<td class="text-left"><p>2048</p></td>
-<td class="text-left"><p>128</p></td>
-<td class="text-right"><p>112</p></td>
+<td class="text-right"><p>836</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p>Falcon 180B</p></td>
 <td class="text-left"><p>64</p></td>
 <td class="text-left"><p>4</p></td>
 <td class="text-left"><p>2048</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-right"><p>114</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Falcon 180B</p></td>
+<td class="text-left"><p>64</p></td>
+<td class="text-left"><p>4</p></td>
 <td class="text-left"><p>2048</p></td>
-<td class="text-right"><p>264</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-right"><p>250</p></td>
 </tr>
 </tbody>
 </table>
 </section>
 <section id="l40s-gpus-fp8">
-<h3>L40S GPUs (FP8)<sup>*</sup><a class="headerlink" href="#l40s-gpus-fp8" title="Link to this heading"></a></h3>
-<p><sup> * The following data is from TensorRT-LLM v0.5. </sup></p>
+<h3>L40S GPUs (FP8)<a class="headerlink" href="#l40s-gpus-fp8" title="Link to this heading"></a></h3>
 <table class="docutils align-default">
 <thead>
 <tr class="row-odd"><th class="head text-left"><p>Model</p></th>
@@ -327,37 +552,37 @@ high throughput offline tasks.</p>
 <th class="head text-left"><p>TP (1)</p></th>
 <th class="head text-left"><p>Input Length</p></th>
 <th class="head text-left"><p>Output Length</p></th>
-<th class="head text-right"><p>Throughput (out tok/s)</p></th>
+<th class="head text-right"><p>Throughput (out tok/s/GPU)</p></th>
 </tr>
 </thead>
 <tbody>
 <tr class="row-even"><td class="text-left"><p>GPT-J 6B</p></td>
-<td class="text-left"><p>64</p></td>
+<td class="text-left"><p>512</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>128</p></td>
 <td class="text-left"><p>128</p></td>
-<td class="text-right"><p>3,630</p></td>
+<td class="text-right"><p>7,992</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>GPT-J 6B</p></td>
 <td class="text-left"><p>64</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>128</p></td>
 <td class="text-left"><p>2048</p></td>
-<td class="text-right"><p>1,859</p></td>
+<td class="text-right"><p>1,874</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p>GPT-J 6B</p></td>
 <td class="text-left"><p>32</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>2048</p></td>
 <td class="text-left"><p>128</p></td>
-<td class="text-right"><p>616</p></td>
+<td class="text-right"><p>693</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>GPT-J 6B</p></td>
 <td class="text-left"><p>32</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>2048</p></td>
 <td class="text-left"><p>2048</p></td>
-<td class="text-right"><p>757</p></td>
+<td class="text-right"><p>768</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p></p></td>
 <td class="text-left"><p></p></td>
@@ -366,33 +591,138 @@ high throughput offline tasks.</p>
 <td class="text-left"><p></p></td>
 <td class="text-right"><p></p></td>
 </tr>
-<tr class="row-odd"><td class="text-left"><p>LLaMA 7B</p></td>
-<td class="text-left"><p>64</p></td>
+<tr class="row-odd"><td class="text-left"><p>Mistral 7B</p></td>
+<td class="text-left"><p>896</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>128</p></td>
 <td class="text-left"><p>128</p></td>
-<td class="text-right"><p>3,240</p></td>
+<td class="text-right"><p>9,679</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Mistral 7B</p></td>
+<td class="text-left"><p>120</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-right"><p>4,401</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Mistral 7B</p></td>
+<td class="text-left"><p>84</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-right"><p>979</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Mistral 7B</p></td>
+<td class="text-left"><p>56</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-right"><p>1,721</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-right"><p></p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p>LLaMA 7B</p></td>
+<td class="text-left"><p>256</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-right"><p>5,954</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>LLaMA 7B</p></td>
 <td class="text-left"><p>64</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>128</p></td>
 <td class="text-left"><p>2048</p></td>
-<td class="text-right"><p>1,622</p></td>
+<td class="text-right"><p>1,654</p></td>
 </tr>
-<tr class="row-odd"><td class="text-left"><p>LLaMA 7B</p></td>
+<tr class="row-even"><td class="text-left"><p>LLaMA 7B</p></td>
 <td class="text-left"><p>32</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>2048</p></td>
 <td class="text-left"><p>128</p></td>
-<td class="text-right"><p>581</p></td>
+<td class="text-right"><p>579</p></td>
 </tr>
-<tr class="row-even"><td class="text-left"><p>LLaMA 7B</p></td>
+<tr class="row-odd"><td class="text-left"><p>LLaMA 7B</p></td>
 <td class="text-left"><p>16</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>2048</p></td>
 <td class="text-left"><p>2048</p></td>
-<td class="text-right"><p>531</p></td>
+<td class="text-right"><p>542</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-right"><p></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>LLaMA 70B</p></td>
+<td class="text-left"><p>256</p></td>
+<td class="text-left"><p>2</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-right"><p>561</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>LLaMA 70B</p></td>
+<td class="text-left"><p>256</p></td>
+<td class="text-left"><p>4</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-right"><p>471</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>LLaMA 70B</p></td>
+<td class="text-left"><p>16</p></td>
+<td class="text-left"><p>2</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-right"><p>49</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>LLaMA 70B</p></td>
+<td class="text-left"><p>64</p></td>
+<td class="text-left"><p>4</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-right"><p>177</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-right"><p></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Falcon 180B</p></td>
+<td class="text-left"><p>512</p></td>
+<td class="text-left"><p>8</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-right"><p>152</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Falcon 180B</p></td>
+<td class="text-left"><p>256</p></td>
+<td class="text-left"><p>8</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-right"><p>200</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Falcon 180B</p></td>
+<td class="text-left"><p>32</p></td>
+<td class="text-left"><p>8</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-right"><p>15</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Falcon 180B</p></td>
+<td class="text-left"><p>16</p></td>
+<td class="text-left"><p>8</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-right"><p>39</p></td>
 </tr>
 </tbody>
 </table>
@@ -406,7 +736,7 @@ high throughput offline tasks.</p>
 <th class="head text-left"><p>TP (1)</p></th>
 <th class="head text-left"><p>Input Length</p></th>
 <th class="head text-left"><p>Output Length</p></th>
-<th class="head text-right"><p>Throughput (out tok/s)</p></th>
+<th class="head text-right"><p>Throughput (out tok/s/GPU)</p></th>
 </tr>
 </thead>
 <tbody>
@@ -415,28 +745,28 @@ high throughput offline tasks.</p>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>128</p></td>
 <td class="text-left"><p>128</p></td>
-<td class="text-right"><p>6,374</p></td>
+<td class="text-right"><p>6,810</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>GPT-J 6B</p></td>
-<td class="text-left"><p>120</p></td>
-<td class="text-left"><p>2</p></td>
+<td class="text-left"><p>32</p></td>
+<td class="text-left"><p>1</p></td>
 <td class="text-left"><p>128</p></td>
 <td class="text-left"><p>2048</p></td>
-<td class="text-right"><p>2,192</p></td>
+<td class="text-right"><p>1,658</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p>GPT-J 6B</p></td>
-<td class="text-left"><p>60</p></td>
+<td class="text-left"><p>32</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>2048</p></td>
 <td class="text-left"><p>128</p></td>
-<td class="text-right"><p>670</p></td>
+<td class="text-right"><p>631</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>GPT-J 6B</p></td>
-<td class="text-left"><p>64</p></td>
-<td class="text-left"><p>2</p></td>
+<td class="text-left"><p>16</p></td>
+<td class="text-left"><p>1</p></td>
 <td class="text-left"><p>2048</p></td>
 <td class="text-left"><p>2048</p></td>
-<td class="text-right"><p>903</p></td>
+<td class="text-right"><p>692</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p></p></td>
 <td class="text-left"><p></p></td>
@@ -445,33 +775,33 @@ high throughput offline tasks.</p>
 <td class="text-left"><p></p></td>
 <td class="text-right"><p></p></td>
 </tr>
-<tr class="row-odd"><td class="text-left"><p>LLaMA 7B</p></td>
-<td class="text-left"><p>384</p></td>
+<tr class="row-odd"><td class="text-left"><p>Mistral 7B</p></td>
+<td class="text-left"><p>896</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>128</p></td>
 <td class="text-left"><p>128</p></td>
-<td class="text-right"><p>5,586</p></td>
+<td class="text-right"><p>6,472</p></td>
 </tr>
-<tr class="row-even"><td class="text-left"><p>LLaMA 7B</p></td>
-<td class="text-left"><p>60</p></td>
+<tr class="row-even"><td class="text-left"><p>Mistral 7B</p></td>
+<td class="text-left"><p>120</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>128</p></td>
 <td class="text-left"><p>2048</p></td>
-<td class="text-right"><p>1,928</p></td>
+<td class="text-right"><p>3,812</p></td>
 </tr>
-<tr class="row-odd"><td class="text-left"><p>LLaMA 7B</p></td>
-<td class="text-left"><p>52</p></td>
+<tr class="row-odd"><td class="text-left"><p>Mistral 7B</p></td>
+<td class="text-left"><p>84</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>2048</p></td>
 <td class="text-left"><p>128</p></td>
-<td class="text-right"><p>591</p></td>
+<td class="text-right"><p>734</p></td>
 </tr>
-<tr class="row-even"><td class="text-left"><p>LLaMA 7B</p></td>
-<td class="text-left"><p>64</p></td>
-<td class="text-left"><p>2</p></td>
+<tr class="row-even"><td class="text-left"><p>Mistral 7B</p></td>
+<td class="text-left"><p>56</p></td>
+<td class="text-left"><p>1</p></td>
 <td class="text-left"><p>2048</p></td>
 <td class="text-left"><p>2048</p></td>
-<td class="text-right"><p>782</p></td>
+<td class="text-right"><p>1,607</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p></p></td>
 <td class="text-left"><p></p></td>
@@ -480,26 +810,68 @@ high throughput offline tasks.</p>
 <td class="text-left"><p></p></td>
 <td class="text-right"><p></p></td>
 </tr>
-<tr class="row-even"><td class="text-left"><p>LLaMA 70B</p></td>
-<td class="text-left"><p>1280</p></td>
-<td class="text-left"><p>4</p></td>
+<tr class="row-even"><td class="text-left"><p>LLaMA 7B</p></td>
+<td class="text-left"><p>256</p></td>
+<td class="text-left"><p>1</p></td>
 <td class="text-left"><p>128</p></td>
 <td class="text-left"><p>128</p></td>
-<td class="text-right"><p>670</p></td>
+<td class="text-right"><p>5,353</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>LLaMA 7B</p></td>
+<td class="text-left"><p>32</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-right"><p>1,518</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>LLaMA 7B</p></td>
+<td class="text-left"><p>32</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-right"><p>547</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>LLaMA 7B</p></td>
+<td class="text-left"><p>16</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-right"><p>613</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-right"><p></p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>LLaMA 70B</p></td>
-<td class="text-left"><p>240</p></td>
+<td class="text-left"><p>256</p></td>
 <td class="text-left"><p>4</p></td>
 <td class="text-left"><p>128</p></td>
-<td class="text-left"><p>2048</p></td>
-<td class="text-right"><p>525</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-right"><p>565</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p>LLaMA 70B</p></td>
-<td class="text-left"><p>120</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-left"><p>4</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-right"><p>595</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>LLaMA 70B</p></td>
+<td class="text-left"><p>32</p></td>
 <td class="text-left"><p>4</p></td>
 <td class="text-left"><p>2048</p></td>
 <td class="text-left"><p>128</p></td>
-<td class="text-right"><p>79</p></td>
+<td class="text-right"><p>66</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>LLaMA 70B</p></td>
+<td class="text-left"><p>32</p></td>
+<td class="text-left"><p>4</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-right"><p>185</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p></p></td>
 <td class="text-left"><p></p></td>
@@ -509,18 +881,25 @@ high throughput offline tasks.</p>
 <td class="text-right"><p></p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p>Falcon 180B</p></td>
-<td class="text-left"><p>1024</p></td>
+<td class="text-left"><p>256</p></td>
 <td class="text-left"><p>8</p></td>
 <td class="text-left"><p>128</p></td>
 <td class="text-left"><p>128</p></td>
-<td class="text-right"><p>232</p></td>
+<td class="text-right"><p>193</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>Falcon 180B</p></td>
-<td class="text-left"><p>128</p></td>
+<td class="text-left"><p>256</p></td>
 <td class="text-left"><p>8</p></td>
 <td class="text-left"><p>128</p></td>
 <td class="text-left"><p>2048</p></td>
-<td class="text-right"><p>180</p></td>
+<td class="text-right"><p>203</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Falcon 180B</p></td>
+<td class="text-left"><p>16</p></td>
+<td class="text-left"><p>8</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-right"><p>20</p></td>
 </tr>
 </tbody>
 </table>
@@ -529,12 +908,13 @@ high throughput offline tasks.</p>
 </section>
 <section id="low-latency">
 <h2>Low Latency<sup>**</sup><a class="headerlink" href="#low-latency" title="Link to this heading"></a></h2>
-<p><sup> ** The following data is from TensorRT-LLM v0.5. Low latency numbers will soon be updated to reflect real time latency with infight-batching.</sup></p>
+<p>All data was generated using version 0.8.0
+<sup> ** Low latency numbers will soon be updated to reflect real time latency with infight-batching.</sup></p>
 <p>The below tables provide reference data at batch size 1 for first token
 latency, representing end-user’s perceived latency for online streaming
 tasks.</p>
 <section id="id1">
-<h3>H100 GPUs (FP8)<a class="headerlink" href="#id1" title="Link to this heading"></a></h3>
+<h3>H200 GPUs (FP8)<a class="headerlink" href="#id1" title="Link to this heading"></a></h3>
 <table class="docutils align-default">
 <thead>
 <tr class="row-odd"><th class="head text-left"><p>Model</p></th>
@@ -549,13 +929,13 @@ tasks.</p>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>128</p></td>
-<td class="text-right"><p>7</p></td>
+<td class="text-right"><p>5.2</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>GPT-J 6B</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>2048</p></td>
-<td class="text-right"><p>29</p></td>
+<td class="text-right"><p>23.6</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p></p></td>
 <td class="text-left"><p></p></td>
@@ -563,17 +943,17 @@ tasks.</p>
 <td class="text-left"><p></p></td>
 <td class="text-right"><p></p></td>
 </tr>
-<tr class="row-odd"><td class="text-left"><p>LLaMA 7B</p></td>
+<tr class="row-odd"><td class="text-left"><p>Mistral 7B</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>128</p></td>
-<td class="text-right"><p>7</p></td>
+<td class="text-right"><p>6.0</p></td>
 </tr>
-<tr class="row-even"><td class="text-left"><p>LLaMA 7B</p></td>
+<tr class="row-even"><td class="text-left"><p>Mistral 7B</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>2048</p></td>
-<td class="text-right"><p>36</p></td>
+<td class="text-right"><p>31.8</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p></p></td>
 <td class="text-left"><p></p></td>
@@ -581,17 +961,17 @@ tasks.</p>
 <td class="text-left"><p></p></td>
 <td class="text-right"><p></p></td>
 </tr>
-<tr class="row-even"><td class="text-left"><p>LLaMA 70B</p></td>
+<tr class="row-even"><td class="text-left"><p>LLaMA 7B</p></td>
 <td class="text-left"><p>1</p></td>
-<td class="text-left"><p>4</p></td>
+<td class="text-left"><p>1</p></td>
 <td class="text-left"><p>128</p></td>
-<td class="text-right"><p>26</p></td>
+<td class="text-right"><p>5.8</p></td>
 </tr>
-<tr class="row-odd"><td class="text-left"><p>LLaMA 70B</p></td>
+<tr class="row-odd"><td class="text-left"><p>LLaMA 7B</p></td>
 <td class="text-left"><p>1</p></td>
-<td class="text-left"><p>4</p></td>
+<td class="text-left"><p>1</p></td>
 <td class="text-left"><p>2048</p></td>
-<td class="text-right"><p>109</p></td>
+<td class="text-right"><p>30.1</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p></p></td>
 <td class="text-left"><p></p></td>
@@ -599,23 +979,41 @@ tasks.</p>
 <td class="text-left"><p></p></td>
 <td class="text-right"><p></p></td>
 </tr>
-<tr class="row-odd"><td class="text-left"><p>Falcon 180B</p></td>
+<tr class="row-odd"><td class="text-left"><p>LLaMA 70B</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>8</p></td>
 <td class="text-left"><p>128</p></td>
-<td class="text-right"><p>27</p></td>
+<td class="text-right"><p>16.0</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>LLaMA 70B</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>8</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-right"><p>78.8</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-right"><p></p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p>Falcon 180B</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>8</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-right"><p>37.2</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Falcon 180B</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>8</p></td>
 <td class="text-left"><p>2048</p></td>
-<td class="text-right"><p>205</p></td>
+<td class="text-right"><p>120.8</p></td>
 </tr>
 </tbody>
 </table>
 </section>
 <section id="id2">
-<h3>L40S GPUs (FP8)<a class="headerlink" href="#id2" title="Link to this heading"></a></h3>
+<h3>H100 GPUs (FP8)<a class="headerlink" href="#id2" title="Link to this heading"></a></h3>
 <table class="docutils align-default">
 <thead>
 <tr class="row-odd"><th class="head text-left"><p>Model</p></th>
@@ -630,13 +1028,13 @@ tasks.</p>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>128</p></td>
-<td class="text-right"><p>12</p></td>
+<td class="text-right"><p>5.7</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>GPT-J 6B</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>2048</p></td>
-<td class="text-right"><p>71</p></td>
+<td class="text-right"><p>23.8</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p></p></td>
 <td class="text-left"><p></p></td>
@@ -644,62 +1042,17 @@ tasks.</p>
 <td class="text-left"><p></p></td>
 <td class="text-right"><p></p></td>
 </tr>
-<tr class="row-odd"><td class="text-left"><p>LLaMA 7B</p></td>
+<tr class="row-odd"><td class="text-left"><p>Mistral 7B</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>128</p></td>
-<td class="text-right"><p>14</p></td>
+<td class="text-right"><p>6.6</p></td>
 </tr>
-<tr class="row-even"><td class="text-left"><p>LLaMA 7B</p></td>
+<tr class="row-even"><td class="text-left"><p>Mistral 7B</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>2048</p></td>
-<td class="text-right"><p>73</p></td>
-</tr>
-</tbody>
-</table>
-</section>
-<section id="id3">
-<h3>A100 GPUs (FP16)<a class="headerlink" href="#id3" title="Link to this heading"></a></h3>
-<table class="docutils align-default">
-<thead>
-<tr class="row-odd"><th class="head text-left"><p>Model</p></th>
-<th class="head text-left"><p>Batch Size</p></th>
-<th class="head text-left"><p>TP (1)</p></th>
-<th class="head text-left"><p>Input Length</p></th>
-<th class="head text-right"><p>1st Token Latency (ms)</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td class="text-left"><p>GPT-J 6B</p></td>
-<td class="text-left"><p>1</p></td>
-<td class="text-left"><p>1</p></td>
-<td class="text-left"><p>128</p></td>
-<td class="text-right"><p>12</p></td>
-</tr>
-<tr class="row-odd"><td class="text-left"><p>GPT-J 6B</p></td>
-<td class="text-left"><p>1</p></td>
-<td class="text-left"><p>1</p></td>
-<td class="text-left"><p>2048</p></td>
-<td class="text-right"><p>129</p></td>
-</tr>
-<tr class="row-even"><td class="text-left"><p></p></td>
-<td class="text-left"><p></p></td>
-<td class="text-left"><p></p></td>
-<td class="text-left"><p></p></td>
-<td class="text-right"><p></p></td>
-</tr>
-<tr class="row-odd"><td class="text-left"><p>LLaMA 7B</p></td>
-<td class="text-left"><p>1</p></td>
-<td class="text-left"><p>1</p></td>
-<td class="text-left"><p>128</p></td>
-<td class="text-right"><p>16</p></td>
-</tr>
-<tr class="row-even"><td class="text-left"><p>LLaMA 7B</p></td>
-<td class="text-left"><p>1</p></td>
-<td class="text-left"><p>1</p></td>
-<td class="text-left"><p>2048</p></td>
-<td class="text-right"><p>133</p></td>
+<td class="text-right"><p>32.6</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p></p></td>
 <td class="text-left"><p></p></td>
@@ -707,17 +1060,17 @@ tasks.</p>
 <td class="text-left"><p></p></td>
 <td class="text-right"><p></p></td>
 </tr>
-<tr class="row-even"><td class="text-left"><p>LLaMA 70B</p></td>
+<tr class="row-even"><td class="text-left"><p>LLaMA 7B</p></td>
 <td class="text-left"><p>1</p></td>
-<td class="text-left"><p>4</p></td>
+<td class="text-left"><p>1</p></td>
 <td class="text-left"><p>128</p></td>
-<td class="text-right"><p>47</p></td>
+<td class="text-right"><p>6.4</p></td>
 </tr>
-<tr class="row-odd"><td class="text-left"><p>LLaMA 70B</p></td>
+<tr class="row-odd"><td class="text-left"><p>LLaMA 7B</p></td>
 <td class="text-left"><p>1</p></td>
-<td class="text-left"><p>4</p></td>
+<td class="text-left"><p>1</p></td>
 <td class="text-left"><p>2048</p></td>
-<td class="text-right"><p>377</p></td>
+<td class="text-right"><p>31.0</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p></p></td>
 <td class="text-left"><p></p></td>
@@ -725,17 +1078,233 @@ tasks.</p>
 <td class="text-left"><p></p></td>
 <td class="text-right"><p></p></td>
 </tr>
-<tr class="row-odd"><td class="text-left"><p>Falcon 180B</p></td>
+<tr class="row-odd"><td class="text-left"><p>LLaMA 70B</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>8</p></td>
 <td class="text-left"><p>128</p></td>
-<td class="text-right"><p>61</p></td>
+<td class="text-right"><p>17.0</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>LLaMA 70B</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>8</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-right"><p>84.4</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-right"><p></p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p>Falcon 180B</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>8</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-right"><p>39.7</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Falcon 180B</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>8</p></td>
 <td class="text-left"><p>2048</p></td>
-<td class="text-right"><p>509</p></td>
+<td class="text-right"><p>128.0</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="id3">
+<h3>L40S GPUs (FP8)<a class="headerlink" href="#id3" title="Link to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Model</p></th>
+<th class="head text-left"><p>Batch Size</p></th>
+<th class="head text-left"><p>TP (1)</p></th>
+<th class="head text-left"><p>Input Length</p></th>
+<th class="head text-right"><p>1st Token Latency (ms)</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p>GPT-J 6B</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-right"><p>12.6</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>GPT-J 6B</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-right"><p>61.2</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-right"><p></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Mistral 7B</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-right"><p>15.5</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Mistral 7B</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-right"><p>84.3</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-right"><p></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>LLaMA 7B</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-right"><p>14.3</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>LLaMA 7B</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-right"><p>79.0</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-right"><p></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>LLaMA 70B</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>8</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-right"><p>70.9</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>LLaMA 70B</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>8</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-right"><p>708.7</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-right"><p></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Falcon 180B</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>8</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-right"><p>93.4</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Falcon 180B</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>8</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-right"><p>769.8</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="id4">
+<h3>A100 GPUs (FP16)<a class="headerlink" href="#id4" title="Link to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Model</p></th>
+<th class="head text-left"><p>Batch Size</p></th>
+<th class="head text-left"><p>TP (1)</p></th>
+<th class="head text-left"><p>Input Length</p></th>
+<th class="head text-right"><p>1st Token Latency (ms)</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p>GPT-J 6B</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-right"><p>14.1</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>GPT-J 6B</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-right"><p>102.8</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-right"><p></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Mistral 7B</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-right"><p>16.4</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Mistral 7B</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-right"><p>128.7</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-right"><p></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>LLaMA 7B</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-right"><p>16.1</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>LLaMA 7B</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-right"><p>120.5</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-right"><p></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>LLaMA 70B</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>8</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-right"><p>35.6</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>LLaMA 70B</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>8</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-right"><p>235.1</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-right"><p></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Falcon 180B</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>8</p></td>
+<td class="text-left"><p>128</p></td>
+<td class="text-right"><p>76.5</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Falcon 180B</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>8</p></td>
+<td class="text-left"><p>2048</p></td>
+<td class="text-right"><p>463.0</p></td>
 </tr>
 </tbody>
 </table>
@@ -757,7 +1326,7 @@ include a more efficient implementation that runs single Matmul + SwiGLU fused k
 <section id="building-the-tensorrt-llm-container">
 <h3>Building the TensorRT-LLM Container<a class="headerlink" href="#building-the-tensorrt-llm-container" title="Link to this heading"></a></h3>
 <hr class="docutils" />
-<p>In order to benchmark TensorRT-LLM, you will need to follow the <span class="xref myst">Quick Start</span>
+<p>In order to benchmark TensorRT-LLM, you will need to follow the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/../../README.md">Quick Start</a>
 build process to create a baseline container for building a wheel. Additionally, the development
 container needs a copy of the source code to build the wheel and the benchmarking script. Create the
 right build environment, use the following :</p>
@@ -801,8 +1370,8 @@ pip<span class="w"> </span>install<span class="w"> </span>./build/tensorrt_llm*.
 </div>
 </section>
 </section>
-<section id="id4">
-<h2>Methodology<a class="headerlink" href="#id4" title="Link to this heading"></a></h2>
+<section id="id5">
+<h2>Methodology<a class="headerlink" href="#id5" title="Link to this heading"></a></h2>
 <section id="engine-building-setups">
 <h3>Engine Building Setups<a class="headerlink" href="#engine-building-setups" title="Link to this heading"></a></h3>
 <p>Each engine needs to be built before they can be benchmarked, and requires the source code for each
@@ -823,8 +1392,14 @@ numbers we document on our [Performance section](#performance of-tensorrt-llm).<
 </section>
 <section id="running-on-a100">
 <h3>Running on A100<a class="headerlink" href="#running-on-a100" title="Link to this heading"></a></h3>
-<p>To run the benchmarks below on A100, you will need to remove the <code class="docutils literal notranslate"><span class="pre">--enable_fp8</span> <span class="pre">--fp8_kv_cache</span></code> options
-from each engine build command because FP8 computation is a feature in H100 and newer GPUs.</p>
+<p>To run the benchmarks below on A100, you will need to remove the below fp8 quantization field from each
+config json file, because FP8 computation is a feature in H100 and newer GPUs.</p>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="nt">&quot;quantization&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">	</span><span class="nt">&quot;quant_algo&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FP8&quot;</span><span class="p">,</span>
+<span class="w">	</span><span class="nt">&quot;kv_cache_quant_algo&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FP8&quot;</span>
+<span class="p">}</span>
+</pre></div>
+</div>
 </section>
 <section id="reproducing-first-token-latency">
 <h3>Reproducing First Token Latency<a class="headerlink" href="#reproducing-first-token-latency" title="Link to this heading"></a></h3>
@@ -838,28 +1413,48 @@ in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">T
 </section>
 <section id="benchmarking-per-model">
 <h2>Benchmarking per Model<a class="headerlink" href="#benchmarking-per-model" title="Link to this heading"></a></h2>
+<blockquote>
+<div><p>[!WARNING]
+In some cases, using Group Query Attention (GQA) can improve performance of some networks. These
+kernels are currently experimental and not enabled by default. In order to enable them, simply run
+<code class="docutils literal notranslate"><span class="pre">export</span> <span class="pre">TRTLLM_ENABLE_XQA=1</span></code> in your shell. The kernels are an inference runtime optimization, so
+previously built engines should still function. For the benchmarks below, we have enabled GQA where
+our tests displayed performance benefits. If your network is not listed below, be sure to try both
+GQA-enabled and GQA-disabled configurations to find the configuration that works best.
+For more details see our documentation about <a class="reference internal" href="gpt_attention.html#generation-phase"><span class="std std-ref">GPT Attention</span></a>.</p>
+</div></blockquote>
 <section id="gpt-j-6b">
 <h3>GPT-J 6B<a class="headerlink" href="#gpt-j-6b" title="Link to this heading"></a></h3>
 <hr class="docutils" />
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>examples/gptj/build.py<span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--enable_context_fmha<span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--parallel_build<span class="w"> </span><span class="se">\</span>
+<p>Prepare a config json file <code class="docutils literal notranslate"><span class="pre">/tmp/engines/gptj/ckpt_config.json</span></code>:</p>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;architecture&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;GPTJForCausalLM&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;dtype&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;float16&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;num_hidden_layers&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">28</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;num_attention_heads&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">16</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;hidden_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">4096</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;norm_epsilon&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">1e-05</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;vocab_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">50400</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;position_embedding_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;rope_gptj&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;max_position_embeddings&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">2048</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;hidden_act&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;gelu&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;quantization&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;quant_algo&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FP8&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;kv_cache_quant_algo&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FP8&quot;</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="nt">&quot;rotary_dim&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">64</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>Build an engine:</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-build<span class="w"> </span>--model_config<span class="w"> </span>/tmp/engines/gptj/ckpt_config.json<span class="w"> </span><span class="se">\</span>
 <span class="w">	</span>--output_dir<span class="w"> </span>/tmp/engines/gptj<span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--dtype<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--use_gpt_attention_plugin<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--world_size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--context_fmha<span class="w"> </span><span class="nb">enable</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--gpt_attention_plugin<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
 <span class="w">	</span>--max_batch_size<span class="w"> </span><span class="m">64</span><span class="w"> </span><span class="se">\</span>
 <span class="w">	</span>--max_input_len<span class="w"> </span><span class="m">2048</span><span class="w"> </span><span class="se">\</span>
 <span class="w">	</span>--max_output_len<span class="w"> </span><span class="m">2048</span><span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--hidden_act<span class="w"> </span>gelu<span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--enable_fp8<span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--fp8_kv_cache<span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--strongly_typed<span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--n_layer<span class="w"> </span><span class="m">28</span><span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--n_head<span class="w"> </span><span class="m">16</span><span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--n_embd<span class="w"> </span><span class="m">4096</span><span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--n_positions<span class="w"> </span><span class="m">2048</span><span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--enable_two_optimization_profiles
+<span class="w">	</span>--strongly_typed
 </pre></div>
 </div>
 <section id="throughput-benchmark">
@@ -894,34 +1489,44 @@ in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">T
 <section id="llama2-7b">
 <h3>Llama2-7b<a class="headerlink" href="#llama2-7b" title="Link to this heading"></a></h3>
 <hr class="docutils" />
+<p>Prepare a config json file <code class="docutils literal notranslate"><span class="pre">/tmp/engines/llama/7b/ckpt_config.json</span></code>:</p>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;architecture&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;LlamaForCausalLM&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;dtype&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;float16&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;num_hidden_layers&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">32</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;num_attention_heads&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">32</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;hidden_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">4096</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;intermediate_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">11008</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;num_key_value_heads&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">32</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;vocab_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">32000</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;position_embedding_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;rope_gpt_neox&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;max_position_embeddings&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">4096</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;hidden_act&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;silu&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;rotary_base&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">10000.0</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;rotary_scaling&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;norm_epsilon&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">1e-05</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;quantization&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;quant_algo&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FP8&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;kv_cache_quant_algo&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FP8&quot;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>Build an engine:</p>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span>-r<span class="w"> </span>examples/llama/requirements.txt
-python<span class="w"> </span>examples/llama/build.py<span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--remove_input_padding<span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--enable_context_fmha<span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--parallel_build<span class="w"> </span><span class="se">\</span>
+trtllm-build<span class="w"> </span>--model_config<span class="w"> </span>/tmp/engines/llama/7b/ckpt_config.json<span class="w"> </span><span class="se">\</span>
 <span class="w">	</span>--output_dir<span class="w"> </span>/tmp/engines/llama/7b<span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--dtype<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--use_gpt_attention_plugin<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--world_size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--tp_size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--pp_size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--remove_input_padding<span class="w"> </span><span class="nb">enable</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--context_fmha<span class="w"> </span><span class="nb">enable</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--gpt_attention_plugin<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
 <span class="w">	</span>--max_batch_size<span class="w"> </span><span class="m">64</span><span class="w"> </span><span class="se">\</span>
 <span class="w">	</span>--max_input_len<span class="w"> </span><span class="m">2048</span><span class="w"> </span><span class="se">\</span>
 <span class="w">	</span>--max_output_len<span class="w"> </span><span class="m">2048</span><span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--enable_fp8<span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--fp8_kv_cache<span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--strongly_typed<span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--n_layer<span class="w"> </span><span class="m">32</span><span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--n_head<span class="w"> </span><span class="m">32</span><span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--n_embd<span class="w"> </span><span class="m">4096</span><span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--inter_size<span class="w"> </span><span class="m">11008</span><span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--vocab_size<span class="w"> </span><span class="m">32000</span><span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--n_positions<span class="w"> </span><span class="m">4096</span><span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--hidden_act<span class="w"> </span>silu
+<span class="w">	</span>--strongly_typed
 </pre></div>
 </div>
-<section id="id5">
-<h4>Throughput Benchmark<a class="headerlink" href="#id5" title="Link to this heading"></a></h4>
+<section id="id6">
+<h4>Throughput Benchmark<a class="headerlink" href="#id6" title="Link to this heading"></a></h4>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nv">in_out_sizes</span><span class="o">=(</span><span class="s2">&quot;64:128,128&quot;</span><span class="w"> </span><span class="s2">&quot;64:128,2048&quot;</span><span class="w"> </span><span class="s2">&quot;64:2048,128&quot;</span><span class="w"> </span><span class="s2">&quot;32:2048,2048&quot;</span><span class="o">)</span>
 <span class="k">for</span><span class="w"> </span>in_out<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="si">${</span><span class="nv">in_out_sizes</span><span class="p">[@]</span><span class="si">}</span>
 <span class="k">do</span>
@@ -934,8 +1539,8 @@ python<span class="w"> </span>examples/llama/build.py<span class="w"> </span><sp
 </pre></div>
 </div>
 </section>
-<section id="id6">
-<h4>First Token Latency Benchmark<a class="headerlink" href="#id6" title="Link to this heading"></a></h4>
+<section id="id7">
+<h4>First Token Latency Benchmark<a class="headerlink" href="#id7" title="Link to this heading"></a></h4>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nv">in_out_sizes</span><span class="o">=(</span><span class="s2">&quot;64:128,1&quot;</span><span class="w"> </span><span class="s2">&quot;32:2048,1&quot;</span><span class="o">)</span>
 <span class="k">for</span><span class="w"> </span>in_out<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="si">${</span><span class="nv">in_out_sizes</span><span class="p">[@]</span><span class="si">}</span>
 <span class="k">do</span>
@@ -951,38 +1556,53 @@ python<span class="w"> </span>examples/llama/build.py<span class="w"> </span><sp
 </section>
 <section id="llama2-70b">
 <h3>Llama2-70b<a class="headerlink" href="#llama2-70b" title="Link to this heading"></a></h3>
+<hr class="docutils" />
+<p>Prepare a config json file <code class="docutils literal notranslate"><span class="pre">/tmp/engines/llama/70b/ckpt_config.json</span></code>:</p>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;architecture&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;LlamaForCausalLM&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;dtype&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;float16&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;num_hidden_layers&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">80</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;num_attention_heads&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">64</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;hidden_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">8192</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;intermediate_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">28672</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;num_key_value_heads&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;vocab_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">32000</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;position_embedding_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;rope_gpt_neox&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;max_position_embeddings&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">4096</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;hidden_act&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;silu&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;rotary_base&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">10000.0</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;rotary_scaling&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;norm_epsilon&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">1e-05</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;quantization&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;quant_algo&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FP8&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;kv_cache_quant_algo&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FP8&quot;</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="nt">&quot;mapping&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;world_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;tp_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;pp_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>Build an engine:</p>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span>-r<span class="w"> </span>examples/llama/requirements.txt
-python<span class="w"> </span>examples/llama/build.py<span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--remove_input_padding<span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--enable_context_fmha<span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--parallel_build<span class="w"> </span><span class="se">\</span>
+trtllm-build<span class="w"> </span>--model_config<span class="w"> </span>/tmp/engines/llama/70b/ckpt_config.json<span class="w"> </span><span class="se">\</span>
 <span class="w">	</span>--output_dir<span class="w"> </span>/tmp/engines/llama/70b<span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--dtype<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--use_gpt_attention_plugin<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--world_size<span class="w"> </span><span class="m">4</span><span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--tp_size<span class="w"> </span><span class="m">4</span><span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--pp_size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--workers<span class="w"> </span><span class="m">4</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--remove_input_padding<span class="w"> </span><span class="nb">enable</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--context_fmha<span class="w"> </span><span class="nb">enable</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--gpt_attention_plugin<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
 <span class="w">	</span>--max_batch_size<span class="w"> </span><span class="m">64</span><span class="w"> </span><span class="se">\</span>
 <span class="w">	</span>--max_input_len<span class="w"> </span><span class="m">2048</span><span class="w"> </span><span class="se">\</span>
 <span class="w">	</span>--max_output_len<span class="w"> </span><span class="m">2048</span><span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--enable_fp8<span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--fp8_kv_cache<span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--strongly_typed<span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--n_layer<span class="w"> </span><span class="m">80</span><span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--n_head<span class="w"> </span><span class="m">64</span><span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--n_kv_head<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--n_embd<span class="w"> </span><span class="m">8192</span><span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--inter_size<span class="w"> </span><span class="m">28672</span><span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--vocab_size<span class="w"> </span><span class="m">32000</span><span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--n_positions<span class="w"> </span><span class="m">4096</span><span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--hidden_act<span class="w"> </span>silu<span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--ffn_dim_multiplier<span class="w"> </span><span class="m">1</span>.3<span class="w"> </span><span class="se">\</span>
-<span class="w">	</span>--multiple_of<span class="w"> </span><span class="m">4096</span>
+<span class="w">	</span>--strongly_typed
 </pre></div>
 </div>
-<section id="id7">
-<h4>Throughput Benchmark<a class="headerlink" href="#id7" title="Link to this heading"></a></h4>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nv">in_out_sizes</span><span class="o">=(</span><span class="s2">&quot;64:128,128&quot;</span><span class="w"> </span><span class="s2">&quot;64:128,2048&quot;</span><span class="w"> </span><span class="s2">&quot;64:2048,128&quot;</span><span class="w"> </span><span class="s2">&quot;64:2048,2048&quot;</span><span class="o">)</span>
+<section id="id8">
+<h4>Throughput Benchmark<a class="headerlink" href="#id8" title="Link to this heading"></a></h4>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">TRTLLM_ENABLE_XQA</span><span class="o">=</span><span class="m">1</span>
+<span class="nv">in_out_sizes</span><span class="o">=(</span><span class="s2">&quot;64:128,128&quot;</span><span class="w"> </span><span class="s2">&quot;64:128,2048&quot;</span><span class="w"> </span><span class="s2">&quot;64:2048,128&quot;</span><span class="w"> </span><span class="s2">&quot;64:2048,2048&quot;</span><span class="o">)</span>
 <span class="k">for</span><span class="w"> </span>in_out<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="si">${</span><span class="nv">in_out_sizes</span><span class="p">[@]</span><span class="si">}</span>
 <span class="k">do</span>
 <span class="w">	</span><span class="nv">batch_size</span><span class="o">=</span><span class="k">$(</span><span class="nb">echo</span><span class="w"> </span><span class="nv">$in_out</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>awk<span class="w"> </span>-F<span class="s1">&#39;:&#39;</span><span class="w"> </span><span class="s1">&#39;{ print $1 }&#39;</span><span class="k">)</span>
@@ -994,9 +1614,10 @@ python<span class="w"> </span>examples/llama/build.py<span class="w"> </span><sp
 </pre></div>
 </div>
 </section>
-<section id="id8">
-<h4>First Token Latency Benchmark<a class="headerlink" href="#id8" title="Link to this heading"></a></h4>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nv">in_out_sizes</span><span class="o">=(</span><span class="s2">&quot;64:128,1&quot;</span><span class="w"> </span><span class="s2">&quot;64:128,1&quot;</span><span class="o">)</span>
+<section id="id9">
+<h4>First Token Latency Benchmark<a class="headerlink" href="#id9" title="Link to this heading"></a></h4>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">TRTLLM_ENABLE_XQA</span><span class="o">=</span><span class="m">1</span>
+<span class="nv">in_out_sizes</span><span class="o">=(</span><span class="s2">&quot;64:128,1&quot;</span><span class="w"> </span><span class="s2">&quot;64:128,1&quot;</span><span class="o">)</span>
 <span class="k">for</span><span class="w"> </span>in_out<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="si">${</span><span class="nv">in_out_sizes</span><span class="p">[@]</span><span class="si">}</span>
 <span class="k">do</span>
 <span class="w">	</span><span class="nv">batch_size</span><span class="o">=</span><span class="k">$(</span><span class="nb">echo</span><span class="w"> </span><span class="nv">$in_out</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>awk<span class="w"> </span>-F<span class="s1">&#39;:&#39;</span><span class="w"> </span><span class="s1">&#39;{ print $1 }&#39;</span><span class="k">)</span>
@@ -1015,7 +1636,39 @@ python<span class="w"> </span>examples/llama/build.py<span class="w"> </span><sp
 <p>Benchmarking Falcon-180B requires a custom engine per batch size, input/output sequence length due
 to the large footprint of the model and the large input size of 2048. You can build and benchmark
 each engine one at a time with the following loop.</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="c1"># Benchmark specific batch size:isl:osl combinations.</span>
+<p>Prepare a config json file <code class="docutils literal notranslate"><span class="pre">/tmp/engines/falcon/180b/ckpt_config.json</span></code>:</p>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;architecture&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FalconForCausalLM&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;dtype&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;bfloat16&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;num_hidden_layers&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">80</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;num_attention_heads&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">232</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;num_key_value_heads&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;hidden_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">14848</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;norm_epsilon&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">1e-05</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;vocab_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">65024</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;position_embedding_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;rope_gpt_neox&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;max_position_embeddings&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">2048</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;hidden_act&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;gelu&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;use_parallel_embedding&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;embedding_sharding_dim&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;share_embedding_table&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;quantization&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;quant_algo&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FP8&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;kv_cache_quant_algo&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FP8&quot;</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="nt">&quot;mapping&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;world_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;tp_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;pp_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="nt">&quot;bias&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;parallel_attention&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;new_decoder_architecture&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">TRTLLM_ENABLE_XQA</span><span class="o">=</span><span class="m">1</span>
+<span class="c1"># Benchmark specific batch size:isl:osl combinations.</span>
 <span class="nv">in_out_sizes</span><span class="o">=(</span><span class="s2">&quot;96:128,128&quot;</span><span class="w"> </span><span class="s2">&quot;96:128,2048&quot;</span><span class="w"> </span><span class="s2">&quot;64:2048,128&quot;</span><span class="o">)</span>
 <span class="k">for</span><span class="w"> </span>in_out<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="si">${</span><span class="nv">in_out_sizes</span><span class="p">[@]</span><span class="si">}</span>
 <span class="k">do</span>
@@ -1027,29 +1680,19 @@ each engine one at a time with the following loop.</p>
 <span class="w">	</span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;BS: </span><span class="nv">$batch_size</span><span class="s2">, ISL/OSL: </span><span class="si">${</span><span class="nv">isl</span><span class="si">}</span><span class="s2">,</span><span class="si">${</span><span class="nv">osl</span><span class="si">}</span><span class="s2">&quot;</span>
 
 <span class="w">	</span><span class="c1"># Build the specific engine for the BS,ISL,OSL combination</span>
-<span class="w">	</span>python<span class="w"> </span>examples/falcon/build.py<span class="w"> </span><span class="se">\</span>
-<span class="w">		</span>--use_inflight_batching<span class="w"> </span><span class="se">\</span>
-<span class="w">		</span>--paged_kv_cache<span class="w"> </span><span class="se">\</span>
-<span class="w">		</span>--remove_input_padding<span class="w"> </span><span class="se">\</span>
-<span class="w">		</span>--enable_context_fmha<span class="w"> </span><span class="se">\</span>
-<span class="w">		</span>--parallel_build<span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>trtllm-build<span class="w"> </span>--model_config<span class="w"> </span>/tmp/engines/falcon/180b/ckpt_config.json<span class="w"> </span><span class="se">\</span>
 <span class="w">		</span>--output_dir<span class="w"> </span><span class="nv">$engine_path</span><span class="w"> </span><span class="se">\</span>
-<span class="w">		</span>--dtype<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
-<span class="w">		</span>--use_gemm_plugin<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
-<span class="w">		</span>--use_gpt_attention_plugin<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
-<span class="w">		</span>--world_size<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
-<span class="w">		</span>--tp<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">		</span>--workers<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">		</span>--remove_input_padding<span class="w"> </span><span class="nb">enable</span><span class="w"> </span><span class="se">\</span>
+<span class="w">		</span>--context_fmha<span class="w"> </span><span class="nb">enable</span><span class="w"> </span><span class="se">\</span>
+<span class="w">		</span>--gpt_attention_plugin<span class="w"> </span>bfloat16<span class="w"> </span><span class="se">\</span>
+<span class="w">		</span>--gemm_plugin<span class="w"> </span>bfloat16<span class="w"> </span><span class="se">\</span>
+<span class="w">		</span>--paged_kv_cache<span class="w"> </span><span class="nb">enable</span><span class="w"> </span><span class="se">\</span>
 <span class="w">		</span>--max_batch_size<span class="w"> </span><span class="nv">$batch_size</span><span class="w"> </span><span class="se">\</span>
 <span class="w">		</span>--max_input_len<span class="w"> </span><span class="nv">$isl</span><span class="w"> </span><span class="se">\</span>
 <span class="w">		</span>--max_output_len<span class="w"> </span><span class="nv">$osl</span><span class="w"> </span><span class="se">\</span>
-<span class="w">		</span>--enable_fp8<span class="w"> </span><span class="se">\</span>
-<span class="w">		</span>--fp8_kv_cache<span class="w"> </span><span class="se">\</span>
-<span class="w">		</span>--n_layer<span class="w"> </span><span class="m">80</span><span class="w"> </span><span class="se">\</span>
-<span class="w">		</span>--n_head<span class="w"> </span><span class="m">232</span><span class="w"> </span><span class="se">\</span>
-<span class="w">		</span>--n_kv_head<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
-<span class="w">		</span>--n_embd<span class="w"> </span><span class="m">14848</span><span class="w"> </span><span class="se">\</span>
-<span class="w">		</span>--vocab_size<span class="w"> </span><span class="m">65024</span><span class="w"> </span><span class="se">\</span>
-<span class="w">		</span>--new_decoder_architecture
+<span class="w">		</span>--strongly_typed
+
 <span class="w">	</span><span class="c1"># Throughput benchmark</span>
 <span class="w">	</span>mpirun<span class="w"> </span>-n<span class="w"> </span><span class="m">8</span><span class="w"> </span>--allow-run-as-root<span class="w"> </span>--oversubscribe<span class="w"> </span>./cpp/build/benchmarks/gptSessionBenchmark<span class="w"> </span>--model<span class="w"> </span>falcon<span class="w"> </span>--engine_dir<span class="w"> </span><span class="nv">$engine_path</span><span class="w"> </span>--warm_up<span class="w"> </span><span class="m">1</span><span class="w"> </span>--batch_size<span class="w"> </span><span class="nv">$batch_size</span><span class="w"> </span>--duration<span class="w"> </span><span class="m">0</span><span class="w"> </span>--num_runs<span class="w"> </span><span class="m">5</span><span class="w"> </span>--input_output_len<span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">isl</span><span class="si">}</span><span class="s2">,</span><span class="si">${</span><span class="nv">osl</span><span class="si">}</span><span class="s2">&quot;</span>
 <span class="w">	</span><span class="c1"># Time to first token benchmark</span>
@@ -1069,7 +1712,7 @@ each engine one at a time with the following loop.</p>
            </div>
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
-        <a href="installation.html" class="btn btn-neutral float-left" title="TensorRT-LLM Installation" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="build_from_source.html" class="btn btn-neutral float-left" title="Build from Source" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
         <a href="2023-05-19-how-to-debug.html" class="btn btn-neutral float-right" title="How to debug" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 

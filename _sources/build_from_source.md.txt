@@ -1,4 +1,4 @@
-# TensorRT-LLM Installation
+# Build from Source
 
 - [Overview](#overview)
 - [Install From the Wheel Package](#install-from-the-wheel-package)
@@ -14,27 +14,15 @@
 
 ## Overview
 
-This document contains instructions to install TensorRT-LLM.
-We recommend the use of [Docker](https://www.docker.com) to build and run
-TensorRT-LLM. Instructions to install an environment to run Docker containers
-for the NVIDIA platform can be found
+This document provides instructions for building TensorRT-LLM from source code on Linux.
+
+We first recommend that you [`install TensorRT-LLM`](../../README.md#installation) directly.
+Building from source code is necessary for users who require the best performance or debugging
+capabilities, or if the [GNU C++11 ABI](https://gcc.gnu.org/onlinedocs/libstdc++/manual/using_dual_abi.html) is required.
+
+We recommend the use of [Docker](https://www.docker.com) to build and run TensorRT-LLM. Instructions
+to install an environment to run Docker containers for the NVIDIA platform can be found
 [here](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html).
-
-## Install From the Wheel Package
-
-After installing CUDA 12.2 according to the [instructions](https://developer.nvidia.com/cuda-toolkit),
-please execute the following commands to install TensorRT-LLM.
-
-```bash
-# Install dependencies, TensorRT-LLM requires Python 3.10
-apt-get update && apt-get -y install python3.10 python3-pip openmpi-bin libopenmpi-dev
-# Install the latest version of TensorRT-LLM
-pip3 install tensorrt_llm -U --extra-index-url https://pypi.nvidia.com
-# Check installation
-python3 -c "import tensorrt_llm; print(tensorrt_llm.__version__)"
-```
-
-Note that users who have debugging needs or use the GNU C++11 ABI need to compile TensorRT-LLM from source.
 
 ## Fetch the Sources
 
@@ -43,15 +31,17 @@ The first step to build TensorRT-LLM is to fetch the sources:
 ```bash
 # TensorRT-LLM uses git-lfs, which needs to be installed in advance.
 apt-get update && apt-get -y install git git-lfs
+git lfs install
 
 git clone https://github.com/NVIDIA/TensorRT-LLM.git
 cd TensorRT-LLM
 git submodule update --init --recursive
-git lfs install
 git lfs pull
 ```
 
-## Build TensorRT-LLM in One Step
+Note: There are two options to create TensorRT-LLM Docker image and approximate disk space required to build the image is 63 GB
+
+## Option 1: Build TensorRT-LLM in One Step
 
 TensorRT-LLM contains a simple command to create a Docker image:
 
@@ -79,7 +69,7 @@ The `make` command supports the `LOCAL_USER=1` argument to switch to the local
 user account instead of `root` inside the container.  The examples of
 TensorRT-LLM are installed in directory `/app/tensorrt_llm/examples`.
 
-## Build Step-by-step
+## Option 2: Build Step-by-step
 
 For users looking for more flexibility, TensorRT-LLM has commands to create and
 run a development container in which TensorRT-LLM can be built.
@@ -167,17 +157,18 @@ The list of supported architectures can be found in the
 ### Build the Python Bindings for the C++ Runtime
 
 The C++ Runtime, in particular, [`GptSession`](source:cpp/include/tensorrt_llm/runtime/gptSession.h) can be exposed to
-Python via [bindings](source:cpp/tensorrt_llm/pybind/bindings.cpp). This is currently an opt-in feature which needs to be
-explicitly activated during compilation time. The corresponding option `--python_bindings` can be specified
-to `build_wheel.py` in the standard way:
+Python via [bindings](source:cpp/tensorrt_llm/pybind/bindings.cpp). This feature can be turned on through the default
+build options:
 
 ```bash
-python3 ./scripts/build_wheel.py --python_bindings --trt_root /usr/local/tensorrt
+python3 ./scripts/build_wheel.py --trt_root /usr/local/tensorrt
 ```
 
 After installing the resulting wheel as described above, the C++ Runtime bindings will be available in
 package `tensorrt_llm.bindings`. Running `help` on this package in a Python interpreter will provide on overview of the
 relevant classes. The [associated unit tests](source:tests/bindings) should also be consulted for understanding the API.
+
+This feature will not be enabled when [`building only the C++ runtime`](#link-with-the-tensorrt-llm-c++-runtime).
 
 ### Link with the TensorRT-LLM C++ Runtime
 
@@ -198,12 +189,10 @@ build directory is `cpp/build`, which may be overridden using the option
 `--build_dir`. Run `build_wheel.py --help` for an overview of all supported
 options.
 
-Clients may choose to link against the shared or the static version of the
-library. These libraries can be found in the following locations:
+The shared library can be found in the following location:
 
 ```bash
 cpp/build/tensorrt_llm/libtensorrt_llm.so
-cpp/build/tensorrt_llm/libtensorrt_llm_static.a
 ```
 
 In addition, one needs to link against the library containing the LLM plugins
