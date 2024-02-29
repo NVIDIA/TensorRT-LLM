@@ -22,7 +22,7 @@
     <link rel="index" title="Index" href="genindex.html" />
     <link rel="search" title="Search" href="search.html" />
     <link rel="next" title="Numerical Precision" href="precision.html" />
-    <link rel="prev" title="The Batch Manager in TensorRT-LLM" href="batch_manager.html" /> 
+    <link rel="prev" title="Inference Request" href="inference_request.html" /> 
 </head>
 
 <body class="wy-body-for-nav"> 
@@ -49,15 +49,20 @@
 <li class="toctree-l1"><a class="reference internal" href="architecture.html">TensorRT-LLM Architecture</a></li>
 <li class="toctree-l1"><a class="reference internal" href="gpt_runtime.html">C++ GPT Runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="batch_manager.html">The Batch Manager in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="inference_request.html">Inference Request</a></li>
 <li class="toctree-l1 current"><a class="current reference internal" href="#">Multi-head, Multi-query and Group-query Attention</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="#important-note">Important Note</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#padded-and-packed-tensors">Padded and Packed Tensors</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#context-and-generation-phases">Context and Generation Phases</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="#context-phase">Context Phase</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#generation-phase">Generation Phase</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#generation-phase">Generation Phase</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#xqa-optimization">XQA Optimization</a></li>
+</ul>
+</li>
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="#inflight-batching">Inflight batching</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#chunked-context">Chunked Context</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#kv-cache-s">KV Cache(s)</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="#contiguous-kv-cache">Contiguous KV Cache</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#paged-kv-cache">Paged KV Cache</a></li>
@@ -65,9 +70,9 @@
 </li>
 <li class="toctree-l2"><a class="reference internal" href="#int8-fp8-kv-caches">INT8/FP8 KV Caches</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#sliding-window-attention-cyclic-rolling-buffer-kv-cache">Sliding Window Attention, Cyclic (Rolling Buffer) KV Cache</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#streamingllm">StreamingLLM</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#beam-search">Beam-Search</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#input-qkv-tensor">Input QKV tensor</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#additional-features">Additional Features</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#input-qkv-tensor">Input QKV tensor</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="#rotary-positional-embedding-rope">Rotary Positional Embedding (RoPE)</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#alibi">ALiBi</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#scaling-factor-s">Scaling factor(s)</a></li>
@@ -78,13 +83,16 @@
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="precision.html">Numerical Precision</a></li>
-<li class="toctree-l1"><a class="reference internal" href="installation.html">TensorRT-LLM Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="build_from_source.html">Build from Source</a></li>
 <li class="toctree-l1"><a class="reference internal" href="performance.html">Performance of TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="2023-05-19-how-to-debug.html">How to debug</a></li>
 <li class="toctree-l1"><a class="reference internal" href="2023-05-17-how-to-add-a-new-model.html">How to add a new model</a></li>
 <li class="toctree-l1"><a class="reference internal" href="graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="memory.html">Memory Usage of TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="new_workflow.html">New Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="perf_best_practices.html">Best Practices for Tuning the Performance of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="performance_analysis.html">Performance Analysis of TensorRT-LLM</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Python API</span></p>
 <ul>
@@ -104,6 +112,7 @@
 <li class="toctree-l1"><a class="reference internal" href="blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
 </ul>
 
         </div>
@@ -222,6 +231,27 @@ proportional to sequence length, so there can be some cases that GPU’s shared
 memory is not enough when multi-block mode is not enabled. To get masked MHA
 kernel work in these cases, multi-block mode is forced on and a warning log is
 printed.</p>
+<section id="xqa-optimization">
+<h4>XQA Optimization<a class="headerlink" href="#xqa-optimization" title="Link to this heading"></a></h4>
+<p>Another optimization for MQA/GQA in generation phase called XQA optimization.
+It is still experimental feature and support limited configurations. LLAMA2 70B
+is one model that it supports.</p>
+<p>Support matrix of the XQA optimization:</p>
+<ul class="simple">
+<li><p>FP16 / BF16 compute data type.</p></li>
+<li><p>FP16 / BF16 / FP8 / INT8 KV cache data type.</p></li>
+<li><p>Paged KV cache (64 / 128 tokens per block).</p></li>
+</ul>
+<p>This is default enabled. To disable this, you need to use the
+flag <code class="docutils literal notranslate"><span class="pre">--disable_xqa</span></code> when building the engines. Note that a heuristic algorithm
+is also used to decide whether to use XQA kernel or masked MHA kernel to get
+better performance. That means even <code class="docutils literal notranslate"><span class="pre">--disable_xqa</span></code> is not set, XQA kernels
+may not also be used. If you want to always use that kernel when possible,
+<code class="docutils literal notranslate"><span class="pre">TRTLLM_FORCE_XQA=1</span></code> can be set to force use XQA kernels when the model config
+is supported. Detailed supported configuration can be found function <code class="docutils literal notranslate"><span class="pre">shouldUse</span></code>
+of class <code class="docutils literal notranslate"><span class="pre">DecoderXQARunner</span></code> in
+<code class="docutils literal notranslate"><span class="pre">cpp/tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunner.h</span></code>.</p>
+</section>
 </section>
 </section>
 <section id="inflight-batching">
@@ -240,6 +270,17 @@ before the tokens of <code class="docutils literal notranslate"><span class="pre
 be relaxed in a future version.</p>
 <p><em>(1) Padding sequences in the generation phase, that contain a single token, to
 the length of the maximum input sequence is inefficient use of resources</em>.</p>
+</section>
+<section id="chunked-context">
+<h2>Chunked Context<a class="headerlink" href="#chunked-context" title="Link to this heading"></a></h2>
+<p>In the original state, the common behavior was to process all context tokens at
+once. This feature splits the context into several chunks. In this way, the
+context chunks can be batched with more tokens during the generation phase,
+which is expected to increase the total throughput. Chunking contexts also removes
+constraints on input length. To enable this feature, the FMHA paged kv-cache also
+needs to be enabled. Except for the last one, the size of the context chunk needs
+to be an integer multiple of the kv-cache block size. Please refer to
+<a class="reference internal" href="perf_best_practices.html#chunked-context"><span class="std std-ref">the performance best practices</span></a> for usage.</p>
 </section>
 <section id="kv-cache-s">
 <h2>KV Cache(s)<a class="headerlink" href="#kv-cache-s" title="Link to this heading"></a></h2>
@@ -282,12 +323,12 @@ outputs. However, TensorRT-LLM supports INT8 and FP8
 <p>The GPT attention operator populates the KV cache. When INT8 or FP8 KV caches
 are enabled, the input values have to be quantized to 8 bits using a scaling
 factor. For quantization, the scaling factor is stored in the
-<code class="docutils literal notranslate"><span class="pre">kv_orig_quant_scale</span></code> tensor. Its shape is <code class="docutils literal notranslate"><span class="pre">[1]</span></code> and only per-tensor
-quantization is supported in the current version.</p>
+<code class="docutils literal notranslate"><span class="pre">kv_cache_scaling_factor</span></code> tensor. Its shape is <code class="docutils literal notranslate"><span class="pre">[1]</span></code> and only per-tensor
+quantization is supported in the current version. Quantization uses inversed scale
+since it does multiply as <code class="docutils literal notranslate"><span class="pre">fp_value</span> <span class="pre">*</span> <span class="pre">(1.0</span> <span class="pre">/</span> <span class="pre">kv_cache_scaling_factor)</span></code> in plugin.</p>
 <p>During generation, the values read from the cache are dequantized on-the-fly in
-the MHA/MQA kernel. The scaling factor to dequantize those values is stored in
-the <code class="docutils literal notranslate"><span class="pre">kv_quant_orig_scale</span></code> tensor. That tensor contains a single value (per
-tensor scaling).</p>
+the MHA/MQA kernel, dequantization can be described as
+<code class="docutils literal notranslate"><span class="pre">quantized_value</span> <span class="pre">*</span> <span class="pre">kv_cache_scaling_factor</span></code>.</p>
 </section>
 <section id="sliding-window-attention-cyclic-rolling-buffer-kv-cache">
 <h2>Sliding Window Attention, Cyclic (Rolling Buffer) KV Cache<a class="headerlink" href="#sliding-window-attention-cyclic-rolling-buffer-kv-cache" title="Link to this heading"></a></h2>
@@ -311,6 +352,22 @@ This tensor will serve as the buffer for <code class="docutils literal notransla
 setting unique values for each layer. However, it’s important to note that the
 memory allocation for the kv cache still relies on the buffer’s maximum value.</em></p>
 </section>
+<section id="streamingllm">
+<h2>StreamingLLM<a class="headerlink" href="#streamingllm" title="Link to this heading"></a></h2>
+<p>The StreamingLLM feature uses a window attention to perform efficient and stable LLM
+on long texts, which means that only <code class="docutils literal notranslate"><span class="pre">N</span></code> tokens need to be stored in the KV cache.
+Similar to the cyclic KV cache feature in TensorRT-LLM, <code class="docutils literal notranslate"><span class="pre">max_attention_window_size</span></code>
+parameter is used to determine <code class="docutils literal notranslate"><span class="pre">N</span></code>. Different from the cyclic KV cache feature,
+the first <code class="docutils literal notranslate"><span class="pre">S</span></code> tokens, called sink tokens, are always kept in the attention window,
+where <code class="docutils literal notranslate"><span class="pre">S</span></code> is determined by <code class="docutils literal notranslate"><span class="pre">sink_token_length</span></code> parameter in <code class="docutils literal notranslate"><span class="pre">GenerationSession.setup</span></code>.
+In addition, the relative position embedding is also changed in StreamingLLM.
+When determining the relative distance and adding positional information to tokens,
+StreamingLLM use the positions within the cache rather than those in the original text.
+<code class="docutils literal notranslate"><span class="pre">enable_pos_shift</span></code> flag is used to enable this feature.</p>
+<p>In context phase, the self-attentions is dense in the official implementation of
+StreamingLLM, and it uses all of the tokens for computation and only saves <code class="docutils literal notranslate"><span class="pre">N</span></code> tokens
+to the KV cache. This mode is determined by the <code class="docutils literal notranslate"><span class="pre">dense_context_fmha</span></code> flag.</p>
+</section>
 <section id="beam-search">
 <h2>Beam-Search<a class="headerlink" href="#beam-search" title="Link to this heading"></a></h2>
 <p>The GPT attention operator supports beam-search. In the context phase, a single
@@ -332,7 +389,7 @@ attention operator.</p>
 where <code class="docutils literal notranslate"><span class="pre">batch_beam_size</span></code> is the batch size (number of sequences) for the context
 phase and the batch size multiplied by the beam width for the generation phase.
 Having different beam widths per sequence in padded mode is not supported.</p>
-<p>In packed mode, its shape is <code class="docutils literal notranslate"><span class="pre">[1,</span> <span class="pre">num_tokens,</span> <span class="pre">3</span> <span class="pre">*</span> <span class="pre">hidden_dim]</span></code> where
+<p>In packed mode, its shape is <code class="docutils literal notranslate"><span class="pre">[num_tokens,</span> <span class="pre">3</span> <span class="pre">*</span> <span class="pre">hidden_dim]</span></code> where
 <code class="docutils literal notranslate"><span class="pre">num_tokens</span></code> is the total number of tokens in the batch. For the sequences in
 context phase, the number of tokens of a sequence corresponds to its input
 length (even if the beam width is greater than <code class="docutils literal notranslate"><span class="pre">1</span></code> for beam search).  For the
@@ -350,13 +407,6 @@ beam width can be different for each sequence.</p>
     <span class="n">num_tokens</span> <span class="o">+=</span> <span class="n">seq</span><span class="o">.</span><span class="n">beam_width</span>
 </pre></div>
 </div>
-<p>In a future release of TensorRT-LLM, the rank of that packed input tensor
-may be reduced from 3 to 2. The current rank is to maintain the homogeneity
-between padded and packed modes. It is no longer justified if support for
-padded mode is removed.</p>
-</section>
-<section id="additional-features">
-<h2>Additional Features<a class="headerlink" href="#additional-features" title="Link to this heading"></a></h2>
 <section id="rotary-positional-embedding-rope">
 <h3>Rotary Positional Embedding (RoPE)<a class="headerlink" href="#rotary-positional-embedding-rope" title="Link to this heading"></a></h3>
 <p>The GPT attention operation can perform the computation of the Rotary
@@ -376,7 +426,7 @@ kernel.</p>
 <h3>Scaling factor(s)<a class="headerlink" href="#scaling-factor-s" title="Link to this heading"></a></h3>
 <p>In MHA, the output of the <code class="docutils literal notranslate"><span class="pre">Q*K^T</span></code> product is scaled by a constant value that
 is computed as:</p>
-<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">scaling</span> <span class="o">=</span> <span class="mf">1.</span><span class="n">f</span> <span class="o">/</span> <span class="p">(</span><span class="n">q_scaling</span> <span class="o">*</span> <span class="n">sqrt</span><span class="p">(</span><span class="n">head_size</span><span class="p">))</span><span class="o">.</span>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">norm_factor</span> <span class="o">=</span> <span class="mf">1.</span><span class="n">f</span> <span class="o">/</span> <span class="p">(</span><span class="n">q_scaling</span> <span class="o">*</span> <span class="n">sqrt</span><span class="p">(</span><span class="n">head_size</span><span class="p">))</span><span class="o">.</span>
 </pre></div>
 </div>
 </section>
@@ -397,7 +447,7 @@ is computed as:</p>
            </div>
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
-        <a href="batch_manager.html" class="btn btn-neutral float-left" title="The Batch Manager in TensorRT-LLM" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="inference_request.html" class="btn btn-neutral float-left" title="Inference Request" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
         <a href="precision.html" class="btn btn-neutral float-right" title="Numerical Precision" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 

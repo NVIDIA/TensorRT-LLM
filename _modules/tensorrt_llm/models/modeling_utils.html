@@ -46,15 +46,19 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../architecture.html">TensorRT-LLM Architecture</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../gpt_runtime.html">C++ GPT Runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../batch_manager.html">The Batch Manager in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../inference_request.html">Inference Request</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../gpt_attention.html">Multi-head, Multi-query and Group-query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../precision.html">Numerical Precision</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../installation.html">TensorRT-LLM Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../build_from_source.html">Build from Source</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance.html">Performance of TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../2023-05-19-how-to-debug.html">How to debug</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../2023-05-17-how-to-add-a-new-model.html">How to add a new model</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../memory.html">Memory Usage of TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../new_workflow.html">New Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../perf_best_practices.html">Best Practices for Tuning the Performance of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance_analysis.html">Performance Analysis of TensorRT-LLM</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Python API</span></p>
 <ul>
@@ -74,6 +78,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
 </ul>
 
         </div>
@@ -106,12 +111,16 @@
 <span class="kn">import</span> <span class="nn">os</span>
 <span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="n">List</span><span class="p">,</span> <span class="n">Optional</span>
 
+<span class="kn">import</span> <span class="nn">numpy</span> <span class="k">as</span> <span class="nn">np</span>
 <span class="kn">import</span> <span class="nn">safetensors</span>
+<span class="kn">import</span> <span class="nn">torch</span>
 
 <span class="kn">from</span> <span class="nn">.._common</span> <span class="kn">import</span> <span class="n">default_net</span>
-<span class="kn">from</span> <span class="nn">.._utils</span> <span class="kn">import</span> <span class="n">str_dtype_to_trt</span>
+<span class="kn">from</span> <span class="nn">.._utils</span> <span class="kn">import</span> <span class="p">(</span><span class="n">numpy_to_torch</span><span class="p">,</span> <span class="n">str_dtype_to_torch</span><span class="p">,</span> <span class="n">str_dtype_to_trt</span><span class="p">,</span>
+                      <span class="n">trt_dtype_to_torch</span><span class="p">)</span>
 <span class="kn">from</span> <span class="nn">..functional</span> <span class="kn">import</span> <span class="n">PositionEmbeddingType</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">gather_last_token_logits</span>
-<span class="kn">from</span> <span class="nn">..layers</span> <span class="kn">import</span> <span class="n">AttentionParams</span><span class="p">,</span> <span class="n">KeyValueCacheParams</span><span class="p">,</span> <span class="n">LoraParams</span>
+<span class="kn">from</span> <span class="nn">..layers</span> <span class="kn">import</span> <span class="p">(</span><span class="n">AttentionParams</span><span class="p">,</span> <span class="n">FusedGatedMLP</span><span class="p">,</span> <span class="n">GatedMLP</span><span class="p">,</span>
+                      <span class="n">KeyValueCacheParams</span><span class="p">,</span> <span class="n">LoraParams</span><span class="p">)</span>
 <span class="kn">from</span> <span class="nn">..mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
 <span class="kn">from</span> <span class="nn">..module</span> <span class="kn">import</span> <span class="n">Module</span><span class="p">,</span> <span class="n">ModuleList</span>
 <span class="kn">from</span> <span class="nn">..quantization</span> <span class="kn">import</span> <span class="n">QuantMode</span>
@@ -123,14 +132,32 @@
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedConfig">[docs]</a>
 <span class="k">class</span> <span class="nc">PretrainedConfig</span><span class="p">:</span>
 
-    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">architecture</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">logits_dtype</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
-                 <span class="n">vocab_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">max_position_embeddings</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-                 <span class="n">hidden_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">num_hidden_layers</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-                 <span class="n">num_attention_heads</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">num_key_value_heads</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-                 <span class="n">hidden_act</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">intermediate_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">norm_epsilon</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
-                 <span class="n">position_embedding_type</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">world_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">tp_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-                 <span class="n">pp_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">quant_mode</span><span class="p">:</span> <span class="n">QuantMode</span><span class="p">,</span> <span class="n">quant_kwargs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">,</span>
-                 <span class="n">use_prompt_tuning</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                 <span class="n">architecture</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+                 <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+                 <span class="n">logits_dtype</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+                 <span class="n">vocab_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+                 <span class="n">max_position_embeddings</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+                 <span class="n">hidden_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+                 <span class="n">num_hidden_layers</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+                 <span class="n">num_attention_heads</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+                 <span class="n">num_key_value_heads</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+                 <span class="n">hidden_act</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+                 <span class="n">intermediate_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+                 <span class="n">norm_epsilon</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
+                 <span class="n">position_embedding_type</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+                 <span class="n">world_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+                 <span class="n">tp_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+                 <span class="n">pp_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+                 <span class="n">quant_mode</span><span class="p">:</span> <span class="n">QuantMode</span><span class="p">,</span>
+                 <span class="n">quant_kwargs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">,</span>
+                 <span class="n">use_prompt_tuning</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+                 <span class="n">use_parallel_embedding</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+                 <span class="n">embedding_sharding_dim</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
+                 <span class="n">share_embedding_table</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+                 <span class="n">max_lora_rank</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">64</span><span class="p">,</span>
+                 <span class="n">head_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">architecture</span> <span class="o">=</span> <span class="n">architecture</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span> <span class="o">=</span> <span class="n">dtype</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">logits_dtype</span> <span class="o">=</span> <span class="n">logits_dtype</span>
@@ -141,18 +168,23 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">num_hidden_layers</span> <span class="o">=</span> <span class="n">num_hidden_layers</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span> <span class="o">=</span> <span class="n">num_attention_heads</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">num_key_value_heads</span> <span class="o">=</span> <span class="n">num_key_value_heads</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">head_size</span> <span class="o">=</span> <span class="n">hidden_size</span> <span class="o">//</span> <span class="n">num_attention_heads</span> <span class="k">if</span> <span class="n">head_size</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">head_size</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">hidden_act</span> <span class="o">=</span> <span class="n">hidden_act</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">intermediate_size</span> <span class="o">=</span> <span class="n">intermediate_size</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">norm_epsilon</span> <span class="o">=</span> <span class="n">norm_epsilon</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">position_embedding_type</span> <span class="o">=</span> <span class="n">PositionEmbeddingType</span><span class="o">.</span><span class="n">from_string</span><span class="p">(</span>
             <span class="n">position_embedding_type</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">use_prompt_tuning</span> <span class="o">=</span> <span class="n">use_prompt_tuning</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">use_parallel_embedding</span> <span class="o">=</span> <span class="n">use_parallel_embedding</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">embedding_sharding_dim</span> <span class="o">=</span> <span class="n">embedding_sharding_dim</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">share_embedding_table</span> <span class="o">=</span> <span class="n">share_embedding_table</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span> <span class="o">=</span> <span class="n">Mapping</span><span class="p">(</span><span class="n">world_size</span><span class="o">=</span><span class="n">world_size</span><span class="p">,</span>
                                <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
                                <span class="n">pp_size</span><span class="o">=</span><span class="n">pp_size</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span> <span class="o">=</span> <span class="n">quant_mode</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">quant_kwargs</span> <span class="o">=</span> <span class="n">quant_kwargs</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">kv_dtype</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">max_lora_rank</span> <span class="o">=</span> <span class="n">max_lora_rank</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_int8_kv_cache</span><span class="p">():</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">kv_dtype</span> <span class="o">=</span> <span class="s1">&#39;int8&#39;</span>
         <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_fp8_kv_cache</span><span class="p">():</span>
@@ -191,70 +223,66 @@
         <span class="n">intermediate_size</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;intermediate_size&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="n">max_position_embeddings</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;max_position_embeddings&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="n">use_prompt_tuning</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;use_prompt_tuning&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
+        <span class="n">use_parallel_embedding</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;use_parallel_embedding&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
+        <span class="n">embedding_sharding_dim</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;embedding_sharding_dim&#39;</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="n">share_embedding_table</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;share_embedding_table&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
 
         <span class="n">mapping</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;mapping&#39;</span><span class="p">,</span> <span class="p">{</span>
             <span class="s1">&#39;world_size&#39;</span><span class="p">:</span> <span class="mi">1</span><span class="p">,</span>
             <span class="s1">&#39;tp_size&#39;</span><span class="p">:</span> <span class="mi">1</span><span class="p">,</span>
-            <span class="s1">&#39;pp_size&#39;</span><span class="p">:</span> <span class="mi">0</span>
+            <span class="s1">&#39;pp_size&#39;</span><span class="p">:</span> <span class="mi">1</span>
         <span class="p">})</span>
         <span class="n">world_size</span> <span class="o">=</span> <span class="n">mapping</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;world_size&#39;</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
         <span class="n">tp_size</span> <span class="o">=</span> <span class="n">mapping</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;tp_size&#39;</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
         <span class="n">pp_size</span> <span class="o">=</span> <span class="n">mapping</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;pp_size&#39;</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
 
+        <span class="k">if</span> <span class="n">share_embedding_table</span> <span class="ow">and</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="k">if</span> <span class="p">(</span><span class="ow">not</span> <span class="n">use_parallel_embedding</span><span class="p">)</span> <span class="ow">or</span> <span class="p">(</span><span class="n">use_parallel_embedding</span> <span class="ow">and</span>
+                                                <span class="n">embedding_sharding_dim</span> <span class="o">==</span> <span class="mi">1</span><span class="p">):</span>
+                <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span>
+                    <span class="s2">&quot;For multiple-processes cases, sharing the embedding table must set&quot;</span> \
+                        <span class="s2">&quot;use_parallel_embedding=True and embedding_sharding_dim=0&quot;</span>
+                <span class="p">)</span>
+
         <span class="n">quantization</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span>
             <span class="s1">&#39;quantization&#39;</span><span class="p">,</span> <span class="p">{</span>
-                <span class="s1">&#39;use_smooth_quant&#39;</span><span class="p">:</span> <span class="kc">False</span><span class="p">,</span>
-                <span class="s1">&#39;per_channel&#39;</span><span class="p">:</span> <span class="kc">False</span><span class="p">,</span>
-                <span class="s1">&#39;per_token&#39;</span><span class="p">:</span> <span class="kc">False</span><span class="p">,</span>
-                <span class="s1">&#39;per_group&#39;</span><span class="p">:</span> <span class="kc">False</span><span class="p">,</span>
+                <span class="s1">&#39;quant_algo&#39;</span><span class="p">:</span> <span class="kc">None</span><span class="p">,</span>
+                <span class="s1">&#39;kv_cache_quant_algo&#39;</span><span class="p">:</span> <span class="kc">None</span><span class="p">,</span>
                 <span class="s1">&#39;group_size&#39;</span><span class="p">:</span> <span class="mi">128</span><span class="p">,</span>
-                <span class="s1">&#39;int8_kv_cache&#39;</span><span class="p">:</span> <span class="kc">False</span><span class="p">,</span>
-                <span class="s1">&#39;enable_fp8&#39;</span><span class="p">:</span> <span class="kc">False</span><span class="p">,</span>
-                <span class="s1">&#39;fp8_kv_cache&#39;</span><span class="p">:</span> <span class="kc">False</span><span class="p">,</span>
-                <span class="s1">&#39;use_weight_only&#39;</span><span class="p">:</span> <span class="kc">False</span><span class="p">,</span>
-                <span class="s1">&#39;weight_only_precision&#39;</span><span class="p">:</span> <span class="s1">&#39;int8&#39;</span>
+                <span class="s1">&#39;has_zero_point&#39;</span><span class="p">:</span> <span class="kc">False</span><span class="p">,</span>
+                <span class="s1">&#39;pre_quant_scale&#39;</span><span class="p">:</span> <span class="kc">False</span><span class="p">,</span>
+                <span class="s1">&#39;exclude_modules&#39;</span><span class="p">:</span> <span class="kc">None</span><span class="p">,</span>
+                <span class="s1">&#39;sq_use_plugin&#39;</span><span class="p">:</span> <span class="kc">False</span><span class="p">,</span>
             <span class="p">})</span>
-        <span class="n">use_smooth_quant</span> <span class="o">=</span> <span class="n">quantization</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;use_smooth_quant&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
-        <span class="n">per_channel</span> <span class="o">=</span> <span class="n">quantization</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;per_channel&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
-        <span class="n">per_token</span> <span class="o">=</span> <span class="n">quantization</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;per_token&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
-        <span class="n">per_group</span> <span class="o">=</span> <span class="n">quantization</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;per_group&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
+        <span class="n">quant_algo</span> <span class="o">=</span> <span class="n">quantization</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;quant_algo&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="n">kv_cache_quant_algo</span> <span class="o">=</span> <span class="n">quantization</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;kv_cache_quant_algo&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="n">group_size</span> <span class="o">=</span> <span class="n">quantization</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;group_size&#39;</span><span class="p">,</span> <span class="mi">128</span><span class="p">)</span>
-        <span class="n">int8_kv_cache</span> <span class="o">=</span> <span class="n">quantization</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;int8_kv_cache&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
-        <span class="n">enable_fp8</span> <span class="o">=</span> <span class="n">quantization</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;enable_fp8&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
-        <span class="n">fp8_kv_cache</span> <span class="o">=</span> <span class="n">quantization</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;fp8_kv_cache&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
-        <span class="n">use_weight_only</span> <span class="o">=</span> <span class="n">quantization</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;use_weight_only&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
-        <span class="n">weight_only_precision</span> <span class="o">=</span> <span class="n">quantization</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;weight_only_precision&#39;</span><span class="p">,</span>
-                                                 <span class="s1">&#39;int8&#39;</span><span class="p">)</span>
+        <span class="n">has_zero_point</span> <span class="o">=</span> <span class="n">quantization</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;has_zero_point&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
+        <span class="n">pre_quant_scale</span> <span class="o">=</span> <span class="n">quantization</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;pre_quant_scale&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
+        <span class="n">exclude_modules</span> <span class="o">=</span> <span class="n">quantization</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;exclude_modules&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="n">sq_use_plugin</span> <span class="o">=</span> <span class="n">quantization</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;sq_use_plugin&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
 
-        <span class="n">quantize_weights</span><span class="p">,</span> <span class="n">quantize_activations</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span> <span class="kc">False</span>
-        <span class="k">if</span> <span class="n">use_smooth_quant</span><span class="p">:</span>
-            <span class="n">quantize_weights</span> <span class="o">=</span> <span class="kc">True</span>
-            <span class="n">quantize_activations</span> <span class="o">=</span> <span class="kc">True</span>
-        <span class="k">elif</span> <span class="n">use_weight_only</span><span class="p">:</span>
-            <span class="n">quantize_weights</span> <span class="o">=</span> <span class="kc">True</span>
-            <span class="n">per_token</span> <span class="o">=</span> <span class="kc">False</span>
-            <span class="n">per_channel</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="n">quant_mode</span> <span class="o">=</span> <span class="n">QuantMode</span><span class="o">.</span><span class="n">from_quant_algo</span><span class="p">(</span><span class="n">quant_algo</span><span class="p">,</span> <span class="n">kv_cache_quant_algo</span><span class="p">)</span>
+        <span class="n">quant_kwargs</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="s1">&#39;quant_algo&#39;</span><span class="p">:</span> <span class="n">quant_algo</span><span class="p">,</span>
+            <span class="s1">&#39;kv_cache_quant_algo&#39;</span><span class="p">:</span> <span class="n">kv_cache_quant_algo</span><span class="p">,</span>
+            <span class="s1">&#39;group_size&#39;</span><span class="p">:</span> <span class="n">group_size</span><span class="p">,</span>
+            <span class="s1">&#39;zero&#39;</span><span class="p">:</span> <span class="n">has_zero_point</span><span class="p">,</span>
+            <span class="s1">&#39;pre_quant_scale&#39;</span><span class="p">:</span> <span class="n">pre_quant_scale</span><span class="p">,</span>
+            <span class="s1">&#39;exclude_modules&#39;</span><span class="p">:</span> <span class="n">exclude_modules</span><span class="p">,</span>
+            <span class="s1">&#39;sq_use_plugin&#39;</span><span class="p">:</span> <span class="n">sq_use_plugin</span><span class="p">,</span>
+        <span class="p">}</span>
 
-        <span class="n">quant_mode</span> <span class="o">=</span> <span class="n">QuantMode</span><span class="o">.</span><span class="n">from_description</span><span class="p">(</span>
-            <span class="n">quantize_weights</span><span class="o">=</span><span class="n">quantize_weights</span><span class="p">,</span>
-            <span class="n">quantize_activations</span><span class="o">=</span><span class="n">quantize_activations</span><span class="p">,</span>
-            <span class="n">per_token</span><span class="o">=</span><span class="n">per_token</span><span class="p">,</span>
-            <span class="n">per_channel</span><span class="o">=</span><span class="n">per_channel</span><span class="p">,</span>
-            <span class="n">per_group</span><span class="o">=</span><span class="n">per_group</span><span class="p">,</span>
-            <span class="n">use_int4_weights</span><span class="o">=</span><span class="p">(</span><span class="n">weight_only_precision</span> <span class="o">==</span> <span class="s1">&#39;int4&#39;</span><span class="p">),</span>
-            <span class="n">use_int8_kv_cache</span><span class="o">=</span><span class="n">int8_kv_cache</span><span class="p">,</span>
-            <span class="n">use_fp8_kv_cache</span><span class="o">=</span><span class="n">fp8_kv_cache</span><span class="p">,</span>
-            <span class="n">use_fp8_qdq</span><span class="o">=</span><span class="n">enable_fp8</span><span class="p">,</span>
-        <span class="p">)</span>
-
-        <span class="n">quant_kwargs</span> <span class="o">=</span> <span class="p">{</span><span class="s1">&#39;group_size&#39;</span><span class="p">:</span> <span class="n">group_size</span><span class="p">}</span>
+        <span class="n">max_lora_rank</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;max_lora_rank&#39;</span><span class="p">,</span> <span class="mi">64</span><span class="p">)</span>
 
         <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="n">architecture</span><span class="p">,</span> <span class="n">dtype</span><span class="p">,</span> <span class="n">logits_dtype</span><span class="p">,</span> <span class="n">vocab_size</span><span class="p">,</span>
                    <span class="n">max_position_embeddings</span><span class="p">,</span> <span class="n">hidden_size</span><span class="p">,</span> <span class="n">num_hidden_layers</span><span class="p">,</span>
                    <span class="n">num_attention_heads</span><span class="p">,</span> <span class="n">num_key_value_heads</span><span class="p">,</span> <span class="n">hidden_act</span><span class="p">,</span>
                    <span class="n">intermediate_size</span><span class="p">,</span> <span class="n">norm_epsilon</span><span class="p">,</span> <span class="n">position_embedding_type</span><span class="p">,</span>
                    <span class="n">world_size</span><span class="p">,</span> <span class="n">tp_size</span><span class="p">,</span> <span class="n">pp_size</span><span class="p">,</span> <span class="n">quant_mode</span><span class="p">,</span> <span class="n">quant_kwargs</span><span class="p">,</span>
-                   <span class="n">use_prompt_tuning</span><span class="p">,</span> <span class="o">**</span><span class="n">config</span><span class="p">)</span></div>
+                   <span class="n">use_prompt_tuning</span><span class="p">,</span> <span class="n">use_parallel_embedding</span><span class="p">,</span>
+                   <span class="n">embedding_sharding_dim</span><span class="p">,</span> <span class="n">share_embedding_table</span><span class="p">,</span> <span class="n">max_lora_rank</span><span class="p">,</span>
+                   <span class="o">**</span><span class="n">config</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="PretrainedConfig.from_json_file">
@@ -280,26 +308,20 @@
         <span class="n">output</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;quant_mode&#39;</span><span class="p">)</span>
         <span class="n">output</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;quant_kwargs&#39;</span><span class="p">)</span>
         <span class="n">output</span><span class="p">[</span><span class="s1">&#39;quantization&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
-            <span class="s1">&#39;use_smooth_quant&#39;</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_act_and_weight_quant</span><span class="p">(),</span>
-            <span class="s1">&#39;per_channel&#39;</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_per_channel_scaling</span><span class="p">(),</span>
-            <span class="s1">&#39;per_token&#39;</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_per_token_dynamic_scaling</span><span class="p">(),</span>
-            <span class="s1">&#39;per_group&#39;</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_per_group_scaling</span><span class="p">(),</span>
+            <span class="s1">&#39;quant_algo&#39;</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">quant_kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;quant_algo&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">),</span>
+            <span class="s1">&#39;kv_cache_quant_algo&#39;</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">quant_kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;kv_cache_quant_algo&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">),</span>
             <span class="s1">&#39;group_size&#39;</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">quant_kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;group_size&#39;</span><span class="p">,</span> <span class="mi">128</span><span class="p">),</span>
-            <span class="s1">&#39;int8_kv_cache&#39;</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_int8_kv_cache</span><span class="p">(),</span>
-            <span class="s1">&#39;enable_fp8&#39;</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_fp8_qdq</span><span class="p">(),</span>
-            <span class="s1">&#39;fp8_kv_cache&#39;</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_fp8_kv_cache</span><span class="p">(),</span>
-            <span class="s1">&#39;use_weight_only&#39;</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">is_weight_only</span><span class="p">(),</span>
-            <span class="s1">&#39;weight_only_precision&#39;</span><span class="p">:</span>
-            <span class="s1">&#39;int8&#39;</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">is_int8_weight_only</span><span class="p">()</span> <span class="k">else</span> <span class="s1">&#39;int4&#39;</span><span class="p">,</span>
+            <span class="s1">&#39;has_zero_point&#39;</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">quant_kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;zero&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">),</span>
+            <span class="s1">&#39;pre_quant_scale&#39;</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">quant_kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;pre_quant_scale&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">),</span>
+            <span class="s1">&#39;exclude_modules&#39;</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">quant_kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;exclude_modules&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">),</span>
+            <span class="s1">&#39;sq_use_plugin&#39;</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">quant_kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;sq_use_plugin&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">),</span>
         <span class="p">}</span>
 
         <span class="k">return</span> <span class="n">output</span></div>
@@ -328,8 +350,9 @@
                 <span class="n">attention_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">kv_cache_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">attention_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">all_reduce_workspace</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">lora_params</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+                <span class="n">lora_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">medusa_position_offsets</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">medusa_packed_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
         <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">fill_none_tensor_list</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">layer_list</span><span class="p">))</span>
 
         <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
@@ -343,15 +366,18 @@
                         <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">host_kv_cache_block_pointers</span><span class="p">,</span>
                         <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">host_max_attention_window_sizes</span><span class="p">)):</span>
 
-            <span class="n">lora_param</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="n">lora_layer_params</span> <span class="o">=</span> <span class="kc">None</span>
             <span class="k">if</span> <span class="n">lora_params</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">lora_params</span><span class="o">.</span><span class="n">lora_ranks</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="n">lora_param</span> <span class="o">=</span> <span class="n">lora_params</span><span class="o">.</span><span class="n">get_layer_params</span><span class="p">(</span><span class="n">layer_idx</span><span class="p">)</span>
+                <span class="n">lora_layer_params</span> <span class="o">=</span> <span class="n">lora_params</span><span class="o">.</span><span class="n">get_layer_params</span><span class="p">(</span><span class="n">layer_idx</span><span class="p">)</span>
 
             <span class="n">kwargs</span> <span class="o">=</span> <span class="p">{}</span>
-            <span class="k">if</span> <span class="n">all_reduce_workspace</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;all_reduce_workspace&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">all_reduce_workspace</span>
-            <span class="k">if</span> <span class="n">lora_param</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;lora_param&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">lora_param</span>
+
+            <span class="k">if</span> <span class="n">lora_layer_params</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;lora_layer_params&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">lora_layer_params</span>
+            <span class="k">if</span> <span class="n">medusa_position_offsets</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;medusa_position_offsets&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">medusa_position_offsets</span>
+            <span class="k">if</span> <span class="n">medusa_packed_mask</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;medusa_packed_mask&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">medusa_packed_mask</span>
             <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">layer</span><span class="p">(</span>
                 <span class="n">hidden_states</span><span class="p">,</span>
                 <span class="n">use_cache</span><span class="o">=</span><span class="n">use_cache</span><span class="p">,</span>
@@ -361,6 +387,8 @@
                     <span class="n">host_past_key_value_lengths</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
                     <span class="n">host_past_key_value_lengths</span><span class="p">,</span>
                     <span class="n">host_max_attention_window_sizes</span><span class="o">=</span><span class="n">max_attention_window_size</span><span class="p">,</span>
+                    <span class="n">host_sink_token_length</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
+                    <span class="n">host_sink_token_length</span><span class="p">,</span>
                     <span class="n">kv_cache_block_pointers</span><span class="o">=</span><span class="p">[</span><span class="n">pointer</span><span class="p">],</span>
                     <span class="n">host_kv_cache_block_pointers</span><span class="o">=</span><span class="p">[</span><span class="n">host_pointer</span><span class="p">],</span>
                     <span class="n">cache_indirection</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span><span class="n">cache_indirection</span><span class="p">),</span>
@@ -388,17 +416,16 @@
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedModel">[docs]</a>
 <span class="k">class</span> <span class="nc">PretrainedModel</span><span class="p">(</span><span class="n">Module</span><span class="p">,</span> <span class="n">GenerationMixin</span><span class="p">,</span> <span class="n">metaclass</span><span class="o">=</span><span class="n">PostInitCaller</span><span class="p">):</span>
 
-    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">config</span> <span class="o">=</span> <span class="n">config</span>
 
     <span class="k">def</span> <span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">check_config</span><span class="p">()</span>
-        <span class="n">quantize</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">quant_mode</span><span class="p">)</span>
+        <span class="n">quantize</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">quant_mode</span><span class="p">,</span> <span class="o">**</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">quant_kwargs</span><span class="p">)</span>
 
 <div class="viewcode-block" id="PretrainedModel.check_config">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedModel.check_config">[docs]</a>
-    <span class="k">def</span> <span class="nf">check_config</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">check_config</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">):</span>
         <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span>
             <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="vm">__class__</span><span class="si">}</span><span class="s2"> is an abstract class. Only classes inheriting this class can be called.&quot;</span>
         <span class="p">)</span></div>
@@ -414,10 +441,14 @@
 <div class="viewcode-block" id="PretrainedModel.from_checkpoint">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedModel.from_checkpoint">[docs]</a>
     <span class="nd">@classmethod</span>
-    <span class="k">def</span> <span class="nf">from_checkpoint</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">ckpt_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">rank</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">):</span>
-        <span class="n">config</span> <span class="o">=</span> <span class="n">PretrainedConfig</span><span class="o">.</span><span class="n">from_json_file</span><span class="p">(</span>
-            <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">ckpt_dir</span><span class="p">,</span> <span class="s1">&#39;config.json&#39;</span><span class="p">))</span>
-        <span class="n">config</span><span class="o">.</span><span class="n">set_rank</span><span class="p">(</span><span class="n">rank</span><span class="p">)</span>
+    <span class="k">def</span> <span class="nf">from_checkpoint</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span>
+                        <span class="n">ckpt_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+                        <span class="n">rank</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
+                        <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+        <span class="k">if</span> <span class="n">config</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">config</span> <span class="o">=</span> <span class="n">PretrainedConfig</span><span class="o">.</span><span class="n">from_json_file</span><span class="p">(</span>
+                <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">ckpt_dir</span><span class="p">,</span> <span class="s1">&#39;config.json&#39;</span><span class="p">))</span>
+            <span class="n">config</span><span class="o">.</span><span class="n">set_rank</span><span class="p">(</span><span class="n">rank</span><span class="p">)</span>
         <span class="n">model</span> <span class="o">=</span> <span class="bp">cls</span><span class="o">.</span><span class="n">from_config</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
 
         <span class="n">weights</span> <span class="o">=</span> <span class="p">{}</span>
@@ -427,7 +458,6 @@
                                    <span class="n">device</span><span class="o">=</span><span class="s1">&#39;cpu&#39;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
             <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">f</span><span class="o">.</span><span class="n">keys</span><span class="p">():</span>
                 <span class="n">weights</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">f</span><span class="o">.</span><span class="n">get_tensor</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
-
         <span class="n">model</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">weights</span><span class="p">)</span>
 
         <span class="k">return</span> <span class="n">model</span></div>
@@ -436,9 +466,17 @@
 <div class="viewcode-block" id="PretrainedModel.load">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedModel.load">[docs]</a>
     <span class="k">def</span> <span class="nf">load</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">weights</span><span class="p">):</span>
+        <span class="n">expected_names</span> <span class="o">=</span> <span class="nb">set</span><span class="p">([</span><span class="n">name</span> <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">param</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">named_parameters</span><span class="p">()])</span>
+        <span class="n">provided_names</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="n">weights</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>
+        <span class="k">if</span> <span class="n">provided_names</span> <span class="o">!=</span> <span class="n">expected_names</span><span class="p">:</span>
+            <span class="n">err_msg</span> <span class="o">=</span> <span class="s2">&quot;Provided tensor names are different from those expected by the engine.&quot;</span>
+            <span class="k">if</span> <span class="n">expected_names</span><span class="o">.</span><span class="n">difference</span><span class="p">(</span><span class="n">provided_names</span><span class="p">):</span>
+                <span class="n">err_msg</span> <span class="o">+=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">Expected but not provided tensors: </span><span class="si">{</span><span class="n">expected_names</span><span class="o">.</span><span class="n">difference</span><span class="p">(</span><span class="n">provided_names</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span>
+            <span class="k">if</span> <span class="n">provided_names</span><span class="o">.</span><span class="n">difference</span><span class="p">(</span><span class="n">expected_names</span><span class="p">):</span>
+                <span class="n">err_msg</span> <span class="o">+=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">Provided but not expected tensors: </span><span class="si">{</span><span class="n">provided_names</span><span class="o">.</span><span class="n">difference</span><span class="p">(</span><span class="n">expected_names</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span>
+            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="n">err_msg</span><span class="p">)</span>
+
         <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">param</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">named_parameters</span><span class="p">():</span>
-            <span class="k">if</span> <span class="n">name</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">weights</span><span class="p">:</span>
-                <span class="k">continue</span>
             <span class="n">param</span><span class="o">.</span><span class="n">value</span> <span class="o">=</span> <span class="n">weights</span><span class="p">[</span><span class="n">name</span><span class="p">]</span></div>
 
 
@@ -447,12 +485,15 @@
     <span class="k">def</span> <span class="nf">prepare_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                        <span class="n">max_batch_size</span><span class="p">,</span>
                        <span class="n">max_input_len</span><span class="p">,</span>
-                       <span class="n">max_new_tokens</span><span class="p">,</span>
+                       <span class="n">max_seq_len</span><span class="p">,</span>
                        <span class="n">use_cache</span><span class="p">,</span>
                        <span class="n">max_beam_width</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
                        <span class="n">max_num_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                        <span class="n">prompt_embedding_table_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
-                       <span class="n">gather_all_token_logits</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+                       <span class="n">position_encoding_2d</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+                       <span class="n">max_draft_len</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
+                       <span class="n">gather_context_logits</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+                       <span class="n">gather_generation_logits</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
                        <span class="n">lora_target_modules</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&#39;&#39;&#39;@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the</span>
 <span class="sd">            ranges of the dimensions of when using TRT dynamic shapes.</span>
@@ -461,7 +502,6 @@
 <span class="sd">        &#39;&#39;&#39;</span>
 
         <span class="c1"># Prepare inputs</span>
-        <span class="n">head_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">num_attention_heads</span>
         <span class="n">remove_input_padding</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">remove_input_padding</span>
         <span class="n">use_gpt_attention_plugin</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">(</span>
         <span class="p">)</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gpt_attention_plugin</span>
@@ -476,9 +516,9 @@
             <span class="n">max_batch_size</span><span class="o">=</span><span class="n">max_batch_size</span><span class="p">,</span>
             <span class="n">max_beam_width</span><span class="o">=</span><span class="n">max_beam_width</span><span class="p">,</span>
             <span class="n">max_input_len</span><span class="o">=</span><span class="n">max_input_len</span><span class="p">,</span>
-            <span class="n">max_new_tokens</span><span class="o">=</span><span class="n">max_new_tokens</span><span class="p">,</span>
+            <span class="n">max_seq_len</span><span class="o">=</span><span class="n">max_seq_len</span><span class="p">,</span>
             <span class="n">num_kv_heads</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">num_key_value_heads</span><span class="p">,</span>
-            <span class="n">head_size</span><span class="o">=</span><span class="n">head_size</span><span class="p">,</span>
+            <span class="n">head_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">head_size</span><span class="p">,</span>
             <span class="n">num_layers</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">num_hidden_layers</span><span class="p">,</span>
             <span class="n">kv_dtype</span><span class="o">=</span><span class="n">str_dtype_to_trt</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">kv_dtype</span><span class="p">),</span>
             <span class="n">remove_input_padding</span><span class="o">=</span><span class="n">remove_input_padding</span><span class="p">,</span>
@@ -490,10 +530,13 @@
             <span class="n">max_num_tokens</span><span class="o">=</span><span class="n">max_num_tokens</span><span class="p">,</span>
             <span class="n">dtype</span><span class="o">=</span><span class="n">str_dtype_to_trt</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">),</span>
             <span class="n">prompt_embedding_table_size</span><span class="o">=</span><span class="n">prompt_embedding_table_size</span><span class="p">,</span>
+            <span class="n">position_encoding_2d</span><span class="o">=</span><span class="n">position_encoding_2d</span><span class="p">,</span>
             <span class="n">mapping</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="p">,</span>
-            <span class="n">gather_all_token_logits</span><span class="o">=</span><span class="n">gather_all_token_logits</span><span class="p">,</span>
+            <span class="n">gather_context_logits</span><span class="o">=</span><span class="n">gather_context_logits</span><span class="p">,</span>
+            <span class="n">gather_generation_logits</span><span class="o">=</span><span class="n">gather_generation_logits</span><span class="p">,</span>
             <span class="n">use_custom_all_reduce</span><span class="o">=</span><span class="n">use_custom_all_reduce</span><span class="p">,</span>
             <span class="n">use_lora_plugin</span><span class="o">=</span><span class="n">use_lora_plugin</span><span class="p">,</span>
+            <span class="n">max_draft_len</span><span class="o">=</span><span class="n">max_draft_len</span><span class="p">,</span>
             <span class="n">lora_target_modules</span><span class="o">=</span><span class="n">lora_target_modules</span><span class="p">)</span>
 
         <span class="n">result</span> <span class="o">=</span> <span class="p">{</span>
@@ -514,6 +557,7 @@
                     <span class="s1">&#39;host_past_key_value_lengths&#39;</span><span class="p">],</span>
                 <span class="n">host_max_attention_window_sizes</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span>
                     <span class="s1">&#39;host_max_attention_window_sizes&#39;</span><span class="p">],</span>
+                <span class="n">host_sink_token_length</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;host_sink_token_length&#39;</span><span class="p">],</span>
                 <span class="n">kv_cache_block_pointers</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span>
                     <span class="s1">&#39;kv_cache_block_pointers_list&#39;</span><span class="p">],</span>
                 <span class="n">host_kv_cache_block_pointers</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span>
@@ -532,13 +576,10 @@
         <span class="k">if</span> <span class="n">prompt_embedding_table_size</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
             <span class="n">result</span><span class="p">[</span><span class="s1">&#39;prompt_embedding_table&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">model_inputs</span><span class="p">[</span>
                 <span class="s1">&#39;prompt_embedding_table&#39;</span><span class="p">]</span>
-            <span class="n">result</span><span class="p">[</span><span class="s1">&#39;tasks&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;tasks&#39;</span><span class="p">]</span>
+            <span class="n">result</span><span class="p">[</span><span class="s1">&#39;prompt_tasks&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;tasks&#39;</span><span class="p">]</span>
             <span class="n">result</span><span class="p">[</span><span class="s1">&#39;prompt_vocab_size&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;prompt_vocab_size&#39;</span><span class="p">]</span>
         <span class="k">if</span> <span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;hidden_states_input&#39;</span><span class="p">]</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">result</span><span class="p">[</span><span class="s1">&#39;hidden_states_input&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;hidden_states_input&#39;</span><span class="p">]</span>
-        <span class="k">if</span> <span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;all_reduce_workspace&#39;</span><span class="p">]</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">result</span><span class="p">[</span><span class="s1">&#39;all_reduce_workspace&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">model_inputs</span><span class="p">[</span>
-                <span class="s1">&#39;all_reduce_workspace&#39;</span><span class="p">]</span>
+            <span class="n">result</span><span class="p">[</span><span class="s1">&#39;hidden_states&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;hidden_states_input&#39;</span><span class="p">]</span>
         <span class="k">if</span> <span class="n">use_lora_plugin</span><span class="p">:</span>
             <span class="n">result</span><span class="p">[</span><span class="s1">&#39;lora_params&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">LoraParams</span><span class="p">(</span>
                 <span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;lora_ranks&#39;</span><span class="p">],</span>
@@ -568,11 +609,12 @@
                 <span class="n">kv_cache_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">attention_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">hidden_states</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">all_reduce_workspace</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">prompt_embedding_table</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                 <span class="n">prompt_tasks</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                 <span class="n">prompt_vocab_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-                <span class="n">lora_params</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+                <span class="n">lora_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">medusa_position_offsets</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">medusa_packed_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
         <span class="n">kwargs</span> <span class="o">=</span> <span class="p">{</span>
             <span class="s1">&#39;input_ids&#39;</span><span class="p">:</span> <span class="n">input_ids</span><span class="p">,</span>
             <span class="s1">&#39;position_ids&#39;</span><span class="p">:</span> <span class="n">position_ids</span><span class="p">,</span>
@@ -581,8 +623,6 @@
             <span class="s1">&#39;kv_cache_params&#39;</span><span class="p">:</span> <span class="n">kv_cache_params</span><span class="p">,</span>
             <span class="s1">&#39;attention_params&#39;</span><span class="p">:</span> <span class="n">attention_params</span><span class="p">,</span>
         <span class="p">}</span>
-        <span class="k">if</span> <span class="n">all_reduce_workspace</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;all_reduce_workspace&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">all_reduce_workspace</span>
         <span class="k">if</span> <span class="n">lora_params</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;lora_params&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">lora_params</span>
         <span class="k">if</span> <span class="n">hidden_states</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
@@ -593,6 +633,11 @@
             <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;prompt_tasks&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">prompt_tasks</span>
         <span class="k">if</span> <span class="n">prompt_vocab_size</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;prompt_vocab_size&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">prompt_vocab_size</span>
+
+        <span class="k">if</span> <span class="n">medusa_position_offsets</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;medusa_position_offsets&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">medusa_position_offsets</span>
+        <span class="k">if</span> <span class="n">medusa_packed_mask</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;medusa_packed_mask&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">medusa_packed_mask</span>
 
         <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">transformer</span><span class="o">.</span><span class="n">forward</span><span class="p">(</span><span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
 
@@ -608,21 +653,100 @@
             <span class="n">lm_logits</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">lm_head</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
             <span class="n">lm_logits</span><span class="o">.</span><span class="n">mark_output</span><span class="p">(</span><span class="s1">&#39;logits&#39;</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">logits_dtype</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
-            <span class="n">hidden_states</span><span class="o">.</span><span class="n">mark_output</span><span class="p">(</span><span class="s1">&#39;hidden_states_output&#39;</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+            <span class="n">hidden_states</span><span class="o">.</span><span class="n">mark_output</span><span class="p">(</span><span class="s1">&#39;hidden_states_output&#39;</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
 
-        <span class="k">if</span> <span class="n">use_cache</span> <span class="ow">and</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">paged_kv_cache</span> <span class="o">==</span> <span class="kc">False</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">use_cache</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">paged_kv_cache</span><span class="p">:</span>
             <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">present</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">pp_layers</span><span class="p">(</span>
                         <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">num_hidden_layers</span><span class="p">),</span> <span class="n">presents</span><span class="p">):</span>
                 <span class="n">present</span><span class="o">.</span><span class="n">mark_output</span><span class="p">(</span><span class="sa">f</span><span class="s1">&#39;present_key_value_</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">,</span>
                                     <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">kv_dtype</span><span class="p">)</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_last_pp_rank</span><span class="p">():</span>
-                <span class="k">return</span> <span class="p">(</span><span class="n">lm_logits</span><span class="p">,</span> <span class="n">presents</span><span class="p">)</span>
+                <span class="k">return</span> <span class="p">(</span><span class="n">lm_logits</span><span class="p">,</span> <span class="n">presents</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">)</span>
             <span class="k">return</span> <span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="n">presents</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_last_pp_rank</span><span class="p">():</span>
-                <span class="k">return</span> <span class="n">lm_logits</span>
+                <span class="k">return</span> <span class="n">lm_logits</span><span class="p">,</span> <span class="n">hidden_states</span>
             <span class="k">return</span> <span class="n">hidden_states</span>
+
+
+<span class="k">def</span> <span class="nf">fuse_gate_mlp</span><span class="p">(</span><span class="n">model</span><span class="p">):</span>
+    <span class="k">for</span> <span class="n">layer</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">transformer</span><span class="o">.</span><span class="n">layers</span><span class="p">:</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">layer</span><span class="p">,</span> <span class="s1">&#39;mlp&#39;</span><span class="p">):</span>
+            <span class="k">continue</span>
+
+        <span class="n">quant_algo</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">quant_kwargs</span><span class="p">[</span><span class="s1">&#39;quant_algo&#39;</span><span class="p">]</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">mlp</span><span class="p">,</span> <span class="n">GatedMLP</span><span class="p">):</span>
+            <span class="n">fused_layer</span> <span class="o">=</span> <span class="n">FusedGatedMLP</span><span class="p">(</span>
+                <span class="n">hidden_size</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">mlp</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+                <span class="n">ffn_hidden_size</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">mlp</span><span class="o">.</span><span class="n">ffn_hidden_size</span><span class="p">,</span>
+                <span class="n">hidden_act</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">mlp</span><span class="o">.</span><span class="n">hidden_act</span><span class="p">,</span>
+                <span class="n">bias</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">mlp</span><span class="o">.</span><span class="n">bias</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">mlp</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
+                <span class="n">tp_group</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">mlp</span><span class="o">.</span><span class="n">tp_group</span><span class="p">,</span>
+                <span class="n">tp_size</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">mlp</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
+                <span class="n">quant_mode</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">mlp</span><span class="o">.</span><span class="n">quant_mode</span><span class="p">,</span>
+                <span class="n">max_lora_rank</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">mlp</span><span class="o">.</span><span class="n">max_lora_rank</span><span class="p">)</span>
+
+            <span class="k">if</span> <span class="n">quant_algo</span> <span class="o">==</span> <span class="s1">&#39;FP8&#39;</span><span class="p">:</span>
+                <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">mlp</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
+                    <span class="n">dtype</span> <span class="o">=</span> <span class="n">str_dtype_to_torch</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">mlp</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="n">dtype</span> <span class="o">=</span> <span class="n">trt_dtype_to_torch</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">mlp</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+
+                <span class="c1"># dequantize</span>
+                <span class="n">gate_weight</span> <span class="o">=</span> <span class="n">numpy_to_torch</span><span class="p">(</span>
+                    <span class="n">layer</span><span class="o">.</span><span class="n">mlp</span><span class="o">.</span><span class="n">gate</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">raw_value</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">dtype</span><span class="p">)</span> <span class="o">*</span> <span class="n">numpy_to_torch</span><span class="p">(</span>
+                        <span class="n">layer</span><span class="o">.</span><span class="n">mlp</span><span class="o">.</span><span class="n">gate</span><span class="o">.</span><span class="n">weights_scaling_factor</span><span class="o">.</span><span class="n">raw_value</span><span class="p">)</span>
+                <span class="n">fc_weight</span> <span class="o">=</span> <span class="n">numpy_to_torch</span><span class="p">(</span>
+                    <span class="n">layer</span><span class="o">.</span><span class="n">mlp</span><span class="o">.</span><span class="n">fc</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">raw_value</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">dtype</span><span class="p">)</span> <span class="o">*</span> <span class="n">numpy_to_torch</span><span class="p">(</span>
+                        <span class="n">layer</span><span class="o">.</span><span class="n">mlp</span><span class="o">.</span><span class="n">fc</span><span class="o">.</span><span class="n">weights_scaling_factor</span><span class="o">.</span><span class="n">raw_value</span><span class="p">)</span>
+
+                <span class="c1"># concat</span>
+                <span class="n">fused_weight</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="n">gate_weight</span><span class="p">,</span> <span class="n">fc_weight</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+
+                <span class="c1"># quantize</span>
+                <span class="n">fused_weight_scaling_factor</span> <span class="o">=</span> <span class="n">numpy_to_torch</span><span class="p">(</span>
+                    <span class="nb">max</span><span class="p">(</span>
+                        <span class="n">layer</span><span class="o">.</span><span class="n">mlp</span><span class="o">.</span><span class="n">gate</span><span class="o">.</span><span class="n">weights_scaling_factor</span><span class="o">.</span><span class="n">raw_value</span><span class="p">,</span>
+                        <span class="n">layer</span><span class="o">.</span><span class="n">mlp</span><span class="o">.</span><span class="n">fc</span><span class="o">.</span><span class="n">weights_scaling_factor</span><span class="o">.</span><span class="n">raw_value</span><span class="p">,</span>
+                    <span class="p">))</span>
+                <span class="n">fused_weight</span> <span class="o">=</span> <span class="p">(</span><span class="n">fused_weight</span> <span class="o">/</span> <span class="n">fused_weight_scaling_factor</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span>
+                    <span class="n">torch</span><span class="o">.</span><span class="n">float8_e4m3fn</span><span class="p">)</span>
+
+                <span class="n">fused_layer</span><span class="o">.</span><span class="n">fused_fc</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">value</span> <span class="o">=</span> <span class="n">fused_weight</span>
+                <span class="n">fused_layer</span><span class="o">.</span><span class="n">fused_fc</span><span class="o">.</span><span class="n">weights_scaling_factor</span><span class="o">.</span><span class="n">value</span> <span class="o">=</span> <span class="n">fused_weight_scaling_factor</span>
+
+                <span class="n">fused_layer</span><span class="o">.</span><span class="n">fused_fc</span><span class="o">.</span><span class="n">activation_scaling_factor</span><span class="o">.</span><span class="n">value</span> <span class="o">=</span> \
+                    <span class="nb">max</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">mlp</span><span class="o">.</span><span class="n">gate</span><span class="o">.</span><span class="n">activation_scaling_factor</span><span class="o">.</span><span class="n">raw_value</span><span class="p">,</span>
+                        <span class="n">layer</span><span class="o">.</span><span class="n">mlp</span><span class="o">.</span><span class="n">fc</span><span class="o">.</span><span class="n">activation_scaling_factor</span><span class="o">.</span><span class="n">raw_value</span>
+                    <span class="p">)</span>
+            <span class="k">elif</span> <span class="n">quant_algo</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">fused_layer</span><span class="o">.</span><span class="n">fused_fc</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">value</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">concatenate</span><span class="p">([</span>
+                    <span class="n">layer</span><span class="o">.</span><span class="n">mlp</span><span class="o">.</span><span class="n">gate</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">raw_value</span><span class="p">,</span>
+                    <span class="n">layer</span><span class="o">.</span><span class="n">mlp</span><span class="o">.</span><span class="n">fc</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">raw_value</span>
+                <span class="p">],</span>
+                                                                   <span class="n">axis</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">layer</span><span class="o">.</span><span class="n">mlp</span><span class="o">.</span><span class="n">bias</span><span class="p">:</span>
+                    <span class="n">fused_layer</span><span class="o">.</span><span class="n">fused_fc</span><span class="o">.</span><span class="n">bias</span><span class="o">.</span><span class="n">value</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">concatenate</span><span class="p">([</span>
+                        <span class="n">layer</span><span class="o">.</span><span class="n">mlp</span><span class="o">.</span><span class="n">gate</span><span class="o">.</span><span class="n">bias</span><span class="o">.</span><span class="n">raw_value</span><span class="p">,</span>
+                        <span class="n">layer</span><span class="o">.</span><span class="n">mlp</span><span class="o">.</span><span class="n">fc</span><span class="o">.</span><span class="n">bias</span><span class="o">.</span><span class="n">raw_value</span>
+                    <span class="p">],</span>
+                                                                     <span class="n">axis</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s1">&#39;Unsupported quant algo: </span><span class="si">{</span><span class="n">quant_algo</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">)</span>
+
+            <span class="n">fused_layer</span><span class="o">.</span><span class="n">proj</span> <span class="o">=</span> <span class="n">layer</span><span class="o">.</span><span class="n">mlp</span><span class="o">.</span><span class="n">proj</span>
+
+            <span class="n">layer</span><span class="o">.</span><span class="n">mlp</span> <span class="o">=</span> <span class="n">fused_layer</span>
+
+    <span class="k">return</span> <span class="n">model</span>
+
+
+<span class="k">def</span> <span class="nf">optimize_model</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">use_fused_mlp</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
+    <span class="k">if</span> <span class="n">use_fused_mlp</span><span class="p">:</span>
+        <span class="n">model</span> <span class="o">=</span> <span class="n">fuse_gate_mlp</span><span class="p">(</span><span class="n">model</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">model</span>
 </pre></div>
 
            </div>

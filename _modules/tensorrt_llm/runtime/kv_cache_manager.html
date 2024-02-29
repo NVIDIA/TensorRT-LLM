@@ -46,15 +46,19 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../architecture.html">TensorRT-LLM Architecture</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../gpt_runtime.html">C++ GPT Runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../batch_manager.html">The Batch Manager in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../inference_request.html">Inference Request</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../gpt_attention.html">Multi-head, Multi-query and Group-query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../precision.html">Numerical Precision</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../installation.html">TensorRT-LLM Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../build_from_source.html">Build from Source</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance.html">Performance of TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../2023-05-19-how-to-debug.html">How to debug</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../2023-05-17-how-to-add-a-new-model.html">How to add a new model</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../memory.html">Memory Usage of TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../new_workflow.html">New Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../perf_best_practices.html">Best Practices for Tuning the Performance of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance_analysis.html">Performance Analysis of TensorRT-LLM</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Python API</span></p>
 <ul>
@@ -74,6 +78,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
 </ul>
 
         </div>
@@ -101,7 +106,7 @@
            <div itemprop="articleBody">
              
   <h1>Source code for tensorrt_llm.runtime.kv_cache_manager</h1><div class="highlight"><pre>
-<span></span><span class="c1"># SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION &amp; AFFILIATES. All rights reserved.</span>
+<span></span><span class="c1"># SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION &amp; AFFILIATES. All rights reserved.</span>
 <span class="c1"># SPDX-License-Identifier: Apache-2.0</span>
 <span class="c1">#</span>
 <span class="c1"># Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);</span>
@@ -137,6 +142,9 @@
 
     <span class="k">def</span> <span class="nf">has_link</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">ref_count</span> <span class="o">&gt;</span> <span class="mi">0</span>
+
+    <span class="k">def</span> <span class="nf">is_shared</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">ref_count</span> <span class="o">&gt;</span> <span class="mi">1</span>
 
     <span class="k">def</span> <span class="nf">get_k_ptr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">idx</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">k_ptrs</span><span class="p">[</span><span class="n">idx</span><span class="p">]</span>
@@ -217,8 +225,11 @@
                     <span class="bp">self</span><span class="o">.</span><span class="n">blocks</span> <span class="o">*</span> <span class="n">elts_per_block</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">_sizeof</span><span class="p">[</span><span class="n">pool</span><span class="o">.</span><span class="n">dtype</span><span class="p">])</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">free_blocks</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">Block</span><span class="p">(</span><span class="n">bi</span><span class="p">,</span> <span class="n">k_ptrs</span><span class="p">,</span> <span class="n">v_ptrs</span><span class="p">))</span>
 
+        <span class="n">beam_width</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">beam_width</span>
+        <span class="c1"># Here use beam_width instead of self.beam_width to remove cyclic reference between self and</span>
+        <span class="c1"># self.allocated_blocks by preventing capture self, which may cause memory leak.</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">allocated_blocks</span> <span class="o">=</span> <span class="n">defaultdict</span><span class="p">(</span>
-            <span class="k">lambda</span><span class="p">:</span> <span class="p">[[]</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">beam_width</span><span class="p">)])</span>
+            <span class="k">lambda</span><span class="p">:</span> <span class="p">[[]</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">beam_width</span><span class="p">)])</span>
 
     <span class="k">def</span> <span class="nf">has_free_block</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
@@ -244,6 +255,30 @@
             <span class="c1"># Add one reference to the block</span>
             <span class="n">block</span><span class="o">.</span><span class="n">add_link</span><span class="p">()</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">allocated_blocks</span><span class="p">[</span><span class="n">owner</span><span class="p">][</span><span class="n">bi</span><span class="p">]</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">block</span><span class="p">)</span>
+
+    <span class="k">def</span> <span class="nf">replace_shared_block</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">owner</span><span class="p">:</span> <span class="n">GenerationSequence</span><span class="p">,</span> <span class="n">block_idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        Replace the shared block.</span>
+<span class="sd">        Free the shared block, and allocate blocks with share_across_beam=False</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">allocated_blocks</span><span class="p">[</span><span class="n">owner</span><span class="p">][</span><span class="mi">0</span><span class="p">][</span><span class="n">block_idx</span><span class="p">]</span><span class="o">.</span><span class="n">is_shared</span><span class="p">():</span>
+            <span class="k">return</span>
+
+        <span class="c1"># Free shared block</span>
+        <span class="k">for</span> <span class="n">bi</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">beam_width</span><span class="p">):</span>
+            <span class="n">block</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">allocated_blocks</span><span class="p">[</span><span class="n">owner</span><span class="p">][</span><span class="n">bi</span><span class="p">][</span><span class="n">block_idx</span><span class="p">]</span>
+            <span class="n">block</span><span class="o">.</span><span class="n">remove_link</span><span class="p">()</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">block</span><span class="o">.</span><span class="n">has_link</span><span class="p">():</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">free_blocks</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">block</span><span class="p">)</span>
+
+        <span class="c1"># Allocate new block</span>
+        <span class="k">for</span> <span class="n">bi</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">beam_width</span><span class="p">):</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">has_free_block</span><span class="p">():</span>
+                <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="s2">&quot;Can&#39;t allocate new block for KV cache&quot;</span><span class="p">)</span>
+            <span class="n">block</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">free_blocks</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+            <span class="n">block</span><span class="o">.</span><span class="n">add_link</span><span class="p">()</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">allocated_blocks</span><span class="p">[</span><span class="n">owner</span><span class="p">][</span><span class="n">bi</span><span class="p">][</span><span class="n">block_idx</span><span class="p">]</span> <span class="o">=</span> <span class="n">block</span>
+        <span class="k">return</span>
 
     <span class="k">def</span> <span class="nf">free</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">owner</span><span class="p">:</span> <span class="n">GenerationSequence</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
@@ -353,7 +388,9 @@
                  <span class="n">tokens_per_block</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
                  <span class="n">max_blocks_per_seq</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
                  <span class="n">max_attention_window_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-                 <span class="n">beam_width</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">):</span>
+                 <span class="n">sink_token_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+                 <span class="n">beam_width</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
+                 <span class="n">use_one_more_block</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">):</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">blocks_manager</span> <span class="o">=</span> <span class="n">BlocksManager</span><span class="p">(</span>
             <span class="n">memory_pools</span><span class="o">=</span><span class="n">memory_pools</span><span class="p">,</span>
@@ -363,7 +400,23 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">num_pools</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">memory_pools</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span> <span class="o">=</span> <span class="n">tokens_per_block</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">max_attention_window_size</span> <span class="o">=</span> <span class="n">max_attention_window_size</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">sink_token_len</span> <span class="o">=</span> <span class="n">sink_token_len</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">beam_width</span> <span class="o">=</span> <span class="n">beam_width</span>
+
+        <span class="c1"># The sink tokens are not stored into the same block with other tokens.</span>
+        <span class="c1"># Need to add the bubble after the sink tokens.</span>
+        <span class="k">if</span> <span class="n">sink_token_len</span> <span class="o">%</span> <span class="n">tokens_per_block</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">bubble_len</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">bubble_len</span> <span class="o">=</span> <span class="n">tokens_per_block</span> <span class="o">-</span> <span class="n">sink_token_len</span> <span class="o">%</span> <span class="n">tokens_per_block</span>
+
+        <span class="c1"># Token num in the sink blocks</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">sink_block_token_num</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">sink_token_len</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">bubble_len</span>
+
+        <span class="c1"># Max token num in the cache</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">max_token_num</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_attention_window_size</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">bubble_len</span>
+        <span class="k">if</span> <span class="n">use_one_more_block</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">max_token_num</span> <span class="o">+=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">lens</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">sequences</span> <span class="o">=</span> <span class="p">[]</span>
@@ -377,12 +430,22 @@
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="k">for</span> <span class="n">seq</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">sequences</span><span class="p">:</span>
             <span class="n">batch_idx</span> <span class="o">=</span> <span class="n">seq</span><span class="o">.</span><span class="n">get_batch_idx</span><span class="p">()</span>
-            <span class="c1"># Enable cyclic kv cache when it exceeds the max_attention_window_size</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">lens</span><span class="p">[</span><span class="n">batch_idx</span><span class="p">]</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_attention_window_size</span><span class="p">:</span>
-                <span class="k">continue</span>
-            <span class="k">if</span> <span class="ow">not</span> <span class="n">finished</span><span class="p">[</span><span class="n">batch_idx</span><span class="p">]</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">lens</span><span class="p">[</span>
-                    <span class="n">batch_idx</span><span class="p">]</span> <span class="o">%</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">blocks_manager</span><span class="o">.</span><span class="n">allocate</span><span class="p">(</span><span class="n">seq</span><span class="p">)</span>
+            <span class="c1"># Enable cyclic kv cache when it exceeds the max_token_num</span>
+            <span class="n">cyclic_token_num</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_token_num</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">sink_block_token_num</span>
+            <span class="n">next_token_idx_in_cache</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">sink_block_token_num</span> <span class="o">+</span> \
+                        <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">lens</span><span class="p">[</span><span class="n">batch_idx</span><span class="p">]</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">sink_block_token_num</span><span class="p">)</span> <span class="o">%</span> <span class="n">cyclic_token_num</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">finished</span><span class="p">[</span><span class="n">batch_idx</span><span class="p">]</span> <span class="ow">and</span> <span class="p">(</span>
+                    <span class="n">next_token_idx_in_cache</span> <span class="o">%</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span> <span class="o">==</span> <span class="mi">0</span> <span class="ow">or</span>
+                <span class="p">(</span><span class="n">next_token_idx_in_cache</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">sink_block_token_num</span><span class="p">)</span> <span class="o">%</span>
+                    <span class="n">cyclic_token_num</span> <span class="o">==</span> <span class="mi">0</span><span class="p">):</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">lens</span><span class="p">[</span><span class="n">batch_idx</span><span class="p">]</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_token_num</span><span class="p">:</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">blocks_manager</span><span class="o">.</span><span class="n">allocate</span><span class="p">(</span><span class="n">seq</span><span class="p">)</span>
+                <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">beam_width</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+                    <span class="c1"># Get next block index</span>
+                    <span class="n">next_block_idx</span> <span class="o">=</span> <span class="n">next_token_idx_in_cache</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span>
+                    <span class="c1"># Replace the shared block with the unshared ones</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">blocks_manager</span><span class="o">.</span><span class="n">replace_shared_block</span><span class="p">(</span>
+                        <span class="n">seq</span><span class="p">,</span> <span class="n">next_block_idx</span><span class="p">)</span>
 
             <span class="bp">self</span><span class="o">.</span><span class="n">lens</span><span class="p">[</span><span class="n">batch_idx</span><span class="p">]</span> <span class="o">+=</span> <span class="mi">1</span>
 
@@ -409,22 +472,31 @@
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">        Add sequence to the manager and allocate minimum amount of blocks for context</span>
 <span class="sd">        &quot;&quot;&quot;</span>
-        <span class="n">seq_len</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">context_len</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_attention_window_size</span><span class="p">)</span>
+        <span class="n">seq_len</span> <span class="o">=</span> <span class="n">context_len</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">bubble_len</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">lens</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">seq_len</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">sequences</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">sequence</span><span class="p">)</span>
 
-        <span class="c1"># With beam_width &gt; 1 we share context blocks between beams.</span>
+        <span class="c1"># Get the final token index in kv cache</span>
+        <span class="n">final_token_kv_index</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">sink_block_token_num</span> <span class="o">+</span> <span class="p">(</span>
+            <span class="p">(</span><span class="n">seq_len</span> <span class="o">-</span> <span class="mi">1</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">sink_block_token_num</span><span class="p">)</span> <span class="o">%</span>
+            <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">max_token_num</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">sink_block_token_num</span><span class="p">))</span>
 
-        <span class="c1"># First get number of blocks that can be shared across different beams.</span>
-        <span class="c1"># This is only possible for complete blocks -&gt; round down.</span>
+        <span class="c1"># Get block index that with shareAmongBeams=False.</span>
+        <span class="n">unshared_block_idx</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span>
+        <span class="k">if</span> <span class="n">final_token_kv_index</span> <span class="o">%</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="n">unshared_block_idx</span> <span class="o">=</span> <span class="n">final_token_kv_index</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span>
+
+        <span class="c1"># Get context block num.</span>
+        <span class="c1"># Allocate one more block if there are tokens that can&#39;t be shared across beams.</span>
+        <span class="n">seq_len</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">seq_len</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_token_num</span><span class="p">)</span>
         <span class="n">context_blocks</span> <span class="o">=</span> <span class="n">seq_len</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span>
-        <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">context_blocks</span><span class="p">):</span>
-            <span class="c1"># Share context stage blocks within beam</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">blocks_manager</span><span class="o">.</span><span class="n">allocate</span><span class="p">(</span><span class="n">sequence</span><span class="p">,</span> <span class="n">share_across_beam</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-
-        <span class="c1"># allocate one more block if there are tokens that can&#39;t be shared across beams.</span>
         <span class="k">if</span> <span class="n">seq_len</span> <span class="o">%</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">blocks_manager</span><span class="o">.</span><span class="n">allocate</span><span class="p">(</span><span class="n">sequence</span><span class="p">,</span> <span class="n">share_across_beam</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span></div>
+            <span class="n">context_blocks</span> <span class="o">+=</span> <span class="mi">1</span>
+
+        <span class="c1"># Allocate blocks</span>
+        <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">context_blocks</span><span class="p">):</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">blocks_manager</span><span class="o">.</span><span class="n">allocate</span><span class="p">(</span>
+                <span class="n">sequence</span><span class="p">,</span> <span class="n">share_across_beam</span><span class="o">=</span><span class="n">i</span> <span class="o">!=</span> <span class="n">unshared_block_idx</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="KVCacheManager.get_pointer_arrays">
@@ -441,6 +513,77 @@
         <span class="k">return</span> <span class="n">pointer_arrays</span></div>
 </div>
 
+
+
+<span class="k">class</span> <span class="nc">KVCacheUpdater</span><span class="p">:</span>
+
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">use_paged_kv_cache</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">num_kv_heads</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">head_dim</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">elt_size</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">past_key_value_list</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">max_kv_cache_length</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_manager</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="k">def</span> <span class="nf">init_linear_kv_cache</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">num_kv_heads</span><span class="p">,</span> <span class="n">head_dim</span><span class="p">,</span> <span class="n">kv_cache_type</span><span class="p">,</span>
+                             <span class="n">past_key_value_list</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">use_paged_kv_cache</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">num_kv_heads</span> <span class="o">=</span> <span class="n">num_kv_heads</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">head_dim</span> <span class="o">=</span> <span class="n">head_dim</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">past_key_value_list</span> <span class="o">=</span> <span class="n">past_key_value_list</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">elt_size</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">kv_cache_type</span><span class="p">)</span><span class="o">.</span><span class="n">element_size</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">max_kv_cache_length</span> <span class="o">=</span> <span class="n">past_key_value_list</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">3</span><span class="p">]</span>
+
+    <span class="k">def</span> <span class="nf">init_paged_kv_cache</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">num_kv_heads</span><span class="p">,</span> <span class="n">head_dim</span><span class="p">,</span> <span class="n">kv_cache_type</span><span class="p">,</span>
+                            <span class="n">kv_cache_manager</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">use_paged_kv_cache</span> <span class="o">=</span> <span class="kc">True</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">num_kv_heads</span> <span class="o">=</span> <span class="n">num_kv_heads</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">head_dim</span> <span class="o">=</span> <span class="n">head_dim</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_manager</span> <span class="o">=</span> <span class="n">kv_cache_manager</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">elt_size</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">kv_cache_type</span><span class="p">)</span><span class="o">.</span><span class="n">element_size</span><span class="p">()</span>
+
+    <span class="k">def</span> <span class="nf">update</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">accepted_draft_token_offsets</span><span class="p">,</span>
+               <span class="n">packed_accepted_draft_tokens_indices</span><span class="p">,</span> <span class="n">sequence_length_buffer</span><span class="p">,</span>
+               <span class="n">rewind_tokens</span><span class="p">):</span>
+        <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_paged_kv_cache</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_paged_kv_cache</span><span class="p">:</span>
+            <span class="n">host_kv_cache_block_pointers</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_manager</span><span class="o">.</span><span class="n">get_pointer_arrays</span><span class="p">(</span>
+                <span class="mi">1</span><span class="p">)</span>
+            <span class="n">kv_cache_block_pointers</span> <span class="o">=</span> <span class="p">[</span>
+                <span class="n">x</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="s1">&#39;cuda&#39;</span><span class="p">)</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">host_kv_cache_block_pointers</span>
+            <span class="p">]</span>
+            <span class="n">torch</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">tensorrt_llm</span><span class="o">.</span><span class="n">update_kv_cache_draft_token_location</span><span class="p">(</span>
+                <span class="n">accepted_draft_token_offsets</span><span class="p">,</span>
+                <span class="n">packed_accepted_draft_tokens_indices</span><span class="p">,</span>
+                <span class="n">sequence_length_buffer</span><span class="p">,</span>
+                <span class="kc">True</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">num_kv_heads</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">head_dim</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">elt_size</span><span class="p">,</span>
+                <span class="n">rewind_tokens</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_manager</span><span class="o">.</span><span class="n">max_attention_window_size</span><span class="p">,</span>
+                <span class="kc">None</span><span class="p">,</span>
+                <span class="n">kv_cache_block_pointers</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_manager</span><span class="o">.</span><span class="n">blocks_manager</span><span class="o">.</span><span class="n">max_blocks_per_seq</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_manager</span><span class="o">.</span><span class="n">tokens_per_block</span><span class="p">,</span>
+                <span class="kc">None</span><span class="p">,</span>
+            <span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">torch</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">tensorrt_llm</span><span class="o">.</span><span class="n">update_kv_cache_draft_token_location</span><span class="p">(</span>
+                <span class="n">accepted_draft_token_offsets</span><span class="p">,</span>
+                <span class="n">packed_accepted_draft_tokens_indices</span><span class="p">,</span>
+                <span class="n">sequence_length_buffer</span><span class="p">,</span>
+                <span class="kc">False</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">num_kv_heads</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">head_dim</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">elt_size</span><span class="p">,</span>
+                <span class="n">rewind_tokens</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">max_kv_cache_length</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">past_key_value_list</span><span class="p">,</span>
+                <span class="kc">None</span><span class="p">,</span>
+                <span class="kc">None</span><span class="p">,</span>
+                <span class="kc">None</span><span class="p">,</span>
+                <span class="kc">None</span><span class="p">,</span>
+            <span class="p">)</span>
 </pre></div>
 
            </div>

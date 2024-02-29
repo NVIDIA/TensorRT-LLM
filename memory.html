@@ -49,9 +49,10 @@
 <li class="toctree-l1"><a class="reference internal" href="architecture.html">TensorRT-LLM Architecture</a></li>
 <li class="toctree-l1"><a class="reference internal" href="gpt_runtime.html">C++ GPT Runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="batch_manager.html">The Batch Manager in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="inference_request.html">Inference Request</a></li>
 <li class="toctree-l1"><a class="reference internal" href="gpt_attention.html">Multi-head, Multi-query and Group-query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="precision.html">Numerical Precision</a></li>
-<li class="toctree-l1"><a class="reference internal" href="installation.html">TensorRT-LLM Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="build_from_source.html">Build from Source</a></li>
 <li class="toctree-l1"><a class="reference internal" href="performance.html">Performance of TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="2023-05-19-how-to-debug.html">How to debug</a></li>
 <li class="toctree-l1"><a class="reference internal" href="2023-05-17-how-to-add-a-new-model.html">How to add a new model</a></li>
@@ -73,6 +74,9 @@
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="new_workflow.html">New Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="perf_best_practices.html">Best Practices for Tuning the Performance of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="performance_analysis.html">Performance Analysis of TensorRT-LLM</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Python API</span></p>
 <ul>
@@ -92,6 +96,7 @@
 <li class="toctree-l1"><a class="reference internal" href="blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
 </ul>
 
         </div>
@@ -139,7 +144,7 @@ Once the TensorRT engine is built, the activation memory size of that engine can
 Here some explanations on how these values affect the memory:</p>
 <ol class="arabic">
 <li><p>Reduce build time max input tokens</p>
-<p>Most of the tensors inside a transformer network have a linear relationship with number of input tokens, so activation size will be close to <code class="docutils literal notranslate"><span class="pre">max</span> <span class="pre">number</span> <span class="pre">of</span> <span class="pre">input</span> <span class="pre">tokens</span> <span class="pre">*</span> <span class="pre">some</span> <span class="pre">constant</span> <span class="pre">factor</span></code>, the constant factor depends on the network structure and TRT internal optimization. The max number of input tokens is derived from build time arguments, one can change the parameters provided to the <code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code> function, like <code class="docutils literal notranslate"><span class="pre">GPTLMHeadModel.prepare_inputs</span></code> to affect the memory usage, or one can change the command line options of the <code class="docutils literal notranslate"><span class="pre">build.py</span></code> scripts used in the examples.</p>
+<p>Most of the tensors inside a transformer network have a linear relationship with number of input tokens, so activation size will be close to <code class="docutils literal notranslate"><span class="pre">max</span> <span class="pre">number</span> <span class="pre">of</span> <span class="pre">input</span> <span class="pre">tokens</span> <span class="pre">*</span> <span class="pre">some</span> <span class="pre">constant</span> <span class="pre">factor</span></code>, the constant factor depends on the network structure and TRT internal optimization. The max number of input tokens is derived from build time arguments, one can change the parameters provided to the <code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code> function, like <code class="docutils literal notranslate"><span class="pre">GPTLMHeadModel.prepare_inputs</span></code> to affect the memory usage, or one can change the command line options of the <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> command used in the examples.</p>
 <p>When using the <a class="reference internal" href="gpt_attention.html#padded-and-packed-tensors"><span class="std std-ref">padded tensors</span></a> format, the max number of input tokens equals to <code class="docutils literal notranslate"><span class="pre">max_batch_size*max_input_len</span></code>, so reducing <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> and <code class="docutils literal notranslate"><span class="pre">max_input_len</span></code> can almost linearly reduce the activation memory size.
 When using the <a class="reference internal" href="gpt_attention.html#padded-and-packed-tensors"><span class="std std-ref">packed tensors</span></a> format and <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code> is specified, reducing its value will also reduce activation memory size. If <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code> is not specified, the max number of input tokens will be derived as <code class="docutils literal notranslate"><span class="pre">max_batch_size*max_input_len</span></code>.</p>
 <p>The packed tensors format is recommended, because it saves both memory and compute.
