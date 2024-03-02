@@ -36,11 +36,13 @@ class BaichuanDecoderLayer(Module):
         quant_mode = config.quant_mode
 
         self.input_layernorm = RmsNorm(normalized_shape=hidden_size,
+                                       eps=config.norm_epsilon,
                                        dtype=dtype)
-
         self.attention = Attention(
-            hidden_size,
-            config.num_attention_heads,
+            layer_idx=layer_idx,
+            hidden_size=hidden_size,
+            num_attention_heads=config.num_attention_heads,
+            num_kv_heads=config.num_key_value_heads,
             max_position_embeddings=config.max_position_embeddings,
             dtype=dtype,
             attention_mask_type=AttentionMaskType.causal,
@@ -59,7 +61,9 @@ class BaichuanDecoderLayer(Module):
                             tp_group=tp_group,
                             tp_size=tp_size,
                             quant_mode=quant_mode)
-        self.post_layernorm = RmsNorm(normalized_shape=hidden_size, dtype=dtype)
+        self.post_layernorm = RmsNorm(normalized_shape=hidden_size,
+                                      eps=config.norm_epsilon,
+                                      dtype=dtype)
 
     def forward(self,
                 hidden_states: Tensor,
@@ -113,7 +117,9 @@ class BaichuanModel(Module):
             tp_rank=config.mapping.tp_rank)
 
         self.layers = DecoderLayerList(BaichuanDecoderLayer, config)
-        self.ln_f = RmsNorm(normalized_shape=hidden_size, dtype=dtype)
+        self.ln_f = RmsNorm(normalized_shape=hidden_size,
+                            eps=config.norm_epsilon,
+                            dtype=dtype)
 
     def forward(self,
                 input_ids: Tensor,

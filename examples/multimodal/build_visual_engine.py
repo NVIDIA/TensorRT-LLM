@@ -28,7 +28,7 @@ def export_visual_wrapper_onnx(visual_wrapper, image, output_dir):
 def build_trt_engine(img_height, img_width, output_dir, max_batch_size):
     part_name = 'visual_encoder'
     onnx_file = '%s/onnx/%s.onnx' % (output_dir, part_name)
-    engine_file = '%s/%s_fp16.engine' % (output_dir, part_name)
+    engine_file = '%s/%s.engine' % (output_dir, part_name)
     logger.log(trt.Logger.INFO, "Building TRT engine for %s" % part_name)
 
     builder = trt.Builder(logger)

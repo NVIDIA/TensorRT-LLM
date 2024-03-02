@@ -1,0 +1,10 @@
+-f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+flax~=0.8.0
+jax[cuda12_pip]~=0.4.19; platform_system != "Windows"
+jax~=0.4.19; platform_system == "Windows"
+safetensors~=0.4.1
+sentencepiece~=0.1.99
+h5py~=3.10.0
+easydict~=1.11
+rouge_score
+nltk

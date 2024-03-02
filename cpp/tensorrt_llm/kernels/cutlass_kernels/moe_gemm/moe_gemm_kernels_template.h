@@ -231,6 +231,24 @@ void dispatchMoeGemmToCutlass(const T* A, const WeightType* B, const T* weight_s
 {
     switch (gemm_config.tile_config)
     {
+    case cutlass_extensions::CutlassTileConfig::CtaShape16x128x64_WarpShape16x32x64:
+        TLLM_CHECK_WITH_INFO(arch::kMinComputeCapability >= 75, "Invalid config on Volta");
+        if constexpr (arch::kMinComputeCapability >= 75)
+        {
+            dispatchGemmConfig<T, WeightType, arch, EpilogueTag, cutlass::gemm::GemmShape<16, 128, 64>,
+                cutlass::gemm::GemmShape<16, 32, 64>>(A, B, weight_scales, biases, C, total_rows_before_expert,
+                total_rows, gemm_n, gemm_k, num_experts, gemm_config, multi_processor_count, stream, occupancy);
+        }
+        break;
+    case cutlass_extensions::CutlassTileConfig::CtaShape16x256x64_WarpShape16x64x64:
+        TLLM_CHECK_WITH_INFO(arch::kMinComputeCapability >= 75, "Invalid config on Volta");
+        if constexpr (arch::kMinComputeCapability >= 75)
+        {
+            dispatchGemmConfig<T, WeightType, arch, EpilogueTag, cutlass::gemm::GemmShape<16, 256, 64>,
+                cutlass::gemm::GemmShape<16, 64, 64>>(A, B, weight_scales, biases, C, total_rows_before_expert,
+                total_rows, gemm_n, gemm_k, num_experts, gemm_config, multi_processor_count, stream, occupancy);
+        }
+        break;
     case cutlass_extensions::CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64:
         dispatchGemmConfig<T, WeightType, arch, EpilogueTag, cutlass::gemm::GemmShape<32, 128, 64>,
             cutlass::gemm::GemmShape<32, 32, 64>>(A, B, weight_scales, biases, C, total_rows_before_expert, total_rows,
@@ -266,6 +284,24 @@ void dispatchMoeGemmToCutlass(const T* A, const WeightType* B, const T* weight_s
 {
     switch (gemm_config.tile_config)
     {
+    case cutlass_extensions::CutlassTileConfig::CtaShape16x128x64_WarpShape16x32x64:
+        TLLM_CHECK_WITH_INFO(arch::kMinComputeCapability >= 75, "Invalid config on Volta");
+        if constexpr (arch::kMinComputeCapability >= 75)
+        {
+            dispatchGemmConfig<T, WeightType, arch, EpilogueTag, cutlass::gemm::GemmShape<16, 128, 64>,
+                cutlass::gemm::GemmShape<16, 32, 64>>(A, B, weight_scales, biases, C, total_rows_before_expert,
+                total_rows, gemm_n, gemm_k, num_experts, gemm_config, multi_processor_count, stream, occupancy);
+        }
+        break;
+    case cutlass_extensions::CutlassTileConfig::CtaShape16x256x64_WarpShape16x64x64:
+        TLLM_CHECK_WITH_INFO(arch::kMinComputeCapability >= 75, "Invalid config on Volta");
+        if constexpr (arch::kMinComputeCapability >= 75)
+        {
+            dispatchGemmConfig<T, WeightType, arch, EpilogueTag, cutlass::gemm::GemmShape<16, 256, 64>,
+                cutlass::gemm::GemmShape<16, 64, 64>>(A, B, weight_scales, biases, C, total_rows_before_expert,
+                total_rows, gemm_n, gemm_k, num_experts, gemm_config, multi_processor_count, stream, occupancy);
+        }
+        break;
     case cutlass_extensions::CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64:
         dispatchGemmConfig<T, WeightType, arch, EpilogueTag, cutlass::gemm::GemmShape<32, 128, 64>,
             cutlass::gemm::GemmShape<32, 32, 64>>(A, B, weight_scales, biases, C, total_rows_before_expert, total_rows,

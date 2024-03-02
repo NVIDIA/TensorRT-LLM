@@ -13,13 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
-from typing import Union
 
 import numpy as np
 import tensorrt as trt
 
 from .._common import default_net, precision
-from .._utils import fp32_array, str_dtype_to_trt
+from .._utils import fp32_array, is_same_dtype
 from ..functional import (ACT2FN, Tensor, allgather, allreduce, cast, concat,
                           constant, generate_alibi_slopes, gpt_attention,
                           matmul, mul, shape, slice, softmax, split, where)
@@ -454,6 +453,7 @@ class WeightOnlyGroupwiseQuantLinear(Module):
         tp_size=1,
         gather_output=True,
         max_lora_rank=None,
+        use_w4a8_awq=False,
     ):
 
         super().__init__()
@@ -462,8 +462,9 @@ class WeightOnlyGroupwiseQuantLinear(Module):
         BIAS = 1
         ZERO = 2
         PRE_QUANT_SCALE = 4
+        W4A8_AWQ = 8
 
-        self.quant_algo = pre_quant_scale * PRE_QUANT_SCALE + zero * ZERO + bias * BIAS
+        self.quant_algo = use_w4a8_awq * W4A8_AWQ + pre_quant_scale * PRE_QUANT_SCALE + zero * ZERO + bias * BIAS
         self.group_size = group_size
         self.in_features = in_features
         self.out_features = out_features // tp_size
@@ -491,6 +492,11 @@ class WeightOnlyGroupwiseQuantLinear(Module):
         else:
             self.register_parameter('bias', None)
 
+        if use_w4a8_awq:
+            self.alpha = Parameter(shape=(1, ), dtype="float32")
+        else:
+            self.register_parameter('alpha', None)
+
         self.tp_size = tp_size
         self.tp_group = tp_group
         self.gather_output = gather_output
@@ -500,11 +506,12 @@ class WeightOnlyGroupwiseQuantLinear(Module):
         pre_quant_scale = self.prequant_scaling_factor.value if self.prequant_scaling_factor else None
         zero = self.zero.value if self.zero else None
         bias = self.bias.value if self.bias else None
+        alpha = self.alpha.value if self.alpha else None
 
         x = weight_only_groupwise_quant_matmul(
             x, pre_quant_scale, self.weight.value,
-            self.weights_scaling_factor.value, zero, bias, self.quant_algo,
-            self.group_size)
+            self.weights_scaling_factor.value, zero, bias, alpha,
+            self.quant_algo, self.group_size)
 
         if self.gather_output and self.tp_size > 1 and self.tp_group is not None:
             # [dim0, local_dim] -> [dim0 * tp_size, local_dim] --> [dim0, local_dim * tp_size]
@@ -530,6 +537,7 @@ class WeightOnlyGroupwiseQuantRowLinear(Module):
         tp_group=None,
         tp_size=1,
         max_lora_rank=None,
+        use_w4a8_awq=False,
     ):
         super().__init__()
 
@@ -537,8 +545,9 @@ class WeightOnlyGroupwiseQuantRowLinear(Module):
         BIAS = 1
         ZERO = 2
         PRE_QUANT_SCALE = 4
+        W4A8_AWQ = 8
 
-        self.quant_algo = pre_quant_scale * PRE_QUANT_SCALE + zero * ZERO + bias * BIAS
+        self.quant_algo = use_w4a8_awq * W4A8_AWQ + pre_quant_scale * PRE_QUANT_SCALE + zero * ZERO + bias * BIAS
         self.group_size = group_size
         self.in_features = in_features // tp_size
         self.out_features = out_features
@@ -566,6 +575,11 @@ class WeightOnlyGroupwiseQuantRowLinear(Module):
         else:
             self.register_parameter('bias', None)
 
+        if use_w4a8_awq:
+            self.alpha = Parameter(shape=(1, ), dtype="float32")
+        else:
+            self.register_parameter('alpha', None)
+
         self.tp_size = tp_size
         self.tp_group = tp_group
 
@@ -574,11 +588,12 @@ class WeightOnlyGroupwiseQuantRowLinear(Module):
         pre_quant_scale = self.prequant_scaling_factor.value if self.prequant_scaling_factor else None
         zero = self.zero.value if self.zero else None
         bias = self.bias.value if self.bias else None
+        alpha = self.alpha.value if self.alpha else None
 
         x = weight_only_groupwise_quant_matmul(
             x, pre_quant_scale, self.weight.value,
-            self.weights_scaling_factor.value, zero, bias, self.quant_algo,
-            self.group_size)
+            self.weights_scaling_factor.value, zero, bias, alpha,
+            self.quant_algo, self.group_size)
         if self.tp_size > 1 and self.tp_group is not None:
             x = allreduce(x, self.tp_group)
 
@@ -650,17 +665,6 @@ class SmoothQuantMLP(Module):
         return output
 
 
-def is_same_dtype(type_a: Union[str, trt.DataType],
-                  type_b: Union[str, trt.DataType]) -> bool:
-    if isinstance(type_a, str):
-        type_a = str_dtype_to_trt(type_a)
-
-    if isinstance(type_b, str):
-        type_b = str_dtype_to_trt(type_b)
-
-    return type_a == type_b
-
-
 class Int8SmoothQuantRowLinear(RowLinear):
 
     def __init__(self,
@@ -695,17 +699,22 @@ class Int8SmoothQuantRowLinear(RowLinear):
                 self.dtype), f"Got input type {x.dtype}, expecting {self.dtype}"
         x = mul(x, self.prequant_scaling_factor.value)
 
-        activation_scaling_factor = cast(self.activation_scaling_factor.value,
-                                         self.dtype)
-        quantized_out = quantize(x, activation_scaling_factor, 'int8')
-        dequantized_out = dequantize(quantized_out, activation_scaling_factor,
-                                     -1, self.dtype)
+        x = cast(x, self.activation_scaling_factor.value.dtype)
 
-        weights_scaling_factor = cast(self.weights_scaling_factor.value,
-                                      self.dtype)
-        w_deq_out = dequantize(self.weight.value, weights_scaling_factor, 0,
-                               self.dtype)
+        quantized_out = quantize(x, self.activation_scaling_factor.value,
+                                 'int8')
 
+        dequantized_out = dequantize(quantized_out,
+                                     self.activation_scaling_factor.value, -1,
+                                     self.activation_scaling_factor.value.dtype)
+
+        dequantized_out = cast(dequantized_out, self.dtype)
+
+        w_deq_out = dequantize(self.weight.value,
+                               self.weights_scaling_factor.value, 0,
+                               self.weights_scaling_factor.value.dtype)
+
+        w_deq_out = cast(w_deq_out, self.dtype)
         return super().multiply_reduce(dequantized_out, w_deq_out, False)
 
 
@@ -746,17 +755,21 @@ class Int8SmoothQuantLinear(Linear):
                 x.dtype,
                 self.dtype), f"Got input type {x.dtype}, expecting {self.dtype}"
         x = mul(x, self.prequant_scaling_factor.value)
+        x = cast(x, self.activation_scaling_factor.value.dtype)
 
-        activation_scaling_factor = cast(self.activation_scaling_factor.value,
-                                         self.dtype)
-        quantized_out = quantize(x, activation_scaling_factor, 'int8')
-        dequantized_out = dequantize(quantized_out, activation_scaling_factor,
-                                     -1, self.dtype)
+        quantized_out = quantize(x, self.activation_scaling_factor.value,
+                                 'int8')
 
-        weights_scaling_factor = cast(self.weights_scaling_factor.value,
-                                      self.dtype)
-        w_deq_out = dequantize(self.weight.value, weights_scaling_factor, 0,
-                               self.dtype)
+        dequantized_out = dequantize(quantized_out,
+                                     self.activation_scaling_factor.value, -1,
+                                     self.activation_scaling_factor.value.dtype)
+
+        dequantized_out = cast(dequantized_out, self.dtype)
+
+        w_deq_out = dequantize(self.weight.value,
+                               self.weights_scaling_factor.value, 0,
+                               self.weights_scaling_factor.value.dtype)
+        w_deq_out = cast(w_deq_out, self.dtype)
 
         return super().multiply_gather(dequantized_out, w_deq_out, False)
 
@@ -932,6 +945,8 @@ class SmoothQuantAttention(Module):
 
     def __init__(
         self,
+        *,
+        layer_idx,
         hidden_size,
         num_attention_heads,
         num_kv_heads=None,
@@ -956,6 +971,7 @@ class SmoothQuantAttention(Module):
         max_lora_rank=None,
     ):
         super().__init__()
+        self.layer_idx = layer_idx
         self.attention_mask_type = attention_mask_type
         self.attention_head_size = hidden_size // num_attention_heads if attention_head_size is None else attention_head_size
         self.num_attention_heads = num_attention_heads // tp_size
@@ -988,7 +1004,7 @@ class SmoothQuantAttention(Module):
         self.rotary_embedding_base = rotary_embedding_base
         self.rotary_embedding_dim = 0
         if self.position_embedding_type.is_rope():
-            self.rotary_embedding_dim = hidden_size // num_attention_heads
+            self.rotary_embedding_dim = self.attention_head_size
 
         self.quant_mode = quant_mode
         self.dtype = dtype
@@ -1049,7 +1065,6 @@ class SmoothQuantAttention(Module):
         lora_layer_params=None,
     ):
         assert lora_layer_params is None, "lora is not supported on SmoothQuantAttention now"
-        # TODO add in-flight batching to SmoothQuant
         if default_net().plugin_config.smooth_quant_gemm_plugin:
             qkv = self.qkv(hidden_states)
         else:
@@ -1098,6 +1113,7 @@ class SmoothQuantAttention(Module):
                 context_lengths=attention_params.context_lengths,
                 cache_indirection=kv_cache_params.cache_indirection,
                 host_request_types=attention_params.host_request_types,
+                layer_idx=self.layer_idx,
                 num_heads=self.num_attention_heads,
                 num_kv_heads=self.num_attention_kv_heads,
                 hidden_size_per_head=self.attention_head_size,
@@ -1112,10 +1128,9 @@ class SmoothQuantAttention(Module):
                 alibi_slopes=alibi_slopes,
                 tp_size=self.tp_size,
                 tp_rank=self.tp_rank,
-                kv_cache_block_pointers=kv_cache_params.
-                get_first_kv_cache_block_pointers(),
+                kv_cache_block_pointers=kv_cache_params.kv_cache_block_pointers,
                 host_kv_cache_block_pointers=kv_cache_params.
-                get_first_host_kv_cache_block_pointers(),
+                host_kv_cache_block_pointers,
                 host_context_lengths=attention_params.host_context_lengths,
                 enable_pos_shift=self.enable_pos_shift,
                 dense_context_fmha=self.dense_context_fmha,

@@ -46,7 +46,7 @@ namespace tensorrt_llm::plugins
 //                      enable_remove_input_padding
 //     1.  sequence_length [batch_size] (optional)
 //     2.  host_past_key_value_lengths [batch_size] (int32) (optional)
-//     3.  host_max_attention_window_sizes [1] (int32)
+//     3.  host_max_attention_window_sizes [num_layers] (int32)
 //     4.  host_sink_token_length [1] (int32)
 //     5.  context_lengths [batch_size]
 //     6.  cache_indir [num_gen_requests, beam_width, memory_max_len] (required in beamsearch) (optional)
@@ -54,8 +54,8 @@ namespace tensorrt_llm::plugins
 //     mode,
 //                      all elements must be identical.
 //     8.  past_key_value_pool [batch_size, 2, local_num_kv_heads, max_seq_len, head_size] or
-//         block_pointers [batch_size, 2, max_blocks_per_seq] if paged kv cache (optional)
-//     8.1 host_block_pointers [batch_size, 2, max_blocks_per_seq] if paged kv cache (optional)
+//         block_pointers [num_layers, batch_size, 2, max_blocks_per_seq] if paged kv cache (optional)
+//     8.1 host_block_pointers [num_layers, batch_size, 2, max_blocks_per_seq] if paged kv cache (optional)
 //     9.  kv_cache_quantization_scale [1] (optional)
 //     10. kv_cache_dequantization_scale [1] (optional)
 //     11. alibi_slopes [num_heads] (optional for ALiBi position embedding)
@@ -70,8 +70,8 @@ namespace tensorrt_llm::plugins
 class GPTAttentionPlugin : public GPTAttentionPluginCommon
 {
 public:
-    GPTAttentionPlugin(int num_heads, int num_kv_heads, int head_size, int unidirectional, float q_scaling,
-        tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
+    GPTAttentionPlugin(int layer_idx, int num_heads, int num_kv_heads, int head_size, int unidirectional,
+        float q_scaling, tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
         int rotary_embedding_dim, // for RoPE. 0 for non-RoPE
         float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
         float rotary_embedding_scale, int rotary_embedding_max_positions, int tp_size, int tp_rank, // for ALiBi

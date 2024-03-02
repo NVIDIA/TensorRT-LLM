@@ -36,8 +36,8 @@ class GPTAttentionPluginCommon : public BasePlugin
 public:
     GPTAttentionPluginCommon() = delete;
 
-    GPTAttentionPluginCommon(int num_heads, int num_kv_heads, int head_size, int unidirectional, float q_scaling,
-        tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
+    GPTAttentionPluginCommon(int layer_idx, int num_heads, int num_kv_heads, int head_size, int unidirectional,
+        float q_scaling, tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
         int rotary_embedding_dim, // for RoPE. Use 0 for non-RoPE
         float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
         float rotary_embedding_scale, int rotary_embedding_max_positions, int tp_size, int tp_rank, // for ALiBi
@@ -79,7 +79,7 @@ public:
 protected:
     int getMaxNumSeqLenTile(int batch_beam_size = 1) const;
     size_t getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t nbReq, int32_t max_input_length,
-        int32_t max_kv_cache_len, int32_t cross_qkv_length = 0) const noexcept;
+        int32_t max_kv_cache_len, int32_t cross_qkv_length = 0, int32_t max_num_tokens = 0) const noexcept;
     // total_num_seq is the sum of beam_width for multiple requests
     size_t getWorkspaceSizeForGeneration(
         nvinfer1::DataType type, int32_t total_num_seq, int32_t max_kv_cache_length) const noexcept;
@@ -213,6 +213,7 @@ protected:
 
     const std::string mLayerName;
 
+    int mLayerIdx;
     int mNumHeads;
     int mNumKVHeads;
     int mHeadSize;

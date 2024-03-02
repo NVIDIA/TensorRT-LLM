@@ -222,16 +222,16 @@ class QkvWeightHelper:
             self._qkv_weights[i] = {}
         self._qkv_weights[i][tag] = weight
 
-    def is_qkv_prepared(self, layer_id):
-        if layer_id not in self._qkv_weights:
+    def is_qkv_prepared(self, layer_idx):
+        if layer_idx not in self._qkv_weights:
             return False
-        weights = self._qkv_weights[layer_id]
+        weights = self._qkv_weights[layer_idx]
         return 'q' in weights and 'k' in weights and 'v' in weights
 
-    def split_qkv_weights(self, layer_id):
-        if not self.is_qkv_prepared(layer_id):
+    def split_qkv_weights(self, layer_idx):
+        if not self.is_qkv_prepared(layer_idx):
             return None
-        weights = self._qkv_weights.pop(layer_id)  # to prevent memory leak.
+        weights = self._qkv_weights.pop(layer_idx)  # to prevent memory leak.
         q, k, v = (torch.tensor(weights[t]) for t in ['q', 'k', 'v'])
 
         if not self.is_mha:
@@ -293,13 +293,13 @@ def load_from_hf_checkpoint(model_dir,
         model_params = load_state_dict(model_file, dtype=dtype)
         for name, param in model_params.items():
             tensorrt_llm.logger.debug(f'Converting weight {name}...')
-            i = retrieved_layer_index_from_name(name)
-            if i is None:
+            layer_idx = retrieved_layer_index_from_name(name)
+            if layer_idx is None:
                 layer = None
             else:
-                if i not in layers_range:
+                if layer_idx not in layers_range:
                     continue
-            tllm_prex = f'transformer.layers.{i}.'
+            tllm_prex = f'transformer.layers.{layer_idx}.'
 
             if 'model.embed_tokens.weight' in name:
                 if lora_config.is_valid and lora_config.embedding_weight is not None:
@@ -349,10 +349,10 @@ def load_from_hf_checkpoint(model_dir,
             elif 'post_attention_layernorm.weight' in name:
                 weights[tllm_prex + 'post_layernorm.weight'] = param
             elif qkv_weight_helper.is_qkv_weight(name):
-                qkv_weight_helper.add_weight(i, name, param)
-                if not qkv_weight_helper.is_qkv_prepared(i):
+                qkv_weight_helper.add_weight(layer_idx, name, param)
+                if not qkv_weight_helper.is_qkv_prepared(layer_idx):
                     continue
-                split_v = qkv_weight_helper.split_qkv_weights(i)
+                split_v = qkv_weight_helper.split_qkv_weights(layer_idx)
                 if use_weight_only:
                     param = split_v.transpose()
                     processed_torch_weights, torch_weight_scales = \
@@ -501,10 +501,7 @@ def load_from_hf_llama(tensorrt_llm_llama: 'LLaMAForCausalLM',
             f'model.layers.{l}.block_sparse_moe.experts.w2.weight'] = w2
 
     torch_dtype = str_dtype_to_torch(dtype)
-    layers_per_pipeline_stage = hf_llama.config.num_hidden_layers // mapping.pp_size
-    layers_range = list(
-        range(mapping.pp_rank * layers_per_pipeline_stage,
-              (mapping.pp_rank + 1) * layers_per_pipeline_stage, 1))
+    layers_range = mapping.pp_layers(hf_llama.config.num_hidden_layers)
 
     vocab_size = hf_llama.config.vocab_size
     weights = {}
@@ -564,7 +561,7 @@ def load_from_hf_llama(tensorrt_llm_llama: 'LLaMAForCausalLM',
             layer_idx = extract_layer_idx(k)
             if layer_idx is None or int(layer_idx) not in layers_range:
                 continue
-            idx = int(layer_idx) - mapping.pp_rank * layers_per_pipeline_stage
+            idx = int(layer_idx) - layers_range[0]
             if 'input_layernorm.weight' in k:
                 weights['transformer.layers.{}.input_layernorm.weight'.format(
                     idx)] = v
@@ -1152,10 +1149,7 @@ def load_from_meta_llama(meta_ckpt_dir, mapping=Mapping(), config=None):
 
     head_size = config.hidden_size // config.num_attention_heads
     ckpt = get_current_weights(num_ckpts)
-    layers_per_pipeline_stage = config.num_hidden_layers // mapping.pp_size
-    layers_range = list(
-        range(mapping.pp_rank * layers_per_pipeline_stage,
-              (mapping.pp_rank + 1) * layers_per_pipeline_stage, 1))
+    layers_range = mapping.pp_layers(config.num_hidden_layers)
 
     for l in layers_range:
         prefix = f'layers.{l}.attention.'
@@ -1230,7 +1224,7 @@ def load_from_meta_llama(meta_ckpt_dir, mapping=Mapping(), config=None):
 
             if layer_idx is None or int(layer_idx) not in layers_range:
                 continue
-            idx = int(layer_idx) - mapping.pp_rank * layers_per_pipeline_stage
+            idx = int(layer_idx) - layers_range[0]
             tllm_prex = f'transformer.layers.{idx}.'
 
             if 'attention_norm.weight' in k:
@@ -1487,13 +1481,10 @@ def load_from_awq_llama(quant_ckpt_path,
         weights['transformer.ln_f.weight'] = v.to(torch_dtype)
 
     # 4. Weights inside each layer
-    layers_per_pipeline_stage = num_hidden_layers // mapping.pp_size
-    layers_range = list(
-        range(mapping.pp_rank * layers_per_pipeline_stage,
-              (mapping.pp_rank + 1) * layers_per_pipeline_stage, 1))
+    layers_range = mapping.pp_layers(num_hidden_layers)
 
     for l in layers_range:
-        layer_idx = l - mapping.pp_rank * layers_per_pipeline_stage
+        layer_idx = l - layers_range[0]
         prefix = "layers" + split_sym + str(layer_idx) + split_sym
         tllm_prex = f'transformer.layers.{l-layers_range[0]}'
 

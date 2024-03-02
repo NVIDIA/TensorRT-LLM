@@ -318,7 +318,7 @@ int WeightOnlyQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDesc* input
         weight_only_quant_type = tensorrt_llm::kernels::WeightOnlyQuantType::Int4b;
         real_n = n * INT8_INT4_RATIO;
     }
-    if (use_cuda_kernel)
+    if (use_cuda_kernel && getSMVersion() < 90)
     {
         // Use CUDA kernels for small batch size
         // The CUDA kernel is designed for ColumnMajorTileInterleave weight layout used in fpAIntB cutlass

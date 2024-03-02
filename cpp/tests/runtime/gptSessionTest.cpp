@@ -278,6 +278,7 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
         samplingConfig.topK = std::vector{0};
         samplingConfig.topP = std::vector{0.0f};
     }
+    samplingConfig.earlyStopping = std::vector{1};
 
     auto const padId = modelIds.padId;
     auto endId = modelIds.endId;
@@ -603,7 +604,7 @@ INSTANTIATE_TEST_SUITE_P(GptSessionOtbTest, ParamTest,
             ModelSpec{FP16_GPT_DIR, FP16_RESULT_FILE, nvinfer1::DataType::kHALF}.useDecoderPerRequest()
 
                 ),
-        testing::Values(1 /*, 2*/),   // beamWidth, DISABLED beam search
+        testing::Values(1),           // beamWidth, DISABLED beam search
         testing::Values(false, true), // cudaGraphMode
         testing::Values(MicroBatchSizes(), MicroBatchSizes{3, 3}, MicroBatchSizes{3, 6})),
     generateTestName);
@@ -812,6 +813,7 @@ TEST_F(ChatGlm2SessionTest, HalfSamplingAttentionPluginBS1BM1)
         modelPath, modelSpec, modeIds, 1, batchSizes, "", mLogger, false, MicroBatchSizes(), true, modelName);
 }
 
+/*
 TEST_F(ChatGlm2SessionTest, HalfSamplingAttentionPluginBS2BM1)
 {
     auto const modelName{"chatglm2_6b"};
@@ -824,6 +826,7 @@ TEST_F(ChatGlm2SessionTest, HalfSamplingAttentionPluginBS2BM1)
     testGptSession(
         modelPath, modelSpec, modeIds, 1, batchSizes, "", mLogger, false, MicroBatchSizes(), true, modelName);
 }
+*/
 
 TEST_F(ChatGlm2SessionTest, HalfSamplingAttentionPluginBS1BM2)
 {

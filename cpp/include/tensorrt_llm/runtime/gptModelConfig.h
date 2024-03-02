@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/loraModule.h"
+#include "tensorrt_llm/runtime/medusaModule.h"
 #include <NvInferRuntime.h>
 
 namespace tensorrt_llm::runtime
@@ -62,6 +63,7 @@ public:
         , mPagedContextFMHA(false)
         , mUseLoraPlugin(false)
         , mMlpHiddenSize(0)
+        , mMedusaModule(std::nullopt)
     {
     }
 
@@ -341,6 +343,31 @@ public:
         mMlpHiddenSize = mlpHiddenSize;
     }
 
+    [[nodiscard]] SizeType constexpr getMaxLoraRank() const noexcept
+    {
+        return mMaxLoraRank;
+    }
+
+    void constexpr setMaxLoraRank(SizeType maxLoraRank) noexcept
+    {
+        mMaxLoraRank = maxLoraRank;
+    }
+
+    [[nodiscard]] bool constexpr useMedusa() const noexcept
+    {
+        return mMedusaModule.has_value();
+    }
+
+    [[nodiscard]] std::optional<MedusaModule> getMedusaModule() const noexcept
+    {
+        return mMedusaModule;
+    }
+
+    void setMedusaModule(MedusaModule const& medusaModule) noexcept
+    {
+        mMedusaModule = medusaModule;
+    }
+
 private:
     SizeType mVocabSize;
     SizeType mNbLayers;
@@ -374,5 +401,8 @@ private:
     bool mUseLoraPlugin;
     std::vector<LoraModule> mLoraModules;
     SizeType mMlpHiddenSize;
+    SizeType mMaxLoraRank;
+
+    std::optional<MedusaModule> mMedusaModule;
 };
 } // namespace tensorrt_llm::runtime

@@ -81,7 +81,7 @@ def get_model(ckpt_path, dtype="float16", cache_dir=None):
     torch_dtype = str_dtype_to_torch(dtype)
     model = AutoModelForCausalLM.from_pretrained(
         ckpt_path,
-        device_map="auto",
+        device_map="cuda",
         cache_dir=cache_dir,
         trust_remote_code=True,
         torch_dtype=torch_dtype,

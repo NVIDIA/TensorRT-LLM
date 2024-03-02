@@ -26,6 +26,20 @@ def woq_torch_dtype(dtype):
     return torch_dtype
 
 
+def woq_all_ones(n, k, dtype):
+    torch_dtype = woq_torch_dtype(dtype)
+    # Init operands for multiplication in int32
+    weight = torch.ones((n, k), dtype=torch_dtype)
+    return weight
+
+
+def woq_all_zeros(n, k, dtype):
+    torch_dtype = woq_torch_dtype(dtype)
+    # Init operands for multiplication in int32
+    weight = torch.zeros((n, k), dtype=torch_dtype)
+    return weight
+
+
 def woq_gen_weights(n, k, dtype):
     torch_dtype = woq_torch_dtype(dtype)
     # Init operands for multiplication in int32
@@ -106,13 +120,13 @@ def woq_assert_colwise_near_eq(ref, act, wTypeId):
     if ref.shape[0] > 1:
         for col_idx in range(ref.shape[-1]):
             col = ref[:, col_idx]
-            max_val = torch.max(col).item()
+            max_val = torch.max(torch.abs(col)).item()
             atol = (max_val * quant_range_scale) * 1.5  # allow for rounding
             np.testing.assert_allclose(col.cpu().numpy(),
                                        act[:, col_idx].cpu().numpy(),
                                        atol=atol)
     else:
-        max_val = torch.max(ref).item()
+        max_val = torch.max(abs(ref)).item()
         atol = (max_val * quant_range_scale) * 1.5  # allow for rounding
         np.testing.assert_allclose(ref.cpu().numpy(),
                                    act.cpu().numpy(),

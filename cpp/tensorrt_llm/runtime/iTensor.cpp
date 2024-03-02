@@ -89,7 +89,12 @@ ITensor::UniquePtr ITensor::wrap(void* data, nvinfer1::DataType type, nvinfer1::
             new GenericTensor<GpuBorrowingAllocator>(
                 shape, capacity, type, GpuBorrowingAllocator(data, capacityInBytes)));
         break;
-    default: TLLM_THROW("Unknown memory type");
+    case MemoryType::kUVM:
+        result.reset( // NOLINT(modernize-make-unique)
+            new GenericTensor<ManagedBorrowingAllocator>(
+                shape, capacity, type, ManagedBorrowingAllocator(data, capacityInBytes)));
+        break;
+    default: TLLM_THROW("Invalid memory type."); break;
     }
     return result;
 }

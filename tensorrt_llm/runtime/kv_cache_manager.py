@@ -374,7 +374,7 @@ class KVCacheManager(object):
             self.blocks_manager.allocate(
                 sequence, share_across_beam=i != unshared_block_idx)
 
-    def get_pointer_arrays(self, beam_width: int) -> List[torch.Tensor]:
+    def get_block_pointers(self, beam_width: int) -> torch.Tensor:
         """
         Returns arrays of pointers for all memory pools
         """
@@ -383,7 +383,8 @@ class KVCacheManager(object):
             pointer_arrays.append(
                 self.blocks_manager.get_pointer_array(
                     pool, beam_width).view(dtype=torch.int64))
-        return pointer_arrays
+
+        return torch.stack(pointer_arrays, dim=0)
 
 
 class KVCacheUpdater:
@@ -417,13 +418,17 @@ class KVCacheUpdater:
     def update(self, accepted_draft_token_offsets,
                packed_accepted_draft_tokens_indices, sequence_length_buffer,
                rewind_tokens):
+        assert isinstance(rewind_tokens, torch.Tensor) or isinstance(
+            rewind_tokens, int)
+        rewind_tokens_tensor = rewind_tokens if isinstance(
+            rewind_tokens, torch.Tensor) else None
+        rewind_tokens_count = rewind_tokens if isinstance(rewind_tokens,
+                                                          int) else 0
         assert self.use_paged_kv_cache is not None
         if self.use_paged_kv_cache:
-            host_kv_cache_block_pointers = self.kv_cache_manager.get_pointer_arrays(
+            host_kv_cache_block_pointers = self.kv_cache_manager.get_block_pointers(
                 1)
-            kv_cache_block_pointers = [
-                x.to('cuda') for x in host_kv_cache_block_pointers
-            ]
+            kv_cache_block_pointers = host_kv_cache_block_pointers.to('cuda')
             torch.ops.tensorrt_llm.update_kv_cache_draft_token_location(
                 accepted_draft_token_offsets,
                 packed_accepted_draft_tokens_indices,
@@ -431,8 +436,9 @@ class KVCacheUpdater:
                 True,
                 self.num_kv_heads,
                 self.head_dim * self.elt_size,
-                rewind_tokens,
+                rewind_tokens_count,
                 self.kv_cache_manager.max_attention_window_size,
+                rewind_tokens_tensor,
                 None,
                 kv_cache_block_pointers,
                 self.kv_cache_manager.blocks_manager.max_blocks_per_seq,
@@ -447,8 +453,9 @@ class KVCacheUpdater:
                 False,
                 self.num_kv_heads,
                 self.head_dim * self.elt_size,
-                rewind_tokens,
+                rewind_tokens_count,
                 self.max_kv_cache_length,
+                rewind_tokens_tensor,
                 self.past_key_value_list,
                 None,
                 None,

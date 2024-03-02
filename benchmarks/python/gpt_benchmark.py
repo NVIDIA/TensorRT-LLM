@@ -95,6 +95,7 @@ class GPTBenchmark(BaseBenchmark):
             if args.mode == 'plugin':
                 self.use_gpt_attention_plugin = True
                 self.remove_input_padding = True
+                self.use_moe_plugin = True
             elif args.mode == 'ootb-except-mha':
                 self.use_gpt_attention_plugin = True
 
@@ -110,6 +111,7 @@ class GPTBenchmark(BaseBenchmark):
             self.num_kv_heads = self.num_heads
         model_config = tensorrt_llm.runtime.ModelConfig(
             max_batch_size=self.max_batch_size,
+            max_beam_width=self.num_beams,
             vocab_size=self.vocab_size,
             num_layers=self.num_layers,
             num_heads=self.num_heads // self.world_size,

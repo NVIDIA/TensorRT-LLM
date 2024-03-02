@@ -39,6 +39,11 @@ public:
         kMLP_H_TO_4H = 5,
         kMLP_4H_TO_H = 6,
         kMLP_GATE = 7,
+        kCROSS_ATTN_QKV = 8,
+        kCROSS_ATTN_Q = 9,
+        kCROSS_ATTN_K = 10,
+        kCROSS_ATTN_V = 11,
+        kCROSS_ATTN_DENSE = 12,
     };
 
     explicit constexpr LoraModule(ModuleType const& t, SizeType inDim, SizeType outDim, bool inDimFirst,
@@ -128,6 +133,16 @@ public:
             return ModuleType::kMLP_4H_TO_H;
         else if (name == "mlp_gate")
             return ModuleType::kMLP_GATE;
+        else if (name == "cross_attn_qkv")
+            return ModuleType::kCROSS_ATTN_QKV;
+        else if (name == "cross_attn_q")
+            return ModuleType::kCROSS_ATTN_Q;
+        else if (name == "cross_attn_k")
+            return ModuleType::kCROSS_ATTN_K;
+        else if (name == "cross_attn_v")
+            return ModuleType::kCROSS_ATTN_V;
+        else if (name == "cross_attn_dense")
+            return ModuleType::kCROSS_ATTN_DENSE;
         else
             return ModuleType::kINVALID;
     }
@@ -144,6 +159,11 @@ public:
         case ModuleType::kMLP_H_TO_4H: return "mlp_h_to_4h";
         case ModuleType::kMLP_4H_TO_H: return "mlp_4h_to_h";
         case ModuleType::kMLP_GATE: return "mlp_gate";
+        case ModuleType::kCROSS_ATTN_QKV: return "cross_attn_qkv";
+        case ModuleType::kCROSS_ATTN_Q: return "cross_attn_q";
+        case ModuleType::kCROSS_ATTN_K: return "cross_attn_k";
+        case ModuleType::kCROSS_ATTN_V: return "cross_attn_v";
+        case ModuleType::kCROSS_ATTN_DENSE: return "cross_attn_dense";
         case ModuleType::kINVALID: return "INVALID";
         }
         return "INVALID";

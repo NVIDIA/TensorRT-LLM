@@ -60,6 +60,20 @@ else()
   message(STATUS "Importing batch manager")
 endif()
 
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tensorrt_llm/executor/CMakeLists.txt")
+  set(BUILD_EXECUTOR_DEFAULT ON)
+else()
+  set(BUILD_EXECUTOR_DEFAULT OFF)
+endif()
+
+option(BUILD_EXECUTOR "Build executor from source" ${BUILD_EXECUTOR_DEFAULT})
+
+if(BUILD_EXECUTOR)
+  message(STATUS "Building executor")
+else()
+  message(STATUS "Importing executor")
+endif()
+
 if(BUILD_PYT)
   message(STATUS "Building PyTorch")
 else()
@@ -168,12 +182,16 @@ if(ENABLE_MULTI_DEVICE EQUAL 1)
   find_library(NCCL_LIB nccl HINTS ${NCCL_LIB_DIR})
 endif()
 
-get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_SOURCE_DIR} PATH)
+get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR} PATH)
 
 set(3RDPARTY_DIR ${TRT_LLM_ROOT_DIR}/3rdparty)
 include_directories(
-  ${CUDAToolkit_INCLUDE_DIRS} ${CUDNN_ROOT_DIR}/include ${NCCL_INCLUDE_DIR}
-  ${3RDPARTY_DIR}/cutlass/include ${3RDPARTY_DIR}/NVTX/include
+  ${CUDAToolkit_INCLUDE_DIRS}
+  ${CUDNN_ROOT_DIR}/include
+  ${NCCL_INCLUDE_DIR}
+  ${3RDPARTY_DIR}/cutlass/include
+  ${3RDPARTY_DIR}/cutlass/tools/util/include
+  ${3RDPARTY_DIR}/NVTX/include
   ${3RDPARTY_DIR}/json/include)
 
 # TRT dependencies

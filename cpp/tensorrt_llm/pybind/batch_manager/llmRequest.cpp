@@ -17,7 +17,10 @@
 #include "llmRequest.h"
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/generationInput.h"
+#include "tensorrt_llm/runtime/torch.h"
+#include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/torchView.h"
 #include <memory>
 
@@ -45,6 +48,25 @@ std::optional<tb::LlmRequest::TensorPtr> from_torch(std::optional<LlmRequest::Te
 
 } // namespace
 
+std::optional<tb::LlmRequest::LogitsPostProcessor> LlmRequest::callbackAdapter(
+    std::optional<LlmRequest::LogitsPostProcessor> callback)
+{
+    if (!callback)
+    {
+        return std::nullopt;
+    }
+
+    return [callback](RequestIdType reqId, tensorrt_llm::runtime::ITensor::SharedPtr& tensor,
+               tensorrt_llm::batch_manager::LlmRequest::BeamTokens const& tokens,
+               tensorrt_llm::runtime::BufferManager::CudaStreamPtr stream)
+    {
+        at::Tensor atTensor = tr::Torch::tensor(tensor);
+
+        auto result = callback.value()(reqId, atTensor, tokens, runtime::TorchUtils::stream(*stream).unwrap());
+        return tr::TorchView::of(result);
+    };
+}
+
 std::shared_ptr<tb::LlmRequest> LlmRequest::toTrtLlm() const
 {
     auto embeddingBias = from_torch(mEmbeddingBias);
@@ -58,7 +80,8 @@ std::shared_ptr<tb::LlmRequest> LlmRequest::toTrtLlm() const
     return std::make_shared<tb::LlmRequest>(mRequestId, mMaxNewTokens,
         std::make_shared<std::vector<TokenIdType>>(mTokens.at(0)), mSamplingConfig, mIsStreaming, mEndId, mPadId,
         embeddingBias, badWordsList, stopWordsList, promptEmbeddingTable, mPromptVocabSize, loraWeights, loraConfig,
-        mReturnLogProbs, mReturnContextLogits, mReturnGenerationLogits, mDraftTokens, draftLogits);
+        mReturnLogProbs, mReturnContextLogits, mReturnGenerationLogits, mDraftTokens, draftLogits,
+        mExcludeInputFromOutput, callbackAdapter(mLogitsPostProcessor));
 }
 
 void LlmRequest::initBindings(py::module_& m)
@@ -70,7 +93,7 @@ void LlmRequest::initBindings(py::module_& m)
                  std::optional<LlmRequest::TensorPtr>, std::optional<LlmRequest::TensorPtr>,
                  std::optional<LlmRequest::SizeType>, std::optional<LlmRequest::TensorPtr>,
                  std::optional<LlmRequest::TensorPtr>, bool, bool, bool, std::optional<LlmRequest::VecTokens>,
-                 std::optional<LlmRequest::TensorPtr>>(),
+                 std::optional<LlmRequest::TensorPtr>, bool, std::optional<LlmRequest::LogitsPostProcessor>>(),
             py::arg("request_id"), py::arg("max_new_tokens"), py::arg("input_tokens"), py::arg("sampling_config"),
             py::arg("is_streaming"), py::arg("end_id") = std::nullopt, py::arg("pad_id") = std::nullopt,
             py::arg("embedding_bias") = std::nullopt, py::arg("bad_words_list") = std::nullopt,
@@ -78,7 +101,8 @@ void LlmRequest::initBindings(py::module_& m)
             py::arg("prompt_vocab_size") = std::nullopt, py::arg("lora_weights") = std::nullopt,
             py::arg("lora_config") = std::nullopt, py::arg("return_log_probs") = false,
             py::arg("return_context_logits") = false, py::arg("return_generation_logits") = false,
-            py::arg("draft_tokens") = std::nullopt, py::arg("draft_logits") = std::nullopt)
+            py::arg("draft_tokens") = std::nullopt, py::arg("draft_logits") = std::nullopt,
+            py::arg("exclude_input_from_output") = false, py::arg("logits_post_processor") = std::nullopt)
         .def("get_num_tokens", &LlmRequest::getNumTokens, py::arg("beam"))
         .def_property_readonly("max_beam_num_tokens", &LlmRequest::getMaxBeamNumTokens)
         .def("get_token", &LlmRequest::getToken, py::arg("beam"), py::arg("pos"))

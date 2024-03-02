@@ -2,34 +2,35 @@
 
 First build a model with LoRA and inflight-batching enabled.
 
-```
+```bash
+git-lfs clone https://huggingface.co/qychen/luotuo-lora-7b-0.1
+git-lfs clone https://huggingface.co/kunishou/Japanese-Alpaca-LoRA-7b-v0
 BASE_MODEL=llama-7b-hf
 
-python3 tensorrt_llm/examples/llama/build.py --model_dir ${BASE_MODEL} \
-                --dtype float16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin float16 \
-                --enable_context_fmha \
-                --use_gemm_plugin float16 \
-                --output_dir "/tmp/llama_7b_with_lora_qkv/trt_engines/fp16/1-gpu/" \
-                --max_batch_size 128 \
-                --max_input_len 512 \
-                --max_output_len 50 \
-                --use_lora_plugin float16 \
-                --lora_target_modules "attn_q" "attn_k" "attn_v" \
-                --use_inflight_batching \
-                --paged_kv_cache \
-                --max_lora_rank 8 \
-                --world_size 1 --tp_size 1
+python examples/llama/convert_checkpoint.py --model_dir ${BASE_MODEL} \
+    --output_dir /tmp/llama_7b_with_lora_qkv/trt_ckpt/fp16/1-gpu/ \
+    --dtype float16 \
+    --hf_lora_dir Japanese-Alpaca-LoRA-7b-v0 \
+    --max_lora_rank 8 \
+    --lora_target_modules "attn_q" "attn_k" "attn_v"
+
+trtllm-build --checkpoint_dir /tmp/llama_7b_with_lora_qkv/trt_ckpt/fp16/1-gpu/ \
+    --output_dir /tmp/llama_7b_with_lora_qkv/trt_engines/fp16/1-gpu/ \
+    --remove_input_padding enable \
+    --gpt_attention_plugin float16 \
+    --context_fmha enable \
+    --paged_kv_cache enable \
+    --gemm_plugin float16 \
+    --lora_plugin float16 \
+    --max_batch_size 128 \
+    --max_input_len 512 \
+    --max_output_len 50 \
 ```
 
 To pass LoRAs into the cpp runtime they must be converted to the format below.
 The script below will convert a huggingface LoRA model to the correct numpy tensors.
 
-```
-git-lfs clone https://huggingface.co/qychen/luotuo-lora-7b-0.1
-git-lfs clone https://huggingface.co/kunishou/Japanese-Alpaca-LoRA-7b-v0
-
+```bash
 python3 tensorrt_llm/examples/hf_lora_convert.py -i Japanese-Alpaca-LoRA-7b-v0 -o Japanese-Alpaca-LoRA-7b-v0-weights --storage-type float16
 python3 tensorrt_llm/examples/hf_lora_convert.py -i luotuo-lora-7b-0.1 -o luotuo-lora-7b-0.1-weights --storage-type float16
 ```
@@ -87,7 +88,7 @@ The tensors below are for a LoRA which has a `q` and `k` adapter.
 
 See LoraModule::ModuleType for model id mapping
 
-| module name (as specified in build.py scripts | module id | description |
+| module name (as specified in convert_checkpoint.py scripts) | module id | description |
 | --------------------------------------------- | --------- | ----------- |
 | attn_qkv | 0 | compbined qkv adapter |
 | attn_q | 1 | q adapter |

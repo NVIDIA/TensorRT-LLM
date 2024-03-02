@@ -191,6 +191,21 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
                  tp_size, '--use_lora_plugin=float16',
                  '--lora_target_modules=attn_qkv', *ifb_args)
 
+    print("\nConverting to fp16 SQ")
+    fp16_weight_dir = weight_dir / 'fp16-sq'
+    fp16_weight_dir_x_gpu = fp16_weight_dir / tp_dir
+    _egc.run_conversion(
+        _egc.ProgArgs(in_file=str(hf_dir),
+                      out_dir=str(fp16_weight_dir),
+                      storage_type='float16',
+                      tensor_parallelism=tp_size,
+                      smoothquant=0.5))
+
+    print("\nBuilding fp16 SQ engines")
+    build_engine(fp16_weight_dir_x_gpu,
+                 engine_dir / 'fp16-plugin-packed-paged-sq' / tp_pp_dir,
+                 tp_size, *ifb_args)
+
     if has_safetensor:
         _pl.Path(str(safetensor_file) + ".bak").rename(safetensor_file)
 

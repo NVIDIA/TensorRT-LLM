@@ -1,5 +1,7 @@
 import os
 
+import torch
+
 from tensorrt_llm.tools.plugin_gen.core import *
 
 openai_triton_example_root = os.path.join(
@@ -8,13 +10,15 @@ openai_triton_example_root = os.path.join(
 
 def get_fmha_kernel_meta_data():
     block_size = 128
+    num_stages = 2 if torch.cuda.get_device_capability() >= (8, 0) else 1
+
     return KernelMetaData(
         kernel_name='fused_attention_kernel',
         ios=[
             # outputs
             OutputArg('Out', Type('tensor[fp16]'), hints=['16', '16']),
             OutputArg('L', Type('tensor[fp32]'), hints=['16', '16']),
-            OutputArg('M', Type('tensor[fp16]'), hints=['16', '16']),
+            OutputArg('M', Type('tensor[fp32]'), hints=['16', '16']),
             # inputs
             InputArg('Q', Type('tensor[fp16]'), hints=['16', '16']),
             InputArg('K', Type('tensor[fp16]'), hints=['16', '16']),
@@ -41,7 +45,7 @@ def get_fmha_kernel_meta_data():
         version=0,
         kernel_file=f'{openai_triton_example_root}/fmha_triton.py',
         num_warps=4,
-        num_stages=2,
+        num_stages=num_stages,
         grid_dims=(f"(seq_len + {block_size-1}) / {block_size}",
                    "batch_size * num_heads", "1"))
 

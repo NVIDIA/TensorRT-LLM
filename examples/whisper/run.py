@@ -19,13 +19,14 @@ import time
 from collections import OrderedDict
 from pathlib import Path
 
+import numpy as np
 import torch
 from datasets import load_dataset
 from tokenizer import get_tokenizer
 from torch.utils.data import DataLoader
 from whisper.normalizers import EnglishTextNormalizer
-from whisper_utils import (log_mel_spectrogram, store_transcripts,
-                           write_error_stats)
+from whisper_utils import (N_SAMPLES, log_mel_spectrogram, pad_or_trim,
+                           store_transcripts, write_error_stats)
 
 import tensorrt_llm
 import tensorrt_llm.logger as logger
@@ -56,6 +57,13 @@ def parse_arguments():
                         type=str,
                         default='float16',
                         choices=['float16'])
+    parser.add_argument('--accuracy_check',
+                        action='store_true',
+                        help="only for CI test")
+    parser.add_argument('--tokenizer_name',
+                        type=str,
+                        default="multilingual",
+                        choices=['multilingual', 'gpt2'])
     return parser.parse_args()
 
 
@@ -147,6 +155,7 @@ class WhisperDecoding:
 
         decoder_model_config = ModelConfig(
             max_batch_size=self.decoder_config['max_batch_size'],
+            max_beam_width=self.decoder_config['max_beam_width'],
             num_heads=self.decoder_config['num_heads'],
             num_kv_heads=self.decoder_config['num_heads'],
             hidden_size=self.decoder_config['hidden_size'],
@@ -187,6 +196,10 @@ class WhisperDecoding:
                                              device='cuda')
         decoder_max_input_length = torch.max(decoder_input_lengths).item()
 
+        cross_attention_mask = torch.ones(
+            [encoder_outputs.shape[0], 1,
+             encoder_outputs.shape[1]]).int().cuda()
+
         # generation config
         sampling_config = SamplingConfig(end_id=eot_id,
                                          pad_id=eot_id,
@@ -207,6 +220,7 @@ class WhisperDecoding:
             sampling_config,
             encoder_output=encoder_outputs,
             encoder_input_lengths=encoder_input_lengths,
+            cross_attention_mask=cross_attention_mask,
         )
         torch.cuda.synchronize()
 
@@ -217,7 +231,11 @@ class WhisperDecoding:
 
 class WhisperTRTLLM(object):
 
-    def __init__(self, engine_dir, debug_mode=False, assets_dir=None):
+    def __init__(self,
+                 engine_dir,
+                 tokenizer_name="multilingual",
+                 debug_mode=False,
+                 assets_dir=None):
         world_size = 1
         runtime_rank = tensorrt_llm.mpi_rank()
         runtime_mapping = tensorrt_llm.Mapping(world_size, runtime_rank)
@@ -229,7 +247,8 @@ class WhisperTRTLLM(object):
                                        runtime_mapping,
                                        debug_mode=False)
         self.n_mels = self.encoder.n_mels
-        self.tokenizer = get_tokenizer(num_languages=self.encoder.num_languages,
+        self.tokenizer = get_tokenizer(name=tokenizer_name,
+                                       num_languages=self.encoder.num_languages,
                                        tokenizer_dir=assets_dir)
         self.eot_id = self.tokenizer.encode(
             "<|endoftext|>",
@@ -290,12 +309,18 @@ def decode_wav_file(
 
 
 def collate_wrapper(batch):
-    speeches, labels, ids = [], [], []
+    speeches, durations, labels, ids = [], [], [], []
     for item in batch:
-        speeches.append(item["audio"]["array"])
+        speech = item["audio"]["array"]
+        duration = speech.shape[-1]
+        speech = pad_or_trim(speech, N_SAMPLES)
+        speech = speech.astype(np.float32)
+        speech = torch.from_numpy(speech)
+        speeches.append(speech)
+        durations.append(duration)
         labels.append(item["text"])
         ids.append(item["id"])
-    return speeches, labels, ids
+    return speeches, durations, labels, ids
 
 
 def decode_dataset(
@@ -318,9 +343,12 @@ def decode_dataset(
     results = []
     total_duration = 0
     for batch in data_loader:
-        waveforms, texts, ids = batch
-        total_duration += sum([wave.shape[0]
-                               for wave in waveforms]) / sample_rate
+        waveforms, durations, texts, ids = batch
+        total_duration += sum(durations) / sample_rate
+
+        for wave in waveforms:
+            assert wave.is_pinned()
+
         features = [
             log_mel_spectrogram(wave,
                                 model.n_mels,
@@ -343,7 +371,8 @@ def decode_dataset(
 if __name__ == '__main__':
     args = parse_arguments()
     tensorrt_llm.logger.set_level(args.log_level)
-    model = WhisperTRTLLM(args.engine_dir, args.debug, args.assets_dir)
+    model = WhisperTRTLLM(args.engine_dir, args.tokenizer_name, args.debug,
+                          args.assets_dir)
     normallizer = EnglishTextNormalizer()
     if args.enable_warmup:
         results, total_duration = decode_dataset(
@@ -383,8 +412,8 @@ if __name__ == '__main__':
                                              "test-set",
                                              results,
                                              enable_log=True)
-        if args.dataset == "hf-internal-testing/librispeech_asr_dummy" and not args.input_file:
-            assert total_error_rate <= 3.1, f"Word Error rate using whisper large model should be less than 3.1% but got {total_error_rate}"
+        if args.accuracy_check and args.dataset == "hf-internal-testing/librispeech_asr_dummy" and not args.input_file:
+            assert total_error_rate <= 2.5, f"Word Error rate using whisper large-v3 model should be less than 2.5% but got {total_error_rate}"
 
     rtf = elapsed / total_duration
     s = f"RTF: {rtf:.4f}\n"

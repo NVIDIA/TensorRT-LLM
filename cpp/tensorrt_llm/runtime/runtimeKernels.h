@@ -51,6 +51,8 @@ void invokeTransposeWithInputOffset(
 
 void invokeInclusiveSum(IBuffer& output, IBuffer const& input, BufferManager const& manager, CudaStream const& stream);
 
+void invokeInclusiveSum(IBuffer& output, IBuffer& tmpBuffer, IBuffer const& input, CudaStream const& stream);
+
 void invokeBuildTokenMask(
     ITensor& tokenMask, ITensor const& inputLengths, SizeType maxInputLength, CudaStream const& stream);
 

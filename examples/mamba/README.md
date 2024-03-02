@@ -108,7 +108,7 @@ trtllm-build --checkpoint_dir ./mamba/mamba-2.8b-slimpj/trt_ckpt/bf16/1-gpu/ \
              --gpt_attention_plugin disable \
              --paged_kv_cache disable \
              --remove_input_padding disable \
-             --use_gemm_plugin bfloat16 \
+             --gemm_plugin bfloat16 \
              --max_batch_size 8 \
              --max_input_len 924 \
              --max_output_len 100 \
@@ -119,7 +119,7 @@ trtllm-build --checkpoint_dir ./mamba/mamba-2.8b/trt_ckpt/bf16/1-gpu/ \
              --gpt_attention_plugin disable \
              --paged_kv_cache disable \
              --remove_input_padding disable \
-             --use_gemm_plugin bfloat16 \
+             --gemm_plugin bfloat16 \
              --max_batch_size 8 \
              --max_input_len 924 \
              --max_output_len 100 \
@@ -130,7 +130,7 @@ trtllm-build --checkpoint_dir ./mamba/mamba-1.4b/trt_ckpt/fp16/1-gpu/ \
              --gpt_attention_plugin disable \
              --paged_kv_cache disable \
              --remove_input_padding disable \
-             --use_gemm_plugin float16 \
+             --gemm_plugin float16 \
              --max_batch_size 8 \
              --max_input_len 924 \
              --max_output_len 100 \
@@ -141,7 +141,7 @@ trtllm-build --checkpoint_dir ./mamba/mamba-790m/trt_ckpt/fp16/1-gpu/ \
              --gpt_attention_plugin disable \
              --paged_kv_cache disable \
              --remove_input_padding disable \
-             --use_gemm_plugin float16 \
+             --gemm_plugin float16 \
              --max_batch_size 8 \
              --max_input_len 924 \
              --max_output_len 100 \
@@ -152,7 +152,7 @@ trtllm-build --checkpoint_dir ./mamba/mamba-370m/trt_ckpt/fp16/1-gpu/ \
              --gpt_attention_plugin disable \
              --paged_kv_cache disable \
              --remove_input_padding disable \
-             --use_gemm_plugin float16 \
+             --gemm_plugin float16 \
              --max_batch_size 8 \
              --max_input_len 924 \
              --max_output_len 100 \
@@ -163,7 +163,7 @@ trtllm-build --checkpoint_dir ./mamba/mamba-130m/trt_ckpt/fp16/1-gpu/ \
              --gpt_attention_plugin disable \
              --paged_kv_cache disable \
              --remove_input_padding disable \
-             --use_gemm_plugin float16 \
+             --gemm_plugin float16 \
              --max_batch_size 8 \
              --max_input_len 924 \
              --max_output_len 100 \

@@ -26,7 +26,7 @@ def is_triton_installed() -> bool:
         if version('triton') != "2.1.0+440fd1b":
             return False
     except Exception:
-        return false
+        return False
 
     return os.path.exists(TRITON_COMPILE_BIN)
 

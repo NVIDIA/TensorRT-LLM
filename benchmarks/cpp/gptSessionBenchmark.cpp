@@ -114,9 +114,9 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                     "benchmark on %d tokens",
                     maxNumTokens.value(), maxBatchSize * maxInputLength);
             }
+            std::atomic_bool done = false;
             try
             {
-                std::atomic_bool done = false;
                 auto peakMemFuture = std::async(&monitorMemory, std::ref(done));
                 TLLM_LOG_INFO(memoryCounter.toString());
 
@@ -266,11 +266,14 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
             catch (std::runtime_error& e)
             {
                 std::size_t found = std::string(e.what()).find("out of memory");
+                // We need to kill the memory monitor when OOM.
+                done = true;
 
                 // Unexpected error; rethrow
                 if (found == std::string::npos)
                 {
-                    throw;
+                    TLLM_LOG_ERROR(e.what());
+                    throw e;
                 }
 
                 // We can ignore the OOM exception and continue the rest of the benchmark
@@ -282,6 +285,12 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                         batchSize, maxInputLength, maxNewTokens);
                 }
                 continue;
+            }
+            catch (...)
+            {
+                // We need to kill memory monitor when any other issue occurs
+                done = true;
+                throw;
             }
         }
         TLLM_LOG_INFO(memoryCounter.toString());

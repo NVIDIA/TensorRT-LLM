@@ -90,6 +90,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                  max_beam_width: Optional[int] = None,
                  max_attention_window_size: Optional[int] = None,
                  sink_token_length: Optional[int] = None,
+                 free_gpu_memory_fraction: Optional[float] = None,
                  debug_mode: bool = False,
                  lora_ckpt_source: str = "hf") -> 'ModelRunnerCpp':
         """
@@ -122,6 +123,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 The attention window size that controls the sliding window attention / cyclic kv cache behaviour.
             sink_token_length (int) :
                 The sink token length, default=0.
+            free_gpu_memory_fraction (float) :
+                Free GPU memory fraction that KV cache used.
             debug_mode (bool):
                 Whether or not to turn on the debug mode.
             lora_ckpt_source (str):
@@ -164,6 +167,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                                           max_beam_width=max_beam_width,
                                           max_sequence_length=max_seq_len)
         session_config.kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=free_gpu_memory_fraction,
             max_attention_window=max_attention_window_size,
             sink_token_length=sink_token_length)
         session = GptSession(config=session_config,
@@ -359,6 +363,7 @@ def _populate_sampling_config(
         sampling_config.beam_search_diversity_rate
     ]
     gpt_sampling_config.length_penalty = [sampling_config.length_penalty]
+    gpt_sampling_config.early_stopping = [sampling_config.early_stopping]
     gpt_sampling_config.min_length = [sampling_config.min_length]
     # TODO: cannot set presence_penalty and frequency_penalty?
     # gpt_sampling_config.presence_penalty = [sampling_config.presence_penalty]

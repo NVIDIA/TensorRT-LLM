@@ -49,7 +49,7 @@ LoraManager::LoraReqTensors& LoraManager::getTask(TaskIdType reqId)
 void LoraManager::create(
     GptModelConfig const& modelConfig, WorldConfig const& worldConfig, BufferManager const& manager)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto modules = modelConfig.getLoraModules();
     SizeType modOff = 0;
@@ -62,14 +62,14 @@ void LoraManager::create(
     // TODO set this size from max adapter size
     mWorkspace = manager.emptyTensor(MemoryType::kGPU, modelConfig.getDataType());
 
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 void LoraManager::fillInputTensors(TensorPtr weightsPtrs, TensorPtr adapterSizes, ReqIdsVec const& reqIds,
     std::vector<SizeType> const& reqBeamWidth, std::vector<bool> const& loraEnabled, SizeType numContextRequests,
     GptModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto localNbLayers = modelConfig.getNbLayers(worldConfig.getPipelineParallelism());
     auto firstLayerId = worldConfig.getPipelineParallelRank() * localNbLayers;
     auto lastLayerId = firstLayerId + localNbLayers;
@@ -85,13 +85,13 @@ void LoraManager::fillInputTensors(TensorPtr weightsPtrs, TensorPtr adapterSizes
         fillInputTensors(
             weightsPtrs, adapterSizes, bid, reqIds[bid], reqBeamWidth[bid], firstLayerId, lastLayerId, tpSize, tpRank);
     }
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 void LoraManager::fillInputTensors(TensorPtr weightsPtrs, TensorPtr adapterSizes, SizeType batchIdx, TaskIdType taskId,
     SizeType beamWidth, SizeType firstLayerId, SizeType lastLayerId, SizeType tpSize, SizeType tpRank)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto weightsPointersPtr = bufferCast<int64_t>(*weightsPtrs);
     auto adapterSizesPtr = bufferCast<int32_t>(*adapterSizes);
@@ -172,13 +172,13 @@ void LoraManager::fillInputTensors(TensorPtr weightsPtrs, TensorPtr adapterSizes
         }
         std::fill_n(writeAdapterSizesPtr, beamWidth, adapterSize);
     }
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 void LoraManager::insertInputTensors(TensorMap& inputTensors, TensorPtr weightsPtrs, TensorPtr adapterSizes,
     GptModelConfig const& modelConfig, WorldConfig const& worldConfig) const
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto localNbLayers = modelConfig.getNbLayers(worldConfig.getPipelineParallelism());
     auto firstLayerId = worldConfig.getPipelineParallelRank() * localNbLayers;
 
@@ -210,13 +210,13 @@ void LoraManager::insertInputTensors(TensorMap& inputTensors, TensorPtr weightsP
             }
         }
     }
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 void LoraManager::formatTaskTensors(LoraWeightsTensorPtr weights, LoraConfigTensorPtr config,
     GptModelConfig const& modelConfig, WorldConfig const& worldConfig, BufferManager const& manager)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     weights->squeeze(0);
     config->squeeze(0);
 
@@ -261,7 +261,7 @@ void LoraManager::formatTaskTensors(LoraWeightsTensorPtr weights, LoraConfigTens
             manager.copy(*mWorkspace, *weightsOut);
         }
     }
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 void LoraManager::reset()

@@ -8,6 +8,7 @@ from typing import List, Optional
 import torch
 
 from tensorrt_llm import LLM, ModelConfig
+from tensorrt_llm.hlapi.llm import SamplingConfig
 from tensorrt_llm.hlapi.utils import get_device_count
 
 # NOTE, Currently, the following examples are only available for LLaMA models.
@@ -37,13 +38,34 @@ def run_llm_from_huggingface_model(prompts: List[str],
         print(output)
 
 
-def run_llm_from_tllm_engine(prompts: List[str], llama_engine_dir: str):
+def run_llm_from_tllm_engine(prompts: List[str],
+                             llama_engine_dir: str,
+                             tp_size: int = 1):
     ''' Loading a built TensorRT-LLM engine. '''
+
+    config = ModelConfig(llama_engine_dir)
+    config.parallel_config.tp_size = tp_size
+    llm = LLM(config)
+
+    for output in llm.generate(prompts):
+        print(output)
+
+
+def run_llm_without_tokenizer_from_tllm_engine(llama_engine_dir: str):
+    ''' Loading a TensorRT-LLM engine built by trtllm-build, and the tokenizer is missing too. '''
 
     config = ModelConfig(llama_engine_dir)
     llm = LLM(config)
 
-    for output in llm.generate(prompts):
+    # since tokenizer is missing, so we cannot get a default sampling config, create one manually
+    sampling_config = SamplingConfig(end_id=2,
+                                     pad_id=2,
+                                     output_sequence_lengths=True,
+                                     return_dict=True)
+
+    prompts = [[23, 14, 3]]
+
+    for output in llm.generate(prompts, sampling_config=sampling_config):
         print(output)
 
 
@@ -124,7 +146,7 @@ def _parse_arguments():
                         help='The directory to dump the engine.',
                         default=None)
     parser.add_argument('--quant_type', type=str, choices=['int4_awq', 'fp8'])
-    parser.add_argument('--prompt', type=str, required=True)
+    parser.add_argument('--prompt', type=str)
     parser.add_argument('--tp_size', type=int, default=1)
     parser.add_argument('--streaming', action='store_true')
     return parser.parse_args()
@@ -149,7 +171,10 @@ if __name__ == '__main__':
             args.dump_engine_dir,
             tp_size=args.tp_size),
         run_llm_from_tllm_engine=lambda: run_llm_from_tllm_engine(
-            [args.prompt], args.dump_engine_dir),
+            [args.prompt],
+            args.dump_engine_dir,
+            tp_size=args.tp_size,
+        ),
         run_llm_generate_async_example=lambda: run_llm_generate_async_example(
             [args.prompt],
             args.hf_model_dir,
@@ -157,6 +182,8 @@ if __name__ == '__main__':
             streaming=args.streaming),
         run_llm_with_quantization=lambda: run_llm_with_quantization(
             [args.prompt], args.hf_model_dir, args.quant_type),
+        run_llm_without_tokenizer_from_tllm_engine=lambda:
+        run_llm_without_tokenizer_from_tllm_engine(args.dump_engine_dir),
     )
 
     print(f'Running {args.task} ...')

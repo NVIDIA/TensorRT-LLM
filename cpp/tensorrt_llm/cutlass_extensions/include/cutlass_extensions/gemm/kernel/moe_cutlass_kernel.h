@@ -321,174 +321,170 @@ public:
         return 0;
     }
 
-    // The dummy template parameter is not used and exists so that we can compile this code using
-    // a standard earlier than C++17. Prior to C++17, fully specialized templates HAD to exists in
-    // a namespace
-    template <bool B, typename dummy = void>
-    struct KernelRunner
+    CUTLASS_DEVICE
+    void run_kernel_(Params const& params, SharedStorage& shared_storage)
     {
-        CUTLASS_DEVICE
-        static void run_kernel(Params const& params, SharedStorage& shared_storage)
+        //
+        // These types shadow the type-level definitions and support the ability to implement
+        // a 'transposed' GEMM that computes the transposed problems.
+        //
+        using ElementA = typename Mma::IteratorA::Element;
+        using LayoutA = typename Mma::IteratorA::Layout;
+        using ElementB = typename Mma::IteratorB::Element;
+        using LayoutB = typename Mma::IteratorB::Layout;
+        using ElementC = typename Epilogue::OutputTileIterator::Element;
+        using LayoutC = typename Epilogue::OutputTileIterator::Layout;
+        static constexpr int kInterleave = Mma::IteratorB::Shape::kRow / Mma::Shape::kK;
+        static_assert(platform::is_same<LayoutB, layout::RowMajor>::value && kInterleave == 1
+                || platform::is_same<LayoutB, layout::ColumnMajor>::value && kInterleave >= 1,
+            "B must be row major/col major OR col major interleaved.");
+
+        //
+        // Problem visitor.
+        //
+        ProblemVisitor problem_visitor(params.problem_visitor, shared_storage.problem_visitor, blockIdx.x);
+
+        const int64_t gemm_k = params.problem_visitor.gemm_k;
+        const int64_t gemm_n = params.problem_visitor.gemm_n;
+        int64_t bytes_per_expert_matrix = (gemm_k * gemm_n / 8) * cutlass::sizeof_bits<ElementB>::value;
+
+        // Outer 'persistent' loop to iterate over tiles
+        int loop = 0;
+        while (problem_visitor.next_tile())
+        {
+            loop++;
+
+            GemmCoord problem_size = problem_visitor.problem_size();
+            int32_t problem_idx = problem_visitor.problem_index();
+            int32_t cta_idx = int32_t(problem_visitor.threadblock_idx());
+
+            GemmCoord grid_shape = problem_visitor.grid_shape(problem_size);
+
+            cutlass::gemm::GemmCoord threadblock_offset(
+                int(cta_idx / grid_shape.n()) * Mma::Shape::kM, int(cta_idx % grid_shape.n()) * Mma::Shape::kN, 0);
+
+            // Load element pointers. Exchange pointers and strides if working on the transpose
+            const int64_t rows_to_jump
+                = problem_idx == 0 ? 0 : params.problem_visitor.last_row_for_problem[problem_idx - 1];
+            ElementA* ptr_A = reinterpret_cast<ElementA*>(params.ptr_A) + rows_to_jump * gemm_k;
+            typename LayoutA::LongIndex ldm_A = gemm_k;
+
+            char* byte_ptr_B = ((char*) params.ptr_B) + problem_idx * bytes_per_expert_matrix;
+            ElementB* ptr_B = reinterpret_cast<ElementB*>(byte_ptr_B);
+            typename LayoutB::LongIndex ldm_B
+                = platform::is_same<layout::RowMajor, LayoutB>::value ? gemm_n : gemm_k * kInterleave;
+
+            // Compute initial location in logical coordinates
+            cutlass::MatrixCoord tb_offset_A{
+                threadblock_offset.m(),
+                0,
+            };
+
+            cutlass::MatrixCoord tb_offset_B{0, threadblock_offset.n() / kInterleave};
+
+            cutlass::MatrixCoord tb_offset_scale{0, threadblock_offset.n()};
+
+            // Compute position within threadblock
+            int thread_idx = threadIdx.x;
+
+            // Construct iterators to A and B operands
+            typename Mma::IteratorA iterator_A(
+                LayoutA(ldm_A), ptr_A, {problem_size.m(), problem_size.k()}, thread_idx, tb_offset_A);
+
+            typename Mma::IteratorB iterator_B(LayoutB(ldm_B), ptr_B,
+                {problem_size.k() * kInterleave, problem_size.n() / kInterleave}, thread_idx, tb_offset_B);
+
+            typename Mma::FragmentC accumulators;
+
+            accumulators.clear();
+
+            // Broadcast the warp_id computed by lane 0 to ensure dependent code
+            // is compiled as warp-uniform.
+            int warp_idx = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+
+            int lane_idx = threadIdx.x % 32;
+
+            //
+            // Matrix multiply phase
+            //
+
+            // Construct thread-scoped matrix multiply
+            auto CreateMMA = [&]()
+            {
+                if constexpr (use_dq_gemm<Mma>::value)
+                    return Mma(shared_storage.main_loop, params.group_size, thread_idx, warp_idx, lane_idx);
+                else
+                    return Mma(shared_storage.main_loop, thread_idx, warp_idx, lane_idx);
+            };
+            Mma mma = CreateMMA();
+
+            // Compute threadblock-scoped matrix multiply-add
+            int gemm_k_iterations = (problem_size.k() + Mma::Shape::kK - 1) / Mma::Shape::kK;
+
+            // Wait for all threads to finish their epilogue phases from the previous tile.
+            __syncthreads();
+
+            // Compute threadblock-scoped matrix multiply-add
+            ElementScale* weight_scale_ptr = params.weight_scales + problem_idx * problem_size.n();
+
+            if constexpr (use_dq_gemm<Mma>::value)
+            {
+                const MatrixCoord scale_extent = {1, problem_size.n()};
+                typename Mma::IteratorScale iterator_scale(Mma::IteratorScale::Layout(scale_extent.column()),
+                    weight_scale_ptr, scale_extent, thread_idx, tb_offset_scale);
+
+                mma(gemm_k_iterations, accumulators, iterator_A, iterator_B, iterator_scale, accumulators);
+            }
+            else
+            {
+                mma(gemm_k_iterations, accumulators, iterator_A, iterator_B, accumulators);
+            }
+
+            //
+            // Epilogue
+            //
+
+            EpilogueOutputOp output_op(params.output_op);
+
+            ElementC* ptr_C = reinterpret_cast<ElementC*>(params.ptr_C) + problem_idx * gemm_n;
+            ElementC* ptr_D = reinterpret_cast<ElementC*>(params.ptr_D) + rows_to_jump * gemm_n;
+
+            LayoutC layout_C(0);
+            LayoutC layout_D(gemm_n);
+
+            typename Epilogue::OutputTileIterator::Params params_C(layout_C);
+            typename Epilogue::OutputTileIterator::Params params_D(layout_D);
+
+            // Tile iterator loading from source tensor.
+            typename Epilogue::OutputTileIterator iterator_C(
+                params_C, ptr_C, problem_size.mn(), thread_idx, threadblock_offset.mn());
+
+            // Tile iterator writing to destination tensor.
+            typename Epilogue::OutputTileIterator iterator_D(
+                params_D, ptr_D, problem_size.mn(), thread_idx, threadblock_offset.mn());
+
+            Epilogue epilogue(shared_storage.epilogue, thread_idx, warp_idx, lane_idx);
+
+            // Execute the epilogue operator to update the destination tensor.
+            epilogue(output_op, iterator_D, accumulators, iterator_C);
+
+            // Next tile
+            problem_visitor.advance(gridDim.x);
+        }
+    }
+
+    template <typename CompilationArch>
+    CUTLASS_DEVICE void run_kernel(Params const& params, SharedStorage& shared_storage)
+    {
+        if constexpr (platform::is_same<KernelArch, CompilationArch>::value)
+        {
+            run_kernel_(params, shared_storage);
+        }
+        else
         {
             CUTLASS_NOT_IMPLEMENTED();
         }
-    };
-
-    template <typename dummy>
-    struct KernelRunner<true, dummy>
-    {
-        CUTLASS_DEVICE
-        static void run_kernel(Params const& params, SharedStorage& shared_storage)
-        {
-            //
-            // These types shadow the type-level definitions and support the ability to implement
-            // a 'transposed' GEMM that computes the transposed problems.
-            //
-            using ElementA = typename Mma::IteratorA::Element;
-            using LayoutA = typename Mma::IteratorA::Layout;
-            using ElementB = typename Mma::IteratorB::Element;
-            using LayoutB = typename Mma::IteratorB::Layout;
-            using ElementC = typename Epilogue::OutputTileIterator::Element;
-            using LayoutC = typename Epilogue::OutputTileIterator::Layout;
-            static constexpr int kInterleave = Mma::IteratorB::Shape::kRow / Mma::Shape::kK;
-            static_assert(platform::is_same<LayoutB, layout::RowMajor>::value && kInterleave == 1
-                    || platform::is_same<LayoutB, layout::ColumnMajor>::value && kInterleave >= 1,
-                "B must be row major/col major OR col major interleaved.");
-
-            //
-            // Problem visitor.
-            //
-            ProblemVisitor problem_visitor(params.problem_visitor, shared_storage.problem_visitor, blockIdx.x);
-
-            const int64_t gemm_k = params.problem_visitor.gemm_k;
-            const int64_t gemm_n = params.problem_visitor.gemm_n;
-            int64_t bytes_per_expert_matrix = (gemm_k * gemm_n / 8) * cutlass::sizeof_bits<ElementB>::value;
-
-            // Outer 'persistent' loop to iterate over tiles
-            int loop = 0;
-            while (problem_visitor.next_tile())
-            {
-                loop++;
-
-                GemmCoord problem_size = problem_visitor.problem_size();
-                int32_t problem_idx = problem_visitor.problem_index();
-                int32_t cta_idx = int32_t(problem_visitor.threadblock_idx());
-
-                GemmCoord grid_shape = problem_visitor.grid_shape(problem_size);
-
-                cutlass::gemm::GemmCoord threadblock_offset(
-                    int(cta_idx / grid_shape.n()) * Mma::Shape::kM, int(cta_idx % grid_shape.n()) * Mma::Shape::kN, 0);
-
-                // Load element pointers. Exchange pointers and strides if working on the transpose
-                const int64_t rows_to_jump
-                    = problem_idx == 0 ? 0 : params.problem_visitor.last_row_for_problem[problem_idx - 1];
-                ElementA* ptr_A = reinterpret_cast<ElementA*>(params.ptr_A) + rows_to_jump * gemm_k;
-                typename LayoutA::LongIndex ldm_A = gemm_k;
-
-                char* byte_ptr_B = ((char*) params.ptr_B) + problem_idx * bytes_per_expert_matrix;
-                ElementB* ptr_B = reinterpret_cast<ElementB*>(byte_ptr_B);
-                typename LayoutB::LongIndex ldm_B
-                    = platform::is_same<layout::RowMajor, LayoutB>::value ? gemm_n : gemm_k * kInterleave;
-
-                // Compute initial location in logical coordinates
-                cutlass::MatrixCoord tb_offset_A{
-                    threadblock_offset.m(),
-                    0,
-                };
-
-                cutlass::MatrixCoord tb_offset_B{0, threadblock_offset.n() / kInterleave};
-
-                cutlass::MatrixCoord tb_offset_scale{0, threadblock_offset.n()};
-
-                // Compute position within threadblock
-                int thread_idx = threadIdx.x;
-
-                // Construct iterators to A and B operands
-                typename Mma::IteratorA iterator_A(
-                    LayoutA(ldm_A), ptr_A, {problem_size.m(), problem_size.k()}, thread_idx, tb_offset_A);
-
-                typename Mma::IteratorB iterator_B(LayoutB(ldm_B), ptr_B,
-                    {problem_size.k() * kInterleave, problem_size.n() / kInterleave}, thread_idx, tb_offset_B);
-
-                typename Mma::FragmentC accumulators;
-
-                accumulators.clear();
-
-                // Broadcast the warp_id computed by lane 0 to ensure dependent code
-                // is compiled as warp-uniform.
-                int warp_idx = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
-
-                int lane_idx = threadIdx.x % 32;
-
-                //
-                // Matrix multiply phase
-                //
-
-                // Construct thread-scoped matrix multiply
-                auto CreateMMA = [&]()
-                {
-                    if constexpr (use_dq_gemm<Mma>::value)
-                        return Mma(shared_storage.main_loop, params.group_size, thread_idx, warp_idx, lane_idx);
-                    else
-                        return Mma(shared_storage.main_loop, thread_idx, warp_idx, lane_idx);
-                };
-                Mma mma = CreateMMA();
-
-                // Compute threadblock-scoped matrix multiply-add
-                int gemm_k_iterations = (problem_size.k() + Mma::Shape::kK - 1) / Mma::Shape::kK;
-
-                // Wait for all threads to finish their epilogue phases from the previous tile.
-                __syncthreads();
-
-                // Compute threadblock-scoped matrix multiply-add
-                ElementScale* weight_scale_ptr = params.weight_scales + problem_idx * problem_size.n();
-
-                if constexpr (use_dq_gemm<Mma>::value)
-                {
-                    const MatrixCoord scale_extent = {1, problem_size.n()};
-                    typename Mma::IteratorScale iterator_scale(Mma::IteratorScale::Layout(scale_extent.column()),
-                        weight_scale_ptr, scale_extent, thread_idx, tb_offset_scale);
-
-                    mma(gemm_k_iterations, accumulators, iterator_A, iterator_B, iterator_scale, accumulators);
-                }
-                else
-                {
-                    mma(gemm_k_iterations, accumulators, iterator_A, iterator_B, accumulators);
-                }
-
-                //
-                // Epilogue
-                //
-
-                EpilogueOutputOp output_op(params.output_op);
-
-                ElementC* ptr_C = reinterpret_cast<ElementC*>(params.ptr_C) + problem_idx * gemm_n;
-                ElementC* ptr_D = reinterpret_cast<ElementC*>(params.ptr_D) + rows_to_jump * gemm_n;
-
-                LayoutC layout_C(0);
-                LayoutC layout_D(gemm_n);
-
-                typename Epilogue::OutputTileIterator::Params params_C(layout_C);
-                typename Epilogue::OutputTileIterator::Params params_D(layout_D);
-
-                // Tile iterator loading from source tensor.
-                typename Epilogue::OutputTileIterator iterator_C(
-                    params_C, ptr_C, problem_size.mn(), thread_idx, threadblock_offset.mn());
-
-                // Tile iterator writing to destination tensor.
-                typename Epilogue::OutputTileIterator iterator_D(
-                    params_D, ptr_D, problem_size.mn(), thread_idx, threadblock_offset.mn());
-
-                Epilogue epilogue(shared_storage.epilogue, thread_idx, warp_idx, lane_idx);
-
-                // Execute the epilogue operator to update the destination tensor.
-                epilogue(output_op, iterator_D, accumulators, iterator_C);
-
-                // Next tile
-                problem_visitor.advance(gridDim.x);
-            }
-        }
-    };
+    }
 
     /*
       To improve compilation speed, we do not compile the device operator if the CUDA_ARCH does not correspond
@@ -498,19 +494,20 @@ public:
     CUTLASS_DEVICE
     void operator()(Params const& params, SharedStorage& shared_storage)
     {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700) && (__CUDA_ARCH__ < 750)
-        static constexpr bool compile_needed = platform::is_same<KernelArch, arch::Sm70>::value;
-        KernelRunner<compile_needed>::run_kernel(params, shared_storage);
-#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 750) && (__CUDA_ARCH__ < 800)
-        static constexpr bool compile_needed = platform::is_same<KernelArch, arch::Sm75>::value;
-        KernelRunner<compile_needed>::run_kernel(params, shared_storage);
-#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && (__CUDA_ARCH__ < 900)
-        static constexpr bool compile_needed = platform::is_same<KernelArch, arch::Sm80>::value;
-        KernelRunner<compile_needed>::run_kernel(params, shared_storage);
-#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-        // TODO Update the arch to Sm90 once CUTLASS hopper specialisations are available
-        static constexpr bool compile_needed = platform::is_same<KernelArch, arch::Sm80>::value;
-        KernelRunner<compile_needed>::run_kernel(params, shared_storage);
+#if defined(__CUDA_ARCH__)
+#if (__CUDA_ARCH__ >= 700) && (__CUDA_ARCH__ < 750)
+        run_kernel<arch::Sm70>(params, shared_storage);
+#elif (__CUDA_ARCH__ >= 750) && (__CUDA_ARCH__ < 800)
+        run_kernel<arch::Sm75>(params, shared_storage);
+#elif (__CUDA_ARCH__ >= 800) && (__CUDA_ARCH__ < 900)
+        run_kernel<arch::Sm80>(params, shared_storage);
+#elif (__CUDA_ARCH__ >= 900)
+        run_kernel<arch::Sm80>(
+            params, shared_storage); // Don't compile these for Hopper or later. Use CUTLASS 3.x kernels.
+#else
+        static_assert(
+            false, "Invalid architecture being compiled. Only Volta+ supported in weight-only quantization kernels.");
+#endif
 #else
         CUTLASS_NOT_IMPLEMENTED();
 #endif

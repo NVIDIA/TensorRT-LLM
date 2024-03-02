@@ -81,6 +81,16 @@ def main():
         (6, num_layers, adapter_size, mlp_hidden_size,
          hidden_size),  # mlp_4h_to_h
         (7, num_layers, adapter_size, hidden_size, mlp_hidden_size),  # mlp_gate
+        (8, num_layers, adapter_size, hidden_size,
+         3 * hidden_size),  # cross_attn_qkv
+        (9, num_layers, adapter_size // 2, hidden_size,
+         hidden_size),  # cross_attn_q
+        (10, num_layers, adapter_size // 2, hidden_size,
+         hidden_size),  # cross_attn_k
+        (11, num_layers, adapter_size // 2, hidden_size,
+         hidden_size),  # cross_attn_v
+        (12, num_layers, adapter_size, hidden_size,
+         hidden_size),  # cross_attn_dense
     ]
 
     all_source = []
@@ -93,7 +103,7 @@ def main():
         all_config.append(config)
 
         mod_id, _, adapter_size, in_dim, out_dim = c
-        split_in = mod_id in (4, 6)
+        split_in = mod_id in (4, 6, 12)
 
         target_weights = format_tensors(source_weights, adapter_size, in_dim,
                                         out_dim, args.tp_size, split_in)

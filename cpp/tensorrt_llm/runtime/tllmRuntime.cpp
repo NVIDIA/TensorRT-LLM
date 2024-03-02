@@ -14,17 +14,13 @@
  * limitations under the License.
  */
 #include "tllmRuntime.h"
-#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
-#include "tensorrt_llm/common/stringUtils.h"
 #include "tllmLogger.h"
 
 #include <limits>
 #include <type_traits>
 
 using namespace tensorrt_llm::runtime;
-
-namespace tc = tensorrt_llm::common;
 
 namespace
 {
@@ -108,14 +104,12 @@ bool TllmRuntime::executeContext(SizeType contextIndex) const
 void TllmRuntime::setInputTensors(SizeType contextIndex, TensorMap const& tensorMap)
 {
     NVTX3_FUNC_RANGE();
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     auto& context = getContext(contextIndex);
     for (std::int32_t i = 0; i < mEngine->getNbIOTensors(); ++i)
     {
         auto const name = mEngine->getIOTensorName(i);
         if (mEngine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT)
         {
-            NVTX3_SCOPED_RANGE(input_tensor);
             auto pos = tensorMap.find(name);
             if (pos == tensorMap.end())
             {
@@ -197,7 +191,6 @@ void TllmRuntime::setOutputTensors(SizeType contextIndex, TensorMap& tensorMap)
         auto const name = mEngine->getIOTensorName(i);
         if (mEngine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kOUTPUT)
         {
-            NVTX3_SCOPED_RANGE(output_tensor);
             auto const dims = context.getTensorShape(name);
             auto const engineDtype = mEngine->getTensorDataType(name);
             auto pos = tensorMap.find(name);

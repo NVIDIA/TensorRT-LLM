@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,35 +30,37 @@ namespace kernels
 {
 
 template <typename T>
-__global__ void batchApplyPenalty(T* logits, const T* biases, int* penaltyWorkspace, const int* penaltyWorkspacePrev,
-    const float* temperatures, const float* repetitionPenalties, const float* presencePenalties,
-    const float* frequencyPenalties, const bool accumulateVocab, const int maxSeqLen, const int vocabSize,
-    const int vocabSizePadded, const int** outputIdsPtr, const int** parentIdsPtr, const int* inputLengths,
-    const int* sequenceLengths, const int* minLengths, const int* endIds, const int* batchSlots)
+__global__ void batchApplyPenalty(T const* const* inputLogits, T* outputLogits, T const* biases,
+    int32_t* penaltyWorkspace, int32_t const* penaltyWorkspacePrev, float const* temperatures,
+    float const* repetitionPenalties, float const* presencePenalties, float const* frequencyPenalties,
+    const bool accumulateVocab, int32_t const maxSeqLen, int32_t const vocabSize, int32_t const vocabSizePadded,
+    int32_t const** outputIdsPtr, int32_t const** parentIdsPtr, int32_t const* inputLengths,
+    int32_t const* sequenceLengths, int32_t const* minLengths, int32_t const* endIds, int32_t const* batchSlots)
 {
-    const int beamWidth = gridDim.y;
-    const int batchIdx = blockIdx.x;
-    const int beamIdx = blockIdx.y;
-    const int batchSlot = batchSlots == nullptr ? batchIdx : batchSlots[batchIdx];
-    const int batchBeamIdx = batchIdx * beamWidth + beamIdx;
-    const int batchSlotBeamIdx = batchSlot * beamWidth + beamIdx;
-    const int inputLen = inputLengths == nullptr ? 0 : inputLengths[batchSlotBeamIdx];
-    const int currentStep = sequenceLengths == nullptr ? 0 : sequenceLengths[batchSlotBeamIdx];
+    int32_t const beamWidth = gridDim.y;
+    int32_t const batchIdx = blockIdx.x;
+    int32_t const beamIdx = blockIdx.y;
+    int32_t const batchSlot = batchSlots == nullptr ? batchIdx : batchSlots[batchIdx];
+    int32_t const batchBeamIdx = batchIdx * beamWidth + beamIdx;
+    int32_t const batchSlotBeamIdx = batchSlot * beamWidth + beamIdx;
+    int32_t const inputLen = inputLengths == nullptr ? 0 : inputLengths[batchSlotBeamIdx];
+    int32_t const currentStep = sequenceLengths == nullptr ? 0 : sequenceLengths[batchSlotBeamIdx];
+    T const* biasBase = biases + batchSlot * vocabSizePadded;
     // Initialize or update the number of occurrences of tokens
     if (accumulateVocab)
     {
         penaltyWorkspace += batchBeamIdx * vocabSize;
         if (currentStep <= inputLen)
         { // Context phase
-            for (int index = threadIdx.x; index < vocabSize; index += blockDim.x)
+            for (int32_t index = threadIdx.x; index < vocabSize; index += blockDim.x)
             {
                 penaltyWorkspace[index] = 0;
             }
             __syncthreads();
-            for (int step = threadIdx.x; step < inputLen; step += blockDim.x)
+            for (int32_t step = threadIdx.x; step < inputLen; step += blockDim.x)
             {
                 // All beams in the context phase are identical
-                int penaltyIndex = outputIdsPtr[batchSlot][beamIdx * maxSeqLen + step];
+                int32_t penaltyIndex = outputIdsPtr[batchSlot][beamIdx * maxSeqLen + step];
                 if (penaltyIndex < vocabSize)
                 {
                     atomicAdd(&penaltyWorkspace[penaltyIndex], 1);
@@ -69,9 +71,9 @@ __global__ void batchApplyPenalty(T* logits, const T* biases, int* penaltyWorksp
         { // Generation phase
             if (beamWidth > 1)
             {
-                int parentBeam = parentIdsPtr[batchSlot][beamIdx * maxSeqLen + currentStep - 2];
+                int32_t parentBeam = parentIdsPtr[batchSlot][beamIdx * maxSeqLen + currentStep - 2];
                 penaltyWorkspacePrev += (batchIdx * beamWidth + parentBeam) * vocabSize;
-                for (int index = threadIdx.x; index < vocabSize; index += blockDim.x)
+                for (int32_t index = threadIdx.x; index < vocabSize; index += blockDim.x)
                 {
                     penaltyWorkspace[index] = penaltyWorkspacePrev[index];
                 }
@@ -79,7 +81,7 @@ __global__ void batchApplyPenalty(T* logits, const T* biases, int* penaltyWorksp
             }
             if (threadIdx.x == 0)
             {
-                int penaltyIndex = outputIdsPtr[batchSlot][beamIdx * maxSeqLen + currentStep - 1];
+                int32_t penaltyIndex = outputIdsPtr[batchSlot][beamIdx * maxSeqLen + currentStep - 1];
                 if (penaltyIndex < vocabSize)
                 {
                     penaltyWorkspace[penaltyIndex] += 1;
@@ -89,7 +91,8 @@ __global__ void batchApplyPenalty(T* logits, const T* biases, int* penaltyWorksp
         __syncthreads();
     }
     // Apply bias and penalties
-    logits += batchBeamIdx * vocabSizePadded;
+    auto const inLogitsPtr = inputLogits[batchIdx] + beamIdx * vocabSizePadded;
+    auto outLogitsPtr = outputLogits + batchBeamIdx * vocabSizePadded;
     const T MASK_VAL = (std::is_same<T, half>::value) ? -HALF_FLT_MAX : -FLT_MAX;
     float invTemperature, repetitionPenalty, presencePenalty, frequencyPenalty;
     if (temperatures != nullptr)
@@ -108,22 +111,22 @@ __global__ void batchApplyPenalty(T* logits, const T* biases, int* penaltyWorksp
     {
         frequencyPenalty = frequencyPenalties[batchSlot];
     }
-    for (int index = threadIdx.x; index < vocabSizePadded; index += blockDim.x)
+    for (int32_t index = threadIdx.x; index < vocabSizePadded; index += blockDim.x)
     {
         if (index < vocabSize)
         {
-            float logit = (float) logits[index];
+            float logit = (float) inLogitsPtr[index];
             // Bias
             if (biases != nullptr)
             {
-                logit += (float) biases[index];
+                logit += (float) biasBase[index];
             }
             // Temperature
             if (temperatures != nullptr)
             {
                 logit *= invTemperature;
             }
-            int numOccurences = penaltyWorkspace[index];
+            int32_t numOccurences = penaltyWorkspace[index];
             if (numOccurences > 0)
             {
                 // Repetition
@@ -142,11 +145,11 @@ __global__ void batchApplyPenalty(T* logits, const T* biases, int* penaltyWorksp
                     logit -= frequencyPenalty * numOccurences;
                 }
             }
-            logits[index] = logit;
+            outLogitsPtr[index] = logit;
         }
         else
         {
-            logits[index] = MASK_VAL;
+            outLogitsPtr[index] = MASK_VAL;
         }
     }
     if (minLengths != nullptr)
@@ -155,7 +158,7 @@ __global__ void batchApplyPenalty(T* logits, const T* biases, int* penaltyWorksp
         // Min length
         if ((threadIdx.x == 0) && (currentStep - inputLen < minLengths[batchSlot]))
         {
-            logits[endIds[batchSlot]] = MASK_VAL;
+            outLogitsPtr[endIds[batchSlot]] = MASK_VAL;
         }
     }
 }
@@ -166,11 +169,11 @@ void invokeBatchApplyPenalty(const InvokeBatchApplyPenaltyParams<T>& params)
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     dim3 block(256);
     dim3 grid(params.batchSize, params.beamWidth);
-    batchApplyPenalty<T><<<grid, block, 0, params.stream>>>(params.logits, params.biases, params.penaltyWorkspace,
-        params.penaltyWorkspacePrev, params.temperatures, params.repetitionPenalties, params.presencePenalties,
-        params.frequencyPenalties, params.accumulateVocab, params.maxSeqLen, params.vocabSize, params.vocabSizePadded,
-        params.outputIdsPtr, params.parentIdsPtr, params.inputLengths, params.sequenceLengths, params.minLengths,
-        params.endIds, params.batchSlots);
+    batchApplyPenalty<T><<<grid, block, 0, params.stream>>>(params.inputLogits, params.outputLogits, params.biases,
+        params.penaltyWorkspace, params.penaltyWorkspacePrev, params.temperatures, params.repetitionPenalties,
+        params.presencePenalties, params.frequencyPenalties, params.accumulateVocab, params.maxSeqLen, params.vocabSize,
+        params.vocabSizePadded, params.outputIdsPtr, params.parentIdsPtr, params.inputLengths, params.sequenceLengths,
+        params.minLengths, params.endIds, params.batchSlots);
 }
 
 template void invokeBatchApplyPenalty(const InvokeBatchApplyPenaltyParams<float>& params);

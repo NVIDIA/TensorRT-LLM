@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/promptTuningParams.h"

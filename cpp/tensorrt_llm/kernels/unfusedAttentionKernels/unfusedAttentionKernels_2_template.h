@@ -274,9 +274,9 @@ __global__ void applyBiasRopeUpdateKVCache(T* QKV, T* Q, KVCacheBuffer kvCacheBu
         //   src QKV: [batch, time, 3, head_num, size_per_head]
         // head_num != kv_head_num:
         //   src QKV: [batch, time, head_num * size_per_head + 2 * kv_head_num * size_per_head]
-        const int src_q_idx = token_idx * n + hidden_idx;
-        const int src_k_idx = token_idx * n + src_k_offset + hidden_idx_kv;
-        const int src_v_idx = token_idx * n + src_v_offset + hidden_idx_kv;
+        auto const src_q_idx = static_cast<size_t>(token_idx) * n + hidden_idx;
+        auto const src_k_idx = static_cast<size_t>(token_idx) * n + src_k_offset + hidden_idx_kv;
+        auto const src_v_idx = static_cast<size_t>(token_idx) * n + src_v_offset + hidden_idx_kv;
 
         Vec_type q, k, v;
         Vec_type q_bias, k_bias, v_bias;

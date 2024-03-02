@@ -19,6 +19,7 @@ from .bloom.model import BloomForCausalLM, BloomModel
 from .chatglm.model import ChatGLMForCausalLM, ChatGLMModel
 from .enc_dec.model import DecoderModel, EncoderModel, WhisperEncoder
 from .falcon.model import FalconForCausalLM, FalconModel
+from .gemma.model import GemmaForCausalLM
 from .gpt.model import GPTLMHeadModel, GPTModel
 from .gptj.model import GPTJForCausalLM, GPTJModel
 from .gptneox.model import GPTNeoXForCausalLM, GPTNeoXModel
@@ -30,7 +31,6 @@ from .mpt.model import MPTForCausalLM, MPTModel
 from .opt.model import OPTForCausalLM, OPTModel
 from .phi.model import PhiForCausalLM, PhiModel
 from .qwen.model import QWenForCausalLM
-from .skywork.model import SkyworkForCausalLM
 
 from .quantized.quant import quantize_model  # noqa # isort:skip
 
@@ -69,6 +69,7 @@ __all__ = [
     'MPTForCausalLM',
     'MPTModel',
     'SkyworkForCausalLM',
+    'GemmaForCausalLM',
 ]
 
 MODEL_MAP = {
@@ -87,5 +88,6 @@ MODEL_MAP = {
     'InternLMForCausalLM': LLaMAForCausalLM,
     'MedusaForCausalLM': MedusaForCausalLm,
     'BaichuanForCausalLM': BaichuanForCausalLM,
-    'SkyworkForCausalLM': SkyworkForCausalLM,
+    'SkyworkForCausalLM': LLaMAForCausalLM,
+    'GemmaForCausalLM': GemmaForCausalLM,
 }

@@ -49,10 +49,12 @@ if(NOT DEFINED TRT_INCLUDE_DIR)
   endif()
 endif()
 message(STATUS "tensorrt include path: ${TRT_INCLUDE_DIR}")
-if(NOT DEFINED TRT_LLM_INCLUDE_DIR)
-  set(TRT_LLM_INCLUDE_DIR "../../../cpp")
+if(DEFINED TRT_LLM_INCLUDE_DIR)
+  message(
+    STATUS "openai_triton/manual_plugin example has been self-contained "
+           "and TRT_LLM_INCLUDE_DIR is now unnecessary to specify the path of "
+           "C++ runtime source files.")
 endif()
-message(STATUS "tensorrt_llm include path: ${TRT_LLM_INCLUDE_DIR}")
 
 if(NOT DEFINED TRT_LIB_DIR)
   set(TRT_LIB_DIR "/usr/local/tensorrt/lib")
@@ -109,4 +111,3 @@ endif()
 
 target_include_directories(${TARGET_NAME} PUBLIC /usr/local/cuda/include)
 target_include_directories(${TARGET_NAME} PUBLIC ${TRT_INCLUDE_DIR})
-target_include_directories(${TARGET_NAME} PUBLIC ${TRT_LLM_INCLUDE_DIR})

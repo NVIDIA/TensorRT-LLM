@@ -248,10 +248,10 @@ class TestGPTJ(unittest.TestCase):
                 'sequence_length': sequence_length,
                 'host_sink_token_length': host_sink_token_length,
             }
+            ctx_buffer[
+                f'host_max_attention_window_sizes'] = host_max_attention_window_sizes
             for i in range(gpt_config.n_layer):
                 ctx_buffer[f'past_key_value_{i}'] = key_value_cache_buffers[i]
-                ctx_buffer[
-                    f'host_max_attention_window_size_{i}'] = host_max_attention_window_sizes
                 ctx_buffer[f'present_key_value_{i}'] = key_value_cache_buffers[
                     i]
 
@@ -325,7 +325,8 @@ class TestGPTJ(unittest.TestCase):
                                               dtype=torch.int32).cpu()
             host_past_key_value_lengths = torch.tensor([0] * batch_size,
                                                        dtype=torch.int32)
-            host_max_attention_window_sizes = torch.tensor([total_seq_len],
+            host_max_attention_window_sizes = torch.tensor([total_seq_len] *
+                                                           gpt_config.n_layer,
                                                            dtype=torch.int32)
             host_sink_token_length = torch.tensor([0], dtype=torch.int32)
 
@@ -406,7 +407,8 @@ class TestGPTJ(unittest.TestCase):
             host_past_key_value_lengths = torch.tensor([seq_len] * batch_size,
                                                        dtype=torch.int32)
 
-            host_max_attention_window_sizes = torch.tensor([total_seq_len],
+            host_max_attention_window_sizes = torch.tensor([total_seq_len] *
+                                                           gpt_config.n_layer,
                                                            dtype=torch.int32)
 
             host_sink_token_length = torch.tensor([0], dtype=torch.int32)

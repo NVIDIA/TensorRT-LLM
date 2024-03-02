@@ -20,7 +20,7 @@ import tarfile
 import weakref
 from functools import partial
 from pathlib import Path, PosixPath
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Union
 
 import numpy as np
 import yaml
@@ -248,6 +248,17 @@ def trt_dtype_to_torch(dtype):
     ret = _trt_to_torch_dtype_dict.get(dtype)
     assert ret is not None, f'Unsupported dtype: {dtype}'
     return ret
+
+
+def is_same_dtype(type_a: Union[str, trt.DataType],
+                  type_b: Union[str, trt.DataType]) -> bool:
+    if isinstance(type_a, str):
+        type_a = str_dtype_to_trt(type_a)
+
+    if isinstance(type_b, str):
+        type_b = str_dtype_to_trt(type_b)
+
+    return type_a == type_b
 
 
 def dim_to_trt_axes(dim):

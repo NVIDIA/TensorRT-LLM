@@ -14,6 +14,19 @@
 # limitations under the License.
 from enum import IntFlag, auto
 
+W8A16 = 'W8A16'
+W4A16 = 'W4A16'
+W4A16_AWQ = 'W4A16_AWQ'
+W4A8_AWQ = 'W4A8_AWQ'
+W4A16_GPTQ = 'W4A16_GPTQ'
+W8A8_SQ_PER_CHANNEL = 'W8A8_SQ_PER_CHANNEL'
+W8A8_SQ_PER_TENSOR_PLUGIN = 'W8A8_SQ_PER_TENSOR_PLUGIN'
+W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN = 'W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN'  # nosec
+W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN = 'W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN'  # nosec
+W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN = 'W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN'  # nosec
+FP8 = 'FP8'
+INT8 = 'INT8'
+
 
 class QuantMode(IntFlag):
     # [WARNING] KEEP BELOW DEFINITION IN SYNC WITH cpp/tensorrt_llm/common/quantization.h
@@ -192,42 +205,42 @@ class QuantMode(IntFlag):
 
     @staticmethod
     def from_quant_algo(quant_algo, kv_cache_quant_algo=None):
-        if quant_algo == 'W8A16':
+        if quant_algo == W8A16:
             quant_mode = QuantMode.use_weight_only(use_int4_weights=False)
-        elif quant_algo == 'W4A16':
+        elif quant_algo == W4A16:
             quant_mode = QuantMode.use_weight_only(use_int4_weights=True)
-        elif quant_algo == 'W4A16_AWQ':
+        elif quant_algo == W4A16_AWQ:
             quant_mode = QuantMode.use_weight_only(use_int4_weights=True,
                                                    per_group=True)
-        elif quant_algo == 'W4A8_AWQ':
+        elif quant_algo == W4A8_AWQ:
             quant_mode = QuantMode.use_weight_only(use_int4_weights=True,
                                                    per_group=True)
-        elif quant_algo == 'W4A16_GPTQ':
+        elif quant_algo == W4A16_GPTQ:
             quant_mode = QuantMode.use_weight_only(use_int4_weights=True,
                                                    per_group=True)
-        elif quant_algo == 'W8A8_SQ_PER_CHANNEL':
+        elif quant_algo == W8A8_SQ_PER_CHANNEL:
             quant_mode = QuantMode.use_smooth_quant(per_token=False,
                                                     per_channel=True)
-        elif quant_algo == 'W8A8_SQ_PER_TENSOR_PLUGIN':
+        elif quant_algo == W8A8_SQ_PER_TENSOR_PLUGIN:
             quant_mode = QuantMode.use_smooth_quant(per_token=False,
                                                     per_channel=False)
-        elif quant_algo == 'W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN':
+        elif quant_algo == W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN:
             quant_mode = QuantMode.use_smooth_quant(per_token=True,
                                                     per_channel=True)
-        elif quant_algo == 'W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN':
+        elif quant_algo == W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN:
             quant_mode = QuantMode.use_smooth_quant(per_token=False,
                                                     per_channel=True)
-        elif quant_algo == 'W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN':
+        elif quant_algo == W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN:
             quant_mode = QuantMode.use_smooth_quant(per_token=True,
                                                     per_channel=False)
-        elif quant_algo == 'FP8':
+        elif quant_algo == FP8:
             quant_mode = QuantMode.from_description(use_fp8_qdq=True)
         else:
             quant_mode = QuantMode(0)
 
-        if kv_cache_quant_algo == 'INT8':
+        if kv_cache_quant_algo == INT8:
             quant_mode = quant_mode.set_int8_kv_cache()
-        elif kv_cache_quant_algo == 'FP8':
+        elif kv_cache_quant_algo == FP8:
             quant_mode = quant_mode.set_fp8_kv_cache()
 
         return quant_mode

@@ -16,12 +16,11 @@
 
 #include "tensorrt_llm/runtime/statefulGptDecoder.h"
 
-#include <algorithm>
-
-#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
+
+#include <algorithm>
 
 namespace tc = tensorrt_llm::common;
 namespace tk = tensorrt_llm::kernels;
@@ -35,7 +34,7 @@ StatefulGptDecoder::StatefulGptDecoder(std::size_t vocabSize, std::size_t vocabS
     , mStream{std::move(stream)}
     , mBufferManager{mStream}
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto constexpr nvTokenIdType = TRTDataType<TokenIdType>::value;
     auto constexpr nvSizeType = TRTDataType<SizeType>::value;
     auto constexpr nvFloatType = TRTDataType<float>::value;
@@ -61,24 +60,33 @@ StatefulGptDecoder::StatefulGptDecoder(std::size_t vocabSize, std::size_t vocabS
     dOutput->cumLogProbs = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
     dOutput->beamHypotheses.empty(mBufferManager);
 
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    dInput->stopWordsPtrs = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<int32_t*>::value);
+    dInput->stopWordsLens = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<SizeType>::value);
+    dInput->badWordsPtrs = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<int32_t*>::value);
+    dInput->badWordsLens = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<SizeType>::value);
+
+    mFinishedSum = mBufferManager.pinned(ITensor::makeShape({1}), nvSizeType);
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void StatefulGptDecoder::setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxAttentionWindow,
-    SizeType sinkTokenLength, SizeType maxSequenceLength, SizeType maxTokensPerStep, nvinfer1::DataType dtype)
+void StatefulGptDecoder::setup(DecodingMode const& mode, SizeType maxBatchSize, SizeType maxBeamWidth,
+    SizeType maxAttentionWindow, SizeType sinkTokenLength, SizeType maxSequenceLength, SizeType maxTokensPerStep,
+    bool fusedDecoder, nvinfer1::DataType dtype)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK(maxTokensPerStep == 1);
-    mDecoder = IGptDecoder::create(dtype, maxBatchSize, mVocabSize, mVocabSizePadded, mStream);
+    mDecoder = IGptDecoder::create(
+        mode, dtype, maxBatchSize, maxBeamWidth, mVocabSize, mVocabSizePadded, maxSequenceLength, mStream);
 
     reshapeBuffers(maxBatchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSequenceLength);
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 void StatefulGptDecoder::reshapeBuffers(SizeType batchSize, SizeType beamWidth, SizeType maxAttentionWindow,
     SizeType sinkTokenLength, SizeType maxSequenceLength)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK(batchSize > 0);
     TLLM_CHECK(beamWidth > 0);
     TLLM_CHECK(maxSequenceLength > 0);
@@ -109,7 +117,14 @@ void StatefulGptDecoder::reshapeBuffers(SizeType batchSize, SizeType beamWidth, 
     dOutput.finished->reshape(batchSizeXbeamWidth);
     dInput.finished = ITensor::view(dOutput.finished);
     mBufferManager.setZero(*dOutput.finished);
+
+    dOutput.finishedSum->reshape(batchSizeShape);
     mBufferManager.setZero(*dOutput.finishedSum);
+
+    const_cast<ITensor&>(*dInput.badWordsPtrs).reshape(ITensor::makeShape({batchSize}));
+    const_cast<ITensor&>(*dInput.badWordsLens).reshape(ITensor::makeShape({batchSize}));
+    const_cast<ITensor&>(*dInput.stopWordsPtrs).reshape(ITensor::makeShape({batchSize}));
+    const_cast<ITensor&>(*dInput.stopWordsLens).reshape(ITensor::makeShape({batchSize}));
 
     if (beamWidth > 1)
     {
@@ -123,13 +138,13 @@ void StatefulGptDecoder::reshapeBuffers(SizeType batchSize, SizeType beamWidth, 
     }
 
     mNbSteps = 0;
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 void StatefulGptDecoder::newBatch(
     GenerationInput const& inputs, GenerationOutput const& outputs, SamplingConfig const& samplingConfig)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto& manager = mBufferManager;
     auto& stream = mStream;
 
@@ -173,8 +188,54 @@ void StatefulGptDecoder::newBatch(
     dInput.maxBatchSize = batchSize;
     kernels::invokeFill(const_cast<ITensor&>(*dInput.endIds), endId, *stream);
     dInput.embeddingBias = inputs.embeddingBias;
-    dInput.badWordsList = inputs.badWordsList;
-    dInput.stopWordsList = inputs.stopWordsList;
+
+    if (inputs.badWordsList)
+    {
+        auto const& badWordsShape = inputs.badWordsList->getShape();
+        auto badWordsLen = badWordsShape.d[1];
+        if (badWordsShape.nbDims == 3)
+        {
+            badWordsLen = badWordsShape.d[2];
+        }
+        dInput.maxBadWordsLen = badWordsLen;
+
+        TensorPtr badWordsList = ITensor::view(inputs.badWordsList);
+        auto badWordsLensRange = BufferRange<SizeType>(*constPointerCast(dInput.badWordsLens));
+        auto badWordsPtrsRange = BufferRange<int32_t*>(*constPointerCast(dInput.badWordsPtrs));
+        for (SizeType bi = 0; bi < batchSize; ++bi)
+        {
+            if (badWordsShape.nbDims == 3)
+            {
+                badWordsPtrsRange[bi] = bufferCast<SizeType>(*badWordsList) + bi * 2 * badWordsLen;
+            }
+            else
+            {
+                badWordsPtrsRange[bi] = bufferCast<SizeType>(*badWordsList);
+            }
+            badWordsLensRange[bi] = badWordsLen;
+        }
+        // NOTE(nkorobov): dInput->badWordsList is not used in gptDecoder, but required to keep badWordsList memory
+        // allocated
+        dInput.badWordsList = badWordsList;
+    }
+    if (inputs.stopWordsList)
+    {
+        auto const stopWordsLen = inputs.stopWordsList->getShape().d[2];
+        dInput.maxStopWordsLen = stopWordsLen;
+
+        TensorPtr stopWordsList = ITensor::view(inputs.stopWordsList);
+        auto stopWordsPtrsRange = BufferRange<int32_t*>(*constPointerCast(dInput.stopWordsPtrs));
+        auto stopWordsLensRange = BufferRange<SizeType>(*constPointerCast(dInput.stopWordsLens));
+        for (SizeType bi = 0; bi < batchSize; ++bi)
+        {
+            stopWordsPtrsRange[bi] = bufferCast<SizeType>(*stopWordsList) + bi * 2 * stopWordsLen;
+            stopWordsLensRange[bi] = stopWordsLen;
+        }
+        // NOTE(nkorobov): dInput->stopWordsList is not used in gptDecoder, but required to keep stopWordsList memory
+        // allocated
+        dInput.stopWordsList = stopWordsList;
+    }
+
     auto inputLengthsView = ITensor::view(dInput.lengths, ITensor::makeShape({batchSize * beamWidth}));
     kernels::tileTensor(const_cast<ITensor&>(*inputLengthsView), *inputLengths, beamWidth, *stream);
     if (inputs.maxNewTokens)
@@ -234,12 +295,12 @@ void StatefulGptDecoder::newBatch(
 
     // remaining
     mNbSteps = 0;
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 void StatefulGptDecoder::forwardAsync(decoder::Output& output, decoder::Input const& input)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto& logits = input.logits;
     auto const& logitsShape = logits->getShape();
 
@@ -268,28 +329,29 @@ void StatefulGptDecoder::forwardAsync(decoder::Output& output, decoder::Input co
     dOutput.lengths = output.sequenceLengths;
 
     mDecoder->forwardAsync(dOutput, dInput);
+    kernels::reduce(*mFinishedSum, *ITensor::slice(mDecodingOutput->finishedSum, 0, batchSize), *mStream);
     mStream->record(mDecodedEvent.get());
 
     dInput.step += 1;
     mNbSteps += 1;
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 void StatefulGptDecoder::forwardSync()
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     mDecodedEvent.synchronize();
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 void StatefulGptDecoder::finalize() const
 {
     // TODO (rkobus) can we do this inplace?
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto& outputIds = mDecodingOutput->ids;
     auto finalOutputIds = mBufferManager.gpu(outputIds->getShape(), outputIds->getDataType());
     mDecoder->gatherTree(*finalOutputIds, *mDecodingOutput, *mDecodingInput, mBufferManager);
     mBufferManager.copy(*finalOutputIds, *outputIds);
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return;
 }

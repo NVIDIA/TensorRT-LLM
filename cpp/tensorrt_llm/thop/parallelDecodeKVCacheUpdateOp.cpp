@@ -25,10 +25,10 @@ namespace torch_ext
 void updateKVCacheDraftTokenLocation(torch::Tensor seqAcceptedDraftTokenOffsetsTensor,
     torch::Tensor packedAcceptedDraftTokensIndicesTensor, torch::Tensor pastKeyValueLengthsTensor, bool usePagedKVCache,
     int64_t numKVHeads, int64_t headSizeInBytes, int64_t rewindDraftTokenCount, int64_t maxKVCacheLen,
+    th::optional<torch::Tensor> rewindDraftTokenTensor,
     th::optional<std::vector<torch::Tensor>> pastKeyValueListOpt = th::nullopt,
-    th::optional<std::vector<torch::Tensor>> pointerArrayListOpt = th::nullopt,
-    th::optional<int64_t> maxBlocksPerSeqOpt = th::nullopt, th::optional<int64_t> tokensPerBlockOpt = th::nullopt,
-    th::optional<int64_t> stream_ptr = th::nullopt)
+    th::optional<torch::Tensor> pointerArrayOpt = th::nullopt, th::optional<int64_t> maxBlocksPerSeqOpt = th::nullopt,
+    th::optional<int64_t> tokensPerBlockOpt = th::nullopt, th::optional<int64_t> stream_ptr = th::nullopt)
 {
     TLLM_CHECK_WITH_INFO(
         at::cuda::is_available(), "update_kv_cache_draft_token_location should be called with cuda enabled.");
@@ -54,27 +54,39 @@ void updateKVCacheDraftTokenLocation(torch::Tensor seqAcceptedDraftTokenOffsetsT
     TLLM_CHECK_WITH_INFO(pastKeyValueLengthsTensor.dim() == 1 && pastKeyValueLengthsTensor.size(0) == seqCount
             && pastKeyValueLengthsTensor.scalar_type() == torch::kInt,
         "past_key_value_lengths tensor should be 1D int tensor with same length as seqCount");
+    int* rewindDraftTokenTensorPtr = nullptr;
+    if (rewindDraftTokenTensor.has_value())
+    {
+        TLLM_CHECK_WITH_INFO(rewindDraftTokenTensor.value().dim() == 1
+                && rewindDraftTokenTensor.value().size(0) == seqCount
+                && rewindDraftTokenTensor.value().scalar_type() == torch::kInt,
+            "rewindDraftTokenTensor should be 1D int tensor same length as seqCount");
+        rewindDraftTokenTensorPtr = rewindDraftTokenTensor.value().data_ptr<int>();
+    }
 
     if (usePagedKVCache)
     {
         TLLM_CHECK_WITH_INFO(
-            pointerArrayListOpt.has_value(), "block_pointer_array should be set when using paged KV cache.");
+            pointerArrayOpt.has_value(), "block_pointer_array should be set when using paged KV cache.");
         TLLM_CHECK_WITH_INFO(
             maxBlocksPerSeqOpt.has_value(), "max_blocks_per_seq should be set when using paged KV cache.");
         TLLM_CHECK_WITH_INFO(
             tokensPerBlockOpt.has_value(), "tokens_per_block should be set when using paged KV cache.");
-        int layerCount = pointerArrayListOpt.value().size();
-        std::vector<int64_t*> pointerArrayList;
-        pointerArrayList.reserve(layerCount);
-        for (auto& pointerArrayTensor : pointerArrayListOpt.value())
+
+        auto const& pointerArray = pointerArrayOpt.value();
+        int layerCount = pointerArray.size(0);
+        std::vector<int64_t*> pointerArrayList(layerCount);
+        auto* const pointerArrayPtr = pointerArray.data_ptr<int64_t>();
+        auto const stride = pointerArray.stride(0);
+        for (int layer = 0; layer < layerCount; ++layer)
         {
-            pointerArrayList.push_back(pointerArrayTensor.data_ptr<int64_t>());
+            pointerArrayList[layer] = pointerArrayPtr + layer * stride;
         }
         tensorrt_llm::kernels::parallel_decoding::updateKVBlockArrayDraftTokenLocation(
             seqAcceptedDraftTokenOffsetsTensor.data_ptr<int>(), packedAcceptedDraftTokensIndicesTensor.data_ptr<int>(),
             pastKeyValueLengthsTensor.data_ptr<int>(), pointerArrayList.data(), layerCount, seqCount, numKVHeads,
-            headSizeInBytes, rewindDraftTokenCount, maxKVCacheLen, maxBlocksPerSeqOpt.value(),
-            tokensPerBlockOpt.value(), stream);
+            headSizeInBytes, rewindDraftTokenCount, rewindDraftTokenTensorPtr, maxKVCacheLen,
+            maxBlocksPerSeqOpt.value(), tokensPerBlockOpt.value(), stream);
     }
     else
     {
@@ -90,7 +102,7 @@ void updateKVCacheDraftTokenLocation(torch::Tensor seqAcceptedDraftTokenOffsetsT
         tensorrt_llm::kernels::parallel_decoding::updateLinearKVCacheDraftTokenLocation(
             seqAcceptedDraftTokenOffsetsTensor.data_ptr<int>(), packedAcceptedDraftTokensIndicesTensor.data_ptr<int>(),
             pastKeyValueLengthsTensor.data_ptr<int>(), pastKeyValueList.data(), layerCount, seqCount, numKVHeads,
-            headSizeInBytes, rewindDraftTokenCount, maxKVCacheLen, stream);
+            headSizeInBytes, rewindDraftTokenCount, rewindDraftTokenTensorPtr, maxKVCacheLen, stream);
     }
 }
 

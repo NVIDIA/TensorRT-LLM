@@ -158,7 +158,7 @@ def parse_arguments():
     parser.add_argument('--minBS', type=int, default=1)
     parser.add_argument('--optBS', type=int, default=1)
     parser.add_argument('--maxBS', type=int, default=4)
-    parser.add_argument('--image_url', type=list, default=['./pics/demo.jpeg'])
+    parser.add_argument('--image_url', nargs='+', default=['./pics/demo.jpeg'])
     args = parser.parse_args()
     return args
 

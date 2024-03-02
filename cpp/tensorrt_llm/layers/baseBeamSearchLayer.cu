@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,9 +16,7 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
-#include "tensorrt_llm/kernels/penaltyKernels.h"
 #include "tensorrt_llm/layers/baseBeamSearchLayer.h"
-#include "tensorrt_llm/layers/fillBuffers.h"
 
 #include <algorithm>
 
@@ -111,11 +109,6 @@ void BaseBeamSearchLayer<T>::freeBuffer()
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     if (mIsAllocateBuffer)
     {
-        mAllocator->free((void**) (&temperature_buf_));
-        mAllocator->free((void**) (&min_lengths_buf_));
-        mAllocator->free((void**) (&repetition_penalty_buf_));
-        mAllocator->free((void**) (&presence_penalty_buf_));
-        mAllocator->free((void**) (&frequency_penalty_buf_));
         mIsAllocateBuffer = false;
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -125,12 +118,6 @@ template <typename T>
 void BaseBeamSearchLayer<T>::allocateBuffer(size_t batch_size)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    temperature_buf_ = mAllocator->reMalloc(temperature_buf_, sizeof(float) * batch_size, false);
-    min_lengths_buf_ = mAllocator->reMalloc(min_lengths_buf_, sizeof(int) * batch_size, false);
-    repetition_penalty_buf_ = mAllocator->reMalloc(repetition_penalty_buf_, sizeof(float) * batch_size, false);
-    presence_penalty_buf_ = mAllocator->reMalloc(presence_penalty_buf_, sizeof(float) * batch_size, false);
-    frequency_penalty_buf_ = mAllocator->reMalloc(frequency_penalty_buf_, sizeof(float) * batch_size, false);
-
     mIsAllocateBuffer = true;
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -138,47 +125,13 @@ void BaseBeamSearchLayer<T>::allocateBuffer(size_t batch_size)
 template <typename T>
 void BaseBeamSearchLayer<T>::setupBase(size_t batch_size, SetupParams const& setupParams)
 {
-    allocateBuffer(batch_size);
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    // Setup penalties.
-    FillBuffers const fillBuffers{batch_size, mStream};
-
-    use_temperature_ = static_cast<bool>(setupParams.temperature);
-    use_repetition_penalty_ = static_cast<bool>(setupParams.repetition_penalty);
-    use_presence_penalty_ = static_cast<bool>(setupParams.presence_penalty);
-    use_frequency_penalty_ = static_cast<bool>(setupParams.frequency_penalty);
-    use_min_lengths_ = static_cast<bool>(setupParams.min_length);
-    if (use_temperature_)
-    {
-        fillBuffers(setupParams.temperature, getDefaultPenaltyValue(RepetitionPenaltyType::Temperature), mTemperature,
-            temperature_buf_, (float*) nullptr, (int*) nullptr);
-    }
-    if (use_repetition_penalty_)
-    {
-        fillBuffers(setupParams.repetition_penalty, getDefaultPenaltyValue(RepetitionPenaltyType::Repetition),
-            mRepetitionPenalty, repetition_penalty_buf_, (float*) nullptr, (int*) nullptr);
-    }
-    if (use_presence_penalty_)
-    {
-        fillBuffers(setupParams.presence_penalty, getDefaultPenaltyValue(RepetitionPenaltyType::Presence),
-            mPresencePenalty, presence_penalty_buf_, (float*) nullptr, (int*) nullptr);
-    }
-    if (use_frequency_penalty_)
-    {
-        fillBuffers(setupParams.frequency_penalty, getDefaultPenaltyValue(RepetitionPenaltyType::Frequency),
-            mFrequencyPenalty, frequency_penalty_buf_, (float*) nullptr, (int*) nullptr);
-    }
-    if (use_min_lengths_)
-    {
-        fillBuffers(setupParams.min_length, (int) getDefaultPenaltyValue(RepetitionPenaltyType::MinLength), mMinLengths,
-            min_lengths_buf_, (int*) nullptr, (int*) nullptr);
-    }
+    allocateBuffer(batch_size);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
-void BaseBeamSearchLayer<T>::forward(BeamSearchOutputParams& outputs, ForwardParams const& params,
-    int* penalty_workspace, const int* penalty_workspace_prev)
+void BaseBeamSearchLayer<T>::forward(BeamSearchOutputParams& outputs, ForwardParams const& params)
 {
     TLLM_LOG_TRACE("%s", __PRETTY_FUNCTION__);
     Tensor& output_ids_ptr = outputs.output_ids_ptr;
@@ -194,47 +147,6 @@ void BaseBeamSearchLayer<T>::forward(BeamSearchOutputParams& outputs, ForwardPar
     int* sequence_length = (outputs.sequence_length) ? outputs.sequence_length->template getPtr<int>() : nullptr;
     Tensor const& logits = params.logits;
     const auto local_batch_size = logits.shape[0];
-
-#define ALL_OF(p_, sz_, dt_, v_) (std::all_of(p_, p_ + sz_, [&](dt_ b) { return b == v_; }))
-
-    const T* embedding_bias = params.embedding_bias ? params.embedding_bias->template getPtr<const T>() : nullptr;
-    auto* temperatures = (use_temperature_
-                             && !ALL_OF(std::begin(mTemperature) + ite * local_batch_size, local_batch_size, float,
-                                 getDefaultPenaltyValue(RepetitionPenaltyType::Temperature)))
-        ? temperature_buf_ + ite * local_batch_size
-        : nullptr;
-    auto* repetition_penalties
-        = (use_repetition_penalty_
-              && !ALL_OF(std::begin(mRepetitionPenalty) + ite * local_batch_size, local_batch_size, float,
-                  getDefaultPenaltyValue(RepetitionPenaltyType::Repetition)))
-        ? repetition_penalty_buf_ + ite * local_batch_size
-        : nullptr;
-    auto* presence_penalties = (use_presence_penalty_
-                                   && !ALL_OF(std::begin(mPresencePenalty) + ite * local_batch_size, local_batch_size,
-                                       float, getDefaultPenaltyValue(RepetitionPenaltyType::Presence)))
-        ? presence_penalty_buf_ + ite * local_batch_size
-        : nullptr;
-    auto* frequency_penalties = (use_frequency_penalty_
-                                    && !ALL_OF(std::begin(mFrequencyPenalty) + ite * local_batch_size, local_batch_size,
-                                        float, getDefaultPenaltyValue(RepetitionPenaltyType::Frequency)))
-        ? frequency_penalty_buf_ + ite * local_batch_size
-        : nullptr;
-    auto* min_lengths = (use_min_lengths_
-                            && !ALL_OF(std::begin(mMinLengths) + ite * local_batch_size, local_batch_size, int,
-                                (int) getDefaultPenaltyValue(RepetitionPenaltyType::MinLength)))
-        ? min_lengths_buf_ + ite * local_batch_size
-        : nullptr;
-
-    InvokeBatchApplyPenaltyParams<T> penalty_params{logits.getPtr<T>(), embedding_bias,
-        penalty_workspace + ite * local_batch_size * beam_width * vocab_size_,
-        penalty_workspace_prev + ite * local_batch_size * beam_width * vocab_size_, temperatures, repetition_penalties,
-        presence_penalties, frequency_penalties,
-        (use_repetition_penalty_ || use_presence_penalty_ || use_frequency_penalty_), local_batch_size, beam_width,
-        max_seq_len, vocab_size_, vocab_size_padded_, output_ids_ptr.template getPtr<const int*>(),
-        outputs.parent_ids_ptr.template getPtr<const int*>(), input_lengths, sequence_length, min_lengths,
-        params.end_ids.template getPtr<const int>(), nullptr, mStream};
-    invokeBatchApplyPenalty(penalty_params);
-    sync_check_cuda_error();
 
     invokeSoftMax(outputs, params);
     sync_check_cuda_error();

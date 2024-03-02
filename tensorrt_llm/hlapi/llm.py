@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import time
+from argparse import Namespace
 from concurrent.futures import as_completed
 from dataclasses import dataclass, field
 from enum import Enum
@@ -126,6 +127,31 @@ class ModelConfig:
             raise ValueError(
                 f"model_dir of path {self.model_dir} does not exist.")
 
+        # Load parallel_config from the engine.
+        if ModelLoader.get_model_format(
+                self.model_dir) is _ModelFormatKind.TLLM_ENGINE:
+            with open(Path(self.model_dir) / "config.json", "r") as f:
+                engine_config = json.load(f)
+            # TODO[chunweiy]: Remove the following if-check after the engine config is unified.
+            if "pretrained_config" in engine_config:
+                mapping = engine_config["pretrained_config"]["mapping"]
+
+                if self.parallel_config.tp_size != 1 and self.parallel_config.tp_size != mapping[
+                        "tp_size"]:
+                    logger.error(
+                        f"tp_size {self.parallel_config.tp_size} is not consistent with the engine's tp_size {mapping['tp_size']}"
+                    )
+                if self.parallel_config.pp_size != 1 and self.parallel_config.pp_size != mapping[
+                        "pp_size"]:
+                    logger.error(
+                        f"pp_size {self.parallel_config.pp_size} is not consistent with the engine's pp_size {mapping['pp_size']}"
+                    )
+
+                self.parallel_config = ParallelConfig(
+                    tp_size=mapping["tp_size"],
+                    pp_size=mapping["pp_size"],
+                )
+
 
 class LLM:
     '''
@@ -174,8 +200,12 @@ class LLM:
         self.async_mode = async_mode
         self.async_engine_tmp_dir = async_engine_tmp_dir
         # TODO[chunweiy]: Support more models and gpus
-        self._extra_build_config = ModelLoader.get_extra_build_configs(
-            'llama7b', 'a100')
+
+        self._extra_build_config = ModelLoader.load_extra_build_configs_from_engine(
+            self.config.model_dir)
+        if not self._extra_build_config:
+            self._extra_build_config = ModelLoader.get_extra_build_configs(
+                'llama7b', 'a100')
 
         if self.config.is_multi_gpu:
             if get_device_count() < self.config.parallel_config.world_size:
@@ -227,6 +257,7 @@ class LLM:
 
         if sampling_config is None:
             sampling_config = self.get_default_sampling_config()
+        assert sampling_config is not None, "The sampling_config need to be provided."
         assert sampling_config.num_beams == self._extra_build_config.max_beam_width, "Beam search is not supported yet."
         assert len(prompts) <= self._extra_build_config.max_batch_size, \
             "The batch size is too large, not supported yet"
@@ -295,7 +326,7 @@ class LLM:
         if not tokenizer:
             try:
                 tokenizer = ModelLoader.load_hf_tokenizer(self.config.model_dir)
-            except:
+            except Exception:
                 return None
 
         return SamplingConfig(
@@ -598,8 +629,12 @@ class _ModelInfo:
 
     @classmethod
     def from_builder_config_json(cls, config: dict):
-        # The Dict format is { 'builder_config':..., 'plugin_config':...}
-        dtype = config['plugin_config']['gpt_attention_plugin']
+        try:
+            # The Dict format is { 'builder_config':..., 'plugin_config':...}
+            dtype = config['plugin_config']['gpt_attention_plugin']
+        except:
+            dtype = config['pretrained_config']['dtype']
+
         return cls(dtype=dtype, architecture=config['builder_config']['name'])
 
     @classmethod
@@ -771,7 +806,7 @@ class ModelLoader:
 
             engine_dir = Path(engine_dir)
             if not engine_dir.exists():
-                engine_dir.mkdir()
+                engine_dir.mkdir(exist_ok=True)
             config_path = engine_dir / 'config.json'
 
             assert model.model_info is not None
@@ -780,13 +815,14 @@ class ModelLoader:
                 mapping.pp_size, rank)
             builder = Builder()
             # write config.json
-            if isinstance(model.engine_config, BuilderConfig):
-                builder.save_config(model.engine_config, config_path)
-            elif isinstance(model.engine_config, dict):
-                with open(config_path, 'w') as f:
-                    json.dump(model.engine_config, f)
-            else:
-                raise ValueError("wrong engine_config type")
+            if rank == 0:
+                if isinstance(model.engine_config, BuilderConfig):
+                    builder.save_config(model.engine_config, config_path)
+                elif isinstance(model.engine_config, dict):
+                    with open(config_path, 'w') as f:
+                        json.dump(model.engine_config, f)
+                else:
+                    raise ValueError("wrong engine_config type")
 
             logger.debug(f"Saving engine to {engine_path}")
             with open(engine_path, 'wb') as f:
@@ -807,17 +843,16 @@ class ModelLoader:
                         shutil.copy2(src, dst)
 
         save_engine_to_dir(engine_dir)
-        if isinstance(model.tokenizer, TransformersTokenizer):
-            if mapping is None or mapping.rank == 0:
-                copy_hf_tokenizer_data_to_engine_dir()
+        if rank == 0 and isinstance(model.tokenizer, TransformersTokenizer):
+            copy_hf_tokenizer_data_to_engine_dir()
 
     @staticmethod
     def get_model_format(model_dir: str) -> _ModelFormatKind:
         ''' Tell the format of the model.  '''
         # TODO[chunweiy]: Add checkpoint support
-        if Path.exists(Path(model_dir) /
-                       'generation_config.json') and file_with_suffix_exists(
-                           model_dir, '.bin'):
+        if (Path.exists(Path(model_dir) / 'generation_config.json')
+                and (file_with_suffix_exists(model_dir, '.bin')
+                     or file_with_suffix_exists(model_dir, '.safetensors'))):
             return _ModelFormatKind.HF
         if Path.exists(
                 Path(model_dir) / 'config.json') and file_with_suffix_exists(
@@ -840,10 +875,16 @@ class ModelLoader:
 
         # TODO[chunweiy]: inspect from hf model/config
         model_arch = _pretrained_config.architectures[0]
-        assert 'llama' in model_arch.lower(), "Only LLaMA is supported now"
 
         # TODO[chunweiy]: add more models if ready
-        model2struct = dict(LlamaForCausalLM=LLaMAForCausalLM)
+        model2struct = dict(
+            LlamaForCausalLM=LLaMAForCausalLM,
+            MixtralForCausalLM=LLaMAForCausalLM,
+        )
+        if model_arch not in model2struct:
+            raise KeyError(
+                f"Unsupported model architecture: {model_arch}, "
+                f"only {', '.join(model2struct.keys())} are supported now.")
 
         self.model = model2struct[model_arch].from_hugging_face(
             self._model_dir,
@@ -859,7 +900,9 @@ class ModelLoader:
         self.model = self.config.model.from_hugging_face(
             self._model_dir,
             mapping=self.mapping,
-            quant_mode=self.config.quant_config.quant_mode)
+            quant_mode=self.config.quant_config.quant_mode,
+            quantize_lm_head=self.config.quant_config.quantize_lm_head,
+        )
         self._model_info = _ModelInfo.from_module(self.model)
 
     def _load_model_runner(self):
@@ -873,8 +916,13 @@ class ModelLoader:
         self._engine = self.runner.session.runtime.engine
         with open(os.path.join(self._model_dir, 'config.json'), 'r') as f:
             self._engine_config: dict = json.load(f)
-            self._model_info = _ModelInfo.from_builder_config_json(
-                self._engine_config)
+            try:
+                self._model_info = _ModelInfo.from_builder_config_json(
+                    self._engine_config)
+            except:
+                self._model_info = _ModelInfo.from_pretrained_config(
+                    PretrainedConfig.from_dict(
+                        self._engine_config['pretrained_config']))
 
     @staticmethod
     def get_extra_build_configs(model: str, device: str):
@@ -907,6 +955,24 @@ class ModelLoader:
 
         return default_config[model][device]
 
+    @staticmethod
+    def load_extra_build_configs_from_engine(
+            model_dir: str) -> Optional[Namespace]:
+        ''' Load the extra build configs from the engine directory, return None if model isn't an engine. '''
+        if ModelLoader.get_model_format(
+                model_dir) is not _ModelFormatKind.TLLM_ENGINE:
+            return None
+
+        with open(Path(model_dir) / "config.json", "r") as f:
+            engine_config = json.load(f)
+
+        # TODO[chunweiy]: Remove the following if-check after the engine config is unified.
+        if 'build_config' not in engine_config:
+            return None
+        build_config = engine_config['build_config']
+        build_config.pop("plugin_config")
+        return Namespace(**build_config)
+
     def _build_engine_and_model_runner(self):
         ''' Build TensorRT-LLM engine from an in-memory model.
         The model runner will be created.
@@ -933,15 +999,21 @@ class ModelLoader:
         runtime_mapping = self.mapping or Mapping()
         session = GenerationSession(model_config, self._engine, runtime_mapping)
         # TODO[chunweiy]: switch to model_runner_cpp, currently it lacks serialize_engine support
-        self.runner = ModelRunner(session, max_batch_size, max_input_len,
-                                  max_output_len, max_beam_width)
+        self.runner = ModelRunner(
+            session=session,
+            max_batch_size=max_batch_size,
+            max_input_len=max_input_len,
+            max_seq_len=max_input_len + max_output_len,
+            max_beam_width=max_beam_width,
+        )
 
     def _load_hf_tokenizer(self):
         assert self._model_dir
         try:
             self.tokenizer = ModelLoader.load_hf_tokenizer(self._model_dir)
-        except:
-            raise RuntimeError(
+        except Exception:
+            self.tokenizer = None
+            logger.error(
                 f"failed to load HuggingFace tokenizer from {self._model_dir}\n"
                 "You can also try to copy the tokenizer* files from HuggingFace model to the engine directory manually."
             )

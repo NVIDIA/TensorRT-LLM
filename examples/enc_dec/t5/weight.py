@@ -72,9 +72,8 @@ def parse_t5_config(config, component, args):
         args.hidden_act = config.get(component, 'dense_act_fn')
         args.gated_act = config.getboolean(component, 'is_gated_act')
         args.mlp_type = mlp_type_map['GatedMLP' if args.gated_act else 'MLP']
-        args.relative_attention = config.getboolean(component,
-                                                    'relative_attention',
-                                                    fallback=True)
+        args.relative_attention = config.get(
+            'structure', 'position_embedding_type') == 'relative'
         args.num_buckets = config.getint(component,
                                          'relative_attention_num_buckets')
         args.max_distance = config.getint(component,

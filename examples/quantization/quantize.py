@@ -110,6 +110,7 @@ MODEL_NAME_PATTERN_MAP = {
     "Bloom": "bloom",
     "ChatGLM": "chatglm",
     "QWen": "qwen",
+    "Gemma": "gemma",
 }
 
 
@@ -296,7 +297,7 @@ def main(args):
             torch.save(model.state_dict(), export_path)
         else:
             export_npz = (model_type not in [
-                'gptj', 'falcon', 'chatglm', 'mpt', 'llama', 'baichuan'
+                'gptj', 'falcon', 'chatglm', 'mpt', 'llama', 'baichuan', 'gemma'
             ])
             export_model_config(model,
                                 model_type,

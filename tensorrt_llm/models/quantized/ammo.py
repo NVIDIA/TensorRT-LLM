@@ -51,10 +51,10 @@ def _register_falcon_linears(model):
 
 
 def _quantize_model(model: torch.nn.Module,
-                    qformat: Literal['fp8', 'int8_sq', 'int4_awq'],
+                    qformat: Literal['fp8', 'int8_sq', 'int4_awq', 'w4a8_awq'],
                     calib_dataloader: DataLoader,
                     quant_cfg_dict: Optional[Dict] = None) -> torch.nn.Module:
-    assert qformat in ['fp8', 'int8_sq', 'int4_awq'], \
+    assert qformat in ['fp8', 'int8_sq', 'int4_awq', 'w4a8_awq'], \
         f'Got unsupported AMMO quantization format, {qformat} '
     if qformat == "fp8":
         quant_cfg = atq.FP8_DEFAULT_CFG
@@ -62,6 +62,8 @@ def _quantize_model(model: torch.nn.Module,
         quant_cfg = atq.INT8_SMOOTHQUANT_CFG
     elif qformat == "int4_awq":
         quant_cfg = atq.INT4_AWQ_CFG
+    elif qformat == "w4a8_awq":
+        quant_cfg = atq.W4A8_AWQ_BETA_CFG
     else:
         raise ValueError(f"Unsupported quantization format: {qformat}")
 
@@ -86,7 +88,7 @@ def _quantize_model(model: torch.nn.Module,
 
 def quantize_and_export(
         model: torch.nn.Module,
-        qformat: Literal['fp8', 'int8_sq', 'int4_awq'],
+        qformat: Literal['fp8', 'int8_sq', 'int4_awq', 'w4a8_awq'],
         calib_dataloader: DataLoader,
         export_path: Optional[Union[str, Path]] = None,
         tensor_parallel_size: int = 1,

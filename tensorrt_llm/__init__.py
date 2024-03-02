@@ -27,6 +27,8 @@ def _add_trt_llm_dll_directory():
 
 _add_trt_llm_dll_directory()
 
+import sys
+
 import tensorrt_llm.functional as functional
 import tensorrt_llm.models as models
 import tensorrt_llm.quantization as quantization
@@ -80,4 +82,6 @@ __all__ = [
 
 _init(log_level="error")
 
-print(f"[TensorRT-LLM] TensorRT-LLM version: {__version__}", end='')
+print(f"[TensorRT-LLM] TensorRT-LLM version: {__version__}")
+
+sys.stdout.flush()

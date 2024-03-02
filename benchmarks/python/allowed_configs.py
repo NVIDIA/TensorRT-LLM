@@ -85,6 +85,7 @@ class EncDecBuildConfig:
     max_decoder_input_len: Optional[int] = None
     max_output_len: Optional[int] = None
     builder_opt: Optional[int] = None
+    n_mels: Optional[int] = None
 
     def __post_init__(self) -> None:
         assert self.head_size is not None
@@ -704,6 +705,7 @@ _allowed_configs = {
                     hidden_act="relu",
                     n_positions=512,
                     num_buckets=32,
+                    max_distance=128,
                     max_batch_size=8,
                     max_encoder_input_len=1024,
                     max_decoder_input_len=1,
@@ -724,6 +726,7 @@ _allowed_configs = {
                     hidden_act="relu",
                     n_positions=512,
                     num_buckets=32,
+                    max_distance=128,
                     max_batch_size=8,
                     max_encoder_input_len=1024,
                     max_decoder_input_len=1,
@@ -744,6 +747,7 @@ _allowed_configs = {
                     hidden_act="relu",
                     n_positions=512,
                     num_buckets=32,
+                    max_distance=128,
                     max_batch_size=8,
                     max_encoder_input_len=1024,
                     max_decoder_input_len=1,
@@ -764,6 +768,7 @@ _allowed_configs = {
                     hidden_act="relu",
                     n_positions=512,
                     num_buckets=32,
+                    max_distance=128,
                     max_batch_size=8,
                     max_encoder_input_len=1024,
                     max_decoder_input_len=1,
@@ -784,6 +789,7 @@ _allowed_configs = {
                     hidden_act="relu",
                     n_positions=512,
                     num_buckets=32,
+                    max_distance=128,
                     max_batch_size=8,
                     max_encoder_input_len=1024,
                     max_decoder_input_len=1,
@@ -947,7 +953,7 @@ _allowed_configs = {
                 )),
     "baichuan_7b":
     ModelConfig(name="baichuan_7b",
-                family="baichuan_7b",
+                family="baichuan",
                 benchmark_type="gpt",
                 build_config=BuildConfig(
                     num_layers=32,
@@ -964,7 +970,7 @@ _allowed_configs = {
                 )),
     "baichuan2_7b_chat":
     ModelConfig(name="baichuan2_7b_chat",
-                family="baichuan_7b",
+                family="baichuan",
                 benchmark_type="gpt",
                 build_config=BuildConfig(
                     num_layers=32,
@@ -981,7 +987,7 @@ _allowed_configs = {
                 )),
     "baichuan_13b_chat":
     ModelConfig(name="baichuan_13b_chat",
-                family="baichuan_13b",
+                family="baichuan",
                 benchmark_type="gpt",
                 build_config=BuildConfig(
                     num_layers=40,
@@ -998,7 +1004,7 @@ _allowed_configs = {
                 )),
     "baichuan2_13b_chat":
     ModelConfig(name="baichuan2_13b_chat",
-                family="baichuan_13b",
+                family="baichuan",
                 benchmark_type="gpt",
                 build_config=BuildConfig(
                     num_layers=40,
@@ -1173,6 +1179,27 @@ _allowed_configs = {
                     mamba_d_state=16,
                     mamba_d_conv=4,
                     mamba_expand=2,
+                )),
+    "whisper_large_v3":
+    ModelConfig(name="whisper_large_v3",
+                family="whisper",
+                benchmark_type="enc_dec",
+                build_config=EncDecBuildConfig(
+                    num_layers=32,
+                    num_decoder_layers=32,
+                    num_heads=20,
+                    head_size=64,
+                    ffn_hidden_size=5120,
+                    hidden_size=1280,
+                    vocab_size=51866,
+                    hidden_act="gelu",
+                    n_positions=448,
+                    n_mels=128,
+                    max_batch_size=8,
+                    max_encoder_input_len=1500,
+                    max_decoder_input_len=1,
+                    max_output_len=200,
+                    builder_opt=None,
                 )),
 }
 
