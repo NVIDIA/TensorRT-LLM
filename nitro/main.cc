@@ -28,7 +28,7 @@ void runBenchmark()
     const std::string modelName = "mistral";
     const std::filesystem::path engineDir = "/app/mistral_engine_2/";
     const int batchSize = 1;
-    const std::vector<int> inOutLen = {60, 20}; // input_length, output_length
+    const std::vector<int> inOutLen = {60, 100}; // input_length, output_length
 
     // Logger setup
     auto logger = std::make_shared<TllmLogger>();
@@ -85,6 +85,35 @@ void runBenchmark()
 
     GenerationOutput generationOutput{bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32),
         bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32)};
+
+    // Define the callback to stream each generated token
+    generationOutput.onTokenGenerated
+        = [&bufferManager](GenerationOutput::TensorPtr const& outputIds, SizeType step, bool finished)
+    {
+        if (!finished)
+        {
+            // Assuming the shape of outputIds tensor is (1, 1, 160), where 160 is the number of tokens
+            int outputLength = outputIds->getShape().d[2]; // Get the length of output IDs based on the tensor shape
+
+            // Copy output IDs from GPU to host for printing
+            std::vector<int32_t> outputIdsHost(outputLength);
+            bufferManager.copy(*outputIds, outputIdsHost.data(), MemoryType::kCPU);
+
+            // Print the entire output IDs array
+            std::cout << "Output IDs at step " << step << ": ";
+            for (int i = 0; i < outputLength; ++i)
+            {
+                std::cout << outputIdsHost[i] << " ";
+            }
+            std::cout << "\n";
+            // Copy output IDs from GPU to host for printing
+            // std::vector<int32_t> outputIdsHost(outputIds->size());
+            // bufferManager.copy(outputIdsHost, outputIds);
+
+            // Print the entire output IDs array
+            // std::cout << "Output IDs at step " << outputIds->getShape().d[2] << ": ";
+        }
+    };
 
     session.generate(generationOutput, generationInput, samplingConfig);
     bufferManager.getStream().synchronize();
