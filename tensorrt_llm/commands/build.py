@@ -98,6 +98,20 @@ def parse_arguments():
         'Enable horizontal fusion in GatedMLP, reduces layer input traffic and potentially improves performance. '
     )
     parser.add_argument(
+        '--visualize-network',
+        default=False,
+        action='store_true',
+        help=
+        'TRT Networks will be exported to ONNX prior to Engine build for debugging. '
+    )
+    parser.add_argument(
+        '--dry-run',
+        default=False,
+        action='store_true',
+        help=
+        'Run through the build process except the actual Engine build for debugging. '
+    )
+    parser.add_argument(
         '--gather_all_token_logits',
         action='store_true',
         default=False,
@@ -139,7 +153,13 @@ def parse_arguments():
     return args
 
 
-def build_model(model: PretrainedModel, build_config: BuildConfig) -> Engine:
+def build_model(rank: int,
+                model: PretrainedModel,
+                build_config: BuildConfig,
+                output_dir: str,
+                dry_run: bool,
+                visualize_network: bool,
+                ) -> Engine:
     builder = Builder()
     builder_config = builder.create_builder_config(
         precision=model.config.dtype,
@@ -210,9 +230,14 @@ def build_model(model: PretrainedModel, build_config: BuildConfig) -> Engine:
                 network._mark_output(v, k, str_dtype_to_trt(model.config.dtype))
 
     optimize(network)
+    if visualize_network:
+        path = os.path.join(output_dir, f'rank{rank}.svg')
+        network.to_dot(path)
 
     # Network -> Engine
-    engine = builder.build_engine(network, builder_config)
+    engine = None
+    if not dry_run:
+        engine = builder.build_engine(network, builder_config)
     engine_config = EngineConfig(model.config, build_config, __version__)
 
     return Engine(engine_config, engine)
@@ -221,9 +246,12 @@ def build_model(model: PretrainedModel, build_config: BuildConfig) -> Engine:
 def build(build_config: BuildConfig,
           rank: int = 0,
           ckpt_dir: str = None,
+          output_dir: str = None,
           model_config: Union[str, PretrainedConfig] = None,
           weights=None,
           model_cls=None,
+          dry_run: bool = False,
+          visualize_network: bool = False,
           **kwargs) -> Engine:
     if ckpt_dir is not None:
         model_config = PretrainedConfig.from_json_file(
@@ -293,7 +321,7 @@ def build(build_config: BuildConfig,
     use_fused_mlp = kwargs.pop('use_fused_mlp', False)
     model = optimize_model(model, use_fused_mlp=use_fused_mlp)
 
-    return build_model(model, build_config)
+    return build_model(rank, model, build_config, output_dir, dry_run, visualize_network)
 
 
 def preprocess_weights(
@@ -419,14 +447,18 @@ def preprocess_weights(
 
 
 def build_and_save(rank, gpu_id, ckpt_dir, build_config, output_dir, log_level,
-                   model_config, model_cls, **kwargs):
+                   model_config, model_cls, dry_run, visualize_network,
+                   **kwargs):
     torch.cuda.set_device(gpu_id)
     logger.set_level(log_level)
     engine = build(build_config,
                    rank,
                    ckpt_dir,
+                   output_dir,
                    model_config,
                    model_cls=model_cls,
+                   dry_run=dry_run,
+                   visualize_network=visualize_network,
                    **kwargs)
     assert engine is not None
     engine.save(output_dir)
@@ -439,6 +471,8 @@ def parallel_build(ckpt_dir_or_model_config: str,
                    workers: int = 1,
                    log_level: str = 'info',
                    model_cls=None,
+                   dry_run: bool = False,
+                   visualize_network: bool = False,
                    **kwargs):
     ckpt_dir = ckpt_dir_or_model_config
     if ckpt_dir_or_model_config.lower().endswith('.json'):
@@ -452,7 +486,8 @@ def parallel_build(ckpt_dir_or_model_config: str,
         for rank in range(model_config.mapping.world_size):
             passed = build_and_save(rank, rank % workers, ckpt_dir,
                                     build_config, output_dir, log_level,
-                                    model_config, model_cls, **kwargs)
+                                    model_config, model_cls,
+                                    dry_run, visualize_network, **kwargs)
             assert passed, "Engine building failed, please check error log."
     else:
         with ProcessPoolExecutor(mp_context=get_context('spawn'),
@@ -460,7 +495,7 @@ def parallel_build(ckpt_dir_or_model_config: str,
             futures = [
                 p.submit(build_and_save, rank, rank % workers, ckpt_dir,
                          build_config, output_dir, log_level, model_config,
-                         model_cls, **kwargs)
+                         model_cls, dry_run, visualize_network, **kwargs)
                 for rank in range(model_config.mapping.world_size)
             ]
             exceptions = []
@@ -529,7 +564,8 @@ def main():
         'weight_only_precision': args.weight_only_precision,
     }
     parallel_build(source, build_config, args.output_dir, workers,
-                   args.log_level, model_cls, **kwargs)
+                   args.log_level, model_cls, args.dry_run,
+                   args.visualize_network, **kwargs)
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))

@@ -47,7 +47,7 @@ class EngineConfig:
 
 class Engine:
 
-    def __init__(self, config: EngineConfig, engine: trt.IHostMemory):
+    def __init__(self, config: EngineConfig, engine: Union[trt.IHostMemory, None]):
         self.config = config
         self.engine = engine
 
@@ -57,11 +57,12 @@ class Engine:
                       "w",
                       encoding="utf-8") as f:
                 json.dump(self.config.to_dict(), f, indent=4)
-        serialize_engine(
-            self.engine,
-            os.path.join(
-                engine_dir,
-                f'rank{self.config.pretrained_config.mapping.rank}.engine'))
+        if self.engine is not None:
+            serialize_engine(
+                self.engine,
+                os.path.join(
+                    engine_dir,
+                    f'rank{self.config.pretrained_config.mapping.rank}.engine'))
 
     @classmethod
     def from_dir(cls, engine_dir: str, rank: int = 0):
