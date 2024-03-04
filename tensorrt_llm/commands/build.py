@@ -107,6 +107,20 @@ def parse_arguments():
         '(An example for reference only: 0.45734 vs 0.45755 for LLaMA-v2 7B using `ammo/examples/hf/instruct_eval/mmlu.py`).'
     )
     parser.add_argument(
+        '--visualize-network',
+        default=False,
+        action='store_true',
+        help=
+        'TRT Networks will be exported to ONNX prior to Engine build for debugging. '
+    )
+    parser.add_argument(
+        '--dry-run',
+        default=False,
+        action='store_true',
+        help=
+        'Run through the build process except the actual Engine build for debugging. '
+    )
+    parser.add_argument(
         '--gather_all_token_logits',
         action='store_true',
         default=False,
@@ -430,6 +444,8 @@ def main():
                         'past_key_value_(\\d+)': 'present_key_value_\\1',
                     },
                 },
+                'dry_run': args.dry_run,
+                'visualize_network': args.visualize_network,
             },
             plugin_config=plugin_config)
     else:

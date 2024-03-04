@@ -427,7 +427,7 @@ class Network(object):
             )
             return
 
-        dot = graphviz.Digraph(comment='TensorRT Graph',
+        dot = graphviz.Digraph(comment=f'TensorRT Graph of {self._get_network_hash(lightweight=False)}',
                                format=format if format != 'text' else None)
 
         inputs_names = set([x.name for x in self.get_inputs()])
@@ -493,7 +493,7 @@ class Network(object):
 
         if format == "text":
             return dot.source
-        dot.render(path)
+        dot.save(path)
 
     def _get_graph(self) -> "Network._GraphState":
         '''
