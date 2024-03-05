@@ -26,7 +26,7 @@ void runBenchmark()
     const std::string modelName = "mistral";
     const std::filesystem::path engineDir = "/app/mistral_engine_2/";
     const int batchSize = 1;
-    const std::vector<int> inOutLen = {10, 10}; // input_length, output_length
+    const std::vector<int> inOutLen = {10, 2038}; // input_length, output_length
 
     // Logger setup
     auto logger = std::make_shared<TllmLogger>();
@@ -60,12 +60,13 @@ void runBenchmark()
     // Generate random input IDs within the model's vocabulary range
     const int vocabSize = modelConfig.getVocabSize();
     std::vector<int32_t> inputIdsHost(batchSize * inOutLen[0]);
-    for (auto& id : inputIdsHost)
-    {
-        id = rand() % vocabSize; // Random token ID within vocabulary range
-        std::cout << id << std::endl;
-    }
-    // Simplified benchmarking process for a single run
+    std::cout << "Start Nitro testing session: " << std::endl;
+    //    for (auto& id : inputIdsHost)
+    //    {
+    //        id = rand() % vocabSize; // Random token ID within vocabulary range
+    //        std::cout << id << std::endl;
+    //    }
+    //    // Simplified benchmarking process for a single run
     // Note: This example does not include input data preparation or output handling for brevity
 
     // Input preparation
@@ -86,7 +87,7 @@ void runBenchmark()
 
     // Define the callback to stream each generated token
     generationOutput.onTokenGenerated
-        = [&bufferManager](GenerationOutput::TensorPtr const& outputIds, SizeType step, bool finished)
+        = [&bufferManager, inOutLen](GenerationOutput::TensorPtr const& outputIds, SizeType step, bool finished)
     {
         if (!finished)
         {
@@ -96,19 +97,22 @@ void runBenchmark()
             std::vector<int32_t> outputIdsHost(outputLength);
             bufferManager.copy(*outputIds, outputIdsHost.data(), MemoryType::kCPU);
 
-            // Print the entire output IDs array
-            std::cout << "Output IDs at step " << step << ": ";
-            for (int i = 0; i < outputLength; ++i)
+            // Find the last non-zero value in the output IDs starting from the end of the input sequence
+            int lastNonZeroIndex = -1;
+            for (int i = outputLength - 1; i >= inOutLen[0]; --i)
             {
-                std::cout << outputIdsHost[i] << " ";
+                if (outputIdsHost[i] != 0)
+                {
+                    lastNonZeroIndex = i;
+                    break; // Stop at the first non-zero token found from the end
+                }
             }
-            std::cout << "\n";
-            // Copy output IDs from GPU to host for printing
-            // std::vector<int32_t> outputIdsHost(outputIds->size());
-            // bufferManager.copy(outputIdsHost, outputIds);
 
-            // Print the entire output IDs array
-            // std::cout << "Output IDs at step " << outputIds->getShape().d[2] << ": ";
+            // Directly print the last non-zero value if found, without using 'step'
+            if (lastNonZeroIndex != -1)
+            {
+                std::cout << outputIdsHost[lastNonZeroIndex] << " ";
+            }
         }
     };
 
