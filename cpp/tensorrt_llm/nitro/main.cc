@@ -26,7 +26,7 @@ void runBenchmark()
     const std::string modelName = "mistral";
     const std::filesystem::path engineDir = "/app/mistral_engine_2/";
     const int batchSize = 1;
-    const std::vector<int> inOutLen = {60, 100}; // input_length, output_length
+    const std::vector<int> inOutLen = {10, 10}; // input_length, output_length
 
     // Logger setup
     auto logger = std::make_shared<TllmLogger>();
@@ -79,7 +79,7 @@ void runBenchmark()
 
     bool inputPacked = modelConfig.usePackedInput();
 
-    GenerationInput generationInput{50256, 50256, inputIds, inputLengths, inputPacked};
+    GenerationInput generationInput{0, 0, inputIds, inputLengths, inputPacked};
 
     GenerationOutput generationOutput{bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32),
         bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32)};
