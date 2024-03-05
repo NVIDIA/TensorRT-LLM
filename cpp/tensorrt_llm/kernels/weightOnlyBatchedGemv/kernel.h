@@ -86,7 +86,7 @@ struct WeightOnlyDetails<ActType, WeightOnlyQuantType::Int4b>
     // weight 0 1 8 9 16 17 24 25 2 3 10 11 18 19 26 27 4 5 12 13 20 21 28 29 6 7 14 15 22 23 30 31
     static constexpr int kShuffleSize = 32;
     static constexpr int kShuffleBasicTile = 2;
-    static constexpr int kShuffleContinous = 4;
+    static constexpr int kShuffleContinuous = 4;
     static constexpr int kShuffleStrided = 4;
 
     // Each warp completes the internal reduce and writes the [Batch * NPerBlock * Interleave] results to the
@@ -136,7 +136,7 @@ struct WeightOnlyDetails<ActType, WeightOnlyQuantType::Int8b>
     // weight 0 1 8 9 2 3 10 11 4 5 12 13 6 7 14 15
     static constexpr int kShuffleSize = 16;
     static constexpr int kShuffleBasicTile = 2;
-    static constexpr int kShuffleContinous = 2;
+    static constexpr int kShuffleContinuous = 2;
     static constexpr int kShuffleStrided = 4;
 
     // Each warp completes the internal reduce and writes the [Batch * NPerBlock * Interleave] results to the
@@ -177,7 +177,7 @@ struct WeightOnlyKernelDetails
 
     static constexpr int kShuffleSize = Layout::kShuffleSize;
     static constexpr int kShuffleBasicTile = Layout::kShuffleBasicTile;
-    static constexpr int kShuffleContinous = Layout::kShuffleContinous;
+    static constexpr int kShuffleContinuous = Layout::kShuffleContinuous;
     static constexpr int kShuffleStrided = Layout::kShuffleStrided;
 
     // The rearrangement here counteracts the effect of cutlass::add_bias_and_interleave_int4/8s_inplace
@@ -352,7 +352,7 @@ __device__ void weight_only_batched_gemv(const uint8_t* qweight, const ActType* 
                         weights_quantized + i * Details::kConvertCount / Details::kElemsPerByte)));
             }
 #pragma unroll
-            for (int i = 0; i < Details::kShuffleContinous; ++i)
+            for (int i = 0; i < Details::kShuffleContinuous; ++i)
             {
 #pragma unroll
                 for (int j = 0; j < Details::kShuffleStrided; ++j)
@@ -360,7 +360,7 @@ __device__ void weight_only_batched_gemv(const uint8_t* qweight, const ActType* 
                     // Dequantize the weights and arrange the shuffled elements back to the correct order in the
                     // register array
                     ActType2 v = *reinterpret_cast<ActType2*>(weights_vec + i * Details::kShuffleBasicTile
-                        + j * Details::kShuffleContinous * Details::kShuffleBasicTile);
+                        + j * Details::kShuffleContinuous * Details::kShuffleBasicTile);
                     v = __hfma2(
                         v, ActTypeDetails<ActType>::to_vec2(scale[idx]), ActTypeDetails<ActType>::to_vec2(zero[idx]));
                     weights_f16[(i * Details::kShuffleStrided * Details::kShuffleBasicTile

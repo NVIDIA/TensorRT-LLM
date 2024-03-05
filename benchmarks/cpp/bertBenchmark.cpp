@@ -57,12 +57,12 @@ std::string engineFilename(
     std::filesystem::path const& dataPath, WorldConfig const& worldConfig, std::string const& model)
 {
     auto constexpr allowExceptions = true;
-    auto constexpr ingoreComments = true;
+    auto constexpr ignoreComments = true;
     auto const jsonFilePath = dataPath / "config.json";
     TLLM_CHECK_WITH_INFO(
         std::filesystem::exists(jsonFilePath), std::string("File does not exist: ") + jsonFilePath.string());
     std::ifstream jsonStream(jsonFilePath);
-    auto const json = nlohmann::json::parse(jsonStream, nullptr, allowExceptions, ingoreComments);
+    auto const json = nlohmann::json::parse(jsonStream, nullptr, allowExceptions, ignoreComments);
     auto const& builderConfig = json.at("builder_config");
     auto const precision = builderConfig.at("precision").template get<std::string>();
     auto const worldSize = builderConfig.at("tensor_parallel").template get<SizeType>();
@@ -97,9 +97,9 @@ void benchmarkBert(std::string const& modelName, std::filesystem::path const& da
             allocator.setZero(*inputIdsBuffer);
             tensorMap.insert(std::make_pair("input_ids", inputIdsBuffer));
             // input_lengths
-            std::vector<SizeType> inputLenghtsHost(batchSize);
+            std::vector<SizeType> inputLengthsHost(batchSize);
             auto inLensBuffer = std::shared_ptr<ITensor>{
-                allocator.copyFrom(inputLenghtsHost, ITensor::makeShape({batchSize}), MemoryType::kGPU)};
+                allocator.copyFrom(inputLengthsHost, ITensor::makeShape({batchSize}), MemoryType::kGPU)};
             allocator.setZero(*inLensBuffer);
             tensorMap.insert(std::make_pair("input_lengths", inLensBuffer));
 

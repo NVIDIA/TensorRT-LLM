@@ -86,7 +86,7 @@ def run_llm_generate_async_example(prompts: List[str],
     config = ModelConfig(llama_model_dir)
     config.parallel_config.tp_size = tp_size
 
-    llm = LLM(config, async_mode=True, kvcahe_free_gpu_memory_fraction=0.4)
+    llm = LLM(config, kvcache_free_gpu_memory_fraction=0.4)
 
     async def task(prompt: str):
         outputs = []
@@ -146,7 +146,7 @@ def _parse_arguments():
                         help='The directory to dump the engine.',
                         default=None)
     parser.add_argument('--quant_type', type=str, choices=['int4_awq', 'fp8'])
-    parser.add_argument('--prompt', type=str)
+    parser.add_argument('--prompt', type=str, default="What is LLM?")
     parser.add_argument('--tp_size', type=int, default=1)
     parser.add_argument('--streaming', action='store_true')
     return parser.parse_args()

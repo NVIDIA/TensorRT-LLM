@@ -14,9 +14,7 @@ GROUP_NAME         ?= $(shell id --group --name)
 # Set this to 1 to add the current user to the docker image and run the container with the user
 LOCAL_USER         ?= 0
 ifeq ($(LOCAL_USER),1)
-  IMAGE_TAG_SUFFIX   ?= -$(USER_NAME)
-else
-  IMAGE_TAG_SUFFIX   ?=
+IMAGE_TAG_SUFFIX   ?= -$(USER_NAME)
 endif
 
 # Default stage of the docker multi-stage build
@@ -70,7 +68,7 @@ endef
 		$(if $(GIT_COMMIT), --build-arg GIT_COMMIT="$(GIT_COMMIT)") \
 		$(if $(STAGE), --target $(STAGE)) \
 		--file Dockerfile.multi \
-		--tag $(IMAGE_WITH_TAG)$(IMAGE_TAG_SUFFIX) \
+		--tag $(IMAGE_WITH_TAG) \
 		..
 
 %_user:
@@ -122,15 +120,15 @@ release_%: STAGE = release
 release_run: WORK_DIR = /app/tensorrt_llm
 
 # For x86_64
-jenkins_%: IMAGE_TAG = jenkins_latest
+jenkins_%: IMAGE_WITH_TAG = $(shell grep 'LLM_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
 jenkins_%: STAGE = devel
 
 # For aarch64
-jenkins-aarch64_%: IMAGE_TAG = jenkins-aarch64_latest
+jenkins-aarch64_%: IMAGE_WITH_TAG = $(shell grep 'LLM_SBSA_DOCKER_IMAGE = ' ../jenkins/GH200Builder.groovy | grep -o '".*"' | tr -d '"')
 jenkins-aarch64_%: STAGE = devel
 
 # For x86_64
-centos7_%: IMAGE_TAG = centos7_latest
+centos7_%: IMAGE_WITH_TAG = $(shell grep 'LLM_CENTOS7_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
 centos7_%: STAGE = devel
 centos7_%: BASE_IMAGE = nvidia/cuda
 centos7_%: BASE_TAG = 12.3.1-devel-centos7
@@ -141,7 +139,7 @@ ubuntu22_%: BASE_IMAGE = nvidia/cuda
 ubuntu22_%: BASE_TAG = 12.3.1-devel-ubuntu22.04
 
 # For x86_64
-old-cuda_%: IMAGE_TAG = old-cuda_latest
+old-cuda_%: IMAGE_WITH_TAG = $(shell grep 'LLM_OLD_CUDA_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
 old-cuda_%: BASE_TAG = 23.07-py3
 old-cuda_%: STAGE = devel
 old-cuda_%: CUDA_VERSION = 12.1

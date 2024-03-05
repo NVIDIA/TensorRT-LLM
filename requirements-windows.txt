@@ -20,7 +20,7 @@ torch==2.1.0+cu121
 torchdata==0.7.0
 torchtext==0.16.0+cpu
 torchvision==0.16.0+cu121
-transformers==4.36.1
+transformers==4.38.2
 wheel
 optimum
 evaluate

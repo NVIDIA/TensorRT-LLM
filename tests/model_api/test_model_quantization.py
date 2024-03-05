@@ -5,6 +5,7 @@ import tempfile
 import torch
 
 import tensorrt_llm
+from tensorrt_llm.executor import GenerationExecutor
 from tensorrt_llm.models import LLaMAForCausalLM
 from tensorrt_llm.quantization.mode import QuantMode
 
@@ -66,13 +67,13 @@ def test_int4_awq_quantization():
     engine_dir = "llama-awq-quantized"
     engine_temp = tempfile.TemporaryDirectory(engine_dir)
     engine_dir = engine_temp.name
-    for idx, (inp, output) in enumerate(
-            llama._generate(input_text, 10, tokenizer_dir=tokenizer_dir)):
-        print(f"Input: {inp}")
-        print(f'Output: {output}')
-        assert output == awq_expected_output[
-            idx], f"Expecting {awq_expected_output[idx]}, got {output}"
-    # llama.save(engine_dir)
+    llama.save(engine_dir)
+    executor = GenerationExecutor(engine_dir, tokenizer_dir)
+    for idx, output in enumerate(executor.generate(input_text, 10)):
+        print(f"Input: {input_text[idx]}")
+        print(f'Output: {output.text}')
+        assert output.text.endswith(awq_expected_output[idx]), \
+              f"Expecting {awq_expected_output[idx]}, got {output.text}"
 
 
 def test_fp8_quantization():
@@ -107,13 +108,14 @@ def test_fp8_quantization():
     engine_dir = "llama-fp8-quantized"
     engine_temp = tempfile.TemporaryDirectory(engine_dir)
     engine_dir = engine_temp.name
-    for idx, (inp, output) in enumerate(
-            llama._generate(input_text, 10, tokenizer_dir=tokenizer_dir)):
-        print(f"Input: {inp}")
-        print(f'Output: {output}')
-        assert output == fp8_expected_output[
-            idx], f"Expecting {fp8_expected_output[idx]}, got {output}"
-    # llama.save(engine_dir)
+
+    llama.save(engine_dir)
+    executor = GenerationExecutor(engine_dir, tokenizer_dir)
+    for idx, output in enumerate(executor.generate(input_text, 10)):
+        print(f"Input: {input_text[idx]}")
+        print(f'Output: {output.text}')
+        assert output.text.endswith(fp8_expected_output[idx]), \
+              f"Expecting {fp8_expected_output[idx]}, got {output.text}"
 
 
 if __name__ == "__main__":

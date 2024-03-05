@@ -6,7 +6,7 @@ This document shows how to build and run a Baichuan models (including `v1_7b`/`v
 
 The TensorRT-LLM Baichuan implementation can be found in [tensorrt_llm/models/baichuan/model.py](../../tensorrt_llm/models/baichuan/model.py). The TensorRT-LLM Baichuan example code is located in [`examples/baichuan`](./). There is one main file:
 
-* [`copnvert_checkpoint.py`](./copnvert_checkpoint.py) to convert supported checkpoints into TensorRT-LLM format.
+* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert supported checkpoints into TensorRT-LLM format.
 
 The script accepts an argument named model_version, whose value should be `v1_7b`/`v1_13b`/`v2_7b`/`v2_13b` and the default value is `v1_13b`.
 
@@ -20,9 +20,9 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
   * FP8
   * BF16
   * INT4 & INT8 Weight-Only
-  * INT8 KV CACHE (+ AWQ/per-channel weight-only)
-  * INT8 Smooth Quant
+  * INT8 SmoothQuant
   * Groupwise quantization (AWQ/GPTQ)
+  * INT8 KV CACHE (+ AWQ/per-channel weight-only/SmoothQuant)
 
 ## Usage
 
@@ -56,27 +56,26 @@ trtllm-build --checkpoint_dir ./trt_ckpt/baichuan_v1_13b/ \
 Here're some examples for checkpoint conversion that take `v1_13b` as example:
 
 ```bash
-# Build a single-GPU float16 engine from HF weights.
-# Build the Baichuan V1 13B model using a single GPU and FP16.
+# Convert the Baichuan V1 13B model using a single GPU and FP16.
 python convert_checkpoint.py --model_version v1_13b \
                              --model_dir baichuan-inc/Baichuan-13B-Chat \
                              --dtype float16 \
                              --output_dir ./tmp/baichuan_v1_13b/trt_engines/fp16/1-gpu/
 
-# Build the Baichuan V1 13B model using a single GPU and BF16.
+# Convert the Baichuan V1 13B model using a single GPU and BF16.
 python convert_checkpoint.py --model_version v1_13b \
                              --model_dir baichuan-inc/Baichuan-13B-Chat \
                              --dtype bfloat16 \
                              --output_dir ./tmp/baichuan_v1_13b/trt_engines/bf16/1-gpu/
 
-# Build the Baichuan V1 13B model using a single GPU and apply INT8 weight-only quantization.
+# Convert the Baichuan V1 13B model using a single GPU and apply INT8 weight-only quantization.
 python convert_checkpoint.py --model_version v1_13b \
                              --model_dir baichuan-inc/Baichuan-13B-Chat \
                              --dtype float16 \
                              --use_weight_only \
                              --output_dir ./tmp/baichuan_v1_13b/trt_engines/int8_weight_only/1-gpu/
 
-# Build the Baichuan V1 13B model using a single GPU and apply INT4 weight-only quantization.
+# Convert the Baichuan V1 13B model using a single GPU and apply INT4 weight-only quantization.
 python convert_checkpoint.py --model_version v1_13b \
                              --model_dir baichuan-inc/Baichuan-13B-Chat \
                              --dtype float16 \
@@ -84,54 +83,13 @@ python convert_checkpoint.py --model_version v1_13b \
                              --weight_only_precision int4 \
                              --output_dir ./tmp/baichuan_v1_13b/trt_engines/int4_weight_only/1-gpu/
 
-# Build Baichuan V1 13B using 2-way tensor parallelism.
+# Convert Baichuan V1 13B using 2-way tensor parallelism.
 python convert_checkpoint.py --model_version v1_13b \
                              --model_dir baichuan-inc/Baichuan-13B-Chat \
                              --dtype float16 \
                              --output_dir ./tmp/baichuan_v1_13b/trt_engines/fp16/1-gpu/ \
                              --world_size 2 \
                              --tp_size 2
-```
-
-#### INT8 KV cache
-INT8 KV cache could be enabled to reduce memory footprint. It will bring more performance gains when batch size gets larger.
-
-You can get the INT8 scale of KV cache through NVIDIA AMMO (AlgorithMic Model Optimization) toolkit, which features a
-`--kv_cache_dtype` option.
-
-Example:
-
-```bash
-python ../quantization/quantize.py --model_dir baichuan-inc/Baichuan-13B-Chat \
-                                   --dtype float16 \
-                                   --kv_cache_dtype int8 \
-                                   --output_dir ./trt_ckpt/baichuan_int8kv_tp1 \
-                                   --calib_size 512
-```
-
-**INT8 KV cache + per-channel weight-only quantization**
-
-INT8 KV cache could be combined with per-channel weight-only quantization, as follows:
-```bash
-python ../quantization/quantize.py --model_dir baichuan-inc/Baichuan-13B-Chat \
-                                   --dtype float16 \
-                                   --qformat int4_wo \
-                                   --kv_cache_dtype int8 \
-                                   --output_dir ./trt_ckpt/baichuan_int4wo_int8kv_tp1 \
-                                   --calib_size 512
-```
-
-**INT8 KV cache + AWQ**
-
-In addition, you can enable INT8 KV cache together with AWQ (per-group INT4 weight-only quantization), as follows:
-
-```bash
-python ../quantization/quantize.py --model_dir baichuan-inc/Baichuan-13B-Chat \
-                                   --dtype float16 \
-                                   --qformat int4_awq \
-                                   --kv_cache_dtype int8 \
-                                   --output_dir ./trt_ckpt/baichuan_int4awq_int8kv_tp1 \
-                                   --calib_size 512
 ```
 
 #### SmoothQuant
@@ -209,6 +167,62 @@ To run the GPTQ Baichuan example, the following steps are required:
                                  --output_dir ./tmp/baichuan_v2_13b/trt_engines/int4_gptq_gs64/2-gpu/
     ```
     The quantized model checkpoint is saved for future TensorRT-LLM engine build directly with the `trtllm-build` command mentioned above.
+
+#### INT8 KV cache
+INT8 KV cache could be enabled to reduce memory footprint. It will bring more performance gains when batch size gets larger.
+
+You can get the INT8 scale of KV cache through NVIDIA AMMO (AlgorithMic Model Optimization) toolkit, which features a
+`--kv_cache_dtype` option.
+
+Example:
+
+```bash
+python ../quantization/quantize.py --model_dir baichuan-inc/Baichuan-13B-Chat \
+                                   --dtype float16 \
+                                   --kv_cache_dtype int8 \
+                                   --output_dir ./trt_ckpt/baichuan_int8kv_tp1 \
+                                   --calib_size 512
+```
+
+**INT8 KV cache + per-channel weight-only quantization**
+
+INT8 KV cache could be combined with per-channel weight-only quantization, as follows:
+```bash
+python ../quantization/quantize.py --model_dir baichuan-inc/Baichuan-13B-Chat \
+                                   --dtype float16 \
+                                   --qformat int4_wo \
+                                   --kv_cache_dtype int8 \
+                                   --output_dir ./trt_ckpt/baichuan_int4wo_int8kv_tp1 \
+                                   --calib_size 512
+```
+
+**INT8 KV cache + AWQ**
+
+In addition, you can enable INT8 KV cache together with AWQ (per-group INT4 weight-only quantization), as follows:
+
+```bash
+python ../quantization/quantize.py --model_dir baichuan-inc/Baichuan-13B-Chat \
+                                   --dtype float16 \
+                                   --qformat int4_awq \
+                                   --kv_cache_dtype int8 \
+                                   --output_dir ./trt_ckpt/baichuan_int4awq_int8kv_tp1 \
+                                   --calib_size 512
+```
+
+**INT8 KV cache + INT8 SmoothQuant**
+
+In addition, you can enable INT8 KV cache together with INT8 SmoothQuant, as follows:
+
+```bash
+python convert_checkpoint.py --model_version v1_13b \
+                --model_dir baichuan-inc/Baichuan-13B-Chat \
+                --dtype float16 \
+                --smoothquant 0.8 \
+                --per_channel \
+                --per_token \
+                --int8_kv_cache \
+                --output_dir ./tmp/baichuan_v1_13b/sq0.8/1-gpu/
+```
 
 ### Run
 

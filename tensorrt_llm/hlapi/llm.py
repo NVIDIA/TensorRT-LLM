@@ -1,9 +1,9 @@
 import json
 import os
+import shutil
 import tempfile
 import time
 from argparse import Namespace
-from concurrent.futures import as_completed
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -21,8 +21,8 @@ from ..logger import logger
 from ..mapping import Mapping
 from ..models.modeling_utils import PretrainedConfig
 from ..module import Module
-from ..runtime import (GenerationSession, ModelRunner, SamplingConfig,
-                       model_runner)
+from ..runtime import SamplingConfig
+from ..runtime.engine import Engine
 from .mpi_session import MpiSession, NodeSession
 from .tokenizer import TokenizerBase, TransformersTokenizer
 from .utils import (GenerationOutput, file_with_suffix_exists, get_device_count,
@@ -138,12 +138,12 @@ class ModelConfig:
 
                 if self.parallel_config.tp_size != 1 and self.parallel_config.tp_size != mapping[
                         "tp_size"]:
-                    logger.error(
+                    logger.warning(
                         f"tp_size {self.parallel_config.tp_size} is not consistent with the engine's tp_size {mapping['tp_size']}"
                     )
                 if self.parallel_config.pp_size != 1 and self.parallel_config.pp_size != mapping[
                         "pp_size"]:
-                    logger.error(
+                    logger.warning(
                         f"pp_size {self.parallel_config.pp_size} is not consistent with the engine's pp_size {mapping['pp_size']}"
                     )
 
@@ -159,7 +159,7 @@ class LLM:
 
     Classical usage:
 
-    config = ModelConfig("llama-7B")
+    config = ModelConfig(<model-path>)
 
     llm = LLM(config)
     llm.generate(["What is your name?"]) # => ["My name is Llama."]
@@ -167,7 +167,7 @@ class LLM:
 
     @dataclass
     class AdditionalOptions:
-        kvcahe_free_gpu_memory_fraction: Optional[float] = None
+        kvcache_free_gpu_memory_fraction: Optional[float] = None
 
         # TODO[chunweiy]: Add other options including runtime configs and other LLM workflow related options
 
@@ -181,7 +181,6 @@ class LLM:
                  config: ModelConfig,
                  tokenizer: Optional[TokenizerBase] = None,
                  enable_tokenizer: bool = True,
-                 async_mode: bool = False,
                  async_engine_tmp_dir: Optional[str] = None,
                  **kwargs):
         '''
@@ -189,7 +188,6 @@ class LLM:
             config: The model config for the model.
             tokenizer: User provided tokenizer, will override the default one
             enable_tokenizer: Turn on the preprocessing and postprocessing with a tokenizer to make the llm pipeline takes texts as input and produces text as output.
-            async_mode: Run the model in async mode.
             async_engine_tmp_dir: The temporary directory to save the async engine. Only for debugging.
         '''
 
@@ -197,7 +195,6 @@ class LLM:
 
         self._tokenizer = tokenizer
         self.enable_tokenizer = enable_tokenizer
-        self.async_mode = async_mode
         self.async_engine_tmp_dir = async_engine_tmp_dir
         # TODO[chunweiy]: Support more models and gpus
 
@@ -206,6 +203,7 @@ class LLM:
         if not self._extra_build_config:
             self._extra_build_config = ModelLoader.get_extra_build_configs(
                 'llama7b', 'a100')
+        self.mpi_session = None
 
         if self.config.is_multi_gpu:
             if get_device_count() < self.config.parallel_config.world_size:
@@ -219,6 +217,8 @@ class LLM:
             self.mpi_session = MpiSession(
                 n_workers=self.config.parallel_config.tp_size)
 
+        # Due to the gptManager can only accept a engine path, we need to save the engine to a directory
+        self._engine_dir: Union[tempfile.TemporaryDirectory, str, Path] = None
         self._executor: Optional[GenerationExecutor] = None
         self._additional_options = LLM.AdditionalOptions()
 
@@ -252,7 +252,6 @@ class LLM:
             prompts: The raw text or token ids to the model.
             sampling_config: The sampling config for the generation, a default one will be used if not provided.
         '''
-        assert not self.async_mode, "Please use generate_async(...) instead on async mode"
         prompts = list(prompts)
 
         if sampling_config is None:
@@ -264,14 +263,13 @@ class LLM:
         assert sum(len(prompt) for prompt in prompts) <= self._extra_build_config.max_num_tokens, \
             "The total input length is too large, not supported yet"
 
-        if self.config.is_multi_gpu:
-            return self._generate_sync_multi_gpu(prompts, sampling_config)
-        else:
-            return self._generate_sync(
-                prompts,
-                self.runtime_context,
-                sampling_config,
-                max_batch_size=self._extra_build_config.max_batch_size)
+        results = self._executor.generate(
+            prompts,
+            max_new_tokens=sampling_config.max_new_tokens,
+            end_id=sampling_config.end_id,
+            pad_id=sampling_config.pad_id)
+
+        return results
 
     def generate_async(self,
                        prompt: Union[str, List[int]],
@@ -291,19 +289,39 @@ class LLM:
             prompt,
             streaming=streaming,
             # TODO[chunweiy]: make executor support all the options in SamplingConfig
-            max_new_tokens=sampling_config.max_new_tokens)
+            max_new_tokens=sampling_config.max_new_tokens,
+            end_id=sampling_config.end_id,
+            pad_id=sampling_config.pad_id)
         return results
 
     @property
     def tokenizer(self) -> TokenizerBase:
-        if self._tokenizer:
+        if self._tokenizer is not None:
             return self._tokenizer
         if self.runtime_context is not None:
             return self.runtime_context.tokenizer
 
     def save(self, engine_dir: str):
-        ''' Save the built engine to the given path.  '''
-        # TODO[chunweiy]: fix issue here: save() requires the engine-buffer in memory even after engine loading, which consumes a lot of memory.
+        ''' Save the built engine to the given path. '''
+        logger.info(f"Save model to {engine_dir}")
+        assert self._engine_dir is not None, "The engine is not built yet."
+        src_engine_dir = self._engine_dir.name if isinstance(
+            self._engine_dir, tempfile.TemporaryDirectory) else self._engine_dir
+        if src_engine_dir != engine_dir:
+            shutil.copytree(src_engine_dir, engine_dir, dirs_exist_ok=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self.mpi_session is not None:
+            self.mpi_session.shutdown()
+            self.mpi_session = None
+        if hasattr(self, "_executor") and self._executor is not None:
+            self._executor.__exit__(exc_type, exc_value, traceback)
+            self._executor = None
+
+    def _save_engine(self, engine_dir: str):
         logger.info(f"Save model to {engine_dir}")
 
         if self.config.is_multi_gpu:
@@ -323,10 +341,10 @@ class LLM:
         '''
         assert self.enable_tokenizer, "Tokenizer is required to deduce the default sampling config"
         tokenizer = self.tokenizer
-        if not tokenizer:
+        if tokenizer is None:
             try:
                 tokenizer = ModelLoader.load_hf_tokenizer(self.config.model_dir)
-            except Exception:
+            except:
                 return None
 
         return SamplingConfig(
@@ -337,109 +355,76 @@ class LLM:
             return_dict=True)
 
     def _build_model(self):
+        model_format = ModelLoader.get_model_format(self.config.model_dir)
 
-        def build_sync():
+        self._engine_dir = self.config.model_dir
+
+        def get_engine_dir():
+            return self._engine_dir.name if isinstance(
+                self._engine_dir,
+                tempfile.TemporaryDirectory) else self._engine_dir
+
+        if model_format is not _ModelFormatKind.TLLM_ENGINE:
+
+            self._engine_dir = self.async_engine_tmp_dir
+            if self._engine_dir is None:
+                self._engine_dir = tempfile.TemporaryDirectory()
+
             if self.config.is_multi_gpu:
-                futures = self.mpi_session.submit(
+                self.mpi_session.submit_sync(
                     LLM._node_build_task, self.config, self.enable_tokenizer,
                     self.config.parallel_config.tp_size,
                     self.config.parallel_config.pp_size, self._tokenizer)
-                res = []
-                for future in as_completed(futures):
-                    res.append(future.result())
-                return bool(res)
-            else:
-                model_loader = ModelLoader(self.config,
-                                           self.enable_tokenizer,
-                                           tokenizer=self._tokenizer)
-                self.runtime_context = model_loader()
+                self._save_engine(get_engine_dir())
 
-                self._tokenizer = self.runtime_context.tokenizer
+                self.mpi_session.submit_sync(LLM._node_free_state_task)
 
-                self.default_sampling_config = self.get_default_sampling_config(
-                ) if self.tokenizer else None
-
-                return True
-
-        # TODO[chunweiy]: Support multi-gpu build
-        def build_async():
-
-            model_format = ModelLoader.get_model_format(self.config.model_dir)
-
-            engine_dir = self.config.model_dir
-
-            if model_format is not _ModelFormatKind.TLLM_ENGINE:
-
-                engine_dir = self.async_engine_tmp_dir
-                if engine_dir is None:
-                    temp_dir = tempfile.TemporaryDirectory()
-                    engine_dir = temp_dir.name
-
-                if self.config.is_multi_gpu:
-                    self.mpi_session.submit_sync(
-                        LLM._node_build_task, self.config,
-                        self.enable_tokenizer,
-                        self.config.parallel_config.tp_size,
-                        self.config.parallel_config.pp_size, self._tokenizer)
-                    self.save(engine_dir)
-
-                    self.mpi_session.submit_sync(LLM._node_free_state_task)
-
-                else:
-
-                    with ModelLoader(self.config,
-                                     self.enable_tokenizer,
-                                     tokenizer=self._tokenizer) as model_loader:
-
-                        runtime_context = model_loader()
-                        # runner is not needed for GptManager
-
-                        # TODO[chunweiy]: Make GptManager support in-memory engine-buffer to save disk loading lantenecy
-                        ModelLoader.save(runtime_context,
-                                         self.config.model_dir,
-                                         engine_dir=engine_dir,
-                                         model_info=runtime_context.model_info)
-
-                        # Once saved, the engine_buffer is not needed anymore
-                        del runtime_context
-
-                    release_gc()
-
-            tokenizer = self.tokenizer
-            if not isinstance(tokenizer, TokenizerBase):
-                tokenizer = ModelLoader.load_hf_tokenizer(self.config.model_dir)
-            assert isinstance(tokenizer, TokenizerBase)
-
-            import tensorrt_llm.bindings as tllm
-            executor_config = tllm.TrtGptModelOptionalParams()
-            if self._additional_options.kvcahe_free_gpu_memory_fraction is not None:
-                executor_config.kv_cache_config.free_gpu_memory_fraction = self._additional_options.kvcahe_free_gpu_memory_fraction
-
-            if self.config.is_multi_gpu:
-                self._executor = ParallelGenerationExecutor(
-                    tp_size=self.config.parallel_config.tp_size,
-                    engine_dir=engine_dir,
-                    tokenizer=tokenizer,
-                    max_beam_width=self._extra_build_config.max_beam_width,
-                    kvcache_free_gpu_memory_fraction=self._additional_options.
-                    kvcahe_free_gpu_memory_fraction,
-                )
             else:
 
-                self._executor = GenerationExecutor(
-                    engine_dir,
-                    tokenizer=tokenizer,
-                    max_beam_width=self._extra_build_config.max_beam_width,
-                    executor_config=executor_config,
-                    # TODO[chunweiy]: Expose more options
-                )
+                with ModelLoader(self.config,
+                                 self.enable_tokenizer,
+                                 tokenizer=self._tokenizer) as model_loader:
 
-            return True
+                    runtime_context = model_loader()
 
-        if self.async_mode:
-            return build_async()
+                    # TODO[chunweiy]: Make GptManager support in-memory engine-buffer to save disk loading lantenecy
+                    ModelLoader.save(runtime_context,
+                                     self.config.model_dir,
+                                     engine_dir=get_engine_dir(),
+                                     model_info=runtime_context.model_info)
+
+                    # Once saved, the engine_buffer is not needed anymore
+                    del runtime_context
+
+            release_gc()
+
+        tokenizer = self.tokenizer
+        if not isinstance(tokenizer, TokenizerBase):
+            tokenizer = ModelLoader.load_hf_tokenizer(self.config.model_dir)
+
+        import tensorrt_llm.bindings as tllm
+        executor_config = tllm.TrtGptModelOptionalParams()
+        if self._additional_options.kvcache_free_gpu_memory_fraction is not None:
+            executor_config.kv_cache_config.free_gpu_memory_fraction = self._additional_options.kvcache_free_gpu_memory_fraction
+
+        if self.config.is_multi_gpu:
+            self._executor = ParallelGenerationExecutor(
+                tp_size=self.config.parallel_config.tp_size,
+                engine_dir=get_engine_dir(),
+                tokenizer=tokenizer,
+                max_beam_width=self._extra_build_config.max_beam_width,
+                kvcache_free_gpu_memory_fraction=self._additional_options.
+                kvcache_free_gpu_memory_fraction,
+            )
         else:
-            return build_sync()
+
+            self._executor = GenerationExecutor(
+                get_engine_dir(),
+                tokenizer=tokenizer,
+                max_beam_width=self._extra_build_config.max_beam_width,
+                executor_config=executor_config,
+                # TODO[chunweiy]: Expose more options
+            )
 
     @print_traceback_on_error
     @staticmethod
@@ -454,35 +439,15 @@ class LLM:
                           rank=mpi_rank(),
                           world_size=tp_size * pp_size)
 
-        model_loader = ModelLoader(config,
-                                   enable_tokenizer,
-                                   tokenizer=tokenizer,
-                                   mapping=mapping)
-        runtime_context = model_loader()
+        with ModelLoader(config,
+                         enable_tokenizer,
+                         tokenizer=tokenizer,
+                         mapping=mapping) as model_loader:
+            runtime_context = model_loader()
 
         # Hold the model builder for later use
         NodeSession.state = runtime_context
         return True
-
-    @print_traceback_on_error
-    @staticmethod
-    def _node_generation_task(prompts: Union[List[str], List[List[int]]],
-                              sampling_config: Optional[SamplingConfig],
-                              max_batch_size: int) -> List[GenerationOutput]:
-        assert NodeSession.is_initialized(), "Model is not built yet."
-        assert isinstance(NodeSession.state, _ModelRuntimeContext)
-        model: _ModelRuntimeContext = NodeSession.state
-        if sampling_config is None:
-            sampling_config = SamplingConfig(
-                end_id=model.tokenizer.eos_token_id,
-                pad_id=model.tokenizer.eos_token_id
-                if model.tokenizer.pad_token_id is None else
-                model.tokenizer.pad_token_id,
-                output_sequence_lengths=True,
-                return_dict=True) if model.tokenizer else None
-
-        return list(
-            LLM._generate_sync(prompts, model, sampling_config, max_batch_size))
 
     @print_traceback_on_error
     @staticmethod
@@ -512,99 +477,8 @@ class LLM:
     def __getstate__(self):
         raise RuntimeError("LLM object can not be pickled.")
 
-    @staticmethod
-    def _generate_sync(prompts, runtime_context: "_ModelRuntimeContext",
-                       sampling_config,
-                       max_batch_size: int) -> Iterable[GenerationOutput]:
-        ''' Generate in sync mode on a single GPU.  '''
-        assert sampling_config is not None, "The sampling_config need to be provided."
-        if not prompts:
-            return []
-        assert runtime_context.runtime, "The model runner is not built yet."
-
-        def generate_batch(batch_input_ids: List[torch.Tensor]):
-            batch_input_ids = [
-                torch.tensor(x, dtype=torch.int32) for x in batch_input_ids
-            ]  # List[torch.Tensor(seq)]
-
-            assert len(batch_input_ids) <= max_batch_size, \
-                f"Can not run batch size larger than {max_batch_size}, got {len(batch_input_ids)}"
-            outputs = runtime_context.runtime.generate(batch_input_ids,
-                                                       sampling_config)
-
-            output_ids = outputs['output_ids']
-            sequence_lengths = outputs['sequence_lengths']
-
-            batch_size, num_beams, max_len = output_ids.size()
-            input_lengths = [x.size(0) for x in batch_input_ids]
-            assert num_beams == 1, "Support beam search later"
-
-            for batch_idx in range(batch_size):
-                for beam in range(num_beams):
-                    inputs = output_ids[batch_idx][
-                        0][:input_lengths[batch_idx]].tolist()
-
-                    output_begin = input_lengths[batch_idx]
-                    output_end = sequence_lengths[batch_idx][beam]
-                    outputs = output_ids[batch_idx][beam][
-                        output_begin:output_end].tolist()
-
-                    output_text = runtime_context.tokenizer.decode(
-                        outputs) if runtime_context.tokenizer else None
-
-                    # get a sequence for each prompt directly
-                    output = GenerationOutput(text=output_text,
-                                              token_ids=outputs
-                                              # TODO[chunweiy]: fill the probs
-                                              )
-                    yield output
-
-        tokenizer = runtime_context.tokenizer
-
-        def batching_prompts(prompts):
-            need_tokenize: bool = isinstance(prompts[0], str)
-
-            if need_tokenize:
-                assert tokenizer, "The tokenizer is not built or provided."
-
-            def process_batch(batch):
-                return tokenizer.batch_encode_plus(
-                    batch)['input_ids'] if need_tokenize else batch
-
-            batch = []
-            for i, prompt in enumerate(prompts):
-                batch.append(prompt)
-                if len(batch) >= max_batch_size:
-                    yield process_batch(batch)
-                    batch = []
-            if batch:
-                yield process_batch(batch)
-
-        for batch in batching_prompts(prompts):
-            outs = generate_batch(batch)
-            for o in outs:
-                yield o
-
-    def _generate_sync_multi_gpu(
-        self, prompts, sampling_config: Optional[SamplingConfig]
-    ) -> Iterable[GenerationOutput]:
-        # TODO[chunweiy]: May merge this with the one gpu version later
-        assert self.config.is_multi_gpu, "The model is not distributed."
-
-        features = self.mpi_session.submit(
-            LLM._node_generation_task, prompts, sampling_config,
-            self._extra_build_config.max_batch_size)
-
-        res = [feature.result() for feature in as_completed(features)]
-
-        # TODO[chunweiy]: make sure that the root's output is always the first
-        return res[0]
-
     def __del__(self):
-        if self.config.is_multi_gpu:
-            self.mpi_session.shutdown()
-            if self._executor is not None:
-                self._executor.shutdown()
+        self.__exit__(None, None, None)
 
 
 class _ModelFormatKind(Enum):
@@ -629,10 +503,10 @@ class _ModelInfo:
 
     @classmethod
     def from_builder_config_json(cls, config: dict):
-        try:
+        if 'version' in config:
             # The Dict format is { 'builder_config':..., 'plugin_config':...}
             dtype = config['plugin_config']['gpt_attention_plugin']
-        except:
+        else:
             dtype = config['pretrained_config']['dtype']
 
         return cls(dtype=dtype, architecture=config['builder_config']['name'])
@@ -647,7 +521,7 @@ class _ModelRuntimeContext:
     ''' _ModelRuntimeContext holds the minimum runtime resources for running a model.
     It could be a runtime cache in MPI nodes.
     '''
-    runtime: Optional[Union[ModelRunner, trt.IHostMemory]] = None
+    engine_buffer: Optional[trt.IHostMemory] = None
     tokenizer: Optional[TokenizerBase] = None
     # engine_config is only used for saving the engine to disk
     engine_config: Optional[Union[dict, BuildConfig]] = None
@@ -655,8 +529,8 @@ class _ModelRuntimeContext:
 
     @property
     def engine(self) -> trt.IHostMemory:
-        assert self.runtime is not None, "The model runner is not built yet."
-        return self.runtime.serialize_engine()
+        assert self.engine_buffer is not None
+        return self.engine_buffer
 
     @property
     def model_structure(self) -> str:
@@ -667,7 +541,7 @@ class _ModelRuntimeContext:
 
 class ModelLoader:
     ''' The ModelLoader is used to build an end-to-end model from a model config.
-    It will construct the runtime resources including engine, tokenizer, model runner, etc.
+    It will construct the runtime resources including engine, tokenizer, model runner etc for a single gpu.
     '''
 
     def __init__(self,
@@ -711,9 +585,9 @@ class ModelLoader:
         if self._model_format is _ModelFormatKind.HF:
             ''' HF -> TFRT checkpoints -> engine '''
             self._model_pipeline.append(
-                ("Load HF model to memory", self._build_model_from_hf))
+                ("Load HF model to memory", self._load_model_from_hf))
             self._model_pipeline.append(
-                ("Build TRT-LLM engine", self._build_engine_and_model_runner))
+                ("Build TRT-LLM engine", self._build_engine))
         elif self._model_format is _ModelFormatKind.TLLM_CKPT:
             ''' TFRT checkpoints -> engine '''
             # TODO[chunweiy]: Support checkpoints when quantization is ready
@@ -721,12 +595,12 @@ class ModelLoader:
         elif self._model_format is _ModelFormatKind.TLLM_ENGINE:
             ''' TFRT engine '''
             self._model_pipeline.append(
-                ("Load TensorRT-LLM engine", self._load_model_runner))
+                ("Load TensorRT-LLM engine", self._load_engine_buffer))
         else:
             raise ValueError(f"Unknown model format {self._model_format}")
 
-        if self.enable_tokenizer and not self.tokenizer:
-            ''' Use the default tokenizer if user doesn't provide one '''
+        if self.enable_tokenizer and self.tokenizer is None:
+            ''' Use the default tokenizer if no one is provided. '''
             self._model_pipeline.append(
                 ("Initialize tokenizer", self._load_hf_tokenizer))
 
@@ -756,7 +630,7 @@ class ModelLoader:
             print_colored('Total latency: {:.3f}s\n'.format(overall_latency),
                           'grey')
 
-        assert self.runner is not None, "The model runner is not built yet."
+        assert self._engine_buffer is not None, "The engine is not built yet."
 
         assert hasattr(self, '_builder_config') or hasattr(
             self, '_engine_config'), "config is not loaded."
@@ -764,7 +638,7 @@ class ModelLoader:
             self, '_engine_config') else self._builder_config
 
         return _ModelRuntimeContext(tokenizer=self.tokenizer,
-                                    runtime=self.runner,
+                                    engine_buffer=self._engine_buffer,
                                     engine_config=config,
                                     model_info=self._model_info)
 
@@ -791,7 +665,7 @@ class ModelLoader:
              engine_dir: str,
              model_info: _ModelInfo,
              mapping=None):
-        ''' Save the built engine to the given path. '''
+        ''' Save the built engine on a single GPU to the given path. '''
         mapping = mapping or Mapping()
         rank = mapping.rank if mapping else 0
 
@@ -848,7 +722,7 @@ class ModelLoader:
 
     @staticmethod
     def get_model_format(model_dir: str) -> _ModelFormatKind:
-        ''' Tell the format of the model.  '''
+        ''' Get the format of the model.  '''
         # TODO[chunweiy]: Add checkpoint support
         if (Path.exists(Path(model_dir) / 'generation_config.json')
                 and (file_with_suffix_exists(model_dir, '.bin')
@@ -864,7 +738,7 @@ class ModelLoader:
         ''' Download HF model from third-party model hub like www.modelscope.cn or huggingface.  '''
         raise NotImplementedError()
 
-    def _build_model_from_hf(self):
+    def _load_model_from_hf(self):
         ''' Build a TRT-LLM model from a HF model.  '''
         from ..models import LLaMAForCausalLM
         assert self._model_dir is not None
@@ -905,24 +779,33 @@ class ModelLoader:
         )
         self._model_info = _ModelInfo.from_module(self.model)
 
-    def _load_model_runner(self):
-        ''' Load a model runner from a TRT-LLM engine. '''
-        assert self._model_dir
-        logger.info(f"Loading model runner from {self._model_dir}")
+    def _build_engine(self):
+        self._engine_buffer, self._builder_config = self.model.to_trt(
+            batch_size=self._extra_build_config.max_batch_size,
+            input_len=self._extra_build_config.max_input_len,
+            output_len=self._extra_build_config.max_output_len,
+            plugin_config=self.config.plugin_config,
+            # override some settings for build_config
+            max_beam_width=self._extra_build_config.max_beam_width,
+            max_num_tokens=self._extra_build_config.max_num_tokens)
 
-        self.runner = ModelRunner.from_dir(
-            self._model_dir,
-            rank=self.mapping.rank if self.mapping is not None else 0)
-        self._engine = self.runner.session.runtime.engine
-        with open(os.path.join(self._model_dir, 'config.json'), 'r') as f:
-            self._engine_config: dict = json.load(f)
-            try:
-                self._model_info = _ModelInfo.from_builder_config_json(
-                    self._engine_config)
-            except:
-                self._model_info = _ModelInfo.from_pretrained_config(
-                    PretrainedConfig.from_dict(
-                        self._engine_config['pretrained_config']))
+        # delete the model explicitly to free all the build-time resources
+        self.model = None
+
+    def _load_engine_buffer(self):
+        # Load engine buffer from disk
+        engine = Engine.from_dir(self._model_dir)
+        self._engine_buffer = engine.engine
+        self._engine_config = engine.config
+
+    def _load_hf_tokenizer(self):
+        assert self._model_dir
+        self.tokenizer = ModelLoader.load_hf_tokenizer(self._model_dir)
+        if self.tokenizer is None:
+            raise RuntimeError(
+                f"failed to load HuggingFace tokenizer from {self._model_dir}\n"
+                "You can also try to copy the tokenizer* files from HuggingFace model to the engine directory manually."
+            )
 
     @staticmethod
     def get_extra_build_configs(model: str, device: str):
@@ -973,56 +856,14 @@ class ModelLoader:
         build_config.pop("plugin_config")
         return Namespace(**build_config)
 
-    def _build_engine_and_model_runner(self):
-        ''' Build TensorRT-LLM engine from an in-memory model.
-        The model runner will be created.
-        '''
-        self._engine, self._builder_config = self.model.to_trt(
-            batch_size=self._extra_build_config.max_batch_size,
-            input_len=self._extra_build_config.max_input_len,
-            output_len=self._extra_build_config.max_output_len,
-            plugin_config=self.config.plugin_config,
-            # override some settings for build_config
-            max_beam_width=self._extra_build_config.max_beam_width,
-            max_num_tokens=self._extra_build_config.max_num_tokens)
-
-        # delete the model explicitly to free all the build-time resources
-        del self.model
-
-        # TODO [chunweiy]: Is this conversion necessary?
-        model_config, other_config = model_runner._builder_to_model_config(
-            self._builder_config.to_dict())
-        max_batch_size = other_config.get('max_batch_size')
-        max_input_len = other_config.get('max_input_len')
-        max_output_len = other_config.get('max_output_len')
-        max_beam_width = other_config.get('max_beam_width')
-        runtime_mapping = self.mapping or Mapping()
-        session = GenerationSession(model_config, self._engine, runtime_mapping)
-        # TODO[chunweiy]: switch to model_runner_cpp, currently it lacks serialize_engine support
-        self.runner = ModelRunner(
-            session=session,
-            max_batch_size=max_batch_size,
-            max_input_len=max_input_len,
-            max_seq_len=max_input_len + max_output_len,
-            max_beam_width=max_beam_width,
-        )
-
-    def _load_hf_tokenizer(self):
-        assert self._model_dir
-        try:
-            self.tokenizer = ModelLoader.load_hf_tokenizer(self._model_dir)
-        except Exception:
-            self.tokenizer = None
-            logger.error(
-                f"failed to load HuggingFace tokenizer from {self._model_dir}\n"
-                "You can also try to copy the tokenizer* files from HuggingFace model to the engine directory manually."
-            )
-
     @staticmethod
-    def load_hf_tokenizer(model_dir):
-        return TransformersTokenizer.from_pretrained(model_dir,
-                                                     legacy=False,
-                                                     padding_side='left',
-                                                     truncation_side='left',
-                                                     trust_remote_code=True,
-                                                     use_fast=True)
+    def load_hf_tokenizer(model_dir) -> Optional[TransformersTokenizer]:
+        try:
+            return TransformersTokenizer.from_pretrained(model_dir,
+                                                         legacy=False,
+                                                         padding_side='left',
+                                                         truncation_side='left',
+                                                         trust_remote_code=True,
+                                                         use_fast=True)
+        except:
+            return None

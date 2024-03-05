@@ -84,8 +84,7 @@ Note that we need to download the dataset of MMLU first and the evaluation of MM
 VOCAB_FILE_PATH=/tmp/models/gemma_nv/checkpoints/tmp_vocab.model
 python3 ../run.py --engine_dir ${ENGINE_PATH} \
                   --max_output_len 30 \
-                  --vocab_file ${VOCAB_FILE_PATH} \
-                  --no_add_special_tokens
+                  --vocab_file ${VOCAB_FILE_PATH}
 
 [TensorRT-LLM] TensorRT-LLM version: 0.9.0.dev2024020600Input [Text 0]: "<bos> Born in north-east France, Soyer trained as a"
 Output [Text 0 Beam 0]: "chef in the renowned kitchens of Lyon. After honing his skills in various Michelin-starred establishments, he embarked on a solo venture, establishing his own restaurant"
@@ -98,8 +97,7 @@ python3 ../summarize.py --test_trt_llm \
                         --engine_dir ${ENGINE_PATH} \
                         --batch_size 8 \
                         --max_ite 5 \
-                        --vocab_file ${VOCAB_FILE_PATH} \
-                        --no_add_special_tokens
+                        --vocab_file ${VOCAB_FILE_PATH}
 
 [02/06/2024-10:08:54] [TRT-LLM] [I] TensorRT-LLM (total latency: 3.2821836471557617 sec)
 [02/06/2024-10:08:54] [TRT-LLM] [I] TensorRT-LLM (total output tokens: 1989)
@@ -167,8 +165,7 @@ python3 ../summarize.py --test_trt_llm \
                       --vocab_file ${VOCAB_FILE_PATH} \
                       --engine_dir ${ENGINE_PATH} \
                       --batch_size 8 \
-                      --max_ite 5 \
-                      --no_add_special_tokens
+                      --max_ite 5
 
 [02/08/2024-05:04:13] [TRT-LLM] [I] TensorRT-LLM (total latency: 3.96612286567688 sec)
 [02/08/2024-05:04:13] [TRT-LLM] [I] TensorRT-LLM (total output tokens: 2510)
@@ -213,8 +210,7 @@ python3 ../summarize.py --test_trt_llm \
                       --vocab_file ${VOCAB_FILE_PATH} \
                       --engine_dir ${ENGINE_PATH} \
                       --batch_size 8 \
-                      --max_ite 5 \
-                      --no_add_special_tokens
+                      --max_ite 5
 
 [02/08/2024-10:37:15] [TRT-LLM] [I] TensorRT-LLM (total latency: 3.116227149963379 sec)
 [02/08/2024-10:37:15] [TRT-LLM] [I] TensorRT-LLM (total output tokens: 2419)
@@ -263,8 +259,7 @@ python3 ../summarize.py --test_trt_llm \
                       --vocab_file ${VOCAB_FILE_PATH} \
                       --engine_dir ${ENGINE_PATH} \
                       --batch_size 8 \
-                      --max_ite 5 \
-                      --no_add_special_tokens
+                      --max_ite 5
 
 [02/08/2024-04:42:06] [TRT-LLM] [I] TensorRT-LLM (total latency: 3.460859775543213 sec)
 [02/08/2024-04:42:06] [TRT-LLM] [I] TensorRT-LLM (total output tokens: 1786)
@@ -308,8 +303,7 @@ python3 ../summarize.py --test_trt_llm \
                       --vocab_file ${VOCAB_FILE_PATH} \
                       --engine_dir ${ENGINE_PATH} \
                       --batch_size 8 \
-                      --max_ite 5 \
-                      --no_add_special_tokens
+                      --max_ite 5
 
 [02/08/2024-04:44:54] [TRT-LLM] [I] TensorRT-LLM (total latency: 3.5987987518310547 sec)
 [02/08/2024-04:44:54] [TRT-LLM] [I] TensorRT-LLM (total output tokens: 1797)
@@ -349,8 +343,7 @@ python3 ../summarize.py --test_trt_llm \
                       --vocab_file ${VOCAB_FILE_PATH} \
                       --engine_dir ${ENGINE_PATH} \
                       --batch_size 8 \
-                      --max_ite 5 \
-                      --no_add_special_tokens
+                      --max_ite 5
 
 [02/08/2024-04:48:06] [TRT-LLM] [I] TensorRT-LLM (total latency: 3.1938045024871826 sec)
 [02/08/2024-04:48:06] [TRT-LLM] [I] TensorRT-LLM (total output tokens: 1462)
@@ -393,8 +386,7 @@ python3 ../summarize.py --test_trt_llm \
                       --vocab_file ${VOCAB_FILE_PATH} \
                       --engine_dir ${ENGINE_PATH} \
                       --batch_size 8 \
-                      --max_ite 5 \
-                      --no_add_special_tokens
+                      --max_ite 5
 
 [02/08/2024-04:52:22] [TRT-LLM] [I] TensorRT-LLM (total latency: 3.5348474979400635 sec)
 [02/08/2024-04:52:22] [TRT-LLM] [I] TensorRT-LLM (total output tokens: 1819)
@@ -437,8 +429,7 @@ python3 ../summarize.py --test_trt_llm \
                       --vocab_file ${VOCAB_FILE_PATH} \
                       --engine_dir ${ENGINE_PATH} \
                       --batch_size 8 \
-                      --max_ite 5 \
-                      --no_add_special_tokens
+                      --max_ite 5
 
 python3 ../mmlu.py --test_trt_llm \
                  --vocab_file ${VOCAB_FILE_PATH} \
@@ -482,8 +473,7 @@ python3 ../summarize.py --test_trt_llm \
                       --vocab_file ${VOCAB_FILE_PATH} \
                       --engine_dir ${ENGINE_PATH} \
                       --batch_size 8 \
-                      --max_ite 5 \
-                      --no_add_special_tokens
+                      --max_ite 5
 
 [02/08/2024-06:42:13] [TRT-LLM] [I] TensorRT-LLM (total latency: 5.884302377700806 sec)
 [02/08/2024-06:42:13] [TRT-LLM] [I] TensorRT-LLM (total output tokens: 2694)
@@ -524,8 +514,7 @@ python3 ../summarize.py --test_trt_llm \
                         --vocab_file ${VOCAB_FILE_PATH} \
                         --engine_dir ${ENGINE_PATH} \
                         --batch_size 8 \
-                        --max_ite 5 \
-                        --no_add_special_tokens
+                        --max_ite 5
 
 [02/19/2024-10:02:53] [TRT-LLM] [I] ---------------------------------------------------------
 [02/19/2024-10:03:09] [TRT-LLM] [I] TensorRT-LLM (total latency: 13.65670919418335 sec)
@@ -570,8 +559,7 @@ python3 ../summarize.py --test_trt_llm \
                       --vocab_file ${VOCAB_FILE_PATH} \
                       --engine_dir ${ENGINE_PATH} \
                       --batch_size 8 \
-                      --max_ite 5 \
-                      --no_add_special_tokens
+                      --max_ite 5
 
 [02/08/2024-07:38:15] [TRT-LLM] [I] TensorRT-LLM (total latency: 8.49835753440857 sec)
 [02/08/2024-07:38:15] [TRT-LLM] [I] TensorRT-LLM (total output tokens: 2654)
@@ -611,8 +599,7 @@ python3 ../summarize.py --test_trt_llm \
                       --vocab_file ${VOCAB_FILE_PATH} \
                       --engine_dir ${ENGINE_PATH} \
                       --batch_size 8 \
-                      --max_ite 5 \
-                      --no_add_special_tokens
+                      --max_ite 5
 
 [02/08/2024-07:43:32] [TRT-LLM] [I] TensorRT-LLM (total latency: 7.282559156417847 sec)
 [02/08/2024-07:43:32] [TRT-LLM] [I] TensorRT-LLM (total output tokens: 2253)
@@ -655,8 +642,7 @@ python3 ../summarize.py --test_trt_llm \
                       --vocab_file ${VOCAB_FILE_PATH} \
                       --engine_dir ${ENGINE_PATH} \
                       --batch_size 8 \
-                      --max_ite 5 \
-                      --no_add_special_tokens
+                      --max_ite 5
 
 [02/08/2024-07:51:11] [TRT-LLM] [I] TensorRT-LLM (total latency: 8.73880124092102 sec)
 [02/08/2024-07:51:11] [TRT-LLM] [I] TensorRT-LLM (total output tokens: 2771)
@@ -672,7 +658,7 @@ python3 ../summarize.py --test_trt_llm \
 
 #### Requirements
 
-AMMO toolkit provides quantization solutions with better accuracy. To enable it, have the latest ammo and transformers Python package installed to support Gemma. Then run the following commands.
+AMMO toolkit also provides quantization solutions. To enable it, have the latest ammo and transformers Python package installed to support Gemma. Then run the following commands.
 
 #### Quantize Checkpoints
 
@@ -713,7 +699,7 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
 
 #### Accuracy Results on MMLU
 
-| Model         | fp8   | int4_awq | int8_sq |
-|---------------|-------|----------|---------|
-| 2B Pretrained | 0.407 | 0.378    | 0.328   |
-| 7B Pretrained | 0.643 | 0.615    | 0.480   |
+| Model         | fp8   | int4_awq | int8_sq (AMMO) | int8_sq (Native per-channel) |
+|---------------|-------|----------|----------------|------------------|
+| 2B Pretrained | 0.407 | 0.378    |    0.338       |     0.338        |
+| 7B Pretrained | 0.643 | 0.615    |    0.448       |     0.595        |

@@ -674,7 +674,8 @@ class TestSmoothQuant(unittest.TestCase):
                                        torch_weight_scales, dtype, bias_data)
 
         # compare diff
-        _utils.woq_assert_colwise_near_eq(ref, output, wTypeId)
+        _utils.woq_assert_near_eq(ref.to(torch.float32),
+                                  output.to(torch.float32), wTypeId)
 
     # @parameterized.expand([
     #     ('float16', QuantMode.PER_TENSOR),

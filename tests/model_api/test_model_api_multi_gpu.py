@@ -1,6 +1,7 @@
 import os
 import pickle
 import sys
+import tempfile
 
 import cloudpickle
 import pytest
@@ -11,6 +12,7 @@ from mpi4py.futures import MPIPoolExecutor
 import tensorrt_llm
 from tensorrt_llm import Mapping
 from tensorrt_llm._utils import mpi_barrier
+from tensorrt_llm.executor import GenerationExecutor
 from tensorrt_llm.hlapi.utils import print_traceback_on_error
 from tensorrt_llm.models import LLaMAForCausalLM
 
@@ -36,7 +38,7 @@ TP_SIZE = 2
 
 # 76s on ipp1-1197, loading weights 18s (varies based on network speed), network/engine creation 27s
 @print_traceback_on_error
-def build_and_run_tp2(rank, model_name):
+def build_and_run_tp2(rank, model_name, engine_dir):
     '''Do not save the engine, all in one LLaMAForCausalLM object
     '''
     input_text = [
@@ -70,17 +72,18 @@ def build_and_run_tp2(rank, model_name):
                                                'float16',
                                                mapping=mapping)
     llama.to_trt(max_batch_size, max_isl, max_osl, strongly_typed=True)
+    llama.save(engine_dir)
     mpi_barrier()
     tensorrt_llm.logger.warning(f"Build finished for rank {rank}")
-    for idx, (inp, output) in enumerate(
-            llama._generate(input_text, 10, tokenizer_dir=tokenizer_dir)):
-        # print(f"Input: {inp}")
-        tensorrt_llm.logger.info(f"{rank} input: {inp}")
-        # print(f'Output: {output}')
-        tensorrt_llm.logger.info(f"{rank} output: {output}")
-        assert output == expected_output[
-            idx], f"Expecting {expected_output[idx]}, got {output}"
-        mpi_barrier()
+    executor = GenerationExecutor(engine_dir, tokenizer_dir)
+    mpi_barrier()
+    for idx, output in enumerate(executor.generate(input_text, 10)):
+        tensorrt_llm.logger.info(f"{rank} input: {input_text[idx]}")
+        tensorrt_llm.logger.info(f"{rank} output: {output.text}")
+        assert output.text.endswith(
+            expected_output[idx]
+        ), f"Expecting {expected_output[idx]}, got {output.text}"
+    mpi_barrier()
     return True
 
 
@@ -90,8 +93,11 @@ def test_multi_gpu(model_name):
     if torch.cuda.device_count() < TP_SIZE:
         print(f"The test needs at least ${TP_SIZE} GPUs, skipping")
         return
+    engine_dir = tempfile.TemporaryDirectory()
+
     with MPIPoolExecutor(max_workers=TP_SIZE) as executor:
-        results = executor.map(build_and_run_tp2, (0, 1), [model_name] * 2)
+        results = executor.map(build_and_run_tp2, (0, 1), [model_name] * 2,
+                               [engine_dir.name] * 2)
         for r in results:
             assert r == True
 

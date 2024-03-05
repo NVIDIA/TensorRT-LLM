@@ -17,122 +17,214 @@ described in the benchmarks [folder](source:benchmarks/).
 The below tables provide reference data at large batch sizes, representing
 high throughput offline tasks.
 
-This data has been updated for v0.6.1, unless specified.
+All data was generated using version 0.8.0
 
-### H100 GPUs (FP8)
+### H200 GPUs (FP8)
+
 
 | Model                        | Batch Size | TP (1)    | Input Length | Output Length | Throughput (out tok/s/GPU) |
 | :--------------------------- | :--------- | :-------- | :----------- | :------------ | -------------------------: |
-| GPT-J 6B                     | 1024       | 1         | 128          | 128           |                     26,150 |
-| GPT-J 6B                     | 120        | 1         | 128          | 2048          |                      8,011 |
-| GPT-J 6B                     | 64         | 1         | 2048         | 128           |                      2,551 |
-| GPT-J 6B                     | 64         | 1         | 2048         | 2048          |                      3,327 |
+| GPT-J 6B                     | 1024       | 1         | 128          | 128           |                     29,168 |
+| GPT-J 6B                     | 120        | 1         | 128          | 2048          |                      9,472 |
+| GPT-J 6B                     | 64         | 1         | 2048         | 128           |                      2,961 |
+| GPT-J 6B                     | 64         | 1         | 2048         | 2048          |                      4,149 |
 |                              |            |           |              |               |                            |
-| LLaMA 7B                     | 768        | 1         | 128          | 128           |                     19,694 |
-| LLaMA 7B                     | 112        | 1         | 128          | 2048          |                      6,818 |
-| LLaMA 7B                     | 80         | 1         | 2048         | 128           |                      2,244 |
-| LLaMA 7B                     | 48         | 1         | 2048         | 2048          |                      2,740 |
+| Mistral 7B                   | 896        | 1         | 128          | 128           |                     20,569 |
+| Mistral 7B                   | 120        | 1         | 128          | 2048          |                      8,968 |
+| Mistral 7B                   | 84         | 1         | 2048         | 128           |                      2,450 |
+| Mistral 7B                   | 56         | 1         | 2048         | 2048          |                      3,868 |
 |                              |            |           |              |               |                            |
-| LLaMA 70B                    | 1024       | 2         | 128          | 128           |                      2,657 |
-| LLaMA 70B                    | 480        | 4         | 128          | 2048          |                      1,486 |
-| LLaMA 70B                    | 96         | 2         | 2048         | 128           |                        306 |
-| LLaMA 70B                    | 64         | 2         | 2048         | 2048          |                        547 |
+| LLaMA 7B                     | 896        | 1         | 128          | 128           |                     20,548 |
+| LLaMA 7B                     | 120        | 1         | 128          | 2048          |                      8,343 |
+| LLaMA 7B                     | 84         | 1         | 2048         | 128           |                      2,429 |
+| LLaMA 7B                     | 56         | 1         | 2048         | 2048          |                      3,530 |
 |                              |            |           |              |               |                            |
-| Falcon 180B                  | 1024       | 4         | 128          | 128           |                        987 |
-| Falcon 180B                  | 1024       | 8         | 128          | 2048          |                        724 |
-| Falcon 180B                  | 64         | 4         | 2048         | 128           |                        112 |
-| Falcon 180B                  | 64         | 4         | 2048         | 2048          |                        264 |
+| LLaMA 70B                    | 512        | 1         | 128          | 128           |                      3,844 |
+| LLaMA 70B                    | 512        | 2         | 128          | 2048          |                      4,008 |
+| LLaMA 70B                    | 64         | 1         | 2048         | 128           |                        421 |
+| LLaMA 70B                    | 64         | 1         | 2048         | 2048          |                      1,461 |
+|                              |            |           |              |               |                            |
+| Falcon 180B                  | 1024       | 4         | 128          | 128           |                      1,116 |
+| Falcon 180B                  | 1024       | 4         | 128          | 2048          |                        990 |
+| Falcon 180B                  | 64         | 4         | 2048         | 128           |                        118 |
+| Falcon 180B                  | 64         | 4         | 2048         | 2048          |                        269 |
 
-### L40S GPUs (FP8)<sup>*</sup>
 
-<sup> * The following data is from TensorRT-LLM v0.5. </sup>
+### H100 GPUs (FP8)
+
+
+| Model                        | Batch Size | TP (1)    | Input Length | Output Length | Throughput (out tok/s/GPU) |
+| :--------------------------- | :--------- | :-------- | :----------- | :------------ | -------------------------: |
+| GPT-J 6B                     | 1024       | 1         | 128          | 128           |                     27,357 |
+| GPT-J 6B                     | 120        | 1         | 128          | 2048          |                      7,831 |
+| GPT-J 6B                     | 64         | 1         | 2048         | 128           |                      2,661 |
+| GPT-J 6B                     | 64         | 1         | 2048         | 2048          |                      3,409 |
+|                              |            |           |              |               |                            |
+| Mistral 7B                   | 896        | 1         | 128          | 128           |                     20,517 |
+| Mistral 7B                   | 120        | 1         | 128          | 2048          |                      8,619 |
+| Mistral 7B                   | 64         | 1         | 2048         | 128           |                      2,438 |
+| Mistral 7B                   | 56         | 1         | 2048         | 2048          |                      3,733 |
+|                              |            |           |              |               |                            |
+| LLaMA 7B                     | 896        | 1         | 128          | 128           |                     20,241 |
+| LLaMA 7B                     | 120        | 1         | 128          | 2048          |                      6,922 |
+| LLaMA 7B                     | 64         | 1         | 2048         | 128           |                      2,170 |
+| LLaMA 7B                     | 56         | 1         | 2048         | 2048          |                      2,816 |
+|                              |            |           |              |               |                            |
+| LLaMA 70B                    | 1024       | 2         | 128          | 128           |                      3,269 |
+| LLaMA 70B                    | 512        | 4         | 128          | 2048          |                      2,718 |
+| LLaMA 70B                    | 96         | 2         | 2048         | 128           |                        347 |
+| LLaMA 70B                    | 64         | 2         | 2048         | 2048          |                      1,020 |
+|                              |            |           |              |               |                            |
+| Falcon 180B                  | 512        | 4         | 128          | 128           |                      1,048 |
+| Falcon 180B                  | 1024       | 8         | 128          | 2048          |                        836 |
+| Falcon 180B                  | 64         | 4         | 2048         | 128           |                        114 |
+| Falcon 180B                  | 64         | 4         | 2048         | 2048          |                        250 |
+
+### L40S GPUs (FP8)
 
 
 | Model                        | Batch Size | TP (1)    | Input Length | Output Length | Throughput (out tok/s/GPU) |
 | :--------------------------- | :--------- | :-------- | :----------- | :------------ | ---------------------: |
-| GPT-J 6B                     | 64         | 1         | 128          | 128           |                  3,630 |
-| GPT-J 6B                     | 64         | 1         | 128          | 2048          |                  1,859 |
-| GPT-J 6B                     | 32         | 1         | 2048         | 128           |                    616 |
-| GPT-J 6B                     | 32         | 1         | 2048         | 2048          |                    757 |
+| GPT-J 6B                     | 512        | 1         | 128          | 128           |                  7,992 |
+| GPT-J 6B                     | 64         | 1         | 128          | 2048          |                  1,874 |
+| GPT-J 6B                     | 32         | 1         | 2048         | 128           |                    693 |
+| GPT-J 6B                     | 32         | 1         | 2048         | 2048          |                    768 |
 |                              |            |           |              |               |                        |
-| LLaMA 7B                     | 64         | 1         | 128          | 128           |                  3,240 |
-| LLaMA 7B                     | 64         | 1         | 128          | 2048          |                  1,622 |
-| LLaMA 7B                     | 32         | 1         | 2048         | 128           |                    581 |
-| LLaMA 7B                     | 16         | 1         | 2048         | 2048          |                    531 |
+| Mistral 7B                   | 896        | 1         | 128          | 128           |                  9,679 |
+| Mistral 7B                   | 120        | 1         | 128          | 2048          |                  4,401 |
+| Mistral 7B                   | 84         | 1         | 2048         | 128           |                    979 |
+| Mistral 7B                   | 56         | 1         | 2048         | 2048          |                  1,721 |
+|                              |            |           |              |               |                        |
+| LLaMA 7B                     | 256        | 1         | 128          | 128           |                  5,954 |
+| LLaMA 7B                     | 64         | 1         | 128          | 2048          |                  1,654 |
+| LLaMA 7B                     | 32         | 1         | 2048         | 128           |                    579 |
+| LLaMA 7B                     | 16         | 1         | 2048         | 2048          |                    542 |
+|                              |            |           |              |               |                        |
+| LLaMA 70B                    | 256        | 2         | 128          | 128           |                    561 |
+| LLaMA 70B                    | 256        | 4         | 128          | 2048          |                    471 |
+| LLaMA 70B                    | 16         | 2         | 2048         | 128           |                     49 |
+| LLaMA 70B                    | 64         | 4         | 2048         | 2048          |                    177 |
+|                              |            |           |              |               |                        |
+| Falcon 180B                  | 512        | 8         | 128          | 128           |                    152 |
+| Falcon 180B                  | 256        | 8         | 128          | 2048          |                    200 |
+| Falcon 180B                  | 32         | 8         | 2048         | 128           |                     15 |
+| Falcon 180B                  | 16         | 8         | 2048         | 2048          |                     39 |
 
 
 ### A100 GPUs (FP16)
 
 | Model                        | Batch Size | TP (1)    | Input Length | Output Length | Throughput (out tok/s/GPU) |
 | :--------------------------- | :--------- | :-------- | :----------- | :------------ | ---------------------: |
-| GPT-J 6B                     | 512        | 1         | 128          | 128           |                  6,374 |
-| GPT-J 6B                     | 120        | 2         | 128          | 2048          |                  2,192 |
-| GPT-J 6B                     | 60         | 1         | 2048         | 128           |                    670 |
-| GPT-J 6B                     | 64         | 2         | 2048         | 2048          |                    903 |
+| GPT-J 6B                     | 512        | 1         | 128          | 128           |                  6,810 |
+| GPT-J 6B                     | 32         | 1         | 128          | 2048          |                  1,658 |
+| GPT-J 6B                     | 32         | 1         | 2048         | 128           |                    631 |
+| GPT-J 6B                     | 16         | 1         | 2048         | 2048          |                    692 |
 |                              |            |           |              |               |                        |
-| LLaMA 7B                     | 384        | 1         | 128          | 128           |                  5,586 |
-| LLaMA 7B                     | 60         | 1         | 128          | 2048          |                  1,928 |
-| LLaMA 7B                     | 52         | 1         | 2048         | 128           |                    591 |
-| LLaMA 7B                     | 64         | 2         | 2048         | 2048          |                    782 |
+| Mistral 7B                   | 896        | 1         | 128          | 128           |                  6,472 |
+| Mistral 7B                   | 120        | 1         | 128          | 2048          |                  3,812 |
+| Mistral 7B                   | 84         | 1         | 2048         | 128           |                    734 |
+| Mistral 7B                   | 56         | 1         | 2048         | 2048          |                  1,607 |
 |                              |            |           |              |               |                        |
-| LLaMA 70B                    | 1280       | 4         | 128          | 128           |                    670 |
-| LLaMA 70B                    | 240        | 4         | 128          | 2048          |                    525 |
-| LLaMA 70B                    | 120        | 4         | 2048         | 128           |                     79 |
+| LLaMA 7B                     | 256        | 1         | 128          | 128           |                  5,353 |
+| LLaMA 7B                     | 32         | 1         | 128          | 2048          |                  1,518 |
+| LLaMA 7B                     | 32         | 1         | 2048         | 128           |                    547 |
+| LLaMA 7B                     | 16         | 1         | 2048         | 2048          |                    613 |
 |                              |            |           |              |               |                        |
-| Falcon 180B                  | 1024       | 8         | 128          | 128           |                    232 |
-| Falcon 180B                  | 128        | 8         | 128          | 2048          |                    180 |
+| LLaMA 70B                    | 256        | 4         | 128          | 128           |                    565 |
+| LLaMA 70B                    | 128        | 4         | 128          | 2048          |                    595 |
+| LLaMA 70B                    | 32         | 4         | 2048         | 128           |                     66 |
+| LLaMA 70B                    | 32         | 4         | 2048         | 2048          |                    185 |
+|                              |            |           |              |               |                        |
+| Falcon 180B                  | 256        | 8         | 128          | 128           |                    193 |
+| Falcon 180B                  | 256        | 8         | 128          | 2048          |                    203 |
+| Falcon 180B                  | 16         | 8         | 2048         | 128           |                     20 |
 
 (1) TP stands for Tensor Parallelism.
 
 ## Low Latency<sup>**</sup>
 
-<sup> ** The following data is from TensorRT-LLM v0.5. Low latency numbers will soon be updated to reflect real time latency with infight-batching.</sup>
+All data was generated using version 0.8.0
+<sup> ** Low latency numbers will soon be updated to reflect real time latency with infight-batching.</sup>
 
 The below tables provide reference data at batch size 1 for first token
 latency, representing end-user's perceived latency for online streaming
 tasks.
 
+### H200 GPUs (FP8)
+
+| Model                        | Batch Size | TP (1)    | Input Length | 1st Token Latency (ms) |
+| :--------------------------- | :--------- | :-------- | :----------- | ---------------------: |
+| GPT-J 6B                     | 1          | 1         | 128          |                    5.2 |
+| GPT-J 6B                     | 1          | 1         | 2048         |                   23.6 |
+|                              |            |           |              |                        |
+| Mistral 7B                   | 1          | 1         | 128          |                    6.0 |
+| Mistral 7B                   | 1          | 1         | 2048         |                   31.8 |
+|                              |            |           |              |                        |
+| LLaMA 7B                     | 1          | 1         | 128          |                    5.8 |
+| LLaMA 7B                     | 1          | 1         | 2048         |                   30.1 |
+|                              |            |           |              |                        |
+| LLaMA 70B                    | 1          | 8         | 128          |                   16.0 |
+| LLaMA 70B                    | 1          | 8         | 2048         |                   78.8 |
+|                              |            |           |              |                        |
+| Falcon 180B                  | 1          | 8         | 128          |                   37.2 |
+| Falcon 180B                  | 1          | 8         | 2048         |                  120.8 |
+
 ### H100 GPUs (FP8)
 
 | Model                        | Batch Size | TP (1)    | Input Length | 1st Token Latency (ms) |
 | :--------------------------- | :--------- | :-------- | :----------- | ---------------------: |
-| GPT-J 6B                     | 1          | 1         | 128          |                      7 |
-| GPT-J 6B                     | 1          | 1         | 2048         |                     29 |
+| GPT-J 6B                     | 1          | 1         | 128          |                    5.7 |
+| GPT-J 6B                     | 1          | 1         | 2048         |                   23.8 |
 |                              |            |           |              |                        |
-| LLaMA 7B                     | 1          | 1         | 128          |                      7 |
-| LLaMA 7B                     | 1          | 1         | 2048         |                     36 |
+| Mistral 7B                   | 1          | 1         | 128          |                    6.6 |
+| Mistral 7B                   | 1          | 1         | 2048         |                   32.6 |
 |                              |            |           |              |                        |
-| LLaMA 70B                    | 1          | 4         | 128          |                     26 |
-| LLaMA 70B                    | 1          | 4         | 2048         |                    109 |
+| LLaMA 7B                     | 1          | 1         | 128          |                    6.4 |
+| LLaMA 7B                     | 1          | 1         | 2048         |                   31.0 |
 |                              |            |           |              |                        |
-| Falcon 180B                  | 1          | 8         | 128          |                     27 |
-| Falcon 180B                  | 1          | 8         | 2048         |                    205 |
+| LLaMA 70B                    | 1          | 8         | 128          |                   17.0 |
+| LLaMA 70B                    | 1          | 8         | 2048         |                   84.4 |
+|                              |            |           |              |                        |
+| Falcon 180B                  | 1          | 8         | 128          |                   39.7 |
+| Falcon 180B                  | 1          | 8         | 2048         |                  128.0 |
 
 ### L40S GPUs (FP8)
 
 | Model                        | Batch Size | TP (1)    | Input Length | 1st Token Latency (ms) |
 | :--------------------------- | :--------- | :-------- | :----------- | ---------------------: |
-| GPT-J 6B                     | 1          | 1         | 128          |                     12 |
-| GPT-J 6B                     | 1          | 1         | 2048         |                     71 |
+| GPT-J 6B                     | 1          | 1         | 128          |                   12.6 |
+| GPT-J 6B                     | 1          | 1         | 2048         |                   61.2 |
 |                              |            |           |              |                        |
-| LLaMA 7B                     | 1          | 1         | 128          |                     14 |
-| LLaMA 7B                     | 1          | 1         | 2048         |                     73 |
+| Mistral 7B                   | 1          | 1         | 128          |                   15.5 |
+| Mistral 7B                   | 1          | 1         | 2048         |                   84.3 |
+|                              |            |           |              |                        |
+| LLaMA 7B                     | 1          | 1         | 128          |                   14.3 |
+| LLaMA 7B                     | 1          | 1         | 2048         |                   79.0 |
+|                              |            |           |              |                        |
+| LLaMA 70B                    | 1          | 8         | 128          |                   70.9 |
+| LLaMA 70B                    | 1          | 8         | 2048         |                  708.7 |
+|                              |            |           |              |                        |
+| Falcon 180B                  | 1          | 8         | 128          |                   93.4 |
+| Falcon 180B                  | 1          | 8         | 2048         |                  769.8 |
 
 ### A100 GPUs (FP16)
 
 | Model                        | Batch Size | TP (1)    | Input Length | 1st Token Latency (ms) |
 | :--------------------------- | :--------- | :-------- | :----------- | ---------------------: |
-| GPT-J 6B                     | 1          | 1         | 128          |                     12 |
-| GPT-J 6B                     | 1          | 1         | 2048         |                    129 |
+| GPT-J 6B                     | 1          | 1         | 128          |                   14.1 |
+| GPT-J 6B                     | 1          | 1         | 2048         |                  102.8 |
 |                              |            |           |              |                        |
-| LLaMA 7B                     | 1          | 1         | 128          |                     16 |
-| LLaMA 7B                     | 1          | 1         | 2048         |                    133 |
+| Mistral 7B                   | 1          | 1         | 128          |                   16.4 |
+| Mistral 7B                   | 1          | 1         | 2048         |                  128.7 |
 |                              |            |           |              |                        |
-| LLaMA 70B                    | 1          | 4         | 128          |                     47 |
-| LLaMA 70B                    | 1          | 4         | 2048         |                    377 |
+| LLaMA 7B                     | 1          | 1         | 128          |                   16.1 |
+| LLaMA 7B                     | 1          | 1         | 2048         |                  120.5 |
 |                              |            |           |              |                        |
-| Falcon 180B                  | 1          | 8         | 128          |                     61 |
-| Falcon 180B                  | 1          | 8         | 2048         |                    509 |
+| LLaMA 70B                    | 1          | 8         | 128          |                   35.6 |
+| LLaMA 70B                    | 1          | 8         | 2048         |                  235.1 |
+|                              |            |           |              |                        |
+| Falcon 180B                  | 1          | 8         | 128          |                   76.5 |
+| Falcon 180B                  | 1          | 8         | 2048         |                  463.0 |
 
 (1) TP stands for Tensor Parallelism.
 
@@ -476,7 +568,7 @@ Prepare a config json file `/tmp/engines/falcon/180b/ckpt_config.json`:
 ```json
 {
     "architecture": "FalconForCausalLM",
-    "dtype": "float16",
+    "dtype": "bfloat16",
     "num_hidden_layers": 80,
     "num_attention_heads": 232,
     "num_key_value_heads": 8,
@@ -523,8 +615,8 @@ do
 		--workers 8 \
 		--remove_input_padding enable \
 		--context_fmha enable \
-		--gpt_attention_plugin float16 \
-		--gemm_plugin float16 \
+		--gpt_attention_plugin bfloat16 \
+		--gemm_plugin bfloat16 \
 		--paged_kv_cache enable \
 		--max_batch_size $batch_size \
 		--max_input_len $isl \

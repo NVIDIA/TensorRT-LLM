@@ -149,7 +149,7 @@ sh gptq_convert.sh
 
 ### 3. Convert weights from HF Transformers to TensorRT-LLM format
 
-To apply groupwise quantization GPTQ, addition commandline flags need to be passed to `convert_checkpoint.py`:
+To apply groupwise quantization GPTQ, addition command-line flags need to be passed to `convert_checkpoint.py`:
 Here `--ammo_quant_ckpt_path` flag specifies the output safetensors of `gptq_convert.sh` script.
 
 ```bash
@@ -173,7 +173,7 @@ python3 convert_checkpoint.py --model_dir ./gptneox_model \
 
 ### 4. Build TensorRT engine(s)
 
-The command to build TensorRT engines to apply GPTQ are almost no change:
+The command to build TensorRT engines to apply GPTQ does not change:
 
 ```bash
 # Single GPU
@@ -197,7 +197,7 @@ trtllm-build --checkpoint_dir ./gptneox/20B/trt_ckpt/int4_gptq/2-gpu/ \
 
 ### 5. Summarization using the GPT-NeoX model
 
-The command to run summarization with GPTQ qunatized model are also no change:
+The command to run summarization with GPTQ quantized model also does not change:
 
 ```bash
 # Single GPU

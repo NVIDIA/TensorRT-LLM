@@ -185,8 +185,8 @@ template <typename InputType>
 GptJsonConfig parseJson(InputType&& input)
 {
     auto constexpr allowExceptions = true;
-    auto constexpr ingoreComments = true;
-    auto const json = nlohmann::json::parse(std::forward<InputType>(input), nullptr, allowExceptions, ingoreComments);
+    auto constexpr ignoreComments = true;
+    auto const json = nlohmann::json::parse(std::forward<InputType>(input), nullptr, allowExceptions, ignoreComments);
 
     auto const engineVersion = parseJsonFieldOr(json, "version", std::string("none"));
 

@@ -3,8 +3,11 @@ import os
 import shutil
 from time import time
 
-import tensorrt as trt
+# isort: off
 import torch
+import tensorrt as trt
+# isort: on
+
 from PIL import Image
 from transformers import (AutoProcessor, Blip2ForConditionalGeneration,
                           Blip2Processor, LlavaForConditionalGeneration,

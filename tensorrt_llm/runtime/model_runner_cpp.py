@@ -120,7 +120,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 be larger than the engine's max_beam_width; otherwise, the engine's max_beam_width
                 will be used.
             max_attention_window_size (int):
-                The attention window size that controls the sliding window attention / cyclic kv cache behaviour.
+                The attention window size that controls the sliding window attention / cyclic kv cache behavior.
             sink_token_length (int) :
                 The sink token length, default=0.
             free_gpu_memory_fraction (float) :

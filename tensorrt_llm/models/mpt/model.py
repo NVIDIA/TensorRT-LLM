@@ -40,8 +40,10 @@ class MPTDecoderLayer(Module):
                                          eps=layernorm_epsilon,
                                          dtype=dtype)
 
+        layers_range = config.mapping.pp_layers(config.num_hidden_layers)
+        local_layer_idx = layer_idx - layers_range[0]
         self.attention = Attention(
-            layer_idx=layer_idx,
+            local_layer_idx=local_layer_idx,
             hidden_size=hidden_size,
             num_attention_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -53,7 +55,8 @@ class MPTDecoderLayer(Module):
             bias=config.bias,
             position_embedding_type=PositionEmbeddingType.alibi,
             quant_mode=config.quant_mode,
-            clip_qkv=config.clip_qkv)
+            clip_qkv=config.clip_qkv,
+            alibi_bias_max=config.alibi_bias_max)
 
         self.mlp = MLP(hidden_size=hidden_size,
                        ffn_hidden_size=hidden_size * 4,
@@ -177,3 +180,4 @@ class MPTForCausalLM(DecoderModelForCausalLM):
     def check_config(self, config):
         config.set_if_not_exist('bias', False)
         config.set_if_not_exist('clip_qkv', None)
+        config.set_if_not_exist('alibi_bias_max', 8)

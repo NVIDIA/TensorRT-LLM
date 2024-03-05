@@ -14,22 +14,18 @@
 # limitations under the License.
 
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple, Union
+from typing import Optional, Tuple
 
 # isort: off
-import torch
 import tensorrt as trt
 # isort: on
 
 from . import profiler
-from ._utils import mpi_rank
 from .builder import Builder
 from .mapping import Mapping
 from .network import net_guard
 from .plugin.plugin import PluginConfig
 from .quantization.mode import QuantMode
-from .runtime import (GenerationSession, LoraManager, ModelRunner,
-                      SamplingConfig, model_runner)
 
 
 class TopModelMixin:
@@ -177,180 +173,6 @@ class TopModelMixin:
         self._builder_config = builder_config
         profiler.stop("Network construction and build engine")
         return engine, builder_config
-
-    def _generate(self,
-                  input_text: Union[List[str], "torch.Tensor"],
-                  max_new_tokens: Optional[str] = None,
-                  sampling_config: Optional["SamplingConfig"] = None,
-                  tokenizer_dir: Optional[str] = None,
-                  engine_dir: Optional[str] = None,
-                  lora_uids: Optional[list] = None,
-                  prompt_tasks: Optional[List[int]] = None,
-                  streaming: bool = False,
-                  stopping_criteria: Optional["StoppingCriteria"] = None,
-                  logits_processor: Optional["LogitsProcessor"] = None,
-                  **kwargs) -> Iterable[Tuple[str, str]]:
-        '''
-        Note: this is private for test purpose only, use higher level LLM class for generation.
-        Parameters:
-            input_text_or_ids:
-            max_new_tokens: when it's None, use the output_len specified in to_trt
-            tokenizer_dir: the directory contains the tokenizer config
-            engine_dir: the directory contains the engine, optional. When it's none, user much call to_trt to compile the engine firstly.
-            lora_uids: list of integers with length as batch size, each integer is lora id for one input sequence
-                When lora_dir and lora_uid is not None, the use_lora() function must be called before to_trt() function builds the engine.
-            prompt_tasks: Optional[List[int]]
-                prompt tuning tasks for each input sequence
-            TODO: add all other features supported by current runtime APIs.
-        '''
-
-        # create and cache tokenizer and runner
-        if getattr(self, 'tokenizer', None) is None:
-            from transformers import AutoTokenizer
-            tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir,
-                                                      legacy=False,
-                                                      padding_side='left',
-                                                      truncation_side='left',
-                                                      trust_remote_code=True,
-                                                      use_fast=True)
-            self.tokenizer = tokenizer
-
-        if getattr(self, 'runner', None) is None:
-            rank = mpi_rank()
-            if engine_dir is not None:  # read from the engine_dir, use ModelRunner
-                assert Path(engine_dir).exists(
-                ), f"Invalid engine_dir argument, the path does not exist {engine_dir}"
-                model_config, other_config = model_runner.read_config(
-                    Path(engine_dir) / "config.json")
-                self.runner = ModelRunner.from_dir(
-                    engine_dir=engine_dir,
-                    rank=rank,
-                    lora_dir=getattr(self, 'lora_dir', None),
-                    lora_ckpt_source=getattr(self, "lora_ckpt_source", 'hf'))
-            else:
-                assert hasattr(
-                    self, '_trt_engine'
-                ), f"must call to_trt(...) function firstly to build model to trt engine"
-                assert isinstance(
-                    self._trt_engine, trt.IHostMemory
-                ), f"Engine type is unexpected, got {type(self._trt_engine)}"
-                assert hasattr(
-                    self, '_builder_config'
-                ), f"Internal error: to_trt() shall set self._builder_config"
-                model_config, other_config = model_runner._builder_to_model_config(
-                    self._builder_config.to_dict())
-                world_size = other_config.get('world_size')
-                tp_size = other_config.get('tp_size')
-                pp_size = other_config.get('pp_size')
-                max_batch_size = other_config.get('max_batch_size')
-                max_input_len = other_config.get('max_input_len')
-                max_output_len = other_config.get('max_output_len')
-                max_beam_width = other_config.get('max_beam_width')
-                runtime_mapping = Mapping(world_size=world_size,
-                                          rank=rank,
-                                          tp_size=tp_size,
-                                          pp_size=pp_size)
-                session = GenerationSession(model_config, self._trt_engine,
-                                            runtime_mapping)
-                lora_manager = None
-                if session.use_lora_plugin:
-                    assert getattr(self.lora_dir, None) is not None, \
-                        "lora_dir should not be None for engine built with lora_plugin enabled."
-                    lora_manager = LoraManager()
-                    lora_manager.load_from_ckpt(
-                        model_dir=self.lora_dir,
-                        model_config=model_config,
-                        runtime_mapping=runtime_mapping,
-                        ckpt_source=self.lora_ckpt_source)
-                self.runner = ModelRunner(
-                    session=session,
-                    max_batch_size=max_batch_size,
-                    max_input_len=max_input_len,
-                    max_seq_len=max_input_len + max_output_len,
-                    max_beam_width=max_beam_width,
-                    lora_manager=lora_manager,
-                )
-        assert self.runner is not None
-
-        tokenizer = self.tokenizer
-        if sampling_config is None:
-            sampling_config = SamplingConfig(
-                end_id=tokenizer.eos_token_id,
-                pad_id=tokenizer.eos_token_id
-                if tokenizer.pad_token_id is None else tokenizer.pad_token_id,
-                max_new_tokens=max_new_tokens)
-            sampling_config.output_sequence_lengths = True
-            sampling_config.return_dict = True
-        assert not isinstance(
-            input_text, torch.Tensor), "Only input string is supported for now"
-
-        def generate_on_batch(batch_input_ids: List[torch.Tensor],
-                              batch_input_text: List[str]):
-            batch_input_ids = [
-                torch.tensor(x, dtype=torch.int32) for x in batch_input_ids
-            ]  # List[torch.Tensor(seq)]
-
-            assert len(batch_input_ids) <= other_config['max_batch_size'], \
-                f"Can not run batch size larger than {other_config['max_batch_size']}, got {len(batch_input_ids)}"
-            # generate
-            outputs = self.runner.generate(batch_input_ids,
-                                           sampling_config,
-                                           prompt_table_path=getattr(
-                                               self, "prompt_table_path", None),
-                                           prompt_tasks=prompt_tasks,
-                                           lora_uids=lora_uids,
-                                           streaming=streaming,
-                                           stopping_criteria=stopping_criteria,
-                                           logits_processor=logits_processor)
-
-            # parse and print output
-            output_ids = outputs['output_ids']
-            sequence_lengths = outputs['sequence_lengths']
-
-            batch_size, num_beams, max_len = output_ids.size()
-            input_lengths = [x.size(0) for x in batch_input_ids]
-            assert num_beams == 1, "Support beam search later"
-
-            batched_output = []
-            for batch_idx in range(batch_size):
-                for beam in range(num_beams):
-                    inputs = output_ids[batch_idx][
-                        0][:input_lengths[batch_idx]].tolist()
-                    input_text_echo = tokenizer.decode(
-                        inputs)  # output_ids shall contain the input ids
-
-                    output_begin = input_lengths[batch_idx]
-                    output_end = sequence_lengths[batch_idx][beam]
-                    outputs = output_ids[batch_idx][beam][
-                        output_begin:output_end].tolist()
-
-                    output_text = tokenizer.decode(outputs)
-                    assert input_text_echo == "<s> " + batch_input_text[
-                        batch_idx], f"Got {input_text_echo}, expect: {batch_input_text[batch_idx]}"
-                    batched_output.append(
-                        (batch_input_text[batch_idx], output_text))
-            return batched_output
-
-        # prepare inputs
-        batch_input_ids = []
-        batch_input_text = []
-        for inp in input_text:
-            # we'd like the avoid the padding and needs to know each seq's length, so tokenize them one by one
-            input_ids = tokenizer.encode(
-                inp, truncation=True, max_length=other_config['max_input_len'])
-            batch_input_ids.append(input_ids)
-            batch_input_text.append(inp)
-            # TODO: handling batching better, use batch size for demo purpose for now.
-            GEN_BATCH_SIZE = 1
-            if len(batch_input_ids) >= GEN_BATCH_SIZE:
-                batch_io_pairs = generate_on_batch(batch_input_ids,
-                                                   batch_input_text)
-                # return text to user
-                for i, o in batch_io_pairs:
-                    yield i, o
-                # clear buffer to next batch
-                batch_input_ids = []
-                batch_input_text = []
 
     def save(self, engine_dir):
         ''' Save the engine and build config to given directory

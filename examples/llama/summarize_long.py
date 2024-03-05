@@ -43,7 +43,7 @@ def parse_args():
         type=int,
         default=4096,
         help=
-        'The attention window size that controls the sliding window attention / cyclic kv cache behaviour'
+        'The attention window size that controls the sliding window attention / cyclic kv cache behavior'
     )
     parser.add_argument(
         '--max_input_len',

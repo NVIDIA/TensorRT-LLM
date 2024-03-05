@@ -82,10 +82,6 @@ class TestPhi(unittest.TestCase):
             'vocab_size': hf_config.vocab_size,
             'max_position_embeddings': hf_config.max_position_embeddings,
             'hidden_act': hf_config.hidden_act,
-            'quantization': {
-                'use_weight_only': False,
-                'weight_only_precision': False,
-            },
             'mapping': {
                 'world_size': tensor_parallel,
                 'tp_size': tensor_parallel,

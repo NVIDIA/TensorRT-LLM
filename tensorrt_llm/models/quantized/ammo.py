@@ -28,7 +28,7 @@ from ...logger import logger
 
 
 def _register_falcon_linears(model):
-    """Register Falcon linear modules as Quantiation.
+    """Register Falcon linear modules as Quantization.
 
     As falcon models could use remote code, which will be loaded dynamically,
     to build their model. Therefore, we need to register the linear on the fly

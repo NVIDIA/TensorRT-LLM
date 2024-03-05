@@ -99,18 +99,18 @@ struct OutputConfig
 class SpeculativeDecodingConfig
 {
 public:
-    explicit SpeculativeDecodingConfig(VecTokens tokens, std::optional<TensorPtr> logits = std::nullopt,
+    explicit SpeculativeDecodingConfig(VecTokens tokens, std::optional<Tensor> logits = std::nullopt,
         std::optional<FloatType> acceptanceThreshold = std::nullopt);
 
     ~SpeculativeDecodingConfig();
 
     [[nodiscard]] VecTokens getTokens() const;
-    [[nodiscard]] std::optional<TensorPtr> getLogits() const;
+    [[nodiscard]] std::optional<Tensor> getLogits() const;
     [[nodiscard]] std::optional<FloatType> getAcceptanceThreshold() const;
 
 private:
     VecTokens mTokens;
-    std::optional<TensorPtr> mLogits;
+    std::optional<Tensor> mLogits;
     std::optional<FloatType> mAcceptanceThreshold;
 };
 
@@ -122,28 +122,28 @@ public:
     /// @param embeddingTable  The prompt embedding table. Data type must match model weights. Shape [vocabSize,
     /// hiddenSize]
     /// @param vocabSize
-    PromptTuningConfig(TensorPtr embeddingTable);
+    PromptTuningConfig(Tensor embeddingTable);
     ~PromptTuningConfig();
 
-    [[nodiscard]] TensorPtr getEmbeddingTable() const;
+    [[nodiscard]] Tensor getEmbeddingTable() const;
 
 private:
-    TensorPtr mEmbeddingTable;
+    Tensor mEmbeddingTable;
 };
 
 /// @brief Configuration for LoRA
 class LoraConfig
 {
 public:
-    LoraConfig(TensorPtr weights, TensorPtr config);
+    LoraConfig(Tensor weights, Tensor config);
     ~LoraConfig();
 
-    [[nodiscard]] TensorPtr getWeights() const;
-    [[nodiscard]] TensorPtr getConfig() const;
+    [[nodiscard]] Tensor getWeights() const;
+    [[nodiscard]] Tensor getConfig() const;
 
 private:
-    TensorPtr mWeights;
-    TensorPtr mConfig;
+    Tensor mWeights;
+    Tensor mConfig;
 };
 
 /// @brief A class that holds information about the request
@@ -169,7 +169,7 @@ public:
         std::optional<SizeType> endId = std::nullopt, std::optional<SizeType> padId = std::nullopt,
         std::optional<std::list<VecTokens>> badWords = std::nullopt,
         std::optional<std::list<VecTokens>> stopWords = std::nullopt,
-        std::optional<TensorPtr> embeddingBias = std::nullopt,
+        std::optional<Tensor> embeddingBias = std::nullopt,
         std::optional<SpeculativeDecodingConfig> speculativeDecodingConfig = std::nullopt,
         std::optional<PromptTuningConfig> pTuningConfig = std::nullopt,
         std::optional<LoraConfig> loraConfig = std::nullopt);
@@ -189,7 +189,7 @@ public:
     [[nodiscard]] std::optional<SizeType> getPadId() const;
     [[nodiscard]] std::optional<std::list<VecTokens>> getBadWords() const;
     [[nodiscard]] std::optional<std::list<VecTokens>> getStopWords() const;
-    [[nodiscard]] std::optional<TensorPtr> getEmbeddingBias() const;
+    [[nodiscard]] std::optional<Tensor> getEmbeddingBias() const;
     [[nodiscard]] std::optional<SpeculativeDecodingConfig> getSpeculativeDecodingConfig() const;
     [[nodiscard]] std::optional<PromptTuningConfig> getPromptTuningConfig() const;
     [[nodiscard]] std::optional<LoraConfig> getLoraConfig() const;
@@ -201,7 +201,7 @@ public:
     void setPadId(SizeType padId);
     void setBadWords(std::list<VecTokens> badWords);
     void setStopWords(std::list<VecTokens> stopWords);
-    void setEmbeddingBias(TensorPtr);
+    void setEmbeddingBias(Tensor);
     void setSpeculativeDecodingConfig(SpeculativeDecodingConfig specDecodingConfig);
     void setPromptTuningConfig(PromptTuningConfig pTuningConfig);
     void setLoraConfig(LoraConfig loraConfig);
@@ -222,8 +222,8 @@ struct Result
 
     std::optional<VecLogProbs> cumLogProbs;           // [beamSize]
     std::optional<std::vector<VecLogProbs>> logProbs; // [beamSize, seqLen]
-    std::optional<TensorPtr> contextLogits;           // [promptLen, vocab_size_padded]
-    std::optional<TensorPtr> generationLogits;        // [beam_size, mMaxNewTokens, vocab_size_padded]
+    std::optional<Tensor> contextLogits;              // [promptLen, vocab_size_padded]
+    std::optional<Tensor> generationLogits;           // [beam_size, mMaxNewTokens, vocab_size_padded]
 };
 
 /// @brief Class that holds either an error or a result

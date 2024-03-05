@@ -157,6 +157,7 @@ class _Runtime(object):
     cuda_graph_instances: List[cudart.cudaGraphExec_t]
 
     def __init__(self, engine_buffer, mapping: Mapping):
+        self.address = None
         self.__prepare(mapping, engine_buffer)
 
     def _serialize_engine(self) -> trt.IHostMemory:
@@ -284,7 +285,8 @@ class _Runtime(object):
 
     def __del__(self):
         try:
-            cudart.cudaFree(self.address)  # FIXME: cudaFree is None??
+            if self.address is not None:
+                cudart.cudaFree(self.address)
         except TypeError:
             pass
 
@@ -620,8 +622,11 @@ class GenerationSession(object):
                 ]
 
             expected_tensor_names += [
-                'encoder_output', 'encoder_input_lengths',
-                'encoder_max_input_length'
+                'encoder_output',
+                'encoder_input_lengths',
+                'encoder_max_input_length',
+                'cross_kv_cache_gen',
+                'cross_qkv_reuse',
             ]
 
         if self.mapping.tp_size > 1 and model_config.use_custom_all_reduce:
@@ -1085,6 +1090,8 @@ class GenerationSession(object):
             self.beam_hyps_num_beams = None
             self.beam_hyps_is_done = None
 
+        self.cross_qkv_reuse = None
+
     def _tensor_dtype(self, name):
         # return torch dtype given tensor name for convenience
         dtype = trt_dtype_to_torch(self.runtime.engine.get_tensor_dtype(name))
@@ -1403,6 +1410,21 @@ class GenerationSession(object):
             add_tensor(position_ids, 'position_ids')
 
         if self.cross_attention:
+            # in context phase, need to generate cross kv cache, set to True
+            add_tensor(torch.ones(1, dtype=torch.bool, device=self.device),
+                       'cross_kv_cache_gen')
+            if self.cross_qkv_reuse is None:
+                # see Attention's self.qkv output dim
+                cross_qkv_out_dim = self.mapping.tp_size * self.num_heads * self.head_size + (
+                    2 * self.mapping.tp_size * self.num_heads_kv *
+                    self.head_size)
+                cross_qkv_shape = encoder_output.shape[:-1] + (
+                    cross_qkv_out_dim, )
+                cross_qkv_reuse = torch.empty(cross_qkv_shape,
+                                              dtype=encoder_output.dtype,
+                                              device=encoder_output.device)
+                self.cross_qkv_reuse = cross_qkv_reuse
+            add_tensor(self.cross_qkv_reuse, 'cross_qkv_reuse')
             add_tensor(encoder_output, 'encoder_output')
             add_tensor(encoder_input_lengths, 'encoder_input_lengths')
             add_tensor(self.buffer['encoder_max_input_length'],
@@ -1625,19 +1647,11 @@ class GenerationSession(object):
             add_tensor(position_ids, 'position_ids')
 
         if self.cross_attention:
-            if self.use_gpt_attention_plugin:
-                # hack: disable (or minimize) cross qkv computation at generation phase
-                # TODO: enable [0,0,.] true zero tensor input; or use IfConditionalLayer
-                encoder_output_shape = [1, encoder_output.shape[-1]
-                                        ] if self.remove_input_padding else [
-                                            1, 1, encoder_output.shape[-1]
-                                        ]  # encoder_output.shape
-            else:
-                # OOTB path doesn't have kv cache for now, so this encoder_output is
-                # a must-have input. We just use the encoder_output
-                encoder_output_shape = encoder_output.shape
-            add_tensor_with_shape(encoder_output, 'encoder_output',
-                                  encoder_output_shape)
+            # in generation phase, cross kv cache is already filled during context phase, set to False
+            add_tensor(torch.zeros(1, dtype=torch.bool, device=self.device),
+                       'cross_kv_cache_gen')
+            add_tensor(self.cross_qkv_reuse, 'cross_qkv_reuse')
+            add_tensor(encoder_output, 'encoder_output')
             add_tensor(encoder_input_lengths, 'encoder_input_lengths')
             add_tensor(self.buffer['encoder_max_input_length'],
                        'encoder_max_input_length')
@@ -2250,13 +2264,14 @@ class GenerationSession(object):
             if step == 0 and self.gather_context_logits:
                 assert not self.is_medusa_mode
                 context_logits = self.buffer['logits'].detach().clone()
+                # gather last token of context
                 if self.remove_input_padding:
                     # reshape self.buffer['logits'] from [bs, max_context_length, vocab]
                     # to [1, bs * max_context_length, vocab]
                     # Note that the data are put in the buffer without padding although
                     # the allocated buffer has padding.
                     self.buffer['logits'] = self.buffer['logits'].reshape(
-                        [1, -1, self.buffer['logits'].shape[-1]])
+                        [1, -1, self.vocab_size_padded])
                     self.buffer['logits'] = torch.index_select(
                         self.buffer['logits'], 1,
                         last_token_ids - 1).view(batch_size,
@@ -2297,6 +2312,11 @@ class GenerationSession(object):
             if self.mapping.is_last_pp_rank():
                 self.buffer['logits'] = _tile_beam_width(
                     self.buffer['logits'], beam_width)
+
+        generation_logits = None
+        if self.mapping.is_last_pp_rank():
+            if self.gather_generation_logits:
+                generation_logits = self.buffer['logits'].detach().clone()
 
         # Initialize sequence_lengths (no paddings) for the generation phase.
         if step == 0:
@@ -2470,7 +2490,7 @@ class GenerationSession(object):
                     for name, tensor in next_step_tensors.items()
                 }
 
-        return should_stop, next_step_tensors, tasks, context_lengths, host_context_lengths, attention_mask, context_logits, encoder_input_lengths
+        return should_stop, next_step_tensors, tasks, context_lengths, host_context_lengths, attention_mask, context_logits, generation_logits, encoder_input_lengths
 
     def dump_debug_buffers(self, step: int) -> None:
         if self.debug_tensors_to_save is not None:
@@ -2526,8 +2546,8 @@ class GenerationSession(object):
         kv_cache_block_pointers = []
         host_kv_cache_block_pointers = []
         attention_mask = None
-        context_logits = None
-        generation_logits = []
+        outputs_context_logits = None
+        outputs_generation_logits = []
 
         def get_outputs_dict(output_ids):
             outputs = {}
@@ -2541,9 +2561,9 @@ class GenerationSession(object):
                     'sequence_lengths'] = self.sequence_length_buffer.reshape(
                         [batch_size, beam_width])
             if self.gather_context_logits:
-                outputs['context_logits'] = context_logits
+                outputs['context_logits'] = outputs_context_logits
             if self.gather_generation_logits:
-                outputs['generation_logits'] = generation_logits
+                outputs['generation_logits'] = outputs_generation_logits
             if self.is_medusa_mode:
                 outputs['medusa_output_tokens'] = self.medusa_output_tokens
                 outputs['accept_lengths'] = self.accept_lengths
@@ -2563,10 +2583,9 @@ class GenerationSession(object):
                                                     step_count)
 
         next_step_tensors = None
-        last_token_ids = torch.cumsum(context_lengths.clone().detach(),
-                                      dim=0).int()
         for step in range(0, self.max_new_tokens):
-            should_stop, next_step_tensors, tasks, context_lengths, host_context_lengths, attention_mask, logits, encoder_input_lengths = self.handle_per_step(
+
+            should_stop, next_step_tensors, tasks, context_lengths, host_context_lengths, attention_mask, context_logits, generation_logits, encoder_input_lengths = self.handle_per_step(
                 cache_indirections, step, batch_size, max_context_length,
                 beam_width, input_ids, hidden_states, scfg,
                 kv_cache_block_pointers, host_kv_cache_block_pointers,
@@ -2584,35 +2603,10 @@ class GenerationSession(object):
                 generation_phase_step_count = generation_phase_step_count + 1
 
             if self.mapping.is_last_pp_rank():
-                if step == 0:
-                    if self.gather_context_logits:
-                        context_logits = logits.clone().detach()
-                    if self.gather_generation_logits:
-                        if self.gather_context_logits:
-                            # gather last token of context
-                            vocab_size_padded = context_logits.shape[-1]
-                            contex_logits_reshape = context_logits.clone(
-                            ).detach().reshape([1, -1, vocab_size_padded])
-                            contex_last_token_logits = torch.index_select(
-                                contex_logits_reshape, 1,
-                                last_token_ids - 1).view(
-                                    batch_size, vocab_size_padded
-                                )  # [batch_size, vocab_size_padded]
-                            # Repate beam_width times
-                            contex_last_token_logits = contex_last_token_logits.repeat(
-                                1, beam_width
-                            ).reshape(
-                                batch_size * beam_width, vocab_size_padded
-                            )  # [batch_size * beam_width, vocab_size_padded]
-                            generation_logits.append(
-                                contex_last_token_logits.clone().detach())
-                        else:
-                            # If not gather context, just append
-                            generation_logits.append(logits.clone().detach())
-                else:
-                    if self.gather_generation_logits:
-                        l = next_step_tensors['logits'].to_torch()
-                        generation_logits.append(l.clone().detach())
+                if step == 0 and self.gather_context_logits:
+                    outputs_context_logits = context_logits
+                if self.gather_generation_logits:
+                    outputs_generation_logits.append(generation_logits)
 
             if should_stop is not None and should_stop.item():
                 profile_fn(benchmark_profiler, generation_phase_step_count)
@@ -2631,9 +2625,9 @@ class GenerationSession(object):
                 elif self.mapping.is_last_pp_rank():
                     outputs = {}
                     if self.gather_context_logits:
-                        outputs['context_logits'] = context_logits
+                        outputs['context_logits'] = outputs_context_logits
                     if self.gather_generation_logits:
-                        outputs['generation_logits'] = generation_logits
+                        outputs['generation_logits'] = outputs_generation_logits
                     return outputs
                 else:
                     return None
@@ -2652,9 +2646,9 @@ class GenerationSession(object):
         elif self.mapping.is_last_pp_rank():
             outputs = {}
             if self.gather_context_logits:
-                outputs['context_logits'] = context_logits
+                outputs['context_logits'] = outputs_context_logits
             if self.gather_generation_logits:
-                outputs['generation_logits'] = generation_logits
+                outputs['generation_logits'] = outputs_generation_logits
             return outputs
         else:
             return None
@@ -2689,7 +2683,7 @@ class GenerationSession(object):
         kv_cache_block_pointers = []
         host_kv_cache_block_pointers = []
         attention_mask = None
-        context_logits = None
+        outputs_context_logits = None
 
         def get_outputs_dict(output_ids):
             outputs = {}
@@ -2699,12 +2693,13 @@ class GenerationSession(object):
                     'sequence_lengths'] = self.sequence_length_buffer.reshape(
                         [batch_size, beam_width])
             if self.gather_context_logits:
-                outputs['context_logits'] = context_logits
+                outputs['context_logits'] = outputs_context_logits
             return outputs
 
         next_step_tensors = None
         for step in range(0, self.max_new_tokens):
-            should_stop, next_step_tensors, tasks, context_lengths, host_context_lengths, attention_mask, logits, encoder_input_lengths = self.handle_per_step(
+
+            should_stop, next_step_tensors, tasks, context_lengths, host_context_lengths, attention_mask, context_logits, generation_logits, encoder_input_lengths = self.handle_per_step(
                 cache_indirections, step, batch_size, max_context_length,
                 beam_width, input_ids, hidden_states, scfg,
                 kv_cache_block_pointers, host_kv_cache_block_pointers,
@@ -2715,7 +2710,7 @@ class GenerationSession(object):
                 bad_words_data, no_repeat_ngram_size, encoder_output,
                 encoder_input_lengths, stopping_criteria, logits_processor)
             if step == 0:
-                context_logits = logits
+                outputs_context_logits = context_logits
             if should_stop is not None:
 
                 final_output_ids = self.finalize_decoder(context_lengths,
@@ -3294,8 +3289,8 @@ class MambaLMHeadModelGenerationSession(GenerationSession):
 
         ssm_state_shape = (
             batch_size,
-            self.mamba_d_inner,
             self.mamba_d_state,
+            self.mamba_d_inner,
         )
 
         for i in range(self.first_layer, self.last_layer):

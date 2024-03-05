@@ -18,7 +18,8 @@
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
 
-# This can happen when not building for Torch
+# The Python executable will only be defined if building with Torch support. If
+# not, we need to find it here.
 if(NOT Python3_EXECUTABLE)
   find_package(
     Python3
@@ -57,17 +58,13 @@ endif()
 
 file(GLOB_RECURSE CU_INSTANTIATIONS ${CMAKE_CURRENT_BINARY_DIR}/*.cu)
 
-add_library(cutlass_src_pre_hopper STATIC ${SRC_CPP} ${SRC_CU})
-set_property(TARGET cutlass_src_pre_hopper PROPERTY POSITION_INDEPENDENT_CODE
-                                                    ON)
-set_property(TARGET cutlass_src_pre_hopper PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS
-                                                    ON)
+add_library(cutlass2_src STATIC ${SRC_CPP} ${SRC_CU})
+set_property(TARGET cutlass2_src PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_property(TARGET cutlass2_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
-add_library(cutlass_src_hopper STATIC ${CU_INSTANTIATIONS})
-set_property(TARGET cutlass_src_hopper PROPERTY POSITION_INDEPENDENT_CODE ON)
-set_property(TARGET cutlass_src_hopper PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-
-add_dependencies(cutlass_src_hopper cutlass_src_pre_hopper)
+add_library(cutlass3_src STATIC ${CU_INSTANTIATIONS})
+set_property(TARGET cutlass3_src PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_property(TARGET cutlass3_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
 # Note - we deliberately do not include 90a PTX (even when 9.0+PTX is
 # specified). This is because sm_90a has arch conditional instructions that are
@@ -75,24 +72,18 @@ add_dependencies(cutlass_src_hopper cutlass_src_pre_hopper)
 # the binary anyway.
 if("9.0" IN_LIST TORCH_CUDA_ARCH_LIST
    OR "9.0+PTX" IN_LIST TORCH_CUDA_ARCH_LIST
-   OR TORCH_CUDA_ARCH_LIST STREQUAL "Auto")
+   OR "90-real" IN_LIST CMAKE_CUDA_ARCHITECTURES_NATIVE)
   message(STATUS "MANUALLY APPENDING FLAG TO COMPILE FOR SM_90a.")
   target_compile_options(
-    cutlass_src_pre_hopper
-    PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_90a,code=sm_90a>)
-  target_compile_options(
-    cutlass_src_hopper
+    cutlass3_src
     PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_90a,code=sm_90a>)
 
   # Hopper kernels require cuda lib for TMA APIs
-  target_link_libraries(cutlass_src_pre_hopper PRIVATE CUDA::cuda_driver)
-  target_link_libraries(cutlass_src_hopper PRIVATE CUDA::cuda_driver)
+  target_link_libraries(cutlass3_src PRIVATE CUDA::cuda_driver)
 
   # No kernels should be parsed, unless hopper is specified. This is a build
   # time improvement
-  target_compile_definitions(cutlass_src_pre_hopper
-                             PRIVATE COMPILE_HOPPER_MIXED_INPUT_GEMMS)
-  target_compile_definitions(cutlass_src_hopper
+  target_compile_definitions(cutlass3_src
                              PRIVATE COMPILE_HOPPER_MIXED_INPUT_GEMMS)
 endif()
 
@@ -101,9 +92,5 @@ endif()
 # compilation output.
 if(NOT WIN32)
   target_compile_options(
-    cutlass_src_pre_hopper
-    PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wno-psabi>)
-  target_compile_options(
-    cutlass_src_hopper
-    PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wno-psabi>)
+    cutlass3_src PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wno-psabi>)
 endif()

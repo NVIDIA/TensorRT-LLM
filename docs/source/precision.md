@@ -139,7 +139,8 @@ This release of TensorRT-LLM contains the following examples:
 | Replit Code|   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | SantaCoder |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | Skywork    |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
-| StarCoder  |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
+| StarCoder1 |   Y   |   Y   |   Y   |   .   |    .    |   Y   |   .   |     .     |     .      |
+| StarCoder2 |   Y   |   Y   |   Y   |   .   |    .    |   Y   |   .   |     .     |     .      |
 | T5         |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | Whisper    |   Y   |   Y   |   Y   |   .   |    .    |   Y   |   Y   |     .     |     .      |
 

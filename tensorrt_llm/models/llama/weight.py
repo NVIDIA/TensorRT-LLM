@@ -106,7 +106,7 @@ def get_scaling_factors(
             weight_dict[f'_np:layers:{layer}:attention:qkv:v:weights_scaling_factor'].item()
         ))
         if quant_mode is not None and quant_mode.has_fp8_kv_cache():
-            # Not calibrarting KV cache.
+            # Not calibrating KV cache.
             scaling_factor['qkv_output'].append(1.0)
         scaling_factor['dense_act'].append(
             weight_dict[f'_np:layers:{layer}:attention:dense:activation_scaling_factor'].item())
@@ -820,7 +820,7 @@ def load_from_fp8_llama(quant_ckpt_path: str, num_hidden_layers: int,
             dtype=fake_fp8_sf_dt)
 
         if fp8_kv_cache:
-            # Not calibrarting KV cache.
+            # Not calibrating KV cache.
             scaling_factor = 1.0
             weights[
                 f'{tllm_prex}.attention.kv_cache_scaling_factor'] = torch.tensor(
@@ -952,13 +952,9 @@ def load_from_gptq_llama(quant_ckpt_path,
         # tensorrt_llm_llama.ln_f.weight.value = v.to(torch_dtype).cpu().numpy()
         weights['transformer.ln_f.weight'] = v.to(torch_dtype)
     # 4. Weights inside each layer
-    layers_per_pipeline_stage = num_hidden_layers // mapping.pp_size
-    layers_range = list(
-        range(mapping.pp_rank * layers_per_pipeline_stage,
-              (mapping.pp_rank + 1) * layers_per_pipeline_stage, 1))
-
+    layers_range = mapping.pp_layers(num_hidden_layers)
     for l in layers_range:
-        layer_idx = l - mapping.pp_rank * layers_per_pipeline_stage
+        layer_idx = l - layers_range[0]
         prefix = "layers" + split_sym + str(layer_idx) + split_sym
         tensorrt_llm.logger.info(f'Process weights in layer: {layer_idx}')
         # layer = tensorrt_llm_llama.layers[layer_idx]

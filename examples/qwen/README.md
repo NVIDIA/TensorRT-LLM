@@ -59,7 +59,7 @@ mv Qwen-14B-Chat ./tmp/Qwen/14B
 
 TensorRT-LLM Qwen builds TensorRT engine(s) from HF checkpoint. If no checkpoint directory is specified, TensorRT-LLM will build engine(s) with dummy weights.
 
-Normally `build.py` only requires single GPU, but if you've already got all the GPUs needed while inferencing, you could enable parallelly building to make the engine building process faster by adding `--parallel_build` argument. Please note that currently `parallel_build` feature only supports single node.
+Normally `build.py` only requires single GPU, but if you've already got all the GPUs needed for inference, you could enable parallel-building to make the engine building process faster by adding `--parallel_build` argument. Please note that currently `parallel_build` feature only supports single node.
 
 Here're some examples:
 

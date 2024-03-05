@@ -211,6 +211,7 @@ std::optional<Config> GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHa
                 << " m=" << m << ", n=" << n << ", k=" << k << ")"
                 << ", reason: \"" << e.what() << "\". Skipped";
             TLLM_LOG_TRACE(msg.str());
+            cudaGetLastError(); // Reset the last cudaError to cudaSuccess.
             continue;
         }
 

@@ -66,6 +66,7 @@ SamplingConfig extractSamplingConfig(SamplingConfig const& batchSamplingConfig, 
     samplingConfig.beamSearchDiversityRate = batchSamplingConfig.beamSearchDiversityRate;
     samplingConfig.lengthPenalty = batchSamplingConfig.lengthPenalty;
     samplingConfig.earlyStopping = batchSamplingConfig.earlyStopping;
+    samplingConfig.normalizeLogProbs = batchSamplingConfig.normalizeLogProbs;
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return samplingConfig;
@@ -278,7 +279,7 @@ void GptDecoderBatch::newRequest(
         tc::fmtstr("Input length (%d) + max new tokens (%d) must be less than max sequence length (%d).", inputLength,
             maxNewTokens, mMaxSequenceLength));
     TLLM_CHECK(requestIds->getDataType() == TRTDataType<TokenIdType>::value);
-    auto const endId = request.endId.value_or(mVocabSize - 1);
+    auto const endId = request.endId.value_or(-1);
 
     auto constexpr localBatchSize = 1;
 
@@ -459,6 +460,7 @@ void GptDecoderBatch::newRequest(
     {
         mDecoders[decoderIdx]->setup(samplingConfig, localBatchSize, mMaxSequenceLength);
     }
+    TLLM_CHECK_WITH_INFO(!mFusedDecoder || beamWidth == 1, "Fused decoder is not supported for beam search yet.");
     mBeamWidths[batchIdx] = beamWidth;
     mNbSteps[batchIdx] = 0;
     mFinished[batchIdx] = false;
@@ -622,8 +624,6 @@ GptDecoderBatch::TokenPtr GptDecoderBatch::forwardAsync(
         }
         else
         {
-            TLLM_CHECK_WITH_INFO(mBeamWidths[0] == 1, "Fused decoder is not supported for beam search yet.");
-
             auto& dInput = *mJointDecodingInput;
             auto& dOutput = *mJointDecodingOutput;
             auto& decoder = *mDecoders[0];

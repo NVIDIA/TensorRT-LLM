@@ -69,8 +69,8 @@ nvinfer1::IPluginV2DynamicExt* SelectiveScanPlugin::clone() const noexcept
 }
 
 // Outputs
-//     output_tensor: [batch_size, dim, seq_len]
-//     state: [batch_size, dim, dstate]
+//     output_tensor: [batch_size, seq_len, dim]
+//     state: [batch_size, dstate, dim]
 nvinfer1::DimsExprs SelectiveScanPlugin::getOutputDimensions(
     int outputIndex, const nvinfer1::DimsExprs* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
 {
@@ -110,11 +110,9 @@ size_t SelectiveScanPlugin::getWorkspaceSize(const nvinfer1::PluginTensorDesc* i
 }
 
 void SelectiveScanPlugin::setSSMParams(SSMParamsBase& params, const size_t batch, const size_t dim, const size_t seqLen,
-    const size_t dstate, const size_t nChunks, const bool isVariableB, const bool isVariableC, void* statePtr,
-    const void* x, const void* delta, const void* deltaBias, const void* A, const void* B, const void* C, const void* D,
-    const void* z, void* out, const size_t strideXBatch, const size_t strideDtBatch, const size_t strideADim,
-    const size_t strideBBatch, const size_t strideCBatch, const size_t strideZBatch, const size_t strideOutBatch,
-    const size_t strideStateBatch, const size_t strideStateDim, bool deltaSoftplus)
+    const size_t dstate, const bool isVariableB, const bool isVariableC, void* statePtr, const void* x,
+    const void* delta, const void* deltaBias, const void* A, const void* B, const void* C, const void* D, const void* z,
+    void* out, bool deltaSoftplus)
 {
     // Reset the parameters
     memset(&params, 0, sizeof(params));
@@ -123,9 +121,6 @@ void SelectiveScanPlugin::setSSMParams(SSMParamsBase& params, const size_t batch
     params.dim = dim;
     params.seqlen = seqLen;
     params.dstate = dstate;
-    params.n_groups = 1;
-    params.n_chunks = nChunks;
-    params.dim_ngroups_ratio = dim;
 
     params.delta_softplus = deltaSoftplus;
 
@@ -143,39 +138,6 @@ void SelectiveScanPlugin::setSSMParams(SSMParamsBase& params, const size_t batch
     params.out_ptr = out;
     params.x_ptr = statePtr;
     params.z_ptr = const_cast<void*>(z);
-    // All stride are in elements, not bytes.
-    params.A_d_stride = strideADim;
-    params.A_dstate_stride = 1;
-    if (!isVariableB)
-    {
-        params.B_d_stride = dim * dstate;
-    }
-    else
-    {
-        params.B_batch_stride = strideBBatch;
-        params.B_group_stride = strideBBatch;
-    }
-    params.B_dstate_stride = !isVariableB ? dstate : seqLen;
-    if (!isVariableC)
-    {
-        params.C_d_stride = dim * dstate;
-    }
-    else
-    {
-        params.C_batch_stride = strideCBatch;
-        params.C_group_stride = strideCBatch;
-    }
-    params.C_dstate_stride = !isVariableC ? dstate : seqLen;
-    params.u_batch_stride = strideXBatch;
-    params.u_d_stride = seqLen;
-    params.delta_batch_stride = strideDtBatch;
-    params.delta_d_stride = seqLen;
-    params.z_batch_stride = strideZBatch;
-    params.z_d_stride = seqLen;
-    params.out_batch_stride = strideOutBatch;
-    params.out_d_stride = seqLen;
-    params.state_batch_stride = strideStateBatch;
-    params.state_d_stride = strideStateDim;
 }
 
 template <typename T>
@@ -184,41 +146,31 @@ int SelectiveScanPlugin::enqueueImpl(const nvinfer1::PluginTensorDesc* inputDesc
     cudaStream_t stream)
 {
     // inputs
-    //     0.  input_tensor [batch_size, dim, seq_len]
-    //     1.  state [batch_size, dim, dstate]
-    //     2.  delta [batch_size, dim, seq_len]
+    //     0.  input_tensor [batch_size, seq_len, dim]
+    //     1.  state [batch_size, dstate, dim]
+    //     2.  delta [batch_size, seq_len, dim]
     //     3.  delta_bias [dim]
-    //     4.  A [dim, dstate]
-    //     5.  B [batch_size, dstate, seq_len]
-    //     6.  C [batch_size, dstate, seq_len]
+    //     4.  A [dstate, dim]
+    //     5.  B [batch_size, seq_len, dstate]
+    //     6.  C [batch_size, seq_len, dstate]
     //     7.  D [dim]
-    //     8.  z [batch_size, dim, seq_len]
+    //     8.  z [batch_size, seq_len, dim]
     //     9.  host_request_types [batch_size] int32. 0: context; 1: generation.
     // outputs
-    //     0. output_tensor [batch_size, dim, seq_len]
-    //     1. state [batch_size, dim, dstate]
+    //     0. output_tensor [batch_size, seq_len, dim]
+    //     1. state [batch_size, dstate, dim]
     auto const batch_size = inputDesc[getInputTensorIdx()].dims.d[0];
-    auto const seq_len = inputDesc[getInputTensorIdx()].dims.d[2];
-    auto const stride_state_batch = mDim * mDState;
-    auto const stride_state_dim = mDState;
-    auto const stride_x_batch = mDim * seq_len;
-    auto const stride_dt_batch = mDim * seq_len;
-    auto const stride_A_dim = mDState;
-    auto const stride_B_batch = mDState * seq_len;
-    auto const stride_C_batch = mDState * seq_len;
-    auto const stride_z_batch = mDim * seq_len;
-    auto const stride_out_batch = mDim * seq_len;
+    auto const seq_len = inputDesc[getInputTensorIdx()].dims.d[1];
 
     // only support context or generation, not for both of them
     RequestType const* reqTypes = static_cast<RequestType const*>(inputs[getHostRequestTypesIdx()]);
 
     auto const n_chunks = (seq_len + 2048 - 1) / 2048;
     SSMParamsBase ssm_params;
-    setSSMParams(ssm_params, batch_size, mDim, seq_len, mDState, n_chunks, mIsVariableB, mIsVariableC, outputs[1],
+
+    setSSMParams(ssm_params, batch_size, mDim, seq_len, mDState, mIsVariableB, mIsVariableC, outputs[1],
         inputs[getInputTensorIdx()], inputs[getDeltaIdx()], inputs[getDeltaBiasIdx()], inputs[getAIdx()],
-        inputs[getBIdx()], inputs[getCIdx()], inputs[getDIdx()], inputs[getZIdx()], outputs[0], stride_x_batch,
-        stride_dt_batch, stride_A_dim, stride_B_batch, stride_C_batch, stride_z_batch, stride_out_batch,
-        stride_state_batch, stride_state_dim, mDeltaSoftplus);
+        inputs[getBIdx()], inputs[getCIdx()], inputs[getDIdx()], inputs[getZIdx()], outputs[0], mDeltaSoftplus);
 
     if (reqTypes[0] == RequestType::kCONTEXT)
     {
@@ -321,9 +273,9 @@ SelectiveScanPluginCreator::SelectiveScanPluginCreator()
     mPluginAttributes.clear();
     mPluginAttributes.emplace_back(PluginField("dim", nullptr, PluginFieldType::kINT32, 16));
     mPluginAttributes.emplace_back(PluginField("dstate", nullptr, PluginFieldType::kINT32, 16));
-    mPluginAttributes.emplace_back(PluginField("is_variable_B", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("is_variable_C", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("delta_softplus", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("is_variable_B", nullptr, PluginFieldType::kINT8, 1));
+    mPluginAttributes.emplace_back(PluginField("is_variable_C", nullptr, PluginFieldType::kINT8, 1));
+    mPluginAttributes.emplace_back(PluginField("delta_softplus", nullptr, PluginFieldType::kINT8, 1));
     mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();

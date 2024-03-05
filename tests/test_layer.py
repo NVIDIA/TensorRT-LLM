@@ -815,7 +815,7 @@ class TestLayer(unittest.TestCase):
                 mask_type = tensorrt_llm.layers.AttentionMaskType.causal
 
             attn_layer = tensorrt_llm.layers.Attention(
-                layer_idx=0,
+                local_layer_idx=0,
                 hidden_size=hidden_size,
                 num_attention_heads=head_num,
                 max_position_embeddings=seq_len,
@@ -932,14 +932,12 @@ class TestLayer(unittest.TestCase):
                                    atol=a_tol,
                                    verbose=True)
 
-    @parameterized.expand([
-        (1, 16, 1024, 16, 'context', 'float32'),
-        (1, 16, 1024, 16, 'context', 'float16'),
-        (1, 16, 1024, 16, 'context', 'bfloat16'),
-        (1, 1, 1024, 16, 'generation', 'float32'),
-        (1, 1, 1024, 16, 'generation', 'float16'),
-        (1, 1, 1024, 16, 'generation', 'bfloat16'),
-    ])
+    @parameterized.expand([(1, 16, 1024, 16, 'context', 'float32'),
+                           (1, 16, 1024, 16, 'context', 'float16'),
+                           (1, 16, 1024, 16, 'context', 'bfloat16'),
+                           (1, 1, 1024, 16, 'generation', 'float32'),
+                           (1, 1, 1024, 16, 'generation', 'float16'),
+                           (1, 1, 1024, 16, 'generation', 'bfloat16')])
     def test_mamba(self, batch_size, seq_len, d_model, d_state, req_type,
                    dtype):
 
@@ -977,11 +975,12 @@ class TestLayer(unittest.TestCase):
                                      dtype=torch_dtype,
                                      device=device)
         if req_type == 'context':
-            ssm_state = torch.empty(size=[batch_size, d_inner, d_state],
+            ssm_state = torch.empty(size=[batch_size, d_state, d_inner],
                                     device=device)
         else:
-            ssm_state = torch.randn(size=[batch_size, d_inner, d_state],
+            ssm_state = torch.randn(size=[batch_size, d_state, d_inner],
                                     device=device)
+
         host_request_types = torch.tensor([0 if req_type == 'context' else 1] *
                                           batch_size,
                                           dtype=torch.int32)
@@ -1003,7 +1002,7 @@ class TestLayer(unittest.TestCase):
                              dtype=torch_dtype,
                              device=device), conv_state),
                 dim=2).detach().clone()
-        ssm_state_ref = ssm_state.detach().clone()
+        ssm_state_ref = ssm_state.detach().clone().permute(0, 2, 1).contiguous()
 
         # get torch layer
         mamba_torch = mamba_ref(d_model,
@@ -1022,10 +1021,12 @@ class TestLayer(unittest.TestCase):
                 if module.bias is not None:
                     torch.nn.init.normal_(module.bias, std=std_dev)
                 torch.nn.init.normal_(module.weight, std=std_dev)
-        A = -torch.rand(d_inner, d_state, device=device) - 1.0
+
+        A = -torch.rand(d_state, d_inner, device=device) - 1.0
         D = torch.randn(d_inner, device=device)
         dt_bias = torch.rand(d_inner, device=device) - 4.0
-        mamba_torch.A.data = A.detach().clone()
+
+        mamba_torch.A.data = A.detach().clone().permute(1, 0).contiguous()
         mamba_torch.D.data = D.detach().clone()
         mamba_torch.dt_proj.bias.data = dt_bias.detach().clone()
 
@@ -1115,6 +1116,8 @@ class TestLayer(unittest.TestCase):
         out_ref, conv_state_ref, ssm_state_ref = mamba_torch(
             hidden_states_ref, conv_state_ref, ssm_state_ref, seqlen_offset)
 
+        ssm_state_cpu = outputs['present_ssm_state'].to(torch.float32).cpu()
+        ssm_state_cpu = ssm_state_cpu.permute(0, 2, 1).contiguous()
         dtype_atol = {"float16": 5e-3, "float32": 2e-3, "bfloat16": 5e-2}
         np.testing.assert_allclose(
             out_ref.detach().to(torch.float32).cpu().numpy(),
@@ -1126,10 +1129,10 @@ class TestLayer(unittest.TestCase):
             outputs['present_conv_state'].to(torch.float32).cpu().numpy(),
             atol=dtype_atol[dtype])
 
-        np.testing.assert_allclose(
-            ssm_state_ref.detach().to(torch.float32).cpu().numpy(),
-            outputs['present_ssm_state'].to(torch.float32).cpu().numpy(),
-            atol=dtype_atol[dtype])
+        np.testing.assert_allclose(ssm_state_ref.detach().to(
+            torch.float32).cpu().numpy(),
+                                   ssm_state_cpu.numpy(),
+                                   atol=dtype_atol[dtype])
 
 
 if __name__ == '__main__':

@@ -24,11 +24,11 @@ from .._utils import (fp32_array, int32_array, is_same_dtype,
                       trt_dtype_to_str)
 from ..functional import (AttentionMaskType, PositionEmbeddingType,
                           RotaryScalingType, Tensor, arange, bert_attention,
-                          cast, clip, concat, constant, embedding, expand,
-                          expand_dims, expand_mask, generate_alibi_biases,
-                          generate_alibi_slopes, gpt_attention, matmul, minimum,
-                          repeat_interleave, shape, slice, softmax, split,
-                          unsqueeze, view, where)
+                          cast, clip, concat, conditional, constant, embedding,
+                          expand, expand_dims, expand_mask,
+                          generate_alibi_biases, generate_alibi_slopes,
+                          gpt_attention, matmul, minimum, repeat_interleave,
+                          shape, slice, softmax, split, unsqueeze, view, where)
 from ..module import Module
 from ..parameter import Parameter
 from ..quantization import QuantMode
@@ -421,7 +421,7 @@ class Attention(Module):
     def __init__(
         self,
         *,
-        layer_idx,
+        local_layer_idx,
         hidden_size,
         num_attention_heads,
         num_kv_heads=None,
@@ -451,10 +451,11 @@ class Attention(Module):
         dense_context_fmha=False,
         max_lora_rank=None,
         clip_qkv=None,
+        alibi_bias_max=8,
     ):
         super().__init__()
 
-        self.layer_idx = layer_idx
+        self.layer_idx = local_layer_idx
         self.cross_attention = cross_attention
         self.attention_mask_type = attention_mask_type
         self.attention_head_size = hidden_size // num_attention_heads if attention_head_size is None else attention_head_size
@@ -491,6 +492,7 @@ class Attention(Module):
         #   - False, inv_sqrt_Dh * Q*K^T + alibi_bias
         #   - True,  inv_sqrt_Dh * Q*K^T + inv_sqrt_Dh * alibi_bias
         self.scale_alibi_bias = position_embedding_type == PositionEmbeddingType.alibi_with_scale
+        self.alibi_bias_max = alibi_bias_max
         self.position_embedding_type = position_embedding_type
         self.enable_pos_shift = enable_pos_shift
         self.dense_context_fmha = dense_context_fmha
@@ -641,7 +643,9 @@ class Attention(Module):
                 encoder_output: Optional[Tensor] = None,
                 position_embedding=None,
                 norm_before_bmm1=False,
-                lora_layer_params=None):
+                lora_layer_params=None,
+                cross_kv_cache_gen: Optional[Tensor] = None,
+                cross_qkv_reuse: Optional[Tensor] = None):
 
         assert isinstance(hidden_states, Tensor)
 
@@ -651,12 +655,13 @@ class Attention(Module):
             if default_net().plugin_config.gpt_attention_plugin:
                 dtype = hidden_states.dtype
             alibi_scale = 1. / self.norm_factor if self.scale_alibi_bias else 1.
-            alibi_slopes = generate_alibi_slopes(self.num_attention_heads *
-                                                 self.tp_size,
-                                                 dtype=dtype,
-                                                 tp_size=self.tp_size,
-                                                 tp_rank=self.tp_rank,
-                                                 alibi_scale=alibi_scale)
+            alibi_slopes = generate_alibi_slopes(
+                self.num_attention_heads * self.tp_size,
+                dtype=dtype,
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
+                alibi_scale=alibi_scale,
+                alibi_bias_max=self.alibi_bias_max)
 
         qkv_lora_params = None
         if lora_layer_params is not None:
@@ -786,17 +791,16 @@ class Attention(Module):
 
         # if cross attention, cross QKV only needs to be calculated once in the
         # 1st decoding step --> write to cross KV cache --> remains constant
-        # during the entire decoding. 1st and >1 steps are distinguished by
-        # whether past_key_value exists or not
+        # during the entire decoding steps.
+        # 1st and >1st steps are distinguished by a boolean tensor `cross_kv_cache_gen` passed at runtime
         # also, cross KV cache max length is set from encoder output seqlen,
         # this maps to the max context length concept in decoder-only models
         cross_qkv = None
-        # get length data in every run
-        if encoder_output:
-            assert isinstance(encoder_output, Tensor)
-        # but only do projection once at 1st decoding step
         if self.cross_attention and encoder_output:
-            cross_qkv = self.qkv(encoder_output, qkv_lora_params)
+            assert isinstance(encoder_output, Tensor)
+
+            ## True branch: context phase, compute cross qkv
+            cross_qkv_true = self.qkv(encoder_output, qkv_lora_params)
 
             if default_net(
             ).plugin_config.lora_plugin and qkv_lora_params is None and lora_layer_params is not None:
@@ -805,7 +809,18 @@ class Attention(Module):
                 cross_qkv_lora = concat(
                     [cross_q_lora, cross_k_lora, cross_v_lora],
                     dim=cross_q_lora.rank() - 1)
-                cross_qkv = cross_qkv + cross_qkv_lora
+                cross_qkv_true = cross_qkv_true + cross_qkv_lora
+            ## End True branch
+
+            ## False branch: generation phase, no compute but need to obey shape constraints
+            # because TRT's IfConditional requires the output shape of two subgraphs to be identical
+            # our 1st attempt was to stack encoder_output [B, S, H] or [N, H] --> cross qkv [B, S, 3*H] or [N, 3*H], but it still introduces unnecessary concat. A better solution is to create a dummy torch tensor `cross_qkv_resue` with the correct shape and reuse it in every generation step
+            cross_qkv_false = cross_qkv_reuse
+            ## End False branch
+
+            # IfConditional layer
+            cross_qkv = conditional(cross_kv_cache_gen, cross_qkv_true,
+                                    cross_qkv_false)
 
         if default_net().plugin_config.gpt_attention_plugin:
             if self.cross_attention and (past_key_value is not None):

@@ -18,10 +18,10 @@
 
 #include <cstdlib>
 #include <iostream>
-#include <map>
 #include <stdexcept>
 #include <string>
 
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/stringUtils.h"
 
 namespace tensorrt_llm::common
@@ -88,13 +88,11 @@ public:
     void setLevel(const Level level)
     {
         level_ = level;
-        log(INFO, "Set logger level by %s", getLevelName(level).c_str());
+        log(INFO, "Set logger level by %s", getLevelName(level));
     }
 
 private:
-    const std::string PREFIX = "[TensorRT-LLM]";
-    std::map<Level, std::string> level_name_
-        = {{TRACE, "TRACE"}, {DEBUG, "DEBUG"}, {INFO, "INFO"}, {WARNING, "WARNING"}, {ERROR, "ERROR"}};
+    static auto constexpr kPREFIX = "[TensorRT-LLM]";
 
 #ifndef NDEBUG
     const Level DEFAULT_LOG_LEVEL = DEBUG;
@@ -105,19 +103,28 @@ private:
 
     Logger(); // NOLINT(modernize-use-equals-delete)
 
-    inline std::string getLevelName(const Level level)
+    static inline char const* getLevelName(const Level level)
     {
-        return level_name_[level];
+        switch (level)
+        {
+        case TRACE: return "TRACE";
+        case DEBUG: return "DEBUG";
+        case INFO: return "INFO";
+        case WARNING: return "WARNING";
+        case ERROR: return "ERROR";
+        }
+
+        TLLM_THROW("Unknown log level: %d", level);
     }
 
-    inline std::string getPrefix(const Level level)
+    static inline std::string getPrefix(const Level level)
     {
-        return PREFIX + "[" + getLevelName(level) + "] ";
+        return fmtstr("%s[%s] ", kPREFIX, getLevelName(level));
     }
 
-    inline std::string getPrefix(const Level level, const int rank)
+    static inline std::string getPrefix(const Level level, const int rank)
     {
-        return PREFIX + "[" + getLevelName(level) + "][" + std::to_string(rank) + "] ";
+        return fmtstr("%s[%s][%d] ", kPREFIX, getLevelName(level), rank);
     }
 };
 

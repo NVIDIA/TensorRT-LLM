@@ -32,6 +32,7 @@ class GenerationRequest:
                  end_id: int,
                  pad_id: int,
                  streaming: bool = True,
+                 digit_input=False,
                  **kwargs):
         self.prompt = None
         self.ids = ids
@@ -39,6 +40,7 @@ class GenerationRequest:
         self.kwargs = kwargs
         self.end_id = end_id
         self.pad_id = pad_id
+        self.digit_input = digit_input
         self._id = req_id
 
     def get_inference_request(self) -> tllm.InferenceRequest:
@@ -128,6 +130,8 @@ class GenerationResult(GenerationOutput):
 
     @property
     def text(self) -> str:
+        if self.tokenizer is None:
+            return ''
         return self.tokenizer.decode(self.token_ids)
 
     def wait_completion(self,
@@ -168,7 +172,7 @@ class GenerationExecutor:
     def __init__(
         self,
         engine_dir: Path,
-        tokenizer: Union[str, Path, TokenizerBase],
+        tokenizer: Union[str, Path, TokenizerBase, None],
         max_beam_width: int = 1,
         executor_type: tllm.TrtGptModelType = tllm.TrtGptModelType.
         InflightBatching,
@@ -181,7 +185,7 @@ class GenerationExecutor:
         self.active_requests = 0
 
         self.tokenizer = tokenizer
-        if not isinstance(tokenizer, TokenizerBase):
+        if tokenizer is not None and not isinstance(tokenizer, TokenizerBase):
             self.tokenizer = AutoTokenizer.from_pretrained(
                 tokenizer,
                 legacy=False,
@@ -220,7 +224,8 @@ class GenerationExecutor:
 
         inference_request = request.get_inference_request()
 
-        result = GenerationResult(request, self.tokenizer)
+        tokenizer = self.tokenizer if not request.digit_input else None
+        result = GenerationResult(request, tokenizer)
         self._results[inference_request.request_id] = result
 
         self.active_requests += 1
@@ -236,24 +241,48 @@ class GenerationExecutor:
         return request_id
 
     def generate_async(
-        self, prompt: Union[str, List[str]], streaming: bool,
-        max_new_tokens: Union[int, List[int]]
+            self,
+            prompt: Union[str, List[int], List[str], List[List[int]]],
+            streaming: bool,
+            max_new_tokens: Union[int, List[int]],
+            end_id: int = -1,
+            pad_id: int = -1
     ) -> Union[GenerationResult, List[GenerationResult]]:
-        unbatched = isinstance(prompt, str)
-        if unbatched:
-            assert isinstance(max_new_tokens, int)
+        batched = False
+        digit_input = False
+        if isinstance(prompt, list):
+            if isinstance(prompt[0], str):  # List[str]
+                batched = True
+                if isinstance(max_new_tokens, int):
+                    max_new_tokens = [max_new_tokens] * len(prompt)
+            elif isinstance(prompt[0], int):  # List[int]
+                digit_input = True
+                prompt = [prompt]
+                if not isinstance(max_new_tokens, list):
+                    max_new_tokens = [max_new_tokens]
+            # List[List[int]]
+            elif isinstance(prompt[0], list) and isinstance(prompt[0][0], int):
+                batched = True
+                digit_input = True
+                if not isinstance(max_new_tokens, list):
+                    max_new_tokens = [max_new_tokens] * len(prompt)
+        else:  # str
             prompt = [prompt]
-            max_new_tokens = [max_new_tokens]
+            if not isinstance(max_new_tokens, list):
+                max_new_tokens = [max_new_tokens]
 
-        assert isinstance(self.tokenizer, TokenizerBase)
-
-        def get_ids(prompt: str) -> torch.Tensor:
+        def get_ids(prompt: str | List[int]) -> torch.Tensor:
+            if digit_input:
+                return torch.tensor([prompt], dtype=torch.int32)
             return self.tokenizer.encode(prompt,
                                          return_tensors="pt",
                                          return_attention_mask=False)
 
-        pad_id = getattr(self.tokenizer, "pad_token_id",
-                         self.tokenizer.eos_token_id)
+        if end_id == -1:
+            assert self.tokenizer is not None, "Please specify end_id if tokenizer is not provided"
+            end_id = self.tokenizer.eos_token_id
+            pad_id = getattr(self.tokenizer, "pad_token_id", end_id)
+
         results = [
             self.submit(
                 GenerationRequest(req_id=self.get_next_request_id(),
@@ -261,18 +290,26 @@ class GenerationExecutor:
                                   streaming=streaming,
                                   max_new_tokens=[m],
                                   pad_id=pad_id,
-                                  end_id=self.tokenizer.eos_token_id))
+                                  end_id=end_id,
+                                  digit_input=digit_input))
             for p, m in zip(prompt, max_new_tokens)
         ]
-        if unbatched:
+        if not batched:
             results = results[0]
         return results
 
     def generate(
-        self, prompt: Union[str, List[str]], max_new_tokens: Union[int,
-                                                                   List[int]]
+            self,
+            prompt: Union[str, List[str]],
+            max_new_tokens: Union[int, List[int]],
+            end_id: int = -1,
+            pad_id: int = -1
     ) -> Union[GenerationResult, List[GenerationResult]]:
-        results = self.generate_async(prompt, False, max_new_tokens)
+        results = self.generate_async(prompt,
+                                      False,
+                                      max_new_tokens,
+                                      end_id=end_id,
+                                      pad_id=pad_id)
         result_list = [results] if isinstance(results,
                                               GenerationRequest) else results
         for result in result_list:
@@ -331,6 +368,18 @@ class GenerationExecutor:
 
         self.stats_queue.put(stats)
 
+    def __enter__(self):
+        self.engine.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self.engine is not None:
+            self.engine.__exit__(exc_type, exc_value, traceback)
+            self.engine = None
+
+    def __del__(self):
+        self.__exit__(None, None, None)
+
 
 class ParallelGenerationExecutor(GenerationExecutor):
     ''' GenerationExecutor with MPI enabled. '''
@@ -339,7 +388,7 @@ class ParallelGenerationExecutor(GenerationExecutor):
         self,
         tp_size: int,
         engine_dir: Path,
-        tokenizer: Union[str, Path, TokenizerBase],
+        tokenizer: Union[str, Path, TokenizerBase, None],
         max_beam_width: int = 1,
         executor_type: tllm.TrtGptModelType = tllm.TrtGptModelType.
         InflightFusedBatching,
@@ -362,7 +411,7 @@ class ParallelGenerationExecutor(GenerationExecutor):
         self.active_requests = 0
 
         self.tokenizer = tokenizer
-        if not isinstance(tokenizer, TokenizerBase):
+        if tokenizer is not None and not isinstance(tokenizer, TokenizerBase):
             self.tokenizer = AutoTokenizer.from_pretrained(
                 tokenizer,
                 legacy=False,
@@ -394,8 +443,7 @@ class ParallelGenerationExecutor(GenerationExecutor):
                               TokenizerBase), "tokenizer not initialized"
 
             self.mpi_session = MpiSession(
-                n_workers=tp_size,
-                async_callback=self._async_listener_calllback)
+                n_workers=tp_size, async_callback=self._async_listener_callback)
             self.socket_client = self.mpi_session.get_socket_client()
 
             self.mpi_session.submit_sync(
@@ -513,7 +561,7 @@ class ParallelGenerationExecutor(GenerationExecutor):
                 finished=finished,
             ))
 
-    def _async_listener_calllback(self, data: Dict[str, Any]):
+    def _async_listener_callback(self, data: Dict[str, Any]):
         req_id = data['req_id']
         output = data['output']
         finished = data['finished']
@@ -531,7 +579,7 @@ class ParallelGenerationExecutor(GenerationExecutor):
             executor._terminated = True
 
         time.sleep(1)
-        executor.engine.shutdown()
+        executor.engine.__exit__(None, None, None)
         NodeSession.state = None
 
     def _shutdown_mpi_nodes(self):
@@ -545,3 +593,10 @@ class ParallelGenerationExecutor(GenerationExecutor):
 
     def __del__(self):
         self.shutdown()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.shutdown()
+        return False

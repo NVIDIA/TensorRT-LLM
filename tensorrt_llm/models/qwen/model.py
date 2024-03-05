@@ -85,7 +85,7 @@ class GPTEmbedding(Module):
 class QWenBlock(Module):
 
     def __init__(self,
-                 layer_idx,
+                 local_layer_idx,
                  hidden_size,
                  seq_length,
                  num_attention_heads,
@@ -108,7 +108,7 @@ class QWenBlock(Module):
                  use_fused_mlp=False,
                  dense_context_fmha=False):
         super().__init__()
-        self.layer_idx = layer_idx
+        self.layer_idx = local_layer_idx
         self.hidden_size = hidden_size
         self.seq_length = seq_length
         self.mlp_hidden_size = mlp_hidden_size
@@ -129,7 +129,7 @@ class QWenBlock(Module):
                             dtype=dtype)
 
         self.attention = Attention(
-            layer_idx=layer_idx,
+            local_layer_idx=local_layer_idx,
             hidden_size=self.hidden_size,
             num_attention_heads=self.num_attention_heads,
             max_position_embeddings=self.max_position_embeddings,
@@ -234,8 +234,9 @@ class QWenModel(Module):
                 sharding_dim=embedding_sharding_dim,
                 tp_rank=mapping.tp_rank)
 
+        layers_range = mapping.pp_layers(self.num_layers)
         self.layers = ModuleList([
-            QWenBlock(layer_idx=i,
+            QWenBlock(local_layer_idx=layer_idx - layers_range[0],
                       hidden_size=hidden_size,
                       seq_length=seq_length,
                       num_attention_heads=num_heads,
@@ -255,7 +256,7 @@ class QWenModel(Module):
                       rms_norm_eps=rms_norm_eps,
                       use_fused_mlp=use_fused_mlp,
                       dense_context_fmha=dense_context_fmha)
-            for i in self.mapping.pp_layers(num_layers)
+            for layer_idx in layers_range
         ])
 
         if self.mapping.is_last_pp_rank():

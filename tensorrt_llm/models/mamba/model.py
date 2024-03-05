@@ -197,11 +197,13 @@ class MambaLMHeadModel(PretrainedModel):
             ('dim_size', [self.d_inner]),
             ('kernel_size', [self.d_conv - 1]),
         ])
+
         ssm_state_dim_range = OrderedDict([
             ('batch_size', batch_range),
-            ('dim_size', [self.d_inner]),
             ('state_size', [self.d_state]),
+            ('dim_size', [self.d_inner]),
         ])
+
         for i in range(self.config.num_hidden_layers):
             conv_state = Tensor(name=f'past_conv_state_{i}',
                                 dtype=self.dtype,
@@ -210,8 +212,9 @@ class MambaLMHeadModel(PretrainedModel):
 
             ssm_state = Tensor(name=f'past_ssm_state_{i}',
                                dtype=str_dtype_to_trt('float32'),
-                               shape=[-1, self.d_inner, self.d_state],
+                               shape=[-1, self.d_state, self.d_inner],
                                dim_range=ssm_state_dim_range)
+
             conv_states.append(conv_state)
             ssm_states.append(ssm_state)
 

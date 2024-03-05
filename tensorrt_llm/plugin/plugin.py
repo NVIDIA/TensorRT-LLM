@@ -336,7 +336,7 @@ class CustomAllReduceHelper:
 
         workspace: Tensor
             When using CUSTOM or AUTO mode, a tensor containing pointers to memory
-            visible to all GPUs. It should be 3 poitners per TP rank -
+            visible to all GPUs. It should be 3 pointers per TP rank -
             ptr to data buffer, ptr to barriers in, ptr to barriers out.
             It must be initialized using IpcMemory class.
 

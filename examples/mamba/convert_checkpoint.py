@@ -30,7 +30,6 @@ def parse_arguments():
         help='The path to save the baichuan TensorRT-LLM checkpoint')
     parser.add_argument('--log_level', type=str, default='info')
     args = parser.parse_args()
-
     return args
 
 
@@ -57,11 +56,7 @@ def get_tllm_linear_weight(weight, prefix, bias=None):
     return results
 
 
-def convert_hf_mamba(
-    hf_mamba,
-    rank=0,
-    dtype='float32',
-):
+def convert_hf_mamba(hf_mamba, rank=0, dtype='float32'):
     weights = {}
     tik = time.time()
 
@@ -85,8 +80,9 @@ def convert_hf_mamba(
             weights[tllm_weight_name] = weight
             if bias is not None:
                 weights[tllm_bias_name] = bias
-        weights[tllm_prex + 'A'] = -torch.exp(
-            model_params[prefix + 'A_log'].float().detach())
+        Aparam = model_params[prefix + 'A_log'].float().detach()
+        Aparam = Aparam.permute(1, 0).contiguous()
+        weights[tllm_prex + 'A'] = -torch.exp(Aparam)
         weights[tllm_prex + 'D'] = model_params[prefix + 'D'].float().detach()
         # norm
         prefix = f'backbone.layers.{l}.norm'
@@ -130,11 +126,9 @@ def rename_hf_to_tllm(name: str):
     return name
 
 
-def convert_from_hf_checkpoint(
-    model_dir: Union[str, Path],
-    rank=0,
-    dtype: Union[str, torch.dtype] = torch.float32,
-):
+def convert_from_hf_checkpoint(model_dir: Union[str, Path],
+                               rank=0,
+                               dtype: Union[str, torch.dtype] = torch.float32):
     logger.info('Loading weights from HF Mamba...')
     tik = time.time()
 
@@ -153,6 +147,7 @@ def convert_from_hf_checkpoint(
             param_fp32 = model_params_fp32[name].detach().cpu()
             if 'A_log' in name:
                 param = -torch.exp(param_fp32)
+                param = param.permute(1, 0).contiguous()
             elif 'D' in name:
                 param = param_fp32
             elif 'dt_proj.bias' in name:

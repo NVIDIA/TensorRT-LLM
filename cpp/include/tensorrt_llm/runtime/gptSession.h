@@ -92,6 +92,46 @@ public:
         std::optional<SizeType> ctxMicroBatchSize = std::nullopt;
         std::optional<SizeType> genMicroBatchSize = std::nullopt;
         std::optional<DecodingMode> decodingMode = std::nullopt;
+        bool normalizeLogProbs = true;
+    };
+
+    //! @brief Optional profiler class to profile the generation phase of an inference request
+    class GenerationProfiler
+    {
+    public:
+        // Use a constexpr variable to resolve the ambiguous match for overloaded CudaEvent constructor
+        static constexpr unsigned int flags{cudaEventDefault};
+
+        GenerationProfiler()
+            : start(flags)
+            , end(flags)
+        {
+        }
+
+        CudaEvent const& getStart() const
+        {
+            return start;
+        }
+
+        CudaEvent const& getEnd() const
+        {
+            return end;
+        }
+
+        float getElapsedTimeMs()
+        {
+            start.synchronize();
+            end.synchronize();
+
+            float result;
+            TLLM_CUDA_CHECK(::cudaEventElapsedTime(&result, start.get(), end.get()));
+
+            return result;
+        }
+
+    private:
+        CudaEvent start;
+        CudaEvent end;
     };
 
     GptSession(Config const& sessionConfig, GptModelConfig const& modelConfig, WorldConfig const& worldConfig,
@@ -129,9 +169,15 @@ public:
         return mDevice;
     }
 
+    [[nodiscard]] bool getNormalizeLogProbs() const noexcept
+    {
+        return mNormalizeLogProbs;
+    }
+
     [[nodiscard]] nvinfer1::DataType getLogitDataType() const;
 
-    void generate(GenerationOutput& outputs, GenerationInput const& inputs, SamplingConfig const& samplingConfig);
+    void generate(GenerationOutput& outputs, GenerationInput const& inputs, SamplingConfig const& samplingConfig,
+        std::shared_ptr<GenerationProfiler> const generationProfiler = nullptr);
 
 private:
     [[nodiscard]] bool useCudaGraphs()
@@ -141,7 +187,7 @@ private:
 
     void generateBatched(std::vector<GenerationOutput>& microBatchesOutputs,
         std::vector<GenerationInput> const& microBatchesInputs, SamplingConfig const& samplingConfig,
-        TokenGeneratedCallback const& onTokenGenerated);
+        TokenGeneratedCallback const& onTokenGenerated, std::shared_ptr<GenerationProfiler> const generationProfiler);
 
     void setup(Config const& sessionConfig);
 
@@ -154,9 +200,8 @@ private:
         SizeType sinkTokenLength, SizeType maxSequenceLength, KvCacheConfig const& config);
     void createCustomAllReduceWorkspace(SizeType batchSize, SizeType beamWidth, SizeType maxSequenceLength);
 
-    void executeContextStep(std::vector<GenerationInput> const& microBatchesInputs,
-        std::vector<GenerationOutput>& microBatchesOutputs, std::vector<SizeType> const& microBatchOffsets,
-        KvCacheManager const* kvCacheManager);
+    void executeContextStep(std::vector<GenerationInput> const& generationBatchesInputs,
+        std::vector<SizeType> const& generationBatchesOffsets, KvCacheManager const* kvCacheManager);
     SizeType executeGenerationStep(SizeType step, std::vector<GenerationInput> const& microBatchesInputs,
         std::vector<GenerationOutput>& microBatchesOutputs, std::vector<SizeType> const& microBatchOffsets,
         KvCacheManager* kvCacheManager, std::vector<bool>& microBatchesFinished);
@@ -275,6 +320,8 @@ private:
     bool mCudaGraphMode{false};
     // ping-pong instances
     std::vector<CudaGraphExecutor> mCudaGraphInstances;
+
+    bool mNormalizeLogProbs = true;
 };
 
 } // namespace tensorrt_llm::runtime

@@ -1,7 +1,8 @@
 import copy
+import dataclasses
 import json
 import os
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import numpy as np
 import safetensors
@@ -18,6 +19,20 @@ from ..module import Module, ModuleList
 from ..quantization import QuantMode
 from ..quantization.quantize import quantize
 from .generation_mixin import GenerationMixin
+
+
+@dataclasses.dataclass
+class QuantizationConfig:
+    '''Serializable quantization configuration class, part of the PretrainedConfig
+    '''
+
+    quant_algo: Optional[str] = None
+    kv_cache_quant_algo: Optional[str] = None
+    group_size: Optional[int] = 128
+    has_zero_point: Optional[bool] = False
+    pre_quant_scale: Optional[bool] = False
+    exclude_modules: Optional[List[str]] = None
+    sq_use_plugin: Optional[bool] = False
 
 
 class PretrainedConfig:
@@ -39,8 +54,7 @@ class PretrainedConfig:
                  world_size: int,
                  tp_size: int,
                  pp_size: int,
-                 quant_mode: QuantMode,
-                 quant_kwargs: dict,
+                 quantization: Union[QuantizationConfig, dict],
                  use_prompt_tuning: bool = False,
                  use_parallel_embedding: bool = False,
                  embedding_sharding_dim: int = 0,
@@ -71,8 +85,18 @@ class PretrainedConfig:
         self.mapping = Mapping(world_size=world_size,
                                tp_size=tp_size,
                                pp_size=pp_size)
-        self.quant_mode = quant_mode
-        self.quant_kwargs = quant_kwargs
+        # Ideally shall only keep one of quant_mode and quant_config to make sure single source of truth
+        # keep them now since many code path is still using the quant_mode
+        self.quant_mode = QuantMode.from_quant_algo(
+            quantization.quant_algo, quantization.kv_cache_quant_algo)
+        if isinstance(quantization, dict):
+            self.quantization = dataclasses.replace(QuantizationConfig(),
+                                                    **quantization)
+        else:
+            assert isinstance(
+                quantization, QuantizationConfig
+            ), f"Expecting type of QuantizationConfig, found {type(quantization)}"
+            self.quantization = quantization
         self.kv_dtype = self.dtype
         self.max_lora_rank = max_lora_rank
         if self.quant_mode.has_int8_kv_cache():
@@ -92,6 +116,9 @@ class PretrainedConfig:
 
     @classmethod
     def from_dict(cls, config):
+        config = copy.deepcopy(
+            config
+        )  # many config.pop calls inside, make one local copy of the config dict such that the function has no side effects
         architecture = config.pop('architecture')
         dtype = config.pop('dtype')
         vocab_size = config.pop('vocab_size')
@@ -121,7 +148,7 @@ class PretrainedConfig:
         tp_size = mapping.get('tp_size', 1)
         pp_size = mapping.get('pp_size', 1)
 
-        if share_embedding_table and mapping.tp_size > 1:
+        if share_embedding_table and tp_size > 1:
             if (not use_parallel_embedding) or (use_parallel_embedding and
                                                 embedding_sharding_dim == 1):
                 raise NotImplementedError(
@@ -129,34 +156,18 @@ class PretrainedConfig:
                         "use_parallel_embedding=True and embedding_sharding_dim=0"
                 )
 
-        quantization = config.pop(
-            'quantization', {
-                'quant_algo': None,
-                'kv_cache_quant_algo': None,
-                'group_size': 128,
-                'has_zero_point': False,
-                'pre_quant_scale': False,
-                'exclude_modules': None,
-                'sq_use_plugin': False,
-            })
-        quant_algo = quantization.get('quant_algo', None)
-        kv_cache_quant_algo = quantization.get('kv_cache_quant_algo', None)
-        group_size = quantization.get('group_size', 128)
-        has_zero_point = quantization.get('has_zero_point', False)
-        pre_quant_scale = quantization.get('pre_quant_scale', False)
-        exclude_modules = quantization.get('exclude_modules', None)
-        sq_use_plugin = quantization.get('sq_use_plugin', False)
+        quant_config = QuantizationConfig()
 
-        quant_mode = QuantMode.from_quant_algo(quant_algo, kv_cache_quant_algo)
-        quant_kwargs = {
-            'quant_algo': quant_algo,
-            'kv_cache_quant_algo': kv_cache_quant_algo,
-            'group_size': group_size,
-            'zero': has_zero_point,
-            'pre_quant_scale': pre_quant_scale,
-            'exclude_modules': exclude_modules,
-            'sq_use_plugin': sq_use_plugin,
-        }
+        if 'quantization' in config:
+            # override the default quantization object from the given dict, allows user to specify partial set of the fields
+            quant_config_from_user = config.pop('quantization')
+            if isinstance(quant_config_from_user, dict):
+                quant_config = dataclasses.replace(quant_config,
+                                                   **quant_config_from_user)
+            # allow user to directly pass one QuantizationConfig object
+            else:
+                assert isinstance(quant_config_from_user, QuantizationConfig)
+                quant_config = quant_config_from_user
 
         max_lora_rank = config.pop('max_lora_rank', 64)
 
@@ -164,7 +175,7 @@ class PretrainedConfig:
                    max_position_embeddings, hidden_size, num_hidden_layers,
                    num_attention_heads, num_key_value_heads, hidden_act,
                    intermediate_size, norm_epsilon, position_embedding_type,
-                   world_size, tp_size, pp_size, quant_mode, quant_kwargs,
+                   world_size, tp_size, pp_size, quant_config,
                    use_prompt_tuning, use_parallel_embedding,
                    embedding_sharding_dim, share_embedding_table, max_lora_rank,
                    **config)
@@ -185,23 +196,7 @@ class PretrainedConfig:
             'pp_size': self.mapping.pp_size,
         }
         output.pop('quant_mode')
-        output.pop('quant_kwargs')
-        output['quantization'] = {
-            'quant_algo':
-            self.quant_kwargs.get('quant_algo', None),
-            'kv_cache_quant_algo':
-            self.quant_kwargs.get('kv_cache_quant_algo', None),
-            'group_size':
-            self.quant_kwargs.get('group_size', 128),
-            'has_zero_point':
-            self.quant_kwargs.get('zero', False),
-            'pre_quant_scale':
-            self.quant_kwargs.get('pre_quant_scale', False),
-            'exclude_modules':
-            self.quant_kwargs.get('exclude_modules', None),
-            'sq_use_plugin':
-            self.quant_kwargs.get('sq_use_plugin', False),
-        }
+        output['quantization'] = dataclasses.asdict(self.quantization)
 
         return output
 
@@ -291,7 +286,8 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
         self.config = config
 
     def __post_init__(self):
-        quantize(self, self.config.quant_mode, **self.config.quant_kwargs)
+        quantize(self, self.config.quant_mode,
+                 **dataclasses.asdict(self.config.quantization))
 
     def check_config(self, config):
         raise NotImplementedError(
@@ -528,7 +524,7 @@ def fuse_gate_mlp(model):
         if not hasattr(layer, 'mlp'):
             continue
 
-        quant_algo = model.config.quant_kwargs['quant_algo']
+        quant_algo = model.config.quantization.quant_algo
         if isinstance(layer.mlp, GatedMLP):
             fused_layer = FusedGatedMLP(
                 hidden_size=layer.mlp.hidden_size,

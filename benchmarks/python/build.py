@@ -53,11 +53,12 @@ def parse_arguments():
         '--mode',
         type=str,
         default="plugin",
-        choices=['ootb', 'plugin', 'ootb-except-mha'],
+        choices=['ootb', 'plugin', 'plugin-ifb', 'ootb-except-mha'],
         help=
         ('Choose mode between ootb/plugin/ootb-except-mha. '
          '\"ootb\" means the engines will be built without any plugins, '
          '\"plugin\" means the engines will be built with tuned recipe of using plugins.'
+         '\"plugin-ifb\" will include additional options required for inflight batching.'
          '\"ootb-except-mha\" means the engines will be built with only attention plugins.'
          ))
 
@@ -749,7 +750,7 @@ def build_gpt(args):
     network.plugin_config.to_legacy_setting()
 
     # Plugins
-    if args.mode == 'plugin':
+    if args.mode in ['plugin', 'plugin-ifb']:
         network.plugin_config.set_gpt_attention_plugin(dtype=args.dtype)
         network.plugin_config.set_context_fmha(ContextFMHAType.enabled)
         network.plugin_config.enable_remove_input_padding()
@@ -773,6 +774,10 @@ def build_gpt(args):
             # RMS norm plugin for SmoothQuant
             network.plugin_config.set_rmsnorm_quantization_plugin(
                 dtype=args.dtype)
+
+        # Inflight batching
+        if args.mode == 'plugin-ifb':
+            network.plugin_config.enable_paged_kv_cache()
     elif args.mode == 'ootb-except-mha':
         network.plugin_config.set_gpt_attention_plugin(dtype=args.dtype)
         network.plugin_config.set_context_fmha(ContextFMHAType.enabled)
@@ -801,7 +806,7 @@ def build_gpt(args):
         else:
             tensorrt_llm_model(*inputs)
 
-    if args.mode == 'plugin':
+    if args.mode in ['plugin', 'plugin-ifb']:
         tensorrt_llm.graph_rewriting.optimize(network)
 
     # Network -> Engine

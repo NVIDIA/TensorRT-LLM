@@ -470,7 +470,7 @@ def parse_arguments():
         args.hidden_act = "silu"
         args.rms_norm_eps = hf_config.layer_norm_epsilon
         args.kv_channels = hf_config.kv_channels
-        args.rotary_emb_base = hf_config.rotary_emb_base
+        args.rotary_base = hf_config.rotary_emb_base
     if args.n_kv_head is None:
         args.n_kv_head = args.n_head
     if args.n_kv_head != args.n_head:
@@ -803,7 +803,7 @@ if __name__ == '__main__':
     if args.parallel_build and args.world_size > 1 and \
             torch.cuda.device_count() >= args.world_size:
         logger.warning(
-            f'Parallelly build TensorRT engines. Please make sure that all of the {args.world_size} GPUs are totally free.'
+            f'Parallel build TensorRT engines. Please make sure that all of the {args.world_size} GPUs are totally free.'
         )
         mp.spawn(build, nprocs=args.world_size, args=(args, ))
     else:

@@ -20,6 +20,7 @@ from itertools import product
 import numpy as np
 import pytest
 import torch
+from einops import rearrange
 from parameterized import parameterized
 
 import tensorrt_llm
@@ -58,27 +59,27 @@ class TestFunctional(unittest.TestCase):
 
         # test data
         torch.random.manual_seed(0)
-        state = torch.randn(batch_size, dim, dstate, device=device)
+        state = torch.randn(batch_size, dstate, dim, device=device)
         x = torch.randn(batch_size,
-                        dim,
                         seq_len,
+                        dim,
                         device=device,
                         dtype=str_dtype_to_torch(dtype))
         dt = torch.randn(batch_size,
-                         dim,
                          seq_len,
+                         dim,
                          device=device,
                          dtype=str_dtype_to_torch(dtype))
         dt_bias = torch.rand(dim, device=device) - 4.0
-        A = -torch.rand(dim, dstate, device=device) - 1.0
+        A = -torch.rand(dstate, dim, device=device) - 1.0
         B = torch.randn(batch_size,
-                        dstate,
                         seq_len,
+                        dstate,
                         device=device,
                         dtype=str_dtype_to_torch(dtype))
         C = torch.randn(batch_size,
-                        dstate,
                         seq_len,
+                        dstate,
                         device=device,
                         dtype=str_dtype_to_torch(dtype))
         D = torch.randn(dim, device=device)
@@ -90,15 +91,15 @@ class TestFunctional(unittest.TestCase):
                              device=device,
                              dtype=str_dtype_to_torch(dtype))
 
-        state_ref = state.detach().clone()
-        x_ref = x.detach().clone()
-        dt_ref = dt.detach().clone()
+        state_ref = state.detach().clone().permute(0, 2, 1).contiguous()
+        x_ref = x.detach().clone().permute(0, 2, 1).contiguous()
+        dt_ref = dt.detach().clone().permute(0, 2, 1).contiguous()
         dt_bias_ref = dt_bias.detach().clone()
-        A_ref = A.detach().clone()
-        B_ref = B.detach().clone()
-        C_ref = C.detach().clone()
+        A_ref = A.detach().clone().permute(1, 0).contiguous()
+        B_ref = B.detach().clone().permute(0, 2, 1).contiguous()
+        C_ref = C.detach().clone().permute(0, 2, 1).contiguous()
         D_ref = D.detach().clone()
-        z_ref = z.detach().clone()
+        z_ref = z.detach().clone().permute(0, 2, 1).contiguous()
 
         # construct trt network
         builder = tensorrt_llm.Builder()
@@ -168,7 +169,7 @@ class TestFunctional(unittest.TestCase):
         engine = builder.build_engine(net, builder_config)
         session = tensorrt_llm.runtime.Session.from_serialized_engine(engine)
         session.run(inputs=inputs, outputs=outputs, stream=stream.cuda_stream)
-
+        out_ref = None
         if req_type == 'context':
             # pytorch run
             out_ref, state_ref = selective_scan_ref(x_ref,
@@ -196,11 +197,16 @@ class TestFunctional(unittest.TestCase):
             out_ref = out_ref.unsqueeze(2)
 
         dtype_atol = {"float16": 5e-3, "float32": 2e-3, "bfloat16": 5e-2}
+
+        output_cpu = outputs['output'].to(torch.float32).cpu()
+        present_state_cpu = outputs['present_state'].to(torch.float32).cpu()
+        output_cpu = rearrange(output_cpu, 'b s d -> b d s').contiguous()
+        present_state_cpu = rearrange(present_state_cpu,
+                                      'b d n -> b n d').contiguous()
+
         np.testing.assert_allclose(out_ref.to(torch.float32).cpu().numpy(),
-                                   outputs['output'].to(
-                                       torch.float32).cpu().numpy(),
+                                   output_cpu.numpy(),
                                    atol=dtype_atol[dtype])
         np.testing.assert_allclose(state_ref.to(torch.float32).cpu().numpy(),
-                                   outputs['present_state'].to(
-                                       torch.float32).cpu().numpy(),
+                                   present_state_cpu.numpy(),
                                    atol=dtype_atol[dtype])

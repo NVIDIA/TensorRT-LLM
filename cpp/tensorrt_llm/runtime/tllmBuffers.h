@@ -480,11 +480,7 @@ public:
     using SizeType = typename Base::SizeType;
     using PoolType = MemoryPool<TAllocator>;
 
-    static PoolType& getPool()
-    {
-        static PoolType pool;
-        return pool;
-    }
+    static PoolType& getPool();
 
 protected:
     void allocateImpl(PointerType* ptr, SizeType n) // NOLINT(readability-convert-member-functions-to-static)

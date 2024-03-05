@@ -176,9 +176,13 @@ def build_model(model: PretrainedModel, build_config: BuildConfig) -> Engine:
         else:
             network.plugin_config.set_plugin("weight_only_quant_matmul_plugin",
                                              model.config.dtype)
-    if use_smooth_quant and model.config.quant_kwargs.get(
-            'sq_use_plugin', False):
+    if use_smooth_quant and model.config.quantization.sq_use_plugin:
         network.plugin_config.set_smooth_quant_plugins()
+    if (model.config.quant_mode.has_fp8_kv_cache()
+            or model.config.quant_mode.has_int8_kv_cache()
+        ) and network.plugin_config.use_paged_context_fmha:
+        raise RuntimeError(
+            "Paged Context FMHA doesn't work with fp8/int8 kv cache currently.")
     nccl_plugin = model.config.dtype if model.config.mapping.world_size > 1 else None
     network.plugin_config.set_nccl_plugin(
         nccl_plugin, network.plugin_config.use_custom_all_reduce)
@@ -247,11 +251,11 @@ def build(build_config: BuildConfig,
         if weight_only_precision == 'int4':
             model_config.quant_mode = QuantMode.use_weight_only(
                 use_int4_weights=True)
-            model_config.quant_kwargs['quant_algo'] = W4A16
+            model_config.quantization.quant_algo = W4A16
         else:
             model_config.quant_mode = QuantMode.use_weight_only(
                 use_int4_weights=False)
-            model_config.quant_kwargs['quant_algo'] = W8A16
+            model_config.quantization.quant_algo = W8A16
 
     assert rank < model_config.mapping.world_size
     architecture = model_config.architecture
@@ -282,9 +286,7 @@ def build(build_config: BuildConfig,
         preprocess_weights(weights, rank_config)
         model.load(weights)
 
-    if model.config.quant_kwargs[
-            'quant_algo'] == FP8 or model.config.quant_kwargs[
-                'kv_cache_quant_algo'] == FP8:
+    if model.config.quantization.quant_algo == FP8 or model.config.quantization.kv_cache_quant_algo == FP8:
         build_config.strongly_typed = True
 
     if hasattr(model.config, 'max_medusa_token_len'):
@@ -299,8 +301,14 @@ def build(build_config: BuildConfig,
 def preprocess_weights(
         weights: Dict[str, torch.Tensor],
         model_config: PretrainedConfig) -> Dict[str, torch.Tensor]:
-    quant_algo = model_config.quant_kwargs['quant_algo']
-    kv_cache_quant_algo = model_config.quant_kwargs['kv_cache_quant_algo']
+    quant_algo = model_config.quantization.quant_algo
+    kv_cache_quant_algo = model_config.quantization.kv_cache_quant_algo
+
+    # For shared embedding.
+    if model_config.mapping.is_last_pp_rank(
+    ) and 'lm_head.weight' not in weights:
+        weights["lm_head.weight"] = weights[
+            "transformer.vocab_embedding.weight"].clone()
 
     # INT4_AWQ
     if quant_algo == W4A8_AWQ or quant_algo == W4A16_AWQ:
@@ -403,12 +411,6 @@ def preprocess_weights(
                 update_dict[name.replace('weight',
                                          'bias')] = torch.zeros_like(param)
         weights.update(update_dict)
-
-    # For shared embedding.
-    if model_config.mapping.is_last_pp_rank(
-    ) and 'lm_head.weight' not in weights:
-        weights["lm_head.weight"] = weights[
-            "transformer.vocab_embedding.weight"].clone()
 
     # Parallel block rowlinear should not have duplicate bias.
     if model_config.architecture == 'GPTJForCausalLM':
