@@ -387,11 +387,6 @@ if(BUILD_BENCHMARKS)
 endif()
 
 
-if(BUILD_NITRO)
-  add_subdirectory(${TRT_LLM_ROOT_DIR}/nitro
-                   ${CMAKE_BINARY_DIR}/nitro)
-endif()
-
 
 # Measure the compile time
 option(MEASURE_BUILD_TIME "Measure the build time of each module" OFF)

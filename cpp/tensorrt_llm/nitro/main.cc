@@ -8,10 +8,8 @@
 #include "tensorrt_llm/runtime/tllmLogger.h"
 
 #include <NvInfer.h>
-#include <chrono>
 #include <filesystem>
 #include <iostream>
-#include <memory>
 #include <ostream>
 #include <string>
 
@@ -94,7 +92,6 @@ void runBenchmark()
         {
             // Assuming the shape of outputIds tensor is (1, 1, 160), where 160 is the number of tokens
             int outputLength = outputIds->getShape().d[2]; // Get the length of output IDs based on the tensor shape
-
             // Copy output IDs from GPU to host for printing
             std::vector<int32_t> outputIdsHost(outputLength);
             bufferManager.copy(*outputIds, outputIdsHost.data(), MemoryType::kCPU);
