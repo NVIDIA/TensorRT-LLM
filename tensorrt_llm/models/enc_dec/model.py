@@ -128,7 +128,7 @@ class EncDecEmbedding(Module):
                 prompt_tasks=None,
                 prompt_vocab_size=None):
         # position_ids and token_type_ids are provided inputs
-        # and should not be formulated determinisitically
+        # and should not be formulated deterministically
 
         ptuning_args = []
         if self.use_prompt_tuning:
@@ -291,7 +291,7 @@ class DecoderLayer(Module):
 
     def __init__(self,
                  *,
-                 layer_idx,
+                 local_layer_idx,
                  hidden_size,
                  ffn_hidden_size,
                  num_attention_heads,
@@ -325,7 +325,7 @@ class DecoderLayer(Module):
 
         # e.g. BART q_scaling = 1.f, T5 q_scaling = 1.f/sqrt(head_size)
         self.self_attention = Attention(
-            layer_idx=layer_idx,
+            local_layer_idx=local_layer_idx,
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
             attention_head_size=head_size,
@@ -358,7 +358,7 @@ class DecoderLayer(Module):
         #
         # e.g. BART q_scaling = 1.f, T5 q_scaling = 1.f/sqrt(head_size)
         self.cross_attention = Attention(
-            layer_idx=layer_idx,
+            local_layer_idx=local_layer_idx,
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
             attention_head_size=head_size,
@@ -416,7 +416,9 @@ class DecoderLayer(Module):
                 use_cache=False,
                 kv_cache_params=None,
                 attention_params=None,
-                lora_layer_params=None):
+                lora_layer_params=None,
+                cross_kv_cache_gen: Optional[Tensor] = None,
+                cross_qkv_reuse: Optional[Tensor] = None):
         assert isinstance(hidden_states, Tensor)
 
         if encoder_output:
@@ -463,7 +465,9 @@ class DecoderLayer(Module):
             use_cache=use_cache,
             kv_cache_params=kv_cache_params,
             attention_params=attention_params,
-            lora_layer_params=lora_layer_params)
+            lora_layer_params=lora_layer_params,
+            cross_kv_cache_gen=cross_kv_cache_gen,
+            cross_qkv_reuse=cross_qkv_reuse)
 
         if use_cache:
             attention_output, presents_cross = attention_output
@@ -1004,9 +1008,10 @@ class DecoderModel(Module, GenerationMixin):
                 embedding_sharding_dim=embedding_sharding_dim,
                 mapping=self.mapping)
 
+        layers_range = self.mapping.pp_layers(self.total_num_layers)
         self.decoder_layers = ModuleList([
             DecoderLayer(
-                layer_idx=layer_idx,
+                local_layer_idx=layer_idx - layers_range[0],
                 hidden_size=hidden_size,
                 ffn_hidden_size=ffn_hidden_size,
                 num_attention_heads=num_heads,
@@ -1029,8 +1034,7 @@ class DecoderModel(Module, GenerationMixin):
                 num_buckets=num_buckets,
                 fp16_clamping=fp16_clamping,
                 max_lora_rank=max_lora_rank,
-            ) for layer_idx in range(
-                len(self.mapping.pp_layers(self.total_num_layers)))
+            ) for layer_idx in layers_range
         ])
 
         if self.mapping.is_last_pp_rank():
@@ -1061,7 +1065,9 @@ class DecoderModel(Module, GenerationMixin):
                 kv_cache_params=None,
                 attention_params=None,
                 hidden_states=None,
-                lora_params: LoraParams = None):
+                lora_params: LoraParams = None,
+                cross_kv_cache_gen: Optional[Tensor] = None,
+                cross_qkv_reuse: Optional[Tensor] = None):
         if self.mapping.is_first_pp_rank():
             assert isinstance(decoder_input_ids, Tensor)
         else:
@@ -1104,7 +1110,9 @@ class DecoderModel(Module, GenerationMixin):
                     host_sink_token_length,
                     cache_indirection=kv_cache_params.cache_indirection),
                 attention_params=attention_params,
-                lora_layer_params=lora_layer_params)
+                lora_layer_params=lora_layer_params,
+                cross_kv_cache_gen=cross_kv_cache_gen,
+                cross_qkv_reuse=cross_qkv_reuse)
 
             if use_cache:
                 presents_self, presents_cross = hidden_states[1], hidden_states[
@@ -1564,9 +1572,40 @@ class DecoderModel(Module, GenerationMixin):
                 encoder_max_input_length=encoder_max_input_length,
             )
 
+        cross_kv_cache_gen = Tensor(name='cross_kv_cache_gen',
+                                    dtype=trt.bool,
+                                    shape=[1],
+                                    dim_range=OrderedDict([
+                                        ('boolean', [1]),
+                                    ]))
+        cross_qkv_reuse = None
+        cross_qkv_out_dim = self.num_heads * self.head_size + 2 * self.num_kv_heads * self.head_size
+        if remove_input_padding:
+            cross_qkv_reuse = Tensor(
+                name="cross_qkv_reuse",
+                dtype=self._dtype,
+                shape=[-1, cross_qkv_out_dim],
+                dim_range=OrderedDict([
+                    ("encoder_num_tokens", [encoder_num_tokens_range]),
+                    ("encoder_qkv_size", [cross_qkv_out_dim]),
+                ]),
+            )
+        else:
+            cross_qkv_reuse = Tensor(
+                name="cross_qkv_reuse",
+                dtype=self._dtype,
+                shape=[-1, -1, cross_qkv_out_dim],
+                dim_range=OrderedDict([
+                    ("batch_size_beam_width_encoder", [bb_range]),
+                    ("encoder_input_len", [encoder_input_len_range]),
+                    ("encoder_qkv_size", [cross_qkv_out_dim]),
+                ]),
+            )
+
         return (input_ids, encoder_output, position_ids, token_type_ids, True,
                 attention_mask, cross_attention_mask, last_token_ids,
-                kv_cache_params, attention_params, hidden_states, lora_params)
+                kv_cache_params, attention_params, hidden_states, lora_params,
+                cross_kv_cache_gen, cross_qkv_reuse)
 
 
 class WhisperEncoder(Module):

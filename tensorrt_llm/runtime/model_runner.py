@@ -477,7 +477,7 @@ class ModelRunner(ModelRunnerMixin):
             assert session_cls == GenerationSession, "Medusa is only supported by GenerationSession"
 
             assert model_config.max_medusa_tokens > 0, \
-                "medusa_chioce is specified but model_config.max_medusa_tokens is 0."
+                "medusa_choice is specified but model_config.max_medusa_tokens is 0."
 
         torch.cuda.set_device(rank % runtime_mapping.gpus_per_node)
         session = session_cls(model_config,

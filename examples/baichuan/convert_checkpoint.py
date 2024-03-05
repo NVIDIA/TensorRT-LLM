@@ -68,13 +68,6 @@ def parse_arguments():
         default=0,
         help='Setting to a value > 0 enables support for prompt tuning.')
     parser.add_argument(
-        "--calibrate_kv_cache",
-        "-kv",
-        action="store_true",
-        help=
-        "Generate scaling factors for KV cache. Used for storing KV cache in int8."
-    )
-    parser.add_argument(
         '--per_channel',
         default=False,
         action="store_true",
@@ -1100,12 +1093,9 @@ def convert_baichuan_gptq(hf_config: AutoConfig,
 
     # 4. Weights inside each layer
     num_hidden_layers = hf_config.num_hidden_layers
-    layers_per_pipeline_stage = num_hidden_layers // mapping.pp_size
-    layers_range = list(
-        range(mapping.pp_rank * layers_per_pipeline_stage,
-              (mapping.pp_rank + 1) * layers_per_pipeline_stage, 1))
+    layers_range = mapping.pp_layers(num_hidden_layers)
     for l in layers_range:
-        layer_idx = l - mapping.pp_rank * layers_per_pipeline_stage
+        layer_idx = l - layers_range[0]
         prefix = f"layers.{l}."
         tllm_prefix = f"transformer.layers.{l}."
         tensorrt_llm.logger.info(f'Process weights in layer: {layer_idx}')
@@ -1189,7 +1179,7 @@ if __name__ == '__main__':
         elif args.per_token and not args.per_channel:
             quant_algo = 'W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN'
 
-    if args.calibrate_kv_cache:
+    if args.int8_kv_cache:
         kv_cache_quant_algo = "INT8"
     else:
         kv_cache_quant_algo = None
@@ -1252,7 +1242,7 @@ if __name__ == '__main__':
         hf_model = AutoModelForCausalLM.from_pretrained(args.model_dir,
                                                         trust_remote_code=True,
                                                         torch_dtype="auto")
-        if args.smoothquant is not None or args.calibrate_kv_cache:
+        if args.smoothquant is not None or args.int8_kv_cache:
             act_range = {}
             baichuan_smoother = {}
             act_range = capture_activation_range(
@@ -1265,9 +1255,8 @@ if __name__ == '__main__':
                                       baichuan_smoother)
             weights = convert_hf_baichuan_sq(hf_model, mapping, rank,
                                              args.dtype, args.per_channel,
-                                             args.per_token,
-                                             args.calibrate_kv_cache, act_range,
-                                             baichuan_smoother)
+                                             args.per_token, args.int8_kv_cache,
+                                             act_range, baichuan_smoother)
         elif args.use_weight_only and args.weight_only_precision == 'int4_gptq':
             weights = convert_baichuan_gptq(hf_config,
                                             args.quant_ckpt_path,

@@ -127,9 +127,9 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void batch_topk_kernel(const int*
 
     const float length_penalty{beam_hyps.length_penalties[global_batch_idx]};
     const int early_stopping{beam_hyps.early_stoppings[global_batch_idx]};
-    const int* sequence_lengths{beam_hyps.sequence_lengths_src};
     const T diversity_rate{beam_hyps.diversity_rates[global_batch_idx]};
     float* output_log_probs{beam_hyps.log_probs_src};
+    const int* sequence_lengths{beam_hyps.sequence_lengths_src};
 
     using cub_kvp = cub::KeyValuePair<int, T>;
     using BlockReduce = cub::BlockReduce<cub_kvp, THREADBLOCK_SIZE>;
@@ -177,21 +177,7 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void batch_topk_kernel(const int*
     for (int elem_id = thread_id; elem_id < candidate_size; elem_id += THREADBLOCK_SIZE)
     {
         int i = beam_hyps.num_beams == nullptr ? elem_id % K : elem_id / 2 / K;
-        T elem = topk_tmp_val_buf[elem_id];
-        if (length_penalty > 0.0f)
-        {
-            int length = sequence_lengths[vector_id * K + i];
-            if (early_stopping == 0)
-            {
-                // Use generated_length (rather than sequence_length) to compute length_penalty
-                // https://github.com/huggingface/transformers/blob/main/src/transformers/generation/beam_search.py#L957
-                // But this branch will cause CI error in
-                // "C++ Tests (GPT) on A30", "C++ Tests (GPT-J) on H100_PCIe", "H100_PCIe-accuracy-0"
-                length -= beam_hyps.input_lengths[global_batch_idx];
-            }
-            const int pad_if_not_finish = finished[vector_id * K + i].isFinished() ? 0 : 1;
-            elem = apply_length_penalty(elem, length + pad_if_not_finish, length_penalty);
-        }
+        T elem = topk_tmp_val_buf[elem_id]; //  use token score to do TopK
         elem += diversity_rate * (T) i;
         cub_kvp new_elem{elem_id, elem};
         partial_topk = arg_max(partial_topk, new_elem);
@@ -232,21 +218,25 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void batch_topk_kernel(const int*
         {
             const int current_key = cta_topk[i].key;
             const T current_value = cta_topk[i].value;
+
+            // Consider to add beam only if this token belongs to top K range and it is end_token
+            // https://github.com/huggingface/transformers/blob/main/src/transformers/generation/beam_search.py#L272
             if (i < K && beam_hyps.num_beams != nullptr
                 && topk_tmp_id_buf[current_key] % vocab_size == beam_hyps.end_ids[vector_id])
             {
-                // Add beam only if beam_token belongs to top K tokens
-                // https://github.com/huggingface/transformers/blob/main/src/transformers/generation/beam_search.py#L272
-                const float normed_score = (float) current_value;
-                const int num_beam = beam_hyps.num_beams[global_batch_idx];
-                int beam_idx = num_beam;
+                const int seq_len = sequence_lengths[vector_id * K + i] - beam_hyps.input_lengths[global_batch_idx];
+                const int pad_if_not_finish = finished[vector_id * K + i].isFinished() ? 0 : 1;
+                const float normed_score
+                    = apply_length_penalty(current_value, seq_len + pad_if_not_finish, length_penalty);
 
+                int beam_idx = beam_hyps.num_beams[global_batch_idx];
                 // There are already K beams
-                if (num_beam == K)
+                if (beam_idx == K)
                 {
                     // The current score is worse than the worst one in beams
                     if (normed_score < beam_hyps.min_normed_scores[global_batch_idx])
                     {
+                        // Stop considering new beams
                         selected_beams = K;
                         break;
                     }
@@ -291,24 +281,34 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void batch_topk_kernel(const int*
                 {
                     const int src_idx = j * beam_hyps.batch_size * K + beam_hyps.ite * beam_hyps.local_batch_size * K
                         + vector_id * K + prev_id;
-
                     beam_hyps.output_ids_tgt[tgt_id_offset + j]
                         = beam_hyps.output_ids_src_ptr[vector_id][prev_id * beam_hyps.max_seq_len + j];
+
                     if (beam_hyps.log_probs != nullptr && beam_hyps.log_probs_src != nullptr)
                     {
                         beam_hyps.log_probs[tgt_id_offset + j] = beam_hyps.log_probs_src[src_idx];
                     }
+
                     prev_id = beam_hyps.parent_ids_src_ptr[vector_id][prev_id * beam_hyps.max_seq_len + j];
                 }
                 const int tgt_beam_idx = global_batch_idx * (K * 2) + beam_idx;
+
                 beam_hyps.sequence_lengths_tgt[tgt_beam_idx] = current_step;
                 beam_hyps.normed_scores[tgt_beam_idx] = normed_score;
                 beam_hyps.min_normed_scores[global_batch_idx]
                     = min(beam_hyps.min_normed_scores[global_batch_idx], beam_hyps.normed_scores[tgt_beam_idx]);
 
                 beam_hyps.num_beams[global_batch_idx]++;
-                cum_log_probs[tgt_beam_idx] = (float) topk_tmp_val_buf[current_key];
+                beam_hyps.cum_log_probs[tgt_beam_idx] = (float) topk_tmp_val_buf[current_key];
             }
+            // This token is end_token but belongs to range K ~ 2K, just ignoe it
+            // TODO: eliminate this branch by rewriting condition of the else_if
+            else if (i >= K && beam_hyps.num_beams != nullptr
+                && topk_tmp_id_buf[current_key] % vocab_size == beam_hyps.end_ids[vector_id])
+            {
+                ;
+            }
+            // Beam search is disabled or this token is not end_token, we add it to the end of the unfinished sentence
             else if (beam_hyps.num_beams != nullptr || beam_hyps.num_beams == nullptr && i < K)
             {
                 const int current_step{sequence_lengths[vector_id * K + selected_beams]};

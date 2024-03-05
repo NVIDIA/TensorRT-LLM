@@ -29,35 +29,29 @@ Logger::Logger()
     int deviceId;
     cudaGetDevice(&deviceId);
 
-    char* levelName = std::getenv("TLLM_LOG_LEVEL");
+    auto const* levelName = std::getenv("TLLM_LOG_LEVEL");
     if (levelName != nullptr)
     {
-        std::map<std::string, Level> nameToLevel = {
-            {"TRACE", TRACE},
-            {"DEBUG", DEBUG},
-            {"INFO", INFO},
-            {"WARNING", WARNING},
-            {"ERROR", ERROR},
-        };
-        auto level = nameToLevel.find(levelName);
+        auto level = [levelName = std::string(levelName)]()
+        {
+            if (levelName == "TRACE")
+                return TRACE;
+            if (levelName == "DEBUG")
+                return DEBUG;
+            if (levelName == "INFO")
+                return INFO;
+            if (levelName == "WARNING")
+                return WARNING;
+            if (levelName == "ERROR")
+                return ERROR;
+            TLLM_THROW("Invalid log level: %s", levelName.c_str());
+        }();
         // If TLLM_LOG_FIRST_RANK_ONLY=ON, set LOG LEVEL of other device to ERROR
         if (isFirstRankOnly && deviceId != 0)
         {
-            level = nameToLevel.find("ERROR");
+            level = ERROR;
         }
-        if (level != nameToLevel.end())
-        {
-            setLevel(level->second);
-        }
-        else
-        {
-            fprintf(stderr,
-                "[TensorRT-LLM][WARNING] Invalid logger level TLLM_LOG_LEVEL=%s. "
-                "Ignore the environment variable and use a default "
-                "logging level.\n",
-                levelName);
-            levelName = nullptr;
-        }
+        setLevel(level);
     }
 }
 

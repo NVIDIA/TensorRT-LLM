@@ -237,12 +237,11 @@ public:
 
     void bcast(runtime::IBuffer& buf, int root) const
     {
-        TLLM_CHECK(buf.getMemoryType() != runtime::MemoryType::kGPU);
         bcast(buf.data(), buf.getSizeInBytes(), MpiType::kBYTE, root);
     }
 
     template <typename T>
-    void bcast(T& value, int root) const
+    void bcastValue(T& value, int root) const
     {
         if constexpr (std::is_fundamental_v<std::remove_cv_t<T>>)
         {

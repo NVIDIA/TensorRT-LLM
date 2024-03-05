@@ -109,6 +109,7 @@ class GPTBenchmark(BaseBenchmark):
 
         if not hasattr(self, 'num_kv_heads') or self.num_kv_heads is None:
             self.num_kv_heads = self.num_heads
+
         model_config = tensorrt_llm.runtime.ModelConfig(
             max_batch_size=self.max_batch_size,
             max_beam_width=self.num_beams,
@@ -118,6 +119,9 @@ class GPTBenchmark(BaseBenchmark):
             num_kv_heads=ceil(self.num_kv_heads / self.world_size),
             hidden_size=self.hidden_size // self.world_size,
             gpt_attention_plugin=self.use_gpt_attention_plugin,
+            paged_kv_cache=self.paged_kv_cache if hasattr(
+                self, 'paged_kv_cache') else False,
+            dtype=self.dtype,
             remove_input_padding=self.remove_input_padding,
             quant_mode=self.quant_mode,
             use_custom_all_reduce=self.use_custom_all_reduce,

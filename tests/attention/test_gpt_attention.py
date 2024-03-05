@@ -958,7 +958,7 @@ class TestFunctional(unittest.TestCase):
         def verify_kv_cache(torch_present):
             if not use_int8_kv_cache and not use_fp8_kv_cache and num_kv_heads == num_heads and beam_width == 1:
                 if paged_kv_cache:
-                    kv_cache_cont = manager.blocks_manager.get_continous_caches(
+                    kv_cache_cont = manager.blocks_manager.get_continuous_caches(
                         0)
                     kv_cache_cont = kv_cache_cont.permute(1, 0, 2)
                 else:

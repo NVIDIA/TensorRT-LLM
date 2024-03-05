@@ -114,13 +114,13 @@ class Session(object):
     def _print_engine_info(self):
         '''print engine info for debug purpose, internal use only.
         '''
-        refitable = self.engine.refittable
+        refittable = self.engine.refittable
         num_layers = self.engine.num_layers
         device_memory_size = self.engine.device_memory_size
         name = self.engine.name
         nb_profiles = self.engine.num_optimization_profiles
         logger.info(
-            f"Engine:{name=:}, {refitable=:}, {num_layers=:}, {device_memory_size=:}, {nb_profiles=:}"
+            f"Engine:{name=:}, {refittable=:}, {num_layers=:}, {device_memory_size=:}, {nb_profiles=:}"
         )
         self._print_io_info()
 

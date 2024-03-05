@@ -168,8 +168,8 @@ class TestMamba(unittest.TestCase):
 
         ssm_state_shape = (
             batch_size,
-            mamba_d_inner,
             mamba_d_state,
+            mamba_d_inner,
         )
         present_conv_states = []
         present_conv_states_1 = []
@@ -324,9 +324,10 @@ class TestMamba(unittest.TestCase):
                 atol=1e-3)
         # layer{l}.ssm.A
         A_hf = -torch.exp(hf_mamba.backbone.layers[l].mixer.A_log.float())
+        A_hf_permute = A_hf.cpu().detach().permute([1, 0]).contiguous()
         np.testing.assert_allclose(
             tensorrt_llm_mamba.backbone.layers[l].ssm.A.raw_value,
-            A_hf.cpu().detach(),
+            A_hf_permute,
             atol=1e-3)
         # layer{l}.ssm.D
         np.testing.assert_allclose(

@@ -5,8 +5,12 @@ from pathlib import Path
 
 import numpy as np
 import requests
-import tensorrt as trt
+
+# isort: off
 import torch
+import tensorrt as trt
+# isort: on
+
 from huggingface_hub import hf_hub_download
 from PIL import Image
 from transformers import (AutoConfig, AutoProcessor, AutoTokenizer,
@@ -127,7 +131,7 @@ class MultiModalModel:
             self.runtime_mapping = self.model.session.mapping
         else:
             self.model = TRTLLMEncDecModel.from_engine(
-                self.args.hf_model_dir.split('/')[-1],
+                os.path.basename(self.args.hf_model_dir),
                 self.args.llm_engine_dir,
                 skip_encoder=self.args.nougat,
                 debug_mode=False,

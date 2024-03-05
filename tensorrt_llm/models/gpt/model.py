@@ -71,7 +71,7 @@ class GPTDecoderLayer(Module):
 
     def __init__(self,
                  *,
-                 layer_idx,
+                 local_layer_idx,
                  hidden_size,
                  num_attention_heads,
                  max_position_embeddings,
@@ -110,7 +110,7 @@ class GPTDecoderLayer(Module):
                                          dtype=dtype)
 
         self.attention = Attention(
-            layer_idx=layer_idx,
+            local_layer_idx=local_layer_idx,
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
             num_kv_heads=num_kv_heads,
@@ -231,9 +231,10 @@ class GPTModel(Module):
                                                 hidden_size,
                                                 dtype=dtype)
 
+        layers_range = self.mapping.pp_layers(num_layers)
         self.layers = ModuleList([
             GPTDecoderLayer(
-                layer_idx=layer_idx,
+                local_layer_idx=layer_idx - layers_range[0],
                 hidden_size=hidden_size,
                 num_attention_heads=num_heads,
                 max_position_embeddings=max_position_embeddings,
@@ -256,7 +257,7 @@ class GPTModel(Module):
                 quant_mode=quant_mode,
                 moe_config=moe_config,
                 max_lora_rank=max_lora_rank,
-            ) for layer_idx in range(num_layers)
+            ) for layer_idx in layers_range
         ])
 
         self.ln_f = LayerNorm(normalized_shape=hidden_size, dtype=dtype)

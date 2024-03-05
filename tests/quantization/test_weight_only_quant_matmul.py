@@ -18,6 +18,8 @@ import unittest
 
 import _utils
 
+from tensorrt_llm._utils import torch_to_numpy
+
 # isort: off
 import torch
 import tensorrt as trt
@@ -31,6 +33,7 @@ from tensorrt_llm.functional import constant
 from tensorrt_llm.quantization.functional import weight_only_quant_matmul
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.util import getSMVersion
 
 
 class TestWeightOnlyQuantMatmul(unittest.TestCase):
@@ -45,7 +48,7 @@ class TestWeightOnlyQuantMatmul(unittest.TestCase):
             assert (False)
         torch_dtype = _utils.woq_torch_dtype(dtype)
         # Init operands for multiplication in int32
-        mat1 = torch.eye(weights.shape[0], dtype=torch_dtype)
+        mat1 = torch.eye(weights.shape[0], dtype=torch.float32).to(torch_dtype)
 
         return self._run_matmul(mat1, weights, scales, dtype, wTypeId, True)
 
@@ -65,12 +68,15 @@ class TestWeightOnlyQuantMatmul(unittest.TestCase):
                        shape=mat1.shape,
                        dtype=tensorrt_llm._utils.str_dtype_to_trt(dtype))
             # Init TensorRT-LLM tensor for weight
-            weights = constant(processed_torch_weights.numpy())
+            weights = constant(torch_to_numpy(processed_torch_weights))
             # Init TensorRT-LLM tensor for per channel scaling
-            scale = constant(torch_weight_scales.numpy())
+            scale = constant(torch_to_numpy(torch_weight_scales))
             # Get output tensor for WOQ Matmul
-            output = weight_only_quant_matmul(x, weights, scale,
-                                              wTypeId).trt_tensor
+            output = weight_only_quant_matmul(x,
+                                              weights,
+                                              scale,
+                                              wTypeId,
+                                              dtype=dtype).trt_tensor
             output.name = 'output'
             network.mark_output(output)
             output.dtype = tensorrt_llm._utils.str_dtype_to_trt(dtype)
@@ -81,15 +87,14 @@ class TestWeightOnlyQuantMatmul(unittest.TestCase):
             config=CreateConfig(
                 int8=True,
                 fp16=(dtype == "float16"),
+                bf16=(dtype == "bfloat16"),
                 memory_pool_limits={trt.MemoryPoolType.WORKSPACE: 33554432}))
 
         # Infer engine
         with TrtRunner(build_engine) as runner:
-            outputs = runner.infer(feed_dict={
-                'x': mat1.numpy(),
-            })
+            outputs = runner.infer(feed_dict={'x': mat1})
 
-        return torch.tensor(outputs['output'])
+        return outputs['output']
 
     def _woq_matmul(self, m, n, k, dtype, wTypeId, use_plugin=True):
         # Init operands for multiplication in int32
@@ -111,7 +116,7 @@ class TestWeightOnlyQuantMatmul(unittest.TestCase):
         ref = _utils.woq_gt_matmul(m, mat1, ref_torch_weights,
                                    torch_weight_scales, dtype)
 
-        _utils.woq_assert_colwise_near_eq(ref, output, wTypeId)
+        _utils.woq_assert_near_eq(ref, output, wTypeId)
         '''
         ref = ref.cpu().flatten()
         diff = abs(ref - output)
@@ -123,25 +128,43 @@ class TestWeightOnlyQuantMatmul(unittest.TestCase):
         '''
 
     @parameterized.expand([
-        (1, 1024, 4096, 'float16', 1, True),
-        (1, 1024, 4096, 'float16', 1, False),
-        (128, 6144, 12288, 'float16', 1, True),  #FP16 * INT8
-        (1, 1024, 4096, 'float16', 2, True),
-        (128, 6144, 12288, 'float16', 2, True),
-    ])  #FP16 * INT4
-    def test_matmul(self, m, n, k, dtype, wTypeId, use_plugin):
-        self._woq_matmul(m, n, k, dtype, wTypeId, use_plugin)
+        (1, 1024, 4096, 1, True),
+        (1, 1024, 4096, 1, False),
+        (128, 6144, 12288, 1, True),  # FP16 * INT8
+        (1, 1024, 4096, 2, True),
+        (128, 6144, 12288, 2, True),  # FP16 * INT4
+    ])
+    def test_matmul_fp16_act(self, m, n, k, wTypeId, use_plugin):
+        self._woq_matmul(m, n, k, 'float16', wTypeId, use_plugin)
 
     @parameterized.expand([
-        (1024, 4096, 'float16', 1), (4096, 512, 'float16', 1),
-        (1024, 4096, 'float16', 2), (4096, 512, 'float16', 2)
+        (1, 1024, 4096, 1, True),
+        (1, 1024, 4096, 1, False),
+        (64, 6144, 12288, 1, True),  # BF16 * INT8
+        (1, 1024, 4096, 2, True),
+        (256, 6144, 12288, 2, True),  # BF16 * INT4
     ])
-    def test_conversion(self, n, k, dtype, wTypeId):
+    @unittest.skipIf(getSMVersion() < 80, "Bfloat requires Ampere or later.")
+    def test_matmul_bf16_act(self, m, n, k, wTypeId, use_plugin):
+        self._woq_matmul(m, n, k, 'bfloat16', wTypeId, use_plugin)
+
+    def _conversion_helper(self, n, k, dtype, wTypeId):
         weight_ref = _utils.woq_gen_weights(n, k, dtype)
         ref_int, perm_int, scale = _utils.woq_conversion(weight_ref, wTypeId)
         weight_act = self._unconvert_weights(perm_int, scale, dtype, wTypeId)
 
-        _utils.woq_assert_colwise_near_eq(weight_ref, weight_act, wTypeId)
+        _utils.woq_assert_near_eq(weight_ref, weight_act, wTypeId)
+
+    @parameterized.expand([(1024, 4096, 1), (4096, 512, 1), (1024, 4096, 2),
+                           (4096, 512, 2)])
+    def test_fp16_conversion(self, n, k, wTypeId):
+        self._conversion_helper(n, k, 'float16', wTypeId)
+
+    @parameterized.expand([(1024, 4096, 1), (4096, 512, 1), (1024, 4096, 2),
+                           (4096, 512, 2)])
+    @unittest.skipIf(getSMVersion() < 80, "Bfloat requires Ampere or later.")
+    def test_bf16_conversion(self, n, k, wTypeId):
+        self._conversion_helper(n, k, 'bfloat16', wTypeId)
 
 
 if __name__ == '__main__':

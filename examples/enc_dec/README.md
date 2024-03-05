@@ -69,7 +69,7 @@ We should distinguish between `X` - TP size and `Y` - total number of GPU ranks:
 # Example 1: build t5-small using a single GPU, FP32, running greedy search
 # use_gpt_attention_plugin is necessary in Enc-Dec.
 # Try use_gemm_plugin to prevent accuracy issue.
-# It is recommend to use --remove_input_padding along with --use_gpt_attention_plugin for better performance
+# It is recommended to use --remove_input_padding along with --use_gpt_attention_plugin for better performance
 python build.py --model_type t5 \
                 --weight_dir tmp/trt_models/t5-small/tp1 \
                 -o tmp/trt_engines/t5-small/1-gpu \

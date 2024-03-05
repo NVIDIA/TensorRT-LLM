@@ -806,17 +806,12 @@ def convert_hf_llama(hf_model,
     num_key_value_heads = hf_model.config.num_key_value_heads
     mha_mode = (num_key_value_heads == num_attention_heads)
 
-    layers_per_pipeline_stage = hf_model.config.num_hidden_layers // mapping.pp_size
-    layers_range = list(
-        range(mapping.pp_rank * layers_per_pipeline_stage,
-              (mapping.pp_rank + 1) * layers_per_pipeline_stage, 1))
-
-    for l in range(hf_model.config.num_hidden_layers):
-        if l not in layers_range:
-            continue
+    num_hidden_layers = hf_model.config.num_hidden_layers
+    layers_range = mapping.pp_layers(num_hidden_layers)
+    for l in layers_range:
+        layer_idx = l - layers_range[0]
         prefix = f'model.layers.{l}.'
-        idx = int(l) - mapping.pp_rank * layers_per_pipeline_stage
-        tllm_prex = f'transformer.layers.{idx}.'
+        tllm_prex = f'transformer.layers.{layer_idx}.'
 
         q_weight = get_weight(model_params, prefix + 'self_attn.q_proj', dtype)
         k_weight = get_weight(model_params, prefix + 'self_attn.k_proj', dtype)

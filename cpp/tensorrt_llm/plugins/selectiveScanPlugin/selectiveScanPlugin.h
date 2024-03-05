@@ -29,19 +29,19 @@ namespace tensorrt_llm::plugins
 // can not support beam search
 
 // inputs
-//     0.  input_tensor [batch_size, dim, seq_len]
-//     1.  state [batch_size, dim, dstate]
-//     2.  delta [batch_size, dim, seq_len]
+//     0.  input_tensor [batch_size, seq_len, dim]
+//     1.  state [batch_size, dstate, dim]
+//     2.  delta [batch_size, seq_len, dim]
 //     3.  delta_bias [dim]
-//     4.  A [dim, seq_len]
-//     5.  B [batch_size, dstate, seq_len]
-//     6.  C [batch_size, dstate, seq_len]
+//     4.  A [dstate, dim]
+//     5.  B [batch_size, seq_len, dstate]
+//     6.  C [batch_size, seq_len, dstate]
 //     7.  D [dim]
-//     8.  z [batch_size, dim, seq_len]
+//     8.  z [batch_size, seq_len, dim]
 //     9.  host_request_types [batch_size] int32. 0: context; 1: generation; 2: none.
 // outputs
-//     0. output_tensor [batch_size, dim, seq_len]
-//     1. state [batch_size, dim, dstate]
+//     0. output_tensor [batch_size, seq_len, dim]
+//     1. state [batch_size, dstate, dim]
 
 class SelectiveScanPlugin : public BasePlugin
 {
@@ -144,15 +144,11 @@ private:
 
     void setSSMParams(tensorrt_llm::kernels::SSMParamsBase& params,
         // sizes
-        const size_t batch, const size_t dim, const size_t seqLen, const size_t dstate, const size_t nChunks,
-        const bool isVariableB, const bool isVariableC,
+        const size_t batch, const size_t dim, const size_t seqLen, const size_t dstate, const bool isVariableB,
+        const bool isVariableC,
         // device pointers
         void* statePtr, const void* x, const void* delta, const void* deltaBias, const void* A, const void* B,
-        const void* C, const void* D, const void* z, void* out,
-        // strides
-        const size_t strideXBatch, const size_t strideDtBatch, const size_t strideADim, const size_t strideBBatch,
-        const size_t strideCBatch, const size_t strideZBatch, const size_t strideOutBatch,
-        const size_t strideStateBatch, const size_t strideStateDim, bool deltaSoftplus);
+        const void* C, const void* D, const void* z, void* out, bool deltaSoftplus);
 
 private:
     int mDim;

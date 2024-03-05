@@ -80,29 +80,71 @@ class BaseBenchmark(object):
             with open(config_path, 'r') as f:
                 self.config = json.load(f)
             # Sanity checks
-            config_dtype = self.config['builder_config']['precision']
-            assert dtype == config_dtype, f"Engine dtype ({config_dtype}) != Runtime dtype ({dtype})"
-            world_size = self.config['builder_config']['tensor_parallel']
-            assert world_size == self.world_size, \
-                (f'Engine world size ({world_size}) != Runtime world size ({self.world_size})')
-            # Load config into self
-            for key, value in self.config['builder_config'].items():
-                if key == "quant_mode":
-                    self.quant_mode = QuantMode(value)
-                elif key in "name":
-                    self.engine_model_name = value
-                else:
+            if 'pretrained_config' in self.config:  # new build api branch
+                config_dtype = self.config['pretrained_config']['dtype']
+                assert dtype == config_dtype, f"Engine dtype ({config_dtype}) != Runtime dtype ({dtype})"
+                world_size = self.config['pretrained_config']['mapping'][
+                    'world_size']
+                assert world_size == self.world_size, \
+                    (f'Engine world size ({world_size}) != Runtime world size ({self.world_size})')
+                # Load config into self
+                for key, value in self.config['pretrained_config'].items():
                     setattr(self, key, value)
-            self.enable_fp8 = self.quant_mode.has_fp8_qdq()
-            self.fp8_kv_cache = self.quant_mode.has_fp8_kv_cache()
-            for key, value in self.config['plugin_config'].items():
-                # Same effect as self.use_foo_plugin = config.json["foo_plugin"]
-                if "plugin" in key:
-                    key = "use_" + key
-                setattr(self, key, value)
 
-        self.engine_name = get_engine_name(self.engine_model_name, self.dtype,
-                                           self.world_size, self.runtime_rank)
+                self.quant_mode = QuantMode.from_quant_algo(
+                    quant_algo=self.quantization['quant_algo'],
+                    kv_cache_quant_algo=self.quantization['kv_cache_quant_algo']
+                )
+                self.enable_fp8 = self.quant_mode.has_fp8_qdq()
+                self.fp8_kv_cache = self.quant_mode.has_fp8_kv_cache()
+
+                for key, value in self.config['build_config'].items():
+                    setattr(self, key, value)
+
+                for key, value in self.plugin_config.items():
+                    if "plugin" in key:
+                        key = "use_" + key
+                    setattr(self, key, value)
+
+                self.engine_name = f"rank{self.runtime_rank}.engine"
+
+                self.num_kv_heads = self.num_key_value_heads
+                self.num_layers = self.num_hidden_layers
+                self.num_heads = self.num_attention_heads
+            else:
+                # Read config from engine directory
+                config_path = os.path.join(engine_dir, 'config.json')
+                with open(config_path, 'r') as f:
+                    self.config = json.load(f)
+                # Sanity checks
+                config_dtype = self.config['builder_config']['precision']
+                assert dtype == config_dtype, f"Engine dtype ({config_dtype}) != Runtime dtype ({dtype})"
+                world_size = self.config['builder_config']['tensor_parallel']
+                assert world_size == self.world_size, \
+                    (f'Engine world size ({world_size}) != Runtime world size ({self.world_size})')
+                # Load config into self
+                for key, value in self.config['builder_config'].items():
+                    if key == "quant_mode":
+                        self.quant_mode = QuantMode(value)
+                    elif key in "name":
+                        self.engine_model_name = value
+                    else:
+                        setattr(self, key, value)
+                self.enable_fp8 = self.quant_mode.has_fp8_qdq()
+                self.fp8_kv_cache = self.quant_mode.has_fp8_kv_cache()
+                for key, value in self.config['plugin_config'].items():
+                    # Same effect as self.use_foo_plugin = config.json["foo_plugin"]
+                    if "plugin" in key:
+                        key = "use_" + key
+                    setattr(self, key, value)
+                self.engine_name = get_engine_name(self.engine_model_name,
+                                                   self.dtype, self.world_size,
+                                                   self.runtime_rank)
+        else:
+            self.engine_name = get_engine_name(self.engine_model_name,
+                                               self.dtype, self.world_size,
+                                               self.runtime_rank)
+
         self.runtime_mapping = tensorrt_llm.Mapping(world_size=self.world_size,
                                                     rank=self.runtime_rank,
                                                     tp_size=self.world_size)

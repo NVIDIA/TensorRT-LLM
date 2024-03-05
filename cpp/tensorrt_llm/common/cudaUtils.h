@@ -283,23 +283,23 @@ inline std::tuple<size_t, size_t> getDeviceMemoryInfo(const bool useUvm)
 {
     if (useUvm)
     {
-        size_t freeSysmem, totalSysmem;
+        size_t freeSysMem, totalSysMem;
 #ifndef _WIN32 // Linux
         struct sysinfo info;
         sysinfo(&info);
-        totalSysmem = info.totalram * info.mem_unit;
-        freeSysmem = info.freeram * info.mem_unit;
+        totalSysMem = info.totalram * info.mem_unit;
+        freeSysMem = info.freeram * info.mem_unit;
 #else  // Windows
         MEMORYSTATUSEX memInfo;
         memInfo.dwLength = sizeof(memInfo);
         GlobalMemoryStatusEx(&memInfo);
-        totalSysmem = memInfo.ullTotalPhys;
-        freeSysmem = memInfo.ullAvailPhys;
+        totalSysMem = memInfo.ullTotalPhys;
+        freeSysMem = memInfo.ullAvailPhys;
 #endif // WIN32
 
         TLLM_LOG_INFO("Using UVM based system memory for KV cache, total memory %0.2f GB, available memory %0.2f GB",
-            ((double) totalSysmem / 1e9), ((double) freeSysmem / 1e9));
-        return {freeSysmem, totalSysmem};
+            ((double) totalSysMem / 1e9), ((double) freeSysMem / 1e9));
+        return {freeSysMem, totalSysMem};
     }
     else
     {

@@ -103,7 +103,8 @@ For example, setting mean=100 and std dev=10 would generate requests where 95.4%
   --tokenizer <path/to/tokenizer> \
    token-norm-dist \
    --num-requests 100 \
-   --input-mean 100 --input-stdev 10 --output-mean 15 --output-stdev 0 --num-requests 100
+   --input-mean 100 --input-stdev 10 \
+   --output-mean 15 --output-stdev 0
 ```
 
 For `tokenizer`, specifying the path to the local tokenizer that have already been downloaded, or simply the name of the tokenizer from HuggingFace like `meta-llama/Llama-2-7b` will both work. The tokenizer will be downloaded automatically for the latter case.
@@ -141,8 +142,25 @@ mpirun -n 2 ./benchmarks/gptManagerBenchmark \
     --max_num_samples 500
 ```
 
-To emulate `gptSessionBenchmark` static batching, you can use the `--static_emulated_batch_size` and `--static_emulated-timeout` arguments.
-Given a `static_emulated_batch_size` of `n` the server will wait for `n` requests to arrive before submitting them to the batch manager at once. If the `static_emulated-timeout` (in ms) is reached before `n` requests are collected, the batch will be submitted prematurely with the current request count.
+`gptManagerBenchmark` can also be used with the high-level C++ API defined by the `executor::Executor` class (see `cpp/include/tensorrt_llm/executor/executor.h`). This can be done by passing the argument `--api executor`. Note that the Executor class is still under development and currently does not support models with tp or pp > 1.
+
+#### Emulated static batching
+
+To emulate `gptSessionBenchmark` static batching, you can use `gptManagerBenchmark` with the `--static_emulated_batch_size` and `--static_emulated-timeout` arguments.
+Given a `static_emulated_batch_size` of `n` the server will wait for `n` requests to arrive before submitting them to the batch manager at once. If the `static_emulated_timeout` (in ms) is reached before `n` requests are collected, the batch will be submitted prematurely with the current request count. New batches will only be submitted once the previous batch has been processed comepletely.
+
+`gptSessionBenchmark` uses fixed input/output lengths for benchmarking. A similar dataset for `gptManagerBenchmark` can be generated with the preprocessing script, e.g.
+```
+ python prepare_dataset.py \
+  --output tokens-fixed-lengths.json \
+  --request-rate -1 \
+  --time-delay-dist constant \
+  --tokenizer <path/to/tokenizer> \
+   token-norm-dist \
+   --num-requests 128 \
+   --input-mean 60 --input-stdev 0 \
+   --output-mean 20 --output-stdev 0
+```
 
 Take GPT-350M as an example for single GPU with static batching
 ```
@@ -152,7 +170,5 @@ Take GPT-350M as an example for single GPU with static batching
     --type IFB \
     --static_emulated_batch_size 32 \
     --static_emulated_timeout 100 \
-    --dataset ../../benchmarks/cpp/preprocessed_dataset.json
+    --dataset ../../benchmarks/cpp/tokens-fixed-lengths.json
 ```
-
-`gptManagerBenchmark` can also be used with the high-level C++ API defined by the `executor::Executor` class (see `cpp/include/tensorrt_llm/executor/executor.h`). This can be done by passing the argument `--api executor`. Note that the Executor class is still under development and currently does not support models with tp or pp > 1.

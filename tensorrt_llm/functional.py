@@ -739,7 +739,7 @@ def swiglu(input: Tensor) -> Tensor:
 
     That function takes a tensor, splits it into two halves along the last
     dimension, applies SiLU to the second half and multiply the results. The
-    behaviour is undefined if the last dimension is not even.
+    behavior is undefined if the last dimension is not even.
 
     Parameters:
         input : Tensor
@@ -1066,7 +1066,7 @@ def slice(input: Tensor,
     the 2nd row (because start[0] == 1) and two columns (size[1] == 2) starting
     from the 1st column (because start[1] == 0).
 
-    In pseudo-code the behaviour of that operation can be described as follows
+    In pseudo-code the behavior of that operation can be described as follows
     for a 2D tensor (and easily be extended to more dimensions):
 
         output = Tensor(shape=sizes)
@@ -1132,6 +1132,34 @@ def slice(input: Tensor,
         layer.set_input(3, strides.trt_tensor)
 
     return _create_tensor(layer.get_output(0), layer)
+
+
+def conditional(condition: Tensor, true_input: Tensor,
+                false_input: Tensor) -> Tensor:
+    '''
+    Add an operation to conditionally execute two code paths/subgraphs.
+
+    Parameters:
+        condition : Tensor
+            The condition tensor. If the condition is true, the operation will
+            return the true_input tensor, otherwise the false_input tensor.
+
+        true_input : Tensor
+            The tensor to return if the condition is true.
+
+        false_input : Tensor
+            The tensor to return if the condition is false.
+    '''
+    if condition.ndim() > 0:
+        condition = view(condition, [])
+    cond_trt_ = condition.trt_tensor
+    layer = default_trtnet().add_if_conditional()
+    layer.set_condition(cond_trt_)
+    true_subgraph = layer.add_input(true_input.trt_tensor)
+    false_subgraph = layer.add_input(false_input.trt_tensor)
+    output = layer.add_output(true_subgraph.get_output(0),
+                              false_subgraph.get_output(0))
+    return _create_tensor(output.get_output(0), output)
 
 
 # TODO: support step.
@@ -1219,7 +1247,7 @@ def expand(input: Tensor, expand_shape: Tensor) -> Tensor:
 
         expand(input, [3, 2, 2])
 
-    will produce a tensor of shape [3, 2, 2]. That behaviour is subject to
+    will produce a tensor of shape [3, 2, 2]. That behavior is subject to
     change in the future.
 
     Parameters:
@@ -1267,7 +1295,7 @@ def einsum(einsum_eq: str, inputs: Sequence[Tensor]) -> Tensor:
     The equation specifies ASCII lower-case letters for each dimension in the
     inputs in the same order as the dimensions, separated by comma for each
     input. The dimensions labeled with the same subscript must match or be
-    broadcastable. Repeated subscript labels in one input take the diagonal.
+    able to be broadcasted. Repeated subscript labels in one input take the diagonal.
     Repeating a label across multiple inputs means that those axes will be
     multiplied. Omitting a label from the output means values along those axes
     will be summed. In implicit mode, the indices which appear once in the
@@ -1310,7 +1338,7 @@ def permute(input: Tensor, dims: Sequence[int]) -> Tensor:
     '''
     Add an operation to permute the dimensions of a tensor.
 
-    The dimensions of the input tensor are permutted according to the sequence
+    The dimensions of the input tensor are permuted according to the sequence
     of dimensions in 'dims'. That operation maps to tensorrt.IShuffleLayer where
     the second transposition is described by the indices in 'dims'.
 
@@ -1813,7 +1841,7 @@ def masked_select(input: Tensor, mask: Tensor) -> Tensor:
     a new tensor. The output tensor is a 1-D tensor.
 
     The input tensor must have rank >= 1. The shapes of the input tensor and
-    the mask tensor don’t need to match, but they must be broadcastable.
+    the mask tensor don’t need to match, but they must be able to be broadcasted.
 
     For example, on input=[[4, 2, 5], [2, 1, 2], [4, 7, 1]], which has a shape
     [3, 3],
@@ -2657,7 +2685,7 @@ def geglu(x: Tensor) -> Tensor:
 
     That function takes a tensor, splits it into two halves along the last
     dimension, applies GELU to the second half and multiply the results. The
-    behaviour is undefined if the last dimension is not even.
+    behavior is undefined if the last dimension is not even.
 
     Parameters:
         input : Tensor
@@ -3341,7 +3369,7 @@ def bert_attention(tensor: Tensor,
     '''
     Add an operation that performs the multi-head attention in BERT.
 
-    The multihead-attention (MHA) is the sequence of a batched matmul, a
+    The multi-head attention (MHA) is the sequence of a batched matmul, a
     softmax and a batched matmul as described in
     https://arxiv.org/abs/1706.03762. That function adds an operation that
     performs those computations using a single GPU kernel.
@@ -4081,7 +4109,8 @@ def generate_alibi_slopes(num_heads: int,
                           dtype: trt.DataType = trt.float32,
                           tp_size: int = 1,
                           tp_rank: int = 0,
-                          alibi_scale: float = 1.0) -> Tensor:
+                          alibi_scale: float = 1.0,
+                          alibi_bias_max: int = 8) -> Tensor:
     '''
     Compute the ALiBi slopes as described in https://arxiv.org/abs/2211.05100.
 
@@ -4113,12 +4142,15 @@ def generate_alibi_slopes(num_heads: int,
     for h_id in range(start_head_id, end_head_id):
         if h_id < closest_power_of_2:
             slopes_ft.append(
-                np.power(2**(-(2**-(np.log2(closest_power_of_2) - 3))),
-                         h_id + 1))
+                np.power(
+                    2**(-(2**-(np.log2(closest_power_of_2) -
+                               np.log2(alibi_bias_max)))), h_id + 1))
         else:
             slopes_ft.append(
-                np.power(2**(-(2**-(np.log2(closest_power_of_2 * 2) - 3))),
-                         (h_id - closest_power_of_2) * 2 + 1))
+                np.power(
+                    2**(-(2**-(np.log2(closest_power_of_2 * 2) -
+                               np.log2(alibi_bias_max)))),
+                    (h_id - closest_power_of_2) * 2 + 1))
     slopes = np.asarray(slopes_ft, dtype=np.float32)
 
     slopes = alibi_scale * slopes
@@ -4139,7 +4171,7 @@ def generate_alibi_biases(slopes: Tensor, key_length: Tensor) -> Tensor:
     Compute the ALiBi biases as described in https://arxiv.org/abs/2211.05100.
 
     The ALiBi biases are added to the result of the Q*K^T product in the
-    multihead-attention block.
+    multi-head attention block.
 
     Parameters:
         slopes : Tensor
@@ -4169,7 +4201,7 @@ def expand_mask(mask: Tensor, tgt_len: Optional[Tensor] = None) -> Tensor:
     shape '[batch_size, src_seq_len]' to a tensor of shape
     '[batch_size, 1, tgt_seq_len, src_seq_len]'. It can be used to create the
     mask applied to the Q*K^T product before the softmax operation in the
-    multihead-attention block.
+    multi-head attention block.
 
     Parameters:
         mask : Tensor
@@ -4458,52 +4490,39 @@ def lora_plugin(
         ]
 
 
-def selective_scan(
-    input: Tensor,
-    state: Tensor,
-    delta: Tensor,
-    delta_bias: Tensor,
-    A: Tensor,
-    B: Tensor,
-    C: Tensor,
-    D: Tensor,
-    z: Tensor,
-    host_request_types: Tensor,
-    dim: int,
-    dstate: int,
-    is_variable_B: bool,
-    is_variable_C: bool,
-    delta_softplus: bool,
-    dtype: str,
-):
+def selective_scan(input: Tensor, state: Tensor, delta: Tensor,
+                   delta_bias: Tensor, A: Tensor, B: Tensor, C: Tensor,
+                   D: Tensor, z: Tensor, host_request_types: Tensor, dim: int,
+                   dstate: int, is_variable_B: bool, is_variable_C: bool,
+                   delta_softplus: bool, dtype: str):
     '''
     Parameters:
         input : Tensor (On GPU)
-            The input tensor. Its shape is [batch_size, dim, seq_len]
+            The input tensor. Its shape is [batch_size, seq_len, dim]
 
         state : Tensor (On GPU)
-            The ssm state tensor. Its shape is [batch_size, dim, dstate]
+            The ssm state tensor. Its shape is [batch_size, dstate, dim]
 
         delta : Tensor (On GPU)
-            The delta tensor. Its shape is [batch_size, dim, seq_len]
+            The delta tensor. Its shape is [batch_size, seq_len, dim]
 
         delta_bias : Tensor (On GPU)
             The delta bias tensor. Its shape is [dim]
 
         A : Tensor (On GPU)
-            A matrix. Its shape is [dim, dstate]
+            A matrix. Its shape is [dstate, dim]
 
         B : Tensor (On GPU)
-            B matrix. Its shape is [batch_size, dstate, seq_len]
+            B matrix. Its shape is [batch_size, seq_len, dstate]
 
         C : Tensor (On GPU)
-            C matrix. Its shape is [batch_size, dstate, seq_len]
+            C matrix. Its shape is [batch_size, seq_len, dstate]
 
         D : Tensor (On GPU)
             D matrix. Its shape is [dim]
 
         z : Tensor (On GPU)
-            The z tensor. Its shape is [batch_size, dim, seq_len]
+            The z tensor. Its shape is [batch_size, seq_len, dim]
 
         host_request_types : Tensor (On CPU)
             The tensor on the host that indicates if a request is in context or
@@ -4552,10 +4571,16 @@ def selective_scan(
         "type_id", np.array([int(str_dtype_to_trt(dtype))], np.int32),
         trt.PluginFieldType.INT32)
 
-    pfc = trt.PluginFieldCollection(
-        [dim, dstate, is_variable_B, is_variable_C, delta_softplus, pf_type])
+    pfc = trt.PluginFieldCollection([
+        dim,
+        dstate,
+        is_variable_B,
+        is_variable_C,
+        delta_softplus,
+        pf_type,
+    ])
     selective_scan_plug = selective_scan_plg_creator.create_plugin(
-        "selectives_can", pfc)
+        "selective_scan", pfc)
 
     plug_inputs = [
         input, state, delta, delta_bias, A, B, C, D, z, host_request_types
@@ -4563,7 +4588,7 @@ def selective_scan(
     plug_inputs = [i.trt_tensor for i in plug_inputs]
 
     layer = default_trtnet().add_plugin_v2(plug_inputs, selective_scan_plug)
-    _add_plugin_info(layer, selective_scan_plg_creator, "selectives_can", pfc)
+    _add_plugin_info(layer, selective_scan_plg_creator, "selective_scan", pfc)
     output = _create_tensor(layer.get_output(0), layer)
     present_state = _create_tensor(layer.get_output(1), layer)
     return output, present_state

@@ -196,7 +196,7 @@ class BlocksManager(object):
 
     def get_pointer_array(self, pool_idx: int, beam_width: int) -> torch.Tensor:
         """
-        Returns array of [batch size, beam_width, 2, max_blocks_per_seq] of poitners
+        Returns array of [batch size, beam_width, 2, max_blocks_per_seq] of pointers
         to the allocated blocks in memory pool
         """
         assert (beam_width <= self.beam_width)
@@ -224,21 +224,21 @@ class BlocksManager(object):
         self.pointer_array = torch.tensor(pointer_array, dtype=torch.int64)
         return self.pointer_array
 
-    def get_continous_caches(self, pool_idx: int) -> torch.Tensor:
+    def get_continuous_caches(self, pool_idx: int) -> torch.Tensor:
         """
-        Returns countinous KV caches.
+        Returns continuous KV caches.
         Used only for debug purposes.
         """
         assert self.beam_width == 1
 
         elts_per_block = self.elts_per_blocks[pool_idx]
         pool = self.memory_pools[pool_idx].flatten()
-        continous_kv_cache = torch.zeros(len(self.allocated_blocks),
-                                         2,
-                                         self.max_blocks_per_seq *
-                                         elts_per_block,
-                                         dtype=pool.dtype,
-                                         device="cuda")
+        continuous_kv_cache = torch.zeros(len(self.allocated_blocks),
+                                          2,
+                                          self.max_blocks_per_seq *
+                                          elts_per_block,
+                                          dtype=pool.dtype,
+                                          device="cuda")
         for owner, beam_blocks in self.allocated_blocks.items():
             for bi in range(self.beam_width):
                 for block_linear_idx, block in enumerate(beam_blocks[bi]):
@@ -251,14 +251,14 @@ class BlocksManager(object):
                     # The first index in the pool for V.
                     v_start = k_start + self.blocks * elts_per_block
 
-                    continous_kv_cache[batch_idx][0][
+                    continuous_kv_cache[batch_idx][0][
                         block_offset:block_offset +
                         elts_per_block] = pool[k_start:k_start + elts_per_block]
-                    continous_kv_cache[batch_idx][1][
+                    continuous_kv_cache[batch_idx][1][
                         block_offset:block_offset +
                         elts_per_block] = pool[v_start:v_start + elts_per_block]
 
-        return continous_kv_cache
+        return continuous_kv_cache
 
 
 class KVCacheManager(object):

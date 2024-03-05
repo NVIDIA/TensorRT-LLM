@@ -292,7 +292,7 @@ class NaivePatternRewriter_ReplaceAddWithSub(PatternRewriter):
     def __init__(self):
         super().__init__('replace_add_with_sub',
                          root_layer={trt.LayerType.ELEMENTWISE},
-                         seperate_match_rewrite=True)
+                         separate_match_rewrite=True)
         self.rewrite_count = 0
 
     def match(self, layer: Layer):

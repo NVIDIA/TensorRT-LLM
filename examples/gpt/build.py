@@ -68,6 +68,7 @@ def override_args_from_model_dir(args: argparse.Namespace) -> None:
         parsed_params = parse_ft_config(Path(args.model_dir) / "config.ini")
         args.n_embd = parsed_params["n_embd"]
         args.n_head = parsed_params["n_head"]
+        args.n_kv_head = parsed_params["n_kv_head"]
         args.n_layer = parsed_params["n_layer"]
         args.n_positions = parsed_params["n_positions"]
         args.vocab_size = parsed_params["vocab_size"]
@@ -82,6 +83,8 @@ def override_args_from_model_dir(args: argparse.Namespace) -> None:
         args.dtype = parsed_params["dtype"]
         args.inter_size = parsed_params["inter_size"]
         args.multi_query_mode = parsed_params["multi_query_mode"]
+    else:
+        args.n_kv_head = 1 if args.multi_query_mode else args.n_head
 
 
 def parse_arguments(args):
@@ -167,7 +170,7 @@ def parse_arguments(args):
         action='store_true',
         help=
         'Split long kv sequence into multiple blocks (applied to generation MHA kernels). \
-                        It is beneifical when batchxnum_heads cannot fully utilize GPU.'
+                        It is beneficial when batch x num_heads cannot fully utilize GPU.'
     )
     parser.add_argument('--gpus_per_node', type=int, default=8)
     parser.add_argument('--builder_opt', type=int, default=None)
@@ -549,6 +552,7 @@ def build_rank_engine(builder: Builder,
     tensorrt_llm_gpt = tensorrt_llm.models.GPTLMHeadModel(
         num_layers=args.n_layer,
         num_heads=args.n_head,
+        num_kv_heads=args.n_kv_head,
         hidden_size=args.n_embd,
         inter_size=args.inter_size,
         vocab_size=args.vocab_size,
@@ -568,7 +572,6 @@ def build_rank_engine(builder: Builder,
         apply_query_key_layer_scaling,
         quant_mode=args.quant_mode,
         bias=args.bias,
-        num_kv_heads=1 if args.multi_query_mode else args.n_head,
         use_prompt_tuning=args.max_prompt_embedding_table_size > 0,
         use_parallel_embedding=args.use_parallel_embedding,
         embedding_sharding_dim=args.embedding_sharding_dim,
@@ -712,7 +715,6 @@ def build(rank, args):
         int8_trt_flag = args.quant_mode.has_act_or_weight_quant() or (
             args.paged_kv_cache == False
             and args.quant_mode.has_int8_kv_cache())
-        num_kv_heads = 1 if args.multi_query_mode else args.n_head
         builder_config = builder.create_builder_config(
             name=MODEL_NAME,
             precision=args.dtype,
@@ -722,7 +724,7 @@ def build(rank, args):
             parallel_build=args.parallel_build,
             num_layers=args.n_layer,
             num_heads=args.n_head,
-            num_kv_heads=num_kv_heads,
+            num_kv_heads=args.n_kv_head,
             hidden_size=args.n_embd,
             vocab_size=args.vocab_size,
             hidden_act=args.hidden_act,
@@ -753,7 +755,7 @@ def build(rank, args):
                                    cur_rank, args)
         assert engine is not None, f'Failed to build engine for rank {cur_rank}'
 
-        local_num_kv_heads = (num_kv_heads + args.world_size -
+        local_num_kv_heads = (args.n_kv_head + args.world_size -
                               1) // args.world_size
         kv_dtype = str_dtype_to_trt(args.dtype)
         if args.quant_mode.has_int8_kv_cache():
@@ -797,7 +799,7 @@ def run_build(args=None):
     if args.parallel_build and args.world_size > 1 and \
             torch.cuda.device_count() >= args.world_size:
         logger.warning(
-            f'Parallelly build TensorRT engines. Please make sure that all of the {args.world_size} GPUs are totally free.'
+            f'Parallel build TensorRT engines. Please make sure that all of the {args.world_size} GPUs are totally free.'
         )
         mp.spawn(build, nprocs=args.world_size, args=(args, ))
     else:

@@ -368,7 +368,7 @@ class WeightOnlyQuantLinear(Module):
         if self.weight_only_quant_mode == 2 and not default_net(
         ).plugin_config.weight_only_quant_matmul_plugin:
             raise TypeError(
-                "Int4 Weight Only Qunat MatMul is only supported with plugin")
+                "Int4 Weight-only Quant MatMul is only supported with plugin")
 
         x = weight_only_quant_matmul(x, self.weight.value,
                                      self.per_channel_scale.value,
@@ -654,7 +654,7 @@ class SmoothQuantMLP(Module):
         inter = inter / value
         if self.quant_mode.has_act_and_weight_quant():
             if self.quant_mode.has_act_static_scaling():
-                # Avoid quantiztion layers as it breaks int8 plugins
+                # Avoid quantization layers as it breaks int8 plugins
                 inter = quantize_tensor(inter,
                                         self.quantization_scaling_factor.value)
             else:
@@ -929,7 +929,7 @@ class SmoothQuantGatedMLP(SmoothQuantMLP):
         inter_x_gate = inter_x_gate / smoother
         if self.quant_mode.has_act_and_weight_quant():
             if self.quant_mode.has_act_static_scaling():
-                # Avoid quantiztion layers as it breaks int8 plugins
+                # Avoid quantization layers as it breaks int8 plugins
                 inter_x_gate = quantize_tensor(
                     inter_x_gate, self.quantization_scaling_factor.value)
             else:
@@ -1233,7 +1233,7 @@ class SmoothQuantAttention(Module):
         context = context / value
         if self.quant_mode.has_act_and_weight_quant():
             if self.quant_mode.has_act_static_scaling():
-                # Avoid quantiztion layers as it breaks int8 plugins
+                # Avoid quantization layers as it breaks int8 plugins
                 context = quantize_tensor(
                     context, self.quantization_scaling_factor.value)
             else:

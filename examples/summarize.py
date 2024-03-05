@@ -158,14 +158,6 @@ def main(args):
                     max_input_length=test_token_num,
                 )
                 input_ids = torch.tensor(input_id_list)
-            elif model_name == 'GemmaForCausalLM':
-                input_ids = tokenizer.encode(
-                    curr_text,
-                    add_special_tokens=add_special_tokens,
-                    truncation=True,
-                    max_length=test_token_num -
-                    1)  # minus 1 to add bos_token_id
-                input_ids = torch.tensor([tokenizer.bos_token_id] + input_ids)
             else:
                 input_ids = tokenizer.encode(
                     curr_text,
@@ -624,7 +616,7 @@ if __name__ == '__main__':
         type=int,
         default=None,
         help=
-        'The attention window size that controls the sliding window attention / cyclic kv cache behaviour'
+        'The attention window size that controls the sliding window attention / cyclic kv cache behavior'
     )
     parser.add_argument('--sink_token_length',
                         type=int,

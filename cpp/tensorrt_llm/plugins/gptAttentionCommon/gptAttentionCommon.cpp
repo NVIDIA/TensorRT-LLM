@@ -823,6 +823,9 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
     if (mEnableContextFMHA)
     {
         const bool enablePagedKVContextFMHA = mPagedKVCache && mPagedContextFMHA;
+        // Paged Context FMHA doesn't work with fp8/int8 kv cache currently.
+        TLLM_CHECK_WITH_INFO(cache_type == KvCacheDataType::BASE || !enablePagedKVContextFMHA,
+            "Paged Context FMHA doesn't work with fp8/int8 kv cache currently.");
         invokeApplyBiasRopeUpdateKVCache(const_cast<T*>(params.attention_input), q_buf_2_, kv_cache_buffer,
             const_cast<T*>(params.qkv_bias), params.q_seq_lengths, params.kv_seq_lengths,
             mRemovePadding ? padding_offset : nullptr, params.batch_size, params.input_seq_length,

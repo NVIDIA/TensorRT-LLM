@@ -252,7 +252,7 @@ populates an instance of the
  * `embeddingBiasOpt`, is a tensor of floating-point values on the GPU that
    contains the bias to add to the logits during sampling (after the projection
    from hidden states to logits as the last step of the model). This tensor
-   must have `vocabSize` elements (as defined in the `ModelConfig` argument
+   must have `vocabSize` elements (as defined in the `modelConfig` argument
    passed to the constructor),
  * `badWordsList`, is a tensor of integers on the GPU that encodes the list of
    words that have to be banned from generated sequences. Its shape is `[2,
@@ -315,8 +315,7 @@ batchSize, beamWidth]`_.
    After inference is complete, you can get the context logits in `GenerationOutput.contextLogits`, these are variables on the GPU. For specific acquisition methods, please refer to the example of [gptSessionBenchmark.cpp](https://github.com/NVIDIA/TensorRT-LLM/blob/main/benchmarks/cpp/gptSessionBenchmark.cpp).
 
    It is important to point out
-   that enabling that computation may have an impact on performance (the final
-   LM head has to perform a matrix multiplication on all the context tokens
+   that enabling the computation may have an impact on performance (the language modeling head (LM head) has to perform a matrix multiplication on all the context tokens
    instead of a just the last one).
  * `generationLogits`, is a tensor of values on the GPU (same datatype as the
    computation type) to store the logits for the generation. Its shape is

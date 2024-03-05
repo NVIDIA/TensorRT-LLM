@@ -533,8 +533,7 @@ def build(rank, args):
             hf_modules_to_trtllm_modules=args.hf_modules_to_trtllm_modules
             if args.use_lora_plugin else None,
             trtllm_modules_to_hf_modules=args.trtllm_modules_to_hf_modules
-            if args.use_lora_plugin else None,
-        )
+            if args.use_lora_plugin else None)
 
         engine_name = get_engine_name(args.engine_name, args.dtype,
                                       args.tp_size, args.pp_size, cur_rank)
@@ -588,7 +587,7 @@ def run_build(component):
     if args.parallel_build and args.world_size > 1 and \
             torch.cuda.device_count() >= args.world_size:
         logger.warning(
-            f'Parallelly build TensorRT engines. Please make sure that all of the {args.world_size} GPUs are totally free.'
+            f'Parallel build TensorRT engines. Please make sure that all of the {args.world_size} GPUs are totally free.'
         )
         mp.spawn(build, nprocs=args.world_size, args=(args, ))
     else:

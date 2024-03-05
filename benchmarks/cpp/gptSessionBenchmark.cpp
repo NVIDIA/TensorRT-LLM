@@ -120,9 +120,9 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                 auto peakMemFuture = std::async(&monitorMemory, std::ref(done));
                 TLLM_LOG_INFO(memoryCounter.toString());
 
-                std::vector<SizeType> inputLenghtsHost(batchSize, maxInputLength);
-                auto inputLenghts
-                    = bufferManager.copyFrom(inputLenghtsHost, ITensor::makeShape({batchSize}), MemoryType::kGPU);
+                std::vector<SizeType> inputLengthsHost(batchSize, maxInputLength);
+                auto inputLengths
+                    = bufferManager.copyFrom(inputLengthsHost, ITensor::makeShape({batchSize}), MemoryType::kGPU);
 
                 // copy inputs and wrap into shared_ptr
                 GenerationInput::TensorPtr inputIds;
@@ -147,7 +147,7 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                 TLLM_LOG_INFO(memoryCounter.toString());
 
                 GenerationInput generationInput{
-                    endId, padId, std::move(inputIds), std::move(inputLenghts), inputPacked};
+                    endId, padId, std::move(inputIds), std::move(inputLengths), inputPacked};
 
                 // runtime will allocate memory for output if this tensor is empty
                 GenerationOutput generationOutput{
@@ -183,6 +183,8 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                 int iterIdx = 0;
                 float curDuration = 0;
                 std::vector<float> latencies;
+                std::vector<float> generationTimes;
+                auto generationProfiler = std::make_shared<GptSession::GenerationProfiler>();
                 while (iterIdx < numRuns || curDuration / 1000 < duration)
                 {
                     auto const start = std::chrono::steady_clock::now();
@@ -190,7 +192,7 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                     generationOutput.onTokenGenerated
                         = [&numSteps, maxNewTokens](GenerationOutput::TensorPtr const& outputIds, SizeType step,
                               bool finished) { ++numSteps; };
-                    session.generate(generationOutput, generationInput, samplingConfig);
+                    session.generate(generationOutput, generationInput, samplingConfig, generationProfiler);
                     bufferManager.getStream().synchronize();
                     auto const end = std::chrono::steady_clock::now();
 
@@ -198,6 +200,7 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                     float latency = std::chrono::duration<float, std::milli>(end - start).count();
                     curDuration += latency;
                     latencies.emplace_back(latency);
+                    generationTimes.emplace_back(generationProfiler->getElapsedTimeMs());
                 }
 
                 TLLM_LOG_INFO(memoryCounter.toString());
@@ -231,12 +234,16 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                 {
                     auto const averageLatency = curDuration / iterIdx;
                     float const tokensPerSec = batchSize * maxNewTokens / (averageLatency / 1000);
+                    auto const avgGenerationTime
+                        = std::reduce(generationTimes.begin(), generationTimes.end(), 0.0f) / generationTimes.size();
+                    float const generationTokensPerSec = batchSize * maxNewTokens / (avgGenerationTime / 1000);
                     // convert to GB
                     float const peakMemGB = peakMem / 1e9;
                     printf(
                         "[BENCHMARK] batch_size %d input_length %d output_length %d latency(ms) %.2f tokensPerSec "
-                        "%.2f gpu_peak_mem(gb) %.2f\n",
-                        batchSize, maxInputLength, maxNewTokens, averageLatency, tokensPerSec, peakMemGB);
+                        "%.2f generation_time(ms) %.2f generationTokensPerSec %.2f gpu_peak_mem(gb) %.2f\n",
+                        batchSize, maxInputLength, maxNewTokens, averageLatency, tokensPerSec, avgGenerationTime,
+                        generationTokensPerSec, peakMemGB);
                 }
 
                 // logits are store in last rank
@@ -246,7 +253,7 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                     {
                         std::cout << "generationOutput.contextLogits.shape: "
                                   << generationOutput.contextLogits->getShape()
-                                  << std::endl; // (batchsize, prompt_len, vocabsize)
+                                  << std::endl; // (batch_size, prompt_len, vocab_size)
                         std::cout << "generationOutput.contextLogits: " << *generationOutput.contextLogits << std::endl;
                     }
 
@@ -254,7 +261,7 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                     {
                         std::cout << "generationOutput.generationLogits.shape: "
                                   << generationOutput.generationLogits->getShape()
-                                  << std::endl; // (batchsize, beamwidth, maxNewTokens, vocabsize)
+                                  << std::endl; // (batch_size, beam_width, maxNewTokens, vocab_size)
                         generationOutput.generationLogits->reshape(ITensor::makeShape({batchSize * beamWidth,
                             maxNewTokens, modelConfig.getVocabSizePadded(worldConfig.getSize())}));
 

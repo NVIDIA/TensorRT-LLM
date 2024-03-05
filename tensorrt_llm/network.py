@@ -122,7 +122,7 @@ class Network(object):
         # intentionally use **kwargs, user should never call this ctor directly
         # use Builder.create_network() instead
 
-        # Holds the removed layers and disable them in graph rewritings and other phases.
+        # Holds the removed layers and disable them in graph rewriting and other phases.
         # This is a hacky way since INetwork python API doesn't provide a way to remove a layer.
         # TODO: remove this when TensorRT provides a better way to remove a layer
         self._removed_layers: Set[str] = set()

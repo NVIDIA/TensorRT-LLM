@@ -1049,12 +1049,8 @@ int main(int argc, char* argv[])
         padId = result["pad_id"].as<int>();
     }
 
-    std::optional<int32_t> eosId;
     // Argument: End-of-sentence token id
-    if (result.count("eos_id"))
-    {
-        eosId = result["eos_id"].as<int>();
-    }
+    std::optional<int32_t> eosId = result["eos_id"].as<int>();
 
     std::optional<int> staticEmulatedBatchSize;
     // Argument: Static emulated batch size

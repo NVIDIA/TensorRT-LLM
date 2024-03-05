@@ -162,10 +162,11 @@ def split_and_save_weight(tp_rank, saved_dir, split_factor, key, vals,
                           storage_type, act_range, config):
     use_attention_nemo_shape = config.get("use_attention_nemo_shape", False)
     split_gated_activation = config.get("split_gated_activation", False)
+    multi_query_mode = config.get("multi_query_mode", False)
     num_attention_heads = config.get("num_attention_heads", 0)
+    num_key_value_heads = config.get("num_key_value_heads", num_attention_heads)
     tp_size = config.get("tp_size", 1)
     int8_outputs = config.get("int8_outputs", None)
-    multi_query_mode = config.get("multi_query_mode", False)
     local_dim = config.get("local_dim", None)
 
     save_int8 = int8_outputs == "all" or int8_outputs == "kv_cache_only"
@@ -236,6 +237,37 @@ def split_and_save_weight(tp_rank, saved_dir, split_factor, key, vals,
             b_q, b_kv = np.split(val, [local_dim], axis=-1)
             b_q_split = np.split(b_q, split_factor, axis=-1)
             split_vals = [np.concatenate((i, b_kv), axis=-1) for i in b_q_split]
+        elif num_attention_heads != num_key_value_heads:
+            # GQA mode
+            # split_vals = np.split(vals[0], split_factor, axis=-1)
+            assert num_key_value_heads % split_factor == 0
+            val = vals[0]
+            qkv_hidden_dim = val.shape[0]
+            size_per_head = qkv_hidden_dim // (num_attention_heads +
+                                               2 * num_key_value_heads)
+            num_attention_heads // num_key_value_heads
+
+            val = val.reshape(num_attention_heads + 2 * num_key_value_heads,
+                              size_per_head)
+
+            # Split the QKV to separate variables.
+            qkv = np.split(val, [
+                num_attention_heads, num_attention_heads + num_key_value_heads
+            ],
+                           axis=0)
+
+            q_split = np.split(qkv[0], split_factor, axis=0)
+            k_split = np.split(qkv[1], split_factor, axis=0)
+            v_split = np.split(qkv[2], split_factor, axis=0)
+
+            # Concatenate Q, K, and V together
+            split_vals = [
+                np.concatenate([
+                    q_split[i].reshape(-1), k_split[i].reshape(-1),
+                    v_split[i].reshape(-1)
+                ],
+                               axis=0) for i in range(split_factor)
+            ]
         else:
             if use_attention_nemo_shape:
                 head_num = num_attention_heads // tp_size
@@ -261,6 +293,35 @@ def split_and_save_weight(tp_rank, saved_dir, split_factor, key, vals,
             w_q, w_kv = np.split(val, [local_dim], axis=-1)
             w_q_split = np.split(w_q, split_factor, axis=-1)
             split_vals = [np.concatenate((i, w_kv), axis=-1) for i in w_q_split]
+        elif num_attention_heads != num_key_value_heads:
+            # GQA mode.
+            assert num_key_value_heads % split_factor == 0
+            val = vals[0]
+            size_per_head = hidden_dim // num_attention_heads
+            num_attention_heads // num_key_value_heads
+
+            val = val.reshape(hidden_dim,
+                              num_attention_heads + 2 * num_key_value_heads,
+                              size_per_head)
+
+            # Split the QKV to separate variables.
+            qkv = np.split(val, [
+                num_attention_heads, num_attention_heads + num_key_value_heads
+            ],
+                           axis=1)
+
+            q_split = np.split(qkv[0], split_factor, axis=1)
+            k_split = np.split(qkv[1], split_factor, axis=1)
+            v_split = np.split(qkv[2], split_factor, axis=1)
+
+            # Concatenate Q, K, and V together
+            split_vals = [
+                np.concatenate([
+                    q_split[i].reshape(hidden_dim, -1), k_split[i].reshape(
+                        hidden_dim, -1), v_split[i].reshape(hidden_dim, -1)
+                ],
+                               axis=1) for i in range(split_factor)
+            ]
         else:
             if use_attention_nemo_shape:
                 head_num = num_attention_heads // tp_size
@@ -291,7 +352,9 @@ def split_and_save_weight(tp_rank, saved_dir, split_factor, key, vals,
                        kv_cache_only=int8_outputs == "kv_cache_only")
     elif ("attention.query.weight" in key or "attention.query.bias" in key
           or "attention.key_value.weight" in key
-          or "attention.key_value.bias" in key):
+          or "attention.key_value.bias" in key or "attention.key.weight" in key
+          or "attention.key.bias" in key or "attention.value.weight" in key
+          or "attention.value.bias" in key):
         pass
     else:
         print(f"[WARNING] {key} not handled by converter")

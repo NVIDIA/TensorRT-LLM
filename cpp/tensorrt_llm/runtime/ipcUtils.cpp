@@ -20,7 +20,7 @@
 namespace tensorrt_llm::runtime
 {
 
-void setPeerAccess(WorldConfig worldConfig, bool enable)
+void setPeerAccess(WorldConfig const& worldConfig, bool enable)
 {
     const auto srcNode = worldConfig.getTensorParallelRank();
 
@@ -50,7 +50,7 @@ void setPeerAccess(WorldConfig worldConfig, bool enable)
     }
 }
 
-IpcMemory::IpcMemory(WorldConfig worldConfig, std::size_t bufferSize)
+IpcMemory::IpcMemory(WorldConfig const& worldConfig, std::size_t bufferSize)
     : mWorldConfig(worldConfig)
     , mCommPtrs(worldConfig.getTensorParallelism())
     , mBufferSize(bufferSize)

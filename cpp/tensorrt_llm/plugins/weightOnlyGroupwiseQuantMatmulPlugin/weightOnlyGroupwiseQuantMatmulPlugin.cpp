@@ -195,20 +195,7 @@ void WeightOnlyGroupwiseQuantMatmulPlugin::init(nvinfer1::DataType type, int qua
             {
                 TLLM_THROW("FP8 is unsupported on pre-Hopper architectures!");
             }
-            if (quant_algo & ZERO)
-            {
-                // has zeros
-                m_weightOnlyGroupwiseGemmRunner
-                    = std::make_shared<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<__nv_fp8_e4m3,
-                        cutlass::int4b_t, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS, half, half, half>>();
-            }
-            else
-            {
-                // no zeros
-                m_weightOnlyGroupwiseGemmRunner
-                    = std::make_shared<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<__nv_fp8_e4m3,
-                        cutlass::int4b_t, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY, half, half, half>>();
-            }
+            TLLM_THROW("FP8 is unsupported on with BF16 scales and zero-points!");
         }
         else
         {
@@ -301,8 +288,7 @@ bool WeightOnlyGroupwiseQuantMatmulPlugin::supportsFormatCombination(
         if (pos == mWeightInputIdx)
         {
             // weights
-            return inOut[mWeightInputIdx].type == nvinfer1::DataType::kHALF
-                && inOut[mWeightInputIdx].format == TensorFormat::kLINEAR;
+            return inOut[mWeightInputIdx].type == mType && inOut[mWeightInputIdx].format == TensorFormat::kLINEAR;
         }
         else if ((mQuantAlgo & FP8_ALPHA) && pos == mAlphaInputIdx)
         {
@@ -310,7 +296,7 @@ bool WeightOnlyGroupwiseQuantMatmulPlugin::supportsFormatCombination(
         }
         else
         {
-            return inOut[pos].type == nvinfer1::DataType::kHALF && inOut[pos].format == TensorFormat::kLINEAR;
+            return inOut[pos].type == mType && inOut[pos].format == TensorFormat::kLINEAR;
         }
     }
     else
@@ -374,7 +360,14 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDe
     }
     const int n = inputDesc[mWeightInputIdx].dims.d[1];
     const int k = inputDesc[0].dims.d[inputDesc[0].dims.nbDims - 1];
+
+    int smVersion = getSMVersion();
     bool use_cuda_kernel = m < SMALL_M_FAST_PATH && mCudaKernelEnabled;
+#if defined(ENABLE_BF16)
+    // CUDA kernels assume FP16 activations for Hopper
+    bool force_disable_cuda_kernel = smVersion == 90 && mType == nvinfer1::DataType::kBF16;
+    use_cuda_kernel = use_cuda_kernel && !force_disable_cuda_kernel;
+#endif
     bool use_pre_quant_scale = mQuantAlgo & PRE_QUANT_SCALE;
 
     const half* zeros_ptr = (mQuantAlgo & ZERO) ? reinterpret_cast<const half*>(inputs[mZerosInputIdx]) : nullptr;
@@ -443,7 +436,7 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDe
         weight_only_act_type = tensorrt_llm::kernels::WeightOnlyActivationType::BF16;
     }
 
-    if (getSMVersion() == 90)
+    if (smVersion == 90)
     {
         // Hopper style kernels
         if (use_cuda_kernel)

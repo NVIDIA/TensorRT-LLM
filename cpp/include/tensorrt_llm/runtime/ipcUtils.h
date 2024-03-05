@@ -24,7 +24,7 @@
 namespace tensorrt_llm::runtime
 {
 
-void setPeerAccess(WorldConfig worldConfig, bool enable = true);
+void setPeerAccess(WorldConfig const& worldConfig, bool enable = true);
 
 class IpcMemory
 {
@@ -33,7 +33,7 @@ public:
 
     size_t static constexpr FLAGS_SIZE = kernels::MAX_ALL_REDUCE_BLOCKS * sizeof(uint32_t);
 
-    IpcMemory(WorldConfig worldConfig, std::size_t bufferSize);
+    IpcMemory(WorldConfig const& worldConfig, std::size_t bufferSize);
     ~IpcMemory();
 
     [[nodiscard]] const std::vector<void*>& getCommPtrsTensor() const
@@ -48,7 +48,7 @@ private:
     WorldConfig mWorldConfig;
     std::vector<void*> mCommPtrs;
     std::size_t mBufferSize;
-    void* mBufferPtr;
+    void* mBufferPtr{nullptr};
 };
 
 } // namespace tensorrt_llm::runtime

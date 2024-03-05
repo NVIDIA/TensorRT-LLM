@@ -88,6 +88,14 @@ def load_tokenizer(tokenizer_dir: Optional[str] = None,
                                                   trust_remote_code=True,
                                                   tokenizer_type=tokenizer_type,
                                                   use_fast=use_fast)
+    elif model_name == 'GemmaForCausalLM':
+        from transformers import GemmaTokenizer
+
+        # Initialize tokenizer from vocab file.
+        tokenizer = GemmaTokenizer(vocab_file=vocab_file,
+                                   padding_side='left',
+                                   truncation_side='left',
+                                   legacy=False)
     else:
         # For gpt-next, directly load from tokenizer.model
         tokenizer = T5Tokenizer(vocab_file=vocab_file,
@@ -107,11 +115,6 @@ def load_tokenizer(tokenizer_dir: Optional[str] = None,
     elif model_name == 'ChatGLMForCausalLM' and model_version == 'glm':
         pad_id = tokenizer.pad_token_id
         end_id = tokenizer.eop_token_id
-    elif model_name == 'GemmaForCausalLM':
-        tokenizer.eos_token_id = tokenizer.sp_model.eos_id()
-        tokenizer.bos_token_id = tokenizer.sp_model.bos_id()
-        pad_id = tokenizer.pad_token_id
-        end_id = tokenizer.eos_token_id
     else:
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id

@@ -275,7 +275,7 @@ if __name__ == '__main__':
                                                 ('batch_size', [bs_range])
                                             ]))
 
-        # logits for QA BERT, or hidden_state for vanila BERT
+        # logits for QA BERT, or hidden_state for vanilla BERT
         output = tensorrt_llm_bert(input_ids=input_ids,
                                    input_lengths=input_lengths,
                                    token_type_ids=token_type_ids)

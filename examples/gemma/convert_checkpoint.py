@@ -25,7 +25,7 @@ from tensorrt_llm._utils import torch_to_numpy
 from tensorrt_llm.models.gemma.smoothquant import *
 from tensorrt_llm.models.gemma.weight import (dummy_weights_awq,
                                               load_from_fp8_llama,
-                                              quantize_fp8_weigths)
+                                              quantize_fp8_weights)
 
 LOGGER = logging.getLogger("convert_checkpoint")
 
@@ -735,7 +735,7 @@ def convert(worker_rank, args, convert_kwargs):
                 trt_llm_config=trt_llm_config,
                 group_size=128)
         elif args.enable_fp8 or args.fp8_kv_cache:
-            weight_scales = quantize_fp8_weigths(
+            weight_scales = quantize_fp8_weights(
                 weights, trt_llm_config.num_hidden_layers,
                 trt_llm_config.mapping)
             scales = load_from_fp8_llama(args.ammo_quant_ckpt_path,
@@ -766,7 +766,6 @@ def main():
 
     print(f"Source configuration determined from parameters: {ckpt_config}")
 
-    quant_mode = tensorrt_llm.quantization.QuantMode(0)
     quant_kwargs = {}
     quant_algo = None
     kv_cache_quant_algo = None
@@ -801,11 +800,6 @@ def main():
 
     quant_kwargs.update(quant_algo=quant_algo,
                         kv_cache_quant_algo=kv_cache_quant_algo)
-    if quant_algo is not None or kv_cache_quant_algo is not None:
-        quant_mode = tensorrt_llm.quantization.QuantMode.from_quant_algo(
-            quant_algo,
-            kv_cache_quant_algo=kv_cache_quant_algo,
-        )
     if args.use_weight_only_with_precision:
         if args.use_weight_only_with_precision.endswith("awq"):
             quant_kwargs.update(has_zero_point=False,
@@ -830,8 +824,7 @@ def main():
         world_size=args.world_size,
         tp_size=args.world_size,
         pp_size=1,
-        quant_mode=quant_mode,
-        quant_kwargs=quant_kwargs,
+        quantization=quant_kwargs,
     )
 
     trt_llm_config_dict = trt_llm_config.to_dict()

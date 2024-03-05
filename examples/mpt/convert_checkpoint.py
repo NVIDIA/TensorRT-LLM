@@ -613,7 +613,7 @@ def get_tllm_param(
     return results
 
 
-def convert_hf_mpt_lagacy(hf_model,
+def convert_hf_mpt_legacy(hf_model,
                           mapping,
                           rank=0,
                           dtype='float32',
@@ -967,7 +967,8 @@ if __name__ == '__main__':
             'pp_size': args.pp_size,
         },
         'bias': (not hf_config.no_bias),
-        'clip_qkv': hf_config.attn_config['clip_qkv']
+        'clip_qkv': hf_config.attn_config['clip_qkv'],
+        'alibi_bias_max': hf_config.attn_config['alibi_bias_max']
     }
 
     with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
@@ -998,7 +999,7 @@ if __name__ == '__main__':
             if args.smoothquant is not None:
                 smooth_mpt_model(hf_model, act_range, args.smoothquant,
                                  mpt_qkv_para, mpt_smoother)
-            weights = convert_hf_mpt_lagacy(
+            weights = convert_hf_mpt_legacy(
                 hf_model, mapping, rank, args.dtype, args.use_weight_only,
                 plugin_weight_only_quant_type, args.smoothquant is not None,
                 args.per_channel, args.per_token, args.calibrate_kv_cache,

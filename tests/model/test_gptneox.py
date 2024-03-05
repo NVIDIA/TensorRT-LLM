@@ -91,10 +91,6 @@ class TestGPTNeoX(unittest.TestCase):
             "rotary_emb_base": 10000,
             "rotary_pct": gpt_config.rotary_pct,
             "hidden_act": hidden_act,
-            "quantization": {
-                "use_weight_only": False,
-                "weight_only_precision": "int8"
-            },
             "mapping": {
                 "world_size": tensor_parallel,
                 "tp_size": tensor_parallel

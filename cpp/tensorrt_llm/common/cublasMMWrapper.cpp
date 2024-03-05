@@ -146,7 +146,7 @@ void CublasMMWrapper::Gemm(cublasOperation_t transa, cublasOperation_t transb, c
     {
         check_cuda_error(cublasSetStream(getCublasHandle(), mStream));
         check_cuda_error(cublasSetWorkspace(getCublasHandle(), mCublasWorkspace, workspaceSize));
-        // Go with default heruistic to choose tactic as cuBLAS does not allow to choose tactics in Ampere+
+        // Go with default heuristic to choose tactic as cuBLAS does not allow to choose tactics in Ampere+
         cublasGemmAlgo_t cublasAlgo = CUBLAS_GEMM_DEFAULT;
         check_cuda_error(cublasGemmEx(getCublasHandle(), transa, transb, m, n, k, alpha, A, mAType, lda, B, mBType, ldb,
             beta, C, mCType, ldc, mComputeType, static_cast<cublasGemmAlgo_t>(cublasAlgo)));
@@ -318,7 +318,7 @@ std::vector<cublasLtMatmulHeuristicResult_t> CublasMMWrapper::getTactics(cublasL
     uint64_t workspace_size = CUBLAS_WORKSPACE_SIZE;
     check_cuda_error(cublasLtMatmulPreferenceSetAttribute(
         preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_size, sizeof(workspace_size)));
-    // Restrict reduction algorithms for numerical stability and better determenism
+    // Restrict reduction algorithms for numerical stability and better determinism
     uint32_t reduction_mask = CUBLASLT_REDUCTION_SCHEME_MASK;
     check_cuda_error(cublasLtMatmulPreferenceSetAttribute(
         preference, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &reduction_mask, sizeof(reduction_mask)));
