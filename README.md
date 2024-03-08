@@ -92,17 +92,16 @@ This process can take upwards of 1 hour.
 TODO
 ```
 
-### Step 3: Run Nitro server
+### Step 3: Run Nitro TensorRT-LLM Server
 
-- [ ] Explain how user needs to run the ./nitro.exe
-- [ ] TODO: Implement thread, host, port, folder path
+- [ ] TODO: Explain how user needs to run the ./nitro.exe
 
 ```bash title="Run Nitro server"
 # Go to folder with `nitro.exe`
 ./nitro
 ```
 
-### Step 4: Load model
+### Step 4: Load Model Engine
 
 ```bash title="Load model"
 curl -X POST   http://0.0.0.0:3928/inferences/tensorrtllm/loadmodel   
@@ -120,10 +119,7 @@ curl -X POST   http://0.0.0.0:3928/inferences/tensorrtllm/loadmodel
 | `engine_path` | String  | The file path to the TensorRT-LLM engine. |
 | `ctx_len`     | Integer | The context length for engine operations. |
 
-### Step 5: Making an Inference
-
-- [ ] Where is the model name defined? (in Engine)
-- [ ] Re-emphasize 'Engine' == 'Model' in TensorRT-LLM
+### Step 5: Making an Inference Request
 
 Note: `model` field is not used, as Nitro TensorRT-LLM only loads one model at a time. It is retained for OpenAI-compatibility but discarded
 
@@ -151,9 +147,13 @@ curl --location 'http://0.0.0.0:3928/v1/chat/completions' \
 
 ## Compile from source
 
+- [ ] TODO
+
 ## Download
 
-### Contact
+- [ ] TODO
+
+## Contact
 
 - For support, please file a GitHub ticket.
 - For questions, join our Discord [here](https://discord.gg/FTk2MvZwJH).
