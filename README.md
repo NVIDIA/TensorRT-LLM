@@ -63,11 +63,22 @@ The Nitro TensorRT-LLM executable is approximately ~730mb. Note: this excludes t
 
 ### Step 1: Pre-requisites
 
-- [ ] Windows Installation instructions
-  - [ ] Nvidia driver
-  - [ ] Cuda
-  - [ ] What else?
-- [ ] Linux Installation instructions
+#### Nvidia Driver
+Install an [NVIDIA Driver](https://www.nvidia.com/Download/index.aspx) supporting CUDA 12.2 or higher.
+
+Use the following command to verify the installation:
+```sh
+nvidia-smi
+```
+
+#### CUDA Toolkit
+Install a [CUDA toolkit](https://developer.nvidia.com/cuda-downloads) compatible with your NVIDIA driver.
+
+Use the following command to verify the installation:
+
+```sh
+nvcc --version
+```
 
 ### Step 2: Get a TensorRT Engine
 
