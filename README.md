@@ -26,8 +26,9 @@ You can try this in [Jan](https://jan.ai) using the TensorRT-LLM Extension, with
 
 ### Repo Structure
 
-- This repo is a fork of [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM)
-- The Nitro inference server is included in `ROOT/cpp/tensorrt_llm/nitro`. Nitro inference server is built as the final step.
+This repo is a fork of [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM).
+
+The Nitro inference server is then included in `ROOT/cpp/tensorrt_llm/nitro`. Nitro inference server is built as the final step.
 
 ```
 +-- cpp
@@ -60,27 +61,41 @@ The Nitro TensorRT-LLM executable is approximately ~730mb. Note: this excludes t
 
 ## Quickstart
 
-### Step 1: Installation
+### Step 1: Pre-requisites
 
-- [ ] Windows Installation instructions
-- [ ] Linux Installation instructions
+#### Nvidia Driver
+Install an [NVIDIA Driver](https://www.nvidia.com/Download/index.aspx) supporting CUDA 12.2 or higher.
+
+Use the following command to verify the installation:
+```sh
+nvidia-smi
+```
+
+#### CUDA Toolkit
+Install a [CUDA toolkit](https://developer.nvidia.com/cuda-downloads) compatible with your NVIDIA driver.
+
+Use the following command to verify the installation:
+
+```sh
+nvcc --version
+```
 
 ### Step 2: Get a TensorRT Engine
 
 TensorRT Engines are precompiled binaries that contain the underlying LLM. These engines are OS and GPU-specific to the machines used to build them, and they are not yet cross-platform.
 
-This means you need a specific engine based on: 
-- Model
+This means you need a specific TensorRT Engine based on: 
+- Large Language Model
 - Operating system
 - GPU type
 
 #### Option 1: Download a prebuilt TensorRT Engine
 
-We've compiled some initial Engines here: 
+We've compiled some initial engines available for download: 
 - OS: Windows 10, GPU: 3090s, Model: OpenHermes 7B
 - OS: Windows 11, GPU: 4090s, Model: OpenHermes 7B
 
-The engines are limited to the models we've chosen above.
+[TODO: add links]
 
 #### Option 2: Build a TensorRT Engine from model
 
@@ -88,9 +103,7 @@ You can also build the TensorRT Engine directly on your machine, using your pref
 
 This process can take upwards of 1 hour. 
 
-```sh
-TODO
-```
+See [Compile from Source](#compile-from-source) instructions below. 
 
 ### Step 3: Run Nitro TensorRT-LLM Server
 
