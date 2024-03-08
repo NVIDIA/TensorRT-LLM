@@ -27,16 +27,17 @@ You can try this in [Jan](https://jan.ai) using the TensorRT-LLM Extension, with
 
 ### Repo Structure
 
-- [ ] Explain that this repo is a fork of TensorRT-LLM repo
-- [ ] Explain we are adding the Nitro inference server into it
+- This repo is a fork of [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM)
+- The Nitro inference server is included in `ROOT/cpp/tensorrt_llm/nitro`. Nitro inference server is built as the final step.
 
 ```
-+-- tensorrt_llm
-|   +-- nitro
-|   |   +-- controllers
-|   |   +-- models
-|   |   +-- nitro_deps 
-|   |   +-- utils
++-- cpp
+|   +-- tensorrt_llm
+|   |   +-- nitro
+|   |   |   +-- nitro_deps
+|   |   |   +-- main.cc
+|   |   |   +-- ...
+|   |   +-- CMakeLists.txt
 ```
 
 ### Package Structure
@@ -58,11 +59,32 @@ You can try this in [Jan](https://jan.ai) using the TensorRT-LLM Extension, with
 - [ ] Windows Installation instructions
 - [ ] Linux Installation instructions
 
-### Step 2: Downloading an Engine
+### Step 2: Get a TensorRT Engine
 
-- [ ] Explain Engines in TensorRT-LLM == Models in GGUF
-- [ ] Explain how Engines are OS and GPU-specific
-- [ ] Link to precompiled Engines (start with 3090, 4090)
+TensorRT Engines are precompiled binaries that contain the underlying LLM. These engines are OS and GPU-specific to the machines used to build them, and they are not yet cross-platform.
+
+This means you need a specific engine based on: 
+- Model
+- Operating system
+- GPU type
+
+#### Option 1: Download a prebuilt TensorRT Engine.
+
+We've compiled some initial Engines here: 
+- OS: Windows 10, GPU: 3090s, Model: OpenHermes 7B
+- OS: Windows 11, GPU: 4090s, Model: OpenHermes 7B
+
+The engines are limited to the models we've chosen above.
+
+#### Option 2: Compile a custom TensorRT Engine.
+
+You can also build the TensorRT Engine directly on your machine, using your preferred model.
+
+This process can take upwards of 1 hour. 
+
+```sh
+TODO
+```
 
 ### Step 3: Run Nitro server
 
