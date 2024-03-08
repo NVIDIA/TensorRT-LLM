@@ -17,7 +17,7 @@ Nitro TensorRT-LLM is an experimental implementation of [Nitro](https://nitro.ja
 
 - Pure C++ inference server on top of TensorRT-LLM's C++ Runtime
 - OpenAI-compatible API with `/chat/completion` and `loadmodel` endpoints
-- Packageable as a single runnable package (e.g. `nitro.exe`) that can be run seamlessly
+- Packageable as a single executable (e.g. `nitro.exe`) that can be run seamlessly
 - Can be embedded in Windows Desktop apps
 
 You can try this in [Jan](https://jan.ai) using the TensorRT-LLM Extension, with a Nvidia 3090 or 4090. 
@@ -27,8 +27,9 @@ You can try this in [Jan](https://jan.ai) using the TensorRT-LLM Extension, with
 
 ### Repo Structure
 
-- This repo is a fork of [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM)
-- The Nitro inference server is included in `ROOT/cpp/tensorrt_llm/nitro`. Nitro inference server is built as the final step.
+This repo is a fork of [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM).
+
+The Nitro inference server is then included in `ROOT/cpp/tensorrt_llm/nitro`. Nitro inference server is built as the final step.
 
 ```
 +-- cpp
@@ -45,46 +46,48 @@ You can try this in [Jan](https://jan.ai) using the TensorRT-LLM Extension, with
 - [ ] Explain that Nitro TensorRT-LLM can be compiled (?) to a single executable
 - [ ] Can be packaged with `.dll` dependencies to remove need to for manual install steps
 
-#### Windows
+#### Windows Distribution
 
-```
-+-- nitro.exe
-+-- tensorrt-llm.dll
-```
+This repo distributes: 
+- `tensorrt-llm.dll(s)`: various precompiled TensorRT Engines, including a C++ execution runtime. [Read more](https://nvidia.github.io/TensorRT-LLM/architecture.html).
+- `nitro.exe`: an executable binary containing a C++ server which serves the Engine for the end user. [Read more](https://nitro.jan.ai/)
 
 ## Quickstart
 
-### Step 1: Installation
+### Step 1: Pre-requisites
 
 - [ ] Windows Installation instructions
+  - [ ] Nvidia driver
+  - [ ] Cuda
+  - [ ] What else?
 - [ ] Linux Installation instructions
 
 ### Step 2: Get a TensorRT Engine
 
 TensorRT Engines are precompiled binaries that contain the underlying LLM. These engines are OS and GPU-specific to the machines used to build them, and they are not yet cross-platform.
 
-This means you need a specific engine based on: 
-- Model
+This means you need a specific TensorRT Engine based on: 
+- Large Language Model
 - Operating system
 - GPU type
 
-#### Option 1: Download a prebuilt TensorRT Engine.
+#### Option 1: Download a prebuilt engine
 
-We've compiled some initial Engines here: 
+We've compiled some initial engines available for download: 
 - OS: Windows 10, GPU: 3090s, Model: OpenHermes 7B
 - OS: Windows 11, GPU: 4090s, Model: OpenHermes 7B
 
-The engines are limited to the models we've chosen above.
+[TODO: add links]
 
-#### Option 2: Compile a custom TensorRT Engine.
+Caveat: The engines are limited to the models we've chosen above.
+
+#### Option 2: Compile a custom TensorRT Engine
 
 You can also build the TensorRT Engine directly on your machine, using your preferred model.
 
 This process can take upwards of 1 hour. 
 
-```sh
-TODO
-```
+See [Compile from Source](#compile-from-source) instructions below. 
 
 ### Step 3: Run Nitro server
 
@@ -144,6 +147,10 @@ curl --location 'http://0.0.0.0:3928/v1/chat/completions' \
 ```
 
 ## Compile from source
+
+TODO
+
+add scripts & troubleshooting
 
 ## Download
 
