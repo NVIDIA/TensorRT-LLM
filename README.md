@@ -196,8 +196,8 @@ curl --location 'http://0.0.0.0:3928/v1/chat/completions' \
 
 3. Modify `openai.json` to point to the URL of your Nitro TensorRT-LLM API endpoint. 
 
-```json
-// openai.json
+```sh
+# openai.json
 {"full_url":"http://localhost:3928/v1/chat/completions","api_key":""}
 ```
 
@@ -236,18 +236,13 @@ curl --location 'http://0.0.0.0:3928/v1/chat/completions' \
 5. Restart the app
 
 6. Create a new chat thread. Select `Remote` and your engine `Name`. 
+
 ## Contributing
 
 ### Repo Structure
 
-TODO: clean up and include script
-
-## Use it with Jan Client
-
-
-
-
 The actual Nitro code is in a subfolder, which is then used in the Build process. 
+We have chosen to work off a fork of TensorRT-LLM, given the need to keep in sync with the fast pace of upstream developments. 
 
 ```
 +-- cpp
@@ -258,6 +253,7 @@ The actual Nitro code is in a subfolder, which is then used in the Build process
 |   |   |   +-- ...
 |   |   +-- CMakeLists.txt
 ```
+
 ## Building a TensorRT-LLM Engine
 
 - [ ] TODO
