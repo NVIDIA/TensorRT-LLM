@@ -17,11 +17,10 @@ Nitro TensorRT-LLM is an experimental implementation of [Nitro](https://nitro.ja
 
 - Pure C++ inference server on top of TensorRT-LLM's C++ Runtime
 - OpenAI-compatible API with `/chat/completion` and `loadmodel` endpoints
-- Packageable as a single runnable package (e.g. `nitro.exe`) that can be run seamlessly
+- Packageable as a single runnable package (e.g. `nitro.exe`) to run seamlessly on bare metal in Windows
 - Can be embedded in Windows Desktop apps
 
 You can try this in [Jan](https://jan.ai) using the TensorRT-LLM Extension, with a Nvidia 3090 or 4090. 
-
 
 > Read more about Nitro at https://nitro.jan.ai/
 
@@ -42,8 +41,19 @@ You can try this in [Jan](https://jan.ai) using the TensorRT-LLM Extension, with
 
 ### Package Structure
 
-- [ ] Explain that Nitro TensorRT-LLM can be compiled (?) to a single executable
-- [ ] Can be packaged with `.dll` dependencies to remove need to for manual install steps
+Nitro TensorRT-LLM can be compiled into a single Windows executable that runs seamlessly on bare metal, without additional manual install steps. 
+
+The Nitro TensorRT-LLM executable is approximately ~730mb. Note: this excludes the TensorRT-LLM Engine for the Model. 
+
+| Dependencies                    | Purpose                                                                                    | Size       |
+| ------------------------------- | ------------------------------------------------------------------------------------------ | ---------- |
+| tensorrt_llm.dll                | [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/windows#tensorrt-llm-repo) | ~450mb     |
+| nvinfer.dll                     | [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/windows#tensorrt-llm-repo) | ~200mb     |
+| nvinfer_plugin_tensorrt_llm.dll | [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/windows#tensorrt-llm-repo) | Negligible |
+| cudnn_ops_infer64_8.dll         | [cuDNN](https://github.com/NVIDIA/TensorRT-LLM/tree/main/windows#cudnn)                    | ~80mb      |
+| cudnn64_8.dll                   | [cuDNN](https://github.com/NVIDIA/TensorRT-LLM/tree/main/windows#cudnn)                    | Negligible |
+| msmpi.dll                       | [Microsoft MPI](https://github.com/NVIDIA/TensorRT-LLM/tree/main/windows#microsoft-mpi)    | Negligible |
+| **Total**                       |                                                                                            | **~730mb** |
 
 #### Windows
 
@@ -68,7 +78,7 @@ This means you need a specific engine based on:
 - Operating system
 - GPU type
 
-#### Option 1: Download a prebuilt TensorRT Engine.
+#### Option 1: Download a prebuilt TensorRT Engine
 
 We've compiled some initial Engines here: 
 - OS: Windows 10, GPU: 3090s, Model: OpenHermes 7B
@@ -76,7 +86,7 @@ We've compiled some initial Engines here:
 
 The engines are limited to the models we've chosen above.
 
-#### Option 2: Compile a custom TensorRT Engine.
+#### Option 2: Build a TensorRT Engine from model
 
 You can also build the TensorRT Engine directly on your machine, using your preferred model.
 
