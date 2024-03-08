@@ -171,11 +171,67 @@ curl --location 'http://0.0.0.0:3928/v1/chat/completions' \
     "max_tokens": 2048
   }'
 ```
+
+## Use with Jan
+
+> NOTE: Jan will be releasing a TensorRT-LLM Extension that wraps Nitro TEnsorRT-LLM. These steps are only if you want to set it up manually. 
+
+1. Download [Jan Windows](https://github.com/janhq/jan/releases)
+
+2. Navigate to the `~/jan/engines` folder and edit `openai.json`. 
+
+3. Modify `openai.json` to point to the URL of your Nitro TensorRT-LLM API endpoint. 
+
+```json
+// openai.json
+{"full_url":"http://localhost:3928/v1/chat/completions","api_key":""}
+```
+
+3. In `~/jan/models`, duplicate the `gpt-4` folder. Name the new folder: `your-model-name-tensorrt-llm`
+
+4. In this folder, edit the `model.json` file.
+
+- `id` matches the `your-model-name`.
+- `Name` is any vanity name you want call your TensorRT Engine
+- `Format` is set to `api`.
+- `Engine` is set to `openai`
+
+```json
+{
+  "sources": [
+    {
+      "url": "http://localhost:3928/v1/chat/completions"
+    }
+  ],
+  "id": "llamacorn-1.1b-tensorrt-llm",
+  "object": "model",
+  "name": "Llamacorn-1.1b (TensorRT-LLM)",
+  "version": "1.0",
+  "description": "TensorRT-LLM is extremely good",
+  "format": "api",
+  "settings": {},
+  "parameters": {},
+  "metadata": {
+    "author": "Nvidia",
+    "tags": ["General", "Big Context Length"]
+  },
+  "engine": "openai"
+}
+```
+
+5. Restart the app
+
+6. Create a new chat thread. Select `Remote` and your engine `Name`. 
 ## Contributing
 
 ### Repo Structure
 
-This repo is a fork of [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM), with the intent of keeping pace with TensorRT-LLM developments.
+TODO: clean up and include script
+
+## Use it with Jan Client
+
+
+
 
 The actual Nitro code is in a subfolder, which is then used in the Build process. 
 
