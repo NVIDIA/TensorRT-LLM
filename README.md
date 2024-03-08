@@ -97,6 +97,8 @@ curl -X POST   http://0.0.0.0:3928/inferences/tensorrtllm/loadmodel
 - [ ] Where is the model name defined? (in Engine)
 - [ ] Re-emphasize 'Engine' == 'Model' in TensorRT-LLM
 
+Note: `model` field is not used, as Nitro TensorRT-LLM only loads one model at a time. It is retained for OpenAI-compatibility but discarded
+
 ```bash title="Nitro TensorRT-LLM Inference"
 curl --location 'http://0.0.0.0:3928/v1/chat/completions' \
   --header 'Content-Type: application/json' \
@@ -114,12 +116,9 @@ curl --location 'http://0.0.0.0:3928/v1/chat/completions' \
       }
     ],
     "stream": true,
-    "model": "operhermes-mistral",
+    "model": <NON-NULL STRING>, 
     "max_tokens": 2048
   }'
-
-
-
 ```
 
 ## Compile from source
