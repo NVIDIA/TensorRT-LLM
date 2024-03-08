@@ -26,25 +26,11 @@ You can try this in [Jan](https://jan.ai) using the TensorRT-LLM Extension.
 
 ### Package Contents
 
-Nitro TensorRT-LLM can be compiled into a single Windows executable that runs seamlessly on bare metal.
 
-The Nitro TensorRT-LLM package is approximately ~730mb. Note: this excludes the TensorRT-LLM Engine for the Model. 
-
-| Dependencies                    | Purpose                                                                                    | Size       |
-| ------------------------------- | ------------------------------------------------------------------------------------------ | ---------- |
-| nitro.exe                       | Nitro                                                                                      | Negligible |
-| tensorrt_llm.dll                | [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/windows#tensorrt-llm-repo) | ~450mb     |
-| nvinfer.dll                     | [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/windows#tensorrt-llm-repo) | ~200mb     |
-| nvinfer_plugin_tensorrt_llm.dll | [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/windows#tensorrt-llm-repo) | Negligible |
-| cudnn_ops_infer64_8.dll         | [cuDNN](https://github.com/NVIDIA/TensorRT-LLM/tree/main/windows#cudnn)                    | ~80mb      |
-| cudnn64_8.dll                   | [cuDNN](https://github.com/NVIDIA/TensorRT-LLM/tree/main/windows#cudnn)                    | Negligible |
-| msmpi.dll                       | [Microsoft MPI](https://github.com/NVIDIA/TensorRT-LLM/tree/main/windows#microsoft-mpi)    | Negligible |
-| zlib.dll                        |                                                                                            | Negligible |
-| **Total**                       |                                                                                            | **~730mb** |
 
 ## Quickstart
 
-### Step 1: Prerequisites
+### Step 0: Prerequisites
 
 > NOTE: Nvidia Driver >=535 and CUDA Toolkit >=12.2 are prerequisites, and are often pre-installed with Nvidia GPUs 
 
@@ -58,6 +44,34 @@ nvidia-smi  # Nvidia Driver
 nvcc --version # CUDA toolkit
 ```
 
+### Step 1: Download Nitro TensorRT-LLM Package
+
+We have compiled Nitro TensorRT-LLM into a single Windows package that can run seamlessly on bare metal, without needing manual installation of dependencies.
+
+| Package | Size | Download |
+|-|-|-|
+| Nitro TensorRT-LLM (zipped) | 336mb | [Download](https://delta.jan.ai/dist/models/ada/windows/nitro-tensorrt-llm.zip) |  
+
+> Note: The Nitro TensorRT-LLM package is approximately ~730mb.
+
+> Note: this excludes the TensorRT-LLM Engine for the Model. 
+
+#### Package Contents
+
+The Nitro TensorRT-LLM package contains `nitro.exe` and dependent `.dll` files. 
+
+| Contents                    | Purpose                                                                                    | Size       |
+| ------------------------------- | ------------------------------------------------------------------------------------------ | ---------- |
+| nitro.exe                       | Nitro                                                                                      | Negligible |
+| tensorrt_llm.dll                | [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/windows#tensorrt-llm-repo) | ~450mb     |
+| nvinfer.dll                     | [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/windows#tensorrt-llm-repo) | ~200mb     |
+| nvinfer_plugin_tensorrt_llm.dll | [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/windows#tensorrt-llm-repo) | Negligible |
+| cudnn_ops_infer64_8.dll         | [cuDNN](https://github.com/NVIDIA/TensorRT-LLM/tree/main/windows#cudnn)                    | ~80mb      |
+| cudnn64_8.dll                   | [cuDNN](https://github.com/NVIDIA/TensorRT-LLM/tree/main/windows#cudnn)                    | Negligible |
+| msmpi.dll                       | [Microsoft MPI](https://github.com/NVIDIA/TensorRT-LLM/tree/main/windows#microsoft-mpi)    | Negligible |
+| zlib.dll                        |                                                                                            | Negligible |
+| **Total**                       |                                                                                            | **~730mb** |
+
 ### Step 2: Get a Model's TensorRT Engine
 
 Models in TensorRT-LLM are compiled to [TensorRT-LLM Engines](https://nvidia.github.io/TensorRT-LLM/architecture.html) for your GPU and Operating System.
@@ -67,7 +81,7 @@ Models in TensorRT-LLM are compiled to [TensorRT-LLM Engines](https://nvidia.git
 | Model          | OS      | GPU Architecture | Download |
 | -------------- | ------- | ---------------- | -------- |
 | Llamacorn 1.1b | Windows | 3090s (Ampere)   | Download |
-| Llamacorn 1.1b | Windows | 4090s (Ada)      | Download |
+| Llamacorn 1.1b | Windows | 4090s (Ada)      | [Download](https://delta.jan.ai/dist/nitro/ada/windows/llamacorn-1.1b-16bit.zip) |
 | OpenHermes 7b  | Windows | 3090s (Ampere)   | Download |
 | OpenHermes 7b  | Windows | 4090s (Ada)      | Download |
 
