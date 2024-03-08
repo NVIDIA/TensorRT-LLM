@@ -64,10 +64,12 @@ Models in TensorRT-LLM are compiled to [TensorRT-LLM Engines](https://nvidia.git
 
 #### Option 1: Prebuilt TensorRT Engine
 
-| Model      | OS      | GPU Architecture | Download |
-| ---------- | ------- | ---------------- | -------- |
-| OpenHermes 7b | Windows | 3090s (Ampere)   | Download |
-| OpenHermes 7b | Windows | 4090s (Ada)      | Download |
+| Model          | OS      | GPU Architecture | Download |
+| -------------- | ------- | ---------------- | -------- |
+| Llamacorn 1.1b | Windows | 3090s (Ampere)   | Download |
+| Llamacorn 1.1b | Windows | 4090s (Ada)      | Download |
+| OpenHermes 7b  | Windows | 3090s (Ampere)   | Download |
+| OpenHermes 7b  | Windows | 4090s (Ada)      | Download |
 
 #### Option 2: Build a TensorRT Engine from model
 
