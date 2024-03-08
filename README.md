@@ -151,7 +151,34 @@ curl --location 'http://0.0.0.0:3928/v1/chat/completions' \
 
 ## Compile from source
 
-## Download
+TODO: clean up and include script
+
+## Use it with Jan Client
+
+> We are currently integrating Nitro-TensorRT-LLM into Jan Desktop as a simple, downloadable extension. But once you get the local API endpoint working, you can already use your engine with the Jan client or any OpenAI compatible client, with a few simple steps. 
+
+1. Download [Jan Windows](https://github.com/janhq/jan/releases)
+
+2. Navigate to the `~/jan/engines` folder and modify the `openai.json file`.
+
+```json
+{"full_url":"http://localhost:3928/v1/chat/completions","api_key":""}
+```
+
+> Note: Currently, the code that supports any OpenAI-compatible endpoint only reads engine/openai.json file. Thus, it will not search any other files in this directory.
+
+3. In ~/jan/models, duplicate the `gpt-4` folder. Name the new folder: `your-model-name`
+
+4. In this folder, edit the `model.json` file. Ensuring
+- `id` matches the `your-model-name`.
+- `Name` is any vanity name you want call your TensorRT Engine
+- `Format` is set to `api`.
+- `Engine` is set to `openai`
+
+5. Restart the app
+
+6. Create a new chat thread. Select `Remote` and your engine `Name`. 
+
 
 ### Contact
 
