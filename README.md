@@ -41,12 +41,15 @@ You can try this in [Jan](https://jan.ai) using the TensorRT-LLM Extension, with
 
 ### Package Structure
 
-Nitro TensorRT-LLM can be compiled into a single Windows executable that runs seamlessly on bare metal, without additional manual install steps. 
+Nitro TensorRT-LLM can be compiled into a single Windows executable that runs seamlessly on bare metal.
 
 The Nitro TensorRT-LLM executable is approximately ~730mb. Note: this excludes the TensorRT-LLM Engine for the Model. 
 
+> NOTE: Nvidia Driver >=535 and CUDA Toolkit >=12.2 are pre-requisites, which are often pre-installed with Nvidia GPUs 
+
 | Dependencies                    | Purpose                                                                                    | Size       |
 | ------------------------------- | ------------------------------------------------------------------------------------------ | ---------- |
+| nitro.exe                       | Nitro                                                                                      | Negligible |
 | tensorrt_llm.dll                | [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/windows#tensorrt-llm-repo) | ~450mb     |
 | nvinfer.dll                     | [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/windows#tensorrt-llm-repo) | ~200mb     |
 | nvinfer_plugin_tensorrt_llm.dll | [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/windows#tensorrt-llm-repo) | Negligible |
@@ -54,13 +57,6 @@ The Nitro TensorRT-LLM executable is approximately ~730mb. Note: this excludes t
 | cudnn64_8.dll                   | [cuDNN](https://github.com/NVIDIA/TensorRT-LLM/tree/main/windows#cudnn)                    | Negligible |
 | msmpi.dll                       | [Microsoft MPI](https://github.com/NVIDIA/TensorRT-LLM/tree/main/windows#microsoft-mpi)    | Negligible |
 | **Total**                       |                                                                                            | **~730mb** |
-
-#### Windows
-
-```
-+-- nitro.exe
-+-- tensorrt-llm.dll
-```
 
 ## Quickstart
 
