@@ -1,4 +1,4 @@
-# Nitro TensorRT-LLM
+# Nitro TensorRT-LLM for Windows
 
 <p align="center">
   <img alt="nitrologo" src="https://raw.githubusercontent.com/janhq/nitro/main/assets/Nitro%20README%20banner.png">
@@ -13,40 +13,22 @@
 
 ## About 
 
-Nitro TensorRT-LLM is an experimental implementation of [Nitro](https://nitro.jan.ai) that runs LLMs using [Nvidia's TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) on Windows. 
+Nitro TensorRT-LLM is an experimental implementation of [Nitro](https://nitro.jan.ai) that runs LLMs using [Nvidia's TensorRT-LLM on Windows](https://github.com/NVIDIA/TensorRT-LLM/tree/main/windows). 
 
 - Pure C++ inference server on top of TensorRT-LLM's C++ Runtime
 - OpenAI-compatible API with `/chat/completion` and `loadmodel` endpoints
 - Packageable as a single runnable package (e.g. `nitro.exe`) to run seamlessly on bare metal in Windows
 - Can be embedded in Windows Desktop apps
 
-You can try this in [Jan](https://jan.ai) using the TensorRT-LLM Extension, with a Nvidia 3090 or 4090. 
+You can try this in [Jan](https://jan.ai) using the TensorRT-LLM Extension. 
 
 > Read more about Nitro at https://nitro.jan.ai/
 
-### Repo Structure
-
-This repo is a fork of [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM).
-
-The Nitro inference server is then included in `ROOT/cpp/tensorrt_llm/nitro`. Nitro inference server is built as the final step.
-
-```
-+-- cpp
-|   +-- tensorrt_llm
-|   |   +-- nitro
-|   |   |   +-- nitro_deps
-|   |   |   +-- main.cc
-|   |   |   +-- ...
-|   |   +-- CMakeLists.txt
-```
-
-### Package Structure
+### Package Contents
 
 Nitro TensorRT-LLM can be compiled into a single Windows executable that runs seamlessly on bare metal.
 
-The Nitro TensorRT-LLM executable is approximately ~730mb. Note: this excludes the TensorRT-LLM Engine for the Model. 
-
-> NOTE: Nvidia Driver >=535 and CUDA Toolkit >=12.2 are pre-requisites, which are often pre-installed with Nvidia GPUs 
+The Nitro TensorRT-LLM package is approximately ~730mb. Note: this excludes the TensorRT-LLM Engine for the Model. 
 
 | Dependencies                    | Purpose                                                                                    | Size       |
 | ------------------------------- | ------------------------------------------------------------------------------------------ | ---------- |
@@ -57,71 +39,71 @@ The Nitro TensorRT-LLM executable is approximately ~730mb. Note: this excludes t
 | cudnn_ops_infer64_8.dll         | [cuDNN](https://github.com/NVIDIA/TensorRT-LLM/tree/main/windows#cudnn)                    | ~80mb      |
 | cudnn64_8.dll                   | [cuDNN](https://github.com/NVIDIA/TensorRT-LLM/tree/main/windows#cudnn)                    | Negligible |
 | msmpi.dll                       | [Microsoft MPI](https://github.com/NVIDIA/TensorRT-LLM/tree/main/windows#microsoft-mpi)    | Negligible |
+| zlib.dll                        |                                                                                            | Negligible |
 | **Total**                       |                                                                                            | **~730mb** |
 
 ## Quickstart
 
-### Step 1: Pre-requisites
+### Step 1: Prerequisites
 
-#### Nvidia Driver
-Install an [NVIDIA Driver](https://www.nvidia.com/Download/index.aspx) supporting CUDA 12.2 or higher.
+> NOTE: Nvidia Driver >=535 and CUDA Toolkit >=12.2 are prerequisites, and are often pre-installed with Nvidia GPUs 
 
-Use the following command to verify the installation:
-```sh
-nvidia-smi
-```
+- [NVIDIA Driver](https://www.nvidia.com/Download/index.aspx) for your specific GPU >=535 
+- [CUDA toolkit](https://developer.nvidia.com/cuda-downloads) >=12.2
 
-#### CUDA Toolkit
-Install a [CUDA toolkit](https://developer.nvidia.com/cuda-downloads) compatible with your NVIDIA driver.
-
-Use the following command to verify the installation:
 
 ```sh
-nvcc --version
+# Verify Prerequisites
+nvidia-smi  # Nvidia Driver
+nvcc --version # CUDA toolkit
 ```
 
-### Step 2: Get a TensorRT Engine
+### Step 2: Get a Model's TensorRT Engine
 
-TensorRT Engines are precompiled binaries that contain the underlying LLM. These engines are OS and GPU-specific to the machines used to build them, and they are not yet cross-platform.
+Models in TensorRT-LLM are compiled to [TensorRT-LLM Engines](https://nvidia.github.io/TensorRT-LLM/architecture.html) for your GPU and Operating System.
 
-This means you need a specific TensorRT Engine based on: 
-- Large Language Model
-- Operating system
-- GPU type
+#### Option 1: Prebuilt TensorRT Engine
 
-#### Option 1: Download a prebuilt TensorRT Engine
-
-We've compiled some initial engines available for download: 
-- OS: Windows 10, GPU: 3090s, Model: OpenHermes 7B
-- OS: Windows 11, GPU: 4090s, Model: OpenHermes 7B
-
-[TODO: add links]
+| Model      | OS      | GPU Architecture | Download |
+| ---------- | ------- | ---------------- | -------- |
+| OpenHermes 7b | Windows | 3090s (Ampere)   | Download |
+| OpenHermes 7b | Windows | 4090s (Ada)      | Download |
 
 #### Option 2: Build a TensorRT Engine from model
 
 You can also build the TensorRT Engine directly on your machine, using your preferred model.
 
-This process can take upwards of 1 hour. 
+- This process can take upwards of 1 hour. 
+- See [Building a TensorRT-LLM Engine](#building-a-tensorrt-llm-engine) instructions below. 
 
-See [Compile from Source](#compile-from-source) instructions below. 
-
-### Step 3: Run Nitro TensorRT-LLM Server
-
-- [ ] TODO: Explain how user needs to run the ./nitro.exe
+### Step 3: Run Nitro TensorRT-LLM for Windows
 
 ```bash title="Run Nitro server"
 # Go to folder with `nitro.exe`
-./nitro
+.\nitro.exe [thread_num] [host] [port] [uploads_folder_path]
+.\nitro.exe 1 http://0.0.0.0 3928
 ```
 
-### Step 4: Load Model Engine
+### Step 4: Load Model's TensorRT-LLM Engine
 
 ```bash title="Load model"
-curl -X POST   http://0.0.0.0:3928/inferences/tensorrtllm/loadmodel   
-  -H 'Content-Type: application/json'
-  -d '{
-    "engine_path": <ENGINE_PATH_HERE>, 
-    "ctx_len": 1000
+# Powershell
+Invoke-WebRequest -Uri "http://localhost:3928/inferences/tensorrtllm/loadmodel" `
+    -Method Post `
+    -ContentType "application/json" `
+    -Body "{ `
+        `"engine_path`": `"./openhermes-7b`", `
+        `"ctx_len`": 512, `
+        `"ngl`": 100 `
+     }"
+
+# WSL
+curl --location 'http://localhost:3928/inferences/tensorrtllm/loadmodel' \
+--header 'Content-Type: application/json' \
+--data '{
+    "engine_path": "./llamacorn-1.1b",
+    "ctx_len": 512,
+    "ngl": 100
   }'
 ```
 
@@ -131,12 +113,42 @@ curl -X POST   http://0.0.0.0:3928/inferences/tensorrtllm/loadmodel
 | ------------- | ------- | ----------------------------------------- |
 | `engine_path` | String  | The file path to the TensorRT-LLM engine. |
 | `ctx_len`     | Integer | The context length for engine operations. |
+| `ngl`         | Integer | The number of GPU layers to use.          |
 
 ### Step 5: Making an Inference Request
 
-Note: `model` field is not used, as Nitro TensorRT-LLM only loads one model at a time. It is retained for OpenAI-compatibility but discarded
+Nitro TensorRT-LLM offers a drop-in replacement for OpenAI's' `/chat/completions`, including streaming responses. 
+
+> Note: `model` field is a placeholder for OpenAI compatibility. It is not used as Nitro TensorRT-LLM currently only loads 1 model at a time
 
 ```bash title="Nitro TensorRT-LLM Inference"
+# Powershell
+$url = "http://localhost:3928/v1/chat/completions"
+$headers = @{
+    "Content-Type" = "application/json"
+    "Accept" = "text/event-stream"
+    "Access-Control-Allow-Origin" = "*"
+}
+
+$body = @{
+    "messages" = @(
+        @{
+            "content" = "Hello there 👋"
+            "role" = "assistant"
+        },
+        @{
+            "content" = "Write a long story about NVIDIA!!!!"
+            "role" = "user"
+        }
+    )
+    "stream" = $true
+    "model" = "operhermes-mistral"
+    "max_tokens" = 2048
+} | ConvertTo-Json
+
+Invoke-RestMethod -Uri $url -Method Post -Headers $headers -Body $body -UseBasicParsing -TimeoutSec 0
+
+# WSL
 curl --location 'http://0.0.0.0:3928/v1/chat/completions' \
   --header 'Content-Type: application/json' \
   --header 'Accept: text/event-stream' \
@@ -157,12 +169,24 @@ curl --location 'http://0.0.0.0:3928/v1/chat/completions' \
     "max_tokens": 2048
   }'
 ```
+## Contributing
 
-## Compile from source
+### Repo Structure
 
-- [ ] TODO
+This repo is a fork of [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM), with the intent of keeping pace with TensorRT-LLM developments.
 
-## Download
+The actual Nitro code is in a subfolder, which is then used in the Build process. 
+
+```
++-- cpp
+|   +-- tensorrt_llm
+|   |   +-- nitro
+|   |   |   +-- nitro_deps
+|   |   |   +-- main.cc
+|   |   |   +-- ...
+|   |   +-- CMakeLists.txt
+```
+## Building a TensorRT-LLM Engine
 
 - [ ] TODO
 
