@@ -24,10 +24,6 @@ You can try this in [Jan](https://jan.ai) using the TensorRT-LLM Extension.
 
 > Read more about Nitro at https://nitro.jan.ai/
 
-### Package Contents
-
-
-
 ## Quickstart
 
 ### Step 0: Prerequisites
