@@ -156,7 +156,7 @@ def convert_checkpoint(args):
     sin_pos_embedding = model.models[0].encoder.embed_positions.get_embedding(
         padding_idx + 1 + num_embeddings,
         embedding_dim,
-        padding_idx=padding_idx)  # [2 + num_embeddings, embed_dim]
+        padding_idx=padding_idx).to(str_dtype_to_torch(args.weight_data_type))  # [2 + num_embeddings, embed_dim]
     sin_pos_embedding = sin_pos_embedding[2:, :]  # remove offset embeddings
     pool.starmap_async(
         split_and_convert_process,
