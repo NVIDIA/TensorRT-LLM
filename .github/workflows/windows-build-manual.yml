@@ -1,0 +1,73 @@
+name: Manuall Build for Windows
+on:
+  workflow_dispatch:
+
+jobs:
+  windows-build:
+    runs-on: windows-nitro-tensorrt-llm-${{ matrix.cuda_arch_name }}
+    strategy:
+      matrix:
+        include:
+          - cuda_arch: '80-real;86-real'
+            cuda_arch_name: 'ampere'
+          - cuda_arch: '89-real'
+            cuda_arch_name: 'ada'
+          - cuda_arch: '75-real'
+            cuda_arch_name: 'turing'
+    permissions:
+      contents: write
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v3
+        with:
+          submodules: recursive
+          lfs: true
+
+      - run: cp -r -Force C:\w\nitro-tensorrt-llm\nitro-tensorrt-llm\cpp\tensorrt_llm\nitro C:\workspace\nitro-tensorrt-llm\cpp\tensorrt_llm
+
+      - uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 45
+          max_attempts: 3
+          shell: powershell
+          command: |
+            cd C:\workspace\nitro-tensorrt-llm\cpp\tensorrt_llm\nitro; powershell -Command cmake -S ./nitro_deps -B ./build_deps/nitro_deps; powershell -Command cmake --build ./build_deps/nitro_deps --config Release
+
+      - name: Build Python
+        shell: powershell
+        run: |
+          cd C:\workspace\nitro-tensorrt-llm; powershell -Command "python .\scripts\build_wheel.py -a '${{ matrix.cuda_arch }}' --trt_root 'C:\workspace\TensorRT-9.2.0.5\'"
+
+      - name: Build nitro
+        shell: powershell
+        run: |
+          cd C:\workspace\nitro-tensorrt-llm\cpp\build
+          powershell -Command "cmake .. -DCMAKE_CUDA_ARCHITECTURES='${{ matrix.cuda_arch }}' -DTRT_LIB_DIR='C:/workspace/TensorRT-9.2.0.5/lib' -DTRT_INCLUDE_DIR='C:/workspace/TensorRT-9.2.0.5/include' -DBUILD_NITRO=ON -DCMAKE_CUDA_COMPILER='C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.2/bin/nvcc.exe' -DENABLE_MULTI_DEVICE=0 -G Ninja"
+          powershell -Command "cmake --build . --parallel 2 --config Release"
+      
+      - name: create nitro artifact with dll file
+        shell: powershell
+        run: |
+          mkdir build_nitro
+          cp -Force C:\workspace\nitro-tensorrt-llm\cpp\build\tensorrt_llm\nitro\nitro.exe .\build_nitro
+          cp -Force C:\workspace\nitro-tensorrt-llm\cpp\build\tensorrt_llm\tensorrt_llm.dll .\build_nitro
+          cp -Force C:\workspace\nitro-tensorrt-llm\cpp\build\tensorrt_llm\plugins\nvinfer_plugin_tensorrt_llm.dll .\build_nitro
+          cp -Force C:\workspace\nitro-tensorrt-llm\cpp\tensorrt_llm\nitro\build_deps\_install\bin\zlib.dll .\build_nitro
+          cp -Force C:\workspace\cuDNN\bin\cudnn_ops_infer64_8.dll .\build_nitro
+          cp -Force C:\workspace\TensorRT-9.2.0.5\lib\nvinfer.dll .\build_nitro
+          cp -Force C:\Windows\SysWOW64\msmpi.dll .\build_nitro
+          cp -Force C:\workspace\cuDNN\bin\cudnn64_8.dll .\build_nitro
+          ls .\build_nitro
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v2
+        with:
+          name: nitro-tensorrt-llm-windows-${{ matrix.cuda_arch_name }}
+          path: ./build_nitro
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v2
+        with:
+          name: python-tensorrt-llm-${{ matrix.cuda_arch }}-wheel
+          path: C:/workspace/nitro-tensorrt-llm/build

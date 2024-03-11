@@ -1,0 +1,87 @@
+name: Release for python Windows
+on:
+  push:
+    tags: ["python-windows-*"]
+
+jobs:
+  create-draft-release:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+      version: ${{ steps.get_version.outputs.version }}
+    permissions:
+      contents: write
+    steps:
+      - name: Extract tag name prefix
+        id: get_version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV && echo "::set-output name=version::${GITHUB_REF#refs/tags/}"
+        env:
+          GITHUB_REF: ${{ github.ref }}
+      - name: Create Draft Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          release_name: "${{ env.VERSION }}"
+          draft: true
+          prerelease: false
+  windows-build:
+    needs: create-draft-release
+    runs-on: windows-nitro-tensorrt-llm-${{ matrix.cuda_arch_name }}
+    strategy:
+      matrix:
+        include:
+          - cuda_arch: '80-real;86-real'
+            cuda_arch_name: 'ampere'
+          - cuda_arch: '89-real'
+            cuda_arch_name: 'ada'
+          - cuda_arch: '75-real'
+            cuda_arch_name: 'turing'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version: "6.0.x"
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v3
+        with:
+          submodules: recursive
+          lfs: true
+
+      - run: cp -r -Force C:\w\nitro-tensorrt-llm\nitro-tensorrt-llm\cpp\tensorrt_llm\nitro C:\workspace\nitro-tensorrt-llm\cpp\tensorrt_llm
+
+      - uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 45
+          max_attempts: 3
+          shell: powershell
+          command: |
+            cd C:\workspace\nitro-tensorrt-llm\cpp\tensorrt_llm\nitro; powershell -Command cmake -S ./nitro_deps -B ./build_deps/nitro_deps; powershell -Command cmake --build ./build_deps/nitro_deps --config Release
+
+      - name: Build Python
+        shell: powershell
+        run: |
+          cd C:\workspace\nitro-tensorrt-llm; powershell -Command "python .\scripts\build_wheel.py -a '${{ matrix.cuda_arch }}' --trt_root 'C:\workspace\TensorRT-9.2.0.5\'"
+
+      - name: Build nitro
+        shell: powershell
+        run: |
+          cd C:\workspace\nitro-tensorrt-llm\cpp\build
+          powershell -Command "cmake .. -DCMAKE_CUDA_ARCHITECTURES='${{ matrix.cuda_arch }}' -DTRT_LIB_DIR='C:/workspace/TensorRT-9.2.0.5/lib' -DTRT_INCLUDE_DIR='C:/workspace/TensorRT-9.2.0.5/include' -DBUILD_NITRO=ON -DCMAKE_CUDA_COMPILER='C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.2/bin/nvcc.exe' -DENABLE_MULTI_DEVICE=0 -G Ninja"
+          powershell -Command "cmake --build . --parallel 2 --config Release"
+          tar -czvf python.tar.gz .\build\*.whl
+
+      - uses: actions/upload-release-asset@v1.0.1
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-draft-release.outputs.upload_url }}
+          asset_path: ./python.tar.gz
+          asset_name: ${{ needs.create-draft-release.outputs.version }}-tensorrt-llm-${{ matrix.cuda_arch_name }}.tar.gz
+          asset_content_type: application/gzip
