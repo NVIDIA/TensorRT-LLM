@@ -100,6 +100,7 @@ public:
     GenerationInput createGenerationInput(std::vector<int32_t> inputIds);
     GenerationOutput createGenerationOutput();
     std::unique_ptr<Tokenizer> nitro_tokenizer;
+    GenerationInput::TensorPtr getTensorChatMLStopWordList();
 
 private:
     GptSession::Config sessionConfig{1, 1, 1};
