@@ -15,7 +15,7 @@ jobs:
     steps:
       - name: Extract tag name without v prefix
         id: get_version
-        run: echo "VERSION=${GITHUB_REF#refs/tags/windows-v}" >> $GITHUB_ENV && echo "::set-output name=version::${GITHUB_REF#refs/tags/windows-v}"
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV && echo "::set-output name=version::${GITHUB_REF#refs/tags/}"
         env:
           GITHUB_REF: ${{ github.ref }}
       - name: Create Draft Release
@@ -63,11 +63,6 @@ jobs:
           command: |
             cd C:\workspace\nitro-tensorrt-llm\cpp\tensorrt_llm\nitro; powershell -Command cmake -S ./nitro_deps -B ./build_deps/nitro_deps; powershell -Command cmake --build ./build_deps/nitro_deps --config Release
 
-      - name: Build Python
-        shell: powershell
-        run: |
-          cd C:\workspace\nitro-tensorrt-llm; powershell -Command "python .\scripts\build_wheel.py -a '${{ matrix.cuda_arch }}' --trt_root 'C:\workspace\TensorRT-9.2.0.5\'"
-
       - name: Build nitro
         shell: powershell
         run: |
@@ -99,5 +94,5 @@ jobs:
         with:
           upload_url: ${{ needs.create-draft-release.outputs.upload_url }}
           asset_path: ./nitro.tar.gz
-          asset_name: nitro-${{ needs.create-draft-release.outputs.version }}-win-amd64-tensorrt-llm-${{ matrix.cuda_arch_name }}.tar.gz
+          asset_name: nitro-${{ needs.create-draft-release.outputs.version }}-amd64-tensorrt-llm-${{ matrix.cuda_arch_name }}.tar.gz
           asset_content_type: application/gzip
