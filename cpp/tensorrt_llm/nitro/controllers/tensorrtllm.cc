@@ -292,73 +292,11 @@ void tensorrtllm::chat_completion(
 
                 std::string rawText = inferState->textsToStream.front();
                 inferState->textsToStream.pop();
-                LOG_INFO << "current text:" << rawText;
-                LOG_INFO << "prev text:" << inferState->prevText;
-                LOG_INFO << "--------";
                 if (handleMatch(rawText, inferState))
                 {
                     continue;
                 };
-                //                if (rawText == "<")
-                //                {
-                //                    inferState->prevText = rawText;
-                //                    continue;
-                //                }
-                //
-                //                if (rawText == "|")
-                //                {
-                //                    if (inferState->prevText == "<")
-                //                    {
-                //                        inferState->prevText = rawText;
-                //                        continue;
-                //                    }
-                //                }
-                //
-                //                if (rawText == "im")
-                //                {
-                //                    if (inferState->prevText == "|")
-                //                    {
-                //                        inferState->prevText = rawText;
-                //                        continue;
-                //                    }
-                //                }
-                //
-                //                if (rawText == "_")
-                //                {
-                //                    if (inferState->prevText == "im")
-                //                    {
-                //                        inferState->prevText = rawText;
-                //                        continue;
-                //                    }
-                //                }
-                //
-                //                if (rawText == "end")
-                //                {
-                //                    if (inferState->prevText == "_")
-                //                    {
-                //                        inferState->prevText = rawText;
-                //                        continue;
-                //                    }
-                //                }
-                //
-                //                if (rawText == "|")
-                //                {
-                //                    if (inferState->prevText == "end")
-                //                    {
-                //                        inferState->prevText = rawText;
-                //                        continue;
-                //                    }
-                //                }
-                //
-                //                if (rawText == ">")
-                //                {
-                //                    if (inferState->prevText == "|")
-                //                    {
-                //                        inferState->prevText = rawText;
-                //                        continue;
-                //                    }
-                //                }
-                //
+
                 if (rawText == "[DONE]")
                 {
                     LOG_INFO << "End of result";
