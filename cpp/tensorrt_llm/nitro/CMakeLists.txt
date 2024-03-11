@@ -47,8 +47,17 @@ find_package(PkgConfig REQUIRED)
 find_package(Drogon CONFIG REQUIRED)
 
 # Use pkg-config to find the SentencePiece library
-pkg_search_module(SENTENCEPIECE REQUIRED sentencepiece)
 
+if(NOT WIN32) # Linux
+  # Use pkg-config to find the SentencePiece library
+  pkg_search_module(SENTENCEPIECE REQUIRED sentencepiece)
+else() # Windows
+  set(SENTENCEPIECE_INCLUDE_DIRS "${CMAKE_PREFIX_PATH}/include")
+  set(SENTENCEPIECE_LIBRARY_DIRS "${CMAKE_PREFIX_PATH}/lib")
+endif()
+
+message(STATUS "SentencePiece library dirs: ${SENTENCEPIECE_LIBRARY_DIRS}")
+message(STATUS "SentencePiece header dirs: ${SENTENCEPIECE_INCLUDE_DIRS}")
 
 include_directories(${PROJECT_SOURCE_DIR}/include ${SENTENCEPIECE_INCLUDE_DIRS})
 
