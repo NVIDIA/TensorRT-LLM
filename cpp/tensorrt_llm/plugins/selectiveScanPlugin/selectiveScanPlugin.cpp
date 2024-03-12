@@ -24,8 +24,8 @@ using namespace tensorrt_llm::common;
 using tensorrt_llm::plugins::SelectiveScanPluginCreator;
 using tensorrt_llm::plugins::SelectiveScanPlugin;
 
-static const char* SELECTIVE_SCAN_PLUGIN_VERSION{"1"};
-static const char* SELECTIVE_SCAN_PLUGIN_NAME{"SelectiveScan"};
+static char const* SELECTIVE_SCAN_PLUGIN_VERSION{"1"};
+static char const* SELECTIVE_SCAN_PLUGIN_NAME{"SelectiveScan"};
 PluginFieldCollection SelectiveScanPluginCreator::mFC{};
 std::vector<nvinfer1::PluginField> SelectiveScanPluginCreator::mPluginAttributes;
 
@@ -45,9 +45,9 @@ SelectiveScanPlugin::SelectiveScanPlugin(
 }
 
 // Parameterized constructor
-SelectiveScanPlugin::SelectiveScanPlugin(const void* data, size_t length)
+SelectiveScanPlugin::SelectiveScanPlugin(void const* data, size_t length)
 {
-    const char *d = reinterpret_cast<const char*>(data), *a = d;
+    char const *d = reinterpret_cast<char const*>(data), *a = d;
     read(d, mDim);
     read(d, mDState);
     read(d, mIsVariableB);
@@ -72,7 +72,7 @@ nvinfer1::IPluginV2DynamicExt* SelectiveScanPlugin::clone() const noexcept
 //     output_tensor: [batch_size, seq_len, dim]
 //     state: [batch_size, dstate, dim]
 nvinfer1::DimsExprs SelectiveScanPlugin::getOutputDimensions(
-    int outputIndex, const nvinfer1::DimsExprs* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
+    int outputIndex, nvinfer1::DimsExprs const* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
 {
     if (outputIndex == 0)
     {
@@ -82,7 +82,7 @@ nvinfer1::DimsExprs SelectiveScanPlugin::getOutputDimensions(
 }
 
 bool SelectiveScanPlugin::supportsFormatCombination(
-    int pos, const nvinfer1::PluginTensorDesc* inOut, int nbInputs, int nbOutputs) noexcept
+    int pos, nvinfer1::PluginTensorDesc const* inOut, int nbInputs, int nbOutputs) noexcept
 {
     if (pos == getHostRequestTypesIdx())
     {
@@ -98,20 +98,20 @@ bool SelectiveScanPlugin::supportsFormatCombination(
     }
 }
 
-void SelectiveScanPlugin::configurePlugin(const nvinfer1::DynamicPluginTensorDesc* in, int nbInputs,
-    const nvinfer1::DynamicPluginTensorDesc* out, int nbOutputs) noexcept
+void SelectiveScanPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int nbInputs,
+    nvinfer1::DynamicPluginTensorDesc const* out, int nbOutputs) noexcept
 {
 }
 
-size_t SelectiveScanPlugin::getWorkspaceSize(const nvinfer1::PluginTensorDesc* inputs, int nbInputs,
-    const nvinfer1::PluginTensorDesc* outputs, int nbOutputs) const noexcept
+size_t SelectiveScanPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* inputs, int nbInputs,
+    nvinfer1::PluginTensorDesc const* outputs, int nbOutputs) const noexcept
 {
     return 0;
 }
 
 void SelectiveScanPlugin::setSSMParams(SSMParamsBase& params, const size_t batch, const size_t dim, const size_t seqLen,
-    const size_t dstate, const bool isVariableB, const bool isVariableC, void* statePtr, const void* x,
-    const void* delta, const void* deltaBias, const void* A, const void* B, const void* C, const void* D, const void* z,
+    const size_t dstate, bool const isVariableB, bool const isVariableC, void* statePtr, void const* x,
+    void const* delta, void const* deltaBias, void const* A, void const* B, void const* C, void const* D, void const* z,
     void* out, bool deltaSoftplus)
 {
     // Reset the parameters
@@ -141,8 +141,8 @@ void SelectiveScanPlugin::setSSMParams(SSMParamsBase& params, const size_t batch
 }
 
 template <typename T>
-int SelectiveScanPlugin::enqueueImpl(const nvinfer1::PluginTensorDesc* inputDesc,
-    const nvinfer1::PluginTensorDesc* outputDesc, const void* const* inputs, void* const* outputs, void* workspace,
+int SelectiveScanPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc,
+    nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
     cudaStream_t stream)
 {
     // inputs
@@ -183,8 +183,8 @@ int SelectiveScanPlugin::enqueueImpl(const nvinfer1::PluginTensorDesc* inputDesc
     return 0;
 }
 
-int SelectiveScanPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc,
-    const nvinfer1::PluginTensorDesc* outputDesc, const void* const* inputs, void* const* outputs, void* workspace,
+int SelectiveScanPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
+    nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
     cudaStream_t stream) noexcept
 {
     if (mType == DataType::kHALF)
@@ -206,7 +206,7 @@ int SelectiveScanPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc,
 
 // IPluginV2Ext Methods
 nvinfer1::DataType SelectiveScanPlugin::getOutputDataType(
-    int index, const nvinfer1::DataType* inputTypes, int nbInputs) const noexcept
+    int index, nvinfer1::DataType const* inputTypes, int nbInputs) const noexcept
 {
     if (index == 0)
     {
@@ -220,12 +220,12 @@ nvinfer1::DataType SelectiveScanPlugin::getOutputDataType(
 
 // IPluginV2 Methods
 
-const char* SelectiveScanPlugin::getPluginType() const noexcept
+char const* SelectiveScanPlugin::getPluginType() const noexcept
 {
     return SELECTIVE_SCAN_PLUGIN_NAME;
 }
 
-const char* SelectiveScanPlugin::getPluginVersion() const noexcept
+char const* SelectiveScanPlugin::getPluginVersion() const noexcept
 {
     return SELECTIVE_SCAN_PLUGIN_VERSION;
 }
@@ -281,60 +281,60 @@ SelectiveScanPluginCreator::SelectiveScanPluginCreator()
     mFC.fields = mPluginAttributes.data();
 }
 
-const char* SelectiveScanPluginCreator::getPluginName() const noexcept
+char const* SelectiveScanPluginCreator::getPluginName() const noexcept
 {
     return SELECTIVE_SCAN_PLUGIN_NAME;
 }
 
-const char* SelectiveScanPluginCreator::getPluginVersion() const noexcept
+char const* SelectiveScanPluginCreator::getPluginVersion() const noexcept
 {
     return SELECTIVE_SCAN_PLUGIN_VERSION;
 }
 
-const PluginFieldCollection* SelectiveScanPluginCreator::getFieldNames() noexcept
+PluginFieldCollection const* SelectiveScanPluginCreator::getFieldNames() noexcept
 {
     return &mFC;
 }
 
-IPluginV2* SelectiveScanPluginCreator::createPlugin(const char* name, const PluginFieldCollection* fc) noexcept
+IPluginV2* SelectiveScanPluginCreator::createPlugin(char const* name, PluginFieldCollection const* fc) noexcept
 {
-    const PluginField* fields = fc->fields;
+    PluginField const* fields = fc->fields;
     int dim, dstate;
     bool isVariableB, isVariableC, deltaSoftplus;
     nvinfer1::DataType type;
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {
-        const char* attrName = fields[i].name;
+        char const* attrName = fields[i].name;
         if (!strcmp(attrName, "dim"))
         {
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
-            dim = static_cast<int>(*(static_cast<const int*>(fields[i].data)));
+            dim = static_cast<int>(*(static_cast<int const*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "dstate"))
         {
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
-            dstate = static_cast<int>(*(static_cast<const int*>(fields[i].data)));
+            dstate = static_cast<int>(*(static_cast<int const*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "is_variable_B"))
         {
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT8);
-            isVariableB = static_cast<bool>(*(static_cast<const bool*>(fields[i].data)));
+            isVariableB = static_cast<bool>(*(static_cast<bool const*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "is_variable_C"))
         {
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT8);
-            isVariableC = static_cast<bool>(*(static_cast<const bool*>(fields[i].data)));
+            isVariableC = static_cast<bool>(*(static_cast<bool const*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "delta_softplus"))
         {
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT8);
-            deltaSoftplus = static_cast<bool>(*(static_cast<const bool*>(fields[i].data)));
+            deltaSoftplus = static_cast<bool>(*(static_cast<bool const*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "type_id"))
         {
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
-            type = static_cast<nvinfer1::DataType>(*(static_cast<const nvinfer1::DataType*>(fields[i].data)));
+            type = static_cast<nvinfer1::DataType>(*(static_cast<nvinfer1::DataType const*>(fields[i].data)));
         }
     }
     try
@@ -343,7 +343,7 @@ IPluginV2* SelectiveScanPluginCreator::createPlugin(const char* name, const Plug
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }
-    catch (const std::exception& e)
+    catch (std::exception const& e)
     {
         caughtError(e);
     }
@@ -351,7 +351,7 @@ IPluginV2* SelectiveScanPluginCreator::createPlugin(const char* name, const Plug
 }
 
 IPluginV2* SelectiveScanPluginCreator::deserializePlugin(
-    const char* name, const void* serialData, size_t serialLength) noexcept
+    char const* name, void const* serialData, size_t serialLength) noexcept
 {
     // This object will be deleted when the network is destroyed, which will
     // call SelectiveScanPlugin::destroy()
@@ -361,7 +361,7 @@ IPluginV2* SelectiveScanPluginCreator::deserializePlugin(
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }
-    catch (const std::exception& e)
+    catch (std::exception const& e)
     {
         caughtError(e);
     }

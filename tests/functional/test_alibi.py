@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
+import sys
 import unittest
 
 import numpy as np
@@ -22,6 +24,9 @@ from transformers.models.bloom.modeling_bloom import build_alibi_tensor
 
 import tensorrt_llm
 from tensorrt_llm import Tensor
+
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.util import unittest_name_func
 
 
 class TestFunctional(unittest.TestCase):
@@ -41,7 +46,8 @@ class TestFunctional(unittest.TestCase):
     # We don't run alibi in FP16, so only check FP32 here.
     @parameterized.expand([(1, 64, 32), (16, 1, 64), (24, 20, 500),
                            (32, 128, 60), (64, 32, 1024), (80, 12, 20),
-                           (112, 4, 389)])
+                           (112, 4, 389)],
+                          name_func=unittest_name_func)
     def test_alibi_biases(self, num_heads, batch_size, seq_len):
 
         # construct trt network

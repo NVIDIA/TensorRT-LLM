@@ -35,16 +35,16 @@ static constexpr int FP8_ALPHA = int(1) << 3;
 using tensorrt_llm::plugins::read;
 using tensorrt_llm::plugins::write;
 
-static const char* WOQ_GROUPWISE_MATMUL_PLUGIN_VERSION{"1"};
-static const char* WOQ_GROUPWISE_MATMUL_PLUGIN_NAME{"WeightOnlyGroupwiseQuantMatmul"};
+static char const* WOQ_GROUPWISE_MATMUL_PLUGIN_VERSION{"1"};
+static char const* WOQ_GROUPWISE_MATMUL_PLUGIN_NAME{"WeightOnlyGroupwiseQuantMatmul"};
 PluginFieldCollection WeightOnlyGroupwiseQuantMatmulPluginCreator::mFC{};
 std::vector<nvinfer1::PluginField> WeightOnlyGroupwiseQuantMatmulPluginCreator::mPluginAttributes;
 
 void WeightOnlyGroupwiseQuantGemmPluginProfiler::runTactic(int m, int n, int k,
-    const WeightOnlyGroupwiseQuantGemmPluginProfiler::Config& tactic, char* workspace, const cudaStream_t& stream)
+    WeightOnlyGroupwiseQuantGemmPluginProfiler::Config const& tactic, char* workspace, cudaStream_t const& stream)
 {
     // Quantized weights are packed in FP16 format (INT4*4 -> FP16)
-    const int originalN = n * FP16_INT4_RATIO;
+    int const originalN = n * FP16_INT4_RATIO;
     half* actPtr = reinterpret_cast<half*>(workspace);
     cutlass::uint4b_t* weightPtr = reinterpret_cast<cutlass::uint4b_t*>(
         nextWorkspacePtr(reinterpret_cast<int8_t*>(actPtr), m * k * sizeof(half)));
@@ -68,7 +68,7 @@ void WeightOnlyGroupwiseQuantGemmPluginProfiler::runTactic(int m, int n, int k,
         biasesPtr = nullptr;
     }
 
-    const int wsSize = mRunner->getWorkspaceSize(m, n, k);
+    int const wsSize = mRunner->getWorkspaceSize(m, n, k);
 
     mRunner->gemm(actPtr, weightPtr, inputScalesPtr, zerosPtr, biasesPtr, outputPtr, m, originalN, k, mGroupSize,
         tactic, workspacePtr, wsSize, stream);
@@ -77,7 +77,7 @@ void WeightOnlyGroupwiseQuantGemmPluginProfiler::runTactic(int m, int n, int k,
 void WeightOnlyGroupwiseQuantGemmPluginProfiler::computeTmpSize(int maxM, int n, int k)
 {
     // Quantized weights are packed in FP16 format (INT4*4 -> FP16)
-    const int originalN = n * FP16_INT4_RATIO;
+    int const originalN = n * FP16_INT4_RATIO;
     std::vector<size_t> workspaces = {
         maxM * k * sizeof(half),                   // A
         k * n * sizeof(float),                     // B
@@ -98,7 +98,7 @@ std::vector<WeightOnlyGroupwiseQuantGemmPluginProfiler::Config> WeightOnlyGroupw
 }
 
 WeightOnlyGroupwiseQuantMatmulPlugin::WeightOnlyGroupwiseQuantMatmulPlugin(nvinfer1::DataType type, int quant_algo,
-    int group_size, const WeightOnlyGroupwiseQuantMatmulPlugin::PluginProfilerPtr& pluginProfiler)
+    int group_size, WeightOnlyGroupwiseQuantMatmulPlugin::PluginProfilerPtr const& pluginProfiler)
     : mPluginProfiler(pluginProfiler)
 {
     init(type, quant_algo, group_size);
@@ -106,10 +106,10 @@ WeightOnlyGroupwiseQuantMatmulPlugin::WeightOnlyGroupwiseQuantMatmulPlugin(nvinf
 
 // Parameterized constructor
 WeightOnlyGroupwiseQuantMatmulPlugin::WeightOnlyGroupwiseQuantMatmulPlugin(
-    const void* data, size_t length, const WeightOnlyGroupwiseQuantMatmulPlugin::PluginProfilerPtr& pluginProfiler)
+    void const* data, size_t length, WeightOnlyGroupwiseQuantMatmulPlugin::PluginProfilerPtr const& pluginProfiler)
     : mPluginProfiler(pluginProfiler)
 {
-    const char *d = reinterpret_cast<const char*>(data), *a = d;
+    char const *d = reinterpret_cast<char const*>(data), *a = d;
     nvinfer1::DataType type;
     int quant_algo = 0;
     int group_size = 0;
@@ -241,7 +241,7 @@ void WeightOnlyGroupwiseQuantMatmulPlugin::configGemm()
 }
 
 nvinfer1::DimsExprs WeightOnlyGroupwiseQuantMatmulPlugin::getOutputDimensions(
-    int outputIndex, const nvinfer1::DimsExprs* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
+    int outputIndex, nvinfer1::DimsExprs const* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
 {
 
     // inputs
@@ -257,8 +257,8 @@ nvinfer1::DimsExprs WeightOnlyGroupwiseQuantMatmulPlugin::getOutputDimensions(
     {
         TLLM_CHECK(nbInputs == mAlphaInputIdx + 1);
         TLLM_CHECK(outputIndex == 0);
-        const int nbDimsA = inputs[0].nbDims;
-        const int nbDimsB = inputs[mWeightInputIdx].nbDims;
+        int const nbDimsA = inputs[0].nbDims;
+        int const nbDimsB = inputs[mWeightInputIdx].nbDims;
         TLLM_CHECK(nbDimsA >= 2);
         TLLM_CHECK(nbDimsB == 2);
         DimsExprs ret;
@@ -273,7 +273,7 @@ nvinfer1::DimsExprs WeightOnlyGroupwiseQuantMatmulPlugin::getOutputDimensions(
 
         return ret;
     }
-    catch (const std::exception& e)
+    catch (std::exception const& e)
     {
         caughtError(e);
     }
@@ -281,7 +281,7 @@ nvinfer1::DimsExprs WeightOnlyGroupwiseQuantMatmulPlugin::getOutputDimensions(
 }
 
 bool WeightOnlyGroupwiseQuantMatmulPlugin::supportsFormatCombination(
-    int pos, const nvinfer1::PluginTensorDesc* inOut, int nbInputs, int nbOutputs) noexcept
+    int pos, nvinfer1::PluginTensorDesc const* inOut, int nbInputs, int nbOutputs) noexcept
 {
     if (pos < mAlphaInputIdx + 2)
     {
@@ -307,19 +307,19 @@ bool WeightOnlyGroupwiseQuantMatmulPlugin::supportsFormatCombination(
     }
 }
 
-void WeightOnlyGroupwiseQuantMatmulPlugin::configurePlugin(const nvinfer1::DynamicPluginTensorDesc* in, int nbInputs,
-    const nvinfer1::DynamicPluginTensorDesc* out, int nbOutputs) noexcept
+void WeightOnlyGroupwiseQuantMatmulPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int nbInputs,
+    nvinfer1::DynamicPluginTensorDesc const* out, int nbOutputs) noexcept
 {
-    const auto minM = std::accumulate(in[0].min.d, in[0].min.d + in[0].min.nbDims - 1, 1, std::multiplies<int>());
-    const auto maxM = std::accumulate(in[0].max.d, in[0].max.d + in[0].max.nbDims - 1, 1, std::multiplies<int>());
+    auto const minM = std::accumulate(in[0].min.d, in[0].min.d + in[0].min.nbDims - 1, 1, std::multiplies<int>());
+    auto const maxM = std::accumulate(in[0].max.d, in[0].max.d + in[0].max.nbDims - 1, 1, std::multiplies<int>());
 
-    const int maxK = in[0].max.d[in[0].max.nbDims - 1];
+    int const maxK = in[0].max.d[in[0].max.nbDims - 1];
 
     // Quantized weights are packed in FP16 format (INT4*4 -> FP16)
-    const int maxN = in[mWeightInputIdx].max.d[1] * FP16_INT4_RATIO;
+    int const maxN = in[mWeightInputIdx].max.d[1] * FP16_INT4_RATIO;
 
-    const auto K = maxK;
-    const auto N = maxN / FP16_INT4_RATIO;
+    auto const K = maxK;
+    auto const N = maxN / FP16_INT4_RATIO;
 
     if (!mDims.isInitialized())
     {
@@ -332,14 +332,14 @@ void WeightOnlyGroupwiseQuantMatmulPlugin::configurePlugin(const nvinfer1::Dynam
     m_workspaceMaxSize = smoothedActSize + m_weightOnlyGroupwiseGemmRunner->getWorkspaceSize(maxM, maxN, maxK);
 }
 
-size_t WeightOnlyGroupwiseQuantMatmulPlugin::getWorkspaceSize(const nvinfer1::PluginTensorDesc* inputs, int nbInputs,
-    const nvinfer1::PluginTensorDesc* outputs, int nbOutputs) const noexcept
+size_t WeightOnlyGroupwiseQuantMatmulPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* inputs, int nbInputs,
+    nvinfer1::PluginTensorDesc const* outputs, int nbOutputs) const noexcept
 {
     return m_workspaceMaxSize;
 }
 
-int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc,
-    const nvinfer1::PluginTensorDesc* outputDesc, const void* const* inputs, void* const* outputs, void* workspace,
+int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
+    nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
     cudaStream_t stream) noexcept
 {
     // inputs
@@ -358,8 +358,8 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDe
     {
         m *= inputDesc[0].dims.d[ii];
     }
-    const int n = inputDesc[mWeightInputIdx].dims.d[1];
-    const int k = inputDesc[0].dims.d[inputDesc[0].dims.nbDims - 1];
+    int const n = inputDesc[mWeightInputIdx].dims.d[1];
+    int const k = inputDesc[0].dims.d[inputDesc[0].dims.nbDims - 1];
 
     int smVersion = getSMVersion();
     bool use_cuda_kernel = m < SMALL_M_FAST_PATH && mCudaKernelEnabled;
@@ -370,9 +370,9 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDe
 #endif
     bool use_pre_quant_scale = mQuantAlgo & PRE_QUANT_SCALE;
 
-    const half* zeros_ptr = (mQuantAlgo & ZERO) ? reinterpret_cast<const half*>(inputs[mZerosInputIdx]) : nullptr;
-    const half* biases_ptr = (mQuantAlgo & BIAS) ? reinterpret_cast<const half*>(inputs[mBiasesInputIdx]) : nullptr;
-    const half* act_ptr = reinterpret_cast<const half*>(inputs[0]);
+    half const* zeros_ptr = (mQuantAlgo & ZERO) ? reinterpret_cast<half const*>(inputs[mZerosInputIdx]) : nullptr;
+    half const* biases_ptr = (mQuantAlgo & BIAS) ? reinterpret_cast<half const*>(inputs[mBiasesInputIdx]) : nullptr;
+    half const* act_ptr = reinterpret_cast<half const*>(inputs[0]);
     float alpha = 1.0;
     if (mQuantAlgo & FP8_ALPHA)
     {
@@ -382,20 +382,20 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDe
     if (use_pre_quant_scale && !use_cuda_kernel)
     {
         // Apply pre-quant per channel scale on activations
-        act_ptr = reinterpret_cast<const half*>(workspace);
+        act_ptr = reinterpret_cast<half const*>(workspace);
         if (mType == nvinfer1::DataType::kHALF)
         {
             if (mQuantAlgo & FP8_ALPHA)
             {
                 tensorrt_llm::kernels::apply_per_channel_scale_kernel_launcher<half, __nv_fp8_e4m3>(
-                    reinterpret_cast<__nv_fp8_e4m3*>(workspace), reinterpret_cast<const half*>(inputs[0]),
-                    reinterpret_cast<const half*>(inputs[mPreQuantScaleInputIdx]), m, k, stream);
+                    reinterpret_cast<__nv_fp8_e4m3*>(workspace), reinterpret_cast<half const*>(inputs[0]),
+                    reinterpret_cast<half const*>(inputs[mPreQuantScaleInputIdx]), m, k, stream);
             }
             else
             {
                 tensorrt_llm::kernels::apply_per_channel_scale_kernel_launcher<half, half>(
-                    reinterpret_cast<half*>(workspace), reinterpret_cast<const half*>(inputs[0]),
-                    reinterpret_cast<const half*>(inputs[mPreQuantScaleInputIdx]), m, k, stream);
+                    reinterpret_cast<half*>(workspace), reinterpret_cast<half const*>(inputs[0]),
+                    reinterpret_cast<half const*>(inputs[mPreQuantScaleInputIdx]), m, k, stream);
             }
         }
 #if defined(ENABLE_BF16)
@@ -404,14 +404,14 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDe
             if (mQuantAlgo & FP8_ALPHA)
             {
                 tensorrt_llm::kernels::apply_per_channel_scale_kernel_launcher<__nv_bfloat16, __nv_fp8_e4m3>(
-                    reinterpret_cast<__nv_fp8_e4m3*>(workspace), reinterpret_cast<const __nv_bfloat16*>(inputs[0]),
-                    reinterpret_cast<const __nv_bfloat16*>(inputs[mPreQuantScaleInputIdx]), m, k, stream);
+                    reinterpret_cast<__nv_fp8_e4m3*>(workspace), reinterpret_cast<__nv_bfloat16 const*>(inputs[0]),
+                    reinterpret_cast<__nv_bfloat16 const*>(inputs[mPreQuantScaleInputIdx]), m, k, stream);
             }
             else
             {
                 tensorrt_llm::kernels::apply_per_channel_scale_kernel_launcher<__nv_bfloat16, __nv_bfloat16>(
-                    reinterpret_cast<__nv_bfloat16*>(workspace), reinterpret_cast<const __nv_bfloat16*>(inputs[0]),
-                    reinterpret_cast<const __nv_bfloat16*>(inputs[mPreQuantScaleInputIdx]), m, k, stream);
+                    reinterpret_cast<__nv_bfloat16*>(workspace), reinterpret_cast<__nv_bfloat16 const*>(inputs[0]),
+                    reinterpret_cast<__nv_bfloat16 const*>(inputs[mPreQuantScaleInputIdx]), m, k, stream);
             }
         }
 #endif
@@ -444,16 +444,16 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDe
             // Use CUDA kernels for small batch size
             // The CUDA kernel is designed for ColumnMajorTileInterleave weight layout used in fpAIntB cutlass kernel
             // when sm >= 75 and the preprocessing of cutlass on sm70 does not interleave the weights.
-            const void* pre_quant_scale_ptr = nullptr;
+            void const* pre_quant_scale_ptr = nullptr;
             if (use_pre_quant_scale)
                 pre_quant_scale_ptr = inputs[mPreQuantScaleInputIdx];
-            void* cuda_kernel_act_ptr = const_cast<void*>(reinterpret_cast<const void*>(inputs[0]));
-            void* cuda_kernel_act_scale_ptr = const_cast<void*>(reinterpret_cast<const void*>(pre_quant_scale_ptr));
-            void* cuda_kernel_weight_ptr = const_cast<void*>(reinterpret_cast<const void*>(inputs[mWeightInputIdx]));
-            void* cuda_kernel_scales_ptr = const_cast<void*>(reinterpret_cast<const void*>(inputs[mScalesInputIdx]));
-            void* cuda_kernel_zeros_ptr = const_cast<void*>(reinterpret_cast<const void*>(zeros_ptr));
-            void* cuda_kernel_bias_ptr = const_cast<void*>(reinterpret_cast<const void*>(biases_ptr));
-            void* cuda_kernel_out_ptr = const_cast<void*>(reinterpret_cast<const void*>(outputs[0]));
+            void* cuda_kernel_act_ptr = const_cast<void*>(reinterpret_cast<void const*>(inputs[0]));
+            void* cuda_kernel_act_scale_ptr = const_cast<void*>(reinterpret_cast<void const*>(pre_quant_scale_ptr));
+            void* cuda_kernel_weight_ptr = const_cast<void*>(reinterpret_cast<void const*>(inputs[mWeightInputIdx]));
+            void* cuda_kernel_scales_ptr = const_cast<void*>(reinterpret_cast<void const*>(inputs[mScalesInputIdx]));
+            void* cuda_kernel_zeros_ptr = const_cast<void*>(reinterpret_cast<void const*>(zeros_ptr));
+            void* cuda_kernel_bias_ptr = const_cast<void*>(reinterpret_cast<void const*>(biases_ptr));
+            void* cuda_kernel_out_ptr = const_cast<void*>(reinterpret_cast<void const*>(outputs[0]));
 
             tensorrt_llm::kernels::weight_only::Params params{cuda_kernel_act_ptr, cuda_kernel_act_scale_ptr,
                 cuda_kernel_weight_ptr, cuda_kernel_scales_ptr, cuda_kernel_zeros_ptr, cuda_kernel_bias_ptr,
@@ -464,11 +464,11 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDe
         else
         {
             // Use cutlass kernels for large batch size
-            const int ws_bytes = m_weightOnlyGroupwiseGemmRunner->getWorkspaceSize(m, n, k);
+            int const ws_bytes = m_weightOnlyGroupwiseGemmRunner->getWorkspaceSize(m, n, k);
 
-            int32_t* weight_ptr = const_cast<int32_t*>(reinterpret_cast<const int32_t*>(inputs[mWeightInputIdx]));
+            int32_t* weight_ptr = const_cast<int32_t*>(reinterpret_cast<int32_t const*>(inputs[mWeightInputIdx]));
 
-            const auto& bestTactic = mPluginProfiler->getBestConfig(m, mGemmId);
+            auto const& bestTactic = mPluginProfiler->getBestConfig(m, mGemmId);
             TLLM_CHECK_WITH_INFO(bestTactic, "No valid weight only groupwise GEMM tactic");
             m_weightOnlyGroupwiseGemmRunner->gemm(act_ptr, weight_ptr, inputs[mScalesInputIdx], zeros_ptr, biases_ptr,
                 alpha, outputs[0], m, real_n, k, mGroupSize, *bestTactic,
@@ -483,10 +483,10 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDe
             // Use CUDA kernels for small batch size
             // The CUDA kernel is designed for ColumnMajorTileInterleave weight layout used in fpAIntB cutlass kernel
             // when sm >= 75 and the preprocessing of cutlass on sm70 does not interleave the weights.
-            const void* pre_quant_scale = nullptr;
+            void const* pre_quant_scale = nullptr;
             if (use_pre_quant_scale)
                 pre_quant_scale = inputs[mPreQuantScaleInputIdx];
-            tensorrt_llm::kernels::WeightOnlyParams params{reinterpret_cast<const uint8_t*>(inputs[mWeightInputIdx]),
+            tensorrt_llm::kernels::WeightOnlyParams params{reinterpret_cast<uint8_t const*>(inputs[mWeightInputIdx]),
                 inputs[mScalesInputIdx], zeros_ptr, act_ptr, pre_quant_scale, biases_ptr, outputs[0], m, real_n, k,
                 mGroupSize, tensorrt_llm::kernels::WeightOnlyQuantType::Int4b,
                 tensorrt_llm::kernels::WeightOnlyType::GroupWise,
@@ -496,11 +496,11 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDe
         else
         {
             // Use cutlass kernels for large batch size
-            const int ws_bytes = m_weightOnlyGroupwiseGemmRunner->getWorkspaceSize(m, n, k);
+            int const ws_bytes = m_weightOnlyGroupwiseGemmRunner->getWorkspaceSize(m, n, k);
 
-            int32_t* weight_ptr = const_cast<int32_t*>(reinterpret_cast<const int32_t*>(inputs[mWeightInputIdx]));
+            int32_t* weight_ptr = const_cast<int32_t*>(reinterpret_cast<int32_t const*>(inputs[mWeightInputIdx]));
 
-            const auto& bestTactic = mPluginProfiler->getBestConfig(m, mGemmId);
+            auto const& bestTactic = mPluginProfiler->getBestConfig(m, mGemmId);
             TLLM_CHECK_WITH_INFO(bestTactic,
                 "No valid weight only groupwise GEMM tactic(It is usually caused by the failure to execute all "
                 "candidate "
@@ -518,7 +518,7 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDe
 
 // IPluginV2Ext Methods
 nvinfer1::DataType WeightOnlyGroupwiseQuantMatmulPlugin::getOutputDataType(
-    int index, const nvinfer1::DataType* inputTypes, int nbInputs) const noexcept
+    int index, nvinfer1::DataType const* inputTypes, int nbInputs) const noexcept
 {
     TLLM_CHECK(index == 0);
     return mType;
@@ -526,12 +526,12 @@ nvinfer1::DataType WeightOnlyGroupwiseQuantMatmulPlugin::getOutputDataType(
 
 // IPluginV2 Methods
 
-const char* WeightOnlyGroupwiseQuantMatmulPlugin::getPluginType() const noexcept
+char const* WeightOnlyGroupwiseQuantMatmulPlugin::getPluginType() const noexcept
 {
     return WOQ_GROUPWISE_MATMUL_PLUGIN_NAME;
 }
 
-const char* WeightOnlyGroupwiseQuantMatmulPlugin::getPluginVersion() const noexcept
+char const* WeightOnlyGroupwiseQuantMatmulPlugin::getPluginVersion() const noexcept
 {
     return WOQ_GROUPWISE_MATMUL_PLUGIN_VERSION;
 }
@@ -589,46 +589,46 @@ WeightOnlyGroupwiseQuantMatmulPluginCreator::WeightOnlyGroupwiseQuantMatmulPlugi
     mFC.fields = mPluginAttributes.data();
 }
 
-const char* WeightOnlyGroupwiseQuantMatmulPluginCreator::getPluginName() const noexcept
+char const* WeightOnlyGroupwiseQuantMatmulPluginCreator::getPluginName() const noexcept
 {
     return WOQ_GROUPWISE_MATMUL_PLUGIN_NAME;
 }
 
-const char* WeightOnlyGroupwiseQuantMatmulPluginCreator::getPluginVersion() const noexcept
+char const* WeightOnlyGroupwiseQuantMatmulPluginCreator::getPluginVersion() const noexcept
 {
     return WOQ_GROUPWISE_MATMUL_PLUGIN_VERSION;
 }
 
-const PluginFieldCollection* WeightOnlyGroupwiseQuantMatmulPluginCreator::getFieldNames() noexcept
+PluginFieldCollection const* WeightOnlyGroupwiseQuantMatmulPluginCreator::getFieldNames() noexcept
 {
     return &mFC;
 }
 
 IPluginV2* WeightOnlyGroupwiseQuantMatmulPluginCreator::createPlugin(
-    const char* name, const PluginFieldCollection* fc) noexcept
+    char const* name, PluginFieldCollection const* fc) noexcept
 {
-    const PluginField* fields = fc->fields;
+    PluginField const* fields = fc->fields;
     nvinfer1::DataType type;
     int QuantAlgo;
     int GroupSize;
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {
-        const char* attrName = fields[i].name;
+        char const* attrName = fields[i].name;
         if (!strcmp(attrName, "quant_algo"))
         {
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
-            QuantAlgo = static_cast<int>(*(static_cast<const int*>(fields[i].data)));
+            QuantAlgo = static_cast<int>(*(static_cast<int const*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "group_size"))
         {
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
-            GroupSize = static_cast<int>(*(static_cast<const int*>(fields[i].data)));
+            GroupSize = static_cast<int>(*(static_cast<int const*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "type_id"))
         {
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
-            type = static_cast<nvinfer1::DataType>(*(static_cast<const nvinfer1::DataType*>(fields[i].data)));
+            type = static_cast<nvinfer1::DataType>(*(static_cast<nvinfer1::DataType const*>(fields[i].data)));
         }
     }
     try
@@ -640,7 +640,7 @@ IPluginV2* WeightOnlyGroupwiseQuantMatmulPluginCreator::createPlugin(
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }
-    catch (const std::exception& e)
+    catch (std::exception const& e)
     {
         caughtError(e);
     }
@@ -648,7 +648,7 @@ IPluginV2* WeightOnlyGroupwiseQuantMatmulPluginCreator::createPlugin(
 }
 
 IPluginV2* WeightOnlyGroupwiseQuantMatmulPluginCreator::deserializePlugin(
-    const char* name, const void* serialData, size_t serialLength) noexcept
+    char const* name, void const* serialData, size_t serialLength) noexcept
 {
     // This object will be deleted when the network is destroyed, which will
     // call weightOnlyGroupwiseQuantMatmulPlugin::destroy()
@@ -660,7 +660,7 @@ IPluginV2* WeightOnlyGroupwiseQuantMatmulPluginCreator::deserializePlugin(
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }
-    catch (const std::exception& e)
+    catch (std::exception const& e)
     {
         caughtError(e);
     }

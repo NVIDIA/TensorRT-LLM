@@ -17,7 +17,6 @@ import sys
 import unittest
 
 import numpy as np
-import pytest
 import torch
 from parameterized import parameterized
 from polygraphy.backend.trt import CreateConfig, EngineFromNetwork, TrtRunner
@@ -26,7 +25,7 @@ import tensorrt_llm
 from tensorrt_llm import Tensor
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import getSMVersion
+from utils.util import skip_bf16_pre_ampere, unittest_name_func
 
 
 class TestFunctional(unittest.TestCase):
@@ -36,13 +35,11 @@ class TestFunctional(unittest.TestCase):
 
     @parameterized.expand([('float32', False), ('float32', True),
                            ('float16', False), ('float16', True),
-                           ('bfloat16', False), ('bfloat16', True)])
+                           ('bfloat16', False), ('bfloat16', True)],
+                          name_func=unittest_name_func)
     def test_identity(self, dtype, use_plugin):
         # Skip tests that are not supported in pre-ampere architecture
-        if getSMVersion() < 80:
-            if dtype == 'bfloat16':
-                pytest.skip(
-                    "bfloat16 is not supported in pre-ampere architecture")
+        skip_bf16_pre_ampere(dtype)
 
         x_data = torch.randn(
             (4, 6, 3, 4), dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype))

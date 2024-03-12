@@ -24,6 +24,7 @@
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
+#include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
@@ -64,20 +65,18 @@ struct BenchmarkParams
 class WorkItem
 {
 public:
-    WorkItem(std::shared_ptr<InferenceRequest> ir, uint64_t requestId)
-        : mInferenceRequest(ir)
+    WorkItem(std::shared_ptr<InferenceRequest> inferenceRequest, uint64_t requestId)
+        : mInferenceRequest(std::move(inferenceRequest))
         , mRequestId(requestId)
     {
     }
 
-    ~WorkItem() {}
-
-    uint64_t requestId() const
+    [[nodiscard]] uint64_t requestId() const
     {
         return mRequestId;
     }
 
-    std::shared_ptr<InferenceRequest> getInferenceRequest() const
+    [[nodiscard]] std::shared_ptr<InferenceRequest> getInferenceRequest() const
     {
         return mInferenceRequest;
     }
@@ -93,7 +92,7 @@ class WorkItemsQueue
 public:
     void clear()
     {
-        std::lock_guard<std::mutex> lk(mMutex);
+        std::lock_guard<std::mutex> lock(mMutex);
         mPendingWorkItems.clear();
         mPendingWorkItemsReqIds.clear();
         mInProgressWorkItems.clear();
@@ -289,7 +288,7 @@ public:
 
             if (outputFile.is_open())
             {
-                for (const auto& header : headers)
+                for (auto const& header : headers)
                 {
                     outputFile << header << ",";
                 }
@@ -340,13 +339,12 @@ public:
         mExecutor = std::make_shared<texec::Executor>(trtEnginePath, texec::ModelType::kDECODER_ONLY, executorConfig);
     }
 
-    ~ExecutorServer() {}
-
     void enqueue(std::vector<texec::Request> requests, bool warmup = false)
     {
         try
         {
-            std::vector<SizeType> inputLengths, maxNewTokens;
+            std::vector<SizeType> inputLengths;
+            std::vector<SizeType> maxNewTokens;
             for (auto const& request : requests)
             {
                 inputLengths.push_back(request.getInputTokenIds().size());
@@ -363,11 +361,10 @@ public:
                 mActiveCount++;
             }
         }
-        catch (const std::exception& e)
+        catch (std::exception const& e)
         {
             TLLM_THROW("%s", e.what());
         }
-        return;
     }
 
     void waitForResponses(std::optional<SizeType> numRequests, bool warmup = false)
@@ -415,17 +412,16 @@ private:
 class GptServer
 {
 public:
-    GptServer(std::filesystem::path const& trtEnginePath, TrtGptModelType modelType, int32_t maxBeamWidth,
+    GptServer(std::filesystem::path const& trtEnginePath, TrtGptModelType modelType, SizeType maxBeamWidth,
         batch_scheduler::SchedulerPolicy schedulerPolicy, TrtGptModelOptionalParams const& optionalParams,
         std::shared_ptr<Recorder> recorder, std::optional<uint64_t> terminateReqId, std::chrono::milliseconds waitSleep,
-        std::optional<uint64_t> const staticEmulatedBatchSize, int const staticEmulatedTimeoutMs, bool logIterationData)
+        std::optional<SizeType> const staticEmulatedBatchSize,
+        std::optional<std::chrono::milliseconds> const batchTimeout, bool logIterationData)
         : mRecorder(std::move(recorder))
         , mTerminateReqId(terminateReqId)
         , mWaitSleep(waitSleep)
         , mStaticEmulatedBatchSize(staticEmulatedBatchSize)
-        , mEmulatedBatchEndTimestamp(
-              std::chrono::steady_clock::now() + std::chrono::milliseconds(staticEmulatedTimeoutMs))
-        , mStaticEmulatedTimeoutMs(staticEmulatedTimeoutMs)
+        , mBatchTimeout(batchTimeout.value_or(std::chrono::milliseconds{0}))
         , mActiveCount(0)
     {
         ReturnBatchManagerStatsCallback iterationDataCallback = [this, logIterationData](std::string const& log)
@@ -473,14 +469,19 @@ public:
             mRecorder->recordStart(request, requestId);
             mWorkItemsQueue.push(request, requestId);
         }
-        catch (const tc::TllmException& e)
+        catch (tc::TllmException const& e)
         {
             throw;
         }
-        catch (const std::exception& e)
+        catch (std::exception const& e)
         {
             TLLM_THROW("%s", e.what());
         }
+    }
+
+    void resetBatchDeadline()
+    {
+        mBatchDeadline = (std::chrono::steady_clock::now() + mBatchTimeout).time_since_epoch();
     }
 
     void waitForEmpty() const
@@ -502,9 +503,9 @@ public:
     }
 
     // Return up to max_num_requests inference requests.
-    std::list<std::shared_ptr<InferenceRequest>> getInferenceRequests(const int max_num_requests)
+    std::list<std::shared_ptr<InferenceRequest>> getInferenceRequests(int const max_num_requests)
     {
-        std::list<std::shared_ptr<InferenceRequest>> rval;
+        std::list<std::shared_ptr<InferenceRequest>> inferenceRequests;
         auto& comm = COMM_SESSION;
         if (max_num_requests > 0)
         {
@@ -515,12 +516,12 @@ public:
                 auto const numNewWorkItems = std::min(static_cast<int64_t>(mWorkItemsQueue.numPendingWorkItems()),
                     static_cast<int64_t>(max_num_requests));
 
-                bool readyForNextBatch = numNewWorkItems > 0;
+                bool const timeout = std::chrono::steady_clock::now().time_since_epoch() > mBatchDeadline.load();
+                bool readyForNextBatch = numNewWorkItems > 0 && timeout;
                 if (mStaticEmulatedBatchSize)
                 {
                     if (numNewWorkItems > 0)
                     {
-                        bool const timeout = std::chrono::steady_clock::now() > mEmulatedBatchEndTimestamp;
                         bool const previousBatchFinished = mActiveCount == 0;
                         bool const haveEnoughForNextBatch = numNewWorkItems >= mStaticEmulatedBatchSize.value();
                         readyForNextBatch = previousBatchFinished && (timeout || haveEnoughForNextBatch);
@@ -529,26 +530,23 @@ public:
                     {
                         // Timeout should only begin once we have at least 1 pending request.
                         // Reset timeout when no requests are pending or we submit a new batch.
-                        mEmulatedBatchEndTimestamp
-                            = std::chrono::steady_clock::now() + std::chrono::milliseconds(mStaticEmulatedTimeoutMs);
+                        resetBatchDeadline();
                     }
                 }
 
                 if (readyForNextBatch)
                 {
-                    int count = 0;
                     // Only add a single batch at a time when emulating static batching
                     auto const numItemsToAdd = std::min(
                         numNewWorkItems, static_cast<int64_t>(mStaticEmulatedBatchSize.value_or(numNewWorkItems)));
                     mActiveCount += numItemsToAdd;
-                    while (count < numItemsToAdd)
+                    while (inferenceRequests.size() < numItemsToAdd)
                     {
                         auto [workItem, markedInProgress] = mWorkItemsQueue.pop();
 
                         if (markedInProgress)
                         {
-                            rval.emplace_back(workItem->getInferenceRequest());
-                            count++;
+                            inferenceRequests.emplace_back(workItem->getInferenceRequest());
                         }
                         else
                         {
@@ -561,14 +559,14 @@ public:
                 }
                 if (world_size > 1)
                 {
-                    auto numNewWorkItems = static_cast<int64_t>(rval.size());
+                    auto numNewWorkItems = static_cast<int64_t>(inferenceRequests.size());
                     comm.bcast(&numNewWorkItems, 1, mpi::MpiType::kINT64, 0);
                     if (numNewWorkItems > 0)
                     {
                         std::vector<int64_t> packed;
-                        for (auto const& ir : rval)
+                        for (auto const& infReq : inferenceRequests)
                         {
-                            auto vpacked = ir->serialize();
+                            auto vpacked = infReq->serialize();
                             packed.push_back(static_cast<int64_t>(vpacked.size()));
                             packed.insert(
                                 packed.end(), std::move_iterator(vpacked.begin()), std::move_iterator(vpacked.end()));
@@ -590,18 +588,18 @@ public:
                     for (int64_t count = 0; count < numNewWorkItems; ++count)
                     {
                         int64_t n = *(packed_ptr++);
-                        auto ir = InferenceRequest::deserialize(packed_ptr);
+                        auto infReq = InferenceRequest::deserialize(packed_ptr);
                         packed_ptr += n;
-                        rval.emplace_back(ir);
+                        inferenceRequests.emplace_back(infReq);
                     }
                 }
             }
         }
-        return rval;
+        return inferenceRequests;
     }
 
     void sendResponse(uint64_t requestId, [[maybe_unused]] std::list<NamedTensor> const& response_tensors,
-        bool final_response, [[maybe_unused]] const std::string& errMsg)
+        bool final_response, [[maybe_unused]] std::string const& errMsg)
     {
         // `response_tensors` contains `outputIds, sequenceLength, [contextLogits, generationLogits], logProbs,
         // cumLogProbs`. `contextLogits, generationLogits` are optional, only contained when `gather_context_logits` and
@@ -616,7 +614,7 @@ public:
                 mActiveCount--;
             }
         }
-        catch (const std::exception& e)
+        catch (std::exception const& e)
         {
             TLLM_LOG_ERROR("Failed to send response for requestId %lu\n%s", requestId, e.what());
         }
@@ -628,9 +626,9 @@ private:
     WorkItemsQueue mWorkItemsQueue;
     std::optional<uint64_t> mTerminateReqId;
     std::chrono::milliseconds mWaitSleep;
-    std::optional<int> mStaticEmulatedBatchSize;
-    std::chrono::time_point<std::chrono::steady_clock> mEmulatedBatchEndTimestamp;
-    int32_t mStaticEmulatedTimeoutMs;
+    std::optional<SizeType> mStaticEmulatedBatchSize;
+    std::chrono::milliseconds mBatchTimeout;
+    std::atomic<std::chrono::steady_clock::time_point::duration> mBatchDeadline;
     std::atomic<uint64_t> mActiveCount;
 
 }; // class GptServer
@@ -674,10 +672,9 @@ std::shared_ptr<InferenceRequest> makeRequest(std::uint64_t reqId, Sample const&
     auto request = std::make_shared<InferenceRequest>(reqId);
     auto const& inputIds = sample.inputIds;
     request->setInputIds(bufferManager.copyFrom(
-        inputIds, ITensor::makeShape({static_cast<SizeType>(inputIds.size())}), MemoryType::kPINNED));
+        inputIds, ITensor::makeShape({static_cast<SizeType>(inputIds.size())}), MemoryType::kCPU));
     auto const requestOutputLen = sample.outputLen;
-    request->setMaxNewTokens(
-        bufferManager.copyFrom(&requestOutputLen, ITensor::makeShape({1, 1}), MemoryType::kPINNED));
+    request->setMaxNewTokens(bufferManager.copyFrom(&requestOutputLen, ITensor::makeShape({1, 1}), MemoryType::kCPU));
     request->setBeamWidth(beamWidthTensor);
     if (eosId != nullptr)
     {
@@ -704,14 +701,15 @@ texec::Request makeExecutorRequest(Sample const& sample, SizeType const& beamWid
 {
     auto samplingConfig = texec::SamplingConfig{beamWidth};
     auto outputConfig = texec::OutputConfig{false, returnContextLogits, returnGenerationLogits, false};
-    return texec::Request(sample.inputIds, sample.outputLen, streaming, samplingConfig, outputConfig, eosId, padId);
+    return {sample.inputIds, sample.outputLen, streaming, samplingConfig, outputConfig, eosId, padId};
 }
 
 void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType modelType,
     std::string const& datasetPath, std::string const& opCsvFile, int maxNumSamples, int beamWidth, int warmUp,
-    std::optional<int32_t> const& eosId, std::optional<int32_t> const& padId, BenchmarkParams const& benchmarkParams,
-    batch_scheduler::SchedulerPolicy schedulerPolicy, std::chrono::milliseconds waitSleep, bool returnContextLogits,
-    bool returnGenerationLogits, std::optional<int> const staticEmulatedBatchSize, int const staticEmulatedTimeoutMs,
+    std::optional<TokenIdType> const& eosId, std::optional<TokenIdType> const& padId,
+    BenchmarkParams const& benchmarkParams, batch_scheduler::SchedulerPolicy schedulerPolicy,
+    std::chrono::milliseconds waitSleep, bool returnContextLogits, bool returnGenerationLogits,
+    std::optional<SizeType> const staticEmulatedBatchSize, std::optional<std::chrono::milliseconds> const batchTimeout,
     bool logIterationData)
 {
     auto const worldConfig = WorldConfig::mpi();
@@ -736,14 +734,14 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
         bufferManager.copyFrom(&beamWidth, ITensor::makeShape({1}), MemoryType::kPINNED)};
 
     // Load dataset
-    const auto samples = parseWorkloadJson(datasetPath, maxNumSamples);
-    const auto numSamples = samples.size();
+    auto const samples = parseWorkloadJson(datasetPath, maxNumSamples);
+    auto const numSamples = samples.size();
 
-    const int maxBeamWidth = beamWidth;
+    int const maxBeamWidth = beamWidth;
     auto recorder = std::make_shared<Recorder>(opCsvFile);
     uint64_t terminateReqId = numSamples + 1;
     auto gptServer = std::make_shared<GptServer>(engineDir, modelType, maxBeamWidth, schedulerPolicy, optionalParams,
-        recorder, terminateReqId, waitSleep, staticEmulatedBatchSize, staticEmulatedTimeoutMs, logIterationData);
+        recorder, terminateReqId, waitSleep, staticEmulatedBatchSize, batchTimeout, logIterationData);
 
     ITensor::SharedPtr eosIdTensor{
         eosId ? bufferManager.copyFrom(&eosId.value(), ITensor::makeShape({1}), MemoryType::kPINNED) : nullptr};
@@ -761,6 +759,7 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
     if (worldConfig.getRank() == 0)
     {
         // Warm up
+        gptServer->resetBatchDeadline();
         SizeType reqId = 0;
         for (auto i = 0; i < warmUp; ++i)
         {
@@ -774,6 +773,7 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
 
         // Benchmark
         recorder->initialize();
+        gptServer->resetBatchDeadline();
         for (std::size_t i = 0; i < numSamples; ++i)
         {
             auto request = makeRequest(i + 1, samples[i], beamWidthTensor, eosIdTensor, padIdTensor, bufferManager,
@@ -806,23 +806,19 @@ void benchmarkExecutor(std::filesystem::path const& engineDir, TrtGptModelType m
     batch_scheduler::SchedulerPolicy schedulerPolicy, std::chrono::milliseconds waitSleep, bool returnContextLogits,
     bool returnGenerationLogits, std::optional<int> const staticEmulatedBatchSize, bool logIterationData)
 {
-    // Check that mpi size is 1 for now
-    auto const worldConfig = WorldConfig::mpi();
-    if (worldConfig.getSize() > 1)
-    {
-        TLLM_THROW("benchmarkExecutor does not yet support mpiSize > 1");
-    }
+    auto const& world = tensorrt_llm::mpi::MpiComm::world();
+    auto worldRank = world.getRank();
 
     // Load dataset
-    const auto samples = parseWorkloadJson(datasetPath, maxNumSamples);
-    const auto numSamples = samples.size();
+    auto const samples = parseWorkloadJson(datasetPath, maxNumSamples);
+    auto const numSamples = samples.size();
 
     auto recorder = std::make_shared<Recorder>(opCsvFile);
 
     auto executorServer = std::make_shared<ExecutorServer>(engineDir, modelType, beamWidth, schedulerPolicy,
         benchmarkParams, recorder, waitSleep, staticEmulatedBatchSize, logIterationData);
 
-    if (worldConfig.getRank() == 0)
+    if (worldRank == 0)
     {
         // Warm up
         {
@@ -849,7 +845,7 @@ void benchmarkExecutor(std::filesystem::path const& engineDir, TrtGptModelType m
                 delays.push_back(static_cast<int>(samples[i].delay * 1000));
             }
 
-            bool hasDelay = std::any_of(delays.begin(), delays.end(), [](const auto& delay) { return delay > 0; });
+            bool hasDelay = std::any_of(delays.begin(), delays.end(), [](auto const& delay) { return delay > 0; });
             if (hasDelay && staticEmulatedBatchSize)
             {
                 TLLM_THROW("Executor benchmark doesn't support delays with emulated static batch sizes");
@@ -910,9 +906,6 @@ int main(int argc, char* argv[])
     cxxopts::Options options(
         "TensorRT-LLM BatchManager Benchmark", "TensorRT-LLM BatchManager Benchmark for GPT and GPT-like models.");
     options.add_options()("h,help", "Print usage");
-    // TODO(rkobus): remove because unused
-    options.add_options()(
-        "m,model", "Model name specified for engines.", cxxopts::value<std::string>()->default_value("gpt_350m"));
     options.add_options()("engine_dir", "Directory that store the engines.", cxxopts::value<std::string>());
     options.add_options()(
         "api", "API type: gptManager or executor.", cxxopts::value<std::string>()->default_value("gptManager"));
@@ -929,8 +922,8 @@ int main(int argc, char* argv[])
     options.add_options()(
         "warm_up", "Specify warm up iterations before benchmark starts.", cxxopts::value<int>()->default_value("2"));
     options.add_options()(
-        "eos_id", "Specify the end-of-sequence token id.", cxxopts::value<int>()->default_value("-1"));
-    options.add_options()("pad_id", "Specify the padding token id.", cxxopts::value<int>());
+        "eos_id", "Specify the end-of-sequence token id.", cxxopts::value<TokenIdType>()->default_value("-1"));
+    options.add_options()("pad_id", "Specify the padding token id.", cxxopts::value<TokenIdType>());
     options.add_options()("max_tokens_in_paged_kvcache", "Max tokens in paged K-V Cache.", cxxopts::value<int>());
     options.add_options()(
         "kv_cache_free_gpu_mem_fraction", "K-V Cache Free Gpu Mem Fraction.", cxxopts::value<float>());
@@ -949,11 +942,15 @@ int main(int argc, char* argv[])
     options.add_options()("scheduler_policy", "Choose scheduler policy between max_utilization/guaranteed_no_evict.",
         cxxopts::value<std::string>()->default_value("guaranteed_no_evict"));
 
+    options.add_options()("first_batch_delay",
+        "Delay before submitting the first batch of requests. This can be used to increase the size of the first "
+        "batch.",
+        cxxopts::value<int32_t>());
     options.add_options()("static_emulated_batch_size",
-        "Emulate static batching performance with the provided batch size.", cxxopts::value<int>());
+        "Emulate static batching performance with the provided batch size.", cxxopts::value<SizeType>());
     options.add_options()("static_emulated_timeout",
         "Timeout (ms) before launching a partial batch in emulated static batching mode",
-        cxxopts::value<int>()->default_value("500"));
+        cxxopts::value<int32_t>()->default_value("500"));
     options.add_options()("log_level", "Choose log level between verbose/info/warning/error/internal_error.",
         cxxopts::value<std::string>()->default_value("error"));
     options.add_options()("log_iteration_data", "On each decoder iteration, print batch state metadata.",
@@ -1042,23 +1039,31 @@ int main(int argc, char* argv[])
     // Argument: Enable return context logits
     bool returnGenerationLogits = result["return_generation_logits"].as<bool>();
 
-    std::optional<int32_t> padId;
+    std::optional<TokenIdType> padId;
     // Argument: Padding token id
     if (result.count("pad_id"))
     {
-        padId = result["pad_id"].as<int>();
+        padId = result["pad_id"].as<TokenIdType>();
     }
 
     // Argument: End-of-sentence token id
-    std::optional<int32_t> eosId = result["eos_id"].as<int>();
+    std::optional<TokenIdType> eosId = result["eos_id"].as<TokenIdType>();
 
-    std::optional<int> staticEmulatedBatchSize;
+    std::optional<std::chrono::milliseconds> batchTimeout;
+    // Argument: first_batch_delay
+    if (result.count("first_batch_delay"))
+    {
+        batchTimeout = std::chrono::milliseconds{result["first_batch_delay"].as<int32_t>()};
+    }
+
+    std::optional<SizeType> staticEmulatedBatchSize;
     // Argument: Static emulated batch size
     if (result.count("static_emulated_batch_size"))
     {
-        staticEmulatedBatchSize = result["static_emulated_batch_size"].as<int>();
+        staticEmulatedBatchSize = result["static_emulated_batch_size"].as<SizeType>();
+
+        batchTimeout = std::chrono::milliseconds{result["static_emulated_timeout"].as<int32_t>()};
     }
-    auto const staticEmulatedTimeout = result["static_emulated_timeout"].as<int>();
 
     // Argument: Scheduler policy
     batch_scheduler::SchedulerPolicy schedulerPolicy;
@@ -1114,10 +1119,10 @@ int main(int argc, char* argv[])
         {
             benchmarkGptManager(result["engine_dir"].as<std::string>(), modelType, datasetPath, opCsvFile,
                 maxNumSamples, beamWidth, result["warm_up"].as<int>(), eosId, padId, benchmarkParams, schedulerPolicy,
-                waitSleep, returnContextLogits, returnGenerationLogits, staticEmulatedBatchSize, staticEmulatedTimeout,
+                waitSleep, returnContextLogits, returnGenerationLogits, staticEmulatedBatchSize, batchTimeout,
                 logIterationData);
         }
-        catch (const std::exception& e)
+        catch (std::exception const& e)
         {
             TLLM_LOG_ERROR(e.what());
             return 1;
@@ -1131,7 +1136,7 @@ int main(int argc, char* argv[])
                 beamWidth, result["warm_up"].as<int>(), eosId, padId, benchmarkParams, schedulerPolicy, waitSleep,
                 returnContextLogits, returnGenerationLogits, staticEmulatedBatchSize, logIterationData);
         }
-        catch (const std::exception& e)
+        catch (std::exception const& e)
         {
             TLLM_LOG_ERROR(e.what());
             return 1;

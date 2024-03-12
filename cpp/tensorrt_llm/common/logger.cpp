@@ -65,5 +65,4 @@ Logger* Logger::getLogger()
     thread_local Logger instance;
     return &instance;
 }
-
 } // namespace tensorrt_llm::common

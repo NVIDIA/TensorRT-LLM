@@ -29,7 +29,7 @@ from tensorrt_llm import Tensor
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import getSMVersion
+from utils.util import skip_fp32_accum_pre_ampere, unittest_name_func
 
 
 class TestFunctional(unittest.TestCase):
@@ -46,21 +46,10 @@ class TestFunctional(unittest.TestCase):
             ], ['float16']))
         return test_cases
 
-    def custom_name_func(testcase_func, param_num, param):
-        return "%s_%s" % (
-            testcase_func.__name__,
-            parameterized.to_safe_name("_".join(str(x) for x in param.args)),
-        )
-
-    @parameterized.expand(load_test_cases, name_func=custom_name_func)
+    @parameterized.expand(load_test_cases, name_func=unittest_name_func)
     def test_bert_attention(self, batch_size, in_len, num_heads, head_size,
                             context_fmha_type, dtype):
-
-        if getSMVersion() < 80:
-            if context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
-                self.skipTest(
-                    "ContextFMHAType with fp32 acc is not supported in pre-ampere architecture"
-                )
+        skip_fp32_accum_pre_ampere(context_fmha_type)
 
         def _construct_execution(input_tensor, weight, bias, input_lengths,
                                  num_heads, hidden_size, output, dtype,

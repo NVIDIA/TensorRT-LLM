@@ -36,7 +36,7 @@ public:
     IpcMemory(WorldConfig const& worldConfig, std::size_t bufferSize);
     ~IpcMemory();
 
-    [[nodiscard]] const std::vector<void*>& getCommPtrsTensor() const
+    [[nodiscard]] std::vector<void*> const& getCommPtrsTensor() const
     {
         return mCommPtrs;
     }

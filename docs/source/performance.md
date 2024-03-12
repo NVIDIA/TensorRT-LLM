@@ -391,7 +391,7 @@ do
 	in_out_dims=$(echo $in_out | awk -F':' '{ print $2 }')
 	echo "BS: $batch_size, ISL/OSL: $in_out_dims"
 
-	./cpp/build/benchmarks/gptSessionBenchmark --model gptj --engine_dir /tmp/engines/gptj/ --warm_up 1 --batch_size $batch_size --duration 0 --num_runs 5 --input_output_len $in_out_dims
+	./cpp/build/benchmarks/gptSessionBenchmark --engine_dir /tmp/engines/gptj/ --warm_up 1 --batch_size $batch_size --duration 0 --num_runs 5 --input_output_len $in_out_dims
 done
 ```
 
@@ -405,7 +405,7 @@ do
 	in_out_dims=$(echo $in_out | awk -F':' '{ print $2 }')
 	echo "BS: $batch_size, ISL/OSL: $in_out_dims"
 
-	./cpp/build/benchmarks/gptSessionBenchmark --model gptj --engine_dir /tmp/engines/gptj/ --warm_up 1 --batch_size $batch_size --duration 0 --num_runs 5 --input_output_len $in_out_dims
+	./cpp/build/benchmarks/gptSessionBenchmark --engine_dir /tmp/engines/gptj/ --warm_up 1 --batch_size $batch_size --duration 0 --num_runs 5 --input_output_len $in_out_dims
 done
 ```
 
@@ -461,7 +461,7 @@ do
 	in_out_dims=$(echo $in_out | awk -F':' '{ print $2 }')
 	echo "BS: $batch_size, ISL/OSL: $in_out_dims"
 
-	./cpp/build/benchmarks/gptSessionBenchmark --model llama --engine_dir /tmp/engines/llama/7b --warm_up 1 --batch_size $batch_size --duration 0 --num_runs 5 --input_output_len $in_out_dims
+	./cpp/build/benchmarks/gptSessionBenchmark --engine_dir /tmp/engines/llama/7b --warm_up 1 --batch_size $batch_size --duration 0 --num_runs 5 --input_output_len $in_out_dims
 done
 ```
 #### First Token Latency Benchmark
@@ -474,7 +474,7 @@ do
 	in_out_dims=$(echo $in_out | awk -F':' '{ print $2 }')
 	echo "BS: $batch_size, ISL/OSL: $in_out_dims"
 
-	./cpp/build/benchmarks/gptSessionBenchmark --model llama --engine_dir /tmp/engines/llama/7b --warm_up 1 --batch_size $batch_size --duration 0 --num_runs 5 --input_output_len $in_out_dims
+	./cpp/build/benchmarks/gptSessionBenchmark --engine_dir /tmp/engines/llama/7b --warm_up 1 --batch_size $batch_size --duration 0 --num_runs 5 --input_output_len $in_out_dims
 done
 ```
 
@@ -536,7 +536,7 @@ do
 	in_out_dims=$(echo $in_out | awk -F':' '{ print $2 }')
 	echo "BS: $batch_size, ISL/OSL: $in_out_dims"
 
-	mpirun -n 4 --allow-run-as-root --oversubscribe ./cpp/build/benchmarks/gptSessionBenchmark --model llama --engine_dir /tmp/engines/llama/70b --warm_up 1 --batch_size $batch_size --duration 0 --num_runs 5 --input_output_len $in_out_dims
+	mpirun -n 4 --allow-run-as-root --oversubscribe ./cpp/build/benchmarks/gptSessionBenchmark --engine_dir /tmp/engines/llama/70b --warm_up 1 --batch_size $batch_size --duration 0 --num_runs 5 --input_output_len $in_out_dims
 done
 ```
 
@@ -551,7 +551,7 @@ do
 	in_out_dims=$(echo $in_out | awk -F':' '{ print $2 }')
 	echo "BS: $batch_size, ISL/OSL: $in_out_dims"
 
-	mpirun -n 4 --allow-run-as-root --oversubscribe ./cpp/build/benchmarks/gptSessionBenchmark --model llama --engine_dir /tmp/engines/llama/70b --warm_up 1 --batch_size $batch_size --duration 0 --num_runs 5 --input_output_len $in_out_dims
+	mpirun -n 4 --allow-run-as-root --oversubscribe ./cpp/build/benchmarks/gptSessionBenchmark --engine_dir /tmp/engines/llama/70b --warm_up 1 --batch_size $batch_size --duration 0 --num_runs 5 --input_output_len $in_out_dims
 done
 ```
 
@@ -624,9 +624,9 @@ do
 		--strongly_typed
 
 	# Throughput benchmark
-	mpirun -n 8 --allow-run-as-root --oversubscribe ./cpp/build/benchmarks/gptSessionBenchmark --model falcon --engine_dir $engine_path --warm_up 1 --batch_size $batch_size --duration 0 --num_runs 5 --input_output_len "${isl},${osl}"
+	mpirun -n 8 --allow-run-as-root --oversubscribe ./cpp/build/benchmarks/gptSessionBenchmark --engine_dir $engine_path --warm_up 1 --batch_size $batch_size --duration 0 --num_runs 5 --input_output_len "${isl},${osl}"
 	# Time to first token benchmark
-	mpirun -n 8 --allow-run-as-root --oversubscribe ./cpp/build/benchmarks/gptSessionBenchmark --model falcon --engine_dir $engine_path --warm_up 1 --batch_size $batch_size --duration 0 --num_runs 5 --input_output_len "${isl},1"
+	mpirun -n 8 --allow-run-as-root --oversubscribe ./cpp/build/benchmarks/gptSessionBenchmark --engine_dir $engine_path --warm_up 1 --batch_size $batch_size --duration 0 --num_runs 5 --input_output_len "${isl},1"
 
 	# The Falcon-180b engine is quite large, remove after the benchmark to free up space
 	# Remove this line if you'd like to save the engines.

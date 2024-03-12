@@ -260,10 +260,10 @@ template <typename T>
 SizeType DynamicDecodeLayerTest<T>::getMaxWordsLen(std::vector<std::vector<std::vector<SizeType>>> const& inputWords)
 {
     SizeType maxWordsLen = 0;
-    for (const auto& batchWords : inputWords)
+    for (auto const& batchWords : inputWords)
     {
         SizeType wordsLen = 0;
-        for (const auto& words : batchWords)
+        for (auto const& words : batchWords)
         {
             wordsLen += words.size();
         }
@@ -379,7 +379,7 @@ typename DynamicDecodeLayer<T>::OutputParams DynamicDecodeLayerTest<T>::createOu
 template <typename T>
 void DynamicDecodeLayerTest<T>::batchCopy(int32_t step)
 {
-    const auto logitsHost = ITensor::wrap(mTestLogitsInit.data() + step * mVocabSizePadded,
+    auto const logitsHost = ITensor::wrap(mTestLogitsInit.data() + step * mVocabSizePadded,
         std::is_same_v<T, float> ? nvinfer1::DataType::kFLOAT : nvinfer1::DataType::kHALF,
         ITensor::makeShape({1, mVocabSizePadded}));
     for (int32_t bi = 0; bi < mBatchSize; ++bi)
@@ -408,7 +408,7 @@ bool DynamicDecodeLayerTest<T>::checkResult(int32_t* outputIds, std::vector<std:
         }
         std::set<int32_t> expts = expectedIds.at(i + step * stride);
         auto bid = batchSlot;
-        const auto outputId = outputIds[bid * leadingDim + s];
+        auto const outputId = outputIds[bid * leadingDim + s];
         if (expts.count(outputId) == 0)
         {
             if (failures < 10)

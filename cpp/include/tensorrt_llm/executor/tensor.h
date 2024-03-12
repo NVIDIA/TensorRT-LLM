@@ -180,11 +180,11 @@ public:
 
     ~Tensor() = default;
 
-    Tensor(const Tensor& other) noexcept = default;
+    Tensor(Tensor const& other) noexcept = default;
 
     Tensor(Tensor&& other) noexcept = default;
 
-    Tensor& operator=(const Tensor& other) noexcept = default;
+    Tensor& operator=(Tensor const& other) noexcept = default;
 
     Tensor& operator=(Tensor&& other) noexcept = default;
 
@@ -267,6 +267,7 @@ private:
 
     friend std::shared_ptr<runtime::ITensor> const& detail::toITensor(Tensor const& tensor);
     friend Tensor detail::ofITensor(std::shared_ptr<runtime::ITensor> tensor);
+    friend class Serialization;
 };
 
 } // namespace tensorrt_llm::executor

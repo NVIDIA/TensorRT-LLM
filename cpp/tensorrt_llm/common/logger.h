@@ -54,26 +54,26 @@ public:
 
 #if defined(_MSC_VER)
     template <typename... Args>
-    void log(Level level, char const* format, const Args&... args);
+    void log(Level level, char const* format, Args const&... args);
 
     template <typename... Args>
-    void log(Level level, int rank, char const* format, const Args&... args);
+    void log(Level level, int rank, char const* format, Args const&... args);
 #else
     template <typename... Args>
-    void log(Level level, char const* format, const Args&... args) __attribute__((format(printf, 3, 0)));
+    void log(Level level, char const* format, Args const&... args) __attribute__((format(printf, 3, 0)));
 
     template <typename... Args>
-    void log(Level level, int rank, char const* format, const Args&... args) __attribute__((format(printf, 4, 0)));
+    void log(Level level, int rank, char const* format, Args const&... args) __attribute__((format(printf, 4, 0)));
 #endif
 
     template <typename... Args>
-    void log(Level level, std::string const& format, const Args&... args)
+    void log(Level level, std::string const& format, Args const&... args)
     {
         return log(level, format.c_str(), args...);
     }
 
     template <typename... Args>
-    void log(const Level level, const int rank, const std::string& format, const Args&... args)
+    void log(const Level level, int const rank, std::string const& format, Args const&... args)
     {
         return log(level, rank, format.c_str(), args...);
     }
@@ -122,7 +122,7 @@ private:
         return fmtstr("%s[%s] ", kPREFIX, getLevelName(level));
     }
 
-    static inline std::string getPrefix(const Level level, const int rank)
+    static inline std::string getPrefix(const Level level, int const rank)
     {
         return fmtstr("%s[%s][%d] ", kPREFIX, getLevelName(level), rank);
     }
@@ -148,7 +148,7 @@ void Logger::log(Logger::Level level, char const* format, Args const&... args)
 }
 
 template <typename... Args>
-void Logger::log(const Logger::Level level, const int rank, char const* format, const Args&... args)
+void Logger::log(const Logger::Level level, int const rank, char const* format, Args const&... args)
 {
     if (level_ <= level)
     {

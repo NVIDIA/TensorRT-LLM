@@ -2,11 +2,14 @@
 
 set -ex
 
-TRT_VER="9.2.0.5"
+# Use https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-01.html#rel-24-01
+TRT_VER="9.3.0.1"
 CUDA_VER="12.3"
-CUDNN_VER="8.9.4.25-1+cuda12.2"
+CUDNN_VER="8.9.7.29-1+cuda12.2"
+# v2.19.4 doesn't exist in https://developer.download.nvidia.cn/compute/cuda/repos/
 NCCL_VER="2.19.3-1+cuda12.3"
 CUBLAS_VER="12.3.4.1-1"
+NVRTC_VER="12.3.107-1"
 
 for i in "$@"; do
     case $i in
@@ -44,10 +47,16 @@ install_ubuntu_requirements() {
     if [[ $(apt list --installed | grep libcublas) ]]; then
       apt-get remove --purge -y --allow-change-held-packages libcublas*
     fi
+    if [[ $(apt list --installed | grep cuda-nvrtc-dev) ]]; then
+      apt-get remove --purge -y --allow-change-held-packages cuda-nvrtc-dev*
+    fi
     CUBLAS_CUDA_VERSION=$(echo $CUDA_VER | sed 's/\./-/g')
     apt-get install -y --no-install-recommends libcudnn8=${CUDNN_VER} libcudnn8-dev=${CUDNN_VER}
     apt-get install -y --no-install-recommends libnccl2=${NCCL_VER} libnccl-dev=${NCCL_VER}
     apt-get install -y --no-install-recommends libcublas-${CUBLAS_CUDA_VERSION}=${CUBLAS_VER} libcublas-dev-${CUBLAS_CUDA_VERSION}=${CUBLAS_VER}
+    # NVRTC static library doesn't exist in NGC PyTorch container.
+    NVRTC_CUDA_VERSION=$(echo $CUDA_VER | sed 's/\./-/g')
+    apt-get install -y --no-install-recommends cuda-nvrtc-dev-${NVRTC_CUDA_VERSION}=${NVRTC_VER}
     apt-get clean
     rm -rf /var/lib/apt/lists/*
 }
@@ -75,7 +84,7 @@ install_tensorrt() {
         if [ "$ARCH" = "amd64" ];then ARCH="x86_64";fi
         if [ "$ARCH" = "x86_64" ];then DIR_NAME="x64-agnostic"; else DIR_NAME=${ARCH};fi
         if [ "$ARCH" = "aarch64" ];then OS1="Ubuntu22_04" && OS2="Ubuntu-22.04" && OS="ubuntu-22.04"; else OS1="Linux" && OS2="Linux" && OS="linux";fi
-        RELEASE_URL_TRT=https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/9.2.0/tensorrt-${TRT_VER}.${OS}.${ARCH}-gnu.cuda-${TRT_CUDA_VERSION}.tar.gz;
+        RELEASE_URL_TRT=https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/9.3.0/tensorrt-${TRT_VER}.${OS}.${ARCH}-gnu.cuda-${TRT_CUDA_VERSION}.tar.gz;
     fi
     wget --no-verbose ${RELEASE_URL_TRT} -O /tmp/TensorRT.tar
     tar -xf /tmp/TensorRT.tar -C /usr/local/

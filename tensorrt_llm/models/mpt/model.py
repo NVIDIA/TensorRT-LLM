@@ -166,13 +166,17 @@ class MPTForCausalLM(DecoderModelForCausalLM):
         vocab_size_padded = pad_vocab_size(config.vocab_size,
                                            config.mapping.tp_size)
         if config.mapping.is_last_pp_rank():
+            share_weight = None
+            if config.share_embedding_table:
+                share_weight = transformer.vocab_embedding.weight
             lm_head = ColumnLinear(config.hidden_size,
                                    vocab_size_padded,
                                    bias=config.bias,
                                    dtype=config.dtype,
                                    tp_group=config.mapping.tp_group,
                                    tp_size=config.mapping.tp_size,
-                                   gather_output=True)
+                                   gather_output=True,
+                                   share_weight=share_weight)
         else:
             lm_head = None
         super().__init__(config, transformer, lm_head)

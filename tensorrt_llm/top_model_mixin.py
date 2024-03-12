@@ -13,17 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
-# isort: off
-import tensorrt as trt
-# isort: on
-
-from . import profiler
-from .builder import Builder
 from .mapping import Mapping
-from .network import net_guard
 from .plugin.plugin import PluginConfig
 from .quantization.mode import QuantMode
 
@@ -39,15 +31,6 @@ class TopModelMixin:
         super().__init__()
         self._trt_engine = None
         self._builder_config = None
-        self.config = None
-
-    @property
-    def config(self):
-        return self._config
-
-    @config.setter
-    def config(self, cfg: 'PretrainedConfig'):
-        self._config = cfg
 
     @classmethod
     def from_hugging_face(cls,
@@ -75,135 +58,6 @@ class TopModelMixin:
     @classmethod
     def from_checkpoint(cls, checkpoint_dir: str):
         raise NotImplementedError("Will implement in the future release")
-
-    def to_trt(self,
-               batch_size: int,
-               input_len: int,
-               output_len: int,
-               plugin_config: 'PluginConfig' = None,
-               **kwargs) -> Tuple[trt.IHostMemory, 'BuilderConfig']:
-        '''Build TRT engine from the Module using given size limits
-            Parameters:
-                batch_size: the max batch size can be used in the runtime by one generate call
-                input_len: the max input length of one input sequence
-                output_len: the max output length
-                plugin_config: PluginConfig
-                    When the plugin_config is None, to_trt() will call default_plugin_config() to build the engine.
-                other optional kwargs:
-                    Other optional fields can be accepted that affects the build behavior, set these if you need finer control:
-                    - max_beam_width: int, default 1,  the max beam search width
-                    - max_num_tokens: int, default batch_size * input_len, max number of tokens one engine forward pass can do,
-                    - timing_cache: str, default None, a file contains the previous timing cache
-                    - strongly_typed: bool, default False, a bool flag to indicate if or not use the strong type mode of TRT
-                    - builder_opt: int, default None, TRT builder opt level
-                    - gather_all_logits: bool, default False, whether or not to gather all the logits.
-                        When this is False, the engine does output all logits, and thus needs additional input Tensor to the engine
-                        for each request to gather the last generated token for that request
-
-        '''
-        profiler.start("Network construction and build engine")
-        assert self.config is not None, "Module.config not set"
-        # assert isinstance(self, Module), "to_trt use self.named_parameters()"
-
-        builder = Builder()
-        builder_config = builder.create_builder_config(
-            # model attribute section
-            name=self.config.architecture,
-            precision=self.config.dtype,
-            tensor_parallel=self.config.mapping.tp_size,
-            pipeline_parallel=self.config.mapping.pp_size,
-            num_layers=self.config.num_hidden_layers,
-            num_heads=self.config.num_attention_heads,
-            num_kv_heads=self.config.num_key_value_heads,
-            hidden_size=self.config.hidden_size,
-            vocab_size=self.config.vocab_size,
-            hidden_act=self.config.hidden_act,
-            max_position_embeddings=self.config.max_position_embeddings,
-            quant_mode=self.config.quant_mode,
-            # trt build config section
-            timing_cache=kwargs.get("timing_cache", None),
-            max_batch_size=batch_size,
-            max_input_len=input_len,
-            max_output_len=output_len,
-            max_beam_width=kwargs.get("max_beam_width", 1),
-            max_num_tokens=kwargs.get("max_num_tokens", batch_size * input_len),
-            int8=False,  # TODO: support int8, see examples/llama/build.py
-            # default to turn on strong type, which is different with the older lower level API
-            strongly_typed=kwargs.get("strongly_typed", True),
-            opt_level=kwargs.get("builder_opt", None),
-            max_prompt_embedding_table_size=getattr(
-                self, 'max_prompt_embedding_table_size', 0),
-            gather_context_logits=kwargs.get('gather_context_logits', False),
-            gather_generation_logits=kwargs.get('gather_generation_logits',
-                                                False),
-            lora_target_modules=None,  # TODO: support lora
-        )
-
-        network = builder.create_network()
-        # use default if user don't provide one
-        network.plugin_config = plugin_config if plugin_config is not None else self.default_plugin_config(
-            **kwargs)
-
-        if self.quant_mode.has_fp8_qdq():
-            network.plugin_config.set_gemm_plugin(False)
-
-        with net_guard(network):
-            # Prepare
-            network.set_named_parameters(self.named_parameters())
-
-            # Forward
-            inputs = self.prepare_inputs(
-                max_batch_size=batch_size,
-                max_input_len=input_len,
-                max_seq_len=input_len + output_len,
-                use_cache=True,
-                max_beam_width=kwargs.get('max_beam_width', 1),
-                max_num_tokens=kwargs.get("max_num_tokens",
-                                          batch_size * input_len),
-                prompt_embedding_table_size=getattr(
-                    self, 'max_prompt_embedding_table_size', 0),
-                gather_context_logits=kwargs.get('gather_context_logits',
-                                                 False),
-                gather_generation_logits=kwargs.get('gather_generation_logits',
-                                                    False),
-                lora_target_modules=None)  #TODO: support lora
-            self(**inputs)
-        engine = builder.build_engine(network, builder_config)
-        self._trt_engine = engine
-        self._builder_config = builder_config
-        profiler.stop("Network construction and build engine")
-        return engine, builder_config
-
-    def save(self, engine_dir):
-        ''' Save the engine and build config to given directory
-        '''
-
-        engine_dir = Path(engine_dir)
-        if not engine_dir.exists():
-            engine_dir.mkdir()
-        config_path = engine_dir / 'config.json'
-
-        def get_engine_name(model, dtype, tp_size, pp_size, rank):
-            if pp_size == 1:
-                return '{}_{}_tp{}_rank{}.engine'.format(
-                    model, dtype, tp_size, rank)
-            return '{}_{}_tp{}_pp{}_rank{}.engine'.format(
-                model, dtype, tp_size, pp_size, rank)
-
-        # TODO: implement multi gpus names
-        engine_path = engine_dir / get_engine_name(
-            self._builder_config.name, self.config.dtype,
-            self.config.mapping.tp_size, self.config.mapping.pp_size,
-            self.config.mapping.rank)
-        builder = Builder()
-        builder.save_config(self._builder_config, config_path)
-        with open(engine_path, 'wb') as f:
-            f.write(self._trt_engine)
-
-    def load_trt(self, engine: trt.IHostMemory, **kwargs):
-        '''Load trt engine for this model
-        '''
-        raise NotImplementedError
 
     def use_lora(self, lora_dir: str, lora_ckpt_source: str):
         '''Load lora weights and config from the give dir to the module. lora_format should be one of 'hf' or 'nemo'.
@@ -239,4 +93,4 @@ class TopModelMixin:
         '''Return the default plugin config for this model, when the plugin_config value is not given in to_trt() call.
            If users need to set different plugin configs, they can start from the return object and change it.
         '''
-        return PluginConfig()
+        return PluginConfig(**kwargs)

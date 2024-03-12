@@ -77,7 +77,7 @@ struct KVBlockArray
         , mSinkTokens(sinkTokenLen)
         , data(nullptr)
     {
-        const float tokensPerBlockSeqLog2 = log2(mTokensPerBlock);
+        float const tokensPerBlockSeqLog2 = log2(mTokensPerBlock);
         TLLM_CHECK_WITH_INFO(
             ceil(tokensPerBlockSeqLog2) == floor(tokensPerBlockSeqLog2), "tokensPerBlock must be power of 2");
         // NOTE: pointer offset arithmetic offset is performed on int32_t (see this.getRowPtr).
@@ -183,7 +183,7 @@ struct KVBlockArrayForContextFMHA
         , mTokensPerBlock(tokensPerBlock)
         , data(nullptr)
     {
-        const float tokensPerBlockSeqLog2 = log2(mTokensPerBlock);
+        float const tokensPerBlockSeqLog2 = log2(mTokensPerBlock);
         TLLM_CHECK_WITH_INFO(
             ceil(tokensPerBlockSeqLog2) == floor(tokensPerBlockSeqLog2), "tokensPerBlock must be power of 2");
         // NOTE: pointer offset arithmetic offset is performed on int32_t (see this.getRowPtr).

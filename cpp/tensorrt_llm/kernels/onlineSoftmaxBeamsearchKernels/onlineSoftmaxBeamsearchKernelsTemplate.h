@@ -37,7 +37,7 @@ namespace kernels
 {
 
 #define DO_SPLIT_SMALL_TOP_K_SOFTMAX
-static const int SMALL_TOP_K_SOFTMAX_THREADBLOCK_SIZE = 256;
+static int const SMALL_TOP_K_SOFTMAX_THREADBLOCK_SIZE = 256;
 
 #define TOPK_FP16_STORAGE 0
 
@@ -52,12 +52,13 @@ __device__ __forceinline__ T apply_length_penalty(T log_prob, int length, float 
     return log_prob / static_cast<T>(powf(length, length_penalty));
 }
 
+/*
+// Useless kernels, remove them?
 template <typename T, int MAX_K, int THREADBLOCK_SIZE>
-__launch_bounds__(THREADBLOCK_SIZE) __global__
-    void batch_topK_kernel(int* topk_tmp_id_buf, T* topk_tmp_val_buf, int* id_buf)
+__launch_bounds__(THREADBLOCK_SIZE) __global__ void batch_topK_kernel(int* topk_id, T* topk_val, int* id_buf)
 {
-    const int thread_id = threadIdx.x;
-    const int block_id = blockIdx.x;
+    int const thread_id = threadIdx.x;
+    int const block_id = blockIdx.x;
     TopK<T, MAX_K> partial;
 
     if (thread_id == 0)
@@ -71,7 +72,7 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
         int index = block_id * MAX_K * MAX_K;
         for (int i = 0; i < MAX_K * MAX_K; i++)
         {
-            partial.insert(topk_tmp_val_buf[index + i], topk_tmp_id_buf[index + i]);
+            partial.insert(topk_val[index + i], topk_id[index + i]);
         }
 
         index = block_id * MAX_K;
@@ -83,11 +84,11 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
 }
 
 template <typename T, int MAX_K, int THREADBLOCK_SIZE>
-__launch_bounds__(THREADBLOCK_SIZE) __global__ void batch_topK_kernel(const int* __restrict topk_tmp_id_buf,
-    const T* __restrict topk_tmp_val_buf, int* __restrict id_buf, T* __restrict val_buf)
+__launch_bounds__(THREADBLOCK_SIZE) __global__ void batch_topK_kernel(
+    int const* __restrict topk_id, T const* __restrict topk_val, int* __restrict id_buf, T* __restrict val_buf)
 {
-    const int thread_id = threadIdx.x;
-    const int block_id = blockIdx.x;
+    int const thread_id = threadIdx.x;
+    int const block_id = blockIdx.x;
     TopK<T, MAX_K> partial;
 
     if (thread_id == 0)
@@ -101,7 +102,7 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void batch_topK_kernel(const int*
         int index = block_id * MAX_K * MAX_K;
         for (int i = 0; i < MAX_K * MAX_K; i++)
         {
-            partial.insert(topk_tmp_val_buf[index + i], topk_tmp_id_buf[index + i]);
+            partial.insert(topk_val[index + i], topk_id[index + i]);
         }
 
         index = block_id * MAX_K;
@@ -112,24 +113,25 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void batch_topK_kernel(const int*
         }
     }
 }
-
+*/
 template <typename T, int MAX_K2, int THREADBLOCK_SIZE>
-__launch_bounds__(THREADBLOCK_SIZE) __global__ void batch_topk_kernel(const int* __restrict topk_tmp_id_buf,
-    const T* __restrict topk_tmp_val_buf, float* __restrict cum_log_probs, const FinishedState* finished,
-    BeamHypotheses beam_hyps, const int candidate_size)
+__launch_bounds__(THREADBLOCK_SIZE) __global__ void batch_topk_kernel(
+    int const* __restrict topk_id, T const* __restrict topk_val, BeamHypotheses beam_hyps, int const candidate_size)
 {
-    const int thread_id = threadIdx.x;
-    const int vector_id = blockIdx.x;
-    const int K{beam_hyps.beam_width};
-    const int vocab_size{beam_hyps.vocab_size};
-    const int global_batch_idx{beam_hyps.ite * beam_hyps.local_batch_size + vector_id};
-    const T MAX_T_VAL = (std::is_same<T, half>::value) ? HALF_FLT_MAX : FLT_MAX;
+    int const thread_id = threadIdx.x;
+    int const vector_id = blockIdx.x;
+    int const global_batch_idx{beam_hyps.ite * beam_hyps.local_batch_size + vector_id};
+    int const K{beam_hyps.beam_width};
+    int const vocab_size{beam_hyps.vocab_size};
+    T const MAX_T_VAL = (std::is_same<T, half>::value) ? HALF_FLT_MAX : FLT_MAX;
 
-    const float length_penalty{beam_hyps.length_penalties[global_batch_idx]};
-    const int early_stopping{beam_hyps.early_stoppings[global_batch_idx]};
-    const T diversity_rate{beam_hyps.diversity_rates[global_batch_idx]};
-    float* output_log_probs{beam_hyps.log_probs_src};
-    const int* sequence_lengths{beam_hyps.sequence_lengths_src};
+    float const diversity_rate{beam_hyps.diversity_rates[global_batch_idx]};
+    float const length_penalty{beam_hyps.length_penalties[global_batch_idx]};
+    int const early_stopping{beam_hyps.early_stoppings[global_batch_idx]};
+    int const* input_lengths{beam_hyps.input_lengths};
+    int const* sequence_lengths{beam_hyps.sequence_lengths_src};
+
+    float* __restrict cum_log_probs_src{beam_hyps.cum_log_probs_src}; // copy since it will be modified
 
     using cub_kvp = cub::KeyValuePair<int, T>;
     using BlockReduce = cub::BlockReduce<cub_kvp, THREADBLOCK_SIZE>;
@@ -142,9 +144,9 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void batch_topk_kernel(const int*
     __shared__ int selected_beams;
     __shared__ int thread_requiring_update;
 
-    // reposition topk_tmp_id_buf, topk_tmp_val_buf to data for the current vector
-    topk_tmp_id_buf += vector_id * candidate_size;
-    topk_tmp_val_buf += vector_id * candidate_size;
+    // reposition topk_id, topk_val to data for the current vector
+    topk_id += vector_id * candidate_size;
+    topk_val += vector_id * candidate_size;
 
     if (thread_id == 0)
     {
@@ -152,20 +154,21 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void batch_topk_kernel(const int*
     }
     if (thread_id < K)
     {
-        old_cum_log_probs[thread_id] = cum_log_probs[vector_id * K + thread_id];
+        old_cum_log_probs[thread_id] = cum_log_probs_src[vector_id * K + thread_id];
     }
     __syncthreads();
 
     if (beam_hyps.num_beams != nullptr)
     {
-        // initialize worst_score if this batch has no finished beam
+        // Beam search is enabled
         if (beam_hyps.num_beams[global_batch_idx] == 0 && thread_id == 0)
         {
+            // Initialize worst_score if this batch has no finished beam
             beam_hyps.min_normed_scores[global_batch_idx] = FLT_MAX;
         }
-        // return if this batch has enough finished beams
         else if (beam_hyps.num_beams[global_batch_idx] == K)
         {
+            // Return if this batch has enough finished beams
             return;
         }
     }
@@ -174,14 +177,13 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void batch_topk_kernel(const int*
     cub::ArgMax arg_max;
     cub_kvp partial_topk{candidate_size - 1, -MAX_T_VAL};
 
-    for (int elem_id = thread_id; elem_id < candidate_size; elem_id += THREADBLOCK_SIZE)
+    for (int id = thread_id; id < candidate_size; id += THREADBLOCK_SIZE)
     {
-        int i = beam_hyps.num_beams == nullptr ? elem_id % K : elem_id / 2 / K;
-        T elem = topk_tmp_val_buf[elem_id]; //  use token score to do TopK
-        elem += diversity_rate * (T) i;
-        cub_kvp new_elem{elem_id, elem};
+        int i = beam_hyps.num_beams == nullptr ? id % K : id / 2 / K;
+        T elem = topk_val[id] + static_cast<T>(diversity_rate * i); // use token score for TopK
+        cub_kvp new_elem{id, elem};
         partial_topk = arg_max(partial_topk, new_elem);
-        buf_s[elem_id] = elem;
+        buf_s[id] = elem;
     }
     __syncthreads();
 
@@ -212,38 +214,36 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void batch_topk_kernel(const int*
 
     if (thread_id == 0)
     {
-        cum_log_probs += vector_id * K;
-
+        // Adjust beams or select completed beams sequentially
+        // Reference (might be changed along HF in the future):
+        // https://github.com/huggingface/transformers/blob/main/src/transformers/generation/beam_search.py#L272
         for (int i = 0; i < 2 * K; ++i)
         {
-            const int current_key = cta_topk[i].key;
-            const T current_value = cta_topk[i].value;
+            int const current_key = cta_topk[i].key;
+            T const current_value = cta_topk[i].value;
+            bool const is_end_token = topk_id[current_key] % vocab_size == beam_hyps.end_ids[vector_id];
 
-            // Consider to add beam only if this token belongs to top K range and it is end_token
-            // https://github.com/huggingface/transformers/blob/main/src/transformers/generation/beam_search.py#L272
-            if (i < K && beam_hyps.num_beams != nullptr
-                && topk_tmp_id_buf[current_key] % vocab_size == beam_hyps.end_ids[vector_id])
+            if (i < K && beam_hyps.num_beams != nullptr && is_end_token)
             {
-                const int seq_len = sequence_lengths[vector_id * K + i] - beam_hyps.input_lengths[global_batch_idx];
-                const int pad_if_not_finish = finished[vector_id * K + i].isFinished() ? 0 : 1;
-                const float normed_score
-                    = apply_length_penalty(current_value, seq_len + pad_if_not_finish, length_penalty);
-
+                // Consider to add beam only if this token is end_token and belongs to top K range
+                int const seq_len = sequence_lengths[vector_id * K + i] - input_lengths[global_batch_idx];
+                int const pad = static_cast<int>(!beam_hyps.finished[vector_id * K + i].isFinished());
+                float const normed_score = apply_length_penalty(current_value, seq_len + pad, length_penalty);
                 int beam_idx = beam_hyps.num_beams[global_batch_idx];
-                // There are already K beams
                 if (beam_idx == K)
                 {
-                    // The current score is worse than the worst one in beams
+                    // There are already K beams
                     if (normed_score < beam_hyps.min_normed_scores[global_batch_idx])
                     {
+                        // Current score is worse than the worst one in candidate beams
                         // Stop considering new beams
                         selected_beams = K;
                         break;
                     }
-                    // The current score is better than the worst one in beams
                     else
                     {
-                        // Find the beam index which score == min_normed_score and erase it.
+                        // Current score is better than the worst one in candidate beams
+                        // Find the beam index which score == min_normed_score and erase it
                         for (int j = 0; j < K; j++)
                         {
                             if (beam_hyps.normed_scores[global_batch_idx * (K * 2) + j]
@@ -264,111 +264,106 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void batch_topk_kernel(const int*
                         }
                     }
                 }
-                const int tgt_id_offset
+                int const tgt_id_offset
                     = ((vector_id + beam_hyps.ite * beam_hyps.local_batch_size) * (K * 2) + beam_idx)
                     * (beam_hyps.max_seq_len);
-                int prev_id = (topk_tmp_id_buf[current_key] / vocab_size) % K;
-                const int current_step{sequence_lengths[vector_id * K + prev_id]};
+                int prev_id = (topk_id[current_key] / vocab_size) % K;
+                int const current_step{sequence_lengths[vector_id * K + prev_id]};
                 beam_hyps.output_ids_tgt[tgt_id_offset + current_step] = beam_hyps.end_ids[vector_id];
-
                 if (beam_hyps.log_probs != nullptr)
                 {
-                    beam_hyps.log_probs[tgt_id_offset + current_step] = (float) topk_tmp_val_buf[current_key]
-                        - old_cum_log_probs[(topk_tmp_id_buf[current_key] / vocab_size) % K];
+                    beam_hyps.log_probs[tgt_id_offset + current_step]
+                        = (float) topk_val[current_key] - old_cum_log_probs[(topk_id[current_key] / vocab_size) % K];
                 }
 
                 for (int j = current_step - 1; j >= 0; j--)
                 {
-                    const int src_idx = j * beam_hyps.batch_size * K + beam_hyps.ite * beam_hyps.local_batch_size * K
+                    int const src_idx = j * beam_hyps.batch_size * K + beam_hyps.ite * beam_hyps.local_batch_size * K
                         + vector_id * K + prev_id;
                     beam_hyps.output_ids_tgt[tgt_id_offset + j]
-                        = beam_hyps.output_ids_src_ptr[vector_id][prev_id * beam_hyps.max_seq_len + j];
-
+                        = beam_hyps.output_ids_tgt_ptr[vector_id][prev_id * beam_hyps.max_seq_len + j];
                     if (beam_hyps.log_probs != nullptr && beam_hyps.log_probs_src != nullptr)
                     {
                         beam_hyps.log_probs[tgt_id_offset + j] = beam_hyps.log_probs_src[src_idx];
                     }
-
-                    prev_id = beam_hyps.parent_ids_src_ptr[vector_id][prev_id * beam_hyps.max_seq_len + j];
+                    prev_id = beam_hyps.parent_ids_tgt_ptr[vector_id][prev_id * beam_hyps.max_seq_len + j];
                 }
-                const int tgt_beam_idx = global_batch_idx * (K * 2) + beam_idx;
-
+                int const tgt_beam_idx = global_batch_idx * (K * 2) + beam_idx;
                 beam_hyps.sequence_lengths_tgt[tgt_beam_idx] = current_step;
                 beam_hyps.normed_scores[tgt_beam_idx] = normed_score;
                 beam_hyps.min_normed_scores[global_batch_idx]
                     = min(beam_hyps.min_normed_scores[global_batch_idx], beam_hyps.normed_scores[tgt_beam_idx]);
-
                 beam_hyps.num_beams[global_batch_idx]++;
-                beam_hyps.cum_log_probs[tgt_beam_idx] = (float) topk_tmp_val_buf[current_key];
+                beam_hyps.cum_log_probs[tgt_beam_idx] = (float) topk_val[current_key];
             }
-            // This token is end_token but belongs to range K ~ 2K, just ignoe it
-            // TODO: eliminate this branch by rewriting condition of the else_if
-            else if (i >= K && beam_hyps.num_beams != nullptr
-                && topk_tmp_id_buf[current_key] % vocab_size == beam_hyps.end_ids[vector_id])
+            else if (i < K || beam_hyps.num_beams != nullptr && !is_end_token)
             {
-                ;
-            }
-            // Beam search is disabled or this token is not end_token, we add it to the end of the unfinished sentence
-            else if (beam_hyps.num_beams != nullptr || beam_hyps.num_beams == nullptr && i < K)
-            {
-                const int current_step{sequence_lengths[vector_id * K + selected_beams]};
+                // Condition of this branch
+                // 1. beam_hyps.num_beams == nullptr && i <  K, i.e., beam search is disable
+                // 2. beam_hyps.num_beams != nullptr && i <  K && is_end_token == false, i.e., add token at the end
+                // 3. beam_hyps.num_beams != nullptr && i >= K && is_end_token == false, i.e., add token at the end
+                int const current_step = sequence_lengths[vector_id * K + selected_beams];
                 beam_hyps.output_ids_tgt_ptr[vector_id][selected_beams * beam_hyps.max_seq_len + current_step]
-                    = topk_tmp_id_buf[current_key];
-                if (output_log_probs != nullptr)
+                    = topk_id[current_key];
+                if (beam_hyps.log_probs_src != nullptr)
                 {
-                    output_log_probs[current_step * beam_hyps.batch_size * K + vector_id * K + selected_beams]
-                        = (float) topk_tmp_val_buf[current_key]
-                        - old_cum_log_probs[(topk_tmp_id_buf[current_key] / vocab_size) % K];
+                    beam_hyps.log_probs_src[current_step * beam_hyps.batch_size * K + vector_id * K + selected_beams]
+                        = (float) topk_val[current_key] - old_cum_log_probs[(topk_id[current_key] / vocab_size) % K];
                 }
-                cum_log_probs[selected_beams] = (float) topk_tmp_val_buf[current_key];
+                cum_log_probs_src[vector_id * K + selected_beams] = (float) topk_val[current_key];
                 selected_beams++;
             }
-            __syncthreads();
+            else
+            {
+                ;
+                // Condition of this branch, which we do nothing for it
+                // 1. beam_hyps.num_beams == nullptr && i >= K, i.e., beam search is disable
+                // 2. beam_hyps.num_beams != nullptr && i >= K && is_end_token == true, i.e., ignore the worse beams
+            }
+
             if (selected_beams >= K)
             {
                 break;
             }
         }
     }
-    // update beam_hyps.is_done for each batch
-    if (threadIdx.x == 0 && beam_hyps.num_beams != nullptr)
+
+    // update beam_hyps.is_done
+    if (thread_id == 0 && beam_hyps.num_beams != nullptr)
     {
-        // no enough beams
-        if (beam_hyps.num_beams[blockIdx.x] < K)
+        if (beam_hyps.num_beams[vector_id] < K)
         {
-            beam_hyps.is_done[blockIdx.x] = false;
+            // no enough beams
+            beam_hyps.is_done[vector_id] = false;
             return;
         }
+        int seq_len = 0;
         float highest_attainable_score = 0.0f;
         switch (early_stopping)
         {
         case 1:
-            // enough beams with early stopping
-            beam_hyps.is_done[blockIdx.x] = true;
+            // enough beams with early_stopping
+            beam_hyps.is_done[vector_id] = true;
             return;
         case 0:
-            // enough beams without early stopping
-            highest_attainable_score = static_cast<float>(apply_length_penalty(cum_log_probs[0],
-                sequence_lengths[vector_id * K] - beam_hyps.input_lengths[global_batch_idx], length_penalty));
-            beam_hyps.is_done[blockIdx.x] = beam_hyps.min_normed_scores[global_batch_idx] >= highest_attainable_score;
+            // enough beams with non_early_stopping
+            seq_len = sequence_lengths[vector_id * K] - input_lengths[global_batch_idx];
+            highest_attainable_score = apply_length_penalty(cum_log_probs_src[vector_id * K], seq_len, length_penalty);
+            beam_hyps.is_done[vector_id] = beam_hyps.min_normed_scores[global_batch_idx] >= highest_attainable_score;
             return;
         default:
-            // early_stopping == "never" in HF, i.e., compute the best possible score depending on `length_penalty`
+            // early_stopping == "never" in HF, i.e., compute the best possible score depending on length_penalty
             // https://github.com/huggingface/transformers/blob/main/src/transformers/generation/beam_search.py#L990
             if (length_penalty > 0.0f)
             {
-                highest_attainable_score = static_cast<float>(apply_length_penalty(cum_log_probs[0],
-                    beam_hyps.max_seq_len - beam_hyps.input_lengths[global_batch_idx], length_penalty));
-                beam_hyps.is_done[blockIdx.x]
-                    = beam_hyps.min_normed_scores[global_batch_idx] >= highest_attainable_score;
+                seq_len = beam_hyps.max_seq_len - input_lengths[global_batch_idx];
             }
             else
             {
-                highest_attainable_score = static_cast<float>(apply_length_penalty(cum_log_probs[0],
-                    sequence_lengths[vector_id * K] - beam_hyps.input_lengths[global_batch_idx], length_penalty));
-                beam_hyps.is_done[blockIdx.x]
-                    = beam_hyps.min_normed_scores[global_batch_idx] >= highest_attainable_score;
+                seq_len = sequence_lengths[vector_id * K] - input_lengths[global_batch_idx];
             }
+            highest_attainable_score = apply_length_penalty(cum_log_probs_src[vector_id * K], seq_len, length_penalty);
+            beam_hyps.is_done[vector_id] = beam_hyps.min_normed_scores[global_batch_idx] >= highest_attainable_score;
             return;
         }
     }
@@ -399,7 +394,7 @@ struct TopKMD
 };
 
 template <typename T, int MAX_K>
-__device__ __forceinline__ TopKMD<T, MAX_K> reduce_topk_md_op(const TopKMD<T, MAX_K>& a, const TopKMD<T, MAX_K>& b)
+__device__ __forceinline__ TopKMD<T, MAX_K> reduce_topk_md_op(TopKMD<T, MAX_K> const& a, TopKMD<T, MAX_K> const& b)
 {
     TopKMD<T, MAX_K> res;
     res.md = reduce_md_op(a.md, b.md);
@@ -408,14 +403,13 @@ __device__ __forceinline__ TopKMD<T, MAX_K> reduce_topk_md_op(const TopKMD<T, MA
 }
 
 template <typename T, int ITEMS_PER_THREAD, int MAX_K, int THREADBLOCK_SIZE>
-__launch_bounds__(THREADBLOCK_SIZE) __global__ void beam_online_softmax_topk_kernel(const T* __restrict log_probs,
-    const T* __restrict bias, const float* __restrict cum_log_probs, const FinishedState* __restrict finished,
-    int* __restrict topk_tmp_id_buf, T* __restrict topk_tmp_val_buf, int vocab_size, int K,
-    const int* __restrict end_ids)
+__launch_bounds__(THREADBLOCK_SIZE) __global__ void beam_online_softmax_topk_kernel(T const* __restrict log_probs,
+    T const* __restrict bias, float const* __restrict cum_log_probs, FinishedState const* __restrict finished,
+    int* __restrict topk_id, T* __restrict topk_val, int vocab_size, int K, int const* __restrict end_ids)
 {
-    const int thread_id = threadIdx.x;
-    const int vector_id = blockIdx.x;
-    const T MAX_T_VAL = (std::is_same<T, half>::value) ? HALF_FLT_MAX : FLT_MAX;
+    int const thread_id = threadIdx.x;
+    int const vector_id = blockIdx.x;
+    T const MAX_T_VAL = (std::is_same<T, half>::value) ? HALF_FLT_MAX : FLT_MAX;
 
     typedef cub::BlockReduce<TopKMD<float, MAX_K>, THREADBLOCK_SIZE> BlockReduce;
     __shared__ typename BlockReduce::TempStorage temp_storage;
@@ -434,23 +428,22 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void beam_online_softmax_topk_ker
 
     if (finished[vector_id].isFinished())
     {
-        for (int elem_id = thread_id; elem_id < vocab_size; elem_id += THREADBLOCK_SIZE)
+        for (int id = thread_id; id < vocab_size; id += THREADBLOCK_SIZE)
         {
-            float elem = (elem_id == end_ids[vector_id / K]) ? MAX_T_VAL : -MAX_T_VAL;
+            float elem = (id == end_ids[vector_id / K]) ? MAX_T_VAL : -MAX_T_VAL;
             MD new_elem{elem, 1.0F};
             partial.md = reduce_md_op(partial.md, new_elem);
-            partial.topk.insert(elem, elem_id);
-            // if (elem_id > THREADBLOCK_SIZE * MAX_K && elem_id == E) break;
+            partial.topk.insert(elem, id);
         }
     }
     else
     {
-        for (int elem_id = thread_id; elem_id < vocab_size; elem_id += THREADBLOCK_SIZE)
+        for (int id = thread_id; id < vocab_size; id += THREADBLOCK_SIZE)
         {
-            float elem = log_probs[elem_id] + bias[elem_id];
+            float elem = log_probs[id] + bias[id];
             MD new_elem{elem, 1.0F};
             partial.md = reduce_md_op(partial.md, new_elem);
-            partial.topk.insert(elem, elem_id);
+            partial.topk.insert(elem, id);
         }
     }
 
@@ -458,8 +451,8 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void beam_online_softmax_topk_ker
 
     if (thread_id == 0)
     {
-        topk_tmp_id_buf += vector_id * K;
-        topk_tmp_val_buf += vector_id * K;
+        topk_id += vector_id * K;
+        topk_val += vector_id * K;
         cum_log_probs += vector_id;
 
         // float d_total_inverse = __fdividef(1.0F, total.md.d);
@@ -470,8 +463,8 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void beam_online_softmax_topk_ker
             float val = total.topk.u[i] - total.md.m - d_total_log;
             if (i < K)
             {
-                topk_tmp_id_buf[i] = total.topk.p[i] + vector_id * vocab_size; // trtllm needs absolute id
-                topk_tmp_val_buf[i] = val + cum_log_probs[0];
+                topk_id[i] = total.topk.p[i] + vector_id * vocab_size; // trtllm needs absolute id
+                topk_val[i] = val + cum_log_probs[0];
             }
         }
     }
@@ -479,34 +472,32 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void beam_online_softmax_topk_ker
 
 template <typename T, int ITEMS_PER_THREAD, int MAX_K2, int THREADBLOCK_SIZE>
 __launch_bounds__(THREADBLOCK_SIZE, 1) __global__ void beam_online_softmax_topk_stage1_kernel_base(
-    const T* __restrict log_probs, const T* __restrict bias, const FinishedState* __restrict finished,
-    float* __restrict tmp_buffer, int vocab_size, int K, const int* __restrict end_ids)
+    T const* __restrict log_probs, T const* __restrict bias, FinishedState const* __restrict finished,
+    float* __restrict tmp_buffer, int vocab_size, int K, int const* __restrict end_ids)
 {
-    const int thread_id = threadIdx.x;
-    const int vector_id = blockIdx.x;
-    const T MAX_T_VAL = (std::is_same<T, half>::value) ? HALF_FLT_MAX : FLT_MAX;
-    const int PACKED_TOP_KMD_SIZE = 2 * MAX_K2 + 2;
+    int const thread_id = threadIdx.x;
+    int const vector_id = blockIdx.x;
+    T const MAX_T_VAL = (std::is_same<T, half>::value) ? HALF_FLT_MAX : FLT_MAX;
+    int const PACKED_TOP_KMD_SIZE = 2 * MAX_K2 + 2;
     // one threadblock has multiple sections per vocab_size
-    const int v_local = (vocab_size + gridDim.y - 1) / gridDim.y;
-    const int section_start = v_local * blockIdx.y;
-    const int section_end = std::min(section_start + v_local, vocab_size);
+    int const v_local = (vocab_size + gridDim.y - 1) / gridDim.y;
+    int const section_start = v_local * blockIdx.y;
+    int const section_end = std::min(section_start + v_local, vocab_size);
 
 #if TOPK_FP16_STORAGE == 1
     typedef cub::BlockReduce<TopKMD<__half, MAX_K2>, THREADBLOCK_SIZE> BlockReduce;
+    TopKMD<__half, MAX_K2> partial;
 #else
     typedef cub::BlockReduce<TopKMD<T, MAX_K2>, THREADBLOCK_SIZE> BlockReduce;
+    TopKMD<T, MAX_K2> partial;
 #endif
+
     __shared__ typename BlockReduce::TempStorage temp_storage;
     __shared__ float buf_s[PACKED_TOP_KMD_SIZE];
 
-    // reposition log_probs to data for the current vector
+    // reposition log_probs to the data for the current vector
     log_probs += vector_id * vocab_size;
 
-#if TOPK_FP16_STORAGE == 1
-    TopKMD<__half, MAX_K2> partial;
-#else
-    TopKMD<T, MAX_K2> partial;
-#endif
     for (int i = 0; i < MAX_K2; ++i)
     {
         partial.topk.p[i] = -1;
@@ -518,24 +509,24 @@ __launch_bounds__(THREADBLOCK_SIZE, 1) __global__ void beam_online_softmax_topk_
     if (finished[vector_id].isFinished())
     {
 #pragma unroll 1
-        for (int elem_id = section_start + thread_id; elem_id < section_end; elem_id += THREADBLOCK_SIZE)
+        for (int id = section_start + thread_id; id < section_end; id += THREADBLOCK_SIZE)
         {
-            float elem = (elem_id == end_ids[vector_id / K]) ? MAX_T_VAL : -MAX_T_VAL;
+            float elem = (id == end_ids[vector_id / K]) ? MAX_T_VAL : -MAX_T_VAL;
             MD new_elem{elem, 1.0F};
             partial.md = reduce_md_op(partial.md, new_elem);
-            partial.topk.insert(elem, elem_id);
+            partial.topk.insert(elem, id);
         }
     }
     else
     {
 #pragma unroll 1
-        for (int elem_id = section_start + thread_id; elem_id < section_end; elem_id += THREADBLOCK_SIZE)
+        for (int id = section_start + thread_id; id < section_end; id += THREADBLOCK_SIZE)
         {
-            T b = bias == nullptr ? (T) 0.0f : bias[elem_id];
-            T elem = log_probs[elem_id] + b;
+            T b = bias == nullptr ? (T) 0.0f : bias[id];
+            T elem = log_probs[id] + b;
             MD new_elem{elem, 1.0F};
             partial.md = reduce_md_op(partial.md, new_elem);
-            partial.topk.insert(elem, elem_id);
+            partial.topk.insert(elem, id);
         }
     }
 
@@ -556,26 +547,26 @@ __launch_bounds__(THREADBLOCK_SIZE, 1) __global__ void beam_online_softmax_topk_
         buf_s[2 * MAX_K2 + 1] = total.md.m;
     }
     __syncthreads();
-    for (int elem_id = thread_id; elem_id < PACKED_TOP_KMD_SIZE; elem_id += THREADBLOCK_SIZE)
+
+    for (int id = thread_id; id < PACKED_TOP_KMD_SIZE; id += THREADBLOCK_SIZE)
     {
-        tmp_buffer[blockIdx.x * PACKED_TOP_KMD_SIZE * gridDim.y + blockIdx.y * PACKED_TOP_KMD_SIZE + elem_id]
-            = buf_s[elem_id];
+        tmp_buffer[blockIdx.x * PACKED_TOP_KMD_SIZE * gridDim.y + blockIdx.y * PACKED_TOP_KMD_SIZE + id] = buf_s[id];
     }
 }
 
 template <typename T, int ITEMS_PER_THREAD, int MAX_K2, int THREADBLOCK_SIZE>
 __launch_bounds__(THREADBLOCK_SIZE, 1) __global__ void beam_online_softmax_topk_stage1_kernel_fast(
-    const T* __restrict log_probs, const T* __restrict bias, const FinishedState* __restrict finished,
-    float* __restrict t, int vocab_size, int K, const int* __restrict end_ids, const int v_local)
+    T const* __restrict log_probs, T const* __restrict bias, FinishedState const* __restrict finished,
+    float* __restrict t, int vocab_size, int K, int const* __restrict end_ids, int const v_local)
 {
-    const int thread_id = threadIdx.x;
-    const int vector_id = blockIdx.x;
-    const T MAX_T_VAL = (std::is_same<T, half>::value) ? HALF_FLT_MAX : FLT_MAX;
-    const int PACKED_TOP_KMD_SIZE = 2 * MAX_K2 + 2;
+    int const thread_id = threadIdx.x;
+    int const vector_id = blockIdx.x;
+    T const MAX_T_VAL = (std::is_same<T, half>::value) ? HALF_FLT_MAX : FLT_MAX;
+    int const PACKED_TOP_KMD_SIZE = 2 * MAX_K2 + 2;
     // one threadblock has multiple sections per vocab_size
-    const int section_start = v_local * blockIdx.y;
-    const int section_end = std::min(section_start + v_local, vocab_size);
-    const int valid_smem_length = section_end - section_start;
+    int const section_start = v_local * blockIdx.y;
+    int const section_end = std::min(section_start + v_local, vocab_size);
+    int const valid_smem_length = section_end - section_start;
 
 #if TOPK_FP16_STORAGE == 1
     using cub_kvp = cub::KeyValuePair<int, __half>;
@@ -589,6 +580,8 @@ __launch_bounds__(THREADBLOCK_SIZE, 1) __global__ void beam_online_softmax_topk_
 
     extern __shared__ char buf_smem_logprobs_[];
     T* buf_smem_logprobs = reinterpret_cast<T*>(buf_smem_logprobs_);
+    __shared__ float buf_s[PACKED_TOP_KMD_SIZE];
+    __shared__ int thread_requiring_update;
 
     __shared__ union
     {
@@ -596,10 +589,7 @@ __launch_bounds__(THREADBLOCK_SIZE, 1) __global__ void beam_online_softmax_topk_
         typename BlockReduceTopK::TempStorage topk_smem;
     } temp_storage;
 
-    __shared__ float buf_s[PACKED_TOP_KMD_SIZE];
-    __shared__ int thread_requiring_update;
-
-    // reposition log_probs to data for the current vector
+    // reposition log_probs to the data for the current vector
     log_probs += vector_id * vocab_size;
 
     cub::ArgMax arg_max;
@@ -608,14 +598,14 @@ __launch_bounds__(THREADBLOCK_SIZE, 1) __global__ void beam_online_softmax_topk_
     if (finished[vector_id].isFinished())
     {
 #pragma unroll 1
-        for (int elem_id = section_start + thread_id; elem_id < section_end; elem_id += THREADBLOCK_SIZE)
+        for (int id = section_start + thread_id; id < section_end; id += THREADBLOCK_SIZE)
         {
-            float elem = (elem_id == end_ids[vector_id / K]) ? MAX_T_VAL : -MAX_T_VAL;
-            buf_smem_logprobs[elem_id - section_start] = elem;
+            float elem = (id == end_ids[vector_id / K]) ? MAX_T_VAL : -MAX_T_VAL;
+            buf_smem_logprobs[id - section_start] = elem;
             MD new_elem{elem, 1.0F};
             partial_md = reduce_md_op(partial_md, new_elem);
 
-            const int smem_index = elem_id - section_start;
+            int const smem_index = id - section_start;
             cub_kvp new_elem_topk{smem_index, elem};
             partial_topk = arg_max(partial_topk, new_elem_topk);
             buf_smem_logprobs[smem_index] = elem;
@@ -624,14 +614,14 @@ __launch_bounds__(THREADBLOCK_SIZE, 1) __global__ void beam_online_softmax_topk_
     else
     {
 #pragma unroll 1
-        for (int elem_id = section_start + thread_id; elem_id < section_end; elem_id += THREADBLOCK_SIZE)
+        for (int id = section_start + thread_id; id < section_end; id += THREADBLOCK_SIZE)
         {
-            T b = bias == nullptr ? (T) 0.0f : bias[elem_id];
-            T elem = log_probs[elem_id] + b;
+            T b = bias == nullptr ? (T) 0.0f : bias[id];
+            T elem = log_probs[id] + b;
             MD new_elem_md{elem, 1.0F};
             partial_md = reduce_md_op(partial_md, new_elem_md);
 
-            const int smem_index = elem_id - section_start;
+            int const smem_index = id - section_start;
             cub_kvp new_elem_topk{smem_index, elem};
             partial_topk = arg_max(partial_topk, new_elem_topk);
             buf_smem_logprobs[smem_index] = elem;
@@ -655,7 +645,7 @@ __launch_bounds__(THREADBLOCK_SIZE, 1) __global__ void beam_online_softmax_topk_
 
         // Only one thread needs to update the old partial before the next block reduce.
         // No need to do this in the last iteration.
-        if (thread_id == thread_requiring_update && i < (2 * K - 1))
+        if (thread_id == thread_requiring_update && i < 2 * K - 1)
         {
             partial_topk.key = vocab_size - 1;
             partial_topk.value = -MAX_T_VAL;
@@ -676,21 +666,22 @@ __launch_bounds__(THREADBLOCK_SIZE, 1) __global__ void beam_online_softmax_topk_
         buf_s[2 * MAX_K2 + 1] = total_md.m;
     }
     __syncthreads();
-    for (int elem_id = thread_id; elem_id < PACKED_TOP_KMD_SIZE; elem_id += THREADBLOCK_SIZE)
+
+    for (int id = thread_id; id < PACKED_TOP_KMD_SIZE; id += THREADBLOCK_SIZE)
     {
-        t[blockIdx.x * PACKED_TOP_KMD_SIZE * gridDim.y + blockIdx.y * PACKED_TOP_KMD_SIZE + elem_id] = buf_s[elem_id];
+        t[blockIdx.x * PACKED_TOP_KMD_SIZE * gridDim.y + blockIdx.y * PACKED_TOP_KMD_SIZE + id] = buf_s[id];
     }
 }
 
 template <typename T, int MAX_K2, int THREADBLOCK_SIZE>
 __launch_bounds__(THREADBLOCK_SIZE) __global__ void beam_online_softmax_topk_stage2_kernel(
-    const float* __restrict temp_storage, const float* __restrict cum_log_probs, int* __restrict ids,
-    T* __restrict vals, int K, int parts_per_beam, const int vocab_size)
+    float const* __restrict temp_storage, float const* __restrict cum_log_probs, int* __restrict ids,
+    T* __restrict vals, int K, int parts_per_beam, int const vocab_size)
 {
-    const int vector_id = blockIdx.x;
-    const int thread_id = threadIdx.x;
-    const T MAX_T_VAL = (std::is_same<T, half>::value) ? HALF_FLT_MAX : FLT_MAX;
-    const int PACKED_TOP_KMD_SIZE = 2 * MAX_K2 + 2;
+    int const vector_id = blockIdx.x;
+    int const thread_id = threadIdx.x;
+    T const MAX_T_VAL = (std::is_same<T, half>::value) ? HALF_FLT_MAX : FLT_MAX;
+    int const PACKED_TOP_KMD_SIZE = 2 * MAX_K2 + 2;
 
     using cub_kvp = cub::KeyValuePair<int, T>;
     using BlockReduceTopK = cub::BlockReduce<cub_kvp, THREADBLOCK_SIZE>;
@@ -788,12 +779,12 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void beam_online_softmax_topk_sta
 }
 
 template <typename T, int MAX_K2>
-void beam_online_softmax_topk_stage2_kernelLauncher(const float* temp_storage, const float* cum_log_probs, int* ids,
-    T* vals, int batch_size, int beam_width, int parts_per_beam, cudaStream_t stream, const int vocab_size)
+void beam_online_softmax_topk_stage2_kernelLauncher(float const* temp_storage, float const* cum_log_probs, int* ids,
+    T* vals, int batch_size, int beam_width, int parts_per_beam, cudaStream_t stream, int const vocab_size)
 {
     // TODO: rewrite beam_online_softmax_topk_stage2_kernel to remove dependence
     // of constant block size in oreder to reduce compilation time
-    const int smem_stage2_size = parts_per_beam * (2 * MAX_K2 + 2) * sizeof(float);
+    int const smem_stage2_size = parts_per_beam * (2 * MAX_K2 + 2) * sizeof(float);
 
     if (parts_per_beam <= 32)
     {
@@ -820,27 +811,28 @@ void beam_online_softmax_topk_stage2_kernelLauncher(const float* temp_storage, c
 }
 
 template <typename T, int MAX_K>
-void topK_softMax_kernelLauncher(const T* log_probs, const T* bias, const FinishedState* finished, float* cum_log_probs,
-    void* temp_storage, const int temp_storage_size, BeamHypotheses& beam_hyps, cudaStream_t stream)
+void topK_softMax_kernelLauncher(T const* log_probs, T const* bias, void* temp_storage, int const temp_storage_size,
+    BeamHypotheses& beam_hyps, cudaStream_t stream)
 {
-    const int batch_size{beam_hyps.local_batch_size};
-    const int beam_width{beam_hyps.beam_width};
-    const int vocab_size{beam_hyps.vocab_size};
-    const int* end_ids{beam_hyps.end_ids};
+    int const batch_size{beam_hyps.local_batch_size};
+    int const beam_width{beam_hyps.beam_width};
+    int const vocab_size{beam_hyps.vocab_size};
+    int const* end_ids{beam_hyps.end_ids};
+    float* cum_log_probs{beam_hyps.cum_log_probs_src};
+    FinishedState const* finished{beam_hyps.finished};
 
-    const int items_per_thread = 1;
-    const int block_sz = (MAX_K < 16) ? ((MAX_K < 8) ? SMALL_TOP_K_SOFTMAX_THREADBLOCK_SIZE : 128) : 64;
-    // const int block_sz = SMALL_TOP_K_SOFTMAX_THREADBLOCK_SIZE;
+    int const items_per_thread = 1;
+    int const block_sz = (MAX_K < 16) ? ((MAX_K < 8) ? SMALL_TOP_K_SOFTMAX_THREADBLOCK_SIZE : 128) : 64;
 
     assert(temp_storage_size % 2 == 0);
     assert(temp_storage_size >= 2 * batch_size * beam_width * beam_width * 2);
-    // Beam search needs the sequence lengths of beams to apply length penalty.
+    // Input and current sequence lengths are needed for computation of length penalty
     assert(beam_hyps.length_penalties == nullptr || beam_hyps.sequence_lengths_src != nullptr);
 
-    const int topk_buf_offset = ceil(batch_size * beam_width * beam_width * 2 / 4.) * 4;
-    int* topk_tmp_id_buf = reinterpret_cast<int*>(temp_storage);
-    T* topk_tmp_val_buf = reinterpret_cast<T*>(topk_tmp_id_buf + topk_buf_offset);
-    float* tmp_buffer = reinterpret_cast<float*>(topk_tmp_val_buf + topk_buf_offset);
+    int const topk_buf_offset = ceil(batch_size * beam_width * beam_width * 2 / 4.) * 4;
+    int* topk_id = reinterpret_cast<int*>(temp_storage);
+    T* topk_val = reinterpret_cast<T*>(topk_id + topk_buf_offset);
+    float* tmp_buffer = reinterpret_cast<float*>(topk_val + topk_buf_offset);
 
 #ifdef DO_SPLIT_SMALL_TOP_K_SOFTMAX
     // First, we query the occupancy assuming we need no smem. The goal of this heuristic is to simply run
@@ -859,14 +851,14 @@ void topK_softMax_kernelLauncher(const T* log_probs, const T* bias, const Finish
     TLLM_CUDA_CHECK(cudaFuncGetAttributes(
         &attr, beam_online_softmax_topk_stage1_kernel_fast<T, items_per_thread, 2 * MAX_K, block_sz>));
 
-    const int constant_smem = attr.sharedSizeBytes;
-    const int max_dyn_smem_per_block = max_smem_per_block - constant_smem;
+    int const constant_smem = attr.sharedSizeBytes;
+    int const max_dyn_smem_per_block = max_smem_per_block - constant_smem;
     constexpr int max_parts = 128;
     TLLM_CHECK_WITH_INFO(vocab_size * sizeof(T) <= max_dyn_smem_per_block * max_parts,
         "Vocab size too large for split-k top-k beam search fast path.");
 
-    const int driver_smem_per_block = max_smem_per_sm - max_smem_per_block;
-    const int extra_smem = driver_smem_per_block + constant_smem;
+    int const driver_smem_per_block = max_smem_per_sm - max_smem_per_block;
+    int const extra_smem = driver_smem_per_block + constant_smem;
 
     int smem_per_block = max_smem_per_sm / max_active_blocks;
     int dyn_smem_size = smem_per_block - extra_smem;
@@ -898,7 +890,7 @@ void topK_softMax_kernelLauncher(const T* log_probs, const T* bias, const Finish
         dyn_smem_size = sizeof(T) * (vocab_size + voc_parts - 1) / voc_parts;
         dim3 grid(batch_size * beam_width, voc_parts);
         // dynamically allocate shared memory
-        const int voc_size_chunk = dyn_smem_size / sizeof(T);
+        int const voc_size_chunk = dyn_smem_size / sizeof(T);
 
         if (dyn_smem_size >= (48 << 10))
         {
@@ -913,7 +905,7 @@ void topK_softMax_kernelLauncher(const T* log_probs, const T* bias, const Finish
     }
     else
     {
-        // use original stage 1 base kernel
+        // use stage 1 base kernel
         int voc_parts = 4;
         if (batch_size * beam_width < 256)
         {
@@ -934,35 +926,32 @@ void topK_softMax_kernelLauncher(const T* log_probs, const T* bias, const Finish
 #endif
 
 #ifdef DO_SPLIT_SMALL_TOP_K_SOFTMAX
-    beam_online_softmax_topk_stage2_kernelLauncher<T, 2 * MAX_K>(tmp_buffer, cum_log_probs, topk_tmp_id_buf,
-        topk_tmp_val_buf, batch_size, beam_width, voc_parts, stream, vocab_size);
+    beam_online_softmax_topk_stage2_kernelLauncher<T, 2 * MAX_K>(
+        tmp_buffer, cum_log_probs, topk_id, topk_val, batch_size, beam_width, voc_parts, stream, vocab_size);
     sync_check_cuda_error();
 #else
     beam_online_softmax_topk_kernel<T, items_per_thread, MAX_K, block_sz>
-        <<<batch_size * beam_width, block_sz, 0, stream>>>(log_probs, bias, cum_log_probs, finished, topk_tmp_id_buf,
-            topk_tmp_val_buf, vocab_size, beam_width, end_ids);
+        <<<batch_size * beam_width, block_sz, 0, stream>>>(
+            log_probs, bias, cum_log_probs, finished, topk_id, topk_val, vocab_size, beam_width, end_ids);
 #endif
 
-    // We need 2*MAX_K candidates because at most k candidates are finished, and
-    // we will not put them into next iteration
-
-    const int candidates = beam_width * beam_width * 2;
-    const int smem_size_batch_topk = sizeof(T) * candidates;
+    // Keep 2*MAX_K candidates in case of k candidates finishes in one iteration
+    int const candidates = beam_width * beam_width * 2;
+    int const smem_size_batch_topk = sizeof(T) * candidates;
     if (smem_size_batch_topk >= (48 << 10))
     {
         TLLM_CUDA_CHECK(cudaFuncSetAttribute(
             batch_topk_kernel<T, MAX_K * 2, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_batch_topk));
     }
 
-    batch_topk_kernel<T, MAX_K * 2, 32><<<batch_size, 32, smem_size_batch_topk, stream>>>(
-        topk_tmp_id_buf, topk_tmp_val_buf, cum_log_probs, finished, beam_hyps, candidates);
+    batch_topk_kernel<T, MAX_K * 2, 32>
+        <<<batch_size, 32, smem_size_batch_topk, stream>>>(topk_id, topk_val, beam_hyps, candidates);
     sync_check_cuda_error();
 }
 
 #define INSTANTIATE_BEAMSEARCH_K(T, MAX_K)                                                                             \
-    template void topK_softMax_kernelLauncher<T, MAX_K>(const T* log_probs, const T* bias,                             \
-        const FinishedState* finished, float* cum_log_probs, void* temp_storage, const int temp_storage_size,          \
-        BeamHypotheses& beam_hyps, cudaStream_t stream);
+    template void topK_softMax_kernelLauncher<T, MAX_K>(T const* log_probs, T const* bias, void* temp_storage,         \
+        int const temp_storage_size, BeamHypotheses& beam_hyps, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm

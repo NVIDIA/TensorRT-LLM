@@ -105,8 +105,7 @@ class QWenBlock(Module):
                  tp_size=1,
                  tp_rank=0,
                  rms_norm_eps=1e-06,
-                 use_fused_mlp=False,
-                 dense_context_fmha=False):
+                 use_fused_mlp=False):
         super().__init__()
         self.layer_idx = local_layer_idx
         self.hidden_size = hidden_size
@@ -142,8 +141,7 @@ class QWenBlock(Module):
             tp_group=self.tp_group,
             tp_size=self.tp_size,
             quant_mode=quant_mode,
-            dense_bias=bias,
-            dense_context_fmha=dense_context_fmha)
+            dense_bias=bias)
         if not mlp_hidden_size:
             mlp_hidden_size = hidden_size * 4
 
@@ -215,8 +213,7 @@ class QWenModel(Module):
                  embedding_sharding_dim=0,
                  rms_norm_eps=1e-06,
                  use_prompt_tuning=False,
-                 use_fused_mlp=False,
-                 dense_context_fmha=False):
+                 use_fused_mlp=False):
         super().__init__()
         self.mapping = mapping
         if self.mapping.is_first_pp_rank():
@@ -254,9 +251,7 @@ class QWenModel(Module):
                       tp_size=mapping.tp_size,
                       tp_rank=mapping.tp_rank,
                       rms_norm_eps=rms_norm_eps,
-                      use_fused_mlp=use_fused_mlp,
-                      dense_context_fmha=dense_context_fmha)
-            for layer_idx in layers_range
+                      use_fused_mlp=use_fused_mlp) for layer_idx in layers_range
         ])
 
         if self.mapping.is_last_pp_rank():
@@ -347,8 +342,7 @@ class QWenForCausalLM(QWenModel, GenerationMixin):
                  embedding_sharding_dim=0,
                  rms_norm_eps=1e-06,
                  use_prompt_tuning=False,
-                 use_fused_mlp=False,
-                 dense_context_fmha=False):
+                 use_fused_mlp=False):
         self.mapping = mapping
         if isinstance(dtype, str):
             self.dtype = str_dtype_to_trt(dtype)
@@ -397,8 +391,7 @@ class QWenForCausalLM(QWenModel, GenerationMixin):
                          embedding_sharding_dim=embedding_sharding_dim,
                          rms_norm_eps=rms_norm_eps,
                          use_prompt_tuning=use_prompt_tuning,
-                         use_fused_mlp=use_fused_mlp,
-                         dense_context_fmha=dense_context_fmha)
+                         use_fused_mlp=use_fused_mlp)
         vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
         if self.mapping.is_last_pp_rank():
             self.lm_head = ColumnLinear(hidden_size,

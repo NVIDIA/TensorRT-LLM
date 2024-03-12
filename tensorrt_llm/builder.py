@@ -24,11 +24,18 @@ from typing import Dict, Optional, Union
 import tensorrt as trt
 
 from ._common import _is_building
-from ._utils import support_strongly_type, to_dict, to_json_file
+from ._utils import (str_dtype_to_trt, support_strongly_type, to_dict,
+                     to_json_file)
+from .auto_parallel import auto_parallel
+from .auto_parallel.config import AutoParallelConfig
+from .graph_rewriting import optimize
 from .logger import logger
-from .network import Network
+from .models import PretrainedConfig, PretrainedModel
+from .models.modeling_utils import optimize_model
+from .network import Network, net_guard
 from .plugin import PluginConfig
 from .quantization import QuantMode
+from .version import __version__
 
 
 class BuilderConfig(object):
@@ -75,10 +82,6 @@ class BuilderConfig(object):
             assert isinstance(self.plugin_config, PluginConfig), \
                 f"Found unexpected plugin_config object with type: {type(self.plugin_config)}"
             config['plugin_config'] = to_dict(self.plugin_config)
-        if self.auto_parallel_config is not None:
-            config['auto_parallel_config'] = self.auto_parallel_config
-            config['builder_config']['tensor_parallel'] = math.prod(
-                self.auto_parallel_config['mesh'])
         return config
 
 
@@ -339,6 +342,10 @@ class Builder():
         assert isinstance(network, Network)
         builder_config.plugin_config = network.plugin_config
         builder_config.auto_parallel_config = network.auto_parallel_config
+        if builder_config.auto_parallel_config is not None:
+            mapping = builder_config.auto_parallel_config["mapping"]
+            builder_config.tensor_parallel = mapping.tp_size
+            builder_config.pipeline_parallel = mapping.pp_size
         if builder_config.trt_builder_config.num_optimization_profiles == 0:
             self._add_optimization_profile(network, builder_config)
         engine = None
@@ -412,6 +419,8 @@ class BuildConfig:
     profiling_verbosity: str = 'layer_names_only'
     enable_debug_output: bool = False
     max_draft_len: int = 0
+    use_refit: bool = False
+    auto_parallel_config: AutoParallelConfig = AutoParallelConfig()
     plugin_config: PluginConfig = PluginConfig()
 
     @classmethod
@@ -431,6 +440,13 @@ class BuildConfig:
                                          'layer_names_only')
         enable_debug_output = config.pop('enable_debug_output', False)
         max_draft_len = config.pop('max_draft_len', 0)
+        use_refit = config.pop('use_refit', False)
+        auto_parallel_config = config.pop('auto_parallel_config', None)
+        if auto_parallel_config is not None:
+            auto_parallel_config = AutoParallelConfig.from_dict(
+                auto_parallel_config)
+        else:
+            auto_parallel_config = AutoParallelConfig()
 
         if plugin_config is None:
             plugin_config = PluginConfig()
@@ -450,6 +466,8 @@ class BuildConfig:
             profiling_verbosity=profiling_verbosity,
             enable_debug_output=enable_debug_output,
             max_draft_len=max_draft_len,
+            use_refit=use_refit,
+            auto_parallel_config=auto_parallel_config,
             plugin_config=plugin_config)
 
     @classmethod
@@ -463,4 +481,178 @@ class BuildConfig:
         plugin_config = output.pop('plugin_config')
         plugin_config_dict = copy.deepcopy(plugin_config.__dict__)
         output['plugin_config'] = plugin_config_dict
+        output['auto_parallel_config'] = output['auto_parallel_config'].to_dict(
+        )
         return output
+
+
+def serialize_engine(engine, path):
+    logger.info(f'Serializing engine to {path}...')
+    tik = time.time()
+    with open(path, 'wb') as f:
+        f.write(engine)
+    tok = time.time()
+    t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
+    logger.info(f'Engine serialized. Total time: {t}')
+
+
+class EngineConfig:
+
+    def __init__(self, pretrained_config: 'PretrainedConfig',
+                 build_config: 'BuildConfig', version: str):
+        self.pretrained_config = pretrained_config
+        self.build_config = build_config
+        self.version = version
+
+    @classmethod
+    def from_json_file(cls, config_file):
+        with open(config_file) as f:
+            config = json.load(f)
+            return cls(PretrainedConfig.from_dict(config['pretrained_config']),
+                       BuildConfig.from_dict(config['build_config']),
+                       config['version'])
+
+    def to_dict(self):
+        return {
+            'version': self.version,
+            'pretrained_config': self.pretrained_config.to_dict(),
+            'build_config': self.build_config.to_dict(),
+        }
+
+
+class Engine:
+
+    def __init__(self, config: EngineConfig, engine: trt.IHostMemory):
+        self.config = config
+        self.engine = engine
+
+    def save(self, engine_dir: str):
+        if self.config.pretrained_config.mapping.rank == 0:
+            with open(os.path.join(engine_dir, 'config.json'),
+                      "w",
+                      encoding="utf-8") as f:
+                json.dump(self.config.to_dict(), f, indent=4)
+        serialize_engine(
+            self.engine,
+            os.path.join(
+                engine_dir,
+                f'rank{self.config.pretrained_config.mapping.rank}.engine'))
+
+    @classmethod
+    def from_dir(cls, engine_dir: str, rank: int = 0):
+        with open(os.path.join(engine_dir, f'rank{rank}.engine'), 'rb') as f:
+            engine_buffer = f.read()
+
+        config = EngineConfig.from_json_file(
+            os.path.join(engine_dir, 'config.json'))
+        config.pretrained_config.set_rank(rank)
+
+        return cls(config, engine_buffer)
+
+
+def get_engine_version(engine_dir: str) -> Union[None, str]:
+    engine_dir = Path(engine_dir)
+    config_path = engine_dir / "config.json"
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+
+    if 'version' not in config:
+        return None
+
+    return config['version']
+
+
+def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
+    builder = Builder()
+    builder_config = builder.create_builder_config(
+        precision=model.config.dtype,
+        use_refit=build_config.use_refit,
+        int8=(model.config.quant_mode.has_act_or_weight_quant()
+              and not model.config.quant_mode.has_per_group_scaling())
+        or model.config.quant_mode.has_int8_kv_cache(),
+        strongly_typed=build_config.strongly_typed,
+        opt_level=build_config.builder_opt,
+        profiling_verbosity=build_config.profiling_verbosity,
+        quant_mode=model.config.quant_mode,
+        lora_target_modules=model.config.lora_target_modules if hasattr(
+            model.config, 'lora_target_modules') else [],
+        hf_modules_to_trtllm_modules=model.config.lora_target_modules
+        if hasattr(model.config, 'hf_modules_to_trtllm_modules') else [],
+        trtllm_modules_to_hf_modules=model.config.lora_target_modules
+        if hasattr(model.config, 'trtllm_modules_to_hf_modules') else [],
+        max_lora_rank=model.config.max_lora_rank if hasattr(
+            model.config, 'max_lora_rank') else 64,
+    )
+
+    network = builder.create_network()
+    network.plugin_config = build_config.plugin_config
+
+    use_weight_only = model.config.quant_mode.is_weight_only()
+    per_group = model.config.quant_mode.has_per_group_scaling()
+    use_smooth_quant = model.config.quant_mode.has_act_and_weight_quant()
+    disable_weight_only_quant_plugin = model.config.disable_weight_only_quant_plugin if hasattr(
+        model.config, 'disable_weight_only_quant_plugin') else False
+
+    if use_weight_only and not disable_weight_only_quant_plugin:
+        if per_group:
+            network.plugin_config.set_plugin(
+                "weight_only_groupwise_quant_matmul_plugin", model.config.dtype)
+        else:
+            network.plugin_config.set_plugin("weight_only_quant_matmul_plugin",
+                                             model.config.dtype)
+    if use_smooth_quant and model.config.quantization.use_plugin_sq:
+        network.plugin_config.set_smooth_quant_plugins()
+    if (model.config.quant_mode.has_fp8_kv_cache()
+            or model.config.quant_mode.has_int8_kv_cache()
+        ) and network.plugin_config.use_paged_context_fmha:
+        raise RuntimeError(
+            "Paged Context FMHA doesn't work with fp8/int8 kv cache currently.")
+    nccl_plugin = model.config.dtype if model.config.mapping.world_size > 1 else None
+    network.plugin_config.set_nccl_plugin(
+        nccl_plugin, network.plugin_config.use_custom_all_reduce)
+
+    use_auto_parallel = build_config.auto_parallel_config.enabled
+    model = optimize_model(model, use_unfused_qkv_gemm=use_auto_parallel)
+
+    with net_guard(network):
+        # Prepare
+        network.set_named_parameters(model.named_parameters())
+
+        # Forward
+        inputs = model.prepare_inputs(
+            max_batch_size=build_config.max_batch_size,
+            max_input_len=build_config.max_input_len,
+            max_seq_len=build_config.max_input_len +
+            build_config.max_output_len,
+            use_cache=True,
+            max_beam_width=build_config.max_beam_width,
+            max_num_tokens=build_config.max_num_tokens,
+            prompt_embedding_table_size=build_config.
+            max_prompt_embedding_table_size,
+            max_draft_len=build_config.max_draft_len,
+            gather_context_logits=build_config.gather_context_logits,
+            gather_generation_logits=build_config.gather_generation_logits,
+            lora_target_modules=model.config.lora_target_modules if hasattr(
+                model.config, 'lora_target_modules') else [])
+        model(**inputs)
+
+        if build_config.enable_debug_output:
+            for k, v in model.named_network_outputs():
+                network._mark_output(v, k, str_dtype_to_trt(model.config.dtype))
+
+    optimize(network)
+
+    if use_auto_parallel:
+        config = build_config.auto_parallel_config
+        config.builder_flags = builder_config.trt_builder_config.flags
+        sharded_networks = auto_parallel(network, config)
+        network = sharded_networks[model.config.mapping.rank]
+        if not build_config.auto_parallel_config.debug_mode:
+            mapping = network.auto_parallel_config["mapping"]
+            model.config.mapping = mapping
+
+    # Network -> Engine
+    engine = builder.build_engine(network, builder_config)
+    engine_config = EngineConfig(model.config, build_config, __version__)
+
+    return Engine(engine_config, engine)

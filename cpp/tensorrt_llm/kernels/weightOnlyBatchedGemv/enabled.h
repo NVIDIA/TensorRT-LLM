@@ -82,7 +82,7 @@ bool isEnabledForArch(int arch)
 
 inline bool isWeightOnlyBatchedGemvEnabled(WeightOnlyQuantType qtype)
 {
-    const int arch = tensorrt_llm::common::getSMVersion();
+    int const arch = tensorrt_llm::common::getSMVersion();
     if (qtype == WeightOnlyQuantType::Int4b)
     {
         return isEnabledForArch<cutlass::uint4b_t>(arch);

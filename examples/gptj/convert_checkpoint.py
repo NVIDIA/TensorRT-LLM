@@ -331,14 +331,16 @@ def main():
     if args.model_dir is None:
         return
 
+    hf_model = AutoModelForCausalLM.from_pretrained(args.model_dir,
+                                                    trust_remote_code=True,
+                                                    torch_dtype="auto")
+
     def covert_and_save(rank):
         mapping = Mapping(world_size=world_size,
                           rank=rank,
                           tp_size=args.tp_size,
                           pp_size=args.pp_size)
-        hf_model = AutoModelForCausalLM.from_pretrained(args.model_dir,
-                                                        trust_remote_code=True,
-                                                        torch_dtype="auto")
+
         weights = convert_hf_gptj(
             hf_model,
             hf_config,
@@ -346,7 +348,6 @@ def main():
             dtype=args.dtype,
             use_weight_only=args.use_weight_only,
             plugin_weight_only_quant_type=plugin_weight_only_quant_type)
-        del hf_model
 
         safetensors.torch.save_file(
             weights, os.path.join(args.output_dir, f'rank{rank}.safetensors'))
@@ -370,6 +371,7 @@ def main():
                 exceptions
             ) == 0, "Checkpoint conversion failed, please check error log."
 
+    del hf_model
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     print(f'Total time of converting checkpoints: {t}')

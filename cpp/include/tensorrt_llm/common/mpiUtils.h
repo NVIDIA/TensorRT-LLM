@@ -56,6 +56,7 @@ enum class MpiType
     kUINT64,
     kFP8,
     kBF16,
+    kCHAR,
 };
 
 //! \brief For converting a C++ data type to a TensorRT data type.
@@ -133,6 +134,12 @@ struct MpiTypeConverter<std::uint64_t>
     static constexpr auto value = MpiType::kUINT64;
 };
 
+template <>
+struct MpiTypeConverter<char>
+{
+    static constexpr auto value = MpiType::kCHAR;
+};
+
 #ifdef ENABLE_FP8
 template <>
 struct MpiTypeConverter<__nv_fp8_e4m3>
@@ -202,8 +209,8 @@ public:
     ~MpiComm() noexcept;
 
     // no copy
-    MpiComm(const MpiComm&) = delete;
-    MpiComm& operator=(const MpiComm&) = delete;
+    MpiComm(MpiComm const&) = delete;
+    MpiComm& operator=(MpiComm const&) = delete;
 
     // move
     MpiComm(MpiComm&&) noexcept;
@@ -253,7 +260,24 @@ public:
         }
     }
 
-    void bcast(std::vector<int64_t>& packed, int root) const;
+    template <typename T>
+    void bcast(std::vector<T>& vec, int root) const
+    {
+        auto const rank = getRank();
+        auto vecSize = (rank == root) ? static_cast<int64_t>(vec.size()) : int64_t(0);
+        bcast(&vecSize, 1, MpiType::kINT64, root);
+        vec.resize(vecSize);
+
+        if constexpr (std::is_fundamental_v<std::remove_cv_t<T>>)
+        {
+            auto const mpiType = MpiTypeConverter<std::remove_cv_t<T>>::value;
+            bcast(vec.data(), vec.size(), mpiType, root);
+        }
+        else
+        {
+            bcast(vec.data(), vec.size() * sizeof(T), MpiType::kBYTE, root);
+        }
+    }
 
     void send(void const* buffer, std::size_t size, MpiType dtype, int dest, int tag) const;
 
@@ -297,8 +321,8 @@ public:
         }
     }
 
-    void allreduce(const void* sendbuf, void* recvbuf, int count, MpiType dtype, MpiOp op) const;
-    void allgather(const void* sendbuf, void* recvbuf, int count, MpiType dtype) const;
+    void allreduce(void const* sendbuf, void* recvbuf, int count, MpiType dtype, MpiOp op) const;
+    void allgather(void const* sendbuf, void* recvbuf, int count, MpiType dtype) const;
     void barrier() const;
 
     void mprobe(int source, int tag, MPI_Message* msg, MPI_Status* status) const;

@@ -14,11 +14,18 @@ from .._utils import (numpy_to_torch, str_dtype_to_torch, str_dtype_to_trt,
 from ..functional import PositionEmbeddingType, Tensor, gather_last_token_logits
 from ..layers import (AttentionParams, FusedGatedMLP, GatedMLP,
                       KeyValueCacheParams, LoraParams)
+from ..layers.attention import Attention
+from ..layers.linear import ColumnLinear
+from ..logger import logger
 from ..mapping import Mapping
 from ..module import Module, ModuleList
 from ..quantization import QuantMode
+from ..quantization.layers import FP8Linear
+from ..quantization.mode import W8A8_SQ_PLUGIN_LIST
 from ..quantization.quantize import quantize
 from .generation_mixin import GenerationMixin
+
+WEIGHT_LOADER_MODELS = {"PhiForCausalLM"}
 
 
 @dataclasses.dataclass
@@ -32,7 +39,16 @@ class QuantizationConfig:
     has_zero_point: Optional[bool] = False
     pre_quant_scale: Optional[bool] = False
     exclude_modules: Optional[List[str]] = None
-    sq_use_plugin: Optional[bool] = False
+
+    @property
+    def use_plugin_sq(self):
+        return self.quant_algo in W8A8_SQ_PLUGIN_LIST
+
+
+def default_weight_loader(mapping: Mapping, param: torch.Tensor,
+                          loaded_weight: torch.Tensor) -> None:
+    """Default weight loader."""
+    param.value = loaded_weight
 
 
 class PretrainedConfig:
@@ -316,6 +332,7 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
                                    device='cpu') as f:
             for key in f.keys():
                 weights[key] = f.get_tensor(key)
+
         model.load(weights)
 
         return model
@@ -323,16 +340,49 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
     def load(self, weights):
         expected_names = set([name for name, param in self.named_parameters()])
         provided_names = set(weights.keys())
-        if provided_names != expected_names:
-            err_msg = "Provided tensor names are different from those expected by the engine."
-            if expected_names.difference(provided_names):
-                err_msg += f"\nExpected but not provided tensors: {expected_names.difference(provided_names)}"
-            if provided_names.difference(expected_names):
-                err_msg += f"\nProvided but not expected tensors: {provided_names.difference(expected_names)}"
-            raise RuntimeError(err_msg)
+        assert expected_names.issubset(
+            provided_names
+        ), f"Expected but not provided tensors:{expected_names.difference(provided_names)}"
 
-        for name, param in self.named_parameters():
-            param.value = weights[name]
+        if self.config.architecture in WEIGHT_LOADER_MODELS:
+            mapping = self.config.mapping
+            for name, param in self.named_parameters():
+                weight_loader = getattr(param, "weight_loader",
+                                        default_weight_loader)
+                weight_loader(mapping, param, weights[name])
+        else:
+            for name, param in self.named_parameters():
+                try:
+                    param.value = weights[name]
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Encounter error '{e}' for parameter '{name}'")
+
+    def load_partial_weights(self, weights: dict):
+        params = {name: param for name, param in self.named_parameters()}
+        mapping = self.config.mapping
+
+        for k, v in weights.items():
+            if k in params.keys():
+                param = params[k]
+                weight_loader = getattr(param, "weight_loader",
+                                        default_weight_loader)
+                weight_loader(mapping, param, v)
+            elif mapping.pp_size == 1:
+                logger.warning(f"Provided but not expected tensors: {k}")
+
+    def save_checkpoint(self, output_dir, save_config=True):
+        # multiple ranks could share same config.json, so adding a save_config parameter to let user avoiding writing config.json in all ranks
+        rank = self.config.mapping.rank
+        weights = {
+            name: numpy_to_torch(param.raw_value)
+            for name, param in self.named_parameters()
+        }
+        from safetensors.torch import save_file
+        save_file(weights, os.path.join(output_dir, f'rank{rank}.safetensors'))
+        if save_config:
+            with open(os.path.join(output_dir, 'config.json'), 'w') as f:
+                json.dump(self.config.to_dict(), f, indent=4)
 
     def prepare_inputs(self,
                        max_batch_size,
@@ -592,7 +642,61 @@ def fuse_gate_mlp(model):
     return model
 
 
-def optimize_model(model, use_fused_mlp=False):
+def unfuse_qkv_gemm(model):
+    for name, layer in model.named_modules(remove_duplicate=True):
+        if isinstance(layer, Attention) and not layer.cross_attention:
+            assert layer.tp_size == 1, "please disable manual tp when enable auto parallel"
+            if layer.unfuse_qkv_gemm:
+                continue
+            layer.unfuse_qkv_gemm = True
+            linear_class = FP8Linear if layer.use_fp8_qdq else ColumnLinear
+            q = linear_class(layer.hidden_size,
+                             layer.attention_hidden_size,
+                             bias=layer.bias,
+                             dtype=layer.dtype,
+                             gather_output=False)
+            k = linear_class(layer.hidden_size,
+                             layer.num_attention_kv_heads *
+                             layer.attention_head_size,
+                             bias=layer.bias,
+                             dtype=layer.dtype,
+                             gather_output=False)
+            v = linear_class(layer.hidden_size,
+                             layer.num_attention_kv_heads *
+                             layer.attention_head_size,
+                             bias=layer.bias,
+                             dtype=layer.dtype,
+                             gather_output=False)
+            if layer.qkv.weight.is_inited():
+                qkv_weight = layer.qkv.weight.raw_value
+                weights = np.split(qkv_weight, [
+                    q.out_features,
+                    q.out_features + k.out_features,
+                ])
+                for gemm, weight in zip([q, k, v], weights):
+                    gemm.weight.value = weight
+            if layer.qkv.bias is not None and layer.qkv.bias.is_inited():
+                qkv_bias = layer.qkv.bias.raw_value
+                biases = np.split(qkv_bias, [
+                    q.out_features,
+                    q.out_features + k.out_features,
+                ])
+                for gemm, bias in zip([q, k, v], biases):
+                    gemm.bias.value = bias
+            for name, parameter in layer.qkv._parameters.items():
+                if name not in ["weight", "bias"]:
+                    for gemm in [q, k, v]:
+                        setattr(gemm, name, parameter)
+            layer.q = q
+            layer.k = k
+            layer.v = v
+            layer.qkv = None
+    return model
+
+
+def optimize_model(model, use_fused_mlp=False, use_unfused_qkv_gemm=False):
     if use_fused_mlp:
         model = fuse_gate_mlp(model)
+    if use_unfused_qkv_gemm:
+        model = unfuse_qkv_gemm(model)
     return model

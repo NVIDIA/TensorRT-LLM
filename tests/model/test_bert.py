@@ -12,8 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
-import sys
 import tempfile
 import unittest
 from collections import OrderedDict
@@ -27,6 +25,9 @@ import parameterized
 import torch
 import tensorrt as trt
 # isort: on
+import os
+import sys
+
 from parameterized import parameterized
 
 import tensorrt_llm
@@ -37,12 +38,12 @@ from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.runtime import TensorInfo
 
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.util import skip_fp32_accum_pre_ampere, unittest_name_func
+
 from transformers import AutoTokenizer  # isort:skip
 from transformers import BertConfig, BertPreTrainedModel, BertForQuestionAnswering, BertForSequenceClassification, BertModel  # isort:skip
 from transformers import RobertaConfig, RobertaPreTrainedModel, RobertaForQuestionAnswering, RobertaForSequenceClassification, RobertaModel  # isort:skip
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import getSMVersion
 
 
 def extract_layer_idx(name):
@@ -226,20 +227,11 @@ class TestBert(unittest.TestCase):
 
         return test_cases
 
-    def custom_name_func(testcase_func, param_num, param):
-        return "%s_%s" % (
-            testcase_func.__name__,
-            parameterized.to_safe_name("_".join(str(x) for x in param.args)),
-        )
-
-    @parameterized.expand(load_test_cases, name_func=custom_name_func)
+    @parameterized.expand(load_test_cases, name_func=unittest_name_func)
     def test_bert(self, model, use_refit, use_plugin, fast_building,
                   context_fmha_type, dtype, model_dir):
-        if getSMVersion() < 80:
-            if context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
-                self.skipTest(
-                    "ContextFMHAType with fp32 acc is not supported in pre-ampere architecture"
-                )
+
+        skip_fp32_accum_pre_ampere(context_fmha_type)
 
         tensorrt_llm.logger.set_level('error')
         if 'Roberta' in model:

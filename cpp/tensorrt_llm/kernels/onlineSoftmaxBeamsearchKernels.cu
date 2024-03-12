@@ -25,17 +25,16 @@ namespace kernels
 {
 
 template <typename T, int MAX_K>
-void topK_softMax_kernelLauncher(const T* log_probs, const T* bias, const FinishedState* finished, float* cum_log_probs,
-    void* temp_storage, const int temp_storage_size, BeamHypotheses& beam_hyps, cudaStream_t stream);
+void topK_softMax_kernelLauncher(T const* log_probs, T const* bias, void* temp_storage, int const temp_storage_size,
+    BeamHypotheses& beam_hyps, cudaStream_t stream);
 
 #define CASE_K(MAX_K)                                                                                                  \
-    topK_softMax_kernelLauncher<T, MAX_K>(                                                                             \
-        log_probs, bias, finished, cum_log_probs, temp_storage, temp_storage_size, beam_hyps, stream);                 \
+    topK_softMax_kernelLauncher<T, MAX_K>(log_probs, bias, temp_storage, temp_storage_size, beam_hyps, stream);        \
     break;
 
 template <typename T>
-void invokeTopkSoftMax(const T* log_probs, const T* bias, const FinishedState* finished, float* cum_log_probs,
-    void* temp_storage, const int temp_storage_size, BeamHypotheses& beam_hyps, cudaStream_t stream)
+void invokeTopkSoftMax(T const* log_probs, T const* bias, void* temp_storage, int const temp_storage_size,
+    BeamHypotheses& beam_hyps, cudaStream_t stream)
 {
     int log_beam_width(0);
     int recursor(beam_hyps.beam_width - 1);
@@ -44,9 +43,8 @@ void invokeTopkSoftMax(const T* log_probs, const T* bias, const FinishedState* f
 
     switch (log_beam_width)
     {
-    // 0 < beam_width <= 4
-    case 0:        // 1, 2
-    case 1:        // 3, 4
+    case 0:
+    case 1:        // 0 < beam_width <= 4
         CASE_K(4)
     case 2:        // 4 < beam_width <= 8
         CASE_K(8)
@@ -66,13 +64,11 @@ void invokeTopkSoftMax(const T* log_probs, const T* bias, const FinishedState* f
 
 #undef CASE_K
 
-template void invokeTopkSoftMax<float>(const float* log_probs, const float* bias, const FinishedState* finished,
-    float* cum_log_probs, void* tmp_storage, const int temp_storage_size, BeamHypotheses& beam_hyps,
-    cudaStream_t stream);
+template void invokeTopkSoftMax<float>(float const* log_probs, float const* bias, void* tmp_storage,
+    int const temp_storage_size, BeamHypotheses& beam_hyps, cudaStream_t stream);
 
-template void invokeTopkSoftMax<half>(const half* log_probs, const half* bias, const FinishedState* finished,
-    float* cum_log_probs, void* tmp_storage, const int temp_storage_size, BeamHypotheses& beam_hyps,
-    cudaStream_t stream);
+template void invokeTopkSoftMax<half>(half const* log_probs, half const* bias, void* tmp_storage,
+    int const temp_storage_size, BeamHypotheses& beam_hyps, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm

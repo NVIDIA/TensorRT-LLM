@@ -43,7 +43,7 @@ namespace tensorrt_llm::tests::layers::sampling
 constexpr float EPSILON = 1e-20f;
 
 template <typename T>
-void computeProb(T* probs, const T* logits, int batchSize, int vocabSize)
+void computeProb(T* probs, T const* logits, int batchSize, int vocabSize)
 {
     // Compute the log probability from logits.
     //   logits = batchSize x vocabSize.

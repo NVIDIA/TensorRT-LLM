@@ -159,8 +159,8 @@ void SamplingLayer<T>::forward(DecodingOutputParams& outputs, ForwardParams& inp
     auto const batchSize = inputs.logits.shape[0];
 
     auto logits = inputs.logits.template getPtr<T>();
-    auto endIds = inputs.end_ids.template getPtr<const int>();
-    auto batchSlots = inputs.batch_slots ? inputs.batch_slots->template getPtr<const int>() : nullptr;
+    auto endIds = inputs.end_ids.template getPtr<int const>();
+    auto batchSlots = inputs.batch_slots ? inputs.batch_slots->template getPtr<int const>() : nullptr;
     float* cumLogProbs = (outputs.cum_log_probs) ? outputs.cum_log_probs->template getPtr<float>() : nullptr;
     float* outputLogProbs = (outputs.output_log_probs) ? outputs.output_log_probs->template getPtr<float>() : nullptr;
 
@@ -170,7 +170,7 @@ void SamplingLayer<T>::forward(DecodingOutputParams& outputs, ForwardParams& inp
 
     std::vector<int32_t> batchSlotsVec(batchSize);
     std::iota(batchSlotsVec.begin(), batchSlotsVec.end(), 0);
-    auto batchSlotsHost = inputs.batch_slots ? inputs.batch_slots->template getPtr<const int>() : batchSlotsVec.data();
+    auto batchSlotsHost = inputs.batch_slots ? inputs.batch_slots->template getPtr<int const>() : batchSlotsVec.data();
 
     bool skipTopK = !mDecodingMode.isTopK();
     if (!skipTopK)

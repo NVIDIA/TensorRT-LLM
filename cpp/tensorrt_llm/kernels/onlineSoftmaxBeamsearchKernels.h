@@ -24,8 +24,8 @@ namespace kernels
 {
 
 template <typename T>
-void invokeTopkSoftMax(const T* log_probs, const T* bias, const FinishedState* finished, float* cum_log_probs,
-    void* tmp_storage, const int temp_storage_size, BeamHypotheses& beam_hyps, cudaStream_t stream);
+void invokeTopkSoftMax(T const* log_probs, T const* bias, void* tmp_storage, int const temp_storage_size,
+    BeamHypotheses& beam_hyps, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm

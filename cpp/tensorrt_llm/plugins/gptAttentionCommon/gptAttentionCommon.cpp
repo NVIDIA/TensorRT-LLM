@@ -66,13 +66,13 @@ struct SATypeConverter<half>
 template <typename T, typename KVCacheBuffer>
 struct FusedQKVMaskedAttentionDispatchParams
 {
-    const T* qkv_buf;
-    const T* qkv_bias;
-    const T* relative_attention_bias;
-    const int* cache_indir;
+    T const* qkv_buf;
+    T const* qkv_bias;
+    T const* relative_attention_bias;
+    int const* cache_indir;
     T* context_buf;
-    const bool* finished;
-    const int* sequence_lengths;
+    bool const* finished;
+    int const* sequence_lengths;
     int max_batch_size;
     int inference_batch_size;
     int beam_width;
@@ -89,16 +89,16 @@ struct FusedQKVMaskedAttentionDispatchParams
     int max_attention_window;
     int cyclic_attention_window_size;
     int sink_token_length;
-    const int* input_lengths;
+    int const* input_lengths;
     int step;
     float q_scaling;
     int relative_attention_bias_stride;
-    const T* linear_bias_slopes;
-    const int* ia3_tasks;
-    const T* ia3_key_weights;
-    const T* ia3_value_weights;
-    const float* qkv_scale_out;
-    const float* attention_out_scale;
+    T const* linear_bias_slopes;
+    int const* ia3_tasks;
+    T const* ia3_key_weights;
+    T const* ia3_value_weights;
+    float const* qkv_scale_out;
+    float const* attention_out_scale;
     bool mUnfuseQkvGemm;
     tc::QuantMode quant_option;
     bool multi_block_mode;
@@ -108,14 +108,14 @@ struct FusedQKVMaskedAttentionDispatchParams
     float* partial_sum;
     float* partial_max;
     int* block_counter;
-    const float* kv_scale_orig_quant;
-    const float* kv_scale_quant_orig;
+    float const* kv_scale_orig_quant;
+    float const* kv_scale_quant_orig;
     tc::QuantMode kv_cache_quant_mode;
     int multi_processor_count;
     KVCacheBuffer kv_block_array;
     KVLinearBuffer shift_k_cache_buffer;
     bool cross_attention = false;
-    const int* memory_length_per_sample = nullptr;
+    int const* memory_length_per_sample = nullptr;
     int max_distance = 0;
 };
 
@@ -158,7 +158,7 @@ struct ConvertMMHAToXQAParamsHelper<__nv_bfloat16, KVBlockArray>
 
 template <typename T, typename KVCacheBuffer>
 bool GPTAttentionPluginCommon::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams& xqaParams,
-    const EnqueueGenerationParams<T, KVCacheBuffer>& generationsParams, bool forConfigurePlugin)
+    EnqueueGenerationParams<T, KVCacheBuffer> const& generationsParams, bool forConfigurePlugin)
 {
     bool retval = ConvertMMHAToXQAParamsHelper<T, KVCacheBuffer>::supported;
     if (!retval)
@@ -242,7 +242,7 @@ bool GPTAttentionPluginCommon::convertMMHAParamsToXQAParams(tensorrt_llm::kernel
 
 template <typename T_MMHA, typename T, typename KVCacheBuffer, bool CROSS_ATTENTION>
 void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS_ATTENTION>& params,
-    const FusedQKVMaskedAttentionDispatchParams<T, KVCacheBuffer>& input_params, cudaStream_t stream)
+    FusedQKVMaskedAttentionDispatchParams<T, KVCacheBuffer> const& input_params, cudaStream_t stream)
 {
     using DataType = typename SATypeConverter<T>::Type;
 
@@ -253,9 +253,9 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
     int hidden_units_kv = input_params.kv_head_num * input_params.size_per_head;
     if (input_params.qkv_bias != nullptr)
     {
-        params.q_bias = reinterpret_cast<const DataType*>(input_params.qkv_bias);
-        params.k_bias = reinterpret_cast<const DataType*>(input_params.qkv_bias) + hidden_units;
-        params.v_bias = reinterpret_cast<const DataType*>(input_params.qkv_bias) + hidden_units + hidden_units_kv;
+        params.q_bias = reinterpret_cast<DataType const*>(input_params.qkv_bias);
+        params.k_bias = reinterpret_cast<DataType const*>(input_params.qkv_bias) + hidden_units;
+        params.v_bias = reinterpret_cast<DataType const*>(input_params.qkv_bias) + hidden_units + hidden_units_kv;
     }
     else
     {
@@ -268,9 +268,9 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
     params.out = reinterpret_cast<DataType*>(input_params.context_buf);
 
     // Set the input buffers.
-    params.q = reinterpret_cast<const DataType*>(input_params.qkv_buf);
-    params.k = reinterpret_cast<const DataType*>(input_params.qkv_buf) + hidden_units;
-    params.v = reinterpret_cast<const DataType*>(input_params.qkv_buf) + hidden_units + hidden_units_kv;
+    params.q = reinterpret_cast<DataType const*>(input_params.qkv_buf);
+    params.k = reinterpret_cast<DataType const*>(input_params.qkv_buf) + hidden_units;
+    params.v = reinterpret_cast<DataType const*>(input_params.qkv_buf) + hidden_units + hidden_units_kv;
 
     params.int8_kv_cache = input_params.kv_cache_quant_mode.hasInt8KvCache();
     params.fp8_kv_cache = input_params.kv_cache_quant_mode.hasFp8KvCache();
@@ -305,20 +305,20 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
     // Note: keep norm factor (sqrt(K_dim)) when adopting megatron T5 structure (may adjust)
     params.inv_sqrt_dh = 1.F / (sqrtf((float) params.hidden_size_per_head) * input_params.q_scaling);
 
-    params.relative_attention_bias = reinterpret_cast<const DataType*>(input_params.relative_attention_bias);
+    params.relative_attention_bias = reinterpret_cast<DataType const*>(input_params.relative_attention_bias);
     params.relative_attention_bias_stride = input_params.relative_attention_bias_stride;
     params.max_distance = input_params.max_distance;
 
     // The slope of linear position bias per head, e.g., ALiBi.
     if (input_params.linear_bias_slopes != nullptr)
     {
-        params.linear_bias_slopes = reinterpret_cast<const DataType*>(input_params.linear_bias_slopes);
+        params.linear_bias_slopes = reinterpret_cast<DataType const*>(input_params.linear_bias_slopes);
     }
     params.input_lengths = input_params.input_lengths;
 
     params.ia3_tasks = input_params.ia3_tasks;
-    params.ia3_key_weights = reinterpret_cast<const DataType*>(input_params.ia3_key_weights);
-    params.ia3_value_weights = reinterpret_cast<const DataType*>(input_params.ia3_value_weights);
+    params.ia3_key_weights = reinterpret_cast<DataType const*>(input_params.ia3_key_weights);
+    params.ia3_value_weights = reinterpret_cast<DataType const*>(input_params.ia3_value_weights);
 
     if (input_params.quant_option.hasStaticActivationScaling())
     {
@@ -464,7 +464,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads,
     }
 }
 
-const int GPTAttentionPluginCommon::getHeadSize(bool checkInit) const
+int const GPTAttentionPluginCommon::getHeadSize(bool checkInit) const
 {
     if (checkInit)
     {
@@ -474,9 +474,9 @@ const int GPTAttentionPluginCommon::getHeadSize(bool checkInit) const
 }
 
 // Parameterized constructor
-GPTAttentionPluginCommon::GPTAttentionPluginCommon(const void* data, size_t length)
+GPTAttentionPluginCommon::GPTAttentionPluginCommon(void const* data, size_t length)
 {
-    const char *d = reinterpret_cast<const char*>(data), *a = d;
+    char const *d = reinterpret_cast<char const*>(data), *a = d;
     unsigned int kvCacheQuantMode;
 
     read(d, mLayerIdx);
@@ -529,15 +529,15 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForContext(nvinfer1::DataType t
     int32_t input_seq_length, int32_t max_attention_window, int32_t cross_qkv_length,
     int32_t max_num_tokens) const noexcept
 {
-    const int local_hidden_units_qo = mNumHeads * getHeadSize();
-    const int local_hidden_units_kv = mNumKVHeads * getHeadSize();
-    const bool chunked_context_support = mEnableContextFMHA && mPagedKVCache && mPagedContextFMHA;
+    int const local_hidden_units_qo = mNumHeads * getHeadSize();
+    int const local_hidden_units_kv = mNumKVHeads * getHeadSize();
+    bool const chunked_context_support = mEnableContextFMHA && mPagedKVCache && mPagedContextFMHA;
 
     auto const size = tensorrt_llm::runtime::BufferDataType(type).getSize();
 
     size_t context_workspace_size = 0;
 
-    const int batch_size = nbReq;
+    int const batch_size = nbReq;
     const size_t attention_mask_size = mEnableContextFMHA
         ? 0
         : size * batch_size * input_seq_length * (isCrossAttention() ? cross_qkv_length : input_seq_length);
@@ -564,7 +564,7 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForContext(nvinfer1::DataType t
         ? batch_size * 2 * TMA_DESC_SIZE_IN_BYTE * tc::divUp(max_attention_window, mTokensPerBlock)
         : 0;
 
-    const int NUM_BUFFERS = 12;
+    int const NUM_BUFFERS = 12;
     size_t workspaces[NUM_BUFFERS];
     workspaces[0] = CUBLAS_WORKSPACE_SIZE;
     workspaces[1] = attention_mask_size;
@@ -585,15 +585,15 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForContext(nvinfer1::DataType t
 size_t GPTAttentionPluginCommon::getWorkspaceSizeForGeneration(
     nvinfer1::DataType type, int32_t total_num_seq, int32_t max_attention_window) const noexcept
 {
-    const int local_hidden_units_qo = mNumHeads * getHeadSize();
-    const int local_hidden_units_kv = mNumKVHeads * getHeadSize();
+    int const local_hidden_units_qo = mNumHeads * getHeadSize();
+    int const local_hidden_units_kv = mNumKVHeads * getHeadSize();
 
     auto const size = tensorrt_llm::runtime::BufferDataType(type).getSize();
 
     size_t context_workspace_size = 0;
     size_t generation_workspace_size = 0;
 
-    const int batch_beam = total_num_seq;
+    int const batch_beam = total_num_seq;
     int32_t const maxSeqLenTile
         = std::max(getMaxNumSeqLenTile(batch_beam), (int) tc::divUp(mMultiProcessorCount, mNumHeads));
 
@@ -605,7 +605,7 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForGeneration(
         ? 0
         : size * batch_beam * mNumHeads * mHeadSize * max_attention_window;
 
-    const int NUM_BUFFERS = 5;
+    int const NUM_BUFFERS = 5;
     size_t workspaces[NUM_BUFFERS];
     workspaces[0] = partial_out_size;
     workspaces[1] = partial_sum_size;
@@ -638,20 +638,20 @@ int GPTAttentionPluginCommon::getMaxNumSeqLenTile(int batch_beam_size) const
 }
 
 template <typename T, typename KVCacheBuffer>
-int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCacheBuffer>& params, cudaStream_t stream)
+int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuffer> const& params, cudaStream_t stream)
 {
-    const int num_heads = mNumHeads;
-    const int num_kv_heads = mNumKVHeads;
-    const int head_size = getHeadSize();
-    const int local_hidden_units_qo = num_heads * head_size;
-    const int local_hidden_units_kv = num_kv_heads * head_size;
+    int const num_heads = mNumHeads;
+    int const num_kv_heads = mNumKVHeads;
+    int const head_size = getHeadSize();
+    int const local_hidden_units_qo = num_heads * head_size;
+    int const local_hidden_units_kv = num_kv_heads * head_size;
     const PositionEmbeddingType position_embedding_type = mPositionEmbeddingType;
-    const float q_scaling = mQScaling;
-    const bool* finished = nullptr;
-    const bool has_ia3 = false;
+    float const q_scaling = mQScaling;
+    bool const* finished = nullptr;
+    bool const has_ia3 = false;
 
     KVCacheBuffer kv_cache_buffer;
-    const auto elem_size = mKVCacheQuantMode.hasKvCacheQuant() ? sizeof(int8_t) : sizeof(T);
+    auto const elem_size = mKVCacheQuantMode.hasKvCacheQuant() ? sizeof(int8_t) : sizeof(T);
     int64_t* host_kv_cache_block_ptrs = nullptr;
     if (mPagedKVCache)
     {
@@ -670,16 +670,16 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
         kv_cache_buffer.data = reinterpret_cast<BufferDataType*>(params.key_value_cache);
     }
 
-    const auto quant_option = tc::QuantMode::fromDescription();
-    const float* qkv_scale_out = nullptr;
-    const float* attention_out_scale = nullptr;
+    auto const quant_option = tc::QuantMode::fromDescription();
+    float const* qkv_scale_out = nullptr;
+    float const* attention_out_scale = nullptr;
 
-    const int* ia3_tasks = nullptr;
-    const T* ia3_key_weights = nullptr;
-    const T* ia3_value_weights = nullptr;
+    int const* ia3_tasks = nullptr;
+    T const* ia3_key_weights = nullptr;
+    T const* ia3_value_weights = nullptr;
 
-    const bool multi_block_mode = false;
-    const int max_seq_len_tile = 0;
+    bool const multi_block_mode = false;
+    int const max_seq_len_tile = 0;
     T* partial_out = nullptr;
     float* partial_sum = nullptr;
     float* partial_max = nullptr;
@@ -731,7 +731,7 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
         ? params.batch_size * 2 * TMA_DESC_SIZE_IN_BYTE * params.max_blocks_per_sequence
         : 0;
 
-    const bool is_qk_buf_float_ = true;
+    bool const is_qk_buf_float_ = true;
 
     // Workspace pointer shift
     int8_t* workspace_byte_ptr = reinterpret_cast<int8_t*>(params.workspace);
@@ -805,15 +805,15 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
         : (mKVCacheQuantMode.hasFp8KvCache() ? KvCacheDataType::FP8 : KvCacheDataType::BASE);
 
     const cudaDataType_t gemm_data_type = tc::CudaDataType<T>::value;
-    const int attention_seq_len_1 = params.input_seq_length;                                                // q length
-    const int attention_seq_len_2 = isCrossAttention() ? params.cross_qkv_length : params.input_seq_length; // kv length
+    int const attention_seq_len_1 = params.input_seq_length;                                                // q length
+    int const attention_seq_len_2 = isCrossAttention() ? params.cross_qkv_length : params.input_seq_length; // kv length
 
     // If the model has relative attentiona bias, q scaling should be applied in QK gemm stage and use 1 in
     // softamax stage (because to get softmax[scale(Q*K) + rel pos bias] here, q_scaling can't be applied during
     // softmax phase by qk_scale); otherwise, use 1 in gemm stage and apply scaling in softmax stage
-    const float qk_scale
+    float const qk_scale
         = 1.0f / (sqrtf(getHeadSize() * 1.0f) * q_scaling); // q_scaling in denominator. by default q_scaling =1.0f
-    const float qk_scale_gemm = isRelativePosition() ? qk_scale : 1.0f;
+    float const qk_scale_gemm = isRelativePosition() ? qk_scale : 1.0f;
     const T qk_scale_softmax = static_cast<T>(isRelativePosition() ? 1.0f : qk_scale);
 
     // in context phase, currently FMHA runner has two restrictions:
@@ -822,7 +822,7 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
     // We update mEnableContextFMHA in constructor to check these conditions
     if (mEnableContextFMHA)
     {
-        const bool enablePagedKVContextFMHA = mPagedKVCache && mPagedContextFMHA;
+        bool const enablePagedKVContextFMHA = mPagedKVCache && mPagedContextFMHA;
         // Paged Context FMHA doesn't work with fp8/int8 kv cache currently.
         TLLM_CHECK_WITH_INFO(cache_type == KvCacheDataType::BASE || !enablePagedKVContextFMHA,
             "Paged Context FMHA doesn't work with fp8/int8 kv cache currently.");
@@ -866,7 +866,7 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
         {
             // the token will pay attention to previous tokens while starting from max(0, rowIdx -
             // cyclic_attention_window_size);
-            const int attention_window_size
+            int const attention_window_size
                 = mDenseContextFMHA ? params.num_tokens : params.cyclic_attention_window_size;
             mFMHARunner->setup(params.batch_size, params.input_seq_length, attention_window_size, params.num_tokens,
                 isALiBi(), isAliBiWithScale(), mTpSize, mTpRank);
@@ -922,10 +922,10 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
         }
         sync_check_cuda_error();
 
-        const T* linear_bias_slopes = isALiBi() ? params.alibi_slopes : nullptr;
-        const T* relative_attention_bias = isRelativePosition() ? params.relative_attention_bias : nullptr;
-        const int relative_attention_bias_stride = isRelativePosition() ? params.relative_attention_bias_stride : 0;
-        const int max_distance = mMaxDistance;
+        T const* linear_bias_slopes = isALiBi() ? params.alibi_slopes : nullptr;
+        T const* relative_attention_bias = isRelativePosition() ? params.relative_attention_bias : nullptr;
+        int const relative_attention_bias_stride = isRelativePosition() ? params.relative_attention_bias_stride : 0;
+        int const max_distance = mMaxDistance;
         cudaDataType_t gemm_out_data_type = is_qk_buf_float_ ? CUDA_R_32F : gemm_data_type;
         void* gemm_out_buf_ = is_qk_buf_float_ ? static_cast<void*>(qk_buf_float_) : static_cast<void*>(qk_buf_);
         if (mNumKVHeads == 1) // MQA
@@ -974,12 +974,12 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
             // Since the KV stride is NOT fixed for all Q, we have 2 options:
             //  1. Loop over stridedBatchedGemm for each KV head. (multiple API calls/cuda kernels)
             //  2. Calculate the pointers and use batchedGemm() (extra device memory) ::TODO::
-            const int num_qheads_per_kv_head = mNumHeads / mNumKVHeads;
+            int const num_qheads_per_kv_head = mNumHeads / mNumKVHeads;
             for (int ki = 0; ki < mNumKVHeads; ++ki)
             {
                 T* qptr = q_buf_2_ + (ki * num_qheads_per_kv_head * attention_seq_len_1 * getHeadSize());
                 T* kptr = k_buf_2_ + (ki * attention_seq_len_2 * getHeadSize());
-                const int qk_offset = ki * attention_seq_len_1 * num_qheads_per_kv_head * attention_seq_len_2;
+                int const qk_offset = ki * attention_seq_len_1 * num_qheads_per_kv_head * attention_seq_len_2;
                 void* qkptr = is_qk_buf_float_ ? static_cast<void*>(qk_buf_float_ + qk_offset)
                                                : static_cast<void*>(qk_buf_ + qk_offset);
                 mCublasWrapper->stridedBatchedGemm(CUBLAS_OP_T, CUBLAS_OP_N,
@@ -1092,7 +1092,7 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
             // Attn_weight[b, h*s_q, s_k]
             // O[b, h*s_q, d] = Attn_weight[b, h*s_q, s_k] * V[b, s_k, d]
             // O'[b, d, h*s_q] = V'[b, d, s_k] * Attn_weight'[b, s_k, h*s_q]
-            const int num_qheads_per_kv_head = mNumHeads / mNumKVHeads;
+            int const num_qheads_per_kv_head = mNumHeads / mNumKVHeads;
             for (int ki = 0; ki < mNumKVHeads; ++ki)
             {
                 T* qkptr = qk_buf_ + (ki * num_qheads_per_kv_head * attention_seq_len_1 * attention_seq_len_2);
@@ -1133,60 +1133,60 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
 }
 
 template int GPTAttentionPluginCommon::enqueueContext<half, KVLinearBuffer>(
-    const EnqueueContextParams<half, KVLinearBuffer>& params, cudaStream_t stream);
+    EnqueueContextParams<half, KVLinearBuffer> const& params, cudaStream_t stream);
 
 template int GPTAttentionPluginCommon::enqueueContext<float, KVLinearBuffer>(
-    const EnqueueContextParams<float, KVLinearBuffer>& params, cudaStream_t stream);
+    EnqueueContextParams<float, KVLinearBuffer> const& params, cudaStream_t stream);
 
 #ifdef ENABLE_BF16
 template int GPTAttentionPluginCommon::enqueueContext<__nv_bfloat16, KVLinearBuffer>(
-    const EnqueueContextParams<__nv_bfloat16, KVLinearBuffer>& params, cudaStream_t stream);
+    EnqueueContextParams<__nv_bfloat16, KVLinearBuffer> const& params, cudaStream_t stream);
 #endif
 
 template int GPTAttentionPluginCommon::enqueueContext<half, KVBlockArray>(
-    const EnqueueContextParams<half, KVBlockArray>& params, cudaStream_t stream);
+    EnqueueContextParams<half, KVBlockArray> const& params, cudaStream_t stream);
 
 template int GPTAttentionPluginCommon::enqueueContext<float, KVBlockArray>(
-    const EnqueueContextParams<float, KVBlockArray>& params, cudaStream_t stream);
+    EnqueueContextParams<float, KVBlockArray> const& params, cudaStream_t stream);
 
 #ifdef ENABLE_BF16
 template int GPTAttentionPluginCommon::enqueueContext<__nv_bfloat16, KVBlockArray>(
-    const EnqueueContextParams<__nv_bfloat16, KVBlockArray>& params, cudaStream_t stream);
+    EnqueueContextParams<__nv_bfloat16, KVBlockArray> const& params, cudaStream_t stream);
 #endif
 
 bool GPTAttentionPluginCommon::mForceMultiBlockWarned = false;
 
 template <typename T, typename KVCacheBuffer>
 int GPTAttentionPluginCommon::enqueueGeneration(
-    const EnqueueGenerationParams<T, KVCacheBuffer>& params, cudaStream_t stream)
+    EnqueueGenerationParams<T, KVCacheBuffer> const& params, cudaStream_t stream)
 {
-    const int step = params.past_kv_length + 1;
+    int const step = params.past_kv_length + 1;
 
-    const int num_heads = mNumHeads;
-    const int num_kv_heads = mNumKVHeads;
-    const int head_size = getHeadSize();
-    const int local_hidden_units_qo = num_heads * head_size;
-    const int local_hidden_units_kv = num_kv_heads * head_size;
+    int const num_heads = mNumHeads;
+    int const num_kv_heads = mNumKVHeads;
+    int const head_size = getHeadSize();
+    int const local_hidden_units_qo = num_heads * head_size;
+    int const local_hidden_units_kv = num_kv_heads * head_size;
     const PositionEmbeddingType position_embedding_type = mPositionEmbeddingType;
-    const float q_scaling = mQScaling;
-    const T* relative_attention_bias = isRelativePosition() ? params.relative_attention_bias : nullptr;
-    const int relative_attention_bias_stride = isRelativePosition() ? params.relative_attention_bias_stride : 0;
-    const int max_distance = mMaxDistance;
-    const bool* finished = nullptr;
-    const bool has_ia3 = false;
+    float const q_scaling = mQScaling;
+    T const* relative_attention_bias = isRelativePosition() ? params.relative_attention_bias : nullptr;
+    int const relative_attention_bias_stride = isRelativePosition() ? params.relative_attention_bias_stride : 0;
+    int const max_distance = mMaxDistance;
+    bool const* finished = nullptr;
+    bool const has_ia3 = false;
 
-    const auto quant_option = tc::QuantMode::fromDescription();
-    const float* qkv_scale_out = nullptr;
-    const float* attention_out_scale = nullptr;
+    auto const quant_option = tc::QuantMode::fromDescription();
+    float const* qkv_scale_out = nullptr;
+    float const* attention_out_scale = nullptr;
 
-    const int* ia3_tasks = nullptr;
-    const T* ia3_key_weights = nullptr;
-    const T* ia3_value_weights = nullptr;
+    int const* ia3_tasks = nullptr;
+    T const* ia3_key_weights = nullptr;
+    T const* ia3_value_weights = nullptr;
 
     int32_t const batch_beam = params.beam_width * params.num_requests;
 
     KVCacheBuffer kv_cache_buffer;
-    const auto elem_size = mKVCacheQuantMode.hasKvCacheQuant() ? sizeof(int8_t) : sizeof(T);
+    auto const elem_size = mKVCacheQuantMode.hasKvCacheQuant() ? sizeof(int8_t) : sizeof(T);
     if (useKVCache())
     {
         if (mPagedKVCache)
@@ -1229,7 +1229,7 @@ int GPTAttentionPluginCommon::enqueueGeneration(
     }
 
     int timestep = params.past_kv_length;
-    const int max_timesteps = mCrossAttention ? params.cyclic_attention_window_size
+    int const max_timesteps = mCrossAttention ? params.cyclic_attention_window_size
                                               : std::min(timestep, params.cyclic_attention_window_size);
     int estimated_min_multi_block_count
         = estimate_min_multi_block_count<T>(max_timesteps, mMaxSharedMemoryPerBlockOptin - 2048);
@@ -1248,7 +1248,7 @@ int GPTAttentionPluginCommon::enqueueGeneration(
     // Runtime check to see the actual number of blocks per sequence we need.
     int32_t const max_num_seq_len_tiles = std::max(getMaxNumSeqLenTile(batch_beam), estimated_min_multi_block_count);
     int32_t const min_num_seq_len_tiles = std::max(1, estimated_min_multi_block_count);
-    const bool enable_multi_block
+    bool const enable_multi_block
         = (mMultiBlockMode && max_num_seq_len_tiles > 1) || estimated_min_multi_block_count > 1;
     const size_t partial_out_size
         = enable_multi_block ? sizeof(T) * batch_beam * mNumHeads * mHeadSize * max_num_seq_len_tiles : 0;
@@ -1364,29 +1364,29 @@ int GPTAttentionPluginCommon::enqueueGeneration(
 }
 
 template int GPTAttentionPluginCommon::enqueueGeneration<half, KVLinearBuffer>(
-    const EnqueueGenerationParams<half, KVLinearBuffer>& params, cudaStream_t stream);
+    EnqueueGenerationParams<half, KVLinearBuffer> const& params, cudaStream_t stream);
 
 template int GPTAttentionPluginCommon::enqueueGeneration<float, KVLinearBuffer>(
-    const EnqueueGenerationParams<float, KVLinearBuffer>& params, cudaStream_t stream);
+    EnqueueGenerationParams<float, KVLinearBuffer> const& params, cudaStream_t stream);
 
 #ifdef ENABLE_BF16
 template int GPTAttentionPluginCommon::enqueueGeneration<__nv_bfloat16, KVLinearBuffer>(
-    const EnqueueGenerationParams<__nv_bfloat16, KVLinearBuffer>& params, cudaStream_t stream);
+    EnqueueGenerationParams<__nv_bfloat16, KVLinearBuffer> const& params, cudaStream_t stream);
 #endif
 
 template int GPTAttentionPluginCommon::enqueueGeneration<half, KVBlockArray>(
-    const EnqueueGenerationParams<half, KVBlockArray>& params, cudaStream_t stream);
+    EnqueueGenerationParams<half, KVBlockArray> const& params, cudaStream_t stream);
 
 template int GPTAttentionPluginCommon::enqueueGeneration<float, KVBlockArray>(
-    const EnqueueGenerationParams<float, KVBlockArray>& params, cudaStream_t stream);
+    EnqueueGenerationParams<float, KVBlockArray> const& params, cudaStream_t stream);
 
 #ifdef ENABLE_BF16
 template int GPTAttentionPluginCommon::enqueueGeneration<__nv_bfloat16, KVBlockArray>(
-    const EnqueueGenerationParams<__nv_bfloat16, KVBlockArray>& params, cudaStream_t stream);
+    EnqueueGenerationParams<__nv_bfloat16, KVBlockArray> const& params, cudaStream_t stream);
 #endif
 
 template <typename T, typename KVCacheBuffer>
-void GPTAttentionPluginCommon::prepareEnqueueGeneration(const EnqueueGenerationParams<T, KVCacheBuffer>& params)
+void GPTAttentionPluginCommon::prepareEnqueueGeneration(EnqueueGenerationParams<T, KVCacheBuffer> const& params)
 {
     // self attn
     XQAParams xqaParams{};
@@ -1399,25 +1399,25 @@ void GPTAttentionPluginCommon::prepareEnqueueGeneration(const EnqueueGenerationP
 }
 
 template void GPTAttentionPluginCommon::prepareEnqueueGeneration<half, KVLinearBuffer>(
-    const EnqueueGenerationParams<half, KVLinearBuffer>& params);
+    EnqueueGenerationParams<half, KVLinearBuffer> const& params);
 
 template void GPTAttentionPluginCommon::prepareEnqueueGeneration<float, KVLinearBuffer>(
-    const EnqueueGenerationParams<float, KVLinearBuffer>& params);
+    EnqueueGenerationParams<float, KVLinearBuffer> const& params);
 
 #ifdef ENABLE_BF16
 template void GPTAttentionPluginCommon::prepareEnqueueGeneration<__nv_bfloat16, KVLinearBuffer>(
-    const EnqueueGenerationParams<__nv_bfloat16, KVLinearBuffer>& params);
+    EnqueueGenerationParams<__nv_bfloat16, KVLinearBuffer> const& params);
 #endif
 
 template void GPTAttentionPluginCommon::prepareEnqueueGeneration<half, KVBlockArray>(
-    const EnqueueGenerationParams<half, KVBlockArray>& params);
+    EnqueueGenerationParams<half, KVBlockArray> const& params);
 
 template void GPTAttentionPluginCommon::prepareEnqueueGeneration<float, KVBlockArray>(
-    const EnqueueGenerationParams<float, KVBlockArray>& params);
+    EnqueueGenerationParams<float, KVBlockArray> const& params);
 
 #ifdef ENABLE_BF16
 template void GPTAttentionPluginCommon::prepareEnqueueGeneration<__nv_bfloat16, KVBlockArray>(
-    const EnqueueGenerationParams<__nv_bfloat16, KVBlockArray>& params);
+    EnqueueGenerationParams<__nv_bfloat16, KVBlockArray> const& params);
 #endif
 
 int GPTAttentionPluginCommon::initialize() noexcept
@@ -1595,7 +1595,7 @@ GPTAttentionPluginCreatorCommon::GPTAttentionPluginCreatorCommon()
     mFC.fields = mPluginAttributes.data();
 }
 
-const PluginFieldCollection* GPTAttentionPluginCreatorCommon::getFieldNames() noexcept
+PluginFieldCollection const* GPTAttentionPluginCreatorCommon::getFieldNames() noexcept
 {
     return &mFC;
 }

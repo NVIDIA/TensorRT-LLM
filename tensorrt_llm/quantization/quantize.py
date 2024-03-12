@@ -5,7 +5,7 @@ from .layers import (Int8SmoothQuantLinear, Int8SmoothQuantRowLinear,
                      WeightOnlyGroupwiseQuantColumnLinear,
                      WeightOnlyGroupwiseQuantRowLinear,
                      WeightOnlyQuantColumnLinear, WeightOnlyQuantRowLinear)
-from .mode import W4A8_AWQ, W4A16_AWQ
+from .mode import W4A8_AWQ, W4A16_AWQ, W8A8_SQ_PLUGIN_LIST
 
 
 def weight_only_quantize(model,
@@ -235,10 +235,8 @@ def smooth_quantize(model, quant_mode, use_plugin=False):
 
 def quantize(model, quant_mode, **kwargs):
     if quant_mode.has_act_and_weight_quant():
-        if 'sq_use_plugin' in kwargs and kwargs['sq_use_plugin']:
-            smooth_quantize(model, quant_mode, use_plugin=True)
-        else:
-            smooth_quantize(model, quant_mode)
+        use_plugin = kwargs.get('quant_algo', None) in W8A8_SQ_PLUGIN_LIST
+        smooth_quantize(model, quant_mode, use_plugin=use_plugin)
     elif quant_mode.is_weight_only():
         if quant_mode.has_per_group_scaling():
             quant_kwargs = {

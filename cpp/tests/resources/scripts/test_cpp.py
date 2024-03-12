@@ -389,8 +389,7 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
     benchmark_exe_dir = build_dir / "benchmarks"
     gpt_engine_dir = resources_dir / "models" / "rt_engine" / "gpt2"
     benchmark = [
-        str(benchmark_exe_dir / "gptSessionBenchmark"), "--model", "gpt",
-        "--engine_dir",
+        str(benchmark_exe_dir / "gptSessionBenchmark"), "--engine_dir",
         str(gpt_engine_dir / "fp16-plugin" / "tp1-pp1-gpu"), "--batch_size",
         "8", "--input_output_len", "10,20", "--duration", "10"
     ]
@@ -424,8 +423,7 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
         run_command(prepare_dataset, cwd=root_dir, timeout=300)
 
         benchmark = [
-            str(benchmark_exe_dir / "gptManagerBenchmark"), "--model", "gpt",
-            "--engine_dir",
+            str(benchmark_exe_dir / "gptManagerBenchmark"), "--engine_dir",
             str(gpt_engine_dir / "fp16-plugin-packed-paged" / "tp1-pp1-gpu"),
             "--type", "IFB", "--dataset",
             str(data_dir / tokens_f)
@@ -433,8 +431,7 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
         run_command(benchmark, cwd=root_dir, timeout=600)
 
         benchmark = [
-            str(benchmark_exe_dir / "gptManagerBenchmark"), "--model", "gpt",
-            "--engine_dir",
+            str(benchmark_exe_dir / "gptManagerBenchmark"), "--engine_dir",
             str(gpt_engine_dir / "fp16-plugin-packed-paged" / "tp1-pp1-gpu"),
             "--type", "V1", "--dataset",
             str(data_dir / tokens_f)
@@ -442,8 +439,7 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
         run_command(benchmark, cwd=root_dir, timeout=600)
 
     benchmark = [
-        str(benchmark_exe_dir / "gptManagerBenchmark"), "--model", "gpt",
-        "--engine_dir",
+        str(benchmark_exe_dir / "gptManagerBenchmark"), "--engine_dir",
         str(gpt_engine_dir / "fp16-plugin-packed-paged" / "tp1-pp1-gpu"),
         "--type", "IFB", "--static_emulated_batch_size", "50", "--dataset",
         str(data_dir / "prepared_dummy_cnn.json")

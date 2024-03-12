@@ -41,45 +41,15 @@ protected:
     using SamplingKernelTest<T>::mBufferManager;
 
 private:
-    size_t getWorkspaceSize(const SamplingKernelTestParam& params) override
+    size_t getWorkspaceSize(SamplingKernelTestParam const& params) override
     {
-        auto const maxBatchSize = 2 * params.batchSize;
-        size_t workspaceSize;
-        size_t cubTempStorageSize;
-        tk::invokeBatchTopPSampling<T>(nullptr, // workspace
-            workspaceSize, cubTempStorageSize,
-            nullptr,                            // output_ids
-            nullptr,                            // sequence_length
-            nullptr,                            // finished_buffer
-            nullptr,                            // finished_buffer
-            nullptr,                            // cum_log_probs
-            nullptr,                            // output_log_probs
-            nullptr,                            // log_probs
-            bufferCast<int32_t>(*this->mTopPIdValsDevice), bufferCast<int32_t>(*this->mEndOffsetsDevice),
-            bufferCast<int32_t>(*this->mBeginOffsetsDevice), this->mCurandStatesDevice, params.batchSize, maxBatchSize,
-            params.vocabSize, nullptr, this->mMaxTopP, bufferCast<float>(*this->mTopPsDevice), this->mStream->get(),
-            nullptr, nullptr);
-        return workspaceSize;
+        return tensorrt_llm::kernels::getTopPWorkspaceSize<T>(params.batchSize, params.vocabSize);
     }
 
-    void callTestedFunction(const SamplingKernelTestParam& params, bool hasDiffRuntimeArgs, size_t workspaceSize,
-        tensorrt_llm::runtime::ITensor::SharedPtr& workspaceDevice) override
+    void callTestedFunction(
+        SamplingKernelTestParam const& params, tensorrt_llm::runtime::ITensor::SharedPtr& workspaceDevice) override
     {
         auto const maxBatchSize = 2 * params.batchSize;
-        size_t cubTempStorageSize;
-        tk::invokeBatchTopPSampling<T>(nullptr, // workspace
-            workspaceSize, cubTempStorageSize,
-            nullptr,                            // output_ids
-            nullptr,                            // sequence_length
-            nullptr,                            // finished_buffer
-            nullptr,                            // finished_buffer
-            nullptr,                            // cum_log_probs
-            nullptr,                            // output_log_probs
-            nullptr,                            // log_probs
-            bufferCast<int32_t>(*this->mTopPIdValsDevice), bufferCast<int32_t>(*this->mEndOffsetsDevice),
-            bufferCast<int32_t>(*this->mBeginOffsetsDevice), this->mCurandStatesDevice, params.batchSize, maxBatchSize,
-            params.vocabSize, nullptr, this->mMaxTopP, bufferCast<float>(*this->mTopPsDevice), this->mStream->get(),
-            nullptr, nullptr);
 
         // Perform batched TopP sampling
         tk::invokeTopPInitialize(bufferCast<int32_t>(*this->mTopPIdValsDevice),
@@ -87,8 +57,8 @@ private:
             params.batchSize, params.vocabSize, this->mStream->get());
 
         // Perform batched TopP sampling
-        tk::invokeBatchTopPSampling<T>(workspaceDevice->data(), workspaceSize, cubTempStorageSize,
-            bufferCast<int*>(*this->mIdsPtrHost), bufferCast<int32_t>(*this->mSeqLengthsDevice),
+        tk::invokeBatchTopPSampling<T>(workspaceDevice->data(), bufferCast<int*>(*this->mIdsPtrHost),
+            bufferCast<int32_t>(*this->mSeqLengthsDevice),
             reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
                 bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(*this->mFinishedDevice)),
             reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
@@ -100,10 +70,10 @@ private:
             // preprocesses log_prob_buf when those are provided.
             bufferCast<T>(*this->mProbsDevice), bufferCast<int32_t>(*this->mTopPIdValsDevice),
             bufferCast<int32_t>(*this->mEndOffsetsDevice), bufferCast<int32_t>(*this->mBeginOffsetsDevice),
-            this->mCurandStatesDevice, params.batchSize, maxBatchSize, params.vocabSize,
-            bufferCast<int32_t>(*this->mEndIdsDevice), this->mMaxTopP,
-            hasDiffRuntimeArgs ? bufferCast<float>(*this->mTopPsDevice) : nullptr, this->mStream->get(),
-            bufferCast<bool>(*this->mSkipDecodeDevice), bufferCast<int32_t>(*this->mBatchSlots));
+            reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*this->mCurandStatesDevice)), params.batchSize,
+            maxBatchSize, params.vocabSize, bufferCast<int32_t>(*this->mEndIdsDevice), this->mMaxTopP,
+            bufferCast<float>(*this->mTopPsDevice), this->mStream->get(), bufferCast<bool>(*this->mSkipDecodeDevice),
+            bufferCast<int32_t>(*this->mBatchSlots));
     }
 };
 
@@ -111,29 +81,27 @@ TYPED_TEST_SUITE(TopPSamplingKernelTest, FloatAndHalfTypes);
 
 TYPED_TEST(TopPSamplingKernelTest, CorrectnessSmallP)
 {
-    this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopK(0).setTopP(0.2f).setOutputLen(1));
+    this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopP(0.2f));
 };
 
 TYPED_TEST(TopPSamplingKernelTest, CorrectnessLargeP)
 {
-    this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopK(0).setTopP(0.9f).setOutputLen(1));
+    this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopP(0.9f));
 };
 
 TYPED_TEST(TopPSamplingKernelTest, CorrectnessAncestral)
 {
-    this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopK(0).setTopP(1.0f).setOutputLen(1));
+    this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopP(1.0f));
 };
 
 TYPED_TEST(TopPSamplingKernelTest, CorrectnessLargeVocabSmallP)
 {
-    this->runTest(
-        SamplingKernelTestParam().setBatchSize(32).setVocabSize(51200).setTopK(0).setTopP(0.2f).setOutputLen(16));
+    this->runTest(SamplingKernelTestParam().setBatchSize(32).setVocabSize(51200).setTopP(0.2f));
 };
 
 TYPED_TEST(TopPSamplingKernelTest, CorrectnessLargeVocabLargeP)
 {
-    this->runTest(
-        SamplingKernelTestParam().setBatchSize(32).setVocabSize(51200).setTopK(0).setTopP(0.9f).setOutputLen(16));
+    this->runTest(SamplingKernelTestParam().setBatchSize(32).setVocabSize(51200).setTopP(0.9f));
 };
 
 class TopPSamplingKernelUtilsTest : public SamplingKernelTest<float>
@@ -145,25 +113,25 @@ TEST_F(TopPSamplingKernelUtilsTest, invokeTopPInitialize)
     const int32_t batchSize = 8;
     const int32_t vocabSize = 256;
 
-    const auto topPIdValsDevice
+    auto const topPIdValsDevice
         = this->mBufferManager->gpu(ITensor::makeShape({batchSize, vocabSize}), nvinfer1::DataType::kINT32);
-    const auto beginOffsetsDevice
+    auto const beginOffsetsDevice
         = this->mBufferManager->gpu(ITensor::makeShape({batchSize + 1}), nvinfer1::DataType::kINT32);
-    const auto endOffsetsDevice
+    auto const endOffsetsDevice
         = this->mBufferManager->gpu(ITensor::makeShape({batchSize + 1}), nvinfer1::DataType::kINT32);
 
     tk::invokeTopPInitialize(bufferCast<int32_t>(*topPIdValsDevice), bufferCast<int32_t>(*endOffsetsDevice),
         bufferCast<int32_t>(*beginOffsetsDevice), batchSize, vocabSize, this->mStream->get());
 
-    const auto topPIdValsHost = this->mBufferManager->copyFrom(*topPIdValsDevice, MemoryType::kCPU);
-    const auto endOffsetsHost = this->mBufferManager->copyFrom(*endOffsetsDevice, MemoryType::kCPU);
-    const auto beginOffsetsHost = this->mBufferManager->copyFrom(*beginOffsetsDevice, MemoryType::kCPU);
+    auto const topPIdValsHost = this->mBufferManager->copyFrom(*topPIdValsDevice, MemoryType::kCPU);
+    auto const endOffsetsHost = this->mBufferManager->copyFrom(*endOffsetsDevice, MemoryType::kCPU);
+    auto const beginOffsetsHost = this->mBufferManager->copyFrom(*beginOffsetsDevice, MemoryType::kCPU);
 
     this->mStream->synchronize();
 
-    const auto topPIdValsHostPtr = bufferCast<int32_t>(*topPIdValsHost);
-    const auto endOffsetsHostPtr = bufferCast<int32_t>(*endOffsetsHost);
-    const auto beginOffsetsHostPtr = bufferCast<int32_t>(*beginOffsetsHost);
+    auto const topPIdValsHostPtr = bufferCast<int32_t>(*topPIdValsHost);
+    auto const endOffsetsHostPtr = bufferCast<int32_t>(*endOffsetsHost);
+    auto const beginOffsetsHostPtr = bufferCast<int32_t>(*beginOffsetsHost);
 
     for (int32_t bi = 0; bi < batchSize + 1; ++bi)
     {

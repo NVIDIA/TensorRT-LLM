@@ -23,7 +23,7 @@ namespace tensorrt_llm::runtime
 namespace utils
 {
 
-bool tensorHasNan(const IBuffer& tensor, BufferManager& manager);
+bool tensorHasNan(IBuffer const& tensor, BufferManager& manager);
 
 }
 } // namespace tensorrt_llm::runtime

@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/assert.h"
 #include <cstdint>
 
 namespace tensorrt_llm::common
@@ -80,11 +81,17 @@ public:
 
     [[nodiscard]] reference operator[](size_type index)
     {
+#ifdef INDEX_RANGE_CHECK
+        TLLM_CHECK_WITH_INFO(index < mSize, "Index %lu is out of bounds [0, %lu)", index, mSize);
+#endif
         return mData[index];
     }
 
     [[nodiscard]] const_reference operator[](size_type index) const
     {
+#ifdef INDEX_RANGE_CHECK
+        TLLM_CHECK_WITH_INFO(index < mSize, "Index %lu is out of bounds [0, %lu)", index, mSize);
+#endif
         return mData[index];
     }
 

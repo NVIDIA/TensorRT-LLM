@@ -378,7 +378,7 @@ void MemoryPool<TAllocator>::allocateImpl(MemoryPool::PointerType* ptr, MemoryPo
 
     // Finds first free segment providing sufficient space
     auto it = std::find_if(mMemorySegments.begin(), mMemorySegments.end(),
-        [alignedRequest](const auto& ms) { return ms.tag == nullptr && ms.size >= alignedRequest; });
+        [alignedRequest](auto const& ms) { return ms.tag == nullptr && ms.size >= alignedRequest; });
 
     if (it == mMemorySegments.end())
     {
@@ -421,7 +421,7 @@ void MemoryPool<TAllocator>::deallocateImpl(PointerType tag, SizeType n)
 {
     std::lock_guard<std::mutex> lock(mLock);
     auto it = std::find_if(mMemorySegments.begin(), mMemorySegments.end(),
-        [&tag](const MemorySegment& segment) { return segment.tag == tag; });
+        [&tag](MemorySegment const& segment) { return segment.tag == tag; });
 
     TLLM_CHECK_WITH_INFO(it != mMemorySegments.end(), "MemoryPool free: Requested tag %p could not be found", tag);
 

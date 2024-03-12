@@ -26,7 +26,7 @@ namespace tensorrt_llm
 namespace kernels
 {
 
-__global__ void curandInitialize(curandState_t* state, const int* batchSlots, const int size, const uint64_t randomSeed)
+__global__ void curandInitialize(curandState_t* state, int const* batchSlots, int const size, const uint64_t randomSeed)
 {
     int const idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < size)
@@ -37,7 +37,7 @@ __global__ void curandInitialize(curandState_t* state, const int* batchSlots, co
 }
 
 void invokeCurandInitialize(
-    curandState_t* state, const int* batchSlots, const size_t batchSize, const uint64_t randomSeed, cudaStream_t stream)
+    curandState_t* state, int const* batchSlots, const size_t batchSize, const uint64_t randomSeed, cudaStream_t stream)
 {
     dim3 block(256);
     dim3 grid((int) (ceil(batchSize * 1.0 / 256)));
@@ -45,7 +45,7 @@ void invokeCurandInitialize(
 }
 
 __global__ void curandBatchInitialize(
-    curandState_t* states, const int* batchSlots, const int size, const uint64_t* randomSeeds)
+    curandState_t* states, int const* batchSlots, int const size, uint64_t const* randomSeeds)
 {
     int const idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < size)
@@ -55,8 +55,8 @@ __global__ void curandBatchInitialize(
     }
 }
 
-void invokeCurandBatchInitialize(curandState_t* states, const int* batchSlots, const size_t batchSize,
-    const uint64_t* randomSeeds, cudaStream_t stream)
+void invokeCurandBatchInitialize(curandState_t* states, int const* batchSlots, const size_t batchSize,
+    uint64_t const* randomSeeds, cudaStream_t stream)
 {
     dim3 block(256);
     dim3 grid((int) (ceil(batchSize * 1.0 / 256)));

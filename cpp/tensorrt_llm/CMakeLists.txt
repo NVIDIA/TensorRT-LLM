@@ -188,7 +188,6 @@ endif()
 set(TRTLLM_LINK_LIBS
     ${CUBLAS_LIB}
     ${CUBLASLT_LIB}
-    ${CUDNN_LIB}
     ${CMAKE_DL_LIBS}
     ${MPI_C_LIBRARIES}
     ${NCCL_LIB}

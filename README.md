@@ -355,6 +355,9 @@ however, that it is recommended to use the C++ version.
 
 ## Troubleshooting
 
+* If you encounter accuracy issues in the generated text, you may want to increase
+  the internal precision in the attention layer. For that, pass the `--context_fmha_fp32_acc enable` to
+  `trtllm-build`.
 
 * It's recommended to add options `–shm-size=1g –ulimit memlock=-1` to the
   docker or nvidia-docker run command.  Otherwise you may see NCCL errors when

@@ -19,6 +19,7 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/penaltyTypes.h"
+#include "tensorrt_llm/runtime/common.h"
 
 namespace tensorrt_llm
 {
@@ -30,31 +31,33 @@ struct InvokeBatchApplyPenaltyParams
 {
     T const* const* inputLogits;
     T* outputLogits;
-    const T* biases;
-    int* penaltyWorkspace;
-    const int* penaltyWorkspacePrev;
-    const float* temperatures;
-    const float* repetitionPenalties;
-    const float* presencePenalties;
-    const float* frequencyPenalties;
-    const bool accumulateVocab;
-    const size_t batchSize;
-    const int beamWidth;
-    const int maxSeqLen;
-    const size_t vocabSize;
-    const size_t vocabSizePadded;
-    const int** outputIdsPtr;
-    const int** parentIdsPtr;
-    const int* inputLengths;
-    const int* sequenceLengths;
-    const int* minLengths;
-    const int* endIds;
-    const int* batchSlots;
+    T const* biases;
+    runtime::TokenIdType* penaltyWorkspace;
+    runtime::TokenIdType const* penaltyWorkspacePrev;
+    float const* temperatures;
+    float const* repetitionPenalties;
+    float const* presencePenalties;
+    float const* frequencyPenalties;
+    bool const accumulateVocab;
+    size_t const batchSize;
+    runtime::SizeType const beamWidth;
+    runtime::SizeType const maxSeqLen;
+    size_t const vocabSize;
+    size_t const vocabSizePadded;
+    runtime::TokenIdType const** outputIdsPtr;
+    runtime::SizeType const** parentIdsPtr;
+    runtime::SizeType const* inputLengths;
+    runtime::SizeType const* sequenceLengths;
+    runtime::SizeType const* minLengths;
+    runtime::TokenIdType const* endIds;
+    runtime::SizeType const* batchSlots;
+    runtime::SizeType const maxTokensPerStep;
+    runtime::SizeType const* tokensPerStep;
     cudaStream_t stream;
 };
 
 template <typename T>
-void invokeBatchApplyPenalty(const InvokeBatchApplyPenaltyParams<T>& params);
+void invokeBatchApplyPenalty(InvokeBatchApplyPenaltyParams<T> const& params);
 
 } // namespace kernels
 } // namespace tensorrt_llm

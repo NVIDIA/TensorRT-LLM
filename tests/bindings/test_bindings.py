@@ -630,3 +630,25 @@ def test_trt_gpt_model_optional_params():
     assert opt_params.device_ids is None
     opt_params.device_ids = [0, 1]
     assert opt_params.device_ids == [0, 1]
+
+
+def test_KvCacheConfig_pickle():
+    cache = _tb.KvCacheConfig(free_gpu_memory_fraction=0.4)
+    cache1 = pickle.dumps(cache)
+    cache2 = pickle.loads(cache1)
+
+    assert cache2 == cache
+
+
+def test_TrtGptModelOptionalParams_pickle():
+    cache = _tb.KvCacheConfig(free_gpu_memory_fraction=0.4)
+    params = _tb.TrtGptModelOptionalParams(
+        kv_cache_config=cache,
+        enable_trt_overlap=True,
+    )
+    params.enable_chunked_context = True
+
+    params1 = pickle.dumps(params)
+    params2: _tb.TrtGptModelOptionalParams = pickle.loads(params1)
+
+    assert params2 == params

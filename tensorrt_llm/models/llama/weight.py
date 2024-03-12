@@ -21,16 +21,15 @@ import numpy as np
 import torch
 from safetensors import safe_open
 
-import tensorrt_llm
-from tensorrt_llm._utils import (numpy_to_torch, pad_vocab_size,
-                                 str_dtype_to_torch, torch_to_numpy)
-from tensorrt_llm.layers import MoeConfig
-from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.modeling_utils import PretrainedConfig
-from tensorrt_llm.models.quantized.quant import get_dummy_quant_scales
-from tensorrt_llm.quantization import QuantMode
-from tensorrt_llm.runtime.lora_manager import LoraConfig
-
+from ..._utils import (numpy_to_torch, pad_vocab_size, str_dtype_to_torch,
+                       torch_to_numpy)
+from ...layers import MoeConfig
+from ...logger import logger
+from ...lora_manager import LoraConfig
+from ...mapping import Mapping
+from ...quantization import QuantMode
+from ..modeling_utils import PretrainedConfig
+from ..quantized.quant import get_dummy_quant_scales
 from .utils import (iterate_shard_files, load_state_dict,
                     retrieved_layer_index_from_name)
 
@@ -72,9 +71,8 @@ def get_scaling_factors(
     """
 
     if model_path is None:
-        tensorrt_llm.logger.warning(
-            f"--quantized_fp8_model_path not specified. "
-            f"Initialize quantization scales automatically.")
+        logger.warning(f"--quantized_fp8_model_path not specified. "
+                       f"Initialize quantization scales automatically.")
         return get_dummy_quant_scales(num_layers)
     weight_dict = np.load(model_path)
     # yapf: disable
@@ -259,7 +257,8 @@ def load_from_hf_checkpoint(model_dir,
                             mapping=Mapping(),
                             config=None,
                             lora_config=LoraConfig()):
-    tensorrt_llm.logger.info('Loading weights from HF LLaMA...')
+    '''Weights-only quantization is the only supported quantization recipe here.'''
+    logger.info('Loading weights from HF LLaMA...')
     tik = time.time()
     weights = {}
     dtype = config.dtype
@@ -289,10 +288,10 @@ def load_from_hf_checkpoint(model_dir,
     for model_file in iterate_shard_files(model_dir,
                                           rank=mapping.tp_rank,
                                           progress_bar=False):
-        tensorrt_llm.logger.debug(f'Loading file {str(model_file)}...')
+        logger.debug(f'Loading file {str(model_file)}...')
         model_params = load_state_dict(model_file, dtype=dtype)
         for name, param in model_params.items():
-            tensorrt_llm.logger.debug(f'Converting weight {name}...')
+            logger.debug(f'Converting weight {name}...')
             layer_idx = retrieved_layer_index_from_name(name)
             if layer_idx is None:
                 layer = None
@@ -421,7 +420,7 @@ def load_from_hf_checkpoint(model_dir,
         del model_params
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
-    tensorrt_llm.logger.info(f'Weights loaded. Total time: {t}')
+    logger.info(f'Weights loaded. Total time: {t}')
     return weights
 
 
@@ -431,7 +430,7 @@ def load_from_hf_llama(tensorrt_llm_llama: 'LLaMAForCausalLM',
                        dtype='float32',
                        use_gemm_woq_plugin=True,
                        lora_config=LoraConfig()):
-    tensorrt_llm.logger.info('Loading weights from HF LLaMA...')
+    logger.info('Loading weights from HF LLaMA...')
     tik = time.time()
 
     quant_mode = getattr(tensorrt_llm_llama, 'quant_mode', QuantMode(0))
@@ -730,7 +729,7 @@ def load_from_hf_llama(tensorrt_llm_llama: 'LLaMAForCausalLM',
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
-    tensorrt_llm.logger.info(f'Weights loaded. Total time: {t}')
+    logger.info(f'Weights loaded. Total time: {t}')
     return weights
 
 
@@ -835,8 +834,7 @@ def load_from_gptq_llama(quant_ckpt_path,
                          mapping=Mapping(),
                          dtype="float16",
                          bin_model_dir=None):
-    tensorrt_llm.logger.info(
-        'Loading weights from groupwise GPTQ LLaMA safetensors...')
+    logger.info('Loading weights from groupwise GPTQ LLaMA safetensors...')
     weights = {}
     tik = time.time()
 
@@ -870,7 +868,7 @@ def load_from_gptq_llama(quant_ckpt_path,
 
     def torch_split(v, dim):
         if v.shape[dim] % mapping.tp_size != 0:
-            tensorrt_llm.logger.error(
+            logger.error(
                 "Current weight shape is invalid for mapping.tp_size=" +
                 str(mapping.tp_size))
             assert False, "Invalid TP size"
@@ -956,7 +954,7 @@ def load_from_gptq_llama(quant_ckpt_path,
     for l in layers_range:
         layer_idx = l - layers_range[0]
         prefix = "layers" + split_sym + str(layer_idx) + split_sym
-        tensorrt_llm.logger.info(f'Process weights in layer: {layer_idx}')
+        logger.info(f'Process weights in layer: {layer_idx}')
         # layer = tensorrt_llm_llama.layers[layer_idx]
         tllm_prex = f'transformer.layers.{l-layers_range[0]}'
         # 4.1 attention.qkv
@@ -1008,7 +1006,7 @@ def load_from_gptq_llama(quant_ckpt_path,
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
-    tensorrt_llm.logger.info(f'Weights loaded. Total time: {t}')
+    logger.info(f'Weights loaded. Total time: {t}')
 
     return weights
 
@@ -1030,7 +1028,6 @@ def load_from_meta_llama(meta_ckpt_dir, mapping=Mapping(), config=None):
         return gathered
 
     def split_ckpt(ckpt, ranks_per_ckpt, ckpt_rank):
-        moe_config = config.moe_config
         split_ckpt = {}
         for k, v in ckpt.items():
             d = 0
@@ -1052,11 +1049,6 @@ def load_from_meta_llama(meta_ckpt_dir, mapping=Mapping(), config=None):
                 split_ckpt[k] = torch.split(tmp,
                                             tmp.shape[d] // ranks_per_ckpt,
                                             dim=d)[ckpt_rank].clone()
-            elif "experts" in k and moe_config.tp_mode == moe_config.ParallelismMode.EXPERT_PARALLEL:
-                rank_experts = mapping.ep_experts(moe_config.num_experts)
-                expert_id = int(k[k.find("experts"):].split(".")[1])
-                if expert_id in rank_experts:
-                    split_ckpt[k] = v.clone()
             else:
                 split_ckpt[k] = torch.split(v,
                                             v.shape[d] // ranks_per_ckpt,
@@ -1125,7 +1117,7 @@ def load_from_meta_llama(meta_ckpt_dir, mapping=Mapping(), config=None):
 
         return load_from_meta_llama.saved_embed
 
-    tensorrt_llm.logger.info('Loading weights from Meta LLaMA checkpoints ...')
+    logger.info('Loading weights from Meta LLaMA checkpoints ...')
     tik = time.time()
 
     quant_mode = config.quant_mode
@@ -1246,7 +1238,7 @@ def load_from_meta_llama(meta_ckpt_dir, mapping=Mapping(), config=None):
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
-    tensorrt_llm.logger.info(f'Weights loaded. Total time: {t}')
+    logger.info(f'Weights loaded. Total time: {t}')
     return weights
 
 
@@ -1332,7 +1324,7 @@ def load_from_awq_llama(quant_ckpt_path,
 
     packer = torch.ops.trtllm.pack_int8_tensor_to_packed_int4
     preprocessor = torch.ops.trtllm.preprocess_weights_for_mixed_gemm
-    torch_dtype = tensorrt_llm._utils.str_dtype_to_torch(dtype)
+    torch_dtype = str_dtype_to_torch(dtype)
 
     # def fromfile(dir_path, name, shape=None, dtype=None):
     #     p = dir_path + '/' + name
@@ -1345,7 +1337,7 @@ def load_from_awq_llama(quant_ckpt_path,
 
     def torch_split(v, dim):
         if v.shape[dim] % mapping.tp_size != 0:
-            tensorrt_llm.logger.error(
+            logger.error(
                 "Current weight shape is invalid for mapping.tp_size=" +
                 str(mapping.tp_size))
             assert False, "Invalid TP size"
@@ -1484,7 +1476,7 @@ def load_from_awq_llama(quant_ckpt_path,
         prefix = "layers" + split_sym + str(layer_idx) + split_sym
         tllm_prex = f'transformer.layers.{l-layers_range[0]}'
 
-        tensorrt_llm.logger.info(f'Process weights in layer: {layer_idx}')
+        logger.info(f'Process weights in layer: {layer_idx}')
         # layer = tensorrt_llm_llama.layers[layer_idx]
 
         # 4.1 attention.qkv

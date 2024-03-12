@@ -17,10 +17,13 @@
 #pragma once
 
 #include "tensorrt_llm/runtime/bufferManager.h"
+#include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/decodingInput.h"
 #include "tensorrt_llm/runtime/decodingMode.h"
 #include "tensorrt_llm/runtime/decodingOutput.h"
+#include "tensorrt_llm/runtime/gptModelConfig.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
+#include "tensorrt_llm/runtime/worldConfig.h"
 #include <curand_kernel.h>
 
 #include <memory>
@@ -59,7 +62,7 @@ public:
         DecodingInput const& decodingInput, BufferManager const& manager)
         = 0;
 
-    virtual const SamplingConfig& getSamplingConfig() = 0;
+    virtual SamplingConfig const& getSamplingConfig() = 0;
 
     static void acceptDraftTokensByIds(ITensor const& targetTokenIds, ITensor const& draftTokenIds,
         ITensor const& contextLengths, ITensor const& numDraftTokens, ITensor& sequenceLengths,
@@ -70,6 +73,11 @@ public:
         ITensor& targetProbs, ITensor const& numDraftTokens, ITensor& finished, ITensor const& batchSlots,
         SizeType vocabSize, SizeType vocabSizePadded, bool useRandomAcceptThreshold, float randomAcceptThreshold,
         curandState_t* curandState, BufferManager::CudaStreamPtr const& stream);
+
+    static void updateKVCacheBasedOnAcceptedTokens(ITensor const& acceptedOffsets, ITensor const& packedAcceptedIds,
+        ITensor const& pointerArray, ITensor const& pastKeyValueLengths, GptModelConfig const& modelConfig,
+        WorldConfig const& worldConfig, BufferManager::CudaStreamPtr stream, SizeType rewindDraftTokenCount,
+        SizeType maxAttentionWindow, SizeType maxBlocksPerSeq, nvinfer1::DataType dtype);
 
     static std::unique_ptr<IGptDecoder> create(DecodingMode const& mode, nvinfer1::DataType dtype, size_t maxBatchSize,
         size_t maxBeamWidth, size_t vocabSize, size_t vocabSizePadded, size_t maxSequenceLength,
@@ -97,7 +105,7 @@ public:
     void gatherTree(ITensor& finalOutputIds, DecodingOutput const& decodingOutput, DecodingInput const& decodingInput,
         BufferManager const& manager) override;
 
-    const SamplingConfig& getSamplingConfig() override
+    SamplingConfig const& getSamplingConfig() override
     {
         return mSamplingConfig;
     }

@@ -45,7 +45,7 @@ __inline__ __device__ float tanh_opt(float x)
     asm("tanh.approx.f32 %0,%1; \n\t" : "=f"(r) : "f"(x));
     return r;
 #else
-    const float exp_val = -1.f * fabs(2 * x);
+    float const exp_val = -1.f * fabs(2 * x);
     return copysignf_pos((1.0f - __expf(exp_val)) / (__expf(exp_val) + 1.0f), x);
 #endif
 }
@@ -53,9 +53,9 @@ __inline__ __device__ float tanh_opt(float x)
 template <typename T>
 struct GeluActivation
 {
-    static __device__ __forceinline__ T apply(const T& val)
+    static __device__ __forceinline__ T apply(T const& val)
     {
-        const float cdf = 0.5f * (1.0f + tanh_opt((0.7978845608028654f * (val + 0.044715f * val * val * val))));
+        float const cdf = 0.5f * (1.0f + tanh_opt((0.7978845608028654f * (val + 0.044715f * val * val * val))));
         return val * cdf;
     }
 };
@@ -63,7 +63,7 @@ struct GeluActivation
 template <typename T>
 struct ReluActivation
 {
-    static __device__ __forceinline__ T apply(const T& val)
+    static __device__ __forceinline__ T apply(T const& val)
     {
         return val > static_cast<T>(0.0f) ? val : static_cast<T>(0.0f);
     }
@@ -72,7 +72,7 @@ struct ReluActivation
 template <typename T>
 struct IdentityActivation
 {
-    static __device__ __forceinline__ T apply(const T& val)
+    static __device__ __forceinline__ T apply(T const& val)
     {
         return val;
     }
@@ -81,11 +81,11 @@ struct IdentityActivation
 template <typename VecType, typename T0, typename T1>
 __device__ __forceinline__ void load(T0* dst, T1* src, size_t offset = 0)
 {
-    *reinterpret_cast<VecType*>(dst) = *(reinterpret_cast<const VecType*>(src) + offset);
+    *reinterpret_cast<VecType*>(dst) = *(reinterpret_cast<VecType const*>(src) + offset);
 }
 
 template <typename AssignType, typename T>
-__device__ __forceinline__ void assign(T* dst, const AssignType& val)
+__device__ __forceinline__ void assign(T* dst, AssignType const& val)
 {
     *reinterpret_cast<AssignType*>(dst) = val;
 }
@@ -93,7 +93,7 @@ __device__ __forceinline__ void assign(T* dst, const AssignType& val)
 template <typename VecType, typename T0, typename T1>
 __device__ __forceinline__ void store(T0* src, T1* dst, size_t offset = 0)
 {
-    *(reinterpret_cast<VecType*>(dst) + offset) = *reinterpret_cast<const VecType*>(src);
+    *(reinterpret_cast<VecType*>(dst) + offset) = *reinterpret_cast<VecType const*>(src);
 }
 } // namespace kernels
 } // namespace tensorrt_llm

@@ -11,9 +11,12 @@ onnx>=1.12.0
 polygraphy
 psutil
 pynvml>=11.5.0
+pulp
+pandas
+h5py
 sentencepiece>=0.1.99
-tensorrt==9.2.0.post12.dev5
-torch<=2.2.0a
+tensorrt==9.3.0.post12.dev1
+torch>=2.1.0a,<=2.2.0a # https://github.com/pytorch/pytorch/blob/v2.1.2/version.txt still uses 2.1.0a0.
 nvidia-ammo~=0.7.0; platform_machine=="x86_64"
 transformers==4.38.2
 wheel

@@ -14,6 +14,8 @@
 # limitations under the License.
 import itertools
 import math
+import os
+import sys
 import unittest
 
 import torch
@@ -22,6 +24,9 @@ from polygraphy.backend.trt import EngineFromNetwork, TrtRunner
 
 import tensorrt_llm
 from tensorrt_llm import Tensor
+
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.util import skip_bf16_pre_ampere, unittest_name_func
 
 
 class TestFunctional(unittest.TestCase):
@@ -38,21 +43,14 @@ class TestFunctional(unittest.TestCase):
                 math.sqrt(2 / math.pi) * (x + 0.044715 * torch.pow(x, 3))))
         return res
 
-    def skip_bf16_before_ampere(self):
-        sm = torch.cuda.get_device_capability()
-        if sm < (8, 0):
-            self.skipTest(
-                f'Skip the test because sm{sm[0]}{sm[1]} does not support '
-                f'bfloat16.')
-
-    @parameterized.expand(
-        itertools.product(
-            ('float32', 'float16', 'bfloat16'),
-            (False, True),
-        ))
+    @parameterized.expand(itertools.product(
+        ('float32', 'float16', 'bfloat16'),
+        (False, True),
+    ),
+                          name_func=unittest_name_func)
     def test_gelu(self, dtype, strongly_typed):
-        if dtype == 'bfloat16':
-            self.skip_bf16_before_ampere()
+        # Skip tests that are not supported in pre-ampere architecture
+        skip_bf16_pre_ampere(dtype)
 
         torch_dtype = tensorrt_llm._utils.str_dtype_to_torch(dtype)
         x_shape = (12, 12, 96, 96)

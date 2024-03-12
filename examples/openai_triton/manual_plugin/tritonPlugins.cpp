@@ -40,7 +40,7 @@ public:
     }
 
     template <typename CreatorType>
-    void addPluginCreator(void* logger, const char* libNamespace)
+    void addPluginCreator(void* logger, char const* libNamespace)
     {
         // Make accesses to the plugin creator registry thread safe
         std::lock_guard<std::mutex> lock(mRegistryLock);
@@ -114,7 +114,7 @@ public:
 };
 
 template <typename CreatorType>
-void initializeTritonPlugin(void* logger, const char* libNamespace)
+void initializeTritonPlugin(void* logger, char const* libNamespace)
 {
     TritonPluginCreatorRegistry::getInstance().addPluginCreator<CreatorType>(logger, libNamespace);
 }
@@ -125,7 +125,7 @@ void initializeTritonPlugin(void* logger, const char* libNamespace)
 
 extern "C"
 {
-    bool initOpenAiTritonPlugins(void* logger, const char* libNamespace)
+    bool initOpenAiTritonPlugins(void* logger, char const* libNamespace)
     {
         initializeTritonPlugin<openai_triton::plugin::TritonFlashAttentionPluginCreator>(logger, libNamespace);
         return true;

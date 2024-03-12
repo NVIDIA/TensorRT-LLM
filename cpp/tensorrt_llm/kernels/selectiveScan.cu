@@ -70,7 +70,7 @@ template <typename input_t, typename weight_t, int DSTATE = 16, int CHANNELS_PER
 __launch_bounds__(256, 1) __global__ void selective_scan_loop_kernel(SSMParamsBase params)
 {
     input_t* output = reinterpret_cast<input_t*>(params.out_ptr);
-    weight_t* state = reinterpret_cast<weight_t*>(params.x_ptr);
+    input_t* state = reinterpret_cast<input_t*>(params.x_ptr);
     input_t* x = reinterpret_cast<input_t*>(params.u_ptr);
     input_t* dt = reinterpret_cast<input_t*>(params.delta_ptr);
     weight_t* A = reinterpret_cast<weight_t*>(params.A_ptr);
@@ -99,12 +99,12 @@ __launch_bounds__(256, 1) __global__ void selective_scan_loop_kernel(SSMParamsBa
     __shared__ weight_t sh_D[CHANNELS_PER_BLOCK];
     __shared__ weight_t sh_dt_bias[CHANNELS_PER_BLOCK];
 
-    const int channel = blockIdx.x * blockDim.x + threadIdx.x;
-    const int sample = blockIdx.y; // batch id
+    int const channel = blockIdx.x * blockDim.x + threadIdx.x;
+    int const sample = blockIdx.y; // batch id
 
-    const int seq_loops = (num_tokens + SEQ_UNROLL - 1) / SEQ_UNROLL;
+    int const seq_loops = (num_tokens + SEQ_UNROLL - 1) / SEQ_UNROLL;
 
-    const int input_matrix_row_id = sample * num_tokens;
+    int const input_matrix_row_id = sample * num_tokens;
 
     if (threadIdx.y == 1)
     {
@@ -300,7 +300,7 @@ __launch_bounds__(256, 1) __global__ void selective_scan_loop_kernel(SSMParamsBa
         // Write the new state back out to the cache
         for (int i = 0; i < DSTATE; i++)
         {
-            weight_t* my_state = &state[sample * num_channels * DSTATE];
+            input_t* my_state = &state[sample * num_channels * DSTATE];
             int offset = i * num_channels + channel;
             convertAndStore(&my_state[offset], state_reg[i]);
         }
@@ -313,8 +313,8 @@ void invokeSelectiveScan(SSMParamsBase& params, cudaStream_t stream)
     int samples = params.batch;
     int channels = params.dim;
 
-    const int threads = 128;
-    const int blocks = (channels + threads - 1) / threads;
+    int const threads = 128;
+    int const blocks = (channels + threads - 1) / threads;
     dim3 block(threads, 2);
     dim3 grid(blocks, samples);
     TLLM_CHECK((channels % block.x) == 0);
@@ -343,7 +343,7 @@ __launch_bounds__(128, 2) __global__ void selective_scan_update_kernel(SSMParams
 {
 
     input_t* output = reinterpret_cast<input_t*>(params.out_ptr);
-    weight_t* state = reinterpret_cast<weight_t*>(params.x_ptr);
+    input_t* state = reinterpret_cast<input_t*>(params.x_ptr);
     input_t* x = reinterpret_cast<input_t*>(params.u_ptr);
     input_t* dt = reinterpret_cast<input_t*>(params.delta_ptr);
     weight_t* A = reinterpret_cast<weight_t*>(params.A_ptr);
@@ -355,12 +355,12 @@ __launch_bounds__(128, 2) __global__ void selective_scan_update_kernel(SSMParams
     bool dt_softplus = params.delta_softplus;
     int num_channels = params.dim;
 
-    const int channel = blockIdx.x * blockDim.x + threadIdx.x;
+    int const channel = blockIdx.x * blockDim.x + threadIdx.x;
     if (channel >= num_channels)
         return;
-    const int sample = blockIdx.y;
+    int const sample = blockIdx.y;
 
-    weight_t* my_state = &state[sample * num_channels * DSTATE];
+    input_t* my_state = &state[sample * num_channels * DSTATE];
     input_t* my_output = &output[sample * num_channels];
 
     float rA[DSTATE];
@@ -424,8 +424,8 @@ void invokeSelectiveScanUpdate(SSMParamsBase& params, cudaStream_t stream)
     int samples = params.batch;
     int channels = params.dim;
 
-    const int threads = 128;
-    const int blocks = (channels + threads - 1) / threads;
+    int const threads = 128;
+    int const blocks = (channels + threads - 1) / threads;
     dim3 block(threads, 1);
     dim3 grid(blocks, samples);
 

@@ -81,12 +81,12 @@ enum class OperationType
 };
 
 /* **************************** debug tools ********************************* */
-static const char* _cudaGetErrorEnum(cudaError_t error)
+static char const* _cudaGetErrorEnum(cudaError_t error)
 {
     return cudaGetErrorString(error);
 }
 
-static const char* _cudaGetErrorEnum(cublasStatus_t error)
+static char const* _cudaGetErrorEnum(cublasStatus_t error)
 {
     switch (error)
     {
@@ -114,7 +114,7 @@ static const char* _cudaGetErrorEnum(cublasStatus_t error)
 }
 
 template <typename T>
-void check(T result, char const* const func, const char* const file, int const line)
+void check(T result, char const* const func, char const* const file, int const line)
 {
     if (result)
     {
@@ -133,7 +133,7 @@ inline bool isCudaLaunchBlocking()
 
     if (firstCall)
     {
-        const char* env = std::getenv("CUDA_LAUNCH_BLOCKING");
+        char const* env = std::getenv("CUDA_LAUNCH_BLOCKING");
         result = env != nullptr && std::string(env) == "1";
         firstCall = false;
     }
@@ -141,12 +141,12 @@ inline bool isCudaLaunchBlocking()
     return result;
 }
 
-inline void syncAndCheck(const char* const file, int const line)
+inline void syncAndCheck(char const* const file, int const line)
 {
 #ifndef NDEBUG
-    const bool checkError = true;
+    bool const checkError = true;
 #else
-    const bool checkError = isCudaLaunchBlocking();
+    bool const checkError = isCudaLaunchBlocking();
 #endif
 
     if (checkError)
@@ -279,7 +279,7 @@ inline int getDeviceCount()
 
 /// Get the memory info
 /// \return The free and total amount of memory in bytes
-inline std::tuple<size_t, size_t> getDeviceMemoryInfo(const bool useUvm)
+inline std::tuple<size_t, size_t> getDeviceMemoryInfo(bool const useUvm)
 {
     if (useUvm)
     {
@@ -351,7 +351,7 @@ auto constexpr ceilDiv(T numerator, U denominator)
 }
 
 template <typename T>
-void printAbsMean(const T* buf, uint64_t size, cudaStream_t stream, std::string name = "")
+void printAbsMean(T const* buf, uint64_t size, cudaStream_t stream, std::string name = "")
 {
     if (buf == nullptr)
     {
@@ -390,9 +390,9 @@ void printAbsMean(const T* buf, uint64_t size, cudaStream_t stream, std::string 
 }
 
 template <typename T>
-void printToStream(const T* result, const int size, FILE* strm)
+void printToStream(T const* result, int const size, FILE* strm)
 {
-    const bool split_rows = (strm == stdout);
+    bool const split_rows = (strm == stdout);
     if (result == nullptr)
     {
         TLLM_LOG_WARNING("It is an nullptr, skip! \n");
@@ -414,13 +414,13 @@ void printToStream(const T* result, const int size, FILE* strm)
 }
 
 template <typename T>
-void printToScreen(const T* result, const int size)
+void printToScreen(T const* result, int const size)
 {
     printToStream(result, size, stdout);
 }
 
 template <typename T>
-void print2dToStream(const T* result, const int r, const int c, const int stride, FILE* strm)
+void print2dToStream(T const* result, int const r, int const c, int const stride, FILE* strm)
 {
     if (result == nullptr)
     {
@@ -429,20 +429,20 @@ void print2dToStream(const T* result, const int r, const int c, const int stride
     }
     for (int ri = 0; ri < r; ++ri)
     {
-        const T* ptr = result + ri * stride;
+        T const* ptr = result + ri * stride;
         printToStream(ptr, c, strm);
     }
     fprintf(strm, "\n");
 }
 
 template <typename T>
-void print2dToScreen(const T* result, const int r, const int c, const int stride)
+void print2dToScreen(T const* result, int const r, int const c, int const stride)
 {
     print2dToStream(result, r, c, stride, stdout);
 }
 
 template <typename T>
-void print2dToFile(std::string fname, const T* result, const int r, const int c, const int stride)
+void print2dToFile(std::string fname, T const* result, int const r, int const c, int const stride)
 {
     FILE* fp = fopen(fname.c_str(), "wt");
     if (fp != nullptr)
@@ -493,7 +493,7 @@ inline void print_element_(int64_t ill)
 }
 
 template <typename T>
-inline void printMatrix(const T* ptr, int m, int k, int stride, bool is_device_ptr)
+inline void printMatrix(T const* ptr, int m, int k, int stride, bool is_device_ptr)
 {
     T* tmp;
     if (is_device_ptr)
@@ -538,14 +538,14 @@ inline void printMatrix(const T* ptr, int m, int k, int stride, bool is_device_p
     }
 }
 
-template void printMatrix(const float* ptr, int m, int k, int stride, bool is_device_ptr);
-template void printMatrix(const half* ptr, int m, int k, int stride, bool is_device_ptr);
+template void printMatrix(float const* ptr, int m, int k, int stride, bool is_device_ptr);
+template void printMatrix(half const* ptr, int m, int k, int stride, bool is_device_ptr);
 #ifdef ENABLE_BF16
-template void printMatrix(const __nv_bfloat16* ptr, int m, int k, int stride, bool is_device_ptr);
+template void printMatrix(__nv_bfloat16 const* ptr, int m, int k, int stride, bool is_device_ptr);
 #endif
-template void printMatrix(const uint32_t* ptr, int m, int k, int stride, bool is_device_ptr);
-template void printMatrix(const uint64_t* ptr, int m, int k, int stride, bool is_device_ptr);
-template void printMatrix(const int* ptr, int m, int k, int stride, bool is_device_ptr);
+template void printMatrix(uint32_t const* ptr, int m, int k, int stride, bool is_device_ptr);
+template void printMatrix(uint64_t const* ptr, int m, int k, int stride, bool is_device_ptr);
+template void printMatrix(int const* ptr, int m, int k, int stride, bool is_device_ptr);
 
 } // namespace tensorrt_llm::common
 

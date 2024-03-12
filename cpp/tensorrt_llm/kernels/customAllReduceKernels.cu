@@ -108,10 +108,10 @@ inline __device__ int4 add128b(T& a, T& b)
 }
 
 __inline__ __device__ void multi_gpu_barrier(
-    uint32_t** signals, const uint32_t flag, const size_t rank, const size_t world_size, const int tidx, const int bidx)
+    uint32_t** signals, const uint32_t flag, const size_t rank, const size_t world_size, int const tidx, int const bidx)
 {
     // At the end of the function, we now that has least block 0 from all others GPUs have reached that point.
-    volatile uint32_t* my_signals = signals[rank];
+    uint32_t volatile* my_signals = signals[rank];
     if (tidx < world_size)
     {
         // The 1st block notifies the other ranks.
@@ -139,8 +139,8 @@ __global__ void multiGpuBarrierKernel(AllReduceParams params)
 template <typename T, int RANKS_PER_NODE>
 static __global__ void oneShotAllReduceKernel(AllReduceParams params)
 {
-    const int bidx = blockIdx.x;
-    const int tidx = threadIdx.x;
+    int const bidx = blockIdx.x;
+    int const tidx = threadIdx.x;
 
     // The number of elements packed into one for comms
     static constexpr int NUM_ELTS = 16 / sizeof(T);
@@ -151,7 +151,7 @@ static __global__ void oneShotAllReduceKernel(AllReduceParams params)
     multi_gpu_barrier(params.peer_barrier_ptrs_in, params.barrier_flag, params.local_rank, RANKS_PER_NODE, tidx, bidx);
 
     // The source pointers. Distributed round-robin for the different warps.
-    const T* src_d[RANKS_PER_NODE];
+    T const* src_d[RANKS_PER_NODE];
 #pragma unroll
     for (int ii = 0; ii < RANKS_PER_NODE; ++ii)
     {
@@ -172,7 +172,7 @@ static __global__ void oneShotAllReduceKernel(AllReduceParams params)
 #pragma unroll
         for (int ii = 0; ii < RANKS_PER_NODE; ++ii)
         {
-            vals[ii].packed = *reinterpret_cast<const int4*>(&src_d[ii][iter_offset]);
+            vals[ii].packed = *reinterpret_cast<int4 const*>(&src_d[ii][iter_offset]);
         }
 
         // Sum the values from the different ranks.
@@ -194,9 +194,9 @@ static __global__ void twoShotAllReduceKernel(AllReduceParams params)
 {
 
     // The block index.
-    const int bidx = blockIdx.x;
+    int const bidx = blockIdx.x;
     // The thread index with the block.
-    const int tidx = threadIdx.x;
+    int const tidx = threadIdx.x;
 
     // The number of elements packed into one for comms
     static constexpr int NUM_ELTS = 16 / sizeof(T);
@@ -233,7 +233,7 @@ static __global__ void twoShotAllReduceKernel(AllReduceParams params)
 #pragma unroll
         for (int ii = 0; ii < RANKS_PER_NODE; ++ii)
         {
-            vals[ii].packed = *reinterpret_cast<const int4*>(&src_d[ii][local_offset]);
+            vals[ii].packed = *reinterpret_cast<int4 const*>(&src_d[ii][local_offset]);
         }
 
         // Sum the values from the different ranks.
@@ -396,14 +396,14 @@ void invokeMultiGpuBarrier(AllReduceParams& param, cudaStream_t stream)
     multiGpuBarrierKernel<<<1, param.ranks_per_node, 0, stream>>>(param);
 }
 
-AllReduceParams AllReduceParams::deserialize(const int32_t* buffer, size_t tpSize, size_t tpRank, uint32_t flag_value)
+AllReduceParams AllReduceParams::deserialize(int32_t const* buffer, size_t tpSize, size_t tpRank, uint32_t flag_value)
 {
     void* const* buffer_ptrs = reinterpret_cast<void* const*>(buffer);
     AllReduceParams params;
     // Even plugins use ping buffers, odd plugins use pong.
     // That way, we don't need to wait for other GPUs to be done
     // before copying input tensor to workspace.
-    const auto buffer_offset = (flag_value % 2 == 0) ? 0 : tpSize;
+    auto const buffer_offset = (flag_value % 2 == 0) ? 0 : tpSize;
 
     for (int i = 0; i < tpSize; ++i)
     {

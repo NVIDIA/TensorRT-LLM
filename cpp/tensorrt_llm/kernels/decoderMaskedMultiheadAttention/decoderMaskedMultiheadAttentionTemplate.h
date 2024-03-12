@@ -652,14 +652,14 @@ struct V_vec_accum_fp32_<fp8_4_t>
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename Tout, typename Tin>
-__inline__ __device__ constexpr Tout vec_conversion(const Tin& x)
+__inline__ __device__ constexpr Tout vec_conversion(Tin const& x)
 {
     static_assert(std::is_same<Tout, Tin>::value, "Type mismatch");
     return x;
 }
 
 template <>
-__inline__ __device__ Float8_ vec_conversion<Float8_, uint4>(const uint4& a)
+__inline__ __device__ Float8_ vec_conversion<Float8_, uint4>(uint4 const& a)
 {
     Float8_ fc;
     fc.x = half2_to_float2(a.x);
@@ -671,7 +671,7 @@ __inline__ __device__ Float8_ vec_conversion<Float8_, uint4>(const uint4& a)
 
 #ifdef ENABLE_BF16
 template <>
-__inline__ __device__ Float8_ vec_conversion<Float8_, bf16_8_t>(const bf16_8_t& a)
+__inline__ __device__ Float8_ vec_conversion<Float8_, bf16_8_t>(bf16_8_t const& a)
 {
     Float8_ fc;
     fc.x = bf1622float2(a.x);
@@ -685,39 +685,39 @@ __inline__ __device__ Float8_ vec_conversion<Float8_, bf16_8_t>(const bf16_8_t& 
 #ifdef ENABLE_FP8
 // fp8_t
 template <>
-__inline__ __device__ float vec_conversion<float, __nv_fp8_e4m3>(const __nv_fp8_e4m3& a)
+__inline__ __device__ float vec_conversion<float, __nv_fp8_e4m3>(__nv_fp8_e4m3 const& a)
 {
     return float(a);
 }
 
 template <>
-__inline__ __device__ __nv_fp8_e4m3 vec_conversion<__nv_fp8_e4m3, float>(const float& a)
+__inline__ __device__ __nv_fp8_e4m3 vec_conversion<__nv_fp8_e4m3, float>(float const& a)
 {
     return __nv_fp8_e4m3(a);
 }
 
 // fp8_2_t
 template <>
-__inline__ __device__ float2 vec_conversion<float2, fp8_2_t>(const fp8_2_t& a)
+__inline__ __device__ float2 vec_conversion<float2, fp8_2_t>(fp8_2_t const& a)
 {
     return float2(a);
 }
 
 template <>
-__inline__ __device__ fp8_2_t vec_conversion<fp8_2_t, float2>(const float2& a)
+__inline__ __device__ fp8_2_t vec_conversion<fp8_2_t, float2>(float2 const& a)
 {
     return fp8_2_t(a);
 }
 
 // fp8_4_t
 template <>
-__inline__ __device__ float4 vec_conversion<float4, fp8_4_t>(const fp8_4_t& a)
+__inline__ __device__ float4 vec_conversion<float4, fp8_4_t>(fp8_4_t const& a)
 {
     return float4(a);
 }
 
 template <>
-__inline__ __device__ fp8_4_t vec_conversion<fp8_4_t, float4>(const float4& a)
+__inline__ __device__ fp8_4_t vec_conversion<fp8_4_t, float4>(float4 const& a)
 {
     return fp8_4_t(a);
 }
@@ -752,7 +752,7 @@ inline __device__ float qk_dot_(const Q_vec (&q)[N], const K_vec (&k)[N])
 }
 
 template <int THREADS_PER_KEY, typename Q_vec, typename K_vec, int N>
-inline __device__ float qk_scale_dot_(const Q_vec (&q)[N], const K_vec (&k)[N], const float k_scale)
+inline __device__ float qk_scale_dot_(const Q_vec (&q)[N], const K_vec (&k)[N], float const k_scale)
 {
 #ifdef MMHA_USE_FP32_ACCUM_FOR_FMA
     using K_vec_accum = typename K_vec_accum_fp32_<K_vec>::Type;
@@ -791,7 +791,7 @@ struct Qk_dot
     }
 
     template <typename Q_vec, typename K_vec, int N>
-    static inline __device__ float scale_dot(const Q_vec (&q)[N], const K_vec (&k)[N], const float k_scale)
+    static inline __device__ float scale_dot(const Q_vec (&q)[N], const K_vec (&k)[N], float const k_scale)
     {
 #ifdef MMHA_USE_HMMA
         static_assert("HMMA doesn't support k scales");
@@ -800,7 +800,7 @@ struct Qk_dot
     }
 
     template <int WARP_SIZE = 32>
-    static inline __device__ bool is_leader(const int tidx)
+    static inline __device__ bool is_leader(int const tidx)
     {
         return (tidx % THREADS_PER_KEY) == 0;
     }
@@ -809,14 +809,14 @@ struct Qk_dot
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename K_vec>
-inline __device__ void hmma_fp32(float4& c, const K_vec& a, K_vec b)
+inline __device__ void hmma_fp32(float4& c, K_vec const& a, K_vec b)
 {
     // Not supported.
     assert(false);
 }
 
 template <>
-inline __device__ void hmma_fp32(float4& c, const uint32_t& a, uint32_t b)
+inline __device__ void hmma_fp32(float4& c, uint32_t const& a, uint32_t b)
 {
     asm volatile(
         "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 \n"
@@ -829,14 +829,14 @@ inline __device__ void hmma_fp32(float4& c, const uint32_t& a, uint32_t b)
 }
 
 template <>
-inline __device__ void hmma_fp32(float4& c, const uint2& a, uint2 b)
+inline __device__ void hmma_fp32(float4& c, uint2 const& a, uint2 b)
 {
     hmma_fp32(c, a.x, b.x);
     hmma_fp32(c, a.y, b.y);
 }
 
 template <>
-inline __device__ void hmma_fp32(float4& c, const uint4& a, uint4 b)
+inline __device__ void hmma_fp32(float4& c, uint4 const& a, uint4 b)
 {
     hmma_fp32(c, a.x, b.x);
     hmma_fp32(c, a.y, b.y);
@@ -918,7 +918,7 @@ struct Qk_dot<uint16_t, THREADS_PER_KEY>
     }
 
     template <typename Q_vec, typename K_vec, int N>
-    static inline __device__ float scale_dot(const Q_vec (&q)[N], const K_vec (&k)[N], const float k_scale)
+    static inline __device__ float scale_dot(const Q_vec (&q)[N], const K_vec (&k)[N], float const k_scale)
     {
 #ifdef MMHA_USE_HMMA
         static_assert("HMMA doesn't support k scales");
@@ -927,7 +927,7 @@ struct Qk_dot<uint16_t, THREADS_PER_KEY>
     }
 
     template <int WARP_SIZE = 32>
-    static inline __device__ bool is_leader(const int tidx)
+    static inline __device__ bool is_leader(int const tidx)
     {
         // Use HMMA.FP32, leader threads are in the diagonal roughly (0, 4, 9, 13, 18, 22, 27, 31).
 #if __CUDA_ARCH__ >= 750 && defined(MMHA_USE_HMMA)
@@ -943,7 +943,7 @@ struct Qk_dot<uint16_t, THREADS_PER_KEY>
             leader = int(lane / THREADS_PER_KEY) * int(THREADS_PER_KEY / 8);
         }
 #else
-        const bool leader = 0;
+        bool const leader = 0;
 #endif // defined MMHA_USE_HMMA
         return (tidx % THREADS_PER_KEY) == leader;
     }
@@ -953,7 +953,7 @@ struct Qk_dot<uint16_t, THREADS_PER_KEY>
 
 template <typename Tk, typename V_vec_accum, typename V_vec_m, bool INT8_KV_CACHE, bool FP8_KV_CACHE>
 inline __device__ void Logit_value_fma(
-    V_vec_accum& out, const Tk* logits_smem, const V_vec_m& v_vec, const float v_scale, const bool is_mask)
+    V_vec_accum& out, Tk const* logits_smem, V_vec_m const& v_vec, float const v_scale, bool const is_mask)
 {
 #if defined(MMHA_USE_FP32_ACCUM_FOR_LOGITS)
     float logit = is_mask ? 0.f : reinterpret_cast<float*>(logits_smem)[0];
@@ -1331,12 +1331,12 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     // Note that the maximum sequence length supported by the model might be greater than this.
     // Note max_attention_window_size is maximum of cyclic_attention_window_size among all layers.
     // By default, you can assume that they are the same.
-    const auto cyclic_kv_cache_len = static_cast<unsigned>(params.cyclic_attention_window_size);
+    auto const cyclic_kv_cache_len = static_cast<unsigned>(params.cyclic_attention_window_size);
     // The number of sink tokens in kv cache to support streamingllm
-    const auto sink_token_len = static_cast<unsigned>(params.sink_token_length);
+    auto const sink_token_len = static_cast<unsigned>(params.sink_token_length);
     // The current timestep (including paddings).
     // It is only used to calculate the smem stride.
-    const auto timestep = static_cast<unsigned>(DO_MULTI_BLOCK ? params.timesteps_per_block : params.timestep);
+    auto const timestep = static_cast<unsigned>(DO_MULTI_BLOCK ? params.timesteps_per_block : params.timestep);
 
 #ifdef ENABLE_MULTI_BLOCK_OPTION
     constexpr bool MULTI_BLOCK_FLAG = DO_MULTI_BLOCK;
@@ -1357,7 +1357,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
 #ifndef MMHA_USE_FP32_ACCUM_FOR_LOGITS
     if (sizeof(Tk) != 4)
     {
-        const auto max_timesteps = DO_CROSS_ATTENTION ? cyclic_kv_cache_len : min(timestep, cyclic_kv_cache_len);
+        auto const max_timesteps = DO_CROSS_ATTENTION ? cyclic_kv_cache_len : min(timestep, cyclic_kv_cache_len);
         logits_smem_ += divUp(max_timesteps + 1, 4u) * 16;
     }
     Tk* logits_smem = reinterpret_cast<Tk*>(logits_smem_);
@@ -1431,27 +1431,27 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     static_assert(THREADS_PER_BLOCK >= QK_VECS_PER_Dh_MAX);
 
     // The batch/beam idx
-    const auto batch_beam_idx = blockIdx.y;
+    auto const batch_beam_idx = blockIdx.y;
     if (params.finished != nullptr && params.finished[batch_beam_idx])
     {
         return;
     }
 
     // The head.
-    const unsigned hi{blockIdx.x};
+    unsigned const hi{blockIdx.x};
     // The head index of keys and values adjusted for MQA/GQA.
-    const int qhead_per_kv{params.num_heads / params.num_kv_heads};
-    const unsigned hi_kv{hi / qhead_per_kv};
+    int const qhead_per_kv{params.num_heads / params.num_kv_heads};
+    unsigned const hi_kv{hi / qhead_per_kv};
     // The number of heads.
-    const auto num_heads = static_cast<unsigned>(params.num_heads);
+    auto const num_heads = static_cast<unsigned>(params.num_heads);
     // The number of heads for keys and values adjusted for MQA/GQA.
-    const auto num_heads_kv = static_cast<unsigned>(params.num_kv_heads);
+    auto const num_heads_kv = static_cast<unsigned>(params.num_kv_heads);
 
     // The thread in the block.
-    const unsigned tidx{threadIdx.x};
+    unsigned const tidx{threadIdx.x};
 
     // The column tile along L dimension on K^T -- noted as T_c in flash-attention paper
-    const unsigned c_tile{MULTI_BLOCK_FLAG ? blockIdx.z : 0};
+    unsigned const c_tile{MULTI_BLOCK_FLAG ? blockIdx.z : 0};
 
     // Indicate if we need to compute the K/V cache element (add KV bias, IA3, RoPE, etc.) and update the cache.
     // For Self-Attention, it's always required.
@@ -1477,40 +1477,40 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
 
     // The actual sequence length excluding the paddings.
     // minus 1 because it includes the current timestep while tlength denotes the kv cache length.
-    const int tlength = DO_CROSS_ATTENTION
+    int const tlength = DO_CROSS_ATTENTION
         ? params.memory_length_per_sample[batch_beam_idx] - 1
         : (params.length_per_sample ? (params.length_per_sample[batch_beam_idx] - 1) : static_cast<int>(timestep));
     // We will use cyclic kv cache when it exceeds the limit.
     // The length position for storing new key and value.
-    const int cyclic_tlength = kvCacheBuffer.getKVTokenIdx(tlength);
+    int const cyclic_tlength = kvCacheBuffer.getKVTokenIdx(tlength);
     // When enable cyclic kv cache and one more block mode, we need to shift the index to the actual index in the
     // sequence. Otherwise, if the token is not the sink token, we need to add the bubblen length to the index.
-    const bool enable_use_seq_idx_kv = kvCacheBuffer.mEnableOneMoreBlock && tlength > cyclic_kv_cache_len;
-    const int shift_for_cyclic_kv = (enable_use_seq_idx_kv) ? tlength - cyclic_kv_cache_len : kvCacheBuffer.mBubbleLen;
-    const int shift_for_cyclic_k = (enable_use_seq_idx_kv) ? tlength - cyclic_kv_cache_len : pastKCache.mBubbleLen;
+    bool const enable_use_seq_idx_kv = kvCacheBuffer.mEnableOneMoreBlock && tlength > cyclic_kv_cache_len;
+    int const shift_for_cyclic_kv = (enable_use_seq_idx_kv) ? tlength - cyclic_kv_cache_len : kvCacheBuffer.mBubbleLen;
+    int const shift_for_cyclic_k = (enable_use_seq_idx_kv) ? tlength - cyclic_kv_cache_len : pastKCache.mBubbleLen;
     // The actual kv cache length.
     // tlength is the past length actually.
-    const int kv_loop_length = min(tlength, cyclic_kv_cache_len);
+    int const kv_loop_length = min(tlength, cyclic_kv_cache_len);
     // The context length for beam searching optimization (all points to beam 0).
     // TODO: with cyclic kv cache, we set it 0 for now (will optimize in the future)
     // as context kv cache might be overwritten by the new kv cache
-    const int beam0_context_length
+    int const beam0_context_length
         = HAS_BEAMS && tlength > cyclic_kv_cache_len ? 0 : params.input_lengths[batch_beam_idx];
     // The position of the current timestep, and it is used to apply the position embedding
-    const int current_pos_idx = (!POS_SHIFT || DO_CROSS_ATTENTION) ? tlength : kv_loop_length;
+    int const current_pos_idx = (!POS_SHIFT || DO_CROSS_ATTENTION) ? tlength : kv_loop_length;
 
     // The offset in the Q and K buffer also accounts for the batch.
-    const auto qk_vec_idx = tidx * QK_VEC_SIZE;
-    const auto is_valid_qk_vec = qk_vec_idx < Dh;
+    auto const qk_vec_idx = tidx * QK_VEC_SIZE;
+    auto const is_valid_qk_vec = qk_vec_idx < Dh;
 
-    const bool load_qkv_quant = params.qkv_scale_quant_orig != nullptr;
-    const bool write_attention_quant = params.attention_out_scale_orig_quant != nullptr;
+    bool const load_qkv_quant = params.qkv_scale_quant_orig != nullptr;
+    bool const write_attention_quant = params.attention_out_scale_orig_quant != nullptr;
 
     // Quant/Dequant scales for 8bits kv cache.
     using T_scale = typename kv_cache_scale_type_t<T, Tcache>::Type;
     T_scale kv_scale_orig_quant, k_scale_quant_orig;
-    const float k_scale_quant_orig_f = (ENABLE_8BITS_K_CACHE ? params.kv_scale_quant_orig[0] : 1.0f);
-    const float kv_scale_quant_orig_f = (ENABLE_8BITS_KV_CACHE ? params.kv_scale_quant_orig[0] : 1.0f);
+    float const k_scale_quant_orig_f = (ENABLE_8BITS_K_CACHE ? params.kv_scale_quant_orig[0] : 1.0f);
+    float const kv_scale_quant_orig_f = (ENABLE_8BITS_KV_CACHE ? params.kv_scale_quant_orig[0] : 1.0f);
     convert_from_float(&k_scale_quant_orig, k_scale_quant_orig_f);
     convert_from_float(&kv_scale_orig_quant, (ENABLE_8BITS_KV_CACHE ? params.kv_scale_orig_quant[0] : 1.0f));
 
@@ -1535,29 +1535,29 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         // The stride between tokens. We may be able to always use params.stride.
         uint32_t q_stride = params.stride ? static_cast<uint32_t>(params.stride) : (num_heads * Dh);
         // The offset.
-        const auto q_offset = tensorrt_llm::common::flat_index_strided3(batch_beam_idx, hi, qk_vec_idx, q_stride, Dh);
+        auto const q_offset = tensorrt_llm::common::flat_index_strided3(batch_beam_idx, hi, qk_vec_idx, q_stride, Dh);
 
         if (load_qkv_quant)
         {
             using Packed_Int8_t = typename packed_type<int8_t, num_elems<Qk_vec_m>::value>::type;
             using Packed_Float_t = typename packed_type<float, num_elems<Qk_vec_m>::value>::type;
-            const auto q_scaling = params.qkv_scale_quant_orig[0];
-            const auto q_quant
-                = *reinterpret_cast<const Packed_Int8_t*>(&reinterpret_cast<const int8_t*>(params.q)[q_offset]);
+            auto const q_scaling = params.qkv_scale_quant_orig[0];
+            auto const q_quant
+                = *reinterpret_cast<Packed_Int8_t const*>(&reinterpret_cast<int8_t const*>(params.q)[q_offset]);
             convert_from_float(&q, mul<Packed_Float_t, float>(q_scaling, float_from_int8(q_quant)));
         }
         else
         {
-            q = vec_conversion<Qk_vec_k, Qk_vec_m>(*reinterpret_cast<const Qk_vec_m*>(&params.q[q_offset]));
+            q = vec_conversion<Qk_vec_k, Qk_vec_m>(*reinterpret_cast<Qk_vec_m const*>(&params.q[q_offset]));
         }
 
         if constexpr (DO_CROSS_ATTENTION)
         {
-            const auto k_idx = QK_VEC_SIZE * tidx;
-            const int inBlockIdx = kvCacheBuffer.getKVLocalIdx(cyclic_tlength, hi, Dh, k_idx);
+            auto const k_idx = QK_VEC_SIZE * tidx;
+            int const inBlockIdx = kvCacheBuffer.getKVLocalIdx(cyclic_tlength, hi, Dh, k_idx);
             Tcache* k_cache = reinterpret_cast<Tcache*>(kvCacheBuffer.getKBlockPtr(batch_beam_idx, cyclic_tlength));
 
-            k = vec_conversion<Qk_vec_k, Qk_vec_m>(*reinterpret_cast<const Qk_vec_m*>(&k_cache[inBlockIdx]));
+            k = vec_conversion<Qk_vec_k, Qk_vec_m>(*reinterpret_cast<Qk_vec_m const*>(&k_cache[inBlockIdx]));
         }
         else
         {
@@ -1565,36 +1565,36 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
             // The stride between tokens. We may be able to always use params.stride.
             uint32_t k_stride = params.stride ? static_cast<uint32_t>(params.stride) : (num_heads_kv * Dh);
             // The offset.
-            const auto k_offset
+            auto const k_offset
                 = tensorrt_llm::common::flat_index_strided3(batch_beam_idx, hi_kv, qk_vec_idx, k_stride, Dh);
 
             if (load_qkv_quant)
             {
                 using Packed_Int8_t = typename packed_type<int8_t, num_elems<Qk_vec_m>::value>::type;
                 using Packed_Float_t = typename packed_type<float, num_elems<Qk_vec_m>::value>::type;
-                const auto k_scaling = params.qkv_scale_quant_orig[1];
-                const auto k_quant
-                    = *reinterpret_cast<const Packed_Int8_t*>(&reinterpret_cast<const int8_t*>(params.k)[k_offset]);
+                auto const k_scaling = params.qkv_scale_quant_orig[1];
+                auto const k_quant
+                    = *reinterpret_cast<Packed_Int8_t const*>(&reinterpret_cast<int8_t const*>(params.k)[k_offset]);
 
                 convert_from_float(&k, mul<Packed_Float_t, float>(k_scaling, float_from_int8(k_quant)));
             }
             else
             {
-                k = vec_conversion<Qk_vec_k, Qk_vec_m>(*reinterpret_cast<const Qk_vec_m*>(&params.k[k_offset]));
+                k = vec_conversion<Qk_vec_k, Qk_vec_m>(*reinterpret_cast<Qk_vec_m const*>(&params.k[k_offset]));
             }
         }
 
         if (params.q_bias != nullptr)
         {
-            const auto q_bias_offset = tensorrt_llm::common::flat_index2(hi, qk_vec_idx, Dh);
+            auto const q_bias_offset = tensorrt_llm::common::flat_index2(hi, qk_vec_idx, Dh);
             q_bias
-                = vec_conversion<Qk_vec_k, Qk_vec_m>(*reinterpret_cast<const Qk_vec_m*>(&params.q_bias[q_bias_offset]));
+                = vec_conversion<Qk_vec_k, Qk_vec_m>(*reinterpret_cast<Qk_vec_m const*>(&params.q_bias[q_bias_offset]));
         }
         if (HANDLE_KV && params.k_bias != nullptr)
         {
-            const auto k_bias_offset = tensorrt_llm::common::flat_index2(hi_kv, qk_vec_idx, Dh);
+            auto const k_bias_offset = tensorrt_llm::common::flat_index2(hi_kv, qk_vec_idx, Dh);
             k_bias
-                = vec_conversion<Qk_vec_k, Qk_vec_m>(*reinterpret_cast<const Qk_vec_m*>(&params.k_bias[k_bias_offset]));
+                = vec_conversion<Qk_vec_k, Qk_vec_m>(*reinterpret_cast<Qk_vec_m const*>(&params.k_bias[k_bias_offset]));
         }
     }
 
@@ -1606,20 +1606,20 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     }
 
     // The width of the beam.
-    const auto beam_width = static_cast<unsigned>(params.beam_width);
+    auto const beam_width = static_cast<unsigned>(params.beam_width);
     // The batch idx.
-    const int batch_idx = batch_beam_idx / beam_width;
+    int const batch_idx = batch_beam_idx / beam_width;
     // Do we apply IA3?
-    const bool do_ia3 = HANDLE_KV && params.ia3_tasks != nullptr;
+    bool const do_ia3 = HANDLE_KV && params.ia3_tasks != nullptr;
     // Compute the IA3 task. One per batch index.
-    const auto ia3_ti_hi = do_ia3
+    auto const ia3_ti_hi = do_ia3
         ? tensorrt_llm::common::flat_index2(static_cast<unsigned>(params.ia3_tasks[batch_idx]), hi, num_heads)
         : 0;
 
     if (do_ia3 && is_valid_qk_vec)
     {
         k = mul<Qk_vec_k, Qk_vec_k, Qk_vec_k>(k,
-            vec_conversion<Qk_vec_k, Qk_vec_m>(*reinterpret_cast<const Qk_vec_m*>(
+            vec_conversion<Qk_vec_k, Qk_vec_m>(*reinterpret_cast<Qk_vec_m const*>(
                 &params.ia3_key_weights[tensorrt_llm::common::flat_index2(ia3_ti_hi, qk_vec_idx, Dh)])));
     }
     k_wo_pos = k;
@@ -1650,15 +1650,15 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     }
     case PositionEmbeddingType::kROPE_GPT_NEOX:
     {
-        const bool do_rotary = is_valid_qk_vec && QK_VEC_SIZE * tidx < params.rotary_embedding_dim;
+        bool const do_rotary = is_valid_qk_vec && QK_VEC_SIZE * tidx < params.rotary_embedding_dim;
 
         T* q_smem_ = reinterpret_cast<T*>(smem_);
         T* k_smem_ = q_smem_ + params.rotary_embedding_dim;
 
-        const int half_rotary_dim = params.rotary_embedding_dim / 2;
-        const int half_idx = qk_vec_idx / half_rotary_dim;
-        const int intra_half_idx = qk_vec_idx % half_rotary_dim;
-        const int smem_pitch = half_rotary_dim; // TODO: adjust for bank conflicts
+        int const half_rotary_dim = params.rotary_embedding_dim / 2;
+        int const half_idx = qk_vec_idx / half_rotary_dim;
+        int const intra_half_idx = qk_vec_idx % half_rotary_dim;
+        int const smem_pitch = half_rotary_dim; // TODO: adjust for bank conflicts
 
         assert(half_rotary_dim % QK_VEC_SIZE == 0);
 
@@ -1673,7 +1673,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
 
         __syncthreads();
 
-        const int transpose_idx = half_idx * (half_rotary_dim / 2) + intra_half_idx / 2;
+        int const transpose_idx = half_idx * (half_rotary_dim / 2) + intra_half_idx / 2;
         constexpr int tidx_factor = (QK_VEC_SIZE > 1) ? QK_VEC_SIZE / 2 : 1;
         if (do_rotary)
         {
@@ -1770,8 +1770,8 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     }
 
     // Pre-compute the pointer for the relative attention bias.
-    const T* relative_attention_bias_ptr = nullptr;
-    const T* relative_attention_bias_ptr_fixed = nullptr; // record the base for offset
+    T const* relative_attention_bias_ptr = nullptr;
+    T const* relative_attention_bias_ptr_fixed = nullptr; // record the base for offset
     if (has_relative_attention_bias)
     {
         // "hi" is unsigned, subtracting int from unsigned int causes underflow. Cast to int
@@ -1819,7 +1819,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
 
     // The positions of the cache buffer (for this B * H) and the vector within that chunk associated with this
     // thread.
-    const auto k_idx = chunk_index<T, K_vec_k, THREADS_PER_KEY>(tidx);
+    auto const k_idx = chunk_index<T, K_vec_k, THREADS_PER_KEY>(tidx);
 
     // The number of vectors per thread.
     constexpr unsigned K_VECS_PER_THREAD{Dh_MAX / K_ELTS_PER_CHUNK};
@@ -1830,7 +1830,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
 #pragma unroll
     for (unsigned ii = 0; ii < K_VECS_PER_THREAD; ++ii)
     {
-        q_vec[ii] = vec_conversion<K_vec_accum, K_vec_k>(*reinterpret_cast<const K_vec_k*>(
+        q_vec[ii] = vec_conversion<K_vec_accum, K_vec_k>(*reinterpret_cast<K_vec_k const*>(
             &q_smem[tensorrt_llm::common::flat_index2(ii, k_idx.y, K_ELTS_PER_CHUNK)]));
     }
 
@@ -1843,11 +1843,11 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     // The number of unrolled keys per ieration.
     constexpr unsigned UNROLLED_K_PER_ITER = K_PER_ITER * K_LOOP_UNROLL;
 
-    const auto timesteps_per_block = static_cast<unsigned>(params.timesteps_per_block);
+    auto const timesteps_per_block = static_cast<unsigned>(params.timesteps_per_block);
 
     // Pick a number of keys to make sure all the threads of a warp enter (due to shfl_sync).
     // Take all previous cache as context when we have no beam searching in order to batch as many LDGs as possible.
-    const int context_length
+    int const context_length
         = DO_CROSS_ATTENTION ? kv_loop_length : (HAS_BEAMS ? beam0_context_length : kv_loop_length);
     // Clarifications:
     // - in self attn, input_length is input text length, tlength is current timestep
@@ -1860,31 +1860,31 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     // - for cross attn, no-beam/beam search: cache length is fixed, not differ context/generation cache -->
     // context_length = tlength Suggestion: we could have a flag HANDLE_GEN_CACHE
 
-    const auto context_ti_end = MULTI_BLOCK_FLAG
+    auto const context_ti_end = MULTI_BLOCK_FLAG
         ? divUp(timesteps_per_block, UNROLLED_K_PER_WARP) * UNROLLED_K_PER_WARP
         : divUp(static_cast<unsigned>(context_length), UNROLLED_K_PER_WARP) * UNROLLED_K_PER_WARP;
 
     // The generation ti_end.
-    const auto generation_ti_end = MULTI_BLOCK_FLAG
+    auto const generation_ti_end = MULTI_BLOCK_FLAG
         ? divUp(timesteps_per_block, K_PER_WARP) * K_PER_WARP
         : divUp(static_cast<unsigned>(kv_loop_length), K_PER_WARP) * K_PER_WARP;
 
     // Iterate over the keys/timesteps to compute the various (Q*K^T)_{ti} values.
     // Note max_attention_window_size is maximum of cyclic_attention_window_size among all layers.
     // By default, you can assume that they are the same.
-    const auto bi_seq_len_offset = static_cast<std::size_t>(batch_beam_idx) * params.max_attention_window_size;
+    auto const bi_seq_len_offset = static_cast<std::size_t>(batch_beam_idx) * params.max_attention_window_size;
     // Beam indices are based on the max_attention_window_size while each layer may have different
     // cyclic_attention_window_size So we need to rebuild the beam_indices if max_attention_window_size is not equal to
     // cyclic_attention_window_size.
-    const int* beam_indices = HAS_BEAMS ? &params.cache_indir[bi_seq_len_offset] : nullptr;
+    int const* beam_indices = HAS_BEAMS ? &params.cache_indir[bi_seq_len_offset] : nullptr;
 
-    const auto c_tile_times_timesteps_per_block = c_tile * timesteps_per_block; // 0 if !MULTI_BLOCK_FLAG
+    auto const c_tile_times_timesteps_per_block = c_tile * timesteps_per_block; // 0 if !MULTI_BLOCK_FLAG
 
     ////////////////////////////////////////////////////////////////////////////////////////////////
     // Key cache loops for dot(Q, K).
 
     // Is it the leader?
-    const bool is_leader = Qk_dot<T, THREADS_PER_KEY>::is_leader(tidx);
+    bool const is_leader = Qk_dot<T, THREADS_PER_KEY>::is_leader(tidx);
 
     // The slope for ALiBi.
     float linear_bias_slope = 0.f;
@@ -1899,7 +1899,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     // Explicit batching of LDGs (by K_LOOP_UNROLL) as it doesn't depend on indirection tables.
     for (int ti = k_idx.x; ti < context_ti_end; ti += UNROLLED_K_PER_ITER)
     {
-        const int time_now = MULTI_BLOCK_FLAG ? ti + c_tile_times_timesteps_per_block : ti;
+        int const time_now = MULTI_BLOCK_FLAG ? ti + c_tile_times_timesteps_per_block : ti;
 
         // The keys loaded from the key cache.
         K_vec_m k_vec_cache[K_LOOP_UNROLL][K_VECS_PER_THREAD];
@@ -1926,21 +1926,21 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
                         valid_time_now = pastKCache.getKVTokenIdx(valid_time_now);
                     }
                 }
-                const int seqIdx = batch_idx * beam_width;
+                int const seqIdx = batch_idx * beam_width;
 
                 // Base pointer to k cache block for beam's batch
                 TKcache* k_cache_batch = reinterpret_cast<TKcache*>(pastKCache.getKBlockPtr(seqIdx, valid_time_now));
 
                 int inBlockIdx = pastKCache.getKVLocalIdx(valid_time_now, hi_kv, Dh, jj);
-                k_vec_cache[k_loop][k_vec_i] = *reinterpret_cast<const K_vec_m*>(&k_cache_batch[inBlockIdx]);
+                k_vec_cache[k_loop][k_vec_i] = *reinterpret_cast<K_vec_m const*>(&k_cache_batch[inBlockIdx]);
             }
         }
 
 #pragma unroll
         for (int k_loop = 0; k_loop < K_LOOP_UNROLL; ++k_loop)
         {
-            const int local_time_now = time_now + k_loop * K_PER_ITER;
-            const int local_ti = ti + k_loop * K_PER_ITER;
+            int const local_time_now = time_now + k_loop * K_PER_ITER;
+            int const local_ti = ti + k_loop * K_PER_ITER;
 
             // Perform the dot product and normalize qk.
             //
@@ -1953,7 +1953,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
             }
 
             // Is it active?
-            const bool is_active = local_time_now < context_length;
+            bool const is_active = local_time_now < context_length;
 
             if constexpr (IMPLICIT_REL_ATTN_BIAS)
             {
@@ -2044,14 +2044,14 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         && (!MULTI_BLOCK_FLAG || (c_tile + 1) * timesteps_per_block > beam0_context_length))
     {
         // The input length;
-        const int input_length_ = MULTI_BLOCK_FLAG ? beam0_context_length % timesteps_per_block : beam0_context_length;
+        int const input_length_ = MULTI_BLOCK_FLAG ? beam0_context_length % timesteps_per_block : beam0_context_length;
         // The beginning of the generation.
-        const int generation_start_ti = k_idx.x + input_length_ / K_PER_WARP * K_PER_WARP;
+        int const generation_start_ti = k_idx.x + input_length_ / K_PER_WARP * K_PER_WARP;
 
         // Iterate over the output tokens.
         for (int ti = generation_start_ti; ti < generation_ti_end; ti += K_PER_ITER)
         {
-            const int time_now = MULTI_BLOCK_FLAG ? ti + c_tile_times_timesteps_per_block : ti;
+            int const time_now = MULTI_BLOCK_FLAG ? ti + c_tile_times_timesteps_per_block : ti;
 
             // The keys loaded from the key cache.
             K_vec_m k_vec[K_VECS_PER_THREAD];
@@ -2059,7 +2059,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
 #pragma unroll
             for (int k_vec_i = 0; k_vec_i < K_VECS_PER_THREAD; ++k_vec_i)
             {
-                const int jj = min(k_idx.y + k_vec_i * K_ELTS_PER_CHUNK, Dh - K_VEC_SIZE);
+                int const jj = min(k_idx.y + k_vec_i * K_ELTS_PER_CHUNK, Dh - K_VEC_SIZE);
                 int valid_time_now = min(time_now, kv_loop_length - 1);
                 int beam_offset = beam_indices[valid_time_now];
                 if (POS_SHIFT && valid_time_now >= sink_token_len)
@@ -2073,16 +2073,16 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
                         valid_time_now = pastKCache.getKVTokenIdx(valid_time_now);
                     }
                 }
-                const int seqIdx = batch_idx * beam_width + beam_offset;
+                int const seqIdx = batch_idx * beam_width + beam_offset;
                 // Base pointer to k cache block for beam's batch, before offsetting with indirection buffer
                 TKcache* k_cache_batch = reinterpret_cast<TKcache*>(pastKCache.getKBlockPtr(seqIdx, valid_time_now));
 
                 int inBlockIdx = pastKCache.getKVLocalIdx(valid_time_now, hi_kv, Dh, jj);
-                k_vec[k_vec_i] = (*reinterpret_cast<const K_vec_m*>(&k_cache_batch[inBlockIdx]));
+                k_vec[k_vec_i] = (*reinterpret_cast<K_vec_m const*>(&k_cache_batch[inBlockIdx]));
             }
 
             // Is it active?
-            const bool is_active = time_now >= context_length && time_now < kv_loop_length;
+            bool const is_active = time_now >= context_length && time_now < kv_loop_length;
 
             if constexpr (IMPLICIT_REL_ATTN_BIAS)
             {
@@ -2192,8 +2192,8 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
 #endif // defined MMHA_USE_HMMA
 
     // Decompose the thread index into warp and lane.
-    const auto warp = tidx / WARP_SIZE;
-    const auto lane = tidx % WARP_SIZE;
+    auto const warp = tidx / WARP_SIZE;
+    auto const lane = tidx % WARP_SIZE;
 
     // The warp leader writes the max to shared memory.
     if (lane == 0)
@@ -2217,8 +2217,8 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     {
         // Trigger the stores to global memory.
         Qk_vec_k k_vec = *reinterpret_cast<Qk_vec_k*>(&k_smem[qk_vec_idx]);
-        const auto k_idx = QK_VEC_SIZE * tidx;
-        const int inBlockIdx = kvCacheBuffer.getKVLocalIdx(cyclic_tlength, hi_kv, Dh, k_idx);
+        auto const k_idx = QK_VEC_SIZE * tidx;
+        int const inBlockIdx = kvCacheBuffer.getKVLocalIdx(cyclic_tlength, hi_kv, Dh, k_idx);
         // The base pointer for the value in the cache buffer.
         Tcache* k_cache = reinterpret_cast<Tcache*>(kvCacheBuffer.getKBlockPtr(batch_beam_idx, cyclic_tlength));
 
@@ -2247,11 +2247,11 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     float sum = 0.f;
 
     // Each thread will handle one float (either qk_smem/logit).
-    const int logit_loop_end = MULTI_BLOCK_FLAG ? timesteps_per_block : kv_loop_length;
+    int const logit_loop_end = MULTI_BLOCK_FLAG ? timesteps_per_block : kv_loop_length;
     for (int ti = tidx; ti <= logit_loop_end; ti += THREADS_PER_BLOCK)
     {
 
-        const int time_now = MULTI_BLOCK_FLAG ? ti + c_tile_times_timesteps_per_block : ti;
+        int const time_now = MULTI_BLOCK_FLAG ? ti + c_tile_times_timesteps_per_block : ti;
 
         // For single-block mode, we don't need the mask since it has been skipped.
         if (!MULTI_BLOCK_FLAG)
@@ -2289,10 +2289,10 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
 #endif // MMHA_FP8_SCALE_P_INSTEAD_OF_V
     float inv_sum = __fdividef(logit_scale, sum + 1.e-6f);
 
-    const int normlization_loop_end = MULTI_BLOCK_FLAG ? timesteps_per_block : kv_loop_length;
+    int const normlization_loop_end = MULTI_BLOCK_FLAG ? timesteps_per_block : kv_loop_length;
     for (int ti = tidx; ti <= normlization_loop_end; ti += THREADS_PER_BLOCK)
     {
-        const int time_now = MULTI_BLOCK_FLAG ? ti + c_tile_times_timesteps_per_block : ti;
+        int const time_now = MULTI_BLOCK_FLAG ? ti + c_tile_times_timesteps_per_block : ti;
 
         if (!MULTI_BLOCK_FLAG)
         {
@@ -2315,11 +2315,11 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     // Put Values part below so we leverage __syncthreads
     // from the previous step
 
-    const auto v_idx = chunk_index<T, V_vec_k, THREADS_PER_VALUE>(tidx);
+    auto const v_idx = chunk_index<T, V_vec_k, THREADS_PER_VALUE>(tidx);
     // The value computed by this thread.
-    const auto vo = v_idx.x;
+    auto const vo = v_idx.x;
     // The hidden dimensions computed by this particular thread.
-    const auto vi = v_idx.y;
+    auto const vi = v_idx.y;
 
     // The number of values processed per iteration of the loop.
     constexpr unsigned V_PER_ITER{THREADS_PER_BLOCK / THREADS_PER_VALUE};
@@ -2337,8 +2337,8 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         // Trigger the loads from the V bias buffer.
         if (params.v_bias != nullptr)
         {
-            const auto v_bias_offset = tensorrt_llm::common::flat_index2(hi_kv, vi, Dh);
-            v_bias = *reinterpret_cast<const V_vec_k*>(&params.v_bias[v_bias_offset]);
+            auto const v_bias_offset = tensorrt_llm::common::flat_index2(hi_kv, vi, Dh);
+            v_bias = *reinterpret_cast<V_vec_k const*>(&params.v_bias[v_bias_offset]);
         }
 
         if (DO_CROSS_ATTENTION)
@@ -2370,7 +2370,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         // Handle both context and generation value cache without beam searching.
         // Explicit batching of LDGs (by V_LOOP_UNROLL) as it doesn't depend on indirection tables.
         // Take all previous cache as context when we have no beam searching in order to batch as many LDGs as possible.
-        const int context_length
+        int const context_length
             = DO_CROSS_ATTENTION ? kv_loop_length : (HAS_BEAMS ? beam0_context_length : kv_loop_length);
         int context_v_loop_end = MULTI_BLOCK_FLAG ? timesteps_per_block : context_length;
         int generation_v_loop_end = MULTI_BLOCK_FLAG ? timesteps_per_block : kv_loop_length;
@@ -2396,11 +2396,11 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
                 }
                 int rowIdx = batch_idx * beam_width;
 
-                const int inBlockIdx = kvCacheBuffer.getKVLocalIdx(time_idx, hi_kv, Dh, vi);
+                int const inBlockIdx = kvCacheBuffer.getKVLocalIdx(time_idx, hi_kv, Dh, vi);
                 // The base pointer for the value in the cache buffer.
                 Tcache* v_cache_batch = reinterpret_cast<Tcache*>(kvCacheBuffer.getVBlockPtr(rowIdx, time_idx));
 
-                v_vec_cache[v_loop] = *reinterpret_cast<const V_vec_m*>(&v_cache_batch[inBlockIdx]);
+                v_vec_cache[v_loop] = *reinterpret_cast<V_vec_m const*>(&v_cache_batch[inBlockIdx]);
             }
 
 #pragma unroll
@@ -2411,7 +2411,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
                 int local_time_idx = ti + v_loop * V_PER_ITER;
                 int time_idx = local_time_idx + (MULTI_BLOCK_FLAG ? c_tile_times_timesteps_per_block : 0);
 
-                const bool is_mask
+                bool const is_mask
                     = (MULTI_BLOCK_FLAG && local_time_idx >= timesteps_per_block) || (time_idx >= context_length);
 
                 // Load the logits from shared memory.
@@ -2424,7 +2424,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         // Handle generation value cache with beam searching.
         if (HAS_BEAMS && !DO_CROSS_ATTENTION)
         {
-            const auto generation_start_ti
+            auto const generation_start_ti
                 = MULTI_BLOCK_FLAG ? vo : (vo + (beam0_context_length / V_PER_ITER) * V_PER_ITER);
             // Only the last few blocks need to handle the generation value cache.
             if (!MULTI_BLOCK_FLAG || (c_tile + 1) * timesteps_per_block > beam0_context_length)
@@ -2452,10 +2452,10 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
                         }
                     }
 
-                    const int inBlockIdx = kvCacheBuffer.getKVLocalIdx(time_idx, hi_kv, Dh, vi);
+                    int const inBlockIdx = kvCacheBuffer.getKVLocalIdx(time_idx, hi_kv, Dh, vi);
                     // The base pointer for the value in the cache buffer.
                     Tcache* v_cache_batch = reinterpret_cast<Tcache*>(kvCacheBuffer.getVBlockPtr(rowIdx, time_idx));
-                    V_vec_m v_vec = reinterpret_cast<const V_vec_m*>(&v_cache_batch[inBlockIdx])[0];
+                    V_vec_m v_vec = reinterpret_cast<V_vec_m const*>(&v_cache_batch[inBlockIdx])[0];
 
                     // Load the logits from shared memory.
                     // Note that fma will convert 8bit vec to the accumulation data type (float by default).
@@ -2470,19 +2470,19 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     __syncthreads();
 
     // Get the c_tile_id that handles the current timestep.
-    const int ctile_idx = tlength / timesteps_per_block;
+    int const ctile_idx = tlength / timesteps_per_block;
 
     // One group of threads computes the product(s) for the current timestep.
     if (vo == kv_loop_length % V_PER_ITER && is_valid_vi && (!MULTI_BLOCK_FLAG || (c_tile == ctile_idx)))
     {
-        const int inBlockIdx = kvCacheBuffer.getKVLocalIdx(cyclic_tlength, hi_kv, Dh, vi);
+        int const inBlockIdx = kvCacheBuffer.getKVLocalIdx(cyclic_tlength, hi_kv, Dh, vi);
         // The base pointer for the value in the cache buffer.
         Tcache* v_cache_base = reinterpret_cast<Tcache*>(kvCacheBuffer.getVBlockPtr(batch_beam_idx, cyclic_tlength));
 
         V_vec_k v;
         if (DO_CROSS_ATTENTION)
         {
-            v = vec_conversion<V_vec_k, V_vec_k>(*reinterpret_cast<const V_vec_k*>(&v_cache_base[inBlockIdx]));
+            v = vec_conversion<V_vec_k, V_vec_k>(*reinterpret_cast<V_vec_k const*>(&v_cache_base[inBlockIdx]));
         }
         else
         {
@@ -2490,21 +2490,21 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
             // The stride between tokens. We may be able to always use params.stride.
             uint32_t v_stride = params.stride ? static_cast<uint32_t>(params.stride) : (num_heads_kv * Dh);
             // The offset.
-            const auto v_offset = tensorrt_llm::common::flat_index_strided3(batch_beam_idx, hi_kv, vi, v_stride, Dh);
+            auto const v_offset = tensorrt_llm::common::flat_index_strided3(batch_beam_idx, hi_kv, vi, v_stride, Dh);
 
             if (load_qkv_quant)
             {
                 using Packed_Int8_t = typename packed_type<int8_t, num_elems<V_vec_k>::value>::type;
                 using Packed_Float_t = typename packed_type<float, num_elems<V_vec_k>::value>::type;
-                const auto v_scaling = params.qkv_scale_quant_orig[2];
-                const auto v_quant
-                    = *reinterpret_cast<const Packed_Int8_t*>(&reinterpret_cast<const int8_t*>(params.v)[v_offset]);
+                auto const v_scaling = params.qkv_scale_quant_orig[2];
+                auto const v_quant
+                    = *reinterpret_cast<Packed_Int8_t const*>(&reinterpret_cast<int8_t const*>(params.v)[v_offset]);
 
                 convert_from_float(&v, mul<Packed_Float_t, float>(v_scaling, float_from_int8(v_quant)));
             }
             else
             {
-                v = *reinterpret_cast<const V_vec_k*>(&params.v[v_offset]);
+                v = *reinterpret_cast<V_vec_k const*>(&params.v[v_offset]);
             }
         }
 
@@ -2516,7 +2516,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
             if (do_ia3)
             {
                 v = mul<V_vec_k, V_vec_k, V_vec_k>(v,
-                    *reinterpret_cast<const V_vec_k*>(
+                    *reinterpret_cast<V_vec_k const*>(
                         &params.ia3_value_weights[tensorrt_llm::common::flat_index2(ia3_ti_hi, vi, Dh)]));
             }
         }
@@ -2584,17 +2584,17 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         // The bottom warps update their values.
         if (vo < midpoint && (Dh == Dh_MAX || vi < Dh))
         {
-            out = add(*reinterpret_cast<const V_vec_k*>(&out_smem[vo * Dh + vi]), out);
+            out = add(*reinterpret_cast<V_vec_k const*>(&out_smem[vo * Dh + vi]), out);
         }
         __syncthreads();
     }
 
-    const auto bhi = tensorrt_llm::common::flat_index2(batch_beam_idx, hi, num_heads);
-    const auto bhi_seq_len_tile = bhi * params.seq_len_tile;
+    auto const bhi = tensorrt_llm::common::flat_index2(batch_beam_idx, hi, num_heads);
+    auto const bhi_seq_len_tile = bhi * params.seq_len_tile;
     // Output the final values.
     if (vo == 0 && (Dh == Dh_MAX || vi < Dh))
     {
-        const auto bhvi = tensorrt_llm::common::flat_index2(bhi, vi, Dh);
+        auto const bhvi = tensorrt_llm::common::flat_index2(bhi, vi, Dh);
 #ifdef MMHA_USE_FP32_ACCUM_FOR_OUT
         if (write_attention_quant)
         {
@@ -2693,7 +2693,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
             if (tidx < gridDim.z)
             {
                 thread_partial_max = params.partial_max[bhi_seq_len_tile + tidx];
-                const auto thread_partial_sum = params.partial_sum[bhi_seq_len_tile + tidx];
+                auto const thread_partial_sum = params.partial_sum[bhi_seq_len_tile + tidx];
                 final_sum += __expf(thread_partial_max - final_max) * thread_partial_sum;
             }
 
@@ -2708,7 +2708,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
             // Shared memory to store partial outputs for each oi. -> size: gridDim.z * Dh * 4 Bytes. Reuse qk_smem.
             T* out_oi_smem = reinterpret_cast<T*>(smem_);
 
-            const auto o_idx = chunk_index<T, V_vec_k, THREADS_PER_VALUE>(tidx);
+            auto const o_idx = chunk_index<T, V_vec_k, THREADS_PER_VALUE>(tidx);
 
             // Init partial out for accumulation.
             V_vec_k zero_k;
@@ -2716,10 +2716,10 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
             V_vec_k thread_accumulated_out = zero_k;
 
             // The hidden dimensions computed by this particular thread. (refer to vi)
-            const auto oi = o_idx.y;
+            auto const oi = o_idx.y;
 
             // The partial output region this thread takes care of
-            const auto oo = o_idx.x;
+            auto const oo = o_idx.x;
 
             // Each thread may handle more than one partial output.
             for (int tile_idx = o_idx.x; tile_idx < gridDim.z; tile_idx += V_PER_ITER)
@@ -2730,7 +2730,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
                 float thread_partial_max_for_out = params.partial_max[bhi_seq_len_tile + tile_idx];
                 // Load the partial outputs.
                 V_vec_k thread_partial_out
-                    = *reinterpret_cast<const V_vec_k*>(&params.partial_out[thread_partial_out_offset + bhi * Dh + oi]);
+                    = *reinterpret_cast<V_vec_k const*>(&params.partial_out[thread_partial_out_offset + bhi * Dh + oi]);
                 // Apply the correction factor.
                 Tk factor_compute;
                 convert_from_float(&factor_compute, __expf(thread_partial_max_for_out - final_max));
@@ -2757,7 +2757,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
                 if (oo < midpoint && (Dh == Dh_MAX || oi < Dh))
                 {
                     thread_accumulated_out
-                        = add(thread_accumulated_out, *reinterpret_cast<const V_vec_k*>(&out_oi_smem[oo * Dh + oi]));
+                        = add(thread_accumulated_out, *reinterpret_cast<V_vec_k const*>(&out_oi_smem[oo * Dh + oi]));
                 }
                 __syncthreads();
             }
@@ -2768,7 +2768,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
 
             if (oo == 0 && (Dh == Dh_MAX || oi < Dh))
             {
-                const auto inv_sum = __fdividef(1.f, final_sum + 1.e-6f);
+                auto const inv_sum = __fdividef(1.f, final_sum + 1.e-6f);
 
                 Tk inv_sum_compute;
                 convert_from_float(&inv_sum_compute, inv_sum);

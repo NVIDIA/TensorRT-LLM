@@ -21,7 +21,6 @@ import unittest
 from itertools import product
 
 import numpy as np
-import pytest
 
 # isort: off
 import torch
@@ -43,10 +42,11 @@ from tensorrt_llm.runtime.kv_cache_manager import (GenerationSequence,
                                                    KVCacheManager)
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
+
 from examples.gpt.weight import load_from_hf_gpt
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import getSMVersion
+from utils.util import skip_fp32_accum_pre_ampere, unittest_name_func
 
 
 class TestGPT(unittest.TestCase):
@@ -171,8 +171,8 @@ class TestGPT(unittest.TestCase):
                 engine_buffer, mapping)
         return runtime, engine_buffer
 
-    @parameterized.expand([(False)])
-    def test_gpt_float32(self, use_refit):
+    @parameterized.expand([("other", False)], name_func=unittest_name_func)
+    def test_gpt_float32(self, test_partition, use_refit):
         model = 'gpt'
         log_level = 'error'
         dtype = 'float32'
@@ -401,11 +401,14 @@ class TestGPT(unittest.TestCase):
                 ContextFMHAType.disabled, ContextFMHAType.enabled,
                 ContextFMHAType.enabled_with_fp32_acc
             ], [False, True], [False, True], [False, True], [False, True]))
+        # split test cases into 4 partitions
+        test_cases = [(f"partition{int(i % 4)}", ) + case
+                      for i, case in enumerate(test_cases)]
 
         return test_cases
 
-    @parameterized.expand(load_test_cases)
-    def test_gpt_plugin(self, use_refit, fast_building,
+    @parameterized.expand(load_test_cases, name_func=unittest_name_func)
+    def test_gpt_plugin(self, test_partition, use_refit, fast_building,
                         apply_query_key_layer_scaling, context_fmha_type,
                         enable_remove_input_padding, enable_paged_kv_cache,
                         gather_context_logits, gather_generation_logits):
@@ -414,11 +417,7 @@ class TestGPT(unittest.TestCase):
             gather_context_logits or gather_generation_logits)
 
         # Skip tests that are not supported in pre-ampere architecture
-        if getSMVersion() < 80:
-            if context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
-                pytest.skip(
-                    "ContextFMHAType with fp32 acc is not supported in pre-ampere architecture"
-                )
+        skip_fp32_accum_pre_ampere(context_fmha_type)
 
         torch.manual_seed(0)
         random.seed(0)
@@ -822,8 +821,9 @@ class TestGPT(unittest.TestCase):
         if use_in_flight_batching:
             compare_mixing_context_and_generation_phases()
 
-    @parameterized.expand([(False, False), (False, True)])
-    def test_greedy_search_float32(self, use_refit, streaming):
+    @parameterized.expand([("other", False, False), ("other", False, True)],
+                          name_func=unittest_name_func)
+    def test_greedy_search_float32(self, test_partition, use_refit, streaming):
         model = 'gpt'
         log_level = 'error'
         dtype = 'float32'
@@ -929,7 +929,8 @@ class TestGPT(unittest.TestCase):
 
         np.testing.assert_allclose(ref.cpu().numpy(), res.cpu().numpy())
 
-    def test_rope_scaling_is_set_in_attention(self):
+    @parameterized.expand(["other"], name_func=unittest_name_func)
+    def test_rope_scaling_is_set_in_attention(self, test_partition):
         num_layers = 2
         position_embedding_type = PositionEmbeddingType.rope_gpt_neox
         rotary_embedding_percentage = 0.3

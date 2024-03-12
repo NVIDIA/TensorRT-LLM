@@ -153,6 +153,18 @@ public:
         return mFinishedSum;
     }
 
+    //! @returns [batchSize, maxTokensPerStep-1], predicted draft tokens for next step, on gpu
+    [[nodiscard]] TensorPtr getNextDraftTokens() const override
+    {
+        return mNextDraftTokens;
+    }
+
+    //! @returns [batchSize], lengths of the predicted draft tokens for next step, on gpu
+    [[nodiscard]] TensorPtr getNextDraftTokenLengths() const override
+    {
+        return mNextDraftTokenLengths;
+    }
+
 private:
     //! @brief Gather final beam search results for request `batchIdx`.
     [[nodiscard]] CudaEvent postProcessRequest(SizeType batchIdx) const;
@@ -204,6 +216,8 @@ private:
     TensorPtr mBatchSlotsAcceptTokens; // [maxBatchSize], int32_t, address map, pinned
     TensorPtr mBatchSlotsAcceptLogits; // [maxBatchSize], int32_t, address map, pinned
     TensorPtr mTargetLogitsPtrs;       // [maxBatchSize], float*, pointers to target logits, pinned
+    TensorPtr mNextDraftTokens;
+    TensorPtr mNextDraftTokenLengths;
     SizeType mMaxSequenceLength{};
     SizeType mMaxAttentionWindow{};
     SizeType mSinkTokenLength{};

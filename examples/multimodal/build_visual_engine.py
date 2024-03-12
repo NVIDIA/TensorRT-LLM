@@ -1,6 +1,7 @@
 import argparse
 import os
 import shutil
+import sys
 from time import time
 
 # isort: off
@@ -16,7 +17,7 @@ from transformers import (AutoProcessor, Blip2ForConditionalGeneration,
 
 def export_visual_wrapper_onnx(visual_wrapper, image, output_dir):
     logger.log(trt.Logger.INFO, "Exporting onnx")
-    os.mkdir(f'{output_dir}/onnx')
+    os.makedirs(f'{output_dir}/onnx', exist_ok=True)
     torch.onnx.export(visual_wrapper,
                       image,
                       f'{output_dir}/onnx/visual_encoder.onnx',
@@ -80,11 +81,8 @@ def build_trt_engine(img_height, img_width, output_dir, max_batch_size):
 
 
 def build_blip2_engine(args):
-    model_type = 'Salesforce/blip2-' + args.model_name
+    model_type = 'Salesforce/blip2-' + args.model_type
     processor = Blip2Processor.from_pretrained(model_type)
-    model = Blip2ForConditionalGeneration.from_pretrained(
-        model_type, torch_dtype=torch.float16)
-    model.to(args.device)
 
     raw_image = Image.new('RGB', [10, 10])  # dummy image
     prompt = "Question: what is this? Answer:"
@@ -94,12 +92,12 @@ def build_blip2_engine(args):
 
     class Blip2VisionWrapper(torch.nn.Module):
 
-        def __init__(self, model):
+        def __init__(self, vision_model, qformer, projector, query_tokens):
             super().__init__()
-            self.vision_model = model.vision_model
-            self.qformer = model.qformer
-            self.projector = model.language_projection
-            self.query_tokens = model.query_tokens
+            self.vision_model = vision_model
+            self.qformer = qformer
+            self.projector = projector
+            self.query_tokens = query_tokens
 
         def forward(self, image):
             features = self.vision_model(image)[0]
@@ -108,7 +106,11 @@ def build_blip2_engine(args):
                                           return_dict=True)
             return self.projector(qformer_output.last_hidden_state)
 
-    wrapper = Blip2VisionWrapper(model)
+    model = Blip2ForConditionalGeneration.from_pretrained(
+        model_type, torch_dtype=torch.float16)
+    wrapper = Blip2VisionWrapper(model.vision_model, model.qformer,
+                                 model.language_projection, model.query_tokens)
+    wrapper.to(args.device)
 
     export_visual_wrapper_onnx(wrapper, image, args.output_dir)
     build_trt_engine(image.shape[2], image.shape[3], args.output_dir,
@@ -138,10 +140,42 @@ def build_llava_engine(args):
 
     model = LlavaForConditionalGeneration.from_pretrained(
         args.model_path, torch_dtype=torch.float16)
-    model.to(args.device)
-    wrapper = LlavaVisionWrapper(model.vision_tower,
-                                 model.multi_modal_projector,
+    wrapper = LlavaVisionWrapper(model.vision_tower.to(args.device),
+                                 model.multi_modal_projector.to(args.device),
                                  model.config.vision_feature_layer)
+
+    export_visual_wrapper_onnx(wrapper, image, args.output_dir)
+    build_trt_engine(image.shape[2], image.shape[3], args.output_dir,
+                     args.max_batch_size)
+
+
+def build_vila_engine(args):
+    # Note: VILA model is not in public HF model zoo yet. We need to explicitly import from the git repo
+    sys.path.append(args.model_path + "/../VILA")
+    from llava.model import LlavaLlamaForCausalLM
+
+    processor = AutoProcessor.from_pretrained(args.model_path)
+    raw_image = Image.new('RGB', [10, 10])  # dummy image
+    image = processor(text="dummy", images=raw_image,
+                      return_tensors="pt")['pixel_values'].to(
+                          args.device, torch.float16)
+
+    class VilaVisionWrapper(torch.nn.Module):
+
+        def __init__(self, tower, projector):
+            super().__init__()
+            self.tower = tower
+            self.projector = projector
+
+        def forward(self, image):
+            features = self.tower(image)
+            return self.projector(features)
+
+    model = LlavaLlamaForCausalLM.from_pretrained(args.model_path,
+                                                  torch_dtype=torch.float16)
+    wrapper = VilaVisionWrapper(
+        model.get_model().get_vision_tower().to(args.device),
+        model.get_model().mm_projector.to(args.device))
 
     export_visual_wrapper_onnx(wrapper, image, args.output_dir)
     build_trt_engine(image.shape[2], image.shape[3], args.output_dir,
@@ -174,20 +208,20 @@ def build_nougat_engine(args):
 
 
 if __name__ == '__main__':
-    logger = trt.Logger(trt.Logger.ERROR)
+    logger = trt.Logger(trt.Logger.INFO)
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_name',
+    parser.add_argument('--model_type',
                         type=str,
                         default=None,
-                        help="Model name")
+                        help="Model type")
     parser.add_argument('--model_path',
                         type=str,
                         default=None,
                         help="Huggingface repo or local directory with weights")
     parser.add_argument('--output_dir',
                         type=str,
-                        default='visual_engines',
+                        default=None,
                         help="Directory where visual TRT engines are saved")
     parser.add_argument('--max_batch_size',
                         type=int,
@@ -197,15 +231,18 @@ if __name__ == '__main__':
 
     args.device = torch.device("cuda") if torch.cuda.is_available() else "cpu"
 
-    args.output_dir = args.output_dir + "/" + args.model_name
+    if args.output_dir is None:
+        args.output_dir = 'visual_engines/%s' % (args.model_path.split('/')[-1])
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
 
-    if args.model_name in ['opt-2.7b', 'flan-t5-xl']:
+    if args.model_type in ['opt-2.7b', 'flan-t5-xl']:
         build_blip2_engine(args)
-    elif 'llava' in args.model_name:
+    elif args.model_type == 'llava':
         build_llava_engine(args)
-    elif 'nougat' in args.model_name:
+    elif args.model_type == 'vila':
+        build_vila_engine(args)
+    elif args.model_type == 'nougat':
         build_nougat_engine(args)
     else:
-        raise RuntimeError(f"Invalid model name {args.model_name}")
+        raise RuntimeError(f"Invalid model type {args.model_type}")

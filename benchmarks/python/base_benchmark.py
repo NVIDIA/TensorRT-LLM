@@ -89,7 +89,11 @@ class BaseBenchmark(object):
                     (f'Engine world size ({world_size}) != Runtime world size ({self.world_size})')
                 # Load config into self
                 for key, value in self.config['pretrained_config'].items():
-                    setattr(self, key, value)
+                    if key == "ssm_cfg":
+                        for ssm_key, ssm_value in value.items():
+                            setattr(self, "mamba_" + ssm_key, ssm_value)
+                    else:
+                        setattr(self, key, value)
 
                 self.quant_mode = QuantMode.from_quant_algo(
                     quant_algo=self.quantization['quant_algo'],

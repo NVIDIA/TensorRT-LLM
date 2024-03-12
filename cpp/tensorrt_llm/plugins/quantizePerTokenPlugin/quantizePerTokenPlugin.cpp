@@ -22,17 +22,17 @@ using namespace tensorrt_llm::kernels;
 using tensorrt_llm::plugins::QuantizePerTokenPluginCreator;
 using tensorrt_llm::plugins::QuantizePerTokenPlugin;
 
-static const char* QUANTIZE_PER_TOKEN_PLUGIN_VERSION{"1"};
-static const char* QUANTIZE_PER_TOKEN_PLUGIN_NAME{"QuantizePerToken"};
+static char const* QUANTIZE_PER_TOKEN_PLUGIN_VERSION{"1"};
+static char const* QUANTIZE_PER_TOKEN_PLUGIN_NAME{"QuantizePerToken"};
 PluginFieldCollection QuantizePerTokenPluginCreator::mFC{};
 std::vector<nvinfer1::PluginField> QuantizePerTokenPluginCreator::mPluginAttributes;
 
 QuantizePerTokenPlugin::QuantizePerTokenPlugin() {}
 
 // Parameterized constructor
-QuantizePerTokenPlugin::QuantizePerTokenPlugin(const void* data, size_t length)
+QuantizePerTokenPlugin::QuantizePerTokenPlugin(void const* data, size_t length)
 {
-    const char *d = reinterpret_cast<const char*>(data), *a = d;
+    char const *d = reinterpret_cast<char const*>(data), *a = d;
     TLLM_CHECK_WITH_INFO(d == a + length,
         "Expected length (%d) != real length (%d). This is often "
         "caused by using different TensorRT-LLM version to build "
@@ -49,7 +49,7 @@ nvinfer1::IPluginV2DynamicExt* QuantizePerTokenPlugin::clone() const noexcept
 }
 
 nvinfer1::DimsExprs QuantizePerTokenPlugin::getOutputDimensions(
-    int outputIndex, const nvinfer1::DimsExprs* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
+    int outputIndex, nvinfer1::DimsExprs const* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
 {
     try
     {
@@ -71,7 +71,7 @@ nvinfer1::DimsExprs QuantizePerTokenPlugin::getOutputDimensions(
         // [M(*), 1] dynamic per token scales
         return ret;
     }
-    catch (const std::exception& e)
+    catch (std::exception const& e)
     {
         caughtError(e);
     }
@@ -79,7 +79,7 @@ nvinfer1::DimsExprs QuantizePerTokenPlugin::getOutputDimensions(
 }
 
 bool QuantizePerTokenPlugin::supportsFormatCombination(
-    int pos, const nvinfer1::PluginTensorDesc* inOut, int nbInputs, int nbOutputs) noexcept
+    int pos, nvinfer1::PluginTensorDesc const* inOut, int nbInputs, int nbOutputs) noexcept
 {
     switch (pos)
     {
@@ -100,19 +100,19 @@ bool QuantizePerTokenPlugin::supportsFormatCombination(
     }
 }
 
-void QuantizePerTokenPlugin::configurePlugin(const nvinfer1::DynamicPluginTensorDesc* in, int nbInputs,
-    const nvinfer1::DynamicPluginTensorDesc* out, int nbOutputs) noexcept
+void QuantizePerTokenPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int nbInputs,
+    nvinfer1::DynamicPluginTensorDesc const* out, int nbOutputs) noexcept
 {
 }
 
-size_t QuantizePerTokenPlugin::getWorkspaceSize(const nvinfer1::PluginTensorDesc* inputs, int nbInputs,
-    const nvinfer1::PluginTensorDesc* outputs, int nbOutputs) const noexcept
+size_t QuantizePerTokenPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* inputs, int nbInputs,
+    nvinfer1::PluginTensorDesc const* outputs, int nbOutputs) const noexcept
 {
     return 0;
 }
 
-int QuantizePerTokenPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc,
-    const nvinfer1::PluginTensorDesc* outputDesc, const void* const* inputs, void* const* outputs, void* workspace,
+int QuantizePerTokenPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
+    nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
     cudaStream_t stream) noexcept
 {
     // inputs
@@ -131,12 +131,12 @@ int QuantizePerTokenPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc,
     if (inputDesc[0].type == DataType::kFLOAT)
     {
         invokePerTokenQuantization<float>(reinterpret_cast<int8_t*>(outputs[0]),
-            reinterpret_cast<const float*>(inputs[0]), m, k, reinterpret_cast<float*>(outputs[1]), stream);
+            reinterpret_cast<float const*>(inputs[0]), m, k, reinterpret_cast<float*>(outputs[1]), stream);
     }
     else
     {
         invokePerTokenQuantization<half>(reinterpret_cast<int8_t*>(outputs[0]),
-            reinterpret_cast<const half*>(inputs[0]), m, k, reinterpret_cast<float*>(outputs[1]), stream);
+            reinterpret_cast<half const*>(inputs[0]), m, k, reinterpret_cast<float*>(outputs[1]), stream);
     }
 
     return 0;
@@ -144,7 +144,7 @@ int QuantizePerTokenPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc,
 
 // IPluginV2Ext Methods
 nvinfer1::DataType QuantizePerTokenPlugin::getOutputDataType(
-    int index, const nvinfer1::DataType* inputTypes, int nbInputs) const noexcept
+    int index, nvinfer1::DataType const* inputTypes, int nbInputs) const noexcept
 {
     TLLM_CHECK(nbInputs == 1);
     TLLM_CHECK(index < 2);
@@ -153,12 +153,12 @@ nvinfer1::DataType QuantizePerTokenPlugin::getOutputDataType(
 
 // IPluginV2 Methods
 
-const char* QuantizePerTokenPlugin::getPluginType() const noexcept
+char const* QuantizePerTokenPlugin::getPluginType() const noexcept
 {
     return QUANTIZE_PER_TOKEN_PLUGIN_NAME;
 }
 
-const char* QuantizePerTokenPlugin::getPluginVersion() const noexcept
+char const* QuantizePerTokenPlugin::getPluginVersion() const noexcept
 {
     return QUANTIZE_PER_TOKEN_PLUGIN_VERSION;
 }
@@ -202,22 +202,22 @@ QuantizePerTokenPluginCreator::QuantizePerTokenPluginCreator()
     mFC.fields = mPluginAttributes.data();
 }
 
-const char* QuantizePerTokenPluginCreator::getPluginName() const noexcept
+char const* QuantizePerTokenPluginCreator::getPluginName() const noexcept
 {
     return QUANTIZE_PER_TOKEN_PLUGIN_NAME;
 }
 
-const char* QuantizePerTokenPluginCreator::getPluginVersion() const noexcept
+char const* QuantizePerTokenPluginCreator::getPluginVersion() const noexcept
 {
     return QUANTIZE_PER_TOKEN_PLUGIN_VERSION;
 }
 
-const PluginFieldCollection* QuantizePerTokenPluginCreator::getFieldNames() noexcept
+PluginFieldCollection const* QuantizePerTokenPluginCreator::getFieldNames() noexcept
 {
     return &mFC;
 }
 
-IPluginV2* QuantizePerTokenPluginCreator::createPlugin(const char* name, const PluginFieldCollection* fc) noexcept
+IPluginV2* QuantizePerTokenPluginCreator::createPlugin(char const* name, PluginFieldCollection const* fc) noexcept
 {
     try
     {
@@ -225,7 +225,7 @@ IPluginV2* QuantizePerTokenPluginCreator::createPlugin(const char* name, const P
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }
-    catch (const std::exception& e)
+    catch (std::exception const& e)
     {
         caughtError(e);
     }
@@ -233,7 +233,7 @@ IPluginV2* QuantizePerTokenPluginCreator::createPlugin(const char* name, const P
 }
 
 IPluginV2* QuantizePerTokenPluginCreator::deserializePlugin(
-    const char* name, const void* serialData, size_t serialLength) noexcept
+    char const* name, void const* serialData, size_t serialLength) noexcept
 {
     // This object will be deleted when the network is destroyed, which will
     // call QuantizePerTokenPlugin::destroy()
@@ -243,7 +243,7 @@ IPluginV2* QuantizePerTokenPluginCreator::deserializePlugin(
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }
-    catch (const std::exception& e)
+    catch (std::exception const& e)
     {
         caughtError(e);
     }

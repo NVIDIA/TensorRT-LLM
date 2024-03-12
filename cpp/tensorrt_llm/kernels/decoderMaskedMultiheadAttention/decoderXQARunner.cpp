@@ -76,7 +76,7 @@ size_t DecoderXQARunner::getWorkspaceSize(int max_batch_beam_size)
     if (mMultiBlockMode)
     {
         int workspaces[4];
-        const int max_num_request = max_batch_beam_size;
+        int const max_num_request = max_batch_beam_size;
         uint32_t const nbSeq = mNumKVHeads * max_num_request;
         uint32_t const nbSubSeq = kMaxNbCtaPerKVHeadFactor * nbSeq;
         int group_size = mNumHeads / mNumKVHeads;
@@ -90,26 +90,26 @@ size_t DecoderXQARunner::getWorkspaceSize(int max_batch_beam_size)
     return workspace_size;
 }
 
-bool DecoderXQARunner::shouldUseImpl(const XQAParams& xqaParams)
+bool DecoderXQARunner::shouldUseImpl(XQAParams const& xqaParams)
 {
     return mImpl->shouldUse(xqaParams);
 }
 
-void DecoderXQARunner::prepareForRun(const XQAParams& xqa_params)
+void DecoderXQARunner::prepareForRun(XQAParams const& xqa_params)
 {
     return mImpl->prepare(xqa_params);
 }
 
 template <typename KVCacheBuffer>
-void DecoderXQARunner::run(const XQAParams& xqa_params, KVCacheBuffer& kv_cache_buffer, const cudaStream_t& stream)
+void DecoderXQARunner::run(XQAParams const& xqa_params, KVCacheBuffer& kv_cache_buffer, cudaStream_t const& stream)
 {
     return mImpl->run(xqa_params, kv_cache_buffer, mLaunchGridBlockCache, stream);
 }
 
 template void DecoderXQARunner::run(
-    const XQAParams& xqa_params, KVLinearBuffer& kv_linear_buffer, const cudaStream_t& stream);
+    XQAParams const& xqa_params, KVLinearBuffer& kv_linear_buffer, cudaStream_t const& stream);
 template void DecoderXQARunner::run(
-    const XQAParams& xqa_params, KVBlockArray& kv_block_array, const cudaStream_t& stream);
+    XQAParams const& xqa_params, KVBlockArray& kv_block_array, cudaStream_t const& stream);
 
 } // namespace kernels
 

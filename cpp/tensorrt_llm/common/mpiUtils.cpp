@@ -50,6 +50,7 @@ MPI_Datatype getMpiDtype(MpiType dtype)
         {MpiType::kUINT64, MPI_UINT64_T},
         {MpiType::kFP8, MPI_UINT8_T},
         {MpiType::kBF16, MPI_UINT16_T},
+        {MpiType::kCHAR, MPI_CHAR},
     };
     return dtype_map.at(dtype);
 }
@@ -126,23 +127,6 @@ void MpiComm::bcast(void* buffer, size_t size, MpiType dtype, int root) const
     MPICHECK(MPI_Bcast(buffer, size, getMpiDtype(dtype), root, mComm));
 }
 
-void MpiComm::bcast(std::vector<int64_t>& packed, int root) const
-{
-    int64_t nWords1;
-    auto const rank = getRank();
-    if (rank == root)
-    {
-        nWords1 = static_cast<int64_t>(packed.size());
-    }
-    auto const mpiInt64 = MpiTypeConverter<int64_t>::value;
-    bcast(&nWords1, 1, mpiInt64, root);
-    if (rank != root)
-    {
-        packed.resize(nWords1);
-    }
-    bcast(packed.data(), packed.size(), mpiInt64, root);
-}
-
 void MpiComm::send(void const* buffer, size_t size, MpiType dtype, int dest, int tag) const
 {
     MPICHECK(MPI_Send(buffer, size, getMpiDtype(dtype), dest, tag, mComm));
@@ -162,12 +146,12 @@ MpiComm MpiComm::split(int color, int key) const
     return MpiComm{splitComm, true};
 }
 
-void MpiComm::allreduce(const void* sendbuf, void* recvbuf, int count, MpiType dtype, MpiOp op) const
+void MpiComm::allreduce(void const* sendbuf, void* recvbuf, int count, MpiType dtype, MpiOp op) const
 {
     MPICHECK(MPI_Allreduce(sendbuf, recvbuf, count, getMpiDtype(dtype), getMpiOp(op), mComm));
 }
 
-void MpiComm::allgather(const void* sendbuf, void* recvbuf, int count, MpiType dtype) const
+void MpiComm::allgather(void const* sendbuf, void* recvbuf, int count, MpiType dtype) const
 {
     MPICHECK(MPI_Allgather(sendbuf, count, getMpiDtype(dtype), recvbuf, count, getMpiDtype(dtype), mComm));
 }

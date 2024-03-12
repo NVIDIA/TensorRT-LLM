@@ -29,13 +29,13 @@ void reportValidationFailure(char const* msg, char const* file, int line)
     getLogger()->log(nvinfer1::ILogger::Severity::kINTERNAL_ERROR, stream.str().c_str());
 }
 
-void caughtError(const std::exception& e)
+void caughtError(std::exception const& e)
 {
     gLogError << e.what() << std::endl;
 }
 
 // break-pointable
-void reportAssertion(const char* msg, const char* file, int line)
+void reportAssertion(char const* msg, char const* file, int line)
 {
     std::ostringstream stream;
     stream << "Assertion failed: " << msg << std::endl
@@ -46,7 +46,7 @@ void reportAssertion(const char* msg, const char* file, int line)
     abort();
 }
 
-void throwCublasError(const char* file, const char* function, int line, int status, const char* msg)
+void throwCublasError(char const* file, char const* function, int line, int status, char const* msg)
 {
     if (msg == nullptr)
     {
@@ -86,7 +86,7 @@ int LogStream<kSeverity>::Buf::sync()
     return 0;
 }
 
-void throwCudaError(const char* file, const char* function, int line, int status, const char* msg)
+void throwCudaError(char const* file, char const* function, int line, int status, char const* msg)
 {
     CudaError error(file, function, line, status, msg);
     error.log(gLogError);

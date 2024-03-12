@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
+import sys
 import unittest
 
 import numpy as np
@@ -23,13 +25,16 @@ from polygraphy.backend.trt import (CreateConfig, EngineFromNetwork, Profile,
 import tensorrt_llm
 from tensorrt_llm import Tensor
 
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.util import unittest_name_func
+
 
 class TestFunctional(unittest.TestCase):
 
     def setUp(self):
         tensorrt_llm.logger.set_level('error')
 
-    @parameterized.expand([('float32', )])
+    @parameterized.expand([('float32', )], name_func=unittest_name_func)
     def test_einsum(self, dtype):
         # torch 1.13: "baddbmm_with_gemm" not implemented for 'Half'
         # test data

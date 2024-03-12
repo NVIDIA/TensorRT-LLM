@@ -174,7 +174,7 @@ public:
         /// Ctor
         CUTLASS_HOST_DEVICE
         Arguments(int problem_count, int threadblock_count, int group_size, typename EpilogueOutputOp::Params output_op,
-            const ElementA* ptr_A, const ElementB* ptr_B, const ElementScale* weight_scales, const ElementC* ptr_C,
+            ElementA const* ptr_A, ElementB const* ptr_B, ElementScale const* weight_scales, ElementC const* ptr_C,
             ElementC* ptr_D, int64_t* total_rows_before_expert, int64_t gemm_n, int64_t gemm_k,
             GemmCoord* host_problem_sizes = nullptr)
             : problem_count(problem_count)

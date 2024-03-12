@@ -39,7 +39,6 @@ Take GPT-350M as an example for single GPU
 
 ```
 ./benchmarks/gptSessionBenchmark \
-    --model gpt_350m \
     --engine_dir "../../benchmarks/gpt_350m/" \
     --batch_size "1" \
     --input_output_len "60,20"
@@ -50,7 +49,6 @@ Take GPT-350M as an example for single GPU
 Take GPT-175B as an example for multiple GPUs
 ```
 mpirun -n 8 ./benchmarks/gptSessionBenchmark \
-    --model gpt_175b \
     --engine_dir "../../benchmarks/gpt_175b/" \
     --batch_size "1" \
     --input_output_len "60,20"
@@ -125,7 +123,6 @@ cd cpp/build
 Take GPT-350M as an example for single GPU V1 batching
 ```
 ./benchmarks/gptManagerBenchmark \
-    --model gpt \
     --engine_dir ../../examples/gpt/trt_engine/gpt2/fp16/1-gpu/ \
     --type V1 \
     --dataset ../../benchmarks/cpp/preprocessed_dataset.json
@@ -135,7 +132,6 @@ Take GPT-350M as an example for single GPU V1 batching
 Take GPT-350M as an example for 2-GPU inflight batching
 ```
 mpirun -n 2 ./benchmarks/gptManagerBenchmark \
-    --model gpt \
     --engine_dir ../../examples/gpt/trt_engine/gpt2-ib/fp16/2-gpu/ \
     --type IFB \
     --dataset ../../benchmarks/cpp/preprocessed_dataset.json
@@ -165,7 +161,6 @@ Given a `static_emulated_batch_size` of `n` the server will wait for `n` request
 Take GPT-350M as an example for single GPU with static batching
 ```
 ./benchmarks/gptManagerBenchmark \
-    --model gpt \
     --engine_dir ../../examples/gpt/trt_engine/gpt2/fp16/1-gpu/ \
     --type IFB \
     --static_emulated_batch_size 32 \

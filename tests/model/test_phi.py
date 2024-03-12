@@ -19,7 +19,6 @@ import unittest
 from itertools import product
 
 import numpy as np
-import pytest
 import torch
 from parameterized import parameterized
 from transformers import AutoConfig, AutoModelForCausalLM
@@ -30,10 +29,11 @@ from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-from examples.phi.convert_checkpoint import convert_hf_phi  # isort:skip
+
+from examples.phi.convert_checkpoint import convert_hf_phi
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import getSMVersion
+from utils.util import skip_fp32_accum_pre_ampere, unittest_name_func
 
 # Fixed code revision or updated config can break the tests.
 HF_CODE_REVISION = "cb2f4533604d8b67de604e7df03bfe6f3ca22869"
@@ -92,12 +92,7 @@ class TestPhi(unittest.TestCase):
         }
         config = tensorrt_llm.models.PretrainedConfig.from_dict(config)
         config.set_rank(rank)
-        weights = convert_hf_phi(hf_model,
-                                 rank=rank,
-                                 tensor_parallel=tensor_parallel,
-                                 dtype=dtype,
-                                 use_parallel_embedding=False,
-                                 sharding_dim=0)
+        weights = convert_hf_phi(hf_model, dtype=dtype)
         trtllm_model = tensorrt_llm.models.PhiForCausalLM(config)
         trtllm_model.load(weights)
 
@@ -176,15 +171,11 @@ class TestPhi(unittest.TestCase):
         ], [False, True])
         return test_cases
 
-    @parameterized.expand(load_test_cases)
+    @parameterized.expand(load_test_cases, name_func=unittest_name_func)
     def test_phi(self, context_fmha_flag, enable_remove_input_padding):
 
         # Skip tests that are not supported in pre-ampere architecture
-        if getSMVersion() < 80:
-            if context_fmha_flag == ContextFMHAType.enabled_with_fp32_acc:
-                pytest.skip(
-                    "ContextFMHAType with fp32 acc is not supported in pre-ampere architecture"
-                )
+        skip_fp32_accum_pre_ampere(context_fmha_flag)
 
         torch.random.manual_seed(0)
         use_refit = False

@@ -181,37 +181,37 @@ struct PackType<__nv_fp8_e4m3, 8>
 };
 #endif
 
-__inline__ __device__ void fp8x4_e4m3_to_bfloat2(__nv_bfloat162* out1, __nv_bfloat162* out2, const __nv_fp8x4_e4m3* in)
+__inline__ __device__ void fp8x4_e4m3_to_bfloat2(__nv_bfloat162* out1, __nv_bfloat162* out2, __nv_fp8x4_e4m3 const* in)
 {
-    const char4 tmp_val = reinterpret_cast<const char4*>(in)[0];
-    *out1 = __nv_bfloat162((float) reinterpret_cast<const __nv_fp8_e4m3*>(&tmp_val.x)[0],
-        (float) reinterpret_cast<const __nv_fp8_e4m3*>(&tmp_val.y)[0]);
-    *out2 = __nv_bfloat162((float) reinterpret_cast<const __nv_fp8_e4m3*>(&tmp_val.z)[0],
-        (float) reinterpret_cast<const __nv_fp8_e4m3*>(&tmp_val.w)[0]);
+    const char4 tmp_val = reinterpret_cast<char4 const*>(in)[0];
+    *out1 = __nv_bfloat162((float) reinterpret_cast<__nv_fp8_e4m3 const*>(&tmp_val.x)[0],
+        (float) reinterpret_cast<__nv_fp8_e4m3 const*>(&tmp_val.y)[0]);
+    *out2 = __nv_bfloat162((float) reinterpret_cast<__nv_fp8_e4m3 const*>(&tmp_val.z)[0],
+        (float) reinterpret_cast<__nv_fp8_e4m3 const*>(&tmp_val.w)[0]);
 }
 
-__inline__ __device__ __nv_bfloat162 fp8x2_e4m3_to_bfloat2(const __nv_fp8x2_e4m3* in)
+__inline__ __device__ __nv_bfloat162 fp8x2_e4m3_to_bfloat2(__nv_fp8x2_e4m3 const* in)
 {
-    const char2 tmp_val = reinterpret_cast<const char2*>(in)[0];
-    __nv_bfloat162 out = __nv_bfloat162((float) reinterpret_cast<const __nv_fp8_e4m3*>(&tmp_val.x)[0],
-        (float) reinterpret_cast<const __nv_fp8_e4m3*>(&tmp_val.y)[0]);
+    const char2 tmp_val = reinterpret_cast<char2 const*>(in)[0];
+    __nv_bfloat162 out = __nv_bfloat162((float) reinterpret_cast<__nv_fp8_e4m3 const*>(&tmp_val.x)[0],
+        (float) reinterpret_cast<__nv_fp8_e4m3 const*>(&tmp_val.y)[0]);
     return out;
 }
 
-__inline__ __device__ void fp8x4_e4m3_to_half2(half2* out1, half2* out2, const __nv_fp8x4_e4m3* in)
+__inline__ __device__ void fp8x4_e4m3_to_half2(half2* out1, half2* out2, __nv_fp8x4_e4m3 const* in)
 {
-    const char4 tmp_val = reinterpret_cast<const char4*>(in)[0];
-    *out1 = half2((float) reinterpret_cast<const __nv_fp8_e4m3*>(&tmp_val.x)[0],
-        (float) reinterpret_cast<const __nv_fp8_e4m3*>(&tmp_val.y)[0]);
-    *out2 = half2((float) reinterpret_cast<const __nv_fp8_e4m3*>(&tmp_val.z)[0],
-        (float) reinterpret_cast<const __nv_fp8_e4m3*>(&tmp_val.w)[0]);
+    const char4 tmp_val = reinterpret_cast<char4 const*>(in)[0];
+    *out1 = half2((float) reinterpret_cast<__nv_fp8_e4m3 const*>(&tmp_val.x)[0],
+        (float) reinterpret_cast<__nv_fp8_e4m3 const*>(&tmp_val.y)[0]);
+    *out2 = half2((float) reinterpret_cast<__nv_fp8_e4m3 const*>(&tmp_val.z)[0],
+        (float) reinterpret_cast<__nv_fp8_e4m3 const*>(&tmp_val.w)[0]);
 }
 
-__inline__ __device__ half2 fp8x2_e4m3_to_half2(const __nv_fp8x2_e4m3* in)
+__inline__ __device__ half2 fp8x2_e4m3_to_half2(__nv_fp8x2_e4m3 const* in)
 {
-    const char2 tmp_val = reinterpret_cast<const char2*>(in)[0];
-    half2 out = half2((float) reinterpret_cast<const __nv_fp8_e4m3*>(&tmp_val.x)[0],
-        (float) reinterpret_cast<const __nv_fp8_e4m3*>(&tmp_val.y)[0]);
+    const char2 tmp_val = reinterpret_cast<char2 const*>(in)[0];
+    half2 out = half2((float) reinterpret_cast<__nv_fp8_e4m3 const*>(&tmp_val.x)[0],
+        (float) reinterpret_cast<__nv_fp8_e4m3 const*>(&tmp_val.y)[0]);
     return out;
 }
 

@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -27,11 +28,11 @@ from ...functional import RotaryScalingType, Tensor, recv, send
 from ...layers import (MOE, Attention, AttentionMaskType, ColumnLinear,
                        Embedding, GatedMLP, MoeConfig, PositionEmbeddingType,
                        PromptTuningEmbedding, RmsNorm)
+from ...lora_manager import LoraConfig
 from ...mapping import Mapping
 from ...module import Module
 from ...plugin import init_all_reduce_helper
 from ...quantization import QuantMode
-from ...runtime.lora_manager import LoraConfig
 from ...top_model_mixin import TopModelMixin
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
                               PretrainedConfig)
@@ -67,8 +68,6 @@ class LLaMADecoderLayer(Module):
             tp_size=config.mapping.tp_size,
             tp_rank=config.mapping.tp_rank,
             quant_mode=config.quant_mode,
-            enable_pos_shift=config.enable_pos_shift,
-            dense_context_fmha=config.dense_context_fmha,
             max_lora_rank=config.max_lora_rank)
 
         mlp_hidden_size = config.hidden_size * 4 if config.intermediate_size is None else config.intermediate_size
@@ -251,8 +250,6 @@ class LLaMAForCausalLM(DecoderModelForCausalLM, TopModelMixin):
         config.set_if_not_exist('attn_bias', False)
         config.set_if_not_exist('rotary_base', 10000.0)
         config.set_if_not_exist('rotary_scaling', None)
-        config.set_if_not_exist('enable_pos_shift', False)
-        config.set_if_not_exist('dense_context_fmha', False)
         config.set_if_not_exist('moe_num_experts', 0)
         config.set_if_not_exist('moe_top_k', 0)
         config.set_if_not_exist('moe_tp_mode',
@@ -272,10 +269,9 @@ class LLaMAForCausalLM(DecoderModelForCausalLM, TopModelMixin):
 
         num_kv_heads = cfg.num_key_value_heads if hasattr(cfg, "num_key_value_heads") \
             else cfg.num_attention_heads
-        if mapping is None:
-            mapping = Mapping()
-        if quant_mode is None:
-            quant_mode = QuantMode(0)
+        use_fused_mlp = kwargs.get("use_fused_mlp", False)
+        mapping = mapping or Mapping()
+        quant_mode = quant_mode or QuantMode(0)
 
         cfg.mapping = mapping
 
@@ -308,7 +304,7 @@ class LLaMAForCausalLM(DecoderModelForCausalLM, TopModelMixin):
             'num_attention_heads': cfg.num_attention_heads,
             'hidden_size': cfg.hidden_size,
             'intermediate_size': cfg.intermediate_size,
-            'num_key_value_heads': cfg.num_key_value_heads,
+            'num_key_value_heads': num_kv_heads,
             'vocab_size': cfg.vocab_size,
             'position_embedding_type': 'rope_gpt_neox',
             'max_position_embeddings': cfg.max_position_embeddings,
@@ -318,11 +314,6 @@ class LLaMAForCausalLM(DecoderModelForCausalLM, TopModelMixin):
             'norm_epsilon': cfg.rms_norm_eps,
             'quantization': {
                 'group_size': 128,
-            },
-            'mapping': {
-                'world_size': mapping.world_size,
-                'tp_size': mapping.tp_size,
-                'pp_size': mapping.pp_size,
             },
             "moe_config": {
                 "num_experts": moe_config.num_experts,
@@ -338,9 +329,7 @@ class LLaMAForCausalLM(DecoderModelForCausalLM, TopModelMixin):
             'moe_top_k': moe_config.top_k,
             'moe_tp_mode': moe_config.tp_mode,
             'moe_normalization_mode': moe_config.normalization_mode,
-            'use_fused_mlp': kwargs.get("use_fused_mlp", False),
-            'enable_pos_shift': kwargs.get("enable_pos_shift", False),
-            'dense_context_fmha': kwargs.get("dense_context_fmha", False),
+            'use_fused_mlp': use_fused_mlp,
         }
         if quant_mode.is_int4_weight_only_per_group():
             config['quantization'].update({
@@ -359,7 +348,7 @@ class LLaMAForCausalLM(DecoderModelForCausalLM, TopModelMixin):
                 raise ValueError(f"Unsupported quantization mode: {quant_mode}")
 
         model_config = PretrainedConfig.from_dict(config)
-        model_config.set_rank(mapping.tp_rank)
+        model_config.mapping = mapping
         tllm_llama = LLaMAForCausalLM(model_config)
         q_weights = {}
         if quant_mode.has_any_quant():
@@ -473,3 +462,75 @@ class LLaMAForCausalLM(DecoderModelForCausalLM, TopModelMixin):
         if self.quant_mode.is_int4_weight_only_per_group():
             plugin_config.set_weight_only_groupwise_quant_matmul_plugin()
         return plugin_config
+
+    @classmethod
+    def from_meta_ckpt(cls,
+                       meta_ckpt_dir,
+                       dtype,
+                       mapping,
+                       override_fileds=None,
+                       **kwargs):
+        meta_config = None
+        with open(Path(meta_ckpt_dir, "params.json")) as fp:
+            meta_config: dict = json.load(fp)
+        assert meta_config is not None
+        config = {}
+        n_embd = meta_config["dim"]
+        n_head = meta_config["n_heads"]
+        n_layer = meta_config["n_layers"]
+        n_kv_head = meta_config.get("n_kv_heads", n_head)
+        # meta checkpoint don't have vocab_size|hidden_act|rotary_base specified, need to read from user input
+        vocab_size = 32000
+        hidden_act = 'silu'
+        rotary_base = 10000.0
+        if "hidden_dim" in meta_config:
+            inter_size = meta_config["hidden_dim"]
+        else:
+            multiple_of = meta_config.get("multiple_of", 1)
+            n_embd_ = int(4 * n_embd * 2 / 3)
+            ffn_dim_multiplier = meta_config.get("ffn_dim_multiplier", 1)
+            inter_size = multiple_of * (
+                (int(n_embd_ * ffn_dim_multiplier) + multiple_of - 1) //
+                multiple_of)
+        rms_norm_eps = meta_config["norm_eps"]
+        moe_num_experts = meta_config.get("moe", {}).get("num_experts", 0)
+        moe_top_k = meta_config.get("moe", {}).get("num_experts_per_tok", 0)
+        moe_tp_mode = None
+        n_positions = 2048
+        config['moe_normalization_mode'] = None  # meta checkpoint has no moe
+        architecture = "LlamaForCausalLM"
+        # config values from reading meta
+        config.update({
+            'architecture': architecture,
+            'dtype': dtype,
+            'logits_dtype': 'float32',
+            'num_hidden_layers': n_layer,
+            'num_attention_heads': n_head,
+            'hidden_size': n_embd,
+            'intermediate_size': inter_size,
+            'num_key_value_heads': n_kv_head,
+            'vocab_size': vocab_size,
+            'position_embedding_type': 'rope_gpt_neox',
+            'max_position_embeddings': n_positions,
+            'hidden_act': hidden_act,
+            'rotary_base': rotary_base,
+            'norm_epsilon': rms_norm_eps,
+            'moe_num_experts': moe_num_experts,
+            'moe_top_k': moe_top_k,
+            'moe_tp_mode': moe_tp_mode,
+            'mapping': {
+                'world_size': mapping.tp_size * mapping.pp_size,
+                'tp_size': mapping.tp_size,
+                'pp_size': mapping.pp_size,
+            },
+        })
+        config.update(override_fileds)
+        pretained_config = PretrainedConfig.from_dict(config)
+        pretained_config.set_rank(
+            mapping.rank
+        )  #TODO: remove the need of calling this, it's hacky design
+        llama = cls(pretained_config)
+        from .weight import load_from_meta_llama
+        weights = load_from_meta_llama(meta_ckpt_dir, mapping, pretained_config)
+        llama.load(weights)
+        return llama

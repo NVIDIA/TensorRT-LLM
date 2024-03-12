@@ -67,7 +67,7 @@ public:
     // Fill the tasks tensor for the batch using the provided tasksHost
     // Function assumes that the first numContextRequests requests in the batch are context requests
     void fillTasksTensor(TensorPtr tasksHost, const SizeType batchSize, const SizeType numContextRequests,
-        const std::vector<SizeType>& reqBeamWidths, const std::vector<SizeType>& reqPromptLengths,
+        std::vector<SizeType> const& reqBeamWidths, std::vector<SizeType> const& reqPromptLengths,
         BufferManager const& manager, bool packedInput);
 };
 

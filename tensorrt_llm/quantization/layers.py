@@ -344,6 +344,7 @@ class WeightOnlyQuantLinear(Module):
             quant_type_size_in_bits = 4
         self.in_features = in_features
         self.out_features = out_features // tp_size
+        self.dtype = dtype
         # we use a fake tensor with data_type = int8
         self.weight = Parameter(shape=(self.in_features,
                                        int(self.out_features *
@@ -372,7 +373,7 @@ class WeightOnlyQuantLinear(Module):
 
         x = weight_only_quant_matmul(x, self.weight.value,
                                      self.per_channel_scale.value,
-                                     self.weight_only_quant_mode)
+                                     self.weight_only_quant_mode, self.dtype)
 
         if self.bias is not None:
             x = x + self.bias.value
@@ -407,6 +408,7 @@ class WeightOnlyQuantRowLinear(Module):
             self.weight_only_quant_mode = 2
         self.in_features = in_features // tp_size
         self.out_features = out_features
+        self.dtype = dtype
         #we use a fake tensor with data_type = int8
         self.weight = Parameter(shape=(self.in_features,
                                        int(self.out_features /
@@ -427,7 +429,7 @@ class WeightOnlyQuantRowLinear(Module):
         assert lora_runtime_params is None, "lora is not supported on WeightOnlyQuantRowLinear now"
         x = weight_only_quant_matmul(x, self.weight.value,
                                      self.per_channel_scale.value,
-                                     self.weight_only_quant_mode)
+                                     self.weight_only_quant_mode, self.dtype)
 
         if self.tp_size > 1 and self.tp_group is not None:
             x = allreduce(x, self.tp_group)
@@ -468,9 +470,10 @@ class WeightOnlyGroupwiseQuantLinear(Module):
         self.group_size = group_size
         self.in_features = in_features
         self.out_features = out_features // tp_size
+        self.dtype = dtype
         self.weight = Parameter(shape=(self.in_features,
                                        self.out_features // 4),
-                                dtype="float16")
+                                dtype=dtype)
 
         scale_shape = (self.in_features // group_size, self.out_features)
         self.weights_scaling_factor = Parameter(shape=scale_shape, dtype=dtype)
@@ -511,7 +514,7 @@ class WeightOnlyGroupwiseQuantLinear(Module):
         x = weight_only_groupwise_quant_matmul(
             x, pre_quant_scale, self.weight.value,
             self.weights_scaling_factor.value, zero, bias, alpha,
-            self.quant_algo, self.group_size)
+            self.quant_algo, self.group_size, self.dtype)
 
         if self.gather_output and self.tp_size > 1 and self.tp_group is not None:
             # [dim0, local_dim] -> [dim0 * tp_size, local_dim] --> [dim0, local_dim * tp_size]
@@ -551,9 +554,10 @@ class WeightOnlyGroupwiseQuantRowLinear(Module):
         self.group_size = group_size
         self.in_features = in_features // tp_size
         self.out_features = out_features
+        self.dtype = dtype
         self.weight = Parameter(shape=(self.in_features,
                                        self.out_features // 4),
-                                dtype="float16")
+                                dtype=dtype)
 
         scale_shape = (self.in_features // group_size, self.out_features)
         self.weights_scaling_factor = Parameter(shape=scale_shape, dtype=dtype)
@@ -593,7 +597,7 @@ class WeightOnlyGroupwiseQuantRowLinear(Module):
         x = weight_only_groupwise_quant_matmul(
             x, pre_quant_scale, self.weight.value,
             self.weights_scaling_factor.value, zero, bias, alpha,
-            self.quant_algo, self.group_size)
+            self.quant_algo, self.group_size, self.dtype)
         if self.tp_size > 1 and self.tp_group is not None:
             x = allreduce(x, self.tp_group)
 
@@ -944,31 +948,29 @@ class SmoothQuantGatedMLP(SmoothQuantMLP):
 class SmoothQuantAttention(Module):
 
     def __init__(
-        self,
-        *,
-        layer_idx,
-        hidden_size,
-        num_attention_heads,
-        num_kv_heads=None,
-        max_position_embeddings=1024,
-        num_layers=1,
-        apply_query_key_layer_scaling=False,
-        attention_head_size=None,
-        attention_mask_type=AttentionMaskType.padding,
-        bias=True,
-        qkv_bias_only=False,
-        dtype=None,
-        position_embedding_type=PositionEmbeddingType.learned_absolute,
-        rotary_embedding_base=10000.0,
-        tp_group=None,
-        tp_size=1,
-        tp_rank=0,
-        scale_alibi_bias=False,
-        paged_kv_cache=False,
-        quant_mode=QuantMode(0),
-        enable_pos_shift=False,
-        dense_context_fmha=False,
-        max_lora_rank=None,
+            self,
+            *,
+            layer_idx,
+            hidden_size,
+            num_attention_heads,
+            num_kv_heads=None,
+            max_position_embeddings=1024,
+            num_layers=1,
+            apply_query_key_layer_scaling=False,
+            attention_head_size=None,
+            attention_mask_type=AttentionMaskType.padding,
+            bias=True,
+            qkv_bias_only=False,
+            dtype=None,
+            position_embedding_type=PositionEmbeddingType.learned_absolute,
+            rotary_embedding_base=10000.0,
+            tp_group=None,
+            tp_size=1,
+            tp_rank=0,
+            scale_alibi_bias=False,
+            paged_kv_cache=False,
+            quant_mode=QuantMode(0),
+            max_lora_rank=None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -998,8 +1000,6 @@ class SmoothQuantAttention(Module):
 
         self.position_embedding_type = position_embedding_type
         self.paged_kv_cache = paged_kv_cache
-        self.enable_pos_shift = enable_pos_shift
-        self.dense_context_fmha = dense_context_fmha
 
         self.rotary_embedding_base = rotary_embedding_base
         self.rotary_embedding_dim = 0
@@ -1132,8 +1132,9 @@ class SmoothQuantAttention(Module):
                 host_kv_cache_block_pointers=kv_cache_params.
                 host_kv_cache_block_pointers,
                 host_context_lengths=attention_params.host_context_lengths,
-                enable_pos_shift=self.enable_pos_shift,
-                dense_context_fmha=self.dense_context_fmha,
+                enable_pos_shift=default_net().plugin_config.pos_shift,
+                dense_context_fmha=default_net(
+                ).plugin_config.dense_context_fmha,
                 medusa_position_offsets=medusa_position_offsets,
                 medusa_packed_mask=medusa_packed_mask)
         else:

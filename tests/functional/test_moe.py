@@ -13,17 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
-import os
-import sys
 import unittest
 
 import numpy as np
-import pytest
 
 # isort: off
 import torch
 import tensorrt as trt
 # isort: on
+import os
+import sys
+
 from parameterized import parameterized
 from polygraphy.backend.trt import CreateConfig, EngineFromNetwork, TrtRunner
 
@@ -34,7 +34,7 @@ from tensorrt_llm.layers.moe import MoeConfig
 from tensorrt_llm.quantization import QuantMode
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import getSMVersion
+from utils.util import getSMVersion, skip_bf16_pre_ampere, unittest_name_func
 
 default_actfn = 'gelu'
 
@@ -326,12 +326,6 @@ class TestFunctional(unittest.TestCase):
             ]
         return params
 
-    def custom_name_func(testcase_func, param_num, param):
-        return "%s_%s" % (
-            testcase_func.__name__,
-            parameterized.to_safe_name("_".join(str(x) for x in param.args)),
-        )
-
     def create_weights(self, num_experts, hidden_size, ffn_hidden_size, bias,
                        dtype, weight_dtype, is_gated):
         self.router_weights = torch.randn((num_experts, hidden_size),
@@ -358,7 +352,7 @@ class TestFunctional(unittest.TestCase):
                                          dtype=trt_dtype_to_torch(dtype),
                                          device="cuda")
 
-    @parameterized.expand(get_params(), name_func=custom_name_func)
+    @parameterized.expand(get_params(), name_func=unittest_name_func)
     def test_mixture_of_experts(self, num_experts, top_k, hidden_size,
                                 num_sequences, sequence_lengths, actfn, bias,
                                 dtype_str, weight_dtype_str, norm_mode,
@@ -433,11 +427,10 @@ class TestFunctional(unittest.TestCase):
                            ('bfloat16', actfn, False)]
         return params
 
-    @parameterized.expand(get_mlp_params(), name_func=custom_name_func)
+    @parameterized.expand(get_mlp_params(), name_func=unittest_name_func)
     def test_mlp_comparison(self, dtype_str, actfn, use_plugin):
         """ This test uses one expert and compares the result to a plain MLP """
-        if getSMVersion() < 80 and dtype_str == 'bfloat16':
-            pytest.skip("Skip bf16 tests on arch < sm80")
+        skip_bf16_pre_ampere(dtype_str)
 
         use_int4_weights = dtype_str == 'int4'
         weight_dtype = trt.int8 if use_int4_weights else tensorrt_llm.str_dtype_to_trt(

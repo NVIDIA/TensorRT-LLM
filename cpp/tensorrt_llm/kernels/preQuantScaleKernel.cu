@@ -25,7 +25,7 @@ struct Vec2Type<__nv_bfloat16>
 
 template <typename T_in, typename T_out, int kProcessRows, typename AccessType>
 __global__ void apply_per_channel_scale(
-    T_out* smoothed_act, const T_in* act, const T_in* per_channel_scale, int rows, int cols)
+    T_out* smoothed_act, T_in const* act, T_in const* per_channel_scale, int rows, int cols)
 {
     static constexpr int kElems = sizeof(AccessType) / sizeof(T_in);
     T_in scale[kElems], act_vec[kElems];
@@ -35,11 +35,11 @@ __global__ void apply_per_channel_scale(
         return;
     act += row_offset * kProcessRows * cols;
     smoothed_act += row_offset * kProcessRows * cols;
-    *reinterpret_cast<AccessType*>(scale) = reinterpret_cast<const AccessType*>(per_channel_scale)[col_offset];
+    *reinterpret_cast<AccessType*>(scale) = reinterpret_cast<AccessType const*>(per_channel_scale)[col_offset];
 #pragma unroll
     for (int i = 0; i < kProcessRows; ++i)
     {
-        *reinterpret_cast<AccessType*>(act_vec) = reinterpret_cast<const AccessType*>(act + i * cols)[col_offset];
+        *reinterpret_cast<AccessType*>(act_vec) = reinterpret_cast<AccessType const*>(act + i * cols)[col_offset];
         if constexpr ((std::is_same_v<T_in, half>
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && defined(ENABLE_BF16))
                           || std::is_same_v<T_in, __nv_bfloat16>
@@ -80,7 +80,7 @@ __global__ void apply_per_channel_scale(
 
 template <typename T_in, typename T_out, int kProcessRows, typename AccessType = float4>
 void apply_per_channel_scale_kernel_launcher_(
-    T_out* smoothed_act, const T_in* act, const T_in* per_channel_scale, int rows, int cols, cudaStream_t stream = 0)
+    T_out* smoothed_act, T_in const* act, T_in const* per_channel_scale, int rows, int cols, cudaStream_t stream = 0)
 {
     static constexpr int kElems = sizeof(AccessType) / sizeof(T_in);
     dim3 block(128);
@@ -91,7 +91,7 @@ void apply_per_channel_scale_kernel_launcher_(
 
 template <typename T_in, typename T_out>
 void apply_per_channel_scale_kernel_launcher(
-    T_out* smoothed_act, const T_in* act, const T_in* per_channel_scale, int rows, int cols, cudaStream_t stream)
+    T_out* smoothed_act, T_in const* act, T_in const* per_channel_scale, int rows, int cols, cudaStream_t stream)
 {
     int elems = rows * cols;
     if (elems < 2048 * 2048)

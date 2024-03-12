@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/decodingCommon.h"
+#include "tensorrt_llm/kernels/samplingAirTopPKernels.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
 #include "tensorrt_llm/kernels/samplingTopPKernels.h"
 #include "tensorrt_llm/layers/topPSamplingLayer.h"
@@ -35,7 +36,7 @@ namespace layers
 {
 
 static __global__ void setTopPRuntimeArgs(int batchSize, uint32_t topK, uint32_t* topKs, int topKsSize, float topP,
-    float* topPs, int topPsSize, bool* skipDecode, const int* batchSlots, float* initialTopPBuf)
+    float* topPs, int topPsSize, bool* skipDecode, int const* batchSlots, float* initialTopPBuf)
 {
     /**
      * @brief Setup the runtime arguments for topp, broadcasting top_p to top_ps
@@ -69,30 +70,11 @@ void TopPSamplingLayer<T>::allocateBuffer(size_t batchSize)
     TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     if (mIsDeterministic)
     {
-        invokeTopPSampling<T>(nullptr, // workspace
-            mSamplingWorkspaceSize, mCubTempStorageSize,
-            nullptr,                   // output_ids
-            nullptr,                   // sequence_length
-            nullptr,                   // finished_input_buffer
-            nullptr,                   // finished_output_buffer
-            nullptr,                   // cum_log_probs
-            nullptr,                   // output_log_probs
-            nullptr,                   // log_probs
-            mTopPIdValsDevice, mTopPOffsetDevice, mBeginTopPOffsetDevice, nullptr, batchSize, mMaxBatchSize,
-            mVocabSizePadded, nullptr, 0.f, mStream, nullptr, nullptr);
+        mSamplingWorkspaceSize = getTopPWorkspaceSize<T>(batchSize, mVocabSizePadded);
     }
     else
     {
-        invokeAirTopPSampling<T>(nullptr, mSamplingWorkspaceSize,
-            nullptr, // output_ids
-            nullptr, // sequence_length
-            nullptr, // finished_input_buffer
-            nullptr, // finished_output_buffer
-            nullptr, // cum_log_probs
-            nullptr, // output_log_probs
-            nullptr, // log_probs)
-            nullptr, batchSize, mMaxBatchSize, mVocabSizePadded, nullptr, 0.f, mStream, mAirTopPBlockNum, nullptr,
-            nullptr);
+        mSamplingWorkspaceSize = getAirTopPWorkspaceSize<T>(batchSize, mVocabSizePadded);
     }
 
     std::array<size_t, 11> deviceBufferSizes;
@@ -285,8 +267,8 @@ void TopPSamplingLayer<T>::forward(DecodingOutputParams& outputs, ForwardParams&
 
     // Probabilities must be already computed instead of logits
     auto probs = inputs.logits.template getPtr<T>();
-    auto endIds = inputs.end_ids.template getPtr<const int>();
-    auto batchSlots = inputs.batch_slots ? inputs.batch_slots->template getPtr<const int>() : nullptr;
+    auto endIds = inputs.end_ids.template getPtr<int const>();
+    auto batchSlots = inputs.batch_slots ? inputs.batch_slots->template getPtr<int const>() : nullptr;
     auto curandStatesDevice = inputs.curand_states;
     auto samplingWorkspaceDevice = inputs.sampling_workspace;
 
@@ -313,23 +295,22 @@ void TopPSamplingLayer<T>::forward(DecodingOutputParams& outputs, ForwardParams&
 
     if (mIsDeterministic)
     {
-        invokeBatchTopPSampling<T>(samplingWorkspaceDevice, mSamplingWorkspaceSize, mCubTempStorageSize,
-            outputs.output_ids_ptr.template getPtr<int*>(), sequenceLength, finishedInput, finishedOutput, cumLogProbs,
-            outputLogProbs, probs, mTopPIdValsDevice, mTopPOffsetDevice, mBeginTopPOffsetDevice, curandStatesDevice,
-            batchSize, mMaxBatchSize, mVocabSizePadded, endIds, mRuntimeMaxTopP, mRuntimeTopPDevice, mStream,
-            mSkipDecodeDevice, batchSlots);
+        invokeBatchTopPSampling<T>(samplingWorkspaceDevice, outputs.output_ids_ptr.template getPtr<int*>(),
+            sequenceLength, finishedInput, finishedOutput, cumLogProbs, outputLogProbs, probs, mTopPIdValsDevice,
+            mTopPOffsetDevice, mBeginTopPOffsetDevice, curandStatesDevice, batchSize, mMaxBatchSize, mVocabSizePadded,
+            endIds, mRuntimeMaxTopP, mRuntimeTopPDevice, mStream, mSkipDecodeDevice, batchSlots);
         sync_check_cuda_error();
         invokeComputeToppDecay(mRuntimeTopPDevice, mInitialTopPDevice,
-            outputs.output_ids_ptr.template getPtr<const int*>(), mTopPDecayDevice, mTopPMinDevice, mTopPResetIdsDevice,
+            outputs.output_ids_ptr.template getPtr<int const*>(), mTopPDecayDevice, mTopPMinDevice, mTopPResetIdsDevice,
             sequenceLength, batchSlots, batchSize, mStream);
         sync_check_cuda_error();
     }
     else
     {
-        invokeBatchAirTopPSampling<T>(samplingWorkspaceDevice, mSamplingWorkspaceSize,
-            outputs.output_ids_ptr.template getPtr<int*>(), sequenceLength, finishedInput, finishedOutput, cumLogProbs,
-            outputLogProbs, probs, curandStatesDevice, batchSize, mMaxBatchSize, mVocabSizePadded, endIds,
-            mRuntimeMaxTopP, mRuntimeTopPDevice, mStream, mAirTopPBlockNum, mSkipDecodeDevice, batchSlots);
+        invokeBatchAirTopPSampling<T>(samplingWorkspaceDevice, outputs.output_ids_ptr.template getPtr<int*>(),
+            sequenceLength, finishedInput, finishedOutput, cumLogProbs, outputLogProbs, probs, curandStatesDevice,
+            batchSize, mMaxBatchSize, mVocabSizePadded, endIds, mRuntimeMaxTopP, mRuntimeTopPDevice, mStream,
+            mAirTopPBlockNum, mSkipDecodeDevice, batchSlots);
         sync_check_cuda_error();
     }
 }

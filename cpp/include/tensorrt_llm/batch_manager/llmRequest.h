@@ -474,7 +474,7 @@ public:
         return mDraftTokens->size();
     }
 
-    void setReturnContextLogits(const bool returnContextLogits)
+    void setReturnContextLogits(bool const returnContextLogits)
     {
         mReturnContextLogits = returnContextLogits;
     }
@@ -484,7 +484,7 @@ public:
         return mReturnContextLogits;
     }
 
-    void setReturnGenerationLogits(const bool returnGenerationLogits)
+    void setReturnGenerationLogits(bool const returnGenerationLogits)
     {
         mReturnGenerationLogits = returnGenerationLogits;
     }
@@ -554,6 +554,11 @@ public:
     [[nodiscard]] bool isGenerationInProgressState() const noexcept
     {
         return mState == REQUEST_STATE_GENERATION_IN_PROGRESS;
+    }
+
+    [[nodiscard]] bool isGenerationCompleteState() const noexcept
+    {
+        return mState == REQUEST_STATE_GENERATION_COMPLETE;
     }
 
     /// To determine whether the context is unchunked. When a context is chunked into only a part, it

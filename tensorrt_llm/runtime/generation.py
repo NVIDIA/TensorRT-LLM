@@ -33,13 +33,13 @@ from cuda import cudart
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
 from .._ipc_utils import set_peer_access
-from .._utils import (pad_vocab_size, str_dtype_to_torch, torch_to_numpy,
-                      trt_dtype_to_torch)
+from .._utils import (pad_vocab_size, preview_trt_version, str_dtype_to_torch,
+                      torch_to_numpy, trt_dtype_to_torch)
 from ..logger import logger
+from ..lora_manager import LoraManager
 from ..mapping import Mapping
 from ..quantization import QuantMode
 from .kv_cache_manager import GenerationSequence, KVCacheManager, KVCacheUpdater
-from .lora_manager import LoraManager
 from .session import _scoped_stream
 
 
@@ -320,6 +320,7 @@ class ModelConfig:
     use_context_fmha_for_generation: bool = False
     hf_modules_to_trtllm_modules: dict = None
     trtllm_modules_to_hf_modules: dict = None
+    skip_cross_qkv: bool = False
     num_medusa_heads: int = 0
     max_medusa_tokens: int = 0
     mamba_d_state: int = 0
@@ -626,8 +627,10 @@ class GenerationSession(object):
                 'encoder_input_lengths',
                 'encoder_max_input_length',
                 'cross_kv_cache_gen',
-                'cross_qkv_reuse',
             ]
+            self.skip_cross_qkv = model_config.skip_cross_qkv
+            if self.skip_cross_qkv:
+                expected_tensor_names += ['cross_qkv_reuse']
 
         if self.mapping.tp_size > 1 and model_config.use_custom_all_reduce:
             expected_tensor_names += ['all_reduce_workspace']
@@ -664,6 +667,8 @@ class GenerationSession(object):
                     f'{lora_module}_lora_weights_pointers_{i}'
                     for i in range(self.first_layer, self.last_layer)
                 ]
+            if self.cross_attention and self.remove_input_padding:
+                expected_tensor_names += ['host_encoder_input_lengths']
 
         if model_config.num_medusa_heads > 0:
             expected_tensor_names += [
@@ -815,6 +820,29 @@ class GenerationSession(object):
     @property
     def num_medusa_heads(self):
         return self._model_config.num_medusa_heads
+
+    def _capture_cuda_graph_and_instantiate(self, context, stream, step):
+        instance_idx = (step + 1) % 2
+        # capture cuda graph
+        CUASSERT(
+            cudart.cudaStreamBeginCapture(
+                stream,
+                cudart.cudaStreamCaptureMode.cudaStreamCaptureModeGlobal))
+        context.execute_async_v3(stream)
+        next_graph = CUASSERT(cudart.cudaStreamEndCapture(stream))[0]
+
+        if self.runtime.cuda_graph_instances[instance_idx] is not None:
+            self.runtime.cuda_graph_instances[
+                instance_idx] = _update_cuda_graph_instance(
+                    self.runtime.cuda_graph_instances[instance_idx], next_graph)
+        else:
+            self.runtime.cuda_graph_instances[instance_idx] = CUASSERT(
+                cudart.cudaGraphInstantiate(next_graph, 0))[0]
+
+        # Pre-upload cuda graph to stream
+        CUASSERT(
+            cudart.cudaGraphUpload(
+                self.runtime.cuda_graph_instances[instance_idx], stream))
 
     def __setup_decoder(self, input_ids: torch.Tensor,
                         sampling_config: SamplingConfig,
@@ -1413,18 +1441,19 @@ class GenerationSession(object):
             # in context phase, need to generate cross kv cache, set to True
             add_tensor(torch.ones(1, dtype=torch.bool, device=self.device),
                        'cross_kv_cache_gen')
-            if self.cross_qkv_reuse is None:
-                # see Attention's self.qkv output dim
-                cross_qkv_out_dim = self.mapping.tp_size * self.num_heads * self.head_size + (
-                    2 * self.mapping.tp_size * self.num_heads_kv *
-                    self.head_size)
-                cross_qkv_shape = encoder_output.shape[:-1] + (
-                    cross_qkv_out_dim, )
-                cross_qkv_reuse = torch.empty(cross_qkv_shape,
-                                              dtype=encoder_output.dtype,
-                                              device=encoder_output.device)
-                self.cross_qkv_reuse = cross_qkv_reuse
-            add_tensor(self.cross_qkv_reuse, 'cross_qkv_reuse')
+            if self.skip_cross_qkv:
+                if self.cross_qkv_reuse is None:
+                    # see Attention's self.qkv output dim
+                    cross_qkv_out_dim = self.mapping.tp_size * self.num_heads * self.head_size + (
+                        2 * self.mapping.tp_size * self.num_heads_kv *
+                        self.head_size)
+                    cross_qkv_shape = encoder_output.shape[:-1] + (
+                        cross_qkv_out_dim, )
+                    cross_qkv_reuse = torch.empty(cross_qkv_shape,
+                                                  dtype=encoder_output.dtype,
+                                                  device=encoder_output.device)
+                    self.cross_qkv_reuse = cross_qkv_reuse
+                add_tensor(self.cross_qkv_reuse, 'cross_qkv_reuse')
             add_tensor(encoder_output, 'encoder_output')
             add_tensor(encoder_input_lengths, 'encoder_input_lengths')
             add_tensor(self.buffer['encoder_max_input_length'],
@@ -1557,6 +1586,9 @@ class GenerationSession(object):
                     add_tensor(self.buffer[lora_ranks], lora_ranks)
                     lora_weights = f'{lora_module}_lora_weights_pointers_{layer_idx}'
                     add_tensor(self.buffer[lora_weights], lora_weights)
+            if self.cross_attention and self.remove_input_padding:
+                add_tensor(encoder_input_lengths.to('cpu'),
+                           'host_encoder_input_lengths')
         if self.is_medusa_mode:
             # Medusa mask and position offsets are fixed for the whole session.
             add_tensor(self.buffer['medusa_packed_mask'], 'medusa_packed_mask')
@@ -1647,11 +1679,30 @@ class GenerationSession(object):
             add_tensor(position_ids, 'position_ids')
 
         if self.cross_attention:
+            if self.use_gpt_attention_plugin:
+                # disable (or minimize) cross qkv computation at generation phase
+                if self.skip_cross_qkv:
+                    # disable
+                    encoder_output_shape = encoder_output.shape
+                    add_tensor(self.cross_qkv_reuse, 'cross_qkv_reuse')
+                else:
+                    # minimize
+                    # hacky way: such that qkv gemm becomes a gemv which is cheap and negligible
+                    encoder_output_shape = [
+                        1, encoder_output.shape[-1]
+                    ] if self.remove_input_padding else [
+                        1, 1, encoder_output.shape[-1]
+                    ]
+            else:
+                # OOTB path doesn't have kv cache for now, so this encoder_output is
+                # a must-have input. We just use the encoder_output
+                encoder_output_shape = encoder_output.shape
+
             # in generation phase, cross kv cache is already filled during context phase, set to False
             add_tensor(torch.zeros(1, dtype=torch.bool, device=self.device),
                        'cross_kv_cache_gen')
-            add_tensor(self.cross_qkv_reuse, 'cross_qkv_reuse')
-            add_tensor(encoder_output, 'encoder_output')
+            add_tensor_with_shape(encoder_output, 'encoder_output',
+                                  encoder_output_shape)
             add_tensor(encoder_input_lengths, 'encoder_input_lengths')
             add_tensor(self.buffer['encoder_max_input_length'],
                        'encoder_max_input_length')
@@ -1754,6 +1805,9 @@ class GenerationSession(object):
                     add_tensor(self.buffer[lora_ranks], lora_ranks)
                     lora_module = f'{lora_module}_lora_weights_pointers_{layer_idx}'
                     add_tensor(self.buffer[lora_module], lora_module)
+            if self.cross_attention and self.remove_input_padding:
+                add_tensor(encoder_input_lengths.to('cpu'),
+                           'host_encoder_input_lengths')
 
         if self.is_medusa_mode:
             # Medusa mask and position offsets are fixed for the whole session.
@@ -2379,30 +2433,8 @@ class GenerationSession(object):
             self.runtime._set_tensors(next_context, next_step_tensors)
 
             if self.cuda_graph_mode:
-                # capture cuda graph
-                CUASSERT(
-                    cudart.cudaStreamBeginCapture(
-                        stream, cudart.cudaStreamCaptureMode.
-                        cudaStreamCaptureModeGlobal))
-                next_context.execute_async_v3(stream)
-                next_graph = CUASSERT(cudart.cudaStreamEndCapture(stream))[0]
-
-                instance_idx = (step + 1) % 2
-
-                if self.runtime.cuda_graph_instances[instance_idx] is not None:
-                    self.runtime.cuda_graph_instances[
-                        instance_idx] = _update_cuda_graph_instance(
-                            self.runtime.cuda_graph_instances[instance_idx],
-                            next_graph)
-                else:
-                    self.runtime.cuda_graph_instances[instance_idx] = CUASSERT(
-                        cudart.cudaGraphInstantiate(next_graph, 0))[0]
-
-                # Pre-upload cuda graph to stream
-                CUASSERT(
-                    cudart.cudaGraphUpload(
-                        self.runtime.cuda_graph_instances[instance_idx],
-                        stream))
+                self._capture_cuda_graph_and_instantiate(
+                    next_context, stream, step)
 
         should_stop = None
         logits = None
@@ -3281,10 +3313,16 @@ class MambaLMHeadModelGenerationSession(GenerationSession):
             dtype=self._tensor_dtype('logits'),
             device=self.device)
 
-        conv_state_shape = (
+        ctx_conv_state_shape = (
             batch_size,
             self.mamba_d_inner,
-            self.mamba_d_conv - 1,
+            self.mamba_d_conv - 1 + self.max_context_length,
+        )
+
+        gen_conv_state_shape = (
+            batch_size,
+            self.mamba_d_inner,
+            self.mamba_d_conv,
         )
 
         ssm_state_shape = (
@@ -3298,11 +3336,11 @@ class MambaLMHeadModelGenerationSession(GenerationSession):
             # They will take turns to act as input and output buffers.
             dtype = self._tensor_dtype(f'present_conv_state_{i}')
             self.buffer[f'present_conv_state_{i}'] = torch.empty(
-                conv_state_shape, dtype=dtype, device=self.device)
+                ctx_conv_state_shape, dtype=dtype, device=self.device)
             self.buffer[f'1_present_conv_state_{i}'] = torch.empty(
-                conv_state_shape, dtype=dtype, device=self.device)
+                gen_conv_state_shape, dtype=dtype, device=self.device)
             self.buffer[f'present_ssm_state_{i}'] = torch.empty(
-                ssm_state_shape, dtype=torch.float32, device=self.device)
+                ssm_state_shape, dtype=dtype, device=self.device)
 
         self.buffer_allocated = True
 
@@ -3406,18 +3444,30 @@ class MambaLMHeadModelGenerationSession(GenerationSession):
 
         for idx in range(self.first_layer, self.last_layer):
             # conv state
-            next_shape = (batch_size, self.mamba_d_inner, self.mamba_d_conv - 1)
+            if step == 0:
+                next_shape_in = (batch_size, self.mamba_d_inner,
+                                 self.mamba_d_conv - 1 +
+                                 self.max_context_length)
+                next_shape_out = (batch_size, self.mamba_d_inner,
+                                  self.mamba_d_conv)
+            else:
+                next_shape_in = (batch_size, self.mamba_d_inner,
+                                 self.mamba_d_conv)
+                next_shape_out = (batch_size, self.mamba_d_inner,
+                                  self.mamba_d_conv)
             if step % 2:
                 add_tensor_with_shape(
                     self.buffer[f'1_present_conv_state_{idx}'],
-                    f'past_conv_state_{idx}', next_shape)
-                add_tensor(self.buffer[f'present_conv_state_{idx}'],
-                           f'present_conv_state_{idx}')
+                    f'past_conv_state_{idx}', next_shape_in)
+                add_tensor_with_shape(self.buffer[f'present_conv_state_{idx}'],
+                                      f'present_conv_state_{idx}',
+                                      next_shape_out)
             else:
                 add_tensor_with_shape(self.buffer[f'present_conv_state_{idx}'],
-                                      f'past_conv_state_{idx}', next_shape)
-                add_tensor(self.buffer[f'1_present_conv_state_{idx}'],
-                           f'present_conv_state_{idx}')
+                                      f'past_conv_state_{idx}', next_shape_in)
+                add_tensor_with_shape(
+                    self.buffer[f'1_present_conv_state_{idx}'],
+                    f'present_conv_state_{idx}', next_shape_out)
             # ssm state
             ssm_state = self.buffer[f'present_ssm_state_{idx}']
             add_tensor(ssm_state, f'past_ssm_state_{idx}')
@@ -3448,3 +3498,15 @@ class MambaLMHeadModelGenerationSession(GenerationSession):
         last_token_ids = torch.ones_like(context_lengths)
         ret = {'last_token_ids': last_token_ids}
         return ret
+
+    def _capture_cuda_graph_and_instantiate(self, context, stream, step):
+        instance_idx = (step + 1) % 2
+        # Mamba model I/O shape isn't changed in generation phase
+        # Create two cuda graph once.If cuda graph has already existed, skip it.
+        if self.runtime.cuda_graph_instances[instance_idx] is not None:
+            return
+        # WAR for TRT 9.x
+        if not preview_trt_version() and step < 3:
+            return
+        return super()._capture_cuda_graph_and_instantiate(
+            context, stream, step)

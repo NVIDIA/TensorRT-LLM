@@ -49,13 +49,13 @@ public:
         bool dense_context_fmha = false, bool use_paged_context_fmha = false, bool use_cache = true,
         bool is_medusa_enabled = false);
 
-    GPTAttentionPluginCommon(const void* data, size_t length);
+    GPTAttentionPluginCommon(void const* data, size_t length);
 
     ~GPTAttentionPluginCommon() override = default;
 
     template <typename T>
-    int enqueueImpl(const nvinfer1::PluginTensorDesc* inputDesc, const nvinfer1::PluginTensorDesc* outputDesc,
-        const void* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream);
+    int enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
+        void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream);
 
     //! This is called on every trt Engine creation
     int initialize() noexcept override;
@@ -74,7 +74,7 @@ public:
 
     static size_t getCommonSerializationSize() noexcept;
     void serializeCommon(void* buffer) const noexcept;
-    const int getHeadSize(bool checkInit = true) const;
+    int const getHeadSize(bool checkInit = true) const;
 
 protected:
     int getMaxNumSeqLenTile(int batch_beam_size = 1) const;
@@ -112,7 +112,7 @@ protected:
         int32_t max_blocks_per_sequence;
         void* workspace;
         // optional when relative position
-        const T* relative_attention_bias = nullptr;
+        T const* relative_attention_bias = nullptr;
         int relative_attention_bias_stride = 0;
         // optional when cross attention
         T const* cross_qkv = nullptr;
@@ -122,7 +122,7 @@ protected:
     };
 
     template <typename T, typename KVCacheBuffer>
-    int enqueueContext(const EnqueueContextParams<T, KVCacheBuffer>& params, cudaStream_t stream);
+    int enqueueContext(EnqueueContextParams<T, KVCacheBuffer> const& params, cudaStream_t stream);
 
     template <typename T, typename KVCacheBuffer>
     struct EnqueueGenerationParams
@@ -154,27 +154,27 @@ protected:
         void* workspace;
         int32_t const* host_past_key_value_lengths;
         // optional when relative position
-        const T* relative_attention_bias = nullptr;
+        T const* relative_attention_bias = nullptr;
         int relative_attention_bias_stride = 0;
         // optional when cross attention
         int32_t const* encoder_input_lengths = nullptr;
         int32_t const* host_context_lengths = nullptr;
         // optional when medusa is used.
-        const bool* medusa_mask = nullptr;
-        const int32_t* medusa_packed_mask = nullptr;
-        const int32_t* medusa_position_offsets = nullptr;
+        bool const* medusa_mask = nullptr;
+        int32_t const* medusa_packed_mask = nullptr;
+        int32_t const* medusa_position_offsets = nullptr;
     };
 
     template <typename T, typename KVCacheBuffer>
-    int enqueueGeneration(const EnqueueGenerationParams<T, KVCacheBuffer>& params, cudaStream_t stream);
+    int enqueueGeneration(EnqueueGenerationParams<T, KVCacheBuffer> const& params, cudaStream_t stream);
 
     // Called in configurePlugin().
     template <typename T, typename KVCacheBuffer>
-    void prepareEnqueueGeneration(const EnqueueGenerationParams<T, KVCacheBuffer>& params);
+    void prepareEnqueueGeneration(EnqueueGenerationParams<T, KVCacheBuffer> const& params);
 
     template <typename T, typename KVCacheBuffer>
     bool convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams& xqaParams,
-        const EnqueueGenerationParams<T, KVCacheBuffer>& generationsParams, bool forConfigurePlugin);
+        EnqueueGenerationParams<T, KVCacheBuffer> const& generationsParams, bool forConfigurePlugin);
 
     bool isRelativePosition() const
     {
@@ -276,10 +276,10 @@ class GPTAttentionPluginCreatorCommon : public BaseCreator
 public:
     GPTAttentionPluginCreatorCommon();
 
-    const nvinfer1::PluginFieldCollection* getFieldNames() noexcept override;
+    nvinfer1::PluginFieldCollection const* getFieldNames() noexcept override;
 
     template <typename T>
-    T* deserializePluginImpl(const char* name, const void* serialData, size_t serialLength) noexcept;
+    T* deserializePluginImpl(char const* name, void const* serialData, size_t serialLength) noexcept;
 
 protected:
     std::vector<nvinfer1::PluginField> mPluginAttributes;

@@ -117,18 +117,18 @@ public:
         std::optional<std::vector<tc::Tensor>> logits_vec; // [batch_size], on gpu
 
         // optional parameters
-        std::optional<tc::Tensor> finished;              // [batch_size * beam_width], optional
+        std::optional<tc::Tensor> finished;              // [batch_size * beam_width]
         std::optional<tc::Tensor> src_cache_indirection; // [local_batch_size, beam_width, max_seq_len] - the k/v cache
                                                          // index for beam search, mandatory for beam search, on gpu
         std::optional<tc::Tensor> sequence_limit_length; // [batch_size], on gpu
         std::optional<tc::Tensor> embedding_bias;        // [vocab_size_padded], on gpu
         std::optional<tc::Tensor> input_lengths;         // [batch_size, beam_width], on gpu
-        std::optional<tc::Tensor> bad_words_ptr; // [2, bad_words_length] or [batch_size, 2, bad_words_length], on gpu
-        std::optional<tc::Tensor> bad_words_lengths;    // [batch_size], on gpu
-        std::optional<tc::Tensor> stop_words_ptr;       // [batch_size][2, stop_words_length], on gpu
-        std::optional<tc::Tensor> stop_words_lengths;   // [batch_size], on gpu
-        std::optional<tc::Tensor> no_repeat_ngram_size; // [batch_size], optional
-        std::optional<tc::Tensor> batch_slots;          // [batch_size], optional, in pinned memory
+        std::optional<tc::Tensor> bad_words_ptr;         // [batch_size][2, bad_words_length], on gpu
+        std::optional<tc::Tensor> bad_words_lengths;     // [batch_size], on gpu
+        std::optional<tc::Tensor> stop_words_ptr;        // [batch_size][2, stop_words_length], on gpu
+        std::optional<tc::Tensor> stop_words_lengths;    // [batch_size], on gpu
+        std::optional<tc::Tensor> no_repeat_ngram_size;  // [batch_size]
+        std::optional<tc::Tensor> batch_slots;           // [batch_size] in pinned memory
     };
 
     class OutputParams
@@ -140,25 +140,24 @@ public:
         }
 
         // mandatory parameters
-        tc::Tensor output_ids; // [batch_size, beam_width. max_seq_len]
+        tc::Tensor output_ids; // [batch_size, beam_width, max_seq_len]
         tc::Tensor newTokens;  // [batch_size, beam_width]
         // optional parameters
-        std::optional<tc::Tensor> finished;        // [batch_size * beam_width], optional
-        std::optional<tc::Tensor> finished_sum;    // [1], optional, in pinned host memory
+        std::optional<tc::Tensor> finished;        // [batch_size * beam_width]
+        std::optional<tc::Tensor> finished_sum;    // [1] in pinned host memory
         std::optional<tc::Tensor> cum_log_probs;   // [batch_size * beam_width], necessary in beam search
         std::optional<tc::Tensor> parent_ids;      // [max_seq_len, batch_size * beam_width], necessary in beam search
-        std::optional<tc::Tensor> sequence_length; // [batch_size * beam_width], optional
-        std::optional<tc::Tensor>
-            output_log_probs_tiled; // [request_output_length, batch_size, beam_width], must be float*, optional
-        std::optional<tc::Tensor>
-            output_log_probs;       // [batch_size, beam_width, request_output_length], must be float*, optional
-        std::optional<tc::Tensor>
-            tgt_cache_indirection;  // [local_batch_size, beam_width, max_seq_len], the k/v cache index for beam search
-        std::shared_ptr<kernels::BeamHypotheses>
-            beamHypotheses;         // a special structure which maintains some pointers of beam search
+        std::optional<tc::Tensor> sequence_length; // [batch_size * beam_width]
+        std::optional<tc::Tensor> output_log_probs_tiled;        // [request_output_length, batch_size, beam_width]
+                                                                 // must be float*
+        std::optional<tc::Tensor> output_log_probs;              // [batch_size, beam_width, request_output_length]
+                                                                 // must be float*
+        std::optional<tc::Tensor> tgt_cache_indirection;         // [local_batch_size, beam_width, max_seq_len]
+                                                                 // the k/v cache index for beam search
+        std::shared_ptr<kernels::BeamHypotheses> beamHypotheses; // structure maintains some pointers of beam search
 
-        tc::Tensor output_ids_ptr;  // [batch_size] int* (2-d array), each int* has [beam_width, max_seq_len]
-        tc::Tensor parent_ids_ptr;  // [batch_size] int* (2-d array), each int* has [beam_width, max_seq_len]
+        tc::Tensor output_ids_ptr; // [batch_size] int* (2-d array), each int* has [beam_width, max_seq_len]
+        tc::Tensor parent_ids_ptr; // [batch_size] int* (2-d array), each int* has [beam_width, max_seq_len]
     };
 
     void forward(OutputParams& outputs, ForwardParams const& params);

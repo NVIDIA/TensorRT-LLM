@@ -1216,7 +1216,6 @@ if __name__ == '__main__':
         'quantization': {
             'quant_algo': quant_algo,
             'kv_cache_quant_algo': kv_cache_quant_algo,
-            'sq_use_plugin': True,
             'group_size': args.group_size,
         },
         'mapping': {
@@ -1234,25 +1233,29 @@ if __name__ == '__main__':
     with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
         json.dump(config, f, indent=4)
 
+    hf_model = AutoModelForCausalLM.from_pretrained(args.model_dir,
+                                                    trust_remote_code=True,
+                                                    torch_dtype="auto")
+
+    if args.smoothquant is not None or args.int8_kv_cache:
+        act_range = {}
+        baichuan_smoother = {}
+        act_range = capture_activation_range(
+            hf_model.cuda(),
+            AutoTokenizer.from_pretrained(args.model_dir,
+                                          use_fast=False,
+                                          trust_remote_code=True))
+        if args.smoothquant is not None:
+            smooth_baichuan_model(hf_model, act_range, args.smoothquant,
+                                  baichuan_smoother)
+
     def covert_and_save(rank):
         mapping = Mapping(world_size=world_size,
                           rank=rank,
                           tp_size=args.tp_size,
                           pp_size=args.pp_size)
-        hf_model = AutoModelForCausalLM.from_pretrained(args.model_dir,
-                                                        trust_remote_code=True,
-                                                        torch_dtype="auto")
+
         if args.smoothquant is not None or args.int8_kv_cache:
-            act_range = {}
-            baichuan_smoother = {}
-            act_range = capture_activation_range(
-                hf_model.cuda(),
-                AutoTokenizer.from_pretrained(args.model_dir,
-                                              use_fast=False,
-                                              trust_remote_code=True))
-            if args.smoothquant is not None:
-                smooth_baichuan_model(hf_model, act_range, args.smoothquant,
-                                      baichuan_smoother)
             weights = convert_hf_baichuan_sq(hf_model, mapping, rank,
                                              args.dtype, args.per_channel,
                                              args.per_token, args.int8_kv_cache,
@@ -1272,7 +1275,6 @@ if __name__ == '__main__':
                 dtype=args.dtype,
                 use_weight_only=args.use_weight_only,
                 plugin_weight_only_quant_type=plugin_weight_only_quant_type)
-        del hf_model
 
         safetensors.torch.save_file(
             weights, os.path.join(args.output_dir, f'rank{rank}.safetensors'))
@@ -1296,6 +1298,7 @@ if __name__ == '__main__':
                 exceptions
             ) == 0, "Checkpoint conversion failed, please check error log."
 
+    del hf_model
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     print(f'Total time of converting checkpoints: {t}')
