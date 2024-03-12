@@ -85,7 +85,7 @@ public:
      * enqueueGeneration.
      */
     template <typename T>
-    bool shouldUse(const XQAParams& xqaParams, bool forConfigurePlugin)
+    bool shouldUse(XQAParams const& xqaParams, bool forConfigurePlugin)
     {
         if (!(xqaParams.data_type == DATA_TYPE_FP16 || xqaParams.data_type == DATA_TYPE_BF16))
         {
@@ -137,9 +137,9 @@ public:
 
         // OPTIMIZE: For the standard generation-phase MHA, there are still extra limitations.
         // NOTE: Medusa mode = Multi_query_tokens > 1.
-        const int nbQHeads = xqaParams.num_q_heads;
-        const int nbKVHeads = xqaParams.num_kv_heads;
-        const int nbQHeadsPerKV = nbQHeads / nbKVHeads;
+        int const nbQHeads = xqaParams.num_q_heads;
+        int const nbKVHeads = xqaParams.num_kv_heads;
+        int const nbQHeadsPerKV = nbQHeads / nbKVHeads;
         if (!xqaParams.multi_query_tokens)
         {
             if (nbQHeadsPerKV != 8 && nbQHeadsPerKV != 1)
@@ -160,7 +160,7 @@ public:
 
     size_t getWorkspaceSize(int max_batch_beam_size);
 
-    void prepare(const XQAParams& xqa_params)
+    void prepare(XQAParams const& xqa_params)
     {
         if (!mPrepareCalled)
         {
@@ -170,7 +170,7 @@ public:
     }
 
     template <typename KVCacheBuffer>
-    void dispatch(const XQAParams& xqa_params, KVCacheBuffer& kv_cache_buffer, const cudaStream_t& stream)
+    void dispatch(XQAParams const& xqa_params, KVCacheBuffer& kv_cache_buffer, cudaStream_t const& stream)
     {
         if (!mPrepareCalled)
         {
@@ -181,11 +181,11 @@ public:
     }
 
 private:
-    bool shouldUseImpl(const XQAParams& xqa_params);
-    void prepareForRun(const XQAParams& xqa_params);
+    bool shouldUseImpl(XQAParams const& xqa_params);
+    void prepareForRun(XQAParams const& xqa_params);
 
     template <typename KVCacheBuffer>
-    void run(const XQAParams& xqa_params, KVCacheBuffer& kv_cache_buffer, const cudaStream_t& stream);
+    void run(XQAParams const& xqa_params, KVCacheBuffer& kv_cache_buffer, cudaStream_t const& stream);
 
     static constexpr int kMaxBeamWidth = 4;
 

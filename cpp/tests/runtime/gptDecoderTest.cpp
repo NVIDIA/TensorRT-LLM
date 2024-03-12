@@ -199,7 +199,7 @@ TEST_P(ParamTest, Test)
 
 INSTANTIATE_TEST_SUITE_P(DecoderTest, ParamTest,
     testing::Combine(testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kHALF), testing::Values(1, 3)),
-    [](const testing::TestParamInfo<ParamTest::ParamType>& info)
+    [](testing::TestParamInfo<ParamTest::ParamType> const& info)
     {
         std::string name{std::get<0>(info.param) == nvinfer1::DataType::kFLOAT ? "Float" : "Half"};
         auto const beamWidth = std::get<1>(info.param);

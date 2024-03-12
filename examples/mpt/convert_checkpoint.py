@@ -43,6 +43,31 @@ def parse_arguments():
                         default='float32',
                         choices=['float16', 'float32'])
     parser.add_argument(
+        '--use_parallel_embedding',
+        action="store_true",
+        default=False,
+        help=
+        'By default embedding parallelism is disabled. By setting this flag, embedding parallelism is enabled'
+    )
+    parser.add_argument(
+        '--embedding_sharding_dim',
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help=
+        'By default the embedding lookup table is sharded along vocab dimension (embedding_sharding_dim=0). '
+        'To shard it along hidden dimension, set embedding_sharding_dim=1'
+        'Note: embedding sharing is only enabled when embedding_sharding_dim = 0'
+    )
+    parser.add_argument(
+        '--use_embedding_sharing',
+        action="store_true",
+        default=False,
+        help=
+        'Try to reduce the engine size by sharing the embedding lookup table between two layers.'
+        'Note: the flag might not take effect when the criteria are not met.')
+
+    parser.add_argument(
         "--calibrate_kv_cache",
         "-kv",
         action="store_true",
@@ -617,6 +642,9 @@ def convert_hf_mpt_legacy(hf_model,
                           mapping,
                           rank=0,
                           dtype='float32',
+                          use_parallel_embedding: bool = False,
+                          sharding_dim: int = 0,
+                          share_embedding_table: bool = False,
                           use_weight_only=False,
                           plugin_weight_only_quant_type='int8',
                           use_smooth_quant=False,
@@ -633,6 +661,7 @@ def convert_hf_mpt_legacy(hf_model,
     dtype = getattr(torch, dtype)
     num_attention_heads = hf_model.config.n_heads
     hidden_size = hf_model.config.d_model
+    vocab_size = hf_model.config.vocab_size
     num_key_value_heads = hf_config.attn_config['kv_n_heads'] if 'kv_n_heads' in hf_config.attn_config \
         else hf_config.n_heads
     multi_query_mode = (num_key_value_heads != num_attention_heads)
@@ -794,13 +823,22 @@ def convert_hf_mpt_legacy(hf_model,
     embed_w = get_weight(model_params, 'transformer.wte', dtype)
     if mapping.is_first_pp_rank():
         # Embedding
-        weights['transformer.vocab_embedding.weight'] = embed_w
+        if not use_parallel_embedding:
+            weights['transformer.vocab_embedding.weight'] = embed_w
+        else:
+            if sharding_dim == 0:
+                assert vocab_size % mapping.tp_size == 0
+            else:
+                assert hidden_size % mapping.tp_size == 0
+            weights['transformer.vocab_embedding.weight'] = split_matrix(
+                embed_w, mapping.tp_size, mapping.tp_rank, sharding_dim)
     if mapping.is_last_pp_rank():
         # lm_head weight and bias
-        weights['lm_head.weight'] = split_matrix(embed_w.clone(),
-                                                 mapping.tp_size,
-                                                 mapping.tp_rank,
-                                                 dim=0)
+        if not share_embedding_table:
+            weights['lm_head.weight'] = split_matrix(embed_w.clone(),
+                                                     mapping.tp_size,
+                                                     mapping.tp_rank,
+                                                     dim=0)
         ln_f_w = get_weight(model_params, 'transformer.norm_f', dtype)
         # ln_f weight and bias
         weights['transformer.ln_f.weight'] = ln_f_w
@@ -815,6 +853,9 @@ def convert_hf_mpt(hf_model: MptForCausalLM,
                    hf_config: AutoConfig,
                    mapping: Mapping,
                    dtype: str = 'float32',
+                   use_parallel_embedding: bool = False,
+                   sharding_dim: int = 0,
+                   share_embedding_table: bool = False,
                    use_weight_only: bool = False,
                    plugin_weight_only_quant_type: torch.dtype = torch.int8):
 
@@ -827,7 +868,8 @@ def convert_hf_mpt(hf_model: MptForCausalLM,
     num_head = hf_config.n_heads
     num_kv_heads = hf_config.attn_config['kv_n_heads'] if 'kv_n_heads' in hf_config.attn_config \
         else hf_config.n_heads
-    num_hidden = hf_config.d_model
+    hidden_size = hf_config.d_model
+    vocab_size = hf_config.vocab_size
 
     layers_range = mapping.pp_layers(num_hidden_layers)
     for l in layers_range:
@@ -835,7 +877,7 @@ def convert_hf_mpt(hf_model: MptForCausalLM,
         tllm_prex = f'transformer.layers.{l-layers_range[0]}'
         # Attention QKV (no bias)
         qkv_w = get_weight(model_params, f'{prefix}.attn.Wqkv', dtype)
-        qkv_w = split_qkv_tp(qkv_w, num_head, num_kv_heads, num_hidden,
+        qkv_w = split_qkv_tp(qkv_w, num_head, num_kv_heads, hidden_size,
                              mapping.tp_size, mapping.tp_rank)
         weights.update(
             get_tllm_linear_weight(qkv_w, f'{tllm_prex}.attention.qkv', None,
@@ -884,13 +926,22 @@ def convert_hf_mpt(hf_model: MptForCausalLM,
     embed_w = get_weight(model_params, 'transformer.wte', dtype)
     if mapping.is_first_pp_rank():
         # Embedding
-        weights['transformer.vocab_embedding.weight'] = embed_w
+        if not use_parallel_embedding:
+            weights['transformer.vocab_embedding.weight'] = embed_w
+        else:
+            if sharding_dim == 0:
+                assert vocab_size % mapping.tp_size == 0
+            else:
+                assert hidden_size % mapping.tp_size == 0
+            weights['transformer.vocab_embedding.weight'] = split_matrix(
+                embed_w, mapping.tp_size, mapping.tp_rank, sharding_dim)
     if mapping.is_last_pp_rank():
         # lm_head weight and bias
-        weights['lm_head.weight'] = split_matrix(embed_w.clone(),
-                                                 mapping.tp_size,
-                                                 mapping.tp_rank,
-                                                 dim=0)
+        if not share_embedding_table:
+            weights['lm_head.weight'] = split_matrix(embed_w.clone(),
+                                                     mapping.tp_size,
+                                                     mapping.tp_rank,
+                                                     dim=0)
         ln_f_w = get_weight(model_params, 'transformer.norm_f', dtype)
         # ln_f weight and bias
         weights['transformer.ln_f.weight'] = ln_f_w
@@ -956,10 +1007,12 @@ if __name__ == '__main__':
         'num_key_value_heads': num_kv_heads,
         'position_embedding_type': 'alibi',
         'hidden_act': 'gelu',
+        'use_parallel_embedding': args.use_parallel_embedding,
+        'embedding_sharding_dim': args.embedding_sharding_dim,
+        'share_embedding_table': args.use_embedding_sharing,
         'quantization': {
             'quant_algo': quant_algo,
             'kv_cache_quant_algo': kv_cache_quant_algo,
-            'sq_use_plugin': True,
         },
         'mapping': {
             'world_size': world_size,
@@ -974,42 +1027,61 @@ if __name__ == '__main__':
     with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
         json.dump(config, f, indent=4)
 
+    hf_model = AutoModelForCausalLM.from_pretrained(args.model_dir,
+                                                    trust_remote_code=True,
+                                                    device_map="auto",
+                                                    torch_dtype=getattr(
+                                                        torch, args.dtype))
+
+    act_range = {}
+    mpt_qkv_para = {}
+    # smoother for inputs of self_attn.o_proj and mlp.down_proj
+    mpt_smoother = {}
+    if args.smoothquant is not None or args.calibrate_kv_cache:
+        dataset = load_dataset("ccdv/cnn_dailymail",
+                               '3.0.0',
+                               cache_dir=args.dataset_cache_dir)
+        act_range = capture_activation_range(
+            hf_model,
+            AutoTokenizer.from_pretrained(args.model_dir, padding_side='left'),
+            dataset)
+        if args.smoothquant is not None:
+            smooth_mpt_model(hf_model, act_range, args.smoothquant,
+                             mpt_qkv_para, mpt_smoother)
+
     def covert_and_save(rank):
         mapping = Mapping(world_size=world_size,
                           rank=rank,
                           tp_size=args.tp_size,
                           pp_size=args.pp_size)
-        hf_model = AutoModelForCausalLM.from_pretrained(args.model_dir,
-                                                        trust_remote_code=True,
-                                                        device_map="auto",
-                                                        torch_dtype=getattr(
-                                                            torch, args.dtype))
-        act_range = {}
-        mpt_qkv_para = {}
-        # smoother for inputs of self_attn.o_proj and mlp.down_proj
-        mpt_smoother = {}
+
         if args.smoothquant is not None or args.calibrate_kv_cache:
-            dataset = load_dataset("ccdv/cnn_dailymail",
-                                   '3.0.0',
-                                   cache_dir=args.dataset_cache_dir)
-            act_range = capture_activation_range(
-                hf_model,
-                AutoTokenizer.from_pretrained(args.model_dir,
-                                              padding_side='left'), dataset)
-            if args.smoothquant is not None:
-                smooth_mpt_model(hf_model, act_range, args.smoothquant,
-                                 mpt_qkv_para, mpt_smoother)
             weights = convert_hf_mpt_legacy(
-                hf_model, mapping, rank, args.dtype, args.use_weight_only,
-                plugin_weight_only_quant_type, args.smoothquant is not None,
-                args.per_channel, args.per_token, args.calibrate_kv_cache,
-                act_range, mpt_qkv_para, mpt_smoother)
+                hf_model,
+                mapping,
+                rank,
+                dtype=args.dtype,
+                use_parallel_embedding=args.use_parallel_embedding,
+                sharding_dim=args.embedding_sharding_dim,
+                share_embedding_table=args.use_embedding_sharing,
+                use_weight_only=args.use_weight_only,
+                plugin_weight_only_quant_type=plugin_weight_only_quant_type,
+                use_smooth_quant=(args.smoothquant is not None),
+                per_channel=args.per_channel,
+                per_token=args.per_token,
+                int8_kv_cache=args.calibrate_kv_cache,
+                act_range=act_range,
+                qkv_para=mpt_qkv_para,
+                smoother=mpt_smoother)
         else:
             weights = convert_hf_mpt(
                 hf_model,
                 hf_config,
                 mapping,
                 dtype=args.dtype,
+                use_parallel_embedding=args.use_parallel_embedding,
+                sharding_dim=args.embedding_sharding_dim,
+                share_embedding_table=args.use_embedding_sharing,
                 use_weight_only=args.use_weight_only,
                 plugin_weight_only_quant_type=plugin_weight_only_quant_type)
 
@@ -1035,6 +1107,7 @@ if __name__ == '__main__':
                 exceptions
             ) == 0, "Checkpoint conversion failed, please check error log."
 
+    del hf_model
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     print(f'Total time of converting checkpoints: {t}')

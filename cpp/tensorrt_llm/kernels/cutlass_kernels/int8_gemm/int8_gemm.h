@@ -47,13 +47,13 @@ public:
 
     virtual ~CutlassInt8GemmRunnerInterface() {}
 
-    virtual void gemm(const int8_t* A, const int8_t* B, tk::QuantMode quantOption, const float* alphaCol,
-        const float* alphaRow, void* C, int m, int n, int k, tkc::CutlassGemmConfig gemmConfig, char* workspacePtr,
+    virtual void gemm(int8_t const* A, int8_t const* B, tk::QuantMode quantOption, float const* alphaCol,
+        float const* alphaRow, void* C, int m, int n, int k, tkc::CutlassGemmConfig gemmConfig, char* workspacePtr,
         const size_t workspaceBytes, cudaStream_t stream)
         = 0;
 
     // Returns desired workspace size in bytes.
-    virtual size_t getWorkspaceSize(const int m, const int n, const int k) = 0;
+    virtual size_t getWorkspaceSize(int const m, int const n, int const k) = 0;
 
     virtual std::vector<tkc::CutlassGemmConfig> getConfigs() const = 0;
 
@@ -70,18 +70,18 @@ public:
     CutlassInt8GemmRunner();
     ~CutlassInt8GemmRunner();
 
-    void gemm(const int8_t* A, const int8_t* B, tk::QuantMode quantOption, const float* alphaCol, const float* alphaRow,
+    void gemm(int8_t const* A, int8_t const* B, tk::QuantMode quantOption, float const* alphaCol, float const* alphaRow,
         void* C, int m, int n, int k, tkc::CutlassGemmConfig gemmConfig, char* workspacePtr,
         const size_t workspaceBytes, cudaStream_t stream) override;
 
     // Returns desired workspace size in bytes.
-    size_t getWorkspaceSize(const int m, const int n, const int k) override;
+    size_t getWorkspaceSize(int const m, int const n, int const k) override;
 
     std::vector<tkc::CutlassGemmConfig> getConfigs() const override;
 
 private:
-    void dispatchToArch(const int8_t* A, const int8_t* B, tk::QuantMode quantOption, const float* alphaCol,
-        const float* alphaRow, T* C, int m, int n, int k, tkc::CutlassGemmConfig gemmConfig, char* workspacePtr,
+    void dispatchToArch(int8_t const* A, int8_t const* B, tk::QuantMode quantOption, float const* alphaCol,
+        float const* alphaRow, T* C, int m, int n, int k, tkc::CutlassGemmConfig gemmConfig, char* workspacePtr,
         const size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr);
 
     int mSm;

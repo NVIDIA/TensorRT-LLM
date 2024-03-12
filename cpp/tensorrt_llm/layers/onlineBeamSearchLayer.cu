@@ -27,41 +27,42 @@ namespace tensorrt_llm
 namespace layers
 {
 
-static const int SMALL_TOP_K_SOFTMAX_MAX_VOC_PARTS = 128;
-static const int MAX_K = 4;
+static int const SMALL_TOP_K_SOFTMAX_MAX_VOC_PARTS = 128;
+static int const MAX_K = 4;
 
 template <typename T>
-__global__ void update_kernel(FinishedState* finished, BeamHypotheses beam_hyps)
+__global__ void update_kernel(BeamHypotheses beam_hyps)
 {
-    const int beam_width{beam_hyps.beam_width};
-    const int ite{beam_hyps.ite};
-    const int local_batch_size{beam_hyps.local_batch_size};
-    const int max_seq_len{beam_hyps.max_seq_len};
-    const int vocab_size{beam_hyps.vocab_size};
-    const int end_id{beam_hyps.end_ids[blockIdx.x]};
+    int const beam_width{beam_hyps.beam_width};
+    int const ite{beam_hyps.ite};
+    int const local_batch_size{beam_hyps.local_batch_size};
+    int const max_seq_len{beam_hyps.max_seq_len};
+    int const vocab_size{beam_hyps.vocab_size};
+    int const end_id{beam_hyps.end_ids[blockIdx.x]};
     int* num_beams{beam_hyps.num_beams};
     int* sequence_lengths{beam_hyps.sequence_lengths_src};
     int** output_ids_ptr{beam_hyps.output_ids_tgt_ptr};
     int** parent_ids_ptr{beam_hyps.parent_ids_tgt_ptr};
+    FinishedState* finished{beam_hyps.finished};
 
     extern __shared__ char s_buf[]; // intermediate result
     int* s_sequence_lengths = reinterpret_cast<int*>(s_buf);
 
     for (int beam_idx = threadIdx.x; beam_idx < beam_width; beam_idx += blockDim.x)
     {
-        const auto batch_beam_idx = blockIdx.x * beam_width + beam_idx;
+        auto const batch_beam_idx = blockIdx.x * beam_width + beam_idx;
         s_sequence_lengths[beam_idx] = sequence_lengths[batch_beam_idx];
     }
     __syncthreads();
 
     for (int beam_idx = threadIdx.x; beam_idx < beam_width; beam_idx += blockDim.x)
     {
-        const auto batch_beam_idx = blockIdx.x * beam_width + beam_idx;
-        const int current_step{s_sequence_lengths[beam_idx]};
+        auto const batch_beam_idx = blockIdx.x * beam_width + beam_idx;
+        int const current_step{s_sequence_lengths[beam_idx]};
 
         // Increase the seq_len even if the request has finished.
         // On the following iteration we check if the sequence has finished before
-        const auto finish_state = finished[batch_beam_idx];
+        auto const finish_state = finished[batch_beam_idx];
         if (!finish_state.isFinished())
         {
             s_sequence_lengths[beam_idx]++;
@@ -88,11 +89,11 @@ __global__ void update_kernel(FinishedState* finished, BeamHypotheses beam_hyps)
     }
 }
 
-void invokeUpdate(FinishedState* finished, BeamHypotheses& beam_hyps, cudaStream_t stream)
+void invokeUpdate(BeamHypotheses& beam_hyps, cudaStream_t stream)
 {
     dim3 grid(beam_hyps.local_batch_size);
     dim3 block(min(beam_hyps.beam_width, 1024));
-    update_kernel<float><<<grid, block, sizeof(int) * beam_hyps.beam_width, stream>>>(finished, beam_hyps);
+    update_kernel<float><<<grid, block, sizeof(int) * beam_hyps.beam_width, stream>>>(beam_hyps);
 }
 
 template <typename T>
@@ -117,21 +118,24 @@ template <typename T>
 void OnlineBeamSearchLayer<T>::invokeSoftMax(BeamSearchOutputParams& outputs, SoftmaxParams const& params)
 {
     TLLM_LOG_TRACE("%s", __PRETTY_FUNCTION__);
-    auto* finished
-        = reinterpret_cast<FinishedState*>(outputs.finished->template getPtr<FinishedState::UnderlyingType>());
 
     BeamHypotheses beam_hyps;
     if (outputs.beamHypotheses)
     {
         beam_hyps = *outputs.beamHypotheses;
-        // Some of beam_hyps members have been initialized before function invokeSoftMax
-        beam_hyps.end_ids = params.end_ids.template getPtr<const int>();
-        beam_hyps.log_probs = (outputs.output_log_probs) ? outputs.output_log_probs->template getPtr<float>() : nullptr;
-        beam_hyps.output_ids_src_ptr = outputs.output_ids_ptr.template getPtr<const int*>();
-        beam_hyps.output_ids_tgt_ptr = outputs.output_ids_ptr.template getPtr<int*>();
-        beam_hyps.parent_ids_src_ptr = outputs.parent_ids_ptr.template getPtr<const int*>();
-        beam_hyps.parent_ids_tgt_ptr = outputs.parent_ids_ptr.template getPtr<int*>();
+        beam_hyps.end_ids = params.end_ids.template getPtr<int const>();
+        beam_hyps.finished
+            = reinterpret_cast<FinishedState*>(outputs.finished->template getPtr<FinishedState::UnderlyingType>());
+        beam_hyps.cum_log_probs_src = outputs.cum_log_probs->template getPtr<float>();
+        beam_hyps.log_probs_src
+            = (outputs.output_log_probs) ? outputs.output_log_probs->template getPtr<float>() : nullptr;
         beam_hyps.sequence_lengths_src = outputs.sequence_length->template getPtr<int>();
+        beam_hyps.output_ids_tgt_ptr = outputs.output_ids_ptr.template getPtr<int*>();
+        beam_hyps.parent_ids_tgt_ptr = outputs.parent_ids_ptr.template getPtr<int*>();
+
+        beam_hyps.diversity_rates = diversity_rates_buf_;
+        beam_hyps.length_penalties = length_penalties_buf_;
+        beam_hyps.early_stoppings = early_stoppings_buf_;
 
         beam_hyps.batch_size = static_cast<std::int32_t>(outputs.output_ids_ptr.shape[0]);
         beam_hyps.beam_width = static_cast<std::int32_t>(outputs.output_ids_ptr.shape[1]);
@@ -139,17 +143,15 @@ void OnlineBeamSearchLayer<T>::invokeSoftMax(BeamSearchOutputParams& outputs, So
         beam_hyps.local_batch_size = params.logits.shape[0];
         beam_hyps.max_seq_len = static_cast<std::int32_t>(outputs.output_ids_ptr.shape[2]);
         beam_hyps.vocab_size = vocab_size_padded_;
-        beam_hyps.diversity_rates = diversity_rates_buf_;
-        beam_hyps.length_penalties = length_penalties_buf_;
-        beam_hyps.early_stoppings = early_stoppings_buf_;
     }
 
-    invokeTopkSoftMax(params.logits.template getPtr<T>(), (const T*) (nullptr), finished,
-        outputs.cum_log_probs->template getPtr<float>(), topk_softmax_workspace_, topk_softmax_workspace_size_,
-        beam_hyps, mStream);
+    T const* logits = params.logits.template getPtr<T>();
+    T const* bias = static_cast<T const*>(nullptr);
+
+    invokeTopkSoftMax(logits, bias, topk_softmax_workspace_, topk_softmax_workspace_size_, beam_hyps, mStream);
     sync_check_cuda_error();
 
-    invokeUpdate(finished, beam_hyps, mStream);
+    invokeUpdate(beam_hyps, mStream);
     sync_check_cuda_error();
 }
 

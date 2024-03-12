@@ -16,8 +16,12 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include <curand_kernel.h>
+
+#include <numeric>
 
 namespace tensorrt_llm
 {
@@ -32,11 +36,12 @@ namespace kernels
 //!
 //! \param workspace pointer to the workspace. Has to be pre-allocated by caller. Function does not take ownership of the
 //! buffer.
-//! \param workspaceSize size of the workspace in bytes
-//! \param logProbs input buffer [batchSize x vocabSizePadded].
+//! \param logProbs input buffer [batchSize, maxTokensPerStep, vocabSizePadded].
 //! Log probabilities of each token in the vocab. If logitsHasProbs is true,
 //! logProbs must contain **just** probabilities instead of log probabilities.
-//! \param outputIds output buffer [maxBatchSize][maxSeqLen]. Contains pointers to rows with output tokens per request
+//! \param logProbsPtr input buffer [batchSize][vocabSizePadded] array of pointers to logits. If nullptr, logProbs is used.
+//! Only maxTokensPerStep == 1 is supported.
+//! \param outputIds output buffer [maxBatchSize][maxSeqLen]. Contains point32_ters to rows with output tokens per request
 //! \param sequenceLength input/output buffer [maxBatchSize]. Current sequence length of the request up to, but excluding endId token
 //! \param finishedInput input buffer [maxBatchSize]. If true, request exits early.
 //! \param finishedOutput output buffer [maxBatchSize]. Set flag if sequence has finished (if finished || outputId == endId).
@@ -56,28 +61,62 @@ namespace kernels
 //! Supported P is in range (0.0, 1.0]. If nullptr, topP is used for all requests
 //! \param vocabSizePadded size of padded vocab
 //! \param endIds input buffer [maxBatchSize]. EOS token ids per request
-//! \param batchSlots input buffer[batchSize], optional. Indices of rows of data in memory pool
+//! \param batchSlots input buffer[batchSize], optional. Indices of rows of data in memory pool.
+//! Linear indexing (batchIdx) is used if nullptr.
 //! \param stream cuda stream
 //! \param batchSize batch size
 //! \param maxBatchSize maximum batch size
+//! \param tokensPerStep input buffer [maxBatchSize], optional. Number of tokens per step for each request.
+//! It is assumed that all requests have maxTokensPerStep tokens per step if nullptr.
+//! \param maxTokensPerStep maximum number of tokens per computed per step
 //! \param skipDecode input buffer [maxBatchSize]. Flags whether to skip decoding per request
 //! \param normalizeLogProbs when set to True outputLogProbs are normalized to TopK
 //! \param logitsHasProbs flag to highlight that logProbs contains probabilities
+//! \param returnAllTopK flag to return all selectedTopK results
 // clang-format on
 template <typename T>
-void invokeBatchTopKSampling(void* workspace, size_t& workspaceSize, const T* logProbs, int** ids, int* sequenceLengths,
-    const FinishedState* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
-    curandState_t* curandstate, const int maxTopK, const int* topKs, const float topP, const float* topPs,
-    const int vocabSizePadded, const int* endIds, const int* batchSlots, cudaStream_t stream, const int batchSize,
-    int maxBatchSize, const bool* skipDecode, const bool normalizeLogProbs, const bool logitsHasProbs);
+void invokeBatchTopKSampling(void* workspace, T const* logProbs, T const* const* logProbsPtr, int32_t** ids,
+    int32_t* sequenceLengths, FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs,
+    float* outputLogProbs, curandState_t* curandstate, const int32_t maxTopK, int32_t const* topKs, float const topP,
+    float const* topPs, const int32_t vocabSizePadded, int32_t const* endIds, int32_t const* batchSlots,
+    cudaStream_t stream, const int32_t batchSize, int maxBatchSize, int32_t const* tokensPerStep,
+    const int32_t maxTokensPerStep, bool const* skipDecode, bool normalizeLogProbs, bool logitsHasProbs,
+    bool returnAllTopK);
 
 //! \brief Specialization of invokeBatchTopKSampling with topPs=nullptr and topKs=nullptr
 template <typename T>
-void invokeTopKSampling(void* workspace, size_t& workspaceSize, const T* logProbs, int** outputIds, int* sequenceLength,
-    const FinishedState* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
-    curandState_t* curandstate, const int topK, const float topP, const int vocabSizePadded, const int* endIds,
-    const int* batchSlots, cudaStream_t stream, const int batchSize, int maxBatchSize, const bool* skipDecode,
-    const bool normalizeLogProbs, const bool logitsHasProbs);
+void invokeTopKSampling(void* workspace, T const* logProbs, T const* const* logProbsPtr, int32_t** outputIds,
+    int32_t* sequenceLength, FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs,
+    float* outputLogProbs, curandState_t* curandstate, const int32_t topK, float const topP,
+    const int32_t vocabSizePadded, int32_t const* endIds, int32_t const* batchSlots, cudaStream_t stream,
+    const int32_t batchSize, int maxBatchSize, int32_t const* tokensPerStep, const int32_t maxTokensPerStep,
+    bool const* skipDecode, bool normalizeLogProbs, bool logitsHasProbs, bool returnAllTopK);
+
+template <typename T>
+[[nodiscard]] std::vector<size_t> getTopKWorkspaceSizes(
+    int32_t batchSize, int32_t maxTokensPerStep, int32_t maxTopK, int32_t vocabSizePadded)
+{
+    int32_t constexpr maxBlockPerBeam = 8;
+    auto const tempLogProbsBufSize = sizeof(T) * batchSize * maxTokensPerStep * vocabSizePadded;         // type T
+    auto const topKTmpIdsBufSize
+        = sizeof(int32_t) * batchSize * maxTokensPerStep * maxTopK * maxBlockPerBeam;                    // type int
+    auto const topKTmpValBufSize = sizeof(T) * batchSize * maxTokensPerStep * maxTopK * maxBlockPerBeam; // type T
+
+    return {tempLogProbsBufSize, topKTmpIdsBufSize, topKTmpValBufSize};
+}
+
+//! \brief Returns workspace size in bytes needed for sampling TopK computation
+//! \param batchSize batch size
+//! \param maxTokensPerStep maximum number of tokens per computed per step
+//! \param maxTopK maximum among all topKs K for topK sampling
+//! \param vocabSizePadded size of padded vocab
+template <typename T>
+[[nodiscard]] size_t getTopKWorkspaceSize(
+    int32_t batchSize, int32_t maxTokensPerStep, int32_t maxTopK, int32_t vocabSizePadded)
+{
+    auto const workspaceSizes = getTopKWorkspaceSizes<T>(batchSize, maxTokensPerStep, maxTopK, vocabSizePadded);
+    return tensorrt_llm::common::calcAlignedSize(workspaceSizes, 256);
+}
 
 } // namespace kernels
 } // namespace tensorrt_llm

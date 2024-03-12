@@ -203,6 +203,7 @@ def selective_scan_ref(u,
     if z is not None:
         out = out * F.silu(z.float())
     out = out.to(dtype=dtype_in)
+    last_state = last_state.to(dtype=dtype_in)
     return out, last_state
 
 

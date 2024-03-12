@@ -37,28 +37,28 @@ __inline__ __device__ int target_index(int id1, int id2, int id3, int id4, int d
 }
 
 template <typename T>
-__global__ void addQKVBiasIA3Transpose(T* q_out, T* k_out, T* v_out, const T* __restrict q_in,
-    const T* __restrict bias_q, const T* __restrict k_in, const T* __restrict bias_k, const T* __restrict v_in,
-    const T* __restrict bias_v, const int* ia3_tasks, const T* ia3_key_weights, const T* ia3_value_weights,
-    const int batch_size, const int seq_len, const int head_num, const int size_per_head)
+__global__ void addQKVBiasIA3Transpose(T* q_out, T* k_out, T* v_out, T const* __restrict q_in,
+    T const* __restrict bias_q, T const* __restrict k_in, T const* __restrict bias_k, T const* __restrict v_in,
+    T const* __restrict bias_v, int const* ia3_tasks, T const* ia3_key_weights, T const* ia3_value_weights,
+    int const batch_size, int const seq_len, int const head_num, int const size_per_head)
 {
-    const int n = head_num * size_per_head;
-    const int batch_id = blockIdx.x;
-    const int word_id = blockIdx.y;
-    const int row_id = batch_id * seq_len + word_id;
+    int const n = head_num * size_per_head;
+    int const batch_id = blockIdx.x;
+    int const word_id = blockIdx.y;
+    int const row_id = batch_id * seq_len + word_id;
 
-    const bool use_ia3 = ia3_tasks != nullptr;
-    const int ia3_task = use_ia3 ? ia3_tasks[batch_id] : 0;
-    const bool use_ia3_key = use_ia3 && (ia3_key_weights != nullptr);
-    const bool use_ia3_value = use_ia3 && (ia3_value_weights != nullptr);
+    bool const use_ia3 = ia3_tasks != nullptr;
+    int const ia3_task = use_ia3 ? ia3_tasks[batch_id] : 0;
+    bool const use_ia3_key = use_ia3 && (ia3_key_weights != nullptr);
+    bool const use_ia3_value = use_ia3 && (ia3_value_weights != nullptr);
 
     for (int col_id = threadIdx.x; col_id < n; col_id += blockDim.x)
     {
-        const int head_id = col_id / size_per_head;
-        const int size_id = col_id % size_per_head;
-        const int target_id = batch_id * (head_num * seq_len * size_per_head) + head_id * seq_len * size_per_head
+        int const head_id = col_id / size_per_head;
+        int const size_id = col_id % size_per_head;
+        int const target_id = batch_id * (head_num * seq_len * size_per_head) + head_id * seq_len * size_per_head
             + word_id * size_per_head + size_id;
-        const int src_id = row_id * n + col_id;
+        int const src_id = row_id * n + col_id;
 
         T q = ldg(&q_in[src_id]);
         q_out[target_id] = add(q, ldg(&bias_q[col_id]));
@@ -80,28 +80,28 @@ __global__ void addQKVBiasIA3Transpose(T* q_out, T* k_out, T* v_out, const T* __
 }
 
 template <typename T>
-__global__ void QKVIA3Transpose(T* q_out, T* k_out, T* v_out, const T* __restrict q_in, const T* __restrict k_in,
-    const T* __restrict v_in, const int* ia3_tasks, const T* __restrict ia3_key_weights,
-    const T* __restrict ia3_value_weights, const int batch_size, const int seq_len, const int head_num,
-    const int size_per_head)
+__global__ void QKVIA3Transpose(T* q_out, T* k_out, T* v_out, T const* __restrict q_in, T const* __restrict k_in,
+    T const* __restrict v_in, int const* ia3_tasks, T const* __restrict ia3_key_weights,
+    T const* __restrict ia3_value_weights, int const batch_size, int const seq_len, int const head_num,
+    int const size_per_head)
 {
-    const int n = head_num * size_per_head;
-    const int batch_id = blockIdx.x;
-    const int word_id = blockIdx.y;
-    const int row_id = batch_id * seq_len + word_id;
+    int const n = head_num * size_per_head;
+    int const batch_id = blockIdx.x;
+    int const word_id = blockIdx.y;
+    int const row_id = batch_id * seq_len + word_id;
 
-    const bool use_ia3 = ia3_tasks != nullptr;
-    const int ia3_task = use_ia3 ? ia3_tasks[batch_id] : 0;
-    const bool use_ia3_key = use_ia3 && (ia3_key_weights != nullptr);
-    const bool use_ia3_value = use_ia3 && (ia3_value_weights != nullptr);
+    bool const use_ia3 = ia3_tasks != nullptr;
+    int const ia3_task = use_ia3 ? ia3_tasks[batch_id] : 0;
+    bool const use_ia3_key = use_ia3 && (ia3_key_weights != nullptr);
+    bool const use_ia3_value = use_ia3 && (ia3_value_weights != nullptr);
 
     for (int col_id = threadIdx.x; col_id < n; col_id += blockDim.x)
     {
-        const int head_id = col_id / size_per_head;
-        const int size_id = col_id % size_per_head;
-        const int target_id = batch_id * (head_num * seq_len * size_per_head) + head_id * seq_len * size_per_head
+        int const head_id = col_id / size_per_head;
+        int const size_id = col_id % size_per_head;
+        int const target_id = batch_id * (head_num * seq_len * size_per_head) + head_id * seq_len * size_per_head
             + word_id * size_per_head + size_id;
-        const int src_id = row_id * n + col_id;
+        int const src_id = row_id * n + col_id;
 
         q_out[target_id] = ldg(&q_in[src_id]);
 
@@ -122,11 +122,11 @@ __global__ void QKVIA3Transpose(T* q_out, T* k_out, T* v_out, const T* __restric
 }
 
 template <typename T>
-void invokeAddQKVBiasIA3Transpose(T* q_buf, T* k_buf, T* v_buf, T* Q, const T* bias_Q, T* K, const T* bias_K, T* V,
-    const T* bias_V, const int batch_size, const int seq_len, const int head_num, const int size_per_head,
-    const int* ia3_tasks, const T* ia3_key_weights, const T* ia3_value_weights, cudaStream_t stream)
+void invokeAddQKVBiasIA3Transpose(T* q_buf, T* k_buf, T* v_buf, T* Q, T const* bias_Q, T* K, T const* bias_K, T* V,
+    T const* bias_V, int const batch_size, int const seq_len, int const head_num, int const size_per_head,
+    int const* ia3_tasks, T const* ia3_key_weights, T const* ia3_value_weights, cudaStream_t stream)
 {
-    const int k = head_num * size_per_head;
+    int const k = head_num * size_per_head;
     dim3 grid(batch_size, seq_len);
     bool is_add_bias = bias_Q != nullptr;
     if (sizeof(T) == 4 || k % 2 != 0)
@@ -178,9 +178,9 @@ INSTANTIATE_ADDQKVBIASIA3_TRANSPOSE(__nv_bfloat16);
 #undef INSTANTIATEADDQKVBIASTRANSPOSE
 
 template <typename T, typename T_IN, int ITEMS_PER_THREAD>
-__global__ void softmax_kernel(T* attn_score, const T_IN* qk, const T* attn_mask, const T* linear_bias_slopes,
+__global__ void softmax_kernel(T* attn_score, const T_IN* qk, T const* attn_mask, T const* linear_bias_slopes,
     const int64_t batch_size, const int64_t head_num, const int64_t q_length, const int64_t k_length,
-    const float qk_scale)
+    float const qk_scale)
 {
     // attn_score, [batch_size, num_heads, q_length, k_length]
     // qk, [batch_size, num_heads, q_length, k_length]
@@ -192,7 +192,7 @@ __global__ void softmax_kernel(T* attn_score, const T_IN* qk, const T* attn_mask
 
     __shared__ float s_mean, s_max;
 
-    const float linear_bias_slope = linear_bias_slopes != nullptr ? (float) linear_bias_slopes[hi] : 0.0f;
+    float const linear_bias_slope = linear_bias_slopes != nullptr ? (float) linear_bias_slopes[hi] : 0.0f;
 
     // Loop along with Q dimension.
     for (int qi = blockIdx.x; qi < q_length; qi += gridDim.x)
@@ -258,7 +258,7 @@ __global__ void softmax_kernel(T* attn_score, const T_IN* qk, const T* attn_mask
 }
 
 template <typename T, int ITEMS_PER_THREAD>
-__global__ void softmax_kernel_h2(T* attn_score, const T* qk_buf, const T* attn_mask, const T* linear_bias_slopes,
+__global__ void softmax_kernel_h2(T* attn_score, T const* qk_buf, T const* attn_mask, T const* linear_bias_slopes,
     const int64_t batch_size, const int64_t head_num, const int64_t q_length, const int64_t k_length, const T qk_scale)
 {
     // attn_score, [batch_size, num_heads, q_length, k_length]
@@ -360,7 +360,7 @@ __global__ void softmax_kernel_h2(T* attn_score, const T* qk_buf, const T* attn_
 }
 
 template <typename T, int K_ITEMS_PER_THREAD, int Q_ITEMS_PER_THREAD>
-__global__ void softmax_kernel_h2_v2(T* attn_score, const T* qk_buf, const T* attn_mask, const T* linear_bias_slopes,
+__global__ void softmax_kernel_h2_v2(T* attn_score, T const* qk_buf, T const* attn_mask, T const* linear_bias_slopes,
     const int64_t batch_size, const int64_t head_num, const int64_t q_length, const int64_t k_length, const T scalar)
 {
     // attn_score, [batch_size, num_heads, q_length, k_length]
@@ -728,8 +728,8 @@ void invokeMaskedSoftmax(MaskedSoftmaxParam<__nv_bfloat16, __nv_bfloat16>& param
 #undef LAUNCH_MASKED_SOFTMAX_
 
 template <typename T>
-__global__ void transpose(const T* src, T* dst, const int batch_size, const int seq_len, const int head_num,
-    const int size_per_head, const float* scale, int int8_mode)
+__global__ void transpose(T const* src, T* dst, int const batch_size, int const seq_len, int const head_num,
+    int const size_per_head, float const* scale, int int8_mode)
 {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -756,20 +756,20 @@ __global__ void transpose(const T* src, T* dst, const int batch_size, const int 
 }
 
 template <>
-__global__ void transpose(const float* src, float* dst, const int batch_size, const int seq_len, const int head_num,
-    const int size_per_head, const float* scale, int int8_mode)
+__global__ void transpose(float const* src, float* dst, int const batch_size, int const seq_len, int const head_num,
+    int const size_per_head, float const* scale, int int8_mode)
 {
     int batch_id = blockIdx.x / (head_num * seq_len);
     int seq_id = blockIdx.x % seq_len;
     int head_id = (blockIdx.x % (head_num * seq_len)) / seq_len;
 
-    const int target_id = batch_id * (head_num * seq_len * size_per_head) + seq_id * head_num * size_per_head
+    int const target_id = batch_id * (head_num * seq_len * size_per_head) + seq_id * head_num * size_per_head
         + head_id * size_per_head + threadIdx.x;
-    const int src_id = blockIdx.x * size_per_head + threadIdx.x;
+    int const src_id = blockIdx.x * size_per_head + threadIdx.x;
 
     if (int8_mode == 2)
     {
-        const float scale_val = *scale;
+        float const scale_val = *scale;
         reinterpret_cast<int8_t*>(dst)[target_id] = cuda_cast<int8_t>(src[src_id] * scale_val);
     }
     else
@@ -779,8 +779,8 @@ __global__ void transpose(const float* src, float* dst, const int batch_size, co
 }
 
 template <typename T>
-void invokeTransposeQKV(T* dst, T* src, const int batch_size, const int seq_len, const int head_num,
-    const int size_per_head, const float* scale, const int int8_mode, cudaStream_t stream)
+void invokeTransposeQKV(T* dst, T* src, int const batch_size, int const seq_len, int const head_num,
+    int const size_per_head, float const* scale, int const int8_mode, cudaStream_t stream)
 {
     dim3 grid, block;
     if (sizeof(T) == 2)
@@ -820,7 +820,7 @@ void invokeTransposeQKV(T* dst, T* src, const int batch_size, const int seq_len,
     }
     else
     {
-        const int seq_per_block = 1;
+        int const seq_per_block = 1;
         grid.x = batch_size * head_num * seq_len / seq_per_block;
         block.x = seq_per_block * size_per_head;
         transpose<T>
@@ -839,28 +839,28 @@ INSTANTIATE_TRANSPOSE_QKV(__nv_bfloat16);
 #undef INSTANTIATE_TRANSPOSE_QKV
 
 template <typename T>
-__global__ void add_QKV_bias_rebuild_padding_ia3(const T* Q, const T* bias_Q, const T* K, const T* bias_K, const T* V,
-    const T* bias_V, T* q_buf_, T* k_buf_, T* v_buf_, const int* ia3_tasks, const T* ia3_key_weights,
-    const T* ia3_value_weights, const int batch_size, const int seq_len, const int head_num, const int size_per_head,
-    const int* mask_offset)
+__global__ void add_QKV_bias_rebuild_padding_ia3(T const* Q, T const* bias_Q, T const* K, T const* bias_K, T const* V,
+    T const* bias_V, T* q_buf_, T* k_buf_, T* v_buf_, int const* ia3_tasks, T const* ia3_key_weights,
+    T const* ia3_value_weights, int const batch_size, int const seq_len, int const head_num, int const size_per_head,
+    int const* mask_offset)
 {
-    const int bid = blockIdx.x;
+    int const bid = blockIdx.x;
 
-    const int tgt_batch_id = (bid + mask_offset[bid]) / seq_len;
-    const int tgt_seq_id = (bid + mask_offset[bid]) % seq_len;
-    const int n = head_num * size_per_head;
+    int const tgt_batch_id = (bid + mask_offset[bid]) / seq_len;
+    int const tgt_seq_id = (bid + mask_offset[bid]) % seq_len;
+    int const n = head_num * size_per_head;
 
-    const bool use_ia3 = ia3_tasks != nullptr;
-    const int ia3_task = use_ia3 ? ia3_tasks[tgt_batch_id] : 0;
-    const bool use_ia3_key = use_ia3 && (ia3_key_weights != nullptr);
-    const bool use_ia3_value = use_ia3 && (ia3_value_weights != nullptr);
+    bool const use_ia3 = ia3_tasks != nullptr;
+    int const ia3_task = use_ia3 ? ia3_tasks[tgt_batch_id] : 0;
+    bool const use_ia3_key = use_ia3 && (ia3_key_weights != nullptr);
+    bool const use_ia3_value = use_ia3 && (ia3_value_weights != nullptr);
     for (int idx = threadIdx.x; idx < n; idx += blockDim.x)
     {
-        const int tgt_head_id = idx / size_per_head;
-        const int tgt_hidden_id = idx % size_per_head;
+        int const tgt_head_id = idx / size_per_head;
+        int const tgt_hidden_id = idx % size_per_head;
 
-        const int src_id = bid * n + idx;
-        const int tgt_id = tgt_batch_id * head_num * seq_len * size_per_head + tgt_head_id * seq_len * size_per_head
+        int const src_id = bid * n + idx;
+        int const tgt_id = tgt_batch_id * head_num * seq_len * size_per_head + tgt_head_id * seq_len * size_per_head
             + tgt_seq_id * size_per_head + tgt_hidden_id;
 
         q_buf_[tgt_id] = add(ldg(&Q[src_id]), ldg(&bias_Q[idx]));
@@ -882,27 +882,27 @@ __global__ void add_QKV_bias_rebuild_padding_ia3(const T* Q, const T* bias_Q, co
 }
 
 template <typename T>
-__global__ void rebuild_padding_ia3(const T* Q, const T* K, const T* V, T* q_buf_, T* k_buf_, T* v_buf_,
-    const int* ia3_tasks, const T* ia3_key_weights, const T* ia3_value_weights, const int batch_size, const int seq_len,
-    const int head_num, const int size_per_head, const int* mask_offset)
+__global__ void rebuild_padding_ia3(T const* Q, T const* K, T const* V, T* q_buf_, T* k_buf_, T* v_buf_,
+    int const* ia3_tasks, T const* ia3_key_weights, T const* ia3_value_weights, int const batch_size, int const seq_len,
+    int const head_num, int const size_per_head, int const* mask_offset)
 {
-    const int bid = blockIdx.x;
+    int const bid = blockIdx.x;
 
-    const int tgt_batch_id = (bid + mask_offset[bid]) / seq_len;
-    const int tgt_seq_id = (bid + mask_offset[bid]) % seq_len;
-    const int n = head_num * size_per_head;
+    int const tgt_batch_id = (bid + mask_offset[bid]) / seq_len;
+    int const tgt_seq_id = (bid + mask_offset[bid]) % seq_len;
+    int const n = head_num * size_per_head;
 
-    const bool use_ia3 = ia3_tasks != nullptr;
-    const int ia3_task = use_ia3 ? ia3_tasks[tgt_batch_id] : 0;
-    const bool use_ia3_key = use_ia3 && (ia3_key_weights != nullptr);
-    const bool use_ia3_value = use_ia3 && (ia3_value_weights != nullptr);
+    bool const use_ia3 = ia3_tasks != nullptr;
+    int const ia3_task = use_ia3 ? ia3_tasks[tgt_batch_id] : 0;
+    bool const use_ia3_key = use_ia3 && (ia3_key_weights != nullptr);
+    bool const use_ia3_value = use_ia3 && (ia3_value_weights != nullptr);
     for (int idx = threadIdx.x; idx < n; idx += blockDim.x)
     {
-        const int tgt_head_id = idx / size_per_head;
-        const int tgt_hidden_id = idx % size_per_head;
+        int const tgt_head_id = idx / size_per_head;
+        int const tgt_hidden_id = idx % size_per_head;
 
-        const int src_id = bid * n + idx;
-        const int tgt_id = tgt_batch_id * head_num * seq_len * size_per_head + tgt_head_id * seq_len * size_per_head
+        int const src_id = bid * n + idx;
+        int const tgt_id = tgt_batch_id * head_num * seq_len * size_per_head + tgt_head_id * seq_len * size_per_head
             + tgt_seq_id * size_per_head + tgt_hidden_id;
 
         q_buf_[tgt_id] = ldg(&Q[src_id]);
@@ -924,10 +924,10 @@ __global__ void rebuild_padding_ia3(const T* Q, const T* K, const T* V, T* q_buf
 }
 
 template <typename T>
-void invokeAddQKVBiasIA3RebuildPadding(T* Q, const T* bias_Q, T* K, const T* bias_K, T* V, const T* bias_V, T* q_buf,
-    T* k_buf, T* v_buf, const int batch_size, const int seq_len, const int head_num, const int size_per_head,
-    const int valid_word_num, const int* mask_offset, const int* ia3_tasks, const T* ia3_key_weights,
-    const T* ia3_value_weights, cudaStream_t stream)
+void invokeAddQKVBiasIA3RebuildPadding(T* Q, T const* bias_Q, T* K, T const* bias_K, T* V, T const* bias_V, T* q_buf,
+    T* k_buf, T* v_buf, int const batch_size, int const seq_len, int const head_num, int const size_per_head,
+    int const valid_word_num, int const* mask_offset, int const* ia3_tasks, T const* ia3_key_weights,
+    T const* ia3_value_weights, cudaStream_t stream)
 {
 #ifdef ENABLE_BF16
     bool is_half2 = (std::is_same<T, half>::value || std::is_same<T, __nv_bfloat16>::value) && (size_per_head % 2 == 0);
@@ -1006,20 +1006,20 @@ INSTANTIATE_ADDQKVBIASIA3_REBUILD_PADDING(__nv_bfloat16);
 #undef INSTANTIATEADDQKVBIASREBUILDPADDING
 
 template <typename T>
-__global__ void transpose_remove_padding(const T* src, T* dst, const int batch_size, const int seq_len,
-    const int head_num, const int size_per_head, const int* mask_offset, const float* scale, const int int8_mode)
+__global__ void transpose_remove_padding(T const* src, T* dst, int const batch_size, int const seq_len,
+    int const head_num, int const size_per_head, int const* mask_offset, float const* scale, int const int8_mode)
 {
     // TODO: optimize this kernel?
     // do remove_sequence_length_padding
-    const int bid = blockIdx.x; // batch * seq_len or valid_word_num
+    int const bid = blockIdx.x; // batch * seq_len or valid_word_num
 
-    const int src_batch_id = (bid + mask_offset[bid]) / seq_len;
-    const int src_seq_id = (bid + mask_offset[bid]) % seq_len;
+    int const src_batch_id = (bid + mask_offset[bid]) / seq_len;
+    int const src_seq_id = (bid + mask_offset[bid]) % seq_len;
 
-    const int dst_seq_id = bid;
+    int const dst_seq_id = bid;
 
-    const int src_offset_base = src_batch_id * seq_len * head_num * size_per_head + src_seq_id * size_per_head;
-    const int dst_offset_base = dst_seq_id * head_num * size_per_head;
+    int const src_offset_base = src_batch_id * seq_len * head_num * size_per_head + src_seq_id * size_per_head;
+    int const dst_offset_base = dst_seq_id * head_num * size_per_head;
 
     using Int8_Packed_T = typename packed_as<int8_t, num_elems<T>::value>::type;
     using Float_Packed_T = typename packed_as<float, num_elems<T>::value>::type;
@@ -1028,8 +1028,8 @@ __global__ void transpose_remove_padding(const T* src, T* dst, const int batch_s
 
     for (int idx = threadIdx.x; idx < head_num * size_per_head; idx += blockDim.x)
     {
-        const int head_id = idx / size_per_head;
-        const int hidden_id = idx % size_per_head;
+        int const head_id = idx / size_per_head;
+        int const hidden_id = idx % size_per_head;
         const T src_elem = ldg(&src[src_offset_base + head_id * seq_len * size_per_head + hidden_id]);
         if (int8_mode == 2)
         {
@@ -1104,9 +1104,9 @@ INSTANTIATE_TRANSPOSE_ATTENTION_OUT_REMOVE_PADDING(__nv_bfloat16);
 #undef INSTANTIATE_TRANSPOSE_ATTENTION_OUT_REMOVE_PADDING
 
 template <typename T, bool ADD_BIAS>
-__global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf, T* QKV, const T* __restrict qkv_bias,
-    const int* seq_lens, const int* padding_offset, const int batch_size, const int seq_len, const int token_num,
-    const int head_num, const int kv_head_num, const int size_per_head, const float* scale, const int int8_mode)
+__global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf, T* QKV, T const* __restrict qkv_bias,
+    int const* seq_lens, int const* padding_offset, int const batch_size, int const seq_len, int const token_num,
+    int const head_num, int const kv_head_num, int const size_per_head, float const* scale, int const int8_mode)
 {
     //   QKV: [token_num, hidden + 2 * kv_head_num * size_per_head]
     //   qkv_bias: [hidden + 2 * kv_head_num * size_per_head]
@@ -1114,20 +1114,20 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
     //   k_buf, v_buf: [batch, kv_head_num, seq_len, size_per_head]
     // For cross attention where q/k/v buffer could be nullptr, writing to split buffer is suppressed when null
     T* qkv_ptr[3] = {q_buf, k_buf, v_buf};
-    const bool has_padding = padding_offset == nullptr;
-    const int hidden = head_num * size_per_head; // hidden dim Q
-    const int n = hidden + 2 * kv_head_num * size_per_head;
+    bool const has_padding = padding_offset == nullptr;
+    int const hidden = head_num * size_per_head; // hidden dim Q
+    int const n = hidden + 2 * kv_head_num * size_per_head;
 
     for (int index = blockDim.x * blockIdx.x + threadIdx.x; index < token_num * n; index += gridDim.x * blockDim.x)
     {
-        const int bias_id = index % n;
+        int const bias_id = index % n;
 
-        const int token_idx = index / n;
-        const int token_padded_idx = token_idx + (has_padding ? 0 : padding_offset[token_idx]);
-        const int target_batch_id = token_padded_idx / seq_len;
-        const int actual_seq_len = seq_lens[target_batch_id];
-        const int seq_id = token_padded_idx % seq_len;
-        const bool valid_seq = seq_id < actual_seq_len || !has_padding;
+        int const token_idx = index / n;
+        int const token_padded_idx = token_idx + (has_padding ? 0 : padding_offset[token_idx]);
+        int const target_batch_id = token_padded_idx / seq_len;
+        int const actual_seq_len = seq_lens[target_batch_id];
+        int const seq_id = token_padded_idx % seq_len;
+        bool const valid_seq = seq_id < actual_seq_len || !has_padding;
 
         int qkv_id;
         int head_id;
@@ -1172,7 +1172,7 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
         {
             if (int8_mode == 2)
             {
-                val = cuda_cast<T>(cuda_cast<float>(reinterpret_cast<const int8_t*>(QKV)[index]) * scale[qkv_id]);
+                val = cuda_cast<T>(cuda_cast<float>(reinterpret_cast<int8_t const*>(QKV)[index]) * scale[qkv_id]);
             }
             else
             {
@@ -1186,9 +1186,9 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
         // Write to split QKV buffer
         if (head_num == kv_head_num || qkv_id == 0) // QKV or Q when MQA/GQA
         {
-            const int target_batch_stride = head_num * seq_len * size_per_head;
-            const int target_head_stride = seq_len * size_per_head;
-            const int target_seq_stride = size_per_head;
+            int const target_batch_stride = head_num * seq_len * size_per_head;
+            int const target_head_stride = seq_len * size_per_head;
+            int const target_seq_stride = size_per_head;
             if (qkv_ptr[qkv_id])
                 qkv_ptr[qkv_id][target_batch_id * target_batch_stride + head_id * target_head_stride
                     + seq_id * target_seq_stride + size_id]
@@ -1196,9 +1196,9 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
         }
         else if (head_num != kv_head_num && qkv_id > 0) // KV when MQA/GQA
         {
-            const int target_batch_stride = kv_head_num * seq_len * size_per_head;
-            const int target_head_stride = seq_len * size_per_head;
-            const int target_seq_stride = size_per_head;
+            int const target_batch_stride = kv_head_num * seq_len * size_per_head;
+            int const target_head_stride = seq_len * size_per_head;
+            int const target_seq_stride = size_per_head;
             if (qkv_ptr[qkv_id])
                 qkv_ptr[qkv_id][target_batch_id * target_batch_stride + head_id * target_head_stride
                     + seq_id * target_seq_stride + size_id]
@@ -1237,10 +1237,10 @@ struct Vec_t<__nv_bfloat16>
 #endif
 
 template <typename T, bool ADD_BIAS>
-__global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf, T* QKV, const T* __restrict qkv_bias,
-    const int* seq_lens, const int* padding_offset, const int batch_size, const int seq_len, const int head_num,
-    const int kv_head_num, const int size_per_head, const int rotary_embedding_dim, float rotary_embedding_base,
-    RotaryScalingType const rotary_scale_type, float rotary_embedding_scale, const int rotary_embedding_max_positions,
+__global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf, T* QKV, T const* __restrict qkv_bias,
+    int const* seq_lens, int const* padding_offset, int const batch_size, int const seq_len, int const head_num,
+    int const kv_head_num, int const size_per_head, int const rotary_embedding_dim, float rotary_embedding_base,
+    RotaryScalingType const rotary_scale_type, float rotary_embedding_scale, int const rotary_embedding_max_positions,
     PositionEmbeddingType const position_embedding_type)
 {
     // This kernel add bias to QKV, which has shape [batch_size, seq_len, 3, head_num, size_per_head], and
@@ -1264,50 +1264,50 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
 
     constexpr int vec_size = Vec_t<T>::size;
     using Vec_t = typename Vec_t<T>::Type;
-    const int token_idx = blockIdx.x;
-    const int token_padding_offset = (padding_offset == nullptr || token_idx < 0) ? 0 : padding_offset[token_idx];
-    const int tgt_token_idx = token_idx + token_padding_offset;
-    const bool has_padding = padding_offset == nullptr;
+    int const token_idx = blockIdx.x;
+    int const token_padding_offset = (padding_offset == nullptr || token_idx < 0) ? 0 : padding_offset[token_idx];
+    int const tgt_token_idx = token_idx + token_padding_offset;
+    bool const has_padding = padding_offset == nullptr;
 
-    const int batch_idx = tgt_token_idx / seq_len;
-    const int seq_idx = tgt_token_idx % seq_len;
-    const int actual_seq_len = seq_lens[batch_idx];
-    const bool valid_seq = seq_idx < actual_seq_len || !has_padding;
+    int const batch_idx = tgt_token_idx / seq_len;
+    int const seq_idx = tgt_token_idx % seq_len;
+    int const actual_seq_len = seq_lens[batch_idx];
+    bool const valid_seq = seq_idx < actual_seq_len || !has_padding;
 
-    const int head_idx = blockIdx.y;
-    const int tidx = threadIdx.x;
+    int const head_idx = blockIdx.y;
+    int const tidx = threadIdx.x;
 
-    const int total_seq_len = seq_len;
+    int const total_seq_len = seq_len;
 
-    const bool is_seq_masked = !valid_seq;
-    const bool is_head_size_masked = tidx * vec_size >= size_per_head;
-    const bool is_masked = is_head_size_masked || is_seq_masked;
+    bool const is_seq_masked = !valid_seq;
+    bool const is_head_size_masked = tidx * vec_size >= size_per_head;
+    bool const is_masked = is_head_size_masked || is_seq_masked;
 
-    const int hidden_size = head_num * size_per_head;
-    const int hidden_idx = head_idx * size_per_head + tidx * vec_size;
-    const int qheads_per_kv_head = head_num / kv_head_num;
-    const int kv_head_idx = head_idx / qheads_per_kv_head;
-    const int hidden_idx_kv = kv_head_idx * size_per_head + tidx * vec_size;
-    const int n = (head_num + 2 * kv_head_num) * size_per_head;
+    int const hidden_size = head_num * size_per_head;
+    int const hidden_idx = head_idx * size_per_head + tidx * vec_size;
+    int const qheads_per_kv_head = head_num / kv_head_num;
+    int const kv_head_idx = head_idx / qheads_per_kv_head;
+    int const hidden_idx_kv = kv_head_idx * size_per_head + tidx * vec_size;
+    int const n = (head_num + 2 * kv_head_num) * size_per_head;
 
-    const int dst_kv_seq_idx = seq_idx;
-    const int src_k_offset = hidden_size;
-    const int src_v_offset = hidden_size + kv_head_num * size_per_head;
+    int const dst_kv_seq_idx = seq_idx;
+    int const src_k_offset = hidden_size;
+    int const src_v_offset = hidden_size + kv_head_num * size_per_head;
 
     // NOTE: q has seq len excluding prefix prompt
     // head_num == kv_head_num:
     //   src QKV: [batch, time, 3, head_num, size_per_head]
     // head_num != kv_head_num:
     //   src QKV: [batch, time, head_num * size_per_head + 2 * kv_head_num * size_per_head]
-    const int src_q_idx = token_idx * n + hidden_idx;
-    const int src_k_idx = token_idx * n + src_k_offset + hidden_idx_kv;
-    const int src_v_idx = token_idx * n + src_v_offset + hidden_idx_kv;
+    int const src_q_idx = token_idx * n + hidden_idx;
+    int const src_k_idx = token_idx * n + src_k_offset + hidden_idx_kv;
+    int const src_v_idx = token_idx * n + src_v_offset + hidden_idx_kv;
 
     // destination offset.
-    const int dest_q_idx = batch_idx * size_per_head * seq_len * head_num + head_idx * size_per_head * seq_len
+    int const dest_q_idx = batch_idx * size_per_head * seq_len * head_num + head_idx * size_per_head * seq_len
         + seq_idx * size_per_head + tidx * vec_size;
 
-    const int dest_kv_idx = batch_idx * size_per_head * total_seq_len * kv_head_num
+    int const dest_kv_idx = batch_idx * size_per_head * total_seq_len * kv_head_num
         + kv_head_idx * size_per_head * total_seq_len + dst_kv_seq_idx * size_per_head + tidx * vec_size;
 
     Vec_t q, k, v, zero;
@@ -1327,15 +1327,15 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
     // load q,k,v and add bias
     if (!is_masked)
     {
-        q = *reinterpret_cast<const Vec_t*>(&QKV[src_q_idx]);
-        k = *reinterpret_cast<const Vec_t*>(&QKV[src_k_idx]);
-        v = *reinterpret_cast<const Vec_t*>(&QKV[src_v_idx]);
+        q = *reinterpret_cast<Vec_t const*>(&QKV[src_q_idx]);
+        k = *reinterpret_cast<Vec_t const*>(&QKV[src_k_idx]);
+        v = *reinterpret_cast<Vec_t const*>(&QKV[src_v_idx]);
 
         if (ADD_BIAS)
         {
-            q_bias = *reinterpret_cast<const Vec_t*>(&qkv_bias[hidden_idx]);
-            k_bias = *reinterpret_cast<const Vec_t*>(&qkv_bias[hidden_idx_kv + src_k_offset]);
-            v_bias = *reinterpret_cast<const Vec_t*>(&qkv_bias[hidden_idx_kv + src_v_offset]);
+            q_bias = *reinterpret_cast<Vec_t const*>(&qkv_bias[hidden_idx]);
+            k_bias = *reinterpret_cast<Vec_t const*>(&qkv_bias[hidden_idx_kv + src_k_offset]);
+            v_bias = *reinterpret_cast<Vec_t const*>(&qkv_bias[hidden_idx_kv + src_v_offset]);
 
             q = mmha::add(q, q_bias);
             k = mmha::add(k, k_bias);
@@ -1353,15 +1353,15 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
     }
     case PositionEmbeddingType::kROPE_GPT_NEOX:
     {
-        const bool do_rotary = !is_masked && vec_size * tidx < rotary_embedding_dim;
+        bool const do_rotary = !is_masked && vec_size * tidx < rotary_embedding_dim;
 
         T* q_smem = reinterpret_cast<T*>(smem_);
         T* k_smem = q_smem + rotary_embedding_dim;
 
-        const int half_rotary_dim = rotary_embedding_dim / 2;
-        const int half_idx = (tidx * vec_size) / half_rotary_dim;
-        const int intra_half_idx = (tidx * vec_size) % half_rotary_dim;
-        const int smem_pitch = half_rotary_dim; // TODO: adjust for bank conflicts?
+        int const half_rotary_dim = rotary_embedding_dim / 2;
+        int const half_idx = (tidx * vec_size) / half_rotary_dim;
+        int const intra_half_idx = (tidx * vec_size) % half_rotary_dim;
+        int const smem_pitch = half_rotary_dim; // TODO: adjust for bank conflicts?
 
         if (do_rotary)
         {
@@ -1371,7 +1371,7 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
 
         __syncthreads();
 
-        const int transpose_idx = half_idx * (half_rotary_dim / 2) + intra_half_idx / 2;
+        int const transpose_idx = half_idx * (half_rotary_dim / 2) + intra_half_idx / 2;
         constexpr int tidx_factor = vec_size / 2;
         if (do_rotary)
         {
@@ -1439,18 +1439,18 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
         rotary_embedding_max_positions, position_embedding_type);
 
 template <typename T>
-void invokeAddFusedQKVBiasTranspose(T* q_buf, T* k_buf, T* v_buf, T* QKV, const T* qkv_bias, const int* seq_lens,
-    const int* padding_offset, const int batch_size, const int seq_len, const int token_num, const int head_num,
-    const int kv_head_num, const int size_per_head, const int rotary_embedding_dim, const float rotary_embedding_base,
-    const RotaryScalingType rotary_scale_type, const float rotary_embedding_scale,
-    const int rotary_embedding_max_positions, const PositionEmbeddingType position_embedding_type, const float* scale,
-    const int int8_mode, cudaStream_t stream)
+void invokeAddFusedQKVBiasTranspose(T* q_buf, T* k_buf, T* v_buf, T* QKV, T const* qkv_bias, int const* seq_lens,
+    int const* padding_offset, int const batch_size, int const seq_len, int const token_num, int const head_num,
+    int const kv_head_num, int const size_per_head, int const rotary_embedding_dim, float const rotary_embedding_base,
+    const RotaryScalingType rotary_scale_type, float const rotary_embedding_scale,
+    int const rotary_embedding_max_positions, const PositionEmbeddingType position_embedding_type, float const* scale,
+    int const int8_mode, cudaStream_t stream)
 {
     // [bs, seq_len, 3, head, Dh]
     if (rotary_embedding_dim == 0)
     {
-        const int m = token_num;
-        const int n = head_num * size_per_head;
+        int const m = token_num;
+        int const n = head_num * size_per_head;
         dim3 block(384);
         dim3 grid((int) (ceil(1.0 * m * n / 384)));
 
@@ -1500,45 +1500,45 @@ INSTANTIATE_ADDFUSEDQKVBIAS_TRANSPOSE(__nv_bfloat16);
 #undef INSTANTIATE_ADDFUSEDQKVBIAS_TRANSPOSE
 
 template <typename T>
-__global__ void transpose_4d(T* dst, T* src, const int dim0, const int dim1, const int dim2, const int dim3,
-    const int dim0_leading_dim, const int ite)
+__global__ void transpose_4d(T* dst, T* src, int const dim0, int const dim1, int const dim2, int const dim3,
+    int const dim0_leading_dim, int const ite)
 {
     // transpose from [dim0, dim1, dim2, dim3] to [dim2, X, dim1, dim3]
     // where the dimension of X is dim0_leading_dim, and offset is ite * dim0
     for (int i = threadIdx.x + blockIdx.x * blockDim.x; i < dim0 * dim1 * dim2 * dim3; i += blockDim.x * gridDim.x)
     {
         int index = i;
-        const int d3 = index % dim3;
+        int const d3 = index % dim3;
         index = (index - d3) / dim3;
-        const int d2 = index % dim2;
+        int const d2 = index % dim2;
         index = (index - d2) / dim2;
-        const int d1 = index % dim1;
+        int const d1 = index % dim1;
         index = (index - d1) / dim1;
-        const int d0 = index % dim0;
+        int const d0 = index % dim0;
         index = (index - d0) / dim0;
         dst[d2 * dim0_leading_dim * dim1 * dim3 + (d0 + dim0 * ite) * dim1 * dim3 + d1 * dim3 + d3] = src[i];
     }
 }
 
 template <>
-__global__ void transpose_4d(half* dst, half* src, const int dim0, const int dim1, const int dim2, const int dim3,
-    const int dim0_leading_dim, const int ite)
+__global__ void transpose_4d(half* dst, half* src, int const dim0, int const dim1, int const dim2, int const dim3,
+    int const dim0_leading_dim, int const ite)
 {
     half2* dst_ptr = (half2*) dst;
     half2* src_ptr = (half2*) src;
-    const int half_dim3 = dim3 / 2;
+    int const half_dim3 = dim3 / 2;
     // transpose from [dim0, dim1, dim2, half_dim3] to [dim2, dim0, dim1, half_dim3]
     // where the dimension of X is dim0_leading_dim, and offset is ite * dim0
     for (int i = threadIdx.x + blockIdx.x * blockDim.x; i < dim0 * dim1 * dim2 * half_dim3; i += blockDim.x * gridDim.x)
     {
         int index = i;
-        const int d3 = index % half_dim3;
+        int const d3 = index % half_dim3;
         index = (index - d3) / half_dim3;
-        const int d2 = index % dim2;
+        int const d2 = index % dim2;
         index = (index - d2) / dim2;
-        const int d1 = index % dim1;
+        int const d1 = index % dim1;
         index = (index - d1) / dim1;
-        const int d0 = index % dim0;
+        int const d0 = index % dim0;
         index = (index - d0) / dim0;
         dst_ptr[d2 * dim0_leading_dim * dim1 * half_dim3 + (d0 + dim0 * ite) * dim1 * half_dim3 + d1 * half_dim3 + d3]
             = src_ptr[i];
@@ -1546,8 +1546,8 @@ __global__ void transpose_4d(half* dst, half* src, const int dim0, const int dim
 }
 
 template <typename T>
-void invokeTranspose4d(T* dst, T* src, const int local_batch_size, const int seq_len, const int size_per_head,
-    const int local_hidden_units, const int local_head_num, const int batch_size, const int ite, cudaStream_t stream)
+void invokeTranspose4d(T* dst, T* src, int const local_batch_size, int const seq_len, int const size_per_head,
+    int const local_hidden_units, int const local_head_num, int const batch_size, int const ite, cudaStream_t stream)
 {
     transpose_4d<<<local_batch_size * seq_len * local_hidden_units / 512, 512 / (4 / (sizeof(T))), 0, stream>>>(
         dst, src, local_batch_size, local_head_num, seq_len, size_per_head, batch_size, ite);
@@ -1562,9 +1562,9 @@ INSTANTIATE_TRANSPOSE_4D(half);
 #undef INSTANTIATE_TRANSPOSE_4D
 
 template <typename T, typename T_cache, typename KVCacheBuffer>
-__global__ void transpose4dBatchMajorKVCache(const T* kSrc, const T* vSrc, KVCacheBuffer kvCacheBuffer,
-    const int headNum, const int sizePerHead, const int seqLen, const int attentionWindowSize,
-    const float* kvScaleOrigQuant, const int* sequence_lengths)
+__global__ void transpose4dBatchMajorKVCache(T const* kSrc, T const* vSrc, KVCacheBuffer kvCacheBuffer,
+    int const headNum, int const sizePerHead, int const seqLen, int const attentionWindowSize,
+    float const* kvScaleOrigQuant, int const* sequence_lengths)
 {
     // We allow only fp32/fp16/bf16 as input types
     static_assert(sizeof(T) == 4 || sizeof(T) == 2, "");
@@ -1574,14 +1574,14 @@ __global__ void transpose4dBatchMajorKVCache(const T* kSrc, const T* vSrc, KVCac
     using T_dst = T_cache;
     using T_src = typename mmha::packed_type<T, X_ELEMS>::type;
 
-    const int batchIdx = blockIdx.y;
-    const int headIdx = blockIdx.z;
+    int const batchIdx = blockIdx.y;
+    int const headIdx = blockIdx.z;
 
     // idx is over output dimension L * sizePerHead / x for values
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     // threadIdx.y 0 handles k, while threadIdx.y 1 handles v.
-    const bool handle_k = (threadIdx.y == 0);
-    const int sizePerHeadDivX = sizePerHead / X_ELEMS;
+    bool const handle_k = (threadIdx.y == 0);
+    int const sizePerHeadDivX = sizePerHead / X_ELEMS;
 
     if (idx >= sizePerHeadDivX * seqLen)
     {
@@ -1592,9 +1592,9 @@ __global__ void transpose4dBatchMajorKVCache(const T* kSrc, const T* vSrc, KVCac
     int tokenIdx = idx / sizePerHeadDivX;
     // Apply cyclic kv cache if tokenIdx >= max_attention_window_size.
     // which means we will drop the tokens in the beginning if seqLen > max_attention_window_size.
-    const int tokenIdxLowerBound = max(sequence_lengths[batchIdx] - attentionWindowSize, 0);
+    int const tokenIdxLowerBound = max(sequence_lengths[batchIdx] - attentionWindowSize, 0);
     // Get channel index
-    const int channelIdx = idx % sizePerHeadDivX;
+    int const channelIdx = idx % sizePerHeadDivX;
     if (tokenIdx >= sequence_lengths[batchIdx] || tokenIdx < tokenIdxLowerBound)
     {
         return;
@@ -1611,7 +1611,7 @@ __global__ void transpose4dBatchMajorKVCache(const T* kSrc, const T* vSrc, KVCac
 
     // 16 byte loads will handle "x" dimension
     const size_t srcOffset = (batchIdx * headNum + headIdx) * sizePerHead * seqLen;
-    auto valSrc = reinterpret_cast<const T_src*>((handle_k ? kSrc : vSrc) + srcOffset);
+    auto valSrc = reinterpret_cast<T_src const*>((handle_k ? kSrc : vSrc) + srcOffset);
 
     T_src val = valSrc[idx];
     if (ENABLE_8BITS_CACHE)
@@ -1635,9 +1635,9 @@ __global__ void transpose4dBatchMajorKVCache(const T* kSrc, const T* vSrc, KVCac
 }
 
 template <typename T, typename KVCacheBuffer>
-void invokeTranspose4dBatchMajor(const T* kSrc, const T* vSrc, KVCacheBuffer& kvTable, const int localBatchSize,
-    const int seqLen, const int attentionWindowSize, const int sizePerHead, const int localHeadNum,
-    const KvCacheDataType cache_type, const float* kvScaleOrigQuant, const int* sequence_lengths, cudaStream_t stream)
+void invokeTranspose4dBatchMajor(T const* kSrc, T const* vSrc, KVCacheBuffer& kvTable, int const localBatchSize,
+    int const seqLen, int const attentionWindowSize, int const sizePerHead, int const localHeadNum,
+    const KvCacheDataType cache_type, float const* kvScaleOrigQuant, int const* sequence_lengths, cudaStream_t stream)
 {
     // Block handles both K and V tile.
     dim3 blockSz(128, 2);
@@ -1685,19 +1685,19 @@ INSTANTIATE_TRANSPOSE_4D_BATCH_MAJOR(__nv_bfloat16);
 #undef INSTANTIATE_TRANSPOSE_4D_BATCH_MAJOR
 
 template <typename T, typename BT>
-__global__ void addRelativeAttentionBiasUnaligned(T* qk_buf, const BT* relative_attention_bias, const int batch_size,
-    const int head_num, const int seq_len, int max_seq_len, bool implicit, int num_buckets, int max_distance,
+__global__ void addRelativeAttentionBiasUnaligned(T* qk_buf, const BT* relative_attention_bias, int const batch_size,
+    int const head_num, int const seq_len, int max_seq_len, bool implicit, int num_buckets, int max_distance,
     bool bidirectional)
 {
-    const int seq_i = blockIdx.x;
-    const int batch_id = blockIdx.y / head_num;
-    const int head_id = blockIdx.y % head_num;
-    const int rel_attn_table_stride = num_buckets; // num_buckets could be modified below, save it beforehand
+    int const seq_i = blockIdx.x;
+    int const batch_id = blockIdx.y / head_num;
+    int const head_id = blockIdx.y % head_num;
+    int const rel_attn_table_stride = num_buckets; // num_buckets could be modified below, save it beforehand
 
     for (int seq_j = threadIdx.x; seq_j < seq_len; seq_j += blockDim.x)
     {
 
-        const int qk_index
+        int const qk_index
             = batch_id * head_num * seq_len * seq_len + head_id * seq_len * seq_len + seq_i * seq_len + seq_j;
 
         if (implicit)
@@ -1730,15 +1730,15 @@ __global__ void addRelativeAttentionBiasUnaligned(T* qk_buf, const BT* relative_
         }
         else
         {
-            const int bias_index = head_id * max_seq_len * max_seq_len + seq_i * max_seq_len + seq_j;
+            int const bias_index = head_id * max_seq_len * max_seq_len + seq_i * max_seq_len + seq_j;
             qk_buf[qk_index] = (T) add((T) relative_attention_bias[bias_index], qk_buf[qk_index]);
         }
     }
 }
 
 template <typename T, typename BT>
-void invokeAddRelativeAttentionBiasUnaligned(T* qk_buf, const BT* relative_attention_bias, const int batch_size,
-    const int head_num, const int seq_len, const int max_seq_len, cudaStream_t stream, bool implicit, int num_buckets,
+void invokeAddRelativeAttentionBiasUnaligned(T* qk_buf, const BT* relative_attention_bias, int const batch_size,
+    int const head_num, int const seq_len, int const max_seq_len, cudaStream_t stream, bool implicit, int num_buckets,
     int max_distance, bool bidirectional)
 {
     // qk_buf: [batch_size, head_num, seq_len, seq_len]
@@ -1764,11 +1764,11 @@ INSTANTIATE_ADD_RELATIVE_ATTENTION_BIAS_UNALIGNED(float, __nv_bfloat16);
 #undef INSTANTIATE_ADD_RELATIVE_ATTENTION_BIAS_UNALIGNED
 
 template <typename T, typename T_cache, typename KVCacheBuffer>
-__global__ void shiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCacheBuffer, const int sizePerHead,
-    const int timestep, const int beam_width, const int maxKCacheLen, const int sinkTokenLen,
-    const float* kScaleQuantOrig, const int* sequence_lengths, const int* input_lengths, const int rotary_embedding_dim,
+__global__ void shiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCacheBuffer, int const sizePerHead,
+    int const timestep, int const beam_width, int const maxKCacheLen, int const sinkTokenLen,
+    float const* kScaleQuantOrig, int const* sequence_lengths, int const* input_lengths, int const rotary_embedding_dim,
     float rotary_embedding_base, RotaryScalingType const rotary_scale_type, float rotary_embedding_scale,
-    const int rotary_embedding_max_positions, PositionEmbeddingType const position_embedding_type)
+    int const rotary_embedding_max_positions, PositionEmbeddingType const position_embedding_type)
 {
     // We allow only fp32/fp16/bf16 as the data types to apply rotary
     static_assert(sizeof(T) == 4 || sizeof(T) == 2, "");
@@ -1785,35 +1785,35 @@ __global__ void shiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCa
     using Vec_k = typename mmha::packed_type<T, vec_size>::type;
     using Vec_k_cache = typename mmha::packed_type<T_cache, vec_size>::type;
     using T_dst = T;
-    const int sizePerHeadDivX = sizePerHead / vec_size;
+    int const sizePerHeadDivX = sizePerHead / vec_size;
 
     // The start token idx for the cyclic part in k cache
-    const int cyclic_k_cache_start_idx
+    int const cyclic_k_cache_start_idx
         = (timestep <= maxKCacheLen) ? sinkTokenLen : sinkTokenLen + timestep - maxKCacheLen;
     // The token idx
     int token_idx
         = (kvCacheBuffer.isSinkToken(blockIdx.x)) ? blockIdx.x : cyclic_k_cache_start_idx + blockIdx.x - sinkTokenLen;
     // The position idx
-    const int token_pos_idx = blockIdx.x;
+    int const token_pos_idx = blockIdx.x;
     // Head
-    const int head_idx = blockIdx.y;
+    int const head_idx = blockIdx.y;
     // The batch beam idx
-    const int batch_beam_idx = blockIdx.z;
+    int const batch_beam_idx = blockIdx.z;
     // The beam idx
-    const int beam_idx = batch_beam_idx % beam_width;
+    int const beam_idx = batch_beam_idx % beam_width;
     // Thread idx
-    const int tidx = threadIdx.x;
+    int const tidx = threadIdx.x;
 
     // The actual sequence length excluding the paddings.
     // minus 1 because it includes the current timestep while tlength denotes the past token length.
-    const int tlength = sequence_lengths[batch_beam_idx] - 1;
+    int const tlength = sequence_lengths[batch_beam_idx] - 1;
     // The context length
-    const int inlength = input_lengths[batch_beam_idx];
+    int const inlength = input_lengths[batch_beam_idx];
     // The k cache valid token length
-    const int cache_length = (tlength > maxKCacheLen) ? maxKCacheLen : tlength;
+    int const cache_length = (tlength > maxKCacheLen) ? maxKCacheLen : tlength;
     // Mask out the tokens exceed the real total length and tokens in the context phase with beam_idx>0
-    const bool valid_seq = token_idx < tlength && !(token_idx < inlength && beam_idx > 0);
-    const bool is_head_size_masked = tidx * vec_size >= sizePerHead;
+    bool const valid_seq = token_idx < tlength && !(token_idx < inlength && beam_idx > 0);
+    bool const is_head_size_masked = tidx * vec_size >= sizePerHead;
 
     // Dequant scales for 8bits k cache
     float k_scale_quant_orig = (ENABLE_8BITS_CACHE ? kScaleQuantOrig[0] : 1.0f);
@@ -1834,7 +1834,7 @@ __global__ void shiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCa
     Vec_k_cache k_cache;
     T_cache* k_cache_batch = reinterpret_cast<T_cache*>(kvCacheBuffer.getKBlockPtr(batch_beam_idx, token_kv_idx));
     int inBlockIdx_r = kvCacheBuffer.getKVLocalIdx(token_kv_idx, head_idx, sizePerHead, tidx * vec_size);
-    k_cache = *reinterpret_cast<const Vec_k_cache*>(&k_cache_batch[inBlockIdx_r]);
+    k_cache = *reinterpret_cast<Vec_k_cache const*>(&k_cache_batch[inBlockIdx_r]);
     if constexpr (INT8_K_CACHE)
     {
         using Packed_Float_t = typename mmha::packed_type<float, vec_size>::type;
@@ -1863,14 +1863,14 @@ __global__ void shiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCa
     }
     case PositionEmbeddingType::kROPE_GPT_NEOX:
     {
-        const bool do_rotary = vec_size * tidx < rotary_embedding_dim;
+        bool const do_rotary = vec_size * tidx < rotary_embedding_dim;
 
         T* k_smem = reinterpret_cast<T*>(smem_);
 
-        const int half_rotary_dim = rotary_embedding_dim / 2;
-        const int half_idx = (tidx * vec_size) / half_rotary_dim;
-        const int intra_half_idx = (tidx * vec_size) % half_rotary_dim;
-        const int smem_pitch = half_rotary_dim; // TODO: adjust for bank conflicts?
+        int const half_rotary_dim = rotary_embedding_dim / 2;
+        int const half_idx = (tidx * vec_size) / half_rotary_dim;
+        int const intra_half_idx = (tidx * vec_size) % half_rotary_dim;
+        int const smem_pitch = half_rotary_dim; // TODO: adjust for bank conflicts?
 
         if (do_rotary)
         {
@@ -1879,7 +1879,7 @@ __global__ void shiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCa
 
         __syncthreads();
 
-        const int transpose_idx = half_idx * (half_rotary_dim / 2) + intra_half_idx / 2;
+        int const transpose_idx = half_idx * (half_rotary_dim / 2) + intra_half_idx / 2;
         constexpr int tidx_factor = vec_size / 2;
         if (do_rotary)
         {
@@ -1908,15 +1908,15 @@ __global__ void shiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCa
 
 template <typename T, typename KVCacheBuffer>
 void invokeShiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCacheBuffer, const KvCacheDataType cache_type,
-    const int sizePerHead, const int timestep, const int batch_beam, const int kv_head_num, const int beam_width,
-    const int maxKCacheLen, const int sinkTokenLen, const float* kScaleQuantOrig, const int* sequence_lengths,
-    const int* input_lengths, const int rotary_embedding_dim, float rotary_embedding_base,
-    RotaryScalingType const rotary_scale_type, float rotary_embedding_scale, const int rotary_embedding_max_positions,
+    int const sizePerHead, int const timestep, int const batch_beam, int const kv_head_num, int const beam_width,
+    int const maxKCacheLen, int const sinkTokenLen, float const* kScaleQuantOrig, int const* sequence_lengths,
+    int const* input_lengths, int const rotary_embedding_dim, float rotary_embedding_base,
+    RotaryScalingType const rotary_scale_type, float rotary_embedding_scale, int const rotary_embedding_max_positions,
     PositionEmbeddingType const position_embedding_type, cudaStream_t stream)
 {
     // Block handles K tile.
-    const int token_num_in_k = (timestep <= maxKCacheLen) ? timestep : maxKCacheLen;
-    const int vec_size = 16u / sizeof(T);
+    int const token_num_in_k = (timestep <= maxKCacheLen) ? timestep : maxKCacheLen;
+    int const vec_size = 16u / sizeof(T);
     dim3 block((sizePerHead / vec_size + 31) / 32 * 32);
     dim3 grid(token_num_in_k, kv_head_num, batch_beam);
     size_t smem_size

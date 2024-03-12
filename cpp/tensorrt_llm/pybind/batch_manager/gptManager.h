@@ -30,7 +30,7 @@ namespace tensorrt_llm::pybind::batch_manager
 {
 
 using GetInferenceRequestsCallback = std::function<std::list<InferenceRequest>(int32_t)>;
-using SendResponseCallback = std::function<void(uint64_t, std::list<NamedTensor> const&, bool, const std::string&)>;
+using SendResponseCallback = std::function<void(uint64_t, std::list<NamedTensor> const&, bool, std::string const&)>;
 
 tensorrt_llm::batch_manager::GetInferenceRequestsCallback callbackAdapter(GetInferenceRequestsCallback const& callback);
 tensorrt_llm::batch_manager::SendResponseCallback callbackAdapter(SendResponseCallback const& callback);

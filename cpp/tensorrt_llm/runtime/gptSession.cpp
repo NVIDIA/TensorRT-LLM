@@ -231,7 +231,7 @@ void GptSession::createCustomAllReduceWorkspace(
 
     for (size_t memIdx = 0; memIdx < mIpcMemoryHandles.size(); memIdx++)
     {
-        const auto& memCommPtrs = mIpcMemoryHandles[memIdx]->getCommPtrsTensor();
+        auto const& memCommPtrs = mIpcMemoryHandles[memIdx]->getCommPtrsTensor();
         for (SizeType tpIdx = 0; tpIdx < mWorldConfig.getTensorParallelism(); tpIdx++)
         {
             commPtrsData[memIdx * mWorldConfig.getTensorParallelism() + tpIdx] = memCommPtrs[tpIdx];
@@ -354,7 +354,7 @@ void GptSession::kvCacheAddSequences(SizeType beamWidth, SizeType microBatchId, 
         TLLM_CHECK(mKvCacheManager);
         auto contextLengthsHost = mBuffers.at(microBatchId)->contextLengthsHost;
         TLLM_CHECK(contextLengthsHost);
-        const auto* const contextLengthsPtr = bufferCast<SizeType const>(*contextLengthsHost);
+        auto const* const contextLengthsPtr = bufferCast<SizeType const>(*contextLengthsHost);
         auto const contextLengthsSize = static_cast<SizeType>(contextLengthsHost->getSize());
         for (SizeType batchIdx = 0; batchIdx < contextLengthsSize; ++batchIdx)
         {

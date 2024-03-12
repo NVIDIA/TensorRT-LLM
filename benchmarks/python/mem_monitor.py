@@ -22,7 +22,7 @@ from tensorrt_llm.profiler import (MemUnitType, bytes_to_target_unit,
 
 class MemoryMonitor:
 
-    def __init__(self, query_interval=0.1):
+    def __init__(self, query_interval=0.1, disable_host_mem_monitor=False):
         self.query_interval = query_interval  # second(s)
         self.mem_monitor_process = None
         # bytes
@@ -34,6 +34,8 @@ class MemoryMonitor:
 
         self.signal_event = Event()  # Sending signal to subprocess
         self.peak_mem_queue = Queue()  # Receiving results from subprocess
+
+        self.disable_host_mem_monitor = disable_host_mem_monitor
 
     def start(self):
         self.mem_monitor_process = Process(target=self._upd_peak_memory_usage,
@@ -70,7 +72,10 @@ class MemoryMonitor:
         peak_mem_queue.put((peak_host_used, peak_device_used))
 
     def get_memory_usage(self):
-        host_used, _, _ = host_memory_info(self.pid)
+        if self.disable_host_mem_monitor:
+            host_used = 0
+        else:
+            host_used, _, _ = host_memory_info(self.pid)
         device_used, _, _ = device_memory_info()
         return host_used, device_used
 

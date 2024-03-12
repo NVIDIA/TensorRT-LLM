@@ -60,6 +60,7 @@ void invokeFill(IBuffer& buffer, T const value, CudaStream const& stream)
 }
 
 // template instantiation
+template void invokeFill(IBuffer&, std::int64_t, CudaStream const&);
 template void invokeFill(IBuffer&, std::int32_t, CudaStream const&);
 template void invokeFill(IBuffer&, std::int8_t, CudaStream const&);
 template void invokeFill(IBuffer&, std::uint8_t, CudaStream const&);
@@ -111,7 +112,7 @@ template void invokeFillBatch<std::int32_t>(IBuffer&, IBuffer const&, std::size_
 namespace
 {
 template <typename VecT>
-__global__ void copyBatch(const uint8_t* srcData, uint8_t* dstData, std::int32_t const* srcOffsets,
+__global__ void copyBatch(uint8_t const* srcData, uint8_t* dstData, std::int32_t const* srcOffsets,
     std::int32_t const* dstOffsets, std::int32_t const* sizes, std::int32_t const dataTypeSize)
 {
     constexpr auto VEC_ELTS = static_cast<int32_t>(sizeof(VecT));
@@ -127,7 +128,7 @@ __global__ void copyBatch(const uint8_t* srcData, uint8_t* dstData, std::int32_t
 
     for (; srcIdx < srcEndIdx; srcIdx += stride, dstIdx += stride)
     {
-        *reinterpret_cast<VecT*>(&dstData[dstIdx]) = *reinterpret_cast<const VecT*>(&srcData[srcIdx]);
+        *reinterpret_cast<VecT*>(&dstData[dstIdx]) = *reinterpret_cast<VecT const*>(&srcData[srcIdx]);
     }
 }
 } // namespace
@@ -135,7 +136,7 @@ __global__ void copyBatch(const uint8_t* srcData, uint8_t* dstData, std::int32_t
 void invokeCopyBatch(IBuffer const& srcBuffer, IBuffer& dstBuffer, IBuffer const& srcOffsets, IBuffer const& dstOffsets,
     IBuffer const& sizes, std::size_t maxStride, CudaStream const& stream)
 {
-    auto srcDataPtr = reinterpret_cast<const uint8_t*>(srcBuffer.data());
+    auto srcDataPtr = reinterpret_cast<uint8_t const*>(srcBuffer.data());
     auto dstDataPtr = reinterpret_cast<uint8_t*>(dstBuffer.data());
     auto srcOffsetsPtr = bufferCast<std::int32_t>(srcOffsets);
     auto dstOffsetsPtr = bufferCast<std::int32_t>(dstOffsets);
@@ -1118,7 +1119,7 @@ void gatherLastTokenLogits(ITensor& output, ITensor const& input, ITensor const&
 // block copies a `vocabSizePadded` length logits tensor from the "inputLogits (microBatchSize, beamWidth,
 // vocabSizePadded)" to the "outputGenerationLogits (batchSize, beamWidth, outputLen, vocabSizePadded)"
 template <typename T>
-__global__ void mergeLogitsFragmentsKernel(T* output, T** fragmentsVector, const int outputLen, int firstBatchSlotIdx,
+__global__ void mergeLogitsFragmentsKernel(T* output, T** fragmentsVector, int const outputLen, int firstBatchSlotIdx,
     int microBatchSize, int beamWidth, int vocabSizePadded, int stepOffset)
 {
     // output: shape: [batchSize, beamWidth, outputLen, vocabSize]
@@ -1137,13 +1138,13 @@ __global__ void mergeLogitsFragmentsKernel(T* output, T** fragmentsVector, const
     int mbeamIdx = blockIdx.x % beamWidth;
 
     // The output pointer
-    const unsigned int outputOffset
+    unsigned int const outputOffset
         = (absoluteBatchSlotIdx * beamWidth * outputLen + mbeamIdx * outputLen + curStep + stepOffset)
         * vocabSizePadded;
 
     T* outputPtr = &output[outputOffset];
 
-    const unsigned int inputOffset = (relativeBatchSlotIdx * beamWidth + mbeamIdx) * vocabSizePadded;
+    unsigned int const inputOffset = (relativeBatchSlotIdx * beamWidth + mbeamIdx) * vocabSizePadded;
     // The input pointer.
     T const* inputPtr = &fragmentsVector[curStep][inputOffset];
 

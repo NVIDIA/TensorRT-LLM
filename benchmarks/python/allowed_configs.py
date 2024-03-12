@@ -86,6 +86,7 @@ class EncDecBuildConfig:
     max_output_len: Optional[int] = None
     builder_opt: Optional[int] = None
     n_mels: Optional[int] = None
+    skip_cross_qkv: bool = False
 
     def __post_init__(self) -> None:
         assert self.head_size is not None

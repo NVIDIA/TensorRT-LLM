@@ -27,7 +27,7 @@ import numpy as np
 import torch
 
 from tensorrt_llm._utils import str_dtype_to_torch
-from tensorrt_llm.runtime.lora_manager import LoraConfig
+from tensorrt_llm.lora_manager import LoraConfig
 
 log_format = "%(asctime)s %(name)s [%(levelname)s] %(message)s"
 logging.basicConfig(format=log_format)

@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
+import sys
 import unittest
 
 import numpy as np
@@ -22,6 +24,9 @@ from polygraphy.backend.trt import CreateConfig, EngineFromNetwork, TrtRunner
 import tensorrt_llm
 from tensorrt_llm import Parameter, Tensor
 from tensorrt_llm.quantization.functional import smooth_quant_layer_norm
+
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.util import unittest_name_func
 
 
 class TestFunctional(unittest.TestCase):
@@ -36,7 +41,7 @@ class TestFunctional(unittest.TestCase):
         return [i + (True, )
                 for i in test_cases] + [i + (False, ) for i in test_cases]
 
-    @parameterized.expand(load_test_cases)
+    @parameterized.expand(load_test_cases, name_func=unittest_name_func)
     def test_smooth_quant_layer_norm_plugin(self, dtype, dynamic_act_scaling,
                                             elementwise_affine,
                                             remove_batch_dim):

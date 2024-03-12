@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
+import os
+import sys
 import unittest
 
 import numpy as np
@@ -22,6 +24,9 @@ from polygraphy.backend.trt import CreateConfig, EngineFromNetwork, TrtRunner
 
 import tensorrt_llm
 from tensorrt_llm import Tensor
+
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.util import unittest_name_func
 
 
 def split_vocab_size(vocab_size, tp_size):
@@ -55,7 +60,8 @@ class TestFunctional(unittest.TestCase):
     ), (
         'float16',
         0,
-    )])
+    )],
+                          name_func=unittest_name_func)
     def test_embedding(self, dtype, use_lookup_plugin):
         # torch gelu does not support float16
         fp16 = (dtype == 'float16')

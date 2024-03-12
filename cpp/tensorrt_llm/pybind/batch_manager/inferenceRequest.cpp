@@ -28,7 +28,7 @@
 
 #ifdef _WIN32
 // FIXME: THPStream_Wrap seems not to be present in libtorch_python.so on Windows
-PyObject* THPStream_Wrap(const c10::Stream& stream)
+PyObject* THPStream_Wrap(c10::Stream const& stream)
 {
     TLLM_THROW("Stream conversion in not yet supported on Windows.");
     return nullptr;
@@ -147,7 +147,7 @@ void InferenceRequest::initBindings(py::module_& m)
         .def_property("is_streaming", &InferenceRequest::isStreaming, &InferenceRequest::setIsStreaming)
         .def_property_readonly("request_id", &InferenceRequest::getRequestId)
         .def(py::pickle(
-            [](const InferenceRequest& p) { // __getstate__
+            [](InferenceRequest const& p) { // __getstate__
                 return py::bytearray(p.serialize());
             },
             [](py::bytearray const& t) { // __setstate__

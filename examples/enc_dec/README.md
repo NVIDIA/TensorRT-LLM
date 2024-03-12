@@ -208,7 +208,7 @@ python build.py --model_type bart \
                 --max_beam_width 1
 ```
 
-* Run the engine, setting `--lora_dir` and `--lora_task_uids`. `lora_task_uids` should be set as a list of uids which length equals to batch size. The following example is for batch size = 2:
+* Run the engine, setting `--lora_dir` and `--lora_task_uids`. `--lora_task_uids` should be set as a list of uids which length equals to batch size. The following example is for batch size = 2:
 
 ```bash
 python run.py \
@@ -219,6 +219,19 @@ python run.py \
         --num_beams=1 \
         --lora_dir tmp/hf_models/bart-large-cnn-samsum-lora/ \
         --lora_task_uids 0 0
+```
+
+* Run with multi-loRA, append `--lora_dir` with other lora directories and set `--lora_task_uids` according to the index of the lora directories. Set to "-1" to run with the base model:
+
+```bash
+python run.py \
+        --engine_dir tmp/trt_engines/bart-large-cnn/1-gpu/float16/tp1/ \
+        --engine_name bart-large-cnn \
+        --model_name tmp/hf_models/bart-large-cnn \
+        --max_new_token=64 \
+        --num_beams=1 \
+        --lora_dir tmp/hf_models/bart-large-cnn-samsum-lora/ ... \
+        --lora_task_uids 0 -1 -1 0 0 -1
 ```
 
 ### Reminders

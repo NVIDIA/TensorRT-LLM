@@ -49,8 +49,8 @@ __device__ __forceinline__ T apply_length_penalty(T log_prob, int length, float 
 
 template <typename T, int MAX_K, int THREADBLOCK_SIZE>
 __launch_bounds__(THREADBLOCK_SIZE) __global__
-    void beam_topK_kernel(const T* log_probs, int* topk_tmp_id_buf, T* topk_tmp_val_buf, const bool* finished,
-        const int* sequence_lengths, const int vocab_size, T diversity_rate, float length_penalty)
+    void beam_topK_kernel(T const* log_probs, int* topk_tmp_id_buf, T* topk_tmp_val_buf, bool const* finished,
+        int const* sequence_lengths, int const vocab_size, T diversity_rate, float length_penalty)
 {
     typedef cub::BlockReduce<TopK<T, MAX_K>, THREADBLOCK_SIZE> BlockReduce;
     __shared__ typename BlockReduce::TempStorage temp_storage;
@@ -59,7 +59,7 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
     int block_id = blockIdx.x; // batch beam index.
     TopK<T, MAX_K> partial;
 
-    const bool IS_FP16 = std::is_same<T, half>::value;
+    bool const IS_FP16 = std::is_same<T, half>::value;
     const T MAX_T_VAL = (IS_FP16) ? HALF_FLT_MAX : FLT_MAX;
 
 #pragma unroll
@@ -101,7 +101,7 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
 {
     int thread_id = threadIdx.x;
     int block_id = blockIdx.x;
-    const bool IS_FP16 = std::is_same<T, half>::value;
+    bool const IS_FP16 = std::is_same<T, half>::value;
     const T MAX_T_VAL = (IS_FP16) ? HALF_FLT_MAX : FLT_MAX;
     TopK<T, MAX_K> partial;
     if (thread_id == 0)
@@ -136,7 +136,7 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
     int tid = threadIdx.x;
     int bid = blockIdx.x;
     TopK<T, MAX_K> partial;
-    const bool IS_FP16 = std::is_same<T, half>::value;
+    bool const IS_FP16 = std::is_same<T, half>::value;
     const T MAX_T_VAL = (IS_FP16) ? HALF_FLT_MAX : FLT_MAX;
 
 #pragma unroll
@@ -167,32 +167,32 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
 }
 
 template <typename T, int BLOCK_SIZE_, int BLOCKS_PER_BEAM_>
-__global__ void topk_stage_1_opt3(const T* __restrict log_probs, T* tmp_log_probs, int* topk_tmp_id_buf,
-    T* topk_tmp_val_buf, const bool* finished, const int* sequence_lengths, const int k, const int vocab_size,
-    const float length_penalty, const int* end_ids)
+__global__ void topk_stage_1_opt3(T const* __restrict log_probs, T* tmp_log_probs, int* topk_tmp_id_buf,
+    T* topk_tmp_val_buf, bool const* finished, int const* sequence_lengths, int const k, int const vocab_size,
+    float const length_penalty, int const* end_ids)
 {
     typedef cub::BlockReduce<TopK_2<T>, BLOCK_SIZE_> BlockReduce;
     __shared__ typename BlockReduce::TempStorage temp_storage;
 
-    const int tid = threadIdx.x;
-    const int bid = blockIdx.x;
+    int const tid = threadIdx.x;
+    int const bid = blockIdx.x;
 
-    const int row_id = bid / BLOCKS_PER_BEAM_;     // row id for log_probs (batchbeam index)
-    const int block_lane = bid % BLOCKS_PER_BEAM_; // block id for a beam
-    const int tmp_log_buf_index = row_id * vocab_size;
-    const int tmp_topk_buf_index = row_id * BLOCKS_PER_BEAM_ * k + block_lane * k;
+    int const row_id = bid / BLOCKS_PER_BEAM_;     // row id for log_probs (batchbeam index)
+    int const block_lane = bid % BLOCKS_PER_BEAM_; // block id for a beam
+    int const tmp_log_buf_index = row_id * vocab_size;
+    int const tmp_topk_buf_index = row_id * BLOCKS_PER_BEAM_ * k + block_lane * k;
     TopK_2<T> partial;
-    const bool IS_FP16 = std::is_same<T, half>::value;
+    bool const IS_FP16 = std::is_same<T, half>::value;
     const T MAX_T_VAL = (IS_FP16) ? HALF_FLT_MAX : FLT_MAX;
 
     if (finished != nullptr && finished[row_id] == true)
     {
         if (tid < k)
         {
-            const int index = tmp_topk_buf_index + tid;
+            int const index = tmp_topk_buf_index + tid;
             if (block_lane == 0 && tid == 0)
             {
-                const int end_id = end_ids[row_id / k];
+                int const end_id = end_ids[row_id / k];
                 topk_tmp_id_buf[index] = tmp_log_buf_index + end_id;
                 topk_tmp_val_buf[index] = log_probs[tmp_log_buf_index + end_id];
             }
@@ -226,7 +226,7 @@ __global__ void topk_stage_1_opt3(const T* __restrict log_probs, T* tmp_log_prob
 
         if (tid == 0)
         {
-            const int index = tmp_topk_buf_index + ite;
+            int const index = tmp_topk_buf_index + ite;
             topk_tmp_id_buf[index] = total.p;
             topk_tmp_val_buf[index] = total.u;
             tmp_log_probs[total.p] = -MAX_T_VAL;
@@ -236,15 +236,15 @@ __global__ void topk_stage_1_opt3(const T* __restrict log_probs, T* tmp_log_prob
 }
 
 template <typename T, int BLOCK_SIZE_, int BLOCKS_PER_BEAM_>
-__global__ void topk_stage_2_opt3(const int* __restrict topk_tmp_id_buf, T* topk_tmp_val_buf, int* ids,
-    BeamHypotheses beam_hyps, const int* end_ids, const int vocab_size, const int k)
+__global__ void topk_stage_2_opt3(int const* __restrict topk_tmp_id_buf, T* topk_tmp_val_buf, int* ids,
+    BeamHypotheses beam_hyps, int const* end_ids, int const vocab_size, int const k)
 {
-    const int size = k * k * BLOCKS_PER_BEAM_;
-    const int tid = threadIdx.x;
-    const int batch_id = blockIdx.x;
-    const bool IS_FP16 = std::is_same<T, half>::value;
+    int const size = k * k * BLOCKS_PER_BEAM_;
+    int const tid = threadIdx.x;
+    int const batch_id = blockIdx.x;
+    bool const IS_FP16 = std::is_same<T, half>::value;
     const T MAX_T_VAL = (IS_FP16) ? HALF_FLT_MAX : FLT_MAX;
-    const float length_penalty{beam_hyps.length_penalties == nullptr ? 1.0f : beam_hyps.length_penalties[batch_id]};
+    float const length_penalty{beam_hyps.length_penalties == nullptr ? 1.0f : beam_hyps.length_penalties[batch_id]};
 
     typedef cub::BlockReduce<TopK_2<T>, BLOCK_SIZE_> BlockReduce;
     __shared__ typename BlockReduce::TempStorage temp_storage;
@@ -263,7 +263,7 @@ __global__ void topk_stage_2_opt3(const int* __restrict topk_tmp_id_buf, T* topk
     __syncthreads();
     if (beam_hyps.num_beams != nullptr)
     {
-        const int global_batch_idx = beam_hyps.ite * beam_hyps.local_batch_size + batch_id;
+        int const global_batch_idx = beam_hyps.ite * beam_hyps.local_batch_size + batch_id;
         if (beam_hyps.num_beams[global_batch_idx] == 0 && tid == 0)
         {
             // initialize the buffer
@@ -304,9 +304,9 @@ __global__ void topk_stage_2_opt3(const int* __restrict topk_tmp_id_buf, T* topk
                 }
                 else
                 {
-                    const int global_batch_idx = beam_hyps.ite * beam_hyps.local_batch_size + batch_id;
-                    const float normed_score = apply_length_penalty(s_val[total.p], beam_hyps.step, length_penalty);
-                    const int num_beam = beam_hyps.num_beams[global_batch_idx];
+                    int const global_batch_idx = beam_hyps.ite * beam_hyps.local_batch_size + batch_id;
+                    float const normed_score = apply_length_penalty(s_val[total.p], beam_hyps.step, length_penalty);
+                    int const num_beam = beam_hyps.num_beams[global_batch_idx];
                     int beam_idx = num_beam;
                     // If there are beam_width finished sentences, check that the score of
                     // selected candidatet is higher than min_normed_score or not. If
@@ -345,20 +345,20 @@ __global__ void topk_stage_2_opt3(const int* __restrict topk_tmp_id_buf, T* topk
                             }
                         }
                     }
-                    const int tgt_id_offset = ((batch_id + beam_hyps.ite * beam_hyps.local_batch_size) * k + beam_idx)
+                    int const tgt_id_offset = ((batch_id + beam_hyps.ite * beam_hyps.local_batch_size) * k + beam_idx)
                         * beam_hyps.max_seq_len;
                     beam_hyps.output_ids_tgt[tgt_id_offset + beam_hyps.step] = end_ids[batch_id];
 
                     int prev_id = (topk_tmp_id_buf[batch_id * size + total.p] / vocab_size) % k;
                     for (int j = beam_hyps.step - 1; j >= 0; j--)
                     {
-                        const int src_idx = j * beam_hyps.batch_size * k
+                        int const src_idx = j * beam_hyps.batch_size * k
                             + beam_hyps.ite * beam_hyps.local_batch_size * k + batch_id * k + prev_id;
 
                         beam_hyps.output_ids_tgt[tgt_id_offset + j] = beam_hyps.output_ids_src[src_idx];
                         prev_id = beam_hyps.parent_ids_src[src_idx];
                     }
-                    const int tgt_beam_idx = global_batch_idx * k + beam_idx;
+                    int const tgt_beam_idx = global_batch_idx * k + beam_idx;
                     beam_hyps.sequence_lengths_tgt[tgt_beam_idx] = beam_hyps.step;
                     beam_hyps.normed_scores[tgt_beam_idx] = normed_score;
                     beam_hyps.min_normed_scores[global_batch_idx]
@@ -389,21 +389,21 @@ __global__ void topk_stage_2_opt3(const int* __restrict topk_tmp_id_buf, T* topk
 }
 
 template <typename T, int BLOCK_SIZE, int BLOCKS_PER_BEAM>
-__global__ void topk_stage_1_opt2_general(const T* __restrict log_probs, T* tmp_log_probs, int* topk_tmp_id_buf,
-    T* topk_tmp_val_buf, const bool* finished, const int* sequence_lengths, const int k, const int vocab_size,
-    const float length_penalty)
+__global__ void topk_stage_1_opt2_general(T const* __restrict log_probs, T* tmp_log_probs, int* topk_tmp_id_buf,
+    T* topk_tmp_val_buf, bool const* finished, int const* sequence_lengths, int const k, int const vocab_size,
+    float const length_penalty)
 {
-    const bool IS_FP16 = std::is_same<T, half>::value;
+    bool const IS_FP16 = std::is_same<T, half>::value;
     const T MAX_T_VAL = (IS_FP16) ? HALF_FLT_MAX : FLT_MAX;
     typedef cub::BlockReduce<TopK_2<T>, BLOCK_SIZE> BlockReduce;
     __shared__ typename BlockReduce::TempStorage temp_storage;
 
-    const int tid = threadIdx.x;
-    const int bid = blockIdx.x;
-    const int row_id = bid / BLOCKS_PER_BEAM;     // row id for log_probs
-    const int block_lane = bid % BLOCKS_PER_BEAM; // block id for a beam
-    const int tmp_log_buf_index = row_id * vocab_size;
-    const int tmp_topk_buf_index = row_id * BLOCKS_PER_BEAM * k + block_lane * k;
+    int const tid = threadIdx.x;
+    int const bid = blockIdx.x;
+    int const row_id = bid / BLOCKS_PER_BEAM;     // row id for log_probs
+    int const block_lane = bid % BLOCKS_PER_BEAM; // block id for a beam
+    int const tmp_log_buf_index = row_id * vocab_size;
+    int const tmp_topk_buf_index = row_id * BLOCKS_PER_BEAM * k + block_lane * k;
     TopK_2<T> partial;
 
     for (int elem_id = tid + block_lane * BLOCK_SIZE; elem_id < vocab_size; elem_id += BLOCK_SIZE * BLOCKS_PER_BEAM)
@@ -426,7 +426,7 @@ __global__ void topk_stage_1_opt2_general(const T* __restrict log_probs, T* tmp_
 
         if (tid == 0)
         {
-            const int index = tmp_topk_buf_index + ite;
+            int const index = tmp_topk_buf_index + ite;
             topk_tmp_id_buf[index] = total.p;
             topk_tmp_val_buf[index] = total.u;
             tmp_log_probs[total.p] = -MAX_T_VAL;
@@ -436,15 +436,15 @@ __global__ void topk_stage_1_opt2_general(const T* __restrict log_probs, T* tmp_
 }
 
 template <typename T, int BLOCK_SIZE, int BLOCKS_PER_BEAM>
-__global__ void topk_stage_2_opt2_general(const int* __restrict topk_tmp_id_buf, T* topk_tmp_val_buf, int* ids,
-    BeamHypotheses beam_hyps, const int* end_ids, const int k, const int vocab_size)
+__global__ void topk_stage_2_opt2_general(int const* __restrict topk_tmp_id_buf, T* topk_tmp_val_buf, int* ids,
+    BeamHypotheses beam_hyps, int const* end_ids, int const k, int const vocab_size)
 {
-    const int size = k * k * BLOCKS_PER_BEAM;
-    const int tid = threadIdx.x;
-    const int batch_id = blockIdx.x;
-    const bool IS_FP16 = std::is_same<T, half>::value;
+    int const size = k * k * BLOCKS_PER_BEAM;
+    int const tid = threadIdx.x;
+    int const batch_id = blockIdx.x;
+    bool const IS_FP16 = std::is_same<T, half>::value;
     const T MAX_T_VAL = (IS_FP16) ? HALF_FLT_MAX : FLT_MAX;
-    const float length_penalty{beam_hyps.length_penalties == nullptr ? 1.0f : beam_hyps.length_penalties[batch_id]};
+    float const length_penalty{beam_hyps.length_penalties == nullptr ? 1.0f : beam_hyps.length_penalties[batch_id]};
 
     typedef cub::BlockReduce<TopK_2<T>, BLOCK_SIZE> BlockReduce;
     __shared__ typename BlockReduce::TempStorage temp_storage;
@@ -463,7 +463,7 @@ __global__ void topk_stage_2_opt2_general(const int* __restrict topk_tmp_id_buf,
     __syncthreads();
     if (beam_hyps.num_beams != nullptr)
     {
-        const int global_batch_idx = beam_hyps.ite * beam_hyps.local_batch_size + batch_id;
+        int const global_batch_idx = beam_hyps.ite * beam_hyps.local_batch_size + batch_id;
         if (beam_hyps.num_beams[global_batch_idx] == 0 && tid == 0)
         {
             beam_hyps.min_normed_scores[global_batch_idx] = FLT_MAX;
@@ -503,9 +503,9 @@ __global__ void topk_stage_2_opt2_general(const int* __restrict topk_tmp_id_buf,
                 }
                 else
                 {
-                    const int global_batch_idx = beam_hyps.ite * beam_hyps.local_batch_size + batch_id;
-                    const float normed_score = apply_length_penalty(s_val[total.p], beam_hyps.step, length_penalty);
-                    const int num_beam = beam_hyps.num_beams[global_batch_idx];
+                    int const global_batch_idx = beam_hyps.ite * beam_hyps.local_batch_size + batch_id;
+                    float const normed_score = apply_length_penalty(s_val[total.p], beam_hyps.step, length_penalty);
+                    int const num_beam = beam_hyps.num_beams[global_batch_idx];
                     int beam_idx = num_beam;
                     // If there are beam_width finished sentences, check that the score of
                     // selected candidatet is higher than min_normed_score or not. If
@@ -544,20 +544,20 @@ __global__ void topk_stage_2_opt2_general(const int* __restrict topk_tmp_id_buf,
                             }
                         }
                     }
-                    const int tgt_id_offset = ((batch_id + beam_hyps.ite * beam_hyps.local_batch_size) * k + beam_idx)
+                    int const tgt_id_offset = ((batch_id + beam_hyps.ite * beam_hyps.local_batch_size) * k + beam_idx)
                         * beam_hyps.max_seq_len;
                     beam_hyps.output_ids_tgt[tgt_id_offset + beam_hyps.step] = end_ids[batch_id];
 
                     int prev_id = (topk_tmp_id_buf[batch_id * size + total.p] / vocab_size) % k;
                     for (int j = beam_hyps.step - 1; j >= 0; j--)
                     {
-                        const int src_idx = j * beam_hyps.batch_size * k
+                        int const src_idx = j * beam_hyps.batch_size * k
                             + beam_hyps.ite * beam_hyps.local_batch_size * k + batch_id * k + prev_id;
 
                         beam_hyps.output_ids_tgt[tgt_id_offset + j] = beam_hyps.output_ids_src[src_idx];
                         prev_id = beam_hyps.parent_ids_src[src_idx];
                     }
-                    const int tgt_beam_idx = global_batch_idx * k + beam_idx;
+                    int const tgt_beam_idx = global_batch_idx * k + beam_idx;
                     beam_hyps.sequence_lengths_tgt[tgt_beam_idx] = beam_hyps.step;
                     beam_hyps.normed_scores[tgt_beam_idx] = normed_score;
                     beam_hyps.min_normed_scores[global_batch_idx]
@@ -613,18 +613,18 @@ __global__ void topk_stage_2_opt2_general(const int* __restrict topk_tmp_id_buf,
 
 template <typename T>
 void invokeTopkBeamSearch(void* workspace, size_t& workspace_size, T* log_probs, int* ids, BeamHypotheses* beam_hyps,
-    const bool* finished, const int* sequence_lengths, const int batch_size, const int beam_width,
-    const int vocab_size_padded_, const T diversity_rate, const float length_penalty, const int* end_ids,
+    bool const* finished, int const* sequence_lengths, int const batch_size, int const beam_width,
+    int const vocab_size_padded_, const T diversity_rate, float const length_penalty, int const* end_ids,
     cudaStream_t stream)
 {
     // log_probs: (batch, beam, vocab) cumulative log_probs of beams ending with a
     // token.
-    const int vocab_size = vocab_size_padded_;
+    int const vocab_size = vocab_size_padded_;
     // Beam size should be less than or equal to vocab size.
     assert(beam_width <= vocab_size);
     // Beam search needs the sequence lengths of beams to apply length penalty.
     assert(length_penalty == 0.0f || sequence_lengths != nullptr);
-    const int max_block_per_beam = 8;
+    int const max_block_per_beam = 8;
     int temp_log_probs_buf_size = batch_size * beam_width * vocab_size;                    // type float
     int topk_tmp_ids_buf_size = batch_size * beam_width * beam_width * max_block_per_beam; // type int
     int topk_tmp_val_buf_size = batch_size * beam_width * beam_width * max_block_per_beam; // type float
@@ -685,13 +685,13 @@ void invokeTopkBeamSearch(void* workspace, size_t& workspace_size, T* log_probs,
 #undef CASE_K_DIV
 
 template void invokeTopkBeamSearch(void* workspace, size_t& workspace_size, float* log_probs, int* ids,
-    BeamHypotheses* beam_hyps, const bool* finished, const int* sequence_lengths, const int batch_size,
-    const int beam_width, const int vocab_size_padded_, const float diversity_rate, const float length_penalty,
-    const int* end_ids, cudaStream_t stream);
+    BeamHypotheses* beam_hyps, bool const* finished, int const* sequence_lengths, int const batch_size,
+    int const beam_width, int const vocab_size_padded_, float const diversity_rate, float const length_penalty,
+    int const* end_ids, cudaStream_t stream);
 
 template <typename T>
-__global__ void tileEncoderResults(T* tiled_output, int* tiled_sequence_length, const T* output,
-    const int* sequence_length, const uint32_t batch_size, const uint32_t beam_width, const uint32_t d_model)
+__global__ void tileEncoderResults(T* tiled_output, int* tiled_sequence_length, T const* output,
+    int const* sequence_length, const uint32_t batch_size, const uint32_t beam_width, const uint32_t d_model)
 {
     if (blockIdx.x == 0)
     {
@@ -711,7 +711,7 @@ __global__ void tileEncoderResults(T* tiled_output, int* tiled_sequence_length, 
 }
 
 template <typename T>
-void invokeTileEncoderResults(T* tiled_output, int* tiled_sequence_length, const T* output, const int* sequence_length,
+void invokeTileEncoderResults(T* tiled_output, int* tiled_sequence_length, T const* output, int const* sequence_length,
     const size_t batch_size, const size_t beam_width, const size_t mem_max_seq_len, const size_t d_model,
     cudaStream_t stream)
 {
@@ -739,30 +739,30 @@ void invokeTileEncoderResults(T* tiled_output, int* tiled_sequence_length, const
     }
 }
 
-template void invokeTileEncoderResults(float* tiled_output, int* tiled_sequence_length, const float* output,
-    const int* sequence_length, const size_t batch_size, const size_t beam_width, const size_t mem_max_seq_len,
+template void invokeTileEncoderResults(float* tiled_output, int* tiled_sequence_length, float const* output,
+    int const* sequence_length, const size_t batch_size, const size_t beam_width, const size_t mem_max_seq_len,
     const size_t d_model, cudaStream_t stream);
 
-template void invokeTileEncoderResults(half* tiled_output, int* tiled_sequence_length, const half* output,
-    const int* sequence_length, const size_t batch_size, const size_t beam_width, const size_t mem_max_seq_len,
+template void invokeTileEncoderResults(half* tiled_output, int* tiled_sequence_length, half const* output,
+    int const* sequence_length, const size_t batch_size, const size_t beam_width, const size_t mem_max_seq_len,
     const size_t d_model, cudaStream_t stream);
 
-template void invokeTileEncoderResults(half2* tiled_output, int* tiled_sequence_length, const half2* output,
-    const int* sequence_length, const size_t batch_size, const size_t beam_width, const size_t mem_max_seq_len,
+template void invokeTileEncoderResults(half2* tiled_output, int* tiled_sequence_length, half2 const* output,
+    int const* sequence_length, const size_t batch_size, const size_t beam_width, const size_t mem_max_seq_len,
     const size_t d_model, cudaStream_t stream);
 #ifdef ENABLE_BF16
 template void invokeTileEncoderResults(__nv_bfloat16* tiled_output, int* tiled_sequence_length,
-    const __nv_bfloat16* output, const int* sequence_length, const size_t batch_size, const size_t beam_width,
+    __nv_bfloat16 const* output, int const* sequence_length, const size_t batch_size, const size_t beam_width,
     const size_t mem_max_seq_len, const size_t d_model, cudaStream_t stream);
 #endif
 
-__global__ void insertUnfinishedPath(BeamHypotheses beam_hyps, const FinishedState* finished,
-    const float* cum_log_probs, const int batch_size, const int beam_width)
+__global__ void insertUnfinishedPath(BeamHypotheses beam_hyps, FinishedState const* finished,
+    float const* cum_log_probs, int const batch_size, int const beam_width)
 {
-    const int bid = blockIdx.x;
-    const int tgt_start_idx = beam_hyps.num_beams[bid];
-    const int max_seq_len{beam_hyps.max_seq_len};
-    const float length_penalty{beam_hyps.length_penalties == nullptr ? 1.0f : beam_hyps.length_penalties[bid]};
+    int const bid = blockIdx.x;
+    int const tgt_start_idx = beam_hyps.num_beams[bid];
+    int const max_seq_len{beam_hyps.max_seq_len};
+    float const length_penalty{beam_hyps.length_penalties == nullptr ? 1.0f : beam_hyps.length_penalties[bid]};
     if (beam_hyps.is_done[bid])
     {
         return;
@@ -771,10 +771,10 @@ __global__ void insertUnfinishedPath(BeamHypotheses beam_hyps, const FinishedSta
     {
         if (threadIdx.x == 0)
         {
-            const int src_beam_idx = bid * beam_width + beam_idx;
-            const int tgt_beam_idx = bid * beam_width * 2 + beam_idx + tgt_start_idx;
+            int const src_beam_idx = bid * beam_width + beam_idx;
+            int const tgt_beam_idx = bid * beam_width * 2 + beam_idx + tgt_start_idx;
 
-            const int last_token_idx = beam_hyps.sequence_lengths_src[src_beam_idx] - 1;
+            int const last_token_idx = beam_hyps.sequence_lengths_src[src_beam_idx] - 1;
 
             beam_hyps.output_ids_tgt[tgt_beam_idx * max_seq_len + last_token_idx]
                 = beam_hyps.output_ids_src[src_beam_idx * max_seq_len + last_token_idx];
@@ -810,8 +810,8 @@ __global__ void insertUnfinishedPath(BeamHypotheses beam_hyps, const FinishedSta
     }
 }
 
-void invokeInsertUnfinishedPath(BeamHypotheses beam_hyps, const FinishedState* finished, const float* cum_log_probs,
-    const int batch_size, const int beam_width, cudaStream_t stream)
+void invokeInsertUnfinishedPath(BeamHypotheses beam_hyps, FinishedState const* finished, float const* cum_log_probs,
+    int const batch_size, int const beam_width, cudaStream_t stream)
 {
     insertUnfinishedPath<<<batch_size, 256, 0, stream>>>(beam_hyps, finished, cum_log_probs, batch_size, beam_width);
 }

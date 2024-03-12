@@ -11,7 +11,7 @@
     ```
     The ONNX and TensorRT engine will be generated under `./onnx/visual_encoder` and `./plan/visual_encoder` respectively.
 
-- If you already have an OONX file under `./onnx/visual_encoder` and want to build a TensorRT engine with it, run:
+- If you already have an ONNX file under `./onnx/visual_encoder` and want to build a TensorRT engine with it, run:
     ```bash
     python3 vit_onnx_trt.py --pretrained_model_path ./Qwen-VL-Chat --only_trt
     ```

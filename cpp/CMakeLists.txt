@@ -36,6 +36,7 @@ option(NVTX_DISABLE "Disable all NVTX features" ON)
 option(WARNING_IS_ERROR "Treat all warnings as errors" OFF)
 option(FAST_BUILD "Skip compiling some kernels to accelerate compiling" OFF)
 option(FAST_MATH "Compiling in fast math mode" OFF)
+option(INDEX_RANGE_CHECK "Compiling with index range checks" OFF)
 
 if(NVTX_DISABLE)
   add_compile_definitions("NVTX_DISABLE")
@@ -95,6 +96,11 @@ endif()
 if(FAST_BUILD)
   add_compile_definitions("FAST_BUILD")
   message(WARNING "Skip some kernels to accelerate compilation")
+endif()
+
+if(INDEX_RANGE_CHECK)
+  add_compile_definitions("INDEX_RANGE_CHECK")
+  message(WARNING "Check index range to detect OOB accesses")
 endif()
 
 # Determine CUDA version before enabling the language extension
@@ -162,10 +168,6 @@ message(STATUS "    version: ${CUDAToolkit_VERSION}")
 message(STATUS "    libraries: ${CUDAToolkit_LIBRARY_DIR}")
 message(STATUS "    include path: ${CUDAToolkit_INCLUDE_DIRS}")
 
-find_library(
-  CUDNN_LIB cudnn
-  HINTS ${CUDNN_ROOT_DIR} ${CUDAToolkit_LIBRARY_DIR}
-  PATH_SUFFIXES lib64 lib lib/x64)
 set(CUBLAS_LIB CUDA::cublas)
 set(CUBLASLT_LIB CUDA::cublasLt)
 set(CUDA_DRV_LIB CUDA::cuda_driver)

@@ -236,14 +236,7 @@ def parse_arguments():
         'For FP8 PTQ, the downside is slight reduction of accuracy because one of the quantization scaling factors are discarded '
         '(0.45734 vs 0.45755 for LLaMA-v2 7B using ammo/examples/hf/instruct_eval/mmlu.py).'
     )
-    parser.add_argument(
-        '--dense_context_fmha',
-        default=False,
-        action='store_true',
-        help=
-        'Enable dense fmha in context phase, otherwise sliding window attention.'
-        'If dense_context_fmha=False, the sliding window size is the max attention window size.'
-    )
+
     # Arguments related to the quantization of the model.
     parser.add_argument(
         '--use_smooth_quant',
@@ -541,8 +534,7 @@ def get_model_object(args, mapping, trt_dtype=None):
         quant_mode=args.quant_mode,
         rms_norm_eps=args.rms_norm_eps,
         use_fused_mlp=args.use_fused_mlp,
-        use_prompt_tuning=args.max_prompt_embedding_table_size > 0,
-        dense_context_fmha=args.dense_context_fmha)
+        use_prompt_tuning=args.max_prompt_embedding_table_size > 0)
     quantize_kwargs = {}
     if args.use_smooth_quant or args.use_weight_only:
         if args.weight_only_precision == 'int4_awq':

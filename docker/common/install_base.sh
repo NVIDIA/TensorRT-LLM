@@ -24,7 +24,8 @@ init_ubuntu() {
     python3-dev \
     python3-pip \
     python-is-python3 \
-    wget
+    wget \
+    pigz
   if ! command -v mpirun &> /dev/null; then
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openmpi-bin libopenmpi-dev
   fi
@@ -92,7 +93,7 @@ install_devtoolset_centos() {
   YUM_CUDA=${CUDA_VERSION/./-}
   # Consistent with manylinux2014 centos-7 based version
   yum -y install vim wget git-lfs rh-git227 devtoolset-10 libffi-devel
-  yum -y install openmpi3 openmpi3-devel
+  yum -y install openmpi3 openmpi3-devel pigz
   echo "source scl_source enable rh-git227" >> "${ENV}"
   echo "source scl_source enable devtoolset-10" >> "${DEVTOOLSET_ENV_FILE}"
   echo "source ${DEVTOOLSET_ENV_FILE}" >> "${ENV}"

@@ -20,8 +20,8 @@
 namespace tensorrt_llm::runtime::lora
 {
 
-void loraValidateRequestTensorDims(const std::optional<ITensor::SharedPtr>& optReqLoraWeights,
-    const std::optional<ITensor::SharedPtr>& optReqLoraConfig)
+void loraValidateRequestTensorDims(std::optional<ITensor::SharedPtr> const& optReqLoraWeights,
+    std::optional<ITensor::SharedPtr> const& optReqLoraConfig)
 {
     TLLM_CHECK_WITH_INFO(optReqLoraWeights.has_value() && optReqLoraConfig.has_value(),
         "Request for LoRA inference must have both lora_weights and lora_keys");
@@ -50,8 +50,8 @@ void loraValidateRequestTensorDims(const std::optional<ITensor::SharedPtr>& optR
         keys->getShape().d[2] == expectedLoraConfigValues, "Expected dim2 of lora_keys to have a size of 3");
 }
 
-void loraValidateRequestTensors(const std::optional<ITensor::SharedPtr>& optReqLoraWeights,
-    const std::optional<ITensor::SharedPtr>& optReqLoraConfig, runtime::GptModelConfig const& modelConfig,
+void loraValidateRequestTensors(std::optional<ITensor::SharedPtr> const& optReqLoraWeights,
+    std::optional<ITensor::SharedPtr> const& optReqLoraConfig, runtime::GptModelConfig const& modelConfig,
     runtime::WorldConfig const& worldConfig)
 {
     SizeType constexpr expectedLoraConfigValues = 3;

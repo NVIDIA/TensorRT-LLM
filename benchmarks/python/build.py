@@ -648,9 +648,12 @@ def build_gpt(args):
                 'tp_size': world_size,
             },
         }
+
         config = PretrainedConfig.from_dict(config)
         tensorrt_llm_model = tensorrt_llm.models.BaichuanForCausalLM(config)
     elif family == "internlm":
+        quant_algo, kv_cache_quant_algo = get_quant_algo(args.quantization)
+
         config = {
             'architecture':
             'LLaMAForCausalLM',
@@ -673,8 +676,10 @@ def build_gpt(args):
             build_config['n_positions'],
             'hidden_act':
             build_config['hidden_act'],
-            'quantization':
-            quant_mode.to_dict(),
+            'quantization': {
+                'quant_algo': quant_algo,
+                'kv_cache_quant_algo': kv_cache_quant_algo
+            },
             'mapping': {
                 'world_size': world_size,
                 'tp_size': world_size
@@ -696,6 +701,7 @@ def build_gpt(args):
                     "has_zero_point": True,
                     "pre_quant_scale": False,
                 })
+
         config = PretrainedConfig.from_dict(config)
         tensorrt_llm_model = tensorrt_llm.models.LLaMAForCausalLM(config)
     elif family == "qwen":
@@ -1038,6 +1044,7 @@ def enc_dec_build_helper(component, config, args):
               or quant_mode.is_int8_weight_only()),
         quant_mode=quant_mode,
         n_mels=n_mels,
+        skip_cross_qkv=config['skip_cross_qkv'],
     )
 
     # build engine

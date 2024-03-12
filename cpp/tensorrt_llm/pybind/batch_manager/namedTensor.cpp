@@ -29,7 +29,7 @@ namespace tb = tensorrt_llm::batch_manager;
 namespace tensorrt_llm::pybind::batch_manager
 {
 
-NamedTensor::NamedTensor(const tb::NamedTensor& cppNamedTensor)
+NamedTensor::NamedTensor(tb::NamedTensor const& cppNamedTensor)
     : Base(runtime::Torch::tensor(cppNamedTensor.tensor), cppNamedTensor.name)
 {
 }

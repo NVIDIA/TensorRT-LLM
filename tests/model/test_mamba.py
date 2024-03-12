@@ -35,10 +35,13 @@ from tensorrt_llm.layers.ssm import MambaParameters
 from tensorrt_llm.network import net_guard
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
+
 from examples.mamba.convert_checkpoint import (convert_from_hf_checkpoint,
                                                convert_hf_mamba)
-from tests.utils.llm_data import llm_models_root
-from tests.utils.util import getSMVersion
+
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.llm_data import llm_models_root
+from utils.util import skip_bf16_pre_ampere, unittest_name_func
 
 
 class TestMamba(unittest.TestCase):
@@ -78,7 +81,7 @@ class TestMamba(unittest.TestCase):
             network.set_named_parameters(tensorrt_llm_mamba.named_parameters())
             inputs = tensorrt_llm_mamba.prepare_inputs(batch_size,
                                                        input_len,
-                                                       output_len,
+                                                       input_len + output_len,
                                                        use_cache=False)
             # Prepare
             tensorrt_llm_mamba(**inputs)
@@ -125,13 +128,11 @@ class TestMamba(unittest.TestCase):
         (False, 'float16'),
         (True, 'bfloat16'),
         (False, 'bfloat16'),
-    ])
+    ],
+                          name_func=unittest_name_func)
     def test_mamba(self, gemm_plugin, dtype):
         # Skip tests that are not supported in pre-ampere architecture
-        if getSMVersion() < 80:
-            if dtype == 'bfloat16':
-                pytest.skip(
-                    "bfloat16 is not supported in pre-ampere architecture")
+        skip_bf16_pre_ampere(dtype)
 
         RANDOM_SEEDS = [1, 4, 5, 8]
         seed_idx = random.randint(0, len(RANDOM_SEEDS) - 1)
@@ -160,10 +161,16 @@ class TestMamba(unittest.TestCase):
         mamba_d_inner = hf_mamba.backbone.layers[0].mixer.d_inner
         mamba_d_conv = hf_mamba.backbone.layers[0].mixer.d_conv
         mamba_d_state = hf_mamba.backbone.layers[0].mixer.d_state
-        conv_state_shape = (
+        ctx_conv_state_shape = (
             batch_size,
             mamba_d_inner,
-            mamba_d_conv - 1,
+            mamba_d_conv - 1 + input_len,
+        )
+
+        gen_conv_state_shape = (
+            batch_size,
+            mamba_d_inner,
+            mamba_d_conv,
         )
 
         ssm_state_shape = (
@@ -176,11 +183,11 @@ class TestMamba(unittest.TestCase):
         present_ssm_states = []
         for _ in range(hf_config.n_layer):
             present_conv_states.append(
-                torch.zeros(conv_state_shape,
+                torch.zeros(ctx_conv_state_shape,
                             dtype=str_dtype_to_torch(dtype),
                             device='cuda'))
             present_conv_states_1.append(
-                torch.empty(conv_state_shape,
+                torch.empty(gen_conv_state_shape,
                             dtype=str_dtype_to_torch(dtype),
                             device='cuda'))
             present_ssm_states.append(
@@ -209,8 +216,12 @@ class TestMamba(unittest.TestCase):
             'host_request_types': ctx_host_request_types,
         }
         for idx in range(hf_config.n_layer):
-            ctx_buffer[f'past_conv_state_{idx}'] = present_conv_states[idx]
-            ctx_buffer[f'present_conv_state_{idx}'] = present_conv_states_1[idx]
+            conv_state_shape = (batch_size, mamba_d_inner, mamba_d_conv - 1)
+            conv_state = torch.zeros(conv_state_shape,
+                                     dtype=str_dtype_to_torch(dtype),
+                                     device='cuda')
+            ctx_buffer[f'past_conv_state_{idx}'] = conv_state
+            ctx_buffer[f'present_conv_state_{idx}'] = present_conv_states[idx]
             ctx_buffer[f'past_ssm_state_{idx}'] = present_ssm_states[idx]
             ctx_buffer[f'present_ssm_state_{idx}'] = present_ssm_states[idx]
         ctx_shape = {k: v.shape for k, v in ctx_buffer.items()}
@@ -245,8 +256,9 @@ class TestMamba(unittest.TestCase):
             'host_request_types': gen_host_request_types,
         }
         for idx in range(hf_config.n_layer):
-            step1_buffer[f'past_conv_state_{idx}'] = present_conv_states_1[idx]
-            step1_buffer[f'present_conv_state_{idx}'] = present_conv_states[idx]
+            step1_buffer[f'past_conv_state_{idx}'] = present_conv_states[idx]
+            step1_buffer[f'present_conv_state_{idx}'] = present_conv_states_1[
+                idx]
             step1_buffer[f'past_ssm_state_{idx}'] = present_ssm_states[idx]
             step1_buffer[f'present_ssm_state_{idx}'] = present_ssm_states[idx]
         step1_shape = {k: v.shape for k, v in step1_buffer.items()}
@@ -265,7 +277,8 @@ class TestMamba(unittest.TestCase):
     @parameterized.expand([
         ('mamba-130m', 'from_checkpoint'),
         ('mamba-130m', 'from_model'),
-    ])
+    ],
+                          name_func=unittest_name_func)
     def test_loaders(self, path, load_mode):
         model_root = llm_models_root()
         if model_root is None:

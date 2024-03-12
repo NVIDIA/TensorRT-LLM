@@ -177,18 +177,6 @@ def parse_arguments():
         default=1,
         help='The number of workers for converting checkpoint in parallel')
 
-    parser.add_argument('--enable_pos_shift',
-                        default=False,
-                        action='store_true',
-                        help='Enable position shift for streamingllm method')
-    parser.add_argument(
-        '--dense_context_fmha',
-        default=False,
-        action='store_true',
-        help=
-        'Enable dense fmha in context phase, otherwise sliding window attention.'
-        'If dense_context_fmha=False, the sliding window size is the max attention window size.'
-    )
     parser.add_argument('--num_medusa_heads', type=int, default=4)
     parser.add_argument(
         '--fixed_num_medusa_heads',
@@ -1140,7 +1128,6 @@ if __name__ == '__main__':
         'quantization': {
             'quant_algo': None,
             'kv_cache_quant_algo': None,
-            "sq_use_plugin": True,
         },
         'mapping': {
             'world_size': world_size,
@@ -1151,8 +1138,6 @@ if __name__ == '__main__':
         'embedding_sharding_dim': args.embedding_sharding_dim,
         'share_embedding_table': args.use_embedding_sharing,
         'use_prompt_tuning': args.use_prompt_tuning,
-        'enable_pos_shift': args.enable_pos_shift,
-        'dense_context_fmha': args.dense_context_fmha,
         'max_draft_len': args.max_medusa_token_len,
         'num_medusa_heads': args.num_medusa_heads,
         'num_medusa_layers': args.num_medusa_layers

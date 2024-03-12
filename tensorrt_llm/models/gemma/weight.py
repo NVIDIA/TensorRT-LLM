@@ -21,14 +21,13 @@ from typing import Dict, List, Optional, Union
 import numpy as np
 import torch
 
-import tensorrt_llm
-from tensorrt_llm._utils import (numpy_to_torch, pad_vocab_size,
-                                 str_dtype_to_torch, torch_to_numpy)
-from tensorrt_llm.layers import MoeConfig
-from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.quantized.quant import get_dummy_quant_scales
-from tensorrt_llm.quantization import QuantMode
-from tensorrt_llm.runtime.lora_manager import LoraConfig
+from ..._utils import (numpy_to_torch, pad_vocab_size, str_dtype_to_torch,
+                       torch_to_numpy)
+from ...logger import logger
+from ...lora_manager import LoraConfig
+from ...mapping import Mapping
+from ...quantization import QuantMode
+from ..quantized.quant import get_dummy_quant_scales
 
 
 def get_scaling_factors(
@@ -68,9 +67,8 @@ def get_scaling_factors(
     """
 
     if model_path is None:
-        tensorrt_llm.logger.warning(
-            f"--quantized_fp8_model_path not specified. "
-            f"Initialize quantization scales automatically.")
+        logger.warning(f"--quantized_fp8_model_path not specified. "
+                       f"Initialize quantization scales automatically.")
         return get_dummy_quant_scales(num_layers)
     weight_dict = np.load(model_path)
     # yapf: disable
@@ -198,7 +196,7 @@ def load_from_binary(tensorrt_llm_gemma,
                      mapping=Mapping(),
                      fp16=False,
                      multi_query_mode=False):
-    tensorrt_llm.logger.info('Loading weights from binary...')
+    logger.info('Loading weights from binary...')
     tik = time.time()
 
     quant_mode = getattr(tensorrt_llm_gemma, 'quant_mode', QuantMode(0))
@@ -488,7 +486,7 @@ def load_from_binary(tensorrt_llm_gemma,
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
-    tensorrt_llm.logger.info(f'Weights loaded. Total time: {t}')
+    logger.info(f'Weights loaded. Total time: {t}')
 
 
 def load_from_hf_gemma(tensorrt_llm_llama: 'GemmaForCausalLM',
@@ -497,7 +495,7 @@ def load_from_hf_gemma(tensorrt_llm_llama: 'GemmaForCausalLM',
                        dtype='float32',
                        use_gemm_woq_plugin=True,
                        lora_config=LoraConfig()):
-    tensorrt_llm.logger.info('Loading weights from HF Gemma...')
+    logger.info('Loading weights from HF Gemma...')
     tik = time.time()
 
     quant_mode = getattr(tensorrt_llm_llama, 'quant_mode', QuantMode(0))
@@ -531,40 +529,6 @@ def load_from_hf_gemma(tensorrt_llm_llama: 'GemmaForCausalLM',
             qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
 
         model_params[prefix + 'qkv_proj.weight'] = qkv_weight
-
-    moe_config = MoeConfig(tensorrt_llm_llama.config.moe_num_experts,
-                           tensorrt_llm_llama.config.moe_top_k,
-                           tensorrt_llm_llama.config.moe_tp_mode,
-                           tensorrt_llm_llama.config.moe_normalization_mode)
-    # concatenate MoE gated activations & stack experts
-    for l in range(hf_gemma.config.num_hidden_layers):
-
-        if not moe_config.has_moe():
-            continue
-
-        rank_experts = list(range(moe_config.num_experts))
-        if moe_config.tp_mode == moe_config.ParallelismMode.EXPERT_PARALLEL:
-            rank_experts = mapping.ep_experts(moe_config.num_experts)
-        for suffix in ["w1", "w2", "w3"]:
-            model_params[f'model.layers.{l}.block_sparse_moe.experts.{suffix}.weight'] = \
-                torch.stack(list(model_params[f'model.layers.{l}.block_sparse_moe.experts.{expert}.{suffix}.weight']
-                                 for expert in rank_experts))
-
-        w3 = model_params[
-            f'model.layers.{l}.block_sparse_moe.experts.w3.weight']
-        w2 = model_params[
-            f'model.layers.{l}.block_sparse_moe.experts.w2.weight']
-        w1 = model_params[
-            f'model.layers.{l}.block_sparse_moe.experts.w1.weight']
-        if moe_config.tp_mode == moe_config.ParallelismMode.TENSOR_PARALLEL:
-            w3 = split(w3, mapping.tp_size, mapping.tp_rank, dim=1)
-            w2 = split(w2, mapping.tp_size, mapping.tp_rank, dim=2)
-            w1 = split(w1, mapping.tp_size, mapping.tp_rank, dim=1)
-        # concat w3 and w1 for gated expert
-        model_params[f'model.layers.{l}.block_sparse_moe.experts.w3w1.weight'] = \
-            torch.concat([w3, w1], dim=-2)
-        model_params[
-            f'model.layers.{l}.block_sparse_moe.experts.w2.weight'] = w2
 
     torch_dtype = str_dtype_to_torch(dtype)
     layers_range = mapping.pp_layers(hf_gemma.config.num_hidden_layers)
@@ -799,7 +763,7 @@ def load_from_hf_gemma(tensorrt_llm_llama: 'GemmaForCausalLM',
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
-    tensorrt_llm.logger.info(f'Weights loaded. Total time: {t}')
+    logger.info(f'Weights loaded. Total time: {t}')
     return weights
 
 
@@ -844,7 +808,7 @@ def load_from_fp8_llama(quant_ckpt_path: str, num_layers: int, mapping: Mapping,
         fp8_llama = np.load(quant_ckpt_path)
     else:
         fp8_llama = None
-        tensorrt_llm.logger.info(
+        logger.info(
             f"There is not quantized checkpoint, use dummy fp8 scaling factors instead."
         )
     weights = {}

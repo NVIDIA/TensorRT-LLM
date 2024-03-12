@@ -81,8 +81,8 @@ void splitkGroupedGemm_(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std
     using LayoutB = cutlass::layout::ColumnMajor;
     using LayoutC = cutlass::layout::RowMajor;
 
-    const int kAlignmentA = 8;
-    const int kAlignmentB = 8;
+    int const kAlignmentA = 8;
+    int const kAlignmentB = 8;
 
     int problem_count = problem_sizes.size();
 

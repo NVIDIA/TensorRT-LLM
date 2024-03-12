@@ -58,7 +58,7 @@ struct BlockPrefixCallbackOp
 
 template <int THREADS_PER_BLOCK>
 __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqOffsets(
-    int* seqOffsets, const int* seqLengths, int batchSize)
+    int* seqOffsets, int const* seqLengths, int batchSize)
 {
     // The implementation of the parallel scan in the thread block (see CUB for details).
     using BlockScan = cub::BlockScan<int, THREADS_PER_BLOCK>;
@@ -108,7 +108,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqOffsets(
 //
 // That kernel uses a grid of batchSize blocks.
 
-__global__ void computePaddingOffsets(int* paddingOffsets, const int* seqOffsets, int maxSeqLength)
+__global__ void computePaddingOffsets(int* paddingOffsets, int const* seqOffsets, int maxSeqLength)
 {
     // The index of the sequence in the batch.
     int batchIdx = blockIdx.x;
@@ -133,7 +133,7 @@ __global__ void computePaddingOffsets(int* paddingOffsets, const int* seqOffsets
 // This kernel computes the attention mask. We must compute this on-the-fly in the future.
 
 template <typename AttentionMaskDataType>
-__global__ void computeAttentionMask(AttentionMaskDataType* attentionMask, const int* seqOffsets, int maxSeqLength,
+__global__ void computeAttentionMask(AttentionMaskDataType* attentionMask, int const* seqOffsets, int maxSeqLength,
     int attentionWindowSize, AttentionMaskType attentionMaskType)
 {
     // The index of the sequence in the batch.
@@ -221,10 +221,10 @@ __global__ void computeAttentionMask(AttentionMaskDataType* attentionMask, const
 }
 
 template <typename T>
-void invokeBuildDecoderInfo(const BuildDecoderInfoParams<T>& params, cudaStream_t stream)
+void invokeBuildDecoderInfo(BuildDecoderInfoParams<T> const& params, cudaStream_t stream)
 {
     // Compute the sequence offsets.
-    const int THREADS_PER_BLOCK = 256;
+    int const THREADS_PER_BLOCK = 256;
     computeSeqOffsets<THREADS_PER_BLOCK>
         <<<1, THREADS_PER_BLOCK, 0, stream>>>(params.seqQOffsets, params.seqQLengths, params.batchSize);
     if (params.seqKVLengths)
@@ -240,7 +240,7 @@ void invokeBuildDecoderInfo(const BuildDecoderInfoParams<T>& params, cudaStream_
     // Compute the attention mask, if needed.
     if (params.attentionMask != nullptr)
     {
-        const int MIN_BLOCKS = 512;
+        int const MIN_BLOCKS = 512;
         int blocksPerSeq = 16;
         while (blocksPerSeq * params.batchSize < MIN_BLOCKS)
         {
@@ -252,16 +252,16 @@ void invokeBuildDecoderInfo(const BuildDecoderInfoParams<T>& params, cudaStream_
     }
 }
 
-template void invokeBuildDecoderInfo(const BuildDecoderInfoParams<float>&, cudaStream_t);
-template void invokeBuildDecoderInfo(const BuildDecoderInfoParams<half>&, cudaStream_t);
+template void invokeBuildDecoderInfo(BuildDecoderInfoParams<float> const&, cudaStream_t);
+template void invokeBuildDecoderInfo(BuildDecoderInfoParams<half> const&, cudaStream_t);
 #ifdef ENABLE_BF16
-template void invokeBuildDecoderInfo(const BuildDecoderInfoParams<__nv_bfloat16>&, cudaStream_t);
+template void invokeBuildDecoderInfo(BuildDecoderInfoParams<__nv_bfloat16> const&, cudaStream_t);
 #endif
 #ifdef ENABLE_FP8
-template void invokeBuildDecoderInfo(const BuildDecoderInfoParams<__nv_fp8_e4m3>&, cudaStream_t);
+template void invokeBuildDecoderInfo(BuildDecoderInfoParams<__nv_fp8_e4m3> const&, cudaStream_t);
 #endif
 
-__global__ void updatePaddingCountKernel(int* paddingPerSeq, const int* seqLengths, int maxSeqLength, int batchSize)
+__global__ void updatePaddingCountKernel(int* paddingPerSeq, int const* seqLengths, int maxSeqLength, int batchSize)
 {
 
     for (int ii = threadIdx.x; ii < batchSize; ii += blockDim.x)

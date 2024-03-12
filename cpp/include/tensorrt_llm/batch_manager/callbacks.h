@@ -29,9 +29,9 @@ class InferenceRequest;
 class NamedTensor;
 
 using GetInferenceRequestsCallback = std::function<std::list<std::shared_ptr<InferenceRequest>>(int32_t)>;
-using SendResponseCallback = std::function<void(uint64_t, std::list<NamedTensor> const&, bool, const std::string&)>;
+using SendResponseCallback = std::function<void(uint64_t, std::list<NamedTensor> const&, bool, std::string const&)>;
 using PollStopSignalCallback = std::function<std::unordered_set<uint64_t>()>;
 // json of stats as a string
-using ReturnBatchManagerStatsCallback = std::function<void(const std::string&)>;
+using ReturnBatchManagerStatsCallback = std::function<void(std::string const&)>;
 
 } // namespace tensorrt_llm::batch_manager

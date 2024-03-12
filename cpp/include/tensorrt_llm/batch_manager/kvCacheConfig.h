@@ -50,6 +50,13 @@ public:
     {
     }
 
+    bool operator==(KvCacheConfig const& other) const
+    {
+        return maxTokens == other.maxTokens && maxAttentionWindow == other.maxAttentionWindow
+            && sinkTokenLength == other.sinkTokenLength && freeGpuMemoryFraction == other.freeGpuMemoryFraction
+            && enableBlockReuse == other.enableBlockReuse && useUvm == other.useUvm;
+    }
+
     std::optional<SizeType> maxTokens;
     std::optional<SizeType> maxAttentionWindow;
     std::optional<SizeType> sinkTokenLength;

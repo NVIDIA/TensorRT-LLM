@@ -12,17 +12,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
-import sys
 import unittest
 
 import numpy as np
-import pytest
 
 # isort: off
 import torch
 import tensorrt as trt
 # isort: on
+import os
+import sys
+
 from parameterized import parameterized
 from polygraphy.backend.trt import CreateConfig, EngineFromNetwork, TrtRunner
 
@@ -30,7 +30,7 @@ import tensorrt_llm
 from tensorrt_llm import Tensor
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import getSMVersion
+from utils.util import skip_bf16_pre_ampere, unittest_name_func
 
 
 class TestMatmul(unittest.TestCase):
@@ -107,18 +107,16 @@ class TestMatmul(unittest.TestCase):
                            ('float16', True, False), ('float16', True, True),
                            ('bfloat16', True, False), ('bfloat16', True, True),
                            ('float32', False, False), ('float32', False, True),
-                           ('float32', True, False), ('float32', True, True)])
+                           ('float32', True, False), ('float32', True, True)],
+                          name_func=unittest_name_func)
     def test_matmul(self, dtype, transa, transb):
+        # Skip tests that are not supported in pre-ampere architecture
+        skip_bf16_pre_ampere(dtype)
+
         bs = 2
         inseq = 16
         hidden_size = 768
         tp = 1
-
-        # Skip tests that are not supported in pre-ampere architecture
-        if getSMVersion() < 80:
-            if dtype == 'bfloat16':
-                pytest.skip(
-                    "bfloat16 is not supported in pre-ampere architecture")
 
         # qkv_gemm
         self._matmul(bs * inseq, 3 * hidden_size // tp, hidden_size, dtype,

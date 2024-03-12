@@ -63,13 +63,13 @@ public:
         return (uint64_t) s << 32 | d;
     }
 
-    virtual uint64_t hashID(const KernelMeta& kernelMeta) const
+    virtual uint64_t hashID(KernelMeta const& kernelMeta) const
     {
         return hashID(kernelMeta.mS, kernelMeta.mD);
     }
 
     TFusedMultiHeadAttentionXMMAKernel(
-        const TKernelMeta* pMetaStart, unsigned int nMetaCount, Data_type type, unsigned int sm)
+        TKernelMeta const* pMetaStart, unsigned int nMetaCount, Data_type type, unsigned int sm)
         : mDataType(type)
         , mKernelMeta(pMetaStart)
         , mKernelMetaCount(nMetaCount)
@@ -86,7 +86,7 @@ public:
 
         for (unsigned int i = 0; i < mKernelMetaCount; ++i)
         {
-            const auto& kernelMeta = mKernelMeta[i];
+            auto const& kernelMeta = mKernelMeta[i];
             if (kernelMeta.mSM == mSM && kernelMeta.mDataType == mDataType)
             {
                 CUmodule hmod{0};
@@ -125,9 +125,9 @@ public:
 
     virtual void run(TKernelParam& params, Launch_params& launch_params, cudaStream_t ss) const
     {
-        const auto findIter = mFunctions.find(hashID(params.s, params.d));
+        auto const findIter = mFunctions.find(hashID(params.s, params.d));
 
-        const auto& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
+        auto const& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
         const CUfunction func = findIter->second.mDeviceFunction;
 
         void* kernelParams[] = {&params, nullptr};
@@ -142,10 +142,10 @@ protected:
     tensorrt_llm::common::CUDADriverWrapper mDriver;
 
     Data_type mDataType;
-    const TKernelMeta* mKernelMeta;
+    TKernelMeta const* mKernelMeta;
     unsigned int mKernelMetaCount;
     unsigned int mSM;
-    std::unordered_map<const unsigned char*, CUmodule> mModules;
+    std::unordered_map<unsigned char const*, CUmodule> mModules;
 
     struct FusedMultiHeadAttentionKernelInfo
     {
@@ -161,14 +161,14 @@ template <typename TFusedMHAKernelList>
 class TFusedMHAKernelFactory
 {
 public:
-    const TFusedMHAKernelList* getXMMAKernels(const typename TFusedMHAKernelList::KernelMeta* pKernelList,
+    TFusedMHAKernelList const* getXMMAKernels(const typename TFusedMHAKernelList::KernelMeta* pKernelList,
         unsigned int nbKernels, Data_type type, unsigned int sm)
     {
         static std::mutex s_mutex;
         std::lock_guard<std::mutex> lg(s_mutex);
 
-        const auto id = hashID(type, sm);
-        const auto findIter = mKernels.find(id);
+        auto const id = hashID(type, sm);
+        auto const findIter = mKernels.find(id);
         if (findIter == mKernels.end())
         {
             TFusedMHAKernelList* newKernel = new TFusedMHAKernelList{pKernelList, nbKernels, type, sm};
@@ -214,7 +214,7 @@ class FusedMultiHeadAttentionXMMAKernelV2
           Fused_multihead_attention_params_v2>
 {
 public:
-    FusedMultiHeadAttentionXMMAKernelV2(const FusedMultiHeadAttentionKernelMetaInfoV2* pMetaStart,
+    FusedMultiHeadAttentionXMMAKernelV2(FusedMultiHeadAttentionKernelMetaInfoV2 const* pMetaStart,
         unsigned int nMetaCount, Data_type type, unsigned int sm)
         : TFusedMultiHeadAttentionXMMAKernel<FusedMultiHeadAttentionKernelMetaInfoV2,
             Fused_multihead_attention_params_v2>(pMetaStart, nMetaCount, type, sm)
@@ -231,7 +231,7 @@ public:
             | (interleaved ? 2ull : 0ull) | (unroll ? 1ull : 0ull);
     }
 
-    virtual uint64_t hashID(const KernelMeta& kernelMeta) const
+    virtual uint64_t hashID(KernelMeta const& kernelMeta) const
     {
 
         return hashID(kernelMeta.mS, kernelMeta.mD, kernelMeta.mInterleaved, kernelMeta.mUnrollStep,
@@ -278,7 +278,7 @@ public:
             }
         }
 
-        const auto findIter
+        auto const findIter
             = mFunctions.find(hashID(launch_params.kernel_s, params.d, launch_params.interleaved, forceUnroll,
                 launch_params.force_fp32_acc, launch_params.flash_attention, !launch_params.useKernelWithoutAlibi,
                 static_cast<int>(launch_params.attention_mask_type), launch_params.granular_tiling));
@@ -290,7 +290,7 @@ public:
             launch_params.flash_attention, !launch_params.useKernelWithoutAlibi,
             static_cast<int>(launch_params.attention_mask_type), launch_params.granular_tiling);
 
-        const auto& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
+        auto const& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
         const CUfunction func = findIter->second.mDeviceFunction;
 
         void* kernelParams[] = {&params, nullptr};
@@ -369,7 +369,7 @@ public:
 
 using FusedMHAKernelFactoryV2 = TFusedMHAKernelFactory<FusedMultiHeadAttentionXMMAKernelV2>;
 
-inline const FusedMultiHeadAttentionXMMAKernelV2* getXMMAKernelsV2(Data_type type, unsigned int sm)
+inline FusedMultiHeadAttentionXMMAKernelV2 const* getXMMAKernelsV2(Data_type type, unsigned int sm)
 {
     return FusedMHAKernelFactoryV2::Get().getXMMAKernels(
         sMhaKernelMetaInfosV2, sizeof(sMhaKernelMetaInfosV2) / sizeof(sMhaKernelMetaInfosV2[0]), type, sm);
@@ -384,7 +384,7 @@ class FusedMultiHeadAttentionPagedKVXMMAKernelV2
           Fused_multihead_attention_paged_kv_params_v2>
 {
 public:
-    FusedMultiHeadAttentionPagedKVXMMAKernelV2(const FusedMultiHeadAttentionPagedKVKernelMetaInfoV2* pMetaStart,
+    FusedMultiHeadAttentionPagedKVXMMAKernelV2(FusedMultiHeadAttentionPagedKVKernelMetaInfoV2 const* pMetaStart,
         unsigned int nMetaCount, Data_type type, unsigned int sm)
         : TFusedMultiHeadAttentionXMMAKernel<FusedMultiHeadAttentionPagedKVKernelMetaInfoV2,
             Fused_multihead_attention_paged_kv_params_v2>(pMetaStart, nMetaCount, type, sm)
@@ -402,7 +402,7 @@ public:
             | (flash_attention ? 4ull : 0ull) | (interleaved ? 2ull : 0ull) | (unroll ? 1ull : 0ull);
     }
 
-    virtual uint64_t hashID(const KernelMeta& kernelMeta) const
+    virtual uint64_t hashID(KernelMeta const& kernelMeta) const
     {
         return hashID(kernelMeta.mS, kernelMeta.mD, kernelMeta.mInterleaved, kernelMeta.mUnrollStep,
             kernelMeta.mFP32Accumulation, kernelMeta.mFlashAttention, kernelMeta.mWarpSpecialization,
@@ -413,7 +413,7 @@ public:
         Fused_multihead_attention_paged_kv_params_v2& params, Launch_params& launch_params, cudaStream_t stream) const
     {
 
-        const auto findIter = mFunctions.find(hashID(launch_params.kernel_s, params.d, launch_params.interleaved,
+        auto const findIter = mFunctions.find(hashID(launch_params.kernel_s, params.d, launch_params.interleaved,
             launch_params.force_unroll, launch_params.force_fp32_acc, launch_params.flash_attention,
             launch_params.warp_specialization, !launch_params.useKernelWithoutAlibi,
             static_cast<int>(launch_params.attention_mask_type), launch_params.granular_tiling));
@@ -426,7 +426,7 @@ public:
             !launch_params.useKernelWithoutAlibi, static_cast<int>(launch_params.attention_mask_type),
             launch_params.granular_tiling);
 
-        const auto& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
+        auto const& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
         const CUfunction func = findIter->second.mDeviceFunction;
 
         void* kernelParams[] = {&params, nullptr};
@@ -488,7 +488,7 @@ public:
 
 using FusedMHAPagedKVKernelFactoryV2 = TFusedMHAKernelFactory<FusedMultiHeadAttentionPagedKVXMMAKernelV2>;
 
-inline const FusedMultiHeadAttentionPagedKVXMMAKernelV2* getPagedKVXMMAKernelsV2(Data_type type, unsigned int sm)
+inline FusedMultiHeadAttentionPagedKVXMMAKernelV2 const* getPagedKVXMMAKernelsV2(Data_type type, unsigned int sm)
 {
     return FusedMHAPagedKVKernelFactoryV2::Get().getXMMAKernels(sMhaPagedKVKernelMetaInfosV2,
         sizeof(sMhaPagedKVKernelMetaInfosV2) / sizeof(sMhaPagedKVKernelMetaInfosV2[0]), type, sm);

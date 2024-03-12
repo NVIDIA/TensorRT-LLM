@@ -4,31 +4,16 @@ import os
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
-from typing import Optional
 
 import safetensors
-import torch
-from datasets import load_dataset
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 import tensorrt_llm
 from tensorrt_llm.layers import MoeConfig
-from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.llama.convert import (capture_activation_range,
-                                               convert_hf_llama,
-                                               smooth_llama_model)
-from tensorrt_llm.models.llama.weight import (load_from_gptq_llama,
-                                              load_from_hf_checkpoint,
-                                              load_from_meta_llama)
-from tensorrt_llm.models.modeling_utils import PretrainedConfig
-from tensorrt_llm.runtime.lora_manager import LoraConfig
-
-try:
-    from transformers import LlavaConfig, LlavaForConditionalGeneration
-except ImportError:
-    pass
+from tensorrt_llm.models import LLaMAForCausalLM
+from tensorrt_llm.models.llama.convert import (create_config_from_hugging_face,
+                                               from_hugging_face, quantize)
+from tensorrt_llm.models.llama.weight import load_from_gptq_llama
 
 
 def parse_arguments():
@@ -134,18 +119,13 @@ def parse_arguments():
     parser.add_argument('--hidden_act', type=str, default='silu')
 
     parser.add_argument('--rotary_base', type=float, default=10000.0)
-    parser.add_argument('--rotary_scaling', nargs=2, type=str, default=None)
 
     parser.add_argument('--group_size',
                         type=int,
                         default=128,
-                        help='Group size used in GPTQ/AWQ quantization.')
+                        help='Group size used in GPTQ quantization.'
+                        )  # AWQ is only supported by quantize.py script
 
-    parser.add_argument("--storage-type",
-                        "-t",
-                        type=str,
-                        default="fp32",
-                        choices=["fp32", "fp16"])
     parser.add_argument("--dataset-cache-dir",
                         type=str,
                         default=None,
@@ -213,18 +193,7 @@ def parse_arguments():
         help=
         'Controls renormalization after gate logits. Check layers/moe.py for accepted values',
     )
-    parser.add_argument('--enable_pos_shift',
-                        default=False,
-                        action='store_true',
-                        help='Enable position shift for streamingllm method')
-    parser.add_argument(
-        '--dense_context_fmha',
-        default=False,
-        action='store_true',
-        help=
-        'Enable dense fmha in context phase, otherwise sliding window attention.'
-        'If dense_context_fmha=False, the sliding window size is the max attention window size.'
-    )
+
     parser.add_argument('--hf_lora_dir', type=str, default=None)
     parser.add_argument(
         '--lora_target_modules',
@@ -249,20 +218,35 @@ def parse_arguments():
         default=64,
         help='maximum lora rank for different lora modules. '
         'It is used to compute the workspace size of lora plugin.')
+    parser.add_argument(
+        '--save_config_only',
+        action="store_true",
+        default=False,
+        help=
+        'Only save the model config w/o read and converting weights, be careful, this is for debug only'
+    )
+
     args = parser.parse_args()
     return args
 
 
-def update_quantization_from_args(config: dict, args: argparse.Namespace):
-    '''update the given config dict in-place based on the command line args
+def args_to_quantization(args: argparse.Namespace):
+    '''return config dict with quantization info based on the command line args
     '''
+    config = {
+        'quantization': {
+            'quant_algo': None,
+            'kv_cache_quant_algo': None,
+            'exclude_modules': ['lm_head'],
+        }
+    }
+
     if args.use_weight_only:
         if args.weight_only_precision == 'int8':
             config['quantization']['quant_algo'] = 'W8A16'
         elif args.weight_only_precision == 'int4':
             config['quantization']['quant_algo'] = 'W4A16'
     elif args.smoothquant:
-        config['quantization']['sq_use_plugin'] = True
         if args.per_channel:
             if args.per_token:
                 config['quantization'][
@@ -278,9 +262,6 @@ def update_quantization_from_args(config: dict, args: argparse.Namespace):
                 config['quantization'][
                     'quant_algo'] = 'W8A8_SQ_PER_TENSOR_PLUGIN'
 
-    if args.use_weight_only and args.moe_config.has_moe():
-        config['quantization']['exclude_modules'].append('router')
-
     if args.int8_kv_cache:
         config['quantization']['kv_cache_quant_algo'] = 'INT8'
 
@@ -291,303 +272,204 @@ def update_quantization_from_args(config: dict, args: argparse.Namespace):
             "pre_quant_scale": False,
             'quant_algo': 'W4A16_GPTQ'
         })
+    return config
 
 
-def create_config_from_args(args: argparse.Namespace,
-                            lora_config: Optional[LoraConfig] = None):
-    config = {
-        'architecture': args.architecture,
-        'dtype': args.dtype,
-        'logits_dtype': 'float32',
-        'num_hidden_layers': args.n_layer,
-        'num_attention_heads': args.n_head,
-        'hidden_size': args.n_embd,
-        'intermediate_size': args.inter_size,
-        'num_key_value_heads': args.n_kv_head,
-        'vocab_size': args.vocab_size,
-        'position_embedding_type': 'rope_gpt_neox',
-        'max_position_embeddings': args.n_positions,
-        'hidden_act': args.hidden_act,
-        'rotary_base': args.rotary_base,
-        'rotary_scaling': args.rotary_scaling,
-        'norm_epsilon': args.rms_norm_eps,
-        'quantization': {
-            'quant_algo': None,
-            'kv_cache_quant_algo': None,
-            "sq_use_plugin": False,
-            'exclude_modules': ['lm_head'],
-        },
-        'mapping': {
-            'world_size': args.tp_size * args.pp_size,
-            'tp_size': args.tp_size,
-            'pp_size': args.pp_size,
-        },
+def has_any_quant(args):
+    config = args_to_quantization(args)
+    return config['quantization']['quant_algo'] is not None or config[
+        'quantization']['kv_cache_quant_algo'] is not None
+
+
+def create_config_from_args(args: argparse.Namespace):
+    config = {}
+    mapping = Mapping(world_size=args.tp_size * args.pp_size,
+                      tp_size=args.tp_size,
+                      pp_size=args.pp_size)
+
+    # Need to convert the cli args to the kay-value pairs and override them in the generate config dict.
+    # Ideally these fields will be moved out of the config and pass them into build API, keep them here for compatibility purpose for now,
+    # before the refactor is done.
+    override_fields = {'moe_tp_mode': args.moe_tp_mode}
+    override_fields.update(args_to_quantization(args))
+    override_fields.update(args_to_build_options(args))
+
+    assert args.model_dir is not None
+    kwargs = {
+        'hf_lora_dir': args.hf_lora_dir,
+        'lora_target_modules': args.lora_target_modules,
+        'max_lora_rank': args.max_lora_rank,
+    }
+    config = create_config_from_hugging_face(args.model_dir,
+                                             args.dtype,
+                                             mapping,
+                                             override_fields=override_fields,
+                                             **kwargs)
+    return config
+
+
+def convert_and_save_meta(args, rank):
+    mapping = Mapping(world_size=args.tp_size * args.pp_size,
+                      tp_size=args.tp_size,
+                      pp_size=args.pp_size,
+                      rank=rank)
+    override_fields = {'moe_tp_mode': args.moe_tp_mode}
+    override_fields.update(args_to_quantization(args))
+    override_fields.update(args_to_build_options(args))
+
+    assert not has_any_quant(
+        args
+    ), "quantization from meta checkpoint or empty model were never supported"
+    assert not args.hf_lora_dir, "lora is only supported when loading from hf model dir for now"
+    kwargs = {}
+    assert args.meta_ckpt_dir is not None
+    llama = LLaMAForCausalLM.from_meta_ckpt(args.meta_ckpt_dir,
+                                            args.dtype,
+                                            mapping,
+                                            override_fileds=override_fields,
+                                            **kwargs)
+    llama.save_checkpoint(args.output_dir, save_config=(rank == 0))
+
+
+def args_to_build_options(args):
+    return {
         'use_parallel_embedding': args.use_parallel_embedding,
         'embedding_sharding_dim': args.embedding_sharding_dim,
         'share_embedding_table': args.use_embedding_sharing,
         'use_prompt_tuning': args.use_prompt_tuning,
-        'moe_num_experts': args.moe_num_experts,
-        'moe_top_k': args.moe_top_k,
-        'moe_tp_mode': args.moe_tp_mode,
-        'moe_normalization_mode': args.moe_renorm_mode,
-        'enable_pos_shift': args.enable_pos_shift,
-        'dense_context_fmha': args.dense_context_fmha,
+        'disable_weight_only_quant_plugin':
+        args.disable_weight_only_quant_plugin
     }
-    if lora_config is not None:
-        config.update({
-            'max_lora_rank':
-            args.max_lora_rank,
-            'lora_target_modules':
-            lora_config.lora_target_modules,
-            'hf_modules_to_trtllm_modules':
-            lora_config.hf_modules_to_trtllm_modules,
-            'trtllm_modules_to_hf_modules':
-            lora_config.trtllm_modules_to_hf_modules,
-            'disable_weight_only_quant_plugin':
-            args.disable_weight_only_quant_plugin
-        })
-        # the lora checkpoint might finetune the embedding
-        if lora_config.vocab_size != 0:
-            config['vocab_size'] = lora_config.vocab_size
-    update_quantization_from_args(config, args)
+
+
+def from_cli_args(args):
+    config = {}
+    mapping = Mapping(world_size=args.tp_size * args.pp_size,
+                      tp_size=args.tp_size,
+                      pp_size=args.pp_size)
+    architecture = "LlamaForCausalLM"
+    n_layer = args.n_layer
+    n_head = args.n_head
+    n_embd = args.n_embd
+    inter_size = args.inter_size
+    n_kv_head = args.n_kv_head if args.n_kv_head is not None else n_head  # default to MHA
+    vocab_size = args.vocab_size
+    n_positions = args.n_positions
+    hidden_act = args.hidden_act
+    rotary_base = args.rotary_base
+    rms_norm_eps = args.rms_norm_eps
+    moe_num_experts = args.moe_num_experts
+    moe_top_k = args.moe_top_k
+    moe_tp_mode = args.moe_tp_mode
+    config['moe_normalization_mode'] = args.moe_renorm_mode
+    # config values from reading model config
+    config.update({
+        'architecture': architecture,
+        'dtype': args.dtype,
+        'logits_dtype': 'float32',
+        'num_hidden_layers': n_layer,
+        'num_attention_heads': n_head,
+        'hidden_size': n_embd,
+        'intermediate_size': inter_size,
+        'num_key_value_heads': n_kv_head,
+        'vocab_size': vocab_size,
+        'position_embedding_type': 'rope_gpt_neox',
+        'max_position_embeddings': n_positions,
+        'hidden_act': hidden_act,
+        'rotary_base': rotary_base,
+        'norm_epsilon': rms_norm_eps,
+        'moe_num_experts': moe_num_experts,
+        'moe_top_k': moe_top_k,
+        'moe_tp_mode': moe_tp_mode,
+        'mapping': {
+            'world_size': mapping.tp_size * mapping.pp_size,
+            'tp_size': mapping.tp_size,
+            'pp_size': mapping.pp_size
+        }
+    })
+    config.update(args_to_build_options(args))
     return config
 
 
-def create_lora_config(args: argparse.Namespace):
-    '''update args based on lora dir
-    '''
-    hf_modules_to_trtllm_modules = {
-        "q_proj": "attn_q",
-        "k_proj": "attn_k",
-        "v_proj": "attn_v",
-        "o_proj": "attn_dense",
-        "gate_proj": "mlp_h_to_4h",
-        "down_proj": "mlp_4h_to_h",
-        "up_proj": "mlp_gate"
-    }  # lora modules on llama
-
-    trtllm_modules_to_hf_modules = {
-        "attn_q": "q_proj",
-        "attn_k": "k_proj",
-        "attn_v": "v_proj",
-        "attn_dense": "o_proj",
-        "mlp_h_to_4h": "gate_proj",
-        "mlp_4h_to_h": "down_proj",
-        "mlp_gate": "up_proj",
-    }
-
-    lora_config = LoraConfig.from_hf(args.hf_lora_dir,
-                                     hf_modules_to_trtllm_modules,
-                                     trtllm_modules_to_hf_modules)
-
-    if lora_config.is_valid:
-        if args.lora_target_modules is not None:
-            # command line options is preferred over the modules in the lora dir
-            lora_config.lora_target_modules = args.lora_target_modules
-    # can be invalid
-    return lora_config
-
-
-def smooth_quant(model, args):
-    assert model is not None
-    act_range = {}
-    llama_qkv_para = {}
-    # smoother for inputs of self_attn.o_proj and mlp.down_proj
-    llama_smoother = {}
-
-    os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get(
-        "TOKENIZERS_PARALLELISM", "false")
-    if args.load_model_on_cpu:
-        logger.warning(
-            "Note that running capture_activation_range on cpu would be very small."
-        )
-    dataset = load_dataset("ccdv/cnn_dailymail",
-                           '3.0.0',
-                           cache_dir=args.dataset_cache_dir)
-
-    act_range = capture_activation_range(
-        model,
-        AutoTokenizer.from_pretrained(args.model_dir,
-                                      trust_remote_code=True,
-                                      use_fast=False,
-                                      padding_side='left'), dataset)
-    if args.smoothquant is not None:
-        smooth_llama_model(model, act_range, args.smoothquant, llama_qkv_para,
-                           llama_smoother)
-    return act_range, llama_qkv_para, llama_smoother
-
-
-def main():
-    # TODO(qijun): Currently, the convert script depends on a torch op:
-    # torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix,
-    # which is included in tensorrt_llm Python package. Otherwise, the convert
-    # script does not need to import tensorrt_llm. Will remove it after reimplementing
-    # the op with PyTorch.
-    print(tensorrt_llm.__version__)
-    args = parse_arguments()
-
+def convert_and_save_hf(args):
+    model_dir = args.model_dir
+    load_model_on_cpu = args.load_model_on_cpu
+    load_by_shard = args.load_by_shard
     world_size = args.tp_size * args.pp_size
+    # Need to convert the cli args to the kay-value pairs and override them in the generate config dict.
+    # Ideally these fields will be moved out of the config and pass them into build API, keep them here for compatibility purpose for now,
+    # before the refactor is done.
+    override_fields = {'moe_tp_mode': args.moe_tp_mode}
+    override_fields.update(args_to_quantization(args))
+    override_fields.update(args_to_build_options(args))
+    assert model_dir is not None
 
-    tik = time.time()
-
-    if not os.path.exists(args.output_dir):
-        os.makedirs(args.output_dir)
-    hf_config = None
-    if args.model_dir is not None:
-        hf_config = AutoConfig.from_pretrained(args.model_dir,
-                                               trust_remote_code=True)
-        if hf_config.model_type == "llava":
-            # LLaVA = Vision model + Llama LLM
-            # We load a llava config and use its' text config as llama config
-            hf_config = LlavaConfig.from_pretrained(args.model_dir).text_config
-            hf_config.model_type = "llava"  # Replace llama with llava
-
-        args.model_type = hf_config.model_type
-        args.n_head = hf_config.num_attention_heads
-        args.inter_size = hf_config.intermediate_size
-        args.n_layer = hf_config.num_hidden_layers
-        args.n_embd = hf_config.hidden_size
-        args.n_kv_head = hf_config.num_key_value_heads
-        args.rms_norm_eps = hf_config.rms_norm_eps
-        args.vocab_size = hf_config.vocab_size
-        args.n_positions = hf_config.max_position_embeddings
-        args.rotary_scaling = getattr(hf_config, "rope_scaling", None)
-        args.rotary_base = getattr(hf_config, "rope_theta", args.rotary_base)
-        args.vocab_size = getattr(hf_config, "vocab_size", args.vocab_size)
-        if hf_config.model_type == "mixtral":
-            # HF LLaMA-type models are implicitly using gated activation.
-            # With our MoE implementation, we must make it explicit
-            args.hidden_act = "swiglu"
-            args.moe_num_experts = getattr(hf_config, "num_local_experts",
-                                           args.moe_num_experts)
-            args.moe_top_k = getattr(hf_config, "num_experts_per_tok",
-                                     args.moe_top_k)
-
-        args.architecture = hf_config.architectures[0]
-
-    elif args.meta_ckpt_dir is not None:
-        with open(Path(args.meta_ckpt_dir, "params.json")) as fp:
-            meta_config: dict = json.load(fp)
-        args.n_embd = meta_config["dim"]
-        args.n_head = meta_config["n_heads"]
-        args.n_layer = meta_config["n_layers"]
-        args.n_kv_head = meta_config.get("n_kv_heads", args.n_head)
-
-        if "hidden_dim" in meta_config:
-            args.inter_size = meta_config["hidden_dim"]
-        else:
-            args.multiple_of = meta_config.get("multiple_of", 1)
-            n_embd = int(4 * args.n_embd * 2 / 3)
-            args.ffn_dim_multiplier = meta_config.get("ffn_dim_multiplier", 1)
-            args.inter_size = args.multiple_of * (
-                (int(n_embd * args.ffn_dim_multiplier) + args.multiple_of - 1)
-                // args.multiple_of)
-        args.rms_norm_eps = meta_config["norm_eps"]
-        args.moe_num_experts = meta_config.get("moe", {}).get("num_experts", 0)
-        args.moe_top_k = meta_config.get("moe", {}).get("num_experts_per_tok",
-                                                        0)
-        args.architecture = "LlamaForCausalLM"
-    else:  # fake checkpoint for testing only
-        args.n_kv_head = args.n_kv_head or args.n_head
-        args.architecture = "LlamaForCausalLM"
-
-    if args.moe_num_experts and args.moe_top_k == 0:
-        args.moe_top_k = 1
-    args.moe_config = MoeConfig(args.moe_num_experts, args.moe_top_k,
-                                args.moe_tp_mode,
-                                args.moe_renorm_mode).validate()
-
-    lora_config = create_lora_config(args)
-    config = create_config_from_args(args, lora_config)
-
-    with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
-        json.dump(config, f, indent=4)
-    if args.model_dir is None and args.meta_ckpt_dir is None:
-        return
-    act_range = {}
-    llama_qkv_para = {}
-    # smoother for inputs of self_attn.o_proj and mlp.down_proj
-    llama_smoother = {}
-    model = None
-    if args.model_dir is not None:
-
-        if args.model_type == "llava":
-            hf_llava = LlavaForConditionalGeneration.from_pretrained(
-                args.model_dir, torch_dtype="auto")
-            model = hf_llava.language_model
-        else:
-            model = AutoModelForCausalLM.from_pretrained(
-                args.model_dir,
-                device_map='auto' if not args.load_model_on_cpu else 'cpu',
-                torch_dtype='auto' if not args.smoothquant else torch.float16,
-                trust_remote_code=True,
-            )
-        if args.smoothquant is not None or args.int8_kv_cache:
-            act_range, llama_qkv_para, llama_smoother = smooth_quant(
-                model, args)
-
-    def covert_and_save(rank):
-        mapping = Mapping(world_size=world_size,
-                          rank=rank,
-                          tp_size=args.tp_size,
-                          pp_size=args.pp_size)
-
-        if args.use_weight_only and args.weight_only_precision == 'int4_gptq':
-            weights = load_from_gptq_llama(args.ammo_quant_ckpt_path,
-                                           args.n_layer,
-                                           args.vocab_size,
-                                           mapping,
-                                           dtype=args.dtype)
-
-        elif args.meta_ckpt_dir is not None:
-            weights = load_from_meta_llama(args.meta_ckpt_dir, mapping,
-                                           PretrainedConfig.from_dict(config))
-
-        else:
-            if args.load_by_shard:
-                weights = load_from_hf_checkpoint(
-                    args.model_dir, mapping, PretrainedConfig.from_dict(config),
-                    lora_config)
-
-            else:
-                if args.weight_only_precision == 'int8':
-                    plugin_weight_only_quant_type = torch.int8
-                elif args.weight_only_precision == 'int4':
-                    plugin_weight_only_quant_type = torch.quint4x2
-                weights = convert_hf_llama(
-                    model,
-                    mapping,
-                    vocab_size=args.vocab_size,
-                    dtype=args.dtype,
-                    use_weight_only=args.use_weight_only,
-                    use_gemm_woq_plugin=not args.
-                    disable_weight_only_quant_plugin,
-                    plugin_weight_only_quant_type=plugin_weight_only_quant_type,
-                    use_parallel_embedding=args.use_parallel_embedding,
-                    sharding_dim=args.embedding_sharding_dim,
-                    share_embedding_table=args.use_embedding_sharing,
-                    use_smooth_quant=args.smoothquant,
-                    per_channel=args.per_channel,
-                    per_token=args.per_token,
-                    int8_kv_cache=args.int8_kv_cache,
-                    act_range=act_range,
-                    qkv_para=llama_qkv_para,
-                    smoother=llama_smoother,
-                    moe_config=args.moe_config,
-                    lora_config=lora_config)
-
-        safetensors.torch.save_file(
-            weights, os.path.join(args.output_dir, f'rank{rank}.safetensors'))
-
-    if args.workers == 1:
-
-        for rank in range(world_size):
-            covert_and_save(rank)
+    if args.smoothquant is not None or args.int8_kv_cache:
+        assert not args.load_by_shard, "When using quantization, TRT-LLM needs to load the whole HF model, thus load by shard not supported"
+        assert not args.load_model_on_cpu, "When using quantization, TRT-LLM needs to load the model to GPU"
+        mapping = Mapping(
+            world_size=world_size,
+            rank=-1,  #intentinoally make -1 to avoid mistake
+            tp_size=args.tp_size,
+            pp_size=args.pp_size)
+        quantize(args.dtype,
+                 args.model_dir,
+                 args.output_dir,
+                 mapping,
+                 override_fields=override_fields,
+                 dataset_cache_dir=args.dataset_cache_dir,
+                 smoothquant_val=args.smoothquant,
+                 int8_kv_cache=args.int8_kv_cache,
+                 hf_lora_dir=args.hf_lora_dir,
+                 lora_target_modules=args.lora_target_modules,
+                 max_lora_rank=args.max_lora_rank)
     else:
-        with ThreadPoolExecutor(max_workers=args.workers) as p:
-            futures = [
-                p.submit(covert_and_save, rank) for rank in range(world_size)
-            ]
+        for rank in range(world_size):
+            mapping = Mapping(world_size=world_size,
+                              rank=rank,
+                              tp_size=args.tp_size,
+                              pp_size=args.pp_size)
+            #TODO: change to LLaMAForCausalLM.from_hugging_face after refactor is done
+            llama = from_hugging_face(
+                LLaMAForCausalLM,
+                model_dir,
+                args.dtype,
+                mapping=mapping,
+                load_by_shard=load_by_shard,
+                load_model_on_cpu=load_model_on_cpu,
+                override_fields=override_fields,
+                hf_lora_dir=args.hf_lora_dir,
+                lora_target_modules=args.lora_target_modules,
+                max_lora_rank=args.max_lora_rank)
+            llama.save_checkpoint(args.output_dir, save_config=(rank == 0))
+
+
+def convert_and_save_gptq(args, rank):
+    config = create_config_from_args(args)
+    if rank == 0:
+        with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
+            json.dump(config, f, indent=4)
+    mapping = Mapping(world_size=config['mapping']['tp_size'] *
+                      config['mapping']['pp_size'],
+                      rank=rank,
+                      tp_size=config['mapping']['tp_size'],
+                      pp_size=config['mapping']['pp_size'])
+    weights = load_from_gptq_llama(args.ammo_quant_ckpt_path,
+                                   config['num_hidden_layers'],
+                                   config['vocab_size'],
+                                   mapping,
+                                   dtype=config['dtype'])
+    safetensors.torch.save_file(
+        weights, os.path.join(args.output_dir, f'rank{rank}.safetensors'))
+
+
+def execute(workers, func, args):
+    if workers == 1:
+        for rank, f in enumerate(func):
+            f(args, rank)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as p:
+            futures = [p.submit(f, args, rank) for rank, f in enumerate(func)]
             exceptions = []
             for future in as_completed(futures):
                 try:
@@ -598,6 +480,37 @@ def main():
             assert len(
                 exceptions
             ) == 0, "Checkpoint conversion failed, please check error log."
+
+
+def main():
+    print(tensorrt_llm.__version__)
+    args = parse_arguments()
+
+    # changing the default to be consistent as the cli help said.
+    if args.moe_num_experts and args.moe_top_k == 0:
+        args.moe_top_k = 1
+    world_size = args.tp_size * args.pp_size
+    tik = time.time()
+
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
+
+    ####### save config
+    if (args.model_dir is None and args.meta_ckpt_dir is None):
+        config = from_cli_args(args)
+        with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
+            json.dump(config, f, indent=4)
+        return
+    elif args.meta_ckpt_dir is not None:
+        execute(args.workers, [convert_and_save_meta] * world_size, args)
+    elif args.weight_only_precision == 'int4_gptq':
+        assert args.model_dir is not None
+        assert args.ammo_quant_ckpt_path is not None
+        execute(args.workers, [convert_and_save_gptq] * world_size, args)
+    else:  # all other non-gptq paths from hf model
+        assert args.model_dir is not None
+        assert args.ammo_quant_ckpt_path is None, "only gptq weights only needs this option"
+        convert_and_save_hf(args)
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))

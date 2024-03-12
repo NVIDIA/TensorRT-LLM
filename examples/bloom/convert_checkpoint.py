@@ -1090,8 +1090,6 @@ def main():
         'embedding_sharding_dim': args.embedding_sharding_dim,
         'share_embedding_table': args.use_embedding_sharing,
     }
-    if args.smoothquant:
-        config['quantization']['sq_use_plugin'] = True
 
     with (args.output_dir / 'config.json').open('w') as f:
         json.dump(config, f, indent=4)

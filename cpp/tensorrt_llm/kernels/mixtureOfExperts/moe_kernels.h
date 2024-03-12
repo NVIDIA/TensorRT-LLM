@@ -26,7 +26,7 @@
 namespace tensorrt_llm::kernels
 {
 
-static inline size_t pad_to_multiple_of_16(const size_t& input)
+static inline size_t pad_to_multiple_of_16(size_t const& input)
 {
     static constexpr int ALIGNMENT = 16;
     return ALIGNMENT * ((input + ALIGNMENT - 1) / ALIGNMENT);
@@ -49,21 +49,21 @@ static inline size_t pad_to_multiple_of_16(const size_t& input)
   k - k value in topk
 */
 template <typename T>
-void topk_gating_softmax_kernelLauncher(const T* input, const bool* finished, T* output, T* softmax_temp_out,
-    int* indices, int* source_row, const int num_rows, const int num_experts, const int k, cudaStream_t stream);
+void topk_gating_softmax_kernelLauncher(T const* input, bool const* finished, T* output, T* softmax_temp_out,
+    int* indices, int* source_row, int const num_rows, int const num_experts, int const k, cudaStream_t stream);
 
 class CubKeyValueSorter
 {
 public:
     CubKeyValueSorter();
 
-    CubKeyValueSorter(const int num_experts);
+    CubKeyValueSorter(int const num_experts);
 
-    void updateNumExperts(const int num_experts);
+    void updateNumExperts(int const num_experts);
 
-    static size_t getWorkspaceSize(const size_t num_key_value_pairs, const int num_experts);
+    static size_t getWorkspaceSize(const size_t num_key_value_pairs, int const num_experts);
 
-    void run(void* workspace, const size_t workspace_size, const int* keys_in, int* keys_out, const int* values_in,
+    void run(void* workspace, const size_t workspace_size, int const* keys_in, int* keys_out, int const* values_in,
         int* values_out, const size_t num_key_value_pairs, cudaStream_t stream);
 
 private:
@@ -120,28 +120,28 @@ struct MOEParallelismConfig
         return {1, 0, ep_size, ep_rank};
     }
 
-    const int tp_size = 1;
-    const int tp_rank = 0;
-    const int ep_size = 1;
-    const int ep_rank = 0;
+    int const tp_size = 1;
+    int const tp_rank = 0;
+    int const ep_size = 1;
+    int const ep_rank = 0;
 };
 
 class CutlassMoeFCRunnerInterface
 {
 public:
     virtual ~CutlassMoeFCRunnerInterface() = default;
-    virtual size_t getWorkspaceSize(const int num_rows, const int hidden_size, const int fc1_output_size,
-        const int num_experts, const int k, ActivationType activation_type,
+    virtual size_t getWorkspaceSize(int const num_rows, int const hidden_size, int const fc1_output_size,
+        int const num_experts, int const k, ActivationType activation_type,
         MOEParallelismConfig parallelism_config) const
         = 0;
     virtual void setTactic(std::optional<cutlass_extensions::CutlassGemmConfig> gemm_config) = 0;
     virtual std::vector<cutlass_extensions::CutlassGemmConfig> getTactics() = 0;
 
-    virtual void runMoe(const void* input_activations, const float* gating_output, const void* fc1_expert_weights,
-        const void* fc1_scales, const void* fc1_expert_biases, ActivationType fc1_activation_type,
-        const void* fc2_expert_weights, const void* fc2_scales, const void* fc2_expert_biases, const int num_rows,
-        const int hidden_size, const int inter_size, const int num_experts, const int k, char* workspace_ptr,
-        void* final_output, void* fc2_result, const bool* finished, const int active_rows, void* expert_scales,
+    virtual void runMoe(void const* input_activations, float const* gating_output, void const* fc1_expert_weights,
+        void const* fc1_scales, void const* fc1_expert_biases, ActivationType fc1_activation_type,
+        void const* fc2_expert_weights, void const* fc2_scales, void const* fc2_expert_biases, int const num_rows,
+        int const hidden_size, int const inter_size, int const num_experts, int const k, char* workspace_ptr,
+        void* final_output, void* fc2_result, bool const* finished, int const active_rows, void* expert_scales,
         int* expanded_source_row_to_expanded_dest_row, int* expert_for_source_row,
         MOEParallelismConfig parallelism_config, MOEExpertScaleNormalizationMode normalization_mode,
         cudaStream_t stream)
@@ -160,8 +160,8 @@ public:
     CutlassMoeFCRunner() = default;
     ~CutlassMoeFCRunner() override = default;
 
-    size_t getWorkspaceSize(const int num_rows, const int hidden_size, const int fc1_output_size, const int num_experts,
-        const int k, ActivationType activation_type, MOEParallelismConfig parallelism_config) const override;
+    size_t getWorkspaceSize(int const num_rows, int const hidden_size, int const fc1_output_size, int const num_experts,
+        int const k, ActivationType activation_type, MOEParallelismConfig parallelism_config) const override;
 
     void setTactic(std::optional<cutlass_extensions::CutlassGemmConfig> gemm_config) override
     {
@@ -173,22 +173,22 @@ public:
         return moe_gemm_runner_.getConfigs();
     }
 
-    void runMoe(const void* input_activations, const float* gating_output, const void* fc1_expert_weights,
-        const void* fc1_scales, const void* fc1_expert_biases, ActivationType fc1_activation_type,
-        const void* fc2_expert_weights, const void* fc2_scales, const void* fc2_expert_biases, const int num_rows,
-        const int hidden_size, const int inter_size, const int num_experts, const int k, char* workspace_ptr,
-        void* final_output, void* fc2_result, const bool* finished, const int active_rows, void* expert_scales,
+    void runMoe(void const* input_activations, float const* gating_output, void const* fc1_expert_weights,
+        void const* fc1_scales, void const* fc1_expert_biases, ActivationType fc1_activation_type,
+        void const* fc2_expert_weights, void const* fc2_scales, void const* fc2_expert_biases, int const num_rows,
+        int const hidden_size, int const inter_size, int const num_experts, int const k, char* workspace_ptr,
+        void* final_output, void* fc2_result, bool const* finished, int const active_rows, void* expert_scales,
         int* expanded_source_row_to_expanded_dest_row, int* expert_for_source_row,
         MOEParallelismConfig parallelism_config, MOEExpertScaleNormalizationMode normalization_mode,
         cudaStream_t stream) override;
 
 private:
-    void computeTotalRowsBeforeExpert(const int* sorted_indices, const int total_indices, const int num_experts,
+    void computeTotalRowsBeforeExpert(int const* sorted_indices, int const total_indices, int const num_experts,
         int64_t* total_rows_before_expert, cudaStream_t stream);
-    std::vector<size_t> getWorkspaceBufferSizes(const int num_rows, const int hidden_size, const int inter_size,
-        const int num_experts, const int num_experts_per_node, const int k, ActivationType activation_type) const;
-    void configureWsPtrs(char* ws_ptr, const int num_rows, const int hidden_size, const int inter_size,
-        const int num_experts, const int num_experts_per_node, const int k, ActivationType activation_type);
+    std::vector<size_t> getWorkspaceBufferSizes(int const num_rows, int const hidden_size, int const inter_size,
+        int const num_experts, int const num_experts_per_node, int const k, ActivationType activation_type) const;
+    void configureWsPtrs(char* ws_ptr, int const num_rows, int const hidden_size, int const inter_size,
+        int const num_experts, int const num_experts_per_node, int const k, ActivationType activation_type);
 
 private:
     CubKeyValueSorter sorter_;
@@ -215,8 +215,8 @@ class CutlassMoeFCRunner<float, WeightType, typename std::enable_if_t<!std::is_s
 public:
     CutlassMoeFCRunner() = default;
 
-    size_t getWorkspaceSize(const int num_rows, const int hidden_size, const int fc1_output_size, const int num_experts,
-        const int k, ActivationType activation_type, MOEParallelismConfig parallelism_config) const override
+    size_t getWorkspaceSize(int const num_rows, int const hidden_size, int const fc1_output_size, int const num_experts,
+        int const k, ActivationType activation_type, MOEParallelismConfig parallelism_config) const override
     {
         return 0;
     }
@@ -226,11 +226,11 @@ public:
         return;
     }
 
-    void runMoe(const void* input_activations, const float* gating_output, const void* fc1_expert_weights,
-        const void* fc1_scales, const void* fc1_expert_biases, ActivationType fc1_activation_type,
-        const void* fc2_expert_weights, const void* fc2_scales, const void* fc2_expert_biases, const int num_rows,
-        const int hidden_size, const int inter_size, const int num_experts, const int k, char* workspace_ptr,
-        void* final_output, void* fc2_result, const bool* finished, const int active_rows, void* expert_scales,
+    void runMoe(void const* input_activations, float const* gating_output, void const* fc1_expert_weights,
+        void const* fc1_scales, void const* fc1_expert_biases, ActivationType fc1_activation_type,
+        void const* fc2_expert_weights, void const* fc2_scales, void const* fc2_expert_biases, int const num_rows,
+        int const hidden_size, int const inter_size, int const num_experts, int const k, char* workspace_ptr,
+        void* final_output, void* fc2_result, bool const* finished, int const active_rows, void* expert_scales,
         int* expanded_source_row_to_expanded_dest_row, int* expert_for_source_row,
         MOEParallelismConfig parallelism_config, MOEExpertScaleNormalizationMode normalization_mode,
         cudaStream_t stream) override

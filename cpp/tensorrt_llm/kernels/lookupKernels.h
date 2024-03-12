@@ -26,8 +26,8 @@ namespace tensorrt_llm
 namespace kernels
 {
 template <typename T, typename Idx>
-void invokeLookUp(T* out, const Idx* input, const T* weight, const Idx batch_size, const Idx offset, const Idx size,
-    const int n_embed, cudaStream_t stream = 0);
+void invokeLookUp(T* out, Idx const* input, T const* weight, const Idx batch_size, const Idx offset, const Idx size,
+    int const n_embed, cudaStream_t stream = 0);
 
 } // namespace kernels
 } // namespace tensorrt_llm

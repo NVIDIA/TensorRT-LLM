@@ -237,7 +237,7 @@ int main(int argc, char* argv[])
         benchmarkBert(result["model"].as<std::string>(), result["engine_dir"].as<std::string>(), batchSizes, inLens,
             logger, result["warm_up"].as<int>(), result["num_runs"].as<int>(), result["duration"].as<int>());
     }
-    catch (const std::exception& e)
+    catch (std::exception const& e)
     {
         TLLM_LOG_ERROR(e.what());
         return 1;

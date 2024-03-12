@@ -47,9 +47,9 @@ namespace tensorrt_llm
 // ============================= Variable batched Gemm things ===========================
 template <typename T, typename WeightType, typename arch, typename EpilogueTag, typename ThreadblockShape,
     typename WarpShape, int Stages>
-void genericMoeGemmKernelLauncher(const T* A, const WeightType* B, const T* weight_scales, const T* biases, T* C,
+void genericMoeGemmKernelLauncher(T const* A, WeightType const* B, T const* weight_scales, T const* biases, T* C,
     int64_t* total_rows_before_expert, int64_t num_rows, int64_t gemm_n, int64_t gemm_k, int num_experts,
-    cutlass_extensions::CutlassGemmConfig gemm_config, const int multi_processor_count, cudaStream_t stream,
+    cutlass_extensions::CutlassGemmConfig gemm_config, int const multi_processor_count, cudaStream_t stream,
     int* kernel_occupancy = nullptr)
 {
 #ifdef ENABLE_BF16
@@ -120,15 +120,15 @@ void genericMoeGemmKernelLauncher(const T* A, const WeightType* B, const T* weig
     }
     int occupancy = std::min(2, GemmGrouped::maximum_active_blocks());
     TLLM_CHECK_WITH_INFO(occupancy > 0, "GPU lacks the shared memory resources to run GroupedGEMM kernel");
-    const int threadblock_count = multi_processor_count * occupancy;
+    int const threadblock_count = multi_processor_count * occupancy;
 
     typename EpilogueOp::Params epilogue_op(
         ElementAccumulator(1.f), biases ? ElementAccumulator(1.f) : ElementAccumulator(0.f));
 
-    const int group_size = gemm_k;
+    int const group_size = gemm_k;
     typename GemmGrouped::Arguments args(num_experts, threadblock_count, group_size, epilogue_op,
-        reinterpret_cast<const ElementType*>(A), reinterpret_cast<const CutlassWeightType*>(B),
-        reinterpret_cast<const ElementType*>(weight_scales), reinterpret_cast<const ElementType*>(biases),
+        reinterpret_cast<ElementType const*>(A), reinterpret_cast<CutlassWeightType const*>(B),
+        reinterpret_cast<ElementType const*>(weight_scales), reinterpret_cast<ElementType const*>(biases),
         reinterpret_cast<ElementType*>(C), total_rows_before_expert, gemm_n, gemm_k);
 
     GemmGrouped gemm;
@@ -151,7 +151,7 @@ template <typename T, typename WeightType, typename arch, typename EpilogueTag, 
     typename WarpShape, int Stages, typename Enable = void>
 struct dispatch_stages
 {
-    static void dispatch(const T* A, const WeightType* B, const T* weight_scales, const T* biases, T* C,
+    static void dispatch(T const* A, WeightType const* B, T const* weight_scales, T const* biases, T* C,
         int64_t* total_rows_before_expert, int64_t num_rows, int64_t gemm_n, int64_t gemm_k, int num_experts,
         cutlass_extensions::CutlassGemmConfig gemm_config, int multi_processor_count, cudaStream_t stream,
         int* occupancy = nullptr)
@@ -165,7 +165,7 @@ template <typename T, typename WeightType, typename arch, typename EpilogueTag, 
     typename WarpShape>
 struct dispatch_stages<T, WeightType, arch, EpilogueTag, ThreadblockShape, WarpShape, 2>
 {
-    static void dispatch(const T* A, const WeightType* B, const T* weight_scales, const T* biases, T* C,
+    static void dispatch(T const* A, WeightType const* B, T const* weight_scales, T const* biases, T* C,
         int64_t* total_rows_before_expert, int64_t num_rows, int64_t gemm_n, int64_t gemm_k, int num_experts,
         cutlass_extensions::CutlassGemmConfig gemm_config, int multi_processor_count, cudaStream_t stream,
         int* occupancy = nullptr)
@@ -181,7 +181,7 @@ template <typename T, typename WeightType, typename EpilogueTag, typename Thread
 struct dispatch_stages<T, WeightType, cutlass::arch::Sm80, EpilogueTag, ThreadblockShape, WarpShape, Stages,
     typename std::enable_if<(Stages > 2)>::type>
 {
-    static void dispatch(const T* A, const WeightType* B, const T* weight_scales, const T* biases, T* C,
+    static void dispatch(T const* A, WeightType const* B, T const* weight_scales, T const* biases, T* C,
         int64_t* total_rows_before_expert, int64_t num_rows, int64_t gemm_n, int64_t gemm_k, int num_experts,
         cutlass_extensions::CutlassGemmConfig gemm_config, int multi_processor_count, cudaStream_t stream,
         int* occupancy = nullptr)
@@ -194,7 +194,7 @@ struct dispatch_stages<T, WeightType, cutlass::arch::Sm80, EpilogueTag, Threadbl
 
 template <typename T, typename WeightType, typename arch, typename EpilogueTag, typename ThreadblockShape,
     typename WarpShape>
-void dispatchGemmConfig(const T* A, const WeightType* B, const T* weight_scales, const T* biases, T* C,
+void dispatchGemmConfig(T const* A, WeightType const* B, T const* weight_scales, T const* biases, T* C,
     int64_t* total_rows_before_expert, int64_t num_rows, int64_t gemm_n, int64_t gemm_k, int num_experts,
     cutlass_extensions::CutlassGemmConfig gemm_config, int multi_processor_count, cudaStream_t stream,
     int* occupancy = nullptr)
@@ -224,7 +224,7 @@ void dispatchGemmConfig(const T* A, const WeightType* B, const T* weight_scales,
 // This overload is only enabled when T == WeightType.
 template <typename T, typename WeightType, typename arch, typename EpilogueTag,
     typename std::enable_if<!std::is_same<T, float>::value && std::is_same<T, WeightType>::value>::type* = nullptr>
-void dispatchMoeGemmToCutlass(const T* A, const WeightType* B, const T* weight_scales, const T* biases, T* C,
+void dispatchMoeGemmToCutlass(T const* A, WeightType const* B, T const* weight_scales, T const* biases, T* C,
     int64_t* total_rows_before_expert, int64_t total_rows, int64_t gemm_n, int64_t gemm_k, int num_experts,
     cutlass_extensions::CutlassGemmConfig gemm_config, int sm_version, int multi_processor_count, cudaStream_t stream,
     int* occupancy = nullptr)
@@ -277,7 +277,7 @@ void dispatchMoeGemmToCutlass(const T* A, const WeightType* B, const T* weight_s
 // compile time
 template <typename T, typename WeightType, typename arch, typename EpilogueTag,
     typename std::enable_if<!std::is_same<T, float>::value && !std::is_same<T, WeightType>::value>::type* = nullptr>
-void dispatchMoeGemmToCutlass(const T* A, const WeightType* B, const T* weight_scales, const T* biases, T* C,
+void dispatchMoeGemmToCutlass(T const* A, WeightType const* B, T const* weight_scales, T const* biases, T* C,
     int64_t* total_rows_before_expert, int64_t total_rows, int64_t gemm_n, int64_t gemm_k, int num_experts,
     cutlass_extensions::CutlassGemmConfig gemm_config, int sm_version, int multi_processor_count, cudaStream_t stream,
     int* occupancy = nullptr)
@@ -328,7 +328,7 @@ void dispatchMoeGemmToCutlass(const T* A, const WeightType* B, const T* weight_s
 // This overload will handle simt gemms. It is disabled via SFINAE for tensorop.
 template <typename T, typename WeightType, typename arch, typename EpilogueTag,
     typename std::enable_if<std::is_same<T, float>::value>::type* = nullptr>
-void dispatchMoeGemmToCutlass(const T* A, const WeightType* B, const T* weight_scales, const T* biases, T* C,
+void dispatchMoeGemmToCutlass(T const* A, WeightType const* B, T const* weight_scales, T const* biases, T* C,
     int64_t* total_rows_before_expert, int64_t total_rows, int64_t gemm_n, int64_t gemm_k, int num_experts,
     cutlass_extensions::CutlassGemmConfig gemm_config, int sm_version, int multi_processor_count, cudaStream_t stream,
     int* occupancy = nullptr)
@@ -370,8 +370,8 @@ MoeGemmRunner<T, WeightType>::MoeGemmRunner()
 
 template <typename T, typename WeightType>
 template <typename EpilogueTag>
-void MoeGemmRunner<T, WeightType>::dispatchToArch<EpilogueTag>(const T* A, const WeightType* B, const T* weight_scales,
-    const T* biases, T* C, int64_t* total_rows_before_expert, int64_t total_rows, int64_t gemm_n, int64_t gemm_k,
+void MoeGemmRunner<T, WeightType>::dispatchToArch<EpilogueTag>(T const* A, WeightType const* B, T const* weight_scales,
+    T const* biases, T* C, int64_t* total_rows_before_expert, int64_t total_rows, int64_t gemm_n, int64_t gemm_k,
     int num_experts, cutlass_extensions::CutlassGemmConfig gemm_config, cudaStream_t stream, int* occupancy)
 {
     if (sm_ >= 70 && sm_ < 75)
@@ -407,8 +407,8 @@ void MoeGemmRunner<T, WeightType>::dispatchToArch<EpilogueTag>(const T* A, const
 
 template <typename T, typename WeightType>
 template <typename EpilogueTag>
-void MoeGemmRunner<T, WeightType>::runGemm<EpilogueTag>(const T* A, const WeightType* B, const T* weight_scales,
-    const T* biases, T* C, int64_t* total_rows_before_expert, int64_t total_rows, int64_t gemm_n, int64_t gemm_k,
+void MoeGemmRunner<T, WeightType>::runGemm<EpilogueTag>(T const* A, WeightType const* B, T const* weight_scales,
+    T const* biases, T* C, int64_t* total_rows_before_expert, int64_t total_rows, int64_t gemm_n, int64_t gemm_k,
     int num_experts, cudaStream_t stream)
 {
     auto chosen_conf = this->best_config_;
@@ -437,8 +437,8 @@ void MoeGemmRunner<T, WeightType>::runGemm<EpilogueTag>(const T* A, const Weight
 }
 
 template <typename T, typename WeightType>
-void MoeGemmRunner<T, WeightType>::moeGemmBiasAct(const T* A, const WeightType* B, const T* weight_scales,
-    const T* biases, T* C, int64_t* total_rows_before_expert, int64_t total_rows, int64_t gemm_n, int64_t gemm_k,
+void MoeGemmRunner<T, WeightType>::moeGemmBiasAct(T const* A, WeightType const* B, T const* weight_scales,
+    T const* biases, T* C, int64_t* total_rows_before_expert, int64_t total_rows, int64_t gemm_n, int64_t gemm_k,
     int num_experts, ActivationType activation_type, cudaStream_t stream)
 {
     switch (activation_type)
@@ -465,7 +465,7 @@ void MoeGemmRunner<T, WeightType>::moeGemmBiasAct(const T* A, const WeightType* 
 }
 
 template <typename T, typename WeightType>
-void MoeGemmRunner<T, WeightType>::moeGemm(const T* A, const WeightType* B, const T* weight_scales, T* C,
+void MoeGemmRunner<T, WeightType>::moeGemm(T const* A, WeightType const* B, T const* weight_scales, T* C,
     int64_t* total_rows_before_expert, int64_t total_rows, int64_t gemm_n, int64_t gemm_k, int num_experts,
     cudaStream_t stream)
 {

@@ -50,9 +50,17 @@ public:
 
     explicit TrtGptModelOptionalParams(executor::ExecutorConfig const& executorConfig)
         : TrtGptModelOptionalParams(KvCacheConfig(executorConfig.getKvCacheConfig()),
-            executorConfig.getEnableTrtOverlap(), executorConfig.getDeviceIds(), executorConfig.getNormalizeLogProbs(),
-            executorConfig.getEnableChunkedContext())
+            executorConfig.getEnableTrtOverlap(),
+            executorConfig.getParallelConfig().value_or(executor::ParallelConfig()).getDeviceIds(),
+            executorConfig.getNormalizeLogProbs(), executorConfig.getEnableChunkedContext())
     {
+    }
+
+    bool operator==(TrtGptModelOptionalParams const& other) const
+    {
+        return kvCacheConfig == other.kvCacheConfig && enableTrtOverlap == other.enableTrtOverlap
+            && deviceIds == other.deviceIds && normalizeLogProbs == other.normalizeLogProbs
+            && enableChunkedContext == other.enableChunkedContext && decodingMode == other.decodingMode;
     }
 
     KvCacheConfig kvCacheConfig;

@@ -313,7 +313,8 @@ class DecoderLayer(Module):
                  max_distance=0,
                  num_buckets=0,
                  fp16_clamping=False,
-                 max_lora_rank=None):
+                 max_lora_rank=None,
+                 skip_cross_qkv=False):
         super().__init__()
 
         # e.g. BART regular, T5 RMS
@@ -344,7 +345,8 @@ class DecoderLayer(Module):
             num_buckets=num_buckets,
             position_embedding_type=PositionEmbeddingType.relative
             if relative_attention else PositionEmbeddingType.learned_absolute,
-            max_lora_rank=max_lora_rank)
+            max_lora_rank=max_lora_rank,
+            skip_cross_qkv=skip_cross_qkv)
 
         self.self_attention_layernorm = ln_type(normalized_shape=hidden_size,
                                                 eps=layernorm_eps,
@@ -819,7 +821,7 @@ class EncoderModel(Module, GenerationMixin):
                                dtype=trt.int32,
                                shape=[-1, 1],
                                dim_range=OrderedDict([
-                                   ('batch_size_beam_width', bs_range),
+                                   ('batch_size', bs_range),
                                    ('broadcast_dim', [1]),
                                ]))
             prompt_vocab_size = Tensor(name='prompt_vocab_size',
@@ -857,8 +859,8 @@ class EncoderModel(Module, GenerationMixin):
                         name=f'{lora_module}_lora_weights_pointers_{i}',
                         dtype=trt.int64,
                         shape=[-1, 2],
-                        dim_range=OrderedDict([('batch_size_beam_width',
-                                                [bs_range]), ('in_out', [2])]))
+                        dim_range=OrderedDict([('batch_size', [bs_range]),
+                                               ('in_out', [2])]))
                     lora_weight_pointer_dict.update({
                         f'{lora_module}_lora_weights_pointers':
                         lora_weight_pointer
@@ -867,9 +869,8 @@ class EncoderModel(Module, GenerationMixin):
                     lora_rank = Tensor(name=f'{lora_module}_lora_ranks_{i}',
                                        dtype=trt.int32,
                                        shape=[-1],
-                                       dim_range=OrderedDict([
-                                           ('batch_size_beam_width', [bs_range])
-                                       ]))
+                                       dim_range=OrderedDict([('batch_size',
+                                                               [bs_range])]))
                     lora_rank_dict.update(
                         {f'{lora_module}_lora_ranks': lora_rank})
 
@@ -879,17 +880,24 @@ class EncoderModel(Module, GenerationMixin):
             host_request_types = Tensor(name='host_request_types',
                                         dtype=trt.int32,
                                         shape=[-1],
-                                        dim_range=OrderedDict([
-                                            ('batch_size_beam_width',
-                                             [bs_range])
-                                        ]))
+                                        dim_range=OrderedDict([('batch_size',
+                                                                [bs_range])]))
 
-            # TODO: add host_context_lengths after remove_input_padding is added to BERT.
+            host_context_lengths = None
+            if remove_input_padding:
+                host_context_lengths = Tensor(name='host_context_lengths',
+                                              dtype=trt.int32,
+                                              shape=[-1],
+                                              dim_range=OrderedDict([
+                                                  ('batch_size', [bs_range])
+                                              ]))
+
             lora_params = LoraParams(
                 lora_ranks=lora_ranks,
                 lora_weights_pointers=lora_weights_pointers,
                 max_context_length=max_input_len,
                 host_request_types=host_request_types,
+                host_context_lengths=host_context_lengths,
             )
 
         return (input_ids, input_lengths, position_ids, token_type_ids,
@@ -937,7 +945,8 @@ class DecoderModel(Module, GenerationMixin):
                  embedding_sharding_dim=0,
                  mapping=Mapping(),
                  fp16_clamping=False,
-                 max_lora_rank=None):
+                 max_lora_rank=None,
+                 skip_cross_qkv=False):
         super().__init__()
         self.mapping = mapping
 
@@ -992,6 +1001,8 @@ class DecoderModel(Module, GenerationMixin):
         self.has_token_type_embedding = type_vocab_size is not None
         self.rescale_before_lm_head = rescale_before_lm_head
 
+        self.skip_cross_qkv = skip_cross_qkv
+
         if self.mapping.is_first_pp_rank():
             self.embedding = EncDecEmbedding(
                 vocab_size,
@@ -1034,6 +1045,7 @@ class DecoderModel(Module, GenerationMixin):
                 num_buckets=num_buckets,
                 fp16_clamping=fp16_clamping,
                 max_lora_rank=max_lora_rank,
+                skip_cross_qkv=skip_cross_qkv,
             ) for layer_idx in layers_range
         ])
 
@@ -1509,12 +1521,28 @@ class DecoderModel(Module, GenerationMixin):
                 lora_weights_pointers.append(lora_weight_pointer_dict)
                 lora_ranks.append(lora_rank_dict)
 
+            # For cross attention, we need to use encoder_input_lengths (in CPU) to pass
+            # as the host_context_lengths to the lora_plugin. But for self attention, we
+            # should keep using the original host_context_lengths. Therefore, we keep both
+            # of them in the lora_params.
+            host_encoder_input_lengths = None
+            if remove_input_padding:
+                host_encoder_input_lengths = Tensor(
+                    name="host_encoder_input_lengths",
+                    dtype=trt.int32,
+                    shape=[-1],
+                    dim_range=OrderedDict([("batch_size_beam_width", [bb_range])
+                                           ]),
+                )
+
             lora_params = LoraParams(
                 lora_ranks=lora_ranks,
                 lora_weights_pointers=lora_weights_pointers,
                 host_context_lengths=host_context_lengths,
                 max_context_length=max_decoder_input_len,
+                max_encoder_context_length=max_encoder_input_len,
                 host_request_types=host_request_types,
+                host_encoder_input_lengths=host_encoder_input_lengths,
             )
 
         for i in layers_range:
@@ -1580,27 +1608,28 @@ class DecoderModel(Module, GenerationMixin):
                                     ]))
         cross_qkv_reuse = None
         cross_qkv_out_dim = self.num_heads * self.head_size + 2 * self.num_kv_heads * self.head_size
-        if remove_input_padding:
-            cross_qkv_reuse = Tensor(
-                name="cross_qkv_reuse",
-                dtype=self._dtype,
-                shape=[-1, cross_qkv_out_dim],
-                dim_range=OrderedDict([
-                    ("encoder_num_tokens", [encoder_num_tokens_range]),
-                    ("encoder_qkv_size", [cross_qkv_out_dim]),
-                ]),
-            )
-        else:
-            cross_qkv_reuse = Tensor(
-                name="cross_qkv_reuse",
-                dtype=self._dtype,
-                shape=[-1, -1, cross_qkv_out_dim],
-                dim_range=OrderedDict([
-                    ("batch_size_beam_width_encoder", [bb_range]),
-                    ("encoder_input_len", [encoder_input_len_range]),
-                    ("encoder_qkv_size", [cross_qkv_out_dim]),
-                ]),
-            )
+        if self.skip_cross_qkv:
+            if remove_input_padding:
+                cross_qkv_reuse = Tensor(
+                    name="cross_qkv_reuse",
+                    dtype=self._dtype,
+                    shape=[-1, cross_qkv_out_dim],
+                    dim_range=OrderedDict([
+                        ("encoder_num_tokens", [encoder_num_tokens_range]),
+                        ("encoder_qkv_size", [cross_qkv_out_dim]),
+                    ]),
+                )
+            else:
+                cross_qkv_reuse = Tensor(
+                    name="cross_qkv_reuse",
+                    dtype=self._dtype,
+                    shape=[-1, -1, cross_qkv_out_dim],
+                    dim_range=OrderedDict([
+                        ("batch_size_beam_width_encoder", [bb_range]),
+                        ("encoder_input_len", [encoder_input_len_range]),
+                        ("encoder_qkv_size", [cross_qkv_out_dim]),
+                    ]),
+                )
 
         return (input_ids, encoder_output, position_ids, token_type_ids, True,
                 attention_mask, cross_attention_mask, last_token_ids,

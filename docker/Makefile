@@ -21,6 +21,7 @@ endif
 STAGE              ?=
 # Set this to define a custom image name and tag
 IMAGE_WITH_TAG     ?= $(IMAGE_NAME)$(if $(STAGE),/$(STAGE)):$(IMAGE_TAG)
+PUSH_TO_STAGING    ?= 1
 DOCKER_BUILD_OPTS  ?= --pull
 DOCKER_BUILD_ARGS  ?=
 DOCKER_PROGRESS    ?= auto
@@ -50,6 +51,11 @@ define add_local_user
 		..
 endef
 
+# Rewrite `/tensorrt-llm:` in image tag with `/tensorrt-llm-staging:` to avoid directly overwriting
+define rewrite_tag
+$(shell echo $(IMAGE_WITH_TAG) | sed "s/\/tensorrt-llm:/\/tensorrt-llm-staging:/g")
+endef
+
 %_build:
 	@echo "Building docker image: $(IMAGE_WITH_TAG)"
 	DOCKER_BUILDKIT=1 docker build $(DOCKER_BUILD_OPTS) $(DOCKER_BUILD_ARGS) \
@@ -75,8 +81,16 @@ endef
 	$(call add_local_user,$(IMAGE_WITH_TAG))
 
 %_push: %_build
-	@echo "Pushing docker image: $(IMAGE_WITH_TAG)"
-	docker push $(IMAGE_WITH_TAG)$(IMAGE_TAG_SUFFIX)
+	@if [ $(PUSH_TO_STAGING) = 0 ]; then \
+		echo "Pushing docker image: $(IMAGE_WITH_TAG)"; \
+		docker push $(IMAGE_WITH_TAG)$(IMAGE_TAG_SUFFIX); \
+	fi
+	@if [ $(PUSH_TO_STAGING) = 1 ]; then \
+		echo "Rewriting docker tag: $(IMAGE_WITH_TAG) to $(call rewrite_tag)"; \
+		docker tag $(IMAGE_WITH_TAG)$(IMAGE_TAG_SUFFIX) $(call rewrite_tag)$(IMAGE_TAG_SUFFIX); \
+		echo "Pushing docker image: $(call rewrite_tag)"; \
+		docker push $(call rewrite_tag)$(IMAGE_TAG_SUFFIX); \
+	fi
 
 %_pull:
 	@echo "Pulling docker image: $(IMAGE_WITH_TAG)"
@@ -148,6 +162,7 @@ old-cuda_%: NCCL_VERSION = 2.18.3-1+cuda12.1
 old-cuda_%: CUBLAS_VERSION = 12.1.3.1-1
 
 trtllm_%: STAGE = release
+trtllm_%: PUSH_TO_STAGING := 0
 trtllm_%: DEVEL_IMAGE = $(shell grep 'LLM_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
 trtllm_%: IMAGE_NAME = $(shell grep 'IMAGE_NAME = ' ../jenkins/BuildDockerImage.groovy | grep -o '".*"' | tr -d '"')
 trtllm_%: IMAGE_TAG = $(shell git rev-parse --abbrev-ref HEAD | tr '/' '_')

@@ -49,30 +49,30 @@ public:
 
     void TearDown() override {}
 
-    void initData(const std::vector<std::vector<SizeType>>& outputIds, const std::vector<SizeType>& nGramSizes)
+    void initData(std::vector<std::vector<SizeType>> const& outputIds, std::vector<SizeType> const& nGramSizes)
     {
         auto const ptrType = TRTDataType<void*>::value;
         SizeType const batchSize = outputIds.size();
         auto const maxBatchSize = 2 * batchSize;
 
-        mLogits = mBufferManager->pinned(ITensor::makeShape({batchSize, mVocabSizePadded}), nvinfer1::DataType::kFLOAT);
+        mLogits = BufferManager::pinned(ITensor::makeShape({batchSize, mVocabSizePadded}), nvinfer1::DataType::kFLOAT);
 
         mSequenceLengths
-            = mBufferManager->pinned(ITensor::makeShape({maxBatchSize, mBeamWidth}), nvinfer1::DataType::kINT32);
-        mFinished = mBufferManager->pinned(
+            = BufferManager::pinned(ITensor::makeShape({maxBatchSize, mBeamWidth}), nvinfer1::DataType::kINT32);
+        mFinished = BufferManager::pinned(
             ITensor::makeShape({maxBatchSize, mBeamWidth}), TRTDataType<tk::FinishedState::UnderlyingType>::value);
 
-        mOutputIds = mBufferManager->pinned(
+        mOutputIds = BufferManager::pinned(
             ITensor::makeShape({maxBatchSize, mBeamWidth, mMaxSeqLen}), nvinfer1::DataType::kINT32);
-        mOutputIdsPtr = mBufferManager->pinned(ITensor::makeShape({maxBatchSize, mBeamWidth}), ptrType);
+        mOutputIdsPtr = BufferManager::pinned(ITensor::makeShape({maxBatchSize, mBeamWidth}), ptrType);
 
-        mParentIds = mBufferManager->pinned(
+        mParentIds = BufferManager::pinned(
             ITensor::makeShape({maxBatchSize, mBeamWidth, mMaxSeqLen}), nvinfer1::DataType::kINT32);
-        mParentIdsPtr = mBufferManager->pinned(ITensor::makeShape({maxBatchSize, mBeamWidth}), ptrType);
+        mParentIdsPtr = BufferManager::pinned(ITensor::makeShape({maxBatchSize, mBeamWidth}), ptrType);
 
-        mNGramSizes = mBufferManager->pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
+        mNGramSizes = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
 
-        mBatchSlots = mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
+        mBatchSlots = BufferManager::pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
 
         auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
         for (SizeType bi = 0; bi < batchSize; ++bi)
@@ -139,7 +139,7 @@ public:
     }
 
     void verifyBanRepeatNGramResults(
-        const std::vector<SizeType>& nGramSizes, const std::vector<SizeType>& expectedLastId)
+        std::vector<SizeType> const& nGramSizes, std::vector<SizeType> const& expectedLastId)
     {
 
         auto const batchSize = expectedLastId.size();
@@ -161,8 +161,8 @@ public:
         }
     }
 
-    void runBanRepeatNGramTest(const std::vector<std::vector<SizeType>>& outputIds,
-        const std::vector<SizeType>& nGramSizes, const std::vector<SizeType>& expectedLastId)
+    void runBanRepeatNGramTest(std::vector<std::vector<SizeType>> const& outputIds,
+        std::vector<SizeType> const& nGramSizes, std::vector<SizeType> const& expectedLastId)
     {
         auto const batchSize = expectedLastId.size();
         int32_t maxStep = 0;

@@ -39,7 +39,7 @@ public:
 
     constexpr QuantMode(QuantMode const&) noexcept = default;
 
-    constexpr QuantMode& operator=(const QuantMode& other) noexcept = default;
+    constexpr QuantMode& operator=(QuantMode const& other) noexcept = default;
 
     static constexpr QuantMode none() noexcept
     {
@@ -276,32 +276,32 @@ public:
         return quantMode;
     }
 
-    constexpr QuantMode operator+(const QuantMode& other) const noexcept
+    constexpr QuantMode operator+(QuantMode const& other) const noexcept
     {
         return QuantMode(mValue | other.mValue);
     }
 
-    constexpr QuantMode& operator+=(const QuantMode& other) noexcept
+    constexpr QuantMode& operator+=(QuantMode const& other) noexcept
     {
         return *this = *this + other;
     }
 
-    constexpr QuantMode operator-(const QuantMode& other) const noexcept
+    constexpr QuantMode operator-(QuantMode const& other) const noexcept
     {
         return QuantMode(mValue & ~other.mValue);
     }
 
-    constexpr QuantMode& operator-=(const QuantMode& other) noexcept
+    constexpr QuantMode& operator-=(QuantMode const& other) noexcept
     {
         return *this = *this - other;
     }
 
-    constexpr bool operator==(const QuantMode& other) const noexcept
+    constexpr bool operator==(QuantMode const& other) const noexcept
     {
         return mValue == other.mValue;
     }
 
-    constexpr bool operator!=(const QuantMode& other) const noexcept
+    constexpr bool operator!=(QuantMode const& other) const noexcept
     {
         return !(*this == other);
     }

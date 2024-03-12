@@ -12,8 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
-import sys
 import unittest
 
 import _utils
@@ -22,6 +20,9 @@ import _utils
 import torch
 import tensorrt as trt
 # isort: on
+import os
+import sys
+
 from parameterized import parameterized
 from polygraphy.backend.trt import CreateConfig, EngineFromNetwork, TrtRunner
 
@@ -31,7 +32,7 @@ from tensorrt_llm.quantization.functional import \
     weight_only_groupwise_quant_matmul
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import getSMVersion
+from utils.util import skip_pre_ampere, skip_pre_hopper, unittest_name_func
 
 
 class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
@@ -209,16 +210,17 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
         ref = _utils.woq_groupwise_gt_matmul(activation, ref_th_weight, bias)
         _utils.woq_assert_near_eq(ref, output, 2)
 
-    @parameterized.expand([(1, 1024, 64, 'float16', False, True, True, 64),
-                           (16, 1024, 256, 'float16', False, True, False, 64),
-                           (32, 2048, 384, 'float16', False, False, True, 64),
-                           (64, 2048, 1024, 'float16', False, False, False, 64),
-                           (2, 1024, 128, 'float16', False, True, True, 128),
-                           (8, 1024, 256, 'float16', False, True, False, 128),
-                           (48, 2048, 384, 'float16', False, False, True, 128),
-                           (96, 2048, 1024, 'float16', False, False, False, 128)
-                           ])
-    @unittest.skipIf(getSMVersion() < 80, "Unsupported test on pre-Ampere.")
+    @parameterized.expand(
+        [(1, 1024, 64, 'float16', False, True, True, 64),
+         (16, 1024, 256, 'float16', False, True, False, 64),
+         (32, 2048, 384, 'float16', False, False, True, 64),
+         (64, 2048, 1024, 'float16', False, False, False, 64),
+         (2, 1024, 128, 'float16', False, True, True, 128),
+         (8, 1024, 256, 'float16', False, True, False, 128),
+         (48, 2048, 384, 'float16', False, False, True, 128),
+         (96, 2048, 1024, 'float16', False, False, False, 128)],
+        name_func=unittest_name_func)
+    @skip_pre_ampere
     def test_matmul_int4_input(self,
                                m,
                                n,
@@ -232,17 +234,17 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
                                    has_pre_quant, has_zero, has_bias,
                                    group_size)
 
-    @parameterized.expand([
-        (1, 1024, 64, 'bfloat16', False, True, True, 64),
-        (16, 1024, 256, 'bfloat16', False, True, False, 64),
-        (32, 2048, 384, 'bfloat16', False, False, True, 64),
-        (64, 2048, 1024, 'bfloat16', False, False, False, 64),
-        (2, 1024, 128, 'bfloat16', False, True, True, 128),
-        (8, 1024, 256, 'bfloat16', False, True, False, 128),
-        (48, 2048, 384, 'bfloat16', False, False, True, 128),
-        (96, 2048, 1024, 'bfloat16', False, False, False, 128)
-    ])
-    @unittest.skipIf(getSMVersion() < 80, "Unsupported test on pre-Ampere.")
+    @parameterized.expand(
+        [(1, 1024, 64, 'bfloat16', False, True, True, 64),
+         (16, 1024, 256, 'bfloat16', False, True, False, 64),
+         (32, 2048, 384, 'bfloat16', False, False, True, 64),
+         (64, 2048, 1024, 'bfloat16', False, False, False, 64),
+         (2, 1024, 128, 'bfloat16', False, True, True, 128),
+         (8, 1024, 256, 'bfloat16', False, True, False, 128),
+         (48, 2048, 384, 'bfloat16', False, False, True, 128),
+         (96, 2048, 1024, 'bfloat16', False, False, False, 128)],
+        name_func=unittest_name_func)
+    @skip_pre_ampere
     def test_matmul_bf16_int4_input(self,
                                     m,
                                     n,
@@ -264,7 +266,7 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
                            (64, 1024, 256, 'float16', True, False, 128),
                            (384, 2048, 384, 'float16', False, True, 128),
                            (512, 2048, 1024, 'float16', False, False, 128)])
-    @unittest.skipIf(getSMVersion() < 80, "Unsupported test on pre-Ampere.")
+    @skip_pre_ampere
     def test_prequant_matmul_fp16_int4_input(self,
                                              m,
                                              n,
@@ -285,8 +287,9 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
                            (4, 1024, 128, 'bfloat16', True, True, 128),
                            (64, 1024, 256, 'bfloat16', True, False, 128),
                            (384, 2048, 384, 'bfloat16', False, True, 128),
-                           (512, 2048, 1024, 'bfloat16', False, False, 128)])
-    @unittest.skipIf(getSMVersion() < 80, "Unsupported test on pre-Ampere.")
+                           (512, 2048, 1024, 'bfloat16', False, False, 128)],
+                          name_func=unittest_name_func)
+    @skip_pre_ampere
     def test_prequant_matmul_bf16_int4_input(self,
                                              m,
                                              n,
@@ -300,18 +303,17 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
                                    has_pre_quant, has_zero, has_bias,
                                    group_size)
 
-    @parameterized.expand([
-        (1, 1024, 128, 'float16', True, True, True, 64, False),
-        (2, 1024, 256, 'float16', True, True, True, 64, False),
-        (3, 1024, 384, 'float16', True, True, True, 64, False),
-        (4, 1024, 512, 'float16', True, True, True, 128, False),
-        (16, 1024, 256, 'float16', True, True, False, 128, True),
-        (64, 1024, 256, 'float16', True, True, False, 128, True),
-        (128, 2048, 384, 'float16', True, False, True, 128, False),
-        (256, 2048, 1024, 'float16', True, False, False, 128, True)
-    ])
-    @unittest.skipIf(getSMVersion() != 90,
-                     "Hopper dedicated test, not supported on pre-Hopper.")
+    @parameterized.expand(
+        [(1, 1024, 128, 'float16', True, True, True, 64, False),
+         (2, 1024, 256, 'float16', True, True, True, 64, False),
+         (3, 1024, 384, 'float16', True, True, True, 64, False),
+         (4, 1024, 512, 'float16', True, True, True, 128, False),
+         (16, 1024, 256, 'float16', True, True, False, 128, True),
+         (64, 1024, 256, 'float16', True, True, False, 128, True),
+         (128, 2048, 384, 'float16', True, False, True, 128, False),
+         (256, 2048, 1024, 'float16', True, False, False, 128, True)],
+        name_func=unittest_name_func)
+    @skip_pre_hopper
     def test_prequant_matmul_fp8_int4_input_hopper(self, m, n, k, dtype,
                                                    has_pre_quant, has_zero,
                                                    has_bias, group_size,
@@ -330,14 +332,15 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
     # On hopper, any multiple of 64 works as a group size for FP16, with the CUTLASS kernel
     # We keep some unit tests to ensure that this support is maintained, even if the CUDA kernels
     # do not support it at the moment.
-    @parameterized.expand([(128, 128, 128, 'float16', False, False, False, 64),
-                           (32, 1024, 128, 'bfloat16', True, True, True, 128),
-                           (32, 1024, 256, 'float16', True, True, False, 192),
-                           (32, 2048, 384, 'bfloat16', True, False, True, 256),
-                           (64, 2048, 1024, 'float16', True, False, False, 320)]
-                          )
-    @unittest.skipIf(getSMVersion() != 90,
-                     "Hopper dedicated test, not supported on pre-Hopper.")
+    @parameterized.expand(
+        [(128, 128, 128, 'float16', False, False, False, 64),
+         (32, 1024, 128, 'bfloat16', True, True, True, 128),
+         (32, 1024, 256, 'float16', True, True, False, 192),
+         (32, 2048, 384, 'bfloat16', True, False, True, 256),
+         (64, 2048, 1024, 'float16', True, False, False, 320)],
+        name_func=unittest_name_func,
+    )
+    @skip_pre_hopper
     def test_hopper_flexible_groups(self, m, n, k, act_dtype, has_pre_quant,
                                     has_zero, has_bias, group_size):
         self._woq_groupwise_matmul(m, n, k, act_dtype, torch.quint4x2,
@@ -347,14 +350,14 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
     # On hopper, any multiple of 128 works as a group size for FP8, with the CUTLASS kernel
     # We keep some unit tests to ensure that this support is maintained, even if the CUDA kernels
     # do not support it at the moment.
-    @parameterized.expand([(32, 1024, 128, 'float16', True, True, True, 128),
-                           (32, 1024, 128, 'float16', True, True, True, 256),
-                           (32, 1024, 256, 'float16', True, True, False, 384),
-                           (32, 2048, 1024, 'float16', True, False, True, 512),
-                           (64, 2048, 2048, 'float16', True, False, False, 640)]
-                          )
-    @unittest.skipIf(getSMVersion() != 90,
-                     "Hopper dedicated test, not supported on pre-Hopper.")
+    @parameterized.expand(
+        [(32, 1024, 128, 'float16', True, True, True, 128),
+         (32, 1024, 128, 'float16', True, True, True, 256),
+         (32, 1024, 256, 'float16', True, True, False, 384),
+         (32, 2048, 1024, 'float16', True, False, True, 512),
+         (64, 2048, 2048, 'float16', True, False, False, 640)],
+        name_func=unittest_name_func)
+    @skip_pre_hopper
     def test_hopper_fp8_int4_flexible_groups(self, m, n, k, dtype,
                                              has_pre_quant, has_zero, has_bias,
                                              group_size):

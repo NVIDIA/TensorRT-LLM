@@ -107,11 +107,14 @@ class Mamba(Module):
 
         # In context phase, conv_state is a zero tensor, and it is used for padding
         # In generation phase, conv_state is a tensor of the past x
-        x_pad = concat([conv_state, x], dim=2)
+        slice_shape = concat([shape(x, 0), self.d_inner, self.d_conv - 1])
+        past_conv_state = slice(conv_state,
+                                concat([0, 0, shape(conv_state, 2) - 3]),
+                                slice_shape)
+        x_pad = concat([past_conv_state, x], dim=2)
 
         # Update conv_state
-        slice_shape = concat([shape(x, 0), self.d_inner, self.d_conv - 1])
-        conv_state = slice(x_pad, concat([0, 0, shape(x, 2)]), slice_shape)
+        conv_state = x_pad
 
         # Convolution
         x_pad = x_pad.view(

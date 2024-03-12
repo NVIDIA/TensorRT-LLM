@@ -74,6 +74,16 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_fp16_wq \
             --output_dir ./tmp/llama/7B/trt_engines/weight_only/1-gpu/ \
             --gemm_plugin float16
 
+# Build LLaMA 7B using 2-way auto parallelism.
+python convert_checkpoint.py --model_dir ./tmp/llama/7B/ \
+                            --output_dir ./tllm_checkpoint_1gpu_fp16 \
+                            --dtype float16
+
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_fp16 \
+            --output_dir ./tmp/llama/7B/trt_engines/fp16/2-gpu/ \
+            --gemm_plugin float16 \
+            --world_size 2
+
 # Build LLaMA 7B using 2-way tensor parallelism.
 python convert_checkpoint.py --model_dir ./tmp/llama/7B/ \
                             --output_dir ./tllm_checkpoint_2gpu_tp2 \
@@ -570,8 +580,7 @@ python convert_checkpoint.py --model_dir /tmp/llama-v2-13b-hf \
                          --output_dir ./tllm_checkpoint_2gpu_lora \
                          --dtype float16 \
                          --tp_size 2 \
-                         --hf_lora_dir /tmp/chinese-llama-2-lora-13b \
-                         --use_fused_mlp
+                         --hf_lora_dir /tmp/chinese-llama-2-lora-13b
 
 trtllm-build --checkpoint_dir ./tllm_checkpoint_2gpu_lora \
             --output_dir /tmp/new_lora_13b/trt_engines/fp16/2-gpu/ \
@@ -692,19 +701,19 @@ We can observe that `luotuo-lora-7b-0.1` produces correct answers on the first s
 
 ## Run LLaMa with StreamingLLM
 
-* Build engine. Set `--enable_pos_shift` to use positions in KV cache for RoPE, and set `--dense_context_fmha` to use dense context fmha in context phase.
+* Build engine. Set `--pos_shift enable` to use positions in KV cache for RoPE, and set `--dense_context_fmha enable` to use dense context fmha in context phase.
 
 ```bash
 # Build the LLaMA 7B model with StreamingLLM feature using a single GPU and FP16.
 python convert_checkpoint.py --model_dir ./tmp/llama/7B/ \
                          --output_dir ./tllm_checkpoint_1gpu_streamlingllm \
-                         --dtype float16 \
-                         --dense_context_fmha \
-                         --enable_pos_shift
+                         --dtype float16
 
 trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_streamlingllm \
             --output_dir ./tmp/llama/7B/trt_engines/fp16_StreamingLLM/1-gpu/ \
-            --gemm_plugin float16
+            --gemm_plugin float16 \
+            --dense_context_fmha enable \
+            --pos_shift enable
 
 ```
 

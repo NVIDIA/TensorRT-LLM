@@ -18,18 +18,17 @@ import unittest
 from itertools import product
 
 import numpy as np
-import pytest
 import torch
 from einops import rearrange
 from parameterized import parameterized
+from torch_ref import selective_scan_ref, selective_state_update_ref
 
 import tensorrt_llm
 from tensorrt_llm import Tensor
 from tensorrt_llm._utils import str_dtype_to_torch
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from torch_ref import selective_scan_ref, selective_state_update_ref
-from utils.util import getSMVersion
+from utils.util import skip_bf16_pre_ampere, unittest_name_func
 
 
 class TestFunctional(unittest.TestCase):
@@ -37,17 +36,14 @@ class TestFunctional(unittest.TestCase):
     def setUp(self):
         tensorrt_llm.logger.set_level('error')
 
-    @parameterized.expand(
-        list(
-            product([2048], [16], ['context', 'generation'],
-                    ['float16', 'float32', 'bfloat16'])))
+    @parameterized.expand(list(
+        product([2048], [16], ['context', 'generation'],
+                ['float16', 'float32', 'bfloat16'])),
+                          name_func=unittest_name_func)
     def test_selective_scan(self, dim, dstate, req_type, dtype):
 
         # Skip tests that are not supported in pre-ampere architecture
-        if getSMVersion() < 80:
-            if dtype == 'bfloat16':
-                pytest.skip(
-                    "bfloat16 is not supported in pre-ampere architecture")
+        skip_bf16_pre_ampere(dtype)
 
         # configs
         batch_size = 1
@@ -59,7 +55,11 @@ class TestFunctional(unittest.TestCase):
 
         # test data
         torch.random.manual_seed(0)
-        state = torch.randn(batch_size, dstate, dim, device=device)
+        state = torch.randn(batch_size,
+                            dstate,
+                            dim,
+                            device=device,
+                            dtype=str_dtype_to_torch(dtype))
         x = torch.randn(batch_size,
                         seq_len,
                         dim,
@@ -108,10 +108,9 @@ class TestFunctional(unittest.TestCase):
             x_tensor = Tensor(name='input',
                               shape=x.shape,
                               dtype=tensorrt_llm.str_dtype_to_trt(dtype))
-            state_tensor = Tensor(
-                name='state',
-                shape=state.shape,
-                dtype=tensorrt_llm.str_dtype_to_trt('float32'))
+            state_tensor = Tensor(name='state',
+                                  shape=state.shape,
+                                  dtype=tensorrt_llm.str_dtype_to_trt(dtype))
             dt_tensor = Tensor(name='delta',
                                shape=dt.shape,
                                dtype=tensorrt_llm.str_dtype_to_trt(dtype))

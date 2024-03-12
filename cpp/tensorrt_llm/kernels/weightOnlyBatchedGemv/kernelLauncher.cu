@@ -25,12 +25,12 @@ template <WeightOnlyQuantType QType, typename WeightOnlyFlag, template <typename
     int N_PER_BLOCK, int BATCH, int BLOCK_SIZE>
 struct WeightOnlyBatchedGemvKernelLauncher
 {
-    static void run(const WeightOnlyParams& params, cudaStream_t stream);
+    static void run(WeightOnlyParams const& params, cudaStream_t stream);
 };
 
 template <WeightOnlyQuantType QType, typename WeightOnlyFlag, template <typename T> class ActOp, int N_PER_BLOCK,
     int BATCH, int BLOCK_SIZE>
-void select_zero_bias(const WeightOnlyParams& params, cudaStream_t stream)
+void select_zero_bias(WeightOnlyParams const& params, cudaStream_t stream)
 {
     if (params.zeros && params.bias)
     {
@@ -55,7 +55,7 @@ void select_zero_bias(const WeightOnlyParams& params, cudaStream_t stream)
 }
 
 template <WeightOnlyQuantType QType, typename WeightOnlyFlag, int N_PER_BLOCK, int BATCH, int BLOCK_SIZE>
-void select_activation(const WeightOnlyParams& params, cudaStream_t stream)
+void select_activation(WeightOnlyParams const& params, cudaStream_t stream)
 {
     switch (params.act_func_type)
     {
@@ -86,7 +86,7 @@ void select_activation(const WeightOnlyParams& params, cudaStream_t stream)
 }
 
 template <typename WeightOnlyFlag, int N_PER_BLOCK, int BATCH, int BLOCK_SIZE>
-void select_quant_type(const WeightOnlyParams& params, cudaStream_t stream)
+void select_quant_type(WeightOnlyParams const& params, cudaStream_t stream)
 {
     if (params.quant_type == WeightOnlyQuantType::Int4b)
     {
@@ -103,7 +103,7 @@ void select_quant_type(const WeightOnlyParams& params, cudaStream_t stream)
 }
 
 template <int N_PER_BLOCK, int BATCH, int BLOCK_SIZE>
-void select_groupwise_weight_only(const WeightOnlyParams& params, cudaStream_t stream)
+void select_groupwise_weight_only(WeightOnlyParams const& params, cudaStream_t stream)
 {
     if (params.weight_only_type == WeightOnlyType::GroupWise && params.group_size == 64)
     {
@@ -119,7 +119,7 @@ void select_groupwise_weight_only(const WeightOnlyParams& params, cudaStream_t s
     }
 }
 
-void weight_only_batched_gemv_launcher(const WeightOnlyParams& params, cudaStream_t stream)
+void weight_only_batched_gemv_launcher(WeightOnlyParams const& params, cudaStream_t stream)
 {
     assert(params.act_func_type == WeightOnlyActivationFunctionType::Identity);
     assert(params.weight_only_type == WeightOnlyType::GroupWise

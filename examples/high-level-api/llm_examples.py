@@ -8,7 +8,7 @@ from typing import List, Optional
 import torch
 
 from tensorrt_llm import LLM, ModelConfig
-from tensorrt_llm.hlapi.llm import SamplingConfig
+from tensorrt_llm.hlapi.llm import KvCacheConfig, SamplingConfig
 from tensorrt_llm.hlapi.utils import get_device_count
 
 # NOTE, Currently, the following examples are only available for LLaMA models.
@@ -86,7 +86,8 @@ def run_llm_generate_async_example(prompts: List[str],
     config = ModelConfig(llama_model_dir)
     config.parallel_config.tp_size = tp_size
 
-    llm = LLM(config, kvcache_free_gpu_memory_fraction=0.4)
+    llm = LLM(config,
+              kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4))
 
     async def task(prompt: str):
         outputs = []
@@ -135,6 +136,84 @@ def run_llm_with_quantization(prompts: List[str],
         print(output)
 
 
+def run_llm_with_async_future(prompts: List[str], llama_model_dir: str):
+    config = ModelConfig(llama_model_dir)
+    llm = LLM(config,
+              kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4))
+
+    # The result of generate() is similar to a Future, it won't block the main thread, call .result() to explicitly wait for the result
+    for generation in llm.generate_async(prompts):
+        # .result() is a blocking call, call it when you want to wait for the result
+        output = generation.result()
+        print(output.text)
+
+    # Similar to .result(), there is an async version of .result(), which is .aresult(), and it works with the generate_async().
+    async def task(prompt: str):
+        generation = llm.generate_async(prompt, streaming=False)
+        output = await generation.aresult()
+        print(output.text)
+
+    async def main():
+        tasks = [task(prompt) for prompt in prompts]
+        await asyncio.gather(*tasks)
+
+    asyncio.run(main())
+
+
+def run_llm_with_auto_parallel(prompts: List[str],
+                               llama_model_dir: str,
+                               world_size: int = 1):
+    ''' Running LLM with auto parallel enabled. '''
+    if get_device_count() < world_size:
+        print(
+            "Skip the example for auto parallel!!! Since the number of GPUs is less than required"
+        )
+        return
+    if world_size > 1:
+        print(f'Running LLM with Auto Parallel on {world_size} GPUs.')
+
+    config = ModelConfig(llama_model_dir)
+    config.parallel_config.auto_parallel = True
+    config.parallel_config.world_size = world_size
+
+    llm = LLM(config)
+
+    for output in llm.generate(prompts):
+        print(output)
+
+
+def run_llm_with_auto_parallel_async(prompts: List[str],
+                                     llama_model_dir: str,
+                                     world_size: int = 1,
+                                     streaming: bool = False):
+    ''' Running LLM asynchronously with auto parallel enabled. '''
+    if get_device_count() < world_size:
+        print(
+            "Skip the example for auto parallel!!! Since the number of GPUs is less than required"
+        )
+        return
+    if world_size > 1:
+        print(f'Running LLM with Auto Parallel on {world_size} GPUs.')
+
+    config = ModelConfig(llama_model_dir)
+    config.parallel_config.auto_parallel = True
+    config.parallel_config.world_size = world_size
+
+    llm = LLM(config)
+
+    async def task(prompt: str):
+        outputs = []
+        async for output in llm.generate_async(prompt, streaming=streaming):
+            outputs.append(output.text)
+        print(' '.join(outputs))
+
+    async def main():
+        tasks = [task(prompt) for prompt in prompts]
+        await asyncio.gather(*tasks)
+
+    asyncio.run(main())
+
+
 def _parse_arguments():
     parser = ArgumentParser()
     parser.add_argument('--task', type=str, choices=_get_functions())
@@ -147,6 +226,7 @@ def _parse_arguments():
                         default=None)
     parser.add_argument('--quant_type', type=str, choices=['int4_awq', 'fp8'])
     parser.add_argument('--prompt', type=str, default="What is LLM?")
+    parser.add_argument('--world_size', type=int, default=1)
     parser.add_argument('--tp_size', type=int, default=1)
     parser.add_argument('--streaming', action='store_true')
     return parser.parse_args()
@@ -182,9 +262,17 @@ if __name__ == '__main__':
             streaming=args.streaming),
         run_llm_with_quantization=lambda: run_llm_with_quantization(
             [args.prompt], args.hf_model_dir, args.quant_type),
+        run_llm_with_auto_parallel=lambda: run_llm_with_auto_parallel(
+            [args.prompt], args.hf_model_dir, args.world_size),
+        run_llm_with_auto_parallel_async=lambda:
+        run_llm_with_auto_parallel_async([args.prompt],
+                                         args.hf_model_dir,
+                                         args.world_size,
+                                         streaming=args.streaming),
         run_llm_without_tokenizer_from_tllm_engine=lambda:
         run_llm_without_tokenizer_from_tllm_engine(args.dump_engine_dir),
-    )
+        run_llm_with_async_future=lambda: run_llm_with_async_future(
+            [args.prompt], args.hf_model_dir))
 
     print(f'Running {args.task} ...')
 

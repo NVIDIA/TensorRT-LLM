@@ -134,13 +134,12 @@ class GenerationResult(GenerationOutput):
             return ''
         return self.tokenizer.decode(self.token_ids)
 
-    def wait_completion(self,
-                        timeout: Optional[float] = None) -> "GenerationResult":
+    def result(self, timeout: Optional[float] = None) -> "GenerationResult":
         while not self.done:
             self.wait_step(timeout)
         return self
 
-    async def await_completion(self) -> "GenerationResult":
+    async def aresult(self) -> "GenerationResult":
         while not self.done:
             await self.await_step()
         return self
@@ -313,7 +312,7 @@ class GenerationExecutor:
         result_list = [results] if isinstance(results,
                                               GenerationRequest) else results
         for result in result_list:
-            result.wait_completion()
+            result.result()
         return results
 
     def get_stats(self):
@@ -386,7 +385,7 @@ class ParallelGenerationExecutor(GenerationExecutor):
 
     def __init__(
         self,
-        tp_size: int,
+        world_size: int,
         engine_dir: Path,
         tokenizer: Union[str, Path, TokenizerBase, None],
         max_beam_width: int = 1,
@@ -394,13 +393,10 @@ class ParallelGenerationExecutor(GenerationExecutor):
         InflightFusedBatching,
         executor_policy: tllm.SchedulerPolicy = tllm.SchedulerPolicy.
         GUARANTEED_NO_EVICT,
-        kvcache_free_gpu_memory_fraction: Optional[float] = None,
+        executor_config: tllm.TrtGptModelOptionalParams = tllm.
+        TrtGptModelOptionalParams(),
         socket_client: Optional[SocketClient] = None,
-        # TODO: support serialization
-        # executor_config: tllm.TrtGptModelOptionalParams = tllm.TrtGptModelOptionalParams(),
     ) -> None:
-        assert kvcache_free_gpu_memory_fraction is None or isinstance(
-            kvcache_free_gpu_memory_fraction, float)
 
         self.on_PMP = mpi_world_size() == 1
         self.on_MPI = mpi_world_size() > 1
@@ -443,18 +439,15 @@ class ParallelGenerationExecutor(GenerationExecutor):
                               TokenizerBase), "tokenizer not initialized"
 
             self.mpi_session = MpiSession(
-                n_workers=tp_size, async_callback=self._async_listener_callback)
+                n_workers=world_size,
+                async_callback=self._async_listener_callback)
             self.socket_client = self.mpi_session.get_socket_client()
 
             self.mpi_session.submit_sync(
                 ParallelGenerationExecutor._node_init_executor_task, engine_dir,
                 self.tokenizer, max_beam_width, executor_type, executor_policy,
-                kvcache_free_gpu_memory_fraction, self.socket_client)
+                executor_config, self.socket_client)
         else:
-            executor_config = tllm.TrtGptModelOptionalParams()
-            if kvcache_free_gpu_memory_fraction is not None:
-                executor_config.kv_cache_config.free_gpu_memory_fraction = kvcache_free_gpu_memory_fraction
-
             self.engine = tllm.GptManager(
                 engine_dir, executor_type, max_beam_width, executor_policy,
                 self.fetch_requests_on_mpi_node,
@@ -492,24 +485,23 @@ class ParallelGenerationExecutor(GenerationExecutor):
         max_beam_width: int,
         executor_type: tllm.TrtGptModelType,
         executor_policy: tllm.SchedulerPolicy,
-        kvcache_free_gpu_memory_fraction: Optional[float],
+        executor_config: tllm.TrtGptModelOptionalParams,
         socket_client: Optional[SocketClient],
-        # executor_config: tllm.TrtGptModelOptionalParams
     ):
         ''' Create a local GenerationExecutor instance for each MPI process. '''
         assert not NodeSession.is_initialized(), 'executor already initialized'
 
         logger.info(f'Initializing executor on MPI node #{mpi_rank()}')
 
-        tp_size = mpi_world_size()
+        world_size = mpi_world_size()
         NodeSession.state = ParallelGenerationExecutor(
-            tp_size,
+            world_size,
             engine_dir,
             tokenizer,
             max_beam_width,
             executor_type,
             executor_policy,
-            kvcache_free_gpu_memory_fraction=kvcache_free_gpu_memory_fraction,
+            executor_config=executor_config,
             socket_client=socket_client)
 
     # Callbacks for BatchManager

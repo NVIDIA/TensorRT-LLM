@@ -44,8 +44,8 @@ TensorRT-LLM Baichuan builds TensorRT engine(s) from HF checkpoint. If no checkp
 # 7B models should always enable `gpt_attention_plugin`` since RoPE is only
 # supported with GPTAttention plugin now.
 # Try gemm_plugin to prevent accuracy issue.
-trtllm-build --checkpoint_dir ./trt_ckpt/baichuan_v1_13b/ \
-             --output_dir ./trt_engines/baichuan_v1_13b/ \
+trtllm-build --checkpoint_dir ./tmp/baichuan_v1_13b/trt_ckpts/fp16/1-gpu/ \
+             --output_dir ./tmp/baichuan_v1_13b/trt_engines/fp16/1-gpu/ \
              --gemm_plugin float16 \
              --max_batch_size=32 \
              --max_input_len=1024 \
@@ -60,20 +60,20 @@ Here're some examples for checkpoint conversion that take `v1_13b` as example:
 python convert_checkpoint.py --model_version v1_13b \
                              --model_dir baichuan-inc/Baichuan-13B-Chat \
                              --dtype float16 \
-                             --output_dir ./tmp/baichuan_v1_13b/trt_engines/fp16/1-gpu/
+                             --output_dir ./tmp/baichuan_v1_13b/trt_ckpts/fp16/1-gpu/
 
 # Convert the Baichuan V1 13B model using a single GPU and BF16.
 python convert_checkpoint.py --model_version v1_13b \
                              --model_dir baichuan-inc/Baichuan-13B-Chat \
                              --dtype bfloat16 \
-                             --output_dir ./tmp/baichuan_v1_13b/trt_engines/bf16/1-gpu/
+                             --output_dir ./tmp/baichuan_v1_13b/trt_ckpts/bf16/1-gpu/
 
 # Convert the Baichuan V1 13B model using a single GPU and apply INT8 weight-only quantization.
 python convert_checkpoint.py --model_version v1_13b \
                              --model_dir baichuan-inc/Baichuan-13B-Chat \
                              --dtype float16 \
                              --use_weight_only \
-                             --output_dir ./tmp/baichuan_v1_13b/trt_engines/int8_weight_only/1-gpu/
+                             --output_dir ./tmp/baichuan_v1_13b/trt_ckpts/int8_weight_only/1-gpu/
 
 # Convert the Baichuan V1 13B model using a single GPU and apply INT4 weight-only quantization.
 python convert_checkpoint.py --model_version v1_13b \
@@ -81,13 +81,13 @@ python convert_checkpoint.py --model_version v1_13b \
                              --dtype float16 \
                              --use_weight_only \
                              --weight_only_precision int4 \
-                             --output_dir ./tmp/baichuan_v1_13b/trt_engines/int4_weight_only/1-gpu/
+                             --output_dir ./tmp/baichuan_v1_13b/trt_ckpts/int4_weight_only/1-gpu/
 
 # Convert Baichuan V1 13B using 2-way tensor parallelism.
 python convert_checkpoint.py --model_version v1_13b \
                              --model_dir baichuan-inc/Baichuan-13B-Chat \
                              --dtype float16 \
-                             --output_dir ./tmp/baichuan_v1_13b/trt_engines/fp16/1-gpu/ \
+                             --output_dir ./tmp/baichuan_v1_13b/trt_ckpts/fp16/1-gpu/ \
                              --world_size 2 \
                              --tp_size 2
 ```
@@ -164,7 +164,7 @@ To run the GPTQ Baichuan example, the following steps are required:
                                  --group_size 64 \
                                  --world_size 2 \
                                  --tp_size 2 \
-                                 --output_dir ./tmp/baichuan_v2_13b/trt_engines/int4_gptq_gs64/2-gpu/
+                                 --output_dir ./tmp/baichuan_v2_13b/trt_ckpts/int4_gptq_gs64/2-gpu/
     ```
     The quantized model checkpoint is saved for future TensorRT-LLM engine build directly with the `trtllm-build` command mentioned above.
 

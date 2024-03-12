@@ -52,8 +52,8 @@ namespace cutlass_kernels
 
 template <typename T, typename WeightType, typename arch, cutlass::WeightOnlyQuantOp QuantOp, typename EpilogueTag,
     typename ThreadblockShape, typename WarpShape, int Stages>
-void generic_mixed_gemm_kernelLauncher(const T* A, const WeightType* B, const T* weight_scales,
-    const T* weight_zero_points, const T* biases, const float alpha, T* C, int m, int n, int k, const int group_size,
+void generic_mixed_gemm_kernelLauncher(T const* A, WeightType const* B, T const* weight_scales,
+    T const* weight_zero_points, T const* biases, float const alpha, T* C, int m, int n, int k, int const group_size,
     tkc::CutlassGemmConfig gemm_config, char* workspace, size_t workspace_bytes, cudaStream_t stream,
     int* occupancy = nullptr)
 {
@@ -127,7 +127,7 @@ void generic_mixed_gemm_kernelLauncher(const T* A, const WeightType* B, const T*
 
     using Gemm = cutlass::gemm::device::GemmUniversalBaseCompat<GemmKernel>;
 
-    const int ldb = cutlass::platform::is_same<cutlass::layout::RowMajor, typename MixedGemmArchTraits::LayoutB>::value
+    int const ldb = cutlass::platform::is_same<cutlass::layout::RowMajor, typename MixedGemmArchTraits::LayoutB>::value
         ? n
         : k * GemmKernel::kInterleave;
 
@@ -171,7 +171,7 @@ void generic_mixed_gemm_kernelLauncher(const T* A, const WeightType* B, const T*
         }
     }
 
-    const int ld_scale_zero = cutlass::isFinegrained(QuantOp) ? n : 0;
+    int const ld_scale_zero = cutlass::isFinegrained(QuantOp) ? n : 0;
     ElementAccumulator output_op_beta = (biases == nullptr) ? ElementAccumulator(0.f) : ElementAccumulator(1.f);
     typename Gemm::Arguments args({m, n, k}, group_size, {reinterpret_cast<ElementType*>(const_cast<T*>(A)), k},
         {reinterpret_cast<CutlassWeightType*>(const_cast<WeightType*>(B)), ldb},
@@ -230,8 +230,8 @@ void generic_mixed_gemm_kernelLauncher(const T* A, const WeightType* B, const T*
 // quanitzation is only supported on Ampere+ GPUs.
 template <typename T, typename WeightType, typename arch, cutlass::WeightOnlyQuantOp QuantOp, typename EpilogueTag,
     typename ThreadblockShape, typename WarpShape, int Stages>
-void filter_and_run_mixed_gemm(const T* A, const WeightType* B, const T* weight_scales, const T* weight_zero_points,
-    const T* biases, const float alpha, T* C, int m, int n, int k, const int group_size,
+void filter_and_run_mixed_gemm(T const* A, WeightType const* B, T const* weight_scales, T const* weight_zero_points,
+    T const* biases, float const alpha, T* C, int m, int n, int k, int const group_size,
     tkc::CutlassGemmConfig gemm_config, char* workspace, size_t workspace_bytes, cudaStream_t stream,
     int* occupancy = nullptr)
 {
@@ -261,8 +261,8 @@ void filter_and_run_mixed_gemm(const T* A, const WeightType* B, const T* weight_
 
 template <typename T, typename WeightType, typename arch, cutlass::WeightOnlyQuantOp QuantOp, typename EpilogueTag,
     typename ThreadblockShape, typename WarpShape>
-void dispatch_gemm_config(const T* A, const WeightType* B, const T* weight_scales, const T* weight_zero_points,
-    const T* biases, const float alpha, T* C, int m, int n, int k, const int group_size,
+void dispatch_gemm_config(T const* A, WeightType const* B, T const* weight_scales, T const* weight_zero_points,
+    T const* biases, float const alpha, T* C, int m, int n, int k, int const group_size,
     tkc::CutlassGemmConfig gemm_config, char* workspace, size_t workspace_bytes, cudaStream_t stream,
     int* occupancy = nullptr)
 {
@@ -300,9 +300,9 @@ constexpr bool is_fp8()
 
 template <typename ActivationType, typename WeightType, typename ScaleZeroType, typename BiasType, typename OutputType,
     typename arch, cutlass::WeightOnlyQuantOp QuantOp, typename EpilogueTag>
-void dispatch_gemm_to_cutlass(const ActivationType* A, const WeightType* B, const ScaleZeroType* weight_scales,
-    const ScaleZeroType* weight_zero_points, const BiasType* biases, const float alpha, OutputType* C, int m, int n,
-    int k, const int group_size, char* workspace, size_t workspace_bytes, tkc::CutlassGemmConfig gemm_config,
+void dispatch_gemm_to_cutlass(ActivationType const* A, WeightType const* B, ScaleZeroType const* weight_scales,
+    ScaleZeroType const* weight_zero_points, BiasType const* biases, float const alpha, OutputType* C, int m, int n,
+    int k, int const group_size, char* workspace, size_t workspace_bytes, tkc::CutlassGemmConfig gemm_config,
     cudaStream_t stream, int* occupancy = nullptr)
 {
 
@@ -412,9 +412,9 @@ template <typename ActivationType, typename WeightType, cutlass::WeightOnlyQuant
     typename BiasType, typename OutputType>
 template <typename EpilogueTag>
 void CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType, BiasType,
-    OutputType>::dispatch_to_arch<EpilogueTag>(const ActivationType* A, const WeightType* B,
-    const ScaleZeroType* weight_scales, const ScaleZeroType* weight_zero_points, const BiasType* biases,
-    const float alpha, OutputType* C, int m, int n, int k, const int group_size, tkc::CutlassGemmConfig gemm_config,
+    OutputType>::dispatch_to_arch<EpilogueTag>(ActivationType const* A, WeightType const* B,
+    ScaleZeroType const* weight_scales, ScaleZeroType const* weight_zero_points, BiasType const* biases,
+    float const alpha, OutputType* C, int m, int n, int k, int const group_size, tkc::CutlassGemmConfig gemm_config,
     char* workspace_ptr, const size_t workspace_bytes, cudaStream_t stream, int* occupancy)
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
@@ -453,16 +453,16 @@ void CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType
 template <typename ActivationType, typename WeightType, cutlass::WeightOnlyQuantOp QuantOp, typename ScaleZeroType,
     typename BiasType, typename OutputType>
 void CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType, BiasType, OutputType>::gemm(
-    const void* A, const void* B, const void* weight_scales, const void* weight_zero_points, const void* biases,
-    const float alpha, void* C, int m, int n, int k, const int group_size, tkc::CutlassGemmConfig gemmConfig,
+    void const* A, void const* B, void const* weight_scales, void const* weight_zero_points, void const* biases,
+    float const alpha, void* C, int m, int n, int k, int const group_size, tkc::CutlassGemmConfig gemmConfig,
     char* workspace_ptr, const size_t workspace_bytes, cudaStream_t stream)
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
     if constexpr ((QuantOp == cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS)
         || (QuantOp == cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY))
     {
-        dispatch_to_arch<tkc::EpilogueOpBias>((const ActivationType*) A, (const WeightType*) B,
-            (const ScaleZeroType*) weight_scales, (const ScaleZeroType*) weight_zero_points, (const BiasType*) biases,
+        dispatch_to_arch<tkc::EpilogueOpBias>((ActivationType const*) A, (WeightType const*) B,
+            (ScaleZeroType const*) weight_scales, (ScaleZeroType const*) weight_zero_points, (BiasType const*) biases,
             alpha, (OutputType*) C, m, n, k, group_size, gemmConfig, workspace_ptr, workspace_bytes, stream, nullptr);
     }
     else
@@ -475,8 +475,8 @@ void CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType
 template <typename ActivationType, typename WeightType, cutlass::WeightOnlyQuantOp QuantOp, typename ScaleZeroType,
     typename BiasType, typename OutputType>
 void CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType, BiasType, OutputType>::gemm(
-    const void* A, const void* B, const void* weight_scales, const void* weight_zero_points, const void* biases,
-    void* C, int m, int n, int k, const int group_size, tkc::CutlassGemmConfig gemmConfig, char* workspace_ptr,
+    void const* A, void const* B, void const* weight_scales, void const* weight_zero_points, void const* biases,
+    void* C, int m, int n, int k, int const group_size, tkc::CutlassGemmConfig gemmConfig, char* workspace_ptr,
     const size_t workspace_bytes, cudaStream_t stream)
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
@@ -487,15 +487,15 @@ void CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType
 template <typename ActivationType, typename WeightType, cutlass::WeightOnlyQuantOp QuantOp, typename ScaleZeroType,
     typename BiasType, typename OutputType>
 void CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType, BiasType, OutputType>::gemm(
-    const void* A, const void* B, const void* weight_scales, const float alpha, void* C, int m, int n, int k,
+    void const* A, void const* B, void const* weight_scales, float const alpha, void* C, int m, int n, int k,
     tkc::CutlassGemmConfig gemmConfig, char* workspace_ptr, const size_t workspace_bytes, cudaStream_t stream)
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
 
     if constexpr (QuantOp == cutlass::WeightOnlyQuantOp::PER_COLUMN_SCALE_ONLY)
     {
-        dispatch_to_arch<tkc::EpilogueOpBias>((const ActivationType*) A, (const WeightType*) B,
-            (const ScaleZeroType*) weight_scales, nullptr, nullptr, alpha, (OutputType*) C, m, n, k, k, gemmConfig,
+        dispatch_to_arch<tkc::EpilogueOpBias>((ActivationType const*) A, (WeightType const*) B,
+            (ScaleZeroType const*) weight_scales, nullptr, nullptr, alpha, (OutputType*) C, m, n, k, k, gemmConfig,
             workspace_ptr, workspace_bytes, stream, nullptr);
     }
     else
@@ -507,7 +507,7 @@ void CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType
 template <typename ActivationType, typename WeightType, cutlass::WeightOnlyQuantOp QuantOp, typename ScaleZeroType,
     typename BiasType, typename OutputType>
 void CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType, BiasType, OutputType>::gemm(
-    const void* A, const void* B, const void* weight_scales, void* C, int m, int n, int k,
+    void const* A, void const* B, void const* weight_scales, void* C, int m, int n, int k,
     tkc::CutlassGemmConfig gemmConfig, char* workspace_ptr, const size_t workspace_bytes, cudaStream_t stream)
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
@@ -529,12 +529,12 @@ template <typename ActivationType, typename WeightType, cutlass::WeightOnlyQuant
     typename BiasType, typename OutputType>
 size_t
 CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType, BiasType, OutputType>::getWorkspaceSize(
-    const int m, const int n, const int k)
+    int const m, int const n, int const k)
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
     // These are the min tile sizes for each config, which would launch the maximum number of blocks
-    const int max_grid_m = cutlass::ceil_div(m, MIN_M_TILE);
-    const int max_grid_n = cutlass::ceil_div(n, MIN_N_TILE);
+    int const max_grid_m = cutlass::ceil_div(m, MIN_M_TILE);
+    int const max_grid_n = cutlass::ceil_div(n, MIN_N_TILE);
     // We need 4 bytes per block in the worst case. We launch split_k_limit in z dim.
     return static_cast<size_t>(max_grid_m * max_grid_n * SPLIT_K_LIMIT * 4);
 }

@@ -13,18 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import contextlib
-import os
-import sys
 import unittest
 
 import _utils
 import numpy as np
-import pytest
 
 # isort: off
 import torch
 import tensorrt as trt
 # isort: on
+import os
+import sys
+
 from parameterized import parameterized
 from polygraphy.backend.trt import CreateConfig, EngineFromNetwork, TrtRunner
 from transformers import GPT2Config
@@ -34,7 +34,7 @@ from tensorrt_llm import Tensor
 from tensorrt_llm.quantization import QuantMode
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import getSMVersion
+from utils.util import skip_pre_ampere, unittest_name_func
 
 
 class GPT2AttentionSmoothQuant(torch.nn.Module):
@@ -202,28 +202,25 @@ class TestSmoothQuant(unittest.TestCase):
     def setUp(self):
         tensorrt_llm.logger.set_level('error')
 
-    @parameterized.expand([
-        ('float16', False, False, False,
-         tensorrt_llm.quantization.layers.SmoothQuantLinear),
-        ('float16', False, True, False,
-         tensorrt_llm.quantization.layers.SmoothQuantLinear),
-        ('float16', True, False, False,
-         tensorrt_llm.quantization.layers.SmoothQuantLinear),
-        ('float16', True, True, False,
-         tensorrt_llm.quantization.layers.SmoothQuantLinear),
-        ('float32', True, True, False,
-         tensorrt_llm.quantization.layers.SmoothQuantLinear),
-        ('int32', True, True, False,
-         tensorrt_llm.quantization.layers.SmoothQuantLinear),
-        ('float32', False, False, True,
-         tensorrt_llm.quantization.layers.SmoothQuantLinear),
-        ('float32', False, False, True,
-         tensorrt_llm.quantization.layers.SmoothQuantRowLinear)
-    ])
-    @pytest.mark.skipif(
-        getSMVersion() < 80,
-        reason="INT8 TC is not supported in pre-ampere architecture"
-    )  # Skip tests that are not supported in pre-ampere architecture
+    @parameterized.expand(
+        [('float16', False, False, False,
+          tensorrt_llm.quantization.layers.SmoothQuantLinear),
+         ('float16', False, True, False,
+          tensorrt_llm.quantization.layers.SmoothQuantLinear),
+         ('float16', True, False, False,
+          tensorrt_llm.quantization.layers.SmoothQuantLinear),
+         ('float16', True, True, False,
+          tensorrt_llm.quantization.layers.SmoothQuantLinear),
+         ('float32', True, True, False,
+          tensorrt_llm.quantization.layers.SmoothQuantLinear),
+         ('int32', True, True, False,
+          tensorrt_llm.quantization.layers.SmoothQuantLinear),
+         ('float32', False, False, True,
+          tensorrt_llm.quantization.layers.SmoothQuantLinear),
+         ('float32', False, False, True,
+          tensorrt_llm.quantization.layers.SmoothQuantRowLinear)],
+        name_func=unittest_name_func)
+    @skip_pre_ampere  # INT8 TC does not support pre-Ampere
     def test_linear_smooth_quant(self, dtype, per_token_scaling,
                                  per_channel_scaling, bias, linear_cls):
         # test data
@@ -326,10 +323,10 @@ class TestSmoothQuant(unittest.TestCase):
         # compare diff
         np.testing.assert_allclose(ref.cpu().numpy(), outputs['output'])
 
-    @parameterized.expand([
-        (tensorrt_llm.quantization.layers.SmoothQuantLinear),
-        (tensorrt_llm.quantization.layers.SmoothQuantRowLinear)
-    ])
+    @parameterized.expand(
+        [(tensorrt_llm.quantization.layers.SmoothQuantLinear),
+         (tensorrt_llm.quantization.layers.SmoothQuantRowLinear)],
+        name_func=unittest_name_func)
     def test_linear_smooth_quant_no_quant(self, linear_cls):
         # Weight only quant for SmoothQuant
         quant_mode = QuantMode.from_description(quantize_weights=True,
@@ -359,11 +356,9 @@ class TestSmoothQuant(unittest.TestCase):
                            ('float16', True, False, 'gelu'),
                            ('float16', True, True, 'gelu'),
                            ('float32', True, True, 'gelu'),
-                           ('float32', True, True, 'elu')])
-    @pytest.mark.skipif(
-        getSMVersion() < 80,
-        reason="INT8 TC is not supported in pre-ampere architecture"
-    )  # Skip tests that are not supported in pre-ampere architecture
+                           ('float32', True, True, 'elu')],
+                          name_func=unittest_name_func)
+    @skip_pre_ampere  # INT8 TC is not supported in pre-Ampere
     def test_mlp_smooth_quant(self, dtype, per_token_scaling,
                               per_channel_scaling, hidden_act):
         # test data
@@ -494,7 +489,8 @@ class TestSmoothQuant(unittest.TestCase):
                                    outputs['output'],
                                    atol=5e-2)
 
-    @parameterized.expand([('float16', True, True), ('float16', True, False)])
+    @parameterized.expand([('float16', True, True), ('float16', True, False)],
+                          name_func=unittest_name_func)
     def test_smooth_quant_layer_norm_layer(self, dtype, per_token_scaling,
                                            elementwise_affine):
         torch.manual_seed(1997)
@@ -586,20 +582,17 @@ class TestSmoothQuant(unittest.TestCase):
                                        outputs['dynamic_scales'],
                                        atol=1e-2)
 
-    @parameterized.expand([
-        ('float16', 1, False,
-         tensorrt_llm.quantization.layers.WeightOnlyQuantLinear),
-        ('float16', 2, False,
-         tensorrt_llm.quantization.layers.WeightOnlyQuantLinear),
-        ('float16', 1, True,
-         tensorrt_llm.quantization.layers.WeightOnlyQuantLinear),
-        ('float16', 1, True,
-         tensorrt_llm.quantization.layers.WeightOnlyQuantRowLinear)
-    ])
-    @pytest.mark.skipif(
-        getSMVersion() < 80,
-        reason="weight only groupwise contains bug on pre-ampere"
-    )  # Skip tests that are not supported in pre-ampere architecture
+    @parameterized.expand(
+        [('float16', 1, False,
+          tensorrt_llm.quantization.layers.WeightOnlyQuantLinear),
+         ('float16', 2, False,
+          tensorrt_llm.quantization.layers.WeightOnlyQuantLinear),
+         ('float16', 1, True,
+          tensorrt_llm.quantization.layers.WeightOnlyQuantLinear),
+         ('float16', 1, True,
+          tensorrt_llm.quantization.layers.WeightOnlyQuantRowLinear)],
+        name_func=unittest_name_func)
+    @skip_pre_ampere  # WOQ contains bug in pre-Ampere
     def test_linear_weight_only_linear(self, dtype, wTypeId, bias, linear_cls):
         # test data
         m = 1
@@ -677,12 +670,10 @@ class TestSmoothQuant(unittest.TestCase):
         _utils.woq_assert_near_eq(ref.to(torch.float32),
                                   output.to(torch.float32), wTypeId)
 
-    # @parameterized.expand([
-    #     ('float16', QuantMode.PER_TENSOR),
-    #     # ('float16', QuantMode.PER_CHANNEL),
-    #     # ('float16', QuantMode.PER_TOKEN),
-    #     # ('float16', QuantMode.PER_TOKEN_PER_CHANNEL),
-    # ])
+    @parameterized.expand([('float16', QuantMode.PER_CHANNEL),
+                           ('float16', QuantMode.PER_TOKEN),
+                           ('float16', QuantMode.PER_GROUP)],
+                          name_func=unittest_name_func)
     @unittest.skip("Attention contains a bug and will be resolved in later MRs")
     def test_gpt_attention_smoothquant(self,
                                        dtype="float16",
@@ -1082,7 +1073,8 @@ class TestSmoothQuant(unittest.TestCase):
         np.testing.assert_allclose(ref.int_repr().cpu().numpy(),
                                    outputs['output'])
 
-    @parameterized.expand([('float16'), ('float32')])
+    @parameterized.expand([('float16'), ('float32')],
+                          name_func=unittest_name_func)
     def test_quantize_per_token(self, dtype):
         x_data = torch.randn(
             (2, 4, 4, 8), dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype))

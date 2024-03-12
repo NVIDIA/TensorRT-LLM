@@ -66,25 +66,25 @@ struct WeightOnlyParams
     using ActType = void;
     using WeiType = uint8_t;
 
-    const uint8_t* qweight;
-    const ActType* scales;
-    const ActType* zeros;
-    const ActType* in;
-    const ActType* act_scale;
-    const ActType* bias;
+    uint8_t const* qweight;
+    ActType const* scales;
+    ActType const* zeros;
+    ActType const* in;
+    ActType const* act_scale;
+    ActType const* bias;
     ActType* out;
-    const int m;
-    const int n;
-    const int k;
-    const int group_size;
+    int const m;
+    int const n;
+    int const k;
+    int const group_size;
     WeightOnlyQuantType quant_type;
     WeightOnlyType weight_only_type;
     WeightOnlyActivationFunctionType act_func_type;
     WeightOnlyActivationType act_type;
 
-    WeightOnlyParams(const uint8_t* _qweight, const ActType* _scales, const ActType* _zeros, const ActType* _in,
-        const ActType* _act_scale, const ActType* _bias, ActType* _out, const int _m, const int _n, const int _k,
-        const int _group_size, const WeightOnlyQuantType _quant_type, const WeightOnlyType _weight_only_type,
+    WeightOnlyParams(uint8_t const* _qweight, ActType const* _scales, ActType const* _zeros, ActType const* _in,
+        ActType const* _act_scale, ActType const* _bias, ActType* _out, int const _m, int const _n, int const _k,
+        int const _group_size, const WeightOnlyQuantType _quant_type, const WeightOnlyType _weight_only_type,
         const WeightOnlyActivationFunctionType _act_func_type, const WeightOnlyActivationType _act_type)
         : qweight(_qweight)
         , scales(_scales)

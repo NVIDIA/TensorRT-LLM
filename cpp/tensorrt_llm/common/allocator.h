@@ -42,11 +42,11 @@ public:
     virtual ~IAllocator() = default;
 
     // no copying
-    IAllocator(const IAllocator&) = delete;
-    IAllocator& operator=(const IAllocator&) = delete;
+    IAllocator(IAllocator const&) = delete;
+    IAllocator& operator=(IAllocator const&) = delete;
 
     template <typename T>
-    [[nodiscard]] T* reMalloc(T* ptr, size_t sizeBytes, const bool setZero = true)
+    [[nodiscard]] T* reMalloc(T* ptr, size_t sizeBytes, bool const setZero = true)
     {
         TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
         // TODO martinma: why do we need this size extension?

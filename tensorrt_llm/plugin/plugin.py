@@ -93,6 +93,8 @@ class PluginConfig:
     tokens_per_block: int = 128
     use_paged_context_fmha: bool = False
     use_context_fmha_for_generation: bool = False
+    dense_context_fmha: bool = False
+    pos_shift: bool = False
 
     def set_plugin(self, name: str, value: Union[str, bool, int]):
         assert hasattr(self, name), f"Plugin name doesn't exist: {name}"
@@ -272,6 +274,14 @@ class PluginConfig:
         self.set_plugin("use_context_fmha_for_generation", True)
         return self
 
+    def set_dense_context_fmha(self):
+        self.set_plugin("dense_context_fmha", True)
+        return self
+
+    def enable_pos_shift(self):
+        self.set_plugin("pos_shift", True)
+        return self
+
 
 cli_plugin_args = [
     # Plugins
@@ -294,6 +304,8 @@ cli_plugin_args = [
     "tokens_per_block",
     "use_paged_context_fmha",
     "use_context_fmha_for_generation",
+    "dense_context_fmha",
+    "pos_shift"
 ]
 
 plugin_options = ["float16", "float32", "bfloat16", "disable"]

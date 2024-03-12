@@ -37,7 +37,7 @@ public:
 
     ~CUDADriverWrapper();
 
-    CUresult cuGetErrorName(CUresult error, const char** pStr) const;
+    CUresult cuGetErrorName(CUresult error, char const** pStr) const;
 
     CUresult cuFuncSetAttribute(CUfunction hfunc, CUfunction_attribute attrib, int value) const;
 
@@ -47,19 +47,19 @@ public:
 
     CUresult cuLinkDestroy(CUlinkState state) const;
 
-    CUresult cuModuleLoadData(CUmodule* module, const void* image) const;
+    CUresult cuModuleLoadData(CUmodule* module, void const* image) const;
 
     CUresult cuLinkCreate(
         unsigned int numOptions, CUjit_option* options, void** optionValues, CUlinkState* stateOut) const;
 
-    CUresult cuModuleGetFunction(CUfunction* hfunc, CUmodule hmod, const char* name) const;
+    CUresult cuModuleGetFunction(CUfunction* hfunc, CUmodule hmod, char const* name) const;
 
-    CUresult cuModuleGetGlobal(CUdeviceptr* dptr, size_t* bytes, CUmodule hmod, const char* name) const;
+    CUresult cuModuleGetGlobal(CUdeviceptr* dptr, size_t* bytes, CUmodule hmod, char const* name) const;
 
-    CUresult cuLinkAddFile(CUlinkState state, CUjitInputType type, const char* path, unsigned int numOptions,
+    CUresult cuLinkAddFile(CUlinkState state, CUjitInputType type, char const* path, unsigned int numOptions,
         CUjit_option* options, void** optionValues) const;
 
-    CUresult cuLinkAddData(CUlinkState state, CUjitInputType type, void* data, size_t size, const char* name,
+    CUresult cuLinkAddData(CUlinkState state, CUjitInputType type, void* data, size_t size, char const* name,
         unsigned int numOptions, CUjit_option* options, void** optionValues) const;
 
     CUresult cuLaunchCooperativeKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY,
@@ -72,18 +72,18 @@ public:
 
 private:
     void* handle;
-    CUresult (*_cuGetErrorName)(CUresult, const char**);
+    CUresult (*_cuGetErrorName)(CUresult, char const**);
     CUresult (*_cuFuncSetAttribute)(CUfunction, CUfunction_attribute, int);
     CUresult (*_cuLinkComplete)(CUlinkState, void**, size_t*);
     CUresult (*_cuModuleUnload)(CUmodule);
     CUresult (*_cuLinkDestroy)(CUlinkState);
     CUresult (*_cuLinkCreate)(unsigned int, CUjit_option*, void**, CUlinkState*);
-    CUresult (*_cuModuleLoadData)(CUmodule*, const void*);
-    CUresult (*_cuModuleGetFunction)(CUfunction*, CUmodule, const char*);
-    CUresult (*_cuModuleGetGlobal)(CUdeviceptr*, size_t*, CUmodule, const char*);
-    CUresult (*_cuLinkAddFile)(CUlinkState, CUjitInputType, const char*, unsigned int, CUjit_option*, void**);
+    CUresult (*_cuModuleLoadData)(CUmodule*, void const*);
+    CUresult (*_cuModuleGetFunction)(CUfunction*, CUmodule, char const*);
+    CUresult (*_cuModuleGetGlobal)(CUdeviceptr*, size_t*, CUmodule, char const*);
+    CUresult (*_cuLinkAddFile)(CUlinkState, CUjitInputType, char const*, unsigned int, CUjit_option*, void**);
     CUresult (*_cuLinkAddData)(
-        CUlinkState, CUjitInputType, void*, size_t, const char*, unsigned int, CUjit_option*, void**);
+        CUlinkState, CUjitInputType, void*, size_t, char const*, unsigned int, CUjit_option*, void**);
     CUresult (*_cuLaunchCooperativeKernel)(CUfunction, unsigned int, unsigned int, unsigned int, unsigned int,
         unsigned int, unsigned int, unsigned int, CUstream, void**);
     CUresult (*_cuLaunchKernel)(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
@@ -91,11 +91,11 @@ private:
         CUstream hStream, void** kernelParams, void** extra);
 };
 
-inline void cuErrCheck_(CUresult stat, const CUDADriverWrapper& wrap, const char* file, int line)
+inline void cuErrCheck_(CUresult stat, CUDADriverWrapper const& wrap, char const* file, int line)
 {
     if (stat != CUDA_SUCCESS)
     {
-        const char* msg = nullptr;
+        char const* msg = nullptr;
         wrap.cuGetErrorName(stat, &msg);
         fprintf(stderr, "CUDA Error: %s %s %d\n", msg, file, line);
     }

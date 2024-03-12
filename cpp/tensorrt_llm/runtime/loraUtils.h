@@ -27,10 +27,10 @@ SizeType constexpr kLORA_CONFIG_ADAPTER_SIZE_OFF = 2;
 
 SizeType constexpr kLORA_NUM_WEIGHTS_POINTERS = 2;
 
-void loraValidateRequestTensorDims(const std::optional<ITensor::SharedPtr>& optReqLoraWeights,
-    const std::optional<ITensor::SharedPtr>& optReqLoraConfig);
+void loraValidateRequestTensorDims(std::optional<ITensor::SharedPtr> const& optReqLoraWeights,
+    std::optional<ITensor::SharedPtr> const& optReqLoraConfig);
 
-void loraValidateRequestTensors(const std::optional<ITensor::SharedPtr>& optReqLoraWeights,
-    const std::optional<ITensor::SharedPtr>& optReqLoraConfig, runtime::GptModelConfig const& modelConfig,
+void loraValidateRequestTensors(std::optional<ITensor::SharedPtr> const& optReqLoraWeights,
+    std::optional<ITensor::SharedPtr> const& optReqLoraConfig, runtime::GptModelConfig const& modelConfig,
     runtime::WorldConfig const& worldConfig);
 } // namespace tensorrt_llm::runtime::lora

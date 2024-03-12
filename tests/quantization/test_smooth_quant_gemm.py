@@ -12,18 +12,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
-import sys
 import unittest
 
 import _utils
 import numpy as np
-import pytest
 
 # isort: off
 import torch
 import tensorrt as trt
 # isort: on
+import os
+import sys
+
 from parameterized import parameterized
 from polygraphy.backend.trt import CreateConfig, EngineFromNetwork, TrtRunner
 
@@ -32,7 +32,7 @@ from tensorrt_llm import Tensor
 from tensorrt_llm.quantization.functional import smooth_quant_gemm
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import getSMVersion
+from utils.util import skip_pre_ampere, unittest_name_func
 
 
 class TestSmoothQuantGemm(unittest.TestCase):
@@ -127,11 +127,9 @@ class TestSmoothQuantGemm(unittest.TestCase):
                            ('float32', False, False), ('float32', False, True),
                            ('float32', True, False), ('float32', True, True),
                            ('int32', False, False), ('int32', False, True),
-                           ('int32', True, False), ('int32', True, True)])
-    @pytest.mark.skipif(
-        getSMVersion() < 80,
-        reason="Smooth quant is not supported in pre-ampere architecture"
-    )  # Skip tests that are not supported in pre-ampere architecture
+                           ('int32', True, False), ('int32', True, True)],
+                          name_func=unittest_name_func)
+    @skip_pre_ampere  # SmoothQuant is not supported in pre-Ampere
     def test_matmul(self, dtype, per_token_scaling, per_channel_scaling):
         bs = 2
         inseq = 16

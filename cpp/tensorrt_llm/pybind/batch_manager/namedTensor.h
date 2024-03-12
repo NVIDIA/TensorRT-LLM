@@ -39,7 +39,7 @@ public:
     explicit NamedTensor(std::string _name)
         : Base(std::move(_name)){};
 
-    explicit NamedTensor(const tensorrt_llm::batch_manager::NamedTensor& cppNamedTensor);
+    explicit NamedTensor(tensorrt_llm::batch_manager::NamedTensor const& cppNamedTensor);
     static void initBindings(pybind11::module_& m);
 };
 

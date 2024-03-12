@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
+import sys
 import unittest
 
 import torch
@@ -22,13 +24,16 @@ import tensorrt_llm
 from tensorrt_llm import Tensor
 from tensorrt_llm.functional import shape
 
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.util import unittest_name_func
+
 
 class TestFunctional(unittest.TestCase):
 
     def setUp(self):
         tensorrt_llm.logger.set_level('error')
 
-    @parameterized.expand([('float32', )])
+    @parameterized.expand([('float32', )], name_func=unittest_name_func)
     def test_assertion(self, dtype):
         # test data
         x_shape = (2, 4, 8)

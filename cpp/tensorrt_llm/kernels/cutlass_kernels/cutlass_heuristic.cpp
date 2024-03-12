@@ -70,7 +70,7 @@ TileShape get_cta_shape_for_config(CutlassTileConfig tile_config)
 }
 
 bool is_valid_split_k_factor(const int64_t m, const int64_t n, const int64_t k, const TileShape tile_shape,
-    const int split_k_factor, const size_t workspace_bytes, const bool is_weight_only)
+    int const split_k_factor, const size_t workspace_bytes, bool const is_weight_only)
 {
 
     // All tile sizes have a k_tile of 64.
@@ -89,7 +89,7 @@ bool is_valid_split_k_factor(const int64_t m, const int64_t n, const int64_t k, 
             return false;
         }
 
-        const int k_elements_per_split = k / split_k_factor;
+        int const k_elements_per_split = k / split_k_factor;
         if ((k_elements_per_split % k_tile) != 0)
         {
             return false;
@@ -97,9 +97,9 @@ bool is_valid_split_k_factor(const int64_t m, const int64_t n, const int64_t k, 
     }
 
     // Check that the workspace has sufficient space for this split-k factor
-    const int ctas_in_m_dim = (m + tile_shape.m - 1) / tile_shape.m;
-    const int ctas_in_n_dim = (n + tile_shape.n - 1) / tile_shape.n;
-    const int required_ws_bytes = split_k_factor == 1 ? 0 : sizeof(int) * ctas_in_m_dim * ctas_in_n_dim;
+    int const ctas_in_m_dim = (m + tile_shape.m - 1) / tile_shape.m;
+    int const ctas_in_n_dim = (n + tile_shape.n - 1) / tile_shape.n;
+    int const required_ws_bytes = split_k_factor == 1 ? 0 : sizeof(int) * ctas_in_m_dim * ctas_in_n_dim;
 
     if (required_ws_bytes > workspace_bytes)
     {
@@ -110,7 +110,7 @@ bool is_valid_split_k_factor(const int64_t m, const int64_t n, const int64_t k, 
 }
 
 std::vector<CutlassTileConfig> get_candidate_tiles(
-    const int sm, const bool is_weight_only, const bool simt_configs_only, const bool int8_configs_only)
+    int const sm, bool const is_weight_only, bool const simt_configs_only, bool const int8_configs_only)
 {
     enum class CutlassGemmType : char
     {
@@ -170,7 +170,7 @@ std::vector<CutlassTileConfig> get_candidate_tiles(
 }
 
 std::vector<CutlassTileConfigSM90> get_candidate_tiles_sm90(
-    const int sm, const bool is_weight_only, const bool simt_configs_only, const bool int8_configs_only)
+    int const sm, bool const is_weight_only, bool const simt_configs_only, bool const int8_configs_only)
 {
     enum class CutlassGemmType : char
     {
@@ -226,8 +226,8 @@ bool supports_mcast_along_n(const CutlassTileConfigSM90 tile)
     return valid_tiles.count(tile) == 1;
 }
 
-std::vector<CutlassGemmConfig> get_candidate_configs(int sm, const bool is_weight_only, const bool simt_configs_only,
-    const bool int8_configs_only, const int max_split_k, const bool enable_hopper_gmma)
+std::vector<CutlassGemmConfig> get_candidate_configs(int sm, bool const is_weight_only, bool const simt_configs_only,
+    bool const int8_configs_only, int const max_split_k, bool const enable_hopper_gmma)
 {
     if (sm == 90 && enable_hopper_gmma)
     {
@@ -235,14 +235,14 @@ std::vector<CutlassGemmConfig> get_candidate_configs(int sm, const bool is_weigh
             = get_candidate_tiles_sm90(sm, is_weight_only, simt_configs_only, int8_configs_only);
 
         std::vector<CutlassGemmConfig> candidate_configs;
-        for (const auto& tile_config : tiles)
+        for (auto const& tile_config : tiles)
         {
             CutlassGemmConfig config(
                 tile_config, MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1);
             candidate_configs.push_back(config);
 
-            const bool has_m_mcast = supports_mcast_along_m(tile_config);
-            const bool has_n_mcast = supports_mcast_along_n(tile_config);
+            bool const has_m_mcast = supports_mcast_along_m(tile_config);
+            bool const has_n_mcast = supports_mcast_along_n(tile_config);
             if (has_m_mcast)
             {
                 CutlassGemmConfig config(tile_config, MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
@@ -270,9 +270,9 @@ std::vector<CutlassGemmConfig> get_candidate_configs(int sm, const bool is_weigh
         = get_candidate_tiles(sm, is_weight_only, simt_configs_only, int8_configs_only);
 
     std::vector<CutlassGemmConfig> candidate_configs;
-    const int min_stages = int8_configs_only ? 3 : 2;
-    const int max_stages = int8_configs_only ? 6 : (sm >= 80 ? 4 : 2);
-    for (const auto& tile_config : tiles)
+    int const min_stages = int8_configs_only ? 3 : 2;
+    int const max_stages = int8_configs_only ? 6 : (sm >= 80 ? 4 : 2);
+    for (auto const& tile_config : tiles)
     {
         for (int stages = min_stages; stages <= max_stages; ++stages)
         {
@@ -292,9 +292,9 @@ std::vector<CutlassGemmConfig> get_candidate_configs(int sm, const bool is_weigh
     return candidate_configs;
 }
 
-CutlassGemmConfig estimate_best_config_from_occupancies(const std::vector<CutlassGemmConfig>& candidate_configs,
-    const std::vector<int>& occupancies, const int64_t m, const int64_t n, const int64_t k, const int64_t num_experts,
-    const int split_k_limit, const size_t workspace_bytes, const int multi_processor_count, const int is_weight_only)
+CutlassGemmConfig estimate_best_config_from_occupancies(std::vector<CutlassGemmConfig> const& candidate_configs,
+    std::vector<int> const& occupancies, const int64_t m, const int64_t n, const int64_t k, const int64_t num_experts,
+    int const split_k_limit, const size_t workspace_bytes, int const multi_processor_count, int const is_weight_only)
 {
 
     if (occupancies.size() != candidate_configs.size())
@@ -311,7 +311,7 @@ CutlassGemmConfig estimate_best_config_from_occupancies(const std::vector<Cutlas
     int config_waves = INT_MAX;
     int current_m_tile = 0;
 
-    const int max_split_k = n >= multi_processor_count * 256 ? 1 : split_k_limit;
+    int const max_split_k = n >= multi_processor_count * 256 ? 1 : split_k_limit;
     for (int ii = 0; ii < candidate_configs.size(); ++ii)
     {
         CutlassGemmConfig candidate_config = candidate_configs[ii];
@@ -330,21 +330,21 @@ CutlassGemmConfig estimate_best_config_from_occupancies(const std::vector<Cutlas
             continue;
         }
 
-        const int ctas_in_m_dim = (m + tile_shape.m - 1) / tile_shape.m;
-        const int ctas_in_n_dim = (n + tile_shape.n - 1) / tile_shape.n;
+        int const ctas_in_m_dim = (m + tile_shape.m - 1) / tile_shape.m;
+        int const ctas_in_n_dim = (n + tile_shape.n - 1) / tile_shape.n;
 
         for (int split_k_factor = 1; split_k_factor <= max_split_k; ++split_k_factor)
         {
             if (is_valid_split_k_factor(m, n, k, tile_shape, split_k_factor, workspace_bytes, is_weight_only))
             {
-                const int ctas_per_wave = occupancy * multi_processor_count;
-                const int ctas_for_problem = ctas_in_m_dim * ctas_in_n_dim * split_k_factor;
+                int const ctas_per_wave = occupancy * multi_processor_count;
+                int const ctas_for_problem = ctas_in_m_dim * ctas_in_n_dim * split_k_factor;
 
-                const int num_waves_total = (ctas_for_problem + ctas_per_wave - 1) / ctas_per_wave;
-                const float num_waves_fractional = ctas_for_problem / float(ctas_per_wave);
-                const float current_score = float(num_waves_total) - num_waves_fractional;
+                int const num_waves_total = (ctas_for_problem + ctas_per_wave - 1) / ctas_per_wave;
+                float const num_waves_fractional = ctas_for_problem / float(ctas_per_wave);
+                float const current_score = float(num_waves_total) - num_waves_fractional;
 
-                const float score_slack = 0.1f;
+                float const score_slack = 0.1f;
                 if (current_score < config_score
                     || ((config_waves > num_waves_total) && (current_score < config_score + score_slack)))
                 {

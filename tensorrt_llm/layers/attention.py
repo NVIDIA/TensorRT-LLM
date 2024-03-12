@@ -34,7 +34,7 @@ from ..parameter import Parameter
 from ..quantization import QuantMode
 from ..quantization.functional import dequantize, quantize
 from ..quantization.layers import FP8Linear, FP8RowLinear
-from .linear import ColumnLinear, RowLinear
+from .linear import ColumnLinear, QKVColumnLinear, RowLinear
 from .lora import Lora, LoraRuntimeParams
 
 
@@ -439,7 +439,6 @@ class Attention(Module):
         tp_group=None,
         tp_size=1,
         tp_rank=0,
-        use_auto_parallel=False,
         quant_mode: QuantMode = QuantMode(0),
         q_scaling=1.0,
         cross_attention=False,
@@ -447,11 +446,10 @@ class Attention(Module):
         max_distance=0,
         num_buckets=0,
         dense_bias=None,
-        enable_pos_shift=False,
-        dense_context_fmha=False,
         max_lora_rank=None,
         clip_qkv=None,
         alibi_bias_max=8,
+        skip_cross_qkv=False,
     ):
         super().__init__()
 
@@ -475,10 +473,7 @@ class Attention(Module):
         self.dtype = dtype
         if dense_bias is None:
             dense_bias = bias
-        self.use_auto_parallel = use_auto_parallel
-        self.unfuse_qkv_gemm = use_auto_parallel and not cross_attention
-        if self.use_auto_parallel:
-            assert self.tp_size == 1, "please disable manual tp when enable auto_parallel"
+        self.unfuse_qkv_gemm = False
 
         self.num_layers = num_layers
         self.apply_query_key_layer_scaling = apply_query_key_layer_scaling
@@ -494,8 +489,6 @@ class Attention(Module):
         self.scale_alibi_bias = position_embedding_type == PositionEmbeddingType.alibi_with_scale
         self.alibi_bias_max = alibi_bias_max
         self.position_embedding_type = position_embedding_type
-        self.enable_pos_shift = enable_pos_shift
-        self.dense_context_fmha = dense_context_fmha
 
         self.relative_attention = relative_attention
         self.max_distance = max_distance
@@ -559,7 +552,7 @@ class Attention(Module):
         else:
             # out dim is not necessarily hidden_size + kv specific size (in MQA/GQA), but num_heads * heads_size
             # example: d_model != num_heads * head_size in Flan-T5
-            self.qkv = ColumnLinear(
+            self.qkv = QKVColumnLinear(
                 hidden_size,
                 tp_size * self.num_attention_heads * self.attention_head_size +
                 (2 * tp_size * self.num_attention_kv_heads *
@@ -578,33 +571,6 @@ class Attention(Module):
                                    tp_group=tp_group,
                                    tp_size=tp_size,
                                    max_lora_rank=max_lora_rank)
-
-        if self.unfuse_qkv_gemm:
-            self.is_weight_rewritten = False
-            linear_class = FP8Linear if self.use_fp8_qdq else ColumnLinear
-            self.q = linear_class(hidden_size,
-                                  self.attention_hidden_size,
-                                  bias=bias,
-                                  dtype=dtype,
-                                  tp_group=tp_group,
-                                  tp_size=tp_size,
-                                  gather_output=False)
-            self.k = linear_class(hidden_size,
-                                  tp_size * self.num_attention_kv_heads *
-                                  self.attention_head_size,
-                                  bias=bias,
-                                  dtype=dtype,
-                                  tp_group=tp_group,
-                                  tp_size=tp_size,
-                                  gather_output=False)
-            self.v = linear_class(hidden_size,
-                                  tp_size * self.num_attention_kv_heads *
-                                  self.attention_head_size,
-                                  bias=bias,
-                                  dtype=dtype,
-                                  tp_group=tp_group,
-                                  tp_size=tp_size,
-                                  gather_output=False)
 
         # per-layer relative attention table
         if relative_attention:
@@ -631,6 +597,8 @@ class Attention(Module):
             self.clip_qkv = fp32_array([clip_qkv])
         else:
             self.clip_qkv = None
+
+        self.skip_cross_qkv = skip_cross_qkv
 
     def forward(self,
                 hidden_states: Tensor,
@@ -675,33 +643,6 @@ class Attention(Module):
         unfuse_qkv_gemm = self.unfuse_qkv_gemm
         if unfuse_qkv_gemm:
             qkv_gemm = [self.q, self.k, self.v]
-            if not self.is_weight_rewritten:
-                if self.qkv.weight.is_inited():
-                    qkv_weight = self.qkv.weight.raw_value
-                    weights = np.split(qkv_weight, [
-                        self.q.out_features,
-                        self.q.out_features + self.k.out_features,
-                    ])
-                    for gemm, weight in zip(qkv_gemm, weights):
-                        gemm.weight.value = weight
-                del self.qkv._parameters["weight"]
-
-                if self.qkv.bias is not None and self.qkv.bias.is_inited():
-                    qkv_bias = self.qkv.bias.raw_value
-                    biases = np.split(qkv_bias, [
-                        self.q.out_features,
-                        self.q.out_features + self.k.out_features,
-                    ])
-                    for gemm, bias in zip(qkv_gemm, biases):
-                        gemm.bias.value = bias
-                del self.qkv._parameters["bias"]
-
-                for name, parameter in self.qkv._parameters.items():
-                    for gemm in qkv_gemm:
-                        setattr(gemm, name, parameter)
-                    del self.qkv._parameters[name]
-
-                self.is_weight_rewritten = True
             qkv = [gemm(hidden_states) for gemm in qkv_gemm]
             if default_net(
             ).plugin_config.lora_plugin and qkv_lora_params is not None:
@@ -757,7 +698,12 @@ class Attention(Module):
                     ],
                     host_request_types=q_lora_params.host_request_types,
                     host_context_lengths=q_lora_params.host_context_lengths,
-                    max_context_length=q_lora_params.max_context_length)
+                    max_context_length=q_lora_params.max_context_length,
+                    max_encoder_context_length=q_lora_params.
+                    max_encoder_context_length,
+                    host_encoder_input_lengths=q_lora_params.
+                    host_encoder_input_lengths,
+                )
 
                 q_lora, k_lora, v_lora = self.qkv_lora(hidden_states,
                                                        qkv_lora_runtime_params)
@@ -805,7 +751,9 @@ class Attention(Module):
             if default_net(
             ).plugin_config.lora_plugin and qkv_lora_params is None and lora_layer_params is not None:
                 cross_q_lora, cross_k_lora, cross_v_lora = self.qkv_lora(
-                    encoder_output, qkv_lora_runtime_params)
+                    encoder_output,
+                    qkv_lora_runtime_params,
+                    is_cross_attention=True)
                 cross_qkv_lora = concat(
                     [cross_q_lora, cross_k_lora, cross_v_lora],
                     dim=cross_q_lora.rank() - 1)
@@ -819,8 +767,11 @@ class Attention(Module):
             ## End False branch
 
             # IfConditional layer
-            cross_qkv = conditional(cross_kv_cache_gen, cross_qkv_true,
-                                    cross_qkv_false)
+            if self.skip_cross_qkv:
+                cross_qkv = conditional(cross_kv_cache_gen, cross_qkv_true,
+                                        cross_qkv_false)
+            else:
+                cross_qkv = cross_qkv_true
 
         if default_net().plugin_config.gpt_attention_plugin:
             if self.cross_attention and (past_key_value is not None):
@@ -835,6 +786,7 @@ class Attention(Module):
             ) else None
             kv_quant_orig_scale = self.kv_cache_scaling_factor.value if self.quant_mode.has_kv_cache_quant(
             ) else None
+
             context, past_key_value = gpt_attention(
                 qkv=qkv,
                 past_key_value=past_key_value,
@@ -877,8 +829,9 @@ class Attention(Module):
                 if self.relative_attention else None,
                 max_distance=self.max_distance,
                 host_context_lengths=attention_params.host_context_lengths,
-                enable_pos_shift=self.enable_pos_shift,
-                dense_context_fmha=self.dense_context_fmha,
+                enable_pos_shift=default_net().plugin_config.pos_shift,
+                dense_context_fmha=default_net(
+                ).plugin_config.dense_context_fmha,
                 use_cache=use_cache,
                 medusa_position_offsets=medusa_position_offsets,
                 medusa_packed_mask=medusa_packed_mask,

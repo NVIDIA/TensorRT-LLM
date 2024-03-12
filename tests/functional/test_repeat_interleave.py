@@ -1,3 +1,5 @@
+import os
+import sys
 import unittest
 
 import numpy as np
@@ -8,13 +10,16 @@ from polygraphy.backend.trt import EngineFromNetwork, TrtRunner
 import tensorrt_llm
 from tensorrt_llm import Tensor
 
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.util import unittest_name_func
+
 
 class TestFunctional(unittest.TestCase):
 
     def setUp(self):
         tensorrt_llm.logger.set_level('error')
 
-    @parameterized.expand([[0], [1], [2]])
+    @parameterized.expand([[0], [1], [2]], name_func=unittest_name_func)
     def test_repeat_interleave(self, axis):
         dtype = 'float32'
         repeats = 3

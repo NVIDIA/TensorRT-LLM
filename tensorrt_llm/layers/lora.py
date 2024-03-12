@@ -29,6 +29,8 @@ class LoraRuntimeParams(object):
         host_request_types: Tensor = None,
         host_context_lengths: Tensor = None,
         max_context_length: Tensor = None,
+        max_encoder_context_length: Tensor = None,
+        host_encoder_input_lengths: Tensor = None,
     ):
 
         self.lora_ranks = lora_ranks
@@ -36,6 +38,8 @@ class LoraRuntimeParams(object):
         self.host_request_types = host_request_types
         self.host_context_lengths = host_context_lengths
         self.max_context_length = max_context_length
+        self.max_encoder_context_length = max_encoder_context_length
+        self.host_encoder_input_lengths = host_encoder_input_lengths
 
 
 class Lora(Module):
@@ -50,7 +54,10 @@ class Lora(Module):
         self.out_hidden_sizes = out_hidden_sizes
         self.max_low_rank = max_low_rank
 
-    def forward(self, x, lora_runtime_params: LoraRuntimeParams = None):
+    def forward(self,
+                x,
+                lora_runtime_params: LoraRuntimeParams = None,
+                is_cross_attention: bool = False):
         if default_net().plugin_config.lora_plugin:
             result = lora_plugin(
                 x,
@@ -58,8 +65,14 @@ class Lora(Module):
                 out_hidden_sizes=self.out_hidden_sizes,
                 host_request_types=lora_runtime_params.host_request_types,
                 transb=True,
-                host_context_lengths=lora_runtime_params.host_context_lengths,
-                max_context_length=lora_runtime_params.max_context_length,
+                # For cross attention, host_encoder_input_lengths should be used instead of host_context_lengths
+                host_context_lengths=lora_runtime_params.host_context_lengths
+                if not is_cross_attention else
+                lora_runtime_params.host_encoder_input_lengths,
+                # For cross attention, max_encoder_context_length should be used instead of max_context_length
+                max_context_length=lora_runtime_params.max_context_length
+                if not is_cross_attention else
+                lora_runtime_params.max_encoder_context_length,
                 max_low_rank=self.max_low_rank,
                 lora_ranks=lora_runtime_params.lora_ranks,
                 lora_weights_pointers=lora_runtime_params.lora_weights_pointers)
@@ -77,14 +90,19 @@ class LoraParams(object):
             lora_weights_pointers=None,  # : List[dict[Tensor]]
             host_context_lengths: Tensor = None,
             max_context_length: Tensor = None,
-            host_request_types: Tensor = None):
+            max_encoder_context_length: Tensor = None,  # For cross attention
+            host_request_types: Tensor = None,
+            host_encoder_input_lengths: Tensor = None,  # For cross attention
+    ):
 
         self.lora_ranks = lora_ranks
         self.lora_weights_pointers = lora_weights_pointers
 
         self.host_context_lengths = host_context_lengths
         self.max_context_length = max_context_length
+        self.max_encoder_context_length = max_encoder_context_length
         self.host_request_types = host_request_types
+        self.host_encoder_input_lengths = host_encoder_input_lengths
 
     def get_layer_params(self, layer_idx: int):
         return LoraParams(
@@ -92,7 +110,10 @@ class LoraParams(object):
             lora_weights_pointers=[self.lora_weights_pointers[layer_idx]],
             host_context_lengths=self.host_context_lengths,
             max_context_length=self.max_context_length,
-            host_request_types=self.host_request_types)
+            max_encoder_context_length=self.max_encoder_context_length,
+            host_request_types=self.host_request_types,
+            host_encoder_input_lengths=self.host_encoder_input_lengths,
+        )
 
     def get_runtime_params(self, layer_idx: int, lora_module: str):
         if f"{lora_module}_lora_ranks" in self.lora_ranks[layer_idx]:
@@ -106,7 +127,9 @@ class LoraParams(object):
                 ],
                 host_context_lengths=self.host_context_lengths,
                 max_context_length=self.max_context_length,
+                max_encoder_context_length=self.max_encoder_context_length,
                 host_request_types=self.host_request_types,
+                host_encoder_input_lengths=self.host_encoder_input_lengths,
             )
         else:
             return None

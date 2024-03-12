@@ -157,8 +157,8 @@ private:
     MatrixCoord extent_real_;
     ElementwiseFunctor elementwise_;
 
-    const bool per_token_quant_;
-    const bool per_channel_quant_;
+    bool const per_token_quant_;
+    bool const per_channel_quant_;
 
     AlphaScaleElementType* ptr_alpha_row_;
     AlphaScaleElementType* ptr_alpha_col_;

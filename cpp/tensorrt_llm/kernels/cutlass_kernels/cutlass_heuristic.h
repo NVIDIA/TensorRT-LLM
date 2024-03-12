@@ -27,13 +27,13 @@ namespace cutlass_kernels
 {
 
 std::vector<tensorrt_llm::cutlass_extensions::CutlassGemmConfig> get_candidate_configs(int sm,
-    const bool is_weight_only, const bool simt_configs_only, const bool int8_configs_only = false,
-    const int max_split_k = 1, const bool enable_hopper_gmma = false);
+    bool const is_weight_only, bool const simt_configs_only, bool const int8_configs_only = false,
+    int const max_split_k = 1, bool const enable_hopper_gmma = false);
 
 tensorrt_llm::cutlass_extensions::CutlassGemmConfig estimate_best_config_from_occupancies(
-    const std::vector<tensorrt_llm::cutlass_extensions::CutlassGemmConfig>& candidate_configs,
-    const std::vector<int>& occupancies, const int64_t m, const int64_t n, const int64_t k, const int64_t num_experts,
-    const int split_k_limit, const size_t workspace_bytes, const int multi_processor_count, const int is_weight_only);
+    std::vector<tensorrt_llm::cutlass_extensions::CutlassGemmConfig> const& candidate_configs,
+    std::vector<int> const& occupancies, const int64_t m, const int64_t n, const int64_t k, const int64_t num_experts,
+    int const split_k_limit, const size_t workspace_bytes, int const multi_processor_count, int const is_weight_only);
 
 } // namespace cutlass_kernels
 } // namespace kernels

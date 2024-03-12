@@ -183,6 +183,9 @@ class MambaLMHeadModel(PretrainedModel):
             @return: a list contains values which can be fed into the self.forward()
         '''
         batch_range = [GenerationMixin.default_range(max_batch_size)]
+        conv_state_range = [
+            GenerationMixin.default_range(self.d_conv - 1 + max_input_len)
+        ]
         input_ids = Tensor(name='input_ids',
                            dtype=trt.int32,
                            shape=[-1, -1],
@@ -195,7 +198,7 @@ class MambaLMHeadModel(PretrainedModel):
         conv_state_dim_range = OrderedDict([
             ('batch_size', batch_range),
             ('dim_size', [self.d_inner]),
-            ('kernel_size', [self.d_conv - 1]),
+            ('kernel_size', conv_state_range),
         ])
 
         ssm_state_dim_range = OrderedDict([
@@ -207,11 +210,11 @@ class MambaLMHeadModel(PretrainedModel):
         for i in range(self.config.num_hidden_layers):
             conv_state = Tensor(name=f'past_conv_state_{i}',
                                 dtype=self.dtype,
-                                shape=[-1, self.d_inner, self.d_conv - 1],
+                                shape=[-1, self.d_inner, -1],
                                 dim_range=conv_state_dim_range)
 
             ssm_state = Tensor(name=f'past_ssm_state_{i}',
-                               dtype=str_dtype_to_trt('float32'),
+                               dtype=self.dtype,
                                shape=[-1, self.d_state, self.d_inner],
                                dim_range=ssm_state_dim_range)
 

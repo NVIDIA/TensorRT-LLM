@@ -55,7 +55,7 @@ def parse_arguments():
                         help='Run nougat pipeline')
     parser.add_argument('--input_text',
                         type=str,
-                        default='Question: which city is this? Answer:',
+                        default=None,
                         help='Text prompt to LLM')
     parser.add_argument('--num_beams',
                         type=int,
@@ -144,21 +144,14 @@ class MultiModalModel:
                 self.model_config = self.model.encoder_model_config
                 self.runtime_mapping = self.model.encoder_runtime_mapping
 
-            config = AutoConfig.from_pretrained(self.args.hf_model_dir)
-            decoder_start_id = config.decoder_start_token_id
-            if decoder_start_id is None:
-                decoder_start_id = self.tokenizer.bos_token_id
-
-            decoder_input_ids = torch.IntTensor([[decoder_start_id]
-                                                 ]).to(self.device)
-            batch_size = self.args.batch_size
-            self.decoder_input_ids = decoder_input_ids.repeat((batch_size, 1))
-
-    def generate(self, pre_prompt, post_prompt, image, max_new_tokens):
-        profiler.start("Generate")
-        profiler.start("Vision")
+    def generate(self, pre_prompt, post_prompt, image, decoder_input_ids,
+                 max_new_tokens, warmup):
+        if not warmup:
+            profiler.start("Generate")
+            profiler.start("Vision")
         visual_features, visual_atts = self.get_visual_features(image)
-        profiler.stop("Vision")
+        if not warmup:
+            profiler.stop("Vision")
 
         pre_input_ids = self.tokenizer(pre_prompt,
                                        return_tensors="pt",
@@ -178,11 +171,11 @@ class MultiModalModel:
         input_ids, ptuning_args = self.setup_fake_prompts(
             visual_features, pre_input_ids, post_input_ids, input_lengths)
 
-        if self.args.decoder_llm and tensorrt_llm.mpi_rank() == 0:
+        if warmup and self.args.decoder_llm and tensorrt_llm.mpi_rank() == 0:
             prompt_table = ptuning_args[0]
             prompt_table = torch.stack([prompt_table])
             np.save('prompt_table.npy', torch_to_numpy(prompt_table))
-        tensorrt_llm.mpi_barrier()  # Sync before reading prompt_table file
+        if warmup: return None
 
         profiler.start("LLM")
         if self.args.decoder_llm:
@@ -212,7 +205,7 @@ class MultiModalModel:
 
             output_ids = self.model.generate(
                 input_ids,
-                self.decoder_input_ids,
+                decoder_input_ids,
                 max_new_tokens,
                 num_beams=self.args.num_beams,
                 bos_token_id=self.tokenizer.bos_token_id,
@@ -293,6 +286,7 @@ class MultiModalModel:
         return input_ids, ptuning_args
 
     def ptuning_setup(self, prompt_table, input_ids, input_lengths):
+        hidden_size = self.model_config.hidden_size * self.runtime_mapping.tp_size
         if prompt_table is not None:
             task_vocab_size = torch.tensor(
                 [prompt_table.shape[1]],
@@ -302,7 +296,6 @@ class MultiModalModel:
                 (prompt_table.shape[0] * prompt_table.shape[1],
                  prompt_table.shape[2]))
 
-            hidden_size = self.model_config.hidden_size * self.runtime_mapping.tp_size
             assert prompt_table.shape[
                 1] == hidden_size, "Prompt table dimensions do not match hidden size"
 
@@ -324,7 +317,11 @@ class MultiModalModel:
 
 
 def load_test_image(model_name):
-    if "nougat" in model_name:
+    if "vila" in model_name:
+        img_url = 'https://github.com/Efficient-Large-Model/VILA/raw/main/demo_images/av.png'
+        image = Image.open(requests.get(img_url,
+                                        stream=True).raw).convert('RGB')
+    elif "nougat" in model_name:
         filepath = hf_hub_download(
             repo_id="hf-internal-testing/fixtures_docvqa",
             filename="nougat_paper.png",
@@ -351,6 +348,9 @@ if __name__ == '__main__':
         else:
             model_type = 'Salesforce/blip2-flan-t5-xl'
 
+        if args.input_text is None:
+            args.input_text = "Question: which city is this? Answer:"
+
         processor = Blip2Processor.from_pretrained(model_type)
         image = processor(image, args.input_text,
                           return_tensors="pt")['pixel_values']
@@ -361,16 +361,28 @@ if __name__ == '__main__':
         processor = NougatProcessor.from_pretrained(args.hf_model_dir)
         image = processor(image, return_tensors="pt")['pixel_values']
 
+        # Nougat doesn't need text prompt (mBART use single token to start generation), just leave a dummy one here
+        if args.input_text is None:
+            args.input_text = "Question: which city is this? Answer:"
+
         pre_prompt = args.input_text
         post_prompt = None
     else:
+        # LLaVA and VILA
+        if "llava" in args.hf_model_dir:
+            pre_prompt = "USER:\n"
+            if args.input_text is None:
+                args.input_text = "Question: which city is this? Answer:"
+        elif "vila" in args.hf_model_dir:
+            pre_prompt = "A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. USER: "
+            if args.input_text is None:
+                args.input_text = "Please describe the traffic condition."
+        post_prompt = args.input_text + " ASSISTANT:"
+
         processor = AutoProcessor.from_pretrained(args.hf_model_dir)
         image = processor(text=args.input_text,
                           images=image,
                           return_tensors="pt")['pixel_values']
-
-        pre_prompt = "USER:\n"
-        post_prompt = args.input_text + " ASSISTANT:"
 
     # Repeat inputs to match batch size
     pre_prompt = [pre_prompt] * args.batch_size
@@ -380,30 +392,67 @@ if __name__ == '__main__':
     model = MultiModalModel(args)
     image = image.to(model.device)
 
-    num_iters = 100 if args.run_profiling else 1
+    # Generate decoder_input_ids for enc-dec models
+    # Custom prompts can be added as:
+    # decoder_input_ids = model.tokenizer(decoder_prompt).input_ids
+    if args.decoder_llm:
+        decoder_input_ids = None
+    else:
+        config = AutoConfig.from_pretrained(args.hf_model_dir)
+        decoder_start_id = config.decoder_start_token_id  # T5
+        if decoder_start_id is None:
+            decoder_start_id = config.decoder.bos_token_id  # Nougat
+
+        decoder_input_ids = torch.IntTensor([[decoder_start_id]])
+        decoder_input_ids = decoder_input_ids.repeat((args.batch_size, 1))
+
+    model.generate(pre_prompt,
+                   post_prompt,
+                   image,
+                   decoder_input_ids,
+                   args.max_new_tokens,
+                   warmup=True)
+    tensorrt_llm.mpi_barrier()
+
+    num_iters = 20 if args.run_profiling else 1
     for _ in range(num_iters):
-        stripped_text = model.generate(pre_prompt, post_prompt, image,
-                                       args.max_new_tokens)
+        stripped_text = model.generate(pre_prompt,
+                                       post_prompt,
+                                       image,
+                                       decoder_input_ids,
+                                       args.max_new_tokens,
+                                       warmup=False)
 
     if runtime_rank == 0:
         logger.info("---------------------------------------------------------")
         if not args.nougat:
             logger.info(f"\n[Q] {args.input_text}")
-        logger.info(f"\n[A] {stripped_text}")
+        logger.info(f"\n[A] {stripped_text[0]}")
 
-        if args.check_accuracy and not args.nougat:
-            assert stripped_text[0][0].lower() == 'singapore'
+        if args.num_beams == 1:
+            output_ids = model.tokenizer(stripped_text[0][0],
+                                         add_special_tokens=False)['input_ids']
+            logger.info(f"Generated {len(output_ids)} tokens")
+
+        if args.check_accuracy:
+            for i in range(args.batch_size - 1):
+                if not (stripped_text[i] == stripped_text[i + 1]):
+                    logger.info(f"Output {i} and {i + 1} do not match")
+                    assert False
+            if not args.nougat:
+                if "vila" in args.hf_model_dir:
+                    assert stripped_text[0][0].lower(
+                    ) == 'the traffic condition in the image is quite busy, with multiple cars and bicycles sharing the road. there are also pedestrians walking on'
+                else:
+                    assert stripped_text[0][0].lower() == 'singapore'
 
         if args.run_profiling:
-            vision_latency = profiler.elapsed_time_in_sec("Vision") / num_iters
-            logger.info(
-                f'TensorRT vision encoder latency: {vision_latency} sec')
-
-            llm_latency = profiler.elapsed_time_in_sec("LLM") / num_iters
-            logger.info(f'TensorRT-LLM LLM latency: {llm_latency} sec')
-
-            generate_latency = profiler.elapsed_time_in_sec(
-                "Generate") / num_iters
-            logger.info(f'Generate latency: {generate_latency} sec')
+            msec_per_batch = lambda name: 1000 * profiler.elapsed_time_in_sec(
+                name) / num_iters
+            logger.info('Latencies per batch (msec)')
+            logger.info('TRT vision encoder: %.1f' % (msec_per_batch('Vision')))
+            logger.info('TRTLLM LLM generate: %.1f' % (msec_per_batch('LLM')))
+            logger.info('Multimodal generate: %.1f' %
+                        (msec_per_batch('Generate')))
 
         logger.info("---------------------------------------------------------")

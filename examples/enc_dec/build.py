@@ -267,6 +267,12 @@ def parse_arguments(component):
         default=False,
         choices=['float16', 'float32', 'bfloat16'],
         help='Activates the lora plugin which enables embedding sharing.')
+    parser.add_argument(
+        '--skip_cross_qkv',
+        action='store_true',
+        help=
+        'Skip redundant cross qkv computation by using TensorRT IfConditional switch (experimental).'
+    )
 
     # parse cmdline args
     args = parser.parse_args()
@@ -391,7 +397,8 @@ def build_rank_engine(builder: Builder,
             rescale_before_lm_head=args.rescale_before_lm_head,
             dtype=dtype,
             logits_dtype=args.logits_dtype,
-            fp16_clamping=fp16_clamping)
+            fp16_clamping=fp16_clamping,
+            skip_cross_qkv=args.skip_cross_qkv)
 
     if args.weight_from_pytorch_ckpt:
         assert args.tp_size == 1, "Loading from framework model via memory is for demonstration purpose. For multi-GPU inference, please use loading from binary for better performance."
@@ -533,7 +540,8 @@ def build(rank, args):
             hf_modules_to_trtllm_modules=args.hf_modules_to_trtllm_modules
             if args.use_lora_plugin else None,
             trtllm_modules_to_hf_modules=args.trtllm_modules_to_hf_modules
-            if args.use_lora_plugin else None)
+            if args.use_lora_plugin else None,
+            skip_cross_qkv=args.skip_cross_qkv)
 
         engine_name = get_engine_name(args.engine_name, args.dtype,
                                       args.tp_size, args.pp_size, cur_rank)

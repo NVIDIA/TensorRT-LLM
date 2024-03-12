@@ -16,7 +16,6 @@ import unittest
 from itertools import product
 
 import numpy as np
-import pytest
 
 # isort: off
 import torch
@@ -29,7 +28,8 @@ from polygraphy.backend.trt import (CreateConfig, EngineFromNetwork, Profile,
 from transformers.models.bloom.modeling_bloom import build_alibi_tensor
 from transformers.models.llama.modeling_llama import (LlamaConfig, LlamaMLP,
                                                       LlamaRMSNorm)
-from utils.util import getSMVersion
+from utils.util import (getSMVersion, skip_bf16_pre_ampere, skip_fp8_pre_ada,
+                        skip_pre_ampere, unittest_name_func)
 
 import tensorrt_llm
 from tensorrt_llm import Tensor
@@ -157,17 +157,12 @@ class TestLayer(unittest.TestCase):
                                    outputs['output'],
                                    atol=1e-6)
 
-    def _gated_mlp_custom_id(testcase_func, param_num, param):
-        return "%s_%s_%s" % (testcase_func.__name__, param.args[0].__name__,
-                             param.args[1])
-
     @parameterized.expand([[tensorrt_llm.layers.GatedMLP, 'float32'],
                            [tensorrt_llm.layers.GatedMLP, 'fp8']],
-                          name_func=_gated_mlp_custom_id)
+                          name_func=unittest_name_func)
     def test_gated_mlp(self, ClsMLP, qformat):
-        if getSMVersion() < 89 and qformat == 'fp8':
-            pytest.skip("fp8 is not supported in pre-ada architecture")
 
+        skip_fp8_pre_ada(qformat == 'fp8')
         # test data
         d_h = 8
         ffn_h = 20
@@ -255,16 +250,14 @@ class TestLayer(unittest.TestCase):
         np.testing.assert_allclose(ref.cpu().numpy(), outputs['output'],
                                    **kwargs)
 
-    @parameterized.expand([["float32", False], ["float32", True],
-                           ["float16", False], ["float16", True],
-                           ["float16", True, "float32"], ["bfloat16", False],
-                           ["bfloat16", True], ["bfloat16", True, "float32"]])
+    @parameterized.expand(
+        [["float32", False], ["float32", True], ["float16", False],
+         ["float16", True], ["float16", True, "float32"], ["bfloat16", False],
+         ["bfloat16", True], ["bfloat16", True, "float32"]],
+        name_func=unittest_name_func)
     def test_linear(self, dtype, use_plugin, output_dtype=None):
-        # Skip tests that are not supported on V100
-        if getSMVersion() < 80:
-            if dtype == 'bfloat16':
-                pytest.skip(
-                    "bfloat16 is not supported in pre-ampere architecture")
+        # Skip tests that are not supported on pre-Ampere
+        skip_bf16_pre_ampere(dtype)
 
         if output_dtype is None:
             output_dtype = dtype
@@ -320,11 +313,9 @@ class TestLayer(unittest.TestCase):
                                    outputs['output'].to(torch.float32).numpy(),
                                    atol=atols[dtype])
 
-    @parameterized.expand(list(product([True, False], [True, False])))
-    @pytest.mark.skipif(
-        getSMVersion() < 80,
-        reason="bfloat16 is not supported in pre-ampere architecture"
-    )  # Skip tests that are not supported in pre-ampere architecture
+    @parameterized.expand(list(product([True, False], [True, False])),
+                          name_func=unittest_name_func)
+    @skip_pre_ampere  # Skip tests that are not supported in pre-ampere architecture
     def test_prompt_tuning_embedding(self, enable_lookup_plugin,
                                      remove_padding):
         torch.random.manual_seed(0)
@@ -557,10 +548,10 @@ class TestLayer(unittest.TestCase):
                                    outputs['output'],
                                    atol=1e-6)
 
-    @parameterized.expand([("bfloat16", "float32"), ("float32", "bfloat16")])
+    @parameterized.expand([("bfloat16", "float32"), ("float32", "bfloat16")],
+                          name_func=unittest_name_func)
+    @skip_pre_ampere
     def test_cast_bf16(self, from_dtype, to_dtype):
-        if getSMVersion() < 80:
-            pytest.skip("bfloat16 is not supported in pre-ampere architecture")
 
         torch_from_dtype = str_dtype_to_torch(from_dtype)
         torch_to_dtype = str_dtype_to_torch(to_dtype)
@@ -659,30 +650,32 @@ class TestLayer(unittest.TestCase):
                                    atol=1e-6)
 
     # The activation memory usage baseline is acquired by `session.engine.device_memory_size` and hardcoded here since it shouldn't change much across platforms if we fused mha successfully.
-    @parameterized.expand([
-        (
-            12, 512, 16, 64, 'float16', PositionEmbeddingType.alibi, False,
-            402653184
-        ),  # TRT has gpu buffer management issues with fmha + alibi, so the baseline here is tested w./o. fused mha.
-        (128, 128, 12, 32, 'float16', PositionEmbeddingType.alibi, True,
-         201326592),
-        (1, 200, 8, 128, 'float32', PositionEmbeddingType.alibi, False,
-         5017600),
-        (48, 30, 24, 80, 'float32', PositionEmbeddingType.alibi, True,
-         55296000),
-        (12, 512, 16, 64, 'float16', PositionEmbeddingType.learned_absolute,
-         False, 88113152),
-        (128, 128, 12, 32, 'float16', PositionEmbeddingType.learned_absolute,
-         True, 88866816),
-        (1, 200, 8, 128, 'float32', PositionEmbeddingType.learned_absolute,
-         False, 5017600),
-        (48, 30, 24, 80, 'float32', PositionEmbeddingType.learned_absolute,
-         True, 55296000),
-        (2, 128, 4, 64, 'float16', PositionEmbeddingType.learned_absolute, True,
-         35588608, True),
-        (2, 128, 4, 64, 'float32', PositionEmbeddingType.learned_absolute, True,
-         36833280, True),
-    ])
+    @parameterized.expand(
+        [
+            (
+                12, 512, 16, 64, 'float16', PositionEmbeddingType.alibi, False,
+                402653184
+            ),  # TRT has gpu buffer management issues with fmha + alibi, so the baseline here is tested w./o. fused mha.
+            (128, 128, 12, 32, 'float16', PositionEmbeddingType.alibi, True,
+             201326592),
+            (1, 200, 8, 128, 'float32', PositionEmbeddingType.alibi, False,
+             5017600),
+            (48, 30, 24, 80, 'float32', PositionEmbeddingType.alibi, True,
+             55296000),
+            (12, 512, 16, 64, 'float16', PositionEmbeddingType.learned_absolute,
+             False, 88113152),
+            (128, 128, 12, 32, 'float16',
+             PositionEmbeddingType.learned_absolute, True, 88866816),
+            (1, 200, 8, 128, 'float32', PositionEmbeddingType.learned_absolute,
+             False, 5017600),
+            (48, 30, 24, 80, 'float32', PositionEmbeddingType.learned_absolute,
+             True, 55296000),
+            (2, 128, 4, 64, 'float16', PositionEmbeddingType.learned_absolute,
+             True, 35588608, True),
+            (2, 128, 4, 64, 'float32', PositionEmbeddingType.learned_absolute,
+             True, 36833280, True),
+        ],
+        name_func=unittest_name_func)
     def test_attention(self,
                        batch_size,
                        seq_len,
@@ -937,15 +930,13 @@ class TestLayer(unittest.TestCase):
                            (1, 16, 1024, 16, 'context', 'bfloat16'),
                            (1, 1, 1024, 16, 'generation', 'float32'),
                            (1, 1, 1024, 16, 'generation', 'float16'),
-                           (1, 1, 1024, 16, 'generation', 'bfloat16')])
+                           (1, 1, 1024, 16, 'generation', 'bfloat16')],
+                          name_func=unittest_name_func)
     def test_mamba(self, batch_size, seq_len, d_model, d_state, req_type,
                    dtype):
 
         # Skip tests that are not supported in pre-ampere architecture
-        if getSMVersion() < 80:
-            if dtype == 'bfloat16':
-                pytest.skip(
-                    "bfloat16 is not supported in pre-ampere architecture")
+        skip_bf16_pre_ampere(dtype)
 
         # configs
         device = "cuda"
@@ -976,9 +967,11 @@ class TestLayer(unittest.TestCase):
                                      device=device)
         if req_type == 'context':
             ssm_state = torch.empty(size=[batch_size, d_state, d_inner],
+                                    dtype=torch_dtype,
                                     device=device)
         else:
             ssm_state = torch.randn(size=[batch_size, d_state, d_inner],
+                                    dtype=torch_dtype,
                                     device=device)
 
         host_request_types = torch.tensor([0 if req_type == 'context' else 1] *
@@ -987,9 +980,10 @@ class TestLayer(unittest.TestCase):
         output = torch.zeros(size=[batch_size, seq_len, d_model],
                              dtype=torch_dtype,
                              device=device)
-        present_conv_state = torch.zeros(size=[batch_size, d_inner, d_conv - 1],
-                                         dtype=torch_dtype,
-                                         device=device)
+        present_conv_state = torch.zeros(
+            size=[batch_size, d_inner, d_conv - 1 + seq_len],
+            dtype=torch_dtype,
+            device=device)
 
         hidden_states_ref = hidden_states.detach().clone()
         if req_type == 'context':
@@ -1045,7 +1039,7 @@ class TestLayer(unittest.TestCase):
             ssm_state_tensor = Tensor(
                 name='ssm_state',
                 shape=ssm_state.shape,
-                dtype=tensorrt_llm.str_dtype_to_trt('float32'))
+                dtype=tensorrt_llm.str_dtype_to_trt(dtype))
             host_request_types_tensor = Tensor(
                 name='host_request_types',
                 shape=host_request_types.shape,
@@ -1126,7 +1120,8 @@ class TestLayer(unittest.TestCase):
 
         np.testing.assert_allclose(
             conv_state_ref[:, :, 1:].detach().to(torch.float32).cpu().numpy(),
-            outputs['present_conv_state'].to(torch.float32).cpu().numpy(),
+            outputs['present_conv_state'][:, :,
+                                          -3:].to(torch.float32).cpu().numpy(),
             atol=dtype_atol[dtype])
 
         np.testing.assert_allclose(ssm_state_ref.detach().to(

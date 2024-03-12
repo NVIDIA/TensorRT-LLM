@@ -19,7 +19,7 @@ from typing import Optional
 
 from transformers import AutoTokenizer, T5Tokenizer
 
-import tensorrt_llm
+from tensorrt_llm.builder import get_engine_version
 
 # TODO(enweiz): Update for refactored models
 DEFAULT_HF_MODEL_DIRS = {
@@ -47,7 +47,7 @@ DEFAULT_PROMPT_TEMPLATES = {
 
 
 def read_model_name(engine_dir: str):
-    engine_version = tensorrt_llm.runtime.engine.get_engine_version(engine_dir)
+    engine_version = get_engine_version(engine_dir)
 
     with open(Path(engine_dir) / "config.json", 'r') as f:
         config = json.load(f)

@@ -14,8 +14,8 @@
 # limitations under the License.
 from ..._utils import pad_vocab_size
 from ...functional import PositionEmbeddingType, Tensor
-from ...layers import (MLP, Attention, AttentionMaskType, ColumnLinear,
-                       Embedding, LayerNorm)
+from ...layers import (MLP, Attention, AttentionMaskType, Embedding, LayerNorm,
+                       ParallelLMHead)
 from ...module import Module
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
                               PretrainedConfig)
@@ -156,14 +156,14 @@ class PhiForCausalLM(DecoderModelForCausalLM):
         if config.share_embedding_table:
             share_weight = transformer.vocab_embedding.weight
 
-        lm_head = ColumnLinear(config.hidden_size,
-                               vocab_size_padded,
-                               bias=True,
-                               dtype=config.dtype,
-                               tp_group=config.mapping.tp_group,
-                               tp_size=config.mapping.tp_size,
-                               gather_output=True,
-                               share_weight=share_weight)
+        lm_head = ParallelLMHead(config.hidden_size,
+                                 vocab_size_padded,
+                                 bias=True,
+                                 dtype=config.dtype,
+                                 tp_group=config.mapping.tp_group,
+                                 tp_size=config.mapping.tp_size,
+                                 gather_output=True,
+                                 share_weight=share_weight)
 
         super().__init__(config, transformer, lm_head)
 

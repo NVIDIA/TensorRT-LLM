@@ -104,6 +104,20 @@ config.quant_config.quantize_lm_head = True
 llm = LLM(config)
 ```
 
+## Auto parallel
+
+By simply enabling `parallel_config.auto_parallel` in the ModelConfig, TensorRT-LLM can parallelize the model automatically. For example, setting `parallel_config.world_size` to perform a 2-way parallelism:
+
+``` python
+from tensorrt_llm import LLM, ModelConfig
+
+config = ModelConfig(model_dir=<llama_model_path>)
+config.parallel_config.auto_parallel = True
+config.parallel_config.world_size = 2
+
+llm = LLM(config)
+```
+
 ## Asynchronous generation
 With the high-level API, you can also perform asynchronous generation with the `generate_async` method. For example:
 
@@ -118,6 +132,29 @@ async for output in llm.generate_async(<prompt>, streaming=True):
 
 When the `streaming` flag is set to `True`, the `generate_async` method will return a generator that yields the token results as soon as they are available. Otherwise, it will return a generator that yields the final results only.
 
+## Future-like generation result
+The result of the `generate_async` methods is a Future-like object, it doesn't block the thread unless the `.result()` is called.
+
+```python
+# This will not block the main thread
+generation = llm.generate_async(<prompt>)
+# Do something else here
+# call .result() to explicitly block the main thread and wait for the result when needed
+output = generation.result()
+```
+
+The `.result()` method works like the [result](https://docs.python.org/zh-cn/3/library/asyncio-future.html#asyncio.Future.result) method in the Python Future, you can specify a timeout to wait for the result.
+
+```python
+output = generation.result(timeout=10)
+```
+
+There is an async version, where the `.aresult()` is used.
+
+```python
+generation = llm.generate_async(<prompt>)
+output = await generation.aresult()
+```
 
 ## Customization
 
@@ -129,10 +166,10 @@ llm = LLM(config, tokenizer=<my_faster_one>)
 
 The LLM() workflow should use your tokenizer instead.
 
-It is also possible to input token IDs directly without Tokenizers with the following code:
+It is also possible to input token IDs directly without Tokenizers with the following code, note that the result will be also IDs without text since the tokenizer is not used.
 
 ``` python
-llm = LLM(config, enable_tokenizer=False)
+llm = LLM(config)
 
 for output in llm.generate([32, 12]): ...
 ```

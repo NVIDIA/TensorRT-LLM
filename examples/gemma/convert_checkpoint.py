@@ -19,6 +19,7 @@ import utils.params
 import utils.transformer
 from datasets import load_dataset
 from easydict import EasyDict
+from transformers import AutoConfig, AutoModelForCausalLM
 
 import tensorrt_llm
 from tensorrt_llm._utils import torch_to_numpy
@@ -34,7 +35,7 @@ def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt-type",
                         type=str,
-                        choices=["jax", "keras", "torch"])
+                        choices=["jax", "keras", "torch", "hf"])
     parser.add_argument("--model-dir", type=pathlib.Path, required=True)
     parser.add_argument("--output-model-dir", type=pathlib.Path, required=True)
     parser.add_argument("--world-size",
@@ -307,7 +308,85 @@ class TorchParser:
         return f_params
 
 
-CKPT_PARSER = {'jax': JAXParser, 'keras': KerasParser, 'torch': TorchParser}
+class HfParser:
+
+    def load_parameters(self, checkpoint_path: pathlib.Path):
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            checkpoint_path,
+            device_map='auto',
+            torch_dtype='auto',
+            trust_remote_code=True,
+        )
+        model_params = dict(hf_model.named_parameters())
+        return model_params
+
+    def embedding_weights(self, ckpt_params):
+        return ckpt_params['model.embed_tokens.weight']
+
+    def get_config(self, checkpoint_path, ckpt_params, num_embed):
+        hf_config = AutoConfig.from_pretrained(
+            checkpoint_path, trust_remote_code=True).to_dict()
+        config_new = {}
+        config_new["num_layers"] = hf_config["num_hidden_layers"]
+        config_new["num_embed"] = hf_config["vocab_size"]
+        config_new["embed_dim"] = hf_config["hidden_size"]
+        config_new["hidden_dim"] = hf_config["intermediate_size"]
+        config_new["num_heads"] = hf_config["num_attention_heads"]
+        config_new["head_dim"] = hf_config["head_dim"]
+        config_new["num_kv_heads"] = hf_config["num_key_value_heads"]
+        return EasyDict(config_new)
+
+    def rename_to_trt_llm(self, name: str):
+        """Rename a gemma parameter name by the corresponding TRT-LLM style name."""
+        prefix = "transformer"
+        sub_patterns = (
+            (r"model.embed_tokens.weight", r"vocab_embedding.weight"),
+            (r"model.layers.(\d+).input_layernorm.weight",
+             r"layers.\1.input_layernorm.weight"),
+            (r"model.layers.(\d+).self_attn.q_proj.weight",
+             r"layers.\1.attention.qkv.weight"),
+            (r"model.layers.(\d+).self_attn.k_proj.weight",
+             None),  # merged with above
+            (r"model.layers.(\d+).self_attn.v_proj.weight",
+             None),  # merged with above
+            (r"model.layers.(\d+).self_attn.o_proj.weight",
+             r"layers.\1.attention.dense.weight"),
+            (r"model.layers.(\d+).mlp.gate_proj.weight",
+             r"layers.\1.mlp.fc.weight"),
+            (r"model.layers.(\d+).mlp.up_proj.weight",
+             None),  # merged with above
+            (r"model.layers.(\d+).mlp.down_proj.weight",
+             r"layers.\1.mlp.proj.weight"),
+            (r"model.layers.(\d+).post_attention_layernorm.weight",
+             r"layers.\1.post_layernorm.weight"),
+            (r"model.norm.weight", r"ln_f.weight"),
+        )
+
+        for source, target in sub_patterns:
+            if re.match(source, name):
+                if target is None:
+                    return target
+                else:
+                    name = re.sub(source, target, name)
+                    return ".".join((prefix, name))
+        else:
+            raise ValueError(f"Don't know how to rename {prefix}.{name}")
+
+    def flatten_params(self, params):
+        f_params = {}
+        for k, v in params.items():
+            if v.dtype == torch.bfloat16:
+                v = v.float()
+            f_params[k] = torch_to_numpy(v)
+        return f_params
+
+
+CKPT_PARSER = {
+    'jax': JAXParser,
+    'keras': KerasParser,
+    'torch': TorchParser,
+    'hf': HfParser
+}
 
 
 def split(v, tp_size, idx, dim=0):
@@ -556,6 +635,51 @@ def convert_from_checkpoint(
                     else:
                         add_trt_llm_weight(weights, trt_llm_name, qkv_param,
                                            trt_llm_config.dtype)
+            elif "q_proj" in name:
+                gqa_mode = trt_llm_config.num_attention_heads != trt_llm_config.num_key_value_heads
+
+                if gqa_mode:
+                    # initial shape: (num_heads * head_dim, hidden_size)
+                    q_param = param
+                    q_param = split_matrix_tp(q_param, tp_size, tp_rank, dim=0)
+
+                    k_name = name.replace("q_proj", "k_proj")
+                    k_param = model_params[k_name]
+
+                    v_name = name.replace("q_proj", "v_proj")
+                    v_param = model_params[v_name]
+                else:
+                    # initial shape: (num_heads * head_dim, hidden_size)
+                    q_param = param
+                    q_param = split_matrix_tp(q_param, tp_size, tp_rank, dim=0)
+
+                    k_name = name.replace("q_proj", "k_proj")
+                    k_param = model_params[k_name]
+                    k_param = split_matrix_tp(k_param, tp_size, tp_rank, dim=0)
+
+                    v_name = name.replace("q_proj", "v_proj")
+                    v_param = model_params[v_name]
+                    v_param = split_matrix_tp(v_param, tp_size, tp_rank, dim=0)
+
+                qkv_param = np.concatenate([q_param, k_param, v_param], axis=0)
+                qkv_param = qkv_param.reshape(qkv_param.shape[0], -1)
+
+                # If int8 kv enabled, weight-only quantization will be done later.
+                if trt_llm_config.quant_mode.is_weight_only() and not trt_llm_config.quant_mode.has_per_group_scaling() and \
+                    not trt_llm_config.quant_mode.has_int8_kv_cache():
+                    qkv_param_quantized, qkv_param_scales = quantize(
+                        qkv_param, trt_llm_config.quant_mode)
+                    add_trt_llm_weight(weights, trt_llm_name,
+                                       qkv_param_quantized)
+                    add_trt_llm_weight(
+                        weights,
+                        trt_llm_name.replace(".weight", ".per_channel_scale"),
+                        qkv_param_scales,
+                        trt_llm_config.dtype,
+                    )
+                else:
+                    add_trt_llm_weight(weights, trt_llm_name, qkv_param,
+                                       trt_llm_config.dtype)
             elif "attention.dense.weight" in trt_llm_name:
                 # initial shape: (num_heads, head_dim, hidden_size)
                 if len(param.shape) == 3:
@@ -583,6 +707,12 @@ def convert_from_checkpoint(
                     fc_param, gate_param = param, model_params[name.replace(
                         "gating_ffw", "gating_ffw_2")]
                 elif isinstance(ckpt_parser, TorchParser):
+                    # initial shape: (intermediate_size, hidden_size)
+                    fc_param, gate_param = param, model_params[name.replace(
+                        "mlp.gate_proj", "mlp.up_proj")]
+                    fc_param = fc_param.transpose(1, 0)
+                    gate_param = gate_param.transpose(1, 0)
+                elif isinstance(ckpt_parser, HfParser):
                     # initial shape: (intermediate_size, hidden_size)
                     fc_param, gate_param = param, model_params[name.replace(
                         "mlp.gate_proj", "mlp.up_proj")]
@@ -632,7 +762,8 @@ def convert_from_checkpoint(
                     add_trt_llm_weight(weights, trt_llm_name, gate_param,
                                        trt_llm_config.dtype)
             elif "mlp.proj.weight" in trt_llm_name:
-                if not isinstance(ckpt_parser, TorchParser):
+                if not isinstance(ckpt_parser, TorchParser) and not isinstance(
+                        ckpt_parser, HfParser):
                     # initial shape: (intermediate_size, hidden_size)
                     param = param.transpose(1, 0)
                 param = split_matrix_tp(param, tp_size, tp_rank, dim=1)
@@ -650,7 +781,8 @@ def convert_from_checkpoint(
                 else:
                     add_trt_llm_weight(weights, trt_llm_name, param,
                                        trt_llm_config.dtype)
-            elif "embedder.input_embedding" in name or "reversible_embedding" in name or "embedder.weight" in name:
+            elif "embedder.input_embedding" in name or "reversible_embedding" in name or "embedder.weight" in name \
+                    or "embed_tokens.weight" in name:
                 if not trt_llm_config.share_embedding_table:
                     # TODO: safetensor doesn't allow to save a shared tensor.
                     # Currently, we clone the weight but to save the disk, it
@@ -796,7 +928,6 @@ def main():
             quant_algo = 'W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN'
         elif args.per_token and not args.per_channel:
             quant_algo = 'W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN'
-        quant_kwargs.update(sq_use_plugin=True)
 
     quant_kwargs.update(quant_algo=quant_algo,
                         kv_cache_quant_algo=kv_cache_quant_algo)
@@ -805,6 +936,16 @@ def main():
             quant_kwargs.update(has_zero_point=False,
                                 pre_quant_scale=True,
                                 exclude_modules=["lm_head"])
+
+    quant_config = tensorrt_llm.models.modeling_utils.QuantizationConfig()
+    quant_config.quant_algo = quant_kwargs['quant_algo']
+    quant_config.kv_cache_quant_algo = quant_kwargs['kv_cache_quant_algo']
+    if args.use_weight_only_with_precision and args.use_weight_only_with_precision.endswith(
+            "awq"):
+        quant_config.group_size = 128
+        quant_config.has_zero_point = quant_kwargs['has_zero_point']
+        quant_config.pre_quant_scale = quant_kwargs['pre_quant_scale']
+        quant_config.exclude_modules = quant_kwargs['exclude_modules']
 
     trt_llm_config = tensorrt_llm.models.modeling_utils.PretrainedConfig(
         architecture="GemmaForCausalLM",
@@ -824,7 +965,7 @@ def main():
         world_size=args.world_size,
         tp_size=args.world_size,
         pp_size=1,
-        quantization=quant_kwargs,
+        quantization=quant_config,
     )
 
     trt_llm_config_dict = trt_llm_config.to_dict()

@@ -44,11 +44,11 @@ struct SATypeConverter<half>
 };
 
 template <typename T, typename KVCacheBuffer>
-__global__ void applyRoPE(KVCacheBuffer kCacheRead, KVLinearBuffer kCacheWrite, const int sizePerHead,
-    const int beam_width, const int* token_read_idxs, const int* token_write_idxs, const int* token_pos_idxs,
-    const int* token_seq_idxs, const int* sequence_lengths, const int* input_lengths, const int rotary_embedding_dim,
+__global__ void applyRoPE(KVCacheBuffer kCacheRead, KVLinearBuffer kCacheWrite, int const sizePerHead,
+    int const beam_width, int const* token_read_idxs, int const* token_write_idxs, int const* token_pos_idxs,
+    int const* token_seq_idxs, int const* sequence_lengths, int const* input_lengths, int const rotary_embedding_dim,
     float rotary_embedding_base, RotaryScalingType const rotary_scale_type, float rotary_embedding_scale,
-    const int rotary_embedding_max_positions, PositionEmbeddingType const position_embedding_type)
+    int const rotary_embedding_max_positions, PositionEmbeddingType const position_embedding_type)
 {
     // We allow only fp32/fp16/bf16 as the data types to apply rotary
     static_assert(sizeof(T) == 4 || sizeof(T) == 2, "");
@@ -57,29 +57,29 @@ __global__ void applyRoPE(KVCacheBuffer kCacheRead, KVLinearBuffer kCacheWrite, 
     // Each thread will handle 16 bytes.
     constexpr int vec_size = 16u / sizeof(T);
     using Vec_k = typename mmha::packed_type<T, vec_size>::type;
-    const int sizePerHeadDivX = sizePerHead / vec_size;
+    int const sizePerHeadDivX = sizePerHead / vec_size;
 
     // The position idx
-    const int token_idx = token_seq_idxs[blockIdx.x];
-    const int token_read_idx = token_read_idxs[blockIdx.x];
-    const int token_write_idx = token_write_idxs[blockIdx.x];
-    const int token_pos_idx = token_pos_idxs[blockIdx.x];
+    int const token_idx = token_seq_idxs[blockIdx.x];
+    int const token_read_idx = token_read_idxs[blockIdx.x];
+    int const token_write_idx = token_write_idxs[blockIdx.x];
+    int const token_pos_idx = token_pos_idxs[blockIdx.x];
     // Head
-    const int head_idx = blockIdx.y;
+    int const head_idx = blockIdx.y;
     // The batch beam idx
-    const int batch_beam_idx = blockIdx.z;
+    int const batch_beam_idx = blockIdx.z;
     // The beam idx
-    const int beam_idx = batch_beam_idx % beam_width;
+    int const beam_idx = batch_beam_idx % beam_width;
     // Thread idx
-    const int tidx = threadIdx.x;
+    int const tidx = threadIdx.x;
 
     // The actual sequence length excluding the paddings.
-    const int tlength = sequence_lengths[batch_beam_idx] - 1;
+    int const tlength = sequence_lengths[batch_beam_idx] - 1;
     // The context length
-    const int inlength = input_lengths[batch_beam_idx];
+    int const inlength = input_lengths[batch_beam_idx];
     // Mask out the tokens exceed the real total length and tokens in the context phase with beam_idx>0
-    const bool valid_seq = token_idx < tlength && !(token_idx < inlength && beam_idx > 0);
-    const bool is_head_size_masked = tidx * vec_size >= sizePerHead;
+    bool const valid_seq = token_idx < tlength && !(token_idx < inlength && beam_idx > 0);
+    bool const is_head_size_masked = tidx * vec_size >= sizePerHead;
 
     if (!valid_seq || is_head_size_masked)
     {
@@ -90,7 +90,7 @@ __global__ void applyRoPE(KVCacheBuffer kCacheRead, KVLinearBuffer kCacheWrite, 
     Vec_k k;
     T* k_cache = reinterpret_cast<T*>(kCacheRead.getKBlockPtr(batch_beam_idx, token_read_idx));
     int inBlockIdx_r = kCacheRead.getKVLocalIdx(token_read_idx, head_idx, sizePerHead, tidx * vec_size);
-    k = *reinterpret_cast<const Vec_k*>(&k_cache[inBlockIdx_r]);
+    k = *reinterpret_cast<Vec_k const*>(&k_cache[inBlockIdx_r]);
 
     // Apply position embedding
     switch (position_embedding_type)
@@ -103,14 +103,14 @@ __global__ void applyRoPE(KVCacheBuffer kCacheRead, KVLinearBuffer kCacheWrite, 
     }
     case PositionEmbeddingType::kROPE_GPT_NEOX:
     {
-        const bool do_rotary = vec_size * tidx < rotary_embedding_dim;
+        bool const do_rotary = vec_size * tidx < rotary_embedding_dim;
 
         T* k_smem = reinterpret_cast<T*>(smem_);
 
-        const int half_rotary_dim = rotary_embedding_dim / 2;
-        const int half_idx = (tidx * vec_size) / half_rotary_dim;
-        const int intra_half_idx = (tidx * vec_size) % half_rotary_dim;
-        const int smem_pitch = half_rotary_dim; // TODO: adjust for bank conflicts?
+        int const half_rotary_dim = rotary_embedding_dim / 2;
+        int const half_idx = (tidx * vec_size) / half_rotary_dim;
+        int const intra_half_idx = (tidx * vec_size) % half_rotary_dim;
+        int const smem_pitch = half_rotary_dim; // TODO: adjust for bank conflicts?
 
         if (do_rotary)
         {
@@ -119,7 +119,7 @@ __global__ void applyRoPE(KVCacheBuffer kCacheRead, KVLinearBuffer kCacheWrite, 
 
         __syncthreads();
 
-        const int transpose_idx = half_idx * (half_rotary_dim / 2) + intra_half_idx / 2;
+        int const transpose_idx = half_idx * (half_rotary_dim / 2) + intra_half_idx / 2;
         constexpr int tidx_factor = vec_size / 2;
         if (do_rotary)
         {
@@ -146,15 +146,15 @@ __global__ void applyRoPE(KVCacheBuffer kCacheRead, KVLinearBuffer kCacheWrite, 
 }
 
 template <typename T, typename KVCacheBuffer>
-void invokeApplyRoPE(KVCacheBuffer kCacheRead, KVLinearBuffer kCacheWrite, const int sizePerHead, const int batch_beam,
-    const int kv_head_num, const int beam_width, const int* token_read_idxs, const int* token_write_idxs,
-    const int* token_pos_idxs, const int* token_seq_idxs, const int token_num, const int* sequence_lengths,
-    const int* input_lengths, const int rotary_embedding_dim, float rotary_embedding_base,
-    RotaryScalingType const rotary_scale_type, float rotary_embedding_scale, const int rotary_embedding_max_positions,
+void invokeApplyRoPE(KVCacheBuffer kCacheRead, KVLinearBuffer kCacheWrite, int const sizePerHead, int const batch_beam,
+    int const kv_head_num, int const beam_width, int const* token_read_idxs, int const* token_write_idxs,
+    int const* token_pos_idxs, int const* token_seq_idxs, int const token_num, int const* sequence_lengths,
+    int const* input_lengths, int const rotary_embedding_dim, float rotary_embedding_base,
+    RotaryScalingType const rotary_scale_type, float rotary_embedding_scale, int const rotary_embedding_max_positions,
     PositionEmbeddingType const position_embedding_type, cudaStream_t stream)
 {
     // Block handles K tile.
-    const int vec_size = 16u / sizeof(T);
+    int const vec_size = 16u / sizeof(T);
     dim3 block((sizePerHead / vec_size + 31) / 32 * 32);
     dim3 grid(token_num, kv_head_num, batch_beam);
     size_t smem_size
@@ -186,10 +186,10 @@ public:
     void TearDown() override {}
 
     void initData(int32_t batchSize, int32_t beamWidth, int32_t numHeads, int32_t maxAttentionWindow, int32_t headSize,
-        bool pagedKvCache, int32_t maxBlocksPerSeq, int32_t tokensPerBlock, const std::vector<int32_t>& seqLengths,
-        const std::vector<int32_t>& inputLengths, const std::vector<int32_t>& tokenReadIdxs,
-        const std::vector<int32_t>& tokenWriteIdxs, const std::vector<int32_t>& tokenPosIdxs,
-        const std::vector<int32_t>& tokenSeqIdxs)
+        bool pagedKvCache, int32_t maxBlocksPerSeq, int32_t tokensPerBlock, std::vector<int32_t> const& seqLengths,
+        std::vector<int32_t> const& inputLengths, std::vector<int32_t> const& tokenReadIdxs,
+        std::vector<int32_t> const& tokenWriteIdxs, std::vector<int32_t> const& tokenPosIdxs,
+        std::vector<int32_t> const& tokenSeqIdxs)
     {
         // allocate buffer
         mSeqLengthsHost = mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
@@ -303,8 +303,8 @@ public:
     }
 
     float compareResults(KVLinearBuffer kCacheOut, KVLinearBuffer kCacheRef, int32_t batchBeam, int32_t beamWidth,
-        int32_t numHeads, int32_t headSize, int32_t validTokenNum, const int32_t* seqLengths,
-        const int32_t* inputLengths, const int32_t* tokenWriteIdxs, const int32_t* tokenSeqIdxs)
+        int32_t numHeads, int32_t headSize, int32_t validTokenNum, int32_t const* seqLengths,
+        int32_t const* inputLengths, int32_t const* tokenWriteIdxs, int32_t const* tokenSeqIdxs)
     {
         mBufferManager->copy(*mOutputDataDevice, *mOutputDataHost);
         mBufferManager->copy(*mRefOutputDataDevice, *mRefOutputDataHost);
@@ -316,16 +316,16 @@ public:
         float tot_diff = 0.f;
         for (SizeType bi = 0; bi < batchBeam; ++bi)
         {
-            const int tlength = seqLengths[bi] - 1;
-            const int inlength = inputLengths[bi];
-            const int beam_idx = bi % beamWidth;
+            int const tlength = seqLengths[bi] - 1;
+            int const inlength = inputLengths[bi];
+            int const beam_idx = bi % beamWidth;
             for (SizeType hi = 0; hi < numHeads; ++hi)
             {
                 for (SizeType ti = 0; ti < validTokenNum; ++ti)
                 {
-                    const int token_seq_idx = tokenSeqIdxs[ti];
-                    const int token_write_idx = tokenWriteIdxs[ti];
-                    const bool valid_seq = token_seq_idx < tlength && !(token_seq_idx < inlength && beam_idx > 0);
+                    int const token_seq_idx = tokenSeqIdxs[ti];
+                    int const token_write_idx = tokenWriteIdxs[ti];
+                    bool const valid_seq = token_seq_idx < tlength && !(token_seq_idx < inlength && beam_idx > 0);
                     if (!valid_seq)
                     {
                         continue;
@@ -350,7 +350,7 @@ public:
     void runTest(int32_t batchSize, int32_t beamWidth, int32_t numHeads, int32_t headSize, int32_t maxAttentionWindow,
         int32_t sinkTokenLength, int32_t pastKCacheLength, int32_t validTokenNum, bool pagedKvCache,
         int32_t maxBlocksPerSeq, int32_t tokensPerBlock, int rotaryEmbeddingDim, float rotaryEmbeddingBase,
-        RotaryScalingType const rotaryScaleType, float rotaryEmbeddingScale, const int rotaryEmbeddingMaxPositions,
+        RotaryScalingType const rotaryScaleType, float rotaryEmbeddingScale, int const rotaryEmbeddingMaxPositions,
         PositionEmbeddingType const positionEmbeddingType)
     {
         // Synchronize
@@ -358,7 +358,7 @@ public:
 
         // get kv cache
         const int32_t batchBeam = batchSize * beamWidth;
-        const auto elemSize = sizeof(T);
+        auto const elemSize = sizeof(T);
 
         KVLinearBuffer shiftKCacheBuffer = KVLinearBuffer(batchBeam, 1, maxAttentionWindow,
             numHeads * headSize * elemSize, maxAttentionWindow, sinkTokenLength, true);
@@ -587,7 +587,7 @@ TYPED_TEST(ShiftKCacheKernelTest, CyclicShiftKCacheSink)
         std::vector<int32_t> tokenPosIdxs = {0, 1, 2, 3};
         std::vector<int32_t> tokenSeqIdxs = {0, 1, 2, 3};
 
-        const int cyclicLength = maxAttentionWindow - sinkTokenLength;
+        int const cyclicLength = maxAttentionWindow - sinkTokenLength;
         for (SizeType idx = pastKCacheLength - cyclicLength; idx < pastKCacheLength; ++idx)
         {
             tokenReadIdxs.push_back(sinkTokenLength + bubbleLength + (idx - sinkTokenLength) % cyclicLength);

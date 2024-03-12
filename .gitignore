@@ -17,6 +17,16 @@ venv/
 .local/
 .hypothesis/
 .idea/
+dump*/
+.trt-internal
+*.dot
+*.prof
+*.log
+*.pkl
+*.hdf5
+*.lock
+config.json
+/*.svg
 cpp/cmake-build-*
 cpp/.ccache/
 tensorrt_llm/libs

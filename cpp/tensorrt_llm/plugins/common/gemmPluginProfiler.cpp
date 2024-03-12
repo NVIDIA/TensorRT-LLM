@@ -30,7 +30,7 @@ GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::GemmPluginPro
     mMNKProfileMap = std::make_shared<MNKProfileMap>();
 
     // set SKIP_GEMM_PLUGIN_PROFILINGS=1 to avoid tactics profilings
-    const auto skipEnv = std::getenv("SKIP_GEMM_PLUGIN_PROFILINGS");
+    auto const skipEnv = std::getenv("SKIP_GEMM_PLUGIN_PROFILINGS");
     mSkip = (skipEnv != NULL && std::stoi(skipEnv));
     if (mSkip)
     {
@@ -42,13 +42,13 @@ GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::GemmPluginPro
 
 template <typename Config, typename RunnerPtr, typename GemmIdType, typename GemmIdHashType>
 void GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::serialize(
-    char*& buffer, const GemmIdType& gemmId) const
+    char*& buffer, GemmIdType const& gemmId) const
 {
     auto mProfileMap = mMNKProfileMap->getMProfileMap(gemmId);
 
     // Save number of profiles for given GEMM ID
     write(buffer, static_cast<int>(mProfileMap->size()));
-    for (const auto& pair : *mProfileMap)
+    for (auto const& pair : *mProfileMap)
     {
         // Save pair of M to the best GEMM config
         write(buffer, pair);
@@ -57,7 +57,7 @@ void GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::serializ
 
 template <typename Config, typename RunnerPtr, typename GemmIdType, typename GemmIdHashType>
 void GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::deserialize(
-    const char*& data, GemmDims& dims, const GemmIdType& gemmId)
+    char const*& data, GemmDims& dims, GemmIdType const& gemmId)
 {
     // NOTE: this mutex is not needed since each thread owns its private map, but will put here for
     // consistency
@@ -85,7 +85,7 @@ void GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::deserial
 
 template <typename Config, typename RunnerPtr, typename GemmIdType, typename GemmIdHashType>
 size_t GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::getSerializationSize(
-    const GemmIdType& gemmId) const
+    GemmIdType const& gemmId) const
 {
     reader_lock lock(mMNKProfileMap->mutex);
     return sizeof(int) +                                 // size of the tactics map
@@ -95,7 +95,7 @@ size_t GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::getSer
 
 template <typename Config, typename RunnerPtr, typename GemmIdType, typename GemmIdHashType>
 void GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::profileTactics(
-    const RunnerPtr& runner, const nvinfer1::DataType& type, const GemmDims& dims, const GemmIdType& gemmId)
+    RunnerPtr const& runner, nvinfer1::DataType const& type, GemmDims const& dims, GemmIdType const& gemmId)
 {
     writer_lock lock(mMNKProfileMap->mutex);
 
@@ -107,7 +107,7 @@ void GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::profileT
     mRunner = runner;
     mType = type;
 
-    const int maxM = std::min(nextPowerOfTwo(dims.maxM), MAX_PROFILE_M);
+    int const maxM = std::min(nextPowerOfTwo(dims.maxM), MAX_PROFILE_M);
     computeTmpSize(maxM, dims.n, dims.k);
 
     if (!mMNKProfileMap->existsMProfileMap(gemmId))
@@ -137,7 +137,7 @@ void GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::profileT
     // Allocate tmp data to run GEMMs
     allocateTmpData();
 
-    const int startMinMRounded = nextPowerOfTwo(dims.minM);
+    int const startMinMRounded = nextPowerOfTwo(dims.minM);
     for (int m = startMinMRounded; m < maxM; m *= 2)
     {
         profileTactics(m, dims.n, dims.k);
@@ -150,7 +150,7 @@ void GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::profileT
 
 template <typename Config, typename RunnerPtr, typename GemmIdType, typename GemmIdHashType>
 std::optional<Config> GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::getBestConfig(
-    int m, const GemmIdType& gemmId) const
+    int m, GemmIdType const& gemmId) const
 {
     reader_lock lock(mMNKProfileMap->mutex);
 
@@ -159,7 +159,7 @@ std::optional<Config> GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHa
         return std::nullopt;
     }
 
-    const int mRounded = std::min(nextPowerOfTwo(m), MAX_PROFILE_M);
+    int const mRounded = std::min(nextPowerOfTwo(m), MAX_PROFILE_M);
     fflush(stdout);
     return mMNKProfileMap->getMProfileMap(gemmId)->at(mRounded);
 }
@@ -168,20 +168,20 @@ template <typename Config, typename RunnerPtr, typename GemmIdType, typename Gem
 void GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::allocateTmpData()
 {
     TLLM_CHECK_WITH_INFO(mTmpWorkspaceSizeInBytes > 0, "tmpWorkspaceSizeInBytes must be larger than 0");
-    const auto status = cudaMalloc(&mWorkspaceTmp, mTmpWorkspaceSizeInBytes);
+    auto const status = cudaMalloc(&mWorkspaceTmp, mTmpWorkspaceSizeInBytes);
     TLLM_CHECK_WITH_INFO(status == cudaSuccess, "Can't allocate tmp workspace for GEMM tactics profiling.");
 }
 
 template <typename Config, typename RunnerPtr, typename GemmIdType, typename GemmIdHashType>
 void GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::freeTmpData()
 {
-    const auto status = cudaFree(mWorkspaceTmp);
+    auto const status = cudaFree(mWorkspaceTmp);
     TLLM_CHECK_WITH_INFO(status == cudaSuccess, "Can't free tmp workspace for GEMM tactics profiling.");
 }
 
 template <typename Config, typename RunnerPtr, typename GemmIdType, typename GemmIdHashType>
 std::optional<Config> GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::profileTacticsForProblem(
-    int m, int n, int k, const std::vector<Config>& tactics)
+    int m, int n, int k, std::vector<Config> const& tactics)
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
 
@@ -192,7 +192,7 @@ std::optional<Config> GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHa
     // Iterate over all tactics for given M, N and K
     for (int ii = 0; ii < tactics.size(); ++ii)
     {
-        const Config& candidateConfig = tactics[ii];
+        Config const& candidateConfig = tactics[ii];
         float time = std::numeric_limits<float>::max();
         try
         {
@@ -204,7 +204,7 @@ std::optional<Config> GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHa
             time = profileTacticForProblem(m, n, k, candidateConfig);
             foundOne = true;
         }
-        catch (const std::exception& e)
+        catch (std::exception const& e)
         {
             std::ostringstream msg;
             msg << "Cannot profile configuration " << ii << " (for"
@@ -236,7 +236,7 @@ std::optional<Config> GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHa
 
 template <typename Config, typename RunnerPtr, typename GemmIdType, typename GemmIdHashType>
 float GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::profileTacticForProblem(
-    int m, int n, int k, const Config& tactic)
+    int m, int n, int k, Config const& tactic)
 {
     constexpr int warmup = 5;
     constexpr int runs = 10;
