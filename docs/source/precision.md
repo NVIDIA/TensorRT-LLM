@@ -146,7 +146,8 @@ This release of TensorRT-LLM contains the following examples:
 
 
 The list of supported multi-modal examples is:
-
+| Model      | FP32  | FP16  | BF16  |  FP8  | W8A8 SQ | W8A16 | W4A16 | W4A16 AWQ | W4A16 GPTQ |
+| :--------- | :---: | :---: | :---: | :---: | :-----: | :---: | :---: | :-------: | :--------: |
 | BLIP2-OPT  |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | BLIP2-T5   |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | LLaVA      |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     Y      |
