@@ -70,8 +70,8 @@ The Nitro TensorRT-LLM package contains `nitro.exe` and dependent `.dll` files.
 
 Models in TensorRT-LLM are compiled to [TensorRT-LLM Engines](https://nvidia.github.io/TensorRT-LLM/architecture.html) for your GPU and Operating System.
 
-Jan has fine-tuned [LlamaCorn-1.1b](https://huggingface.co/jan-hq/LlamaCorn-1.1B), a small model that can be run even on laptop GPUs with <6gb of VRAM. 
-- Based on [TinyLlama-1.1b](https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v0.6)
+Jan has fine-tuned [LlamaCorn-1.1b](https://huggingface.co/jan-hq/LlamaCorn-1.1B-Chat), a small model that can be run even on laptop GPUs with <6 GB of VRAM. 
+- Based on [TinyLlama-1.1b](https://huggingface.co/TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T)
 - Finetuned to be usable for simple tasks and have acceptable conversational quality
 
 #### Option 1: Prebuilt TensorRT Engine
