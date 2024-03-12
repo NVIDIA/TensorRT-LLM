@@ -46,11 +46,9 @@ We have compiled Nitro TensorRT-LLM into a single Windows package that can run s
 
 | Package | Size | Download |
 |-|-|-|
-| Nitro TensorRT-LLM (zipped) | 336mb | [Download](https://delta.jan.ai/dist/models/ada/windows/nitro-tensorrt-llm.zip) |  
+| Nitro TensorRT-LLM (zipped) | 336mb | [Download](https://delta.jan.ai/dist/nitro/ada/windows/nitro-tensorrt-llm.zip) |  
 
-> Note: The Nitro TensorRT-LLM package is approximately ~730mb.
-
-> Note: this excludes the TensorRT-LLM Engine for the Model. 
+> Note: The Nitro TensorRT-LLM package is approximately ~730mb. This excludes the TensorRT-LLM Engine for the Model. 
 
 #### Package Contents
 
@@ -77,7 +75,7 @@ Models in TensorRT-LLM are compiled to [TensorRT-LLM Engines](https://nvidia.git
 | Model          | OS      | GPU Architecture | Download |
 | -------------- | ------- | ---------------- | -------- |
 | Llamacorn 1.1b | Windows | 3090s (Ampere)   | Download |
-| Llamacorn 1.1b | Windows | 4090s (Ada)      | [Download](https://delta.jan.ai/dist/nitro/ada/windows/llamacorn-1.1b-16bit.zip) |
+| Llamacorn 1.1b | Windows | 4090s (Ada)      | [Download](https://delta.jan.ai/dist/models/ada/windows/llamacorn-1.1b-16bit.zip) |
 | OpenHermes 7b  | Windows | 3090s (Ampere)   | Download |
 | OpenHermes 7b  | Windows | 4090s (Ada)      | Download |
 
