@@ -70,14 +70,18 @@ The Nitro TensorRT-LLM package contains `nitro.exe` and dependent `.dll` files.
 
 Models in TensorRT-LLM are compiled to [TensorRT-LLM Engines](https://nvidia.github.io/TensorRT-LLM/architecture.html) for your GPU and Operating System.
 
+Jan has fine-tuned [LlamaCorn-1.1b](https://huggingface.co/jan-hq/LlamaCorn-1.1B), a small model that can be run even on laptop GPUs with <6gb of VRAM. 
+- Based on [TinyLlama-1.1b](https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v0.6)
+- Finetuned to be usable for simple tasks and have acceptable conversational quality
+
 #### Option 1: Prebuilt TensorRT Engine
 
-| Model          | OS      | GPU Architecture | Download |
-| -------------- | ------- | ---------------- | -------- |
-| Llamacorn 1.1b | Windows | 3090s (Ampere)   | Download |
-| Llamacorn 1.1b | Windows | 4090s (Ada)      | [Download](https://delta.jan.ai/dist/models/ada/windows/llamacorn-1.1b-16bit.zip) |
-| OpenHermes 7b  | Windows | 3090s (Ampere)   | Download |
-| OpenHermes 7b  | Windows | 4090s (Ada)      | Download |
+| Model          | OS      | Size    | Architecture | GPU Supported | Download                                                                          |
+| -------------- | ------- | ------- | ------------ | ------------- | --------------------------------------------------------------------------------- |
+| Llamacorn 1.1b | Windows |         | Ampere       | >3050         | Download                                                                          |
+| Llamacorn 1.1b | Windows | ~2.05gb | Ada          | >4050         | [Download](https://delta.jan.ai/dist/models/ada/windows/llamacorn-1.1b-16bit.zip) |
+| OpenHermes 7b  | Windows |         | Ampere       | 3090          | Download                                                                          |
+| OpenHermes 7b  | Windows |         | Ada          | 4090          | Download                                                                          |
 
 #### Option 2: Build a TensorRT Engine from model
 
