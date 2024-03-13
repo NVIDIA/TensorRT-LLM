@@ -14,12 +14,15 @@
  * limitations under the License.
  */
 
+#define _USE_MATH_DEFINES
+
 #include "fmhaRunner.h"
 #include "fused_multihead_attention_v2.h"
 
 #include <cassert>
 #include <cstring>
 #include <iostream>
+#include <math.h>
 #include <tuple>
 #include <vector>
 
