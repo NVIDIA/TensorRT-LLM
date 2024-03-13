@@ -7,7 +7,7 @@ import torch
 
 import tensorrt_llm.bindings as tllm
 
-from .hlapi.tokenizer import TokenizerBase
+from .hlapi.tokenizer import TokenizerBase, TransformersTokenizer
 from .hlapi.utils import GenerationOutput
 from .logger import logger
 from .runtime import SamplingConfig
@@ -27,8 +27,7 @@ class AsyncLLMEngine:
 
         self.tokenizer = tokenizer
         if not isinstance(tokenizer, TokenizerBase):
-            from transformers import AutoTokenizer
-            self.tokenizer = AutoTokenizer.from_pretrained(
+            self.tokenizer = TransformersTokenizer.from_pretrained(
                 tokenizer,
                 legacy=False,
                 padding_side='left',

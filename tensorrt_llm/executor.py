@@ -6,12 +6,11 @@ from typing import Any, Dict, Generator, List, Optional, Set, Tuple, Union
 
 import torch
 from janus import Queue as AsyncQueue
-from transformers import AutoTokenizer
 
 import tensorrt_llm.bindings as tllm
 from tensorrt_llm._utils import mpi_broadcast, mpi_rank, mpi_world_size
 from tensorrt_llm.hlapi.mpi_session import MpiSession, NodeSession, SocketClient
-from tensorrt_llm.hlapi.tokenizer import TokenizerBase
+from tensorrt_llm.hlapi.tokenizer import TokenizerBase, TransformersTokenizer
 from tensorrt_llm.hlapi.utils import GenerationOutput, print_traceback_on_error
 from tensorrt_llm.logger import logger
 
@@ -185,7 +184,7 @@ class GenerationExecutor:
 
         self.tokenizer = tokenizer
         if tokenizer is not None and not isinstance(tokenizer, TokenizerBase):
-            self.tokenizer = AutoTokenizer.from_pretrained(
+            self.tokenizer = TransformersTokenizer.from_pretrained(
                 tokenizer,
                 legacy=False,
                 padding_side='left',
@@ -408,7 +407,7 @@ class ParallelGenerationExecutor(GenerationExecutor):
 
         self.tokenizer = tokenizer
         if tokenizer is not None and not isinstance(tokenizer, TokenizerBase):
-            self.tokenizer = AutoTokenizer.from_pretrained(
+            self.tokenizer = TransformersTokenizer.from_pretrained(
                 tokenizer,
                 legacy=False,
                 padding_side='left',
