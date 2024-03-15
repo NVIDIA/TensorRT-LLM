@@ -35,7 +35,7 @@ namespace kernels
 
 template <typename T_in, typename T_out = T_in>
 void apply_per_channel_scale_kernel_launcher(
-    T_out* smoothed_act, const T_in* act, const T_in* per_channel_scale, int rows, int cols, cudaStream_t stream = 0);
+    T_out* smoothed_act, T_in const* act, T_in const* per_channel_scale, int rows, int cols, cudaStream_t stream = 0);
 
 } // namespace kernels
 } // namespace tensorrt_llm

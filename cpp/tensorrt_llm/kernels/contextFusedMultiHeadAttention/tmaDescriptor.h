@@ -186,7 +186,7 @@ public:
     // set the desctriptor.
     int set_tma_desctriptor(
         // ptr to gmem
-        const void* gmem_ptr,
+        void const* gmem_ptr,
         // format is really data_type in TMA terminology.
         cudaTmaDescFormat format,
         // interleave mode.
@@ -221,7 +221,7 @@ public:
     // set the desctriptor.
     int set_tma_desctriptor(
         // ptr to gmem
-        const void* gmem_ptr,
+        void const* gmem_ptr,
         // format is really data_type in TMA terminology.
         cudaTmaDescFormat format,
         // interleave mode.

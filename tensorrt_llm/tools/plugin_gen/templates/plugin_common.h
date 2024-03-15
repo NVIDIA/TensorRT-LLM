@@ -107,7 +107,7 @@ inline LogStream<kSeverity>& operator<<(LogStream<kSeverity>& stream, std::ostre
 class TRTException : public std::exception
 {
 public:
-    TRTException(const char* fl, const char* fn, int ln, int st, const char* msg, const char* nm)
+    TRTException(char const* fl, char const* fn, int ln, int st, char const* msg, char const* nm)
         : file(fl)
         , function(fn)
         , line(ln)
@@ -127,24 +127,24 @@ public:
         logStream << std::endl;
     }
 
-    void setMessage(const char* msg)
+    void setMessage(char const* msg)
     {
         message = msg;
     }
 
 protected:
-    const char* file{};
-    const char* function{};
+    char const* file{};
+    char const* function{};
     int line{};
     int status{};
-    const char* message{};
-    const char* name{};
+    char const* message{};
+    char const* name{};
 };
 
 class TritonError : public TRTException
 {
 public:
-    TritonError(const char* fl, const char* fn, int ln, int stat, const char* msg = nullptr)
+    TritonError(char const* fl, char const* fn, int ln, int stat, char const* msg = nullptr)
         : TRTException(fl, fn, ln, stat, msg, "cuBLAS")
     {
     }
@@ -162,7 +162,7 @@ public:
 class CudaError : public TRTException
 {
 public:
-    CudaError(const char* fl, const char* fn, int ln, int stat, const char* msg = nullptr)
+    CudaError(char const* fl, char const* fn, int ln, int stat, char const* msg = nullptr)
         : TRTException(fl, fn, ln, stat, msg, "Cuda")
     {
     }
@@ -171,7 +171,7 @@ public:
 class CublasError : public TRTException
 {
 public:
-    CublasError(const char* fl, const char* fn, int ln, int stat, const char* msg = nullptr)
+    CublasError(char const* fl, char const* fn, int ln, int stat, char const* msg = nullptr)
         : TRTException(fl, fn, ln, stat, msg, "cuBLAS")
     {
     }
@@ -179,7 +179,7 @@ public:
 
 // Write values into buffer
 template <typename T>
-void write(char*& buffer, const T& val)
+void write(char*& buffer, T const& val)
 {
     std::memcpy(buffer, &val, sizeof(T));
     buffer += sizeof(T);
@@ -187,17 +187,17 @@ void write(char*& buffer, const T& val)
 
 // Read values from buffer
 template <typename T>
-void read(const char*& buffer, T& val)
+void read(char const*& buffer, T& val)
 {
     std::memcpy(&val, buffer, sizeof(T));
     buffer += sizeof(T);
 }
 
-void reportAssertion(const char* msg, const char* file, int line);
-void caughtError(const std::exception& e);
+void reportAssertion(char const* msg, char const* file, int line);
+void caughtError(std::exception const& e);
 void reportValidationFailure(char const* msg, char const* file, int line);
-void throwCublasError(const char* file, const char* function, int line, int status, const char* msg = nullptr);
-void throwCudaError(const char* file, const char* function, int line, int status, const char* msg = nullptr);
+void throwCublasError(char const* file, char const* function, int line, int status, char const* msg = nullptr);
+void throwCudaError(char const* file, char const* function, int line, int status, char const* msg = nullptr);
 
 } // namespace plugin
 

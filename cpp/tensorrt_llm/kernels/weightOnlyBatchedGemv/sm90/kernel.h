@@ -56,8 +56,8 @@ struct ConverterI4ToF16
         static constexpr uint32_t hfma_bias_rep = 0xD480E408;
         static constexpr uint32_t hfma_scale_rep = 0x2C003C00;
 
-        const half2& hfma_bias = reinterpret_cast<const half2&>(hfma_bias_rep);
-        const half2& hfma_scale = reinterpret_cast<const half2&>(hfma_scale_rep);
+        half2 const& hfma_bias = reinterpret_cast<half2 const&>(hfma_bias_rep);
+        half2 const& hfma_scale = reinterpret_cast<half2 const&>(hfma_scale_rep);
 #pragma unroll
         for (int ii = 0; ii < 4; ++ii)
         {
@@ -322,8 +322,8 @@ __global__ void kernel(typename Details::ActDataType* act, half* act_scale, uint
     static constexpr int CtaK = StepK * Threads;
     static_assert(CtaN % 2 == 0);
 
-    const int m_tile_id = blockIdx.x, n_tile_id = blockIdx.y, tid = threadIdx.x;
-    const int m_offset = m_tile_id * CtaM, n_offset = n_tile_id * CtaN;
+    int const m_tile_id = blockIdx.x, n_tile_id = blockIdx.y, tid = threadIdx.x;
+    int const m_offset = m_tile_id * CtaM, n_offset = n_tile_id * CtaN;
 
     act += m_offset * k;
     weight += n_offset * k / 2;

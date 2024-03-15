@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
-import os
-import sys
 import unittest
 from itertools import product
 
@@ -25,6 +23,9 @@ import pytest
 import torch
 import tensorrt as trt
 # isort: on
+import os
+import sys
+
 from parameterized import parameterized
 from transformers import GPT2Config, GPTBigCodeConfig, GPTJConfig, LlamaConfig
 from transformers.cache_utils import DynamicCache
@@ -45,7 +46,8 @@ from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime import GenerationSequence, KVCacheManager
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import getSMVersion
+from utils.util import (skip_bf16_fp32_accum, skip_bf16_pre_ampere,
+                        skip_fp32_accum_pre_ampere, unittest_name_func)
 
 
 class TestFunctional(unittest.TestCase):
@@ -143,17 +145,10 @@ class TestFunctional(unittest.TestCase):
         test_cases += list(
             product(['llama_attention'], [ContextFMHAType.disabled],
                     ['float16'], [2], [128], [8], [4], [64], [0], [False],
-                    [False], [1], [False], [10000.0], [None], [4],
-                    [False, True]))
+                    [False], [1], [False], [10000.0], [None], [4]))
         return test_cases
 
-    def custom_name_func(testcase_func, param_num, param):
-        return "%s_%s" % (
-            testcase_func.__name__,
-            parameterized.to_safe_name("_".join(str(x) for x in param.args)),
-        )
-
-    @parameterized.expand(load_test_cases, name_func=custom_name_func)
+    @parameterized.expand(load_test_cases, name_func=unittest_name_func)
     def test_gpt_attention_IFB(self,
                                attention_type,
                                context_fmha_type,
@@ -170,16 +165,14 @@ class TestFunctional(unittest.TestCase):
                                fuse_bias,
                                rope_base=10000.0,
                                rope_scaling=None,
-                               sink_token_len=0,
-                               enable_pos_shift=False):
+                               sink_token_len=0):
+
+        skip_bf16_pre_ampere(dtype)
+        skip_fp32_accum_pre_ampere(context_fmha_type)
+        skip_bf16_fp32_accum(dtype, context_fmha_type)
+
         if num_kv_heads == 0:
             num_kv_heads = num_heads
-
-        # Skip duplicated tests.
-        if context_fmha_type == ContextFMHAType.enabled_with_fp32_acc and \
-            dtype == 'bfloat16':
-            pytest.skip("bfloat16 Context FMHA will always accumulate on FP32, \
-                so it has been tested with ContextFMHAType.enabled")
 
         session = None
         kv_cache_dtype = 'int8' if use_int8_kv_cache else dtype
@@ -189,13 +182,6 @@ class TestFunctional(unittest.TestCase):
 
         if beam_width != 1:
             pytest.skip("Beam search is not supported in this test yet")
-
-        # Skip tests that are not supported in pre-ampere architecture
-        if getSMVersion() < 80:
-            if context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
-                pytest.skip(
-                    "ContextFMHAType with fp32 acc is not supported in pre-ampere architecture"
-                )
 
         tokens_per_block = 128
 
@@ -359,8 +345,7 @@ class TestFunctional(unittest.TestCase):
                     kv_cache_block_pointers=pointer_array_tensor,
                     host_kv_cache_block_pointers=host_pointer_array_tensor,
                     host_context_lengths=host_context_lengths_tensor,
-                    qkv_bias=qkv_bias,
-                    enable_pos_shift=enable_pos_shift)
+                    qkv_bias=qkv_bias)
 
                 net._mark_output(outputs[0],
                                  'output',

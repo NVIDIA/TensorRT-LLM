@@ -32,8 +32,8 @@ using namespace nvinfer1;
 using openai_triton::plugin::TritonFlashAttentionPluginCreator;
 using openai_triton::plugin::TritonFlashAttentionPlugin;
 
-static const char* TRITON_FLASH_ATTENTION_PLUGIN_VERSION{"1"};
-static const char* TRITON_FLASH_ATTENTION_PLUGIN_NAME{"TritonFlashAttention"};
+static char const* TRITON_FLASH_ATTENTION_PLUGIN_VERSION{"1"};
+static char const* TRITON_FLASH_ATTENTION_PLUGIN_NAME{"TritonFlashAttention"};
 PluginFieldCollection TritonFlashAttentionPluginCreator::mFC{};
 std::vector<PluginField> TritonFlashAttentionPluginCreator::mPluginAttributes;
 
@@ -42,7 +42,7 @@ namespace openai_triton::plugin
 
 // Write values into buffer
 template <typename T>
-void writeArg(char*& buffer, const T& val)
+void writeArg(char*& buffer, T const& val)
 {
     std::memcpy(buffer, &val, sizeof(T));
     buffer += sizeof(T);
@@ -50,7 +50,7 @@ void writeArg(char*& buffer, const T& val)
 
 // Read values from buffer
 template <typename T>
-void readArg(const char*& buffer, T& val)
+void readArg(char const*& buffer, T& val)
 {
     std::memcpy(&val, buffer, sizeof(T));
     buffer += sizeof(T);
@@ -79,9 +79,9 @@ TritonFlashAttentionPlugin::TritonFlashAttentionPlugin(
 }
 
 // Parameterized constructor
-TritonFlashAttentionPlugin::TritonFlashAttentionPlugin(const void* data, size_t length)
+TritonFlashAttentionPlugin::TritonFlashAttentionPlugin(void const* data, size_t length)
 {
-    const char *d = reinterpret_cast<const char*>(data), *a = d;
+    char const *d = reinterpret_cast<char const*>(data), *a = d;
     readArg(d, mNumHeads);
     readArg(d, mHeadSize);
     readArg(d, mSoftmaxScale);
@@ -98,7 +98,7 @@ nvinfer1::IPluginV2DynamicExt* TritonFlashAttentionPlugin::clone() const noexcep
 }
 
 nvinfer1::DimsExprs TritonFlashAttentionPlugin::getOutputDimensions(
-    int outputIndex, const nvinfer1::DimsExprs* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
+    int outputIndex, nvinfer1::DimsExprs const* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
 {
     // Output shape.
     //   output tensor [batchSize, seqLen, mNumHeads, head_size]
@@ -107,7 +107,7 @@ nvinfer1::DimsExprs TritonFlashAttentionPlugin::getOutputDimensions(
 }
 
 bool TritonFlashAttentionPlugin::supportsFormatCombination(
-    int pos, const nvinfer1::PluginTensorDesc* inOut, int nbInputs, int nbOutputs) noexcept
+    int pos, nvinfer1::PluginTensorDesc const* inOut, int nbInputs, int nbOutputs) noexcept
 {
     // In this example, inputs: Q, K, V, outputs: Out
     assert(nbInputs + nbOutputs == 4);
@@ -125,19 +125,19 @@ bool TritonFlashAttentionPlugin::supportsFormatCombination(
     return is_valid;
 }
 
-void TritonFlashAttentionPlugin::configurePlugin(const nvinfer1::DynamicPluginTensorDesc* in, int nbInputs,
-    const nvinfer1::DynamicPluginTensorDesc* out, int nbOutputs) noexcept
+void TritonFlashAttentionPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int nbInputs,
+    nvinfer1::DynamicPluginTensorDesc const* out, int nbOutputs) noexcept
 {
 }
 
-size_t TritonFlashAttentionPlugin::getWorkspaceSize(const nvinfer1::PluginTensorDesc* inputs, int nbInputs,
-    const nvinfer1::PluginTensorDesc* outputs, int nbOutputs) const noexcept
+size_t TritonFlashAttentionPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* inputs, int nbInputs,
+    nvinfer1::PluginTensorDesc const* outputs, int nbOutputs) const noexcept
 {
     // Set workspace size if needed. In this example, we need for L and m buffers.
-    const auto Q = inputs[0];
-    const int batchSize = Q.dims.d[0];
-    const int seqLen = Q.dims.d[2];
-    const int numBuffers = 2;
+    auto const Q = inputs[0];
+    int const batchSize = Q.dims.d[0];
+    int const seqLen = Q.dims.d[2];
+    int const numBuffers = 2;
     size_t workspaces[numBuffers];
     workspaces[0] = sizeof(float) * batchSize * mNumHeads * seqLen;
     workspaces[1] = sizeof(float) * batchSize * mNumHeads * seqLen;
@@ -155,8 +155,8 @@ size_t TritonFlashAttentionPlugin::getWorkspaceSize(const nvinfer1::PluginTensor
 }
 
 template <typename T>
-int TritonFlashAttentionPlugin::enqueueImpl(const nvinfer1::PluginTensorDesc* inputDesc,
-    const nvinfer1::PluginTensorDesc* outputDesc, const void* const* inputs, void* const* outputs, void* workspace,
+int TritonFlashAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc,
+    nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
     cudaStream_t stream)
 {
     assert(inputDesc[0].dims.d[1] == mNumHeads && inputDesc[0].dims.d[3] == mHeadSize);
@@ -172,9 +172,9 @@ int TritonFlashAttentionPlugin::enqueueImpl(const nvinfer1::PluginTensorDesc* in
     float* L = reinterpret_cast<float*>(workspace);
     float* M = reinterpret_cast<float*>(nextWorkspacePtr(reinterpret_cast<int8_t*>(L), bufSize));
 
-    const T* Q = reinterpret_cast<const T*>(inputs[0]);
-    const T* K = reinterpret_cast<const T*>(inputs[1]);
-    const T* V = reinterpret_cast<const T*>(inputs[2]);
+    T const* Q = reinterpret_cast<T const*>(inputs[0]);
+    T const* K = reinterpret_cast<T const*>(inputs[1]);
+    T const* V = reinterpret_cast<T const*>(inputs[2]);
 
     // Launch a cuda kernel generated by Triton AoT.
     int res = 0;
@@ -193,8 +193,8 @@ int TritonFlashAttentionPlugin::enqueueImpl(const nvinfer1::PluginTensorDesc* in
     return res;
 }
 
-int TritonFlashAttentionPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc,
-    const nvinfer1::PluginTensorDesc* outputDesc, const void* const* inputs, void* const* outputs, void* workspace,
+int TritonFlashAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
+    nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
     cudaStream_t stream) noexcept
 {
     if (mType == DataType::kHALF)
@@ -210,7 +210,7 @@ int TritonFlashAttentionPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputD
 
 // IPluginV2Ext Methods
 nvinfer1::DataType TritonFlashAttentionPlugin::getOutputDataType(
-    int index, const nvinfer1::DataType* inputTypes, int nbInputs) const noexcept
+    int index, nvinfer1::DataType const* inputTypes, int nbInputs) const noexcept
 {
     assert(index == 0);
     return inputTypes[0];
@@ -218,12 +218,12 @@ nvinfer1::DataType TritonFlashAttentionPlugin::getOutputDataType(
 
 // IPluginV2 Methods
 
-const char* TritonFlashAttentionPlugin::getPluginType() const noexcept
+char const* TritonFlashAttentionPlugin::getPluginType() const noexcept
 {
     return TRITON_FLASH_ATTENTION_PLUGIN_NAME;
 }
 
-const char* TritonFlashAttentionPlugin::getPluginVersion() const noexcept
+char const* TritonFlashAttentionPlugin::getPluginVersion() const noexcept
 {
     return TRITON_FLASH_ATTENTION_PLUGIN_VERSION;
 }
@@ -269,12 +269,12 @@ void TritonFlashAttentionPlugin::destroy() noexcept
     delete this;
 }
 
-void TritonFlashAttentionPlugin::setPluginNamespace(const char* libNamespace) noexcept
+void TritonFlashAttentionPlugin::setPluginNamespace(char const* libNamespace) noexcept
 {
     mNamespace = libNamespace;
 }
 
-const char* TritonFlashAttentionPlugin::getPluginNamespace() const noexcept
+char const* TritonFlashAttentionPlugin::getPluginNamespace() const noexcept
 {
     return mNamespace.c_str();
 }
@@ -293,24 +293,24 @@ TritonFlashAttentionPluginCreator::TritonFlashAttentionPluginCreator()
     mFC.fields = mPluginAttributes.data();
 }
 
-const char* TritonFlashAttentionPluginCreator::getPluginName() const noexcept
+char const* TritonFlashAttentionPluginCreator::getPluginName() const noexcept
 {
     return TRITON_FLASH_ATTENTION_PLUGIN_NAME;
 }
 
-const char* TritonFlashAttentionPluginCreator::getPluginVersion() const noexcept
+char const* TritonFlashAttentionPluginCreator::getPluginVersion() const noexcept
 {
     return TRITON_FLASH_ATTENTION_PLUGIN_VERSION;
 }
 
-const PluginFieldCollection* TritonFlashAttentionPluginCreator::getFieldNames() noexcept
+PluginFieldCollection const* TritonFlashAttentionPluginCreator::getFieldNames() noexcept
 {
     return &mFC;
 }
 
-IPluginV2* TritonFlashAttentionPluginCreator::createPlugin(const char* name, const PluginFieldCollection* fc) noexcept
+IPluginV2* TritonFlashAttentionPluginCreator::createPlugin(char const* name, PluginFieldCollection const* fc) noexcept
 {
-    const PluginField* fields = fc->fields;
+    PluginField const* fields = fc->fields;
     int numHeads = 0;
     int headSize = 0;
     float softmaxScale = 1.0f;
@@ -318,26 +318,26 @@ IPluginV2* TritonFlashAttentionPluginCreator::createPlugin(const char* name, con
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {
-        const char* attrName = fields[i].name;
+        char const* attrName = fields[i].name;
         if (!strcmp(attrName, "num_heads"))
         {
             assert(fields[i].type == PluginFieldType::kINT32);
-            numHeads = static_cast<int>(*(static_cast<const int*>(fields[i].data)));
+            numHeads = static_cast<int>(*(static_cast<int const*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "head_size"))
         {
             assert(fields[i].type == PluginFieldType::kINT32);
-            headSize = static_cast<int>(*(static_cast<const int*>(fields[i].data)));
+            headSize = static_cast<int>(*(static_cast<int const*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "softmax_scale"))
         {
             assert(fields[i].type == PluginFieldType::kFLOAT32);
-            softmaxScale = static_cast<float>(*(static_cast<const float*>(fields[i].data)));
+            softmaxScale = static_cast<float>(*(static_cast<float const*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "type_id"))
         {
             assert(fields[i].type == PluginFieldType::kINT32);
-            type = static_cast<nvinfer1::DataType>(*(static_cast<const nvinfer1::DataType*>(fields[i].data)));
+            type = static_cast<nvinfer1::DataType>(*(static_cast<nvinfer1::DataType const*>(fields[i].data)));
         }
     }
     try
@@ -346,7 +346,7 @@ IPluginV2* TritonFlashAttentionPluginCreator::createPlugin(const char* name, con
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }
-    catch (const std::exception& e)
+    catch (std::exception const& e)
     {
         std::cerr << "Caught exception: " << e.what() << std::endl;
     }
@@ -354,7 +354,7 @@ IPluginV2* TritonFlashAttentionPluginCreator::createPlugin(const char* name, con
 }
 
 IPluginV2* TritonFlashAttentionPluginCreator::deserializePlugin(
-    const char* name, const void* serialData, size_t serialLength) noexcept
+    char const* name, void const* serialData, size_t serialLength) noexcept
 {
     // This object will be deleted when the network is destroyed, which will
     // call TritonFlashAttentionPlugin::destroy()
@@ -364,19 +364,19 @@ IPluginV2* TritonFlashAttentionPluginCreator::deserializePlugin(
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }
-    catch (const std::exception& e)
+    catch (std::exception const& e)
     {
         std::cerr << "Caught exception: " << e.what() << std::endl;
     }
     return nullptr;
 }
 
-void TritonFlashAttentionPluginCreator::setPluginNamespace(const char* libNamespace) noexcept
+void TritonFlashAttentionPluginCreator::setPluginNamespace(char const* libNamespace) noexcept
 {
     mNamespace = libNamespace;
 }
 
-const char* TritonFlashAttentionPluginCreator::getPluginNamespace() const noexcept
+char const* TritonFlashAttentionPluginCreator::getPluginNamespace() const noexcept
 {
     return mNamespace.c_str();
 }

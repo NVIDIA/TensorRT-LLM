@@ -14,15 +14,14 @@ GROUP_NAME         ?= $(shell id --group --name)
 # Set this to 1 to add the current user to the docker image and run the container with the user
 LOCAL_USER         ?= 0
 ifeq ($(LOCAL_USER),1)
-  IMAGE_TAG_SUFFIX   ?= -$(USER_NAME)
-else
-  IMAGE_TAG_SUFFIX   ?=
+IMAGE_TAG_SUFFIX   ?= -$(USER_NAME)
 endif
 
 # Default stage of the docker multi-stage build
 STAGE              ?=
 # Set this to define a custom image name and tag
 IMAGE_WITH_TAG     ?= $(IMAGE_NAME)$(if $(STAGE),/$(STAGE)):$(IMAGE_TAG)
+PUSH_TO_STAGING    ?= 1
 DOCKER_BUILD_OPTS  ?= --pull
 DOCKER_BUILD_ARGS  ?=
 DOCKER_PROGRESS    ?= auto
@@ -52,6 +51,11 @@ define add_local_user
 		..
 endef
 
+# Rewrite `/tensorrt-llm:` in image tag with `/tensorrt-llm-staging:` to avoid directly overwriting
+define rewrite_tag
+$(shell echo $(IMAGE_WITH_TAG) | sed "s/\/tensorrt-llm:/\/tensorrt-llm-staging:/g")
+endef
+
 %_build:
 	@echo "Building docker image: $(IMAGE_WITH_TAG)"
 	DOCKER_BUILDKIT=1 docker build $(DOCKER_BUILD_OPTS) $(DOCKER_BUILD_ARGS) \
@@ -70,15 +74,23 @@ endef
 		$(if $(GIT_COMMIT), --build-arg GIT_COMMIT="$(GIT_COMMIT)") \
 		$(if $(STAGE), --target $(STAGE)) \
 		--file Dockerfile.multi \
-		--tag $(IMAGE_WITH_TAG)$(IMAGE_TAG_SUFFIX) \
+		--tag $(IMAGE_WITH_TAG) \
 		..
 
 %_user:
 	$(call add_local_user,$(IMAGE_WITH_TAG))
 
 %_push: %_build
-	@echo "Pushing docker image: $(IMAGE_WITH_TAG)"
-	docker push $(IMAGE_WITH_TAG)$(IMAGE_TAG_SUFFIX)
+	@if [ $(PUSH_TO_STAGING) = 0 ]; then \
+		echo "Pushing docker image: $(IMAGE_WITH_TAG)"; \
+		docker push $(IMAGE_WITH_TAG)$(IMAGE_TAG_SUFFIX); \
+	fi
+	@if [ $(PUSH_TO_STAGING) = 1 ]; then \
+		echo "Rewriting docker tag: $(IMAGE_WITH_TAG) to $(call rewrite_tag)"; \
+		docker tag $(IMAGE_WITH_TAG)$(IMAGE_TAG_SUFFIX) $(call rewrite_tag)$(IMAGE_TAG_SUFFIX); \
+		echo "Pushing docker image: $(call rewrite_tag)"; \
+		docker push $(call rewrite_tag)$(IMAGE_TAG_SUFFIX); \
+	fi
 
 %_pull:
 	@echo "Pulling docker image: $(IMAGE_WITH_TAG)"
@@ -122,15 +134,15 @@ release_%: STAGE = release
 release_run: WORK_DIR = /app/tensorrt_llm
 
 # For x86_64
-jenkins_%: IMAGE_TAG = jenkins_latest
+jenkins_%: IMAGE_WITH_TAG = $(shell grep 'LLM_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
 jenkins_%: STAGE = devel
 
 # For aarch64
-jenkins-aarch64_%: IMAGE_TAG = jenkins-aarch64_latest
+jenkins-aarch64_%: IMAGE_WITH_TAG = $(shell grep 'LLM_SBSA_DOCKER_IMAGE = ' ../jenkins/GH200Builder.groovy | grep -o '".*"' | tr -d '"')
 jenkins-aarch64_%: STAGE = devel
 
 # For x86_64
-centos7_%: IMAGE_TAG = centos7_latest
+centos7_%: IMAGE_WITH_TAG = $(shell grep 'LLM_CENTOS7_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
 centos7_%: STAGE = devel
 centos7_%: BASE_IMAGE = nvidia/cuda
 centos7_%: BASE_TAG = 12.3.1-devel-centos7
@@ -141,7 +153,7 @@ ubuntu22_%: BASE_IMAGE = nvidia/cuda
 ubuntu22_%: BASE_TAG = 12.3.1-devel-ubuntu22.04
 
 # For x86_64
-old-cuda_%: IMAGE_TAG = old-cuda_latest
+old-cuda_%: IMAGE_WITH_TAG = $(shell grep 'LLM_OLD_CUDA_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
 old-cuda_%: BASE_TAG = 23.07-py3
 old-cuda_%: STAGE = devel
 old-cuda_%: CUDA_VERSION = 12.1
@@ -150,6 +162,7 @@ old-cuda_%: NCCL_VERSION = 2.18.3-1+cuda12.1
 old-cuda_%: CUBLAS_VERSION = 12.1.3.1-1
 
 trtllm_%: STAGE = release
+trtllm_%: PUSH_TO_STAGING := 0
 trtllm_%: DEVEL_IMAGE = $(shell grep 'LLM_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
 trtllm_%: IMAGE_NAME = $(shell grep 'IMAGE_NAME = ' ../jenkins/BuildDockerImage.groovy | grep -o '".*"' | tr -d '"')
 trtllm_%: IMAGE_TAG = $(shell git rev-parse --abbrev-ref HEAD | tr '/' '_')

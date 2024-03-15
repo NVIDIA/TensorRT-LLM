@@ -57,6 +57,10 @@ def get_device_count() -> int:
     return torch.cuda.device_count() if torch.cuda.is_available() else 0
 
 
+def get_total_gpu_memory(device: int) -> float:
+    return torch.cuda.get_device_properties(device).total_memory
+
+
 def release_gc():
     ''' Release memory allocated by PyTorch and Python garbage collector explicitly and immediately.
     This could be used when some states might be kept in memory even after the variables are deleted.

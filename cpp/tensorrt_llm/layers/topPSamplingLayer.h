@@ -45,7 +45,7 @@ public:
     void setup(std::size_t batchSize, int32_t const* batchSlots, SetupParams const& setupParams) override;
     void forward(DecodingOutputParams& outputs, ForwardParams& inputs) override;
 
-    const bool* getSkipDecodeHost() const
+    bool const* getSkipDecodeHost() const
     {
         return mSkipDecodeHost;
     }
@@ -65,7 +65,6 @@ protected:
     int32_t* mBeginTopPOffsetDevice = nullptr;
     bool* mSkipDecodeDevice = nullptr;
     bool* mSkipDecodeHost = nullptr;
-    size_t mCubTempStorageSize;
     bool mIsDeterministic = true;
     int mAirTopPBlockNum;
 

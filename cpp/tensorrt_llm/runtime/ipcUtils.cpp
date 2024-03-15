@@ -20,9 +20,9 @@
 namespace tensorrt_llm::runtime
 {
 
-void setPeerAccess(WorldConfig worldConfig, bool enable)
+void setPeerAccess(WorldConfig const& worldConfig, bool enable)
 {
-    const auto srcNode = worldConfig.getTensorParallelRank();
+    auto const srcNode = worldConfig.getTensorParallelRank();
 
     for (SizeType destNode = 0; destNode < worldConfig.getTensorParallelism(); destNode++)
     {
@@ -42,7 +42,7 @@ void setPeerAccess(WorldConfig worldConfig, bool enable)
         {
             cudaDeviceDisablePeerAccess(destNode);
         }
-        const auto error = cudaGetLastError();
+        auto const error = cudaGetLastError();
         if (error != cudaErrorPeerAccessAlreadyEnabled && error != cudaErrorPeerAccessNotEnabled)
         {
             TLLM_CUDA_CHECK(error);
@@ -50,7 +50,7 @@ void setPeerAccess(WorldConfig worldConfig, bool enable)
     }
 }
 
-IpcMemory::IpcMemory(WorldConfig worldConfig, std::size_t bufferSize)
+IpcMemory::IpcMemory(WorldConfig const& worldConfig, std::size_t bufferSize)
     : mWorldConfig(worldConfig)
     , mCommPtrs(worldConfig.getTensorParallelism())
     , mBufferSize(bufferSize)
@@ -66,8 +66,8 @@ void IpcMemory::allocateIpcMemory()
     cudaIpcMemHandle_t localHandle;
     TLLM_CUDA_CHECK(cudaIpcGetMemHandle(&localHandle, mBufferPtr));
 
-    const auto tpRank = mWorldConfig.getTensorParallelRank();
-    const auto ppRank = mWorldConfig.getPipelineParallelRank();
+    auto const tpRank = mWorldConfig.getTensorParallelRank();
+    auto const ppRank = mWorldConfig.getPipelineParallelRank();
     auto const comm = COMM_SESSION.split(ppRank, tpRank);
     std::vector<char> serialHandles(CUDA_IPC_HANDLE_SIZE * mWorldConfig.getTensorParallelism(), 0);
     comm.allgather(&localHandle.reserved, serialHandles.data(), CUDA_IPC_HANDLE_SIZE, mpi::MpiType::kBYTE);

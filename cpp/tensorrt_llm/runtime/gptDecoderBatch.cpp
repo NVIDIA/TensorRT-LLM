@@ -66,6 +66,7 @@ SamplingConfig extractSamplingConfig(SamplingConfig const& batchSamplingConfig, 
     samplingConfig.beamSearchDiversityRate = batchSamplingConfig.beamSearchDiversityRate;
     samplingConfig.lengthPenalty = batchSamplingConfig.lengthPenalty;
     samplingConfig.earlyStopping = batchSamplingConfig.earlyStopping;
+    samplingConfig.normalizeLogProbs = batchSamplingConfig.normalizeLogProbs;
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return samplingConfig;
@@ -127,7 +128,10 @@ GptDecoderBatch::GptDecoderBatch(
     dInput->badWordsLens = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<SizeType>::value);
     dInput->embeddingBias = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
 
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+    mNextDraftTokens = mBufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32);
+    mNextDraftTokenLengths = mBufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32);
+
+    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
 void GptDecoderBatch::setup(DecodingMode const& mode, SizeType maxBatchSize, SizeType maxBeamWidth,
@@ -228,6 +232,9 @@ void GptDecoderBatch::setup(DecodingMode const& mode, SizeType maxBatchSize, Siz
     const_cast<ITensor&>(*dInput.stopWordsLens).reshape(ITensor::makeShape({maxBatchSize}));
 
     auto const numOfDecoders = fusedDecoder ? 1 : maxBatchSize;
+    mNextDraftTokens->reshape(ITensor::makeShape({maxBatchSize, mMaxTokensPerStep - 1}));
+    mNextDraftTokenLengths->reshape(ITensor::makeShape({maxBatchSize}));
+
     mStreams.resize(maxBatchSize);
     mDecoders.resize(numOfDecoders);
     mDecodingInputs.resize(maxBatchSize);
@@ -278,7 +285,7 @@ void GptDecoderBatch::newRequest(
         tc::fmtstr("Input length (%d) + max new tokens (%d) must be less than max sequence length (%d).", inputLength,
             maxNewTokens, mMaxSequenceLength));
     TLLM_CHECK(requestIds->getDataType() == TRTDataType<TokenIdType>::value);
-    auto const endId = request.endId.value_or(mVocabSize - 1);
+    auto const endId = request.endId.value_or(-1);
 
     auto constexpr localBatchSize = 1;
 
@@ -416,41 +423,53 @@ void GptDecoderBatch::newRequest(
         dOutput->beamHypotheses.init(manager, endId);
     }
 
-    auto generatedTokensPerStep = request.generatedTokensPerStep();
+    auto generatedTokensPerStep = request.generatedTokensPerStep;
     if (generatedTokensPerStep > 1)
     {
         TLLM_CHECK(beamWidth == 1);
-        auto numDraftTokens = generatedTokensPerStep - 1;
-        TensorPtr draftTokensReqBatchSlice = std::move(ITensor::slice(mDraftTokenIds, batchIdx, 1));
-        draftTokensReqBatchSlice->squeeze(0);
-        TensorPtr draftTokensReqTokensSlice = ITensor::slice(draftTokensReqBatchSlice, 0, numDraftTokens);
-        TensorPtr draftTokensView = ITensor::view(request.draftTokens, ITensor::makeShape({numDraftTokens}));
-        manager.copy(*draftTokensView, *draftTokensReqTokensSlice);
         mAcceptByLogits[batchIdx] = false;
-        if (request.draftLogits.has_value())
+        auto const numDraftTokens = generatedTokensPerStep - 1;
+        // If draft tokens are given with context at decoder setup it is target model in speculative decoding
+        if (request.draftTokens)
         {
-            TensorPtr draftLogitsView = ITensor::view(request.draftLogits.value());
-            mAcceptByLogits[batchIdx] = true;
+            if (request.draftLogits.has_value())
+            {
+                TensorPtr draftLogitsView = ITensor::view(request.draftLogits.value());
+                mAcceptByLogits[batchIdx] = true;
 
-            TensorPtr draftLogitsReqBatchSlice = std::move(ITensor::slice(mDraftLogits, batchIdx, 1));
-            draftLogitsReqBatchSlice->squeeze(0);
-            TensorPtr draftLogitsReqTokensSlice = ITensor::slice(draftLogitsReqBatchSlice, 0, numDraftTokens);
-            manager.copy(*draftLogitsView, *draftLogitsReqTokensSlice);
+                TensorPtr draftLogitsReqBatchSlice = std::move(ITensor::slice(mDraftLogits, batchIdx, 1));
+                draftLogitsReqBatchSlice->squeeze(0);
+                TensorPtr draftLogitsReqTokensSlice = ITensor::slice(draftLogitsReqBatchSlice, 0, numDraftTokens);
+                manager.copy(*draftLogitsView, *draftLogitsReqTokensSlice);
+            }
+            TensorPtr draftTokensReqBatchSlice = std::move(ITensor::slice(mDraftTokenIds, batchIdx, 1));
+            draftTokensReqBatchSlice->squeeze(0);
+            TensorPtr draftTokensReqTokensSlice = ITensor::slice(draftTokensReqBatchSlice, 0, numDraftTokens);
+            TensorPtr draftTokensView = ITensor::view(request.draftTokens, ITensor::makeShape({numDraftTokens}));
+            manager.copy(*draftTokensView, *draftTokensReqTokensSlice);
+
+            auto const curandStatesView = ITensor::slice(mCurandStates, batchIdx, localBatchSize);
+            auto curandState = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*curandStatesView));
+            if (samplingConfig.randomSeed.has_value())
+            {
+                tk::invokeCurandInitialize(
+                    curandState, nullptr, localBatchSize, samplingConfig.randomSeed.value()[0], stream->get());
+            }
+            else
+            {
+                tk::invokeCurandInitialize(curandState, nullptr, localBatchSize, 0, stream->get());
+            }
+            auto numDraftTokensView = ITensor::slice(mNumDraftTokens, batchIdx, localBatchSize);
+            kernels::invokeFill(*numDraftTokensView, numDraftTokens, *stream);
         }
-
-        auto numDraftTokensView = ITensor::slice(mNumDraftTokens, batchIdx, localBatchSize);
-        kernels::invokeFill(*numDraftTokensView, numDraftTokens, *stream);
-
-        auto const curandStatesView = ITensor::slice(mCurandStates, batchIdx, localBatchSize);
-        auto curandState = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*curandStatesView));
-        if (samplingConfig.randomSeed.has_value())
+        else // Medusa
         {
-            tk::invokeCurandInitialize(
-                curandState, nullptr, localBatchSize, samplingConfig.randomSeed.value()[0], stream->get());
-        }
-        else
-        {
-            tk::invokeCurandInitialize(curandState, nullptr, localBatchSize, 0, stream->get());
+            auto nextDraftTokenLengthsView = ITensor::slice(mNextDraftTokenLengths, batchIdx, localBatchSize);
+            kernels::invokeFill(*nextDraftTokenLengthsView, numDraftTokens, *stream);
+            TensorPtr nextDraftTokens = ITensor::slice(mNextDraftTokens, batchIdx, localBatchSize);
+            manager.setZero(*nextDraftTokens);
+            // FIXME(nkorobov): skip decoding draft tokens at medusa for now
+            generatedTokensPerStep = 1;
         }
     }
 
@@ -459,6 +478,7 @@ void GptDecoderBatch::newRequest(
     {
         mDecoders[decoderIdx]->setup(samplingConfig, localBatchSize, mMaxSequenceLength);
     }
+    TLLM_CHECK_WITH_INFO(!mFusedDecoder || beamWidth == 1, "Fused decoder is not supported for beam search yet.");
     mBeamWidths[batchIdx] = beamWidth;
     mNbSteps[batchIdx] = 0;
     mFinished[batchIdx] = false;
@@ -622,8 +642,6 @@ GptDecoderBatch::TokenPtr GptDecoderBatch::forwardAsync(
         }
         else
         {
-            TLLM_CHECK_WITH_INFO(mBeamWidths[0] == 1, "Fused decoder is not supported for beam search yet.");
-
             auto& dInput = *mJointDecodingInput;
             auto& dOutput = *mJointDecodingOutput;
             auto& decoder = *mDecoders[0];
@@ -653,8 +671,8 @@ GptDecoderBatch::TokenPtr GptDecoderBatch::forwardAsync(
             {
                 // These params are only used for testing. Thus, can be per batch instead of per request
                 auto const& samplingConfig = decoder.getSamplingConfig();
-                const bool useRandomAcceptanceThreshold = !samplingConfig.draftAcceptanceThreshold.has_value();
-                const float randomAcceptanceThreshold
+                bool const useRandomAcceptanceThreshold = !samplingConfig.draftAcceptanceThreshold.has_value();
+                float const randomAcceptanceThreshold
                     = useRandomAcceptanceThreshold ? 0 : samplingConfig.draftAcceptanceThreshold.value()[0];
 
                 TensorPtr batchSlotsAcceptLogitsStepSlice = std::move(ITensor::slice(mBatchSlotsAcceptLogits, si, 1));

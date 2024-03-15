@@ -182,7 +182,7 @@ class _BuildingFlag:
 
 
 def _is_building(f):
-    '''Use this to decorate functions which are called during engine building/refiting process,
+    '''Use this to decorate functions which are called during engine building/refitting process,
     otherwise, the plugin registration will fail.
     '''
 

@@ -94,7 +94,7 @@ class ProgArgs:
             default="gpt2",
             type=str,
             help="Specify GPT variants to convert checkpoints correctly",
-            choices=["gpt2", "santacoder", "starcoder"])
+            choices=["gpt2", "santacoder", "starcoder", "starcoder2"])
         parser.add_argument("--storage-type",
                             "-t",
                             type=str,
@@ -134,14 +134,30 @@ def smooth_gpt_model(model, scales, alpha):
 
 
 # SantaCoder separates Q projection from KV projection
-def concat_qkv_weight_bias(q, hf_key, hf_model):
-    kv = hf_model.state_dict()[hf_key.replace("q_attn", "kv_attn")]
-    return torch.cat([q, kv], dim=-1)
+def concat_qkv_weight_bias(q, hf_key, hf_model, model_type):
+    if model_type == "starcoder2":
+        k = hf_model.state_dict()[hf_key.replace("q_proj",
+                                                 "k_proj")].to(q.device)
+        v = hf_model.state_dict()[hf_key.replace("q_proj",
+                                                 "v_proj")].to(q.device)
+        if len(q.shape) == 2:
+            k = k.transpose(0, 1)
+            v = v.transpose(0, 1)
+        return torch.cat([q, k, v], dim=-1)
+    else:
+        kv = hf_model.state_dict()[hf_key.replace("q_attn",
+                                                  "kv_attn")].to(q.device)
+        return torch.cat([q, kv], dim=-1)
 
 
 # StarCoder uses nn.Linear for these following ops whose weight matrix is transposed compared to transformer.Conv1D
-def transpose_weights(hf_name, param):
-    weight_to_transpose = ["c_attn", "c_proj", "c_fc"]
+def transpose_weights(hf_name, param, model_type):
+
+    weight_to_transpose = []
+    if model_type == "starcoder":
+        weight_to_transpose = ["c_attn", "c_proj", "c_fc"]
+    elif model_type == "starcoder2":
+        weight_to_transpose = ["self_attn", "c_proj", "c_fc"]
     if any([k in hf_name for k in weight_to_transpose]):
         if len(param.shape) == 2:
             param = param.transpose(0, 1)
@@ -154,7 +170,11 @@ def gpt_to_ft_name(orig_name):
         "transformer.wte.weight": "model.wte",
         "transformer.ln_f.bias": "model.final_layernorm.bias",
         "transformer.ln_f.weight": "model.final_layernorm.weight",
-        "lm_head.weight": "model.lm_head.weight"
+        "lm_head.weight": "model.lm_head.weight",
+        # StarCoder2
+        "model.embed_tokens.weight": "model.wte",
+        "model.norm.weight": "model.final_layernorm.weight",
+        "model.norm.bias": "model.final_layernorm.bias"
     }
 
     if orig_name in global_weights:
@@ -181,6 +201,25 @@ def gpt_to_ft_name(orig_name):
         "transformer.mlp.c_fc.weight": "mlp.dense_h_to_4h.weight",
         "transformer.mlp.c_proj.bias": "mlp.dense_4h_to_h.bias",
         "transformer.mlp.c_proj.weight": "mlp.dense_4h_to_h.weight",
+        # StarCoder2
+        "transformer.input_layernorm.bias": "input_layernorm.bias",
+        "transformer.input_layernorm.weight": "input_layernorm.weight",
+        "transformer.self_attn.q_proj.bias": "attention.query.bias",
+        "transformer.self_attn.q_proj.weight": "attention.query.weight",
+        "transformer.self_attn.k_proj.weight": "attention.key.weight",
+        "transformer.self_attn.k_proj.bias": "attention.key.bias",
+        "transformer.self_attn.v_proj.weight": "attention.value.weight",
+        "transformer.self_attn.v_proj.bias": "attention.value.bias",
+        "transformer.self_attn.o_proj.bias": "attention.dense.bias",
+        "transformer.self_attn.o_proj.weight": "attention.dense.weight",
+        "transformer.post_attention_layernorm.bias":
+        "post_attention_layernorm.bias",
+        "transformer.post_attention_layernorm.weight":
+        "post_attention_layernorm.weight",
+        "transformer.mlp.c_fc.bias": "mlp.dense_h_to_4h.bias",
+        "transformer.mlp.c_fc.weight": "mlp.dense_h_to_4h.weight",
+        "transformer.mlp.c_proj.bias": "mlp.dense_4h_to_h.bias",
+        "transformer.mlp.c_proj.weight": "mlp.dense_4h_to_h.weight"
     }
     return f"layers.{layer_idx}.{per_layer_weights[weight_name]}"
 
@@ -222,6 +261,9 @@ def hf_gpt_converter(args: ProgArgs):
         config["gpt"][k] = f"{v}"
     config["gpt"]["storage_dtype"] = args.storage_type
     config["gpt"]["multi_query_mode"] = str(multi_query_mode)
+    num_attention_heads = int(config['gpt'].get("num_attention_heads", 0))
+    num_key_value_heads = 1 if multi_query_mode else int(config['gpt'].get(
+        "num_key_value_heads", num_attention_heads))
     with open(saved_dir / "config.ini", 'w') as configfile:
         config.write(configfile)
 
@@ -246,14 +288,13 @@ def hf_gpt_converter(args: ProgArgs):
 
         if args.convert_model_on_cpu:
             param = param.cpu()
-        if args.model == "starcoder":
-            param = transpose_weights(name, param)
+        param = transpose_weights(name, param, args.model)
         if ft_name in global_ft_weights:
             torch_to_numpy(param.to(storage_type).cpu()).tofile(
                 saved_dir / f"{ft_name}.bin")
         else:
-            if 'q_attn' in name:
-                param = concat_qkv_weight_bias(param, name, model)
+            if 'q_attn' in name or 'q_proj' in name:
+                param = concat_qkv_weight_bias(param, name, model, args.model)
                 ft_name = ft_name.replace("query", "query_key_value")
             # Needed by QKV projection weight split. With multi_query_mode one does not simply take
             # out_dim and divide it by 3 to get local_dim because out_dim = local_dim + 2 * head_size
@@ -265,7 +306,9 @@ def hf_gpt_converter(args: ProgArgs):
                     storage_type, act_range.get(name.replace(".weight", "")), {
                         "int8_outputs": int8_outputs,
                         "multi_query_mode": multi_query_mode,
-                        "local_dim": local_dim
+                        "local_dim": local_dim,
+                        "num_attention_heads": num_attention_heads,
+                        "num_key_value_heads": num_key_value_heads
                     })
             else:
                 starmap_args.append(
@@ -273,7 +316,9 @@ def hf_gpt_converter(args: ProgArgs):
                      storage_type, act_range.get(name.replace(".weight", "")), {
                          "int8_outputs": int8_outputs,
                          "multi_query_mode": multi_query_mode,
-                         "local_dim": local_dim
+                         "local_dim": local_dim,
+                         "num_attention_heads": num_attention_heads,
+                         "num_key_value_heads": num_key_value_heads
                      }))
 
     starmap_args = tqdm(starmap_args, desc="saving weights")

@@ -19,7 +19,6 @@ import unittest
 from itertools import product
 
 import numpy as np
-import pytest
 
 # isort: off
 import torch
@@ -34,10 +33,11 @@ from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-from examples.gptj.convert_checkpoint import convert_hf_gptj  # isort:skip
+
+from examples.gptj.convert_checkpoint import convert_hf_gptj
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import getSMVersion
+from utils.util import skip_fp32_accum_pre_ampere, unittest_name_func
 
 
 class TestGPTJ(unittest.TestCase):
@@ -167,15 +167,11 @@ class TestGPTJ(unittest.TestCase):
 
         return test_cases
 
-    @parameterized.expand(load_test_cases)
+    @parameterized.expand(load_test_cases, name_func=unittest_name_func)
     def test_gptj_plugin(self, context_fmha_flag, enable_remove_input_padding):
 
         # Skip tests that are not supported in pre-ampere architecture
-        if getSMVersion() < 80:
-            if context_fmha_flag == ContextFMHAType.enabled_with_fp32_acc:
-                pytest.skip(
-                    "ContextFMHAType with fp32 acc is not supported in pre-ampere architecture"
-                )
+        skip_fp32_accum_pre_ampere(context_fmha_flag)
 
         torch.random.manual_seed(0)
         use_refit = False

@@ -61,7 +61,7 @@ std::vector<Tensor> e4m3_quantize_helper(Tensor input, QuantizeMode quantize_mod
         scale_shape.assign(input.dim(), 1);
     }
 
-    const auto is_cuda = input.is_cuda();
+    auto const is_cuda = input.is_cuda();
     input = input.cuda();
 
     Tensor quantized_input
@@ -75,19 +75,19 @@ std::vector<Tensor> e4m3_quantize_helper(Tensor input, QuantizeMode quantize_mod
 
     if (input.scalar_type() == at::ScalarType::Float)
     {
-        invokeComputeScalesAndQuantizeMatrix(quantized_input_ptr, get_ptr<float>(scales), get_ptr<const float>(input),
+        invokeComputeScalesAndQuantizeMatrix(quantized_input_ptr, get_ptr<float>(scales), get_ptr<float const>(input),
             input.numel(), input.size(-1), quantize_mode, stream);
     }
     else if (input.scalar_type() == at::ScalarType::Half)
     {
-        invokeComputeScalesAndQuantizeMatrix(quantized_input_ptr, get_ptr<half>(scales), get_ptr<const half>(input),
+        invokeComputeScalesAndQuantizeMatrix(quantized_input_ptr, get_ptr<half>(scales), get_ptr<half const>(input),
             input.numel(), input.size(-1), quantize_mode, stream);
     }
 #ifdef ENABLE_BF16
     else if (input.scalar_type() == at::ScalarType::BFloat16)
     {
         invokeComputeScalesAndQuantizeMatrix(quantized_input_ptr, get_ptr<__nv_bfloat16>(scales),
-            get_ptr<const __nv_bfloat16>(input), input.numel(), input.size(-1), quantize_mode, stream);
+            get_ptr<__nv_bfloat16 const>(input), input.numel(), input.size(-1), quantize_mode, stream);
     }
 #endif
     else
@@ -136,7 +136,7 @@ Tensor e4m3_dequantize_helper(Tensor input, Tensor scales, QuantizeMode quantize
             TORCH_CHECK(scales.size(i) == 1);
     }
 
-    const auto w_is_cuda = input.is_cuda();
+    auto const w_is_cuda = input.is_cuda();
     input = input.cuda();
     scales = scales.cuda();
 

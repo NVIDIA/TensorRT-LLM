@@ -15,7 +15,7 @@ from transformers import (AutoModelForSeq2SeqLM, MBartForConditionalGeneration,
                           VisionEncoderDecoderModel)
 
 from tensorrt_llm._utils import str_dtype_to_torch, torch_to_numpy
-from tensorrt_llm.runtime.lora_manager import LoraConfig
+from tensorrt_llm.lora_manager import LoraConfig
 
 LOGGER = logging.getLogger(__name__)
 

@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/cudaAllocator.h"
 #include "tensorrt_llm/common/tensorConversion.h"
 #include "tensorrt_llm/kernels/decodingKernels.h"
+#include "tensorrt_llm/kernels/parallelDecoding/kvCacheUpdateKernels.h"
 #include "tensorrt_llm/layers/dynamicDecodeLayer.h"
 
 #include <memory>
@@ -218,21 +219,13 @@ typename tl::DynamicDecodeLayer<T>::OutputParams prepareOutputs(
     }
 
     outputParams.beamHypotheses = std::make_shared<tensorrt_llm::kernels::BeamHypotheses>();
-    if (output.beamHypotheses.outputIdsTgt)
+    if (output.beamHypotheses.isDone)
     {
-        outputParams.beamHypotheses->output_ids_tgt = bufferCast<int>(*output.beamHypotheses.outputIdsTgt);
-    }
-    if (output.beamHypotheses.sequenceLengthsTgt)
-    {
-        outputParams.beamHypotheses->sequence_lengths_tgt = bufferCast<int>(*output.beamHypotheses.sequenceLengthsTgt);
+        outputParams.beamHypotheses->is_done = bufferCast<bool>(*output.beamHypotheses.isDone);
     }
     if (output.beamHypotheses.cumLogProbs)
     {
         outputParams.beamHypotheses->cum_log_probs = bufferCast<float>(*output.beamHypotheses.cumLogProbs);
-    }
-    if (output.beamHypotheses.normedScores)
-    {
-        outputParams.beamHypotheses->normed_scores = bufferCast<float>(*output.beamHypotheses.normedScores);
     }
     if (output.beamHypotheses.logProbs)
     {
@@ -242,13 +235,21 @@ typename tl::DynamicDecodeLayer<T>::OutputParams prepareOutputs(
     {
         outputParams.beamHypotheses->min_normed_scores = bufferCast<float>(*output.beamHypotheses.minNormedScores);
     }
+    if (output.beamHypotheses.normedScores)
+    {
+        outputParams.beamHypotheses->normed_scores = bufferCast<float>(*output.beamHypotheses.normedScores);
+    }
     if (output.beamHypotheses.numBeams)
     {
         outputParams.beamHypotheses->num_beams = bufferCast<int>(*output.beamHypotheses.numBeams);
     }
-    if (output.beamHypotheses.isDone)
+    if (output.beamHypotheses.outputIdsTgt)
     {
-        outputParams.beamHypotheses->is_done = bufferCast<bool>(*output.beamHypotheses.isDone);
+        outputParams.beamHypotheses->output_ids_tgt = bufferCast<int>(*output.beamHypotheses.outputIdsTgt);
+    }
+    if (output.beamHypotheses.sequenceLengthsTgt)
+    {
+        outputParams.beamHypotheses->sequence_lengths_tgt = bufferCast<int>(*output.beamHypotheses.sequenceLengthsTgt);
     }
     if (inputLengths)
     {
@@ -316,6 +317,8 @@ void GptDecoder<T>::forwardAsync(DecodingOutput& output, DecodingInput const& in
     auto outputParams = prepareOutputs<T>(output, input.lengths, mLogProbsTiled);
 
     mDynamicDecodeLayer->forward(outputParams, forwardParams);
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 // this should be similar to gatherTree in cpp/tensorrt_llm/thop/gatherTreeOp.cpp
@@ -370,7 +373,7 @@ void GptDecoder<T>::gatherTree(ITensor& finalOutputIds, DecodingOutput const& de
 
     // This is where transpose is done
     tensorrt_llm::kernels::invokeInsertUnfinishedPath(beamHypotheses,
-        reinterpret_cast<const tensorrt_llm::kernels::FinishedState*>(
+        reinterpret_cast<tensorrt_llm::kernels::FinishedState const*>(
             bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(*decodingOutput.finished)),
         bufferCast<float>(*decodingOutput.cumLogProbs), batchSize, beamWidth, stream.get());
     sync_check_cuda_error();
@@ -432,7 +435,7 @@ void IGptDecoder::acceptDraftTokensByIds(ITensor const& targetTokenIds, ITensor 
     tensorrt_llm::kernels::invokeAcceptDraftTokensByIds(bufferCast<SizeType>(draftTokenIds),
         bufferCast<SizeType>(targetTokenIds), bufferCast<SizeType>(contextLengths),
         bufferCast<SizeType>(numDraftTokens), bufferCast<SizeType>(sequenceLengths),
-        reinterpret_cast<const tensorrt_llm::kernels::FinishedState*>(
+        reinterpret_cast<tensorrt_llm::kernels::FinishedState const*>(
             bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(finishedVec)),
         reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
             bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(finishedFinal)),
@@ -487,6 +490,32 @@ void IGptDecoder::acceptDraftTokensByLogits(ITensor& draftLogits, ITensor const&
     {
         TLLM_THROW("Incorrect logits dtype. Only float32 and float16 are supported");
     }
+
+    sync_check_cuda_error();
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void IGptDecoder::updateKVCacheBasedOnAcceptedTokens(ITensor const& acceptedOffsets, ITensor const& packedAcceptedIds,
+    ITensor const& pointerArray, ITensor const& pastKeyValueLengths, GptModelConfig const& modelConfig,
+    WorldConfig const& worldConfig, BufferManager::CudaStreamPtr stream, SizeType rewindDraftTokenCount,
+    SizeType maxAttentionWindow, SizeType maxBlocksPerSeq, nvinfer1::DataType dtype)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    auto const numLayers = modelConfig.getNbLayers(worldConfig.getPipelineParallelism());
+    auto const numKvHeads = modelConfig.getNbKvHeads();
+    auto const tokensPerBlock = modelConfig.getTokensPerBlock();
+    auto const sizeInBytesPerKVHead = modelConfig.getSizePerHead() * BufferDataType(dtype).getSize();
+    auto* const* pointerArrayPtr = reinterpret_cast<int64_t* const*>(bufferCast<int64_t>(pointerArray));
+    auto const seqCount = acceptedOffsets.getShape().d[0] - 1;
+    TLLM_CHECK_WITH_INFO(seqCount > 0, "Number of offsets must be larger than 0");
+
+    tensorrt_llm::kernels::parallel_decoding::updateKVBlockArrayDraftTokenLocation(
+        bufferCast<SizeType>(acceptedOffsets), bufferCast<SizeType>(packedAcceptedIds),
+        bufferCast<SizeType>(pastKeyValueLengths), pointerArrayPtr, numLayers, seqCount, numKvHeads,
+        sizeInBytesPerKVHead, rewindDraftTokenCount, nullptr, maxAttentionWindow, maxBlocksPerSeq, tokensPerBlock,
+        stream->get());
 
     sync_check_cuda_error();
 

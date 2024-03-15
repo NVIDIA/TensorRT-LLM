@@ -142,7 +142,7 @@ struct GemmFpAIntB
         Arguments() {}
 
         CUTLASS_HOST_DEVICE
-        Arguments(cutlass::gemm::GemmCoord const& problem_size, const int group_size,
+        Arguments(cutlass::gemm::GemmCoord const& problem_size, int const group_size,
             typename Mma::IteratorA::TensorRef ref_A, typename Mma::IteratorB::TensorRef ref_B,
             typename Mma::IteratorScale::TensorRef ref_scale, typename Mma::IteratorScale::TensorRef ref_zero,
             typename Epilogue::OutputTileIterator::TensorRef ref_C,
@@ -206,7 +206,7 @@ struct GemmFpAIntB
         }
 
         CUTLASS_HOST_DEVICE
-        Params(Arguments const& args, cutlass::gemm::GemmCoord const& grid_tiled_shape, const int gemm_k_size,
+        Params(Arguments const& args, cutlass::gemm::GemmCoord const& grid_tiled_shape, int const gemm_k_size,
             void* workspace = nullptr)
             : problem_size(args.problem_size)
             , group_size(args.group_size)

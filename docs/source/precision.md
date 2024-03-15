@@ -139,10 +139,22 @@ This release of TensorRT-LLM contains the following examples:
 | Replit Code|   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | SantaCoder |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | Skywork    |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
-| StarCoder  |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
+| StarCoder1 |   Y   |   Y   |   Y   |   .   |    .    |   Y   |   .   |     .     |     .      |
+| StarCoder2 |   Y   |   Y   |   Y   |   .   |    .    |   Y   |   .   |     .     |     .      |
 | T5         |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | Whisper    |   Y   |   Y   |   Y   |   .   |    .    |   Y   |   Y   |     .     |     .      |
 
+
+The list of supported multi-modal examples is:
+
+| BLIP2-OPT  |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
+| BLIP2-T5   |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
+| LLaVA      |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     Y      |
+| VILA       |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     Y      |
+| Nougat     |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
+
+Note: The vision component of multi-modal models uses FP16 by default.
+The language component decides which quantization methods are supported by a given multi-modal model.
 
 ## Technical Detail: The `QuantMode` Flags
 

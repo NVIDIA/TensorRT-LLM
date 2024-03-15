@@ -29,6 +29,9 @@ from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.runtime import ModelConfig, SamplingConfig
 from tensorrt_llm.runtime.generation import _prepare_attention_mask
 
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.util import unittest_name_func
+
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 from examples.falcon.convert_checkpoint import convert_hf_falcon  # isort:skip
 
@@ -250,25 +253,13 @@ class TestFalcon(unittest.TestCase):
                        new_decoder_architecture, use_refit,
                        use_gpt_attengion_plugin, use_gemm_plugin,
                        remove_input_padding, context_fmha_type, dtype):
-        print(' Test Case Parameters')
-        print(' - query_type', query_type)
-        print(' - use_alibi', use_alibi)
-        print(' - parallel_attention', parallel_attention)
-        print(' - new_decoder_architecture', new_decoder_architecture)
-        print(' - use_refit', use_refit)
-        print(' - use_gpt_attengion_plugin', use_gpt_attengion_plugin)
-        print(' - use_gemm_plugin', use_gemm_plugin)
-        print(' - remove_input_padding', remove_input_padding)
-        print(' - context_fmha_type', context_fmha_type)
-        print(' - dtype', dtype)
-
         # Skip unsupported cases.
         if use_alibi and use_gpt_attengion_plugin:
             self.skipTest('ALiBi needs use_gpt_attengion_plugin = False')
         if not use_alibi and not use_gpt_attengion_plugin:
             self.skipTest('RoPE needs use_gpt_attengion_plugin = True')
 
-    @parameterized.expand(load_test_cases())
+    @parameterized.expand(load_test_cases(), name_func=unittest_name_func)
     def test_falcon(self, query_type, use_alibi, parallel_attention,
                     new_decoder_architecture, use_refit,
                     use_gpt_attengion_plugin, use_gemm_plugin,
@@ -494,7 +485,7 @@ class TestFalcon(unittest.TestCase):
 
         torch.testing.assert_close(ref, res, atol=1e-2, rtol=1e-1)
 
-    @parameterized.expand(load_test_cases())
+    @parameterized.expand(load_test_cases(), name_func=unittest_name_func)
     def test_greedy_search(self, query_type, use_alibi, parallel_attention,
                            new_decoder_architecture, use_refit,
                            use_gpt_attengion_plugin, use_gemm_plugin,

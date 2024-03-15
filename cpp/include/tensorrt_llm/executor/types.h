@@ -155,21 +155,16 @@ enum class SchedulerPolicy
     kGUARANTEED_NO_EVICT = 1,
 };
 
-enum class CommunicatorType
+enum class CommunicationType
 {
     kMPI = 0
 };
 
-enum class CommMode
+enum class CommunicationMode
 {
-    kLEADER,       // With the leader mode, only the leader will be returning from the executor constructor and
-                   // therefore only the leader can enqueue requests and get responses
-    kORCHESTRATOR, // With the orchestrator mode, only the orchestrator will be returning from the executor constructor
-                   // and therefore only the leader can enqueue requests and get responses The orchestrator doesn't
-                   // participate in the computations
-    kALL,          // With the ALL mode, all participants are expected to make the same calls to the executor API
-                   // So they all need to send the same requests
-                   // Responses will be the same for all participants
+    kLEADER, // With the leader mode, only the leader can enqueue requests. The requests will be
+             // broadcasted to the workers. All participants can get response via awaitResponses. The leader is the
+             // first participant in the provided participant IDS, or 0 if participant ID is not provided
 };
 
 } // namespace tensorrt_llm::executor

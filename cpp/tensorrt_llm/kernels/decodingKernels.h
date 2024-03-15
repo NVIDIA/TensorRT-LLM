@@ -18,6 +18,7 @@
 
 #include "gptKernels.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
+#include "tensorrt_llm/runtime/common.h"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
@@ -61,7 +62,7 @@ void invokeFinalize(int32_t* outputIds, int32_t* sequenceLengths, float* cumLogP
     int32_t maxSeqLen, int32_t batchSize, cudaStream_t stream);
 
 void invokeInitializeOutput(
-    int32_t* outputIds, const int32_t* endIds, int batchBeam, int maxSeqLen, cudaStream_t stream);
+    int32_t* outputIds, int32_t const* endIds, int batchBeam, int maxSeqLen, cudaStream_t stream);
 
 void invokeCopyNextStepIds(int32_t* nextStepIds, int32_t** outputIdsPtr, int32_t const* sequenceLengths,
     int32_t const* batchSlots, int32_t batchSize, int32_t beamWidth, int32_t maxSeqLen, cudaStream_t stream);
@@ -133,10 +134,41 @@ void invokeTransposeLogProbs(float* output_log_probs, float* output_log_probs_ti
     int32_t const* batchSlots, int32_t batch_size, int32_t max_batch_size, int32_t beam_width, int32_t max_seq_len,
     cudaStream_t stream);
 
-void invokeAcceptTokens(int32_t const* draft_tokens, int32_t const* target_tokens, int32_t const* context_lengths,
-    int32_t const* nums_draft_tokens, int32_t* sequence_lengths, bool const* finished, bool* finished_final,
-    int32_t* finished_sum, int32_t batch_size, int32_t beam_width, int32_t max_seq_len, int32_t max_draft_tokens,
-    cudaStream_t stream);
-
+//! \brief verifies draft medusa tokens given target tokens. Modifies outputIds tensor accordingly filling it with
+//! accepted tokens. Fills logitsPtrs tensor with the pointers to the respective medusa logits tensor according
+//! to the next after the last accepted token.
+//!
+//! \param outputIds input/output buffer [maxBatchSize, maxDraftSeqLen],
+//! input tokens followed by draft tokens to be verified.
+//! After accepting tokens, gets overwritten such that input tokens are followed by the accepted tokens
+//! and one additional token -- next after the last accepted.
+//! \param targetIds input buffer [maxBatchSize, maxTargetSeqLen], tokens predicted from the target medusa head
+//! \param sequenceLengths input/output buffer [maxBatchSize], length of the data in outputIds without draft tokens
+//! Incrememnted according to the accepted length
+//! \param finishedFinal input buffer [maxBatchSize], finished states per request
+//! \param batchSlots input buffer [batchSize], address map from local index
+//! to global index [0, batchSize] -> [0, maxBatchSize]
+//! \param paths input buffer [maxBatchSize, maxTokensPerStep, maxNumHeads+1],
+//! paths to restore sequences from outputIds and targetIds. Should be filled with -1 for everything that is not path.
+//! \param endIds input buffer [maxBatchSize], EOS ids per request
+//! \param medusaLogits input buffer [maxNumHeads, maxBatchSize, maxTokensPerStep, vocabSize], pointer
+//! to the logits from medusa heads
+//! \param logitsPtrs output buffer [batchSize, maxNumHeads], contains pointers to the
+//! respective rows of the medusaLogits for the next after the accepted token
+//! \param batchSize current batch size
+//! \param maxBatchSize maximum batch size
+//! \param vocabSize vocab size
+//! \param maxDraftSeqLen maximum sequence length of the sequence containing draft tokens
+//! \param maxTargetSeqLen maximum sequence length predicted from target head
+//! \param maxNumHeads maximum number of medusa heads
+//! \param maxTokensPerStep maximum number of tokens per step configured in the system
+//! \param stream stream
+template <typename T>
+void acceptDraftTokensByIdsWithPaths(runtime::TokenIdType* outputIds, runtime::TokenIdType const* targetIds,
+    runtime::SizeType* sequenceLengths, FinishedState* finishedFinal, runtime::SizeType const* batchSlots,
+    runtime::SizeType const* paths, runtime::TokenIdType const* endIds, T const* medusaLogits, T const** logitsPtrs,
+    runtime::SizeType batchSize, runtime::SizeType maxBatchSize, runtime::SizeType vocabSize,
+    runtime::SizeType maxDraftSeqLen, runtime::SizeType maxTargetSeqLen, runtime::SizeType maxNumHeads,
+    runtime::SizeType maxTokensPerStep, cudaStream_t stream);
 } // namespace kernels
 } // namespace tensorrt_llm

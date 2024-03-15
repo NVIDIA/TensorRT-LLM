@@ -120,7 +120,7 @@ public:
     {
         if (req.getEmbeddingBias())
         {
-            mEmbeddingBias = executor::detail::toITensor(*(req.getEmbeddingBias().value()));
+            mEmbeddingBias = executor::detail::toITensor(req.getEmbeddingBias().value());
             // Add leading 1 dimension since that's what IFB code expects
             mEmbeddingBias.value()->unsqueeze(0);
         }
@@ -136,7 +136,7 @@ public:
         auto pTuningConfig = req.getPromptTuningConfig();
         if (pTuningConfig)
         {
-            mPromptEmbeddingTable = executor::detail::toITensor(*pTuningConfig.value().getEmbeddingTable());
+            mPromptEmbeddingTable = executor::detail::toITensor(pTuningConfig.value().getEmbeddingTable());
             TLLM_CHECK(mPromptEmbeddingTable.value()->getShape().nbDims == 2);
             mPromptVocabSize = mPromptEmbeddingTable.value()->getShape().d[0];
             mPromptEmbeddingTable.value()->unsqueeze(0);
@@ -145,10 +145,10 @@ public:
         auto loraConfig = req.getLoraConfig();
         if (loraConfig)
         {
-            mLoraWeights = executor::detail::toITensor(*loraConfig.value().getWeights());
+            mLoraWeights = executor::detail::toITensor(loraConfig.value().getWeights());
             mLoraWeights.value()->unsqueeze(0);
 
-            mLoraConfig = executor::detail::toITensor(*loraConfig.value().getConfig());
+            mLoraConfig = executor::detail::toITensor(loraConfig.value().getConfig());
             mLoraConfig.value()->unsqueeze(0);
         }
 
@@ -159,7 +159,7 @@ public:
 
             if (speculativeDecodingConfig.value().getLogits())
             {
-                mDraftLogits = executor::detail::toITensor(*speculativeDecodingConfig.value().getLogits().value());
+                mDraftLogits = executor::detail::toITensor(speculativeDecodingConfig.value().getLogits().value());
             }
 
             // NOTE: Draft acceptance threshold is stored in mSamplingConfig
@@ -474,7 +474,7 @@ public:
         return mDraftTokens->size();
     }
 
-    void setReturnContextLogits(const bool returnContextLogits)
+    void setReturnContextLogits(bool const returnContextLogits)
     {
         mReturnContextLogits = returnContextLogits;
     }
@@ -484,7 +484,7 @@ public:
         return mReturnContextLogits;
     }
 
-    void setReturnGenerationLogits(const bool returnGenerationLogits)
+    void setReturnGenerationLogits(bool const returnGenerationLogits)
     {
         mReturnGenerationLogits = returnGenerationLogits;
     }
@@ -551,9 +551,14 @@ public:
         return mState == REQUEST_STATE_CONTEXT_INIT;
     }
 
-    [[nodiscard]] bool isGenerationInProgessState() const noexcept
+    [[nodiscard]] bool isGenerationInProgressState() const noexcept
     {
         return mState == REQUEST_STATE_GENERATION_IN_PROGRESS;
+    }
+
+    [[nodiscard]] bool isGenerationCompleteState() const noexcept
+    {
+        return mState == REQUEST_STATE_GENERATION_COMPLETE;
     }
 
     /// To determine whether the context is unchunked. When a context is chunked into only a part, it
@@ -680,14 +685,12 @@ public:
 
                 if (getReturnContextLogits())
                 {
-                    result.contextLogits
-                        = std::make_shared<executor::Tensor>(executor::detail::ofITensor(getContextLogitsHost()));
+                    result.contextLogits = executor::detail::ofITensor(getContextLogitsHost());
                 }
 
                 if (getReturnGenerationLogits())
                 {
-                    result.generationLogits
-                        = std::make_shared<executor::Tensor>(executor::detail::ofITensor(getGenerationLogitsHost()));
+                    result.generationLogits = executor::detail::ofITensor(getGenerationLogitsHost());
                 }
 
                 // Update position of last sent response

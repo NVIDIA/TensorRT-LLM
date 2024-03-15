@@ -16,11 +16,14 @@ from typing import Optional
 
 import numpy as np
 import tensorrt as trt
+import torch
+import torch.nn.functional as F
 
 from .._common import default_net, default_trtnet
-from .._utils import str_dtype_to_trt
+from .._utils import pad_vocab_size, set_obj_attrs, str_dtype_to_trt
 from ..functional import (Tensor, _add_plugin_info, _create_tensor, allgather,
                           allreduce, cast, matmul)
+from ..mapping import Mapping
 from ..module import Module
 from ..parameter import Parameter
 from ..plugin import TRT_LLM_PLUGIN_NAMESPACE
@@ -32,7 +35,7 @@ def _gemm_plugin(input: Tensor,
                  transa: bool = False,
                  transb: bool = False,
                  use_fp8: bool = False,
-                 strict_dtype: Optional[str] = None) -> Tensor:
+                 strict_dtype: Optional[trt.DataType] = None) -> Tensor:
     plg_creator = trt.get_plugin_registry().get_plugin_creator(
         'Gemm', '1', TRT_LLM_PLUGIN_NAMESPACE)
     assert plg_creator is not None
@@ -48,6 +51,7 @@ def _gemm_plugin(input: Tensor,
                               trt.PluginFieldType.INT32)
 
     if strict_dtype is not None:
+        assert isinstance(strict_dtype, trt.DataType)
         p_dtype = strict_dtype
     else:
         p_dtype = str_dtype_to_trt(default_net().plugin_config.gemm_plugin)
@@ -84,6 +88,9 @@ class Linear(Module):
         if not share_weight:
             self.weight = Parameter(shape=(self.out_features, self.in_features),
                                     dtype=('fp8' if use_fp8 else dtype))
+            set_obj_attrs(self.weight, {
+                "weight_loader": self.weight_loader,
+            })
         else:
             self.weight = share_weight
 
@@ -94,6 +101,9 @@ class Linear(Module):
 
         if bias:
             self.bias = Parameter(shape=(self.out_features, ), dtype=dtype)
+            set_obj_attrs(self.bias, {
+                "weight_loader": self.weight_loader,
+            })
         else:
             self.register_parameter('bias', None)
 
@@ -141,8 +151,59 @@ class Linear(Module):
                                     default_net().plugin_config.gemm_plugin,
                                     lora_runtime_params=lora_runtime_params)
 
+    def weight_loader(self, mapping: Mapping, param: Parameter,
+                      loaded_weight: torch.Tensor):
+        tp_rank = mapping.tp_rank
+        output_dim = 0
+        shard_size = param._shape[output_dim]
+        start_idx = tp_rank * shard_size
+        loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+
+        param.value = loaded_weight
+
 
 ColumnLinear = Linear
+
+
+class QKVColumnLinear(ColumnLinear):
+
+    def weight_loader(self, mapping: Mapping, param: Parameter,
+                      loaded_weight: torch.Tensor):
+        tp_rank = mapping.tp_rank
+        output_dim = 0
+        shard_size = param._shape[output_dim] // 3
+        start_idx = tp_rank * shard_size
+        # reshape for qkv_weights
+        assert loaded_weight.shape[output_dim] % 3 == 0
+        loaded_weight = loaded_weight.reshape(
+            3, loaded_weight.shape[output_dim] // 3, -1)
+        loaded_weight = loaded_weight.narrow(output_dim + 1, start_idx,
+                                             shard_size)
+        loaded_weight = loaded_weight.reshape(
+            loaded_weight.shape[output_dim + 1] * 3, -1)
+        # for bias
+        if len(param._shape) == 1:
+            loaded_weight.squeeze_(-1)
+        param.value = loaded_weight
+
+
+class ParallelLMHead(ColumnLinear):
+
+    def weight_loader(self, mapping: Mapping, param: Parameter,
+                      loaded_weight: torch.Tensor):
+        tp_rank = mapping.tp_rank
+        output_dim = 0
+        shard_size = param._shape[output_dim]
+        start_idx = tp_rank * shard_size
+        # vocab padding for TP
+        vocab_size = loaded_weight.shape[output_dim]
+        pad_width = pad_vocab_size(vocab_size, self.tp_size) - vocab_size
+        if pad_width > 0:
+            loaded_weight = F.pad(loaded_weight, (0, 0, 0, pad_width),
+                                  mode="constant",
+                                  value=0)
+        loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+        param.value = loaded_weight
 
 
 class RowLinear(Module):
@@ -165,6 +226,9 @@ class RowLinear(Module):
 
         self.weight = Parameter(shape=(self.out_features, self.in_features),
                                 dtype=('fp8' if use_fp8 else dtype))
+        set_obj_attrs(self.weight, {
+            "weight_loader": self.weight_loader,
+        })
 
         if bias:
             self.bias = Parameter(shape=(self.out_features, ), dtype=dtype)
@@ -218,3 +282,12 @@ class RowLinear(Module):
                                     self.weight.value,
                                     default_net().plugin_config.gemm_plugin,
                                     lora_runtime_params=lora_runtime_params)
+
+    def weight_loader(self, mapping: Mapping, param: Parameter,
+                      loaded_weight: torch.Tensor):
+        tp_rank = mapping.tp_rank
+        input_dim = 1
+        shard_size = param._shape[input_dim]
+        start_idx = tp_rank * shard_size
+        loaded_weight = loaded_weight.narrow(input_dim, start_idx, shard_size)
+        param.value = loaded_weight

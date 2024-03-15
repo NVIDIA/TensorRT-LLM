@@ -51,5 +51,5 @@ def test_sync_generation():
     print("We have sent the requests: ", [id(f) for f in futures])
     for future in executor.wait_first_completed(futures):
         print(
-            f"Request {id(future)} has finished: {future.wait_completion(timeout=0).text}"
+            f"Request {id(future)} has finished: {future.result(timeout=0).text}"
         )

@@ -15,6 +15,7 @@
 import unittest
 
 from parameterized import parameterized
+from utils.util import unittest_name_func
 
 import tensorrt_llm
 from tensorrt_llm._utils import str_dtype_to_np
@@ -28,7 +29,8 @@ class TestModelDtype(unittest.TestCase):
 
     @parameterized.expand([(GPTLMHeadModel, 'float32'),
                            (GPTLMHeadModel, 'bfloat16'),
-                           (GPTLMHeadModel, 'float16')])
+                           (GPTLMHeadModel, 'float16')],
+                          name_func=unittest_name_func)
     def test_model_dtype(self, model_cls, dtype):
         ''' Every parameter in the model should have the same dtype as the model initialized to
         '''

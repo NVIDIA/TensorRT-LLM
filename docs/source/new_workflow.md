@@ -60,8 +60,8 @@ The different files will be loaded by different ranks in a multi-GPU (multi-proc
 | mapping.world_size                     | int        | 1                   |
 | mapping.tp_size                        | int        | 1                   |
 | mapping.pp_size                        | int        | 1                   |
-| quantization.quant_aglo                | str        | null                |
-| quantization.kv_cache_quant_aglo       | str        | null                |
+| quantization.quant_algo                | str        | null                |
+| quantization.kv_cache_quant_algo       | str        | null                |
 | quantization.group_size                | int        | 64                  |
 | quantization.has_zero_point            | bool       | False               |
 | quantization.pre_quant_scale           | bool       | False               |
@@ -211,10 +211,6 @@ Here is the `config.json`:
     "position_embedding_type": "learned_absolute",
     "max_position_embeddings": 2048,
     "hidden_act": "relu",
-    "quantization": {
-        "use_weight_only": false,
-        "weight_only_precision": "int8"
-    },
     "mapping": {
         "world_size": 2,
         "tp_size": 2

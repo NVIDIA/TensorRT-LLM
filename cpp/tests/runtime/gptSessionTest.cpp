@@ -199,7 +199,7 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
     if (isChatGlmTest)
     {
         ASSERT_TRUE(fs::exists(DATA_PATH / modelName));
-        const int batchSize = *batchSizes.begin();
+        int const batchSize = *batchSizes.begin();
         fileNameSuffix
             = std::string("-BS") + std::to_string(batchSize) + "-BM" + std::to_string(beamWidth) + std::string(".npy");
         inputPath = DATA_PATH / modelName / (std::string("inputId") + fileNameSuffix);
@@ -239,7 +239,7 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
     auto const modelConfig = json.getModelConfig();
     verifyModelConfig(modelConfig, modelSpec);
 
-    const int worldSize = modelSpec.mTPSize * modelSpec.mPPSize;
+    int const worldSize = modelSpec.mTPSize * modelSpec.mPPSize;
     auto const worldConfig = WorldConfig::mpi(worldSize, modelSpec.mTPSize, modelSpec.mPPSize);
 
     auto enginePath = modelPath / json.engineFilename(worldConfig);
@@ -297,9 +297,9 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
         std::srand(42);
         if (modelSpec.mRandomEndId)
         {
-            const auto endIdRow = std::rand() % nbGivenInputs;
-            const auto endIdBeam = std::rand() % beamWidth;
-            const auto endIdCol = givenInputLengths[endIdRow] + minLength + std::rand() % (maxNewTokens - minLength);
+            auto const endIdRow = std::rand() % nbGivenInputs;
+            auto const endIdBeam = std::rand() % beamWidth;
+            auto const endIdCol = givenInputLengths[endIdRow] + minLength + std::rand() % (maxNewTokens - minLength);
             auto const endIdIndex = tc::flat_index2((endIdRow * beamWidth + endIdBeam), endIdCol, maxSeqLength);
             endId = expectedOutputData[endIdIndex];
         }
@@ -357,7 +357,7 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
         std::vector<SizeType> inputLengthsHost(batchSize);
         for (SizeType i = 0; i < batchSize; ++i)
         {
-            const int inputIdx = i % nbGivenInputs;
+            int const inputIdx = i % nbGivenInputs;
             inputLengthsHost[i] = givenInputLengths[inputIdx];
         }
         auto inputLengths = bufferManager.copyFrom(inputLengthsHost, ITensor::makeShape({batchSize}), MemoryType::kGPU);
@@ -519,7 +519,7 @@ auto constexpr kBatchSizes = {1, 8};
 
 using ParamType = std::tuple<ModelParams, ModelSpec, SizeType, bool, MicroBatchSizes>;
 
-std::string generateTestName(const testing::TestParamInfo<ParamType>& info)
+std::string generateTestName(testing::TestParamInfo<ParamType> const& info)
 {
     auto const modelSpec = std::get<1>(info.param);
     std::string name{modelSpec.mDataType == nvinfer1::DataType::kFLOAT ? "Float" : "Half"};

@@ -312,9 +312,9 @@ public:
 
     [[nodiscard]] std::vector<int64_t> serialize() const;
 
-    static std::shared_ptr<InferenceRequest> deserialize(const std::vector<int64_t>& packed);
+    static std::shared_ptr<InferenceRequest> deserialize(std::vector<int64_t> const& packed);
 
-    static std::shared_ptr<InferenceRequest> deserialize(const int64_t* packed_ptr);
+    static std::shared_ptr<InferenceRequest> deserialize(int64_t const* packed_ptr);
 };
 
 } // namespace tensorrt_llm::batch_manager

@@ -207,17 +207,14 @@ def load_from_binary(tensorrt_llm_qwen: QWenForCausalLM,
         tensorrt_llm_qwen.lm_head.weight.value = np.ascontiguousarray(
             split(lm_head_weight, mapping.tp_size, mapping.tp_rank))
 
-    layers_per_pipeline_stage = tensorrt_llm_qwen.num_layers // mapping.pp_size
-    layers_range = list(
-        range(mapping.pp_rank * layers_per_pipeline_stage,
-              (mapping.pp_rank + 1) * layers_per_pipeline_stage, 1))
-
+    num_hidden_layers = tensorrt_llm_qwen.num_layers
+    layers_range = mapping.pp_layers(num_hidden_layers)
     for i in layers_range:
         c_attn_out_dim = (3 * hidden_size //
                           mapping.tp_size) if not multi_query_mode else (
                               hidden_size // mapping.tp_size +
                               (hidden_size // num_hidden_layers) * 2)
-        idx = i - mapping.pp_rank * layers_per_pipeline_stage
+        idx = i - layers_range[0]
         tensorrt_llm_qwen.layers[idx].ln_1.weight.value = fromfile(
             dir_path, 'model.layers.' + str(i) + '.ln_1.weight.bin')
 
@@ -406,10 +403,9 @@ def load_from_hf_qwen(tensorrt_llm_qwen: tensorrt_llm.models.QWenForCausalLM,
 
     model_params = dict(hf_qwen.named_parameters())
     torch_dtype = str_dtype_to_torch(dtype)
-    layers_per_pipeline_stage = hf_qwen.config.num_hidden_layers // mapping.pp_size
-    layers_range = list(
-        range(mapping.pp_rank * layers_per_pipeline_stage,
-              (mapping.pp_rank + 1) * layers_per_pipeline_stage, 1))
+
+    num_hidden_layers = hf_qwen.config.num_hidden_layers
+    layers_range = mapping.pp_layers(num_hidden_layers)
 
     for k, v in tqdm(model_params.items(),
                      total=len(model_params),
@@ -438,7 +434,7 @@ def load_from_hf_qwen(tensorrt_llm_qwen: tensorrt_llm.models.QWenForCausalLM,
             layer_idx = extract_layer_idx(k)
             if layer_idx is None or int(layer_idx) not in layers_range:
                 continue
-            idx = int(layer_idx) - mapping.pp_rank * layers_per_pipeline_stage
+            idx = int(layer_idx) - layers_range[0]
             if idx >= tensorrt_llm_qwen.num_layers:
                 continue
             if 'ln_1.weight' in k:
@@ -631,13 +627,7 @@ def load_from_gptq_qwen(
     num_hidden_layers = max(layer_ids) + 1
     suffixs = ["qweight", "qzeros", "scales"]
 
-    layers_per_pipeline_stage = num_hidden_layers // mapping.pp_size
-    layers_range = list(
-        range(
-            mapping.pp_rank * layers_per_pipeline_stage,
-            (mapping.pp_rank + 1) * layers_per_pipeline_stage,
-            1,
-        ))
+    layers_range = mapping.pp_layers(num_hidden_layers)
     torch_dtype = str_dtype_to_torch(dtype)
     for layer in tqdm(layers_range,
                       ncols=80,
@@ -655,7 +645,7 @@ def load_from_gptq_qwen(
             # dtype: int32, int32, float16
             split_qkv_suf.append(split_qkv)
 
-        idx = layer - mapping.pp_rank * layers_per_pipeline_stage
+        idx = layer - layers_range[0]
         th_bias = model_params[prefix + "c_attn.bias"].to(
             torch_dtype).cpu().contiguous()
 
@@ -709,7 +699,7 @@ def load_from_gptq_qwen(
             idx = int(layer_idx)
             if idx not in layers_range:
                 continue
-            idx = idx - mapping.pp_rank * layers_per_pipeline_stage
+            idx = idx - layers_range[0]
 
             if "ln_1.weight" in k:
                 tensorrt_llm_qwen.layers[idx].ln_1.weight.value = v
@@ -791,7 +781,7 @@ def load_from_gptq_qwen(
                 dst.value = np.ascontiguousarray(split_v)
 
     tok = time.time()
-    t = time.strftime("%h:%m:%s", time.gmtime(tok - tik))
+    t = time.strftime("%H:%M:%S", time.gmtime(tok - tik))
     tensorrt_llm.logger.info(f"weights loaded. total time: {t}")
 
 
@@ -919,11 +909,7 @@ def load_from_awq_qwen(tensorrt_llm_qwen: QWenForCausalLM,
     ]
 
     num_hidden_layers = max(layer_ids) + 1
-    layers_per_pipeline_stage = num_hidden_layers // mapping.pp_size
-    layers_range = list(
-        range(mapping.pp_rank * layers_per_pipeline_stage,
-              (mapping.pp_rank + 1) * layers_per_pipeline_stage, 1))
-
+    layers_range = mapping.pp_layers(num_hidden_layers)
     for layer_idx in tqdm(layers_range, "Loading weights..."):
         prefix = "transformer.h." + str(layer_idx) + "."
         for idx, awq_attr in enumerate(awq_block_names):

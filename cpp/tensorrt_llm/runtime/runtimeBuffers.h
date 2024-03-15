@@ -177,13 +177,13 @@ private:
     // Some tensors are properly tiled, some are just reshaped.
     void tile(BufferManager& manager, GptModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
-    static std::vector<SizeType> getPositionIdsContextPhaseGlm(const SizeType& batchSize,
-        const SizeType& maxInputLength, const SizeType* pInputLengths, const bool useGptAttentionPlugin,
-        const bool usePackedInput);
+    static std::vector<SizeType> getPositionIdsContextPhaseGlm(SizeType const& batchSize,
+        SizeType const& maxInputLength, SizeType const* pInputLengths, bool const useGptAttentionPlugin,
+        bool const usePackedInput);
 
-    static std::vector<SizeType> getPositionIdsGenerationPhaseGlm(const SizeType& batchSize, const SizeType& beamSize,
-        const SizeType& step, const SizeType* pInputLengths, const bool useGptAttentionPlugin,
-        const bool usePackedInput);
+    static std::vector<SizeType> getPositionIdsGenerationPhaseGlm(SizeType const& batchSize, SizeType const& beamSize,
+        SizeType const& step, SizeType const* pInputLengths, bool const useGptAttentionPlugin,
+        bool const usePackedInput);
 };
 
 } // namespace tensorrt_llm::runtime

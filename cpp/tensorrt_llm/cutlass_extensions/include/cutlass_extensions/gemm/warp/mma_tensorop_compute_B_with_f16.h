@@ -218,7 +218,7 @@ public:
     /// Performs a warp-level matrix multiply-accumulate operation
     CUTLASS_DEVICE
     void operator()(FragmentC& D, TransformedFragmentA const& A, TransformedFragmentB const& B, FragmentC const& C,
-        const int warp_tileB_k_offset) const
+        int const warp_tileB_k_offset) const
     {
 
         using MmaOperandA = typename ArchMmaOperator::FragmentA;

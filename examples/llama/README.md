@@ -34,7 +34,7 @@ Need to prepare the HF LLaMA checkpoint first by following the guides here https
 
 TensorRT-LLM LLaMA builds TensorRT engine(s) from HF checkpoint. If no checkpoint directory is specified, TensorRT-LLM will build engine(s) with dummy weights.
 
-Normally `trtllm-build` only requires single GPU, but if you've already got all the GPUs needed while inferencing, you could enable parallelly building to make the engine building process faster by adding `--workers` argument. Please note that currently `workers` feature only supports single node.
+Normally `trtllm-build` only requires single GPU, but if you've already got all the GPUs needed for inference, you could enable parallel building to make the engine building process faster by adding `--workers` argument. Please note that currently `workers` feature only supports single node.
 
 `--use_fused_mlp` enables GEMM horizontal fusion in gated MLP layer, which reduces input traffic and potentially improves performance. For FP8 PTQ, the downside is slight reduction of accuracy because one of the quantization scaling factors are discarded (accuracy 0.45734 vs 0.45755 for LLaMA-v2 7B using ammo/examples/hf/instruct_eval/mmlu.py).
 
@@ -73,6 +73,16 @@ python convert_checkpoint.py --model_dir ./tmp/llama/7B/ \
 trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_fp16_wq \
             --output_dir ./tmp/llama/7B/trt_engines/weight_only/1-gpu/ \
             --gemm_plugin float16
+
+# Build LLaMA 7B using 2-way auto parallelism.
+python convert_checkpoint.py --model_dir ./tmp/llama/7B/ \
+                            --output_dir ./tllm_checkpoint_1gpu_fp16 \
+                            --dtype float16
+
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_fp16 \
+            --output_dir ./tmp/llama/7B/trt_engines/fp16/2-gpu/ \
+            --gemm_plugin float16 \
+            --world_size 2
 
 # Build LLaMA 7B using 2-way tensor parallelism.
 python convert_checkpoint.py --model_dir ./tmp/llama/7B/ \
@@ -159,7 +169,7 @@ The implementation is identical to Huggingface's.
 Please refer to https://huggingface.co/docs/transformers/model_doc/llama2#transformers.LlamaConfig.rope_scaling for more details.
 
 ### Long context length
-To use the model with Long context lengths, it is necessary to add `--multi_block_mode` in the build command to enable faster decoding in multihead attention.
+To use the model with Long context lengths, it is necessary to add `--multi_block_mode` in the build command to enable faster decoding in multi-head attention.
 
 
 A few LLaMA models are fine-tuned for long context length that TRT-LLM can support today. For example https://huggingface.co/Yukang/LongAlpaca-70B employs rotary scaling plus fine-tuning to support up to 32K context length. The following show the steps for running LongAlpaca-70B in TRT-LLM:
@@ -171,8 +181,6 @@ python convert_checkpoint.py --meta_ckpt_dir ./tmp/LongAlpaca-70B/ \
                             --output_dir ./tllm_checkpoint_8gpu_tp8 \
                             --dtype float16 \
                             --tp_size 8 \
-                            --vocab_size=32001 \
-                            --rotary_scaling linear 8.0
 
 trtllm-build --checkpoint_dir ./tllm_checkpoint_8gpu_tp8 \
             --output_dir ./tmp/llama/70B/trt_engines/fp16/8-gpu/ \
@@ -506,26 +514,23 @@ Use the following command to build `CodeLlama-7b-Instruct`:
 ```bash
 python convert_checkpoint.py --model_dir /tmp/CodeLlama-7b-Instruct-hf  \
                              --output_dir ./tllm_checkpoint_1gpu_codellama \
-                             --dtype float16 \
-                             --rotary_base 1000000 \
-                             --vocab_size 32016
+                             --dtype float16
+
 
 trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_codellama \
             --output_dir ./tmp/codellama/trt_engines/fp16/1-gpu/ \
-            --gemm_plugin float16 \
+            --gemm_plugin float16
 ```
 Use the following command to build `CodeLlama-34b-Instruct` for 4 GPUs (TP=4):
 ```bash
 python convert_checkpoint.py --model_dir /tmp/CodeLlama-34b-Instruct-hf  \
                              --output_dir ./tllm_checkpoint_4gpu_codellama \
                              --dtype float16 \
-                             --rotary_base 1000000 \
-                             --vocab_size 32000 \
                              --tp_size 4
 
 trtllm-build --checkpoint_dir ./tllm_checkpoint_4gpu_codellama \
             --output_dir ./tmp/codellama/trt_engines/fp16/4-gpu/ \
-            --gemm_plugin float16 \
+            --gemm_plugin float16
 ```
 
 NOTE: CodeLlama uses the `max_position_embeddings` of 16K.
@@ -536,8 +541,6 @@ Use `--max_input_len` and `--max_output_len` (which defaults to `2048` and `512`
 python convert_checkpoint.py --model_dir /tmp/CodeLlama-34b-Instruct-hf  \
                              --output_dir ./tllm_checkpoint_4gpu_codellama \
                              --dtype float16 \
-                             --rotary_base 1000000 \
-                             --vocab_size 32000 \
                              --tp_size 8 \
                              --use_parallel_embedding
 
@@ -577,8 +580,7 @@ python convert_checkpoint.py --model_dir /tmp/llama-v2-13b-hf \
                          --output_dir ./tllm_checkpoint_2gpu_lora \
                          --dtype float16 \
                          --tp_size 2 \
-                         --hf_lora_dir /tmp/chinese-llama-2-lora-13b \
-                         --use_fused_mlp
+                         --hf_lora_dir /tmp/chinese-llama-2-lora-13b
 
 trtllm-build --checkpoint_dir ./tllm_checkpoint_2gpu_lora \
             --output_dir /tmp/new_lora_13b/trt_engines/fp16/2-gpu/ \
@@ -625,7 +627,7 @@ Output: "我看见一个人坐在那边边看书书，我看起来还挺像你�
 ### Run LLaMa with several lora checkpoints
 
 In this section, we show how to run a model with multiple LoRA modules at the same time. Note that if one of the LoRA module has a
-fine-tuned embedding table or logit GEMM, users should guarantee that all the instances of the model can use the same finetuned
+fine-tuned embedding table or logit GEMM, users should guarantee that all the instances of the model can use the same fine-tuned
 embedding table or logit GEMM.
 Here, we use two LoRA checkpoints as examples. These two LoRA checkponits add LoRA modules to `q_proj` and `v_proj`. Because we only
 support adding lora modules on `q`, `k` and `v` at the same time, we need to add `--lora_target_modules "attn_q" "attn_k" "attn_v"`.
@@ -633,7 +635,7 @@ In this case, we assign null pointers for the `k` LoRA module in TensorRT-LLM an
 
 As the rank of the LoRA modules of both checkpoints is 8, we can set `--max_lora_rank 8` to reduce the memory requirement for the LoRA plugin.
 
-In this example, we use a LoRA checkpoint finetuned on the Chinese dataset `luotuo-lora-7b-0.1` and a LoRA checkpoint finetuned on
+In this example, we use a LoRA checkpoint fine-tuned on the Chinese dataset `luotuo-lora-7b-0.1` and a LoRA checkpoint fine-tuned on
 the Japanese dataset `Japanese-Alpaca-LoRA-7b-v0`. For the `lora_manager` to load several checkpoints, we pass several directories
 of LoRA checkpoints at the same time: `--lora_dir  "luotuo-lora-7b-0.1/" "Japanese-Alpaca-LoRA-7b-v0/"`.
 Then, `lora_manager` will assign `lora_task_uids` to these checkpoints. `lora_task_uids -1` is a predefined value, which corresponds to
@@ -699,19 +701,19 @@ We can observe that `luotuo-lora-7b-0.1` produces correct answers on the first s
 
 ## Run LLaMa with StreamingLLM
 
-* Build engine. Set `--enable_pos_shift` to use positions in KV cache for RoPE, and set `--dense_context_fmha` to use dense context fmha in context phase.
+* Build engine. Set `--pos_shift enable` to use positions in KV cache for RoPE, and set `--dense_context_fmha enable` to use dense context fmha in context phase.
 
 ```bash
 # Build the LLaMA 7B model with StreamingLLM feature using a single GPU and FP16.
 python convert_checkpoint.py --model_dir ./tmp/llama/7B/ \
                          --output_dir ./tllm_checkpoint_1gpu_streamlingllm \
-                         --dtype float16 \
-                         --dense_context_fmha \
-                         --enable_pos_shift
+                         --dtype float16
 
 trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_streamlingllm \
             --output_dir ./tmp/llama/7B/trt_engines/fp16_StreamingLLM/1-gpu/ \
-            --gemm_plugin float16
+            --gemm_plugin float16 \
+            --dense_context_fmha enable \
+            --pos_shift enable
 
 ```
 

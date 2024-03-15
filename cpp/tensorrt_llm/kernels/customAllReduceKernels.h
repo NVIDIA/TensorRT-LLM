@@ -57,7 +57,7 @@ struct AllReduceParams
     void* peer_comm_buffer_ptrs[MAX_RANKS_PER_NODE];
     void* local_output_buffer_ptr;
 
-    static AllReduceParams deserialize(const int32_t* buffer, size_t tpSize, size_t tpRank, uint32_t flag_value);
+    static AllReduceParams deserialize(int32_t const* buffer, size_t tpSize, size_t tpRank, uint32_t flag_value);
 };
 
 template <typename T>

@@ -47,7 +47,7 @@ private:
 extern "C"
 {
     // This function is used for explicitly registering the TRT-LLM plugins and the default logger.
-    bool initTrtLlmPlugins(void* logger, const char* libNamespace = tensorrt_llm::plugins::api::kDefaultNamespace);
+    bool initTrtLlmPlugins(void* logger, char const* libNamespace = tensorrt_llm::plugins::api::kDefaultNamespace);
 
     // The functions below are used by TensorRT to when loading a shared plugin library with automatic registering.
     // see https://docs.nvidia.com/deeplearning/tensorrt/developer-guide/index.html#generating-plugin-library

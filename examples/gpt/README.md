@@ -206,7 +206,7 @@ python3 build.py \
 mpirun -np 4 python3 ../run.py --engine_dir santacoder_outputs_tp4 --tokenizer_dir ./santacoder --input_text "def print_hello_world():" --max_output_len 20 --no_add_special_tokens
 ```
 
-## GPT Variant - StarCoder
+## GPT Variant - StarCoder (v1 and v2)
 
 For StarCoder, the steps are similar except that `santacoder` is swapped with `starcoder`.
 
@@ -227,6 +227,11 @@ python3 build.py \
 
 mpirun -np 4 python3 ../run.py --engine_dir starcoder_outputs_tp4 --tokenizer_dir ./starcoder  --input_text "def print_hello_world():" --max_output_len 20 --no_add_special_tokens
 ```
+
+For StarCoder2, you can use almost the same steps as shown above by just setting `--model starcoder2` when converting the huggingface models.
+ - Note that StarCoder2 hasn't been merged to the official releases of transformers package yet, so remember using the [main branch of transformers repo](https://github.com/huggingface/transformers).
+ - Add `--max_attention_window_size 4096` when running with run.py or summarization, which enables the sliding window attention.
+   - the sliding window size comes from the hf model [config.json](https://huggingface.co/bigcode/starcoder2-15b/blob/main/config.json#L23).
 
 ## Summarization using the GPT model
 

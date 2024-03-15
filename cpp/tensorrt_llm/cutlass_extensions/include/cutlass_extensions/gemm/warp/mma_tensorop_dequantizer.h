@@ -136,11 +136,11 @@ public:
     static constexpr WeightOnlyQuantOp QuantOp = QuantOp_;
 
     CUTLASS_DEVICE
-    MmaTensorOpDequantizer(TensorRef smem_scales, TensorRef smem_zeros, const int warp_idx_n, const int lane_idx)
+    MmaTensorOpDequantizer(TensorRef smem_scales, TensorRef smem_zeros, int const warp_idx_n, int const lane_idx)
     {
-        const int warp_offset = warp_idx_n * Shape::kN;
-        const int quad = lane_idx / 4;
-        const int thread_offset = warp_offset + quad;
+        int const warp_offset = warp_idx_n * Shape::kN;
+        int const quad = lane_idx / 4;
+        int const thread_offset = warp_offset + quad;
         pointer_scale_ = smem_scales.data() + thread_offset;
         if constexpr (hasZero(QuantOp))
         {
@@ -149,7 +149,7 @@ public:
     }
 
     CUTLASS_DEVICE
-    MmaTensorOpDequantizer(TensorRef smem_scales, const int warp_idx_n, const int lane_idx)
+    MmaTensorOpDequantizer(TensorRef smem_scales, int const warp_idx_n, int const lane_idx)
         : MmaTensorOpDequantizer(smem_scales, TensorRef(), warp_idx_n, lane_idx)
     {
     }
@@ -165,7 +165,7 @@ public:
     }
 
     CUTLASS_DEVICE
-    void dequantize(FragmentDequantizedOperand& operand_frag, const FragmentScale& scale_frag)
+    void dequantize(FragmentDequantizedOperand& operand_frag, FragmentScale const& scale_frag)
     {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && defined(ENABLE_BF16))
         using _MmaOperandB = typename ArchMmaOperator::FragmentB;
@@ -174,7 +174,7 @@ public:
                 == FragmentDequantizedOperand::kElements,
             "");
 
-        const __nv_bfloat16* scale_ptr = reinterpret_cast<const __nv_bfloat16*>(&scale_frag);
+        __nv_bfloat16 const* scale_ptr = reinterpret_cast<__nv_bfloat16 const*>(&scale_frag);
         ExpandedMmaOperandB* operand_frag_ptr = reinterpret_cast<ExpandedMmaOperandB*>(&operand_frag);
         CUTLASS_PRAGMA_UNROLL
         for (int mma_n_iter = 0; mma_n_iter < MmaOperator::MmaIterations::kColumn; ++mma_n_iter)
@@ -222,7 +222,7 @@ public:
 
     CUTLASS_DEVICE
     void dequantize(
-        FragmentDequantizedOperand& operand_frag, const FragmentScale& scale_frag, const FragmentScale& zero_frag)
+        FragmentDequantizedOperand& operand_frag, FragmentScale const& scale_frag, FragmentScale const& zero_frag)
     {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && defined(ENABLE_BF16))
         using _MmaOperandB = typename ArchMmaOperator::FragmentB;
@@ -231,8 +231,8 @@ public:
                 == FragmentDequantizedOperand::kElements,
             "");
 
-        const __nv_bfloat16* scale_ptr = reinterpret_cast<const __nv_bfloat16*>(&scale_frag);
-        const __nv_bfloat16* zero_ptr = reinterpret_cast<const __nv_bfloat16*>(&zero_frag);
+        __nv_bfloat16 const* scale_ptr = reinterpret_cast<__nv_bfloat16 const*>(&scale_frag);
+        __nv_bfloat16 const* zero_ptr = reinterpret_cast<__nv_bfloat16 const*>(&zero_frag);
 
         ExpandedMmaOperandB* operand_frag_ptr = reinterpret_cast<ExpandedMmaOperandB*>(&operand_frag);
         CUTLASS_PRAGMA_UNROLL
@@ -335,11 +335,11 @@ public:
     static constexpr WeightOnlyQuantOp QuantOp = QuantOp_;
 
     CUTLASS_DEVICE
-    MmaTensorOpDequantizer(TensorRef smem_scales, TensorRef smem_zeros, const int warp_idx_n, const int lane_idx)
+    MmaTensorOpDequantizer(TensorRef smem_scales, TensorRef smem_zeros, int const warp_idx_n, int const lane_idx)
     {
-        const int warp_offset = warp_idx_n * Shape::kN;
-        const int quad = lane_idx / 4;
-        const int thread_offset = warp_offset + quad;
+        int const warp_offset = warp_idx_n * Shape::kN;
+        int const quad = lane_idx / 4;
+        int const thread_offset = warp_offset + quad;
         pointer_scale_ = smem_scales.data() + thread_offset;
         if constexpr (hasZero(QuantOp))
         {
@@ -348,7 +348,7 @@ public:
     }
 
     CUTLASS_DEVICE
-    MmaTensorOpDequantizer(TensorRef smem_scales, const int warp_idx_n, const int lane_idx)
+    MmaTensorOpDequantizer(TensorRef smem_scales, int const warp_idx_n, int const lane_idx)
         : MmaTensorOpDequantizer(smem_scales, TensorRef(), warp_idx_n, lane_idx)
     {
     }
@@ -364,7 +364,7 @@ public:
     }
 
     CUTLASS_DEVICE
-    void dequantize(FragmentDequantizedOperand& operand_frag, const FragmentScale& scale_frag)
+    void dequantize(FragmentDequantizedOperand& operand_frag, FragmentScale const& scale_frag)
     {
         using _MmaOperandB = typename ArchMmaOperator::FragmentB;
         using ExpandedMmaOperandB = Array<typename _MmaOperandB::Element, kExpansionFactor * _MmaOperandB::kElements>;
@@ -406,7 +406,7 @@ public:
 
     CUTLASS_DEVICE
     void dequantize(
-        FragmentDequantizedOperand& operand_frag, const FragmentScale& scale_frag, const FragmentScale& zero_frag)
+        FragmentDequantizedOperand& operand_frag, FragmentScale const& scale_frag, FragmentScale const& zero_frag)
     {
         using _MmaOperandB = typename ArchMmaOperator::FragmentB;
         using ExpandedMmaOperandB = Array<typename _MmaOperandB::Element, kExpansionFactor * _MmaOperandB::kElements>;
@@ -505,11 +505,11 @@ public:
     static_assert(QuantOp == WeightOnlyQuantOp::PER_COLUMN_SCALE_ONLY, "");
 
     CUTLASS_DEVICE
-    MmaTensorOpDequantizer(TensorRef smem_scales, const int warp_idx_n, const int lane_idx)
+    MmaTensorOpDequantizer(TensorRef smem_scales, int const warp_idx_n, int const lane_idx)
     {
-        const int warp_offset = warp_idx_n * Shape::kN;
-        const int base_col = lane_idx & 0xF8;
-        const int thread_offset = warp_offset + base_col;
+        int const warp_offset = warp_idx_n * Shape::kN;
+        int const base_col = lane_idx & 0xF8;
+        int const thread_offset = warp_offset + base_col;
         pointer_ = smem_scales.data() + thread_offset;
     }
 
@@ -527,7 +527,7 @@ public:
     }
 
     CUTLASS_DEVICE
-    void dequantize(FragmentDequantizedOperand& operand_frag, const FragmentScale& scale_frag)
+    void dequantize(FragmentDequantizedOperand& operand_frag, FragmentScale const& scale_frag)
     {
         static_assert(FragmentScale::kElements == FragmentDequantizedOperand::kElements, "");
 
@@ -591,11 +591,11 @@ public:
     static_assert(QuantOp == WeightOnlyQuantOp::PER_COLUMN_SCALE_ONLY, "");
 
     CUTLASS_DEVICE
-    MmaTensorOpDequantizer(TensorRef smem_scales, const int warp_idx_n, const int lane_idx)
+    MmaTensorOpDequantizer(TensorRef smem_scales, int const warp_idx_n, int const lane_idx)
     {
-        const int warp_offset = warp_idx_n * Shape::kN;
-        const int base_col = lane_idx & 0xF8 + lane_idx % 4;
-        const int thread_offset = warp_offset + base_col;
+        int const warp_offset = warp_idx_n * Shape::kN;
+        int const base_col = lane_idx & 0xF8 + lane_idx % 4;
+        int const thread_offset = warp_offset + base_col;
         pointer_ = smem_scales.data() + thread_offset;
     }
 
@@ -617,7 +617,7 @@ public:
     }
 
     CUTLASS_DEVICE
-    void dequantize(FragmentDequantizedOperand& operand_frag, const FragmentScale& scale_frag)
+    void dequantize(FragmentDequantizedOperand& operand_frag, FragmentScale const& scale_frag)
     {
         using MmaOperandB = typename ArchMmaOperator::FragmentB;
         static constexpr int total_n_mmas = 2 * TileNIterations;

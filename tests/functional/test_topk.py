@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
+import sys
 import unittest
 
 import numpy as np
@@ -20,6 +22,9 @@ from parameterized import parameterized
 from polygraphy.backend.trt import EngineFromNetwork, TrtRunner
 
 import tensorrt_llm
+
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.util import unittest_name_func
 
 
 class TestFunctional(unittest.TestCase):
@@ -32,7 +37,8 @@ class TestFunctional(unittest.TestCase):
         ((3, 4, 6), 2, 0, True),
         ((3, 5), 1, 1, False),
         ((3, 4, 6), 2, 0, False),
-    ])
+    ],
+                          name_func=unittest_name_func)
     def test_topk(self, input_shape, k, d, largest):
         value_dtype = 'float32'
         indices_dtype = 'int32'

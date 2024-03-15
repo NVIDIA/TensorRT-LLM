@@ -37,7 +37,8 @@ from tensorrt_llm.plugin.plugin import ContextFMHAType
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root
-from utils.util import getSMVersion
+from utils.util import (skip_bf16_pre_ampere, skip_fp32_accum_pre_ampere,
+                        unittest_name_func)
 
 
 class TestLLaMA(unittest.TestCase):
@@ -87,8 +88,6 @@ class TestLLaMA(unittest.TestCase):
                 'moe_tp_mode': 2,
                 'moe_normalization_mode': 1,
                 'use_fused_mlp': False,
-                'enable_pos_shift': False,
-                'dense_context_fmha': False,
             }
 
             # Initialize model
@@ -208,25 +207,13 @@ class TestLLaMA(unittest.TestCase):
                            False, 'float16', 4))  # GQA
         return test_cases
 
-    def custom_name_func(testcase_func, param_num, param):
-        return "%s_%s" % (
-            testcase_func.__name__,
-            parameterized.to_safe_name("_".join(str(x) for x in param.args)),
-        )
-
-    @parameterized.expand(load_test_cases, name_func=custom_name_func)
+    @parameterized.expand(load_test_cases, name_func=unittest_name_func)
     def test_llama(self, use_refit, fast_building, context_fmha_flag,
                    enable_remove_input_padding, dtype, num_kv_heads):
 
         # Skip tests that are not supported in pre-ampere architecture
-        if getSMVersion() < 80:
-            if context_fmha_flag == ContextFMHAType.enabled_with_fp32_acc:
-                pytest.skip(
-                    "ContextFMHAType with fp32 acc is not supported in pre-ampere architecture"
-                )
-            if dtype == 'bfloat16':
-                pytest.skip(
-                    "bfloat16 is not supported in pre-ampere architecture")
+        skip_bf16_pre_ampere(dtype)
+        skip_fp32_accum_pre_ampere(context_fmha_flag)
 
         PRECHECKED_GOOD_RANDOM_SEEDS = [1, 4, 5, 8]
         model = 'llama'
@@ -463,18 +450,7 @@ class TestLLaMA(unittest.TestCase):
                 ], [(8, 0), (8, 7)], [-1, 0, 1])))
         return test_cases
 
-    def loader_name_func(testcase_func, param_num, param):
-        expand_params = lambda params: '_'.join([
-            expand_params(x) if isinstance(x, (list, tuple)) else str(x)
-            for x in params
-        ])
-        name = expand_params(param.args)
-        return "%s_%s" % (
-            testcase_func.__name__,
-            parameterized.to_safe_name(name),
-        )
-
-    @parameterized.expand(get_loader_test_cases, name_func=loader_name_func)
+    @parameterized.expand(get_loader_test_cases, name_func=unittest_name_func)
     def test_loaders(self, paths, tp_info, emb_sharding_dim):
         model_root = llm_models_root()
         if model_root is None:
@@ -559,8 +535,6 @@ class TestLLaMA(unittest.TestCase):
             'moe_tp_mode': 1,
             'moe_normalization_mode': 1,
             'use_fused_mlp': False,
-            'enable_pos_shift': False,
-            'dense_context_fmha': False,
         }
         cfg = PretrainedConfig.from_dict(config)
         tensorrt_llm_llama_wHF = tensorrt_llm.models.LLaMAForCausalLM(cfg)

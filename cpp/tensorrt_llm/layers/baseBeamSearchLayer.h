@@ -113,8 +113,8 @@ private:
     void freeBuffer();
 };
 
-void update_indir_cache_kernelLauncher(int* tgt_indir_cache, const int* src_indir_cache, const int* beam_ids,
-    const tensorrt_llm::kernels::FinishedState* finished, int batch_dim, int beam_width, int max_seq_len, int ite,
+void update_indir_cache_kernelLauncher(int* tgt_indir_cache, int const* src_indir_cache, int const* beam_ids,
+    tensorrt_llm::kernels::FinishedState const* finished, int batch_dim, int beam_width, int max_seq_len, int ite,
     cudaStream_t stream);
 
 } // namespace layers

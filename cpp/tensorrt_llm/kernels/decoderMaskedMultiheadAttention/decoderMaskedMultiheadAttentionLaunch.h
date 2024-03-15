@@ -41,15 +41,15 @@ namespace mmha
 {
 
 template <typename T, int Dh, bool DO_MULTI_BLOCK, bool DO_CROSS_ATTENTION>
-inline size_t smem_size_in_bytes(const Multihead_attention_params<T, DO_CROSS_ATTENTION>& params, int threads_per_block)
+inline size_t smem_size_in_bytes(Multihead_attention_params<T, DO_CROSS_ATTENTION> const& params, int threads_per_block)
 {
     using Tk = typename kernel_type_t<T>::Type;
     // The amount of shared memory needed to store the Q*K^T values in float.
-    const int max_timesteps = DO_CROSS_ATTENTION
+    int const max_timesteps = DO_CROSS_ATTENTION
         ? params.cyclic_attention_window_size
         : min((DO_MULTI_BLOCK ? params.timesteps_per_block : params.timestep), params.cyclic_attention_window_size);
-    const auto qk_elts = static_cast<std::size_t>(divUp(max_timesteps + 1, 4)); // explicit cast because of the sign
-    const auto qk_sz = qk_elts * 16;
+    auto const qk_elts = static_cast<std::size_t>(divUp(max_timesteps + 1, 4)); // explicit cast because of the sign
+    auto const qk_sz = qk_elts * 16;
 
     // The extra memory needed if we are not using floats for the final logits.
     size_t logits_sz = 0;
@@ -92,7 +92,7 @@ inline size_t smem_size_in_bytes(const Multihead_attention_params<T, DO_CROSS_AT
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename T, int Dh, bool DO_CROSS_ATTENTION>
-inline void multi_block_grid_setup(dim3& grid, const Multihead_attention_params<T, DO_CROSS_ATTENTION>& params,
+inline void multi_block_grid_setup(dim3& grid, Multihead_attention_params<T, DO_CROSS_ATTENTION> const& params,
     int blocks_per_sm, int block_size, int tlength)
 {
     if (!params.multi_block_mode)
@@ -103,17 +103,17 @@ inline void multi_block_grid_setup(dim3& grid, const Multihead_attention_params<
     int balanced_seq_len_tile
         = mmha::divUp(params.multi_processor_count * blocks_per_sm, params.batch_size * params.num_heads);
 
-    const int threads_per_value = mmha::threads_per_value<T>(mmha::dh_max(Dh));
+    int const threads_per_value = mmha::threads_per_value<T>(mmha::dh_max(Dh));
     // Make sure that each block at least processes one loop of kv (unroll size is default at 8).
-    const int seq_len_per_kv_loop = mmha::divUp(block_size, threads_per_value) * 8;
+    int const seq_len_per_kv_loop = mmha::divUp(block_size, threads_per_value) * 8;
     int max_seq_len_tile = params.max_seq_len_tile;
 
-    const bool multi_block_debug_flag = getEnvMmhaMultiblockDebug();
+    bool const multi_block_debug_flag = getEnvMmhaMultiblockDebug();
 
     // User defined number of blocks.
     if (multi_block_debug_flag)
     {
-        const int env_seq_len_tile = getEnvMmhaBlocksPerSequence();
+        int const env_seq_len_tile = getEnvMmhaBlocksPerSequence();
         balanced_seq_len_tile = env_seq_len_tile > 0 ? env_seq_len_tile : balanced_seq_len_tile;
     }
     else
@@ -211,12 +211,12 @@ inline void multi_block_grid_setup(dim3& grid, const Multihead_attention_params<
 template <typename T, typename T_cache, typename TKcache, typename KVCacheBuffer, typename KCacheBuffer,
     typename KernelParamsType, int Dh, int THDS_PER_BLOCK, bool HAS_BEAMS, bool DO_MULTI_BLOCK, bool POS_SHIFT,
     bool IMPLICIT_REL_ATTN_BIAS>
-void mmha_launch_kernel_ex(const KernelParamsType& params, const KVCacheBuffer& kv_cache_buffer,
-    const KCacheBuffer& k_cache_buffer, const cudaStream_t& stream, int tlength)
+void mmha_launch_kernel_ex(KernelParamsType const& params, KVCacheBuffer const& kv_cache_buffer,
+    KCacheBuffer const& k_cache_buffer, cudaStream_t const& stream, int tlength)
 {
     dim3 grid{static_cast<unsigned>(params.num_heads), static_cast<unsigned>(params.batch_size), 1};
 
-    const int kernel_total_blocks = params.batch_size * params.num_heads;
+    int const kernel_total_blocks = params.batch_size * params.num_heads;
     // Don't tune the block size if batchxhead is large enough.
     // The max number of warps we can launch per SM is 32 limited by registers.
     if (kernel_total_blocks >= params.multi_processor_count * 4)
@@ -296,8 +296,8 @@ void mmha_launch_kernel_ex(const KernelParamsType& params, const KVCacheBuffer& 
 
 template <typename T, typename T_cache, typename KVCacheBuffer, typename KernelParamsType, int Dh, int THDS_PER_BLOCK,
     bool HAS_BEAMS, bool DO_MULTI_BLOCK, bool IMPLICIT_REL_ATTN_BIAS>
-void mmha_launch_kernel_dispatch_pos_shift(const KernelParamsType& params, const KVCacheBuffer& kv_cache_buffer,
-    const KVLinearBuffer& shift_k_cache, const cudaStream_t& stream, int tlength)
+void mmha_launch_kernel_dispatch_pos_shift(KernelParamsType const& params, KVCacheBuffer const& kv_cache_buffer,
+    KVLinearBuffer const& shift_k_cache, cudaStream_t const& stream, int tlength)
 {
     if (params.position_shift_enabled && !KernelParamsType::DO_CROSS_ATTENTION)
     {
@@ -315,8 +315,8 @@ void mmha_launch_kernel_dispatch_pos_shift(const KernelParamsType& params, const
 
 template <typename T, typename KVCacheBuffer, typename KernelParamsType, int Dh, int THDS_PER_BLOCK, bool HAS_BEAMS,
     bool DO_MULTI_BLOCK, bool IMPLICIT_REL_ATTN_BIAS>
-void mmha_launch_kernel_dispatch_8bits_kv_cache(const KernelParamsType& params, const KVCacheBuffer& kv_cache_buffer,
-    const KVLinearBuffer& shift_k_cache, const cudaStream_t& stream, int tlength)
+void mmha_launch_kernel_dispatch_8bits_kv_cache(KernelParamsType const& params, KVCacheBuffer const& kv_cache_buffer,
+    KVLinearBuffer const& shift_k_cache, cudaStream_t const& stream, int tlength)
 {
     if (params.int8_kv_cache)
     {
@@ -339,8 +339,8 @@ void mmha_launch_kernel_dispatch_8bits_kv_cache(const KernelParamsType& params, 
 
 template <typename T, typename KVCacheBuffer, typename KernelParamsType, int Dh, bool HAS_BEAMS,
     bool IMPLICIT_REL_ATTN_BIAS>
-void mmha_launch_kernel_dispatch(const KernelParamsType& params, const KVCacheBuffer& kv_cache_buffer,
-    const KVLinearBuffer& shift_k_cache, const cudaStream_t& stream)
+void mmha_launch_kernel_dispatch(KernelParamsType const& params, KVCacheBuffer const& kv_cache_buffer,
+    KVLinearBuffer const& shift_k_cache, cudaStream_t const& stream)
 {
     int const tlength = params.timestep;
     if (params.multi_block_mode)
@@ -356,8 +356,8 @@ void mmha_launch_kernel_dispatch(const KernelParamsType& params, const KVCacheBu
 }
 
 template <typename T, typename KVCacheBuffer, typename KernelParamsType, int Dh, bool IMPLICIT_REL_ATTN_BIAS>
-void mmha_launch_kernel(const KernelParamsType& params, const KVCacheBuffer& kv_cache_buffer,
-    const KVLinearBuffer& shift_k_cache, const cudaStream_t& stream)
+void mmha_launch_kernel(KernelParamsType const& params, KVCacheBuffer const& kv_cache_buffer,
+    KVLinearBuffer const& shift_k_cache, cudaStream_t const& stream)
 {
     assert((params.rotary_embedding_dim != 0)
         == (params.position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX

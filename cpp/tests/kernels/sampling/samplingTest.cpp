@@ -41,290 +41,345 @@ void SamplingKernelTest<T>::TearDown()
 }
 
 template <typename T>
-void SamplingKernelTest<T>::allocateBuffers(
-    int32_t batchSize, int32_t maxBatchSize, int32_t vocabSize, int32_t maxSeqLen, int32_t outputLen)
+void SamplingKernelTest<T>::allocateBuffers(SamplingKernelTestParam const& param)
 {
+    auto const batchSize = param.batchSize;
+    auto const maxBatchSize = 2 * batchSize;
+    auto const vocabSize = param.vocabSize;
+    auto const maxTokensPerStep = param.maxTokensPerStep;
+
     auto const dataType = TRTDataType<T>::value;
     auto const ptrType = TRTDataType<T*>::value;
 
     // Allocate GPU data
-    mSeqLengthsHost = mBufferManager->pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
+    mSeqLengthsHost = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
     mSeqLengthsDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
 
-    mFinishedHost = mBufferManager->pinned(
+    mFinishedHost = BufferManager::pinned(
         ITensor::makeShape({maxBatchSize}), TRTDataType<tk::FinishedState::UnderlyingType>::value);
     mFinishedDevice = mBufferManager->gpu(
         ITensor::makeShape({maxBatchSize}), TRTDataType<tk::FinishedState::UnderlyingType>::value);
 
-    mOutputIdsHost = mBufferManager->pinned(ITensor::makeShape({maxBatchSize, maxSeqLen}), nvinfer1::DataType::kINT32);
-    mOutputIdsDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize, maxSeqLen}), nvinfer1::DataType::kINT32);
+    mOutputIdsHost = BufferManager::pinned(ITensor::makeShape({maxBatchSize, mMaxSeqLen}), nvinfer1::DataType::kINT32);
+    mOutputIdsDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize, mMaxSeqLen}), nvinfer1::DataType::kINT32);
 
-    mProbsHost = mBufferManager->pinned(ITensor::makeShape({batchSize, vocabSize}), dataType);
-    mProbsDevice = mBufferManager->gpu(ITensor::makeShape({batchSize, vocabSize}), dataType);
+    mProbsHost = BufferManager::pinned(ITensor::makeShape({batchSize, maxTokensPerStep, vocabSize}), dataType);
+    mProbsDevice = mBufferManager->gpu(ITensor::makeShape({batchSize, maxTokensPerStep, vocabSize}), dataType);
+    mProbsPtrsDevice
+        = BufferManager::pinned(ITensor::makeShape({batchSize, maxTokensPerStep}), nvinfer1::DataType::kINT64);
 
     mCumLogProbsDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
     mOutputLogProbsDevice
-        = mBufferManager->gpu(ITensor::makeShape({maxSeqLen, maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = mBufferManager->gpu(ITensor::makeShape({mMaxSeqLen, maxBatchSize}), nvinfer1::DataType::kFLOAT);
 
     mZeroParentIdsDevice
-        = mBufferManager->gpu(ITensor::makeShape({maxBatchSize, maxSeqLen}), nvinfer1::DataType::kINT32);
+        = mBufferManager->gpu(ITensor::makeShape({maxBatchSize, maxTokensPerStep}), nvinfer1::DataType::kINT32);
     mTopPIdValsDevice = mBufferManager->gpu(ITensor::makeShape({batchSize, vocabSize}), nvinfer1::DataType::kINT32);
     mBeginOffsetsDevice = mBufferManager->gpu(ITensor::makeShape({batchSize + 1}), nvinfer1::DataType::kINT32);
     mEndOffsetsDevice = mBufferManager->gpu(ITensor::makeShape({batchSize + 1}), nvinfer1::DataType::kINT32);
 
-    mLogitsHost = mBufferManager->pinned(ITensor::makeShape({batchSize, vocabSize}), dataType);
-    mLogProbsHost = mBufferManager->pinned(ITensor::makeShape({batchSize, vocabSize}), dataType);
-    mIdsPtrHost = mBufferManager->pinned(ITensor::makeShape({2 * maxBatchSize}), ptrType);
+    mLogitsHost = BufferManager::pinned(ITensor::makeShape({batchSize, maxTokensPerStep, vocabSize}), dataType);
+    mLogProbsHost = BufferManager::pinned(ITensor::makeShape({batchSize, maxTokensPerStep, vocabSize}), dataType);
+    mIdsPtrHost = BufferManager::pinned(ITensor::makeShape({2 * maxBatchSize}), ptrType);
 
-    mEndIdsHost = mBufferManager->pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
+    mEndIdsHost = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
     mEndIdsDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
 
-    mTopPsHost = mBufferManager->pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+    mTopPsHost = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
     mTopPsDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
 
-    mTopKsHost = mBufferManager->pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
+    mTopKsHost = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
     mTopKsDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
 
-    mSkipDecodeHost = mBufferManager->pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kBOOL);
+    mSkipDecodeHost = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kBOOL);
     mSkipDecodeDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kBOOL);
 
-    mBatchSlots = mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
+    mTokensPerStep = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
 
-    mExpectedCumLogProbsHost = mBufferManager->pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+    mBatchSlots = BufferManager::pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
+
+    mExpectedCumLogProbsHost = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+
+    mCurandStatesDevice
+        = mBufferManager->gpu(ITensor::makeShape({maxBatchSize, sizeof(curandState_t)}), nvinfer1::DataType::kINT8);
 }
 
 template <typename T>
-void SamplingKernelTest<T>::setupBuffers(int32_t batchSize, int32_t maxBatchSize, int32_t vocabSize, int32_t maxSeqLen,
-    int32_t outputLen, int32_t topK, float topP, bool useSkipDecode, bool hasDiffRuntimeArgs, std::mt19937& gen,
-    std::uniform_int_distribution<>& endIdsDistr)
+void SamplingKernelTest<T>::setupBuffers(SamplingKernelTestParam const& param)
 {
+    auto const batchSize = param.batchSize;
+    auto const maxBatchSize = 2 * batchSize;
+    auto const vocabSize = param.vocabSize;
+    auto const maxTokensPerStep = param.maxTokensPerStep;
+
+    auto const topK = param.topK;
+    auto const topP = param.topP;
+
+    std::mt19937 gen(42);
+
     auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
+    auto probsPtr = BufferRange<T*>(*mProbsPtrsDevice);
+    auto probsDevicePtr = bufferCast<T>(*mProbsDevice);
     for (SizeType bi = 0; bi < batchSize; ++bi)
     {
         batchSlotsPtr[bi] = 2 * bi;
+        for (SizeType ti = 0; ti < maxTokensPerStep; ++ti)
+        {
+            probsPtr[bi * maxTokensPerStep + ti] = probsDevicePtr + bi * maxTokensPerStep * vocabSize + ti * vocabSize;
+        }
     }
 
     // Allocate and init curand states
-    cudaMalloc(&mCurandStatesDevice, sizeof(curandState_t) * maxBatchSize);
-    tk::invokeCurandInitialize(mCurandStatesDevice, batchSlotsPtr, batchSize, mSeed, mStream->get());
+    tk::invokeCurandInitialize(reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*mCurandStatesDevice)),
+        batchSlotsPtr, batchSize, mSeed, mStream->get());
 
-    std::uniform_real_distribution<> skipDecodeDist(0, 1); // uniform distribution between 0 and 1
-    std::uniform_real_distribution<> topPDist(0, 1);       // uniform distribution between 0 and 1
-    std::uniform_int_distribution<> topKDist(1, std::min(1024, vocabSize));
+    std::uniform_int_distribution<> endIdsDistr(
+        0, vocabSize - 1); // -1 because uniform_int_distribution generates closed interval
+    std::uniform_real_distribution<> skipDecodeDist(0, 1);
+    std::uniform_real_distribution<> topPDist(0, topP);
+    std::uniform_int_distribution<> topKDist(1, topK);
+    std::uniform_int_distribution<> tokensPerStepDist(1, maxTokensPerStep);
+    std::uniform_int_distribution<> seqLenDist(0, mMaxSeqLen - maxTokensPerStep);
+    std::uniform_real_distribution<> logProbDist(-3.f, 3.f);
+    std::uniform_real_distribution<> finishedDist(0, 1);
 
     // Init by zero.
-    trk::invokeFill(*mSeqLengthsDevice, int32_t{0}, *mStream);
     trk::invokeFill(*mFinishedDevice, uint8_t{0}, *mStream);
-    trk::invokeFill(*mCumLogProbsDevice, float{0.0f}, *mStream);
     trk::invokeFill(*mOutputLogProbsDevice, float{0.0f}, *mStream);
     trk::invokeFill(*mZeroParentIdsDevice, int32_t{0}, *mStream);
     trk::invokeFill(*mOutputIdsDevice, int32_t{0}, *mStream);
-    std::fill_n(bufferCast<float>(*mExpectedCumLogProbsHost), maxBatchSize, 0);
 
     // Init topK, topP and endIds for each request in batch
     auto skipDecodeHostPtr = bufferCast<bool>(*mSkipDecodeHost);
     auto topPsHostPtr = bufferCast<float>(*mTopPsHost);
     auto topKsHostPtr = bufferCast<int32_t>(*mTopKsHost);
     auto endIdsHostPtr = bufferCast<int32_t>(*mEndIdsHost);
+    auto tokensPerStepPtr = bufferCast<int32_t>(*mTokensPerStep);
+    auto finishedHostPtr
+        = reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*mFinishedHost));
     for (SizeType bi = 0; bi < maxBatchSize; ++bi)
     {
         endIdsHostPtr[bi] = endIdsDistr(gen);
-        skipDecodeHostPtr[bi] = useSkipDecode ? skipDecodeDist(gen) > 0.8 : false;
-        topKsHostPtr[bi] = hasDiffRuntimeArgs ? topKDist(gen) : topK;
-        topPsHostPtr[bi] = hasDiffRuntimeArgs ? topPDist(gen) : topP;
+        skipDecodeHostPtr[bi] = skipDecodeDist(gen) > 0.8;
+        topPsHostPtr[bi] = topPDist(gen);
+        topKsHostPtr[bi] = topKDist(gen);
+        tokensPerStepPtr[bi] = tokensPerStepDist(gen);
+        finishedHostPtr[bi] = finishedDist(gen) > 0.8 ? tk::FinishedState::finished() : tk::FinishedState::empty();
     }
-    mMaxTopK = *std::max_element(topKsHostPtr, topKsHostPtr + maxBatchSize);
-    mMaxTopP = *std::max_element(topPsHostPtr, topPsHostPtr + maxBatchSize);
+    mMaxTopK = topK;
+    mMaxTopP = topP;
+
+    TLLM_CHECK(mMaxTopK * maxTokensPerStep <= mMaxSeqLen);
 
     // Setup pointers to output ids for each request in batch
     auto idsPtrHostPtr = BufferRange<void*>(*mIdsPtrHost);
     auto outputIdsDevicePtr = bufferCast<int32_t>(*mOutputIdsDevice);
     auto zeroParentIdsDevicePtr = bufferCast<int32_t>(*mZeroParentIdsDevice);
+    auto seqLensHostPtr = bufferCast<int32_t>(*mSeqLengthsHost);
+    auto logProbHostPtr = bufferCast<float>(*mExpectedCumLogProbsHost);
     for (SizeType bi = 0; bi < maxBatchSize; bi++)
     {
-        idsPtrHostPtr[bi] = outputIdsDevicePtr + bi * maxSeqLen;
+        idsPtrHostPtr[bi] = outputIdsDevicePtr + bi * mMaxSeqLen;
+        idsPtrHostPtr[maxBatchSize + bi] = zeroParentIdsDevicePtr + bi * mMaxSeqLen;
     }
+
     for (SizeType bi = 0; bi < maxBatchSize; bi++)
     {
-        idsPtrHostPtr[maxBatchSize + bi] = zeroParentIdsDevicePtr + bi * maxSeqLen;
+        seqLensHostPtr[bi] = seqLenDist(gen);
+        logProbHostPtr[bi] = logProbDist(gen);
     }
 
     mBufferManager->copy(*mEndIdsHost, *mEndIdsDevice);
     mBufferManager->copy(*mSkipDecodeHost, *mSkipDecodeDevice);
     mBufferManager->copy(*mTopPsHost, *mTopPsDevice);
     mBufferManager->copy(*mTopKsHost, *mTopKsDevice);
+    mBufferManager->copy(*mSeqLengthsHost, *mSeqLengthsDevice);
+    mBufferManager->copy(*mExpectedCumLogProbsHost, *mCumLogProbsDevice);
+    mBufferManager->copy(*mFinishedHost, *mFinishedDevice);
+
+    // Init logits randomly
+    auto logitsHostPtr = bufferCast<T>(*mLogitsHost);
+    initRandom(logitsHostPtr, batchSize * maxTokensPerStep * vocabSize, -3.0f, 3.0f);
+
+    // Only in greedy search we can guarantee the selected token and stop by condition
+    if (topK == 1)
+    {
+        for (SizeType bi = 0; bi < batchSize; ++bi)
+        {
+            auto const batchSlot = batchSlotsPtr[bi];
+            for (int32_t ti = 0; ti < maxTokensPerStep; ++ti)
+            {
+                // Set logit of the endId for the finished request to the value above others
+                // NOTE that we can guarantee finish only in greedy search
+                logitsHostPtr[(bi * maxTokensPerStep + ti) * vocabSize + endIdsHostPtr[batchSlot]] = 4.0f;
+            }
+        }
+    }
+
+    // Compute probabilities for each token
+    computeProb(bufferCast<T>(*mProbsHost), logitsHostPtr, batchSize * maxTokensPerStep, vocabSize);
+    mBufferManager->copy(*mProbsHost, *mProbsDevice);
 }
 
 template <typename T>
-void SamplingKernelTest<T>::verifyCurrentStep(int32_t batchSize, int32_t maxBatchSize, int32_t vocabSize,
-    int32_t maxSeqLen, int32_t step, bool greedySearch, bool useSkipDecode, bool hasDiffRuntimeArgs,
-    std::vector<tk::FinishedState>& refFinished, std::vector<int32_t>& refSeqLength,
-    std::vector<tk::FinishedState> const& finishedCurrentStep)
+std::vector<SizeType> SamplingKernelTest<T>::computeTopKTopPVariants(
+    int32_t bi, int32_t batchSlot, int32_t ti, int32_t maxTokensPerStep, int32_t vocabSize)
 {
+    std::vector<SizeType> allowedTokens;
+    auto probsPtr = bufferCast<T>(*mProbsHost) + (bi * maxTokensPerStep + ti) * vocabSize;
+    std::vector<SizeType> indices(vocabSize);
+    std::iota(indices.begin(), indices.end(), 0);
+    std::sort(
+        indices.begin(), indices.end(), [probsPtr](SizeType i1, SizeType i2) { return probsPtr[i1] > probsPtr[i2]; });
+
+    auto topK = bufferCast<int32_t>(*mTopKsHost)[batchSlot];
+    auto topP = bufferCast<float>(*mTopPsHost)[batchSlot];
+
+    allowedTokens.insert(allowedTokens.begin(), indices.begin(), indices.begin() + topK);
+    float totalProb = 0.f;
+    SizeType idx = 0;
+    while (totalProb < topP && idx < vocabSize)
+    {
+        allowedTokens.push_back(indices[idx]);
+        totalProb += static_cast<float>(probsPtr[indices[idx++]]);
+    }
+    return allowedTokens;
+}
+
+template <typename T>
+void SamplingKernelTest<T>::verifyResult(SamplingKernelTestParam const& param)
+{
+    auto const batchSize = param.batchSize;
+    auto const vocabSize = param.vocabSize;
+    auto const maxTokensPerStep = param.maxTokensPerStep;
+
+    auto const outputIdsHost = mBufferManager->copyFrom(*mOutputIdsDevice, MemoryType::kCPU);
+    auto const seqLenHost = mBufferManager->copyFrom(*mSeqLengthsDevice, MemoryType::kCPU);
+    auto const finishedHost = mBufferManager->copyFrom(*mFinishedDevice, MemoryType::kCPU);
+    auto const cumLogProbsHost = mBufferManager->copyFrom(*mCumLogProbsDevice, MemoryType::kCPU);
+
+    // Synchronize to get valid data on Host
+    mStream->synchronize();
+
+    // Compute reference.
+    computeLogProb(bufferCast<T>(*mLogProbsHost), bufferCast<T>(*mLogitsHost), batchSize * maxTokensPerStep, vocabSize);
+
     auto const batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
-    auto const outputIdsHostPtr = bufferCast<int32_t>(*mOutputIdsHost);
-    auto const seqLengthsHostPtr = bufferCast<int32_t>(*mSeqLengthsHost);
+
+    auto const outputIdsHostPtr = bufferCast<int32_t>(*outputIdsHost);
+    auto const seqLengthsHostPtr = bufferCast<int32_t>(*seqLenHost);
     auto const finishedHostPtr
+        = reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*finishedHost));
+
+    auto const outputIdsOrigHostPtr = bufferCast<int32_t>(*mOutputIdsHost);
+    auto const seqLengthsOrigHostPtr = bufferCast<int32_t>(*mSeqLengthsHost);
+    auto const finishedOrigHostPtr
         = reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*mFinishedHost));
+
     auto const logProbsHostPtr = bufferCast<T>(*mLogProbsHost);
     auto const endIdsHostPtr = bufferCast<int32_t>(*mEndIdsHost);
     auto const skipDecodeHostPtr = bufferCast<bool>(*mSkipDecodeHost);
+    auto const tokensPerStepPtr = bufferCast<int32_t>(*mTokensPerStep);
     auto const expectedCumLogProbsHostPtr = bufferCast<float>(*mExpectedCumLogProbsHost);
 
     for (SizeType bi = 0; bi < batchSize; ++bi)
     {
         auto const batchSlot = batchSlotsPtr[bi];
-        // Set reference finished state to true if we finished before or at current step
-        bool const generatedEOS = outputIdsHostPtr[batchSlot * maxSeqLen + step] == endIdsHostPtr[batchSlot];
-        bool finishedThisStep = finishedCurrentStep[batchSlot].isFinished() || generatedEOS;
-        refFinished[batchSlot] = generatedEOS ? tk::FinishedState::finishedEOS() : refFinished[batchSlot];
-
-        if (!refFinished[batchSlot].isFinished())
+        auto const tokensPerStep = tokensPerStepPtr[batchSlot];
+        for (SizeType ti = 0; ti < tokensPerStep; ++ti)
         {
-            // Increase reference seq len excluding the EOS token
-            refSeqLength[batchSlot]++;
+            auto kResults = param.returnAllTopK ? bufferCast<int32_t>(*mTopKsHost)[batchSlot] : 1;
+
+            for (SizeType ki = 0; ki < kResults; ++ki)
+            {
+                // Set reference finished state to true if we finished before or at current step
+                auto const idsIdx = param.returnAllTopK ? ti * mMaxTopK + ki : seqLengthsOrigHostPtr[batchSlot] + ti;
+                auto const outputId = outputIdsHostPtr[batchSlot * mMaxSeqLen + idsIdx];
+                // Check the range of the returned token ([0, vocabSize))
+                EXPECT_TRUE((outputId >= 0) && (outputId < vocabSize));
+                bool const generatedEOS = outputId == endIdsHostPtr[batchSlot];
+
+                // If decoding for this batch is skipped ignore cumLog calculation
+                if (!skipDecodeHostPtr[batchSlot] && !finishedOrigHostPtr[batchSlot].isFinished()
+                    && !finishedOrigHostPtr[batchSlot].isSkipDecoding())
+                {
+                    if (maxTokensPerStep == 1 && !param.returnAllTopK)
+                    {
+                        if (generatedEOS)
+                        {
+                            EXPECT_EQ(seqLengthsHostPtr[batchSlot], seqLengthsOrigHostPtr[batchSlot]);
+                            EXPECT_TRUE(finishedHostPtr[batchSlot].isFinished());
+                        }
+                        else
+                        {
+                            EXPECT_EQ(seqLengthsHostPtr[batchSlot], seqLengthsOrigHostPtr[batchSlot] + tokensPerStep);
+                            EXPECT_EQ(
+                                finishedHostPtr[batchSlot].isFinished(), finishedOrigHostPtr[batchSlot].isFinished());
+                        }
+                    }
+
+                    auto topKTopPVariants = computeTopKTopPVariants(bi, batchSlot, ti, maxTokensPerStep, vocabSize);
+
+                    bool found = false;
+                    for (auto const& var : topKTopPVariants)
+                    {
+                        if (outputId == var)
+                        {
+                            found = true;
+                            break;
+                        }
+                    }
+                    EXPECT_TRUE(found) << "Incorrect output id token";
+
+                    // Compute reference cumLogProb by summing all logProbs up to the stop token
+                    expectedCumLogProbsHostPtr[batchSlot]
+                        += static_cast<float>(logProbsHostPtr[bi * vocabSize + outputId]);
+                }
+                else
+                {
+                    // Check that tensors are not modified
+                    auto const idsIdx = batchSlot * mMaxSeqLen + seqLengthsOrigHostPtr[batchSlot] + ti;
+                    EXPECT_EQ(outputId, outputIdsOrigHostPtr[idsIdx]);
+                    EXPECT_EQ(seqLengthsHostPtr[batchSlot], seqLengthsOrigHostPtr[batchSlot]);
+                    EXPECT_EQ(finishedHostPtr[batchSlot].isFinished(), finishedOrigHostPtr[batchSlot].isFinished());
+                }
+            }
         }
+    }
 
-        // If decoding for this batch is skipped ignore cumLog calculation
-        if (!skipDecodeHostPtr[batchSlot])
+    // Cum log probs is not supported for multiple tokens per step or all top K return
+    if (maxTokensPerStep == 1 && !param.returnAllTopK)
+    {
+        for (int32_t bi = 0; bi < batchSize; ++bi)
         {
-            // Check seq len correctness
-            EXPECT_EQ(seqLengthsHostPtr[batchSlot], refSeqLength[batchSlot]);
-            // Only in greedy search we can guarantee the selected token and stop by condition
-            if (greedySearch)
-            {
-                EXPECT_EQ(finishedHostPtr[batchSlot].isFinished(), refFinished[batchSlot].isFinished());
-            }
-
-            // Check the range of the returned token ([0, vocabSize))
-            auto const outputId = outputIdsHostPtr[batchSlot * maxSeqLen + step];
-            EXPECT_TRUE((outputId >= 0) && (outputId < vocabSize));
-            int idx = bi * vocabSize + outputId;
-
-            // Compute reference cumLogProb by summing all logProbs up to the stop token
-            expectedCumLogProbsHostPtr[batchSlot]
-                += step < refSeqLength[batchSlot] || finishedThisStep ? (float) logProbsHostPtr[idx] : 0.0f;
-            // If sequence has just finished at this step
-            if (finishedHostPtr[batchSlot].isFinished() && step < seqLengthsHostPtr[batchSlot])
-            {
-                // Check that finished tokens is endId
-                EXPECT_EQ(outputIdsHostPtr[batchSlot * maxSeqLen + step], endIdsHostPtr[batchSlot])
-                    << "step: " << step << " b: " << bi << " hasDiffRuntimeArgs: " << hasDiffRuntimeArgs
-                    << " useSkipDecode: " << useSkipDecode;
-            }
-            // TODO(nkorobov): check correctness with K>1
+            auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
+            auto const batchSlot = batchSlotsPtr[bi];
+            bool passed = checkResult("cum log probs", bufferCast<float>(*cumLogProbsHost) + batchSlot,
+                bufferCast<float>(*mExpectedCumLogProbsHost) + batchSlot, 1);
+            EXPECT_TRUE(passed);
         }
     }
 }
 
 template <typename T>
-void SamplingKernelTest<T>::runTest(const SamplingKernelTestParam& param, bool hasDiffRuntimeArgs, bool useSkipDecode)
+void SamplingKernelTest<T>::runTest(SamplingKernelTestParam const& param)
 {
-    auto const batchSize = param.batchSize;
-    auto const maxBatchSize = 2 * batchSize;
-    auto const vocabSize = param.vocabSize;
-    auto const outputLen = param.outputLen;
-    auto const maxSeqLen = outputLen;
-
-    auto const topK = param.topK;
-    auto const topP = param.topP;
-
-    bool const greedySearch = topK == 1 && hasDiffRuntimeArgs == false && useSkipDecode == false;
-
-    std::mt19937 gen(42);
-    std::uniform_real_distribution<> finishedDist(0, 1); // uniform distribution between 0 and 1
-    std::uniform_int_distribution<> endIdsDistr(
-        0, vocabSize - 1); // -1 because uniform_int_distribution generates closed interval
-
     // Allocate buffers
-    allocateBuffers(batchSize, maxBatchSize, vocabSize, maxSeqLen, outputLen);
+    allocateBuffers(param);
 
     // Setup buffers
-    setupBuffers(batchSize, maxBatchSize, vocabSize, maxSeqLen, outputLen, topK, topP, useSkipDecode,
-        hasDiffRuntimeArgs, gen, endIdsDistr);
-    auto const batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
+    setupBuffers(param);
 
-    // Allocate internal state holders for reference
-    std::vector<int32_t> refSeqLength(maxBatchSize);
-    std::vector<tk::FinishedState> refFinished(maxBatchSize, tk::FinishedState::empty());
-
-    // retrieve the workspace size of the sampling kernel.
+    // Retrieve the workspace size of the sampling kernel.
     auto const workspaceSize = getWorkspaceSize(param);
     TensorPtr workspaceDevice
         = mBufferManager->gpu(ITensor::makeShape({static_cast<int32_t>(workspaceSize)}), nvinfer1::DataType::kINT8);
 
-    for (size_t step = 0; step < outputLen; ++step)
-    {
-        // Init logits randomly
-        auto logitsHostPtr = bufferCast<T>(*mLogitsHost);
-        auto endIdsHostPtr = bufferCast<int32_t>(*mEndIdsHost);
-        initRandom(logitsHostPtr, batchSize * vocabSize, -3.0f, 3.0f);
+    // Call tested function sampling
+    callTestedFunction(param, workspaceDevice);
 
-        std::vector<tk::FinishedState> finishedCurrentStep(maxBatchSize, tk::FinishedState::empty());
-        // Only in greedy search we can guarantee the selected token and stop by condition
-        if (greedySearch)
-        {
-            for (SizeType bi = 0; bi < batchSize; ++bi)
-            {
-                auto const batchSlot = batchSlotsPtr[bi];
-                // Randomly decide if the sequence finishes at current step
-                finishedCurrentStep[batchSlot]
-                    = (refFinished[batchSlot].isFinished() == false && finishedDist(gen) < 0.1)
-                    ? tk::FinishedState::finishedEOS()
-                    : tk::FinishedState::empty();
-
-                if (finishedCurrentStep[batchSlot].isFinished())
-                {
-                    // Set logit of the endId for the finished request to the value above others
-                    // NOTE that we can guarantee finish only in greedy search
-                    logitsHostPtr[bi * vocabSize + endIdsHostPtr[batchSlot]] = 4.0f;
-                }
-            }
-        }
-
-        // Compute probobilities for each token
-        computeProb(bufferCast<T>(*mProbsHost), bufferCast<T>(*mLogitsHost), batchSize, vocabSize);
-        mBufferManager->copy(*mProbsHost, *mProbsDevice);
-
-        // Call tested function sampling
-        callTestedFunction(param, hasDiffRuntimeArgs, workspaceSize, workspaceDevice);
-
-        mBufferManager->copy(*mOutputIdsDevice, *mOutputIdsHost);
-        mBufferManager->copy(*mSeqLengthsDevice, *mSeqLengthsHost);
-        mBufferManager->copy(*mFinishedDevice, *mFinishedHost);
-
-        // Synchronize to get valid data on Host
-        mStream->synchronize();
-
-        // Compute reference.
-        computeLogProb(bufferCast<T>(*mLogProbsHost), bufferCast<T>(*mLogitsHost), batchSize, vocabSize);
-
-        verifyCurrentStep(batchSize, maxBatchSize, vocabSize, maxSeqLen, step, greedySearch, useSkipDecode,
-            hasDiffRuntimeArgs, refFinished, refSeqLength, finishedCurrentStep);
-    }
-    auto const cumLogProbsHost = mBufferManager->copyFrom(*mCumLogProbsDevice, MemoryType::kCPU);
-
-    mStream->synchronize();
-
-    for (int32_t bi = 0; bi < batchSize; ++bi)
-    {
-        auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
-        auto const batchSlot = batchSlotsPtr[bi];
-        bool passed = checkResult(param.toString(), bufferCast<float>(*cumLogProbsHost) + batchSlot,
-            bufferCast<float>(*mExpectedCumLogProbsHost) + batchSlot, 1);
-        EXPECT_TRUE(passed);
-    }
-
-    cudaFree(mCurandStatesDevice);
-}
-
-template <typename T>
-void SamplingKernelTest<T>::runTest(const SamplingKernelTestParam& param)
-{
-    runTest(param, false, false); // Single params, do not skip decoders
-    runTest(param, true, false);  // Different params, do not skip decoders
-    runTest(param, false, true);  // Single params, skip some decoders
-    runTest(param, true, true);   // Different params, skip some decoders
+    // Verify results
+    verifyResult(param);
 }
 
 template class SamplingKernelTest<float>;

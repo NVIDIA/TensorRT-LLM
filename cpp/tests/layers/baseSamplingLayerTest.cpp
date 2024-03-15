@@ -167,7 +167,7 @@ bool BaseSamplingLayerTest<T>::checkResult(int32_t* outputIds, std::vector<std::
         int32_t b = i % mBatchBeam;
         auto const batchSlot = batchSlotsPtr[b];
         std::set<int32_t> expts = expectedIds.at(i);
-        const auto outputId = outputIds[batchSlot * mMaxSeqLen + s];
+        auto const outputId = outputIds[batchSlot * mMaxSeqLen + s];
         if (expts.count(outputId) == 0)
         {
             if (failures < 10)
@@ -214,7 +214,7 @@ void BaseSamplingLayerTest<T>::runTest(
             mStream->synchronize();
         }
 
-        const auto outputIdsHost = mBufferManager->copyFrom(*mOutputIdsDevice, tensorrt_llm::runtime::MemoryType::kCPU);
+        auto const outputIdsHost = mBufferManager->copyFrom(*mOutputIdsDevice, tensorrt_llm::runtime::MemoryType::kCPU);
 
         mStream->synchronize();
 

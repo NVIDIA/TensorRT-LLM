@@ -51,7 +51,7 @@ std::unique_ptr<trt::IHostMemory> buildMnistEngine(trt::ILogger& logger)
 {
     EXPECT_TRUE(fs::exists(MNIST_MODEL_PATH));
     auto builder = makeUnique(trt::createInferBuilder(logger));
-    const auto explicitBatch = 1U << static_cast<uint32_t>(trt::NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
+    auto const explicitBatch = 1U << static_cast<uint32_t>(trt::NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
     auto network = makeUnique(builder->createNetworkV2(explicitBatch));
     auto parser = makeUnique(nvonnxparser::createParser(*network, logger));
     auto const parsingSuccess = parser->parseFromFile(

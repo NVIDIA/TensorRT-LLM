@@ -271,6 +271,7 @@ class QWenInfer(object):
         prompt_table=None,
         tasks=None,
         task_vocab_size=None,
+        num_beams=1,
     ):
         input_ids = None
         input_lengths = None
@@ -283,9 +284,12 @@ class QWenInfer(object):
         max_input_length = torch.max(input_lengths).item()
         max_new_tokens = min(max_new_tokens,
                              self.global_max_input_len - max_input_length)
-        self.decoder.setup(batch_size=input_lengths.size(0),
-                           max_context_length=max_input_length,
-                           max_new_tokens=max_new_tokens)
+        self.decoder.setup(
+            batch_size=input_lengths.size(0),
+            max_context_length=max_input_length,
+            max_new_tokens=max_new_tokens,
+            beam_width=num_beams,
+        )
         profiler.start("QWen")
         run_time = 1
         for _ in range(run_time):
@@ -303,6 +307,7 @@ class QWenInfer(object):
                    images_path,
                    input_text,
                    max_new_tokens,
+                   num_beams=1,
                    history=None):
         if images_path is None:
             content_list = []
@@ -337,7 +342,8 @@ class QWenInfer(object):
             input_vit, dtype, self.config.hidden_size, None, input_ids)
 
         output_ids, Qwen_time = self.generate_for_qwenvl(
-            input_ids, max_new_tokens, prompt_table, tasks, task_vocab_size)
+            input_ids, max_new_tokens, prompt_table, tasks, task_vocab_size,
+            num_beams)
 
         runtime_rank = tensorrt_llm.mpi_rank()
         input_lengths = torch.tensor([input_ids.size(1)],
@@ -488,4 +494,5 @@ if __name__ == '__main__':
                       args.images_path,
                       args.input_text,
                       args.max_new_tokens,
+                      args.num_beams,
                       history=[])

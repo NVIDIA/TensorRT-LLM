@@ -40,16 +40,16 @@ template <typename T>
 void deviceFill(T* devptr, size_t size, T value, cudaStream_t stream = 0);
 
 template <typename T>
-void cudaD2Hcpy(T* tgt, const T* src, const size_t size);
+void cudaD2Hcpy(T* tgt, T const* src, const size_t size);
 
 template <typename T>
-void cudaH2Dcpy(T* tgt, const T* src, const size_t size);
+void cudaH2Dcpy(T* tgt, T const* src, const size_t size);
 
 template <typename T>
-void cudaD2Dcpy(T* tgt, const T* src, const size_t size, cudaStream_t stream = NULL);
+void cudaD2Dcpy(T* tgt, T const* src, const size_t size, cudaStream_t stream = NULL);
 
 template <typename T>
-void cudaAutoCpy(T* tgt, const T* src, const size_t size, cudaStream_t stream = NULL);
+void cudaAutoCpy(T* tgt, T const* src, const size_t size, cudaStream_t stream = NULL);
 
 template <typename T>
 void cudaRandomUniform(T* buffer, const size_t size);
@@ -234,9 +234,9 @@ void invokeCudaD2DcpyConvert(T_OUT* tgt, const T_IN* src, const size_t size, cud
 
 template <typename T_IN, typename T_OUT>
 void invokeCudaD2DScaleCpyConvert(
-    T_OUT* tgt, const T_IN* src, const float* scale, bool invert_scale, const size_t size, cudaStream_t stream = 0);
+    T_OUT* tgt, const T_IN* src, float const* scale, bool invert_scale, const size_t size, cudaStream_t stream = 0);
 
-inline bool checkIfFileExist(const std::string& file_path)
+inline bool checkIfFileExist(std::string const& file_path)
 {
     std::ifstream in(file_path, std::ios::in | std::ios::binary);
     if (in.is_open())
@@ -248,7 +248,7 @@ inline bool checkIfFileExist(const std::string& file_path)
 }
 
 template <typename T>
-void saveToBinary(const T* ptr, const size_t size, std::string filename);
+void saveToBinary(T const* ptr, const size_t size, std::string filename);
 
 template <typename T_IN, typename T_fake_type>
 void invokeFakeCast(T_IN* input_ptr, const size_t size, cudaStream_t stream);
@@ -256,10 +256,10 @@ void invokeFakeCast(T_IN* input_ptr, const size_t size, cudaStream_t stream);
 size_t cuda_datatype_size(TRTLLMCudaDataType dt);
 
 template <typename T>
-bool invokeCheckRange(const T* buffer, const size_t size, T min, T max, bool* d_within_range, cudaStream_t stream);
+bool invokeCheckRange(T const* buffer, const size_t size, T min, T max, bool* d_within_range, cudaStream_t stream);
 
-size_t calcAlignedSize(const std::vector<size_t>& sizes, size_t ALIGN_BYTES = 256);
+size_t calcAlignedSize(std::vector<size_t> const& sizes, size_t ALIGN_BYTES = 256);
 void calcAlignedPointers(
-    std::vector<void*>& outPtrs, const void* p, const std::vector<size_t>& sizes, size_t ALIGN_BYTES = 256);
+    std::vector<void*>& outPtrs, void const* p, std::vector<size_t> const& sizes, size_t ALIGN_BYTES = 256);
 } // namespace common
 } // namespace tensorrt_llm

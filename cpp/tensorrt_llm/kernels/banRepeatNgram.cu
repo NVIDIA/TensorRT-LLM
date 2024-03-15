@@ -25,9 +25,9 @@ namespace kernels
 {
 
 template <typename T>
-__global__ void ban_repeat_ngram(T* logits, const int** output_ids_buf, const FinishedState* finished_buf,
-    const int** parent_ids_buf, const int* batch_slots, int batch_size, int beam_width, int max_seq_len,
-    const int* no_repeat_ngram_size_buf, int vocab_size_padded, const int* sequence_lengths)
+__global__ void ban_repeat_ngram(T* logits, int const** output_ids_buf, FinishedState const* finished_buf,
+    int const** parent_ids_buf, int const* batch_slots, int batch_size, int beam_width, int max_seq_len,
+    int const* no_repeat_ngram_size_buf, int vocab_size_padded, int const* sequence_lengths)
 {
     /**
      * Find subsequences that match the last (ngram_size - 1) generated tokens. The next-tokens of those matching
@@ -46,13 +46,13 @@ __global__ void ban_repeat_ngram(T* logits, const int** output_ids_buf, const Fi
      * in-bound positions only. For leftside out-of-boundary tokens, access by global memory.
      */
 
-    const int output_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int local_batch_idx = blockIdx.y / beam_width;
+    int const output_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int const local_batch_idx = blockIdx.y / beam_width;
     auto const batch_slot = batch_slots != nullptr ? batch_slots[local_batch_idx] : local_batch_idx;
-    const int beam_idx = blockIdx.y % beam_width;
-    const bool beam_search = beam_width > 1;
-    const int no_repeat_ngram_size = no_repeat_ngram_size_buf[batch_slot];
-    const int step = sequence_lengths[batch_slot];
+    int const beam_idx = blockIdx.y % beam_width;
+    bool const beam_search = beam_width > 1;
+    int const no_repeat_ngram_size = no_repeat_ngram_size_buf[batch_slot];
+    int const step = sequence_lengths[batch_slot];
 
     // case 1: ngram_size == 0 --> this means no ngram limit
     // case 2: generated length must be greater than ngram_size to do ngram check
@@ -133,9 +133,9 @@ __global__ void ban_repeat_ngram(T* logits, const int** output_ids_buf, const Fi
 }
 
 template <typename T>
-void invokeBanRepeatNgram(T* logits, const int** output_ids_buf, const FinishedState* finished_buf,
-    const int** parent_ids_buf, const int* batch_slot, const int* sequence_lengths, int batch_size, int beam_width,
-    int max_seq_len, const int* no_repeat_ngram_size_buf, int vocab_size_padded, size_t max_step, cudaStream_t stream)
+void invokeBanRepeatNgram(T* logits, int const** output_ids_buf, FinishedState const* finished_buf,
+    int const** parent_ids_buf, int const* batch_slot, int const* sequence_lengths, int batch_size, int beam_width,
+    int max_seq_len, int const* no_repeat_ngram_size_buf, int vocab_size_padded, size_t max_step, cudaStream_t stream)
 {
     // each input in the local batch can have different no_repeat_ngram_size. Use max for shmem allocation
     // getting the max of current batch and allocate shmem as needed is ideal. But here the ngram_buf is on GPU, while

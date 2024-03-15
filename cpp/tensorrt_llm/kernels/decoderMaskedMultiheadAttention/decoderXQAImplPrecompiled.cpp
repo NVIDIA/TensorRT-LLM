@@ -45,7 +45,7 @@ struct XQAKernelLoadHashKey
 
 struct XQAKernelLoadHasher
 {
-    size_t operator()(const XQAKernelLoadHashKey& s) const
+    size_t operator()(XQAKernelLoadHashKey const& s) const
     {
         size_t key = s.data_type;
         key <<= 16;
@@ -76,7 +76,7 @@ struct XQAKernelRuntimeHashKey
 
 struct XQAKernelRuntimeHasher
 {
-    size_t operator()(const XQAKernelRuntimeHashKey& s) const
+    size_t operator()(XQAKernelRuntimeHashKey const& s) const
     {
         size_t key = s.kv_data_type;
         key <<= 16;
@@ -120,24 +120,24 @@ struct XQALaunchParam
 {
     uint32_t num_k_heads;
     void* output;
-    const void* qkv;
+    void const* qkv;
     KVCache kvCacheParams;
     std::optional<BeamSearchParams> beamSearchParams;
     uint32_t batch_size;
-    const float* kv_scale_quant_orig = nullptr;
+    float const* kv_scale_quant_orig = nullptr;
     void* scratch = nullptr;
 };
 
 // Setup launch params.
 template <typename KVCacheBuffer>
-void buildXQALaunchParams(XQALaunchParam& launchParams, const XQAParams& params, KVCacheBuffer kv_cache_buffer)
+void buildXQALaunchParams(XQALaunchParam& launchParams, XQAParams const& params, KVCacheBuffer kv_cache_buffer)
 {
     TLLM_CHECK_WITH_INFO(
         params.data_type == DATA_TYPE_FP16 || params.data_type == DATA_TYPE_BF16, "Only fp16 or bf16 supported now.");
     memset(&launchParams, 0, sizeof(XQALaunchParam));
     launchParams.num_k_heads = params.num_kv_heads;
     launchParams.output = static_cast<uint8_t*>(params.output);
-    launchParams.qkv = static_cast<const uint8_t*>(params.qkv);
+    launchParams.qkv = static_cast<uint8_t const*>(params.qkv);
     launchParams.batch_size = params.batch_size;
     launchParams.kv_scale_quant_orig = params.kv_scale_quant_orig;
     launchParams.scratch = params.workspaces;
@@ -179,7 +179,7 @@ public:
         }
         for (unsigned int i = 0; i < mKernelMetaCount; ++i)
         {
-            const auto& kernelMeta = mKernelMeta[i];
+            auto const& kernelMeta = mKernelMeta[i];
             if (kernelMeta.mSM != mSM || kernelMeta.mDataType != mDataType)
                 continue;
 
@@ -220,7 +220,7 @@ public:
         }
     }
 
-    bool supportConfig(const XQAParams& xqaParams) const
+    bool supportConfig(XQAParams const& xqaParams) const
     {
         unsigned int head_size = xqaParams.head_size;
         int num_q_heads = xqaParams.num_q_heads;
@@ -237,11 +237,11 @@ public:
             = {xqaParams.kv_cache_data_type, head_size, beam_width, kernel_num_q_heads_over_kv, m_tilesize,
                 xqaParams.paged_kv_cache ? static_cast<unsigned int>(xqaParams.tokens_per_block) : 0,
                 xqaParams.paged_kv_cache, xqaParams.multi_query_tokens};
-        const auto findIter = mFunctions.find(hash_key);
+        auto const findIter = mFunctions.find(hash_key);
         return findIter != mFunctions.end();
     }
 
-    bool mayHavePerfGain(const XQAParams& xqaParams, int multiprocessor_count) const
+    bool mayHavePerfGain(XQAParams const& xqaParams, int multiprocessor_count) const
     {
         // NOTE: only XQA supports multi_query_tokens (Medusa mode).
         if (mForceXQA || xqaParams.multi_query_tokens)
@@ -261,8 +261,8 @@ public:
     }
 
     template <typename T, typename KVCacheBuffer>
-    void run(const XQAParams& xqaParams, KVCacheBuffer& kv_cache_buffer, int2& rotary_kernel_launch_cache,
-        int multiprocessor_count, const cudaStream_t& stream) const
+    void run(XQAParams const& xqaParams, KVCacheBuffer& kv_cache_buffer, int2& rotary_kernel_launch_cache,
+        int multiprocessor_count, cudaStream_t const& stream) const
     {
         unsigned int head_size = xqaParams.head_size;
         int num_q_heads = xqaParams.num_q_heads;
@@ -280,7 +280,7 @@ public:
         void const* xqa_q_input_ptr = xqaParams.output;
         invokeApplyBiasRopeUpdateKVCache<T, KVCacheBuffer, true>(static_cast<T*>(const_cast<void*>(xqaParams.qkv)),
             static_cast<T*>(const_cast<void*>(xqaParams.output)), kv_cache_buffer,
-            static_cast<const T*>(xqaParams.qkv_bias), xqaParams.sequence_lengths, nullptr, nullptr,
+            static_cast<T const*>(xqaParams.qkv_bias), xqaParams.sequence_lengths, nullptr, nullptr,
             xqaParams.batch_size, xqaParams.generation_input_length, xqaParams.cyclic_attention_window_size,
             xqaParams.sink_token_length, xqaParams.batch_size * beam_width * xqaParams.generation_input_length,
             xqaParams.num_q_heads, xqaParams.num_kv_heads, xqaParams.head_size, xqaParams.rotary_embedding_dim,
@@ -302,13 +302,13 @@ public:
             kernel_num_q_heads_over_kv, kernel_m_tilesize,
             xqaParams.paged_kv_cache ? static_cast<unsigned int>(xqaParams.tokens_per_block) : 0,
             xqaParams.paged_kv_cache, xqaParams.multi_query_tokens};
-        const auto findIter = mFunctions.find(hash_key);
+        auto const findIter = mFunctions.find(hash_key);
 
         TLLM_CHECK_WITH_INFO(findIter != mFunctions.end(), "XQAKernelFunc not found.");
 
-        const auto& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
+        auto const& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
         const CUfunction func = findIter->second.mDeviceFunction;
-        const unsigned int shared_mem_bytes = findIter->second.mSharedMemBytes;
+        unsigned int const shared_mem_bytes = findIter->second.mSharedMemBytes;
 
         XQALaunchParam launchParams;
         buildXQALaunchParams(launchParams, xqaParams, kv_cache_buffer);
@@ -373,7 +373,7 @@ public:
         sync_check_cuda_error();
     }
 
-    static int computeMultiBlockCount(const XQAParams& xqaParams, int batch_size, int multiprocessor_count)
+    static int computeMultiBlockCount(XQAParams const& xqaParams, int batch_size, int multiprocessor_count)
     {
         int multi_block_count = 1;
         int num_kv_heads = xqaParams.num_kv_heads;
@@ -401,10 +401,10 @@ protected:
     tensorrt_llm::common::CUDADriverWrapper mDriver;
 
     Data_type mDataType;
-    const TKernelMeta* mKernelMeta;
+    TKernelMeta const* mKernelMeta;
     unsigned int mKernelMetaCount;
     unsigned int mSM;
-    std::unordered_map<const unsigned long long*, CUmodule> mModules;
+    std::unordered_map<unsigned long long const*, CUmodule> mModules;
 
     bool mForceXQA = false;
 
@@ -421,14 +421,14 @@ protected:
 class XQAKernelLoader
 {
 public:
-    const XQAKernelList* getXQAKernels(Data_type type, unsigned int sm)
+    XQAKernelList const* getXQAKernels(Data_type type, unsigned int sm)
     {
         static std::mutex s_mutex;
         std::lock_guard<std::mutex> lg(s_mutex);
 
         XQAKernelLoadHashKey hash_key{type, sm};
 
-        const auto findIter = mKernels.find(hash_key);
+        auto const findIter = mKernels.find(hash_key);
         if (findIter == mKernels.end())
         {
             XQAKernelList* newKernel = new XQAKernelList{type, sm};
@@ -458,7 +458,7 @@ private:
     std::unordered_map<XQAKernelLoadHashKey, const std::unique_ptr<XQAKernelList>, XQAKernelLoadHasher> mKernels;
 };
 
-inline const XQAKernelList* getXQAKernels(Data_type type, unsigned int sm)
+inline XQAKernelList const* getXQAKernels(Data_type type, unsigned int sm)
 {
     return XQAKernelLoader::Get().getXQAKernels(type, sm);
 }
@@ -468,10 +468,10 @@ inline const XQAKernelList* getXQAKernels(Data_type type, unsigned int sm)
         xqa_params, kv_cache_buffer, rotary_kernel_launch_cache, multi_processor_count, stream);
 
 template <typename KVCacheBuffer>
-void DecoderXQAImplPrecompiled::runDispatchBuffer(const XQAParams& xqa_params, KVCacheBuffer& kv_cache_buffer,
-    int2& rotary_kernel_launch_cache, const cudaStream_t& stream)
+void DecoderXQAImplPrecompiled::runDispatchBuffer(XQAParams const& xqa_params, KVCacheBuffer& kv_cache_buffer,
+    int2& rotary_kernel_launch_cache, cudaStream_t const& stream)
 {
-    const XQAKernelList* xqa_kernel = getXQAKernels(mRunner->mDataType, tensorrt_llm::common::getSMVersion());
+    XQAKernelList const* xqa_kernel = getXQAKernels(mRunner->mDataType, tensorrt_llm::common::getSMVersion());
     int multi_processor_count = mRunner->mMultiProcessorCount;
     if (mRunner->mDataType == DATA_TYPE_FP16)
     {
@@ -485,26 +485,26 @@ void DecoderXQAImplPrecompiled::runDispatchBuffer(const XQAParams& xqa_params, K
 
 #undef XQA_KERNEL_RUN
 
-bool DecoderXQAImplPrecompiled::shouldUse(const XQAParams& xqaParams)
+bool DecoderXQAImplPrecompiled::shouldUse(XQAParams const& xqaParams)
 {
-    const XQAKernelList* xqa_kernel = getXQAKernels(mRunner->mDataType, tensorrt_llm::common::getSMVersion());
+    XQAKernelList const* xqa_kernel = getXQAKernels(mRunner->mDataType, tensorrt_llm::common::getSMVersion());
     return xqa_kernel->supportConfig(xqaParams)
         && xqa_kernel->mayHavePerfGain(xqaParams, mRunner->mMultiProcessorCount);
 }
 
-void DecoderXQAImplPrecompiled::prepare(const XQAParams&)
+void DecoderXQAImplPrecompiled::prepare(XQAParams const&)
 {
     // Intentionally do nothing.
 }
 
-void DecoderXQAImplPrecompiled::runWithKVLinearBuffer(const XQAParams& xqa_params, KVLinearBuffer& kv_linear_buffer,
-    int2& rotary_kernel_launch_cache, const cudaStream_t& stream)
+void DecoderXQAImplPrecompiled::runWithKVLinearBuffer(XQAParams const& xqa_params, KVLinearBuffer& kv_linear_buffer,
+    int2& rotary_kernel_launch_cache, cudaStream_t const& stream)
 {
     runDispatchBuffer<KVLinearBuffer>(xqa_params, kv_linear_buffer, rotary_kernel_launch_cache, stream);
 }
 
-void DecoderXQAImplPrecompiled::runWithKVBlockArray(const XQAParams& xqa_params, KVBlockArray& kv_block_array,
-    int2& rotary_kernel_launch_cache, const cudaStream_t& stream)
+void DecoderXQAImplPrecompiled::runWithKVBlockArray(XQAParams const& xqa_params, KVBlockArray& kv_block_array,
+    int2& rotary_kernel_launch_cache, cudaStream_t const& stream)
 {
     runDispatchBuffer<KVBlockArray>(xqa_params, kv_block_array, rotary_kernel_launch_cache, stream);
 }

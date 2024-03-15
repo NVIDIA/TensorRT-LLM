@@ -5,7 +5,7 @@ from .layers import (Int8SmoothQuantLinear, Int8SmoothQuantRowLinear,
                      WeightOnlyGroupwiseQuantColumnLinear,
                      WeightOnlyGroupwiseQuantRowLinear,
                      WeightOnlyQuantColumnLinear, WeightOnlyQuantRowLinear)
-from .mode import W4A8_AWQ, W4A16_AWQ
+from .mode import W4A8_AWQ, W4A16_AWQ, W8A8_SQ_PLUGIN_LIST
 
 
 def weight_only_quantize(model,
@@ -164,6 +164,7 @@ def smooth_quantize_plugin(model, quant_mode):
         assert quant_norm_cls is not None
         layer.input_layernorm = quant_norm_cls(
             normalized_shape=config.hidden_size,
+            eps=config.norm_epsilon,
             dtype=config.dtype,
             quant_mode=quant_mode)
 
@@ -205,9 +206,8 @@ def smooth_quantize_plugin(model, quant_mode):
                                  tp_size=config.mapping.tp_size,
                                  quant_mode=quant_mode,
                                  bias=layer.mlp.bias)
-        assert hasattr(
-            layer,
-            "post_layernorm"), "The layer has no post_rmspost_layernormnorm"
+        assert hasattr(layer,
+                       "post_layernorm"), "The layer has no post_layernorm"
 
         quant_norm_cls = None
         if isinstance(layer.post_layernorm, RmsNorm):
@@ -218,6 +218,7 @@ def smooth_quantize_plugin(model, quant_mode):
 
         layer.post_layernorm = quant_norm_cls(
             normalized_shape=config.hidden_size,
+            eps=config.norm_epsilon,
             dtype=config.dtype,
             quant_mode=quant_mode)
 
@@ -234,20 +235,21 @@ def smooth_quantize(model, quant_mode, use_plugin=False):
 
 def quantize(model, quant_mode, **kwargs):
     if quant_mode.has_act_and_weight_quant():
-        if 'sq_use_plugin' in kwargs and kwargs['sq_use_plugin']:
-            smooth_quantize(model, quant_mode, use_plugin=True)
-        else:
-            smooth_quantize(model, quant_mode)
+        use_plugin = kwargs.get('quant_algo', None) in W8A8_SQ_PLUGIN_LIST
+        smooth_quantize(model, quant_mode, use_plugin=use_plugin)
     elif quant_mode.is_weight_only():
         if quant_mode.has_per_group_scaling():
-            kwargs = {
+            quant_kwargs = {
                 k: kwargs[k]
                 for k in [
-                    'quant_algo', 'group_size', 'zero', 'pre_quant_scale',
+                    'quant_algo', 'group_size', 'pre_quant_scale',
                     'exclude_modules'
                 ]
             }
-            weight_only_groupwise_quantize(model, quant_mode, **kwargs)
+            # due to legacy reason, the weight_only_groupwise_quantize function take 'zero' as arg
+            # while the checkpoint uses 'has_zero_point'
+            quant_kwargs['zero'] = kwargs['has_zero_point']
+            weight_only_groupwise_quantize(model, quant_mode, **quant_kwargs)
         else:
             kwargs = {k: kwargs[k] for k in ['exclude_modules']}
             weight_only_quantize(model, quant_mode, **kwargs)

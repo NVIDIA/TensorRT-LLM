@@ -940,8 +940,8 @@ void RuntimeBuffers::getRuntimeBuffers(TensorMap& inputBuffers, TensorMap& outpu
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-std::vector<SizeType> RuntimeBuffers::getPositionIdsContextPhaseGlm(const SizeType& batchSize,
-    const SizeType& maxInputLength, const SizeType* pInputLengths, bool useGptAttentionPlugin, bool usePackedInput)
+std::vector<SizeType> RuntimeBuffers::getPositionIdsContextPhaseGlm(SizeType const& batchSize,
+    SizeType const& maxInputLength, SizeType const* pInputLengths, bool useGptAttentionPlugin, bool usePackedInput)
 {
     TLLM_CHECK(pInputLengths != nullptr);
 
@@ -991,8 +991,8 @@ std::vector<SizeType> RuntimeBuffers::getPositionIdsContextPhaseGlm(const SizeTy
     return positionIdsVec;
 }
 
-std::vector<SizeType> RuntimeBuffers::getPositionIdsGenerationPhaseGlm(const SizeType& batchSize,
-    const SizeType& beamSize, const SizeType& step, const SizeType* pInputLengths, bool useGptAttentionPlugin,
+std::vector<SizeType> RuntimeBuffers::getPositionIdsGenerationPhaseGlm(SizeType const& batchSize,
+    SizeType const& beamSize, SizeType const& step, SizeType const* pInputLengths, bool useGptAttentionPlugin,
     bool usePackedInput)
 {
     TLLM_CHECK(pInputLengths != nullptr);

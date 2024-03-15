@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .._utils import str_dtype_to_torch, torch_to_numpy, unpack_nemo_weights
+from ._utils import str_dtype_to_torch, torch_to_numpy, unpack_nemo_weights
 
 
 def get_all_nemo_lora_weights(num_layers, lora_weights):

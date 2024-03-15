@@ -14,8 +14,8 @@
 # limitations under the License.
 from ..._utils import pad_vocab_size
 from ...functional import PositionEmbeddingType, Tensor
-from ...layers import (MLP, Attention, AttentionMaskType, ColumnLinear,
-                       Embedding, LayerNorm)
+from ...layers import (MLP, Attention, AttentionMaskType, Embedding, LayerNorm,
+                       ParallelLMHead)
 from ...module import Module
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
                               PretrainedConfig)
@@ -33,8 +33,10 @@ class PhiDecoderLayer(Module):
         self.input_layernorm = LayerNorm(normalized_shape=config.hidden_size,
                                          dtype=config.dtype)
 
+        layers_range = config.mapping.pp_layers(config.num_hidden_layers)
+        local_layer_idx = layer_idx - layers_range[0]
         self.attention = Attention(
-            layer_idx=layer_idx,
+            local_layer_idx=local_layer_idx,
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
             rotary_embedding_percentage=config.partial_rotary_factor,
@@ -154,14 +156,14 @@ class PhiForCausalLM(DecoderModelForCausalLM):
         if config.share_embedding_table:
             share_weight = transformer.vocab_embedding.weight
 
-        lm_head = ColumnLinear(config.hidden_size,
-                               vocab_size_padded,
-                               bias=True,
-                               dtype=config.dtype,
-                               tp_group=config.mapping.tp_group,
-                               tp_size=config.mapping.tp_size,
-                               gather_output=True,
-                               share_weight=share_weight)
+        lm_head = ParallelLMHead(config.hidden_size,
+                                 vocab_size_padded,
+                                 bias=True,
+                                 dtype=config.dtype,
+                                 tp_group=config.mapping.tp_group,
+                                 tp_size=config.mapping.tp_size,
+                                 gather_output=True,
+                                 share_weight=share_weight)
 
         super().__init__(config, transformer, lm_head)
 
