@@ -64,7 +64,7 @@ public:
     using TensorPtr = Base::TensorPtr;
 
     NamedTensor(
-        nvinfer1::DataType _type, std::vector<int64_t> const& _shape, std::string _name, const void* _data = nullptr);
+        nvinfer1::DataType _type, std::vector<int64_t> const& _shape, std::string _name, void const* _data = nullptr);
 
     NamedTensor(TensorPtr _tensor, std::string _name)
         : Base(std::move(_tensor), std::move(_name)){};
@@ -74,6 +74,10 @@ public:
 
     [[nodiscard]] std::vector<int64_t> serialize() const;
 
-    static NamedTensor deserialize(const int64_t* packed);
+    void serialize(int64_t* out, const size_t totalSize) const;
+
+    [[nodiscard]] size_t serializedSize() const;
+
+    static NamedTensor deserialize(int64_t const* packed);
 };
 } // namespace tensorrt_llm::batch_manager

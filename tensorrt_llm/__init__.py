@@ -41,6 +41,7 @@ from ._common import _init, default_net, default_trtnet, precision
 from ._utils import mpi_barrier  # NOQA
 from ._utils import str_dtype_to_torch  # NOQA
 from ._utils import mpi_rank, mpi_world_size, str_dtype_to_trt
+from .auto_parallel import AutoParallelConfig, auto_parallel
 from .builder import Builder, BuilderConfig
 from .functional import Tensor, constant
 from .hlapi.llm import LLM, ModelConfig
@@ -73,6 +74,8 @@ __all__ = [
     'Module',
     'functional',
     'models',
+    'auto_parallel',
+    'AutoParallelConfig',
     'quantization',
     'tools',
     'LLM',

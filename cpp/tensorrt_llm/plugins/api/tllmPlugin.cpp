@@ -93,7 +93,7 @@ bool pluginsInitialized = false;
 
 extern "C"
 {
-    bool initTrtLlmPlugins(void* logger, const char* libNamespace)
+    bool initTrtLlmPlugins(void* logger, char const* libNamespace)
     {
         if (pluginsInitialized)
             return true;

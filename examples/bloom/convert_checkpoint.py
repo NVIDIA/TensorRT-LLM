@@ -519,7 +519,7 @@ def smooth_bloom_model(model, scales, alpha, bloom_qkv_param, bloom_smoother):
         bloom_qkv_param[layer_name] = param
 
         # dense
-        # enabled for better accuracy with perf overhead of quantiztion
+        # enabled for better accuracy with perf overhead of quantization
         layer_name = name + ".self_attention.dense"
         smoother = smooth_gemm(module.self_attention.dense.weight,
                                scales[layer_name]["x"], None, None, alpha)
@@ -540,7 +540,7 @@ def smooth_bloom_model(model, scales, alpha, bloom_qkv_param, bloom_smoother):
             dim=1)[0]
 
         # fc2
-        # enabled for better accuracy with perf overhead of quantiztion
+        # enabled for better accuracy with perf overhead of quantization
         layer_name = name + ".mlp.dense_4h_to_h"
         smoother = smooth_gemm(module.mlp.dense_4h_to_h.weight,
                                scales[layer_name]["x"], None, None, alpha)
@@ -1090,8 +1090,6 @@ def main():
         'embedding_sharding_dim': args.embedding_sharding_dim,
         'share_embedding_table': args.use_embedding_sharing,
     }
-    if args.smoothquant:
-        config['quantization']['sq_use_plugin'] = True
 
     with (args.output_dir / 'config.json').open('w') as f:
         json.dump(config, f, indent=4)

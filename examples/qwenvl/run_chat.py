@@ -118,7 +118,8 @@ if __name__ == '__main__':
 
         run_i = run_i + 1
         output_text = qinfer.qwen_infer(image_embeds, None, query,
-                                        args.max_new_tokens, history)
+                                        args.max_new_tokens, args.num_beams,
+                                        history)
         if args.display:
             if exist_cooridinate(output_text):
                 cooridinate_extract_show(output_text, history, qinfer.tokenizer,

@@ -22,7 +22,7 @@ Optional tensors that can be supplied to `InferenceRequest` are shown below. Def
 | `presence_penalty` | [1] | `float` | Sampling Config param: `presencePenalty` |
 | `frequency_penalty` | [1] | `float` | Sampling Config param: `frequencyPenalty` |
 | `random_seed` | [1] | `uint64_t` | Sampling Config param: `randomSeed` |
-| `end_id` | [1] | `int32_t` | End token Id |
+| `end_id` | [1] | `int32_t` | End token Id. If not specified, defaults to -1 |
 | `pad_id` | [1] | `int32_t` | Pad token Id |
 | `embedding_bias` | [1] | `float` | Embedding bias |
 | `bad_words_list` | [2, num_bad_words] | `int32_t` | Bad words list |

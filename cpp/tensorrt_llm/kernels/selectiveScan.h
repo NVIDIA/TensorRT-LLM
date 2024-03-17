@@ -30,6 +30,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 
 namespace tensorrt_llm
@@ -41,33 +42,11 @@ struct SSMParamsBase
 {
     using index_t = uint32_t;
 
-    int batch, dim, seqlen, dstate, n_groups, n_chunks;
-    int dim_ngroups_ratio;
+    int batch, dim, seqlen, dstate;
     bool is_variable_B;
     bool is_variable_C;
 
     bool delta_softplus;
-
-    index_t A_d_stride;
-    index_t A_dstate_stride;
-    index_t B_batch_stride;
-    index_t B_d_stride;
-    index_t B_dstate_stride;
-    index_t B_group_stride;
-    index_t C_batch_stride;
-    index_t C_d_stride;
-    index_t C_dstate_stride;
-    index_t C_group_stride;
-    index_t u_batch_stride;
-    index_t u_d_stride;
-    index_t delta_batch_stride;
-    index_t delta_d_stride;
-    index_t z_batch_stride;
-    index_t z_d_stride;
-    index_t out_batch_stride;
-    index_t out_d_stride;
-    index_t state_batch_stride;
-    index_t state_d_stride;
 
     // Common data pointers.
     void* __restrict__ A_ptr;

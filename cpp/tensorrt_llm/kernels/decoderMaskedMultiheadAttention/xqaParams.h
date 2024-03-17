@@ -30,12 +30,12 @@ struct XQAParams
     XQADataType data_type = DATA_TYPE_FP16;
     XQADataType kv_cache_data_type = DATA_TYPE_FP16;
     void* output = nullptr;
-    const void* qkv = nullptr;
-    const int32_t* cache_indir = nullptr;
-    const float* kv_scale_orig_quant = nullptr;
-    const float* kv_scale_quant_orig = nullptr;
-    const int32_t* host_past_key_value_lengths = nullptr;
-    const int32_t* host_context_lengths = nullptr;
+    void const* qkv = nullptr;
+    int32_t const* cache_indir = nullptr;
+    float const* kv_scale_orig_quant = nullptr;
+    float const* kv_scale_quant_orig = nullptr;
+    int32_t const* host_past_key_value_lengths = nullptr;
+    int32_t const* host_context_lengths = nullptr;
     void* workspaces = nullptr;
     uint32_t batch_size = 0;
     int32_t beam_width = 0;
@@ -43,12 +43,12 @@ struct XQAParams
     int32_t cyclic_attention_window_size = 0;
     int32_t sink_token_length = 0;
     int timestep = 0;
-    const void* qkv_bias;
-    const int32_t* sequence_lengths;    //
-    const int32_t* context_lengths;     // maybe not used now
-    const void* alibi_slopes;           // maybe not used now
-    const int32_t* medusa_packed_mask;
-    const int* medusa_position_offsets; // rotary embedding.
+    void const* qkv_bias;
+    int32_t const* sequence_lengths;    //
+    int32_t const* context_lengths;     // maybe not used now
+    void const* alibi_slopes;           // maybe not used now
+    int32_t const* medusa_packed_mask;
+    int const* medusa_position_offsets; // rotary embedding.
 
     // almost copy from GPTAttentionPluginCommon.
     // maybe use one struct for parameters in GPTAttentionPluginCommon and share the same here.

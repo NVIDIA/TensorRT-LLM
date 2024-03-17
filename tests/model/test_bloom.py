@@ -12,8 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
-import sys
 import tempfile
 import unittest
 from itertools import product
@@ -24,6 +22,9 @@ import pytest
 # isort: off
 import torch
 # isort: on
+import os
+import sys
+
 from parameterized import parameterized
 from transformers import BloomConfig, BloomForCausalLM
 
@@ -36,10 +37,11 @@ from tensorrt_llm.runtime import ModelConfig, SamplingConfig
 from tensorrt_llm.runtime.generation import _prepare_attention_mask
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
+
 from examples.bloom.convert_checkpoint import convert_hf_bloom
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import getSMVersion
+from utils.util import skip_fp32_accum_pre_ampere, unittest_name_func
 
 
 class TestBloom(unittest.TestCase):
@@ -161,7 +163,7 @@ class TestBloom(unittest.TestCase):
             ], [False], ['float16', 'float32']))
         return test_cases
 
-    @parameterized.expand(load_test_cases())
+    @parameterized.expand(load_test_cases(), name_func=unittest_name_func)
     def test_bloom(self, use_gpt_attention_plugin, context_fmha_type,
                    enable_remove_input_padding, dtype):
         model = 'bloom'
@@ -380,16 +382,12 @@ class TestBloom(unittest.TestCase):
                                    res.cpu().numpy(),
                                    atol=1e-1)
 
-    @parameterized.expand(load_test_cases())
+    @parameterized.expand(load_test_cases(), name_func=unittest_name_func)
     def test_greedy_search(self, use_gpt_attention_plugin, context_fmha_type,
                            enable_remove_input_padding, dtype):
 
         # Skip tests that are not supported in pre-ampere architecture
-        if getSMVersion() < 80:
-            if context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
-                pytest.skip(
-                    "ContextFMHAType with fp32 acc is not supported in pre-ampere architecture"
-                )
+        skip_fp32_accum_pre_ampere(context_fmha_type)
 
         model = 'bloom'
         log_level = 'error'

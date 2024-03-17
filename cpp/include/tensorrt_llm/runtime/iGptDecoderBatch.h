@@ -46,13 +46,8 @@ public:
         , endId{endId}
         , computeCumLogProbs(false)
         , computeLogProbs(false)
+        , generatedTokensPerStep(1)
     {
-    }
-
-    // the number of tokens generated per step
-    SizeType generatedTokensPerStep() const
-    {
-        return draftTokens ? draftTokens->getSize() + 1 : 1;
     }
 
     // mandatory parameters
@@ -71,6 +66,7 @@ public:
 
     bool computeCumLogProbs; // boolean that controls if cumLogProbs should be computed for that request
     bool computeLogProbs;    // boolean that controls if cumLogProbs should be computed for that request
+    SizeType generatedTokensPerStep;
 };
 
 class Input
@@ -183,6 +179,12 @@ public:
     virtual void newRequests(std::vector<SizeType> const& seqSlots, std::vector<decoder_batch::Request> const& requests,
         std::vector<SamplingConfig> const& samplingConfigs)
         = 0;
+
+    //! @returns [batchSize, maxTokensPerStep-1], predicted draft tokens for next step, on gpu
+    virtual TensorPtr getNextDraftTokens() const = 0;
+
+    //! @returns [batchSize], lengths of the predicted draft tokens for next step, on gpu
+    virtual TensorPtr getNextDraftTokenLengths() const = 0;
 
 protected:
     IGptDecoderBatch() = default;

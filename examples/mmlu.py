@@ -248,12 +248,7 @@ class Pipeline:
 
     def __call__(self, prompt):
         # Run the model in batch size 1 and beam size 1
-        if self.model_name == 'GemmaForCausalLM':
-            inputs = self.tokenizer.encode(prompt, add_special_tokens=False)
-            inputs = torch.tensor([self.tokenizer.bos_token_id] + inputs)
-        else:
-            inputs = self.tokenizer.encode(prompt,
-                                           return_tensors="pt").squeeze(0)
+        inputs = self.tokenizer.encode(prompt, return_tensors="pt").squeeze(0)
         batch_input_ids = [inputs]
 
         # For multi-choice tasks like MMLU, we don't need to adjust following parameters
@@ -341,7 +336,7 @@ def parse_args():
         type=int,
         default=None,
         help=
-        'The attention window size that controls the sliding window attention / cyclic kv cache behaviour'
+        'The attention window size that controls the sliding window attention / cyclic kv cache behavior'
     )
     parser.add_argument(
         '--tokenizer_dir',
@@ -394,10 +389,10 @@ def main():
                                      debug_mode=args.debug_mode)
     else:
         assert args.test_hf, "Must test either TRT-LLM or HF"
-        if model_name.startswith("chatglm"):
-            auto_model_cls = AutoModel
-        elif model_name.startswith("glm"):
+        if model_name == 'ChatGLMForCausalLM' and model_version == 'glm':
             auto_model_cls = AutoModelForSeq2SeqLM
+        elif model_name == 'ChatGLMForCausalLM' and model_version == 'chatglm':
+            auto_model_cls = AutoModel
         else:
             auto_model_cls = AutoModelForCausalLM
         model = auto_model_cls.from_pretrained(

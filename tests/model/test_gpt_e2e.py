@@ -41,12 +41,12 @@ from llm_data import llm_models_root
 from util import getSMVersion
 
 
-def build_engine(weigth_dir: Path, engine_dir: Path, *args):
+def build_engine(weight_dir: Path, engine_dir: Path, *args):
     print(
-        f"== Build engine from {weigth_dir} to {engine_dir}, with args {args}")
+        f"== Build engine from {weight_dir} to {engine_dir}, with args {args}")
     run_build([
         '--model_dir',
-        str(weigth_dir),
+        str(weight_dir),
         '--output_dir',
         str(engine_dir),
         '--log_level=verbose',

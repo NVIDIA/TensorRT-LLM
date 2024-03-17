@@ -938,7 +938,7 @@ void testCopyBatch(SizeType stride, BufferManager& manager, CudaStream& stream)
     {
         for (SizeType ci = 0; ci < stride; ++ci)
         {
-            const auto idx = row * stride + ci;
+            auto const idx = row * stride + ci;
             srcBufferHostPtr[idx] = idx;
         }
     }
@@ -968,18 +968,18 @@ void testCopyBatch(SizeType stride, BufferManager& manager, CudaStream& stream)
         {
             if (idx < numIndices && ci < sizesPtr[idx])
             {
-                const auto refIdx = srcOffsetsPtr[idx] + ci;
-                const auto ref = srcBufferHostPtr[refIdx];
+                auto const refIdx = srcOffsetsPtr[idx] + ci;
+                auto const ref = srcBufferHostPtr[refIdx];
 
-                const auto outIdx = dstOffsetsPtr[idx] + ci;
-                const auto out = dstBufferHostPtr[outIdx];
+                auto const outIdx = dstOffsetsPtr[idx] + ci;
+                auto const out = dstBufferHostPtr[outIdx];
 
                 EXPECT_EQ(ref, out) << "Error at index row: " << idx << " column: " << ci << " for stride " << stride;
             }
             else
             {
-                const auto outIdx = idx * stride + ci;
-                const auto out = dstBufferHostPtr[outIdx];
+                auto const outIdx = idx * stride + ci;
+                auto const out = dstBufferHostPtr[outIdx];
 
                 EXPECT_EQ(0, out) << "Error at index row: " << idx << " column: " << ci << " for stride " << stride;
             }

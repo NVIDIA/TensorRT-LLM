@@ -57,31 +57,31 @@ public:
         std::uniform_int_distribution<int> seqLenDistr(0, mMaxSeqLen);
 
         mSequenceLengths
-            = mBufferManager->pinned(ITensor::makeShape({maxBatchSize, beamWidth}), nvinfer1::DataType::kINT32);
-        mSequenceLengthLimits = mBufferManager->pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
-        mFinished = mBufferManager->pinned(
+            = BufferManager::pinned(ITensor::makeShape({maxBatchSize, beamWidth}), nvinfer1::DataType::kINT32);
+        mSequenceLengthLimits = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
+        mFinished = BufferManager::pinned(
             ITensor::makeShape({maxBatchSize, beamWidth}), TRTDataType<tk::FinishedState::UnderlyingType>::value);
-        mFinishedSum = mBufferManager->pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
+        mFinishedSum = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
 
-        mOutputIds = mBufferManager->pinned(
+        mOutputIds = BufferManager::pinned(
             ITensor::makeShape({maxBatchSize, beamWidth, mMaxSeqLen}), nvinfer1::DataType::kINT32);
         mOutputIdsPtr
-            = mBufferManager->pinned(ITensor::makeShape({maxBatchSize, beamWidth}), nvinfer1::DataType::kINT64);
+            = BufferManager::pinned(ITensor::makeShape({maxBatchSize, beamWidth}), nvinfer1::DataType::kINT64);
 
-        mParentIds = mBufferManager->pinned(
+        mParentIds = BufferManager::pinned(
             ITensor::makeShape({maxBatchSize, beamWidth, mMaxSeqLen}), nvinfer1::DataType::kINT32);
         mParentIdsPtr
-            = mBufferManager->pinned(ITensor::makeShape({maxBatchSize, beamWidth}), nvinfer1::DataType::kINT64);
+            = BufferManager::pinned(ITensor::makeShape({maxBatchSize, beamWidth}), nvinfer1::DataType::kINT64);
 
-        mRefOutputIds = mBufferManager->pinned(
+        mRefOutputIds = BufferManager::pinned(
             ITensor::makeShape({maxBatchSize, beamWidth, mMaxSeqLen}), nvinfer1::DataType::kINT32);
 
-        mStopWords = mBufferManager->pinned(
-            ITensor::makeShape({maxBatchSize, 2, maxStopWordsLen}), nvinfer1::DataType::kINT32);
-        mStopWordsPtr = mBufferManager->pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT64);
-        mStopWordsLen = mBufferManager->pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
+        mStopWords
+            = BufferManager::pinned(ITensor::makeShape({maxBatchSize, 2, maxStopWordsLen}), nvinfer1::DataType::kINT32);
+        mStopWordsPtr = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT64);
+        mStopWordsLen = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
 
-        mBatchSlots = mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
+        mBatchSlots = BufferManager::pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
 
         auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
         for (SizeType bi = 0; bi < batchSize; ++bi)
@@ -229,7 +229,7 @@ public:
         }
     }
 
-    bool isSubsequence(const SizeType* sequence, SizeType n, const std::vector<int>& subsequence)
+    bool isSubsequence(SizeType const* sequence, SizeType n, std::vector<int> const& subsequence)
     {
         auto it = std::search(sequence, sequence + n, subsequence.begin(), subsequence.end());
         return it != sequence + n;
@@ -278,10 +278,10 @@ public:
         std::vector<std::vector<std::vector<SizeType>>> const& stopWords, SizeType batchSize, SizeType beamWidth)
     {
         SizeType maxStopWordsLen = 0;
-        for (const auto& batchStopWords : stopWords)
+        for (auto const& batchStopWords : stopWords)
         {
             SizeType stopWordsLen = 0;
-            for (const auto& words : batchStopWords)
+            for (auto const& words : batchStopWords)
             {
                 stopWordsLen += words.size();
             }
@@ -311,7 +311,7 @@ public:
         tk::invokeLengthCriterion(
             reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*mFinished)),
             bufferCast<SizeType>(*mFinishedSum),
-            reinterpret_cast<const uint32_t*>(bufferCast<SizeType>(*mSequenceLengthLimits)),
+            reinterpret_cast<uint32_t const*>(bufferCast<SizeType>(*mSequenceLengthLimits)),
             bufferCast<SizeType>(*mSequenceLengths), bufferCast<int32_t>(*mBatchSlots), batchSize, beamWidth,
             mStream->get());
 

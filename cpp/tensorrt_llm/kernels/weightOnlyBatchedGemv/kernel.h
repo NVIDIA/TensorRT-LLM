@@ -86,7 +86,7 @@ struct WeightOnlyDetails<ActType, WeightOnlyQuantType::Int4b>
     // weight 0 1 8 9 16 17 24 25 2 3 10 11 18 19 26 27 4 5 12 13 20 21 28 29 6 7 14 15 22 23 30 31
     static constexpr int kShuffleSize = 32;
     static constexpr int kShuffleBasicTile = 2;
-    static constexpr int kShuffleContinous = 4;
+    static constexpr int kShuffleContinuous = 4;
     static constexpr int kShuffleStrided = 4;
 
     // Each warp completes the internal reduce and writes the [Batch * NPerBlock * Interleave] results to the
@@ -136,7 +136,7 @@ struct WeightOnlyDetails<ActType, WeightOnlyQuantType::Int8b>
     // weight 0 1 8 9 2 3 10 11 4 5 12 13 6 7 14 15
     static constexpr int kShuffleSize = 16;
     static constexpr int kShuffleBasicTile = 2;
-    static constexpr int kShuffleContinous = 2;
+    static constexpr int kShuffleContinuous = 2;
     static constexpr int kShuffleStrided = 4;
 
     // Each warp completes the internal reduce and writes the [Batch * NPerBlock * Interleave] results to the
@@ -177,7 +177,7 @@ struct WeightOnlyKernelDetails
 
     static constexpr int kShuffleSize = Layout::kShuffleSize;
     static constexpr int kShuffleBasicTile = Layout::kShuffleBasicTile;
-    static constexpr int kShuffleContinous = Layout::kShuffleContinous;
+    static constexpr int kShuffleContinuous = Layout::kShuffleContinuous;
     static constexpr int kShuffleStrided = Layout::kShuffleStrided;
 
     // The rearrangement here counteracts the effect of cutlass::add_bias_and_interleave_int4/8s_inplace
@@ -239,14 +239,14 @@ struct WeightOnlyScaleLoader
     static constexpr int kGroupSize = WeightOnlyProperties<WeightOnlyFlag>::kGroupSize;
 
 private:
-    const ElemType* _scales;
-    const ElemType* _zeros;
+    ElemType const* _scales;
+    ElemType const* _zeros;
     int _stride;
     int _offset;
 
 public:
     __device__ __forceinline__ WeightOnlyScaleLoader(
-        const ElemType* scales, const ElemType* zeros, int initial_offset, int stride)
+        ElemType const* scales, ElemType const* zeros, int initial_offset, int stride)
         : _scales(scales)
         , _zeros(zeros)
         , _stride(stride)
@@ -293,8 +293,8 @@ public:
 
 template <typename ActType, WeightOnlyQuantType QType, typename WeightOnlyFlag, template <typename T> class ActOp,
     bool Zero, bool Bias, bool ActScale, int NPerBlock, int Batch, int BlockSize>
-__device__ void weight_only_batched_gemv(const uint8_t* qweight, const ActType* scales, const ActType* zeros,
-    const ActType* in, const ActType* act_scale, const ActType* bias, ActType* out, const int n, const int k)
+__device__ void weight_only_batched_gemv(uint8_t const* qweight, ActType const* scales, ActType const* zeros,
+    ActType const* in, ActType const* act_scale, ActType const* bias, ActType* out, int const n, int const k)
 {
     static_assert(NPerBlock == 1 || (NPerBlock % 2 == 0));
     using ActType2 = typename ActTypeDetails<ActType>::Vec2;
@@ -309,11 +309,11 @@ __device__ void weight_only_batched_gemv(const uint8_t* qweight, const ActType* 
     constexpr int Interleave = Details::kInterleave;
     constexpr int WarpSize = 32;
     constexpr int Num = Batch * NPerBlock;
-    const int tid = threadIdx.x;
-    const int bid = blockIdx.x;
-    const int n_start_id = bid * NPerBlock * Interleave;
+    int const tid = threadIdx.x;
+    int const bid = blockIdx.x;
+    int const n_start_id = bid * NPerBlock * Interleave;
     // Calculate the n-dimensional index of the data processed by the current thread in the interleave tile
-    const int interleave_n_id = (tid / Details::kThreadsNumPerTile) % Interleave;
+    int const interleave_n_id = (tid / Details::kThreadsNumPerTile) % Interleave;
 
     qweight += n_start_id * k / Details::kElemsPerByte;
     ScaleLoader scale_loader(scales, zeros, n_start_id + interleave_n_id, n);
@@ -352,7 +352,7 @@ __device__ void weight_only_batched_gemv(const uint8_t* qweight, const ActType* 
                         weights_quantized + i * Details::kConvertCount / Details::kElemsPerByte)));
             }
 #pragma unroll
-            for (int i = 0; i < Details::kShuffleContinous; ++i)
+            for (int i = 0; i < Details::kShuffleContinuous; ++i)
             {
 #pragma unroll
                 for (int j = 0; j < Details::kShuffleStrided; ++j)
@@ -360,7 +360,7 @@ __device__ void weight_only_batched_gemv(const uint8_t* qweight, const ActType* 
                     // Dequantize the weights and arrange the shuffled elements back to the correct order in the
                     // register array
                     ActType2 v = *reinterpret_cast<ActType2*>(weights_vec + i * Details::kShuffleBasicTile
-                        + j * Details::kShuffleContinous * Details::kShuffleBasicTile);
+                        + j * Details::kShuffleContinuous * Details::kShuffleBasicTile);
                     v = __hfma2(
                         v, ActTypeDetails<ActType>::to_vec2(scale[idx]), ActTypeDetails<ActType>::to_vec2(zero[idx]));
                     weights_f16[(i * Details::kShuffleStrided * Details::kShuffleBasicTile
@@ -469,8 +469,8 @@ __device__ void weight_only_batched_gemv(const uint8_t* qweight, const ActType* 
 
 template <typename ActType, WeightOnlyQuantType QType, typename WeightOnlyFlag, template <typename T> class ActOp,
     bool Zero, bool Bias, bool ActScale, int NPerBlock, int Batch, int BlockSize>
-__global__ void weight_only_batched_gemv_wrapper(const uint8_t* qweight, const ActType* scales, const ActType* zeros,
-    const ActType* in, const ActType* act_scale, const ActType* bias, ActType* out, const int n, const int k)
+__global__ void weight_only_batched_gemv_wrapper(uint8_t const* qweight, ActType const* scales, ActType const* zeros,
+    ActType const* in, ActType const* act_scale, ActType const* bias, ActType* out, int const n, int const k)
 {
     if constexpr (std::is_same_v<ActType, half>)
     {
@@ -490,7 +490,7 @@ template <WeightOnlyQuantType QType, typename WeightOnlyFlag, template <typename
     int NPerBlock, int Batch, int BlockSize>
 struct WeightOnlyBatchedGemvKernelLauncher
 {
-    static void run(const WeightOnlyParams& params, cudaStream_t stream)
+    static void run(WeightOnlyParams const& params, cudaStream_t stream)
     {
         if (params.act_type == WeightOnlyActivationType::FP16)
         {
@@ -502,18 +502,18 @@ struct WeightOnlyBatchedGemvKernelLauncher
             {
                 weight_only_batched_gemv_wrapper<half, QType, WeightOnlyFlag, ActOp, Zero, Bias, true, NPerBlock, Batch,
                     BlockSize><<<grid, block, size, stream>>>(params.qweight,
-                    reinterpret_cast<const half*>(params.scales), reinterpret_cast<const half*>(params.zeros),
-                    reinterpret_cast<const half*>(params.in), reinterpret_cast<const half*>(params.act_scale),
-                    reinterpret_cast<const half*>(params.bias), reinterpret_cast<half*>(params.out), params.n,
+                    reinterpret_cast<half const*>(params.scales), reinterpret_cast<half const*>(params.zeros),
+                    reinterpret_cast<half const*>(params.in), reinterpret_cast<half const*>(params.act_scale),
+                    reinterpret_cast<half const*>(params.bias), reinterpret_cast<half*>(params.out), params.n,
                     params.k);
             }
             else
             {
                 weight_only_batched_gemv_wrapper<half, QType, WeightOnlyFlag, ActOp, Zero, Bias, false, NPerBlock,
                     Batch, BlockSize><<<grid, block, size, stream>>>(params.qweight,
-                    reinterpret_cast<const half*>(params.scales), reinterpret_cast<const half*>(params.zeros),
-                    reinterpret_cast<const half*>(params.in), reinterpret_cast<const half*>(params.act_scale),
-                    reinterpret_cast<const half*>(params.bias), reinterpret_cast<half*>(params.out), params.n,
+                    reinterpret_cast<half const*>(params.scales), reinterpret_cast<half const*>(params.zeros),
+                    reinterpret_cast<half const*>(params.in), reinterpret_cast<half const*>(params.act_scale),
+                    reinterpret_cast<half const*>(params.bias), reinterpret_cast<half*>(params.out), params.n,
                     params.k);
             }
         }
@@ -528,22 +528,22 @@ struct WeightOnlyBatchedGemvKernelLauncher
             {
                 weight_only_batched_gemv_wrapper<__nv_bfloat16, QType, WeightOnlyFlag, ActOp, Zero, Bias, true,
                     NPerBlock, Batch, BlockSize><<<grid, block, size, stream>>>(params.qweight,
-                    reinterpret_cast<const __nv_bfloat16*>(params.scales),
-                    reinterpret_cast<const __nv_bfloat16*>(params.zeros),
-                    reinterpret_cast<const __nv_bfloat16*>(params.in),
-                    reinterpret_cast<const __nv_bfloat16*>(params.act_scale),
-                    reinterpret_cast<const __nv_bfloat16*>(params.bias), reinterpret_cast<__nv_bfloat16*>(params.out),
+                    reinterpret_cast<__nv_bfloat16 const*>(params.scales),
+                    reinterpret_cast<__nv_bfloat16 const*>(params.zeros),
+                    reinterpret_cast<__nv_bfloat16 const*>(params.in),
+                    reinterpret_cast<__nv_bfloat16 const*>(params.act_scale),
+                    reinterpret_cast<__nv_bfloat16 const*>(params.bias), reinterpret_cast<__nv_bfloat16*>(params.out),
                     params.n, params.k);
             }
             else
             {
                 weight_only_batched_gemv_wrapper<__nv_bfloat16, QType, WeightOnlyFlag, ActOp, Zero, Bias, false,
                     NPerBlock, Batch, BlockSize><<<grid, block, size, stream>>>(params.qweight,
-                    reinterpret_cast<const __nv_bfloat16*>(params.scales),
-                    reinterpret_cast<const __nv_bfloat16*>(params.zeros),
-                    reinterpret_cast<const __nv_bfloat16*>(params.in),
-                    reinterpret_cast<const __nv_bfloat16*>(params.act_scale),
-                    reinterpret_cast<const __nv_bfloat16*>(params.bias), reinterpret_cast<__nv_bfloat16*>(params.out),
+                    reinterpret_cast<__nv_bfloat16 const*>(params.scales),
+                    reinterpret_cast<__nv_bfloat16 const*>(params.zeros),
+                    reinterpret_cast<__nv_bfloat16 const*>(params.in),
+                    reinterpret_cast<__nv_bfloat16 const*>(params.act_scale),
+                    reinterpret_cast<__nv_bfloat16 const*>(params.bias), reinterpret_cast<__nv_bfloat16*>(params.out),
                     params.n, params.k);
             }
         }

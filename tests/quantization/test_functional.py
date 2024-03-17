@@ -21,6 +21,9 @@ import numpy as np
 import torch
 import tensorrt as trt
 # isort: on
+import os
+import sys
+
 from parameterized import parameterized
 from polygraphy.backend.trt import EngineFromNetwork, TrtRunner
 
@@ -30,6 +33,9 @@ from tensorrt_llm.quantization.functional import (dequantize, quantize,
                                                   quantize_per_token)
 from tensorrt_llm.quantization.layers import quantize_tensor
 
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.util import unittest_name_func
+
 
 class TestQuantization(unittest.TestCase):
 
@@ -38,7 +44,8 @@ class TestQuantization(unittest.TestCase):
         tensorrt_llm.logger.set_level('error')
 
     @parameterized.expand([('float32', True), ('float16', True),
-                           ('float32', False)])
+                           ('float32', False)],
+                          name_func=unittest_name_func)
     def test_quantize_tensor(self, dtype, use_plugin):
         x_data = torch.randn(
             (1, 2, 2, 4), dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype))
@@ -126,7 +133,8 @@ class TestQuantization(unittest.TestCase):
                                    outputs['output'])
 
     @parameterized.expand([('float32', True), ('float16', True),
-                           ('float32', False)])
+                           ('float32', False)],
+                          name_func=unittest_name_func)
     def test_quantize_per_token(self, dtype, use_plugin):
         x_data = torch.randn(
             (4, 2, 4, 8), dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype))

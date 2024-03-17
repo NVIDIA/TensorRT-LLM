@@ -9,7 +9,7 @@ from binding_test_utils import *
 import tensorrt_llm.bindings as _tb
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import getSMVersion
+from utils.util import skip_pre_ampere
 
 
 @pytest.mark.parametrize(
@@ -22,13 +22,10 @@ from utils.util import getSMVersion
         # ("fp16-plugin-packed", "output_tokens_fp16_plugin_packed_tp1_pp1.npy"),
         # ("fp16-plugin-packed-paged", "output_tokens_fp16_plugin_packed_paged_tp1_pp1.npy"),
     ])
+@skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
 def test_gpt_session(variant, results_file, load_bytearray, llm_root: _pl.Path,
                      resource_path: _pl.Path, engine_path: _pl.Path,
                      data_path: _pl.Path, llm_model_root):
-    if getSMVersion() < 80:
-        pytest.skip(
-            "ContextFMHAType with fp32 acc is not supported in pre-ampere architecture"
-        )
     model_dir = "gpt2"
     tp_size = 1
     pp_size = 1

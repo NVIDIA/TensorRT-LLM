@@ -246,7 +246,7 @@ class BertModel(Module):
                                      sizes=seq_len_2d)
                 position_ids = expand(position_ids, shape(input_ids))
 
-        # creat extended_attention_mask as https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_utils.py
+        # create extended_attention_mask as https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_utils.py
         extended_attention_mask = expand_mask(mask, tgt_len=1)  # BxL -> Bx1x1xL
 
         # create token_type_ids

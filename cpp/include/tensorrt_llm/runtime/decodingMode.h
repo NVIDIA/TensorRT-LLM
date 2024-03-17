@@ -81,6 +81,11 @@ public:
 
     using UnderlyingType = uint8_t;
 
+    bool operator==(DecodingMode const& other) const
+    {
+        return mState == other.mState;
+    }
+
 private:
     constexpr DecodingMode(UnderlyingType state)
         : mState(state)

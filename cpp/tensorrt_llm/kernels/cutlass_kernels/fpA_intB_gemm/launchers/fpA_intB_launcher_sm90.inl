@@ -59,9 +59,9 @@ namespace cutlass_kernels
 template <typename ActivationType, typename WeightType, typename ScaleZeroType, typename BiasType, typename OutputType,
     cutlass::WeightOnlyQuantOp QuantOp, typename EpilogueTag, typename CTAShape, typename ClusterShape,
     typename MainloopScheduleType, typename EpilogueScheduleType>
-void sm90_generic_mixed_gemm_kernelLauncher(const ActivationType* A, const WeightType* B,
-    const ScaleZeroType* weight_scales, const ScaleZeroType* weight_zero_points, const BiasType* biases,
-    const float alpha, OutputType* C, int m, int n, int k, const int group_size, tkc::CutlassGemmConfig gemm_config,
+void sm90_generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType const* B,
+    ScaleZeroType const* weight_scales, ScaleZeroType const* weight_zero_points, BiasType const* biases,
+    float const alpha, OutputType* C, int m, int n, int k, int const group_size, tkc::CutlassGemmConfig gemm_config,
     char* workspace, size_t workspace_bytes, cudaStream_t stream, int* occupancy)
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
@@ -233,7 +233,7 @@ void sm90_generic_mixed_gemm_kernelLauncher(const ActivationType* A, const Weigh
         StrideS stride_S = cutlass::make_cute_packed_stride(StrideS{}, cute::make_shape(n, cutlass_scale_k, 1));
 
         // Use the output as the bias to avoid making a tma descriptor with a nullptr.
-        auto output_as_bias_type = reinterpret_cast<const CutlassBiasType*>(C);
+        auto output_as_bias_type = reinterpret_cast<CutlassBiasType const*>(C);
 
         typename Gemm::Arguments args{cutlass::gemm::GemmUniversalMode::kGemm, {n, m, k, 1},
             {reinterpret_cast<CutlassWeightType const*>(B), stride_B, reinterpret_cast<CutlassActivationType const*>(A),

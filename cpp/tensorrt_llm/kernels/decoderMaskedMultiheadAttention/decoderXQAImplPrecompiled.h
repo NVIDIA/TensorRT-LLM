@@ -29,19 +29,19 @@ public:
     {
     }
 
-    bool shouldUse(const XQAParams& xqaParams) override;
-    void prepare(const XQAParams& xqa_params) override;
+    bool shouldUse(XQAParams const& xqaParams) override;
+    void prepare(XQAParams const& xqa_params) override;
 
 protected:
-    void runWithKVLinearBuffer(const XQAParams& xqa_params, KVLinearBuffer& kv_linear_buffer,
-        int2& rotary_kernel_launch_cache, const cudaStream_t& stream) override;
-    void runWithKVBlockArray(const XQAParams& xqa_params, KVBlockArray& kv_block_array,
-        int2& rotary_kernel_launch_cache, const cudaStream_t& stream) override;
+    void runWithKVLinearBuffer(XQAParams const& xqa_params, KVLinearBuffer& kv_linear_buffer,
+        int2& rotary_kernel_launch_cache, cudaStream_t const& stream) override;
+    void runWithKVBlockArray(XQAParams const& xqa_params, KVBlockArray& kv_block_array,
+        int2& rotary_kernel_launch_cache, cudaStream_t const& stream) override;
 
 private:
     template <typename KVCacheBuffer>
-    void runDispatchBuffer(const XQAParams& xqa_params, KVCacheBuffer& kv_cache_buffer,
-        int2& rotary_kernel_launch_cache, const cudaStream_t& stream);
+    void runDispatchBuffer(XQAParams const& xqa_params, KVCacheBuffer& kv_cache_buffer,
+        int2& rotary_kernel_launch_cache, cudaStream_t const& stream);
 };
 
 } // namespace kernels

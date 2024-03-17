@@ -43,14 +43,14 @@ struct GemmIDMoe
     tensorrt_llm::common::QuantMode quant_mode;
     tensorrt_llm::kernels::MOEParallelismMode parallelism_mode{};
 
-    bool operator==(const GemmIDMoe& id) const
+    bool operator==(GemmIDMoe const& id) const
     {
         return id.num_experts == num_experts && id.moe_k == moe_k && id.hidden == hidden && id.inter == inter
             && id.actfn == actfn && id.dtype == dtype && id.wdtype == wdtype && id.quant_mode == quant_mode
             && id.parallelism_mode == parallelism_mode;
     }
 
-    friend std::ostream& operator<<(std::ostream& out, const GemmIDMoe& id)
+    friend std::ostream& operator<<(std::ostream& out, GemmIDMoe const& id)
     {
         out << "experts, k, hidden, inter, actfn, dtype, weight type, parallelism mode=" << id.num_experts << ","
             << id.moe_k << "," << id.hidden << "," << id.inter << "," << static_cast<int>(id.actfn) << ","
@@ -63,7 +63,7 @@ struct GemmIDMoe
 // Hash of GemmIDMoe
 struct GemmIDMoeHash
 {
-    std::size_t operator()(const GemmIDMoe& id) const
+    std::size_t operator()(GemmIDMoe const& id) const
     {
         size_t hash = std::hash<int>{}(id.num_experts);
         hash ^= std::hash<int>{}(id.moe_k);
@@ -90,8 +90,8 @@ public:
         tensorrt_llm::common::QuantMode quant_mode, bool use_finished, bool use_bias, int tp_size, int tp_rank,
         MOEParallelismMode parallelism_mode, MOEExpertScaleNormalizationMode normalization_mode,
         MixtureOfExpertsPluginProfilerPtr plugin_profiler_ptr);
-    MixtureOfExpertsPlugin(const void* data, size_t length, MixtureOfExpertsPluginProfilerPtr plugin_profiler_ptr);
-    MixtureOfExpertsPlugin(const MixtureOfExpertsPlugin&);
+    MixtureOfExpertsPlugin(void const* data, size_t length, MixtureOfExpertsPluginProfilerPtr plugin_profiler_ptr);
+    MixtureOfExpertsPlugin(MixtureOfExpertsPlugin const&);
 
     void init();
 
@@ -99,24 +99,24 @@ public:
 
     // IPluginV2DynamicExt Methods
     nvinfer1::IPluginV2DynamicExt* clone() const noexcept override;
-    nvinfer1::DimsExprs getOutputDimensions(int outputIndex, const nvinfer1::DimsExprs* inputs, int nbInputs,
+    nvinfer1::DimsExprs getOutputDimensions(int outputIndex, nvinfer1::DimsExprs const* inputs, int nbInputs,
         nvinfer1::IExprBuilder& exprBuilder) noexcept override;
     bool supportsFormatCombination(
-        int pos, const nvinfer1::PluginTensorDesc* inOut, int nbInputs, int nbOutputs) noexcept override;
-    void configurePlugin(const nvinfer1::DynamicPluginTensorDesc* in, int nbInputs,
-        const nvinfer1::DynamicPluginTensorDesc* out, int nbOutputs) noexcept override;
-    size_t getWorkspaceSize(const nvinfer1::PluginTensorDesc* inputs, int nbInputs,
-        const nvinfer1::PluginTensorDesc* outputs, int nbOutputs) const noexcept override;
-    int enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const nvinfer1::PluginTensorDesc* outputDesc,
-        const void* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept override;
+        int pos, nvinfer1::PluginTensorDesc const* inOut, int nbInputs, int nbOutputs) noexcept override;
+    void configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int nbInputs,
+        nvinfer1::DynamicPluginTensorDesc const* out, int nbOutputs) noexcept override;
+    size_t getWorkspaceSize(nvinfer1::PluginTensorDesc const* inputs, int nbInputs,
+        nvinfer1::PluginTensorDesc const* outputs, int nbOutputs) const noexcept override;
+    int enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
+        void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept override;
 
     // IPluginV2Ext Methods
     nvinfer1::DataType getOutputDataType(
-        int index, const nvinfer1::DataType* inputTypes, int nbInputs) const noexcept override;
+        int index, nvinfer1::DataType const* inputTypes, int nbInputs) const noexcept override;
 
     // IPluginV2 Methods
-    const char* getPluginType() const noexcept override;
-    const char* getPluginVersion() const noexcept override;
+    char const* getPluginType() const noexcept override;
+    char const* getPluginVersion() const noexcept override;
 
     int getNbOutputs() const noexcept override
     {
@@ -128,8 +128,8 @@ public:
     size_t getSerializationSize() const noexcept override;
     void serialize(void* buffer) const noexcept override;
     void destroy() noexcept override;
-    void setPluginNamespace(const char* pluginNamespace) noexcept override;
-    const char* getPluginNamespace() const noexcept override;
+    void setPluginNamespace(char const* pluginNamespace) noexcept override;
+    char const* getPluginNamespace() const noexcept override;
 
 private:
     friend class MixtureOfExpertsGemmProfiler;
@@ -169,7 +169,7 @@ private:
         size_t size{};
     };
 
-    int getNumTokens(const nvinfer1::PluginTensorDesc* input_tensor) const;
+    int getNumTokens(nvinfer1::PluginTensorDesc const* input_tensor) const;
     WorkspaceInfo setupWorkspace(void* base_ptr, int num_tokens) const;
 
     kernels::MOEParallelismConfig getParallelismConfig() const;
@@ -288,7 +288,7 @@ public:
 
 protected:
     using Config = tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
-    void runTactic(int m, int n, int k, const Config& tactic, char* workspace, const cudaStream_t& stream) override;
+    void runTactic(int m, int n, int k, Config const& tactic, char* workspace, cudaStream_t const& stream) override;
     void computeTmpSize(int maxM, int n, int k) override;
     std::vector<Config> getTactics(int m, int n, int k) const override;
     void initTmpData(int maxM, int n, int k, char* workspace, size_t size, cudaStream_t stream) override;
@@ -301,20 +301,20 @@ class MixtureOfExpertsPluginCreator : public nvinfer1::IPluginCreator
 public:
     MixtureOfExpertsPluginCreator();
 
-    const char* getPluginName() const noexcept override;
+    char const* getPluginName() const noexcept override;
 
-    const char* getPluginVersion() const noexcept override;
+    char const* getPluginVersion() const noexcept override;
 
-    const nvinfer1::PluginFieldCollection* getFieldNames() noexcept override;
+    nvinfer1::PluginFieldCollection const* getFieldNames() noexcept override;
 
-    nvinfer1::IPluginV2* createPlugin(const char* name, const nvinfer1::PluginFieldCollection* fc) noexcept override;
+    nvinfer1::IPluginV2* createPlugin(char const* name, nvinfer1::PluginFieldCollection const* fc) noexcept override;
 
     nvinfer1::IPluginV2* deserializePlugin(
-        const char* name, const void* serialData, size_t serialLength) noexcept override;
+        char const* name, void const* serialData, size_t serialLength) noexcept override;
 
-    void setPluginNamespace(const char* pluginNamespace) noexcept override;
+    void setPluginNamespace(char const* pluginNamespace) noexcept override;
 
-    const char* getPluginNamespace() const noexcept override;
+    char const* getPluginNamespace() const noexcept override;
 
 private:
     GemmPluginProfilerManager<MixtureOfExpertsGemmProfiler> moePluginProfiler;

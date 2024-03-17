@@ -119,7 +119,7 @@ struct BaseMoeProblemVisitor
 
     /// Get the grid shape
     CUTLASS_HOST_DEVICE
-    static cutlass::gemm::GemmCoord grid_shape(const cutlass::gemm::GemmCoord& problem)
+    static cutlass::gemm::GemmCoord grid_shape(cutlass::gemm::GemmCoord const& problem)
     {
 
         return cutlass::gemm::GemmCoord(((problem.m() - 1 + ThreadblockShape::kM) / ThreadblockShape::kM),
@@ -177,12 +177,12 @@ struct BaseMoeProblemVisitor
     }
 
     CUTLASS_HOST_DEVICE
-    static int32_t tile_count(const cutlass::gemm::GemmCoord& grid)
+    static int32_t tile_count(cutlass::gemm::GemmCoord const& grid)
     {
         return ProblemSizeHelper::tile_count(grid);
     }
 
-    static int32_t group_tile_count(const cutlass::gemm::GemmCoord* host_problem_sizes_ptr, int32_t problem_count)
+    static int32_t group_tile_count(cutlass::gemm::GemmCoord const* host_problem_sizes_ptr, int32_t problem_count)
     {
         int32_t total_tiles = 0;
         for (int32_t i = 0; i < problem_count; ++i)
@@ -328,12 +328,12 @@ struct MoeProblemVisitor<ProblemSizeHelper, ThreadblockShape, GroupScheduleMode:
     }
 
     static size_t get_workspace_size(
-        const cutlass::gemm::GemmCoord* host_problem_sizes_ptr, int32_t problem_count, int32_t block_count)
+        cutlass::gemm::GemmCoord const* host_problem_sizes_ptr, int32_t problem_count, int32_t block_count)
     {
         return 0;
     }
 
-    static void host_precompute(const cutlass::gemm::GemmCoord* host_problem_sizes_ptr, int32_t problem_count,
+    static void host_precompute(cutlass::gemm::GemmCoord const* host_problem_sizes_ptr, int32_t problem_count,
         int32_t block_count, void* host_workspace_ptr)
     {
     }

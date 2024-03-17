@@ -65,7 +65,7 @@ __forceinline__ __device__ float copysignf_pos(float a, float b)
 __forceinline__ __device__ float tanh_opt(float x)
 {
 #if (__CUDACC_VER_MAJOR__ < 11) || (__CUDA_ARCH__ < 750)
-    const float exp_val = -1.f * fabs(2 * x);
+    float const exp_val = -1.f * fabs(2 * x);
     return copysignf_pos((1.0f - __expf(exp_val)) / (__expf(exp_val) + 1.0f), x);
 #else
     return fast_tanh(x);
@@ -76,7 +76,7 @@ __forceinline__ __device__ float tanh_opt(float x)
 template <>
 struct GELU_taylor<float>
 {
-    static const bool kIsHeavy = true;
+    static bool const kIsHeavy = true;
 
     CUTLASS_DEVICE
     float operator()(float const& z) const

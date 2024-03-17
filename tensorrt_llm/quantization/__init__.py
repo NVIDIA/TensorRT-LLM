@@ -13,5 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from .mode import QuantMode
+from .quantize_by_ammo import quantize_and_export
 
-__all__ = ['QuantMode']
+__all__ = ['QuantMode', 'quantize_and_export']

@@ -32,3 +32,7 @@ python3 llm_examples.py --task run_llm_generate_async_example \
     --hf_model_dir=$LLAMA_MODEL_DIR \
     --streaming \
     --tp_size=2
+
+python3 llm_examples.py --task run_llm_with_async_future \
+    --prompt="$PROMPT" \
+    --hf_model_dir=$LLAMA_MODEL_DIR

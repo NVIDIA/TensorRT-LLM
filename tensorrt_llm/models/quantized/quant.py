@@ -116,9 +116,8 @@ def _smooth_quantize_llama(model, quant_mode):
                                         tp_size=layer.tp_size,
                                         quant_mode=quant_mode,
                                         bias=layer.mlp.fc.bias is not None)
-        assert hasattr(
-            layer,
-            "post_layernorm"), "The layer has no post_rmspost_layernormnorm"
+        assert hasattr(layer,
+                       "post_layernorm"), "The layer has no post_layernorm"
         layer.post_layernorm = SmoothQuantRmsNorm(
             normalized_shape=layer.hidden_size,
             dtype=layer.dtype,
@@ -159,9 +158,8 @@ def _smooth_quantize_bloom(model, quant_mode):
                                    tp_group=layer.tp_group,
                                    tp_size=layer.tp_size,
                                    quant_mode=quant_mode)
-        assert hasattr(
-            layer,
-            "post_layernorm"), "The layer has no post_rmspost_layernormnorm"
+        assert hasattr(layer,
+                       "post_layernorm"), "The layer has no post_layernorm"
         layer.post_layernorm = SmoothQuantLayerNorm(
             normalized_shape=layer.hidden_size,
             dtype=layer.dtype,
@@ -210,9 +208,8 @@ def _smooth_quantize_baichuan(model, quant_mode):
                                         tp_size=layer.tp_size,
                                         quant_mode=quant_mode,
                                         bias=layer.mlp.fc.bias is not None)
-        assert hasattr(
-            layer,
-            "post_layernorm"), "The layer has no post_rmspost_layernormnorm"
+        assert hasattr(layer,
+                       "post_layernorm"), "The layer has no post_layernorm"
         layer.post_layernorm = SmoothQuantRmsNorm(
             normalized_shape=layer.hidden_size,
             dtype=layer.dtype,
@@ -255,9 +252,8 @@ def _smooth_quantize_internlm(model, quant_mode):
                                         tp_size=layer.tp_size,
                                         quant_mode=quant_mode,
                                         bias=False)
-        assert hasattr(
-            layer,
-            "post_layernorm"), "The layer has no post_rmspost_layernormnorm"
+        assert hasattr(layer,
+                       "post_layernorm"), "The layer has no post_layernorm"
         layer.post_layernorm = SmoothQuantRmsNorm(
             normalized_shape=layer.hidden_size,
             dtype=layer.dtype,

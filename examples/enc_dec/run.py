@@ -29,7 +29,8 @@ from transformers import (AutoConfig, AutoModelForSeq2SeqLM, AutoTokenizer,
 import tensorrt_llm
 from tensorrt_llm import logger
 from tensorrt_llm._utils import torch_to_numpy, trt_dtype_to_torch
-from tensorrt_llm.runtime import LoraManager, ModelConfig, SamplingConfig
+from tensorrt_llm.lora_manager import LoraManager
+from tensorrt_llm.runtime import ModelConfig, SamplingConfig
 
 
 def get_engine_name(model, dtype, tp_size, pp_size, rank):
@@ -83,6 +84,7 @@ def read_config(config_path: Path):
     num_kv_heads = (num_kv_heads + tp_size - 1) // tp_size
 
     cross_attention = builder_config["cross_attention"]
+    skip_cross_qkv = builder_config.get('skip_cross_qkv', False)
     has_position_embedding = builder_config["has_position_embedding"]
     has_token_type_embedding = builder_config["has_token_type_embedding"]
     use_custom_all_reduce = config['plugin_config'].get('use_custom_all_reduce',
@@ -120,6 +122,7 @@ def read_config(config_path: Path):
             'hf_modules_to_trtllm_modules'),
         trtllm_modules_to_hf_modules=builder_config.get(
             'trtllm_modules_to_hf_modules'),
+        skip_cross_qkv=skip_cross_qkv,
     )
 
     return model_config, tp_size, pp_size, gpus_per_node, dtype
@@ -145,7 +148,7 @@ def parse_arguments():
     parser.add_argument("--compare_hf_fp32",
                         help="Compare results with HuggingFace FP32",
                         action='store_true')
-    parser.add_argument('--lora_dir', type=str, default=None)
+    parser.add_argument('--lora_dir', type=str, default=None, nargs="+")
     parser.add_argument('--lora_task_uids', type=str, default=None, nargs="+")
     return parser.parse_args()
 
@@ -228,7 +231,7 @@ class TRTLLMEncDecModel:
                 # TODO: this is only for bart
                 self.encoder_lora_manager.load_from_hf_bart(
                     component='encoder',
-                    model_dirs=[lora_dir],
+                    model_dirs=lora_dir,
                     model_config=self.encoder_model_config,
                     runtime_mapping=self.encoder_runtime_mapping,
                 )
@@ -252,7 +255,7 @@ class TRTLLMEncDecModel:
             # TODO: this is only for bart
             self.decoder_lora_manager.load_from_hf_bart(
                 component='decoder',
-                model_dirs=[lora_dir],
+                model_dirs=lora_dir,
                 model_config=self.decoder_model_config,
                 runtime_mapping=self.decoder_runtime_mapping,
             )
@@ -378,6 +381,7 @@ class TRTLLMEncDecModel:
             device=self.device).contiguous()
 
         if self.encoder_model_config.lora_plugin and self.encoder_lora_manager is not None:
+            batch_size = input_lengths.size(0)
             missing_qkv_modules = []
             if any(x in self.encoder_model_config.lora_target_modules
                    for x in ["attn_q", "attn_k", "attn_v"]):
@@ -391,7 +395,7 @@ class TRTLLMEncDecModel:
                         missing_qkv_modules):
                     lora_ranks = []
                     lora_ptrs = []
-                    for batch_idx in range(input_ids.shape[0]):
+                    for batch_idx in range(batch_size):
                         lora_uid = self.lora_task_uids[batch_idx]
                         if lora_uid is not None and lora_uid != "-1" and self.encoder_lora_manager.uid_to_low_ranks(
                                 lora_uid)[layer_idx][lora_module] != 0:
@@ -415,8 +419,12 @@ class TRTLLMEncDecModel:
                     })
             inputs.update({
                 'host_request_types':
-                torch.IntTensor([0] * input_ids.shape[0]).to('cpu'),
+                torch.IntTensor([0] * batch_size).to('cpu'),
             })
+            if self.encoder_model_config.remove_input_padding:
+                inputs.update({
+                    'host_context_lengths': input_lengths.to('cpu'),
+                })
 
         # Note: runtime.Session's run() method will set input/output tensor address, here we only need to provide tensor shape
         self.encoder_session.set_shapes(inputs)
@@ -575,8 +583,8 @@ class TRTLLMEncDecModel:
                                          num_beams=num_beams,
                                          min_length=1,
                                          return_dict=return_dict)
-        sampling_config.update(output_cum_log_probs=False,
-                               output_log_probs=False)
+        sampling_config.update(output_cum_log_probs=return_dict,
+                               output_log_probs=return_dict)
 
         # decoder autoregressive generation
         self.decoder_session.setup(
@@ -748,9 +756,12 @@ if __name__ == "__main__":
                 MBartForConditionalGeneration), 'Unsupported model!'
 
             if args.lora_dir is not None:
+                assert len(args.lora_dir
+                           ) >= 1, "At least one lora model dir is required"
+                # we can only test single lora with HF
                 from peft import PeftModel
                 hf_model = PeftModel.from_pretrained(
-                    hf_model, args.lora_dir).to('cuda').eval()
+                    hf_model, args.lora_dir[0]).to('cuda').eval()
 
             tik = time.time()
             hf_gen_output = hf_model.generate(

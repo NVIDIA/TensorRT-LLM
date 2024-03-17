@@ -53,7 +53,8 @@ def generate_output(engine: str, output_name: str, max_output_len: int = 8):
 def generate_outputs():
     print(f'Generating outputs for Medusa FP16')
     generate_output(engine='fp16-plugin-packed-paged',
-                    output_name='output_tokens_fp16_plugin_packed_paged')
+                    output_name='output_tokens_long_fp16_plugin_packed_paged',
+                    max_output_len=128)
 
 
 if __name__ == '__main__':

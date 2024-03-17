@@ -26,9 +26,9 @@ namespace kernels
 {
 
 template <typename T>
-void invokeBanRepeatNgram(T* logits, const int** output_ids_buf, const FinishedState* finished_buf,
-    const int** parent_ids_buf, const int* batch_slot, const int* sequence_lengths, int batch_size, int beam_width,
-    int max_seq_len, const int* no_repeat_ngram_size_buf, int vocab_size_padded, size_t max_step, cudaStream_t stream);
+void invokeBanRepeatNgram(T* logits, int const** output_ids_buf, FinishedState const* finished_buf,
+    int const** parent_ids_buf, int const* batch_slot, int const* sequence_lengths, int batch_size, int beam_width,
+    int max_seq_len, int const* no_repeat_ngram_size_buf, int vocab_size_padded, size_t max_step, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm

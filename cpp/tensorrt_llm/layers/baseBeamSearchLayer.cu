@@ -28,16 +28,16 @@ namespace tensorrt_llm
 namespace layers
 {
 
-__global__ void update_indir_cache_kernel(int* tgt_indir_cache, const int* src_indir_cache, const int** parent_ids,
-    const FinishedState* finished, const int* sequence_lengths, const int* input_lengths, int batch_dim,
+__global__ void update_indir_cache_kernel(int* tgt_indir_cache, int const* src_indir_cache, int const** parent_ids,
+    FinishedState const* finished, int const* sequence_lengths, int const* input_lengths, int batch_dim,
     int local_batch_size, int beam_width, int max_attention_window, int sink_token_length, int max_seq_len)
 {
     int time_step = threadIdx.x + blockIdx.x * blockDim.x;
     int bb_id = threadIdx.y + blockIdx.y * blockDim.y;   // should be just blockIdx.y?
-    const int current_step{sequence_lengths[bb_id] - 1}; // the sequence_lengths is updated, need to minus 1
-    const int input_length{input_lengths == nullptr ? 0 : input_lengths[bb_id]};
-    const int batch_id = bb_id / beam_width;
-    const int beam_id = bb_id % beam_width;
+    int const current_step{sequence_lengths[bb_id] - 1}; // the sequence_lengths is updated, need to minus 1
+    int const input_length{input_lengths == nullptr ? 0 : input_lengths[bb_id]};
+    int const batch_id = bb_id / beam_width;
+    int const beam_id = bb_id % beam_width;
     // Exit when the batch_beam or timestep is out of the bound.
     // Assume that KV Cache is shared and fixed for context part,
     //  so we don't need to update the indices for context part.
@@ -54,7 +54,7 @@ __global__ void update_indir_cache_kernel(int* tgt_indir_cache, const int* src_i
     }
 
     // for the parent_ids, we will still keep it for all past tokens (i.e. max_seq_len)
-    const int src_beam = parent_ids[batch_id][beam_id * max_seq_len + current_step];
+    int const src_beam = parent_ids[batch_id][beam_id * max_seq_len + current_step];
 
     // for the indir tables, we have the cyclic kv cache.
     const uint32_t tgt_offset
@@ -65,8 +65,8 @@ __global__ void update_indir_cache_kernel(int* tgt_indir_cache, const int* src_i
     tgt_indir_cache[tgt_offset] = (time_step == current_step) ? beam_id : src_indir_cache[src_offset];
 }
 
-void update_indir_cache_kernelLauncher(int* tgt_indir_cache, const int* src_indir_cache, const int** parent_ids,
-    const FinishedState* finished, const int* sequence_lengths, const int* input_lengths, int batch_dim,
+void update_indir_cache_kernelLauncher(int* tgt_indir_cache, int const* src_indir_cache, int const** parent_ids,
+    FinishedState const* finished, int const* sequence_lengths, int const* input_lengths, int batch_dim,
     int local_batch_size, int beam_width, int max_seq_len, int max_attention_window, int sink_token_length,
     cudaStream_t stream)
 {
@@ -136,17 +136,17 @@ void BaseBeamSearchLayer<T>::forward(BeamSearchOutputParams& outputs, ForwardPar
     TLLM_LOG_TRACE("%s", __PRETTY_FUNCTION__);
     Tensor& output_ids_ptr = outputs.output_ids_ptr;
 
-    const auto batch_size = static_cast<std::int32_t>(output_ids_ptr.shape[0]);
-    const auto beam_width = static_cast<std::int32_t>(output_ids_ptr.shape[1]);
-    const auto max_seq_len = static_cast<std::int32_t>(output_ids_ptr.shape[2]);
+    auto const batch_size = static_cast<std::int32_t>(output_ids_ptr.shape[0]);
+    auto const beam_width = static_cast<std::int32_t>(output_ids_ptr.shape[1]);
+    auto const max_seq_len = static_cast<std::int32_t>(output_ids_ptr.shape[2]);
 
     TLLM_CHECK_WITH_INFO(params.ite == 0, "Pipeline Parallelism is not supported yet !");
 
-    const int ite = params.ite;
-    auto* const input_lengths = params.input_lengths ? params.input_lengths->template getPtr<const int>() : nullptr;
+    int const ite = params.ite;
+    auto* const input_lengths = params.input_lengths ? params.input_lengths->template getPtr<int const>() : nullptr;
     int* sequence_length = (outputs.sequence_length) ? outputs.sequence_length->template getPtr<int>() : nullptr;
     Tensor const& logits = params.logits;
-    const auto local_batch_size = logits.shape[0];
+    auto const local_batch_size = logits.shape[0];
 
     invokeSoftMax(outputs, params);
     sync_check_cuda_error();
@@ -154,9 +154,9 @@ void BaseBeamSearchLayer<T>::forward(BeamSearchOutputParams& outputs, ForwardPar
     if (beam_width > 1)
     {
         update_indir_cache_kernelLauncher(outputs.tgt_cache_indirection.template getPtr<int>(),
-            params.src_cache_indirection.template getPtr<const int>(),
-            outputs.parent_ids_ptr.template getPtr<const int*>(),
-            reinterpret_cast<const FinishedState*>(
+            params.src_cache_indirection.template getPtr<int const>(),
+            outputs.parent_ids_ptr.template getPtr<int const*>(),
+            reinterpret_cast<FinishedState const*>(
                 outputs.finished->template getPtr<const FinishedState::UnderlyingType>()),
             sequence_length, input_lengths, batch_size, local_batch_size, beam_width, max_seq_len,
             params.max_attention_window, params.sink_token_length, mStream);

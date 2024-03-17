@@ -164,7 +164,7 @@ protected:
         size_t workspace_size = mMoERunner.getWorkspaceSize(
             mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK, mActType, parallelism_config);
 
-        const auto stream = mStream->get();
+        auto const stream = mStream->get();
 
         mWorkspace = allocBuffer<char>(workspace_size);
         check_cuda_error(cudaMemsetAsync(mWorkspace, 0xD5, workspace_size, stream));
@@ -273,8 +273,8 @@ protected:
     {
         if (parallelism_config.tp_size > 1)
         {
-            const int tp_size = parallelism_config.tp_size;
-            const int tp_rank = parallelism_config.tp_rank;
+            int const tp_size = parallelism_config.tp_size;
+            int const tp_rank = parallelism_config.tp_rank;
 
             const size_t matrix_size = mHiddenSize * mInterSize / tp_size;
 
@@ -321,7 +321,7 @@ protected:
         // Clear the buffers to blank so we can assume zero if not written
         resetOutBuffers();
 
-        const auto [weight1_ptr, weight2_ptr, bias1_ptr, bias2_ptr] = getWeights(parallelism_config);
+        auto const [weight1_ptr, weight2_ptr, bias1_ptr, bias2_ptr] = getWeights(parallelism_config);
 
         auto stream = mStream->get();
         mMoERunner.setTactic(std::nullopt);
@@ -333,18 +333,18 @@ protected:
     }
 
     template <class T>
-    std::vector<T> getDataFromDevice(const T* in, size_t length)
+    std::vector<T> getDataFromDevice(T const* in, size_t length)
     {
         std::vector<T> data(length);
 
-        const auto stream = mStream->get();
+        auto const stream = mStream->get();
         check_cuda_error(cudaMemcpyAsync(data.data(), in, length * sizeof(T), cudaMemcpyDeviceToHost, stream));
         check_cuda_error(cudaStreamSynchronize(mStream->get()));
 
         return data;
     }
 
-    auto maskSelectedExpertsForTP(const std::vector<int>& vector, int tp_size, int tp_rank)
+    auto maskSelectedExpertsForTP(std::vector<int> const& vector, int tp_size, int tp_rank)
     {
         std::vector<int> result;
         int num_experts_per_node = mNumExperts / tp_size;
@@ -415,8 +415,8 @@ protected:
         return calcMLPVal(input, expert_id, mUseBias);
     }
 
-    void comparePermuted(const std::vector<int>& expected_experts, const std::vector<int>& expected_permutation,
-        const std::vector<DataType>& input_data)
+    void comparePermuted(std::vector<int> const& expected_experts, std::vector<int> const& expected_permutation,
+        std::vector<DataType> const& input_data)
     {
         auto states = getDataFromDevice(mExpertOutput, mTotalTokens * mK * mHiddenSize);
 
@@ -427,11 +427,11 @@ protected:
             {
                 // Permutation has the position of the first copy of all token,
                 // followed by the position of the second copy of all tokens etc.
-                const int permuted_position = expected_permutation[k_idx * mTotalTokens + token_id];
+                int const permuted_position = expected_permutation[k_idx * mTotalTokens + token_id];
 
                 // Expected experts has all the selected experts for token one,
                 // followed by all the selected experts for token two etc.
-                const int expert_id = expected_experts[token_id * mK + k_idx];
+                int const expert_id = expected_experts[token_id * mK + k_idx];
 
                 // Compare the copied tokens with the projection applied
                 for (int hidden_id = 0; hidden_id < mHiddenSize; hidden_id++)
@@ -445,7 +445,7 @@ protected:
         }
     }
 
-    std::vector<DataType> softmax(const std::vector<DataType>& expected_probs)
+    std::vector<DataType> softmax(std::vector<DataType> const& expected_probs)
     {
         std::vector<DataType> result;
         // All values we test are 0-1 so we can skip the normalization step
@@ -467,7 +467,7 @@ protected:
         return result;
     }
 
-    void compareSoftmax(const std::vector<int>& expected_experts, const std::vector<DataType>& expected_probs,
+    void compareSoftmax(std::vector<int> const& expected_experts, std::vector<DataType> const& expected_probs,
         std::vector<DataType> scale_probs = {})
     {
         if (scale_probs.empty())
@@ -489,7 +489,7 @@ protected:
         }
     }
 
-    void renormScales(DataType* probs, const int* experts)
+    void renormScales(DataType* probs, int const* experts)
     {
         if (mNormMode == MOEExpertScaleNormalizationMode::NONE)
             return;
@@ -505,8 +505,8 @@ protected:
         }
     }
 
-    void compareFinal(const std::vector<int>& expected_experts, const std::vector<DataType>& expected_probs,
-        const std::vector<DataType>& input_data, std::vector<DataType> final_results = {})
+    void compareFinal(std::vector<int> const& expected_experts, std::vector<DataType> const& expected_probs,
+        std::vector<DataType> const& input_data, std::vector<DataType> final_results = {})
     {
         if (final_results.empty())
             final_results = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
@@ -536,7 +536,7 @@ protected:
 
     void BasicPermuteTest(int k = 1);
 
-    std::vector<int> calcPermuteMapExpertParallel(const std::vector<int>& expected_experts);
+    std::vector<int> calcPermuteMapExpertParallel(std::vector<int> const& expected_experts);
     void ExpertParallelTest(int k = 1);
 
     void TensorParallelTest(int k = 1);
@@ -546,7 +546,7 @@ BufferManager::CudaStreamPtr MixtureOfExpertsTest::mStream{};
 std::unique_ptr<BufferManager> MixtureOfExpertsTest::mBufferManager{};
 int MixtureOfExpertsTest::mDeviceCount{};
 
-const int DEFAULT_HIDDEN_SIZE = 4;
+int const DEFAULT_HIDDEN_SIZE = 4;
 
 void MixtureOfExpertsTest::BasicPermuteTest(int k)
 {
@@ -658,7 +658,7 @@ TEST_F(MixtureOfExpertsTest, Finished)
     compareFinal(selected_expert, probs, hidden_states);
 }
 
-std::vector<int> MixtureOfExpertsTest::calcPermuteMapExpertParallel(const std::vector<int>& expected_experts)
+std::vector<int> MixtureOfExpertsTest::calcPermuteMapExpertParallel(std::vector<int> const& expected_experts)
 {
     std::vector<int> map(expected_experts.size());
     auto getInterleavedIndex = [this](int i) { return (i % mK) * mTotalTokens + i / mK; };
@@ -713,7 +713,7 @@ void MixtureOfExpertsTest::ExpertParallelTest(int k)
         auto selected_expert = getDataFromDevice(mSelectedExpert, num_tokens * k);
         // Experts should only be selected when we are on the right node
         // Note the index is [0,num_experts_per_node), so we offset the experts by the start for this node
-        const int start_expert = i * (mNumExperts / parallelism);
+        int const start_expert = i * (mNumExperts / parallelism);
         std::transform(selected_expert.begin(), selected_expert.end(), selected_expert.begin(),
             [&](int val) { return val == mNumExperts ? mNumExperts : val + start_expert; });
         auto masked_expected_experts = maskSelectedExpertsForTP(expected_experts, parallelism, i);

@@ -58,12 +58,12 @@ std::optional<FieldType> parseJsonFieldOptional(Json const& json, std::string_vi
     {
         value = json.at(name).template get<FieldType>();
     }
-    catch (const nlohmann::json::out_of_range& e)
+    catch (nlohmann::json::out_of_range const& e)
     {
         TLLM_LOG_WARNING(e.what());
         TLLM_LOG_WARNING("Optional value for parameter %s will not be set.", std::string(name).c_str());
     }
-    catch (const nlohmann::json::type_error& e)
+    catch (nlohmann::json::type_error const& e)
     {
         TLLM_LOG_WARNING(e.what());
         TLLM_LOG_WARNING("Optional value for parameter %s will not be set.", std::string(name).c_str());
@@ -185,8 +185,8 @@ template <typename InputType>
 GptJsonConfig parseJson(InputType&& input)
 {
     auto constexpr allowExceptions = true;
-    auto constexpr ingoreComments = true;
-    auto const json = nlohmann::json::parse(std::forward<InputType>(input), nullptr, allowExceptions, ingoreComments);
+    auto constexpr ignoreComments = true;
+    auto const json = nlohmann::json::parse(std::forward<InputType>(input), nullptr, allowExceptions, ignoreComments);
 
     auto const engineVersion = parseJsonFieldOr(json, "version", std::string("none"));
 

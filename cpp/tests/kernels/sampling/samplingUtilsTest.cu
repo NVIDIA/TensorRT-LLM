@@ -31,7 +31,7 @@ namespace
 
 static float constexpr HALF_FLT_MAX = 65504.F;
 
-__global__ void generateRandomNumber(int32_t* vals, curandState_t* states, const int batch_size)
+__global__ void generateRandomNumber(int32_t* vals, curandState_t* states, int const batch_size)
 {
     int idx = threadIdx.x;
     if (idx < batch_size)
@@ -196,17 +196,16 @@ public:
         int32_t const vocabSize = 51000;
         int32_t const vocabSizePadded = tc::divUp(vocabSize, 256) * 256;
 
-        auto logitsHost
-            = this->mBufferManager->pinned(ITensor::makeShape({batchSize, beamWidth, vocabSizePadded}), dataType);
-        auto logitsHostPtrs = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), ptrType);
-        auto refLogitsHost = this->mBufferManager->pinned(
+        auto logitsHost = BufferManager::pinned(ITensor::makeShape({batchSize, beamWidth, vocabSizePadded}), dataType);
+        auto logitsHostPtrs = BufferManager::pinned(ITensor::makeShape({batchSize}), ptrType);
+        auto refLogitsHost = BufferManager::pinned(
             ITensor::makeShape({batchSize, beamWidth, vocabSizePadded}), nvinfer1::DataType::kFLOAT);
-        auto biasHost = this->mBufferManager->pinned(ITensor::makeShape({vocabSize}), dataType);
-        auto endIdsHost = this->mBufferManager->pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
-        auto finishedHost = this->mBufferManager->pinned(
+        auto biasHost = BufferManager::pinned(ITensor::makeShape({vocabSize}), dataType);
+        auto endIdsHost = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
+        auto finishedHost = BufferManager::pinned(
             ITensor::makeShape({beamWidth, maxBatchSize}), TRTDataType<tk::FinishedState::UnderlyingType>::value);
 
-        auto batchSlots = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
+        auto batchSlots = BufferManager::pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
 
         auto batchSlotsPtr = bufferCast<int32_t>(*batchSlots);
         for (SizeType bi = 0; bi < batchSize; ++bi)

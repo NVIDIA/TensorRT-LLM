@@ -58,13 +58,13 @@ static inline void set_alpha(uint32_t& alpha, float norm, Data_type dtype)
     else if (dtype == DATA_TYPE_INT32)
     {
         int32_t inorm = static_cast<int32_t>(norm);
-        alpha = reinterpret_cast<const uint32_t&>(inorm);
+        alpha = reinterpret_cast<uint32_t const&>(inorm);
     }
     else if (dtype == DATA_TYPE_BF16)
     {
         // TODO HACK!! BF16 Outputs are computed in FP32 for FP8.
         // This is because cublas does not allow current FP32 output.
-        alpha = reinterpret_cast<const uint32_t&>(norm);
+        alpha = reinterpret_cast<uint32_t const&>(norm);
     }
     else
     {
@@ -77,7 +77,7 @@ static inline void set_alpha(uint32_t& alpha, float norm, Data_type dtype)
 class FusedMHARunnerV2::mhaImpl
 {
 public:
-    mhaImpl(const Data_type data_type, const int numHeads, const int headSize, const float qScaling, int sm_)
+    mhaImpl(const Data_type data_type, int const numHeads, int const headSize, float const qScaling, int sm_)
         : mDataType(data_type)
         , mNumHeads(numHeads)
         , mHeadSize(headSize)
@@ -105,17 +105,17 @@ public:
 
     // Shared setup function.
     template <typename Params>
-    void setup_params(Params& params, const int b, const int s_q, const int s_kv, const int sliding_window_size,
-        const int total_seqlen, const bool has_alibi, const bool scale_alibi, const int tp_size, const int tp_rank)
+    void setup_params(Params& params, int const b, int const s_q, int const s_kv, int const sliding_window_size,
+        int const total_seqlen, bool const has_alibi, bool const scale_alibi, int const tp_size, int const tp_rank)
     {
 
-        const float inv_sqrt_scale = (1.f / (sqrtf(mHeadSize) * mQScaling));
+        float const inv_sqrt_scale = (1.f / (sqrtf(mHeadSize) * mQScaling));
         // Note that we apply scales and bias in the order of
         // (bmm1_output * scale_bmm1 + alibi) * scale_after_alibi
-        const float scale_after_alibi = scale_alibi ? inv_sqrt_scale : 1.0f;
-        const float scale_bmm1 = scale_alibi ? 1.0f : inv_sqrt_scale;
-        const float scale_softmax = 1.f; // Seems to be only required for int8
-        const float scale_bmm2 = 1.f;
+        float const scale_after_alibi = scale_alibi ? inv_sqrt_scale : 1.0f;
+        float const scale_bmm1 = scale_alibi ? 1.0f : inv_sqrt_scale;
+        float const scale_softmax = 1.f; // Seems to be only required for int8
+        float const scale_bmm2 = 1.f;
 
         Data_type scale_type = mLaunchParams.force_fp32_acc ? DATA_TYPE_FP32 : mDataType;
         // Use exp2f optimization for warp-specialized ws kernels on Hopper.
@@ -153,8 +153,8 @@ public:
     }
 
     // Support packed QKV.
-    void setup(const int b, const int s, const int sliding_window_size, const int total_seqlen, const bool has_alibi,
-        const bool scale_alibi, const int tp_size, const int tp_rank)
+    void setup(int const b, int const s, int const sliding_window_size, int const total_seqlen, bool const has_alibi,
+        bool const scale_alibi, int const tp_size, int const tp_rank)
     {
 
         // Determine launch parameters.
@@ -165,10 +165,10 @@ public:
         TLLM_CHECK_WITH_INFO(mHeadSize > 0, "Head size should be greater than 0.");
         mLaunchParams.padded_d = (mHeadSize & (mHeadSize - 1)) == 0 ? mHeadSize : pow(2, int(log2(mHeadSize)) + 1);
 
-        const bool isSm70 = (sm == kSM_70);
-        const bool isSm90 = (sm == kSM_90);
-        const bool isSm8x = (sm == kSM_86 || sm == kSM_89);
-        const bool isSm80 = (sm == kSM_80);
+        bool const isSm70 = (sm == kSM_70);
+        bool const isSm90 = (sm == kSM_90);
+        bool const isSm8x = (sm == kSM_86 || sm == kSM_89);
+        bool const isSm80 = (sm == kSM_80);
         if (isSm70)
         {
             mLaunchParams.flash_attention = true;
@@ -238,9 +238,9 @@ public:
     }
 
     // Support paged_kv_cache and chunked_attention.
-    void setup_paged_kv(const int b, const int s_q, const int s_kv, const int blocks_per_context_sequence,
-        const int tokens_per_kv_block, const int sliding_window_size, const int total_seqlen, const bool has_alibi,
-        const bool scale_alibi, const int tp_size, const int tp_rank)
+    void setup_paged_kv(int const b, int const s_q, int const s_kv, int const blocks_per_context_sequence,
+        int const tokens_per_kv_block, int const sliding_window_size, int const total_seqlen, bool const has_alibi,
+        bool const scale_alibi, int const tp_size, int const tp_rank)
     {
 
         // Determine launch parameters.
@@ -253,9 +253,9 @@ public:
         mLaunchParams.padded_d = (mHeadSize & (mHeadSize - 1)) == 0 ? mHeadSize : pow(2, int(log2(mHeadSize)) + 1);
 
         // Hopper: fallback to original fmha_v2 when head_size <= 64 and seq_len <= 256
-        const bool isSm90 = (sm == kSM_90);
-        const bool isSm8x = (sm == kSM_86 || sm == kSM_89);
-        const bool isSm80 = (sm == kSM_80);
+        bool const isSm90 = (sm == kSM_90);
+        bool const isSm8x = (sm == kSM_86 || sm == kSM_89);
+        bool const isSm80 = (sm == kSM_80);
 
         // always use flash attention kernels.
         mLaunchParams.flash_attention = true;
@@ -383,7 +383,7 @@ public:
 
         // QKV [TOTAL, 3, h, d]
         // NOTE: we may need to use actual seqlen to set oob_value
-        const char* qkv_ptr = reinterpret_cast<const char*>(mParams.qkv_ptr);
+        char const* qkv_ptr = reinterpret_cast<char const*>(mParams.qkv_ptr);
         tensor_size_qkv[3] = mTotalSeqLen;
 
         // Q: STEP_Q
@@ -467,7 +467,7 @@ public:
                 : (d_bytes_per_group > 32 ? cudaTmaDescSwizzle::SWIZZLE_64B : cudaTmaDescSwizzle::SWIZZLE_32B));
 
         // Q ptr.
-        const char* q_ptr = reinterpret_cast<const char*>(mPagedKVParams.q_ptr);
+        char const* q_ptr = reinterpret_cast<char const*>(mPagedKVParams.q_ptr);
 
         // Q: STEP_Q.
         q_tma_descriptor.set_tma_desctriptor(q_ptr, cudaTmaDescFormat::F16_RN,
@@ -518,7 +518,7 @@ public:
         paged_kv_tma_descriptor.copy_to_device(mPagedKVParams.tma_desc_paged_kv, stream);
     }
 
-    void setup_flags(const bool force_fp32_acc, const bool is_s_padded, const bool causal_mask, const int num_kv_heads)
+    void setup_flags(bool const force_fp32_acc, bool const is_s_padded, bool const causal_mask, int const num_kv_heads)
     {
         // BF16 FMHA only accumulates on FP32
         mLaunchParams.force_fp32_acc = mDataType == DATA_TYPE_BF16 || force_fp32_acc;
@@ -541,11 +541,11 @@ public:
         return MHARunner::fmha_supported(mHeadSize, sm);
     }
 
-    void run(const void* qkvPtr, const void* cuSeqlenPtr, void* outputPtr, cudaStream_t stream)
+    void run(void const* qkvPtr, void const* cuSeqlenPtr, void* outputPtr, cudaStream_t stream)
     {
         mParams.qkv_ptr = qkvPtr;
         mParams.o_ptr = outputPtr;
-        mParams.cu_seqlens = reinterpret_cast<const int*>(cuSeqlenPtr);
+        mParams.cu_seqlens = reinterpret_cast<int const*>(cuSeqlenPtr);
 
         if (sm == kSM_90 && mLaunchParams.use_tma)
         {
@@ -556,8 +556,8 @@ public:
         xmmaKernel->run(mParams, mLaunchParams, stream);
     }
 
-    void run_paged_kv(const void* qPtr, void* pagedKVTmaDesc, const void* pagedKVBlockPtrsOnHost,
-        const KVBlockArray pagedKVCache, const void* cuQSeqlenPtr, const void* cuKVSeqlenPtr, void* outputPtr,
+    void run_paged_kv(void const* qPtr, void* pagedKVTmaDesc, void const* pagedKVBlockPtrsOnHost,
+        const KVBlockArray pagedKVCache, void const* cuQSeqlenPtr, void const* cuKVSeqlenPtr, void* outputPtr,
         cudaStream_t stream)
     {
         KVBlockArrayForContextFMHA pagedKVCacheForContextMHA;
@@ -568,10 +568,10 @@ public:
         mPagedKVParams.tma_desc_paged_kv = reinterpret_cast<cudaTmaDesc*>(pagedKVTmaDesc);
         mPagedKVParams.paged_kv_cache = pagedKVCacheForContextMHA;
         mPagedKVParams.o_ptr = outputPtr;
-        mPagedKVParams.cu_q_seqlens = reinterpret_cast<const int*>(cuQSeqlenPtr);
-        mPagedKVParams.cu_seqlens = reinterpret_cast<const int*>(cuKVSeqlenPtr);
+        mPagedKVParams.cu_q_seqlens = reinterpret_cast<int const*>(cuQSeqlenPtr);
+        mPagedKVParams.cu_seqlens = reinterpret_cast<int const*>(cuKVSeqlenPtr);
         // paged kv block device ptrs on host (used by tma descriptors).
-        mLaunchParams.paged_kv_block_ptrs = reinterpret_cast<const int64_t*>(pagedKVBlockPtrsOnHost);
+        mLaunchParams.paged_kv_block_ptrs = reinterpret_cast<int64_t const*>(pagedKVBlockPtrsOnHost);
 
         if (sm == kSM_90 && mLaunchParams.use_tma)
         {
@@ -587,7 +587,7 @@ public:
         return pagedKVXmmaKernel->isValid(s) && xmmaKernel->isValid(s);
     }
 
-    int getSFromMaxSeqLen(const int max_seq_len)
+    int getSFromMaxSeqLen(int const max_seq_len)
     {
         int S = 1024;
 
@@ -625,35 +625,35 @@ private:
     Fused_multihead_attention_paged_kv_params_v2 mPagedKVParams;
     Launch_params mLaunchParams;
     int sm;
-    const FusedMultiHeadAttentionXMMAKernelV2* xmmaKernel;
-    const FusedMultiHeadAttentionPagedKVXMMAKernelV2* pagedKVXmmaKernel;
+    FusedMultiHeadAttentionXMMAKernelV2 const* xmmaKernel;
+    FusedMultiHeadAttentionPagedKVXMMAKernelV2 const* pagedKVXmmaKernel;
     bool use_flash_attention = false;
     const Data_type mDataType;
-    const int mNumHeads;
-    const int mHeadSize;
-    const float mQScaling;
+    int const mNumHeads;
+    int const mHeadSize;
+    float const mQScaling;
     int mTotalSeqLen;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 FusedMHARunnerV2::FusedMHARunnerV2(
-    const Data_type data_type, const int numHeads, const int headSize, const float qScaling)
+    const Data_type data_type, int const numHeads, int const headSize, float const qScaling)
     : pimpl(new mhaImpl(data_type, numHeads, headSize, qScaling, tensorrt_llm::common::getSMVersion()))
 {
 }
 
 FusedMHARunnerV2::~FusedMHARunnerV2() = default;
 
-void FusedMHARunnerV2::setup(const int b, const int s, const int sliding_window_size, const int total_seqlen,
-    const bool has_alibi, const bool scale_alibi, const int tp_size, const int tp_rank)
+void FusedMHARunnerV2::setup(int const b, int const s, int const sliding_window_size, int const total_seqlen,
+    bool const has_alibi, bool const scale_alibi, int const tp_size, int const tp_rank)
 {
     pimpl->setup(b, s, sliding_window_size, total_seqlen, has_alibi, scale_alibi, tp_size, tp_rank);
 }
 
-void FusedMHARunnerV2::setup_paged_kv(const int b, const int s_q, const int s_kv, const int blocks_per_context_sequence,
-    const int tokens_per_kv_block, const int sliding_window_size, const int total_seqlen, const bool has_alibi,
-    const bool scale_alibi, const int tp_size, const int tp_rank)
+void FusedMHARunnerV2::setup_paged_kv(int const b, int const s_q, int const s_kv, int const blocks_per_context_sequence,
+    int const tokens_per_kv_block, int const sliding_window_size, int const total_seqlen, bool const has_alibi,
+    bool const scale_alibi, int const tp_size, int const tp_rank)
 {
     pimpl->setup_paged_kv(b, s_q, s_kv, blocks_per_context_sequence, tokens_per_kv_block, sliding_window_size,
         total_seqlen, has_alibi, scale_alibi, tp_size, tp_rank);
@@ -665,18 +665,18 @@ bool FusedMHARunnerV2::fmha_supported()
 }
 
 void FusedMHARunnerV2::setup_flags(
-    const bool force_fp32_acc, const bool is_s_padded, const bool causal_mask, const int num_kv_heads)
+    bool const force_fp32_acc, bool const is_s_padded, bool const causal_mask, int const num_kv_heads)
 {
     pimpl->setup_flags(force_fp32_acc, is_s_padded, causal_mask, num_kv_heads);
 }
 
-void FusedMHARunnerV2::run(const void* qkvPtr, const void* cuSeqlenPtr, void* outputPtr, cudaStream_t stream)
+void FusedMHARunnerV2::run(void const* qkvPtr, void const* cuSeqlenPtr, void* outputPtr, cudaStream_t stream)
 {
     pimpl->run(qkvPtr, cuSeqlenPtr, outputPtr, stream);
 }
 
-void FusedMHARunnerV2::run_paged_kv(const void* qPtr, void* pagedKVTmaDesc, const void* pagedKVBlockPtrsOnHost,
-    const KVBlockArray pagedKVCache, const void* cuQSeqlenPtr, const void* cuKVSeqlenPtr, void* outputPtr,
+void FusedMHARunnerV2::run_paged_kv(void const* qPtr, void* pagedKVTmaDesc, void const* pagedKVBlockPtrsOnHost,
+    const KVBlockArray pagedKVCache, void const* cuQSeqlenPtr, void const* cuKVSeqlenPtr, void* outputPtr,
     cudaStream_t stream)
 {
     pimpl->run_paged_kv(
@@ -689,7 +689,7 @@ bool FusedMHARunnerV2::isValid(int s) const
 }
 
 // static function to check if fmha is supported when building plugins
-bool MHARunner::fmha_supported(const int headSize, const int sm)
+bool MHARunner::fmha_supported(int const headSize, int const sm)
 {
     if (sm == kSM_70)
     {

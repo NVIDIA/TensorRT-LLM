@@ -71,7 +71,7 @@ class GPTDecoderLayer(Module):
 
     def __init__(self,
                  *,
-                 layer_idx,
+                 local_layer_idx,
                  hidden_size,
                  num_attention_heads,
                  max_position_embeddings,
@@ -89,7 +89,6 @@ class GPTDecoderLayer(Module):
                  bias=True,
                  num_kv_heads=None,
                  moe_config: MoeConfig = MoeConfig(),
-                 use_auto_parallel=False,
                  tp_group=None,
                  tp_size=1,
                  tp_rank=0,
@@ -110,7 +109,7 @@ class GPTDecoderLayer(Module):
                                          dtype=dtype)
 
         self.attention = Attention(
-            layer_idx=layer_idx,
+            local_layer_idx=local_layer_idx,
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
             num_kv_heads=num_kv_heads,
@@ -126,7 +125,6 @@ class GPTDecoderLayer(Module):
             bias=bias,
             tp_group=tp_group,
             tp_size=tp_size,
-            use_auto_parallel=use_auto_parallel,
             tp_rank=tp_rank,
             quant_mode=quant_mode,
             max_lora_rank=max_lora_rank)
@@ -197,7 +195,6 @@ class GPTModel(Module):
                  max_position_embeddings,
                  dtype=None,
                  mapping=Mapping(),
-                 use_auto_parallel=False,
                  apply_query_key_layer_scaling=False,
                  position_embedding_type=PositionEmbeddingType.learned_absolute,
                  rotary_embedding_percentage=1.0,
@@ -231,9 +228,10 @@ class GPTModel(Module):
                                                 hidden_size,
                                                 dtype=dtype)
 
+        layers_range = self.mapping.pp_layers(num_layers)
         self.layers = ModuleList([
             GPTDecoderLayer(
-                layer_idx=layer_idx,
+                local_layer_idx=layer_idx - layers_range[0],
                 hidden_size=hidden_size,
                 num_attention_heads=num_heads,
                 max_position_embeddings=max_position_embeddings,
@@ -250,13 +248,12 @@ class GPTModel(Module):
                 tp_group=mapping.tp_group,
                 tp_size=mapping.tp_size,
                 tp_rank=mapping.tp_rank,
-                use_auto_parallel=use_auto_parallel,
                 inter_size=inter_size,
                 bias=bias,
                 quant_mode=quant_mode,
                 moe_config=moe_config,
                 max_lora_rank=max_lora_rank,
-            ) for layer_idx in range(num_layers)
+            ) for layer_idx in layers_range
         ])
 
         self.ln_f = LayerNorm(normalized_shape=hidden_size, dtype=dtype)
@@ -335,7 +332,6 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
                  dtype,
                  logits_dtype='float32',
                  mapping=Mapping(),
-                 use_auto_parallel=False,
                  apply_query_key_layer_scaling=False,
                  position_embedding_type=PositionEmbeddingType.learned_absolute,
                  rotary_embedding_percentage=1.0,
@@ -394,7 +390,6 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
             max_position_embeddings=max_position_embeddings,
             dtype=dtype,
             mapping=mapping,
-            use_auto_parallel=use_auto_parallel,
             apply_query_key_layer_scaling=apply_query_key_layer_scaling,
             position_embedding_type=position_embedding_type,
             rotary_embedding_percentage=rotary_embedding_percentage,

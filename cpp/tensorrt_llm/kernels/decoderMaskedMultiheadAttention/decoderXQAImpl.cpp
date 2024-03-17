@@ -27,15 +27,15 @@ namespace kernels
 {
 
 template <>
-void DecoderXQAImpl::run(const XQAParams& xqa_params, KVLinearBuffer& kv_linear_buffer,
-    int2& rotary_kernel_launch_cache, const cudaStream_t& stream)
+void DecoderXQAImpl::run(XQAParams const& xqa_params, KVLinearBuffer& kv_linear_buffer,
+    int2& rotary_kernel_launch_cache, cudaStream_t const& stream)
 {
     runWithKVLinearBuffer(xqa_params, kv_linear_buffer, rotary_kernel_launch_cache, stream);
 }
 
 template <>
-void DecoderXQAImpl::run(const XQAParams& xqa_params, KVBlockArray& kv_block_array, int2& rotary_kernel_launch_cache,
-    const cudaStream_t& stream)
+void DecoderXQAImpl::run(XQAParams const& xqa_params, KVBlockArray& kv_block_array, int2& rotary_kernel_launch_cache,
+    cudaStream_t const& stream)
 {
     runWithKVBlockArray(xqa_params, kv_block_array, rotary_kernel_launch_cache, stream);
 }

@@ -4,7 +4,7 @@ NVIDIA Nsight Systems reports at the application level are highly informative. M
 
 Given the potential long runtimes of Large Languages Models (LLMs) and the diversity of workloads a model may experience during a single inference pass or binary execution, we have added features to TensorRT-LLM to get the most out of Nsight Systems capabilities. This document outlines those features as well as provides examples of how to best utilize them to understand your application.
 
-# Feature Descriptions
+## Feature Descriptions
 
 The main functionality here:
   * Relies on toggling the CUDA profiler runtime API on and off.
@@ -35,7 +35,7 @@ To profile just those iterations, in addition to setting `TLLM_GPTS_PROFILE_STAR
   * We need to tell Nsight Systems to look for explicit API triggers to profile (`-c cudaProfilerApi`)
   * We need to tell Nsight Systems to keep profiling after seeing a profile stop API call (`--capture-range-end="repeat[]"`)
 
-# Examples
+## Examples
 Consult the Nsight Systems User Guide for full overview of MPI-related options.
 
 ## Profiling a single IFB iteration executing on a single rank of a multi-GPU model

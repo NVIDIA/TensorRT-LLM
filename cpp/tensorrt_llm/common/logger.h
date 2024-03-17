@@ -18,10 +18,10 @@
 
 #include <cstdlib>
 #include <iostream>
-#include <map>
 #include <stdexcept>
 #include <string>
 
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/stringUtils.h"
 
 namespace tensorrt_llm::common
@@ -54,26 +54,26 @@ public:
 
 #if defined(_MSC_VER)
     template <typename... Args>
-    void log(Level level, char const* format, const Args&... args);
+    void log(Level level, char const* format, Args const&... args);
 
     template <typename... Args>
-    void log(Level level, int rank, char const* format, const Args&... args);
+    void log(Level level, int rank, char const* format, Args const&... args);
 #else
     template <typename... Args>
-    void log(Level level, char const* format, const Args&... args) __attribute__((format(printf, 3, 0)));
+    void log(Level level, char const* format, Args const&... args) __attribute__((format(printf, 3, 0)));
 
     template <typename... Args>
-    void log(Level level, int rank, char const* format, const Args&... args) __attribute__((format(printf, 4, 0)));
+    void log(Level level, int rank, char const* format, Args const&... args) __attribute__((format(printf, 4, 0)));
 #endif
 
     template <typename... Args>
-    void log(Level level, std::string const& format, const Args&... args)
+    void log(Level level, std::string const& format, Args const&... args)
     {
         return log(level, format.c_str(), args...);
     }
 
     template <typename... Args>
-    void log(const Level level, const int rank, const std::string& format, const Args&... args)
+    void log(const Level level, int const rank, std::string const& format, Args const&... args)
     {
         return log(level, rank, format.c_str(), args...);
     }
@@ -88,13 +88,11 @@ public:
     void setLevel(const Level level)
     {
         level_ = level;
-        log(INFO, "Set logger level by %s", getLevelName(level).c_str());
+        log(INFO, "Set logger level by %s", getLevelName(level));
     }
 
 private:
-    const std::string PREFIX = "[TensorRT-LLM]";
-    std::map<Level, std::string> level_name_
-        = {{TRACE, "TRACE"}, {DEBUG, "DEBUG"}, {INFO, "INFO"}, {WARNING, "WARNING"}, {ERROR, "ERROR"}};
+    static auto constexpr kPREFIX = "[TensorRT-LLM]";
 
 #ifndef NDEBUG
     const Level DEFAULT_LOG_LEVEL = DEBUG;
@@ -105,19 +103,28 @@ private:
 
     Logger(); // NOLINT(modernize-use-equals-delete)
 
-    inline std::string getLevelName(const Level level)
+    static inline char const* getLevelName(const Level level)
     {
-        return level_name_[level];
+        switch (level)
+        {
+        case TRACE: return "TRACE";
+        case DEBUG: return "DEBUG";
+        case INFO: return "INFO";
+        case WARNING: return "WARNING";
+        case ERROR: return "ERROR";
+        }
+
+        TLLM_THROW("Unknown log level: %d", level);
     }
 
-    inline std::string getPrefix(const Level level)
+    static inline std::string getPrefix(const Level level)
     {
-        return PREFIX + "[" + getLevelName(level) + "] ";
+        return fmtstr("%s[%s] ", kPREFIX, getLevelName(level));
     }
 
-    inline std::string getPrefix(const Level level, const int rank)
+    static inline std::string getPrefix(const Level level, int const rank)
     {
-        return PREFIX + "[" + getLevelName(level) + "][" + std::to_string(rank) + "] ";
+        return fmtstr("%s[%s][%d] ", kPREFIX, getLevelName(level), rank);
     }
 };
 
@@ -141,7 +148,7 @@ void Logger::log(Logger::Level level, char const* format, Args const&... args)
 }
 
 template <typename... Args>
-void Logger::log(const Logger::Level level, const int rank, char const* format, const Args&... args)
+void Logger::log(const Logger::Level level, int const rank, char const* format, Args const&... args)
 {
     if (level_ <= level)
     {

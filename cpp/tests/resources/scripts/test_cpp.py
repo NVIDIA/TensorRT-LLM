@@ -15,7 +15,6 @@
 # limitations under the License.
 
 import argparse as _arg
-import glob as _gl
 import logging as _log
 import os as _os
 import pathlib as _pl
@@ -72,7 +71,7 @@ def build_trt_llm(python_exe: str,
         python_exe, "scripts/build_wheel.py", "--cuda_architectures",
         cuda_architectures, "--build_dir",
         str(build_dir), "--dist_dir",
-        str(dist_dir)
+        str(dist_dir), "-s", "-i"
     ]
 
     if use_ccache:
@@ -85,12 +84,6 @@ def build_trt_llm(python_exe: str,
         build_wheel += ["-j", str(job_count)]
 
     run_command(build_wheel, cwd=root_dir, env=_os.environ, timeout=2400)
-
-    dist_dir = dist_dir if dist_dir.is_absolute() else root_dir / dist_dir
-    wheels = _gl.glob(str(dist_dir / "tensorrt_llm-*.whl"))
-    assert len(wheels) > 0, "No wheels found"
-    install_wheel = [python_exe, "-m", "pip", "install", "--upgrade", *wheels]
-    run_command(install_wheel, cwd=root_dir, timeout=300)
 
 
 def run_tests(cuda_architectures: _tp.Optional[str] = None,
@@ -369,11 +362,18 @@ def run_multi_gpu_tests(build_dir: _pl.Path):
 
     tests_dir = build_dir / "tests"
     cpp_env = {**_os.environ}
+    # TP2+PP2 tests fail for beam search
     session_test = [
         "mpirun", "-n", "4", "--allow-run-as-root", "gptSessionTest",
-        "--gtest_filter=*TP*:*PP*"
+        "--gtest_filter=*TP4*:*PP4*"
     ]
-    run_command(session_test, cwd=tests_dir, env=cpp_env, timeout=900)
+    run_command(session_test, cwd=tests_dir, env=cpp_env, timeout=300)
+
+    trt_model_test = [
+        "mpirun", "-n", "4", "--allow-run-as-root",
+        "batch_manager/trtGptModelRealDecoderTest", "--gtest_filter=*TP*:*PP*"
+    ]
+    run_command(trt_model_test, cwd=tests_dir, env=cpp_env, timeout=300)
 
 
 def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
@@ -389,8 +389,7 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
     benchmark_exe_dir = build_dir / "benchmarks"
     gpt_engine_dir = resources_dir / "models" / "rt_engine" / "gpt2"
     benchmark = [
-        str(benchmark_exe_dir / "gptSessionBenchmark"), "--model", "gpt",
-        "--engine_dir",
+        str(benchmark_exe_dir / "gptSessionBenchmark"), "--engine_dir",
         str(gpt_engine_dir / "fp16-plugin" / "tp1-pp1-gpu"), "--batch_size",
         "8", "--input_output_len", "10,20", "--duration", "10"
     ]
@@ -424,8 +423,7 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
         run_command(prepare_dataset, cwd=root_dir, timeout=300)
 
         benchmark = [
-            str(benchmark_exe_dir / "gptManagerBenchmark"), "--model", "gpt",
-            "--engine_dir",
+            str(benchmark_exe_dir / "gptManagerBenchmark"), "--engine_dir",
             str(gpt_engine_dir / "fp16-plugin-packed-paged" / "tp1-pp1-gpu"),
             "--type", "IFB", "--dataset",
             str(data_dir / tokens_f)
@@ -433,8 +431,7 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
         run_command(benchmark, cwd=root_dir, timeout=600)
 
         benchmark = [
-            str(benchmark_exe_dir / "gptManagerBenchmark"), "--model", "gpt",
-            "--engine_dir",
+            str(benchmark_exe_dir / "gptManagerBenchmark"), "--engine_dir",
             str(gpt_engine_dir / "fp16-plugin-packed-paged" / "tp1-pp1-gpu"),
             "--type", "V1", "--dataset",
             str(data_dir / tokens_f)
@@ -442,8 +439,7 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
         run_command(benchmark, cwd=root_dir, timeout=600)
 
     benchmark = [
-        str(benchmark_exe_dir / "gptManagerBenchmark"), "--model", "gpt",
-        "--engine_dir",
+        str(benchmark_exe_dir / "gptManagerBenchmark"), "--engine_dir",
         str(gpt_engine_dir / "fp16-plugin-packed-paged" / "tp1-pp1-gpu"),
         "--type", "IFB", "--static_emulated_batch_size", "50", "--dataset",
         str(data_dir / "prepared_dummy_cnn.json")

@@ -37,6 +37,7 @@ set(SRCS
     runtimeBuffers.cpp
     runtimeKernels.cu
     statefulGptDecoder.cpp
+    tllmBuffers.cpp
     tllmRuntime.cpp
     tllmLogger.cpp
     worldConfig.cpp)

@@ -20,7 +20,7 @@ import tarfile
 import weakref
 from functools import partial
 from pathlib import Path, PosixPath
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import yaml
@@ -407,3 +407,20 @@ def unpack_nemo_weights(nemo_archive_path):
                 raise Exception(err_str)
         return yaml.safe_load(model_config), torch.load(
             model_weights, map_location=torch.device("cpu"))
+
+
+def set_obj_attrs(
+    obj: torch.Tensor,
+    ojb_attrs: Optional[Dict[str, Any]],
+):
+    """Set attributes on a object.
+
+    This method is used to set attributes on a object. This method
+    will not overwrite existing attributes.
+    """
+    if ojb_attrs is None:
+        return
+    for key, value in ojb_attrs.items():
+        assert not hasattr(
+            obj, key), (f"Overwriting existing tensor attribute: {key}")
+        setattr(obj, key, value)

@@ -65,7 +65,7 @@ namespace device
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename T_IN, typename T_OUT>
-__global__ void splitkReduction(T_OUT** out_tensor, const T_IN* in_tensor, const GemmCoord* problem_sizes, int splitk,
+__global__ void splitkReduction(T_OUT** out_tensor, const T_IN* in_tensor, GemmCoord const* problem_sizes, int splitk,
     int64_t* splitk_buffer_offsets)
 {
     // in_tensor: [problem_idx, k_partition, hidden_size]
@@ -73,9 +73,9 @@ __global__ void splitkReduction(T_OUT** out_tensor, const T_IN* in_tensor, const
     //      so, we need to use splitk_buffer_offsets.
     // out_tensor: problem_idx * [hidden_size]
 
-    const int problem_idx = blockIdx.y;
+    int const problem_idx = blockIdx.y;
     GemmCoord problem = problem_sizes[problem_idx];
-    const int hidden_size = problem.m() * problem.n();
+    int const hidden_size = problem.m() * problem.n();
     const T_IN* in_tensor_ = in_tensor + splitk_buffer_offsets[problem_idx] * splitk;
     T_OUT* out_tensor_ = out_tensor[problem_idx];
 
@@ -143,7 +143,7 @@ protected:
 
 private:
     /// Get the number of tiles across all problems in a group
-    static int32_t group_tile_count(const cutlass::gemm::GemmCoord* problem_sizes_ptr, int problem_count)
+    static int32_t group_tile_count(cutlass::gemm::GemmCoord const* problem_sizes_ptr, int problem_count)
     {
         int32_t tiles = 0;
         for (int32_t i = 0; i < problem_count; ++i)
@@ -182,7 +182,7 @@ private:
 
     /// Reorder `data` according to `indices`
     template <typename T>
-    static void reorder_array(T* data, const std::vector<size_t>& indices)
+    static void reorder_array(T* data, std::vector<size_t> const& indices)
     {
         // For now, simply create a copy of the data and then copy over to the original.
         std::vector<T> copy(indices.size());
@@ -314,7 +314,7 @@ public:
 
     /// Computes the number of threadblocks to launch for the grouped kernel
     static int sufficient(
-        const cutlass::gemm::GemmCoord* problem_sizes_ptr = nullptr, int problem_count = 0, int available_sm_count = -1)
+        cutlass::gemm::GemmCoord const* problem_sizes_ptr = nullptr, int problem_count = 0, int available_sm_count = -1)
     {
         // Determine the number of blocks that would be launched to fill up a single
         // wave on the GPU with each SM having maximum occupancy.

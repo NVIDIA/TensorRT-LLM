@@ -228,7 +228,7 @@ class ChatGLMTokenizer(PreTrainedTokenizer):
                          unk_token=unk_token,
                          num_image_tokens=num_image_tokens,
                          **kwargs)
-        """ Initialisation """
+        """ Initialization """
 
     @property
     def gmask_token_id(self) -> Optional[int]:

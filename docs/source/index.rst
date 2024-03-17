@@ -23,6 +23,10 @@ Welcome to TensorRT-LLM's documentation!
    graph-rewriting.md
    memory.md
    new_workflow.md
+   lora.md
+   perf_best_practices.md
+   performance_analysis.md
+
 
 Python API
 ----------
@@ -81,3 +85,4 @@ Blogs
    blogs/H100vsA100.md
    blogs/H200launch.md
    blogs/Falcon180B-H200.md
+   blogs/quantization-in-TRT-LLM.md

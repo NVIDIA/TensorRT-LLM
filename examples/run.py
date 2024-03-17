@@ -40,7 +40,7 @@ def parse_arguments(args=None):
         type=int,
         default=None,
         help=
-        'The attention window size that controls the sliding window attention / cyclic kv cache behaviour'
+        'The attention window size that controls the sliding window attention / cyclic kv cache behavior'
     )
     parser.add_argument('--sink_token_length',
                         type=int,
@@ -231,8 +231,6 @@ def parse_input(tokenizer,
         else:
             print('Input file format not supported.')
             raise SystemExit
-    if model_name == 'GemmaForCausalLM':
-        batch_input_ids[0] = [tokenizer.bos_token_id] + batch_input_ids[0]
 
     if num_prepend_vtokens:
         assert len(num_prepend_vtokens) == len(batch_input_ids)

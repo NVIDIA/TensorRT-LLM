@@ -176,6 +176,13 @@ public:
         mNumTokens += n;
     }
 
+    void removeTokens(SizeType n)
+    {
+        TLLM_CHECK(n <= mNumTokens);
+        TLLM_CHECK(mNumTokens - n >= 0);
+        mNumTokens -= n;
+    }
+
     [[nodiscard]] SizeType getSequenceSlotIdx() const
     {
         return mSeqSlotIdx;
@@ -211,6 +218,14 @@ public:
         for (auto& beamBlockIds : mCacheBlockIds)
         {
             beamBlockIds.clear();
+        }
+    }
+
+    void removeLastBlock()
+    {
+        for (auto& beamBlockIds : mCacheBlockIds)
+        {
+            beamBlockIds.pop_back();
         }
     }
 
@@ -280,32 +295,40 @@ public:
     //! \brief Simulate freeing all blocks for that sequence to check impact on number of free blocks
     void schedulingReleaseBlocks(GenerationRequest& sequence);
 
-    [[nodiscard]] SizeType getNumFreeBlocks() const
+    //! \brief Release last block in the sequence
+    void releaseLastBlock(GenerationRequest& sequence);
+
+    [[nodiscard]] SizeType getNumFreeBlocks() const noexcept
     {
         return mFreeBlocks.size();
     }
 
-    [[nodiscard]] SizeType getNumAllocatedBlocks() const
+    [[nodiscard]] SizeType getNumReusedBlocks() const noexcept
+    {
+        return mReusedBlocks;
+    }
+
+    [[nodiscard]] SizeType getNumAllocatedBlocks() const noexcept
     {
         return getMaxNumBlocks() - getNumFreeBlocks();
     }
 
-    [[nodiscard]] bool hasFreeBlocks(SizeType numRequired = 1) const
+    [[nodiscard]] bool hasFreeBlocks(SizeType numRequired = 1) const noexcept
     {
         return getNumFreeBlocks() >= numRequired;
     }
 
-    [[nodiscard]] bool schedulingHasFreeBlocks(SizeType numRequired = 1) const
+    [[nodiscard]] bool schedulingHasFreeBlocks(SizeType numRequired = 1) const noexcept
     {
         return mSchedulingNumFreeBlocks >= numRequired;
     }
 
-    [[nodiscard]] SizeType getMaxNumBlocks() const
+    [[nodiscard]] SizeType getMaxNumBlocks() const noexcept
     {
         return static_cast<SizeType>(mAllBlocksByIdx.size());
     }
 
-    [[nodiscard]] SizeType getTokensPerBlock() const
+    [[nodiscard]] SizeType getTokensPerBlock() const noexcept
     {
         return mTokensPerBlock;
     }
@@ -478,11 +501,15 @@ public:
         return mEnableBlockReuse;
     }
 
+    void removeToken(SizeType seqSlotIdx);
+    void rewindKVCache(SizeType seqSlotIdx, SizeType rewindLengths);
+
 private:
     void resetBlockPointers(SizeType seqSlotIdx, SizeType beamWidth);
     void cacheBlockPointers(GenerationRequest const& seq, SizeType seqSlotIdx);
     void cacheNewBlockPointers(GenerationRequest const& seq, SizeType seqSlotIdx);
-    void updateNewBlockPointer(const GenerationRequest& seq, SizeType seqSlotIdx, SizeType blockIdx);
+    void updateNewBlockPointer(GenerationRequest const& seq, SizeType seqSlotIdx, SizeType blockIdx);
+    void updateToken(SizeType seqSlotIdx, bool addToken);
 
 private:
     // Number of elements per one blocks

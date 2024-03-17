@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
+import sys
 import unittest
 
 import numpy as np
@@ -21,6 +23,9 @@ from polygraphy.backend.trt import CreateConfig, EngineFromNetwork, TrtRunner
 
 import tensorrt_llm
 from tensorrt_llm import Tensor
+
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.util import unittest_name_func
 
 
 class TestFunctional(unittest.TestCase):
@@ -37,7 +42,8 @@ class TestFunctional(unittest.TestCase):
         ('float16', (5, 6, 8), 1),
         ('float16', (5, 6, 8), 2),
         ('float16', (5, 6, 8), -3),
-    ])
+    ],
+                          name_func=unittest_name_func)
     def test_cumsum(self, dtype, x_shape, dim):
         if 'float' in dtype:
             x_data = torch.rand(

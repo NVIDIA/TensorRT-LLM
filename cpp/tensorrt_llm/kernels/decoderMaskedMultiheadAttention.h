@@ -81,19 +81,19 @@ struct Multihead_attention_params_base
     T* out = nullptr;
 
     // The input Qs and the associated bias. Dimensions B x D and D, resp.
-    const T *q = nullptr, *q_bias = nullptr;
+    T const *q = nullptr, *q_bias = nullptr;
     // The input Ks and the associated bias. Dimensions B x D and D, resp.
-    const T *k = nullptr, *k_bias = nullptr;
+    T const *k = nullptr, *k_bias = nullptr;
     // The input Vs and the associated bias. Dimensions B x D and D, resp.
-    const T *v = nullptr, *v_bias = nullptr;
+    T const *v = nullptr, *v_bias = nullptr;
 
     // The indirections to use for cache when beam sampling.
-    const int* cache_indir = nullptr;
+    int const* cache_indir = nullptr;
 
     // scales
-    const float* query_weight_output_scale = nullptr;
-    const float* attention_qk_scale = nullptr;
-    const float* attention_output_weight_input_scale_inv = nullptr;
+    float const* query_weight_output_scale = nullptr;
+    float const* attention_qk_scale = nullptr;
+    float const* attention_output_weight_input_scale_inv = nullptr;
 
     // Stride to handle the case when KQV is a single buffer
     int stride = 0;
@@ -134,22 +134,22 @@ struct Multihead_attention_params_base
     float inv_sqrt_dh = 0.0f;
 
     // If relative position embedding is used
-    const T* relative_attention_bias = nullptr;
+    T const* relative_attention_bias = nullptr;
     int relative_attention_bias_stride = 0;
     int max_distance = 0;
 
     // The slope per head of linear position bias to attention score (H).
-    const T* linear_bias_slopes = nullptr;
+    T const* linear_bias_slopes = nullptr;
 
-    const T* ia3_key_weights = nullptr;
-    const T* ia3_value_weights = nullptr;
-    const int* ia3_tasks = nullptr;
+    T const* ia3_key_weights = nullptr;
+    T const* ia3_value_weights = nullptr;
+    int const* ia3_tasks = nullptr;
 
-    const float* qkv_scale_quant_orig = nullptr;
-    const float* attention_out_scale_orig_quant = nullptr;
+    float const* qkv_scale_quant_orig = nullptr;
+    float const* attention_out_scale_orig_quant = nullptr;
 
-    const float* kv_scale_orig_quant = nullptr;
-    const float* kv_scale_quant_orig = nullptr;
+    float const* kv_scale_orig_quant = nullptr;
+    float const* kv_scale_quant_orig = nullptr;
 
     bool int8_kv_cache = false;
     bool fp8_kv_cache = false;
@@ -176,7 +176,7 @@ struct Multihead_attention_params_base
     // threadblock counter to identify the complete of partial attention computations
     int* block_counter = nullptr;
 
-    const int* memory_length_per_sample = nullptr;
+    int const* memory_length_per_sample = nullptr;
 };
 
 template <typename T, bool USE_CROSS_ATTENTION = false>
@@ -194,10 +194,10 @@ struct Multihead_attention_params<T, false> : public Multihead_attention_params_
     bool* finished = nullptr;
 
     // required in case of masked attention with different length
-    const int* length_per_sample = nullptr;
+    int const* length_per_sample = nullptr;
 
     // input lengths to identify the paddings (i.e. input seq < padding < new generated seq).
-    const int* input_lengths = nullptr;
+    int const* input_lengths = nullptr;
 };
 template <class T>
 using Masked_multihead_attention_params = Multihead_attention_params<T, false>;
@@ -214,10 +214,10 @@ struct Multihead_attention_params<T, true> : public Multihead_attention_params_b
     bool* finished = nullptr;
 
     // required in case of masked attention with different length
-    const int* length_per_sample = nullptr;
+    int const* length_per_sample = nullptr;
 
     // input lengths to identify the paddings (i.e. input seq < padding < new generated seq).
-    const int* input_lengths = nullptr;
+    int const* input_lengths = nullptr;
 };
 template <class T>
 using Cross_multihead_attention_params = Multihead_attention_params<T, true>;
@@ -248,9 +248,9 @@ DECLARE_MMHA_NORMAL_AND_PAGED(__nv_bfloat16);
 template <typename T>
 inline int estimate_min_multi_block_count(int max_timesteps, int max_dynamic_shmem_per_block)
 {
-    const auto qk_elts = static_cast<int>((max_timesteps + 1 + 4 - 1) / 4);
+    auto const qk_elts = static_cast<int>((max_timesteps + 1 + 4 - 1) / 4);
     int size_per_elts = 16;
-    const auto qk_sz = qk_elts * 16;
+    auto const qk_sz = qk_elts * 16;
     size_t logits_sz = 0;
 #ifndef MMHA_USE_FP32_ACUM_FOR_LOGITS
     if (sizeof(T) != 4)

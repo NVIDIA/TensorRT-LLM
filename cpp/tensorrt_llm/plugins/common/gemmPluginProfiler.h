@@ -72,7 +72,7 @@ public:
     int k;
     nvinfer1::DataType dtype;
 
-    GemmIdCore(int n_, int k_, const nvinfer1::DataType& dtype_)
+    GemmIdCore(int n_, int k_, nvinfer1::DataType const& dtype_)
         : n(n_)
         , k(k_)
         , dtype(dtype_)
@@ -86,12 +86,12 @@ public:
     {
     }
 
-    bool operator==(const GemmIdCore& id) const
+    bool operator==(GemmIdCore const& id) const
     {
         return isEqual(id);
     }
 
-    friend std::ostream& operator<<(std::ostream& out, const GemmIdCore& id)
+    friend std::ostream& operator<<(std::ostream& out, GemmIdCore const& id)
     {
         out << "(N;K)=(" << id.n << ";" << id.k << "),";
         out << " type=" << static_cast<int>(id.dtype);
@@ -99,7 +99,7 @@ public:
     }
 
 protected:
-    bool isEqual(const GemmIdCore& id) const
+    bool isEqual(GemmIdCore const& id) const
     {
         return n == id.n && k == id.k && dtype == id.dtype;
     }
@@ -108,7 +108,7 @@ protected:
 // Hash of GemmId
 struct GemmIdCoreHash
 {
-    std::size_t operator()(const GemmIdCore& id) const
+    std::size_t operator()(GemmIdCore const& id) const
     {
         auto h1 = std::hash<int>{}(id.n);
         auto h2 = std::hash<int>{}(id.k);
@@ -123,7 +123,7 @@ public:
     bool transA{};
     bool transB{};
 
-    GemmIdCublas(int n_, int k_, const nvinfer1::DataType& dtype_, bool transA_, bool transB_)
+    GemmIdCublas(int n_, int k_, nvinfer1::DataType const& dtype_, bool transA_, bool transB_)
         : GemmIdCore(n_, k_, dtype_)
         , transA(transA_)
         , transB(transB_)
@@ -132,12 +132,12 @@ public:
 
     GemmIdCublas() {}
 
-    bool operator==(const GemmIdCublas& id) const
+    bool operator==(GemmIdCublas const& id) const
     {
         return isEqual(id) && transA == id.transA && transB == id.transB;
     }
 
-    friend std::ostream& operator<<(std::ostream& out, const GemmIdCublas& id)
+    friend std::ostream& operator<<(std::ostream& out, GemmIdCublas const& id)
     {
         out << "(N;K)=(" << id.n << ";" << id.k << "),";
         out << " type=" << static_cast<int>(id.dtype);
@@ -150,7 +150,7 @@ public:
 // Hash of GemmIdCublas
 struct GemmIdCublasHash
 {
-    std::size_t operator()(const GemmIdCublas& id) const
+    std::size_t operator()(GemmIdCublas const& id) const
     {
         auto h1 = std::hash<int>{}(id.n);
         auto h2 = std::hash<int>{}(id.k);
@@ -184,20 +184,20 @@ public:
         // Map from GEMM Id to profile for particular GEMM
         std::unordered_map<GemmIdType, MProfileMapPtr, GemmIdHashType> profileMap;
 
-        bool existsMProfileMap(const GemmIdType& id)
+        bool existsMProfileMap(GemmIdType const& id)
         {
-            const auto iter = profileMap.find(id);
+            auto const iter = profileMap.find(id);
             return iter != profileMap.end();
         }
 
-        void createMProfileMap(const GemmIdType& id)
+        void createMProfileMap(GemmIdType const& id)
         {
             profileMap[id] = std::make_shared<MProfileMap>();
         }
 
-        MProfileMapPtr getMProfileMap(const GemmIdType& id)
+        MProfileMapPtr getMProfileMap(GemmIdType const& id)
         {
-            const auto iter = profileMap.find(id);
+            auto const iter = profileMap.find(id);
             if (iter == profileMap.end())
             {
                 std::ostringstream msg;
@@ -212,15 +212,15 @@ public:
 
     GemmPluginProfiler();
 
-    void serialize(char*& buffer, const GemmIdType& gemmId) const;
+    void serialize(char*& buffer, GemmIdType const& gemmId) const;
 
-    void deserialize(const char*& data, GemmDims& dims, const GemmIdType& gemmId);
-    size_t getSerializationSize(const GemmIdType& gemmId) const;
+    void deserialize(char const*& data, GemmDims& dims, GemmIdType const& gemmId);
+    size_t getSerializationSize(GemmIdType const& gemmId) const;
 
     void profileTactics(
-        const RunnerPtr& runner, const nvinfer1::DataType& type, const GemmDims& dims, const GemmIdType& gemmId);
+        RunnerPtr const& runner, nvinfer1::DataType const& type, GemmDims const& dims, GemmIdType const& gemmId);
 
-    void setSelectionTactics(const MNKProfileMapPtr& map)
+    void setSelectionTactics(MNKProfileMapPtr const& map)
     {
         mMNKProfileMap = map;
     }
@@ -235,14 +235,14 @@ public:
         mSkip = mSkip || skip;
     }
 
-    std::optional<Config> getBestConfig(int m, const GemmIdType& gemmId) const;
+    std::optional<Config> getBestConfig(int m, GemmIdType const& gemmId) const;
 
 protected:
-    virtual void runTactic(int m, int n, int k, const Config& tactic, char* workspace, const cudaStream_t& stream) = 0;
+    virtual void runTactic(int m, int n, int k, Config const& tactic, char* workspace, cudaStream_t const& stream) = 0;
 
     virtual void computeTmpSize(int maxM, int n, int k) = 0;
 
-    virtual bool checkTactic(int m, int n, int k, const Config& tactic) const
+    virtual bool checkTactic(int m, int n, int k, Config const& tactic) const
     {
         return true;
     }
@@ -256,9 +256,9 @@ private:
 
     void freeTmpData();
 
-    std::optional<Config> profileTacticsForProblem(int m, int n, int k, const std::vector<Config>& tactics);
+    std::optional<Config> profileTacticsForProblem(int m, int n, int k, std::vector<Config> const& tactics);
 
-    float profileTacticForProblem(int m, int n, int k, const Config& tactic);
+    float profileTacticForProblem(int m, int n, int k, Config const& tactic);
 
     int nextPowerOfTwo(int v) const
     {

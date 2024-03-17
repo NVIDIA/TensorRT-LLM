@@ -2,20 +2,16 @@ import os
 import sys
 import tempfile
 
-import pytest
-import torch
-
 from tensorrt_llm.hlapi.llm import LLM, ModelConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root
+from utils.util import skip_pre_ampere, skip_pre_hopper
 
 llama_model_path = str(llm_models_root() / "llama-models/llama-7b-hf")
 
-major, minor = torch.cuda.get_device_capability()
 
-
-@pytest.mark.skipif(major < 8, reason="Test supported on post Ampere")
+@skip_pre_ampere
 def test_llm_int4_awq_quantization():
     config = ModelConfig(llama_model_path)
     config.quant_config.init_from_description(quantize_weights=True,
@@ -29,7 +25,7 @@ def test_llm_int4_awq_quantization():
         llm.save(tmpdir)
 
 
-@pytest.mark.skipif(major < 9, reason="Test supported on post Hopper")
+@skip_pre_hopper
 def test_llm_fp8_quantization():
     config = ModelConfig(llama_model_path)
     config.quant_config.set_fp8_qdq()

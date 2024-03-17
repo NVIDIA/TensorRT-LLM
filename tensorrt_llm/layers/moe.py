@@ -23,7 +23,7 @@ from tensorrt_llm._utils import str_dtype_to_trt
 
 from .._common import default_net, default_trtnet
 from ..functional import (_create_tensor, allreduce, cast, is_gated_activation,
-                          non_gated_version, softmax, split, sum, topk)
+                          non_gated_version, softmax, sum, topk)
 from ..layers import MLP, GatedMLP
 from ..module import Module
 from ..parameter import Parameter
@@ -234,17 +234,18 @@ class MixtureOfExperts(Module):
         if quant_mode.is_weight_only():
             self.weight_dtype = trt.int8
 
-        # TODO: benchmark the router and check best TP configuration
-        # Since output dimension is usually low (in the order of 10s), we split on input dim for the moment
-        # Maybe no TP at all is even more efficient
+        # Since output dimension is usually low (in the order of 10s), no TP at
+        # all is more efficient as no allreduce required in the end.
+        # Note that if we see models that have large number of experts, we may
+        # need to consider add TP back here.
         self.router = RowLinear(
             hidden_size,
             self.num_experts,
             bias=False,
             dtype=trt.
             float32,  # Routing is sensitive since it conditions what experts are used
-            tp_group=tp_group,
-            tp_size=tp_size,
+            tp_group=None,
+            tp_size=1,
             strict_dtype=True,
         )
 
@@ -341,10 +342,6 @@ class MixtureOfExperts(Module):
     def forward(self, hidden_states, finished=None, lora_layer_params=None):
         assert lora_layer_params is None, "LoRA + MoE is not supported for the moment"
         routing_input = cast(hidden_states, trt.float32)
-        if self.tp_size > 1:
-            routing_input = split(routing_input,
-                                  self.router.in_features,
-                                  dim=-1)[self.tp_rank]
         routing = self.router(routing_input)
 
         if not default_net().plugin_config.moe_plugin:

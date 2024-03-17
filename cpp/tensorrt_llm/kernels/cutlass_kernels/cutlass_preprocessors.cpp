@@ -158,8 +158,8 @@ LayoutDetails getLayoutDetailsForTransform(QuantType quant_type, int arch)
 //  0 1 8 9 2 3 10 11 4 5 12 13 6 7 14 15
 // For int4, each group of 32 rows is permuted using the map below:
 //  0 1 8 9 16 17 24 25 2 3 10 11 18 19 26 27 4 5 12 13 20 21 28 29 6 7 14 15 22 23 30 31
-void permute_B_rows_for_mixed_gemm(int8_t* permuted_quantized_tensor, const int8_t* quantized_tensor,
-    const std::vector<size_t>& shape, QuantType quant_type, const int64_t arch_version)
+void permute_B_rows_for_mixed_gemm(int8_t* permuted_quantized_tensor, int8_t const* quantized_tensor,
+    std::vector<size_t> const& shape, QuantType quant_type, const int64_t arch_version)
 {
 
     // We only want to run this step for weight only quant.
@@ -170,19 +170,19 @@ void permute_B_rows_for_mixed_gemm(int8_t* permuted_quantized_tensor, const int8
     const size_t num_rows = shape.size() == 2 ? shape[0] : shape[1];
     const size_t num_cols = shape.size() == 2 ? shape[1] : shape[2];
 
-    const int BITS_PER_ELT = get_bits_in_quant_type(quant_type);
-    const int K = 16 / BITS_PER_ELT;
-    const int ELTS_PER_BYTE = 8 / BITS_PER_ELT;
-    const int ELTS_PER_REG = 32 / BITS_PER_ELT;
+    int const BITS_PER_ELT = get_bits_in_quant_type(quant_type);
+    int const K = 16 / BITS_PER_ELT;
+    int const ELTS_PER_BYTE = 8 / BITS_PER_ELT;
+    int const ELTS_PER_REG = 32 / BITS_PER_ELT;
 
-    const uint32_t* input_byte_ptr = reinterpret_cast<const uint32_t*>(quantized_tensor);
+    uint32_t const* input_byte_ptr = reinterpret_cast<uint32_t const*>(quantized_tensor);
     uint32_t* output_byte_ptr = reinterpret_cast<uint32_t*>(permuted_quantized_tensor);
 
     int MMA_SHAPE_N = 8;
     int B_ROWS_PER_MMA = 8 * K;
-    const int elts_in_int32 = 32 / BITS_PER_ELT;
+    int const elts_in_int32 = 32 / BITS_PER_ELT;
 
-    const int num_vec_cols = num_cols / elts_in_int32;
+    int const num_vec_cols = num_cols / elts_in_int32;
 
     TLLM_CHECK_WITH_INFO(
         arch_version >= 75, "Unsupported Arch. Pre-volta not supported. Column interleave not needed on Volta.");
@@ -205,11 +205,11 @@ void permute_B_rows_for_mixed_gemm(int8_t* permuted_quantized_tensor, const int8
 
                 for (int write_col = 0; write_col < num_vec_cols; ++write_col)
                 {
-                    const int write_row = base_row + tile_row;
-                    const int tile_read_row
+                    int const write_row = base_row + tile_row;
+                    int const tile_read_row
                         = 8 * (((tile_row % ELTS_PER_REG) / 2)) + tile_row % 2 + 2 * (tile_row / ELTS_PER_REG);
-                    const int read_row = base_row + tile_read_row;
-                    const int read_col = write_col;
+                    int const read_row = base_row + tile_read_row;
+                    int const read_col = write_col;
 
                     const int64_t read_offset = matrix_offset + int64_t(read_row) * num_vec_cols + read_col;
                     const int64_t write_offset = matrix_offset + int64_t(write_row) * num_vec_cols + write_col;
@@ -227,9 +227,9 @@ void permute_B_rows_for_mixed_gemm(int8_t* permuted_quantized_tensor, const int8
 // issue for relatively large models.
 template <QuantType quant_type>
 void subbyte_transpose_impl(
-    int8_t* transposed_quantized_tensor, const int8_t* quantized_tensor, const std::vector<size_t>& shape)
+    int8_t* transposed_quantized_tensor, int8_t const* quantized_tensor, std::vector<size_t> const& shape)
 {
-    const int bits_per_elt = get_bits_in_quant_type(quant_type);
+    int const bits_per_elt = get_bits_in_quant_type(quant_type);
 
     TLLM_CHECK_WITH_INFO(shape.size() == 2 || shape.size() == 3, "Shape must be 2-D or 3-D");
     const size_t num_experts = shape.size() == 2 ? 1 : shape[0];
@@ -240,7 +240,7 @@ void subbyte_transpose_impl(
     const size_t col_bytes_trans = num_rows * bits_per_elt / 8;
     const size_t num_bytes = size_t(num_experts) * num_rows * col_bytes;
 
-    const uint8_t* input_byte_ptr = reinterpret_cast<const uint8_t*>(quantized_tensor);
+    uint8_t const* input_byte_ptr = reinterpret_cast<uint8_t const*>(quantized_tensor);
     uint8_t* output_byte_ptr = reinterpret_cast<uint8_t*>(transposed_quantized_tensor);
 
     static_assert(quant_type == QuantType::INT8_WEIGHT_ONLY || quant_type == QuantType::PACKED_INT4_WEIGHT_ONLY, "");
@@ -260,8 +260,8 @@ void subbyte_transpose_impl(
                "num_col_bytes = %ld.",
             VECTOR_WIDTH, col_bytes_trans, col_bytes));
 
-    const int num_m_tiles = (num_rows + M_TILE_L1 - 1) / M_TILE_L1;
-    const int num_n_tiles = (col_bytes + N_TILE_L1 - 1) / N_TILE_L1;
+    int const num_m_tiles = (num_rows + M_TILE_L1 - 1) / M_TILE_L1;
+    int const num_n_tiles = (col_bytes + N_TILE_L1 - 1) / N_TILE_L1;
 
     for (size_t expert = 0; expert < num_experts; ++expert)
     {
@@ -271,16 +271,16 @@ void subbyte_transpose_impl(
             for (size_t col_tile_start_byte = 0; col_tile_start_byte < col_bytes; col_tile_start_byte += N_TILE_L1)
             {
 
-                const int row_limit = std::min(row_tile_start + M_TILE_L1, num_rows);
-                const int col_limit = std::min(col_tile_start_byte + N_TILE_L1, col_bytes);
+                int const row_limit = std::min(row_tile_start + M_TILE_L1, num_rows);
+                int const col_limit = std::min(col_tile_start_byte + N_TILE_L1, col_bytes);
 
                 for (int ii = 0; ii < M_TILE_L1; ++ii)
                 {
-                    const int row = row_tile_start + ii;
+                    int const row = row_tile_start + ii;
 
                     for (int jj = 0; jj < N_TILE_L1; jj += VECTOR_WIDTH)
                     {
-                        const int col = col_tile_start_byte + jj;
+                        int const col = col_tile_start_byte + jj;
 
                         const size_t logical_src_offset = matrix_offset + row * col_bytes + col;
 
@@ -313,11 +313,11 @@ void subbyte_transpose_impl(
                         // is square in the number of elements (not necessarily the number of bytes).
                         for (int jj = ii + 1; jj < M_TILE_L1; ++jj)
                         {
-                            const int ii_byte = ii / ELTS_PER_BYTE;
-                            const int ii_bit_offset = ii % ELTS_PER_BYTE;
+                            int const ii_byte = ii / ELTS_PER_BYTE;
+                            int const ii_bit_offset = ii % ELTS_PER_BYTE;
 
-                            const int jj_byte = jj / ELTS_PER_BYTE;
-                            const int jj_bit_offset = jj % ELTS_PER_BYTE;
+                            int const jj_byte = jj / ELTS_PER_BYTE;
+                            int const jj_bit_offset = jj % ELTS_PER_BYTE;
 
                             uint8_t src_elt = 0xF & (cache_buf[ii][jj_byte] >> (4 * jj_bit_offset));
                             uint8_t tgt_elt = 0xF & (cache_buf[jj][ii_byte] >> (4 * ii_bit_offset));
@@ -338,15 +338,15 @@ void subbyte_transpose_impl(
                 const size_t row_tile_start_trans = col_tile_start_byte * ELTS_PER_BYTE;
                 const size_t col_tile_start_byte_trans = row_tile_start / ELTS_PER_BYTE;
 
-                const int row_limit_trans = std::min(row_tile_start_trans + M_TILE_L1, num_cols);
-                const int col_limit_trans = std::min(col_tile_start_byte_trans + N_TILE_L1, col_bytes_trans);
+                int const row_limit_trans = std::min(row_tile_start_trans + M_TILE_L1, num_cols);
+                int const col_limit_trans = std::min(col_tile_start_byte_trans + N_TILE_L1, col_bytes_trans);
 
                 for (int ii = 0; ii < M_TILE_L1; ++ii)
                 {
-                    const int row = row_tile_start_trans + ii;
+                    int const row = row_tile_start_trans + ii;
                     for (int jj = 0; jj < N_TILE_L1; jj += VECTOR_WIDTH)
                     {
-                        const int col = col_tile_start_byte_trans + jj;
+                        int const col = col_tile_start_byte_trans + jj;
 
                         const size_t logical_tgt_offset = matrix_offset + row * col_bytes_trans + col;
 
@@ -364,8 +364,8 @@ void subbyte_transpose_impl(
     }
 }
 
-void subbyte_transpose(int8_t* transposed_quantized_tensor, const int8_t* quantized_tensor,
-    const std::vector<size_t>& shape, QuantType quant_type)
+void subbyte_transpose(int8_t* transposed_quantized_tensor, int8_t const* quantized_tensor,
+    std::vector<size_t> const& shape, QuantType quant_type)
 {
 
     if (quant_type == QuantType::INT8_WEIGHT_ONLY)
@@ -409,7 +409,7 @@ void add_bias_and_interleave_int8s_inplace(int8_t* int8_tensor, const size_t num
 
 void add_bias_and_interleave_int4s_inplace(int8_t* packed_int4_tensor, const size_t num_elts)
 {
-    const int num_bytes = num_elts / 2;
+    int const num_bytes = num_elts / 2;
 
     // Step 1 will be to transform all the int4s to unsigned in order to make the dequantize take as little
     // instructions as possible in the CUDA code.
@@ -451,9 +451,9 @@ void add_bias_and_interleave_int4s_inplace(int8_t* packed_int4_tensor, const siz
 
         for (int dest_idx = 0; dest_idx < 8; ++dest_idx)
         {
-            const int src_idx = dest_idx < 4 ? 2 * dest_idx : 2 * (dest_idx - 4) + 1;
-            const int src_shift = 4 * src_idx;
-            const int dest_shift = 4 * dest_idx;
+            int const src_idx = dest_idx < 4 ? 2 * dest_idx : 2 * (dest_idx - 4) + 1;
+            int const src_shift = 4 * src_idx;
+            int const dest_shift = 4 * dest_idx;
 
             const uint32_t src_bits = (current_register >> src_shift) & 0xF;
             transformed_register |= (src_bits << dest_shift);
@@ -478,8 +478,8 @@ void add_bias_and_interleave_quantized_tensor_inplace(int8_t* tensor, const size
     }
 }
 
-void interleave_column_major_tensor(int8_t* interleaved_quantized_tensor, const int8_t* quantized_tensor,
-    const std::vector<size_t>& shape, QuantType quant_type, LayoutDetails details)
+void interleave_column_major_tensor(int8_t* interleaved_quantized_tensor, int8_t const* quantized_tensor,
+    std::vector<size_t> const& shape, QuantType quant_type, LayoutDetails details)
 {
 
     // We only want to run this step for weight only quant.
@@ -490,23 +490,23 @@ void interleave_column_major_tensor(int8_t* interleaved_quantized_tensor, const 
     const size_t num_rows = shape.size() == 2 ? shape[0] : shape[1];
     const size_t num_cols = shape.size() == 2 ? shape[1] : shape[2];
 
-    const int BITS_PER_ELT = get_bits_in_quant_type(quant_type);
-    const int elts_in_int32 = 32 / BITS_PER_ELT;
+    int const BITS_PER_ELT = get_bits_in_quant_type(quant_type);
+    int const elts_in_int32 = 32 / BITS_PER_ELT;
 
-    const int rows_per_tile = details.rows_per_column_tile;
+    int const rows_per_tile = details.rows_per_column_tile;
 
     TLLM_CHECK_WITH_INFO(!(num_rows % elts_in_int32),
         fmtstr("The number of rows must be a multiple of %d but the number of rows is %ld.", elts_in_int32, num_rows));
 
-    const uint32_t* input_byte_ptr = reinterpret_cast<const uint32_t*>(quantized_tensor);
+    uint32_t const* input_byte_ptr = reinterpret_cast<uint32_t const*>(quantized_tensor);
     uint32_t* output_byte_ptr = reinterpret_cast<uint32_t*>(interleaved_quantized_tensor);
 
     TLLM_CHECK_WITH_INFO(!(num_rows % rows_per_tile),
         fmtstr("The number of rows must be a multiple of %d but the number of rows is %ld.", rows_per_tile, num_rows));
 
-    const int num_vec_rows = num_rows / elts_in_int32;
-    const int vec_rows_per_tile = rows_per_tile / elts_in_int32;
-    const int interleave = details.columns_interleaved;
+    int const num_vec_rows = num_rows / elts_in_int32;
+    int const vec_rows_per_tile = rows_per_tile / elts_in_int32;
+    int const interleave = details.columns_interleaved;
 
     for (int expert = 0; expert < num_experts; ++expert)
     {
@@ -532,8 +532,8 @@ void interleave_column_major_tensor(int8_t* interleaved_quantized_tensor, const 
     }
 }
 
-void preprocess_weights_for_mixed_gemm(int8_t* preprocessed_quantized_weight, const int8_t* row_major_quantized_weight,
-    const std::vector<size_t>& shape, QuantType quant_type, bool force_interleave)
+void preprocess_weights_for_mixed_gemm(int8_t* preprocessed_quantized_weight, int8_t const* row_major_quantized_weight,
+    std::vector<size_t> const& shape, QuantType quant_type, bool force_interleave)
 {
     int arch = getSMVersion();
     if (force_interleave && arch == 90)
@@ -546,7 +546,7 @@ void preprocess_weights_for_mixed_gemm(int8_t* preprocessed_quantized_weight, co
     TLLM_CHECK_WITH_INFO(shape.size() == 2 || shape.size() == 3, "Shape must be 2-D or 3-D");
 
     size_t num_elts = 1;
-    for (const auto& dim : shape)
+    for (auto const& dim : shape)
     {
         num_elts *= dim;
     }
@@ -620,7 +620,7 @@ Outputs
 
 template <typename ComputeType, typename WeightType>
 void symmetric_quantize(int8_t* processed_quantized_weight, int8_t* unprocessed_quantized_weight,
-    ComputeType* scale_ptr, const WeightType* input_weight_ptr, const std::vector<size_t>& shape, QuantType quant_type,
+    ComputeType* scale_ptr, WeightType const* input_weight_ptr, std::vector<size_t> const& shape, QuantType quant_type,
     bool force_interleave)
 {
 
@@ -633,8 +633,8 @@ void symmetric_quantize(int8_t* processed_quantized_weight, int8_t* unprocessed_
     const size_t num_rows = shape.size() == 2 ? shape[0] : shape[1];
     const size_t num_cols = shape.size() == 2 ? shape[1] : shape[2];
 
-    const int bits_in_type = get_bits_in_quant_type(quant_type);
-    const int bytes_per_out_col = num_cols * bits_in_type / 8;
+    int const bits_in_type = get_bits_in_quant_type(quant_type);
+    int const bytes_per_out_col = num_cols * bits_in_type / 8;
 
     std::vector<int8_t> weight_buf;
     if (unprocessed_quantized_weight == nullptr)
@@ -643,15 +643,15 @@ void symmetric_quantize(int8_t* processed_quantized_weight, int8_t* unprocessed_
         unprocessed_quantized_weight = weight_buf.data();
     }
 
-    const int input_mat_size = num_rows * num_cols;
-    const int quantized_mat_size = num_rows * bytes_per_out_col;
-    const float quant_range_scale = 1.f / float(1 << (bits_in_type - 1));
+    int const input_mat_size = num_rows * num_cols;
+    int const quantized_mat_size = num_rows * bytes_per_out_col;
+    float const quant_range_scale = 1.f / float(1 << (bits_in_type - 1));
 
     std::vector<float> per_col_max(num_cols);
 
     for (int expert = 0; expert < num_experts; ++expert)
     {
-        const WeightType* current_weight = input_weight_ptr + expert * input_mat_size;
+        WeightType const* current_weight = input_weight_ptr + expert * input_mat_size;
         int8_t* current_quantized_weight = unprocessed_quantized_weight + expert * quantized_mat_size;
 
         // First we find the per column max for this expert weight.
@@ -662,7 +662,7 @@ void symmetric_quantize(int8_t* processed_quantized_weight, int8_t* unprocessed_
 
         for (int ii = 0; ii < num_rows; ++ii)
         {
-            const WeightType* current_weight_row = current_weight + ii * num_cols;
+            WeightType const* current_weight_row = current_weight + ii * num_cols;
             for (int jj = 0; jj < num_cols; ++jj)
             {
                 per_col_max[jj] = std::max(per_col_max[jj], std::abs(float(current_weight_row[jj])));
@@ -681,15 +681,15 @@ void symmetric_quantize(int8_t* processed_quantized_weight, int8_t* unprocessed_
         for (int ii = 0; ii < num_rows; ++ii)
         {
             int8_t* current_quantized_weight_row = current_quantized_weight + ii * bytes_per_out_col;
-            const WeightType* current_weight_row = current_weight + ii * num_cols;
+            WeightType const* current_weight_row = current_weight + ii * num_cols;
             for (int jj = 0; jj < bytes_per_out_col; ++jj)
             {
 
                 if (quant_type == QuantType::INT8_WEIGHT_ONLY)
                 {
-                    const float col_scale = per_col_max[jj];
-                    const float weight_elt = float(current_weight_row[jj]);
-                    const float scaled_weight = round(weight_elt / col_scale);
+                    float const col_scale = per_col_max[jj];
+                    float const weight_elt = float(current_weight_row[jj]);
+                    float const scaled_weight = round(weight_elt / col_scale);
                     const int8_t clipped_weight = int8_t(std::max(-128.f, std::min(127.f, scaled_weight)));
                     current_quantized_weight_row[jj] = clipped_weight;
                 }
@@ -700,12 +700,12 @@ void symmetric_quantize(int8_t* processed_quantized_weight, int8_t* unprocessed_
                     int8_t packed_int4s = 0;
                     for (int packed_idx = 0; packed_idx < 2; ++packed_idx)
                     {
-                        const int input_idx = 2 * jj + packed_idx;
+                        int const input_idx = 2 * jj + packed_idx;
                         if (input_idx < num_cols)
                         {
-                            const float col_scale = per_col_max[input_idx];
-                            const float weight_elt = float(current_weight_row[input_idx]);
-                            const float scaled_weight = round(weight_elt / col_scale);
+                            float const col_scale = per_col_max[input_idx];
+                            float const weight_elt = float(current_weight_row[input_idx]);
+                            float const scaled_weight = round(weight_elt / col_scale);
                             int int_weight = int(scaled_weight);
                             const int8_t clipped_weight = std::max(-8, std::min(7, int_weight));
 
@@ -729,47 +729,47 @@ void symmetric_quantize(int8_t* processed_quantized_weight, int8_t* unprocessed_
 }
 
 template void symmetric_quantize<half, float>(
-    int8_t*, int8_t*, half*, const float*, const std::vector<size_t>&, QuantType, bool);
+    int8_t*, int8_t*, half*, float const*, std::vector<size_t> const&, QuantType, bool);
 
 template void symmetric_quantize<half, half>(
-    int8_t*, int8_t*, half*, const half*, const std::vector<size_t>&, QuantType, bool);
+    int8_t*, int8_t*, half*, half const*, std::vector<size_t> const&, QuantType, bool);
 
 #ifdef ENABLE_BF16
 template void symmetric_quantize<__nv_bfloat16, __nv_bfloat16>(
-    int8_t*, int8_t*, __nv_bfloat16*, const __nv_bfloat16*, const std::vector<size_t>&, QuantType, bool);
+    int8_t*, int8_t*, __nv_bfloat16*, __nv_bfloat16 const*, std::vector<size_t> const&, QuantType, bool);
 
 template void symmetric_quantize<__nv_bfloat16, float>(
-    int8_t*, int8_t*, __nv_bfloat16*, const float*, const std::vector<size_t>&, QuantType, bool);
+    int8_t*, int8_t*, __nv_bfloat16*, float const*, std::vector<size_t> const&, QuantType, bool);
 #endif
 
 template <typename ComputeType, typename WeightType>
-void symmetric_quantize(int8_t* processed_quantized_weight, ComputeType* scale_ptr, const WeightType* input_weight_ptr,
-    const std::vector<size_t>& shape, QuantType quant_type, bool force_interleave)
+void symmetric_quantize(int8_t* processed_quantized_weight, ComputeType* scale_ptr, WeightType const* input_weight_ptr,
+    std::vector<size_t> const& shape, QuantType quant_type, bool force_interleave)
 {
     symmetric_quantize(
         processed_quantized_weight, nullptr, scale_ptr, input_weight_ptr, shape, quant_type, force_interleave);
 }
 
 template void symmetric_quantize<float, float>(
-    int8_t*, float*, const float*, const std::vector<size_t>&, QuantType, bool);
+    int8_t*, float*, float const*, std::vector<size_t> const&, QuantType, bool);
 
 template void symmetric_quantize<half, float>(
-    int8_t*, half*, const float*, const std::vector<size_t>&, QuantType, bool);
+    int8_t*, half*, float const*, std::vector<size_t> const&, QuantType, bool);
 
-template void symmetric_quantize<half, half>(int8_t*, half*, const half*, const std::vector<size_t>&, QuantType, bool);
+template void symmetric_quantize<half, half>(int8_t*, half*, half const*, std::vector<size_t> const&, QuantType, bool);
 
 #ifdef ENABLE_BF16
 template void symmetric_quantize<__nv_bfloat16, __nv_bfloat16>(
-    int8_t*, __nv_bfloat16*, const __nv_bfloat16*, const std::vector<size_t>&, QuantType, bool);
+    int8_t*, __nv_bfloat16*, __nv_bfloat16 const*, std::vector<size_t> const&, QuantType, bool);
 
 template void symmetric_quantize<__nv_bfloat16, half>(
-    int8_t*, __nv_bfloat16*, const half*, const std::vector<size_t>&, QuantType, bool);
+    int8_t*, __nv_bfloat16*, half const*, std::vector<size_t> const&, QuantType, bool);
 
 template void symmetric_quantize<half, __nv_bfloat16>(
-    int8_t*, half*, const __nv_bfloat16*, const std::vector<size_t>&, QuantType, bool);
+    int8_t*, half*, __nv_bfloat16 const*, std::vector<size_t> const&, QuantType, bool);
 
 template void symmetric_quantize<__nv_bfloat16, float>(
-    int8_t*, __nv_bfloat16*, const float*, const std::vector<size_t>&, QuantType, bool);
+    int8_t*, __nv_bfloat16*, float const*, std::vector<size_t> const&, QuantType, bool);
 #endif
 
 } // namespace cutlass_kernels

@@ -15,8 +15,10 @@
  * limitations under the License.
  */
 
+#include <pybind11/cast.h>
 #include <pybind11/functional.h>
 #include <pybind11/operators.h>
+#include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <torch/extension.h>
 #include <vector>
@@ -62,6 +64,17 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
     tpr::GenerationInput::initBindings(m);
     tpr::GenerationOutput::initBindings(m);
 
+    auto kvCacheConfigGetstate = [](tbk::KvCacheConfig const& config)
+    {
+        return py::make_tuple(config.maxTokens, config.maxAttentionWindow, config.sinkTokenLength,
+            config.freeGpuMemoryFraction, config.enableBlockReuse, config.useUvm);
+    };
+    auto kvCacheConfigSetstate = [](py::tuple t)
+    {
+        return tbk::KvCacheConfig(t[0].cast<std::optional<SizeType>>(), t[1].cast<std::optional<SizeType>>(),
+            t[2].cast<std::optional<SizeType>>(), t[3].cast<std::optional<float>>(), t[4].cast<bool>(),
+            t[5].cast<bool>());
+    };
     py::class_<tbk::KvCacheConfig>(m, "KvCacheConfig")
         .def(py::init<std::optional<SizeType>, std::optional<SizeType>, std::optional<SizeType>, std::optional<float>,
                  bool>(),
@@ -72,7 +85,9 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_readwrite("max_attention_window", &tbk::KvCacheConfig::maxAttentionWindow)
         .def_readwrite("sink_token_length", &tbk::KvCacheConfig::sinkTokenLength)
         .def_readwrite("free_gpu_memory_fraction", &tbk::KvCacheConfig::freeGpuMemoryFraction)
-        .def_readwrite("enable_block_reuse", &tbk::KvCacheConfig::enableBlockReuse);
+        .def_readwrite("enable_block_reuse", &tbk::KvCacheConfig::enableBlockReuse)
+        .def(py::pickle(kvCacheConfigGetstate, kvCacheConfigSetstate))
+        .def("__eq__", &tbk::KvCacheConfig::operator==);
 
     py::class_<tr::GptSession::Config>(m, "GptSessionConfig")
         .def(py::init<SizeType, SizeType, SizeType>(), py::arg("max_batch_size"), py::arg("max_beam_width"),
@@ -251,11 +266,11 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property_readonly("pipeline_parallelism", &tr::GptJsonConfig::getPipelineParallelism)
         .def_property_readonly("world_size", &tr::GptJsonConfig::getWorldSize)
         .def("engine_filename",
-            py::overload_cast<const tr::WorldConfig&, const std::string&>(
+            py::overload_cast<tr::WorldConfig const&, std::string const&>(
                 &tr::GptJsonConfig::engineFilename, py::const_),
             py::arg("world_config"), py::arg("model"))
         .def("engine_filename",
-            py::overload_cast<const tr::WorldConfig&>(&tr::GptJsonConfig::engineFilename, py::const_),
+            py::overload_cast<tr::WorldConfig const&>(&tr::GptJsonConfig::engineFilename, py::const_),
             py::arg("world_config"));
 
     py::class_<tr::GptSession>(m, "GptSession")
@@ -333,6 +348,20 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .value("MAX_UTILIZATION", tbb::SchedulerPolicy::MAX_UTILIZATION)
         .value("GUARANTEED_NO_EVICT", tbb::SchedulerPolicy::GUARANTEED_NO_EVICT);
 
+    auto gptModelParamsGetstate = [&kvCacheConfigGetstate](tb::TrtGptModelOptionalParams const& params)
+    {
+        auto kvCacheState = kvCacheConfigGetstate(params.kvCacheConfig);
+        return py::make_tuple(kvCacheState, params.enableTrtOverlap, params.deviceIds, params.normalizeLogProbs,
+            params.enableChunkedContext, params.decodingMode);
+    };
+    auto gptModelParamsSetstate = [&kvCacheConfigSetstate](py::tuple t)
+    {
+        auto kvCacheConfig = kvCacheConfigSetstate(t[0]);
+        return tb::TrtGptModelOptionalParams(kvCacheConfig, t[1].cast<bool>(),
+            t[2].cast<std::optional<std::vector<SizeType>>>(), t[3].cast<bool>(), t[4].cast<bool>(),
+            t[5].cast<std::optional<tensorrt_llm::runtime::DecodingMode>>());
+    };
+
     py::class_<tb::TrtGptModelOptionalParams>(m, "TrtGptModelOptionalParams")
         .def(py::init<tbk::KvCacheConfig, bool>(),
             py::arg_v("kv_cache_config", tbk::KvCacheConfig{}, "KvCacheConfig()"),
@@ -342,7 +371,9 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_readwrite("device_ids", &tb::TrtGptModelOptionalParams::deviceIds)
         .def_readwrite("enable_chunked_context", &tb::TrtGptModelOptionalParams::enableChunkedContext)
         .def_readwrite("normalize_log_probs", &tb::TrtGptModelOptionalParams::normalizeLogProbs)
-        .def_readwrite("decoding_mode", &tb::TrtGptModelOptionalParams::decodingMode);
+        .def_readwrite("decoding_mode", &tb::TrtGptModelOptionalParams::decodingMode)
+        .def(py::pickle(gptModelParamsGetstate, gptModelParamsSetstate))
+        .def("__eq__", &tb::TrtGptModelOptionalParams::operator==);
 
     tpb::GptManager::initBindings(m);
 

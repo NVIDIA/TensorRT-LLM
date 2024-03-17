@@ -102,6 +102,7 @@ std::vector<decoder_batch::Request> prepareRequests(SizeType batchSize, SizeType
             std::vector<TokenIdType> draftTokens(generatedTokensPerSteps[batchIdx] - 1);
             std::fill(draftTokens.begin(), draftTokens.begin() + acceptedTokensPerStep[batchIdx], 1023);
             requests.back().draftTokens = manager.copyFrom(draftTokens, MemoryType::kGPU);
+            requests.back().generatedTokensPerStep = generatedTokensPerSteps[batchIdx];
         }
         requests.back().computeCumLogProbs = computeLogProbs;
         requests.back().computeLogProbs = computeLogProbs;
@@ -523,7 +524,7 @@ struct BeamConfig
 
 using ParamType = std::tuple<nvinfer1::DataType, BeamConfig, bool>;
 
-std::string generateTestName(const testing::TestParamInfo<ParamType>& info)
+std::string generateTestName(testing::TestParamInfo<ParamType> const& info)
 {
     std::string name{std::get<0>(info.param) == nvinfer1::DataType::kFLOAT ? "Float" : "Half"};
     BeamConfig const beamConfig = std::get<1>(info.param);
@@ -631,7 +632,7 @@ INSTANTIATE_TEST_SUITE_P(DecoderTest, ParamDraftTest,
             DraftConfig{4, {1, 2, 3}, {0, 0, 1}}
 
             )),
-    [](const testing::TestParamInfo<DraftTestParamType>& info)
+    [](testing::TestParamInfo<DraftTestParamType> const& info)
     {
         std::string name{std::get<0>(info.param) == nvinfer1::DataType::kFLOAT ? "Float" : "Half"};
         BeamConfig const beamConfig = std::get<1>(info.param);

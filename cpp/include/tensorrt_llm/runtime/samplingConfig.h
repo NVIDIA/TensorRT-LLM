@@ -43,7 +43,7 @@ private:
         auto const hasValues = accessor(0).has_value();
         for (size_t ci = 0; ci < configs.size(); ++ci)
         {
-            const auto& configValue = accessor(ci);
+            auto const& configValue = accessor(ci);
             TLLM_CHECK(hasValues == configValue.has_value());
             if (hasValues)
             {

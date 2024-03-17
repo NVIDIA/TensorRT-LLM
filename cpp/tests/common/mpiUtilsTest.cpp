@@ -46,7 +46,7 @@ void testBroadcast()
     auto constexpr expectedValue = static_cast<T>(42);
     auto constexpr root = 0;
     auto value = rank == root ? expectedValue : T{};
-    comm.bcast(value, root);
+    comm.bcastValue(value, root);
     EXPECT_EQ(value, expectedValue);
 }
 
@@ -79,7 +79,7 @@ TEST(MPIUtils, BroadcastNcclId)
     {
         std::memset(&id, 0, sizeof(id));
     }
-    comm.bcast(id, root);
+    comm.bcastValue(id, root);
     EXPECT_TRUE(std::any_of(
         id.internal, id.internal + sizeof(id.internal) / sizeof(id.internal[0]), [](auto x) { return x != 0; }));
 }

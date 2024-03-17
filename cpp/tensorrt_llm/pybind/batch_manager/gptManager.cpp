@@ -37,7 +37,7 @@ namespace tensorrt_llm::pybind::batch_manager
 
 GptManager::GptManager(std::filesystem::path const& trtEnginePath, tb::TrtGptModelType modelType, int32_t maxBeamWidth,
     tb::batch_scheduler::SchedulerPolicy schedulerPolicy, GetInferenceRequestsCallback const& getInferenceRequestsCb,
-    SendResponseCallback const& sendResponseCb, const tb::PollStopSignalCallback& pollStopSignalCb,
+    SendResponseCallback const& sendResponseCb, tb::PollStopSignalCallback const& pollStopSignalCb,
     tb::ReturnBatchManagerStatsCallback const& returnBatchManagerStatsCb,
     tb::TrtGptModelOptionalParams const& optionalParams, std::optional<uint64_t> terminateReqId)
 {
@@ -87,7 +87,7 @@ tb::GetInferenceRequestsCallback callbackAdapter(GetInferenceRequestsCallback co
 
 tb::SendResponseCallback callbackAdapter(SendResponseCallback const& callback)
 {
-    return [callback](uint64_t id, std::list<tb::NamedTensor> const& cppTensors, bool isOk, const std::string& errMsg)
+    return [callback](uint64_t id, std::list<tb::NamedTensor> const& cppTensors, bool isOk, std::string const& errMsg)
     {
         std::list<NamedTensor> pythonList{};
         for (const auto& cppNamedTensor : cppTensors)
@@ -103,7 +103,7 @@ void GptManager::initBindings(py::module_& m)
     py::class_<GptManager>(m, "GptManager")
         .def(py::init<std::filesystem::path const&, tb::TrtGptModelType, int32_t, tb::batch_scheduler::SchedulerPolicy,
                  GetInferenceRequestsCallback, SendResponseCallback, tb::PollStopSignalCallback,
-                 tb::ReturnBatchManagerStatsCallback, const tb::TrtGptModelOptionalParams&, std::optional<uint64_t>>(),
+                 tb::ReturnBatchManagerStatsCallback, tb::TrtGptModelOptionalParams const&, std::optional<uint64_t>>(),
             py::arg("trt_engine_path"), py::arg("model_type"), py::arg("max_beam_width"), py::arg("scheduler_policy"),
             py::arg("get_inference_requests_cb"), py::arg("send_response_cb"), py::arg("poll_stop_signal_cb") = nullptr,
             py::arg("return_batch_manager_stats_cb") = nullptr,

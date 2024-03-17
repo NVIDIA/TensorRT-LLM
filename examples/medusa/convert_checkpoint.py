@@ -177,18 +177,6 @@ def parse_arguments():
         default=1,
         help='The number of workers for converting checkpoint in parallel')
 
-    parser.add_argument('--enable_pos_shift',
-                        default=False,
-                        action='store_true',
-                        help='Enable position shift for streamingllm method')
-    parser.add_argument(
-        '--dense_context_fmha',
-        default=False,
-        action='store_true',
-        help=
-        'Enable dense fmha in context phase, otherwise sliding window attention.'
-        'If dense_context_fmha=False, the sliding window size is the max attention window size.'
-    )
     parser.add_argument('--num_medusa_heads', type=int, default=4)
     parser.add_argument(
         '--fixed_num_medusa_heads',
@@ -806,17 +794,12 @@ def convert_hf_llama(hf_model,
     num_key_value_heads = hf_model.config.num_key_value_heads
     mha_mode = (num_key_value_heads == num_attention_heads)
 
-    layers_per_pipeline_stage = hf_model.config.num_hidden_layers // mapping.pp_size
-    layers_range = list(
-        range(mapping.pp_rank * layers_per_pipeline_stage,
-              (mapping.pp_rank + 1) * layers_per_pipeline_stage, 1))
-
-    for l in range(hf_model.config.num_hidden_layers):
-        if l not in layers_range:
-            continue
+    num_hidden_layers = hf_model.config.num_hidden_layers
+    layers_range = mapping.pp_layers(num_hidden_layers)
+    for l in layers_range:
+        layer_idx = l - layers_range[0]
         prefix = f'model.layers.{l}.'
-        idx = int(l) - mapping.pp_rank * layers_per_pipeline_stage
-        tllm_prex = f'transformer.layers.{idx}.'
+        tllm_prex = f'transformer.layers.{layer_idx}.'
 
         q_weight = get_weight(model_params, prefix + 'self_attn.q_proj', dtype)
         k_weight = get_weight(model_params, prefix + 'self_attn.k_proj', dtype)
@@ -1145,7 +1128,6 @@ if __name__ == '__main__':
         'quantization': {
             'quant_algo': None,
             'kv_cache_quant_algo': None,
-            "sq_use_plugin": True,
         },
         'mapping': {
             'world_size': world_size,
@@ -1156,8 +1138,6 @@ if __name__ == '__main__':
         'embedding_sharding_dim': args.embedding_sharding_dim,
         'share_embedding_table': args.use_embedding_sharing,
         'use_prompt_tuning': args.use_prompt_tuning,
-        'enable_pos_shift': args.enable_pos_shift,
-        'dense_context_fmha': args.dense_context_fmha,
         'max_draft_len': args.max_medusa_token_len,
         'num_medusa_heads': args.num_medusa_heads,
         'num_medusa_layers': args.num_medusa_layers

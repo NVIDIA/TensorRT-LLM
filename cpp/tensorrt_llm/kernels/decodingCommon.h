@@ -151,7 +151,7 @@ static_assert(FinishedState::finishedMaxLength().isFinishedMaxLength());
 //! \param randomSeed seed to initialize states
 //! \param stream stream
 void invokeCurandInitialize(
-    curandState_t* state, const int* batchSlots, const size_t batchSize, uint64_t randomSeed, cudaStream_t stream);
+    curandState_t* state, int const* batchSlots, const size_t batchSize, uint64_t randomSeed, cudaStream_t stream);
 
 //! \brief Initialize batchSize curand states with given seed per request.
 //!
@@ -160,8 +160,8 @@ void invokeCurandInitialize(
 //! \param batchSize number of states to initialize
 //! \param randomSeeds input buffer [maxBatchSize] with seeds
 //! \param stream stream
-void invokeCurandBatchInitialize(curandState_t* states, const int* batchSlots, const size_t batchSize,
-    const uint64_t* randomSeeds, cudaStream_t stream);
+void invokeCurandBatchInitialize(curandState_t* states, int const* batchSlots, const size_t batchSize,
+    uint64_t const* randomSeeds, cudaStream_t stream);
 
 //! \brief Applies mask, adds bias to logits and computes softmax values.
 //! Sets -MAX_FLT value for tokens in range [vocabSize; vocabSizePadded) to prevent them from being chosen.

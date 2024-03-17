@@ -26,8 +26,7 @@ from utils.convert import cpu_map_location
 from utils.nemo import unpack_nemo_ckpt
 
 from tensorrt_llm._utils import str_dtype_to_torch, to_json_file, torch_to_numpy
-from tensorrt_llm.runtime.lora_manager import (LoraConfig,
-                                               get_all_nemo_lora_weights)
+from tensorrt_llm.lora_manager import LoraConfig, get_all_nemo_lora_weights
 
 log_format = "%(asctime)s %(name)s [%(levelname)s] %(message)s"
 logging.basicConfig(format=log_format)

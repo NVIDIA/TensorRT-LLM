@@ -67,7 +67,7 @@ public:
     using SetupParams = typename tensorrt_llm::layers::DynamicDecodeLayer<T>::SetupParams;
 
     FtDynamicDecode(const size_t max_batch_size, const size_t max_beam_width, const size_t vocab_size,
-        const size_t vocab_size_padded, const int tensor_para_size, const int pipeline_para_size);
+        const size_t vocab_size_padded, int const tensor_para_size, int const pipeline_para_size);
 
     void setup(size_t batch_size, size_t beam_width, th::optional<th::Tensor> runtime_top_k_opt,
         th::optional<th::Tensor> runtime_top_p_opt, th::optional<th::Tensor> temperature_opt,

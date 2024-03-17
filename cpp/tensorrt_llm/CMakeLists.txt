@@ -188,15 +188,14 @@ endif()
 set(TRTLLM_LINK_LIBS
     ${CUBLAS_LIB}
     ${CUBLASLT_LIB}
-    ${CUDNN_LIB}
     ${CMAKE_DL_LIBS}
     ${MPI_C_LIBRARIES}
     ${NCCL_LIB}
     ${TRT_LIB}
     common_src
     kernels_src
-    cutlass_src_pre_hopper
-    cutlass_src_hopper
+    cutlass2_src
+    cutlass3_src
     layers_src
     runtime_src)
 

@@ -96,7 +96,7 @@ git clone https://huggingface.co/THUDM/chatglm3-6b-base chatglm3_6b_base
 git clone https://huggingface.co/THUDM/chatglm3-6b-32k  chatglm3_6b_32k
 git clone https://huggingface.co/THUDM/glm-10b          glm_10b
 
-# replace tokenizationfile if using transformers-4.36.1 for model ChatGLM-6B (this might be needless in the future)
+# replace tokenization file if using transformers-4.36.1 for model ChatGLM-6B (this might be needless in the future)
 cp chatglm_6b/tokenization_chatglm.py chatglm_6b/tokenization_chatglm.py-backup
 cp tokenization_chatglm.py chatglm_6b
 ```
@@ -184,7 +184,7 @@ If the engines are run successfully, you will see output like (ChatGLM3-6B as th
 * The engine(s) must be built accordingly if [in-flight batching in C++ runtime](../../docs/in_flight_batching.md) will be used.
 * Use `--gpt_attention_plugin float16`, `--paged_kv_cache enable`, `--remove_input_padding enable` to build engine(s) supporting In-flight Batching.
   * It is possible to use `--gpt_attention_plugin float32` In-flight Batching.
-  * The size of the block in paged KV cache can be conteoled additionally by using `--tokens_per_block=N`.
+  * The size of the block in paged KV cache can be controlled additionally by using `--tokens_per_block=N`.
 
 ### 4. Run inference
 
@@ -258,7 +258,7 @@ If the engines are run successfully, you will see output like (ChatGLM3-6B as th
 
 ### Weight Only quantization
 
-Use `--use_weight_only` to enable INT8-Weight-Only quantization, this will siginficantly lower the latency and memory footprint. Furthermore, use `--weight_only_precision int8` or `--weight_only_precision int4` to configure the data type of the weights.
+Use `--use_weight_only` to enable INT8-Weight-Only quantization, this will significantly lower the latency and memory footprint. Furthermore, use `--weight_only_precision int8` or `--weight_only_precision int4` to configure the data type of the weights.
 
 ```bash
 # ChatGLM3-6B: single gpu, int8 weight only quantization

@@ -59,9 +59,84 @@ def split(v, tp_size, idx, dim=0):
     return None
 
 
+def parse_sc2_config(ini_file):
+    gpt_config = configparser.ConfigParser()
+    gpt_config.read(ini_file)
+
+    n_embd = gpt_config.getint('gpt', 'hidden_size')
+    n_head = gpt_config.getint('gpt', 'num_attention_heads')
+    n_kv_head = gpt_config.getint('gpt', 'num_key_value_heads')
+    n_layer = gpt_config.getint('gpt', 'num_hidden_layers')
+    n_positions = gpt_config.getint('gpt', 'max_position_embeddings')
+    vocab_size = gpt_config.getint('gpt', 'vocab_size')
+    do_layer_norm_before = gpt_config.getboolean('gpt',
+                                                 'do_layer_norm_before',
+                                                 fallback=True)
+    rotary_base = gpt_config.getfloat('gpt', 'rope_theta', fallback=None)
+    rotary_scaling_type = gpt_config.get('gpt',
+                                         'rotary_scaling_type',
+                                         fallback=None)
+    rotary_scaling_factor = gpt_config.get('gpt',
+                                           'rotary_scaling_factor',
+                                           fallback=None)
+    if rotary_scaling_type is None:
+        if rotary_scaling_factor is not None:
+            raise ValueError(
+                f"'rotary_scaling_factor={rotary_scaling_factor}' is found in ini "
+                f"config file {ini_file}, whereas 'rotary_scaling_type' is missing "
+                f"in the config. The 'rotary_scaling_factor' will be ignored and "
+                f"rotary scaling will not be used.")
+        rotary_scaling = None
+    else:
+        if rotary_scaling_factor is None:
+            raise ValueError(
+                f"'rotary_scaling_factor={rotary_scaling_factor}' was not found "
+                f"in ini config file {ini_file}, whereas 'rotary_scaling_type' is "
+                f"provided  and equals {repr(rotary_scaling_type)}.")
+        rotary_scaling = [rotary_scaling_type, rotary_scaling_factor]
+    rotary_pct = 1.0
+    hidden_act = "gelu"
+    bias = gpt_config.getboolean('gpt', 'use_bias', fallback=True)
+    inter_size = gpt_config.getint('gpt', 'intermediate_size', fallback=None)
+    dtype = gpt_config.get('gpt', 'storage_dtype', fallback='float32')
+
+    if inter_size is None:
+        inter_size = 4 * n_embd
+
+    multi_query_mode = gpt_config.getboolean('gpt',
+                                             'multi_query_mode',
+                                             fallback=False)
+    prompt_num_tasks = gpt_config.getint('gpt', 'prompt_num_tasks', fallback=0)
+    prompt_max_vocab_size = gpt_config.getint('gpt',
+                                              'prompt_max_vocab_size',
+                                              fallback=0)
+    return {
+        "n_embd": n_embd,
+        "n_head": n_head,
+        "n_kv_head": n_kv_head,
+        "n_layer": n_layer,
+        "n_positions": n_positions,
+        "vocab_size": vocab_size,
+        "do_layer_norm_before": do_layer_norm_before,
+        "hidden_act": hidden_act,
+        "rotary_pct": rotary_pct,
+        "rotary_base": rotary_base,
+        "rotary_scaling": rotary_scaling,
+        "bias": bias,
+        "inter_size": inter_size,
+        "multi_query_mode": multi_query_mode,
+        "dtype": dtype,
+        "prompt_num_tasks": prompt_num_tasks,
+        "prompt_max_vocab_size": prompt_max_vocab_size
+    }
+
+
 def parse_ft_config(ini_file):
     gpt_config = configparser.ConfigParser()
     gpt_config.read(ini_file)
+
+    if gpt_config.get("gpt", "model", fallback=None) == "starcoder2":
+        return parse_sc2_config(ini_file)
 
     n_embd = gpt_config.getint('gpt', 'n_embd')
     n_head = gpt_config.getint('gpt', 'n_head')
@@ -112,6 +187,7 @@ def parse_ft_config(ini_file):
     return {
         "n_embd": n_embd,
         "n_head": n_head,
+        "n_kv_head": 1 if multi_query_mode else n_head,
         "n_layer": n_layer,
         "n_positions": n_positions,
         "vocab_size": vocab_size,
@@ -157,6 +233,8 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
     _parsed_params = parse_ft_config(Path(dir_path) / 'config.ini')
     n_embd = _parsed_params["n_embd"]
     n_head = _parsed_params["n_head"]
+    n_kv_head = _parsed_params["n_kv_head"]
+    head_size = n_embd // n_head
     n_layer = _parsed_params["n_layer"]
     n_positions = _parsed_params["n_positions"]
     vocab_size = _parsed_params["vocab_size"]
@@ -164,7 +242,6 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
     hidden_act = _parsed_params["hidden_act"]
     bias = _parsed_params["bias"]
     inter_size = _parsed_params["inter_size"]
-    multi_query_mode = _parsed_params["multi_query_mode"]
 
     np_dtype = str_dtype_to_np(dtype)
 
@@ -284,10 +361,8 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
             split(lm_head_weight, tensor_parallel, rank))
     fake_fp8_sf_dt = np.float32
     for i in range(n_layer):
-        c_attn_out_dim = (3 * n_embd //
-                          tensor_parallel) if not multi_query_mode else (
-                              n_embd // tensor_parallel +
-                              (n_embd // n_head) * 2)
+        c_attn_out_dim = ((n_head // tensor_parallel) +
+                          max(n_kv_head // tensor_parallel, 1) * 2) * head_size
         gpt_layer = tensorrt_llm_gpt.layers[i]
         gpt_layer.input_layernorm.weight.value = (fromfile(
             dir_path, 'model.layers.' + str(i) + '.input_layernorm.weight.bin'))

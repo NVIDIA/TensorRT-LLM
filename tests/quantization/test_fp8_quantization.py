@@ -17,16 +17,15 @@ import sys
 import unittest
 
 import numpy as np
-import pytest
 import torch
 from parameterized import parameterized
 
 import tensorrt_llm  # NOQA
 
-FP8_E4M3_MAX = 448.0
-
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import getSMVersion
+from utils.util import skip_bf16_pre_ampere, unittest_name_func
+
+FP8_E4M3_MAX = 448.0
 
 
 class TestDynamicFP8QuantDequant(unittest.TestCase):
@@ -34,13 +33,11 @@ class TestDynamicFP8QuantDequant(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(42)
 
-    @parameterized.expand([(torch.float32), (torch.float16), (torch.bfloat16)])
+    @parameterized.expand([(torch.float32), (torch.float16), (torch.bfloat16)],
+                          name_func=unittest_name_func)
     def test_quantization_activation_scales(self, dtype):
         # Skip tests that are not supported in pre-ampere architecture
-        if getSMVersion() < 80:
-            if dtype == torch.bfloat16:
-                pytest.skip(
-                    "bfloat16 is not supported in pre-ampere architecture")
+        skip_bf16_pre_ampere(dtype)
 
         A = torch.tensor([[1, 2, 3], [2, 4, 6]], dtype=dtype)
         _, s = torch.ops.tensorrt_llm.quantize_e4m3_activation(A)
@@ -49,13 +46,11 @@ class TestDynamicFP8QuantDequant(unittest.TestCase):
         np.testing.assert_allclose(s_ref.float().numpy(),
                                    s.squeeze().float().numpy())
 
-    @parameterized.expand([(torch.float32), (torch.float16), (torch.bfloat16)])
+    @parameterized.expand([(torch.float32), (torch.float16), (torch.bfloat16)],
+                          name_func=unittest_name_func)
     def test_quantization_weight_scales(self, dtype):
         # Skip tests that are not supported in pre-ampere architecture
-        if getSMVersion() < 80:
-            if dtype == torch.bfloat16:
-                pytest.skip(
-                    "bfloat16 is not supported in pre-ampere architecture")
+        skip_bf16_pre_ampere(dtype)
 
         A = torch.tensor([[1, 2, 3], [2, 4, 6]], dtype=dtype)
         _, s = torch.ops.tensorrt_llm.quantize_e4m3_weight(A)
@@ -64,13 +59,11 @@ class TestDynamicFP8QuantDequant(unittest.TestCase):
         np.testing.assert_allclose(s_ref.float().numpy(),
                                    s.squeeze().float().numpy())
 
-    @parameterized.expand([(torch.float32), (torch.float16), (torch.bfloat16)])
+    @parameterized.expand([(torch.float32), (torch.float16), (torch.bfloat16)],
+                          name_func=unittest_name_func)
     def test_quantization_per_tensor_scales(self, dtype):
         # Skip tests that are not supported in pre-ampere architecture
-        if getSMVersion() < 80:
-            if dtype == torch.bfloat16:
-                pytest.skip(
-                    "bfloat16 is not supported in pre-ampere architecture")
+        skip_bf16_pre_ampere(dtype)
 
         A = torch.tensor([[1, 2, 3], [2, 4, 6]], dtype=dtype)
         _, s = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(A)
@@ -79,13 +72,11 @@ class TestDynamicFP8QuantDequant(unittest.TestCase):
         np.testing.assert_allclose(s_ref.float().numpy(),
                                    s.squeeze().float().numpy())
 
-    @parameterized.expand([(torch.float32), (torch.float16), (torch.bfloat16)])
+    @parameterized.expand([(torch.float32), (torch.float16), (torch.bfloat16)],
+                          name_func=unittest_name_func)
     def test_quantization_dequantization_activation(self, dtype):
         # Skip tests that are not supported in pre-ampere architecture
-        if getSMVersion() < 80:
-            if dtype == torch.bfloat16:
-                pytest.skip(
-                    "bfloat16 is not supported in pre-ampere architecture")
+        skip_bf16_pre_ampere(dtype)
 
         n = 512
         m = 1024
@@ -122,13 +113,11 @@ class TestDynamicFP8QuantDequant(unittest.TestCase):
 
         np.testing.assert_allclose(A.float().numpy(), B.float().numpy())
 
-    @parameterized.expand([(torch.float32), (torch.float16), (torch.bfloat16)])
+    @parameterized.expand([(torch.float32), (torch.float16), (torch.bfloat16)],
+                          name_func=unittest_name_func)
     def test_quantization_dequantization_weight(self, dtype):
         # Skip tests that are not supported in pre-ampere architecture
-        if getSMVersion() < 80:
-            if dtype == torch.bfloat16:
-                pytest.skip(
-                    "bfloat16 is not supported in pre-ampere architecture")
+        skip_bf16_pre_ampere(dtype)
 
         n = 512
         m = 1024
@@ -160,13 +149,11 @@ class TestDynamicFP8QuantDequant(unittest.TestCase):
 
         np.testing.assert_allclose(A.float().numpy(), B.float().numpy())
 
-    @parameterized.expand([(torch.float32), (torch.float16), (torch.bfloat16)])
+    @parameterized.expand([(torch.float32), (torch.float16), (torch.bfloat16)],
+                          name_func=unittest_name_func)
     def test_quantization_dequantization_per_tensor(self, dtype):
         # Skip tests that are not supported in pre-ampere architecture
-        if getSMVersion() < 80:
-            if dtype == torch.bfloat16:
-                pytest.skip(
-                    "bfloat16 is not supported in pre-ampere architecture")
+        skip_bf16_pre_ampere(dtype)
 
         n = 512
         m = 1024

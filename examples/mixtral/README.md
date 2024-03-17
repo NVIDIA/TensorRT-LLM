@@ -52,7 +52,7 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_mixtral_2gpu \
                  --gemm_plugin float16
 ```
 
-Then, you can test your engine with the [run.py](./examples/run.py) script:
+Then, you can test your engine with the [run.py](../run.py) script:
 
 ```
 mpirun -n 2 python3 ../run.py --engine_dir ./trt_engines/mixtral/tp2 --tokenizer_dir ./Mixtral-8x7B-v0.1 --max_output_len 8 --input_text "I love french quiche"

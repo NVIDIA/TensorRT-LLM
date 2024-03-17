@@ -34,6 +34,9 @@
 namespace tensorrt_llm::executor
 {
 
+class Model;
+class Serialization;
+
 /// @brief Sampling configuration
 class SamplingConfig
 {
@@ -50,6 +53,8 @@ public:
         std::optional<SizeType> earlyStopping = std::nullopt);
 
     ~SamplingConfig();
+
+    bool operator==(SamplingConfig const& other) const;
 
     [[nodiscard]] SizeType getBeamWidth() const;
     [[nodiscard]] std::optional<SizeType> getTopK() const;
@@ -68,6 +73,7 @@ public:
     [[nodiscard]] std::optional<SizeType> getEarlyStopping() const;
 
 private:
+    friend class Serialization;
     SizeType mBeamWidth;
     std::optional<SizeType> mTopK;
     std::optional<FloatType> mTopP;
@@ -86,12 +92,16 @@ private:
 };
 
 /// @brief  Configuration that controls the outputs of a Result
-struct OutputConfig
+class OutputConfig
 {
-    bool returnLogProbs{false};
-    bool returnContextLogits{false};
-    bool returnGenerationLogits{false};
-    bool excludeInputFromOutput{false};
+public:
+    OutputConfig(bool returnLogProbs = false, bool returnContextLogits = false, bool returnGenerationLogits = false,
+        bool excludeInputFromOutput = false);
+
+    bool returnLogProbs;
+    bool returnContextLogits;
+    bool returnGenerationLogits;
+    bool excludeInputFromOutput;
 };
 
 /// @brief Configuration for speculative decoding. Allows to include draft tokens, draft logits and specify acceptance
@@ -99,18 +109,19 @@ struct OutputConfig
 class SpeculativeDecodingConfig
 {
 public:
-    explicit SpeculativeDecodingConfig(VecTokens tokens, std::optional<TensorPtr> logits = std::nullopt,
+    explicit SpeculativeDecodingConfig(VecTokens tokens, std::optional<Tensor> logits = std::nullopt,
         std::optional<FloatType> acceptanceThreshold = std::nullopt);
 
     ~SpeculativeDecodingConfig();
 
     [[nodiscard]] VecTokens getTokens() const;
-    [[nodiscard]] std::optional<TensorPtr> getLogits() const;
+    [[nodiscard]] std::optional<Tensor> getLogits() const;
     [[nodiscard]] std::optional<FloatType> getAcceptanceThreshold() const;
 
 private:
+    friend class Serialization;
     VecTokens mTokens;
-    std::optional<TensorPtr> mLogits;
+    std::optional<Tensor> mLogits;
     std::optional<FloatType> mAcceptanceThreshold;
 };
 
@@ -122,28 +133,31 @@ public:
     /// @param embeddingTable  The prompt embedding table. Data type must match model weights. Shape [vocabSize,
     /// hiddenSize]
     /// @param vocabSize
-    PromptTuningConfig(TensorPtr embeddingTable);
+    PromptTuningConfig(Tensor embeddingTable);
     ~PromptTuningConfig();
 
-    [[nodiscard]] TensorPtr getEmbeddingTable() const;
+    [[nodiscard]] Tensor getEmbeddingTable() const;
 
 private:
-    TensorPtr mEmbeddingTable;
+    friend class Serialization;
+    Tensor mEmbeddingTable;
 };
 
 /// @brief Configuration for LoRA
 class LoraConfig
 {
 public:
-    LoraConfig(TensorPtr weights, TensorPtr config);
+    LoraConfig(Tensor weights, Tensor config);
     ~LoraConfig();
 
-    [[nodiscard]] TensorPtr getWeights() const;
-    [[nodiscard]] TensorPtr getConfig() const;
+    [[nodiscard]] Tensor getWeights() const;
+    [[nodiscard]] Tensor getConfig() const;
 
 private:
-    TensorPtr mWeights;
-    TensorPtr mConfig;
+    friend class Serialization;
+
+    Tensor mWeights;
+    Tensor mConfig;
 };
 
 /// @brief A class that holds information about the request
@@ -169,7 +183,7 @@ public:
         std::optional<SizeType> endId = std::nullopt, std::optional<SizeType> padId = std::nullopt,
         std::optional<std::list<VecTokens>> badWords = std::nullopt,
         std::optional<std::list<VecTokens>> stopWords = std::nullopt,
-        std::optional<TensorPtr> embeddingBias = std::nullopt,
+        std::optional<Tensor> embeddingBias = std::nullopt,
         std::optional<SpeculativeDecodingConfig> speculativeDecodingConfig = std::nullopt,
         std::optional<PromptTuningConfig> pTuningConfig = std::nullopt,
         std::optional<LoraConfig> loraConfig = std::nullopt);
@@ -189,7 +203,7 @@ public:
     [[nodiscard]] std::optional<SizeType> getPadId() const;
     [[nodiscard]] std::optional<std::list<VecTokens>> getBadWords() const;
     [[nodiscard]] std::optional<std::list<VecTokens>> getStopWords() const;
-    [[nodiscard]] std::optional<TensorPtr> getEmbeddingBias() const;
+    [[nodiscard]] std::optional<Tensor> getEmbeddingBias() const;
     [[nodiscard]] std::optional<SpeculativeDecodingConfig> getSpeculativeDecodingConfig() const;
     [[nodiscard]] std::optional<PromptTuningConfig> getPromptTuningConfig() const;
     [[nodiscard]] std::optional<LoraConfig> getLoraConfig() const;
@@ -201,12 +215,13 @@ public:
     void setPadId(SizeType padId);
     void setBadWords(std::list<VecTokens> badWords);
     void setStopWords(std::list<VecTokens> stopWords);
-    void setEmbeddingBias(TensorPtr);
+    void setEmbeddingBias(Tensor);
     void setSpeculativeDecodingConfig(SpeculativeDecodingConfig specDecodingConfig);
     void setPromptTuningConfig(PromptTuningConfig pTuningConfig);
     void setLoraConfig(LoraConfig loraConfig);
 
 private:
+    friend class Serialization;
     class Impl;
     std::unique_ptr<Impl> mImpl;
 };
@@ -222,8 +237,8 @@ struct Result
 
     std::optional<VecLogProbs> cumLogProbs;           // [beamSize]
     std::optional<std::vector<VecLogProbs>> logProbs; // [beamSize, seqLen]
-    std::optional<TensorPtr> contextLogits;           // [promptLen, vocab_size_padded]
-    std::optional<TensorPtr> generationLogits;        // [beam_size, mMaxNewTokens, vocab_size_padded]
+    std::optional<Tensor> contextLogits;              // [promptLen, vocab_size_padded]
+    std::optional<Tensor> generationLogits;           // [beam_size, mMaxNewTokens, vocab_size_padded]
 };
 
 /// @brief Class that holds either an error or a result
@@ -298,15 +313,49 @@ private:
 
 SizeType const kDefaultIterStatsMaxIterations = 1000;
 
+/// @brief A configuration class for the parallel execution parameters
+///        Currently only supports commType = CommunicationType::kMPI
+class ParallelConfig
+{
+public:
+    /// @brief Constructor
+    /// @param commType The communication type. See CommunicationType.
+    /// @param commMode The communication mode. See CommunicationMode.
+    /// @param deviceIds The IDs of the GPUs involved in the execution of the model
+    /// @param participantIds The participant IDs (MPI ranks if commType == kMPI) involved in the execution of the
+    /// model. The first participant is considered to be the leader.
+    ParallelConfig(CommunicationType commType = CommunicationType::kMPI,
+        CommunicationMode commMode = CommunicationMode::kLEADER,
+        std::optional<std::vector<SizeType>> deviceIds = std::nullopt,
+        std::optional<std::vector<SizeType>> participantIds = std::nullopt);
+    ~ParallelConfig();
+
+    [[nodiscard]] CommunicationType getCommunicationType() const;
+    [[nodiscard]] CommunicationMode getCommunicationMode() const;
+    [[nodiscard]] std::optional<std::vector<SizeType>> getDeviceIds() const;
+    [[nodiscard]] std::optional<std::vector<SizeType>> getParticipantIds() const;
+
+    void setCommunicationType(CommunicationType type);
+    void setCommunicationMode(CommunicationMode mode);
+    void setDeviceIds(std::vector<SizeType> deviceIds);
+    void setParticipantIds(std::vector<SizeType> participantIds);
+
+private:
+    CommunicationType mCommType;
+    CommunicationMode mCommMode;
+    std::optional<std::vector<SizeType>> mDeviceIds;
+    std::optional<std::vector<SizeType>> mParticipantIds;
+};
+
 /// @brief Configuration class for the model executor
 class ExecutorConfig
 {
 public:
     ExecutorConfig(SizeType maxBeamWidth = 1, SchedulerConfig schedulerConfig = SchedulerConfig(),
         KvCacheConfig kvCacheConfig = KvCacheConfig(), bool enableChunkedContext = false, bool normalizeLogProbs = true,
-        bool enableTrtOverlap = false, std::optional<std::vector<SizeType>> deviceIds = std::nullopt,
-        SizeType iterStatsMaxIterations = kDefaultIterStatsMaxIterations,
-        BatchingType batchingType = BatchingType::kINFLIGHT);
+        bool enableTrtOverlap = false, SizeType iterStatsMaxIterations = kDefaultIterStatsMaxIterations,
+        BatchingType batchingType = BatchingType::kINFLIGHT,
+        std::optional<ParallelConfig> parallelConfig = std::nullopt);
 
     [[nodiscard]] SizeType getMaxBeamWidth() const;
     [[nodiscard]] SchedulerConfig getSchedulerConfig() const;
@@ -314,9 +363,9 @@ public:
     [[nodiscard]] bool getEnableChunkedContext() const;
     [[nodiscard]] bool getNormalizeLogProbs() const;
     [[nodiscard]] bool getEnableTrtOverlap() const;
-    [[nodiscard]] std::optional<std::vector<SizeType>> getDeviceIds() const;
     [[nodiscard]] SizeType getIterStatsMaxIterations() const;
     [[nodiscard]] BatchingType getBatchingType() const;
+    [[nodiscard]] std::optional<ParallelConfig> getParallelConfig() const;
 
     void setMaxBeamWidth(SizeType maxBeamWidth);
     void setSchedulerConfig(SchedulerConfig schedulerConfig);
@@ -324,9 +373,9 @@ public:
     void setEnableChunkedContext(bool enableChunkedContext);
     void setNormalizeLogProbs(bool normalizeLogProbs);
     void setEnableTrtOverlap(bool enableTrtOverlap);
-    void setDeviceIds(std::optional<std::vector<SizeType>> deviceIds);
     void setIterStatsMaxIterations(SizeType iterStatsMaxIterations);
     void setBatchingType(BatchingType batchingType);
+    void setParallelConfig(ParallelConfig parallelConfig);
 
 private:
     SizeType mMaxBeamWidth;
@@ -335,23 +384,10 @@ private:
     bool mEnableChunkedContext;
     bool mNormalizeLogProbs;
     bool mEnableTrtOverlap;
-    std::optional<std::vector<SizeType>> mDeviceIds;
     SizeType mIterStatsMaxIterations;
     BatchingType mBatchingType;
+    std::optional<ParallelConfig> mParallelConfig;
 };
-
-/// TODO:
-/// @brief A class to identify processes involved in the execution of a model
-///        Currently only supports MPI communication
-class Communicator
-{
-public:
-    Communicator(CommunicatorType commType, CommMode mode, SizeType currentId, std::vector<SizeType> const& commIds,
-        std::optional<SizeType> orchestratorId){};
-    ~Communicator() = default;
-};
-
-class Model;
 
 /// @brief The executor is responsible for receiving new requests and sending responses, and running the inference
 class Executor
@@ -364,14 +400,12 @@ public:
     /// @param modelType The type of model
     /// @param executorConfig The configuration for the executor
     /// @param comm An optional inter-process communicator configuration
-    Executor(std::filesystem::path const& modelPath, ModelType modelType, ExecutorConfig executorConfig,
-        std::optional<Communicator> comm = std::nullopt);
+    Executor(std::filesystem::path const& modelPath, ModelType modelType, ExecutorConfig executorConfig);
 
     Executor(std::vector<uint8_t> const& engineBuffer, std::string const& jsonConfigStr, ModelType modelType,
-        ExecutorConfig executorConfig, std::optional<Communicator> comm = std::nullopt);
+        ExecutorConfig executorConfig);
 
-    Executor(
-        std::shared_ptr<Model> model, ExecutorConfig executorConfig, std::optional<Communicator> comm = std::nullopt);
+    Executor(std::shared_ptr<Model> model, ExecutorConfig executorConfig);
 
     ~Executor();
 

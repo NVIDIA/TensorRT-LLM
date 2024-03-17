@@ -242,7 +242,7 @@ def check_gpt_mem_usage(engine, kv_dtype, use_gpt_attention_plugin,
     if est_memory_size > total_mem:
         logger.warning(
             f'Engine is successfully built, but GPU Memory ({total_mem:.2f} MB)'
-            ' may not be enough when inferencing on max shape.')
+            ' may not be enough when running inference on max shape.')
         if paged_kv_cache:
             logger.warning(f'Since paged_kv_cache is enabled, the max KV Cache '
                            'memory size is a estimate for very extreme cases, '

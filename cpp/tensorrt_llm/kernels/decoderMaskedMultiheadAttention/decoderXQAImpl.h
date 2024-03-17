@@ -41,15 +41,15 @@ class DecoderXQAImpl
 {
 public:
     // Whether it is beneficial to use this XQA codepath.
-    virtual bool shouldUse(const XQAParams& xqaParams) = 0;
+    virtual bool shouldUse(XQAParams const& xqaParams) = 0;
     // Prepares for the kernel running. Must be called before calling run.
-    virtual void prepare(const XQAParams& xqa_params) = 0;
+    virtual void prepare(XQAParams const& xqa_params) = 0;
     // Run XQA kernel with KVCacheBuffer.
     //
     // Sub-classes should implement runWithKVLinearBuffer and runWithKVBlockArray.
     template <typename KVCacheBuffer>
-    void run(const XQAParams& xqa_params, KVCacheBuffer& kv_cache_buffer, int2& rotary_kernel_launch_cache,
-        const cudaStream_t& stream);
+    void run(XQAParams const& xqa_params, KVCacheBuffer& kv_cache_buffer, int2& rotary_kernel_launch_cache,
+        cudaStream_t const& stream);
 
     enum class ImplType
     {
@@ -65,11 +65,11 @@ protected:
     {
     }
 
-    virtual void runWithKVLinearBuffer(const XQAParams& xqa_params, KVLinearBuffer& kv_linear_buffer,
-        int2& rotary_kernel_launch_cache, const cudaStream_t& stream)
+    virtual void runWithKVLinearBuffer(XQAParams const& xqa_params, KVLinearBuffer& kv_linear_buffer,
+        int2& rotary_kernel_launch_cache, cudaStream_t const& stream)
         = 0;
-    virtual void runWithKVBlockArray(const XQAParams& xqa_params, KVBlockArray& kv_block_array,
-        int2& rotary_kernel_launch_cache, const cudaStream_t& stream)
+    virtual void runWithKVBlockArray(XQAParams const& xqa_params, KVBlockArray& kv_block_array,
+        int2& rotary_kernel_launch_cache, cudaStream_t const& stream)
         = 0;
 
     DecoderXQARunner* mRunner;

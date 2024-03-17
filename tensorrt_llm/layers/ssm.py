@@ -36,17 +36,15 @@ class MambaParameters:
 
 class Mamba(Module):
 
-    def __init__(
-        self,
-        d_model,
-        d_state=16,
-        d_conv=4,
-        expand=2,
-        dt_rank="auto",
-        conv_bias=True,
-        bias=False,
-        dtype=None,
-    ):
+    def __init__(self,
+                 d_model,
+                 d_state=16,
+                 d_conv=4,
+                 expand=2,
+                 dt_rank="auto",
+                 conv_bias=True,
+                 bias=False,
+                 dtype=None):
         super().__init__()
         self.d_model = d_model
         self.d_state = d_state
@@ -57,7 +55,8 @@ class Mamba(Module):
                                  16) if dt_rank == "auto" else dt_rank
         self.dtype = dtype
 
-        self.A = Parameter(shape=(self.d_inner, self.d_state), dtype="float32")
+        self.A = Parameter(shape=(self.d_state, self.d_inner), dtype="float32")
+
         self.D = Parameter(shape=(self.d_inner, ), dtype="float32")
         self.dt_bias = Parameter(shape=(self.d_inner, ), dtype="float32")
 
@@ -98,21 +97,24 @@ class Mamba(Module):
         Parameters:
             hidden_states: [B, L, D]
             conv_state: [B, D, W]
-            ssm_state: [B, D, N]
+            ssm_state: [B, N, D]
             host_request_types: [B]
         '''
         # in_proj
         xz = self.in_proj(hidden_states)
-        xz = xz.permute([0, 2, 1])
-        x, z = split(xz, [self.d_inner, self.d_inner], dim=1)
+        x, z = split(xz, [self.d_inner, self.d_inner], dim=2)
+        x = x.permute([0, 2, 1])
 
         # In context phase, conv_state is a zero tensor, and it is used for padding
         # In generation phase, conv_state is a tensor of the past x
-        x_pad = concat([conv_state, x], dim=2)
+        slice_shape = concat([shape(x, 0), self.d_inner, self.d_conv - 1])
+        past_conv_state = slice(conv_state,
+                                concat([0, 0, shape(conv_state, 2) - 3]),
+                                slice_shape)
+        x_pad = concat([past_conv_state, x], dim=2)
 
         # Update conv_state
-        slice_shape = concat([shape(x, 0), self.d_inner, self.d_conv - 1])
-        conv_state = slice(x_pad, concat([0, 0, shape(x, 2)]), slice_shape)
+        conv_state = x_pad
 
         # Convolution
         x_pad = x_pad.view(
@@ -126,12 +128,11 @@ class Mamba(Module):
                     shape(x_conv, 2)]))
 
         # Get dt, B and C
-        x_dbl = self.x_proj(x_conv.permute([0, 2, 1]))
+        x_conv = x_conv.permute([0, 2, 1])
+        x_dbl = self.x_proj(x_conv)
         dt, B, C = split(x_dbl, [self.dt_rank, self.d_state, self.d_state],
                          dim=2)
-        dt = self.dt_proj(dt).permute([0, 2, 1])
-        B = B.permute([0, 2, 1])
-        C = C.permute([0, 2, 1])
+        dt = self.dt_proj(dt)
 
         # selective scan
         y, ssm_state = selective_scan(x_conv,
@@ -150,7 +151,6 @@ class Mamba(Module):
                                       is_variable_C=True,
                                       delta_softplus=True,
                                       dtype=self.dtype)
-
         # out_proj
-        out = self.out_proj(y.permute([0, 2, 1]))
+        out = self.out_proj(y)
         return out, conv_state, ssm_state
