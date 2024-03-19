@@ -1,5 +1,7 @@
 # TensorRT-LLM Architecture
 
+<img src="media/TensorRT-LLM-TensorRT-Architecture.png" alt="TensorRT-LLM and TensorRT Relationship" width="500" height="auto">
+
 TensorRT-LLM is a toolkit to assemble optimized solutions to perform Large
 Language Model (LLM) inference. It offers a Python API to define models and
 compile efficient [TensorRT](https://developer.nvidia.com/tensorrt) engines for
