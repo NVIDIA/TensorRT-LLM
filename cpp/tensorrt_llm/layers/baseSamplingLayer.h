@@ -23,6 +23,7 @@
 #include "tensorrt_llm/kernels/penaltyTypes.h"
 #include "tensorrt_llm/layers/baseLayer.h"
 #include "tensorrt_llm/layers/decodingParams.h"
+#include "tensorrt_llm/runtime/common.h"
 
 namespace tc = tensorrt_llm::common;
 
@@ -40,12 +41,12 @@ public:
     class SetupParams : public DecodingSetupParams
     {
     public:
-        std::optional<std::vector<std::uint32_t>> runtime_top_k;  // [1] or [batchSize] on cpu
-        std::optional<std::vector<float>> runtime_top_p;          // [1] or [batchSize] on cpu
-        std::optional<std::vector<uint64_t>> randomSeed;          // [1] or [batchSize] on cpu
-        std::optional<std::vector<float>> top_p_decay;            // [batchSize], must between [0, 1]
-        std::optional<std::vector<float>> top_p_min;              // [batchSize], must between [0, 1]
-        std::optional<std::vector<std::int32_t>> top_p_reset_ids; // [batchSize]
+        std::optional<std::vector<runtime::SizeType>> runtime_top_k; // [1] or [batchSize] on cpu
+        std::optional<std::vector<float>> runtime_top_p;             // [1] or [batchSize] on cpu
+        std::optional<std::vector<uint64_t>> randomSeed;             // [1] or [batchSize] on cpu
+        std::optional<std::vector<float>> top_p_decay;               // [batchSize], must between [0, 1]
+        std::optional<std::vector<float>> top_p_min;                 // [batchSize], must between [0, 1]
+        std::optional<std::vector<std::int32_t>> top_p_reset_ids;    // [batchSize]
         std::optional<bool> normalize_log_probs;
     };
 
@@ -80,8 +81,8 @@ public:
     //! \param allocator shared pointer to IAllocator object that will be use to alloc and free tensors
     //! \param prop [optional] cudaDeviceProp
     // clang-format on
-    BaseSamplingLayer(size_t maxBatchSize, size_t vocabSize, size_t vocabSizePadded, cudaStream_t stream,
-        std::shared_ptr<tensorrt_llm::common::IAllocator> allocator, cudaDeviceProp* prop);
+    BaseSamplingLayer(runtime::SizeType maxBatchSize, runtime::SizeType vocabSize, runtime::SizeType vocabSizePadded,
+        cudaStream_t stream, std::shared_ptr<tensorrt_llm::common::IAllocator> allocator, cudaDeviceProp* prop);
 
     ~BaseSamplingLayer() override = default;
 
@@ -107,7 +108,7 @@ public:
     //! \param batchSlots input tensor [batchSize], address map of the new requests, in pinned memory
     //! \param setupParams setup sampling parameters per request
     // clang-format on
-    virtual void setup(size_t batchSize, int32_t const* batchSlots, SetupParams const& setupParams) = 0;
+    virtual void setup(runtime::SizeType batchSize, int32_t const* batchSlots, SetupParams const& setupParams) = 0;
 
     size_t getWorkspaceSize() const
     {
@@ -120,9 +121,9 @@ public:
     }
 
 protected:
-    size_t mMaxBatchSize;
-    size_t mVocabSize;
-    size_t mVocabSizePadded;
+    runtime::SizeType mMaxBatchSize;
+    runtime::SizeType mVocabSize;
+    runtime::SizeType mVocabSizePadded;
 
     size_t mSamplingWorkspaceSize = 0;
     size_t mAllocatedSize = 0;

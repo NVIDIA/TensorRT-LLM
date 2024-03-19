@@ -8,13 +8,10 @@ git-lfs clone https://huggingface.co/kunishou/Japanese-Alpaca-LoRA-7b-v0
 BASE_MODEL=llama-7b-hf
 
 python examples/llama/convert_checkpoint.py --model_dir ${BASE_MODEL} \
-    --output_dir /tmp/llama_7b_with_lora_qkv/trt_ckpt/fp16/1-gpu/ \
-    --dtype float16 \
-    --hf_lora_dir Japanese-Alpaca-LoRA-7b-v0 \
-    --max_lora_rank 8 \
-    --lora_target_modules "attn_q" "attn_k" "attn_v"
+    --output_dir /tmp/llama_7b/trt_ckpt/fp16/1-gpu/ \
+    --dtype float16
 
-trtllm-build --checkpoint_dir /tmp/llama_7b_with_lora_qkv/trt_ckpt/fp16/1-gpu/ \
+trtllm-build --checkpoint_dir /tmp/llama_7b/trt_ckpt/fp16/1-gpu/ \
     --output_dir /tmp/llama_7b_with_lora_qkv/trt_engines/fp16/1-gpu/ \
     --remove_input_padding enable \
     --gpt_attention_plugin float16 \
@@ -25,6 +22,9 @@ trtllm-build --checkpoint_dir /tmp/llama_7b_with_lora_qkv/trt_ckpt/fp16/1-gpu/ \
     --max_batch_size 128 \
     --max_input_len 512 \
     --max_output_len 50 \
+    --lora_dir Japanese-Alpaca-LoRA-7b-v0 \
+    --max_lora_rank 8 \
+    --lora_target_modules "attn_q" "attn_k" "attn_v"
 ```
 
 To pass LoRAs into the cpp runtime they must be converted to the format below.
@@ -40,6 +40,12 @@ See tensorrtllm_backend [docs](https://github.com/triton-inference-server/tensor
 ### LoRA tensor format details
 
 To run inference with LoRA weights using GptManager, InferenceRequests must have LoraWeights (lora_weights) and LoraConfig (lora_config) parameters.
+
+'LoraTaskId` the unique task ID for the given LoRA.
+
+To perform inference with a specific LoRA for the first time `lora_task_id` `lora_weights` and `lora_config` must all be given.
+The LoRA will be cached, so that subsequent requests for the same task only require `lora_task_id`.
+If the cache is full the oldest LoRA will be evicted to make space for new ones.  An error is returned if `lora_task_id` is not cached.
 
 `LoraWeights` contains the weights for all the LoRAs. Currently this should include weight for all tp and pp ranks.
 The weights tensor has the shape `[ num_lora_modules_layers, D x Hi + Ho x D ]`. the last dimension holds the in / out adapter weights for the associated module (e.g. attn_qkv) and model layer.
@@ -98,3 +104,9 @@ See LoraModule::ModuleType for model id mapping
 | mlp_h_to_4h | 5 | for llama2 adapter for gated mlp layer after attention / RMSNorm: up projection |
 | mlp_4h_to_h | 6 | for llama2 adapter for gated mlp layer after attention / RMSNorm: down projection |
 | mlp_gate | 7 | for llama2 adapter for gated mlp later after attention / RMSNorm: gate |
+
+#### LoraCache configuration
+
+The core idea is that we will have a fixed size, 2-level LoRA cache in TRT-LLM. The higher level cache resides on the host and the lower level is on GPU (distinct from the existing KV cache). Sizes of both are user configurable.
+The CPU cache is configured to be a max size.  The GPU cache is configured to a percentage of free GPU memory after engine load. As requests come in LoRAs are stored in the host cache.
+As requests are scheduled for execution LoRAs are loaded into the GPU cache.

@@ -1,16 +1,21 @@
 import json
 import os
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Dict, List
 
 import numpy as np
 import torch
 
-from ._utils import str_dtype_to_torch, torch_to_numpy, unpack_nemo_weights
+from ._utils import (DictConversion, pad_vocab_size, str_dtype_to_torch,
+                     torch_to_numpy, unpack_nemo_weights)
+from .layers.linear import ColumnLinear
+from .models.convert_utils import split_matrix_tp
 
 
 def get_all_nemo_lora_weights(num_layers, lora_weights):
-    layer_weights = [{} for _ in range(2 * num_layers)]
+    layer_weights = [{} for _ in range(num_layers)]
     adapter_key = "self_attention.adapter_layer.lora_kqv_adapter"
     layer_pattern = re.compile(r'.*\.layers\.([0-9]+)\..*')
     for key, weights in lora_weights.items():
@@ -27,22 +32,198 @@ def get_all_nemo_lora_weights(num_layers, lora_weights):
     return layer_weights
 
 
-class LoraConfig(object):
-    LORA_MODULE_IDS = {
-        "attn_qkv": 0,
-        "attn_q": 1,
-        "attn_k": 2,
-        "attn_v": 3,
-        "attn_dense": 4,
-        "mlp_h_to_4h": 5,
-        "mlp_4h_to_h": 6,
-        "mlp_gate": 7,
-        "cross_attn_qkv": 8,
-        "cross_attn_q": 9,
-        "cross_attn_k": 10,
-        "cross_attn_v": 11,
-        "cross_attn_dense": 12,
+@dataclass
+class LoraBuildConfig(DictConversion):
+    lora_dir: List[str] = field(default_factory=list)
+    lora_ckpt_source: str = 'hf'
+    max_lora_rank: int = 64
+    lora_target_modules: List[str] = field(default_factory=list)
+    trtllm_modules_to_hf_modules: Dict[str, str] = field(default_factory=dict)
+
+    def __post_init__(self):
+        assert self.lora_ckpt_source in [
+            'hf', 'nemo'
+        ], f"lora_ckpt_source must be one of 'hf' or 'nemo', got {self.lora_ckpt_source}"
+
+
+class HfLoraLoader:
+
+    def __init__(self, lora_dirs: List[str]):
+        self.lora_target_modules = []
+        self.is_valid = False
+        self.lm_head = None
+        self.embed_tokens = None
+        self.vocab_size = 0
+
+        if len(lora_dirs) == 0:
+            return
+
+        for lora_dir in lora_dirs:
+            for filename in ["adapter_config.json", "adapter_model.bin"]:
+                path = Path(f"{lora_dir}/{filename}")
+                if not path.exists():
+                    raise ValueError(f"{path} does not exist")
+                if not path.is_file():
+                    raise ValueError(f"{path} is not a file")
+        self.is_valid = True
+
+        lora_dir = lora_dirs[0]
+        with open(f"{lora_dir}/adapter_config.json") as f:
+            adapter_config = json.load(f)
+        self.lora_target_modules = adapter_config["target_modules"]
+
+        lora_weight = torch.load(f"{lora_dir}/adapter_model.bin")
+        if adapter_config["modules_to_save"] is not None:
+            if "lm_head" in adapter_config["modules_to_save"]:
+                self.lm_head = lora_weight["base_model.model.lm_head.weight"]
+                self.vocab_size = self.lm_head.shape[0]
+
+            if "embed_tokens" in adapter_config["modules_to_save"]:
+                self.embed_tokens = lora_weight[
+                    "base_model.model.model.embed_tokens.weight"]
+
+    def get_target_modules(self, trtllm_modules_to_hf_modules):
+        hf_modules_to_trtllm_modules = {
+            v: k
+            for k, v in trtllm_modules_to_hf_modules.items()
+        }
+        lora_target_modules = []
+        if self.is_valid:
+            # lora_target_modules[m] can ba either a string or a list of strings
+            for m in self.lora_target_modules:
+                trtllm_module = hf_modules_to_trtllm_modules[m]
+                if isinstance(trtllm_module, list):
+                    lora_target_modules.extend(trtllm_module)
+                else:
+                    lora_target_modules.append(trtllm_module)
+        return lora_target_modules
+
+
+class NemoLoraLoader:
+
+    def __init__(self, lora_dirs: List[str]):
+        self.lora_target_modules = []
+        self.is_valid = False
+
+        if len(lora_dirs) == 0:
+            return
+
+        for lora_file in lora_dirs:
+            path = Path(lora_file)
+            if not path.exists():
+                raise ValueError(f"{path} does not exist")
+            if not path.is_file():
+                raise ValueError(f"{path} is not a file")
+        self.is_valid = True
+        # Hardcoded since LoraManager only supports this case now
+        self.lora_target_modules = ["attn_qkv"]
+
+
+def load_nemo_lora(model, lora_config: LoraBuildConfig):
+    lora_loader = NemoLoraLoader(lora_config.lora_dir)
+    if len(lora_config.lora_target_modules) == 0:
+        lora_config.lora_target_modules = lora_loader.lora_target_modules
+
+
+def load_hf_lora(
+    model,
+    lora_config: LoraBuildConfig,
+    trtllm_modules_to_hf_modules: Dict[str, str] = None,
+):
+    trtllm_modules_to_hf_modules = trtllm_modules_to_hf_modules or {
+        "attn_q": "q_proj",
+        "attn_k": "k_proj",
+        "attn_v": "v_proj",
+        "attn_dense": "o_proj",
+        "mlp_h_to_4h": "gate_proj",
+        "mlp_4h_to_h": "down_proj",
+        "mlp_gate": "up_proj",
     }
+    lora_config.trtllm_modules_to_hf_modules = trtllm_modules_to_hf_modules
+
+    lora_loader = HfLoraLoader(lora_config.lora_dir)
+
+    if len(lora_config.lora_target_modules) == 0:
+        lora_config.lora_target_modules = lora_loader.get_target_modules(
+            trtllm_modules_to_hf_modules)
+
+    config = model.config
+    if lora_loader.is_valid:
+        # the lora checkpoint might finetune the embedding
+        if lora_loader.vocab_size != 0:
+            config.vocab_size = lora_loader.vocab_size
+        mapping = config.mapping
+        if mapping.is_first_pp_rank() and lora_loader.embed_tokens is not None:
+            weight = lora_loader.embed_tokens
+            if config.use_parallel_embedding:
+                weight = split_matrix_tp(
+                    weight,
+                    mapping.tp_size,
+                    mapping.tp_rank,
+                    dim=config.embedding_sharding_dim,
+                )
+            if model.transformer.vocab_embedding.weight.raw_value.shape != weight.shape:
+                model.transformer.vocab_embedding = model.transformer.vocab_embedding.__class__(
+                    num_embeddings=config.vocab_size,
+                    embedding_dim=config.hidden_size,
+                    dtype=config.dtype,
+                    tp_size=mapping.tp_size
+                    if config.use_parallel_embedding else 1,
+                    tp_group=mapping.tp_group
+                    if config.use_parallel_embedding else None,
+                    sharding_dim=config.embedding_sharding_dim,
+                    tp_rank=mapping.tp_rank,
+                )
+            model.transformer.vocab_embedding.weight.value = weight
+        if mapping.is_last_pp_rank() and lora_loader.lm_head is not None:
+            weight = lora_loader.lm_head
+            vocab_size = lora_loader.vocab_size
+            if vocab_size % mapping.tp_size != 0:
+                # padding
+                vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
+                pad_width = vocab_size_padded - vocab_size
+
+                weight = torch.from_numpy(
+                    np.pad(weight.detach().cpu().numpy(),
+                           ((0, pad_width), (0, 0)),
+                           'constant',
+                           constant_values=0))
+            else:
+                vocab_size_padded = vocab_size
+            if model.lm_head.weight.raw_value.shape != weight.shape:
+                model.lm_head = ColumnLinear(
+                    config.hidden_size,
+                    vocab_size_padded,
+                    bias=False,
+                    dtype=config.dtype,
+                    tp_group=mapping.tp_group,
+                    tp_size=mapping.tp_size,
+                    gather_output=True,
+                )
+            model.lm_head.weight.value = split_matrix_tp(
+                weight,
+                mapping.tp_size,
+                mapping.tp_rank,
+                dim=0,
+            )
+
+
+def use_lora(
+    model,
+    lora_config: LoraBuildConfig,
+    trtllm_modules_to_hf_modules: Dict[str, str] = None,
+):
+    model.lora_config = lora_config
+    if lora_config.lora_ckpt_source == "nemo":
+        load_nemo_lora(model, lora_config)
+    elif lora_config.lora_ckpt_source == "hf":
+        load_hf_lora(model, lora_config, trtllm_modules_to_hf_modules)
+    else:
+        raise ValueError(
+            f"Unsupported lora_ckpt_source: {lora_config.lora_ckpt_source}")
+
+
+class LoraConfig(object):
 
     def __init__(self,
                  hf_lora_dir: str = None,
@@ -121,6 +302,21 @@ class LoraConfig(object):
 
 
 class LoraManager(object):
+    LORA_MODULE_IDS = {
+        "attn_qkv": 0,
+        "attn_q": 1,
+        "attn_k": 2,
+        "attn_v": 3,
+        "attn_dense": 4,
+        "mlp_h_to_4h": 5,
+        "mlp_4h_to_h": 6,
+        "mlp_gate": 7,
+        "cross_attn_qkv": 8,
+        "cross_attn_q": 9,
+        "cross_attn_k": 10,
+        "cross_attn_v": 11,
+        "cross_attn_dense": 12,
+    }
 
     def __init__(self):
         self._lora_uid_to_key = {}
@@ -239,8 +435,7 @@ class LoraManager(object):
                                                t_out.flatten()]))
                         self._lora_weight_config[uid].append(
                             np.array([
-                                LoraConfig.LORA_MODULE_IDS[lora_module],
-                                layer_idx,
+                                self.LORA_MODULE_IDS[lora_module], layer_idx,
                                 int(rank)
                             ],
                                      dtype=np.int32))
@@ -421,7 +616,7 @@ class LoraManager(object):
                                            t_out.flatten()]))
                     self._lora_weight_config[uid].append(
                         np.array([
-                            LoraConfig.LORA_MODULE_IDS[lora_module], layer_idx,
+                            self.LORA_MODULE_IDS[lora_module], layer_idx,
                             int(hf_config['r'])
                         ],
                                  dtype=np.int32))
@@ -603,7 +798,7 @@ class LoraManager(object):
                                            t_out.flatten()]))
                     self._lora_weight_config[uid].append(
                         np.array([
-                            LoraConfig.LORA_MODULE_IDS[lora_module], layer_idx,
+                            self.LORA_MODULE_IDS[lora_module], layer_idx,
                             int(hf_config['r'])
                         ],
                                  dtype=np.int32))

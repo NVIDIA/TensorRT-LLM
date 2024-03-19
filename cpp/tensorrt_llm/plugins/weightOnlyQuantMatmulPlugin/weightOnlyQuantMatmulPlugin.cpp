@@ -15,7 +15,6 @@
  * limitations under the License.
  */
 #include "weightOnlyQuantMatmulPlugin.h"
-#include "tensorrt_llm/kernels/weightOnlyBatchedGemv/enabled.h"
 
 using namespace nvinfer1;
 using namespace tensorrt_llm::common;
@@ -110,29 +109,34 @@ WeightOnlyQuantMatmulPlugin::WeightOnlyQuantMatmulPlugin(
 
 void WeightOnlyQuantMatmulPlugin::init(nvinfer1::DataType type, WeightTypeId weightTypeId)
 {
+    mArch = tensorrt_llm::common::getSMVersion();
     mType = type;
     mWeightTypeId = weightTypeId;
+
     if (mWeightTypeId == WeightTypeId::INT8)
     {
         if (mType == nvinfer1::DataType::kHALF)
         {
             m_weightOnlyGemmRunner = std::make_shared<
                 CutlassFpAIntBGemmRunner<half, uint8_t, cutlass::WeightOnlyQuantOp::PER_COLUMN_SCALE_ONLY>>();
+            mCudaKernelEnabled = tensorrt_llm::kernels::weight_only::is_supported(
+                mArch, tensorrt_llm::kernels::weight_only::KernelType::FP16Int8PerChannel);
+            mCudaKernelType = tensorrt_llm::kernels::weight_only::KernelType::FP16Int8PerChannel;
         }
 #if defined(ENABLE_BF16)
         else if (mType == nvinfer1::DataType::kBF16)
         {
             m_weightOnlyGemmRunner = std::make_shared<
                 CutlassFpAIntBGemmRunner<__nv_bfloat16, uint8_t, cutlass::WeightOnlyQuantOp::PER_COLUMN_SCALE_ONLY>>();
+            mCudaKernelEnabled = tensorrt_llm::kernels::weight_only::is_supported(
+                mArch, tensorrt_llm::kernels::weight_only::KernelType::BF16Int8PerChannel);
+            mCudaKernelType = tensorrt_llm::kernels::weight_only::KernelType::BF16Int8PerChannel;
         }
 #endif
         else
         {
             TLLM_CHECK(false);
         }
-
-        mCudaKernelEnabled
-            = tensorrt_llm::kernels::isWeightOnlyBatchedGemvEnabled(tensorrt_llm::kernels::WeightOnlyQuantType::Int8b);
     }
     else if (mWeightTypeId == WeightTypeId::INT4)
     {
@@ -140,20 +144,24 @@ void WeightOnlyQuantMatmulPlugin::init(nvinfer1::DataType type, WeightTypeId wei
         {
             m_weightOnlyGemmRunner = std::make_shared<
                 CutlassFpAIntBGemmRunner<half, cutlass::uint4b_t, cutlass::WeightOnlyQuantOp::PER_COLUMN_SCALE_ONLY>>();
+            mCudaKernelEnabled = tensorrt_llm::kernels::weight_only::is_supported(
+                mArch, tensorrt_llm::kernels::weight_only::KernelType::FP16Int4PerChannel);
+            mCudaKernelType = tensorrt_llm::kernels::weight_only::KernelType::FP16Int4PerChannel;
         }
 #if defined(ENABLE_BF16)
         else if (mType == nvinfer1::DataType::kBF16)
         {
             m_weightOnlyGemmRunner = std::make_shared<CutlassFpAIntBGemmRunner<__nv_bfloat16, cutlass::uint4b_t,
                 cutlass::WeightOnlyQuantOp::PER_COLUMN_SCALE_ONLY>>();
+            mCudaKernelEnabled = tensorrt_llm::kernels::weight_only::is_supported(
+                mArch, tensorrt_llm::kernels::weight_only::KernelType::BF16Int4PerChannel);
+            mCudaKernelType = tensorrt_llm::kernels::weight_only::KernelType::BF16Int4PerChannel;
         }
 #endif
         else
         {
             TLLM_CHECK(false);
         }
-        mCudaKernelEnabled
-            = tensorrt_llm::kernels::isWeightOnlyBatchedGemvEnabled(tensorrt_llm::kernels::WeightOnlyQuantType::Int4b);
     }
     else
     {
@@ -296,38 +304,16 @@ int WeightOnlyQuantMatmulPlugin::enqueue(nvinfer1::PluginTensorDesc const* input
 #else
     TLLM_CHECK_WITH_INFO(mType == nvinfer1::DataType::kHALF, "No valid weightOnlyQuantMatmul configuration");
 #endif
-
-    tensorrt_llm::kernels::WeightOnlyQuantType weight_only_quant_type;
-    tensorrt_llm::kernels::WeightOnlyActivationType weight_only_act_type;
-    int real_n;
-    if (mType == nvinfer1::DataType::kHALF)
+    int real_n = mWeightTypeId == WeightTypeId::INT4 ? n * INT8_INT4_RATIO : n;
+    if (use_cuda_kernel)
     {
-        weight_only_act_type = tensorrt_llm::kernels::WeightOnlyActivationType::FP16;
-    }
-    else if (mType == nvinfer1::DataType::kBF16)
-    {
-        weight_only_act_type = tensorrt_llm::kernels::WeightOnlyActivationType::BF16;
-    }
-    if (mWeightTypeId == WeightTypeId::INT8)
-    {
-        weight_only_quant_type = tensorrt_llm::kernels::WeightOnlyQuantType::Int8b;
-        real_n = n;
-    }
-    else if (mWeightTypeId == WeightTypeId::INT4)
-    {
-        weight_only_quant_type = tensorrt_llm::kernels::WeightOnlyQuantType::Int4b;
-        real_n = n * INT8_INT4_RATIO;
-    }
-    if (use_cuda_kernel && getSMVersion() < 90)
-    {
-        // Use CUDA kernels for small batch size
-        // The CUDA kernel is designed for ColumnMajorTileInterleave weight layout used in fpAIntB cutlass
-        // kernel when sm >= 75 and the preprocessing of cutlass on sm70 does not interleave the weights.
-        tensorrt_llm::kernels::WeightOnlyParams params{reinterpret_cast<uint8_t const*>(inputs[1]), inputs[2], nullptr,
-            inputs[0], nullptr, nullptr, outputs[0], m, real_n, k, 0, weight_only_quant_type,
-            tensorrt_llm::kernels::WeightOnlyType::PerChannel,
-            tensorrt_llm::kernels::WeightOnlyActivationFunctionType::Identity, weight_only_act_type};
-        tensorrt_llm::kernels::weight_only_batched_gemv_launcher(params, stream);
+        void const* cuda_kernel_act_ptr = inputs[0];
+        void const* cuda_kernel_weight_ptr = inputs[1];
+        void const* cuda_kernel_scales_ptr = inputs[2];
+        void* cuda_kernel_out_ptr = outputs[0];
+        tensorrt_llm::kernels::weight_only::Params params(cuda_kernel_act_ptr, nullptr, cuda_kernel_weight_ptr,
+            cuda_kernel_scales_ptr, nullptr, nullptr, cuda_kernel_out_ptr, 1.f, m, real_n, k, 0, mCudaKernelType);
+        tensorrt_llm::kernels::weight_only::kernel_launcher(mArch, params, stream);
     }
     else
     {

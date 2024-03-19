@@ -17,8 +17,7 @@ from typing import Optional
 from ..._utils import pad_vocab_size
 from ...functional import Tensor, recv, send
 from ...layers import (Attention, AttentionMaskType, ColumnLinear, Embedding,
-                       GatedMLP, PositionEmbeddingType, PromptTuningEmbedding,
-                       RmsNorm)
+                       GatedMLP, PositionEmbeddingType, RmsNorm)
 from ...mapping import Mapping
 from ...module import Module
 from ...quantization import QuantMode
@@ -118,10 +117,8 @@ class GemmaModel(Module):
         super().__init__()
 
         self.mapping = config.mapping
-        self.use_prompt_tuning = config.use_prompt_tuning
-        EmbeddingCls = PromptTuningEmbedding if config.use_prompt_tuning else Embedding
         if self.mapping.is_first_pp_rank():
-            self.vocab_embedding = EmbeddingCls(
+            self.vocab_embedding = Embedding(
                 num_embeddings=config.vocab_size,
                 embedding_dim=config.hidden_size,
                 dtype=config.dtype,
@@ -160,7 +157,7 @@ class GemmaModel(Module):
 
         ptuning_args = [
             prompt_embedding_table, prompt_tasks, prompt_vocab_size
-        ] if self.use_prompt_tuning else []
+        ] if prompt_embedding_table is not None else []
 
         if self.mapping.is_first_pp_rank():
             hidden_states = self.vocab_embedding(input_ids, *ptuning_args)
@@ -265,7 +262,6 @@ class GemmaForCausalLM(DecoderModelForCausalLM, TopModelMixin):
             'use_parallel_embedding': kwargs.get("use_parallel_embedding",
                                                  False),
             'embedding_sharding_dim': kwargs.get("embedding_sharding_dim", 0),
-            'use_prompt_tuning': kwargs.get("use_prompt_tuning", False),
             'use_fused_mlp': kwargs.get("use_fused_mlp", False),
         }
 

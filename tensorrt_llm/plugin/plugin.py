@@ -95,6 +95,7 @@ class PluginConfig:
     use_context_fmha_for_generation: bool = False
     dense_context_fmha: bool = False
     pos_shift: bool = False
+    multiple_profiles: bool = False
 
     def set_plugin(self, name: str, value: Union[str, bool, int]):
         assert hasattr(self, name), f"Plugin name doesn't exist: {name}"
@@ -305,7 +306,8 @@ cli_plugin_args = [
     "use_paged_context_fmha",
     "use_context_fmha_for_generation",
     "dense_context_fmha",
-    "pos_shift"
+    "pos_shift",
+    "multiple_profiles",
 ]
 
 plugin_options = ["float16", "float32", "bfloat16", "disable"]
@@ -370,16 +372,14 @@ class CustomAllReduceHelper:
 
     def set_workspace_tensor(self,
                              mapping: Mapping,
-                             two_opt_profiles: Optional[bool] = None):
+                             num_profiles: Optional[int] = None):
         from ..functional import Tensor
         workspace_size = self.POINTERS_PER_RANK * mapping.tp_size
 
         dim_range = None
-        if two_opt_profiles is not None:
-            dim_range = OrderedDict([
-                ('all_reduce_size', [workspace_size, workspace_size]
-                 if two_opt_profiles else [workspace_size])
-            ])
+        if num_profiles is not None:
+            dim_range = OrderedDict([('all_reduce_size',
+                                      [workspace_size] * num_profiles)])
 
         self.workspace = Tensor(
             name='all_reduce_workspace',

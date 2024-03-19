@@ -49,6 +49,11 @@ public:
         return DecodingMode{kBeamSearch};
     }
 
+    static auto constexpr Medusa()
+    {
+        return DecodingMode{kMedusa};
+    }
+
     bool constexpr isNone()
     {
         return mState == 0;
@@ -79,6 +84,11 @@ public:
         return anyBitSet(kBeamSearch);
     }
 
+    bool constexpr isMedusa()
+    {
+        return anyBitSet(kMedusa);
+    }
+
     using UnderlyingType = uint8_t;
 
     bool operator==(DecodingMode const& other) const
@@ -98,6 +108,7 @@ private:
     static UnderlyingType constexpr kTopK{1u << 0};
     static UnderlyingType constexpr kTopP{1u << 1};
     static UnderlyingType constexpr kBeamSearch{1u << 2};
+    static UnderlyingType constexpr kMedusa{1u << 3};
     static UnderlyingType constexpr kTopKTopP{kTopK | kTopP};
 
     bool constexpr anyBitSet(UnderlyingType bits) const
@@ -117,27 +128,39 @@ static_assert(DecodingMode::None().isNone());
 static_assert(!DecodingMode::None().isTopK());
 static_assert(!DecodingMode::None().isTopP());
 static_assert(!DecodingMode::None().isBeamSearch());
+static_assert(!DecodingMode::None().isMedusa());
 
 static_assert(DecodingMode::TopK().isTopK());
 static_assert(DecodingMode::TopK().isTopKorTopP());
 static_assert(!DecodingMode::TopK().isTopKandTopP());
 static_assert(!DecodingMode::TopK().isTopP());
 static_assert(!DecodingMode::TopK().isBeamSearch());
+static_assert(!DecodingMode::TopK().isMedusa());
 
 static_assert(DecodingMode::TopP().isTopP());
 static_assert(DecodingMode::TopP().isTopKorTopP());
 static_assert(!DecodingMode::TopP().isTopKandTopP());
 static_assert(!DecodingMode::TopP().isTopK());
 static_assert(!DecodingMode::TopP().isBeamSearch());
+static_assert(!DecodingMode::TopP().isMedusa());
 
 static_assert(DecodingMode::TopKTopP().isTopK());
 static_assert(DecodingMode::TopKTopP().isTopP());
 static_assert(DecodingMode::TopKTopP().isTopKorTopP());
 static_assert(DecodingMode::TopKTopP().isTopKandTopP());
 static_assert(!DecodingMode::TopKTopP().isBeamSearch());
+static_assert(!DecodingMode::TopKTopP().isMedusa());
 
 static_assert(DecodingMode::BeamSearch().isBeamSearch());
 static_assert(!DecodingMode::BeamSearch().isTopKorTopP());
+static_assert(!DecodingMode::BeamSearch().isMedusa());
+
+static_assert(!DecodingMode::Medusa().isTopK());
+static_assert(!DecodingMode::Medusa().isTopKorTopP());
+static_assert(!DecodingMode::Medusa().isTopKandTopP());
+static_assert(!DecodingMode::Medusa().isTopP());
+static_assert(!DecodingMode::Medusa().isBeamSearch());
+static_assert(DecodingMode::Medusa().isMedusa());
 
 } // namespace runtime
 } // namespace tensorrt_llm

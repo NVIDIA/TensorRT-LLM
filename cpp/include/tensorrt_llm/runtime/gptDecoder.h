@@ -117,6 +117,8 @@ private:
     TensorPtr mLogProbsTiled; // Buffer used to store the transpose of the logProbs. Needed because the kernels have
                               // been written to use that shape.
     SamplingConfig mSamplingConfig;
+
+    cudaDeviceProp mProp; // Avoid dangling pointers in mDynamicDecodeLayer
 };
 
 inline std::unique_ptr<IGptDecoder> IGptDecoder::create(DecodingMode const& mode, nvinfer1::DataType dtype,

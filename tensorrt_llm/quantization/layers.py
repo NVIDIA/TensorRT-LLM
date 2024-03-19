@@ -93,8 +93,7 @@ class SmoothQuantLinear(Module):
                  tp_group=None,
                  tp_size=1,
                  gather_output=True,
-                 quant_mode=QuantMode(0),
-                 max_lora_rank=None):
+                 quant_mode=QuantMode(0)):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features // tp_size
@@ -167,7 +166,6 @@ class SmoothQuantRowLinear(Module):
             tp_group=None,
             tp_size=1,
             quant_mode=QuantMode(0),
-            max_lora_rank=None,
     ):
         super().__init__()
         self.in_features = in_features // tp_size
@@ -230,7 +228,6 @@ class SmoothQuantLayerNorm(Module):
             elementwise_affine=True,
             dtype=None,
             quant_mode=QuantMode(0),
-            max_lora_rank=None,
     ):
         super().__init__()
         if isinstance(normalized_shape, int):
@@ -279,7 +276,6 @@ class SmoothQuantRmsNorm(Module):
             dtype=None,
             quant_mode=QuantMode(0),
             bias=False,
-            max_lora_rank=None,
     ):
         super().__init__()
         if isinstance(normalized_shape, int):
@@ -333,7 +329,6 @@ class WeightOnlyQuantLinear(Module):
             tp_size=1,
             gather_output=True,
             quant_mode=QuantMode.use_weight_only(),
-            max_lora_rank=None,
     ):
         super().__init__()
         if quant_mode.is_int8_weight_only():
@@ -399,7 +394,6 @@ class WeightOnlyQuantRowLinear(Module):
             tp_group=None,
             tp_size=1,
             quant_mode=QuantMode.use_weight_only(),
-            max_lora_rank=None,
     ):
         super().__init__()
         if quant_mode.is_int8_weight_only():
@@ -454,7 +448,6 @@ class WeightOnlyGroupwiseQuantLinear(Module):
         tp_group=None,
         tp_size=1,
         gather_output=True,
-        max_lora_rank=None,
         use_w4a8_awq=False,
     ):
 
@@ -539,7 +532,6 @@ class WeightOnlyGroupwiseQuantRowLinear(Module):
         dtype=None,
         tp_group=None,
         tp_size=1,
-        max_lora_rank=None,
         use_w4a8_awq=False,
     ):
         super().__init__()
@@ -616,7 +608,6 @@ class SmoothQuantMLP(Module):
             tp_group=None,
             tp_size=1,
             quant_mode=QuantMode(0),
-            max_lora_rank=None,
     ):
         super().__init__()
         if hidden_act not in ACT2FN:
@@ -677,8 +668,7 @@ class Int8SmoothQuantRowLinear(RowLinear):
                  bias=True,
                  dtype=None,
                  tp_group=None,
-                 tp_size=1,
-                 max_lora_rank=None):
+                 tp_size=1):
         super().__init__(in_features,
                          out_features,
                          bias=bias,
@@ -733,7 +723,6 @@ class Int8SmoothQuantLinear(Linear):
         tp_group=None,
         tp_size=1,
         gather_output=True,
-        max_lora_rank=None,
     ):
         super().__init__(in_features,
                          out_features,
@@ -789,7 +778,6 @@ class FP8Linear(Linear):
         tp_group=None,
         tp_size=1,
         gather_output=True,
-        max_lora_rank=None,
     ):
         super().__init__(in_features,
                          out_features,
@@ -840,7 +828,6 @@ class FP8RowLinear(RowLinear):
         dtype=None,
         tp_group=None,
         tp_size=1,
-        max_lora_rank=None,
     ):
         super().__init__(in_features,
                          out_features,
@@ -895,7 +882,6 @@ class SmoothQuantGatedMLP(SmoothQuantMLP):
             tp_group=None,
             tp_size=1,
             quant_mode=QuantMode(0),
-            max_lora_rank=None,
     ):
         super().__init__(hidden_size,
                          ffn_hidden_size,
@@ -970,7 +956,6 @@ class SmoothQuantAttention(Module):
             scale_alibi_bias=False,
             paged_kv_cache=False,
             quant_mode=QuantMode(0),
-            max_lora_rank=None,
     ):
         super().__init__()
         self.layer_idx = layer_idx

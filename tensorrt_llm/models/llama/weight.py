@@ -733,110 +733,15 @@ def load_from_hf_llama(tensorrt_llm_llama: 'LLaMAForCausalLM',
     return weights
 
 
-def load_from_fp8_llama(quant_ckpt_path: str, num_hidden_layers: int,
-                        mapping: Mapping, fp8_kv_cache: bool):
-    """
-    Get the fp8 scaling factors for Falcon model.
-    """
-    fake_fp8_sf_dt = torch.float32
-    fp8_llama = np.load(quant_ckpt_path)
-    weights = {}
-
-    layers_range = mapping.pp_layers(num_hidden_layers)
-    for l in layers_range:
-        prefix = f'_np:layers:{l}'
-        tllm_prex = f'transformer.layers.{l-layers_range[0]}'
-
-        weights[f'{tllm_prex}.attention.qkv.activation_scaling_factor'] = torch.tensor(
-            [
-                max(
-                    fp8_llama[
-                        f'{prefix}:attention:qkv:q:activation_scaling_factor'].
-                    item(), fp8_llama[
-                        f'{prefix}:attention:qkv:k:activation_scaling_factor'].
-                    item(), fp8_llama[
-                        f'{prefix}:attention:qkv:v:activation_scaling_factor'].
-                    item())
-            ],
-            dtype=fake_fp8_sf_dt)
-        weights[
-            f'{tllm_prex}.attention.qkv.weights_scaling_factor'] = torch.tensor(
-                [
-                    max(
-                        fp8_llama[
-                            f'{prefix}:attention:qkv:q:weights_scaling_factor'].
-                        item(), fp8_llama[
-                            f'{prefix}:attention:qkv:k:weights_scaling_factor'].
-                        item(), fp8_llama[
-                            f'{prefix}:attention:qkv:v:weights_scaling_factor'].
-                        item())
-                ],
-                dtype=fake_fp8_sf_dt)
-        weights[
-            f'{tllm_prex}.attention.dense.activation_scaling_factor'] = torch.tensor(
-                [
-                    fp8_llama[
-                        f'{prefix}:attention:dense:activation_scaling_factor'].
-                    item()
-                ],
-                dtype=fake_fp8_sf_dt)
-        weights[
-            f'{tllm_prex}.attention.dense.weights_scaling_factor'] = torch.tensor(
-                [
-                    fp8_llama[
-                        f'{prefix}:attention:dense:weights_scaling_factor'].
-                    item()
-                ],
-                dtype=fake_fp8_sf_dt)
-
-        weights[f'{tllm_prex}.mlp.fc.activation_scaling_factor'] = torch.tensor(
-            [fp8_llama[f'{prefix}:mlp:fc:activation_scaling_factor'].item()],
-            dtype=fake_fp8_sf_dt)
-        weights[f'{tllm_prex}.mlp.fc.weights_scaling_factor'] = torch.tensor(
-            [fp8_llama[f'{prefix}:mlp:fc:weights_scaling_factor'].item()],
-            dtype=fake_fp8_sf_dt)
-
-        weights[
-            f'{tllm_prex}.mlp.gate.activation_scaling_factor'] = torch.tensor(
-                [
-                    fp8_llama[f'{prefix}:mlp:gate:activation_scaling_factor'].
-                    item()
-                ],
-                dtype=fake_fp8_sf_dt)
-        weights[f'{tllm_prex}.mlp.gate.weights_scaling_factor'] = torch.tensor(
-            [fp8_llama[f'{prefix}:mlp:gate:weights_scaling_factor'].item()],
-            dtype=fake_fp8_sf_dt)
-
-        weights[
-            f'{tllm_prex}.mlp.proj.activation_scaling_factor'] = torch.tensor(
-                [
-                    fp8_llama[f'{prefix}:mlp:proj:activation_scaling_factor'].
-                    item()
-                ],
-                dtype=fake_fp8_sf_dt)
-        weights[f'{tllm_prex}.mlp.proj.weights_scaling_factor'] = torch.tensor(
-            [fp8_llama[f'{prefix}:mlp:proj:weights_scaling_factor'].item()],
-            dtype=fake_fp8_sf_dt)
-
-        if fp8_kv_cache:
-            # Not calibrating KV cache.
-            scaling_factor = 1.0
-            weights[
-                f'{tllm_prex}.attention.kv_cache_scaling_factor'] = torch.tensor(
-                    [scaling_factor], dtype=fake_fp8_sf_dt)
-
-    return weights
-
-
-def load_from_gptq_llama(quant_ckpt_path,
-                         num_hidden_layers=None,
-                         vocab_size=32000,
-                         mapping=Mapping(),
-                         dtype="float16",
-                         bin_model_dir=None):
+def load_from_gptq_llama(config: PretrainedConfig, quant_ckpt_path):
     logger.info('Loading weights from groupwise GPTQ LLaMA safetensors...')
     weights = {}
     tik = time.time()
+
+    num_hidden_layers = config.num_hidden_layers
+    vocab_size = config.vocab_size
+    dtype = config.dtype
+    mapping = config.mapping
 
     gptq_llama = safe_open(quant_ckpt_path, framework="pt", device=0)
     gptq_prefix = "model."
@@ -1011,7 +916,7 @@ def load_from_gptq_llama(quant_ckpt_path,
     return weights
 
 
-def load_from_meta_llama(meta_ckpt_dir, mapping=Mapping(), config=None):
+def load_from_meta_llama(meta_ckpt_dir, mapping, config):
     torch_dtype = str_dtype_to_torch(config.dtype)
     weights = {}
 
@@ -1034,10 +939,6 @@ def load_from_meta_llama(meta_ckpt_dir, mapping=Mapping(), config=None):
             if any(n in k for n in
                    ["wo", "feed_forward.w2", "tok", "feed_forward.gate"]):
                 d = 1
-            if "feed_forward.experts" in k and ("w2" in k) == (
-                    not quant_mode.is_weight_only()):
-                d = 1
-
             if "norm" in k or "rope" in k:  # no TP
                 split_ckpt[k] = v.clone()
             elif config.num_key_value_heads < mapping.tp_size and any(
@@ -1120,12 +1021,6 @@ def load_from_meta_llama(meta_ckpt_dir, mapping=Mapping(), config=None):
     logger.info('Loading weights from Meta LLaMA checkpoints ...')
     tik = time.time()
 
-    quant_mode = config.quant_mode
-    if quant_mode.is_int8_weight_only():
-        torch.int8
-    elif quant_mode.is_int4_weight_only():
-        torch.quint4x2
-    quant_mode.is_weight_only()
     num_kv_heads = config.num_key_value_heads
     mha_mode = (num_kv_heads == config.num_attention_heads)
 
@@ -1157,25 +1052,6 @@ def load_from_meta_llama(meta_ckpt_dir, mapping=Mapping(), config=None):
 
         qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
         ckpt[prefix + 'qkv.weight'] = qkv_weight
-
-    moe_config = MoeConfig(config.moe_num_experts, config.moe_top_k,
-                           config.moe_tp_mode, config.moe_normalization_mode)
-    for l in layers_range:
-        if not moe_config.has_moe():
-            continue
-
-        rank_experts = list(range(moe_config.num_experts))
-        if moe_config.tp_mode == moe_config.ParallelismMode.EXPERT_PARALLEL:
-            rank_experts = mapping.ep_experts(moe_config.num_experts)
-        for suffix in ["w1", "w2", "w3"]:
-            ckpt[f'layers.{l}.feed_forward.experts.{suffix}.weight'] = \
-                torch.stack(list(ckpt[f'layers.{l}.feed_forward.experts.{expert}.{suffix}.weight']
-                            for expert in rank_experts))
-
-        # concat w3 and w1 for gated expert
-        ckpt[f'layers.{l}.feed_forward.experts.w3w1.weight'] = \
-            torch.concat([ckpt[f'layers.{l}.feed_forward.experts.w3.weight'],
-                          ckpt[f'layers.{l}.feed_forward.experts.w1.weight']], dim=-2)
 
     for k, v in ckpt.items():
         dtype = torch_dtype if 'feed_forward.gate' not in k else torch.float32
@@ -1229,301 +1105,10 @@ def load_from_meta_llama(meta_ckpt_dir, mapping=Mapping(), config=None):
                 weights[tllm_prex + 'attention.dense.weight'] = v
             elif 'attention.qkv.weight' in k:
                 weights[tllm_prex + 'attention.qkv.weight'] = v
-            elif 'experts.w2.weight' in k:
-                weights[tllm_prex + 'mlp.experts_weight_2'] = v
-            elif 'experts.w3w1.weight' in k:
-                weights[tllm_prex + 'mlp.experts_weight_1'] = v
             elif 'feed_forward.gate' in k:
                 weights[tllm_prex + 'mlp.router.weight'] = v
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     logger.info(f'Weights loaded. Total time: {t}')
-    return weights
-
-
-def load_from_awq_llama(quant_ckpt_path,
-                        num_hidden_layers,
-                        vocab_size,
-                        quantize_lm_head=False,
-                        mapping=Mapping(),
-                        dtype="float16",
-                        bin_model_dir=None):
-
-    weights = {}
-
-    if quant_ckpt_path.endswith(".pt"):
-        awq_llama = torch.load(quant_ckpt_path)
-        awq_prefix = "model."
-        awq_suffix_list = [
-            ".weight",
-            ".weight_quantizer._amax",
-            ".input_quantizer._pre_quant_scale",
-        ]
-        awq_key_list = [
-            "embed_tokens.weight",  # vocab_embedding
-            "lm_head",  # lm_head
-            "norm.weight",  # ln_f
-            "self_attn.",  # attention.qkv
-            "_proj",  # qkv suffix
-            "self_attn.o_proj",  # attention.dense
-            "mlp.up_proj",  # mlp.gate
-            "mlp.down_proj",  # mlp.proj
-            "mlp.gate_proj",  # mlp.fc
-            "input_layernorm.weight",  # input_layernorm
-            "post_attention_layernorm.weight",  # post_layernorm
-        ]
-        split_sym = "."
-
-        def load(key):
-            if "lm_head" in key:
-                v = awq_llama[key]
-            else:
-                v = awq_llama[awq_prefix + key]
-            return v
-
-        group_size = load("layers.0.self_attn.o_proj.weight").numel() // load(
-            "layers.0.self_attn.o_proj.weight_quantizer._amax").numel()
-    elif quant_ckpt_path.endswith(".npz"):
-        awq_llama = np.load(quant_ckpt_path)
-        awq_prefix = "_np:"
-        awq_suffix_list = [
-            ":weight",
-            ":weights_scaling_factor",
-            ":prequant_scaling_factor",
-        ]
-        awq_key_list = [
-            "vocab_embedding:weight",  # vocab_embedding
-            "lm_head",  # lm_head
-            "final_layernorm:weight",  # ln_f
-            "attention:qkv:",  # attention.qkv
-            "",  # qkv suffix
-            "attention:dense",  # attention.dense
-            "mlp:gate",  # mlp.gate
-            "mlp:proj",  # mlp.proj
-            "mlp:fc",  # mlp.fc
-            "input_layernorm:weight",  # input_layernorm
-            "post_layernorm:weight",  # post_layernorm
-        ]
-        split_sym = ":"
-
-        def load(key):
-            v = torch.from_numpy(awq_llama[awq_prefix + key])
-            if "weights_scaling_factor" in key:
-                v *= 7  # For AMMO *.npz checkpoints
-            return v
-
-        group_size = load("layers:0:attention:dense:weight").numel() // load(
-            "layers:0:attention:dense:weights_scaling_factor").numel()
-    else:
-        assert False, "Unsupported AWQ quantized checkpoint format"
-
-    # quant_mode = getattr(tensorrt_llm_llama, 'quant_mode', QuantMode(0))
-    # Int8 KV cache
-    # use_int8_kv_cache = quant_mode.has_int8_kv_cache()
-
-    packer = torch.ops.trtllm.pack_int8_tensor_to_packed_int4
-    preprocessor = torch.ops.trtllm.preprocess_weights_for_mixed_gemm
-    torch_dtype = str_dtype_to_torch(dtype)
-
-    # def fromfile(dir_path, name, shape=None, dtype=None):
-    #     p = dir_path + '/' + name
-    #     if Path(p).exists():
-    #         t = np.fromfile(p, dtype=dtype)
-    #         if shape is not None:
-    #             t = t.reshape(shape)
-    #         return t
-    #     return None
-
-    def torch_split(v, dim):
-        if v.shape[dim] % mapping.tp_size != 0:
-            logger.error(
-                "Current weight shape is invalid for mapping.tp_size=" +
-                str(mapping.tp_size))
-            assert False, "Invalid TP size"
-        return v.split(v.shape[dim] // mapping.tp_size,
-                       dim=dim)[mapping.tp_rank]
-
-    def AWQ_quantize_pack_preprocess(weight, scale):
-        weight /= scale.repeat_interleave(group_size, dim=0)
-        qweight_int8 = torch.clamp(torch.round(weight.cuda()).char(), -8, 7)
-        int4_weight = preprocessor(packer(qweight_int8.cpu()), torch.quint4x2)
-        return int4_weight.view(torch.float16)
-
-    def get_tllm_weight_from_awq(v: List[torch.Tensor],
-                                 tllm_prex: str,
-                                 tp_dim: int = 0):
-        weight = v[0].T.contiguous()
-        [k, n] = weight.shape
-        weight = torch_split(weight, tp_dim)
-        amax = v[1].reshape((n, k // group_size)).T.contiguous()
-        amax = torch_split(amax, tp_dim)
-        pre_quant_scale = v[2].reshape((1, k))
-        if tp_dim == 0:
-            pre_quant_scale = torch_split(pre_quant_scale, 1)
-        scale = amax / 8.0
-        results = {
-            f'{tllm_prex}.weight': AWQ_quantize_pack_preprocess(weight, scale),
-            f'{tllm_prex}.weights_scaling_factor': scale.to(torch_dtype),
-            f'{tllm_prex}.prequant_scaling_factor':
-            pre_quant_scale.to(torch_dtype),
-        }
-        return results
-
-    def reSmooth_and_get_scale(weight, pre_quant_scale, avg_pre_quant_scale):
-        # deSmooth and reSmooth
-        [k, n] = weight.shape
-
-        if quant_ckpt_path.endswith("pt"):
-            # NPZ files are already re-smoothed
-            weight *= pre_quant_scale.repeat((n, 1)).transpose(1,
-                                                               0).contiguous()
-            weight /= avg_pre_quant_scale.repeat(
-                (n, 1)).transpose(1, 0).contiguous()
-
-        # Get scale
-        weight_t = weight.T.contiguous()
-        weight_t = weight_t.reshape(n, k // group_size, group_size)
-        weight_t = torch.abs(weight_t.reshape(-1, group_size))
-        amax, idx = weight_t.max(1)
-        amax = amax.reshape(n, k // group_size).T.contiguous()
-        scale = amax / 8
-        return weight, scale
-
-    def get_tllm_qkv_weight_from_awq(prefix, tllm_prex):
-        q_weight = load(prefix + "q" + awq_key_list[4] +
-                        awq_suffix_list[0]).T.contiguous()
-        k_weight = load(prefix + "k" + awq_key_list[4] +
-                        awq_suffix_list[0]).T.contiguous()
-        v_weight = load(prefix + "v" + awq_key_list[4] +
-                        awq_suffix_list[0]).T.contiguous()
-        dim_k = q_weight.shape[0]
-        q_weight = torch_split(q_weight, 1)
-        k_weight = torch_split(k_weight, 1)
-        v_weight = torch_split(v_weight, 1)
-        q_pre_quant_scale = load(prefix + "q" + awq_key_list[4] +
-                                 awq_suffix_list[2]).reshape((1, dim_k))
-        k_pre_quant_scale = load(prefix + "k" + awq_key_list[4] +
-                                 awq_suffix_list[2]).reshape((1, dim_k))
-        v_pre_quant_scale = load(prefix + "v" + awq_key_list[4] +
-                                 awq_suffix_list[2]).reshape((1, dim_k))
-        qkv_pre_quant_scale = (q_pre_quant_scale + k_pre_quant_scale +
-                               v_pre_quant_scale) / 3.0
-        q_weight, q_scale = reSmooth_and_get_scale(q_weight, q_pre_quant_scale,
-                                                   qkv_pre_quant_scale)
-        k_weight, k_scale = reSmooth_and_get_scale(k_weight, k_pre_quant_scale,
-                                                   qkv_pre_quant_scale)
-        v_weight, v_scale = reSmooth_and_get_scale(v_weight, v_pre_quant_scale,
-                                                   qkv_pre_quant_scale)
-        qkv_weights = torch.cat((q_weight, k_weight, v_weight), dim=1)
-        qkv_scale = torch.cat((q_scale, k_scale, v_scale), dim=1)
-
-        results = {
-            f'{tllm_prex}.weight':
-            AWQ_quantize_pack_preprocess(qkv_weights, qkv_scale),
-            f'{tllm_prex}.weights_scaling_factor':
-            qkv_scale.to(torch_dtype),
-            f'{tllm_prex}.prequant_scaling_factor':
-            qkv_pre_quant_scale.to(torch_dtype),
-        }
-        return results
-
-    # Load weights from AWQ checkpoint into TRT-LLM module
-    # 1. vocab_embedding
-    v = load(awq_key_list[0])
-    # TRT-LLM requires vocab_size to be multiple of 64 for successful GEMM
-    if v.shape[0] % 64 != 0:
-        v = torch.nn.functional.pad(v, [0, 0, 0, 64 - v.shape[0] % 64])
-    if mapping.is_first_pp_rank():
-        weights['transformer.vocab_embedding.weight'] = v.to(torch_dtype)
-
-    # 2. lm_head
-    if quantize_lm_head:
-        v = [load(awq_key_list[1] + suf) for suf in awq_suffix_list]
-        if v[0].shape[0] % 64 != 0:
-            v[0] = torch.nn.functional.pad(v[0],
-                                           [0, 0, 0, 64 - v[0].shape[0] % 64])
-            scale_align = 64 * (v[0].shape[1] // group_size)
-            v[1] = v[1].reshape(-1)
-            v[1] = torch.nn.functional.pad(
-                v[1], [0, scale_align - v[1].shape[0] % scale_align], value=1)
-        if mapping.is_last_pp_rank():
-            weights.update(get_tllm_weight_from_awq(v, 'lm_head', 1))
-    else:
-        v = load(awq_key_list[1] + awq_suffix_list[0])
-        if mapping.is_last_pp_rank():
-            if vocab_size % mapping.tp_size != 0:
-                # padding
-                vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
-                pad_width = vocab_size_padded - vocab_size
-                v = torch.from_numpy(
-                    np.pad(v.detach().cpu().numpy(), ((0, pad_width), (0, 0)),
-                           'constant',
-                           constant_values=0))
-            weights['lm_head.weight'] = torch_split(v, 0).to(torch_dtype)
-
-    # 3. ln_f
-    v = load(awq_key_list[2])
-    if mapping.is_last_pp_rank():
-        # tensorrt_llm_llama.ln_f.weight.value = v.to(torch_dtype).cpu().numpy()
-        weights['transformer.ln_f.weight'] = v.to(torch_dtype)
-
-    # 4. Weights inside each layer
-    layers_range = mapping.pp_layers(num_hidden_layers)
-
-    for l in layers_range:
-        layer_idx = l - layers_range[0]
-        prefix = "layers" + split_sym + str(layer_idx) + split_sym
-        tllm_prex = f'transformer.layers.{l-layers_range[0]}'
-
-        logger.info(f'Process weights in layer: {layer_idx}')
-        # layer = tensorrt_llm_llama.layers[layer_idx]
-
-        # 4.1 attention.qkv
-        weights.update(
-            get_tllm_qkv_weight_from_awq(prefix + awq_key_list[3],
-                                         f'{tllm_prex}.attention.qkv'))
-
-        # 4.2 attention.dense
-        v = [load(prefix + awq_key_list[5] + suf) for suf in awq_suffix_list]
-        # process_and_assign_weight(layer.attention.dense, v, 0)
-        weights.update(
-            get_tllm_weight_from_awq(v,
-                                     f'{tllm_prex}.attention.dense',
-                                     tp_dim=0))
-        # 4.3 mlp.gate
-        v = [load(prefix + awq_key_list[6] + suf) for suf in awq_suffix_list]
-
-        weights.update(
-            get_tllm_weight_from_awq(v, f'{tllm_prex}.mlp.gate', tp_dim=1))
-
-        # 4.4 mlp.proj
-        v = [load(prefix + awq_key_list[7] + suf) for suf in awq_suffix_list]
-        weights.update(
-            get_tllm_weight_from_awq(v, f'{tllm_prex}.mlp.proj', tp_dim=0))
-        # 4.5 mlp.fc
-        v = [load(prefix + awq_key_list[8] + suf) for suf in awq_suffix_list]
-        weights.update(
-            get_tllm_weight_from_awq(v, f'{tllm_prex}.mlp.fc', tp_dim=1))
-        # 4.6 input_layernorm
-        v = load(prefix + awq_key_list[9])
-        # layer.input_layernorm.weight.value = v.to(torch_dtype).cpu().numpy()
-
-        weights[f'{tllm_prex}.input_layernorm.weight'] = v.to(torch_dtype)
-        # 4.7 post_layernorm
-        v = load(prefix + awq_key_list[10])
-        # layer.post_layernorm.weight.value = v.to(torch_dtype).cpu().numpy()
-        weights[f'{tllm_prex}.post_layernorm.weight'] = v.to(torch_dtype)
-
-        # 4.8 attention.kv_quant_orig_scale / kv_quant_orig_scale
-        # if use_int8_kv_cache:
-        #     assert bin_model_dir, "You must pass --bin_model_dir to tell TRT-LLM where to look for scales of INT8 kv cache."
-        #     t = fromfile(
-        #         bin_model_dir, 'model.layers.' + str(layer_idx) +
-        #         '.attention.query_key_value.scale_y_quant_orig.bin', [1],
-        #         np.float32)
-        #     assert t is not None, f"{bin_model_dir} does not contain model.layers.{layer_idx}.attention.query_key_value.scale_y_quant_orig.bin"
-        #     layer.attention.kv_orig_quant_scale.value = 1.0 / t
-        #     layer.attention.kv_quant_orig_scale.value = t
-
     return weights

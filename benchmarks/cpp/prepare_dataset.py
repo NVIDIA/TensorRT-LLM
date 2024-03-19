@@ -1,4 +1,19 @@
-from typing import Literal
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import logging
+from typing import Literal, Optional, Tuple
 
 import click
 from pydantic import BaseModel, field_validator
@@ -15,14 +30,16 @@ class RootArgs(BaseModel):
     mean_time_bet_reqs: float
     time_delay_dist: Literal["constant", "exponential_dist"]
     random_seed: int
+    task_id: int
+    rand_task_id: Optional[Tuple[int, int]]
 
     @field_validator('tokenizer')
     def get_tokenizer(cls, v: str):
         try:
             tokenizer = AutoTokenizer.from_pretrained(v, padding_side='left')
-        except EnvironmentError:
+        except EnvironmentError as e:
             raise ValueError(
-                "Cannot find a tokenizer from the given string. Please set tokenizer to the directory that contains the tokenizer, or set to a model name in HuggingFace."
+                f"Cannot find a tokenizer from the given string because of {e}\nPlease set tokenizer to the directory that contains the tokenizer, or set to a model name in HuggingFace."
             )
         tokenizer.pad_token = tokenizer.eos_token
         return tokenizer
@@ -49,23 +66,40 @@ class RootArgs(BaseModel):
               type=click.Choice(["constant", "exponential_dist"]),
               help="Distribution of the time delay.",
               default="exponential_dist")
-@click.option(
-    "--random-seed",
-    required=False,
-    type=int,
-    help=
-    "random seed for exponential delays (dataset/norm-token-dist) and token_ids(norm-token-dist)",
-    default=420)
+@click.option("--random-seed",
+              required=False,
+              type=int,
+              help="random seed for exponential delays and token_ids",
+              default=420)
+@click.option("--task-id", type=int, default=-1, help="LoRA task id")
+@click.option("--rand-task-id",
+              type=int,
+              default=None,
+              nargs=2,
+              help="Random LoRA Tasks")
+@click.option("--log-level",
+              default="info",
+              type=click.Choice(['info', 'debug']),
+              help="Logging level.")
 @click.pass_context
 def cli(ctx, **kwargs):
     """This script generates dataset input for gptManagerBenchmark."""
+    if kwargs['log_level'] == 'info':
+        logging.basicConfig(level=logging.INFO)
+    elif kwargs['log_level'] == 'debug':
+        logging.basicConfig(level=logging.DEBUG)
+    else:
+        raise ValueError(f"Unsupported logging level {kwargs['log_level']}")
+
     ctx.obj = RootArgs(tokenizer=kwargs['tokenizer'],
                        output=kwargs['output'],
                        request_rate=kwargs['request_rate'],
                        mean_time_bet_reqs=get_req_time_interval(
                            kwargs['request_rate']),
                        time_delay_dist=kwargs['time_delay_dist'],
-                       random_seed=kwargs['random_seed'])
+                       random_seed=kwargs['random_seed'],
+                       task_id=kwargs['task_id'],
+                       rand_task_id=kwargs['rand_task_id'])
 
 
 cli.add_command(dataset)

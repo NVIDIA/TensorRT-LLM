@@ -20,6 +20,7 @@
 #include <gtest/gtest.h>
 
 #include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/common/stlUtils.h"
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
@@ -29,7 +30,6 @@
 
 #include <algorithm>
 #include <filesystem>
-#include <mpi.h>
 
 using namespace tensorrt_llm::runtime;
 
@@ -583,7 +583,7 @@ TEST_P(ParamTest, Test)
 
     // Warning: This should be the last check before running the test.
     // It will initialize MPI which can take significant time.
-    if (!WorldConfig::validConfig(modelSpec.mTPSize, modelSpec.mPPSize))
+    if (modelSpec.mTPSize * modelSpec.mPPSize != COMM_SESSION.getSize())
     {
         GTEST_SKIP() << "Model's world size " << modelSpec.mPPSize * modelSpec.mTPSize
                      << " is not equal to the system world size";

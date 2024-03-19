@@ -29,8 +29,6 @@ namespace tk = tensorrt_llm::kernels;
 namespace
 {
 
-static float constexpr HALF_FLT_MAX = 65504.F;
-
 __global__ void generateRandomNumber(int32_t* vals, curandState_t* states, int const batch_size)
 {
     int idx = threadIdx.x;

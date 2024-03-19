@@ -21,6 +21,8 @@
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/schedulerPolicy.h"
 #include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
+#include "tensorrt_llm/runtime/gptModelConfig.h"
+#include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <atomic>
 #include <filesystem>
@@ -86,7 +88,8 @@ private:
     [[nodiscard]] SizeType getMaxSequenceLen() const;
     [[nodiscard]] SizeType getMaxNumSequences() const;
 
-    void validateLlmRequest(LlmRequest& newReq) const;
+    void validateLlmRequest(
+        LlmRequest& newReq, runtime::GptModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig) const;
     static std::shared_ptr<LlmRequest> fillLlmRequest(std::shared_ptr<InferenceRequest> newReq);
     static std::shared_ptr<std::vector<TokenIdType>> getReqInputTokens(std::shared_ptr<InferenceRequest> newReq);
     static SizeType getMaxNewTokens(std::shared_ptr<InferenceRequest> newReq);

@@ -26,6 +26,8 @@
 #include <string>
 #include <vector>
 
+class BufferManagerTest;
+
 namespace tensorrt_llm::runtime
 {
 //! \brief A helper class for managing memory on host and device.
@@ -42,7 +44,16 @@ public:
     //!
     //! \param[in] cudaStream The cuda stream to use for all operations on GPU (allocation, de-allocation, copying,
     //! etc.).
-    explicit BufferManager(CudaStreamPtr stream);
+    explicit BufferManager(CudaStreamPtr stream, bool trimPool = false);
+
+    //! \brief Destructor.
+    ~BufferManager()
+    {
+        if (mTrimPool)
+        {
+            memoryPoolTrimTo(0);
+        }
+    }
 
     static auto constexpr kBYTE_TYPE = nvinfer1::DataType::kUINT8;
 
@@ -171,6 +182,8 @@ public:
     void memoryPoolTrimTo(std::size_t size);
 
 private:
+    friend class ::BufferManagerTest;
+
     void static initMemoryPool(int device);
 
     std::size_t static memoryPoolReserved(int device);
@@ -185,6 +198,7 @@ private:
     void static memoryPoolTrimTo(int device, std::size_t size);
 
     CudaStreamPtr mStream;
+    bool const mTrimPool;
 };
 
 } // namespace tensorrt_llm::runtime

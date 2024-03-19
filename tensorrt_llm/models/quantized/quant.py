@@ -357,13 +357,13 @@ def _smooth_quantize_chatglm(model, quant_mode):
 
 def _smooth_quantize(model, quant_mode):
     from ...models import (BaichuanForCausalLM, BloomForCausalLM,
-                           ChatGLMForCausalLM, GPTLMHeadModel, LLaMAForCausalLM,
+                           ChatGLMForCausalLM, GPTForCausalLM, LLaMAForCausalLM,
                            QWenForCausalLM)
-    assert isinstance(model, GPTLMHeadModel) or isinstance(model, LLaMAForCausalLM) \
+    assert isinstance(model, GPTForCausalLM) or isinstance(model, LLaMAForCausalLM) \
             or isinstance(model, BloomForCausalLM) or isinstance(model, BaichuanForCausalLM) \
             or isinstance(model, QWenForCausalLM) or isinstance(model, ChatGLMForCausalLM), \
-            "Only GPTLMHeadModel, LLaMAForCausalLM BloomForCausalLM and BaichuanForCausalLM are well tested now"
-    if isinstance(model, GPTLMHeadModel):
+            "Only GPTForCausalLM, LLaMAForCausalLM BloomForCausalLM and BaichuanForCausalLM are well tested now"
+    if isinstance(model, GPTForCausalLM):
         return _smooth_quantize_gpt(model, quant_mode)
     elif isinstance(model, LLaMAForCausalLM):
         return _smooth_quantize_llama(model, quant_mode)
@@ -536,8 +536,8 @@ def _default_fp8_quantize(model,
 
 def _fp8_quantize(model, quant_mode: QuantMode, quant_scales: dict = None):
     from ...models import (BaichuanForCausalLM, FalconForCausalLM,
-                           GPTJForCausalLM, GPTLMHeadModel, LLaMAForCausalLM)
-    if isinstance(model, (FalconForCausalLM, GPTJForCausalLM, GPTLMHeadModel,
+                           GPTForCausalLM, GPTJForCausalLM, LLaMAForCausalLM)
+    if isinstance(model, (FalconForCausalLM, GPTJForCausalLM, GPTForCausalLM,
                           LLaMAForCausalLM, BaichuanForCausalLM)):
         return _default_fp8_quantize(model, quant_mode, quant_scales)
     raise NotImplementedError(

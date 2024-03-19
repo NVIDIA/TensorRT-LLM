@@ -17,43 +17,30 @@
     ```
     This command saves the test image tensor to `image.pt` for later pipeline inference.
 
-3. Build INT4-GPTQ Qwen TensorRT engine.
-- Quantize the weights to INT4 with GPTQ
+3. Build Qwen TensorRT engine.
+- Convert checkpoint
     1. Install packages
     ```bash
     pip install -r requirements.txt
     ```
-    2. Weight quantization to INT4 with GPTQ
+    2. Convert
     ```bash
-    python3 gptq_convert.py --pretrained_model_dir ./Qwen-VL-Chat \
-            --quantized_model_dir ./Qwen-VL-Chat-4bit
+    python3 ../qwen/convert_checkpoint.py --model_dir=./Qwen-VL-Chat \
+            --output_dir=./tllm_checkpoint_1gpu
     ```
 
 - Build TensorRT-LLM engine
 
     NOTE: `max_prompt_embedding_table_size = query_token_num * max_batch_size`, therefore, if you change `max_batch_size`, `--max_prompt_embedding_table_size` must be reset accordingly.
     ```bash
-    python3 ../qwen/build.py --model_dir=Qwen-VL-Chat \
-            --quant_ckpt_path=./Qwen-VL-Chat-4bit/gptq_model-4bit-128g.safetensors \
-            --dtype float16 \
-            --max_batch_size 8 \
-            --max_input_len 2048 \
-            --max_output_len 1024 \
-            --remove_input_padding \
-            --use_gpt_attention_plugin float16 \
-            --use_gemm_plugin float16 \
-            --use_weight_only \
-            --weight_only_precision int4_gptq \
-            --per_group \
-            --enable_context_fmha \
-            --log_level verbose \
-            --use_lookup_plugin float16 \
-            --max_prompt_embedding_table_size 2048 \
-            --output_dir=./trt_engines/Qwen-VL-7B-Chat-int4-gptq
-
-            # --max_prompt_embedding_table_size 2048 = 256 (query_token number) * 8 (max_batch_size)
+    trtllm-build --checkpoint_dir=./tllm_checkpoint_1gpu \
+                 --gemm_plugin=float16 --gpt_attention_plugin=float16 \
+                 --lookup_plugin=float16 --max_input_len=2048 --max_output_len=1024 \
+                 --max_batch_size=8 --max_prompt_embedding_table_size=2048 \
+                 --remove_input_padding=enable \
+                 --output_dir=./trt_engines/Qwen-VL-7B-Chat
     ```
-    The built Qwen engines are located in `./trt_engines/Qwen-VL-7B-Chat-int4-gptq`.
+    The built Qwen engines are located in `./trt_engines/Qwen-VL-7B-Chat`.
     For more information about Qwen, refer to the README.md in [`example/qwen`](../qwen).
 
 4. Assemble everything into the Qwen-VL pipeline.
@@ -62,7 +49,7 @@
     ```bash
     python3 run.py \
         --tokenizer_dir=./Qwen-VL-Chat \
-        --qwen_engine_dir=./trt_engines/Qwen-VL-7B-Chat-int4-gptq \
+        --qwen_engine_dir=./trt_engines/Qwen-VL-7B-Chat \
         --vit_engine_dir=./plan \
         --images_path='{"image": "./pics/demo.jpeg"}' \
         --input_dir='{"image": "image.pt"}'
@@ -71,7 +58,7 @@
     ```bash
     python3 run_chat.py \
         --tokenizer_dir=./Qwen-VL-Chat \
-        --qwen_engine_dir=./trt_engines/Qwen-VL-7B-Chat-int4-gptq \
+        --qwen_engine_dir=./trt_engines/Qwen-VL-7B-Chat \
         --vit_engine_dir=./plan \
         --images_path='{"image": "./pics/demo.jpeg"}' \
         --input_dir='{"image": "image.pt"}'
@@ -97,7 +84,7 @@
     ```bash
     python3 run_chat.py \
         --tokenizer_dir=./Qwen-VL-Chat \
-        --qwen_engine_dir=./trt_engines/Qwen-VL-7B-Chat-int4-gptq \
+        --qwen_engine_dir=./trt_engines/Qwen-VL-7B-Chat \
         --vit_engine_dir=./plan \
         --display \
         --port=8006
@@ -110,7 +97,7 @@
     ```bash
     python3 run_chat.py \
         --tokenizer_dir=./Qwen-VL-Chat \
-        --qwen_engine_dir=./trt_engines/Qwen-VL-7B-Chat-int4-gptq \
+        --qwen_engine_dir=./trt_engines/Qwen-VL-7B-Chat \
         --vit_engine_dir=./plan \
         --display \
         --local_machine

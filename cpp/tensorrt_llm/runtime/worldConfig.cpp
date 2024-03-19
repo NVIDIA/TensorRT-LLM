@@ -72,10 +72,9 @@ WorldConfig::WorldConfig(SizeType tensorParallelism, SizeType pipelineParallelis
     TLLM_CHECK(mPipelineParallelism > 0);
 }
 
-bool WorldConfig::validConfig(SizeType tensorParallelism, SizeType pipelineParallelism)
+bool WorldConfig::validMpiConfig() const
 {
-    auto const mpiSize = COMM_SESSION.getSize();
-    return mpiSize == tensorParallelism * pipelineParallelism;
+    return COMM_SESSION.getSize() == getSize();
 }
 
 WorldConfig WorldConfig::mpi(SizeType gpusPerNode, std::optional<SizeType> tensorParallelism,

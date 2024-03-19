@@ -19,7 +19,7 @@ from utils.util import unittest_name_func
 
 import tensorrt_llm
 from tensorrt_llm._utils import str_dtype_to_np
-from tensorrt_llm.models import GPTLMHeadModel
+from tensorrt_llm.models import GPTForCausalLM, PretrainedConfig
 
 
 class TestModelDtype(unittest.TestCase):
@@ -27,20 +27,25 @@ class TestModelDtype(unittest.TestCase):
     def setUp(self):
         tensorrt_llm.logger.set_level('error')
 
-    @parameterized.expand([(GPTLMHeadModel, 'float32'),
-                           (GPTLMHeadModel, 'bfloat16'),
-                           (GPTLMHeadModel, 'float16')],
+    @parameterized.expand([(GPTForCausalLM, 'float32'),
+                           (GPTForCausalLM, 'bfloat16'),
+                           (GPTForCausalLM, 'float16')],
                           name_func=unittest_name_func)
     def test_model_dtype(self, model_cls, dtype):
         ''' Every parameter in the model should have the same dtype as the model initialized to
         '''
-        tiny_model = model_cls(num_layers=6,
-                               num_heads=4,
-                               hidden_size=128,
-                               vocab_size=128,
-                               hidden_act='relu',
-                               max_position_embeddings=128,
-                               dtype=dtype)
+        config = {
+            'architecture': 'GPTForCausalLM',
+            'dtype': dtype,
+            'num_hidden_layers': 6,
+            'num_attention_heads': 4,
+            'hidden_size': 128,
+            'vocab_size': 128,
+            'max_position_embeddings': 128,
+            'hidden_act': 'relu',
+        }
+        config = PretrainedConfig.from_dict(config)
+        tiny_model = model_cls(config)
         for p in tiny_model.parameter():
             self.assertEqual(p.raw_value.dtype, str_dtype_to_np(dtype))
 

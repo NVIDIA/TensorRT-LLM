@@ -15,8 +15,6 @@
 # limitations under the License.
 import argparse
 import datetime
-#from utils.convert import cpu_map_location
-#from utils.nemo import unpack_nemo_ckpt
 import json
 import logging
 import re
@@ -27,7 +25,7 @@ import numpy as np
 import torch
 
 from tensorrt_llm._utils import str_dtype_to_torch
-from tensorrt_llm.lora_manager import LoraConfig
+from tensorrt_llm.lora_manager import LoraManager
 
 log_format = "%(asctime)s %(name)s [%(levelname)s] %(message)s"
 logging.basicConfig(format=log_format)
@@ -70,7 +68,7 @@ hf_modules_to_trtllm_modules = {
     "up_proj": "mlp_gate"
 }  # lora modules on llama
 hf_modules_to_module_id = {
-    k: LoraConfig.LORA_MODULE_IDS[v]
+    k: LoraManager.LORA_MODULE_IDS[v]
     for k, v in hf_modules_to_trtllm_modules.items()
 }
 

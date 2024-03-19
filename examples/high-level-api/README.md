@@ -4,10 +4,10 @@ Here we show you a preview of how it works and how to use it.
 
 Note that the APIs are not stable and only support the LLaMA model. We appreciate your patience and understanding as we improve this API.
 
-You can refer to [llm_examples.py](llm_examples.py) for all of the examples, and run it with the [run_examples.sh](./run_examples.sh) script, the command is as follows:
+You can refer to [llm_examples.py](llm_examples.py) for all of the examples, and run it with the [run_examples.py](./run_examples.py) script, the command is as follows:
 
 ```sh
-./run_examples.sh <llama-model-path>
+python3 ./run_examples.py <llama-model-path>
 ```
 
 For 7B, 13B models those could be held in a single GPU, it should run all the examples automatically and print the results.

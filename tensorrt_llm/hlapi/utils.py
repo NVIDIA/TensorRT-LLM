@@ -1,10 +1,9 @@
-import gc
 import sys
 import traceback
 from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
-from typing import List
+from typing import List, Union
 
 import torch
 
@@ -12,7 +11,7 @@ import torch
 @dataclass
 class GenerationOutput:
     text: str = ""
-    token_ids: List[int] = field(default_factory=list)
+    token_ids: Union[List[int], List[List[int]]] = field(default_factory=list)
     logprobs: List[float] = field(default_factory=list)
 
 
@@ -59,11 +58,3 @@ def get_device_count() -> int:
 
 def get_total_gpu_memory(device: int) -> float:
     return torch.cuda.get_device_properties(device).total_memory
-
-
-def release_gc():
-    ''' Release memory allocated by PyTorch and Python garbage collector explicitly and immediately.
-    This could be used when some states might be kept in memory even after the variables are deleted.
-    '''
-    gc.collect()
-    torch.cuda.empty_cache()

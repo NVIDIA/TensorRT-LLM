@@ -44,14 +44,14 @@ public:
         std::optional<std::vector<int>> early_stopping;               // [1] or [batch_size] on cpu
     };
 
-    OnlineBeamSearchLayer(
-        size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream, std::shared_ptr<tc::IAllocator> allocator);
+    OnlineBeamSearchLayer(runtime::SizeType vocab_size, runtime::SizeType vocab_size_padded, cudaStream_t stream,
+        std::shared_ptr<tc::IAllocator> allocator);
 
     OnlineBeamSearchLayer(OnlineBeamSearchLayer<T> const& beam_search_layer);
 
     ~OnlineBeamSearchLayer() override;
 
-    void setup(size_t batch_size, SetupParams const& setupParams);
+    void setup(runtime::SizeType batch_size, SetupParams const& setupParams);
 
 protected:
     // meta data
@@ -78,7 +78,7 @@ protected:
     int* early_stoppings_buf_;
 
 private:
-    void allocateBuffer(size_t batch_size);
+    void allocateBuffer(runtime::SizeType batch_size);
     void freeBuffer();
 };
 

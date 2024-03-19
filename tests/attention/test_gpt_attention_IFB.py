@@ -57,7 +57,7 @@ class TestFunctional(unittest.TestCase):
 
     def _build_trt_engine(self, trt_network, trt_builder, dtype, shape_dict,
                           use_int8):
-        config = trt_builder.create_builder_config()
+        config = trt_builder.create_builder_config(opt_level=0)
         if dtype == 'float16':
             config.flags = 1 << (int)(trt.BuilderFlag.FP16)
 
@@ -380,6 +380,7 @@ class TestFunctional(unittest.TestCase):
             int8_trt_flag = False
             builder_config = builder.create_builder_config(name=attention_type,
                                                            precision=dtype,
+                                                           opt_level=0,
                                                            int8=int8_trt_flag)
             if session is None:
                 engine = builder.build_engine(net, builder_config)

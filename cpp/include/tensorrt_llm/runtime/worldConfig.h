@@ -106,12 +106,12 @@ public:
 
     [[nodiscard]] std::vector<SizeType> getPipelineParallelGroup() const;
 
-    static bool validConfig(SizeType tensorParallelism, SizeType pipelineParallelism);
-
     static WorldConfig mpi(SizeType gpusPerNode = kDefaultGpusPerNode,
         std::optional<SizeType> tensorParallelism = std::nullopt,
         std::optional<SizeType> pipelineParallelism = std::nullopt,
         std::optional<std::vector<SizeType>> const& deviceIds = std::nullopt);
+
+    [[nodiscard]] bool validMpiConfig() const;
 
 private:
     SizeType mTensorParallelism;

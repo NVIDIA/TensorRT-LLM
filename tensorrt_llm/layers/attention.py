@@ -35,7 +35,7 @@ from ..quantization import QuantMode
 from ..quantization.functional import dequantize, quantize
 from ..quantization.layers import FP8Linear, FP8RowLinear
 from .linear import ColumnLinear, QKVColumnLinear, RowLinear
-from .lora import Lora, LoraRuntimeParams
+from .lora import LoraRuntimeParams
 
 
 class RopeEmbeddingUtils:
@@ -446,7 +446,6 @@ class Attention(Module):
         max_distance=0,
         num_buckets=0,
         dense_bias=None,
-        max_lora_rank=None,
         clip_qkv=None,
         alibi_bias_max=8,
         skip_cross_qkv=False,
@@ -463,7 +462,7 @@ class Attention(Module):
         self.num_attention_kv_heads = (
             num_kv_heads + tp_size - 1
         ) // tp_size if num_kv_heads is not None else self.num_attention_heads
-        self.hidden_size = hidden_size // tp_size
+        self.hidden_size = hidden_size
         self.attention_hidden_size = self.attention_head_size * self.num_attention_heads
         self.max_position_embeddings = max_position_embeddings
         self.bias = bias
@@ -539,16 +538,14 @@ class Attention(Module):
                 dtype=dtype,
                 tp_group=tp_group,
                 tp_size=tp_size,
-                gather_output=False,
-                max_lora_rank=max_lora_rank)
+                gather_output=False)
             self.dense = FP8RowLinear(tp_size * self.num_attention_heads *
                                       self.attention_head_size,
                                       hidden_size,
                                       bias=dense_bias,
                                       dtype=dtype,
                                       tp_group=tp_group,
-                                      tp_size=tp_size,
-                                      max_lora_rank=max_lora_rank)
+                                      tp_size=tp_size)
         else:
             # out dim is not necessarily hidden_size + kv specific size (in MQA/GQA), but num_heads * heads_size
             # example: d_model != num_heads * head_size in Flan-T5
@@ -561,37 +558,20 @@ class Attention(Module):
                 dtype=dtype,
                 tp_group=tp_group,
                 tp_size=tp_size,
-                gather_output=False,
-                max_lora_rank=max_lora_rank)
+                gather_output=False)
             self.dense = RowLinear(tp_size * self.num_attention_heads *
                                    self.attention_head_size,
                                    hidden_size,
                                    bias=dense_bias,
                                    dtype=dtype,
                                    tp_group=tp_group,
-                                   tp_size=tp_size,
-                                   max_lora_rank=max_lora_rank)
+                                   tp_size=tp_size)
 
         # per-layer relative attention table
         if relative_attention:
             self.rel_attn_table = Parameter(shape=(num_attention_heads //
                                                    tp_size, num_buckets),
                                             dtype=dtype)
-
-        if max_lora_rank is None:
-            max_lora_rank = min(
-                hidden_size,
-                self.num_attention_heads * self.attention_head_size,
-                self.num_attention_kv_heads * self.attention_head_size)
-        self.qkv_lora = Lora(
-            in_hidden_size=hidden_size,
-            out_hidden_sizes=[
-                self.num_attention_heads * self.attention_head_size,
-                self.num_attention_kv_heads * self.attention_head_size,
-                self.num_attention_kv_heads * self.attention_head_size
-            ],
-            max_low_rank=max_lora_rank,
-        )
 
         if clip_qkv is not None:
             self.clip_qkv = fp32_array([clip_qkv])
@@ -1181,8 +1161,7 @@ class BertAttention(Module):
                  tp_rank=0,
                  relative_attention=False,
                  max_distance=0,
-                 num_buckets=0,
-                 max_lora_rank=None):
+                 num_buckets=0):
         super().__init__()
 
         self.attention_head_size = hidden_size // num_attention_heads if attention_head_size is None else attention_head_size
@@ -1190,7 +1169,7 @@ class BertAttention(Module):
         self.num_attention_kv_heads = (
             num_kv_heads + tp_size - 1
         ) // tp_size if num_kv_heads is not None else self.num_attention_heads
-        self.hidden_size = hidden_size // tp_size
+        self.hidden_size = hidden_size
         self.attention_hidden_size = self.attention_head_size * self.num_attention_heads
         self.max_position_embeddings = max_position_embeddings
         self.norm_factor = math.sqrt(self.attention_head_size)
@@ -1222,37 +1201,20 @@ class BertAttention(Module):
                                 dtype=dtype,
                                 tp_group=tp_group,
                                 tp_size=tp_size,
-                                gather_output=False,
-                                max_lora_rank=max_lora_rank)
+                                gather_output=False)
         self.dense = RowLinear(tp_size * self.num_attention_heads *
                                self.attention_head_size,
                                hidden_size,
                                bias=bias,
                                dtype=dtype,
                                tp_group=tp_group,
-                               tp_size=tp_size,
-                               max_lora_rank=max_lora_rank)
+                               tp_size=tp_size)
 
         # per-layer relative attention table
         if relative_attention:
             self.rel_attn_table = Parameter(shape=(num_attention_heads //
                                                    tp_size, num_buckets),
                                             dtype=dtype)
-
-        if max_lora_rank is None:
-            max_lora_rank = min(
-                hidden_size,
-                self.num_attention_heads * self.attention_head_size,
-                self.num_attention_kv_heads * self.attention_head_size)
-        self.qkv_lora = Lora(
-            in_hidden_size=hidden_size,
-            out_hidden_sizes=[
-                self.num_attention_heads * self.attention_head_size,
-                self.num_attention_kv_heads * self.attention_head_size,
-                self.num_attention_kv_heads * self.attention_head_size
-            ],
-            max_low_rank=max_lora_rank,
-        )
 
     def forward(self,
                 hidden_states: Tensor,

@@ -18,10 +18,8 @@
 #include <cassert>
 #include <cmath>
 #include <cstdint>
-#include <cuda_fp16.h>
-#if defined(ENABLE_BF16)
 #include <cuda_bf16.h>
-#endif
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
 #include <iostream>
@@ -30,79 +28,74 @@ namespace tensorrt_llm
 {
 namespace kernels
 {
-enum class WeightOnlyQuantType
+namespace weight_only
 {
-    Int4b,
-    Int8b
-};
-enum class WeightOnlyType
+enum class KernelType
 {
-    PerChannel,
-    GroupWise
-};
-
-struct WeightOnlyPerChannel;
-template <int GS>
-struct WeightOnlyGroupWise;
-
-enum class WeightOnlyActivationFunctionType
-{
-    Gelu,
-    Relu,
-    Identity,
-    InvalidType
+    FP16Int4Groupwise,
+    BF16Int4Groupwise,
+    FP16Int8PerChannel,
+    BF16Int8PerChannel,
+    FP16Int4PerChannel,
+    BF16Int4PerChannel
 };
 
-enum class WeightOnlyActivationType
+template <KernelType KT>
+struct kernel_type_traits;
+#define KERNEL_TYPE_TRAITS_REGISTRY(KT, _isGroupwise, _isInt4)                                                         \
+    template <>                                                                                                        \
+    struct kernel_type_traits<KT>                                                                                      \
+    {                                                                                                                  \
+        static constexpr bool isGroupwise = _isGroupwise;                                                              \
+        static constexpr bool isInt4 = _isInt4;                                                                        \
+    };
+KERNEL_TYPE_TRAITS_REGISTRY(KernelType::FP16Int4Groupwise, true, true);
+KERNEL_TYPE_TRAITS_REGISTRY(KernelType::BF16Int4Groupwise, true, true);
+KERNEL_TYPE_TRAITS_REGISTRY(KernelType::FP16Int8PerChannel, false, false);
+KERNEL_TYPE_TRAITS_REGISTRY(KernelType::BF16Int8PerChannel, false, false);
+KERNEL_TYPE_TRAITS_REGISTRY(KernelType::FP16Int4PerChannel, false, true);
+KERNEL_TYPE_TRAITS_REGISTRY(KernelType::BF16Int4PerChannel, false, true);
+#undef KERNEL_TYPE_TRAITS_REGISTRY
+
+struct Params
 {
-    FP16,
-    BF16,
-    FP8
-};
+    using Pointer = void*;
+    using ConstPointer = void const*;
+    Pointer act;
+    Pointer act_scale;
+    Pointer weight;
+    Pointer scales;
+    Pointer zeros;
+    Pointer bias;
+    Pointer out;
+    float alpha;
+    int m;
+    int n;
+    int k;
+    int groupsize;
+    KernelType type;
+    bool apply_alpha_in_advance;
 
-struct WeightOnlyParams
-{
-    // ActType is fp16 or bf16
-    using ActType = void;
-    using WeiType = uint8_t;
-
-    uint8_t const* qweight;
-    ActType const* scales;
-    ActType const* zeros;
-    ActType const* in;
-    ActType const* act_scale;
-    ActType const* bias;
-    ActType* out;
-    int const m;
-    int const n;
-    int const k;
-    int const group_size;
-    WeightOnlyQuantType quant_type;
-    WeightOnlyType weight_only_type;
-    WeightOnlyActivationFunctionType act_func_type;
-    WeightOnlyActivationType act_type;
-
-    WeightOnlyParams(uint8_t const* _qweight, ActType const* _scales, ActType const* _zeros, ActType const* _in,
-        ActType const* _act_scale, ActType const* _bias, ActType* _out, int const _m, int const _n, int const _k,
-        int const _group_size, const WeightOnlyQuantType _quant_type, const WeightOnlyType _weight_only_type,
-        const WeightOnlyActivationFunctionType _act_func_type, const WeightOnlyActivationType _act_type)
-        : qweight(_qweight)
-        , scales(_scales)
-        , zeros(_zeros)
-        , in(_in)
-        , act_scale(_act_scale)
-        , bias(_bias)
+    Params(ConstPointer _act, ConstPointer _act_scale, ConstPointer _weight, ConstPointer _scales, ConstPointer _zeros,
+        ConstPointer _bias, Pointer _out, float _alpha, int _m, int _n, int _k, int _groupsize, KernelType _type,
+        bool _apply_alpha_in_advance = false)
+        : act(const_cast<Pointer>(_act))
+        , act_scale(const_cast<Pointer>(_act_scale))
+        , weight(const_cast<Pointer>(_weight))
+        , scales(const_cast<Pointer>(_scales))
+        , zeros(const_cast<Pointer>(_zeros))
+        , bias(const_cast<Pointer>(_bias))
         , out(_out)
+        , alpha(_alpha)
         , m(_m)
         , n(_n)
         , k(_k)
-        , group_size(_group_size)
-        , quant_type(_quant_type)
-        , weight_only_type(_weight_only_type)
-        , act_func_type(_act_func_type)
-        , act_type(_act_type)
+        , groupsize(_groupsize)
+        , type(_type)
+        , apply_alpha_in_advance(_apply_alpha_in_advance)
     {
     }
 };
+} // namespace weight_only
 } // namespace kernels
 } // namespace tensorrt_llm

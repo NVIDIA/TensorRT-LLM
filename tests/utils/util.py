@@ -50,6 +50,10 @@ skip_pre_hopper = pytest.mark.skipif(
     getSMVersion() < 90,
     reason="This test is not supported in pre-Hopper architecture")
 
+force_ampere = pytest.mark.skipif(
+    getSMVersion() < 80 or getSMVersion() > 89,
+    reason="This test is only enabled in Ampere architecture")
+
 
 def is_bf16(dtype):
     return dtype == 'bfloat16' or dtype == 'bf16' or dtype == torch.bfloat16

@@ -25,6 +25,8 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/samplingAirTopPKernels.h"
+#include <cuda/atomic>
+
 #include <cuda/std/limits>
 #include <cuda_fp16.h>
 
@@ -74,7 +76,7 @@ struct alignas(128) Counter
     // For a row inside a batch, we may launch multiple thread blocks. This counter is
     // used to determine if the current block is the last running block. If so, this block
     // will execute scan() and chooseBucket().
-    alignas(128) unsigned int finishedBlockCnt;
+    alignas(128) uint32_t finishedBlockCnt;
 };
 
 /*******************************Functions*********************************/
@@ -118,7 +120,7 @@ __host__ __device__ int constexpr calcNumPasses()
  * significant (rightmost)). This way, we can skip some passes in the end at the cost of having an unsorted output.
  */
 template <typename T, int BitsPerPass>
-__device__ int constexpr calcsStartBit(int pass)
+__device__ int constexpr calcStartBit(int pass)
 {
     int startBit = static_cast<int>(sizeof(T) * 8) - (pass + 1) * BitsPerPass;
     if (startBit < 0)
@@ -129,11 +131,229 @@ __device__ int constexpr calcsStartBit(int pass)
 }
 
 template <typename T, int BitsPerPass>
-__device__ unsigned constexpr calcMask(int pass)
+__device__ uint32_t constexpr calcMask(int pass)
 {
     static_assert(BitsPerPass <= 31);
-    int numBits = calcsStartBit<T, BitsPerPass>(pass - 1) - calcsStartBit<T, BitsPerPass>(pass);
+    int numBits = calcStartBit<T, BitsPerPass>(pass - 1) - calcStartBit<T, BitsPerPass>(pass);
     return (1 << numBits) - 1;
+}
+
+template <typename T>
+__device__ constexpr uint32_t getNumTotalMantissa()
+{
+    if constexpr (std::is_same_v<T, half>)
+    {
+        return 10;
+    }
+    else if constexpr (std::is_same_v<T, float>)
+    {
+        return 23;
+    }
+}
+
+template <typename T>
+__device__ uint32_t calcMantissa(T value);
+
+template <>
+__device__ uint32_t calcMantissa(float value)
+{
+    union
+    {
+        uint32_t bits;
+        float value;
+    } input;
+
+    input.value = value;
+
+    constexpr uint32_t numTotalMantissa = getNumTotalMantissa<float>();
+    uint32_t mask = (1u << numTotalMantissa) - 1;
+    return input.bits & mask;
+}
+
+__device__ uint32_t calcMantissa(half value)
+{
+    union
+    {
+        uint16_t bits;
+        half value;
+    } input;
+
+    input.value = value;
+
+    constexpr uint32_t numTotalMantissa = getNumTotalMantissa<half>();
+    uint32_t t = 0u | input.bits;
+    uint32_t mask = (1u << numTotalMantissa) - 1;
+    return t & mask;
+}
+
+template <typename T>
+__device__ uint32_t calcExponent(T value);
+
+template <>
+__device__ uint32_t calcExponent(float value)
+{
+    union
+    {
+        uint32_t bits;
+        float value;
+    } input;
+
+    input.value = value;
+
+    constexpr uint32_t numTotalMantissa = getNumTotalMantissa<float>();
+    uint32_t mask = (1u << numTotalMantissa) - 1;
+    return input.bits & ~mask;
+}
+
+template <>
+__device__ uint32_t calcExponent(half value)
+{
+    union
+    {
+        uint16_t bits;
+        half value;
+    } input;
+
+    input.value = value;
+
+    constexpr uint32_t numTotalMantissa = getNumTotalMantissa<half>();
+    uint32_t t = 0u | input.bits;
+    uint32_t mask = (1u << numTotalMantissa) - 1;
+    return t & ~mask;
+}
+
+__device__ float calcHalfValue(uint32_t count, uint32_t exponent, uint32_t sign, uint64_t bitSum)
+{
+    constexpr uint32_t numTotalBits = 64; // The bit number of uint64_t
+    constexpr uint32_t numOffset = 16;    // The bits number difference between float and half data type
+    constexpr uint32_t numTotalMantissaHalf
+        = getNumTotalMantissa<half>();    // The bit number of mantissa for half data type
+    constexpr uint32_t numTotalMantissaFloat
+        = getNumTotalMantissa<float>();   // The bit number of mantissa for float data type
+
+    uint64_t extraInMatissa = (bitSum >> numTotalMantissaHalf);
+
+    // Count the bit number for exceeding mantissa and the extra unwritten 1s
+    uint32_t numExtra = 0;
+    uint32_t numDeNorm = 0;
+    int numNorm = 0;
+    uint32_t mask = 0;
+    extraInMatissa = (exponent == 0) ? extraInMatissa : extraInMatissa + count;
+    numExtra = numTotalBits - __clzll(extraInMatissa);
+    numNorm = (exponent == 0) ? 0 : -1;
+    if (extraInMatissa == 0)
+    {
+        numDeNorm = numTotalMantissaHalf - (numTotalBits - __clzll(bitSum));
+    }
+    exponent = exponent + ((numExtra + numNorm + 127 - 15 - numDeNorm) << numTotalMantissaHalf);
+    // As extra bits (extraInMatissa) need to be part of the mantissa, we have to move the current
+    // mantissa within the range of [0-23]bits.
+    // This is the only step cause precision loss
+    uint32_t mantissa;
+    if (extraInMatissa != 0)
+    {
+        int numMove = numTotalMantissaFloat - (numExtra - 1);
+        mask = (1u << (numExtra - 1)) - 1;
+        // As the first bit of extraInMatissa is the unwritten 1,
+        // we need to mask that to zero
+        extraInMatissa = extraInMatissa & mask;
+        if (numMove > 0)
+        {
+            extraInMatissa = extraInMatissa << numMove;
+            mask = (1u << numTotalMantissaHalf) - 1;
+            mantissa = (((bitSum & mask) << (numTotalMantissaFloat - numTotalMantissaHalf)) >> (numExtra - 1))
+                | extraInMatissa;
+        }
+        else
+        {
+            mantissa = extraInMatissa >> (-1 * numMove);
+        }
+    }
+    else
+    {
+        mask = (1u << numTotalMantissaHalf) - 1;
+        mantissa = bitSum << (numDeNorm + 1);
+        mantissa = mantissa & mask;
+        mantissa = mantissa << (numTotalMantissaFloat - numTotalMantissaHalf);
+    }
+
+    uint32_t bitFloat = (sign << numOffset) | (exponent << (numTotalMantissaFloat - numTotalMantissaHalf)) | mantissa;
+    return reinterpret_cast<float&>(bitFloat);
+}
+
+__device__ float calcFloatValue(uint32_t count, uint32_t exponent, uint64_t bitSum)
+{
+    constexpr uint32_t numTotalBits = 64;
+    constexpr uint32_t numTotalMantissa = getNumTotalMantissa<float>();
+    uint64_t extraInMatissa = (bitSum >> numTotalMantissa);
+    // Count the bit number for exceeding mantissa and the extra unwritten 1s
+    uint32_t numExtra;
+    int numNorm = 0;
+    uint32_t mask = 0;
+    extraInMatissa = (exponent == 0) ? extraInMatissa : extraInMatissa + count;
+    numExtra = numTotalBits - __clzll(extraInMatissa);
+    numNorm = (exponent == 0) ? 0 : -1;
+    exponent = exponent + ((numExtra + numNorm) << numTotalMantissa);
+    // As extra integers need to be part of the mantissa, we have to move the current
+    // mantissa within the range of [0-23]bits.
+    // This is the only step cause precision loss
+    uint32_t mantissa;
+    if (extraInMatissa != 0)
+    {
+        int numMove = numTotalMantissa - (numExtra - 1);
+        // As the first bit of extraInMatissa is the unwritten 1,
+        // we need to mask that to zero
+        mask = (1u << (numExtra - 1)) - 1;
+        extraInMatissa = extraInMatissa & mask;
+        if (numMove > 0)
+        {
+            extraInMatissa = extraInMatissa << numMove;
+            mask = (1u << numTotalMantissa) - 1;
+            mantissa = ((bitSum & mask) >> (numExtra - 1)) | extraInMatissa;
+        }
+        else
+        {
+            mantissa = extraInMatissa >> (-1 * numMove);
+        }
+    }
+    else
+    {
+        mantissa = bitSum;
+    }
+    uint32_t bitFloat = exponent | mantissa;
+    return reinterpret_cast<float&>(bitFloat);
+}
+
+template <typename T, typename HisT, bool isDeterministic = false>
+__device__ constexpr void calcAtomicAdd(HisT* dst, T value)
+{
+    if constexpr (isDeterministic)
+    {
+        uint32_t mantissa = calcMantissa(value);
+        if constexpr (std::is_same_v<T, half>)
+        {
+            atomicAdd(dst, mantissa);
+        }
+        else
+        {
+            // Have to use reinterpret_cast() to convert uint64_t to "unsigned long long"
+            // Otherwise, the complication will report the follow error:
+            //"error: no instance of overloaded function "atomicAdd" matches the argument list
+            // argument types are: (uint64_t *, uint64_t)"
+            atomicAdd(reinterpret_cast<unsigned long long*>(dst), static_cast<HisT>(mantissa));
+        }
+    }
+    else
+    {
+        if constexpr (std::is_same_v<T, half>)
+        {
+            atomicAdd(dst, __half2float(value));
+        }
+        else
+        {
+            atomicAdd(dst, value);
+        }
+    }
 }
 
 /**
@@ -166,7 +386,7 @@ __device__ T twiddleOut(typename cub::Traits<T>::UnsignedBits bits, bool selectM
  * Find the bucket based on the radix
  */
 template <typename T, int BitsPerPass>
-__device__ int calcBucket(T x, int startBit, unsigned mask, bool selectMin)
+__device__ int calcBucket(T x, int startBit, uint32_t mask, bool selectMin)
 {
     static_assert(BitsPerPass <= sizeof(int) * 8 - 1, "BitsPerPass is too large that the result type could not be int");
     return (twiddleIn(x, selectMin) >> startBit) & mask;
@@ -308,19 +528,18 @@ __device__ void vectorizedProcess(size_t threadRank, size_t numThreads, T const*
  * Fused filtering of the current pass and building histogram for the next pass (see steps 4 & 1 in `airTopPSampling`
  * description).
  */
-template <typename T, typename IdxT, typename AccT, int BitsPerPass>
+template <typename T, typename IdxT, typename AccT, typename HisT, int BitsPerPass, bool isDeterministic = false>
 __device__ __forceinline__ void filterAndHistogram(T const* inBuf, IdxT const* inIdxBuf, T* outBuf, IdxT* outIdxBuf,
-    int previousLen, Counter<T, IdxT, AccT>* counter, AccT* histogram, IdxT* countHistogram, int pass,
-    float* outputLogProbs, float* cumLogProbs, IdxT** ids, IdxT const* endIds, IdxT* sequenceLengths,
-    FinishedState* finishedOutput, int const batchId, int maxBatchSize, bool earlyStop)
+    int previousLen, Counter<T, IdxT, AccT>* counter, HisT* histogram, IdxT* countHistogram, HisT* histogramSmem,
+    IdxT* countHistogramSmem, int pass, float* outputLogProbs, float* cumLogProbs, IdxT** ids, IdxT const* endIds,
+    IdxT* sequenceLengths, FinishedState* finishedOutput, int const batchId, int maxBatchSize, bool earlyStop)
 {
     static_assert(std::is_same_v<T, half> | std::is_same_v<T, float>, "T needs to be either half or float");
     static_assert(std::is_same_v<AccT, float>, "AccT needs to be float");
 
     int constexpr numBuckets = calcNumBuckets<BitsPerPass>();
     bool constexpr selectMin = false;
-    __shared__ AccT histogramSmem[numBuckets];
-    __shared__ IdxT countHistogramSmem[numBuckets];
+
     for (IdxT i = threadIdx.x; i < numBuckets; i += blockDim.x)
     {
         histogramSmem[i] = 0;
@@ -328,8 +547,8 @@ __device__ __forceinline__ void filterAndHistogram(T const* inBuf, IdxT const* i
     }
     __syncthreads();
 
-    int const startBit = calcsStartBit<T, BitsPerPass>(pass);
-    unsigned const mask = calcMask<T, BitsPerPass>(pass);
+    int const startBit = calcStartBit<T, BitsPerPass>(pass);
+    uint32_t const mask = calcMask<T, BitsPerPass>(pass);
 
     if (pass == 0)
     {
@@ -337,18 +556,10 @@ __device__ __forceinline__ void filterAndHistogram(T const* inBuf, IdxT const* i
         // parallel, i.e. the work is split along the input (both, in batches and
         // chunks of a single row). Later, the histograms are merged using
         // atomicAdd.
-        auto f = [selectMin, startBit, mask](T value, IdxT)
+        auto f = [selectMin, startBit, mask, histogramSmem, countHistogramSmem](T value, IdxT)
         {
             int bucket = calcBucket<T, BitsPerPass>(value, startBit, mask, selectMin);
-            if constexpr (std::is_same_v<T, half>)
-            {
-                atomicAdd(histogramSmem + bucket, __half2float(value));
-            }
-            else
-            {
-                atomicAdd(histogramSmem + bucket, value);
-            }
-
+            calcAtomicAdd<T, HisT, isDeterministic>(histogramSmem + bucket, value);
             atomicAdd(countHistogramSmem + bucket, static_cast<IdxT>(1));
         };
         vectorizedProcess(static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x,
@@ -358,23 +569,33 @@ __device__ __forceinline__ void filterAndHistogram(T const* inBuf, IdxT const* i
     {
         IdxT* pFilterCnt = &counter->filterCnt;
         auto const kthValueBits = counter->kthValueBits;
-        int const previousStartBit = calcsStartBit<T, BitsPerPass>(pass - 1);
+        int const previousStartBit = calcStartBit<T, BitsPerPass>(pass - 1);
 
         // See the remark above on the distributed execution of `f` using
         // vectorizedProcess.
         auto f = [inIdxBuf, outBuf, outIdxBuf, selectMin, startBit, mask, previousStartBit, kthValueBits, pFilterCnt,
-                     outputLogProbs, cumLogProbs, ids, endIds, sequenceLengths, finishedOutput, batchId, maxBatchSize,
-                     earlyStop](T value, IdxT i)
+                     histogramSmem, countHistogramSmem, outputLogProbs, cumLogProbs, ids, endIds, sequenceLengths,
+                     finishedOutput, batchId, maxBatchSize, earlyStop](T value, IdxT i)
         {
             auto const previousBits = (twiddleIn(value, selectMin) >> previousStartBit) << previousStartBit;
             if (previousBits == kthValueBits)
             {
                 if (earlyStop)
                 {
+
                     int const currentStep = sequenceLengths[batchId];
                     IdxT index = inIdxBuf ? inIdxBuf[i] : i;
                     ids[batchId][currentStep] = index;
-                    epilogue(value, index, outputLogProbs, cumLogProbs, endIds, sequenceLengths, finishedOutput,
+                    float valueFloat;
+                    if constexpr (std::is_same_v<T, half>)
+                    {
+                        valueFloat = __half2float(value);
+                    }
+                    else
+                    {
+                        valueFloat = value;
+                    }
+                    epilogue(valueFloat, index, outputLogProbs, cumLogProbs, endIds, sequenceLengths, finishedOutput,
                         batchId, maxBatchSize);
                 }
                 if (outBuf)
@@ -385,15 +606,7 @@ __device__ __forceinline__ void filterAndHistogram(T const* inBuf, IdxT const* i
                 }
 
                 int bucket = calcBucket<T, BitsPerPass>(value, startBit, mask, selectMin);
-                if constexpr (std::is_same_v<T, half>)
-                {
-                    atomicAdd(histogramSmem + bucket, __half2float(value));
-                }
-                else
-                {
-                    atomicAdd(histogramSmem + bucket, value);
-                }
-
+                calcAtomicAdd<T, HisT, isDeterministic>(histogramSmem + bucket, value);
                 atomicAdd(countHistogramSmem + bucket, static_cast<IdxT>(1));
             }
         };
@@ -412,7 +625,18 @@ __device__ __forceinline__ void filterAndHistogram(T const* inBuf, IdxT const* i
     {
         if (histogramSmem[i] != 0)
         {
-            atomicAdd(histogram + i, histogramSmem[i]);
+            if constexpr ((isDeterministic) && (std::is_same_v<T, float>) )
+            {
+                // Have to use reinterpret_cast() to convert uint64_t to "unsigned long long"
+                // Otherwise, the complication will report the follow error:
+                //"error: no instance of overloaded function "atomicAdd" matches the argument list
+                // argument types are: (uint64_t *, uint64_t)"
+                atomicAdd(reinterpret_cast<unsigned long long*>(histogram + i), histogramSmem[i]);
+            }
+            else
+            {
+                atomicAdd(histogram + i, histogramSmem[i]);
+            }
         }
         if (countHistogramSmem[i] != 0)
         {
@@ -425,7 +649,7 @@ __device__ __forceinline__ void filterAndHistogram(T const* inBuf, IdxT const* i
  *  Replace histogram with its own prefix sum (step 2 in `airTopPSampling` description)
  */
 template <typename IdxT, int BitsPerPass, int BlockSize>
-__device__ void scan(IdxT volatile* histogram)
+__device__ void scan(IdxT volatile* histogram, IdxT* histogramOut)
 {
     int constexpr numBuckets = calcNumBuckets<BitsPerPass>();
     if constexpr (numBuckets >= BlockSize)
@@ -451,7 +675,7 @@ __device__ void scan(IdxT volatile* histogram)
         BlockScan(tempStorage.scan).InclusiveSum(threadData, threadData);
         __syncthreads();
 
-        BlockStore(tempStorage.store).Store(histogram, threadData);
+        BlockStore(tempStorage.store).Store(histogramOut, threadData);
     }
     else
     {
@@ -469,7 +693,7 @@ __device__ void scan(IdxT volatile* histogram)
 
         if (threadIdx.x < numBuckets)
         {
-            histogram[threadIdx.x] = threadData;
+            histogramOut[threadIdx.x] = threadData;
         }
     }
 }
@@ -498,7 +722,7 @@ __device__ void chooseBucket(
                 counter->sum = sum - prev;        // how many values still are there to find
                 counter->len = countHistogram[i]; // cur - prev; // number of values in next pass
                 typename cub::Traits<T>::UnsignedBits bucket = i;
-                int startBit = calcsStartBit<T, BitsPerPass>(pass);
+                int startBit = calcStartBit<T, BitsPerPass>(pass);
                 counter->kthValueBits |= bucket << startBit;
             }
         }
@@ -543,34 +767,159 @@ __device__ void epilogue(T const value, IdxT const index, float* outputLogProbs,
  *  Find the target element.
  *  (steps 4 in `airTopPSampling` description)
  */
-template <typename T, typename IdxT, typename AccT, int BitsPerPass>
+template <typename T, typename IdxT, typename AccT, int BitsPerPass, int BlockSize, bool isDeterministic = false>
 __device__ void lastFilter(T const* inBuf, IdxT const* inIdxBuf, IdxT currentLen, Counter<T, IdxT, AccT>* counter,
     float* outputLogProbs, float* cumLogProbs, IdxT** ids, IdxT const* endIds, IdxT* sequenceLengths,
-    FinishedState* finishedOutput, int const batchId, int maxBatchSize)
+    FinishedState* finishedOutput, int const batchId, int maxBatchSize, IdxT* lastIdxBuf, IdxT* countHistogram)
 {
     auto const kthValueBits = counter->kthValueBits;
     auto const equalValue = twiddleOut<T>(kthValueBits, false);
     int const currentStep = sequenceLengths[batchId];
     IdxT* outIdx = &ids[batchId][currentStep];
-    if (threadIdx.x == 0)
-    {
-        *outIdx = cuda::std::numeric_limits<IdxT>::max();
-    }
-    __syncthreads();
 
-    for (IdxT i = threadIdx.x; i < currentLen; i += blockDim.x)
+    float equalValueFloat;
+    if constexpr (std::is_same_v<T, half>)
     {
-        if (inBuf[i] == equalValue)
+        equalValueFloat = __half2float(equalValue);
+    }
+    else
+    {
+        equalValueFloat = equalValue;
+    }
+    if constexpr (!isDeterministic)
+    {
+
+        for (IdxT i = threadIdx.x; i < currentLen; i += blockDim.x)
         {
-            atomicMin(outIdx, inIdxBuf ? inIdxBuf[i] : i);
+            if (inBuf[i] == equalValue)
+            {
+                *outIdx = inIdxBuf ? inIdxBuf[i] : i;
+                break;
+            }
+        }
+    }
+    else
+    {
+        IdxT const bufLen = calcBufLen<T>(counter->oriLen);
+        IdxT neededNumOfKth = counter->sum > 0 ? ceil(counter->sum / equalValueFloat) : 1;
+
+        if (counter->len < neededNumOfKth)
+        {
+            neededNumOfKth = counter->len;
+        }
+
+        if (neededNumOfKth < bufLen)
+        {
+            for (int i = threadIdx.x; i < neededNumOfKth; i += blockDim.x)
+            {
+                lastIdxBuf[i] = cuda::std::numeric_limits<IdxT>::max();
+            }
+            __threadfence_block();
+            __syncthreads();
+
+            cuda::atomic_ref<IdxT, cuda::thread_scope_block> refLast(lastIdxBuf[neededNumOfKth - 1]);
+
+            for (IdxT i = threadIdx.x; i < currentLen; i += blockDim.x)
+            {
+                if (inBuf[i] == equalValue)
+                {
+                    IdxT newIdx = inIdxBuf ? inIdxBuf[i] : i;
+                    if (newIdx < refLast.load(cuda::memory_order_relaxed))
+                    {
+                        for (int j = 0; j < neededNumOfKth; j++)
+                        {
+                            IdxT preIdx = atomicMin_block(&lastIdxBuf[j], newIdx);
+                            if (preIdx > newIdx)
+                            {
+                                newIdx = preIdx;
+                            }
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+            if (threadIdx.x == 0)
+            {
+                *outIdx = refLast.load(cuda::memory_order_relaxed);
+            }
+        }
+        else
+        {
+            int numPass = calcNumPasses<IdxT, BitsPerPass>();
+            int constexpr numBuckets = calcNumBuckets<BitsPerPass>();
+            __shared__ typename cub::Traits<IdxT>::UnsignedBits kthValueBitsIdx;
+            __shared__ IdxT neededNumOfKthSmem;
+            if (threadIdx.x == 0)
+            {
+                kthValueBitsIdx = 0;
+                neededNumOfKthSmem = neededNumOfKth;
+            }
+            __syncthreads();
+            for (int pass = 0; pass < numPass; pass++)
+            {
+                for (IdxT i = threadIdx.x; i < numBuckets; i += blockDim.x)
+                {
+                    countHistogram[i] = 0;
+                }
+                __syncthreads();
+
+                int preNeededNumOfKth = neededNumOfKthSmem;
+                int const startBit = calcStartBit<IdxT, BitsPerPass>(pass);
+                uint32_t const mask = calcMask<IdxT, BitsPerPass>(pass);
+                for (IdxT j = threadIdx.x; j < currentLen; j += blockDim.x)
+                {
+                    if (inBuf[j] == equalValue)
+                    {
+                        IdxT newIdx = inIdxBuf ? inIdxBuf[j] : j;
+                        bool isQualified = (pass == 0) ? true : false;
+                        if (pass > 0)
+                        {
+                            int const previousStartBit = calcStartBit<IdxT, BitsPerPass>(pass - 1);
+                            auto const previousBits = (twiddleIn(newIdx, true) >> previousStartBit) << previousStartBit;
+                            if (previousBits == kthValueBitsIdx)
+                            {
+                                isQualified = true;
+                            }
+                        }
+                        if (isQualified)
+                        {
+                            int bucket = calcBucket<IdxT, BitsPerPass>(newIdx, startBit, mask, true);
+                            atomicAdd(countHistogram + bucket, static_cast<IdxT>(1));
+                        }
+                    }
+                } // end histogram
+                __syncthreads();
+
+                scan<IdxT, BitsPerPass, BlockSize>(countHistogram, countHistogram); // prefix sum
+                __syncthreads();
+                // Locate the bucket
+                for (int i = threadIdx.x; i < numBuckets; i += blockDim.x)
+                {
+                    IdxT prev = (i == 0) ? 0 : countHistogram[i - 1];
+                    IdxT cur = countHistogram[i];
+                    // one and only one thread will satisfy this condition, so counter is
+                    // written by only one thread
+                    if (prev < preNeededNumOfKth && preNeededNumOfKth <= cur)
+                    {
+                        neededNumOfKthSmem = neededNumOfKthSmem - prev;
+                        typename cub::Traits<IdxT>::UnsignedBits bucket = i;
+                        kthValueBitsIdx |= bucket << startBit;
+                    }
+                }
+                __syncthreads();
+            }
+            if (threadIdx.x == 0)
+            {
+                *outIdx = twiddleOut<IdxT>(kthValueBitsIdx, true);
+            }
         }
     }
     __syncthreads();
 
     if (threadIdx.x == 0)
     {
-        epilogue(equalValue, *outIdx, outputLogProbs, cumLogProbs, endIds, sequenceLengths, finishedOutput, batchId,
-            maxBatchSize);
+        epilogue(equalValueFloat, *outIdx, outputLogProbs, cumLogProbs, endIds, sequenceLengths, finishedOutput,
+            batchId, maxBatchSize);
     }
 }
 
@@ -611,8 +960,9 @@ __device__ void lastFilter(T const* inBuf, IdxT const* inIdxBuf, IdxT currentLen
  * rather than from `in_buf`. The benefit is that we can save the cost of writing candidates and
  * their indices.
  */
-template <typename T, typename IdxT, typename AccT, int BitsPerPass, int BlockSize, bool is_fused_filter = false>
-__global__ void airTopPSampling(Counter<T, IdxT, AccT>* counters, AccT* histograms, IdxT* countHistograms, IdxT** ids,
+template <typename T, typename IdxT, typename AccT, typename HisT, int BitsPerPass, int BlockSize,
+    bool isFusedFilter = false, bool isDeterministic = false>
+__global__ void airTopPSampling(Counter<T, IdxT, AccT>* counters, HisT* histograms, IdxT* countHistograms, IdxT** ids,
     int* sequenceLengths, FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs,
     float* outputLogProbs, IdxT const* endIds, int const maxBatchSize, bool const* skipDecode, int const pass, T* buf1,
     IdxT* idxBuf1, T* buf2, IdxT* idxBuf2, int32_t const* batchSlots)
@@ -699,10 +1049,13 @@ __global__ void airTopPSampling(Counter<T, IdxT, AccT>* counters, AccT* histogra
     int constexpr numBuckets = calcNumBuckets<BitsPerPass>();
     auto histogram = histograms + batchId * numBuckets;
     auto countHistogram = countHistograms + batchId * numBuckets;
+    __shared__ HisT histogramSmem[numBuckets];
+    __shared__ IdxT countHistogramSmem[numBuckets];
+    AccT* histValueSmem = reinterpret_cast<AccT*>(histogramSmem);
 
-    filterAndHistogram<T, IdxT, AccT, BitsPerPass>(inBuf, inIdxBuf, outBuf, outIdxBuf, previousLen, counter, histogram,
-        countHistogram, pass, outputLogProbs, cumLogProbs, ids, endIds, sequenceLengths, finishedOutput, batchSlot,
-        maxBatchSize, earlyStop);
+    filterAndHistogram<T, IdxT, AccT, HisT, BitsPerPass, isDeterministic>(inBuf, inIdxBuf, outBuf, outIdxBuf,
+        previousLen, counter, histogram, countHistogram, histogramSmem, countHistogramSmem, pass, outputLogProbs,
+        cumLogProbs, ids, endIds, sequenceLengths, finishedOutput, batchSlot, maxBatchSize, earlyStop);
 
     __syncthreads();
     __threadfence();
@@ -710,7 +1063,7 @@ __global__ void airTopPSampling(Counter<T, IdxT, AccT>* counters, AccT* histogra
     bool isLastBlock = false;
     if (threadIdx.x == 0)
     {
-        unsigned int finished = atomicInc(&counter->finishedBlockCnt, gridDim.x - 1);
+        uint32_t finished = atomicInc(&counter->finishedBlockCnt, gridDim.x - 1);
         isLastBlock = (finished == (gridDim.x - 1));
     }
 
@@ -718,9 +1071,70 @@ __global__ void airTopPSampling(Counter<T, IdxT, AccT>* counters, AccT* histogra
     {
         if (earlyStop)
         {
+            if (threadIdx.x == 0)
+            {
+                // avoid duplicated epilgue()
+                counter->previousLen = 0;
+                counter->len = 0;
+            }
             return;
         }
 
+        if constexpr (isDeterministic)
+        {
+            for (int i = threadIdx.x; i < numBuckets; i += blockDim.x)
+            {
+                uint64_t value = (uint64_t) histogram[i];
+                IdxT count = countHistogram[i];
+
+                if (count != 0)
+                {
+                    uint32_t startBit = calcStartBit<T, BitsPerPass>(pass);
+                    float bucketValueFloat;
+                    if constexpr (std::is_same_v<T, half>)
+                    {
+                        // To acquire the summation in single-precision format, we need to get the original exponent
+                        // value first counter->kthValueBits stores the bits selected by previous pass, which contains
+                        // the bit corresponds to the exponent value
+                        uint16_t bucketValue = counter->kthValueBits;
+
+                        // For the first pass, different bucket indices correspond to different exponents.
+                        // The bucket index can be used to deduce the exponent.
+                        if (pass == 0)
+                        {
+                            // Right shift the bucket index with startBit bits (5 bits for half-precision when pass==0),
+                            // so that the bucket index fills the bit related to exponent.
+                            bucketValue = i << startBit;
+                        }
+                        uint32_t exponent = calcExponent(twiddleOut<T>(bucketValue, false));
+                        uint32_t mask = (1u << (sizeof(half) * CHAR_BIT - 1)) - 1;
+                        uint32_t sign = exponent & (~mask);
+                        exponent = exponent & mask;
+                        float tmp = calcHalfValue((uint32_t) count, exponent, sign, value);
+                        histValueSmem[i] = tmp;
+                    }
+                    else
+                    {
+                        // To acquire the summation in single-precision format, we need to get the original exponent
+                        // value first
+                        uint32_t bucketValue = counter->kthValueBits;
+                        if (pass == 0)
+                        {
+                            // Right shift the bucket index with startBit bits (22 bits for single-precision when
+                            // pass==0), so that the bucket index fills the bit related to exponent.
+                            bucketValue = i << startBit;
+                        }
+                        bucketValueFloat = twiddleOut<T>(bucketValue, false);
+                        uint32_t exponent = calcExponent(bucketValueFloat);
+                        histValueSmem[i] = calcFloatValue((uint32_t) count, exponent, value);
+                    }
+                }
+                else
+                {
+                    histValueSmem[i] = 0.0f;
+                }
+            }
+        }
         __shared__ IdxT maxBucket;
         if (pass > 0)
         {
@@ -743,21 +1157,22 @@ __global__ void airTopPSampling(Counter<T, IdxT, AccT>* counters, AccT* histogra
             __syncthreads();
         }
 
-        scan<AccT, BitsPerPass, BlockSize>(histogram);
+        scan<AccT, BitsPerPass, BlockSize>(
+            isDeterministic ? histValueSmem : reinterpret_cast<AccT*>(histogram), histValueSmem);
         __syncthreads();
         if (pass == 0)
         {
-            currentSum = histogram[numBuckets - 1] * counter->p;
+            currentSum = histValueSmem[numBuckets - 1] * counter->p;
         }
         else
         {
-            if (currentSum > histogram[maxBucket])
+            if (currentSum > histValueSmem[maxBucket])
             {
-                currentSum = histogram[maxBucket];
+                currentSum = histValueSmem[maxBucket];
             }
         }
 
-        chooseBucket<T, IdxT, AccT, BitsPerPass>(counter, histogram, countHistogram, currentSum, pass);
+        chooseBucket<T, IdxT, AccT, BitsPerPass>(counter, histValueSmem, countHistogram, currentSum, pass);
         __syncthreads();
 
         int constexpr numPasses = calcNumPasses<T, BitsPerPass>();
@@ -779,12 +1194,18 @@ __global__ void airTopPSampling(Counter<T, IdxT, AccT>* counters, AccT* histogra
 
         if (pass == numPasses - 1)
         {
-            if constexpr (is_fused_filter)
+            // Used when isDeterministic==true
+            // idxBuf1 and idxBuf2 are ping-pong buffers used in previous iterations to store candidates.
+            // In the last pass (pass==2 for single-precision and pass==1 for half-precision),
+            // we reuse the buffer didn't store the candidates (idxBuf1 for single-precision and idxBuf2 for
+            // half-precision) to help find the correct index of the result.
+            IdxT* lastIdxBuf = (pass % 2 == 0) ? idxBuf1 + bufLen * batchId : idxBuf2 + bufLen * batchId;
+            if constexpr (isFusedFilter)
             {
-                lastFilter<T, IdxT, AccT, BitsPerPass>(outBuf ? outBuf : inBuf, outIdxBuf ? outIdxBuf : inIdxBuf,
-                    outBuf ? currentLen : counter->oriLen, counter, outputLogProbs, cumLogProbs, ids, endIds,
-                    sequenceLengths, finishedOutput, batchSlot, maxBatchSize);
-
+                lastFilter<T, IdxT, AccT, BitsPerPass, BlockSize, isDeterministic>(outBuf ? outBuf : inBuf,
+                    outIdxBuf ? outIdxBuf : inIdxBuf, outBuf ? currentLen : counter->oriLen, counter, outputLogProbs,
+                    cumLogProbs, ids, endIds, sequenceLengths, finishedOutput, batchSlot, maxBatchSize, lastIdxBuf,
+                    countHistogramSmem);
                 __syncthreads();
             }
         }
@@ -794,9 +1215,9 @@ __global__ void airTopPSampling(Counter<T, IdxT, AccT>* counters, AccT* histogra
 /**
  * Initialize the Counter<T, IdxT, AccT> and the histogram and countHistogram.
  */
-template <typename T, typename IdxT, typename AccT, int BitsPerPass, int BlockSize>
+template <typename T, typename IdxT, typename AccT, typename HisT, int BitsPerPass, int BlockSize>
 __global__ void airTopPInitialize(Counter<T, IdxT, AccT>* counters, int const batchSize, int const len, T const* in,
-    IdxT const* inIdx, float const topP, float const* topPs, curandState_t* curandstate, AccT* histograms,
+    IdxT const* inIdx, float const topP, float const* topPs, curandState_t* curandstate, HisT* histograms,
     IdxT* countHistograms, int32_t const* batchSlots)
 {
     auto const batchIdx = blockIdx.x;
@@ -828,7 +1249,7 @@ __global__ void airTopPInitialize(Counter<T, IdxT, AccT>* counters, int const ba
     }
 
     int constexpr numBuckets = calcNumBuckets<BitsPerPass>();
-    AccT* histogram = histograms + batchIdx * numBuckets;
+    HisT* histogram = histograms + batchIdx * numBuckets;
     for (int i = threadIdx.x; i < numBuckets; i += BlockSize)
     {
         histogram[i] = 0;
@@ -848,15 +1269,28 @@ __global__ void airTopPInitialize(Counter<T, IdxT, AccT>* counters, int const ba
 /*
  *  Calculate the number of blocks based on the batchSize and len to avoid tailing effect.
  */
-template <typename T, typename IdxT, typename AccT, int BitsPerPass, int BlockSize>
-unsigned calcAirTopPBlockNum(int batchSize, IdxT len, int smCnt)
+template <typename T>
+uint32_t calcAirTopPBlockNum(int batchSize, int len, int smCnt, bool isDeterministic)
 {
+    int constexpr BitsPerPass = 11;
+    int constexpr BlockSize = 512;
     int constexpr VECTORIZED_READ_SIZE = 16;
     static_assert(VECTORIZED_READ_SIZE / sizeof(T) >= 1);
+    TLLM_CHECK_WITH_INFO(
+        smCnt > 0, "AIR Top-P needs the count of multiprocessor to calculate the proper block dimension settings");
 
     int activeBlocks;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &activeBlocks, airTopPSampling<T, IdxT, AccT, BitsPerPass, BlockSize, false>, BlockSize, 0);
+    if (isDeterministic)
+    {
+        using HisT = std::conditional_t<std::is_same_v<T, float>, uint64_t, uint32_t>;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &activeBlocks, airTopPSampling<T, IdxT, AccT, HisT, BitsPerPass, BlockSize, false, true>, BlockSize, 0);
+    }
+    else
+    {
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &activeBlocks, airTopPSampling<T, IdxT, AccT, float, BitsPerPass, BlockSize, false, false>, BlockSize, 0);
+    }
     activeBlocks *= smCnt;
 
     IdxT bestNumBlocks = 0;
@@ -892,15 +1326,17 @@ unsigned calcAirTopPBlockNum(int batchSize, IdxT len, int smCnt)
     return bestNumBlocks;
 }
 
-template <typename T>
+template <typename T, bool isDeterministic = false>
 [[nodiscard]] std::vector<size_t> getAirTopPWorkspaceSizes(int32_t batchSize, int32_t vocabSize)
 {
+    using HisT
+        = std::conditional_t<isDeterministic, std::conditional_t<std::is_same_v<T, float>, uint64_t, uint32_t>, float>;
     int constexpr BitsPerPass = 11;
     int constexpr numBuckets = calcNumBuckets<BitsPerPass>();
     IdxT const bufLen = calcBufLen<T>(vocabSize);
 
     size_t countersSize = sizeof(Counter<T, IdxT, AccT>) * batchSize;
-    size_t histogramsSize = sizeof(AccT) * numBuckets * batchSize;
+    size_t histogramsSize = sizeof(HisT) * numBuckets * batchSize;
     size_t countHistogramsSize = sizeof(IdxT) * numBuckets * batchSize;
     size_t buf1Size = sizeof(T) * bufLen * batchSize;
     size_t idxBuf1Size = sizeof(IdxT) * bufLen * batchSize;
@@ -913,18 +1349,27 @@ template <typename T>
     return sizes;
 }
 
-template std::vector<size_t> getAirTopPWorkspaceSizes<float>(int32_t batchSize, int32_t vocabSize);
-template std::vector<size_t> getAirTopPWorkspaceSizes<half>(int32_t batchSize, int32_t vocabSize);
+template std::vector<size_t> getAirTopPWorkspaceSizes<float, true>(int32_t batchSize, int32_t vocabSize);
+template std::vector<size_t> getAirTopPWorkspaceSizes<float, false>(int32_t batchSize, int32_t vocabSize);
+template std::vector<size_t> getAirTopPWorkspaceSizes<half, true>(int32_t batchSize, int32_t vocabSize);
+template std::vector<size_t> getAirTopPWorkspaceSizes<half, false>(int32_t batchSize, int32_t vocabSize);
 
-template <typename T>
-void invokeBatchAirTopPSampling(void* workspace, int** outputIds, int* sequenceLength,
+template <typename T, bool isDeterministic = false>
+void invokeAirTopPSamplingWithDeterministicPara(void* workspace, int** outputIds, int* sequenceLength,
     FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
     T const* logProbs, curandState_t* curandstate, int const batchSize, int maxBatchSize, size_t const vocabSizePadded,
     int const* endIds, float const maxTopP, float const* topPs, cudaStream_t stream, int blockNum,
     bool const* skipDecode, int32_t const* batchSlots)
 {
+    using HisT
+        = std::conditional_t<isDeterministic, std::conditional_t<std::is_same_v<T, float>, uint64_t, uint32_t>, float>;
+
     static_assert(std::is_same_v<T, half> | std::is_same_v<T, float>, "T needs to be either half or float");
     static_assert(std::is_same_v<AccT, float>, "AccT needs to be float");
+    TLLM_CHECK_WITH_INFO(((std::is_same_v<T, half>) &&(vocabSizePadded < pow(2, 22)) && isDeterministic)
+            || ((std::is_same_v<T, float>) &&(vocabSizePadded < pow(2, 41)) && isDeterministic) || (~isDeterministic),
+        "For Deterministic AIR Top-P, the maximum vocab_size we support is pow(2,22) for half-precision and pow(2,41) "
+        "for single-precision");
 
     IdxT const vocabSize = vocabSizePadded;
     int constexpr BitsPerPass = 11;
@@ -933,14 +1378,14 @@ void invokeBatchAirTopPSampling(void* workspace, int** outputIds, int* sequenceL
     int constexpr THREADS_PER_CTA_TOP_P_INIT = 1024;
 
     Counter<T, IdxT, AccT>* counters = nullptr;
-    AccT* histograms = nullptr;
+    HisT* histograms = nullptr;
     IdxT* countHistograms = nullptr;
     T* buf1 = nullptr;
     IdxT* idxBuf1 = nullptr;
     T* buf2 = nullptr;
     IdxT* idxBuf2 = nullptr;
 
-    auto const workspaceSizes = getAirTopPWorkspaceSizes<T>(batchSize, vocabSize);
+    auto const workspaceSizes = getAirTopPWorkspaceSizes<T, isDeterministic>(batchSize, vocabSize);
 
     std::vector<void*> alignedPointers;
     calcAlignedPointers(alignedPointers, workspace, workspaceSizes);
@@ -952,27 +1397,46 @@ void invokeBatchAirTopPSampling(void* workspace, int** outputIds, int* sequenceL
     buf2 = static_cast<decltype(buf2)>(alignedPointers[5]);
     idxBuf2 = static_cast<decltype(idxBuf2)>(alignedPointers[6]);
 
-    airTopPInitialize<T, IdxT, AccT, BitsPerPass, THREADS_PER_CTA_TOP_P_INIT>
+    airTopPInitialize<T, IdxT, AccT, HisT, BitsPerPass, THREADS_PER_CTA_TOP_P_INIT>
         <<<batchSize, THREADS_PER_CTA_TOP_P_INIT, 0, stream>>>(counters, batchSize, vocabSize, logProbs, nullptr,
             maxTopP, topPs, curandstate, histograms, countHistograms, batchSlots);
-    sync_check_cuda_error();
 
     dim3 grid(blockNum, batchSize);
     // Sample with Top P given sorted tokens
     int constexpr numPasses = calcNumPasses<T, BitsPerPass>();
-    auto kernel = airTopPSampling<T, IdxT, AccT, BitsPerPass, SAMPLING_BLOCK_SIZE, false>;
+    auto kernel = airTopPSampling<T, IdxT, AccT, HisT, BitsPerPass, SAMPLING_BLOCK_SIZE, false, isDeterministic>;
 
     for (int pass = 0; pass < numPasses; ++pass)
     {
         if (pass == numPasses - 1)
         {
-            kernel = airTopPSampling<T, IdxT, AccT, BitsPerPass, SAMPLING_BLOCK_SIZE, true>;
+            kernel = airTopPSampling<T, IdxT, AccT, HisT, BitsPerPass, SAMPLING_BLOCK_SIZE, true, isDeterministic>;
         }
 
         kernel<<<grid, SAMPLING_BLOCK_SIZE, 0, stream>>>(counters, histograms, countHistograms, outputIds,
             sequenceLength, finishedInput, finishedOutput, cumLogProbs, outputLogProbs, endIds, maxBatchSize,
             skipDecode, pass, buf1, idxBuf1, buf2, idxBuf2, batchSlots);
-        sync_check_cuda_error();
+    }
+}
+
+template <typename T>
+void invokeBatchAirTopPSampling(void* workspace, int** outputIds, int* sequenceLength,
+    FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
+    T const* logProbs, curandState_t* curandstate, int const batchSize, int maxBatchSize, size_t const vocabSizePadded,
+    int const* endIds, float const maxTopP, float const* topPs, cudaStream_t stream, int blockNum,
+    bool const* skipDecode, int32_t const* batchSlots, bool isDeterministic)
+{
+    if (isDeterministic)
+    {
+        invokeAirTopPSamplingWithDeterministicPara<T, true>(workspace, outputIds, sequenceLength, finishedInput,
+            finishedOutput, cumLogProbs, outputLogProbs, logProbs, curandstate, batchSize, maxBatchSize,
+            vocabSizePadded, endIds, maxTopP, topPs, stream, blockNum, skipDecode, batchSlots);
+    }
+    else
+    {
+        invokeAirTopPSamplingWithDeterministicPara<T, false>(workspace, outputIds, sequenceLength, finishedInput,
+            finishedOutput, cumLogProbs, outputLogProbs, logProbs, curandstate, batchSize, maxBatchSize,
+            vocabSizePadded, endIds, maxTopP, topPs, stream, blockNum, skipDecode, batchSlots);
     }
 }
 
@@ -980,49 +1444,57 @@ template void invokeBatchAirTopPSampling(void* workspace, int** outputIds, int* 
     FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
     float const* logProbs, curandState_t* curandstate, int const batchSize, int maxBatchSize,
     size_t const vocabSizePadded, int const* endIds, float const maxTopP, float const* topPs, cudaStream_t stream,
-    int blockNum, bool const* skipDecode, int32_t const* batchSlots);
+    int blockNum, bool const* skipDecode, int32_t const* batchSlots, bool isDeterministic);
 
 template void invokeBatchAirTopPSampling(void* workspace, int** outputIds, int* sequenceLength,
     FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
     half const* logProbs, curandState_t* curandstate, int const batchSize, int maxBatchSize,
     size_t const vocabSizePadded, int const* endIds, float const maxTopP, float const* topPs, cudaStream_t stream,
-    int blockNum, bool const* skipDecode, int32_t const* batchSlots);
+    int blockNum, bool const* skipDecode, int32_t const* batchSlots, bool isDeterministic);
 
 template <typename T>
 void invokeAirTopPSampling(void* workspace, int** outputIds, int* sequenceLength, FinishedState const* finishedInput,
     FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs, T const* logProbs,
     curandState_t* curandstate, int const batchSize, int maxBatchSize, size_t const vocabSizePadded, int const* endIds,
-    float const topP, cudaStream_t stream, int blockNum, bool const* skipDecode, int32_t const* batchSlots)
+    float const topP, cudaStream_t stream, int blockNum, bool const* skipDecode, int32_t const* batchSlots,
+    bool isDeterministic)
 {
     invokeBatchAirTopPSampling(workspace, outputIds, sequenceLength, finishedInput, finishedOutput, cumLogProbs,
         outputLogProbs, logProbs, curandstate, batchSize, maxBatchSize, vocabSizePadded, endIds, topP, nullptr, stream,
-        blockNum, skipDecode, batchSlots);
+        blockNum, skipDecode, batchSlots, isDeterministic);
 }
 
 template void invokeAirTopPSampling(void* workspace, int** outputIds, int* sequenceLength,
     FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
     float const* logProbs, curandState_t* curandstate, int const batchSize, int maxBatchSize,
     size_t const vocabSizePadded, int const* endIds, float const topP, cudaStream_t stream, int blockNum,
-    bool const* skipDecode, int32_t const* batchSlots);
+    bool const* skipDecode, int32_t const* batchSlots, bool isDeterministic);
 
 template void invokeAirTopPSampling(void* workspace, int** outputIds, int* sequenceLength,
     FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
     half const* logProbs, curandState_t* curandstate, int const batchSize, int maxBatchSize,
     size_t const vocabSizePadded, int const* endIds, float const topP, cudaStream_t stream, int blockNum,
-    bool const* skipDecode, int32_t const* batchSlots);
-
-template unsigned calcAirTopPBlockNum<float, int, float>(int batchSize, int len, int smCnt);
-template unsigned calcAirTopPBlockNum<half, int, float>(int batchSize, int len, int smCnt);
+    bool const* skipDecode, int32_t const* batchSlots, bool isDeterministic);
 
 template <typename T>
-size_t getAirTopPWorkspaceSize(int32_t batchSize, int32_t vocabSizePadded)
+size_t getAirTopPWorkspaceSize(int32_t batchSize, int32_t vocabSizePadded, bool isDeterministic)
 {
-    auto const workspaceSizes = getAirTopPWorkspaceSizes<T>(batchSize, vocabSizePadded);
+    std::vector<size_t> workspaceSizes;
+    if (isDeterministic == true)
+    {
+        workspaceSizes = getAirTopPWorkspaceSizes<T, true>(batchSize, vocabSizePadded);
+    }
+    else
+    {
+        workspaceSizes = getAirTopPWorkspaceSizes<T, false>(batchSize, vocabSizePadded);
+    }
     return calcAlignedSize(workspaceSizes, 256);
 }
 
-template size_t getAirTopPWorkspaceSize<float>(int32_t batchSize, int32_t vocabSizePadded);
-template size_t getAirTopPWorkspaceSize<half>(int32_t batchSize, int32_t vocabSizePadded);
+template size_t getAirTopPWorkspaceSize<float>(int32_t batchSize, int32_t vocabSizePadded, bool isDeterministic);
+template size_t getAirTopPWorkspaceSize<half>(int32_t batchSize, int32_t vocabSizePadded, bool isDeterministic);
 
+template uint32_t calcAirTopPBlockNum<float>(int batchSize, int len, int smCnt, bool isDeterministic);
+template uint32_t calcAirTopPBlockNum<half>(int batchSize, int len, int smCnt, bool isDeterministic);
 } // namespace kernels
 } // namespace tensorrt_llm

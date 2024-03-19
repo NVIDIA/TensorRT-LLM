@@ -45,7 +45,7 @@ def build_trt_engine(img_height, img_width, output_dir, max_batch_size):
     parser = trt.OnnxParser(network, logger)
 
     with open(onnx_file, 'rb') as model:
-        if not parser.parse(model.read(), "/".join(onnx_file.split("/"))):
+        if not parser.parse(model.read(), os.path.abspath(onnx_file)):
             logger.log(trt.Logger.ERROR, "Failed parsing %s" % onnx_file)
             for error in range(parser.num_errors):
                 logger.log(trt.Logger.ERROR, parser.get_error(error))

@@ -131,7 +131,7 @@ void LoraPlugin::init()
 
     mPluginProfiler->setTranspose(mTransA, mTransB);
 
-    mGemmId = GemmIdCublas(mDims.n, mDims.k, mType, mTransA, mTransB);
+    mGemmId = GemmIdCublas(mDims.n, mDims.k, mType, mTransA, mTransB, mType);
 }
 
 void LoraPlugin::setGemmConfig()

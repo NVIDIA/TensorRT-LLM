@@ -16,7 +16,7 @@
 import math
 from dataclasses import dataclass
 
-from ..functional import (ACT2FN, Tensor, concat, selective_scan, shape, slice,
+from ..functional import (ACT2FN, Tensor, concat, gather, selective_scan, shape,
                           split)
 from ..module import Module
 from ..parameter import Parameter
@@ -92,7 +92,8 @@ class Mamba(Module):
                                gather_output=False)
 
     def forward(self, hidden_states: Tensor, conv_state: Tensor,
-                ssm_state: Tensor, host_request_types: Tensor):
+                ssm_state: Tensor, host_request_types: Tensor,
+                conv_indices: Tensor, last_token_ids: Tensor):
         '''
         Parameters:
             hidden_states: [B, L, D]
@@ -107,14 +108,10 @@ class Mamba(Module):
 
         # In context phase, conv_state is a zero tensor, and it is used for padding
         # In generation phase, conv_state is a tensor of the past x
-        slice_shape = concat([shape(x, 0), self.d_inner, self.d_conv - 1])
-        past_conv_state = slice(conv_state,
-                                concat([0, 0, shape(conv_state, 2) - 3]),
-                                slice_shape)
-        x_pad = concat([past_conv_state, x], dim=2)
+        x_pad = concat([conv_state, x], dim=2)
 
         # Update conv_state
-        conv_state = x_pad
+        conv_state = gather(x_pad, 2, conv_indices)
 
         # Convolution
         x_pad = x_pad.view(
@@ -145,6 +142,7 @@ class Mamba(Module):
                                       self.D.value,
                                       z,
                                       host_request_types,
+                                      last_token_ids,
                                       self.d_inner,
                                       self.d_state,
                                       is_variable_B=True,

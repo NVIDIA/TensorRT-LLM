@@ -80,7 +80,6 @@ __launch_bounds__(256, 1) __global__ void selective_scan_loop_kernel(SSMParamsBa
     input_t* z = reinterpret_cast<input_t*>(params.z_ptr);
     weight_t* dt_bias = reinterpret_cast<weight_t*>(params.delta_bias_ptr);
     bool dt_softplus = params.delta_softplus;
-    int num_tokens = params.seqlen;
     int num_channels = params.dim;
 
     // static const int STAGES = 12;
@@ -102,9 +101,14 @@ __launch_bounds__(256, 1) __global__ void selective_scan_loop_kernel(SSMParamsBa
     int const channel = blockIdx.x * blockDim.x + threadIdx.x;
     int const sample = blockIdx.y; // batch id
 
+    int num_tokens;
+    int start_token_idx;
+    start_token_idx = sample * params.seqlen;
+    num_tokens = params.last_token_ids_ptr[sample];
+
     int const seq_loops = (num_tokens + SEQ_UNROLL - 1) / SEQ_UNROLL;
 
-    int const input_matrix_row_id = sample * num_tokens;
+    int const input_matrix_row_id = start_token_idx;
 
     if (threadIdx.y == 1)
     {

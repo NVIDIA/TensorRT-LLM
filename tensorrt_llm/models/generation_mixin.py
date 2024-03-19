@@ -26,10 +26,10 @@ from ..plugin import current_all_reduce_helper
 class GenerationMixin:
 
     @staticmethod
-    def has_two_optimization_profiles(use_gpt_attention_plugin: bool,
-                                      use_gemm_plugin: bool,
-                                      remove_input_padding: bool,
-                                      paged_kv_cache: bool) -> bool:
+    def has_ctx_gen_opt_profiles(use_gpt_attention_plugin: bool,
+                                 use_gemm_plugin: bool,
+                                 remove_input_padding: bool,
+                                 paged_kv_cache: bool) -> bool:
         res = False
         if not use_gpt_attention_plugin or not use_gemm_plugin:
             use_in_flight_batching = use_gpt_attention_plugin and remove_input_padding and paged_kv_cache
@@ -41,6 +41,26 @@ class GenerationMixin:
         result = [1, (max_range + 1) // 2, max_range]
         return [elem + offset for elem in result]
 
+    @staticmethod
+    def split_num_tokens_range(max_num_tokens):
+        split_point = [64, 128, 256, 512, 1024]
+        num_tokens_ranges = []
+        for i, p in enumerate(split_point):
+            if i == 0 and max_num_tokens <= p:
+                return [0, max_num_tokens, max_num_tokens]
+            elif max_num_tokens <= p:
+                num_tokens_ranges.append(
+                    [split_point[i - 1], max_num_tokens, max_num_tokens])
+                return num_tokens_ranges
+            elif i == 0 and max_num_tokens > p:
+                num_tokens_ranges = [[0, 64, 64]]
+            else:
+                num_tokens_ranges.append(
+                    [split_point[i - 1], split_point[i], split_point[i]])
+        num_tokens_ranges.append(
+            [split_point[-1], max_num_tokens, max_num_tokens])
+        return num_tokens_ranges
+
     def prepare_attention_inputs(self,
                                  *,
                                  max_batch_size,
@@ -51,9 +71,10 @@ class GenerationMixin:
                                  head_size,
                                  num_layers,
                                  kv_dtype,
+                                 num_profiles=1,
+                                 enable_ctx_gen_opt_profiles=False,
                                  remove_input_padding=False,
                                  use_gpt_attention_plugin=False,
-                                 use_gemm_plugin=False,
                                  paged_kv_cache=False,
                                  tokens_per_block=64,
                                  mapping=Mapping(),
@@ -70,26 +91,21 @@ class GenerationMixin:
         _kv_cache_range_gen = default_range(max_seq_len, -1)
         _kv_cache_range = default_range(max_seq_len)
 
-        enable_two_optimization_profiles = GenerationMixin.has_two_optimization_profiles(
-            use_gpt_attention_plugin, use_gemm_plugin, remove_input_padding,
-            paged_kv_cache)
-        if enable_two_optimization_profiles:
+        if enable_ctx_gen_opt_profiles:
+            assert num_profiles == 2
             bb_range = [bb_range_cxt, bb_range_gen]
-            bs_range = [_bs_range, _bs_range]
-            beam_width_range = [_beam_width_range, _beam_width_range]
-            max_len_range = [_max_len_range, _max_len_range]
             mask_len_range = [_mask_len_ctx, _max_len_range]
             if use_gpt_attention_plugin:
                 kv_cache_range = [_kv_cache_range, _kv_cache_range]
             else:
                 kv_cache_range = [_kv_cache_range_ctx, _kv_cache_range_gen]
         else:
-            bb_range = [bb_range_gen]
-            bs_range = [_bs_range]
-            beam_width_range = [_beam_width_range]
-            max_len_range = [_max_len_range]
-            mask_len_range = [_max_len_range]
-            kv_cache_range = [_kv_cache_range]
+            bb_range = [bb_range_gen] * num_profiles
+            mask_len_range = [_max_len_range] * num_profiles
+            kv_cache_range = [_kv_cache_range] * num_profiles
+        bs_range = [_bs_range] * num_profiles
+        beam_width_range = [_beam_width_range] * num_profiles
+        max_len_range = [_max_len_range] * num_profiles
 
         num_kv_heads = (num_kv_heads + mapping.tp_size - 1) // mapping.tp_size
         layers_range = mapping.pp_layers(num_layers)
@@ -102,13 +118,10 @@ class GenerationMixin:
                 for i in layers_range:
                     kv_dim_range = OrderedDict([
                         ('batch_size_beam_width', bb_range),
-                        ('kv',
-                         [2, 2] if enable_two_optimization_profiles else [2]),
-                        ('num_heads', [num_kv_heads, num_kv_heads] if
-                         enable_two_optimization_profiles else [num_kv_heads]),
+                        ('kv', [2] * num_profiles),
+                        ('num_heads', [num_kv_heads] * num_profiles),
                         ('past_key_len', kv_cache_range),
-                        ('head_size', [head_size, head_size]
-                         if enable_two_optimization_profiles else [head_size]),
+                        ('head_size', [head_size] * num_profiles),
                     ])
                     kv = Tensor(name=f'past_key_value_{i}',
                                 dtype=kv_dtype,
@@ -116,7 +129,7 @@ class GenerationMixin:
                                 dim_range=kv_dim_range)
                     past_key_value.append(kv)
             else:
-                if enable_two_optimization_profiles:
+                if enable_ctx_gen_opt_profiles:
                     max_blocks_per_seq_range = [
                         [
                             math.ceil(kv_cache_range[0][0] / tokens_per_block),
@@ -129,29 +142,21 @@ class GenerationMixin:
                             math.ceil(kv_cache_range[1][2] / tokens_per_block)
                         ]
                     ]
-                    max_blocks_per_seq_range = [[
-                        x for x in max_blocks_per_seq_range[0]
-                    ], [x for x in max_blocks_per_seq_range[1]]]
                 else:
                     max_blocks_per_seq_range = [[
                         math.ceil(kv_cache_range[0][0] / tokens_per_block),
                         math.ceil(kv_cache_range[0][1] / tokens_per_block),
                         math.ceil(kv_cache_range[0][2] / tokens_per_block)
-                    ]]
-                    max_blocks_per_seq_range = [[
-                        x for x in max_blocks_per_seq_range[0]
-                    ]]
+                    ]] * num_profiles
 
                 kv_cache_block_pointers = Tensor(
                     name=f'kv_cache_block_pointers',
                     dtype=trt.int64,
                     shape=[num_pp_layers, -1, 2, -1],
                     dim_range=OrderedDict([
-                        ('num_layers', [num_pp_layers, num_pp_layers] if
-                         enable_two_optimization_profiles else [num_pp_layers]),
+                        ('num_layers', [num_pp_layers] * num_profiles),
                         ('batch_size_beam_width', bb_range),
-                        ('kv',
-                         [2, 2] if enable_two_optimization_profiles else [2]),
+                        ('kv', [2] * num_profiles),
                         ('max_blocks_per_seq', max_blocks_per_seq_range),
                     ]))
                 host_kv_cache_block_pointers = Tensor(
@@ -159,11 +164,9 @@ class GenerationMixin:
                     dtype=trt.int64,
                     shape=[num_pp_layers, -1, 2, -1],
                     dim_range=OrderedDict([
-                        ('num_layers', [num_pp_layers, num_pp_layers] if
-                         enable_two_optimization_profiles else [num_pp_layers]),
+                        ('num_layers', [num_pp_layers] * num_profiles),
                         ('batch_size_beam_width', bb_range),
-                        ('kv',
-                         [2, 2] if enable_two_optimization_profiles else [2]),
+                        ('kv', [2] * num_profiles),
                         ('max_blocks_per_seq', max_blocks_per_seq_range),
                     ]))
 
@@ -234,19 +237,15 @@ class GenerationMixin:
                 name=f'host_max_attention_window_sizes',
                 dtype=trt.int32,
                 shape=[num_pp_layers],
-                dim_range=OrderedDict([
-                    ('num_layers', [num_pp_layers, num_pp_layers]
-                     if enable_two_optimization_profiles else [num_pp_layers])
-                ]))
+                dim_range=OrderedDict([('num_layers',
+                                        [num_pp_layers] * num_profiles)]))
 
-            host_sink_token_length = Tensor(
-                name='host_sink_token_length',
-                dtype=trt.int32,
-                shape=[1],
-                dim_range=OrderedDict([
-                    ('scalar',
-                     [1, 1] if enable_two_optimization_profiles else [1])
-                ]))
+            host_sink_token_length = Tensor(name='host_sink_token_length',
+                                            dtype=trt.int32,
+                                            shape=[1],
+                                            dim_range=OrderedDict([
+                                                ('scalar', [1] * num_profiles)
+                                            ]))
 
         if use_cache:
             cache_indirection = Tensor(
@@ -301,7 +300,8 @@ class GenerationMixin:
                              position_encoding_2d=False,
                              use_lora_plugin: bool = False,
                              lora_target_modules: List[str] = None,
-                             max_draft_len=0):
+                             max_draft_len=0,
+                             multiple_profiles: bool = False):
 
         default_range = GenerationMixin.default_range
         last_token_range = [1, max_draft_len + 1, max_draft_len + 1]
@@ -318,14 +318,15 @@ class GenerationMixin:
         inlen_range_cxt = default_range(max_input_len)
         inlen_range_gen = [1, 1, max_draft_len + 1]
 
-        enable_two_optimization_profiles = GenerationMixin.has_two_optimization_profiles(
+        enable_ctx_gen_opt_profiles = GenerationMixin.has_ctx_gen_opt_profiles(
             use_gpt_attention_plugin, use_gemm_plugin, remove_input_padding,
             paged_kv_cache)
         if max_num_tokens is None:
             max_num_tokens = max(
                 max_input_len * max_batch_size,
                 max_beam_width * (max_draft_len + 1) * max_batch_size)
-        if enable_two_optimization_profiles:
+        if enable_ctx_gen_opt_profiles:
+            num_profiles = 2
             bb_range = [bb_range_cxt, bb_range_gen]
             bbd_range = [bbd_range_ctx, bbd_range_gen]
             inlen_range = [inlen_range_cxt, inlen_range_gen]
@@ -334,16 +335,20 @@ class GenerationMixin:
             num_tokens_range_gen = default_range(
                 max_batch_size * (max_draft_len + 1) * max_beam_width)
             num_tokens_range = [num_tokens_range_ctx, num_tokens_range_gen]
-            last_token_range = [last_token_range, last_token_range]
         else:
-            bb_range = [bb_range_gen]
-            bbd_range = [bbd_range_gen]
-            last_token_range = [last_token_range]
-            inlen_range = [[1, 1, max_input_len]]
-            position_ids_inlen_range = [[1, 1, max_input_len]]
-            num_tokens_range = [[
-                1, max_batch_size * max_beam_width, max_num_tokens
-            ]]
+            if multiple_profiles:
+                num_tokens_range = GenerationMixin.split_num_tokens_range(
+                    max_num_tokens)
+            else:
+                num_tokens_range = [[
+                    1, max_batch_size * max_beam_width, max_num_tokens
+                ]]
+            num_profiles = len(num_tokens_range)
+            bb_range = [bb_range_gen] * num_profiles
+            bbd_range = [bbd_range_gen] * num_profiles
+            inlen_range = [[1, 1, max_input_len]] * num_profiles
+            position_ids_inlen_range = [[1, 1, max_input_len]] * num_profiles
+        last_token_range = [last_token_range] * num_profiles
         position_ids_num_tokens_range = num_tokens_range
 
         input_ids = None
@@ -363,8 +368,7 @@ class GenerationMixin:
                         dtype=trt.int32,
                         shape=[2, -1],
                         dim_range=OrderedDict([
-                            ('2', [2, 2]
-                             if enable_two_optimization_profiles else [2]),
+                            ('2', [2] * num_profiles),
                             ('position_ids_num_tokens_range',
                              position_ids_num_tokens_range),
                         ]),
@@ -388,10 +392,7 @@ class GenerationMixin:
                     shape=[-1, head_size * num_heads],
                     dim_range=OrderedDict([
                         ('num_tokens', num_tokens_range),
-                        ('hidden_size',
-                         [head_size * num_heads, head_size *
-                          num_heads] if enable_two_optimization_profiles else
-                         [head_size * num_heads]),
+                        ('hidden_size', [head_size * num_heads] * num_profiles),
                     ]))
 
         else:
@@ -410,8 +411,7 @@ class GenerationMixin:
                         shape=[-1, 2, -1],
                         dim_range=OrderedDict([
                             ('batch_size_beam_width', bb_range),
-                            ('2', [2, 2]
-                             if enable_two_optimization_profiles else [2]),
+                            ('2', [2] * num_profiles),
                             ('position_ids_inlen_range',
                              position_ids_inlen_range),
                         ]),
@@ -437,15 +437,12 @@ class GenerationMixin:
                     dim_range=OrderedDict([
                         ('batch_size_beam_width', bb_range),
                         ('input_len', inlen_range),
-                        ('hidden_size',
-                         [head_size * num_heads, head_size *
-                          num_heads] if enable_two_optimization_profiles else
-                         [head_size * num_heads]),
+                        ('hidden_size', [head_size * num_heads] * num_profiles),
                     ]))
 
         if use_custom_all_reduce and mapping.tp_size > 1:
             current_all_reduce_helper().set_workspace_tensor(
-                mapping, enable_two_optimization_profiles)
+                mapping, num_profiles)
 
         prompt_embedding_table = None
         tasks = None
@@ -456,20 +453,17 @@ class GenerationMixin:
             _p_embedding_range = [
                 1, prompt_embedding_table_size // 2, prompt_embedding_table_size
             ]
-            if enable_two_optimization_profiles:
-                p_embedding_range = [_p_embedding_range, _p_embedding_range]
-            else:
-                p_embedding_range = [_p_embedding_range]
+            p_embedding_range = [_p_embedding_range] * num_profiles
 
-            prompt_embedding_table = Tensor(
-                name='prompt_embedding_table',
-                dtype=dtype,
-                shape=[-1, hidden_size],
-                dim_range=OrderedDict([
-                    ('prompt_embedding_table_size', p_embedding_range),
-                    ('hidden_size', [hidden_size, hidden_size]
-                     if enable_two_optimization_profiles else [hidden_size]),
-                ]))
+            prompt_embedding_table = Tensor(name='prompt_embedding_table',
+                                            dtype=dtype,
+                                            shape=[-1, hidden_size],
+                                            dim_range=OrderedDict([
+                                                ('prompt_embedding_table_size',
+                                                 p_embedding_range),
+                                                ('hidden_size',
+                                                 [hidden_size] * num_profiles),
+                                            ]))
             if remove_input_padding:
                 tasks = Tensor(name='tasks',
                                dtype=trt.int32,
@@ -478,23 +472,19 @@ class GenerationMixin:
                                    ('input_len_task', num_tokens_range),
                                ]))
             else:
-                tasks = Tensor(
-                    name='tasks',
-                    dtype=trt.int32,
-                    shape=[-1, 1],
-                    dim_range=OrderedDict([
-                        ('batch_size_beam_width', bb_range),
-                        ('broadcast_dim',
-                         [1, 1] if enable_two_optimization_profiles else [1]),
-                    ]))
-            prompt_vocab_size = Tensor(
-                name='prompt_vocab_size',
-                dtype=trt.int32,
-                shape=[1],
-                dim_range=OrderedDict([
-                    ('size',
-                     [1, 1] if enable_two_optimization_profiles else [1])
-                ]))
+                tasks = Tensor(name='tasks',
+                               dtype=trt.int32,
+                               shape=[-1, 1],
+                               dim_range=OrderedDict([
+                                   ('batch_size_beam_width', bb_range),
+                                   ('broadcast_dim', [1] * num_profiles),
+                               ]))
+            prompt_vocab_size = Tensor(name='prompt_vocab_size',
+                                       dtype=trt.int32,
+                                       shape=[1],
+                                       dim_range=OrderedDict([
+                                           ('size', [1] * num_profiles)
+                                       ]))
 
         lora_weights_pointers = None
         lora_ranks = None
@@ -513,8 +503,7 @@ class GenerationMixin:
                         shape=[-1, 2],
                         dim_range=OrderedDict([
                             ('batch_size_beam_width', bb_range),
-                            ('in_out', [2, 2]
-                             if enable_two_optimization_profiles else [2]),
+                            ('in_out', [2] * num_profiles),
                         ]))
                     lora_weight_pointer_dict.update({
                         f"{lora_module}_lora_weights_pointers":
@@ -577,9 +566,10 @@ class GenerationMixin:
             head_size=head_size,
             num_layers=num_layers,
             kv_dtype=kv_dtype,
+            num_profiles=num_profiles,
+            enable_ctx_gen_opt_profiles=enable_ctx_gen_opt_profiles,
             remove_input_padding=remove_input_padding,
             use_gpt_attention_plugin=use_gpt_attention_plugin,
-            use_gemm_plugin=use_gemm_plugin,
             paged_kv_cache=paged_kv_cache,
             tokens_per_block=tokens_per_block,
             mapping=mapping)

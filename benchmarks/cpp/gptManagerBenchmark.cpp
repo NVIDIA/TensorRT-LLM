@@ -23,9 +23,11 @@
 #include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/executor/executor.h"
+#include "tensorrt_llm/executor/tensor.h"
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
+#include "tensorrt_llm/runtime/utils/numpyUtils.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <chrono>
@@ -48,6 +50,89 @@ namespace trt = nvinfer1;
 namespace
 {
 
+using TensorPtr = ITensor::SharedPtr;
+
+class LoraLib
+{
+public:
+    LoraLib(std::string const& loraDir)
+        : mLoraDir(loraDir)
+        , mBufferManager(std::make_shared<CudaStream>())
+        , mTaskPaths(parseDirPaths(mLoraDir))
+        , mLoras(readLoras(mTaskPaths))
+    {
+    }
+
+    TensorPtr getLoraWeights(uint64_t taskId) const
+    {
+        return mLoras.at(taskId).first;
+    }
+
+    TensorPtr getLoraConfig(uint64_t taskId) const
+    {
+        return mLoras.at(taskId).second;
+    }
+
+    void clear()
+    {
+        mLoras.clear();
+    }
+
+    std::map<uint64_t, std::pair<TensorPtr, TensorPtr>> const& getLoras()
+    {
+        return mLoras;
+    }
+
+private:
+    std::string const mLoraDir;
+    BufferManager mBufferManager;
+    std::map<uint64_t, fs::path> mTaskPaths;
+    std::map<uint64_t, std::pair<TensorPtr, TensorPtr>> mLoras;
+
+    std::map<uint64_t, std::pair<TensorPtr, TensorPtr>> readLoras(std::map<uint64_t, fs::path> taskPaths)
+    {
+        std::map<uint64_t, std::pair<TensorPtr, TensorPtr>> loras;
+        for (auto const& [id, p] : taskPaths)
+        {
+            TensorPtr loraWeights = utils::loadNpy(mBufferManager, p / "model.lora_weights.npy", MemoryType::kCPU);
+            TensorPtr loraConfig = utils::loadNpy(mBufferManager, p / "model.lora_config.npy", MemoryType::kCPU);
+            loras.insert_or_assign(id, std::make_pair(loraWeights, loraConfig));
+        }
+        return loras;
+    }
+
+    std::map<uint64_t, fs::path> parseDirPaths(std::string const& loraDir)
+    {
+        std::map<uint64_t, fs::path> taskPaths;
+        if (loraDir == "")
+        {
+            return taskPaths;
+        }
+        for (auto const& entry : fs::recursive_directory_iterator(loraDir))
+        {
+            if (entry.is_directory())
+            {
+                auto taskId = parseId(entry.path());
+                taskPaths.insert_or_assign(taskId, entry.path());
+            }
+        }
+        return taskPaths;
+    }
+
+    uint64_t parseId(fs::path p)
+    {
+        auto fn = p.filename().string();
+        auto dashPos = fn.find_first_of("-");
+        std::string idStr = fn;
+        if (dashPos != std::string::npos)
+        {
+            auto idStr = fn.substr(0, dashPos);
+        }
+        uint64_t id = static_cast<uint64_t>(std::stoi(idStr));
+        return id;
+    }
+};
+
 struct BenchmarkParams
 {
     std::optional<SizeType> maxTokensInPagedKvCache = std::nullopt;
@@ -56,6 +141,11 @@ struct BenchmarkParams
     bool enableBlockReuse = false;
     bool enableChunkedContext = false;
     bool streaming = false;
+
+    // lora / peft params
+    std::optional<std::string> loraDir = std::nullopt;
+    SizeType loraDeviceNumModLayers = 0;
+    size_t loraHostCacheSize = 1024 * 2024 * 1024;
 };
 } // namespace
 
@@ -99,13 +189,13 @@ public:
     }
 
     // Note: this function only be called under a lock
-    bool hasInProgressReqId(const uint64_t reqId) const
+    bool hasInProgressReqId(uint64_t const reqId) const
     {
         return (mInProgressWorkItems.find(reqId) != mInProgressWorkItems.end());
     }
 
     // Note: this function only be called under a lock
-    bool hasPendingReqId(const uint64_t reqId) const
+    bool hasPendingReqId(uint64_t const reqId) const
     {
         return (mPendingWorkItemsReqIds.find(reqId) != mPendingWorkItemsReqIds.end());
     }
@@ -168,7 +258,7 @@ public:
 
     /// @brief  Mark a request as being finished
     /// @param requestId
-    void markFinished(const uint64_t requestId)
+    void markFinished(uint64_t const requestId)
     {
         std::lock_guard<std::mutex> lock(mMutex);
         if (hasInProgressReqId(requestId))
@@ -328,15 +418,33 @@ public:
         , mWaitSleep(waitSleep)
         , mStaticEmulatedBatchSize(staticEmulatedBatchSize)
         , mActiveCount(0)
+        , mShutdown(false)
     {
 
         texec::SchedulerConfig schedulerConfig(batch_scheduler::batchManagerToExecSchedPolicy(schedulerPolicy));
         texec::KvCacheConfig kvCacheConfig(benchmarkParams.enableBlockReuse, benchmarkParams.maxTokensInPagedKvCache,
-            std::nullopt, std::nullopt, benchmarkParams.freeGpuMemoryFraction, false);
-        texec::ExecutorConfig executorConfig(maxBeamWidth, schedulerConfig, kvCacheConfig,
-            benchmarkParams.enableChunkedContext, true, benchmarkParams.enableTrtOverlap);
+            std::nullopt, std::nullopt, benchmarkParams.freeGpuMemoryFraction);
+        texec::PeftCacheConfig peftCacheConfig(0, benchmarkParams.loraDeviceNumModLayers, 8, 64, 4, 4, 4, 24, 8,
+            std::nullopt, benchmarkParams.loraHostCacheSize);
+        texec::ExecutorConfig executorConfig(
+            maxBeamWidth, schedulerConfig, kvCacheConfig, benchmarkParams.enableChunkedContext, true);
+        executorConfig.setPeftCacheConfig(peftCacheConfig);
 
         mExecutor = std::make_shared<texec::Executor>(trtEnginePath, texec::ModelType::kDECODER_ONLY, executorConfig);
+
+        if (logIterationData)
+        {
+            mCollectStatsThread = std::thread(&ExecutorServer::collectStats, this);
+        }
+    }
+
+    ~ExecutorServer()
+    {
+        mShutdown = true;
+        if (mCollectStatsThread.joinable())
+        {
+            mCollectStatsThread.join();
+        }
     }
 
     void enqueue(std::vector<texec::Request> requests, bool warmup = false)
@@ -367,10 +475,10 @@ public:
         }
     }
 
-    void waitForResponses(std::optional<SizeType> numRequests, bool warmup = false)
+    void waitForResponses(SizeType numRequests, bool warmup = false)
     {
         SizeType numFinished = 0;
-        while (mActiveCount || (numRequests && numFinished < numRequests.value()))
+        while (mActiveCount || (numFinished < numRequests))
         {
             auto responses = mExecutor->awaitResponses(std::nullopt, mWaitSleep);
             for (auto const& response : responses)
@@ -396,17 +504,28 @@ public:
         }
     }
 
-    void shutdown()
+    void collectStats()
     {
-        mExecutor->shutdown();
+        while (!mShutdown)
+        {
+            auto iterStats = mExecutor->getLatestIterationStats();
+            for (auto const& iterStat : iterStats)
+            {
+                TLLM_LOG_INFO(texec::JsonSerialization::toJsonStr(iterStat));
+            }
+            auto const waitSleep = std::chrono::milliseconds(50);
+            std::this_thread::sleep_for(waitSleep);
+        }
     }
 
 private:
     std::shared_ptr<texec::Executor> mExecutor;
+    std::thread mCollectStatsThread;
     std::shared_ptr<Recorder> mRecorder;
     std::chrono::milliseconds mWaitSleep;
     std::optional<int> mStaticEmulatedBatchSize;
     std::atomic<uint64_t> mActiveCount;
+    std::atomic<bool> mShutdown;
 }; // class ExecutorServer
 
 class GptServer
@@ -641,6 +760,7 @@ struct Sample
     std::vector<int32_t> inputIds;
     int32_t outputLen;
     float delay;
+    int32_t taskId;
 };
 
 using Samples = std::vector<Sample>;
@@ -659,7 +779,8 @@ Samples parseWorkloadJson(std::filesystem::path const& datasetPath, int maxNumSa
     {
         if (samples.size() >= maxNumSamples)
             break;
-        samples.emplace_back(Sample{sample["input_ids"], sample["output_len"], sample["delay"]});
+        int32_t taskId = sample.count("task_id") ? sample["task_id"].template get<int32_t>() : -1;
+        samples.emplace_back(Sample{sample["input_ids"], sample["output_len"], sample["delay"], taskId});
     }
     return samples;
 }
@@ -667,7 +788,8 @@ Samples parseWorkloadJson(std::filesystem::path const& datasetPath, int maxNumSa
 std::shared_ptr<InferenceRequest> makeRequest(std::uint64_t reqId, Sample const& sample,
     ITensor::SharedPtr const& beamWidthTensor, ITensor::SharedPtr const& eosId, ITensor::SharedPtr const& padId,
     BufferManager const& bufferManager, ITensor::SharedPtr const& returnContextLogits = nullptr,
-    ITensor::SharedPtr const& returnGenerationLogits = nullptr)
+    ITensor::SharedPtr const& returnGenerationLogits = nullptr, ITensor::SharedPtr const& loraWeights = nullptr,
+    ITensor::SharedPtr const& loraConfig = nullptr)
 {
     auto request = std::make_shared<InferenceRequest>(reqId);
     auto const& inputIds = sample.inputIds;
@@ -692,16 +814,36 @@ std::shared_ptr<InferenceRequest> makeRequest(std::uint64_t reqId, Sample const&
     {
         request->setReturnGenerationLogits(returnGenerationLogits);
     }
+    if (sample.taskId >= 0)
+    {
+        uint64_t taskId = static_cast<uint64_t>(sample.taskId);
+        request->setLoraTaskId(bufferManager.copyFrom(&taskId, ITensor::makeShape({1}), MemoryType::kPINNED));
+    }
+    if (loraWeights)
+    {
+        request->setLoraWeights(loraWeights);
+    }
+    if (loraConfig)
+    {
+        request->setLoraConfig(loraConfig);
+    }
     return request;
 }
 
 texec::Request makeExecutorRequest(Sample const& sample, SizeType const& beamWidth,
     std::optional<SizeType> const& eosId, std::optional<SizeType> const& padId, bool streaming = false,
-    bool const& returnContextLogits = false, bool const& returnGenerationLogits = false)
+    bool const& returnContextLogits = false, bool const& returnGenerationLogits = false,
+    std::optional<texec::LoraConfig> const& loraConfig = std::nullopt)
 {
     auto samplingConfig = texec::SamplingConfig{beamWidth};
     auto outputConfig = texec::OutputConfig{false, returnContextLogits, returnGenerationLogits, false};
-    return {sample.inputIds, sample.outputLen, streaming, samplingConfig, outputConfig, eosId, padId};
+    return texec::Request(sample.inputIds, sample.outputLen, streaming, samplingConfig, outputConfig, eosId, padId,
+        std::nullopt, // badWords
+        std::nullopt, // stopWords
+        std::nullopt, // embeddingBias
+        std::nullopt, // speculativeDecoding
+        std::nullopt, // pTuning
+        loraConfig);
 }
 
 void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType modelType,
@@ -727,6 +869,11 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
     optionalParams.kvCacheConfig.enableBlockReuse = benchmarkParams.enableBlockReuse;
     optionalParams.enableChunkedContext = benchmarkParams.enableChunkedContext;
     optionalParams.enableTrtOverlap = benchmarkParams.enableTrtOverlap;
+    optionalParams.peftCacheManagerConfig.hostCacheSize = benchmarkParams.loraHostCacheSize;
+    optionalParams.peftCacheManagerConfig.numDeviceModuleLayer = benchmarkParams.loraDeviceNumModLayers;
+    optionalParams.peftCacheManagerConfig.numPutWorkers = 4;
+    optionalParams.peftCacheManagerConfig.numEnsureWorkers = 4;
+    optionalParams.peftCacheManagerConfig.numCopyStreams = 4;
 
     BufferManager bufferManager{std::make_shared<CudaStream>()}; // the stream is not used
 
@@ -758,6 +905,29 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
 
     if (worldConfig.getRank() == 0)
     {
+        if (benchmarkParams.loraDir)
+        {
+            auto startLoraLoad = std::chrono::steady_clock::now();
+            LoraLib loras(benchmarkParams.loraDir.value());
+            SizeType reqId = 0;
+            for (auto const& [taskId, p] : loras.getLoras())
+            {
+                reqId++;
+                if (reqId == terminateReqId)
+                {
+                    reqId++;
+                }
+                Sample s{std::vector<int32_t>{1, 2, 3, 4, 5}, 1, 0.f, static_cast<int32_t>(taskId)};
+                auto r = makeRequest(reqId, s, beamWidthTensor, eosIdTensor, padIdTensor, bufferManager, nullptr,
+                    nullptr, p.first, p.second);
+                gptServer->enqueue(r);
+            }
+            gptServer->waitForEmpty();
+            auto endLoraLoad = std::chrono::steady_clock::now();
+            printf("[BENCHMARK] time to preload LoRAs(ms) %.2f\n",
+                std::chrono::duration<float, std::milli>(endLoraLoad - startLoraLoad).count());
+        }
+
         // Warm up
         gptServer->resetBatchDeadline();
         SizeType reqId = 0;
@@ -820,6 +990,24 @@ void benchmarkExecutor(std::filesystem::path const& engineDir, TrtGptModelType m
 
     if (worldRank == 0)
     {
+        if (benchmarkParams.loraDir)
+        {
+            auto startLoraLoad = std::chrono::steady_clock::now();
+            LoraLib loras(benchmarkParams.loraDir.value());
+            std::vector<texec::Request> requests;
+            for (auto& [taskId, p] : loras.getLoras())
+            {
+                texec::LoraConfig loraConfig(
+                    taskId, texec::detail::ofITensor(p.first), texec::detail::ofITensor(p.second));
+                Sample s{std::vector<int32_t>{1, 2, 3, 4, 5}, 1, 0.f, static_cast<int32_t>(taskId)};
+                requests.emplace_back(makeExecutorRequest(s, beamWidth, eosId, padId, false, false, false, loraConfig));
+            }
+            executorServer->enqueue(std::move(requests), true);
+            executorServer->waitForResponses(loras.getLoras().size(), true);
+            auto endLoraLoad = std::chrono::steady_clock::now();
+            printf("[BENCHMARK] time to preload LoRAs(ms) %.2f\n",
+                std::chrono::duration<float, std::milli>(endLoraLoad - startLoraLoad).count());
+        }
         // Warm up
         {
             std::vector<texec::Request> requests;
@@ -840,8 +1028,13 @@ void benchmarkExecutor(std::filesystem::path const& engineDir, TrtGptModelType m
             std::vector<int> delays;
             for (std::size_t i = 0; i < numSamples; ++i)
             {
+                std::optional<texec::LoraConfig> loraConfig;
+                if (samples[i].taskId >= 0)
+                {
+                    loraConfig = texec::LoraConfig(samples[i].taskId);
+                }
                 requests.emplace_back(makeExecutorRequest(samples[i], beamWidth, eosId, padId,
-                    benchmarkParams.streaming, returnContextLogits, returnGenerationLogits));
+                    benchmarkParams.streaming, returnContextLogits, returnGenerationLogits, loraConfig));
                 delays.push_back(static_cast<int>(samples[i].delay * 1000));
             }
 
@@ -957,6 +1150,9 @@ int main(int argc, char* argv[])
         cxxopts::value<bool>()->default_value("false"));
     options.add_options()("wait_sleep", "Specify how many milliseconds to sleep each iteration of waitForEmpty loop.",
         cxxopts::value<int>()->default_value("25"));
+    options.add_options()("lora_dir", "Directory containing LoRAs", cxxopts::value<std::string>()->default_value(""));
+    options.add_options()("lora_host_cache_bytes", "LoRA host cache memory in bytes", cxxopts::value<size_t>());
+    options.add_options()("lora_num_device_mod_layers", "LoRA number 1d cache rows", cxxopts::value<int>());
 
     auto result = options.parse(argc, argv);
 
@@ -1038,6 +1234,19 @@ int main(int argc, char* argv[])
 
     // Argument: Enable return context logits
     bool returnGenerationLogits = result["return_generation_logits"].as<bool>();
+
+    if (result.count("lora_dir"))
+    {
+        benchmarkParams.loraDir = result["lora_dir"].as<std::string>();
+    }
+    if (result.count("lora_host_cache_bytes"))
+    {
+        benchmarkParams.loraHostCacheSize = result["lora_host_cache_bytes"].as<size_t>();
+    }
+    if (result.count("lora_num_device_mod_layers"))
+    {
+        benchmarkParams.loraDeviceNumModLayers = result["lora_num_device_mod_layers"].as<SizeType>();
+    }
 
     std::optional<TokenIdType> padId;
     // Argument: Padding token id

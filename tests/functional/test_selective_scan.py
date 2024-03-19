@@ -19,7 +19,7 @@ from itertools import product
 
 import numpy as np
 import torch
-from einops import rearrange
+import torch.nn.functional as F
 from parameterized import parameterized
 from torch_ref import selective_scan_ref, selective_state_update_ref
 
@@ -46,7 +46,7 @@ class TestFunctional(unittest.TestCase):
         skip_bf16_pre_ampere(dtype)
 
         # configs
-        batch_size = 1
+        batch_size = 4
         device = "cuda"
         seq_len = 16 if req_type == 'context' else 1
         is_variable_B = True
@@ -55,6 +55,16 @@ class TestFunctional(unittest.TestCase):
 
         # test data
         torch.random.manual_seed(0)
+        if req_type == 'context':
+            last_token_ids = torch.randint(1,
+                                           seq_len + 1,
+                                           size=(batch_size, ),
+                                           dtype=torch.int32,
+                                           device=device)
+            last_token_ids[0] = seq_len
+        else:
+            last_token_ids = torch.ones(
+                [batch_size], dtype=torch.int32, device=device) * seq_len
         state = torch.randn(batch_size,
                             dstate,
                             dim,
@@ -91,15 +101,15 @@ class TestFunctional(unittest.TestCase):
                              device=device,
                              dtype=str_dtype_to_torch(dtype))
 
-        state_ref = state.detach().clone().permute(0, 2, 1).contiguous()
-        x_ref = x.detach().clone().permute(0, 2, 1).contiguous()
-        dt_ref = dt.detach().clone().permute(0, 2, 1).contiguous()
+        state_ref = state.detach().clone()
+        x_ref = x.detach().clone()
+        dt_ref = dt.detach().clone()
         dt_bias_ref = dt_bias.detach().clone()
-        A_ref = A.detach().clone().permute(1, 0).contiguous()
-        B_ref = B.detach().clone().permute(0, 2, 1).contiguous()
-        C_ref = C.detach().clone().permute(0, 2, 1).contiguous()
+        A_ref = A.detach().clone()
+        B_ref = B.detach().clone()
+        C_ref = C.detach().clone()
         D_ref = D.detach().clone()
-        z_ref = z.detach().clone().permute(0, 2, 1).contiguous()
+        z_ref = z.detach().clone()
 
         # construct trt network
         builder = tensorrt_llm.Builder()
@@ -137,11 +147,15 @@ class TestFunctional(unittest.TestCase):
                 name='host_request_types',
                 shape=host_request_types.shape,
                 dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+            last_token_ids_tensor = Tensor(
+                name='last_token_ids',
+                shape=last_token_ids.shape,
+                dtype=tensorrt_llm.str_dtype_to_trt('int32'))
             outputs = tensorrt_llm.functional.selective_scan(
                 x_tensor, state_tensor, dt_tensor, dt_bias_tensor, A_tensor,
                 B_tensor, C_tensor, D_tensor, z_tensor,
-                host_request_types_tensor, dim, dstate, is_variable_B,
-                is_variable_C, delta_softplus, dtype)
+                host_request_types_tensor, last_token_ids_tensor, dim, dstate,
+                is_variable_B, is_variable_C, delta_softplus, dtype)
             net._mark_output(outputs[0],
                              'output',
                              dtype=tensorrt_llm.str_dtype_to_trt(dtype))
@@ -160,7 +174,8 @@ class TestFunctional(unittest.TestCase):
             'C': C,
             'D': D,
             'z': z,
-            'host_request_types': host_request_types
+            'host_request_types': host_request_types,
+            'last_token_ids': last_token_ids
         }
         outputs = {'output': output, 'present_state': state}
         stream = torch.cuda.current_stream()
@@ -171,41 +186,61 @@ class TestFunctional(unittest.TestCase):
         out_ref = None
         if req_type == 'context':
             # pytorch run
-            out_ref, state_ref = selective_scan_ref(x_ref,
-                                                    dt_ref,
-                                                    A_ref,
-                                                    B_ref,
-                                                    C_ref,
-                                                    D=D_ref,
-                                                    z=z_ref,
-                                                    delta_bias=dt_bias_ref,
-                                                    delta_softplus=True)
-
+            out_ref, state_ref = [], []
+            for i in range(batch_size):
+                seq_len_i = last_token_ids[i]
+                out_ref_i, state_ref_i = selective_scan_ref(
+                    x_ref[i:i + 1, 0:seq_len_i, :],
+                    dt_ref[i:i + 1, 0:seq_len_i, :],
+                    A_ref,
+                    B_ref[i:i + 1, 0:seq_len_i, :],
+                    C_ref[i:i + 1, 0:seq_len_i, :],
+                    D=D_ref,
+                    z=z_ref[i:i + 1, 0:seq_len_i, :],
+                    delta_bias=dt_bias_ref,
+                    delta_softplus=True)
+                out_ref_i = F.pad(out_ref_i,
+                                  (0, 0, 0, seq_len - out_ref_i.shape[1], 0, 0),
+                                  value=0)
+                out_ref.append(out_ref_i)
+                state_ref.append(state_ref_i)
+            out_ref = torch.concat(out_ref, dim=0)
+            state_ref = torch.concat(state_ref, dim=0)
         elif req_type == 'generation':
             # pytorch run
             out_ref = selective_state_update_ref(state_ref,
-                                                 x_ref.squeeze(2),
-                                                 dt_ref.squeeze(2),
+                                                 x_ref.squeeze(1),
+                                                 dt_ref.squeeze(1),
                                                  A_ref,
-                                                 B_ref.squeeze(2),
-                                                 C_ref.squeeze(2),
+                                                 B_ref.squeeze(1),
+                                                 C_ref.squeeze(1),
                                                  D=D_ref,
-                                                 z=z_ref.squeeze(2),
+                                                 z=z_ref.squeeze(1),
                                                  dt_bias=dt_bias_ref,
                                                  dt_softplus=True)
-            out_ref = out_ref.unsqueeze(2)
+            out_ref = out_ref.unsqueeze(1)
+
+        # get output mask
+        if req_type == 'context':
+            out_mask = torch.zeros(batch_size, seq_len, device=device)
+            for i in range(batch_size):
+                for j in range(last_token_ids[i]):
+                    out_mask[i, j] = 1
+            out_mask = out_mask.unsqueeze(2).expand([batch_size, seq_len, dim])
+        else:
+            out_mask = torch.ones(batch_size, seq_len, dim, device=device)
 
         dtype_atol = {"float16": 5e-3, "float32": 2e-3, "bfloat16": 5e-2}
 
-        output_cpu = outputs['output'].to(torch.float32).cpu()
-        present_state_cpu = outputs['present_state'].to(torch.float32).cpu()
-        output_cpu = rearrange(output_cpu, 'b s d -> b d s').contiguous()
-        present_state_cpu = rearrange(present_state_cpu,
-                                      'b d n -> b n d').contiguous()
+        # compare out diff
+        outputs['output'][out_mask == 0] = 0
+        out_trt_llm = outputs['output'].detach().to(torch.float32).cpu().numpy()
+        out_ref = (out_ref * out_mask).detach().to(torch.float32).cpu().numpy()
+        np.testing.assert_allclose(out_ref, out_trt_llm, atol=dtype_atol[dtype])
 
-        np.testing.assert_allclose(out_ref.to(torch.float32).cpu().numpy(),
-                                   output_cpu.numpy(),
-                                   atol=dtype_atol[dtype])
-        np.testing.assert_allclose(state_ref.to(torch.float32).cpu().numpy(),
-                                   present_state_cpu.numpy(),
+        # compare present state diff
+        state_trt_llm = outputs['present_state'].detach().to(torch.float32)
+        state_ref = state_ref.detach().to(torch.float32)
+        np.testing.assert_allclose(state_ref.cpu().numpy(),
+                                   state_trt_llm.cpu().numpy(),
                                    atol=dtype_atol[dtype])

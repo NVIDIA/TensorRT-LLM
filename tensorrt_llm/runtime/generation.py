@@ -318,7 +318,6 @@ class ModelConfig:
     lora_plugin: bool = False
     lora_target_modules: List[str] = field(default_factory=list)
     use_context_fmha_for_generation: bool = False
-    hf_modules_to_trtllm_modules: dict = None
     trtllm_modules_to_hf_modules: dict = None
     skip_cross_qkv: bool = False
     num_medusa_heads: int = 0
@@ -345,9 +344,9 @@ class SamplingConfig:
     temperature: Union[float, torch.Tensor] = field(default=1.0)
     top_k: Union[int, torch.Tensor] = field(default=1)
     top_p: Union[float, torch.Tensor] = field(default=0.0)
-    top_p_decay: Optional[float] = field(default=None)
-    top_p_min: Optional[float] = field(default=None)
-    top_p_reset_ids: Optional[int] = field(default=None)
+    top_p_decay: Optional[torch.Tensor] = field(default=None)  # float
+    top_p_min: Optional[torch.Tensor] = field(default=None)  # float
+    top_p_reset_ids: Optional[torch.Tensor] = field(default=None)  # int
 
     length_penalty: Union[float, torch.Tensor] = field(default=1.0)
     early_stopping: Union[int, torch.Tensor] = field(default=1)
@@ -691,7 +690,7 @@ class GenerationSession(object):
             logger.error(f"Found tensor names: {found_tensor_names}")
             raise RuntimeError(
                 "Tensor names in engine are not the same as expected, to use this GenerationSession, "
-                "you need to use GPTLMHeadModel.prepare_inputs to create TRT Network inputs."
+                "you need to use PretrainedModel.prepare_inputs to create TRT Network inputs."
             )
         if self.debug_mode:
             self.debug_tensors = list(
@@ -891,14 +890,28 @@ class GenerationSession(object):
                                                  scfg.repetition_penalty,
                                                  dtype=torch.float32)
 
-        self.host_length_penalty = torch.full([batch_size],
-                                              scfg.length_penalty,
-                                              dtype=torch.float32)
+        if isinstance(scfg.length_penalty, torch.Tensor):
+            assert scfg.length_penalty.dtype == torch.float32, f"scfg.length_penalty.dtype ({scfg.length_penalty.dtype}) must be torch.float32"
+            assert scfg.length_penalty.shape[
+                0] == batch_size, f"scfg.length_penalty.shape[0] ({scfg.length_penalty.shape[0]}) must equal to batch_size ({batch_size})"
+            self.host_length_penalty = scfg.length_penalty
+        else:
+            self.host_length_penalty = torch.full([batch_size],
+                                                  scfg.length_penalty,
+                                                  dtype=torch.float32)
+
         self.length_penalty = self.host_length_penalty.to(self.device)
 
-        self.host_early_stopping = torch.full([batch_size],
-                                              scfg.early_stopping,
-                                              dtype=torch.int32)
+        if isinstance(scfg.early_stopping, torch.Tensor):
+            assert scfg.early_stopping.dtype == torch.int32, f"scfg.early_stopping.dtype ({scfg.early_stopping.dtype}) must be torch.int32"
+            assert scfg.early_stopping.shape[
+                0] == batch_size, f"scfg.early_stopping.shape[0] ({scfg.early_stopping.shape[0]}) must equal to batch_size ({batch_size})"
+            self.host_early_stopping = scfg.early_stopping
+        else:
+            self.host_early_stopping = torch.full([batch_size],
+                                                  scfg.early_stopping,
+                                                  dtype=torch.int32)
+
         self.early_stopping = self.host_early_stopping.to(self.device)
 
         if isinstance(scfg.presence_penalty, torch.Tensor):
@@ -1444,9 +1457,8 @@ class GenerationSession(object):
             if self.skip_cross_qkv:
                 if self.cross_qkv_reuse is None:
                     # see Attention's self.qkv output dim
-                    cross_qkv_out_dim = self.mapping.tp_size * self.num_heads * self.head_size + (
-                        2 * self.mapping.tp_size * self.num_heads_kv *
-                        self.head_size)
+                    cross_qkv_out_dim = self.num_heads * self.head_size + (
+                        2 * self.num_heads_kv * self.head_size)
                     cross_qkv_shape = encoder_output.shape[:-1] + (
                         cross_qkv_out_dim, )
                     cross_qkv_reuse = torch.empty(cross_qkv_shape,
@@ -3226,8 +3238,7 @@ class MambaLMHeadModelGenerationSession(GenerationSession):
         expected_tensor_names += ['input_ids']
         expected_tensor_names += ['logits']
         expected_tensor_names += ['host_request_types']
-        if not model_config.gather_context_logits:
-            expected_tensor_names += ['last_token_ids']
+        expected_tensor_names += ['last_token_ids']
 
         expected_tensor_names += [
             f'past_conv_state_{i}'
@@ -3313,16 +3324,10 @@ class MambaLMHeadModelGenerationSession(GenerationSession):
             dtype=self._tensor_dtype('logits'),
             device=self.device)
 
-        ctx_conv_state_shape = (
+        conv_state_shape = (
             batch_size,
             self.mamba_d_inner,
-            self.mamba_d_conv - 1 + self.max_context_length,
-        )
-
-        gen_conv_state_shape = (
-            batch_size,
-            self.mamba_d_inner,
-            self.mamba_d_conv,
+            self.mamba_d_conv - 1,
         )
 
         ssm_state_shape = (
@@ -3336,9 +3341,9 @@ class MambaLMHeadModelGenerationSession(GenerationSession):
             # They will take turns to act as input and output buffers.
             dtype = self._tensor_dtype(f'present_conv_state_{i}')
             self.buffer[f'present_conv_state_{i}'] = torch.empty(
-                ctx_conv_state_shape, dtype=dtype, device=self.device)
+                conv_state_shape, dtype=dtype, device=self.device)
             self.buffer[f'1_present_conv_state_{i}'] = torch.empty(
-                gen_conv_state_shape, dtype=dtype, device=self.device)
+                conv_state_shape, dtype=dtype, device=self.device)
             self.buffer[f'present_ssm_state_{i}'] = torch.empty(
                 ssm_state_shape, dtype=dtype, device=self.device)
 
@@ -3372,15 +3377,14 @@ class MambaLMHeadModelGenerationSession(GenerationSession):
 
         add_tensor(input_ids, 'input_ids')
         add_tensor(self.buffer['logits'], 'logits')
-        if not self.gather_context_logits:
-            add_tensor(last_token_ids, 'last_token_ids')
+        add_tensor(last_token_ids, 'last_token_ids')
 
         batch_size = context_lengths.shape[0]
+        conv_state_shape = (batch_size, self.mamba_d_inner,
+                            self.mamba_d_conv - 1)
         for idx in range(self.first_layer, self.last_layer):
             # conv state
             dtype = self._tensor_dtype(f'present_conv_state_{idx}')
-            conv_state_shape = (batch_size, self.mamba_d_inner,
-                                self.mamba_d_conv - 1)
             conv_state = torch.zeros(conv_state_shape,
                                      dtype=dtype,
                                      device=self.device)
@@ -3439,35 +3443,22 @@ class MambaLMHeadModelGenerationSession(GenerationSession):
         input_ids_shape = (batch_size * beam_width, 1)
         add_tensor_with_shape(self.new_tokens, 'input_ids', input_ids_shape)
         add_tensor(self.buffer['logits'], 'logits')
-        if not self.gather_context_logits:
-            add_tensor(last_token_ids, 'last_token_ids')
+        add_tensor(last_token_ids, 'last_token_ids')
 
         for idx in range(self.first_layer, self.last_layer):
             # conv state
-            if step == 0:
-                next_shape_in = (batch_size, self.mamba_d_inner,
-                                 self.mamba_d_conv - 1 +
-                                 self.max_context_length)
-                next_shape_out = (batch_size, self.mamba_d_inner,
-                                  self.mamba_d_conv)
-            else:
-                next_shape_in = (batch_size, self.mamba_d_inner,
-                                 self.mamba_d_conv)
-                next_shape_out = (batch_size, self.mamba_d_inner,
-                                  self.mamba_d_conv)
             if step % 2:
-                add_tensor_with_shape(
-                    self.buffer[f'1_present_conv_state_{idx}'],
-                    f'past_conv_state_{idx}', next_shape_in)
-                add_tensor_with_shape(self.buffer[f'present_conv_state_{idx}'],
-                                      f'present_conv_state_{idx}',
-                                      next_shape_out)
+                add_tensor(self.buffer[f'1_present_conv_state_{idx}'],
+                           f'past_conv_state_{idx}')
+                add_tensor(
+                    self.buffer[f'present_conv_state_{idx}'],
+                    f'present_conv_state_{idx}',
+                )
             else:
-                add_tensor_with_shape(self.buffer[f'present_conv_state_{idx}'],
-                                      f'past_conv_state_{idx}', next_shape_in)
-                add_tensor_with_shape(
-                    self.buffer[f'1_present_conv_state_{idx}'],
-                    f'present_conv_state_{idx}', next_shape_out)
+                add_tensor(self.buffer[f'present_conv_state_{idx}'],
+                           f'past_conv_state_{idx}')
+                add_tensor(self.buffer[f'1_present_conv_state_{idx}'],
+                           f'present_conv_state_{idx}')
             # ssm state
             ssm_state = self.buffer[f'present_ssm_state_{idx}']
             add_tensor(ssm_state, f'past_ssm_state_{idx}')

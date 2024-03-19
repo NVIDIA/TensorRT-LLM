@@ -1,14 +1,11 @@
 __pycache__/
 .vscode/
-*.pt
-awq/
 chatglm*/
 dataset/
-engine_outputs/
 glm*/
-model.cache
-output_*/
-sq/
+trt_ckpt/
+trt_engine/
 
-*.pt
 model.cache
+*.safetensors
+*.json

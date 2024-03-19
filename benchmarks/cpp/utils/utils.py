@@ -11,6 +11,7 @@ class Sample(BaseModel):
     input_ids: List[int]
     output_len: int
     delay: float
+    task_id: int
 
 
 class Workload(BaseModel):
@@ -31,13 +32,15 @@ class Workload(BaseModel):
         self.metadata.setdefault('workload_name', workload_name)
 
 
-def dataset_dump(input_ids, output_lens, delays, metadata, output_file):
+def dataset_dump(input_ids, output_lens, delays, task_ids, metadata,
+                 output_file):
     samples = []
     for i in range(len(input_ids)):
         samples.append(
             Sample(input_ids=input_ids[i],
                    output_len=output_lens[i],
-                   delay=delays[i]))
+                   delay=delays[i],
+                   task_id=task_ids[i]))
     workload = Workload(metadata=metadata, samples=samples)
     with open(output_file, 'w') as f:
         json.dump(workload.dict(), f)
@@ -79,10 +82,15 @@ def gen_random_tokens(ip_lens, tokenizer, random_seed):
     input_ids = []
     random.seed(random_seed)
     for ip_len in ip_lens:
-        start_ids = random.sample(range(0, tokenizer.vocab_size), ip_len)
+        start_ids = [
+            random.randint(0, tokenizer.vocab_size - 1) for _ in range(ip_len)
+        ]
         # Make sure it does not contain EOS token
         while set(tokenizer.encode(tokenizer.eos_token)).issubset(start_ids):
-            start_ids = random.sample(range(0, tokenizer.vocab_size), ip_len)
+            start_ids = [
+                random.randint(0, tokenizer.vocab_size - 1)
+                for _ in range(ip_len)
+            ]
         input_ids.append(start_ids)
 
     return input_ids

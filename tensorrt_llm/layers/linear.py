@@ -27,7 +27,7 @@ from ..mapping import Mapping
 from ..module import Module
 from ..parameter import Parameter
 from ..plugin import TRT_LLM_PLUGIN_NAMESPACE
-from .lora import Lora, LoraRuntimeParams
+from .lora import LoraRuntimeParams
 
 
 def _gemm_plugin(input: Tensor,
@@ -77,8 +77,7 @@ class Linear(Module):
                  tp_size=1,
                  gather_output=True,
                  share_weight=None,
-                 strict_dtype=False,
-                 max_lora_rank=None):
+                 strict_dtype=False):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features // tp_size
@@ -106,14 +105,6 @@ class Linear(Module):
             })
         else:
             self.register_parameter('bias', None)
-
-        if max_lora_rank is None:
-            max_lora_rank = min(self.in_features, self.out_features)
-        self.lora = Lora(
-            in_hidden_size=self.in_features,
-            out_hidden_sizes=[self.out_features],
-            max_low_rank=max_lora_rank,
-        )
 
     def multiply_gather(self,
                         x,
@@ -216,8 +207,7 @@ class RowLinear(Module):
                  use_fp8=False,
                  tp_group=None,
                  tp_size=1,
-                 strict_dtype: bool = False,
-                 max_lora_rank=None):
+                 strict_dtype: bool = False):
         super().__init__()
         self.in_features = in_features // tp_size
         self.out_features = out_features
@@ -237,14 +227,6 @@ class RowLinear(Module):
 
         self.tp_group = tp_group
         self.tp_size = tp_size
-
-        if max_lora_rank is None:
-            max_lora_rank = min(self.in_features, self.out_features)
-        self.lora = Lora(
-            in_hidden_size=self.in_features,
-            out_hidden_sizes=[self.out_features],
-            max_low_rank=max_lora_rank,
-        )
         self.strict_dtype = self.dtype if strict_dtype else None
 
     def multiply_reduce(self,

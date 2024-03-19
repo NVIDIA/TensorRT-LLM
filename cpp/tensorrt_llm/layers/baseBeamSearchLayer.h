@@ -21,6 +21,7 @@
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/layers/baseLayer.h"
 #include "tensorrt_llm/layers/decodingParams.h"
+#include "tensorrt_llm/runtime/common.h"
 
 #include <utility>
 
@@ -42,8 +43,8 @@ class BaseBeamSearchLayer : public BaseLayer
 public:
     using SetupParams = DecodingSetupParams;
 
-    BaseBeamSearchLayer(
-        size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream, std::shared_ptr<tc::IAllocator> allocator);
+    BaseBeamSearchLayer(runtime::SizeType vocab_size, runtime::SizeType vocab_size_padded, cudaStream_t stream,
+        std::shared_ptr<tc::IAllocator> allocator);
 
     BaseBeamSearchLayer(BaseBeamSearchLayer<T> const& beam_search_layer);
 
@@ -54,8 +55,9 @@ public:
     class ForwardParams : public SoftmaxParams
     {
     public:
-        ForwardParams(int step, int ite, tc::Tensor logits, tc::Tensor endIds, tc::Tensor src_cache_indirection,
-            int max_attention_window, int sink_token_length, int max_seq_len)
+        ForwardParams(runtime::SizeType step, runtime::SizeType ite, tc::Tensor logits, tc::Tensor endIds,
+            tc::Tensor src_cache_indirection, runtime::SizeType max_attention_window,
+            runtime::SizeType sink_token_length, runtime::SizeType max_seq_len)
             : SoftmaxParams(step, ite, std::move(logits), std::move(endIds))
             , src_cache_indirection{std::move(src_cache_indirection)}
             , max_attention_window{max_attention_window}
@@ -65,9 +67,9 @@ public:
         }
 
         // mandatory parameters
-        int max_attention_window;
-        int sink_token_length;
-        int max_seq_len;
+        runtime::SizeType max_attention_window;
+        runtime::SizeType sink_token_length;
+        runtime::SizeType max_seq_len;
         tc::Tensor src_cache_indirection; // [local_batch_size, beam_width, max_seq_len]
 
         // optional parameters
@@ -98,18 +100,18 @@ public:
 
 protected:
     // meta data
-    size_t vocab_size_;
-    size_t vocab_size_padded_;
+    runtime::SizeType vocab_size_;
+    runtime::SizeType vocab_size_padded_;
 
     size_t topk_softmax_workspace_size_;
     void* topk_softmax_workspace_ = nullptr;
 
     virtual void invokeSoftMax(BeamSearchOutputParams& outputs, SoftmaxParams const& params) = 0;
 
-    void setupBase(size_t batch_size, SetupParams const& setupParams);
+    void setupBase(runtime::SizeType batch_size, SetupParams const& setupParams);
 
 private:
-    void allocateBuffer(size_t batch_size);
+    void allocateBuffer(runtime::SizeType batch_size);
     void freeBuffer();
 };
 

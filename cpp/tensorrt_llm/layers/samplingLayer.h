@@ -34,9 +34,11 @@ namespace layers
 {
 
 template <typename T>
-inline bool allOfBatchSlots(int32_t const* batchSlotsHost, T const* data, size_t batchSize, T value)
+inline bool allOfBatchSlots(
+    runtime::SizeType const* batchSlotsHost, T const* data, runtime::SizeType batchSize, T value)
 {
-    return std::all_of(batchSlotsHost, batchSlotsHost + batchSize, [&](int32_t b) { return data[b] == value; });
+    return std::all_of(
+        batchSlotsHost, batchSlotsHost + batchSize, [&](runtime::SizeType b) { return data[b] == value; });
 };
 
 //! \brief Top class for sampling layers.
@@ -49,14 +51,16 @@ public:
     using SetupParams = typename Base::SetupParams;
     using ForwardParams = typename Base::ForwardParams;
 
-    SamplingLayer(runtime::DecodingMode const& mode, size_t maxBatchSize, size_t vocabSize, size_t vocabSizePadded,
-        cudaStream_t stream, std::shared_ptr<tensorrt_llm::common::IAllocator> allocator, cudaDeviceProp* prop);
+    SamplingLayer(runtime::DecodingMode const& mode, runtime::SizeType maxBatchSize, runtime::SizeType vocabSize,
+        runtime::SizeType vocabSizePadded, cudaStream_t stream,
+        std::shared_ptr<tensorrt_llm::common::IAllocator> allocator, cudaDeviceProp* prop);
 
     ~SamplingLayer() override = default;
 
     void forward(DecodingOutputParams& outputs, ForwardParams& inputs) override;
 
-    void setup(size_t batchSize, int32_t const* batchSlots, SetupParams const& setupParams) override;
+    void setup(
+        runtime::SizeType batchSize, runtime::SizeType const* batchSlots, SetupParams const& setupParams) override;
 
 private:
     using Base::mMaxBatchSize;
@@ -83,7 +87,7 @@ private:
     std::unique_ptr<TopPSamplingLayer<T>> mTopPDecode;
 
 private:
-    void allocateBuffer(size_t batchSize);
+    void allocateBuffer(runtime::SizeType batchSize);
     void freeBuffer();
 };
 

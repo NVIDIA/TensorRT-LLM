@@ -1,5 +1,7 @@
-from typing import Any, List
+from pathlib import Path
+from typing import Any, List, Union
 
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 TokenIdsTy = List[int]
@@ -42,3 +44,22 @@ class TransformersTokenizer(TokenizerBase):
 
     def batch_encode_plus(self, texts: List[str], *args, **kwargs) -> dict:
         return self.tokenizer.batch_encode_plus(texts, *args, **kwargs)
+
+
+def tokenizer_factory(
+        obj: Union[str, Path, TokenizerBase, PreTrainedTokenizerBase, None],
+        **kwargs) -> Union[TokenizerBase, PreTrainedTokenizerBase, None]:
+    if obj is None:
+        return None
+    if isinstance(obj, (str, Path)):
+        default_kwargs = {
+            'legacy': False,
+            'padding_side': 'left',
+            'truncation_side': 'left',
+            'trust_remote_code': True,
+            'use_fast': True,
+        }
+        default_kwargs.update(kwargs)
+        return AutoTokenizer.from_pretrained(obj, **kwargs)
+
+    return obj

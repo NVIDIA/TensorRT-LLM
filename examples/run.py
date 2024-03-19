@@ -221,13 +221,12 @@ def parse_input(tokenizer,
         elif input_file.endswith('.txt'):
             with open(input_file, 'r', encoding='utf-8',
                       errors='replace') as txt_file:
-                input_text = txt_file.read()
-                input_ids = tokenizer.encode(
+                input_text = txt_file.readlines()
+                batch_input_ids = tokenizer(
                     input_text,
                     add_special_tokens=add_special_tokens,
                     truncation=True,
-                    max_length=max_input_length)
-                batch_input_ids.append(input_ids)
+                    max_length=max_input_length)["input_ids"]
         else:
             print('Input file format not supported.')
             raise SystemExit

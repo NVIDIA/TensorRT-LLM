@@ -59,6 +59,7 @@ struct SSMParamsBase
     void* __restrict__ out_ptr;
     void* __restrict__ x_ptr;
     void* __restrict__ z_ptr;
+    int const* __restrict__ last_token_ids_ptr;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

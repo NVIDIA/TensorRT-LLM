@@ -24,7 +24,6 @@ import numpy as np
 
 # isort: off
 import torch
-import tensorrt as trt
 # isort: on
 from parameterized import parameterized
 from transformers import GPT2Config, GPT2LMHeadModel
@@ -42,8 +41,7 @@ from tensorrt_llm.runtime.kv_cache_manager import (GenerationSequence,
                                                    KVCacheManager)
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-
-from examples.gpt.weight import load_from_hf_gpt
+from examples.gpt.convert_checkpoint import convert_hf_gpt
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.util import skip_fp32_accum_pre_ampere, unittest_name_func
@@ -58,6 +56,7 @@ class TestGPT(unittest.TestCase):
             max_length=max_length,
             torch_dtype=dtype,
         )
+        gpt_config.n_kv_head = gpt_config.n_head
         hf_gpt = GPT2LMHeadModel(gpt_config).cuda().eval()
         return gpt_config, hf_gpt
 
@@ -67,28 +66,39 @@ class TestGPT(unittest.TestCase):
                                   apply_query_key_layer_scaling,
                                   gather_context_logits,
                                   gather_generation_logits):
-        num_layers = gpt_config.n_layer
-        num_heads = gpt_config.n_head
-        hidden_size = gpt_config.n_embd
-        vocab_size = gpt_config.vocab_size
-        hidden_act = gpt_config.activation_function
-        n_positions = gpt_config.n_positions
-        tensor_parallel_group = list(range(tensor_parallel))
+        dtype = 'float16' if fp16 else 'float32'
+        config = {
+            'architecture': 'GPTForCausalLM',
+            'dtype': dtype,
+            'num_hidden_layers': gpt_config.n_layer,
+            'num_attention_heads': gpt_config.n_head,
+            'num_key_value_heads': gpt_config.n_head,
+            'hidden_size': gpt_config.n_embd,
+            'intermediate_size': gpt_config.n_embd * 4,
+            'norm_epsilon': 1e-5,
+            'vocab_size': gpt_config.vocab_size,
+            'position_embedding_type': 'learned_absolute',
+            'max_position_embeddings': gpt_config.n_positions,
+            'hidden_act': gpt_config.activation_function,
+            'mapping': {
+                'world_size': tensor_parallel,
+                'tp_size': tensor_parallel,
+            },
+            'bias': getattr(gpt_config, 'bias', True),
+            'apply_query_key_layer_scaling': apply_query_key_layer_scaling,
+        }
+        config = tensorrt_llm.models.PretrainedConfig.from_dict(config)
+        weights = convert_hf_gpt(hf_gpt,
+                                 gpt_config,
+                                 "gpt2",
+                                 config.mapping,
+                                 dtype=dtype)
+        tensorrt_llm_gpt = tensorrt_llm.models.GPTForCausalLM(config)
+        tensorrt_llm_gpt.load(weights)
 
         with net_guard(network):
-            kv_dtype = trt.float16 if fp16 else trt.float32
             # Initialize model
-            tensorrt_llm_gpt = tensorrt_llm.models.GPTLMHeadModel(
-                num_layers=num_layers,
-                num_heads=num_heads,
-                hidden_size=hidden_size,
-                vocab_size=vocab_size,
-                hidden_act=hidden_act,
-                max_position_embeddings=n_positions,
-                dtype=kv_dtype,
-                mapping=tensorrt_llm.Mapping(world_size=tensor_parallel,
-                                             tp_size=tensor_parallel),
-                apply_query_key_layer_scaling=apply_query_key_layer_scaling)
+            network.set_named_parameters(tensorrt_llm_gpt.named_parameters())
             inputs = tensorrt_llm_gpt.prepare_inputs(
                 max_batch_size=batch_size,
                 max_input_len=input_len,
@@ -97,14 +107,9 @@ class TestGPT(unittest.TestCase):
                 max_beam_width=1,
                 gather_context_logits=gather_context_logits,
                 gather_generation_logits=gather_generation_logits)
-            load_from_hf_gpt(tensorrt_llm_gpt,
-                             hf_gpt,
-                             dtype="float16" if fp16 else "float32")
 
             # Prepare
-            network.set_named_parameters(tensorrt_llm_gpt.named_parameters())
-
-            tensorrt_llm_gpt(*inputs)
+            tensorrt_llm_gpt(**inputs)
 
         return network
 
@@ -932,33 +937,38 @@ class TestGPT(unittest.TestCase):
     @parameterized.expand(["other"], name_func=unittest_name_func)
     def test_rope_scaling_is_set_in_attention(self, test_partition):
         num_layers = 2
-        position_embedding_type = PositionEmbeddingType.rope_gpt_neox
+        position_embedding_type = 'rope_gpt_neox'
         rotary_embedding_percentage = 0.3
         rotary_base = 99999.1
         rotary_scaling = {"type": "linear", "factor": 2.72}
-        tensorrt_llm_gpt = tensorrt_llm.models.GPTLMHeadModel(
-            num_layers=num_layers,
-            num_heads=4,
-            hidden_size=128,
-            vocab_size=256,
-            hidden_act='gelu',
-            max_position_embeddings=1024,
-            dtype=trt.float16,
-            position_embedding_type=position_embedding_type,
-            rotary_embedding_percentage=rotary_embedding_percentage,
-            rotary_base=rotary_base,
-            rotary_scaling=rotary_scaling,
-        )
+
+        config = {
+            'architecture': 'GPTForCausalLM',
+            'dtype': 'float16',
+            'num_hidden_layers': num_layers,
+            'num_attention_heads': 4,
+            'hidden_size': 128,
+            'vocab_size': 256,
+            'max_position_embeddings': 1024,
+            'hidden_act': 'gelu',
+            'position_embedding_type': position_embedding_type,
+            'rotary_pct': rotary_embedding_percentage,
+            'rotary_base': rotary_base,
+            'rotary_scaling': rotary_scaling,
+        }
+        config = tensorrt_llm.models.PretrainedConfig.from_dict(config)
+        tensorrt_llm_gpt = tensorrt_llm.models.GPTForCausalLM(config)
+
         for layer_i in range(num_layers):
-            assert tensorrt_llm_gpt.layers[
+            assert tensorrt_llm_gpt.transformer.layers[
                 layer_i].attention.rotary_embedding_base == rotary_base
-            assert tensorrt_llm_gpt.layers[
+            assert tensorrt_llm_gpt.transformer.layers[
                 layer_i].attention.rotary_embedding_scale == rotary_scaling[
                     "factor"]
-            assert tensorrt_llm_gpt.layers[
+            assert tensorrt_llm_gpt.transformer.layers[
                 layer_i].attention.rotary_embedding_scale_type == RotaryScalingType.linear
-            assert tensorrt_llm_gpt.layers[
-                layer_i].attention.position_embedding_type == position_embedding_type
+            assert tensorrt_llm_gpt.transformer.layers[
+                layer_i].attention.position_embedding_type == PositionEmbeddingType.rope_gpt_neox
 
 
 if __name__ == '__main__':

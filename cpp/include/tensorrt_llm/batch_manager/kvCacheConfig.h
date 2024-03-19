@@ -46,7 +46,7 @@ public:
     explicit KvCacheConfig(executor::KvCacheConfig const& kvCacheConfig)
         : KvCacheConfig(kvCacheConfig.getMaxTokens(), kvCacheConfig.getMaxAttentionWindow(),
             kvCacheConfig.getSinkTokenLength(), kvCacheConfig.getFreeGpuMemoryFraction(),
-            kvCacheConfig.getEnableBlockReuse(), kvCacheConfig.getUseUvm())
+            kvCacheConfig.getEnableBlockReuse(), false)
     {
     }
 

@@ -142,6 +142,7 @@ void InferenceRequest::initBindings(py::module_& m)
             &InferenceRequest::setPromptEmbeddingTable)
         .def_property(
             "prompt_vocab_size", &InferenceRequest::getPromptVocabSizeUnchecked, &InferenceRequest::setPromptVocabSize)
+        .def_property("lora_task_id", &InferenceRequest::getLoraTaskId, &InferenceRequest::setLoraTaskId)
         .def_property("lora_weights", &InferenceRequest::getLoraWeightsUnchecked, &InferenceRequest::setLoraWeights)
         .def_property("lora_config", &InferenceRequest::getLoraConfigUnchecked, &InferenceRequest::setLoraConfig)
         .def_property("is_streaming", &InferenceRequest::isStreaming, &InferenceRequest::setIsStreaming)

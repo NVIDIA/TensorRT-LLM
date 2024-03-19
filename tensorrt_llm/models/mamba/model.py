@@ -18,7 +18,8 @@ from typing import List
 import tensorrt as trt
 
 from ..._utils import str_dtype_to_trt
-from ...functional import Tensor, cast, gather_last_token_logits
+from ...functional import (Tensor, arange, cast, concat, expand,
+                           gather_last_token_logits, shape, unsqueeze)
 from ...layers import (Embedding, LayerNorm, Linear, Mamba, MambaParameters,
                        RmsNorm)
 from ...module import Module, ModuleList
@@ -49,7 +50,8 @@ class MambaLayer(Module):
 
     def forward(self, hidden_states: Tensor, residual: Tensor,
                 conv_state: Tensor, ssm_state: Tensor,
-                host_request_types: Tensor):
+                host_request_types: Tensor, conv_indices: Tensor,
+                last_token_ids: Tensor):
 
         hidden_states = self.input_layernorm(hidden_states)
 
@@ -57,7 +59,9 @@ class MambaLayer(Module):
             hidden_states,
             conv_state=conv_state,
             ssm_state=ssm_state,
-            host_request_types=host_request_types)
+            host_request_types=host_request_types,
+            conv_indices=conv_indices,
+            last_token_ids=last_token_ids)
         if self.residual_in_fp32:
             residual = residual + cast(ssm_out, 'float32')
             hidden_states = cast(residual, self.dtype)
@@ -75,6 +79,8 @@ class MambaModel(Module):
 
     def __init__(self, config: PretrainedConfig):
         super().__init__()
+        self.d_conv = config.ssm_cfg['d_conv']
+        self.d_inner = int(config.ssm_cfg['expand'] * config.hidden_size)
         n_layer = config.num_hidden_layers
         self.residual_in_fp32 = config.residual_in_fp32
         if config.vocab_size % config.pad_vocab_size_multiple != 0:
@@ -96,8 +102,21 @@ class MambaModel(Module):
                                     eps=config.norm_epsilon,
                                     dtype=config.dtype)
 
-    def forward(self, input_ids, conv_states, ssm_states, host_request_types):
+    def forward(self, input_ids, conv_states, ssm_states, host_request_types,
+                last_token_ids):
         hidden_states = self.vocab_embedding(input_ids)
+
+        # Get conv state indices
+        batch_size = shape(input_ids, 0)
+        indices = expand(
+            unsqueeze(arange(0, self.d_conv - 1, dtype='int32'), 0),
+            concat([batch_size, self.d_conv - 1]))
+        offsets = expand(unsqueeze(last_token_ids, 1),
+                         concat([batch_size, self.d_conv - 1]))
+        indices = unsqueeze(indices + offsets, 1)
+        indices = expand(indices,
+                         concat([batch_size, self.d_inner, self.d_conv - 1]))
+
         residual = cast(hidden_states,
                         'float32') if self.residual_in_fp32 else hidden_states
         hidden_values = [hidden_states, residual]
@@ -105,7 +124,8 @@ class MambaModel(Module):
         for layer, past_conv, past_ssm in zip(self.layers, conv_states,
                                               ssm_states):
             hidden_values = layer(hidden_values[0], hidden_values[1], past_conv,
-                                  past_ssm, host_request_types)
+                                  past_ssm, host_request_types, indices,
+                                  last_token_ids)
             present_convs.append(hidden_values[2])
             present_ssms.append(hidden_values[3])
         hidden_states = hidden_values[0]
@@ -130,6 +150,7 @@ class MambaLMHeadModel(PretrainedModel):
         self.d_conv = self.ssm_cfg.d_conv
         self.d_state = self.ssm_cfg.d_state
         self.config = config
+        self.gather_context_logits = False
 
         if isinstance(logits_dtype, str):
             self._logits_dtype = str_dtype_to_trt(logits_dtype)
@@ -150,10 +171,12 @@ class MambaLMHeadModel(PretrainedModel):
     def forward(self, input_ids, conv_states, ssm_states, host_request_types,
                 last_token_ids):
         hidden_states, present_convs, present_ssms = self.backbone(
-            input_ids, conv_states, ssm_states, host_request_types)
+            input_ids, conv_states, ssm_states, host_request_types,
+            last_token_ids)
 
-        hidden_states = gather_last_token_logits(hidden_states, last_token_ids,
-                                                 False)
+        if not self.gather_context_logits:
+            hidden_states = gather_last_token_logits(hidden_states,
+                                                     last_token_ids, False)
 
         lm_logits = self.lm_head(hidden_states)
         lm_logits.mark_output('logits', self._logits_dtype)
@@ -183,9 +206,7 @@ class MambaLMHeadModel(PretrainedModel):
             @return: a list contains values which can be fed into the self.forward()
         '''
         batch_range = [GenerationMixin.default_range(max_batch_size)]
-        conv_state_range = [
-            GenerationMixin.default_range(self.d_conv - 1 + max_input_len)
-        ]
+        self.gather_context_logits = gather_context_logits
         input_ids = Tensor(name='input_ids',
                            dtype=trt.int32,
                            shape=[-1, -1],
@@ -198,7 +219,7 @@ class MambaLMHeadModel(PretrainedModel):
         conv_state_dim_range = OrderedDict([
             ('batch_size', batch_range),
             ('dim_size', [self.d_inner]),
-            ('kernel_size', conv_state_range),
+            ('kernel_size', [self.d_conv - 1]),
         ])
 
         ssm_state_dim_range = OrderedDict([
@@ -210,7 +231,7 @@ class MambaLMHeadModel(PretrainedModel):
         for i in range(self.config.num_hidden_layers):
             conv_state = Tensor(name=f'past_conv_state_{i}',
                                 dtype=self.dtype,
-                                shape=[-1, self.d_inner, -1],
+                                shape=[-1, self.d_inner, self.d_conv - 1],
                                 dim_range=conv_state_dim_range)
 
             ssm_state = Tensor(name=f'past_ssm_state_{i}',
@@ -228,16 +249,14 @@ class MambaLMHeadModel(PretrainedModel):
             dim_range=OrderedDict([('batch_size', batch_range)]),
         )
 
-        last_token_ids = None
-        if not gather_context_logits:
-            last_token_ids = Tensor(
-                name='last_token_ids',
-                dtype=trt.int32,
-                shape=[-1],
-                dim_range=OrderedDict([
-                    ('batch_size_last_token_ids', batch_range),
-                ]),
-            )
+        last_token_ids = Tensor(
+            name='last_token_ids',
+            dtype=trt.int32,
+            shape=[-1],
+            dim_range=OrderedDict([
+                ('batch_size', batch_range),
+            ]),
+        )
 
         return {
             'input_ids': input_ids,

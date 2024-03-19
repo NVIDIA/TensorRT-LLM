@@ -14,7 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "tllmPlugin.h"
+#include "tensorrt_llm/plugins/api/tllmPlugin.h"
 
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"

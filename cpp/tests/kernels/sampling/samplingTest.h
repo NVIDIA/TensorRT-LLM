@@ -197,6 +197,7 @@ struct SamplingKernelTestParam
     int32_t maxTokensPerStep{1};
     bool returnAllTopK{false};
     bool useLogitsPtrs{false};
+    bool isDeterministicTopP{false};
 
     SamplingKernelTestParam& setBatchSize(int32_t bs)
     {
@@ -237,6 +238,12 @@ struct SamplingKernelTestParam
     SamplingKernelTestParam& setUseLogitsPtrs()
     {
         useLogitsPtrs = true;
+        return *this;
+    }
+
+    SamplingKernelTestParam& setDeterministicTopP(bool isDeter)
+    {
+        isDeterministicTopP = isDeter;
         return *this;
     }
 

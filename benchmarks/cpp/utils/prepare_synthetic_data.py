@@ -1,3 +1,5 @@
+import random
+
 import click
 from utils.utils import (dataset_dump, gen_random_tokens, get_list_of_delays,
                          get_norm_dist_tokens)
@@ -30,6 +32,7 @@ def token_norm_dist(root_args, **kwargs):
     input_ids = []
     input_lens = []
     output_lens = []
+    task_ids = []
 
     input_lens = get_norm_dist_tokens(kwargs['input_mean'],
                                       kwargs['input_stdev'],
@@ -47,8 +50,14 @@ def token_norm_dist(root_args, **kwargs):
     input_ids = gen_random_tokens(input_lens, root_args.tokenizer,
                                   root_args.random_seed)
 
+    if root_args.rand_task_id is None:
+        task_ids = [root_args.task_id for _ in range(num_reqs)]
+    else:
+        min_id, max_id = root_args.rand_task_id
+        task_ids = [random.randint(min_id, max_id) for _ in range(num_reqs)]
+
     dataset_dump(
-        input_ids, output_lens, delays, {
+        input_ids, output_lens, delays, task_ids, {
             "workload_type": "token-norm-dist",
             "input_mean": kwargs['input_mean'],
             "input_stdev": kwargs['input_stdev'],

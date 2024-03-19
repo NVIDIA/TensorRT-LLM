@@ -64,8 +64,29 @@ void invokeFinalize(int32_t* outputIds, int32_t* sequenceLengths, float* cumLogP
 void invokeInitializeOutput(
     int32_t* outputIds, int32_t const* endIds, int batchBeam, int maxSeqLen, cudaStream_t stream);
 
-void invokeCopyNextStepIds(int32_t* nextStepIds, int32_t** outputIdsPtr, int32_t const* sequenceLengths,
-    int32_t const* batchSlots, int32_t batchSize, int32_t beamWidth, int32_t maxSeqLen, cudaStream_t stream);
+//! \brief Copies last numNewTokens (or 1 if numNewTokens == nullptr) tokens from outputIdsPtr
+//! to nextStepIds according to sequenceLengths.
+//!
+//! \param nextStepIds output buffer [maxTokensPerStep, maxBatchSize, maxBeamWidth],
+//! destination of the new tokens.
+//! \param outputIdsPtr input buffer [maxBatchSize][maxBeamWidth, maxSeqLen],
+//! array of pointers to the source of the copy.
+//! \param sequenceLengths input buffer [maxBatchSize], sequence length of the request
+//! in outputIdsPtr that includes all new tokens. It must be guaranteed that sequenceLengths <= maxSeqLen.
+//! \param numNewTokens input buffer [maxBatchSize], optional, number of tokens to be copied.
+//! If nullptr, only 1 token is copied. It must be guaranteed that numNewTokens <= sequenceLengths.
+//! \param batchSlots input buffer [batchSize], address map from local index
+//! to global index [0, batchSize] -> [0, maxBatchSize]
+//! \param batchSize current batch size
+//! \param maxBatchSize maximum batch size
+//! \param beamWidth current beam width
+//! \param maxSeqLen maximum sequence length
+//! \param maxTokensPerStep maximum tokens per step
+//! \param stream stream
+void invokeCopyNextStepIds(runtime::TokenIdType* nextStepIds, runtime::TokenIdType const* const* outputIdsPtr,
+    runtime::SizeType const* sequenceLengths, runtime::SizeType const* numNewTokens,
+    runtime::SizeType const* batchSlots, runtime::SizeType batchSize, runtime::SizeType maxBatchSize,
+    runtime::SizeType beamWidth, runtime::SizeType maxSeqLen, runtime::SizeType maxTokensPerStep, cudaStream_t stream);
 
 //! \brief Accepts or rejects draft tokens based on the equality of draft and target tokens
 //! for speculative decoding. Target token is accepted if targetToken == draftToken.
@@ -82,7 +103,8 @@ void invokeCopyNextStepIds(int32_t* nextStepIds, int32_t** outputIdsPtr, int32_t
 //! \param finished input buffer [maxDraftTokens + 1, batchSize] finished states at each decoding iteration
 //! \param finishedFinal output buffer [batchSize] finished states after accepting/rejecting tokens
 //! \param finishedSum output buffer [1] total number of requests in batch that finished the execution
-//! \param batchSlots
+//! \param batchSlots input buffer [batchSize], address map from local index
+//! to global index [0, batchSize] -> [0, maxBatchSize]
 //! \param batchSize current batch size
 //! \param maxBatchSize maximum batch size
 //! \param beamWidth beam width
@@ -114,7 +136,8 @@ void invokeAcceptDraftTokensByIds(int32_t const* draftIds, int32_t const* target
 //! At each step sets to NOT_FINISHED if token is accepted or SKIP_DECODING if token is not accepted
 //! \param curandState input buffer [batchSize]. Curand states properly
 //! initialized using invokeCurandInitialize per request.
-//! \param batchSlots
+//! \param batchSlots input buffer [batchSize], address map from local index
+//! to global index [0, batchSize] -> [0, maxBatchSize]
 //! \param batchSize current batch size
 //! \param maxBatchSize maximum batch size
 //! \param beamWidth beam width
@@ -145,6 +168,7 @@ void invokeTransposeLogProbs(float* output_log_probs, float* output_log_probs_ti
 //! \param targetIds input buffer [maxBatchSize, maxTargetSeqLen], tokens predicted from the target medusa head
 //! \param sequenceLengths input/output buffer [maxBatchSize], length of the data in outputIds without draft tokens
 //! Incrememnted according to the accepted length
+//! \param acceptedLengths output buffer [maxBatchSize], length of the data accepted tokens
 //! \param finishedFinal input buffer [maxBatchSize], finished states per request
 //! \param batchSlots input buffer [batchSize], address map from local index
 //! to global index [0, batchSize] -> [0, maxBatchSize]
@@ -165,10 +189,10 @@ void invokeTransposeLogProbs(float* output_log_probs, float* output_log_probs_ti
 //! \param stream stream
 template <typename T>
 void acceptDraftTokensByIdsWithPaths(runtime::TokenIdType* outputIds, runtime::TokenIdType const* targetIds,
-    runtime::SizeType* sequenceLengths, FinishedState* finishedFinal, runtime::SizeType const* batchSlots,
-    runtime::SizeType const* paths, runtime::TokenIdType const* endIds, T const* medusaLogits, T const** logitsPtrs,
-    runtime::SizeType batchSize, runtime::SizeType maxBatchSize, runtime::SizeType vocabSize,
-    runtime::SizeType maxDraftSeqLen, runtime::SizeType maxTargetSeqLen, runtime::SizeType maxNumHeads,
-    runtime::SizeType maxTokensPerStep, cudaStream_t stream);
+    runtime::SizeType* sequenceLengths, runtime::SizeType* acceptedLengths, FinishedState* finishedFinal,
+    runtime::SizeType const* batchSlots, runtime::SizeType const* paths, runtime::TokenIdType const* endIds,
+    T const* medusaLogits, T const** logitsPtrs, runtime::SizeType batchSize, runtime::SizeType maxBatchSize,
+    runtime::SizeType vocabSize, runtime::SizeType maxDraftSeqLen, runtime::SizeType maxTargetSeqLen,
+    runtime::SizeType maxNumHeads, runtime::SizeType maxTokensPerStep, cudaStream_t stream);
 } // namespace kernels
 } // namespace tensorrt_llm

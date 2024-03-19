@@ -27,13 +27,14 @@
 
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::kernels;
+using namespace tensorrt_llm::runtime;
 
 namespace tensorrt_llm
 {
 namespace layers
 {
 template <typename T>
-BaseSamplingLayer<T>::BaseSamplingLayer(size_t maxBatchSize, size_t vocabSize, size_t vocabSizePadded,
+BaseSamplingLayer<T>::BaseSamplingLayer(SizeType maxBatchSize, SizeType vocabSize, SizeType vocabSizePadded,
     cudaStream_t stream, std::shared_ptr<IAllocator> allocator, cudaDeviceProp* prop)
     : BaseLayer(stream, std::move(allocator), prop)
     , mMaxBatchSize(maxBatchSize)

@@ -16,6 +16,7 @@
 #include "tensorrt_llm/runtime/gptModelConfig.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
+#include <string>
 
 namespace tensorrt_llm::runtime::lora
 {
@@ -27,7 +28,6 @@ void loraValidateRequestTensorDims(std::optional<ITensor::SharedPtr> const& optR
         "Request for LoRA inference must have both lora_weights and lora_keys");
 
     SizeType constexpr expectedBatchSize = 1;
-    SizeType constexpr expectedLoraConfigValues = kLORA_CONFIG_ROW_SIZE;
     SizeType constexpr expectedWeightsDims = 3;
     SizeType constexpr expectedKeysDims = 3;
 
@@ -46,41 +46,44 @@ void loraValidateRequestTensorDims(std::optional<ITensor::SharedPtr> const& optR
 
     TLLM_CHECK_WITH_INFO(keys->getShape().d[1] == weights->getShape().d[1],
         "Expected dim1 lora_weights and lora_keys to have the same size");
-    TLLM_CHECK_WITH_INFO(
-        keys->getShape().d[2] == expectedLoraConfigValues, "Expected dim2 of lora_keys to have a size of 3");
+    TLLM_CHECK_WITH_INFO(keys->getShape().d[2] == kLORA_CONFIG_ROW_SIZE,
+        "Expected dim2 of lora_keys to have a size of " + std::to_string(kLORA_CONFIG_ROW_SIZE));
 }
 
-void loraValidateRequestTensors(std::optional<ITensor::SharedPtr> const& optReqLoraWeights,
+void loraValidateRequestTensors(std::optional<std::uint64_t> const& optTaskId,
+    std::optional<ITensor::SharedPtr> const& optReqLoraWeights,
     std::optional<ITensor::SharedPtr> const& optReqLoraConfig, runtime::GptModelConfig const& modelConfig,
     runtime::WorldConfig const& worldConfig)
 {
-    SizeType constexpr expectedLoraConfigValues = 3;
-
-    loraValidateRequestTensorDims(optReqLoraWeights, optReqLoraConfig);
-
-    auto weights = optReqLoraWeights.value();
-    auto keys = optReqLoraConfig.value();
-    SizeType nbModelLayers = modelConfig.getNbLayers();
-    TLLM_CHECK_WITH_INFO(weights->getDataType() == modelConfig.getDataType(),
-        "Expected lora weights to be the same data type as base model");
-
-    auto loraModules = modelConfig.getLoraModules();
-    auto keysPtr = bufferCast<SizeType>(*keys);
-    for (SizeType row = 0; row < keys->getShape().d[1]; ++row)
+    TLLM_CHECK_WITH_INFO(optTaskId.has_value(), "lora_task_id must be set for LoRA inference");
+    if (optReqLoraWeights.has_value() || optReqLoraConfig.has_value())
     {
-        auto modId = keysPtr[row * expectedLoraConfigValues];
-        auto layerId = keysPtr[row * expectedLoraConfigValues + 1];
-        auto adapterSize = keysPtr[row * expectedLoraConfigValues + 2];
+        loraValidateRequestTensorDims(optReqLoraWeights, optReqLoraConfig);
 
-        TLLM_CHECK_WITH_INFO(
-            layerId >= 0 && layerId < nbModelLayers, "Expected layerId to be in the range [0, numModelLayers)");
-        TLLM_CHECK_WITH_INFO(adapterSize > 0, "Expected adapterSize to be > 0");
-        auto it = std::find_if(
-            loraModules.begin(), loraModules.end(), [modId](LoraModule const& m) { return m.value() == modId; });
-        std::string moduleName(LoraModule::toModuleName(modId));
-        TLLM_CHECK_WITH_INFO(it != loraModules.end(), "lora module " + moduleName + " not enabled for this model");
-        TLLM_CHECK_WITH_INFO(it->flattenedInOutSize(adapterSize) <= weights->getShape().d[2],
-            "lora_weights has to few values for " + moduleName);
+        auto weights = optReqLoraWeights.value();
+        auto config = optReqLoraConfig.value();
+        SizeType nbModelLayers = modelConfig.getNbLayers();
+        TLLM_CHECK_WITH_INFO(weights->getDataType() == modelConfig.getDataType(),
+            "Expected lora weights to be the same data type as base model");
+
+        auto loraModules = modelConfig.getLoraModules();
+        auto configPtr = bufferCast<SizeType>(*config);
+        for (SizeType row = 0; row < config->getShape().d[1]; ++row)
+        {
+            auto modId = configPtr[row * kLORA_CONFIG_ROW_SIZE + kLORA_CONFIG_MODULE_OFF];
+            auto layerId = configPtr[row * kLORA_CONFIG_ROW_SIZE + kLORA_CONFIG_LAYER_OFF];
+            auto adapterSize = configPtr[row * kLORA_CONFIG_ROW_SIZE + kLORA_CONFIG_ADAPTER_SIZE_OFF];
+
+            TLLM_CHECK_WITH_INFO(
+                layerId >= 0 && layerId < nbModelLayers, "Expected layerId to be in the range [0, numModelLayers)");
+            TLLM_CHECK_WITH_INFO(adapterSize > 0, "Expected adapterSize to be > 0");
+            auto it = std::find_if(
+                loraModules.begin(), loraModules.end(), [modId](LoraModule const& m) { return m.value() == modId; });
+            std::string moduleName(LoraModule::toModuleName(modId));
+            TLLM_CHECK_WITH_INFO(it != loraModules.end(), "lora module " + moduleName + " not enabled for this model");
+            TLLM_CHECK_WITH_INFO(it->flattenedInOutSize(adapterSize) <= weights->getShape().d[2],
+                "lora_weights has to few values for " + moduleName);
+        }
     }
 }
 } // namespace tensorrt_llm::runtime::lora

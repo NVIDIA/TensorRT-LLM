@@ -63,11 +63,6 @@ def parse_arguments():
         default=1,
         help='The number of workers for converting checkpoint in parallel')
     parser.add_argument(
-        '--max_prompt_embedding_table_size',
-        type=int,
-        default=0,
-        help='Setting to a value > 0 enables support for prompt tuning.')
-    parser.add_argument(
         '--per_channel',
         default=False,
         action="store_true",
@@ -1223,7 +1218,6 @@ if __name__ == '__main__':
             'tp_size': args.tp_size,
             'pp_size': args.pp_size,
         },
-        'use_prompt_tuning': args.max_prompt_embedding_table_size > 0,
     }
     if args.use_weight_only and args.weight_only_precision == 'int4_gptq':
         config['quantization'].update({

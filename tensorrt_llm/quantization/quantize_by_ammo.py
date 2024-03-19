@@ -25,9 +25,12 @@ import time
 import numpy as np
 import safetensors
 import torch
+from ammo.torch.export.tensorrt_llm_utils import MODEL_NAME_TO_HF_ARCH_MAP
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+MODEL_NAME_TO_HF_ARCH_MAP.update({"gpt2": "GPTForCausalLM"})
 
 EMPTY_CFG = {
     "quant_cfg": {
@@ -129,7 +132,7 @@ def get_tokenizer(ckpt_path, max_seq_length, model_type=None):
         tokenizer.eos_token = tokenizer.convert_ids_to_tokens(151643)
 
     # can't set attribute 'pad_token' for "<unk>"
-    if tokenizer.pad_token != "<unk>":
+    if tokenizer.pad_token != "<unk>":  # nosec B105
         tokenizer.pad_token = tokenizer.eos_token
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -223,6 +226,8 @@ def quantize_model(model, quant_cfg, calib_dataloader=None):
         """Adjusts weights and scaling factors based on selected algorithms."""
         for idx, data in enumerate(calib_dataloader):
             print(f"Calibrating batch {idx}")
+            # model might be mapped to different device because the device_map is auto
+            data = data.to(model.device)
             model(data)
 
     print("Starting quantization...")
@@ -311,47 +316,64 @@ def quantize_and_export(*, model_dir, dtype, device, qformat, kv_cache_dtype,
         export_path = output_dir
         start_time = time.time()
 
-        if qformat == "int4_awq" and model_type == "qwen":
-            torch.save(model.state_dict(), export_path)
-        else:
-            export_npz = (model_type not in [
-                'gptj', 'falcon', 'chatglm', 'mpt', 'llama', 'baichuan', 'gemma'
-            ])
-            export_model_config(model,
-                                model_type,
-                                getattr(torch, dtype),
-                                export_dir=export_path,
-                                inference_tensor_parallel=tp_size,
-                                inference_pipeline_parallel=pp_size,
-                                export_tensorrt_llm_config=(not export_npz),
-                                export_npz=export_npz)
+        export_npz = (model_type not in [
+            'gpt2', 'gptj', 'falcon', 'chatglm', 'mpt', 'llama', 'baichuan',
+            'gemma', 'qwen'
+        ])
+        export_model_config(model,
+                            model_type,
+                            getattr(torch, dtype),
+                            export_dir=export_path,
+                            inference_tensor_parallel=tp_size,
+                            inference_pipeline_parallel=pp_size,
+                            export_tensorrt_llm_config=(not export_npz),
+                            export_npz=export_npz)
 
-            # Workaround for wo quantization
-            if qformat in ["int8_wo", "int4_wo", "full_prec"]:
+        # Workaround for wo quantization
+        if qformat in ["int8_wo", "int4_wo", "full_prec"]:
+            with open(f"{export_path}/config.json", "r") as f:
+                tensorrt_llm_config = json.load(f)
+            if qformat == "int8_wo":
+                tensorrt_llm_config["quantization"]["quant_algo"] = 'W8A16'
+            elif qformat == "int4_wo":
+                tensorrt_llm_config["quantization"]["quant_algo"] = 'W4A16'
+            else:
+                tensorrt_llm_config["quantization"]["quant_algo"] = None
+            with open(f"{export_path}/config.json", "w") as f:
+                json.dump(tensorrt_llm_config, f, indent=4)
+
+        # Workaround for share_embedding_table
+        if pp_size == 1:
+            with safetensors.safe_open(f"{export_path}/rank0.safetensors",
+                                       framework='pt',
+                                       device='cpu') as f:
+                share_embedding_table = 'lm_head.weight' not in f.keys()
+            if share_embedding_table:
                 with open(f"{export_path}/config.json", "r") as f:
                     tensorrt_llm_config = json.load(f)
-                if qformat == "int8_wo":
-                    tensorrt_llm_config["quantization"]["quant_algo"] = 'W8A16'
-                elif qformat == "int4_wo":
-                    tensorrt_llm_config["quantization"]["quant_algo"] = 'W4A16'
-                else:
-                    tensorrt_llm_config["quantization"]["quant_algo"] = None
+                tensorrt_llm_config["share_embedding_table"] = True
                 with open(f"{export_path}/config.json", "w") as f:
                     json.dump(tensorrt_llm_config, f, indent=4)
 
-            # Workaround for share_embedding_table
-            if pp_size == 1:
-                with safetensors.safe_open(f"{export_path}/rank0.safetensors",
-                                           framework='pt',
-                                           device='cpu') as f:
-                    share_embedding_table = 'lm_head.weight' not in f.keys()
-                if share_embedding_table:
-                    with open(f"{export_path}/config.json", "r") as f:
-                        tensorrt_llm_config = json.load(f)
-                    tensorrt_llm_config["share_embedding_table"] = True
-                    with open(f"{export_path}/config.json", "w") as f:
-                        json.dump(tensorrt_llm_config, f, indent=4)
+        # Workaround for gpt2 position embedding
+        if model_type == 'gpt2':
+            for rank in range(tp_size):
+                weights = {}
+                with safetensors.safe_open(
+                        f"{export_path}/rank{rank}.safetensors",
+                        framework='pt',
+                        device='cpu') as f:
+                    for key in f.keys():
+                        weights[key] = f.get_tensor(key)
+                if 'transformer.positional_embedding.weight' in weights:
+                    weights[
+                        'transformer.position_embedding.weight'] = weights.pop(
+                            'transformer.positional_embedding.weight')
+                safetensors.torch.save_file(
+                    weights, f"{export_path}/rank{rank}.safetensors")
 
+        torch.cuda.empty_cache(
+        )  # otherwise torch is keeping using GPU, other routine like build engine has less free GPU to use
         end_time = time.time()
         print(
             "Quantized model exported to {} \nTotal time used {:.2f} s.".format(

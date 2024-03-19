@@ -79,8 +79,7 @@ class TestPluginNoCache(unittest.TestCase):
                 kv_dtype=kv_dtype,
                 remove_input_padding=remove_input_padding,
                 use_gpt_attention_plugin=True,
-                use_gemm_plugin=
-                True,  # because we don't want two optimization profiles
+                enable_ctx_gen_opt_profiles=False,
                 use_cache=use_cache,
             )
 

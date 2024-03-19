@@ -173,6 +173,9 @@ protected:
         trk::invokeFill(*mLogitsRefHost, T{0.0f}, *mStream);
         trk::invokeFill(*mOutLogitsDevice, T{0.0f}, *mStream);
 
+        trk::invokeFill(*mLogitsRefHost, T{0.0f}, *mStream);
+        trk::invokeFill(*mOutLogitsDevice, T{0.0f}, *mStream);
+
         auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
         for (SizeType bi = 0; bi < mBatchSize; ++bi)
         {
@@ -256,9 +259,9 @@ public:
         InvokeBatchApplyPenaltyParams<T> penaltyParams{reinterpret_cast<T**>(bufferCast<int64_t>(*mLogitsPtrs)),
             bufferCast<T>(*mOutLogitsDevice), bufferCast<T>(*mBiasDevice),
             bufferCast<int32_t>(*mPenaltyWorkspaceDevice), nullptr, bufferCast<float>(*mTemperaturesDevice), nullptr,
-            nullptr, nullptr, false, static_cast<size_t>(mBatchSize), 1, 1, static_cast<size_t>(mVocabSize),
-            static_cast<size_t>(mVocabSizePadded), nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-            bufferCast<int32_t>(*mBatchSlots), mMaxTokensPerStep, bufferCast<int32_t>(*mTokensPerStep), mStream->get()};
+            nullptr, nullptr, false, mBatchSize, 1, 1, mVocabSize, mVocabSizePadded, nullptr, nullptr, nullptr, nullptr,
+            nullptr, nullptr, bufferCast<int32_t>(*mBatchSlots), mMaxTokensPerStep,
+            bufferCast<int32_t>(*mTokensPerStep), mStream->get()};
         tk::invokeBatchApplyPenalty(penaltyParams);
         auto logitsOutHost = mBufferManager->copyFrom(*mOutLogitsDevice, MemoryType::kCPU);
 
@@ -655,15 +658,14 @@ public:
     {
         subsetup(param);
 
-        InvokeBatchApplyPenaltyParams<T> penalty_params{reinterpret_cast<T**>(bufferCast<int64_t>(*mLogitsPtrs)),
+        InvokeBatchApplyPenaltyParams<T> penaltyParams{reinterpret_cast<T**>(bufferCast<int64_t>(*mLogitsPtrs)),
             bufferCast<T>(*mOutLogitsDevice), nullptr, bufferCast<int32_t>(*mPenaltyWorkspaceDevice), nullptr, nullptr,
             bufferCast<float>(*mRepetitionPenaltiesDevice), bufferCast<float>(*mPresencePenaltiesDevice),
-            bufferCast<float>(*mFrequencyPenaltiesDevice), true, static_cast<size_t>(mBatchSize), 1, mSequenceLength,
-            static_cast<size_t>(mVocabSize), static_cast<size_t>(mVocabSizePadded),
-            reinterpret_cast<int32_t const**>(bufferCast<int64_t>(*mIdsPtrDevice)), nullptr,
+            bufferCast<float>(*mFrequencyPenaltiesDevice), true, mBatchSize, 1, mSequenceLength, mVocabSize,
+            mVocabSizePadded, reinterpret_cast<int32_t const**>(bufferCast<int64_t>(*mIdsPtrDevice)), nullptr,
             bufferCast<int32_t>(*mContextLengthDevice), bufferCast<int32_t>(*mSeqLengthDevice), nullptr, nullptr,
             bufferCast<int32_t>(*mBatchSlots), mMaxTokensPerStep, bufferCast<int32_t>(*mTokensPerStep), mStream->get()};
-        tk::invokeBatchApplyPenalty(penalty_params);
+        tk::invokeBatchApplyPenalty(penaltyParams);
 
         auto logitsOutHost = mBufferManager->copyFrom(*mOutLogitsDevice, MemoryType::kCPU);
 
@@ -1252,14 +1254,13 @@ public:
     {
         subsetup(param);
 
-        InvokeBatchApplyPenaltyParams<T> penalty_params{reinterpret_cast<T**>(bufferCast<int64_t>(*mLogitsPtrs)),
+        InvokeBatchApplyPenaltyParams<T> penaltyParams{reinterpret_cast<T**>(bufferCast<int64_t>(*mLogitsPtrs)),
             bufferCast<T>(*mOutLogitsDevice), nullptr, bufferCast<int32_t>(*mPenaltyWorkspaceDevice), nullptr, nullptr,
-            nullptr, nullptr, nullptr, false, static_cast<size_t>(mBatchSize), 1, mSequenceLength,
-            static_cast<size_t>(mVocabSize), static_cast<size_t>(mVocabSizePadded), nullptr, nullptr,
-            bufferCast<int32_t>(*mContextLengthDevice), bufferCast<int32_t>(*mSeqLengthDevice),
+            nullptr, nullptr, nullptr, false, mBatchSize, 1, mSequenceLength, mVocabSize, mVocabSizePadded, nullptr,
+            nullptr, bufferCast<int32_t>(*mContextLengthDevice), bufferCast<int32_t>(*mSeqLengthDevice),
             bufferCast<int32_t>(*mMinLengthDevice), bufferCast<int32_t>(*mEndIdsDevice),
             bufferCast<int32_t>(*mBatchSlots), mMaxTokensPerStep, bufferCast<int32_t>(*mTokensPerStep), mStream->get()};
-        tk::invokeBatchApplyPenalty(penalty_params);
+        tk::invokeBatchApplyPenalty(penaltyParams);
 
         mStream->synchronize();
 

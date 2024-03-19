@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
+#include "tensorrt_llm/runtime/common.h"
 #include <curand_kernel.h>
 
 #include <numeric>
@@ -27,6 +28,9 @@ namespace tensorrt_llm
 {
 namespace kernels
 {
+
+static constexpr uint32_t TOP_K_MAX = 1024;
+
 // clang-format off
 //! \brief Given logProbs, performs top K **and** top P sampling at the same time. Fills sampled tokens to outputIds.
 //! Computes sequenceLength, finished state, cumLogProbs inplace.
@@ -41,7 +45,10 @@ namespace kernels
 //! logProbs must contain **just** probabilities instead of log probabilities.
 //! \param logProbsPtr input buffer [batchSize][vocabSizePadded] array of pointers to logits. If nullptr, logProbs is used.
 //! Only maxTokensPerStep == 1 is supported.
-//! \param outputIds output buffer [maxBatchSize][maxSeqLen]. Contains point32_ters to rows with output tokens per request
+//! \param outputIdsPtrs output buffer [maxBatchSize][maxSeqLen], optional. Contains pointers to rows with output tokens per request.
+//! If nullptr, outputIds must be provided.
+//! \param outputIds output buffer [maxBatchSize, maxSeqLen], optional. Tensor to store output tokens.
+//! Not used if outputIdsPtrs != nullptr
 //! \param sequenceLength input/output buffer [maxBatchSize]. Current sequence length of the request up to, but excluding endId token
 //! \param finishedInput input buffer [maxBatchSize]. If true, request exits early.
 //! \param finishedOutput output buffer [maxBatchSize]. Set flag if sequence has finished (if finished || outputId == endId).
@@ -69,37 +76,42 @@ namespace kernels
 //! \param tokensPerStep input buffer [maxBatchSize], optional. Number of tokens per step for each request.
 //! It is assumed that all requests have maxTokensPerStep tokens per step if nullptr.
 //! \param maxTokensPerStep maximum number of tokens per computed per step
+//! \param maxSeqLen maximum sequence length of outputIds
 //! \param skipDecode input buffer [maxBatchSize]. Flags whether to skip decoding per request
 //! \param normalizeLogProbs when set to True outputLogProbs are normalized to TopK
 //! \param logitsHasProbs flag to highlight that logProbs contains probabilities
 //! \param returnAllTopK flag to return all selectedTopK results
 // clang-format on
 template <typename T>
-void invokeBatchTopKSampling(void* workspace, T const* logProbs, T const* const* logProbsPtr, int32_t** ids,
-    int32_t* sequenceLengths, FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs,
-    float* outputLogProbs, curandState_t* curandstate, const int32_t maxTopK, int32_t const* topKs, float const topP,
-    float const* topPs, const int32_t vocabSizePadded, int32_t const* endIds, int32_t const* batchSlots,
-    cudaStream_t stream, const int32_t batchSize, int maxBatchSize, int32_t const* tokensPerStep,
-    const int32_t maxTokensPerStep, bool const* skipDecode, bool normalizeLogProbs, bool logitsHasProbs,
+void invokeBatchTopKSampling(void* workspace, T const* logProbs, T const* const* logProbsPtr,
+    runtime::TokenIdType** outputIdsPtrs, runtime::TokenIdType* outputIds, runtime::SizeType* sequenceLengths,
+    FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
+    curandState_t* curandstate, runtime::SizeType maxTopK, runtime::SizeType const* topKs, float topP,
+    float const* topPs, runtime::SizeType vocabSizePadded, runtime::TokenIdType const* endIds,
+    runtime::SizeType const* batchSlots, cudaStream_t stream, runtime::SizeType batchSize,
+    runtime::SizeType maxBatchSize, runtime::SizeType const* tokensPerStep, runtime::SizeType maxTokensPerStep,
+    runtime::SizeType maxSeqLen, bool const* skipDecode, bool normalizeLogProbs, bool logitsHasProbs,
     bool returnAllTopK);
 
 //! \brief Specialization of invokeBatchTopKSampling with topPs=nullptr and topKs=nullptr
 template <typename T>
-void invokeTopKSampling(void* workspace, T const* logProbs, T const* const* logProbsPtr, int32_t** outputIds,
-    int32_t* sequenceLength, FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs,
-    float* outputLogProbs, curandState_t* curandstate, const int32_t topK, float const topP,
-    const int32_t vocabSizePadded, int32_t const* endIds, int32_t const* batchSlots, cudaStream_t stream,
-    const int32_t batchSize, int maxBatchSize, int32_t const* tokensPerStep, const int32_t maxTokensPerStep,
-    bool const* skipDecode, bool normalizeLogProbs, bool logitsHasProbs, bool returnAllTopK);
+void invokeTopKSampling(void* workspace, T const* logProbs, T const* const* logProbsPtr,
+    runtime::TokenIdType** outputIdsPtrs, runtime::TokenIdType* outputIds, runtime::SizeType* sequenceLength,
+    FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
+    curandState_t* curandstate, runtime::SizeType topK, float topP, runtime::SizeType vocabSizePadded,
+    runtime::TokenIdType const* endIds, runtime::SizeType const* batchSlots, cudaStream_t stream,
+    runtime::SizeType batchSize, int maxBatchSize, runtime::SizeType const* tokensPerStep,
+    runtime::SizeType maxTokensPerStep, runtime::SizeType maxSeqLen, bool const* skipDecode, bool normalizeLogProbs,
+    bool logitsHasProbs, bool returnAllTopK);
 
 template <typename T>
-[[nodiscard]] std::vector<size_t> getTopKWorkspaceSizes(
-    int32_t batchSize, int32_t maxTokensPerStep, int32_t maxTopK, int32_t vocabSizePadded)
+[[nodiscard]] std::vector<size_t> getTopKWorkspaceSizes(runtime::SizeType batchSize, runtime::SizeType maxTokensPerStep,
+    runtime::SizeType maxTopK, runtime::SizeType vocabSizePadded)
 {
-    int32_t constexpr maxBlockPerBeam = 8;
+    runtime::SizeType constexpr maxBlockPerBeam = 8;
     auto const tempLogProbsBufSize = sizeof(T) * batchSize * maxTokensPerStep * vocabSizePadded;         // type T
     auto const topKTmpIdsBufSize
-        = sizeof(int32_t) * batchSize * maxTokensPerStep * maxTopK * maxBlockPerBeam;                    // type int
+        = sizeof(runtime::SizeType) * batchSize * maxTokensPerStep * maxTopK * maxBlockPerBeam;          // type int
     auto const topKTmpValBufSize = sizeof(T) * batchSize * maxTokensPerStep * maxTopK * maxBlockPerBeam; // type T
 
     return {tempLogProbsBufSize, topKTmpIdsBufSize, topKTmpValBufSize};
@@ -111,8 +123,8 @@ template <typename T>
 //! \param maxTopK maximum among all topKs K for topK sampling
 //! \param vocabSizePadded size of padded vocab
 template <typename T>
-[[nodiscard]] size_t getTopKWorkspaceSize(
-    int32_t batchSize, int32_t maxTokensPerStep, int32_t maxTopK, int32_t vocabSizePadded)
+[[nodiscard]] size_t getTopKWorkspaceSize(runtime::SizeType batchSize, runtime::SizeType maxTokensPerStep,
+    runtime::SizeType maxTopK, runtime::SizeType vocabSizePadded)
 {
     auto const workspaceSizes = getTopKWorkspaceSizes<T>(batchSize, maxTokensPerStep, maxTopK, vocabSizePadded);
     return tensorrt_llm::common::calcAlignedSize(workspaceSizes, 256);

@@ -236,6 +236,7 @@ public:
         mNumsDraftTokens = BufferManager::pinned(
             ITensor::makeShape({mMaxBatchSize, mMaxDraftSeqPerStep}), nvinfer1::DataType::kINT32);
         mSequenceLengths = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+        mAcceptedLengths = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
         mContextLengths = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
         mDraftContextLengths = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
         mFinishedSteps = BufferManager::pinned(ITensor::makeShape({mMaxDraftTokens + 1, mMaxBatchSize}),
@@ -402,6 +403,10 @@ public:
                 for (SizeType si = 0; si < numsDraftTokensPtr[bi * mMaxDraftSeqPerStep + ti]; ++si)
                 {
                     auto const pathIdx = tc::flat_index3(bi, ti, si, mMaxDraftSeqPerStep, mMaxDraftTokens);
+                    if (pathsPtr[pathIdx] == -1)
+                    {
+                        continue;
+                    }
                     auto const draftTokenIdx = bi * mMaxDraftSeqlen + draftContextLengthsPtr[bi] + pathsPtr[pathIdx];
                     // Avoid generating endId. We'll insert in manually later if needed.
                     draftTokensPtr[draftTokenIdx] = generateAvoidingValues(vocabDistr, {mPadId, endIdsPtr[bi]});
@@ -443,28 +448,42 @@ public:
                 //         ti (!= di), ti+1 (!= di+1), ... for (targetPredictedLen[bi] - targetAcceptedLen[bi]),
                 //         EOS, EOS, EOS, ... for (numsDraftTokensPtr[bi] - targetPredictedLen[bi])
                 //         padId, padId, .. to mMaxSeqLen]
-                for (SizeType si = 0; si < numsDraftTokensPtr[bi * mMaxDraftSeqPerStep + ti]; ++si)
+                auto numDraftTokens = numsDraftTokensPtr[bi * mMaxDraftSeqPerStep + ti];
+                for (SizeType si = 0; si < numDraftTokens; ++si)
                 {
-                    auto const pathIdx = tc::flat_index3(bi, ti, si, mMaxDraftSeqPerStep, mMaxDraftTokens);
-                    auto const pathId = pathsPtr[pathIdx];
-                    if (pathId == -1)
+                    auto const curPathIdx = tc::flat_index3(bi, ti, si, mMaxDraftSeqPerStep, mMaxDraftTokens);
+                    auto const nextPathIdx = si + 1 < numDraftTokens
+                        ? tc::flat_index3(bi, ti, si + 1, mMaxDraftSeqPerStep, mMaxDraftTokens)
+                        : -1;
+                    auto const curPathId = pathsPtr[curPathIdx];
+                    auto nextPathId = curPathId;
+                    if (mAcceptMode == AcceptKernelMode::BY_IDS_WITH_PATH)
+                    {
+                        nextPathId = nextPathIdx > -1 ? pathsPtr[nextPathIdx] : -1;
+                    }
+
+                    if (curPathId == -1)
                     {
                         continue;
                     }
-                    auto const draftTokenIdx = bi * mMaxDraftSeqlen + draftContextLengthsPtr[bi] + pathId;
-                    auto const targetTokenIdx = bi * mMaxSeqLen + contextLengthsPtr[bi] + pathId;
+                    auto const draftTokenIdx = bi * mMaxDraftSeqlen + draftContextLengthsPtr[bi] + nextPathId;
+                    auto const targetTokenIdx = bi * mMaxSeqLen + contextLengthsPtr[bi] + curPathId;
                     auto targetToken = mPadId;
 
-                    if (0 <= si && si < targetAcceptedLen[bi])
+                    if (0 <= si && si < targetAcceptedLen[bi] && nextPathId != -1)
                     {
                         // Use draft token up to the accepted len
                         targetToken = draftTokensPtr[draftTokenIdx];
                     }
-                    else if (targetAcceptedLen[bi] <= si && si < targetPredictedLen[bi])
+                    else if (0 <= si && si < targetPredictedLen[bi])
                     {
                         // Do not use draft token token up to the generated len
-                        targetToken = generateAvoidingValues(
-                            vocabDistr, {mPadId, endIdsPtr[bi], draftTokensPtr[draftTokenIdx]});
+                        std::unordered_set<SizeType> avoidValues = {mPadId, endIdsPtr[bi]};
+                        if (nextPathId != -1)
+                        {
+                            avoidValues.insert(draftTokensPtr[draftTokenIdx]);
+                        }
+                        targetToken = generateAvoidingValues(vocabDistr, avoidValues);
                     }
                     else if (targetPredictedLen[bi] <= si && si < numsDraftTokensPtr[bi])
                     {
@@ -472,7 +491,7 @@ public:
                         targetToken = endIdsPtr[bi];
                     }
                     targetTokensPtr[targetTokenIdx] = targetToken;
-                    TLLM_LOG_DEBUG("bi %d ti %d si %d pathId %d targetToken %d", bi, ti, si, pathId, targetToken);
+                    TLLM_LOG_DEBUG("bi %d ti %d si %d pathId %d targetToken %d", bi, ti, si, curPathId, targetToken);
                 }
             }
         }
@@ -506,19 +525,32 @@ public:
         mAcceptedPathIdx.resize(mMaxBatchSize);
         mRefAcceptedTokens.resize(mMaxBatchSize);
         mFinishedByIdsPaths.resize(mMaxBatchSize);
+        mLastTargetIdx.resize(mMaxBatchSize);
         for (SizeType bi = 0; bi < mMaxBatchSize; ++bi)
         {
             SizeType maxAcceptedLen = -1;
             SizeType maxAcceptedPath = -1;
+            SizeType maxNextTargetTokenIdx = -1;
             bool maxFinished = false;
             std::vector<SizeType> maxAcceptedTokens;
             for (SizeType ti = 0; ti < mMaxDraftSeqPerStep; ++ti)
             {
                 std::vector<SizeType> acceptedTokens;
                 SizeType curAcceptedLen = mMaxDraftTokens;
-                SizeType curAcceptedPath = -1;
+                SizeType curAcceptedPath = ti;
                 bool curFinished = false;
-                for (SizeType di = 0; di < mMaxDraftTokens; ++di)
+
+                auto const pathIdx = tc::flat_index3(bi, ti, 0, mMaxDraftSeqPerStep, mMaxDraftTokens);
+                auto const pathId = pathsPtr[pathIdx];
+                if (pathId == -1)
+                {
+                    continue;
+                }
+                auto targetTokenIdx = bi * mMaxSeqLen + contextLengthsPtr[bi] + pathId;
+                auto targetToken = targetTokensPtr[targetTokenIdx];
+                auto curNextTargetTokenIdx = pathId;
+
+                for (SizeType di = 1; di < mMaxDraftTokens; ++di)
                 {
                     auto const pathIdx = tc::flat_index3(bi, ti, di, mMaxDraftSeqPerStep, mMaxDraftTokens);
                     auto const pathId = pathsPtr[pathIdx];
@@ -527,12 +559,12 @@ public:
                         curAcceptedLen = di;
                         curAcceptedPath = ti;
                         curFinished = false;
+                        acceptedTokens.push_back(targetToken);
                         break;
                     }
                     auto const draftTokenIdx = bi * mMaxDraftSeqlen + draftContextLengthsPtr[bi] + pathId;
-                    auto const targetTokenIdx = bi * mMaxSeqLen + contextLengthsPtr[bi] + pathId;
+                    auto targetTokenIdx = bi * mMaxSeqLen + contextLengthsPtr[bi] + pathId;
                     auto const draftToken = draftTokensPtr[draftTokenIdx];
-                    auto const targetToken = targetTokensPtr[targetTokenIdx];
                     bool const hasEnd = targetToken == endIdsPtr[bi];
                     if (!hasEnd)
                     {
@@ -540,12 +572,19 @@ public:
                     }
                     if (draftToken != targetToken || hasEnd)
                     {
-                        auto const curLen = hasEnd ? di : di + 1;
+                        auto const curLen = hasEnd ? di - 1 : di;
                         curAcceptedLen = curLen;
                         curAcceptedPath = ti;
                         curFinished = hasEnd;
+                        curNextTargetTokenIdx = pathId;
                         break;
                     }
+                    targetToken = targetTokensPtr[targetTokenIdx];
+                    curNextTargetTokenIdx = pathId;
+                }
+                if (curAcceptedLen == mMaxDraftTokens)
+                {
+                    acceptedTokens.push_back(targetToken);
                 }
                 if (curAcceptedLen > maxAcceptedLen)
                 {
@@ -553,12 +592,14 @@ public:
                     maxAcceptedPath = curAcceptedPath;
                     maxAcceptedTokens = acceptedTokens;
                     maxFinished = curFinished;
+                    maxNextTargetTokenIdx = curNextTargetTokenIdx;
                 }
             }
             mAcceptedLen[bi] = maxAcceptedLen;
             mAcceptedPathIdx[bi] = maxAcceptedPath;
             mRefAcceptedTokens[bi] = maxAcceptedTokens;
             mFinishedByIdsPaths[bi] = maxFinished;
+            mLastTargetIdx[bi] = maxNextTargetTokenIdx;
             TLLM_LOG_DEBUG("bi %d maxAcceptedLen %d maxAcceptedPath %d", bi, maxAcceptedLen, maxAcceptedPath);
             std::ostringstream ss;
             for (auto& tk : maxAcceptedTokens)
@@ -687,7 +728,7 @@ public:
     void callAcceptByIdsWithPaths()
     {
         tk::acceptDraftTokensByIdsWithPaths(bufferCast<SizeType>(*mDraftTokens), bufferCast<SizeType>(*mTargetTokens),
-            bufferCast<SizeType>(*mDraftContextLengths),
+            bufferCast<SizeType>(*mDraftContextLengths), bufferCast<SizeType>(*mAcceptedLengths),
             reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*mFinishedFinal)),
             bufferCast<SizeType>(*mBatchSlots), bufferCast<SizeType>(*mPaths), bufferCast<SizeType>(*mEndIds),
             static_cast<T const*>(nullptr), reinterpret_cast<T const**>(bufferCast<int64_t>(*mMedusaLogitsPtrs)),
@@ -779,6 +820,7 @@ public:
         auto batchSlotsPtr = BufferRange<SizeType>(*mBatchSlots);
         auto draftContextLengths = BufferRange<SizeType>(*mDraftContextLengths);
         auto draftContextLengthsInit = BufferRange<SizeType>(*mDraftContextLengthsCopy);
+        auto acceptedLengths = BufferRange<SizeType>(*mAcceptedLengths);
         auto draftTokensPtr = BufferRange<SizeType>(*mDraftTokens);
         auto finishedFinalPtr
             = reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*mFinishedFinal));
@@ -787,17 +829,24 @@ public:
         {
             auto const batchSlot = batchSlotsPtr[bi];
             auto const bestPathIdx = mAcceptedPathIdx[batchSlot];
+            auto const lastTargetIdx = mLastTargetIdx[batchSlot];
+            if (lastTargetIdx < 0)
+            {
+                continue;
+            }
+
             auto const acceptedLen = mAcceptedLen[batchSlot];
             auto acceptedTokens = mRefAcceptedTokens[batchSlot];
 
             for (int32_t hi = 0; hi < mMaxNumHeads; ++hi)
             {
                 auto refOffset
-                    = tc::flat_index4(hi, bi, acceptedLen, 0, mMaxBatchSize, mMaxDraftSeqPerStep, mVocabSize);
+                    = tc::flat_index4(hi, bi, lastTargetIdx, 0, mMaxBatchSize, mMaxDraftSeqPerStep, mVocabSize);
                 auto outOffset
                     = static_cast<SizeType>(medusaLogitsPtrsPtr[bi * mMaxNumHeads + hi] - static_cast<T*>(nullptr));
                 EXPECT_EQ(outOffset, refOffset) << " bi: " << bi << " hi: " << hi << " seed: " << seed;
             }
+            EXPECT_EQ(acceptedLengths[batchSlot], acceptedLen) << " bi: " << bi << " seed: " << seed;
             EXPECT_EQ(draftContextLengths[batchSlot], draftContextLengthsInit[batchSlot] + acceptedLen)
                 << " bi: " << bi << " seed: " << seed << " out: " << draftContextLengths[batchSlot]
                 << " ref: " << draftContextLengthsInit[batchSlot] + acceptedLen;
@@ -858,6 +907,10 @@ public:
 
         for (SizeType seed = 0; seed < mSeeds; ++seed)
         {
+            // if (seed != 145)
+            // {
+            //     continue;
+            // }
             TLLM_LOG_DEBUG("Seed %d", seed);
 
             initData(seed);
@@ -889,6 +942,7 @@ protected:
 
     TensorPtr mNumsDraftTokens;
     TensorPtr mSequenceLengths;
+    TensorPtr mAcceptedLengths;
     TensorPtr mContextLengths;
     TensorPtr mDraftContextLengthsCopy;
     TensorPtr mDraftContextLengths;
@@ -907,6 +961,7 @@ protected:
     std::vector<SizeType> mOutputLen;
     std::vector<tk::FinishedState> mAcceptedFinished;
     std::vector<SizeType> mAcceptedPathIdx;
+    std::vector<SizeType> mLastTargetIdx;
     std::vector<std::vector<SizeType>> mRefAcceptedTokens;
     std::vector<bool> mFinishedByIdsPaths;
 

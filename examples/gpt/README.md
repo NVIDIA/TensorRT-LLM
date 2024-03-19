@@ -1,15 +1,12 @@
 # GPT
 
-This document explains how to build the [GPT](https://huggingface.co/gpt2) model using TensorRT-LLM and run on a single GPU, a single node with
-multiple GPUs or multiple nodes with multiple GPUs.
+This document explains how to build the [GPT](https://huggingface.co/gpt2) model using TensorRT-LLM and run on a single GPU, a single node with multiple GPUs or multiple nodes with multiple GPUs.
 
 ## Overview
 
-The TensorRT-LLM GPT implementation can be found in [`tensorrt_llm/models/gpt/model.py`](../../tensorrt_llm/models/gpt/model.py). The TensorRT-LLM GPT example code is located in [`examples/gpt`](./). There are two main files:
+The TensorRT-LLM GPT implementation can be found in [`tensorrt_llm/models/gpt/model.py`](../../tensorrt_llm/models/gpt/model.py). The TensorRT-LLM GPT example code is located in [`examples/gpt`](./). There is one main file:
 
-* [`hf_gpt_convert.py`](./hf_gpt_convert.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers)
-    format to the [FasterTransformer (FT)](https://github.com/NVIDIA/FasterTransformer) format,
-* [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the GPT model.
+* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT-LLM format.
 
 In addition, there are two shared files in the parent folder [`examples`](../) for inference and evaluation:
 
@@ -28,128 +25,201 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 ## Usage
 
 The next two sections describe how to convert the weights from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers)
-format to the FT format. You can skip those two sections if you already have weights in the
-FT format.
-
-Note, also, that if your weights are neither in HF Transformers nor in FT formats, you will need to convert to the FT format. The script like
-[`hf_gpt_convert.py`](./hf_gpt_convert.py) can serve as a starting point.
+format to the TensorRT-LLM format.
 
 ### 1. Download weights from HuggingFace Transformers
 
 ```bash
-# Weights & config
+# Download hf gpt2 model
 rm -rf gpt2 && git clone https://huggingface.co/gpt2-medium gpt2
 pushd gpt2 && rm pytorch_model.bin model.safetensors && wget -q https://huggingface.co/gpt2-medium/resolve/main/pytorch_model.bin && popd
 ```
 
-### 2. Convert weights from HF Transformers to FT format
-
-TensorRT-LLM can directly load weights from FT. The [`hf_gpt_convert.py`](./hf_gpt_convert.py) script allows you to convert weights from HF Transformers
-format to FT format.
+### 2. Convert weights from HF Transformers to TensorRT-LLM format
+The [`convert_checkpoint.py`](./convert_checkpoint.py) script converts HF weights to TensorRT-LLM checkpoints. The number of checkpoint files (in .safetensors format) is same to the number of GPUs used to run inference.
 
 ```bash
-python3 hf_gpt_convert.py -i gpt2 -o ./c-model/gpt2 --tensor-parallelism 1 --storage-type float16
+# single gpu, dtype float16
+python3 convert_checkpoint.py --model_dir gpt2 \
+        --dtype float16 \
+        --output_dir gpt2/trt_ckpt/fp16/1-gpu
+
+# 2-way tensor parallelism
+python3 convert_checkpoint.py --model_dir gpt2 \
+        --dtype float16 \
+        --tp_size 2 \
+        --output_dir gpt2/trt_ckpt/fp16/2-gpu
 ```
 
-This script uses multiple processes to speed-up writing the model to disk. This may saturate your RAM depending on the model you are exporting.
-In case that happens, you can reduce the number of processes with `--processes <num_processes>`. Set it to 1 for minimal RAM usage.
-
 ### 3. Build TensorRT engine(s)
+The `trtllm-build` command builds TensorRT-LLM engines from TensorRT-LLM checkpoints. The checkpoint directory provides the model's weights and architecture configuration. The number of engine files is also same to the number of GPUs used to run inference.
 
-TensorRT-LLM builds TensorRT engine(s) using a checkpoint in FT format. The checkpoint directory provides the model's weights, architecture configuration
-and custom tokenizer if specified. If no checkpoint directories are specified, TensorRT-LLM will build engine(s) using random weights. When building with
-random weights, you can use command-line arguments to modify the architecture: `--n_layer, --n_head, --n_embd, --hidden_act, --no_bias, ...`
-Also, note that the number of TensorRT engines depends on the number of GPUs that will be used to run inference.
-
-The [`build.py`](./build.py) script requires a single GPU to build the TensorRT engine(s). However, if you have more than one GPU in your system (of the same
-model), you can enable parallel builds to accelerate the engine building process. For that, add the `--parallel_build` argument to the build command. Please
-note that for the moment, the `parallel_build` feature cannot take advantage of more than a single node.
-
-Examples of build invocations:
+Normally, the `trtllm-build` command only requires a single GPU, but you can enable parallel building by passing the number of GPUs to the `--workers` argument.
 
 ```bash
-# Build a single-GPU float16 engine using FT weights.
-# Enable the special TensorRT-LLM GPT Attention plugin (--use_gpt_attention_plugin) to increase runtime performance.
-# It is recommend to use --remove_input_padding along with --use_gpt_attention_plugin for better performance
-python3 build.py --model_dir=./c-model/gpt2/1-gpu --use_gpt_attention_plugin --remove_input_padding
+# Build a single-GPU float16 engine from TensorRT-LLM checkpoint.
+# Enable the special TensorRT-LLM GPT Attention plugin (--gpt_attention_plugin) to increase runtime performance.
+# It is recommend to use --remove_input_padding along with --gpt_attention_plugin for better performance
+trtllm-build --checkpoint_dir gpt2/trt_ckpt/fp16/1-gpu \
+        --gpt_attention_plugin float16 \
+        --remove_input_padding enable \
+        --output_dir gpt2/trt_engines/fp16/1-gpu
 
-# Build 8-GPU GPT-175B float16 engines using dummy weights, useful for performance tests.
-# Enable several TensorRT-LLM plugins to increase runtime performance. It also helps with build time.
-python3 build.py --world_size=8 \
-                 --log_level=verbose \
-                 --n_layer=96 \
-                 --n_embd=12288 \
-                 --n_head=96 \
-                 --max_batch_size=256 \
-                 --dtype float16 \
-                 --remove_input_padding \
-                 --use_gpt_attention_plugin \
-                 --enable_context_fmha \
-                 --use_gemm_plugin \
-                 --output_dir=gpt_175b 2>&1 | tee build.log
+# Build 2-way tensor parallelism engines from TensorRT-LLM checkpoint.
+trtllm-build --checkpoint_dir gpt2/trt_ckpt/fp16/2-gpu \
+        --gpt_attention_plugin float16 \
+        --remove_input_padding enable \
+        --output_dir gpt2/trt_engines/fp16/2-gpu
+```
 
-# Build 16-GPU GPT-530B float16 engines using dummy weights, useful for performance tests.
-# Enable several TensorRT-LLM plugins to increase runtime performance. It also helps with build time.
-python3 build.py --world_size=16 \
-                 --log_level=info \
-                 --n_layer=105 \
-                 --n_embd=20480 \
-                 --n_head=128 \
-                 --max_batch_size=128 \
-                 --max_input_len=128 \
-                 --max_output_len=20 \
-                 --dtype float16 \
-                 --remove_input_padding \
-                 --use_gpt_attention_plugin \
-                 --enable_context_fmha \
-                 --use_gemm_plugin \
-                 --output_dir=gpt_530b 2>&1 | tee build.log
+If the engines are built successfully, you will see output like:
+```
+......
+[03/12/2024-10:21:08] [TRT] [I] Engine generation completed in 35.9738 seconds.
+[03/12/2024-10:21:08] [TRT] [I] [MemUsageStats] Peak memory usage of TRT CPU/GPU memory allocators: CPU 212 MiB, GPU 775 MiB
+[03/12/2024-10:21:08] [TRT] [I] [MemUsageChange] TensorRT-managed allocation in building engine: CPU +0, GPU +775, now: CPU 0, GPU 775 (MiB)
+[03/12/2024-10:21:09] [TRT] [I] [MemUsageStats] Peak memory usage during Engine building and serialization: CPU: 6600 MiB
+[03/12/2024-10:21:09] [TRT-LLM] [I] Total time of building Unnamed Network 0: 00:00:36
+[03/12/2024-10:21:09] [TRT-LLM] [I] Serializing engine to gpt2/trt_engines/fp16/1-gpu/rank0.engine...
+[03/12/2024-10:21:11] [TRT-LLM] [I] Engine serialized. Total time: 00:00:02
+[03/12/2024-10:21:11] [TRT-LLM] [I] Total time of building all engines: 00:00:41
 ```
 
 #### Fused MultiHead Attention (FMHA)
 
-You can enable the FMHA kernels for GPT by adding `--enable_context_fmha` to the invocation of `build.py`.
+You can enable the FMHA kernels by adding `--context_fmha enable` to the invocation of `trtllm-build`.
 
-If you find that the default fp16 accumulation (`--enable_context_fmha`) cannot meet the requirement, you can try to enable fp32 accumulation by adding `--enable_context_fmha_fp32_acc`. However, it is expected to see performance drop.
+If you find that the default fp16 accumulation (`--context_fmha enable`) cannot meet the requirement, you can try to enable fp32 accumulation by adding `--context_fmha_fp32_acc enable`. However, it is expected to see performance drop.
 
-Note `--enable_context_fmha` / `--enable_context_fmha_fp32_acc` has to be used together with `--use_gpt_attention_plugin float16`.
+Note that the FMHA kernels have to be used together with `--gpt_attention_plugin float16`.
 
 #### In-flight batching and paged KV cache
 
-If one wants to use [in-flight batching in C++ runtime](../../docs/in_flight_batching.md), the engine must be built accordingly.
-In-flight batching is enabled by adding `--use_inflight_batching` to the invocation of `build.py`.
-Note that in-flight batching in C++ runtime works only with attention plugin `--use_gpt_attention_plugin=float16`, paged KV cache `--paged_kv_cache` and with packed data `--remove_input_padding`.
-Adding `--use_inflight_batching` will enable these three flags if not already enabled. It is possible to choose a different precision for `--use_gpt_attention_plugin` if the flag is provided separately.
-One can additionally control the size of the block in paged KV cache using `--tokens_per_block=N`.
+If one wants to use [in-flight batching in C++ runtime](../../docs/in_flight_batching.md), the engine must be built accordingly. In-flight batching in C++ runtime works only with attention plugin, paged KV cache and with packed data. Hence, the `trtllm-build` should be called with `--gpt_attention_plugin float16`, `--paged_kv_cache enable`, `--remove_input_padding enable`. It is possible to choose a different precision for `--gpt_attention_plugin` if the flag is provided separately. One can additionally control the size of the block in paged KV cache using `--tokens_per_block=N`.
 
-### 4. Run
-
-
-#### Single node, single GPU
-
-To run a TensorRT-LLM GPT model on a single GPU, you can use `python3`:
+### 4. Build TensorRT engine(s) with Random Weights
+You can build engine(s) using random weights, which is useful for benchmarking. First, the [`../generate_checkpoint_config.py`](../generate_checkpoint_config.py) script can be used to generate a TensorRT-LLM checkpoint config file:
 
 ```bash
-# Run the GPT-350M model on a single GPU.
-python3 ../run.py --max_output_len=8 --no_add_special_tokens
+# Generate an 8-GPU GPT-175B float16 checkpoint config file.
+python3 ../generate_checkpoint_config.py --architecture GPTForCausalLM \
+        --vocab_size 51200 \
+        --hidden_size 12288 \
+        --num_hidden_layers 96 \
+        --num_attention_heads 96 \
+        --dtype float16 \
+        --tp_size 8 \
+        --output_path gpt_175b/trt_ckpt/fp16/8-gpu/config.json
+
+
+# Generate a 16-GPU GPT-530B float16 checkpoint config file.
+python3 ../generate_checkpoint_config.py --architecture GPTForCausalLM \
+        --vocab_size 51200 \
+        --hidden_size 20480 \
+        --num_hidden_layers 105 \
+        --num_attention_heads 128 \
+        --dtype float16 \
+        --tp_size 16 \
+        --output_path gpt_530b/trt_ckpt/fp16/16-gpu/config.json
+```
+
+Then, use `trtllm-build` command to build engine(s) with random weights and the model architecture specified by the generated config file.
+
+```bash
+# Build 8-GPU GPT-175B float16 engines using dummy weights, useful for performance tests.
+# Enable several TensorRT-LLM plugins to increase runtime performance. It also helps with build time.
+trtllm-build --model_config gpt_175b/trt_ckpt/fp16/8-gpu/config.json \
+        --gpt_attention_plugin float16 \
+        --remove_input_padding enable \
+        --context_fmha enable \
+        --gemm_plugin float16 \
+        --max_batch_size 256 \
+        --output_dir gpt_175b/trt_engines/fp16/8-gpu \
+        --workers 8
+
+# Build 16-GPU GPT-530B float16 engines using dummy weights, useful for performance tests.
+# Enable several TensorRT-LLM plugins to increase runtime performance. It also helps with build time.
+trtllm-build --model_config gpt_530b/trt_ckpt/fp16/16-gpu/config.json \
+        --gpt_attention_plugin float16 \
+        --remove_input_padding enable \
+        --context_fmha enable \
+        --gemm_plugin float16 \
+        --max_batch_size 128 \
+        --max_input_len 128 \
+        --max_output_len 20 \
+        --output_dir gpt_530b/trt_engines/fp16/16-gpu \
+        --workers 8
+```
+
+### 5. Run inference
+#### Single node, single GPU
+
+The [`../run.py`](../run.py) script can be used to run inference with the built engine(s).
+
+```bash
+python3 ../run.py --engine_dir gpt2/trt_engines/fp16/1-gpu \
+        --tokenizer_dir gpt2 \
+        --max_output_len 8
+```
+
+If the engines are run successfully, you will see output like:
+```
+......
+Input [Text 0]: "Born in north-east France, Soyer trained as a"
+Output [Text 0 Beam 0]: " chef before moving to London in the early"
+```
+
+The [`../summarize.py`](../summarize.py) script can run the built engines to summarize the articles from the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
+For each summary, the script can compute the
+[ROUGE](https://en.wikipedia.org/wiki/ROUGE_(metric)) scores and use the `ROUGE-1` score to validate the implementation.
+By passing `--test_trt_llm` flag, the script will evaluate TensorRT-LLM engines. You may also pass `--test_hf` flag to evaluate the HF model.
+
+```bash
+python3 ../summarize.py --engine_dir gpt2/trt_engines/fp16/1-gpu \
+        --hf_model_dir gpt2 \
+        --test_trt_llm \
+        --test_hf
+```
+If the engines are run successfully, you will see output like:
+```
+......
+[03/13/2024-05:43:18] [TRT-LLM] [I] TensorRT-LLM (total latency: 1.520904541015625 sec)
+[03/13/2024-05:43:18] [TRT-LLM] [I] TensorRT-LLM (total output tokens: 0)
+[03/13/2024-05:43:18] [TRT-LLM] [I] TensorRT-LLM (tokens per second: 0.0)
+[03/13/2024-05:43:18] [TRT-LLM] [I] TensorRT-LLM beam 0 result
+[03/13/2024-05:43:18] [TRT-LLM] [I]   rouge1 : 21.13474087351942
+[03/13/2024-05:43:18] [TRT-LLM] [I]   rouge2 : 6.2641616526063775
+[03/13/2024-05:43:18] [TRT-LLM] [I]   rougeL : 16.693574311238077
+[03/13/2024-05:43:18] [TRT-LLM] [I]   rougeLsum : 18.477384201634088
+[03/13/2024-05:43:18] [TRT-LLM] [I] Hugging Face (total latency: 8.76440143585205 sec)
+[03/13/2024-05:43:18] [TRT-LLM] [I] HF beam 0 result
+[03/13/2024-05:43:18] [TRT-LLM] [I]   rouge1 : 20.834898522466
+[03/13/2024-05:43:18] [TRT-LLM] [I]   rouge2 : 5.6914719275508805
+[03/13/2024-05:43:18] [TRT-LLM] [I]   rougeL : 16.297064309934132
+[03/13/2024-05:43:18] [TRT-LLM] [I]   rougeLsum : 18.018627021792142
 ```
 
 #### Single node, multiple GPUs
 
-To run a model using multiple GPUs on a single node, you can use `mpirun` as:
+To run engines using multiple GPUs on a single node, you can use `mpirun` as:
 
 ```bash
-# Run the GPT-175B model on a single node using multiple GPUs.
-mpirun -np 8 python3 ../run.py --max_output_len=8 --engine_dir=gpt_175b --no_add_special_tokens
+mpirun -np 2 \
+    python3 ../run.py --engine_dir gpt2/trt_engines/fp16/2-gpu \
+        --tokenizer_dir gpt2 \
+        --max_output_len 8
+
+# Note that GPT-175B is built with random weights, so the output will also be random
+mpirun -np 8 \
+    python3 ../run.py --engine_dir gpt_175b/trt_engines/fp16/8-gpu \
+        --max_output_len 8
 ```
 
 #### Multiple nodes, multiple GPUs using [Slurm](https://slurm.schedmd.com)
 
-To run a model using multiple nodes, you should use a cluster manager like `Slurm`. The following section shows how to configure
-TensorRT-LLM to execute on two nodes using Slurm.
+To run engines using multiple nodes, you should use a cluster manager like `Slurm`. The following section shows how to configure TensorRT-LLM to execute on two nodes using Slurm.
 
-We start by preparing an `sbatch` script called `tensorrt_llm_run.sub`. That script contains the following code (you must replace
-the `<REPLACE ...>` strings with your own values):
+We start by preparing an `sbatch` script called `tensorrt_llm_run.sub`. That script contains the following code (you must replace the `<REPLACE ...>` strings with your own values):
 
 ```bash
 #!/bin/bash
@@ -165,11 +235,12 @@ the `<REPLACE ...>` strings with your own values):
 sudo nvidia-smi -lgc 1410,1410
 
 srun --mpi=pmix \
-     --container-image <image> \
-     --container-mounts <path>:<path> \
-     --container-workdir <path> \
-     --output logs/tensorrt_llm_%t.out \
-     --error logs/tensorrt_llm_%t.error python3 -u ../run.py --max_output_len=8 --engine_dir <engine_dir> --no_add_special_tokens
+    --container-image <image> \
+    --container-mounts <path>:<path> \
+    --container-workdir <path> \
+    --output logs/tensorrt_llm_%t.out \
+    --error logs/tensorrt_llm_%t.error \
+        python3 -u ../run.py --engine_dir <engine_dir> --max_output_len 8
 ```
 
 Then, submit the job using:
@@ -180,109 +251,12 @@ sbatch tensorrt_llm_run.sub
 
 You might have to contact your cluster's administrator to help you customize the above script.
 
-## GPT Variant - SantaCoder
 
-The SantaCoder extends the existing GPT model with multi-query attention mechanism. The following example shows building a 4-GPU engine and running simple prompt to generate the implementation of `hello_world()`.
+## Quantization
 
-The main differences in this example are:
-1. In model conversion `hf_gpt_convert.py` where extra option `--model santacoder` is required to allow converting checkpoint correctly
-2. In engine execution `../run.py` where `--tokenizer_dir ./santacoder` needs to be specified to decode the output ids correctly.
-
-```bash
-git clone https://huggingface.co/bigcode/santacoder
-
-python3 hf_gpt_convert.py -p 8 --model santacoder -i ./santacoder -o ./c-model/santacoder --tensor-parallelism 4 --storage-type float16
-
-python3 build.py \
-    --model_dir ./c-model/santacoder/4-gpu \
-    --remove_input_padding \
-    --use_gpt_attention_plugin \
-    --enable_context_fmha \
-    --use_gemm_plugin \
-    --parallel_build \
-    --output_dir santacoder_outputs_tp4 \
-    --world_size 4
-
-mpirun -np 4 python3 ../run.py --engine_dir santacoder_outputs_tp4 --tokenizer_dir ./santacoder --input_text "def print_hello_world():" --max_output_len 20 --no_add_special_tokens
-```
-
-## GPT Variant - StarCoder (v1 and v2)
-
-For StarCoder, the steps are similar except that `santacoder` is swapped with `starcoder`.
-
-```bash
-git clone https://huggingface.co/bigcode/starcoder
-
-python3 hf_gpt_convert.py -p 8 --model starcoder -i ./starcoder -o ./c-model/starcoder --tensor-parallelism 4 --storage-type float16
-
-python3 build.py \
-    --model_dir ./c-model/starcoder/4-gpu \
-    --remove_input_padding \
-    --use_gpt_attention_plugin \
-    --enable_context_fmha \
-    --use_gemm_plugin \
-    --parallel_build \
-    --output_dir starcoder_outputs_tp4 \
-    --world_size 4
-
-mpirun -np 4 python3 ../run.py --engine_dir starcoder_outputs_tp4 --tokenizer_dir ./starcoder  --input_text "def print_hello_world():" --max_output_len 20 --no_add_special_tokens
-```
-
-For StarCoder2, you can use almost the same steps as shown above by just setting `--model starcoder2` when converting the huggingface models.
- - Note that StarCoder2 hasn't been merged to the official releases of transformers package yet, so remember using the [main branch of transformers repo](https://github.com/huggingface/transformers).
- - Add `--max_attention_window_size 4096` when running with run.py or summarization, which enables the sliding window attention.
-   - the sliding window size comes from the hf model [config.json](https://huggingface.co/bigcode/starcoder2-15b/blob/main/config.json#L23).
-
-## Summarization using the GPT model
-
-The following section describes how to run a TensorRT-LLM GPT model to summarize the articles from the
-[cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset. For each summary, the script can compute the
-[ROUGE](https://en.wikipedia.org/wiki/ROUGE_(metric)) scores and use the `ROUGE-1` score to validate the implementation.
-The script can also perform the same summarization using the HF GPT model.
-
-As previously explained, the first step is to convert from an HF checkpoint and build the TensorRT engines.
-
-```bash
-# Load the GPT2 weights from the HF hub.
-pip install -r requirements.txt
-rm -rf gpt2 && git clone https://huggingface.co/gpt2
-pushd gpt2 && rm pytorch_model.bin model.safetensors && wget -q https://huggingface.co/gpt2/resolve/main/pytorch_model.bin && popd
-
-# Convert the weights to FT format.
-python3 hf_gpt_convert.py -i gpt2 -o ./c-model/gpt2/fp16 --tensor-parallelism 1 --storage-type float16
-
-# Build the model.
-python3 build.py --model_dir=./c-model/gpt2/fp16/1-gpu \
-                 --remove_input_padding \
-                 --use_gpt_attention_plugin \
-                 --enable_context_fmha \
-                 --use_gemm_plugin \
-                 --max_batch_size 8 \
-                 --max_input_len 924 \
-                 --max_output_len 100 \
-                 --output_dir trt_engine/gpt2/fp16/1-gpu/ \
-                 --hidden_act gelu
-```
-
-The summarization can be done using the [`../summarize.py`](../summarize.py) script as follows:
-
-```bash
-# Run the summarization task.
-python3 ../summarize.py --engine_dir trt_engine/gpt2/fp16/1-gpu \
-                        --hf_model_dir gpt2 \
-                        --test_trt_llm \
-                        --test_hf \
-                        --batch_size 1 \
-                        --check_accuracy \
-                        --tensorrt_llm_rouge1_threshold=14 \
-                        --no_add_special_tokens
-```
-
-## SmoothQuant
+### SmoothQuant
 
 This section explains how to use SmoothQuant on GPT models with TensorRT-LLM.
-
-### Overview
 
 [SmoothQuant](https://arxiv.org/abs/2211.10438) is a post-training quantization
 (PTQ) method to quantize LLM models to INT8 for faster inference. As explained
@@ -346,144 +320,323 @@ TensorRT-LLM also supports more elaborate modes:
 Users can mix-and-match per-channel and per-token options. Both tend to
 increase the accuracy of the model at the cost of a slightly increased latency.
 
-### Usage
-
-#### SmoothQuant a HF model, export weights & scales for TensorRT-LLM
-
-For SmoothQuant, [`hf_gpt_convert.py`](./hf_gpt_convert.py) features a
-`--smoothquant, -sq` option. It must be set to a decimal value in `[0, 1]` and
+#### Usage
+[`convert_checkpoint.py`](./convert_checkpoint.py) features a
+`--smoothquant` option. It must be set to a decimal value in `[0, 1]` and
 corresponds to the `alpha` parameter in the [SmoothQuant
-paper](https://arxiv.org/abs/2211.10438). Setting `-sq` will smooth the model
+paper](https://arxiv.org/abs/2211.10438). Setting `--smoothquant` will smooth the model
 as explained in [model transformation](#model-transformation) and export the
 scaling factors needed for INT8 inference.
 
-Example:
-```bash
-python3 hf_gpt_convert.py -i gpt2 -o ./c-model/gpt2-smooth --smoothquant 0.5 -t float16
-```
-
-#### Build TensorRT engine(s)
-
-[`build.py`](./build.py) add new options for the support of INT8 inference of SmoothQuant models.
-
-`--use_smooth_quant` is the starting point of INT8 inference. By default, it
-will run the model in the _per-tensor_ mode, as explained in [INT8
-inference](#int8-inference).
-
-Then, you can add any combination of `--per-token` and `--per-channel` to get the corresponding behaviors.
-
-Examples of build invocations:
+By default, it will run the model in the per-tensor mode, as explained in [INT8
+inference](#int8-inference). You can add any combination of `--per_token` and `--per_channel` to get the corresponding behaviors.
 
 ```bash
-# Build model for SmoothQuant in the _per_tensor_ mode.
-python3 build.py --model_dir=./c-model/gpt2-smooth/1-gpu \
-                 --use_gpt_attention_plugin \
-                 --use_smooth_quant
+# Per-tensor SmoothQuant
+python3 convert_checkpoint.py --model_dir gpt2 \
+        --dtype float16 \
+        --smoothquant 0.5 \
+        --output_dir gpt2/trt_ckpt/int8-sq/1-gpu
 
-# Build model for SmoothQuant in the _per_token_ + _per_channel_ mode
-python3 build.py --model_dir=./c-model/gpt2-smooth/1-gpu \
-                 --use_gpt_attention_plugin \
-                 --use_smooth_quant \
-                 --per_token \
-                 --per_channel
+# Per-token per-channel SmoothQuant
+python3 convert_checkpoint.py --model_dir gpt2 \
+        --dtype float16 \
+        --smoothquant 0.5 \
+        --per_token \
+        --per_channel \
+        --output_dir gpt2/trt_ckpt/int8-sq-ptpc/1-gpu
 ```
+
+Then, use `trtllm-build` to build engine(s).
+
+```bash
+# Per-tensor SmoothQuant
+trtllm-build --checkpoint_dir gpt2/trt_ckpt/int8-sq/1-gpu \
+        --gpt_attention_plugin float16 \
+        --remove_input_padding enable \
+        --output_dir gpt2/trt_engines/int8-sq/1-gpu
+
+# Per-token per-channel SmoothQuant
+trtllm-build --checkpoint_dir gpt2/trt_ckpt/int8-sq-ptpc/1-gpu \
+        --gpt_attention_plugin float16 \
+        --remove_input_padding enable \
+        --output_dir gpt2/trt_engines/int8-sq-ptpc/1-gpu
+```
+
 Note that GPT attention plugin is required to be enabled for SmoothQuant for now.
 
-### INT8 KV Cache, export weights & scales for TensorRT-LLM
 
-For int8 kv cache, [`hf_gpt_convert.py`](./hf_gpt_convert.py) features a
-`--calibrate-kv-cache, -kv` option. Setting `-kv` will calibrate the model as
-explained in [model transformation](#model-transformation) and export the
+### INT8 KV Cache
+
+[`convert_checkpoint.py`](./convert_checkpoint.py) features a
+`--int8_kv_cache` option. Setting `--int8_kv_cache` will calibrate the model and export the
 scaling factors needed for INT8 KV cache inference.
 
-Example:
-
 ```bash
-python3 hf_gpt_convert.py -i gpt2 -o ./c-model/gpt2 --calibrate-kv-cache -t float16
+# Int8 KV cache
+python3 convert_checkpoint.py --model_dir gpt2 \
+        --dtype float16 \
+        --int8_kv_cache \
+        --output_dir gpt2/trt_ckpt/int8kv/1-gpu
+
+trtllm-build --checkpoint_dir gpt2/trt_ckpt/int8kv/1-gpu \
+        --gpt_attention_plugin float16 \
+        --remove_input_padding enable \
+        --strongly_typed \
+        --output_dir gpt2/trt_engines/int8kv/1-gpu
 ```
 
-#### Build TensorRT engine(s)
+INT8 KV cache can be used with or without gpt attention plugin.
 
-[`build.py`](./build.py) add new options for the support of INT8 kv cache for models.
-`--int8_kv_cache` forces KV cache to int8. INT8 KV cache can be used with or without gpt attention plugin.
-Examples of build invocations:
+### Weight Only Quantization
+
+[`convert_checkpoint.py`](./convert_checkpoint.py) features a `--use_weight_only` option that can enable weight-only quantization. You can further set the weight-only precision by passing `int8` or `int4` to the `--weight_only_precision` flag.
 
 ```bash
-# Build model for GPT with int8 kv cache.
-python3 build.py --model_dir=./c-model/gpt2/1-gpu \
-                 --int8_kv_cache --remove_input_padding --use_gpt_attention_plugin float16
+# Int8 weight-only quantization
+python3 convert_checkpoint.py --model_dir gpt2 \
+        --dtype float16 \
+        --use_weight_only \
+        --weight_only_precision int8 \
+        --output_dir gpt2/trt_ckpt/int8-wo/1-gpu
+
+# Int4 weight-only quantization
+python3 convert_checkpoint.py --model_dir gpt2 \
+        --dtype float16 \
+        --use_weight_only \
+        --weight_only_precision int4 \
+        --output_dir gpt2/trt_ckpt/int4-wo/1-gpu
 ```
 
-Example of build  invocations without gpt attention plugin
+Then, use `trtllm-build` to build engine(s).
+
 ```bash
-python3 build.py --model_dir=./c-model/gpt2/1-gpu --int8_kv_cache
+# Int8 weight-only quantization
+trtllm-build --checkpoint_dir gpt2/trt_ckpt/int8-wo/1-gpu \
+        --gpt_attention_plugin float16 \
+        --remove_input_padding enable \
+        --output_dir gpt2/trt_engines/int8-wo/1-gpu
+
+# Int4 weight-only quantization
+trtllm-build --checkpoint_dir gpt2/trt_ckpt/int4-wo/1-gpu \
+        --gpt_attention_plugin float16 \
+        --remove_input_padding enable \
+        --output_dir gpt2/trt_engines/int4-wo/1-gpu
 ```
+
+### FP8 Quantization
+
+[`../quantization/quantize.py`](../quantization/quantize.py) can do FP8 quantization and/or FP8 kv cache quantization, and export TensorRT-LLM checkpoint.
+
+```bash
+# FP8 quantization with FP8 kv cache
+python3 ../quantization/quantize.py --model_dir gpt2 \
+        --dtype float16 \
+        --qformat fp8 \
+        --kv_cache_dtype fp8 \
+        --output_dir gpt2/trt_ckpt/fp8/1-gpu
+
+trtllm-build --checkpoint_dir gpt2/trt_ckpt/fp8/1-gpu \
+        --gpt_attention_plugin float16 \
+        --remove_input_padding enable \
+        --strongly_typed \
+        --output_dir gpt2/trt_engines/fp8/1-gpu
+```
+
+## Embedding Parallelism and Sharing
+Since the embedding lookup table can be several gigabytes in size. We can distribute this weight across multiple GPUs in order to reduce the memory consumption per GPU.
+
+### 1. Embedding parallelism
+To enable this feature, add the flag `--use_parallel_embedding` to `convert_checkpoint.py`.
+
+### 2. The sharding dimension for embedding parallelism
+
+Assume the size of embedding lookup table is (vocab\_size \* hidden\_size), we can shard it along the vocab\_size (`--embedding_sharding_dim 0`) or hidden\_size (`--embedding_sharding_dim 1`) dimension.
+
+2.1 To shard the embedding lookup table along the hidden\_size dimension, set the flag `--use_parallel_embedding --embedding_sharding_dim 1`. Here is an example:
+
+```bash
+# 2-way tensor parallelism with embedding parallelism along hidden dimension
+python3 convert_checkpoint.py --model_dir gpt2 \
+        --dtype float16 \
+        --tp_size 2 \
+        --use_parallel_embedding \
+        --embedding_sharding_dim 1 \
+        --output_dir gpt2/trt_ckpt/fp16/2-gpu
+
+trtllm-build --checkpoint_dir gpt2/trt_ckpt/fp16/2-gpu \
+        --gpt_attention_plugin float16 \
+        --remove_input_padding enable \
+        --output_dir gpt2/trt_engines/fp16/2-gpu
+```
+
+2.2 To shard the embedding lookup table along the vocab\_size dimension, set the flag `--use_parallel_embedding --embedding_sharding_dim 0`. In this case, you can optionally enable the lookup plugin when building the engines.
+
+```bash
+# 2-way tensor parallelism with embedding parallelism along vocab dimension
+python3 convert_checkpoint.py --model_dir gpt2 \
+        --dtype float16 \
+        --tp_size 2 \
+        --use_parallel_embedding \
+        --embedding_sharding_dim 0 \
+        --output_dir gpt2/trt_ckpt/fp16/2-gpu
+
+# It is optional to add --lookup_plugin
+trtllm-build --checkpoint_dir gpt2/trt_ckpt/fp16/2-gpu \
+        --gpt_attention_plugin float16 \
+        --remove_input_padding enable \
+        --lookup_plugin float16 \
+        --output_dir gpt2/trt_engines/fp16/2-gpu
+```
+
+### 3. Embedding sharing
+In some models, the embedding weight is used in both the embedding layer and lm_head (language modeling head) layer. In this case, sharing the embedding weight can reduce memory consumption.
+
+With flag `--use_embedding_sharing` for `convert_checkpoint.py`, we will try to enable this feature. However it only takes effect when the following criteria are met:
+- The embedding weight is shared between the embedding and lm_head layers. If not, we should not enable this feature.
+- For tensor parallelism cases, `--use_parallel_embedding --embedding_sharding_dim 0` must be set. In other words, we must enable embedding parallelism along the vocab dimension, which minimizes the overall communication cost.
+- For TensorRT 9.0 version, the engine size is expected to be reduced when the lookup and gemm plugin are enabled.
+
+Here is an example for using embedding parallelism and sharing feature:
+
+
+```bash
+# 2-way tensor parallelism with embedding sharing
+# It requires enabling embedding parallelism along vocab dimension
+python3 convert_checkpoint.py --model_dir gpt2 \
+        --dtype float16 \
+        --tp_size 2 \
+        --use_embedding_sharing \
+        --use_parallel_embedding \
+        --embedding_sharding_dim 0 \
+        --output_dir gpt2/trt_ckpt/fp16/2-gpu
+
+# It is recommended to add --lookup_plugin and --gemm_plugin
+trtllm-build --checkpoint_dir gpt2/trt_ckpt/fp16/2-gpu \
+        --gpt_attention_plugin float16 \
+        --remove_input_padding enable \
+        --lookup_plugin float16 \
+        --gemm_plugin float16 \
+        --output_dir gpt2/trt_engines/fp16/2-gpu
+```
+
+
+## GPT Variant - SantaCoder
+
+The SantaCoder extends the existing GPT model with multi-query attention mechanism. The following example shows building a 4-GPU engine and running simple prompt to generate the implementation of `print_hello_world()`.
+
+```bash
+# Download hf santacoder model
+git clone https://huggingface.co/bigcode/santacoder
+
+# Convert to TensorRT-LLM checkpoint
+python3 convert_checkpoint.py --model_dir santacoder \
+        --dtype float16 \
+        --tp_size 4 \
+        --output_dir santacoder/trt_ckpt/fp16/4-gpu
+
+# Build TensorRT-LLM engines
+trtllm-build --checkpoint_dir santacoder/trt_ckpt/fp16/4-gpu \
+        --gpt_attention_plugin float16 \
+        --remove_input_padding enable \
+        --context_fmha enable \
+        --gemm_plugin float16 \
+        --output_dir santacoder/trt_engines/fp16/4-gpu
+
+# Run inference
+mpirun -np 4 \
+    python3 ../run.py --engine_dir santacoder/trt_engines/fp16/4-gpu \
+        --tokenizer_dir santacoder \
+        --input_text "def print_hello_world():" \
+        --max_output_len 20
+```
+
+
+## GPT Variant - StarCoder (v1 and v2)
+
+For StarCoder, the steps are similar to SantaCoder.
+
+```bash
+# Download hf starcoder model
+git clone https://huggingface.co/bigcode/starcoder
+
+# Convert to TensorRT-LLM checkpoint
+python3 convert_checkpoint.py --model_dir starcoder \
+        --dtype float16 \
+        --tp_size 4 \
+        --output_dir starcoder/trt_ckpt/fp16/4-gpu
+
+# Build TensorRT-LLM engines
+trtllm-build --checkpoint_dir starcoder/trt_ckpt/fp16/4-gpu \
+        --gpt_attention_plugin float16 \
+        --remove_input_padding enable \
+        --context_fmha enable \
+        --gemm_plugin float16 \
+        --output_dir starcoder/trt_engines/fp16/4-gpu
+
+# Run inference
+mpirun -np 4 \
+    python3 ../run.py --engine_dir starcoder/trt_engines/fp16/4-gpu \
+        --tokenizer_dir starcoder \
+        --input_text "def print_hello_world():" \
+        --max_output_len 20
+```
+
+For StarCoder2, you can use almost the same steps as shown above.
+ - Note that StarCoder2 hasn't been merged to the official releases of transformers package yet, so remember using the [main branch of transformers repo](https://github.com/huggingface/transformers).
+ - Add `--max_attention_window_size 4096` when running with run.py or summarization, which enables the sliding window attention.
+   - the sliding window size comes from the hf model [config.json](https://huggingface.co/bigcode/starcoder2-15b/blob/main/config.json#L23).
+
 
 ## GPT-Next
 
-NVIDIA has released a GPT-like model with some architectural improvements, that you can find here: [https://huggingface.co/nvidia/GPT-2B-001](https://huggingface.co/nvidia/GPT-2B-001)
-This architecture is also supported by TensorRT-LLM
+NVIDIA has released a GPT-like model with some architectural improvements, that you can find here: [https://huggingface.co/nvidia/GPT-2B-001](https://huggingface.co/nvidia/GPT-2B-001). This architecture is also supported by TensorRT-LLM.
 
-### 1. Download weights from HuggingFace Transformers
+Different from Huggingface's checkpoint, you should specify the NeMo checkpoint path using `--nemo_ckpt_path` for `convert_checkpoint.py`. The script also extracts the tokenizer file from the NeMo checkpoint and saves it to the TensorRT-LLM checkpoint folder, which can be used in the inference scripts.
 
 ```bash
+# Download NeMo checkpoint
 wget https://huggingface.co/nvidia/GPT-2B-001/resolve/main/GPT-2B-001_bf16_tp1.nemo
+
+# Convert to TensorRT-LLM checkpoint
+# It also extracts the tokenizer file and saves to the TensorRT-LLM checkpoint folder
+python3 convert_checkpoint.py --nemo_ckpt_path GPT-2B-001_bf16_tp1.nemo \
+        --dtype bfloat16 \
+        --output_dir gpt-next-2B/trt_ckpt/bf16/1-gpu
+
+# Build TensorRT-LLM engines
+# --gpt_attention_plugin must be set for GPT-Next since Rotary positional embeddings (RoPE) is only supported by the gpt attention plugin at this time.
+trtllm-build --checkpoint_dir gpt-next-2B/trt_ckpt/bf16/1-gpu \
+        --gpt_attention_plugin bfloat16 \
+        --remove_input_padding enable \
+        --output_dir gpt-next-2B/trt_engines/bf16/1-gpu
+
+# Run inference
+python3 ../run.py --engine_dir gpt-next-2B/trt_engines/bf16/1-gpu \
+        --vocab_file gpt-next-2B/trt_ckpt/bf16/1-gpu/tokenizer.model \
+        --no_add_special_tokens \
+        --max_output_len 8
 ```
 
-### 2. Convert weights from NeMo Checkpoint to FT format
-
-TensorRT-LLM can convert `.nemo` to generic binary files with [`nemo_ckpt_convert.py`](./nemo_ckpt_convert.py) script. For example:
-
-```bash
-python3 nemo_ckpt_convert.py -i GPT-2B-001_bf16_tp1.nemo -o ./c-model/gpt-next-2B --tensor-parallelism 1 --storage-type bfloat16
-```
-
-### 3. Build TensorRT engine(s)
-
-```bash
-# Build a single-GPU bfloat16 engine using FT weights.
-# --use_gpt_attention_plugin must be set for GPT-Next since Rotary positional embeddings (RoPE) is only supported by the gpt attention plugin at this time.
-python3 build.py --model_dir=./c-model/gpt-next-2B/1-gpu \
-                 --dtype bfloat16 \
-                 --remove_input_padding \
-                 --use_gpt_attention_plugin
-
-# Build GPT-Next architecture engines using dummy weights, useful for performance tests.
-# Enable several TensorRT-LLM plugins to increase runtime performance. It also helps with build time.
-python3 build.py --vocab_size=256000 \
-                 --n_layer=24 \
-                 --n_embd=2048 \
-                 --n_head=16 \
-                 --max_batch_size=256 \
-                 --dtype float16 \
-                 --no_bias \
-                 --hidden_act swiglu \
-                 --rotary_pct 0.5 \
-                 --remove_input_padding \
-                 --use_gpt_attention_plugin \
-                 --use_gemm_plugin \
-                 --output_dir=gpt-next-2B
-```
-
-### 4. Run
-
-```bash
-# Run the GPT-Next model on a single GPU. Use custom tokenizer.
-python3 ../run.py --max_output_len=8 \
-                  --vocab_file=./c-model/gpt-next-2B/1-gpu/tokenizer.model \
-                  --no_add_special_tokens
-```
-
-## Prompt-tuning
+### Prompt-tuning
 
 For efficient fine-tuning, the NeMo framework allows you to learn virtual tokens to accomplish a downstream task. For more details, please read the
 NeMo documentation [here](https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/stable/nlp/nemo_megatron/prompt_learning.html).
 
-TensorRT-LLM supports inference with those virtual tokens. To enable it, pass the prompt embedding table's maximum size at build time with
-`--max_prompt_embedding_table_size N`. For example:
+TensorRT-LLM supports inference with those virtual tokens. To enable it, pass the prompt embedding table's maximum size at build time with `--max_prompt_embedding_table_size N`. For example:
+
 ```bash
-# Build a GPT-Next model with prompt-tuning enabled
-python3 build.py --model_dir=./c-model/gpt-next-8B/1-gpu --remove_input_padding --use_gpt_attention_plugin --max_prompt_embedding_table_size 100
+# Convert to TensorRT-LLM checkpoint
+python3 convert_checkpoint.py --nemo_ckpt_path megatron_converted_8b_tp4_pp1.nemo \
+        --dtype float16 \
+        --output_dir gpt-next-8B/trt_ckpt/fp16/1-gpu
+
+# Build TensorRT-LLM engines with prompt-tuning enabled
+trtllm-build --checkpoint_dir gpt-next-8B/trt_ckpt/fp16/1-gpu \
+        --gpt_attention_plugin float16 \
+        --remove_input_padding enable \
+        --max_prompt_embedding_table_size 100 \
+        --output_dir gpt-next-8B/trt_engines/fp16/1-gpu
 ```
 
 You can now export the learned embedding table with:
@@ -494,103 +647,56 @@ It'll give you a summary of the different tasks in the table, that you can speci
 
 Finally, you can run inference on pre-defined tokens:
 ```bash
-python3 ../run.py --input_file input.csv --prompt_table email_composition.npy --tasks 0 --max_output_len=8 --vocab_file=./c-model/gpt-next-8B/1-gpu/tokenizer.model --no_add_special_tokens
+python3 ../run.py --engine_dir gpt-next-8B/trt_engines/fp16/1-gpu \
+        --vocab_file gpt-next-8B/trt_ckpt/fp16/1-gpu/tokenizer.model \
+        --no_add_special_tokens \
+        --prompt_table_path email_composition.npy \
+        --prompt_tasks 0 \
+        --max_output_len 8
 ```
 
-## Tensor Parallelism for Embedding Lookup Table.
-Since the embedding lookup table can be several gigabytes in size. We can distribute this weight across multiple GPUs in order to reduce the memory consumption per GPU.
 
-### 1. Enable this feature
-To enable this feature, add the flag `--use_parallel_embedding` to `build.py`.
-
-### 2. Choose the dimension for tensor parallelism
-
-Assume the size of embedding lookup table is (vocab\_size \* hidden\_size), we can shard it along the vocab\_size (`--embedding_sharding_dim 0`) or hidden\_size (`--embedding_sharding_dim 1`) dimension.
-
-2.1 To shard the embedding lookup table along the hidden\_size dimension, set the flag `--use_parallel_embedding --embedding_sharding_dim 1`. Here is an example:
-```Bash
-python3 build.py --model_dir=./c-model/gpt2/2-gpu --dtype float16 --world_size=2 --remove_input_padding --use_gpt_attention_plugin float16 --parallel_build --max_input_len 1000 \
-                  --use_parallel_embedding --embedding_sharding_dim 1 \
-                  --output_dir=trt_engine/gpt2/float16/2-gpu
-```
-2.2 To shard the embedding lookup table along the vocab\_size dimension, set the flag `--use_parallel_embedding --embedding_sharding_dim 0`.
-
-Meanwhile, we provide a lookup plugin to support tensor parallelism on vocab\_size dimension.
-
-- An example of sharing along vocab\_size dimension with lookup plugin:
-
-```Bash
-python3 build.py --model_dir=./c-model/gpt2/2-gpu --dtype float16 --world_size=2 --remove_input_padding --use_gpt_attention_plugin float16 --parallel_build --max_input_len 1000 \
-                  --use_parallel_embedding --embedding_sharding_dim 0 --use_lookup_plugin float16 \
-                  --output_dir=trt_engine/gpt2/float16/2-gpu
-```
-- An example of sharing along vocab\_size dimension without lookup plugin:
-```Bash
-python3 build.py --model_dir=./c-model/gpt2/2-gpu --dtype float16 --world_size=2 --remove_input_padding --use_gpt_attention_plugin float16 --parallel_build --max_input_len 1000 \
-                  --use_parallel_embedding --embedding_sharding_dim 0 \
-                  --output_dir=trt_engine/gpt2/float16/2-gpu
-```
-### 3. Embedding sharing
-In some examples, the embedding lookup table is used both in embedding() and lm_head() layers. Sharing the embedding lookup table can reduce memory consumption.
-
-With flag `--use_embedding_sharing` for  `build.py`, we will try to enable this feature. However it only takes effect when the following criteria are met:
-- The weight is shared between two layers. If we found the weight for lm_head() layer, we cannot enable it.
-- For multiple processes case, `--use_parallel_embedding` must be set. And we only support sharing when the embedding lookup table is sharded along the vocab dimension (`--embedding_sharding_dim 0`, as is the default value), which minimizes the overall communication cost.
-- For TensorRT 9.0 version, the engine size is expected to be reduced when the lookup and gemm plugin are enabled.
-
-Here is an example for using embedding parallelism and sharing feature:
-```Bash
-python3 hf_gpt_convert.py -i gpt2 -o ./c-model/gpt2 --tensor-parallelism 2 --storage-type bfloat16
-
-python3 build.py --model_dir=./c-model/gpt2/2-gpu --dtype bfloat16 --world_size=2 --remove_input_padding --use_gpt_attention_plugin --use_gemm_plugin --parallel_build --max_input_len 1000 --use_parallel_embedding --embedding_sharding_dim 0 --use_lookup_plugin --use_embedding_sharing --output_dir=trt_engine/gpt2/bfloat16/2-gpu
-
-mpirun -np 2 python3 ../summarize.py --engine_dir trt_engine/gpt2/bfloat16/2-gpu --hf_model_dir gpt2 --batch_size 10 --test_trt_llm --check_accuracy --tensorrt_llm_rouge1_threshold=14 --dataset_path ./dataset --no_add_special_tokens
-```
-
-### Run MultiLoRA with the Nemo checkpoint
+### MultiLoRA with the Nemo checkpoint
 
 ```bash
-git clone https://huggingface.co/nvidia/GPT-2B-001
+# Download NeMo checkpoint
+wget https://huggingface.co/nvidia/GPT-2B-001/resolve/main/GPT-2B-001_bf16_tp1.nemo
 
-python3 examples/gpt/nemo_ckpt_convert.py -i GPT-2B-001_bf16_tp1.nemo -o gpt-2b-fp16-weights-tp1-pp1 -tp 1 -p 4 -t float16
+# Convert to TensorRT-LLM checkpoint
+python3 convert_checkpoint.py --nemo_ckpt_path GPT-2B-001_bf16_tp1.nemo \
+        --dtype float16 \
+        --output_dir gpt-next-2B/trt_ckpt/fp16/1-gpu
 
-python3 examples/gpt/build.py --model_dir=gpt-2b-fp16-weights-tp1-pp1/1-gpu \
-    --dtype float16 \
-    --remove_input_padding \
-    --use_gpt_attention_plugin float16 \
-    --use_inflight_batching \
-    --paged_kv_cache \
-    --output_dir gpt-2b-trt-fp16-tp1-pp1-test \
-    --use_lora_plugin \
-    --lora_target_modules attn_qkv \
-    --max_batch_size 4 \
-    --max_beam_width 2 \
-    --max_input_len 512 \
-    --max_output_len 50 \
-    --log_level verbose
+# Build TensorRT-LLM engines
+trtllm-build --checkpoint_dir gpt-next-2B/trt_ckpt/fp16/1-gpu \
+        --gpt_attention_plugin float16 \
+        --remove_input_padding enable \
+        --lora_plugin float16 \
+        --lora_dir gpt2b_lora-900.nemo gpt2b_lora-stories.nemo \
+        --lora_ckpt_source "nemo" \
+        --lora_target_modules attn_qkv \
+        --max_batch_size 4 \
+        --max_beam_width 2 \
+        --max_input_len 512 \
+        --max_output_len 50 \
+        --output_dir gpt-next-2B/trt_engines/fp16/1-gpu
 
 # Run inference directly from NeMo LoRA checkpoint
 # --lora_task_ids correspond to the index of the models given with --lora_dir. -1 means no LoRA
-
-python3 examples/run.py --max_output_len=20 \
-    --use_py_session \
-    --vocab_file=gpt-2b-fp16-weights-tp1-pp1/1-gpu/tokenizer.model \
-    --engine_dir gpt-2b-trt-fp16-tp1-pp1-test/ \
-    --lora_dir gpt2b_lora-900.nemo gpt2b_lora-stories.nemo \
-    --lora_task_uids 0 -1 1 \
-    --lora_ckpt_source "nemo" \
-    --no_add_special_tokens \
-    --input_text "After Washington had returned to Williamsburg, Dinwiddie ordered him to lead a larger force to assist Trent in his work. While en route, Washington learned of Trent's retreat. Since Tanaghrisson had promised support to the British, Washington continued toward Fort Duquesne and met with the Mingo leader. Learning of a French scouting party in the area, Washington, with Tanaghrisson and his party, surprised the Canadians on May 28 in what became known as the Battle of Jumonville Glen. They killed many of the Canadians, including their commanding officer, Joseph Coulon de Jumonville, whose head was reportedly split open by Tanaghrisson with a tomahawk. The historian Fred Anderson suggests that Tanaghrisson was acting to gain the support of the British and regain authority over his own people. They had been inclined to support the French, with whom they had long trading relationships. One of Tanaghrisson's men told Contrecoeur that Jumonville had been killed by British musket fire. Question: Upon learning of a French scounting party in the area, what did Washington do? Answer:" "You hold the job title in the Wizarding World of Harry Potter where you say random words looking for spells" "You hold the job title in the Wizarding World of Harry Potter where you say random words looking for spells"
+python3 ../run.py --engine_dir gpt-next-2B/trt_engines/fp16/1-gpu \
+        --vocab_file gpt-next-2B/trt_ckpt/fp16/1-gpu/tokenizer.model \
+        --no_add_special_tokens \
+        --max_output_len 20 \
+        --use_py_session \
+        --lora_task_uids 0 -1 1 \
+        --input_text "After Washington had returned to Williamsburg, Dinwiddie ordered him to lead a larger force to assist Trent in his work. While en route, Washington learned of Trent's retreat. Since Tanaghrisson had promised support to the British, Washington continued toward Fort Duquesne and met with the Mingo leader. Learning of a French scouting party in the area, Washington, with Tanaghrisson and his party, surprised the Canadians on May 28 in what became known as the Battle of Jumonville Glen. They killed many of the Canadians, including their commanding officer, Joseph Coulon de Jumonville, whose head was reportedly split open by Tanaghrisson with a tomahawk. The historian Fred Anderson suggests that Tanaghrisson was acting to gain the support of the British and regain authority over his own people. They had been inclined to support the French, with whom they had long trading relationships. One of Tanaghrisson's men told Contrecoeur that Jumonville had been killed by British musket fire. Question: Upon learning of a French scounting party in the area, what did Washington do? Answer:" "You hold the job title in the Wizarding World of Harry Potter where you say random words looking for spells" "You hold the job title in the Wizarding World of Harry Potter where you say random words looking for spells"
 ```
 
-#### Example output
-
-* Note that in this case the adapters have only been trained for a few epochs, so the result quality is poor.
+The output would look like (Note that in this case the adapters have only been trained for a few epochs, so the result quality is poor):
 
 ```
-Input [Text 0]: "After Washington had returned to Williamsburg, Dinwiddie ordered him to lead a larger force to assist Trent in his work. While en route, Washington learned of Trent's retreat. Since Tanaghrisson had promised support to the British, Washington continued toward Fort Duquesne and met with the Mingo leader. Learning of a French scouting party in the area, Washington, with Tanaghrisson and his party, surprise
-d the Canadians on May 28 in what became known as the Battle of Jumonville Glen. They killed many of the Canadians, including their commanding officer, Joseph Coulon de Jumonville, whose head was reportedly split open by Tanaghrisson with a tomahawk. The historian Fred Anderson suggests that Tanaghrisson was acting to gain the support of the British and regain authority over his own people. They had been inclined to support the French, with whom they had long trading relati
-onships. One of Tanaghrisson's men told Contrecoeur that Jumonville had been killed by British musket fire. Question: Upon learning of a French scounting party in the area, what did Washington do? Answer:"
+......
+Input [Text 0]: "After Washington had returned to Williamsburg, Dinwiddie ordered him to lead a larger force to assist Trent in his work. While en route, Washington learned of Trent's retreat. Since Tanaghrisson had promised support to the British, Washington continued toward Fort Duquesne and met with the Mingo leader. Learning of a French scouting party in the area, Washington, with Tanaghrisson and his party, surprised the Canadians on May 28 in what became known as the Battle of Jumonville Glen. They killed many of the Canadians, including their commanding officer, Joseph Coulon de Jumonville, whose head was reportedly split open by Tanaghrisson with a tomahawk. The historian Fred Anderson suggests that Tanaghrisson was acting to gain the support of the British and regain authority over his own people. They had been inclined to support the French, with whom they had long trading relationships. One of Tanaghrisson's men told Contrecoeur that Jumonville had been killed by British musket fire. Question: Upon learning of a French scounting party in the area, what did Washington do? Answer:"
 Output [Text 0 Beam 0]: "He surprised the Canadians on May 28 in what became known as the Battle of Jumonville"
 Input [Text 1]: "You hold the job title in the Wizarding World of Harry Potter where you say random words looking for spells"
 Output [Text 1 Beam 0]: ".
