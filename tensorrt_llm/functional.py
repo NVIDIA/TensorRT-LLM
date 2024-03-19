@@ -4492,8 +4492,9 @@ def lora_plugin(
 
 def selective_scan(input: Tensor, state: Tensor, delta: Tensor,
                    delta_bias: Tensor, A: Tensor, B: Tensor, C: Tensor,
-                   D: Tensor, z: Tensor, host_request_types: Tensor, dim: int,
-                   dstate: int, is_variable_B: bool, is_variable_C: bool,
+                   D: Tensor, z: Tensor, host_request_types: Tensor,
+                   last_token_ids: Tensor, dim: int, dstate: int,
+                   is_variable_B: bool, is_variable_C: bool,
                    delta_softplus: bool, dtype: str):
     '''
     Parameters:
@@ -4523,6 +4524,10 @@ def selective_scan(input: Tensor, state: Tensor, delta: Tensor,
 
         z : Tensor (On GPU)
             The z tensor. Its shape is [batch_size, seq_len, dim]
+
+        last_token_ids : Tensor (On GPU)
+            The inclusive prefix-sum of the lengths or the lengths of the
+            sequences in the batch.
 
         host_request_types : Tensor (On CPU)
             The tensor on the host that indicates if a request is in context or
@@ -4583,7 +4588,8 @@ def selective_scan(input: Tensor, state: Tensor, delta: Tensor,
         "selective_scan", pfc)
 
     plug_inputs = [
-        input, state, delta, delta_bias, A, B, C, D, z, host_request_types
+        input, state, delta, delta_bias, A, B, C, D, z, host_request_types,
+        last_token_ids
     ]
     plug_inputs = [i.trt_tensor for i in plug_inputs]
 

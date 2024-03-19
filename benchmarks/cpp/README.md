@@ -22,7 +22,7 @@ instead, and be sure to set DLL paths as specified in
 
 Before you launch C++ benchmarking, please make sure that you have already built engine(s) using TensorRT-LLM API, C++ benchmarking code cannot generate engine(s) for you.
 
-You can use the [`build.py`](source:benchmarks/python/build.py) script to build the engine(s). Alternatively, if you have already benchmarked Python Runtime, you can reuse the engine(s) built previously, please see that [`document`](../python/README.md).
+Use `trtllm-build` to build the TRT-LLM engine. Alternatively, if you have already benchmarked Python Runtime, you can reuse the engine(s) built previously, please see that [`document`](../python/README.md).
 
 ####  Launch benchmarking
 
@@ -73,19 +73,39 @@ This tool can be used in 2 different modes of traffic generation.
 
 ##### 1 – Dataset
 
-“Prompt”, “Instruction” (optional) and “Answer” specified as sentences in a Json file
-
 The tool will tokenize the words and instruct the model to generate a specified number of output tokens for a request.
 
 ```
 python3 prepare_dataset.py \
-    --output preprocessed_dataset.json
-    --request-rate 10 \
-    --time-delay-dist exponential_dist \
     --tokenizer <path/to/tokenizer> \
+    --output preprocessed_dataset.json
+    [--request-rate 10] \
+    [--time-delay-dist exponential_dist] \
     dataset
-    --dataset <path/to/dataset> \
-    --max-input-len 300
+    --dataset-name <name of the dataset> \
+    --dataset-input-key <dataset dictionary key for input> \
+    --dataset-prompt-key <dataset dictionary key for prompt> \
+    --dataset-output-key <dataset dictionary key for output> \
+    [--num-requests 100] \
+    [--max-input-len 1000] \
+    [--output-len-dist 100,10]
+```
+
+For datasets that don't have prompt key, set --dataset-prompt instead.
+Take [cnn_dailymail dataset](https://huggingface.co/datasets/cnn_dailymail) for example:
+```
+python3 prepare_dataset.py \
+    --tokenizer <path/to/tokenizer> \
+    --output cnn_dailymail.json
+    dataset
+    --dataset-name cnn_dailymail \
+    --dataset-config-name 3.0.0 \
+    --dataset-input-key article \
+    --dataset-prompt "Summarize the following article:" \
+    --dataset-output-key "highlights" \
+    [--num-requests 100] \
+    [--max-input-len 1000] \
+    [--output-len-dist 100,10]
 ```
 
 ##### 2 – Normal token length distribution
@@ -94,7 +114,7 @@ This mode allows the user to generate normal token length distributions with a m
 For example, setting mean=100 and std dev=10 would generate requests where 95.4% of values are in <80,120> range following the normal probability distribution. Setting std dev=0 will generate all requests with the same mean number of tokens.
 
 ```
- python prepare_dataset.py \
+python prepare_dataset.py \
   --output token-norm-dist.json \
   --request-rate 10 \
   --time-delay-dist constant \

@@ -2,7 +2,7 @@ import copy
 import dataclasses
 import json
 import os
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 import numpy as np
 import safetensors
@@ -12,16 +12,18 @@ from .._common import default_net
 from .._utils import (numpy_to_torch, str_dtype_to_torch, str_dtype_to_trt,
                       trt_dtype_to_torch)
 from ..functional import PositionEmbeddingType, Tensor, gather_last_token_logits
-from ..layers import (AttentionParams, FusedGatedMLP, GatedMLP,
-                      KeyValueCacheParams, LoraParams)
-from ..layers.attention import Attention
-from ..layers.linear import ColumnLinear
+from ..layers import (AttentionParams, Embedding, FusedGatedMLP, GatedMLP,
+                      KeyValueCacheParams, LoraParams, PromptTuningEmbedding)
+from ..layers.attention import Attention, BertAttention
+from ..layers.linear import ColumnLinear, Linear, RowLinear
+from ..layers.lora import Lora
 from ..logger import logger
 from ..mapping import Mapping
 from ..module import Module, ModuleList
 from ..quantization import QuantMode
 from ..quantization.layers import FP8Linear
-from ..quantization.mode import W8A8_SQ_PLUGIN_LIST
+from ..quantization.mode import (FP8, W4A8_AWQ, W4A16, W4A16_AWQ,
+                                 W8A8_SQ_PLUGIN_LIST, W8A16)
 from ..quantization.quantize import quantize
 from .generation_mixin import GenerationMixin
 
@@ -43,6 +45,32 @@ class QuantizationConfig:
     @property
     def use_plugin_sq(self):
         return self.quant_algo in W8A8_SQ_PLUGIN_LIST
+
+    def quant_algo_to_ammo_qformat(self):
+        from ..quantization import mode as quant_algo
+
+        #"fp8", "int8_sq", "int4_awq", "w4a8_awq", "int8_wo", "int4_wo",
+        algo_to_ammo_map = {
+            quant_algo.W8A16: "int8_wo",
+            quant_algo.W4A16: "int4_wo",
+            quant_algo.W4A16_AWQ: "int4_awq",
+            quant_algo.W4A8_AWQ: 'w4a8_awq',
+            quant_algo.FP8: 'fp8',
+            quant_algo.W4A16_GPTQ: None,
+            quant_algo.W8A8_SQ_PER_CHANNEL: 'int8_sq',
+            quant_algo.W8A8_SQ_PER_TENSOR_PLUGIN: None,
+            quant_algo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN: None,
+            quant_algo.W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN: None,
+            quant_algo.W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN: None,
+            None: 'full_prec'
+        }
+        assert self.quant_algo in algo_to_ammo_map
+        qformat = algo_to_ammo_map[self.quant_algo]
+        assert qformat is not None, "None means we don't use AMMO for this kind of quantization algorithm, you probably shall not call this"
+        return qformat
+
+    def asdict(self):
+        return dataclasses.asdict(self)
 
 
 def default_weight_loader(mapping: Mapping, param: torch.Tensor,
@@ -71,11 +99,9 @@ class PretrainedConfig:
                  tp_size: int,
                  pp_size: int,
                  quantization: Union[QuantizationConfig, dict],
-                 use_prompt_tuning: bool = False,
                  use_parallel_embedding: bool = False,
                  embedding_sharding_dim: int = 0,
                  share_embedding_table: bool = False,
-                 max_lora_rank: int = 64,
                  head_size: int = None,
                  **kwargs):
         self.architecture = architecture
@@ -94,7 +120,6 @@ class PretrainedConfig:
         self.norm_epsilon = norm_epsilon
         self.position_embedding_type = PositionEmbeddingType.from_string(
             position_embedding_type)
-        self.use_prompt_tuning = use_prompt_tuning
         self.use_parallel_embedding = use_parallel_embedding
         self.embedding_sharding_dim = embedding_sharding_dim
         self.share_embedding_table = share_embedding_table
@@ -114,7 +139,6 @@ class PretrainedConfig:
             ), f"Expecting type of QuantizationConfig, found {type(quantization)}"
             self.quantization = quantization
         self.kv_dtype = self.dtype
-        self.max_lora_rank = max_lora_rank
         if self.quant_mode.has_int8_kv_cache():
             self.kv_dtype = 'int8'
         elif self.quant_mode.has_fp8_kv_cache():
@@ -150,7 +174,6 @@ class PretrainedConfig:
                                          num_attention_heads)
         intermediate_size = config.pop('intermediate_size', None)
         max_position_embeddings = config.pop('max_position_embeddings', None)
-        use_prompt_tuning = config.pop('use_prompt_tuning', False)
         use_parallel_embedding = config.pop('use_parallel_embedding', False)
         embedding_sharding_dim = config.pop('embedding_sharding_dim', 0)
         share_embedding_table = config.pop('share_embedding_table', False)
@@ -185,16 +208,13 @@ class PretrainedConfig:
                 assert isinstance(quant_config_from_user, QuantizationConfig)
                 quant_config = quant_config_from_user
 
-        max_lora_rank = config.pop('max_lora_rank', 64)
-
         return cls(architecture, dtype, logits_dtype, vocab_size,
                    max_position_embeddings, hidden_size, num_hidden_layers,
                    num_attention_heads, num_key_value_heads, hidden_act,
                    intermediate_size, norm_epsilon, position_embedding_type,
                    world_size, tp_size, pp_size, quant_config,
-                   use_prompt_tuning, use_parallel_embedding,
-                   embedding_sharding_dim, share_embedding_table, max_lora_rank,
-                   **config)
+                   use_parallel_embedding, embedding_sharding_dim,
+                   share_embedding_table, **config)
 
     @classmethod
     def from_json_file(cls, config_file: str):
@@ -332,7 +352,7 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
                                    device='cpu') as f:
             for key in f.keys():
                 weights[key] = f.get_tensor(key)
-
+        preprocess_weights(weights, config)
         model.load(weights)
 
         return model
@@ -413,6 +433,7 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
         use_custom_all_reduce = default_net(
         ).plugin_config.use_custom_all_reduce
         use_lora_plugin = default_net().plugin_config.lora_plugin
+        multiple_profiles = default_net().plugin_config.multiple_profiles
 
         model_inputs = self.prepare_basic_inputs(
             max_batch_size=max_batch_size,
@@ -439,7 +460,8 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
             use_custom_all_reduce=use_custom_all_reduce,
             use_lora_plugin=use_lora_plugin,
             max_draft_len=max_draft_len,
-            lora_target_modules=lora_target_modules)
+            lora_target_modules=lora_target_modules,
+            multiple_profiles=multiple_profiles)
 
         result = {
             'input_ids':
@@ -490,6 +512,44 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
                 host_request_types=model_inputs['host_request_types'])
 
         return result
+
+    @classmethod
+    def quantize(
+        cls,
+        hf_model_dir,
+        output_dir,
+        quant_config: QuantizationConfig,
+        *,
+        dtype='float16',
+        mapping: Optional[Mapping] = None,
+        calib_batches=512,
+        calib_batch_size=1,
+        random_seed=1234,
+        tokenizer_max_seq_length=2048,
+    ):
+        if mapping is None:  # single gpu
+            mapping = Mapping()
+        ammo_qformat = quant_config.quant_algo_to_ammo_qformat()
+        kv_cache_dtype = quant_config.kv_cache_quant_algo
+        assert ammo_qformat is not None
+        from ..quantization import quantize_and_export
+        hf_model_dir = str(
+            hf_model_dir)  # quantize_and_export has some code can not take Path
+        quantize_and_export(
+            model_dir=hf_model_dir,
+            dtype=dtype,
+            device='cuda',
+            qformat=ammo_qformat,
+            kv_cache_dtype=kv_cache_dtype,
+            calib_size=calib_batches,
+            batch_size=calib_batch_size,
+            output_dir=output_dir,
+            tp_size=mapping.tp_size,
+            pp_size=mapping.pp_size,
+            seed=random_seed,
+            max_seq_length=tokenizer_max_seq_length,
+            awq_block_size=quant_config.group_size,
+        )
 
 
 class DecoderModelForCausalLM(PretrainedModel):
@@ -584,8 +644,7 @@ def fuse_gate_mlp(model):
                 dtype=layer.mlp.dtype,
                 tp_group=layer.mlp.tp_group,
                 tp_size=layer.mlp.tp_size,
-                quant_mode=layer.mlp.quant_mode,
-                max_lora_rank=layer.mlp.max_lora_rank)
+                quant_mode=layer.mlp.quant_mode)
 
             if quant_algo == 'FP8':
                 if isinstance(layer.mlp.dtype, str):
@@ -694,9 +753,196 @@ def unfuse_qkv_gemm(model):
     return model
 
 
-def optimize_model(model, use_fused_mlp=False, use_unfused_qkv_gemm=False):
+def set_prompt_tuning(model):
+    if isinstance(model.transformer.vocab_embedding, Embedding):
+        embedding = model.transformer.vocab_embedding
+        model.transformer.vocab_embedding = PromptTuningEmbedding(
+            num_embeddings=embedding.num_embeddings,
+            embedding_dim=embedding.embedding_dim,
+            dtype=embedding.dtype,
+            tp_size=embedding.tp_size,
+            tp_group=embedding.tp_group,
+            sharding_dim=embedding.sharding_dim,
+            tp_rank=embedding.tp_rank)
+
+        model.transformer.vocab_embedding.weight.value = embedding.weight.raw_value
+    return model
+
+
+def add_lora(model, max_lora_rank: Optional[int]):
+    for name, layer in model.named_modules(remove_duplicate=True):
+        max_rank = max_lora_rank
+        if isinstance(layer, (Attention, BertAttention)):
+            if max_rank is None:
+                max_rank = min(
+                    layer.hidden_size,
+                    layer.num_attention_heads * layer.attention_head_size,
+                    layer.num_attention_kv_heads * layer.attention_head_size)
+            layer.qkv_lora = Lora(
+                in_hidden_size=layer.hidden_size,
+                out_hidden_sizes=[
+                    layer.num_attention_heads * layer.attention_head_size,
+                    layer.num_attention_kv_heads * layer.attention_head_size,
+                    layer.num_attention_kv_heads * layer.attention_head_size
+                ],
+                max_low_rank=max_rank,
+            )
+        if isinstance(layer, (Linear, RowLinear)):
+            if max_rank is None:
+                max_rank = min(layer.in_features, layer.out_features)
+            layer.lora = Lora(
+                in_hidden_size=layer.in_features,
+                out_hidden_sizes=[layer.out_features],
+                max_low_rank=max_rank,
+            )
+        if isinstance(layer, FusedGatedMLP):
+            if max_rank is None:
+                max_rank = min(layer.hidden_size,
+                               layer.ffn_hidden_size // layer.tp_size)
+            layer.mlp_in_lora = Lora(
+                in_hidden_size=layer.hidden_size,
+                out_hidden_sizes=[
+                    layer.ffn_hidden_size // layer.tp_size,
+                    layer.ffn_hidden_size // layer.tp_size
+                ],
+                max_low_rank=max_rank,
+            )
+    return model
+
+
+def optimize_model(
+    model,
+    use_fused_mlp=False,
+    use_unfused_qkv_gemm=False,
+    use_prompt_tuning=False,
+    use_lora=False,
+    max_lora_rank=None,
+):
     if use_fused_mlp:
         model = fuse_gate_mlp(model)
     if use_unfused_qkv_gemm:
         model = unfuse_qkv_gemm(model)
+    if use_prompt_tuning:
+        model = set_prompt_tuning(model)
+    if use_lora:
+        model = add_lora(model, max_lora_rank)
     return model
+
+
+def preprocess_weights(
+        weights: Dict[str, torch.Tensor],
+        model_config: PretrainedConfig) -> Dict[str, torch.Tensor]:
+    quant_algo = model_config.quantization.quant_algo
+    kv_cache_quant_algo = model_config.quantization.kv_cache_quant_algo
+
+    # INT4_AWQ
+    if quant_algo == W4A8_AWQ or quant_algo == W4A16_AWQ:
+        preprocessor = torch.ops.trtllm.preprocess_weights_for_mixed_gemm
+        for name, param in weights.items():
+            if name.endswith('weight') and param.dtype == torch.int8:
+                dtype = torch.float16
+                if model_config.dtype == "bfloat16":
+                    dtype = torch.bfloat16
+                weights[name] = preprocessor(param.T.contiguous(),
+                                             torch.quint4x2).view(dtype)
+            if name.endswith('weights_scaling_factor'):
+                weights[name] = param.T.contiguous().to(
+                    str_dtype_to_torch(model_config.dtype))
+            if name.endswith('prequant_scaling_factor'):
+                weights[name] = param.reshape(1, -1)
+            if model_config.mapping.tp_rank > 0:
+                if name.endswith('attention.dense.bias') or name.endswith(
+                        'mlp.proj.bias'):
+                    weights[name] = torch.zeros_like(param)
+
+        if quant_algo == W4A8_AWQ:
+            for name in list(weights):
+                if name.endswith('weights_scaling_factor'):
+                    activation_scaling_factor = weights.pop(
+                        name.replace('weights_scaling_factor',
+                                     'activation_scaling_factor'))
+                    weights_scaling_factor_2 = weights.pop(
+                        name.replace('weights_scaling_factor',
+                                     'weights_scaling_factor_2'))
+                    weights[name] /= weights_scaling_factor_2
+                    weights[name.replace(
+                        'weights_scaling_factor',
+                        'prequant_scaling_factor')] /= activation_scaling_factor
+                    weights[name.replace(
+                        'weights_scaling_factor', 'alpha'
+                    )] = activation_scaling_factor * weights_scaling_factor_2
+
+    # FP8
+    elif quant_algo == FP8:
+        for name, param in weights.items():
+            if name.endswith('weight') and param.dtype == torch.int8:
+                weights[name] = param.view(torch.float8_e4m3fn)
+        # lm_head is not quantized to FP8
+        if "lm_head.weight" in weights:
+            assert weights['lm_head.weight'].dtype == str_dtype_to_torch(
+                model_config.dtype)
+            weights.pop('lm_head.weights_scaling_factor', None)
+            weights.pop('lm_head.activation_scaling_factor', None)
+
+    # Weight only 4bit
+    elif quant_algo == W4A16:
+        for name in list(weights):
+            if any([
+                    _name in name for _name in [
+                        'qkv.weight', 'dense.weight', 'fc.weight',
+                        'proj.weight', 'gate.weight'
+                    ]
+            ]) and weights[name].dtype != torch.int8:
+                processed_torch_weights, torch_weight_scales = \
+            torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
+                weights[name].t().contiguous(), torch.quint4x2)
+                weights[name] = processed_torch_weights
+                weights[name.replace(
+                    '.weight', '.per_channel_scale')] = torch_weight_scales
+
+    # Weight only 8bit
+    elif quant_algo == W8A16:
+        for name in list(weights):
+            if any([
+                    _name in name for _name in [
+                        'qkv.weight', 'dense.weight', 'fc.weight',
+                        'proj.weight', 'gate.weight'
+                    ]
+            ]) and weights[name].dtype != torch.int8:
+                processed_torch_weights, torch_weight_scales = \
+            torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
+                weights[name].t().contiguous(), torch.int8)
+                weights[name] = processed_torch_weights
+                weights[name.replace(
+                    '.weight', '.per_channel_scale')] = torch_weight_scales
+
+    # FP8 kv_cache_scaling_factor is always 1.0
+    if kv_cache_quant_algo == FP8:
+        for name, param in weights.items():
+            if name.endswith('kv_cache_scaling_factor'):
+                weights[name] = torch.tensor([1.0], dtype=torch.float32)
+
+    # If layer_norm bias is None. (For MPT)
+    if model_config.architecture == 'MPTForCausalLM':
+        update_dict = {}
+        for name, param in weights.items():
+            if 'input_layernorm.weight' in name and name.replace(
+                    'weight', 'bias') not in weights:
+                update_dict[name.replace('weight',
+                                         'bias')] = torch.zeros_like(param)
+            if 'post_layernorm.weight' in name and name.replace(
+                    'weight', 'bias') not in weights:
+                update_dict[name.replace('weight',
+                                         'bias')] = torch.zeros_like(param)
+            if 'ln_f.weight' in name and name.replace('weight',
+                                                      'bias') not in weights:
+                update_dict[name.replace('weight',
+                                         'bias')] = torch.zeros_like(param)
+        weights.update(update_dict)
+
+    # Parallel block rowlinear should not have duplicate bias.
+    elif model_config.architecture == 'GPTJForCausalLM':
+        if model_config.mapping.tp_rank > 0:
+            for name, param in weights.items():
+                if 'attention.dense.bias' in name or 'mlp.proj.bias' in name:
+                    weights[name] = torch.zeros_like(param)

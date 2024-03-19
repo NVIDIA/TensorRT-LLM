@@ -6,7 +6,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fpA_intB_gemm/fpA_intB_gemm.h"
-#include "tensorrt_llm/kernels/weightOnlyBatchedGemv/enabled.h"
+#include "tensorrt_llm/kernels/preQuantScaleKernel.h"
 #include "tensorrt_llm/kernels/weightOnlyBatchedGemv/kernelLauncher.h"
 
 #include <algorithm>
@@ -18,51 +18,12 @@
 #include <iostream>
 #include <random>
 #include <set>
+#include <sstream>
+#include <string>
 #include <type_traits>
 #include <vector>
 
-using tensorrt_llm::kernels::WeightOnlyParams;
-using tensorrt_llm::kernels::WeightOnlyType;
-using tensorrt_llm::kernels::WeightOnlyQuantType;
-using tensorrt_llm::kernels::WeightOnlyActivationType;
-using tensorrt_llm::kernels::WeightOnlyActivationFunctionType;
-template <WeightOnlyActivationType T>
-struct AType;
-
-template <>
-struct AType<WeightOnlyActivationType::FP16>
-{
-    using CudaKernelAType = half;
-    using CutlassKernelAType = half;
-};
-#if defined(ENABLE_BF16)
-template <>
-struct AType<WeightOnlyActivationType::BF16>
-{
-    using CudaKernelAType = __nv_bfloat16;
-    using CutlassKernelAType = __nv_bfloat16;
-};
-#endif
-template <WeightOnlyQuantType T>
-struct BType;
-
-template <>
-struct BType<WeightOnlyQuantType::Int4b>
-{
-    using CudaKernelBType = uint8_t;
-    using CutlassKernelBType = cutlass::uint4b_t;
-    static constexpr int elemsPerByte = 2;
-};
-
-template <>
-struct BType<WeightOnlyQuantType::Int8b>
-{
-    using CudaKernelBType = uint8_t;
-    using CutlassKernelBType = uint8_t;
-    static constexpr int elemsPerByte = 1;
-};
-struct CutlassKernel;
-struct CudaKernel;
+namespace wo = tensorrt_llm::kernels::weight_only;
 
 void simple_assert(bool flag)
 {
@@ -70,192 +31,6 @@ void simple_assert(bool flag)
     {
         throw std::runtime_error("assert failed");
     }
-}
-
-template <typename T>
-std::vector<tensorrt_llm::cutlass_extensions::CutlassGemmConfig> get_configs(T& runner, int k)
-{
-    auto configs = runner.getConfigs();
-    std::vector<tensorrt_llm::cutlass_extensions::CutlassGemmConfig> rets;
-    for (auto config : configs)
-    {
-        if (config.stages >= 5)
-        {
-            continue;
-        }
-        if (config.split_k_style != tensorrt_llm::cutlass_extensions::SplitKStyle::NO_SPLIT_K)
-        {
-            int k_size = (k + config.split_k_factor - 1) / config.split_k_factor;
-            if (k_size % 64)
-            {
-                continue;
-            }
-        }
-        rets.push_back(config);
-    }
-    return rets;
-}
-
-template <typename KernelFlag, WeightOnlyActivationType AFlag, WeightOnlyQuantType BFlag>
-float benchmark_perchannel(void* act, void* weight, void* scales, void* zeros, void* bias, void* out, int m, int n,
-    int k, int group_size, int warmup, int iter)
-{
-    simple_assert(zeros == nullptr && bias == nullptr && group_size == 0);
-    cudaStream_t s;
-    cudaStreamCreate(&s);
-    cudaEvent_t begin, end;
-    cudaEventCreate(&begin);
-    cudaEventCreate(&end);
-    if constexpr (std::is_same_v<KernelFlag, CudaKernel>)
-    {
-        WeightOnlyParams params{reinterpret_cast<uint8_t*>(weight), scales, zeros, act, nullptr, bias, out, m, n, k,
-            group_size, BFlag, WeightOnlyType::PerChannel, WeightOnlyActivationFunctionType::Identity, AFlag};
-        for (int i = 0; i < warmup; ++i)
-        {
-            tensorrt_llm::kernels::weight_only_batched_gemv_launcher(params, s);
-        }
-        cudaEventRecord(begin, s);
-        for (int i = 0; i < iter; ++i)
-        {
-            tensorrt_llm::kernels::weight_only_batched_gemv_launcher(params, s);
-        }
-    }
-    else if (std::is_same_v<KernelFlag, CutlassKernel>)
-    {
-        tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<typename AType<AFlag>::CutlassKernelAType,
-            typename BType<BFlag>::CutlassKernelBType, cutlass::WeightOnlyQuantOp::PER_COLUMN_SCALE_ONLY>
-            gemm;
-        auto configs = get_configs(gemm, k);
-        int ws_bytes = gemm.getWorkspaceSize(m, n, k);
-        char* ws_ptr = nullptr;
-        if (ws_bytes)
-            cudaMalloc(&ws_ptr, ws_bytes);
-        float fast_time = 1e8;
-        auto best_config = configs[0];
-        for (auto& config : configs)
-        {
-            for (int i = 0; i < 2; ++i)
-            {
-                gemm.gemm(act, weight, scales, out, m, n, k, config, ws_ptr, ws_bytes, s);
-            }
-            cudaEventRecord(begin, s);
-            for (int i = 0; i < 5; ++i)
-            {
-                gemm.gemm(act, weight, scales, out, m, n, k, config, ws_ptr, ws_bytes, s);
-            }
-            cudaEventRecord(end, s);
-            cudaEventSynchronize(end);
-            float time;
-            cudaEventElapsedTime(&time, begin, end);
-            if (time < fast_time)
-            {
-                fast_time = time;
-                best_config = config;
-            }
-        }
-
-        for (int i = 0; i < warmup; ++i)
-        {
-            gemm.gemm(act, weight, scales, out, m, n, k, best_config, ws_ptr, ws_bytes, s);
-        }
-        cudaEventRecord(begin, s);
-        for (int i = 0; i < iter; ++i)
-        {
-            gemm.gemm(act, weight, scales, out, m, n, k, best_config, ws_ptr, ws_bytes, s);
-        }
-        if (ws_ptr)
-            cudaFree(ws_ptr);
-    }
-
-    cudaEventRecord(end, s);
-    cudaEventSynchronize(end);
-    float time;
-    cudaEventElapsedTime(&time, begin, end);
-    cudaEventDestroy(begin);
-    cudaEventDestroy(end);
-    cudaStreamDestroy(s);
-    return time / iter;
-}
-
-template <typename KernelFlag, WeightOnlyActivationType AFlag, WeightOnlyQuantType BFlag>
-float benchmark_groupwise(void* act, void* weight, void* scales, void* zeros, void* bias, void* out, int m, int n,
-    int k, int group_size, int warmup, int iter)
-{
-    simple_assert(zeros && bias && (group_size == 64 || group_size == 128));
-    cudaStream_t s;
-    cudaStreamCreate(&s);
-    cudaEvent_t begin, end;
-    cudaEventCreate(&begin);
-    cudaEventCreate(&end);
-    if constexpr (std::is_same_v<KernelFlag, CudaKernel>)
-    {
-        WeightOnlyParams params{reinterpret_cast<uint8_t*>(weight), scales, zeros, act, nullptr, bias, out, m, n, k,
-            group_size, BFlag, WeightOnlyType::GroupWise, WeightOnlyActivationFunctionType::Identity, AFlag};
-        for (int i = 0; i < warmup; ++i)
-        {
-            tensorrt_llm::kernels::weight_only_batched_gemv_launcher(params, s);
-        }
-        cudaEventRecord(begin, s);
-        for (int i = 0; i < iter; ++i)
-        {
-            tensorrt_llm::kernels::weight_only_batched_gemv_launcher(params, s);
-        }
-    }
-    else if (std::is_same_v<KernelFlag, CutlassKernel>)
-    {
-        tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<typename AType<AFlag>::CutlassKernelAType,
-            typename BType<BFlag>::CutlassKernelBType, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS>
-            gemm;
-        auto configs = get_configs(gemm, k);
-        int ws_bytes = gemm.getWorkspaceSize(m, n, k);
-        char* ws_ptr = nullptr;
-        if (ws_bytes)
-            cudaMalloc(&ws_ptr, ws_bytes);
-        float fast_time = 1e8;
-        auto best_config = configs[0];
-        for (auto& config : configs)
-        {
-            for (int i = 0; i < 2; ++i)
-            {
-                gemm.gemm(act, weight, scales, zeros, bias, out, m, n, k, group_size, config, ws_ptr, ws_bytes, s);
-            }
-            cudaEventRecord(begin, s);
-            for (int i = 0; i < 5; ++i)
-            {
-                gemm.gemm(act, weight, scales, zeros, bias, out, m, n, k, group_size, config, ws_ptr, ws_bytes, s);
-            }
-            cudaEventRecord(end, s);
-            cudaEventSynchronize(end);
-            float time;
-            cudaEventElapsedTime(&time, begin, end);
-            if (time < fast_time)
-            {
-                fast_time = time;
-                best_config = config;
-            }
-        }
-
-        for (int i = 0; i < warmup; ++i)
-        {
-            gemm.gemm(act, weight, scales, zeros, bias, out, m, n, k, group_size, best_config, ws_ptr, ws_bytes, s);
-        }
-        cudaEventRecord(begin, s);
-        for (int i = 0; i < iter; ++i)
-        {
-            gemm.gemm(act, weight, scales, zeros, bias, out, m, n, k, group_size, best_config, ws_ptr, ws_bytes, s);
-        }
-        if (ws_ptr)
-            cudaFree(ws_ptr);
-    }
-
-    cudaEventRecord(end, s);
-    cudaEventSynchronize(end);
-    float time;
-    cudaEventElapsedTime(&time, begin, end);
-    cudaEventDestroy(begin);
-    cudaEventDestroy(end);
-    cudaStreamDestroy(s);
-    return time / iter;
 }
 
 struct CudaBuffer
@@ -334,7 +109,7 @@ float compare(void* _pa, void* _pb, int size, float scale)
 template <typename T1, typename T2>
 void random_fill(std::vector<T1>& vec, T2 minv, T2 maxv)
 {
-    std::mt19937 gen(20231205);
+    std::mt19937 gen(rand());
     std::uniform_real_distribution<float> dis(static_cast<float>(minv), static_cast<float>(maxv));
     for (auto& v : vec)
     {
@@ -342,50 +117,224 @@ void random_fill(std::vector<T1>& vec, T2 minv, T2 maxv)
     }
 }
 
-template <WeightOnlyActivationType AFlag, WeightOnlyQuantType BFlag>
-bool benchmark(int m, int n, int k, int group_size, int warmup, int iter)
+template <typename T>
+std::vector<tensorrt_llm::cutlass_extensions::CutlassGemmConfig> get_configs(T& runner, int k)
 {
-    printf("benchmark mnk (%d, %d, %d) ", m, n, k);
-    if (AFlag == WeightOnlyActivationType::FP16)
+    auto configs = runner.getConfigs();
+    std::vector<tensorrt_llm::cutlass_extensions::CutlassGemmConfig> rets;
+    for (auto config : configs)
     {
-        printf("FP16 Activation ");
+        if (config.stages >= 5)
+        {
+            continue;
+        }
+        if (config.split_k_style != tensorrt_llm::cutlass_extensions::SplitKStyle::NO_SPLIT_K)
+        {
+            int k_size = (k + config.split_k_factor - 1) / config.split_k_factor;
+            if (k_size % 64)
+            {
+                continue;
+            }
+        }
+        rets.push_back(config);
     }
-    else
+    return rets;
+}
+
+template <wo::KernelType KT>
+struct cutlassTypeMapper
+{
+};
+
+#define CUTLASS_TYPE_MAPPER_REGISTRY(                                                                                  \
+    CudaKernelType, KernelInfoStr, CutlassAType, CutlassWType, WElemBits, CutlassQuantOp)                              \
+    template <>                                                                                                        \
+    struct cutlassTypeMapper<CudaKernelType>                                                                           \
+    {                                                                                                                  \
+        using AType = CutlassAType;                                                                                    \
+        using WType = CutlassWType;                                                                                    \
+        static constexpr cutlass::WeightOnlyQuantOp QuantOp = CutlassQuantOp;                                          \
+        static constexpr int WSizeInBits = WElemBits;                                                                  \
+        static std::string str(int m, int n, int k, int gs)                                                            \
+        {                                                                                                              \
+            std::stringstream ss;                                                                                      \
+            ss << KernelInfoStr << " mnk(" << m << ", " << n << ", " << k << ")";                                      \
+            if (gs != 0)                                                                                               \
+                ss << ", gs " << gs;                                                                                   \
+            return ss.str();                                                                                           \
+        }                                                                                                              \
+    };
+CUTLASS_TYPE_MAPPER_REGISTRY(wo::KernelType::FP16Int4Groupwise, "FP16Int4Groupwise", half, cutlass::uint4b_t, 4,
+    cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS);
+CUTLASS_TYPE_MAPPER_REGISTRY(wo::KernelType::BF16Int4Groupwise, "BF16Int4Groupwise", __nv_bfloat16, cutlass::uint4b_t,
+    4, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS);
+CUTLASS_TYPE_MAPPER_REGISTRY(wo::KernelType::FP16Int8PerChannel, "FP16Int8PerChannel", half, uint8_t, 8,
+    cutlass::WeightOnlyQuantOp::PER_COLUMN_SCALE_ONLY);
+CUTLASS_TYPE_MAPPER_REGISTRY(wo::KernelType::BF16Int8PerChannel, "BF16Int8PerChannel", __nv_bfloat16, uint8_t, 8,
+    cutlass::WeightOnlyQuantOp::PER_COLUMN_SCALE_ONLY);
+CUTLASS_TYPE_MAPPER_REGISTRY(wo::KernelType::FP16Int4PerChannel, "FP16Int4PerChannel", half, cutlass::uint4b_t, 4,
+    cutlass::WeightOnlyQuantOp::PER_COLUMN_SCALE_ONLY);
+CUTLASS_TYPE_MAPPER_REGISTRY(wo::KernelType::BF16Int4PerChannel, "BF16Int4PerChannel", __nv_bfloat16, cutlass::uint4b_t,
+    4, cutlass::WeightOnlyQuantOp::PER_COLUMN_SCALE_ONLY);
+
+float run_cuda_kernel(wo::Params& params, int warmup, int iter)
+{
+    int arch = tensorrt_llm::common::getSMVersion();
+    simple_assert(wo::is_supported(arch, params.type));
+    cudaStream_t s;
+    cudaStreamCreate(&s);
+    cudaEvent_t begin, end;
+    cudaEventCreate(&begin);
+    cudaEventCreate(&end);
+    for (int i = 0; i < warmup; ++i)
     {
-        printf("BF16 Activation ");
+        wo::kernel_launcher(arch, params, s);
     }
-    if (BFlag == WeightOnlyQuantType::Int8b)
+    cudaEventRecord(begin, s);
+    for (int i = 0; i < iter; ++i)
     {
-        printf("Int8b ");
+        wo::kernel_launcher(arch, params, s);
     }
-    else
+    cudaEventRecord(end, s);
+    cudaEventSynchronize(end);
+    float time;
+    cudaEventElapsedTime(&time, begin, end);
+    cudaEventDestroy(begin);
+    cudaEventDestroy(end);
+    cudaStreamDestroy(s);
+    return time / iter;
+}
+
+template <wo::KernelType KT, typename Runner, typename Config>
+void exec_cutlass_kernel(
+    void* scaled_act, Runner& runner, wo::Params& params, Config& config, char* ws, size_t ws_size, cudaStream_t stream)
+{
+    using AType = typename cutlassTypeMapper<KT>::AType;
+    static constexpr cutlass::WeightOnlyQuantOp QuantOp = cutlassTypeMapper<KT>::QuantOp;
+    void* act = params.act;
+    if (params.act_scale)
     {
-        printf("Int4b ");
+        tensorrt_llm::kernels::apply_per_channel_scale_kernel_launcher<AType, AType>(
+            reinterpret_cast<AType*>(scaled_act), reinterpret_cast<AType const*>(params.act),
+            reinterpret_cast<AType const*>(params.act_scale), params.m, params.k, stream);
+        act = scaled_act;
     }
-    if (group_size == 0)
+    if constexpr (QuantOp == cutlass::WeightOnlyQuantOp::PER_COLUMN_SCALE_ONLY)
     {
-        printf("PerChannel Weight Only\n");
+        runner.gemm(
+            act, params.weight, params.scales, params.out, params.m, params.n, params.k, config, ws, ws_size, stream);
     }
-    else
+    else if (QuantOp == cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS)
     {
-        printf("GroupWise%d Weight Only\n", group_size);
+        runner.gemm(act, params.weight, params.scales, params.zeros, params.bias, params.out, params.m, params.n,
+            params.k, params.groupsize, config, ws, ws_size, stream);
     }
-    using AT = typename AType<AFlag>::CudaKernelAType;
-    using BT = typename BType<BFlag>::CudaKernelBType;
-    constexpr int elem_per_byte = BType<BFlag>::elemsPerByte;
-    CudaBuffer d_act(m * k * sizeof(AT));
-    CudaBuffer d_weight(k * n * sizeof(uint8_t) / elem_per_byte);
-    CudaBuffer d_scales(n * k * sizeof(AT));
-    CudaBuffer d_zeros(n * k * sizeof(AT));
-    CudaBuffer d_bias(n * sizeof(AT));
-    CudaBuffer d_out(m * n * sizeof(AT));
-    std::vector<AT> h_act(m * k);
+}
+
+template <wo::KernelType KT>
+float run_cutlass_kernel(wo::Params& params, int warmup, int iter)
+{
+    int arch = tensorrt_llm::common::getSMVersion();
+    simple_assert(KT == params.type);
+    simple_assert(wo::is_supported(arch, params.type));
+    using AType = typename cutlassTypeMapper<KT>::AType;
+    using WType = typename cutlassTypeMapper<KT>::WType;
+    CudaBuffer scaled_act(params.m * params.k * sizeof(AType));
+    auto runner = std::make_shared<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<AType, WType,
+        cutlassTypeMapper<KT>::QuantOp>>();
+    auto& gemm = *runner;
+    cudaStream_t s;
+    cudaStreamCreate(&s);
+    cudaEvent_t begin, end;
+    cudaEventCreate(&begin);
+    cudaEventCreate(&end);
+    auto configs = get_configs(gemm, params.k);
+    int ws_bytes = gemm.getWorkspaceSize(params.m, params.n, params.k);
+    char* ws_ptr = nullptr;
+    if (ws_bytes)
+        cudaMalloc(&ws_ptr, ws_bytes);
+    float fast_time = 1e8;
+    auto best_config = configs[0];
+    for (auto& config : configs)
+    {
+        for (int i = 0; i < 2; ++i)
+        {
+            exec_cutlass_kernel<KT>(scaled_act.data(), gemm, params, config, ws_ptr, ws_bytes, s);
+        }
+        cudaEventRecord(begin, s);
+        for (int i = 0; i < 5; ++i)
+        {
+            exec_cutlass_kernel<KT>(scaled_act.data(), gemm, params, config, ws_ptr, ws_bytes, s);
+        }
+        cudaEventRecord(end, s);
+        cudaEventSynchronize(end);
+        float time;
+        cudaEventElapsedTime(&time, begin, end);
+        if (time < fast_time)
+        {
+            fast_time = time;
+            best_config = config;
+        }
+    }
+
+    for (int i = 0; i < warmup; ++i)
+    {
+        exec_cutlass_kernel<KT>(scaled_act.data(), gemm, params, best_config, ws_ptr, ws_bytes, s);
+    }
+    cudaEventRecord(begin, s);
+    for (int i = 0; i < iter; ++i)
+    {
+        exec_cutlass_kernel<KT>(scaled_act.data(), gemm, params, best_config, ws_ptr, ws_bytes, s);
+    }
+    if (ws_ptr)
+        cudaFree(ws_ptr);
+    cudaEventRecord(end, s);
+    cudaEventSynchronize(end);
+    float time;
+    cudaEventElapsedTime(&time, begin, end);
+    cudaEventDestroy(begin);
+    cudaEventDestroy(end);
+    cudaStreamDestroy(s);
+    return time / iter;
+}
+
+template <wo::KernelType KT>
+bool benchmark_and_verify(int m, int n, int k, int groupsize, int warmup, int iter)
+{
+    std::srand(20240123);
+    simple_assert(m <= 4);
+    if constexpr (cutlassTypeMapper<KT>::QuantOp == cutlass::WeightOnlyQuantOp::PER_COLUMN_SCALE_ONLY)
+    {
+        simple_assert(groupsize == 0);
+    }
+    else if (cutlassTypeMapper<KT>::QuantOp == cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS)
+    {
+        simple_assert(groupsize == 64 || groupsize == 128);
+    }
+    using AType = typename cutlassTypeMapper<KT>::AType;
+    using WType = typename cutlassTypeMapper<KT>::WType;
+    static constexpr int ASizeInBits = sizeof(AType) * 8;
+    static constexpr int WSizeInBits = cutlassTypeMapper<KT>::WSizeInBits;
+    int gs_factor = groupsize == 0 ? 1 : groupsize;
+    printf("Kernel %s\n", cutlassTypeMapper<KT>::str(m, n, k, groupsize).c_str());
+
+    CudaBuffer d_act(m * k * ASizeInBits / 8);
+    CudaBuffer d_act_scale(k * ASizeInBits / 8);
+    CudaBuffer d_weight(k * n * WSizeInBits / 8);
+    CudaBuffer d_scales(n * k / gs_factor * ASizeInBits / 8);
+    CudaBuffer d_zeros(n * k / gs_factor * ASizeInBits / 8);
+    CudaBuffer d_bias(n * ASizeInBits / 8);
+    CudaBuffer d_out(m * n * ASizeInBits / 8);
+    std::vector<AType> h_act(m * k), h_act_scale(k);
     std::vector<uint8_t> h_weight(k * n);
-    std::vector<AT> h_scales(n * k), h_zeros(n * k), h_bias(n);
-    std::vector<AT> h_out1(m * n), h_out2(m * n);
+    std::vector<AType> h_scales(n * k), h_zeros(n * k), h_bias(n);
+    std::vector<AType> h_out1(m * n), h_out2(m * n);
 
     random_fill(h_act, -1.f, 1.f);
+    random_fill(h_act_scale, -1.f, 1.f);
     random_fill(h_scales, -1.f, 1.f);
+    random_fill(h_zeros, -1.f, 1.f);
+    random_fill(h_bias, -1.f, 1.f);
 
     for (uint8_t& v : h_weight)
     {
@@ -393,37 +342,31 @@ bool benchmark(int m, int n, int k, int group_size, int warmup, int iter)
     }
 
     d_act.copy_from(h_act.data());
+    d_act_scale.copy_from(h_act_scale.data());
     d_weight.copy_from(h_weight.data());
     d_scales.copy_from(h_scales.data());
     d_zeros.copy_from(h_zeros.data());
     d_bias.copy_from(h_bias.data());
 
+    void* p_act_scale = nullptr;
     void* p_zeros = nullptr;
     void* p_bias = nullptr;
-    if (group_size == 64 || group_size == 128)
+
+    if (groupsize != 0)
     {
         p_zeros = d_zeros.data();
         p_bias = d_bias.data();
+        p_act_scale = d_act_scale.data();
     }
-
+    wo::Params params(d_act.data(), p_act_scale, d_weight.data(), d_scales.data(), p_zeros, p_bias, d_out.data(), 1.f,
+        m, n, k, groupsize, KT);
     float time1, time2;
-    std::function<decltype(benchmark_perchannel<CudaKernel, AFlag, BFlag>)> benchmark_func_cuda
-        = benchmark_perchannel<CudaKernel, AFlag, BFlag>;
-    std::function<decltype(benchmark_perchannel<CutlassKernel, AFlag, BFlag>)> benchmark_func_cutlass
-        = benchmark_perchannel<CutlassKernel, AFlag, BFlag>;
-    if (group_size != 0)
-    {
-        benchmark_func_cuda = benchmark_groupwise<CudaKernel, AFlag, BFlag>;
-        benchmark_func_cutlass = benchmark_groupwise<CutlassKernel, AFlag, BFlag>;
-    }
-    time1 = benchmark_func_cuda(d_act.data(), d_weight.data(), d_scales.data(), p_zeros, p_bias, d_out.data(), m, n, k,
-        group_size, warmup, iter);
+    time1 = run_cuda_kernel(params, warmup, iter);
     d_out.copy_to(h_out1.data());
-    time2 = benchmark_func_cutlass(d_act.data(), d_weight.data(), d_scales.data(), p_zeros, p_bias, d_out.data(), m, n,
-        k, group_size, warmup, iter);
+    time2 = run_cutlass_kernel<KT>(params, warmup, iter);
     d_out.copy_to(h_out2.data());
-    float quant_scale = 1.f / (1 << (8 / elem_per_byte - 1));
-    bool pass = compare<AT>(h_out1.data(), h_out2.data(), m * n, quant_scale);
+    float quant_scale = 1.f / (1 << (8 / WSizeInBits - 1));
+    bool pass = compare<AType>(h_out1.data(), h_out2.data(), m * n, quant_scale);
     printf(
         "cuda kernel cost time %.6f, cutlass kernel cost time %.6f, cuda speedup %.3f\n", time1, time2, time2 / time1);
     return pass;
@@ -431,37 +374,36 @@ bool benchmark(int m, int n, int k, int group_size, int warmup, int iter)
 
 TEST(Kernel, WeightOnly)
 {
-    // Will re-enable 90 later when sm90 cuda kernels are ready
-    if (tensorrt_llm::common::getSMVersion() >= 90)
-    {
-        return;
-    }
+    int const arch = tensorrt_llm::common::getSMVersion();
     bool pass;
     int warmup = 10, iter = 30;
-    std::vector<int> ms{1, 2, 4};
-    std::vector<int> ns{512, 1024, 2048, 4096};
-    std::vector<int> ks{512, 1024, 2048, 4096};
-    std::vector<int> gss{0, 64, 128};
+    std::vector<int> ms{1, 2, 3, 4};
+    std::vector<int> ns{2048, 4096};
+    std::vector<int> ks{2048, 4096};
     for (auto m : ms)
     {
         for (auto n : ns)
         {
             for (auto k : ks)
             {
-                for (auto gs : gss)
+                pass = benchmark_and_verify<wo::KernelType::FP16Int8PerChannel>(m, n, k, 0, warmup, iter);
+                EXPECT_TRUE(pass);
+                pass = benchmark_and_verify<wo::KernelType::FP16Int4PerChannel>(m, n, k, 0, warmup, iter);
+                EXPECT_TRUE(pass);
+                if (arch >= 80)
                 {
-                    pass = benchmark<WeightOnlyActivationType::FP16, WeightOnlyQuantType::Int8b>(
-                        m, n, k, gs, warmup, iter);
+                    pass = benchmark_and_verify<wo::KernelType::FP16Int4Groupwise>(m, n, k, 64, warmup, iter);
                     EXPECT_TRUE(pass);
-                    pass = benchmark<WeightOnlyActivationType::FP16, WeightOnlyQuantType::Int4b>(
-                        m, n, k, gs, warmup, iter);
+                    pass = benchmark_and_verify<wo::KernelType::FP16Int4Groupwise>(m, n, k, 128, warmup, iter);
                     EXPECT_TRUE(pass);
 #if defined(ENABLE_BF16)
-                    pass = benchmark<WeightOnlyActivationType::BF16, WeightOnlyQuantType::Int8b>(
-                        m, n, k, gs, warmup, iter);
+                    pass = benchmark_and_verify<wo::KernelType::BF16Int4Groupwise>(m, n, k, 64, warmup, iter);
                     EXPECT_TRUE(pass);
-                    pass = benchmark<WeightOnlyActivationType::BF16, WeightOnlyQuantType::Int4b>(
-                        m, n, k, gs, warmup, iter);
+                    pass = benchmark_and_verify<wo::KernelType::BF16Int4Groupwise>(m, n, k, 128, warmup, iter);
+                    EXPECT_TRUE(pass);
+                    pass = benchmark_and_verify<wo::KernelType::BF16Int8PerChannel>(m, n, k, 0, warmup, iter);
+                    EXPECT_TRUE(pass);
+                    pass = benchmark_and_verify<wo::KernelType::BF16Int4PerChannel>(m, n, k, 0, warmup, iter);
                     EXPECT_TRUE(pass);
 #endif
                 }

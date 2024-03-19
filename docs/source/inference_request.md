@@ -29,6 +29,7 @@ Optional tensors that can be supplied to `InferenceRequest` are shown below. Def
 | `stop_words_list` | [2, num_stop_words] | `int32_t` | Stop words list |
 | `prompt_embedding_table` | [1] | `float16` | P-tuning prompt embedding table |
 | `prompt_vocab_size` | [1] | `int32_t` | P-tuning prompt vocab size |
+| `lora_task_id` | [1] | `uint64_t` | Task ID for the given lora_weights.  This ID is expected to be globally unique.  To perform inference with a specific LoRA for the first time `lora_task_id` `lora_weights` and `lora_config` must all be given.  The LoRA will be cached, so that subsequent requests for the same task only require `lora_task_id`. If the cache is full the oldest LoRA will be evicted to make space for new ones.  An error is returned if `lora_task_id` is not cached |
 | `lora_weights` | [ num_lora_modules_layers, D x Hi + Ho x D ] | `float` (model data type) | weights for a lora adapter. see [lora docs](lora.md#lora-tensor-format-details) for more details. |
 | `lora_config` | [3] | `int32_t` | lora configuration tensor. `[ module_id, layer_idx, adapter_size (D aka R value) ]` see [lora docs](lora.md#lora-tensor-format-details) for more details. |
 | `return_log_probs` | [1] | `bool` | When `true`, include log probs in the output |

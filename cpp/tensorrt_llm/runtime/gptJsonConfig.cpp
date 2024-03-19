@@ -153,7 +153,7 @@ void parsePluginConfig(GptModelConfig& modelConfig, Json const& pluginConfig)
 void parseLora(GptModelConfig& modelConfig, Json const& json, Json const& pluginConfig, bool engineVersionNone,
     SizeType tensorParallelism)
 {
-    auto const& config = engineVersionNone ? json.at("builder_config") : json.at("pretrained_config");
+    auto const& config = engineVersionNone ? json.at("builder_config") : json.at("build_config").at("lora_config");
 
     auto const loraMaxRank = parseJsonFieldOr(config, "max_lora_rank", SizeType{0});
     auto const loraTargetModules = parseJsonFieldOptional<std::vector<std::string>>(config, "lora_target_modules");

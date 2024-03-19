@@ -27,6 +27,7 @@
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
 #include "tensorrt_llm/kernels/samplingTopPKernels.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
+#include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
@@ -40,19 +41,27 @@ namespace tensorrt_llm::tests::layers::sampling
 
 struct SamplingParams
 {
-    std::vector<uint32_t> topKs;
+    std::vector<runtime::SizeType> topKs;
     std::vector<float> topPs;
     std::vector<float> temperatures;
     std::vector<float> repetitionPenalties;
     std::vector<float> presencePenalties;
     std::vector<float> frequencyPenalties;
-    std::vector<int32_t> minLengths;
+    std::vector<runtime::SizeType> minLengths;
     std::vector<float> decay;
     std::vector<float> minTopP;
-    std::vector<int32_t> topPResetIds;
-    std::vector<std::vector<std::vector<int32_t>>> badWords;
-    std::vector<std::vector<std::vector<int32_t>>> stopWords;
-    bool useBias = false;
+    std::vector<runtime::TokenIdType> topPResetIds;
+    std::vector<std::vector<std::vector<runtime::TokenIdType>>> badWords;
+    std::vector<std::vector<std::vector<runtime::TokenIdType>>> stopWords;
+    bool useBias{false};
+
+    // Medusa setup
+    bool useMedusa{false};
+    std::optional<runtime::SizeType> maxNumMedusaHeads{std::nullopt};
+    std::optional<std::vector<std::vector<runtime::SizeType>>> topKMedusaHeads{std::nullopt};
+    std::optional<std::vector<runtime::SizeType>> tokensPerStep{std::nullopt};
+    std::optional<std::vector<std::vector<tensorrt_llm::runtime::SizeType>>> paths;
+    std::optional<std::vector<std::vector<tensorrt_llm::runtime::TokenIdType>>> outputIds;
 };
 
 template <typename T>
@@ -64,22 +73,22 @@ private:
     using TensorPtr = tensorrt_llm::runtime::ITensor::SharedPtr;
     using BufferPtr = tensorrt_llm::runtime::IBuffer::SharedPtr;
 
-    int32_t seed = 0;
-    const static uint64_t mMaxSeed = 32;
-    int32_t const mBatchSize = 6;
-    int32_t const mMaxBatchSize = 2 * mBatchSize;
-    int32_t const mBeamWidth = 1;
-    int32_t const mBatchBeam = mBatchSize * mBeamWidth;
-    int32_t const mVocabSize = 9;
-    int32_t const mVocabSizePadded = mVocabSize;
+    static const uint64_t mMaxSeed{32};
+    runtime::SizeType const mBatchSize{6};
+    runtime::SizeType const mMaxBatchSize{2 * mBatchSize};
+    runtime::SizeType const mBeamWidth{1};
+    runtime::SizeType const mBatchBeam{mBatchSize * mBeamWidth};
+    runtime::SizeType const mVocabSize{9};
+    runtime::SizeType const mVocabSizePadded{mVocabSize};
 
-    int32_t const mMaxInputLen = 0; // has no effect.
-    int32_t const mMaxOutputLen = 4;
-    int32_t const mMaxSeqLen = mMaxInputLen + mMaxOutputLen;
-    int32_t const mSinkTokenLength = 0;
-    int32_t mEndId = mVocabSize;
+    runtime::SizeType const mMaxInputLen{0}; // has no effect.
+    runtime::SizeType const mMaxOutputLen{4};
+    runtime::SizeType const mMaxSeqLen{mMaxInputLen + mMaxOutputLen};
+    runtime::SizeType const mSinkTokenLength{0};
+    runtime::TokenIdType mEndId = mVocabSize;
+    runtime::SizeType mMaxTokensPerStep{1};
 
-    bool mUseLogitsVec = false;
+    bool mUseLogitsVec{false};
 
     TensorPtr mLogitsDevice;
     TensorPtr mRuntimeLogitsHost;
@@ -110,11 +119,15 @@ private:
 
     TensorPtr mCumLogProbsDevice;
 
+    // Medusa tensors
+    TensorPtr mPathsDevice;
+    TensorPtr mAcceptedLengths;
+    TensorPtr mMedusaLogitsDevice;
+    TensorPtr mNextDraftTokensDevice;
+
     std::vector<tensorrt_llm::common::Tensor> mLogitsVec;
 
     struct cudaDeviceProp mDeviceProp;
-
-    const tensorrt_llm::common::DataType data_type = tensorrt_llm::common::getTensorType<T>();
 
     // Order is important because we pass mAllocator to mDecodeLayer and it is used in destructor
     std::shared_ptr<tensorrt_llm::runtime::CudaStream> mStream;
@@ -124,33 +137,39 @@ private:
 
     std::vector<T> mTestLogitsInit;
 
-    int32_t mMaxBadWordsLen{0};
-    int32_t mMaxStopWordsLen{0};
+    runtime::SizeType mMaxBadWordsLen{0};
+    runtime::SizeType mMaxStopWordsLen{0};
+
+    bool mUseMedusa{false};
 
 private:
+    void allocateData(SamplingParams const& params);
+
     void setup(uint64_t seed, SamplingParams const& params);
 
-    int32_t getMaxWordsLen(std::vector<std::vector<std::vector<int32_t>>> const& inputWords);
-    void initXWordsTensors(int32_t* batchSlotsPtr, int32_t* wordsData, int32_t** wordsPtr, int32_t* wordsLenData,
-        int32_t maxWordsLen, std::vector<std::vector<std::vector<int32_t>>> const& inputWords);
+    runtime::SizeType getMaxWordsLen(std::vector<std::vector<std::vector<runtime::TokenIdType>>> const& inputWords);
+    void initXWordsTensors(runtime::SizeType* batchSlotsPtr, runtime::TokenIdType* wordsData,
+        runtime::TokenIdType** wordsPtr, runtime::SizeType* wordsLenData, runtime::SizeType maxWordsLen,
+        std::vector<std::vector<std::vector<runtime::TokenIdType>>> const& inputWords);
 
-    typename tensorrt_llm::layers::DynamicDecodeLayer<T>::ForwardParams createInputTensors(int32_t step);
+    typename tensorrt_llm::layers::DynamicDecodeLayer<T>::ForwardParams createInputTensors(runtime::SizeType step);
 
     typename tensorrt_llm::layers::DynamicDecodeLayer<T>::OutputParams createOutputTensors();
 
-    void batchCopy(int32_t step);
-    bool checkResult(int32_t* outputIds, std::vector<std::set<int32_t>> const& expectedIds, int32_t* seqLens,
-        int32_t leadingDim, int32_t stride, int32_t step);
+    void batchCopy(runtime::SizeType step);
+    bool checkResult(runtime::TokenIdType* outputIds, std::vector<std::set<runtime::TokenIdType>> const& expectedIds,
+        runtime::SizeType* seqLens, runtime::SizeType leadingDim, runtime::SizeType stride, runtime::SizeType step,
+        bool outputIdsTransposed = false, runtime::SizeType strideTransposed = 0);
 
-    void runTestImpl(
-        std::vector<std::set<int32_t>> const& expectedOutputIds, SamplingParams const& params, int32_t endId = -1);
+    void runTestImpl(std::vector<std::set<runtime::TokenIdType>> const& expectedOutputIds, SamplingParams const& params,
+        runtime::TokenIdType endId = -1);
 
-    void fillRefLogits(
-        int32_t const* seqLenHost, std::vector<std::set<int32_t>> const& expectedOutputIds, int32_t step);
+    void fillRefLogits(runtime::SizeType const* seqLenHost,
+        std::vector<std::set<runtime::TokenIdType>> const& expectedOutputIds, runtime::SizeType step);
 
 public:
-    void runTest(
-        std::vector<std::set<int32_t>> const& expectedOutputIds, SamplingParams const& params, int32_t endId = -1);
+    void runTest(std::vector<std::set<runtime::TokenIdType>> const& expectedOutputIds, SamplingParams const& params,
+        runtime::TokenIdType endId = -1);
 };
 
 typedef testing::Types<float, half> FloatAndHalfTypes;

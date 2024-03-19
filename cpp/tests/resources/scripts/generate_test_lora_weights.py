@@ -58,11 +58,68 @@ def pad_tensors(weights_list):
     return torch.concatenate(padded_weights, dim=0)
 
 
+def copy_to_cache_pages(weights,
+                        lora_config,
+                        page_blocks,
+                        configs,
+                        tp_rank=0,
+                        tp_size=1):
+    page_slots = page_blocks.shape[1]
+    page_width = page_blocks.shape[2]
+
+    curr_page = 0
+    curr_slot = 0
+    for i in range(lora_config.shape[0]):
+        module = configs[lora_config[i, 0]]
+        adapter_size = module[2]
+        in_dim = module[3]
+        out_dim = module[4]
+        mod_id = module[0]
+        split_in = mod_id in (4, 6, 12)
+
+        local_in_dim = in_dim // tp_size
+        local_out_dim = out_dim // tp_size
+
+        local_size = 0
+        if split_in:
+            local_size = adapter_size * (local_in_dim + out_dim)
+        else:
+            local_size = adapter_size * (in_dim + local_out_dim)
+
+        num_slots = (local_size + page_width - 1) // page_width
+        if num_slots + curr_slot > page_slots:
+            curr_slot = 0
+            curr_page += 1
+
+        flattend_size = adapter_size * (in_dim + out_dim)
+
+        if split_in:
+            in_weights = weights[i, :adapter_size * in_dim].reshape(
+                (adapter_size, tp_size,
+                 local_in_dim))[:, tp_rank, :].contiguous().flatten()
+            out_weights = weights[i, adapter_size *
+                                  in_dim:flattend_size].contiguous().flatten()
+        else:
+            in_weights = weights[i, :adapter_size *
+                                 in_dim].contiguous().flatten()
+            out_weights = weights[i,
+                                  adapter_size * in_dim:flattend_size].reshape(
+                                      (tp_size, local_out_dim, adapter_size
+                                       ))[tp_rank, :, :].contiguous().flatten()
+
+        page_blocks[curr_page, curr_slot:curr_slot + num_slots, :].view(
+            -1)[0:in_weights.shape[0] +
+                out_weights.shape[0]] = torch.concatenate(
+                    (in_weights, out_weights)).contiguous().flatten()
+        curr_slot += num_slots
+
+
 def main():
     torch.manual_seed(12345)
     parser = argparse.ArgumentParser()
     parser.add_argument('--tp-size', type=int, default=1)
     parser.add_argument('--out-dir', type=Path, required=True)
+    parser.add_argument('--num-loras', type=int, default=1)
 
     args = parser.parse_args()
 
@@ -93,35 +150,55 @@ def main():
          hidden_size),  # cross_attn_dense
     ]
 
-    all_source = []
-    all_config = []
+    for lora_idx in range(args.num_loras):
+        all_source = []
+        all_config = []
 
-    all_target = []
-    for c in configs:
-        source_weights, config = generate_source_weights(*c)
-        all_source.append(source_weights)
-        all_config.append(config)
+        all_target = []
+        for c in configs:
+            source_weights, config = generate_source_weights(*c)
+            all_source.append(source_weights)
+            all_config.append(config)
 
-        mod_id, _, adapter_size, in_dim, out_dim = c
-        split_in = mod_id in (4, 6, 12)
+            mod_id, _, adapter_size, in_dim, out_dim = c
+            split_in = mod_id in (4, 6, 12)
 
-        target_weights = format_tensors(source_weights, adapter_size, in_dim,
-                                        out_dim, args.tp_size, split_in)
-        all_target.append(target_weights)
+            target_weights = format_tensors(source_weights, adapter_size,
+                                            in_dim, out_dim, args.tp_size,
+                                            split_in)
+            all_target.append(target_weights)
 
-    all_source = pad_tensors(all_source)
-    all_config = pad_tensors(all_config)
-    all_target = pad_tensors(all_target)
+        all_source = pad_tensors(all_source)
+        all_config = pad_tensors(all_config)
+        all_target = pad_tensors(all_target)
 
-    source_out_path = args.out_dir / 'source.npy'
-    config_out_path = args.out_dir / 'config.npy'
-    target_out_path = args.out_dir / 'target.npy'
+        output_dir = Path(args.out_dir)
+        if args.num_loras > 1:
+            output_dir = output_dir / str(lora_idx)
 
-    os.makedirs(args.out_dir, exist_ok=True)
+        os.makedirs(output_dir, exist_ok=True)
+        # copy weights into cache pages
+        for rank in range(args.tp_size):
+            page_block = torch.zeros((8, 18, 128),
+                                     dtype=torch.float32,
+                                     device='cpu')
+            copy_to_cache_pages(all_source,
+                                all_config,
+                                page_block,
+                                configs,
+                                tp_rank=rank,
+                                tp_size=args.tp_size)
 
-    np.save(source_out_path, all_source)
-    np.save(config_out_path, all_config)
-    np.save(target_out_path, all_target)
+            out_path = output_dir / f'cache_pages_rank{rank}.npy'
+            np.save(out_path, page_block)
+
+        source_out_path = output_dir / 'source.npy'
+        config_out_path = output_dir / 'config.npy'
+        target_out_path = output_dir / 'target.npy'
+
+        np.save(source_out_path, all_source)
+        np.save(config_out_path, all_config)
+        np.save(target_out_path, all_target)
 
 
 if __name__ == "__main__":

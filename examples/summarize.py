@@ -21,7 +21,7 @@ import evaluate
 import numpy as np
 import torch
 from datasets import load_dataset
-from qwen.utils.utils import make_context
+from qwen.convert_checkpoint import make_context
 from transformers import (AutoModel, AutoModelForCausalLM,
                           AutoModelForSeq2SeqLM, GenerationConfig)
 from utils import DEFAULT_HF_MODEL_DIRS, load_tokenizer, read_model_name
@@ -147,7 +147,7 @@ def main(args):
                 input_ids = tokenizer.encode(curr_text,
                                              return_tensors='pt').squeeze(0)
                 input_ids = input_ids[:test_token_num]
-            elif model_name == 'qwen':
+            elif model_name == 'QWenForCausalLM':
                 # use make_content to generate prompt
                 system_prompt = "You are a useful assistant, please directly output the corresponding summary according to the article entered by the user."
                 _, input_id_list = make_context(
@@ -274,6 +274,12 @@ def main(args):
         batch_input_ids = torch.stack(batch_input_ids)
         batch_input_ids = batch_input_ids.cuda()
 
+        # specialization for HF
+        if early_stopping in [0, 1]:
+            local_early_stopping = bool(early_stopping)
+        else:
+            local_early_stopping = "never"
+
         with torch.no_grad():
             outputs = model.generate(batch_input_ids,
                                      max_new_tokens=output_len,
@@ -284,7 +290,7 @@ def main(args):
                                      num_beams=num_beams,
                                      num_return_sequences=num_beams,
                                      length_penalty=length_penalty,
-                                     early_stopping=early_stopping,
+                                     early_stopping=local_early_stopping,
                                      output_scores=True,
                                      return_dict_in_generate=True)
             if eval_ppl and batch_size == 1:

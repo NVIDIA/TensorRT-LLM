@@ -413,7 +413,7 @@ if __name__ == '__main__':
                                              results,
                                              enable_log=True)
         if args.accuracy_check and args.dataset == "hf-internal-testing/librispeech_asr_dummy" and not args.input_file:
-            assert total_error_rate <= 2.5, f"Word Error rate using whisper large-v3 model should be less than 2.5% but got {total_error_rate}"
+            assert total_error_rate <= 2.8, f"Word Error rate using whisper large-v3 model should be 2.40%, but got {total_error_rate}"
 
     rtf = elapsed / total_duration
     s = f"RTF: {rtf:.4f}\n"

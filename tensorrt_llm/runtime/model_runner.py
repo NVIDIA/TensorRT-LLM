@@ -122,8 +122,6 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
         'max_prompt_embedding_table_size', 0)
     quant_mode = QuantMode(builder_config.get('quant_mode', 0))
     lora_target_modules = builder_config.get('lora_target_modules')
-    lora_hf_modules_to_trtllm_modules = builder_config.get(
-        'hf_modules_to_trtllm_modules')
     lora_trtllm_modules_to_hf_modules = builder_config.get(
         'trtllm_modules_to_hf_modules')
     max_medusa_token_len = builder_config.get('max_draft_len', 0)
@@ -165,7 +163,6 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
         lora_plugin=lora_plugin,
         lora_target_modules=lora_target_modules,
         use_context_fmha_for_generation=use_context_fmha_for_generation,
-        hf_modules_to_trtllm_modules=lora_hf_modules_to_trtllm_modules,
         trtllm_modules_to_hf_modules=lora_trtllm_modules_to_hf_modules,
         num_medusa_heads=num_medusa_heads,
         max_medusa_tokens=max_medusa_token_len,
@@ -339,7 +336,7 @@ class ModelRunner(ModelRunnerMixin):
     @classmethod
     def from_engine(cls,
                     engine: Engine,
-                    lora_dir: Optional[str] = None,
+                    lora_dir: Optional[List[str]] = None,
                     rank: int = 0,
                     debug_mode: bool = False,
                     lora_ckpt_source: str = "hf",
@@ -387,14 +384,9 @@ class ModelRunner(ModelRunnerMixin):
             mamba_expand=mamba_expand,
             mamba_d_conv=mamba_d_conv,
             lora_plugin=build_config.plugin_config.lora_plugin,
-            lora_target_modules=pretrained_config.lora_target_modules
-            if hasattr(pretrained_config, 'lora_target_modules') else [],
-            hf_modules_to_trtllm_modules=pretrained_config.
-            hf_modules_to_trtllm_modules if hasattr(
-                pretrained_config, 'hf_modules_to_trtllm_modules') else [],
-            trtllm_modules_to_hf_modules=pretrained_config.
-            trtllm_modules_to_hf_modules if hasattr(
-                pretrained_config, 'trtllm_modules_to_hf_modules') else [],
+            lora_target_modules=build_config.lora_config.lora_target_modules,
+            trtllm_modules_to_hf_modules=build_config.lora_config.
+            trtllm_modules_to_hf_modules,
             max_medusa_tokens=pretrained_config.max_draft_len if hasattr(
                 pretrained_config, 'max_draft_len') else 0,
             num_medusa_heads=pretrained_config.num_medusa_heads if hasattr(
@@ -450,7 +442,7 @@ class ModelRunner(ModelRunnerMixin):
     @classmethod
     def from_dir(cls,
                  engine_dir: str,
-                 lora_dir: Optional[str] = None,
+                 lora_dir: Optional[List[str]] = None,
                  rank: int = 0,
                  debug_mode: bool = False,
                  lora_ckpt_source: str = "hf",
@@ -462,8 +454,8 @@ class ModelRunner(ModelRunnerMixin):
         Args:
             engine_dir (str):
                 The directory that contains the serialized engine files and config files.
-            lora_dir (str):
-                The directory that contains LoRA weights.
+            lora_dir (Optional[List[str]]):
+                The directories that contain LoRA weights.
             rank (int):
                 The runtime rank id.
             debug_mode (bool):
@@ -545,6 +537,13 @@ class ModelRunner(ModelRunnerMixin):
         else:
             # the new engine format
             engine = Engine.from_dir(engine_dir, rank)
+            if lora_dir is None:
+                config_lora_dir = engine.config.build_config.lora_config.lora_dir
+                if len(config_lora_dir) > 0:
+                    lora_dir = [
+                        f"{engine_dir}/{dir}" for dir in config_lora_dir
+                    ]
+                    lora_ckpt_source = engine.config.build_config.lora_config.lora_ckpt_source
             runner = ModelRunner.from_engine(engine, lora_dir, rank, debug_mode,
                                              lora_ckpt_source, medusa_choices,
                                              stream)

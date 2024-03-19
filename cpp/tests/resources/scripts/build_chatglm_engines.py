@@ -37,7 +37,6 @@ def convert_ckpt(model_dir: str, output_dir: str, world_size: int):
         f"--model_dir={model_dir}", f"--output_dir={output_dir}",
         f"--tp_size={world_size}"
     ]
-    print("Running: " + " ".join(convert_cmd))
     run_command(convert_cmd)
 
 
@@ -50,7 +49,6 @@ def build_engine(ckpt_dir: str, engine_dir: str):
         "--builder_opt=0", "--remove_input_padding=disable",
         "--paged_kv_cache=disable"
     ]
-    print("Running: " + " ".join(build_cmd))
     run_command(build_cmd)
 
 

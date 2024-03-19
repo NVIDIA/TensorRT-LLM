@@ -38,11 +38,12 @@ public:
     using SetupParams = typename Base::SetupParams;
     using ForwardParams = typename Base::ForwardParams;
 
-    TopKSamplingLayer(size_t maxBatchSize, size_t vocabSize, size_t vocabSizePadded, cudaStream_t stream,
-        std::shared_ptr<tensorrt_llm::common::IAllocator> allocator);
+    TopKSamplingLayer(runtime::SizeType maxBatchSize, runtime::SizeType vocabSize, runtime::SizeType vocabSizePadded,
+        cudaStream_t stream, std::shared_ptr<tensorrt_llm::common::IAllocator> allocator);
     ~TopKSamplingLayer();
 
-    void setup(size_t batchSize, int32_t const* batchSlots, SetupParams const& setupParams) override;
+    void setup(
+        runtime::SizeType batchSize, runtime::SizeType const* batchSlots, SetupParams const& setupParams) override;
     void forward(DecodingOutputParams& outputs, ForwardParams& inputs) override;
 
     bool const* getSkipDecodeHost() const
@@ -52,8 +53,8 @@ public:
 
 protected:
     bool mNormalizeLogProbs = true;
-    uint32_t mRuntimeMaxTopK = 0;
-    uint32_t* mRuntimeTopKDevice = nullptr;
+    runtime::SizeType mRuntimeMaxTopK = 0;
+    runtime::SizeType* mRuntimeTopKDevice = nullptr;
     float* mRuntimeTopPDevice = nullptr;
     void* mSetupWorkspaceDevice = nullptr;
     bool* mSkipDecodeDevice = nullptr;
@@ -69,10 +70,8 @@ protected:
     using Base::mStream;
     using Base::mAllocator;
 
-    static constexpr uint32_t TOP_K_MAX = 1024;
-
 private:
-    void allocateBuffer(size_t batchSize);
+    void allocateBuffer(runtime::SizeType batchSize);
     void freeBuffer();
 };
 

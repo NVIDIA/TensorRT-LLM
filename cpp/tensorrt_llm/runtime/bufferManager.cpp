@@ -27,8 +27,9 @@ using namespace tensorrt_llm::runtime;
 
 namespace tc = tensorrt_llm::common;
 
-BufferManager::BufferManager(CudaStreamPtr stream)
+BufferManager::BufferManager(CudaStreamPtr stream, bool trimPool)
     : mStream{std::move(stream)}
+    , mTrimPool{trimPool}
 {
     TLLM_CHECK_WITH_INFO(static_cast<bool>(mStream), "Undefined CUDA stream");
     thread_local static std::unordered_set<int> initializedDevices(8);

@@ -79,8 +79,8 @@ void update_indir_cache_kernelLauncher(int* tgt_indir_cache, int const* src_indi
 }
 
 template <typename T>
-BaseBeamSearchLayer<T>::BaseBeamSearchLayer(
-    size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream, std::shared_ptr<IAllocator> allocator)
+BaseBeamSearchLayer<T>::BaseBeamSearchLayer(runtime::SizeType vocab_size, runtime::SizeType vocab_size_padded,
+    cudaStream_t stream, std::shared_ptr<IAllocator> allocator)
     : BaseLayer(stream, std::move(allocator), nullptr)
     , vocab_size_(vocab_size)
     , vocab_size_padded_(vocab_size_padded)
@@ -115,7 +115,7 @@ void BaseBeamSearchLayer<T>::freeBuffer()
 }
 
 template <typename T>
-void BaseBeamSearchLayer<T>::allocateBuffer(size_t batch_size)
+void BaseBeamSearchLayer<T>::allocateBuffer(runtime::SizeType batch_size)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     mIsAllocateBuffer = true;
@@ -123,7 +123,7 @@ void BaseBeamSearchLayer<T>::allocateBuffer(size_t batch_size)
 }
 
 template <typename T>
-void BaseBeamSearchLayer<T>::setupBase(size_t batch_size, SetupParams const& setupParams)
+void BaseBeamSearchLayer<T>::setupBase(runtime::SizeType batch_size, SetupParams const& setupParams)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     allocateBuffer(batch_size);

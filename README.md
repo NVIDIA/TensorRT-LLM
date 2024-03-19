@@ -206,17 +206,16 @@ architectures as well as important features implemented in TensorRT-LLM.
 
 ### Devices
 
-TensorRT-LLM is rigorously tested on the following GPUs:
+TensorRT-LLM supports the following architectures:
 
-* [H100](https://www.nvidia.com/en-us/data-center/h100/)
-* [L40S](https://www.nvidia.com/en-us/data-center/l40s/)
-* [A100](https://www.nvidia.com/en-us/data-center/a100/)
-* [A30](https://www.nvidia.com/en-us/data-center/products/a30-gpu/)
-* [V100](https://www.nvidia.com/en-us/data-center/v100/) (experimental)
+* [NVIDIA Hopper](https://www.nvidia.com/en-us/data-center/technologies/hopper-architecture/) (SM90), for example, H200, H100, H20
+* [NVIDIA Ada Lovelace](https://www.nvidia.com/en-us/geforce/ada-lovelace-architecture/) (SM89), for example, L40S, L20, L4
+* [NVIDIA Ampere](https://www.nvidia.com/en-us/data-center/ampere-architecture/) (SM80, SM86), for example, A100, A30, A10G
+* [NVIDIA Turing](https://www.nvidia.com/en-us/geforce/turing/) (SM75), for example, T4
+* [NVIDIA Volta](https://www.nvidia.com/en-us/data-center/volta-gpu-architecture/) (SM70 - experimental), for example, V100
 
-If a GPU is not listed above, it is important to note that TensorRT-LLM is
-expected to work on GPUs based on the Volta, Turing, Ampere, Hopper and Ada
-Lovelace architectures. Certain limitations may, however, apply.
+
+It is important to note that TensorRT-LLM is expected to work on all GPUs based on the Volta, Turing, Ampere, Hopper, and Ada Lovelace architectures. Certain limitations may apply.
 
 ### Precision
 
@@ -273,7 +272,7 @@ The list of supported models is:
 * [Blip2](examples/blip2)
 * [BLOOM](examples/bloom)
 * [ChatGLM](examples/chatglm)
-* [FairSeq NMT](examples/nmt)
+* [FairSeq NMT](examples/enc_dec/nmt)
 * [Falcon](examples/falcon)
 * [Flan-T5](examples/enc_dec)
 * [GPT](examples/gpt)
@@ -406,7 +405,7 @@ As a rule of thumb, if you are running TensorRT-LLM interactively on a Slurm
 node, prefix your commands with `mpirun -n 1` to run TensorRT-LLM in a
 dedicated MPI environment, not the one provided by your Slurm allocation.
 
-For example: `mpirun -n 1 python3 examples/gpt/build.py ...`
+For example: `mpirun -n 1 python3 examples/run.py ...`
 
 ## Release notes
 

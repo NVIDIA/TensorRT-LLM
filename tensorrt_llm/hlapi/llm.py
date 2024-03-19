@@ -12,24 +12,22 @@ from typing import Any, Dict, Iterable, List, Optional, Union
 import tensorrt as trt
 import torch
 
-import tensorrt_llm.bindings as tllm
-from tensorrt_llm.bindings import KvCacheConfig, SchedulerPolicy
-
-from .._utils import mpi_rank
+from .. import bindings as tllm
+from .._utils import mpi_rank, release_gc
 from ..auto_parallel.config import AutoParallelConfig, infer_cluster_key
+from ..bindings import KvCacheConfig, SchedulerPolicy
 from ..builder import (BuildConfig, Engine, EngineConfig, PluginConfig,
                        QuantMode, build)
-from ..executor import (GenerationExecutor, GenerationResult,
-                        ParallelGenerationExecutor)
+from ..executor import GenerationExecutor, GenerationResult
 from ..logger import logger
 from ..mapping import Mapping
 from ..models.modeling_utils import PretrainedConfig
 from ..module import Module
 from ..runtime import SamplingConfig
-from .mpi_session import MpiSession, NodeSession
+from .mpi_session import MPINodeState, MpiSession
 from .tokenizer import TokenizerBase, TransformersTokenizer
 from .utils import (GenerationOutput, file_with_suffix_exists, get_device_count,
-                    print_colored, print_traceback_on_error, release_gc)
+                    print_colored, print_traceback_on_error)
 
 
 @dataclass
@@ -265,6 +263,7 @@ class LLM:
         self.decoding_mode = decoding_mode
         self.scheduling_policy = scheduling_policy
 
+        self.mpi_session = None
         # TODO[chunweiy]: Support more models and gpus
 
         self._extra_build_config = ModelLoader.load_extra_build_configs_from_engine(
@@ -285,7 +284,8 @@ class LLM:
             self.mpi_session = MpiSession(n_workers=self.config.world_size)
 
         # Due to the gptManager can only accept a engine path, we need to save the engine to a directory
-        self._engine_dir: Union[tempfile.TemporaryDirectory, str, Path] = None
+        self._engine_dir: Union[tempfile.TemporaryDirectory, str, Path,
+                                None] = None
         self._executor: Optional[GenerationExecutor] = None
 
         self.runtime_context: Optional[_ModelRuntimeContext] = None
@@ -390,21 +390,28 @@ class LLM:
         if src_engine_dir != engine_dir:
             shutil.copytree(src_engine_dir, engine_dir, dirs_exist_ok=True)
 
-    def __enter__(self):
-        return self
+    def shutdown(self):
+        if self._executor is not None:
+            self._executor.shutdown()
 
-    def __exit__(self, exc_type, exc_value, traceback):
         if self.mpi_session is not None:
             self.mpi_session.shutdown()
             self.mpi_session = None
-        if hasattr(self, "_executor") and self._executor is not None:
-            self._executor.__exit__(exc_type, exc_value, traceback)
-            self._executor = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        del exc_value, traceback
+        self.shutdown()
+        return exc_type is not None
 
     def _save_engine(self, engine_dir: str):
         logger.info(f"Save model to {engine_dir}")
 
         if self.config.is_multi_gpu:
+            if self._executor is not None:
+                self._executor.shutdown()
             self.mpi_session.submit_sync(LLM._node_save_task, engine_dir,
                                          self.config.model_dir)
         else:
@@ -443,6 +450,9 @@ class LLM:
 
         if model_format is not _ModelFormatKind.TLLM_ENGINE:
 
+            if self._executor is not None:
+                self._executor.shutdown()
+
             self._engine_dir = self.async_engine_tmp_dir
             if self._engine_dir is None:
                 self._engine_dir = tempfile.TemporaryDirectory()
@@ -464,7 +474,7 @@ class LLM:
 
                     runtime_context = model_loader()
 
-                    # TODO[chunweiy]: Make GptManager support in-memory engine-buffer to save disk loading lantenecy
+                    # TODO[chunweiy]: Make GptManager support in-memory engine-buffer to save disk loading latency
                     ModelLoader.save(runtime_context,
                                      self.config.model_dir,
                                      engine_dir=get_engine_dir(),
@@ -488,42 +498,32 @@ class LLM:
         executor_config.decoding_mode = self.decoding_mode.to_cpp(
         ) if self.decoding_mode else None
 
-        if self.config.is_multi_gpu:
-            self._executor = ParallelGenerationExecutor(
-                world_size=self.config.world_size,
-                engine_dir=get_engine_dir(),
-                tokenizer=tokenizer,
-                max_beam_width=self.config.max_beam_width,
-                executor_policy=self.scheduling_policy,
-                executor_config=executor_config,
-            )
-        else:
-
-            self._executor = GenerationExecutor(
-                get_engine_dir(),
-                tokenizer=tokenizer,
-                max_beam_width=self.config.max_beam_width,
-                executor_config=executor_config,
-                executor_policy=self.scheduling_policy,
-            )
+        self._executor = GenerationExecutor.create(
+            get_engine_dir(),
+            tokenizer,
+            max_beam_width=self.config.max_beam_width,
+            executor_config=executor_config,
+            executor_policy=self.scheduling_policy,
+            model_world_size=self.config.world_size,
+            mpi_session=self.mpi_session)
 
     @print_traceback_on_error
     @staticmethod
     def _node_build_task(config: ModelConfig,
                          tokenizer: TokenizerBase = None) -> bool:
-        assert not NodeSession.is_initialized()
+        assert not MPINodeState.is_initialized()
 
         with ModelLoader(config, tokenizer=tokenizer) as model_loader:
             runtime_context = model_loader()
 
         # Hold the model builder for later use
-        NodeSession.state = runtime_context
+        MPINodeState.state = runtime_context
         return True
 
     @print_traceback_on_error
     @staticmethod
     def _node_save_task(engine_dir: str, model_dir: str):
-        runtime_context: _ModelRuntimeContext = NodeSession.state
+        runtime_context: _ModelRuntimeContext = MPINodeState.state
         assert isinstance(runtime_context,
                           _ModelRuntimeContext), "Model is not built yet."
 
@@ -535,7 +535,7 @@ class LLM:
     @print_traceback_on_error
     @staticmethod
     def _node_free_state_task():
-        NodeSession.state = None
+        MPINodeState.state = None
         # release the large resource explicitly and immediately, since the following LLM pipeline may need a lot of memory
         release_gc()
 
@@ -543,7 +543,7 @@ class LLM:
         raise RuntimeError("LLM object can not be pickled.")
 
     def __del__(self):
-        self.__exit__(None, None, None)
+        self.shutdown()
 
 
 class _ModelFormatKind(Enum):
@@ -811,6 +811,8 @@ class ModelLoader:
             mapping=self.mapping,
             quant_mode=self.config.quant_config.quant_mode,
             quantize_lm_head=self.config.quant_config.quantize_lm_head,
+            load_model_on_cpu=
+            True,  # TODO:TRTLLM-195 to enhance the weights loading memory usage and chose best location
         )
         self.pretrained_config = self.model.config
         self._model_info = _ModelInfo.from_pretrained_config(

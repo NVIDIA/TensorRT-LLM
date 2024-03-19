@@ -98,3 +98,16 @@ Runtime
 subprocess.run(['mkdir', '-p', CPP_GEN_DIR])
 gen_cpp_doc(CPP_GEN_DIR + '/runtime.rst', CPP_INCLUDE_DIR + '/runtime',
             runtime_summary)
+
+executor_summary = f"""
+Executor
+==========
+
+.. Here are files in the cpp/include/executor
+.. We manually add subsection to enable detailed description in the future
+.. It is also doable to automatically generate this file and list all the modules in the conf.py
+    """.strip()
+
+subprocess.run(['mkdir', '-p', CPP_GEN_DIR])
+gen_cpp_doc(CPP_GEN_DIR + '/executor.rst', CPP_INCLUDE_DIR + '/executor',
+            executor_summary)

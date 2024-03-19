@@ -44,8 +44,9 @@ FtDynamicDecode<T>::FtDynamicDecode(const size_t max_batch_size, const size_t ma
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     auto allocator = std::make_shared<tensorrt_llm::thop::TorchAllocator>(stream);
 
-    cudaDeviceProp prop;
-    tensorrt_llm::common::check_cuda_error(cudaGetDeviceProperties(&prop, 0));
+    int deviceId;
+    tensorrt_llm::common::check_cuda_error(cudaGetDevice(&deviceId)); // Get the correct device id
+    tensorrt_llm::common::check_cuda_error(cudaGetDeviceProperties(&prop_, deviceId));
 
     dynamic_decode_layer_ = std::make_shared<tensorrt_llm::layers::DynamicDecodeLayer<T>>(tr::DecodingMode::None(),
         max_batch_size, max_beam_width, vocab_size_, vocab_size_padded_, stream, std::move(allocator), &prop_);

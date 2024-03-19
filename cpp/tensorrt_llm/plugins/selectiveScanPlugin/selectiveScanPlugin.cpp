@@ -84,7 +84,7 @@ nvinfer1::DimsExprs SelectiveScanPlugin::getOutputDimensions(
 bool SelectiveScanPlugin::supportsFormatCombination(
     int pos, nvinfer1::PluginTensorDesc const* inOut, int nbInputs, int nbOutputs) noexcept
 {
-    if (pos == getHostRequestTypesIdx())
+    if (pos == getHostRequestTypesIdx() || pos == getLastTokenIdsIdx())
     {
         return inOut[pos].type == nvinfer1::DataType::kINT32;
     }
@@ -112,7 +112,7 @@ size_t SelectiveScanPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* i
 void SelectiveScanPlugin::setSSMParams(SSMParamsBase& params, const size_t batch, const size_t dim, const size_t seqLen,
     const size_t dstate, bool const isVariableB, bool const isVariableC, void* statePtr, void const* x,
     void const* delta, void const* deltaBias, void const* A, void const* B, void const* C, void const* D, void const* z,
-    void* out, bool deltaSoftplus)
+    int const* lastTokenIds, void* out, bool deltaSoftplus)
 {
     // Reset the parameters
     memset(&params, 0, sizeof(params));
@@ -138,6 +138,7 @@ void SelectiveScanPlugin::setSSMParams(SSMParamsBase& params, const size_t batch
     params.out_ptr = out;
     params.x_ptr = statePtr;
     params.z_ptr = const_cast<void*>(z);
+    params.last_token_ids_ptr = lastTokenIds;
 }
 
 template <typename T>
@@ -156,6 +157,7 @@ int SelectiveScanPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
     //     7.  D [dim]
     //     8.  z [batch_size, seq_len, dim]
     //     9.  host_request_types [batch_size] int32. 0: context; 1: generation.
+    //    10.  last_token_ids [batch_size] int32
     // outputs
     //     0. output_tensor [batch_size, seq_len, dim]
     //     1. state [batch_size, dstate, dim]
@@ -170,7 +172,8 @@ int SelectiveScanPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
 
     setSSMParams(ssm_params, batch_size, mDim, seq_len, mDState, mIsVariableB, mIsVariableC, outputs[1],
         inputs[getInputTensorIdx()], inputs[getDeltaIdx()], inputs[getDeltaBiasIdx()], inputs[getAIdx()],
-        inputs[getBIdx()], inputs[getCIdx()], inputs[getDIdx()], inputs[getZIdx()], outputs[0], mDeltaSoftplus);
+        inputs[getBIdx()], inputs[getCIdx()], inputs[getDIdx()], inputs[getZIdx()],
+        static_cast<int const*>(inputs[getLastTokenIdsIdx()]), outputs[0], mDeltaSoftplus);
 
     if (reqTypes[0] == RequestType::kCONTEXT)
     {

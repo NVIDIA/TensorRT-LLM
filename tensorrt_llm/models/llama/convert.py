@@ -5,6 +5,7 @@ import os
 import sys
 import time
 from collections import defaultdict
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -17,8 +18,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from transformers.pytorch_utils import Conv1D
 
-from tensorrt_llm._utils import pad_vocab_size
-
+from ..._utils import pad_vocab_size, release_gc
 from ...layers import MoeConfig
 from ...lora_manager import LoraConfig
 from ...mapping import Mapping
@@ -236,8 +236,10 @@ def smooth_llama_model(model, scales, alpha, llama_qkv_para, llama_smoother):
     # Smooth the activation and weights with smoother = $\diag{s}$
     for name, module in model.named_modules():
         if not isinstance(
-                module, LlamaDecoderLayer
-        ) and not module.__class__.__name__ == "InternLMDecoderLayer":
+                module,
+                LlamaDecoderLayer) and not module.__class__.__name__ in [
+                    "InternLMDecoderLayer", "MistralDecoderLayer"
+                ]:
             continue
         # qkv_proj
         layer_name_q = name + ".self_attn.q_proj"
@@ -497,7 +499,8 @@ def get_tllm_linear_sq_weight(vals,
         if is_qkv:
             hidden_dim = cur_weights.shape[0]
             cur_weights = cur_weights.reshape(hidden_dim, -1)
-        results[prefix + 'weight'] = torch.from_numpy(cur_weights).t().clone()
+        results[prefix + 'weight'] = torch.from_numpy(
+            cur_weights).t().clone().contiguous()
         if smoother_value is None:
             results[last_prefix] = torch.from_numpy(
                 np.array([1.0], dtype=np.float32))
@@ -524,7 +527,8 @@ def get_tllm_linear_sq_weight(vals,
         if is_qkv:
             hidden_dim = cur_weights.shape[0]
             cur_weights = cur_weights.reshape(hidden_dim, -1)
-        results[prefix + 'weight'] = torch.from_numpy(cur_weights).t().clone()
+        results[prefix + 'weight'] = torch.from_numpy(
+            cur_weights).t().clone().contiguous()
 
         cur_per_channel_value = vals["scale_y_accum_quant"]
 
@@ -578,13 +582,14 @@ def convert_hf_llama(hf_model,
     dtype = getattr(torch, dtype)
     num_attention_heads = hf_model.config.num_attention_heads
     hidden_size = hf_model.config.hidden_size
+    head_size = hidden_size // num_attention_heads
     intermediate_size = hf_model.config.intermediate_size
     num_key_value_heads = getattr(hf_model.config, 'num_key_value_heads',
                                   num_attention_heads)
     mha_mode = (num_key_value_heads == num_attention_heads)
     layers_range = mapping.pp_layers(hf_model.config.num_hidden_layers)
 
-    for l in layers_range:
+    def convert_layer(l):
         prefix = f'model.layers.{l}.'
         tllm_prex = f'transformer.layers.{l - layers_range[0]}.'
         q_weight = get_weight(model_params, prefix + 'self_attn.q_proj', dtype)
@@ -592,7 +597,6 @@ def convert_hf_llama(hf_model,
         v_weight = get_weight(model_params, prefix + 'self_attn.v_proj', dtype)
 
         if not mha_mode:
-            head_size = hidden_size // num_attention_heads
             if num_key_value_heads < tensor_parallel:
                 # duplicate the KV heads up to tensor_parallel
                 k_weight = dup_kv_weight(k_weight, num_key_value_heads,
@@ -630,11 +634,10 @@ def convert_hf_llama(hf_model,
             qkv_weight = qkv_para[prefix + 'self_attn.qkv_proj']
 
             if not mha_mode:
-                hidden_size = qkv_weight.shape[0]
-                local_dim = hidden_size
-                head_size = (qkv_weight.shape[-1] - local_dim) // 2
-                qkv_weight = qkv_weight.reshape(hidden_size,
-                                                local_dim + 2 * head_size)
+                local_dim = qkv_weight.shape[0]
+                kv_hidden_size = (qkv_weight.shape[-1] - local_dim) // 2
+                qkv_weight = qkv_weight.reshape(local_dim,
+                                                local_dim + 2 * kv_hidden_size)
             else:
                 qkv_weight = qkv_weight.reshape(hidden_size, 3, hidden_size)
 
@@ -650,8 +653,7 @@ def convert_hf_llama(hf_model,
                     tllm_prex + 'attention.qkv.', [
                         1, 3 * hidden_size // tensor_parallel
                         if mha_mode else hidden_size // tensor_parallel +
-                        (hidden_size // num_key_value_heads) //
-                        tensor_parallel * 2
+                        (head_size * num_key_value_heads) // tensor_parallel * 2
                     ],
                     tensor_parallel,
                     is_qkv=True,
@@ -791,11 +793,6 @@ def convert_hf_llama(hf_model,
                     moe_experts_gate_weights.to(torch.float32),
                     tllm_prex + 'mlp.router.', None, use_weight_only,
                     plugin_weight_only_quant_type, dtype, use_gemm_woq_plugin))
-            del w1, w2, w3, moe_experts_w2_weights, moe_experts_w3w1_weights
-
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
         else:
             mlp_gate_weight = get_weight(model_params, prefix + 'mlp.up_proj',
                                          dtype)
@@ -910,9 +907,9 @@ def convert_hf_llama(hf_model,
         for weight_name in cur_block_weights:
             model_params[weight_name] = None
 
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
+    for l in layers_range:
+        convert_layer(l)
+        release_gc()
 
     v = get_weight(model_params, 'model.embed_tokens', dtype)
     if lora_config.is_valid and lora_config.embedding_weight is not None:
@@ -1034,10 +1031,13 @@ def smooth_quant(model,
     return act_range, llama_qkv_para, llama_smoother
 
 
-def create_config_from_hugging_face(hf_model, dtype, mapping,
-                                    override_fields: dict, **kwargs):
+def create_config_from_hugging_face(hf_model,
+                                    dtype,
+                                    mapping,
+                                    quantization: 'QuantizationConfig' = None,
+                                    override_fields: dict = {},
+                                    **kwargs):
     config = {}
-    assert isinstance(hf_model, str)
     hf_config = AutoConfig.from_pretrained(hf_model, trust_remote_code=True)
     if hf_config.model_type == "llava":
         # LLaVA = Vision model + Llama LLM
@@ -1095,7 +1095,7 @@ def create_config_from_hugging_face(hf_model, dtype, mapping,
         'mapping': {
             'world_size': mapping.tp_size * mapping.pp_size,
             'tp_size': mapping.tp_size,
-            'pp_size': mapping.pp_size,
+            'pp_size': mapping.pp_size
         },
         'attn_bias': attn_bias,
     })
@@ -1121,7 +1121,7 @@ def create_config_from_hugging_face(hf_model, dtype, mapping,
             # the lora checkpoint might finetune the embedding
             if lora_config.vocab_size != 0:
                 config['vocab_size'] = lora_config.vocab_size
-
+    config['quantization'] = quantization.asdict()
     config.update(override_fields)
 
     moe_config = MoeConfig(config['moe_num_experts'], config['moe_top_k'],
@@ -1139,15 +1139,20 @@ def from_hugging_face(cls,
                       dtype,
                       *,
                       mapping,
+                      quantization: 'QuantizationConfig' = None,
                       load_by_shard=False,
                       load_model_on_cpu=False,
                       override_fields={},
                       hf_lora_dir=None,
                       lora_target_modules=None,
-                      max_lora_rank=None):
+                      max_lora_rank=None,
+                      skip_loading_weights=False,
+                      preloaded_model=None):
     ''' Create a LLaMAForCausalLM object from give parameters
     '''
     assert model_dir is not None
+    if isinstance(model_dir, Path):  # some code relies on this as string
+        model_dir = str(model_dir)
     kwargs = {
         'hf_lora_dir': hf_lora_dir,
         'lora_target_modules': lora_target_modules,
@@ -1164,11 +1169,18 @@ def from_hugging_face(cls,
     config = create_config_from_hugging_face(model_dir,
                                              dtype,
                                              mapping,
+                                             quantization,
                                              override_fields=override_fields,
                                              **kwargs)
-    model = None
-    # TODO: accept one model from outside of the world
-    if not load_by_shard:  # when load by shard, no need to create complete hf model
+
+    pretrained_config = PretrainedConfig.from_dict(config)
+    pretrained_config.set_rank(mapping.rank)  #TODO: remove this hack
+    llama = cls.from_config(pretrained_config)
+    if skip_loading_weights == True:
+        return llama
+
+    model = preloaded_model
+    if model is None and not load_by_shard:  # when load by shard, no need to create complete hf model
         hf_config = AutoConfig.from_pretrained(model_dir,
                                                trust_remote_code=True)
         if hf_config.model_type == "llava":
@@ -1182,10 +1194,11 @@ def from_hugging_face(cls,
                 torch_dtype='auto',
                 trust_remote_code=True,
             )
+
     if load_by_shard:
         lora_config = create_lora_config(hf_lora_dir)
-        weights = load_from_hf_checkpoint(model_dir, mapping,
-                                          PretrainedConfig.from_dict(config),
+
+        weights = load_from_hf_checkpoint(model_dir, mapping, pretrained_config,
                                           lora_config)
     else:
         weights = load_weights_from_hf(config=config,
@@ -1193,9 +1206,6 @@ def from_hugging_face(cls,
                                        model=model,
                                        hf_lora_dir=hf_lora_dir)
 
-    pretrained_config = PretrainedConfig.from_dict(config)
-    pretrained_config.set_rank(mapping.rank)  #TODO: remove this hack
-    llama = cls.from_config(pretrained_config)
     llama.load(weights)
     return llama
 
@@ -1204,11 +1214,11 @@ def quantize(dtype,
              model_dir,
              output_dir,
              mapping,
+             quantization: 'QuantizationConfig',
              *,
              override_fields,
              dataset_cache_dir: Optional[str] = None,
              smoothquant_val: Optional[float] = None,
-             int8_kv_cache=False,
              hf_lora_dir=None,
              lora_target_modules=None,
              max_lora_rank=None):
@@ -1224,6 +1234,7 @@ def quantize(dtype,
     config = create_config_from_hugging_face(model_dir,
                                              dtype,
                                              mapping,
+                                             quantization,
                                              override_fields=override_fields,
                                              **kwargs)
 
@@ -1235,12 +1246,16 @@ def quantize(dtype,
     # smoother for inputs of self_attn.o_proj and mlp.down_proj
     llama_smoother = {}
     model = None
-    assert smoothquant_val is not None or int8_kv_cache
-    assert model_dir is not None
-    quant_algo = config['quantization']['quant_algo']
-    use_smooth_quant = quant_algo is not None and quant_algo.startswith(
+    assert config['quantization']['quant_algo'] == quantization.quant_algo
+    int8_kv_cache = quantization.kv_cache_quant_algo == "INT8"
+    use_smooth_quant = quantization.quant_algo is not None and quantization.quant_algo.startswith(
         'W8A8_SQ')
 
+    assert use_smooth_quant or int8_kv_cache, "Call from_hugging_face when there is no quantization"
+    if use_smooth_quant:
+        assert smoothquant_val is not None, "A smooth value must be specified when using smooth quant"
+
+    assert model_dir is not None
     ## only load and call smooth quant routine once for all ranks
     hf_config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
     assert "llava" not in hf_config.model_type, "Smooth quant llava/vila is not supported yet"
@@ -1270,6 +1285,8 @@ def quantize(dtype,
         )
         safetensors.torch.save_file(
             weights, os.path.join(output_dir, f'rank{rank}.safetensors'))
+        del weights
+        release_gc()
 
 
 def load_weights_from_hf(*,
@@ -1307,11 +1324,12 @@ def load_weights_from_hf(*,
         vocab_size=config['vocab_size'],
         dtype=config['dtype'],
         use_weight_only=use_weight_only,
-        use_gemm_woq_plugin=not config['disable_weight_only_quant_plugin'],
+        use_gemm_woq_plugin=not config.get('disable_weight_only_quant_plugin',
+                                           False),
         plugin_weight_only_quant_type=plugin_weight_only_quant_type,
-        use_parallel_embedding=config['use_parallel_embedding'],
-        sharding_dim=config['embedding_sharding_dim'],
-        share_embedding_table=config['share_embedding_table'],
+        use_parallel_embedding=config.get('use_parallel_embedding', False),
+        sharding_dim=config.get('embedding_sharding_dim', 0),
+        share_embedding_table=config.get('share_embedding_table', False),
         use_smooth_quant=use_smooth_quant,
         per_channel=per_channel_sq,
         per_token=per_token_sq,

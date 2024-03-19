@@ -37,13 +37,12 @@ GptDecoder<T>::GptDecoder(DecodingMode const& mode, size_t maxBatchSize, size_t 
     size_t vocabSizePadded, size_t maxSequenceLength, CudaStreamPtr const& stream)
     : mManager{stream}
 {
-    cudaDeviceProp prop;
-    tc::check_cuda_error(cudaGetDeviceProperties(&prop, 0));
-
+    int deviceId;
+    tc::check_cuda_error(cudaGetDevice(&deviceId)); // Get the correct device id
+    tc::check_cuda_error(cudaGetDeviceProperties(&mProp, deviceId));
     auto allocator = std::make_shared<common::CudaAllocator>(mManager);
-
     mDynamicDecodeLayer = std::make_shared<tensorrt_llm::layers::DynamicDecodeLayer<T>>(
-        mode, maxBatchSize, maxBeamWidth, vocabSize, vocabSizePadded, stream->get(), std::move(allocator), &prop);
+        mode, maxBatchSize, maxBeamWidth, vocabSize, vocabSizePadded, stream->get(), std::move(allocator), &mProp);
 
     auto constexpr nvFloatType = TRTDataType<float>::value;
     mLogProbsTiled = mManager.gpu(ITensor::makeShape({static_cast<SizeType>(maxSequenceLength),
@@ -73,7 +72,7 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
     if (samplingConfig.topK)
     {
         auto const& topK = samplingConfig.topK.value();
-        setupParams.runtime_top_k = std::vector<uint32_t>(std::begin(topK), std::end(topK));
+        setupParams.runtime_top_k = std::vector<SizeType>(std::begin(topK), std::end(topK));
     }
 
     setupParams.runtime_top_p = samplingConfig.topP;

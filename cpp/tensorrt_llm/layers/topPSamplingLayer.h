@@ -38,11 +38,13 @@ public:
     using SetupParams = typename Base::SetupParams;
     using ForwardParams = typename Base::ForwardParams;
 
-    TopPSamplingLayer(std::size_t maxBatchSize, std::size_t vocabSize, std::size_t vocabSizePadded, cudaStream_t stream,
-        std::shared_ptr<tensorrt_llm::common::IAllocator> allocator, cudaDeviceProp* prop, bool isDeterministic = true);
+    TopPSamplingLayer(runtime::SizeType maxBatchSize, runtime::SizeType vocabSize, runtime::SizeType vocabSizePadded,
+        cudaStream_t stream, std::shared_ptr<tensorrt_llm::common::IAllocator> allocator, cudaDeviceProp* prop,
+        bool isDeterministic = true, bool isAirTopP = true);
     ~TopPSamplingLayer();
 
-    void setup(std::size_t batchSize, int32_t const* batchSlots, SetupParams const& setupParams) override;
+    void setup(
+        runtime::SizeType batchSize, runtime::SizeType const* batchSlots, SetupParams const& setupParams) override;
     void forward(DecodingOutputParams& outputs, ForwardParams& inputs) override;
 
     bool const* getSkipDecodeHost() const
@@ -51,22 +53,23 @@ public:
     }
 
 protected:
-    uint32_t* mRuntimeTopKDevice = nullptr;
+    runtime::SizeType* mRuntimeTopKDevice = nullptr;
     float* mRuntimeTopPDevice = nullptr;
     float mRuntimeMaxTopP{0.f};
     float* mInitialTopPDevice = nullptr;
     float* mTopPDecayDevice = nullptr;
     float* mTopPMinDevice = nullptr;
-    int32_t* mTopPResetIdsDevice = nullptr;
+    runtime::TokenIdType* mTopPResetIdsDevice = nullptr;
     void* mSetupWorkspaceDevice = nullptr;
 
-    int32_t* mTopPIdValsDevice = nullptr;
-    int32_t* mTopPOffsetDevice = nullptr;
-    int32_t* mBeginTopPOffsetDevice = nullptr;
+    runtime::TokenIdType* mTopPIdValsDevice = nullptr;
+    runtime::SizeType* mTopPOffsetDevice = nullptr;
+    runtime::SizeType* mBeginTopPOffsetDevice = nullptr;
     bool* mSkipDecodeDevice = nullptr;
     bool* mSkipDecodeHost = nullptr;
     bool mIsDeterministic = true;
-    int mAirTopPBlockNum;
+    runtime::SizeType mAirTopPBlockNum;
+    bool mIsAirTopP = false;
 
     using Base::mMaxBatchSize;
     using Base::mVocabSize;
@@ -80,7 +83,7 @@ protected:
     using Base::mCudaDeviceProp;
 
 private:
-    void allocateBuffer(std::size_t batchSize);
+    void allocateBuffer(runtime::SizeType batchSize);
     void freeBuffer();
 };
 

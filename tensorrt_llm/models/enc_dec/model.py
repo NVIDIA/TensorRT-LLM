@@ -32,6 +32,7 @@ from tensorrt_llm.layers import (MLP, Attention, AttentionMaskType,
                                  LoraParams, PromptTuningEmbedding, RmsNorm)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.generation_mixin import GenerationMixin
+from tensorrt_llm.models.modeling_utils import optimize_model
 from tensorrt_llm.module import Module, ModuleList
 from tensorrt_llm.parameter import Parameter
 from tensorrt_llm.plugin.plugin import current_all_reduce_helper
@@ -175,8 +176,7 @@ class EncoderLayer(Module):
                  relative_attention=False,
                  max_distance=0,
                  num_buckets=0,
-                 fp16_clamping=False,
-                 max_lora_rank=None):
+                 fp16_clamping=False):
         super().__init__()
 
         # e.g. BART regular, T5 RMS
@@ -201,8 +201,7 @@ class EncoderLayer(Module):
             dtype=dtype,
             relative_attention=relative_attention,
             max_distance=max_distance,
-            num_buckets=num_buckets,
-            max_lora_rank=max_lora_rank)
+            num_buckets=num_buckets)
 
         self.attention_layernorm = ln_type(normalized_shape=hidden_size,
                                            eps=layernorm_eps,
@@ -219,7 +218,6 @@ class EncoderLayer(Module):
             tp_group=mapping.tp_group,
             tp_size=mapping.tp_size,
             dtype=dtype,
-            max_lora_rank=max_lora_rank,
         )
 
         self.mlp_layernorm = ln_type(normalized_shape=hidden_size,
@@ -313,7 +311,6 @@ class DecoderLayer(Module):
                  max_distance=0,
                  num_buckets=0,
                  fp16_clamping=False,
-                 max_lora_rank=None,
                  skip_cross_qkv=False):
         super().__init__()
 
@@ -344,9 +341,7 @@ class DecoderLayer(Module):
             max_distance=max_distance,
             num_buckets=num_buckets,
             position_embedding_type=PositionEmbeddingType.relative
-            if relative_attention else PositionEmbeddingType.learned_absolute,
-            max_lora_rank=max_lora_rank,
-            skip_cross_qkv=skip_cross_qkv)
+            if relative_attention else PositionEmbeddingType.learned_absolute)
 
         self.self_attention_layernorm = ln_type(normalized_shape=hidden_size,
                                                 eps=layernorm_eps,
@@ -379,7 +374,7 @@ class DecoderLayer(Module):
             max_distance=max_distance,
             num_buckets=num_buckets,
             position_embedding_type=PositionEmbeddingType.learned_absolute,
-            max_lora_rank=max_lora_rank)
+            skip_cross_qkv=skip_cross_qkv)
 
         self.cross_attention_layernorm = ln_type(normalized_shape=hidden_size,
                                                  eps=layernorm_eps,
@@ -396,7 +391,6 @@ class DecoderLayer(Module):
             tp_group=mapping.tp_group,
             tp_size=mapping.tp_size,
             dtype=dtype,
-            max_lora_rank=max_lora_rank,
         )
 
         self.mlp_layernorm = ln_type(normalized_shape=hidden_size,
@@ -615,8 +609,7 @@ class EncoderModel(Module, GenerationMixin):
                          relative_attention=relative_attention,
                          max_distance=max_distance,
                          num_buckets=num_buckets,
-                         fp16_clamping=fp16_clamping,
-                         max_lora_rank=max_lora_rank)
+                         fp16_clamping=fp16_clamping)
             for _ in self.mapping.pp_layers(self.total_num_layers)
         ])
 
@@ -625,6 +618,9 @@ class EncoderModel(Module, GenerationMixin):
                 self.final_layernorm = ln_type(normalized_shape=hidden_size,
                                                eps=layernorm_eps,
                                                dtype=dtype)
+
+        if max_lora_rank is not None:
+            optimize_model(self, use_lora=True, max_lora_rank=max_lora_rank)
 
     def forward(self,
                 input_ids: Tensor,
@@ -777,8 +773,7 @@ class EncoderModel(Module, GenerationMixin):
                 )
 
         if use_custom_all_reduce and self.mapping.tp_size > 1:
-            current_all_reduce_helper().set_workspace_tensor(
-                self.mapping, False)
+            current_all_reduce_helper().set_workspace_tensor(self.mapping, 1)
 
         input_lengths = Tensor(
             name="input_lengths",
@@ -1044,7 +1039,6 @@ class DecoderModel(Module, GenerationMixin):
                 max_distance=max_distance,
                 num_buckets=num_buckets,
                 fp16_clamping=fp16_clamping,
-                max_lora_rank=max_lora_rank,
                 skip_cross_qkv=skip_cross_qkv,
             ) for layer_idx in layers_range
         ])
@@ -1064,6 +1058,9 @@ class DecoderModel(Module, GenerationMixin):
                 tp_size=mapping.tp_size,
                 gather_output=True,
             )
+
+        if max_lora_rank is not None:
+            optimize_model(self, use_lora=True, max_lora_rank=max_lora_rank)
 
     def forward(self,
                 decoder_input_ids: Tensor,
@@ -1441,8 +1438,7 @@ class DecoderModel(Module, GenerationMixin):
         )
 
         if use_custom_all_reduce and self.mapping.tp_size > 1:
-            current_all_reduce_helper().set_workspace_tensor(
-                self.mapping, False)
+            current_all_reduce_helper().set_workspace_tensor(self.mapping, 1)
 
         layers_range = self.mapping.pp_layers(self.total_num_layers)
         num_pp_layers = len(layers_range)
@@ -1607,7 +1603,9 @@ class DecoderModel(Module, GenerationMixin):
                                         ('boolean', [1]),
                                     ]))
         cross_qkv_reuse = None
-        cross_qkv_out_dim = self.num_heads * self.head_size + 2 * self.num_kv_heads * self.head_size
+        num_heads = (self.num_heads + self.mapping.tp_size -
+                     1) // self.mapping.tp_size
+        cross_qkv_out_dim = num_heads * self.head_size + 2 * num_kv_heads * self.head_size
         if self.skip_cross_qkv:
             if remove_input_padding:
                 cross_qkv_reuse = Tensor(

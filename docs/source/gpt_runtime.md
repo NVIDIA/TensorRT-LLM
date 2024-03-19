@@ -345,17 +345,17 @@ value for a given parameter, the vector can be limited to a single element
 ***General***
 
  * `temperature`, a vector of floating-point numbers to control the
-   modulation of logits when sampling new tokens. The default value is `1.0f`,
+   modulation of logits when sampling new tokens. It can have any value  `> 0.0f`. The default value is `1.0f`(no modulation).
  * `minLength`, a vector of integers to set a lower-bound on the number of tokens
-   generated. The default value is 0,
+   generated. It can have any value. Values  `< 1` have no effect, the first generated token can be EOS. The default value is `1` (at least one non-EOS token is generated).
  * `repetitionPenalty`, a vector of float-point numbers to penalize tokens
-   based on how often they appear in the sequence. The default value is `0.f`,
+   based on how often they appear in the sequence. It can have any value `> 0.0f`. Repetition penalty `< 1.0f` encourages repetition, `> 1.0f` discourages it. The default value is `1.0f` (no effect).
  * `presencePenalty`, a vector of float-point numbers to penalize tokens
    already present in the sequence (irrespective of the number of appearances).
-   The default value is `0.f`,
+   It can have any value, values `< 0.0f` encourage repetition, `> 0.f` discourage it. The default value is `0.0f` (no effect).
  * `frequencyPenalty`, a vector of float-point numbers to penalize tokens
-   already present in the sequence (dependent on the number of appearances).
-   The default value is `0.f`,
+   already present in the sequence (dependent on the number of appearances). It can have any value, values `< 0.0f` encourage repetition, `> 0.0f` discourage it.
+   The default value is `0.0f`(no effect).
 
 The parameters `repetitionPenalty`, `presencePenalty`, and `frequencyPenalty` are not mutually
 exclusive.

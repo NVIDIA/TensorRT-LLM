@@ -52,6 +52,8 @@ endfunction()
 
 add_gtest(loraManagerTest runtime/loraManagerTest.cpp)
 add_gtest(loraUtilsTest runtime/loraUtilsTest.cpp)
+add_gtest(loraCacheTest runtime/loraCacheTest.cpp)
+add_gtest(workerPoolTest runtime/workerPoolTest.cpp)
 add_gtest(attentionKernelTest runtime/transposeKVKernelTest.cpp)
 add_gtest(gptDecoderTest runtime/gptDecoderTest.cpp)
 add_gtest(gptDecoderBatchTest runtime/gptDecoderBatchTest.cpp)
@@ -96,6 +98,7 @@ set(SAMPLING_LAYER_TEST_SRC
     layers/topKSamplingLayerTest.cpp layers/topPSamplingLayerTest.cpp)
 add_gtest(samplingLayerTest "${SAMPLING_LAYER_TEST_SRC}")
 add_gtest(dynamicDecodeLayerTest layers/dynamicDecodeLayerTest.cpp)
+add_gtest(medusaDecodeLayerTest layers/medusaDecodeLayerTest.cpp)
 
 if(BUILD_BATCH_MANAGER)
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/batch_manager)

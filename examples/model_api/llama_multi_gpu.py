@@ -1,12 +1,13 @@
 import argparse
 import os
+from pathlib import Path
 
 import torch
 from mpi4py.futures import MPIPoolExecutor
 
 import tensorrt_llm
 from tensorrt_llm import Mapping, mpi_barrier
-from tensorrt_llm.executor import GenerationExecutor
+from tensorrt_llm.executor import GenerationExecutorWorker
 from tensorrt_llm.models import LLaMAForCausalLM
 
 
@@ -36,10 +37,12 @@ def build_and_run_llama(hf_model_dir, engine_dir, tp_size, rank, clean_build):
     mpi_barrier()  # make sure every rank engine build finished
 
     generate_len = 20  # change on your needs, hard code for simplicity here
-    executor = GenerationExecutor(engine_dir, tokenizer_dir)
+    executor = GenerationExecutorWorker(Path(engine_dir), tokenizer_dir)
 
-    output_streams = executor.generate_async(dataset(), True,
-                                             [generate_len] * len(dataset()))
+    output_streams = executor.generate_async(dataset(),
+                                             True,
+                                             max_new_tokens=[generate_len] *
+                                             len(dataset()))
     if rank == 0:
         for stream in output_streams:
             for state in stream:

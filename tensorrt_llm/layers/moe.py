@@ -196,8 +196,7 @@ class MixtureOfExperts(Module):
                  tp_group: List[int] = None,
                  tp_size: int = 1,
                  tp_rank: int = 0,
-                 quant_mode=QuantMode(0),
-                 max_lora_rank=None):
+                 quant_mode=QuantMode(0)):
         super().__init__()
 
         self.moe_config = moe_config
@@ -309,7 +308,7 @@ class MixtureOfExperts(Module):
         self.experts = [
             ClsMLP(self.hidden_size, ffn_hidden_size,
                    non_gated_version(self.hidden_act), bias, dtype, tp_group,
-                   tp_size, quant_mode, 0) for _ in range(self.experts_per_node)
+                   tp_size, quant_mode) for _ in range(self.experts_per_node)
         ]
 
     def set_ootb_weight(self):

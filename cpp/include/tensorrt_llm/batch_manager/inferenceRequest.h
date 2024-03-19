@@ -59,6 +59,7 @@ auto constexpr kReturnContextLogitsTensorName = "return_context_logits";
 auto constexpr kReturnGenerationLogitsTensorName = "return_generation_logits";
 auto constexpr kPromptEmbeddingTableName = "prompt_embedding_table";
 auto constexpr kPromptVocabSizeName = "prompt_vocab_size";
+auto constexpr kLoraTaskId = "lora_task_id";
 // weights for a lora adapter shape [ num_lora_modules_layers, D x Hi + Ho x D ]
 // where the last dimension holds the in / out adapter weights for the associated module (e.g. attn_qkv) and model layer
 // each of the in / out tensors are first flattened and then concatenated together in the format above.
@@ -191,6 +192,7 @@ public:
         inference_request::kPromptVocabSizeName,
         // obsolete names for backward compatibility
         inference_request::kInputLengthsTensorName,
+        inference_request::kLoraTaskId,
         inference_request::kLoraWeights,
         inference_request::kLoraConfig,
     };
@@ -255,6 +257,7 @@ public:
     TENSOR_GETTER_SETTER(ReturnGenerationLogits, inference_request::kReturnGenerationLogitsTensorName)
     TENSOR_GETTER_SETTER(PromptEmbeddingTable, inference_request::kPromptEmbeddingTableName)
     TENSOR_GETTER_SETTER(PromptVocabSize, inference_request::kPromptVocabSizeName)
+    TENSOR_GETTER_SETTER(LoraTaskId, inference_request::kLoraTaskId)
     TENSOR_GETTER_SETTER(LoraWeights, inference_request::kLoraWeights)
     TENSOR_GETTER_SETTER(LoraConfig, inference_request::kLoraConfig)
 

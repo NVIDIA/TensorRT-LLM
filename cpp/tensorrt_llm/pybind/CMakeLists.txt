@@ -30,6 +30,8 @@ set(SRCS
     batch_manager/llmRequest.cpp
     batch_manager/inferenceRequest.cpp
     batch_manager/namedTensor.cpp
+    executor/bindings.cpp
+    executor/executor.cpp
     runtime/generationInput.cpp
     runtime/generationOutput.cpp)
 

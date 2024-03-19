@@ -59,7 +59,7 @@ protected:
             params.useLogitsPtrs ? nullptr : bufferCast<T>(*this->mProbsDevice),
             params.useLogitsPtrs ? reinterpret_cast<T const* const*>(bufferCast<int64_t>(*this->mProbsPtrsDevice))
                                  : nullptr,
-            bufferCast<int*>(*this->mIdsPtrHost), bufferCast<int32_t>(*this->mSeqLengthsDevice),
+            bufferCast<int32_t*>(*this->mIdsPtrHost), nullptr, bufferCast<int32_t>(*this->mSeqLengthsDevice),
             reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
                 bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(*this->mFinishedDevice)),
             reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
@@ -69,7 +69,7 @@ protected:
             bufferCast<int32_t>(*this->mTopKsDevice), params.topP, bufferCast<float>(*this->mTopPsDevice),
             params.vocabSize, bufferCast<int32_t>(*this->mEndIdsDevice), bufferCast<int32_t>(*this->mBatchSlots),
             this->mStream->get(), params.batchSize, maxBatchSize, bufferCast<int32_t>(*this->mTokensPerStep),
-            params.maxTokensPerStep, bufferCast<bool>(*this->mSkipDecodeDevice), params.normalizeLogProbs,
+            params.maxTokensPerStep, 0, bufferCast<bool>(*this->mSkipDecodeDevice), params.normalizeLogProbs,
             params.logitsHasProbs, params.returnAllTopK);
     }
 };

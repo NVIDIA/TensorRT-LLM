@@ -1,6 +1,6 @@
 -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
 --extra-index-url https://pypi.nvidia.com
-tensorrt_llm==0.9.0.dev2024031200
+tensorrt_llm==0.9.0.dev2024031900
 flax~=0.8.0
 jax[cuda12_pip]~=0.4.19; platform_system != "Windows"
 jax~=0.4.19; platform_system == "Windows"

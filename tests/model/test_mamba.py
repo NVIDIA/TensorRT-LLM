@@ -146,6 +146,7 @@ class TestMamba(unittest.TestCase):
         load_mode = 'from_model'
         hf_path = ''
         hf_config = MambaConfig(d_model=128, n_layer=2, vocab_size=128)
+        pad_id = 0
 
         # get hf mamba
         hf_mamba = MambaLMHeadModel(hf_config,
@@ -161,16 +162,10 @@ class TestMamba(unittest.TestCase):
         mamba_d_inner = hf_mamba.backbone.layers[0].mixer.d_inner
         mamba_d_conv = hf_mamba.backbone.layers[0].mixer.d_conv
         mamba_d_state = hf_mamba.backbone.layers[0].mixer.d_state
-        ctx_conv_state_shape = (
+        conv_state_shape = (
             batch_size,
             mamba_d_inner,
-            mamba_d_conv - 1 + input_len,
-        )
-
-        gen_conv_state_shape = (
-            batch_size,
-            mamba_d_inner,
-            mamba_d_conv,
+            mamba_d_conv - 1,
         )
 
         ssm_state_shape = (
@@ -183,40 +178,66 @@ class TestMamba(unittest.TestCase):
         present_ssm_states = []
         for _ in range(hf_config.n_layer):
             present_conv_states.append(
-                torch.zeros(ctx_conv_state_shape,
+                torch.zeros(conv_state_shape,
                             dtype=str_dtype_to_torch(dtype),
                             device='cuda'))
             present_conv_states_1.append(
-                torch.empty(gen_conv_state_shape,
+                torch.empty(conv_state_shape,
                             dtype=str_dtype_to_torch(dtype),
                             device='cuda'))
             present_ssm_states.append(
-                torch.empty(ssm_state_shape, dtype=torch.float32,
+                torch.empty(ssm_state_shape,
+                            dtype=str_dtype_to_torch(dtype),
                             device='cuda'))
 
         # compare context
-        ctx_ids = torch.randint(100, (batch_size, input_len)).int().cuda()
-        ctx_last_token_ids = input_len * torch.ones(
-            (batch_size), dtype=torch.int32, device='cuda')
+        ctx_len = torch.randint(1,
+                                input_len + 1,
+                                size=(batch_size, ),
+                                dtype=torch.int32,
+                                device='cuda')
+        ctx_len[0] = input_len
+        ctx_ids = [
+            torch.randint(100,
+                          size=(ctx_len[i], ),
+                          dtype=torch.int32,
+                          device='cuda') for i in range(batch_size)
+        ]
+        paddings = [
+            torch.ones(input_len - l, dtype=torch.int32, device='cuda') * pad_id
+            for l in ctx_len
+        ]
+        ctx_ids = [torch.cat([x, pad]) for x, pad in zip(ctx_ids, paddings)]
+        ctx_ids = torch.stack(ctx_ids)
+        ctx_last_token_ids = ctx_len.detach().clone()
+        ctx_conv_token_ids = torch.zeros((batch_size, ),
+                                         dtype=torch.int32,
+                                         device='cuda')
+
         ctx_host_request_types = torch.tensor([0] * batch_size,
                                               dtype=torch.int32)
-        infer_params = InferenceParams(max_seqlen=input_len + output_len,
-                                       max_batch_size=batch_size)
+        infer_params = [
+            InferenceParams(max_seqlen=input_len + output_len, max_batch_size=1)
+            for i in range(batch_size)
+        ]
 
         with torch.no_grad():
-            hf_outputs = hf_mamba.forward(ctx_ids,
-                                          inference_params=infer_params)
-            infer_params.seqlen_offset += ctx_ids.shape[1]
+            hf_outputs = []
+            for i in range(batch_size):
+                hf_output = hf_mamba.forward(ctx_ids[i:i + 1, 0:ctx_len[i]],
+                                             inference_params=infer_params[i])
+                hf_outputs.append(hf_output.logits[:, -1, :])
+                infer_params[i].seqlen_offset += ctx_len[i]
         torch.cuda.synchronize()
-        ref = hf_outputs.logits[:, -1, :]
+        ref = torch.concat(hf_outputs, dim=0)
 
         ctx_buffer = {
             'input_ids': ctx_ids,
             'last_token_ids': ctx_last_token_ids,
             'host_request_types': ctx_host_request_types,
+            'conv_token_ids': ctx_conv_token_ids,
         }
         for idx in range(hf_config.n_layer):
-            conv_state_shape = (batch_size, mamba_d_inner, mamba_d_conv - 1)
             conv_state = torch.zeros(conv_state_shape,
                                      dtype=str_dtype_to_torch(dtype),
                                      device='cuda')
@@ -239,21 +260,27 @@ class TestMamba(unittest.TestCase):
 
         # compare generation
         step1_id = torch.randint(100, (batch_size, 1)).int().cuda()
-        gen_last_token_ids = torch.zeros((batch_size),
-                                         dtype=torch.int32,
-                                         device='cuda')
+        gen_last_token_ids = torch.ones((batch_size),
+                                        dtype=torch.int32,
+                                        device='cuda')
+        gen_conv_token_ids = ctx_last_token_ids.detach().clone()
         gen_host_request_types = torch.tensor([1] * batch_size,
                                               dtype=torch.int32)
         with torch.no_grad():
-            hf_outputs = hf_mamba.forward(step1_id,
-                                          inference_params=infer_params)
-            infer_params.seqlen_offset += step1_id.shape[1]
+            hf_outputs = []
+            for i in range(batch_size):
+                hf_output = hf_mamba.forward(step1_id[i:i + 1, ],
+                                             inference_params=infer_params[i])
+                hf_outputs.append(hf_output.logits[:, -1, :])
+                infer_params[i].seqlen_offset += step1_id.shape[1]
         torch.cuda.synchronize()
-        ref = hf_outputs.logits[:, -1, :]
+        ref = torch.concat(hf_outputs, dim=0)
+
         step1_buffer = {
             'input_ids': step1_id,
             'last_token_ids': gen_last_token_ids,
             'host_request_types': gen_host_request_types,
+            'conv_token_ids': gen_conv_token_ids,
         }
         for idx in range(hf_config.n_layer):
             step1_buffer[f'past_conv_state_{idx}'] = present_conv_states[idx]

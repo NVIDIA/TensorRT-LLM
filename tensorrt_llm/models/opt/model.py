@@ -16,7 +16,7 @@
 from ..._utils import pad_vocab_size
 from ...functional import Tensor
 from ...layers import (MLP, Attention, AttentionMaskType, ColumnLinear,
-                       Embedding, LayerNorm, PromptTuningEmbedding)
+                       Embedding, LayerNorm)
 from ...module import Module
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
                               PretrainedConfig)
@@ -109,11 +109,9 @@ class OPTModel(Module):
     def __init__(self, config: PretrainedConfig):
         super().__init__()
         self.do_layer_norm_before = config.do_layer_norm_before
-        self.use_prompt_tuning = config.use_prompt_tuning
         mapping = config.mapping
 
-        EmbeddingCls = PromptTuningEmbedding if config.use_prompt_tuning else Embedding
-        self.vocab_embedding = EmbeddingCls(
+        self.vocab_embedding = Embedding(
             config.vocab_size,
             config.hidden_size,
             dtype=config.dtype,
@@ -144,7 +142,7 @@ class OPTModel(Module):
                 prompt_vocab_size=None):
 
         args = [prompt_embedding_table, prompt_tasks, prompt_vocab_size
-                ] if self.use_prompt_tuning else []
+                ] if prompt_embedding_table is not None else []
         hidden_states = self.vocab_embedding(input_ids, *args)
         hidden_states = hidden_states + self.position_embedding(position_ids)
 

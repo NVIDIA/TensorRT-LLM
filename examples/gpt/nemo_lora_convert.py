@@ -22,11 +22,10 @@ from pathlib import Path
 import numpy as np
 import torch
 import yaml
-from utils.convert import cpu_map_location
-from utils.nemo import unpack_nemo_ckpt
+from convert_checkpoint import cpu_map_location, unpack_nemo_ckpt
 
 from tensorrt_llm._utils import str_dtype_to_torch, to_json_file, torch_to_numpy
-from tensorrt_llm.lora_manager import LoraConfig, get_all_nemo_lora_weights
+from tensorrt_llm.lora_manager import LoraManager, get_all_nemo_lora_weights
 
 log_format = "%(asctime)s %(name)s [%(levelname)s] %(message)s"
 logging.basicConfig(format=log_format)
@@ -121,7 +120,7 @@ def lora_convert_cpp_runtime(out_dir,
         weights.append(in_out_weights)
         weight_config.append(
             np.array([
-                LoraConfig.LORA_MODULE_IDS["attn_qkv"], layer_idx, adapter_size
+                LoraManager.LORA_MODULE_IDS["attn_qkv"], layer_idx, adapter_size
             ],
                      dtype=np.int32))
     all_weights = np.expand_dims(np.stack(weights), 0)

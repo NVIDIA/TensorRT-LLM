@@ -26,6 +26,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
+#include "tensorrt_llm/runtime/common.h"
 
 namespace tensorrt_llm
 {
@@ -39,7 +40,7 @@ struct FillBuffers
 
     template <typename T>
     void operator()(std::optional<std::vector<T>> const& optParam, T const defaultValue, std::vector<T>& hostBuffer,
-        T* deviceBuffer, int32_t const* batchSlots) const
+        T* deviceBuffer, runtime::SizeType const* batchSlots) const
     {
         using tensorrt_llm::common::cudaAutoCpy;
 
@@ -71,8 +72,8 @@ struct FillBuffers
         }
     }
 
-    size_t batchSize;
-    size_t maxBatchSize;
+    runtime::SizeType batchSize;
+    runtime::SizeType maxBatchSize;
     cudaStream_t stream;
 };
 

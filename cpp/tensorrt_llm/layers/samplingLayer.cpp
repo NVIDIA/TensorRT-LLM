@@ -32,9 +32,36 @@ namespace tensorrt_llm
 namespace layers
 {
 template <typename T>
-void SamplingLayer<T>::allocateBuffer(size_t batchSize)
+SamplingLayer<T>::SamplingLayer(DecodingMode const& mode, SizeType maxBatchSize, SizeType vocabSize,
+    SizeType vocabSizePadded, cudaStream_t stream, std::shared_ptr<IAllocator> allocator, cudaDeviceProp* prop)
+    : BaseSamplingLayer<T>(maxBatchSize, vocabSize, vocabSizePadded, stream, std::move(allocator), nullptr)
+    , mDecodingMode(mode)
 {
-    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    TLLM_CHECK_WITH_INFO(!mDecodingMode.isBeamSearch(), "SamplingLayer does not support Beam search mode");
+    TLLM_CHECK_WITH_INFO(mDecodingMode.isTopKorTopP(), "SamplingLayer requires TopK nor TopP mode");
+    if (mDecodingMode.isTopK())
+    {
+        mTopKDecode
+            = std::make_unique<TopKSamplingLayer<T>>(maxBatchSize, vocabSize, vocabSizePadded, mStream, mAllocator);
+    }
+
+    if (mDecodingMode.isTopP())
+    {
+        mTopPDecode = std::make_unique<TopPSamplingLayer<T>>(
+            maxBatchSize, vocabSize, vocabSizePadded, mStream, mAllocator, prop, /* deterministic */ true);
+    }
+
+    allocateBuffer(maxBatchSize);
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+template <typename T>
+void SamplingLayer<T>::allocateBuffer(SizeType batchSize)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     mSamplingWorkspaceSize = 0;
     if (mDecodingMode.isTopK())
@@ -73,46 +100,28 @@ void SamplingLayer<T>::allocateBuffer(size_t batchSize)
     // host buffers.
     mSkipDecodeHost = (bool*) std::realloc(mSkipDecodeHost, sizeof(bool) * batchSize);
     TLLM_CHECK(mSkipDecodeHost != nullptr);
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
 void SamplingLayer<T>::freeBuffer()
 {
-    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
     mAllocator->free((void**) (&mCurandStatesDevice));
     mAllocator->free((void**) (&mRandomSeedsDevice));
     mAllocator->free((void**) (&mSkipDecodeDevice));
     mAllocator->free((void**) (&mSamplingWorkspaceDevice));
     std::free(mSkipDecodeHost);
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
-SamplingLayer<T>::SamplingLayer(DecodingMode const& mode, size_t maxBatchSize, size_t vocabSize, size_t vocabSizePadded,
-    cudaStream_t stream, std::shared_ptr<IAllocator> allocator, cudaDeviceProp* prop)
-    : BaseSamplingLayer<T>(maxBatchSize, vocabSize, vocabSizePadded, stream, std::move(allocator), nullptr)
-    , mDecodingMode(mode)
+void SamplingLayer<T>::setup(SizeType batchSize, SizeType const* batchSlots, SetupParams const& setupParams)
 {
-    TLLM_CHECK_WITH_INFO(!mDecodingMode.isBeamSearch(), "Beam search mode has been requested from Sampling Layer");
-    TLLM_CHECK_WITH_INFO(mDecodingMode.isTopKorTopP(), "Requested mode is neither TopK nor TopP");
-    if (mDecodingMode.isTopK())
-    {
-        mTopKDecode
-            = std::make_unique<TopKSamplingLayer<T>>(maxBatchSize, vocabSize, vocabSizePadded, mStream, mAllocator);
-    }
-
-    if (mDecodingMode.isTopP())
-    {
-        mTopPDecode = std::make_unique<TopPSamplingLayer<T>>(
-            maxBatchSize, vocabSize, vocabSizePadded, mStream, mAllocator, prop, /* deterministic */ true);
-    }
-
-    allocateBuffer(maxBatchSize);
-}
-
-template <typename T>
-void SamplingLayer<T>::setup(const size_t batchSize, int32_t const* batchSlots, SetupParams const& setupParams)
-{
-    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     // If runtime argument has single random seed, using this random seed to
     // initialize the random table of all sentences. If the argument has
@@ -149,6 +158,8 @@ void SamplingLayer<T>::setup(const size_t batchSize, int32_t const* batchSlots, 
     {
         mTopPDecode->setup(batchSize, batchSlots, setupParams);
     }
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>

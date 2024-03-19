@@ -16,539 +16,135 @@
 
 #pragma once
 #include "tensorrt_llm/kernels/weightOnlyBatchedGemv/common.h"
+#include "tensorrt_llm/kernels/weightOnlyBatchedGemv/converter.h"
+#include "tensorrt_llm/kernels/weightOnlyBatchedGemv/details.h"
 #include "tensorrt_llm/kernels/weightOnlyBatchedGemv/utility.h"
 
 namespace tensorrt_llm
 {
 namespace kernels
 {
-template <typename ActType>
-struct ActTypeDetails;
-
-template <>
-struct ActTypeDetails<half>
+namespace weight_only
 {
-    using CutlassType = cutlass::half_t;
-    using Vec2 = half2;
-
-    __device__ __forceinline__ static Vec2 to_vec2(half v)
-    {
-        return __half2half2(v);
-    }
-};
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && defined(ENABLE_BF16))
-template <>
-struct ActTypeDetails<__nv_bfloat16>
+template <typename Details, int CtaM, int CtaN, int Threads, int GroupSize, bool EnableActScale, bool EnableZero,
+    bool EnableBias, bool ApplyAlphaInAdvance, typename TypeA = typename Details::TypeDetailsA::Type>
+__global__ void kernel(TypeA* act, TypeA* act_scale, uint8_t* weight, TypeA* scales, TypeA* zeros, TypeA* bias,
+    TypeA* out, float alpha, int m, int n, int k)
 {
-    using CutlassType = cutlass::bfloat16_t;
-    using Vec2 = __nv_bfloat162;
-
-    __device__ __forceinline__ static Vec2 to_vec2(__nv_bfloat16 v)
-    {
-        return __bfloat162bfloat162(v);
-    }
-};
-#endif
-
-template <typename ActType, WeightOnlyQuantType QType>
-struct ConverterSelector
-{
-    static_assert(QType == WeightOnlyQuantType::Int4b || QType == WeightOnlyQuantType::Int8b);
-
-    using WeiType = std::conditional_t<QType == WeightOnlyQuantType::Int4b, cutlass::uint4b_t, uint8_t>;
-    static constexpr int kConvertCount = QType == WeightOnlyQuantType::Int4b ? 8 : 4;
-    using Converter
-        = cutlass::FastInterleavedAndBiasedNumericArrayConverter<typename ActTypeDetails<ActType>::CutlassType, WeiType,
-            kConvertCount>;
-};
-
-template <typename ActType, WeightOnlyQuantType QType>
-struct WeightOnlyDetails;
-
-template <typename ActType>
-struct WeightOnlyDetails<ActType, WeightOnlyQuantType::Int4b>
-{
-    // Every four rows of the original weights are interleaved into a row with stride of 64, so if each thread
-    // processes 32 elements(for int4, we can use ldg.128 to load weights), then every group of two adjacent threads
-    // will alternately process four different row weights
-    // for example
-    // every 256 consecutive int4 elements [256*i, 256*(i+1)-1] of row N under interleave layout,
-    // the first 64 are from [64*i, 64*(i+1)-1] of row 4N before interleaving,
-    // and the second 64 are from [64*i, 64*(i+1)-1] of row 4N+1 before interleaving, and so on.
-    // So if each thread loads 32 int4 elements, then the elements of each 2 adjacent threads of each 8
-    // consecutive threads will come from row 4N ~ 4N+3 respectively before interleaving.
-    static constexpr int kElemBits = 4;
-    static constexpr int kInterleave = 4;
-    static constexpr int kStride = 64;
-
-    // The index remapping here is to counteracts the effect of cutlass::permute_B_rows_for_mixed_gemm
-    // input 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 ... 31
-    // weight 0 1 8 9 16 17 24 25 2 3 10 11 18 19 26 27 4 5 12 13 20 21 28 29 6 7 14 15 22 23 30 31
-    static constexpr int kShuffleSize = 32;
-    static constexpr int kShuffleBasicTile = 2;
-    static constexpr int kShuffleContinuous = 4;
-    static constexpr int kShuffleStrided = 4;
-
-    // Each warp completes the internal reduce and writes the [Batch * NPerBlock * Interleave] results to the
-    // corresponding address in shared memory
-    template <int Num, int WarpSize>
-    __device__ __forceinline__ static void sync(float* res, float (*sm)[Num * kInterleave])
-    {
-#pragma unroll
-        for (int i = 0; i < Num; ++i)
-        {
-            res[i] += __shfl_xor_sync(~0, res[i], 16);
-            res[i] += __shfl_xor_sync(~0, res[i], 8);
-            res[i] += __shfl_xor_sync(~0, res[i], 1);
-        }
-        __syncthreads();
-        int warp = threadIdx.x / WarpSize, lane = threadIdx.x % WarpSize;
-        if (lane == 0 || lane == 2 || lane == 4 || lane == 6)
-        {
-#pragma unroll
-            for (int i = 0; i < Num; ++i)
-            {
-                sm[warp][i * kInterleave + lane / 2] = res[i];
-            }
-        }
-        __syncthreads();
-    }
-};
-
-template <typename ActType>
-struct WeightOnlyDetails<ActType, WeightOnlyQuantType::Int8b>
-{
-    // Every two rows of the original weights are interleaved into a row with stride of 64, so if each thread
-    // processes 16 elements(for int8, we can use ldg.128 to load weights), then every group of four adjacent threads
-    // will alternately process two different row weights
-    // for example
-    // every 128 consecutive int8 elements [128*i, 128*(i+1)-1] of row N under interleave layout,
-    // the first 64 are from [64*i, 64*(i+1)-1] of row 2N before interleaving,
-    // and the last 64 are from [64*i, 64*(i+1)-1] of row 2N+1 before interleaving.
-    // So if each thread loads 16 int8 elements, then the elements of the first four and last four threads of each 8
-    // consecutive threads will come from row 2N and row 2N+1 respectively before interleaving.
-    static constexpr int kElemBits = 8;
-    static constexpr int kInterleave = 2;
-    static constexpr int kStride = 64;
-
-    // The index remapping here is to counteracts the effect of cutlass::permute_B_rows_for_mixed_gemm
-    // input 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
-    // weight 0 1 8 9 2 3 10 11 4 5 12 13 6 7 14 15
-    static constexpr int kShuffleSize = 16;
-    static constexpr int kShuffleBasicTile = 2;
-    static constexpr int kShuffleContinuous = 2;
-    static constexpr int kShuffleStrided = 4;
-
-    // Each warp completes the internal reduce and writes the [Batch * NPerBlock * Interleave] results to the
-    // corresponding address in shared memory
-    template <int Num, int WarpSize>
-    __device__ __forceinline__ static void sync(float* res, float (*sm)[Num * kInterleave])
-    {
-#pragma unroll
-        for (int i = 0; i < Num; ++i)
-        {
-            res[i] += __shfl_xor_sync(~0, res[i], 16);
-            res[i] += __shfl_xor_sync(~0, res[i], 8);
-            res[i] += __shfl_xor_sync(~0, res[i], 2);
-            res[i] += __shfl_xor_sync(~0, res[i], 1);
-        }
-        __syncthreads();
-        int warp = threadIdx.x / WarpSize, lane = threadIdx.x % WarpSize;
-        if (lane == 0 || lane == 4)
-        {
-#pragma unroll
-            for (int i = 0; i < Num; ++i)
-            {
-                sm[warp][i * kInterleave + lane / 4] = res[i];
-            }
-        }
-        __syncthreads();
-    }
-};
-
-template <typename ActType, WeightOnlyQuantType QType>
-struct WeightOnlyKernelDetails
-{
-    using Layout = WeightOnlyDetails<ActType, QType>;
-
-    static constexpr int kElemBits = Layout::kElemBits;
-    static constexpr int kInterleave = Layout::kInterleave;
-    static constexpr int kStride = Layout::kStride;
-
-    static constexpr int kShuffleSize = Layout::kShuffleSize;
-    static constexpr int kShuffleBasicTile = Layout::kShuffleBasicTile;
-    static constexpr int kShuffleContinuous = Layout::kShuffleContinuous;
-    static constexpr int kShuffleStrided = Layout::kShuffleStrided;
-
-    // The rearrangement here counteracts the effect of cutlass::add_bias_and_interleave_int4/8s_inplace
-    // Input int8 data layout
-    //      [elt_3  elt_1  elt_2  elt_0] (each elt occupies 8 bits)
+    // clang-format off
+    // ArgType          ArgName          DataType               Shape                           Layout
     //
-    // Converted fp16/bf16 data layout
-    //      [elt_3  elt_2  elt_1  elt_0] (each elt occupies 16 bits)
+    // input            act              fp16/bf16              [m, k]                          RowMajor
+    // input            act_scale        fp16/bf16              [1, k]                          RowMajor
+    // input            weight           int4b/int8b            [k, n]                          ColumnMajor or ColumnMajorInterleaved
+    // input            scales           fp16/bf16              [k / GroupSize, n] or [1, n]    RowMajor
+    // input            zeros            fp16/bf16              [k / GroupSize, n] or [1, n]    RowMajor
+    // input            bias             fp16/bf16              [1, n]                          RowMajor
+    // output           out              fp16/bf16              [m, n]                          RowMajor
+    // clang-format on
+    using AccessTypeA = typename Details::AccessTypeA;
+    using AccessTypeW = typename Details::AccessTypeW;
 
-    // Input int8 data layout
-    //      [elt_7  elt_5  elt_3  elt_1  elt_6  elt_4  elt_2  elt_0] (each elt occupies 4 bits)
-    //
-    // Converted fp16/bf16 data layout
-    //      [elt_7  elt_6  elt_5  elt_4  elt_3  elt_2  elt_1  elt_0] (each elt occupies 16 bits)
-    static constexpr int kConvertCount = ConverterSelector<ActType, QType>::kConvertCount;
-    using Converter = typename ConverterSelector<ActType, QType>::Converter;
-
-    // Use ldg128 load data from global memory
-    static constexpr int kAccessSize = 128;
-    using AccessType = uint4;
-
-    static constexpr int kElemsPerByte = 8 / kElemBits;
-    static constexpr int kElemsPerThread = kAccessSize / kElemBits;
-    static constexpr int kBytePerThread = kElemsPerThread / kElemsPerByte;
-    static constexpr int kThreadsNumPerTile = kStride / kElemsPerThread;
-    static constexpr int kThreadsNumPerInterleave = kThreadsNumPerTile * kInterleave;
-
-    static constexpr int kConvertIters = kElemsPerThread / kConvertCount;
-
-    // Each thread loads 16(int8b)/32(int4b) quantized weight elements each time through ldg128
-    // So more times of ldg128 are needed to load the same number of fp16/bf16 activation elements.
-    static constexpr int kActivationElemNumPerAccess = kAccessSize / (sizeof(ActType) * 8);
-    static constexpr int kActivationAccessNum = kElemsPerThread / kActivationElemNumPerAccess;
-};
-
-template <typename WeightOnlyFlag>
-struct WeightOnlyProperties;
-
-template <>
-struct WeightOnlyProperties<WeightOnlyPerChannel>
-{
-    static constexpr bool kIsFineGrained = false;
-    static constexpr int kGroupSize = 0;
-};
-
-template <int GS>
-struct WeightOnlyProperties<WeightOnlyGroupWise<GS>>
-{
-    static constexpr bool kIsFineGrained = true;
-    static constexpr int kGroupSize = GS;
-};
-
-template <typename ActType, WeightOnlyQuantType QType, typename WeightOnlyFlag, bool Zero, int BlockSize>
-struct WeightOnlyScaleLoader
-{
-    using ElemType = ActType;
-    using Details = WeightOnlyKernelDetails<ActType, QType>;
-    static constexpr bool kIsFineGrained = WeightOnlyProperties<WeightOnlyFlag>::kIsFineGrained;
-    static constexpr int kGroupSize = WeightOnlyProperties<WeightOnlyFlag>::kGroupSize;
-
-private:
-    ElemType const* _scales;
-    ElemType const* _zeros;
-    int _stride;
-    int _offset;
-
-public:
-    __device__ __forceinline__ WeightOnlyScaleLoader(
-        ElemType const* scales, ElemType const* zeros, int initial_offset, int stride)
-        : _scales(scales)
-        , _zeros(zeros)
-        , _stride(stride)
+    static constexpr bool Mandatory = true;
+    static constexpr int StepK = Details::kStepK;
+    static constexpr int CtaK = StepK * Threads;
+    static_assert(CtaN % 2 == 0);
+    if constexpr (GroupSize != 0)
     {
-        _scales += initial_offset;
-        if constexpr (Zero)
-        {
-            _zeros += initial_offset;
-        }
-        // Calculate the k dimension index of the element processed by the current thread of layout before interleave
-        // Used to load scales and zeros in groupwise weight only quant
-        _offset = threadIdx.x / Details::kThreadsNumPerInterleave * Details::kStride
-            + (threadIdx.x % Details::kThreadsNumPerTile) * Details::kElemsPerThread;
+        static_assert((CtaK / Details::kInterleave) % GroupSize == 0);
     }
 
-    __device__ __forceinline__ void load(ElemType& scale, ElemType& zero, int nid)
+    int const origin_k = k, interleaved_k = k * Details::kInterleave;
+
+    int const tile_id_m = blockIdx.x, tile_id_n = blockIdx.y, tid = threadIdx.x;
+    int const offset_m = tile_id_m * CtaM, interleaved_offset_n = tile_id_n * CtaN;
+    int const real_offset_n = interleaved_offset_n * Details::kInterleave
+        + ((tid * StepK / Details::LayoutDeatils::kTileSize) % Details::kInterleave);
+    int const real_offset_k
+        = (tid * StepK / (Details::kInterleave * Details::LayoutDeatils::kTileSize)) * Details::LayoutDeatils::kTileSize
+        + ((tid * StepK) % Details::LayoutDeatils::kTileSize);
+
+    GMemIterator<Mandatory, AccessTypeA, CtaM, Details::kAccessNumA, TypeA> act_iterator(
+        act, offset_m * origin_k + real_offset_k, CtaK / Details::kInterleave, origin_k);
+    GMemIterator<EnableActScale, AccessTypeA, 1, Details::kAccessNumA, TypeA> act_scale_iterator(
+        act_scale, real_offset_k, CtaK / Details::kInterleave, 0);
+    GMemIterator<Mandatory, AccessTypeW, CtaN, Details::kAccessNumW, uint8_t> weight_iterator(weight,
+        (interleaved_offset_n * interleaved_k + tid * StepK) / Details::kElemsPerByteW, CtaK / Details::kElemsPerByteW,
+        interleaved_k / Details::kElemsPerByteW);
+    GMemIterator<Mandatory, TypeA, CtaN, 1, TypeA> scales_iterator(scales,
+        (GroupSize != 0 ? real_offset_k / GroupSize * n : 0) + real_offset_n,
+        (GroupSize != 0 ? CtaK / Details::kInterleave / GroupSize * n : 0), Details::kInterleave);
+    GMemIterator<EnableZero, TypeA, CtaN, 1, TypeA> zeros_iterator(zeros,
+        (GroupSize != 0 ? real_offset_k / GroupSize * n : 0) + real_offset_n,
+        (GroupSize != 0 ? CtaK / Details::kInterleave / GroupSize * n : 0), Details::kInterleave);
+
+    out += offset_m * n + tile_id_n * CtaN * Details::kInterleave;
+    if constexpr (EnableBias)
     {
-        int offset = nid * Details::kInterleave;
-        if constexpr (kIsFineGrained)
-        {
-            offset += _offset / kGroupSize * _stride;
-        }
-        scale = _scales[offset];
-        if constexpr (Zero)
-        {
-            zero = _zeros[offset];
-        }
-        else
-        {
-            zero = static_cast<ElemType>(0.f);
-        }
+        bias += tile_id_n * CtaN * Details::kInterleave;
     }
 
-    __device__ __forceinline__ void advance()
+    TypeA tile_acc[CtaM * CtaN];
+    fill<CtaM * CtaN>(tile_acc, static_cast<TypeA>(0.f));
+
+    for (int idx_k = tid * StepK, iter = 0; idx_k < interleaved_k; idx_k += CtaK, ++iter)
     {
-        _offset += BlockSize * Details::kElemsPerThread / Details::kInterleave;
-    }
-
-    __device__ __forceinline__ int offset()
-    {
-        return _offset;
-    }
-};
-
-template <typename ActType, WeightOnlyQuantType QType, typename WeightOnlyFlag, template <typename T> class ActOp,
-    bool Zero, bool Bias, bool ActScale, int NPerBlock, int Batch, int BlockSize>
-__device__ void weight_only_batched_gemv(uint8_t const* qweight, ActType const* scales, ActType const* zeros,
-    ActType const* in, ActType const* act_scale, ActType const* bias, ActType* out, int const n, int const k)
-{
-    static_assert(NPerBlock == 1 || (NPerBlock % 2 == 0));
-    using ActType2 = typename ActTypeDetails<ActType>::Vec2;
-    using Details = WeightOnlyKernelDetails<ActType, QType>;
-
-    using Converter = typename Details::Converter;
-    using AccType = typename Details::AccessType;
-    using CvtSrcType = typename Converter::source_type;
-    using CvtResType = typename Converter::result_type;
-    using ScaleLoader = WeightOnlyScaleLoader<ActType, QType, WeightOnlyFlag, Zero, BlockSize>;
-    extern __shared__ uint8_t shmem[];
-    constexpr int Interleave = Details::kInterleave;
-    constexpr int WarpSize = 32;
-    constexpr int Num = Batch * NPerBlock;
-    int const tid = threadIdx.x;
-    int const bid = blockIdx.x;
-    int const n_start_id = bid * NPerBlock * Interleave;
-    // Calculate the n-dimensional index of the data processed by the current thread in the interleave tile
-    int const interleave_n_id = (tid / Details::kThreadsNumPerTile) % Interleave;
-
-    qweight += n_start_id * k / Details::kElemsPerByte;
-    ScaleLoader scale_loader(scales, zeros, n_start_id + interleave_n_id, n);
-
-    float(*sm)[Num * Interleave] = reinterpret_cast<float(*)[Num * Interleave]>(shmem);
-
-    // In order to take advantage of hfma2, we use fp16/bf16 for accumulation within threads and fp32 for accumulation
-    // between threads.
-    ActType accumulator[Num];
-    for (int i = 0; i < Num; ++i)
-    {
-        accumulator[i] = static_cast<ActType>(0.f);
-    }
-
-    // Iteration in k dimensions
-    for (int local_k = tid * Details::kElemsPerThread; local_k < k * Interleave;
-         local_k += BlockSize * Details::kElemsPerThread)
-    {
-        ActType weights_f16[Details::kElemsPerThread * NPerBlock];
-        ActType scale[NPerBlock], zero[NPerBlock];
+        TypeA vec_act_scale[StepK];
+        TypeA vec_scale[CtaN], vec_zero[CtaN];
+        TypeA tile_a[StepK], tile_w[StepK], tile_w_pack2[CtaN * StepK];
+        uint8_t tile_w_quantized[StepK / Details::kElemsPerByteW];
 #pragma unroll
-        for (int idx = 0; idx < NPerBlock; ++idx)
+        for (int i = 0; i < CtaN; ++i)
         {
-            // Load quantized weight and scales/zeros
-            uint8_t weights_quantized[Details::kBytePerThread];
-            load<AccType>(weights_quantized,
-                qweight + idx * Interleave * k / Details::kElemsPerByte + local_k / Details::kElemsPerByte);
-            scale_loader.load(scale[idx], zero[idx], idx);
-            ActType weights_vec[Details::kElemsPerThread];
-#pragma unroll
-            for (int i = 0; i < Details::kConvertIters; ++i)
-            {
-                // Use cutlass::FastInterleavedAndBiasedNumericArrayConverter for I2F type conversion
-                assign<CvtResType>(weights_vec + i * Details::kConvertCount,
-                    Converter::convert(*reinterpret_cast<CvtSrcType*>(
-                        weights_quantized + i * Details::kConvertCount / Details::kElemsPerByte)));
-            }
-#pragma unroll
-            for (int i = 0; i < Details::kShuffleContinuous; ++i)
-            {
-#pragma unroll
-                for (int j = 0; j < Details::kShuffleStrided; ++j)
-                {
-                    // Dequantize the weights and arrange the shuffled elements back to the correct order in the
-                    // register array
-                    ActType2 v = *reinterpret_cast<ActType2*>(weights_vec + i * Details::kShuffleBasicTile
-                        + j * Details::kShuffleContinuous * Details::kShuffleBasicTile);
-                    v = __hfma2(
-                        v, ActTypeDetails<ActType>::to_vec2(scale[idx]), ActTypeDetails<ActType>::to_vec2(zero[idx]));
-                    weights_f16[(i * Details::kShuffleStrided * Details::kShuffleBasicTile
-                                    + j * Details::kShuffleBasicTile + 0)
-                            * NPerBlock
-                        + idx]
-                        = v.x;
-                    weights_f16[(i * Details::kShuffleStrided * Details::kShuffleBasicTile
-                                    + j * Details::kShuffleBasicTile + 1)
-                            * NPerBlock
-                        + idx]
-                        = v.y;
-                }
-            }
+            scales_iterator.load(vec_scale + i, iter, i);
+            zeros_iterator.load(vec_zero + i, iter, i);
         }
-        ActType act_scale_v[Details::kElemsPerThread];
-        if constexpr (ActScale)
-        {
+        act_scale_iterator.load(vec_act_scale, iter);
 #pragma unroll
-            for (int idx = 0; idx < Details::kActivationAccessNum; ++idx)
-            {
-                load<AccType>(act_scale_v + idx * Details::kActivationElemNumPerAccess,
-                    act_scale + scale_loader.offset() + idx * Details::kActivationElemNumPerAccess);
-            }
+        for (int i = 0; i < CtaN; ++i)
+        {
+            weight_iterator.load(tile_w_quantized, iter, i);
+            dequantize<Details, 1, StepK, EnableZero, ApplyAlphaInAdvance>(
+                tile_w, tile_w_quantized, vec_scale + i, vec_zero + i, alpha);
+            pack_to_vec2<Details, StepK>(tile_w_pack2, tile_w, i);
         }
 #pragma unroll
-        for (int b = 0; b < Batch; ++b)
+        for (int i = 0; i < CtaM; ++i)
         {
-            ActType in_v[Details::kElemsPerThread];
-#pragma unroll
-            for (int idx = 0; idx < Details::kActivationAccessNum; ++idx)
-            {
-                // load activation elements
-                load<AccType>(in_v + idx * Details::kActivationElemNumPerAccess,
-                    in + b * k + scale_loader.offset() + idx * Details::kActivationElemNumPerAccess);
-                if constexpr (ActScale)
-                {
-#pragma unroll
-                    for (int i = 0; i < Details::kActivationElemNumPerAccess; i += 2)
-                    {
-                        *reinterpret_cast<ActType2*>(in_v + idx * Details::kActivationElemNumPerAccess + i) = __hmul2(
-                            *reinterpret_cast<ActType2*>(in_v + idx * Details::kActivationElemNumPerAccess + i),
-                            *reinterpret_cast<ActType2*>(act_scale_v + idx * Details::kActivationElemNumPerAccess + i));
-                    }
-                }
-            }
-            // Perform vector inner product and accumulate
-            if constexpr (NPerBlock == 1)
-            {
-                ActType2 v = ActTypeDetails<ActType>::to_vec2(static_cast<ActType>(0.f));
-#pragma unroll
-                for (int y = 0; y < Details::kElemsPerThread; y += 2)
-                {
-                    v = __hfma2(
-                        *reinterpret_cast<ActType2*>(weights_f16 + y), *reinterpret_cast<ActType2*>(in_v + y), v);
-                }
-                accumulator[b] += __hadd(v.x, v.y);
-            }
-            else
-            {
-#pragma unroll
-                for (int x = 0; x < NPerBlock / 2; ++x)
-                {
-#pragma unroll
-                    for (int y = 0; y < Details::kElemsPerThread; ++y)
-                    {
-                        *reinterpret_cast<ActType2*>(accumulator + b * NPerBlock + x * 2)
-                            = __hfma2(*reinterpret_cast<ActType2*>(weights_f16 + y * NPerBlock + x * 2),
-                                ActTypeDetails<ActType>::to_vec2(in_v[y]),
-                                *reinterpret_cast<ActType2*>(accumulator + b * NPerBlock + x * 2));
-                    }
-                }
-            }
+            act_iterator.load(tile_a, iter, i);
+            apply_scale<Details, 1, StepK, EnableActScale>(tile_a, vec_act_scale);
+            mma<Details, 1, CtaN, StepK>(tile_acc + i * CtaN, tile_w_pack2, tile_a);
         }
-        scale_loader.advance();
     }
-    float reses[Num];
-#pragma unroll
-    for (int i = 0; i < Num; ++i)
-    {
-        reses[i] = static_cast<float>(accumulator[i]);
-    }
-
-    // Each warp completes the internal reduce and writes the [Batch * NPerBlock * Interleave] results to the
-    // corresponding address in shared memory
-    Details::Layout::sync<Num, WarpSize>(reses, sm);
-
-    // Each thread is responsible for the accumulation and store to global memory of one element
-    for (int i = tid; i < Num * Interleave; i += BlockSize)
-    {
-        int nid = i % (NPerBlock * Interleave);
-        float v = 0.f;
-        for (int j = 0; j < BlockSize / WarpSize; ++j)
-        {
-            v += sm[j][i];
-        }
-        float bias_v = 0.f;
-        if constexpr (Bias)
-        {
-            bias_v = static_cast<float>(bias[n_start_id + nid]);
-        }
-        int b = i / NPerBlock / Interleave;
-        out[b * n + n_start_id + nid] = static_cast<ActType>(ActOp<float>::apply(v + bias_v));
-    }
+    epilogue<Details, CtaM, CtaN, Threads, EnableBias, ApplyAlphaInAdvance>(out, n, tile_acc, bias, alpha);
 }
 
-template <typename ActType, WeightOnlyQuantType QType, typename WeightOnlyFlag, template <typename T> class ActOp,
-    bool Zero, bool Bias, bool ActScale, int NPerBlock, int Batch, int BlockSize>
-__global__ void weight_only_batched_gemv_wrapper(uint8_t const* qweight, ActType const* scales, ActType const* zeros,
-    ActType const* in, ActType const* act_scale, ActType const* bias, ActType* out, int const n, int const k)
+template <typename Details, int CtaM, int CtaN, int Threads, int GroupSize, bool EnableActScale, bool EnableZero,
+    bool EnableBias, bool ApplyAlphaInAdvance>
+void exec_kernel(Params& params, cudaStream_t s)
 {
-    if constexpr (std::is_same_v<ActType, half>)
+    using T = typename Details::TypeDetailsA::Type;
+    if (params.m % CtaM || params.n % (CtaN * Details::kInterleave))
     {
-        weight_only_batched_gemv<ActType, QType, WeightOnlyFlag, ActOp, Zero, Bias, ActScale, NPerBlock, Batch,
-            BlockSize>(qweight, scales, zeros, in, act_scale, bias, out, n, k);
+        throw std::runtime_error("launch failed");
     }
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && defined(ENABLE_BF16))
-    else if (std::is_same_v<ActType, nv_bfloat16>)
-    {
-        weight_only_batched_gemv<ActType, QType, WeightOnlyFlag, ActOp, Zero, Bias, ActScale, NPerBlock, Batch,
-            BlockSize>(qweight, scales, zeros, in, act_scale, bias, out, n, k);
-    }
-#endif
+    dim3 grid(params.m / CtaM, params.n / (CtaN * Details::kInterleave));
+    dim3 block(Threads);
+    // clang-format off
+    kernel<Details, CtaM, CtaN, Threads, GroupSize, EnableActScale, EnableZero, EnableBias, ApplyAlphaInAdvance><<<grid, block, 0, s>>>(
+        reinterpret_cast<T*>(params.act),
+        reinterpret_cast<T*>(params.act_scale),
+        reinterpret_cast<uint8_t*>(params.weight),
+        reinterpret_cast<T*>(params.scales),
+        reinterpret_cast<T*>(params.zeros),
+        reinterpret_cast<T*>(params.bias),
+        reinterpret_cast<T*>(params.out),
+        params.alpha,
+        params.m, params.n, params.k
+    );
+    // clang-format on
 }
 
-template <WeightOnlyQuantType QType, typename WeightOnlyFlag, template <typename T> class ActOp, bool Zero, bool Bias,
-    int NPerBlock, int Batch, int BlockSize>
-struct WeightOnlyBatchedGemvKernelLauncher
-{
-    static void run(WeightOnlyParams const& params, cudaStream_t stream)
-    {
-        if (params.act_type == WeightOnlyActivationType::FP16)
-        {
-            constexpr int kInterleave = WeightOnlyDetails<half, QType>::kInterleave;
-            dim3 grid(params.n / NPerBlock / kInterleave);
-            dim3 block(BlockSize);
-            int size = sizeof(float) * BlockSize / 32 * Batch * NPerBlock * kInterleave;
-            if (params.act_scale != nullptr)
-            {
-                weight_only_batched_gemv_wrapper<half, QType, WeightOnlyFlag, ActOp, Zero, Bias, true, NPerBlock, Batch,
-                    BlockSize><<<grid, block, size, stream>>>(params.qweight,
-                    reinterpret_cast<half const*>(params.scales), reinterpret_cast<half const*>(params.zeros),
-                    reinterpret_cast<half const*>(params.in), reinterpret_cast<half const*>(params.act_scale),
-                    reinterpret_cast<half const*>(params.bias), reinterpret_cast<half*>(params.out), params.n,
-                    params.k);
-            }
-            else
-            {
-                weight_only_batched_gemv_wrapper<half, QType, WeightOnlyFlag, ActOp, Zero, Bias, false, NPerBlock,
-                    Batch, BlockSize><<<grid, block, size, stream>>>(params.qweight,
-                    reinterpret_cast<half const*>(params.scales), reinterpret_cast<half const*>(params.zeros),
-                    reinterpret_cast<half const*>(params.in), reinterpret_cast<half const*>(params.act_scale),
-                    reinterpret_cast<half const*>(params.bias), reinterpret_cast<half*>(params.out), params.n,
-                    params.k);
-            }
-        }
-#if defined(ENABLE_BF16)
-        else if (params.act_type == WeightOnlyActivationType::BF16)
-        {
-            constexpr int kInterleave = WeightOnlyDetails<nv_bfloat16, QType>::kInterleave;
-            dim3 grid(params.n / NPerBlock / kInterleave);
-            dim3 block(BlockSize);
-            int size = sizeof(float) * BlockSize / 32 * Batch * NPerBlock * kInterleave;
-            if (params.act_scale != nullptr)
-            {
-                weight_only_batched_gemv_wrapper<__nv_bfloat16, QType, WeightOnlyFlag, ActOp, Zero, Bias, true,
-                    NPerBlock, Batch, BlockSize><<<grid, block, size, stream>>>(params.qweight,
-                    reinterpret_cast<__nv_bfloat16 const*>(params.scales),
-                    reinterpret_cast<__nv_bfloat16 const*>(params.zeros),
-                    reinterpret_cast<__nv_bfloat16 const*>(params.in),
-                    reinterpret_cast<__nv_bfloat16 const*>(params.act_scale),
-                    reinterpret_cast<__nv_bfloat16 const*>(params.bias), reinterpret_cast<__nv_bfloat16*>(params.out),
-                    params.n, params.k);
-            }
-            else
-            {
-                weight_only_batched_gemv_wrapper<__nv_bfloat16, QType, WeightOnlyFlag, ActOp, Zero, Bias, false,
-                    NPerBlock, Batch, BlockSize><<<grid, block, size, stream>>>(params.qweight,
-                    reinterpret_cast<__nv_bfloat16 const*>(params.scales),
-                    reinterpret_cast<__nv_bfloat16 const*>(params.zeros),
-                    reinterpret_cast<__nv_bfloat16 const*>(params.in),
-                    reinterpret_cast<__nv_bfloat16 const*>(params.act_scale),
-                    reinterpret_cast<__nv_bfloat16 const*>(params.bias), reinterpret_cast<__nv_bfloat16*>(params.out),
-                    params.n, params.k);
-            }
-        }
-#endif
-    }
-};
+} // namespace weight_only
 } // namespace kernels
 } // namespace tensorrt_llm

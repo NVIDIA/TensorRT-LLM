@@ -122,11 +122,14 @@ class GemmIdCublas : public GemmIdCore
 public:
     bool transA{};
     bool transB{};
+    nvinfer1::DataType outputDtype;
 
-    GemmIdCublas(int n_, int k_, nvinfer1::DataType const& dtype_, bool transA_, bool transB_)
+    GemmIdCublas(int n_, int k_, nvinfer1::DataType const& dtype_, bool transA_, bool transB_,
+        nvinfer1::DataType const& output_dtype_)
         : GemmIdCore(n_, k_, dtype_)
         , transA(transA_)
         , transB(transB_)
+        , outputDtype(output_dtype_)
     {
     }
 
@@ -134,7 +137,7 @@ public:
 
     bool operator==(GemmIdCublas const& id) const
     {
-        return isEqual(id) && transA == id.transA && transB == id.transB;
+        return isEqual(id) && transA == id.transA && transB == id.transB && outputDtype == id.outputDtype;
     }
 
     friend std::ostream& operator<<(std::ostream& out, GemmIdCublas const& id)
@@ -143,6 +146,7 @@ public:
         out << " type=" << static_cast<int>(id.dtype);
         out << " transA=" << id.transA;
         out << " transB=" << id.transB;
+        out << " outputDtype=" << static_cast<int>(id.outputDtype);
         return out;
     }
 };
@@ -157,7 +161,8 @@ struct GemmIdCublasHash
         auto h3 = std::hash<int>{}(static_cast<int>(id.dtype));
         auto h4 = std::hash<bool>{}(id.transA);
         auto h5 = std::hash<bool>{}(id.transB);
-        return h1 ^ h2 ^ h3 ^ h4 ^ h5;
+        auto h6 = std::hash<bool>{}(static_cast<int>(id.outputDtype));
+        return h1 ^ h2 ^ h3 ^ h4 ^ h5 ^ h6;
     }
 };
 

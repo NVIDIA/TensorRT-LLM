@@ -96,7 +96,6 @@ class PhiModel(Module):
         mapping = config.mapping
         use_parallel_embedding = False
         embedding_sharding_dim = 0
-        self.use_prompt_tuning = config.use_prompt_tuning
 
         self.vocab_embedding = Embedding(
             num_embeddings=config.vocab_size,
@@ -124,7 +123,7 @@ class PhiModel(Module):
         prompt_vocab_size=None,
     ):
         args = [prompt_embedding_table, prompt_tasks, prompt_vocab_size
-                ] if self.use_prompt_tuning else []
+                ] if prompt_embedding_table is not None else []
         hidden_states = self.vocab_embedding(input_ids, *args)
 
         hidden_states = self.layers(

@@ -20,8 +20,8 @@ import numpy as np
 import torch
 
 sys.path.append(str(Path(__file__).parent.resolve() /
-                    "../examples/gpt/utils"))  # more precise, avoid confusion
-from convert import generate_int8
+                    "../examples/gpt"))  # more precise, avoid confusion
+from convert_checkpoint import generate_int8
 
 
 def dist(x, y):

@@ -56,7 +56,6 @@ The different files will be loaded by different ranks in a multi-GPU (multi-proc
 | intermediate_size                      | int        | null                |
 | norm_epsilon                           | float      | 1e-5                |
 | position_embedding_type                | string     | 'learned_absolute'  |
-| use_prompt_tuning                      | bool       | false               |
 | mapping.world_size                     | int        | 1                   |
 | mapping.tp_size                        | int        | 1                   |
 | mapping.pp_size                        | int        | 1                   |
@@ -219,7 +218,6 @@ Here is the `config.json`:
     "embedding_sharding_dim": 0,
     "share_embedding_table": false,
     "do_layer_norm_before": true,
-    "use_prompt_tuning": false
 }
 ```
 

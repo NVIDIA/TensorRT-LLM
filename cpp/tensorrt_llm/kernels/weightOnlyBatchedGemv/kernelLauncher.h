@@ -13,13 +13,99 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 #pragma once
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/weightOnlyBatchedGemv/common.h"
+#include "tensorrt_llm/kernels/weightOnlyBatchedGemv/details.h"
 
 namespace tensorrt_llm
 {
 namespace kernels
 {
-void weight_only_batched_gemv_launcher(WeightOnlyParams const& params, cudaStream_t stream);
+namespace weight_only
+{
+template <bool isGroupwise, typename Details>
+void select_gs(Params& params, cudaStream_t s);
+
+inline void kernel_launcher(int arch, Params& params, cudaStream_t s)
+{
+#define EXEC(KType, A, B, Layout, ConverterInterleave)                                                                 \
+    if (params.type == KType)                                                                                          \
+    {                                                                                                                  \
+        select_gs<kernel_type_traits<KType>::isGroupwise, KernelDetails<A, B, Layout, ConverterInterleave>>(           \
+            params, s);                                                                                                \
+        return;                                                                                                        \
+    }
+    if (arch >= 70 && arch < 75)
+    {
+        EXEC(KernelType::FP16Int8PerChannel, FP16DetailsA, Int8DetailsW, ColumnMajor, true);
+        EXEC(KernelType::FP16Int4PerChannel, FP16DetailsA, Int4DetailsW, ColumnMajor, true);
+    }
+    else if (arch >= 75 && arch < 80)
+    {
+        EXEC(KernelType::FP16Int4Groupwise, FP16DetailsA, Int4DetailsW, ColumnMajorInterleaved, true);
+        EXEC(KernelType::FP16Int8PerChannel, FP16DetailsA, Int8DetailsW, ColumnMajorInterleaved, true);
+        EXEC(KernelType::FP16Int4PerChannel, FP16DetailsA, Int4DetailsW, ColumnMajorInterleaved, true);
+    }
+    else if (arch >= 80 && arch < 90)
+    {
+        EXEC(KernelType::FP16Int4Groupwise, FP16DetailsA, Int4DetailsW, ColumnMajorInterleaved, true);
+        EXEC(KernelType::BF16Int4Groupwise, BF16DetailsA, Int4DetailsW, ColumnMajorInterleaved, true);
+        EXEC(KernelType::FP16Int8PerChannel, FP16DetailsA, Int8DetailsW, ColumnMajorInterleaved, true);
+        EXEC(KernelType::BF16Int8PerChannel, BF16DetailsA, Int8DetailsW, ColumnMajorInterleaved, true);
+        EXEC(KernelType::FP16Int4PerChannel, FP16DetailsA, Int4DetailsW, ColumnMajorInterleaved, true);
+        EXEC(KernelType::BF16Int4PerChannel, BF16DetailsA, Int4DetailsW, ColumnMajorInterleaved, true);
+    }
+    else if (arch >= 90)
+    {
+        EXEC(KernelType::FP16Int4Groupwise, FP16DetailsA, Int4DetailsW, ColumnMajor, false);
+        EXEC(KernelType::BF16Int4Groupwise, BF16DetailsA, Int4DetailsW, ColumnMajor, false);
+        EXEC(KernelType::FP16Int8PerChannel, FP16DetailsA, Int8DetailsW, ColumnMajor, false);
+        EXEC(KernelType::BF16Int8PerChannel, BF16DetailsA, Int8DetailsW, ColumnMajor, false);
+        EXEC(KernelType::FP16Int4PerChannel, FP16DetailsA, Int4DetailsW, ColumnMajor, false);
+        EXEC(KernelType::BF16Int4PerChannel, BF16DetailsA, Int4DetailsW, ColumnMajor, false);
+    }
+#undef EXEC
 }
+
+inline bool is_supported(int arch, KernelType kernel_type)
+{
+#define SUPPORT(Type)                                                                                                  \
+    if (kernel_type == Type)                                                                                           \
+        return true;
+    if (arch >= 70 && arch < 75)
+    {
+        SUPPORT(KernelType::FP16Int8PerChannel);
+        SUPPORT(KernelType::FP16Int4PerChannel);
+    }
+    else if (arch >= 75 && arch < 80)
+    {
+        SUPPORT(KernelType::FP16Int4Groupwise);
+        SUPPORT(KernelType::FP16Int8PerChannel);
+        SUPPORT(KernelType::FP16Int4PerChannel);
+    }
+    else if (arch >= 80 && arch < 90)
+    {
+        SUPPORT(KernelType::FP16Int4Groupwise);
+        SUPPORT(KernelType::BF16Int4Groupwise);
+        SUPPORT(KernelType::FP16Int8PerChannel);
+        SUPPORT(KernelType::BF16Int8PerChannel);
+        SUPPORT(KernelType::FP16Int4PerChannel);
+        SUPPORT(KernelType::BF16Int4PerChannel);
+    }
+    else if (arch >= 90)
+    {
+        SUPPORT(KernelType::FP16Int4Groupwise);
+        SUPPORT(KernelType::BF16Int4Groupwise);
+        SUPPORT(KernelType::FP16Int8PerChannel);
+        SUPPORT(KernelType::BF16Int8PerChannel);
+        SUPPORT(KernelType::FP16Int4PerChannel);
+        SUPPORT(KernelType::BF16Int4PerChannel);
+    }
+    return false;
+#undef SUPPORT
+}
+} // namespace weight_only
+} // namespace kernels
 } // namespace tensorrt_llm

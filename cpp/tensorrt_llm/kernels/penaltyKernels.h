@@ -39,11 +39,11 @@ struct InvokeBatchApplyPenaltyParams
     float const* presencePenalties;
     float const* frequencyPenalties;
     bool const accumulateVocab;
-    size_t const batchSize;
+    runtime::SizeType const batchSize;
     runtime::SizeType const beamWidth;
     runtime::SizeType const maxSeqLen;
-    size_t const vocabSize;
-    size_t const vocabSizePadded;
+    runtime::SizeType const vocabSize;
+    runtime::SizeType const vocabSizePadded;
     runtime::TokenIdType const** outputIdsPtr;
     runtime::SizeType const** parentIdsPtr;
     runtime::SizeType const* inputLengths;

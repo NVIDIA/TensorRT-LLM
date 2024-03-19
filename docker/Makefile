@@ -145,12 +145,12 @@ jenkins-aarch64_%: STAGE = devel
 centos7_%: IMAGE_WITH_TAG = $(shell grep 'LLM_CENTOS7_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
 centos7_%: STAGE = devel
 centos7_%: BASE_IMAGE = nvidia/cuda
-centos7_%: BASE_TAG = 12.3.1-devel-centos7
+centos7_%: BASE_TAG = 12.3.2-devel-centos7
 
 # For x86_64 and aarch64
 ubuntu22_%: STAGE = devel
 ubuntu22_%: BASE_IMAGE = nvidia/cuda
-ubuntu22_%: BASE_TAG = 12.3.1-devel-ubuntu22.04
+ubuntu22_%: BASE_TAG = 12.3.2-devel-ubuntu22.04
 
 # For x86_64
 old-cuda_%: IMAGE_WITH_TAG = $(shell grep 'LLM_OLD_CUDA_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')

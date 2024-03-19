@@ -61,7 +61,7 @@ tensorrt_llm::runtime::TllmLogger defaultLogger{};
 
 TllmRuntime::TllmRuntime(void const* engineData, std::size_t engineSize, nvinfer1::ILogger& logger)
     : mStream(std::make_shared<CudaStream>())
-    , mBufferManager{mStream}
+    , mBufferManager{mStream, true} // Ensure to trim the memory pool on destruction.
     , mRuntime{nvinfer1::createInferRuntime(logger)}
     , mEngine{mRuntime->deserializeCudaEngine(engineData, engineSize)}
 {

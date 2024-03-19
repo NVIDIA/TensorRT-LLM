@@ -7,7 +7,7 @@ from typing import List, Optional
 
 import torch
 
-from tensorrt_llm import LLM, ModelConfig
+from tensorrt_llm import LLM, ModelConfig, logger
 from tensorrt_llm.hlapi.llm import KvCacheConfig, SamplingConfig
 from tensorrt_llm.hlapi.utils import get_device_count
 
@@ -229,6 +229,7 @@ def _parse_arguments():
     parser.add_argument('--world_size', type=int, default=1)
     parser.add_argument('--tp_size', type=int, default=1)
     parser.add_argument('--streaming', action='store_true')
+    parser.add_argument('--log_level', type=str, default='info')
     return parser.parse_args()
 
 
@@ -243,7 +244,7 @@ def _get_functions():
 
 if __name__ == '__main__':
     args = _parse_arguments()
-
+    logger.set_level(args.log_level)
     tasks = dict(
         run_llm_from_huggingface_model=lambda: run_llm_from_huggingface_model(
             [args.prompt],

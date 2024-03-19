@@ -15,7 +15,7 @@
 from ..._utils import pad_vocab_size
 from ...functional import Tensor
 from ...layers import (Attention, AttentionMaskType, ColumnLinear, Embedding,
-                       GatedMLP, PromptTuningEmbedding, RmsNorm)
+                       GatedMLP, RmsNorm)
 from ...module import Module
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
                               PretrainedConfig)
@@ -104,10 +104,7 @@ class BaichuanModel(Module):
         super().__init__()
         hidden_size = config.hidden_size
         dtype = config.dtype
-        self.use_prompt_tuning = config.use_prompt_tuning
-
-        EmbeddingCls = PromptTuningEmbedding if config.use_prompt_tuning else Embedding
-        self.vocab_embedding = EmbeddingCls(
+        self.vocab_embedding = Embedding(
             config.vocab_size,
             config.hidden_size,
             dtype=config.dtype,
@@ -134,7 +131,7 @@ class BaichuanModel(Module):
                 prompt_tasks=None,
                 prompt_vocab_size=None):
         args = [prompt_embedding_table, prompt_tasks, prompt_vocab_size
-                ] if self.use_prompt_tuning else []
+                ] if prompt_embedding_table is not None else []
         hidden_states = self.vocab_embedding(input_ids, *args)
 
         hidden_states = self.layers(hidden_states,

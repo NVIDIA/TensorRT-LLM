@@ -12,24 +12,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import json
 import os
 import subprocess
 import sys
 import unittest
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 import torch
 import torch.multiprocessing as multiprocessing
 
 import tensorrt_llm
-from tensorrt_llm.runtime import ModelConfig, SamplingConfig
-
-sys.path.insert(
-    0, str(Path(__file__).resolve().parent.parent.parent / "examples/gpt"))
-from build import get_engine_name, run_build  # isort:skip
-from hf_gpt_convert import ProgArgs, run_conversion
+from tensorrt_llm.runtime import ModelRunner, SamplingConfig
 
 END_ID = 50256
 PAD_ID = 50256
@@ -40,22 +35,44 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '../utils'))
 from llm_data import llm_models_root
 from util import getSMVersion
 
+gpt_example_root = os.path.join(os.path.dirname(__file__), '../../examples/gpt')
 
-def build_engine(weight_dir: Path, engine_dir: Path, *args):
-    print(
-        f"== Build engine from {weight_dir} to {engine_dir}, with args {args}")
-    run_build([
-        '--model_dir',
-        str(weight_dir),
-        '--output_dir',
-        str(engine_dir),
+
+def run_command(command: Sequence[str], *, cwd=None, **kwargs) -> None:
+    print(f"Running: cd %s && %s" % (str(cwd or Path.cwd()), " ".join(command)),
+          flush=True)
+    subprocess.check_call(command, cwd=cwd, **kwargs)
+
+
+def convert_ckpt(model_dir: str, output_dir: str, *args):
+    convert_cmd = [
+        sys.executable, f"{gpt_example_root}/convert_checkpoint.py",
+        f"--model_dir={model_dir}", f"--output_dir={output_dir}"
+    ] + list(args)
+    run_command(convert_cmd)
+
+
+def build_engine(checkpoint_dir: str, engine_dir: str, *args):
+    build_cmd = [
+        "trtllm-build",
+        f"--checkpoint_dir={checkpoint_dir}",
+        f"--output_dir={engine_dir}",
         '--log_level=verbose',
         '--max_batch_size=256',
         '--max_input_len=40',
         '--max_output_len=20',
         '--max_beam_width=2',
         '--builder_opt=0',
-    ] + list(args))
+    ]
+    legacy_args = [
+        "--gpt_attention_plugin=disable",
+        "--context_fmha=disable",
+        "--paged_kv_cache=disable",
+        "--remove_input_padding=disable",
+        "--enable_xqa=disable",
+    ]
+    build_cmd = build_cmd + legacy_args + list(args)
+    run_command(build_cmd)
 
 
 def build_engines():
@@ -77,108 +94,59 @@ def build_engines():
             pytorch_model
         ])
 
-    weight_dir = work_dir / 'c-model/gpt2'
+    ckpt_dir = work_dir / 'c-model/gpt2'
     engine_dir = work_dir / 'rt_engine/gpt2'
 
     print("\nConverting to fp32")
-    fp32_weight_dir = weight_dir / 'fp32/1-gpu'
-    run_conversion(
-        ProgArgs(in_file=str(gpt2_dir),
-                 out_dir=str(fp32_weight_dir),
-                 storage_type='float32'))
+    fp32_ckpt_dir = ckpt_dir / 'fp32/1-gpu'
+    convert_ckpt(str(gpt2_dir), str(fp32_ckpt_dir), "--dtype=float32")
 
     print("\nBuilding fp32 engines")
-    fp32_weight_dir_1_gpu = fp32_weight_dir / '1-gpu'
-    build_engine(fp32_weight_dir_1_gpu, engine_dir / 'fp32-default/1-gpu',
-                 '--dtype=float32')
-    build_engine(fp32_weight_dir_1_gpu, engine_dir / 'fp32-plugin/1-gpu',
-                 '--dtype=float32', '--use_gpt_attention_plugin=float32')
+
+    build_engine(str(fp32_ckpt_dir), str(engine_dir / 'fp32-default/1-gpu'))
+    build_engine(str(fp32_ckpt_dir), str(engine_dir / 'fp32-plugin/1-gpu'),
+                 '--gpt_attention_plugin=float32')
 
     print("\nConverting to fp16")
-    fp16_weight_dir = weight_dir / 'fp16/1-gpu'
-    run_conversion(
-        ProgArgs(in_file=str(gpt2_dir),
-                 out_dir=str(fp16_weight_dir),
-                 storage_type='float16'))
+    fp16_ckpt_dir = ckpt_dir / 'fp16/1-gpu'
+    convert_ckpt(str(gpt2_dir), str(fp16_ckpt_dir), "--dtype=float16")
 
     print("\nBuilding fp16 engines")
-    fp16_weight_dir_1_gpu = fp16_weight_dir / '1-gpu'
-    build_engine(fp16_weight_dir_1_gpu, engine_dir / 'fp16-default/1-gpu',
-                 '--dtype=float16', '--strongly_typed')
-    build_engine(fp16_weight_dir_1_gpu, engine_dir / 'fp16-plugin/1-gpu',
-                 '--dtype=float16', '--use_gpt_attention_plugin=float16',
+    build_engine(str(fp16_ckpt_dir), str(engine_dir / 'fp16-default/1-gpu'),
                  '--strongly_typed')
+    build_engine(str(fp16_ckpt_dir), str(engine_dir / 'fp16-plugin/1-gpu'),
+                 '--gpt_attention_plugin=float16', '--strongly_typed')
 
     # Skip tests that are not supported in pre-ampere architecture
     if getSMVersion() >= 80:
-        build_engine(fp16_weight_dir_1_gpu,
-                     engine_dir / 'fp16-plugin-fmha/1-gpu', '--dtype=float16',
-                     '--use_gpt_attention_plugin=float16',
-                     '--enable_context_fmha', '--strongly_typed')
+        build_engine(str(fp16_ckpt_dir),
+                     str(engine_dir / 'fp16-plugin-fmha/1-gpu'),
+                     '--gpt_attention_plugin=float16', '--context_fmha=enable',
+                     '--strongly_typed')
 
-    build_engine(fp16_weight_dir_1_gpu, engine_dir / 'fp16-plugin-packed/1-gpu',
-                 '--dtype=float16', '--use_gpt_attention_plugin=float16',
-                 '--remove_input_padding', '--strongly_typed')
+    build_engine(str(fp16_ckpt_dir),
+                 str(engine_dir / 'fp16-plugin-packed/1-gpu'),
+                 '--gpt_attention_plugin=float16',
+                 '--remove_input_padding=enable', '--strongly_typed')
 
     # Skip tests that are not supported in pre-ampere architecture
     if getSMVersion() >= 80:
-        build_engine(fp16_weight_dir_1_gpu,
-                     engine_dir / 'fp16-plugin-packed-fmha/1-gpu',
-                     '--dtype=float16', '--use_gpt_attention_plugin=float16',
-                     '--remove_input_padding', '--enable_context_fmha',
+        build_engine(fp16_ckpt_dir,
+                     str(engine_dir / 'fp16-plugin-packed-fmha/1-gpu'),
+                     '--gpt_attention_plugin=float16',
+                     '--remove_input_padding=enable', '--context_fmha=enable',
                      '--strongly_typed')
 
     print("Done.")
 
 
 def check_accuracy(engine_dir, input_tokens, max_output_len):
-    config_path = os.path.join(engine_dir, 'config.json')
-    with open(config_path, 'r') as f:
-        config = json.load(f)
-    dtype = config['builder_config']['precision']
-    use_gpt_attention_plugin = config['plugin_config']['gpt_attention_plugin']
-    remove_input_padding = config['plugin_config']['remove_input_padding']
-    dtype = config['builder_config']['precision']
-    world_size = config['builder_config']['tensor_parallel']
-    assert world_size == tensorrt_llm.mpi_world_size(), \
-        f'Engine world size ({world_size}) != Runtime world size ({tensorrt_llm.mpi_world_size()})'
-    num_heads = config['builder_config']['num_heads'] // world_size
-    hidden_size = config['builder_config']['hidden_size'] // world_size
-    max_batch_size = config['builder_config']['max_batch_size']
-    max_beam_width = config['builder_config']['max_beam_width']
-    vocab_size = config['builder_config']['vocab_size']
-    num_layers = config['builder_config']['num_layers']
-    num_kv_heads = config['builder_config']['num_kv_heads']
-
     runtime_rank = tensorrt_llm.mpi_rank()
-    runtime_mapping = tensorrt_llm.Mapping(world_size,
-                                           runtime_rank,
-                                           tp_size=world_size)
-    torch.cuda.set_device(runtime_rank % runtime_mapping.gpus_per_node)
-
-    model_config = ModelConfig(max_batch_size=max_batch_size,
-                               max_beam_width=max_beam_width,
-                               num_heads=num_heads,
-                               num_kv_heads=num_kv_heads,
-                               hidden_size=hidden_size,
-                               vocab_size=vocab_size,
-                               num_layers=num_layers,
-                               gpt_attention_plugin=use_gpt_attention_plugin,
-                               remove_input_padding=remove_input_padding,
-                               dtype=dtype)
+    runner = ModelRunner.from_dir(engine_dir, rank=runtime_rank)
     sampling_config = SamplingConfig(end_id=END_ID, pad_id=END_ID)
 
-    engine_name = get_engine_name('gpt', dtype, world_size, runtime_rank)
-    serialize_path = os.path.join(engine_dir, engine_name)
-    with open(serialize_path, 'rb') as f:
-        engine_buffer = f.read()
-    decoder = tensorrt_llm.runtime.GenerationSession(model_config,
-                                                     engine_buffer,
-                                                     runtime_mapping)
-
-    input_lengths = torch.tensor([len(x) for x in input_tokens],
-                                 dtype=torch.int,
-                                 device='cuda')
+    all_input_ids = [torch.tensor(x, dtype=torch.int32) for x in input_tokens]
+    all_input_lengths = [len(x) for x in input_tokens]
     num_samples = len(input_tokens)
 
     expect_output = None
@@ -188,50 +156,45 @@ def check_accuracy(engine_dir, input_tokens, max_output_len):
         output_with_fake_dim = []
         print(f"Running batch size: {batch_size}")
         for i in range(num_samples // batch_size):
-            samples = input_tokens[i * batch_size:(i + 1) * batch_size]
-            sample_lengths = input_lengths[i * batch_size:(i + 1) * batch_size]
-            if remove_input_padding:
-                input_ids = np.concatenate(samples)
-                input_ids = torch.tensor(input_ids,
-                                         dtype=torch.int,
-                                         device='cuda')
-                input_ids_with_fake_dim = input_ids.unsqueeze(0)
-                max_input_length = torch.max(sample_lengths).item()
-            else:
-                input_ids = torch.nested.to_padded_tensor(
-                    torch.nested.nested_tensor(samples, dtype=torch.int32),
-                    PAD_ID).cuda()
-                max_input_length = input_ids.size(1)
-
-            decoder.setup(batch_size, max_input_length, max_output_len)
-            output_ids = decoder.decode(input_ids, sample_lengths,
-                                        sampling_config)
+            batch_input_ids = all_input_ids[i * batch_size:(i + 1) * batch_size]
+            batch_input_lengths = all_input_lengths[i * batch_size:(i + 1) *
+                                                    batch_size]
+            max_input_length = max(batch_input_lengths)
+            output_ids = runner.generate(batch_input_ids,
+                                         sampling_config=sampling_config,
+                                         max_new_tokens=max_output_len)
             torch.cuda.synchronize()
 
-            if remove_input_padding:
-                decoder.setup(batch_size, max_input_length, max_output_len)
-                output_ids_with_fake_dim = decoder.decode(
-                    input_ids_with_fake_dim, sample_lengths, sampling_config)
+            if runner.remove_input_padding:
+                runner.session.setup(batch_size, max_input_length,
+                                     max_output_len)
+                batch_input_ids_with_fake_dim = torch.concat(
+                    batch_input_ids).unsqueeze(0)
+
+                output_ids_with_fake_dim = runner.session.decode(
+                    batch_input_ids_with_fake_dim.cuda(),
+                    torch.tensor(batch_input_lengths, dtype=torch.int32).cuda(),
+                    sampling_config)
                 outputs_with_fake_dim_list = [
-                    output_ids_with_fake_dim[
-                        batch_idx, :,
-                        sample_lengths[batch_idx]:sample_lengths[batch_idx] +
-                        max_output_len].cpu()
+                    output_ids_with_fake_dim[batch_idx, :,
+                                             batch_input_lengths[batch_idx]:
+                                             batch_input_lengths[batch_idx] +
+                                             max_output_len].cpu()
                     for batch_idx in range(output_ids_with_fake_dim.shape[0])
                 ]
                 outputs_with_fake_dim = torch.cat(outputs_with_fake_dim_list)
                 output_with_fake_dim.append(outputs_with_fake_dim)
 
             outputs_list = [
-                output_ids[batch_idx, :,
-                           sample_lengths[batch_idx]:sample_lengths[batch_idx] +
+                output_ids[batch_idx, :, batch_input_lengths[batch_idx]:
+                           batch_input_lengths[batch_idx] +
                            max_output_len].cpu()
                 for batch_idx in range(output_ids.shape[0])
             ]
             outputs = torch.cat(outputs_list)
             output.append(outputs)
         output = torch.stack(output, dim=0)
-        if remove_input_padding:
+        if runner.remove_input_padding:
             output_with_fake_dim = torch.stack(output_with_fake_dim, dim=0)
             error = np.mean(output.cpu().numpy().flatten() !=
                             output_with_fake_dim.cpu().numpy().flatten())

@@ -1,42 +1,12 @@
-import json
-from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional, Union
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Union
 
 import torch
 
+from tensorrt_llm._utils import DictConversion
+from tensorrt_llm.logger import logger
+
 from .utils import BaseEnum
-
-
-class DictConversion:
-
-    @classmethod
-    def from_dict(cls, config: Dict[str, Any]):
-        obj = cls()
-        fields = obj.__dataclass_fields__
-        for key, value in config.items():
-            assert hasattr(obj, key)
-            field_cls = fields[key].type
-            if (isinstance(field_cls, type)
-                    and issubclass(field_cls, DictConversion)
-                    and isinstance(value, dict)):
-                value = field_cls.from_dict(value)
-            setattr(obj, key, value)
-        return obj
-
-    def to_dict(self):
-        return asdict(self)
-
-    @classmethod
-    def from_json_file(cls, file):
-        with open(file) as f:
-            return cls.from_dict(json.load(f))
-
-    def set_defaults(self, **kwargs):
-        for key, default in kwargs.items():
-            value = getattr(self, key)
-            if (value is None
-                    or (isinstance(value, (list, dict)) and len(value) == 0)):
-                setattr(self, key, default)
 
 
 @dataclass
@@ -337,7 +307,11 @@ def infer_cluster_key() -> str:
                 return "V100-PCIe-32GB"
             else:
                 return "V100-PCIe-16GB"
-    return None
+
+    fallback_key = "A100-SXM-80GB"
+    logger.warning(
+        f"Fail to infer cluster key, use {fallback_key} as fallback.")
+    return fallback_key
 
 
 class CostModel(str, BaseEnum):

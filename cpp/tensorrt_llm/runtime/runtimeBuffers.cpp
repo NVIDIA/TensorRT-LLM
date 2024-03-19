@@ -583,6 +583,7 @@ void RuntimeBuffers::prepareContextStep(TensorPtr const& inputIds, TokenIdType c
     auto& stream = manager.getStream();
     SizeType const batchSize = generationConfig.batchSize;
     SizeType const maxInputLength = generationConfig.maxInputLength;
+    auto const& inputShape = inputIds->getShape();
 
     // use context lengths only in context step
     sequenceLengths = contextLengthsDevice;
@@ -604,7 +605,6 @@ void RuntimeBuffers::prepareContextStep(TensorPtr const& inputIds, TokenIdType c
 
         bufferCast<SizeType>(*sinkTokenLengths)[0] = generationConfig.sinkTokenLength;
 
-        auto const& inputShape = inputIds->getShape();
         auto const contextLengthsHostPtr = bufferCast<SizeType const>(*contextLengthsHost);
         auto const modelVariant = modelConfig.getModelVariant();
 
@@ -647,16 +647,6 @@ void RuntimeBuffers::prepareContextStep(TensorPtr const& inputIds, TokenIdType c
             pastKeyValueLengthsPtr[i] = contextLengthsHostPtr[i];
         }
 
-        if (worldConfig.isPipelineParallel())
-        {
-            auto const hiddenSize
-                = hiddenStates->getShape().nbDims == 2 ? hiddenStates->getShape().d[1] : hiddenStates->getShape().d[2];
-            auto const hiddenStatesShape = modelConfig.usePackedInput()
-                ? ITensor::makeShape({inputShape.d[0], hiddenSize})
-                : ITensor::makeShape({inputShape.d[0], inputShape.d[1], hiddenSize});
-            hiddenStates->reshape(hiddenStatesShape);
-        }
-
         if (modelConfig.usePromptTuning())
         {
             std::vector<SizeType> reqBeamWidths(batchSize, 1);
@@ -693,6 +683,15 @@ void RuntimeBuffers::prepareContextStep(TensorPtr const& inputIds, TokenIdType c
         positionIds = manager.copyFrom(positionIdsVec, attentionMask->getShape(), MemoryType::kGPU);
     }
 
+    if (worldConfig.isPipelineParallel())
+    {
+        auto const hiddenSize = hiddenStates->getShape().d[hiddenStates->getShape().nbDims - 1];
+        auto const hiddenStatesShape = modelConfig.usePackedInput()
+            ? ITensor::makeShape({inputShape.d[0], hiddenSize})
+            : ITensor::makeShape({inputShape.d[0], inputShape.d[1], hiddenSize});
+        hiddenStates->reshape(hiddenStatesShape);
+    }
+
     if (modelConfig.useGptAttentionPlugin() && modelConfig.usePagedKvCache())
     {
         auto constexpr contextBeamWidth = 1;
@@ -722,17 +721,20 @@ RuntimeBuffers::TensorPtr RuntimeBuffers::prepareNextStep(SizeType const step, B
     SizeType const batchSize = generationConfig.batchSize;
     SizeType const beamWidth = generationConfig.beamWidth;
 
-    nvinfer1::Dims inputShape;
-    if (modelConfig.usePackedInput())
+    auto const inputShape = [&modelConfig, batchSize, beamWidth]()
     {
-        // batch in last dim
-        inputShape = ITensor::makeShape({batchSize * beamWidth});
-    }
-    else
-    {
-        // batch in first dim
-        inputShape = ITensor::makeShape({batchSize * beamWidth, 1});
-    }
+        if (modelConfig.usePackedInput())
+        {
+            // batch in last dim
+            return ITensor::makeShape({batchSize * beamWidth});
+        }
+        else
+        {
+            // batch in first dim
+            return ITensor::makeShape({batchSize * beamWidth, 1});
+        }
+    }();
+
     auto nextInputIds = newTokens ? ITensor::view(newTokens, inputShape) : TensorPtr{};
 
     if (modelConfig.useGptAttentionPlugin())
@@ -774,16 +776,6 @@ RuntimeBuffers::TensorPtr RuntimeBuffers::prepareNextStep(SizeType const step, B
         {
             TLLM_THROW("Unsupported model variant");
         }
-
-        if (worldConfig.isPipelineParallel())
-        {
-            auto const hiddenSize
-                = hiddenStates->getShape().nbDims == 2 ? hiddenStates->getShape().d[1] : hiddenStates->getShape().d[2];
-            auto const hiddenStatesShape = modelConfig.usePackedInput()
-                ? ITensor::makeShape({inputShape.d[0], hiddenSize})
-                : ITensor::makeShape({inputShape.d[0], inputShape.d[1], hiddenSize});
-            hiddenStates->reshape(hiddenStatesShape);
-        }
     }
     else
     {
@@ -815,6 +807,15 @@ RuntimeBuffers::TensorPtr RuntimeBuffers::prepareNextStep(SizeType const step, B
             positionIdsEndVec[i] = positionIdsVec[(i + 1) * newLength - 1];
 
         positionIds = manager.copyFrom(positionIdsEndVec, ITensor::makeShape({nbInputs, 1}), MemoryType::kGPU);
+    }
+
+    if (worldConfig.isPipelineParallel())
+    {
+        auto const hiddenSize = hiddenStates->getShape().d[hiddenStates->getShape().nbDims - 1];
+        auto const hiddenStatesShape = modelConfig.usePackedInput()
+            ? ITensor::makeShape({inputShape.d[0], hiddenSize})
+            : ITensor::makeShape({inputShape.d[0], inputShape.d[1], hiddenSize});
+        hiddenStates->reshape(hiddenStatesShape);
     }
 
     if (modelConfig.usePagedKvCache())
@@ -909,10 +910,10 @@ void RuntimeBuffers::getRuntimeBuffers(TensorMap& inputBuffers, TensorMap& outpu
             auto kvCacheShape = presentKeysValsAlt.at(0)->getShape();
             kvCacheShape.d[3] = 0;
 
-            for (SizeType i = firstLayerId; i < firstLayerId + localNbLayers; ++i)
+            for (SizeType i = 0; i < localNbLayers; ++i)
             {
-                std::string name = "past_key_value_" + std::to_string(i);
-                TensorPtr tmp = ITensor::view(presentKeysValsAlt[i], kvCacheShape);
+                std::string name = "past_key_value_" + std::to_string(firstLayerId + i);
+                TensorPtr tmp = ITensor::view(presentKeysValsAlt.at(i), kvCacheShape);
                 inputBuffers.insert_or_assign(name, std::move(tmp));
             }
         }

@@ -31,7 +31,6 @@ import tensorrt_llm
 from tensorrt_llm._utils import str_dtype_to_trt
 from tensorrt_llm.builder import Builder
 from tensorrt_llm.functional import LayerNormPositionType, LayerNormType
-from tensorrt_llm.layers import MoeConfig, PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import PretrainedConfig, quantize_model
@@ -312,26 +311,44 @@ def build_gpt(args):
     # Initialize Module
     family = get_model_family(args.model)
     if family == "gpt":
-        tensorrt_llm_model = tensorrt_llm.models.GPTLMHeadModel(
-            num_layers=build_config['num_layers'],
-            num_heads=build_config['num_heads'],
-            hidden_size=build_config['hidden_size'],
-            vocab_size=build_config['vocab_size'],
-            hidden_act=build_config['hidden_act'],
-            max_position_embeddings=build_config['n_positions'],
-            dtype=kv_dtype,
-            mapping=tensorrt_llm.Mapping(world_size=world_size,
-                                         tp_size=world_size),  # TP only
-            apply_query_key_layer_scaling=builder_config.
-            apply_query_key_layer_scaling,
-            position_embedding_type=PositionEmbeddingType.learned_absolute
-            if build_config['position_embedding_type'] is None else
-            PositionEmbeddingType[build_config['position_embedding_type']],
-            rotary_embedding_percentage=build_config['rotary_pct'],
-            quant_mode=quant_mode,
-            bias=build_config['bias'],
-            moe_config=MoeConfig(build_config["moe_num_experts"],
-                                 build_config["moe_top_k"]))
+        if build_config['num_kv_heads'] is None:
+            build_config['num_kv_heads'] = build_config['num_heads']
+        if build_config['inter_size'] is None:
+            build_config['inter_size'] = build_config['hidden_size'] * 4
+        if build_config['position_embedding_type'] is None:
+            build_config['position_embedding_type'] = 'learned_absolute'
+        quant_algo, kv_cache_quant_algo = get_quant_algo(args.quantization)
+        config = {
+            'architecture': 'GPTForCausalLM',
+            'dtype': args.dtype,
+            'num_hidden_layers': build_config['num_layers'],
+            'num_attention_heads': build_config['num_heads'],
+            'num_key_value_heads': build_config['num_kv_heads'],
+            'hidden_size': build_config['hidden_size'],
+            'intermediate_size': build_config['inter_size'],
+            'norm_epsilon': 1e-05,
+            'vocab_size': build_config['vocab_size'],
+            'position_embedding_type': build_config['position_embedding_type'],
+            'max_position_embeddings': build_config['n_positions'],
+            'hidden_act': build_config['hidden_act'],
+            'quantization': {
+                'quant_algo': quant_algo,
+                'kv_cache_quant_algo': kv_cache_quant_algo,
+                'group_size': 128,
+            },
+            'mapping': {
+                'world_size': world_size,
+                'tp_size': world_size,
+            },
+            'bias': build_config['bias'],
+            'apply_query_key_layer_scaling':
+            builder_config.apply_query_key_layer_scaling,
+            'rotary_pct': build_config['rotary_pct'],
+            'moe_num_experts': build_config["moe_num_experts"],
+            'moe_top_k': build_config["moe_top_k"],
+        }
+        config = PretrainedConfig.from_dict(config)
+        tensorrt_llm_model = tensorrt_llm.models.GPTForCausalLM(config)
     elif family == "opt":
         config = {
             'architecture': 'OPTForCausalLM',
@@ -374,6 +391,8 @@ def build_gpt(args):
             else build_config['num_kv_heads'],
             'hidden_size':
             build_config['hidden_size'],
+            'intermediate_size':
+            build_config['inter_size'],
             'vocab_size':
             build_config['vocab_size'],
             'position_embedding_type':
@@ -731,10 +750,14 @@ def build_gpt(args):
             'num_hidden_layers': build_config['num_layers'],
             'num_attention_heads': build_config['num_heads'],
             'hidden_act': build_config['hidden_act'],
-            "ssm_cfg": {},
-            "rms_norm": True,
-            "residual_in_fp32": True,
-            "pad_vocab_size_multiple": 8,
+            'ssm_cfg': {
+                'd_state': build_config['mamba_d_state'],
+                'd_conv': build_config['mamba_d_conv'],
+                'expand': build_config['mamba_expand']
+            },
+            'rms_norm': True,
+            'residual_in_fp32': True,
+            'pad_vocab_size_multiple': 8,
         }
         config = PretrainedConfig.from_dict(config)
         tensorrt_llm_model = tensorrt_llm.models.MambaLMHeadModel(config)
@@ -742,7 +765,10 @@ def build_gpt(args):
         raise Exception(f'Unexpected model: {args.model}')
 
     quant_kwargs = {}
-    if family not in ['opt', 'bloom', 'falcon', 'llama', 'gptj', 'internlm']:
+    if family not in [
+            'gpt', 'opt', 'bloom', 'falcon', 'llama', 'internlm', 'gptneox',
+            'gptj', 'mamba', 'baichuan', 'chatglm', 'chatglm2', 'chatglm3'
+    ]:
         tensorrt_llm_model = quantize_model(tensorrt_llm_model, quant_mode,
                                             **quant_kwargs)
 
@@ -768,11 +794,7 @@ def build_gpt(args):
 
         # Quantization plugins.
         if use_smooth_quant:
-            network.plugin_config.set_smooth_quant_gemm_plugin(dtype=args.dtype)
-            network.plugin_config.set_layernorm_quantization_plugin(
-                dtype=args.dtype)
-            network.plugin_config.set_quantize_tensor_plugin()
-            network.plugin_config.set_quantize_per_token_plugin()
+            network.plugin_config.set_smooth_quant_plugins(dtype=args.dtype)
         elif use_weight_only:
             network.plugin_config.set_weight_only_quant_matmul_plugin(
                 dtype=args.dtype)
@@ -805,7 +827,7 @@ def build_gpt(args):
             use_cache=True,
             max_beam_width=max_beam_width)
         if family in [
-                'opt', 'bloom', 'falcon', 'llama', 'internlm', 'gptneox',
+                'gpt', 'opt', 'bloom', 'falcon', 'llama', 'internlm', 'gptneox',
                 'gptj', 'mamba', 'baichuan', 'chatglm', 'chatglm2', 'chatglm3'
         ]:
             tensorrt_llm_model(**inputs)
@@ -874,7 +896,8 @@ def build_bert(args):
         max_position_embeddings=build_config['n_positions'],
         max_batch_size=max_batch_size,
         max_input_len=max_input_len,
-        opt_level=build_config['builder_opt'])
+        opt_level=build_config['builder_opt'],
+        strongly_typed=args.strongly_typed)
     engine_name = get_engine_name(args.model, args.dtype, world_size,
                                   runtime_rank)
 

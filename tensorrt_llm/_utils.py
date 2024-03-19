@@ -13,11 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
+import gc
 import json
 import math
 import struct
 import tarfile
 import weakref
+from dataclasses import asdict
 from functools import partial
 from pathlib import Path, PosixPath
 from typing import Any, Dict, List, Optional, Union
@@ -49,11 +51,11 @@ def torch_to_numpy(x: torch.Tensor):
 
 def numpy_to_torch(x):
     if x.dtype == np_bfloat16:
-        return torch.tensor(x.view(np.int16)).view(torch.bfloat16)
+        return torch.from_numpy(x.view(np.int16)).view(torch.bfloat16)
     elif x.dtype == np_float8:
-        return torch.tensor(x.view(np.int8)).view(torch.float8_e4m3fn)
+        return torch.from_numpy(x.view(np.int8)).view(torch.float8_e4m3fn)
     else:
-        return torch.tensor(x)
+        return torch.from_numpy(x)
 
 
 def numpy_to_dtype(x, dtype: str):
@@ -424,3 +426,45 @@ def set_obj_attrs(
         assert not hasattr(
             obj, key), (f"Overwriting existing tensor attribute: {key}")
         setattr(obj, key, value)
+
+
+def release_gc():
+    ''' Release memory allocated by PyTorch and Python garbage collector explicitly and immediately.
+    This could be used when some states might be kept in memory even after the variables are deleted.
+    '''
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+
+class DictConversion:
+
+    @classmethod
+    def from_dict(cls, config: Dict[str, Any]):
+        obj = cls()
+        fields = obj.__dataclass_fields__
+        for key, value in config.items():
+            assert hasattr(obj, key)
+            field_cls = fields[key].type
+            if (isinstance(field_cls, type)
+                    and issubclass(field_cls, DictConversion)
+                    and isinstance(value, dict)):
+                value = field_cls.from_dict(value)
+            setattr(obj, key, value)
+        return obj
+
+    def to_dict(self):
+        return asdict(self)
+
+    @classmethod
+    def from_json_file(cls, file):
+        with open(file) as f:
+            return cls.from_dict(json.load(f))
+
+    def set_defaults(self, **kwargs):
+        for key, default in kwargs.items():
+            value = getattr(self, key)
+            if (value is None
+                    or (isinstance(value, (list, dict)) and len(value) == 0)):
+                setattr(self, key, default)

@@ -925,15 +925,15 @@ class TestLayer(unittest.TestCase):
                                    atol=a_tol,
                                    verbose=True)
 
-    @parameterized.expand([(1, 16, 1024, 16, 'context', 'float32'),
-                           (1, 16, 1024, 16, 'context', 'float16'),
-                           (1, 16, 1024, 16, 'context', 'bfloat16'),
-                           (1, 1, 1024, 16, 'generation', 'float32'),
-                           (1, 1, 1024, 16, 'generation', 'float16'),
-                           (1, 1, 1024, 16, 'generation', 'bfloat16')],
+    @parameterized.expand([(3, 16, 1, 1024, 16, 'context', 'float32'),
+                           (3, 16, 1, 1024, 16, 'context', 'float16'),
+                           (3, 16, 1, 1024, 16, 'context', 'bfloat16'),
+                           (3, 16, 1, 1024, 16, 'generation', 'float32'),
+                           (3, 16, 1, 1024, 16, 'generation', 'float16'),
+                           (3, 16, 1, 1024, 16, 'generation', 'bfloat16')],
                           name_func=unittest_name_func)
-    def test_mamba(self, batch_size, seq_len, d_model, d_state, req_type,
-                   dtype):
+    def test_mamba(self, batch_size, in_seq_len, out_seq_len, d_model, d_state,
+                   req_type, dtype):
 
         # Skip tests that are not supported in pre-ampere architecture
         skip_bf16_pre_ampere(dtype)
@@ -946,12 +946,32 @@ class TestLayer(unittest.TestCase):
         conv_bias = True
         bias = False
         d_inner = int(expand * d_model)
-        seqlen_offset = 0 if req_type == 'context' else seq_len
+        seqlen_offset = 0 if req_type == 'context' else in_seq_len
+        seq_len = in_seq_len if req_type == 'context' else out_seq_len
 
         # test data
         torch_dtype = str_dtype_to_torch(dtype)
         mean = 0.0
         std_dev = 0.1 if dtype == "float32" else 0.05
+
+        if req_type == 'context':
+            last_token_ids = torch.randint(1,
+                                           in_seq_len + 1,
+                                           size=(batch_size, ),
+                                           dtype=torch.int32,
+                                           device=device)
+            last_token_ids[0] = in_seq_len
+        else:
+            last_token_ids = torch.ones(size=[batch_size],
+                                        dtype=torch.int32,
+                                        device=device)
+        offsets = last_token_ids.view([batch_size, 1, 1])
+        conv_indices = torch.arange(0,
+                                    d_conv - 1,
+                                    dtype=torch.int32,
+                                    device=device).view([1, 1, d_conv - 1])
+        conv_indices = conv_indices.expand([batch_size, d_inner, d_conv - 1
+                                            ]) + offsets
 
         hidden_states = torch.empty(size=[batch_size, seq_len, d_model],
                                     dtype=torch_dtype,
@@ -980,10 +1000,9 @@ class TestLayer(unittest.TestCase):
         output = torch.zeros(size=[batch_size, seq_len, d_model],
                              dtype=torch_dtype,
                              device=device)
-        present_conv_state = torch.zeros(
-            size=[batch_size, d_inner, d_conv - 1 + seq_len],
-            dtype=torch_dtype,
-            device=device)
+        present_conv_state = torch.zeros(size=[batch_size, d_inner, d_conv - 1],
+                                         dtype=torch_dtype,
+                                         device=device)
 
         hidden_states_ref = hidden_states.detach().clone()
         if req_type == 'context':
@@ -996,7 +1015,7 @@ class TestLayer(unittest.TestCase):
                              dtype=torch_dtype,
                              device=device), conv_state),
                 dim=2).detach().clone()
-        ssm_state_ref = ssm_state.detach().clone().permute(0, 2, 1).contiguous()
+        ssm_state_ref = ssm_state.detach().clone()
 
         # get torch layer
         mamba_torch = mamba_ref(d_model,
@@ -1020,7 +1039,7 @@ class TestLayer(unittest.TestCase):
         D = torch.randn(d_inner, device=device)
         dt_bias = torch.rand(d_inner, device=device) - 4.0
 
-        mamba_torch.A.data = A.detach().clone().permute(1, 0).contiguous()
+        mamba_torch.A.data = A.detach().clone()
         mamba_torch.D.data = D.detach().clone()
         mamba_torch.dt_proj.bias.data = dt_bias.detach().clone()
 
@@ -1043,6 +1062,14 @@ class TestLayer(unittest.TestCase):
             host_request_types_tensor = Tensor(
                 name='host_request_types',
                 shape=host_request_types.shape,
+                dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+            conv_indices_tensor = Tensor(
+                name='conv_indices',
+                shape=conv_indices.shape,
+                dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+            last_token_ids_tensor = Tensor(
+                name='last_token_ids',
+                shape=last_token_ids.shape,
                 dtype=tensorrt_llm.str_dtype_to_trt('int32'))
             mamba_layer = tensorrt_llm.layers.Mamba(d_model=d_model,
                                                     d_state=d_state,
@@ -1075,7 +1102,8 @@ class TestLayer(unittest.TestCase):
                 mamba_torch.dt_proj.weight.detach().cpu())
 
             outputs = mamba_layer(hidden_states_tensor, conv_state_tensor,
-                                  ssm_state_tensor, host_request_types_tensor)
+                                  ssm_state_tensor, host_request_types_tensor,
+                                  conv_indices_tensor, last_token_ids_tensor)
             net._mark_output(outputs[0],
                              'output',
                              dtype=tensorrt_llm.str_dtype_to_trt(dtype))
@@ -1091,7 +1119,9 @@ class TestLayer(unittest.TestCase):
             'hidden_states': hidden_states,
             'conv_state': conv_state,
             'ssm_state': ssm_state,
-            'host_request_types': host_request_types
+            'host_request_types': host_request_types,
+            'conv_indices': conv_indices,
+            'last_token_ids': last_token_ids,
         }
         outputs = {
             'output': output,
@@ -1108,25 +1138,43 @@ class TestLayer(unittest.TestCase):
 
         # pytorch run
         out_ref, conv_state_ref, ssm_state_ref = mamba_torch(
-            hidden_states_ref, conv_state_ref, ssm_state_ref, seqlen_offset)
+            hidden_states_ref, last_token_ids, conv_state_ref, ssm_state_ref,
+            seqlen_offset)
 
-        ssm_state_cpu = outputs['present_ssm_state'].to(torch.float32).cpu()
-        ssm_state_cpu = ssm_state_cpu.permute(0, 2, 1).contiguous()
-        dtype_atol = {"float16": 5e-3, "float32": 2e-3, "bfloat16": 5e-2}
-        np.testing.assert_allclose(
-            out_ref.detach().to(torch.float32).cpu().numpy(),
-            outputs['output'].to(torch.float32).cpu().numpy(),
-            atol=dtype_atol[dtype])
+        dtype_atol = {"float16": 5e-3, "float32": 3e-3, "bfloat16": 5e-2}
 
-        np.testing.assert_allclose(
-            conv_state_ref[:, :, 1:].detach().to(torch.float32).cpu().numpy(),
-            outputs['present_conv_state'][:, :,
-                                          -3:].to(torch.float32).cpu().numpy(),
-            atol=dtype_atol[dtype])
+        # get out_mask
+        if req_type == 'context':
+            out_mask = torch.zeros(batch_size, seq_len, device=device)
+            for i in range(batch_size):
+                for j in range(last_token_ids[i]):
+                    out_mask[i, j] = 1
+            out_mask = out_mask.unsqueeze(2).expand(
+                [batch_size, seq_len, d_model])
+        else:
+            out_mask = torch.ones(batch_size, seq_len, d_model, device=device)
 
-        np.testing.assert_allclose(ssm_state_ref.detach().to(
-            torch.float32).cpu().numpy(),
-                                   ssm_state_cpu.numpy(),
+        # compare out diff
+        out_ref = (out_ref * out_mask).detach().to(torch.float32).cpu().numpy()
+        outputs['output'][out_mask == 0] = 0
+        out_trt_llm = outputs['output'].to(torch.float32).cpu().numpy()
+        np.testing.assert_allclose(out_ref, out_trt_llm, atol=dtype_atol[dtype])
+
+        # compare conv state diff
+        conv_state_ref = conv_state_ref[:, :, 1:].detach().to(
+            torch.float32).cpu().numpy()
+        conv_state_trt_llm = outputs['present_conv_state'].detach().to(
+            torch.float32).cpu().numpy()
+        np.testing.assert_allclose(conv_state_ref,
+                                   conv_state_trt_llm,
+                                   atol=dtype_atol[dtype])
+
+        # compare ssm state diff
+        ssm_state_ref = ssm_state_ref.detach().to(torch.float32).cpu().numpy()
+        ssm_state_trt_llm = outputs['present_ssm_state']
+        ssm_state_trt_llm = ssm_state_trt_llm.to(torch.float32).cpu().numpy()
+        np.testing.assert_allclose(ssm_state_ref,
+                                   ssm_state_trt_llm,
                                    atol=dtype_atol[dtype])
 
 

@@ -70,7 +70,7 @@ test_wo_int8() {
 }
 
 test_sq() {
-    python3 convert_checkpoint.py --model_dir ${MODEL} --output_dir ./tllm_checkpoint/sq --dtype float16 --smoothquant 0.5
+    python3 convert_checkpoint.py --model_dir ${MODEL} --output_dir ./tllm_checkpoint/sq --dtype float16 --smoothquant 0.5 --int8_kv_cache
     trtllm-build --checkpoint_dir ./tllm_checkpoint/sq  --output_dir ./trt_engines/sq  --gemm_plugin float16
     python ../summarize.py --test_trt_llm --hf_model_dir ${MODEL}  --data_type fp16  --engine_dir trt_engines/sq  --test_hf
 }
@@ -84,7 +84,8 @@ test_gptq() {
                                  --use_weight_only \
                                  --weight_only_precision int4_gptq \
                                  --per_group \
-                                 --tp_size 2
+                                 --tp_size 2 \
+                                 --workers 2
 
     trtllm-build --checkpoint_dir ./tllm_checkpoint/2gpu_gptq \
              --output_dir ./trt_engines/gptq \
@@ -103,13 +104,13 @@ test_lora() {
     python convert_checkpoint.py --model_dir /home/scratch.trt_llm_data/llm-models/llama-models-v2/llama-v2-13b-hf \
                          --output_dir ./tllm_checkpoint/2gpu_lora \
                          --dtype float16 \
-                         --tp_size 2 \
-                         --hf_lora_dir ${hf_lora_dir}
+                         --tp_size 2
 
     trtllm-build --checkpoint_dir   ./tllm_checkpoint/2gpu_lora \
             --output_dir ./trt_engines/llama-v2-13b-with-lora \
             --gemm_plugin float16 \
             --lora_plugin float16 \
+            --lora_dir ${hf_lora_dir} \
             --max_batch_size 1 \
             --max_input_len 512 \
             --max_output_len 50
@@ -118,8 +119,7 @@ test_lora() {
     python ../run.py --engine_dir ./trt_engines/llama-v2-13b-with-lora \
               --max_output_len 50 \
               --tokenizer_dir ${hf_lora_dir} \
-              --input_text "今天天气很好，我到公园的时后，" \
-              --lora_dir ${hf_lora_dir} \
+              --input_text "今天天气很好，我到公园的时候，" \
               --lora_task_uids 0 \
               --no_add_special_tokens \
               --use_py_session
@@ -128,7 +128,7 @@ test_lora() {
 test_mixtral() {
     python convert_checkpoint.py --model_dir /home/scratch.trt_llm_data/llm-models/Mixtral-8x7B-v0.1/ \
                                  --output_dir ./tllm_checkpoint/mixtral_2gpu \
-                                 --dtype float16 --load_model_on_cpu \
+                                 --dtype float16 \
                                  --pp_size 2 \
 
     trtllm-build --checkpoint_dir ./tllm_checkpoint/mixtral_2gpu \

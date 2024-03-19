@@ -76,6 +76,10 @@ public:
     std::optional<tc::Tensor> parent_ids; // [max_seq_len, batch_size * beam_width], necessary in beam search
 
     tc::Tensor output_ids_ptr;            // [batch_size] int* (2-d array), each int* has [beam_width, max_seq_len]
+
+    // Medusa params
+    std::optional<tc::Tensor> nextDraftTokens; // [batch_size, max_draft_tokens_per_step]
+    std::optional<tc::Tensor> acceptedLengths; // [batch_size]
 };
 
 } // namespace tensorrt_llm::layers

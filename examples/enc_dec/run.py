@@ -118,8 +118,6 @@ def read_config(config_path: Path):
         max_prompt_embedding_table_size=max_prompt_embedding_table_size,
         lora_plugin=use_lora_plugin,
         lora_target_modules=builder_config.get('lora_target_modules'),
-        hf_modules_to_trtllm_modules=builder_config.get(
-            'hf_modules_to_trtllm_modules'),
         trtllm_modules_to_hf_modules=builder_config.get(
             'trtllm_modules_to_hf_modules'),
         skip_cross_qkv=skip_cross_qkv,

@@ -1,12 +1,12 @@
 # Qwen
 
-This document shows how to build and run a Qwen model in TensorRT-LLM on both single GPU, single node multi-GPU and multi-node multi-GPU.
+This document shows how to build and run a Qwen model in TensorRT-LLM on both single GPU, single node multi-GPU.
 
 ## Overview
 
 The TensorRT-LLM Qwen implementation can be found in [model.py](../../tensorrt_llm/models/qwen/model.py). The TensorRT-LLM Qwen example code is located in [`examples/qwen`](./). There is one main file:
 
-* [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the Qwen model.
+* [`convert_checkpoint.py`](./convert_checkpoint.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the Qwen model.
 
 In addition, there are two shared files in the parent folder [`examples`](../) for inference and evaluation:
 
@@ -16,13 +16,13 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 ## Support Matrix
 |    Model Name    | FP16  | FMHA  |  WO   |  AWQ  | GPTQ  |  SQ   |  TP   | PP  |  ST   | C++ Runtime | benchmark |  IFB  |   Arch  |
 | :--------------: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |:---:|:---:  | :---------: | :-------: | :---: |  :---:  |
-|   Qwen-7B-Chat   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |  Y  |   Y   |      Y      |     Y     |   Y   | Ampere+ |
-|  Qwen-14B-Chat   |   Y   |   Y   |   Y   |  Y*   |   Y   |   Y   |   Y   |  Y  |   Y   |      Y      |     Y     |   Y   | Ampere+ |
-|  Qwen-72B-Chat   |   Y   |   Y   |   Y   |   -   |   Y   |   Y   |   Y   |  Y  |   Y   |      Y      |     Y     |   Y   | Ampere+ |
+|   Qwen-7B(-Chat)   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |  Y  |   Y   |      Y      |     Y     |   Y   | Ampere+ |
+|  Qwen-14B(-Chat)   |   Y   |   Y   |   Y   |  Y*   |   Y   |   Y   |   Y   |  Y  |   Y   |      Y      |     Y     |   Y   | Ampere+ |
+|  Qwen-72B(-Chat)   |   Y   |   Y   |   Y   |   -   |   Y   |   Y   |   Y   |  Y  |   Y   |      Y      |     Y     |   Y   | Ampere+ |
 
 *Please note that Qwen-14B-Chat model supports AWQ only with single GPU.
 * Model Name: the name of the model, the same as the name on HuggingFace
-* FMHA: Fused MultiHead Attention (see introduction below)
+* FMHA: Fused MultiHead Attention
 * WO: Weight Only Quantization (int8 / int4)
 * AWQ: Activation Aware Weight Quantization (int4)
 * GPTQ: Generative Pretrained Transformer Quantization (int4)
@@ -30,9 +30,9 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 * TP: Tensor Parallel
 * PP: Pipeline Parallel
 * ST: Strongly Typed
-* IFB: In-flight Batching (see introduction below)
+* IFB: In-flight Batching
 
-*Currently Qwen models does not support dynamic NTK and logn attention. Therefore, accuracy on long sequence input is not promised.
+*Currently Qwen models does not support dynamic NTK and logn attention. Therefore, accuracy on long sequence input for the 7B and 14B model is not promised.
 
 ## Usage
 
@@ -40,215 +40,139 @@ The TensorRT-LLM Qwen example code locates at [examples/qwen](./). It takes HF w
 
 ### Build TensorRT engine(s)
 
-Need to prepare the HF Qwen checkpoint first by following the guides here [Qwen-7B-Chat](https://huggingface.co/Qwen/Qwen-7B-Chat) or [Qwen-14B-Chat](https://huggingface.co/Qwen/Qwen-14B-Chat)
+Need to prepare the HF Qwen checkpoint first by following the guides here [Qwen-7B-Chat](https://huggingface.co/Qwen/Qwen-7B-Chat)
 
-Create a `tmp/Qwen` directory to store the weights downloaded from huaggingface.
-```bash
-mkdir -p ./tmp/Qwen
-```
+TensorRT-LLM builds TensorRT engine(s) from HF checkpoint. If no checkpoint directory is specified, TensorRT-LLM will build engine(s) with dummy weights.
 
-Store Qwen-7B-Chat or Qwen-14B-Chat separately.
-- for Qwen-7B-Chat
-```bash
-mv Qwen-7B-Chat ./tmp/Qwen/7B
-```
-- for Qwen-14B-Chat
-```
-mv Qwen-14B-Chat ./tmp/Qwen/14B
-```
-
-TensorRT-LLM Qwen builds TensorRT engine(s) from HF checkpoint. If no checkpoint directory is specified, TensorRT-LLM will build engine(s) with dummy weights.
-
-Normally `build.py` only requires single GPU, but if you've already got all the GPUs needed for inference, you could enable parallel-building to make the engine building process faster by adding `--parallel_build` argument. Please note that currently `parallel_build` feature only supports single node.
+Normally `trtllm-build` only requires single GPU, but if you've already got all the GPUs needed while inferencing, you could enable parallelly building to make the engine building process faster by adding `--workers` argument. Please note that currently `workers` feature only supports single node.
 
 Here're some examples:
 
 ```bash
 # Build a single-GPU float16 engine from HF weights.
-# use_gpt_attention_plugin is necessary in Qwen.
 # Try use_gemm_plugin to prevent accuracy issue.
-# It is recommend to use --remove_input_padding along with --use_gpt_attention_plugin for better performance
 
-# Build the Qwen 7B model using a single GPU and FP16.
-python build.py --model_dir ./tmp/Qwen/7B/ \
-                --dtype float16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin float16 \
-                --enable_context_fmha \
-                --use_gemm_plugin float16 \
-                --output_dir ./tmp/Qwen/7B/trt_engines/fp16/1-gpu/
+# Build the Qwen-7B-Chat model using a single GPU and FP16.
+python convert_checkpoint.py --model_dir ./tmp/Qwen/7B/ \
+                              --output_dir ./tllm_checkpoint_1gpu_fp16 \
+                              --dtype float16
 
-# Build the Qwen 7B model using a single GPU and BF16.
-python build.py --model_dir ./tmp/Qwen/7B/ \
-                --dtype bfloat16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin bfloat16 \
-                --enable_context_fmha \
-                --use_gemm_plugin bfloat16 \
-                --output_dir ./tmp/Qwen/7B/trt_engines/bf16/1-gpu/
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_fp16 \
+            --output_dir ./tmp/qwen/7B/trt_engines/fp16/1-gpu \
+            --gemm_plugin float16
 
-# Build the Qwen 7B model using a single GPU and apply INT8 weight-only quantization.
-python build.py --model_dir ./tmp/Qwen/7B/ \
-                --dtype float16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin float16 \
-                --use_gemm_plugin float16 \
-                --use_weight_only \
-                --weight_only_precision int8 \
-                --output_dir ./tmp/Qwen/7B/trt_engines/int8_weight_only/1-gpu/
+# Build the Qwen-7B-Chat model using a single GPU and BF16.
+python convert_checkpoint.py --model_dir ./tmp/Qwen/7B/ \
+                              --output_dir ./tllm_checkpoint_1gpu_bf16 \
+                              --dtype bfloat16
 
-# Build the Qwen 7B model using a single GPU and apply INT4 weight-only quantization.
-python build.py --model_dir ./tmp/Qwen/7B/ \
-                --dtype float16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin float16 \
-                --use_gemm_plugin float16 \
-                --use_weight_only \
-                --weight_only_precision int4 \
-                --output_dir ./tmp/Qwen/7B/trt_engines/int4_weight_only/1-gpu/
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_bf16 \
+            --output_dir ./tmp/qwen/7B/trt_engines/bf16/1-gpu \
+            --gpt_attention_plugin bfloat16 \
+            --gemm_plugin bfloat16
 
-# Build Qwen 7B using 2-way tensor parallelism.
-python build.py --model_dir ./tmp/Qwen/7B/ \
-                --dtype float16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin float16 \
-                --enable_context_fmha \
-                --use_gemm_plugin float16 \
-                --output_dir ./tmp/Qwen/7B/trt_engines/fp16/2-gpu/ \
-                --world_size 2 \
-                --tp_size 2
+# Build the Qwen-7B-Chat model using a single GPU and apply INT8 weight-only quantization.
+python convert_checkpoint.py --model_dir ./tmp/Qwen/7B/ \
+                              --output_dir ./tllm_checkpoint_1gpu_fp16_wq \
+                              --dtype float16 \
+                              --use_weight_only \
+                              --weight_only_precision int8
 
-# Build Qwen 7B using 2-way tensor parallelism and 2-way pipeline parallelism.
-python build.py --model_dir ./tmp/Qwen/7B/ \
-                --dtype float16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin float16 \
-                --enable_context_fmha \
-                --use_gemm_plugin float16 \
-                --output_dir ./tmp/Qwen/7B/trt_engines/fp16/2-gpu/ \
-                --world_size 4 \
-                --tp_size 2 \
-                --pp_size 2
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_fp16_wq \
+            --output_dir ./tmp/qwen/7B/trt_engines/weight_only/1-gpu/ \
+            --gemm_plugin float16
 
-# Build Qwen 14B using 2-way tensor parallelism.
-python build.py --model_dir ./tmp/Qwen/14B \
-                --dtype float16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin float16 \
-                --enable_context_fmha \
-                --use_gemm_plugin float16 \
-                --output_dir ./tmp/Qwen/14B/trt_engines/fp16/2-gpu/ \
-                --world_size 2 \
-                --tp_size 2
+# Build the Qwen-7B-Chat model using a single GPU and apply INT4 weight-only quantization.
+python convert_checkpoint.py --model_dir ./tmp/Qwen/7B/ \
+                              --output_dir ./tllm_checkpoint_1gpu_fp16_wq \
+                              --dtype float16 \
+                              --use_weight_only \
+                              --weight_only_precision int4
 
-# Build Qwen 72B using 8-way tensor parallelism.
-python build.py --model_dir ./tmp/Qwen/72B \
-                --dtype float16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin float16 \
-                --enable_context_fmha \
-                --use_gemm_plugin float16 \
-                --output_dir ./tmp/Qwen/72B/trt_engines/fp16/8-gpu/ \
-                --world_size 8 \
-                --tp_size 8
-```
-**Demo output of engine building:**
-```python
-python3 build.py --model_dir /llm-models/Qwen-7B-Chat/ --output_dir /engine_qwen
-```
-```
-[11/09/2023-00:57:06] [TRT-LLM] [I] Serially build TensorRT engines.
-[11/09/2023-00:57:06] [TRT] [I] [MemUsageChange] Init CUDA: CPU +14, GPU +0, now: CPU 118, GPU 427 (MiB)
-[11/09/2023-00:57:08] [TRT] [I] [MemUsageChange] Init builder kernel library: CPU +1974, GPU +350, now: CPU 2227, GPU 777 (MiB)
-[11/09/2023-00:57:08] [TRT-LLM] [W] Invalid timing cache, using freshly created one
-[11/09/2023-00:57:14] [TRT-LLM] [I] Loading HF QWen ... from /llm-models/Qwen-7B-Chat/
-......
-[11/09/2023-01:01:34] [TRT] [I] [MemUsageStats] Peak memory usage during Engine building and serialization: CPU: 47322 MiB
-[11/09/2023-01:01:34] [TRT-LLM] [I] Total time of building qwen_float16_tp1_rank0.engine: 00:03:44
-[11/09/2023-01:01:34] [TRT-LLM] [I] Config saved to /engine_qwen/config.json.
-[11/09/2023-01:01:34] [TRT-LLM] [I] Serializing engine to /engine_qwen/qwen_float16_tp1_rank0.engine...
-[11/09/2023-01:01:49] [TRT-LLM] [I] Engine serialized. Total time: 00:00:14
-[11/09/2023-01:01:49] [TRT-LLM] [I] Timing cache serialized to /engine_qwen/model.cache
-[11/09/2023-01:01:50] [TRT-LLM] [I] Total time of building all 1 engines: 00:04:43
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_fp16_wq \
+            --output_dir ./tmp/qwen/7B/trt_engines/weight_only/1-gpu/ \
+            --gemm_plugin float16
+
+# Build Qwen-7B-Chat using 2-way tensor parallelism.
+python convert_checkpoint.py --model_dir ./tmp/Qwen/7B/ \
+                            --output_dir ./tllm_checkpoint_2gpu_tp2 \
+                            --dtype float16 \
+                            --tp_size 2
+
+trtllm-build --checkpoint_dir ./tllm_checkpoint_2gpu_tp2 \
+            --output_dir ./tmp/qwen/7B/trt_engines/fp16/2-gpu/ \
+            --gemm_plugin float16
+
+# Build Qwen-7B-Chat using 2-way tensor parallelism and 2-way pipeline parallelism.
+python convert_checkpoint.py --model_dir ./tmp/Qwen/7B/ \
+                            --output_dir ./tllm_checkpoint_4gpu_tp2_pp2 \
+                            --dtype float16 \
+                            --tp_size 2 \
+                            --pp_size 2
+trtllm-build --checkpoint_dir ./tllm_checkpoint_4gpu_tp2_pp2 \
+            --output_dir ./tmp/qwen/7B/trt_engines/fp16/4-gpu/ \
+            --gemm_plugin float16
+
+# Build Qwen-14B-Chat using 2-way tensor parallelism.
+python convert_checkpoint.py --model_dir ./tmp/Qwen/14B/ \
+                            --output_dir ./tllm_checkpoint_2gpu_tp2 \
+                            --dtype float16 \
+                            --tp_size 2
+
+trtllm-build --checkpoint_dir ./tllm_checkpoint_2gpu_tp2 \
+            --output_dir ./tmp/qwen/14B/trt_engines/fp16/2-gpu/ \
+            --gemm_plugin float16 \
+
+# Build Qwen-72B-Chat using 8-way tensor parallelism.
+python convert_checkpoint.py --model_dir ./tmp/Qwen/72B/ \
+                            --output_dir ./tllm_checkpoint_8gpu_tp8 \
+                            --dtype float16 \
+                            --tp_size 8
+
+trtllm-build --checkpoint_dir ./tllm_checkpoint_8gpu_tp8 \
+            --output_dir ./tmp/qwen/72B/trt_engines/fp16/8-gpu/ \
+            --gemm_plugin float16 \
 ```
 
+#### INT8 KV cache
+INT8 KV cache could be enabled to reduce memory footprint. It will bring more performance gains when batch size gets larger.
 
-#### INT8 weight only + INT8 KV cache
-For INT8 KV cache, [`hf_qwen_convert.py`](./hf_qwen_convert.py) features a
-`--calibrate-kv-cache, -kv` option. Setting `-kv` will calibrate the model,
-and then export the scaling factors needed for INT8 KV cache inference.
-
+For INT8 KV cache, [`convert_checkpoint.py`](./convert_checkpoint.py) features a
+`--int8_kv_cache` option. Setting `--int8_kv_cache` will calibrate the model,
+and then export the scaling factors needed for INT8 KV cache inference. Remember to set `--strongly_typed` when building the engine if you are not using INT8 weight only quantization at the same time.
 
 Example:
 
 ```bash
-python3 hf_qwen_convert.py \
-    -i ./tmp/Qwen/7B/ \
-    -o ./tmp/Qwen/7B/int8_kv_cache/ \
-    --calibrate-kv-cache -t float16
+python convert_checkpoint.py --model_dir ./tmp/Qwen/7B/   \
+                             --output_dir ./tllm_checkpoint_1gpu_fp16_int8kv
+                             --dtype float16  \
+                             --int8_kv_cache
+
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_sq \
+             --output_dir ./engine_outputs \
+             --strongly_typed
+             --gemm_plugin float16
 ```
 
-[`build.py`](./build.py) add new options for the support of INT8 KV cache.
+[`convert_checkpoint.py`](./convert_checkpoint.py) add new options for the support of INT8 KV cache.
 
-`--int8_kv_cache` is the command-line option to enable INT8 KV cache.
-
-In addition, it could be combined with INT8 weight-only quantization, as follows:
-
-Examples of INT8 weight-only quantization + INT8 KV cache
-
-```bash
-# Build model with both INT8 weight-only and INT8 KV cache enabled
-python build.py --bin_model_dir ./tmp/Qwen/7B/int8_kv_cache/1-gpu/ \
-                --dtype float16 \
-                --model_dir ./tmp/Qwen/7B \
-                --use_gpt_attention_plugin float16 \
-                --use_gemm_plugin float16 \
-                --output_dir ./tmp/Qwen/7B/trt_engines/int8_kv_cache_weight_only/1-gpu \
-                --int8_kv_cache \
-                --use_weight_only
-```
-
-- run
-```bash
-python3 ../run.py --input_text "你好，请问你叫什么？" \
-                  --max_output_len=50 \
-                  --tokenizer_dir ./tmp/Qwen/7B/ \
-                  --engine_dir=./tmp/Qwen/7B/trt_engines/int8_kv_cache_weight_only/1-gpu
-```
-
-Test with `../summarize.py`:
-
-
-- validate huggingface
-```bash
-python3 ../summarize.py --test_hf \
-                        --tokenizer_dir ./tmp/Qwen/7B \
-                        --model_dir ./tmp/Qwen/7B \
-                        --max_input_length 2048 \
-                        --output_len 2048
-```
-
-- validate trt-llm
-```bash
-python3 ../summarize.py --test_trt_llm \
-                        --tokenizer_dir ./tmp/Qwen/7B \
-                        --engine_dir ./tmp/Qwen/7B/trt_engines/int8_kv_cache_weight_only/1-gpu \
-                        --max_input_length 2048 \
-                        --output_len 2048
-```
 
 #### SmoothQuant
 
-The smoothquant supports both Qwen v1 and Qwen v2. Unlike the FP16 build where the HF weights are processed and loaded into the TensorRT-LLM directly, the SmoothQuant needs to load INT8 weights which should be pre-processed before building an engine.
+The smoothquant supports Qwen models. Unlike the FP16 build where the HF weights are processed and loaded into the TensorRT-LLM directly, the SmoothQuant needs to load INT8 weights which should be pre-processed before building an engine.
 
 Example:
 ```bash
-python3 hf_qwen_convert.py -i ./tmp/Qwen/7B -o ./tmp/Qwen/7B/sq0.5/ -sq 0.5 --tensor-parallelism 1 --storage-type float16
+python3 convert_checkpoint.py --model_dir ./tmp/Qwen/7B/ --output_dir ./tllm_checkpoint_1gpu_sq --dtype float16 --smoothquant 0.5
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_sq \
+             --output_dir ./engine_outputs \
+             --gemm_plugin float16
 ```
 
-[`build.py`](./build.py) add new options for the support of INT8 inference of SmoothQuant models.
+[`convert_checkpoint.py`](./convert_checkpoint.py) add new options for the support of INT8 inference of SmoothQuant models.
 
-`--use_smooth_quant` is the starting point of INT8 inference. By default, it
+`--smoothquant` is the starting point of INT8 inference. By default, it
 will run the model in the _per-tensor_ mode.
 
 Then, you can add any combination of `--per-token` and `--per-channel` to get the corresponding behaviors.
@@ -257,99 +181,36 @@ Examples of build invocations:
 
 ```bash
 # Build model for SmoothQuant in the _per_token_ + _per_channel_ mode
-python3 build.py --bin_model_dir=./tmp/Qwen/7B/sq0.5/1-gpu/ \
-                 --use_gpt_attention_plugin float16 \
-                 --remove_input_padding \
-                 --enable_context_fmha \
-                 --use_smooth_quant \
-                 --per_token \
-                 --per_channel \
-                 --model_dir ./tmp/Qwen/7B \
-                 --output_dir ./tmp/Qwen/7B/trt_engines/sq0.5/1-gpu/
+python3 convert_checkpoint.py --model_dir ./tmp/Qwen/7B/ \
+                              --output_dir ./tllm_checkpoint_1gpu_sq \
+                              --dtype float16 \
+                              --smoothquant 0.5 \
+                              --per_token \
+                              --per_channel
+
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_sq \
+             --output_dir ./engine_outputs \
+             --gemm_plugin float16
 ```
 
-- run
-```bash
-python3 ../run.py --input_text "你好，请问你叫什么？" \
-                  --max_output_len=50 \
-                  --tokenizer_dir ./tmp/Qwen/7B/ \
-                  --engine_dir=./tmp/Qwen/7B/trt_engines/sq0.5/1-gpu/
-```
-
-- summarize
-```bash
-python ../summarize.py --test_trt_llm \
-                       --tokenizer_dir ./tmp/Qwen/7B/ \
-                       --data_type fp16 \
-                       --engine_dir=./tmp/Qwen/7B/trt_engines/sq0.5/1-gpu/ \
-                       --max_input_length 2048 \
-                       --output_len 2048
-```
 #### INT4-GPTQ
-To run the GPTQ Qwen example, the following steps are required:
-1. Install auto-gptq module:
+You may find the official GPTQ quantized INT4 weights of Qwen-7B-Chat here: [Qwen-7B-Chat-Int4](https://huggingface.co/Qwen/Qwen-7B-Chat-Int4). And you need to first install auto-gptq:
 ```bash
 pip install auto-gptq
 ```
 
-2. Download quantized weights, for Qwen-7B-Chat, you can find it [here](https://huggingface.co/Qwen/Qwen-7B-Chat-Int4):
+Example of building engine for INT4 GPTQ quantized Qwen model:
 ```bash
-git lfs install
-git clone https://huggingface.co/Qwen/Qwen-7B-Chat-Int4
-```
+python3 convert_checkpoint.py --model_dir ./tmp/Qwen-7B-Chat-Int4 \
+                              --output_dir ./tllm_checkpoint_1gpu_gptq \
+                              --dtype float16 \
+                              --use_weight_only \
+                              --weight_only_precision int4_gptq \
+                              --per_group \
 
-3. Build TRT-LLM engine:
-```bash
-python build.py --model_dir Qwen-7B-Chat-Int4 \
-                --quant_ckpt_path Qwen-7B-Chat-Int4 \
-                --dtype float16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin float16 \
-                --enable_context_fmha \
-                --use_gemm_plugin float16 \
-                --use_weight_only \
-                --weight_only_precision int4_gptq \
-                --per_group \
-                --world_size 1 \
-                --tp_size 1 \
-                --output_dir ./tmp/Qwen/7B/trt_engines/int4-gptq/1-gpu
-```
-
-4. Run int4-gptq
-```bash
-python3 ../run.py --input_text "你好，请问你叫什么？" \
-                  --max_output_len=50 \
-                  --tokenizer_dir Qwen-7B-Chat-Int4 \
-                  --engine_dir=./tmp/Qwen/7B/trt_engines/int4-gptq/1-gpu
-```
-```
-......
-Input [Text 0]: "<|im_start|>system
-You are a helpful assistant.<|im_end|>
-<|im_start|>user
-你好，请问你叫什么？<|im_end|>
-<|im_start|>assistant
-"
-Output [Text 0 Beam 0]: "你好，我是通义千问，由阿里云开发。"
-```
-
-5. Summarize
-- validate huggingface
-```bash
-python3 ../summarize.py --test_hf \
-                        --tokenizer_dir ./tmp/Qwen/7B \
-                        --model_dir ./tmp/Qwen/7B \
-                        --max_input_length 2048 \
-                        --output_len 2048
-```
-
-- validate trt-llm
-```bash
-python3 ../summarize.py --test_trt_llm \
-                        --tokenizer_dir ./tmp/Qwen/7B \
-                        --engine_dir ./tmp/Qwen/7B/trt_engines/int4-gptq/1-gpu \
-                        --max_input_length 2048 \
-                        --output_len 2048
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_gptq \
+                --output_dir ./tmp/Qwen/7B/trt_engines/int4_GPTQ/1-gpu/ \
+                --gemm_plugin float16
 ```
 
 #### INT4-AWQ
@@ -358,70 +219,27 @@ To run the AWQ Qwen example, the following steps are required:
 
     NVIDIA AMMO toolkit is used for AWQ weight quantization. Please see [examples/quantization/README.md](/examples/quantization/README.md#preparation) for AMMO installation instructions.
 
-```bash
-python3 ../quantization/quantize.py --model_dir ./tmp/Qwen/7B \
-                                    --dtype float16 \
-                                    --qformat int4_awq \
-                                    --output_dir ./qwen_7b_4bit_gs128_awq.pt \
-                                    --calib_size 32
-```
+    ```bash
+    # Quantize Qwen-7B-Chat checkpoint into INT4 AWQ format
+    python ../quantization/quantize.py --model_dir ./tmp/Qwen/7B/ \
+                                       --dtype float16 \
+                                       --qformat int4_awq \
+                                       --awq_block_size 128 \
+                                       --output_dir ./quantized_int4-awq \
+                                       --calib_size 32
+    ```
 
-2. TRT-LLM engine:
-```bash
-python build.py --model_dir ./tmp/Qwen/7B \
-                --quant_ckpt_path ./qwen_7b_4bit_gs128_awq.pt \
-                --dtype float16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin float16 \
-                --enable_context_fmha \
-                --use_gemm_plugin float16 \
-                --use_weight_only \
-                --weight_only_precision int4_awq \
-                --per_group \
-                --world_size 1 \
-                --tp_size 1 \
-                --output_dir ./tmp/Qwen/7B/trt_engines/int4-awq/1-gpu
-```
-3. Run int4-awq
-```bash
-python3 ../run.py --input_text "你好，请问你叫什么？" \
-                  --max_output_len=50 \
-                  --tokenizer_dir ./tmp/Qwen/7B/ \
-                  --engine_dir=./tmp/Qwen/7B/trt_engines/int4-awq/1-gpu
-```
-```
-......
-Input [Text 0]: "<|im_start|>system
-You are a helpful assistant.<|im_end|>
-<|im_start|>user
-你好，请问你叫什么？<|im_end|>
-<|im_start|>assistant
-"
-Output [Text 0 Beam 0]: "你好，我叫通义千问，是由阿里云开发的AI助手。有什么我可以帮助你的吗？"
-```
+2. Build TRT-LLM engine:
 
-4. Summarize
-- validate huggingface
-```bash
-python3 ../summarize.py --test_hf \
-                        --tokenizer_dir ./tmp/Qwen/7B \
-                        --model_dir ./tmp/Qwen/7B \
-                        --max_input_length 2048 \
-                        --output_len 2048
-```
-
-- validate trt-llm
-```bash
-python3 ../summarize.py --test_trt_llm \
-                        --tokenizer_dir ./tmp/Qwen/7B \
-                        --engine_dir ./tmp/Qwen/7B/trt_engines/int4-awq/1-gpu \
-                        --max_input_length 2048 \
-                        --output_len 2048
-```
+    ```bash
+    trtllm-build --checkpoint_dir ./quantized_int4-awq \
+                 --output_dir ./tmp/qwen/7B/trt_engines/int4_AWQ/1-gpu/ \
+                 --gemm_plugin float16
+    ```
 
 ### Run
 
-To run a TensorRT-LLM Qwen model using the engines generated by build.py
+To run a TensorRT-LLM Qwen model using the engines generated by `trtllm-build`
 
 ```bash
 # With fp16 inference
@@ -441,40 +259,77 @@ python3 ../run.py --input_text "你好，请问你叫什么？" \
                   --max_output_len=50 \
                   --tokenizer_dir ./tmp/Qwen/7B/ \
                   --engine_dir=./tmp/Qwen/7B/trt_engines/int8_weight_only/1-gpu/
-
-# With int4 weight only inference
-python3 ../run.py --input_text "你好，请问你叫什么？" \
-                  --max_output_len=50 \
-                  --tokenizer_dir ./tmp/Qwen/7B/ \
-                  --engine_dir=./tmp/Qwen/7B/trt_engines/int4_weight_only/1-gpu/
-
-# Run 72B model with 8-gpu
-mpirun -n 8 --allow-run-as-root \
-    python ../run.py --input_text "What is your name?" \
-                     --max_output_len=50 \
-                     --tokenizer_dir ./tmp/Qwen/72B/ \
-                     --engine_dir=./tmp/Qwen/72B/trt_engines/fp16/8-gpu/
 ```
-
-**Demo output of run.py:**
-```bash
-python3 ../run.py --input_text "你好，请问你叫什么？" \
-                  --max_output_len=50 \
-                  --tokenizer_dir /llm-models/Qwen-7B-Chat/ \
-                  --engine_dir /engine_qwen
 ```
-
-```
-Loading engine from /engine_qwen/qwen_float16_tp1_rank0.engine
-Input: "<|im_start|>system
+Input [Text 0]: "<|im_start|>system
 You are a helpful assistant.<|im_end|>
 <|im_start|>user
 你好，请问你叫什么？<|im_end|>
 <|im_start|>assistant
 "
-Output: "我是来自阿里云的大规模语言模型，我叫通义千问。"
+Output [Text 0 Beam 0]: "你好，我是来自阿里云的大规模语言模型，我叫通义千问。<|im_end|>
+<|im_start|>
+<|im_start|>
+
+"
 ```
+
 ```bash
+# With int4 weight only inference
+python3 ../run.py --input_text "你好，请问你叫什么？" \
+                  --max_output_len=50 \
+                  --tokenizer_dir ./tmp/Qwen/7B/ \
+                  --engine_dir=./tmp/Qwen/7B/trt_engines/int4_weight_only/1-gpu/
+```
+```
+Input [Text 0]: "<|im_start|>system
+You are a helpful assistant.<|im_end|>
+<|im_start|>user
+你好，请问你叫什么？<|im_end|>
+<|im_start|>assistant
+"
+Output [Text 0 Beam 0]: "我叫通义千问，是由阿里云开发的预训练语言模型。<|im_end|>
+"
+```
+
+```bash
+# With INT4 GPTQ quantization
+python3 ../run.py --input_text "你好，请问你叫什么？" \
+                  --max_output_len=50 \
+                  --tokenizer_dir ./tmp/Qwen-7B-Chat-Int4 \
+                  --engine_dir=./tmp/Qwen/7B/trt_engines/int4_GPTQ/1-gpu/
+```
+```
+Input [Text 0]: "<|im_start|>system
+You are a helpful assistant.<|im_end|>
+<|im_start|>user
+你好，请问你叫什么？<|im_end|>
+<|im_start|>assistant
+"
+Output [Text 0 Beam 0]: "你好，我是通义千问，由阿里云开发。<|im_end|>
+"
+```
+
+```bash
+# With INT4 AWQ quantization
+python3 ../run.py --input_text "你好，请问你叫什么？" \
+                  --max_output_len=50 \
+                  --tokenizer_dir ./tmp/Qwen/7B/ \
+                  --engine_dir=./tmp/Qwen/7B/trt_engines/int4_AWQ/1-gpu/
+```
+```
+Input [Text 0]: "<|im_start|>system
+You are a helpful assistant.<|im_end|>
+<|im_start|>user
+你好，请问你叫什么？<|im_end|>
+<|im_start|>assistant
+"
+Output [Text 0 Beam 0]: "你好，我是通义千问，由阿里云开发。<|im_end|>
+"
+```
+
+```bash
+# Run 72B model with 8-gpu
 mpirun -n 8 --allow-run-as-root \
     python ../run.py --input_text "What is your name?" \
                      --max_output_len=50 \
@@ -490,12 +345,13 @@ What is your name?<|im_end|>
 "
 Output [Text 0 Beam 0]: "I am QianWen, a large language model created by Alibaba Cloud."
 ```
+
 ### Summarization using the Qwen model
 
 ```bash
 # Run summarization using the Qwen 7B model in FP16.
 python ../summarize.py --test_trt_llm \
-                       --tokenizer_dir ./tmp/Qwen/7B/ \
+                       --hf_model_dir ./tmp/Qwen/7B/ \
                        --data_type fp16 \
                        --engine_dir ./tmp/Qwen/7B/trt_engines/fp16/1-gpu/ \
                        --max_input_length 2048 \
@@ -503,7 +359,7 @@ python ../summarize.py --test_trt_llm \
 
 # Run summarization using the Qwen 7B model in BF16.
 python ../summarize.py --test_trt_llm \
-                       --tokenizer_dir ./tmp/Qwen/7B/ \
+                       --hf_model_dir ./tmp/Qwen/7B/ \
                        --data_type fp16 \
                        --engine_dir ./tmp/Qwen/7B/trt_engines/bf16/1-gpu/ \
                        --max_input_length 2048 \
@@ -511,7 +367,7 @@ python ../summarize.py --test_trt_llm \
 
 # Run summarization using the Qwen 7B model quantized to INT8.
 python ../summarize.py --test_trt_llm \
-                       --tokenizer_dir  ./tmp/Qwen/7B/ \
+                       --hf_model_dir  ./tmp/Qwen/7B/ \
                        --data_type fp16 \
                        --engine_dir ./tmp/Qwen/7B/trt_engines/int8_weight_only/1-gpu/ \
                        --max_input_length 2048 \
@@ -519,7 +375,7 @@ python ../summarize.py --test_trt_llm \
 
 # Run summarization using the Qwen 7B model quantized to INT4.
 python ../summarize.py --test_trt_llm \
-                       --tokenizer_dir  ./tmp/Qwen/7B/ \
+                       --hf_model_dir  ./tmp/Qwen/7B/ \
                        --data_type fp16 \
                        --engine_dir ./tmp/Qwen/7B/trt_engines/int4_weight_only/1-gpu/ \
                        --max_input_length 2048 \
@@ -528,7 +384,7 @@ python ../summarize.py --test_trt_llm \
 # Run summarization using the Qwen 7B model in FP16 using two GPUs.
 mpirun -n 2 --allow-run-as-root \
     python ../summarize.py --test_trt_llm \
-                           --tokenizer_dir  ./tmp/Qwen/7B/ \
+                           --hf_model_dir  ./tmp/Qwen/7B/ \
                            --data_type fp16 \
                            --engine_dir ./tmp/Qwen/7B/trt_engines/fp16/2-gpu/ \
                            --max_input_length 2048 \
@@ -537,15 +393,20 @@ mpirun -n 2 --allow-run-as-root \
 # Run summarization using the Qwen 14B model in FP16 using two GPUs.
 mpirun -n 2 --allow-run-as-root \
     python ../summarize.py --test_trt_llm \
-                           --tokenizer_dir  ./tmp/Qwen/14B/ \
+                           --hf_model_dir  ./tmp/Qwen/14B/ \
                            --data_type fp16 \
                            --engine_dir ./tmp/Qwen/14B/trt_engines/fp16/2-gpu/ \
                            --max_input_length 2048 \
                            --output_len 2048
 ```
 **Demo output of summarize.py:**
-```python
-python3 ../summarize.py --test_trt_llm --tokenizer_dir /llm-models/Qwen-7B-Chat/ --engine_dir /engine_qwen --max_input_length 2048 --output_len 2048
+```bash
+python ../summarize.py --test_trt_llm \
+                       --hf_model_dir ./tmp/Qwen/7B/ \
+                       --data_type fp16 \
+                       --engine_dir ./tmp/Qwen/7B/trt_engines/fp16/1-gpu/ \
+                       --max_input_length 2048 \
+                       --output_len 2048
 ```
 ```
 [11/09/2023-02:21:10] [TRT-LLM] [I] Load tokenizer takes: 0.4043385982513428 sec

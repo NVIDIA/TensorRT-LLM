@@ -438,7 +438,7 @@ def test_llm_request():
     assert llm_request.is_streaming
     assert llm_request.pad_id == 99
     assert llm_request.end_id == 100
-    assert llm_request.seq_slot == -1  # seq_slot is still uninitialized
+    assert llm_request.seq_slot == None
     assert torch.equal(llm_request.prompt_embedding_table,
                        kwargs["prompt_embedding_table"])
     assert llm_request.prompt_vocab_size == 2
@@ -642,13 +642,16 @@ def test_KvCacheConfig_pickle():
 
 def test_TrtGptModelOptionalParams_pickle():
     cache = _tb.KvCacheConfig(free_gpu_memory_fraction=0.4)
-    params = _tb.TrtGptModelOptionalParams(
+    params1 = _tb.TrtGptModelOptionalParams(
         kv_cache_config=cache,
         enable_trt_overlap=True,
     )
-    params.enable_chunked_context = True
+    params1.enable_chunked_context = True
+    params2 = pickle.loads(pickle.dumps(params1))
 
-    params1 = pickle.dumps(params)
-    params2: _tb.TrtGptModelOptionalParams = pickle.loads(params1)
+    assert params2 == params1
 
-    assert params2 == params
+    params1 = _tb.TrtGptModelOptionalParams()
+    params2 = pickle.loads(pickle.dumps(params1))
+
+    assert params2 == params1

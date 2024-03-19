@@ -77,7 +77,7 @@ void computeProb(T* probs, T const* logits, int batchSize, int vocabSize)
 
 struct SamplingParams
 {
-    std::vector<uint32_t> topKs;
+    std::vector<runtime::SizeType> topKs;
     std::vector<float> topPs;
     std::vector<float> temperatures;
     std::vector<float> repetitionPenalties;

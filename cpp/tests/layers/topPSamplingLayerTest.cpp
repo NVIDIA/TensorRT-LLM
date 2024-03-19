@@ -20,6 +20,7 @@ namespace
 {
 
 using namespace tensorrt_llm::tests::layers::sampling;
+using namespace tensorrt_llm::runtime;
 
 template <typename T>
 class TopPSamplingLayerTest : public BaseSamplingLayerTest<T>
@@ -51,7 +52,7 @@ TYPED_TEST_SUITE(TopPSamplingLayerTest, FloatAndHalfTypes);
 
 TYPED_TEST(TopPSamplingLayerTest, TopKSkipDecode)
 {
-    uint32_t topK = 2;
+    SizeType topK = 2;
     float topP = 0.0f;
     SamplingParams params;
     params.topKs = {topK};
@@ -68,7 +69,7 @@ TYPED_TEST(TopPSamplingLayerTest, TopKSkipDecode)
 
 TYPED_TEST(TopPSamplingLayerTest, TopKTopPSkipDecode)
 {
-    uint32_t topK = 2;
+    SizeType topK = 2;
     float topP = 1.0f;
     SamplingParams params;
     params.topKs = {topK};
@@ -85,7 +86,7 @@ TYPED_TEST(TopPSamplingLayerTest, TopKTopPSkipDecode)
 
 TYPED_TEST(TopPSamplingLayerTest, BatchTopKTopP)
 {
-    std::vector<uint32_t> topKs = {0, 1, 1, 0, 1, 0};
+    std::vector<SizeType> topKs = {0, 1, 1, 0, 1, 0};
     std::vector<float> topPs = {0.3f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f};
     SamplingParams params;
     params.topKs = topKs;
@@ -102,7 +103,7 @@ TYPED_TEST(TopPSamplingLayerTest, BatchTopKTopP)
 
 TYPED_TEST(TopPSamplingLayerTest, TopP)
 {
-    uint32_t topK = 0;
+    SizeType topK = 0;
     float topP = 0.3f;
     SamplingParams params;
     params.topKs = {topK};

@@ -16,6 +16,7 @@ import copy
 import json
 import math
 import os
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,13 +24,14 @@ from typing import Dict, Optional, Union
 
 import tensorrt as trt
 
-from ._common import _is_building
+from ._common import _is_building, serialize_engine
 from ._utils import (str_dtype_to_trt, support_strongly_type, to_dict,
                      to_json_file)
 from .auto_parallel import auto_parallel
 from .auto_parallel.config import AutoParallelConfig
 from .graph_rewriting import optimize
 from .logger import logger
+from .lora_manager import LoraBuildConfig
 from .models import PretrainedConfig, PretrainedModel
 from .models.modeling_utils import optimize_model
 from .network import Network, net_guard
@@ -154,7 +156,7 @@ class Builder():
         if use_refit and int8:
             # TRT folds weights into Myelin graph because network contains int8 tensor or Q/DQ nodes
             # These folded weights can not be refitted
-            logger.error(f"can't use refit and int8 mode at the same time")
+            logger.error("can't use refit and int8 mode at the same time")
 
         config = self.trt_builder.create_builder_config()
         if not self.strongly_typed:
@@ -299,7 +301,7 @@ class Builder():
             @return: A serialized TRT engine if refit successfully, None otherwise
         '''
         assert isinstance(network, Network)
-        logger.info(f'Refit TRT engine')
+        logger.info('Refit TRT engine')
         runtime = trt.Runtime(logger.trt_logger)
         engine = runtime.deserialize_cuda_engine(engine_buffer)
 
@@ -316,12 +318,11 @@ class Builder():
                     return None
         else:
             logger.error(
-                f'Please set named parameters before building multiple engines.'
-            )
+                'Please set named parameters before building multiple engines.')
             return None
 
         if not refitter.refit_cuda_engine():
-            logger.error(f'Failed to refit engine.')
+            logger.error('Failed to refit engine.')
             return None
 
         tok = time.time()
@@ -420,6 +421,9 @@ class BuildConfig:
     enable_debug_output: bool = False
     max_draft_len: int = 0
     use_refit: bool = False
+    input_timing_cache: str = None
+    output_timing_cache: str = None
+    lora_config: LoraBuildConfig = LoraBuildConfig()
     auto_parallel_config: AutoParallelConfig = AutoParallelConfig()
     plugin_config: PluginConfig = PluginConfig()
 
@@ -441,12 +445,11 @@ class BuildConfig:
         enable_debug_output = config.pop('enable_debug_output', False)
         max_draft_len = config.pop('max_draft_len', 0)
         use_refit = config.pop('use_refit', False)
-        auto_parallel_config = config.pop('auto_parallel_config', None)
-        if auto_parallel_config is not None:
-            auto_parallel_config = AutoParallelConfig.from_dict(
-                auto_parallel_config)
-        else:
-            auto_parallel_config = AutoParallelConfig()
+        input_timing_cache = config.pop('input_timing_cache', None)
+        output_timing_cache = config.pop('output_timing_cache', None)
+        lora_config = LoraBuildConfig.from_dict(config.get('lora_config', {}))
+        auto_parallel_config = AutoParallelConfig.from_dict(
+            config.get('auto_parallel_config', {}))
 
         if plugin_config is None:
             plugin_config = PluginConfig()
@@ -467,6 +470,9 @@ class BuildConfig:
             enable_debug_output=enable_debug_output,
             max_draft_len=max_draft_len,
             use_refit=use_refit,
+            input_timing_cache=input_timing_cache,
+            output_timing_cache=output_timing_cache,
+            lora_config=lora_config,
             auto_parallel_config=auto_parallel_config,
             plugin_config=plugin_config)
 
@@ -481,19 +487,10 @@ class BuildConfig:
         plugin_config = output.pop('plugin_config')
         plugin_config_dict = copy.deepcopy(plugin_config.__dict__)
         output['plugin_config'] = plugin_config_dict
+        output['lora_config'] = output['lora_config'].to_dict()
         output['auto_parallel_config'] = output['auto_parallel_config'].to_dict(
         )
         return output
-
-
-def serialize_engine(engine, path):
-    logger.info(f'Serializing engine to {path}...')
-    tik = time.time()
-    with open(path, 'wb') as f:
-        f.write(engine)
-    tok = time.time()
-    t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
-    logger.info(f'Engine serialized. Total time: {t}')
 
 
 class EngineConfig:
@@ -527,6 +524,28 @@ class Engine:
         self.engine = engine
 
     def save(self, engine_dir: str):
+        os.makedirs(engine_dir, exist_ok=True)
+        lora_config = self.config.build_config.lora_config
+        lora_dirs = lora_config.lora_dir
+        root_lora_dir = os.path.join(engine_dir, 'lora')
+        if len(lora_dirs) > 0:
+            os.makedirs(root_lora_dir, exist_ok=True)
+            for index, lora_dir in enumerate(lora_dirs):
+                if lora_config.lora_ckpt_source == 'hf':
+                    target_lora_dir = f"{root_lora_dir}/{index}"
+                    os.makedirs(target_lora_dir, exist_ok=True)
+                    shutil.copy2(os.path.join(lora_dir, 'adapter_config.json'),
+                                 target_lora_dir)
+                    shutil.copy2(os.path.join(lora_dir, 'adapter_model.bin'),
+                                 target_lora_dir)
+                    lora_config.lora_dir[index] = f"lora/{index}"
+                elif lora_config.lora_ckpt_source == 'nemo':
+                    target_lora_file = f"{root_lora_dir}/{index}.nemo"
+                    shutil.copyfile(lora_dir, target_lora_file)
+                    lora_config.lora_dir[index] = f"lora/{index}.nemo"
+        else:
+            if os.path.exists(root_lora_dir) and os.path.isdir(root_lora_dir):
+                shutil.rmtree(root_lora_dir)
         if self.config.pretrained_config.mapping.rank == 0:
             with open(os.path.join(engine_dir, 'config.json'),
                       "w",
@@ -563,10 +582,20 @@ def get_engine_version(engine_dir: str) -> Union[None, str]:
 
 
 def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
+    if build_config.plugin_config.lora_plugin is not None:
+        # TODO(yuxianq): remove this check after TopModelMixin merged into PretrainedModel
+        assert hasattr(model, 'use_lora'), "This model does not support LoRA"
+        model = optimize_model(
+            model,
+            use_lora=True,
+            max_lora_rank=model.lora_config.max_lora_rank,
+        )
+        build_config.lora_config = model.lora_config
     builder = Builder()
     builder_config = builder.create_builder_config(
         precision=model.config.dtype,
         use_refit=build_config.use_refit,
+        timing_cache=build_config.input_timing_cache,
         int8=(model.config.quant_mode.has_act_or_weight_quant()
               and not model.config.quant_mode.has_per_group_scaling())
         or model.config.quant_mode.has_int8_kv_cache(),
@@ -574,14 +603,6 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
         opt_level=build_config.builder_opt,
         profiling_verbosity=build_config.profiling_verbosity,
         quant_mode=model.config.quant_mode,
-        lora_target_modules=model.config.lora_target_modules if hasattr(
-            model.config, 'lora_target_modules') else [],
-        hf_modules_to_trtllm_modules=model.config.lora_target_modules
-        if hasattr(model.config, 'hf_modules_to_trtllm_modules') else [],
-        trtllm_modules_to_hf_modules=model.config.lora_target_modules
-        if hasattr(model.config, 'trtllm_modules_to_hf_modules') else [],
-        max_lora_rank=model.config.max_lora_rank if hasattr(
-            model.config, 'max_lora_rank') else 64,
     )
 
     network = builder.create_network()
@@ -632,8 +653,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
             max_draft_len=build_config.max_draft_len,
             gather_context_logits=build_config.gather_context_logits,
             gather_generation_logits=build_config.gather_generation_logits,
-            lora_target_modules=model.config.lora_target_modules if hasattr(
-                model.config, 'lora_target_modules') else [])
+            lora_target_modules=build_config.lora_config.lora_target_modules)
         model(**inputs)
 
         if build_config.enable_debug_output:
@@ -654,5 +674,10 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
     # Network -> Engine
     engine = builder.build_engine(network, builder_config)
     engine_config = EngineConfig(model.config, build_config, __version__)
+
+    if build_config.output_timing_cache is not None and model.config.mapping.rank == 0:
+        ok = builder.save_timing_cache(builder_config,
+                                       build_config.output_timing_cache)
+        assert ok, "Failed to save timing cache."
 
     return Engine(engine_config, engine)

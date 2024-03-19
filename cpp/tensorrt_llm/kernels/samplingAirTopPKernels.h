@@ -61,37 +61,41 @@ namespace kernels
 //! \param blockNum The appropriate block configuration calculated based on the number of multiprocessors, occupancy,
 //! batchSize and vocabSizePadded
 //! \param skipDecode input buffer [batchSize]. Flags whether to skip decoding per request
+//! \param batchSlots input buffer[batchSize], optional. Indices of rows of data in memory pool
+//! \param isDeterministic bool, optional. Default value is false.
+//! When isDeterministic==true, the result is reproducible.
 template <typename T>
 void invokeBatchAirTopPSampling(void* workspace, int** outputIds, int* sequenceLength,
     FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
     T const* logProbs, curandState_t* curandstate, int const batchSize, int maxBatchSize, size_t const vocabSizePadded,
     int const* endIds, float const maxTopP, float const* topPs, cudaStream_t stream, int blockNum,
-    bool const* skipDecode, int32_t const* batchSlots);
+    bool const* skipDecode, int32_t const* batchSlots, bool isDeterministic = false);
 
 //! \brief Specialization of invokeBatchAirTopPSampling with topPs=nullptr
 template <typename T>
 void invokeAirTopPSampling(void* workspace, int** outputIds, int* sequenceLength, FinishedState const* finishedInput,
     FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs, T const* logProbs,
     curandState_t* curandstate, int const batchSize, int maxBatchSize, size_t const vocabSizePadded, int const* endIds,
-    float const topP, cudaStream_t stream, int blockNum, bool const* skipDecode, int32_t const* batchSlots);
+    float const topP, cudaStream_t stream, int blockNum, bool const* skipDecode, int32_t const* batchSlots,
+    bool isDeterministic = false);
 
 //! \brief  Calculate the number of blocks based on the number of multiprocessors, batchSize and vocabSize.
 //! \tparam T the data type of value
-//! \tparam IdxT the data type of index
-//! \tparam AccT the data type of variables related to accumulation
-//! \tparam BitsPerPass the number of bits for each pass. Can be 8 or 11. Use 11 for default.
-//! \tparam BlockSize the block size
 //! \param batchSize
 //! \param len the number of candidates for each case
 //! \param smCnt number of multiprocessors on device
-template <typename T, typename IdxT, typename AccT, int BitsPerPass = 11, int BlockSize = 512>
-unsigned calcAirTopPBlockNum(int batchSize, IdxT len, int smCnt);
+//! \param isDeterministic bool, optional. Default value is false.
+//! When isDeterministic==true, the result is reproducible.
+template <typename T>
+uint32_t calcAirTopPBlockNum(int batchSize, int len, int smCnt, bool isDeterministic = false);
 
 //! \brief Returns workspace size in bytes needed for sampling Air TopP computation
 //! \param batchSize batch size
 //! \param vocabSizePadded size of padded vocab
+//! \param isDeterministic bool, optional. Default value is false.
+//! When isDeterministic==true, the result is reproducible.
 template <typename T>
-[[nodiscard]] size_t getAirTopPWorkspaceSize(int32_t batchSize, int32_t vocabSizePadded);
+[[nodiscard]] size_t getAirTopPWorkspaceSize(int32_t batchSize, int32_t vocabSizePadded, bool isDeterministic = false);
 
 } // namespace kernels
 } // namespace tensorrt_llm

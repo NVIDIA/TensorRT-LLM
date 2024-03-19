@@ -170,7 +170,7 @@ void GemmPlugin::init()
     mPluginProfiler->setTranspose(mTransA, mTransB);
     mPluginProfiler->setOutputType(mOutputType);
 
-    mGemmId = GemmIdCublas(mDims.n, mDims.k, mType, mTransA, mTransB);
+    mGemmId = GemmIdCublas(mDims.n, mDims.k, mType, mTransA, mTransB, mOutputType);
 }
 
 void GemmPlugin::setGemmConfig()

@@ -1,5 +1,6 @@
 import argparse
 import os
+from pathlib import Path
 
 from tensorrt_llm.executor import GenerationExecutor
 from tensorrt_llm.models import LLaMAForCausalLM
@@ -17,7 +18,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Llama single model example")
     parser.add_argument(
         "--engine_dir",
-        type=str,
+        type=Path,
         required=True,
         help=
         "Directory to save and load the engine. When -c is specified, always rebuild and save to this dir. When -c is not specified, load engine when the engine_dir exists, rebuild otherwise"
@@ -43,13 +44,14 @@ def main():
     tokenizer_dir = args.hf_model_dir
     max_batch_size, max_isl, max_osl = 1, 256, 20
 
-    if args.clean_build or not os.path.exists(args.engine_dir):
+    if args.clean_build or not args.engine_dir.exists():
+        args.engine_dir.mkdir(exist_ok=True, parents=True)
         os.makedirs(args.engine_dir, exist_ok=True)
         llama = LLaMAForCausalLM.from_hugging_face(args.hf_model_dir)
         llama.to_trt(max_batch_size, max_isl, max_osl)
-        llama.save(args.engine_dir)
+        llama.save(str(args.engine_dir))
 
-    executor = GenerationExecutor(args.engine_dir, tokenizer_dir)
+    executor = GenerationExecutor.create(args.engine_dir, tokenizer_dir)
 
     for inp in read_input():
         output = executor.generate(inp, max_new_tokens=20)

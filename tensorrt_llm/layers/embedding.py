@@ -52,6 +52,7 @@ class Embedding(Module):
         self.tp_group = tp_group
         self.sharding_dim = sharding_dim
         self.tp_rank = tp_rank
+        self.dtype = dtype
 
         if sharding_dim == 1:
             self.weight = Parameter(shape=(self.num_embeddings,

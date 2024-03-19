@@ -39,6 +39,7 @@ namespace tensorrt_llm::plugins
 //     7.  D [dim]
 //     8.  z [batch_size, seq_len, dim]
 //     9.  host_request_types [batch_size] int32. 0: context; 1: generation; 2: none.
+//    10.  last_token_ids [batch_size] int32
 // outputs
 //     0. output_tensor [batch_size, seq_len, dim]
 //     1. state [batch_size, dstate, dim]
@@ -142,13 +143,18 @@ private:
         return 9;
     };
 
+    IndexType getLastTokenIdsIdx() const
+    {
+        return 10;
+    };
+
     void setSSMParams(tensorrt_llm::kernels::SSMParamsBase& params,
         // sizes
         const size_t batch, const size_t dim, const size_t seqLen, const size_t dstate, bool const isVariableB,
         bool const isVariableC,
         // device pointers
         void* statePtr, void const* x, void const* delta, void const* deltaBias, void const* A, void const* B,
-        void const* C, void const* D, void const* z, void* out, bool deltaSoftplus);
+        void const* C, void const* D, void const* z, int const* lastTokenIds, void* out, bool deltaSoftplus);
 
 private:
     int mDim;

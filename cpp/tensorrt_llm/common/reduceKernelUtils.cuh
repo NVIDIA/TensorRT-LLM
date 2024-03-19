@@ -291,43 +291,46 @@ __inline__ __device__ void cgBlockReduceSumElements(float* element_list, float* 
 template <typename T, int MAX_K>
 struct TopK
 {
-    int p[MAX_K];
-    T u[MAX_K];
+    int p[MAX_K]; // index, being -1 at the tail if the array is not full
+    T u[MAX_K];   // value in descend order, being -MAX_T_VAL if the element is invalid
 
-    __device__ __forceinline__ void insert(T elem, int elem_id)
+    __device__ __forceinline__ void insert(T const elem, int const elem_id)
     {
         if (elem_id < 0)
         {
             return;
         }
-
-        if (elem > u[MAX_K - 1] || (p[MAX_K - 1] == -1) || ((elem == u[MAX_K - 1]) && (elem_id < p[MAX_K - 1])))
-        // if (elem > u[MAX_K-1] || ((elem == u[MAX_K-1]) && (elem_id < p[MAX_K-1])))
+        // Condition of updating the array
+        // 1. array is not full
+        // 2. elem is greater than the smallest (last) element in the array
+        // 3. elem is equal to the smallest (last) element in the array but its elem_id is smaller
+        bool const need_update
+            = (p[MAX_K - 1] == -1 || elem > u[MAX_K - 1] || elem == u[MAX_K - 1] && elem_id < p[MAX_K - 1]);
+        if (!need_update)
         {
-            u[MAX_K - 1] = elem;
-            p[MAX_K - 1] = elem_id;
+            return;
         }
-
-        for (int k = MAX_K - 2; k >= 0; --k)
+        // Find suitable index for the new element
+        int i;
+        for (i = MAX_K - 2; i >= 0; --i)
         {
-            if ((u[k + 1] > u[k]) || (p[k] == -1) || ((u[k + 1] == u[k]) && (p[k + 1] < p[k])))
-            // if ((u[k+1] > u[k]) || ((u[k+1] == u[k])&&(p[k+1] < p[k])))
-            {
-                T u2 = u[k];
-                int p2 = p[k];
-                u[k] = u[k + 1];
-                p[k] = p[k + 1];
-                u[k + 1] = u2;
-                p[k + 1] = p2;
-            }
+            bool const need_decrease = (p[i] == -1 || elem > u[i] || elem == u[i] && elem_id < p[i]);
+            if (!need_decrease)
+                break;
         }
+        // Move elements to correct positions
+        for (int k = MAX_K - 2; k >= i; --k)
+        {
+            p[k + 1] = p[k];
+            u[k + 1] = u[k];
+        }
+        p[i] = elem_id;
+        u[i] = elem;
     }
 
     __device__ __forceinline__ void init()
     {
-        bool const IS_FP16 = std::is_same<T, half>::value;
-        const T MAX_T_VAL = (IS_FP16) ? HALF_FLT_MAX : FLT_MAX;
-
+        T const MAX_T_VAL = (std::is_same<T, half>::value) ? HALF_FLT_MAX : FLT_MAX;
         for (int i = 0; i < MAX_K; i++)
         {
             p[i] = -1;

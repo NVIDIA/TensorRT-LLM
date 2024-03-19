@@ -27,7 +27,7 @@ DEFAULT_HF_MODEL_DIRS = {
     'BloomForCausalLM': 'bigscience/bloom-560m',
     'ChatGLMForCausalLM': 'THUDM/chatglm3-6b',
     'FalconForCausalLM': 'tiiuae/falcon-rw-1b',
-    'gpt': 'gpt2-medium',
+    'GPTForCausalLM': 'gpt2-medium',
     'GPTJForCausalLM': 'EleutherAI/gpt-j-6b',
     'GPTNeoXForCausalLM': 'EleutherAI/gpt-neox-20b',
     'InternLMForCausalLM': 'internlm/internlm-chat-7b',
@@ -35,13 +35,13 @@ DEFAULT_HF_MODEL_DIRS = {
     'MPTForCausalLM': 'mosaicml/mpt-7b',
     'PhiForCausalLM': 'microsoft/phi-2',
     'OPTForCausalLM': 'facebook/opt-350m',
-    'qwen': 'Qwen/Qwen-7B',
+    'QWenForCausalLM': 'Qwen/Qwen-7B',
 }
 
 DEFAULT_PROMPT_TEMPLATES = {
     'InternLMForCausalLM':
     "<|User|>:{input_text}<eoh>\n<|Bot|>:",
-    'qwen':
+    'QWenForCausalLM':
     "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{input_text}<|im_end|>\n<|im_start|>assistant\n",
 }
 
@@ -73,7 +73,7 @@ def throttle_generator(generator, stream_interval):
 
 def load_tokenizer(tokenizer_dir: Optional[str] = None,
                    vocab_file: Optional[str] = None,
-                   model_name: str = 'gpt',
+                   model_name: str = 'GPTForCausalLM',
                    model_version: Optional[str] = None,
                    tokenizer_type: Optional[str] = None):
     if vocab_file is None:
@@ -103,7 +103,7 @@ def load_tokenizer(tokenizer_dir: Optional[str] = None,
                                 truncation_side='left',
                                 legacy=False)
 
-    if model_name == 'qwen':
+    if model_name == 'QWenForCausalLM':
         with open(Path(tokenizer_dir) / "generation_config.json") as f:
             gen_config = json.load(f)
         chat_format = gen_config['chat_format']
