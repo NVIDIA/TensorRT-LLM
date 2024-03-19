@@ -23,6 +23,7 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
   * INT8 KV CACHE (+ AWQ/per-channel weight-only)
   * Tensor Parallel
   * STRONGLY TYPED
+  * Inflight Batching
 
 ## Usage
 
