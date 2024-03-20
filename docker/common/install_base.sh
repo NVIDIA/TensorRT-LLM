@@ -62,7 +62,6 @@ install_python_centos() {
   PYTHON_VERSION=$1
   PYTHON_MAJOR="3"
   PYTHON_URL="https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tgz"
-  PYTHON_ENV_FILE="/tmp/python${PYTHON_VERSION}_env"
   yum -y update
   yum -y install centos-release-scl-rh epel-release
   yum-builddep -y python3 && yum remove -y python3
@@ -73,8 +72,7 @@ install_python_centos() {
   bash -c "./configure --enable-shared --prefix=/opt/python/${PYTHON_VERSION} --enable-ipv6 \
     LDFLAGS=-Wl,-rpath=/opt/python/${PYTHON_VERSION}/lib,--disable-new-dtags && make -j$(nproc) && make install"
   ln -s /opt/python/${PYTHON_VERSION}/bin/python3 /usr/local/bin/python
-  echo "export PATH=\$PATH:/opt/python/${PYTHON_VERSION}/bin" >> "${PYTHON_ENV_FILE}"
-  echo "source ${PYTHON_ENV_FILE}" >> "${ENV}"
+  echo "export PATH=\$PATH:/opt/python/${PYTHON_VERSION}/bin" >> "${ENV}"
   yum clean all
   cd .. && rm -rf /tmp/Python-${PYTHON_VERSION}
 }
@@ -84,7 +82,6 @@ install_pyp_centos() {
 }
 
 install_devtoolset_centos() {
-  DEVTOOLSET_ENV_FILE="/tmp/devtoolset_env"
   yum -y update
   yum -y install centos-release-scl-rh epel-release
   # https://gitlab.com/nvidia/container-images/cuda
@@ -95,8 +92,7 @@ install_devtoolset_centos() {
   yum -y install vim wget git-lfs rh-git227 devtoolset-10 libffi-devel
   yum -y install openmpi3 openmpi3-devel pigz
   echo "source scl_source enable rh-git227" >> "${ENV}"
-  echo "source scl_source enable devtoolset-10" >> "${DEVTOOLSET_ENV_FILE}"
-  echo "source ${DEVTOOLSET_ENV_FILE}" >> "${ENV}"
+  echo "source scl_source enable devtoolset-10" >> "${ENV}"
   echo 'export PATH=$PATH:/usr/lib64/openmpi3/bin' >> "${ENV}"
   yum clean all
 }
