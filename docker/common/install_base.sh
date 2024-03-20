@@ -111,7 +111,6 @@ case "$ID" in
   centos)
     install_python_centos "3.10.12"
     install_pyp_centos
-    install_gcc_centos
     install_devtoolset_centos
     ;;
   *)
