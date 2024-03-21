@@ -17,10 +17,6 @@ def add_model_argument(parser: argparse.ArgumentParser):
                         type=str, 
                         default=None,
                         help='Specify the model version')   
-    parser.add_argument('--upload',
-                        action='store_true',
-                        default=False,
-                        help='Upload the converted model to www.modelscope.cn')
     
  
 def prepare_model_files(model_id: str,
@@ -48,13 +44,5 @@ def prepare_model_files(model_id: str,
             "Use model from www.modelscope.cn need pip install modelscope"
         )
         raise e
-
-def upload_model(path: str,
-                 model_id: str):
-    """Upload build output to www.modelscope.cn
-
-    Args:
-        path (str): The path of the build output.
-        model_id (str): The model id in modelscope.
-    """
-    pass
+    
+    

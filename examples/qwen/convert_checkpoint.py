@@ -21,7 +21,8 @@ import tensorrt_llm
 from tensorrt_llm._utils import pad_vocab_size, str_dtype_to_torch
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-
+from prepare_model import (add_model_argument, 
+                           prepare_model_files)
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
