@@ -88,7 +88,7 @@ class GenerationRequest:
         set_property("pad_id")
         set_property("min_length")
         set_property("temperature", torch.float32)
-        set_property("runtime_top_k", torch.float32)
+        set_property("runtime_top_k", torch.int32)
         set_property("runtime_top_p", torch.float32)
         set_property("random_seed", torch.int64)
 
