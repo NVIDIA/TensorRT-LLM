@@ -42,7 +42,6 @@ The TensorRT-LLM Qwen example code locates at [examples/qwen](./). It takes HF w
 
 Need to prepare the HF Qwen checkpoint first by following the guides here [Qwen-7B-Chat](https://huggingface.co/Qwen/Qwen-7B-Chat)
 
-
 TensorRT-LLM Qwen builds TensorRT engine(s) from HF checkpoint. If no checkpoint directory is specified, TensorRT-LLM will build engine(s) with dummy weights.
 
 Normally `trtllm-build` only requires single GPU, but if you've already got all the GPUs needed while inferencing, you could enable parallelly building to make the engine building process faster by adding `--workers` argument. Please note that currently `workers` feature only supports single node.
