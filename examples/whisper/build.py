@@ -68,6 +68,7 @@ def parse_arguments():
                             "small.en",
                             "base.en",
                             "tiny.en",
+                            "distil-large-v3",
                             "distil-large-v2",
                             "distil-medium.en",
                             "distil-small.en",
