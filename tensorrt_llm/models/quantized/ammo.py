@@ -121,8 +121,7 @@ def quantize_and_export(
 
     if export_path:
         with torch.inference_mode():
-            if qformat == "int4_awq" and model_type == "qwen" or \
-                model_type == "chatglm":
+            if qformat == "int4_awq" and model_type in ["qwen", "chatglm", "llama"]:
                 torch.save(model.state_dict(), export_path)
             else:
                 export_model_config(
