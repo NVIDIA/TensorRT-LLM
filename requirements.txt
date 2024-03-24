@@ -1,9 +1,9 @@
 --extra-index-url https://pypi.nvidia.com
-accelerate==0.25.0
+accelerate>=0.25.0
 build
 colored
 cuda-python # Do not override the custom version of cuda-python installed in the NGC PyTorch image.
-diffusers==0.15.0
+diffusers>=0.15.0
 lark
 mpi4py
 numpy
@@ -15,12 +15,12 @@ pulp
 pandas
 h5py
 sentencepiece>=0.1.99
-tensorrt==9.3.0.post12.dev1
+tensorrt>=9.3.0.post12.dev1
 # https://github.com/pytorch/pytorch/blob/v2.2.1/version.txt still uses 2.2.0a0.
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-02.html#rel-24-02 uses 2.3.0a0.
 torch>=2.2.0a,<=2.3.0a
 nvidia-ammo~=0.7.0
-transformers==4.38.2
+transformers>=4.38.2
 wheel
 optimum
 evaluate
