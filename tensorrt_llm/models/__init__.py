@@ -31,6 +31,7 @@ from .mpt.model import MPTForCausalLM, MPTModel
 from .opt.model import OPTForCausalLM, OPTModel
 from .phi.model import PhiForCausalLM, PhiModel
 from .qwen.model import QWenForCausalLM
+from .qwen2.model import Qwen2ForCausalLM
 
 from .quantized.quant import quantize_model  # noqa # isort:skip
 
@@ -60,6 +61,7 @@ __all__ = [
     'ChatGLMModel',
     'BaichuanForCausalLM',
     'QWenForCausalLM',
+    'Qwen2ForCausalLM',
     'EncoderModel',
     'DecoderModel',
     'PretrainedConfig',
@@ -73,7 +75,6 @@ __all__ = [
 ]
 
 MODEL_MAP = {
-    'GPTForCausalLM': GPTForCausalLM,
     'OPTForCausalLM': OPTForCausalLM,
     'BloomForCausalLM': BloomForCausalLM,
     'FalconForCausalLM': FalconForCausalLM,
@@ -89,6 +90,7 @@ MODEL_MAP = {
     'InternLMForCausalLM': LLaMAForCausalLM,
     'MedusaForCausalLM': MedusaForCausalLm,
     'BaichuanForCausalLM': BaichuanForCausalLM,
+    'Qwen2ForCausalLM': Qwen2ForCausalLM,
     'SkyworkForCausalLM': LLaMAForCausalLM,
     'GemmaForCausalLM': GemmaForCausalLM,
     'QWenForCausalLM': QWenForCausalLM,
