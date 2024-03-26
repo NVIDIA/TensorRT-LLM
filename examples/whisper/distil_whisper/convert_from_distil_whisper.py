@@ -27,7 +27,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name",
                         type=str,
-                        default="distil-whisper/distil-large-v2",
+                        default="distil-whisper/distil-large-v3",
                         help="Model name")
     parser.add_argument("--cache_dir",
                         type=str,
@@ -39,7 +39,7 @@ def main():
                         help='Store the "translated" model here')
     parser.add_argument("--output_name",
                         type=str,
-                        default="distil-large-v2",
+                        default="distil-large-v3",
                         help="Output model name")
 
     args = parser.parse_args()
