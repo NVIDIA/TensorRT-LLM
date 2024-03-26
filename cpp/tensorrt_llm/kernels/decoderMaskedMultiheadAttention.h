@@ -148,6 +148,7 @@ struct Multihead_attention_params_base
     float const* qkv_scale_quant_orig = nullptr;
     float const* attention_out_scale_orig_quant = nullptr;
 
+    // 8 bits kv cache scales.
     float const* kv_scale_orig_quant = nullptr;
     float const* kv_scale_quant_orig = nullptr;
 

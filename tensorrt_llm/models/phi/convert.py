@@ -3,7 +3,7 @@ import torch
 from ..._utils import str_dtype_to_torch
 
 
-def convert_hf_phi(hf_model, dtype):
+def convert_hf_weights(hf_model, dtype, **kwargs):
     torch_dtype = str_dtype_to_torch(dtype)
     hf_state_dict = hf_model.state_dict()
     weights = {}
@@ -45,10 +45,10 @@ def convert_hf_phi(hf_model, dtype):
     return weights
 
 
-def convert_hf_config(hf_config, args):
+def convert_hf_config(hf_config, dtype, **kwargs):
     config = {
         'architecture': hf_config.architectures[0],
-        'dtype': args.dtype,
+        'dtype': dtype,
         'num_hidden_layers': hf_config.num_hidden_layers,
         'num_attention_heads': hf_config.num_key_value_heads,
         'partial_rotary_factor': hf_config.partial_rotary_factor,

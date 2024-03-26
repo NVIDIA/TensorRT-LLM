@@ -19,8 +19,9 @@ from ...functional import Tensor, concat, shape
 from ...layers import (MLP, Attention, AttentionMaskType, AttentionParams,
                        ColumnLinear, Embedding, KeyValueCacheParams, LayerNorm,
                        RmsNorm)
-from ...module import Module, ModuleList
-from ..modeling_utils import DecoderModelForCausalLM, PretrainedConfig
+from ...module import Module
+from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
+                              PretrainedConfig)
 
 
 class ChatGLMDecoderLayer(Module):
@@ -38,7 +39,8 @@ class ChatGLMDecoderLayer(Module):
         tp_rank = config.mapping.tp_rank
         layernorm_epsilon = config.norm_epsilon
 
-        rope_base = 10000.0 * config.rope_ratio
+        rope_base = 10000.0
+        rotary_embedding_scaling = None
         self.apply_residual_connection_post_layernorm = config.apply_residual_connection_post_layernorm
         self.alpha = (2 * config.num_hidden_layers)**0.5
         norm_cls = RmsNorm if config.rmsnorm else LayerNorm
@@ -47,8 +49,16 @@ class ChatGLMDecoderLayer(Module):
             attention_mask_type = AttentionMaskType.bidirectionalglm
         elif config.chatglm_version == 'chatglm':
             attention_mask_type = AttentionMaskType.bidirectional
-        elif config.chatglm_version in ['chatglm2', 'chatglm3']:
+        elif config.chatglm_version == 'chatglm2':
             attention_mask_type = AttentionMaskType.causal
+            if config.rope_ratio > 1:
+                rotary_embedding_scaling = {
+                    'type': 'linear',
+                    'factor': config.rope_ratio
+                }
+        elif config.chatglm_version == 'chatglm3':
+            attention_mask_type = AttentionMaskType.causal
+            rope_base *= config.rope_ratio
 
         self.input_layernorm = norm_cls(
             normalized_shape=hidden_size,
@@ -73,7 +83,7 @@ class ChatGLMDecoderLayer(Module):
             dtype=config.dtype,
             position_embedding_type=config.position_embedding_type,
             rotary_embedding_base=rope_base,
-            rotary_embedding_scaling=None,
+            rotary_embedding_scaling=rotary_embedding_scaling,
             rotary_embedding_percentage=0.5,
             tp_group=tp_group,
             tp_size=tp_size,
@@ -168,19 +178,9 @@ class ChatGLMModel(Module):
         self.chatglm_version = config.chatglm_version
         norm_cls = RmsNorm if config.rmsnorm else LayerNorm
 
-        if config.use_parallel_embedding:
-            self.vocab_embedding = Embedding(
-                config.vocab_size,
-                config.hidden_size,
-                dtype=config.dtype,
-                tp_group=config.mapping.tp_group,
-                tp_size=config.mapping.tp_size,
-                sharding_dim=config.embedding_sharding_dim,
-                tp_rank=config.mapping.tp_rank)
-        else:
-            self.vocab_embedding = Embedding(config.vocab_size,
-                                             config.hidden_size,
-                                             dtype=config.dtype)
+        self.vocab_embedding = Embedding(config.vocab_size,
+                                         config.hidden_size,
+                                         dtype=config.dtype)
 
         if config.chatglm_version == 'glm':
             self.position_embedding = Embedding(
@@ -194,10 +194,7 @@ class ChatGLMModel(Module):
                 dtype=config.dtype,
             )
 
-        self.layers = ModuleList([
-            ChatGLMDecoderLayer(config, idx)
-            for idx in range(config.num_hidden_layers)
-        ])
+        self.layers = DecoderLayerList(ChatGLMDecoderLayer, config)
 
         self.ln_f = norm_cls(
             normalized_shape=config.hidden_size,
@@ -243,37 +240,15 @@ class ChatGLMModel(Module):
 
             hidden_states = hidden_states + position_embedding
 
-        kv_cache_params.fill_none_tensor_list(len(self.layers))
+        hidden_states = self.layers(hidden_states,
+                                    use_cache=use_cache,
+                                    attention_mask=attention_mask,
+                                    kv_cache_params=kv_cache_params,
+                                    attention_params=attention_params,
+                                    position_ids=position_ids)
 
         if use_cache:
-            presents = []
-
-        for layer, past in zip(self.layers, kv_cache_params.past_key_value):
-            layer_output = layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                use_cache=use_cache,
-                kv_cache_params=KeyValueCacheParams(
-                    past_key_value=[past],
-                    host_past_key_value_lengths=kv_cache_params.
-                    host_past_key_value_lengths,
-                    host_max_attention_window_sizes=kv_cache_params.
-                    host_max_attention_window_sizes,
-                    host_sink_token_length=kv_cache_params.
-                    host_sink_token_length,
-                    kv_cache_block_pointers=kv_cache_params.
-                    kv_cache_block_pointers,
-                    host_kv_cache_block_pointers=kv_cache_params.
-                    host_kv_cache_block_pointers,
-                    cache_indirection=kv_cache_params.cache_indirection,
-                ),
-                attention_params=attention_params,
-            )
-
-            if use_cache:
-                hidden_states = layer_output[0]
-                presents.append(layer_output[1])
+            hidden_states, presents = hidden_states
 
         hidden_states = self.ln_f(hidden_states)
 
@@ -290,20 +265,13 @@ class ChatGLMForCausalLM(DecoderModelForCausalLM):
         vocab_size_padded = pad_vocab_size(config.vocab_size,
                                            config.mapping.tp_size)
 
-        share_weight = None
-        if config.share_embedding_table:
-            share_weight = transformer.vocab_embedding.weight
-
-        lm_head = ColumnLinear(
-            config.hidden_size,
-            vocab_size_padded,
-            bias=False,
-            dtype=config.dtype,
-            tp_group=config.mapping.tp_group,
-            tp_size=config.mapping.tp_size,
-            gather_output=True,
-            share_weight=share_weight,
-        )
+        lm_head = ColumnLinear(config.hidden_size,
+                               vocab_size_padded,
+                               bias=False,
+                               dtype=config.dtype,
+                               tp_group=config.mapping.tp_group,
+                               tp_size=config.mapping.tp_size,
+                               gather_output=True)
         super().__init__(config, transformer, lm_head)
 
     def check_config(self, config: PretrainedConfig):

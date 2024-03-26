@@ -167,18 +167,10 @@ class GPTModel(Module):
         self.mapping = config.mapping
         self.position_embedding_type = config.position_embedding_type
 
-        tp_group = config.mapping.tp_group
-        tp_size = config.mapping.tp_size
-        tp_rank = config.mapping.tp_rank
+        self.vocab_embedding = Embedding(config.vocab_size,
+                                         config.hidden_size,
+                                         dtype=config.dtype)
 
-        self.vocab_embedding = Embedding(
-            num_embeddings=config.vocab_size,
-            embedding_dim=config.hidden_size,
-            dtype=config.dtype,
-            tp_size=tp_size if config.use_parallel_embedding else 1,
-            tp_group=tp_group if config.use_parallel_embedding else None,
-            sharding_dim=config.embedding_sharding_dim,
-            tp_rank=tp_rank)
         if config.position_embedding_type == PositionEmbeddingType.learned_absolute:
             self.position_embedding = Embedding(
                 num_embeddings=config.max_position_embeddings,
@@ -201,12 +193,6 @@ class GPTModel(Module):
                 prompt_tasks=None,
                 prompt_vocab_size=None,
                 lora_params=None):
-
-        kv_cache_params.fill_none_tensor_list(len(self.layers))
-
-        if use_cache:
-            presents = []
-
         ptuning_args = [
             prompt_embedding_table, prompt_tasks, prompt_vocab_size
         ] if prompt_embedding_table is not None else []
@@ -239,26 +225,13 @@ class GPTForCausalLM(DecoderModelForCausalLM):
         vocab_size_padded = pad_vocab_size(config.vocab_size,
                                            config.mapping.tp_size)
 
-        if config.share_embedding_table and config.mapping.tp_size > 1:
-            if (not config.use_parallel_embedding) or (
-                    config.use_parallel_embedding
-                    and config.embedding_sharding_dim == 1):
-                raise NotImplementedError(
-                    'For multiple-processes cases, sharing the embedding table must set use_parallel_embedding=True and embedding_sharding_dim = 0'
-                )
-
-        share_weight = None
-        if config.share_embedding_table:
-            share_weight = transformer.vocab_embedding.weight
-
         lm_head = ColumnLinear(config.hidden_size,
                                vocab_size_padded,
                                bias=False,
                                dtype=config.dtype,
                                tp_group=config.mapping.tp_group,
                                tp_size=config.mapping.tp_size,
-                               gather_output=True,
-                               share_weight=share_weight)
+                               gather_output=True)
         super().__init__(config, transformer, lm_head)
 
     def check_config(self, config: PretrainedConfig):

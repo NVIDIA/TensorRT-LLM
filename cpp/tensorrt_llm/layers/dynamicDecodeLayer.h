@@ -84,7 +84,6 @@ public:
 
         // Medusa params
         std::optional<std::vector<std::vector<runtime::SizeType>>> topKMedusaHeads; // [batchSize, maxMedusaHeads]
-        std::optional<std::vector<runtime::SizeType>> tokensPerStep;                // [batchSize]
     };
 
     void setup(runtime::SizeType batch_size, runtime::SizeType beam_width, int const* batch_slots,
@@ -139,10 +138,18 @@ public:
         std::optional<tc::Tensor> batch_slots;           // [batch_size], in pinned memory
 
         // Medusa inputs
-        std::optional<tc::Tensor> tokensPerStep; // [batch_size], optional, on gpu
-        std::optional<tc::Tensor> paths; // [batch_size, max_tokens_per_step, max_num_heads + 1], optional, on gpu
-        std::optional<tc::Tensor>
-            medusaLogits; // [max_num_heads, batch_size, max_tokens_per_step, vocab_size], optional, on gpu
+        class MedusaInputs
+        {
+        public:
+            tc::Tensor medusaCurTokensPerStep;    // [batch_size], optional, on gpu
+            tc::Tensor medusaTargetTokensPerStep; // [batch_size], optional, on gpu
+            tc::Tensor medusaPaths;   // [batch_size, max_tokens_per_step, max_num_heads + 1], optional, on gpu
+            tc::Tensor medusaTreeIds; // [batch_size, max_tokens_per_step], optional, on gpu
+            std::vector<std::vector<tc::Tensor>>
+                medusaLogits;         // [max_batch_size][max_num_heads][tokens_per_step, vocab_size], optional, on gpu
+        };
+
+        std::optional<MedusaInputs> medusaInputs;
     };
 
     class OutputParams
@@ -173,9 +180,16 @@ public:
         tc::Tensor parent_ids_ptr; // [batch_size] int* (2-d array), each int* has [beam_width, max_seq_len]
 
         // Medusa outputs
-        std::optional<tc::Tensor>
-            nextDraftTokens; // [batch_size, max_tokens_per_step], draft tokens predicted by Medusa heads
-        std::optional<tc::Tensor> acceptedLengths; // [batch_size], lengths of the accepted draft tokens + 1
+        class MedusaOutputs
+        {
+        public:
+            tc::Tensor nextDraftTokens; // [batch_size, max_tokens_per_step], draft tokens predicted by Medusa heads
+            tc::Tensor acceptedLengths; // [batch_size], lengths of the accepted draft tokens + 1
+            tc::Tensor medusaAcceptedLengthsCumSum; // [batch_size + 1]
+            tc::Tensor medusaPathsOffsets;          // [batch_size * max_medusa_heads]
+        };
+
+        std::optional<MedusaOutputs> medusaOutputs;
     };
 
     void forward(OutputParams& outputs, ForwardParams const& params);

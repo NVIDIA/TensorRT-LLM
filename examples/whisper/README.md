@@ -1,6 +1,16 @@
 # Whisper
 
 This document shows how to build and run a [whisper model](https://github.com/openai/whisper/tree/main) in TensorRT-LLM on a single GPU.
+
+- [Whisper](#whisper)
+  - [Overview](#overview)
+  - [Support Matrix](#support-matrix)
+  - [Usage](#usage)
+    - [Build TensorRT engine(s)](#build-tensorrt-engines)
+    - [Run](#run)
+    - [Distil-Whisper](#distil-whisper)
+    - [Acknowledgment](#acknowledgment)
+
 ## Overview
 
 The TensorRT-LLM Whisper example code is located in [`examples/whisper`](./). There are three main files in that folder:

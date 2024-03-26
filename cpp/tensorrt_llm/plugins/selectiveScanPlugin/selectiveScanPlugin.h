@@ -29,26 +29,26 @@ namespace tensorrt_llm::plugins
 // can not support beam search
 
 // inputs
-//     0.  input_tensor [batch_size, seq_len, dim]
-//     1.  state [batch_size, dstate, dim]
-//     2.  delta [batch_size, seq_len, dim]
+//     0.  input_tensor [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
+//     1.  state [batch_size, dstate, dim] or host [1] containing only pointer for paged_state
+//     2.  delta [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
 //     3.  delta_bias [dim]
 //     4.  A [dstate, dim]
-//     5.  B [batch_size, seq_len, dstate]
-//     6.  C [batch_size, seq_len, dstate]
-//     7.  D [dim]
-//     8.  z [batch_size, seq_len, dim]
-//     9.  host_request_types [batch_size] int32. 0: context; 1: generation; 2: none.
-//    10.  last_token_ids [batch_size] int32
+//     5.  BC [batch_size, seq_len, dstate * 2] or [num_tokens, dstate * 2] for remove_input_padding
+//     6.  D [dim]
+//     7.  z [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
+//     8.  host_request_types [batch_size] int32. 0: context; 1: generation; 2: none.
+//     9.  last_token_ids [batch_size] int32
+//    10.  state_slot_mapping [batch_size] int32, optional for paged state
 // outputs
-//     0. output_tensor [batch_size, seq_len, dim]
+//     0. output_tensor [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
 //     1. state [batch_size, dstate, dim]
 
 class SelectiveScanPlugin : public BasePlugin
 {
 public:
-    SelectiveScanPlugin(
-        int dim, int dstate, bool isVariableB, bool isVariableC, bool deltaSoftplus, nvinfer1::DataType type);
+    SelectiveScanPlugin(int dim, int dstate, int dt_rank, bool isVariableB, bool isVariableC, bool deltaSoftplus,
+        nvinfer1::DataType type, bool removePadding, bool pagedState);
 
     SelectiveScanPlugin(void const* data, size_t length);
 
@@ -118,51 +118,55 @@ private:
         return 4;
     };
 
-    IndexType getBIdx() const
+    IndexType getBCIdx() const
     {
         return 5;
     };
 
-    IndexType getCIdx() const
+    IndexType getDIdx() const
     {
         return 6;
     };
 
-    IndexType getDIdx() const
+    IndexType getZIdx() const
     {
         return 7;
     };
 
-    IndexType getZIdx() const
+    IndexType getHostRequestTypesIdx() const
     {
         return 8;
     };
 
-    IndexType getHostRequestTypesIdx() const
+    IndexType getLastTokenIdsIdx() const
     {
         return 9;
     };
 
-    IndexType getLastTokenIdsIdx() const
+    IndexType getSlotMappingIdx() const
     {
         return 10;
     };
 
     void setSSMParams(tensorrt_llm::kernels::SSMParamsBase& params,
         // sizes
-        const size_t batch, const size_t dim, const size_t seqLen, const size_t dstate, bool const isVariableB,
-        bool const isVariableC,
+        const size_t batch, const size_t dim, const size_t maxSeqLen, const size_t dstate, const size_t dtRank,
+        bool const isVariableB, bool const isVariableC,
         // device pointers
-        void* statePtr, void const* x, void const* delta, void const* deltaBias, void const* A, void const* B,
-        void const* C, void const* D, void const* z, int const* lastTokenIds, void* out, bool deltaSoftplus);
+        void* statePtr, void const* x, void const* delta, void const* deltaBias, void const* A, void const* BC,
+        void const* D, void const* z, int const* lastTokenIds, int const* slotMapping, void* out, bool deltaSoftplus,
+        bool removePadding);
 
 private:
     int mDim;
     int mDState;
+    int mDtRank;
     bool mIsVariableB;
     bool mIsVariableC;
     bool mDeltaSoftplus;
     nvinfer1::DataType mType;
+    bool mRemovePadding = false;
+    bool mPagedState = false;
 };
 
 class SelectiveScanPluginCreator : public BaseCreator

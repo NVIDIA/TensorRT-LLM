@@ -279,7 +279,7 @@ public:
         // NOTE: MHA kernels should read kv cache that has already been appended with new tokens' kv cache.
         void const* xqa_q_input_ptr = xqaParams.output;
         invokeApplyBiasRopeUpdateKVCache<T, KVCacheBuffer, true>(static_cast<T*>(const_cast<void*>(xqaParams.qkv)),
-            static_cast<T*>(const_cast<void*>(xqaParams.output)), kv_cache_buffer,
+            (__nv_fp8_e4m3*) nullptr, static_cast<T*>(const_cast<void*>(xqaParams.output)), kv_cache_buffer,
             static_cast<T const*>(xqaParams.qkv_bias), xqaParams.sequence_lengths, nullptr, nullptr,
             xqaParams.batch_size, xqaParams.generation_input_length, xqaParams.cyclic_attention_window_size,
             xqaParams.sink_token_length, xqaParams.batch_size * beam_width * xqaParams.generation_input_length,
@@ -287,7 +287,7 @@ public:
             xqaParams.rotary_embedding_base, xqaParams.rotary_embedding_scale_type, xqaParams.rotary_embedding_scale,
             xqaParams.rotary_embedding_max_positions, xqaParams.position_embedding_type,
             xqaParams.medusa_position_offsets, xqaParams.position_shift_enabled, (float*) nullptr, 0, cache_type,
-            xqaParams.kv_scale_orig_quant, true, beam_width, rotary_kernel_launch_cache, stream);
+            xqaParams.kv_scale_orig_quant, true, false, beam_width, rotary_kernel_launch_cache, stream);
 
         sync_check_cuda_error();
 

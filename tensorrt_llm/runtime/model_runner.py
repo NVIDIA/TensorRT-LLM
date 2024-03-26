@@ -129,8 +129,10 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
 
     plugin_config = config['plugin_config']
     use_gpt_attention_plugin = bool(plugin_config['gpt_attention_plugin'])
+    mamba_conv1d_plugin = bool(plugin_config['mamba_conv1d_plugin'])
     remove_input_padding = plugin_config['remove_input_padding']
     paged_kv_cache = plugin_config['paged_kv_cache']
+    paged_state = plugin_config['paged_state']
     tokens_per_block = plugin_config['tokens_per_block']
     use_custom_all_reduce = plugin_config.get('use_custom_all_reduce', False)
     lora_plugin = plugin_config.get('lora_plugin')
@@ -147,9 +149,11 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
         hidden_size=hidden_size,
         head_size=head_size,
         gpt_attention_plugin=use_gpt_attention_plugin,
+        mamba_conv1d_plugin=mamba_conv1d_plugin,
         remove_input_padding=remove_input_padding,
         model_name=model_name,
         paged_kv_cache=paged_kv_cache,
+        paged_state=paged_state,
         cross_attention=cross_attention,
         has_position_embedding=has_position_embedding,
         has_token_type_embedding=has_token_type_embedding,
@@ -370,9 +374,12 @@ class ModelRunner(ModelRunnerMixin):
             head_size=head_size,
             gpt_attention_plugin=bool(
                 build_config.plugin_config.gpt_attention_plugin),
+            mamba_conv1d_plugin=bool(
+                build_config.plugin_config.mamba_conv1d_plugin),
             remove_input_padding=build_config.plugin_config.
             remove_input_padding,
             paged_kv_cache=build_config.plugin_config.paged_kv_cache,
+            paged_state=build_config.plugin_config.paged_state,
             tokens_per_block=build_config.plugin_config.tokens_per_block,
             quant_mode=pretrained_config.quant_mode,
             gather_context_logits=build_config.gather_context_logits,

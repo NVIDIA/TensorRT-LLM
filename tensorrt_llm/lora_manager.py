@@ -213,7 +213,6 @@ def use_lora(
     lora_config: LoraBuildConfig,
     trtllm_modules_to_hf_modules: Dict[str, str] = None,
 ):
-    model.lora_config = lora_config
     if lora_config.lora_ckpt_source == "nemo":
         load_nemo_lora(model, lora_config)
     elif lora_config.lora_ckpt_source == "hf":
@@ -223,6 +222,7 @@ def use_lora(
             f"Unsupported lora_ckpt_source: {lora_config.lora_ckpt_source}")
 
 
+# TODO(https://jirasw.nvidia.com/browse/TRTLLM-233): Deprecate LoraConfig.
 class LoraConfig(object):
 
     def __init__(self,

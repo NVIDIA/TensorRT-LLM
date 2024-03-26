@@ -43,10 +43,11 @@ function(add_gtest test_name test_src)
   target_compile_definitions(${test_name}
                              PUBLIC TOP_LEVEL_DIR="${TOP_LEVEL_DIR}")
   gtest_discover_tests(
-    ${test_name} PROPERTIES ENVIRONMENT "CUDA_MODULE_LOADING=LAZY"
-                            DISCOVERY_TIMEOUT 30) # Longer timeout needed
-                                                  # because discovery can be
-                                                  # slow on Windows
+    ${test_name}
+    PROPERTIES ENVIRONMENT "CUDA_MODULE_LOADING=LAZY" DISCOVERY_MODE
+               PRE_TEST # WAR for DLL discovery on windows.
+               DISCOVERY_TIMEOUT 30) # Longer timeout needed because discovery
+                                     # can be slow on Windows
   add_dependencies(google-tests ${test_name})
 endfunction()
 
@@ -89,6 +90,7 @@ set(SAMPLING_KERNEL_TEST_SRC
     kernels/sampling/samplingUtilsTest.cu)
 add_gtest(samplingKernelsTest "${SAMPLING_KERNEL_TEST_SRC}")
 add_gtest(weightOnlyKernelTest kernels/weightOnly/weightOnlyKernelTest.cpp)
+add_gtest(smoothQuantKernelTest kernels/smoothQuant/smoothQuantKernelTest.cpp)
 add_gtest(decodingKernelsTest kernels/decodingKernelTest.cpp)
 add_gtest(banRepeatNGramsKernelsTest kernels/banRepeatNGramsKernelsTest.cpp)
 add_gtest(stopCriteriaKernelsTest kernels/stopCriteriaKernelsTest.cpp)

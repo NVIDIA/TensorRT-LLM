@@ -15,12 +15,14 @@
  * limitations under the License.
  */
 
+#include <pybind11/functional.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <vector>
 
 #include "bindings.h"
 #include "executor.h"
+#include "streamCaster.h"
 #include "tensorCaster.h"
 
 #include "tensorrt_llm/executor/executor.h"
@@ -112,11 +114,12 @@ void InitBindings(pybind11::module_& m)
         .def_readwrite("request_stats", &tle::RequestStatsPerIteration::requestStats);
 
     py::class_<tle::SamplingConfig>(m, "SamplingConfig")
-        .def(py::init<SizeType, std::optional<SizeType>, std::optional<FloatType>, std::optional<FloatType>,
-                 std::optional<SizeType>, std::optional<FloatType>, std::optional<tle::RandomSeedType>,
-                 std::optional<FloatType>, std::optional<SizeType>, std::optional<FloatType>, std::optional<FloatType>,
-                 std::optional<FloatType>, std::optional<FloatType>, std::optional<FloatType>,
-                 std::optional<SizeType>>(),
+        .def(py::init<SizeType, std::optional<SizeType> const&, std::optional<FloatType> const&,
+                 std::optional<FloatType> const&, std::optional<SizeType> const&, std::optional<FloatType> const&,
+                 std::optional<tle::RandomSeedType> const&, std::optional<FloatType> const&,
+                 std::optional<SizeType> const&, std::optional<FloatType> const&, std::optional<FloatType> const&,
+                 std::optional<FloatType> const&, std::optional<FloatType> const&, std::optional<FloatType> const&,
+                 std::optional<SizeType> const&>(),
             py::arg("beam_width") = 1, py::arg("top_k") = py::none(), py::arg("top_p") = py::none(),
             py::arg("top_p_min") = py::none(), py::arg("top_p_reset_ids") = py::none(),
             py::arg("top_p_decay") = py::none(), py::arg("random_seed") = py::none(),
@@ -150,7 +153,7 @@ void InitBindings(pybind11::module_& m)
         .def_readwrite("exclude_input_from_output", &tle::OutputConfig::excludeInputFromOutput);
 
     py::class_<tle::SpeculativeDecodingConfig>(m, "SpeculativeDecodingConfig")
-        .def(py::init<VecTokens, std::optional<Tensor>, std::optional<FloatType>>(), py::arg("tokens"),
+        .def(py::init<VecTokens, std::optional<Tensor>, std::optional<FloatType> const&>(), py::arg("tokens"),
             py::arg("logits") = py::none(), py::arg("acceptance_threshold") = py::none())
         .def_property_readonly("tokens", &tle::SpeculativeDecodingConfig::getTokens)
         .def_property_readonly("logits", &tle::SpeculativeDecodingConfig::getLogits)
@@ -168,10 +171,11 @@ void InitBindings(pybind11::module_& m)
         .def_property_readonly("config", &tle::LoraConfig::getConfig);
 
     py::class_<tle::Request>(m, "Request")
-        .def(py::init<VecTokens, SizeType, bool, tle::SamplingConfig, tle::OutputConfig, std::optional<SizeType>,
-                 std::optional<SizeType>, std::optional<std::list<VecTokens>>, std::optional<std::list<VecTokens>>,
-                 std::optional<Tensor>, std::optional<tle::SpeculativeDecodingConfig>,
-                 std::optional<tle::PromptTuningConfig>, std::optional<tle::LoraConfig>>(),
+        .def(py::init<VecTokens, SizeType, bool, tle::SamplingConfig const&, tle::OutputConfig const&,
+                 std::optional<SizeType> const&, std::optional<SizeType> const&, std::optional<std::list<VecTokens>>,
+                 std::optional<std::list<VecTokens>>, std::optional<Tensor>,
+                 std::optional<tle::SpeculativeDecodingConfig>, std::optional<tle::PromptTuningConfig>,
+                 std::optional<tle::LoraConfig>>(),
             py::arg("input_token_ids"), py::arg("max_new_tokens"), py::arg("streaming") = false,
             py::arg_v("sampling_config", tle::SamplingConfig(), "SamplingConfig()"),
             py::arg_v("output_config", tle::OutputConfig(), "OutputConfig()"), py::arg("end_id") = py::none(),
@@ -192,7 +196,9 @@ void InitBindings(pybind11::module_& m)
             &tle::Request::setSpeculativeDecodingConfig)
         .def_property(
             "prompt_tuning_config", &tle::Request::getPromptTuningConfig, &tle::Request::setPromptTuningConfig)
-        .def_property("lora_config", &tle::Request::getLoraConfig, &tle::Request::setLoraConfig);
+        .def_property("lora_config", &tle::Request::getLoraConfig, &tle::Request::setLoraConfig)
+        .def_property("logits_post_processor_name", &tle::Request::getLogitsPostProcessorName,
+            &tle::Request::setLogitsPostProcessorName);
 
     py::class_<tle::Result>(m, "Result")
         .def(py::init<>())
@@ -217,8 +223,8 @@ void InitBindings(pybind11::module_& m)
         .def_property_readonly("policy", &tle::SchedulerConfig::getPolicy);
 
     py::class_<tle::KvCacheConfig>(m, "KvCacheConfig")
-        .def(py::init<bool, std::optional<SizeType>, std::optional<SizeType>, std::optional<SizeType>,
-                 std::optional<float>>(),
+        .def(py::init<bool, std::optional<SizeType> const&, std::optional<SizeType> const&,
+                 std::optional<SizeType> const&, std::optional<float> const&>(),
             py::arg("enable_block_reuse") = false, py::arg("max_tokens") = py::none(),
             py::arg("max_attention_window") = py::none(), py::arg("sink_token_length") = py::none(),
             py::arg("free_gpu_memory_fraction") = py::none())
@@ -229,8 +235,8 @@ void InitBindings(pybind11::module_& m)
         .def_property_readonly("free_gpu_memory_fraction", &tle::KvCacheConfig::getFreeGpuMemoryFraction);
 
     py::class_<tle::ParallelConfig>(m, "ParallelConfig")
-        .def(py::init<tle::CommunicationType, tle::CommunicationMode, std::optional<std::vector<SizeType>>,
-                 std::optional<std::vector<SizeType>>>(),
+        .def(py::init<tle::CommunicationType, tle::CommunicationMode, std::optional<std::vector<SizeType>> const&,
+                 std::optional<std::vector<SizeType>> const&>(),
             py::arg_v("communication_type", tle::CommunicationType::kMPI, "CommunicationType.MPI"),
             py::arg_v("communication_mode", tle::CommunicationMode::kLEADER, "CommunicationMode.LEADER"),
             py::arg("device_ids") = py::none(), py::arg("participant_ids") = py::none())
@@ -244,7 +250,7 @@ void InitBindings(pybind11::module_& m)
 
     py::class_<tle::PeftCacheConfig>(m, "PeftCacheConfig")
         .def(py::init<SizeType, SizeType, SizeType, SizeType, SizeType, SizeType, SizeType, SizeType, SizeType,
-                 std::optional<float>, std::optional<size_t>>(),
+                 std::optional<float> const&, std::optional<size_t> const&>(),
             py::arg("num_host_module_layer") = 0, py::arg("num_device_module_layer") = 0,
             py::arg("optimal_adapter_size") = 8, py::arg("max_adapter_size") = 64, py::arg("num_put_workers") = 1,
             py::arg("num_ensure_workers") = 1, py::arg("num_copy_streams") = 1,
@@ -263,8 +269,9 @@ void InitBindings(pybind11::module_& m)
         .def_property_readonly("host_cache_size", &tle::PeftCacheConfig::getHostCacheSize);
 
     py::class_<tle::ExecutorConfig>(m, "ExecutorConfig")
-        .def(py::init<SizeType, tle::SchedulerConfig, tle::KvCacheConfig, bool, bool, SizeType, SizeType,
-                 tle::BatchingType, std::optional<tle::ParallelConfig>, tle::PeftCacheConfig>(),
+        .def(py::init<SizeType, tle::SchedulerConfig const&, tle::KvCacheConfig const&, bool, bool, SizeType, SizeType,
+                 tle::BatchingType, std::optional<tle::ParallelConfig>, tle::PeftCacheConfig const&,
+                 std::optional<tle::LogitsPostProcessorMap>, std::optional<tle::MedusaChoices>>(),
             py::arg("max_beam_width") = 1, py::arg_v("scheduler_config", tle::SchedulerConfig(), "SchedulerConfig()"),
             py::arg_v("kv_cache_config", tle::KvCacheConfig(), "KvCacheConfig()"),
             py::arg("enable_chunked_context") = false, py::arg("normalize_log_probs") = true,
@@ -272,7 +279,8 @@ void InitBindings(pybind11::module_& m)
             py::arg("request_stats_max_iterations") = tle::kDefaultRequestStatsMaxIterations,
             py::arg_v("batching_type", tle::BatchingType::kINFLIGHT, "BatchingType.INFLIGHT"),
             py::arg("parallel_config") = py::none(),
-            py::arg_v("peft_cache_config", tle::PeftCacheConfig(), "PeftCacheConfig()"))
+            py::arg_v("peft_cache_config", tle::PeftCacheConfig(), "PeftCacheConfig()"),
+            py::arg("logits_post_processor_map") = py::none(), py::arg("medusa_choices") = py::none())
         .def_property("max_beam_width", &tle::ExecutorConfig::getMaxBeamWidth, &tle::ExecutorConfig::setMaxBeamWidth)
         .def_property(
             "scheduler_config", &tle::ExecutorConfig::getSchedulerConfig, &tle::ExecutorConfig::setSchedulerConfig)
@@ -289,7 +297,10 @@ void InitBindings(pybind11::module_& m)
         .def_property(
             "parallel_config", &tle::ExecutorConfig::getParallelConfig, &tle::ExecutorConfig::setParallelConfig)
         .def_property(
-            "peft_cache_config", &tle::ExecutorConfig::getPeftCacheConfig, &tle::ExecutorConfig::setPeftCacheConfig);
+            "peft_cache_config", &tle::ExecutorConfig::getPeftCacheConfig, &tle::ExecutorConfig::setPeftCacheConfig)
+        .def_property("logits_post_processor_map", &tle::ExecutorConfig::getLogitsPostProcessorMap,
+            &tle::ExecutorConfig::setLogitsPostProcessorMap)
+        .def_property("medusa_choices", &tle::ExecutorConfig::getMedusaChoices, &tle::ExecutorConfig::setMedusaChoices);
 
     tensorrt_llm::pybind::executor::Executor::initBindings(m);
 }

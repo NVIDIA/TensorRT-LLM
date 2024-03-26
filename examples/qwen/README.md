@@ -2,6 +2,20 @@
 
 This document shows how to build and run a Qwen model in TensorRT-LLM on both single GPU, single node multi-GPU.
 
+- [Qwen](#qwen)
+  - [Overview](#overview)
+  - [Support Matrix](#support-matrix)
+  - [Usage](#usage)
+    - [Download model weights](#download-model-weights)
+    - [Build TensorRT engine(s)](#build-tensorrt-engines)
+      - [INT8 KV cache](#int8-kv-cache)
+      - [SmoothQuant](#smoothquant)
+      - [INT4-GPTQ](#int4-gptq)
+      - [INT4-AWQ](#int4-awq)
+    - [Run](#run)
+    - [Summarization using the Qwen model](#summarization-using-the-qwen-model)
+  - [Credits](#credits)
+
 ## Overview
 
 The TensorRT-LLM Qwen implementation can be found in [model.py](../../tensorrt_llm/models/qwen/model.py). The TensorRT-LLM Qwen example code is located in [`examples/qwen`](./). There is one main file:
@@ -14,11 +28,11 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 * [`../summarize.py`](../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
 
 ## Support Matrix
-|    Model Name    | FP16  | FMHA  |  WO   |  AWQ  | GPTQ  |  SQ   |  TP   | PP  |  ST   | C++ Runtime | benchmark |  IFB  |   Arch  |
-| :--------------: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |:---:|:---:  | :---------: | :-------: | :---: |  :---:  |
-|   Qwen-7B(-Chat)   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |  Y  |   Y   |      Y      |     Y     |   Y   | Ampere+ |
-|  Qwen-14B(-Chat)   |   Y   |   Y   |   Y   |  Y*   |   Y   |   Y   |   Y   |  Y  |   Y   |      Y      |     Y     |   Y   | Ampere+ |
-|  Qwen-72B(-Chat)   |   Y   |   Y   |   Y   |   -   |   Y   |   Y   |   Y   |  Y  |   Y   |      Y      |     Y     |   Y   | Ampere+ |
+|   Model Name    | FP16  | FMHA  |  WO   |  AWQ  | GPTQ  |  SQ   |  TP   |  PP   |  ST   | C++ Runtime | benchmark |  IFB  |  Arch   |
+| :-------------: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---------: | :-------: | :---: | :-----: |
+| Qwen-7B(-Chat)  |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |      Y      |     Y     |   Y   | Ampere+ |
+| Qwen-14B(-Chat) |   Y   |   Y   |   Y   |  Y*   |   Y   |   Y   |   Y   |   Y   |   Y   |      Y      |     Y     |   Y   | Ampere+ |
+| Qwen-72B(-Chat) |   Y   |   Y   |   Y   |   -   |   Y   |   Y   |   Y   |   Y   |   Y   |      Y      |     Y     |   Y   | Ampere+ |
 
 *Please note that Qwen-14B-Chat model supports AWQ only with single GPU.
 * Model Name: the name of the model, the same as the name on HuggingFace
@@ -38,11 +52,39 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 
 The TensorRT-LLM Qwen example code locates at [examples/qwen](./). It takes HF weights as input, and builds the corresponding TensorRT engines. The number of TensorRT engines depends on the number of GPUs used to run inference.
 
+### Download model weights
+
+Install the dependency packages and setup `git-lfs`.
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Setup git-lfs
+git lfs install
+```
+
+Download one or more Qwen models that you would like to build to TensorRT-LLM engines. You may download from the [HuggingFace](https://huggingface.co) hub:
+
+```bash
+git clone https://huggingface.co/Qwen/Qwen-7B-Chat   ./tmp/Qwen/7B
+git clone https://huggingface.co/Qwen/Qwen-14B-Chat  ./tmp/Qwen/14B
+git clone https://huggingface.co/Qwen/Qwen-72B-Chat  ./tmp/Qwen/72B
+```
+
+Or download from the [ModelScope](https://www.modelscope.cn) hub:
+
+```bash
+git clone https://www.modelscope.cn/qwen/Qwen-7B-Chat.git   ./tmp/Qwen/7B
+git clone https://www.modelscope.cn/qwen/Qwen-14B-Chat.git  ./tmp/Qwen/14B
+git clone https://www.modelscope.cn/qwen/Qwen-72B-Chat.git  ./tmp/Qwen/72B
+```
+
 ### Build TensorRT engine(s)
 
-Need to prepare the HF Qwen checkpoint first by following the guides here [Qwen-7B-Chat](https://huggingface.co/Qwen/Qwen-7B-Chat)
+The [`convert_checkpoint.py`](./convert_checkpoint.py) script converts HF weights to TensorRT-LLM checkpoints.
 
-TensorRT-LLM builds TensorRT engine(s) from HF checkpoint. If no checkpoint directory is specified, TensorRT-LLM will build engine(s) with dummy weights.
+The `trtllm-build` command builds TensorRT-LLM engines from TensorRT-LLM checkpoints. The number of engine files is also same to the number of GPUs used to run inference.
 
 Normally `trtllm-build` only requires single GPU, but if you've already got all the GPUs needed while inferencing, you could enable parallelly building to make the engine building process faster by adding `--workers` argument. Please note that currently `workers` feature only supports single node.
 
@@ -50,7 +92,7 @@ Here're some examples:
 
 ```bash
 # Build a single-GPU float16 engine from HF weights.
-# Try use_gemm_plugin to prevent accuracy issue.
+# Try --gemm_plugin to prevent accuracy issue.
 
 # Build the Qwen-7B-Chat model using a single GPU and FP16.
 python convert_checkpoint.py --model_dir ./tmp/Qwen/7B/ \
@@ -121,7 +163,7 @@ python convert_checkpoint.py --model_dir ./tmp/Qwen/14B/ \
 
 trtllm-build --checkpoint_dir ./tllm_checkpoint_2gpu_tp2 \
             --output_dir ./tmp/qwen/14B/trt_engines/fp16/2-gpu/ \
-            --gemm_plugin float16 \
+            --gemm_plugin float16
 
 # Build Qwen-72B-Chat using 8-way tensor parallelism.
 python convert_checkpoint.py --model_dir ./tmp/Qwen/72B/ \
@@ -131,7 +173,7 @@ python convert_checkpoint.py --model_dir ./tmp/Qwen/72B/ \
 
 trtllm-build --checkpoint_dir ./tllm_checkpoint_8gpu_tp8 \
             --output_dir ./tmp/qwen/72B/trt_engines/fp16/8-gpu/ \
-            --gemm_plugin float16 \
+            --gemm_plugin float16
 ```
 
 #### INT8 KV cache
@@ -151,7 +193,7 @@ python convert_checkpoint.py --model_dir ./tmp/Qwen/7B/   \
 
 trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_sq \
              --output_dir ./engine_outputs \
-             --strongly_typed
+             --strongly_typed \
              --gemm_plugin float16
 ```
 

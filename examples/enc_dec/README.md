@@ -2,6 +2,23 @@
 
 This document shows how to build and run an Encoder-Decoder (Enc-Dec) model in TensorRT-LLM on NVIDIA GPUs.
 
+## Table of Contents
+
+- [Encoder-Decoder](#encoder-decoder)
+  - [Table of Contents](#table-of-contents)
+  - [Overview](#overview)
+  - [Usage](#usage)
+  - [Encoder-Decoder Model Support](#encoder-decoder-model-support)
+    - [Download weights from HuggingFace Transformers](#download-weights-from-huggingface-transformers)
+    - [Convert and Split Weights](#convert-and-split-weights)
+    - [Build TensorRT engine(s)](#build-tensorrt-engines)
+    - [Run](#run)
+    - [Benchmark](#benchmark)
+    - [Run BART with LoRA](#run-bart-with-lora)
+    - [Reminders](#reminders)
+    - [Attention Scaling Factors](#attention-scaling-factors)
+    - [Run FairSeq NMT (Neural Machine Translation) models](#run-fairseq-nmt-neural-machine-translation-models)
+
 ## Overview
 
 The TensorRT-LLM Enc-Dec implementation can be found in [tensorrt_llm/models/enc_dec/model.py](../../tensorrt_llm/models/enc_dec/model.py). The TensorRT-LLM Enc-Dec example code is located in [`examples/enc_dec`](./):

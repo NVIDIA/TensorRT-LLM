@@ -16,20 +16,20 @@ import unittest
 
 from tensorrt_llm.layers import ColumnLinear, RowLinear
 from tensorrt_llm.models import GPTForCausalLM, PretrainedConfig
-from tensorrt_llm.quantization import QuantMode
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.quantization.layers import (SmoothQuantAttention,
                                               SmoothQuantLayerNorm,
                                               SmoothQuantMLP,
                                               WeightOnlyQuantColumnLinear,
                                               WeightOnlyQuantRowLinear)
-from tensorrt_llm.quantization.mode import W8A8_SQ_PER_TENSOR_PLUGIN
 from tensorrt_llm.quantization.quantize import quantize
 
 
 class TestQuant(unittest.TestCase):
 
     def test_weight_only_quant(self):
-        mode = QuantMode.use_weight_only()
+        quant_algo = QuantAlgo.W8A16
         config = {
             'architecture': 'GPTForCausalLM',
             'dtype': 'float16',
@@ -43,7 +43,7 @@ class TestQuant(unittest.TestCase):
         config = PretrainedConfig.from_dict(config)
         model = GPTForCausalLM(config)
 
-        quant_model = quantize(model, mode)
+        quant_model = quantize(model, QuantConfig(quant_algo))
 
         self.assertTrue(hasattr(quant_model, 'quant_mode'))
 
@@ -76,7 +76,7 @@ class TestQuant(unittest.TestCase):
         self.assertTrue(isinstance(quant_model.lm_head, ColumnLinear))
 
     def test_weight_only_quant_exclude_modules(self):
-        mode = QuantMode.use_weight_only()
+        quant_algo = QuantAlgo.W8A16
         config = {
             'architecture': 'GPTForCausalLM',
             'dtype': 'float16',
@@ -90,7 +90,8 @@ class TestQuant(unittest.TestCase):
         config = PretrainedConfig.from_dict(config)
         model = GPTForCausalLM(config)
 
-        quant_model = quantize(model, mode, exclude_modules=['fc', 'dense'])
+        quant_model = quantize(
+            model, QuantConfig(quant_algo, exclude_modules=['fc', 'dense']))
 
         self.assertTrue(hasattr(quant_model, 'quant_mode'))
 
@@ -122,17 +123,16 @@ class TestQuant(unittest.TestCase):
         config = PretrainedConfig.from_dict(config)
         model = GPTForCausalLM(config)
 
-        quant_mode = QuantMode.use_smooth_quant()
-        quant_model = quantize(model,
-                               quant_mode,
-                               quant_algo=W8A8_SQ_PER_TENSOR_PLUGIN)
+        quant_algo = QuantAlgo.W8A8_SQ_PER_TENSOR_PLUGIN
+        quant_config = QuantConfig(quant_algo)
+        quant_model = quantize(model, quant_config)
         for layer in quant_model.transformer.layers:
             assert isinstance(layer.input_layernorm, SmoothQuantLayerNorm)
             assert isinstance(layer.post_layernorm, SmoothQuantLayerNorm)
             assert isinstance(layer.mlp, SmoothQuantMLP)
             assert isinstance(layer.attention, SmoothQuantAttention)
 
-        assert quant_model.quant_mode == quant_mode
+        assert quant_model.quant_mode == quant_config.quant_mode
 
 
 if __name__ == '__main__':

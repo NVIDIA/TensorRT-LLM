@@ -96,6 +96,7 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
               run_llama=False,
               run_chatglm=False,
               run_medusa=False,
+              run_mamba=False,
               run_fp8=False,
               only_multi_gpu=False,
               trt_root: _tp.Optional[str] = None,
@@ -117,6 +118,21 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
                   dist_dir=dist_dir,
                   trt_root=trt_root,
                   job_count=job_count)
+
+    if run_mamba:
+        # adding here but not in requirements.txt to prevent break build package.
+        run_command([
+            python_exe, "-m", "pip", "install", "causal-conv1d==1.2.0.post2",
+            "mamba-ssm==1.2.0.post1"
+        ],
+                    cwd=root_dir,
+                    env=_os.environ,
+                    timeout=300)
+        run_command(
+            [python_exe, "-m", "pip", "install", "--force-reinstall", "build"],
+            cwd=root_dir,
+            env=_os.environ,
+            timeout=300)
 
     build_dir = build_dir if build_dir.is_absolute() else root_dir / build_dir
     resources_dir = _pl.Path("cpp") / "tests" / "resources"
@@ -162,6 +178,7 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
                                 run_llama=run_llama,
                                 run_chatglm=run_chatglm,
                                 run_medusa=run_medusa,
+                                run_mamba=run_mamba,
                                 run_fp8=run_fp8)
 
         if build_only:
@@ -173,6 +190,7 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
                              run_llama=run_llama,
                              run_chatglm=run_chatglm,
                              run_medusa=run_medusa,
+                             run_mamba=run_mamba,
                              run_fp8=run_fp8)
 
         if run_gpt:
@@ -204,6 +222,7 @@ def prepare_all_model_tests(python_exe: str,
                             run_llama=False,
                             run_chatglm=False,
                             run_medusa=False,
+                            run_mamba=False,
                             run_fp8=False):
     model_cache_arg = ["--model_cache", model_cache] if model_cache else []
 
@@ -259,6 +278,15 @@ def prepare_all_model_tests(python_exe: str,
                             model_cache_arg=model_cache_arg)
     else:
         _log.info("Skipping Medusa tests")
+
+    if run_mamba:
+        prepare_model_tests(model_name="mamba",
+                            python_exe=python_exe,
+                            root_dir=root_dir,
+                            resources_dir=resources_dir,
+                            model_cache_arg=model_cache_arg)
+    else:
+        _log.info("Skipping Mamba tests")
 
 
 def prepare_multi_gpu_model_tests(python_exe: str,
@@ -329,12 +357,13 @@ def run_unit_tests(build_dir: _pl.Path):
     excluded_tests.append("Llama")
     excluded_tests.append("ChatGlm")
     excluded_tests.append("Medusa")
+    excluded_tests.append("Mamba")
     ctest.extend(["-E", "|".join(excluded_tests)])
     run_command(ctest, cwd=build_dir, env=cpp_env, timeout=1800)
 
 
 def run_single_gpu_tests(build_dir: _pl.Path, run_gpt, run_gptj, run_llama,
-                         run_chatglm, run_medusa, run_fp8):
+                         run_chatglm, run_medusa, run_mamba, run_fp8):
     build_tests(build_dir=build_dir)
 
     cpp_env = {**_os.environ}
@@ -354,6 +383,8 @@ def run_single_gpu_tests(build_dir: _pl.Path, run_gpt, run_gptj, run_llama,
         included_tests.append("ChatGlm")
     if run_medusa:
         included_tests.append("Medusa")
+    if run_mamba:
+        included_tests.append("Mamba")
 
     excluded_tests = []
     if not run_fp8:
@@ -507,6 +538,9 @@ if __name__ == "__main__":
     parser.add_argument("--run_medusa",
                         action="store_true",
                         help="Run the tests for Medusa")
+    parser.add_argument("--run_mamba",
+                        action="store_true",
+                        help="Run the tests for Mamba")
     parser.add_argument(
         "--run_fp8",
         action="store_true",
@@ -526,6 +560,7 @@ if __name__ == "__main__":
         args.run_gptj = True
         args.run_llama = True
         args.run_chatglm = True
+        args.run_mamba = True
 
     del args.run_all_models
 

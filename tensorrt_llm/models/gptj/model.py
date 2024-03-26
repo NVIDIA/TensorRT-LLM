@@ -16,7 +16,7 @@
 from ..._utils import pad_vocab_size
 from ...functional import PositionEmbeddingType, Tensor, allreduce
 from ...layers import (MLP, Attention, AttentionMaskType, ColumnLinear,
-                       Embedding, KeyValueCacheParams, LayerNorm)
+                       Embedding, LayerNorm)
 from ...module import Module
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
                               PretrainedConfig)
@@ -109,19 +109,9 @@ class GPTJModel(Module):
         self.config = config
 
         if config.mapping.is_first_pp_rank():
-            if config.use_parallel_embedding:
-                self.vocab_embedding = Embedding(
-                    config.vocab_size,
-                    config.hidden_size,
-                    dtype=config.dtype,
-                    tp_group=config.mapping.tp_group,
-                    tp_size=config.mapping.tp_size,
-                    sharding_dim=config.embedding_sharding_dim,
-                    tp_rank=config.mapping.tp_rank)
-            else:
-                self.vocab_embedding = Embedding(config.vocab_size,
-                                                 config.hidden_size,
-                                                 dtype=config.dtype)
+            self.vocab_embedding = Embedding(config.vocab_size,
+                                             config.hidden_size,
+                                             dtype=config.dtype)
         self.layers = DecoderLayerList(GPTJDecoderLayer, config)
         if config.mapping.is_last_pp_rank():
             self.ln_f = LayerNorm(normalized_shape=config.hidden_size,
@@ -137,33 +127,14 @@ class GPTJModel(Module):
 
         hidden_states = self.vocab_embedding(input_ids)
 
-        kv_cache_params.fill_none_tensor_list(len(self.layers))
+        hidden_states = self.layers(hidden_states,
+                                    use_cache=use_cache,
+                                    attention_mask=attention_mask,
+                                    kv_cache_params=kv_cache_params,
+                                    attention_params=attention_params)
 
         if use_cache:
-            presents = []
-
-        for layer, past in zip(self.layers, kv_cache_params.past_key_value):
-            hidden_states = layer(
-                hidden_states,
-                use_cache=use_cache,
-                kv_cache_params=KeyValueCacheParams(
-                    past_key_value=[past],
-                    host_past_key_value_lengths=kv_cache_params.
-                    host_past_key_value_lengths,
-                    host_max_attention_window_sizes=kv_cache_params.
-                    host_max_attention_window_sizes,
-                    host_sink_token_length=kv_cache_params.
-                    host_sink_token_length,
-                    kv_cache_block_pointers=kv_cache_params.
-                    kv_cache_block_pointers,
-                    host_kv_cache_block_pointers=kv_cache_params.
-                    host_kv_cache_block_pointers,
-                    cache_indirection=kv_cache_params.cache_indirection),
-                attention_params=attention_params)
-
-            if use_cache:
-                presents.append(hidden_states[1])
-                hidden_states = hidden_states[0]
+            hidden_states, presents = hidden_states
 
         hidden_states = self.ln_f(hidden_states)
 

@@ -1638,13 +1638,13 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     {
         if (HANDLE_KV)
         {
-            apply_rotary_embedding(q, k, tidx, params.rotary_embedding_dim, params.rotary_embedding_base,
-                params.rotary_embedding_scale, current_pos_idx);
+            apply_rotary_embedding(q, k, tidx, params.rotary_embedding_dim, rotary_embedding_base,
+                rotary_embedding_scale, current_pos_idx);
         }
         else
         {
-            apply_rotary_embedding(q, tidx, params.rotary_embedding_dim, params.rotary_embedding_base,
-                params.rotary_embedding_scale, current_pos_idx);
+            apply_rotary_embedding(
+                q, tidx, params.rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale, current_pos_idx);
         }
         break;
     }
@@ -2589,6 +2589,9 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         __syncthreads();
     }
 
+    // Quantized output only supports fp8 currently, which should be used together with FP8 Context FMHA.
+    using Quantized_t = __nv_fp8_e4m3;
+    using Quantized_vec = typename packed_type<__nv_fp8_e4m3, num_elems<V_vec_accum>::value>::type;
     auto const bhi = tensorrt_llm::common::flat_index2(batch_beam_idx, hi, num_heads);
     auto const bhi_seq_len_tile = bhi * params.seq_len_tile;
     // Output the final values.
@@ -2596,35 +2599,36 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     {
         auto const bhvi = tensorrt_llm::common::flat_index2(bhi, vi, Dh);
 #ifdef MMHA_USE_FP32_ACCUM_FOR_OUT
-        if (write_attention_quant)
+        if (!MULTI_BLOCK_FLAG)
         {
-            using Packed_Int8_t = typename packed_type<int8_t, num_elems<V_vec_accum>::value>::type;
-            out = mul<V_vec_accum, float>(*params.attention_out_scale_orig_quant, out);
-            *reinterpret_cast<Packed_Int8_t*>(&(reinterpret_cast<int8_t*>(params.out)[bhvi])) = cast_to_int8(out);
-        }
-        else
-        {
-            if (!MULTI_BLOCK_FLAG)
+            if (write_attention_quant)
+            {
+                out = mul<V_vec_accum, float>(*params.attention_out_scale_orig_quant, out);
+                Quantized_vec final_out;
+                convert_to_fp8(&final_out, out);
+                *reinterpret_cast<Quantized_vec*>(reinterpret_cast<Quantized_t*>(params.out) + bhvi) = final_out;
+            }
+            else
             {
                 // This makes sure we have coalesced memory access.
                 V_vec_k final_out;
                 convert_from_float(&final_out, out);
                 *reinterpret_cast<V_vec_k*>(&params.out[bhvi]) = final_out;
             }
-            else
-            {
-                // for write partial output to partial_out
-                int partial_out_offset = c_tile * params.batch_size * num_heads * params.hidden_size_per_head;
-                // for write partial statistics to partial_max and partial_sum
-                int partial_stats_offset = bhi_seq_len_tile + c_tile;
+        }
+        else
+        {
+            // for write partial output to partial_out
+            int partial_out_offset = c_tile * params.batch_size * num_heads * params.hidden_size_per_head;
+            // for write partial statistics to partial_max and partial_sum
+            int partial_stats_offset = bhi_seq_len_tile + c_tile;
 
-                // This makes sure we have coalesced memory access.
-                V_vec_k partial_out;
-                convert_from_float(&partial_out, out);
-                *reinterpret_cast<V_vec_k*>(&params.partial_out[partial_out_offset + bhvi]) = partial_out;
-                convert_from_float(reinterpret_cast<float*>(&params.partial_max[partial_stats_offset]), qk_max);
-                convert_from_float(reinterpret_cast<float*>(&params.partial_sum[partial_stats_offset]), sum);
-            }
+            // This makes sure we have coalesced memory access.
+            V_vec_k partial_out;
+            convert_from_float(&partial_out, out);
+            *reinterpret_cast<V_vec_k*>(&params.partial_out[partial_out_offset + bhvi]) = partial_out;
+            convert_from_float(reinterpret_cast<float*>(&params.partial_max[partial_stats_offset]), qk_max);
+            convert_from_float(reinterpret_cast<float*>(&params.partial_sum[partial_stats_offset]), sum);
         }
 #else  // MMHA_USE_FP32_ACCUM_FOR_OUT
         *reinterpret_cast<V_vec_accum*>(&params.out[bhvi]) = out;
@@ -2768,13 +2772,25 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
 
             if (oo == 0 && (Dh == Dh_MAX || oi < Dh))
             {
-                auto const inv_sum = __fdividef(1.f, final_sum + 1.e-6f);
+                auto const inv_sum = __fdividef(
+                    write_attention_quant ? *params.attention_out_scale_orig_quant : 1.f, final_sum + 1.e-6f);
 
                 Tk inv_sum_compute;
                 convert_from_float(&inv_sum_compute, inv_sum);
 
                 thread_accumulated_out = mul<V_vec_k, Tk, V_vec_k>(inv_sum_compute, thread_accumulated_out);
-                *reinterpret_cast<V_vec_k*>(&params.out[bhi * Dh + oi]) = thread_accumulated_out;
+
+                if (write_attention_quant)
+                {
+                    Quantized_vec final_out;
+                    convert_to_fp8(&final_out, thread_accumulated_out);
+                    *reinterpret_cast<Quantized_vec*>(reinterpret_cast<Quantized_t*>(params.out) + bhi * Dh + oi)
+                        = final_out;
+                }
+                else
+                {
+                    *reinterpret_cast<V_vec_k*>(&params.out[bhi * Dh + oi]) = thread_accumulated_out;
+                }
             }
 
             // Reset qk_current_smem and block_counter for the next timestep

@@ -2,10 +2,7 @@ import argparse
 import json
 import os
 
-from tensorrt_llm.quantization.mode import (
-    FP8, INT8, W4A8_AWQ, W4A16, W4A16_AWQ, W4A16_GPTQ, W8A8_SQ_PER_CHANNEL,
-    W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN, W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN,
-    W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN, W8A8_SQ_PER_TENSOR_PLUGIN, W8A16)
+from tensorrt_llm.quantization import KV_CACHE_QUANT_ALGO_LIST, QUANT_ALGO_LIST
 
 
 def parse_arguments():
@@ -70,18 +67,13 @@ def parse_arguments():
     parser.add_argument('--quant_algo',
                         type=str,
                         default=None,
-                        choices=[
-                            None, W8A16, W4A16, W4A16_AWQ, W4A8_AWQ, W4A16_GPTQ,
-                            W8A8_SQ_PER_CHANNEL, W8A8_SQ_PER_TENSOR_PLUGIN,
-                            W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN,
-                            W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN,
-                            W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN
-                        ])
+                        choices=[None] + QUANT_ALGO_LIST)
     parser.add_argument('--kv_cache_quant_algo',
                         type=str,
                         default=None,
-                        choices=[None, FP8, INT8])
+                        choices=[None] + KV_CACHE_QUANT_ALGO_LIST)
     parser.add_argument('--group_size', type=int, default=64)
+    parser.add_argument('--smoothquant_val', type=float, default=None)
     parser.add_argument('--has_zero_point', default=False, action='store_true')
     parser.add_argument('--pre_quant_scale', default=False, action='store_true')
     parser.add_argument('--exclude_modules', nargs='+', default=None)
@@ -93,30 +85,6 @@ def parse_arguments():
     parser.add_argument('--rotary_pct', type=float, default=1.0)
     parser.add_argument('--rotary_base', type=float, default=10000.0)
     parser.add_argument('--rotary_scaling', nargs=2, type=str, default=None)
-
-    parser.add_argument(
-        '--max_lora_rank',
-        type=int,
-        default=64,
-        help='maximum lora rank for different lora modules. '
-        'It is used to compute the workspace size of lora plugin.')
-    parser.add_argument(
-        '--lora_target_modules',
-        nargs='+',
-        default=None,
-        choices=[
-            "attn_qkv",
-            "attn_q",
-            "attn_k",
-            "attn_v",
-            "attn_dense",
-            "mlp_h_to_4h",
-            "mlp_gate",
-            "mlp_4h_to_h",
-        ],
-        help=
-        "Add lora in which modules. Only be activated when use_lora_plugin is enabled."
-    )
 
     args = parser.parse_args()
     return args
@@ -150,6 +118,7 @@ if __name__ == '__main__':
         'quantization': {
             'quant_algo': args.quant_algo,
             'kv_cache_quant_algo': args.kv_cache_quant_algo,
+            'exclude_modules': args.exclude_modules,
         },
         'mapping': {
             'world_size': world_size,
@@ -161,8 +130,6 @@ if __name__ == '__main__':
         'rotary_pct': args.rotary_pct,
         'rotary_base': args.rotary_base,
         'rotary_scaling': args.rotary_scaling,
-        'max_lora_rank': args.max_lora_rank,
-        'lora_target_modules': args.lora_target_modules,
     }
 
     if args.intermediate_size is None:
@@ -179,8 +146,11 @@ if __name__ == '__main__':
                 args.has_zero_point,
                 'pre_quant_scale':
                 args.pre_quant_scale,
-                'exclude_modules':
-                args.exclude_modules,
+            })
+        if 'SQ' in args.quant_algo:
+            config['quantization'].update({
+                'smoothquant_val':
+                args.smoothquant_val,
             })
 
     with open(args.output_path, 'w') as f:

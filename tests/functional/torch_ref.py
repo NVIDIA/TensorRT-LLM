@@ -155,6 +155,38 @@ def attention_qkvpacked_ref(qkv,
                          reorder_ops=reorder_ops)
 
 
+def mamba_conv1d_ref(x, past_conv_state, conv_weight, conv_bias):
+    """
+    Arguments:
+        x: [batch_size, dim, seq_len]
+        past_conv_state: [batch_size, dim, dconv-1]
+        conv_weight: [dim, 1, dconv]
+        conv_bias: [dim]
+    Output:
+        y: [batch_size, dim, seq_len]
+        present_conv_state: [batch_size, dim, dconv-1]
+    """
+    assert x.dim() == 3
+    assert past_conv_state.dim() == 3
+    assert conv_weight.dim() == 3
+    assert conv_bias.dim() == 1
+    batch_size, dim, seq_len = x.shape
+    assert past_conv_state.shape[0] == batch_size
+    assert past_conv_state.shape[1] == dim
+    dconv = past_conv_state.shape[2] + 1
+    assert conv_weight.shape[0] == dim
+    assert conv_weight.shape[1] == 1
+    assert conv_weight.shape[2] == dconv
+    assert conv_weight.shape[0] == dim
+
+    padded_x = torch.cat([past_conv_state, x], dim=2)
+    present_conv_state = padded_x[:, :, -(dconv - 1):]
+    x_conv = F.conv1d(padded_x, conv_weight, bias=conv_bias, groups=dim)
+
+    y = F.silu(x_conv)
+    return y, present_conv_state
+
+
 def selective_scan_ref(u,
                        delta,
                        A,
@@ -325,17 +357,27 @@ class mamba_ref(nn.Module):
                 last_token_ids,
                 conv_state,
                 ssm_state,
+                remove_padding,
+                batch_size,
                 seqlen_offset=0):
-        batch, seqlen, _ = hidden_states.shape
         out, present_conv_state, present_ssm_state = [], [], []
-        for i in range(batch):
-            hidden_states_i = hidden_states[i:i + 1, 0:last_token_ids[i], :]
+        for i in range(batch_size):
+            start_id = 0 if (i == 0
+                             or not remove_padding) else last_token_ids[i - 1]
+            end_id = last_token_ids[i]
+            if remove_padding:
+                hidden_states_i = hidden_states[start_id:end_id, :].unsqueeze(0)
+            else:
+                hidden_states_i = hidden_states[i:i + 1, start_id:end_id, :]
             conv_state_i = conv_state[i:i + 1, :]
             ssm_state_i = ssm_state[i:i + 1, :]
             out_i, conv_state_i, ssm_state_i = self.forward_impl(
                 hidden_states_i, conv_state_i, ssm_state_i, seqlen_offset)
-            out_i = F.pad(out_i, (0, 0, 0, seqlen - out_i.shape[1], 0, 0),
-                          value=0)
+            if remove_padding:
+                out_i = out_i.squeeze(0)
+            else:
+                padding_num = hidden_states.shape[1] - out_i.shape[1]
+                out_i = F.pad(out_i, (0, 0, 0, padding_num, 0, 0), value=0)
             out.append(out_i)
             present_conv_state.append(conv_state_i)
             present_ssm_state.append(ssm_state_i)

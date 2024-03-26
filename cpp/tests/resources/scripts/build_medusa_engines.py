@@ -37,8 +37,8 @@ def build_engine(weight_dir: _pl.Path, medusa_dir: _pl.Path,
         ['--checkpoint_dir', str(engine_dir)] if engine_dir else []) + [
             '--output_dir',
             str(engine_dir), '--gpt_attention_plugin=float16',
-            '--gemm_plugin=float16', '--max_batch_size=32',
-            '--max_input_len=1024', '--max_output_len=20', '--log_level=error',
+            '--gemm_plugin=float16', '--max_batch_size=8',
+            '--max_input_len=512', '--max_output_len=20', '--log_level=error',
             '--paged_kv_cache=enable', '--remove_input_padding=enable'
         ]
 
@@ -55,8 +55,8 @@ def build_engines(model_cache: str):
         print("Copy model from model_cache")
         model_cache_dir = _pl.Path(model_cache) / model_name
         medusa_cache_dir = _pl.Path(model_cache) / medusa_name
-        assert (model_cache_dir.is_dir())
-        assert (medusa_cache_dir.is_dir())
+        assert model_cache_dir.is_dir()
+        assert medusa_cache_dir.is_dir()
 
         if _pf.system() == "Windows":
             wincopy(source=str(model_cache_dir),

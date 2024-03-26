@@ -273,9 +273,9 @@ TEST_F(LoraCacheTest, determineNumPages)
 
 TEST_F(LoraCacheTest, basicPutGet)
 {
-    TensorPtr loraReqWeights = utils::loadNpy(*mManager, TEST_SOURCE_LORA_TP2, MemoryType::kCPU);
-    TensorPtr loraReqKeys = utils::loadNpy(*mManager, TEST_KEYS_LORA_TP2, MemoryType::kCPU);
-    TensorPtr loraDestWeights = utils::loadNpy(*mManager, TEST_DEST_LORA_TP2, MemoryType::kCPU);
+    TensorPtr loraReqWeights = utils::loadNpy(*mManager, TEST_SOURCE_LORA_TP2.string(), MemoryType::kCPU);
+    TensorPtr loraReqKeys = utils::loadNpy(*mManager, TEST_KEYS_LORA_TP2.string(), MemoryType::kCPU);
+    TensorPtr loraDestWeights = utils::loadNpy(*mManager, TEST_DEST_LORA_TP2.string(), MemoryType::kCPU);
 
     EXPECT_FALSE(mLoraCache->has(1234));
     mLoraCache->put(1234, loraReqWeights, loraReqKeys);
@@ -443,13 +443,13 @@ TEST_F(LoraCacheTest, copyToPages_tp1)
         moduleIdToModule[m.value()] = m;
     }
 
-    TensorPtr loraReqWeights = utils::loadNpy(*mManager, TEST_SOURCE_LORA_TP1, MemoryType::kCPU);
+    TensorPtr loraReqWeights = utils::loadNpy(*mManager, TEST_SOURCE_LORA_TP1.string(), MemoryType::kCPU);
     loraReqWeights->unsqueeze(0);
-    TensorPtr loraReqKeys = utils::loadNpy(*mManager, TEST_KEYS_LORA_TP1, MemoryType::kCPU);
+    TensorPtr loraReqKeys = utils::loadNpy(*mManager, TEST_KEYS_LORA_TP1.string(), MemoryType::kCPU);
     loraReqKeys->unsqueeze(0);
-    TensorPtr loraTargetTensors = utils::loadNpy(*mManager, TEST_DEST_LORA_TP1, MemoryType::kCPU);
+    TensorPtr loraTargetTensors = utils::loadNpy(*mManager, TEST_DEST_LORA_TP1.string(), MemoryType::kCPU);
 
-    TensorPtr targetPageBlock = utils::loadNpy(*mManager, TEST_KEYS_LORA_TP1_PAGES_RANK0, MemoryType::kCPU);
+    TensorPtr targetPageBlock = utils::loadNpy(*mManager, TEST_KEYS_LORA_TP1_PAGES_RANK0.string(), MemoryType::kCPU);
     TensorPtr pageBlock = mManager->cpu(targetPageBlock->getShape(), targetPageBlock->getDataType());
     mManager->setZero(*pageBlock);
     std::vector<TensorPtr> pages;
@@ -501,12 +501,12 @@ TEST_F(LoraCacheTest, copyToPages_tp2_rank0)
         moduleIdToModule[m.value()] = m;
     }
 
-    TensorPtr loraReqWeights = utils::loadNpy(*mManager, TEST_SOURCE_LORA_TP2, MemoryType::kCPU);
+    TensorPtr loraReqWeights = utils::loadNpy(*mManager, TEST_SOURCE_LORA_TP2.string(), MemoryType::kCPU);
     loraReqWeights->unsqueeze(0);
-    TensorPtr loraReqKeys = utils::loadNpy(*mManager, TEST_KEYS_LORA_TP2, MemoryType::kCPU);
+    TensorPtr loraReqKeys = utils::loadNpy(*mManager, TEST_KEYS_LORA_TP2.string(), MemoryType::kCPU);
     loraReqKeys->unsqueeze(0);
 
-    TensorPtr targetPageBlock = utils::loadNpy(*mManager, TEST_KEYS_LORA_TP2_PAGES_RANK0, MemoryType::kCPU);
+    TensorPtr targetPageBlock = utils::loadNpy(*mManager, TEST_KEYS_LORA_TP2_PAGES_RANK0.string(), MemoryType::kCPU);
     TensorPtr pageBlock = mManager->cpu(targetPageBlock->getShape(), targetPageBlock->getDataType());
     mManager->setZero(*pageBlock);
     std::vector<TensorPtr> pages;
@@ -558,12 +558,12 @@ TEST_F(LoraCacheTest, copyToPages_tp2_rank1)
         moduleIdToModule[m.value()] = m;
     }
 
-    TensorPtr loraReqWeights = utils::loadNpy(*mManager, TEST_SOURCE_LORA_TP2, MemoryType::kCPU);
+    TensorPtr loraReqWeights = utils::loadNpy(*mManager, TEST_SOURCE_LORA_TP2.string(), MemoryType::kCPU);
     loraReqWeights->unsqueeze(0);
-    TensorPtr loraReqKeys = utils::loadNpy(*mManager, TEST_KEYS_LORA_TP2, MemoryType::kCPU);
+    TensorPtr loraReqKeys = utils::loadNpy(*mManager, TEST_KEYS_LORA_TP2.string(), MemoryType::kCPU);
     loraReqKeys->unsqueeze(0);
 
-    TensorPtr targetPageBlock = utils::loadNpy(*mManager, TEST_KEYS_LORA_TP2_PAGES_RANK1, MemoryType::kCPU);
+    TensorPtr targetPageBlock = utils::loadNpy(*mManager, TEST_KEYS_LORA_TP2_PAGES_RANK1.string(), MemoryType::kCPU);
     TensorPtr pageBlock = mManager->cpu(targetPageBlock->getShape(), targetPageBlock->getDataType());
     mManager->setZero(*pageBlock);
     std::vector<TensorPtr> pages;

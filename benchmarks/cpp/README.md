@@ -127,6 +127,7 @@ python prepare_dataset.py \
 
 For `tokenizer`, specifying the path to the local tokenizer that have already been downloaded, or simply the name of the tokenizer from HuggingFace like `meta-llama/Llama-2-7b` will both work. The tokenizer will be downloaded automatically for the latter case.
 
+
 #### Prepare TensorRT-LLM engines
 Please make sure that the engines are built with argument `--use_inflight_batching` and `--remove_input_padding` if you'd like to benchmark inflight batching, for more details, please see the document in TensorRT-LLM examples.
 
@@ -186,4 +187,131 @@ Take GPT-350M as an example for single GPU with static batching
     --static_emulated_batch_size 32 \
     --static_emulated_timeout 100 \
     --dataset ../../benchmarks/cpp/tokens-fixed-lengths.json
+```
+
+#### Benchmarking LoRA
+
+Using either of the `prepare_dataset.py` methods above, add `--rand-task-id <start-id> <end-id>` to the command. This will add a random `task_id` from `<start-id>` to `<end-id>` inclusive.
+You can then use `utils/generate_rand_loras.py` to generate random LoRA weights for benchmarking purposes. `utils/generate_rand_loras.py` takes an example LoRA for the model you are benchmarking.
+Then you can run `gptManagerBenchmark` with `--type IFB` and `--lora_dir /path/to/utils/generate_rand_loras/output`
+
+End-to-end LoRA benchmarking script
+
+```
+git-lfs clone https://huggingface.co/meta-llama/Llama-2-13b-hf
+git-lfs clone https://huggingface.co/hfl/chinese-llama-2-lora-13b
+
+MODEL_CHECKPOINT=Llama-2-13b-hf
+CONVERTED_CHECKPOINT=Llama-2-13b-hf-ckpt
+TOKENIZER=Llama-2-13b-hf
+LORA_ENGINE=Llama-2-13b-hf-engine
+
+DTYPE=float16
+TP=2
+PP=1
+MAX_LEN=1024
+MAX_BATCH=32
+MAX_LORA_RANK=32
+
+SOURCE_LORA=chinese-llama-2-lora-13b
+CPP_LORA=chinese-llama-2-lora-13b-cpp
+
+EG_DIR=/tmp/lora-eg
+
+# Build lora enabled engine
+python examples/llama/convert_checkpoint.py --model_dir ${MODEL_CHECKPOINT} \
+                              --output_dir ${CONVERTED_CHECKPOINT} \
+                              --dtype ${DTYPE} \
+                              --tp_size ${TP} \
+                              --pp_size 1 \
+                              --lora_target_modules attn_qkv \
+                              --max_lora_rank ${MAX_LORA_RANK}
+
+${HOME}/.local/bin/trtllm-build \
+    --checkpoint_dir ${CONVERTED_CHECKPOINT} \
+    --output_dir ${LORA_ENGINE} \
+    --max_batch_size ${MAX_BATCH} \
+    --max_input_len $MAX_LEN \
+    --max_output_len $MAX_LEN \
+    --gpt_attention_plugin float16 \
+    --paged_kv_cache enable \
+    --remove_input_padding enable \
+    --gemm_plugin float16 \
+    --lora_plugin float16 \
+    --use_paged_context_fmha enable \
+    --use_custom_all_reduce disable
+
+NUM_LORAS=(8 16 24 32 64 128 256)
+NUM_REQUESTS=1024
+
+# Convert LoRA to cpp format
+python examples/gpt/nemo_lora_convert.py \
+    -i $SOURCE_LORA \
+    --storage-type $DTYPE \
+    --write-cpp-runtime-tensors \
+    -o $CPP_LORA
+
+# Prepare datasets
+mkdir -p $EG_DIR/data
+
+# Prepare dataset without lora_task_id
+python benchmarks/cpp/prepare_dataset.py \
+    --output "${EG_DIR}/data/token-norm-dist.json" \
+    --request-rate -1 \
+    --time-delay-dist constant \
+    --tokenizer $TOKENIZER \
+    token-norm-dist \
+    --num-requests $NUM_REQUESTS \
+    --input-mean 256 --input-stdev 16 --output-mean 128 --output-stdev 24
+
+# Prepare dataset with lora_task_ids from 0 - $nloras
+for nloras in ${NUM_LORAS[@]}; do
+    python benchmarks/cpp/prepare_dataset.py \
+        --output "${EG_DIR}/data/token-norm-dist-lora-${nloras}.json" \
+        --request-rate -1 \
+        --time-delay-dist constant \
+        --rand-task-id 0 $(( $nloras - 1 )) \
+        --tokenizer $TOKENIZER \
+        token-norm-dist \
+        --num-requests $NUM_REQUESTS \
+        --input-mean 256 --input-stdev 16 --output-mean 128 --output-stdev 24
+done
+
+# Generate random lora weights for 256 adapters
+python benchmarks/cpp/utils/generate_rand_loras.py ${CPP_LORA} ${EG_DIR}/loras 256
+
+# perform benchmarking
+
+# First run inference without LoRAs
+mkdir -p ${EG_DIR}/log-base-lora
+mpirun -n ${TP} --output-filename ${EG_DIR}/log-base-lora \
+    cpp/build_Debug/benchmarks/gptManagerBenchmark \
+    --engine_dir $LORA_ENGINE \
+    --type IFB \
+    --dataset "${EG_DIR}/data/token-norm-dist.json" \
+    --lora_host_cache_bytes 8589934592 \
+    --lora_num_device_mod_layers $(( 32 * $NUM_LAYERS * $NUM_LORA_MODS * $MAX_LORA_RANK )) \
+    --kv_cache_free_gpu_mem_fraction 0.80 \
+    --log_level info \
+    --eos_id ${EOS_ID}
+
+# Now run inference with various numbers or loras
+# The host cache is set large enough to hold all the LoRAs in lora_dir
+# GPU cache is set to hold 32 LoRAs
+# This benchmark will preload all the LoRAs into the host cache
+# We run inference on a range of active LoRAs exercising different cache miss rates.
+for nloras in ${NUM_LORAS[@]}; do
+    mkdir -p ${EG_DIR}/log-lora-${nloras}
+    mpirun -n ${TP} --output-filename "${EG_DIR}/log-lora-${nloras}" \
+        cpp/build_Debug/benchmarks/gptManagerBenchmark \
+        --engine_dir $LORA_ENGINE \
+        --type IFB \
+        --dataset "${EG_DIR}/data/token-norm-dist-lora-${nloras}.json" \
+        --lora_host_cache_bytes 8589934592 \
+        --lora_num_device_mod_layers $(( 32 * $NUM_LAYERS * $NUM_LORA_MODS * $MAX_LORA_RANK )) \
+        --kv_cache_free_gpu_mem_fraction 0.80 \
+        --log_level info \
+        --eos_id ${EOS_ID} \
+        --lora_dir ${EG_DIR}/loras
+done
 ```

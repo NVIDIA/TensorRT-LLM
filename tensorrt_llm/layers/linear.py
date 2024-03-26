@@ -34,8 +34,49 @@ def _gemm_plugin(input: Tensor,
                  mat2: Tensor,
                  transa: bool = False,
                  transb: bool = False,
+                 pad_lda: int = 0,
+                 pad_ldb: int = 0,
                  use_fp8: bool = False,
                  strict_dtype: Optional[trt.DataType] = None) -> Tensor:
+    '''
+    output = op(mat2)op(input)
+
+    Parameters:
+        input : Tensor (On GPU)
+            The input tensor.
+
+        mat2 : Tensor (On GPU)
+            The mat2 tensor.
+
+        transa : bool
+            Is the input tensor transposed? Set to 'True' if you want the
+            input tensor to be transposed, 'False' otherwise.
+
+        transb : bool
+            Is the mat2 tensor transposed? Set to 'True' if you want the
+            mat2 tensor to be transposed, 'False' otherwise.
+
+        pad_lda: int
+            Padding to the lead dimension of input tensor. It is used to
+            support the strided GEMM that only uses the sub-tensor for
+            computation. The GEMM plugin computation is
+            [N, K] x [K, M+pad_lda] -> [N, M] if transa,
+            [N, K] x [K+pad_lda, M] -> [N, M] if not transa.
+
+        pad_ldb: int
+            Padding to the lead dimension of mat2 tensor. It is used to
+            support the strided GEMM that only uses the sub-tensor for
+            computation. The GEMM plugin computation is
+            [N, K+pad_ldb] x [K, M] -> [N, M] if transb,
+            [N+pad_ldb, K] x [K, M] -> [N, M] if not transb.
+
+        use_fp8: bool
+            Do we use fp8 GEMM.
+
+        strict_dtype: trt.DataType
+            Set the data type for the GEMM plugin. If it is None, the data
+            type is the gemm_plugin type set in the plugin_config.
+    '''
     plg_creator = trt.get_plugin_registry().get_plugin_creator(
         'Gemm', '1', TRT_LLM_PLUGIN_NAMESPACE)
     assert plg_creator is not None
@@ -46,6 +87,10 @@ def _gemm_plugin(input: Tensor,
     transb = 1 if transb else 0
     transb = trt.PluginField("transb", np.array(transb, dtype=np.int32),
                              trt.PluginFieldType.INT32)
+    pad_lda = trt.PluginField("pad_lda", np.array(pad_lda, dtype=np.int32),
+                              trt.PluginFieldType.INT32)
+    pad_ldb = trt.PluginField("pad_ldb", np.array(pad_ldb, dtype=np.int32),
+                              trt.PluginFieldType.INT32)
     use_fp8 = 1 if use_fp8 else 0
     use_fp8 = trt.PluginField("use_fp8", np.array(use_fp8, dtype=np.int32),
                               trt.PluginFieldType.INT32)
@@ -57,7 +102,8 @@ def _gemm_plugin(input: Tensor,
         p_dtype = str_dtype_to_trt(default_net().plugin_config.gemm_plugin)
     pf_type = trt.PluginField("type_id", np.array([int(p_dtype)], np.int32),
                               trt.PluginFieldType.INT32)
-    pfc = trt.PluginFieldCollection([transa, transb, pf_type, use_fp8])
+    pfc = trt.PluginFieldCollection(
+        [transa, transb, pad_lda, pad_ldb, pf_type, use_fp8])
     gemm_plug = plg_creator.create_plugin("gemm", pfc)
     plug_inputs = [input.trt_tensor, mat2.trt_tensor]
     layer = default_trtnet().add_plugin_v2(plug_inputs, gemm_plug)
@@ -77,12 +123,14 @@ class Linear(Module):
                  tp_size=1,
                  gather_output=True,
                  share_weight=None,
-                 strict_dtype=False):
+                 strict_dtype=False,
+                 pad_lda=0):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features // tp_size
         self.dtype = dtype
         self.use_fp8 = use_fp8
+        self.pad_lda = pad_lda
 
         if not share_weight:
             self.weight = Parameter(shape=(self.out_features, self.in_features),
@@ -116,6 +164,7 @@ class Linear(Module):
             x = _gemm_plugin(x,
                              weight,
                              transb=True,
+                             pad_lda=self.pad_lda,
                              use_fp8=self.use_fp8,
                              strict_dtype=self.strict_dtype)
         else:
@@ -207,12 +256,14 @@ class RowLinear(Module):
                  use_fp8=False,
                  tp_group=None,
                  tp_size=1,
-                 strict_dtype: bool = False):
+                 strict_dtype: bool = False,
+                 pad_lda=0):
         super().__init__()
         self.in_features = in_features // tp_size
         self.out_features = out_features
         self.dtype = dtype
         self.use_fp8 = use_fp8
+        self.pad_lda = pad_lda
 
         self.weight = Parameter(shape=(self.out_features, self.in_features),
                                 dtype=('fp8' if use_fp8 else dtype))
@@ -240,6 +291,7 @@ class RowLinear(Module):
             x = _gemm_plugin(x,
                              weight,
                              transb=True,
+                             pad_lda=self.pad_lda,
                              use_fp8=self.use_fp8,
                              strict_dtype=self.strict_dtype)
         else:

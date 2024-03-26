@@ -76,6 +76,20 @@ public:
 
     // parameters for beam search
     TensorPtr cacheIndirection; // [maxBatchSize, beamWidth, maxSeqLen] - the k/v cache index for beam search, on gpu
+
+    // Medusa
+    class MedusaInputs
+    {
+    public:
+        TensorPtr medusaPaths;               // [maxBatchSize, maxTokensPerStep, maxMedusaHeads + 1], on gpu
+        TensorPtr medusaTreeIds;             // [maxBatchSize, maxTokensPerStep], on gpu
+        std::vector<std::vector<TensorPtr>>
+            medusaLogits;                    // [maxBatchSize][maxMedusaHeads][tokensPerStep, vocabSizePadded], on gpu
+        TensorPtr medusaCurTokensPerStep;    // [maxBatchSize], on gpu
+        TensorPtr medusaTargetTokensPerStep; // [maxBatchSize], on gpu
+    };
+
+    std::optional<MedusaInputs> medusaInputs;
 };
 
 } // namespace tensorrt_llm::runtime

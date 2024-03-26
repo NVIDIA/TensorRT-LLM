@@ -21,6 +21,7 @@ from transformers.pytorch_utils import Conv1D
 
 import tensorrt_llm
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.quantization import QuantAlgo
 
 
 def parse_arguments():
@@ -971,23 +972,23 @@ if __name__ == '__main__':
     plugin_weight_only_quant_type = None
     if args.use_weight_only and args.weight_only_precision == 'int8':
         plugin_weight_only_quant_type = torch.int8
-        quant_algo = "W8A16"
+        quant_algo = QuantAlgo.W8A16
     elif args.use_weight_only and args.weight_only_precision == 'int4':
         plugin_weight_only_quant_type = torch.quint4x2
-        quant_algo = "W4A16"
+        quant_algo = QuantAlgo.W4A16
 
     if args.smoothquant:
         if args.per_token and args.per_channel:
-            quant_algo = 'W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN'
+            quant_algo = QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
         elif not args.per_token and not args.per_channel:
-            quant_algo = 'W8A8_SQ_PER_TENSOR_PLUGIN'
+            quant_algo = QuantAlgo.W8A8_SQ_PER_TENSOR_PLUGIN
         elif not args.per_token and args.per_channel:
-            quant_algo = 'W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN'
+            quant_algo = QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN
         elif args.per_token and not args.per_channel:
-            quant_algo = 'W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN'
+            quant_algo = QuantAlgo.W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN
 
     if args.calibrate_kv_cache:
-        kv_cache_quant_algo = "INT8"
+        kv_cache_quant_algo = QuantAlgo.INT8
     else:
         kv_cache_quant_algo = None
 

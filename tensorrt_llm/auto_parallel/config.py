@@ -1,12 +1,12 @@
 from dataclasses import dataclass, field
+from enum import auto
 from typing import Dict, List, Optional, Union
 
 import torch
+from strenum import LowercaseStrEnum
 
-from tensorrt_llm._utils import DictConversion
+from tensorrt_llm._utils import BaseEnumMeta, DictConversion
 from tensorrt_llm.logger import logger
-
-from .utils import BaseEnum
 
 
 @dataclass
@@ -314,14 +314,14 @@ def infer_cluster_key() -> str:
     return fallback_key
 
 
-class CostModel(str, BaseEnum):
-    ALPHA_BETA = "alpha_beta"
-    PROFILE = "profile"
-    S_CURVE = "s_curve"
+class CostModel(LowercaseStrEnum, metaclass=BaseEnumMeta):
+    ALPHA_BETA = auto()
+    PROFILE = auto()
+    S_CURVE = auto()
     # Zero cost model is for test purpose.
     # Use zero cost model for communication will make solver prefer sharding
     # Use zero cost model for computation will make solver prefer replication
-    ZERO = "zero"
+    ZERO = auto()
 
 
 @dataclass

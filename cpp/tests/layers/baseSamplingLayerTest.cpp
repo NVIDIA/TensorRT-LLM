@@ -92,7 +92,6 @@ void BaseSamplingLayerTest<T>::setup(uint64_t seed, SamplingParams const& params
     setupParams.randomSeed = std::make_optional<std::vector<uint64_t>>({seed});
     setupParams.runtime_top_k
         = params.topKs.size() ? std::make_optional<std::vector<SizeType>>(params.topKs) : std::nullopt;
-    std::cout << "topP size " << params.topPs.size() << std::endl;
     setupParams.runtime_top_p
         = params.topPs.size() ? std::make_optional<std::vector<float>>(params.topPs) : std::nullopt;
     setupParams.top_p_decay = params.decay.size() ? std::make_optional<std::vector<float>>(params.decay) : std::nullopt;

@@ -42,7 +42,10 @@ struct SamplingParams
     std::vector<std::vector<tensorrt_llm::runtime::SizeType>> runtimeHeadsTopK;
     std::vector<std::vector<tensorrt_llm::runtime::TokenIdType>> draftIds;
     std::vector<std::vector<tensorrt_llm::runtime::SizeType>> paths;
+    std::vector<std::vector<tensorrt_llm::runtime::SizeType>> treeIds;
     std::vector<tensorrt_llm::runtime::SizeType> tokensPerStep;
+    std::vector<tensorrt_llm::runtime::SizeType> acceptedCumSum;
+    std::vector<tensorrt_llm::runtime::SizeType> packedPaths;
     std::optional<tensorrt_llm::runtime::TokenIdType> endId;
 };
 
@@ -52,11 +55,13 @@ class MedusaDecodingLayerTest : public testing::Test
 private:
     void SetUp() override;
 
+public:
     using TensorPtr = tensorrt_llm::runtime::ITensor::SharedPtr;
     using BufferPtr = tensorrt_llm::runtime::IBuffer::SharedPtr;
     using SizeType = tensorrt_llm::runtime::SizeType;
     using TokenIdType = tensorrt_llm::runtime::TokenIdType;
 
+private:
     SizeType mBatchSize{6};
     SizeType mMaxBatchSize{2 * mBatchSize};
     SizeType const mVocabSize{9};
@@ -79,8 +84,13 @@ private:
     TensorPtr mNextDraftTokensDevice;
 
     TensorPtr mPathsDevice;
+    TensorPtr mTreeIdsDevice;
+    TensorPtr mAcceptedLengthCumSumDevice;
+    TensorPtr mPackedPathsDevice;
     TensorPtr mEndIdsDevice;
     TensorPtr mBatchSlots;
+
+    TensorPtr mTokensPerStepDevice;
 
     std::vector<tensorrt_llm::common::Tensor> mLogitsVec;
 
@@ -99,7 +109,8 @@ private:
     tensorrt_llm::layers::DecodingOutputParams createOutputTensors();
 
     void checkResult(std::vector<std::vector<std::set<TokenIdType>>> const& expectedOutTokens,
-        std::vector<std::vector<TokenIdType>> const& expectedDraftTokens, std::vector<bool> const& finished);
+        std::vector<std::vector<TokenIdType>> const& expectedDraftTokens, std::vector<bool> const& finished,
+        SamplingParams& params);
 
 public:
     void runTest(std::vector<std::vector<std::set<TokenIdType>>> const& expectedOutTokens,

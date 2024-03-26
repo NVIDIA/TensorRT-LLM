@@ -8,12 +8,12 @@ from profile_utils import profile
 
 import tensorrt_llm
 from tensorrt_llm.builder import BuildConfig, build
-from tensorrt_llm.executor import GenerationExecutor
+from tensorrt_llm.executor import GenerationExecutor, SamplingConfig
 from tensorrt_llm.models import LLaMAForCausalLM
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root
-from utils.util import force_ampere, skip_pre_ampere
+from utils.util import force_ampere
 
 tensorrt_llm.logger.set_level('verbose')
 
@@ -66,8 +66,9 @@ def test_save_load():
         # use context manager to make sure the __exit__ can release the resources immediately
         with GenerationExecutor.create(engine_dir, tokenizer_dir) as executor:
             for idx, output in enumerate(
-                    executor.generate(input_text,
-                                      max_new_tokens=[10] * len(input_text))):
+                    executor.generate(
+                        input_text,
+                        sampling_config=SamplingConfig(max_new_tokens=10))):
                 tensorrt_llm.logger.info(f"Input: {input_text[idx]}")
                 tensorrt_llm.logger.info(f'Output: {output.text}')
                 # note the output.text contains everything from the input, so only compare the suffix here.
@@ -100,7 +101,7 @@ def test_high_level_fake_weights():
     build(llama, build_config)
 
 
-@skip_pre_ampere
+@force_ampere
 def test_inflight_batching():
     max_batch_size, max_isl, max_osl = 8, 256, 256
     hf_model_dir = llm_models_root() / "llama-models/llama-7b-hf"
@@ -123,16 +124,19 @@ def test_inflight_batching():
                                        tokenizer_dir) as async_engine:
 
             async def generate_and_print(idx, inp):
-                result = async_engine.generate_async(inp,
-                                                     streaming=False,
-                                                     max_new_tokens=10)
+                result = async_engine.generate_async(
+                    inp,
+                    streaming=False,
+                    sampling_config=SamplingConfig(max_new_tokens=10))
                 await result.aresult()
                 tensorrt_llm.logger.info(result.text)
                 assert result.text.endswith(expected_output[idx])
 
                 output = ""
                 async for stream in async_engine.generate_async(
-                        inp, streaming=True, max_new_tokens=10):
+                        inp,
+                        streaming=True,
+                        sampling_config=SamplingConfig(max_new_tokens=10)):
                     output += stream.text + ' '
                     tensorrt_llm.logger.info(
                         f"prompt: '{inp}', generation: '{output}'")

@@ -64,15 +64,17 @@ std::string fmtstr(char const* format, ...) __attribute__((format(printf, 1, 2))
 #define __PRETTY_FUNCTION__ __FUNCSIG__
 #endif
 
+auto constexpr kDefaultDelimiter = ", ";
+
 template <typename U, typename TStream, typename T>
-inline TStream& arr2outCasted(TStream& out, T* arr, size_t size)
+inline TStream& arr2outCasted(TStream& out, T* arr, size_t size, char const* delim = kDefaultDelimiter)
 {
     out << "(";
     if (size > 0)
     {
         for (size_t i = 0; i < size - 1; ++i)
         {
-            out << static_cast<U>(arr[i]) << ", ";
+            out << static_cast<U>(arr[i]) << delim;
         }
         out << static_cast<U>(arr[size - 1]);
     }
@@ -81,22 +83,22 @@ inline TStream& arr2outCasted(TStream& out, T* arr, size_t size)
 }
 
 template <typename TStream, typename T>
-inline TStream& arr2out(TStream& out, T* arr, size_t size)
+inline TStream& arr2out(TStream& out, T* arr, size_t size, char const* delim = kDefaultDelimiter)
 {
-    return arr2outCasted<T>(out, arr, size);
+    return arr2outCasted<T>(out, arr, size, delim);
 }
 
 template <typename T>
-inline std::string arr2str(T* arr, size_t size)
+inline std::string arr2str(T* arr, size_t size, char const* delim = kDefaultDelimiter)
 {
     std::stringstream ss;
-    return arr2out(ss, arr, size).str();
+    return arr2out(ss, arr, size, delim).str();
 }
 
 template <typename T>
-inline std::string vec2str(std::vector<T> vec)
+inline std::string vec2str(std::vector<T> vec, char const* delim = kDefaultDelimiter)
 {
-    return arr2str(vec.data(), vec.size());
+    return arr2str(vec.data(), vec.size(), delim);
 }
 
 inline bool strStartsWith(std::string const& str, std::string const& prefix)

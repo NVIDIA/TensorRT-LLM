@@ -36,7 +36,7 @@ from .models import PretrainedConfig, PretrainedModel
 from .models.modeling_utils import optimize_model
 from .network import Network, net_guard
 from .plugin import PluginConfig
-from .quantization import QuantMode
+from .quantization import QuantAlgo, QuantMode
 from .version import __version__
 
 
@@ -211,6 +211,11 @@ class Builder():
         # so the cache should never None here
         assert cache is not None and isinstance(cache, trt.ITimingCache)
         config.set_timing_cache(cache, ignore_mismatch=False)
+
+        # set weight sparsity
+        weight_sparsity = kwargs.get("weight_sparsity", False)
+        if weight_sparsity:
+            config.set_flag(trt.BuilderFlag.SPARSE_WEIGHTS)
 
         return BuilderConfig()._init(config,
                                      precision=precision,
@@ -412,6 +417,7 @@ class BuildConfig:
     max_batch_size: int = 8
     max_beam_width: int = 1
     max_num_tokens: Optional[int] = None
+    opt_num_tokens: Optional[int] = None
     max_prompt_embedding_table_size: int = 0
     gather_context_logits: int = False
     gather_generation_logits: int = False
@@ -425,7 +431,9 @@ class BuildConfig:
     output_timing_cache: str = None
     lora_config: LoraBuildConfig = LoraBuildConfig()
     auto_parallel_config: AutoParallelConfig = AutoParallelConfig()
+    weight_sparsity: bool = False
     plugin_config: PluginConfig = PluginConfig()
+    use_fused_mlp: bool = False
 
     @classmethod
     def from_dict(cls, config, plugin_config=None):
@@ -434,12 +442,14 @@ class BuildConfig:
         max_batch_size = config.pop('max_batch_size')
         max_beam_width = config.pop('max_beam_width')
         max_num_tokens = config.pop('max_num_tokens')
+        opt_num_tokens = config.pop('opt_num_tokens')
         max_prompt_embedding_table_size = config.pop(
             'max_prompt_embedding_table_size', 0)
         gather_context_logits = config.pop('gather_context_logits', False)
         gather_generation_logits = config.pop('gather_generation_logits', False)
         strongly_typed = config.pop('strongly_typed', False)
         builder_opt = config.pop('builder_opt', None)
+        weight_sparsity = config.pop('weight_sparsity', False)
         profiling_verbosity = config.pop('profiling_verbosity',
                                          'layer_names_only')
         enable_debug_output = config.pop('enable_debug_output', False)
@@ -461,6 +471,7 @@ class BuildConfig:
             max_batch_size=max_batch_size,
             max_beam_width=max_beam_width,
             max_num_tokens=max_num_tokens,
+            opt_num_tokens=opt_num_tokens,
             max_prompt_embedding_table_size=max_prompt_embedding_table_size,
             gather_context_logits=gather_context_logits,
             gather_generation_logits=gather_generation_logits,
@@ -474,6 +485,7 @@ class BuildConfig:
             output_timing_cache=output_timing_cache,
             lora_config=lora_config,
             auto_parallel_config=auto_parallel_config,
+            weight_sparsity=weight_sparsity,
             plugin_config=plugin_config)
 
     @classmethod
@@ -582,15 +594,35 @@ def get_engine_version(engine_dir: str) -> Union[None, str]:
 
 
 def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
+    '''Build engine from given model and optimization options specified in the build_config
+       WARNING: this function may change the given \p model object state in some optimization passes
+       to avoid cloning a model since normally the LLM models consumes large memory.
+       Create a new fresh model object if you need to build with different options.
+
+    '''
+    build_config = copy.deepcopy(
+        build_config)  # avoid changing the input config
+    if model.config.quantization.quant_algo == QuantAlgo.FP8 or \
+        model.config.quantization.kv_cache_quant_algo == QuantAlgo.FP8:
+        build_config.strongly_typed = True
+
+    if hasattr(model.config, 'max_medusa_token_len'):
+        build_config.max_draft_len = model.config.max_medusa_token_len
+
+    use_auto_parallel = build_config.auto_parallel_config.enabled
+    model = optimize_model(
+        model,
+        use_fused_mlp=(build_config.use_fused_mlp and not use_auto_parallel),
+        use_prompt_tuning=(build_config.max_prompt_embedding_table_size > 0))
+
     if build_config.plugin_config.lora_plugin is not None:
-        # TODO(yuxianq): remove this check after TopModelMixin merged into PretrainedModel
-        assert hasattr(model, 'use_lora'), "This model does not support LoRA"
+        model.use_lora(build_config.lora_config)
         model = optimize_model(
             model,
             use_lora=True,
-            max_lora_rank=model.lora_config.max_lora_rank,
+            max_lora_rank=build_config.lora_config.max_lora_rank,
         )
-        build_config.lora_config = model.lora_config
+
     builder = Builder()
     builder_config = builder.create_builder_config(
         precision=model.config.dtype,
@@ -603,6 +635,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
         opt_level=build_config.builder_opt,
         profiling_verbosity=build_config.profiling_verbosity,
         quant_mode=model.config.quant_mode,
+        weight_sparsity=build_config.weight_sparsity,
     )
 
     network = builder.create_network()
@@ -648,6 +681,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
             use_cache=True,
             max_beam_width=build_config.max_beam_width,
             max_num_tokens=build_config.max_num_tokens,
+            opt_num_tokens=build_config.opt_num_tokens,
             prompt_embedding_table_size=build_config.
             max_prompt_embedding_table_size,
             max_draft_len=build_config.max_draft_len,

@@ -33,6 +33,8 @@ from transformers.pytorch_utils import Conv1D
 
 import tensorrt_llm
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.convert_utils import weight_only_quantize_dict
+from tensorrt_llm.quantization import QuantAlgo
 
 
 def parse_arguments():
@@ -634,44 +636,11 @@ def get_tllm_linear_weight(
     weight: torch.Tensor,
     prefix: str,
     bias: Optional[torch.Tensor] = None,
-    use_weight_only: bool = False,
-    plugin_weight_only_quant_type: torch.dtype = torch.int8
 ) -> Dict[str, torch.Tensor]:
     results = {}
-    if use_weight_only:
-        v = weight.t().contiguous()
-        processed_torch_weights, torch_weight_scales = \
-            torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
-                v, plugin_weight_only_quant_type)
-        results[f'{prefix}.weight'] = processed_torch_weights
-        results[f'{prefix}.per_channel_scale'] = torch_weight_scales
-    else:
-        results[f'{prefix}.weight'] = weight.contiguous()
-
+    results[f'{prefix}.weight'] = weight.contiguous()
     if bias is not None:
         results[f'{prefix}.bias'] = bias
-
-    return results
-
-
-def get_tllm_param(
-    param: torch.Tensor,
-    name: str,
-    use_weight_only: bool = False,
-    plugin_weight_only_quant_type: torch.dtype = torch.int8
-) -> Dict[str, torch.Tensor]:
-    results = {}
-    if name.endswith('.weight') and use_weight_only:
-        v = param.t().contiguous()
-        processed_torch_weights, torch_weight_scales = \
-            torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
-                v, plugin_weight_only_quant_type)
-        results[name] = processed_torch_weights
-        results[name.replace('weight',
-                             'per_channel_scale')] = torch_weight_scales
-    else:
-        results[name] = param
-
     return results
 
 
@@ -858,14 +827,12 @@ def convert_hf_baichuan_sq(hf_model,
     return weights
 
 
-def convert_hf_baichuan(
-        hf_model: AutoModelForCausalLM,
-        hf_config: AutoConfig,
-        model_version: str,
-        mapping: Mapping,
-        dtype: str = 'float32',
-        use_weight_only: bool = False,
-        plugin_weight_only_quant_type: torch.dtype = torch.int8):
+def convert_hf_baichuan(hf_model: AutoModelForCausalLM,
+                        hf_config: AutoConfig,
+                        model_version: str,
+                        mapping: Mapping,
+                        dtype: str = 'float32',
+                        quant_algo: str = None):
 
     weights = {}
     tik = time.time()
@@ -907,12 +874,7 @@ def convert_hf_baichuan(
             v = v.split(v.shape[tp_dim] // mapping.tp_size,
                         dim=tp_dim)[mapping.tp_rank]
         v = v.to(dtype).contiguous().detach().cpu()
-        if quant and use_weight_only:
-            processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
-                v.T.contiguous(), plugin_weight_only_quant_type)
-            return processed_torch_weights, torch_weight_scales
-        else:
-            return v
+        return v
 
     # Convert vocab_embedding
     if mapping.is_first_pp_rank():
@@ -933,43 +895,21 @@ def convert_hf_baichuan(
     layers_range = mapping.pp_layers(num_hidden_layers)
     for l in layers_range:
         prefix = f"transformer.layers.{l}."
-        if use_weight_only:
-            weights[prefix + 'attention.qkv.weight'], weights[
-                prefix + 'attention.qkv.per_channel_scale'] = load(3,
-                                                                   l,
-                                                                   quant=True)
-            weights[prefix + 'attention.dense.weight'], weights[
-                prefix + 'attention.dense.per_channel_scale'] = load(4,
-                                                                     l,
-                                                                     1,
-                                                                     quant=True)
-            weights[prefix + 'mlp.gate.weight'], weights[
-                prefix + 'mlp.gate.per_channel_scale'] = load(5,
-                                                              l,
-                                                              0,
-                                                              quant=True)
-            weights[prefix + 'mlp.proj.weight'], weights[
-                prefix + 'mlp.proj.per_channel_scale'] = load(6,
-                                                              l,
-                                                              1,
-                                                              quant=True)
-            weights[prefix + 'mlp.fc.weight'], weights[
-                prefix + 'mlp.fc.per_channel_scale'] = load(7, l, 0, quant=True)
-            weights[prefix + 'input_layernorm.weight'] = load(8, l)
-            weights[prefix + 'post_layernorm.weight'] = load(9, l)
-        else:
-            weights[prefix + 'attention.qkv.weight'] = load(3, l)
-            weights[prefix + 'attention.dense.weight'] = load(4, l, 1)
-            weights[prefix + 'mlp.gate.weight'] = load(5, l, 0)
-            weights[prefix + 'mlp.proj.weight'] = load(6, l, 1)
-            weights[prefix + 'mlp.fc.weight'] = load(7, l, 0)
-            weights[prefix + 'input_layernorm.weight'] = load(8, l)
-            weights[prefix + 'post_layernorm.weight'] = load(9, l)
+        weights[prefix + 'attention.qkv.weight'] = load(3, l)
+        weights[prefix + 'attention.dense.weight'] = load(4, l, 1)
+        weights[prefix + 'mlp.gate.weight'] = load(5, l, 0)
+        weights[prefix + 'mlp.proj.weight'] = load(6, l, 1)
+        weights[prefix + 'mlp.fc.weight'] = load(7, l, 0)
+        weights[prefix + 'input_layernorm.weight'] = load(8, l)
+        weights[prefix + 'post_layernorm.weight'] = load(9, l)
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     print(f'Weights loaded. Total time: {t}')
-    return weights
+
+    return weight_only_quantize_dict(weights,
+                                     quant_algo=quant_algo,
+                                     plugin=True)
 
 
 def convert_baichuan_gptq(hf_config: AutoConfig,
@@ -1157,25 +1097,25 @@ if __name__ == '__main__':
     plugin_weight_only_quant_type = None
     if args.use_weight_only and args.weight_only_precision == 'int8':
         plugin_weight_only_quant_type = torch.int8
-        quant_algo = "W8A16"
+        quant_algo = QuantAlgo.W8A16
     elif args.use_weight_only and args.weight_only_precision == 'int4':
         plugin_weight_only_quant_type = torch.quint4x2
-        quant_algo = "W4A16"
+        quant_algo = QuantAlgo.W4A16
     elif args.use_weight_only and args.weight_only_precision == 'int4_gptq':
-        quant_algo = "W4A16_GPTQ"
+        quant_algo = QuantAlgo.W4A16_GPTQ
 
     if args.smoothquant:
         if args.per_token and args.per_channel:
-            quant_algo = 'W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN'
+            quant_algo = QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
         elif not args.per_token and not args.per_channel:
-            quant_algo = 'W8A8_SQ_PER_TENSOR_PLUGIN'
+            quant_algo = QuantAlgo.W8A8_SQ_PER_TENSOR_PLUGIN
         elif not args.per_token and args.per_channel:
-            quant_algo = 'W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN'
+            quant_algo = QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN
         elif args.per_token and not args.per_channel:
-            quant_algo = 'W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN'
+            quant_algo = QuantAlgo.W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN
 
     if args.int8_kv_cache:
-        kv_cache_quant_algo = "INT8"
+        kv_cache_quant_algo = QuantAlgo.INT8
     else:
         kv_cache_quant_algo = None
 
@@ -1261,14 +1201,12 @@ if __name__ == '__main__':
                                             mapping,
                                             dtype=args.dtype)
         else:
-            weights = convert_hf_baichuan(
-                hf_model,
-                hf_config,
-                args.model_version,
-                mapping,
-                dtype=args.dtype,
-                use_weight_only=args.use_weight_only,
-                plugin_weight_only_quant_type=plugin_weight_only_quant_type)
+            weights = convert_hf_baichuan(hf_model,
+                                          hf_config,
+                                          args.model_version,
+                                          mapping,
+                                          dtype=args.dtype,
+                                          quant_algo=quant_algo)
 
         safetensors.torch.save_file(
             weights, os.path.join(args.output_dir, f'rank{rank}.safetensors'))

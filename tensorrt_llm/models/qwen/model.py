@@ -109,16 +109,9 @@ class QWenModel(Module):
         super().__init__()
         self.mapping = config.mapping
         if self.mapping.is_first_pp_rank():
-            self.vocab_embedding = Embedding(
-                config.vocab_size,
-                config.hidden_size,
-                dtype=config.dtype,
-                tp_size=self.mapping.tp_size
-                if config.use_parallel_embedding else 1,
-                tp_group=self.mapping.tp_group
-                if config.use_parallel_embedding else None,
-                sharding_dim=config.embedding_sharding_dim,
-                tp_rank=self.mapping.tp_rank)
+            self.vocab_embedding = Embedding(config.vocab_size,
+                                             config.hidden_size,
+                                             dtype=config.dtype)
 
         self.layers = DecoderLayerList(QWenDecoderLayer, config)
 
@@ -138,11 +131,6 @@ class QWenModel(Module):
                 prompt_embedding_table: Optional[Tensor] = None,
                 prompt_tasks: Optional[Tensor] = None,
                 prompt_vocab_size: Optional[Tensor] = None):
-
-        kv_cache_params.fill_none_tensor_list(len(self.layers))
-
-        if use_cache:
-            presents = []
 
         ptuning_args = [
             prompt_embedding_table, prompt_tasks, prompt_vocab_size

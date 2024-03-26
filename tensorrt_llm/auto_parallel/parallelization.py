@@ -1575,7 +1575,7 @@ class DistributedGraphGroup(GraphGroupBase):
             if self.use_custom_all_reduce:
                 strategy = AllReduceStrategy.AUTO
             else:
-                strategy = AllReduceStrategy.RING
+                strategy = AllReduceStrategy.NCCL
             allreduce_plg_creator = trt.get_plugin_registry(
             ).get_plugin_creator('AllReduce', '1', TRT_LLM_PLUGIN_NAMESPACE)
             assert allreduce_plg_creator is not None

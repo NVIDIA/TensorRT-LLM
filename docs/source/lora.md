@@ -104,9 +104,14 @@ See LoraModule::ModuleType for model id mapping
 | mlp_h_to_4h | 5 | for llama2 adapter for gated mlp layer after attention / RMSNorm: up projection |
 | mlp_4h_to_h | 6 | for llama2 adapter for gated mlp layer after attention / RMSNorm: down projection |
 | mlp_gate | 7 | for llama2 adapter for gated mlp later after attention / RMSNorm: gate |
+| cross_attn_qkv | 8 | compbined qkv adapter for cross attention |
+| cross_attn_q | 9 | q adapter for cross attention |
+| cross_attn_k | 10 | k adapter for cross attention |
+| cross_attn_v | 11 | v adapter for cross attention |
+| cross_attn_dense | 12 | adapter for the dense layer in cross attention |
 
 #### LoraCache configuration
 
 The core idea is that we will have a fixed size, 2-level LoRA cache in TRT-LLM. The higher level cache resides on the host and the lower level is on GPU (distinct from the existing KV cache). Sizes of both are user configurable.
 The CPU cache is configured to be a max size.  The GPU cache is configured to a percentage of free GPU memory after engine load. As requests come in LoRAs are stored in the host cache.
-As requests are scheduled for execution LoRAs are loaded into the GPU cache.
+As requests are scheduled for execution LoRAs are loaded into the GPU cache. See [batch_manager docs](/docs/source/batch_manager.md) for more details.

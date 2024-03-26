@@ -42,7 +42,7 @@ from ._utils import mpi_barrier  # NOQA
 from ._utils import str_dtype_to_torch  # NOQA
 from ._utils import mpi_rank, mpi_world_size, str_dtype_to_trt
 from .auto_parallel import AutoParallelConfig, auto_parallel
-from .builder import Builder, BuilderConfig
+from .builder import BuildConfig, Builder, BuilderConfig, build
 from .functional import Tensor, constant
 from .hlapi.llm import LLM, ModelConfig
 from .logger import logger
@@ -68,6 +68,8 @@ __all__ = [
     'Mapping',
     'Builder',
     'BuilderConfig',
+    'build',
+    'BuildConfig',
     'Tensor',
     'Parameter',
     'runtime',

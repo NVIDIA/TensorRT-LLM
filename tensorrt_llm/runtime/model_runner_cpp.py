@@ -432,7 +432,7 @@ def _populate_sampling_config(sampling_config: SamplingConfig,
         assert sampling_config.random_seed.dtype == torch.int64, f"sampling_config.random_seed.dtype ({sampling_config.random_seed.dtype}) must be torch.int64"
         assert sampling_config.random_seed.shape[
             0] == batch_size, f"sampling_config.random_seed.shape[0] ({sampling_config.random_seed.shape[0]}) must equal to batch_size ({batch_size})"
-        gpt_sampling_config.random_seed = sampling_config.random_seed
+        gpt_sampling_config.random_seed = sampling_config.random_seed.tolist()
     elif sampling_config.random_seed is not None:
         gpt_sampling_config.random_seed = [sampling_config.random_seed]
     else:

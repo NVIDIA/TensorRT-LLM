@@ -96,6 +96,7 @@ class GPTBenchmark(BaseBenchmark):
                 self.use_gpt_attention_plugin = True
                 self.remove_input_padding = True
                 self.use_moe_plugin = True
+                self.use_mamba_conv1d_plugin = True
             elif args.mode == 'ootb-except-mha':
                 self.use_gpt_attention_plugin = True
 
@@ -121,6 +122,8 @@ class GPTBenchmark(BaseBenchmark):
             gpt_attention_plugin=self.use_gpt_attention_plugin,
             paged_kv_cache=self.paged_kv_cache if hasattr(
                 self, 'paged_kv_cache') else False,
+            paged_state=self.paged_state
+            if hasattr(self, 'paged_state') else False,
             dtype=self.dtype,
             remove_input_padding=self.remove_input_padding,
             quant_mode=self.quant_mode,
@@ -148,8 +151,6 @@ class GPTBenchmark(BaseBenchmark):
             model_config.mamba_d_state = self.mamba_d_state
             model_config.mamba_d_conv = self.mamba_d_conv
             model_config.mamba_expand = self.mamba_expand
-            self.remove_input_padding = False
-            model_config.remove_input_padding = False
             self.sampling_config = tensorrt_llm.runtime.SamplingConfig(
                 end_id=0, pad_id=0, top_k=args.top_k, top_p=args.top_p)
             self.decoder = tensorrt_llm.runtime.MambaLMHeadModelGenerationSession(

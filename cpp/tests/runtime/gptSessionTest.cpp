@@ -45,6 +45,7 @@ auto const DATA_PATH = TEST_RESOURCE_PATH / "data";
 auto const GPT_MODEL_DIR = "gpt2";
 auto const GPTJ_MODEL_DIR = "gpt-j-6b";
 auto const LLAMA_MODEL_DIR = "llama-7b-hf";
+auto const MAMBA_MODEL_DIR = "mamba-2.8b";
 
 // Engines need to be generated using cpp/tests/resources/scripts/build_gpt_engines.py.
 auto const FP32_GPT_DIR = "fp32-default";
@@ -687,6 +688,23 @@ INSTANTIATE_TEST_SUITE_P(GptjSessionTest, ParamTest,
 
                 ),
         testing::Values(1, 2),  // beamWidth
+        testing::Values(false), // cudaGraphMode
+        testing::Values(MicroBatchSizes())),
+    generateTestName);
+
+INSTANTIATE_TEST_SUITE_P(MambaSessionOOTBTest, ParamTest,
+    testing::Combine(testing::Values(ModelParams{MAMBA_MODEL_DIR, {0, 1}}),
+        testing::Values(
+            // single decoder
+            ModelSpec{FP16_GPT_DIR, FP16_RESULT_FILE, nvinfer1::DataType::kHALF}),
+        testing::Values(1),     // beamWidth
+        testing::Values(false), // cudaGraphMode
+        testing::Values(MicroBatchSizes())),
+    generateTestName);
+INSTANTIATE_TEST_SUITE_P(MambaSessionPluginTest, ParamTest,
+    testing::Combine(testing::Values(ModelParams{MAMBA_MODEL_DIR, {0, 1}}),
+        testing::Values(ModelSpec{FP16_GPT_ATTENTION_DIR, FP16_PLUGIN_RESULT_FILE, nvinfer1::DataType::kHALF}),
+        testing::Values(1),     // beamWidth
         testing::Values(false), // cudaGraphMode
         testing::Values(MicroBatchSizes())),
     generateTestName);

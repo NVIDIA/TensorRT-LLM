@@ -25,7 +25,6 @@ from ..._utils import (numpy_to_torch, pad_vocab_size, str_dtype_to_torch,
                        torch_to_numpy)
 from ...layers import MoeConfig
 from ...logger import logger
-from ...lora_manager import LoraConfig
 from ...mapping import Mapping
 from ...quantization import QuantMode
 from ..modeling_utils import PretrainedConfig
@@ -253,10 +252,7 @@ class QkvWeightHelper:
         return fused_qkv
 
 
-def load_from_hf_checkpoint(model_dir,
-                            mapping=Mapping(),
-                            config=None,
-                            lora_config=LoraConfig()):
+def load_from_hf_checkpoint(model_dir, mapping=Mapping(), config=None):
     '''Weights-only quantization is the only supported quantization recipe here.'''
     logger.info('Loading weights from HF LLaMA...')
     tik = time.time()
@@ -301,8 +297,6 @@ def load_from_hf_checkpoint(model_dir,
             tllm_prex = f'transformer.layers.{layer_idx}.'
 
             if 'model.embed_tokens.weight' in name:
-                if lora_config.is_valid and lora_config.embedding_weight is not None:
-                    param = lora_config.embedding_weight.to(dtype)
                 if hf_config.tie_word_embeddings:
                     # lm_head.weight has the same weights as embedding
                     if mapping.is_last_pp_rank():
@@ -328,8 +322,6 @@ def load_from_hf_checkpoint(model_dir,
                 if mapping.is_last_pp_rank():
                     weights['transformer.ln_f.weight'] = param
             elif 'lm_head.weight' in name:
-                if lora_config.is_valid and lora_config.lm_head_weight is not None:
-                    param = lora_config.lm_head_weight.to(dtype)
                 if mapping.is_last_pp_rank():
                     if config.vocab_size % mapping.tp_size != 0:
                         # padding
@@ -428,8 +420,7 @@ def load_from_hf_llama(tensorrt_llm_llama: 'LLaMAForCausalLM',
                        hf_llama,
                        mapping=Mapping(),
                        dtype='float32',
-                       use_gemm_woq_plugin=True,
-                       lora_config=LoraConfig()):
+                       use_gemm_woq_plugin=True):
     logger.info('Loading weights from HF LLaMA...')
     tik = time.time()
 
@@ -511,9 +502,6 @@ def load_from_hf_llama(tensorrt_llm_llama: 'LLaMAForCausalLM',
         else:
             v = torch_to_numpy(v.to(t_dtype).detach().cpu())
         if 'model.embed_tokens.weight' in k:
-            if lora_config.is_valid and lora_config.embedding_weight is not None:
-                v = torch_to_numpy(
-                    lora_config.embedding_weight.to(torch_dtype).detach().cpu())
             if hf_llama.config.tie_word_embeddings:
                 # lm_head.weight has the same weights as embedding
                 if mapping.is_last_pp_rank():
@@ -541,11 +529,6 @@ def load_from_hf_llama(tensorrt_llm_llama: 'LLaMAForCausalLM',
 
         elif 'lm_head.weight' in k:
             if mapping.is_last_pp_rank():
-                if lora_config.is_valid and lora_config.lm_head_weight is not None:
-                    v = torch_to_numpy(
-                        lora_config.lm_head_weight.to(
-                            torch_dtype).detach().cpu())
-                    vocab_size = v.shape[0]
                 if vocab_size % mapping.tp_size != 0:
                     # padding
                     vocab_size_padded = tensorrt_llm_llama.lm_head.out_features * mapping.tp_size

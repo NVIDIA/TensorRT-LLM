@@ -16,7 +16,9 @@ from tqdm import tqdm
 from transformers import AutoConfig, AutoModel, AutoTokenizer
 
 import tensorrt_llm
+from tensorrt_llm._utils import pad_vocab_size
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.quantization import QuantAlgo
 
 
 def parse_arguments():
@@ -228,6 +230,30 @@ def split_qkv(v: torch.Tensor, tp_size: int, rank: int, hidden_size: int,
     k_tmp = torch.chunk(key, tp_size, dim=0)[rank]
     v_tmp = torch.chunk(value, tp_size, dim=0)[rank]
     return torch.concatenate([q_tmp, k_tmp, v_tmp], dim=0).contiguous()
+
+
+def split_embedding(
+    param: torch.Tensor,
+    tp_size: int,
+    tp_rank: int,
+    use_parallel_embedding: bool = False,
+    sharding_dim: int = 0,
+) -> torch.Tensor:
+    if param is None:
+        return None
+    if not use_parallel_embedding:
+        return param
+
+    vocab_size, hidden_size = param.size()
+    if sharding_dim == 0:
+        if vocab_size % tp_size != 0:
+            vocab_size_padded = pad_vocab_size(vocab_size, tp_size)
+            pad_width = vocab_size_padded - vocab_size
+            param = torch.nn.functional.pad(param, (0, 0, 0, pad_width),
+                                            value=0)
+        else:
+            assert hidden_size % tp_size == 0
+    return split(param, tp_size, tp_rank, dim=sharding_dim)
 
 
 def get_weight(params: Dict[str, torch.Tensor], prefix: str,
@@ -669,7 +695,7 @@ def convert_hf_chatglm(hf_model: AutoModel,
     dtype = getattr(torch, dtype)
     num_attention_heads = hf_config.num_attention_heads
     hidden_size = hf_config.hidden_size
-    vocab_size = hf_config.vocab_size
+    hf_config.vocab_size
     num_kv_heads = getattr(hf_config, 'num_kv_heads', num_attention_heads)
     num_hidden_layers = hf_config.num_layers
 
@@ -915,11 +941,21 @@ def convert_hf_chatglm(hf_model: AutoModel,
             embed_w = get_weight(model_params, 'word_embeddings', dtype)
             pos_embed_w = get_weight(model_params,
                                      'transformer.position_embeddings', dtype)
-            weights['transformer.position_embedding.weight'] = pos_embed_w
+            weights['transformer.position_embedding.weight'] = split_embedding(
+                pos_embed_w,
+                tp_size=mapping.tp_size,
+                tp_rank=mapping.tp_rank,
+                use_parallel_embedding=use_parallel_embedding,
+                sharding_dim=sharding_dim)
             block_embed_w = get_weight(model_params,
                                        'transformer.block_position_embeddings',
                                        dtype)
-            weights['transformer.block_embedding.weight'] = block_embed_w
+            weights['transformer.block_embedding.weight'] = split_embedding(
+                block_embed_w,
+                tp_size=mapping.tp_size,
+                tp_rank=mapping.tp_rank,
+                use_parallel_embedding=use_parallel_embedding,
+                sharding_dim=sharding_dim)
         elif chatglm_version == 'chatglm':
             embed_w = get_weight(model_params, 'transformer.word_embeddings',
                                  dtype)
@@ -927,15 +963,12 @@ def convert_hf_chatglm(hf_model: AutoModel,
             embed_w = get_weight(model_params,
                                  'transformer.embedding.word_embeddings', dtype)
 
-        if not use_parallel_embedding:
-            weights['transformer.vocab_embedding.weight'] = embed_w
-        else:
-            if sharding_dim == 0:
-                assert vocab_size % mapping.tp_size == 0
-            else:
-                assert hidden_size % mapping.tp_size == 0
-            weights['transformer.vocab_embedding.weight'] = split(
-                embed_w, mapping.tp_size, mapping.tp_rank, sharding_dim)
+        weights['transformer.vocab_embedding.weight'] = split_embedding(
+            embed_w,
+            tp_size=mapping.tp_size,
+            tp_rank=mapping.tp_rank,
+            use_parallel_embedding=use_parallel_embedding,
+            sharding_dim=sharding_dim)
 
     if mapping.is_last_pp_rank():
         if chatglm_version == 'glm':
@@ -1032,27 +1065,27 @@ if __name__ == '__main__':
 
     if args.use_weight_only:
         if args.weight_only_precision == 'int8':
-            config['quantization']['quant_algo'] = 'W8A16'
+            config['quantization']['quant_algo'] = QuantAlgo.W8A16
         elif args.weight_only_precision == 'int4':
-            config['quantization']['quant_algo'] = 'W4A16'
+            config['quantization']['quant_algo'] = QuantAlgo.W4A16
     elif args.smoothquant:
         if args.per_channel:
             if args.per_token:
                 config['quantization'][
-                    'quant_algo'] = 'W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN'
+                    'quant_algo'] = QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
             else:
                 config['quantization'][
-                    'quant_algo'] = 'W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN'
+                    'quant_algo'] = QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN
         else:
             if args.per_token:
                 config['quantization'][
-                    'quant_algo'] = 'W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN'
+                    'quant_algo'] = QuantAlgo.W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN
             else:
                 config['quantization'][
-                    'quant_algo'] = 'W8A8_SQ_PER_TENSOR_PLUGIN'
+                    'quant_algo'] = QuantAlgo.W8A8_SQ_PER_TENSOR_PLUGIN
 
     if args.int8_kv_cache:
-        config['quantization']['kv_cache_quant_algo'] = 'INT8'
+        config['quantization']['kv_cache_quant_algo'] = QuantAlgo.INT8
 
     with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
         json.dump(config, f, indent=4)

@@ -2,7 +2,10 @@ import argparse
 import os
 from pathlib import Path
 
+import tensorrt_llm
+from tensorrt_llm import BuildConfig, build
 from tensorrt_llm.executor import GenerationExecutor
+from tensorrt_llm.hlapi import SamplingConfig
 from tensorrt_llm.models import LLaMAForCausalLM
 
 
@@ -40,21 +43,28 @@ def parse_args():
 
 
 def main():
+    tensorrt_llm.logger.set_level('verbose')
     args = parse_args()
-    tokenizer_dir = args.hf_model_dir
-    max_batch_size, max_isl, max_osl = 1, 256, 20
+
+    build_config = BuildConfig(max_input_len=256,
+                               max_output_len=20,
+                               max_batch_size=1)
+    # just for fast build, not best for production
+    build_config.builder_opt = 0
+    build_config.plugin_config.gemm_plugin = "float16"
 
     if args.clean_build or not args.engine_dir.exists():
         args.engine_dir.mkdir(exist_ok=True, parents=True)
         os.makedirs(args.engine_dir, exist_ok=True)
         llama = LLaMAForCausalLM.from_hugging_face(args.hf_model_dir)
-        llama.to_trt(max_batch_size, max_isl, max_osl)
-        llama.save(str(args.engine_dir))
+        engine = build(llama, build_config)
+        engine.save(args.engine_dir)
 
+    tokenizer_dir = args.hf_model_dir
     executor = GenerationExecutor.create(args.engine_dir, tokenizer_dir)
-
+    sampling_config = SamplingConfig(max_new_tokens=20)
     for inp in read_input():
-        output = executor.generate(inp, max_new_tokens=20)
+        output = executor.generate(inp, sampling_config=sampling_config)
         print(f">{output.text}")
 
 

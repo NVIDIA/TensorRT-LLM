@@ -114,19 +114,9 @@ class MPTModel(Module):
         self.config = config
 
         if config.mapping.is_first_pp_rank():
-            if config.use_parallel_embedding:
-                self.vocab_embedding = Embedding(
-                    config.vocab_size,
-                    config.hidden_size,
-                    dtype=config.dtype,
-                    tp_group=config.mapping.tp_group,
-                    tp_size=config.mapping.tp_size,
-                    sharding_dim=config.embedding_sharding_dim,
-                    tp_rank=config.mapping.tp_rank)
-            else:
-                self.vocab_embedding = Embedding(config.vocab_size,
-                                                 config.hidden_size,
-                                                 dtype=config.dtype)
+            self.vocab_embedding = Embedding(config.vocab_size,
+                                             config.hidden_size,
+                                             dtype=config.dtype)
         self.layers = DecoderLayerList(MPTDecoderLayer, config)
         if config.mapping.is_last_pp_rank():
             self.ln_f = LayerNorm(normalized_shape=config.hidden_size,
@@ -166,17 +156,13 @@ class MPTForCausalLM(DecoderModelForCausalLM):
         vocab_size_padded = pad_vocab_size(config.vocab_size,
                                            config.mapping.tp_size)
         if config.mapping.is_last_pp_rank():
-            share_weight = None
-            if config.share_embedding_table:
-                share_weight = transformer.vocab_embedding.weight
             lm_head = ColumnLinear(config.hidden_size,
                                    vocab_size_padded,
                                    bias=config.bias,
                                    dtype=config.dtype,
                                    tp_group=config.mapping.tp_group,
                                    tp_size=config.mapping.tp_size,
-                                   gather_output=True,
-                                   share_weight=share_weight)
+                                   gather_output=True)
         else:
             lm_head = None
         super().__init__(config, transformer, lm_head)

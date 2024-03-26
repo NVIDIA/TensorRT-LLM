@@ -19,15 +19,17 @@ if __name__ == "__main__":
     executor = trtllm.Executor(args.model_path, trtllm.ModelType.DECODER_ONLY,
                                trtllm.ExecutorConfig(1))
 
-    # Create the request.
-    request = trtllm.Request(input_token_ids=[1, 2, 3, 4], max_new_tokens=10)
+    if executor.can_enqueue_requests():
+        # Create the request.
+        request = trtllm.Request(input_token_ids=[1, 2, 3, 4],
+                                 max_new_tokens=10)
 
-    # Enqueue the request.
-    request_id = executor.enqueue_request(request)
+        # Enqueue the request.
+        request_id = executor.enqueue_request(request)
 
-    # Wait for the new tokens.
-    responses = executor.await_responses(request_id)
-    output_tokens = responses[0].result.output_token_ids
+        # Wait for the new tokens.
+        responses = executor.await_responses(request_id)
+        output_tokens = responses[0].result.output_token_ids
 
-    # Print tokens.
-    print(output_tokens)
+        # Print tokens.
+        print(output_tokens)

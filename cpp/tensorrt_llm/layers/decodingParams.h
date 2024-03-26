@@ -78,8 +78,10 @@ public:
     tc::Tensor output_ids_ptr;            // [batch_size] int* (2-d array), each int* has [beam_width, max_seq_len]
 
     // Medusa params
-    std::optional<tc::Tensor> nextDraftTokens; // [batch_size, max_draft_tokens_per_step]
-    std::optional<tc::Tensor> acceptedLengths; // [batch_size]
+    std::optional<tc::Tensor> nextDraftTokens;       // [batch_size, max_draft_tokens_per_step]
+    std::optional<tc::Tensor> acceptedLengths;       // [batch_size]
+    std::optional<tc::Tensor> acceptedLengthsCumSum; // [batch_size + 1]
+    std::optional<tc::Tensor> medusaPathsOffsets;    // [batch_size * max_medusa_heads]
 };
 
 } // namespace tensorrt_llm::layers

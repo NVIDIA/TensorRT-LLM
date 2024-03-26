@@ -108,15 +108,15 @@ void invokeTranspose4dBatchMajor(T const* k_src, T const* v_src, KVCacheBuffer& 
 
 // NOTE: this kernel is in-place, QKV will be modified, if other kernels need that, may need copy or use before it.
 template <typename T, typename KVCacheBuffer, bool IsGenerate = false>
-void invokeApplyBiasRopeUpdateKVCache(T* QKV, T* Q, KVCacheBuffer& kvTable, T const* qkv_bias, int const* seq_lens,
-    int const* kv_seq_lens, int const* padding_offset, int const batch_size, int const seq_len,
+void invokeApplyBiasRopeUpdateKVCache(T* QKV, void* O, T* Q, KVCacheBuffer& kvTable, T const* qkv_bias,
+    int const* seq_lens, int const* kv_seq_lens, int const* padding_offset, int const batch_size, int const seq_len,
     int const cyclic_kv_cache_len, int const sink_token_len, int const token_num, int const head_num,
     int const kv_head_num, int const size_per_head, int const rotary_embedding_dim, float const rotary_embedding_base,
     const RotaryScalingType rotary_scale_type, float const rotary_embedding_scale,
     int const rotary_embedding_max_positions, const PositionEmbeddingType position_embedding_type,
     int const* medusa_position_offsets, bool const position_shift_enabled, float const* scale, int const int8_mode,
     const KvCacheDataType cache_type, float const* kvScaleOrigQuant, bool const enable_paged_kv_fmha,
-    int const beam_width, int2& grid_block_cache, cudaStream_t stream);
+    bool const quantized_fp8_output, int const beam_width, int2& grid_block_cache, cudaStream_t stream);
 
 template <typename T, typename BT>
 void invokeAddRelativeAttentionBiasUnaligned(T* qk_buf, const BT* relative_attention_bias, int const batch_size,

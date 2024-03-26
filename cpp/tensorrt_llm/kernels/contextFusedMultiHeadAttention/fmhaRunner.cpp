@@ -86,7 +86,9 @@ public:
     {
         TLLM_CHECK_WITH_INFO(
             (sm == kSM_70 || sm == kSM_80 || sm == kSM_86 || sm == kSM_89 || sm == kSM_90), "Unsupported architecture");
-        TLLM_CHECK_WITH_INFO((mDataType == DATA_TYPE_FP16 || mDataType == DATA_TYPE_BF16), "Unsupported data type");
+        TLLM_CHECK_WITH_INFO(
+            (mDataType == DATA_TYPE_FP16 || mDataType == DATA_TYPE_BF16 || mDataType == DATA_TYPE_E4M3),
+            "Unsupported data type");
 
         pagedKVXmmaKernel = getPagedKVXMMAKernelsV2(mDataType, sm);
         xmmaKernel = getXMMAKernelsV2(mDataType, sm);
@@ -117,7 +119,7 @@ public:
         float const scale_softmax = 1.f; // Seems to be only required for int8
         float const scale_bmm2 = 1.f;
 
-        Data_type scale_type = mLaunchParams.force_fp32_acc ? DATA_TYPE_FP32 : mDataType;
+        Data_type scale_type = mLaunchParams.force_fp32_acc || mDataType == DATA_TYPE_E4M3 ? DATA_TYPE_FP32 : mDataType;
         // Use exp2f optimization for warp-specialized ws kernels on Hopper.
         if (mLaunchParams.useBase2ExpTrick)
         {
@@ -130,6 +132,7 @@ public:
             set_alpha(params.scale_bmm1, scale_bmm1, scale_type);
         }
         set_alpha(params.scale_softmax, scale_softmax, scale_type);
+        // Host scale_bmm2 will not be used.
         set_alpha(params.scale_bmm2, scale_bmm2, scale_type);
 
         params.b = b;
@@ -138,7 +141,7 @@ public:
         params.d = mHeadSize;
         params.sliding_window_size = sliding_window_size;
 
-        params.o_stride_in_bytes = mNumHeads * mHeadSize * sizeof(half);
+        params.o_stride_in_bytes = get_size_in_bytes(mNumHeads * mHeadSize, mDataType);
 
         // Total sequence length needed by TMA descriptor
         // it should be actual total seq length if non-padded input is given.
@@ -153,8 +156,8 @@ public:
     }
 
     // Support packed QKV.
-    void setup(int const b, int const s, int const sliding_window_size, int const total_seqlen, bool const has_alibi,
-        bool const scale_alibi, int const tp_size, int const tp_rank)
+    void setup(int const b, int const s, int const sliding_window_size, int const total_seqlen,
+        float const* scale_bmm2_d, bool const has_alibi, bool const scale_alibi, int const tp_size, int const tp_rank)
     {
 
         // Determine launch parameters.
@@ -169,7 +172,14 @@ public:
         bool const isSm90 = (sm == kSM_90);
         bool const isSm8x = (sm == kSM_86 || sm == kSM_89);
         bool const isSm80 = (sm == kSM_80);
-        if (isSm70)
+
+        // Only warp-specialized FMHA kernels support FP8 on Hopper.
+        if (isSm90 && mDataType == DATA_TYPE_E4M3)
+        {
+            mLaunchParams.flash_attention = true;
+            mLaunchParams.force_unroll = true;
+        }
+        else if (isSm70)
         {
             mLaunchParams.flash_attention = true;
             mLaunchParams.force_unroll = true;          // need more profile
@@ -234,7 +244,10 @@ public:
 
         // Set kernel parameters.
         setup_params(mParams, b, s, s, sliding_window_size, total_seqlen, has_alibi, scale_alibi, tp_size, tp_rank);
-        mParams.qkv_stride_in_bytes = (mNumHeads + 2 * mParams.h_kv) * mHeadSize * sizeof(half);
+        // TODO: move this to setup_params when fp8 paged kv fmha is supported.
+        // TRT doesn't support host scales. Use device scales instead.
+        mParams.scale_bmm2_d = reinterpret_cast<uint32_t const*>(scale_bmm2_d);
+        mParams.qkv_stride_in_bytes = get_size_in_bytes((mNumHeads + 2 * mParams.h_kv) * mHeadSize, mDataType);
     }
 
     // Support paged_kv_cache and chunked_attention.
@@ -309,6 +322,7 @@ public:
             mLaunchParams.attention_mask_type = ContextAttentionMaskType::SLIDING_WINDOW_CAUSAL;
         }
 
+        // TODO: add paged kv FP8 FMHA.
         setup_params(
             mPagedKVParams, b, s_q, s_kv, sliding_window_size, total_seqlen, has_alibi, scale_alibi, tp_size, tp_rank);
         mPagedKVParams.q_stride_in_bytes = mNumHeads * mHeadSize * sizeof(half);
@@ -320,7 +334,7 @@ public:
     void set_tma_descriptors()
     {
         // split D into multiple groups in order to match the TMA swizzle mode (128B)
-        const uint32_t d_in_bytes = mLaunchParams.padded_d * sizeof(uint16_t);
+        const uint32_t d_in_bytes = get_size_in_bytes(mLaunchParams.padded_d, mDataType);
         const uint32_t d_groups = d_in_bytes > 128 ? d_in_bytes / 128 : 1;
 
         // separate q, k, and v tma descriptors
@@ -351,9 +365,9 @@ public:
 
         // stride size in bytes. Assumes least significant dim is 1 (?)
         uint64_t tensor_stride_qkv[3];
-        tensor_stride_qkv[0] = tensor_size_qkv[0] * sizeof(uint16_t);     // d
-        tensor_stride_qkv[1] = tensor_size_qkv[1] * tensor_stride_qkv[0]; // d*h
-        tensor_stride_qkv[2] = tensor_size_qkv[2] * tensor_stride_qkv[1]; // d*h*3
+        tensor_stride_qkv[0] = get_size_in_bytes(tensor_size_qkv[0], mDataType); // d
+        tensor_stride_qkv[1] = tensor_size_qkv[1] * tensor_stride_qkv[0];        // d*h
+        tensor_stride_qkv[2] = tensor_size_qkv[2] * tensor_stride_qkv[1];        // d*h*3
 
         // traversal stride
         uint32_t traversal_stride_qkv[4] = {1, 1, 1, 1};
@@ -365,7 +379,7 @@ public:
         uint32_t fp32_to_tf32 = 0;
 
         // gmma descriptor mode
-        const uint32_t d_bytes_per_group = (mLaunchParams.padded_d * sizeof(uint16_t)) / d_groups;
+        const uint32_t d_bytes_per_group = d_in_bytes / d_groups;
         const cudaTmaDescSwizzle swizzle_mode = (d_bytes_per_group > 64
                 ? cudaTmaDescSwizzle::SWIZZLE_128B
                 : (d_bytes_per_group > 32 ? cudaTmaDescSwizzle::SWIZZLE_64B : cudaTmaDescSwizzle::SWIZZLE_32B));
@@ -388,21 +402,21 @@ public:
 
         // Q: STEP_Q
         box_size[3] = q_step;
-        qkv_tma_descriptor.set_tma_desctriptor(qkv_ptr, cudaTmaDescFormat::F16_RN,
-            cudaTmaDescInterleave::INTERLEAVE_DISABLED, swizzle_mode, cudaTmaDescPromotion::PROMOTION_DISABLED,
-            tensor_size_qkv, tensor_stride_qkv, traversal_stride_qkv, box_size, oob_fill, fp32_to_tf32,
-            &mParams.tma_desc_q);
+        // Desc Format (data type).
+        const cudaTmaDescFormat desc_format
+            = (get_size_in_bytes(1, mDataType) == 1) ? cudaTmaDescFormat::U8 : cudaTmaDescFormat::F16_RN;
+        qkv_tma_descriptor.set_tma_desctriptor(qkv_ptr, desc_format, cudaTmaDescInterleave::INTERLEAVE_DISABLED,
+            swizzle_mode, cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_qkv, tensor_stride_qkv,
+            traversal_stride_qkv, box_size, oob_fill, fp32_to_tf32, &mParams.tma_desc_q);
 
         // K/V: STEP_KV
         box_size[3] = kv_step;
-        qkv_tma_descriptor.set_tma_desctriptor(qkv_ptr, cudaTmaDescFormat::F16_RN,
-            cudaTmaDescInterleave::INTERLEAVE_DISABLED, swizzle_mode, cudaTmaDescPromotion::PROMOTION_DISABLED,
-            tensor_size_qkv, tensor_stride_qkv, traversal_stride_qkv, box_size, oob_fill, fp32_to_tf32,
-            &mParams.tma_desc_k);
-        qkv_tma_descriptor.set_tma_desctriptor(qkv_ptr, cudaTmaDescFormat::F16_RN,
-            cudaTmaDescInterleave::INTERLEAVE_DISABLED, swizzle_mode, cudaTmaDescPromotion::PROMOTION_DISABLED,
-            tensor_size_qkv, tensor_stride_qkv, traversal_stride_qkv, box_size, oob_fill, fp32_to_tf32,
-            &mParams.tma_desc_v);
+        qkv_tma_descriptor.set_tma_desctriptor(qkv_ptr, desc_format, cudaTmaDescInterleave::INTERLEAVE_DISABLED,
+            swizzle_mode, cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_qkv, tensor_stride_qkv,
+            traversal_stride_qkv, box_size, oob_fill, fp32_to_tf32, &mParams.tma_desc_k);
+        qkv_tma_descriptor.set_tma_desctriptor(qkv_ptr, desc_format, cudaTmaDescInterleave::INTERLEAVE_DISABLED,
+            swizzle_mode, cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_qkv, tensor_stride_qkv,
+            traversal_stride_qkv, box_size, oob_fill, fp32_to_tf32, &mParams.tma_desc_v);
     }
 
     // Q are contiguous in the shape of [B, S, H, D]
@@ -520,8 +534,9 @@ public:
 
     void setup_flags(bool const force_fp32_acc, bool const is_s_padded, bool const causal_mask, int const num_kv_heads)
     {
-        // BF16 FMHA only accumulates on FP32
-        mLaunchParams.force_fp32_acc = mDataType == DATA_TYPE_BF16 || force_fp32_acc;
+        // BF16 FMHA only accumulates on FP32.
+        // E4M3 FMHA only supports fp32 accumulation currently.
+        mLaunchParams.force_fp32_acc = mDataType == DATA_TYPE_BF16 || mDataType == DATA_TYPE_E4M3 || force_fp32_acc;
         mLaunchParams.attention_mask_type
             = causal_mask ? ContextAttentionMaskType::CAUSAL : ContextAttentionMaskType::PADDING;
 
@@ -646,9 +661,9 @@ FusedMHARunnerV2::FusedMHARunnerV2(
 FusedMHARunnerV2::~FusedMHARunnerV2() = default;
 
 void FusedMHARunnerV2::setup(int const b, int const s, int const sliding_window_size, int const total_seqlen,
-    bool const has_alibi, bool const scale_alibi, int const tp_size, int const tp_rank)
+    float const* scale_bmm2_d, bool const has_alibi, bool const scale_alibi, int const tp_size, int const tp_rank)
 {
-    pimpl->setup(b, s, sliding_window_size, total_seqlen, has_alibi, scale_alibi, tp_size, tp_rank);
+    pimpl->setup(b, s, sliding_window_size, total_seqlen, scale_bmm2_d, has_alibi, scale_alibi, tp_size, tp_rank);
 }
 
 void FusedMHARunnerV2::setup_paged_kv(int const b, int const s_q, int const s_kv, int const blocks_per_context_sequence,

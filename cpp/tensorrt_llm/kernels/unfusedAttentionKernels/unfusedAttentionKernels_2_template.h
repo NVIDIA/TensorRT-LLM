@@ -46,7 +46,9 @@ template <typename T, int Dh_MAX>
 struct Rotary_vec_t
 {
     using Type = T;
-    using Packed_type = T;
+    // Quantized output type only supports fp8 currently.
+    using Packed_type = __nv_fp8_e4m3;
+    using Quantized_type = void;
     static constexpr int size = 1;
 };
 
@@ -56,6 +58,7 @@ template <>
 struct Rotary_vec_t<float, 32>
 {
     using Type = float;
+    using Quantized_type = __nv_fp8_e4m3;
     using Packed_type = float;
     static constexpr int size = 1;
 };
@@ -64,6 +67,7 @@ template <>
 struct Rotary_vec_t<float, 64>
 {
     using Type = float2;
+    using Quantized_type = mmha::fp8_2_t;
     using Packed_type = float2;
     static constexpr int size = 2;
 };
@@ -72,6 +76,7 @@ template <>
 struct Rotary_vec_t<float, 128>
 {
     using Type = float4;
+    using Quantized_type = mmha::fp8_4_t;
     using Packed_type = float2;
     static constexpr int size = 4;
 };
@@ -80,6 +85,7 @@ template <>
 struct Rotary_vec_t<float, 256>
 {
     using Type = mmha::Float8_;
+    using Quantized_type = mmha::fp8_8_t;
     using Packed_type = float2;
     static constexpr int size = 8;
 };
@@ -90,6 +96,7 @@ template <>
 struct Rotary_vec_t<half, 32>
 {
     using Type = uint16_t;
+    using Quantized_type = __nv_fp8_e4m3;
     using Packed_type = uint16_t;
     static constexpr int size = 1;
 };
@@ -98,6 +105,7 @@ template <>
 struct Rotary_vec_t<half, 64>
 {
     using Type = uint32_t;
+    using Quantized_type = mmha::fp8_2_t;
     using Packed_type = uint32_t;
     static constexpr int size = 2;
 };
@@ -106,6 +114,7 @@ template <>
 struct Rotary_vec_t<half, 128>
 {
     using Type = uint2;
+    using Quantized_type = mmha::fp8_4_t;
     using Packed_type = uint32_t;
     static constexpr int size = 4;
 };
@@ -114,6 +123,7 @@ template <>
 struct Rotary_vec_t<half, 256>
 {
     using Type = uint4;
+    using Quantized_type = mmha::fp8_8_t;
     using Packed_type = uint32_t;
     static constexpr int size = 8;
 };
@@ -126,6 +136,7 @@ template <>
 struct Rotary_vec_t<__nv_bfloat16, 32>
 {
     using Type = __nv_bfloat16;
+    using Quantized_type = __nv_fp8_e4m3;
     using Packed_type = __nv_bfloat16;
     static constexpr int size = 1;
 };
@@ -134,6 +145,7 @@ template <>
 struct Rotary_vec_t<__nv_bfloat16, 64>
 {
     using Type = __nv_bfloat162;
+    using Quantized_type = mmha::fp8_2_t;
     using Packed_type = __nv_bfloat162;
     static constexpr int size = 2;
 };
@@ -142,6 +154,7 @@ template <>
 struct Rotary_vec_t<__nv_bfloat16, 128>
 {
     using Type = mmha::bf16_4_t;
+    using Quantized_type = mmha::fp8_4_t;
     using Packed_type = __nv_bfloat162;
     static constexpr int size = 4;
 };
@@ -150,6 +163,7 @@ template <>
 struct Rotary_vec_t<__nv_bfloat16, 256>
 {
     using Type = mmha::bf16_8_t;
+    using Quantized_type = mmha::fp8_8_t;
     using Packed_type = __nv_bfloat162;
     static constexpr int size = 8;
 };
@@ -158,13 +172,14 @@ struct Rotary_vec_t<__nv_bfloat16, 256>
 
 template <typename T, typename T_cache, int Dh_MAX, bool ADD_BIAS, bool STORE_QKV, bool POS_SHIFT,
     typename KVCacheBuffer, bool IS_GENERATE>
-__global__ void applyBiasRopeUpdateKVCache(T* QKV, T* Q, KVCacheBuffer kvCacheBuffer, T const* __restrict qkv_bias,
-    int const* seq_lens, int const* kv_seq_lens, int const* padding_offset, float const* kvScaleOrigQuant,
-    int const num_tokens, int const batch_size, int const seq_len, int const cyclic_kv_cache_len,
-    int const sink_token_len, int const head_num, int const kv_head_num, int const qheads_per_kv_head,
-    int const size_per_head, int const rotary_embedding_dim, float rotary_embedding_base,
+__global__ void applyBiasRopeUpdateKVCache(T* QKV, void* O, T* Q, KVCacheBuffer kvCacheBuffer,
+    T const* __restrict qkv_bias, int const* seq_lens, int const* kv_seq_lens, int const* padding_offset,
+    float const* kvScaleOrigQuant, int const num_tokens, int const batch_size, int const seq_len,
+    int const cyclic_kv_cache_len, int const sink_token_len, int const head_num, int const kv_head_num,
+    int const qheads_per_kv_head, int const size_per_head, int const rotary_embedding_dim, float rotary_embedding_base,
     RotaryScalingType const rotary_scale_type, float rotary_embedding_scale, int const rotary_embedding_max_positions,
-    PositionEmbeddingType const position_embedding_type, int const* medusa_position_offsets, int const beam_width)
+    PositionEmbeddingType const position_embedding_type, int const* medusa_position_offsets,
+    bool const quantized_fp8_output, int const beam_width)
 {
     // This kernel add bias to QKV, which has shape [batch_size, seq_len, 3, head_num, size_per_head]
     // Extract the Q input when using paged KV FMHA.
@@ -190,6 +205,9 @@ __global__ void applyBiasRopeUpdateKVCache(T* QKV, T* Q, KVCacheBuffer kvCacheBu
     // VEC_SIZE is power of 2.
     constexpr int VEC_SIZE = Rotary_vec_t<T, Dh_MAX>::size;
     using Vec_type = typename Rotary_vec_t<T, Dh_MAX>::Type;
+    // Quantized output only supports fp8 currently.
+    using Quantized_elt_type = __nv_fp8_e4m3;
+    using Quantized_type = typename Rotary_vec_t<T, Dh_MAX>::Quantized_type;
     using Packed_type = typename Rotary_vec_t<T, Dh_MAX>::Packed_type;
     bool const has_padding = padding_offset == nullptr;
 
@@ -348,7 +366,16 @@ __global__ void applyBiasRopeUpdateKVCache(T* QKV, T* Q, KVCacheBuffer kvCacheBu
 
             if constexpr (STORE_QKV)
             {
-                *reinterpret_cast<Vec_type*>(&QKV[src_q_idx]) = q;
+                if (quantized_fp8_output)
+                {
+                    // use 1.0f scale currently for qkv input of FP8 FMHA.
+                    mmha::convert_to_fp8(
+                        reinterpret_cast<Quantized_type*>(reinterpret_cast<Quantized_elt_type*>(O) + src_q_idx), q);
+                }
+                else
+                {
+                    *reinterpret_cast<Vec_type*>(&QKV[src_q_idx]) = q;
+                }
             }
             else
             {
@@ -358,10 +385,21 @@ __global__ void applyBiasRopeUpdateKVCache(T* QKV, T* Q, KVCacheBuffer kvCacheBu
             {
                 if constexpr (STORE_QKV)
                 {
-                    *reinterpret_cast<Vec_type*>(&QKV[src_k_idx]) = k;
-                    if constexpr (ADD_BIAS)
+                    if (quantized_fp8_output)
                     {
-                        *reinterpret_cast<Vec_type*>(&QKV[src_v_idx]) = v;
+                        // use 1.0f scale currently for qkv input of FP8 FMHA.
+                        mmha::convert_to_fp8(
+                            reinterpret_cast<Quantized_type*>(reinterpret_cast<Quantized_elt_type*>(O) + src_k_idx), k);
+                        mmha::convert_to_fp8(
+                            reinterpret_cast<Quantized_type*>(reinterpret_cast<Quantized_elt_type*>(O) + src_v_idx), v);
+                    }
+                    else
+                    {
+                        *reinterpret_cast<Vec_type*>(&QKV[src_k_idx]) = k;
+                        if constexpr (ADD_BIAS)
+                        {
+                            *reinterpret_cast<Vec_type*>(&QKV[src_v_idx]) = v;
+                        }
                     }
                 }
 
@@ -405,22 +443,22 @@ __global__ void applyBiasRopeUpdateKVCache(T* QKV, T* Q, KVCacheBuffer kvCacheBu
         = std::min((grid_size + head_num - 1) / head_num, (token_num + tokens_per_block - 1) / tokens_per_block);      \
     dim3 grid(blocks_per_sequence, head_num);                                                                          \
     applyBiasRopeUpdateKVCache<T, T_cache, Dh_MAX, ADD_BIAS, STORE_QKV, POS_SHIFT, KVCacheBuffer, IS_GENERATE>         \
-        <<<grid, block, 0, stream>>>(QKV, Q, kvTable, qkv_bias, seq_lens, kv_seq_lens, padding_offset,                 \
+        <<<grid, block, 0, stream>>>(QKV, O, Q, kvTable, qkv_bias, seq_lens, kv_seq_lens, padding_offset,              \
             kvScaleOrigQuant, token_num, batch_size, seq_len, cyclic_kv_cache_len, sink_token_len, head_num,           \
             kv_head_num, head_num / kv_head_num, size_per_head, rotary_embedding_dim, rotary_embedding_base,           \
             rotary_scale_type, updated_rotary_embedding_scale, rotary_embedding_max_positions,                         \
-            position_embedding_type, medusa_position_offsets, beam_width);
+            position_embedding_type, medusa_position_offsets, quantized_fp8_output, beam_width);
 
 template <int Dh_MAX, typename T, typename T_cache, typename KVCacheBuffer, bool IS_GENERATE>
-void kernelDispatchHeadSize(T* QKV, T* Q, KVCacheBuffer& kvTable, T const* qkv_bias, int const* seq_lens,
+void kernelDispatchHeadSize(T* QKV, void* O, T* Q, KVCacheBuffer& kvTable, T const* qkv_bias, int const* seq_lens,
     int const* kv_seq_lens, int const* padding_offset, int const batch_size, int const seq_len,
     int const cyclic_kv_cache_len, int const sink_token_len, int const token_num, int const head_num,
     int const kv_head_num, int const size_per_head, int const rotary_embedding_dim, float const rotary_embedding_base,
     const RotaryScalingType rotary_scale_type, float const rotary_embedding_scale,
     int const rotary_embedding_max_positions, const PositionEmbeddingType position_embedding_type,
     int const* medusa_position_offsets, bool const position_shift_enabled, float const* scale,
-    float const* kvScaleOrigQuant, int const int8_mode, bool const enable_paged_kv_fmha, int const beam_width,
-    int2& grid_block_cache, cudaStream_t stream)
+    float const* kvScaleOrigQuant, int const int8_mode, bool const enable_paged_kv_fmha,
+    bool const quantized_fp8_output, int const beam_width, int2& grid_block_cache, cudaStream_t stream)
 {
     bool const add_bias = qkv_bias != nullptr;
     bool const store_contiguous_qkv = !enable_paged_kv_fmha;
@@ -482,15 +520,15 @@ void kernelDispatchHeadSize(T* QKV, T* Q, KVCacheBuffer& kvTable, T const* qkv_b
 }
 
 template <typename T, typename T_cache, typename KVCacheBuffer, bool IS_GENERATE>
-void invokeApplyBiasRopeUpdateKVCacheDispatch(T* QKV, T* Q, KVCacheBuffer& kvTable, T const* qkv_bias,
+void invokeApplyBiasRopeUpdateKVCacheDispatch(T* QKV, void* O, T* Q, KVCacheBuffer& kvTable, T const* qkv_bias,
     int const* seq_lens, int const* kv_seq_lens, int const* padding_offset, int const batch_size, int const seq_len,
     int const cyclic_kv_cache_len, int const sink_token_len, int const token_num, int const head_num,
     int const kv_head_num, int const size_per_head, int const rotary_embedding_dim, float const rotary_embedding_base,
     const RotaryScalingType rotary_scale_type, float const rotary_embedding_scale,
     int const rotary_embedding_max_positions, const PositionEmbeddingType position_embedding_type,
     int const* medusa_position_offsets, bool const position_shift_enabled, float const* scale,
-    float const* kvScaleOrigQuant, int const int8_mode, bool const enable_paged_kv_fmha, int const beam_width,
-    int2& grid_block_cache, cudaStream_t stream)
+    float const* kvScaleOrigQuant, int const int8_mode, bool const enable_paged_kv_fmha,
+    bool const quantized_fp8_output, int const beam_width, int2& grid_block_cache, cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(int8_mode != 2, "w8a8 not yet implemented with RoPE"); // TODO
     if constexpr (!IS_GENERATE)
@@ -509,30 +547,30 @@ void invokeApplyBiasRopeUpdateKVCacheDispatch(T* QKV, T* Q, KVCacheBuffer& kvTab
     // GPTJ Rotary embedding needs at least two elements per thread.
     if (size_per_head <= 64)
     {
-        kernelDispatchHeadSize<64, T, T_cache, KVCacheBuffer, IS_GENERATE>(QKV, Q, kvTable, qkv_bias, seq_lens,
+        kernelDispatchHeadSize<64, T, T_cache, KVCacheBuffer, IS_GENERATE>(QKV, O, Q, kvTable, qkv_bias, seq_lens,
             kv_seq_lens, padding_offset, batch_size, seq_len, cyclic_kv_cache_len, sink_token_len, token_num, head_num,
             kv_head_num, size_per_head, rotary_embedding_dim, rotary_embedding_base, rotary_scale_type,
             rotary_embedding_scale, rotary_embedding_max_positions, position_embedding_type, medusa_position_offsets,
-            position_shift_enabled, scale, kvScaleOrigQuant, int8_mode, enable_paged_kv_fmha, beam_width,
-            grid_block_cache, stream);
+            position_shift_enabled, scale, kvScaleOrigQuant, int8_mode, enable_paged_kv_fmha, quantized_fp8_output,
+            beam_width, grid_block_cache, stream);
     }
     else if (size_per_head <= 128)
     {
-        kernelDispatchHeadSize<128, T, T_cache, KVCacheBuffer, IS_GENERATE>(QKV, Q, kvTable, qkv_bias, seq_lens,
+        kernelDispatchHeadSize<128, T, T_cache, KVCacheBuffer, IS_GENERATE>(QKV, O, Q, kvTable, qkv_bias, seq_lens,
             kv_seq_lens, padding_offset, batch_size, seq_len, cyclic_kv_cache_len, sink_token_len, token_num, head_num,
             kv_head_num, size_per_head, rotary_embedding_dim, rotary_embedding_base, rotary_scale_type,
             rotary_embedding_scale, rotary_embedding_max_positions, position_embedding_type, medusa_position_offsets,
-            position_shift_enabled, scale, kvScaleOrigQuant, int8_mode, enable_paged_kv_fmha, beam_width,
-            grid_block_cache, stream);
+            position_shift_enabled, scale, kvScaleOrigQuant, int8_mode, enable_paged_kv_fmha, quantized_fp8_output,
+            beam_width, grid_block_cache, stream);
     }
     else if (size_per_head <= 256)
     {
-        kernelDispatchHeadSize<256, T, T_cache, KVCacheBuffer, IS_GENERATE>(QKV, Q, kvTable, qkv_bias, seq_lens,
+        kernelDispatchHeadSize<256, T, T_cache, KVCacheBuffer, IS_GENERATE>(QKV, O, Q, kvTable, qkv_bias, seq_lens,
             kv_seq_lens, padding_offset, batch_size, seq_len, cyclic_kv_cache_len, sink_token_len, token_num, head_num,
             kv_head_num, size_per_head, rotary_embedding_dim, rotary_embedding_base, rotary_scale_type,
             rotary_embedding_scale, rotary_embedding_max_positions, position_embedding_type, medusa_position_offsets,
-            position_shift_enabled, scale, kvScaleOrigQuant, int8_mode, enable_paged_kv_fmha, beam_width,
-            grid_block_cache, stream);
+            position_shift_enabled, scale, kvScaleOrigQuant, int8_mode, enable_paged_kv_fmha, quantized_fp8_output,
+            beam_width, grid_block_cache, stream);
     }
     else
     {
@@ -541,15 +579,15 @@ void invokeApplyBiasRopeUpdateKVCacheDispatch(T* QKV, T* Q, KVCacheBuffer& kvTab
 }
 
 template <typename T, typename KVCacheBuffer, bool IS_GENERATE>
-void invokeApplyBiasRopeUpdateKVCache(T* QKV, T* Q, KVCacheBuffer& kvTable, T const* qkv_bias, int const* seq_lens,
-    int const* kv_seq_lens, int const* padding_offset, int const batch_size, int const seq_len,
+void invokeApplyBiasRopeUpdateKVCache(T* QKV, void* O, T* Q, KVCacheBuffer& kvTable, T const* qkv_bias,
+    int const* seq_lens, int const* kv_seq_lens, int const* padding_offset, int const batch_size, int const seq_len,
     int const cyclic_kv_cache_len, int const sink_token_len, int const token_num, int const head_num,
     int const kv_head_num, int const size_per_head, int const rotary_embedding_dim, float const rotary_embedding_base,
     const RotaryScalingType rotary_scale_type, float const rotary_embedding_scale,
     int const rotary_embedding_max_positions, const PositionEmbeddingType position_embedding_type,
     int const* medusa_position_offsets, bool const position_shift_enabled, float const* scale, int const int8_mode,
     const KvCacheDataType cache_type, float const* kvScaleOrigQuant, bool const enable_paged_kv_fmha,
-    int const beam_width, int2& grid_block_cache, cudaStream_t stream)
+    bool const quantized_fp8_output, int const beam_width, int2& grid_block_cache, cudaStream_t stream)
 {
     // Block handles both K and V tile.
     constexpr int x = (sizeof(T) == 4) ? 4 : 8;
@@ -557,38 +595,38 @@ void invokeApplyBiasRopeUpdateKVCache(T* QKV, T* Q, KVCacheBuffer& kvTable, T co
 
     if (cache_type == KvCacheDataType::INT8)
     {
-        invokeApplyBiasRopeUpdateKVCacheDispatch<T, int8_t, KVCacheBuffer, IS_GENERATE>(QKV, Q, kvTable, qkv_bias,
+        invokeApplyBiasRopeUpdateKVCacheDispatch<T, int8_t, KVCacheBuffer, IS_GENERATE>(QKV, O, Q, kvTable, qkv_bias,
             seq_lens, kv_seq_lens, padding_offset, batch_size, seq_len, cyclic_kv_cache_len, sink_token_len, token_num,
             head_num, kv_head_num, size_per_head, rotary_embedding_dim, rotary_embedding_base, rotary_scale_type,
             rotary_embedding_scale, rotary_embedding_max_positions, position_embedding_type, medusa_position_offsets,
-            position_shift_enabled, scale, kvScaleOrigQuant, int8_mode, enable_paged_kv_fmha, beam_width,
-            grid_block_cache, stream);
+            position_shift_enabled, scale, kvScaleOrigQuant, int8_mode, enable_paged_kv_fmha, quantized_fp8_output,
+            beam_width, grid_block_cache, stream);
     }
 #ifdef ENABLE_FP8
     else if (cache_type == KvCacheDataType::FP8)
     {
-        invokeApplyBiasRopeUpdateKVCacheDispatch<T, __nv_fp8_e4m3, KVCacheBuffer, IS_GENERATE>(QKV, Q, kvTable,
+        invokeApplyBiasRopeUpdateKVCacheDispatch<T, __nv_fp8_e4m3, KVCacheBuffer, IS_GENERATE>(QKV, O, Q, kvTable,
             qkv_bias, seq_lens, kv_seq_lens, padding_offset, batch_size, seq_len, cyclic_kv_cache_len, sink_token_len,
             token_num, head_num, kv_head_num, size_per_head, rotary_embedding_dim, rotary_embedding_base,
             rotary_scale_type, rotary_embedding_scale, rotary_embedding_max_positions, position_embedding_type,
             medusa_position_offsets, position_shift_enabled, scale, kvScaleOrigQuant, int8_mode, enable_paged_kv_fmha,
-            beam_width, grid_block_cache, stream);
+            quantized_fp8_output, beam_width, grid_block_cache, stream);
     }
 #endif // ENABLE_FP8
     else
     {
-        invokeApplyBiasRopeUpdateKVCacheDispatch<T, T, KVCacheBuffer, IS_GENERATE>(QKV, Q, kvTable, qkv_bias, seq_lens,
-            kv_seq_lens, padding_offset, batch_size, seq_len, cyclic_kv_cache_len, sink_token_len, token_num, head_num,
-            kv_head_num, size_per_head, rotary_embedding_dim, rotary_embedding_base, rotary_scale_type,
+        invokeApplyBiasRopeUpdateKVCacheDispatch<T, T, KVCacheBuffer, IS_GENERATE>(QKV, O, Q, kvTable, qkv_bias,
+            seq_lens, kv_seq_lens, padding_offset, batch_size, seq_len, cyclic_kv_cache_len, sink_token_len, token_num,
+            head_num, kv_head_num, size_per_head, rotary_embedding_dim, rotary_embedding_base, rotary_scale_type,
             rotary_embedding_scale, rotary_embedding_max_positions, position_embedding_type, medusa_position_offsets,
-            position_shift_enabled, scale, kvScaleOrigQuant, int8_mode, enable_paged_kv_fmha, beam_width,
-            grid_block_cache, stream);
+            position_shift_enabled, scale, kvScaleOrigQuant, int8_mode, enable_paged_kv_fmha, quantized_fp8_output,
+            beam_width, grid_block_cache, stream);
     }
 }
 
 #define INSTANTIATE_ADDFUSEDQKVBIAS_TRANSPOSE(T, KVCacheBuffer, IS_GENERATE)                                           \
-    template void invokeApplyBiasRopeUpdateKVCache<T, KVCacheBuffer, IS_GENERATE>(T * QKV, T * Q,                      \
-        KVCacheBuffer & kvTable, const T* qkv_bias, const int* seq_lens, const int* kv_seq_lens,                       \
+    template void invokeApplyBiasRopeUpdateKVCache<T, KVCacheBuffer, IS_GENERATE>(T * QKV, void* O, T* Q,              \
+        KVCacheBuffer& kvTable, const T* qkv_bias, const int* seq_lens, const int* kv_seq_lens,                        \
         const int* padding_offset, const int batch_size, const int seq_len, const int cyclic_kv_cache_len,             \
         const int sink_token_len, const int token_num, const int head_num, const int kv_head_num,                      \
         const int size_per_head, const int rotary_embedding_dim, const float rotary_embedding_base,                    \
@@ -596,7 +634,8 @@ void invokeApplyBiasRopeUpdateKVCache(T* QKV, T* Q, KVCacheBuffer& kvTable, T co
         const int rotary_embedding_max_positions, const PositionEmbeddingType position_embedding_type,                 \
         const int* medusa_position_offsets, const bool position_shift_enabled, const float* scale,                     \
         const int int8_mode, const KvCacheDataType cache_type, const float* kvScaleOrigQuant,                          \
-        const bool enable_paged_kv_fmha, const int beam_width, int2& grid_block_cache, cudaStream_t stream)
+        const bool enable_paged_kv_fmha, bool const quantized_fp8_output, const int beam_width,                        \
+        int2& grid_block_cache, cudaStream_t stream)
 
 } // namespace kernels
 } // namespace tensorrt_llm

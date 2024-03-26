@@ -1,6 +1,5 @@
 import contextlib
 import threading
-from enum import Enum, EnumMeta
 from types import NoneType
 from typing import ByteString, Iterable, MutableMapping
 
@@ -10,21 +9,6 @@ import torch
 from tensorrt_llm._utils import get_extra_attr, np_dtype_to_trt, set_extra_attr
 from tensorrt_llm.logger import logger
 from tensorrt_llm.network import PluginInfo, get_plugin_info
-
-
-class BaseEnumMeta(EnumMeta):
-
-    def __contains__(cls, item):
-        try:
-            cls(item)
-        except ValueError:
-            return False
-        return True
-
-
-class BaseEnum(Enum, metaclass=BaseEnumMeta):
-    pass
-
 
 LAYER_TYPE_2_CLASS = {
     trt.LayerType.ACTIVATION: trt.IActivationLayer,

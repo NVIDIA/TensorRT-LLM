@@ -66,7 +66,7 @@ void OnlineBeamSearchLayer<T>::invokeSoftMax(BeamSearchOutputParams& outputs, So
     bh.length_penalties = length_penalties_buf_;
     bh.early_stoppings = early_stoppings_buf_;
 
-    bh.batch_size = static_cast<std::int32_t>(outputs.output_ids_ptr.shape[0]);
+    bh.batch_size = static_cast<std::int32_t>(params.end_ids.shape[0]);
     bh.beam_width = static_cast<std::int32_t>(outputs.output_ids_ptr.shape[1]);
     bh.ite = params.ite;
     bh.local_batch_size = params.logits.shape[0];

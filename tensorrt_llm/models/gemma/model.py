@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 from typing import Optional
 
 from ..._utils import pad_vocab_size
@@ -20,15 +21,15 @@ from ...layers import (Attention, AttentionMaskType, ColumnLinear, Embedding,
                        GatedMLP, PositionEmbeddingType, RmsNorm)
 from ...mapping import Mapping
 from ...module import Module
-from ...quantization import QuantMode
 from ...top_model_mixin import TopModelMixin
-from ..modeling_utils import DecoderLayerList, DecoderModelForCausalLM
+from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
+                              PretrainedConfig, QuantConfig)
 from .weight import load_from_hf_gemma
 
 
 class GemmaDecoderLayer(Module):
 
-    def __init__(self, config, layer_idx):
+    def __init__(self, config: PretrainedConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
         self.config = config
@@ -113,22 +114,14 @@ class GemmaDecoderLayer(Module):
 
 class GemmaModel(Module):
 
-    def __init__(self, config) -> None:
+    def __init__(self, config: PretrainedConfig) -> None:
         super().__init__()
 
         self.mapping = config.mapping
         if self.mapping.is_first_pp_rank():
-            self.vocab_embedding = Embedding(
-                num_embeddings=config.vocab_size,
-                embedding_dim=config.hidden_size,
-                dtype=config.dtype,
-                tp_size=self.mapping.tp_size
-                if config.use_parallel_embedding else 1,
-                tp_group=self.mapping.tp_group
-                if config.use_parallel_embedding else None,
-                sharding_dim=config.embedding_sharding_dim,
-                tp_rank=self.mapping.tp_rank,
-            )
+            self.vocab_embedding = Embedding(config.vocab_size,
+                                             config.hidden_size,
+                                             dtype=config.dtype)
 
         self.layers = DecoderLayerList(GemmaDecoderLayer, config)
 
@@ -136,6 +129,7 @@ class GemmaModel(Module):
             self.ln_f = RmsNorm(normalized_shape=config.hidden_size,
                                 eps=config.norm_epsilon,
                                 dtype=config.dtype)
+        self.hidden_size = config.hidden_size
 
     def forward(self,
                 input_ids,
@@ -150,17 +144,13 @@ class GemmaModel(Module):
                 prompt_vocab_size: Optional[Tensor] = None,
                 lora_params=None):
 
-        kv_cache_params.fill_none_tensor_list(len(self.layers))
-
-        if use_cache:
-            presents = []
-
         ptuning_args = [
             prompt_embedding_table, prompt_tasks, prompt_vocab_size
         ] if prompt_embedding_table is not None else []
 
         if self.mapping.is_first_pp_rank():
             hidden_states = self.vocab_embedding(input_ids, *ptuning_args)
+            hidden_states = hidden_states * math.sqrt(self.hidden_size)
         else:
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
 
@@ -188,13 +178,17 @@ class GemmaModel(Module):
 
 class GemmaForCausalLM(DecoderModelForCausalLM, TopModelMixin):
 
-    def __init__(self, config):
+    def __init__(self, config: PretrainedConfig):
 
         self.check_config(config)
         transformer = GemmaModel(config)
 
         vocab_size_padded = pad_vocab_size(config.vocab_size,
                                            config.mapping.tp_size)
+        share_weight = None
+        assert config.share_embedding_table, "Gemma only supports share_embedding_table"
+        share_weight = transformer.vocab_embedding.weight
+
         if config.mapping.is_last_pp_rank():
             lm_head = ColumnLinear(config.hidden_size,
                                    vocab_size_padded,
@@ -202,7 +196,8 @@ class GemmaForCausalLM(DecoderModelForCausalLM, TopModelMixin):
                                    dtype=config.dtype,
                                    tp_group=config.mapping.tp_group,
                                    tp_size=config.mapping.tp_size,
-                                   gather_output=True)
+                                   gather_output=True,
+                                   share_weight=share_weight)
         else:
             lm_head = None
         self.quant_mode = config.quant_mode
@@ -215,7 +210,6 @@ class GemmaForCausalLM(DecoderModelForCausalLM, TopModelMixin):
                           hf_model_dir,
                           dtype='float16',
                           mapping: Optional[Mapping] = None,
-                          quant_mode: Optional[QuantMode] = None,
                           **kwargs):
         import transformers
         from transformers import GemmaConfig
@@ -225,16 +219,12 @@ class GemmaForCausalLM(DecoderModelForCausalLM, TopModelMixin):
 
         num_kv_heads = cfg.num_key_value_heads if hasattr(cfg, "num_key_value_heads") \
             else cfg.num_attention_heads
+        quantization = kwargs.get('quantization', QuantConfig())
         if mapping is None:
             mapping = Mapping()
-        if quant_mode is None:
-            quant_mode = QuantMode(0)
 
         cfg.mapping = mapping
-
         cfg.dtype = dtype
-        cfg.quant_mode = quant_mode
-
         cfg.norm_epsilon = cfg.rms_norm_eps
 
         config = {
@@ -246,7 +236,7 @@ class GemmaForCausalLM(DecoderModelForCausalLM, TopModelMixin):
             'head_size': cfg.head_dim,
             'hidden_size': cfg.hidden_size,
             'intermediate_size': cfg.intermediate_size,
-            'num_key_value_heads': cfg.num_key_value_heads,
+            'num_key_value_heads': num_kv_heads,
             'vocab_size': cfg.vocab_size,
             'position_embedding_type': 'rope_gpt_neox',
             'max_position_embeddings': cfg.max_position_embeddings,
@@ -254,7 +244,7 @@ class GemmaForCausalLM(DecoderModelForCausalLM, TopModelMixin):
             'rotary_base': getattr(cfg, 'rotary_base', 10000.0),
             'rotary_scaling': getattr(cfg, 'rotary_scaling', None),
             'norm_epsilon': cfg.rms_norm_eps,
-            'quantization': quant_mode.to_dict(),
+            'quantization': quantization.asdict(),
             'mapping': {
                 'world_size': mapping.world_size,
                 'tp_size': mapping.world_size,
@@ -265,7 +255,7 @@ class GemmaForCausalLM(DecoderModelForCausalLM, TopModelMixin):
             'use_fused_mlp': kwargs.get("use_fused_mlp", False),
         }
 
-        assert not quant_mode.has_any_quant()
+        assert not quantization.quant_mode.has_any_quant()
 
         tllm_llama = GemmaForCausalLM(PretrainedConfig.from_dict(config))
 

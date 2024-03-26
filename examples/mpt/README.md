@@ -2,6 +2,28 @@
 
 This document explains how to build the [MPT](https://huggingface.co/mosaicml/mpt-7b) model using TensorRT-LLM and run on a single GPU and a single node with multiple GPUs.
 
+- [MPT](#mpt)
+  - [Overview](#overview)
+  - [Support Matrix](#support-matrix)
+    - [MPT 7B](#mpt-7b)
+      - [1.1 Convert from HF Transformers in FP](#11-convert-from-hf-transformers-in-fp)
+      - [1.2 Convert from HF Transformers with weight-only quantization](#12-convert-from-hf-transformers-with-weight-only-quantization)
+      - [1.3 Convert from HF Transformers with SmoothQuant quantization](#13-convert-from-hf-transformers-with-smoothquant-quantization)
+      - [1.4 Convert from HF Transformers with INT8 KV cache quantization](#14-convert-from-hf-transformers-with-int8-kv-cache-quantization)
+      - [1.5 AWQ weight-only quantization with AMMO](#15-awq-weight-only-quantization-with-ammo)
+      - [1.6 FP8 Post-Training Quantization with AMMO](#16-fp8-post-training-quantization-with-ammo)
+      - [1.6 Weight-only quantization with AMMO](#16-weight-only-quantization-with-ammo)
+      - [1.7 SmoothQuant and INT8 KV cache with AMMO](#17-smoothquant-and-int8-kv-cache-with-ammo)
+    - [2.1 Build TensorRT engine(s)](#21-build-tensorrt-engines)
+    - [MPT 30B](#mpt-30b)
+      - [1. Convert weights from HF Transformers to TRTLLM format](#1-convert-weights-from-hf-transformers-to-trtllm-format)
+      - [2. Build TensorRT engine(s)](#2-build-tensorrt-engines)
+      - [3. Run TRT engine to check if the build was correct](#3-run-trt-engine-to-check-if-the-build-was-correct)
+    - [Replit Code V-1.5 3B](#replit-code-v-15-3b)
+      - [1. Convert weights from HF Transformers to TRTLLM format](#1-convert-weights-from-hf-transformers-to-trtllm-format-1)
+      - [2. Build TensorRT engine(s)](#2-build-tensorrt-engines-1)
+      - [3. Run TRT engine to check if the build was correct](#3-run-trt-engine-to-check-if-the-build-was-correct-1)
+
 ## Overview
 
 The TensorRT-LLM MPT implementation can be found in [`tensorrt_llm/models/mpt/model.py`](../../tensorrt_llm/models/mpt/model.py). The TensorRT-LLM MPT example code is located in [`examples/mpt`](./). There is one main file:
@@ -24,6 +46,12 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
   * STRONGLY TYPED
 
 ### MPT 7B
+
+Please install required packages first:
+
+```bash
+pip install -r requirements.txt
+```
 
 The [`convert_checkpoint.py`](./convert_checkpoint.py) script allows you to convert weights from HF Transformers format to TRTLLM checkpoints.
 

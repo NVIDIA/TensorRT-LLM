@@ -40,9 +40,9 @@ namespace kernels
 
 struct SSMParamsBase
 {
-    using index_t = uint32_t;
-
-    int batch, dim, seqlen, dstate;
+    int batch, dim, dstate, dt_rank;
+    int max_seqlen; // only valid for padded input.
+    bool remove_padding;
     bool is_variable_B;
     bool is_variable_C;
 
@@ -50,8 +50,7 @@ struct SSMParamsBase
 
     // Common data pointers.
     void* __restrict__ A_ptr;
-    void* __restrict__ B_ptr;
-    void* __restrict__ C_ptr;
+    void* __restrict__ BC_ptr;
     void* __restrict__ D_ptr;
     void* __restrict__ u_ptr;
     void* __restrict__ delta_ptr;
@@ -60,6 +59,7 @@ struct SSMParamsBase
     void* __restrict__ x_ptr;
     void* __restrict__ z_ptr;
     int const* __restrict__ last_token_ids_ptr;
+    int const* __restrict__ slot_mapping_ptr;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

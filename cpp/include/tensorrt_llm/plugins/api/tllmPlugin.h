@@ -16,27 +16,37 @@
 
 #pragma once
 
-#include <NvInferRuntime.h>
+#include <cstdint>
 #include <mutex>
+
+// Forward declarations
+namespace nvinfer1
+{
+class ILoggerFinder;
+class IPluginCreator;
+class ILogger;
+} // namespace nvinfer1
 
 namespace tensorrt_llm::plugins::api
 {
 
 auto constexpr kDefaultNamespace = "tensorrt_llm";
 
-class LoggerFinder : public nvinfer1::ILoggerFinder
+class LoggerManager
 {
 public:
     //! Set the logger finder.
     void setLoggerFinder(nvinfer1::ILoggerFinder* finder);
 
     //! Get the logger.
-    nvinfer1::ILogger* findLogger() override;
+    [[maybe_unused]] nvinfer1::ILogger* logger();
 
-    static LoggerFinder& getInstance() noexcept;
+    static LoggerManager& getInstance() noexcept;
+
+    static nvinfer1::ILogger* defaultLogger() noexcept;
 
 private:
-    LoggerFinder() = default;
+    LoggerManager() = default;
 
     nvinfer1::ILoggerFinder* mLoggerFinder{nullptr};
     std::mutex mMutex;
@@ -47,10 +57,11 @@ private:
 extern "C"
 {
     // This function is used for explicitly registering the TRT-LLM plugins and the default logger.
-    bool initTrtLlmPlugins(void* logger, char const* libNamespace = tensorrt_llm::plugins::api::kDefaultNamespace);
+    bool initTrtLlmPlugins(void* logger = tensorrt_llm::plugins::api::LoggerManager::defaultLogger(),
+        char const* libNamespace = tensorrt_llm::plugins::api::kDefaultNamespace);
 
     // The functions below are used by TensorRT to when loading a shared plugin library with automatic registering.
     // see https://docs.nvidia.com/deeplearning/tensorrt/developer-guide/index.html#generating-plugin-library
-    TENSORRTAPI [[maybe_unused]] void setLoggerFinder([[maybe_unused]] nvinfer1::ILoggerFinder* finder);
-    TENSORRTAPI [[maybe_unused]] nvinfer1::IPluginCreator* const* getPluginCreators(int32_t& nbCreators);
+    [[maybe_unused]] void setLoggerFinder([[maybe_unused]] nvinfer1::ILoggerFinder* finder);
+    [[maybe_unused]] nvinfer1::IPluginCreator* const* getPluginCreators(int32_t& nbCreators);
 }

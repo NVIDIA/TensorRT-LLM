@@ -68,7 +68,7 @@ def convert_hf_mamba(hf_mamba, rank=0, dtype='float32'):
         # ssm layer
         prefix = f'backbone.layers.{l}.mixer.'
         tllm_prex = f'backbone.layers.{l}.ssm.'
-        for layer in ['in_proj', 'conv1d', 'x_proj', 'dt_proj', 'out_proj']:
+        for layer in ['conv1d', 'x_proj', 'dt_proj', 'out_proj']:
             dtype_b = torch.float32 if layer == 'dt_proj' else dtype
             weight, bias = get_weight_and_bias(model_params, prefix + layer,
                                                dtype, dtype_b)
@@ -80,6 +80,22 @@ def convert_hf_mamba(hf_mamba, rank=0, dtype='float32'):
             weights[tllm_weight_name] = weight
             if bias is not None:
                 weights[tllm_bias_name] = bias
+        # in_proj
+        weight, bias = get_weight_and_bias(model_params, prefix + 'in_proj',
+                                           dtype, dtype)
+        in_proj_weights = torch.split(weight, weight.size(0) // 2, dim=0)
+        tllm_weight_name = tllm_prex + 'in_proj.weight'
+        weights[tllm_weight_name.replace('proj', 'proj_x')] = in_proj_weights[0]
+        weights[tllm_weight_name.replace('proj', 'proj_z')] = in_proj_weights[1]
+        if bias is not None:
+            in_proj_biases = torch.split(bias, bias.size(0) // 2, dim=0)
+            tllm_bias_name = tllm_prex + 'in_proj.bias'
+            weights[tllm_bias_name.replace('proj',
+                                           'proj_x')] = in_proj_biases[0]
+            weights[tllm_bias_name.replace('proj',
+                                           'proj_x')] = in_proj_biases[1]
+
+        # A and D
         Aparam = model_params[prefix + 'A_log'].float().detach()
         Aparam = Aparam.permute(1, 0).contiguous()
         weights[tllm_prex + 'A'] = -torch.exp(Aparam)
@@ -154,7 +170,13 @@ def convert_from_hf_checkpoint(model_dir: Union[str, Path],
                 param = param.float()
             elif 'conv1d.weight' in name:
                 param = param.unsqueeze(3)
-            weights[tllm_name] = param
+
+            if 'in_proj' in name:
+                in_proj_params = torch.split(param, param.size(0) // 2, dim=0)
+                weights[tllm_name.replace('proj', 'proj_x')] = in_proj_params[0]
+                weights[tllm_name.replace('proj', 'proj_z')] = in_proj_params[1]
+            else:
+                weights[tllm_name] = param
         del model_params
         del model_params_fp32
 

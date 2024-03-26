@@ -19,7 +19,7 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
-
+#include <optional>
 #include <utility>
 
 namespace tensorrt_llm::runtime
@@ -84,6 +84,18 @@ public:
     TensorPtr cacheIndirection; // [batchSize, beamWidth, maxSeqLen], k/v indirection for next generation step, on gpu
 
     BeamHypotheses beamHypotheses;
+
+    // Medusa
+    class MedusaOutputs
+    {
+    public:
+        TensorPtr medusaNextDraftTokens;       // [maxBatchSize, maxTokensPerStep], on gpu
+        TensorPtr medusaAcceptedTokensLen;     // [maxBatchSize], on gpu
+        TensorPtr medusaAcceptedLengthsCumSum; // [maxBatchSize + 1], on gpu
+        TensorPtr medusaPathsOffsets;          // [maxBatchSize * maxNumHeads], on gpu
+    };
+
+    std::optional<MedusaOutputs> medusaOutputs;
 };
 
 } // namespace tensorrt_llm::runtime

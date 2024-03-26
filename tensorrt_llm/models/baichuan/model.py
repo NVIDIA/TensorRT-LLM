@@ -103,22 +103,15 @@ class BaichuanModel(Module):
     def __init__(self, config: PretrainedConfig):
         super().__init__()
         hidden_size = config.hidden_size
-        dtype = config.dtype
-        self.vocab_embedding = Embedding(
-            config.vocab_size,
-            config.hidden_size,
-            dtype=config.dtype,
-            tp_size=config.mapping.tp_size
-            if config.use_parallel_embedding else 1,
-            tp_group=config.mapping.tp_group
-            if config.use_parallel_embedding else None,
-            sharding_dim=config.embedding_sharding_dim,
-            tp_rank=config.mapping.tp_rank)
+
+        self.vocab_embedding = Embedding(config.vocab_size,
+                                         config.hidden_size,
+                                         dtype=config.dtype)
 
         self.layers = DecoderLayerList(BaichuanDecoderLayer, config)
         self.ln_f = RmsNorm(normalized_shape=hidden_size,
                             eps=config.norm_epsilon,
-                            dtype=dtype)
+                            dtype=config.dtype)
 
     def forward(self,
                 input_ids: Tensor,

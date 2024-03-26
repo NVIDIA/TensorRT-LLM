@@ -45,7 +45,9 @@ class Mapping(object):
         self.gpus_per_node = gpus_per_node
 
         if pp_size * tp_size != world_size:
-            raise ValueError("world_size must equal to pp_size * tp_size")
+            raise ValueError(
+                f"world_size must equal to pp_size * tp_size, but got {world_size} != {pp_size} * {tp_size}"
+            )
         self.pp_groups = []
         self.tp_groups = []
 

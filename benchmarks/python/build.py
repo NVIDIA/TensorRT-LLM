@@ -37,7 +37,7 @@ from tensorrt_llm.models import PretrainedConfig, quantize_model
 from tensorrt_llm.models.modeling_utils import optimize_model
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
-from tensorrt_llm.quantization import QuantMode
+from tensorrt_llm.quantization import QuantAlgo, QuantMode
 
 
 def parse_arguments():
@@ -224,23 +224,23 @@ def get_quant_mode(quantization):
 
 def get_quant_algo(quantization):
     if quantization == "fp8":
-        return "FP8", "FP8"
+        return QuantAlgo.FP8, QuantAlgo.FP8
     elif quantization == "fp8_gemm":
-        return "FP8", None
+        return QuantAlgo.FP8, None
     elif quantization == "fp8_kv_cache":
-        return None, "FP8"
+        return None, QuantAlgo.FP8
     elif quantization == "int8_sq_per_tensor":
-        return "W8A8_SQ_PER_TENSOR_PLUGIN", None
+        return QuantAlgo.W8A8_SQ_PER_TENSOR_PLUGIN, None
     elif quantization == "int8_sq_per_token_channel":
-        return "W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN", None
+        return QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN, None
     elif quantization == "int8_weight_only":
-        return "W8A16", None
+        return QuantAlgo.W8A16, None
     elif quantization == "int4_weight_only":
-        return "W4A16", None
+        return QuantAlgo.W4A16, None
     elif quantization == "int4_weight_only_awq":
-        return "W4A16_AWQ", None
+        return QuantAlgo.W4A16_AWQ, None
     elif quantization == "int4_weight_only_gptq":
-        return "W4A16_GPTQ", None
+        return QuantAlgo.W4A16_GPTQ, None
     elif quantization is None:
         return None, None
 
@@ -764,13 +764,11 @@ def build_gpt(args):
     else:
         raise Exception(f'Unexpected model: {args.model}')
 
-    quant_kwargs = {}
     if family not in [
             'gpt', 'opt', 'bloom', 'falcon', 'llama', 'internlm', 'gptneox',
             'gptj', 'mamba', 'baichuan', 'chatglm', 'chatglm2', 'chatglm3'
     ]:
-        tensorrt_llm_model = quantize_model(tensorrt_llm_model, quant_mode,
-                                            **quant_kwargs)
+        tensorrt_llm_model = quantize_model(tensorrt_llm_model, quant_mode)
 
     if family in ['llama']:
         tensorrt_llm_model = optimize_model(tensorrt_llm_model,
@@ -788,6 +786,7 @@ def build_gpt(args):
         network.plugin_config.enable_remove_input_padding()
         network.plugin_config.set_lookup_plugin(dtype=args.dtype)
         network.plugin_config.set_moe_plugin(dtype=args.dtype)
+        network.plugin_config.set_mamba_conv1d_plugin(dtype=args.dtype)
 
         if args.quantization is None or "fp8" not in args.quantization:
             network.plugin_config.set_gemm_plugin(dtype=args.dtype)

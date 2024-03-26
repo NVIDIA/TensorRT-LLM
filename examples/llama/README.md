@@ -2,6 +2,30 @@
 
 This document shows how to build and run a LLaMA model in TensorRT-LLM on both single GPU, single node multi-GPU and multi-node multi-GPU.
 
+- [LLaMA](#llama)
+  - [Overview](#overview)
+  - [Support Matrix](#support-matrix)
+  - [Usage](#usage)
+    - [Build TensorRT engine(s)](#build-tensorrt-engines)
+      - [LLaMA v2 Updates](#llama-v2-updates)
+    - [Using RoPE Scaling](#using-rope-scaling)
+    - [Long context length](#long-context-length)
+      - [INT8 KV cache](#int8-kv-cache)
+      - [SmoothQuant](#smoothquant)
+      - [FP8 Post-Training Quantization](#fp8-post-training-quantization)
+      - [Groupwise quantization (AWQ/GPTQ)](#groupwise-quantization-awqgptq)
+        - [AWQ](#awq)
+        - [GPTQ](#gptq)
+    - [Run](#run)
+    - [Summarization using the LLaMA model](#summarization-using-the-llama-model)
+      - [Mistral v0.1](#mistral-v01)
+  - [Running CodeLlama](#running-codellama)
+    - [Build](#build)
+    - [Run](#run-1)
+  - [Run LLaMa with LoRA](#run-llama-with-lora)
+    - [Run LLaMa with several lora checkpoints](#run-llama-with-several-lora-checkpoints)
+  - [Run LLaMa with StreamingLLM](#run-llama-with-streamingllm)
+
 ## Overview
 
 The TensorRT-LLM LLaMA implementation can be found in [tensorrt_llm/models/llama/model.py](../../tensorrt_llm/models/llama/model.py). The TensorRT-LLM LLaMA example code is located in [`examples/llama`](./). There is one main file:
@@ -30,7 +54,13 @@ The TensorRT-LLM LLaMA example code locates at [examples/llama](./). It takes HF
 
 ### Build TensorRT engine(s)
 
-Need to prepare the HF LLaMA checkpoint first by following the guides here https://huggingface.co/docs/transformers/main/en/model_doc/llama.
+Please install required packages first to make sure the example uses matched `tensorrt_llm` version:
+
+```bash
+pip install -r requirements.txt
+```
+
+Need to prepare the HF LLaMA checkpoint by following the guides here https://huggingface.co/docs/transformers/main/en/model_doc/llama.
 
 TensorRT-LLM LLaMA builds TensorRT engine(s) from HF checkpoint. If no checkpoint directory is specified, TensorRT-LLM will build engine(s) with dummy weights.
 
@@ -256,7 +286,8 @@ python convert_checkpoint.py --model_dir ./llama-models/llama-7b-hf   \
 trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_int8_kv_wq \
             --output_dir ./tmp/llama/7B/trt_engines/int8_kv_cache_weight_only/1-gpu \
             --gemm_plugin float16 \
-            --multi_block_mode
+            --multi_block_mode \
+            --strongly_typed
 ```
 
 Test with `../summarize.py`:
@@ -285,6 +316,7 @@ python ../quantization/quantize.py --model_dir /tmp/llama-7b-hf \
 trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_awq_int8_kv_cache \
             --output_dir ./tmp/llama/7B/trt_engines/int8_kv_cache_int4_AWQ/1-gpu/ \
             --gemm_plugin float16 \
+            --strongly_typed
 ```
 
 Test with `../summarize.py`:
@@ -350,12 +382,17 @@ python ../quantization/quantize.py --model_dir ./tmp/llama/70B \
                                    --tp_size 2
 
 # Build trtllm engines from the trtllm checkpoint
+# Enable fp8 context fmha to get further acceleration by setting `--use_fp8_context_fmha enable`
 trtllm-build --checkpoint_dir ./tllm_checkpoint_2gpu_fp8 \
              --output_dir ./engine_outputs \
              --gemm_plugin float16 \
              --strongly_typed \
              --workers 2
 ```
+
+**Note**: A LLaMA 70B model with BF16 is about 140GB, a LLaMA 70B model with FP8 is about 70GB.
+The peak GPU memory consumption when doing FP8 quantizaton is more than 210GB (there is also some activation memory occupation when doing calibration).
+So you need a node with at least 4 H100(A100) to run the quantization command. After quantization, 2 GPUs are okay to for building and run.
 
 #### Groupwise quantization (AWQ/GPTQ)
 One can enable AWQ/GPTQ INT4 weight only quantization with these options when building engine with `trtllm-build`:
@@ -573,7 +610,7 @@ git-lfs clone https://huggingface.co/meta-llama/Llama-2-13b-hf
 git-lfs clone https://huggingface.co/hfl/chinese-llama-2-lora-13b
 ```
 
-* Build engine, setting `--use_lora_plugin` and `--lora_dir`. If lora has separate lm_head and embedding, they will replace lm_head and embedding of base model.
+* Build engine, setting `--lora_plugin` and `--lora_dir`. If lora has separate lm_head and embedding, they will replace lm_head and embedding of base model.
 
 ```bash
 python convert_checkpoint.py --model_dir Llama-2-13b-hf \
@@ -699,7 +736,7 @@ We can observe that `luotuo-lora-7b-0.1` produces correct answers on the first s
 
 ## Run LLaMa with StreamingLLM
 
-* Build engine. Set `--pos_shift enable` to use positions in KV cache for RoPE, and set `--dense_context_fmha enable` to use dense context fmha in context phase.
+* Build engine. Set `--streamingllm enable` to enable StreamingLLM.
 
 ```bash
 # Build the LLaMA 7B model with StreamingLLM feature using a single GPU and FP16.
@@ -710,8 +747,7 @@ python convert_checkpoint.py --model_dir ./tmp/llama/7B/ \
 trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_streamlingllm \
             --output_dir ./tmp/llama/7B/trt_engines/fp16_StreamingLLM/1-gpu/ \
             --gemm_plugin float16 \
-            --dense_context_fmha enable \
-            --pos_shift enable
+            --streamingllm enable
 
 ```
 

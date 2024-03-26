@@ -29,6 +29,7 @@ import tensorrt_llm
 from tensorrt_llm._utils import pad_vocab_size, str_dtype_to_torch
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.llama.utils import retrieved_layer_index_from_name
+from tensorrt_llm.quantization import QuantAlgo
 
 LOGGER = logging.getLogger(__name__)
 
@@ -138,30 +139,6 @@ def parse_arguments():
                         type=str,
                         default=None,
                         help="cache dir to load the hugging face dataset")
-
-    parser.add_argument(
-        '--lora_target_modules',
-        nargs='+',
-        default=None,
-        choices=[
-            "attn_qkv",
-            "attn_q",
-            "attn_k",
-            "attn_v",
-            "attn_dense",
-            "mlp_h_to_4h",
-            "mlp_gate",
-            "mlp_4h_to_h",
-        ],
-        help=
-        "Add lora in which modules. Only be activated when use_lora_plugin is enabled."
-    )
-    parser.add_argument(
-        '--max_lora_rank',
-        type=int,
-        default=64,
-        help='maximum lora rank for different lora modules. '
-        'It is used to compute the workspace size of lora plugin.')
     parser.add_argument('--output_dir',
                         type=str,
                         default='tllm_checkpoint',
@@ -275,6 +252,30 @@ def split_qkv(
     k_param = split(k_param, tp_rank, tp_size, is_column=True)
     v_param = split(v_param, tp_rank, tp_size, is_column=True)
     return torch.cat([q_param, k_param, v_param], dim=0)
+
+
+def split_embedding(
+    param: torch.Tensor,
+    tp_rank: int,
+    tp_size: int,
+    use_parallel_embedding: bool = False,
+    sharding_dim: int = 0,
+) -> torch.Tensor:
+    if param is None:
+        return None
+    if not use_parallel_embedding:
+        return param
+
+    vocab_size, hidden_size = param.size()
+    if sharding_dim == 0:
+        if vocab_size % tp_size != 0:
+            vocab_size_padded = pad_vocab_size(vocab_size, tp_size)
+            pad_width = vocab_size_padded - vocab_size
+            param = torch.nn.functional.pad(param, (0, 0, 0, pad_width),
+                                            value=0)
+        else:
+            assert hidden_size % tp_size == 0
+    return split(param, tp_rank, tp_size, is_column=(sharding_dim == 0))
 
 
 def get_weight(params: Dict[str, torch.Tensor], prefix: str,
@@ -452,28 +453,21 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
             embed_w = get_weight(model_params, 'model.embed_tokens', dtype)
         else:
             embed_w = get_weight(model_params, 'transformer.wte', dtype)
-        if not use_parallel_embedding:
-            weights['transformer.vocab_embedding.weight'] = embed_w
-        else:
-            if sharding_dim == 0:
-                if vocab_size % mapping.tp_size != 0:
-                    vocab_size_padded = pad_vocab_size(vocab_size,
-                                                       mapping.tp_size)
-                    pad_width = vocab_size_padded - vocab_size
-                    embed_w = torch.nn.functional.pad(embed_w,
-                                                      (0, 0, 0, pad_width),
-                                                      value=0)
-            else:
-                assert hidden_size % mapping.tp_size == 0
-            weights['transformer.vocab_embedding.weight'] = split(
-                embed_w,
-                mapping.tp_rank,
-                mapping.tp_size,
-                is_column=(sharding_dim == 0))
+        weights['transformer.vocab_embedding.weight'] = split_embedding(
+            embed_w,
+            mapping.tp_rank,
+            mapping.tp_size,
+            use_parallel_embedding=use_parallel_embedding,
+            sharding_dim=sharding_dim)
 
         pos_embed_w = get_weight(model_params, 'transformer.wpe', dtype)
         if pos_embed_w is not None:
-            weights['transformer.position_embedding.weight'] = pos_embed_w
+            weights['transformer.position_embedding.weight'] = split_embedding(
+                pos_embed_w,
+                mapping.tp_rank,
+                mapping.tp_size,
+                use_parallel_embedding=use_parallel_embedding,
+                sharding_dim=sharding_dim)
 
     if mapping.is_last_pp_rank():
         if gpt_variant == 'starcoder2':
@@ -1071,28 +1065,21 @@ def convert_hf_gpt_legacy(hf_model: AutoModelForCausalLM,
 
     if mapping.is_first_pp_rank():
         embed_w = get_weight(model_params, 'transformer.wte', dtype)
-        if not use_parallel_embedding:
-            weights['transformer.vocab_embedding.weight'] = embed_w
-        else:
-            if sharding_dim == 0:
-                if vocab_size % mapping.tp_size != 0:
-                    vocab_size_padded = pad_vocab_size(vocab_size,
-                                                       mapping.tp_size)
-                    pad_width = vocab_size_padded - vocab_size
-                    embed_w = torch.nn.functional.pad(embed_w,
-                                                      (0, 0, 0, pad_width),
-                                                      value=0)
-            else:
-                assert hidden_size % mapping.tp_size == 0
-            weights['transformer.vocab_embedding.weight'] = split(
-                embed_w,
-                mapping.tp_rank,
-                mapping.tp_size,
-                is_column=(sharding_dim == 0))
+        weights['transformer.vocab_embedding.weight'] = split_embedding(
+            embed_w,
+            mapping.tp_rank,
+            mapping.tp_size,
+            use_parallel_embedding=use_parallel_embedding,
+            sharding_dim=sharding_dim)
 
         pos_embed_w = get_weight(model_params, 'transformer.wpe', dtype)
         if pos_embed_w is not None:
-            weights['transformer.position_embedding.weight'] = pos_embed_w
+            weights['transformer.position_embedding.weight'] = split_embedding(
+                pos_embed_w,
+                mapping.tp_rank,
+                mapping.tp_size,
+                use_parallel_embedding=use_parallel_embedding,
+                sharding_dim=sharding_dim)
 
     if mapping.is_last_pp_rank():
         embed_w = get_weight(model_params, 'transformer.wte', dtype)
@@ -1857,22 +1844,22 @@ if __name__ == '__main__':
     if args.use_weight_only:
         if args.weight_only_precision == 'int8':
             plugin_weight_only_quant_type = torch.int8
-            quant_algo = 'W8A16'
+            quant_algo = QuantAlgo.W8A16
         elif args.weight_only_precision == 'int4':
             plugin_weight_only_quant_type = torch.quint4x2
-            quant_algo = 'W4A16'
+            quant_algo = QuantAlgo.W4A16
     elif args.smoothquant:
         if args.per_token and args.per_channel:
-            quant_algo = 'W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN'
+            quant_algo = QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
         elif not args.per_token and not args.per_channel:
-            quant_algo = 'W8A8_SQ_PER_TENSOR_PLUGIN'
+            quant_algo = QuantAlgo.W8A8_SQ_PER_TENSOR_PLUGIN
         elif not args.per_token and args.per_channel:
-            quant_algo = 'W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN'
+            quant_algo = QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN
         elif args.per_token and not args.per_channel:
-            quant_algo = 'W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN'
+            quant_algo = QuantAlgo.W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN
 
     if args.int8_kv_cache:
-        kv_cache_quant_algo = "INT8"
+        kv_cache_quant_algo = QuantAlgo.INT8
 
     if args.model_dir is not None:
         hf_config, gpt_variant = load_gpt_config(args.model_dir,
@@ -1936,10 +1923,6 @@ if __name__ == '__main__':
         getattr(hf_config, 'apply_query_key_layer_scaling', False),
         'rotary_pct':
         getattr(hf_config, 'rotary_pct', 1.0),
-        'max_lora_rank':
-        args.max_lora_rank,
-        'lora_target_modules':
-        args.lora_target_modules,
     }
 
     with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:

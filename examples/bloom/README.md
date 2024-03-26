@@ -2,6 +2,18 @@
 
 This document shows how to build and run a BLOOM model in TensorRT-LLM on both single GPU, single node multi-GPU and multi-node multi-GPU.
 
+## Table of Contents
+
+- [BLOOM](#bloom)
+  - [Table of Contents](#table-of-contents)
+  - [Overview](#overview)
+  - [Support Matrix](#support-matrix)
+  - [Usage](#usage)
+    - [Build TensorRT engine(s)](#build-tensorrt-engines)
+      - [INT8 weight only + INT8 KV cache](#int8-weight-only--int8-kv-cache)
+      - [SmoothQuant](#smoothquant)
+    - [4. Run](#4-run)
+
 ## Overview
 
 The TensorRT-LLM BLOOM implementation can be found in [tensorrt_llm/models/bloom/model.py](../../tensorrt_llm/models/bloom/model.py). The TensorRT-LLM BLOOM example code is located in [`examples/bloom`](./). There is one main file:
@@ -26,7 +38,13 @@ The TensorRT-LLM BLOOM example code locates at [examples/bloom](./). It takes HF
 
 ### Build TensorRT engine(s)
 
-Need to prepare the HF BLOOM checkpoint first by following the guides here https://huggingface.co/docs/transformers/main/en/model_doc/bloom.
+Please install required packages first:
+
+```bash
+pip install -r requirements.txt
+```
+
+Need to prepare the HF BLOOM checkpoint by following the guides here https://huggingface.co/docs/transformers/main/en/model_doc/bloom.
 
 e.g. To install BLOOM-560M
 
@@ -137,7 +155,8 @@ python convert_checkpoint.py --model_dir ./bloom/560m/ \
                 --use_weight_only --output_dir ./bloom/560m/trt_ckpt/int8/1-gpu/
 trtllm-build --checkpoint_dir ./bloom/560m/trt_ckpt/int8/1-gpu/ \
                 --gemm_plugin float16 \
-                --output_dir ./bloom/560m/trt_engines/int8/1-gpu/
+                --output_dir ./bloom/560m/trt_engines/int8/1-gpu/ \
+                --strongly_typed
 ```
 
 

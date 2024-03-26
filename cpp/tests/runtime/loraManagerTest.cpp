@@ -99,8 +99,8 @@ protected:
         pageConfig.setInitToZero(true);
         LoraCache loraCache(pageConfig, modelConfig, worldConfig, *mManager);
 
-        TensorPtr loraReqWeights = utils::loadNpy(*mManager, TEST_SOURCE_LORA_TP2, MemoryType::kCPU);
-        TensorPtr loraReqKeys = utils::loadNpy(*mManager, TEST_KEYS_LORA_TP2, MemoryType::kCPU);
+        TensorPtr loraReqWeights = utils::loadNpy(*mManager, TEST_SOURCE_LORA_TP2.string(), MemoryType::kCPU);
+        TensorPtr loraReqKeys = utils::loadNpy(*mManager, TEST_KEYS_LORA_TP2.string(), MemoryType::kCPU);
 
         loraCache.put(1234, loraReqWeights, loraReqKeys);
         PeftTable peftTable{};
@@ -327,7 +327,7 @@ TEST_F(LoraManagerTest, fillInputTensors)
     std::vector<uint64_t> reqIds{1, 2, 3};
     std::vector<SizeType> reqBeamWidth{1, 2, 1};
 
-    TensorPtr loraReqKeys = utils::loadNpy(*mManager, TEST_KEYS_LORA_TP1, MemoryType::kCPU);
+    TensorPtr loraReqKeys = utils::loadNpy(*mManager, TEST_KEYS_LORA_TP1.string(), MemoryType::kCPU);
     std::vector<TensorPtr> loraConfigs{loraReqKeys, loraReqKeys, nullptr};
 
     std::vector<LoraCache::TaskLayerModuleConfigListPtr> valuesWorkspace;

@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import dataclasses
 from typing import Any
 
 import numpy as np
@@ -20,7 +21,9 @@ from ...layers import ColumnLinear, RowLinear
 from ...module import Module
 from ...quantization import QuantMode
 from ...quantization.layers import FP8Linear, FP8RowLinear
+from ...quantization.mode import QuantAlgo
 from ...quantization.quantize import weight_only_quantize
+from ..modeling_utils import QuantConfig
 
 # isort: off
 from ...quantization.layers import (SmoothQuantAttention, SmoothQuantGatedMLP,
@@ -441,7 +444,10 @@ def quantize_model(model: Module, quant_mode: QuantMode, **kwargs: Any):
         if quant_mode.has_per_group_scaling():
             model = _weight_only_groupwise_quantize(model, quant_mode, **kwargs)
         else:
-            model = weight_only_quantize(model, quant_mode, **kwargs)
+            quant_algo = QuantAlgo.W4A16 if quant_mode.is_int4_weight_only(
+            ) else QuantAlgo.W8A16
+            model = weight_only_quantize(
+                model, dataclasses.replace(QuantConfig(quant_algo), **kwargs))
     elif quant_mode.has_fp8_qdq() or quant_mode.has_fp8_kv_cache():
         model = _fp8_quantize(model, quant_mode, **kwargs)
     elif quant_mode.has_act_and_weight_quant():

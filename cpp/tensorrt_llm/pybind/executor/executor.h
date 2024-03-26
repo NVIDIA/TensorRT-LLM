@@ -39,31 +39,31 @@ public:
         [[maybe_unused]] pybind11::handle traceback);
     void shutdown();
 
-    tle::IdType enqueueRequest(tle::Request request)
+    [[nodiscard]] tle::IdType enqueueRequest(tle::Request request)
     {
         return mExecutor->enqueueRequest(std::move(request));
     }
 
-    std::vector<tle::IdType> enqueueRequests(std::vector<tle::Request> requests)
+    [[nodiscard]] std::vector<tle::IdType> enqueueRequests(std::vector<tle::Request> requests)
     {
         return mExecutor->enqueueRequests(std::move(requests));
     }
 
-    std::vector<tle::Response> awaitResponses(
-        std::optional<tle::IdType> id = std::nullopt, std::optional<std::chrono::milliseconds> timeout = std::nullopt)
+    [[nodiscard]] std::vector<tle::Response> awaitResponses(std::optional<tle::IdType> const& requestId = std::nullopt,
+        std::optional<std::chrono::milliseconds> const& timeout = std::nullopt)
     {
 
-        return mExecutor->awaitResponses(id, timeout);
+        return mExecutor->awaitResponses(requestId, timeout);
     }
 
-    tle::SizeType getNumResponsesReady(std::optional<tle::IdType> id = std::nullopt)
+    [[nodiscard]] tle::SizeType getNumResponsesReady(std::optional<tle::IdType> const& requestId = std::nullopt) const
     {
-        return mExecutor->getNumResponsesReady(id);
+        return mExecutor->getNumResponsesReady(requestId);
     }
 
-    void cancelRequest(tle::IdType id)
+    void cancelRequest(tle::IdType requestId)
     {
-        mExecutor->cancelRequest(id);
+        mExecutor->cancelRequest(requestId);
     }
 
     std::deque<tle::IterationStats> getLatestIterationStats()
@@ -74,6 +74,11 @@ public:
     std::deque<tle::RequestStatsPerIteration> getLatestRequestStats()
     {
         return mExecutor->getLatestRequestStats();
+    }
+
+    [[nodiscard]] bool canEnqueueRequests() const
+    {
+        return mExecutor->canEnqueueRequests();
     }
 
     static void initBindings(pybind11::module_& m);

@@ -2,6 +2,20 @@
 
 This document shows how to build and run a Falcon model in TensorRT-LLM on single GPU, single node multi-GPU, and multi-node multi-GPU.
 
+- [Falcon](#falcon)
+  - [Overview](#overview)
+  - [Support Matrix](#support-matrix)
+  - [Usage](#usage)
+    - [1. Download weights from HuggingFace Transformers](#1-download-weights-from-huggingface-transformers)
+    - [2. Convert weights from HF Transformers to TensorRT-LLM format](#2-convert-weights-from-hf-transformers-to-tensorrt-llm-format)
+    - [3. Build TensorRT engine(s)](#3-build-tensorrt-engines)
+    - [4. Run summarization task with the TensorRT engine(s)](#4-run-summarization-task-with-the-tensorrt-engines)
+    - [FP8 Post-Training Quantization](#fp8-post-training-quantization)
+    - [Groupwise quantization (AWQ)](#groupwise-quantization-awq)
+      - [W4A16 AWQ with FP8 GEMM (W4A8 AWQ)](#w4a16-awq-with-fp8-gemm-w4a8-awq)
+  - [Troubleshooting](#troubleshooting)
+    - [1. The HuggingFace Falcon may raise an error when using  the `accelerate` package.](#1-the-huggingface-falcon-may-raise-an-error-when-using--the-accelerate-package)
+
 ## Overview
 
 The TensorRT-LLM Falcon implementation can be found in [tensorrt_llm/models/falcon/model.py](../../tensorrt_llm/models/falcon/model.py). The TensorRT-LLM Falcon example code is located in [`examples/falcon`](./). There is one main file:
@@ -244,6 +258,8 @@ mpirun -n 8 --allow-run-as-root --oversubscribe \
                 --hf_model_dir ./falcon/180b \
                 --engine_dir ./falcon/180b/trt_engines/fp8/tp8-pp1
 ```
+
+Note that you can enable fp8 context fmha to get further acceleration by setting `--use_fp8_context_fmha enable` when building the engines.
 
 ### Groupwise quantization (AWQ)
 

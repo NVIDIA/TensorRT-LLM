@@ -21,9 +21,11 @@
 namespace tensorrt_llm::runtime
 {
 
-void MedusaModule::initMedusaTensorsFromChoices(MedusaChoices& choices, TensorPtr& topKs, TensorPtr& positionOffsets,
-    TensorPtr& treeIds, TensorPtr& paths, TensorPtr& packedMask, SizeType& totalPaths) const noexcept
+void MedusaModule::initMedusaTensorsFromChoices(MedusaChoices const& choices, std::vector<SizeType>& topKs,
+    TensorPtr& positionOffsets, TensorPtr& treeIds, TensorPtr& paths, TensorPtr& packedMask,
+    SizeType& totalPaths) const noexcept
 {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto const numChoices = static_cast<SizeType>(choices.size());
 
     std::vector<SizeType> sortedIndices(numChoices);
@@ -48,11 +50,10 @@ void MedusaModule::initMedusaTensorsFromChoices(MedusaChoices& choices, TensorPt
 
     dumpChoices(choices, sortedIndices);
 
-    auto topKsPtr = bufferCast<SizeType>(*topKs);
+    topKs.resize(medusaHeads(), 0);
     auto positionOffsetsPtr = bufferCast<SizeType>(*positionOffsets);
     auto treeIdsPtr = bufferCast<SizeType>(*treeIds);
 
-    std::fill(topKsPtr, topKsPtr + topKs->getSize(), 0);
     std::fill(positionOffsetsPtr, positionOffsetsPtr + positionOffsets->getSize(), -1);
     std::fill(treeIdsPtr, treeIdsPtr + treeIds->getSize(), -1);
 
@@ -77,7 +78,6 @@ void MedusaModule::initMedusaTensorsFromChoices(MedusaChoices& choices, TensorPt
     // Add root node
     prevPrefixToLinearIdxMap[0] = 0;
     positionOffsetsPtr[0] = 0;
-    treeIdsPtr[0] = 0;
 
     TLLM_CHECK(numChoices <= maxMedusaTokens());
 
@@ -93,7 +93,7 @@ void MedusaModule::initMedusaTensorsFromChoices(MedusaChoices& choices, TensorPt
         {
             TLLM_CHECK(depth + 1 == curDepth);
             // Save TopK
-            topKsPtr[depth - 1] = maxTopK;
+            topKs[depth - 1] = maxTopK;
             // Accumulate TopK for global indexing in tree
             globalNodeInTreeIdx += maxTopK;
 
@@ -129,14 +129,14 @@ void MedusaModule::initMedusaTensorsFromChoices(MedusaChoices& choices, TensorPt
         // Position offset is the depth of the node
         positionOffsetsPtr[node.linearIdx] = depth;
         // Save tree ids
-        treeIdsPtr[node.linearIdx] = globalNodeInTreeIdx + node.nodeId + 1;
+        treeIdsPtr[node.linearIdx - 1] = globalNodeInTreeIdx + node.nodeId;
 
         // Save node
         tree[node.linearIdx] = node;
     }
 
     // Write TopK for the last level
-    topKsPtr[depth - 1] = maxTopK;
+    topKs[depth - 1] = maxTopK;
 
     for (SizeType ci = 0; ci < numChoices + 1; ++ci)
     {
@@ -150,11 +150,13 @@ void MedusaModule::initMedusaTensorsFromChoices(MedusaChoices& choices, TensorPt
     }
 
     totalPaths = computePathsAndMask(tree, packedMask, paths);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 SizeType MedusaModule::computePathsAndMask(
     std::vector<MedusaTreeNode> const& tree, TensorPtr& packedMask, TensorPtr& paths) const
 {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto pathsPtr = bufferCast<SizeType>(*paths);
 
     std::fill(pathsPtr, pathsPtr + paths->getSize(), -1);
@@ -219,6 +221,7 @@ SizeType MedusaModule::computePathsAndMask(
             stack.push(childLinearIdx);
         }
     }
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return numPaths;
 }
 

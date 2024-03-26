@@ -14,6 +14,7 @@ import tensorrt_llm
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.llama.utils import (  # TODO: move the utils to common dir shared by models
     iterate_shard_files, load_state_dict, retrieved_layer_index_from_name)
+from tensorrt_llm.quantization import QuantAlgo
 
 
 def parse_arguments():
@@ -651,10 +652,10 @@ if __name__ == '__main__':
     plugin_weight_only_quant_type = None
     if args.use_weight_only and args.weight_only_precision == 'int8':
         plugin_weight_only_quant_type = torch.int8
-        quant_algo = 'W8A16'
+        quant_algo = QuantAlgo.W8A16
     elif args.use_weight_only and args.weight_only_precision == 'int4':
         plugin_weight_only_quant_type = torch.quint4x2
-        quant_algo = 'W4A16'
+        quant_algo = QuantAlgo.W4A16
 
     hf_config = load_falcon_config(args.model_dir)
     config = {

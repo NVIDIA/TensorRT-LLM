@@ -48,7 +48,8 @@ public:
     virtual ~MHARunner() = default;
 
     virtual void setup(int const b, int const s, int const sliding_window_size, int const total_seqlen,
-        bool const has_alibi = false, bool const scale_alibi = false, int const tp_size = 1, int const tp_rank = 0)
+        float const* scale_bmm2_d = nullptr, bool const has_alibi = false, bool const scale_alibi = false,
+        int const tp_size = 1, int const tp_rank = 0)
         = 0;
 
     virtual void setup_paged_kv(int const b, int const s_q, int const s_kv, int const blocks_per_context_sequence,
@@ -91,8 +92,8 @@ public:
     ~FusedMHARunnerV2(); // for pimpl
 
     void setup(int const b, int const s, int const sliding_window_size, int const total_seqlen,
-        bool const has_alibi = false, bool const scale_alibi = false, int const tp_size = 1,
-        int const tp_rank = 0) override;
+        float const* scale_bmm2_d = nullptr, bool const has_alibi = false, bool const scale_alibi = false,
+        int const tp_size = 1, int const tp_rank = 0) override;
 
     void setup_paged_kv(int const b, int const s_q, int const s_kv, int const blocks_per_context_sequence,
         int const tokens_per_kv_block, int const sliding_window_size, int const total_seqlen,

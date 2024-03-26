@@ -31,7 +31,7 @@ from tensorrt_llm import Builder
 from tensorrt_llm._utils import str_dtype_to_trt, trt_dtype_to_str
 from tensorrt_llm.models.llama.weight import (load_from_hf_llama,
                                               load_from_meta_llama)
-from tensorrt_llm.models.modeling_utils import PretrainedConfig
+from tensorrt_llm.models.modeling_utils import PretrainedConfig, optimize_model
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 
@@ -536,6 +536,9 @@ class TestLLaMA(unittest.TestCase):
         }
         cfg = PretrainedConfig.from_dict(config)
         tensorrt_llm_llama_wHF = tensorrt_llm.models.LLaMAForCausalLM(cfg)
+        tensorrt_llm_llama_wHF = optimize_model(
+            tensorrt_llm_llama_wHF,
+            use_parallel_embedding=use_parallel_embedding)
         # print_layers(tensorrt_llm_llama_wHF)
         weights_wHF = load_from_hf_llama(tensorrt_llm_llama_wHF,
                                          hf_llama,
@@ -548,6 +551,9 @@ class TestLLaMA(unittest.TestCase):
         # print_layers(tensorrt_llm_llama_wHF)
 
         tensorrt_llm_llama_wMETA = tensorrt_llm.models.LLaMAForCausalLM(cfg)
+        tensorrt_llm_llama_wMETA = optimize_model(
+            tensorrt_llm_llama_wMETA,
+            use_parallel_embedding=use_parallel_embedding)
         # print_layers(tensorrt_llm_llama_wMETA)
         weights_wMETA = load_from_meta_llama(meta_path,
                                              mapping=tensorrt_llm.Mapping(

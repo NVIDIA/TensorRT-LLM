@@ -161,11 +161,9 @@ void invokeTransposeLogProbs(float* output_log_probs, float* output_log_probs_ti
 //! accepted tokens. Fills logitsPtrs tensor with the pointers to the respective medusa logits tensor according
 //! to the next after the last accepted token.
 //!
-//! \param outputIds input/output buffer [maxBatchSize, maxDraftSeqLen],
-//! input tokens followed by draft tokens to be verified.
-//! After accepting tokens, gets overwritten such that input tokens are followed by the accepted tokens
-//! and one additional token -- next after the last accepted.
-//! \param targetIds input buffer [maxBatchSize, maxTargetSeqLen], tokens predicted from the target medusa head
+//! \param outputIds output buffer [maxBatchSize, maxSeqLen], input tokens.
+//! \param draftIds input buffer [maxBatchSize, maxDraftTokens], draft tokens
+//! \param targetIds input buffer [maxBatchSize, maxDraftTokens], tokens predicted from the target medusa head
 //! \param sequenceLengths input/output buffer [maxBatchSize], length of the data in outputIds without draft tokens
 //! Incrememnted according to the accepted length
 //! \param acceptedLengths output buffer [maxBatchSize], length of the data accepted tokens
@@ -179,20 +177,65 @@ void invokeTransposeLogProbs(float* output_log_probs, float* output_log_probs_ti
 //! to the logits from medusa heads
 //! \param logitsPtrs output buffer [batchSize, maxNumHeads], contains pointers to the
 //! respective rows of the medusaLogits for the next after the accepted token
+//! \param curTokensPerStep current tokens to compute per step will be updated to
+//! targetTokensPerStep if curTokensPerStep == 1
+//! \param targetTokensPerStep target values of tokens to compute per step
+//! \param bestPathIds output buffer [maxBatchSize], indices of the selected paths
 //! \param batchSize current batch size
 //! \param maxBatchSize maximum batch size
 //! \param vocabSize vocab size
-//! \param maxDraftSeqLen maximum sequence length of the sequence containing draft tokens
-//! \param maxTargetSeqLen maximum sequence length predicted from target head
+//! \param maxDraftTokens maximum sequence length of the sequence containing draft tokens
+//! \param maxSeqLen maximum sequence length of output ids
 //! \param maxNumHeads maximum number of medusa heads
 //! \param maxTokensPerStep maximum number of tokens per step configured in the system
 //! \param stream stream
 template <typename T>
-void acceptDraftTokensByIdsWithPaths(runtime::TokenIdType* outputIds, runtime::TokenIdType const* targetIds,
-    runtime::SizeType* sequenceLengths, runtime::SizeType* acceptedLengths, FinishedState* finishedFinal,
-    runtime::SizeType const* batchSlots, runtime::SizeType const* paths, runtime::TokenIdType const* endIds,
-    T const* medusaLogits, T const** logitsPtrs, runtime::SizeType batchSize, runtime::SizeType maxBatchSize,
-    runtime::SizeType vocabSize, runtime::SizeType maxDraftSeqLen, runtime::SizeType maxTargetSeqLen,
-    runtime::SizeType maxNumHeads, runtime::SizeType maxTokensPerStep, cudaStream_t stream);
+void acceptDraftTokensByIdsWithPaths(runtime::TokenIdType* outputIds, runtime::TokenIdType const* draftIds,
+    runtime::TokenIdType const* targetIds, runtime::SizeType* sequenceLengths, runtime::SizeType* acceptedLengths,
+    FinishedState* finishedFinal, runtime::SizeType const* batchSlots, runtime::SizeType const* paths,
+    runtime::TokenIdType const* endIds, T const** medusaLogits, T const** logitsPtrs,
+    runtime::SizeType* curTokensPerStep, runtime::SizeType const* targetTokensPerStep, runtime::SizeType* bestPathIds,
+    runtime::SizeType batchSize, runtime::SizeType maxBatchSize, runtime::SizeType vocabSize,
+    runtime::SizeType maxDraftTokens, runtime::SizeType maxSeqLen, runtime::SizeType maxNumHeads,
+    runtime::SizeType maxTokensPerStep, cudaStream_t stream);
+
+//! \brief assembles draft tokens to treeDraftIds from sourceDraftIds using indices of treeIds
+//!
+//! \param treeDraftIds output buffer [maxBatchSize, maxDraftTokens], output draft tokens
+//! scattered from sourceDraftIds according to treeIds111
+//! \param sourceDraftIds input buffer [maxBatchSize, maxDraftTokens], draft tokens saved leanearly after
+//! sampling from Medusa heads with TopK.
+//! \param treeIds input buffer [maxBatchSize, maxDraftTokens], address map from sourceDraftIds to treeDraftIds
+//! [0, unqiueDraftTokens] -> [0, maxDraftTokens], where unqiueDraftTokens = sum(MedusaHeadsTopK)
+//! unqiueDraftTokens <= maxDraftTokens
+//! \param tokensPerStep input buffer [maxBatchSize], number of output draft tokens
+//! \param batchSlots input buffer [maxBatchSize], address map from local index
+//! to global index [0, batchSize] -> [0, maxBatchSize]
+//! \param maxDraftTokens maximum number of tokens per step configured in the system
+//! \param batchSize current batch size
+//! \param stream cuda stream
+void scatterMedusaDraftTokens(runtime::TokenIdType* treeDraftIds, runtime::TokenIdType const* sourceDraftIds,
+    runtime::SizeType const* treeIds, runtime::SizeType const* tokensPerStep, runtime::SizeType const* batchSlots,
+    runtime::SizeType maxDraftTokens, runtime::SizeType batchSize, cudaStream_t stream);
+
+//! \brief Linearly packs accepted paths in memory according to the accceptedLengths and bestPathIds
+//!
+//! \param acceptedLengthsCumSum input buffer [maxBatchSize + 1], exclusive sum of accepted lengths
+//! (indexed linearly in memory).
+//! \param pathsOffsets input buffer [maxBatchSize * maxDraftLen], slices of accepted paths packed in memory
+//! \param acceptedLengths input buffer [maxBatchSize], length of the data accepted tokens
+//! \param bestPathIds input buffer [maxBatchSize], indices of the selected paths
+//! \param paths input buffer [maxBatchSize, maxTokensPerStep, maxNumHeads+1],
+//! paths to restore sequences from outputIds and targetIds. Should be filled with -1 for everything that is not path.
+//! \param batchSlots input buffer [batchSize], address map from local index
+//! to global index [0, batchSize] -> [0, maxBatchSize]
+//! \param batchSize current batch size
+//! \param maxTokensPerStep maximum number of tokens per step configured in the system
+//! \param maxDraftTokens maximum sequence length of the sequence containing draft tokens
+//! \param stream stream
+void invokePackAcceptedPaths(runtime::SizeType* acceptedLengthsCumSum, runtime::SizeType* pathsOffsets,
+    runtime::SizeType const* acceptedLengths, runtime::SizeType const* bestPathIds, runtime::SizeType const* paths,
+    runtime::SizeType const* batchSlots, runtime::SizeType batchSize, runtime::SizeType maxTokensPerStep,
+    runtime::SizeType maxNumDraftTokens, cudaStream_t stream);
 } // namespace kernels
 } // namespace tensorrt_llm

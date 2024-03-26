@@ -150,7 +150,6 @@ __global__ void topKStage2Sampling(int const* __restrict topKTmpIdBuf, T* topKTm
     {
         return;
     }
-
     if (tokensPerStep != nullptr && tokenIdx >= tokensPerStep[batchSlot])
     {
         return;

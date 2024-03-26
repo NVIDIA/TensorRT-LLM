@@ -17,7 +17,9 @@
 #include "allreducePlugin.h"
 
 #include "tensorrt_llm/common/customAllReduceUtils.h"
+#include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/mpiUtils.h"
+#include "tensorrt_llm/common/tensor.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include <nccl.h>
 
@@ -25,17 +27,19 @@ using namespace nvinfer1;
 using tensorrt_llm::plugins::AllreducePluginCreator;
 using tensorrt_llm::plugins::AllreducePlugin;
 using tensorrt_llm::kernels::AllReduceStrategyType;
+using tensorrt_llm::kernels::AllReduceStrategyConfig;
 
 static char const* ALLREDUCE_PLUGIN_VERSION{"1"};
 static char const* ALLREDUCE_PLUGIN_NAME{"AllReduce"};
 PluginFieldCollection AllreducePluginCreator::mFC{};
 std::vector<nvinfer1::PluginField> AllreducePluginCreator::mPluginAttributes;
 
-AllreducePlugin::AllreducePlugin(
-    std::set<int> group, nvinfer1::DataType type, AllReduceStrategyType strategy, int32_t counter)
+AllreducePlugin::AllreducePlugin(std::set<int> group, nvinfer1::DataType type, AllReduceStrategyType strategy,
+    AllReduceStrategyConfig config, int32_t counter)
     : mGroup(std::move(group))
     , mType(type)
     , mStrategy(strategy)
+    , mConfig(config)
     , mCounter(counter)
 {
 }
@@ -46,6 +50,7 @@ AllreducePlugin::AllreducePlugin(void const* data, size_t length)
     char const *d = reinterpret_cast<char const*>(data), *a = d;
     read(d, mType);
     read(d, mStrategy);
+    read(d, mConfig);
     read(d, mCounter);
     mGroup.clear();
     int groupItem = 0;
@@ -78,13 +83,13 @@ nvinfer1::DimsExprs AllreducePlugin::getOutputDimensions(
 bool AllreducePlugin::supportsFormatCombination(
     int pos, nvinfer1::PluginTensorDesc const* inOut, int nbInputs, int nbOutputs) noexcept
 {
-    if (mStrategy == AllReduceStrategyType::RING)
+    if (mStrategy == AllReduceStrategyType::NCCL)
     {
-        TLLM_CHECK_WITH_INFO(nbInputs == 1, "RING (aka. NCCL) strategy only accepts one input.");
+        TLLM_CHECK_WITH_INFO(nbInputs == 1, "NCCL strategy only accepts one input.");
     }
     else
     {
-        TLLM_CHECK_WITH_INFO(nbInputs == 2, "Non-RING (aka. NCCL) strategies require a workspace tensor.");
+        TLLM_CHECK_WITH_INFO(nbInputs == 2, "Non-NCCL strategies require a workspace tensor.");
     }
 
     if (nbInputs == 2 && pos == 1)
@@ -108,34 +113,51 @@ size_t AllreducePlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* input
     return 0;
 }
 
-AllReduceStrategyType AllreducePlugin::selectImplementation(size_t messageSize, int worldSize) noexcept
+AllReduceStrategyType AllreducePlugin::selectImplementation(
+    size_t messageSize, int worldSize, nvinfer1::DataType type) noexcept
 {
     auto const maxWorkspaceSize = utils::customAllReduceUtils::getMaxRequiredWorkspaceSize(worldSize);
 
-    if (messageSize > maxWorkspaceSize)
-    {
-        return AllReduceStrategyType::RING;
-    }
+    AllReduceStrategyType strat = AllReduceStrategyType::NCCL;
+    auto const messageSizeBytes = messageSize * common::getDTypeSize(type);
 
-    if (worldSize <= 2)
+    if (messageSizeBytes <= maxWorkspaceSize)
     {
-        return AllReduceStrategyType::ONESHOT;
-    }
 
-    if (worldSize <= 4)
-    {
-        if (messageSize < 1 * 1000 * 1000)
+        if (worldSize <= 2)
         {
-            return AllReduceStrategyType::ONESHOT;
+            strat = AllReduceStrategyType::ONESHOT;
         }
-        return AllReduceStrategyType::TWOSHOT;
+        else if (worldSize <= 4)
+        {
+            if (messageSizeBytes < 1 * 1000 * 1000)
+            {
+                strat = AllReduceStrategyType::ONESHOT;
+            }
+            else
+            {
+                strat = AllReduceStrategyType::TWOSHOT;
+            }
+        }
+        else
+        {
+            if (messageSizeBytes < 500 * 1000)
+            {
+                strat = AllReduceStrategyType::ONESHOT;
+            }
+            else
+            {
+                strat = AllReduceStrategyType::TWOSHOT;
+            }
+        }
     }
 
-    if (messageSize < 500 * 1000)
+    if (!kernels::configurationSupported(strat, messageSize, worldSize, type))
     {
-        return AllReduceStrategyType::ONESHOT;
+        strat = AllReduceStrategyType::NCCL;
     }
-    return AllReduceStrategyType::TWOSHOT;
+
+    return strat;
 }
 
 int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
@@ -150,38 +172,18 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
     {
         size *= inputDesc[0].dims.d[i];
     }
-    size_t sizePerElem = 0;
-    using tensorrt_llm::common::datatype_enum;
-    datatype_enum type;
-    switch (mType)
-    {
-    case DataType::kFLOAT:
-        sizePerElem = sizeof(float);
-        type = datatype_enum::TYPE_FP32;
-        break;
-    case DataType::kHALF:
-        sizePerElem = sizeof(half);
-        type = datatype_enum::TYPE_FP16;
-        break;
-#ifdef ENABLE_BF16
-    case DataType::kBF16:
-        sizePerElem = sizeof(__nv_bfloat16);
-        type = datatype_enum::TYPE_BF16;
-        break;
-#endif
-    default: break;
-    }
+    auto const sizePerElem = common::getDTypeSize(mType);
 
     auto runtimeStrategy = mStrategy;
     if (runtimeStrategy == AllReduceStrategyType::AUTO)
     {
-        runtimeStrategy = selectImplementation(size * sizePerElem, mGroup.size());
+        runtimeStrategy = selectImplementation(size, mGroup.size(), mType);
     }
 
-    if (runtimeStrategy == AllReduceStrategyType::RING)
+    if (runtimeStrategy == AllReduceStrategyType::NCCL)
     {
-        NCCLCHECK(ncclAllReduce(inputs[0], outputs[0], size, (*getDtypeMap())[inputDesc[0].type], ncclSum,
-            (*getCommMap())[mGroup], stream));
+        NCCLCHECK(ncclAllReduce(
+            inputs[0], outputs[0], size, (*getDtypeMap())[mType], ncclSum, (*getCommMap())[mGroup], stream));
     }
     else
     {
@@ -193,10 +195,10 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
         auto params = tensorrt_llm::kernels::AllReduceParams::deserialize(
             reinterpret_cast<int32_t const*>(inputs[1]), nRanks, myRank, mCounter);
 
-        cudaMemcpyAsync(
-            params.peer_comm_buffer_ptrs[myRank], inputs[0], size * sizePerElem, cudaMemcpyDeviceToDevice, stream);
-
-        tensorrt_llm::kernels::customAllReduce(params, outputs[0], size, sizePerElem, type, runtimeStrategy, stream);
+        params.local_output_buffer_ptr = outputs[0];
+        params.local_input_buffer_ptr = inputs[0];
+        params.elts_total = size;
+        tensorrt_llm::kernels::customAllReduce(params, mType, runtimeStrategy, mConfig, stream);
     }
 
     return 0;
@@ -253,7 +255,7 @@ int AllreducePlugin::initialize() noexcept
 
 void AllreducePlugin::terminate() noexcept
 {
-    if (mStrategy == AllReduceStrategyType::RING || mStrategy == AllReduceStrategyType::AUTO)
+    if (mStrategy == AllReduceStrategyType::NCCL || mStrategy == AllReduceStrategyType::AUTO)
     {
         auto* commMap = getCommMap();
         // [] operator inserts T() if it does not exist
@@ -268,7 +270,7 @@ void AllreducePlugin::terminate() noexcept
 
 size_t AllreducePlugin::getSerializationSize() const noexcept
 {
-    return sizeof(int) * mGroup.size() + sizeof(mType) + sizeof(mStrategy) + sizeof(mCounter);
+    return sizeof(int) * mGroup.size() + sizeof(mType) + sizeof(mStrategy) + sizeof(mConfig) + sizeof(mCounter);
 }
 
 void AllreducePlugin::serialize(void* buffer) const noexcept
@@ -276,6 +278,7 @@ void AllreducePlugin::serialize(void* buffer) const noexcept
     char *d = static_cast<char*>(buffer), *a = d;
     write(d, mType);
     write(d, mStrategy);
+    write(d, mConfig);
     write(d, mCounter);
     for (auto it = mGroup.begin(); it != mGroup.end(); ++it)
     {
@@ -325,6 +328,7 @@ IPluginV2* AllreducePluginCreator::createPlugin(char const* name, PluginFieldCol
     std::set<int> group;
     nvinfer1::DataType type;
     AllReduceStrategyType strategy;
+    AllReduceStrategyConfig config;
     int32_t counter;
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
@@ -350,6 +354,11 @@ IPluginV2* AllreducePluginCreator::createPlugin(char const* name, PluginFieldCol
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT8);
             strategy = static_cast<AllReduceStrategyType>(*static_cast<int8_t const*>(fields[i].data));
         }
+        else if (!strcmp(attrName, "config"))
+        {
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT8);
+            config = static_cast<AllReduceStrategyConfig>(*static_cast<int8_t const*>(fields[i].data));
+        }
         else if (!strcmp(attrName, "counter"))
         {
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
@@ -359,7 +368,7 @@ IPluginV2* AllreducePluginCreator::createPlugin(char const* name, PluginFieldCol
 
     try
     {
-        auto* obj = new AllreducePlugin(group, type, strategy, counter);
+        auto* obj = new AllreducePlugin(group, type, strategy, config, counter);
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }

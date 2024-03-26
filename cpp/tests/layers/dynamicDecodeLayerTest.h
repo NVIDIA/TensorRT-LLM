@@ -87,6 +87,7 @@ private:
     runtime::SizeType const mSinkTokenLength{0};
     runtime::TokenIdType mEndId = mVocabSize;
     runtime::SizeType mMaxTokensPerStep{1};
+    runtime::SizeType mMaxMedusaHeads{0};
 
     bool mUseLogitsVec{false};
 
@@ -121,9 +122,13 @@ private:
 
     // Medusa tensors
     TensorPtr mPathsDevice;
+    TensorPtr mTreeIdsDevice;
     TensorPtr mAcceptedLengths;
+    TensorPtr mAcceptedLengthCumSumDevice;
+    TensorPtr mPackedPathsDevice;
     TensorPtr mMedusaLogitsDevice;
     TensorPtr mNextDraftTokensDevice;
+    TensorPtr mTokensPerStepDevice;
 
     std::vector<tensorrt_llm::common::Tensor> mLogitsVec;
 
@@ -144,6 +149,7 @@ private:
 
 private:
     void allocateData(SamplingParams const& params);
+    void allocateMedusaData(SamplingParams const& params);
 
     void setup(uint64_t seed, SamplingParams const& params);
 
@@ -166,6 +172,9 @@ private:
 
     void fillRefLogits(runtime::SizeType const* seqLenHost,
         std::vector<std::set<runtime::TokenIdType>> const& expectedOutputIds, runtime::SizeType step);
+
+    typename tensorrt_llm::layers::DynamicDecodeLayer<T>::ForwardParams::MedusaInputs createMedusaInputs();
+    typename tensorrt_llm::layers::DynamicDecodeLayer<T>::OutputParams::MedusaOutputs createMedusaOutputs();
 
 public:
     void runTest(std::vector<std::set<runtime::TokenIdType>> const& expectedOutputIds, SamplingParams const& params,

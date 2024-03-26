@@ -496,7 +496,6 @@ def test_inference_request():
     def logits_post_processor(req_id: int, logits: torch.Tensor,
                               ids: List[List[int]]):
         del req_id, ids
-        return logits
 
     ir = _tb.InferenceRequest(42, logits_post_processor)
     setattr(ir, _tb.tensor_names.INPUT_IDS, input_ids)
@@ -655,3 +654,41 @@ def test_TrtGptModelOptionalParams_pickle():
     params2 = pickle.loads(pickle.dumps(params1))
 
     assert params2 == params1
+
+
+def test_Mpicomm():
+    size1 = _tb.MpiComm.getSize()
+    rank1 = _tb.MpiComm.getRank()
+
+    session_size = (size1 + 1) // 2
+    session_color = rank1 // session_size
+    session_rank = rank1 % session_size
+    _tb.MpiComm.split(session_color, session_rank)
+
+    rank2 = _tb.MpiComm.getRank()
+    size2 = _tb.MpiComm.getSize()
+
+    assert rank2 == session_rank
+    assert size2 == session_size
+
+
+def test_SamplingConfig_pickle():
+    config = _tb.SamplingConfig()
+    config.beam_width = 2
+    config.temperature = [1.0, 2.0]
+    config.top_k = [1, 2]
+    config.top_p = [0.1, 0.2]
+    config.random_seed = [1, 2]
+    config.repetition_penalty = [1.0, 2.0]
+    config.presence_penalty = [1.0, 2.0]
+    config.frequency_penalty = [1.0, 2.0]
+    config.length_penalty = [1.0, 2.0]
+    config.early_stopping = [1, 2]
+    config.top_p_decay = [1.0, 2.0]
+    config.top_p_min = [1.0, 2.0]
+    config.top_p_reset_ids = [1, 2]
+    config.beam_search_diversity_rate = [1.0, 2.0]
+
+    config1 = pickle.loads(pickle.dumps(config))
+
+    assert config1 == config

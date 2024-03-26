@@ -3,6 +3,21 @@
 This document explains how to build the [GPT-NeoX](https://huggingface.co/EleutherAI/gpt-neox-20b) model using TensorRT-LLM and run on a single GPU and a single node with
 multiple GPUs.
 
+- [GPT-NeoX](#gpt-neox)
+  - [Overview](#overview)
+  - [Support Matrix](#support-matrix)
+  - [Usage](#usage)
+    - [1. Download weights from HuggingFace (HF) Transformers](#1-download-weights-from-huggingface-hf-transformers)
+    - [2. Convert weights from HF Transformers to TensorRT-LLM format](#2-convert-weights-from-hf-transformers-to-tensorrt-llm-format)
+    - [3. Build TensorRT engine(s)](#3-build-tensorrt-engines)
+    - [4. Summarization using the GPT-NeoX model](#4-summarization-using-the-gpt-neox-model)
+  - [Apply groupwise quantization GPTQ](#apply-groupwise-quantization-gptq)
+    - [1. Download weights from HuggingFace (HF)](#1-download-weights-from-huggingface-hf)
+    - [2. Generating quantized weights](#2-generating-quantized-weights)
+    - [3. Convert weights from HF Transformers to TensorRT-LLM format](#3-convert-weights-from-hf-transformers-to-tensorrt-llm-format)
+    - [4. Build TensorRT engine(s)](#4-build-tensorrt-engines)
+    - [5. Summarization using the GPT-NeoX model](#5-summarization-using-the-gpt-neox-model)
+
 ## Overview
 
 The TensorRT-LLM GPT-NeoX implementation can be found in [`tensorrt_llm/models/gptneox/model.py`](../../tensorrt_llm/models/gptneox/model.py). The TensorRT-LLM GPT-NeoX example code is located in [`examples/gptneox`](./). There is one main file:
@@ -25,6 +40,12 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 The TensorRT-LLM GPT-NeoX example code locates at [examples/gptneox](./). It takes HF weights as input, and builds the corresponding TensorRT engines. The number of TensorRT engines depends on the number of GPUs used to run inference.
 
 ### 1. Download weights from HuggingFace (HF) Transformers
+
+Please install required packages first:
+
+```bash
+pip install -r requirements.txt
+```
 
 ```bash
 # Weights & config
@@ -65,7 +86,6 @@ python3 convert_checkpoint.py --model_dir ./gptneox_model \
 # Single GPU
 trtllm-build --checkpoint_dir ./gptneox/20B/trt_ckpt/fp16/1-gpu/ \
              --gemm_plugin float16 \
-             --paged_kv_cache disable \
              --max_batch_size 8 \
              --max_input_len 924 \
              --max_output_len 100 \
@@ -73,7 +93,6 @@ trtllm-build --checkpoint_dir ./gptneox/20B/trt_ckpt/fp16/1-gpu/ \
 # With 2-way Tensor Parallel
 trtllm-build --checkpoint_dir ./gptneox/20B/trt_ckpt/fp16/2-gpu/ \
              --gemm_plugin float16 \
-             --paged_kv_cache disable \
              --max_batch_size 8 \
              --max_input_len 924 \
              --max_output_len 100 \
@@ -82,7 +101,6 @@ trtllm-build --checkpoint_dir ./gptneox/20B/trt_ckpt/fp16/2-gpu/ \
 # Single GPU with int8 weight only
 trtllm-build --checkpoint_dir ./gptneox/20B/trt_ckpt/int8_wo/1-gpu/ \
              --gemm_plugin float16 \
-             --paged_kv_cache disable \
              --max_batch_size 8 \
              --max_input_len 924 \
              --max_output_len 100 \
@@ -90,7 +108,6 @@ trtllm-build --checkpoint_dir ./gptneox/20B/trt_ckpt/int8_wo/1-gpu/ \
 # With 2-way Tensor Parallel with int8 weight only
 trtllm-build --checkpoint_dir ./gptneox/20B/trt_ckpt/int8_wo/2-gpu/ \
              --gemm_plugin float16 \
-             --paged_kv_cache disable \
              --max_batch_size 8 \
              --max_input_len 924 \
              --max_output_len 100 \
@@ -179,7 +196,6 @@ The command to build TensorRT engines to apply GPTQ does not change:
 # Single GPU
 trtllm-build --checkpoint_dir ./gptneox/20B/trt_ckpt/int4_gptq/1-gpu/ \
              --gemm_plugin float16 \
-             --paged_kv_cache disable \
              --max_batch_size 8 \
              --max_input_len 924 \
              --max_output_len 100 \
@@ -187,7 +203,6 @@ trtllm-build --checkpoint_dir ./gptneox/20B/trt_ckpt/int4_gptq/1-gpu/ \
 # With 2-way Tensor Parallel
 trtllm-build --checkpoint_dir ./gptneox/20B/trt_ckpt/int4_gptq/2-gpu/ \
              --gemm_plugin float16 \
-             --paged_kv_cache disable \
              --max_batch_size 8 \
              --max_input_len 924 \
              --max_output_len 100 \
