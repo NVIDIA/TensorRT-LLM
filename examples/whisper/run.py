@@ -373,14 +373,14 @@ if __name__ == '__main__':
     tensorrt_llm.logger.set_level(args.log_level)
     model = WhisperTRTLLM(args.engine_dir, args.tokenizer_name, args.debug,
                           args.assets_dir)
-    normallizer = EnglishTextNormalizer()
+    normalizer = EnglishTextNormalizer()
     if args.enable_warmup:
         results, total_duration = decode_dataset(
             model,
             "hf-internal-testing/librispeech_asr_dummy",
             batch_size=args.batch_size,
             num_beams=args.num_beams,
-            normalizer=normallizer,
+            normalizer=normalizer,
             mel_filters_dir=args.assets_dir)
     start_time = time.time()
     if args.input_file:
@@ -398,7 +398,7 @@ if __name__ == '__main__':
             dtype=args.dtype,
             batch_size=args.batch_size,
             num_beams=args.num_beams,
-            normalizer=normallizer,
+            normalizer=normalizer,
             mel_filters_dir=args.assets_dir)
     elapsed = time.time() - start_time
     results = sorted(results)
