@@ -31,7 +31,7 @@ from ...mapping import Mapping
 from ...module import Module
 from ...plugin import init_all_reduce_helper
 from ...quantization import QuantMode
-from ...runtime.lora_manager import LoraConfig
+from ...lora_manager import LoraConfig
 from ...top_model_mixin import TopModelMixin
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
                               PretrainedConfig)

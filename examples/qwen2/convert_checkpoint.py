@@ -27,7 +27,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.qwen2.weight import (load_from_gptq_qwen,
                                               load_from_hf_checkpoint)
 from tensorrt_llm.models.modeling_utils import PretrainedConfig
-from tensorrt_llm.runtime.lora_manager import LoraConfig
+from tensorrt_llm.lora_manager import LoraConfig
 
 try:
     from transformers import LlavaConfig, LlavaForConditionalGeneration
