@@ -21,6 +21,7 @@ from .generation import (ChatGLMGenerationSession, GenerationSession,
 from .kv_cache_manager import GenerationSequence, KVCacheManager
 from .model_runner import ModelRunner
 from .session import Session, TensorInfo
+from .engine import get_engine_version
 
 try:
     from .model_runner_cpp import ModelRunnerCpp
