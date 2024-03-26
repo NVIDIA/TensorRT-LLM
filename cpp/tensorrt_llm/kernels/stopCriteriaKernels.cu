@@ -107,7 +107,7 @@ void invokeStopWordsCriterion(int32_t const** outputIds, int32_t const** parentI
 }
 
 __global__ void lengthCriterion(FinishedState* finished, int32_t* finishedSum, uint32_t const* sequenceLimitLength,
-    int32_t const* sequenceLengths, int32_t const* batchSlots, int32_t batchSize, int32_t beamWidth)
+    int32_t* sequenceLengths, int32_t const* batchSlots, int32_t batchSize, int32_t beamWidth)
 {
     int32_t threadFinishedCount = 0;
     auto const batchIdx = blockIdx.x;
@@ -122,6 +122,7 @@ __global__ void lengthCriterion(FinishedState* finished, int32_t* finishedSum, u
         if (sequenceLengths[batchSlotBeamWidthIdx] >= sequenceLimitLength[batchSlot])
         {
             finishState.setFinishedMaxLength();
+            sequenceLengths[batchSlotBeamWidthIdx] = sequenceLimitLength[batchSlot];
         }
         threadFinishedCount += finishState.isFinished() ? 1 : 0;
         finished[batchSlotBeamWidthIdx] = finishState;
@@ -148,8 +149,7 @@ __global__ void lengthCriterion(FinishedState* finished, int32_t* finishedSum, u
 }
 
 void invokeLengthCriterion(FinishedState* finished, int32_t* finishedSum, uint32_t const* sequenceLimitLength,
-    int32_t const* sequenceLengths, int32_t const* batchSlots, int32_t batchSize, int32_t beamWidth,
-    cudaStream_t stream)
+    int32_t* sequenceLengths, int32_t const* batchSlots, int32_t batchSize, int32_t beamWidth, cudaStream_t stream)
 {
     // Check if we have attained the sequence length limit. If so, stop the
     // sequence. In addition, check if all sequences are stopped and return the

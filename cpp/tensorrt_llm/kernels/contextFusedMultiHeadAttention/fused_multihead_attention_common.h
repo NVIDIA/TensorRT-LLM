@@ -122,8 +122,9 @@ struct Fused_multihead_attention_params_v2
     int *counters, *max_barriers, *sum_barriers, *locks;
     // Scratch buffers to finalize softmax.
     float *max_scratch_ptr, *sum_scratch_ptr;
-    // Scratch buffer to finalize the output (not needed for FP16).
-    int* o_scratch_ptr;
+
+    // Scale bmm2 in the device memory.
+    uint32_t const* scale_bmm2_d;
 
     // In multi-query or grouped-query attention (MQA/GQA), several Q heads are associated with one KV head
     int h_kv;
@@ -198,6 +199,10 @@ struct Fused_multihead_attention_paged_kv_params_v2
     int b, h, s, d;
     // The scaling factors for the kernel.
     uint32_t scale_bmm1, scale_softmax, scale_bmm2;
+
+    // TODO: add fp8 paged kv fmha later.
+    // Scale bmm2 in the device memory.
+    // uint32_t const* scale_bmm2_d;
 
     // Do we use Niall's trick to avoid I2F/F2I in the INT8 kernel.
     // See https://confluence.nvidia.com/pages/viewpage.action?pageId=302779721 for details.

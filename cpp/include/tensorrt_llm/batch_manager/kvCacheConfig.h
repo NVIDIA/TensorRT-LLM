@@ -25,6 +25,7 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
+//! @brief Encapsulates parameters to configure paged KV cache.
 class KvCacheConfig
 {
 public:

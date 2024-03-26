@@ -20,6 +20,7 @@ import struct
 import tarfile
 import weakref
 from dataclasses import asdict
+from enum import EnumMeta
 from functools import partial
 from pathlib import Path, PosixPath
 from typing import Any, Dict, List, Optional, Union
@@ -120,7 +121,11 @@ _str_to_np_dict = dict(
 
 
 def str_dtype_to_np(dtype):
-    ret = _str_to_np_dict.get(dtype)
+    if isinstance(dtype, str):
+        ret = _str_to_np_dict.get(dtype)
+    else:
+        # metadata
+        ret = _str_to_np_dict.get(dtype.metadata['dtype'])
     assert ret is not None, f'Unsupported dtype: {dtype}'
     return ret
 
@@ -468,3 +473,13 @@ class DictConversion:
             if (value is None
                     or (isinstance(value, (list, dict)) and len(value) == 0)):
                 setattr(self, key, default)
+
+
+class BaseEnumMeta(EnumMeta):
+
+    def __contains__(cls, item):
+        try:
+            cls(item)
+        except ValueError:
+            return False
+        return True

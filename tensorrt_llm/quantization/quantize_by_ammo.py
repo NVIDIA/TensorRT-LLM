@@ -30,6 +30,8 @@ from datasets import load_dataset
 from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
+from .mode import QuantAlgo
+
 MODEL_NAME_TO_HF_ARCH_MAP.update({"gpt2": "GPTForCausalLM"})
 
 EMPTY_CFG = {
@@ -334,9 +336,11 @@ def quantize_and_export(*, model_dir, dtype, device, qformat, kv_cache_dtype,
             with open(f"{export_path}/config.json", "r") as f:
                 tensorrt_llm_config = json.load(f)
             if qformat == "int8_wo":
-                tensorrt_llm_config["quantization"]["quant_algo"] = 'W8A16'
+                tensorrt_llm_config["quantization"][
+                    "quant_algo"] = QuantAlgo.W8A16
             elif qformat == "int4_wo":
-                tensorrt_llm_config["quantization"]["quant_algo"] = 'W4A16'
+                tensorrt_llm_config["quantization"][
+                    "quant_algo"] = QuantAlgo.W4A16
             else:
                 tensorrt_llm_config["quantization"]["quant_algo"] = None
             with open(f"{export_path}/config.json", "w") as f:

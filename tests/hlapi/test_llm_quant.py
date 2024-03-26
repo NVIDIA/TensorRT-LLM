@@ -3,6 +3,7 @@ import sys
 import tempfile
 
 from tensorrt_llm.hlapi.llm import LLM, ModelConfig
+from tensorrt_llm.quantization import QuantAlgo
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root
@@ -14,11 +15,8 @@ llama_model_path = str(llm_models_root() / "llama-models/llama-7b-hf")
 @skip_pre_ampere
 def test_llm_int4_awq_quantization():
     config = ModelConfig(llama_model_path)
-    config.quant_config.init_from_description(quantize_weights=True,
-                                              use_int4_weights=True,
-                                              per_group=True)
-    config.quant_config.quantize_lm_head = True
-    assert config.quant_config.has_any_quant()
+    config.quant_config.quant_algo = QuantAlgo.W4A16_AWQ
+    assert config.quant_config.quant_mode.has_any_quant()
 
     llm = LLM(config)
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -28,10 +26,11 @@ def test_llm_int4_awq_quantization():
 @skip_pre_hopper
 def test_llm_fp8_quantization():
     config = ModelConfig(llama_model_path)
-    config.quant_config.set_fp8_qdq()
-    config.quant_config.set_fp8_kv_cache()
+    config.quant_config.quant_algo = QuantAlgo.FP8
+    config.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+    config.quant_config.exclude_modules = ["lm_head"]
 
-    assert config.quant_config.has_any_quant()
+    assert config.quant_config.quant_mode.has_any_quant()
 
     llm = LLM(config)
     with tempfile.TemporaryDirectory() as tmpdir:

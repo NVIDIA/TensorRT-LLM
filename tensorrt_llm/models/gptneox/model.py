@@ -13,11 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ..._common import default_net
 from ..._utils import pad_vocab_size
 from ...functional import PositionEmbeddingType, Tensor
 from ...layers import (MLP, Attention, AttentionMaskType, ColumnLinear,
-                       Embedding, KeyValueCacheParams, LayerNorm)
+                       Embedding, LayerNorm)
 from ...module import Module
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
                               PretrainedConfig)
@@ -96,16 +95,9 @@ class GPTNeoXModel(Module):
 
     def __init__(self, config: PretrainedConfig):
         super().__init__()
-        mapping = config.mapping
-        self.vocab_embedding = Embedding(
-            num_embeddings=config.vocab_size,
-            embedding_dim=config.hidden_size,
-            dtype=config.dtype,
-            tp_size=mapping.tp_size if config.use_parallel_embedding else 1,
-            tp_group=mapping.tp_group
-            if config.use_parallel_embedding else None,
-            sharding_dim=config.embedding_sharding_dim,
-            tp_rank=mapping.tp_rank)
+        self.vocab_embedding = Embedding(num_embeddings=config.vocab_size,
+                                         embedding_dim=config.hidden_size,
+                                         dtype=config.dtype)
 
         self.layers = DecoderLayerList(GPTNeoXDecoderLayer, config)
 
@@ -121,32 +113,13 @@ class GPTNeoXModel(Module):
                 attention_params=None):
         hidden_states = self.vocab_embedding(input_ids)
 
-        assert default_net(
-        ).plugin_config.paged_kv_cache == False, "Paged KV cache is not supported for this model yet, will add in future release"
-        kv_cache_params.fill_none_tensor_list(len(self.layers))
-
+        hidden_states = self.layers(hidden_states,
+                                    use_cache=use_cache,
+                                    attention_mask=attention_mask,
+                                    kv_cache_params=kv_cache_params,
+                                    attention_params=attention_params)
         if use_cache:
-            presents = []
-
-        for layer, past in zip(self.layers, kv_cache_params.past_key_value):
-            hidden_states = layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                use_cache=use_cache,
-                kv_cache_params=KeyValueCacheParams(
-                    past_key_value=[past],
-                    host_past_key_value_lengths=kv_cache_params.
-                    host_past_key_value_lengths,
-                    host_max_attention_window_sizes=kv_cache_params.
-                    host_max_attention_window_sizes,
-                    host_sink_token_length=kv_cache_params.
-                    host_sink_token_length,
-                    cache_indirection=kv_cache_params.cache_indirection),
-                attention_params=attention_params)
-
-            if use_cache:
-                presents.append(hidden_states[1])
-                hidden_states = hidden_states[0]
+            hidden_states, presents = hidden_states
 
         hidden_states = self.ln_f(hidden_states)
 

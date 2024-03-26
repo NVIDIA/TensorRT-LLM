@@ -42,6 +42,12 @@ public:
         mTransB = transposeB;
     }
 
+    void setPadLd(int padLda, int padLdb)
+    {
+        mPadLda = padLda;
+        mPadLdb = padLdb;
+    }
+
     void setOutputType(nvinfer1::DataType type)
     {
         mOutputType = type;
@@ -59,6 +65,8 @@ protected:
 private:
     bool mTransA;
     bool mTransB;
+    int mPadLda;
+    int mPadLdb;
     nvinfer1::DataType mOutputType;
 
     static constexpr size_t ALIGNMENT = 256;
@@ -71,7 +79,8 @@ public:
 
     GemmPlugin() = delete;
 
-    GemmPlugin(int transA, int transB, nvinfer1::DataType type, bool useFp8, PluginProfilerPtr const& profiler);
+    GemmPlugin(int transA, int transB, int padLda, int padLdb, nvinfer1::DataType type, bool useFp8,
+        PluginProfilerPtr const& profiler);
 
     GemmPlugin(void const* data, size_t length, PluginProfilerPtr const& profiler);
 
@@ -114,6 +123,8 @@ private:
 
     int mTransA;
     int mTransB;
+    int mPadLda;
+    int mPadLdb;
     nvinfer1::DataType mType;
     nvinfer1::DataType mOutputType;
 

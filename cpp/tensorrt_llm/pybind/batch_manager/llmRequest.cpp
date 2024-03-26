@@ -61,9 +61,7 @@ std::optional<tb::LlmRequest::LogitsPostProcessor> LlmRequest::callbackAdapter(
                tensorrt_llm::runtime::BufferManager::CudaStreamPtr stream)
     {
         at::Tensor atTensor = tr::Torch::tensor(tensor);
-
-        auto result = callback.value()(reqId, atTensor, tokens, runtime::TorchUtils::stream(*stream).unwrap());
-        return tr::TorchView::of(result);
+        callback.value()(reqId, atTensor, tokens, runtime::TorchUtils::stream(*stream).unwrap());
     };
 }
 

@@ -46,7 +46,7 @@ public:
         , endId{endId}
         , computeCumLogProbs(false)
         , computeLogProbs(false)
-        , generatedTokensPerStep(1)
+        , generatedTokensPerEngineStep(1)
     {
     }
 
@@ -66,7 +66,9 @@ public:
 
     bool computeCumLogProbs; // boolean that controls if cumLogProbs should be computed for that request
     bool computeLogProbs;    // boolean that controls if cumLogProbs should be computed for that request
-    SizeType generatedTokensPerStep;
+    SizeType generatedTokensPerEngineStep;
+    TensorPtr medusaPaths;   // [tokensPerStep, medusaHeads + 1], on gpu
+    TensorPtr medusaTreeIds; // [tokensPerStep], on gpu
 };
 
 class Input
@@ -109,6 +111,8 @@ public:
     // parameters for beam search
     TensorConstPtr cacheIndirection; // [batchSize, maxBeamWidth, maxSeqLen] - indices into KV cache of different rays
                                      // within one beam for beam search, on gpu
+    std::vector<std::vector<TensorConstPtr>>
+        medusaLogits;                // [maxBatchSize][maxNumHeads][tokensPerStep, vocabSizePadded]
 };
 
 using Output = decoder::Output;
@@ -183,8 +187,11 @@ public:
     //! @returns [batchSize, maxTokensPerStep-1], predicted draft tokens for next step, on gpu
     virtual TensorPtr getNextDraftTokens() const = 0;
 
-    //! @returns [batchSize], lengths of the predicted draft tokens for next step, on gpu
-    virtual TensorPtr getNextDraftTokenLengths() const = 0;
+    //! @returns [batchSize + 1], exclusive sum of accepted draft token lengths, on gpu
+    virtual TensorPtr getMedusaAcceptedLengthsCumSum() const = 0;
+
+    //! @returns [batchSize * maxMedusaHeads], accepted paths packed into continuous tensor, on gpu
+    virtual TensorPtr getMedusaAcceptedPackedPaths() const = 0;
 
 protected:
     IGptDecoderBatch() = default;

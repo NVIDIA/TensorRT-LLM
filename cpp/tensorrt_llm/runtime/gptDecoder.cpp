@@ -34,15 +34,18 @@ using namespace tensorrt_llm::runtime;
 
 template <typename T>
 GptDecoder<T>::GptDecoder(DecodingMode const& mode, size_t maxBatchSize, size_t maxBeamWidth, size_t vocabSize,
-    size_t vocabSizePadded, size_t maxSequenceLength, CudaStreamPtr const& stream)
+    size_t vocabSizePadded, size_t maxSequenceLength, CudaStreamPtr const& stream,
+    std::optional<runtime::SizeType> maxTokensPerStep, std::optional<runtime::SizeType> maxNumMedusaHeads)
     : mManager{stream}
+    , mMaxBatchSize(maxBatchSize)
 {
     int deviceId;
     tc::check_cuda_error(cudaGetDevice(&deviceId)); // Get the correct device id
     tc::check_cuda_error(cudaGetDeviceProperties(&mProp, deviceId));
     auto allocator = std::make_shared<common::CudaAllocator>(mManager);
-    mDynamicDecodeLayer = std::make_shared<tensorrt_llm::layers::DynamicDecodeLayer<T>>(
-        mode, maxBatchSize, maxBeamWidth, vocabSize, vocabSizePadded, stream->get(), std::move(allocator), &mProp);
+    mDynamicDecodeLayer
+        = std::make_shared<tensorrt_llm::layers::DynamicDecodeLayer<T>>(mode, maxBatchSize, maxBeamWidth, vocabSize,
+            vocabSizePadded, stream->get(), std::move(allocator), &mProp, maxTokensPerStep, maxNumMedusaHeads);
 
     auto constexpr nvFloatType = TRTDataType<float>::value;
     mLogProbsTiled = mManager.gpu(ITensor::makeShape({static_cast<SizeType>(maxSequenceLength),
@@ -84,6 +87,8 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
     setupParams.length_penalty = samplingConfig.lengthPenalty;
     setupParams.early_stopping = samplingConfig.earlyStopping;
 
+    setupParams.topKMedusaHeads = samplingConfig.topKMedusaHeads;
+
     auto const batchSlotsPtr = batchSlots.has_value() ? bufferCast<SizeType>(*(batchSlots.value())) : nullptr;
     mDynamicDecodeLayer->setup(batchSize, samplingConfig.beamWidth, batchSlotsPtr, setupParams);
 }
@@ -100,7 +105,46 @@ void safeInsert(tc::TensorMap& map, std::string const& key, DecodingOutput::Tens
 }
 
 template <typename T>
-typename tl::DynamicDecodeLayer<T>::ForwardParams prepareInputs(DecodingInput const& input)
+typename tl::DynamicDecodeLayer<T>::ForwardParams::MedusaInputs prepareMedusaInputs(
+    DecodingInput const& inputs, size_t maxBatchSize)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    auto const& medusaInputs = inputs.medusaInputs.value();
+
+    typename tl::DynamicDecodeLayer<T>::ForwardParams::MedusaInputs medusaDecodingInputs;
+    medusaDecodingInputs.medusaCurTokensPerStep = tcc::toTllmTensor(*medusaInputs.medusaCurTokensPerStep);
+    medusaDecodingInputs.medusaTargetTokensPerStep = tcc::toTllmTensor(*medusaInputs.medusaTargetTokensPerStep);
+    medusaDecodingInputs.medusaPaths = tcc::toTllmTensor(*medusaInputs.medusaPaths);
+    medusaDecodingInputs.medusaTreeIds = tcc::toTllmTensor(*medusaInputs.medusaTreeIds);
+    auto const batchSlots = bufferCast<SizeType>(*inputs.batchSlots);
+    if (medusaInputs.medusaLogits.size())
+    {
+        std::vector<std::vector<tc::Tensor>> medusaLogits;
+        auto const batchSize = medusaInputs.medusaLogits.size();
+        medusaLogits.resize(maxBatchSize);
+        for (size_t bi = 0; bi < batchSize; ++bi)
+        {
+            auto const slot = batchSlots[bi];
+            auto const& logitsHeads = medusaInputs.medusaLogits.at(slot);
+            auto const medusaHeads = logitsHeads.size();
+            medusaLogits[slot].resize(medusaHeads);
+            for (size_t hi = 0; hi < medusaHeads; ++hi)
+            {
+                if (logitsHeads[hi])
+                {
+                    medusaLogits[slot][hi] = tcc::toTllmTensor(*logitsHeads[hi]);
+                }
+            }
+        }
+        medusaDecodingInputs.medusaLogits = medusaLogits;
+    }
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+    return medusaDecodingInputs;
+}
+
+template <typename T>
+typename tl::DynamicDecodeLayer<T>::ForwardParams prepareInputs(DecodingInput const& input, size_t maxBatchSize)
 {
 
     auto constexpr ite = 0; // no pipeline parallelism
@@ -169,7 +213,31 @@ typename tl::DynamicDecodeLayer<T>::ForwardParams prepareInputs(DecodingInput co
         forwardParams.batch_slots = tcc::toTllmTensor(*input.batchSlots);
     }
 
+    // Medusa
+    if (input.medusaInputs)
+    {
+        forwardParams.medusaInputs = prepareMedusaInputs<T>(input, maxBatchSize);
+    }
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+
     return forwardParams;
+}
+
+template <typename T>
+typename tl::DynamicDecodeLayer<T>::OutputParams::MedusaOutputs prepareMedusaOutputs(
+    DecodingOutput::MedusaOutputs& output)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    typename tl::DynamicDecodeLayer<T>::OutputParams::MedusaOutputs medusaOutputs;
+    medusaOutputs.nextDraftTokens = tcc::toTllmTensor(*output.medusaNextDraftTokens);
+    medusaOutputs.acceptedLengths = tcc::toTllmTensor(*output.medusaAcceptedTokensLen);
+    medusaOutputs.medusaAcceptedLengthsCumSum = tcc::toTllmTensor(*output.medusaAcceptedLengthsCumSum);
+    medusaOutputs.medusaPathsOffsets = tcc::toTllmTensor(*output.medusaPathsOffsets);
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+    return medusaOutputs;
 }
 
 template <typename T>
@@ -255,6 +323,13 @@ typename tl::DynamicDecodeLayer<T>::OutputParams prepareOutputs(
         outputParams.beamHypotheses->input_lengths = bufferCast<int32_t>(*inputLengths);
     }
 
+    // Medusa
+    if (output.medusaOutputs)
+    {
+        outputParams.medusaOutputs = prepareMedusaOutputs<T>(output.medusaOutputs.value());
+    }
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return outputParams;
 }
 
@@ -264,7 +339,7 @@ template <typename T>
 bool GptDecoder<T>::forward(DecodingOutput& output, DecodingInput const& input)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto forwardParams = prepareInputs<T>(input);
+    auto forwardParams = prepareInputs<T>(input, mMaxBatchSize);
     auto outputParams = prepareOutputs<T>(output, input.lengths, mLogProbsTiled);
     auto const maxBatchSize = input.maxBatchSize;
 
@@ -312,7 +387,7 @@ template <typename T>
 void GptDecoder<T>::forwardAsync(DecodingOutput& output, DecodingInput const& input)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto forwardParams = prepareInputs<T>(input);
+    auto forwardParams = prepareInputs<T>(input, mMaxBatchSize);
     auto outputParams = prepareOutputs<T>(output, input.lengths, mLogProbsTiled);
 
     mDynamicDecodeLayer->forward(outputParams, forwardParams);
@@ -489,32 +564,6 @@ void IGptDecoder::acceptDraftTokensByLogits(ITensor& draftLogits, ITensor const&
     {
         TLLM_THROW("Incorrect logits dtype. Only float32 and float16 are supported");
     }
-
-    sync_check_cuda_error();
-
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
-
-void IGptDecoder::updateKVCacheBasedOnAcceptedTokens(ITensor const& acceptedOffsets, ITensor const& packedAcceptedIds,
-    ITensor const& pointerArray, ITensor const& pastKeyValueLengths, GptModelConfig const& modelConfig,
-    WorldConfig const& worldConfig, BufferManager::CudaStreamPtr stream, SizeType rewindDraftTokenCount,
-    SizeType maxAttentionWindow, SizeType maxBlocksPerSeq, nvinfer1::DataType dtype)
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-
-    auto const numLayers = modelConfig.getNbLayers(worldConfig.getPipelineParallelism());
-    auto const numKvHeads = modelConfig.getNbKvHeads();
-    auto const tokensPerBlock = modelConfig.getTokensPerBlock();
-    auto const sizeInBytesPerKVHead = modelConfig.getSizePerHead() * BufferDataType(dtype).getSize();
-    auto* const* pointerArrayPtr = reinterpret_cast<int64_t* const*>(bufferCast<int64_t>(pointerArray));
-    auto const seqCount = acceptedOffsets.getShape().d[0] - 1;
-    TLLM_CHECK_WITH_INFO(seqCount > 0, "Number of offsets must be larger than 0");
-
-    tensorrt_llm::kernels::parallel_decoding::updateKVBlockArrayDraftTokenLocation(
-        bufferCast<SizeType>(acceptedOffsets), bufferCast<SizeType>(packedAcceptedIds),
-        bufferCast<SizeType>(pastKeyValueLengths), pointerArrayPtr, numLayers, seqCount, numKvHeads,
-        sizeInBytesPerKVHead, rewindDraftTokenCount, nullptr, maxAttentionWindow, maxBlocksPerSeq, tokensPerBlock,
-        stream->get());
 
     sync_check_cuda_error();
 

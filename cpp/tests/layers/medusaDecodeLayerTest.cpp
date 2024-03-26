@@ -159,11 +159,22 @@ void MedusaDecodingLayerTest<T>::allocateBuffers()
 
     mAcceptedLengths = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
 
+    mTreeIdsDevice
+        = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize, mMaxTokensPerStep - 1}), nvinfer1::DataType::kINT32);
+
     mMedusaLogitsDevice = mBufferManager->gpu(
         ITensor::makeShape({mMaxNumHeads, mMaxBatchSize, mMaxTokensPerStep, mVocabSizePadded}), dataType);
 
     mNextDraftTokensDevice
-        = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize, mMaxTokensPerStep}), nvinfer1::DataType::kINT32);
+        = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize, mMaxTokensPerStep - 1}), nvinfer1::DataType::kINT32);
+
+    mTokensPerStepDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+
+    mAcceptedLengthCumSumDevice
+        = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize + 1}), nvinfer1::DataType::kINT32);
+
+    mPackedPathsDevice
+        = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize * mMaxNumHeads}), nvinfer1::DataType::kINT32);
 
     for (int32_t bi = 0; bi < mBatchSize; ++bi)
     {
@@ -195,6 +206,10 @@ void MedusaDecodingLayerTest<T>::setup(SamplingParams& params)
     trk::invokeFill(*mEndIdsDevice, TokenIdType{endId}, *mStream);
     trk::invokeFill(*mNextDraftTokensDevice, TokenIdType{-1}, *mStream);
     trk::invokeFill(*mPathsDevice, SizeType{-1}, *mStream);
+    trk::invokeFill(*mTreeIdsDevice, SizeType{0}, *mStream);
+    trk::invokeFill(*mTokensPerStepDevice, SizeType{0}, *mStream);
+    trk::invokeFill(*mAcceptedLengthCumSumDevice, SizeType{-1}, *mStream);
+    trk::invokeFill(*mPackedPathsDevice, SizeType{-1}, *mStream);
 
     auto batchSlotsPtr = bufferCast<SizeType>(*mBatchSlots);
     for (SizeType bi = 0; bi < mBatchSize; ++bi)
@@ -204,10 +219,10 @@ void MedusaDecodingLayerTest<T>::setup(SamplingParams& params)
 
     for (SizeType bi = 0; bi < mBatchSize; ++bi)
     {
-        auto const outputIdsHost = ITensor::wrap(reinterpret_cast<TokenIdType*>(params.draftIds[bi].data()),
-            nvinfer1::DataType::kINT32, ITensor::makeShape({1, mMaxTokensPerStep}));
-        auto outputIdsDeviceSlice = ITensor::slice(mOutputIdsDevice, batchSlotsPtr[bi], 1);
-        mBufferManager->copy(*outputIdsHost, *outputIdsDeviceSlice);
+        auto const draftIdsHost = ITensor::wrap(reinterpret_cast<TokenIdType*>(params.draftIds[bi].data()),
+            nvinfer1::DataType::kINT32, ITensor::makeShape({1, mMaxTokensPerStep - 1}));
+        auto draftIdsDeviceSlice = ITensor::slice(mNextDraftTokensDevice, batchSlotsPtr[bi], 1);
+        mBufferManager->copy(*draftIdsHost, *draftIdsDeviceSlice);
     }
 
     for (SizeType bi = 0; bi < mBatchSize; ++bi)
@@ -223,10 +238,27 @@ void MedusaDecodingLayerTest<T>::setup(SamplingParams& params)
         mBufferManager->copy(*pathsHost, *pathsNumPathsDeviceSlice);
     }
 
+    auto tokensPerStep = params.tokensPerStep;
+    for (SizeType bi = 0; bi < mBatchSize; ++bi)
+    {
+        TensorPtr tokensPerStepDeviceSlice = ITensor::slice(mTokensPerStepDevice, batchSlotsPtr[bi], 1);
+        trk::invokeFill(*tokensPerStepDeviceSlice, SizeType{tokensPerStep[bi]}, *mStream);
+    }
+
+    auto treeIds = params.treeIds;
+    for (SizeType bi = 0; bi < mBatchSize; ++bi)
+    {
+        auto const tokensPerStep = static_cast<SizeType>(treeIds[bi].size());
+        auto const treeIdsBatchHost = ITensor::wrap(treeIds[bi], ITensor::makeShape({tokensPerStep}));
+        TensorPtr treeIdsBatchDevice = ITensor::slice(mTreeIdsDevice, batchSlotsPtr[bi], 1);
+        treeIdsBatchDevice->squeeze(0);
+        auto const treeIdsBatchDeviceSlice = ITensor::slice(treeIdsBatchDevice, 0, tokensPerStep);
+        mBufferManager->copy(*treeIdsBatchHost, *treeIdsBatchDeviceSlice);
+    }
+
     typename MedusaDecodingLayer<T>::MedusaSetupParams setupParams;
     setupParams.runtimeTopK = std::make_optional<std::vector<SizeType>>(params.runtimeTopK);
     setupParams.runtimeHeadsTopK = std::make_optional<std::vector<std::vector<SizeType>>>(params.runtimeHeadsTopK);
-    setupParams.tokensPerStep = std::make_optional<std::vector<SizeType>>(params.tokensPerStep);
     setupParams.randomSeed = {{0}};
 
     mMedusaDecodingLayer->setup(mBatchSize, batchSlotsPtr, setupParams);
@@ -240,13 +272,37 @@ typename MedusaDecodingLayer<T>::MedusaForwardParams MedusaDecodingLayerTest<T>:
     typename MedusaDecodingLayer<T>::MedusaForwardParams forwardParams(
         tcc::toTllmTensor(*mTargetLogitsDevice), tcc::toTllmTensor(*mEndIdsDevice));
 
+    auto batchSlots = BufferRange<SizeType>(*mBatchSlots);
+
     forwardParams.finished = tcc::toTllmTensor(*mFinishedDevice);
 
     forwardParams.batch_slots = tcc::toTllmTensor(*mBatchSlots);
 
     forwardParams.paths = tcc::toTllmTensor(*mPathsDevice);
 
-    forwardParams.medusaLogits = tcc::toTllmTensor(*mMedusaLogitsDevice);
+    forwardParams.treeIds = tcc::toTllmTensor(*mTreeIdsDevice);
+
+    std::vector<std::vector<tc::Tensor>> medusaLogits(mMaxBatchSize);
+    auto const medusaLogitsPtr = bufferCast<T>(*mMedusaLogitsDevice);
+    for (SizeType bi = 0; bi < mMaxBatchSize; ++bi)
+    {
+        medusaLogits[bi].resize(mMaxNumHeads);
+    }
+    for (SizeType bi = 0; bi < mBatchSize; ++bi)
+    {
+        for (SizeType hi = 0; hi < mMaxNumHeads; ++hi)
+        {
+            TensorPtr logitsHead = ITensor::slice(mMedusaLogitsDevice, hi, 1);
+            logitsHead->squeeze(0);
+            TensorPtr logitsHeadBatch = ITensor::slice(logitsHead, bi, 1);
+            medusaLogits[batchSlots[bi]][hi] = tcc::toTllmTensor(*logitsHeadBatch);
+        }
+    }
+    forwardParams.medusaLogits = medusaLogits;
+
+    forwardParams.medusaCurTokensPerStep = tcc::toTllmTensor(*mTokensPerStepDevice);
+
+    forwardParams.medusaTargetTokensPerStep = tcc::toTllmTensor(*mTokensPerStepDevice);
 
     return forwardParams;
 }
@@ -264,18 +320,26 @@ DecodingOutputParams MedusaDecodingLayerTest<T>::createOutputTensors()
 
     outputParams.acceptedLengths = tcc::toTllmTensor(*mAcceptedLengths);
 
+    outputParams.acceptedLengthsCumSum = tcc::toTllmTensor(*mAcceptedLengthCumSumDevice);
+
+    outputParams.medusaPathsOffsets = tcc::toTllmTensor(*mPackedPathsDevice);
+
     return outputParams;
 }
 
 template <typename T>
 void MedusaDecodingLayerTest<T>::checkResult(std::vector<std::vector<std::set<TokenIdType>>> const& expectedOutTokens,
-    std::vector<std::vector<TokenIdType>> const& expectedDraftTokens, std::vector<bool> const& finished)
+    std::vector<std::vector<TokenIdType>> const& expectedDraftTokens, std::vector<bool> const& finished,
+    SamplingParams& params)
 {
     auto const nextDraftTokensHost = mBufferManager->copyFrom(*mNextDraftTokensDevice, runtime::MemoryType::kCPU);
     auto const outputIdsHost = mBufferManager->copyFrom(*mOutputIdsDevice, runtime::MemoryType::kCPU);
     auto const seqLenHost = mBufferManager->copyFrom(*mSeqLengthsDevice, runtime::MemoryType::kCPU);
     auto const acceptedLengthsHost = mBufferManager->copyFrom(*mAcceptedLengths, runtime::MemoryType::kCPU);
     auto const finishedHost = mBufferManager->copyFrom(*mFinishedDevice, runtime::MemoryType::kCPU);
+    auto const acceptedLengthCumSumHost
+        = mBufferManager->copyFrom(*mAcceptedLengthCumSumDevice, runtime::MemoryType::kCPU);
+    auto const packedPathsHost = mBufferManager->copyFrom(*mPackedPathsDevice, runtime::MemoryType::kCPU);
 
     mStream->synchronize();
 
@@ -284,6 +348,8 @@ void MedusaDecodingLayerTest<T>::checkResult(std::vector<std::vector<std::set<To
     auto seqLen = BufferRange<SizeType>(*seqLenHost);
     auto batchSlots = BufferRange<SizeType>(*mBatchSlots);
     auto acceptedLengths = BufferRange<SizeType>(*acceptedLengthsHost);
+    auto acceptedLengthCumSum = BufferRange<SizeType>(*acceptedLengthCumSumHost);
+    auto packedPaths = BufferRange<SizeType>(*packedPathsHost);
     auto finishedPtr
         = reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*finishedHost));
 
@@ -297,6 +363,12 @@ void MedusaDecodingLayerTest<T>::checkResult(std::vector<std::vector<std::set<To
         {
             EXPECT_GE(expectedOutTokensBatch[ti].count(outputIds[slot * mMaxSeqLen + ti]), 1);
         }
+        EXPECT_EQ(acceptedLengthCumSum[bi], params.acceptedCumSum[bi]);
+    }
+    EXPECT_EQ(acceptedLengthCumSum[mBatchSize], params.acceptedCumSum[mBatchSize]);
+    for (SizeType ti = 0; ti < params.packedPaths.size(); ++ti)
+    {
+        EXPECT_EQ(packedPaths[ti], params.packedPaths[ti]);
     }
 
     for (SizeType bi = 0; bi < mBatchSize; ++bi)
@@ -305,7 +377,8 @@ void MedusaDecodingLayerTest<T>::checkResult(std::vector<std::vector<std::set<To
         auto const slot = batchSlots[bi];
         for (SizeType ti = 0; ti < expectedDraftTokensBatch.size(); ++ti)
         {
-            EXPECT_EQ(expectedDraftTokensBatch[ti], nextDraftTokens[slot * mMaxTokensPerStep + ti]);
+            EXPECT_EQ(expectedDraftTokensBatch[ti], nextDraftTokens[slot * (mMaxTokensPerStep - 1) + ti])
+                << "bi " << bi << " ti " << ti;
         }
     }
     for (SizeType bi = 0; bi < mBatchSize; ++bi)
@@ -334,7 +407,7 @@ void MedusaDecodingLayerTest<T>::runTest(std::vector<std::vector<std::set<TokenI
 
     mStream->synchronize();
 
-    checkResult(expectedOutTokens, expectedDraftTokens, finished);
+    checkResult(expectedOutTokens, expectedDraftTokens, finished, params);
 }
 
 template class MedusaDecodingLayerTest<float>;
@@ -347,13 +420,16 @@ TYPED_TEST(MedusaDecodingLayerTest, SimpleTestBS1)
     SamplingParams params;
     params.runtimeTopK = {1};
     params.runtimeHeadsTopK = {{2, 3, 2, 1}};
-    params.draftIds = {{0, 4, 0, 2, 1, 3, 4, 3, 0, 2, 3, 4}};
+    params.draftIds = {{4, 0, 2, 1, 3, 4, 3, 0, 2, 3, 4}};
     params.paths = {{0, 1, 2, 3, -1}};
+    params.treeIds = {{0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2}};
     params.tokensPerStep = {12};
+    params.acceptedCumSum = {0, 3};
+    params.packedPaths = {0, 1, 2};
     params.batchSize = 1;
 
     std::vector<std::vector<std::set<TokenIdType>>> expectedOutTokens = {{{4}, {0}, {2}, {1}}};
-    std::vector<std::vector<TokenIdType>> expectedDraftTokens = {{1, 2, 1, 2, 3, 2, 3, 0}};
+    std::vector<std::vector<TokenIdType>> expectedDraftTokens = {{1, 2, 1, 2, 3, 2, 3, 0, 1, 2, 1}};
     std::vector<bool> finished = {false};
     this->runTest(expectedOutTokens, expectedDraftTokens, finished, params);
 }
@@ -366,10 +442,10 @@ TYPED_TEST(MedusaDecodingLayerTest, SimpleTestBS4)
     params.runtimeTopK = {1, 1, 1, 1};
     params.runtimeHeadsTopK = {{2, 3, 2, 1}, {1, 2, 3, 4}, {3, 1, 1, 1}, {1, 1, 1, 1}};
     // clang-format off
-    params.draftIds = {{0, 4, 0, 2, 1, 3, 4, 4, 0, 2, 3, 4},
-                       {0, 4, 0, 2, 1, 4, 4, 4, 0, 2, 2, 4},
-                       {0, 4, 0, 4, 1, 1, 4, 4, 0, 2, 0, 4},
-                       {0, 4, 0, 2, 1, 3, 2, 4, 0, 2, 3, 4}};
+    params.draftIds = {{4, 0, 2, 1, 3, 4, 4, 0, 2, 3, 4},
+                       {4, 0, 2, 1, 4, 4, 4, 0, 2, 2, 4},
+                       {4, 0, 4, 1, 1, 4, 4, 0, 2, 0, 4},
+                       {4, 0, 2, 1, 3, 2, 4, 0, 2, 3, 4}};
     params.paths = {{0, 7, 2, 8, -1,
                      0, 3, -1, -1, -1},
                     {0, 5, 7, 8, 10,
@@ -379,15 +455,20 @@ TYPED_TEST(MedusaDecodingLayerTest, SimpleTestBS4)
                      0, 3, 5, 7, 10},
                     {0, 1, 2, 6, -1,
                      0, 3, -1, -1, -1}};
-
+    params.treeIds = {{0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2},
+                      {0, 1, 2, 3, 4, 5, 6, 7, 8, 9},
+                      {0, 1, 2, 3, 4, 5, 0, 1, 2, 3},
+                      {0, 1, 2, 3, 1, 2}};
+    params.acceptedCumSum = {0, 2, 6, 10, 13};
+    params.packedPaths = {6, 1, 4, 6, 7, 9, 2, 4, 6, 9, 0, 1, 5};
     // clang-format on
     params.tokensPerStep = {12, 11, 11, 7};
     params.batchSize = 4;
 
     std::vector<std::vector<std::set<TokenIdType>>> expectedOutTokens
         = {{{4}, {0}, {2}}, {{4}, {4}, {0}, {2}, {4}}, {{4}, {1}, {4}, {0}, {4}}, {{4}, {0}, {2}, {3}}};
-    std::vector<std::vector<TokenIdType>> expectedDraftTokens
-        = {{2, 3, 3, 4, 5, 1, 2, 3}, {4, 1, 2, 4, 5, 6, 0, 1, 2, 3}, {4, 5, 6, 1, 4, 0}, {3, 3, 0, 3}};
+    std::vector<std::vector<TokenIdType>> expectedDraftTokens = {{2, 3, 4, 5, 6, 1, 2, 1, 2, 3, 4},
+        {4, 1, 2, 4, 5, 6, 0, 1, 2, 3}, {4, 5, 6, 1, 4, 0, 4, 5, 6, 1}, {3, 3, 0, 3, 3, 0}};
     std::vector<bool> finished = {false, false, false, false};
     this->runTest(expectedOutTokens, expectedDraftTokens, finished, params);
 }
@@ -399,17 +480,20 @@ TYPED_TEST(MedusaDecodingLayerTest, SimpleTestEndIdNotSelected)
     SamplingParams params;
     params.runtimeTopK = {1};
     params.runtimeHeadsTopK = {{1, 1, 1, 1}};
-    params.draftIds = {{0, 4, 0, 4, 1, 3, 2, 3, 0, 2, 3, 4}};
+    params.draftIds = {{4, 0, 4, 1, 3, 2, 3, 0, 2, 3, 4}};
     // clang-format off
     params.paths = {{0, 3, 4, 5, -1,
                      0, 1, 2, 6, -1}};
+    params.treeIds = {{0, 1, 2, 3, 0, 1, 2, 3, 3, 2, 1}};
     // clang-format on
     params.tokensPerStep = {12};
+    params.acceptedCumSum = {0, 3};
+    params.packedPaths = {0, 1, 5};
     params.batchSize = 1;
     params.endId = 1;
 
     std::vector<std::vector<std::set<TokenIdType>>> expectedOutTokens = {{{4}, {0}, {2}, {3}}};
-    std::vector<std::vector<TokenIdType>> expectedDraftTokens = {{3, 3, 0, 3}};
+    std::vector<std::vector<TokenIdType>> expectedDraftTokens = {{3, 3, 0, 3, 3, 3, 0, 3, 3, 0, 3}};
     std::vector<bool> finished = {false};
     this->runTest(expectedOutTokens, expectedDraftTokens, finished, params);
 }
@@ -421,17 +505,20 @@ TYPED_TEST(MedusaDecodingLayerTest, SimpleTestEndIdSelected)
     SamplingParams params;
     params.runtimeTopK = {1};
     params.runtimeHeadsTopK = {{1, 1, 1, 1}};
-    params.draftIds = {{0, 4, 0, 4, 1, 3, 2, 3, 0, 2, 3, 4}};
+    params.draftIds = {{4, 0, 4, 1, 3, 2, 3, 0, 2, 3, 4}};
     // clang-format off
     params.paths = {{0, 3, 4, 5, -1,
                      0, 11, 7, 9, -1}};
+    params.treeIds = {{0, 1, 2, 3, 0, 1, 2, 3, 3, 2, 1}};
     // clang-format on
     params.tokensPerStep = {12};
+    params.acceptedCumSum = {0, 0};
+    params.packedPaths = {};
     params.batchSize = 1;
     params.endId = 1;
 
     std::vector<std::vector<std::set<TokenIdType>>> expectedOutTokens = {{{4}}};
-    std::vector<std::vector<TokenIdType>> expectedDraftTokens = {{3, 4, 4, 4}};
+    std::vector<std::vector<TokenIdType>> expectedDraftTokens = {{1, 1, 2, 0, 1, 1, 2, 0, 0, 2, 1}};
     std::vector<bool> finished = {true};
     this->runTest(expectedOutTokens, expectedDraftTokens, finished, params);
 }

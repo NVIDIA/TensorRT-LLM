@@ -3,7 +3,7 @@ from enum import Enum, auto
 import torch
 
 from tensorrt_llm.functional import PositionEmbeddingType
-from tensorrt_llm.quantization.mode import QuantMode
+from tensorrt_llm.quantization import QuantMode
 
 from ..plugin_node import PluginNode
 from ..sharding_strategy import StrategiesVector

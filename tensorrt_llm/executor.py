@@ -1,9 +1,9 @@
 import asyncio
 import secrets
 from abc import ABC, abstractmethod
-from multiprocessing.managers import BaseManager
+from multiprocessing.connection import Client, Listener
 from pathlib import Path
-from queue import Empty, Queue
+from queue import Queue
 from threading import Lock, Semaphore, Thread
 from typing import Any, Dict, Generator, List, Optional, Set, Tuple, Union
 
@@ -15,7 +15,7 @@ from mpi4py import MPI
 from tensorrt_llm._utils import mpi_rank, mpi_world_size
 from tensorrt_llm.hlapi.mpi_session import MpiSession, find_free_port
 from tensorrt_llm.hlapi.tokenizer import TokenizerBase, tokenizer_factory
-from tensorrt_llm.hlapi.utils import GenerationOutput
+from tensorrt_llm.hlapi.utils import GenerationOutput, SamplingConfig
 
 from . import bindings as tllm
 
@@ -34,7 +34,7 @@ class GenerationRequest:
                  ids_or_prompt: Union[torch.Tensor, np.ndarray, list, str],
                  streaming: bool = True,
                  tokenizer: Optional[TokenizerBase] = None,
-                 **kwargs):
+                 sampling_config: Optional[SamplingConfig] = None):
         if isinstance(ids_or_prompt, str):
             assert tokenizer is not None, "GenerationRequest constructor with str prompt requires a tokenizer argument"
             self.input_ids = (tokenizer.encode(ids_or_prompt,
@@ -55,12 +55,7 @@ class GenerationRequest:
 
         self.tokenizer = tokenizer
         self.streaming = streaming
-        self.options = kwargs
-        if tokenizer is not None:
-            end_id, pad_id = tokenizer.eos_token_id, tokenizer.pad_token_id
-            self.options.setdefault("end_id", end_id)
-            self.options.setdefault("pad_id",
-                                    pad_id if pad_id is not None else end_id)
+        self.sampling_config = sampling_config or SamplingConfig()
 
         self.id = -1
 
@@ -75,21 +70,38 @@ class GenerationRequest:
 
         def set_property(name: str,
                          dtype: torch.dtype = torch.int32,
-                         default: Any = None):
-            if name in self.options or default is not None:
-                value = self.options.get(name, default)
+                         default: Any = None,
+                         value=None):
+            if value is None:
+                value = getattr(self.sampling_config, name, None)
+                value = value if value is not None else default
+            if value is not None:
                 setattr(ir, name, torch.tensor([value], dtype=dtype))
 
-        if "max_new_tokens" in self.options:
-            self.options["max_new_tokens"] = [self.options["max_new_tokens"]]
+        top_k = self.sampling_config.top_k[
+            0] if self.sampling_config.top_k is not None else None
+
+        top_p = self.sampling_config.top_p[
+            0] if self.sampling_config.top_p is not None else None
+        temperature = self.sampling_config.temperature[
+            0] if self.sampling_config.temperature is not None else None
+        max_new_tokens = [
+            self.sampling_config.max_new_tokens
+        ] if self.sampling_config.max_new_tokens is not None else None
+        min_length = self.sampling_config.min_length[
+            0] if self.sampling_config.min_length is not None else None
+        end_id = self.tokenizer.eos_token_id if self.tokenizer is not None else None
+        pad_id = self.tokenizer.pad_token_id if self.tokenizer is not None else None
+        pad_id = end_id if pad_id is None else pad_id
+
         set_property("beam_width")
-        set_property("max_new_tokens", default=[32])
-        set_property("end_id")
-        set_property("pad_id")
-        set_property("min_length")
-        set_property("temperature", torch.float32)
-        set_property("runtime_top_k", torch.float32)
-        set_property("runtime_top_p", torch.float32)
+        set_property("max_new_tokens", default=[32], value=max_new_tokens)
+        set_property("end_id", value=end_id)
+        set_property("pad_id", value=pad_id)
+        set_property("min_length", value=min_length)
+        set_property("temperature", torch.float32, value=temperature)
+        set_property("runtime_top_k", torch.float32, value=top_k)
+        set_property("runtime_top_p", torch.float32, value=top_p)
         set_property("random_seed", torch.int64)
 
         return ir
@@ -114,7 +126,8 @@ class GenerationResult(GenerationOutput):
             self.queue = Queue()
             self.aqueue = None
 
-        beam_width = generation_request.options.get("beam_width", 1)
+        beam_width = generation_request.sampling_config.beam_width
+
         self.beam_search_enabled = beam_width > 1
         self._token_ids = [[] for _ in range(beam_width)]
 
@@ -235,9 +248,10 @@ class GenerationExecutor(ABC):
         pass
 
     def generate_async(
-            self, prompt: Union[str, List[int], List[str],
-                                List[List[int]]], streaming: bool,
-            **kwargs: Any) -> Union[GenerationResult, List[GenerationResult]]:
+        self, prompt: Union[str, List[int], List[str], List[List[int]]],
+        streaming: bool, sampling_config: Union[SamplingConfig,
+                                                List[SamplingConfig]]
+    ) -> Union[GenerationResult, List[GenerationResult]]:
         unbatched = isinstance(prompt, str) or (isinstance(prompt, list)
                                                 and isinstance(prompt[0], int))
         string_input = isinstance(
@@ -246,26 +260,34 @@ class GenerationExecutor(ABC):
 
         if unbatched:
             results = self.submit(
-                GenerationRequest(prompt, streaming, tokenizer, **kwargs))
+                GenerationRequest(prompt,
+                                  streaming,
+                                  tokenizer,
+                                  sampling_config=sampling_config))
         else:
+            sampling_config = [sampling_config] * len(prompt) if not isinstance(
+                sampling_config, list) else sampling_config
             results = []
             for idx, p in enumerate(prompt):
-                request_kwargs = {
-                    k: v[idx] if isinstance(v, list) else v
-                    for k, v in kwargs.items()
-                }
                 results.append(
                     self.submit(
-                        GenerationRequest(p, streaming, tokenizer,
-                                          **request_kwargs)))
+                        GenerationRequest(
+                            p,
+                            streaming,
+                            tokenizer,
+                            sampling_config=sampling_config[idx])))
         return results
 
     def generate(
-            self,
-            prompt: Union[str, List[int], List[str], List[List[int]]],
-            streaming: bool = False,
-            **kwargs: Any) -> Union[GenerationResult, List[GenerationResult]]:
-        futures = self.generate_async(prompt, streaming=streaming, **kwargs)
+        self,
+        prompt: Union[str, List[int], List[str], List[List[int]]],
+        streaming: bool = False,
+        sampling_config: Optional[Union[SamplingConfig,
+                                        List[SamplingConfig]]] = None
+    ) -> Union[GenerationResult, List[GenerationResult]]:
+        futures = self.generate_async(prompt,
+                                      streaming=streaming,
+                                      sampling_config=sampling_config)
         if isinstance(futures, GenerationRequest):
             futures.result()
         else:
@@ -495,10 +517,9 @@ class GenerationExecutorWorker(GenerationExecutor):
             if self._termination_requested:
                 self._termination_ack.release()
                 self._termination_pending = True
-            else:
-                fetched = self.comm.bcast(fetched)
-
             self._termination_lock.release()
+
+            fetched = self.comm.bcast(fetched)
 
         return fetched
 
@@ -527,10 +548,35 @@ class GenerationExecutorWorker(GenerationExecutor):
         self.shutdown()
 
 
-class GenerationExecutorProxy(GenerationExecutor):
+class Fifo:
 
-    class ExecutorManager(BaseManager):
-        pass
+    def __init__(self, address: Tuple[str, int, bytes], *, is_server: bool):
+        self.address, self.authkey = (address[0], address[1]), address[2]
+        self.is_server = is_server
+        self.conn = None
+        if is_server:
+            self.listener = Listener(self.address,
+                                     'AF_INET',
+                                     authkey=self.authkey)
+
+    def setup(self):
+        if self.is_server:
+            self.conn = self.listener.accept()
+        else:
+            self.conn = Client(self.address, authkey=self.authkey)
+
+    def put(self, obj: Any):
+        if self.conn is None:
+            self.setup()
+        self.conn.send(obj)
+
+    def get(self) -> Any:
+        if self.conn is None:
+            self.setup()
+        return self.conn.recv()
+
+
+class GenerationExecutorProxy(GenerationExecutor):
 
     def __init__(
         self,
@@ -543,16 +589,13 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.workers_started = False
         self.tokenizer = tokenizer_factory(workers_kwargs["tokenizer"])
 
-        manager_address = ("localhost", find_free_port())
-        manager_secret = secrets.token_bytes(512)
-        self.manager = GenerationExecutorProxy.ExecutorManager(
-            manager_address, manager_secret)
-        request_queue, result_queue = Queue(), Queue()
-        GenerationExecutorProxy.ExecutorManager.register(
-            "request_queue", lambda: request_queue)
-        GenerationExecutorProxy.ExecutorManager.register(
-            "result_queue", lambda: result_queue)
-        self.manager.start()
+        request_queue_addr = ("127.0.0.1", find_free_port(),
+                              secrets.token_bytes(512))
+        self.request_queue = Fifo(request_queue_addr, is_server=True)
+        result_queue_addr = ("127.0.0.1", find_free_port(),
+                             secrets.token_bytes(512))
+        self.result_queue = Fifo(result_queue_addr, is_server=True)
+
         self._results: Dict[int, GenerationResult] = {}
 
         if mpi_session is None:
@@ -563,46 +606,47 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         self.workers_kwargs = workers_kwargs
         self.workers_kwargs.update({
-            "manager_address": manager_address,
-            "manager_secret": manager_secret
+            "request_queue_addr": request_queue_addr,
+            "result_queue_addr": result_queue_addr,
         })
         self.dispatcher = Thread(target=self.dispatcher_thread)
 
     @staticmethod
-    def workers_main(engine_dir: Path,
-                     tokenizer: Union[str, Path, TokenizerBase],
-                     max_beam_width: int = 1,
-                     executor_type: tllm.TrtGptModelType = tllm.TrtGptModelType.
-                     InflightBatching,
-                     executor_policy: tllm.SchedulerPolicy = tllm.
-                     SchedulerPolicy.GUARANTEED_NO_EVICT,
-                     executor_config: tllm.TrtGptModelOptionalParams = tllm.
-                     TrtGptModelOptionalParams(),
-                     manager_address: Tuple[str, int] = ("", 0),
-                     manager_secret: bytes = b"") -> None:
+    def workers_main(
+        engine_dir: Path,
+        tokenizer: Union[str, Path, TokenizerBase],
+        request_queue_addr: Tuple[str, int, bytes],
+        result_queue_addr: Tuple[str, int, bytes],
+        max_beam_width: int = 1,
+        executor_type: tllm.TrtGptModelType = tllm.TrtGptModelType.
+        InflightBatching,
+        executor_policy: tllm.SchedulerPolicy = tllm.SchedulerPolicy.
+        GUARANTEED_NO_EVICT,
+        executor_config: tllm.TrtGptModelOptionalParams = tllm.
+        TrtGptModelOptionalParams()
+    ) -> None:
+        result_queue = None
 
         with GenerationExecutorWorker(engine_dir, tokenizer, max_beam_width,
                                       executor_type, executor_policy,
                                       executor_config) as executor:
             executor.block_subordinates()
+            request_queue = Fifo(request_queue_addr, is_server=False)
+            result_queue = Fifo(result_queue_addr, is_server=False)
+            result_queue.put(True)  # ack that we started
 
-            manager = GenerationExecutorProxy.ExecutorManager(
-                manager_address, manager_secret)
-            GenerationExecutorProxy.ExecutorManager.register("request_queue")
-            GenerationExecutorProxy.ExecutorManager.register("result_queue")
-            manager.connect()
-            request_queue = manager.request_queue()
-            manager.result_queue().put(True)
-
-            executor.set_result_queue(manager.result_queue())
+            executor.set_result_queue(result_queue)
             while (req := request_queue.get()) is not None:
                 executor.submit(req)
 
+        if mpi_rank() == 0:
+            result_queue.put(None)
+
     def dispatcher_thread(self):
-        """ Collect centralized results from Manager's result queue and dispatch them in the
+        """ Collect centralized results from result queue and dispatch them in the
             correct GenerationResult queues. """
 
-        while (res := self.manager.result_queue().get()) is not None:
+        while (res := self.result_queue.get()) is not None:
             id, tensors, finished, err = res
             self._results[id].queue.put(
                 (id,
@@ -613,28 +657,17 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.mpi_futures = self.mpi_session.submit(
             GenerationExecutorProxy.workers_main, **self.workers_kwargs)
         self.workers_started = True
-
-        while True:
-            ack = False
-            try:
-                ack = self.manager.result_queue().get(timeout=0.5)
-            except Empty:
-                pass
-            if not ack:
-                if any(f.done() for f in self.mpi_futures):
-                    self.shutdown()
-                    raise RuntimeError(
-                        "GenerationExecutorWorker has exited unexpectedly")
-            else:
-                break
-
+        ack = Thread(target=lambda: self.result_queue.get())
+        ack.start()
+        ack.join(timeout=20)
+        if ack.is_alive():
+            raise RuntimeError("GptManager seems to have crashed")
         self.dispatcher.start()
 
     def shutdown(self):
         if not self.workers_started:
             return
-        self.manager.request_queue().put(None)
-        self.manager.result_queue().put(None)
+        self.request_queue.put(None)
         for f in self.mpi_futures:
             f.result()
         self.dispatcher.join()
@@ -643,7 +676,7 @@ class GenerationExecutorProxy(GenerationExecutor):
     def submit(self, request: GenerationRequest) -> GenerationResult:
         """
             Low-level API to the executor. Return a "future" GenerationResult which can be waited.
-            Forwards the request to the workers through the Manager's request queue.
+            Forwards the request to the workers through the request queue.
         """
         if not self.workers_started:
             self.start()
@@ -651,10 +684,15 @@ class GenerationExecutorProxy(GenerationExecutor):
         req_id = self.generate_id()
         request.set_id(req_id)
 
-        result = GenerationResult(request, request.tokenizer)
+        tokenizer = request.tokenizer
+        result = GenerationResult(request, tokenizer)
         self._results[req_id] = result
 
-        self.manager.request_queue().put(request)
+        # no need to send the tokenizer to the executor,
+        # saves communication time
+        request.tokenizer = None
+        self.request_queue.put(request)
+        request.tokenizer = tokenizer
 
         return result
 

@@ -54,14 +54,13 @@ void invokeStopWordsCriterion(int32_t const** outputIds, int32_t const** parentI
 //! \param finishedSum output buffer [1].
 //! Total sum of finished requests
 //! \param sequenceLimitLength input buffer [maxBatchSize]. Maximum sequence length.
-//! \param sequenceLengths input buffer [maxBatchSize, beamWidth].
+//! \param sequenceLengths input/output buffer [maxBatchSize, beamWidth].
 //! Current sequence lengths of the request tokens.
 //! \param batchSlots input buffer[batchSize], optional. Indices of rows of data in memory pool
 //! \param batchSize batch size
 //! \param beamWidth beam width
 //! \param stream stream
 void invokeLengthCriterion(FinishedState* finished, int32_t* finishedSum, uint32_t const* sequenceLimitLength,
-    int32_t const* sequenceLengths, int32_t const* batchSlots, int32_t batchSize, int32_t beamWidth,
-    cudaStream_t stream);
+    int32_t* sequenceLengths, int32_t const* batchSlots, int32_t batchSize, int32_t beamWidth, cudaStream_t stream);
 } // namespace kernels
 } // namespace tensorrt_llm

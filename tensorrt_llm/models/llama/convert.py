@@ -20,9 +20,9 @@ from transformers.pytorch_utils import Conv1D
 
 from ..._utils import pad_vocab_size, release_gc
 from ...layers import MoeConfig
-from ...lora_manager import LoraConfig
 from ...mapping import Mapping
-from ..modeling_utils import PretrainedConfig
+from ...quantization import QuantAlgo
+from ..modeling_utils import PretrainedConfig, QuantConfig
 from .weight import load_from_hf_checkpoint
 
 try:
@@ -485,10 +485,13 @@ def get_tllm_linear_sq_weight(vals,
     col_shape = shape if (is_qkv or per_channel) else [1, 1]
 
     if per_token:
-        original_weights = vals["weight.int8.col"]
-
+        if per_channel:
+            original_weights = np.array(vals["weight.int8.col"])
+        else:
+            original_weights = np.array(vals["weight.int8"])
         local_dim = original_weights.shape[0]
         head_size = (original_weights.shape[1] - local_dim) // 2
+
         if multi_query_mode:
             cur_weights = multi_query_split(original_weights, local_dim,
                                             head_size, tensor_parallel, rank)
@@ -505,49 +508,98 @@ def get_tllm_linear_sq_weight(vals,
             results[last_prefix] = torch.from_numpy(
                 np.array([1.0], dtype=np.float32))
 
-        if smoother_value is None:
-            if multi_query_mode:
-                cur_per_channel_value = multi_query_split(
-                    vals["scale_w_quant_orig.col"], local_dim, head_size,
-                    tensor_parallel, rank)
-            else:
-                cur_per_channel_value = np.split(vals["scale_w_quant_orig.col"],
-                                                 tensor_parallel,
-                                                 axis=cat_dim)[rank]
-        else:
+        if per_channel:
             cur_per_channel_value = vals["scale_w_quant_orig.col"]
+            if smoother_value is None:
+                if multi_query_mode:
+                    cur_per_channel_value = multi_query_split(
+                        vals["scale_w_quant_orig.col"], local_dim, head_size,
+                        tensor_parallel, rank)
+                else:
+                    cur_per_channel_value = np.split(
+                        vals["scale_w_quant_orig.col"],
+                        tensor_parallel,
+                        axis=cat_dim)[rank]
+        else:
+            cur_per_channel_value = vals["scale_w_quant_orig"]
+            if is_qkv:
+                if multi_query_mode:
+                    cur_per_channel_value = multi_query_split(
+                        vals["scale_w_quant_orig"], local_dim, head_size,
+                        tensor_parallel, rank)
+                else:
+                    cur_per_channel_value = np.split(vals["scale_w_quant_orig"],
+                                                     tensor_parallel,
+                                                     axis=cat_dim)[rank]
+
         results[prefix + 'per_channel_scale'] = torch.from_numpy(
             np.array(cur_per_channel_value,
-                     dtype=np.float32).reshape(col_shape)).clone()
+                     dtype=np.float32).reshape(col_shape)).contiguous()
     else:
-        original_weights = np.array(vals["weight.int8"])
-        cur_weights = np.split(original_weights, tensor_parallel,
-                               axis=cat_dim)[rank]
+        if per_channel:
+            original_weights = np.array(vals["weight.int8.col"])
+        else:
+            original_weights = np.array(vals["weight.int8"])
+        local_dim = original_weights.shape[0]
+        head_size = (original_weights.shape[1] - local_dim) // 2
 
+        if multi_query_mode:
+            cur_weights = multi_query_split(original_weights, local_dim,
+                                            head_size, tensor_parallel, rank)
+        else:
+            cur_weights = np.split(original_weights,
+                                   tensor_parallel,
+                                   axis=cat_dim)[rank]
         if is_qkv:
             hidden_dim = cur_weights.shape[0]
             cur_weights = cur_weights.reshape(hidden_dim, -1)
         results[prefix + 'weight'] = torch.from_numpy(
             cur_weights).t().clone().contiguous()
 
-        cur_per_channel_value = vals["scale_y_accum_quant"]
+        if per_channel:
+            cur_per_channel_value = vals["scale_y_accum_quant.col"]
+            if smoother_value is None:
+                if multi_query_mode:
+                    cur_per_channel_value = multi_query_split(
+                        vals["scale_y_accum_quant.col"], local_dim, head_size,
+                        tensor_parallel, rank)
+                else:
+                    cur_per_channel_value = np.split(
+                        vals["scale_y_accum_quant.col"],
+                        tensor_parallel,
+                        axis=cat_dim)[rank]
+        else:
+            cur_per_channel_value = vals["scale_y_accum_quant"]
+            # QKV is always per_channel
+            if is_qkv:
+                if multi_query_mode:
+                    cur_per_channel_value = multi_query_split(
+                        vals["scale_y_accum_quant"], local_dim, head_size,
+                        tensor_parallel, rank)
+                else:
+                    cur_per_channel_value = np.split(
+                        vals["scale_y_accum_quant"],
+                        tensor_parallel,
+                        axis=cat_dim)[rank]
 
         results[prefix + 'per_channel_scale'] = torch.from_numpy(
             np.array([cur_per_channel_value],
-                     dtype=np.float32).reshape(col_shape)).clone()
+                     dtype=np.float32).reshape(col_shape)).contiguous()
 
         results[last_prefix] = torch.from_numpy(
-            np.array([vals['scale_x_orig_quant']], dtype=np.float32)).clone()
+            np.array([vals['scale_x_orig_quant']],
+                     dtype=np.float32)).contiguous()
 
         results[prefix + 'act_scale'] = torch.from_numpy(
-            np.array([[vals["scale_y_quant_orig"]]], dtype=np.float32)).clone()
+            np.array([[vals["scale_y_quant_orig"]]],
+                     dtype=np.float32)).contiguous()
 
     if smoother_value is not None:
         cur_smoother_value = np.split(smoother_value,
                                       tensor_parallel,
                                       axis=cat_dim)[rank]
         results[prefix + 'smoother'] = cur_smoother_value.reshape(
-            smoother_shape).clone().to(torch.float32)
+            smoother_shape).contiguous().to(torch.float32)
 
     if bias is not None:
         results[prefix + 'bias'] = bias
@@ -572,8 +624,7 @@ def convert_hf_llama(hf_model,
                      act_range=[],
                      qkv_para=[],
                      smoother=[],
-                     moe_config=None,
-                     lora_config=None):
+                     moe_config=None):
 
     weights = {}
     tik = time.time()
@@ -632,6 +683,7 @@ def convert_hf_llama(hf_model,
 
         if use_smooth_quant:
             qkv_weight = qkv_para[prefix + 'self_attn.qkv_proj']
+            qkv_out_dim = qkv_weight.shape[1]
 
             if not mha_mode:
                 local_dim = qkv_weight.shape[0]
@@ -648,24 +700,21 @@ def convert_hf_llama(hf_model,
                                          multi_query_mode=bool(not mha_mode))
 
             weights.update(
-                get_tllm_linear_sq_weight(
-                    int8_weights,
-                    tllm_prex + 'attention.qkv.', [
-                        1, 3 * hidden_size // tensor_parallel
-                        if mha_mode else hidden_size // tensor_parallel +
-                        (head_size * num_key_value_heads) // tensor_parallel * 2
-                    ],
-                    tensor_parallel,
-                    is_qkv=True,
-                    bias=split_bias_v,
-                    per_token=per_token,
-                    per_channel=per_channel,
-                    last_prefix=tllm_prex + 'input_layernorm.scale_to_int',
-                    smoother_value=None,
-                    smoother_shape=None,
-                    rank=mapping.tp_rank,
-                    cat_dim=-1,
-                    multi_query_mode=bool(not mha_mode)))
+                get_tllm_linear_sq_weight(int8_weights,
+                                          tllm_prex + 'attention.qkv.',
+                                          [1, qkv_out_dim // tensor_parallel],
+                                          tensor_parallel,
+                                          is_qkv=True,
+                                          bias=split_bias_v,
+                                          per_token=per_token,
+                                          per_channel=per_channel,
+                                          last_prefix=tllm_prex +
+                                          'input_layernorm.scale_to_int',
+                                          smoother_value=None,
+                                          smoother_shape=None,
+                                          rank=mapping.tp_rank,
+                                          cat_dim=-1,
+                                          multi_query_mode=bool(not mha_mode)))
         else:
             weights.update(
                 get_tllm_linear_weight(split_v, tllm_prex + 'attention.qkv.',
@@ -791,8 +840,12 @@ def convert_hf_llama(hf_model,
             weights.update(
                 get_tllm_linear_weight(
                     moe_experts_gate_weights.to(torch.float32),
-                    tllm_prex + 'mlp.router.', None, use_weight_only,
-                    plugin_weight_only_quant_type, dtype, use_gemm_woq_plugin))
+                    tllm_prex + 'mlp.router.',
+                    None,
+                    False,  # Router should never be quantized
+                    plugin_weight_only_quant_type,
+                    dtype,
+                    use_gemm_woq_plugin))
         else:
             mlp_gate_weight = get_weight(model_params, prefix + 'mlp.up_proj',
                                          dtype)
@@ -912,8 +965,6 @@ def convert_hf_llama(hf_model,
         release_gc()
 
     v = get_weight(model_params, 'model.embed_tokens', dtype)
-    if lora_config.is_valid and lora_config.embedding_weight is not None:
-        v = lora_config.embedding_weight
     if hf_model.config.tie_word_embeddings:
         # lm_head.weight has the same weights as embedding
         if mapping.is_last_pp_rank():
@@ -948,11 +999,6 @@ def convert_hf_llama(hf_model,
     lm_head_weights = get_weight(model_params, 'lm_head', dtype)
 
     if mapping.is_last_pp_rank():
-
-        if lora_config.is_valid and lora_config.lm_head_weight is not None:
-
-            lm_head_weights = lora_config.lm_head_weight
-
         if vocab_size % mapping.tp_size != 0:
             # padding
             vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
@@ -974,33 +1020,6 @@ def convert_hf_llama(hf_model,
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     print(f'Weights loaded. Total time: {t}')
     return weights
-
-
-def create_lora_config(hf_lora_dir):
-    '''update args based on lora dir
-    '''
-    hf_modules_to_trtllm_modules = {
-        "q_proj": "attn_q",
-        "k_proj": "attn_k",
-        "v_proj": "attn_v",
-        "o_proj": "attn_dense",
-        "gate_proj": "mlp_h_to_4h",
-        "down_proj": "mlp_4h_to_h",
-        "up_proj": "mlp_gate"
-    }  # lora modules on llama
-
-    trtllm_modules_to_hf_modules = {
-        "attn_q": "q_proj",
-        "attn_k": "k_proj",
-        "attn_v": "v_proj",
-        "attn_dense": "o_proj",
-        "mlp_h_to_4h": "gate_proj",
-        "mlp_4h_to_h": "down_proj",
-        "mlp_gate": "up_proj",
-    }
-    lora_config = LoraConfig.from_hf(hf_lora_dir, hf_modules_to_trtllm_modules,
-                                     trtllm_modules_to_hf_modules)
-    return lora_config
 
 
 def smooth_quant(model,
@@ -1034,9 +1053,8 @@ def smooth_quant(model,
 def create_config_from_hugging_face(hf_model,
                                     dtype,
                                     mapping,
-                                    quantization: 'QuantizationConfig' = None,
-                                    override_fields: dict = {},
-                                    **kwargs):
+                                    quantization: QuantConfig = None,
+                                    override_fields: dict = {}):
     config = {}
     hf_config = AutoConfig.from_pretrained(hf_model, trust_remote_code=True)
     if hf_config.model_type == "llava":
@@ -1071,7 +1089,8 @@ def create_config_from_hugging_face(hf_model,
     # VILA model, force to use llama config
     if hf_config.model_type == "llava_llama":
         architecture = "LlamaForCausalLM"
-    attn_bias = getattr(hf_config, 'bias', False)
+    attn_bias = getattr(hf_config, 'bias', False) or getattr(
+        hf_config, 'attention_bias', False)
 
     config.update({
         'architecture': architecture,
@@ -1099,35 +1118,15 @@ def create_config_from_hugging_face(hf_model,
         },
         'attn_bias': attn_bias,
     })
-    if kwargs.get('hf_lora_dir', None) is not None:
-        hf_lora_dir = kwargs.get('hf_lora_dir')
-        lora_target_modules = kwargs.get('lora_target_modules', None)
-        max_lora_rank = kwargs.get('max_lora_rank', 64)
-        lora_config = create_lora_config(hf_lora_dir)
-        if lora_config.is_valid:
-            if lora_target_modules is not None:
-                # command line options is preferred over the modules in the lora dir
-                lora_config.lora_target_modules = lora_target_modules
-            config.update({
-                'max_lora_rank':
-                max_lora_rank,
-                'lora_target_modules':
-                lora_config.lora_target_modules,
-                'hf_modules_to_trtllm_modules':
-                lora_config.hf_modules_to_trtllm_modules,
-                'trtllm_modules_to_hf_modules':
-                lora_config.trtllm_modules_to_hf_modules,
-            })
-            # the lora checkpoint might finetune the embedding
-            if lora_config.vocab_size != 0:
-                config['vocab_size'] = lora_config.vocab_size
     config['quantization'] = quantization.asdict()
     config.update(override_fields)
 
     moe_config = MoeConfig(config['moe_num_experts'], config['moe_top_k'],
                            config['moe_tp_mode'],
                            config['moe_normalization_mode']).validate()
-    use_weight_only = config['quantization']['quant_algo'] in ['W8A16', 'W4A16']
+    use_weight_only = config['quantization']['quant_algo'] in [
+        QuantAlgo.W8A16, QuantAlgo.W4A16
+    ]
     if use_weight_only and moe_config.has_moe():
         config['quantization']['exclude_modules'].append('router')
 
@@ -1139,13 +1138,10 @@ def from_hugging_face(cls,
                       dtype,
                       *,
                       mapping,
-                      quantization: 'QuantizationConfig' = None,
+                      quantization: QuantConfig = None,
                       load_by_shard=False,
                       load_model_on_cpu=False,
                       override_fields={},
-                      hf_lora_dir=None,
-                      lora_target_modules=None,
-                      max_lora_rank=None,
                       skip_loading_weights=False,
                       preloaded_model=None):
     ''' Create a LLaMAForCausalLM object from give parameters
@@ -1153,11 +1149,6 @@ def from_hugging_face(cls,
     assert model_dir is not None
     if isinstance(model_dir, Path):  # some code relies on this as string
         model_dir = str(model_dir)
-    kwargs = {
-        'hf_lora_dir': hf_lora_dir,
-        'lora_target_modules': lora_target_modules,
-        'max_lora_rank': max_lora_rank,
-    }
 
     # register VILA model
     if "vila" in model_dir:
@@ -1170,13 +1161,13 @@ def from_hugging_face(cls,
                                              dtype,
                                              mapping,
                                              quantization,
-                                             override_fields=override_fields,
-                                             **kwargs)
+                                             override_fields=override_fields)
 
     pretrained_config = PretrainedConfig.from_dict(config)
-    pretrained_config.set_rank(mapping.rank)  #TODO: remove this hack
+    pretrained_config.set_rank(mapping.rank)  # TODO:remove this hack
+
     llama = cls.from_config(pretrained_config)
-    if skip_loading_weights == True:
+    if skip_loading_weights:
         return llama
 
     model = preloaded_model
@@ -1196,15 +1187,11 @@ def from_hugging_face(cls,
             )
 
     if load_by_shard:
-        lora_config = create_lora_config(hf_lora_dir)
-
-        weights = load_from_hf_checkpoint(model_dir, mapping, pretrained_config,
-                                          lora_config)
+        weights = load_from_hf_checkpoint(model_dir, mapping, pretrained_config)
     else:
         weights = load_weights_from_hf(config=config,
                                        mapping=mapping,
-                                       model=model,
-                                       hf_lora_dir=hf_lora_dir)
+                                       model=model)
 
     llama.load(weights)
     return llama
@@ -1214,29 +1201,19 @@ def quantize(dtype,
              model_dir,
              output_dir,
              mapping,
-             quantization: 'QuantizationConfig',
+             quantization: QuantConfig,
              *,
              override_fields,
-             dataset_cache_dir: Optional[str] = None,
-             smoothquant_val: Optional[float] = None,
-             hf_lora_dir=None,
-             lora_target_modules=None,
-             max_lora_rank=None):
+             dataset_cache_dir: Optional[str] = None):
     '''
         Quantize the save the model as TRT-LLM checkpoint to output_dir
     '''
     #TODO: currently only smooth quant and kv cache quantization are supported, needs to support mode quant algorithm calling ammo
-    kwargs = {
-        'hf_lora_dir': hf_lora_dir,
-        'lora_target_modules': lora_target_modules,
-        'max_lora_rank': max_lora_rank,
-    }
     config = create_config_from_hugging_face(model_dir,
                                              dtype,
                                              mapping,
                                              quantization,
-                                             override_fields=override_fields,
-                                             **kwargs)
+                                             override_fields=override_fields)
 
     with open(os.path.join(output_dir, 'config.json'), 'w') as f:
         json.dump(config, f, indent=4)
@@ -1247,13 +1224,13 @@ def quantize(dtype,
     llama_smoother = {}
     model = None
     assert config['quantization']['quant_algo'] == quantization.quant_algo
-    int8_kv_cache = quantization.kv_cache_quant_algo == "INT8"
+    int8_kv_cache = quantization.kv_cache_quant_algo == QuantAlgo.INT8
     use_smooth_quant = quantization.quant_algo is not None and quantization.quant_algo.startswith(
         'W8A8_SQ')
 
     assert use_smooth_quant or int8_kv_cache, "Call from_hugging_face when there is no quantization"
     if use_smooth_quant:
-        assert smoothquant_val is not None, "A smooth value must be specified when using smooth quant"
+        assert quantization.smoothquant_val is not None, "A smooth value must be specified when using smooth quant"
 
     assert model_dir is not None
     ## only load and call smooth quant routine once for all ranks
@@ -1265,7 +1242,7 @@ def quantize(dtype,
         torch_dtype='auto' if not use_smooth_quant else torch.float16,
         trust_remote_code=True)
     act_range, llama_qkv_para, llama_smoother = smooth_quant(
-        model, model_dir, dataset_cache_dir, smoothquant_val)
+        model, model_dir, dataset_cache_dir, quantization.smoothquant_val)
 
     for rank in range(mapping.world_size):
         # To avoid changing the mapping arg in-place, also the given mapping from caller is rank agnostic, since quantize is called from only one rank
@@ -1281,7 +1258,6 @@ def quantize(dtype,
             act_range=act_range,
             llama_qkv_para=llama_qkv_para,
             llama_smoother=llama_smoother,
-            hf_lora_dir=hf_lora_dir,
         )
         safetensors.torch.save_file(
             weights, os.path.join(output_dir, f'rank{rank}.safetensors'))
@@ -1295,29 +1271,28 @@ def load_weights_from_hf(*,
                          model,
                          act_range={},
                          llama_qkv_para={},
-                         llama_smoother={},
-                         hf_lora_dir=None):
+                         llama_smoother={}):
     #TODO: simplify the parameters here
 
     assert model is not None
     plugin_weight_only_quant_type = None  # the value does not matter when use_weight_only is False
     quant_algo = config['quantization']['quant_algo']
-    if quant_algo == 'W8A16':
+    if quant_algo == QuantAlgo.W8A16:
         plugin_weight_only_quant_type = torch.int8
-    elif quant_algo == 'W4A16':
+    elif quant_algo == QuantAlgo.W4A16:
         plugin_weight_only_quant_type = torch.quint4x2
 
-    lora_config = create_lora_config(hf_lora_dir)
     moe_config = MoeConfig(config['moe_num_experts'], config['moe_top_k'],
                            config['moe_tp_mode'],
                            config['moe_normalization_mode']).validate()
 
-    use_weight_only = quant_algo in ['W8A16', 'W4A16']
+    use_weight_only = quant_algo in [QuantAlgo.W8A16, QuantAlgo.W4A16]
     use_smooth_quant = quant_algo is not None and quant_algo.startswith(
         'W8A8_SQ')
     per_channel_sq = use_smooth_quant and 'PER_CHANNEL' in quant_algo
     per_token_sq = use_smooth_quant and 'PER_TOKEN' in quant_algo
-    use_int8_kv_cache = config['quantization']['kv_cache_quant_algo'] == 'INT8'
+    use_int8_kv_cache = config['quantization'][
+        'kv_cache_quant_algo'] == QuantAlgo.INT8
     weights = convert_hf_llama(
         model,
         mapping,
@@ -1337,6 +1312,5 @@ def load_weights_from_hf(*,
         act_range=act_range,
         qkv_para=llama_qkv_para,
         smoother=llama_smoother,
-        moe_config=moe_config,
-        lora_config=lora_config)
+        moe_config=moe_config)
     return weights

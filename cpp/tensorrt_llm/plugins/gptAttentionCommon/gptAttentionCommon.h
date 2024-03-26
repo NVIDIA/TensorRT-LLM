@@ -46,8 +46,8 @@ public:
         int kv_cache_quant_mode, bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type,
         bool paged_kv_cache, int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length,
         bool qkv_bias_enabled, bool cross_attention = false, int max_distance = 0, bool pos_shift_enabled = false,
-        bool dense_context_fmha = false, bool use_paged_context_fmha = false, bool use_cache = true,
-        bool is_medusa_enabled = false);
+        bool dense_context_fmha = false, bool use_paged_context_fmha = false, bool use_fp8_context_fmha = false,
+        bool use_cache = true, bool is_medusa_enabled = false);
 
     GPTAttentionPluginCommon(void const* data, size_t length);
 
@@ -102,6 +102,7 @@ protected:
         int32_t const* kv_seq_lengths;
         float const* kv_scale_orig_quant;
         float const* kv_scale_quant_orig;
+        float const* attention_output_orig_quant;
         T const* alibi_slopes;
         T* context_buf;
         void* key_value_cache;
@@ -137,6 +138,7 @@ protected:
         int32_t const* context_lengths;
         float const* kv_scale_orig_quant;
         float const* kv_scale_quant_orig;
+        float const* attention_output_orig_quant;
         T const* alibi_slopes;
         T* context_buf;
         void* key_value_cache;
@@ -241,6 +243,7 @@ protected:
     int mMaxDistance = 0;
     bool mPosShiftEnabled = false;
     bool mPagedContextFMHA = false;
+    bool mFP8ContextFMHA = false;
     bool mDenseContextFMHA = false;
     bool mIsMedusaEnabled = false;
 

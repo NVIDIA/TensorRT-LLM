@@ -25,13 +25,21 @@
 namespace tensorrt_llm::runtime
 {
 
+struct MambaConfig
+{
+    SizeType dState = 0;
+    SizeType dConv = 0;
+    SizeType expand = 0;
+};
+
 class GptModelConfig
 {
 public:
     enum class ModelVariant : std::int32_t
     {
         kGpt = 0,
-        kGlm = 1, // https://github.com/THUDM/GLM and https://github.com/THUDM/ChatGLM-6B
+        kGlm = 1,   // https://github.com/THUDM/GLM and https://github.com/THUDM/ChatGLM-6B
+        kMamba = 2, // https://github.com/state-spaces/mamba
     };
 
     explicit GptModelConfig(
@@ -44,8 +52,10 @@ public:
         , mSizePerHead(mHiddenSize / mNbHeads)
         , mDataType(dtype)
         , mUseGptAttentionPlugin(false)
+        , mUseMambaConv1dPlugin(false)
         , mInputPacked{false}
         , mPagedKvCache{false}
+        , mPagedState{false}
         , mTokensPerBlock{64}
         , mQuantMode{common::QuantMode::none()}
         , mMaxBatchSize(0)
@@ -128,6 +138,16 @@ public:
         mUseGptAttentionPlugin = useGptAttentionPlugin;
     }
 
+    [[nodiscard]] bool constexpr useMambaConv1dPlugin() const noexcept
+    {
+        return mUseMambaConv1dPlugin;
+    }
+
+    void constexpr useMambaConv1dPlugin(bool useMambaConv1dPlugin) noexcept
+    {
+        mUseMambaConv1dPlugin = useMambaConv1dPlugin;
+    }
+
     [[nodiscard]] bool constexpr usePackedInput() const noexcept
     {
         return mInputPacked;
@@ -146,6 +166,16 @@ public:
     void constexpr usePagedKvCache(bool pagedKvCache) noexcept
     {
         mPagedKvCache = pagedKvCache;
+    }
+
+    [[nodiscard]] bool constexpr usePagedState() const noexcept
+    {
+        return mPagedState;
+    }
+
+    void constexpr usePagedState(bool pagedState) noexcept
+    {
+        mPagedState = pagedState;
     }
 
     [[nodiscard]] SizeType constexpr getTokensPerBlock() const noexcept
@@ -170,7 +200,8 @@ public:
 
     [[nodiscard]] bool constexpr supportsInflightBatching() const noexcept
     {
-        return mUseGptAttentionPlugin && mInputPacked && mPagedKvCache;
+        return (isTransformerBased() && mUseGptAttentionPlugin && mInputPacked && mPagedKvCache)
+            || (isSsmBased() && mUseMambaConv1dPlugin && mInputPacked && mPagedState);
     }
 
     [[nodiscard]] SizeType constexpr getMaxBatchSize() const noexcept
@@ -368,6 +399,47 @@ public:
         mMedusaModule = medusaModule;
     }
 
+    [[nodiscard]] nvinfer1::DataType getKvDataType() const noexcept
+    {
+        if (getQuantMode().hasFp8KvCache())
+        {
+            return nvinfer1::DataType::kFP8;
+        }
+        else if (getQuantMode().hasInt8KvCache())
+        {
+            return nvinfer1::DataType::kINT8;
+        }
+        else
+        {
+            return getDataType();
+        }
+    }
+
+    [[nodiscard]] bool constexpr isTransformerBased() const noexcept
+    {
+        return mModelVariant == ModelVariant::kGpt || mModelVariant == ModelVariant::kGlm;
+    }
+
+    [[nodiscard]] bool hasMambaConfig() const noexcept
+    {
+        return mMambaConfig.has_value();
+    }
+
+    [[nodiscard]] std::optional<MambaConfig> getMambaConfig() const noexcept
+    {
+        return mMambaConfig;
+    }
+
+    void setMambaConfig(MambaConfig const& mambaConfig) noexcept
+    {
+        mMambaConfig = mambaConfig;
+    }
+
+    [[nodiscard]] bool constexpr isSsmBased() const noexcept
+    {
+        return mModelVariant == ModelVariant::kMamba;
+    }
+
 private:
     SizeType mVocabSize;
     SizeType mNbLayers;
@@ -377,8 +449,10 @@ private:
     SizeType mSizePerHead;
     nvinfer1::DataType mDataType;
     bool mUseGptAttentionPlugin;
+    bool mUseMambaConv1dPlugin;
     bool mInputPacked;
     bool mPagedKvCache;
+    bool mPagedState;
     SizeType mTokensPerBlock;
     common::QuantMode mQuantMode;
     SizeType mMaxBatchSize;
@@ -404,5 +478,7 @@ private:
     SizeType mMaxLoraRank;
 
     std::optional<MedusaModule> mMedusaModule;
+
+    std::optional<MambaConfig> mMambaConfig;
 };
 } // namespace tensorrt_llm::runtime

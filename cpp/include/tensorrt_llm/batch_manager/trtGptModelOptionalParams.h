@@ -22,6 +22,7 @@
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/decodingMode.h"
+#include "tensorrt_llm/runtime/medusaModule.h"
 
 #include <optional>
 #include <vector>
@@ -40,7 +41,8 @@ public:
         bool enableTrtOverlap = false, std::optional<std::vector<SizeType>> const& deviceIds = std::nullopt,
         bool normalizeLogProbs = true, bool enableChunkedContext = false,
         std::optional<runtime::DecodingMode> const& decodingMode = std::nullopt,
-        PeftCacheManagerConfig const& peftCacheManagerConfig = PeftCacheManagerConfig{})
+        PeftCacheManagerConfig const& peftCacheManagerConfig = PeftCacheManagerConfig{},
+        std::optional<runtime::MedusaModule::MedusaChoices> const& medusaChoices = std::nullopt)
         : kvCacheConfig{kvCacheConfig}
         , enableTrtOverlap{enableTrtOverlap}
         , deviceIds(deviceIds)
@@ -48,6 +50,7 @@ public:
         , enableChunkedContext{enableChunkedContext}
         , decodingMode{decodingMode}
         , peftCacheManagerConfig(peftCacheManagerConfig)
+        , medusaChoices(medusaChoices)
     {
     }
 
@@ -55,7 +58,8 @@ public:
         : TrtGptModelOptionalParams(KvCacheConfig(executorConfig.getKvCacheConfig()), false,
             executorConfig.getParallelConfig().value_or(executor::ParallelConfig()).getDeviceIds(),
             executorConfig.getNormalizeLogProbs(), executorConfig.getEnableChunkedContext(), std::nullopt,
-            PeftCacheManagerConfig(executorConfig.getPeftCacheConfig()))
+            PeftCacheManagerConfig(executorConfig.getPeftCacheConfig().value_or(executor::PeftCacheConfig())),
+            executorConfig.getMedusaChoices())
     {
     }
 
@@ -74,6 +78,7 @@ public:
     bool enableChunkedContext;
     std::optional<runtime::DecodingMode> decodingMode;
     PeftCacheManagerConfig peftCacheManagerConfig;
+    std::optional<runtime::MedusaModule::MedusaChoices> medusaChoices;
 };
 
 } // namespace tensorrt_llm::batch_manager

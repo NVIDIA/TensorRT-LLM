@@ -22,7 +22,6 @@ from importlib.machinery import SourceFileLoader
 from multiprocessing import get_context
 from typing import Union
 
-import safetensors
 import torch
 
 from .._common import check_max_num_tokens
@@ -30,12 +29,11 @@ from ..auto_parallel.config import _cluster_infos, infer_cluster_key
 from ..builder import BuildConfig, Engine, build
 from ..logger import logger
 from ..lora_manager import LoraBuildConfig
-from ..models import MODEL_MAP, PretrainedConfig
-from ..models.modeling_utils import (WEIGHT_LOADER_MODELS, optimize_model,
-                                     preprocess_weights)
+from ..models import PretrainedConfig
+from ..models.modeling_utils import (WEIGHT_LOADER_MODELS, QuantConfig,
+                                     load_model)
 from ..plugin import PluginConfig, add_plugin_argument
-from ..quantization import QuantMode
-from ..quantization.mode import FP8, W4A16, W8A16
+from ..quantization import QuantAlgo
 
 
 def parse_arguments():
@@ -82,6 +80,13 @@ def parse_arguments():
     parser.add_argument('--max_output_len', type=int, default=1024)
     parser.add_argument('--max_beam_width', type=int, default=1)
     parser.add_argument('--max_num_tokens', type=int, default=None)
+    parser.add_argument(
+        '--opt_num_tokens',
+        type=int,
+        default=None,
+        help='It equals to max_batch_size*max_beam_width by default, set this '
+        'value as close as possible to the actual number of tokens on your workload. '
+        'Note that this argument might be removed in the future.')
     parser.add_argument('--tp_size', type=int, default=1)
     parser.add_argument('--pp_size', type=int, default=1)
     parser.add_argument(
@@ -132,6 +137,7 @@ def parse_arguments():
                         type=str,
                         default=None,
                         choices=['int8', 'int4'])
+    parser.add_argument('--weight_sparsity', default=False, action='store_true')
     parser.add_argument(
         '--max_draft_len',
         type=int,
@@ -217,7 +223,6 @@ def build_model(build_config: BuildConfig,
                 rank: int = 0,
                 ckpt_dir: str = None,
                 model_config: Union[str, PretrainedConfig] = None,
-                weights=None,
                 model_cls=None,
                 **kwargs) -> Engine:
     if ckpt_dir is not None:
@@ -236,63 +241,31 @@ def build_model(build_config: BuildConfig,
     if logits_dtype is not None:
         model_config.logits_dtype = logits_dtype
 
-    model_config.use_prompt_tuning = build_config.max_prompt_embedding_table_size > 0
     weight_only_precision = kwargs.get('weight_only_precision', None)
-    if model_config.quant_mode == QuantMode(
-            0) and weight_only_precision is not None:
+    if not model_config.quant_mode.has_any_quant(
+    ) and weight_only_precision is not None:
         if weight_only_precision == 'int4':
-            model_config.quant_mode = QuantMode.use_weight_only(
-                use_int4_weights=True)
-            model_config.quantization.quant_algo = W4A16
+            model_config.quantization = QuantConfig(QuantAlgo.W4A16)
         else:
-            model_config.quant_mode = QuantMode.use_weight_only(
-                use_int4_weights=False)
-            model_config.quantization.quant_algo = W8A16
+            model_config.quantization = QuantConfig(QuantAlgo.W8A16)
 
     architecture = model_config.architecture
-
-    if model_cls is None:
-        if architecture not in MODEL_MAP:
-            raise RuntimeError(
-                f'Unsupported model architecture: {architecture}')
-        model_cls = MODEL_MAP[architecture]
-
+    assert not build_config.plugin_config.streamingllm or architecture == "LlamaForCausalLM", \
+        "StreamingLLM is only supported in the llama model."
     real_rank = rank
+
     if build_config.auto_parallel_config.enabled:
         assert rank < build_config.auto_parallel_config.world_size
-        rank = 0
+        assert model_config.mapping.pp_size == 1 and model_config.mapping.tp_size == 1, \
+            "You must convert to full model with TP=1&&PP=1 to use auto parallel planner"
+        #TODO: TRTLLM-193 remove this after the new build API for autopp is done
+        rank = 0  # This is a WAR to construct a whole model and load all the weights before auto parallel
     else:
         assert rank < model_config.mapping.world_size
 
     rank_config = copy.deepcopy(model_config)
     rank_config.set_rank(rank)
-
-    model = model_cls.from_config(rank_config)
-    if ckpt_dir is not None:
-        if model_config.architecture in WEIGHT_LOADER_MODELS:
-            model_path = os.path.join(ckpt_dir, 'rank0.safetensors')
-        else:
-            model_path = os.path.join(ckpt_dir, f'rank{rank}.safetensors')
-
-        if os.path.isfile(model_path):
-            weights = {}
-            with safetensors.safe_open(model_path, framework='pt',
-                                       device='cpu') as f:
-                for key in f.keys():
-                    weights[key] = f.get_tensor(key)
-        else:
-            logger.warning(
-                f"Cannot find {model_path}. Use dummy model weights.")
-
-    if weights is not None:
-        preprocess_weights(weights, rank_config)
-        model.load(weights)
-
-    if model.config.quantization.quant_algo == FP8 or model.config.quantization.kv_cache_quant_algo == FP8:
-        build_config.strongly_typed = True
-
-    if hasattr(model.config, 'max_medusa_token_len'):
-        build_config.max_draft_len = model.config.max_medusa_token_len
+    model = load_model(rank_config, ckpt_dir, model_cls)
 
     if build_config.plugin_config.lora_plugin is not None:
         lora_config = LoraBuildConfig(
@@ -302,20 +275,12 @@ def build_model(build_config: BuildConfig,
         if kwargs['lora_target_modules'] is not None:
             # command line options is preferred over the modules in the lora dir
             lora_config.lora_target_modules = kwargs['lora_target_modules']
-        # TODO(yuxianq): remove this check after TopModelMixin merged into PretrainedModel
-        assert hasattr(model, 'use_lora'), "This model does not support LoRA"
-        model.use_lora(lora_config)
+        build_config.lora_config = lora_config
 
-    use_fused_mlp = kwargs.get('use_fused_mlp', False)
-    use_auto_parallel = build_config.auto_parallel_config.enabled
-    model = optimize_model(
-        model,
-        use_fused_mlp=(use_fused_mlp and not use_auto_parallel),
-        use_prompt_tuning=(build_config.max_prompt_embedding_table_size > 0))
-
-    if use_auto_parallel:
+    build_config.use_fused_mlp = kwargs.get('use_fused_mlp', False)
+    # tells the low level build api to only build rank-th shard of the model
+    if build_config.auto_parallel_config.enabled:
         model.config.mapping.rank = real_rank
-
     return build(model, build_config)
 
 
@@ -417,10 +382,16 @@ def main():
         'lora_target_modules': args.lora_target_modules,
     }
     if args.build_config is None:
-        args.max_num_tokens = check_max_num_tokens(
+        if args.multiple_profiles == "enable" and args.opt_num_tokens is not None:
+            raise RuntimeError(
+                "multiple_profiles is enabled, while opt_num_tokens is set. "
+                "They are not supposed to be working in the same time for now.")
+        args.max_num_tokens, args.opt_num_tokens = check_max_num_tokens(
             max_num_tokens=args.max_num_tokens,
+            opt_num_tokens=args.opt_num_tokens,
             max_batch_size=args.max_batch_size,
             max_input_len=args.max_input_len,
+            max_beam_width=args.max_beam_width,
             remove_input_padding=(args.remove_input_padding == "enable"),
             enable_context_fmha=(args.context_fmha == "enable"),
             tokens_per_block=args.tokens_per_block)
@@ -431,12 +402,14 @@ def main():
                 'max_batch_size': args.max_batch_size,
                 'max_beam_width': args.max_beam_width,
                 'max_num_tokens': args.max_num_tokens,
+                'opt_num_tokens': args.opt_num_tokens,
                 'max_prompt_embedding_table_size':
                 args.max_prompt_embedding_table_size,
                 'gather_context_logits': args.gather_context_logits,
                 'gather_generation_logits': args.gather_generation_logits,
                 'strongly_typed': args.strongly_typed,
                 'builder_opt': args.builder_opt,
+                'weight_sparsity': args.weight_sparsity,
                 'profiling_verbosity': args.profiling_verbosity,
                 'enable_debug_output': args.enable_debug_output,
                 'max_draft_len': args.max_draft_len,

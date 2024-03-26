@@ -282,6 +282,7 @@ The list of supported models is:
 * [InternLM](examples/internlm)
 * [LLaMA](examples/llama)
 * [LLaMA-v2](examples/llama)
+* [Mamba](examples/mamba)
 * [mBART](examples/enc_dec)
 * [Mistral](examples/llama#mistral-v01)
 * [MPT](examples/mpt)
@@ -454,7 +455,7 @@ For example: `mpirun -n 1 python3 examples/run.py ...`
   - Support FP16 fMHA on NVIDIA V100 GPU
 * API
   - Add a set of High-level APIs for end-to-end generation tasks (see examples/high-level-api/README.md)
-  - **[BREAKING CHANGES]** Migrate models to the new build workflow, including LLaMA, Mistral, Mixtral, InternLM, ChatGLM, Falcon, GPT-J, GPT-NeoX, Medusa, MPT, Baichuan and Phi (see docs/source/new_workflow.md)
+  - **[BREAKING CHANGES]** Migrate models to the new build workflow, including LLaMA, Mistral, Mixtral, InternLM, ChatGLM, Falcon, GPT-J, GPT-NeoX, Medusa, MPT, Baichuan and Phi (see docs/source/checkpoint.md)
   - **[BREAKING CHANGES]** Deprecate `LayerNorm` and `RMSNorm` plugins and removed corresponding build parameters
   - **[BREAKING CHANGES]** Remove optional parameter `maxNumSequences` for GPT manager
 * Bug fixes
@@ -482,7 +483,7 @@ For example: `mpirun -n 1 python3 examples/run.py ...`
   - Batch manager arguments documentation updates
   - Add documentation for best practices for tuning the performance of TensorRT-LLM (See docs/source/perf_best_practices.md)
   - Add documentation for Falcon AWQ support (See examples/falcon/README.md)
-  - Update to the `docs/source/new_workflow.md` documentation
+  - Update to the `docs/source/checkpoint.md` documentation
   - Update AWQ INT4 weight only quantization documentation for GPT-J
   - Add blog: Speed up inference with SOTA quantization techniques in TRT-LLM
   - Refine TensorRT-LLM backend README structure #133

@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 #include "smoothQuantGemmPlugin.h"
+#include "tensorrt_llm/kernels/weightOnlyBatchedGemv/int8SQ.h"
 #include <numeric>
 
 using namespace nvinfer1;
@@ -236,12 +237,33 @@ int SmoothQuantGemmPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     int const n = inputDesc[1].dims.d[0];
     int const k = inputDesc[0].dims.d[inputDesc[0].dims.nbDims - 1];
     int const wsSize = m_sqGemmRunner->getWorkspaceSize(m, n, k);
-
-    auto const& bestTactic = mPluginProfiler->getBestConfig(m, mGemmId);
-    TLLM_CHECK_WITH_INFO(bestTactic, "No valid SQ GEMM tactic");
-    m_sqGemmRunner->gemm(reinterpret_cast<int8_t const*>(inputs[0]), reinterpret_cast<int8_t const*>(inputs[1]),
-        mQuantMode, reinterpret_cast<float const*>(inputs[3]), reinterpret_cast<float const*>(inputs[2]),
-        reinterpret_cast<void*>(outputs[0]), m, n, k, *bestTactic, reinterpret_cast<char*>(workspace), wsSize, stream);
+    if (m <= 4)
+    {
+        tensorrt_llm::kernels::smooth_quant::Params params(reinterpret_cast<int8_t const*>(inputs[0]),
+            reinterpret_cast<int8_t const*>(inputs[1]), reinterpret_cast<float const*>(inputs[2]),
+            reinterpret_cast<float const*>(inputs[3]), reinterpret_cast<void*>(outputs[0]), m, n, k, mQuantMode);
+        if (mType == nvinfer1::DataType::kHALF)
+        {
+            tensorrt_llm::kernels::smooth_quant::int8_sq_launcher<half>(params, stream);
+        }
+        else if (mType == nvinfer1::DataType::kFLOAT)
+        {
+            tensorrt_llm::kernels::smooth_quant::int8_sq_launcher<float>(params, stream);
+        }
+        else if (mType == nvinfer1::DataType::kINT32)
+        {
+            tensorrt_llm::kernels::smooth_quant::int8_sq_launcher<int>(params, stream);
+        }
+    }
+    else
+    {
+        auto const& bestTactic = mPluginProfiler->getBestConfig(m, mGemmId);
+        TLLM_CHECK_WITH_INFO(bestTactic, "No valid SQ GEMM tactic");
+        m_sqGemmRunner->gemm(reinterpret_cast<int8_t const*>(inputs[0]), reinterpret_cast<int8_t const*>(inputs[1]),
+            mQuantMode, reinterpret_cast<float const*>(inputs[3]), reinterpret_cast<float const*>(inputs[2]),
+            reinterpret_cast<void*>(outputs[0]), m, n, k, *bestTactic, reinterpret_cast<char*>(workspace), wsSize,
+            stream);
+    }
 
     return 0;
 }

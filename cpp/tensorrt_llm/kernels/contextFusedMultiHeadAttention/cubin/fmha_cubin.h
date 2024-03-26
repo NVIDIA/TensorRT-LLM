@@ -303,6 +303,25 @@ extern unsigned char cubin_fmha_v2_flash_attention_fp16_64_16_Causal_S_80_sm70_c
 extern unsigned char cubin_fmha_v2_flash_attention_fp16_64_16_Causal_S_128_sm70_cu_cubin[];
 extern unsigned char cubin_fmha_v2_flash_attention_fp16_64_16_Causal_S_160_sm70_cu_cubin[];
 extern unsigned char cubin_fmha_v2_flash_attention_fp16_64_16_Causal_S_256_sm70_cu_cubin[];
+// FP8
+extern unsigned char cubin_fmha_v2_flash_attention_e4m3_64_256_S_32_tma_ws_sm90_cu_cubin[];
+extern unsigned char cubin_fmha_v2_flash_attention_e4m3_64_256_S_40_tma_ws_sm90_cu_cubin[];
+extern unsigned char cubin_fmha_v2_flash_attention_e4m3_64_256_S_64_tma_ws_sm90_cu_cubin[];
+extern unsigned char cubin_fmha_v2_flash_attention_e4m3_64_128_S_80_tma_ws_sm90_cu_cubin[];
+extern unsigned char cubin_fmha_v2_flash_attention_e4m3_64_128_S_96_tma_ws_sm90_cu_cubin[];
+extern unsigned char cubin_fmha_v2_flash_attention_e4m3_64_128_S_104_tma_ws_sm90_cu_cubin[];
+extern unsigned char cubin_fmha_v2_flash_attention_e4m3_64_128_S_128_tma_ws_sm90_cu_cubin[];
+extern unsigned char cubin_fmha_v2_flash_attention_e4m3_64_64_S_160_tma_ws_sm90_cu_cubin[];
+extern unsigned char cubin_fmha_v2_flash_attention_e4m3_64_64_S_256_tma_ws_sm90_cu_cubin[];
+extern unsigned char cubin_fmha_v2_flash_attention_e4m3_64_256_S_32_alibi_tma_ws_sm90_cu_cubin[];
+extern unsigned char cubin_fmha_v2_flash_attention_e4m3_64_256_S_40_alibi_tma_ws_sm90_cu_cubin[];
+extern unsigned char cubin_fmha_v2_flash_attention_e4m3_64_256_S_64_alibi_tma_ws_sm90_cu_cubin[];
+extern unsigned char cubin_fmha_v2_flash_attention_e4m3_64_128_S_80_alibi_tma_ws_sm90_cu_cubin[];
+extern unsigned char cubin_fmha_v2_flash_attention_e4m3_64_128_S_96_alibi_tma_ws_sm90_cu_cubin[];
+extern unsigned char cubin_fmha_v2_flash_attention_e4m3_64_128_S_104_alibi_tma_ws_sm90_cu_cubin[];
+extern unsigned char cubin_fmha_v2_flash_attention_e4m3_64_128_S_128_alibi_tma_ws_sm90_cu_cubin[];
+extern unsigned char cubin_fmha_v2_flash_attention_e4m3_64_64_S_160_alibi_tma_ws_sm90_cu_cubin[];
+extern unsigned char cubin_fmha_v2_flash_attention_e4m3_64_64_S_256_alibi_tma_ws_sm90_cu_cubin[];
 
 extern uint32_t cubin_fmha_v2_fp16_64_32_ldgsts_sm90_cu_cubin_len;
 extern uint32_t cubin_fmha_v2_fp16_128_32_ldgsts_sm90_cu_cubin_len;
@@ -582,6 +601,25 @@ extern uint32_t cubin_fmha_v2_flash_attention_fp16_64_16_Causal_S_80_sm70_cu_cub
 extern uint32_t cubin_fmha_v2_flash_attention_fp16_64_16_Causal_S_128_sm70_cu_cubin_len;
 extern uint32_t cubin_fmha_v2_flash_attention_fp16_64_16_Causal_S_160_sm70_cu_cubin_len;
 extern uint32_t cubin_fmha_v2_flash_attention_fp16_64_16_Causal_S_256_sm70_cu_cubin_len;
+// FP8
+extern uint32_t cubin_fmha_v2_flash_attention_e4m3_64_256_S_32_tma_ws_sm90_cu_cubin_len;
+extern uint32_t cubin_fmha_v2_flash_attention_e4m3_64_256_S_40_tma_ws_sm90_cu_cubin_len;
+extern uint32_t cubin_fmha_v2_flash_attention_e4m3_64_256_S_64_tma_ws_sm90_cu_cubin_len;
+extern uint32_t cubin_fmha_v2_flash_attention_e4m3_64_128_S_80_tma_ws_sm90_cu_cubin_len;
+extern uint32_t cubin_fmha_v2_flash_attention_e4m3_64_128_S_96_tma_ws_sm90_cu_cubin_len;
+extern uint32_t cubin_fmha_v2_flash_attention_e4m3_64_128_S_104_tma_ws_sm90_cu_cubin_len;
+extern uint32_t cubin_fmha_v2_flash_attention_e4m3_64_128_S_128_tma_ws_sm90_cu_cubin_len;
+extern uint32_t cubin_fmha_v2_flash_attention_e4m3_64_64_S_160_tma_ws_sm90_cu_cubin_len;
+extern uint32_t cubin_fmha_v2_flash_attention_e4m3_64_64_S_256_tma_ws_sm90_cu_cubin_len;
+extern uint32_t cubin_fmha_v2_flash_attention_e4m3_64_256_S_32_alibi_tma_ws_sm90_cu_cubin_len;
+extern uint32_t cubin_fmha_v2_flash_attention_e4m3_64_256_S_40_alibi_tma_ws_sm90_cu_cubin_len;
+extern uint32_t cubin_fmha_v2_flash_attention_e4m3_64_256_S_64_alibi_tma_ws_sm90_cu_cubin_len;
+extern uint32_t cubin_fmha_v2_flash_attention_e4m3_64_128_S_80_alibi_tma_ws_sm90_cu_cubin_len;
+extern uint32_t cubin_fmha_v2_flash_attention_e4m3_64_128_S_96_alibi_tma_ws_sm90_cu_cubin_len;
+extern uint32_t cubin_fmha_v2_flash_attention_e4m3_64_128_S_104_alibi_tma_ws_sm90_cu_cubin_len;
+extern uint32_t cubin_fmha_v2_flash_attention_e4m3_64_128_S_128_alibi_tma_ws_sm90_cu_cubin_len;
+extern uint32_t cubin_fmha_v2_flash_attention_e4m3_64_64_S_160_alibi_tma_ws_sm90_cu_cubin_len;
+extern uint32_t cubin_fmha_v2_flash_attention_e4m3_64_64_S_256_alibi_tma_ws_sm90_cu_cubin_len;
 
 static const struct FusedMultiHeadAttentionKernelMetaInfoV2
 {
@@ -1511,7 +1549,62 @@ static const struct FusedMultiHeadAttentionKernelMetaInfoV2
 { DATA_TYPE_FP16, 0, 160, kSM_70,  cubin_fmha_v2_flash_attention_fp16_64_16_Causal_S_160_sm70_cu_cubin, cubin_fmha_v2_flash_attention_fp16_64_16_Causal_S_160_sm70_cu_cubin_len, "fmha_v2_flash_attention_fp16_64_16_Causal_S_160_sm70_kernel", 98304, 128, 0, false, true, false, 1, false, false },
 { DATA_TYPE_FP16, 0, 160, kSM_70,  cubin_fmha_v2_flash_attention_fp16_64_16_Causal_S_160_sm70_cu_cubin, cubin_fmha_v2_flash_attention_fp16_64_16_Causal_S_160_sm70_cu_cubin_len, "fmha_v2_flash_attention_fp16_64_16_Causal_S_160_sm70_kernel_nl", 98304, 128, 64, false, true, false, 1, false, false },
 { DATA_TYPE_FP16, 0, 256, kSM_70,  cubin_fmha_v2_flash_attention_fp16_64_16_Causal_S_256_sm70_cu_cubin, cubin_fmha_v2_flash_attention_fp16_64_16_Causal_S_256_sm70_cu_cubin_len, "fmha_v2_flash_attention_fp16_64_16_Causal_S_256_sm70_kernel", 98304, 128, 0, false, true, false, 1, false, false },
-{ DATA_TYPE_FP16, 0, 256, kSM_70,  cubin_fmha_v2_flash_attention_fp16_64_16_Causal_S_256_sm70_cu_cubin, cubin_fmha_v2_flash_attention_fp16_64_16_Causal_S_256_sm70_cu_cubin_len, "fmha_v2_flash_attention_fp16_64_16_Causal_S_256_sm70_kernel_nl", 98304, 128, 64, false, true, false, 1, false, false }
+{ DATA_TYPE_FP16, 0, 256, kSM_70,  cubin_fmha_v2_flash_attention_fp16_64_16_Causal_S_256_sm70_cu_cubin, cubin_fmha_v2_flash_attention_fp16_64_16_Causal_S_256_sm70_cu_cubin_len, "fmha_v2_flash_attention_fp16_64_16_Causal_S_256_sm70_kernel_nl", 98304, 128, 64, false, true, false, 1, false, false },
+// FP8
+{ DATA_TYPE_E4M3, 0, 32, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_256_S_32_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_256_S_32_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_256_S_32_tma_ws_sm90_kernel", 53504, 384, 64, false, true, true, 0, false, false},
+{ DATA_TYPE_E4M3, 0, 32, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_256_S_32_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_256_S_32_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_256_S_32_causal_tma_ws_sm90_kernel", 53504, 384, 64, false, true, true, 1, false, false},
+{ DATA_TYPE_E4M3, 0, 32, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_256_S_32_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_256_S_32_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_256_S_32_sliding_window_causal_tma_ws_sm90_kernel", 53504, 384, 64, false, true, true, 2, false, false},
+{ DATA_TYPE_E4M3, 0, 40, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_256_S_40_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_256_S_40_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_256_S_40_tma_ws_sm90_kernel", 106752, 384, 64, false, true, true, 0, false, false},
+{ DATA_TYPE_E4M3, 0, 40, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_256_S_40_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_256_S_40_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_256_S_40_causal_tma_ws_sm90_kernel", 106752, 384, 64, false, true, true, 1, false, false},
+{ DATA_TYPE_E4M3, 0, 40, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_256_S_40_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_256_S_40_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_256_S_40_sliding_window_causal_tma_ws_sm90_kernel", 106752, 384, 64, false, true, true, 2, false, false},
+{ DATA_TYPE_E4M3, 0, 64, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_256_S_64_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_256_S_64_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_256_S_64_tma_ws_sm90_kernel", 106752, 384, 64, false, true, true, 0, false, false},
+{ DATA_TYPE_E4M3, 0, 64, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_256_S_64_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_256_S_64_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_256_S_64_causal_tma_ws_sm90_kernel", 106752, 384, 64, false, true, true, 1, false, false},
+{ DATA_TYPE_E4M3, 0, 64, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_256_S_64_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_256_S_64_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_256_S_64_sliding_window_causal_tma_ws_sm90_kernel", 106752, 384, 64, false, true, true, 2, false, false},
+{ DATA_TYPE_E4M3, 0, 80, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_128_S_80_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_128_S_80_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_128_S_80_tma_ws_sm90_kernel", 180480, 384, 64, false, true, true, 0, false, false},
+{ DATA_TYPE_E4M3, 0, 80, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_128_S_80_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_128_S_80_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_128_S_80_causal_tma_ws_sm90_kernel", 180480, 384, 64, false, true, true, 1, false, false},
+{ DATA_TYPE_E4M3, 0, 80, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_128_S_80_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_128_S_80_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_128_S_80_sliding_window_causal_tma_ws_sm90_kernel", 180480, 384, 64, false, true, true, 2, false, false},
+{ DATA_TYPE_E4M3, 0, 96, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_128_S_96_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_128_S_96_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_128_S_96_tma_ws_sm90_kernel", 180480, 384, 64, false, true, true, 0, false, false},
+{ DATA_TYPE_E4M3, 0, 96, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_128_S_96_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_128_S_96_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_128_S_96_causal_tma_ws_sm90_kernel", 180480, 384, 64, false, true, true, 1, false, false},
+{ DATA_TYPE_E4M3, 0, 96, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_128_S_96_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_128_S_96_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_128_S_96_sliding_window_causal_tma_ws_sm90_kernel", 180480, 384, 64, false, true, true, 2, false, false},
+{ DATA_TYPE_E4M3, 0, 104, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_128_S_104_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_128_S_104_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_128_S_104_tma_ws_sm90_kernel", 180480, 384, 64, false, true, true, 0, false, false},
+{ DATA_TYPE_E4M3, 0, 104, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_128_S_104_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_128_S_104_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_128_S_104_causal_tma_ws_sm90_kernel", 180480, 384, 64, false, true, true, 1, false, false},
+{ DATA_TYPE_E4M3, 0, 104, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_128_S_104_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_128_S_104_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_128_S_104_sliding_window_causal_tma_ws_sm90_kernel", 180480, 384, 64, false, true, true, 2, false, false},
+{ DATA_TYPE_E4M3, 0, 128, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_128_S_128_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_128_S_128_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_128_S_128_tma_ws_sm90_kernel", 180480, 384, 64, false, true, true, 0, false, false},
+{ DATA_TYPE_E4M3, 0, 128, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_128_S_128_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_128_S_128_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_128_S_128_causal_tma_ws_sm90_kernel", 180480, 384, 64, false, true, true, 1, false, false},
+{ DATA_TYPE_E4M3, 0, 128, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_128_S_128_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_128_S_128_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_128_S_128_sliding_window_causal_tma_ws_sm90_kernel", 180480, 384, 64, false, true, true, 2, false, false},
+{ DATA_TYPE_E4M3, 0, 160, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_64_S_160_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_64_S_160_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_64_S_160_tma_ws_sm90_kernel", 131328, 384, 64, false, true, true, 0, false, false},
+{ DATA_TYPE_E4M3, 0, 160, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_64_S_160_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_64_S_160_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_64_S_160_causal_tma_ws_sm90_kernel", 131328, 384, 64, false, true, true, 1, false, false},
+{ DATA_TYPE_E4M3, 0, 160, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_64_S_160_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_64_S_160_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_64_S_160_sliding_window_causal_tma_ws_sm90_kernel", 131328, 384, 64, false, true, true, 2, false, false},
+{ DATA_TYPE_E4M3, 0, 256, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_64_S_256_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_64_S_256_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_64_S_256_tma_ws_sm90_kernel", 131328, 384, 64, false, true, true, 0, false, false},
+{ DATA_TYPE_E4M3, 0, 256, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_64_S_256_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_64_S_256_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_64_S_256_causal_tma_ws_sm90_kernel", 131328, 384, 64, false, true, true, 1, false, false},
+{ DATA_TYPE_E4M3, 0, 256, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_64_S_256_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_64_S_256_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_64_S_256_sliding_window_causal_tma_ws_sm90_kernel", 131328, 384, 64, false, true, true, 2, false, false},
+{ DATA_TYPE_E4M3, 0, 32, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_256_S_32_alibi_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_256_S_32_alibi_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_256_S_32_alibi_tma_ws_sm90_kernel", 53504, 384, 64, false, true, true, 0, true, false},
+{ DATA_TYPE_E4M3, 0, 32, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_256_S_32_alibi_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_256_S_32_alibi_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_256_S_32_causal_alibi_tma_ws_sm90_kernel", 53504, 384, 64, false, true, true, 1, true, false},
+{ DATA_TYPE_E4M3, 0, 32, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_256_S_32_alibi_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_256_S_32_alibi_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_256_S_32_sliding_window_causal_alibi_tma_ws_sm90_kernel", 53504, 384, 64, false, true, true, 2, true, false},
+{ DATA_TYPE_E4M3, 0, 40, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_256_S_40_alibi_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_256_S_40_alibi_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_256_S_40_alibi_tma_ws_sm90_kernel", 106752, 384, 64, false, true, true, 0, true, false},
+{ DATA_TYPE_E4M3, 0, 40, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_256_S_40_alibi_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_256_S_40_alibi_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_256_S_40_causal_alibi_tma_ws_sm90_kernel", 106752, 384, 64, false, true, true, 1, true, false},
+{ DATA_TYPE_E4M3, 0, 40, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_256_S_40_alibi_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_256_S_40_alibi_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_256_S_40_sliding_window_causal_alibi_tma_ws_sm90_kernel", 106752, 384, 64, false, true, true, 2, true, false},
+{ DATA_TYPE_E4M3, 0, 64, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_256_S_64_alibi_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_256_S_64_alibi_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_256_S_64_alibi_tma_ws_sm90_kernel", 106752, 384, 64, false, true, true, 0, true, false},
+{ DATA_TYPE_E4M3, 0, 64, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_256_S_64_alibi_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_256_S_64_alibi_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_256_S_64_causal_alibi_tma_ws_sm90_kernel", 106752, 384, 64, false, true, true, 1, true, false},
+{ DATA_TYPE_E4M3, 0, 64, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_256_S_64_alibi_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_256_S_64_alibi_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_256_S_64_sliding_window_causal_alibi_tma_ws_sm90_kernel", 106752, 384, 64, false, true, true, 2, true, false},
+{ DATA_TYPE_E4M3, 0, 80, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_128_S_80_alibi_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_128_S_80_alibi_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_128_S_80_alibi_tma_ws_sm90_kernel", 180480, 384, 64, false, true, true, 0, true, false},
+{ DATA_TYPE_E4M3, 0, 80, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_128_S_80_alibi_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_128_S_80_alibi_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_128_S_80_causal_alibi_tma_ws_sm90_kernel", 180480, 384, 64, false, true, true, 1, true, false},
+{ DATA_TYPE_E4M3, 0, 80, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_128_S_80_alibi_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_128_S_80_alibi_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_128_S_80_sliding_window_causal_alibi_tma_ws_sm90_kernel", 180480, 384, 64, false, true, true, 2, true, false},
+{ DATA_TYPE_E4M3, 0, 96, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_128_S_96_alibi_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_128_S_96_alibi_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_128_S_96_alibi_tma_ws_sm90_kernel", 180480, 384, 64, false, true, true, 0, true, false},
+{ DATA_TYPE_E4M3, 0, 96, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_128_S_96_alibi_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_128_S_96_alibi_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_128_S_96_causal_alibi_tma_ws_sm90_kernel", 180480, 384, 64, false, true, true, 1, true, false},
+{ DATA_TYPE_E4M3, 0, 96, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_128_S_96_alibi_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_128_S_96_alibi_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_128_S_96_sliding_window_causal_alibi_tma_ws_sm90_kernel", 180480, 384, 64, false, true, true, 2, true, false},
+{ DATA_TYPE_E4M3, 0, 104, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_128_S_104_alibi_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_128_S_104_alibi_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_128_S_104_alibi_tma_ws_sm90_kernel", 180480, 384, 64, false, true, true, 0, true, false},
+{ DATA_TYPE_E4M3, 0, 104, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_128_S_104_alibi_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_128_S_104_alibi_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_128_S_104_causal_alibi_tma_ws_sm90_kernel", 180480, 384, 64, false, true, true, 1, true, false},
+{ DATA_TYPE_E4M3, 0, 104, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_128_S_104_alibi_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_128_S_104_alibi_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_128_S_104_sliding_window_causal_alibi_tma_ws_sm90_kernel", 180480, 384, 64, false, true, true, 2, true, false},
+{ DATA_TYPE_E4M3, 0, 128, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_128_S_128_alibi_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_128_S_128_alibi_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_128_S_128_alibi_tma_ws_sm90_kernel", 180480, 384, 64, false, true, true, 0, true, false},
+{ DATA_TYPE_E4M3, 0, 128, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_128_S_128_alibi_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_128_S_128_alibi_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_128_S_128_causal_alibi_tma_ws_sm90_kernel", 180480, 384, 64, false, true, true, 1, true, false},
+{ DATA_TYPE_E4M3, 0, 128, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_128_S_128_alibi_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_128_S_128_alibi_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_128_S_128_sliding_window_causal_alibi_tma_ws_sm90_kernel", 180480, 384, 64, false, true, true, 2, true, false},
+{ DATA_TYPE_E4M3, 0, 160, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_64_S_160_alibi_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_64_S_160_alibi_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_64_S_160_alibi_tma_ws_sm90_kernel", 131328, 384, 64, false, true, true, 0, true, false},
+{ DATA_TYPE_E4M3, 0, 160, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_64_S_160_alibi_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_64_S_160_alibi_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_64_S_160_causal_alibi_tma_ws_sm90_kernel", 131328, 384, 64, false, true, true, 1, true, false},
+{ DATA_TYPE_E4M3, 0, 160, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_64_S_160_alibi_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_64_S_160_alibi_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_64_S_160_sliding_window_causal_alibi_tma_ws_sm90_kernel", 131328, 384, 64, false, true, true, 2, true, false},
+{ DATA_TYPE_E4M3, 0, 256, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_64_S_256_alibi_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_64_S_256_alibi_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_64_S_256_alibi_tma_ws_sm90_kernel", 131328, 384, 64, false, true, true, 0, true, false},
+{ DATA_TYPE_E4M3, 0, 256, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_64_S_256_alibi_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_64_S_256_alibi_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_64_S_256_causal_alibi_tma_ws_sm90_kernel", 131328, 384, 64, false, true, true, 1, true, false},
+{ DATA_TYPE_E4M3, 0, 256, kSM_90,  cubin_fmha_v2_flash_attention_e4m3_64_64_S_256_alibi_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_64_64_S_256_alibi_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_e4m3_64_64_S_256_sliding_window_causal_alibi_tma_ws_sm90_kernel", 131328, 384, 64, false, true, true, 2, true, false}
 };
 
 // clang-format on

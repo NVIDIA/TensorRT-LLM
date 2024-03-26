@@ -25,6 +25,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.llama.weight import load_from_hf_checkpoint
 from tensorrt_llm.models.modeling_utils import PretrainedConfig
+from tensorrt_llm.quantization import QuantAlgo
 
 try:
     from transformers import MixtralForCausalLM
@@ -1075,34 +1076,34 @@ if __name__ == '__main__':
 
     if args.use_weight_only:
         if args.weight_only_precision == 'int8':
-            config['quantization']['quant_algo'] = 'W8A16'
+            config['quantization']['quant_algo'] = QuantAlgo.W8A16
         elif args.weight_only_precision == 'int4':
-            config['quantization']['quant_algo'] = 'W4A16'
+            config['quantization']['quant_algo'] = QuantAlgo.W4A16
     elif args.smoothquant:
         if args.per_channel:
             if args.per_token:
                 config['quantization'][
-                    'quant_algo'] = 'W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN'
+                    'quant_algo'] = QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
             else:
                 config['quantization'][
-                    'quant_algo'] = 'W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN'
+                    'quant_algo'] = QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN
         else:
             if args.per_token:
                 config['quantization'][
-                    'quant_algo'] = 'W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN'
+                    'quant_algo'] = QuantAlgo.W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN
             else:
                 config['quantization'][
-                    'quant_algo'] = 'W8A8_SQ_PER_TENSOR_PLUGIN'
+                    'quant_algo'] = QuantAlgo.W8A8_SQ_PER_TENSOR_PLUGIN
 
     if args.int8_kv_cache:
-        config['quantization']['kv_cache_quant_algo'] = 'INT8'
+        config['quantization']['kv_cache_quant_algo'] = QuantAlgo.INT8
 
     if args.weight_only_precision == 'int4_gptq':
         config['quantization'].update({
             "group_size": args.group_size,
             "has_zero_point": True,
             "pre_quant_scale": False,
-            'quant_algo': 'W4A16_GPTQ'
+            'quant_algo': QuantAlgo.W4A16_GPTQ
         })
 
     with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:

@@ -45,7 +45,8 @@ set(PLUGIN_LISTS
     lookupPlugin
     loraPlugin
     mixtureOfExperts
-    selectiveScanPlugin)
+    selectiveScanPlugin
+    mambaConv1dPlugin)
 
 foreach(PLUGIN_ITER ${PLUGIN_LISTS})
   include_directories(${PLUGIN_ITER})

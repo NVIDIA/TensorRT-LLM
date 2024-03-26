@@ -325,6 +325,8 @@ class ModelConfig:
     mamba_d_state: int = 0
     mamba_d_conv: int = 0
     mamba_expand: int = 0
+    paged_state: bool = True
+    mamba_conv1d_plugin: bool = True
 
 
 @dataclass
@@ -727,6 +729,10 @@ class GenerationSession(object):
         return self._model_config.gpt_attention_plugin
 
     @property
+    def use_mamba_conv1d_plugin(self):
+        return self._model_config.mamba_conv1d_plugin
+
+    @property
     def paged_kv_cache(self):
         return self._model_config.paged_kv_cache
 
@@ -842,6 +848,10 @@ class GenerationSession(object):
         CUASSERT(
             cudart.cudaGraphUpload(
                 self.runtime.cuda_graph_instances[instance_idx], stream))
+
+    @property
+    def paged_state(self):
+        return self._model_config.paged_state
 
     def __setup_decoder(self, input_ids: torch.Tensor,
                         sampling_config: SamplingConfig,
@@ -3238,24 +3248,36 @@ class MambaLMHeadModelGenerationSession(GenerationSession):
         expected_tensor_names += ['input_ids']
         expected_tensor_names += ['logits']
         expected_tensor_names += ['host_request_types']
+        expected_tensor_names += ['host_context_lengths']
         expected_tensor_names += ['last_token_ids']
 
-        expected_tensor_names += [
-            f'past_conv_state_{i}'
-            for i in range(self.first_layer, self.last_layer)
-        ]
-        expected_tensor_names += [
-            f'present_conv_state_{i}'
-            for i in range(self.first_layer, self.last_layer)
-        ]
-        expected_tensor_names += [
-            f'past_ssm_state_{i}'
-            for i in range(self.first_layer, self.last_layer)
-        ]
-        expected_tensor_names += [
-            f'present_ssm_state_{i}'
-            for i in range(self.first_layer, self.last_layer)
-        ]
+        if self.paged_state:
+            expected_tensor_names += [
+                f'conv_state_ptr_{i}'
+                for i in range(self.first_layer, self.last_layer)
+            ]
+            expected_tensor_names += [
+                f'ssm_state_ptr_{i}'
+                for i in range(self.first_layer, self.last_layer)
+            ]
+            expected_tensor_names += ['slot_mapping']
+        else:
+            expected_tensor_names += [
+                f'past_conv_state_{i}'
+                for i in range(self.first_layer, self.last_layer)
+            ]
+            expected_tensor_names += [
+                f'present_conv_state_{i}'
+                for i in range(self.first_layer, self.last_layer)
+            ]
+            expected_tensor_names += [
+                f'past_ssm_state_{i}'
+                for i in range(self.first_layer, self.last_layer)
+            ]
+            expected_tensor_names += [
+                f'present_ssm_state_{i}'
+                for i in range(self.first_layer, self.last_layer)
+            ]
 
         if self.mapping.tp_size > 1 and model_config.use_custom_all_reduce:
             expected_tensor_names += ['all_reduce_workspace']
@@ -3266,6 +3288,9 @@ class MambaLMHeadModelGenerationSession(GenerationSession):
         ]
         if not self.debug_mode and set(expected_tensor_names) != set(
                 found_tensor_names):
+            logger.error(
+                f'self.remove_input_padding={self.remove_input_padding}, self.paged_state={self.paged_state}'
+            )
             logger.error(
                 f"The following expected tensors are not found: {set(expected_tensor_names).difference(set(found_tensor_names))}"
             )
@@ -3324,11 +3349,18 @@ class MambaLMHeadModelGenerationSession(GenerationSession):
             dtype=self._tensor_dtype('logits'),
             device=self.device)
 
-        conv_state_shape = (
-            batch_size,
-            self.mamba_d_inner,
-            self.mamba_d_conv - 1,
-        )
+        if self.use_mamba_conv1d_plugin:
+            conv_state_shape = (
+                batch_size,
+                self.mamba_d_conv - 1,
+                self.mamba_d_inner,
+            )
+        else:
+            conv_state_shape = (
+                batch_size,
+                self.mamba_d_inner,
+                self.mamba_d_conv - 1,
+            )
 
         ssm_state_shape = (
             batch_size,
@@ -3339,13 +3371,24 @@ class MambaLMHeadModelGenerationSession(GenerationSession):
         for i in range(self.first_layer, self.last_layer):
             # we need two set of kv cache buffers, one for inputs, and the other for outputs.
             # They will take turns to act as input and output buffers.
-            dtype = self._tensor_dtype(f'present_conv_state_{i}')
+            dtype = self.dtype
             self.buffer[f'present_conv_state_{i}'] = torch.empty(
                 conv_state_shape, dtype=dtype, device=self.device)
             self.buffer[f'1_present_conv_state_{i}'] = torch.empty(
                 conv_state_shape, dtype=dtype, device=self.device)
             self.buffer[f'present_ssm_state_{i}'] = torch.empty(
-                ssm_state_shape, dtype=dtype, device=self.device)
+                ssm_state_shape, dtype=torch.float32, device=self.device)
+            if self.paged_state:
+                conv_state_ptr = torch.tensor(
+                    [self.buffer[f'present_conv_state_{i}'].data_ptr()],
+                    dtype=torch.int64,
+                    device='cpu')
+                ssm_state_ptr = torch.tensor(
+                    [self.buffer[f'present_ssm_state_{i}'].data_ptr()],
+                    dtype=torch.int64,
+                    device='cpu')
+                self.buffer[f'conv_state_ptr_{i}'] = conv_state_ptr
+                self.buffer[f'ssm_state_ptr_{i}'] = ssm_state_ptr
 
         self.buffer_allocated = True
 
@@ -3380,26 +3423,45 @@ class MambaLMHeadModelGenerationSession(GenerationSession):
         add_tensor(last_token_ids, 'last_token_ids')
 
         batch_size = context_lengths.shape[0]
-        conv_state_shape = (batch_size, self.mamba_d_inner,
-                            self.mamba_d_conv - 1)
         for idx in range(self.first_layer, self.last_layer):
-            # conv state
-            dtype = self._tensor_dtype(f'present_conv_state_{idx}')
-            conv_state = torch.zeros(conv_state_shape,
-                                     dtype=dtype,
-                                     device=self.device)
-            add_tensor(conv_state, f'past_conv_state_{idx}')
-            present = f'present_conv_state_{idx}'
-            add_tensor(self.buffer[present], present)
-            # ssm state
-            ssm_state = self.buffer[f'present_ssm_state_{idx}']
-            add_tensor(ssm_state, f'past_ssm_state_{idx}')
-            add_tensor(ssm_state, f'present_ssm_state_{idx}')
+            if self.paged_state:
+                add_tensor(self.buffer[f'conv_state_ptr_{idx}'],
+                           f'conv_state_ptr_{idx}')
+                add_tensor(self.buffer[f'ssm_state_ptr_{idx}'],
+                           f'ssm_state_ptr_{idx}')
+            else:
+                # conv state
+                dtype = self._tensor_dtype(f'present_conv_state_{idx}')
+                if self.use_mamba_conv1d_plugin:
+                    conv_state_shape = (batch_size, self.mamba_d_conv - 1,
+                                        self.mamba_d_inner)
+                else:
+                    conv_state_shape = (batch_size, self.mamba_d_inner,
+                                        self.mamba_d_conv - 1)
+
+                conv_state = torch.zeros(conv_state_shape,
+                                         dtype=dtype,
+                                         device=self.device)
+                add_tensor(conv_state, f'past_conv_state_{idx}')
+                present = f'present_conv_state_{idx}'
+                add_tensor(self.buffer[present], present)
+                # ssm state
+                ssm_state = self.buffer[f'present_ssm_state_{idx}']
+                add_tensor(ssm_state, f'past_ssm_state_{idx}')
+                add_tensor(ssm_state, f'present_ssm_state_{idx}')
 
         # context request
         host_request_types = torch.zeros_like(context_lengths,
                                               device='cpu').int()
         add_tensor(host_request_types, 'host_request_types')
+        add_tensor(host_context_lengths, 'host_context_lengths')
+
+        if self.paged_state:
+            slot_mapping = torch.arange(0,
+                                        batch_size,
+                                        device='cuda',
+                                        dtype=torch.int32)
+            add_tensor(slot_mapping, 'slot_mapping')
 
         # all reduce
         if self.use_custom_all_reduce and self.mapping.tp_size > 1:
@@ -3440,34 +3502,57 @@ class MambaLMHeadModelGenerationSession(GenerationSession):
             return tensors.update(
                 {name: RuntimeTensor.from_torch(name, x, override_shape=shape)})
 
-        input_ids_shape = (batch_size * beam_width, 1)
+        if self.remove_input_padding:
+            input_ids_shape = (batch_size * beam_width, )
+        else:
+            input_ids_shape = (batch_size * beam_width, 1)
         add_tensor_with_shape(self.new_tokens, 'input_ids', input_ids_shape)
         add_tensor(self.buffer['logits'], 'logits')
         add_tensor(last_token_ids, 'last_token_ids')
 
         for idx in range(self.first_layer, self.last_layer):
-            # conv state
-            if step % 2:
-                add_tensor(self.buffer[f'1_present_conv_state_{idx}'],
-                           f'past_conv_state_{idx}')
-                add_tensor(
-                    self.buffer[f'present_conv_state_{idx}'],
-                    f'present_conv_state_{idx}',
-                )
+            if self.paged_state:
+                add_tensor(self.buffer[f'conv_state_ptr_{idx}'],
+                           f'conv_state_ptr_{idx}')
+                add_tensor(self.buffer[f'ssm_state_ptr_{idx}'],
+                           f'ssm_state_ptr_{idx}')
             else:
-                add_tensor(self.buffer[f'present_conv_state_{idx}'],
-                           f'past_conv_state_{idx}')
-                add_tensor(self.buffer[f'1_present_conv_state_{idx}'],
-                           f'present_conv_state_{idx}')
-            # ssm state
-            ssm_state = self.buffer[f'present_ssm_state_{idx}']
-            add_tensor(ssm_state, f'past_ssm_state_{idx}')
-            add_tensor(ssm_state, f'present_ssm_state_{idx}')
+                # conv state
+                if self.use_mamba_conv1d_plugin:
+                    conv_state_shape = (batch_size, self.mamba_d_conv - 1,
+                                        self.mamba_d_inner)
+                else:
+                    conv_state_shape = (batch_size, self.mamba_d_inner,
+                                        self.mamba_d_conv - 1)
+                if step % 2:
+                    add_tensor_with_shape(
+                        self.buffer[f'1_present_conv_state_{idx}'],
+                        f'past_conv_state_{idx}', conv_state_shape)
+                    add_tensor(self.buffer[f'present_conv_state_{idx}'],
+                               f'present_conv_state_{idx}')
+                else:
+                    add_tensor_with_shape(
+                        self.buffer[f'present_conv_state_{idx}'],
+                        f'past_conv_state_{idx}', conv_state_shape)
+                    add_tensor(self.buffer[f'1_present_conv_state_{idx}'],
+                               f'present_conv_state_{idx}')
+                # ssm state
+                ssm_state = self.buffer[f'present_ssm_state_{idx}']
+                add_tensor(ssm_state, f'past_ssm_state_{idx}')
+                add_tensor(ssm_state, f'present_ssm_state_{idx}')
 
         # generation requests
         host_request_types = torch.ones_like(context_lengths,
                                              device='cpu').int()
         add_tensor(host_request_types, 'host_request_types')
+        add_tensor(host_context_lengths, 'host_context_lengths')
+
+        if self.paged_state:
+            slot_mapping = torch.arange(0,
+                                        batch_size,
+                                        device='cuda',
+                                        dtype=torch.int32)
+            add_tensor(slot_mapping, 'slot_mapping')
 
         # all reduce
         if self.use_custom_all_reduce and self.mapping.tp_size > 1:
@@ -3480,6 +3565,8 @@ class MambaLMHeadModelGenerationSession(GenerationSession):
                                 remove_input_padding, **kwargs):
 
         last_token_ids = context_lengths.detach().clone()
+        if remove_input_padding:
+            last_token_ids = torch.cumsum(last_token_ids, dim=0).int()
         ret = {'last_token_ids': last_token_ids}
         return ret
 
@@ -3487,6 +3574,8 @@ class MambaLMHeadModelGenerationSession(GenerationSession):
                                    use_gpt_attention_plugin,
                                    remove_input_padding, **kwargs):
         last_token_ids = torch.ones_like(context_lengths)
+        if remove_input_padding:
+            last_token_ids = torch.cumsum(last_token_ids, dim=0).int()
         ret = {'last_token_ids': last_token_ids}
         return ret
 

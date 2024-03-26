@@ -30,7 +30,8 @@ from polygraphy.backend.trt import CreateConfig, EngineFromNetwork
 import tensorrt_llm as tllm
 from tensorrt_llm import Mapping, Tensor
 from tensorrt_llm._ipc_utils import peer_access
-from tensorrt_llm.functional import AllReduceStrategy, allreduce
+from tensorrt_llm.functional import (AllReduceConfig, AllReduceStrategy,
+                                     allreduce)
 from tensorrt_llm.plugin.plugin import current_all_reduce_helper
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -56,14 +57,21 @@ class TestCommunicationPlugin(unittest.TestCase):
 
     @parameterized.expand(list(
         product(["bfloat16", 'float16', "float32"], [
-            AllReduceStrategy.RING, AllReduceStrategy.ONESHOT,
+            AllReduceStrategy.NCCL, AllReduceStrategy.ONESHOT,
             AllReduceStrategy.TWOSHOT
+        ], [
+            AllReduceConfig(0),
+            AllReduceConfig.PUSH_MODE,
+            AllReduceConfig.USE_MEMCPY,
         ], [64 * 70000, 64 * 70, 64])),
                           name_func=unittest_name_func)
-    def test_nccl_allreduce(self, dtype: str, strategy: AllReduceStrategy,
-                            size: int):
+    def test_allreduce(self, dtype: str, strategy: AllReduceStrategy,
+                       config: AllReduceConfig, size: int):
         if self.world_size == 1:
             pytest.skip("Skip single GPU NCCL")
+
+        if strategy == AllReduceStrategy.NCCL and config != AllReduceConfig(0):
+            pytest.skip("NCCL with specific config discarded")
 
         workspace = None
 
@@ -98,7 +106,7 @@ class TestCommunicationPlugin(unittest.TestCase):
                 current = x
                 for i in range(inner_loop):
                     current = allreduce(current, self.mapping.tp_group,
-                                        strategy)
+                                        strategy, config)
                 output = current.trt_tensor
 
                 output.name = 'output'

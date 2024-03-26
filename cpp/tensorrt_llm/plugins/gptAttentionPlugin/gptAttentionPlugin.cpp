@@ -47,13 +47,13 @@ GPTAttentionPlugin::GPTAttentionPlugin(int layer_idx, int num_heads, int num_kv_
     int kv_cache_quant_mode, bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type,
     bool paged_kv_cache, int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length,
     bool qkv_bias_enabled, bool cross_attention, int max_distance, bool pos_shift_enabled, bool dense_context_fmha,
-    bool use_paged_context_fmha, bool use_cache, bool is_medusa_enabled)
+    bool use_paged_context_fmha, bool use_fp8_context_fmha, bool use_cache, bool is_medusa_enabled)
     : GPTAttentionPluginCommon(layer_idx, num_heads, num_kv_heads, head_size, unidirectional, q_scaling,
         position_embedding_type, rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale_type,
         rotary_embedding_scale, rotary_embedding_max_positions, tp_size, tp_rank, unfuse_qkv_gemm, context_fmha_type,
         multi_block_mode, enable_xqa, kv_cache_quant_mode, remove_input_padding, mask_type, paged_kv_cache,
         tokens_per_block, type, max_context_length, qkv_bias_enabled, cross_attention, max_distance, pos_shift_enabled,
-        dense_context_fmha, use_paged_context_fmha, use_cache, is_medusa_enabled)
+        dense_context_fmha, use_paged_context_fmha, use_fp8_context_fmha, use_cache, is_medusa_enabled)
 {
     initEntryIdx();
 }
@@ -83,6 +83,7 @@ bool GPTAttentionPlugin::isEntryUsed(IdxEntry const& entry) const
     case IdxEntry::PAST_KEY_VALUE: return useKVCache() && !mPagedKVCache;
     case IdxEntry::KV_CACHE_QUANTIZATION_SCALE: return useKVCache() && mKVCacheQuantMode.hasKvCacheQuant();
     case IdxEntry::KV_CACHE_DEQUANTIZATION_SCALE: return useKVCache() && mKVCacheQuantMode.hasKvCacheQuant();
+    case IdxEntry::ATTENTION_OUTPUT_QUANTIZATION_SCALE: return mFP8ContextFMHA && mKVCacheQuantMode.hasFp8Qdq();
     case IdxEntry::ALIBI_SLOPES: return isALiBi();
     case IdxEntry::RELATIVE_ATTENTION_BIAS: return isRelativePosition();
     case IdxEntry::CROSS_QKV: return isCrossAttention();
@@ -186,6 +187,10 @@ bool GPTAttentionPlugin::supportsFormatCombination(
         // kv_scale for mType->int8/fp8 and int8/fp8->mType conversion
         return inOut[pos].type == nvinfer1::DataType::kFLOAT && inOut[pos].format == TensorFormat::kLINEAR;
     }
+    else if (mFP8ContextFMHA && pos == getIdx(IdxEntry::ATTENTION_OUTPUT_QUANTIZATION_SCALE))
+    {
+        return inOut[pos].type == nvinfer1::DataType::kFLOAT && inOut[pos].format == TensorFormat::kLINEAR;
+    }
     else if (mPagedKVCache
         && (pos == getIdx(IdxEntry::KV_CACHE_BLOCK_POINTERS) || pos == getIdx(IdxEntry::HOST_KV_CACHE_BLOCK_POINTERS)))
     {
@@ -212,6 +217,11 @@ bool GPTAttentionPlugin::supportsFormatCombination(
         && (pos == getIdx(IdxEntry::CROSS_QKV_LENGTH) || pos == getIdx(IdxEntry::ENCODER_INPUT_LENGTH)))
     {
         return inOut[pos].type == nvinfer1::DataType::kINT32;
+    }
+    else if (pos == nbInputs && mFP8ContextFMHA)
+    {
+        // Output tensor now supports fp8 data type.
+        return (inOut[pos].type == nvinfer1::DataType::kFP8) && (inOut[pos].format == TensorFormat::kLINEAR);
     }
     else
     {
@@ -247,6 +257,7 @@ void GPTAttentionPlugin::configurePluginImpl(nvinfer1::DynamicPluginTensorDesc c
         /*context_lengths=*/nullptr,
         /*kv_scale_orig_quant=*/nullptr,
         /*kv_scale_quant_orig=*/nullptr,
+        /*attention_out_orig_quant=*/nullptr,
         /*alibi_slopes=*/nullptr,
         /*context_buf_=*/nullptr,
         /*key_value_cache=*/nullptr,
@@ -498,6 +509,14 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         kv_scale_quant_orig = reinterpret_cast<float const*>(inputs[getIdx(IdxEntry::KV_CACHE_DEQUANTIZATION_SCALE)]);
     }
 
+    float const* attention_output_orig_quant = nullptr;
+    if (mFP8ContextFMHA)
+    {
+        assert(inputDesc[getIdx(IdxEntry::ATTENTION_OUTPUT_QUANTIZATION_SCALE)].type == nvinfer1::DataType::kFLOAT);
+        attention_output_orig_quant
+            = reinterpret_cast<float const*>(inputs[getIdx(IdxEntry::ATTENTION_OUTPUT_QUANTIZATION_SCALE)]);
+    }
+
     int max_blocks_per_sequence = 0;
     void* block_pointers = nullptr;
     void* host_block_pointers = nullptr;
@@ -584,9 +603,9 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
 
         EnqueueContextParams<T, KVCacheBuffer> enqueue_params{attention_input, qkv_bias, max_context_q_len,
             max_context_kv_len, max_attention_window_size, cyclic_attention_window_size, sink_token_length,
-            context_q_lengths, sequence_kv_length, kv_scale_orig_quant, kv_scale_quant_orig, alibi_slopes, context_buf_,
-            key_value_cache, block_pointers, host_block_pointers, batch_size, localNbTokens, max_blocks_per_sequence,
-            workspace};
+            context_q_lengths, sequence_kv_length, kv_scale_orig_quant, kv_scale_quant_orig,
+            attention_output_orig_quant, alibi_slopes, context_buf_, key_value_cache, block_pointers,
+            host_block_pointers, batch_size, localNbTokens, max_blocks_per_sequence, workspace};
         if (isRelativePosition())
         {
             enqueue_params.relative_attention_bias
@@ -627,9 +646,9 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         TLLM_CHECK_WITH_INFO(input_seq_length == num_medusa_tokens + 1, "The generation input length is not expected.");
         EnqueueGenerationParams<T, KVCacheBuffer> enqueue_params{attention_input, qkv_bias, input_seq_length,
             sequence_kv_length, max_context_kv_len, beamWidth, context_q_lengths, kv_scale_orig_quant,
-            kv_scale_quant_orig, alibi_slopes, context_buf_, key_value_cache, block_pointers, max_attention_window_size,
-            cyclic_attention_window_size, sink_token_length, num_requests, max_blocks_per_sequence, cache_indir,
-            workspace, max_context_kv_len_list};
+            kv_scale_quant_orig, attention_output_orig_quant, alibi_slopes, context_buf_, key_value_cache,
+            block_pointers, max_attention_window_size, cyclic_attention_window_size, sink_token_length, num_requests,
+            max_blocks_per_sequence, cache_indir, workspace, max_context_kv_len_list};
         enqueue_params.host_context_lengths = host_context_lengths;
         if (isRelativePosition())
         {
@@ -699,7 +718,8 @@ nvinfer1::DataType GPTAttentionPlugin::getOutputDataType(
     TLLM_CHECK(index == 0 || (!mPagedKVCache && index == 1));
     if (index == 0)
     {
-        return inputTypes[getIdx(IdxEntry::QKV_TENSOR)];
+        return mFP8ContextFMHA && mEnableContextFMHA ? nvinfer1::DataType::kFP8
+                                                     : inputTypes[getIdx(IdxEntry::QKV_TENSOR)];
     }
     else
     {
@@ -794,6 +814,7 @@ IPluginV2* GPTAttentionPluginCreator::createPlugin(char const* name, PluginField
             static_cast<bool>(p.getScalar<int8_t>("pos_shift_enabled").value()),
             static_cast<bool>(p.getScalar<int8_t>("dense_context_fmha").value()),
             static_cast<bool>(p.getScalar<int8_t>("use_paged_context_fmha").value()),
+            static_cast<bool>(p.getScalar<int8_t>("use_fp8_context_fmha").value()),
             static_cast<bool>(p.getScalar<int32_t>("use_cache").value()),
             static_cast<bool>(p.getScalar<int8_t>("is_medusa_enabled").value()));
         obj->setPluginNamespace(mNamespace.c_str());

@@ -18,7 +18,6 @@ from typing import Optional
 from .lora_manager import LoraBuildConfig
 from .mapping import Mapping
 from .plugin.plugin import PluginConfig
-from .quantization.mode import QuantMode
 
 
 class TopModelMixin:
@@ -29,24 +28,31 @@ class TopModelMixin:
     '''
 
     def __init__(self) -> None:
-        super().__init__()
-        self._trt_engine = None
-        self._builder_config = None
+        pass
 
     @classmethod
     def from_hugging_face(cls,
                           hf_model_dir: str,
                           dtype: Optional[str] = 'float16',
                           mapping: Optional[Mapping] = None,
-                          quant_mode: Optional[QuantMode] = None,
                           **kwargs):
         '''
-        Create and object and load weights from hugging face
+        Create LLM object and load weights from hugging face
         Parameters:
             hf_model_dir: the hugging face model directory
             dtype: str, the default weights data type when loading from the hugging face model
             mapping: Mapping, specify the multi-gpu parallel strategy, when it's None, single GPU is used
-            quant_mode: QuantMode the quantization algorithm to be used, when it's None, no quantization is done
+        '''
+        raise NotImplementedError("Subclass shall override this")
+
+    @classmethod
+    def convert_hf_checkpoint(cls,
+                              hf_model_dir: str,
+                              dtype: Optional[str] = "float16",
+                              output_dir: Optional[str] = None,
+                              **kwargs):
+        '''
+        Convert Huggingface checkpoint to TRT-LLM checkpoint
         '''
         raise NotImplementedError("Subclass shall override this")
 

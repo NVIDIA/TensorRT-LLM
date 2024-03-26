@@ -522,6 +522,7 @@ class Attention(Module):
                                                      dtype='float32')
         else:
             self.register_parameter('kv_cache_scaling_factor', None)
+
         # The output feature size is therefore (h/tp + 2*kvh/tp) * d, where h is num_heads,
         # d is head_size, kvh is the num_kv_heads and tp is tensor_parallel_size.
         # In ColumnLinear op, the output dim is calculated by (h + 2*kvh) * d / tp,
@@ -760,12 +761,28 @@ class Attention(Module):
                 AttentionMaskType.causal, AttentionMaskType.bidirectional,
                 AttentionMaskType.bidirectionalglm
             ], 'Plugin only support masked MHA.'
+
+            # KV cache scales.
             kv_orig_quant_scale = constant(
                 fp32_array([1.0])
             ) / self.kv_cache_scaling_factor.value if self.quant_mode.has_kv_cache_quant(
             ) else None
             kv_quant_orig_scale = self.kv_cache_scaling_factor.value if self.quant_mode.has_kv_cache_quant(
             ) else None
+
+            # Attention output scales
+            assert (
+                not default_net().plugin_config.use_fp8_context_fmha
+            ) or self.use_fp8_qdq, "FP8 Context FMHA must be used together with the fp8 quantization workflow."
+
+            if self.use_fp8_qdq and default_net(
+            ).plugin_config.use_fp8_context_fmha:
+                # the attention plugin only quantizes the output when fp8 context fmha is enabled.
+                attention_output_orig_quant_scale = constant(
+                    fp32_array([1.0] /
+                               self.dense.activation_scaling_factor.raw_value))
+            else:
+                attention_output_orig_quant_scale = None
 
             context, past_key_value = gpt_attention(
                 qkv=qkv,
@@ -792,6 +809,8 @@ class Attention(Module):
                 position_embedding_type=self.position_embedding_type,
                 kv_orig_quant_scale=kv_orig_quant_scale,
                 kv_quant_orig_scale=kv_quant_orig_scale,
+                attention_output_orig_quant_scale=
+                attention_output_orig_quant_scale,
                 kv_cache_quant_mode=self.quant_mode,
                 max_context_length=attention_params.max_context_length,
                 mask_type=self.attention_mask_type,
@@ -809,9 +828,6 @@ class Attention(Module):
                 if self.relative_attention else None,
                 max_distance=self.max_distance,
                 host_context_lengths=attention_params.host_context_lengths,
-                enable_pos_shift=default_net().plugin_config.pos_shift,
-                dense_context_fmha=default_net(
-                ).plugin_config.dense_context_fmha,
                 use_cache=use_cache,
                 medusa_position_offsets=medusa_position_offsets,
                 medusa_packed_mask=medusa_packed_mask,

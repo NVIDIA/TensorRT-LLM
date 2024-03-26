@@ -10,6 +10,8 @@ import torch
 from transformers import AutoModelForCausalLM
 
 import tensorrt_llm
+from tensorrt_llm._utils import pad_vocab_size
+from tensorrt_llm.quantization import QuantAlgo
 
 
 def parse_arguments():
@@ -113,6 +115,30 @@ def split_qkv_bias_tp(v, n_head, n_hidden, tensor_parallel, rank):
 
 def split_matrix_tp(v, tensor_parallel, rank, dim):
     return split(v, tensor_parallel, rank, dim=dim)
+
+
+def split_embedding(
+    param: torch.Tensor,
+    tp_size: int,
+    tp_rank: int,
+    use_parallel_embedding: bool = False,
+    sharding_dim: int = 0,
+) -> torch.Tensor:
+    if param is None:
+        return None
+    if not use_parallel_embedding:
+        return param
+
+    vocab_size, hidden_size = param.size()
+    if sharding_dim == 0:
+        if vocab_size % tp_size != 0:
+            vocab_size_padded = pad_vocab_size(vocab_size, tp_size)
+            pad_width = vocab_size_padded - vocab_size
+            param = torch.nn.functional.pad(param, (0, 0, 0, pad_width),
+                                            value=0)
+        else:
+            assert hidden_size % tp_size == 0
+    return split(param, tp_size, tp_rank, dim=sharding_dim)
 
 
 def get_weight(config, prefix, dtype):
@@ -248,15 +274,20 @@ def convert_hf_opt(hf_model,
                                                     rank,
                                                     dim=0)
 
-    if not use_parallel_embedding:
-        weights['transformer.vocab_embedding.weight'] = embed_w
-    else:
-        assert hf_model.config.vocab_size % tensor_parallel == 0
-        weights['transformer.vocab_embedding.weight'] = split_matrix_tp(
-            embed_w, tensor_parallel, rank, dim=sharding_dim)
+    weights['transformer.vocab_embedding.weight'] = split_embedding(
+        embed_w,
+        tp_size=tensor_parallel,
+        tp_rank=rank,
+        use_parallel_embedding=use_parallel_embedding,
+        sharding_dim=sharding_dim)
 
     embed_p = get_weight(model_params, 'model.decoder.embed_positions', dtype)
-    weights['transformer.position_embedding.weight'] = embed_p[2:, :]
+    weights['transformer.position_embedding.weight'] = split_embedding(
+        embed_p[2:, :],
+        tp_size=tensor_parallel,
+        tp_rank=rank,
+        use_parallel_embedding=use_parallel_embedding,
+        sharding_dim=sharding_dim)
 
     if do_layer_norm_before:
         ln_f_w, ln_f_b = get_weight_and_bias(model_params,
@@ -298,10 +329,10 @@ if __name__ == '__main__':
     plugin_weight_only_quant_type = None
     if args.use_weight_only and args.weight_only_precision == 'int8':
         plugin_weight_only_quant_type = torch.int8
-        quant_algo = "W8A16"
+        quant_algo = QuantAlgo.W8A16
     elif args.use_weight_only and args.weight_only_precision == 'int4':
         plugin_weight_only_quant_type = torch.quint4x2
-        quant_algo = "W4A16"
+        quant_algo = QuantAlgo.W4A16
 
     config = {
         'architecture': hf_config.architectures[0],

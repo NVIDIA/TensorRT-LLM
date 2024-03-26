@@ -109,17 +109,10 @@ class OPTModel(Module):
     def __init__(self, config: PretrainedConfig):
         super().__init__()
         self.do_layer_norm_before = config.do_layer_norm_before
-        mapping = config.mapping
 
-        self.vocab_embedding = Embedding(
-            config.vocab_size,
-            config.hidden_size,
-            dtype=config.dtype,
-            tp_size=mapping.tp_size if config.use_parallel_embedding else 1,
-            tp_group=mapping.tp_group
-            if config.use_parallel_embedding else None,
-            sharding_dim=config.embedding_sharding_dim,
-            tp_rank=mapping.tp_rank)
+        self.vocab_embedding = Embedding(config.vocab_size,
+                                         config.hidden_size,
+                                         dtype=config.dtype)
         self.position_embedding = Embedding(config.max_position_embeddings,
                                             config.hidden_size,
                                             dtype=config.dtype)
@@ -171,18 +164,13 @@ class OPTForCausalLM(DecoderModelForCausalLM):
         vocab_size_padded = pad_vocab_size(config.vocab_size,
                                            config.mapping.tp_size)
 
-        share_weight = None
-        if config.share_embedding_table:
-            share_weight = transformer.vocab_embedding.weight
-
         lm_head = ColumnLinear(config.hidden_size,
                                vocab_size_padded,
                                bias=False,
                                dtype=config.dtype,
                                tp_group=config.mapping.tp_group,
                                tp_size=config.mapping.tp_size,
-                               gather_output=True,
-                               share_weight=share_weight)
+                               gather_output=True)
 
         super().__init__(config, transformer, lm_head)
 

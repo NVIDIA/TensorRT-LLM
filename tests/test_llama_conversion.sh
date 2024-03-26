@@ -100,7 +100,7 @@ test_gptq() {
 }
 
 test_lora() {
-    hf_lora_dir=/home/scratch.trt_llm_data/llm-models/llama-models-v2/chinese-llama-2-lora-13b
+    lora_dir=/home/scratch.trt_llm_data/llm-models/llama-models-v2/chinese-llama-2-lora-13b
     python convert_checkpoint.py --model_dir /home/scratch.trt_llm_data/llm-models/llama-models-v2/llama-v2-13b-hf \
                          --output_dir ./tllm_checkpoint/2gpu_lora \
                          --dtype float16 \
@@ -110,7 +110,7 @@ test_lora() {
             --output_dir ./trt_engines/llama-v2-13b-with-lora \
             --gemm_plugin float16 \
             --lora_plugin float16 \
-            --lora_dir ${hf_lora_dir} \
+            --lora_dir ${lora_dir} \
             --max_batch_size 1 \
             --max_input_len 512 \
             --max_output_len 50
@@ -118,7 +118,7 @@ test_lora() {
     mpirun -n 2 --allow-run-as-root \
     python ../run.py --engine_dir ./trt_engines/llama-v2-13b-with-lora \
               --max_output_len 50 \
-              --tokenizer_dir ${hf_lora_dir} \
+              --tokenizer_dir ${lora_dir} \
               --input_text "今天天气很好，我到公园的时候，" \
               --lora_task_uids 0 \
               --no_add_special_tokens \

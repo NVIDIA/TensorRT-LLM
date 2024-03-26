@@ -107,27 +107,14 @@ class BloomModel(Module):
 
     def __init__(self, config: PretrainedConfig):
         super().__init__()
-        dtype = config.dtype
-        tp_group = config.mapping.tp_group
-        tp_size = config.mapping.tp_size
-        tp_rank = config.mapping.tp_rank
-        if config.use_parallel_embedding:
-            self.vocab_embedding = Embedding(
-                config.vocab_size,
-                config.hidden_size,
-                dtype=dtype,
-                tp_group=tp_group,
-                tp_size=tp_size,
-                sharding_dim=config.embedding_sharding_dim,
-                tp_rank=tp_rank)
-        else:
-            self.vocab_embedding = Embedding(config.vocab_size,
-                                             config.hidden_size,
-                                             dtype=dtype)
+        self.vocab_embedding = Embedding(config.vocab_size,
+                                         config.hidden_size,
+                                         dtype=config.dtype)
         self.ln_embed = LayerNorm(normalized_shape=config.hidden_size,
-                                  dtype=dtype)
+                                  dtype=config.dtype)
         self.layers = DecoderLayerList(BloomDecoderLayer, config)
-        self.ln_f = LayerNorm(normalized_shape=config.hidden_size, dtype=dtype)
+        self.ln_f = LayerNorm(normalized_shape=config.hidden_size,
+                              dtype=config.dtype)
 
     def forward(self,
                 input_ids: Tensor,
@@ -166,17 +153,12 @@ class BloomForCausalLM(DecoderModelForCausalLM):
         vocab_size_padded = pad_vocab_size(config.vocab_size,
                                            config.mapping.tp_size)
 
-        share_weight = None
-        if config.share_embedding_table:
-            share_weight = transformer.vocab_embedding.weight
-
         lm_head = ColumnLinear(config.hidden_size,
                                vocab_size_padded,
                                bias=False,
                                dtype=config.dtype,
                                tp_group=config.mapping.tp_group,
                                tp_size=config.mapping.tp_size,
-                               gather_output=True,
-                               share_weight=share_weight)
+                               gather_output=True)
 
         super().__init__(config, transformer, lm_head)

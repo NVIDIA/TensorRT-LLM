@@ -21,10 +21,9 @@ from typing import Dict, List, Optional, Union
 import numpy as np
 import torch
 
-from ..._utils import (numpy_to_torch, pad_vocab_size, str_dtype_to_torch,
-                       torch_to_numpy)
+from ..._utils import (numpy_to_dtype, numpy_to_torch, pad_vocab_size,
+                       str_dtype_to_torch, torch_to_numpy)
 from ...logger import logger
-from ...lora_manager import LoraConfig
 from ...mapping import Mapping
 from ...quantization import QuantMode
 from ..quantized.quant import get_dummy_quant_scales
@@ -493,8 +492,7 @@ def load_from_hf_gemma(tensorrt_llm_llama: 'GemmaForCausalLM',
                        hf_gemma,
                        mapping=Mapping(),
                        dtype='float32',
-                       use_gemm_woq_plugin=True,
-                       lora_config=LoraConfig()):
+                       use_gemm_woq_plugin=True):
     logger.info('Loading weights from HF Gemma...')
     tik = time.time()
 
@@ -542,9 +540,6 @@ def load_from_hf_gemma(tensorrt_llm_llama: 'GemmaForCausalLM',
         else:
             v = torch_to_numpy(v.to(t_dtype).detach().cpu())
         if 'model.embed_tokens.weight' in k:
-            if lora_config.is_valid and lora_config.embedding_weight is not None:
-                v = torch_to_numpy(
-                    lora_config.embedding_weight.to(torch_dtype).detach().cpu())
             if hf_gemma.config.tie_word_embeddings:
                 # lm_head.weight has the same weights as embedding
                 if mapping.is_last_pp_rank():
@@ -575,11 +570,6 @@ def load_from_hf_gemma(tensorrt_llm_llama: 'GemmaForCausalLM',
 
         elif 'lm_head.weight' in k:
             if mapping.is_last_pp_rank():
-                if lora_config.is_valid and lora_config.lm_head_weight is not None:
-                    v = torch_to_numpy(
-                        lora_config.lm_head_weight.to(
-                            torch_dtype).detach().cpu())
-                    vocab_size = v.shape[0]
                 if vocab_size % mapping.tp_size != 0:
                     # padding
                     vocab_size_padded = tensorrt_llm_llama.lm_head.out_features * mapping.tp_size
@@ -770,8 +760,8 @@ def load_from_hf_gemma(tensorrt_llm_llama: 'GemmaForCausalLM',
 def quantize_fp8_weights(weights, num_layers, mapping):
 
     def get_scaling_factor(weight):
-        amax = weight.max()
-        scale = 448.0 / amax
+        scale = torch_to_numpy(448.0 / numpy_to_torch(weight).max()).reshape(
+            [-1])
         return scale
 
     layers_range = mapping.pp_layers(num_layers)
@@ -791,9 +781,13 @@ def quantize_fp8_weights(weights, num_layers, mapping):
             dtype = weights[trt_llm_name].dtype
             scale = get_scaling_factor(weight)
             scaled_weights[trt_llm_name] = np.ascontiguousarray(
-                (weight * scale).astype(dtype))
-            scaling_factors[scale_name] = np.asarray([1 / scale
-                                                      ]).astype(np.float32)
+                numpy_to_dtype(
+                    torch_to_numpy(
+                        numpy_to_torch(weight).to(torch.float32) *
+                        numpy_to_torch(scale).to(torch.float32)), dtype))
+            scaling_factors[scale_name] = torch_to_numpy(
+                (1 / numpy_to_torch(scale)).to(torch.float32))
+
     return scaling_factors
 
 

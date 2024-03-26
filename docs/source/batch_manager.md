@@ -152,6 +152,18 @@ Note: this feature isn't supported with the `V1` batching scheme for the moment.
     - `enableBlockReuse` (default: `false`) allow reuse of previously computed KV cache blocks across requests. This is expected to optimize memory use and computation.
   - `enableTrtOverlap` (default: `false`) when `true`, GptManager partitions available requests into 2 'microbatches' that can be run concurrently to hide exposed CPU runtime. However, it may not give performance benefits when the size of the model is not big enough to overlap the host overhead, or when the number of requests is too small.
   - `enableChunkedContext` (default: `false`) Whether to enable context chunking. Context chunking increases the possibility of batching the context and generation phases, which in turn improves performance. When set to `false`, it indicates that the context chunk is disabled.
+  - `peftCacheManagerConfig` (currently only supports LoRA, and requires `--use_lora_plugin` during engine build)
+    - `numHostModuleLayer` (default: 0) number of adapter_size 1 single module single layer LoRA weight rows the host cache can hold.  Overrides `hostCacheSize` if non-zero.
+    - `numDeviceModuleLayer` (default: 0) number of adapter_size 1 single module single layer LoRA weight rows the device cache can hold.  Overrides `deviceCachePercent` if non-zero.
+    - `optimalAdapterSize` (default: 8) Used to size cache pages. Typically optimally sized adapters will fix exactly into 1 cache page.
+    - `maxAdapterSize` (default: 64) Used to set the minimum size of a cache page.  Pages must be at least large enough to fit a single module, single later adapter_size `maxAdapterSize` row of weights.
+    - `numPutWorkers` (default: 1) Number of CPU workers used to put weights into host cache.
+    - `numEnsureWorkers` (default: 1) Number of CPU workers used to ensure all weights needed for the next forward pass are in the GPU cache.
+    - `numCopyStreams` (default: 1) Number of CUDA streams used for H2D copies of cache pages
+    - `maxPagesPerBlockHost` (default: 24) Number of cache pages per host memory allocation
+    - `maxPagesPerBlockDevice` (default: 24) Number of cache pages per device memory allocation
+    - `deviceCachePercent` (default: 0.05) percent of device memory used for PEFT cache after engine load and KV cache allocation
+    - `hostCacheSize` (default: 1G) size in bytes of the host PEFT cache
 
 ### Responses content
 The responses from `SendResponseCallback` are stored in a `std::shared_ptr<Tensor>` list, which contains the following tensors of a specific request:

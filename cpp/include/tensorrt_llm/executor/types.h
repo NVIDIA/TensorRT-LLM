@@ -52,7 +52,9 @@ using IterationType = std::uint64_t;
 using RandomSeedType = std::uint64_t;
 using VecLogProbs = std::vector<FloatType>;
 using StreamPtr = std::shared_ptr<tensorrt_llm::runtime::CudaStream>;
-using LogitsPostProcessor = std::function<Tensor(IdType, Tensor&, BeamTokens const&, StreamPtr&)>;
+using LogitsPostProcessor = std::function<void(IdType, Tensor&, BeamTokens const&, StreamPtr&)>;
+using LogitsPostProcessorMap = std::unordered_map<std::string, LogitsPostProcessor>;
+using MedusaChoices = std::vector<std::vector<SizeType>>;
 
 enum class DataType
 {
@@ -153,15 +155,29 @@ enum class ModelType
     kDECODER_ONLY = 0,
 };
 
+/// @brief The batching type
 enum class BatchingType
 {
+    /// @brief STATIC refers to the traditional batching scheme with a batch of requests running in lockstep until the
+    /// full generation for all of them is complete. Requests in a batch are all padded up to the maximum input and
+    /// output sequence length of any member of the batch.
     kSTATIC = 0,
+
+    /// @brief INFLIGHT refers to a scheme where newly arrived requests are dynamically incorporated into the batch
+    /// under execution, and requests are returned as soon as the end condition is met without any padding.
     kINFLIGHT = 1,
 };
 
+/// @brief The policy used to select the subset of available requests in each iteration of the executor generation loop
 enum class SchedulerPolicy
 {
+    /// @brief MAX_UTILIZATION packs as many requests as the underlying TRT engine can support in any iteration of the
+    /// InflightBatching generation loop. While this is expected to maximize GPU throughput, it might require that some
+    /// requests be paused and restarted depending on peak KV cache memory availability.
     kMAX_UTILIZATION = 0,
+
+    /// @brief GUARANTEED_NO_EVICT uses KV cache more conservatively guaranteeing that a request, once started, will run
+    /// to completion without eviction.
     kGUARANTEED_NO_EVICT = 1,
 };
 
@@ -228,7 +244,7 @@ struct IterationStats
     /// @brief Ending time of this iteration
     std::string timestamp;
     /// @brief Iteration id
-    SizeType iter;
+    IterationType iter;
     /// @brief Number of active requests
     SizeType numActiveRequests;
     /// @brief Number of max active requests

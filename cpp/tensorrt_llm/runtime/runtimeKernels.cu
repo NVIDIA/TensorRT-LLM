@@ -18,6 +18,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
+#include "tensorrt_llm/kernels/parallelDecoding/kvCacheUpdateKernels.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 
 #include <cub/cub.cuh>
@@ -1213,6 +1214,19 @@ void mergeLogitsFragments(BufferManager const& bufferManager, ITensor& output, s
 #endif // ENABLE_FP8
     default: TLLM_CHECK_WITH_INFO(false, "data type not supported");
     }
+}
+
+void invokeUpdateKVBlockArrayDraftTokenLocation(ITensor const& seqAcceptedDraftTokenOffsets,
+    ITensor const& packedAcceptedDraftTokensIndices, ITensor const& pastKeyValueLengths, int64_t* const* pointerArray,
+    SizeType layerCount, SizeType seqCount, SizeType numKVHeads, SizeType sizeInBytesPerKVHead,
+    SizeType rewindDraftTokenCommonCount, int* rewindDraftTokenSeparateAdjustments, ITensor const& seqSlotRemapping,
+    SizeType maxKVCacheLen, SizeType maxBlocksPerSeq, SizeType tokensPerBlock, cudaStream_t stream)
+{
+    tensorrt_llm::kernels::parallel_decoding::updateKVBlockArrayDraftTokenLocation(
+        bufferCast<SizeType>(seqAcceptedDraftTokenOffsets), bufferCast<SizeType>(packedAcceptedDraftTokensIndices),
+        bufferCast<SizeType>(pastKeyValueLengths), pointerArray, layerCount, seqCount, numKVHeads, sizeInBytesPerKVHead,
+        rewindDraftTokenCommonCount, rewindDraftTokenSeparateAdjustments, bufferCast<SizeType>(seqSlotRemapping),
+        maxKVCacheLen, maxBlocksPerSeq, tokensPerBlock, stream);
 }
 
 } // namespace tensorrt_llm::runtime::kernels

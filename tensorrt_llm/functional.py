@@ -15,7 +15,7 @@
 import math
 import weakref
 from collections import OrderedDict
-from enum import IntEnum
+from enum import IntEnum, IntFlag, auto
 from functools import partial
 from typing import List, Optional, Sequence, Tuple, Union
 
@@ -3096,15 +3096,27 @@ class AllReduceStrategy(IntEnum):
     Warning: actual definition is in cpp/tensorrt_llm/kernels/customAllReduceKernels.h
              they must be kept in sync
     """
-    RING = 0
+    NCCL = 0
     ONESHOT = 1
     TWOSHOT = 2
     AUTO = 3
 
 
-def allreduce(tensor: Tensor,
-              group: List[int],
-              strategy: Optional[AllReduceStrategy] = None) -> Tensor:
+class AllReduceConfig(IntFlag):
+    """
+    Warning: actual definition is in cpp/tensorrt_llm/kernels/customAllReduceKernels.h
+             they must be kept in sync
+    """
+    USE_MEMCPY = auto()
+    PUSH_MODE = auto()
+
+
+def allreduce(
+    tensor: Tensor,
+    group: List[int],
+    strategy: Optional[AllReduceStrategy] = None,
+    config: AllReduceConfig = AllReduceConfig(0)
+) -> Tensor:
     '''
     Add an operation that performs a collective all-reduce.
 
@@ -3132,7 +3144,7 @@ def allreduce(tensor: Tensor,
             The ranks participating into the all-reduce operation.
 
         strategy: AllReduceStrategy
-            RING delegates all-reduce to NCCL while ONESHOT and TWOSHOT are custom latency-optimal algorithms.
+            NCCL delegates all-reduce to NCCL while ONESHOT and TWOSHOT are custom latency-optimal algorithms.
             AUTO chooses amongst the three based on a message-size heuristic.
 
     Returns:
@@ -3146,12 +3158,12 @@ def allreduce(tensor: Tensor,
         if default_net().plugin_config.use_custom_all_reduce:
             strategy = AllReduceStrategy.AUTO
         else:
-            strategy = AllReduceStrategy.RING
+            strategy = AllReduceStrategy.NCCL
 
     counter = 0
     workspace = None
 
-    if strategy != AllReduceStrategy.RING:
+    if strategy != AllReduceStrategy.NCCL:
         counter = current_all_reduce_helper().gen_id()
         workspace = current_all_reduce_helper().workspace
 
@@ -3168,6 +3180,9 @@ def allreduce(tensor: Tensor,
     p_strategy = trt.PluginField("strategy", np.array([int(strategy)], np.int8),
                                  trt.PluginFieldType.INT8)
     pfc.append(p_strategy)
+    p_config = trt.PluginField("config", np.array([int(config)], np.int8),
+                               trt.PluginFieldType.INT8)
+    pfc.append(p_config)
     p_counter = trt.PluginField("counter", np.array([counter], np.int32),
                                 trt.PluginFieldType.INT32)
     pfc.append(p_counter)
@@ -3175,7 +3190,7 @@ def allreduce(tensor: Tensor,
     pfc = trt.PluginFieldCollection(pfc)
     ar_plug = allreduce_plg_creator.create_plugin("allreduce", pfc)
     plug_inputs = [tensor.cast(p_dtype).trt_tensor]
-    if strategy != AllReduceStrategy.RING:
+    if strategy != AllReduceStrategy.NCCL:
         plug_inputs.append(workspace.trt_tensor)
 
     layer = default_trtnet().add_plugin_v2(plug_inputs, ar_plug)
@@ -3508,6 +3523,7 @@ def gpt_attention(
     learned_absolute,
     kv_orig_quant_scale: Optional[Tensor] = None,
     kv_quant_orig_scale: Optional[Tensor] = None,
+    attention_output_orig_quant_scale: Optional[Tensor] = None,
     kv_cache_quant_mode: QuantMode = QuantMode(0),
     max_context_length: Optional[int] = None,
     mask_type: AttentionMaskType = AttentionMaskType.causal,
@@ -3523,10 +3539,6 @@ def gpt_attention(
     relative_attention_bias: Optional[Tensor] = None,  # for relative attention
     max_distance: int = 0,  # for relative attention
     host_context_lengths: Optional[Tensor] = None,  # for pad-free input mode
-    enable_pos_shift: Optional[
-        bool] = False,  # for position shift attention mode in streamingllm
-    dense_context_fmha: Optional[
-        bool] = False,  # for dense fmha in context phase
     qkv_bias: Optional[Tensor] = None,
     use_cache: bool = True,
     medusa_position_offsets: Tensor = None,
@@ -3638,6 +3650,10 @@ def gpt_attention(
             INT8/FP8 in the KV cache. Its shape is [1]. See INT8/FP8 KV Cache
             in docs/gpt_attention.md,
 
+        attention_output_orig_quant_scale: Tensor
+            The tensor to store the scaling factor for quantization to FP8
+            in the KV cache. Its shape is [1].
+
         kv_cache_quant_mode: QuantMode (int flags)
             Do we enable the INT8 or FP8 KV cache?
 
@@ -3695,12 +3711,6 @@ def gpt_attention(
 
         host_context_lengths: Tensor = None (On CPU)
             A host tensor that contains the lengths of the different inputs,
-
-        enable_pos_shift: bool = False
-            Do we enable position shift in attention to support streamingllm method,
-
-        dense_context_fmha: bool = False
-            Do we use dense fmha in context phase,
 
         qkv_bias: Tensor = None,
             The qkv bias tensor.
@@ -3825,12 +3835,13 @@ def gpt_attention(
                                          np.array(max_context_length, np.int32),
                                          trt.PluginFieldType.INT32)
     pos_shift_enabled = trt.PluginField(
-        "pos_shift_enabled", np.array(np.int8(enable_pos_shift), dtype=np.int8),
-        trt.PluginFieldType.INT8)
+        "pos_shift_enabled",
+        np.array(np.int8(default_net().plugin_config.streamingllm),
+                 dtype=np.int8), trt.PluginFieldType.INT8)
     dense_context_fmha = trt.PluginField(
         "dense_context_fmha",
-        np.array(np.int8(dense_context_fmha), dtype=np.int8),
-        trt.PluginFieldType.INT8)
+        np.array(np.int8(default_net().plugin_config.streamingllm),
+                 dtype=np.int8), trt.PluginFieldType.INT8)
     if qkv_bias is None:
         qkv_bias_enabled = trt.PluginField("qkv_bias_enabled",
                                            np.array(0, dtype=np.int8),
@@ -3850,6 +3861,10 @@ def gpt_attention(
         "use_paged_context_fmha",
         np.array(np.int8(default_net().plugin_config.use_paged_context_fmha),
                  dtype=np.int8), trt.PluginFieldType.INT8)
+    use_fp8_context_fmha_field = trt.PluginField(
+        "use_fp8_context_fmha",
+        np.array(np.int8(default_net().plugin_config.use_fp8_context_fmha),
+                 dtype=np.int8), trt.PluginFieldType.INT8)
     use_cache_pf = trt.PluginField("use_cache",
                                    np.array([use_cache], dtype=np.int32),
                                    trt.PluginFieldType.INT32)
@@ -3864,7 +3879,7 @@ def gpt_attention(
         paged_kv_cache, tokens_per_block, pf_type, max_context_length,
         qkv_bias_enabled, do_cross_attention_field, max_distance,
         pos_shift_enabled, dense_context_fmha, use_paged_context_fmha_field,
-        use_cache_pf, is_medusa_enabled
+        use_fp8_context_fmha_field, use_cache_pf, is_medusa_enabled
     ])
 
     attn_plug = attn_plg_creator.create_plugin("causal_attn", pfc)
@@ -3898,6 +3913,11 @@ def gpt_attention(
 
     if use_cache and kv_cache_quant_mode.has_kv_cache_quant():
         plug_inputs += [kv_orig_quant_scale, kv_quant_orig_scale]
+
+    if attention_output_orig_quant_scale is not None:
+        assert default_net(
+        ).plugin_config.use_fp8_context_fmha, "FP8 Context FMHA needs to be enabled"
+        plug_inputs += [attention_output_orig_quant_scale]
 
     if alibi_slopes is not None:
         plug_inputs += [alibi_slopes]
@@ -4490,22 +4510,130 @@ def lora_plugin(
         ]
 
 
-def selective_scan(input: Tensor, state: Tensor, delta: Tensor,
-                   delta_bias: Tensor, A: Tensor, B: Tensor, C: Tensor,
-                   D: Tensor, z: Tensor, host_request_types: Tensor,
-                   last_token_ids: Tensor, dim: int, dstate: int,
-                   is_variable_B: bool, is_variable_C: bool,
-                   delta_softplus: bool, dtype: str):
+def mamba_conv1d(input: Tensor,
+                 conv_state_or_ptr: Tensor,
+                 conv_weight: Tensor,
+                 conv_bias: Tensor,
+                 host_request_types: Tensor,
+                 last_token_ids: Tensor,
+                 dim: int,
+                 dconv: int,
+                 dtype: str,
+                 host_context_lengths: Optional[Tensor] = None,
+                 slot_mapping: Optional[Tensor] = None):
+    '''
+    Parameters:
+        input : Tensor (On GPU)
+            The input tensor. Its shape is [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
+
+        conv_state_or_ptr : Tensor (On GPU or CPU)
+            The conv state tensor. Its shape is [batch_size, dconv - 1, dim]
+            Or the CPU tensor of shape [1] for the pointer of paged states.
+
+        conv_weight : Tensor (On GPU)
+            The weight tensor. Its shape is [1, dconv, dim]
+
+        conv_bias : Tensor (On GPU)
+            The bias tensor. Its shape is [dim]
+
+        host_request_types : Tensor (On CPU)
+            The tensor on the host that indicates if a request is in context or
+            generation phase. Its shape is [batch_size]. See Inflight Batching
+            in docs/gpt_attention.md,
+
+        last_token_ids : Tensor (On GPU)
+            The inclusive prefix-sum of the lengths or the lengths of the
+            sequences in the batch.
+
+        dim : int
+            The hidden dimension of conv1d
+
+        dconv : int
+            The window size of conv1d
+
+        dtype: str
+            data type
+
+        host_context_lengths: Tensor (On CPU) (Optional)
+            A host tensor that contains the lengths of the different inputs,
+
+        slot_mapping: Tensor (On GPU) (Optional)
+            Real page index in state. Its shape is [dim], used for paged state, each page shape is [dconv, dim]
+    '''
+    assert host_request_types is not None
+    mamba_conv1d_plg_creator = trt.get_plugin_registry().get_plugin_creator(
+        'MambaConv1d', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert mamba_conv1d_plg_creator is not None
+
+    dim = trt.PluginField("dim", np.array(dim, dtype=np.int32),
+                          trt.PluginFieldType.INT32)
+    dconv = trt.PluginField("dconv", np.array(dconv, dtype=np.int32),
+                            trt.PluginFieldType.INT32)
+    pf_type = trt.PluginField(
+        "type_id", np.array([int(str_dtype_to_trt(dtype))], np.int32),
+        trt.PluginFieldType.INT32)
+    remove_input_padding = trt.PluginField(
+        "remove_input_padding",
+        np.array(np.int8(default_net().plugin_config.remove_input_padding),
+                 dtype=np.int8), trt.PluginFieldType.INT8)
+    paged_state = trt.PluginField(
+        "paged_state",
+        np.array(np.int8(default_net().plugin_config.paged_state),
+                 dtype=np.int8), trt.PluginFieldType.INT8)
+
+    pfc = trt.PluginFieldCollection(
+        [dim, dconv, pf_type, remove_input_padding, paged_state])
+    mamba_conv1d_plug = mamba_conv1d_plg_creator.create_plugin(
+        "mamba_conv1d", pfc)
+    plug_inputs = [
+        input, conv_state_or_ptr, conv_weight, conv_bias, host_request_types,
+        last_token_ids
+    ]
+    if default_net().plugin_config.remove_input_padding:
+        plug_inputs += [host_context_lengths]
+    if default_net().plugin_config.paged_state:
+        plug_inputs += [slot_mapping]
+    plug_inputs = [i.trt_tensor for i in plug_inputs]
+
+    layer = default_trtnet().add_plugin_v2(plug_inputs, mamba_conv1d_plug)
+    _add_plugin_info(layer, mamba_conv1d_plg_creator, "mamba_conv1d", pfc)
+    output = _create_tensor(layer.get_output(0), layer)
+    if default_net().plugin_config.paged_state:
+        return output, None
+    else:
+        present_state = _create_tensor(layer.get_output(1), layer)
+        return output, present_state
+
+
+def selective_scan(input: Tensor,
+                   state_or_ptr: Tensor,
+                   delta: Tensor,
+                   delta_bias: Tensor,
+                   A: Tensor,
+                   BC: Tensor,
+                   D: Tensor,
+                   z: Tensor,
+                   host_request_types: Tensor,
+                   last_token_ids: Tensor,
+                   dim: int,
+                   dstate: int,
+                   dt_rank: int,
+                   is_variable_B: bool,
+                   is_variable_C: bool,
+                   delta_softplus: bool,
+                   dtype: str,
+                   slot_mapping: Optional[Tensor] = None):
     '''
     Parameters:
         input : Tensor (On GPU)
             The input tensor. Its shape is [batch_size, seq_len, dim]
 
-        state : Tensor (On GPU)
+        state_or_ptr : Tensor (On GPU or CPU)
             The ssm state tensor. Its shape is [batch_size, dstate, dim]
+            Or the CPU tensor of shape [1] for the pointer of paged states.
 
         delta : Tensor (On GPU)
-            The delta tensor. Its shape is [batch_size, seq_len, dim]
+            The delta tensor. Its shape is [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
 
         delta_bias : Tensor (On GPU)
             The delta bias tensor. Its shape is [dim]
@@ -4513,32 +4641,32 @@ def selective_scan(input: Tensor, state: Tensor, delta: Tensor,
         A : Tensor (On GPU)
             A matrix. Its shape is [dstate, dim]
 
-        B : Tensor (On GPU)
-            B matrix. Its shape is [batch_size, seq_len, dstate]
-
-        C : Tensor (On GPU)
-            C matrix. Its shape is [batch_size, seq_len, dstate]
+        BC : Tensor (On GPU)
+            B matrix. Its shape is [batch_size, seq_len, dstate * 2] or [num_tokens, dstate * 2] for remove_input_padding
 
         D : Tensor (On GPU)
             D matrix. Its shape is [dim]
 
         z : Tensor (On GPU)
-            The z tensor. Its shape is [batch_size, seq_len, dim]
-
-        last_token_ids : Tensor (On GPU)
-            The inclusive prefix-sum of the lengths or the lengths of the
-            sequences in the batch.
+            The z tensor. Its shape is [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
 
         host_request_types : Tensor (On CPU)
             The tensor on the host that indicates if a request is in context or
             generation phase. Its shape is [batch_size]. See Inflight Batching
             in docs/gpt_attention.md,
 
+        last_token_ids : Tensor (On GPU)
+            The inclusive prefix-sum of the lengths or the lengths of the
+            sequences in the batch.
+
         dim : int
             The inner dimension of SSM block
 
         dstate : int
             The state dimension of SSM block
+
+        dt_rank: int
+            The rank dimension of dt_proj
 
         is_variable_B : bool
             Is the matrix B a variable? Set to 'True' if B is a dynamic matrix
@@ -4553,6 +4681,9 @@ def selective_scan(input: Tensor, state: Tensor, delta: Tensor,
 
         dtype: str
             data type
+
+        slot_mapping: Tensor (On GPU) (Optional)
+            Real page index in state. Its shape is [dim], used for paged state, each page shape is [dstate, dim]
     '''
     assert host_request_types is not None
     selective_scan_plg_creator = trt.get_plugin_registry().get_plugin_creator(
@@ -4563,6 +4694,8 @@ def selective_scan(input: Tensor, state: Tensor, delta: Tensor,
                           trt.PluginFieldType.INT32)
     dstate = trt.PluginField("dstate", np.array(dstate, dtype=np.int32),
                              trt.PluginFieldType.INT32)
+    dt_rank = trt.PluginField("dt_rank", np.array(dt_rank, dtype=np.int32),
+                              trt.PluginFieldType.INT32)
     is_variable_B = trt.PluginField(
         "is_variable_B", np.array(np.int8(is_variable_B), dtype=np.int8),
         trt.PluginFieldType.INT8)
@@ -4575,29 +4708,38 @@ def selective_scan(input: Tensor, state: Tensor, delta: Tensor,
     pf_type = trt.PluginField(
         "type_id", np.array([int(str_dtype_to_trt(dtype))], np.int32),
         trt.PluginFieldType.INT32)
+    remove_input_padding = trt.PluginField(
+        "remove_input_padding",
+        np.array(np.int8(default_net().plugin_config.remove_input_padding),
+                 dtype=np.int8), trt.PluginFieldType.INT8)
+    paged_state = trt.PluginField(
+        "paged_state",
+        np.array(np.int8(default_net().plugin_config.paged_state),
+                 dtype=np.int8), trt.PluginFieldType.INT8)
 
     pfc = trt.PluginFieldCollection([
-        dim,
-        dstate,
-        is_variable_B,
-        is_variable_C,
-        delta_softplus,
-        pf_type,
+        dim, dstate, dt_rank, is_variable_B, is_variable_C, delta_softplus,
+        pf_type, remove_input_padding, paged_state
     ])
     selective_scan_plug = selective_scan_plg_creator.create_plugin(
         "selective_scan", pfc)
 
     plug_inputs = [
-        input, state, delta, delta_bias, A, B, C, D, z, host_request_types,
+        input, state_or_ptr, delta, delta_bias, A, BC, D, z, host_request_types,
         last_token_ids
     ]
+    if default_net().plugin_config.paged_state:
+        plug_inputs += [slot_mapping]
     plug_inputs = [i.trt_tensor for i in plug_inputs]
 
     layer = default_trtnet().add_plugin_v2(plug_inputs, selective_scan_plug)
     _add_plugin_info(layer, selective_scan_plg_creator, "selective_scan", pfc)
     output = _create_tensor(layer.get_output(0), layer)
-    present_state = _create_tensor(layer.get_output(1), layer)
-    return output, present_state
+    if default_net().plugin_config.paged_state:
+        return output, None
+    else:
+        present_state = _create_tensor(layer.get_output(1), layer)
+        return output, present_state
 
 
 def topk(input: Tensor,

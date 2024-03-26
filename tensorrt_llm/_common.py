@@ -194,24 +194,30 @@ def _is_building(f):
     return decorated
 
 
-def check_max_num_tokens(max_num_tokens, max_batch_size, max_input_len,
-                         remove_input_padding, enable_context_fmha,
-                         tokens_per_block):
+def check_max_num_tokens(max_num_tokens, opt_num_tokens, max_batch_size,
+                         max_input_len, max_beam_width, remove_input_padding,
+                         enable_context_fmha, tokens_per_block):
     if not remove_input_padding:
-        if max_num_tokens is not None:
+        if max_num_tokens is not None or opt_num_tokens is not None:
             logger.warning("remove_input_padding is not enabled, the specified "
-                           "max_num_tokens will be ignored.")
-        return max_num_tokens
-    elif remove_input_padding and max_num_tokens is None:
-        max_num_tokens = max_input_len * max_batch_size
-        logger.warning(
-            "remove_input_padding is enabled, while max_num_tokens "
-            "is not set, setting to max_batch_size*max_input_len. \n"
-            "It may not be optimal to set max_num_tokens=max_batch_size*max_input_len "
-            "when remove_input_padding is enabled, because the number "
-            "of packed input tokens are very likely to be smaller, "
-            "we strongly recommend to set max_num_tokens according "
-            "to your workloads.")
+                           "max_num_tokens/opt_num_tokens will be ignored.")
+        return max_num_tokens, opt_num_tokens
+    elif remove_input_padding:
+        if max_num_tokens is None:
+            max_num_tokens = max_input_len * max_batch_size
+            logger.warning(
+                "remove_input_padding is enabled, while max_num_tokens "
+                "is not set, setting to max_batch_size*max_input_len. \n"
+                "It may not be optimal to set max_num_tokens=max_batch_size*max_input_len "
+                "when remove_input_padding is enabled, because the number "
+                "of packed input tokens are very likely to be smaller, "
+                "we strongly recommend to set max_num_tokens according "
+                "to your workloads.")
+        if opt_num_tokens is None:
+            opt_num_tokens = max_batch_size * max_beam_width
+            logger.warning(
+                "remove_input_padding is enabled, while opt_num_tokens "
+                "is not set, setting to max_batch_size*max_beam_width. \n")
     if max_num_tokens > max_input_len * max_batch_size:
         max_num_tokens = max_input_len * max_batch_size
         logger.warning(
@@ -222,14 +228,22 @@ def check_max_num_tokens(max_num_tokens, max_batch_size, max_input_len,
     if max_num_tokens < max_input_len and not enable_context_fmha:
         logger.warning(
             f"When enable_context_fmha is not turned on, max_num_tokens ({max_num_tokens}) "
-            f"should be greater than max_input_len ({max_input_len}), specifying to "
+            f"should be at least max_input_len ({max_input_len}), specifying to "
             f"max_input_len ({max_input_len}).")
         max_num_tokens = max_input_len
     elif max_num_tokens < tokens_per_block and enable_context_fmha:
         logger.warning(
             f"When enable_context_fmha is turned on, max_num_tokens ({max_num_tokens}) "
-            f"should be greater than tokens_per_block ({tokens_per_block}), specifying to "
+            f"should be at least tokens_per_block ({tokens_per_block}), specifying to "
             f"tokens_per_block ({tokens_per_block}). At this time, you also need to enable "
             f"context chunking at runtime, otherwise you may encounter errors.")
         max_num_tokens = tokens_per_block
-    return max_num_tokens
+
+    if opt_num_tokens > max_num_tokens:
+        logger.warning(
+            f"opt_num_tokens ({opt_num_tokens}) shouldn't be greater than "
+            f"max_num_tokens ({max_num_tokens}), "
+            f"specifying to max_num_tokens ({max_num_tokens}).")
+        opt_num_tokens = max_num_tokens
+
+    return max_num_tokens, opt_num_tokens

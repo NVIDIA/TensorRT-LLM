@@ -34,7 +34,7 @@
   - Optimize AllReduce for parallel attention on Falcon and GPT-J
   - Enable split-k for weight-only cutlass kernel when SM>=75
 * Documentation
-  - Add [documentation for new builder workflow](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/new_workflow.md)
+  - Add [documentation for convert/build workflow](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/checkpoint.md)
 
 ## Versions 0.6.0 / 0.6.1
 

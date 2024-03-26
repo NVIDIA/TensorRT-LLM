@@ -292,7 +292,6 @@ void DynamicDecodeLayer<T>::setupLayers(
         typename MedusaDecodingLayer<T>::MedusaSetupParams medusaSetupParams;
         medusaSetupParams.runtimeTopK = setupParams.runtime_top_k;
         medusaSetupParams.runtimeHeadsTopK = setupParams.topKMedusaHeads;
-        medusaSetupParams.tokensPerStep = setupParams.tokensPerStep;
         medusaSetupParams.randomSeed = setupParams.randomSeed;
         mMedusaDecodingLayer->setup(batchSize, batchSlots, medusaSetupParams);
     }
@@ -555,14 +554,19 @@ void DynamicDecodeLayer<T>::layersForward(Tensor& logits, OutputParams& outputs,
         typename MedusaDecodingLayer<T>::MedusaForwardParams medusaInputParams(logits, endIds);
         medusaInputParams.finished = outputs.finished.value();
         medusaInputParams.batch_slots = params.batch_slots;
-        medusaInputParams.paths = params.paths.value();
-        medusaInputParams.medusaLogits = params.medusaLogits.value();
+        medusaInputParams.paths = params.medusaInputs->medusaPaths;
+        medusaInputParams.medusaLogits = params.medusaInputs->medusaLogits;
+        medusaInputParams.medusaCurTokensPerStep = params.medusaInputs->medusaCurTokensPerStep;
+        medusaInputParams.medusaTargetTokensPerStep = params.medusaInputs->medusaTargetTokensPerStep;
+        medusaInputParams.treeIds = params.medusaInputs->medusaTreeIds;
 
         DecodingOutputParams medusaOutputParams(outputs.output_ids);
         medusaOutputParams.sequence_length = outputs.sequence_length.value();
         medusaOutputParams.finished = outputs.finished.value();
-        medusaOutputParams.nextDraftTokens = outputs.nextDraftTokens.value();
-        medusaOutputParams.acceptedLengths = outputs.acceptedLengths.value();
+        medusaOutputParams.nextDraftTokens = outputs.medusaOutputs->nextDraftTokens;
+        medusaOutputParams.acceptedLengths = outputs.medusaOutputs->acceptedLengths;
+        medusaOutputParams.acceptedLengthsCumSum = outputs.medusaOutputs->medusaAcceptedLengthsCumSum;
+        medusaOutputParams.medusaPathsOffsets = outputs.medusaOutputs->medusaPathsOffsets;
 
         mMedusaDecodingLayer->forward(medusaOutputParams, medusaInputParams);
     }
@@ -614,7 +618,8 @@ void DynamicDecodeLayer<T>::applyPenalties(OutputParams& outputs, ForwardParams 
 
 #undef GET_PENALTIES
 
-    auto const tokensPerStep = params.tokensPerStep ? params.tokensPerStep->template getPtr<SizeType const>() : nullptr;
+    auto const tokensPerStep
+        = params.medusaInputs ? params.medusaInputs->medusaCurTokensPerStep.template getPtr<SizeType const>() : nullptr;
     InvokeBatchApplyPenaltyParams<T> penaltyParams{reinterpret_cast<T const* const*>(logitsPtrsHostData),
         mRuntimeLogitsDevice, embeddingBias, mPenaltyWorkspaceDevice, mPenaltyWorkspacePrevDevice, temperatures,
         repetitionPenalties, presencePenalties, frequencyPenalties,
@@ -788,8 +793,9 @@ void DynamicDecodeLayer<T>::prepareOutputData(OutputParams& outputs, ForwardPara
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto idsPtrHostSlice = ITensor::slice(idsPtrsHost, cyclicStep, 1);
     auto idsPtrHost = reinterpret_cast<TokenIdType**>(runtime::bufferCast<int64_t>(*idsPtrHostSlice));
-    auto const numNewTokens = outputs.acceptedLengths ? outputs.acceptedLengths->template getPtr<SizeType const>()
-                                                      : static_cast<SizeType*>(nullptr);
+    auto const numNewTokens = outputs.medusaOutputs
+        ? outputs.medusaOutputs->acceptedLengths.template getPtr<SizeType const>()
+        : static_cast<SizeType*>(nullptr);
     invokeCopyNextStepIds(outputs.newTokens.template getPtr<TokenIdType>(), idsPtrHost,
         outputs.sequence_length->template getPtr<SizeType>(), numNewTokens, batchSlots, batchSize, maxBatchSize,
         beamWidth, maxSeqLen, maxTokensPerStep, stream);

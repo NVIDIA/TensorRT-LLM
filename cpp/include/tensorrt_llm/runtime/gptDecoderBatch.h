@@ -43,7 +43,7 @@ public:
     //! Setup the decoder before calling `forward()`
     void setup(DecodingMode const& mode, SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxAttentionWindow,
         SizeType sinkTokenLength, SizeType maxSequenceLength, SizeType maxTokensPerStep, bool fusedDecoder,
-        nvinfer1::DataType dtype) override;
+        nvinfer1::DataType dtype, GptModelConfig const& modelConfig) override;
 
     void newBatch(
         GenerationInput const& inputs, GenerationOutput const& outputs, SamplingConfig const& samplingConfig) override;
@@ -156,13 +156,19 @@ public:
     //! @returns [batchSize, maxTokensPerStep-1], predicted draft tokens for next step, on gpu
     [[nodiscard]] TensorPtr getNextDraftTokens() const override
     {
-        return mNextDraftTokens;
+        return mJointDecodingOutput->medusaOutputs->medusaNextDraftTokens;
     }
 
-    //! @returns [batchSize], lengths of the predicted draft tokens for next step, on gpu
-    [[nodiscard]] TensorPtr getNextDraftTokenLengths() const override
+    //! @returns [batchSize + 1], exclusive sum of accepted draft token lengths, on gpu
+    [[nodiscard]] TensorPtr getMedusaAcceptedLengthsCumSum() const override
     {
-        return mNextDraftTokenLengths;
+        return mJointDecodingOutput->medusaOutputs->medusaAcceptedLengthsCumSum;
+    }
+
+    //! @returns [batchSize * maxMedusaHeads], accepted paths packed into continuous tensor, on gpu
+    [[nodiscard]] TensorPtr getMedusaAcceptedPackedPaths() const override
+    {
+        return mJointDecodingOutput->medusaOutputs->medusaPathsOffsets;
     }
 
 private:
@@ -171,6 +177,27 @@ private:
 
     //! @brief Initialize the decoder at `batchIdx` with a new `request`.
     void newRequest(SizeType batchIdx, decoder_batch::Request const& request, SamplingConfig const& samplingConfig);
+
+    //! @brief Allocate buffers for medusa decoding.
+    void allocateMedusaBuffers();
+
+    //! @brief Setup buffers for medusa decoding.
+    void setupMedusa(GptModelConfig const& modelConfig);
+
+    //! @brief Setups decoder internal tensors for new speculative decoding request
+    void newRequestSpeculativeDecoding(
+        SizeType batchIdx, decoder_batch::Request const& request, SamplingConfig const& samplingConfig);
+
+    //! @brief Setups decoder internal tensors for new Medusa request
+    void newRequestMedusa(SizeType batchIdx, decoder_batch::Request const& request);
+
+    //! @brief Asynchronously calls unfused decoder for whole batch in loop
+    void forwardAsyncUnfusedDecoder(
+        SizeType step, decoder_batch::Output& output, decoder_batch::Input const& input, CudaEvent const& eventStart);
+
+    //! @brief Asynchronously calls fused decoder for whole batch
+    void forwardAsyncFusedDecoder(
+        SizeType step, decoder_batch::Output& output, decoder_batch::Input const& input, CudaEvent const& eventStart);
 
 private:
     std::size_t const mVocabSize;
@@ -200,7 +227,7 @@ private:
     TensorPtr mFinishedSum;
     std::vector<SizeType> mMaxNewTokens;
     std::vector<SizeType> mBeamWidths;
-    std::vector<SizeType> mGeneratedTokensPerStep;
+    std::vector<SizeType> mGeneratedTokensPerEngineStep;
 
     TensorPtr mFinishedSteps;   // [maxTokensPerStep, batchSize, beamWidth] finished states of type FinishedState
                                 // for each generated token of maxTokensPerStep, on gpu
@@ -216,16 +243,17 @@ private:
     TensorPtr mBatchSlotsAcceptTokens; // [maxBatchSize], int32_t, address map, pinned
     TensorPtr mBatchSlotsAcceptLogits; // [maxBatchSize], int32_t, address map, pinned
     TensorPtr mTargetLogitsPtrs;       // [maxBatchSize], float*, pointers to target logits, pinned
-    TensorPtr mNextDraftTokens;
-    TensorPtr mNextDraftTokenLengths;
     SizeType mMaxSequenceLength{};
     SizeType mMaxAttentionWindow{};
     SizeType mSinkTokenLength{};
     SizeType mActualBatchSize{};
-    SizeType mMaxTokensPerStep{};
+    SizeType mMaxTokensPerEngineStep{};
     SizeType mMaxStopWordsLen{};
     SizeType mMaxBadWordsLen{};
+    // How many tokens for one request can be processed per mDecoders call
+    SizeType mMaxTokensPerDecoderStep{};
 
     bool mFusedDecoder{false};
+    bool mUseMedusa{false};
 };
 } // namespace tensorrt_llm::runtime

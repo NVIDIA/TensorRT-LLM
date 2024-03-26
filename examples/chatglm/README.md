@@ -2,6 +2,28 @@
 
 This document explains how to build the [ChatGLM-6B](https://huggingface.co/THUDM/chatglm-6b), [ChatGLM2-6B](https://huggingface.co/THUDM/chatglm2-6b), [ChatGLM2-6B-32k](https://huggingface.co/THUDM/chatglm2-6b-32k), [ChatGLM3-6B](https://huggingface.co/THUDM/chatglm3-6b), [ChatGLM3-6B-Base](https://huggingface.co/THUDM/chatglm3-6b-base), [ChatGLM3-6B-32k](https://huggingface.co/THUDM/chatglm3-6b-32k) models using TensorRT-LLM and run on a single GPU, a single node with multiple GPUs or multiple nodes with multiple GPUs.
 
+- [ChatGLM](#chatglm)
+  - [Overview](#overview)
+  - [Support Matrix](#support-matrix)
+  - [Model comparison](#model-comparison)
+  - [Tokenizer and special tokens comparison](#tokenizer-and-special-tokens-comparison)
+  - [Usage](#usage)
+    - [1. Download repo and weights from HuggingFace Transformers](#1-download-repo-and-weights-from-huggingface-transformers)
+    - [2. Convert weights from HF Transformers to TensorRT-LLM format](#2-convert-weights-from-hf-transformers-to-tensorrt-llm-format)
+    - [3. Build TensorRT engine(s)](#3-build-tensorrt-engines)
+      - [Enable plugins](#enable-plugins)
+      - [In-flight batching](#in-flight-batching)
+    - [4. Run inference](#4-run-inference)
+      - [Single node, single GPU](#single-node-single-gpu)
+      - [Single node, multi GPU](#single-node-multi-gpu)
+    - [5. Run summarization task](#5-run-summarization-task)
+    - [Weight Only quantization](#weight-only-quantization)
+    - [Smooth Quantization (SQ)](#smooth-quantization-sq)
+    - [Activation-aware Weight Quantization (AWQ)](#activation-aware-weight-quantization-awq)
+    - [FP8 Quantization](#fp8-quantization)
+  - [Benchmark](#benchmark)
+
+
 ## Overview
 
 The TensorRT-LLM ChatGLM implementation can be found in [`tensorrt_llm/models/chatglm/model.py`](../../tensorrt_llm/models/chatglm/model.py).

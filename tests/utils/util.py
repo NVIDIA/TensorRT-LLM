@@ -88,15 +88,12 @@ def skip_bf16_fp32_accum(dtype, context_fmha_type):
 def ammo_installed():
     try:
         # isort: off
-        import ammo.torch.quantization as atq
-        from ammo.torch.export import export_model_config
-        print(type(atq))
-        print(type(export_model_config))
+        import ammo.torch.quantization as atq  # NOQA
+        from ammo.torch.export import export_model_config  # NOQA
         # isort: on
         return True
     except Exception:
         return False
-    return False
 
 
 skip_no_ammo = pytest.mark.skipif(not ammo_installed(),

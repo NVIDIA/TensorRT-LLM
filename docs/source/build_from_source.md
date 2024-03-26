@@ -156,7 +156,8 @@ The list of supported architectures can be found in the
 
 ### Build the Python Bindings for the C++ Runtime
 
-The C++ Runtime, in particular, [`GptSession`](source:cpp/include/tensorrt_llm/runtime/gptSession.h) can be exposed to
+The C++ Runtime, in particular, ['Executor'](source:cpp/include/executor/executor.h) and
+ [`GptSession`](source:cpp/include/tensorrt_llm/runtime/gptSession.h) can be exposed to
 Python via [bindings](source:cpp/tensorrt_llm/pybind/bindings.cpp). This feature can be turned on through the default
 build options:
 
@@ -166,7 +167,7 @@ python3 ./scripts/build_wheel.py --trt_root /usr/local/tensorrt
 
 After installing the resulting wheel as described above, the C++ Runtime bindings will be available in
 package `tensorrt_llm.bindings`. Running `help` on this package in a Python interpreter will provide on overview of the
-relevant classes. The [associated unit tests](source:tests/bindings) should also be consulted for understanding the API.
+relevant classes. The [examples](source:examples/bindings) and [unit tests](source:tests/bindings) can also be consulted for understanding the API.
 
 This feature will not be enabled when [`building only the C++ runtime`](#link-with-the-tensorrt-llm-c++-runtime).
 

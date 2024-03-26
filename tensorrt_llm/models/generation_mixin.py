@@ -41,26 +41,6 @@ class GenerationMixin:
         result = [1, (max_range + 1) // 2, max_range]
         return [elem + offset for elem in result]
 
-    @staticmethod
-    def split_num_tokens_range(max_num_tokens):
-        split_point = [64, 128, 256, 512, 1024]
-        num_tokens_ranges = []
-        for i, p in enumerate(split_point):
-            if i == 0 and max_num_tokens <= p:
-                return [0, max_num_tokens, max_num_tokens]
-            elif max_num_tokens <= p:
-                num_tokens_ranges.append(
-                    [split_point[i - 1], max_num_tokens, max_num_tokens])
-                return num_tokens_ranges
-            elif i == 0 and max_num_tokens > p:
-                num_tokens_ranges = [[0, 64, 64]]
-            else:
-                num_tokens_ranges.append(
-                    [split_point[i - 1], split_point[i], split_point[i]])
-        num_tokens_ranges.append(
-            [split_point[-1], max_num_tokens, max_num_tokens])
-        return num_tokens_ranges
-
     def prepare_attention_inputs(self,
                                  *,
                                  max_batch_size,
@@ -78,7 +58,8 @@ class GenerationMixin:
                                  paged_kv_cache=False,
                                  tokens_per_block=64,
                                  mapping=Mapping(),
-                                 use_cache=True):
+                                 use_cache=True,
+                                 streamingllm=False):
 
         default_range = GenerationMixin.default_range
         bb_range_cxt = default_range(max_batch_size)
@@ -89,7 +70,17 @@ class GenerationMixin:
         _mask_len_ctx = default_range(max_input_len)
         _kv_cache_range_ctx = [0, 0, 0]
         _kv_cache_range_gen = default_range(max_seq_len, -1)
-        _kv_cache_range = default_range(max_seq_len)
+        if not paged_kv_cache:
+            _kv_cache_range = default_range(max_seq_len)
+        else:
+            kv_max_seq_len = max_seq_len
+            if streamingllm:
+                # add the max bubble length
+                kv_max_seq_len += tokens_per_block - 1
+            if max_beam_width > 1:
+                # support cyclic kv cache cases that use one more block
+                kv_max_seq_len += tokens_per_block
+            _kv_cache_range = default_range(kv_max_seq_len)
 
         if enable_ctx_gen_opt_profiles:
             assert num_profiles == 2
@@ -296,12 +287,14 @@ class GenerationMixin:
                              num_heads=None,
                              mapping=Mapping(),
                              max_num_tokens=None,
+                             opt_num_tokens=None,
                              prompt_embedding_table_size: int = 0,
                              position_encoding_2d=False,
                              use_lora_plugin: bool = False,
                              lora_target_modules: List[str] = None,
                              max_draft_len=0,
-                             multiple_profiles: bool = False):
+                             multiple_profiles: bool = False,
+                             streamingllm: bool = False):
 
         default_range = GenerationMixin.default_range
         last_token_range = [1, max_draft_len + 1, max_draft_len + 1]
@@ -336,13 +329,20 @@ class GenerationMixin:
                 max_batch_size * (max_draft_len + 1) * max_beam_width)
             num_tokens_range = [num_tokens_range_ctx, num_tokens_range_gen]
         else:
+            max_bs_x_max_bw = max_batch_size * max_beam_width
+            if opt_num_tokens is None:
+                opt_num_tokens = max_bs_x_max_bw
             if multiple_profiles:
-                num_tokens_range = GenerationMixin.split_num_tokens_range(
-                    max_num_tokens)
+                if max_num_tokens > max_bs_x_max_bw:
+                    num_tokens_range = [[1, max_bs_x_max_bw, max_bs_x_max_bw],
+                                        [
+                                            max_bs_x_max_bw, max_num_tokens,
+                                            max_num_tokens
+                                        ]]
+                else:
+                    num_tokens_range = [[1, max_num_tokens, max_num_tokens]]
             else:
-                num_tokens_range = [[
-                    1, max_batch_size * max_beam_width, max_num_tokens
-                ]]
+                num_tokens_range = [[1, opt_num_tokens, max_num_tokens]]
             num_profiles = len(num_tokens_range)
             bb_range = [bb_range_gen] * num_profiles
             bbd_range = [bbd_range_gen] * num_profiles
@@ -572,7 +572,8 @@ class GenerationMixin:
             use_gpt_attention_plugin=use_gpt_attention_plugin,
             paged_kv_cache=paged_kv_cache,
             tokens_per_block=tokens_per_block,
-            mapping=mapping)
+            mapping=mapping,
+            streamingllm=streamingllm)
 
         for key, value in attention_inputs.items():
             basic_inputs[key] = value

@@ -80,8 +80,8 @@ public:
         int kv_cache_quant_mode, bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type,
         bool paged_kv_cache, int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length,
         bool qkv_bias_enabled, bool cross_attention = false, int max_distance = 0, bool pos_shift_enabled = false,
-        bool dense_context_fmha = false, bool use_paged_context_fmha = false, bool use_cache = true,
-        bool is_medusa_enabled = false);
+        bool dense_context_fmha = false, bool use_paged_context_fmha = false, bool use_fp8_context_fmha = false,
+        bool use_cache = true, bool is_medusa_enabled = false);
 
     GPTAttentionPlugin(void const* data, size_t length);
 
@@ -164,6 +164,7 @@ private:
         PAST_KEY_VALUE,
         KV_CACHE_QUANTIZATION_SCALE,
         KV_CACHE_DEQUANTIZATION_SCALE,
+        ATTENTION_OUTPUT_QUANTIZATION_SCALE,
         ALIBI_SLOPES,
         RELATIVE_ATTENTION_BIAS,
         CROSS_QKV,

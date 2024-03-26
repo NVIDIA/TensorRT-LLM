@@ -44,11 +44,10 @@ public:
     class MedusaSetupParams : public DecodingSetupParams
     {
     public:
-        std::optional<std::vector<runtime::SizeType>> runtimeTopK;   // [1] or [batchSize] on cpu
+        std::optional<std::vector<runtime::SizeType>> runtimeTopK; // [1] or [batchSize] on cpu
         std::optional<std::vector<std::vector<runtime::SizeType>>>
-            runtimeHeadsTopK;                                        // [batchSize, maxMedusaHeads] on cpu
-        std::optional<std::vector<uint64_t>> randomSeed;             // [1] or [batchSize] on cpu
-        std::optional<std::vector<runtime::SizeType>> tokensPerStep; // [1] or [batchSize] on cpu
+            runtimeHeadsTopK;                                      // [batchSize, maxMedusaHeads] on cpu
+        std::optional<std::vector<uint64_t>> randomSeed;           // [1] or [batchSize] on cpu
     };
 
     class MedusaForwardParams : public DecodingParams
@@ -59,8 +58,12 @@ public:
         {
         }
 
-        tc::Tensor paths;        // [maxBatchSize, maxTokensPerStep, maxNumHeads + 1] on gpu
-        tc::Tensor medusaLogits; // [maxNumHeads, maxBatchSize, maxTokensPerStep, vocabSize] on gpu
+        tc::Tensor paths;                     // [maxBatchSize, maxTokensPerStep, maxNumHeads + 1] on gpu
+        std::vector<std::vector<tc::Tensor>>
+            medusaLogits;                     // [maxBatchSize][maxNumHeads][tokensPerStep, vocabSize] on gpu
+        tc::Tensor medusaCurTokensPerStep;    // [maxBatchSize] on gpu
+        tc::Tensor medusaTargetTokensPerStep; // [maxBatchSize] on gpu
+        tc::Tensor treeIds;                   // [maxBatchSize, maxTokensPerStep] on gpu
     };
 
     MedusaDecodingLayer(runtime::SizeType maxBatchSize, runtime::SizeType vocabSize, runtime::SizeType vocabSizePadded,
@@ -80,6 +83,8 @@ private:
     void samplePrimeHeadTokens(DecodingOutputParams& outputs, MedusaForwardParams& inputs);
     void acceptDraftTokens(DecodingOutputParams& outputs, MedusaForwardParams& inputs);
     void sampleNewDraftTokens(DecodingOutputParams& outputs, MedusaForwardParams& inputs);
+    void scatterNewDraftTokens(DecodingOutputParams& outputs, MedusaForwardParams& inputs);
+    void packAcceptedPaths(DecodingOutputParams& outputs, MedusaForwardParams& inputs);
 
 private:
     using Base::mStream;
@@ -97,19 +102,21 @@ private:
     runtime::SizeType mRuntimeMaxTopKPerRequestPerMedusaHead{0};
 
     curandState_t* mCurandStatesDevice{nullptr};
-    runtime::SizeType* mTokensPerStepDevice{nullptr};
     void* mSetupWorkspaceDevice{nullptr};
     void* mSamplingWorkspaceDevice{nullptr};
     runtime::SizeType* mRuntimeTopKDevice{nullptr};
     runtime::TokenIdType* mTargetTokensDevice{nullptr};
     uint64_t* mRandomSeedsDevice{nullptr};
-    T** mMedusaLogitsPtrsDevice{nullptr};
+    T** mMedusaSelectedLogitsPtrsDevice{nullptr};
     curandState_t* mCurandStatesMedusaLogitsDevice{nullptr};
     runtime::SizeType* mRuntimeTopKPerRequestPerMedusaHeadDevice{nullptr};
+    runtime::TokenIdType* mNewDraftTokensDevice{nullptr};
+    runtime::SizeType* mBestPathIdsDevice{nullptr};
 
     runtime::ITensor::UniquePtr mTiledBatchSlotsSetup;
     runtime::ITensor::UniquePtr mTiledBatchSlotsForward;
     runtime::ITensor::UniquePtr mDraftIdsPtrHost;
+    runtime::ITensor::UniquePtr mMedusaInputLogitsPtrs;
 
     std::vector<runtime::SizeType> mCummulativeTopK;
 };

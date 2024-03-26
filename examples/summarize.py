@@ -21,7 +21,6 @@ import evaluate
 import numpy as np
 import torch
 from datasets import load_dataset
-from qwen.convert_checkpoint import make_context
 from transformers import (AutoModel, AutoModelForCausalLM,
                           AutoModelForSeq2SeqLM, GenerationConfig)
 from utils import DEFAULT_HF_MODEL_DIRS, load_tokenizer, read_model_name
@@ -30,6 +29,7 @@ import tensorrt_llm
 import tensorrt_llm.profiler as profiler
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.logger import logger
+from tensorrt_llm.models.qwen.utils import make_context
 from tensorrt_llm.runtime import PYTHON_BINDINGS, ModelRunner
 from tensorrt_llm.tools.ppl import ppl
 

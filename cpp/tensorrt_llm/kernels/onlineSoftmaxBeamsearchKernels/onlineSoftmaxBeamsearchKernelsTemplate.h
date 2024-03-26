@@ -41,6 +41,8 @@ static int const SMALL_TOP_K_SOFTMAX_THREADBLOCK_SIZE = 256;
 
 #define TOPK_FP16_STORAGE 0
 
+#pragma nv_diag_suppress static_var_with_dynamic_init
+
 template <typename T, int MAX_K2, int THREADBLOCK_SIZE>
 __launch_bounds__(THREADBLOCK_SIZE) __global__ void batch_topk_kernel(
     int const* __restrict topk_id, T const* __restrict topk_val, BeamHypotheses bh, int const candidate_size)

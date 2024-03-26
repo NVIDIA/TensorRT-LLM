@@ -14,25 +14,23 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <iostream>
-#include <stdexcept>
 #include <string>
 
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
-#include "tensorrt_llm/runtime/tllmLogger.h"
 
+namespace tlc = tensorrt_llm::common;
 namespace tle = tensorrt_llm::executor;
 
 int main(int argc, char* argv[])
 {
-    // Register the TRT-LLM plugins and the logger
-    auto logger = std::make_shared<tensorrt_llm::runtime::TllmLogger>();
-    initTrtLlmPlugins(logger.get());
+    // Register the TRT-LLM plugins
+    initTrtLlmPlugins();
 
     if (argc != 2)
     {
-        logger->log(nvinfer1::ILogger::Severity::kERROR, "Usage: ./tensorrt_llm_executor <dir_with_engine_files>");
+        TLLM_LOG_ERROR("Usage: %s <dir_with_engine_files>", argv[0]);
         return 1;
     }
 
@@ -56,11 +54,7 @@ int main(int argc, char* argv[])
     // Get outputTokens
     auto outputTokens = responses.at(0).getResult().outputTokenIds.at(beamWidth - 1);
 
-    logger->log(nvinfer1::ILogger::Severity::kINFO, "Output tokens: ");
-    for (auto& outputToken : outputTokens)
-    {
-        logger->log(nvinfer1::ILogger::Severity::kINFO, std::to_string(outputToken).c_str());
-    }
+    TLLM_LOG_INFO("Output tokens: %s", tlc::vec2str(outputTokens).c_str());
 
     return 0;
 }

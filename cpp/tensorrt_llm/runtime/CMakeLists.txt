@@ -24,6 +24,7 @@ set(SRCS
     loraModule.cpp
     loraCache.cpp
     decodingOutput.cpp
+    generationConfig.cpp
     gptDecoder.cpp
     gptDecoderBatch.cpp
     gptJsonConfig.cpp
@@ -37,10 +38,12 @@ set(SRCS
     promptTuningParams.cpp
     runtimeBuffers.cpp
     runtimeKernels.cu
+    ssmStateBuffers.cpp
     statefulGptDecoder.cpp
     tllmBuffers.cpp
     tllmRuntime.cpp
     tllmLogger.cpp
+    transformerBuffers.cpp
     worldConfig.cpp)
 
 include_directories(${API_INCLUDE_DIR}/tensorrt_llm/runtime)

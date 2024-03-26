@@ -4,6 +4,12 @@ Here we show you a preview of how it works and how to use it.
 
 Note that the APIs are not stable and only support the LLaMA model. We appreciate your patience and understanding as we improve this API.
 
+Please install the required packages first:
+
+```bash
+pip install -r requirements.txt
+```
+
 You can refer to [llm_examples.py](llm_examples.py) for all of the examples, and run it with the [run_examples.py](./run_examples.py) script, the command is as follows:
 
 ```sh
@@ -21,17 +27,28 @@ python3 llm_examples.py --task run_llm_on_tensor_parallel \
 ```
 
 ## Model preparation
+The high-level API supports three kinds of model formats:
 
-Given its popularity, the TRT-LLM high-level API chooses to support HuggingFace format as start point, to use the high-level API on LLaMA models, you need to run the following conversion script provided in [transformers/llama](https://huggingface.co/docs/transformers/main/model_doc/llama) or [transformers/llama2](https://huggingface.co/docs/transformers/main/model_doc/llama2) to convert the Meta checkpoint to HuggingFace format.
+1. HuggingFace models
+2. TensorRT-LLM engine built by trtllm-build tool or saved by the high-level API
+3. TensorRT-LLM checkpoints, converted by `convert_checkpoint.py` in examples
 
-For instance, specially for a LLaMA2 7B model, the official way to retrieve the model is to visit the [LLaMA2 7B model page](https://huggingface.co/transformers/llama2-7B), normally you need to submit a request for the the model file.
+All kinds of models could be used directly by the high-level API, and the `ModelConfig(<any-model-path>)` could accept any kind of them.
+
+Let's elaborate on the preparation of the three kinds of model formats.
+
+### Option 1: From HuggingFace models
+
+Given its popularity, the TRT-LLM high-level API chooses to support HuggingFace format as one of the start points, to use the high-level API on LLaMA models, you need to run the following conversion script provided in [transformers/llama](https://huggingface.co/docs/transformers/main/model_doc/llama) or [transformers/llama2](https://huggingface.co/docs/transformers/main/model_doc/llama2) to convert the Meta checkpoint to HuggingFace format.
+
+For instance, when targeting the LLaMA2 7B model, the official way to retrieve the model is to visit the [LLaMA2 7B model page](https://huggingface.co/transformers/llama2-7B), normally you need to submit a request for the model file.
 For a quick start, you can also download the model checkpoint files directly from [modelscope.cn](https://www.modelscope.cn/models/shakechen/Llama-2-7b/files), the command is as follows:
 
 ``` sh
 git clone https://www.modelscope.cn/shakechen/Llama-2-7b.git
 ```
 
-And to convert the checkpoint files, a script from transformers is required, thus please also clone the transformers repo with the following code:
+To convert the checkpoint files, a script from transformers is required, thus please also clone the transformers repo with the following code:
 
 ```sh
 git clone https://github.com/huggingface/transformers.git
@@ -45,6 +62,26 @@ python <transformers-dir>/src/transformers/models/llama/convert_llama_weights_to
 ```
 
 That should produce a HuggingFace format model in `./llama-hf-7b`, which could be used by the high-level API.
+
+### Option 2: From TensorRT-LLM engine
+There are two ways to build the TensorRT-LLM engine:
+
+1. You can build the TensorRT-LLM engine from the HuggingFace model directly with the `trtllm-build` tool, and save the engine to disk for later use.  Please consult the LLaMA's [README](../llama/README.md).
+2. Use the Python high-level API to save one:
+
+```python
+config = ModelConfig(<model-path>)
+llm = LLM(config)
+
+# Save engine to local disk
+llm.save(<engine-dir>)
+```
+
+### Option 3: From TensorRT-LLM checkpoint
+In each model example, there is a `convert_checkpoint.py` to convert third-party models to TensorRT-LLM checkpoint for further usage.
+The Python high-level API could seamlessly accept the checkpoint, and build the engine in the backend.
+For step-by-step guidance on checkpoint conversion, please refer to the LLaMA's [README](../llama/README.md).
+
 
 ## Basic usage
 To use the API, import the `LLM` and `ModelConfig` from the `tensorrt_llm` package and create an LLM object with a HuggingFace model directly.
@@ -84,8 +121,7 @@ config = ModelConfig(model_dir=<engine-path>)
 llm = LLM(config)
 ```
 
-In other words, the `model_dir` could accept either a HugggingFace model or a built TensorRT-LLM engine, the `LLM()` will do the rest work silently.
-
+In other words, the `model_dir` could accept either a HugggingFace model, a built TensorRT-LLM engine, or a TensorRT-LLM checkpoint, and the `LLM()` will do the rest work silently for end-to-end execution.
 
 ## Quantization
 
@@ -93,18 +129,28 @@ By simply setting several flags in the ModelConfig, TensorRT-LLM can quantize th
 
 
 ``` python
+from tensorrt_llm.quantization import QuantAlgo
+
 config = ModelConfig(model_dir=<llama_model_path>)
 
-config.quant_config.init_from_description(
-                       quantize_weights=True,
-                       use_int4_weights=True,
-                       per_group=True)
-config.quant_config.quantize_lm_head = True
+config.quant_config.quant_algo = QuantAlgo.W4A16_AWQ
 
 llm = LLM(config)
 ```
 
-## Auto parallel
+## Parallelism
+
+### Tensor Parallelism
+It is easy to enable Tensor Parallelism in the high-level API. For example, setting `parallel_config.tp_size=2` to perform a 2-way parallelism:
+
+```python
+from tensorrt_llm import LLM, ModelConfig
+
+config = ModelConfig(model_dir=<llama_model_path>)
+config.parallel_config.tp_size = 2
+```
+
+### Automatic Parallelism (in preview)
 
 By simply enabling `parallel_config.auto_parallel` in the ModelConfig, TensorRT-LLM can parallelize the model automatically. For example, setting `parallel_config.world_size` to perform a 2-way parallelism:
 
@@ -114,11 +160,10 @@ from tensorrt_llm import LLM, ModelConfig
 config = ModelConfig(model_dir=<llama_model_path>)
 config.parallel_config.auto_parallel = True
 config.parallel_config.world_size = 2
-
-llm = LLM(config)
 ```
 
-## Asynchronous generation
+## Generation
+### `asyncio`-based generation
 With the high-level API, you can also perform asynchronous generation with the `generate_async` method. For example:
 
 ```python
@@ -132,8 +177,8 @@ async for output in llm.generate_async(<prompt>, streaming=True):
 
 When the `streaming` flag is set to `True`, the `generate_async` method will return a generator that yields the token results as soon as they are available. Otherwise, it will return a generator that yields the final results only.
 
-## Future-like generation result
-The result of the `generate_async` methods is a Future-like object, it doesn't block the thread unless the `.result()` is called.
+### Future-style generation
+The result of the `generate_async` method is a Future-like object, it doesn't block the thread unless the `.result()` is called.
 
 ```python
 # This will not block the main thread
@@ -156,7 +201,48 @@ generation = llm.generate_async(<prompt>)
 output = await generation.aresult()
 ```
 
-## Customization
+### Customizing sampling with `SamplingConfig`
+With SamplingConfig, you can customize the sampling strategy, such as beam search, temperature, and so on.
+
+To enable beam search with a beam size of 4, set the `sampling_config` as follows:
+
+```python
+from tensorrt_llm import ModelConfig, LLM
+from tensorrt_llm.hlapi import SamplingConfig
+
+config = ModelConfig(model_dir=<llama_model_path>, max_beam_width=4)
+
+llm = LLM(config)
+# Let the LLM object generate text with the default sampling strategy, or
+# you can create a SamplingConfig object as well with several fields set manually
+sampling_config = llm.get_default_sampling_config()
+sampling_config.beam_width = 4 # current limitation: beam_width should be equal to max_beam_width
+
+for output in llm.generate(<prompt>, sampling_config=sampling_config):
+    print(output)
+```
+
+You can set other fields in the `SamplingConfig` object to customize the sampling strategy, please refer to the [SamplingConfig](https://nvidia.github.io/TensorRT-LLM/_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14SamplingConfigE) class for more details.
+
+## LLM pipeline configuration
+
+### Runtime customization
+
+For `kv_cache_config`, `scheduling_policy` and `streaming_llm` features, please refer to LLaMA's [README](../llama/README.md) for more details, the high-level API supports these features as well by setting the corresponding fields in the `LLM()` constructor.
+
+```python
+from tensorrt_llm import ModelConfig, LLM
+from tensorrt_llm.hlapi import KvCacheConfig, SchedulerPolicy
+
+config = ModelConfig(model_dir=<llama_model_path>)
+llm = LLM(config,
+          kv_cache_config=KvCacheConfig(
+                            max_new_tokens=128,
+                            free_gpu_memory_fraction=0.8),
+          scheduling_policy=SchedulerPolicy.GUARANTEED_NO_EVICT)
+```
+
+### Tokenizer customization
 
 By default, the high-level API uses transformers’ `AutoTokenizer`. You can override it with your own tokenizer by passing it when creating the LLM object. For example:
 
@@ -173,3 +259,24 @@ llm = LLM(config)
 
 for output in llm.generate([32, 12]): ...
 ```
+
+### Disabling tokenizer
+For performance considerations, you can disable the tokenizer by passing the token ID list to the `LLM.generate/_async` method. For example:
+
+```python
+config = ModelConfig(model_dir=<llama_model_path>)
+
+llm = LLM(config)
+for output in llm.generate([[32, 12]]):
+    print(output)
+```
+
+You will get something like `GenerationResult(text='', token_ids=[23, 14, 3, 29871, 3], ...)`, note that the `text` field is empty since the tokenizer is not activated.
+
+## Fine grain control (Danger Zone)
+The high-level API is designed to be easy to use with hiding and auto-configuring most of the details, ideally, you don't need to touch the low-level details. However, if you want to fine-tune the underlying details, it is still possible to do so with two temporary APIs:
+
+1. `ModelConfig._set_additional_options` to set additional options for the model, such as some TensorRT shape range.
+2. `LLM(..., **_additional_options)` to set extra options for the LLM pipeline, such as some runtime optimization knobs.
+
+Note that, both APIs are not stable and we aim to gradually remove them, please use them with caution.

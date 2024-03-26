@@ -2,6 +2,15 @@
 
 This document explains how to build the [Phi](https://huggingface.co/microsoft/phi-2) model using TensorRT-LLM and run on a single GPU.
 
+- [Phi](#phi)
+  - [Overview](#overview)
+  - [Support Matrix](#support-matrix)
+  - [Usage](#usage)
+    - [1. Convert weights from HF Transformers to TensorRT-LLM format](#1-convert-weights-from-hf-transformers-to-tensorrt-llm-format)
+    - [2. Build TensorRT engine(s)](#2-build-tensorrt-engines)
+      - [Fused MultiHead Attention (FMHA)](#fused-multihead-attention-fmha)
+    - [3. Summarization using the Phi model](#3-summarization-using-the-phi-model)
+
 ## Overview
 
 The TensorRT-LLM Phi implementation can be found in [`tensorrt_llm/models/phi/model.py`](../../tensorrt_llm/models/phi/model.py). The TensorRT-LLM Phi example code is located in [`examples/phi`](./). There is one file:
@@ -21,6 +30,12 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 ## Usage
 
 ### 1. Convert weights from HF Transformers to TensorRT-LLM format
+
+Please install required packages first:
+
+```bash
+pip install -r requirements.txt
+```
 
 ```bash
 python ./convert_checkpoint.py --model_dir "microsoft/phi-2" --output_dir ./phi-2-checkpoint --dtype float16

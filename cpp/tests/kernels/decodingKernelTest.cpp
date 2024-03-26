@@ -232,13 +232,14 @@ public:
         mDraftTokens
             = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize, mMaxDraftSeqlen}), nvinfer1::DataType::kINT32);
         mTargetTokens
+            = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize, mMaxTargetSeqlen}), nvinfer1::DataType::kINT32);
+        mOutputTokens
             = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize, mMaxSeqLen}), nvinfer1::DataType::kINT32);
         mNumsDraftTokens = BufferManager::pinned(
             ITensor::makeShape({mMaxBatchSize, mMaxDraftSeqPerStep}), nvinfer1::DataType::kINT32);
         mSequenceLengths = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
         mAcceptedLengths = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
         mContextLengths = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
-        mDraftContextLengths = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
         mFinishedSteps = BufferManager::pinned(ITensor::makeShape({mMaxDraftTokens + 1, mMaxBatchSize}),
             TRTDataType<tk::FinishedState::UnderlyingType>::value);
         mFinishedFinal = BufferManager::pinned(
@@ -277,7 +278,11 @@ public:
 
         if (mAcceptMode == AcceptKernelMode::BY_IDS_WITH_PATH)
         {
-            mMedusaLogitsPtrs = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize, mMaxNumHeads}), ptrType);
+            mMedusaLogitsPtrs = BufferManager::pinned(
+                ITensor::makeShape({mMaxBatchSize, mMaxDraftSeqPerStep, mMaxNumHeads}), ptrType);
+            mMedusaInputLogitsPtrs = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize, mMaxNumHeads}), ptrType);
+            mTokensPerStep = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+            mBestPaths = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
         }
     }
 
@@ -285,8 +290,6 @@ public:
     {
         std::mt19937 generator(seed);
         std::uniform_int_distribution<SizeType> contextLenDistr(0, std::max(mMaxSeqLen - mMaxTotalDraftTokens, 0));
-        std::uniform_int_distribution<SizeType> draftContextLenDistr(
-            0, std::max(mMaxDraftSeqlen - mMaxTotalDraftTokens, 0));
         std::uniform_int_distribution<SizeType> numTotalDraftTokensDistr(1, mMaxTotalDraftTokens);
         std::uniform_int_distribution<SizeType> numDraftTokensDistr(0, mMaxDraftTokens);
         std::uniform_int_distribution<SizeType> vocabDistr(1, mVocabSize - 1);
@@ -297,7 +300,6 @@ public:
 
         auto sequenceLengthsPtr = BufferRange<SizeType>(*mSequenceLengths);
         auto contextLengthsPtr = BufferRange<SizeType>(*mContextLengths);
-        auto draftContextLengthsPtr = BufferRange<SizeType>(*mDraftContextLengths);
         auto numsDraftTokensPtr = BufferRange<SizeType>(*mNumsDraftTokens);
         auto draftTokensPtr = BufferRange<SizeType>(*mDraftTokens);
         auto targetTokensPtr = BufferRange<SizeType>(*mTargetTokens);
@@ -344,11 +346,10 @@ public:
 
             // Randomly init context len for target and draft
             contextLengthsPtr[bi] = contextLenDistr(generator);
-            draftContextLengthsPtr[bi] = draftContextLenDistr(generator);
         }
 
         std::fill(draftTokensPtr.begin(), draftTokensPtr.begin() + mMaxBatchSize * mMaxDraftSeqlen, mPadId);
-        std::fill(targetTokensPtr.begin(), targetTokensPtr.begin() + mMaxBatchSize * mMaxSeqLen, mPadId);
+        std::fill(targetTokensPtr.begin(), targetTokensPtr.begin() + mMaxBatchSize * mMaxTargetSeqlen, mPadId);
         std::fill(pathsPtr.begin(), pathsPtr.begin() + mMaxBatchSize * mMaxDraftSeqPerStep * mMaxDraftTokens, -1);
 
         // Generate paths
@@ -366,13 +367,16 @@ public:
                 {
                     auto const pathIdx = tc::flat_index3(bi, pi, ti, mMaxDraftSeqPerStep, mMaxDraftTokens);
                     // Single linear path for BY_IDS and BY_LOGITS modes
-                    auto const pathId = mAcceptMode == AcceptKernelMode::BY_IDS_WITH_PATH
+                    auto const pathId = mAcceptMode == AcceptKernelMode::BY_IDS_WITH_PATH && ti != 0
                         ? generateAvoidingValues(pathIdDistr, pathIds, mMaxDraftTokens * 5, -1)
                         : ti;
                     pathsPtr[pathIdx] = pathId;
                     pathIds.insert(pathId);
                 }
-                TLLM_LOG_DEBUG("bi %d pi %d numsDraftTokensPtr[bi] %d", bi, pi, numDraftTokensAtStep);
+                if (bi == 2)
+                {
+                    TLLM_LOG_DEBUG("bi %d pi %d numsDraftTokensPtr[bi] %d", bi, pi, numDraftTokensAtStep);
+                }
             }
         }
 
@@ -391,10 +395,11 @@ public:
                 // Accept ~ half of the tokens on avergae
                 std::poisson_distribution<SizeType> targetAcceptedDistr(targetPredictedLen[bi] / 2);
                 targetAcceptedLen[bi] = std::min(targetAcceptedDistr(generator), targetPredictedLen[bi]);
-
-                TLLM_LOG_DEBUG(
-                    "bi %d ti %d targetPredictedLen[bi] %d targetAcceptedLen[bi] %d draftContextLengthsPtr[bi] %d", bi,
-                    ti, targetPredictedLen[bi], targetAcceptedLen[bi], draftContextLengthsPtr[bi]);
+                if (bi == 2)
+                {
+                    TLLM_LOG_DEBUG("bi %d ti %d targetPredictedLen[bi] %d targetAcceptedLen[bi] %d", bi, ti,
+                        targetPredictedLen[bi], targetAcceptedLen[bi]);
+                }
             }
 
             // Fill draft tokens
@@ -407,11 +412,14 @@ public:
                     {
                         continue;
                     }
-                    auto const draftTokenIdx = bi * mMaxDraftSeqlen + draftContextLengthsPtr[bi] + pathsPtr[pathIdx];
+                    auto const draftTokenIdx = bi * mMaxDraftSeqlen + pathsPtr[pathIdx];
                     // Avoid generating endId. We'll insert in manually later if needed.
                     draftTokensPtr[draftTokenIdx] = generateAvoidingValues(vocabDistr, {mPadId, endIdsPtr[bi]});
-                    TLLM_LOG_DEBUG("bi %d ti %d si %d pathId %d draftToken %d", bi, ti, si, pathsPtr[pathIdx],
-                        draftTokensPtr[draftTokenIdx]);
+                    if (bi == 2)
+                    {
+                        TLLM_LOG_DEBUG("bi %d ti %d si %d pathId %d draftToken %d", bi, ti, si, pathsPtr[pathIdx],
+                            draftTokensPtr[draftTokenIdx]);
+                    }
                 }
             }
 
@@ -430,18 +438,20 @@ public:
                 mAcceptedLen[bi] = contextLengthsPtr[bi] + std::max(targetAcceptedLen[bi], 0);
                 mOutputLen[bi] = std::min(sequenceLengthsPtr[bi], std::min(mAcceptedLen[bi] + 1, mMaxSeqLen));
                 mAcceptedFinished[bi] = finishedStepsPtr[std::max(targetAcceptedLen[bi], 0) * mMaxBatchSize + bi];
-
-                TLLM_LOG_DEBUG(
-                    "bi %d ti %d contextLengthsPtr[bi] %d sequenceLengthsPtr[bi] %d mAcceptedLen[bi] %d mOutputLen[bi] "
-                    "%d",
-                    bi, ti, contextLengthsPtr[bi], sequenceLengthsPtr[bi], mAcceptedLen[bi], mOutputLen[bi]);
+                if (bi == 2)
+                {
+                    TLLM_LOG_DEBUG(
+                        "bi %d ti %d contextLengthsPtr[bi] %d sequenceLengthsPtr[bi] %d mAcceptedLen[bi] %d "
+                        "mOutputLen[bi] "
+                        "%d",
+                        bi, ti, contextLengthsPtr[bi], sequenceLengthsPtr[bi], mAcceptedLen[bi], mOutputLen[bi]);
+                }
             }
 
             // Fill token arrays
             for (SizeType bi = 0; bi < mMaxBatchSize; ++bi)
             {
-                // Draft:  [padId, padId, for draftContextLengthsPtr[bi] ... padId,
-                //         d0, d1, d2, ... for numsDraftTokensPtr[bi] ... , dK,
+                // Draft:  [d0, d1, d2, ... for numsDraftTokensPtr[bi] ... , dK,
                 //         padId, padId, .. to mMaxDraftSeqlen]
                 // Target: [padId, padId, ... for contextLengthsPtr[bi] ... padId,
                 //         d0, d1, d2, ... for targetAcceptedLen[bi],
@@ -466,10 +476,11 @@ public:
                     {
                         continue;
                     }
-                    auto const draftTokenIdx = bi * mMaxDraftSeqlen + draftContextLengthsPtr[bi] + nextPathId;
-                    auto const targetTokenIdx = bi * mMaxSeqLen + contextLengthsPtr[bi] + curPathId;
+                    auto const contextLen
+                        = mAcceptMode == AcceptKernelMode::BY_IDS_WITH_PATH ? 0 : contextLengthsPtr[bi];
+                    auto const draftTokenIdx = bi * mMaxDraftSeqlen + nextPathId;
+                    auto const targetTokenIdx = bi * mMaxTargetSeqlen + contextLen + curPathId;
                     auto targetToken = mPadId;
-
                     if (0 <= si && si < targetAcceptedLen[bi] && nextPathId != -1)
                     {
                         // Use draft token up to the accepted len
@@ -491,7 +502,11 @@ public:
                         targetToken = endIdsPtr[bi];
                     }
                     targetTokensPtr[targetTokenIdx] = targetToken;
-                    TLLM_LOG_DEBUG("bi %d ti %d si %d pathId %d targetToken %d", bi, ti, si, curPathId, targetToken);
+                    if (bi == 2)
+                    {
+                        TLLM_LOG_DEBUG(
+                            "bi %d ti %d si %d pathId %d targetToken %d", bi, ti, si, curPathId, targetToken);
+                    }
                 }
             }
         }
@@ -505,6 +520,7 @@ public:
         {
             initDataAndReferenceAcceptByIdsWithPaths();
         }
+        mSequenceLengthsCopy = mBufferManager->copyFrom(*mSequenceLengths, MemoryType::kCPU);
     }
 
     void initDataAndReferenceAcceptByIdsWithPaths()
@@ -515,11 +531,13 @@ public:
         auto pathsPtr = BufferRange<SizeType>(*mPaths);
         auto endIdsPtr = BufferRange<SizeType>(*mEndIds);
         auto contextLengthsPtr = BufferRange<SizeType>(*mContextLengths);
-        auto draftContextLengthsPtr = BufferRange<SizeType>(*mDraftContextLengths);
         auto draftTokensPtr = BufferRange<SizeType>(*mDraftTokens);
         auto targetTokensPtr = BufferRange<SizeType>(*mTargetTokens);
+        auto medusaInputLogitsPtr = BufferRange<T*>(*mMedusaInputLogitsPtrs);
 
         trk::invokeFill(*mMedusaLogitsPtrs, int64_t{0}, *mStream);
+        trk::invokeFill(*mTokensPerStep, int32_t{mMaxTotalDraftTokens}, *mStream);
+        trk::invokeFill(*mBestPaths, int32_t{-1}, *mStream);
 
         mAcceptedLen.resize(mMaxBatchSize);
         mAcceptedPathIdx.resize(mMaxBatchSize);
@@ -546,10 +564,9 @@ public:
                 {
                     continue;
                 }
-                auto targetTokenIdx = bi * mMaxSeqLen + contextLengthsPtr[bi] + pathId;
+                auto targetTokenIdx = bi * mMaxTargetSeqlen + pathId;
                 auto targetToken = targetTokensPtr[targetTokenIdx];
                 auto curNextTargetTokenIdx = pathId;
-
                 for (SizeType di = 1; di < mMaxDraftTokens; ++di)
                 {
                     auto const pathIdx = tc::flat_index3(bi, ti, di, mMaxDraftSeqPerStep, mMaxDraftTokens);
@@ -562,8 +579,8 @@ public:
                         acceptedTokens.push_back(targetToken);
                         break;
                     }
-                    auto const draftTokenIdx = bi * mMaxDraftSeqlen + draftContextLengthsPtr[bi] + pathId;
-                    auto targetTokenIdx = bi * mMaxSeqLen + contextLengthsPtr[bi] + pathId;
+                    auto const draftTokenIdx = bi * mMaxDraftSeqlen + pathId - 1;
+                    auto const targetTokenIdx = bi * mMaxTargetSeqlen + pathId;
                     auto const draftToken = draftTokensPtr[draftTokenIdx];
                     bool const hasEnd = targetToken == endIdsPtr[bi];
                     if (!hasEnd)
@@ -576,7 +593,6 @@ public:
                         curAcceptedLen = curLen;
                         curAcceptedPath = ti;
                         curFinished = hasEnd;
-                        curNextTargetTokenIdx = pathId;
                         break;
                     }
                     targetToken = targetTokensPtr[targetTokenIdx];
@@ -600,15 +616,23 @@ public:
             mRefAcceptedTokens[bi] = maxAcceptedTokens;
             mFinishedByIdsPaths[bi] = maxFinished;
             mLastTargetIdx[bi] = maxNextTargetTokenIdx;
-            TLLM_LOG_DEBUG("bi %d maxAcceptedLen %d maxAcceptedPath %d", bi, maxAcceptedLen, maxAcceptedPath);
-            std::ostringstream ss;
-            for (auto& tk : maxAcceptedTokens)
+            for (SizeType hi = 0; hi < mMaxNumHeads; ++hi)
             {
-                ss << tk << " ";
+                medusaInputLogitsPtr[bi * mMaxNumHeads + hi] = static_cast<T*>(nullptr)
+                    + tc::flat_index4(hi, bi, 0, 0, mMaxBatchSize, mMaxDraftSeqPerStep, mVocabSize);
             }
-            TLLM_LOG_DEBUG(ss.str().c_str());
+            if (bi == 2)
+            {
+                TLLM_LOG_DEBUG("bi %d maxAcceptedLen %d maxAcceptedPath %d maxNextTargetTokenIdx %d", bi,
+                    maxAcceptedLen, maxAcceptedPath, maxNextTargetTokenIdx);
+                std::ostringstream ss;
+                for (auto& tk : maxAcceptedTokens)
+                {
+                    ss << tk << " ";
+                }
+                TLLM_LOG_DEBUG(ss.str().c_str());
+            }
         }
-        mDraftContextLengthsCopy = mBufferManager->copyFrom(*mDraftContextLengths, MemoryType::kCPU);
     }
 
     void initDataAndReferenceAcceptByLogits()
@@ -727,13 +751,15 @@ public:
 
     void callAcceptByIdsWithPaths()
     {
-        tk::acceptDraftTokensByIdsWithPaths(bufferCast<SizeType>(*mDraftTokens), bufferCast<SizeType>(*mTargetTokens),
-            bufferCast<SizeType>(*mDraftContextLengths), bufferCast<SizeType>(*mAcceptedLengths),
+        tk::acceptDraftTokensByIdsWithPaths(bufferCast<SizeType>(*mOutputTokens), bufferCast<SizeType>(*mDraftTokens),
+            bufferCast<SizeType>(*mTargetTokens), bufferCast<SizeType>(*mSequenceLengths),
+            bufferCast<SizeType>(*mAcceptedLengths),
             reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*mFinishedFinal)),
             bufferCast<SizeType>(*mBatchSlots), bufferCast<SizeType>(*mPaths), bufferCast<SizeType>(*mEndIds),
-            static_cast<T const*>(nullptr), reinterpret_cast<T const**>(bufferCast<int64_t>(*mMedusaLogitsPtrs)),
-            mBatchSize, mVocabSize, mMaxBatchSize, mMaxDraftSeqlen, mMaxTotalDraftTokens, mMaxNumHeads,
-            mMaxDraftSeqPerStep, mStream->get());
+            reinterpret_cast<T const**>(bufferCast<int64_t>(*mMedusaInputLogitsPtrs)),
+            reinterpret_cast<T const**>(bufferCast<int64_t>(*mMedusaLogitsPtrs)), bufferCast<SizeType>(*mTokensPerStep),
+            bufferCast<SizeType>(*mTokensPerStep), bufferCast<SizeType>(*mBestPaths), mBatchSize, mVocabSize,
+            mMaxBatchSize, mMaxTargetSeqlen, mMaxSeqLen, mMaxNumHeads, mMaxDraftSeqPerStep, mStream->get());
     }
 
     void callTestedKernel()
@@ -818,10 +844,11 @@ public:
     {
         auto medusaLogitsPtrsPtr = BufferRange<T*>(*mMedusaLogitsPtrs);
         auto batchSlotsPtr = BufferRange<SizeType>(*mBatchSlots);
-        auto draftContextLengths = BufferRange<SizeType>(*mDraftContextLengths);
-        auto draftContextLengthsInit = BufferRange<SizeType>(*mDraftContextLengthsCopy);
+        auto draftContextLengths = BufferRange<SizeType>(*mSequenceLengths);
+        auto draftContextLengthsInit = BufferRange<SizeType>(*mSequenceLengthsCopy);
         auto acceptedLengths = BufferRange<SizeType>(*mAcceptedLengths);
-        auto draftTokensPtr = BufferRange<SizeType>(*mDraftTokens);
+        auto outputIdsPtr = BufferRange<TokenIdType>(*mOutputTokens);
+        auto bestPathIds = BufferRange<SizeType>(*mBestPaths);
         auto finishedFinalPtr
             = reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*mFinishedFinal));
 
@@ -838,10 +865,12 @@ public:
             auto const acceptedLen = mAcceptedLen[batchSlot];
             auto acceptedTokens = mRefAcceptedTokens[batchSlot];
 
+            EXPECT_EQ(bestPathIds[batchSlot], bestPathIdx) << "bi: " << bi << " seed: " << seed;
+
             for (int32_t hi = 0; hi < mMaxNumHeads; ++hi)
             {
                 auto refOffset
-                    = tc::flat_index4(hi, bi, lastTargetIdx, 0, mMaxBatchSize, mMaxDraftSeqPerStep, mVocabSize);
+                    = tc::flat_index4(hi, batchSlot, lastTargetIdx, 0, mMaxBatchSize, mMaxDraftSeqPerStep, mVocabSize);
                 auto outOffset
                     = static_cast<SizeType>(medusaLogitsPtrsPtr[bi * mMaxNumHeads + hi] - static_cast<T*>(nullptr));
                 EXPECT_EQ(outOffset, refOffset) << " bi: " << bi << " hi: " << hi << " seed: " << seed;
@@ -855,7 +884,7 @@ public:
             {
                 ASSERT_EQ(mRefAcceptedTokens[batchSlot].size(), acceptedLen)
                     << " bi: " << bi << " ti: " << ti << " seed: " << seed;
-                EXPECT_EQ(draftTokensPtr[batchSlot * mMaxDraftSeqlen + draftContextLengthsInit[batchSlot] + ti],
+                EXPECT_EQ(outputIdsPtr[batchSlot * mMaxSeqLen + draftContextLengthsInit[batchSlot] + ti],
                     mRefAcceptedTokens[batchSlot][ti])
                     << " bi: " << bi << " ti: " << ti << " seed: " << seed;
             }
@@ -884,6 +913,7 @@ public:
         mBeamWidth = params.mBeamWidth;
         mVocabSize = params.mVocabSize;
         mMaxDraftTokens = params.mMaxDraftTokens;
+        mMaxSeqLen = params.mMaxSeqLen;
 
         mMaxNumHeads = params.mMaxNumHeads;
         if (mMaxNumHeads > 1 && mAcceptMode != AcceptKernelMode::BY_IDS_WITH_PATH)
@@ -900,8 +930,8 @@ public:
         mMaxTotalDraftTokens = mMaxDraftSeqPerStep * mMaxDraftTokens;
         mPadId = mVocabSize - 1;
 
-        mMaxDraftSeqlen = mAcceptMode == AcceptKernelMode::BY_IDS_WITH_PATH ? params.mMaxSeqLen : mMaxDraftTokens;
-        mMaxSeqLen = mAcceptMode == AcceptKernelMode::BY_IDS_WITH_PATH ? mMaxTotalDraftTokens : params.mMaxSeqLen;
+        mMaxDraftSeqlen = mAcceptMode == AcceptKernelMode::BY_IDS_WITH_PATH ? mMaxDraftTokens - 1 : mMaxDraftTokens;
+        mMaxTargetSeqlen = mAcceptMode == AcceptKernelMode::BY_IDS_WITH_PATH ? mMaxDraftTokens : mMaxSeqLen;
 
         createBuffers();
 
@@ -931,6 +961,7 @@ protected:
 
     TensorPtr mDraftTokens;
     TensorPtr mTargetTokens;
+    TensorPtr mOutputTokens;
 
     TensorPtr mDraftLogits;
     TensorPtr mTargetLogits;
@@ -942,10 +973,9 @@ protected:
 
     TensorPtr mNumsDraftTokens;
     TensorPtr mSequenceLengths;
+    TensorPtr mSequenceLengthsCopy;
     TensorPtr mAcceptedLengths;
     TensorPtr mContextLengths;
-    TensorPtr mDraftContextLengthsCopy;
-    TensorPtr mDraftContextLengths;
     TensorPtr mFinishedSteps;
     TensorPtr mFinishedFinal;
     TensorPtr mFinishedSum;
@@ -954,6 +984,9 @@ protected:
     TensorPtr mPaths;
     TensorPtr mEndIds;
     TensorPtr mMedusaLogitsPtrs;
+    TensorPtr mMedusaInputLogitsPtrs;
+    TensorPtr mTokensPerStep;
+    TensorPtr mBestPaths;
 
     TensorPtr mCurandStates;
 
@@ -973,6 +1006,7 @@ protected:
     SizeType mMaxDraftTokens;
     SizeType mMaxTotalDraftTokens;
     SizeType mMaxDraftSeqlen;
+    SizeType mMaxTargetSeqlen;
     SizeType mMaxNumHeads;
     SizeType mMaxDraftSeqPerStep;
     AcceptKernelMode mAcceptMode;
@@ -1037,9 +1071,9 @@ TYPED_TEST(DecodingKernelsTest, acceptDraftTokensByIdsWithPathsKernelSmall)
                       .setBatchSize(1)
                       .setMaxSeqLen(128)
                       .setVocabSize(32)
-                      .setMaxDraftTokens(5)
+                      .setMaxDraftTokens(3)
                       .setMaxDraftSeqPerStep(4)
-                      .setMaxNumHeads(4)
+                      .setMaxNumHeads(2)
                       .setAcceptMode(AcceptKernelMode::BY_IDS_WITH_PATH));
 }
 

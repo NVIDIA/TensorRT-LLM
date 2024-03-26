@@ -2,6 +2,16 @@
 
 This document shows how to build and run InternLM 7B / 20B models in TensorRT-LLM on both single GPU, single node multi-GPU and multi-node multi-GPU.
 
+- [InternLM](#internlm)
+  - [Overview](#overview)
+  - [Support Matrix](#support-matrix)
+  - [Usage](#usage)
+    - [Build TensorRT engine(s)](#build-tensorrt-engines)
+      - [INT8 weight only + INT8 KV cache](#int8-weight-only--int8-kv-cache)
+      - [SmoothQuant](#smoothquant)
+    - [Run](#run)
+    - [Summarization using the InternLM model](#summarization-using-the-internlm-model)
+
 ## Overview
 
 The TensorRT-LLM InternLM implementation is based on the LLaMA model. The implementation can
@@ -28,6 +38,12 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 The TensorRT-LLM InternLM example code locates at [examples/internlm](./). It takes HF weights as input, and builds the corresponding TensorRT engines. The number of TensorRT engines depends on the number of GPUs used to run inference.
 
 ### Build TensorRT engine(s)
+
+Please install required packages first:
+
+```bash
+pip install -r requirements.txt
+```
 
 TensorRT-LLM InternLM builds TensorRT engine(s) from HF checkpoint. If no checkpoint directory is specified, TensorRT-LLM will build engine(s) with dummy weights.
 
@@ -114,7 +130,8 @@ python convert_checkpoint.py --model_dir ./internlm-chat-7b  \
 # Build 7B model with both INT8 weight-only and INT8 KV cache enabled
 trtllm-build --checkpoint_dir ./internlm-chat-7b/smooth_internlm/int8_kv_cache/ \
              --output_dir ./engine_outputs \
-             --gemm_plugin float16
+             --gemm_plugin float16 \
+             --strongly_typed
 ```
 
 
@@ -123,7 +140,7 @@ cd examples/llama
 
 # For 20B models
 python convert_checkpoint.py --model_dir ./internlm-chat-20b  \
-                            --output_dir ./internlm-chat-20b/smooth_internlm/int8_kv_cache/ \
+                             --output_dir ./internlm-chat-20b/smooth_internlm/int8_kv_cache/ \
                              --dtype float16  \
                              --use_weight_only \
                              --weight_only_precision int8 \
@@ -133,6 +150,7 @@ python convert_checkpoint.py --model_dir ./internlm-chat-20b  \
 trtllm-build --checkpoint_dir ./internlm-chat-20b/smooth_internlm/int8_kv_cache/ \
   --output_dir ./engine_outputs \
   --gemm_plugin float16 \
+  --strongly_typed
 ```
 
 

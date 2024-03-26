@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
+from typing import Optional
 
 import torch
 
@@ -37,13 +38,13 @@ class Embedding(Module):
     """
 
     def __init__(self,
-                 num_embeddings,
-                 embedding_dim,
-                 dtype=None,
-                 tp_size=1,
-                 tp_group=None,
-                 sharding_dim=0,
-                 tp_rank=None):
+                 num_embeddings: int,
+                 embedding_dim: int,
+                 dtype: Optional[str] = None,
+                 tp_size: int = 1,
+                 tp_group: Optional[list] = None,
+                 sharding_dim: int = 0,
+                 tp_rank: Optional[int] = None):
         super().__init__()
         # num_embeddings records the total vocab size no matter using TP or not
         self.num_embeddings = num_embeddings

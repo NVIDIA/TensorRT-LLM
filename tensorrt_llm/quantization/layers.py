@@ -842,14 +842,13 @@ class FP8RowLinear(RowLinear):
 
     def forward(self, x, lora_runtime_params=None):
         assert lora_runtime_params is None, "lora is not supported on FP8RowLinear now"
-        if default_net().strongly_typed:
-            assert is_same_dtype(
-                x.dtype,
-                self.dtype), f"Got input type {x.dtype}, expecting {self.dtype}"
 
         activation_scaling_factor = cast(self.activation_scaling_factor.value,
                                          self.dtype)
-        quantized_out = quantize(x, activation_scaling_factor, 'fp8')
+        if x.dtype != trt.fp8:
+            quantized_out = quantize(x, activation_scaling_factor, 'fp8')
+        else:
+            quantized_out = x
         dequantized_out = dequantize(quantized_out, activation_scaling_factor,
                                      -1, self.dtype)
 
@@ -1117,9 +1116,6 @@ class SmoothQuantAttention(Module):
                 host_kv_cache_block_pointers=kv_cache_params.
                 host_kv_cache_block_pointers,
                 host_context_lengths=attention_params.host_context_lengths,
-                enable_pos_shift=default_net().plugin_config.pos_shift,
-                dense_context_fmha=default_net(
-                ).plugin_config.dense_context_fmha,
                 medusa_position_offsets=medusa_position_offsets,
                 medusa_packed_mask=medusa_packed_mask)
         else:

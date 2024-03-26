@@ -41,12 +41,12 @@ public:
     class SetupParams : public DecodingSetupParams
     {
     public:
-        std::optional<std::vector<runtime::SizeType>> runtime_top_k; // [1] or [batchSize] on cpu
-        std::optional<std::vector<float>> runtime_top_p;             // [1] or [batchSize] on cpu
-        std::optional<std::vector<uint64_t>> randomSeed;             // [1] or [batchSize] on cpu
-        std::optional<std::vector<float>> top_p_decay;               // [batchSize], must between [0, 1]
-        std::optional<std::vector<float>> top_p_min;                 // [batchSize], must between [0, 1]
-        std::optional<std::vector<std::int32_t>> top_p_reset_ids;    // [batchSize]
+        std::optional<std::vector<runtime::SizeType>> runtime_top_k;      // [1] or [batchSize] on cpu
+        std::optional<std::vector<float>> runtime_top_p;                  // [1] or [batchSize] on cpu
+        std::optional<std::vector<uint64_t>> randomSeed;                  // [1] or [batchSize] on cpu
+        std::optional<std::vector<float>> top_p_decay;                    // [batchSize], must between [0, 1]
+        std::optional<std::vector<float>> top_p_min;                      // [batchSize], must between [0, 1]
+        std::optional<std::vector<runtime::TokenIdType>> top_p_reset_ids; // [batchSize]
         std::optional<bool> normalize_log_probs;
     };
 

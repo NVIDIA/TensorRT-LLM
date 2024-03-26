@@ -102,7 +102,7 @@ std::vector<decoder_batch::Request> prepareRequests(SizeType batchSize, SizeType
             std::vector<TokenIdType> draftTokens(generatedTokensPerSteps[batchIdx] - 1);
             std::fill(draftTokens.begin(), draftTokens.begin() + acceptedTokensPerStep[batchIdx], 1023);
             requests.back().draftTokens = manager.copyFrom(draftTokens, MemoryType::kGPU);
-            requests.back().generatedTokensPerStep = generatedTokensPerSteps[batchIdx];
+            requests.back().generatedTokensPerEngineStep = generatedTokensPerSteps[batchIdx];
         }
         requests.back().computeCumLogProbs = computeLogProbs;
         requests.back().computeLogProbs = computeLogProbs;
@@ -247,7 +247,7 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig> con
     // set up decoder
     auto decoder = GptDecoderBatch(vocabSize, vocabSizePadded, streamPtr);
     decoder.setup(decodingMode, batchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSeqLength,
-        maxGeneratedTokensPerStep, false, dataType);
+        maxGeneratedTokensPerStep, false, dataType, modelConfig);
 
     std::vector<SizeType> seqSlots;
     std::vector<decoder_batch::Request> decoderRequests;
@@ -364,7 +364,7 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
     // set up decoder
     auto decoder = GptDecoderBatch(vocabSize, vocabSizePadded, streamPtr);
     decoder.setup(decodingMode, batchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSeqLength,
-        maxGeneratedTokensPerStep, false, dataType);
+        maxGeneratedTokensPerStep, false, dataType, modelConfig);
 
     std::vector<SizeType> expectedSteps(batchSize, 0);
     auto expectedLengths = tiledInputLengths;
@@ -481,7 +481,7 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
     auto decoder = GptDecoderBatch(vocabSize, vocabSizePadded, streamPtr);
     decoder.setup(decodingMode, batchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSeqLength,
         maxGeneratedTokensPerStep,
-        /* fused decoder */ true, dataType);
+        /* fused decoder */ true, dataType, modelConfig);
 
     std::vector<SizeType> seqSlots(batchSize);
     std::iota(seqSlots.begin(), seqSlots.end(), 0);

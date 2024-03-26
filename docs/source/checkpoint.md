@@ -1,17 +1,16 @@
-# New Workflow
+# TensorRT-LLM Checkpoint
 
 ## Overview
 
-The first versions of TensorRT-LLM were developed with a very aggressive timeline. For those versions emphasis was not put
+The earlier versions (pre-0.8 version) of TensorRT-LLM were developed with a very aggressive timeline. For those versions, emphasis was not put
 on defining a unified workflow. Now that TensorRT-LLM has reached some level of feature richness, the development team has
-decided to put more efforts into unifying the APIs and workflow of TensorRT-LLM. This document summarises the new workflow
-adopted by TensorRT-LLM at its core.
+decided to put more effort into unifying the APIs and workflow of TensorRT-LLM. This file documents the workflow around TensorRT-LLM checkpoint and the set of CLI tools to generate checkpoint, build engines, and evaluate engines.
 
-There are 3 steps in the new workflow:
+There are three steps in the workflow:
 
-1. Convert weights from different source frameworks into TensorRT-LLM checkpoint
-2. Build the TensorRT-LLM checkpoint into TensorRT engine(s) with a unified build command
-3. Load the engine(s) to TensorRT-LLM model runner and make evaluation with different evaluation tasks
+1. Convert weights from different source frameworks into TensorRT-LLM checkpoint.
+2. Build the TensorRT-LLM checkpoint into TensorRT engines with a unified build command.
+3. Load the engines to TensorRT-LLM model runner and evaluate with different evaluation tasks.
 
 ```
 NeMo -------------
@@ -27,17 +26,17 @@ DeepSpeed --------
 
 ## Prepare the TensorRT-LLM Checkpoint
 
-TensorRT-LLM aims at supporting different of sources:
+TensorRT-LLM aims at supporting different sources:
 
-1. Trained models from NeMo, DeepSpeed, JAX
-2. Quantized models from AMMO
+1. Trained models from NVIDIA NeMo, Microsoft DeepSpeed, and JAX
+2. Quantized models from NVIDIA AMMO
 3. Popular models from HuggingFace
 
 TensorRT-LLM defines its own checkpoint format. A checkpoint directory includes:
 
-1. One config json file, which contains several model hyper-parameters
+1. One config `json` file, which contains several model hyper-parameters.
 2. One or several rank weights files, each file contains a dictionary of tensors (weights).
-The different files will be loaded by different ranks in a multi-GPU (multi-process) scenario
+The different files are loaded by different ranks in a multi-GPU (multi-process) scenario.
 
 ### Config
 
@@ -109,75 +108,76 @@ Here is the model specific config list:
 
 ### Rank Weights
 
-Like PyTorch, the tensor(weight) name is a string containing hierarchical information,
+Like PyTorch, the tensor (weight) name is a string containing hierarchical information,
 which is uniquely mapped to a certain parameter of a TensorRT-LLM model.
 
-For example, each transformer layer of the OPT model contains an `Attention` layer, an `MLP` layer and two `LayerNorm` layers.
+For example, each transformer layer of the OPT model contains an `Attention` layer, an `MLP` layer. and two `LayerNorm` layers.
 
 #### Attention Weights
 
 The `Attention` layer contains two `Linear` layers, qkv and dense; each `Linear` layer contains one weight and one bias.
-So, there are four tensors (weights) in total, whose names are:
+There are four tensors (weights) in total, whose names are:
 
-- "transformer.layers.0.attention.qkv.weight"
-- "transformer.layers.0.attention.qkv.bias"
-- "transformer.layers.0.attention.dense.weight"
-- "transformer.layers.0.attention.dense.bias"
+- `transformer.layers.0.attention.qkv.weight`
+- `transformer.layers.0.attention.qkv.bias`
+- `transformer.layers.0.attention.dense.weight`
+- `transformer.layers.0.attention.dense.bias`
 
-where `transformer.layers.0.attention` is the prefix name, indicating that the weights/biases are in the attention module of the 0-th transformer layer.
+where `transformer.layers.0.attention` is the prefix name, indicating that the weights/biases are in the Attention module of the 0-th transformer layer.
 
 #### MLP Weights
 
 The `MLP` layer also contains two `Linear` layers, fc and proj; each `Linear` layer contains one weight and one bias.
-So, there are four tensors (weights) in total, whose names are:
+There are four tensors (weights) in total, whose names are:
 
-- "transformer.layers.0.mlp.fc.weight"
-- "transformer.layers.0.mlp.fc.bias"
-- "transformer.layers.0.mlp.proj.weight"
-- "transformer.layers.0.mlp.proj.bias"
+- `transformer.layers.0.mlp.fc.weight`
+- `transformer.layers.0.mlp.fc.bias`
+- `transformer.layers.0.mlp.proj.weight`
+- `transformer.layers.0.mlp.proj.bias`
 
-where `transformer.layers.0.mlp` is the prefix name, indicating that the weights/biases are in the mlp module of the 0-th transformer layer.
+where `transformer.layers.0.mlp` is the prefix name, indicating that the weights/biases are in the MLP module of the 0-th transformer layer.
 
 #### LayerNorm Weights
 
-Each of the two `LayerNorm` layers, namely input_layernorm and post_layernorm, contains one weight and one bias.
-So, there are four tensors (weights) in total, whose names are:
+Each of the two `LayerNorm` layers, namely `input_layernorm` and `post_layernorm`, contains one weight and one bias.
+There are four tensors (weights) in total, whose names are:
 
-- "transformer.layers.0.input_layernorm.weight"
-- "transformer.layers.0.input_layernorm.bias"
-- "transformer.layers.0.post_layernorm.weight"
-- "transformer.layers.0.post_layernorm.bias"
+- `transformer.layers.0.input_layernorm.weight`
+- `transformer.layers.0.input_layernorm.bias`
+- `transformer.layers.0.post_layernorm.weight`
+- `transformer.layers.0.post_layernorm.bias`
 
-where `transformer.layers.0.input_layernorm` and `transformer.layers.0.post_layernorm` are prefix names for the two layernorm modules.
+where `transformer.layers.0.input_layernorm` and `transformer.layers.0.post_layernorm` are prefix names for the two `layernorm` modules.
 
 #### KV Cache Quantization Scaling Factors
 
-Note that if we quantize the model, there will be different tensors (depending on the quantization method applied).
+If we quantize the model, there will be different tensors (depending on the quantization method applied).
 For example, if we quantize the KV cache, the `Attention` layer will have this extra scaling factor:
 
-- "transformer.layers.0.attention.kv_cache_scaling_factor"
+- `transformer.layers.0.attention.kv_cache_scaling_factor`
 
 #### FP8 Quantization Scaling Factors
 
-For example, here is the FP8 scaling factors of attention.qkv linear layer:
+Here is the FP8 scaling factors of `attention.qkv` linear layer:
 
-- "transformer.layers.0.attention.qkv.activation_scaling_factor"
-- "transformer.layers.0.attention.qkv.weights_scaling_factor"
+- `transformer.layers.0.attention.qkv.activation_scaling_factor`
+- `transformer.layers.0.attention.qkv.weights_scaling_factor`
 
 #### AWQ Quantization Scaling Factors
 
-For example, here is the AWQ scaling factors of mlp.fc linear layer:
+Here is the AWQ scaling factors of `mlp.fc` linear layer:
 
-- "transformer.layers.0.mlp.fc.weights_scaling_factor"
-- "transformer.layers.0.mlp.fc.prequant_scaling_factor"
+- `transformer.layers.0.mlp.fc.weights_scaling_factor`
+- `transformer.layers.0.mlp.fc.prequant_scaling_factor`
 
-**Note**: The linear weights in TensorRT-LLM checkpoint always follows (out_feature, in_feature) shape,
-whereas some quantized linear in TensorRT-LLM implemented by plugin may use (in_feature, out_fature) shape.
-`trtllm-build` command will add a transpose operation to post-process it.
+```{note}
+The linear weights in TensorRT-LLM checkpoint always follows (`out_feature`, `in_feature`) shape,
+whereas some quantized linear in TensorRT-LLM implemented by plugin may use (`in_feature`, `out_fature`) shape.
+The `trtllm-build` command adds a transpose operation to post-process it.
 
 ### Example
 
-Let's take OPT as an example, say we want to deploy the model with tensor parallelism 2:
+Let's take OPT as an example and deploy the model with tensor parallelism 2:
 
 ```bash
 cd examples/opt
@@ -224,7 +224,7 @@ Here is the `config.json`:
 ## Build Checkpoint into TensorRT Engine
 
 TensorRT-LLM provides a unified build command: `trtllm-build`. Before using it,
-you may need to add it to the `PATH`
+you may need to add it to the `PATH`.
 
 ```bash
 export PATH=/usr/local/bin:$PATH

@@ -113,8 +113,6 @@ def test_gpt_manager(variant, results_file, llm_root: _pl.Path,
             logits[:] = float("-inf")
             logits[..., 42] = 0
 
-        return logits
-
     ir = _tb.InferenceRequest(42, logits_post_processor)
     ir.input_ids = _tor.tensor(given_input[0].tolist(), dtype=_tor.int32)
     ir.max_new_tokens = _tor.tensor([[8]], dtype=_tor.int32)
@@ -285,8 +283,6 @@ def test_gpt_manager_constrained_generation(
 
         with _tor.cuda.stream(cuda_stream):
             logits += mask
-
-        return logits
 
     result = ""
 

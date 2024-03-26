@@ -3,6 +3,7 @@ import os
 import random
 import sys
 import time
+import typing as tp
 from pathlib import Path
 
 import numpy as np
@@ -706,6 +707,8 @@ def test_executor_config():
     assert config.batching_type == trtllm.BatchingType.INFLIGHT
     assert config.parallel_config is None
     assert isinstance(config.peft_cache_config, trtllm.PeftCacheConfig)
+    assert config.logits_post_processor_map is None
+    assert config.medusa_choices is None
 
     kwargs = {
         "max_beam_width":
@@ -725,7 +728,9 @@ def test_executor_config():
         "parallel_config":
         trtllm.ParallelConfig(),
         "peft_cache_config":
-        trtllm.PeftCacheConfig(10)
+        trtllm.PeftCacheConfig(10),
+        "logits_post_processor_map": {},
+        "medusa_choices": [[1, 2, 3]],
     }
     config = trtllm.ExecutorConfig(**kwargs)
     for k, v in kwargs.items():
@@ -781,3 +786,57 @@ def test_peft_cache_config():
     assert np.isclose(peft_cache_config.device_cache_percent,
                       device_cache_percent)
     assert peft_cache_config.host_cache_size == host_cache_size
+
+
+@skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
+def test_logits_post_processor(model_files, model_path):
+
+    # Define the logits post-processor callback
+    def logits_post_processor(req_id: int, logits: torch.Tensor,
+                              ids: tp.List[tp.List[int]], stream_ptr: int):
+        with torch.cuda.stream(torch.cuda.ExternalStream(stream_ptr)):
+            logits[:] = float("-inf")
+            logits[..., 42] = 0
+
+    # Create executor
+    beam_width = 1
+    executor_config = trtllm.ExecutorConfig(beam_width)
+    executor_config.logits_post_processor_map = {
+        "my_logits_pp": logits_post_processor
+    }
+    executor = trtllm.Executor(model_path, trtllm.ModelType.DECODER_ONLY,
+                               executor_config)
+
+    # Create the request
+    max_new_tokens = 5
+    input_tokens = [1, 2, 3, 4]
+    request = trtllm.Request(input_tokens, max_new_tokens, False)
+    request.logits_post_processor_name = "my_logits_pp"
+
+    # Enqueue the request
+    request_id = executor.enqueue_request(request)
+
+    # Get the new tokens
+    tokens = []
+    done = False
+    i = 0
+    max_wait_ms = 10000
+    while not done and i < max_wait_ms:
+        wait_time = datetime.timedelta(milliseconds=1)
+        responses = executor.await_responses(request_id, wait_time)
+        for response in responses:
+            assert not response.has_error(
+            ), f"Request id {request_id} failed with err {response.error_msg}"
+            result = response.result
+            done = result.is_final
+            new_tokens = result.output_token_ids[beam_width - 1]
+            tokens.extend(new_tokens)
+        i += 1
+    assert i < max_wait_ms
+    assert len(tokens) == get_expected_num_tokens(len(input_tokens),
+                                                  max_new_tokens, False,
+                                                  False), f"{request_id}"
+
+    # check that all output tokens are 42
+    print(tokens)
+    assert tokens[-max_new_tokens:] == [42] * max_new_tokens

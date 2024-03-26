@@ -22,6 +22,7 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include <NvInferRuntime.h>
 
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
@@ -106,6 +107,9 @@ public:
     {
         return allocate(memoryType, ITensor::makeShape({}), type);
     }
+
+    //! \brief Set the contents of the given `buffer` to value.
+    void setMem(IBuffer& buffer, int32_t value) const;
 
     //! \brief Set the contents of the given `buffer` to zero.
     void setZero(IBuffer& buffer) const;

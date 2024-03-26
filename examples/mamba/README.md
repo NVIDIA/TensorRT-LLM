@@ -25,10 +25,10 @@ format to the TensorRT-LLM format.
 
 ### 1. Download weights from HuggingFace Transformers
 
-Install the dependency packages and setup `git-lfs`.
+Please install required packages first and setup `git-lfs`:
 
 ```bash
-# Install dependencies
+pip install -r requirements.txt
 git clone --branch v1.1.1 https://github.com/Dao-AILab/causal-conv1d.git
 git clone --branch v1.1.1 https://github.com/state-spaces/mamba.git
 pip install ./causal-conv1d/ ./mamba/
@@ -109,8 +109,8 @@ The `trtllm-build` command builds TensorRT-LLM engines from TensorRT-LLM checkpo
 trtllm-build --checkpoint_dir ./mamba_model/mamba-2.8b-slimpj/trt_ckpt/bf16/1-gpu/ \
              --gpt_attention_plugin disable \
              --paged_kv_cache disable \
-             --remove_input_padding disable \
              --gemm_plugin bfloat16 \
+             --mamba_conv1d_plugin bfloat16 \
              --max_batch_size 8 \
              --max_input_len 924 \
              --max_output_len 100 \
@@ -120,8 +120,8 @@ trtllm-build --checkpoint_dir ./mamba_model/mamba-2.8b-slimpj/trt_ckpt/bf16/1-gp
 trtllm-build --checkpoint_dir ./mamba_model/mamba-2.8b/trt_ckpt/bf16/1-gpu/ \
              --gpt_attention_plugin disable \
              --paged_kv_cache disable \
-             --remove_input_padding disable \
              --gemm_plugin bfloat16 \
+             --mamba_conv1d_plugin bfloat16 \
              --max_batch_size 8 \
              --max_input_len 924 \
              --max_output_len 100 \
@@ -131,8 +131,8 @@ trtllm-build --checkpoint_dir ./mamba_model/mamba-2.8b/trt_ckpt/bf16/1-gpu/ \
 trtllm-build --checkpoint_dir ./mamba_model/mamba-1.4b/trt_ckpt/fp16/1-gpu/ \
              --gpt_attention_plugin disable \
              --paged_kv_cache disable \
-             --remove_input_padding disable \
              --gemm_plugin float16 \
+             --mamba_conv1d_plugin float16 \
              --max_batch_size 8 \
              --max_input_len 924 \
              --max_output_len 100 \
@@ -142,8 +142,8 @@ trtllm-build --checkpoint_dir ./mamba_model/mamba-1.4b/trt_ckpt/fp16/1-gpu/ \
 trtllm-build --checkpoint_dir ./mamba_model/mamba-790m/trt_ckpt/fp16/1-gpu/ \
              --gpt_attention_plugin disable \
              --paged_kv_cache disable \
-             --remove_input_padding disable \
              --gemm_plugin float16 \
+             --mamba_conv1d_plugin float16 \
              --max_batch_size 8 \
              --max_input_len 924 \
              --max_output_len 100 \
@@ -153,8 +153,8 @@ trtllm-build --checkpoint_dir ./mamba_model/mamba-790m/trt_ckpt/fp16/1-gpu/ \
 trtllm-build --checkpoint_dir ./mamba_model/mamba-370m/trt_ckpt/fp16/1-gpu/ \
              --gpt_attention_plugin disable \
              --paged_kv_cache disable \
-             --remove_input_padding disable \
              --gemm_plugin float16 \
+             --mamba_conv1d_plugin float16 \
              --max_batch_size 8 \
              --max_input_len 924 \
              --max_output_len 100 \
@@ -164,8 +164,8 @@ trtllm-build --checkpoint_dir ./mamba_model/mamba-370m/trt_ckpt/fp16/1-gpu/ \
 trtllm-build --checkpoint_dir ./mamba_model/mamba-130m/trt_ckpt/fp16/1-gpu/ \
              --gpt_attention_plugin disable \
              --paged_kv_cache disable \
-             --remove_input_padding disable \
              --gemm_plugin float16 \
+             --mamba_conv1d_plugin float16 \
              --max_batch_size 8 \
              --max_input_len 924 \
              --max_output_len 100 \
@@ -182,7 +182,6 @@ The following section describes how to run a TensorRT-LLM Mamba model to summari
 ```bash
 # mamba-2.8b-slimpj
 python ../summarize.py --test_trt_llm \
-                       --use_py_session \
                        --hf_model_dir ./mamba_model/mamba-2.8b-slimpj/ \
                        --tokenizer_dir ./mamba_model/gpt-neox-20b/ \
                        --data_type bf16 \
@@ -190,7 +189,6 @@ python ../summarize.py --test_trt_llm \
 
 # mamba-2.8b
 python ../summarize.py --test_trt_llm \
-                       --use_py_session \
                        --hf_model_dir ./mamba_model/mamba-2.8b/ \
                        --tokenizer_dir ./mamba_model/gpt-neox-20b/ \
                        --data_type bf16 \
@@ -198,7 +196,6 @@ python ../summarize.py --test_trt_llm \
 
 # mamba-1.4b
 python ../summarize.py --test_trt_llm \
-                       --use_py_session \
                        --hf_model_dir ./mamba_model/mamba-1.4b/ \
                        --tokenizer_dir ./mamba_model/gpt-neox-20b/ \
                        --data_type fp16 \
@@ -206,7 +203,6 @@ python ../summarize.py --test_trt_llm \
 
 # mamba-790m
 python ../summarize.py --test_trt_llm \
-                       --use_py_session \
                        --hf_model_dir ./mamba_model/mamba-790m/ \
                        --tokenizer_dir ./mamba_model/gpt-neox-20b/ \
                        --data_type fp16 \
@@ -214,7 +210,6 @@ python ../summarize.py --test_trt_llm \
 
 # mamba-370m
 python ../summarize.py --test_trt_llm \
-                       --use_py_session \
                        --hf_model_dir ./mamba_model/mamba-370m/ \
                        --tokenizer_dir ./mamba_model/gpt-neox-20b/ \
                        --data_type fp16 \
@@ -222,7 +217,6 @@ python ../summarize.py --test_trt_llm \
 
 # mamba-130m
 python ../summarize.py --test_trt_llm \
-                       --use_py_session \
                        --hf_model_dir ./mamba_model/mamba-130m/ \
                        --tokenizer_dir ./mamba_model/gpt-neox-20b/ \
                        --data_type fp16 \

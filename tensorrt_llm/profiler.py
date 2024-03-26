@@ -204,7 +204,8 @@ def print_memory_usage(
 @_is_building
 def check_gpt_mem_usage(engine, kv_dtype, use_gpt_attention_plugin,
                         paged_kv_cache, max_batch_size, max_beam_width,
-                        max_seq_len, local_num_kv_heads, head_size, num_layers):
+                        max_seq_len, local_num_kv_heads, head_size,
+                        num_layers) -> int:
     # Get the amount of memory
     runtime = trt.Runtime(logger.trt_logger)
     # 1. TensorRT engine activation memory

@@ -3,9 +3,60 @@ import traceback
 from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
-from typing import List, Union
+from typing import List, Optional, Union
 
 import torch
+
+import tensorrt_llm.bindings as tllm
+
+
+class SamplingConfig(tllm.SamplingConfig):
+    ''' The sampling config for the generation. '''
+
+    # TODO[chunweiy]: switch to the cpp executor's once ready
+    def __init__(self,
+                 end_id: Optional[int] = None,
+                 pad_id: Optional[int] = None,
+                 beam_width: int = 1,
+                 max_new_tokens: Optional[int] = None) -> None:
+        super().__init__(beam_width)
+        self.end_id = end_id
+        self.pad_id = pad_id if pad_id is not None else end_id
+        self.max_new_tokens = max_new_tokens
+
+    def __setstate__(self, arg0: tuple) -> None:
+        self.end_id = arg0[0]
+        self.pad_id = arg0[1]
+        self.max_new_tokens = arg0[2]
+        super().__setstate__(arg0[3:])
+
+    def __getstate__(self) -> tuple:
+        return (self.end_id, self.pad_id,
+                self.max_new_tokens) + super().__getstate__()
+
+    def get_attr_names(self):
+        return list(self.__dict__.keys()) + [
+            "beam_search_diversity_rate",
+            "beam_width",
+            "early_stopping",
+            "frequency_penalty",
+            "length_penalty",
+            "min_length",
+            "presence_penalty",
+            "random_seed",
+            "repetition_penalty",
+            "temperature",
+            "top_k",
+            "top_p",
+            "top_p_decay",
+            "top_p_min",
+            "top_p_reset_ids",
+        ]
+
+    def __repr__(self):
+        return f"SamplingConfig(" + ", ".join(
+            f"{k}={getattr(self, k)}" for k in self.get_attr_names()
+            if getattr(self, k) is not None) + ")"
 
 
 @dataclass
@@ -22,6 +73,7 @@ def print_colored(message, color: str = None):
         red="\x1b[31;20m",
         bold_red="\x1b[31;1m",
         bold_green="\033[1;32m",
+        green="\033[0;32m",
     )
     reset = "\x1b[0m"
 
@@ -31,12 +83,16 @@ def print_colored(message, color: str = None):
         sys.stderr.write(message)
 
 
-def file_with_suffix_exists(directory, suffix) -> bool:
+def file_with_glob_exists(directory, glob) -> bool:
     path = Path(directory)
-    for file_path in path.glob(f'*{suffix}'):
+    for file_path in path.glob(glob):
         if file_path.is_file():
             return True
     return False
+
+
+def file_with_suffix_exists(directory, suffix) -> bool:
+    return file_with_glob_exists(directory, f'*{suffix}')
 
 
 def print_traceback_on_error(func):

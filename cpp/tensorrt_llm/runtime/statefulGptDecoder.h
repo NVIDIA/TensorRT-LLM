@@ -37,7 +37,7 @@ public:
     //! Setup the decoder before calling `forward()`
     void setup(DecodingMode const& mode, SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxAttentionWindow,
         SizeType sinkTokenLength, SizeType maxSequenceLength, SizeType maxTokensPerStep, bool fusedDecoder,
-        nvinfer1::DataType dtype) override;
+        nvinfer1::DataType dtype, GptModelConfig const& modelConfig) override;
 
     //! @brief Initialize the decoder with new batch of inputs.
     void newBatch(

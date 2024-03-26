@@ -36,6 +36,7 @@
 #include "tensorrt_llm/batch_manager/kvCacheConfig.h"
 #include "tensorrt_llm/batch_manager/schedulerPolicy.h"
 #include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
+#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
@@ -52,6 +53,8 @@ namespace tc = tensorrt_llm::common;
 namespace tr = tensorrt_llm::runtime;
 namespace tpr = tensorrt_llm::pybind::runtime;
 using SizeType = tr::SizeType;
+template <typename T>
+using OptVec = std::optional<std::vector<T>>;
 
 #if not defined(TRTLLM_PYBIND_MODULE)
 #error "TRTLLM_PYBIND_MODULE must be defined"
@@ -234,6 +237,37 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
             py::arg("gpus_per_node") = tr::WorldConfig::kDefaultGpusPerNode, py::arg("tensor_parallelism") = py::none(),
             py::arg("pipeline_parallelism") = py::none(), py::arg("device_ids") = py::none());
 
+    auto SamplingConfigGetState = [](tr::SamplingConfig const& config) -> py::tuple
+    {
+        return py::make_tuple(config.beamWidth, config.temperature, config.minLength, config.repetitionPenalty,
+            config.presencePenalty, config.frequencyPenalty, config.topK, config.topP, config.randomSeed,
+            config.topPDecay, config.topPMin, config.topPResetIds, config.beamSearchDiversityRate, config.lengthPenalty,
+            config.earlyStopping);
+    };
+    auto SamplingConfigSetState = [](py::tuple t) -> tr::SamplingConfig
+    {
+        assert(t.size() == 15);
+
+        tr::SamplingConfig config;
+        config.beamWidth = t[0].cast<SizeType>();
+        config.temperature = t[1].cast<OptVec<float>>();
+        config.minLength = t[2].cast<OptVec<SizeType>>();
+        config.repetitionPenalty = t[3].cast<OptVec<float>>();
+        config.presencePenalty = t[4].cast<OptVec<float>>();
+        config.frequencyPenalty = t[5].cast<OptVec<float>>();
+        config.topK = t[6].cast<OptVec<SizeType>>();
+        config.topP = t[7].cast<OptVec<float>>();
+        config.randomSeed = t[8].cast<OptVec<uint64_t>>();
+        config.topPDecay = t[9].cast<OptVec<float>>();
+        config.topPMin = t[10].cast<OptVec<float>>();
+        config.topPResetIds = t[11].cast<OptVec<SizeType>>();
+        config.beamSearchDiversityRate = t[12].cast<OptVec<float>>();
+        config.lengthPenalty = t[13].cast<OptVec<float>>();
+        config.earlyStopping = t[14].cast<OptVec<SizeType>>();
+
+        return std::move(config);
+    };
+
     py::class_<tr::SamplingConfig>(m, "SamplingConfig")
         .def(py::init<SizeType>(), py::arg("beam_width") = 1)
         .def_readwrite("beam_width", &tr::SamplingConfig::beamWidth)
@@ -250,7 +284,9 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_readwrite("top_p_reset_ids", &tr::SamplingConfig::topPResetIds)
         .def_readwrite("beam_search_diversity_rate", &tr::SamplingConfig::beamSearchDiversityRate)
         .def_readwrite("length_penalty", &tr::SamplingConfig::lengthPenalty)
-        .def_readwrite("early_stopping", &tr::SamplingConfig::earlyStopping);
+        .def_readwrite("early_stopping", &tr::SamplingConfig::earlyStopping)
+        .def(py::pickle(SamplingConfigGetState, SamplingConfigSetState))
+        .def("__eq__", &tr::SamplingConfig::operator==);
 
     py::class_<tr::GptJsonConfig>(m, "GptJsonConfig")
         .def(py::init<std::string, std::string, std::string, SizeType, SizeType, tr::GptModelConfig>(), py::arg("name"),
@@ -388,4 +424,25 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
     // Create submodule for executor bindings.
     py::module_ executor_submodule = m.def_submodule("executor", "Executor bindings");
     tensorrt_llm::pybind::executor::InitBindings(executor_submodule);
+
+    py::class_<tensorrt_llm::mpi::MpiComm>(m, "MpiComm")
+        .def_static("getRank",
+            []()
+            {
+                auto& session = tensorrt_llm::mpi::MpiComm::session();
+                return session.tensorrt_llm::mpi::MpiComm::getRank();
+            })
+        .def_static("getSize",
+            []()
+            {
+                auto& session = tensorrt_llm::mpi::MpiComm::session();
+                return session.tensorrt_llm::mpi::MpiComm::getSize();
+            })
+        .def_static("split",
+            [](size_t color, size_t rank)
+            {
+                auto& world = tensorrt_llm::mpi::MpiComm::world();
+                auto& session = tensorrt_llm::mpi::MpiComm::session();
+                session = world.split(color, rank);
+            });
 }

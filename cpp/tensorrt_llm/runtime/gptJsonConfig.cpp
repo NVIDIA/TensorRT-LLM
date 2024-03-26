@@ -134,16 +134,21 @@ void parseBuilderConfig(GptModelConfig& modelConfig, Json const& builderConfig)
 void parsePluginConfig(GptModelConfig& modelConfig, Json const& pluginConfig)
 {
     auto const useGptAttentionPlugin = !pluginConfig.at("gpt_attention_plugin").is_null();
+    auto const useMambaConv1dPlugin
+        = pluginConfig.contains("mamba_conv1d_plugin") && !pluginConfig.at("mamba_conv1d_plugin").is_null();
     auto const removeInputPadding = pluginConfig.at("remove_input_padding").template get<bool>();
     auto const& pagedKvCache = pluginConfig.at("paged_kv_cache");
     auto const& tokensPerBlock = pluginConfig.at("tokens_per_block");
     auto const useCustomAllReduce = pluginConfig.at("use_custom_all_reduce").template get<bool>();
     auto const useContextFMHAForGeneration = pluginConfig.at("use_context_fmha_for_generation").template get<bool>();
     auto const pagedContextFMHA = pluginConfig.at("use_paged_context_fmha").template get<bool>();
+    auto const& pagedState = parseJsonFieldOr(pluginConfig, "paged_state", false);
 
     modelConfig.useGptAttentionPlugin(useGptAttentionPlugin);
+    modelConfig.useMambaConv1dPlugin(useMambaConv1dPlugin);
     modelConfig.usePackedInput(removeInputPadding);
     modelConfig.usePagedKvCache(pagedKvCache);
+    modelConfig.usePagedState(pagedState);
     modelConfig.setTokensPerBlock(tokensPerBlock);
     modelConfig.useCustomAllReduce(useCustomAllReduce);
     modelConfig.setUseContextFMHAForGeneration(useContextFMHAForGeneration);
@@ -289,6 +294,25 @@ GptJsonConfig parseJson(InputType&& input)
         }
     }
 
+    // Mamba config
+    if (!engineVersionNone)
+    {
+        auto const& pretrainedConfig = json.at("pretrained_config");
+        auto const architecture = pretrainedConfig.at("architecture").template get<std::string>();
+        if (architecture == std::string("MambaLMHeadModel"))
+        {
+            modelConfig.setModelVariant(GptModelConfig::ModelVariant::kMamba);
+            auto const& ssmCfg = pretrainedConfig.at("ssm_cfg");
+            auto const& mambaDState = ssmCfg.at("d_state").template get<SizeType>();
+            auto const& mambaDConv = ssmCfg.at("d_conv").template get<SizeType>();
+            auto const& mambaExpand = ssmCfg.at("expand").template get<SizeType>();
+            MambaConfig mambaConfig{};
+            mambaConfig.dState = mambaDState;
+            mambaConfig.dConv = mambaDConv;
+            mambaConfig.expand = mambaExpand;
+            modelConfig.setMambaConfig(mambaConfig);
+        }
+    }
     return GptJsonConfig{name, engineVersion, precision, tensorParallelism, pipelineParallelism, modelConfig};
 }
 

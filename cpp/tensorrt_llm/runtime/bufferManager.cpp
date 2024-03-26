@@ -93,13 +93,18 @@ BufferManager::ITensorPtr BufferManager::managed(nvinfer1::Dims dims, nvinfer1::
 
 void BufferManager::setZero(IBuffer& buffer) const
 {
+    setMem(buffer, 0);
+}
+
+void BufferManager::setMem(IBuffer& buffer, int32_t value) const
+{
     if (buffer.getMemoryType() == MemoryType::kGPU)
     {
-        TLLM_CUDA_CHECK(cudaMemsetAsync(buffer.data(), 0, buffer.getSizeInBytes(), mStream->get()));
+        TLLM_CUDA_CHECK(cudaMemsetAsync(buffer.data(), value, buffer.getSizeInBytes(), mStream->get()));
     }
     else
     {
-        std::memset(buffer.data(), 0, buffer.getSizeInBytes());
+        std::memset(buffer.data(), value, buffer.getSizeInBytes());
     }
 }
 

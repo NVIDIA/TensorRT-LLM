@@ -164,7 +164,7 @@ void GptSession::createDecoders(SizeType batchSize, SizeType beamWidth, SizeType
         }
         constexpr SizeType maxTokensPerStep = 1;
         mDecoders.back()->setup(decodingMode, batchSize, beamWidth, maxAttentionWindow, sinkTokenLength,
-            maxSequenceLength, maxTokensPerStep, /* fusedDecoder*/ false, logitsType);
+            maxSequenceLength, maxTokensPerStep, /* fusedDecoder*/ false, logitsType, mModelConfig);
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -176,21 +176,7 @@ void GptSession::createKvCacheManager(SizeType batchSize, SizeType beamWidth, Si
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto const tokensPerBlock = mModelConfig.getTokensPerBlock();
 
-    auto const kvDtype = [this]()
-    {
-        if (mModelConfig.getQuantMode().hasFp8KvCache())
-        {
-            return nvinfer1::DataType::kFP8;
-        }
-        else if (mModelConfig.getQuantMode().hasInt8KvCache())
-        {
-            return nvinfer1::DataType::kINT8;
-        }
-        else
-        {
-            return mModelConfig.getDataType();
-        }
-    }();
+    auto const kvDtype = mModelConfig.getKvDataType();
 
     auto const maxNumBlocks = bmkv::KVCacheManager::calculateMaxNumBlocks(
         kvCacheConfig, kvDtype, mModelConfig, mWorldConfig, getBufferManager());
@@ -328,7 +314,7 @@ void GptSession::setup(Config const& sessionConfig)
         createCustomAllReduceWorkspace(mMicroBatchConfig.genBatchSize, maxBeamWidth, maxSequenceLength);
     }
 
-    if (mModelConfig.usePagedKvCache())
+    if (mModelConfig.isTransformerBased() && mModelConfig.usePagedKvCache())
     {
         createKvCacheManager(maxBatchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSequenceLength,
             sessionConfig.kvCacheConfig);
@@ -339,7 +325,7 @@ void GptSession::setup(Config const& sessionConfig)
     for (auto& buffers : mBuffers)
     {
         // we don't know maxInputLength yet and ignore it for pre-allocation
-        buffers->generationConfig = RuntimeBuffers::GenerationConfig{
+        buffers->generationConfig = GenerationConfig{
             mMicroBatchConfig.genBatchSize, maxBeamWidth, 0, maxAttentionWindow, sinkTokenLength, maxSequenceLength};
         buffers->reshape(kvCacheManager, mModelConfig, mWorldConfig);
     }

@@ -34,7 +34,6 @@ private:
     template <typename T>
     using OptVec = std::optional<std::vector<T>>;
 
-private:
     template <typename T>
     static OptVec<T> fuseValues(
         std::vector<SamplingConfig> const& configs, std::function<OptVec<T>(SizeType ci)> accessor)
@@ -91,6 +90,8 @@ public:
         earlyStopping = fuseValues<SizeType>(configs, [&configs](SizeType ci) { return configs[ci].earlyStopping; });
         draftAcceptanceThreshold
             = fuseValues<FloatType>(configs, [&configs](SizeType ci) { return configs[ci].draftAcceptanceThreshold; });
+        topKMedusaHeads = fuseValues<std::vector<runtime::SizeType>>(
+            configs, [&configs](SizeType ci) { return configs[ci].topKMedusaHeads; });
     }
 
     explicit SamplingConfig(executor::SamplingConfig const& samplingConfig,
@@ -152,7 +153,22 @@ public:
     // speculative decoding, only the first value is used (in gptDecoderBatch.cpp)
     OptVec<FloatType> draftAcceptanceThreshold; // [1] or [batch_size]
 
+    // medusa params
+    OptVec<std::vector<runtime::SizeType>> topKMedusaHeads; // [batchSize, maxMedusaHeads]
+
     std::optional<bool> normalizeLogProbs;
+
+    bool operator==(SamplingConfig const& other) const
+    {
+        return beamWidth == other.beamWidth && temperature == other.temperature && minLength == other.minLength
+            && repetitionPenalty == other.repetitionPenalty && presencePenalty == other.presencePenalty
+            && frequencyPenalty == other.frequencyPenalty && topK == other.topK && topP == other.topP
+            && randomSeed == other.randomSeed && topPDecay == other.topPDecay && topPMin == other.topPMin
+            && topPResetIds == other.topPResetIds && beamSearchDiversityRate == other.beamSearchDiversityRate
+            && lengthPenalty == other.lengthPenalty && earlyStopping == other.earlyStopping
+            && draftAcceptanceThreshold == other.draftAcceptanceThreshold && topKMedusaHeads == other.topKMedusaHeads
+            && normalizeLogProbs == other.normalizeLogProbs;
+    }
 };
 
 } // namespace tensorrt_llm::runtime

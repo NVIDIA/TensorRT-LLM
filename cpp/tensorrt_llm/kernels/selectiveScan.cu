@@ -65,6 +65,8 @@ __device__ void convertAndStore(__nv_bfloat16* output, float input)
 }
 #endif
 
+#pragma nv_diag_suppress static_var_with_dynamic_init
+
 template <typename input_t, typename weight_t, int DSTATE = 16, int CHANNELS_PER_BLOCK = 128, int STAGES = 12,
     int SEQ_UNROLL = 6>
 __launch_bounds__(256, 1) __global__ void selective_scan_loop_kernel(SSMParamsBase params)
@@ -74,8 +76,8 @@ __launch_bounds__(256, 1) __global__ void selective_scan_loop_kernel(SSMParamsBa
     input_t* x = reinterpret_cast<input_t*>(params.u_ptr);
     input_t* dt = reinterpret_cast<input_t*>(params.delta_ptr);
     weight_t* A = reinterpret_cast<weight_t*>(params.A_ptr);
-    input_t* B = reinterpret_cast<input_t*>(params.B_ptr);
-    input_t* C = reinterpret_cast<input_t*>(params.C_ptr);
+    input_t* B = reinterpret_cast<input_t*>(params.BC_ptr);
+    input_t* C = reinterpret_cast<input_t*>(params.BC_ptr);
     weight_t* D = reinterpret_cast<weight_t*>(params.D_ptr);
     input_t* z = reinterpret_cast<input_t*>(params.z_ptr);
     weight_t* dt_bias = reinterpret_cast<weight_t*>(params.delta_bias_ptr);
@@ -101,11 +103,24 @@ __launch_bounds__(256, 1) __global__ void selective_scan_loop_kernel(SSMParamsBa
     int const channel = blockIdx.x * blockDim.x + threadIdx.x;
     int const sample = blockIdx.y; // batch id
 
+    int const slot_idx = params.slot_mapping_ptr == nullptr ? sample : params.slot_mapping_ptr[sample];
+    int const bc_cols = DSTATE * 2 + params.dt_rank;
+    int const b_offset = params.dt_rank;
+    int const c_offset = params.dt_rank + DSTATE;
+
     int num_tokens;
     int start_token_idx;
-    start_token_idx = sample * params.seqlen;
-    num_tokens = params.last_token_ids_ptr[sample];
-
+    if (params.remove_padding)
+    {
+        start_token_idx = sample == 0 ? 0 : params.last_token_ids_ptr[sample - 1];
+        int end_token_idx = params.last_token_ids_ptr[sample];
+        num_tokens = end_token_idx - start_token_idx;
+    }
+    else
+    {
+        start_token_idx = sample * params.max_seqlen;
+        num_tokens = params.last_token_ids_ptr[sample];
+    }
     int const seq_loops = (num_tokens + SEQ_UNROLL - 1) / SEQ_UNROLL;
 
     int const input_matrix_row_id = start_token_idx;
@@ -132,8 +147,8 @@ __launch_bounds__(256, 1) __global__ void selective_scan_loop_kernel(SSMParamsBa
             for (int token_id = si * SEQ_UNROLL; token_id < num_tokens && token_id < (si + 1) * SEQ_UNROLL; token_id++)
             {
 
-                input_t* my_B = &B[input_matrix_row_id * DSTATE + token_id * DSTATE];
-                input_t* my_C = &C[input_matrix_row_id * DSTATE + token_id * DSTATE];
+                input_t* my_B = &B[(input_matrix_row_id + token_id) * bc_cols + b_offset];
+                input_t* my_C = &C[(input_matrix_row_id + token_id) * bc_cols + c_offset];
 
                 int block_channel_per_token = blockIdx.x * blockDim.x;
                 int block_channel
@@ -304,7 +319,7 @@ __launch_bounds__(256, 1) __global__ void selective_scan_loop_kernel(SSMParamsBa
         // Write the new state back out to the cache
         for (int i = 0; i < DSTATE; i++)
         {
-            input_t* my_state = &state[sample * num_channels * DSTATE];
+            input_t* my_state = &state[slot_idx * num_channels * DSTATE];
             int offset = i * num_channels + channel;
             convertAndStore(&my_state[offset], state_reg[i]);
         }
@@ -351,8 +366,8 @@ __launch_bounds__(128, 2) __global__ void selective_scan_update_kernel(SSMParams
     input_t* x = reinterpret_cast<input_t*>(params.u_ptr);
     input_t* dt = reinterpret_cast<input_t*>(params.delta_ptr);
     weight_t* A = reinterpret_cast<weight_t*>(params.A_ptr);
-    input_t* B = reinterpret_cast<input_t*>(params.B_ptr);
-    input_t* C = reinterpret_cast<input_t*>(params.C_ptr);
+    input_t* B = reinterpret_cast<input_t*>(params.BC_ptr);
+    input_t* C = reinterpret_cast<input_t*>(params.BC_ptr);
     weight_t* D = reinterpret_cast<weight_t*>(params.D_ptr);
     input_t* z = reinterpret_cast<input_t*>(params.z_ptr);
     weight_t* dt_bias = reinterpret_cast<weight_t*>(params.delta_bias_ptr);
@@ -363,8 +378,12 @@ __launch_bounds__(128, 2) __global__ void selective_scan_update_kernel(SSMParams
     if (channel >= num_channels)
         return;
     int const sample = blockIdx.y;
+    int const slot_idx = params.slot_mapping_ptr == nullptr ? sample : params.slot_mapping_ptr[sample];
+    int const bc_cols = DSTATE * 2 + params.dt_rank;
+    int const b_offset = params.dt_rank;
+    int const c_offset = params.dt_rank + DSTATE;
 
-    input_t* my_state = &state[sample * num_channels * DSTATE];
+    input_t* my_state = &state[slot_idx * num_channels * DSTATE];
     input_t* my_output = &output[sample * num_channels];
 
     float rA[DSTATE];
@@ -377,8 +396,8 @@ __launch_bounds__(128, 2) __global__ void selective_scan_update_kernel(SSMParams
     for (int i = 0; i < DSTATE; i++)
     {
         rA[i] = toFloat(A[i * num_channels + channel]);
-        rB[i] = toFloat(B[sample * DSTATE + i]);
-        rC[i] = toFloat(C[sample * DSTATE + i]);
+        rB[i] = toFloat(B[sample * bc_cols + b_offset + i]);
+        rC[i] = toFloat(C[sample * bc_cols + c_offset + i]);
         rState[i] = toFloat(my_state[i * num_channels + channel]);
     }
 

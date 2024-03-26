@@ -2,6 +2,23 @@
 
 This document shows how to build and run a Baichuan models (including `v1_7b`/`v1_13b`/`v2_7b`/`v2_13b`) in TensorRT-LLM on both single GPU and single node multi-GPU.
 
+## Table of Contents
+
+- [Baichuan](#baichuan)
+  - [Table of Contents](#table-of-contents)
+  - [Overview](#overview)
+  - [Support Matrix](#support-matrix)
+  - [Usage](#usage)
+    - [Build TensorRT engine(s)](#build-tensorrt-engines)
+      - [SmoothQuant](#smoothquant)
+      - [FP8 Post-Training Quantization](#fp8-post-training-quantization)
+      - [Groupwise quantization (AWQ/GPTQ)](#groupwise-quantization-awqgptq)
+        - [AWQ](#awq)
+        - [GPTQ](#gptq)
+      - [INT8 KV cache](#int8-kv-cache)
+    - [Run](#run)
+    - [Summarization using the Baichuan model](#summarization-using-the-baichuan-model)
+
 ## Overview
 
 The TensorRT-LLM Baichuan implementation can be found in [tensorrt_llm/models/baichuan/model.py](../../tensorrt_llm/models/baichuan/model.py). The TensorRT-LLM Baichuan example code is located in [`examples/baichuan`](./). There is one main file:
@@ -29,6 +46,12 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 The TensorRT-LLM Baichuan example code locates at [examples/baichuan](./). It takes HF weights as input, and builds the corresponding TensorRT engines. The number of TensorRT engines depends on the number of GPUs used to run inference.
 
 ### Build TensorRT engine(s)
+
+Please install required packages first:
+
+```bash
+pip install -r requirements.txt
+```
 
 Need to specify the HF Baichuan checkpoint path. For `v1_13b`, you should use whether [baichuan-inc/Baichuan-13B-Chat](https://huggingface.co/baichuan-inc/Baichuan-13B-Chat) or [baichuan-inc/Baichuan-13B-Base](https://huggingface.co/baichuan-inc/Baichuan-13B-Base). For `v2_13b`, you should use whether [baichuan-inc/Baichuan2-13B-Chat](https://huggingface.co/baichuan-inc/Baichuan2-13B-Chat) or [baichuan-inc/Baichuan2-13B-Base](https://huggingface.co/baichuan-inc/Baichuan2-13B-Base). More Baichuan models could be found on [baichuan-inc](https://huggingface.co/baichuan-inc).
 
@@ -128,6 +151,7 @@ python ../quantization/quantize.py --model_dir /code/model/Baichuan2-13B-Chat/ \
 ```
 
 The quantized model checkpoint is saved to `./quantized_fp8/` for future TensorRT-LLM engine build directly with the `trtllm-build` command mentioned above.
+Note that you can enable fp8 context fmha to get further acceleration by setting `--use_fp8_context_fmha enable` when building the engines.
 
 #### Groupwise quantization (AWQ/GPTQ)
 ##### AWQ
@@ -193,7 +217,8 @@ python ../quantization/quantize.py --model_dir baichuan-inc/Baichuan-13B-Chat \
                                    --qformat int4_wo \
                                    --kv_cache_dtype int8 \
                                    --output_dir ./trt_ckpt/baichuan_int4wo_int8kv_tp1 \
-                                   --calib_size 512
+                                   --calib_size 512 \
+                                   --strongly_typed
 ```
 
 **INT8 KV cache + AWQ**
