@@ -28,11 +28,20 @@ from tensorrt_llm.functional import (LayerNormPositionType, LayerNormType,
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import (  # TODO: probably need to change model name to distinguish from other models
     DecoderModel, EncoderModel)
+from tensorrt_llm.quantization import QuantMode
 
 layernorm_type_map = {i.name: i.value for i in LayerNormType}
 layernorm_position_map = {i.name: i.value for i in LayerNormPositionType}
 mlp_type_map = {i.name: i.value for i in MLPType}
 
+def gen_suffix(rank, use_smooth_quant, quant_per_channel):
+    suffix = f"{rank}.bin"
+    if use_smooth_quant:
+        sq_prefix = "int8."
+        if quant_per_channel:
+            sq_prefix += "col."
+        suffix = sq_prefix + suffix
+    return "." + suffix
 
 def parse_t5_config(config, component, args):
     if component == 'encoder':
@@ -350,33 +359,97 @@ def load_from_binary_t5(tllm_model: Union[EncoderModel, DecoderModel],
     if mapping is None:
         mapping = Mapping()
 
-    ckpt_np_dtype = str_dtype_to_np(args.ckpt_weight_dtype)
+    # Check Quantization Settings
+    quant_mode = getattr(tllm_model, "quant_mode", QuantMode(0))
 
-    def fromfile(name, split=True, shape=None) -> Optional[np.ndarray]:
-        p = path.join(
-            dir_path,
-            f'{name}.{str(mapping.tp_rank)}.bin' if split else f'{name}.bin')
+    # Do we use SmoothQuant?
+    use_smooth_quant = quant_mode.has_act_and_weight_quant()
+    # Do we use quantization per token?
+    quant_per_token_dyn = quant_mode.has_per_token_dynamic_scaling()
+    # Do we use quantization per channel?
+    quant_per_channel = quant_mode.has_per_channel_scaling()
+
+    ckpt_np_dtype = str_dtype_to_np(args.ckpt_weight_dtype)
+    suffix = gen_suffix(mapping.tp_rank, use_smooth_quant, quant_per_channel)
+    dtype_override = None if not use_smooth_quant else np.int8
+
+    def fromfile(dir_path, name, shape=None, dtype_override=None) -> Optional[np.ndarray]:
+        p = dir_path + '/' + name
         if Path(p).exists():
             # load from original dtype and cast to inference dtype
-            t = np.fromfile(p, dtype=ckpt_np_dtype)
-            t = numpy_to_dtype(t, dtype)
+            t = np.fromfile(p, dtype=dtype_override or ckpt_np_dtype)
+            # NOTE: if the file is stored in a specific
+            # dtype, do not convert it to the inference dtype.
+            # E.g. for smoothquant the weights are stored as int8 arrays.
+            if dtype_override is None:
+                t = numpy_to_dtype(t, dtype)
             if shape is not None:
                 t = t.reshape(shape)
             t = np.ascontiguousarray(t)
             return t
-        return None
+        raise FileNotFoundError(p)
+
+    def set_smoothquant_scale_factors(module,
+                                      pre_scale_weight,
+                                      dir_path,
+                                      basename,
+                                      shape,
+                                      per_tok_dyn,
+                                      per_channel,
+                                      is_qkv=False,
+                                      rank=None):
+        suffix = "bin"
+        if per_channel:
+            if rank is not None:
+                suffix = f"{rank}." + suffix
+            suffix = "col." + suffix
+
+        col_shape = shape if (per_channel or is_qkv) else [1, 1]
+
+        if per_tok_dyn:
+            if pre_scale_weight is not None:
+                pre_scale_weight.value = np.array([1.0], dtype=np.float32)
+            if is_qkv and not per_channel:
+                t = fromfile(dir_path,
+                             f"{basename}scale_w_quant_orig.{rank}.{suffix}",
+                             col_shape, np.float32)
+            else:
+                t = fromfile(dir_path, f"{basename}scale_w_quant_orig.{suffix}",
+                             col_shape, np.float32)
+            module.per_channel_scale.value = t
+        else:
+            t = fromfile(dir_path, f"{basename}scale_x_orig_quant.bin", [1],
+                         np.float32)
+            pre_scale_weight.value = t
+            if is_qkv and not per_channel:
+                t = fromfile(dir_path,
+                             f"{basename}scale_y_accum_quant.{rank}.{suffix}",
+                             col_shape, np.float32)
+            else:
+                t = fromfile(dir_path,
+                             f"{basename}scale_y_accum_quant.{suffix}",
+                             col_shape, np.float32)
+            module.per_channel_scale.value = t
+            t = fromfile(dir_path, f"{basename}scale_y_quant_orig.bin", [1, 1],
+                         np.float32)
+            module.act_scale.value = t
+
+    def set_smoother(module, dir_path, base_name, shape, rank):
+        suffix = f"{rank}.bin"
+        t = fromfile(dir_path, f"{base_name}smoother.{suffix}", shape,
+                     np.float32)
+        module.smoother.value = t
 
     component = 'encoder' if isinstance(tllm_model, EncoderModel) else 'decoder'
 
     if mapping.is_first_pp_rank():
-        wte = fromfile('shared.weight',
-                       shape=[args.vocab_size, -1],
-                       split=False)
+        wte = fromfile(dir_path, 'shared.weight.bin',
+                       shape=[args.vocab_size, -1])
         tllm_model.embedding.vocab_embedding.weight.value = wte
 
     # T5 special: all layers use 1st layer's attn table
-    relative_attention_table = fromfile(
-        f'{component}.block.0.layer.0.SelfAttention.relative_attention_bias.weight',
+    relative_attention_table = fromfile(dir_path,
+        f'{component}.block.0.layer.0.SelfAttention.relative_attention_bias.weight.{mapping.tp_rank}.bin',
         shape=[args.n_head // mapping.tp_size, args.num_buckets])
 
     # TP is by loading different split weights. PP is by loading different layer weights
@@ -398,63 +471,200 @@ def load_from_binary_t5(tllm_model: Union[EncoderModel, DecoderModel],
 
         # self attention
         attention_hidden_size = args.n_head * args.head_size  # head size * num_heads not necessarily equals hidden_dim, such as Flan-T5
-        self_attention_layer.qkv.weight.value = fromfile(
-            f'{layer_prefix}.layer.0.SelfAttention.qkv.weight',
-            shape=[
-                3 * attention_hidden_size // mapping.tp_size, args.hidden_size
-            ])
-        self_attention_layer.dense.weight.value = fromfile(
-            f'{layer_prefix}.layer.0.SelfAttention.o.weight',
-            shape=[args.hidden_size, attention_hidden_size // mapping.tp_size])
+
+        t = fromfile(
+            dir_path,
+            f'{layer_prefix}.layer.0.SelfAttention.qkv.weight{suffix}',
+            shape=[3 * attention_hidden_size // mapping.tp_size, args.hidden_size],
+            dtype_override=dtype_override
+        )
+        if use_smooth_quant:
+            self_attention_layer.qkv.weight.value = t
+            layernorm_name = "attention_layernorm" if component == "encoder" else "self_attention_layernorm"
+            attn_layernorm = getattr(layer, layernorm_name)
+            set_smoothquant_scale_factors(
+                self_attention_layer.qkv,
+                attn_layernorm.scale_to_int,
+                dir_path,
+                f'{layer_prefix}.layer.0.SelfAttention.qkv.',
+                [1, 3 * attention_hidden_size // mapping.tp_size],
+                quant_per_token_dyn,
+                quant_per_channel,
+                rank=mapping.tp_rank,
+                is_qkv=True)
+        else:
+            self_attention_layer.qkv.weight.value = t
+        
+        t = fromfile(
+            dir_path,
+            f'{layer_prefix}.layer.0.SelfAttention.o.weight{suffix}',
+            shape=[args.hidden_size, attention_hidden_size // mapping.tp_size],
+            dtype_override=dtype_override
+        )
+        if use_smooth_quant:
+            self_attention_layer.dense.weight.value = t
+            base_path = f'{layer_prefix}.layer.0.SelfAttention.o.'
+            dense_scale = getattr(self_attention_layer,
+                                  "quantization_scaling_factor", None)
+            set_smoothquant_scale_factors(
+                self_attention_layer.dense, dense_scale,
+                dir_path, base_path,
+                [1, attention_hidden_size], quant_per_token_dyn, quant_per_channel)
+            set_smoother(self_attention_layer.dense,
+                         dir_path,
+                         base_path,
+                         [1, attention_hidden_size // mapping.tp_size], mapping.tp_rank)
+        else:
+            self_attention_layer.dense.weight.value = t
+
         self_attention_layernorm = getattr(
             layer, 'self_attention_layernorm'
             if component == 'decoder' else 'attention_layernorm')
         self_attention_layernorm.weight.value = fromfile(
-            f'{layer_prefix}.layer.0.layer_norm.weight', split=False)
+            dir_path,
+            f'{layer_prefix}.layer.0.layer_norm.weight.bin')
 
         # cross attention
         if component == 'decoder':
             attention_hidden_size = args.n_head * args.head_size
-            layer.cross_attention.qkv.weight.value = fromfile(
-                f'{layer_prefix}.layer.1.EncDecAttention.qkv.weight',
-                shape=[
-                    3 * attention_hidden_size // mapping.tp_size,
-                    args.hidden_size
-                ])
-            layer.cross_attention.dense.weight.value = fromfile(
-                f'{layer_prefix}.layer.1.EncDecAttention.o.weight',
-                shape=[
-                    args.hidden_size, attention_hidden_size // mapping.tp_size
-                ])
+            t = fromfile(
+                dir_path,
+                f'{layer_prefix}.layer.1.EncDecAttention.qkv.weight{suffix}',
+                shape=[3 * attention_hidden_size // mapping.tp_size, args.hidden_size],
+                dtype_override=dtype_override,
+            )
+            if use_smooth_quant:
+                layer.cross_attention.qkv.weight.value = t
+                set_smoothquant_scale_factors(
+                    layer.cross_attention.qkv,
+                    layer.cross_attention_layernorm.scale_to_int,
+                    dir_path,
+                    f'{layer_prefix}.layer.1.EncDecAttention.qkv.',
+                    [1, 3 * attention_hidden_size // mapping.tp_size],
+                    quant_per_token_dyn,
+                    quant_per_channel,
+                    rank=mapping.tp_rank,
+                    is_qkv=True)
+            else:
+                layer.cross_attention.qkv.weight.value = t
+            
+            t = fromfile(
+                dir_path,
+                f'{layer_prefix}.layer.1.EncDecAttention.o.weight{suffix}',
+                shape=[args.hidden_size, attention_hidden_size // mapping.tp_size],
+                dtype_override=dtype_override
+            )
+            if use_smooth_quant:
+                layer.cross_attention.dense.weight.value = t
+                base_path = f'{layer_prefix}.layer.1.EncDecAttention.o.'
+                dense_scale = getattr(layer.cross_attention,
+                                    "quantization_scaling_factor", None)
+                set_smoothquant_scale_factors(
+                    layer.cross_attention.dense, dense_scale,
+                    dir_path, base_path,
+                    [1, attention_hidden_size], quant_per_token_dyn, quant_per_channel)
+                set_smoother(layer.cross_attention.dense,
+                            dir_path,
+                            base_path,
+                            [1, attention_hidden_size // mapping.tp_size], mapping.tp_rank)
+            else:
+                layer.cross_attention.dense.weight.value = t
+            
             layer.cross_attention_layernorm.weight.value = fromfile(
-                f'{layer_prefix}.layer.1.layer_norm.weight', split=False)
+                dir_path,
+                f'{layer_prefix}.layer.1.layer_norm.weight.bin')
 
         # MLP
         hf_component_idx = 1 if component == 'encoder' else 2
-        layer.mlp.fc.weight.value = fromfile(
-            f'{layer_prefix}.layer.{hf_component_idx}.DenseReluDense.wi.weight',
-            shape=[args.ffn_hidden_size // mapping.tp_size, args.hidden_size])
+        t = fromfile(
+            dir_path,
+            f'{layer_prefix}.layer.{hf_component_idx}.DenseReluDense.wi.weight{suffix}',
+            shape=[args.ffn_hidden_size // mapping.tp_size, args.hidden_size],
+            dtype_override=dtype_override)
+        if use_smooth_quant:
+            layer.mlp.fc.weight.value = t
+            base_path = f'{layer_prefix}.layer.{hf_component_idx}.DenseReluDense.wi.'
+            set_smoothquant_scale_factors(
+                layer.mlp.fc,
+                layer.mlp_layernorm.scale_to_int,
+                dir_path,
+                base_path,
+                [1, args.ffn_hidden_size // mapping.tp_size],
+                quant_per_token_dyn,
+                quant_per_channel,
+                rank=mapping.tp_rank)
+        else:
+            layer.mlp.fc.weight.value = t
+        
         if args.gated_act:
+            t = fromfile(
+                dir_path,
+                f'{layer_prefix}.layer.{hf_component_idx}.DenseReluDense.wi2.weight{suffix}',
+                shape=[
+                    args.ffn_hidden_size // mapping.tp_size, args.hidden_size
+                ],
+                dtype_override=dtype_override
+            )
             layer.mlp.gate.weight.value = fromfile(
                 f'{layer_prefix}.layer.{hf_component_idx}.DenseReluDense.wi2.weight',
                 shape=[
                     args.ffn_hidden_size // mapping.tp_size, args.hidden_size
                 ])
-        layer.mlp.proj.weight.value = fromfile(
-            f'{layer_prefix}.layer.{hf_component_idx}.DenseReluDense.wo.weight',
-            shape=[args.hidden_size, args.ffn_hidden_size // mapping.tp_size])
+            if use_smooth_quant:
+                layer.mlp.gate.weight.value = t
+                base_path = f'{layer_prefix}.layer.{hf_component_idx}.DenseReluDense.wi2.'
+                set_smoothquant_scale_factors(
+                    layer.mlp.gate,
+                    layer.mlp_layernorm.scale_to_int,
+                    dir_path,
+                    base_path,
+                    [1, args.ffn_hidden_size // mapping.tp_size],
+                    quant_per_token_dyn,
+                    quant_per_channel,
+                    rank=mapping.tp_rank)
+            else:
+                layer.mlp.gate.weight.value = t
+
+        t = fromfile(
+            dir_path,
+            f'{layer_prefix}.layer.{hf_component_idx}.DenseReluDense.wo.weight{suffix}',
+            shape=[args.hidden_size, args.ffn_hidden_size // mapping.tp_size],
+            dtype_override=dtype_override
+        )
+        if use_smooth_quant:
+            layer.mlp.proj.weight.value = t
+            base_path = f'{layer_prefix}.layer.{hf_component_idx}.DenseReluDense.wo.'
+            proj_scale = getattr(layer.mlp,
+                                 "quantization_scaling_factor", None)
+            set_smoothquant_scale_factors(
+                layer.mlp.proj,
+                proj_scale,
+                dir_path,
+                base_path,
+                [1, args.hidden_size],
+                quant_per_token_dyn,
+                quant_per_channel)
+            set_smoother(layer.mlp.proj, dir_path,
+                         base_path,
+                         [1, args.ffn_hidden_size // mapping.tp_size], mapping.tp_rank)
+        else:
+            layer.mlp.proj.weight.value = t
+
         layer.mlp_layernorm.weight.value = fromfile(
-            f'{layer_prefix}.layer.{hf_component_idx}.layer_norm.weight',
-            split=False)
+            dir_path,
+            f'{layer_prefix}.layer.{hf_component_idx}.layer_norm.weight.bin')
 
     if mapping.is_last_pp_rank():
         if tllm_model.has_model_final_layernorm:
             tllm_model.final_layernorm.weight.value = fromfile(
-                f'{component}.final_layer_norm.weight', split=False)
+                dir_path,
+                f'{component}.final_layer_norm.weight.bin')
 
         if component == 'decoder':
             tllm_model.lm_head.weight.value = fromfile(
                 'lm_head.weight',
+                dir_path,
+                f'lm_head.weight.{mapping.tp_rank}.bin',
                 shape=[args.vocab_size // mapping.tp_size, args.hidden_size])
 
     tok = time.time()

@@ -321,6 +321,23 @@ class DecoderLayer(Module):
         # e.g. BART post, T5 pre
         self.layernorm_position = layernorm_position
 
+        self.hidden_size = hidden_size
+        self.ffn_hidden_size = ffn_hidden_size
+        self.num_attention_heads = num_attention_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_size = head_size
+        self.max_position_embeddings = max_position_embeddings
+        self.q_scaling = q_scaling
+        self.has_attention_qkvo_bias = has_attention_qkvo_bias
+        self.layernorm_eps = layernorm_eps
+        self.hidden_act = hidden_act
+        self.mapping = mapping
+        self.dtype = dtype
+        self.max_distance = max_distance
+        self.num_buckets = num_buckets
+        self.relative_attention = relative_attention
+        self.has_mlp_bias = has_mlp_bias
+
         # e.g. BART q_scaling = 1.f, T5 q_scaling = 1.f/sqrt(head_size)
         self.self_attention = Attention(
             local_layer_idx=local_layer_idx,

@@ -28,6 +28,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
+from tensorrt_llm.quantization import QuantMode
 
 from t5.weight import parse_t5_config, load_from_hf_t5, load_from_binary_t5  # isort:skip
 from bart.weight import parse_bart_config, load_from_binary_bart  # isort:skip
@@ -273,6 +274,30 @@ def parse_arguments(component):
         help=
         'Skip redundant cross qkv computation by using TensorRT IfConditional switch (experimental).'
     )
+    parser.add_argument(
+        '--use_smooth_quant',
+        default=False,
+        action="store_true",
+        help=
+        'Use the SmoothQuant method to quantize activations and weights for the various GEMMs.'
+        'See --per_channel and --per_token for finer-grained quantization options.'
+    )
+    parser.add_argument(
+        '--per_channel',
+        default=False,
+        action="store_true",
+        help=
+        'By default, we use a single static scaling factor for the GEMM\'s result. '
+        'per_channel instead uses a different static scaling factor for each channel. '
+        'The latter is usually more accurate, but a little slower.')
+    parser.add_argument(
+        '--per_token',
+        default=False,
+        action="store_true",
+        help=
+        'By default, we use a single static scaling factor to scale activations in the int8 range. '
+        'per_token chooses at run time, and for each token, a custom scaling factor. '
+        'The latter is usually more accurate, but a little slower.')
 
     # parse cmdline args
     args = parser.parse_args()
@@ -281,6 +306,15 @@ def parse_arguments(component):
     if component == 'encoder' and args.skip_encoder:
         # Skip further processing
         return args
+    
+    if component == "encoder":
+        # Only use smoothquant for decoder for now.
+        # TODO: remove this hack once we have SmoothQuantBertAttention
+        args.use_smooth_quant = False
+
+    if args.use_smooth_quant:
+        args.quant_mode = QuantMode.use_smooth_quant(args.per_token,
+                                                     args.per_channel)
 
     # parse model config and add to args
     if args.weight_dir is not None:
@@ -445,6 +479,15 @@ def build_rank_engine(builder: Builder,
     if args.world_size > 1:
         network.plugin_config.set_nccl_plugin(args.dtype,
                                               args.use_custom_all_reduce)
+    
+    if args.use_smooth_quant:
+        network.plugin_config.set_smooth_quant_gemm_plugin(dtype=args.dtype)
+        network.plugin_config.set_rmsnorm_quantization_plugin(dtype=args.dtype)
+        network.plugin_config.set_layernorm_quantization_plugin(dtype=args.dtype)
+        network.plugin_config.set_quantize_tensor_plugin()
+        # TODO: this gives wrong results when enabled.
+        # network.plugin_config.set_quantize_per_token_plugin()
+        
 
     with net_guard(network):
         # Prepare

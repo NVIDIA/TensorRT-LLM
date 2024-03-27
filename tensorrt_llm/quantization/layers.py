@@ -20,7 +20,7 @@ import tensorrt as trt
 from .._common import default_net, precision
 from .._utils import fp32_array, is_same_dtype
 from ..functional import (ACT2FN, Tensor, allgather, allreduce, cast, concat,
-                          constant, generate_alibi_slopes, gpt_attention,
+                          constant, expand_mask, generate_alibi_slopes, gpt_attention,
                           matmul, mul, shape, slice, softmax, split, where)
 from ..layers.attention import AttentionMaskType, PositionEmbeddingType
 from ..layers.linear import Linear, RowLinear
@@ -955,6 +955,11 @@ class SmoothQuantAttention(Module):
             scale_alibi_bias=False,
             paged_kv_cache=False,
             quant_mode=QuantMode(0),
+            relative_attention=False,
+            max_distance=0,
+            num_buckets=0,
+            cross_attention=False,
+            q_scaling=1.0,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -972,7 +977,15 @@ class SmoothQuantAttention(Module):
         self.num_layers = num_layers
         self.apply_query_key_layer_scaling = apply_query_key_layer_scaling
         self.norm_factor = math.sqrt(self.attention_head_size)
-        self.q_scaling = 1
+        self.q_scaling = q_scaling
+        self.max_distance = max_distance
+        self.relative_attention = relative_attention
+        self.cross_attention = cross_attention
+        if relative_attention:
+            self.rel_attn_table = Parameter(shape=(num_attention_heads //
+                                                   tp_size, num_buckets),
+                                            dtype=dtype)
+
         if self.apply_query_key_layer_scaling:
             self.norm_factor *= self.num_layers
             self.q_scaling *= self.num_layers
@@ -1069,8 +1082,51 @@ class SmoothQuantAttention(Module):
                 dtype=dtype,
                 tp_size=self.tp_size,
                 tp_rank=self.tp_rank)
+        
+        def dequantize_tensor(x, scale, invert_scale = False):
+            # Cast from int8 to dtype
+            casted_x = cast(x, self.dtype)
+            if invert_scale:
+                return casted_x / scale
+            return casted_x * scale
+        
+        # if cross attention, cross QKV only needs to be calculated once in the
+        # 1st decoding step --> write to cross KV cache --> remains constant
+        # during the entire decoding. 1st and >1 steps are distinguished by
+        # whether past_key_value exists or not
+        # also, cross KV cache max length is set from encoder output seqlen,
+        # this maps to the max context length concept in decoder-only models
+        cross_qkv = None
+        # get length data in every run
+        if encoder_output:
+            assert isinstance(encoder_output, Tensor)
+        # but only do projection once at 1st decoding step
+        if self.cross_attention and encoder_output:
+            if self.quant_mode.has_act_and_weight_quant():
+                if self.quant_mode.has_act_static_scaling():
+                    # Avoid quantiztion layers as it breaks int8 plugins
+                    encoder_output = quantize_tensor(
+                        encoder_output, self.quantization_scaling_factor.value)
+                else:
+                    # Quantize per token outputs tuple:
+                    # quantized tensor and scaling factors per token
+                    encoder_output = quantize_per_token(encoder_output)
+        
+            cross_qkv = self.qkv(encoder_output)
+            if self.quant_mode.has_act_and_weight_quant():
+                if self.quant_mode.has_act_static_scaling():
+                    cross_qkv_dequant_scale = self.quantization_scaling_factor.value
+                else:
+                    cross_qkv_dequant_scale = constant(fp32_array([1.0]))
+            cross_qkv = dequantize_tensor(
+                    cross_qkv,
+                    cross_qkv_dequant_scale,
+            )
 
+        past_key_value = None if kv_cache_params is None else kv_cache_params.get_first_past_key_value()
         if default_net().plugin_config.gpt_attention_plugin:
+            if self.cross_attention and (past_key_value is not None):
+                past_key_value = kv_cache_params.past_key_value[1]
 
             assert attention_params.is_valid(
                 default_net().plugin_config.gpt_attention_plugin,
@@ -1087,7 +1143,7 @@ class SmoothQuantAttention(Module):
             ) else None
             context, past_key_value = gpt_attention(
                 qkv=qkv,
-                past_key_value=kv_cache_params.get_first_past_key_value(),
+                past_key_value=past_key_value,
                 sequence_length=attention_params.sequence_length,
                 host_past_key_value_lengths=kv_cache_params.
                 host_past_key_value_lengths,
@@ -1117,7 +1173,14 @@ class SmoothQuantAttention(Module):
                 host_kv_cache_block_pointers,
                 host_context_lengths=attention_params.host_context_lengths,
                 medusa_position_offsets=medusa_position_offsets,
-                medusa_packed_mask=medusa_packed_mask)
+                medusa_packed_mask=medusa_packed_mask,
+                do_cross_attention=self.cross_attention,
+                cross_qkv=cross_qkv,
+                cross_qkv_length=attention_params.encoder_max_input_length,
+                encoder_input_lengths=attention_params.encoder_input_lengths,
+                relative_attention_bias=self.rel_attn_table.value
+                if self.relative_attention else None,
+                max_distance=self.max_distance)
         else:
             assert self.paged_kv_cache == False
 
@@ -1128,14 +1191,23 @@ class SmoothQuantAttention(Module):
                     self.attention_head_size
                 ])
                 return x.view(new_x_shape).permute([0, 2, 1, 3])
-
+            
             query, key, value = split(qkv, self.hidden_size, dim=2)
+            # in cross attention mode, replace kv by encoder_output
+            if self.cross_attention and encoder_output is not None:
+                encoder_qkv = self.qkv(encoder_output)
+                _, key, value = split(
+                    encoder_qkv, self.hidden_size,
+                    dim=2)
+
             query = transpose_for_scores(query)
             key = transpose_for_scores(key)
             value = transpose_for_scores(value)
+            
+            if self.cross_attention and (past_key_value is not None):
+                past_key_value = kv_cache_params.past_key_value[1]
 
-            past_key_value = kv_cache_params.get_first_past_key_value()
-            if past_key_value is not None:
+            if past_key_value is not None and not self.cross_attention:
 
                 def dequantize_tensor(x, scale):
                     # Cast from int8 to dtype
@@ -1175,7 +1247,7 @@ class SmoothQuantAttention(Module):
                 past_key_value = concat([inflated_key, inflated_value], dim=1)
                 return past_key_value
 
-            if self.attention_mask_type == AttentionMaskType.causal:
+            if self.attention_mask_type == AttentionMaskType.causal and not self.cross_attention:
                 query_length = shape(query, 2)
                 key_length = shape(key, 2)
                 starts = concat([0, 0, key_length - query_length, 0])
@@ -1188,16 +1260,30 @@ class SmoothQuantAttention(Module):
                                  self.max_position_embeddings))).astype(bool),
                         (0, 1)))
                 causal_mask = slice(buffer, starts, sizes)
+            
+            bias = None
+            if attention_mask is not None and self.cross_attention:
+                batch_size = shape(attention_mask, 0)
+                query_len = shape(attention_mask, 1)
+                encoder_input_len = shape(attention_mask, 2)
+                attention_mask = attention_mask.view(
+                    concat([batch_size, 1, query_len, encoder_input_len]))
+                attention_mask = where(attention_mask == 0, float('-inf'),
+                                        0.0)
+                bias = attention_mask
 
             key = key.permute([0, 1, 3, 2])
             with precision("float32"):
                 attention_scores = matmul(query, key)
 
-                if self.attention_mask_type == AttentionMaskType.causal:
+                if self.attention_mask_type == AttentionMaskType.causal and not self.cross_attention:
                     attention_scores = where(causal_mask, attention_scores,
                                              -10000.0)
 
                 attention_scores = attention_scores / self.norm_factor
+                if bias is not None:
+                    bias = cast(bias, attention_scores.dtype)
+                    attention_scores = attention_scores + bias
                 attention_probs = softmax(attention_scores, dim=-1)
 
             context = matmul(attention_probs, value,

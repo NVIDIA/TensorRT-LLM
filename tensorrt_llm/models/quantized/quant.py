@@ -17,6 +17,9 @@ from typing import Any
 
 import numpy as np
 
+from tensorrt_llm.functional import LayerNormType, MLPType, PositionEmbeddingType
+from tensorrt_llm.layers import AttentionMaskType
+
 from ...layers import ColumnLinear, RowLinear
 from ...module import Module
 from ...quantization import QuantMode
@@ -357,14 +360,138 @@ def _smooth_quantize_chatglm(model, quant_mode):
         )
     return model
 
+def _smooth_quantize_encoder_decoder(model, quant_mode):
+    assert quant_mode.has_act_and_weight_quant()
+    from ...models import DecoderModel
+    is_decoder = isinstance(model, DecoderModel)
+    layer_attribute_name = "decoder_layers" if is_decoder else "encoder_layers"
+    layers = getattr(model, layer_attribute_name)
+    for layer in layers:
+        # Set SmoothQuant LayerNorm
+        attn_layernorm_name = "self_attention_layernorm" if is_decoder else "attention_layernorm"
+        assert hasattr(layer,
+                       attn_layernorm_name), f"The layer has no {attn_layernorm_name}"
+        assert hasattr(layer,
+                       "mlp_layernorm"), "The layer has no mlp_layernorm"        
+        layernorm_cls = None
+        if layer.layernorm_type == LayerNormType.LayerNorm:
+            layernorm_cls = SmoothQuantLayerNorm
+        elif layer.layernorm_type == LayerNormType.RmsNorm:
+            layernorm_cls = SmoothQuantRmsNorm
+        assert layernorm_cls, f"layer has unrecognized layernorm type {layer.layernorm_type}"
+        
+        setattr(
+            layer, attn_layernorm_name, 
+            layernorm_cls(
+                normalized_shape=layer.hidden_size,
+                dtype=layer.dtype,
+                quant_mode=quant_mode,
+                eps=layer.layernorm_eps
+            )
+        )
+        
+        layer.mlp_layernorm = layernorm_cls(
+            normalized_shape=layer.hidden_size,
+            dtype=layer.dtype,
+            quant_mode=quant_mode,
+            eps=layer.layernorm_eps)
+        
+        if is_decoder:
+            layer.cross_attention_layernorm = layernorm_cls(
+                normalized_shape=layer.hidden_size,
+                dtype=layer.dtype,
+                quant_mode=quant_mode,
+                eps=layer.layernorm_eps)
+        
+        # Set SmoothQuant MLP        
+        mlp_cls = None
+        if layer.mlp_type == MLPType.GatedMLP:
+            mlp_cls = SmoothQuantGatedMLP
+        elif layer.mlp_type == MLPType.MLP:
+            mlp_cls = SmoothQuantMLP
+        assert mlp_cls, f"Unrecognized MLP type {layer.mlp_type}"
+
+        layer.mlp = mlp_cls(
+            hidden_size=layer.hidden_size,
+            ffn_hidden_size=layer.ffn_hidden_size,
+            hidden_act=layer.hidden_act,
+            bias=layer.has_mlp_bias,
+            tp_group=layer.mapping.tp_group,
+            tp_size=layer.mapping.tp_size,
+            dtype=layer.dtype,
+            quant_mode=quant_mode,
+        )
+
+        # Set SmoothQuant Attention depending on encoder or decoder
+        if is_decoder:
+            assert hasattr(layer, "self_attention"), "The layer has no self_attention"
+            assert hasattr(layer, "cross_attention"), "The layer has no cross_attention"
+            layer.self_attention = SmoothQuantAttention(
+                layer.hidden_size,
+                num_attention_heads=layer.num_attention_heads,
+                attention_head_size=layer.head_size,
+                num_kv_heads=layer.num_kv_heads,
+                max_position_embeddings=layer.max_position_embeddings,
+                q_scaling=layer.q_scaling,
+                bias=layer.has_attention_qkvo_bias,
+                attention_mask_type=AttentionMaskType.causal,
+                tp_group=layer.mapping.tp_group,
+                tp_size=layer.mapping.tp_size,
+                tp_rank=layer.mapping.tp_rank,
+                dtype=layer.dtype,
+                cross_attention=False,
+                relative_attention=layer.relative_attention,
+                max_distance=layer.max_distance,
+                num_buckets=layer.num_buckets,
+                position_embedding_type=(
+                    PositionEmbeddingType.relative
+                    if layer.relative_attention
+                    else PositionEmbeddingType.learned_absolute
+                ),
+                quant_mode=quant_mode,
+                clip_qkv=None,
+            )
+            layer.cross_attention = SmoothQuantAttention(
+                layer.hidden_size,
+                num_attention_heads=layer.num_attention_heads,
+                attention_head_size=layer.head_size,
+                num_kv_heads=layer.num_kv_heads,
+                max_position_embeddings=layer.max_position_embeddings,
+                q_scaling=layer.q_scaling,
+                bias=layer.has_attention_qkvo_bias,
+                attention_mask_type=AttentionMaskType.causal,
+                tp_group=layer.mapping.tp_group,
+                tp_size=layer.mapping.tp_size,
+                tp_rank=layer.mapping.tp_rank,
+                dtype=layer.dtype,
+                cross_attention=True,
+                relative_attention=False,
+                max_distance=layer.max_distance,
+                num_buckets=layer.num_buckets,
+                position_embedding_type=PositionEmbeddingType.learned_absolute,
+                quant_mode=quant_mode,
+                clip_qkv=None,
+            )
+        else: # Encoder
+            # TODO: Need to support BertAttention for SQ
+            pass
+    return model
+
 
 def _smooth_quantize(model, quant_mode):
     from ...models import (BaichuanForCausalLM, BloomForCausalLM,
                            ChatGLMForCausalLM, GPTForCausalLM, LLaMAForCausalLM,
-                           QWenForCausalLM)
-    assert isinstance(model, GPTForCausalLM) or isinstance(model, LLaMAForCausalLM) \
-            or isinstance(model, BloomForCausalLM) or isinstance(model, BaichuanForCausalLM) \
-            or isinstance(model, QWenForCausalLM) or isinstance(model, ChatGLMForCausalLM), \
+                           QWenForCausalLM, EncoderModel, DecoderModel)
+    valid_models = (
+        LLaMAForCausalLM,
+        BloomForCausalLM,
+        BaichuanForCausalLM,
+        QWenForCausalLM,
+        ChatGLMForCausalLM,
+        EncoderModel,
+        DecoderModel,
+    )
+    assert isinstance(model, valid_models), \
             "Only GPTForCausalLM, LLaMAForCausalLM BloomForCausalLM and BaichuanForCausalLM are well tested now"
     if isinstance(model, GPTForCausalLM):
         return _smooth_quantize_gpt(model, quant_mode)
@@ -378,6 +505,8 @@ def _smooth_quantize(model, quant_mode):
         return _smooth_quantize_qwen(model, quant_mode)
     elif isinstance(model, ChatGLMForCausalLM):
         return _smooth_quantize_chatglm(model, quant_mode)
+    elif isinstance(model, (EncoderModel, DecoderModel)):
+        return _smooth_quantize_encoder_decoder(model, quant_mode)
     else:
         assert False, f"Model {type(model).__name__} is not supported by SmoothQuant yet"
 
