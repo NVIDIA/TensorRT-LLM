@@ -449,7 +449,6 @@ def _smooth_quantize_encoder_decoder(model, quant_mode):
                     else PositionEmbeddingType.learned_absolute
                 ),
                 quant_mode=quant_mode,
-                clip_qkv=None,
             )
             layer.cross_attention = SmoothQuantAttention(
                 layer.hidden_size,
@@ -470,7 +469,6 @@ def _smooth_quantize_encoder_decoder(model, quant_mode):
                 num_buckets=layer.num_buckets,
                 position_embedding_type=PositionEmbeddingType.learned_absolute,
                 quant_mode=quant_mode,
-                clip_qkv=None,
             )
         else: # Encoder
             # TODO: Need to support BertAttention for SQ
