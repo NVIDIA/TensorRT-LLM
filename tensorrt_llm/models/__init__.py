@@ -31,6 +31,7 @@ from .mpt.model import MPTForCausalLM, MPTModel
 from .opt.model import OPTForCausalLM, OPTModel
 from .phi.model import PhiForCausalLM, PhiModel
 from .qwen.model import QWenForCausalLM
+from .dbrx.model import DbrxForCausalLM
 
 from .quantized.quant import quantize_model  # noqa # isort:skip
 
@@ -70,6 +71,7 @@ __all__ = [
     'MPTModel',
     'SkyworkForCausalLM',
     'GemmaForCausalLM',
+    'DbrxForCausalLM',
 ]
 
 MODEL_MAP = {
@@ -92,4 +94,5 @@ MODEL_MAP = {
     'SkyworkForCausalLM': LLaMAForCausalLM,
     'GemmaForCausalLM': GemmaForCausalLM,
     'QWenForCausalLM': QWenForCausalLM,
+    'DbrxForCausalLM': DbrxForCausalLM,
 }
