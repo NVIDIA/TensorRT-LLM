@@ -32,6 +32,7 @@ from ..quantization import QuantMode
 from .kv_cache_manager import GenerationSequence, KVCacheManager
 from .session import _scoped_stream
 
+import time
 
 def to_word_list_format(word_dict: List[List[str]], tokenizer=None):
     '''
@@ -1390,6 +1391,8 @@ class GenerationSession(object):
             sequence_lengths: torch.Tensor, next_step_buffer: dict,
             stop_words_list, bad_words_list, no_repeat_ngram_size,
             encoder_output: torch.Tensor, encoder_input_lengths: torch.Tensor):
+        torch.cuda.synchronize()
+        print(f"{step}\t{time.time()}")
         if step % 2:
             context = self.runtime.context_0
             this_src_cache_indirection = cache_indirections[1]
@@ -1651,11 +1654,13 @@ class GenerationSession(object):
                 outputs[
                     'sequence_lengths'] = self.sequence_length_buffer.reshape(
                         [batch_size, beam_width])
+            print(f"\t{time.time()}")
             if self.gather_all_token_logits:
                 outputs['context_logits'] = context_logits
             return outputs
 
         for step in range(0, self.max_new_tokens):
+            print(f"\t{time.time()}")
             should_stop, next_step_buffer, tasks, context_lengths, host_context_lengths, attention_mask, logits = self.handle_per_step(
                 cache_indirections, step, batch_size, max_context_length,
                 beam_width, input_ids, hidden_states, scfg,
