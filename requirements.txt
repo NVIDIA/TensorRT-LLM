@@ -16,6 +16,9 @@ pandas
 h5py
 StrEnum
 sentencepiece>=0.1.99
+# WAR the new posting of "nvidia-cudnn-cu12~=9.0".
+# "tensorrt==9.3.0.post12.dev1" specifies "nvidia-cudnn-cu12" but actually requires "nvidia-cudnn-cu12~=8.9".
+nvidia-cudnn-cu12~=8.9; platform_machine == "x86_64"
 tensorrt==9.3.0.post12.dev1
 # https://github.com/pytorch/pytorch/blob/v2.2.1/version.txt still uses 2.2.0a0.
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-02.html#rel-24-02 uses 2.3.0a0.

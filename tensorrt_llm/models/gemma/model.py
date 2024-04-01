@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import math
 from typing import Optional
 
 from ..._utils import pad_vocab_size
@@ -129,7 +128,6 @@ class GemmaModel(Module):
             self.ln_f = RmsNorm(normalized_shape=config.hidden_size,
                                 eps=config.norm_epsilon,
                                 dtype=config.dtype)
-        self.hidden_size = config.hidden_size
 
     def forward(self,
                 input_ids,
@@ -150,7 +148,6 @@ class GemmaModel(Module):
 
         if self.mapping.is_first_pp_rank():
             hidden_states = self.vocab_embedding(input_ids, *ptuning_args)
-            hidden_states = hidden_states * math.sqrt(self.hidden_size)
         else:
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
 
@@ -185,10 +182,6 @@ class GemmaForCausalLM(DecoderModelForCausalLM, TopModelMixin):
 
         vocab_size_padded = pad_vocab_size(config.vocab_size,
                                            config.mapping.tp_size)
-        share_weight = None
-        assert config.share_embedding_table, "Gemma only supports share_embedding_table"
-        share_weight = transformer.vocab_embedding.weight
-
         if config.mapping.is_last_pp_rank():
             lm_head = ColumnLinear(config.hidden_size,
                                    vocab_size_padded,
@@ -196,8 +189,7 @@ class GemmaForCausalLM(DecoderModelForCausalLM, TopModelMixin):
                                    dtype=config.dtype,
                                    tp_group=config.mapping.tp_group,
                                    tp_size=config.mapping.tp_size,
-                                   gather_output=True,
-                                   share_weight=share_weight)
+                                   gather_output=True)
         else:
             lm_head = None
         self.quant_mode = config.quant_mode

@@ -23,7 +23,7 @@ from tensorrt_llm.profiler import bytes_to_target_unit
 
 from allowed_configs import get_build_config, BuildConfig  # isort:skip
 from base_benchmark import BaseBenchmark  # isort:skip
-from build import build_gpt, get_quant_mode  # isort:skip
+from build import build_gpt, get_quant_config  # isort:skip
 
 
 def element_size(dtype: str):
@@ -81,7 +81,8 @@ class GPTBenchmark(BaseBenchmark):
             if args.max_output_len is not None:
                 self.max_output_len = args.max_output_len
 
-            self.quant_mode, _, _ = get_quant_mode(args.quantization)
+            self.quant_config = get_quant_config(args.quantization)
+            self.quant_mode = self.quant_config.quant_mode
             self.enable_fp8 = self.quant_mode.has_fp8_qdq()
             self.fp8_kv_cache = self.quant_mode.has_fp8_kv_cache()
             if self.quant_mode.has_fp8_kv_cache():

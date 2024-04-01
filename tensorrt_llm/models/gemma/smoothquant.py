@@ -17,8 +17,6 @@ from transformers.models.llama.modeling_llama import (LlamaAttention,
                                                       repeat_kv)
 from transformers.pytorch_utils import Conv1D
 
-from tensorrt_llm._utils import numpy_to_dtype
-
 
 def generate_int8(weights, act_range, is_qkv=False, multi_query_mode=False):
     """
@@ -740,8 +738,8 @@ def create_model_from_config(trt_llm_config, weights):
     }
     for name in list(weights):
         if model_config.dtype == "bfloat16":
-            param = torch.from_numpy(numpy_to_dtype(
-                weights[name], "float32")).to(torch.bfloat16)
+            param = torch.from_numpy(weights[name].astype(np.float32)).to(
+                torch.bfloat16)
         else:
             param = torch.from_numpy(weights[name])
         weights.pop(name)
@@ -761,9 +759,6 @@ def create_model_from_config(trt_llm_config, weights):
             weights[new_name.replace('attention.qkv', 'self_attn.v_proj')] = vw
         else:
             weights[new_name] = param
-
-    if "lm_head.weight" not in weights:
-        weights["lm_head.weight"] = weights["model.embed_tokens.weight"].clone()
     model.load_state_dict(weights)
     return model
 

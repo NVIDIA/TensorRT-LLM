@@ -318,18 +318,13 @@ def quantize_and_export(*, model_dir, dtype, device, qformat, kv_cache_dtype,
         export_path = output_dir
         start_time = time.time()
 
-        export_npz = (model_type not in [
-            'gpt2', 'gptj', 'falcon', 'chatglm', 'mpt', 'llama', 'baichuan',
-            'gemma', 'qwen'
-        ])
         export_model_config(model,
                             model_type,
                             getattr(torch, dtype),
                             export_dir=export_path,
                             inference_tensor_parallel=tp_size,
                             inference_pipeline_parallel=pp_size,
-                            export_tensorrt_llm_config=(not export_npz),
-                            export_npz=export_npz)
+                            export_tensorrt_llm_config=True)
 
         # Workaround for wo quantization
         if qformat in ["int8_wo", "int4_wo", "full_prec"]:

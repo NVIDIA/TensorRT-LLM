@@ -469,7 +469,8 @@ public:
     void getBlockPointersOfBatch(
         runtime::ITensor& dstPointers, SizeType firstBatchSlotIdx, SizeType batchSize, SizeType beamWidth) const;
 
-    void copyBlockPointers(
+    // returns maxBlockCount of all beams
+    SizeType copyBlockPointers(
         runtime::ITensor& dstPointers, SizeType dstSlotOffset, SizeType seqSlotIdx, SizeType beamWidth) const;
 
     // Volume of [2, numKvHeads, tokensPerBlock, sizePerHead]

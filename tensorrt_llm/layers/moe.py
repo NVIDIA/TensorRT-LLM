@@ -71,10 +71,6 @@ class MoeConfig:
         return self.num_experts > 1
 
 
-def is_gated_activation(activation_str):
-    return activation_str in ("swiglu", "geglu")
-
-
 def _moe_plugin(moe_config,
                 hidden_states,
                 routing,

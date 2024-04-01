@@ -121,11 +121,7 @@ _str_to_np_dict = dict(
 
 
 def str_dtype_to_np(dtype):
-    if isinstance(dtype, str):
-        ret = _str_to_np_dict.get(dtype)
-    else:
-        # metadata
-        ret = _str_to_np_dict.get(dtype.metadata['dtype'])
+    ret = _str_to_np_dict.get(dtype)
     assert ret is not None, f'Unsupported dtype: {dtype}'
     return ret
 

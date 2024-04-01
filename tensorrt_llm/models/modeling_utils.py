@@ -1028,14 +1028,6 @@ def load_model(
             logger.warning(
                 f"Cannot find {model_path}. Use dummy model weights.")
 
-    if model_config.share_embedding_table:
-        if "lm_head.weight" in weights and "transformer.vocab_embedding.weight" in weights:
-            assert not (
-                weights["lm_head.weight"] -
-                weights["transformer.vocab_embedding.weight"]
-            ).any(
-            ), "When share_embedding_table is enabled, lm_head.weight and transformer.vocab_embedding.weight must be same."
-
     # Currently, use_parallel_embedding and share_embedding_table should be enabled before weight loading;
     # otherwise, the model will be inconsistent with the weights loaded from checkpoint.
     model = optimize_model(

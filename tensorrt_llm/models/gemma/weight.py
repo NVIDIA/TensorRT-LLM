@@ -16,107 +16,16 @@ import configparser
 import os
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Union
 
 import numpy as np
 import torch
 
-from ..._utils import (numpy_to_dtype, numpy_to_torch, pad_vocab_size,
-                       str_dtype_to_torch, torch_to_numpy)
+from ..._utils import (numpy_to_torch, pad_vocab_size, str_dtype_to_torch,
+                       torch_to_numpy)
 from ...logger import logger
 from ...mapping import Mapping
 from ...quantization import QuantMode
-from ..quantized.quant import get_dummy_quant_scales
-
-
-def get_scaling_factors(
-    model_path: Union[str, Path],
-    num_layers: int,
-    quant_mode: Optional[QuantMode] = None,
-) -> Optional[Dict[str, List[int]]]:
-    """ Get the scaling factors for LLaMA model
-
-    Returns a dictionary of scaling factors for the selected layers of the
-    LLaMA model.
-
-    Args:
-        model_path (str): Path to the quantized LLaMA model
-        layers (list): List of layers to get the scaling factors for. If None,
-            all layers are selected.
-
-    Returns:
-        dict: Dictionary of scaling factors for the selected layers of the
-        LLaMA model.
-
-        example:
-
-        {
-            'qkv_act': qkv_act_scale,
-            'qkv_weights': qkv_weights_scale,
-            'qkv_output' : qkv_outputs_scale,
-            'dense_act': dense_act_scale,
-            'dense_weights': dense_weights_scale,
-            'fc_act': fc_act_scale,
-            'fc_weights': fc_weights_scale,
-            'gate_act': gate_act_scale,
-            'gate_weights': gate_weights_scale,
-            'proj_act': proj_act_scale,
-            'proj_weights': proj_weights_scale,
-        }
-    """
-
-    if model_path is None:
-        logger.warning(f"--quantized_fp8_model_path not specified. "
-                       f"Initialize quantization scales automatically.")
-        return get_dummy_quant_scales(num_layers)
-    weight_dict = np.load(model_path)
-    # yapf: disable
-    scaling_factor = {
-        'qkv_act': [],
-        'qkv_weights': [],
-        'dense_act': [],
-        'dense_weights': [],
-        'fc_act': [],
-        'fc_weights': [],
-        'gate_act': [],
-        'gate_weights': [],
-        'proj_act': [],
-        'proj_weights': [],
-    }
-
-    if quant_mode is not None and quant_mode.has_fp8_kv_cache():
-        scaling_factor['qkv_output'] = []
-
-    for layer in range(num_layers):
-        scaling_factor['qkv_act'].append(max(
-            weight_dict[f'_np:layers:{layer}:attention:qkv:q:activation_scaling_factor'].item(),
-            weight_dict[f'_np:layers:{layer}:attention:qkv:k:activation_scaling_factor'].item(),
-            weight_dict[f'_np:layers:{layer}:attention:qkv:v:activation_scaling_factor'].item()
-        ))
-        scaling_factor['qkv_weights'].append(max(
-            weight_dict[f'_np:layers:{layer}:attention:qkv:q:weights_scaling_factor'].item(),
-            weight_dict[f'_np:layers:{layer}:attention:qkv:k:weights_scaling_factor'].item(),
-            weight_dict[f'_np:layers:{layer}:attention:qkv:v:weights_scaling_factor'].item()
-        ))
-        if quant_mode is not None and quant_mode.has_fp8_kv_cache():
-            # Not calibrating KV cache.
-            scaling_factor['qkv_output'].append(1.0)
-        scaling_factor['dense_act'].append(
-            weight_dict[f'_np:layers:{layer}:attention:dense:activation_scaling_factor'].item())
-        scaling_factor['dense_weights'].append(
-            weight_dict[f'_np:layers:{layer}:attention:dense:weights_scaling_factor'].item())
-        scaling_factor['fc_act'].append(weight_dict[f'_np:layers:{layer}:mlp:fc:activation_scaling_factor'].item())
-        scaling_factor['fc_weights'].append(weight_dict[f'_np:layers:{layer}:mlp:fc:weights_scaling_factor'].item())
-        scaling_factor['gate_act'].append(weight_dict[f'_np:layers:{layer}:mlp:gate:activation_scaling_factor'].item())
-        scaling_factor['gate_weights'].append(weight_dict[f'_np:layers:{layer}:mlp:gate:weights_scaling_factor'].item())
-        scaling_factor['proj_act'].append(weight_dict[f'_np:layers:{layer}:mlp:proj:activation_scaling_factor'].item())
-        scaling_factor['proj_weights'].append(weight_dict[f'_np:layers:{layer}:mlp:proj:weights_scaling_factor'].item())
-    # yapf: enable
-    for k, v in scaling_factor.items():
-        assert len(v) == num_layers, \
-            f'Expect scaling factor {k} of length {num_layers}, got {len(v)}'
-
-    return scaling_factor
 
 
 def gen_suffix(rank, use_smooth_quant, quant_per_channel):
@@ -760,8 +669,8 @@ def load_from_hf_gemma(tensorrt_llm_llama: 'GemmaForCausalLM',
 def quantize_fp8_weights(weights, num_layers, mapping):
 
     def get_scaling_factor(weight):
-        scale = torch_to_numpy(448.0 / numpy_to_torch(weight).max()).reshape(
-            [-1])
+        amax = weight.max()
+        scale = 448.0 / amax
         return scale
 
     layers_range = mapping.pp_layers(num_layers)
@@ -781,13 +690,9 @@ def quantize_fp8_weights(weights, num_layers, mapping):
             dtype = weights[trt_llm_name].dtype
             scale = get_scaling_factor(weight)
             scaled_weights[trt_llm_name] = np.ascontiguousarray(
-                numpy_to_dtype(
-                    torch_to_numpy(
-                        numpy_to_torch(weight).to(torch.float32) *
-                        numpy_to_torch(scale).to(torch.float32)), dtype))
-            scaling_factors[scale_name] = torch_to_numpy(
-                (1 / numpy_to_torch(scale)).to(torch.float32))
-
+                (weight * scale).astype(dtype))
+            scaling_factors[scale_name] = np.asarray([1 / scale
+                                                      ]).astype(np.float32)
     return scaling_factors
 
 
