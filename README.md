@@ -17,9 +17,10 @@ TensorRT-LLM
 <div align="left">
 
 ## Latest News
+* [*Weekly*] Check out **[@NVIDIAAIDev](https://twitter.com/nvidiaaidev?lang=en)** & **[NVIDIA AI](https://www.linkedin.com/showcase/nvidia-ai/)** LinkedIn for the latest updates!
 * [2024/02/06] [🚀 Speed up inference with SOTA quantization techniques in TRT-LLM](./docs/source/blogs/quantization-in-TRT-LLM.md)
-* [2024/01/30] [ New **XQA-kernel** provides **2.4x more Llama-70B throughput** within the same latency budget](./docs/source/blogs/XQA-kernel.md)
-* [2023/12/04] [**Falcon-180B** on a **single H200** GPU with INT4 AWQ, and **6.7x faster Llama-70B** over A100](./docs/source/blogs/Falcon180B-H200.md)
+* [2024/01/30] [ New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget](./docs/source/blogs/XQA-kernel.md)
+* [2023/12/04] [Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100](./docs/source/blogs/Falcon180B-H200.md)
 * [2023/11/27] [SageMaker LMI now supports TensorRT-LLM - improves throughput by 60%, compared to previous version](https://aws.amazon.com/blogs/machine-learning/boost-inference-performance-for-llms-with-new-amazon-sagemaker-containers/)
 * [2023/11/13] [H200 achieves nearly 12,000 tok/sec on Llama2-13B](./docs/source/blogs/H200launch.md)
 * [2023/10/22] [🚀 RAG on Windows using TensorRT-LLM and LlamaIndex 🦙](https://github.com/NVIDIA/trt-llm-rag-windows#readme)
@@ -28,13 +29,6 @@ TensorRT-LLM
 * [2023/10/17] [Large Language Models up to 4x Faster on RTX With TensorRT-LLM for Windows
 ](https://blogs.nvidia.com/blog/2023/10/17/tensorrt-llm-windows-stable-diffusion-rtx/)
 
-
-[2023/11/27 - Amazon Sagemaker](https://aws.amazon.com/blogs/machine-learning/boost-inference-performance-for-llms-with-new-amazon-sagemaker-containers/)
-[2023/11/17 - Perplexity](https://blog.perplexity.ai/blog/turbocharging-llama-2-70b-with-nvidia-h100) ;
-[2023/10/31 - Phind](https://www.phind.com/blog/phind-model-beats-gpt4-fast) ;
-[2023/10/12 - Databricks (MosaicML)](https://www.databricks.com/blog/llm-inference-performance-engineering-best-practices) ;
-[2023/10/04 - Perplexity](https://blog.perplexity.ai/blog/introducing-pplx-api) ;
-[2023/09/27 - CloudFlare](https://www.cloudflare.com/press-releases/2023/cloudflare-powers-hyper-local-ai-inference-with-nvidia/);
 
 ## Table of Contents
 

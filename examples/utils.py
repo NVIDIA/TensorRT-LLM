@@ -21,7 +21,6 @@ from transformers import AutoTokenizer, T5Tokenizer
 
 from tensorrt_llm.builder import get_engine_version
 
-# TODO(enweiz): Update for refactored models
 DEFAULT_HF_MODEL_DIRS = {
     'BaichuanForCausalLM': 'baichuan-inc/Baichuan-13B-Chat',
     'BloomForCausalLM': 'bigscience/bloom-560m',

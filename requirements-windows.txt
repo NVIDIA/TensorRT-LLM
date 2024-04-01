@@ -16,6 +16,9 @@ pandas
 h5py
 pywin32
 sentencepiece>=0.1.99
+# WAR the new posting of "nvidia-cudnn-cu12~=9.0".
+# "tensorrt==9.2.0.post12.dev5" specifies "nvidia-cudnn-cu12" but actually requires "nvidia-cudnn-cu12~=8.9".
+nvidia-cudnn-cu12~=8.9; platform_machine == "x86_64"
 tensorrt==9.2.0.post12.dev5
 tokenizers>=0.14
 # Default torch is CPU-only on Windows, so need to specify a torch version with GPU support

@@ -22,7 +22,7 @@ Toggling the CUDA profiler runtime API on and off:
 [TensorRT-LLM][INFO] {"Active Request Count":249,"Context Requests":8,"Free KV cache blocks":0,"Generation Requests":231,"Iteration Counter":90,"Max KV cache blocks":2448,"Max Request Count":256,"MicroBatch ID":0,"Runtime CPU Memory Usage":28784,"Runtime GPU Memory Usage":540173600,"Runtime Pinned Memory Usage":0,"Scheduled Requests":239,"Timestamp":"12-13-2023 14:55:14","Tokens per KV cache block":128,"Total Context Tokens":6904,"Used KV cache blocks":2448}
 ```
 ### Inference Time Environment Variables
-  * `TLLM_GPTM_PROFILE_START_STOP`, a csv of iterations to trigger start/stop for gptManagerBenchmark (corresponds to "Iteration Counter" in output above
+  * `TLLM_GPTM_PROFILE_START_STOP`, a csv of iterations to trigger start/stop for gptManagerBenchmark (corresponds to "Iteration Counter" in output above. Each value can be a range using the "-" separator e.g. 0-10. In the case of ranges all iterations in that range will be placed in the same nsys file.
   * `TLLM_GPTS_PROFILE_START_STOP`, a csv of static batching iteration indexes to trigger start/stop for gptSessionBenchmark
 
 ## Coordinating with NVIDIA Nsight Systems Launch
