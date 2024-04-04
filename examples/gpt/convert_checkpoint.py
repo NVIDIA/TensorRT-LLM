@@ -1923,6 +1923,8 @@ if __name__ == '__main__':
         getattr(hf_config, 'apply_query_key_layer_scaling', False),
         'rotary_pct':
         getattr(hf_config, 'rotary_pct', 1.0),
+        'rotary_base':
+        getattr(hf_config, 'rotary_base', 10000)
     }
 
     with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
