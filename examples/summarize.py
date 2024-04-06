@@ -488,7 +488,7 @@ def main(args):
 
         ite_count = 0
         data_point_idx = 0
-        total_output_token_count_trt_llm = 0  # only valid for runtime_rank == 0
+        # total_output_token_count_trt_llm = 0  # only valid for runtime_rank == 0
         while (data_point_idx < len(dataset)) and (ite_count < args.max_ite):
             if runtime_rank == 0:
                 logger.debug(
