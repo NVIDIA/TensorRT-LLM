@@ -332,14 +332,14 @@ class ModelRunnerCpp(ModelRunnerMixin):
                                      device=cuda_device)
         generation_output = GenerationOutput(output_ids, output_lengths)
         if self.gather_generation_logits:
-            generation_output.context_logits = torch.empty(
-                (batch_size, self.max_input_len, self.vocab_size_padded),
-                device=cuda_device)
             generation_output.generation_logits = torch.zeros(
                 (batch_size, sampling_config.num_beams,
                  sampling_config.max_new_tokens, self.vocab_size_padded),
                 device=cuda_device)
-
+        if self.gather_context_logits:
+            generation_output.context_logits = torch.empty(
+                (batch_size, self.max_input_len, self.vocab_size_padded),
+                device=cuda_device)
         self.session.generate(generation_output, generation_input,
                               gpt_sampling_config)
         if sampling_config.return_dict:
