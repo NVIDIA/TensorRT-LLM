@@ -714,12 +714,12 @@ bool MHARunner::fmha_supported(int const headSize, int const sm)
     else if (sm == kSM_80 || sm == kSM_86 || sm == kSM_89)
     {
         return (headSize == 16 || headSize == 32 || headSize == 40 || headSize == 64 || headSize == 80 || headSize == 96
-            || headSize == 104 || headSize == 128 || headSize == 160 || headSize == 256);
+            || headSize == 104 || headSize == 128 || headSize == 160 || headSize == 192 || headSize == 256);
     }
     else if (sm == kSM_90)
     {
         return (headSize == 32 || headSize == 40 || headSize == 64 || headSize == 80 || headSize == 96
-            || headSize == 104 || headSize == 128 || headSize == 160 || headSize == 256);
+            || headSize == 104 || headSize == 128 || headSize == 160 || headSize == 192 || headSize == 256);
     }
 
     return false;

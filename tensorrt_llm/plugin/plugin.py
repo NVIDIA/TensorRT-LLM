@@ -103,7 +103,7 @@ class PluginConfig:
         assert hasattr(self, name), f"Plugin name doesn't exist: {name}"
         if value is not None and getattr(self, name) is not None:
             target_type = type(getattr(self, name))
-            assert type(value) == target_type, \
+            assert isinstance(value, target_type), \
                 f"Plugin {name} expects {target_type}, got {type(value)}"
         setattr(self, name, value)
         logger.info(f"Set {name} to {value}.")
@@ -112,7 +112,7 @@ class PluginConfig:
         for name in config.keys():
             if hasattr(self, name):
                 value_to_be_update = config[name]
-                if type(getattr(self, name)) == bool:
+                if isinstance(getattr(self, name), bool):
                     if value_to_be_update is True or \
                             value_to_be_update == "enable":
                         value_to_be_update = True
@@ -295,6 +295,7 @@ cli_plugin_args = [
     "lora_plugin",
     "moe_plugin",
     "mamba_conv1d_plugin",
+    "nccl_plugin",
 
     # Features
     "context_fmha",

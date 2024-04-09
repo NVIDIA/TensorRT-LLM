@@ -172,6 +172,10 @@ trtllm-build --checkpoint_dir ./mamba_model/mamba-130m/trt_ckpt/fp16/1-gpu/ \
              --output_dir ./mamba_model/mamba-130m/trt_engines/fp16/1-gpu/
 ```
 
+Note that when building Mamba models, you need to disable the `paged_kv_cache` as it is used for
+transformer-based models. Mamba models use `paged_state` instead and it is enabed by default.
+If `paged_state` is disabled, engine will be built with the contiguous stage cache.
+
 ### 4. Run summarization task with the TensorRT engine(s)
 
 The following section describes how to run a TensorRT-LLM Mamba model to summarize the articles from the

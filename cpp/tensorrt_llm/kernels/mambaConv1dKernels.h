@@ -42,6 +42,7 @@ struct MambaConv1dParamsBase
 {
     int batch, dim, max_seqlen, dconv;
     bool remove_padding;
+    bool apply_silu;
     void* __restrict__ in_ptr;
     void* state_in_ptr;
     void* state_out_ptr;

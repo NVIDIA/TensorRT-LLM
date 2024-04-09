@@ -668,6 +668,7 @@ private:
 };
 
 using DeviceBuffer = GenericBuffer<CudaAllocatorAsync>;
+using StaticDeviceBuffer = GenericBuffer<CudaAllocator>;
 using HostBuffer = GenericBuffer<HostAllocator>;
 using PinnedBuffer = GenericBuffer<PinnedAllocator>;
 using PinnedPoolBuffer = GenericBuffer<PinnedPoolAllocator>;
@@ -757,6 +758,7 @@ private:
 };
 
 using DeviceTensor = GenericTensor<CudaAllocatorAsync>;
+using StaticDeviceTensor = GenericTensor<CudaAllocator>;
 using HostTensor = GenericTensor<HostAllocator>;
 using PinnedTensor = GenericTensor<PinnedAllocator>;
 using PinnedPoolTensor = GenericTensor<PinnedPoolAllocator>;

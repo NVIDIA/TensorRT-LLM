@@ -95,8 +95,10 @@ private:
         std::map<uint64_t, std::pair<TensorPtr, TensorPtr>> loras;
         for (auto const& [id, p] : taskPaths)
         {
-            TensorPtr loraWeights = utils::loadNpy(mBufferManager, p / "model.lora_weights.npy", MemoryType::kCPU);
-            TensorPtr loraConfig = utils::loadNpy(mBufferManager, p / "model.lora_config.npy", MemoryType::kCPU);
+            TensorPtr loraWeights
+                = utils::loadNpy(mBufferManager, (p / "model.lora_weights.npy").string(), MemoryType::kCPU);
+            TensorPtr loraConfig
+                = utils::loadNpy(mBufferManager, (p / "model.lora_config.npy").string(), MemoryType::kCPU);
             loras.insert_or_assign(id, std::make_pair(loraWeights, loraConfig));
         }
         return loras;
@@ -136,17 +138,21 @@ private:
 
 struct BenchmarkParams
 {
-    std::optional<SizeType> maxTokensInPagedKvCache = std::nullopt;
-    std::optional<float> freeGpuMemoryFraction = std::nullopt;
-    bool enableTrtOverlap = false;
-    bool enableBlockReuse = false;
-    bool enableChunkedContext = false;
-    bool streaming = false;
+    std::optional<SizeType> maxTokensInPagedKvCache{std::nullopt};
+    std::optional<float> freeGpuMemoryFraction{std::nullopt};
+    bool enableTrtOverlap{false};
+    bool enableBlockReuse{false};
+    bool enableChunkedContext{false};
+    bool streaming{false};
 
     // lora / peft params
-    std::optional<std::string> loraDir = std::nullopt;
-    SizeType loraDeviceNumModLayers = 0;
-    size_t loraHostCacheSize = 1024 * 2024 * 1024;
+    std::optional<std::string> loraDir{std::nullopt};
+    SizeType loraDeviceNumModLayers{0};
+    size_t loraHostCacheSize{1024 * 2024 * 1024};
+
+    // KV cache block offloading
+    size_t kvHostCacheSize{0};
+    bool kvOnboardBlocks{true};
 };
 } // namespace
 
@@ -289,6 +295,8 @@ struct BenchInfo
         , outputLength(_outputLength)
         , start(_start)
         , latency()
+        , firstTokenLatency()
+        , avgGenT2TLatency()
     {
     }
 
@@ -296,7 +304,12 @@ struct BenchInfo
     int outputLength;
     std::chrono::time_point<std::chrono::steady_clock> start;
     std::chrono::time_point<std::chrono::steady_clock> end;
+    std::chrono::time_point<std::chrono::steady_clock> firstTokenTs;
     float latency; // millisecond
+    bool hasError;
+    float firstTokenLatency;
+    float avgGenT2TLatency;
+    bool firstTokenSeen = false;
 };
 
 class Recorder
@@ -304,8 +317,10 @@ class Recorder
     using TensorPtr = ITensor::SharedPtr;
 
 public:
-    explicit Recorder(std::string opCsvFile, std::string responsesJsonFile = "", bool excludeInputInOutput = false)
+    explicit Recorder(std::string opCsvFile, bool streaming = false, std::string responsesJsonFile = "",
+        bool excludeInputInOutput = false)
         : mOpCsvFile(std::move(opCsvFile))
+        , mStreaming(streaming)
         , mRespJsonFile(std::move(responsesJsonFile))
         , mOutputHasInput(!excludeInputInOutput)
     {
@@ -343,17 +358,28 @@ public:
         mRequestBenchInfos[requestId] = BenchInfo(inputLength, maxNewTokens, start);
     }
 
-    void recordEnd(uint64_t requestId)
+    void recordEnd(uint64_t requestId, bool hasError)
     {
         mRequestBenchInfos[requestId].end = std::chrono::steady_clock::now();
-        mRequestBenchInfos[requestId].latency = std::chrono::duration<float, std::milli>(
-            mRequestBenchInfos[requestId].end - mRequestBenchInfos[requestId].start)
-                                                    .count();
+        mRequestBenchInfos[requestId].hasError = hasError;
     }
 
-    void recordEnd(uint64_t requestId, std::list<NamedTensor> const& responseTensors)
+    void recordToken(uint64_t requestId)
     {
-        this->recordEnd(requestId);
+        if (mRequestBenchInfos[requestId].firstTokenSeen)
+        {
+            return;
+        }
+        else
+        {
+            mRequestBenchInfos[requestId].firstTokenTs = std::chrono::steady_clock::now();
+            mRequestBenchInfos[requestId].firstTokenSeen = true;
+        }
+    }
+
+    void recordEnd(uint64_t requestId, std::list<NamedTensor> const& responseTensors, bool hasError)
+    {
+        this->recordEnd(requestId, hasError);
 
         if (mRespJsonFile.empty())
             return;
@@ -385,49 +411,151 @@ public:
         return latencies[index];
     }
 
+    void calculateLatencies()
+    {
+        for (auto& reqInfo : mRequestBenchInfos)
+        {
+            reqInfo.second.latency
+                = std::chrono::duration<float, std::milli>(reqInfo.second.end - reqInfo.second.start).count();
+            if (mStreaming)
+            {
+                reqInfo.second.firstTokenLatency
+                    = std::chrono::duration<float, std::milli>(reqInfo.second.firstTokenTs - reqInfo.second.start)
+                          .count();
+                reqInfo.second.avgGenT2TLatency
+                    = std::chrono::duration<float, std::milli>(reqInfo.second.end - reqInfo.second.firstTokenTs).count()
+                    / (reqInfo.second.outputLength - 1);
+            }
+        }
+    }
+
     void calculateMetrics()
     {
-        mNumSamples = mRequestBenchInfos.size();
         mTotalLatency = std::chrono::duration<float, std::milli>(mEnd - mStart).count();
+
         mSeqThroughput = mNumSamples / (mTotalLatency / 1000);
-        mAvgSeqLatency = 0;
+        mAvgSeqLatency = mAvgFtLatency = mAvgGenT2TLatency = 0;
+
+        calculateLatencies();
 
         std::vector<float> reqLatencies;
+        std::vector<float> ftLatencies;
+        std::vector<float> genT2TLatencies;
+
         int totalOutputTokens = 0;
+        mNumErrorSamples = 0;
+        mNumSamples = 0;
         for (auto reqInfo : mRequestBenchInfos)
         {
-            mAvgSeqLatency += reqInfo.second.latency;
-            reqLatencies.push_back(reqInfo.second.latency);
-            totalOutputTokens += reqInfo.second.outputLength;
+            if (!reqInfo.second.hasError)
+            {
+                mAvgSeqLatency += reqInfo.second.latency;
+                reqLatencies.push_back(reqInfo.second.latency);
+                totalOutputTokens += reqInfo.second.outputLength;
+
+                if (mStreaming)
+                {
+                    mAvgFtLatency += reqInfo.second.firstTokenLatency;
+                    mAvgGenT2TLatency += reqInfo.second.avgGenT2TLatency;
+                    ftLatencies.push_back(reqInfo.second.firstTokenLatency);
+                    genT2TLatencies.push_back(reqInfo.second.avgGenT2TLatency);
+                }
+                ++mNumSamples;
+            }
+            else
+            {
+                ++mNumErrorSamples;
+            }
         }
+
+        mSeqThroughput = mNumSamples / (mTotalLatency / 1000);
         mAvgSeqLatency /= mNumSamples;
         mTokenThroughput = totalOutputTokens / (mTotalLatency / 1000);
 
         std::sort(reqLatencies.begin(), reqLatencies.end());
+
         mP99SeqLatency = calcPercentile(reqLatencies, 99);
         mP90SeqLatency = calcPercentile(reqLatencies, 90);
         mP50SeqLatency = calcPercentile(reqLatencies, 50);
+        mMaxSeqLatency = reqLatencies.back();
+        mMinSeqLatency = reqLatencies.front();
+
+        if (mStreaming)
+        {
+            mAvgFtLatency /= mNumSamples;
+            mAvgGenT2TLatency /= mNumSamples;
+
+            std::sort(ftLatencies.begin(), ftLatencies.end());
+            std::sort(genT2TLatencies.begin(), genT2TLatencies.end());
+
+            mP99FtLatency = calcPercentile(ftLatencies, 99);
+            mP90FtLatency = calcPercentile(ftLatencies, 90);
+            mP50FtLatency = calcPercentile(ftLatencies, 50);
+            mMaxFtLatency = ftLatencies.back();
+            mMinFtLatency = ftLatencies.front();
+
+            mP99GenT2TLatency = calcPercentile(genT2TLatencies, 99);
+            mP90GenT2TLatency = calcPercentile(genT2TLatencies, 90);
+            mP50GenT2TLatency = calcPercentile(genT2TLatencies, 50);
+            mMaxGenT2TLatency = genT2TLatencies.back();
+            mMinGenT2TLatency = genT2TLatencies.front();
+        }
     }
 
     void report()
     {
+
         printf("[BENCHMARK] num_samples %d\n", mNumSamples);
+        printf("[BENCHMARK] num_error_samples %d\n", mNumErrorSamples);
+        printf("\n[BENCHMARK] num_samples %d\n", mNumSamples);
         printf("[BENCHMARK] total_latency(ms) %.2f\n", mTotalLatency);
         printf("[BENCHMARK] seq_throughput(seq/sec) %.2f\n", mSeqThroughput);
-        printf("[BENCHMARK] token_throughput(token/sec) %.2f\n", mTokenThroughput);
+        printf("[BENCHMARK] token_throughput(token/sec) %.2f\n\n", mTokenThroughput);
+
         printf("[BENCHMARK] avg_sequence_latency(ms) %.2f\n", mAvgSeqLatency);
+        printf("[BENCHMARK] max_sequence_latency(ms) %.2f\n", mMaxSeqLatency);
+        printf("[BENCHMARK] min_sequence_latency(ms) %.2f\n", mMinSeqLatency);
         printf("[BENCHMARK] p99_sequence_latency(ms) %.2f\n", mP99SeqLatency);
         printf("[BENCHMARK] p90_sequence_latency(ms) %.2f\n", mP90SeqLatency);
-        printf("[BENCHMARK] p50_sequence_latency(ms) %.2f\n", mP50SeqLatency);
+        printf("[BENCHMARK] p50_sequence_latency(ms) %.2f\n\n", mP50SeqLatency);
+
+        if (mStreaming)
+        {
+            printf("[BENCHMARK] avg_time_to_first_token(ms) %.2f\n", mAvgFtLatency);
+            printf("[BENCHMARK] max_time_to_first_token(ms) %.2f\n", mMaxFtLatency);
+            printf("[BENCHMARK] min_time_to_first_token(ms) %.2f\n", mMinFtLatency);
+            printf("[BENCHMARK] p99_time_to_first_token(ms) %.2f\n", mP99FtLatency);
+            printf("[BENCHMARK] p90_time_to_first_token(ms) %.2f\n", mP90FtLatency);
+            printf("[BENCHMARK] p50_time_to_first_token(ms) %.2f\n\n", mP50FtLatency);
+
+            printf("[BENCHMARK] avg_inter_token_latency(ms) %.2f\n", mAvgGenT2TLatency);
+            printf("[BENCHMARK] max_inter_token_latency(ms) %.2f\n", mMaxGenT2TLatency);
+            printf("[BENCHMARK] min_inter_token_latency(ms) %.2f\n", mMinGenT2TLatency);
+            printf("[BENCHMARK] p99_inter_token_latency(ms) %.2f\n", mP99GenT2TLatency);
+            printf("[BENCHMARK] p90_inter_token_latency(ms) %.2f\n", mP90GenT2TLatency);
+            printf("[BENCHMARK] p50_inter_token_latency(ms) %.2f\n\n", mP50GenT2TLatency);
+        }
     }
 
     void writeOpMetricsToCsv()
     {
         if (!mOpCsvFile.empty())
         {
-            std::vector<std::string> headers = {"num_samples", "total_latency(ms)", "seq_throughput(seq/sec)",
-                "token_throughput(token/sec)", "avg_sequence_latency(ms)", "p99_sequence_latency(ms)",
+            std::vector<std::string> headers = {"num_samples", "num_error_samples", "total_latency(ms)",
+                "seq_throughput(seq/sec)", "token_throughput(token/sec)", "avg_sequence_latency(ms)",
+                "max_sequence_latency(ms)", "min_sequence_latency(ms)", "p99_sequence_latency(ms)",
                 "p90_sequence_latency(ms)", "p50_sequence_latency(ms)"};
+
+            if (mStreaming)
+            {
+                std::vector<std::string> streamingHeaders
+                    = {"avg_time_to_first_token(ms)", "max_time_to_first_token(ms)", "min_time_to_first_token(ms)",
+                        "p99_time_to_first_token(ms)", "p90_time_to_first_token(ms)", "p50_time_to_first_token(ms)",
+                        "avg_inter_token_latency(ms)", "max_inter_token_latency(ms)", "min_inter_token_latency(ms)",
+                        "p99_inter_token_latency(ms)", "p90_inter_token_latency(ms)", "p50_inter_token_latency(ms)"};
+
+                headers.insert(headers.end(), streamingHeaders.begin(), streamingHeaders.end());
+            }
 
             std::ofstream outputFile(mOpCsvFile);
 
@@ -438,9 +566,17 @@ public:
                     outputFile << header << ",";
                 }
                 outputFile << "\n";
-                outputFile << mNumSamples << "," << mTotalLatency << "," << mSeqThroughput << "," << mTokenThroughput
-                           << "," << mAvgSeqLatency << "," << mP99SeqLatency << "," << mP90SeqLatency << ","
-                           << mP50SeqLatency;
+                outputFile << mNumSamples << "," << mNumErrorSamples << "," << mTotalLatency << "," << mSeqThroughput
+                           << "," << mTokenThroughput << "," << mAvgSeqLatency << "," << mMaxSeqLatency << ","
+                           << mMinSeqLatency << "," << mP99SeqLatency << "," << mP90SeqLatency << "," << mP50SeqLatency;
+                if (mStreaming)
+                {
+                    outputFile << "," << mAvgFtLatency << "," << mMaxFtLatency << "," << mMinFtLatency << ","
+                               << mP99FtLatency << "," << mP90FtLatency << "," << mP50FtLatency << ","
+                               << mAvgGenT2TLatency << "," << mMaxGenT2TLatency << "," << mMinGenT2TLatency << ","
+                               << mP99GenT2TLatency << "," << mP90GenT2TLatency << "," << mP50GenT2TLatency;
+                }
+
                 outputFile << "\n";
             }
             else
@@ -482,14 +618,31 @@ private:
     std::chrono::time_point<std::chrono::steady_clock> mStart;
     std::chrono::time_point<std::chrono::steady_clock> mEnd;
     int mNumSamples{};
+    int mNumErrorSamples{};
     float mTotalLatency{};
     float mSeqThroughput{};
     float mAvgSeqLatency{};
+    float mAvgGenT2TLatency{};
+    float mAvgFtLatency{};
     float mTokenThroughput{};
     float mP99SeqLatency{};
     float mP90SeqLatency{};
     float mP50SeqLatency{};
+    float mMaxSeqLatency{};
+    float mMinSeqLatency{};
+    float mP99FtLatency{};
+    float mP90FtLatency{};
+    float mP50FtLatency{};
+    float mMaxFtLatency{};
+    float mMinFtLatency{};
+    float mP99GenT2TLatency{};
+    float mP90GenT2TLatency{};
+    float mP50GenT2TLatency{};
+    float mMaxGenT2TLatency{};
+    float mMinGenT2TLatency{};
+
     std::string mOpCsvFile;
+    bool mStreaming;
     std::string mRespJsonFile;
     std::unordered_map<uint64_t, TensorPtr> mResponseTensors;
     bool mOutputHasInput;
@@ -512,12 +665,15 @@ public:
 
         texec::SchedulerConfig schedulerConfig(batch_scheduler::batchManagerToExecSchedPolicy(schedulerPolicy));
         texec::KvCacheConfig kvCacheConfig(benchmarkParams.enableBlockReuse, benchmarkParams.maxTokensInPagedKvCache,
-            std::nullopt, std::nullopt, benchmarkParams.freeGpuMemoryFraction);
+            std::nullopt, std::nullopt, benchmarkParams.freeGpuMemoryFraction, benchmarkParams.kvHostCacheSize,
+            benchmarkParams.kvOnboardBlocks);
         texec::PeftCacheConfig peftCacheConfig(0, benchmarkParams.loraDeviceNumModLayers, 8, 64, 4, 4, 4, 24, 8,
             std::nullopt, benchmarkParams.loraHostCacheSize);
         texec::ExecutorConfig executorConfig(
             maxBeamWidth, schedulerConfig, kvCacheConfig, benchmarkParams.enableChunkedContext, true);
         executorConfig.setPeftCacheConfig(peftCacheConfig);
+        executorConfig.setBatchingType(
+            modelType == TrtGptModelType::V1 ? texec::BatchingType::kSTATIC : texec::BatchingType::kINFLIGHT);
 
         mExecutor = std::make_unique<texec::Executor>(trtEnginePath, texec::ModelType::kDECODER_ONLY, executorConfig);
 
@@ -572,21 +728,24 @@ public:
             auto responses = mExecutor->awaitResponses(std::nullopt, mWaitSleep);
             for (auto const& response : responses)
             {
-                if (response.hasError())
-                {
-                    // This request failed for some reason, get error msg
-                    std::string errStr = "Request id " + std::to_string(response.getRequestId()) + " failed with err "
-                        + response.getErrorMsg();
-                    TLLM_THROW(errStr);
-                }
-                else if (response.getResult().isFinal)
+                if (response.hasError() || response.getResult().isFinal)
                 {
                     auto reqId = response.getRequestId();
-                    mActiveCount--;
-                    numFinished++;
-                    if (!warmup)
+                    if (response.getResult().isFinal)
                     {
-                        mRecorder->recordEnd(reqId);
+                        mActiveCount--;
+                        numFinished++;
+                        if (!warmup)
+                        {
+                            mRecorder->recordEnd(reqId, response.hasError());
+                        }
+                    }
+                    else
+                    {
+                        if (!warmup)
+                        {
+                            mRecorder->recordToken(reqId);
+                        }
                     }
                 }
             }
@@ -818,8 +977,12 @@ public:
             if (final_response)
             {
                 mWorkItemsQueue.markFinished(requestId);
-                mRecorder->recordEnd(requestId, response_tensors);
+                mRecorder->recordEnd(requestId, response_tensors, !errMsg.empty());
                 mActiveCount--;
+            }
+            else
+            {
+                mRecorder->recordToken(requestId);
             }
         }
         catch (std::exception const& e)
@@ -854,7 +1017,8 @@ struct Sample
 
 using Samples = std::vector<Sample>;
 
-Samples parseWorkloadJson(std::filesystem::path const& datasetPath, int maxNumSamples)
+Samples parseWorkloadJson(
+    std::filesystem::path const& datasetPath, int maxNumSamples, std::optional<SizeType> const maxPromptLen)
 {
     auto constexpr allowExceptions = true;
     auto constexpr ignoreComments = true;
@@ -869,12 +1033,17 @@ Samples parseWorkloadJson(std::filesystem::path const& datasetPath, int maxNumSa
         if (samples.size() >= maxNumSamples)
             break;
         int32_t taskId = sample.count("task_id") ? sample["task_id"].template get<int32_t>() : -1;
-        samples.emplace_back(Sample{sample["input_ids"], sample["output_len"], sample["delay"], taskId});
+        auto input_ids(sample["input_ids"].template get<std::vector<int32_t>>());
+        if (maxPromptLen && (input_ids.size() > maxPromptLen.value()))
+        {
+            input_ids.resize(maxPromptLen.value());
+        }
+        samples.emplace_back(Sample{std::move(input_ids), sample["output_len"], sample["delay"], taskId});
     }
     return samples;
 }
 
-std::shared_ptr<InferenceRequest> makeRequest(std::uint64_t reqId, Sample const& sample,
+std::shared_ptr<InferenceRequest> makeRequest(std::uint64_t reqId, Sample const& sample, bool streaming,
     ITensor::SharedPtr const& beamWidthTensor, ITensor::SharedPtr const& eosId, ITensor::SharedPtr const& padId,
     BufferManager const& bufferManager, ITensor::SharedPtr const& returnContextLogits = nullptr,
     ITensor::SharedPtr const& returnGenerationLogits = nullptr, ITensor::SharedPtr const& loraWeights = nullptr,
@@ -916,6 +1085,10 @@ std::shared_ptr<InferenceRequest> makeRequest(std::uint64_t reqId, Sample const&
     {
         request->setLoraConfig(loraConfig);
     }
+    if (streaming)
+    {
+        request->setIsStreaming(true);
+    }
     return request;
 }
 
@@ -941,7 +1114,8 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
     BenchmarkParams const& benchmarkParams, batch_scheduler::SchedulerPolicy schedulerPolicy,
     std::chrono::milliseconds waitSleep, bool returnContextLogits, bool returnGenerationLogits,
     std::optional<SizeType> const staticEmulatedBatchSize, std::optional<std::chrono::milliseconds> const batchTimeout,
-    bool logIterationData, bool excludeInputInOutput, std::string const& responsesJsonFile)
+    bool logIterationData, bool excludeInputInOutput, std::string const& responsesJsonFile,
+    std::optional<SizeType> const maxPromptLen)
 {
     auto const worldConfig = WorldConfig::mpi();
 
@@ -963,6 +1137,8 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
     optionalParams.peftCacheManagerConfig.numPutWorkers = 4;
     optionalParams.peftCacheManagerConfig.numEnsureWorkers = 4;
     optionalParams.peftCacheManagerConfig.numCopyStreams = 4;
+    optionalParams.kvCacheConfig.hostCacheSize = benchmarkParams.kvHostCacheSize;
+    optionalParams.kvCacheConfig.onboardBlocks = benchmarkParams.kvOnboardBlocks;
 
     BufferManager bufferManager{std::make_shared<CudaStream>()}; // the stream is not used
 
@@ -970,11 +1146,12 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
         bufferManager.copyFrom(&beamWidth, ITensor::makeShape({1}), MemoryType::kPINNED)};
 
     // Load dataset
-    auto const samples = parseWorkloadJson(datasetPath, maxNumSamples);
+    auto const samples = parseWorkloadJson(datasetPath, maxNumSamples, maxPromptLen);
     auto const numSamples = samples.size();
 
     int const maxBeamWidth = beamWidth;
-    auto recorder = std::make_shared<Recorder>(opCsvFile, responsesJsonFile, excludeInputInOutput);
+    auto recorder
+        = std::make_shared<Recorder>(opCsvFile, benchmarkParams.streaming, responsesJsonFile, excludeInputInOutput);
     uint64_t terminateReqId = numSamples + 1;
     auto gptServer
         = std::make_shared<GptServer>(engineDir, modelType, maxBeamWidth, schedulerPolicy, optionalParams, recorder,
@@ -1008,8 +1185,8 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
                     reqId++;
                 }
                 Sample s{std::vector<int32_t>{1, 2, 3, 4, 5}, 1, 0.f, static_cast<int32_t>(taskId)};
-                auto r = makeRequest(reqId, s, beamWidthTensor, eosIdTensor, padIdTensor, bufferManager, nullptr,
-                    nullptr, p.first, p.second);
+                auto r = makeRequest(reqId, s, benchmarkParams.streaming, beamWidthTensor, eosIdTensor, padIdTensor,
+                    bufferManager, nullptr, nullptr, p.first, p.second);
                 gptServer->enqueue(r);
             }
             gptServer->waitForEmpty();
@@ -1026,7 +1203,8 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
             ++reqId;
             if (i == terminateReqId)
                 ++reqId;
-            auto request = makeRequest(reqId, samples[0], beamWidthTensor, eosIdTensor, padIdTensor, bufferManager);
+            auto request = makeRequest(
+                reqId, samples[0], benchmarkParams.streaming, beamWidthTensor, eosIdTensor, padIdTensor, bufferManager);
             gptServer->enqueue(request);
         }
         gptServer->waitForEmpty();
@@ -1036,8 +1214,8 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
         gptServer->resetBatchDeadline();
         for (std::size_t i = 0; i < numSamples; ++i)
         {
-            auto request = makeRequest(i + 1, samples[i], beamWidthTensor, eosIdTensor, padIdTensor, bufferManager,
-                returnContextLogitsFlagTensor, returnGenerationLogitsFlagTensor);
+            auto request = makeRequest(i + 1, samples[i], benchmarkParams.streaming, beamWidthTensor, eosIdTensor,
+                padIdTensor, bufferManager, returnContextLogitsFlagTensor, returnGenerationLogitsFlagTensor);
             gptServer->enqueue(request);
             auto delayInMs = static_cast<int>(samples[i].delay * 1000);
 
@@ -1065,16 +1243,17 @@ void benchmarkExecutor(std::filesystem::path const& engineDir, TrtGptModelType m
     std::string const& datasetPath, std::string const& opCsvFile, int maxNumSamples, int beamWidth, int warmUp,
     std::optional<int32_t> const& eosId, std::optional<int32_t> const& padId, BenchmarkParams const& benchmarkParams,
     batch_scheduler::SchedulerPolicy schedulerPolicy, std::chrono::milliseconds waitSleep, bool returnContextLogits,
-    bool returnGenerationLogits, std::optional<int> const staticEmulatedBatchSize, bool logIterationData)
+    bool returnGenerationLogits, std::optional<int> const staticEmulatedBatchSize, bool logIterationData,
+    std::optional<SizeType> const maxPromptLen)
 {
     auto const& world = tensorrt_llm::mpi::MpiComm::world();
     auto worldRank = world.getRank();
 
     // Load dataset
-    auto const samples = parseWorkloadJson(datasetPath, maxNumSamples);
+    auto const samples = parseWorkloadJson(datasetPath, maxNumSamples, maxPromptLen);
     auto const numSamples = samples.size();
 
-    auto recorder = std::make_shared<Recorder>(opCsvFile);
+    auto recorder = std::make_shared<Recorder>(opCsvFile, benchmarkParams.streaming);
 
     auto executorServer = std::make_shared<ExecutorServer>(engineDir, modelType, beamWidth, schedulerPolicy,
         benchmarkParams, recorder, waitSleep, staticEmulatedBatchSize, logIterationData);
@@ -1244,6 +1423,12 @@ int main(int argc, char* argv[])
     options.add_options()("lora_dir", "Directory containing LoRAs", cxxopts::value<std::string>()->default_value(""));
     options.add_options()("lora_host_cache_bytes", "LoRA host cache memory in bytes", cxxopts::value<size_t>());
     options.add_options()("lora_num_device_mod_layers", "LoRA number 1d cache rows", cxxopts::value<int>());
+    options.add_options()("kv_host_cache_bytes",
+        "Size of secondary memory pool used for offloading kv cache blocks (in bytes).",
+        cxxopts::value<size_t>()->default_value("0"));
+    options.add_options()("kv_dont_onboard_blocks",
+        "If offloaded blocks should be onboarded to primary memory before reuse",
+        cxxopts::value<bool>()->default_value("false"));
 
     options.add_options()("exclude_input_in_output_seq",
         "When enabled, GptManager will exclude the input sequence from output. (Only works if --api is gptManager)",
@@ -1252,6 +1437,9 @@ int main(int argc, char* argv[])
     options.add_options()("responses_json_file",
         "When specified, dumps the responses to JSON file. (only works if --api is gptManager)",
         cxxopts::value<std::string>()->default_value(""));
+
+    options.add_options()(
+        "max_prompt_len", "Truncate all prompts from dataset to the length specified.", cxxopts::value<SizeType>());
 
     auto result = options.parse(argc, argv);
 
@@ -1347,6 +1535,12 @@ int main(int argc, char* argv[])
         benchmarkParams.loraDeviceNumModLayers = result["lora_num_device_mod_layers"].as<SizeType>();
     }
 
+    // Argument: How many KV cache blocks (as fraction of number of GPU kv cache blocks).
+    benchmarkParams.kvHostCacheSize = result["kv_host_cache_bytes"].as<size_t>();
+
+    // Argument: If offloaded blocks should be onboarded to primary memory before they are reused.
+    benchmarkParams.kvOnboardBlocks = !result["kv_dont_onboard_blocks"].as<bool>();
+
     std::optional<TokenIdType> padId;
     // Argument: Padding token id
     if (result.count("pad_id"))
@@ -1390,6 +1584,13 @@ int main(int argc, char* argv[])
         return 1;
     }
 
+    // Argument: max_prompt_len
+    std::optional<SizeType> maxPromptLen;
+    if (result.count("max_prompt_len"))
+    {
+        maxPromptLen = result["max_prompt_len"].as<SizeType>();
+    }
+
     // Argument: Log level
     auto logger = std::make_shared<TllmLogger>();
     auto const logLevel = result["log_level"].as<std::string>();
@@ -1429,7 +1630,7 @@ int main(int argc, char* argv[])
                 maxNumSamples, beamWidth, result["warm_up"].as<int>(), eosId, padId, benchmarkParams, schedulerPolicy,
                 waitSleep, returnContextLogits, returnGenerationLogits, staticEmulatedBatchSize, batchTimeout,
                 logIterationData, result["exclude_input_in_output_seq"].as<bool>(),
-                result["responses_json_file"].as<std::string>());
+                result["responses_json_file"].as<std::string>(), maxPromptLen);
         }
         catch (std::exception const& e)
         {
@@ -1443,7 +1644,7 @@ int main(int argc, char* argv[])
         {
             benchmarkExecutor(result["engine_dir"].as<std::string>(), modelType, datasetPath, opCsvFile, maxNumSamples,
                 beamWidth, result["warm_up"].as<int>(), eosId, padId, benchmarkParams, schedulerPolicy, waitSleep,
-                returnContextLogits, returnGenerationLogits, staticEmulatedBatchSize, logIterationData);
+                returnContextLogits, returnGenerationLogits, staticEmulatedBatchSize, logIterationData, maxPromptLen);
         }
         catch (std::exception const& e)
         {

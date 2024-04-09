@@ -313,6 +313,21 @@ GptJsonConfig parseJson(InputType&& input)
             modelConfig.setMambaConfig(mambaConfig);
         }
     }
+    else
+    {
+        if (name.size() >= 6 && name.substr(0, 6) == "mamba_")
+        {
+            modelConfig.setModelVariant(GptModelConfig::ModelVariant::kMamba);
+            auto const& mambaDState = builderConfig.at("mamba_d_state").template get<SizeType>();
+            auto const& mambaDConv = builderConfig.at("mamba_d_conv").template get<SizeType>();
+            auto const& mambaExpand = builderConfig.at("mamba_expand").template get<SizeType>();
+            MambaConfig mambaConfig{};
+            mambaConfig.dState = mambaDState;
+            mambaConfig.dConv = mambaDConv;
+            mambaConfig.expand = mambaExpand;
+            modelConfig.setMambaConfig(mambaConfig);
+        }
+    }
     return GptJsonConfig{name, engineVersion, precision, tensorParallelism, pipelineParallelism, modelConfig};
 }
 

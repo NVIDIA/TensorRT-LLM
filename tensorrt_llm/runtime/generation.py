@@ -147,6 +147,34 @@ def _tile_beam_width(tensor: torch.Tensor, num_beams: int):
     return new_tensor
 
 
+class _Profiler(trt.IProfiler):
+
+    def __init__(self):
+        super().__init__()
+        self.results = []
+
+    def report_layer_time(self, layer_name, ms):
+        self.results.append((layer_name, ms))
+
+
+def _contiguous_tile_beam_width(tensor: torch.Tensor, size: int,
+                                num_beams: int):
+    new_shape = list(tensor.shape)
+    new_shape[0] *= num_beams
+
+    numel = tensor.numel()
+    new_tensor = torch.empty(num_beams * numel,
+                             device=tensor.device,
+                             dtype=tensor.dtype)
+
+    # Take the first 'size' values to tile and skip the others.
+    vals = tensor.view(-1)[:size]
+    for i in range(num_beams):
+        new_tensor[i * size:(i + 1) * size] = vals
+
+    return new_tensor.view(new_shape)
+
+
 class _Runtime(object):
     runtime_rank: int
     runtime: trt.Runtime
@@ -154,6 +182,7 @@ class _Runtime(object):
     ctx_context: trt.IExecutionContext
     context_0: trt.IExecutionContext
     context_1: trt.IExecutionContext
+    profiler: _Profiler
     cuda_graph_instances: List[cudart.cudaGraphExec_t]
 
     def __init__(self, engine_buffer, mapping: Mapping):
@@ -171,6 +200,21 @@ class _Runtime(object):
         context.set_optimization_profile_async(profile_idx, stream)
         return context
 
+    def _set_profiler(self):
+        if self.profiler is not None:
+            return
+        assert self.context_0 is not None
+        assert self.context_1 is not None
+        self.profiler = _Profiler()
+        self.context_0.profiler = self.profiler
+        self.context_0.enqueue_emits_profile = False
+        self.context_1.profiler = self.profiler
+        self.context_1.enqueue_emits_profile = False
+        if self.engine.num_optimization_profiles == 2:
+            assert self.ctx_context is not None
+            self.ctx_context.profiler = self.profiler
+            self.ctx_context.enqueue_emits_profile = False
+
     def __prepare(self, mapping: Mapping, engine_buffer):
         self.runtime_rank = mapping.rank
         local_rank = self.runtime_rank % mapping.gpus_per_node
@@ -183,6 +227,7 @@ class _Runtime(object):
         # The device_memory_size stores the memory required by the largest profile
         address = CUASSERT(cudart.cudaMalloc(self.engine.device_memory_size))[0]
         self.address = address
+        self.profiler = None
 
         # cuda graph ping-pong instances
         self.cuda_graph_instances = [None for _ in range(2)]
@@ -273,6 +318,14 @@ class _Runtime(object):
             if ptr == 0:
                 raise RuntimeError(f"Engine I/O tensor {name} is unbound")
 
+    def _insert_step_to_profiler(self, step: int):
+        if not self.profiler:
+            raise RuntimeError("Profiler is disable")
+        self.profiler.results.append(("step", step))
+
+    def _is_profiling(self):
+        return self.profiler is not None
+
     def _run(self,
              context: trt.IExecutionContext,
              stream: Union[int, torch.cuda.Stream] = None) -> bool:
@@ -289,6 +342,10 @@ class _Runtime(object):
                 cudart.cudaFree(self.address)
         except TypeError:
             pass
+
+    @property
+    def context_mem_size(self) -> int:
+        return self.engine.device_memory_size
 
 
 @dataclass
@@ -699,6 +756,10 @@ class GenerationSession(object):
                 set(found_tensor_names) - set(expected_tensor_names))
 
     @property
+    def context_mem_size(self) -> int:
+        return self.runtime.context_mem_size
+
+    @property
     def vocab_size(self):
         return self._model_config.vocab_size
 
@@ -775,6 +836,10 @@ class GenerationSession(object):
     @property
     def use_custom_all_reduce(self):
         return self._model_config.use_custom_all_reduce
+
+    @property
+    def profiler(self):
+        return self.runtime.profiler
 
     def cuda_stream_guard(func):
         """Sync external stream and set current stream to the one bound to the session. Reset on exit.
@@ -909,7 +974,6 @@ class GenerationSession(object):
             self.host_length_penalty = torch.full([batch_size],
                                                   scfg.length_penalty,
                                                   dtype=torch.float32)
-
         self.length_penalty = self.host_length_penalty.to(self.device)
 
         if isinstance(scfg.early_stopping, torch.Tensor):
@@ -921,8 +985,6 @@ class GenerationSession(object):
             self.host_early_stopping = torch.full([batch_size],
                                                   scfg.early_stopping,
                                                   dtype=torch.int32)
-
-        self.early_stopping = self.host_early_stopping.to(self.device)
 
         if isinstance(scfg.presence_penalty, torch.Tensor):
             assert scfg.presence_penalty.dtype == torch.float32, f"scfg.presence_penalty.dtype ({scfg.presence_penalty.dtype}) must be torch.float32"
@@ -1981,6 +2043,7 @@ class GenerationSession(object):
                 self.beam_hyps_log_probs, self.beam_hyps_min_normed_scores,
                 self.beam_hyps_num_beams, self.beam_hyps_is_done
             ]
+
             if scfg.use_beam_hyps and in_progress:
                 # self.gather_tree modifies these args.
                 # In streaming mode, this results in incorrect decoding in the following steps.
@@ -1989,9 +2052,8 @@ class GenerationSession(object):
             final_output_ids = self.gather_tree(
                 self.sequence_length_buffer, self.output_ids, self.parent_ids,
                 self.end_ids, context_lengths, self.cum_log_probs,
-                *beam_hyps_args, self.finished, self.length_penalty,
-                self.early_stopping, batch_size, beam_width,
-                self.max_seq_length, scfg.use_beam_hyps)
+                *beam_hyps_args, self.finished, self.length_penalty, batch_size,
+                beam_width, self.max_seq_length, scfg.use_beam_hyps)
 
         # Communicate ranks in Pipeline Parallelism
         if self.mapping.has_pp():
@@ -2379,12 +2441,23 @@ class GenerationSession(object):
 
             # Move tiling before logit computing of context
             if not self.paged_kv_cache:
-                for key in self.buffer.keys():
-                    # Note: this tiles both self attn cache and cross attn cache!
-                    # both names contain "present_key_value"
+                for key in self.buffer:
+                    # Note: this tiles both self attn cache and cross attn
+                    # cache! both names contain "present_key_value"
                     if "present_key_value" in key:
-                        self.buffer[key] = _tile_beam_width(
-                            self.buffer[key], beam_width)
+                        if self.use_gpt_attention_plugin:
+                            self.buffer[key] = _tile_beam_width(
+                                self.buffer[key], beam_width)
+                        else:
+                            # In the OOTB path, KV cache should be contiguously
+                            # tiled since TRT engine allocates past_kv cache of
+                            # length context_length, i.e., we need a buffer of
+                            # shape (batch * beam, 2, heads, context_length, head_size).
+                            b, _, h, _, d = self.buffer[key].shape
+                            numel = 2 * b * h * (max_context_length + step) * d
+                            self.buffer[key] = _contiguous_tile_beam_width(
+                                self.buffer[key], numel, beam_width)
+
             if self.mapping.is_last_pp_rank():
                 self.buffer['logits'] = _tile_beam_width(
                     self.buffer['logits'], beam_width)
@@ -2510,6 +2583,7 @@ class GenerationSession(object):
                         self.beam_hyps_min_normed_scores,
                         self.beam_hyps_num_beams, self.beam_hyps_is_done,
                         scfg.use_beam_hyps)
+
                     if stopping_criteria is not None and not should_stop.item():
                         final_output_ids = self.finalize_decoder(
                             context_lengths,
@@ -2522,6 +2596,11 @@ class GenerationSession(object):
                             -1, final_output_ids.size(-1))
                         should_stop[0] = stopping_criteria(
                             step, final_output_ids_, logits)
+
+        if self.runtime._is_profiling():
+            if not context.report_to_profiler():
+                logger.warning("Runtime report to profiler failed.")
+            self.runtime._insert_step_to_profiler(step)
 
         if self.mapping.has_pp():
             should_stop = self.pp_communicate_new_tokens(
@@ -2627,6 +2706,9 @@ class GenerationSession(object):
 
         benchmark_profiler = kwargs.get('benchmark_profiler', None)
         generation_phase_step_count = 0
+
+        if benchmark_profiler is not None and benchmark_profiler.is_recording_perf_profile:
+            self.runtime._set_profiler()
 
         def profile_fn(benchmark_profiler_obj, step_count):
             if benchmark_profiler_obj is not None:

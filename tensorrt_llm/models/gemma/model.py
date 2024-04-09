@@ -20,7 +20,6 @@ from ...layers import (Attention, AttentionMaskType, ColumnLinear, Embedding,
                        GatedMLP, PositionEmbeddingType, RmsNorm)
 from ...mapping import Mapping
 from ...module import Module
-from ...top_model_mixin import TopModelMixin
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
                               PretrainedConfig, QuantConfig)
 from .weight import load_from_hf_gemma
@@ -173,7 +172,7 @@ class GemmaModel(Module):
         return hidden_states
 
 
-class GemmaForCausalLM(DecoderModelForCausalLM, TopModelMixin):
+class GemmaForCausalLM(DecoderModelForCausalLM):
 
     def __init__(self, config: PretrainedConfig):
 

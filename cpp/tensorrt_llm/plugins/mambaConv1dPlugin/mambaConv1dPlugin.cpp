@@ -31,12 +31,14 @@ static char const* MAMBA_CONV1D_PLUGIN_NAME{"MambaConv1d"};
 PluginFieldCollection MambaConv1dPluginCreator::mFC{};
 std::vector<nvinfer1::PluginField> MambaConv1dPluginCreator::mPluginAttributes;
 
-MambaConv1dPlugin::MambaConv1dPlugin(int dim, int dconv, nvinfer1::DataType type, bool removePadding, bool pagedState)
+MambaConv1dPlugin::MambaConv1dPlugin(
+    int dim, int dconv, nvinfer1::DataType type, bool removePadding, bool pagedState, bool applySilu)
     : mDim(dim)
     , mDConv(dconv)
     , mType(type)
     , mRemovePadding(removePadding)
     , mPagedState(pagedState)
+    , mApplySilu(applySilu)
 {
     TLLM_CHECK_WITH_INFO((getSMVersion() >= 80) || (mType != DataType::kBF16),
         "Unsupported data type, pre SM 80 GPUs do not support bfloat16");
@@ -53,6 +55,7 @@ MambaConv1dPlugin::MambaConv1dPlugin(void const* data, size_t length)
     read(d, mType);
     read(d, mRemovePadding);
     read(d, mPagedState);
+    read(d, mApplySilu);
     TLLM_CHECK(d == a + length);
     TLLM_CHECK_WITH_INFO((getSMVersion() >= 80) || (mType != DataType::kBF16), "Unsupported data type");
     TLLM_CHECK_WITH_INFO((mType == DataType::kBF16) || (mType == DataType::kFLOAT) || (mType == DataType::kHALF),
@@ -62,7 +65,7 @@ MambaConv1dPlugin::MambaConv1dPlugin(void const* data, size_t length)
 // IPluginV2DynamicExt Methods
 nvinfer1::IPluginV2DynamicExt* MambaConv1dPlugin::clone() const noexcept
 {
-    auto* plugin = new MambaConv1dPlugin(mDim, mDConv, mType, mRemovePadding, mPagedState);
+    auto* plugin = new MambaConv1dPlugin(mDim, mDConv, mType, mRemovePadding, mPagedState, mApplySilu);
     plugin->setPluginNamespace(mNamespace.c_str());
     return plugin;
 }
@@ -112,7 +115,7 @@ size_t MambaConv1dPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* inp
 void MambaConv1dPlugin::setMambaConv1dParams(tensorrt_llm::kernels::MambaConv1dParamsBase& params, const size_t batch,
     const size_t dim, const size_t maxSeqLen, const size_t dconv, void const* inPtr, void const* stateInPtr,
     void* stateOutPtr, void const* convWeight, void const* convBias, void* outPtr, int const* lastTokenIds,
-    int const* stateSlotMapping, bool removePadding)
+    int const* stateSlotMapping, bool removePadding, bool applySilu)
 {
     // Reset the parameters
     memset(&params, 0, sizeof(params));
@@ -123,6 +126,7 @@ void MambaConv1dPlugin::setMambaConv1dParams(tensorrt_llm::kernels::MambaConv1dP
     params.dconv = dconv;
 
     params.remove_padding = removePadding;
+    params.apply_silu = applySilu;
 
     // Set the pointers and strides.
     params.in_ptr = const_cast<void*>(inPtr);
@@ -177,7 +181,7 @@ int MambaConv1dPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc,
 
     setMambaConv1dParams(mambaConv1dParams, batchSize, mDim, maxSeqLen, mDConv, inputs[getInputTensorIdx()], stateInPtr,
         stateOutPtr, inputs[getWeightIdx()], inputs[getBiasIdx()], outputs[0],
-        static_cast<int const*>(inputs[getLastTokenIdsIdx()]), slotMapping, mRemovePadding);
+        static_cast<int const*>(inputs[getLastTokenIdsIdx()]), slotMapping, mRemovePadding, mApplySilu);
 
     if (reqTypes[0] == RequestType::kCONTEXT)
     {
@@ -244,7 +248,8 @@ void MambaConv1dPlugin::terminate() noexcept {}
 
 size_t MambaConv1dPlugin::getSerializationSize() const noexcept
 {
-    return sizeof(mDim) + sizeof(mDConv) + sizeof(mType) + sizeof(mRemovePadding) + sizeof(mPagedState);
+    return sizeof(mDim) + sizeof(mDConv) + sizeof(mType) + sizeof(mRemovePadding) + sizeof(mPagedState)
+        + sizeof(mApplySilu);
 }
 
 void MambaConv1dPlugin::serialize(void* buffer) const noexcept
@@ -255,6 +260,7 @@ void MambaConv1dPlugin::serialize(void* buffer) const noexcept
     write(d, mType);
     write(d, mRemovePadding);
     write(d, mPagedState);
+    write(d, mApplySilu);
     assert(d == a + getSerializationSize());
 }
 
@@ -274,6 +280,7 @@ MambaConv1dPluginCreator::MambaConv1dPluginCreator()
     mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("remove_input_padding", nullptr, PluginFieldType::kINT8, 0));
     mPluginAttributes.emplace_back(PluginField("paged_state", nullptr, PluginFieldType::kINT8, 0));
+    mPluginAttributes.emplace_back(PluginField("apply_silu", nullptr, PluginFieldType::kINT8, 0));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }
@@ -299,6 +306,7 @@ IPluginV2* MambaConv1dPluginCreator::createPlugin(char const* name, PluginFieldC
     int dim, dconv;
     bool removePadding;
     bool pagedState;
+    bool applySilu;
     nvinfer1::DataType type;
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
@@ -329,10 +337,15 @@ IPluginV2* MambaConv1dPluginCreator::createPlugin(char const* name, PluginFieldC
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT8);
             pagedState = static_cast<bool>(*(static_cast<bool const*>(fields[i].data)));
         }
+        else if (!strcmp(attrName, "apply_silu"))
+        {
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT8);
+            applySilu = static_cast<bool>(*(static_cast<bool const*>(fields[i].data)));
+        }
     }
     try
     {
-        auto* obj = new MambaConv1dPlugin(dim, dconv, type, removePadding, pagedState);
+        auto* obj = new MambaConv1dPlugin(dim, dconv, type, removePadding, pagedState, applySilu);
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }

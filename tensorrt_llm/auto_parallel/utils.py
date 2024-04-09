@@ -1,6 +1,10 @@
 import contextlib
 import threading
-from types import NoneType
+
+try:
+    from types import NoneType
+except importError:
+    NoneType = type(None)
 from typing import ByteString, Iterable, MutableMapping
 
 import tensorrt as trt

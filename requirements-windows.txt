@@ -1,9 +1,8 @@
---extra-index-url https://download.pytorch.org/whl/cu121
 --extra-index-url https://pypi.nvidia.com
 accelerate==0.25.0
 build
 colored
-cuda-python==12.2.0
+cuda-python==12.3.0
 diffusers==0.15.0
 mpi4py
 numpy
@@ -14,20 +13,20 @@ pynvml>=11.5.0
 pulp
 pandas
 h5py
+StrEnum
 pywin32
+StrEnum
 sentencepiece>=0.1.99
 # WAR the new posting of "nvidia-cudnn-cu12~=9.0".
-# "tensorrt==9.2.0.post12.dev5" specifies "nvidia-cudnn-cu12" but actually requires "nvidia-cudnn-cu12~=8.9".
+# "tensorrt==9.3.0.post12.dev1" specifies "nvidia-cudnn-cu12" but actually requires "nvidia-cudnn-cu12~=8.9".
 nvidia-cudnn-cu12~=8.9; platform_machine == "x86_64"
-tensorrt==9.2.0.post12.dev5
+tensorrt==9.3.0.post12.dev1
 tokenizers>=0.14
 # Default torch is CPU-only on Windows, so need to specify a torch version with GPU support
-torch==2.1.0+cu121
-torchdata==0.7.0
-torchtext==0.16.0+cpu
-torchvision==0.16.0+cu121
+torch==2.2.0+cu121
 transformers==4.38.2
 wheel
 optimum
 evaluate
 janus
+mpmath==1.3.0

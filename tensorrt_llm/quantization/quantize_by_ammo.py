@@ -25,14 +25,12 @@ import time
 import numpy as np
 import safetensors
 import torch
-from ammo.torch.export.tensorrt_llm_utils import MODEL_NAME_TO_HF_ARCH_MAP
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
+from ..logger import logger
 from .mode import QuantAlgo
-
-MODEL_NAME_TO_HF_ARCH_MAP.update({"gpt2": "GPTForCausalLM"})
 
 EMPTY_CFG = {
     "quant_cfg": {
@@ -249,7 +247,17 @@ def quantize_and_export(*, model_dir, dtype, device, qformat, kv_cache_dtype,
         Load model from the model_dir, call AMMO to quantize the model, and then export
         the quantized model as TRT-LLM checkpoint
     '''
+    try:
+        import ammo  # noqa
+    except ImportError as e:
+        logger.error(
+            "Failed to import ammo, pls check the AMMO installation. Currently it is known to be unsupported on Windows OS"
+        )
+        raise e
     from ammo.torch.export import export_model_config
+    from ammo.torch.export.tensorrt_llm_utils import MODEL_NAME_TO_HF_ARCH_MAP
+    MODEL_NAME_TO_HF_ARCH_MAP.update({"gpt2": "GPTForCausalLM"})
+
     if not torch.cuda.is_available():
         raise EnvironmentError("GPU is required for inference.")
 

@@ -192,7 +192,7 @@ bool GPTAttentionPluginCommon::convertMMHAParamsToXQAParams(tensorrt_llm::kernel
     xqaParams.qkv_bias_enabled = mQKVBiasEnabled;
     xqaParams.cross_attention = mCrossAttention;
     xqaParams.max_distance = mMaxDistance;
-    xqaParams.multi_block_mode = mMultiBlockMode;
+    xqaParams.multi_block_mode = false; // WAR for bug 4565783. Real fix is blocked and will be integrated later.
     // Medusa mode will have multiple query tokens.
     xqaParams.multi_query_tokens = mIsMedusaEnabled;
 
