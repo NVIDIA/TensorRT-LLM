@@ -292,11 +292,11 @@ typename tl::DynamicDecodeLayer<T>::OutputParams prepareOutputs(
     }
     if (output.beamHypotheses.cumLogProbs)
     {
-        outputParams.beamHypotheses->cum_log_probs = bufferCast<float>(*output.beamHypotheses.cumLogProbs);
+        outputParams.beamHypotheses->cum_log_probs_cba = bufferCast<float>(*output.beamHypotheses.cumLogProbs);
     }
     if (output.beamHypotheses.logProbs)
     {
-        outputParams.beamHypotheses->log_probs = bufferCast<float>(*output.beamHypotheses.logProbs);
+        outputParams.beamHypotheses->log_probs_cba = bufferCast<float>(*output.beamHypotheses.logProbs);
     }
     if (output.beamHypotheses.minNormedScores)
     {
@@ -304,7 +304,7 @@ typename tl::DynamicDecodeLayer<T>::OutputParams prepareOutputs(
     }
     if (output.beamHypotheses.normedScores)
     {
-        outputParams.beamHypotheses->normed_scores = bufferCast<float>(*output.beamHypotheses.normedScores);
+        outputParams.beamHypotheses->normed_scores_cba = bufferCast<float>(*output.beamHypotheses.normedScores);
     }
     if (output.beamHypotheses.numBeams)
     {
@@ -312,11 +312,11 @@ typename tl::DynamicDecodeLayer<T>::OutputParams prepareOutputs(
     }
     if (output.beamHypotheses.outputIdsTgt)
     {
-        outputParams.beamHypotheses->output_ids_tgt = bufferCast<int>(*output.beamHypotheses.outputIdsTgt);
+        outputParams.beamHypotheses->output_ids_cba = bufferCast<int>(*output.beamHypotheses.outputIdsTgt);
     }
     if (output.beamHypotheses.sequenceLengthsTgt)
     {
-        outputParams.beamHypotheses->sequence_lengths_tgt = bufferCast<int>(*output.beamHypotheses.sequenceLengthsTgt);
+        outputParams.beamHypotheses->seq_len_cba = bufferCast<int>(*output.beamHypotheses.sequenceLengthsTgt);
     }
     if (inputLengths)
     {
@@ -395,7 +395,7 @@ void GptDecoder<T>::forwardAsync(DecodingOutput& output, DecodingInput const& in
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-// this should be similar to gatherTree in cpp/tensorrt_llm/thop/gatherTreeOp.cpp
+// Must be similar to [cpp/tensorrt_llm/thop/gatherTreeOp.cpp] gatherTree
 template <typename T>
 void GptDecoder<T>::gatherTree(ITensor& finalOutputIds, DecodingOutput const& decodingOutput,
     DecodingInput const& decodingInput, BufferManager const& manager)
@@ -419,45 +419,42 @@ void GptDecoder<T>::gatherTree(ITensor& finalOutputIds, DecodingOutput const& de
         common::fmtstr("Decoder seq length size (%d) is too large for final seq length (%d)",
             decodingOutputIdsShape.d[2], maxSeqLength));
 
-    auto const& stream = manager.getStream();
+    auto const& stream = manager.getStream().get();
 
     tensorrt_llm::kernels::invokeInitializeOutput(bufferCast<TokenIdType>(finalOutputIds),
-        bufferCast<TokenIdType>(*decodingInput.endIds), batchSize * beamWidth, maxSeqLength, stream.get());
+        bufferCast<TokenIdType>(*decodingInput.endIds), batchSize * beamWidth, maxSeqLength, stream);
     sync_check_cuda_error();
 
-    tensorrt_llm::kernels::BeamHypotheses beamHypotheses;
-    beamHypotheses.sequence_lengths_src = bufferCast<SizeType>(*decodingOutput.lengths);
-    beamHypotheses.parent_ids_src = bufferCast<TokenIdType>(*decodingOutput.parentIds);
-    beamHypotheses.output_ids_src = bufferCast<TokenIdType>(*decodingOutput.ids);
-    beamHypotheses.log_probs_src = bufferCast<float>(*mLogProbsTiled);
-    beamHypotheses.max_seq_len = maxSeqLength;
-    beamHypotheses.length_penalties
-        = nullptr; // TODO (bhsueh) should set length penalties, this should be a gpu tensor When it is set as
-                   // nullptr, the kernel will use default value (1.0f) automatically.
-    beamHypotheses.early_stoppings = nullptr; // TODO (wili), similar as length_penalties
-    beamHypotheses.output_ids_tgt = bufferCast<TokenIdType>(*decodingOutput.beamHypotheses.outputIdsTgt);
-    beamHypotheses.sequence_lengths_tgt = bufferCast<SizeType>(*decodingOutput.beamHypotheses.sequenceLengthsTgt);
-    beamHypotheses.cum_log_probs = bufferCast<float>(*decodingOutput.beamHypotheses.cumLogProbs);
-    beamHypotheses.normed_scores = bufferCast<float>(*decodingOutput.beamHypotheses.normedScores);
-    beamHypotheses.log_probs = bufferCast<float>(*decodingOutput.beamHypotheses.logProbs);
-    beamHypotheses.min_normed_scores = bufferCast<float>(*decodingOutput.beamHypotheses.minNormedScores);
-    beamHypotheses.num_beams = bufferCast<SizeType>(*decodingOutput.beamHypotheses.numBeams);
-    beamHypotheses.is_done = bufferCast<bool>(*decodingOutput.beamHypotheses.isDone);
-    beamHypotheses.input_lengths = bufferCast<SizeType>(*decodingInput.lengths);
+    tensorrt_llm::kernels::BeamHypotheses bh;
+    bh.seq_len = bufferCast<SizeType>(*decodingOutput.lengths);
+    bh.parent_ids_src = bufferCast<TokenIdType>(*decodingOutput.parentIds);
+    bh.output_ids_src = bufferCast<TokenIdType>(*decodingOutput.ids);
+    bh.log_probs = bufferCast<float>(*mLogProbsTiled);
+    bh.max_seq_len = maxSeqLength;
+    bh.length_penalties = nullptr; // TODO (bhsueh): A gpu tensor used in invokeInsertUnfinishedPath
+                                   // default value (1.0f) will be used when it is nullptr
+    bh.output_ids_cba = bufferCast<TokenIdType>(*decodingOutput.beamHypotheses.outputIdsTgt);
+    bh.seq_len_cba = bufferCast<SizeType>(*decodingOutput.beamHypotheses.sequenceLengthsTgt);
+    bh.cum_log_probs_cba = bufferCast<float>(*decodingOutput.beamHypotheses.cumLogProbs);
+    bh.normed_scores_cba = bufferCast<float>(*decodingOutput.beamHypotheses.normedScores);
+    bh.log_probs_cba = bufferCast<float>(*decodingOutput.beamHypotheses.logProbs);
+    bh.min_normed_scores = bufferCast<float>(*decodingOutput.beamHypotheses.minNormedScores);
+    bh.num_beams = bufferCast<SizeType>(*decodingOutput.beamHypotheses.numBeams);
+    bh.is_done = bufferCast<bool>(*decodingOutput.beamHypotheses.isDone);
+    bh.input_lengths = bufferCast<SizeType>(*decodingInput.lengths);
+
+    bh.batch_size = batchSize;
+    bh.beam_width = beamWidth;
+    bh.cum_log_probs = bufferCast<float>(*decodingOutput.cumLogProbs);
+    bh.finished = reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
+        bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(*decodingOutput.finished));
+    bh.final_output_ids = bufferCast<TokenIdType>(finalOutputIds);
 
     // This is where transpose is done
-    tensorrt_llm::kernels::invokeInsertUnfinishedPath(beamHypotheses,
-        reinterpret_cast<tensorrt_llm::kernels::FinishedState const*>(
-            bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(*decodingOutput.finished)),
-        bufferCast<float>(*decodingOutput.cumLogProbs), batchSize, beamWidth, stream.get());
+    tensorrt_llm::kernels::invokeInsertUnfinishedPath(bh, stream);
     sync_check_cuda_error();
 
-    tensorrt_llm::kernels::invokeFinalize(bufferCast<TokenIdType>(finalOutputIds),
-        bufferCast<SizeType>(*decodingOutput.lengths), bufferCast<float>(*decodingOutput.cumLogProbs),
-        decodingOutput.logProbs ? bufferCast<float>(*decodingOutput.logProbs) : nullptr, beamHypotheses.output_ids_tgt,
-        beamHypotheses.sequence_lengths_tgt, beamHypotheses.normed_scores, beamHypotheses.cum_log_probs,
-        beamHypotheses.log_probs, beamHypotheses.num_beams, beamHypotheses.input_lengths, beamWidth, maxSeqLength,
-        batchSize, stream.get());
+    tensorrt_llm::kernels::invokeFinalize(bh, stream);
     sync_check_cuda_error();
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);

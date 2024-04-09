@@ -405,11 +405,11 @@ def main(args):
                 input_lengths = lengths_info['input_lengths']
                 seq_lengths = lengths_info['seq_lengths']
                 output_token_count_trt_llm = sum(
-                    seq_lengths[idx][0] - input_lengths[idx]
-                    for idx in range(len(input_lengths)))
+                    seq_lengths[bs][bm] - input_lengths[bs]
+                    for bm in range(len(output_tensorrt_llm[0]))
+                    for bs in range(len(output_tensorrt_llm)))
                 total_output_token_count_trt_llm += output_token_count_trt_llm
 
-            if runtime_rank == 0:
                 for batch_idx in range(len(output_tensorrt_llm)):
                     for beam_idx in range(num_beams):
                         metric_tensorrt_llm[beam_idx].add_batch(
@@ -488,7 +488,7 @@ def main(args):
 
         ite_count = 0
         data_point_idx = 0
-        total_output_token_count_trt_llm = 0  # only valid for runtime_rank == 0
+        total_output_token_count_hf = 0  # only valid for runtime_rank == 0
         while (data_point_idx < len(dataset)) and (ite_count < args.max_ite):
             if runtime_rank == 0:
                 logger.debug(
@@ -498,7 +498,7 @@ def main(args):
                                                 max_batch_size)]
 
             profiler.start('hf')
-            output_hf, _, curr_ppls_hf = eval_hf(
+            output_hf, token_list, curr_ppls_hf = eval_hf(
                 datapoint,
                 eval_task=args.eval_task,
                 eval_ppl=args.eval_ppl,
@@ -506,6 +506,9 @@ def main(args):
             profiler.stop('hf')
 
             if runtime_rank == 0:
+                seq_lengths = [len(tokens) for tokens in token_list]
+                total_output_token_count_hf += sum(seq_lengths)
+
                 for beam_idx in range(num_beams):
                     for batch_idx in range(len(output_hf[beam_idx])):
                         metric_hf[beam_idx].add_batch(
@@ -568,6 +571,13 @@ def main(args):
             logger.info(
                 f'Hugging Face (total latency: {profiler.elapsed_time_in_sec("hf")} sec)'
             )
+            logger.info(
+                f'Hugging Face (total output tokens: {total_output_token_count_hf})'
+            )
+            logger.info(
+                f'Hugging Face (tokens per second: {total_output_token_count_hf / profiler.elapsed_time_in_sec("hf")})'
+            )
+
             for beam_idx in range(num_beams):
                 logger.info(f"HF beam {beam_idx} result")
                 computed_metrics_hf = metric_hf[beam_idx].compute()

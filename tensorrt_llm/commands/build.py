@@ -421,7 +421,8 @@ def main():
                     'gpus_per_node':
                     args.gpus_per_node,
                     'cluster_key':
-                    args.cluster_key or infer_cluster_key(),
+                    args.cluster_key
+                    or infer_cluster_key(allow_fallback=args.auto_parallel > 1),
                     'sharded_io_allowlist': [
                         'past_key_value_\\d+',
                         'present_key_value_\\d*',

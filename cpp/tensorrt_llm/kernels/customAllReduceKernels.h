@@ -45,7 +45,7 @@ enum class AllReduceStrategyType : int8_t
 enum class AllReduceStrategyConfig : int8_t
 {
     USE_MEMCPY = 1 << 0,
-    PULL_MODE = 1 << 1,
+    PUSH_MODE = 1 << 1,
 };
 
 struct AllReduceParams

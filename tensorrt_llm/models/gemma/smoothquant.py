@@ -17,6 +17,8 @@ from transformers.models.llama.modeling_llama import (LlamaAttention,
                                                       repeat_kv)
 from transformers.pytorch_utils import Conv1D
 
+from tensorrt_llm._utils import torch_to_numpy
+
 
 def generate_int8(weights, act_range, is_qkv=False, multi_query_mode=False):
     """
@@ -44,13 +46,14 @@ def generate_int8(weights, act_range, is_qkv=False, multi_query_mode=False):
     """
 
     # compute weight scaling factors for fp->int8 and int8->fp
+    fp32_weight = weights.to(torch.float32)
     if is_qkv and not multi_query_mode:
         scale_w_orig_quant_t = 127. / act_range["w"].reshape(3, -1).max(
             dim=-1, keepdims=True)[0].cpu().numpy()
         scale_w_orig_quant_c = 127. / act_range["w"].reshape(3,
                                                              -1).cpu().numpy()
     elif is_qkv and multi_query_mode:
-        hidden_dim = weights.shape[0]
+        hidden_dim = fp32_weight.shape[0]
         local_dim = act_range["w"].shape[0]
         kv_dim = (local_dim - hidden_dim) // 2
         scale_w_q = act_range["w"][0:hidden_dim]
@@ -101,16 +104,16 @@ def generate_int8(weights, act_range, is_qkv=False, multi_query_mode=False):
             np.broadcast_to(scale_w_quant_orig_t[2], scale_w_v.shape)
         ])
 
-    to_i8 = lambda x: x.round().clip(-127, 127).astype(np.int8)
+    to_i8 = lambda x: torch_to_numpy(x.round().clip(-127, 127).to(torch.int8))
 
     if is_qkv and multi_query_mode:
-        weight_int8 = to_i8(weights / scale_w_quant_orig_t)
+        weight_int8 = to_i8(fp32_weight / scale_w_quant_orig_t)
     else:
-        weight_int8 = to_i8(weights * scale_w_orig_quant_t)
+        weight_int8 = to_i8(fp32_weight * scale_w_orig_quant_t)
 
     return {
         "weight.int8": weight_int8,
-        "weight.int8.col": to_i8(weights * scale_w_orig_quant_c),
+        "weight.int8.col": to_i8(fp32_weight * scale_w_orig_quant_c),
         "scale_x_orig_quant": scale_x_orig_quant_t.astype(np.float32),
         "scale_w_quant_orig": scale_w_quant_orig_t.astype(np.float32),
         "scale_w_quant_orig.col": scale_w_quant_orig_c.astype(np.float32),
@@ -737,11 +740,7 @@ def create_model_from_config(trt_llm_config, weights):
         'vocab_embedding': 'embed_tokens',
     }
     for name in list(weights):
-        if model_config.dtype == "bfloat16":
-            param = torch.from_numpy(weights[name].astype(np.float32)).to(
-                torch.bfloat16)
-        else:
-            param = torch.from_numpy(weights[name])
+        param = weights[name]
         weights.pop(name)
         new_name = name.replace('transformer', 'model')
         for _name in replace_name_dict:
@@ -813,7 +812,7 @@ def convert_hf_model(hf_model,
                 qkv_weight = qkv_weight.reshape(hidden_size, 3,
                                                 head_size * num_attention_heads)
 
-            int8_weights = generate_int8(qkv_weight.numpy(),
+            int8_weights = generate_int8(qkv_weight,
                                          act_range.get(prefix +
                                                        'self_attn.qkv_proj'),
                                          is_qkv=True,
@@ -887,7 +886,7 @@ def convert_hf_model(hf_model,
         attn_dense_weight = get_weight(model_params,
                                        prefix + 'self_attn.o_proj', dtype)
         if use_smooth_quant:
-            attn_dense_weight = attn_dense_weight.t().numpy()
+            attn_dense_weight = attn_dense_weight.t()
             int8_weights = generate_int8(
                 attn_dense_weight, act_range.get(prefix + 'self_attn.o_proj'))
             weights.update(
@@ -919,7 +918,7 @@ def convert_hf_model(hf_model,
         # MLP hf up to trt gate
         mlp_up_weight = get_weight(model_params, prefix + 'mlp.up_proj', dtype)
         if use_smooth_quant:
-            mlp_up_weight = mlp_up_weight.t().numpy()
+            mlp_up_weight = mlp_up_weight.t()
             int8_weights = generate_int8(mlp_up_weight,
                                          act_range.get(prefix + 'mlp.up_proj'))
             weights.update(
@@ -950,7 +949,7 @@ def convert_hf_model(hf_model,
         mlp_gate_weight = get_weight(model_params, prefix + 'mlp.gate_proj',
                                      dtype)
         if use_smooth_quant:
-            mlp_gate_weight = mlp_gate_weight.t().numpy()
+            mlp_gate_weight = mlp_gate_weight.t()
             int8_weights = generate_int8(
                 mlp_gate_weight, act_range.get(prefix + 'mlp.gate_proj'))
             weights.update(
@@ -981,7 +980,7 @@ def convert_hf_model(hf_model,
         mlp_proj_weight = get_weight(model_params, prefix + 'mlp.down_proj',
                                      dtype)
         if use_smooth_quant:
-            mlp_proj_weight = mlp_proj_weight.t().numpy()
+            mlp_proj_weight = mlp_proj_weight.t()
             int8_weights = generate_int8(
                 mlp_proj_weight, act_range.get(prefix + 'mlp.down_proj'))
             weights.update(

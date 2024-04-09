@@ -204,6 +204,12 @@ class EncDecBenchmark(BaseBenchmark):
             self.decoder_runtime_mapping,
         )
 
+        # Print context memory size for CI/CD to track.
+        context_mem_size = self.encoder_session.context_mem_size + self.decoder_session.context_mem_size
+        print(
+            f"Allocated {context_mem_size / 1048576.0:.2f} MiB for execution context memory."
+        )
+
     def get_config(self):
         if 'whisper' in self.model_name:
             print(

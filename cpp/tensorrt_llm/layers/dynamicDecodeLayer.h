@@ -17,10 +17,10 @@
 #pragma once
 
 #include "tensorrt_llm/common/tensor.h"
-#include "tensorrt_llm/kernels/beamSearchTopkKernels.h"
+#include "tensorrt_llm/kernels/beamSearchKernels.h"
 #include "tensorrt_llm/layers/baseLayer.h"
+#include "tensorrt_llm/layers/beamSearchLayer.h"
 #include "tensorrt_llm/layers/medusaDecodingLayer.h"
-#include "tensorrt_llm/layers/onlineBeamSearchLayer.h"
 #include "tensorrt_llm/layers/samplingLayer.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/decodingMode.h"
@@ -47,10 +47,10 @@ template <typename T>
 class DynamicDecodeLayer : public BaseLayer
 {
 public:
-    DynamicDecodeLayer(runtime::DecodingMode const& mode, runtime::SizeType max_batch_size,
-        runtime::SizeType max_beam_width, runtime::SizeType vocab_size, runtime::SizeType vocab_size_padded,
-        cudaStream_t stream, std::shared_ptr<tc::IAllocator> allocator, cudaDeviceProp* cuda_device_prop,
-        std::optional<runtime::SizeType> maxTokensPerStep = std::nullopt,
+    DynamicDecodeLayer(runtime::DecodingMode const& mode, runtime::SizeType const max_batch_size,
+        runtime::SizeType const max_beam_width, runtime::SizeType const vocab_size,
+        runtime::SizeType const vocab_size_padded, cudaStream_t stream, std::shared_ptr<tc::IAllocator> allocator,
+        cudaDeviceProp* cuda_device_prop, std::optional<runtime::SizeType> maxTokensPerStep = std::nullopt,
         std::optional<runtime::SizeType> maxNumMedusaHeads = std::nullopt);
 
     ~DynamicDecodeLayer() override;
@@ -75,10 +75,10 @@ public:
         std::optional<std::vector<float>> top_p_min;              // [batch_size], must between [0, 1]
         std::optional<std::vector<std::int32_t>> top_p_reset_ids; // [batch_size]
 
-        // onlineBeamSearchLayer
-        std::optional<std::vector<float>> beam_search_diversity_rate;
-        std::optional<std::vector<float>> length_penalty;
-        std::optional<std::vector<int>> early_stopping;
+        // BeamSearchLayer
+        std::optional<std::vector<float>> beam_search_diversity_rate; // [batch_size] on cpu
+        std::optional<std::vector<float>> length_penalty;             // [batch_size] on cpu
+        std::optional<std::vector<int>> early_stopping;               // [batch_size] on cpu
 
         std::optional<bool> normalize_log_probs;
 
@@ -246,7 +246,7 @@ private:
         cudaStream_t stream);
 
 private:
-    std::unique_ptr<OnlineBeamSearchLayer<T>> mOnlineBeamSearchDecode;
+    std::unique_ptr<BeamSearchLayer<T>> mBeamSearchDecoder;
     std::unique_ptr<SamplingLayer<T>> mSamplingLayer;
     std::unique_ptr<MedusaDecodingLayer<T>> mMedusaDecodingLayer;
 

@@ -37,7 +37,7 @@ class MambaParameters:
 
 class MambaConv1d(Module):
 
-    def __init__(self, d_inner, d_conv=4, dtype=None):
+    def __init__(self, d_inner, d_conv=4, dtype=None, apply_silu=True):
         super().__init__()
         self.d_inner = d_inner
         self.d_conv = d_conv
@@ -45,6 +45,7 @@ class MambaConv1d(Module):
         self.weight = Parameter(shape=(self.d_inner, 1, self.d_conv, 1),
                                 dtype=dtype)
         self.bias = Parameter(shape=(self.d_inner, ), dtype=dtype)
+        self.apply_silu = apply_silu
 
     def forward(self,
                 x: Tensor,
@@ -71,7 +72,7 @@ class MambaConv1d(Module):
             x_conv, conv_state = mamba_conv1d(
                 x, conv_state, transposed_weight, self.bias.value,
                 host_request_types, last_token_ids, self.d_inner, self.d_conv,
-                self.dtype, host_context_lengths, slot_mapping)
+                self.dtype, host_context_lengths, slot_mapping, self.apply_silu)
         else:
             assert len(
                 x.shape
@@ -94,7 +95,8 @@ class MambaConv1d(Module):
                             self.weight.value,
                             self.bias.value,
                             groups=self.d_inner)
-            x_conv = ACT2FN['silu'](x_conv)
+            if self.apply_silu:
+                x_conv = ACT2FN['silu'](x_conv)
             x_conv = x_conv.view(
                 concat([shape(x_conv, 0),
                         shape(x_conv, 1),

@@ -22,10 +22,11 @@ from easydict import EasyDict
 from transformers import AutoConfig, AutoModelForCausalLM
 
 import tensorrt_llm
-from tensorrt_llm._utils import torch_to_numpy
+from tensorrt_llm._utils import (np_bfloat16, numpy_to_torch,
+                                 str_dtype_to_torch, torch_to_numpy)
 from tensorrt_llm.models.gemma.smoothquant import *
 from tensorrt_llm.models.gemma.weight import (dummy_weights_awq,
-                                              load_from_fp8_llama,
+                                              load_from_fp8_gemma,
                                               quantize_fp8_weights)
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -60,7 +61,7 @@ def parse_arguments():
         "--fp8_kv_cache",
         action="store_true",
         help=
-        "By default, we use dtype for KV cache. fp8_kv_cache chooses int8 quantization for KV",
+        "By default, we use dtype for KV cache. fp8_kv_cache chooses fp8 quantization for KV",
     )
     parser.add_argument(
         "--ammo_quant_ckpt_path",
@@ -161,7 +162,13 @@ class JAXParser:
             raise ValueError(f"Don't know how to rename {prefix}.{name}")
 
     def flatten_params(self, params):
-        return flax.traverse_util.flatten_dict(params, sep=".")
+        new_params = flax.traverse_util.flatten_dict(params, sep=".")
+        # if the dtype is bfloat16, cast to float32
+        for k in new_params:
+            if new_params[k].dtype != np.float32 and new_params[
+                    k].dtype != np.float16:
+                new_params[k] = new_params[k].astype(np.float32)
+        return new_params
 
 
 class KerasParser:
@@ -233,7 +240,13 @@ class KerasParser:
 
         def walk(name, obj):
             if isinstance(obj, h5py.Dataset):
-                f_params[name] = np.array(obj)
+                if obj.dtype == "|V2":
+                    # bfloat16 case
+                    f_params[name] = torch_to_numpy(
+                        numpy_to_torch(np.array(obj).astype(np_bfloat16)).to(
+                            torch.float32))
+                else:
+                    f_params[name] = np.array(obj)
 
         params.visititems(walk)
         return f_params
@@ -405,10 +418,12 @@ def add_trt_llm_weight(weights: typing.Dict[str, np.ndarray],
                        param: np.ndarray,
                        dtype: typing.Optional[np.dtype] = None):
     assert name not in weights, f"{name} is already added."
+    param = numpy_to_torch(param)
     if dtype is not None:
-        param = param.astype(dtype)
-    param = np.ascontiguousarray(param)
-    weights[name] = param
+        assert isinstance(dtype,
+                          str), f"dtype must be str, but get type {type(dtype)}"
+        param = param.to(str_dtype_to_torch(dtype))
+    weights[name] = param.contiguous()
 
 
 def quantize(param: np.ndarray,
@@ -839,6 +854,7 @@ def convert(worker_rank, args, convert_kwargs):
             qkv_para = {}
             smoother = {}
             dataset = load_dataset("ccdv/cnn_dailymail", '3.0.0')
+            assert args.tokenizer_dir is not None, "Must set tokenizer_dir to do calibration"
             tokenizer = sp.SentencePieceProcessor(model_file=args.tokenizer_dir)
             hf_model = create_model_from_config(trt_llm_config, weights)
             act_range = capture_activation_range(hf_model, tokenizer, dataset)
@@ -871,13 +887,13 @@ def convert(worker_rank, args, convert_kwargs):
             weight_scales = quantize_fp8_weights(
                 weights, trt_llm_config.num_hidden_layers,
                 trt_llm_config.mapping)
-            scales = load_from_fp8_llama(args.ammo_quant_ckpt_path,
+            scales = load_from_fp8_gemma(args.ammo_quant_ckpt_path,
                                          trt_llm_config.num_hidden_layers,
                                          trt_llm_config.mapping,
                                          args.fp8_kv_cache, weight_scales)
             weights.update(scales)
 
-        safetensors.numpy.save_file(
+        safetensors.torch.save_file(
             weights, args.output_model_dir / f"rank{rank}.safetensors")
 
 

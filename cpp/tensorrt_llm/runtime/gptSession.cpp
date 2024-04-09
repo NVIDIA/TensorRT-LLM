@@ -178,7 +178,7 @@ void GptSession::createKvCacheManager(SizeType batchSize, SizeType beamWidth, Si
 
     auto const kvDtype = mModelConfig.getKvDataType();
 
-    auto const maxNumBlocks = bmkv::KVCacheManager::calculateMaxNumBlocks(
+    auto const [blocksInPrimaryPool, blocksInSecondaryPool] = bmkv::KVCacheManager::calculateMaxNumBlocks(
         kvCacheConfig, kvDtype, mModelConfig, mWorldConfig, getBufferManager());
 
     // If beamWidth > 1, use one more block for each sequence in the paged kv cache to avoid dropping the needed
@@ -190,8 +190,9 @@ void GptSession::createKvCacheManager(SizeType batchSize, SizeType beamWidth, Si
     auto const sizePerHead = mModelConfig.getSizePerHead();
     bool constexpr enableBlockReuse{false};
     mKvCacheManager = std::make_shared<bmkv::KVCacheManager>(localNbLayers, nbKvHeads, sizePerHead, tokensPerBlock,
-        maxNumBlocks, batchSize, beamWidth, maxAttentionWindow, sinkTokenLength, useOneMoreBlock, kvDtype,
-        mRuntime->getStreamPtr(), enableBlockReuse, kvCacheConfig.useUvm);
+        blocksInPrimaryPool, blocksInSecondaryPool, batchSize, beamWidth, maxAttentionWindow, sinkTokenLength,
+        useOneMoreBlock, kvDtype, mRuntime->getStreamPtr(), enableBlockReuse, kvCacheConfig.useUvm,
+        kvCacheConfig.onboardBlocks);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -940,7 +941,20 @@ SizeType GptSession::executeGenerationStep(SizeType step, std::vector<Generation
 
         if (useCudaGraphs())
         {
-            mCudaGraphInstances.at(graphId).prepareNextGraph(*mRuntime, contextId);
+            // SSMBased only create cuda graph instance once.
+            if (mModelConfig.isSsmBased())
+            {
+                // step > 3 is WAR for TRT 9.x.
+                // Which is fixed in TRT 10.x.
+                if (step > 3 && !mCudaGraphInstances.at(graphId).hasInstance())
+                {
+                    mCudaGraphInstances.at(graphId).prepareNextGraph(*mRuntime, contextId);
+                }
+            }
+            else
+            {
+                mCudaGraphInstances.at(graphId).prepareNextGraph(*mRuntime, contextId);
+            }
         }
 
         // check decoder result of previous iteration
@@ -953,10 +967,10 @@ SizeType GptSession::executeGenerationStep(SizeType step, std::vector<Generation
             continue;
         }
 
-        if (useCudaGraphs())
+        if (useCudaGraphs() && mCudaGraphInstances.size() > (size_t) graphId
+            && mCudaGraphInstances.at(graphId).hasInstance())
         {
             auto& cudaGraphInstance = mCudaGraphInstances.at(graphId);
-            TLLM_CHECK(cudaGraphInstance.hasInstance());
             cudaGraphInstance.launch(mRuntime->getStream());
         }
         else

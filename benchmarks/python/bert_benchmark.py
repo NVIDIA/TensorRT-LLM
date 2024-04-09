@@ -64,6 +64,12 @@ class BERTBenchmark(BaseBenchmark):
         self.session = tensorrt_llm.runtime.Session.from_serialized_engine(
             engine_buffer)
 
+        # Print context memory size for CI/CD to track.
+        context_mem_size = self.session.context_mem_size
+        print(
+            f"Allocated {context_mem_size / 1048576.0:.2f} MiB for execution context memory."
+        )
+
     def get_config(self):
         for inlen in self.in_lens:
             if inlen > self.max_input_len:

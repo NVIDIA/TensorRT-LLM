@@ -266,8 +266,10 @@ static __global__ void oneShotAllReduceKernel(AllReduceParams params)
         PackedStruct sums;
         sums.packed = {0, 0, 0, 0};
 #pragma unroll
-        for (int ii = 0; ii < RANKS_PER_NODE; ++ii)
+        for (int rank = 0; rank < RANKS_PER_NODE; ++rank)
         {
+            // Always reduce from rank 0 to ensure stable reduce order.
+            int ii = (rank + RANKS_PER_NODE - params.local_rank) % RANKS_PER_NODE;
             sums.packed = add128b(sums, vals[ii]);
         }
 
@@ -402,8 +404,10 @@ static __global__ void twoShotAllReduceKernel(AllReduceParams params)
         PackedType sums;
         sums.packed = {0, 0, 0, 0};
 #pragma unroll
-        for (int ii = 0; ii < RANKS_PER_NODE; ++ii)
+        for (int rank = 0; rank < RANKS_PER_NODE; ++rank)
         {
+            // Always reduce from rank 0 to ensure stable reduce order.
+            int ii = (rank + RANKS_PER_NODE - params.local_rank) % RANKS_PER_NODE;
             sums.packed = add128b(sums, vals[ii]);
         }
 
@@ -554,7 +558,7 @@ void AllReduceDispatchRanksPerNode(
     AllReduceStrategyType algo, AllReduceStrategyConfig config, AllReduceParams& param, cudaStream_t stream)
 {
     if (static_cast<std::underlying_type_t<AllReduceStrategyConfig>>(config)
-        & static_cast<std::underlying_type_t<AllReduceStrategyConfig>>(AllReduceStrategyConfig::PULL_MODE))
+        & static_cast<std::underlying_type_t<AllReduceStrategyConfig>>(AllReduceStrategyConfig::PUSH_MODE))
     {
         AllReduceDispatchPushMode<T, RANKS_PER_NODE, true>(algo, config, param, stream);
     }

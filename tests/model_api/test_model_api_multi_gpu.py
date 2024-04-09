@@ -76,7 +76,7 @@ def build_and_run_tp2(rank, model_name, engine_dir, use_auto_parallel):
         mapping.rank = rank
         auto_parallel_config = AutoParallelConfig(
             world_size=TP_SIZE,
-            cluster_key=infer_cluster_key(),
+            cluster_key=infer_cluster_key(allow_fallback=True),
             sharded_io_allowlist=[
                 "past_key_value_\\d+",
                 "present_key_value_\\d*",

@@ -39,10 +39,11 @@ class TestFunctional(unittest.TestCase):
     @parameterized.expand(list(
         product([2048], [4], ['context', 'generation'],
                 ['float16', 'float32', 'bfloat16'], [5], [16], [False, True],
-                [False, True])),
+                [False, True], [False, True])),
                           name_func=unittest_name_func)
     def test_mamba_conv1d(self, dim, dconv, req_type, dtype, batch_size,
-                          max_seq_len, remove_padding, use_mamba_conv1d_plugin):
+                          max_seq_len, remove_padding, use_mamba_conv1d_plugin,
+                          apply_silu):
         # Skip tests that are not supported in pre-ampere architecture
         skip_bf16_pre_ampere(dtype)
 
@@ -158,7 +159,8 @@ class TestFunctional(unittest.TestCase):
                 dim,
                 dconv,
                 dtype,
-                host_context_lengths=host_context_length_tensor)
+                host_context_lengths=host_context_length_tensor,
+                apply_silu=apply_silu)
             net._mark_output(outputs[0],
                              'output',
                              dtype=tensorrt_llm.str_dtype_to_trt(dtype))
@@ -194,7 +196,8 @@ class TestFunctional(unittest.TestCase):
             out_ref[b:b + 1, :, :host_context_length[b].item(
             )], present_conv_state_ref[b:b + 1, :, :] = mamba_conv1d_ref(
                 x[b:b + 1, :, :host_context_length[b].item()],
-                past_conv_state[b:b + 1, :, :], conv_weight, conv_bias)
+                past_conv_state[b:b + 1, :, :], conv_weight, conv_bias,
+                apply_silu)
         present_conv_state_ref = present_conv_state_ref.permute(0, 2,
                                                                 1).contiguous()
         out_ref = out_ref.permute(0, 2, 1).contiguous()

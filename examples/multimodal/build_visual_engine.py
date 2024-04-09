@@ -7,6 +7,7 @@ from time import time
 # isort: off
 import torch
 import tensorrt as trt
+from tensorrt_llm.builder import Builder
 # isort: on
 
 from PIL import Image
@@ -29,18 +30,21 @@ def export_visual_wrapper_onnx(visual_wrapper, image, output_dir):
                       }})
 
 
-def build_trt_engine(img_height, img_width, output_dir, max_batch_size):
+def build_trt_engine(model_type, img_height, img_width, output_dir,
+                     max_batch_size):
     part_name = 'visual_encoder'
     onnx_file = '%s/onnx/%s.onnx' % (output_dir, part_name)
     engine_file = '%s/%s.engine' % (output_dir, part_name)
+    config_file = '%s/%s' % (output_dir, "config.json")
     logger.log(trt.Logger.INFO, "Building TRT engine for %s" % part_name)
 
     builder = trt.Builder(logger)
     network = builder.create_network(
         1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
     profile = builder.create_optimization_profile()
-    config = builder.create_builder_config()
-    config.set_flag(trt.BuilderFlag.FP16)
+    config_wrapper = Builder().create_builder_config(precision="float16",
+                                                     model_type=model_type)
+    config = config_wrapper.trt_builder_config
 
     parser = trt.OnnxParser(network, logger)
 
@@ -79,6 +83,8 @@ def build_trt_engine(img_height, img_width, output_dir, max_batch_size):
         with open(engine_file, 'wb') as f:
             f.write(engine_string)
 
+    Builder.save_config(config_wrapper, config_file)
+
 
 def build_blip2_engine(args):
     model_type = 'Salesforce/blip2-' + args.model_type
@@ -113,8 +119,8 @@ def build_blip2_engine(args):
     wrapper.to(args.device)
 
     export_visual_wrapper_onnx(wrapper, image, args.output_dir)
-    build_trt_engine(image.shape[2], image.shape[3], args.output_dir,
-                     args.max_batch_size)
+    build_trt_engine(model_type, image.shape[2], image.shape[3],
+                     args.output_dir, args.max_batch_size)
 
 
 def build_llava_engine(args):
@@ -145,20 +151,23 @@ def build_llava_engine(args):
                                  model.config.vision_feature_layer)
 
     export_visual_wrapper_onnx(wrapper, image, args.output_dir)
-    build_trt_engine(image.shape[2], image.shape[3], args.output_dir,
-                     args.max_batch_size)
+    build_trt_engine(args.model_type, image.shape[2], image.shape[3],
+                     args.output_dir, args.max_batch_size)
 
 
 def build_vila_engine(args):
     # Note: VILA model is not in public HF model zoo yet. We need to explicitly import from the git repo
-    sys.path.append(args.model_path + "/../VILA")
+    sys.path.append(args.vila_path)
     from llava.model import LlavaLlamaForCausalLM
 
-    processor = AutoProcessor.from_pretrained(args.model_path)
+    model = LlavaLlamaForCausalLM.from_pretrained(args.model_path,
+                                                  torch_dtype=torch.float16)
+    vision_tower = model.get_vision_tower()
+    image_processor = vision_tower.image_processor
     raw_image = Image.new('RGB', [10, 10])  # dummy image
-    image = processor(text="dummy", images=raw_image,
-                      return_tensors="pt")['pixel_values'].to(
-                          args.device, torch.float16)
+    image = image_processor(images=raw_image,
+                            return_tensors="pt")['pixel_values'].to(
+                                args.device, torch.float16)
 
     class VilaVisionWrapper(torch.nn.Module):
 
@@ -178,8 +187,8 @@ def build_vila_engine(args):
         model.get_model().mm_projector.to(args.device))
 
     export_visual_wrapper_onnx(wrapper, image, args.output_dir)
-    build_trt_engine(image.shape[2], image.shape[3], args.output_dir,
-                     args.max_batch_size)
+    build_trt_engine(args.model_type, image.shape[2], image.shape[3],
+                     args.output_dir, args.max_batch_size)
 
 
 def build_nougat_engine(args):
@@ -203,8 +212,8 @@ def build_nougat_engine(args):
     wrapper = SwinEncoderWrapper(swin_encoder)
 
     export_visual_wrapper_onnx(wrapper, image, args.output_dir)
-    build_trt_engine(image.shape[2], image.shape[3], args.output_dir,
-                     args.max_batch_size)
+    build_trt_engine(args.model_type, image.shape[2], image.shape[3],
+                     args.output_dir, args.max_batch_size)
 
 
 if __name__ == '__main__':
@@ -214,11 +223,19 @@ if __name__ == '__main__':
     parser.add_argument('--model_type',
                         type=str,
                         default=None,
+                        choices=[
+                            'opt-2.7b', 'opt-6.7b', 'flan-t5-xl', 'flan-t5-xxl',
+                            'llava', 'vila', 'nougat'
+                        ],
                         help="Model type")
     parser.add_argument('--model_path',
                         type=str,
                         default=None,
                         help="Huggingface repo or local directory with weights")
+    parser.add_argument('--vila_path',
+                        type=str,
+                        default=None,
+                        help="Path to VILA source code directory")
     parser.add_argument('--output_dir',
                         type=str,
                         default=None,
@@ -236,11 +253,12 @@ if __name__ == '__main__':
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
 
-    if args.model_type in ['opt-2.7b', 'flan-t5-xl']:
+    if 'opt' in args.model_type or 't5' in args.model_type:
         build_blip2_engine(args)
     elif args.model_type == 'llava':
         build_llava_engine(args)
     elif args.model_type == 'vila':
+        assert args.vila_path is not None, "Please clone and provide VILA source code path"
         build_vila_engine(args)
     elif args.model_type == 'nougat':
         build_nougat_engine(args)

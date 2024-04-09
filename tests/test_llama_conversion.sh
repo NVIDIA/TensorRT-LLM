@@ -150,7 +150,7 @@ test_long_alpaca_rope_scaling() {
     python ../run.py \
         --max_output_len 128 \
         --max_input_length 32768 \
-        --input_file ../../tests/llm-test-defs/turtle/test_input_files/pg64317.txt \
+        --input_file ../../tests/llm-test-defs/turtle/test_input_files/pg64317_sanitized.txt \
         --engine_dir ./trt_engines/long_alpaca_tp2  \
         --tokenizer_dir /home/scratch.trt_llm_data/llm-models/LongAlpaca-7B/
 }

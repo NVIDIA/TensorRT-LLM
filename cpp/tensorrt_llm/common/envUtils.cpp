@@ -77,4 +77,24 @@ int getEnvMmhaBlocksPerSequence()
     return mmhaBlocksPerSequence;
 }
 
+int getEnvMmhaKernelBlockSize()
+{
+    static bool init = false;
+    static int mmhaKernelBlockSize = 0;
+    if (!init)
+    {
+        init = true;
+        char const* mmhaKernelBlockSizeEnv = std::getenv("TRTLLM_MMHA_KERNEL_BLOCK_SIZE");
+        if (mmhaKernelBlockSizeEnv)
+        {
+            mmhaKernelBlockSize = std::atoi(mmhaKernelBlockSizeEnv);
+            if (mmhaKernelBlockSize <= 0)
+            {
+                TLLM_LOG_WARNING("Invalid value for TRTLLM_MMHA_KERNEL_BLOCK_SIZE. Will use default values instead!");
+            }
+        }
+    }
+    return mmhaKernelBlockSize;
+}
+
 } // namespace tensorrt_llm::common

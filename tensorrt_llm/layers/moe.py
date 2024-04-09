@@ -173,9 +173,10 @@ def _moe_plugin(moe_config,
 
     plugin_inputs = [i.trt_tensor for i in plugin_inputs]
     layer = default_trtnet().add_plugin_v2(plugin_inputs, moe_plugin)
-    for ii in range(layer.num_inputs):
-        if layer.get_input(ii).dtype == str_dtype_to_trt("int8"):
-            layer.get_input(ii).set_dynamic_range(-127, 127)
+    if not default_net().strongly_typed:
+        for ii in range(layer.num_inputs):
+            if layer.get_input(ii).dtype == str_dtype_to_trt("int8"):
+                layer.get_input(ii).set_dynamic_range(-127, 127)
     output = _create_tensor(layer.get_output(0), layer)
     return output
 

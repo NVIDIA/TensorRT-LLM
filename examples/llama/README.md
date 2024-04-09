@@ -220,6 +220,9 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_8gpu_tp8 \
 # Get the long text data from Gutenberg Project
 wget https://www.gutenberg.org/cache/epub/64317/pg64317.txt
 
+# Replace the line breaks with special character '\n' and append "Summarize this story:" at end of text
+awk '{printf "%s\\n", $0} END {printf "\\nSummarize this story:"}' pg64317.txt > pg64317_sanitized.txt
+
 # Run with 8 GPUs
 # Notice, `--max_input_length <n>` is a convenience option to limit the input length for the data.
 # It should be set to the maximum context length the model supports. Here the limit is set to 32K.
@@ -227,7 +230,7 @@ mpirun -n 8 --allow-run-as-root \
     python ../run.py \
     --max_output_len 128 \
     --max_input_length 32768 \
-    --input_file pg64317.txt \
+    --input_file pg64317_sanitized.txt \
     --engine_dir ./tmp/llama/70B/trt_engines/fp16/8-gpu/ \
     --tokenizer_dir ./tmp/LongAlpaca-70B/
 ```

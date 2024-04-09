@@ -21,12 +21,14 @@ class BenchmarkProfiler(object):
     timer_dict: dict
     aux_info: dict
     started: bool
+    is_recording_perf_profile: bool
 
     def __init__(self):
         self.cuda_event_dict = {}
         self.timer_dict = {}
         self.aux_info = {}
         self.started = False
+        self.is_recording_perf_profile = False
 
     def clean(self):
         self.cuda_event_dict = {}
@@ -75,3 +77,6 @@ class BenchmarkProfiler(object):
         if not self.started:
             return
         self.aux_info[aux_name] += add_value
+
+    def set_recording_perf_profile(self, value: bool):
+        self.is_recording_perf_profile = value

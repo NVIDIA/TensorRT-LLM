@@ -16,6 +16,7 @@ import os
 from dataclasses import asdict
 from math import ceil
 
+import pandas as pd
 import torch
 
 import tensorrt_llm
@@ -93,6 +94,7 @@ class GPTBenchmark(BaseBenchmark):
             # Plugins
             self.use_gpt_attention_plugin = False
             self.remove_input_padding = False
+            self.use_mamba_conv1d_plugin = False
             if args.mode == 'plugin':
                 self.use_gpt_attention_plugin = True
                 self.remove_input_padding = True
@@ -129,6 +131,7 @@ class GPTBenchmark(BaseBenchmark):
             remove_input_padding=self.remove_input_padding,
             quant_mode=self.quant_mode,
             use_custom_all_reduce=self.use_custom_all_reduce,
+            mamba_conv1d_plugin=self.use_mamba_conv1d_plugin,
         )
         if args.model == 'chatglm_6b':
             self.sampling_config = tensorrt_llm.runtime.SamplingConfig(
@@ -176,6 +179,12 @@ class GPTBenchmark(BaseBenchmark):
                 engine_buffer,
                 self.runtime_mapping,
                 cuda_graph_mode=self.cuda_graph_mode)
+
+        # Print context memory size for CI/CD to track.
+        context_mem_size = self.decoder.context_mem_size
+        print(
+            f"Allocated {context_mem_size / 1048576.0:.2f} MiB for execution context memory."
+        )
 
     def get_config(self):
         for inlen, outlen in self.in_out_lens:
@@ -338,3 +347,56 @@ class GPTBenchmark(BaseBenchmark):
                 kv_pairs = [f"{k} {v}" for k, v in report_dict.items()]
                 line = '[BENCHMARK] ' + " ".join(kv_pairs)
                 print(line)
+
+        if benchmark_profiler is not None and benchmark_profiler.is_recording_perf_profile:
+            perf_profile_data = self.decoder.profiler.results
+            if not perf_profile_data:
+                tensorrt_llm.logger.error("profiler data is empty")
+                return
+
+            ctx_layers = list()
+            generation_layers = list()
+            start = 0
+            ctx_iter_cnt = 0
+            generation_iter_cnt = 0
+
+            # split context/generations layer information
+            for idx, layer_info in enumerate(perf_profile_data):
+                if layer_info[0] == "step":
+                    if layer_info[1] == 0:
+                        ctx_layers.extend(perf_profile_data[start:idx])
+                        ctx_iter_cnt += 1
+                    else:
+                        generation_layers.extend(perf_profile_data[start:idx])
+                        generation_iter_cnt += 1
+                        start = idx + 1
+
+            # Reduce all data
+            def reduce_layer_data(layers):
+                layer_infos = dict()
+                for layer in layers:
+                    if layer[0] in layer_infos:
+                        layer_infos[layer[0]] += layer[1]
+                    else:
+                        layer_infos[layer[0]] = layer[1]
+                return layer_infos
+
+            # Dump kernel data
+            def dump_kernel_profile_table(name: str, profile_data: list,
+                                          iter_cnt: int):
+                table = pd.DataFrame(
+                    [[k, '{:0.3f}'.format(v)] for k, v in profile_data.items()],
+                    columns=['{} Phase LayerName'.format(name), 'times (ms)'])
+
+                def ljust(s):
+                    s = s.astype(str).str.strip()
+                    return s.str.ljust(s.str.len().max())
+
+                print(table.apply(ljust).to_string(index=False, justify='left'))
+                print("{} phase step iter: {}".format(name, iter_cnt))
+
+            ctx_layer_infos = reduce_layer_data(ctx_layers)
+            generation_layer_infos = reduce_layer_data(generation_layers)
+            dump_kernel_profile_table("Context", ctx_layer_infos, ctx_iter_cnt)
+            dump_kernel_profile_table("Generation", generation_layer_infos,
+                                      generation_iter_cnt)

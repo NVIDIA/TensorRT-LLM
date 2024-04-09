@@ -683,6 +683,8 @@ def test_kv_cache_config():
     assert config.max_attention_window is None
     assert config.sink_token_length is None
     assert config.free_gpu_memory_fraction is None
+    assert config.host_cache_size is None
+    assert config.onboard_blocks == True
 
     kwargs = {
         "enable_block_reuse": True,
@@ -690,6 +692,8 @@ def test_kv_cache_config():
         "max_attention_window": 10,
         "sink_token_length": 2,
         "free_gpu_memory_fraction": 0.5,
+        "host_cache_size": 1024,
+        "onboard_blocks": False,
     }
     config = trtllm.KvCacheConfig(**kwargs)
     for k, v in kwargs.items():

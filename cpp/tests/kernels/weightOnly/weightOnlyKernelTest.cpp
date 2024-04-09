@@ -365,7 +365,7 @@ bool benchmark_and_verify(int m, int n, int k, int groupsize, int warmup, int it
     d_out.copy_to(h_out1.data());
     time2 = run_cutlass_kernel<KT>(params, warmup, iter);
     d_out.copy_to(h_out2.data());
-    float quant_scale = 1.f / (1 << (8 / WSizeInBits - 1));
+    float quant_scale = 1.f / (1 << (WSizeInBits - 1));
     bool pass = compare<AType>(h_out1.data(), h_out2.data(), m * n, quant_scale);
     printf(
         "cuda kernel cost time %.6f, cutlass kernel cost time %.6f, cuda speedup %.3f\n", time1, time2, time2 / time1);

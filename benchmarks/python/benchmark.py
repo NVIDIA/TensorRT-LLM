@@ -244,6 +244,11 @@ def parse_arguments():
         help=
         "Check the estimated memory usage against the total GPU memory. Raise error if the estimated memory requirement is bigger than the total GPU memory"
         "Warning: only GPT model family is supported for now")
+    parser.add_argument(
+        '--dump_profile',
+        default=False,
+        action='store_true',
+        help="Print profile information per layer (default = disabled)")
     return parser.parse_args()
 
 
@@ -309,6 +314,9 @@ def main(args):
 
     if args.build_only:
         return
+
+    if args.dump_profile and benchmark_profiler is not None:
+        benchmark_profiler.set_recording_perf_profile(True)
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)

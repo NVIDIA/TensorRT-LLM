@@ -19,7 +19,7 @@ We first describe how to run each model on a single GPU. We then provide general
    following example in `examples/enc_dec/README.md`.
 
     ```bash
-    export MODEL_NAME=flan-t5-xl
+    export MODEL_NAME="flan-t5-xl" # also flan-t5-xxl
     git clone https://huggingface.co/google/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
 
     python ../enc_dec/t5/convert.py -i tmp/hf_models/${MODEL_NAME} \
@@ -64,7 +64,6 @@ We first describe how to run each model on a single GPU. We then provide general
 
     ```bash
     python run.py \
-        --blip2_encoder \
         --max_new_tokens 30 \
         --input_text "Question: which city is this? Answer:" \
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
@@ -80,12 +79,10 @@ OPT pipeline needs few minor changes from T5 pipeline
 
 2. Use `trtllm-build` command to build TRT-LLM engine for OPT.
 
-3. Add `--decoder-llm` argument to inference script, since OPT is a decoder-only LLM.
-
-4. The full list of commands is as follows:
+3. The full list of commands is as follows:
 
     ```bash
-    export MODEL_NAME=opt-2.7b
+    export MODEL_NAME="opt-2.7b" # also opt-6.7b
     git clone https://huggingface.co/facebook/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
 
     python ../opt/convert_checkpoint.py \
@@ -106,16 +103,14 @@ OPT pipeline needs few minor changes from T5 pipeline
     python build_visual_engine.py --model_type ${MODEL_NAME} --model_path tmp/hf_models/${MODEL_NAME}
 
     python run.py \
-        --blip2_encoder \
         --max_new_tokens 30 \
         --input_text "Question: which city is this? Answer:" \
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
         --visual_engine_dir visual_engines/${MODEL_NAME} \
         --llm_engine_dir trt_engines/${MODEL_NAME}/fp16/1-gpu \
-        --decoder_llm
     ```
 
-5. INT8/INT4 weight-only quantization for OPT can be enabled using commands as follows (take `INT4` as an example, while `INT8` is the default precision for weight-only quantization):
+4. INT8/INT4 weight-only quantization for OPT can be enabled using commands as follows (take `INT4` as an example, while `INT8` is the default precision for weight-only quantization):
     ```bash
     python ../opt/convert_checkpoint.py \
         --model_dir tmp/hf_models/${MODEL_NAME} \
@@ -150,23 +145,25 @@ OPT pipeline needs few minor changes from T5 pipeline
 
     For LLaVA,
     ```bash
-        export MODEL_NAME="llava-1.5-7b-hf"
+        export MODEL_NAME="llava-1.5-7b-hf" # also llava-1.5-13b-hf
         git clone https://huggingface.co/llava-hf/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
     ```
 
     For VILA, we need a few more steps until it is added to HF model zoo
     ```bash
-        export MODEL_NAME="vila-7B"
+        # clone original VILA repo
+        export VILA_PATH="tmp/hf_models/VILA"
+        git clone https://github.com/Efficient-Large-Model/VILA.git ${VILA_PATH}
+
+        # download VILA checkpoints
+        export MODEL_NAME="vila-7B" # also vila-2.7B, vila-13B
         git clone https://huggingface.co/Efficient-Large-Model/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
-        # clone original VILA repo (please clone to the same level of ${MODEL_NAME} directory)
-        git clone https://github.com/Efficient-Large-Model/VILA.git tmp/hf_models/VILA
-        # reuse LLaVA's preprocessor
-        wget https://huggingface.co/llava-hf/llava-1.5-7b-hf/resolve/main/preprocessor_config.json -P tmp/hf_models/${MODEL_NAME}/
+
         # turn off delay_load to allow model component access
-        sed -i 's/delay_load=True/delay_load=False/g' tmp/hf_models/VILA/llava/model/llava_arch.py
+        sed -i 's/delay_load=True/delay_load=False/g' ${VILA_PATH}/llava/model/llava_arch.py
         # line manipulation to enable AWQ. otherwise need to replace HF's llama implementation
-        sed -i '/vision_tower = self.get_vision_tower()/a \        attention_mask = torch.ones_like(input_ids, dtype=torch.bool)' tmp/hf_models/VILA/llava/model/llava_arch.py
-        sed -i 's/seqlens_in_batch=sorted_seqlens_in_batch/#seqlens_in_batch=sorted_seqlens_in_batch/g' tmp/hf_models/VILA/llava/model/language_model/llava_llama.py
+        sed -i '/vision_tower = self.get_vision_tower()/a \        attention_mask = torch.ones_like(input_ids, dtype=torch.bool)' ${VILA_PATH}/llava/model/llava_arch.py
+        sed -i 's/seqlens_in_batch=sorted_seqlens_in_batch/#seqlens_in_batch=sorted_seqlens_in_batch/g' ${VILA_PATH}/llava/model/language_model/llava_llama.py
     ```
 
 2. Generate TRT-LLM engine for LLaMA following example in `examples/llama/README.md`
@@ -192,10 +189,9 @@ OPT pipeline needs few minor changes from T5 pipeline
 3.  Build TensorRT engines for visual components
 
     ```bash
-    python build_visual_engine.py --model_path tmp/hf_models/${MODEL_NAME} --model_type llava # or "--model_type vila" for VILA
+    python build_visual_engine.py --model_path tmp/hf_models/${MODEL_NAME} --model_type llava # for LLaVA
+    python build_visual_engine.py --model_path tmp/hf_models/${MODEL_NAME} --model_type vila --vila_path ${VILA_PATH} # for VILA
     ```
-
-4. Add `--decoder-llm` argument to inference script, since LLaMA is a decoder-only LLM.
 
     ```bash
     python run.py \
@@ -203,12 +199,11 @@ OPT pipeline needs few minor changes from T5 pipeline
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
         --visual_engine_dir visual_engines/${MODEL_NAME} \
         --llm_engine_dir trt_engines/${MODEL_NAME}/fp16/1-gpu \
-        --decoder_llm \
         --input_text "Question: which city is this? Answer:" # or "Please describe the traffic condition." for VILA
     ```
     Note: use `--run_profiling` for performance measurement, use `--check_accuracy` for accuracy check.
 
-5. (Optional) INT8/INT4 weight-only quantization for LLaMA can be enabled as follows (take `INT4` as an example, while `INT8` is the default precision for weight-only quantization):
+4. (Optional) INT8/INT4 weight-only quantization for LLaMA can be enabled as follows (take `INT4` as an example, while `INT8` is the default precision for weight-only quantization):
     ```bash
     python ../llama/convert_checkpoint.py \
         --model_dir tmp/hf_models/${MODEL_NAME} \
@@ -230,8 +225,8 @@ OPT pipeline needs few minor changes from T5 pipeline
     The built engines lie in `trt_engines/${MODEL_NAME}/int4_weightonly/1-gpu`.
     You should use this directory as `--llm_engine_dir` argument to `run.py`
 
-6. (Optional) One can also use LLaVA/VILA with other quantization options, like SmoothQuant and INT4 AWQ, that are supported by LLaMA.
-   Instructions in [../llama/README.md](../llama/README.md) to enable SmoothQuant and INT4 AWQ can be re-used to generate
+5. (Optional) One can also use LLaVA/VILA with other quantization options, like SmoothQuant and INT4 AWQ, that are supported by LLaMA.
+   Instructions in LLaMA [README](../llama/README.md) to enable SmoothQuant and INT4 AWQ can be re-used to generate
    quantized TRT engines for LLM component of LLaVA/VILA.
 
    For example,
@@ -258,7 +253,7 @@ OPT pipeline needs few minor changes from T5 pipeline
 1. Download Huggingface weights
 
     ```bash
-    export MODEL_NAME="nougat-base" # or nougat-small
+    export MODEL_NAME="nougat-base" # also nougat-small
     git clone https://huggingface.co/facebook/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
     ```
 
@@ -298,7 +293,6 @@ OPT pipeline needs few minor changes from T5 pipeline
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
         --visual_engine_dir visual_engines/${MODEL_NAME} \
         --llm_engine_dir trt_engines/${MODEL_NAME}/1-gpu/bfloat16/tp1 \
-        --nougat
     ```
     Note: Nougat models usually do not need a text prompt.
 
@@ -338,5 +332,4 @@ The full set of commands to enable 2-way tensor parallelism for LLaVA is:
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
         --visual_engine_dir visual_engines/${MODEL_NAME} \
         --llm_engine_dir trt_engines/${MODEL_NAME}/fp16/2-gpu \
-        --decoder_llm
     ```

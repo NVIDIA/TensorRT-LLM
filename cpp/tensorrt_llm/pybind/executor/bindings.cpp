@@ -224,15 +224,18 @@ void InitBindings(pybind11::module_& m)
 
     py::class_<tle::KvCacheConfig>(m, "KvCacheConfig")
         .def(py::init<bool, std::optional<SizeType> const&, std::optional<SizeType> const&,
-                 std::optional<SizeType> const&, std::optional<float> const&>(),
+                 std::optional<SizeType> const&, std::optional<float> const&, std::optional<size_t> const&, bool>(),
             py::arg("enable_block_reuse") = false, py::arg("max_tokens") = py::none(),
             py::arg("max_attention_window") = py::none(), py::arg("sink_token_length") = py::none(),
-            py::arg("free_gpu_memory_fraction") = py::none())
+            py::arg("free_gpu_memory_fraction") = py::none(), py::arg("host_cache_size") = py::none(),
+            py::arg("onboard_blocks") = true)
         .def_property_readonly("enable_block_reuse", &tle::KvCacheConfig::getEnableBlockReuse)
         .def_property_readonly("max_tokens", &tle::KvCacheConfig::getMaxTokens)
         .def_property_readonly("max_attention_window", &tle::KvCacheConfig::getMaxAttentionWindow)
         .def_property_readonly("sink_token_length", &tle::KvCacheConfig::getSinkTokenLength)
-        .def_property_readonly("free_gpu_memory_fraction", &tle::KvCacheConfig::getFreeGpuMemoryFraction);
+        .def_property_readonly("free_gpu_memory_fraction", &tle::KvCacheConfig::getFreeGpuMemoryFraction)
+        .def_property_readonly("host_cache_size", &tle::KvCacheConfig::getHostCacheSize)
+        .def_property_readonly("onboard_blocks", &tle::KvCacheConfig::getOnboardBlocks);
 
     py::class_<tle::ParallelConfig>(m, "ParallelConfig")
         .def(py::init<tle::CommunicationType, tle::CommunicationMode, std::optional<std::vector<SizeType>> const&,
