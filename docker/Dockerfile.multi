@@ -60,7 +60,7 @@ COPY tensorrt_llm tensorrt_llm
 COPY 3rdparty 3rdparty
 COPY setup.py requirements.txt requirements-dev.txt ./
 
-ARG BUILD_WHEEL_ARGS="--clean --trt_root /usr/local/tensorrt --python_bindings --benchmarks"
+ARG BUILD_WHEEL_ARGS="--clean --trt_root /usr/local/tensorrt --nvtx -a "80-real" --python_bindings --benchmarks"
 RUN python3 scripts/build_wheel.py ${BUILD_WHEEL_ARGS}
 
 FROM ${DEVEL_IMAGE} as release

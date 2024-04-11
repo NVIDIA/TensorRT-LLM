@@ -363,6 +363,7 @@ def main(args):
                 max_output_len=output_len,
                 max_beam_width=num_beams,
                 max_attention_window_size=max_attention_window_size,
+                free_gpu_memory_fraction=0.75,
                 sink_token_length=sink_token_length)
         runner = runner_cls.from_dir(**runner_kwargs)
         assert not (args.eval_ppl and not (runner.gather_context_logits and runner.gather_generation_logits)), \
