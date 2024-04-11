@@ -158,7 +158,8 @@ class ModelConfig:
         self._engine_config: Optional[EngineConfig] = None
 
         self.auto_parallel_config = AutoParallelConfig(
-            cluster_key=infer_cluster_key(),
+            cluster_key=infer_cluster_key(
+                allow_fallback=self.parallel_config.auto_parallel),
             sharded_io_allowlist=[
                 "past_key_value_\\d+",
                 "present_key_value_\\d*",
@@ -169,8 +170,8 @@ class ModelConfig:
         )
 
         # Load parallel_config from the engine.
-        if ModelLoader.get_model_format(
-                self.model_dir) is _ModelFormatKind.TLLM_ENGINE:
+        self.model_format = ModelLoader.get_model_format(self.model_dir)
+        if self.model_format is _ModelFormatKind.TLLM_ENGINE:
             self._load_config_from_engine(Path(self.model_dir))
 
         # Load parallel_config from the checkpoint.
@@ -211,10 +212,11 @@ class ModelConfig:
 
             # load build_config
             self.max_beam_width = build_config.max_beam_width
-            self.max_batch_size = build_config.max_batch_size
-            self.max_num_tokens = build_config.max_num_tokens
-            self.max_input_len = build_config.max_input_len
-            self.max_output_len = build_config.max_output_len
+            self._set_additional_options(
+                max_batch_size=build_config.max_batch_size,
+                max_input_len=build_config.max_input_len,
+                max_output_len=build_config.max_output_len,
+                max_num_tokens=build_config.max_num_tokens)
 
             # load plugin_config
             self.plugin_config = build_config.plugin_config
@@ -289,8 +291,6 @@ class LLM:
                  *,
                  tokenizer: Optional[TokenizerBase] = None,
                  kv_cache_config: Optional[KvCacheConfig] = None,
-                 scheduling_policy: SchedulerPolicy = SchedulerPolicy.
-                 GUARANTEED_NO_EVICT,
                  streaming_llm: Union[bool, StreamingLLMParam] = False,
                  async_engine_tmp_dir: Optional[str] = None,
                  **_additional_options: Any):
@@ -299,7 +299,6 @@ class LLM:
             config: The model config for the model.
             tokenizer: User provided tokenizer, will override the default one if exists in the HF model or TRT-LLM engine.
             kv_cache_config: The config for the paged KV cache.
-            scheduling_policy: The scheduling policy for the generation.
             enable_streaming_llm(bool): Whether to enable the streaming LLM mode.
             async_engine_tmp_dir: The temporary directory to save the async engine. Only for debugging.
             _additional_params: Additional options for the model. These options are unstable and are not suggested to be used directly.
@@ -311,6 +310,7 @@ class LLM:
             use_custom_all_reduce(bool): Whether to use the custom all reduce for the multi-gpu case. Default is False.
             multi_block_mode(bool): Switch the optimization on multi-head attention optimization for long context decoding.
             enable_chunked_context(bool): Whether to enable the chunked context for the generation.
+            scheduling_policy(SchedulerPolicy): The scheduling policy for the generation.
         '''
 
         self.config = config
@@ -318,7 +318,6 @@ class LLM:
         self._tokenizer = tokenizer
         self.async_engine_tmp_dir = async_engine_tmp_dir
         self.kv_cache_config = kv_cache_config
-        self.scheduling_policy = scheduling_policy
         # TODO[chunweiy]: add doc for enable_streaming_llm
         self.enable_streaming_llm = streaming_llm
         if self.enable_streaming_llm is True:
@@ -326,20 +325,32 @@ class LLM:
 
         self.mpi_session = None
 
+        plugin_config_alterable = self.config.model_format is not _ModelFormatKind.TLLM_ENGINE
+
         # Read the additional options
         self.normalize_log_probs = _additional_options.pop(
             'normalize_log_probs', None)
         # TODO[chunweiy]: Turn on the custom all reduce by default later
         self.use_custom_all_reduce = _additional_options.pop(
-            'use_custom_all_reduce', False)
+            'use_custom_all_reduce', False if plugin_config_alterable else None)
         self.multi_block_mode = _additional_options.pop('multi_block_mode',
                                                         None)
+        # Chunked context is enabled by default for performance
         self.enable_chunked_context = _additional_options.pop(
-            'enable_chunked_context', None)
+            'enable_chunked_context', True if plugin_config_alterable else None)
         self.enable_trt_overlap = _additional_options.pop(
             'enable_trt_overlap', None)
+        self.scheduling_policy = _additional_options.pop(
+            'scheduling_policy', SchedulerPolicy.GUARANTEED_NO_EVICT)
         if _additional_options:
             raise ValueError(f"Unknown options {_additional_options}")
+
+        devices = self.config.parallel_config.get_devices()
+        if torch.cuda.get_device_properties(devices[0]).major < 8:
+            logger.info(
+                f"Disable the chunked context on GPUs that predate the Volta architecture."
+            )
+            self.enable_chunked_context = False
 
         if self.config.is_multi_gpu:
             if get_device_count() < self.config.world_size:
@@ -360,29 +371,34 @@ class LLM:
         self.runtime_context: Optional[_ModelRuntimeContext] = None
 
         # Update the dependency config if necessary
-        if self.kv_cache_config is not None:
-            if self.kv_cache_config.enable_block_reuse:
-                logger.info(
-                    f"Turn on `use_paged_context_fmha` due to enable_block_reuse"
-                )
-                self.config._update_plugin_config("use_paged_context_fmha",
-                                                  True)
-        if self.enable_chunked_context is not None:
-            self.config._update_plugin_config("enable_chunked_context",
-                                              self.enable_chunked_context)
-        if self.multi_block_mode is not None:
-            self.config._update_plugin_config("multi_block_mode",
-                                              self.multi_block_mode)
-        if self.use_custom_all_reduce is not None:
-            self.config._update_plugin_config("use_custom_all_reduce",
-                                              self.use_custom_all_reduce)
-        if self.enable_streaming_llm:
-            self.config._update_plugin_config("streamingllm", True)
+        # When got an engine, the plugin config are fixed, shouldn't be altered.
+        if self.config.model_format is not _ModelFormatKind.TLLM_ENGINE:
+            if self.kv_cache_config is not None:
+                if self.kv_cache_config.enable_block_reuse:
+                    logger.info(
+                        f"Turn on `use_paged_context_fmha` due to enable_block_reuse"
+                    )
+                    self.config._update_plugin_config("use_paged_context_fmha",
+                                                      True)
+            if self.enable_chunked_context is not None:
+                self.config._update_plugin_config("enable_chunked_context",
+                                                  self.enable_chunked_context)
+                if self.enable_chunked_context is True:
+                    self.config._update_plugin_config("use_paged_context_fmha",
+                                                      True)
+            if self.multi_block_mode is not None:
+                self.config._update_plugin_config("multi_block_mode",
+                                                  self.multi_block_mode)
+            if self.use_custom_all_reduce is not None:
+                self.config._update_plugin_config("use_custom_all_reduce",
+                                                  self.use_custom_all_reduce)
+            if self.enable_streaming_llm:
+                self.config._update_plugin_config("streamingllm", True)
 
-            self.kv_cache_config = KvCacheConfig(
-            ) if self.kv_cache_config is None else self.kv_cache_config
-            self.kv_cache_config.max_attention_window = self.enable_streaming_llm.max_attention_window_size
-            self.kv_cache_config.sink_token_length = self.enable_streaming_llm.sink_token_length
+                self.kv_cache_config = KvCacheConfig(
+                ) if self.kv_cache_config is None else self.kv_cache_config
+                self.kv_cache_config.max_attention_window = self.enable_streaming_llm.max_attention_window_size
+                self.kv_cache_config.sink_token_length = self.enable_streaming_llm.sink_token_length
 
         self._build_model()
 

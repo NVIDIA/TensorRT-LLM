@@ -28,4 +28,6 @@ bool getEnvMmhaMultiblockDebug();
 
 int getEnvMmhaBlocksPerSequence();
 
+int getEnvMmhaKernelBlockSize();
+
 } // namespace tensorrt_llm::common

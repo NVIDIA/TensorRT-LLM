@@ -51,6 +51,16 @@ BufferManager::ITensorPtr BufferManager::gpu(nvinfer1::Dims dims, nvinfer1::Data
     return std::make_unique<DeviceTensor>(dims, type, CudaAllocatorAsync{mStream});
 }
 
+BufferManager::IBufferPtr BufferManager::gpuSync(std::size_t size, nvinfer1::DataType type)
+{
+    return std::make_unique<StaticDeviceBuffer>(size, type, CudaAllocator{});
+}
+
+BufferManager::ITensorPtr BufferManager::gpuSync(nvinfer1::Dims dims, nvinfer1::DataType type)
+{
+    return std::make_unique<StaticDeviceTensor>(dims, type, CudaAllocator{});
+}
+
 BufferManager::IBufferPtr BufferManager::cpu(std::size_t size, nvinfer1::DataType type)
 {
     return std::make_unique<HostBuffer>(size, type);

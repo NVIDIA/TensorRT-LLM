@@ -454,7 +454,7 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
         "prepared_" + s['--dataset-name'].replace('/', '_')
         for s in prompt_datasets_args
     ]
-    max_input_lens = ["512", "20"]
+    max_input_lens = ["256", "20"]
     num_reqs = ["50", "10"]
 
     for prompt_ds_args, tokens_f, len, num_req in zip(prompt_datasets_args,
@@ -474,19 +474,35 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
             prepare_dataset += [k, v]
         run_command(prepare_dataset, cwd=root_dir, timeout=300)
 
+        batching_types = ["IFB", "V1"]
+        api_types = ["gptManager", "executor"]
+
+        for batching_type in batching_types:
+            for api_type in api_types:
+                benchmark = [
+                    str(benchmark_exe_dir / "gptManagerBenchmark"),
+                    "--engine_dir",
+                    str(gpt_engine_dir / "fp16-plugin-packed-paged" /
+                        "tp1-pp1-gpu"), "--type",
+                    str(batching_type), "--api",
+                    str(api_type), "--dataset",
+                    str(data_dir / tokens_f)
+                ]
+                run_command(benchmark, cwd=root_dir, timeout=600)
+
         benchmark = [
             str(benchmark_exe_dir / "gptManagerBenchmark"), "--engine_dir",
             str(gpt_engine_dir / "fp16-plugin-packed-paged" / "tp1-pp1-gpu"),
             "--type", "IFB", "--dataset",
-            str(data_dir / tokens_f)
+            str(data_dir / tokens_f), "--api", "executor", "--streaming"
         ]
         run_command(benchmark, cwd=root_dir, timeout=600)
 
         benchmark = [
             str(benchmark_exe_dir / "gptManagerBenchmark"), "--engine_dir",
             str(gpt_engine_dir / "fp16-plugin-packed-paged" / "tp1-pp1-gpu"),
-            "--type", "V1", "--dataset",
-            str(data_dir / tokens_f)
+            "--type", "IFB", "--dataset",
+            str(data_dir / tokens_f), "--api", "gptManager", "--streaming"
         ]
         run_command(benchmark, cwd=root_dir, timeout=600)
 

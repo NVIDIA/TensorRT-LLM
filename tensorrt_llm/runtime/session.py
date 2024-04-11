@@ -111,6 +111,10 @@ class Session(object):
         '''
         return self._context
 
+    @property
+    def context_mem_size(self) -> int:
+        return self.engine.device_memory_size
+
     def _print_engine_info(self):
         '''print engine info for debug purpose, internal use only.
         '''

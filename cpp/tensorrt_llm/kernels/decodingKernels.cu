@@ -127,17 +127,6 @@ __global__ void gatherTree(gatherTreeParam param)
     }
 }
 
-template <typename T>
-__device__ __forceinline__ T applyLengthPenalty(T logProb, int length, float lengthPenalty)
-{
-    // score = log(prob) / (length ^ lengthPenalty)
-    if (lengthPenalty == 0.0f || length == 1)
-    {
-        return logProb;
-    }
-    return logProb / static_cast<T>(powf(length, lengthPenalty));
-}
-
 struct RankNorm
 {
     int rank;
@@ -292,45 +281,106 @@ void invokeGatherTree(gatherTreeParam param)
     }
 }
 
-__global__ void finalize(int* outputIds, int* sequenceLengths, float* cumLogProbs, float* outputLogProbs,
-    int const* topKOutputIds, int const* topKSequenceLengths, float const* scores, float const* topKCumLogProbs,
-    float const* topKLogProbs, int const* numBeams, int const* inputLengths, int const beamWidth, int const maxSeqLen)
+__global__ void insertUnfinishedPath(BeamHypotheses bh)
 {
-    // outputIds: [bs, beamWidth, maxSeqLen]
-    // sequenceLengths: [bs, beamWidth]
-    // cumLogProbs: [bs, beamWidth]
-    // outputLogProbs: [bs, beamWidth, maxSeqLen]
-    // topKOutputIds: [bs, 2 * beamWidth, maxSeqLen + 1]
-    // topKSequenceLengths: [bs, 2 * beamWidth]
-    // scores: [bs, 2 * beamWidth]
-    // topKCumLogProbs: [bs, 2 * beamWidth]
-    // topKLogProbs: [bs, 2 * beamWidth, maxSeqLen + 1]
-    // numBeams: [bs]
+    int const bid = blockIdx.x;
+    int const nBS{bh.batch_size};
+    int const nBM{bh.beam_width};
 
-    // This kernel do a sorting for scores first, and then put the topKOutputIds
-    // into outputIds by the rank of scores.
-    // Note that we remove the start_token (the id at first position) from topKOutputIds
+    int const tgt_start_idx{bh.num_beams[bid]};
+    int const nMaxSeqLen{bh.max_seq_len};
+    // TODO: nullptr is from [gptDecoder.cpp] GptDecoder<T>::gatherTree, need to be fixed
+    float const length_penalty{bh.length_penalties == nullptr ? 1.0f : bh.length_penalties[bid]};
+
+    if (bh.is_done[bid])
+    {
+        return;
+    }
+
+    // Move unfinished beams from bh.output_ids_src to bh.output_ids_cba
+    for (int i = 0; i < nBM; ++i)
+    {
+        int const src_beam_idx = bid * nBM + i;
+        int const tgt_beam_idx = bid * nBM * 2 + i + tgt_start_idx;
+        int const current_step = bh.seq_len[src_beam_idx] - 1;
+        bh.output_ids_cba[tgt_beam_idx * nMaxSeqLen + current_step]
+            = bh.output_ids_src[src_beam_idx * nMaxSeqLen + current_step];
+        if (bh.log_probs_cba != nullptr && bh.log_probs != nullptr)
+        {
+            bh.log_probs_cba[tgt_beam_idx * nMaxSeqLen + current_step]
+                = bh.log_probs[current_step * nBS * nBM + src_beam_idx];
+        }
+        int prev_id = bh.parent_ids_src[src_beam_idx * nMaxSeqLen + current_step];
+        for (int j = current_step - 1; j >= 0; --j)
+        {
+            bh.output_ids_cba[tgt_beam_idx * nMaxSeqLen + j]
+                = bh.output_ids_src[bid * nBM * nMaxSeqLen + prev_id * nMaxSeqLen + j];
+            if (bh.log_probs_cba != nullptr && bh.log_probs != nullptr)
+            {
+                bh.log_probs_cba[tgt_beam_idx * nMaxSeqLen + j] = bh.log_probs[j * nBS * nBM + bid * nBM + prev_id];
+            }
+            prev_id = bh.parent_ids_src[bid * nBM * nMaxSeqLen + prev_id * nMaxSeqLen + j];
+        }
+        if (bh.log_probs_cba != nullptr && bh.log_probs != nullptr)
+        {
+            prev_id = bh.parent_ids_src[src_beam_idx * nMaxSeqLen + current_step];
+            for (int j = current_step - 1; j >= 0; --j)
+            {
+                bh.log_probs_cba[tgt_beam_idx * nMaxSeqLen + j] = bh.log_probs[j * nBS * nBM + bid * nBM + prev_id];
+                prev_id = bh.parent_ids_src[bid * nBM * nMaxSeqLen + prev_id * nMaxSeqLen + j];
+            }
+        }
+        bh.seq_len_cba[tgt_beam_idx] = bh.seq_len[src_beam_idx];
+        bh.normed_scores_cba[tgt_beam_idx] = applyLengthPenalty(
+            bh.cum_log_probs[src_beam_idx], current_step - bh.input_lengths[src_beam_idx], length_penalty);
+        bh.cum_log_probs_cba[tgt_beam_idx] = bh.cum_log_probs[src_beam_idx];
+        bh.num_beams[bid]++;
+    }
+}
+
+void invokeInsertUnfinishedPath(BeamHypotheses& bh, cudaStream_t stream)
+{
+    insertUnfinishedPath<<<bh.batch_size, 1, 0, stream>>>(bh);
+}
+
+__global__ void finalizeKernel(BeamHypotheses bh)
+{
+    // Do index sort on bh.normed_scores_cba, then move buffers from CBA to output by the order of index
+    // bh.output_ids_cba    -> bh.final_output_ids
+    // bh.seq_len_cba       -> bh.seq_len
+    // bh.cum_log_probs_cba -> bh.cum_log_probs
+    // bh.log_probs_cba     -> bh.log_probs
+
+    int const bid = blockIdx.x;
+    int const tid = threadIdx.x;
+    int const nBM{bh.beam_width};
+    int const nMaxSeqLen{bh.max_seq_len};
+    int const numBeam{bh.num_beams[bid]};
+
+    float const* topKLogProbs{bh.log_probs_cba};
+    float* cumLogProbs{bh.cum_log_probs};
+    float* outputLogProbs{bh.log_probs};
+    int const* inputLengths{bh.input_lengths};
+    int const* topKOutputIds{bh.output_ids_cba};
+    int* outputIds{bh.final_output_ids};
+    int* sequenceLengths{bh.seq_len};
 
     extern __shared__ char array[];
-    int* sRank = (int*) (array);                              // [beamWidth]
-    float* sScores = (float*) (sRank + beamWidth);            // [2 * beamWidth]
-    int* sSequenceLengths = (int*) (sScores + beamWidth * 2); // [beamWidth]
-    int const numBeam = numBeams[blockIdx.x];
-    if (threadIdx.x < numBeam)
+    int* sRank = (int*) (array);                        // [nBM]
+    float* sScores = (float*) (sRank + nBM);            // [2*nBM]
+    int* sSequenceLengths = (int*) (sScores + nBM * 2); // [nBM]
+
+    if (tid < numBeam)
     {
-        sScores[threadIdx.x] = scores[blockIdx.x * beamWidth * 2 + threadIdx.x];
+        sScores[tid] = bh.normed_scores_cba[bid * nBM * 2 + tid];
     }
     __syncthreads();
 
     if (numBeam < 32)
     {
-        int const beamIdx = threadIdx.x;
-        RankNorm rankNorm;
-        rankNorm.rank = beamIdx;
-        rankNorm.norm = beamIdx < numBeam ? sScores[beamIdx] : -FLT_MAX;
-
-        int warpid = threadIdx.x / 32;
-        int laneid = threadIdx.x % 32;
+        int const warpid = tid / 32;
+        int const laneid = tid % 32;
+        RankNorm rankNorm{tid, tid < numBeam ? sScores[tid] : -FLT_MAX};
 
         if (warpid == 0 && numBeam > 1)
         {
@@ -367,23 +417,21 @@ __global__ void finalize(int* outputIds, int* sequenceLengths, float* cumLogProb
             rankNorm = swap(rankNorm, 0x01, bfe(laneid, 4) ^ bfe(laneid, 0));
         }
 
-        if (beamIdx < beamWidth)
+        if (tid < nBM)
         {
-            sRank[beamIdx] = rankNorm.rank;
+            sRank[tid] = rankNorm.rank;
         }
-
         __syncthreads();
     }
     else
     {
-        for (int i = 0; i < beamWidth; i++)
+        for (int i = 0; i < nBM; ++i)
         {
-            float score = threadIdx.x < numBeams[blockIdx.x] ? sScores[threadIdx.x] : -FLT_MAX;
-            float maxScore = blockReduceMax<float>(score);
-
-            if (threadIdx.x == 0)
+            float const score = tid < bh.num_beams[bid] ? sScores[tid] : -FLT_MAX;
+            float const maxScore = blockReduceMax<float>(score);
+            if (tid == 0)
             {
-                for (int j = 0; j < beamWidth * 2; j++)
+                for (int j = 0; j < nBM * 2; ++j)
                 {
                     if (sScores[j] == maxScore)
                     {
@@ -397,64 +445,58 @@ __global__ void finalize(int* outputIds, int* sequenceLengths, float* cumLogProb
         }
     }
 
-    if (threadIdx.x < beamWidth)
+    if (tid < nBM)
     {
-        sSequenceLengths[threadIdx.x] = topKSequenceLengths[blockIdx.x * beamWidth * 2 + sRank[threadIdx.x]];
-        sequenceLengths[blockIdx.x * beamWidth + threadIdx.x] = sSequenceLengths[threadIdx.x];
-
+        sSequenceLengths[tid] = bh.seq_len_cba[bid * nBM * 2 + sRank[tid]];
+        sequenceLengths[bid * nBM + tid] = sSequenceLengths[tid];
         if (cumLogProbs != nullptr)
         {
-            cumLogProbs[blockIdx.x * beamWidth + threadIdx.x]
-                = topKCumLogProbs[blockIdx.x * beamWidth * 2 + sRank[threadIdx.x]];
+            cumLogProbs[bid * nBM + tid] = bh.cum_log_probs_cba[bid * nBM * 2 + sRank[tid]];
         }
     }
     __syncthreads();
 
-    for (int beamIdx = 0; beamIdx < beamWidth; beamIdx++)
+    for (int beamIdx = 0; beamIdx < nBM; beamIdx++)
     {
         // start from step 1 to skip the start token
-        for (int i = threadIdx.x; i < sSequenceLengths[beamIdx]; i += blockDim.x)
+        for (int i = tid; i < sSequenceLengths[beamIdx]; i += blockDim.x)
         {
-            outputIds[blockIdx.x * beamWidth * maxSeqLen + beamIdx * maxSeqLen + i]
-                = topKOutputIds[blockIdx.x * (beamWidth * 2) * maxSeqLen + sRank[beamIdx] * maxSeqLen + i];
+            outputIds[bid * nBM * nMaxSeqLen + beamIdx * nMaxSeqLen + i]
+                = topKOutputIds[bid * (nBM * 2) * nMaxSeqLen + sRank[beamIdx] * nMaxSeqLen + i];
             if (outputLogProbs != nullptr)
             {
-                int inputLen = inputLengths[blockIdx.x * beamWidth + beamIdx];
+                int const inputLen = inputLengths[bid * nBM + beamIdx];
                 if (i >= inputLen)
                 {
-                    outputLogProbs[blockIdx.x * beamWidth * maxSeqLen + beamIdx * maxSeqLen + i - inputLen]
-                        = topKLogProbs[blockIdx.x * (beamWidth * 2) * maxSeqLen + sRank[beamIdx] * maxSeqLen + i];
+                    outputLogProbs[bid * nBM * nMaxSeqLen + beamIdx * nMaxSeqLen + i - inputLen]
+                        = topKLogProbs[bid * (nBM * 2) * nMaxSeqLen + sRank[beamIdx] * nMaxSeqLen + i];
                 }
             }
         }
     }
 }
 
-void invokeFinalize(int* outputIds, int* sequenceLengths, float* cumLogProbs, float* outputLogProbs,
-    int const* topKOutputIds, int const* topKSequenceLengths, float const* scores, float const* topKCumLogProbs,
-    float const* topKLogProbs, int const* numBeams, int const* inputLengths, int const beamWidth, int const maxSeqLen,
-    int const batchSize, cudaStream_t stream)
+void invokeFinalize(BeamHypotheses& bh, cudaStream_t stream)
 {
     TLLM_LOG_DEBUG("%s %s start", __FILE__, __PRETTY_FUNCTION__);
-    dim3 block(beamWidth * 2);
-    block.x = (block.x + 31) / 32 * 32;
-    TLLM_CHECK(block.x < 1024);
-    finalize<<<batchSize, block, beamWidth * sizeof(int) * 2 + (beamWidth * 2) * sizeof(float), stream>>>(outputIds,
-        sequenceLengths, cumLogProbs, outputLogProbs, topKOutputIds, topKSequenceLengths, scores, topKCumLogProbs,
-        topKLogProbs, numBeams, inputLengths, beamWidth, maxSeqLen);
+
+    int const nBM = bh.beam_width;
+    size_t const smem_size = sizeof(int) * nBM * 2 + sizeof(float) * nBM * 2;
+    finalizeKernel<<<bh.batch_size, roundUp(nBM * 2, 32), smem_size, stream>>>(bh);
 }
 
-__global__ void initializeOutput(int* outputIds, int const* endIds, int const maxSeqLen)
+__global__ void initializeOutput(int* finalOutputIds, int const* endIds, int const nMaxSeqLen)
 {
-    for (int i = threadIdx.x; i < maxSeqLen; i += blockDim.x)
+    for (int i = threadIdx.x; i < nMaxSeqLen; i += blockDim.x)
     {
-        outputIds[blockIdx.x * maxSeqLen + i] = endIds[blockIdx.x];
+        finalOutputIds[blockIdx.x * nMaxSeqLen + i] = endIds[blockIdx.x];
     }
 }
 
-void invokeInitializeOutput(int* outputIds, int const* endIds, int batchBeam, int maxSeqLen, cudaStream_t stream)
+void invokeInitializeOutput(
+    int* finalOutputIds, int const* endIds, int const batchBeam, int const nMaxSeqLen, cudaStream_t stream)
 {
-    initializeOutput<<<batchBeam, 256, 0, stream>>>(outputIds, endIds, maxSeqLen);
+    initializeOutput<<<batchBeam, 256, 0, stream>>>(finalOutputIds, endIds, nMaxSeqLen);
 }
 
 __global__ void copyNextStepIds(TokenIdType* nextStepIds, TokenIdType const* const* outputIdsPtr,

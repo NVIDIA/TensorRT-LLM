@@ -223,6 +223,15 @@ def build_gpt(args):
     quant_mode = quant_config.quant_mode
 
     builder = Builder()
+    builder_config_extra_kwargs = {}
+    if get_model_family(args.model) == 'mamba':
+        builder_config_extra_kwargs['mamba_d_state'] = build_config[
+            'mamba_d_state']
+        builder_config_extra_kwargs['mamba_d_conv'] = build_config[
+            'mamba_d_conv']
+        builder_config_extra_kwargs['mamba_expand'] = build_config[
+            'mamba_expand']
+        builder_config_extra_kwargs['max_beam_width'] = max_beam_width
     builder_config = builder.create_builder_config(
         name=args.model,
         precision=args.dtype,
@@ -246,7 +255,8 @@ def build_gpt(args):
         quant_mode=quant_mode,
         use_refit=False,
         opt_level=build_config['builder_opt'],
-        strongly_typed=strongly_typed)
+        strongly_typed=strongly_typed,
+        **builder_config_extra_kwargs)
     engine_name = get_engine_name(args.model, args.dtype, world_size,
                                   runtime_rank)
 
@@ -360,7 +370,8 @@ def build_gpt(args):
         }
         config = PretrainedConfig.from_dict(config)
         tensorrt_llm_model = tensorrt_llm.models.LLaMAForCausalLM(config)
-
+        tensorrt_llm_model = optimize_model(tensorrt_llm_model,
+                                            use_fused_mlp=True)
     elif family == "gptj":
         config = {
             'architecture': 'GPTJForCausalLM',
@@ -524,7 +535,9 @@ def build_gpt(args):
         }
         config = PretrainedConfig.from_dict(config)
         tensorrt_llm_model = tensorrt_llm.models.BloomForCausalLM(config)
-
+        tensorrt_llm_model = optimize_model(
+            tensorrt_llm_model,
+            use_parallel_embedding=config.use_parallel_embedding)
     elif family == "falcon":
         config = {
             'architecture':
@@ -666,32 +679,45 @@ def build_gpt(args):
 
     elif family == "qwen":
         config = {
-            'architecture': 'QWenForCausalLM',
-            'dtype': args.dtype,
-            'num_hidden_layers': build_config['num_layers'],
-            'num_attention_heads': build_config['num_heads'],
-            'hidden_size': build_config['hidden_size'],
-            'intermediate_size': build_config['inter_size'],
-            'num_key_value_heads': num_kv_heads,
-            'vocab_size': build_config['vocab_size'],
-            'position_embedding_type': 'rope_gpt_neox',
-            'max_position_embeddings': build_config['n_positions'],
-            'hidden_act': build_config['hidden_act'],
-            'rotary_base': 10000.0,
-            'norm_epsilon': 1e-06,
+            'architecture':
+            'QWenForCausalLM',
+            'dtype':
+            args.dtype,
+            'num_hidden_layers':
+            build_config['num_layers'],
+            'num_attention_heads':
+            build_config['num_heads'],
+            'num_key_value_heads':
+            build_config['num_heads'] if build_config['num_kv_heads'] is None
+            else build_config['num_kv_heads'],
+            'hidden_size':
+            build_config['hidden_size'],
+            'intermediate_size':
+            build_config['inter_size'],
+            'vocab_size':
+            build_config['vocab_size'],
+            'position_embedding_type':
+            'rope_gpt_neox',
+            'max_position_embeddings':
+            build_config['n_positions'],
+            'hidden_act':
+            build_config['hidden_act'],
             'quantization': {
+                'group_size': 128,
                 'quant_algo': quant_algo,
-                'kv_cache_quant_algo': kv_cache_quant_algo,
-                'group_size': 128
+                'kv_cache_quant_algo': kv_cache_quant_algo
             },
             'mapping': {
                 'world_size': world_size,
-                'tp_size': world_size,
+                'tp_size': world_size
             },
+            'moe_num_experts':
+            build_config["moe_num_experts"],
+            'moe_top_k':
+            build_config["moe_top_k"],
         }
         config = PretrainedConfig.from_dict(config)
         tensorrt_llm_model = tensorrt_llm.models.QWenForCausalLM(config)
-
     elif family == "mamba":
         config = {
             'architecture': 'MambaLMHeadModel',
@@ -715,10 +741,6 @@ def build_gpt(args):
 
     else:
         raise Exception(f'Unexpected model: {args.model}')
-
-    if family in ['llama']:
-        tensorrt_llm_model = optimize_model(tensorrt_llm_model,
-                                            use_fused_mlp=True)
 
     # Module -> Network
     network = builder.create_network()
@@ -1225,13 +1247,20 @@ def build_enc_dec(args):
 def main(args):
     logger.set_level(args.log_level)
     if args.model in get_allowed_models(benchmark_type="gpt"):
-        build_gpt(args)
+        engine = build_gpt(args)[0]
+        engine_size = engine.nbytes
     elif args.model in get_allowed_models(benchmark_type="bert"):
-        build_bert(args)
+        engine = build_bert(args)[0]
+        engine_size = engine.nbytes
     elif args.model in get_allowed_models(benchmark_type="enc_dec"):
-        build_enc_dec(args)
+        encoder_engine, decoder_engine = build_enc_dec(args)[:2]
+        engine_size = encoder_engine.nbytes + decoder_engine.nbytes
     else:
         raise Exception(f'Unexpected model: {args.model}')
+
+    # Print engine size for CI/CD to track.
+    logger.info(
+        f"Total engine size per GPU is {engine_size / 1048576:.2f} MiB.")
 
 
 if __name__ == '__main__':

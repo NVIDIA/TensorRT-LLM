@@ -155,7 +155,7 @@ def attention_qkvpacked_ref(qkv,
                          reorder_ops=reorder_ops)
 
 
-def mamba_conv1d_ref(x, past_conv_state, conv_weight, conv_bias):
+def mamba_conv1d_ref(x, past_conv_state, conv_weight, conv_bias, apply_silu):
     """
     Arguments:
         x: [batch_size, dim, seq_len]
@@ -183,7 +183,7 @@ def mamba_conv1d_ref(x, past_conv_state, conv_weight, conv_bias):
     present_conv_state = padded_x[:, :, -(dconv - 1):]
     x_conv = F.conv1d(padded_x, conv_weight, bias=conv_bias, groups=dim)
 
-    y = F.silu(x_conv)
+    y = F.silu(x_conv) if apply_silu else x_conv
     return y, present_conv_state
 
 

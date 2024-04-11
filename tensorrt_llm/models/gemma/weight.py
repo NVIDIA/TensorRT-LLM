@@ -397,7 +397,7 @@ def load_from_binary(tensorrt_llm_gemma,
     logger.info(f'Weights loaded. Total time: {t}')
 
 
-def load_from_hf_gemma(tensorrt_llm_llama: 'GemmaForCausalLM',
+def load_from_hf_gemma(tensorrt_llm_gemma: 'GemmaForCausalLM',
                        hf_gemma,
                        mapping=Mapping(),
                        dtype='float32',
@@ -405,14 +405,14 @@ def load_from_hf_gemma(tensorrt_llm_llama: 'GemmaForCausalLM',
     logger.info('Loading weights from HF Gemma...')
     tik = time.time()
 
-    quant_mode = getattr(tensorrt_llm_llama, 'quant_mode', QuantMode(0))
+    quant_mode = getattr(tensorrt_llm_gemma, 'quant_mode', QuantMode(0))
     if quant_mode.is_int8_weight_only():
         plugin_weight_only_quant_type = torch.int8
     elif quant_mode.is_int4_weight_only():
         plugin_weight_only_quant_type = torch.quint4x2
     use_weight_only = quant_mode.is_weight_only()
-    num_kv_heads = tensorrt_llm_llama.config.num_key_value_heads
-    mha_mode = (num_kv_heads == tensorrt_llm_llama.config.num_attention_heads)
+    num_kv_heads = tensorrt_llm_gemma.config.num_key_value_heads
+    mha_mode = (num_kv_heads == tensorrt_llm_gemma.config.num_attention_heads)
 
     model_params = dict(hf_gemma.named_parameters())
     # concatenate, duplicate and reshape q, k, v -> qkv
@@ -422,7 +422,7 @@ def load_from_hf_gemma(tensorrt_llm_llama: 'GemmaForCausalLM',
         k_weight = model_params[prefix + 'k_proj.weight']
         v_weight = model_params[prefix + 'v_proj.weight']
         if not mha_mode:
-            head_size = tensorrt_llm_llama.config.hidden_size // tensorrt_llm_llama.config.num_attention_heads
+            head_size = tensorrt_llm_gemma.config.hidden_size // tensorrt_llm_gemma.config.num_attention_heads
             if num_kv_heads < mapping.tp_size:
                 # duplicate the KV heads up to tensor_parallel
                 k_weight = dup_kv_weight(k_weight, num_kv_heads,
@@ -465,13 +465,13 @@ def load_from_hf_gemma(tensorrt_llm_llama: 'GemmaForCausalLM',
                     weights['lm_head.weight'] = split(v, mapping.tp_size,
                                                       mapping.tp_rank)
 
-            if tensorrt_llm_llama.config.use_parallel_embedding:
+            if tensorrt_llm_gemma.config.use_parallel_embedding:
                 v = split(v, mapping.tp_size, mapping.tp_rank,
-                          tensorrt_llm_llama.config.embedding_sharding_dim)
+                          tensorrt_llm_gemma.config.embedding_sharding_dim)
             if mapping.is_first_pp_rank():
                 weights['transformer.vocab_embedding.weight'] = torch_to_numpy(
                     numpy_to_torch(v).to(torch.float32) *
-                    np.sqrt(tensorrt_llm_llama.config.hidden_size))
+                    np.sqrt(tensorrt_llm_gemma.config.hidden_size))
         elif 'model.norm.weight' in k:
             if mapping.is_last_pp_rank():
                 weights['transformer.ln_f.weight'] = torch_to_numpy(
@@ -481,7 +481,7 @@ def load_from_hf_gemma(tensorrt_llm_llama: 'GemmaForCausalLM',
             if mapping.is_last_pp_rank():
                 if vocab_size % mapping.tp_size != 0:
                     # padding
-                    vocab_size_padded = tensorrt_llm_llama.lm_head.out_features * mapping.tp_size
+                    vocab_size_padded = tensorrt_llm_gemma.lm_head.out_features * mapping.tp_size
                     pad_width = vocab_size_padded - vocab_size
                     v = np.pad(v, ((0, pad_width), (0, 0)),
                                'constant',
@@ -535,7 +535,7 @@ def load_from_hf_gemma(tensorrt_llm_llama: 'GemmaForCausalLM',
                         idx)] = split_v
 
             elif 'self_attn.o_proj.weight' in k:
-                # dst = tensorrt_llm_llama.layers[idx].attention.dense.weight
+                # dst = tensorrt_llm_gemma.layers[idx].attention.dense.weight
                 split_v = split(v, mapping.tp_size, mapping.tp_rank, dim=1)
                 if use_weight_only:
                     v = np.ascontiguousarray(split_v.transpose())
@@ -579,7 +579,7 @@ def load_from_hf_gemma(tensorrt_llm_llama: 'GemmaForCausalLM',
                         idx)] = split_v
 
             elif 'mlp.down_proj.weight' in k:
-                # dst = tensorrt_llm_llama.layers[idx].mlp.proj.weight
+                # dst = tensorrt_llm_gemma.layers[idx].mlp.proj.weight
                 split_v = split(v, mapping.tp_size, mapping.tp_rank, dim=1)
                 if use_weight_only:
                     v = np.ascontiguousarray(split_v.transpose())
@@ -599,7 +599,7 @@ def load_from_hf_gemma(tensorrt_llm_llama: 'GemmaForCausalLM',
                     weights['transformer.layers.{}.mlp.proj.weight'.format(
                         idx)] = split_v
             elif 'mlp.gate_proj.weight' in k:
-                # dst = tensorrt_llm_llama.layers[idx].mlp.fc.weight
+                # dst = tensorrt_llm_gemma.layers[idx].mlp.fc.weight
                 split_v = split(v, mapping.tp_size, mapping.tp_rank, dim=0)
                 if use_weight_only:
                     v = np.ascontiguousarray(split_v.transpose())
@@ -686,17 +686,17 @@ def quantize_fp8_weights(weights, num_layers, mapping):
             trt_llm_name = ".".join((trt_llm_prefix, str(l), name, "weight"))
             scale_name = ".".join(
                 (trt_llm_prefix, str(l), name, "weights_scaling_factor"))
-            weight = weights[trt_llm_name]
+            weight = weights[trt_llm_name].float()
             dtype = weights[trt_llm_name].dtype
             scale = get_scaling_factor(weight)
-            scaled_weights[trt_llm_name] = np.ascontiguousarray(
-                (weight * scale).astype(dtype))
-            scaling_factors[scale_name] = np.asarray([1 / scale
-                                                      ]).astype(np.float32)
+            scaled_weights[trt_llm_name] = (weight *
+                                            scale).to(dtype).contiguous()
+            scaling_factors[scale_name] = numpy_to_torch(
+                np.asarray([1 / scale]).astype(np.float32))
     return scaling_factors
 
 
-def load_from_fp8_llama(quant_ckpt_path: str, num_layers: int, mapping: Mapping,
+def load_from_fp8_gemma(quant_ckpt_path: str, num_layers: int, mapping: Mapping,
                         fp8_kv_cache: bool, weight_scales: dict):
     """
     Get the fp8 scaling factors.
@@ -704,17 +704,17 @@ def load_from_fp8_llama(quant_ckpt_path: str, num_layers: int, mapping: Mapping,
     fake_fp8_sf_dt = torch.float32
 
     if quant_ckpt_path is not None and os.path.isfile(quant_ckpt_path):
-        fp8_llama = np.load(quant_ckpt_path)
+        fp8_gemma = np.load(quant_ckpt_path)
     else:
-        fp8_llama = None
+        fp8_gemma = None
         logger.info(
             f"There is not quantized checkpoint, use dummy fp8 scaling factors instead."
         )
     weights = {}
 
-    def get_fp8_llama(name):
-        if fp8_llama is not None:
-            return fp8_llama[name]
+    def get_fp8_gemma(name):
+        if fp8_gemma is not None:
+            return fp8_gemma[name]
         else:
             return torch.tensor([1.0], dtype=fake_fp8_sf_dt).numpy()
 
@@ -724,39 +724,39 @@ def load_from_fp8_llama(quant_ckpt_path: str, num_layers: int, mapping: Mapping,
         tllm_prex = f'transformer.layers.{l-layers_range[0]}'
 
         weights[f'{tllm_prex}.attention.qkv.activation_scaling_factor'] = max(
-            get_fp8_llama(
+            get_fp8_gemma(
                 f'{prefix}:attention:qkv:q:activation_scaling_factor'),
-            get_fp8_llama(
+            get_fp8_gemma(
                 f'{prefix}:attention:qkv:k:activation_scaling_factor'),
-            get_fp8_llama(
+            get_fp8_gemma(
                 f'{prefix}:attention:qkv:v:activation_scaling_factor'))
         weights[f'{tllm_prex}.attention.qkv.weights_scaling_factor'] = max(
-            get_fp8_llama(f'{prefix}:attention:qkv:q:weights_scaling_factor'),
-            get_fp8_llama(f'{prefix}:attention:qkv:k:weights_scaling_factor'),
-            get_fp8_llama(f'{prefix}:attention:qkv:v:weights_scaling_factor'))
+            get_fp8_gemma(f'{prefix}:attention:qkv:q:weights_scaling_factor'),
+            get_fp8_gemma(f'{prefix}:attention:qkv:k:weights_scaling_factor'),
+            get_fp8_gemma(f'{prefix}:attention:qkv:v:weights_scaling_factor'))
         weights[
-            f'{tllm_prex}.attention.dense.activation_scaling_factor'] = get_fp8_llama(
+            f'{tllm_prex}.attention.dense.activation_scaling_factor'] = get_fp8_gemma(
                 f'{prefix}:attention:dense:activation_scaling_factor')
         weights[
-            f'{tllm_prex}.attention.dense.weights_scaling_factor'] = get_fp8_llama(
+            f'{tllm_prex}.attention.dense.weights_scaling_factor'] = get_fp8_gemma(
                 f'{prefix}:attention:dense:weights_scaling_factor')
 
         weights[
-            f'{tllm_prex}.mlp.fc.activation_scaling_factor'] = get_fp8_llama(
+            f'{tllm_prex}.mlp.fc.activation_scaling_factor'] = get_fp8_gemma(
                 f'{prefix}:mlp:fc:activation_scaling_factor')
-        weights[f'{tllm_prex}.mlp.fc.weights_scaling_factor'] = get_fp8_llama(
+        weights[f'{tllm_prex}.mlp.fc.weights_scaling_factor'] = get_fp8_gemma(
             f'{prefix}:mlp:fc:weights_scaling_factor')
 
         weights[
-            f'{tllm_prex}.mlp.gate.activation_scaling_factor'] = get_fp8_llama(
+            f'{tllm_prex}.mlp.gate.activation_scaling_factor'] = get_fp8_gemma(
                 f'{prefix}:mlp:gate:activation_scaling_factor')
-        weights[f'{tllm_prex}.mlp.gate.weights_scaling_factor'] = get_fp8_llama(
+        weights[f'{tllm_prex}.mlp.gate.weights_scaling_factor'] = get_fp8_gemma(
             f'{prefix}:mlp:gate:weights_scaling_factor')
 
         weights[
-            f'{tllm_prex}.mlp.proj.activation_scaling_factor'] = get_fp8_llama(
+            f'{tllm_prex}.mlp.proj.activation_scaling_factor'] = get_fp8_gemma(
                 f'{prefix}:mlp:proj:activation_scaling_factor')
-        weights[f'{tllm_prex}.mlp.proj.weights_scaling_factor'] = get_fp8_llama(
+        weights[f'{tllm_prex}.mlp.proj.weights_scaling_factor'] = get_fp8_gemma(
             f'{prefix}:mlp:proj:weights_scaling_factor')
 
         if fp8_kv_cache:
@@ -765,9 +765,12 @@ def load_from_fp8_llama(quant_ckpt_path: str, num_layers: int, mapping: Mapping,
             weights[
                 f'{tllm_prex}.attention.kv_cache_scaling_factor'] = torch.tensor(
                     [scaling_factor], dtype=fake_fp8_sf_dt).numpy()
-            if fp8_llama is None:
+            if fp8_gemma is None:
                 weights.update(weight_scales)
 
+    for key in weights:
+        if isinstance(weights[key], np.ndarray):
+            weights[key] = numpy_to_torch(weights[key])
     return weights
 
 

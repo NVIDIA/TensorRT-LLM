@@ -251,7 +251,7 @@ _cluster_infos = {
 }
 
 
-def infer_cluster_key() -> str:
+def infer_cluster_key(allow_fallback: bool = False) -> str:
 
     def is_sxm():
         return "SXM" in device_name
@@ -308,10 +308,13 @@ def infer_cluster_key() -> str:
             else:
                 return "V100-PCIe-16GB"
 
-    fallback_key = "A100-SXM-80GB"
-    logger.warning(
-        f"Fail to infer cluster key, use {fallback_key} as fallback.")
-    return fallback_key
+    if allow_fallback:
+        fallback_key = "A100-SXM-80GB"
+        logger.warning(
+            f"Fail to infer cluster key, use {fallback_key} as fallback.")
+        return fallback_key
+    else:
+        return None
 
 
 class CostModel(LowercaseStrEnum, metaclass=BaseEnumMeta):

@@ -68,6 +68,9 @@ TllmRuntime::TllmRuntime(void const* engineData, std::size_t engineSize, nvinfer
     TLLM_CHECK_WITH_INFO(mEngine != nullptr, "Failed to deserialize cuda engine");
     auto const devMemorySize = mEngine->getDeviceMemorySize();
     mEngineBuffer = mBufferManager.gpu(devMemorySize);
+
+    // Print context memory size for CI/CD to track.
+    TLLM_LOG_INFO("Allocated %.2f MiB for execution context memory.", static_cast<double>(devMemorySize) / 1048576.0);
 }
 
 TllmRuntime::TllmRuntime(void const* engineData, std::size_t engineSize)

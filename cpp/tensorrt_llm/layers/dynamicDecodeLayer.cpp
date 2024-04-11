@@ -21,9 +21,8 @@
 #include "tensorrt_llm/kernels/decodingKernels.h"
 #include "tensorrt_llm/kernels/penaltyKernels.h"
 #include "tensorrt_llm/kernels/stopCriteriaKernels.h"
-#include "tensorrt_llm/layers/baseBeamSearchLayer.h"
+#include "tensorrt_llm/layers/beamSearchLayer.h"
 #include "tensorrt_llm/layers/fillBuffers.h"
-#include "tensorrt_llm/layers/onlineBeamSearchLayer.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 
@@ -71,10 +70,10 @@ bool hasDiffRuntimeArgs(DecodingSetupParams const& params)
 } // namespace
 
 template <typename T>
-DynamicDecodeLayer<T>::DynamicDecodeLayer(DecodingMode const& mode, SizeType maxBatchSize, SizeType maxBeamWidth,
-    SizeType vocabSize, SizeType vocabSizePadded, cudaStream_t stream, std::shared_ptr<IAllocator> allocator,
-    cudaDeviceProp* cudaDeviceProp, std::optional<runtime::SizeType> maxTokensPerStep,
-    std::optional<runtime::SizeType> maxNumMedusaHeads)
+DynamicDecodeLayer<T>::DynamicDecodeLayer(DecodingMode const& mode, SizeType const maxBatchSize,
+    SizeType const maxBeamWidth, SizeType const vocabSize, SizeType const vocabSizePadded, cudaStream_t stream,
+    std::shared_ptr<IAllocator> allocator, cudaDeviceProp* cudaDeviceProp,
+    std::optional<runtime::SizeType> maxTokensPerStep, std::optional<runtime::SizeType> maxNumMedusaHeads)
     : BaseLayer(stream, std::move(allocator))
     , mDecodingMode(mode)
     , mMaxBatchSize(maxBatchSize)
@@ -206,8 +205,7 @@ void DynamicDecodeLayer<T>::initializeLayers()
     }
     else if (mDecodingMode.isBeamSearch())
     {
-        mOnlineBeamSearchDecode
-            = std::make_unique<OnlineBeamSearchLayer<T>>(mVocabSize, mVocabSizePadded, mStream, mAllocator);
+        mBeamSearchDecoder = std::make_unique<BeamSearchLayer<T>>(mVocabSize, mVocabSizePadded, mStream, mAllocator);
         mPenaltyWorkspacePrevDevice = mAllocator->reMalloc(mPenaltyWorkspacePrevDevice, workspaceSize, false);
     }
     else if (mDecodingMode.isMedusa())
@@ -278,14 +276,14 @@ void DynamicDecodeLayer<T>::setupLayers(
     else if (mDecodingMode.isBeamSearch())
     { // beam search layer
         TLLM_CHECK_WITH_INFO(beamWidth > 1, "Decoding mode is beam search, but beamWidth <= 1 (%d <= 1)", beamWidth);
-        typename OnlineBeamSearchLayer<T>::SetupParams beamSearchParams;
+        typename BeamSearchLayer<T>::SetupParams beamSearchParams;
 
         beamSearchParams.beam_search_diversity_rate = setupParams.beam_search_diversity_rate;
         beamSearchParams.length_penalty = setupParams.length_penalty;
         beamSearchParams.early_stopping = setupParams.early_stopping;
 
         mHasDiffRuntimeArgs = hasDiffRuntimeArgs(beamSearchParams);
-        mOnlineBeamSearchDecode->setup(batchSize, beamSearchParams);
+        mBeamSearchDecoder->setup(batchSize, beamWidth, beamSearchParams);
     }
     else if (mDecodingMode.isMedusa())
     {
@@ -455,10 +453,10 @@ void DynamicDecodeLayer<T>::layersForward(Tensor& logits, OutputParams& outputs,
         TLLM_CHECK_WITH_INFO(outputs.finished.has_value(), "finished tensor is mandatory in beam search.");
         TLLM_CHECK_WITH_INFO(outputs.cum_log_probs.has_value(), "cum_log_probs tensor is mandatory in beam search.");
 
-        // Because we still not support batch beam search now, so we need to compute
-        // one by one if there are different runtime arguments.
+        // Compute one by one if there are different runtime arguments
+        //     due to Batch-Beam-Search is not supported yet, so we need to compute
         size_t const dynamic_decode_batch_size = mHasDiffRuntimeArgs ? 1 : localBatchSize;
-        auto const dynamic_decode_total_iteration = localBatchSize / dynamic_decode_batch_size;
+        auto const dynamic_decode_total_iteration = mHasDiffRuntimeArgs ? localBatchSize : 1;
 
         for (uint32_t dynamic_ite = 0; dynamic_ite < dynamic_decode_total_iteration; ++dynamic_ite)
         {
@@ -469,36 +467,32 @@ void DynamicDecodeLayer<T>::layersForward(Tensor& logits, OutputParams& outputs,
                 {dynamic_decode_batch_size, logits.shape[1], logits.shape[2]}, dynamic_decode_vocab_size_units_offset);
             auto const end_id_offset
                 = endIds.slice({dynamic_decode_batch_size}, dynamic_ite * dynamic_decode_batch_size);
-            typename BaseBeamSearchLayer<T>::ForwardParams dynamic_decode_input_tensors{step, ite, logits_offset,
-                end_id_offset, *params.src_cache_indirection, static_cast<std::int32_t>(params.max_attention_window),
+
+            typename BeamSearchLayer<T>::ForwardParams forwardParams{step, ite, logits_offset, end_id_offset,
+                *params.src_cache_indirection, static_cast<std::int32_t>(params.max_attention_window),
                 static_cast<std::int32_t>(params.sink_token_length), static_cast<std::int32_t>(maxSeqLen)};
 
             if (params.input_lengths)
             {
-                dynamic_decode_input_tensors.input_lengths
+                forwardParams.input_lengths
                     = params.input_lengths->slice({dynamic_decode_batch_size * beamWidth}, dynamic_id_offset);
             }
 
-            // common outputs
-            typename BaseBeamSearchLayer<T>::BeamSearchOutputParams dynamic_decode_outputs(
+            typename BeamSearchLayer<T>::OutputParams outputParams(
                 outputs.output_ids, outputs.parent_ids.value(), outputs.tgt_cache_indirection.value());
 
-            dynamic_decode_outputs.output_ids_ptr = std::move(outputs.output_ids_ptr);
-            dynamic_decode_outputs.parent_ids_ptr = std::move(outputs.parent_ids_ptr);
-
-            dynamic_decode_outputs.sequence_length
+            outputParams.output_ids_ptr = std::move(outputs.output_ids_ptr);
+            outputParams.parent_ids_ptr = std::move(outputs.parent_ids_ptr);
+            outputParams.sequence_length
                 = outputs.sequence_length->slice({dynamic_decode_batch_size * beamWidth}, dynamic_id_offset);
-            dynamic_decode_outputs.finished
-                = outputs.finished->slice({dynamic_decode_batch_size * beamWidth}, dynamic_id_offset);
-            dynamic_decode_outputs.cum_log_probs
+            outputParams.finished = outputs.finished->slice({dynamic_decode_batch_size * beamWidth}, dynamic_id_offset);
+            outputParams.cum_log_probs
                 = outputs.cum_log_probs->slice({dynamic_decode_batch_size * beamWidth}, dynamic_id_offset);
+            outputParams.output_log_probs = outputs.output_log_probs_tiled;
+            outputParams.beamHypotheses = outputs.beamHypotheses;
 
-            dynamic_decode_outputs.beamHypotheses = outputs.beamHypotheses;
-            dynamic_decode_outputs.output_log_probs = outputs.output_log_probs_tiled;
-
-            // only OnlineBeamSearchLayer support beam_search_diversity_rate
-            // when beamHypotheses is used
-            mOnlineBeamSearchDecode->forward(dynamic_decode_outputs, dynamic_decode_input_tensors);
+            // beam_search_diversity_rate is only supported when using BeamHypotheses
+            mBeamSearchDecoder->forward(outputParams, forwardParams);
         } // end of dynamic_ite
         std::swap(mPenaltyWorkspaceDevice, mPenaltyWorkspacePrevDevice);
     }

@@ -17,6 +17,7 @@
 #pragma once
 
 #include "gptKernels.h"
+#include "tensorrt_llm/kernels/beamSearchKernels.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/runtime/common.h"
 #include <cuda_fp16.h>
@@ -56,13 +57,12 @@ Do gatherTree on beam search to get final result.
 */
 void invokeGatherTree(gatherTreeParam param);
 
-void invokeFinalize(int32_t* outputIds, int32_t* sequenceLengths, float* cumLogProbs, float* outputLogProbs,
-    int32_t const* topKOutputIds, int32_t const* topKSequenceLengths, float const* scores, float const* topKCumLogProbs,
-    float const* topKLogProbs, int32_t const* numBeams, int32_t const* inputLengths, int32_t beamWidth,
-    int32_t maxSeqLen, int32_t batchSize, cudaStream_t stream);
+void invokeInsertUnfinishedPath(BeamHypotheses& bh, cudaStream_t stream);
+
+void invokeFinalize(BeamHypotheses& bh, cudaStream_t stream);
 
 void invokeInitializeOutput(
-    int32_t* outputIds, int32_t const* endIds, int batchBeam, int maxSeqLen, cudaStream_t stream);
+    int32_t* finalOutputIds, int32_t const* endIds, int batchBeam, int maxSeqLen, cudaStream_t stream);
 
 //! \brief Copies last numNewTokens (or 1 if numNewTokens == nullptr) tokens from outputIdsPtr
 //! to nextStepIds according to sequenceLengths.

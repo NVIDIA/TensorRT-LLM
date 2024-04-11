@@ -805,10 +805,11 @@ def cast(input: Tensor, dtype: Union[str, trt.DataType]):
     if not default_net().strongly_typed:
         layer.set_output_type(0, cvt_dtype)
     output = _create_tensor(layer.get_output(0), layer)
-    if input.dtype == str_dtype_to_trt('int8'):
-        layer.get_input(0).set_dynamic_range(-127, 127)
-    if cvt_dtype == str_dtype_to_trt('int8'):
-        layer.get_output(0).set_dynamic_range(-127, 127)
+    if not default_net().strongly_typed:
+        if input.dtype == str_dtype_to_trt('int8'):
+            layer.get_input(0).set_dynamic_range(-127, 127)
+        if cvt_dtype == str_dtype_to_trt('int8'):
+            layer.get_output(0).set_dynamic_range(-127, 127)
 
     return output
 
@@ -3957,7 +3958,8 @@ def gpt_attention(
     assert layer.num_outputs == expected_outputs, \
         f"Plugin outputs number mismatch with expected, got {layer.num_outputs}, expected {expected_outputs}"
 
-    if kv_cache_quant_mode.has_int8_kv_cache() and not paged_kv_cache_flag:
+    if kv_cache_quant_mode.has_int8_kv_cache(
+    ) and not paged_kv_cache_flag and not default_net().strongly_typed:
         # past key value
         layer.get_input(8).set_dynamic_range(-127, 127)
         # present key value
@@ -4520,7 +4522,8 @@ def mamba_conv1d(input: Tensor,
                  dconv: int,
                  dtype: str,
                  host_context_lengths: Optional[Tensor] = None,
-                 slot_mapping: Optional[Tensor] = None):
+                 slot_mapping: Optional[Tensor] = None,
+                 apply_silu: bool = True):
     '''
     Parameters:
         input : Tensor (On GPU)
@@ -4559,6 +4562,10 @@ def mamba_conv1d(input: Tensor,
 
         slot_mapping: Tensor (On GPU) (Optional)
             Real page index in state. Its shape is [dim], used for paged state, each page shape is [dconv, dim]
+
+        apply_silu: bool
+            Is there a SiLU operation after the conv1d? When True apply
+            SiLU activation function after the conv1d.
     '''
     assert host_request_types is not None
     mamba_conv1d_plg_creator = trt.get_plugin_registry().get_plugin_creator(
@@ -4580,9 +4587,12 @@ def mamba_conv1d(input: Tensor,
         "paged_state",
         np.array(np.int8(default_net().plugin_config.paged_state),
                  dtype=np.int8), trt.PluginFieldType.INT8)
+    apply_silu = trt.PluginField("apply_silu",
+                                 np.array(np.int8(apply_silu), dtype=np.int8),
+                                 trt.PluginFieldType.INT8)
 
     pfc = trt.PluginFieldCollection(
-        [dim, dconv, pf_type, remove_input_padding, paged_state])
+        [dim, dconv, pf_type, remove_input_padding, paged_state, apply_silu])
     mamba_conv1d_plug = mamba_conv1d_plg_creator.create_plugin(
         "mamba_conv1d", pfc)
     plug_inputs = [

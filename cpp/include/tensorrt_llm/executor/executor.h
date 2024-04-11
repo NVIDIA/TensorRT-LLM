@@ -334,13 +334,16 @@ public:
     explicit KvCacheConfig(bool enableBlockReuse = false, std::optional<SizeType> const& maxTokens = std::nullopt,
         std::optional<SizeType> const& maxAttentionWindow = std::nullopt,
         std::optional<SizeType> const& sinkTokenLength = std::nullopt,
-        std::optional<FloatType> const& freeGpuMemoryFraction = std::nullopt);
+        std::optional<FloatType> const& freeGpuMemoryFraction = std::nullopt,
+        std::optional<size_t> const& hostCacheSize = std::nullopt, bool onboardBlocks = true);
 
     [[nodiscard]] bool getEnableBlockReuse() const;
     [[nodiscard]] std::optional<SizeType> getMaxTokens() const;
     [[nodiscard]] std::optional<SizeType> getMaxAttentionWindow() const;
     [[nodiscard]] std::optional<SizeType> getSinkTokenLength() const;
     [[nodiscard]] std::optional<FloatType> getFreeGpuMemoryFraction() const;
+    [[nodiscard]] std::optional<size_t> getHostCacheSize() const;
+    [[nodiscard]] bool getOnboardBlocks() const;
 
 private:
     /// @brief Controls if KV cache blocks can be reused for different requests
@@ -362,6 +365,13 @@ private:
     /// If both mMaxTokens and mFreeGpuMemoryFraction are specified, memory corresponding to the minimum will be
     /// allocated.
     std::optional<FloatType> mFreeGpuMemoryFraction;
+
+    /// @brief Size of secondary memory pool in bytes. Default is 0.
+    /// Having a secondary memory pool increases KV cache block reuse potential.
+    std::optional<size_t> mHostCacheSize;
+
+    /// @brief Controls whether offloaded blocks should be onboarded back into primary memory before being reused.
+    bool mOnboardBlocks;
 };
 
 SizeType const kDefaultIterStatsMaxIterations = 1000;

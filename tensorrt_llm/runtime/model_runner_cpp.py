@@ -380,8 +380,6 @@ def _populate_sampling_config(sampling_config: SamplingConfig,
             0] == batch_size, f"sampling_config.length_penalty.shape[0] ({sampling_config.length_penalty.shape[0]}) must equal to batch_size ({batch_size})"
         gpt_sampling_config.length_penalty = sampling_config.length_penalty.tolist(
         )
-    elif sampling_config.length_penalty == 1.0:
-        gpt_sampling_config.length_penalty = None
     else:
         gpt_sampling_config.length_penalty = [sampling_config.length_penalty]
 

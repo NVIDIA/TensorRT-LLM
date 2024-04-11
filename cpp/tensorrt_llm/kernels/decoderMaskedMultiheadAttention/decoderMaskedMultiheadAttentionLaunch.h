@@ -236,8 +236,11 @@ void mmha_launch_kernel_ex(KernelParamsType const& params, KVCacheBuffer const& 
 
     int block_size_factor
         = min(mmha::divUp(params.multi_processor_count * num_blocks_per_sm, kernel_total_blocks), num_blocks_per_sm);
+
     // Max block size is 1024.
-    int dynamic_block_size = min(THDS_PER_BLOCK * block_size_factor, 1024);
+    // Block size can be finetuned by TRTLLM_MMHA_KERNEL_BLOCK_SIZE.
+    int dynamic_block_size
+        = getEnvMmhaKernelBlockSize() > 0 ? getEnvMmhaKernelBlockSize() : min(THDS_PER_BLOCK * block_size_factor, 1024);
 
     // Check if resources are enough for launch.
     int available_blocks = -1;
@@ -291,6 +294,7 @@ void mmha_launch_kernel_ex(KernelParamsType const& params, KVCacheBuffer const& 
             MMHA_KERNEL(1024, false);
         }
         break;
+    default: TLLM_CHECK_WITH_INFO(false, "Wrong kernel block size for launching the MMHA kernel.");
     }
 }
 

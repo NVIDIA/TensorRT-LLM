@@ -6,7 +6,8 @@ import numpy as np
 import tensorrt as trt
 import torch
 
-from tensorrt_llm._utils import trt_dtype_to_np, trt_dtype_to_str
+from tensorrt_llm._utils import (trt_dtype_to_np, trt_dtype_to_str,
+                                 trt_dtype_to_torch)
 from tensorrt_llm.logger import logger
 
 from .pipeline_graph import PipelineGraph
@@ -101,8 +102,7 @@ def get_shape_network(trt_network,
             new_layer = shape_graph.add_layer(layer)
             for i in range(layer.num_outputs):
                 output = layer.get_output(i)
-                # TODO: Remove WAR for INT64 after https://nvbugs/4557631 fixed.
-                if output.dtype in [trt.DataType.BOOL, trt.DataType.INT64]:
+                if output.dtype == trt.DataType.BOOL:
                     proxy_layer = shape_network.add_cast(
                         new_layer.as_trt().get_output(i),
                         trt.DataType.INT32,
@@ -170,8 +170,7 @@ def get_per_layer_graph(
         else:
             is_output_shape = False
         if is_output_shape:
-            # TODO: Remove WAR for INT64 after https://nvbugs/4557631 fixed.
-            if output.dtype in [trt.DataType.BOOL, trt.DataType.INT64]:
+            if output.dtype == trt.DataType.BOOL:
                 proxy_layer = network.add_cast(
                     new_layer.as_trt().get_output(i),
                     trt.DataType.INT32,
@@ -218,9 +217,11 @@ def infer_shapes(network, shapes, values, profile=None):
             else:
                 if shape == []:
                     shape = [1]
-                value = torch.empty(list(shape),
-                                    dtype=torch.int32,
-                                    device="cpu")
+                value = torch.empty(
+                    list(shape),
+                    dtype=trt_dtype_to_torch(output.dtype),
+                    device="cpu",
+                )
                 values[output.name] = value
                 context.set_tensor_address(output.name, value.data_ptr())
     context.infer_shapes()
@@ -282,20 +283,20 @@ def infer_per_layer_shapes(
                 if output_values[i] is not None:
                     values[output.name] = output_values[i]
             return
-    logger.debug(f"infer shapes for layer {layer.name}")
     graph, output_mapping = get_per_layer_graph(layer, shapes, values)
+    dtypes = [
+        trt_dtype_to_str(layer.get_input(i).dtype)
+        for i in range(layer.num_inputs)
+    ]
+    layer_info = (f"type={cache_key[0]}, "
+                  f"attrs={dict(cache_key[1])}, "
+                  f"dtypes={dtypes}, "
+                  f"shapes={list(cache_key[2])}, "
+                  f"values={list(cache_key[3])}")
+    logger.debug(f"infer shapes for layer {layer.name} ({layer_info})")
     try:
         infer_shapes(graph.as_trt(), shapes, values)
     except RuntimeError as e:
-        dtypes = [
-            trt_dtype_to_str(layer.get_input(i).dtype)
-            for i in range(layer.num_inputs)
-        ]
-        layer_info = (f"type={cache_key[0]}, "
-                      f"attrs={dict(cache_key[1])}, "
-                      f"dtypes={dtypes}, "
-                      f"shapes={list(cache_key[2])}, "
-                      f"values={list(cache_key[3])}")
         raise RuntimeError(
             f"infer shapes failed for layer {layer.name} ({layer_info})") from e
     for proxy_output, (output, dtype) in output_mapping.items():

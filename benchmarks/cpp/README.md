@@ -83,6 +83,7 @@ python3 prepare_dataset.py \
     [--time-delay-dist exponential_dist] \
     dataset
     --dataset-name <name of the dataset> \
+    --dataset-split <split of the dataset to use> \
     --dataset-input-key <dataset dictionary key for input> \
     --dataset-prompt-key <dataset dictionary key for prompt> \
     --dataset-output-key <dataset dictionary key for output> \
@@ -99,6 +100,7 @@ python3 prepare_dataset.py \
     --output cnn_dailymail.json
     dataset
     --dataset-name cnn_dailymail \
+    --dataset-split validation \
     --dataset-config-name 3.0.0 \
     --dataset-input-key article \
     --dataset-prompt "Summarize the following article:" \

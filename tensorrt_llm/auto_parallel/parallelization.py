@@ -14,7 +14,7 @@ from filelock import FileLock
 
 from tensorrt_llm._utils import (preview_trt_version, trt_dtype_to_np,
                                  trt_dtype_to_torch)
-from tensorrt_llm.functional import AllReduceStrategy
+from tensorrt_llm.functional import AllReduceConfig, AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.network import (PluginInfo, delete_plugin_info, get_np_weight,
@@ -1590,7 +1590,11 @@ class DistributedGraphGroup(GraphGroupBase):
             pf_strategy = trt.PluginField("strategy",
                                           np.array([int(strategy)], np.int8),
                                           trt.PluginFieldType.INT8)
-            pfc = [group, pf_type, pf_strategy]
+            config = AllReduceConfig(0)
+            pf_config = trt.PluginField("config",
+                                        np.array([int(config)], np.int8),
+                                        trt.PluginFieldType.INT8)
+            pfc = [group, pf_type, pf_strategy, pf_config]
             if self.use_custom_all_reduce:
                 pf_counter = trt.PluginField(
                     "counter",

@@ -125,11 +125,10 @@ def load_dataset_from_hf(dataset_config: DatasetConfig):
               type=str,
               default=None,
               help=f"Dataset config name in HuggingFace (if exists).")
-@click.option(
-    "--dataset-split",
-    type=str,
-    default=None,
-    help=f"Split of the dataset to use. Default will include all splits.")
+@click.option("--dataset-split",
+              type=str,
+              required=True,
+              help=f"Split of the dataset to use.")
 @click.option("--dataset-input-key",
               required=True,
               type=str,
