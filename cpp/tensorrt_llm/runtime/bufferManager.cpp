@@ -27,8 +27,9 @@ using namespace tensorrt_llm::runtime;
 
 namespace tc = tensorrt_llm::common;
 
-BufferManager::BufferManager(CudaStreamPtr stream)
+BufferManager::BufferManager(CudaStreamPtr stream, bool trimPool)
     : mStream{std::move(stream)}
+    , mTrimPool{trimPool}
 {
     TLLM_CHECK_WITH_INFO(static_cast<bool>(mStream), "Undefined CUDA stream");
     thread_local static std::unordered_set<int> initializedDevices(8);
@@ -48,6 +49,16 @@ BufferManager::IBufferPtr BufferManager::gpu(std::size_t size, nvinfer1::DataTyp
 BufferManager::ITensorPtr BufferManager::gpu(nvinfer1::Dims dims, nvinfer1::DataType type) const
 {
     return std::make_unique<DeviceTensor>(dims, type, CudaAllocatorAsync{mStream});
+}
+
+BufferManager::IBufferPtr BufferManager::gpuSync(std::size_t size, nvinfer1::DataType type)
+{
+    return std::make_unique<StaticDeviceBuffer>(size, type, CudaAllocator{});
+}
+
+BufferManager::ITensorPtr BufferManager::gpuSync(nvinfer1::Dims dims, nvinfer1::DataType type)
+{
+    return std::make_unique<StaticDeviceTensor>(dims, type, CudaAllocator{});
 }
 
 BufferManager::IBufferPtr BufferManager::cpu(std::size_t size, nvinfer1::DataType type)
@@ -80,25 +91,30 @@ BufferManager::ITensorPtr BufferManager::pinnedPool(nvinfer1::Dims dims, nvinfer
     return std::make_unique<PinnedPoolTensor>(dims, type);
 }
 
-BufferManager::IBufferPtr BufferManager::managed(std::size_t size, nvinfer1::DataType type) const
+BufferManager::IBufferPtr BufferManager::managed(std::size_t size, nvinfer1::DataType type)
 {
     return std::make_unique<UVMBuffer>(size, type);
 }
 
-BufferManager::ITensorPtr BufferManager::managed(nvinfer1::Dims dims, nvinfer1::DataType type) const
+BufferManager::ITensorPtr BufferManager::managed(nvinfer1::Dims dims, nvinfer1::DataType type)
 {
     return std::make_unique<UVMTensor>(dims, type);
 }
 
 void BufferManager::setZero(IBuffer& buffer) const
 {
+    setMem(buffer, 0);
+}
+
+void BufferManager::setMem(IBuffer& buffer, int32_t value) const
+{
     if (buffer.getMemoryType() == MemoryType::kGPU)
     {
-        TLLM_CUDA_CHECK(cudaMemsetAsync(buffer.data(), 0, buffer.getSizeInBytes(), mStream->get()));
+        TLLM_CUDA_CHECK(cudaMemsetAsync(buffer.data(), value, buffer.getSizeInBytes(), mStream->get()));
     }
     else
     {
-        std::memset(buffer.data(), 0, buffer.getSizeInBytes());
+        std::memset(buffer.data(), value, buffer.getSizeInBytes());
     }
 }
 
@@ -149,8 +165,10 @@ BufferManager::IBufferPtr BufferManager::allocate(
     case MemoryType::kCPU: return cpu(size, type);
     case MemoryType::kGPU: return gpu(size, type);
     case MemoryType::kPINNED: return pinned(size, type);
-    default: TLLM_THROW("Unknown memory type");
+    case MemoryType::kUVM: return managed(size, type);
     }
+
+    TLLM_THROW("Unknown memory type");
 }
 
 BufferManager::ITensorPtr BufferManager::allocate(
@@ -161,8 +179,10 @@ BufferManager::ITensorPtr BufferManager::allocate(
     case MemoryType::kCPU: return cpu(dims, type);
     case MemoryType::kGPU: return gpu(dims, type);
     case MemoryType::kPINNED: return pinned(dims, type);
-    default: TLLM_THROW("Unknown memory type");
+    case MemoryType::kUVM: return managed(dims, type);
     }
+
+    TLLM_THROW("Unknown memory type");
 }
 
 BufferManager::IBufferPtr BufferManager::copyFrom(IBuffer const& src, MemoryType memoryType) const

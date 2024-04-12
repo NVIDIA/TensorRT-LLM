@@ -2,6 +2,23 @@
 
 This document shows how to build and run an Encoder-Decoder (Enc-Dec) model in TensorRT-LLM on NVIDIA GPUs.
 
+## Table of Contents
+
+- [Encoder-Decoder](#encoder-decoder)
+  - [Table of Contents](#table-of-contents)
+  - [Overview](#overview)
+  - [Usage](#usage)
+  - [Encoder-Decoder Model Support](#encoder-decoder-model-support)
+    - [Download weights from HuggingFace Transformers](#download-weights-from-huggingface-transformers)
+    - [Convert and Split Weights](#convert-and-split-weights)
+    - [Build TensorRT engine(s)](#build-tensorrt-engines)
+    - [Run](#run)
+    - [Benchmark](#benchmark)
+    - [Run BART with LoRA](#run-bart-with-lora)
+    - [Reminders](#reminders)
+    - [Attention Scaling Factors](#attention-scaling-factors)
+    - [Run FairSeq NMT (Neural Machine Translation) models](#run-fairseq-nmt-neural-machine-translation-models)
+
 ## Overview
 
 The TensorRT-LLM Enc-Dec implementation can be found in [tensorrt_llm/models/enc_dec/model.py](../../tensorrt_llm/models/enc_dec/model.py). The TensorRT-LLM Enc-Dec example code is located in [`examples/enc_dec`](./):
@@ -69,7 +86,7 @@ We should distinguish between `X` - TP size and `Y` - total number of GPU ranks:
 # Example 1: build t5-small using a single GPU, FP32, running greedy search
 # use_gpt_attention_plugin is necessary in Enc-Dec.
 # Try use_gemm_plugin to prevent accuracy issue.
-# It is recommend to use --remove_input_padding along with --use_gpt_attention_plugin for better performance
+# It is recommended to use --remove_input_padding along with --use_gpt_attention_plugin for better performance
 python build.py --model_type t5 \
                 --weight_dir tmp/trt_models/t5-small/tp1 \
                 -o tmp/trt_engines/t5-small/1-gpu \
@@ -113,6 +130,7 @@ python build.py --model_type t5 \
                 --max_beam_width 3
 
 # Example 4: build bart-large-cnn using a single GPU, FP32, running greedy search
+# Note: non-T5 models can enable FMHA for the encoder part, for FP16/BF16
 python build.py --model_type bart \
                 --weight_dir tmp/trt_models/bart-large-cnn/tp1 \
                 -o tmp/trt_engines/bart-large-cnn/1-gpu \
@@ -120,6 +138,7 @@ python build.py --model_type bart \
                 --remove_input_padding \
                 --use_bert_attention_plugin \
                 --use_gpt_attention_plugin \
+                --enable_context_fmha \
                 --use_gemm_plugin \
                 --dtype float32 \
                 --max_beam_width 1
@@ -148,38 +167,7 @@ python3 run.py --engine_dir tmp/trt_engines/bart-large-cnn/1-gpu/float32/tp1 --e
 
 The benchmark implementation and entrypoint can be found in [`benchmarks/python/benchmark.py`](../../benchmarks/python/benchmark.py). Specifically, [`benchmarks/python/enc_dec_benchmark.py`](../../benchmarks/python/enc_dec_benchmark.py) is the benchmark script for Encoder-Decoder models.
 
-Step 1: In `examples/enc_dec/`:
-
-After downloading the models and converting/splitting the weights, build the engine **without** the `--remove_input_padding` flag and **without** pipeline parallelism.
-
-```bash
-# Example 1: build t5-small using a single GPU, FP32, running greedy search
-python build.py --model_type t5 \
-                --weight_dir tmp/trt_models/t5-small/tp1 \
-                -o tmp/trt_engines/t5-small/1-gpu \
-                --engine_name t5-small \
-                --use_bert_attention_plugin \
-                --use_gpt_attention_plugin \
-                --use_gemm_plugin \
-                --dtype float32 \
-                --max_beam_width 1
-
-# Example 2: build t5-small using 4-way tensor parallelism on a node with 8 GPUs (but only use 4 of them for demonstration purpose), BF16, enabling beam search up to width=3
-python build.py --model_type t5 \
-                --world_size 4 \
-                --tp_size 4 \
-                --gpus_per_node 4 \
-                --weight_dir tmp/trt_models/t5-small/tp4 \
-                -o tmp/trt_engines/t5-small/4-gpu \
-                --engine_name t5-small \
-                --use_bert_attention_plugin \
-                --use_gpt_attention_plugin \
-                --use_gemm_plugin \
-                --dtype bfloat16 \
-                --max_beam_width 3
-```
-
-Step 2: In `benchmarks/python/`:
+In `benchmarks/python/`:
 
 ```bash
 # Example 1: Single-GPU benchmark
@@ -188,7 +176,6 @@ python benchmark.py \
     --batch_size "1;8" \
     --input_output_len "60,20;128,20" \
     --dtype float32 \
-    --engine_dir ../../examples/enc_dec/tmp/trt_engines/t5-small/1-gpu/float32/tp1 \
     --csv # optional
 
 # Example 2: Multi-GPU benchmark
@@ -197,8 +184,71 @@ mpirun --allow-run-as-root -np 4 python benchmark.py \
     --batch_size "1;8" \
     --input_output_len "60,20;128,20" \
     --dtype bfloat16 \
-    --engine_dir ../../examples/enc_dec/tmp/trt_engines/t5-small/4-gpu/bfloat16/tp4 \
     --csv # optional
+```
+
+### Run BART with LoRA
+
+* Download the base model and lora model from HF:
+
+```bash
+git clone https://huggingface.co/facebook/bart-large-cnn tmp/hf_models/bart-large-cnn
+git clone https://huggingface.co/sooolee/bart-large-cnn-samsum-lora tmp/hf_models/bart-large-cnn-samsum-lora
+```
+
+If using customize models, just put both the base model and lora model dirs into `tmp/hf_models`.
+
+* Convert and Split Weights, setting `--hf_lora_dir`.
+
+```bash
+python bart/convert.py \
+        -i tmp/hf_models/bart-large-cnn \
+        -o tmp/trt_models/bart-large-cnn/ \
+        --weight_data_type float16 \
+        --inference_tensor_para_size 1 \
+        --hf_lora_dir tmp/hf_models/bart-large-cnn-samsum-lora/
+```
+
+* Build engine, setting `--use_lora_plugin`.
+
+```bash
+python build.py --model_type bart \
+                --weight_dir tmp/trt_models/bart-large-cnn/tp1 \
+                -o tmp/trt_engines/bart-large-cnn/1-gpu/ \
+                --engine_name bart-large-cnn \
+                --use_bert_attention_plugin \
+                --use_gpt_attention_plugin \
+                --enable_context_fmha \
+                --use_gemm_plugin \
+                --use_lora_plugin \
+                --dtype float16 \
+                --max_beam_width 1
+```
+
+* Run the engine, setting `--lora_dir` and `--lora_task_uids`. `--lora_task_uids` should be set as a list of uids which length equals to batch size. The following example is for batch size = 3:
+
+```bash
+python run.py \
+        --engine_dir tmp/trt_engines/bart-large-cnn/1-gpu/float16/tp1/ \
+        --engine_name bart-large-cnn \
+        --model_name tmp/hf_models/bart-large-cnn \
+        --max_new_token=64 \
+        --num_beams=1 \
+        --lora_dir tmp/hf_models/bart-large-cnn-samsum-lora/ \
+        --lora_task_uids 0 0 0
+```
+
+* Run with multi-loRA, append `--lora_dir` with other lora directories and set `--lora_task_uids` according to the index of the lora directories. Set to "-1" to run with the base model:
+
+```bash
+python run.py \
+        --engine_dir tmp/trt_engines/bart-large-cnn/1-gpu/float16/tp1/ \
+        --engine_name bart-large-cnn \
+        --model_name tmp/hf_models/bart-large-cnn \
+        --max_new_token=64 \
+        --num_beams=1 \
+        --lora_dir tmp/hf_models/bart-large-cnn-samsum-lora/ ... \
+        --lora_task_uids 0 -1 -1 0 0 -1
 ```
 
 ### Reminders
@@ -237,12 +287,14 @@ pushd tmp && (git clone https://github.com/facebookresearch/fairseq.git || true)
 python nmt/convert.py -i tmp/fairseq_models/wmt14 -o tmp/trt_models/wmt14 --weight_data_type float32 --inference_tensor_para_size 1
 
 # Build TensorRT engine(s)
+# Note: non-T5 models can enable FMHA for the encoder part, although only FP16/BF16 precisions are valid
 python build.py --model_type nmt \
         --weight_dir tmp/trt_models/wmt14/tp1/  \
         -o  tmp/trt_engines/wmt14/1-gpu  \
         --engine_name wmt14 \
         --use_bert_attention_plugin \
         --use_gpt_attention_plugin \
+        --enable_context_fmha \
         --dtype float32 \
         --max_beam_width 1
 

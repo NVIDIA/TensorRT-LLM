@@ -16,9 +16,8 @@
 
 #include <gtest/gtest.h>
 
-#include "tensorrt_llm/runtime/worldConfig.h"
-
 #include "tensorrt_llm/common/tllmException.h"
+#include "tensorrt_llm/runtime/worldConfig.h"
 
 namespace tr = tensorrt_llm::runtime;
 namespace tc = tensorrt_llm::common;

@@ -36,8 +36,8 @@ class GPTAttentionPluginCommon : public BasePlugin
 public:
     GPTAttentionPluginCommon() = delete;
 
-    GPTAttentionPluginCommon(int num_heads, int num_kv_heads, int head_size, int unidirectional, float q_scaling,
-        tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
+    GPTAttentionPluginCommon(int layer_idx, int num_heads, int num_kv_heads, int head_size, int unidirectional,
+        float q_scaling, tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
         int rotary_embedding_dim, // for RoPE. Use 0 for non-RoPE
         float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
         float rotary_embedding_scale, int rotary_embedding_max_positions, int tp_size, int tp_rank, // for ALiBi
@@ -46,16 +46,16 @@ public:
         int kv_cache_quant_mode, bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type,
         bool paged_kv_cache, int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length,
         bool qkv_bias_enabled, bool cross_attention = false, int max_distance = 0, bool pos_shift_enabled = false,
-        bool dense_context_fmha = false, bool use_paged_context_fmha = false, bool use_cache = true,
-        bool is_medusa_enabled = false);
+        bool dense_context_fmha = false, bool use_paged_context_fmha = false, bool use_fp8_context_fmha = false,
+        bool use_cache = true, bool is_medusa_enabled = false);
 
-    GPTAttentionPluginCommon(const void* data, size_t length);
+    GPTAttentionPluginCommon(void const* data, size_t length);
 
     ~GPTAttentionPluginCommon() override = default;
 
     template <typename T>
-    int enqueueImpl(const nvinfer1::PluginTensorDesc* inputDesc, const nvinfer1::PluginTensorDesc* outputDesc,
-        const void* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream);
+    int enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
+        void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream);
 
     //! This is called on every trt Engine creation
     int initialize() noexcept override;
@@ -74,12 +74,12 @@ public:
 
     static size_t getCommonSerializationSize() noexcept;
     void serializeCommon(void* buffer) const noexcept;
-    const int getHeadSize(bool checkInit = true) const;
+    int const getHeadSize(bool checkInit = true) const;
 
 protected:
     int getMaxNumSeqLenTile(int batch_beam_size = 1) const;
     size_t getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t nbReq, int32_t max_input_length,
-        int32_t max_kv_cache_len, int32_t cross_qkv_length = 0) const noexcept;
+        int32_t max_kv_cache_len, int32_t cross_qkv_length = 0, int32_t max_num_tokens = 0) const noexcept;
     // total_num_seq is the sum of beam_width for multiple requests
     size_t getWorkspaceSizeForGeneration(
         nvinfer1::DataType type, int32_t total_num_seq, int32_t max_kv_cache_length) const noexcept;
@@ -102,6 +102,7 @@ protected:
         int32_t const* kv_seq_lengths;
         float const* kv_scale_orig_quant;
         float const* kv_scale_quant_orig;
+        float const* attention_output_orig_quant;
         T const* alibi_slopes;
         T* context_buf;
         void* key_value_cache;
@@ -112,7 +113,7 @@ protected:
         int32_t max_blocks_per_sequence;
         void* workspace;
         // optional when relative position
-        const T* relative_attention_bias = nullptr;
+        T const* relative_attention_bias = nullptr;
         int relative_attention_bias_stride = 0;
         // optional when cross attention
         T const* cross_qkv = nullptr;
@@ -122,7 +123,7 @@ protected:
     };
 
     template <typename T, typename KVCacheBuffer>
-    int enqueueContext(const EnqueueContextParams<T, KVCacheBuffer>& params, cudaStream_t stream);
+    int enqueueContext(EnqueueContextParams<T, KVCacheBuffer> const& params, cudaStream_t stream);
 
     template <typename T, typename KVCacheBuffer>
     struct EnqueueGenerationParams
@@ -137,6 +138,7 @@ protected:
         int32_t const* context_lengths;
         float const* kv_scale_orig_quant;
         float const* kv_scale_quant_orig;
+        float const* attention_output_orig_quant;
         T const* alibi_slopes;
         T* context_buf;
         void* key_value_cache;
@@ -154,27 +156,27 @@ protected:
         void* workspace;
         int32_t const* host_past_key_value_lengths;
         // optional when relative position
-        const T* relative_attention_bias = nullptr;
+        T const* relative_attention_bias = nullptr;
         int relative_attention_bias_stride = 0;
         // optional when cross attention
         int32_t const* encoder_input_lengths = nullptr;
         int32_t const* host_context_lengths = nullptr;
         // optional when medusa is used.
-        const bool* medusa_mask = nullptr;
-        const int32_t* medusa_packed_mask = nullptr;
-        const int32_t* medusa_position_offsets = nullptr;
+        bool const* medusa_mask = nullptr;
+        int32_t const* medusa_packed_mask = nullptr;
+        int32_t const* medusa_position_offsets = nullptr;
     };
 
     template <typename T, typename KVCacheBuffer>
-    int enqueueGeneration(const EnqueueGenerationParams<T, KVCacheBuffer>& params, cudaStream_t stream);
+    int enqueueGeneration(EnqueueGenerationParams<T, KVCacheBuffer> const& params, cudaStream_t stream);
 
     // Called in configurePlugin().
     template <typename T, typename KVCacheBuffer>
-    void prepareEnqueueGeneration(const EnqueueGenerationParams<T, KVCacheBuffer>& params);
+    void prepareEnqueueGeneration(EnqueueGenerationParams<T, KVCacheBuffer> const& params);
 
     template <typename T, typename KVCacheBuffer>
     bool convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams& xqaParams,
-        const EnqueueGenerationParams<T, KVCacheBuffer>& generationsParams, bool forConfigurePlugin);
+        EnqueueGenerationParams<T, KVCacheBuffer> const& generationsParams, bool forConfigurePlugin);
 
     bool isRelativePosition() const
     {
@@ -213,6 +215,7 @@ protected:
 
     const std::string mLayerName;
 
+    int mLayerIdx;
     int mNumHeads;
     int mNumKVHeads;
     int mHeadSize;
@@ -240,6 +243,7 @@ protected:
     int mMaxDistance = 0;
     bool mPosShiftEnabled = false;
     bool mPagedContextFMHA = false;
+    bool mFP8ContextFMHA = false;
     bool mDenseContextFMHA = false;
     bool mIsMedusaEnabled = false;
 
@@ -275,10 +279,10 @@ class GPTAttentionPluginCreatorCommon : public BaseCreator
 public:
     GPTAttentionPluginCreatorCommon();
 
-    const nvinfer1::PluginFieldCollection* getFieldNames() noexcept override;
+    nvinfer1::PluginFieldCollection const* getFieldNames() noexcept override;
 
     template <typename T>
-    T* deserializePluginImpl(const char* name, const void* serialData, size_t serialLength) noexcept;
+    T* deserializePluginImpl(char const* name, void const* serialData, size_t serialLength) noexcept;
 
 protected:
     std::vector<nvinfer1::PluginField> mPluginAttributes;

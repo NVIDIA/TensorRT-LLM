@@ -60,7 +60,7 @@ namespace threadblock
 template <typename WarpMma, int kExpansionFactor = 1>
 CUTLASS_DEVICE void run_warp_mma(WarpMma& warp_mma, typename WarpMma::FragmentC& D,
     typename WarpMma::FragmentA const& A, typename WarpMma::FragmentB const& B, typename WarpMma::FragmentC const& C,
-    const int warp_tileB_k_offset)
+    int const warp_tileB_k_offset)
 {
     warp_mma(D, A, B, C);
 }
@@ -68,7 +68,7 @@ CUTLASS_DEVICE void run_warp_mma(WarpMma& warp_mma, typename WarpMma::FragmentC&
 template <typename WarpMma, int kExpansionFactor = WarpMma::kExpansionFactor>
 CUTLASS_DEVICE void run_warp_mma(WarpMma& warp_mma, typename WarpMma::FragmentC& D,
     typename WarpMma::TransformedFragmentA const& A, typename WarpMma::TransformedFragmentB const& B,
-    typename WarpMma::FragmentC const& C, const int warp_tileB_k_offset)
+    typename WarpMma::FragmentC const& C, int const warp_tileB_k_offset)
 {
     warp_mma(D, A, B, C, warp_tileB_k_offset);
 }

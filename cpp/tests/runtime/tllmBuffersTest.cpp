@@ -417,7 +417,7 @@ TEST_F(TllmBuffersTest, PinnedPoolAllocator)
         GTEST_SKIP();
 
     using MemPool = MemoryPool<PinnedAllocator>;
-    auto expectedSize = [](const auto& tensor)
+    auto expectedSize = [](auto const& tensor)
     {
         auto s = tensor()->getSizeInBytes();
         constexpr auto alignment = MemPool::kAlignment;

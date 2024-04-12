@@ -19,7 +19,6 @@ import unittest
 from itertools import product
 
 import numpy as np
-import pytest
 import torch
 from parameterized import parameterized
 from transformers import AutoConfig, AutoModelForCausalLM
@@ -30,10 +29,11 @@ from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-from examples.phi.convert_checkpoint import convert_hf_phi  # isort:skip
+
+from tensorrt_llm.models.phi.convert import convert_hf_weights
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import getSMVersion
+from utils.util import skip_fp32_accum_pre_ampere, unittest_name_func
 
 # Fixed code revision or updated config can break the tests.
 HF_CODE_REVISION = "cb2f4533604d8b67de604e7df03bfe6f3ca22869"
@@ -82,10 +82,6 @@ class TestPhi(unittest.TestCase):
             'vocab_size': hf_config.vocab_size,
             'max_position_embeddings': hf_config.max_position_embeddings,
             'hidden_act': hf_config.hidden_act,
-            'quantization': {
-                'use_weight_only': False,
-                'weight_only_precision': False,
-            },
             'mapping': {
                 'world_size': tensor_parallel,
                 'tp_size': tensor_parallel,
@@ -96,12 +92,7 @@ class TestPhi(unittest.TestCase):
         }
         config = tensorrt_llm.models.PretrainedConfig.from_dict(config)
         config.set_rank(rank)
-        weights = convert_hf_phi(hf_model,
-                                 rank=rank,
-                                 tensor_parallel=tensor_parallel,
-                                 dtype=dtype,
-                                 use_parallel_embedding=False,
-                                 sharding_dim=0)
+        weights = convert_hf_weights(hf_model, dtype=dtype)
         trtllm_model = tensorrt_llm.models.PhiForCausalLM(config)
         trtllm_model.load(weights)
 
@@ -180,15 +171,11 @@ class TestPhi(unittest.TestCase):
         ], [False, True])
         return test_cases
 
-    @parameterized.expand(load_test_cases)
+    @parameterized.expand(load_test_cases, name_func=unittest_name_func)
     def test_phi(self, context_fmha_flag, enable_remove_input_padding):
 
         # Skip tests that are not supported in pre-ampere architecture
-        if getSMVersion() < 80:
-            if context_fmha_flag == ContextFMHAType.enabled_with_fp32_acc:
-                pytest.skip(
-                    "ContextFMHAType with fp32 acc is not supported in pre-ampere architecture"
-                )
+        skip_fp32_accum_pre_ampere(context_fmha_flag)
 
         torch.random.manual_seed(0)
         use_refit = False
@@ -286,13 +273,14 @@ class TestPhi(unittest.TestCase):
         ctx_shape = {k: v.shape for k, v in ctx_buffer.items()}
         shape = (batch_size, 2, gpt_config.num_attention_heads, total_seq_len,
                  gpt_config.hidden_size // gpt_config.num_attention_heads)
+        ctx_buffer[f'host_max_attention_window_sizes'] = torch.tensor(
+            [total_seq_len] * gpt_config.num_hidden_layers, dtype=torch.int32)
+        ctx_shape[f'host_max_attention_window_sizes'] = (
+            gpt_config.num_hidden_layers, )
         for i in range(gpt_config.num_hidden_layers):
             ctx_shape[f'past_key_value_{i}'] = shape
             ctx_buffer[f'past_key_value_{i}'] = key_value_cache_buffers[i]
             ctx_buffer[f'present_key_value_{i}'] = key_value_cache_buffers[i]
-            ctx_buffer[f'host_max_attention_window_size_{i}'] = torch.tensor(
-                [total_seq_len], dtype=torch.int32)
-            ctx_shape[f'host_max_attention_window_size_{i}'] = (1, )
         ctx_buffer['sequence_length'] = sequence_length_buffer
         sequence_length_buffer = torch.add(sequence_length_buffer, step)
         ctx_shape['sequence_length'] = ctx_buffer['sequence_length'].shape
@@ -350,17 +338,18 @@ class TestPhi(unittest.TestCase):
         if enable_remove_input_padding:
             step1_buffer['host_context_lengths'] = gen_context_lengths.cpu()
         step1_shape = {k: v.shape for k, v in step1_buffer.items()}
+        step1_shape[f'host_max_attention_window_sizes'] = (
+            gpt_config.num_hidden_layers, )
         for i in range(gpt_config.num_hidden_layers):
             step1_shape[f'past_key_value_{i}'] = shape
-            step1_shape[f'host_max_attention_window_size_{i}'] = (1, )
         step1_shape['sequence_length'] = (batch_size, )
         step1_shape['host_past_key_value_lengths'] = (batch_size, )
         step1_shape['host_sink_token_length'] = (1, )
+        step1_buffer[f'host_max_attention_window_sizes'] = torch.tensor(
+            [total_seq_len] * gpt_config.num_hidden_layers, dtype=torch.int32)
         for i in range(gpt_config.num_hidden_layers):
             step1_buffer[f'past_key_value_{i}'] = key_value_cache_buffers[i]
             step1_buffer[f'present_key_value_{i}'] = key_value_cache_buffers[i]
-            step1_buffer[f'host_max_attention_window_size_{i}'] = torch.tensor(
-                [total_seq_len], dtype=torch.int32)
         # For step 1, the sequence_lengths = context_lengths + 1.
         sequence_length_buffer = torch.add(sequence_length_buffer, step)
         step1_buffer['sequence_length'] = sequence_length_buffer

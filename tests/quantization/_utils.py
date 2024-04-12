@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import numpy as np
 import torch
 
 import tensorrt_llm
@@ -21,9 +20,25 @@ import tensorrt_llm
 def woq_torch_dtype(dtype):
     if dtype == "float16":
         torch_dtype = torch.half
+    elif dtype == "bfloat16":
+        torch_dtype = torch.bfloat16
     else:
         assert (False)
     return torch_dtype
+
+
+def woq_all_ones(n, k, dtype):
+    torch_dtype = woq_torch_dtype(dtype)
+    # Init operands for multiplication in int32
+    weight = torch.ones((n, k), dtype=torch_dtype)
+    return weight
+
+
+def woq_all_zeros(n, k, dtype):
+    torch_dtype = woq_torch_dtype(dtype)
+    # Init operands for multiplication in int32
+    weight = torch.zeros((n, k), dtype=torch_dtype)
+    return weight
 
 
 def woq_gen_weights(n, k, dtype):
@@ -43,19 +58,6 @@ def woq_conversion(weight, wTypeId):
         assert (False)
     return torch.ops.trtllm._symmetric_quantize_last_axis_of_batched_matrix(
         weight, torch_wTypeId)
-
-
-def woq_groupwise_extract_int4(w_packed, uint4_input=False):
-    w_packed_int8 = w_packed.T.contiguous().view(torch.uint8)
-    w_unpacked_int4 = torch.stack(
-        ((w_packed_int8 % 16).view(-1, 1), (w_packed_int8 // 16).view(-1, 1)),
-        dim=1)
-    # Unpacked uint4s
-    w_unpacked_int4 = w_unpacked_int4.flatten().view(w_packed.shape[1],
-                                                     -1).T.contiguous().int()
-    if not uint4_input:
-        w_unpacked_int4 -= 8
-    return w_unpacked_int4
 
 
 def woq_groupwise_gt_matmul(mat1, ref_torch_weights, bias=torch.Tensor()):
@@ -94,7 +96,7 @@ def woq_gt_matmul(m,
     return ref
 
 
-def woq_assert_colwise_near_eq(ref, act, wTypeId):
+def woq_assert_near_eq(ref, act, wTypeId):
     # match the scale in cpp/tensorrt_llm/kernels/cutlass_kernels/cutlass_preprocessors.cpp
     if wTypeId == 1:
         bits_in_type = 8
@@ -102,21 +104,9 @@ def woq_assert_colwise_near_eq(ref, act, wTypeId):
         bits_in_type = 4
     quant_range_scale = 1.0 / float(1 << (bits_in_type - 1))
 
-    # check each column independently
-    if ref.shape[0] > 1:
-        for col_idx in range(ref.shape[-1]):
-            col = ref[:, col_idx]
-            max_val = torch.max(col).item()
-            atol = (max_val * quant_range_scale) * 1.5  # allow for rounding
-            np.testing.assert_allclose(col.cpu().numpy(),
-                                       act[:, col_idx].cpu().numpy(),
-                                       atol=atol)
-    else:
-        max_val = torch.max(ref).item()
-        atol = (max_val * quant_range_scale) * 1.5  # allow for rounding
-        np.testing.assert_allclose(ref.cpu().numpy(),
-                                   act.cpu().numpy(),
-                                   atol=atol)
+    max_val = torch.max(abs(ref)).item()
+    atol = (max_val * quant_range_scale) * 1.5  # allow for rounding
+    torch.testing.assert_close(ref.cpu(), act.cpu(), atol=atol, rtol=1e-7)
 
 
 def gt_matmul_smooth_quant(mat1, mat2, scale_a_, scale_b_, dtype, bias=None):

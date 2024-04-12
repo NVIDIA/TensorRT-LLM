@@ -85,6 +85,8 @@ class EncDecBuildConfig:
     max_decoder_input_len: Optional[int] = None
     max_output_len: Optional[int] = None
     builder_opt: Optional[int] = None
+    n_mels: Optional[int] = None
+    skip_cross_qkv: bool = False
 
     def __post_init__(self) -> None:
         assert self.head_size is not None
@@ -290,6 +292,42 @@ _allowed_configs = {
                     builder_opt=None,
                     pre_norm=True,
                     do_layer_norm_before=True,
+                )),
+    "starcoder":
+    ModelConfig(name="starcoder_15.5b",
+                family="gpt",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=40,
+                    num_heads=48,
+                    num_kv_heads=1,
+                    hidden_size=6144,
+                    vocab_size=49152,
+                    hidden_act='gelu',
+                    n_positions=8192,
+                    max_batch_size=256,
+                    max_input_len=512,
+                    max_output_len=200,
+                    builder_opt=None,
+                )),
+    "starcoder2_3b":
+    ModelConfig(name="starcoder2_3b",
+                family="gpt",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=30,
+                    num_heads=24,
+                    num_kv_heads=2,
+                    hidden_size=3072,
+                    vocab_size=49152,
+                    hidden_act='gelu',
+                    n_positions=16384,
+                    position_embedding_type='rope_gpt_neox',
+                    rotary_pct=1.0,
+                    max_batch_size=256,
+                    max_input_len=512,
+                    max_output_len=200,
+                    builder_opt=None,
                 )),
     "llama_7b":
     ModelConfig(name="llama_7b",
@@ -704,6 +742,7 @@ _allowed_configs = {
                     hidden_act="relu",
                     n_positions=512,
                     num_buckets=32,
+                    max_distance=128,
                     max_batch_size=8,
                     max_encoder_input_len=1024,
                     max_decoder_input_len=1,
@@ -724,6 +763,7 @@ _allowed_configs = {
                     hidden_act="relu",
                     n_positions=512,
                     num_buckets=32,
+                    max_distance=128,
                     max_batch_size=8,
                     max_encoder_input_len=1024,
                     max_decoder_input_len=1,
@@ -744,6 +784,7 @@ _allowed_configs = {
                     hidden_act="relu",
                     n_positions=512,
                     num_buckets=32,
+                    max_distance=128,
                     max_batch_size=8,
                     max_encoder_input_len=1024,
                     max_decoder_input_len=1,
@@ -764,6 +805,7 @@ _allowed_configs = {
                     hidden_act="relu",
                     n_positions=512,
                     num_buckets=32,
+                    max_distance=128,
                     max_batch_size=8,
                     max_encoder_input_len=1024,
                     max_decoder_input_len=1,
@@ -784,6 +826,7 @@ _allowed_configs = {
                     hidden_act="relu",
                     n_positions=512,
                     num_buckets=32,
+                    max_distance=128,
                     max_batch_size=8,
                     max_encoder_input_len=1024,
                     max_decoder_input_len=1,
@@ -1173,6 +1216,27 @@ _allowed_configs = {
                     mamba_d_state=16,
                     mamba_d_conv=4,
                     mamba_expand=2,
+                )),
+    "whisper_large_v3":
+    ModelConfig(name="whisper_large_v3",
+                family="whisper",
+                benchmark_type="enc_dec",
+                build_config=EncDecBuildConfig(
+                    num_layers=32,
+                    num_decoder_layers=32,
+                    num_heads=20,
+                    head_size=64,
+                    ffn_hidden_size=5120,
+                    hidden_size=1280,
+                    vocab_size=51866,
+                    hidden_act="gelu",
+                    n_positions=448,
+                    n_mels=128,
+                    max_batch_size=8,
+                    max_encoder_input_len=1500,
+                    max_decoder_input_len=1,
+                    max_output_len=200,
+                    builder_opt=None,
                 )),
 }
 

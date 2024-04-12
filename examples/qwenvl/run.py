@@ -29,11 +29,8 @@ from tensorrt_llm.runtime import (ModelConfig, SamplingConfig, Session,
                                   TensorInfo)
 
 
-def get_engine_name(model, dtype, tp_size, pp_size, rank):
-    if pp_size == 1:
-        return '{}_{}_tp{}_rank{}.engine'.format(model, dtype, tp_size, rank)
-    return '{}_{}_tp{}_pp{}_rank{}.engine'.format(model, dtype, tp_size,
-                                                  pp_size, rank)
+def get_engine_name(rank):
+    return 'rank{}.engine'.format(rank)
 
 
 def trt_dtype_to_torch(dtype):
@@ -89,33 +86,40 @@ class QWenInfer(object):
         else:
             raise Exception("unknown chat format ", chat_format)
 
-        use_gpt_attention_plugin = config['plugin_config'][
+        use_gpt_attention_plugin = config['build_config']['plugin_config'][
             'gpt_attention_plugin']
-        remove_input_padding = config['plugin_config']['remove_input_padding']
-        dtype = config['builder_config']['precision']
-        tp_size = config['builder_config']['tensor_parallel']
-        pp_size = config['builder_config']['pipeline_parallel']
+        remove_input_padding = config['build_config']['plugin_config'][
+            'remove_input_padding']
+        dtype = config['pretrained_config']['dtype']
+        tp_size = config['pretrained_config']['mapping']['tp_size']
+        pp_size = config['pretrained_config']['mapping']['pp_size']
         world_size = tp_size * pp_size
         assert world_size == tensorrt_llm.mpi_world_size(), \
             f'Engine world size ({world_size}) != Runtime world size ({tensorrt_llm.mpi_world_size()})'
-        num_heads = config['builder_config']['num_heads'] // world_size
-        max_batch_size = config['builder_config']['max_batch_size']
-        hidden_size = config['builder_config']['hidden_size'] // world_size
-        vocab_size = config['builder_config']['vocab_size']
-        num_layers = config['builder_config']['num_layers']
-        num_kv_heads = config['builder_config'].get('num_kv_heads', num_heads)
-        paged_kv_cache = config['plugin_config']['paged_kv_cache']
-        tokens_per_block = config['plugin_config']['tokens_per_block']
-        max_prompt_embedding_table_size = config['builder_config'].get(
+        num_heads = config['pretrained_config'][
+            'num_attention_heads'] // world_size
+        max_batch_size = config['build_config']['max_batch_size']
+        hidden_size = config['pretrained_config']['hidden_size'] // world_size
+        vocab_size = config['pretrained_config']['vocab_size']
+        num_layers = config['pretrained_config']['num_hidden_layers']
+        num_kv_heads = config['pretrained_config'].get('num_key_value_heads',
+                                                       num_heads)
+        paged_kv_cache = config['build_config']['plugin_config'][
+            'paged_kv_cache']
+        tokens_per_block = config['build_config']['plugin_config'][
+            'tokens_per_block']
+        max_prompt_embedding_table_size = config['build_config'].get(
             'max_prompt_embedding_table_size', 0)
-        quant_mode = QuantMode(config['builder_config']['quant_mode'])
-        if config['builder_config'].get('multi_query_mode', False):
+        quant_mode = QuantMode.from_quant_algo(
+            config['pretrained_config']['quantization']['quant_algo'],
+            config['pretrained_config']['quantization']['kv_cache_quant_algo'])
+        if config['pretrained_config'].get('multi_query_mode', False):
             tensorrt_llm.logger.warning(
                 "`multi_query_mode` config is deprecated. Please rebuild the engine."
             )
             num_kv_heads = 1
         # num_kv_heads = (num_kv_heads + tp_size - 1) // tp_size
-        use_custom_all_reduce = config['plugin_config'].get(
+        use_custom_all_reduce = config['build_config']['plugin_config'].get(
             'use_custom_all_reduce', False)
 
         runtime_rank = tensorrt_llm.mpi_rank()
@@ -139,7 +143,8 @@ class QWenInfer(object):
             dtype=dtype,
             quant_mode=quant_mode,
             use_custom_all_reduce=use_custom_all_reduce,
-            max_prompt_embedding_table_size=max_prompt_embedding_table_size)
+            max_prompt_embedding_table_size=max_prompt_embedding_table_size,
+            max_beam_width=self.num_beams)
         sampling_config = SamplingConfig(
             end_id=eos_token_id,
             pad_id=pad_token_id,
@@ -149,8 +154,7 @@ class QWenInfer(object):
             temperature=1.0,
         )
 
-        engine_name = get_engine_name('qwen', dtype, tp_size, pp_size,
-                                      runtime_rank)
+        engine_name = get_engine_name(runtime_rank)
         serialize_path = os.path.join(self.qwen_engine_dir, engine_name)
         print(f'Loading engine from {serialize_path}')
         return (model_config, sampling_config, runtime_mapping, runtime_rank,
@@ -283,10 +287,12 @@ class QWenInfer(object):
         max_input_length = torch.max(input_lengths).item()
         max_new_tokens = min(max_new_tokens,
                              self.global_max_input_len - max_input_length)
-        self.decoder.setup(batch_size=input_lengths.size(0),
-                           max_context_length=max_input_length,
-                           max_new_tokens=max_new_tokens,
-                           beam_width=num_beams)
+        self.decoder.setup(
+            batch_size=input_lengths.size(0),
+            max_context_length=max_input_length,
+            max_new_tokens=max_new_tokens,
+            beam_width=num_beams,
+        )
         profiler.start("QWen")
         run_time = 1
         for _ in range(run_time):
@@ -299,15 +305,13 @@ class QWenInfer(object):
 
         return output_ids, Qwen_time
 
-    def qwen_infer(
-        self,
-        input_vit,
-        images_path,
-        input_text,
-        max_new_tokens,
-        num_beams=1,
-        history=None,
-    ):
+    def qwen_infer(self,
+                   input_vit,
+                   images_path,
+                   input_text,
+                   max_new_tokens,
+                   num_beams=1,
+                   history=None):
         if images_path is None:
             content_list = []
         else:

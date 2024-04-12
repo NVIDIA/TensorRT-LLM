@@ -9,11 +9,11 @@ param (
 # Respond to non-terminating errors by stopping execution and displaying an error message.
 $ErrorActionPreference = 'Stop'
 
-# Install CUDA 12.2
+# Install CUDA 12.3
 if (-not ($skipCUDA)) {
-    Write-Output "Downloading CUDA 12.2 - this will take a while"
-    Invoke-WebRequest -Uri 'https://developer.download.nvidia.com/compute/cuda/12.2.2/local_installers/cuda_12.2.2_537.13_windows.exe' -OutFile 'cuda_installer.exe'
-    Write-Output "Installing CUDA 12.2 silently - this will take a while"
+    Write-Output "Downloading CUDA 12.3 - this will take a while"
+    Invoke-WebRequest -Uri 'https://developer.download.nvidia.com/compute/cuda/12.3.2/local_installers/cuda_12.3.2_546.12_windows.exe' -OutFile 'cuda_installer.exe'
+    Write-Output "Installing CUDA 12.3 silently - this will take a while"
     Start-Process -Wait -FilePath 'cuda_installer.exe' -ArgumentList '-s'
     Write-Output "Removing CUDA installer"
     Remove-Item -Path 'cuda_installer.exe' -Force

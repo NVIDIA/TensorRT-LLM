@@ -137,6 +137,7 @@ def create_gpt_attention_network(attention_type='gpt2_attention',
                 context_lengths=context_lengths_tensor,
                 cache_indirection=cache_indirection_tensor,
                 host_request_types=host_request_types_tensor,
+                layer_idx=0,
                 num_heads=num_heads,
                 num_kv_heads=1 if enable_multi_query_attention else num_heads,
                 hidden_size_per_head=head_size,
@@ -291,7 +292,7 @@ class NaivePatternRewriter_ReplaceAddWithSub(PatternRewriter):
     def __init__(self):
         super().__init__('replace_add_with_sub',
                          root_layer={trt.LayerType.ELEMENTWISE},
-                         seperate_match_rewrite=True)
+                         separate_match_rewrite=True)
         self.rewrite_count = 0
 
     def match(self, layer: Layer):

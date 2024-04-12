@@ -45,7 +45,8 @@ set(PLUGIN_LISTS
     lookupPlugin
     loraPlugin
     mixtureOfExperts
-    selectiveScanPlugin)
+    selectiveScanPlugin
+    mambaConv1dPlugin)
 
 foreach(PLUGIN_ITER ${PLUGIN_LISTS})
   include_directories(${PLUGIN_ITER})
@@ -114,7 +115,6 @@ target_link_libraries(
   ${PLUGIN_SHARED_TARGET}
   ${CUBLAS_LIB}
   ${CUBLASLT_LIB}
-  ${CUDNN_LIB}
   nvinfer
   ${CUDA_DRV_LIB}
   ${CUDA_RT_LIB}

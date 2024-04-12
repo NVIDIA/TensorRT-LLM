@@ -36,11 +36,11 @@ class Module(object):
         unique_name = current_net._module_call_stack.get_mod_name(self)
         with current_net._module_call_stack.call_stack_mgr() as stack:
             stack.append(unique_name)
-            start_layer_id = current_net.trt_network.num_layers
+            start_layer_idx = current_net.trt_network.num_layers
             output = self.forward(*args, **kwargs)
-            end_layer_id = current_net.trt_network.num_layers
+            end_layer_idx = current_net.trt_network.num_layers
             current_net._module_call_stack.set_layer_range(
-                self, range(start_layer_id, end_layer_id))
+                self, range(start_layer_idx, end_layer_idx))
             return output
 
     def __getattr__(self, name):

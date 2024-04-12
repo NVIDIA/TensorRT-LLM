@@ -32,14 +32,14 @@ namespace common
 {
 
 template <typename T>
-inline __device__ T ldg(const T* val)
+inline __device__ T ldg(T const* val)
 {
     return __ldg(val);
 }
 
 #if ENABLE_BF16
 template <>
-inline __device__ __nv_bfloat162 ldg(const __nv_bfloat162* val)
+inline __device__ __nv_bfloat162 ldg(__nv_bfloat162 const* val)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
     return val[0];
@@ -49,7 +49,7 @@ inline __device__ __nv_bfloat162 ldg(const __nv_bfloat162* val)
 }
 
 template <>
-inline __device__ __nv_bfloat16 ldg(const __nv_bfloat16* val)
+inline __device__ __nv_bfloat16 ldg(__nv_bfloat16 const* val)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
     return val[0];

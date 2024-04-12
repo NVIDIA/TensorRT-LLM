@@ -572,8 +572,8 @@ public:
                 this->warp_tile_iterator_A_.load(warp_frag_A[(warp_mma_k + 1) % 2]);
                 ++this->warp_tile_iterator_A_;
 
-                const int warp_tileB_k_compute_offset = warp_mma_k % Base::kNumKIterationsPerWarpBLoad;
-                const int warp_tileB_k_load_offset = warp_mma_k / Base::kNumKIterationsPerWarpBLoad;
+                int const warp_tileB_k_compute_offset = warp_mma_k % Base::kNumKIterationsPerWarpBLoad;
+                int const warp_tileB_k_load_offset = warp_mma_k / Base::kNumKIterationsPerWarpBLoad;
                 if (warp_tileB_k_compute_offset == Base::kNumKIterationsPerWarpBLoad - 1)
                 {
                     this->warp_tile_iterator_B_.set_kgroup_index(

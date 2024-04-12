@@ -26,6 +26,7 @@ from tensorrt_llm.functional import LayerNormPositionType, LayerNormType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models import quantize_model
 from tensorrt_llm.network import net_guard
+from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
 
 MODEL_ENCODER_NAME = "whisper_encoder"
@@ -59,6 +60,17 @@ def parse_arguments():
                         choices=[
                             "large-v3",
                             "large-v2",
+                            "medium",
+                            "small",
+                            "base",
+                            "tiny",
+                            "medium.en",
+                            "small.en",
+                            "base.en",
+                            "tiny.en",
+                            "distil-large-v2",
+                            "distil-medium.en",
+                            "distil-small.en",
                         ])
     parser.add_argument('--quantize_dir', type=str, default="quantize/1-gpu")
     parser.add_argument('--dtype',
@@ -116,6 +128,9 @@ def parse_arguments():
         action="store_true",
         help='Quantize weights for the various GEMMs to INT4/INT8.'
         'See --weight_only_precision to set the precision')
+    parser.add_argument('--enable_context_fmha',
+                        default=False,
+                        action='store_true')
     parser.add_argument(
         '--weight_only_precision',
         const='int8',
@@ -188,6 +203,7 @@ def build_encoder(model, args):
         num_heads=num_heads,
         hidden_size=hidden_states,
         max_batch_size=max_batch_size,
+        max_beam_width=args.max_beam_width,
         int8=args.quant_mode.has_act_or_weight_quant(),
         n_mels=model_metadata['n_mels'],
         num_languages=model_metadata['n_vocab'] - 51765 -
@@ -202,9 +218,11 @@ def build_encoder(model, args):
     if args.use_weight_only:
         tensorrt_llm_whisper_encoder = quantize_model(
             tensorrt_llm_whisper_encoder, args.quant_mode)
+    use_gemm_woq_plugin = args.use_gemm_plugin and args.use_weight_only
 
     load_encoder_weight(tensorrt_llm_whisper_encoder, model_metadata,
-                        model_params, model_metadata['n_audio_layer'])
+                        model_params, model_metadata['n_audio_layer'],
+                        use_gemm_woq_plugin)
 
     network = builder.create_network()
     network.plugin_config.to_legacy_setting()
@@ -214,9 +232,11 @@ def build_encoder(model, args):
     if args.use_bert_attention_plugin:
         network.plugin_config.set_bert_attention_plugin(
             dtype=args.use_bert_attention_plugin)
+    if args.enable_context_fmha:
+        network.plugin_config.set_context_fmha(ContextFMHAType.enabled)
     if args.remove_input_padding:
         network.plugin_config.enable_remove_input_padding()
-    if args.use_weight_only:
+    if use_gemm_woq_plugin:
         network.plugin_config.set_weight_only_quant_matmul_plugin(
             dtype=args.dtype)
 
@@ -267,6 +287,7 @@ def build_decoder(model, args):
         max_position_embeddings=model_metadata['n_text_ctx'],
         apply_query_key_layer_scaling=False,
         max_batch_size=args.max_batch_size,
+        max_beam_width=args.max_beam_width,
         max_input_len=args.max_input_len,
         max_output_len=args.max_output_len,
         opt_level=None,
@@ -308,11 +329,10 @@ def build_decoder(model, args):
     if args.use_weight_only:
         tensorrt_llm_whisper_decoder = quantize_model(
             tensorrt_llm_whisper_decoder, args.quant_mode)
+    use_gemm_woq_plugin = args.use_gemm_plugin and args.use_weight_only
 
-    load_decoder_weight(
-        tensorrt_llm_whisper_decoder,
-        model_params,
-    )
+    load_decoder_weight(tensorrt_llm_whisper_decoder, model_params,
+                        use_gemm_woq_plugin)
 
     network = builder.create_network()
     network.plugin_config.to_legacy_setting()
@@ -322,8 +342,13 @@ def build_decoder(model, args):
     if args.use_gpt_attention_plugin:
         network.plugin_config.set_gpt_attention_plugin(
             dtype=args.use_gpt_attention_plugin)
+    if args.enable_context_fmha:
+        network.plugin_config.set_context_fmha(ContextFMHAType.enabled)
     if args.remove_input_padding:
         network.plugin_config.enable_remove_input_padding()
+    if use_gemm_woq_plugin:
+        network.plugin_config.set_weight_only_quant_matmul_plugin(
+            dtype=args.dtype)
 
     with net_guard(network):
         inputs = tensorrt_llm_whisper_decoder.prepare_inputs(

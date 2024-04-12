@@ -25,7 +25,7 @@ int main(int argc, char* argv[])
     class TRTLogger : public nvinfer1::ILogger
     {
     public:
-        void log(nvinfer1::ILogger::Severity severity, const char* msg) noexcept override
+        void log(nvinfer1::ILogger::Severity severity, char const* msg) noexcept override
         {
             if (severity <= nvinfer1::ILogger::Severity::kERROR)
                 std::cerr << "[TensorRT-LLM ERR]: " << msg << std::endl;
@@ -42,7 +42,7 @@ int main(int argc, char* argv[])
 
     /* =============== initLibNvInferPlugins =============== */
 
-    typedef bool (*initLibNvInferPlugins_sig)(void*, const void*);
+    typedef bool (*initLibNvInferPlugins_sig)(void*, void const*);
 
     auto initLibNvInferPlugins = getTrtLLMFunction<initLibNvInferPlugins_sig>(
         /*libFileSoName=*/libname,
@@ -51,7 +51,7 @@ int main(int argc, char* argv[])
     std::cout << std::endl;
 
     std::string libNamespace = "tensorrt_llm";
-    const char* libNamespace_cstr = libNamespace.data();
+    char const* libNamespace_cstr = libNamespace.data();
 
     bool status1 = initLibNvInferPlugins(trtLogger, libNamespace_cstr);
     std::cout << "Success Status: " << status1 << std::endl << std::endl;

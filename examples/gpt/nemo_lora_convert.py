@@ -22,21 +22,19 @@ from pathlib import Path
 import numpy as np
 import torch
 import yaml
-from utils.convert import cpu_map_location
-from utils.nemo import unpack_nemo_ckpt
+from convert_checkpoint import cpu_map_location, unpack_nemo_ckpt
 
 from tensorrt_llm._utils import str_dtype_to_torch, to_json_file, torch_to_numpy
-from tensorrt_llm.runtime.lora_manager import (LoraConfig,
-                                               get_all_nemo_lora_weights)
+from tensorrt_llm.lora_manager import LoraManager, get_all_nemo_lora_weights
 
 log_format = "%(asctime)s %(name)s [%(levelname)s] %(message)s"
 logging.basicConfig(format=log_format)
 LOGGER = logging.getLogger(__name__)
 
 
-def get_lora_keys(layer_id):
-    in_key = f'model.language_model.encoder.layers.{layer_id}.self_attention.adapter_layer.lora_kqv_adapter.linear_in.weight'
-    out_key = f'model.language_model.encoder.layers.{layer_id}.self_attention.adapter_layer.lora_kqv_adapter.linear_out.weight'
+def get_lora_keys(layer_idx):
+    in_key = f'model.language_model.encoder.layers.{layer_idx}.self_attention.adapter_layer.lora_kqv_adapter.linear_in.weight'
+    out_key = f'model.language_model.encoder.layers.{layer_idx}.self_attention.adapter_layer.lora_kqv_adapter.linear_out.weight'
     return in_key, out_key
 
 
@@ -57,16 +55,16 @@ def lora_convert(out_dir, lora_config, lora_weights, customization_id,
     config = {"lora_config": {"lora_kqv_adapter": {}}}
     config['lora_config']['precision'] = precision
     layer_weights = get_all_nemo_lora_weights(num_layers, lora_weights)
-    for layer_id in range(num_layers):
-        linear_in_weight = layer_weights[layer_id]['in']
-        linear_out_weight = layer_weights[layer_id]['out']
+    for layer_idx in range(num_layers):
+        linear_in_weight = layer_weights[layer_idx]['in']
+        linear_out_weight = layer_weights[layer_idx]['out']
         config["lora_config"]["lora_kqv_adapter"]["0"] = {
             "key": f"{customization_id}",
             "low_rank": f"{linear_in_weight.shape[0]}",
         }
 
         # do something else here.  just choose some key instead of basing it on the nemo key
-        in_key, out_key = get_lora_keys(layer_id)
+        in_key, out_key = get_lora_keys(layer_idx)
 
         save_val(
             torch_to_numpy(
@@ -94,11 +92,11 @@ def lora_convert_cpp_runtime(out_dir,
     weights = []
     weight_config = []
     layer_weights = get_all_nemo_lora_weights(num_layers, lora_weights)
-    for layer_id in range(num_layers):
-        in_weights = layer_weights[layer_id]['in']
-        out_weights = layer_weights[layer_id]['out']
-        LOGGER.debug(f"layer {layer_id} in_weights: {in_weights.shape}")
-        LOGGER.debug(f"layer {layer_id} out_weights: {out_weights.shape}")
+    for layer_idx in range(num_layers):
+        in_weights = layer_weights[layer_idx]['in']
+        out_weights = layer_weights[layer_idx]['out']
+        LOGGER.debug(f"layer {layer_idx} in_weights: {in_weights.shape}")
+        LOGGER.debug(f"layer {layer_idx} out_weights: {out_weights.shape}")
         in_out_weights = []
         adapter_size = 0
         for w, inout in ((in_weights, "in"), (out_weights, "out")):
@@ -122,7 +120,7 @@ def lora_convert_cpp_runtime(out_dir,
         weights.append(in_out_weights)
         weight_config.append(
             np.array([
-                LoraConfig.LORA_MODULE_IDS["attn_qkv"], layer_id, adapter_size
+                LoraManager.LORA_MODULE_IDS["attn_qkv"], layer_idx, adapter_size
             ],
                      dtype=np.int32))
     all_weights = np.expand_dims(np.stack(weights), 0)

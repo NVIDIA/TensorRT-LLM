@@ -2,6 +2,30 @@
 
 This document shows how to build and run a LLaMA model in TensorRT-LLM on both single GPU, single node multi-GPU and multi-node multi-GPU.
 
+- [LLaMA](#llama)
+  - [Overview](#overview)
+  - [Support Matrix](#support-matrix)
+  - [Usage](#usage)
+    - [Build TensorRT engine(s)](#build-tensorrt-engines)
+      - [LLaMA v2 Updates](#llama-v2-updates)
+    - [Using RoPE Scaling](#using-rope-scaling)
+    - [Long context length](#long-context-length)
+      - [INT8 KV cache](#int8-kv-cache)
+      - [SmoothQuant](#smoothquant)
+      - [FP8 Post-Training Quantization](#fp8-post-training-quantization)
+      - [Groupwise quantization (AWQ/GPTQ)](#groupwise-quantization-awqgptq)
+        - [AWQ](#awq)
+        - [GPTQ](#gptq)
+    - [Run](#run)
+    - [Summarization using the LLaMA model](#summarization-using-the-llama-model)
+      - [Mistral v0.1](#mistral-v01)
+  - [Running CodeLlama](#running-codellama)
+    - [Build](#build)
+    - [Run](#run-1)
+  - [Run LLaMa with LoRA](#run-llama-with-lora)
+    - [Run LLaMa with several lora checkpoints](#run-llama-with-several-lora-checkpoints)
+  - [Run LLaMa with StreamingLLM](#run-llama-with-streamingllm)
+
 ## Overview
 
 The TensorRT-LLM LLaMA implementation can be found in [tensorrt_llm/models/llama/model.py](../../tensorrt_llm/models/llama/model.py). The TensorRT-LLM LLaMA example code is located in [`examples/llama`](./). There is one main file:
@@ -30,11 +54,17 @@ The TensorRT-LLM LLaMA example code locates at [examples/llama](./). It takes HF
 
 ### Build TensorRT engine(s)
 
-Need to prepare the HF LLaMA checkpoint first by following the guides here https://huggingface.co/docs/transformers/main/en/model_doc/llama.
+Please install required packages first to make sure the example uses matched `tensorrt_llm` version:
+
+```bash
+pip install -r requirements.txt
+```
+
+Need to prepare the HF LLaMA checkpoint by following the guides here https://huggingface.co/docs/transformers/main/en/model_doc/llama.
 
 TensorRT-LLM LLaMA builds TensorRT engine(s) from HF checkpoint. If no checkpoint directory is specified, TensorRT-LLM will build engine(s) with dummy weights.
 
-Normally `trtllm-build` only requires single GPU, but if you've already got all the GPUs needed while inferencing, you could enable parallelly building to make the engine building process faster by adding `--workers` argument. Please note that currently `workers` feature only supports single node.
+Normally `trtllm-build` only requires single GPU, but if you've already got all the GPUs needed for inference, you could enable parallel building to make the engine building process faster by adding `--workers` argument. Please note that currently `workers` feature only supports single node.
 
 `--use_fused_mlp` enables GEMM horizontal fusion in gated MLP layer, which reduces input traffic and potentially improves performance. For FP8 PTQ, the downside is slight reduction of accuracy because one of the quantization scaling factors are discarded (accuracy 0.45734 vs 0.45755 for LLaMA-v2 7B using ammo/examples/hf/instruct_eval/mmlu.py).
 
@@ -73,6 +103,16 @@ python convert_checkpoint.py --model_dir ./tmp/llama/7B/ \
 trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_fp16_wq \
             --output_dir ./tmp/llama/7B/trt_engines/weight_only/1-gpu/ \
             --gemm_plugin float16
+
+# Build LLaMA 7B using 2-way auto parallelism.
+python convert_checkpoint.py --model_dir ./tmp/llama/7B/ \
+                            --output_dir ./tllm_checkpoint_1gpu_fp16 \
+                            --dtype float16
+
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_fp16 \
+            --output_dir ./tmp/llama/7B/trt_engines/fp16/2-gpu/ \
+            --gemm_plugin float16 \
+            --auto_parallel 2
 
 # Build LLaMA 7B using 2-way tensor parallelism.
 python convert_checkpoint.py --model_dir ./tmp/llama/7B/ \
@@ -159,7 +199,7 @@ The implementation is identical to Huggingface's.
 Please refer to https://huggingface.co/docs/transformers/model_doc/llama2#transformers.LlamaConfig.rope_scaling for more details.
 
 ### Long context length
-To use the model with Long context lengths, it is necessary to add `--multi_block_mode` in the build command to enable faster decoding in multihead attention.
+To use the model with Long context lengths, it is necessary to add `--multi_block_mode` in the build command to enable faster decoding in multi-head attention.
 
 
 A few LLaMA models are fine-tuned for long context length that TRT-LLM can support today. For example https://huggingface.co/Yukang/LongAlpaca-70B employs rotary scaling plus fine-tuning to support up to 32K context length. The following show the steps for running LongAlpaca-70B in TRT-LLM:
@@ -171,8 +211,6 @@ python convert_checkpoint.py --meta_ckpt_dir ./tmp/LongAlpaca-70B/ \
                             --output_dir ./tllm_checkpoint_8gpu_tp8 \
                             --dtype float16 \
                             --tp_size 8 \
-                            --vocab_size=32001 \
-                            --rotary_scaling linear 8.0
 
 trtllm-build --checkpoint_dir ./tllm_checkpoint_8gpu_tp8 \
             --output_dir ./tmp/llama/70B/trt_engines/fp16/8-gpu/ \
@@ -248,7 +286,8 @@ python convert_checkpoint.py --model_dir ./llama-models/llama-7b-hf   \
 trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_int8_kv_wq \
             --output_dir ./tmp/llama/7B/trt_engines/int8_kv_cache_weight_only/1-gpu \
             --gemm_plugin float16 \
-            --multi_block_mode
+            --multi_block_mode \
+            --strongly_typed
 ```
 
 Test with `../summarize.py`:
@@ -277,6 +316,7 @@ python ../quantization/quantize.py --model_dir /tmp/llama-7b-hf \
 trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_awq_int8_kv_cache \
             --output_dir ./tmp/llama/7B/trt_engines/int8_kv_cache_int4_AWQ/1-gpu/ \
             --gemm_plugin float16 \
+            --strongly_typed
 ```
 
 Test with `../summarize.py`:
@@ -342,12 +382,17 @@ python ../quantization/quantize.py --model_dir ./tmp/llama/70B \
                                    --tp_size 2
 
 # Build trtllm engines from the trtllm checkpoint
+# Enable fp8 context fmha to get further acceleration by setting `--use_fp8_context_fmha enable`
 trtllm-build --checkpoint_dir ./tllm_checkpoint_2gpu_fp8 \
              --output_dir ./engine_outputs \
              --gemm_plugin float16 \
              --strongly_typed \
              --workers 2
 ```
+
+**Note**: A LLaMA 70B model with BF16 is about 140GB, a LLaMA 70B model with FP8 is about 70GB.
+The peak GPU memory consumption when doing FP8 quantizaton is more than 210GB (there is also some activation memory occupation when doing calibration).
+So you need a node with at least 4 H100(A100) to run the quantization command. After quantization, 2 GPUs are okay to for building and run.
 
 #### Groupwise quantization (AWQ/GPTQ)
 One can enable AWQ/GPTQ INT4 weight only quantization with these options when building engine with `trtllm-build`:
@@ -506,26 +551,23 @@ Use the following command to build `CodeLlama-7b-Instruct`:
 ```bash
 python convert_checkpoint.py --model_dir /tmp/CodeLlama-7b-Instruct-hf  \
                              --output_dir ./tllm_checkpoint_1gpu_codellama \
-                             --dtype float16 \
-                             --rotary_base 1000000 \
-                             --vocab_size 32016
+                             --dtype float16
+
 
 trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_codellama \
             --output_dir ./tmp/codellama/trt_engines/fp16/1-gpu/ \
-            --gemm_plugin float16 \
+            --gemm_plugin float16
 ```
 Use the following command to build `CodeLlama-34b-Instruct` for 4 GPUs (TP=4):
 ```bash
 python convert_checkpoint.py --model_dir /tmp/CodeLlama-34b-Instruct-hf  \
                              --output_dir ./tllm_checkpoint_4gpu_codellama \
                              --dtype float16 \
-                             --rotary_base 1000000 \
-                             --vocab_size 32000 \
                              --tp_size 4
 
 trtllm-build --checkpoint_dir ./tllm_checkpoint_4gpu_codellama \
             --output_dir ./tmp/codellama/trt_engines/fp16/4-gpu/ \
-            --gemm_plugin float16 \
+            --gemm_plugin float16
 ```
 
 NOTE: CodeLlama uses the `max_position_embeddings` of 16K.
@@ -536,8 +578,6 @@ Use `--max_input_len` and `--max_output_len` (which defaults to `2048` and `512`
 python convert_checkpoint.py --model_dir /tmp/CodeLlama-34b-Instruct-hf  \
                              --output_dir ./tllm_checkpoint_4gpu_codellama \
                              --dtype float16 \
-                             --rotary_base 1000000 \
-                             --vocab_size 32000 \
                              --tp_size 8 \
                              --use_parallel_embedding
 
@@ -570,23 +610,22 @@ git-lfs clone https://huggingface.co/meta-llama/Llama-2-13b-hf
 git-lfs clone https://huggingface.co/hfl/chinese-llama-2-lora-13b
 ```
 
-* Build engine, setting `--use_lora_plugin` and `--hf_lora_dir`. If lora has separate lm_head and embedding, they will replace lm_head and embedding of base model.
+* Build engine, setting `--lora_plugin` and `--lora_dir`. If lora has separate lm_head and embedding, they will replace lm_head and embedding of base model.
 
 ```bash
-python convert_checkpoint.py --model_dir /tmp/llama-v2-13b-hf \
-                         --output_dir ./tllm_checkpoint_2gpu_lora \
+python convert_checkpoint.py --model_dir Llama-2-13b-hf \
+                         --output_dir ./tllm_checkpoint_2gpu \
                          --dtype float16 \
-                         --tp_size 2 \
-                         --hf_lora_dir /tmp/chinese-llama-2-lora-13b \
-                         --use_fused_mlp
+                         --tp_size 2
 
-trtllm-build --checkpoint_dir ./tllm_checkpoint_2gpu_lora \
+trtllm-build --checkpoint_dir ./tllm_checkpoint_2gpu \
             --output_dir /tmp/new_lora_13b/trt_engines/fp16/2-gpu/ \
             --gemm_plugin float16 \
             --lora_plugin float16 \
             --max_batch_size 1 \
             --max_input_len 512 \
-            --max_output_len 50
+            --max_output_len 50 \
+            --lora_dir chinese-llama-2-lora-13b
 ```
 
 * Run inference. Need to setup the `lora_dir`. Remember to use lora tokenizer because lora model has larger vocab size.
@@ -595,37 +634,36 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_2gpu_lora \
 mpirun -n 2 python ../run.py --engine_dir "/tmp/new_lora_13b/trt_engines/fp16/2-gpu/" \
               --max_output_len 50 \
               --tokenizer_dir "chinese-llama-2-lora-13b/" \
-              --input_text "今天天气很好，我到公园的时后，" \
-              --lora_dir "chinese-llama-2-lora-13b/" \
+              --input_text "今天天气很好，我到公园的时候，" \
               --lora_task_uids 0 \
               --no_add_special_tokens \
               --use_py_session
 
- Input: "今天天气很好，我到公园的时后，"
-Output: "发现公园里人很多，有的在打羽毛球，有的在打乒乓球，有的在跳绳，还有的在跑步。我和妈妈来到一个空地上，我和妈妈一起跳绳，我跳了1"
+ Input: "今天天气很好，我到公园的时候，"
+Output: "发现公园里到处都是人，有的在跑步，有的在打羽毛球，还有的在跳绳，我和妈妈一起在公园里散步，我和妈妈在公园里散步的时候，看见了一位老爷爷在打羽毛球"
 ```
 Users who want to skip LoRA module may pass uid -1 with `--lora_task_uids -1`.
 In that case, the model will not run the LoRA module and the results will be
-different.
+different. Since the LoRA tokenizer, embedding and LM head are still used,
+the results will also be different with vanilla LLaMA and significantly degrade compared with `--lora_task_uids 0`.
 
 ```bash
 mpirun -n 2 python ../run.py --engine_dir "/tmp/new_lora_13b/trt_engines/fp16/2-gpu/" \
               --max_output_len 50 \
               --tokenizer_dir "chinese-llama-2-lora-13b/" \
-              --input_text "今天天气很好，我到公园的时后，" \
-              --lora_dir "chinese-llama-2-lora-13b/" \
+              --input_text "今天天气很好，我到公园的时候，" \
               --lora_task_uids -1 \
               --no_add_special_tokens \
               --use_py_session
 
- Input: "今天天气很好，我到公园的时后，"
-Output: "我看见一个人坐在那边边看书书，我看起来还挺像你，可是我走过过去问了一下他说你是你吗，他说没有，然后我就说你看我看看你像你，他说说你看我像你，我说你是你，他说你是你，"
+ Input: "今天天气很好，我到公园的时候，"
+Output: "看见好多人们都看书，看书书看书书，看书书看书书书书书书书书书书书书书书书书书书书书书书书书书书书书书书书书书书书书"
 ```
 
 ### Run LLaMa with several lora checkpoints
 
 In this section, we show how to run a model with multiple LoRA modules at the same time. Note that if one of the LoRA module has a
-fine-tuned embedding table or logit GEMM, users should guarantee that all the instances of the model can use the same finetuned
+fine-tuned embedding table or logit GEMM, users should guarantee that all the instances of the model can use the same fine-tuned
 embedding table or logit GEMM.
 Here, we use two LoRA checkpoints as examples. These two LoRA checkponits add LoRA modules to `q_proj` and `v_proj`. Because we only
 support adding lora modules on `q`, `k` and `v` at the same time, we need to add `--lora_target_modules "attn_q" "attn_k" "attn_v"`.
@@ -633,7 +671,7 @@ In this case, we assign null pointers for the `k` LoRA module in TensorRT-LLM an
 
 As the rank of the LoRA modules of both checkpoints is 8, we can set `--max_lora_rank 8` to reduce the memory requirement for the LoRA plugin.
 
-In this example, we use a LoRA checkpoint finetuned on the Chinese dataset `luotuo-lora-7b-0.1` and a LoRA checkpoint finetuned on
+In this example, we use a LoRA checkpoint fine-tuned on the Chinese dataset `luotuo-lora-7b-0.1` and a LoRA checkpoint fine-tuned on
 the Japanese dataset `Japanese-Alpaca-LoRA-7b-v0`. For the `lora_manager` to load several checkpoints, we pass several directories
 of LoRA checkpoints at the same time: `--lora_dir  "luotuo-lora-7b-0.1/" "Japanese-Alpaca-LoRA-7b-v0/"`.
 Then, `lora_manager` will assign `lora_task_uids` to these checkpoints. `lora_task_uids -1` is a predefined value, which corresponds to
@@ -647,24 +685,23 @@ git-lfs clone https://huggingface.co/kunishou/Japanese-Alpaca-LoRA-7b-v0
 BASE_LLAMA_MODEL=llama-7b-hf/
 
 python convert_checkpoint.py --model_dir ${BASE_LLAMA_MODEL} \
-                            --output_dir ./tllm_checkpoint_1gpu_lora_rank \
-                            --dtype float16 \
-                            --hf_lora_dir /tmp/Japanese-Alpaca-LoRA-7b-v0 \
-                            --max_lora_rank 8 \
-                            --lora_target_modules "attn_q" "attn_k" "attn_v"
-trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_lora_rank \
+                            --output_dir ./tllm_checkpoint_1gpu \
+                            --dtype float16
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu \
             --output_dir /tmp/llama_7b_with_lora_qkv/trt_engines/fp16/1-gpu/ \
             --gemm_plugin float16 \
             --lora_plugin float16 \
             --max_batch_size 8 \
             --max_input_len 512 \
-            --max_output_len 50
+            --max_output_len 50 \
+            --lora_dir  "luotuo-lora-7b-0.1/" "Japanese-Alpaca-LoRA-7b-v0/" \
+            --max_lora_rank 8 \
+            --lora_target_modules attn_q attn_k attn_v
 
 python ../run.py --engine_dir "/tmp/llama_7b_with_lora_qkv/trt_engines/fp16/1-gpu/" \
               --max_output_len 10 \
               --tokenizer_dir ${BASE_LLAMA_MODEL} \
               --input_text "美国的首都在哪里? \n答案:" "美国的首都在哪里? \n答案:" "美国的首都在哪里? \n答案:" "アメリカ合衆国の首都はどこですか? \n答え:" "アメリカ合衆国の首都はどこですか? \n答え:" "アメリカ合衆国の首都はどこですか? \n答え:" \
-              --lora_dir  "luotuo-lora-7b-0.1/" "Japanese-Alpaca-LoRA-7b-v0/" \
               --lora_task_uids -1 0 1 -1 0 1 \
               --use_py_session --top_p 0.5 --top_k 0
 ```
@@ -699,19 +736,18 @@ We can observe that `luotuo-lora-7b-0.1` produces correct answers on the first s
 
 ## Run LLaMa with StreamingLLM
 
-* Build engine. Set `--enable_pos_shift` to use positions in KV cache for RoPE, and set `--dense_context_fmha` to use dense context fmha in context phase.
+* Build engine. Set `--streamingllm enable` to enable StreamingLLM.
 
 ```bash
 # Build the LLaMA 7B model with StreamingLLM feature using a single GPU and FP16.
 python convert_checkpoint.py --model_dir ./tmp/llama/7B/ \
                          --output_dir ./tllm_checkpoint_1gpu_streamlingllm \
-                         --dtype float16 \
-                         --dense_context_fmha \
-                         --enable_pos_shift
+                         --dtype float16
 
 trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_streamlingllm \
             --output_dir ./tmp/llama/7B/trt_engines/fp16_StreamingLLM/1-gpu/ \
-            --gemm_plugin float16
+            --gemm_plugin float16 \
+            --streamingllm enable
 
 ```
 

@@ -15,6 +15,7 @@ from transformers import AutoConfig, AutoModelForCausalLM
 import tensorrt_llm
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.quantization import QuantAlgo
 
 
 def parse_arguments():
@@ -322,13 +323,9 @@ def load_from_gptq_gptneox(quant_ckpt_path,
         weights['transformer.ln_f.bias'] = b.to(torch_dtype)
     # 4. Weights inside each layer
     num_hidden_layers = hf_config.num_hidden_layers
-    layers_per_pipeline_stage = num_hidden_layers // mapping.pp_size
-    layers_range = list(
-        range(mapping.pp_rank * layers_per_pipeline_stage,
-              (mapping.pp_rank + 1) * layers_per_pipeline_stage, 1))
-
+    layers_range = mapping.pp_layers(num_hidden_layers)
     for l in layers_range:
-        layer_idx = l - mapping.pp_rank * layers_per_pipeline_stage
+        layer_idx = l - layers_range[0]
         prefix = "layers" + split_sym + str(l) + split_sym
         tensorrt_llm.logger.info(f'Process weights in layer: {layer_idx}')
         # layer = tensorrt_llm_llama.layers[layer_idx]
@@ -669,12 +666,12 @@ if __name__ == '__main__':
     plugin_weight_only_quant_type = None
     if args.use_weight_only and args.weight_only_precision == 'int8':
         plugin_weight_only_quant_type = torch.int8
-        quant_algo = 'W8A16'
+        quant_algo = QuantAlgo.W8A16
     elif args.use_weight_only and args.weight_only_precision == 'int4':
         plugin_weight_only_quant_type = torch.quint4x2
-        quant_algo = 'W4A16'
+        quant_algo = QuantAlgo.W4A16
     elif args.use_weight_only and args.weight_only_precision == 'int4_gptq':
-        quant_algo = 'W4A16_GPTQ'
+        quant_algo = QuantAlgo.W4A16_GPTQ
 
     hf_config = AutoConfig.from_pretrained(args.model_dir)
     hf_model = AutoModelForCausalLM.from_pretrained(args.model_dir,

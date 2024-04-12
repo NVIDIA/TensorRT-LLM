@@ -32,6 +32,10 @@ std::shared_ptr<tr::GenerationOutput> GenerationOutput::toTrtLlm() const
 {
     auto output
         = std::make_shared<tr::GenerationOutput>(tr::TorchView::of(ids.value()), tr::TorchView::of(lengths.value()));
+    if (cumLogProbs)
+    {
+        output->cumLogProbs = tr::TorchView::of(cumLogProbs.value());
+    }
     if (logProbs)
     {
         output->logProbs = tr::TorchView::of(logProbs.value());
@@ -60,6 +64,7 @@ void GenerationOutput::initBindings(py::module_& m)
         .def(py::init<GenerationOutput::TensorPtr, GenerationOutput::TensorPtr>(), py::arg("ids"), py::arg("lengths"))
         .def_readwrite("ids", &GenerationOutput::ids)
         .def_readwrite("lengths", &GenerationOutput::lengths)
+        .def_readwrite("cum_log_probs", &GenerationOutput::cumLogProbs)
         .def_readwrite("log_probs", &GenerationOutput::logProbs)
         .def_readwrite("context_logits", &GenerationOutput::contextLogits)
         .def_readwrite("generation_logits", &GenerationOutput::generationLogits)

@@ -16,11 +16,10 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
-
+#include <optional>
 #include <utility>
 
 namespace tensorrt_llm::runtime
@@ -75,7 +74,7 @@ public:
                         // Set to true by decoding if any of the stop conditions are met or if DecodingInput.finished is
                         // true. In beam search and to determine whether to stop according to
                         // DecodingInput.sequenceLimitLength, on gpu
-    TensorPtr finishedSum; // [1], the sum of finished sequences, in pinned memory
+    TensorPtr finishedSum; // [batchSize], the sum of finished sequences per request, in pinned memory
 
     // mandatory parameters for beam search
     TensorPtr logProbs;         // [batchSize, beamWidth, maxSeqLen], must be float*, on gpu
@@ -85,6 +84,18 @@ public:
     TensorPtr cacheIndirection; // [batchSize, beamWidth, maxSeqLen], k/v indirection for next generation step, on gpu
 
     BeamHypotheses beamHypotheses;
+
+    // Medusa
+    class MedusaOutputs
+    {
+    public:
+        TensorPtr medusaNextDraftTokens;       // [maxBatchSize, maxTokensPerStep], on gpu
+        TensorPtr medusaAcceptedTokensLen;     // [maxBatchSize], on gpu
+        TensorPtr medusaAcceptedLengthsCumSum; // [maxBatchSize + 1], on gpu
+        TensorPtr medusaPathsOffsets;          // [maxBatchSize * maxNumHeads], on gpu
+    };
+
+    std::optional<MedusaOutputs> medusaOutputs;
 };
 
 } // namespace tensorrt_llm::runtime

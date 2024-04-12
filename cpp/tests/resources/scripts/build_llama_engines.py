@@ -24,22 +24,31 @@ from build_engines_utils import run_command, wincopy
 
 def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, *args):
 
-    covert_cmd = [_sys.executable, "examples/llama/convert_checkpoint.py"] + (
-        ['--model_dir', str(weight_dir)] if weight_dir else []) + [
-            '--output_dir', str(engine_dir), '--dtype=float16'
-        ] + list(args)
+    ckpt_dir = engine_dir / 'ckpt'
+
+    covert_cmd = [_sys.executable, "examples/llama/convert_checkpoint.py"
+                  ] + ([f'--model_dir={weight_dir}'] if weight_dir else []) + [
+                      f'--output_dir={ckpt_dir}',
+                      '--dtype=float16',
+                  ] + list(args)
 
     run_command(covert_cmd)
 
-    build_args = ["trtllm-build"] + (
-        ['--checkpoint_dir', str(engine_dir)] if engine_dir else []) + [
-            '--output_dir',
-            str(engine_dir), '--gpt_attention_plugin=float16',
-            '--use_custom_all_reduce=enable', '--gemm_plugin=float16',
-            '--max_batch_size=32', '--max_input_len=40', '--max_output_len=20',
-            '--max_beam_width=2', '--log_level=error',
-            '--paged_kv_cache=enable', '--remove_input_padding=enable'
-        ]
+    build_args = [
+        'trtllm-build',
+        f'--checkpoint_dir={ckpt_dir}',
+        f'--output_dir={engine_dir}',
+        '--gpt_attention_plugin=float16',
+        '--use_custom_all_reduce=enable',
+        '--gemm_plugin=float16',
+        '--max_batch_size=32',
+        '--max_input_len=40',
+        '--max_output_len=20',
+        '--max_beam_width=2',
+        '--log_level=error',
+        '--paged_kv_cache=enable',
+        '--remove_input_padding=enable',
+    ]
 
     run_command(build_args)
 

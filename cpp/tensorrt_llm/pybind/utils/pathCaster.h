@@ -35,18 +35,18 @@ struct PathCaster
 {
 
 private:
-    static PyObject* unicode_from_fs_native(const std::string& w)
+    static PyObject* unicode_from_fs_native(std::string const& w)
     {
         return PyUnicode_DecodeFSDefaultAndSize(w.c_str(), ssize_t(w.size()));
     }
 
-    static PyObject* unicode_from_fs_native(const std::wstring& w)
+    static PyObject* unicode_from_fs_native(std::wstring const& w)
     {
         return PyUnicode_FromWideChar(w.c_str(), ssize_t(w.size()));
     }
 
 public:
-    static handle cast(const T& path, return_value_policy, handle)
+    static handle cast(T const& path, return_value_policy, handle)
     {
         if (auto py_str = unicode_from_fs_native(path.native()))
         {

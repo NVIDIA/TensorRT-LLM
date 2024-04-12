@@ -191,7 +191,7 @@ struct TensorDataType<int*>
 };
 
 template <>
-struct TensorDataType<const int*>
+struct TensorDataType<int const*>
 {
     static constexpr DataType value = TYPE_INT32_PTR;
 };
@@ -419,8 +419,8 @@ private:
 
 public:
     TensorMap() = default;
-    TensorMap(const std::unordered_map<std::string, Tensor>& tensor_map);
-    TensorMap(const std::vector<Tensor>& tensor_map);
+    TensorMap(std::unordered_map<std::string, Tensor> const& tensor_map);
+    TensorMap(std::vector<Tensor> const& tensor_map);
     TensorMap(std::initializer_list<std::pair<std::string, Tensor>> tensor_map);
     ~TensorMap();
 
@@ -429,7 +429,7 @@ public:
         return tensor_map_.size();
     }
 
-    inline bool contains(const std::string& key) const
+    inline bool contains(std::string const& key) const
     {
         TLLM_LOG_TRACE("%s for key: %s", __PRETTY_FUNCTION__, key.c_str());
         return tensor_map_.find(key) != tensor_map_.end();
@@ -437,7 +437,7 @@ public:
 
     std::vector<std::string> keys() const;
 
-    inline void insert(const std::string& key, const Tensor& value)
+    inline void insert(std::string const& key, Tensor const& value)
     {
         TLLM_CHECK_WITH_INFO(!contains(key), fmtstr("Duplicated key %s", key.c_str()));
         TLLM_CHECK_WITH_INFO(
@@ -445,7 +445,7 @@ public:
         tensor_map_.insert({key, value});
     }
 
-    inline void insertIfValid(const std::string& key, const Tensor& value)
+    inline void insertIfValid(std::string const& key, Tensor const& value)
     {
         if (value.isValid())
         {
@@ -462,7 +462,7 @@ public:
     Tensor at(int tmp) = delete;
     Tensor at(size_t tmp) = delete;
 
-    inline Tensor& at(const std::string& key)
+    inline Tensor& at(std::string const& key)
     {
         TLLM_LOG_TRACE("%s for key %s", __PRETTY_FUNCTION__, key.c_str());
         TLLM_CHECK_WITH_INFO(contains(key),
@@ -471,7 +471,7 @@ public:
         return tensor_map_.at(key);
     }
 
-    inline Tensor at(const std::string& key) const
+    inline Tensor at(std::string const& key) const
     {
         TLLM_CHECK_WITH_INFO(contains(key),
             fmtstr(
@@ -479,7 +479,7 @@ public:
         return tensor_map_.at(key);
     }
 
-    inline std::optional<Tensor> atOpt(const std::string& key) const
+    inline std::optional<Tensor> atOpt(std::string const& key) const
     {
         if (contains(key))
             return tensor_map_.at(key);
@@ -487,7 +487,7 @@ public:
             return std::nullopt;
     }
 
-    inline Tensor& at(const std::string& key, Tensor& default_tensor)
+    inline Tensor& at(std::string const& key, Tensor& default_tensor)
     {
         TLLM_LOG_TRACE("%s for key %s", __PRETTY_FUNCTION__, key.c_str());
         if (contains(key))
@@ -497,7 +497,7 @@ public:
         return default_tensor;
     }
 
-    inline Tensor at(const std::string& key, Tensor& default_tensor) const
+    inline Tensor at(std::string const& key, Tensor& default_tensor) const
     {
         TLLM_LOG_TRACE("%s for key %s", __PRETTY_FUNCTION__, key.c_str());
         if (contains(key))
@@ -507,7 +507,7 @@ public:
         return default_tensor;
     }
 
-    inline Tensor& at(const std::string& key, Tensor&& default_tensor)
+    inline Tensor& at(std::string const& key, Tensor&& default_tensor)
     {
         TLLM_LOG_TRACE("%s for key %s", __PRETTY_FUNCTION__, key.c_str());
         if (contains(key))
@@ -517,7 +517,7 @@ public:
         return default_tensor;
     }
 
-    inline Tensor at(const std::string& key, Tensor&& default_tensor) const
+    inline Tensor at(std::string const& key, Tensor&& default_tensor) const
     {
         if (contains(key))
         {
@@ -527,7 +527,7 @@ public:
     }
 
     template <typename T>
-    inline T getVal(const std::string& key) const
+    inline T getVal(std::string const& key) const
     {
         TLLM_CHECK_WITH_INFO(contains(key),
             fmtstr(
@@ -536,7 +536,7 @@ public:
     }
 
     template <typename T>
-    inline std::optional<T> getValOpt(const std::string& key) const
+    inline std::optional<T> getValOpt(std::string const& key) const
     {
         if (contains(key))
         {
@@ -549,7 +549,7 @@ public:
     }
 
     template <typename T>
-    inline T getVal(const std::string& key, T default_value) const
+    inline T getVal(std::string const& key, T default_value) const
     {
         if (contains(key))
         {
@@ -559,7 +559,7 @@ public:
     }
 
     template <typename T>
-    inline T getValWithOffset(const std::string& key, size_t index) const
+    inline T getValWithOffset(std::string const& key, size_t index) const
     {
         TLLM_CHECK_WITH_INFO(contains(key),
             fmtstr(
@@ -568,7 +568,7 @@ public:
     }
 
     template <typename T>
-    inline T getValWithOffset(const std::string& key, size_t index, T default_value) const
+    inline T getValWithOffset(std::string const& key, size_t index, T default_value) const
     {
         if (contains(key))
         {
@@ -578,7 +578,7 @@ public:
     }
 
     template <typename T>
-    inline T* getPtr(const std::string& key) const
+    inline T* getPtr(std::string const& key) const
     {
         TLLM_CHECK_WITH_INFO(contains(key),
             fmtstr(
@@ -587,7 +587,7 @@ public:
     }
 
     template <typename T>
-    inline T* getPtr(const std::string& key, T* default_ptr) const
+    inline T* getPtr(std::string const& key, T* default_ptr) const
     {
         if (contains(key))
         {
@@ -597,7 +597,7 @@ public:
     }
 
     template <typename T>
-    inline T* getPtrWithOffset(const std::string& key, size_t index) const
+    inline T* getPtrWithOffset(std::string const& key, size_t index) const
     {
         TLLM_CHECK_WITH_INFO(contains(key),
             fmtstr(
@@ -606,7 +606,7 @@ public:
     }
 
     template <typename T>
-    inline T* getPtrWithOffset(const std::string& key, size_t index, T* default_ptr) const
+    inline T* getPtrWithOffset(std::string const& key, size_t index, T* default_ptr) const
     {
         if (contains(key))
         {

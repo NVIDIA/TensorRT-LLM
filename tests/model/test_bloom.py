@@ -12,8 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
-import sys
 import tempfile
 import unittest
 from itertools import product
@@ -24,6 +22,9 @@ import pytest
 # isort: off
 import torch
 # isort: on
+import os
+import sys
+
 from parameterized import parameterized
 from transformers import BloomConfig, BloomForCausalLM
 
@@ -36,10 +37,11 @@ from tensorrt_llm.runtime import ModelConfig, SamplingConfig
 from tensorrt_llm.runtime.generation import _prepare_attention_mask
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
+
 from examples.bloom.convert_checkpoint import convert_hf_bloom
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import getSMVersion
+from utils.util import skip_fp32_accum_pre_ampere, unittest_name_func
 
 
 class TestBloom(unittest.TestCase):
@@ -161,7 +163,7 @@ class TestBloom(unittest.TestCase):
             ], [False], ['float16', 'float32']))
         return test_cases
 
-    @parameterized.expand(load_test_cases())
+    @parameterized.expand(load_test_cases(), name_func=unittest_name_func)
     def test_bloom(self, use_gpt_attention_plugin, context_fmha_type,
                    enable_remove_input_padding, dtype):
         model = 'bloom'
@@ -217,7 +219,8 @@ class TestBloom(unittest.TestCase):
                                            dtype=torch.int32).cuda()
         ctx_host_past_key_value_lengths = torch.tensor([0] * batch_size,
                                                        dtype=torch.int32)
-        host_max_attention_window_sizes = torch.tensor([total_length],
+        host_max_attention_window_sizes = torch.tensor([total_length] *
+                                                       bloom_config.n_layer,
                                                        dtype=torch.int32)
         host_sink_token_length = torch.tensor([0], dtype=torch.int32)
 
@@ -263,16 +266,20 @@ class TestBloom(unittest.TestCase):
 
         ctx_shape = {k: v.shape for k, v in ctx_buffer.items()}
 
+        ctx_shape.update(
+            {f'host_max_attention_window_sizes': (bloom_config.n_layer, )})
+        ctx_buffer.update({
+            f'host_max_attention_window_sizes':
+            host_max_attention_window_sizes
+        })
+
         for i in range(bloom_config.n_layer):
             shape = (batch_size, 2, bloom_config.n_head, 0,
                      bloom_config.hidden_size // bloom_config.n_head)
             past_buffer = torch.zeros((1, ),
                                       dtype=str_dtype_to_torch(dtype),
                                       device='cuda')
-            ctx_shape.update({
-                f'past_key_value_{i}': shape,
-                f'host_max_attention_window_size_{i}': (1, ),
-            })
+            ctx_shape.update({f'past_key_value_{i}': shape})
             shape = (batch_size, 2, bloom_config.n_head, seq_len,
                      bloom_config.hidden_size // bloom_config.n_head)
             ctx_buffer.update({
@@ -282,8 +289,6 @@ class TestBloom(unittest.TestCase):
                 torch.zeros(shape,
                             dtype=str_dtype_to_torch(dtype),
                             device='cuda'),
-                f'host_max_attention_window_size_{i}':
-                host_max_attention_window_sizes,
             })
 
         context = runtime.ctx_context
@@ -320,8 +325,6 @@ class TestBloom(unittest.TestCase):
         gen_host_past_key_value_lengths = torch.tensor([seq_len + step - 1] *
                                                        batch_size,
                                                        dtype=torch.int32)
-        gen_host_max_attention_window_sizes = torch.tensor([total_length],
-                                                           dtype=torch.int32)
         gen_host_sink_token_length = torch.tensor([0], dtype=torch.int32)
         step1_buffer = {
             'input_ids': gen_id,
@@ -345,19 +348,19 @@ class TestBloom(unittest.TestCase):
 
         step1_shape = {k: v.shape for k, v in step1_buffer.items()}
 
+        step1_shape.update(
+            {f'host_max_attention_window_sizes': (bloom_config.n_layer, )})
+        step1_buffer.update({
+            f'host_max_attention_window_sizes':
+            host_max_attention_window_sizes
+        })
+
         for i in range(bloom_config.n_layer):
             shape = (batch_size, 2, bloom_config.n_head, seq_len,
                      bloom_config.hidden_size // bloom_config.n_head)
-            step1_shape.update({
-                f'past_key_value_{i}': shape,
-                f'host_max_attention_window_size_{i}': (1, ),
-            })
-            step1_buffer.update({
-                f'past_key_value_{i}':
-                ctx_buffer[f'present_key_value_{i}'],
-                f'host_max_attention_window_size_{i}':
-                host_max_attention_window_sizes,
-            })
+            step1_shape.update({f'past_key_value_{i}': shape})
+            step1_buffer.update(
+                {f'past_key_value_{i}': ctx_buffer[f'present_key_value_{i}']})
 
         context = runtime.context_1
         runtime._set_shape(context, step1_shape)
@@ -379,16 +382,12 @@ class TestBloom(unittest.TestCase):
                                    res.cpu().numpy(),
                                    atol=1e-1)
 
-    @parameterized.expand(load_test_cases())
+    @parameterized.expand(load_test_cases(), name_func=unittest_name_func)
     def test_greedy_search(self, use_gpt_attention_plugin, context_fmha_type,
                            enable_remove_input_padding, dtype):
 
         # Skip tests that are not supported in pre-ampere architecture
-        if getSMVersion() < 80:
-            if context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
-                pytest.skip(
-                    "ContextFMHAType with fp32 acc is not supported in pre-ampere architecture"
-                )
+        skip_fp32_accum_pre_ampere(context_fmha_type)
 
         model = 'bloom'
         log_level = 'error'
@@ -432,6 +431,7 @@ class TestBloom(unittest.TestCase):
 
         model_config = ModelConfig(
             max_batch_size=batch_size,
+            max_beam_width=num_beams,
             vocab_size=bloom_config.vocab_size,
             num_layers=bloom_config.n_layer,
             num_heads=bloom_config.n_head,

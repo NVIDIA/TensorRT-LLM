@@ -39,14 +39,14 @@ input IDs and get the correct results.
  * If the input ids is out of range it writes zero, otherwise it writes the correct embedding result.
  */
 template <typename T, typename Idx>
-__global__ void lookup_kernel(T* output, const Idx* input, const T* weight, const Idx batch_size, const Idx offset,
-    const Idx size, const int n_embed)
+__global__ void lookup_kernel(T* output, Idx const* input, T const* weight, const Idx batch_size, const Idx offset,
+    const Idx size, int const n_embed)
 {
     for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < batch_size * n_embed;
          index += blockDim.x * gridDim.x)
     {
-        const int word_index = input[index / n_embed] - offset;
-        const int col_index = index % n_embed;
+        int const word_index = input[index / n_embed] - offset;
+        int const col_index = index % n_embed;
         T embedding;
         if (word_index < 0 || word_index >= size)
         {
@@ -61,8 +61,8 @@ __global__ void lookup_kernel(T* output, const Idx* input, const T* weight, cons
 }
 
 template <typename T, typename Idx>
-void invokeLookUp(T* out, const Idx* input, const T* weight, const Idx batch_size, const Idx offset, const Idx size,
-    const int n_embed, cudaStream_t stream)
+void invokeLookUp(T* out, Idx const* input, T const* weight, const Idx batch_size, const Idx offset, const Idx size,
+    int const n_embed, cudaStream_t stream)
 {
     dim3 grid(min(batch_size, 65536));
     dim3 block(min(n_embed, 512));

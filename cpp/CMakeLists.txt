@@ -36,6 +36,7 @@ option(NVTX_DISABLE "Disable all NVTX features" ON)
 option(WARNING_IS_ERROR "Treat all warnings as errors" OFF)
 option(FAST_BUILD "Skip compiling some kernels to accelerate compiling" OFF)
 option(FAST_MATH "Compiling in fast math mode" OFF)
+option(INDEX_RANGE_CHECK "Compiling with index range checks" OFF)
 
 if(NVTX_DISABLE)
   add_compile_definitions("NVTX_DISABLE")
@@ -60,6 +61,20 @@ else()
   message(STATUS "Importing batch manager")
 endif()
 
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tensorrt_llm/executor/CMakeLists.txt")
+  set(BUILD_EXECUTOR_DEFAULT ON)
+else()
+  set(BUILD_EXECUTOR_DEFAULT OFF)
+endif()
+
+option(BUILD_EXECUTOR "Build executor from source" ${BUILD_EXECUTOR_DEFAULT})
+
+if(BUILD_EXECUTOR)
+  message(STATUS "Building executor")
+else()
+  message(STATUS "Importing executor")
+endif()
+
 if(BUILD_PYT)
   message(STATUS "Building PyTorch")
 else()
@@ -81,6 +96,11 @@ endif()
 if(FAST_BUILD)
   add_compile_definitions("FAST_BUILD")
   message(WARNING "Skip some kernels to accelerate compilation")
+endif()
+
+if(INDEX_RANGE_CHECK)
+  add_compile_definitions("INDEX_RANGE_CHECK")
+  message(WARNING "Check index range to detect OOB accesses")
 endif()
 
 # Determine CUDA version before enabling the language extension
@@ -148,10 +168,6 @@ message(STATUS "    version: ${CUDAToolkit_VERSION}")
 message(STATUS "    libraries: ${CUDAToolkit_LIBRARY_DIR}")
 message(STATUS "    include path: ${CUDAToolkit_INCLUDE_DIRS}")
 
-find_library(
-  CUDNN_LIB cudnn
-  HINTS ${CUDNN_ROOT_DIR} ${CUDAToolkit_LIBRARY_DIR}
-  PATH_SUFFIXES lib64 lib lib/x64)
 set(CUBLAS_LIB CUDA::cublas)
 set(CUBLASLT_LIB CUDA::cublasLt)
 set(CUDA_DRV_LIB CUDA::cuda_driver)
@@ -168,12 +184,16 @@ if(ENABLE_MULTI_DEVICE EQUAL 1)
   find_library(NCCL_LIB nccl HINTS ${NCCL_LIB_DIR})
 endif()
 
-get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_SOURCE_DIR} PATH)
+get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR} PATH)
 
 set(3RDPARTY_DIR ${TRT_LLM_ROOT_DIR}/3rdparty)
 include_directories(
-  ${CUDAToolkit_INCLUDE_DIRS} ${CUDNN_ROOT_DIR}/include ${NCCL_INCLUDE_DIR}
-  ${3RDPARTY_DIR}/cutlass/include ${3RDPARTY_DIR}/NVTX/include
+  ${CUDAToolkit_INCLUDE_DIRS}
+  ${CUDNN_ROOT_DIR}/include
+  ${NCCL_INCLUDE_DIR}
+  ${3RDPARTY_DIR}/cutlass/include
+  ${3RDPARTY_DIR}/cutlass/tools/util/include
+  ${3RDPARTY_DIR}/NVTX/include
   ${3RDPARTY_DIR}/json/include)
 
 # TRT dependencies

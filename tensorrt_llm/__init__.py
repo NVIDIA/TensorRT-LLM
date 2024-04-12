@@ -27,11 +27,22 @@ def _add_trt_llm_dll_directory():
 
 _add_trt_llm_dll_directory()
 
+import sys
+
 import tensorrt_llm.functional as functional
 import tensorrt_llm.models as models
 import tensorrt_llm.quantization as quantization
 import tensorrt_llm.runtime as runtime
 import tensorrt_llm.tools as tools
+
+try:
+    import tensorrt_llm.bindings  # NOQA
+except ImportError:
+    raise ImportError(
+        'Import of the `bindings` module failed. Please check the package integrity. '
+        'If you are attempting to use the pip development mode (editable installation), '
+        'please execute `build_wheels.py` first, and then run `pip install -e .`'
+    )
 
 from ._common import _init, default_net, default_trtnet, precision
 # Disable flake8 on the line below because mpi_barrier is not used in tensorrt_llm project
@@ -39,7 +50,8 @@ from ._common import _init, default_net, default_trtnet, precision
 from ._utils import mpi_barrier  # NOQA
 from ._utils import str_dtype_to_torch  # NOQA
 from ._utils import mpi_rank, mpi_world_size, str_dtype_to_trt
-from .builder import Builder, BuilderConfig
+from .auto_parallel import AutoParallelConfig, auto_parallel
+from .builder import BuildConfig, Builder, BuilderConfig, build
 from .functional import Tensor, constant
 from .hlapi.llm import LLM, ModelConfig
 from .logger import logger
@@ -65,12 +77,16 @@ __all__ = [
     'Mapping',
     'Builder',
     'BuilderConfig',
+    'build',
+    'BuildConfig',
     'Tensor',
     'Parameter',
     'runtime',
     'Module',
     'functional',
     'models',
+    'auto_parallel',
+    'AutoParallelConfig',
     'quantization',
     'tools',
     'LLM',
@@ -80,4 +96,6 @@ __all__ = [
 
 _init(log_level="error")
 
-print(f"[TensorRT-LLM] TensorRT-LLM version: {__version__}", end='')
+print(f"[TensorRT-LLM] TensorRT-LLM version: {__version__}")
+
+sys.stdout.flush()

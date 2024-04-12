@@ -85,7 +85,6 @@ setup(
     # TODO Add windows support for python bindings.
     classifiers=[
         "Development Status :: 4 - Beta",
-        "License :: Apache License 2.0",
         "Intended Audience :: Developers",
         "Programming Language :: Python :: 3.10",
     ],

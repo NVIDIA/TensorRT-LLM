@@ -115,6 +115,16 @@ void insertTensorSlices(
     }
 }
 
+void printTensorMap(std::ostream& stream, StringPtrMap<ITensor> const& map)
+{
+    for (auto const& [name, tensor] : map)
+    {
+        stream << "Tensor name: " << name << '\n';
+        stream << "Shape" << tensor->getShape() << '\n';
+        stream << *tensor << '\n';
+    }
+}
+
 void setRawPointers(ITensor& pointers, ITensor::SharedPtr const& input, int32_t pointersSlot, int32_t inputSlot)
 {
     auto const pointersLength = static_cast<int32_t>(pointers.getSizeInBytes() / sizeof(void**));

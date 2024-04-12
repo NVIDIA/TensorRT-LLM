@@ -16,7 +16,7 @@
 from ..._utils import pad_vocab_size
 from ...functional import Tensor
 from ...layers import (MLP, Attention, AttentionMaskType, ColumnLinear,
-                       Embedding, LayerNorm, PromptTuningEmbedding)
+                       Embedding, LayerNorm)
 from ...module import Module
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
                               PretrainedConfig)
@@ -38,9 +38,12 @@ class OPTDecoderLayer(Module):
         self.input_layernorm = LayerNorm(normalized_shape=hidden_size,
                                          dtype=dtype)
 
+        layers_range = config.mapping.pp_layers(config.num_hidden_layers)
+        local_layer_idx = layer_idx - layers_range[0]
         self.attention = Attention(
-            hidden_size,
-            config.num_attention_heads,
+            local_layer_idx=local_layer_idx,
+            hidden_size=hidden_size,
+            num_attention_heads=config.num_attention_heads,
             max_position_embeddings=config.max_position_embeddings,
             attention_mask_type=AttentionMaskType.causal,
             dtype=dtype,
@@ -106,19 +109,10 @@ class OPTModel(Module):
     def __init__(self, config: PretrainedConfig):
         super().__init__()
         self.do_layer_norm_before = config.do_layer_norm_before
-        self.use_prompt_tuning = config.use_prompt_tuning
-        mapping = config.mapping
 
-        EmbeddingCls = PromptTuningEmbedding if config.use_prompt_tuning else Embedding
-        self.vocab_embedding = EmbeddingCls(
-            config.vocab_size,
-            config.hidden_size,
-            dtype=config.dtype,
-            tp_size=mapping.tp_size if config.use_parallel_embedding else 1,
-            tp_group=mapping.tp_group
-            if config.use_parallel_embedding else None,
-            sharding_dim=config.embedding_sharding_dim,
-            tp_rank=mapping.tp_rank)
+        self.vocab_embedding = Embedding(config.vocab_size,
+                                         config.hidden_size,
+                                         dtype=config.dtype)
         self.position_embedding = Embedding(config.max_position_embeddings,
                                             config.hidden_size,
                                             dtype=config.dtype)
@@ -141,7 +135,7 @@ class OPTModel(Module):
                 prompt_vocab_size=None):
 
         args = [prompt_embedding_table, prompt_tasks, prompt_vocab_size
-                ] if self.use_prompt_tuning else []
+                ] if prompt_embedding_table is not None else []
         hidden_states = self.vocab_embedding(input_ids, *args)
         hidden_states = hidden_states + self.position_embedding(position_ids)
 
@@ -170,18 +164,13 @@ class OPTForCausalLM(DecoderModelForCausalLM):
         vocab_size_padded = pad_vocab_size(config.vocab_size,
                                            config.mapping.tp_size)
 
-        share_weight = None
-        if config.share_embedding_table:
-            share_weight = transformer.vocab_embedding.weight
-
         lm_head = ColumnLinear(config.hidden_size,
                                vocab_size_padded,
                                bias=False,
                                dtype=config.dtype,
                                tp_group=config.mapping.tp_group,
                                tp_size=config.mapping.tp_size,
-                               gather_output=True,
-                               share_weight=share_weight)
+                               gather_output=True)
 
         super().__init__(config, transformer, lm_head)
 

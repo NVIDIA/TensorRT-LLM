@@ -82,4 +82,10 @@ void MemoryCounters::deallocate(MemoryType memoryType, MemoryCounters::SizeType 
     default: TLLM_THROW("Unknown memory type");
     }
 }
+
+MemoryCounters& MemoryCounters::getInstance()
+{
+    static MemoryCounters mInstance;
+    return mInstance;
+}
 } // namespace tensorrt_llm::runtime

@@ -1,39 +1,14 @@
-from typing import Any, List
+from pathlib import Path
+from typing import Any, List, Union
+
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 TokenIdsTy = List[int]
 
 
-class TokenizerBase:
+class TokenizerBase(PreTrainedTokenizerBase):
     ''' This is a protocol for the tokenizer. Users can implement their own tokenizer by inheriting this class.  '''
-
-    @property
-    def eos_token_id(self) -> int:
-        ''' Return the id of the end of sentence token.  '''
-        raise NotImplementedError()
-
-    @property
-    def pad_token_id(self) -> int:
-        ''' Return the id of the padding token.  '''
-        raise NotImplementedError()
-
-    def encode(self, text: str, *args, **kwargs) -> TokenIdsTy:
-        ''' Encode the text to token ids.  '''
-        raise NotImplementedError()
-
-    def decode(self, token_ids: TokenIdsTy, *args, **kwargs) -> str:
-        ''' Decode the token ids to text.  '''
-        raise NotImplementedError()
-
-    def batch_encode_plus(self, texts: List[str]) -> dict:
-        ''' Encode the batch of texts to token ids.  '''
-        raise NotImplementedError()
-
-    def tokenize(self, text, *args, **kwargs):
-        return self.encode(text, *args, **kwargs)
-
-    def __call__(self, text: str, *args, **kwargs) -> Any:
-        ''' Encode the text to token ids.  '''
-        raise NotImplementedError()
 
 
 class TransformersTokenizer(TokenizerBase):
@@ -41,7 +16,7 @@ class TransformersTokenizer(TokenizerBase):
     This is the default tokenizer for LLM. '''
 
     @classmethod
-    def from_pretrained(self, pretrained_model_dir: str, **kwargs):
+    def from_pretrained(cls, pretrained_model_dir: str, **kwargs):
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(pretrained_model_dir,
                                                   **kwargs)
@@ -69,3 +44,22 @@ class TransformersTokenizer(TokenizerBase):
 
     def batch_encode_plus(self, texts: List[str], *args, **kwargs) -> dict:
         return self.tokenizer.batch_encode_plus(texts, *args, **kwargs)
+
+
+def tokenizer_factory(
+        obj: Union[str, Path, TokenizerBase, PreTrainedTokenizerBase, None],
+        **kwargs) -> Union[TokenizerBase, PreTrainedTokenizerBase, None]:
+    if obj is None:
+        return None
+    if isinstance(obj, (str, Path)):
+        default_kwargs = {
+            'legacy': False,
+            'padding_side': 'left',
+            'truncation_side': 'left',
+            'trust_remote_code': True,
+            'use_fast': True,
+        }
+        default_kwargs.update(kwargs)
+        return AutoTokenizer.from_pretrained(obj, **kwargs)
+
+    return obj

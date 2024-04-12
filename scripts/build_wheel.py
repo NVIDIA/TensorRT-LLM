@@ -23,7 +23,7 @@ from functools import partial
 from multiprocessing import cpu_count
 from pathlib import Path
 from shutil import copy, rmtree
-from subprocess import check_output, run
+from subprocess import CalledProcessError, check_output, run
 from textwrap import dedent
 from typing import List
 
@@ -238,8 +238,16 @@ def main(build_type: str = "Release",
                 build_run(f"\"{sys.executable}\" {stubgen} -o . bindings")
                 (pkg_dir / stubgen).unlink()
             else:
-                build_run(
-                    f"\"{sys.executable}\" -m pybind11_stubgen -o . bindings")
+                env_ld = os.environ.copy()
+                env_ld[
+                    "LD_LIBRARY_PATH"] = f"/usr/local/cuda/compat/lib.real:{env_ld['LD_LIBRARY_PATH']}"
+                try:
+                    build_run(
+                        f"\"{sys.executable}\" -m pybind11_stubgen -o . bindings",
+                        env=env_ld)
+                except CalledProcessError as ex:
+                    print(f"Failed to build pybind11 stubgen: {ex}",
+                          file=sys.stderr)
 
     if dist_dir is None:
         dist_dir = project_dir / "build"

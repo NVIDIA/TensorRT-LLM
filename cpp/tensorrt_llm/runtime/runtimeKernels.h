@@ -51,6 +51,8 @@ void invokeTransposeWithInputOffset(
 
 void invokeInclusiveSum(IBuffer& output, IBuffer const& input, BufferManager const& manager, CudaStream const& stream);
 
+void invokeInclusiveSum(IBuffer& output, IBuffer& tmpBuffer, IBuffer const& input, CudaStream const& stream);
+
 void invokeBuildTokenMask(
     ITensor& tokenMask, ITensor const& inputLengths, SizeType maxInputLength, CudaStream const& stream);
 
@@ -92,4 +94,9 @@ void mergeLogitsFragments(BufferManager const& bufferManager, ITensor& output, s
     ITensor& cachePointerDevice, ITensor& cachePointerHost, SizeType firstBatchSlotIdx, SizeType const microBatchSize,
     SizeType const beamWidth, CudaStream const& stream, int stepOffset);
 
+void invokeUpdateKVBlockArrayDraftTokenLocation(ITensor const& seqAcceptedDraftTokenOffsets,
+    ITensor const& packedAcceptedDraftTokensIndices, ITensor const& pastKeyValueLengths, int64_t* const* pointerArray,
+    SizeType layerCount, SizeType seqCount, SizeType numKVHeads, SizeType sizeInBytesPerKVHead,
+    SizeType rewindDraftTokenCommonCount, int* rewindDraftTokenSeparateAdjustments, ITensor const& seqSlotRemapping,
+    SizeType maxKVCacheLen, SizeType maxBlocksPerSeq, SizeType tokensPerBlock, cudaStream_t stream);
 } // namespace tensorrt_llm::runtime::kernels

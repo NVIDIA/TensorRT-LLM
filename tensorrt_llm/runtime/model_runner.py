@@ -24,10 +24,10 @@ import torch
 
 from .. import profiler
 from .._utils import mpi_world_size
+from ..builder import Engine, get_engine_version
 from ..logger import logger
 from ..mapping import Mapping
 from ..quantization import QuantMode
-from .engine import Engine, get_engine_version
 from .generation import (ChatGLMGenerationSession, GenerationSession,
                          LogitsProcessor, LoraManager,
                          MambaLMHeadModelGenerationSession, ModelConfig,
@@ -109,6 +109,7 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
     vocab_size = builder_config['vocab_size']
     num_layers = builder_config['num_layers']
     max_batch_size = builder_config['max_batch_size']
+    max_beam_width = builder_config['max_beam_width']
 
     cross_attention = builder_config.get('cross_attention', False)
     has_position_embedding = builder_config.get('has_position_embedding', True)
@@ -121,17 +122,17 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
         'max_prompt_embedding_table_size', 0)
     quant_mode = QuantMode(builder_config.get('quant_mode', 0))
     lora_target_modules = builder_config.get('lora_target_modules')
-    lora_hf_modules_to_trtllm_modules = builder_config.get(
-        'hf_modules_to_trtllm_modules')
     lora_trtllm_modules_to_hf_modules = builder_config.get(
         'trtllm_modules_to_hf_modules')
-    max_medusa_token_len = builder_config.get('max_medusa_token_len', 0)
+    max_medusa_token_len = builder_config.get('max_draft_len', 0)
     num_medusa_heads = builder_config.get('num_medusa_heads', 0)
 
     plugin_config = config['plugin_config']
     use_gpt_attention_plugin = bool(plugin_config['gpt_attention_plugin'])
+    mamba_conv1d_plugin = bool(plugin_config['mamba_conv1d_plugin'])
     remove_input_padding = plugin_config['remove_input_padding']
     paged_kv_cache = plugin_config['paged_kv_cache']
+    paged_state = plugin_config['paged_state']
     tokens_per_block = plugin_config['tokens_per_block']
     use_custom_all_reduce = plugin_config.get('use_custom_all_reduce', False)
     lora_plugin = plugin_config.get('lora_plugin')
@@ -140,6 +141,7 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
 
     model_config = ModelConfig(
         max_batch_size=max_batch_size,
+        max_beam_width=max_beam_width,
         vocab_size=vocab_size,
         num_layers=num_layers,
         num_heads=num_heads,
@@ -147,9 +149,11 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
         hidden_size=hidden_size,
         head_size=head_size,
         gpt_attention_plugin=use_gpt_attention_plugin,
+        mamba_conv1d_plugin=mamba_conv1d_plugin,
         remove_input_padding=remove_input_padding,
         model_name=model_name,
         paged_kv_cache=paged_kv_cache,
+        paged_state=paged_state,
         cross_attention=cross_attention,
         has_position_embedding=has_position_embedding,
         has_token_type_embedding=has_token_type_embedding,
@@ -163,7 +167,6 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
         lora_plugin=lora_plugin,
         lora_target_modules=lora_target_modules,
         use_context_fmha_for_generation=use_context_fmha_for_generation,
-        hf_modules_to_trtllm_modules=lora_hf_modules_to_trtllm_modules,
         trtllm_modules_to_hf_modules=lora_trtllm_modules_to_hf_modules,
         num_medusa_heads=num_medusa_heads,
         max_medusa_tokens=max_medusa_token_len,
@@ -335,33 +338,144 @@ class ModelRunner(ModelRunnerMixin):
         self.lora_manager = lora_manager
 
     @classmethod
+    def from_engine(cls,
+                    engine: Engine,
+                    lora_dir: Optional[List[str]] = None,
+                    rank: int = 0,
+                    debug_mode: bool = False,
+                    lora_ckpt_source: str = "hf",
+                    medusa_choices: List[List[int]] = None,
+                    stream: torch.cuda.Stream = None) -> 'ModelRunner':
+        pretrained_config = engine.config.pretrained_config
+        build_config = engine.config.build_config
+
+        tp_size = pretrained_config.mapping.tp_size
+        num_heads = pretrained_config.num_attention_heads // tp_size
+        num_kv_heads = pretrained_config.num_key_value_heads
+        num_kv_heads = (num_kv_heads + tp_size - 1) // tp_size
+        hidden_size = pretrained_config.hidden_size // tp_size
+        head_size = pretrained_config.head_size
+
+        if pretrained_config.architecture == 'MambaLMHeadModel':
+            mamba_d_state = pretrained_config.ssm_cfg['d_state']
+            mamba_expand = pretrained_config.ssm_cfg['expand']
+            mamba_d_conv = pretrained_config.ssm_cfg['d_conv']
+        else:
+            mamba_d_state, mamba_expand, mamba_d_conv = 0, 0, 0
+
+        model_config = ModelConfig(
+            max_batch_size=build_config.max_batch_size,
+            max_beam_width=build_config.max_beam_width,
+            vocab_size=pretrained_config.vocab_size,
+            num_layers=pretrained_config.num_hidden_layers,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            hidden_size=hidden_size,
+            head_size=head_size,
+            gpt_attention_plugin=bool(
+                build_config.plugin_config.gpt_attention_plugin),
+            mamba_conv1d_plugin=bool(
+                build_config.plugin_config.mamba_conv1d_plugin),
+            remove_input_padding=build_config.plugin_config.
+            remove_input_padding,
+            paged_kv_cache=build_config.plugin_config.paged_kv_cache,
+            paged_state=build_config.plugin_config.paged_state,
+            tokens_per_block=build_config.plugin_config.tokens_per_block,
+            quant_mode=pretrained_config.quant_mode,
+            gather_context_logits=build_config.gather_context_logits,
+            gather_generation_logits=build_config.gather_generation_logits,
+            dtype=pretrained_config.dtype,
+            max_prompt_embedding_table_size=build_config.
+            max_prompt_embedding_table_size,
+            mamba_d_state=mamba_d_state,
+            mamba_expand=mamba_expand,
+            mamba_d_conv=mamba_d_conv,
+            lora_plugin=build_config.plugin_config.lora_plugin,
+            lora_target_modules=build_config.lora_config.lora_target_modules,
+            trtllm_modules_to_hf_modules=build_config.lora_config.
+            trtllm_modules_to_hf_modules,
+            max_medusa_tokens=pretrained_config.max_draft_len if hasattr(
+                pretrained_config, 'max_draft_len') else 0,
+            num_medusa_heads=pretrained_config.num_medusa_heads if hasattr(
+                pretrained_config, 'num_medusa_heads') else 0,
+            use_custom_all_reduce=build_config.plugin_config.
+            use_custom_all_reduce,
+        )
+        max_batch_size = build_config.max_batch_size
+        max_input_len = build_config.max_input_len
+        max_output_len = build_config.max_output_len
+        max_beam_width = build_config.max_beam_width
+        if pretrained_config.architecture == 'ChatGLMForCausalLM' and pretrained_config.chatglm_version in [
+                'glm', 'chatglm'
+        ]:
+            session_cls = ChatGLMGenerationSession
+        elif pretrained_config.architecture == 'MambaLMHeadModel':
+            session_cls = MambaLMHeadModelGenerationSession
+        else:
+            session_cls = GenerationSession
+        engine_buffer = engine.engine
+        runtime_mapping = pretrained_config.mapping
+
+        if medusa_choices is not None:
+            assert session_cls == GenerationSession, "Medusa is only supported by GenerationSession"
+
+            assert model_config.max_medusa_tokens > 0, \
+                "medusa_chioce is specified but model_config.max_medusa_tokens is 0."
+
+        torch.cuda.set_device(rank % runtime_mapping.gpus_per_node)
+        session = session_cls(model_config,
+                              engine_buffer,
+                              runtime_mapping,
+                              debug_mode=debug_mode,
+                              stream=stream)
+
+        if session.use_lora_plugin:
+            lora_manager = LoraManager()
+            if lora_dir is not None:
+                lora_manager.load_from_ckpt(model_dir=lora_dir,
+                                            model_config=model_config,
+                                            runtime_mapping=runtime_mapping,
+                                            ckpt_source=lora_ckpt_source)
+        else:
+            lora_manager = None
+
+        return cls(session=session,
+                   max_batch_size=max_batch_size,
+                   max_input_len=max_input_len,
+                   max_seq_len=max_input_len + max_output_len,
+                   max_beam_width=max_beam_width,
+                   lora_manager=lora_manager)
+
+    @classmethod
     def from_dir(cls,
                  engine_dir: str,
-                 lora_dir: Optional[str] = None,
+                 lora_dir: Optional[List[str]] = None,
                  rank: int = 0,
                  debug_mode: bool = False,
                  lora_ckpt_source: str = "hf",
-                 medusa_choices: List[List[int]] = None) -> 'ModelRunner':
+                 medusa_choices: List[List[int]] = None,
+                 stream: torch.cuda.Stream = None) -> 'ModelRunner':
         """
         Create a ModelRunner instance from an engine directory.
 
         Args:
             engine_dir (str):
                 The directory that contains the serialized engine files and config files.
-            lora_dir (str):
-                The directory that contains LoRA weights.
+            lora_dir (Optional[List[str]]):
+                The directories that contain LoRA weights.
             rank (int):
                 The runtime rank id.
             debug_mode (bool):
                 Whether or not to turn on the debug mode.
             medusa_choices (List[List[int]]):
                 Medusa choices to use when in Medusa decoding
+            stream (torch.cuda.Stream):
+                Stream to use.
         Returns:
             ModelRunner: An instance of ModelRunner.
         """
-        profiler.start('load tensorrt_llm engine')
-
         engine_version = get_engine_version(engine_dir)
+        profiler.start('load tensorrt_llm engine')
         # the old engine format
         if engine_version is None:
             engine_dir = Path(engine_dir)
@@ -393,111 +507,58 @@ class ModelRunner(ModelRunnerMixin):
                 session_cls = QWenForCausalLMGenerationSession
             else:
                 session_cls = GenerationSession
+
+            if medusa_choices is not None:
+                assert session_cls == GenerationSession, "Medusa is only supported by GenerationSession"
+
+                assert model_config.max_medusa_tokens > 0, \
+                    "medusa_chioce is specified but model_config.max_medusa_tokens is 0."
+
+            torch.cuda.set_device(rank % runtime_mapping.gpus_per_node)
+            session = session_cls(model_config,
+                                  engine_buffer,
+                                  runtime_mapping,
+                                  debug_mode=debug_mode,
+                                  stream=stream)
+            if session.use_lora_plugin:
+                lora_manager = LoraManager()
+                if lora_dir is not None:
+                    lora_manager.load_from_ckpt(model_dir=lora_dir,
+                                                model_config=model_config,
+                                                runtime_mapping=runtime_mapping,
+                                                ckpt_source=lora_ckpt_source)
+            else:
+                lora_manager = None
+
+            profiler.stop('load tensorrt_llm engine')
+            loading_time = profiler.elapsed_time_in_sec(
+                "load tensorrt_llm engine")
+            logger.info(f'Load engine takes: {loading_time} sec')
+
+            return cls(session=session,
+                       max_batch_size=max_batch_size,
+                       max_input_len=max_input_len,
+                       max_seq_len=max_input_len + max_output_len,
+                       max_beam_width=max_beam_width,
+                       lora_manager=lora_manager)
         else:
             # the new engine format
             engine = Engine.from_dir(engine_dir, rank)
-            pretrained_config = engine.config.pretrained_config
-            build_config = engine.config.build_config
-
-            tp_size = pretrained_config.mapping.tp_size
-            num_heads = pretrained_config.num_attention_heads // tp_size
-            num_kv_heads = pretrained_config.num_key_value_heads
-            num_kv_heads = (num_kv_heads + tp_size - 1) // tp_size
-            hidden_size = pretrained_config.hidden_size // tp_size
-            head_size = pretrained_config.head_size
-
-            if pretrained_config.architecture == 'MambaLMHeadModel':
-                mamba_d_state = pretrained_config.ssm_cfg['d_state']
-                mamba_expand = pretrained_config.ssm_cfg['expand']
-                mamba_d_conv = pretrained_config.ssm_cfg['d_conv']
-            else:
-                mamba_d_state, mamba_expand, mamba_d_conv = 0, 0, 0
-
-            model_config = ModelConfig(
-                max_batch_size=build_config.max_batch_size,
-                vocab_size=pretrained_config.vocab_size,
-                num_layers=pretrained_config.num_hidden_layers,
-                num_heads=num_heads,
-                num_kv_heads=num_kv_heads,
-                hidden_size=hidden_size,
-                head_size=head_size,
-                gpt_attention_plugin=bool(
-                    build_config.plugin_config.gpt_attention_plugin),
-                remove_input_padding=build_config.plugin_config.
-                remove_input_padding,
-                paged_kv_cache=build_config.plugin_config.paged_kv_cache,
-                tokens_per_block=build_config.plugin_config.tokens_per_block,
-                quant_mode=pretrained_config.quant_mode,
-                gather_context_logits=build_config.gather_context_logits,
-                gather_generation_logits=build_config.gather_generation_logits,
-                dtype=pretrained_config.dtype,
-                max_prompt_embedding_table_size=build_config.
-                max_prompt_embedding_table_size,
-                mamba_d_state=mamba_d_state,
-                mamba_expand=mamba_expand,
-                mamba_d_conv=mamba_d_conv,
-                lora_plugin=build_config.plugin_config.lora_plugin,
-                lora_target_modules=pretrained_config.lora_target_modules
-                if hasattr(pretrained_config, 'lora_target_modules') else [],
-                hf_modules_to_trtllm_modules=pretrained_config.
-                hf_modules_to_trtllm_modules if hasattr(
-                    pretrained_config, 'hf_modules_to_trtllm_modules') else [],
-                trtllm_modules_to_hf_modules=pretrained_config.
-                trtllm_modules_to_hf_modules if hasattr(
-                    pretrained_config, 'trtllm_modules_to_hf_modules') else [],
-                max_medusa_tokens=pretrained_config.max_medusa_token_len
-                if hasattr(pretrained_config, 'max_medusa_token_len') else 0,
-                num_medusa_heads=pretrained_config.num_medusa_heads if hasattr(
-                    pretrained_config, 'num_medusa_heads') else 0,
-                use_custom_all_reduce=build_config.plugin_config.
-                use_custom_all_reduce,
-            )
-            max_batch_size = build_config.max_batch_size
-            max_input_len = build_config.max_input_len
-            max_output_len = build_config.max_output_len
-            max_beam_width = build_config.max_beam_width
-            if pretrained_config.architecture == 'ChatGLMForCausalLM' and pretrained_config.chatglm_version in [
-                    'glm', 'chatglm'
-            ]:
-                session_cls = ChatGLMGenerationSession
-            elif pretrained_config.architecture == 'MambaLMHeadModel':
-                session_cls = MambaLMHeadModelGenerationSession
-            else:
-                session_cls = GenerationSession
-            engine_buffer = engine.engine
-            runtime_mapping = pretrained_config.mapping
-
-        if medusa_choices is not None:
-            assert session_cls == GenerationSession, "Medusa is only supported by GenerationSession"
-
-            assert model_config.max_medusa_tokens > 0, \
-                "medusa_chioce is specified but model_config.max_medusa_tokens is 0."
-
-        torch.cuda.set_device(rank % runtime_mapping.gpus_per_node)
-        session = session_cls(model_config,
-                              engine_buffer,
-                              runtime_mapping,
-                              debug_mode=debug_mode)
-        profiler.stop('load tensorrt_llm engine')
-        loading_time = profiler.elapsed_time_in_sec("load tensorrt_llm engine")
-        logger.info(f'Load engine takes: {loading_time} sec')
-
-        if session.use_lora_plugin:
-            lora_manager = LoraManager()
-            if lora_dir is not None:
-                lora_manager.load_from_ckpt(model_dir=lora_dir,
-                                            model_config=model_config,
-                                            runtime_mapping=runtime_mapping,
-                                            ckpt_source=lora_ckpt_source)
-        else:
-            lora_manager = None
-
-        return cls(session,
-                   max_batch_size,
-                   max_input_len,
-                   max_input_len + max_output_len,
-                   max_beam_width,
-                   lora_manager=lora_manager)
+            if lora_dir is None:
+                config_lora_dir = engine.config.build_config.lora_config.lora_dir
+                if len(config_lora_dir) > 0:
+                    lora_dir = [
+                        f"{engine_dir}/{dir}" for dir in config_lora_dir
+                    ]
+                    lora_ckpt_source = engine.config.build_config.lora_config.lora_ckpt_source
+            runner = ModelRunner.from_engine(engine, lora_dir, rank, debug_mode,
+                                             lora_ckpt_source, medusa_choices,
+                                             stream)
+            profiler.stop('load tensorrt_llm engine')
+            loading_time = profiler.elapsed_time_in_sec(
+                "load tensorrt_llm engine")
+            logger.info(f'Load engine takes: {loading_time} sec')
+            return runner
 
     @property
     def dtype(self) -> torch.dtype:

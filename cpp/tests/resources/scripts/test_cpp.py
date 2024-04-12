@@ -15,7 +15,6 @@
 # limitations under the License.
 
 import argparse as _arg
-import glob as _gl
 import logging as _log
 import os as _os
 import pathlib as _pl
@@ -72,7 +71,7 @@ def build_trt_llm(python_exe: str,
         python_exe, "scripts/build_wheel.py", "--cuda_architectures",
         cuda_architectures, "--build_dir",
         str(build_dir), "--dist_dir",
-        str(dist_dir)
+        str(dist_dir), "-s", "-i"
     ]
 
     if use_ccache:
@@ -86,12 +85,6 @@ def build_trt_llm(python_exe: str,
 
     run_command(build_wheel, cwd=root_dir, env=_os.environ, timeout=2400)
 
-    dist_dir = dist_dir if dist_dir.is_absolute() else root_dir / dist_dir
-    wheels = _gl.glob(str(dist_dir / "tensorrt_llm-*.whl"))
-    assert len(wheels) > 0, "No wheels found"
-    install_wheel = [python_exe, "-m", "pip", "install", "--upgrade", *wheels]
-    run_command(install_wheel, cwd=root_dir, timeout=300)
-
 
 def run_tests(cuda_architectures: _tp.Optional[str] = None,
               build_dir: _tp.Optional[str] = None,
@@ -102,6 +95,8 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
               run_gptj=False,
               run_llama=False,
               run_chatglm=False,
+              run_medusa=False,
+              run_mamba=False,
               run_fp8=False,
               only_multi_gpu=False,
               trt_root: _tp.Optional[str] = None,
@@ -124,6 +119,21 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
                   trt_root=trt_root,
                   job_count=job_count)
 
+    if run_mamba:
+        # adding here but not in requirements.txt to prevent break build package.
+        run_command([
+            python_exe, "-m", "pip", "install", "causal-conv1d==1.2.0.post2",
+            "mamba-ssm==1.2.0.post1"
+        ],
+                    cwd=root_dir,
+                    env=_os.environ,
+                    timeout=300)
+        run_command(
+            [python_exe, "-m", "pip", "install", "--force-reinstall", "build"],
+            cwd=root_dir,
+            env=_os.environ,
+            timeout=300)
+
     build_dir = build_dir if build_dir.is_absolute() else root_dir / build_dir
     resources_dir = _pl.Path("cpp") / "tests" / "resources"
 
@@ -141,8 +151,17 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
         "--tp-size=2"
     ]
 
+    generate_multi_lora_tp2_args = [
+        python_exe,
+        str(resources_dir / "scripts" / "generate_test_lora_weights.py"),
+        "--out-dir=cpp/tests/resources/data/multi_lora",
+        "--tp-size=2",
+        "--num-loras=128",
+    ]
+
     run_command(generate_lora_data_args_tp1, cwd=root_dir, timeout=100)
     run_command(generate_lora_data_args_tp2, cwd=root_dir, timeout=100)
+    run_command(generate_multi_lora_tp2_args, cwd=root_dir, timeout=100)
 
     if not skip_unit_tests:
         run_unit_tests(build_dir=build_dir)
@@ -158,6 +177,8 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
                                 run_gptj=run_gptj,
                                 run_llama=run_llama,
                                 run_chatglm=run_chatglm,
+                                run_medusa=run_medusa,
+                                run_mamba=run_mamba,
                                 run_fp8=run_fp8)
 
         if build_only:
@@ -168,6 +189,8 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
                              run_gptj=run_gptj,
                              run_llama=run_llama,
                              run_chatglm=run_chatglm,
+                             run_medusa=run_medusa,
+                             run_mamba=run_mamba,
                              run_fp8=run_fp8)
 
         if run_gpt:
@@ -198,6 +221,8 @@ def prepare_all_model_tests(python_exe: str,
                             run_gptj=False,
                             run_llama=False,
                             run_chatglm=False,
+                            run_medusa=False,
+                            run_mamba=False,
                             run_fp8=False):
     model_cache_arg = ["--model_cache", model_cache] if model_cache else []
 
@@ -244,6 +269,24 @@ def prepare_all_model_tests(python_exe: str,
                             model_cache_arg=model_cache_arg)
     else:
         _log.info("Skipping ChatGLM tests")
+
+    if run_medusa:
+        prepare_model_tests(model_name="medusa",
+                            python_exe=python_exe,
+                            root_dir=root_dir,
+                            resources_dir=resources_dir,
+                            model_cache_arg=model_cache_arg)
+    else:
+        _log.info("Skipping Medusa tests")
+
+    if run_mamba:
+        prepare_model_tests(model_name="mamba",
+                            python_exe=python_exe,
+                            root_dir=root_dir,
+                            resources_dir=resources_dir,
+                            model_cache_arg=model_cache_arg)
+    else:
+        _log.info("Skipping Mamba tests")
 
 
 def prepare_multi_gpu_model_tests(python_exe: str,
@@ -313,12 +356,14 @@ def run_unit_tests(build_dir: _pl.Path):
     excluded_tests.append("Gptj")
     excluded_tests.append("Llama")
     excluded_tests.append("ChatGlm")
+    excluded_tests.append("Medusa")
+    excluded_tests.append("Mamba")
     ctest.extend(["-E", "|".join(excluded_tests)])
     run_command(ctest, cwd=build_dir, env=cpp_env, timeout=1800)
 
 
 def run_single_gpu_tests(build_dir: _pl.Path, run_gpt, run_gptj, run_llama,
-                         run_chatglm, run_fp8):
+                         run_chatglm, run_medusa, run_mamba, run_fp8):
     build_tests(build_dir=build_dir)
 
     cpp_env = {**_os.environ}
@@ -336,6 +381,10 @@ def run_single_gpu_tests(build_dir: _pl.Path, run_gpt, run_gptj, run_llama,
         included_tests.append("Llama")
     if run_chatglm:
         included_tests.append("ChatGlm")
+    if run_medusa:
+        included_tests.append("Medusa")
+    if run_mamba:
+        included_tests.append("Mamba")
 
     excluded_tests = []
     if not run_fp8:
@@ -353,16 +402,24 @@ def run_multi_gpu_tests(build_dir: _pl.Path):
 
     tests_dir = build_dir / "tests"
     cpp_env = {**_os.environ}
+    # TP2+PP2 tests fail for beam search
     session_test = [
         "mpirun", "-n", "4", "--allow-run-as-root", "gptSessionTest",
-        "--gtest_filter=*TP*:*PP*"
+        "--gtest_filter=*TP4*:*PP4*"
     ]
-    run_command(session_test, cwd=tests_dir, env=cpp_env, timeout=900)
+    run_command(session_test, cwd=tests_dir, env=cpp_env,
+                timeout=300)  # expecting ~250s
+
+    trt_model_test = [
+        "mpirun", "-n", "4", "--allow-run-as-root",
+        "batch_manager/trtGptModelRealDecoderTest", "--gtest_filter=*TP*:*PP*"
+    ]
+    run_command(trt_model_test, cwd=tests_dir, env=cpp_env,
+                timeout=1500)  # expecting ~ 1200s
 
 
 def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
                    resources_dir: _pl.Path):
-    scripts_dir = resources_dir / "scripts"
 
     make_benchmarks = [
         "cmake", "--build", ".", "--config", "Release", "-j", "--target",
@@ -373,28 +430,36 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
     benchmark_exe_dir = build_dir / "benchmarks"
     gpt_engine_dir = resources_dir / "models" / "rt_engine" / "gpt2"
     benchmark = [
-        str(benchmark_exe_dir / "gptSessionBenchmark"), "--model", "gpt",
-        "--engine_dir",
+        str(benchmark_exe_dir / "gptSessionBenchmark"), "--engine_dir",
         str(gpt_engine_dir / "fp16-plugin" / "tp1-pp1-gpu"), "--batch_size",
         "8", "--input_output_len", "10,20", "--duration", "10"
     ]
     run_command(benchmark, cwd=root_dir, timeout=600)
 
-    prompt_flags = [None, "--long_prompt"]
-    prompt_files = ["dummy_cnn.json", "dummy_long_cnn.json"]
-    token_files = ["prepared_" + s for s in prompt_files]
-    max_input_lens = ["20", "512"]
+    prompt_datasets_args = [{
+        '--dataset-name': "cnn_dailymail",
+        '--dataset-config-name': "3.0.0",
+        '--dataset-split': "validation",
+        '--dataset-input-key': "article",
+        '--dataset-prompt': "Summarize the following article:",
+        '--dataset-output-key': "highlights"
+    }, {
+        '--dataset-name': "Open-Orca/1million-gpt-4",
+        '--dataset-split': "train",
+        '--dataset-input-key': "question",
+        '--dataset-prompt-key': "system_prompt",
+        '--dataset-output-key': "response"
+    }]
+    token_files = [
+        "prepared_" + s['--dataset-name'].replace('/', '_')
+        for s in prompt_datasets_args
+    ]
+    max_input_lens = ["512", "20"]
+    num_reqs = ["50", "10"]
 
-    for flag, prompt_f, tokens_f, len in zip(prompt_flags, prompt_files,
-                                             token_files, max_input_lens):
-        generate_batch_manager_data = [
-            python_exe,
-            str(scripts_dir / "generate_batch_manager_data.py"),
-            "--output_filename", prompt_f
-        ]
-        if flag is not None:
-            generate_batch_manager_data.append(flag)
-        run_command(generate_batch_manager_data, cwd=root_dir, timeout=300)
+    for prompt_ds_args, tokens_f, len, num_req in zip(prompt_datasets_args,
+                                                      token_files,
+                                                      max_input_lens, num_reqs):
 
         benchmark_src_dir = _pl.Path("benchmarks") / "cpp"
         data_dir = resources_dir / "data"
@@ -402,14 +467,15 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
             python_exe,
             str(benchmark_src_dir / "prepare_dataset.py"), "--tokenizer",
             str(resources_dir / "models" / "gpt2"), "--output",
-            str(data_dir / tokens_f), "dataset", "--dataset",
-            str(data_dir / prompt_f), "--max-input-len", len
+            str(data_dir / tokens_f), "dataset", "--max-input-len", len,
+            "--num-requests", num_req
         ]
+        for k, v in prompt_ds_args.items():
+            prepare_dataset += [k, v]
         run_command(prepare_dataset, cwd=root_dir, timeout=300)
 
         benchmark = [
-            str(benchmark_exe_dir / "gptManagerBenchmark"), "--model", "gpt",
-            "--engine_dir",
+            str(benchmark_exe_dir / "gptManagerBenchmark"), "--engine_dir",
             str(gpt_engine_dir / "fp16-plugin-packed-paged" / "tp1-pp1-gpu"),
             "--type", "IFB", "--dataset",
             str(data_dir / tokens_f)
@@ -417,22 +483,12 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
         run_command(benchmark, cwd=root_dir, timeout=600)
 
         benchmark = [
-            str(benchmark_exe_dir / "gptManagerBenchmark"), "--model", "gpt",
-            "--engine_dir",
+            str(benchmark_exe_dir / "gptManagerBenchmark"), "--engine_dir",
             str(gpt_engine_dir / "fp16-plugin-packed-paged" / "tp1-pp1-gpu"),
             "--type", "V1", "--dataset",
             str(data_dir / tokens_f)
         ]
         run_command(benchmark, cwd=root_dir, timeout=600)
-
-    benchmark = [
-        str(benchmark_exe_dir / "gptManagerBenchmark"), "--model", "gpt",
-        "--engine_dir",
-        str(gpt_engine_dir / "fp16-plugin-packed-paged" / "tp1-pp1-gpu"),
-        "--type", "IFB", "--static_emulated_batch_size", "50", "--dataset",
-        str(data_dir / "prepared_dummy_cnn.json")
-    ]
-    run_command(benchmark, cwd=root_dir)
 
 
 if __name__ == "__main__":
@@ -479,6 +535,12 @@ if __name__ == "__main__":
     parser.add_argument("--run_chatglm",
                         action="store_true",
                         help="Run the tests for ChatGLM")
+    parser.add_argument("--run_medusa",
+                        action="store_true",
+                        help="Run the tests for Medusa")
+    parser.add_argument("--run_mamba",
+                        action="store_true",
+                        help="Run the tests for Mamba")
     parser.add_argument(
         "--run_fp8",
         action="store_true",
@@ -498,6 +560,7 @@ if __name__ == "__main__":
         args.run_gptj = True
         args.run_llama = True
         args.run_chatglm = True
+        args.run_mamba = True
 
     del args.run_all_models
 

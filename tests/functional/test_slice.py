@@ -20,6 +20,9 @@ import numpy as np
 import torch
 import tensorrt as trt
 # isort: on
+import os
+import sys
+
 from parameterized import parameterized
 from polygraphy.backend.trt import (CreateConfig, EngineFromNetwork, Profile,
                                     TrtRunner)
@@ -27,13 +30,17 @@ from polygraphy.backend.trt import (CreateConfig, EngineFromNetwork, Profile,
 import tensorrt_llm
 from tensorrt_llm import Tensor
 
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.util import unittest_name_func
+
 
 class TestFunctional(unittest.TestCase):
 
     def setUp(self):
         tensorrt_llm.logger.set_level('error')
 
-    @parameterized.expand([('float32', ), ('float16')])
+    @parameterized.expand([('float32', ), ('float16', )],
+                          name_func=unittest_name_func)
     def test_slice_1(self, dtype):
         # test data
         x_shape = (1, 256)

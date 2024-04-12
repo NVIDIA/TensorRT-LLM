@@ -29,6 +29,9 @@ from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.runtime import ModelConfig, SamplingConfig
 from tensorrt_llm.runtime.generation import _prepare_attention_mask
 
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.util import unittest_name_func
+
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 from examples.falcon.convert_checkpoint import convert_hf_falcon  # isort:skip
 
@@ -250,25 +253,13 @@ class TestFalcon(unittest.TestCase):
                        new_decoder_architecture, use_refit,
                        use_gpt_attengion_plugin, use_gemm_plugin,
                        remove_input_padding, context_fmha_type, dtype):
-        print(' Test Case Parameters')
-        print(' - query_type', query_type)
-        print(' - use_alibi', use_alibi)
-        print(' - parallel_attention', parallel_attention)
-        print(' - new_decoder_architecture', new_decoder_architecture)
-        print(' - use_refit', use_refit)
-        print(' - use_gpt_attengion_plugin', use_gpt_attengion_plugin)
-        print(' - use_gemm_plugin', use_gemm_plugin)
-        print(' - remove_input_padding', remove_input_padding)
-        print(' - context_fmha_type', context_fmha_type)
-        print(' - dtype', dtype)
-
         # Skip unsupported cases.
         if use_alibi and use_gpt_attengion_plugin:
             self.skipTest('ALiBi needs use_gpt_attengion_plugin = False')
         if not use_alibi and not use_gpt_attengion_plugin:
             self.skipTest('RoPE needs use_gpt_attengion_plugin = True')
 
-    @parameterized.expand(load_test_cases())
+    @parameterized.expand(load_test_cases(), name_func=unittest_name_func)
     def test_falcon(self, query_type, use_alibi, parallel_attention,
                     new_decoder_architecture, use_refit,
                     use_gpt_attengion_plugin, use_gemm_plugin,
@@ -316,6 +307,7 @@ class TestFalcon(unittest.TestCase):
         kv_dtype = dtype
         device = hf_model.device
         pad_id = hf_config.pad_token_id
+        num_layers = hf_config.num_hidden_layers
 
         # 1. Check the correctness of context computation.
 
@@ -353,7 +345,8 @@ class TestFalcon(unittest.TestCase):
         # past kv length: (length, is_context)
         host_past_key_value_lengths = torch.tensor([0] * batch_size,
                                                    dtype=torch.int32)
-        host_max_attention_window_sizes = torch.tensor([total_length],
+        host_max_attention_window_sizes = torch.tensor([total_length] *
+                                                       num_layers,
                                                        dtype=torch.int32)
         host_sink_token_length = torch.tensor([0], dtype=torch.int32)
 
@@ -382,9 +375,11 @@ class TestFalcon(unittest.TestCase):
             past_kv_shape = (batch_size, 2, num_kv_heads, 0, head_dim)
             present_kv_shape = (batch_size, 2, num_kv_heads, input_len,
                                 head_dim)
-        for i in range(hf_config.num_hidden_layers):
+        ctx_shape[f'host_max_attention_window_sizes'] = (num_layers, )
+        ctx_buffer[
+            f'host_max_attention_window_sizes'] = host_max_attention_window_sizes
+        for i in range(num_layers):
             ctx_shape[f'past_key_value_{i}'] = past_kv_shape
-            ctx_shape[f'host_max_attention_window_size_{i}'] = (1, )
             ctx_buffer[f'present_key_value_{i}'] = torch.zeros(
                 present_kv_shape,
                 dtype=str_dtype_to_torch(kv_dtype),
@@ -392,8 +387,6 @@ class TestFalcon(unittest.TestCase):
             if use_gpt_attengion_plugin:
                 ctx_buffer[f'past_key_value_{i}'] = ctx_buffer[
                     f'present_key_value_{i}']
-                ctx_buffer[
-                    f'host_max_attention_window_size_{i}'] = host_max_attention_window_sizes
             else:
                 ctx_buffer[f'past_key_value_{i}'] = torch.zeros(
                     (1, ), dtype=str_dtype_to_torch(kv_dtype), device=device)
@@ -458,14 +451,15 @@ class TestFalcon(unittest.TestCase):
         }
         if remove_input_padding:
             step1_buffer['host_context_lengths'] = gen_context_lengths.cpu()
+        if use_gpt_attengion_plugin:
+            step1_buffer[
+                f'host_max_attention_window_sizes'] = host_max_attention_window_sizes
         for i in range(hf_config.num_hidden_layers):
             kv_cache = ctx_buffer[f'present_key_value_{i}']
             step1_buffer[f'past_key_value_{i}'] = kv_cache
             if use_gpt_attengion_plugin:
                 # gpt_attention_plugin shares past/present cache.
                 step1_buffer[f'present_key_value_{i}'] = kv_cache
-                step1_buffer[
-                    f'host_max_attention_window_size_{i}'] = host_max_attention_window_sizes
         step1_shape = {k: v.shape for k, v in step1_buffer.items()}
 
         context = runtime.context_1
@@ -491,7 +485,7 @@ class TestFalcon(unittest.TestCase):
 
         torch.testing.assert_close(ref, res, atol=1e-2, rtol=1e-1)
 
-    @parameterized.expand(load_test_cases())
+    @parameterized.expand(load_test_cases(), name_func=unittest_name_func)
     def test_greedy_search(self, query_type, use_alibi, parallel_attention,
                            new_decoder_architecture, use_refit,
                            use_gpt_attengion_plugin, use_gemm_plugin,
@@ -539,6 +533,7 @@ class TestFalcon(unittest.TestCase):
 
         model_config = ModelConfig(
             max_batch_size=batch_size,
+            max_beam_width=beam_width,
             model_name=model_name,
             vocab_size=hf_config.vocab_size,
             num_layers=hf_config.num_hidden_layers,

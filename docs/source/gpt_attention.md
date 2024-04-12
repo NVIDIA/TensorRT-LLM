@@ -67,6 +67,15 @@ to the elements (like RoPE) and populate the KV cache (see below). In a future
 release, the number of such kernels is planned on being reduced in order to
 improve the overall performance.
 
+#### FP8 Context FMHA
+
+When FP8 quantization is activated, the attention can be further accelerated by
+enabling FP8 Context FMHA (`use_fp8_context_fmha = enable`).
+
+Please be aware that this is an experimental feature only supported on Hopper.
+If you notice a significant decrease in accuracy, it is recommended to disable
+it..
+
 ### Generation Phase
 
 The generation phase is implemented using a single kernel, called the masked
@@ -238,14 +247,15 @@ Similar to the cyclic KV cache feature in TensorRT-LLM, `max_attention_window_si
 parameter is used to determine `N`. Different from the cyclic KV cache feature,
 the first `S` tokens, called sink tokens, are always kept in the attention window,
 where `S` is determined by `sink_token_length` parameter in `GenerationSession.setup`.
+But in context phase, the self-attentions is dense in the official implementation of
+StreamingLLM, and it uses all of the tokens for computation and only saves `N` tokens
+to the KV cache.
+
 In addition, the relative position embedding is also changed in StreamingLLM.
 When determining the relative distance and adding positional information to tokens,
 StreamingLLM use the positions within the cache rather than those in the original text.
-`enable_pos_shift` flag is used to enable this feature.
 
-In context phase, the self-attentions is dense in the official implementation of
-StreamingLLM, and it uses all of the tokens for computation and only saves `N` tokens
-to the KV cache. This mode is determined by the `dense_context_fmha` flag.
+`streamingllm` flag is used to enable this feature.
 
 ## Beam-Search
 

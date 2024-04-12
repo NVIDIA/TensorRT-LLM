@@ -152,7 +152,7 @@ Tensor Tensor::slice(std::vector<size_t> shape, size_t offset) const
     return Tensor(this->where, this->type, shape, this->getPtrWithOffset(offset));
 }
 
-TensorMap::TensorMap(const std::unordered_map<std::string, Tensor>& tensor_map)
+TensorMap::TensorMap(std::unordered_map<std::string, Tensor> const& tensor_map)
 {
     for (auto& kv : tensor_map)
     {
@@ -167,7 +167,7 @@ TensorMap::TensorMap(const std::unordered_map<std::string, Tensor>& tensor_map)
     }
 }
 
-TensorMap::TensorMap(const std::vector<Tensor>& tensor_map)
+TensorMap::TensorMap(std::vector<Tensor> const& tensor_map)
 {
     for (size_t i = 0; i < tensor_map.size(); i++)
     {

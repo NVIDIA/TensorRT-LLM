@@ -61,7 +61,7 @@ nvinfer1::DataType typeFromNumpyDesc(std::string type)
 
 void parseNpyIntro(FILE*& f_ptr, uint32_t& header_len, uint32_t& start_data)
 {
-    const char magic[]
+    char const magic[]
         = "\x93"
           "NUMPY";
     char magic_test[sizeof(magic)] = "\0";
@@ -144,7 +144,7 @@ int parseNpyHeader(FILE*& f_ptr, uint32_t header_len, nvinfer1::DataType& type, 
 }
 
 //! \brief Create new tensor from numpy file.
-[[nodiscard]] ITensor::UniquePtr loadNpy(BufferManager& manager, const std::string& npyFile, const MemoryType where)
+[[nodiscard]] ITensor::UniquePtr loadNpy(BufferManager& manager, std::string const& npyFile, const MemoryType where)
 {
     FILE* f_ptr = fopen(npyFile.c_str(), "rb");
     if (f_ptr == nullptr)
@@ -180,7 +180,7 @@ int parseNpyHeader(FILE*& f_ptr, uint32_t header_len, nvinfer1::DataType& type, 
     return tensor;
 }
 
-void saveNpy(BufferManager& manager, ITensor const& tensor, const std::string& filename)
+void saveNpy(BufferManager& manager, ITensor const& tensor, std::string const& filename)
 {
     // Save tensor to NPY 1.0 format (see https://numpy.org/neps/nep-0001-npy-format.html)
     auto const tensorSize = tensor.getSize();
@@ -209,7 +209,7 @@ void saveNpy(BufferManager& manager, ITensor const& tensor, const std::string& f
         return;
     }
 
-    const char magic[]
+    char const magic[]
         = "\x93"
           "NUMPY";
     const uint8_t npy_major = 1;

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2024, NVIDIA CORPORATION.  All rights reserved.
  * Copyright (c) 2021, NAVER Corp.  Authored by CLOVA.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,6 +23,7 @@
 #include "tensorrt_llm/kernels/penaltyTypes.h"
 #include "tensorrt_llm/layers/baseLayer.h"
 #include "tensorrt_llm/layers/decodingParams.h"
+#include "tensorrt_llm/runtime/common.h"
 
 namespace tc = tensorrt_llm::common;
 
@@ -32,8 +33,7 @@ namespace layers
 {
 
 //! \brief Base class for sampling layers.
-//! Layer modifies logits in-place. However, when any of the requests skips the sampling layer,
-//! logits are copied and modified in temporary buffer.
+//! Layer modifies logits in-place.
 template <typename T>
 class BaseSamplingLayer : public BaseLayer
 {
@@ -41,12 +41,12 @@ public:
     class SetupParams : public DecodingSetupParams
     {
     public:
-        std::optional<std::vector<std::uint32_t>> runtime_top_k;  // [1] or [batchSize] on cpu
-        std::optional<std::vector<float>> runtime_top_p;          // [1] or [batchSize] on cpu
-        std::optional<std::vector<uint64_t>> randomSeed;          // [1] or [batchSize] on cpu
-        std::optional<std::vector<float>> top_p_decay;            // [batchSize], must between [0, 1]
-        std::optional<std::vector<float>> top_p_min;              // [batchSize], must between [0, 1]
-        std::optional<std::vector<std::int32_t>> top_p_reset_ids; // [batchSize]
+        std::optional<std::vector<runtime::SizeType>> runtime_top_k;      // [1] or [batchSize] on cpu
+        std::optional<std::vector<float>> runtime_top_p;                  // [1] or [batchSize] on cpu
+        std::optional<std::vector<uint64_t>> randomSeed;                  // [1] or [batchSize] on cpu
+        std::optional<std::vector<float>> top_p_decay;                    // [batchSize], must between [0, 1]
+        std::optional<std::vector<float>> top_p_min;                      // [batchSize], must between [0, 1]
+        std::optional<std::vector<runtime::TokenIdType>> top_p_reset_ids; // [batchSize]
         std::optional<bool> normalize_log_probs;
     };
 
@@ -63,8 +63,12 @@ public:
         int max_seq_len;
 
         // optional parameters
-        std::optional<tc::Tensor> embedding_bias; // [vocabSizePadded]
-        std::optional<tc::Tensor> input_lengths;  // [localBatchSize]
+        std::optional<tc::Tensor> input_lengths; // [localBatchSize]
+        curandState_t* curand_states;            // [localBatchSize]
+        // Pointer to the workspace for sampling computation
+        void* sampling_workspace;
+        // Flag to mark that logits tensor contains probabilities
+        bool probs_computed;
     };
 
     // clang-format off
@@ -77,10 +81,8 @@ public:
     //! \param allocator shared pointer to IAllocator object that will be use to alloc and free tensors
     //! \param prop [optional] cudaDeviceProp
     // clang-format on
-    BaseSamplingLayer(size_t maxBatchSize, size_t vocabSize, size_t vocabSizePadded, cudaStream_t stream,
-        std::shared_ptr<tensorrt_llm::common::IAllocator> allocator, cudaDeviceProp* prop);
-
-    BaseSamplingLayer(BaseSamplingLayer const& samplingLayer);
+    BaseSamplingLayer(runtime::SizeType maxBatchSize, runtime::SizeType vocabSize, runtime::SizeType vocabSizePadded,
+        cudaStream_t stream, std::shared_ptr<tensorrt_llm::common::IAllocator> allocator, cudaDeviceProp* prop);
 
     ~BaseSamplingLayer() override = default;
 
@@ -92,9 +94,9 @@ public:
     //!
     //! \param outputs DecodingOutputParams struct with output tensors
     //! \param inputs ForwardParams struct with input tensors and params
-    //! \param penaltyWorkspace
+    //! \param curandStatesDevice Properly initialized curand states buffer on device
     // clang-format on
-    void forward(DecodingOutputParams& outputs, ForwardParams const& inputs, int* penaltyWorkspace);
+    virtual void forward(DecodingOutputParams& outputs, ForwardParams& inputs) = 0;
 
     // clang-format off
     //! \brief Virtual function that setups internal tensors of the layer with sampling params
@@ -103,60 +105,28 @@ public:
     //! Thus, it must be called only once for new requests.
     //!
     //! \param batchSize Maximum batch size configured in the system
-    //! \param batchSlots input tensor [batchSize], address map of the new requests
+    //! \param batchSlots input tensor [batchSize], address map of the new requests, in pinned memory
     //! \param setupParams setup sampling parameters per request
     // clang-format on
-    virtual void setup(size_t batchSize, int const* batchSlots, SetupParams const& setupParams) = 0;
+    virtual void setup(runtime::SizeType batchSize, int32_t const* batchSlots, SetupParams const& setupParams) = 0;
+
+    size_t getWorkspaceSize() const
+    {
+        return mSamplingWorkspaceSize;
+    }
+
+    size_t getAllocatedSize() const
+    {
+        return mAllocatedSize;
+    }
 
 protected:
-    //! \brief setup of the base class, has to be called in the beginning of the derived's class setup
-    void setupBase(size_t batchSize, int const* batchSlots, SetupParams const& setupParams);
+    runtime::SizeType mMaxBatchSize;
+    runtime::SizeType mVocabSize;
+    runtime::SizeType mVocabSizePadded;
 
-    // clang-format off
-    //! \brief Executes sampling logic of the derived class
-    //!
-    //! \param outputs DecodingOutputParams struct with output tensors
-    //! \param inputs ForwardParams struct with input tensors and params
-    // clang-format on
-    virtual void runSampling(DecodingOutputParams& outputs, DecodingParams const& inputs) = 0;
-
-    virtual void freeBuffer();
-
-protected:
-    size_t mMaxBatchSize;
-    size_t mVocabSize;
-    size_t mVocabSizePadded;
-
-    size_t mSamplingWorkspaceSize;
-    void* mSamplingWorkspaceDevice = nullptr;
-    curandState_t* mCurandStatesDevice = nullptr;
-    uint64_t* mRandomSeedsDevice = nullptr;
-
-    float* mTemperaturesDevice = nullptr;
-    float* mRepetitionPenaltiesDevice = nullptr;
-    float* mPresencePenaltiesDevice = nullptr;
-    float* mFrequencyPenaltiesDevice = nullptr;
-    int32_t* mMinLengthsDevice = nullptr;
-    bool* mSkipDecodeDevice = nullptr;
-    T* mRuntimeLogitsDevice = nullptr;
-    void* mSetupWorkspaceDevice = nullptr;
-
-    std::vector<float> mTemperature;
-    std::vector<float> mRepetitionPenalty;
-    std::vector<float> mPresencePenalty;
-    std::vector<float> mFrequencyPenalty;
-    std::vector<int32_t> mMinLengths;
-    bool* mSkipDecodeHost = nullptr;
-    bool mSkipAny = false;
-
-    bool mUseTemperature = false;
-    bool mUseRepetitionPenalty = false;
-    bool mUsePresencePenalty = false;
-    bool mUseFrequencyPenalty = false;
-    bool mUseMinLengths = false;
-
-private:
-    void allocateBuffer(size_t batchSize);
+    size_t mSamplingWorkspaceSize = 0;
+    size_t mAllocatedSize = 0;
 };
 
 } // namespace layers

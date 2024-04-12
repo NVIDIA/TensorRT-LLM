@@ -43,15 +43,18 @@ function(add_gtest test_name test_src)
   target_compile_definitions(${test_name}
                              PUBLIC TOP_LEVEL_DIR="${TOP_LEVEL_DIR}")
   gtest_discover_tests(
-    ${test_name} PROPERTIES ENVIRONMENT "CUDA_MODULE_LOADING=LAZY"
-                            DISCOVERY_TIMEOUT 30) # Longer timeout needed
-                                                  # because discovery can be
-                                                  # slow on Windows
+    ${test_name}
+    PROPERTIES ENVIRONMENT "CUDA_MODULE_LOADING=LAZY" DISCOVERY_MODE
+               PRE_TEST # WAR for DLL discovery on windows.
+               DISCOVERY_TIMEOUT 30) # Longer timeout needed because discovery
+                                     # can be slow on Windows
   add_dependencies(google-tests ${test_name})
 endfunction()
 
 add_gtest(loraManagerTest runtime/loraManagerTest.cpp)
 add_gtest(loraUtilsTest runtime/loraUtilsTest.cpp)
+add_gtest(loraCacheTest runtime/loraCacheTest.cpp)
+add_gtest(workerPoolTest runtime/workerPoolTest.cpp)
 add_gtest(attentionKernelTest runtime/transposeKVKernelTest.cpp)
 add_gtest(gptDecoderTest runtime/gptDecoderTest.cpp)
 add_gtest(gptDecoderBatchTest runtime/gptDecoderBatchTest.cpp)
@@ -69,8 +72,10 @@ add_gtest(tllmBuffersTest runtime/tllmBuffersTest.cpp)
 add_gtest(bufferManagerTest runtime/bufferManagerTest.cpp)
 add_gtest(runtimeKernelTest runtime/runtimeKernelTest.cpp)
 add_gtest(samplingTest runtime/samplingTest.cpp)
+add_gtest(samplingConfigTest runtime/samplingConfigTest.cpp)
 add_gtest(iTensorTest runtime/iTensorTest.cpp)
 add_gtest(worldConfigTest runtime/worldConfigTest.cpp)
+add_gtest(medusaModuleTest runtime/medusaModuleTest.cpp)
 add_gtest(mixtureOfExpertsTest kernels/mixtureOfExpertsTest.cu)
 if(${BUILD_PYT})
   add_gtest(torchTest runtime/torchTest.cpp)
@@ -85,17 +90,24 @@ set(SAMPLING_KERNEL_TEST_SRC
     kernels/sampling/samplingUtilsTest.cu)
 add_gtest(samplingKernelsTest "${SAMPLING_KERNEL_TEST_SRC}")
 add_gtest(weightOnlyKernelTest kernels/weightOnly/weightOnlyKernelTest.cpp)
+add_gtest(smoothQuantKernelTest kernels/smoothQuant/smoothQuantKernelTest.cpp)
 add_gtest(decodingKernelsTest kernels/decodingKernelTest.cpp)
 add_gtest(banRepeatNGramsKernelsTest kernels/banRepeatNGramsKernelsTest.cpp)
 add_gtest(stopCriteriaKernelsTest kernels/stopCriteriaKernelsTest.cpp)
 add_gtest(shiftKCacheKernelTest kernels/shiftKCacheKernelTest.cu)
 set(SAMPLING_LAYER_TEST_SRC
-    layers/samplingLayerTest.cpp layers/topKSamplingLayerTest.cpp
-    layers/topPSamplingLayerTest.cpp)
+    layers/baseSamplingLayerTest.cpp layers/samplingLayerTest.cpp
+    layers/topKSamplingLayerTest.cpp layers/topPSamplingLayerTest.cpp)
 add_gtest(samplingLayerTest "${SAMPLING_LAYER_TEST_SRC}")
+add_gtest(dynamicDecodeLayerTest layers/dynamicDecodeLayerTest.cpp)
+add_gtest(medusaDecodeLayerTest layers/medusaDecodeLayerTest.cpp)
 
 if(BUILD_BATCH_MANAGER)
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/batch_manager)
     add_subdirectory(batch_manager)
   endif()
+endif()
+
+if(BUILD_EXECUTOR)
+  add_subdirectory(executor)
 endif()

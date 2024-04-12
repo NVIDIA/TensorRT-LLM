@@ -1,4 +1,4 @@
-Usage:
+The folder contains examples to demonstrate the usage of `LLaMAForCausalLM` class, the low level `tensorrt_llm.builder.build"
 
 # Single GPU
 ```bash
@@ -15,6 +15,13 @@ Using multi GPU tensor parallel to build and run llama, and then generate on pre
 Note that multi GPU can also support the chat scenario, need to add additional code to read input from the root process, and broadcast the tokens to all worker processes.
 The example only targets to demonstrate the TRT-LLM API usage here, so it uses pre-defined dataset for simplicity.
 
+```bash
+python ./llama_multi_gpu.py --hf_model_dir <hf llama path> --engine_dir ./llama.engine.tp2 -c --tp_size 2
 ```
-python ./llama_multi_gpu.py --hf_model_dir <llama-7b-hf path> --engine_dir ./llama.engine.tp2 -c --tp_size 2
+
+# Quantization
+Using AWQ INT4 weight only algorithm to quantize the given hugging llama model first and save as TRT-LLM checkpoint, and then build TRT-LLM engine from that checkpoint and serve
+
+```bash
+python ./llama_quantize.py --hf_model_dir <hf llama path> --cache_dir ./llama.awq/ -c
 ```

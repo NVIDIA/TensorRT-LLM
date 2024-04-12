@@ -196,7 +196,7 @@ class BlocksManager(object):
 
     def get_pointer_array(self, pool_idx: int, beam_width: int) -> torch.Tensor:
         """
-        Returns array of [batch size, beam_width, 2, max_blocks_per_seq] of poitners
+        Returns array of [batch size, beam_width, 2, max_blocks_per_seq] of pointers
         to the allocated blocks in memory pool
         """
         assert (beam_width <= self.beam_width)
@@ -224,21 +224,21 @@ class BlocksManager(object):
         self.pointer_array = torch.tensor(pointer_array, dtype=torch.int64)
         return self.pointer_array
 
-    def get_continous_caches(self, pool_idx: int) -> torch.Tensor:
+    def get_continuous_caches(self, pool_idx: int) -> torch.Tensor:
         """
-        Returns countinous KV caches.
+        Returns continuous KV caches.
         Used only for debug purposes.
         """
         assert self.beam_width == 1
 
         elts_per_block = self.elts_per_blocks[pool_idx]
         pool = self.memory_pools[pool_idx].flatten()
-        continous_kv_cache = torch.zeros(len(self.allocated_blocks),
-                                         2,
-                                         self.max_blocks_per_seq *
-                                         elts_per_block,
-                                         dtype=pool.dtype,
-                                         device="cuda")
+        continuous_kv_cache = torch.zeros(len(self.allocated_blocks),
+                                          2,
+                                          self.max_blocks_per_seq *
+                                          elts_per_block,
+                                          dtype=pool.dtype,
+                                          device="cuda")
         for owner, beam_blocks in self.allocated_blocks.items():
             for bi in range(self.beam_width):
                 for block_linear_idx, block in enumerate(beam_blocks[bi]):
@@ -251,14 +251,14 @@ class BlocksManager(object):
                     # The first index in the pool for V.
                     v_start = k_start + self.blocks * elts_per_block
 
-                    continous_kv_cache[batch_idx][0][
+                    continuous_kv_cache[batch_idx][0][
                         block_offset:block_offset +
                         elts_per_block] = pool[k_start:k_start + elts_per_block]
-                    continous_kv_cache[batch_idx][1][
+                    continuous_kv_cache[batch_idx][1][
                         block_offset:block_offset +
                         elts_per_block] = pool[v_start:v_start + elts_per_block]
 
-        return continous_kv_cache
+        return continuous_kv_cache
 
 
 class KVCacheManager(object):
@@ -374,7 +374,7 @@ class KVCacheManager(object):
             self.blocks_manager.allocate(
                 sequence, share_across_beam=i != unshared_block_idx)
 
-    def get_pointer_arrays(self, beam_width: int) -> List[torch.Tensor]:
+    def get_block_pointers(self, beam_width: int) -> torch.Tensor:
         """
         Returns arrays of pointers for all memory pools
         """
@@ -383,7 +383,8 @@ class KVCacheManager(object):
             pointer_arrays.append(
                 self.blocks_manager.get_pointer_array(
                     pool, beam_width).view(dtype=torch.int64))
-        return pointer_arrays
+
+        return torch.stack(pointer_arrays, dim=0)
 
 
 class KVCacheUpdater:
@@ -417,13 +418,17 @@ class KVCacheUpdater:
     def update(self, accepted_draft_token_offsets,
                packed_accepted_draft_tokens_indices, sequence_length_buffer,
                rewind_tokens):
+        assert isinstance(rewind_tokens, torch.Tensor) or isinstance(
+            rewind_tokens, int)
+        rewind_tokens_tensor = rewind_tokens if isinstance(
+            rewind_tokens, torch.Tensor) else None
+        rewind_tokens_count = rewind_tokens if isinstance(rewind_tokens,
+                                                          int) else 0
         assert self.use_paged_kv_cache is not None
         if self.use_paged_kv_cache:
-            host_kv_cache_block_pointers = self.kv_cache_manager.get_pointer_arrays(
+            host_kv_cache_block_pointers = self.kv_cache_manager.get_block_pointers(
                 1)
-            kv_cache_block_pointers = [
-                x.to('cuda') for x in host_kv_cache_block_pointers
-            ]
+            kv_cache_block_pointers = host_kv_cache_block_pointers.to('cuda')
             torch.ops.tensorrt_llm.update_kv_cache_draft_token_location(
                 accepted_draft_token_offsets,
                 packed_accepted_draft_tokens_indices,
@@ -431,8 +436,9 @@ class KVCacheUpdater:
                 True,
                 self.num_kv_heads,
                 self.head_dim * self.elt_size,
-                rewind_tokens,
+                rewind_tokens_count,
                 self.kv_cache_manager.max_attention_window_size,
+                rewind_tokens_tensor,
                 None,
                 kv_cache_block_pointers,
                 self.kv_cache_manager.blocks_manager.max_blocks_per_seq,
@@ -447,8 +453,9 @@ class KVCacheUpdater:
                 False,
                 self.num_kv_heads,
                 self.head_dim * self.elt_size,
-                rewind_tokens,
+                rewind_tokens_count,
                 self.max_kv_cache_length,
+                rewind_tokens_tensor,
                 self.past_key_value_list,
                 None,
                 None,
