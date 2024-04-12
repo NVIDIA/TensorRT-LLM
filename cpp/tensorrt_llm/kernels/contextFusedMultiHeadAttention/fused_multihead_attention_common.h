@@ -84,9 +84,9 @@ struct AlibiParams
 struct Fused_multihead_attention_params_v2
 {
     // The QKV matrices.
-    const void* qkv_ptr;
+    void const* qkv_ptr;
     // The mask to implement drop-out.
-    const void* packed_mask_ptr;
+    void const* packed_mask_ptr;
     // The O matrix (output).
     void* o_ptr;
 
@@ -106,7 +106,7 @@ struct Fused_multihead_attention_params_v2
     bool enable_i2f_trick;
 
     // array of length b+1 holding prefix sum of actual sequence lengths
-    const int* cu_seqlens;
+    int const* cu_seqlens;
 
     // use C/32 Format.
     bool interleaved = false;
@@ -122,8 +122,9 @@ struct Fused_multihead_attention_params_v2
     int *counters, *max_barriers, *sum_barriers, *locks;
     // Scratch buffers to finalize softmax.
     float *max_scratch_ptr, *sum_scratch_ptr;
-    // Scratch buffer to finalize the output (not needed for FP16).
-    int* o_scratch_ptr;
+
+    // Scale bmm2 in the device memory.
+    uint32_t const* scale_bmm2_d;
 
     // In multi-query or grouped-query attention (MQA/GQA), several Q heads are associated with one KV head
     int h_kv;
@@ -177,13 +178,13 @@ struct Fused_multihead_attention_params_v2
 struct Fused_multihead_attention_paged_kv_params_v2
 {
     // The Q matrices.
-    const void* q_ptr;
+    void const* q_ptr;
     // Paged KV Cache buffer.
     KVBlockArrayForContextFMHA paged_kv_cache;
     // The O matrix (output).
     void* o_ptr;
     // The packed mask for random mask.
-    const void* packed_mask_ptr;
+    void const* packed_mask_ptr;
 
     // The stride between rows of the Q matrices.
     int64_t q_stride_in_bytes;
@@ -199,6 +200,10 @@ struct Fused_multihead_attention_paged_kv_params_v2
     // The scaling factors for the kernel.
     uint32_t scale_bmm1, scale_softmax, scale_bmm2;
 
+    // TODO: add fp8 paged kv fmha later.
+    // Scale bmm2 in the device memory.
+    // uint32_t const* scale_bmm2_d;
+
     // Do we use Niall's trick to avoid I2F/F2I in the INT8 kernel.
     // See https://confluence.nvidia.com/pages/viewpage.action?pageId=302779721 for details.
     bool enable_i2f_trick;
@@ -211,9 +216,9 @@ struct Fused_multihead_attention_paged_kv_params_v2
     AlibiParams alibi_params;
 
     // array of length b+1 holding prefix sum of actual kv sequence lengths.
-    const int* cu_seqlens;
+    int const* cu_seqlens;
     // Chunked attention (only handles one tile of Q).
-    const int* cu_q_seqlens;
+    int const* cu_q_seqlens;
 
     // q with shape [B, S, H, D] in const cache.
     cudaTmaDesc tma_desc_q;
@@ -283,6 +288,8 @@ struct Launch_params
     int kernel_s = 0;
     // kv_seq_length to set launch strategies.
     int kernel_kv_s = 0;
+    // padded head size (new power of 2) for tma descriptors.
+    int padded_d = 0;
     // flags to control small batch kernel choice
     // true: never unroll
     bool ignore_b1opt = false;
@@ -299,7 +306,7 @@ struct Launch_params
     // number of paged kv blocks for context sequence.
     int blocks_per_context_sequence = 0;
     // device ptrs on the host for paged kv cache.
-    const int64_t* paged_kv_block_ptrs = nullptr;
+    int64_t const* paged_kv_block_ptrs = nullptr;
     // if flash attention is used (only FP16)
     bool flash_attention = false;
     // if warp_specialized kernels are used (only SM90 HGMMA + TMA)
@@ -321,6 +328,7 @@ struct Launch_params
     {
         kernel_s = 0;
         kernel_kv_s = 0;
+        padded_d = 0;
         force_unroll = false;
         use_tma = false;
         flash_attention = false;

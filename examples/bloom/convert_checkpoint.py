@@ -19,7 +19,7 @@ from transformers.pytorch_utils import Conv1D
 # isort: off
 import tensorrt_llm
 from tensorrt_llm import logger
-from tensorrt_llm.quantization import QuantMode
+from tensorrt_llm.quantization import QuantAlgo, QuantMode
 from tensorrt_llm.models.llama.utils import iterate_shard_files, load_state_dict  #TODO: move the utils to common dir shared by models
 # isort: on
 
@@ -519,7 +519,7 @@ def smooth_bloom_model(model, scales, alpha, bloom_qkv_param, bloom_smoother):
         bloom_qkv_param[layer_name] = param
 
         # dense
-        # enabled for better accuracy with perf overhead of quantiztion
+        # enabled for better accuracy with perf overhead of quantization
         layer_name = name + ".self_attention.dense"
         smoother = smooth_gemm(module.self_attention.dense.weight,
                                scales[layer_name]["x"], None, None, alpha)
@@ -540,7 +540,7 @@ def smooth_bloom_model(model, scales, alpha, bloom_qkv_param, bloom_smoother):
             dim=1)[0]
 
         # fc2
-        # enabled for better accuracy with perf overhead of quantiztion
+        # enabled for better accuracy with perf overhead of quantization
         layer_name = name + ".mlp.dense_4h_to_h"
         smoother = smooth_gemm(module.mlp.dense_4h_to_h.weight,
                                scales[layer_name]["x"], None, None, alpha)
@@ -1046,23 +1046,23 @@ def main():
     plugin_weight_only_quant_type = None
     if args.use_weight_only and args.weight_only_precision == 'int8':
         plugin_weight_only_quant_type = torch.int8
-        quant_algo = 'W8A16'
+        quant_algo = QuantAlgo.W8A16
     elif args.use_weight_only and args.weight_only_precision == 'int4':
         plugin_weight_only_quant_type = torch.quint4x2
-        quant_algo = 'W4A16'
+        quant_algo = QuantAlgo.W4A16
     elif args.smoothquant:
         if args.per_channel and args.per_token:
-            quant_algo = 'W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN'
+            quant_algo = QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
         elif args.per_channel and not args.per_token:
-            quant_algo = 'W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN'
+            quant_algo = QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN
         elif not args.per_channel and args.per_token:
-            quant_algo = 'W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN'
+            quant_algo = QuantAlgo.W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN
         else:
-            quant_algo = 'W8A8_SQ_PER_TENSOR_PLUGIN'
+            quant_algo = QuantAlgo.W8A8_SQ_PER_TENSOR_PLUGIN
 
     kv_cache_quant_algo = None
     if args.int8_kv_cache:
-        kv_cache_quant_algo = 'INT8'
+        kv_cache_quant_algo = QuantAlgo.INT8
 
     hf_config = BloomConfig.from_pretrained(args.model_dir)
     config = {
@@ -1090,8 +1090,6 @@ def main():
         'embedding_sharding_dim': args.embedding_sharding_dim,
         'share_embedding_table': args.use_embedding_sharing,
     }
-    if args.smoothquant:
-        config['quantization']['sq_use_plugin'] = True
 
     with (args.output_dir / 'config.json').open('w') as f:
         json.dump(config, f, indent=4)

@@ -18,7 +18,7 @@ from ..module import Module
 from ..quantization import QuantMode
 from ..quantization.layers import FP8Linear, FP8RowLinear
 from .linear import ColumnLinear, RowLinear
-from .lora import Lora, LoraRuntimeParams
+from .lora import LoraRuntimeParams
 
 
 class MLP(Module):
@@ -33,7 +33,6 @@ class MLP(Module):
             tp_group=None,
             tp_size=1,
             quant_mode=QuantMode(0),
-            max_lora_rank=None,
     ):
         super().__init__()
         if hidden_act not in ACT2FN:
@@ -49,15 +48,13 @@ class MLP(Module):
                                 dtype=dtype,
                                 tp_group=tp_group,
                                 tp_size=tp_size,
-                                gather_output=False,
-                                max_lora_rank=max_lora_rank)
+                                gather_output=False)
             self.proj = FP8RowLinear(ffn_hidden_size,
                                      hidden_size,
                                      bias=bias,
                                      dtype=dtype,
                                      tp_group=tp_group,
-                                     tp_size=tp_size,
-                                     max_lora_rank=max_lora_rank)
+                                     tp_size=tp_size)
         else:
             self.fc = ColumnLinear(hidden_size,
                                    fc_output_size,
@@ -65,15 +62,13 @@ class MLP(Module):
                                    dtype=dtype,
                                    tp_group=tp_group,
                                    tp_size=tp_size,
-                                   gather_output=False,
-                                   max_lora_rank=max_lora_rank)
+                                   gather_output=False)
             self.proj = RowLinear(ffn_hidden_size,
                                   hidden_size,
                                   bias=bias,
                                   dtype=dtype,
                                   tp_group=tp_group,
-                                  tp_size=tp_size,
-                                  max_lora_rank=max_lora_rank)
+                                  tp_size=tp_size)
 
         self.hidden_act = hidden_act
         self.dtype = dtype
@@ -108,7 +103,6 @@ class GatedMLP(MLP):
             tp_group=None,
             tp_size=1,
             quant_mode=QuantMode(0),
-            max_lora_rank=None,
     ):
         super().__init__(hidden_size,
                          ffn_hidden_size,
@@ -127,7 +121,6 @@ class GatedMLP(MLP):
         self.tp_group = tp_group
         self.tp_size = tp_size
         self.quant_mode = quant_mode
-        self.max_lora_rank = max_lora_rank
 
         if self.use_fp8_qdq:
             self.gate = FP8Linear(hidden_size,
@@ -136,8 +129,7 @@ class GatedMLP(MLP):
                                   dtype=dtype,
                                   tp_group=tp_group,
                                   tp_size=tp_size,
-                                  gather_output=False,
-                                  max_lora_rank=max_lora_rank)
+                                  gather_output=False)
         else:
             self.gate = ColumnLinear(hidden_size,
                                      ffn_hidden_size,
@@ -145,8 +137,7 @@ class GatedMLP(MLP):
                                      dtype=dtype,
                                      tp_group=tp_group,
                                      tp_size=tp_size,
-                                     gather_output=False,
-                                     max_lora_rank=max_lora_rank)
+                                     gather_output=False)
 
     def forward(self, hidden_states, lora_layer_params=None):
 
@@ -186,7 +177,6 @@ class FusedGatedMLP(Module):
             tp_group=None,
             tp_size=1,
             quant_mode=QuantMode(0),
-            max_lora_rank=None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -214,8 +204,7 @@ class FusedGatedMLP(Module):
                                      bias=bias,
                                      dtype=dtype,
                                      tp_group=tp_group,
-                                     tp_size=tp_size,
-                                     max_lora_rank=max_lora_rank)
+                                     tp_size=tp_size)
         else:
             self.fused_fc = ColumnLinear(
                 self.hidden_size,
@@ -231,18 +220,7 @@ class FusedGatedMLP(Module):
                                   bias=bias,
                                   dtype=dtype,
                                   tp_group=tp_group,
-                                  tp_size=tp_size,
-                                  max_lora_rank=max_lora_rank)
-
-        if max_lora_rank is None:
-            max_lora_rank = min(hidden_size, ffn_hidden_size // tp_size)
-        self.mlp_in_lora = Lora(
-            in_hidden_size=hidden_size,
-            out_hidden_sizes=[
-                ffn_hidden_size // tp_size, ffn_hidden_size // tp_size
-            ],
-            max_low_rank=max_lora_rank,
-        )
+                                  tp_size=tp_size)
 
     def forward(self, hidden_states, lora_layer_params=None):
         # Combine the following pattern

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -41,34 +41,27 @@ protected:
     using SamplingKernelTest<T>::mBufferManager;
 
 private:
-    size_t getWorkspaceSize(const SamplingKernelTestParam& params) override
+    size_t getWorkspaceSize(SamplingKernelTestParam const& params) override
     {
-        size_t sampling_workspace_size_;
-        tk::invokeAirTopPSampling<T>(nullptr, sampling_workspace_size_,
-            nullptr, // output_ids
-            nullptr, // sequence_length
-            nullptr, // finished_input_buffer
-            nullptr, // finished_output_buffer
-            nullptr, // cum_log_probs
-            nullptr, // output_log_probs
-            nullptr, // log_probs)
-            this->mCurandStatesDevice, params.batchSize, params.vocabSize, nullptr, this->mMaxTopP,
-            this->mStream->get(), 0, nullptr, nullptr);
-        return sampling_workspace_size_;
+        return tensorrt_llm::kernels::getAirTopPWorkspaceSize<T>(
+            params.batchSize, params.vocabSize, params.isDeterministicTopP);
     }
 
-    void callTestedFunction(const SamplingKernelTestParam& params, bool hasDiffRuntimeArgs, size_t workspaceSize,
-        tensorrt_llm::runtime::ITensor::SharedPtr& workspaceDevice) override
+    void callTestedFunction(
+        SamplingKernelTestParam const& params, tensorrt_llm::runtime::ITensor::SharedPtr& workspaceDevice) override
     {
         // Calculate the number of blocks based on the number of multiprocessors, batchSize and vocabSize.
         int dev;
         int smCnt;
         TLLM_CUDA_CHECK(cudaGetDevice(&dev));
         TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&smCnt, cudaDevAttrMultiProcessorCount, dev));
+        auto const maxBatchSize = 2 * params.batchSize;
 
-        int blockNum = tk::calcAirTopPBlockNum<T, int, float>(params.batchSize, params.vocabSize, smCnt);
+        int blockNum
+            = tk::calcAirTopPBlockNum<T>(params.batchSize, params.vocabSize, smCnt, params.isDeterministicTopP);
+
         // Perform batched TopP sampling
-        tk::invokeBatchAirTopPSampling<T>(workspaceDevice->data(), workspaceSize, bufferCast<int*>(*this->mIdsPtrHost),
+        tk::invokeBatchAirTopPSampling<T>(workspaceDevice->data(), bufferCast<int*>(*this->mIdsPtrHost),
             bufferCast<int32_t>(*this->mSeqLengthsDevice),
             reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
                 bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(*this->mFinishedDevice)),
@@ -79,45 +72,67 @@ private:
             // log-prob if cum_log_probs or output_log_probs are
             // provided. It's because the sampling layer already
             // preprocesses log_prob_buf when those are provided.
-            bufferCast<T>(*this->mProbsDevice), this->mCurandStatesDevice, params.batchSize, params.vocabSize,
-            bufferCast<int32_t>(*this->mEndIdsDevice), this->mMaxTopP,
-            hasDiffRuntimeArgs ? bufferCast<float>(*this->mTopPsDevice) : nullptr, this->mStream->get(), blockNum,
-            bufferCast<bool>(*this->mSkipDecodeDevice), bufferCast<int32_t>(*this->mBatchSlots));
+            bufferCast<T>(*this->mProbsDevice),
+            reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*this->mCurandStatesDevice)), params.batchSize,
+            maxBatchSize, params.vocabSize, bufferCast<int32_t>(*this->mEndIdsDevice), this->mMaxTopP,
+            bufferCast<float>(*this->mTopPsDevice), this->mStream->get(), blockNum,
+            bufferCast<bool>(*this->mSkipDecodeDevice), bufferCast<int32_t>(*this->mBatchSlots),
+            params.isDeterministicTopP);
     }
 };
 
 TYPED_TEST_SUITE(AirTopPSamplingKernelTest, FloatAndHalfTypes);
 
-TYPED_TEST(AirTopPSamplingKernelTest, CorrectnessSmallP)
+TYPED_TEST(AirTopPSamplingKernelTest, NondeterministicCorrectnessSmallP)
 {
-    GTEST_SKIP() << "Disabled because of https://nvbugspro.nvidia.com/bug/4469821";
-    this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopK(0).setTopP(0.2f).setOutputLen(1));
+    this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopP(0.2f));
 };
 
-TYPED_TEST(AirTopPSamplingKernelTest, CorrectnessLargeP)
+TYPED_TEST(AirTopPSamplingKernelTest, NondeterministicCorrectnessLargeP)
 {
-    GTEST_SKIP() << "Disabled because of https://nvbugspro.nvidia.com/bug/4469821";
-    this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopK(0).setTopP(0.9f).setOutputLen(1));
+    this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopP(0.9f));
 };
 
-TYPED_TEST(AirTopPSamplingKernelTest, CorrectnessAncestral)
+TYPED_TEST(AirTopPSamplingKernelTest, NondeterministicCorrectnessAncestral)
 {
-    GTEST_SKIP() << "Disabled because of https://nvbugspro.nvidia.com/bug/4469821";
-    this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopK(0).setTopP(1.0f).setOutputLen(1));
+    this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopP(1.0f));
 };
 
-TYPED_TEST(AirTopPSamplingKernelTest, CorrectnessLargeVocabSmallP)
+TYPED_TEST(AirTopPSamplingKernelTest, NondeterministicCorrectnessLargeVocabSmallP)
 {
-    GTEST_SKIP() << "Disabled because of https://nvbugspro.nvidia.com/bug/4469821";
+    this->runTest(SamplingKernelTestParam().setBatchSize(32).setVocabSize(51200).setTopP(0.2f));
+};
+
+TYPED_TEST(AirTopPSamplingKernelTest, NondeterministicCorrectnessLargeVocabLargeP)
+{
+    this->runTest(SamplingKernelTestParam().setBatchSize(32).setVocabSize(51200).setTopP(0.9f));
+};
+
+TYPED_TEST(AirTopPSamplingKernelTest, DeterministicCorrectnessSmallP)
+{
+    this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopP(0.2f).setDeterministicTopP(true));
+};
+
+TYPED_TEST(AirTopPSamplingKernelTest, DeterministicCorrectnessLargeP)
+{
+    this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopP(0.9f).setDeterministicTopP(true));
+};
+
+TYPED_TEST(AirTopPSamplingKernelTest, DeterministicCorrectnessAncestral)
+{
+    this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopP(1.0f).setDeterministicTopP(true));
+};
+
+TYPED_TEST(AirTopPSamplingKernelTest, DeterministicCorrectnessLargeVocabSmallP)
+{
     this->runTest(
-        SamplingKernelTestParam().setBatchSize(32).setVocabSize(51200).setTopK(0).setTopP(0.2f).setOutputLen(16));
+        SamplingKernelTestParam().setBatchSize(32).setVocabSize(51200).setTopP(0.2f).setDeterministicTopP(true));
 };
 
-TYPED_TEST(AirTopPSamplingKernelTest, CorrectnessLargeVocabLargeP)
+TYPED_TEST(AirTopPSamplingKernelTest, DeterministicCorrectnessLargeVocabLargeP)
 {
-    GTEST_SKIP() << "Disabled because of https://nvbugspro.nvidia.com/bug/4469821";
     this->runTest(
-        SamplingKernelTestParam().setBatchSize(32).setVocabSize(51200).setTopK(0).setTopP(0.9f).setOutputLen(16));
+        SamplingKernelTestParam().setBatchSize(32).setVocabSize(51200).setTopP(0.9f).setDeterministicTopP(true));
 };
 
 class AirTopPSamplingKernelUtilsTest : public SamplingKernelTest<float>

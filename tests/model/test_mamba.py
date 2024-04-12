@@ -35,10 +35,13 @@ from tensorrt_llm.layers.ssm import MambaParameters
 from tensorrt_llm.network import net_guard
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
+
 from examples.mamba.convert_checkpoint import (convert_from_hf_checkpoint,
                                                convert_hf_mamba)
-from tests.utils.llm_data import llm_models_root
-from tests.utils.util import getSMVersion
+
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.llm_data import llm_models_root
+from utils.util import skip_bf16_pre_ampere, unittest_name_func
 
 
 class TestMamba(unittest.TestCase):
@@ -78,15 +81,16 @@ class TestMamba(unittest.TestCase):
             network.set_named_parameters(tensorrt_llm_mamba.named_parameters())
             inputs = tensorrt_llm_mamba.prepare_inputs(batch_size,
                                                        input_len,
-                                                       output_len,
+                                                       input_len + output_len,
                                                        use_cache=False)
             # Prepare
             tensorrt_llm_mamba(**inputs)
         return network
 
-    def _gen_tensorrt_llm_engine(self, model_name, gemm_plugin, hf_config,
-                                 hf_path, hf_mamba, load_mode, batch_size,
-                                 input_len, output_len, dtype):
+    def _gen_tensorrt_llm_engine(self, model_name, gemm_plugin,
+                                 mamba_conv1d_plugin, hf_config, hf_path,
+                                 hf_mamba, load_mode, batch_size, input_len,
+                                 output_len, dtype, remove_padding):
         builder = Builder()
         with tempfile.TemporaryDirectory() as tmpdirname:
             builder_config = builder.create_builder_config(
@@ -96,8 +100,14 @@ class TestMamba(unittest.TestCase):
             )
             network = builder.create_network()
             network.plugin_config.to_legacy_setting()
+            network.plugin_config.remove_input_padding = remove_padding
+            network.plugin_config.paged_state = False
             if gemm_plugin:
                 network.plugin_config.set_gemm_plugin(dtype)
+            if mamba_conv1d_plugin:
+                network.plugin_config.set_mamba_conv1d_plugin(dtype)
+            else:
+                network.plugin_config.set_mamba_conv1d_plugin(None)
 
             self._gen_tensorrt_llm_network(network, hf_config, hf_path,
                                            hf_mamba, load_mode, batch_size,
@@ -107,31 +117,38 @@ class TestMamba(unittest.TestCase):
             return engine_buffer
 
     def _gen_tensorrt_llm_runtime(self, log_level, model_name, gemm_plugin,
-                                  hf_config, hf_path, hf_mamba, load_mode,
-                                  batch_size, input_len, output_len, dtype):
+                                  mamba_conv1d_plugin, hf_config, hf_path,
+                                  hf_mamba, load_mode, batch_size, input_len,
+                                  output_len, dtype, remove_padding):
         tensorrt_llm.logger.set_level(log_level)
         mapping = tensorrt_llm.Mapping()
-        engine_buffer = self._gen_tensorrt_llm_engine(model_name, gemm_plugin,
-                                                      hf_config, hf_path,
-                                                      hf_mamba, load_mode,
-                                                      batch_size, input_len,
-                                                      output_len, dtype)
+        engine_buffer = self._gen_tensorrt_llm_engine(
+            model_name, gemm_plugin, mamba_conv1d_plugin, hf_config, hf_path,
+            hf_mamba, load_mode, batch_size, input_len, output_len, dtype,
+            remove_padding)
         runtime = tensorrt_llm.runtime.generation._Runtime(
             engine_buffer, mapping)
         return runtime, engine_buffer
 
     @parameterized.expand([
-        (True, 'float16'),
-        (False, 'float16'),
-        (True, 'bfloat16'),
-        (False, 'bfloat16'),
-    ])
-    def test_mamba(self, gemm_plugin, dtype):
+        (True, True, 'float16', False),
+        (False, True, 'float16', False),
+        (True, True, 'bfloat16', False),
+        (False, True, 'bfloat16', False),
+        (True, False, 'float16', False),
+        (False, False, 'float16', False),
+        (True, False, 'bfloat16', False),
+        (False, False, 'bfloat16', False),
+        (True, True, 'float16', True),
+        (False, True, 'float16', True),
+        (True, True, 'bfloat16', True),
+        (False, True, 'bfloat16', True),
+    ],
+                          name_func=unittest_name_func)
+    def test_mamba(self, gemm_plugin, mamba_conv1d_plugin, dtype,
+                   remove_padding):
         # Skip tests that are not supported in pre-ampere architecture
-        if getSMVersion() < 80:
-            if dtype == 'bfloat16':
-                pytest.skip(
-                    "bfloat16 is not supported in pre-ampere architecture")
+        skip_bf16_pre_ampere(dtype)
 
         RANDOM_SEEDS = [1, 4, 5, 8]
         seed_idx = random.randint(0, len(RANDOM_SEEDS) - 1)
@@ -140,11 +157,12 @@ class TestMamba(unittest.TestCase):
         model_name = 'mamba'
         log_level = 'error'
         batch_size = 4
-        input_len = 4
+        input_len = 16
         output_len = 2
         load_mode = 'from_model'
         hf_path = ''
-        hf_config = MambaConfig(d_model=128, n_layer=2, vocab_size=128)
+        d_model = 128
+        hf_config = MambaConfig(d_model=d_model, n_layer=2, vocab_size=128)
 
         # get hf mamba
         hf_mamba = MambaLMHeadModel(hf_config,
@@ -153,23 +171,31 @@ class TestMamba(unittest.TestCase):
 
         # get tensorrt llm mamba rumtime
         runtime, _ = self._gen_tensorrt_llm_runtime(
-            log_level, model_name, gemm_plugin, hf_config, hf_path, hf_mamba,
-            load_mode, batch_size, input_len, output_len, dtype)
+            log_level, model_name, gemm_plugin, mamba_conv1d_plugin, hf_config,
+            hf_path, hf_mamba, load_mode, batch_size, input_len, output_len,
+            dtype, remove_padding)
 
         # prepare buffers
         mamba_d_inner = hf_mamba.backbone.layers[0].mixer.d_inner
         mamba_d_conv = hf_mamba.backbone.layers[0].mixer.d_conv
         mamba_d_state = hf_mamba.backbone.layers[0].mixer.d_state
-        conv_state_shape = (
-            batch_size,
-            mamba_d_inner,
-            mamba_d_conv - 1,
-        )
+        if mamba_conv1d_plugin:
+            conv_state_shape = (
+                batch_size,
+                mamba_d_conv - 1,
+                mamba_d_inner,
+            )
+        else:
+            conv_state_shape = (
+                batch_size,
+                mamba_d_inner,
+                mamba_d_conv - 1,
+            )
 
         ssm_state_shape = (
             batch_size,
-            mamba_d_inner,
             mamba_d_state,
+            mamba_d_inner,
         )
         present_conv_states = []
         present_conv_states_1 = []
@@ -184,29 +210,76 @@ class TestMamba(unittest.TestCase):
                             dtype=str_dtype_to_torch(dtype),
                             device='cuda'))
             present_ssm_states.append(
-                torch.empty(ssm_state_shape, dtype=torch.float32,
+                torch.empty(ssm_state_shape,
+                            dtype=str_dtype_to_torch(dtype),
                             device='cuda'))
 
         # compare context
-        ctx_ids = torch.randint(100, (batch_size, input_len)).int().cuda()
-        ctx_last_token_ids = input_len * torch.ones(
-            (batch_size), dtype=torch.int32, device='cuda')
+        if remove_padding:
+            ctx_last_token_ids = torch.randint(1,
+                                               input_len + 1, (batch_size, ),
+                                               dtype=torch.int32)
+            host_ctx_lengths = ctx_last_token_ids.detach().clone().cpu()
+            ctx_last_token_ids = torch.cumsum(ctx_last_token_ids,
+                                              dim=0,
+                                              dtype=torch.int32).to('cuda')
+            total_num_tokens = ctx_last_token_ids[batch_size - 1]
+        else:
+            ctx_last_token_ids = input_len * torch.ones(
+                (batch_size, ), dtype=torch.int32, device='cuda')
+            total_num_tokens = batch_size * input_len
+            host_ctx_lengths = input_len * torch.ones(
+                (batch_size, ), dtype=torch.int32)
+        ctx_ids = torch.randint(100, (total_num_tokens, )).int().cuda()
+        if not remove_padding:
+            ctx_ids = ctx_ids.view(-1, input_len)
+
         ctx_host_request_types = torch.tensor([0] * batch_size,
                                               dtype=torch.int32)
-        infer_params = InferenceParams(max_seqlen=input_len + output_len,
-                                       max_batch_size=batch_size)
+
+        step1_id = torch.randint(100, (batch_size, )).int().cuda()
+        if not remove_padding:
+            step1_id = step1_id.view(-1, 1)
 
         with torch.no_grad():
-            hf_outputs = hf_mamba.forward(ctx_ids,
-                                          inference_params=infer_params)
-            infer_params.seqlen_offset += ctx_ids.shape[1]
-        torch.cuda.synchronize()
-        ref = hf_outputs.logits[:, -1, :]
+            if remove_padding:
+                ref = torch.empty(batch_size, d_model)
+                gen_ref = torch.empty(batch_size, d_model)
+                for i in range(batch_size):
+                    start_id = 0 if i == 0 else ctx_last_token_ids[i - 1]
+                    end_id = ctx_last_token_ids[i]
+                    infer_params = InferenceParams(max_seqlen=end_id -
+                                                   start_id + output_len,
+                                                   max_batch_size=1)
+                    part_ctx_ids = torch.unsqueeze(ctx_ids[start_id:end_id],
+                                                   dim=0)
+                    part_hf_outputs = hf_mamba.forward(
+                        part_ctx_ids, inference_params=infer_params)
+                    infer_params.seqlen_offset += end_id - start_id
+                    torch.cuda.synchronize()
+                    ref[i][:] = part_hf_outputs.logits[0, -1, :]
 
+                    part_step1_id = step1_id[i].view(1, 1)
+                    part_hf_gen_outputs = hf_mamba.forward(
+                        part_step1_id, inference_params=infer_params)
+                    torch.cuda.synchronize()
+                    gen_ref[i][:] = part_hf_gen_outputs.logits[0, -1, :]
+                    infer_params.seqlen_offset += 1
+            else:
+                infer_params = InferenceParams(max_seqlen=input_len +
+                                               output_len,
+                                               max_batch_size=batch_size)
+                hf_outputs = hf_mamba.forward(ctx_ids,
+                                              inference_params=infer_params)
+                infer_params.seqlen_offset += ctx_ids.shape[1]
+                ref = hf_outputs.logits[:, -1, :]
+
+        torch.cuda.synchronize()
         ctx_buffer = {
             'input_ids': ctx_ids,
             'last_token_ids': ctx_last_token_ids,
             'host_request_types': ctx_host_request_types,
+            'host_context_lengths': host_ctx_lengths,
         }
         for idx in range(hf_config.n_layer):
             ctx_buffer[f'past_conv_state_{idx}'] = present_conv_states[idx]
@@ -227,22 +300,27 @@ class TestMamba(unittest.TestCase):
                                    atol=1e-2)
 
         # compare generation
-        step1_id = torch.randint(100, (batch_size, 1)).int().cuda()
-        gen_last_token_ids = torch.zeros((batch_size),
-                                         dtype=torch.int32,
-                                         device='cuda')
+        gen_last_token_ids = torch.ones((batch_size, ),
+                                        dtype=torch.int32,
+                                        device='cuda')
+        if remove_padding:
+            gen_last_token_ids = torch.cumsum(gen_last_token_ids,
+                                              dim=0,
+                                              dtype=torch.int32).to('cuda')
         gen_host_request_types = torch.tensor([1] * batch_size,
                                               dtype=torch.int32)
-        with torch.no_grad():
-            hf_outputs = hf_mamba.forward(step1_id,
-                                          inference_params=infer_params)
-            infer_params.seqlen_offset += step1_id.shape[1]
-        torch.cuda.synchronize()
-        ref = hf_outputs.logits[:, -1, :]
+        if not remove_padding:
+            with torch.no_grad():
+                hf_outputs = hf_mamba.forward(step1_id,
+                                              inference_params=infer_params)
+                infer_params.seqlen_offset += step1_id.shape[1]
+            torch.cuda.synchronize()
+            gen_ref = hf_outputs.logits[:, -1, :]
         step1_buffer = {
             'input_ids': step1_id,
             'last_token_ids': gen_last_token_ids,
             'host_request_types': gen_host_request_types,
+            'host_context_lengths': host_ctx_lengths,
         }
         for idx in range(hf_config.n_layer):
             step1_buffer[f'past_conv_state_{idx}'] = present_conv_states_1[idx]
@@ -258,14 +336,15 @@ class TestMamba(unittest.TestCase):
         torch.cuda.synchronize()
         res = step1_buffer['logits']
 
-        np.testing.assert_allclose(ref.to(torch.float32).cpu().numpy(),
+        np.testing.assert_allclose(gen_ref.to(torch.float32).cpu().numpy(),
                                    res.to(torch.float32).cpu().numpy(),
                                    atol=1e-2)
 
     @parameterized.expand([
         ('mamba-130m', 'from_checkpoint'),
         ('mamba-130m', 'from_model'),
-    ])
+    ],
+                          name_func=unittest_name_func)
     def test_loaders(self, path, load_mode):
         model_root = llm_models_root()
         if model_root is None:
@@ -324,9 +403,10 @@ class TestMamba(unittest.TestCase):
                 atol=1e-3)
         # layer{l}.ssm.A
         A_hf = -torch.exp(hf_mamba.backbone.layers[l].mixer.A_log.float())
+        A_hf_permute = A_hf.cpu().detach().permute([1, 0]).contiguous()
         np.testing.assert_allclose(
             tensorrt_llm_mamba.backbone.layers[l].ssm.A.raw_value,
-            A_hf.cpu().detach(),
+            A_hf_permute,
             atol=1e-3)
         # layer{l}.ssm.D
         np.testing.assert_allclose(
@@ -340,16 +420,33 @@ class TestMamba(unittest.TestCase):
                 torch.float32).detach(),
             atol=1e-3)
         # layer{l}.ssm.in_proj
-        np.testing.assert_allclose(
-            tensorrt_llm_mamba.backbone.layers[l].ssm.in_proj.weight.raw_value,
-            hf_mamba.backbone.layers[l].mixer.in_proj.weight.cpu().detach(),
-            atol=1e-3)
+        d_inner = tensorrt_llm_mamba.backbone.layers[
+            l].ssm.in_proj_x.weight.raw_value.shape[0]
+        in_proj_x_hf = hf_mamba.backbone.layers[l].mixer.in_proj.weight[
+            0:d_inner, ]
+        in_proj_z_hf = hf_mamba.backbone.layers[l].mixer.in_proj.weight[
+            d_inner:, ]
+        np.testing.assert_allclose(tensorrt_llm_mamba.backbone.layers[l].ssm.
+                                   in_proj_x.weight.raw_value,
+                                   in_proj_x_hf.cpu().detach(),
+                                   atol=1e-3)
+        np.testing.assert_allclose(tensorrt_llm_mamba.backbone.layers[l].ssm.
+                                   in_proj_z.weight.raw_value,
+                                   in_proj_z_hf.cpu().detach(),
+                                   atol=1e-3)
         if has_bias(hf_mamba.backbone.layers[l].mixer.in_proj):
-            np.testing.assert_allclose(
-                tensorrt_llm_mamba.backbone.layers[l].ssm.in_proj.bias.
-                raw_value,
-                hf_mamba.backbone.layers[l].mixer.in_proj.bias.cpu().detach(),
-                atol=1e-3)
+            in_proj_bias_x_hf = hf_mamba.backbone.layers[l].mixer.in_proj.bias[
+                0:d_inner]
+            in_proj_bias_z_hf = hf_mamba.backbone.layers[l].mixer.in_proj.bias[
+                d_inner:]
+            np.testing.assert_allclose(tensorrt_llm_mamba.backbone.layers[l].
+                                       ssm.in_proj_x.bias.raw_value,
+                                       in_proj_bias_x_hf.cpu().detach(),
+                                       atol=1e-3)
+            np.testing.assert_allclose(tensorrt_llm_mamba.backbone.layers[l].
+                                       ssm.in_proj_z.bias.raw_value,
+                                       in_proj_bias_z_hf.cpu().detach(),
+                                       atol=1e-3)
         # layer{l}.ssm.conv1d
         np.testing.assert_allclose(
             tensorrt_llm_mamba.backbone.layers[l].ssm.conv1d.weight.raw_value,

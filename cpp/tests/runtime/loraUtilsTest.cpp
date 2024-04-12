@@ -14,18 +14,19 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/runtime/loraUtils.h"
+#include <gmock/gmock.h>
+#include <gtest/gtest.h>
+
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/gptModelConfig.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/loraModule.h"
+#include "tensorrt_llm/runtime/loraUtils.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 #include <NvInferRuntimeBase.h>
+
 #include <algorithm>
-#include <gmock/gmock-matchers.h>
-#include <gmock/gmock.h>
-#include <gtest/gtest.h>
 #include <optional>
 #include <stdexcept>
 
@@ -104,7 +105,8 @@ TEST_F(LoraUtilsTest, loraValidateRequestTensors)
     auto configPtr = bufferCast<int32_t>(*optReqLoraConfig.value());
     std::copy_n(config.data(), config.size(), configPtr);
 
-    EXPECT_THAT([&]() { loraValidateRequestTensors(optReqLoraWeights, optReqLoraConfig, modelConfig, worldConfig); },
+    EXPECT_THAT([&]()
+        { loraValidateRequestTensors(12345, optReqLoraWeights, optReqLoraConfig, modelConfig, worldConfig); },
         testing::Throws<std::runtime_error>());
 
     std::vector<LoraModule> modules{
@@ -112,7 +114,11 @@ TEST_F(LoraUtilsTest, loraValidateRequestTensors)
     };
     modelConfig.setLoraModules(modules);
 
-    loraValidateRequestTensors(optReqLoraWeights, optReqLoraConfig, modelConfig, worldConfig);
+    loraValidateRequestTensors(12345, optReqLoraWeights, optReqLoraConfig, modelConfig, worldConfig);
+
+    EXPECT_THAT([&]()
+        { loraValidateRequestTensors(std::nullopt, optReqLoraWeights, optReqLoraConfig, modelConfig, worldConfig); },
+        testing::Throws<std::runtime_error>());
 }
 
 } // namespace tensorrt_llm::runtime::lora

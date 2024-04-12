@@ -1,20 +1,20 @@
 from ..layers import MLP, ColumnLinear, GatedMLP, LayerNorm, RmsNorm, RowLinear
+from ..models.modeling_utils import QuantConfig
 from .layers import (Int8SmoothQuantLinear, Int8SmoothQuantRowLinear,
                      SmoothQuantAttention, SmoothQuantGatedMLP,
                      SmoothQuantLayerNorm, SmoothQuantMLP, SmoothQuantRmsNorm,
                      WeightOnlyGroupwiseQuantColumnLinear,
                      WeightOnlyGroupwiseQuantRowLinear,
                      WeightOnlyQuantColumnLinear, WeightOnlyQuantRowLinear)
+from .mode import W8A8_SQ_PLUGIN_LIST, QuantAlgo
 
 
 def weight_only_quantize(model,
-                         quant_mode,
-                         exclude_modules=None,
+                         quant_config: QuantConfig,
                          current_key_name=None):
-    assert quant_mode.is_weight_only()
+    assert quant_config.quant_mode.is_weight_only()
 
-    exclude_modules = ['lm_head'
-                       ] if exclude_modules is None else exclude_modules
+    exclude_modules = quant_config.exclude_modules or ['lm_head']
 
     for name, module in model.named_children():
         if current_key_name is None:
@@ -22,8 +22,7 @@ def weight_only_quantize(model,
         current_key_name.append(name)
 
         if len(list(module.children())) > 0:
-            weight_only_quantize(module, quant_mode, exclude_modules,
-                                 current_key_name)
+            weight_only_quantize(module, quant_config, current_key_name)
 
         if isinstance(module, ColumnLinear) and name not in exclude_modules:
             if not any(key in '.'.join(current_key_name)
@@ -36,7 +35,7 @@ def weight_only_quantize(model,
                     tp_group=module.tp_group,
                     tp_size=module.tp_size,
                     gather_output=module.gather_output,
-                    quant_mode=quant_mode)
+                    quant_mode=quant_config.quant_mode)
         elif isinstance(module, RowLinear) and name not in exclude_modules:
             if not any(key in '.'.join(current_key_name)
                        for key in exclude_modules):
@@ -47,27 +46,20 @@ def weight_only_quantize(model,
                     dtype=module.dtype,
                     tp_group=module.tp_group,
                     tp_size=module.tp_size,
-                    quant_mode=quant_mode)
+                    quant_mode=quant_config.quant_mode)
 
         current_key_name.pop(-1)
 
-    setattr(model, 'quant_mode', quant_mode)
-
+    setattr(model, 'quant_mode', quant_config.quant_mode)
     return model
 
 
 def weight_only_groupwise_quantize(model,
-                                   quant_mode,
-                                   quant_algo='W4A16_AWQ',
-                                   group_size=128,
-                                   pre_quant_scale=False,
-                                   zero=False,
-                                   exclude_modules=None,
+                                   quant_config: QuantConfig,
                                    current_key_name=None):
-    assert quant_mode.is_weight_only()
+    assert quant_config.quant_mode.is_weight_only()
 
-    exclude_modules = ['lm_head'
-                       ] if exclude_modules is None else exclude_modules
+    exclude_modules = quant_config.exclude_modules or ['lm_head']
 
     for name, module in model.named_children():
         if current_key_name is None:
@@ -75,9 +67,8 @@ def weight_only_groupwise_quantize(model,
         current_key_name.append(name)
 
         if len(list(module.children())) > 0:
-            weight_only_groupwise_quantize(module, quant_mode, quant_algo,
-                                           group_size, pre_quant_scale, zero,
-                                           exclude_modules, current_key_name)
+            weight_only_groupwise_quantize(module, quant_config,
+                                           current_key_name)
 
         if isinstance(module, ColumnLinear) and name not in exclude_modules:
             if not any(key in '.'.join(current_key_name)
@@ -85,10 +76,11 @@ def weight_only_groupwise_quantize(model,
                 model._modules[name] = WeightOnlyGroupwiseQuantColumnLinear(
                     in_features=module.in_features,
                     out_features=module.out_features * module.tp_size,
-                    group_size=group_size,
-                    pre_quant_scale=pre_quant_scale,
-                    zero=zero,
+                    group_size=quant_config.group_size,
+                    pre_quant_scale=quant_config.pre_quant_scale,
+                    zero=quant_config.has_zero_point,
                     bias=module.bias is not None,
+                    use_w4a8_awq=quant_config.quant_algo == QuantAlgo.W4A8_AWQ,
                     dtype=module.dtype,
                     tp_group=module.tp_group,
                     tp_size=module.tp_size,
@@ -99,25 +91,27 @@ def weight_only_groupwise_quantize(model,
                 model._modules[name] = WeightOnlyGroupwiseQuantRowLinear(
                     in_features=module.in_features * module.tp_size,
                     out_features=module.out_features,
-                    group_size=group_size,
-                    pre_quant_scale=pre_quant_scale,
-                    zero=zero,
+                    group_size=quant_config.group_size,
+                    pre_quant_scale=quant_config.pre_quant_scale,
+                    zero=quant_config.has_zero_point,
                     bias=module.bias is not None,
+                    use_w4a8_awq=quant_config.quant_algo == QuantAlgo.W4A8_AWQ,
                     dtype=module.dtype,
                     tp_group=module.tp_group,
                     tp_size=module.tp_size)
 
         current_key_name.pop(-1)
 
+    setattr(model, 'quant_mode', quant_config.quant_mode)
     return model
 
 
-def smooth_quantize_ootb(model,
-                         quant_mode,
-                         current_key_name=None,
-                         exclude_modules=None):
-    exclude_modules = ['lm_head'
-                       ] if exclude_modules is None else exclude_modules
+def smooth_quantize_ootb(
+    model,
+    quant_config: QuantConfig,
+    current_key_name=None,
+):
+    exclude_modules = quant_config.exclude_modules or ['lm_head']
 
     for name, module in model.named_children():
         if current_key_name is None:
@@ -125,8 +119,7 @@ def smooth_quantize_ootb(model,
         current_key_name.append(name)
 
         if len(list(module.children())) > 0:
-            smooth_quantize_ootb(module, quant_mode, exclude_modules,
-                                 current_key_name)
+            smooth_quantize_ootb(module, quant_config, current_key_name)
 
         if isinstance(module, ColumnLinear) and name not in exclude_modules:
             if not any(key in '.'.join(current_key_name)
@@ -144,11 +137,12 @@ def smooth_quantize_ootb(model,
 
         current_key_name.pop(-1)
 
+    setattr(model, 'quant_mode', quant_config.quant_mode)
     return model
 
 
 def smooth_quantize_plugin(model, quant_mode):
-    for layer in model.transformer.layers:
+    for layer_idx, layer in enumerate(model.transformer.layers):
         config = layer.config
 
         assert hasattr(layer,
@@ -161,6 +155,7 @@ def smooth_quantize_plugin(model, quant_mode):
         assert quant_norm_cls is not None
         layer.input_layernorm = quant_norm_cls(
             normalized_shape=config.hidden_size,
+            eps=config.norm_epsilon,
             dtype=config.dtype,
             quant_mode=quant_mode)
 
@@ -169,7 +164,8 @@ def smooth_quantize_plugin(model, quant_mode):
         dense_bias = layer.attention.dense.bias is not None
         head_size = config.head_size if hasattr(config, 'head_size') else None
         layer.attention = SmoothQuantAttention(
-            config.hidden_size,
+            layer_idx=layer_idx,
+            hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             attention_head_size=head_size,
@@ -193,17 +189,17 @@ def smooth_quantize_plugin(model, quant_mode):
         elif isinstance(layer.mlp, MLP):
             mlp_norm_cls = SmoothQuantMLP
 
+        mlp_hidden_size = config.hidden_size * 4 if config.intermediate_size is None else config.intermediate_size
         layer.mlp = mlp_norm_cls(hidden_size=config.hidden_size,
-                                 ffn_hidden_size=config.intermediate_size,
+                                 ffn_hidden_size=mlp_hidden_size,
                                  hidden_act=config.hidden_act,
                                  dtype=config.dtype,
                                  tp_group=config.mapping.tp_group,
                                  tp_size=config.mapping.tp_size,
                                  quant_mode=quant_mode,
                                  bias=layer.mlp.bias)
-        assert hasattr(
-            layer,
-            "post_layernorm"), "The layer has no post_rmspost_layernormnorm"
+        assert hasattr(layer,
+                       "post_layernorm"), "The layer has no post_layernorm"
 
         quant_norm_cls = None
         if isinstance(layer.post_layernorm, RmsNorm):
@@ -214,36 +210,28 @@ def smooth_quantize_plugin(model, quant_mode):
 
         layer.post_layernorm = quant_norm_cls(
             normalized_shape=config.hidden_size,
+            eps=config.norm_epsilon,
             dtype=config.dtype,
             quant_mode=quant_mode)
 
+    setattr(model, 'quant_mode', quant_mode)
     return model
 
 
-def smooth_quantize(model, quant_mode, use_plugin=False):
-    assert quant_mode.has_act_and_weight_quant()
-    if use_plugin:
-        return smooth_quantize_plugin(model, quant_mode)
+def smooth_quantize(model, quant_config: QuantConfig):
+    assert quant_config.quant_mode.has_act_and_weight_quant()
+    if quant_config.quant_algo in W8A8_SQ_PLUGIN_LIST:
+        return smooth_quantize_plugin(model, quant_config.quant_mode)
     else:
-        return smooth_quantize_ootb(model, quant_mode)
+        return smooth_quantize_ootb(model, quant_config)
 
 
-def quantize(model, quant_mode, **kwargs):
+def quantize(model, quant_config: QuantConfig):
+    quant_mode = quant_config.quant_mode
     if quant_mode.has_act_and_weight_quant():
-        if 'sq_use_plugin' in kwargs and kwargs['sq_use_plugin']:
-            smooth_quantize(model, quant_mode, use_plugin=True)
-        else:
-            smooth_quantize(model, quant_mode)
+        return smooth_quantize(model, quant_config)
     elif quant_mode.is_weight_only():
         if quant_mode.has_per_group_scaling():
-            kwargs = {
-                k: kwargs[k]
-                for k in [
-                    'quant_algo', 'group_size', 'zero', 'pre_quant_scale',
-                    'exclude_modules'
-                ]
-            }
-            weight_only_groupwise_quantize(model, quant_mode, **kwargs)
+            return weight_only_groupwise_quantize(model, quant_config)
         else:
-            kwargs = {k: kwargs[k] for k in ['exclude_modules']}
-            weight_only_quantize(model, quant_mode, **kwargs)
+            return weight_only_quantize(model, quant_config)

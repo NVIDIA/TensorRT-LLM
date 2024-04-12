@@ -16,7 +16,9 @@ from tqdm import tqdm
 from transformers import AutoConfig, AutoModel, AutoTokenizer
 
 import tensorrt_llm
+from tensorrt_llm._utils import pad_vocab_size
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.quantization import QuantAlgo
 
 
 def parse_arguments():
@@ -230,6 +232,30 @@ def split_qkv(v: torch.Tensor, tp_size: int, rank: int, hidden_size: int,
     return torch.concatenate([q_tmp, k_tmp, v_tmp], dim=0).contiguous()
 
 
+def split_embedding(
+    param: torch.Tensor,
+    tp_size: int,
+    tp_rank: int,
+    use_parallel_embedding: bool = False,
+    sharding_dim: int = 0,
+) -> torch.Tensor:
+    if param is None:
+        return None
+    if not use_parallel_embedding:
+        return param
+
+    vocab_size, hidden_size = param.size()
+    if sharding_dim == 0:
+        if vocab_size % tp_size != 0:
+            vocab_size_padded = pad_vocab_size(vocab_size, tp_size)
+            pad_width = vocab_size_padded - vocab_size
+            param = torch.nn.functional.pad(param, (0, 0, 0, pad_width),
+                                            value=0)
+        else:
+            assert hidden_size % tp_size == 0
+    return split(param, tp_size, tp_rank, dim=sharding_dim)
+
+
 def get_weight(params: Dict[str, torch.Tensor], prefix: str,
                dtype: torch.dtype) -> torch.Tensor:
     if f'{prefix}.weight' not in params:
@@ -283,195 +309,6 @@ def get_tllm_linear_weight(
         results[f'{prefix}.bias'] = bias
 
     return results
-
-
-def convert_hf_chatglm(hf_model: AutoModel,
-                       hf_config: AutoConfig,
-                       chatglm_version: str,
-                       mapping: Mapping,
-                       dtype: str = 'float32',
-                       use_parallel_embedding: bool = False,
-                       sharding_dim: int = 0,
-                       share_embedding_table: bool = False,
-                       use_weight_only: bool = False,
-                       plugin_weight_only_quant_type: torch.dtype = torch.int8):
-    weights = {}
-    tik = time.time()
-
-    model_params = dict(hf_model.named_parameters())
-    dtype = getattr(torch, dtype)
-    num_attention_heads = hf_config.num_attention_heads
-    hidden_size = hf_config.hidden_size
-    vocab_size = hf_config.vocab_size
-    num_kv_heads = getattr(hf_config, 'num_kv_heads', num_attention_heads)
-    num_hidden_layers = hf_config.num_layers
-
-    layers_range = mapping.pp_layers(num_hidden_layers)
-    for l in layers_range:
-        if chatglm_version in ['glm', 'chatglm']:
-            prefix = f'transformer.layers.{l}'
-        elif chatglm_version in ['chatglm2', 'chatglm3']:
-            prefix = f'transformer.encoder.layers.{l}'
-        tllm_prex = f'transformer.layers.{l-layers_range[0]}'
-
-        if chatglm_version in ['glm', 'chatglm']:
-            qkv_weight, qkv_bias = get_weight_and_bias(
-                model_params, f'{prefix}.attention.query_key_value', dtype)
-        elif chatglm_version in ['chatglm2', 'chatglm3']:
-            qkv_weight, qkv_bias = get_weight_and_bias(
-                model_params, f'{prefix}.self_attention.query_key_value', dtype)
-
-        qkv_w = split_qkv(qkv_weight,
-                          mapping.tp_size,
-                          mapping.tp_rank,
-                          hidden_size,
-                          num_attention_heads,
-                          num_kv_heads=num_kv_heads)
-        if qkv_bias is None:
-            qkv_b = None
-        else:
-            qkv_b = split_qkv(qkv_bias,
-                              mapping.tp_size,
-                              mapping.tp_rank,
-                              hidden_size,
-                              num_attention_heads,
-                              num_kv_heads=num_kv_heads)
-        weights.update(
-            get_tllm_linear_weight(qkv_w, f'{tllm_prex}.attention.qkv', qkv_b,
-                                   use_weight_only,
-                                   plugin_weight_only_quant_type))
-
-        if chatglm_version in ['glm', 'chatglm']:
-            attn_dense_weight, attn_dense_bias = get_weight_and_bias(
-                model_params, f'{prefix}.attention.dense', dtype)
-        else:
-            attn_dense_weight, attn_dense_bias = get_weight_and_bias(
-                model_params, f'{prefix}.self_attention.dense', dtype)
-
-        attn_dense_w = split(attn_dense_weight,
-                             mapping.tp_size,
-                             mapping.tp_rank,
-                             dim=1)
-        weights.update(
-            get_tllm_linear_weight(attn_dense_w, f'{tllm_prex}.attention.dense',
-                                   attn_dense_bias, use_weight_only,
-                                   plugin_weight_only_quant_type))
-
-        mlp_fc_weight, mlp_fc_bias = get_weight_and_bias(
-            model_params, f'{prefix}.mlp.dense_h_to_4h', dtype)
-        if chatglm_version in ['glm', 'chatglm']:
-            mlp_fc_w = split(mlp_fc_weight,
-                             mapping.tp_size,
-                             mapping.tp_rank,
-                             dim=0)
-            if mlp_fc_bias is None:
-                mlp_fc_b = None
-            else:
-                mlp_fc_b = split(mlp_fc_bias,
-                                 mapping.tp_size,
-                                 mapping.tp_rank,
-                                 dim=0)
-
-        elif chatglm_version in ['chatglm2', 'chatglm3']:
-            mlp_fc_w = swap_and_split_mlp(mlp_fc_weight, mapping.tp_size,
-                                          mapping.tp_rank)
-
-            if mlp_fc_bias is None:
-                mlp_fc_b = None
-            else:
-                mlp_fc_b = swap_and_split_mlp(mlp_fc_bias, mapping.tp_size,
-                                              mapping.tp_rank)
-
-        weights.update(
-            get_tllm_linear_weight(mlp_fc_w, f'{tllm_prex}.mlp.fc', mlp_fc_b,
-                                   use_weight_only,
-                                   plugin_weight_only_quant_type))
-
-        mlp_proj_weight, mlp_proj_bias = get_weight_and_bias(
-            model_params, f'{prefix}.mlp.dense_4h_to_h', dtype)
-
-        mlp_proj_w = split(mlp_proj_weight,
-                           mapping.tp_size,
-                           mapping.tp_rank,
-                           dim=1)
-        weights.update(
-            get_tllm_linear_weight(mlp_proj_w, f'{tllm_prex}.mlp.proj',
-                                   mlp_proj_bias, use_weight_only,
-                                   plugin_weight_only_quant_type))
-
-        input_ln_weight, input_ln_bias = get_weight_and_bias(
-            model_params, f'{prefix}.input_layernorm', dtype)
-        weights[f'{tllm_prex}.input_layernorm.weight'] = input_ln_weight
-        if input_ln_bias is not None:
-            weights[f'{tllm_prex}.input_layernorm.bias'] = input_ln_bias
-
-        post_ln_weight, post_ln_bias = get_weight_and_bias(
-            model_params, f'{prefix}.post_attention_layernorm', dtype)
-        weights[f'{tllm_prex}.post_layernorm.weight'] = post_ln_weight
-        if post_ln_bias is not None:
-            weights[f'{tllm_prex}.post_layernorm.bias'] = post_ln_bias
-
-    if mapping.is_first_pp_rank():
-        if chatglm_version == 'glm':
-            embed_w = get_weight(model_params, 'word_embeddings', dtype)
-            pos_embed_w = get_weight(model_params,
-                                     'transformer.position_embeddings', dtype)
-            weights['transformer.position_embedding.weight'] = pos_embed_w
-            block_embed_w = get_weight(model_params,
-                                       'transformer.block_position_embeddings',
-                                       dtype)
-            weights['transformer.block_embedding.weight'] = block_embed_w
-        elif chatglm_version == 'chatglm':
-            embed_w = get_weight(model_params, 'transformer.word_embeddings',
-                                 dtype)
-        elif chatglm_version in ['chatglm2', 'chatglm3']:
-            embed_w = get_weight(model_params,
-                                 'transformer.embedding.word_embeddings', dtype)
-
-        if not use_parallel_embedding:
-            weights['transformer.vocab_embedding.weight'] = embed_w
-        else:
-            if sharding_dim == 0:
-                assert vocab_size % mapping.tp_size == 0
-            else:
-                assert hidden_size % mapping.tp_size == 0
-            weights['transformer.vocab_embedding.weight'] = split(
-                embed_w, mapping.tp_size, mapping.tp_rank, sharding_dim)
-
-    if mapping.is_last_pp_rank():
-        if chatglm_version == 'glm':
-            lm_head_weight = get_weight(model_params, 'word_embeddings',
-                                        dtype).clone()
-        elif chatglm_version == 'chatglm':
-            lm_head_weight = get_weight(model_params,
-                                        'transformer.word_embeddings',
-                                        dtype).clone()
-        elif chatglm_version in ['chatglm2', 'chatglm3']:
-            lm_head_weight = get_weight(model_params,
-                                        'transformer.output_layer', dtype)
-            assert not share_embedding_table
-
-        if not share_embedding_table:
-            weights['lm_head.weight'] = split(lm_head_weight,
-                                              mapping.tp_size,
-                                              mapping.tp_rank,
-                                              dim=0)
-
-        if chatglm_version in ['glm', 'chatglm']:
-            ln_f_w, ln_f_b = get_weight_and_bias(model_params,
-                                                 'transformer.final_layernorm',
-                                                 dtype)
-        elif chatglm_version in ['chatglm2', 'chatglm3']:
-            ln_f_w, ln_f_b = get_weight_and_bias(
-                model_params, 'transformer.encoder.final_layernorm', dtype)
-        weights['transformer.ln_f.weight'] = ln_f_w
-        if ln_f_b is not None:
-            weights['transformer.ln_f.bias'] = ln_f_b
-
-    tok = time.time()
-    t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
-    print(f'Weights loaded. Total time: {t}')
-    return weights
 
 
 @torch.no_grad()
@@ -835,20 +672,22 @@ def get_tllm_linear_sq_weight(vals,
     return results
 
 
-def convert_hf_chatglm_sq(hf_model: AutoModel,
-                          hf_config: AutoConfig,
-                          chatglm_version: str,
-                          mapping: Mapping,
-                          dtype: str = 'float32',
-                          use_parallel_embedding: bool = False,
-                          sharding_dim: int = 0,
-                          share_embedding_table: bool = False,
-                          per_channel=False,
-                          per_token=False,
-                          int8_kv_cache=False,
-                          act_range=None,
-                          smoother=None):
-    assert mapping.world_size == 1
+def convert_hf_chatglm(hf_model: AutoModel,
+                       hf_config: AutoConfig,
+                       chatglm_version: str,
+                       mapping: Mapping,
+                       dtype: str = 'float32',
+                       use_parallel_embedding: bool = False,
+                       sharding_dim: int = 0,
+                       share_embedding_table: bool = False,
+                       use_weight_only: bool = False,
+                       plugin_weight_only_quant_type: str = 'int8',
+                       use_smooth_quant: bool = False,
+                       per_channel=False,
+                       per_token=False,
+                       int8_kv_cache=False,
+                       act_range=None,
+                       smoother=None):
     weights = {}
     tik = time.time()
 
@@ -856,7 +695,7 @@ def convert_hf_chatglm_sq(hf_model: AutoModel,
     dtype = getattr(torch, dtype)
     num_attention_heads = hf_config.num_attention_heads
     hidden_size = hf_config.hidden_size
-    vocab_size = hf_config.vocab_size
+    hf_config.vocab_size
     num_kv_heads = getattr(hf_config, 'num_kv_heads', num_attention_heads)
     num_hidden_layers = hf_config.num_layers
 
@@ -868,6 +707,7 @@ def convert_hf_chatglm_sq(hf_model: AutoModel,
             prefix = f'transformer.encoder.layers.{l}'
         tllm_prex = f'transformer.layers.{l-layers_range[0]}'
 
+        # Attention QKV
         if chatglm_version in ['glm', 'chatglm']:
             qkv_weight, qkv_bias = get_weight_and_bias(
                 model_params, f'{prefix}.attention.query_key_value', dtype)
@@ -878,37 +718,63 @@ def convert_hf_chatglm_sq(hf_model: AutoModel,
             qkv_act_range = act_range.get(
                 f'{prefix}.self_attention.query_key_value')
 
-        qkv_vals_int8 = generate_int8(qkv_weight.t().numpy(),
-                                      qkv_act_range,
-                                      is_qkv=True,
-                                      multi_query_mode=True)
-        weights.update(
-            get_tllm_linear_sq_weight(
-                vals=qkv_vals_int8,
-                prefix=f'{tllm_prex}.attention.qkv.',
-                shape=[1, qkv_weight.size(0)],
-                is_qkv=True,
-                per_token=per_token,
-                per_channel=per_channel,
-                last_prefix=f'{tllm_prex}.input_layernorm.scale_to_int',
-                smoother_value=None,
-                smoother_shape=None))
-
-        if qkv_bias is not None:
-            qkv_b = split_qkv(qkv_bias,
+        if use_smooth_quant:
+            qkv_vals_int8 = generate_int8(qkv_weight.t().numpy(),
+                                          qkv_act_range,
+                                          is_qkv=True,
+                                          multi_query_mode=True)
+            weights.update(
+                get_tllm_linear_sq_weight(
+                    vals=qkv_vals_int8,
+                    prefix=f'{tllm_prex}.attention.qkv.',
+                    shape=[1, qkv_weight.size(0)],
+                    is_qkv=True,
+                    per_token=per_token,
+                    per_channel=per_channel,
+                    last_prefix=f'{tllm_prex}.input_layernorm.scale_to_int',
+                    smoother_value=None,
+                    smoother_shape=None))
+            if qkv_bias is not None:
+                qkv_b = split_qkv(qkv_bias,
+                                  mapping.tp_size,
+                                  mapping.tp_rank,
+                                  hidden_size,
+                                  num_attention_heads,
+                                  num_kv_heads=num_kv_heads)
+                weights[f'{tllm_prex}.attention.qkv.bias'] = qkv_b
+        else:
+            qkv_w = split_qkv(qkv_weight,
                               mapping.tp_size,
                               mapping.tp_rank,
                               hidden_size,
                               num_attention_heads,
                               num_kv_heads=num_kv_heads)
-            weights[f'{tllm_prex}.attention.qkv.bias'] = qkv_b
+            if qkv_bias is None:
+                qkv_b = None
+            else:
+                qkv_b = split_qkv(qkv_bias,
+                                  mapping.tp_size,
+                                  mapping.tp_rank,
+                                  hidden_size,
+                                  num_attention_heads,
+                                  num_kv_heads=num_kv_heads)
+
+            weights.update(
+                get_tllm_linear_weight(qkv_w, f'{tllm_prex}.attention.qkv',
+                                       qkv_b, use_weight_only,
+                                       plugin_weight_only_quant_type))
 
         if int8_kv_cache:
+            qkv_vals_int8 = generate_int8(qkv_weight.t().numpy(),
+                                          qkv_act_range,
+                                          is_qkv=True,
+                                          multi_query_mode=True)
             weights[
                 f'{tllm_prex}.attention.kv_cache_scaling_factor'] = torch.from_numpy(
                     np.array([qkv_vals_int8['scale_y_quant_orig']],
                              dtype=np.float32)).contiguous()
 
+        # Attention dense
         if chatglm_version in ['glm', 'chatglm']:
             attn_dense_weight, attn_dense_bias = get_weight_and_bias(
                 model_params, f'{prefix}.attention.dense', dtype)
@@ -920,96 +786,143 @@ def convert_hf_chatglm_sq(hf_model: AutoModel,
             dense_act_range = act_range.get(f'{prefix}.self_attention.dense')
             dense_smoother = smoother.get(f'{prefix}.self_attention.dense')
 
-        dense_vals_int8 = generate_int8(attn_dense_weight.t().numpy(),
-                                        dense_act_range,
-                                        is_qkv=False,
-                                        multi_query_mode=True)
-        weights.update(
-            get_tllm_linear_sq_weight(
-                vals=dense_vals_int8,
-                prefix=f'{tllm_prex}.attention.dense.',
-                shape=[1, hidden_size],
+        if use_smooth_quant:
+            dense_vals_int8 = generate_int8(attn_dense_weight.t().numpy(),
+                                            dense_act_range,
+                                            is_qkv=False,
+                                            multi_query_mode=True)
+            weights.update(
+                get_tllm_linear_sq_weight(
+                    vals=dense_vals_int8,
+                    prefix=f'{tllm_prex}.attention.dense.',
+                    shape=[1, hidden_size],
+                    is_qkv=False,
+                    per_token=per_token,
+                    per_channel=per_channel,
+                    last_prefix=
+                    f'{tllm_prex}.attention.quantization_scaling_factor',
+                    smoother_value=dense_smoother,
+                    smoother_shape=[1, hidden_size]))
+            if attn_dense_bias is not None:
+                weights[f'{tllm_prex}.attention.dense.bias'] = attn_dense_bias
+        else:
+            attn_dense_w = split(attn_dense_weight,
+                                 mapping.tp_size,
+                                 mapping.tp_rank,
+                                 dim=1)
+            weights.update(
+                get_tllm_linear_weight(attn_dense_w,
+                                       f'{tllm_prex}.attention.dense',
+                                       attn_dense_bias, use_weight_only,
+                                       plugin_weight_only_quant_type))
+
+        # MLP FC
+        mlp_fc_weight, mlp_fc_bias = get_weight_and_bias(
+            model_params, f'{prefix}.mlp.dense_h_to_4h', dtype)
+
+        if use_smooth_quant:
+            fc_act_range = act_range.get(f'{prefix}.mlp.dense_h_to_4h')
+            fc_vals_int8 = generate_int8(mlp_fc_weight.t().numpy(),
+                                         fc_act_range,
+                                         is_qkv=False,
+                                         multi_query_mode=True)
+            cur_weights = get_tllm_linear_sq_weight(
+                vals=fc_vals_int8,
+                prefix=f'{tllm_prex}.mlp.fc.',
+                shape=[1, mlp_fc_weight.size(0)],
                 is_qkv=False,
                 per_token=per_token,
                 per_channel=per_channel,
-                last_prefix=f'{tllm_prex}.attention.quantization_scaling_factor',
-                smoother_value=dense_smoother,
-                smoother_shape=[1, hidden_size]))
-
-        if attn_dense_bias is not None:
-            weights[f'{tllm_prex}.attention.dense.bias'] = attn_dense_bias
-
-        mlp_fc_weight, mlp_fc_bias = get_weight_and_bias(
-            model_params, f'{prefix}.mlp.dense_h_to_4h', dtype)
-        fc_act_range = act_range.get(f'{prefix}.mlp.dense_h_to_4h')
-        fc_vals_int8 = generate_int8(mlp_fc_weight.t().numpy(),
-                                     fc_act_range,
-                                     is_qkv=False,
-                                     multi_query_mode=True)
-
-        cur_weights = get_tllm_linear_sq_weight(
-            vals=fc_vals_int8,
-            prefix=f'{tllm_prex}.mlp.fc.',
-            shape=[1, mlp_fc_weight.size(0)],
-            is_qkv=False,
-            per_token=per_token,
-            per_channel=per_channel,
-            last_prefix=f'{tllm_prex}.post_layernorm.scale_to_int',
-            smoother_value=None,
-            smoother_shape=None,
-        )
-        cur_weights[f'{tllm_prex}.mlp.fc.weight'] = swap_and_split_mlp(
-            cur_weights[f'{tllm_prex}.mlp.fc.weight'],
-            mapping.tp_size,
-            mapping.tp_rank,
-            dim=0,
-        )
-        if per_channel:
-            cur_weights[
-                f'{tllm_prex}.mlp.fc.per_channel_scale'] = swap_and_split_mlp(
-                    cur_weights[f'{tllm_prex}.mlp.fc.per_channel_scale'],
-                    mapping.tp_size,
-                    mapping.tp_rank,
-                    dim=1,
-                )
-        weights.update(cur_weights)
-
-        if chatglm_version in ['glm', 'chatglm']:
-            if mlp_fc_bias is not None:
-                mlp_fc_b = split(mlp_fc_bias,
+                last_prefix=f'{tllm_prex}.post_layernorm.scale_to_int',
+                smoother_value=None,
+                smoother_shape=None,
+            )
+            cur_weights[f'{tllm_prex}.mlp.fc.weight'] = swap_and_split_mlp(
+                cur_weights[f'{tllm_prex}.mlp.fc.weight'],
+                mapping.tp_size,
+                mapping.tp_rank,
+                dim=0,
+            )
+            if per_channel:
+                cur_weights[
+                    f'{tllm_prex}.mlp.fc.per_channel_scale'] = swap_and_split_mlp(
+                        cur_weights[f'{tllm_prex}.mlp.fc.per_channel_scale'],
+                        mapping.tp_size,
+                        mapping.tp_rank,
+                        dim=1,
+                    )
+            weights.update(cur_weights)
+            if chatglm_version in ['glm', 'chatglm']:
+                if mlp_fc_bias is not None:
+                    mlp_fc_b = split(mlp_fc_bias,
+                                     mapping.tp_size,
+                                     mapping.tp_rank,
+                                     dim=0)
+                    weights[f'{tllm_prex}.mlp.fc.bias'] = mlp_fc_b
+            elif chatglm_version in ['chatglm2', 'chatglm3']:
+                if mlp_fc_bias is not None:
+                    mlp_fc_b = swap_and_split_mlp(mlp_fc_bias, mapping.tp_size,
+                                                  mapping.tp_rank)
+                    weights[f'{tllm_prex}.mlp.fc.bias'] = mlp_fc_b
+        else:
+            if chatglm_version in ['glm', 'chatglm']:
+                mlp_fc_w = split(mlp_fc_weight,
                                  mapping.tp_size,
                                  mapping.tp_rank,
                                  dim=0)
-                weights[f'{tllm_prex}.mlp.fc.bias'] = mlp_fc_b
-        elif chatglm_version in ['chatglm2', 'chatglm3']:
-            if mlp_fc_bias is not None:
-                mlp_fc_b = swap_and_split_mlp(mlp_fc_bias, mapping.tp_size,
+                if mlp_fc_bias is None:
+                    mlp_fc_b = None
+                else:
+                    mlp_fc_b = split(mlp_fc_bias,
+                                     mapping.tp_size,
+                                     mapping.tp_rank,
+                                     dim=0)
+            elif chatglm_version in ['chatglm2', 'chatglm3']:
+                mlp_fc_w = swap_and_split_mlp(mlp_fc_weight, mapping.tp_size,
                                               mapping.tp_rank)
-                weights[f'{tllm_prex}.mlp.fc.bias'] = mlp_fc_b
+                if mlp_fc_bias is None:
+                    mlp_fc_b = None
+                else:
+                    mlp_fc_b = swap_and_split_mlp(mlp_fc_bias, mapping.tp_size,
+                                                  mapping.tp_rank)
+            weights.update(
+                get_tllm_linear_weight(mlp_fc_w, f'{tllm_prex}.mlp.fc',
+                                       mlp_fc_b, use_weight_only,
+                                       plugin_weight_only_quant_type))
 
+        # MLP Proj
         mlp_proj_weight, mlp_proj_bias = get_weight_and_bias(
             model_params, f'{prefix}.mlp.dense_4h_to_h', dtype)
-        proj_act_range = act_range.get(f'{prefix}.mlp.dense_4h_to_h')
-        proj_smoother = smoother.get(f'{prefix}.mlp.dense_4h_to_h')
-        proj_vals_int8 = generate_int8(mlp_proj_weight.t().numpy(),
-                                       proj_act_range,
-                                       is_qkv=False,
-                                       multi_query_mode=True)
 
-        weights.update(
-            get_tllm_linear_sq_weight(
-                vals=proj_vals_int8,
-                prefix=f'{tllm_prex}.mlp.proj.',
-                shape=[1, hidden_size],
-                is_qkv=False,
-                per_token=per_token,
-                per_channel=per_channel,
-                last_prefix=f'{tllm_prex}.mlp.quantization_scaling_factor',
-                smoother_value=proj_smoother,
-                smoother_shape=[1, hf_config.ffn_hidden_size]))
-
-        if mlp_proj_bias is not None:
-            weights[f'{tllm_prex}.mlp.proj.bias'] = mlp_proj_bias
+        if use_smooth_quant:
+            proj_act_range = act_range.get(f'{prefix}.mlp.dense_4h_to_h')
+            proj_smoother = smoother.get(f'{prefix}.mlp.dense_4h_to_h')
+            proj_vals_int8 = generate_int8(mlp_proj_weight.t().numpy(),
+                                           proj_act_range,
+                                           is_qkv=False,
+                                           multi_query_mode=True)
+            weights.update(
+                get_tllm_linear_sq_weight(
+                    vals=proj_vals_int8,
+                    prefix=f'{tllm_prex}.mlp.proj.',
+                    shape=[1, hidden_size],
+                    is_qkv=False,
+                    per_token=per_token,
+                    per_channel=per_channel,
+                    last_prefix=f'{tllm_prex}.mlp.quantization_scaling_factor',
+                    smoother_value=proj_smoother,
+                    smoother_shape=[1, hf_config.ffn_hidden_size]))
+            if mlp_proj_bias is not None:
+                weights[f'{tllm_prex}.mlp.proj.bias'] = mlp_proj_bias
+        else:
+            mlp_proj_w = split(mlp_proj_weight,
+                               mapping.tp_size,
+                               mapping.tp_rank,
+                               dim=1)
+            weights.update(
+                get_tllm_linear_weight(mlp_proj_w, f'{tllm_prex}.mlp.proj',
+                                       mlp_proj_bias, use_weight_only,
+                                       plugin_weight_only_quant_type))
 
         input_ln_weight, input_ln_bias = get_weight_and_bias(
             model_params, f'{prefix}.input_layernorm', dtype)
@@ -1028,11 +941,21 @@ def convert_hf_chatglm_sq(hf_model: AutoModel,
             embed_w = get_weight(model_params, 'word_embeddings', dtype)
             pos_embed_w = get_weight(model_params,
                                      'transformer.position_embeddings', dtype)
-            weights['transformer.position_embedding.weight'] = pos_embed_w
+            weights['transformer.position_embedding.weight'] = split_embedding(
+                pos_embed_w,
+                tp_size=mapping.tp_size,
+                tp_rank=mapping.tp_rank,
+                use_parallel_embedding=use_parallel_embedding,
+                sharding_dim=sharding_dim)
             block_embed_w = get_weight(model_params,
                                        'transformer.block_position_embeddings',
                                        dtype)
-            weights['transformer.block_embedding.weight'] = block_embed_w
+            weights['transformer.block_embedding.weight'] = split_embedding(
+                block_embed_w,
+                tp_size=mapping.tp_size,
+                tp_rank=mapping.tp_rank,
+                use_parallel_embedding=use_parallel_embedding,
+                sharding_dim=sharding_dim)
         elif chatglm_version == 'chatglm':
             embed_w = get_weight(model_params, 'transformer.word_embeddings',
                                  dtype)
@@ -1040,15 +963,12 @@ def convert_hf_chatglm_sq(hf_model: AutoModel,
             embed_w = get_weight(model_params,
                                  'transformer.embedding.word_embeddings', dtype)
 
-        if not use_parallel_embedding:
-            weights['transformer.vocab_embedding.weight'] = embed_w
-        else:
-            if sharding_dim == 0:
-                assert vocab_size % mapping.tp_size == 0
-            else:
-                assert hidden_size % mapping.tp_size == 0
-            weights['transformer.vocab_embedding.weight'] = split(
-                embed_w, mapping.tp_size, mapping.tp_rank, sharding_dim)
+        weights['transformer.vocab_embedding.weight'] = split_embedding(
+            embed_w,
+            tp_size=mapping.tp_size,
+            tp_rank=mapping.tp_rank,
+            use_parallel_embedding=use_parallel_embedding,
+            sharding_dim=sharding_dim)
 
     if mapping.is_last_pp_rank():
         if chatglm_version == 'glm':
@@ -1127,7 +1047,6 @@ if __name__ == '__main__':
         'quantization': {
             'quant_algo': None,
             'kv_cache_quant_algo': None,
-            "sq_use_plugin": True,
         },
         'mapping': {
             'world_size': world_size,
@@ -1146,27 +1065,27 @@ if __name__ == '__main__':
 
     if args.use_weight_only:
         if args.weight_only_precision == 'int8':
-            config['quantization']['quant_algo'] = 'W8A16'
+            config['quantization']['quant_algo'] = QuantAlgo.W8A16
         elif args.weight_only_precision == 'int4':
-            config['quantization']['quant_algo'] = 'W4A16'
+            config['quantization']['quant_algo'] = QuantAlgo.W4A16
     elif args.smoothquant:
         if args.per_channel:
             if args.per_token:
                 config['quantization'][
-                    'quant_algo'] = 'W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN'
+                    'quant_algo'] = QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
             else:
                 config['quantization'][
-                    'quant_algo'] = 'W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN'
+                    'quant_algo'] = QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN
         else:
             if args.per_token:
                 config['quantization'][
-                    'quant_algo'] = 'W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN'
+                    'quant_algo'] = QuantAlgo.W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN
             else:
                 config['quantization'][
-                    'quant_algo'] = 'W8A8_SQ_PER_TENSOR_PLUGIN'
+                    'quant_algo'] = QuantAlgo.W8A8_SQ_PER_TENSOR_PLUGIN
 
     if args.int8_kv_cache:
-        config['quantization']['kv_cache_quant_algo'] = 'INT8'
+        config['quantization']['kv_cache_quant_algo'] = QuantAlgo.INT8
 
     with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
         json.dump(config, f, indent=4)
@@ -1179,70 +1098,60 @@ if __name__ == '__main__':
     else:
         plugin_weight_only_quant_type = None
 
+    hf_model = AutoModel.from_pretrained(
+        args.model_dir,
+        trust_remote_code=True,
+        torch_dtype="auto",
+        device_map="auto" if chatglm_version != 'glm' else None)
+
+    act_range = {}
+    # smoother for query_key_value.dense and mlp.proj
+    model_smoother = {}
+    if args.smoothquant is not None or args.int8_kv_cache:
+        os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get(
+            "TOKENIZERS_PARALLELISM", "false")
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.model_dir,
+            trust_remote_code=True,
+        )
+        dataset = load_dataset(
+            "cnn_dailymail",
+            '3.0.0',
+            split="validation",
+        )
+
+        act_range = capture_activation_range(hf_model,
+                                             tokenizer,
+                                             dataset,
+                                             num_samples=64)
+        if args.smoothquant is not None:
+            smooth_chatglm_model(hf_model, act_range, args.smoothquant,
+                                 model_smoother)
+
     def covert_and_save(rank):
         mapping = Mapping(world_size=world_size,
                           rank=rank,
                           tp_size=args.tp_size,
                           pp_size=args.pp_size)
 
-        hf_model = AutoModel.from_pretrained(
-            args.model_dir,
-            trust_remote_code=True,
-            torch_dtype="auto",
-            device_map="auto" if chatglm_version != 'glm' else None)
-
-        if args.smoothquant is not None or args.int8_kv_cache:
-            os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get(
-                "TOKENIZERS_PARALLELISM", "false")
-            tokenizer = AutoTokenizer.from_pretrained(
-                args.model_dir,
-                trust_remote_code=True,
-            )
-            dataset = load_dataset(
-                "cnn_dailymail",
-                '3.0.0',
-                split="validation",
-            )
-
-            act_range = capture_activation_range(hf_model,
-                                                 tokenizer,
-                                                 dataset,
-                                                 num_samples=64)
-            model_smoother = {
-            }  # smoother for query_key_value.dense and mlp.proj
-            if args.smoothquant is not None:
-                smooth_chatglm_model(hf_model, act_range, args.smoothquant,
-                                     model_smoother)
-            weights = convert_hf_chatglm_sq(
-                hf_model,
-                hf_config,
-                chatglm_version,
-                mapping,
-                dtype=args.dtype,
-                use_parallel_embedding=args.use_parallel_embedding,
-                sharding_dim=args.embedding_sharding_dim,
-                share_embedding_table=args.use_embedding_sharing,
-                per_channel=args.per_channel,
-                per_token=args.per_token,
-                int8_kv_cache=args.int8_kv_cache,
-                act_range=act_range,
-                smoother=model_smoother,
-            )
-
-        else:
-            weights = convert_hf_chatglm(
-                hf_model,
-                hf_config,
-                chatglm_version,
-                mapping,
-                dtype=args.dtype,
-                use_parallel_embedding=args.use_parallel_embedding,
-                sharding_dim=args.embedding_sharding_dim,
-                share_embedding_table=args.use_embedding_sharing,
-                use_weight_only=args.use_weight_only,
-                plugin_weight_only_quant_type=plugin_weight_only_quant_type)
-
-        del hf_model
+        weights = convert_hf_chatglm(
+            hf_model,
+            hf_config,
+            chatglm_version,
+            mapping,
+            dtype=args.dtype,
+            use_parallel_embedding=args.use_parallel_embedding,
+            sharding_dim=args.embedding_sharding_dim,
+            share_embedding_table=args.use_embedding_sharing,
+            use_weight_only=args.use_weight_only,
+            plugin_weight_only_quant_type=plugin_weight_only_quant_type,
+            use_smooth_quant=args.smoothquant is not None,
+            per_channel=args.per_channel,
+            per_token=args.per_token,
+            int8_kv_cache=args.int8_kv_cache,
+            act_range=act_range,
+            smoother=model_smoother,
+        )
 
         safetensors.torch.save_file(
             weights, os.path.join(args.output_dir, f'rank{rank}.safetensors'))
@@ -1266,6 +1175,7 @@ if __name__ == '__main__':
                 exceptions
             ) == 0, "Checkpoint conversion failed, please check error log."
 
+    del hf_model
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     print(f'Total time of converting checkpoints: {t}')

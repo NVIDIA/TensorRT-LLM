@@ -15,7 +15,6 @@
  * limitations under the License.
  */
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
 #include "tensorrt_llm/runtime/gptSession.h"
@@ -56,12 +55,11 @@ size_t monitorMemory(std::atomic_bool& done)
     return peakMem;
 }
 
-void benchmarkGptSession(std::string const& modelName, std::filesystem::path const& dataPath,
-    std::vector<int> const& batchSizes, int beamWidth, std::vector<std::vector<int>> const& inOutLen,
-    std::shared_ptr<nvinfer1::ILogger> const& logger, int warmUp, int numRuns, int duration,
-    GptSession::Config& sessionConfig, bool cudaGraphMode, bool printAllLogits, bool disableForceMaxTokens)
+void benchmarkGptSession(std::filesystem::path const& dataPath, std::vector<int> const& batchSizes, int beamWidth,
+    std::vector<std::vector<int>> const& inOutLen, std::shared_ptr<nvinfer1::ILogger> const& logger, int warmUp,
+    int numRuns, int duration, GptSession::Config& sessionConfig, bool cudaGraphMode, bool printAllLogits,
+    bool disableForceMaxTokens)
 {
-    std::string modelNameHyphen = modelName;
     std::filesystem::path jsonFileName = dataPath / "config.json";
     auto const json = GptJsonConfig::parse(jsonFileName);
     auto const modelConfig = json.getModelConfig();
@@ -69,7 +67,7 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
     SizeType deviceCount{0};
     TLLM_CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
     auto const worldConfig = WorldConfig::mpi(deviceCount, json.getTensorParallelism(), json.getPipelineParallelism());
-    auto const enginePath = dataPath / json.engineFilename(worldConfig, modelNameHyphen);
+    auto const enginePath = dataPath / json.engineFilename(worldConfig);
     auto const dtype = modelConfig.getDataType();
     auto const maxNumTokens = modelConfig.getMaxNumTokens();
     auto const useHalf = (dtype == nvinfer1::DataType::kHALF);
@@ -104,7 +102,7 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
 
         auto& memoryCounter = MemoryCounters::getInstance();
         TLLM_LOG_INFO(memoryCounter.toString());
-
+        std::atomic_bool done;
         for (auto const batchSize : batchSizes)
         {
             if (inputPacked && maxNumTokens != std::nullopt)
@@ -114,15 +112,16 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                     "benchmark on %d tokens",
                     maxNumTokens.value(), maxBatchSize * maxInputLength);
             }
+            done = false;
+            auto peakMemFuture = std::async(&monitorMemory, std::ref(done));
+            size_t peakMem;
             try
             {
-                std::atomic_bool done = false;
-                auto peakMemFuture = std::async(&monitorMemory, std::ref(done));
                 TLLM_LOG_INFO(memoryCounter.toString());
 
-                std::vector<SizeType> inputLenghtsHost(batchSize, maxInputLength);
-                auto inputLenghts
-                    = bufferManager.copyFrom(inputLenghtsHost, ITensor::makeShape({batchSize}), MemoryType::kGPU);
+                std::vector<SizeType> inputLengthsHost(batchSize, maxInputLength);
+                auto inputLengths
+                    = bufferManager.copyFrom(inputLengthsHost, ITensor::makeShape({batchSize}), MemoryType::kGPU);
 
                 // copy inputs and wrap into shared_ptr
                 GenerationInput::TensorPtr inputIds;
@@ -147,7 +146,7 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                 TLLM_LOG_INFO(memoryCounter.toString());
 
                 GenerationInput generationInput{
-                    endId, padId, std::move(inputIds), std::move(inputLenghts), inputPacked};
+                    endId, padId, std::move(inputIds), std::move(inputLengths), inputPacked};
 
                 // runtime will allocate memory for output if this tensor is empty
                 GenerationOutput generationOutput{
@@ -183,6 +182,8 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                 int iterIdx = 0;
                 float curDuration = 0;
                 std::vector<float> latencies;
+                std::vector<float> generationTimes;
+                auto generationProfiler = std::make_shared<GptSession::GenerationProfiler>();
                 while (iterIdx < numRuns || curDuration / 1000 < duration)
                 {
                     auto const start = std::chrono::steady_clock::now();
@@ -190,7 +191,7 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                     generationOutput.onTokenGenerated
                         = [&numSteps, maxNewTokens](GenerationOutput::TensorPtr const& outputIds, SizeType step,
                               bool finished) { ++numSteps; };
-                    session.generate(generationOutput, generationInput, samplingConfig);
+                    session.generate(generationOutput, generationInput, samplingConfig, generationProfiler);
                     bufferManager.getStream().synchronize();
                     auto const end = std::chrono::steady_clock::now();
 
@@ -198,11 +199,13 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                     float latency = std::chrono::duration<float, std::milli>(end - start).count();
                     curDuration += latency;
                     latencies.emplace_back(latency);
+                    generationTimes.emplace_back(generationProfiler->getElapsedTimeMs());
                 }
 
                 TLLM_LOG_INFO(memoryCounter.toString());
                 done = true;
-                size_t peakMem = peakMemFuture.get();
+                peakMemFuture.wait();
+                peakMem = peakMemFuture.get();
 
                 printf("Benchmarking done. Iteration: %d, duration: %.2f sec.\n", iterIdx, curDuration / 1000);
 
@@ -231,12 +234,16 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                 {
                     auto const averageLatency = curDuration / iterIdx;
                     float const tokensPerSec = batchSize * maxNewTokens / (averageLatency / 1000);
+                    auto const avgGenerationTime
+                        = std::reduce(generationTimes.begin(), generationTimes.end(), 0.0f) / generationTimes.size();
+                    float const generationTokensPerSec = batchSize * maxNewTokens / (avgGenerationTime / 1000);
                     // convert to GB
                     float const peakMemGB = peakMem / 1e9;
                     printf(
                         "[BENCHMARK] batch_size %d input_length %d output_length %d latency(ms) %.2f tokensPerSec "
-                        "%.2f gpu_peak_mem(gb) %.2f\n",
-                        batchSize, maxInputLength, maxNewTokens, averageLatency, tokensPerSec, peakMemGB);
+                        "%.2f generation_time(ms) %.2f generationTokensPerSec %.2f gpu_peak_mem(gb) %.2f\n",
+                        batchSize, maxInputLength, maxNewTokens, averageLatency, tokensPerSec, avgGenerationTime,
+                        generationTokensPerSec, peakMemGB);
                 }
 
                 // logits are store in last rank
@@ -246,7 +253,7 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                     {
                         std::cout << "generationOutput.contextLogits.shape: "
                                   << generationOutput.contextLogits->getShape()
-                                  << std::endl; // (batchsize, prompt_len, vocabsize)
+                                  << std::endl; // (batch_size, prompt_len, vocab_size)
                         std::cout << "generationOutput.contextLogits: " << *generationOutput.contextLogits << std::endl;
                     }
 
@@ -254,7 +261,7 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                     {
                         std::cout << "generationOutput.generationLogits.shape: "
                                   << generationOutput.generationLogits->getShape()
-                                  << std::endl; // (batchsize, beamwidth, maxNewTokens, vocabsize)
+                                  << std::endl; // (batch_size, beam_width, maxNewTokens, vocab_size)
                         generationOutput.generationLogits->reshape(ITensor::makeShape({batchSize * beamWidth,
                             maxNewTokens, modelConfig.getVocabSizePadded(worldConfig.getSize())}));
 
@@ -266,11 +273,16 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
             catch (std::runtime_error& e)
             {
                 std::size_t found = std::string(e.what()).find("out of memory");
+                // We need to kill the memory monitor when OOM.
+                done = true;
+                peakMemFuture.wait();
+                peakMem = peakMemFuture.get();
 
                 // Unexpected error; rethrow
                 if (found == std::string::npos)
                 {
-                    throw;
+                    TLLM_LOG_ERROR(e.what());
+                    throw e;
                 }
 
                 // We can ignore the OOM exception and continue the rest of the benchmark
@@ -282,6 +294,14 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                         batchSize, maxInputLength, maxNewTokens);
                 }
                 continue;
+            }
+            catch (...)
+            {
+                // We need to kill memory monitor when any other issue occurs
+                done = true;
+                peakMemFuture.wait();
+                peakMem = peakMemFuture.get();
+                throw;
             }
         }
         TLLM_LOG_INFO(memoryCounter.toString());
@@ -295,8 +315,6 @@ int main(int argc, char* argv[])
     cxxopts::Options options(
         "TensorRT-LLM C++ Runtime Benchmark", "TensorRT-LLM C++ Runtime Benchmark for GPT and GPT-like models.");
     options.add_options()("h,help", "Print usage");
-    options.add_options()(
-        "m,model", "Model name specified for engines.", cxxopts::value<std::string>()->default_value("gpt_350m"));
     options.add_options()("engine_dir", "Directory that store the engines.", cxxopts::value<std::string>());
     options.add_options()("batch_size",
         "Specify batch size(s) you want to benchmark. Multiple batch sizes can be separated by \";\", example: "
@@ -443,11 +461,11 @@ int main(int argc, char* argv[])
 
     try
     {
-        benchmarkGptSession(result["model"].as<std::string>(), result["engine_dir"].as<std::string>(), batchSizes,
-            beamWidth, inOutLen, logger, result["warm_up"].as<int>(), result["num_runs"].as<int>(),
-            result["duration"].as<int>(), sessionConfig, enableCudaGraph, printAllLogits, disableForceMaxTokens);
+        benchmarkGptSession(result["engine_dir"].as<std::string>(), batchSizes, beamWidth, inOutLen, logger,
+            result["warm_up"].as<int>(), result["num_runs"].as<int>(), result["duration"].as<int>(), sessionConfig,
+            enableCudaGraph, printAllLogits, disableForceMaxTokens);
     }
-    catch (const std::exception& e)
+    catch (std::exception const& e)
     {
         TLLM_LOG_ERROR(e.what());
         return 1;

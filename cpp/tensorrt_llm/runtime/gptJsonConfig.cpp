@@ -16,6 +16,7 @@
 
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
 
+#include "common.h"
 #include "gptModelConfig.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
@@ -24,6 +25,7 @@
 #include <fstream>
 #include <nlohmann/json.hpp>
 #include <string_view>
+#include <utility>
 
 using namespace tensorrt_llm::runtime;
 namespace tc = tensorrt_llm::common;
@@ -56,12 +58,12 @@ std::optional<FieldType> parseJsonFieldOptional(Json const& json, std::string_vi
     {
         value = json.at(name).template get<FieldType>();
     }
-    catch (const nlohmann::json::out_of_range& e)
+    catch (nlohmann::json::out_of_range const& e)
     {
         TLLM_LOG_WARNING(e.what());
         TLLM_LOG_WARNING("Optional value for parameter %s will not be set.", std::string(name).c_str());
     }
-    catch (const nlohmann::json::type_error& e)
+    catch (nlohmann::json::type_error const& e)
     {
         TLLM_LOG_WARNING(e.what());
         TLLM_LOG_WARNING("Optional value for parameter %s will not be set.", std::string(name).c_str());
@@ -69,12 +71,127 @@ std::optional<FieldType> parseJsonFieldOptional(Json const& json, std::string_vi
     return value;
 }
 
+GptModelConfig createModelConfig(
+    Json const& json, bool engineVersionNone, SizeType tensorParallelism, nvinfer1::DataType dataType)
+{
+    auto const& config = engineVersionNone ? json.at("builder_config") : json.at("pretrained_config");
+
+    auto const* const numLayersField = engineVersionNone ? "num_layers" : "num_hidden_layers";
+    auto const* const numHeadsField = engineVersionNone ? "num_heads" : "num_attention_heads";
+    auto const* const numKvHeadsField = engineVersionNone ? "num_kv_heads" : "num_key_value_heads";
+    auto const* const mlpHiddenSizeField = engineVersionNone ? "mlp_hidden_size" : "intermediate_size";
+
+    auto const numLayers = config.at(numLayersField).template get<SizeType>();
+    auto const numHeads = config.at(numHeadsField).template get<SizeType>() / tensorParallelism;
+
+    auto const vocabSize = config.at("vocab_size").template get<SizeType>();
+    auto const hiddenSize = config.at("hidden_size").template get<SizeType>() / tensorParallelism;
+    auto const sizePerHead = parseJsonFieldOr(config, "head_size", hiddenSize / numHeads);
+
+    // TODO:
+    // Code crashes when numKvHeads <= 0. Clamping downwards to 1 prevents that, make sure this is best fix.
+    auto const numKvHeads
+        = std::max(parseJsonFieldOr(config, numKvHeadsField, numHeads * tensorParallelism) / tensorParallelism, 1);
+
+    auto const mlpHiddenSize = parseJsonFieldOptional<SizeType>(config, mlpHiddenSizeField);
+
+    auto modelConfig = GptModelConfig{vocabSize, numLayers, numHeads, hiddenSize, dataType};
+    modelConfig.setSizePerHead(sizePerHead);
+    modelConfig.setNbKvHeads(numKvHeads);
+
+    if (mlpHiddenSize.has_value())
+    {
+        modelConfig.setMlpHiddenSize(mlpHiddenSize.value() / tensorParallelism);
+    }
+
+    return modelConfig;
+};
+
+void parseBuilderConfig(GptModelConfig& modelConfig, Json const& builderConfig)
+{
+    auto const maxBatchSize = parseJsonFieldOr(builderConfig, "max_batch_size", 0);
+    auto const maxBeamWidth = parseJsonFieldOr(builderConfig, "max_beam_width", 0);
+    auto const maxInputLen = parseJsonFieldOr(builderConfig, "max_input_len", 0);
+    auto const maxSequenceLen = maxInputLen + parseJsonFieldOr(builderConfig, "max_output_len", 0);
+    auto const maxDraftLen = parseJsonFieldOr(builderConfig, "max_draft_len", 0);
+    auto const maxNumTokens = parseJsonFieldOptional<SizeType>(builderConfig, "max_num_tokens");
+    auto const maxPromptEmbeddingTableSize
+        = parseJsonFieldOr<SizeType>(builderConfig, "max_prompt_embedding_table_size", 0);
+    auto const computeContextLogits = parseJsonFieldOr(builderConfig, "gather_context_logits", false);
+    auto const computeGenerationLogits = parseJsonFieldOr(builderConfig, "gather_generation_logits", false);
+
+    modelConfig.setMaxBatchSize(maxBatchSize);
+    modelConfig.setMaxBeamWidth(maxBeamWidth);
+    modelConfig.setMaxInputLen(maxInputLen);
+    modelConfig.setMaxSequenceLen(maxSequenceLen);
+    modelConfig.setMaxNumTokens(maxNumTokens);
+    modelConfig.setMaxDraftLen(maxDraftLen);
+    modelConfig.setMaxPromptEmbeddingTableSize(maxPromptEmbeddingTableSize);
+    modelConfig.computeContextLogits(computeContextLogits);
+    modelConfig.computeGenerationLogits(computeGenerationLogits);
+}
+
+void parsePluginConfig(GptModelConfig& modelConfig, Json const& pluginConfig)
+{
+    auto const useGptAttentionPlugin = !pluginConfig.at("gpt_attention_plugin").is_null();
+    auto const useMambaConv1dPlugin
+        = pluginConfig.contains("mamba_conv1d_plugin") && !pluginConfig.at("mamba_conv1d_plugin").is_null();
+    auto const removeInputPadding = pluginConfig.at("remove_input_padding").template get<bool>();
+    auto const& pagedKvCache = pluginConfig.at("paged_kv_cache");
+    auto const& tokensPerBlock = pluginConfig.at("tokens_per_block");
+    auto const useCustomAllReduce = pluginConfig.at("use_custom_all_reduce").template get<bool>();
+    auto const useContextFMHAForGeneration = pluginConfig.at("use_context_fmha_for_generation").template get<bool>();
+    auto const pagedContextFMHA = pluginConfig.at("use_paged_context_fmha").template get<bool>();
+    auto const& pagedState = parseJsonFieldOr(pluginConfig, "paged_state", false);
+
+    modelConfig.useGptAttentionPlugin(useGptAttentionPlugin);
+    modelConfig.useMambaConv1dPlugin(useMambaConv1dPlugin);
+    modelConfig.usePackedInput(removeInputPadding);
+    modelConfig.usePagedKvCache(pagedKvCache);
+    modelConfig.usePagedState(pagedState);
+    modelConfig.setTokensPerBlock(tokensPerBlock);
+    modelConfig.useCustomAllReduce(useCustomAllReduce);
+    modelConfig.setUseContextFMHAForGeneration(useContextFMHAForGeneration);
+    modelConfig.setPagedContextFMHA(pagedContextFMHA);
+}
+
+void parseLora(GptModelConfig& modelConfig, Json const& json, Json const& pluginConfig, bool engineVersionNone,
+    SizeType tensorParallelism)
+{
+    auto const& config = engineVersionNone ? json.at("builder_config") : json.at("build_config").at("lora_config");
+
+    auto const loraMaxRank = parseJsonFieldOr(config, "max_lora_rank", SizeType{0});
+    auto const loraTargetModules = parseJsonFieldOptional<std::vector<std::string>>(config, "lora_target_modules");
+
+    if (loraTargetModules.has_value())
+    {
+
+        modelConfig.setLoraModules(LoraModule::createLoraModules(loraTargetModules.value(), modelConfig.getHiddenSize(),
+            modelConfig.getMlpHiddenSize(), modelConfig.getNbHeads(), modelConfig.getNbKvHeads(),
+            modelConfig.getSizePerHead(), tensorParallelism));
+    }
+
+    modelConfig.setMaxLoraRank(loraMaxRank);
+
+    auto useLoraPlugin = !pluginConfig.at("lora_plugin").is_null();
+    if (useLoraPlugin)
+    {
+
+        if (modelConfig.getLoraModules().empty() || modelConfig.getMaxLoraRank() == 0)
+        {
+            TLLM_LOG_WARNING("lora_plugin enabled, but no lora module enabled: setting useLoraPlugin to false");
+            useLoraPlugin = false;
+        }
+    }
+    modelConfig.useLoraPlugin(useLoraPlugin);
+}
+
 template <typename InputType>
-GptJsonConfig parseJson(InputType&& i)
+GptJsonConfig parseJson(InputType&& input)
 {
     auto constexpr allowExceptions = true;
-    auto constexpr ingoreComments = true;
-    auto const json = nlohmann::json::parse(i, nullptr, allowExceptions, ingoreComments);
+    auto constexpr ignoreComments = true;
+    auto const json = nlohmann::json::parse(std::forward<InputType>(input), nullptr, allowExceptions, ignoreComments);
 
     auto const engineVersion = parseJsonFieldOr(json, "version", std::string("none"));
 
@@ -104,113 +221,26 @@ GptJsonConfig parseJson(InputType&& i)
     auto const precision = engineVersionNone ? builderConfig.at("precision").template get<std::string>()
                                              : json.at("pretrained_config").at("dtype").template get<std::string>();
 
-    auto dataType = nvinfer1::DataType::kFLOAT;
-    if (!precision.compare("float32"))
-        dataType = nvinfer1::DataType::kFLOAT;
-    else if (!precision.compare("float16"))
-        dataType = nvinfer1::DataType::kHALF;
-    else if (!precision.compare("bfloat16"))
-        dataType = nvinfer1::DataType::kBF16;
-    else
-        TLLM_CHECK_WITH_INFO(false, tc::fmtstr("Model data type '%s' not supported", precision.c_str()));
-
-    auto modelConfig = [&engineVersionNone, &json, &builderConfig, &tensorParallelism, &dataType]()
+    auto const dataType = [&precision]()
     {
-        auto const& config = engineVersionNone ? builderConfig : json.at("pretrained_config");
-
-        std::string const numLayersField = engineVersionNone ? "num_layers" : "num_hidden_layers";
-        std::string const numHeadsField = engineVersionNone ? "num_heads" : "num_attention_heads";
-        std::string const numKvHeadsField = engineVersionNone ? "num_kv_heads" : "num_key_value_heads";
-        std::string const mlpHiddenSizeField = engineVersionNone ? "mlp_hidden_size" : "intermediate_size";
-
-        auto const numLayers = config.at(numLayersField).template get<SizeType>();
-        auto const numHeads = config.at(numHeadsField).template get<SizeType>() / tensorParallelism;
-
-        auto const vocabSize = config.at("vocab_size").template get<SizeType>();
-        auto const hiddenSize = config.at("hidden_size").template get<SizeType>() / tensorParallelism;
-        auto const sizePerHead = parseJsonFieldOr(config, "head_size", hiddenSize / numHeads);
-        auto const loraMaxRank = parseJsonFieldOr(config, "max_lora_rank", SizeType{0});
-        auto const loraTargetModules = parseJsonFieldOptional<std::vector<std::string>>(config, "lora_target_modules");
-
-        // TODO:
-        // Code crashes when numKvHeads <= 0. Clamping downwards to 1 prevents that, make sure this is best fix.
-        auto const numKvHeads
-            = std::max(parseJsonFieldOr(config, numKvHeadsField, numHeads * tensorParallelism) / tensorParallelism, 1);
-
-        auto const mlpHiddenSize = parseJsonFieldOptional<SizeType>(config, mlpHiddenSizeField);
-
-        auto modelConfig = GptModelConfig{vocabSize, numLayers, numHeads, hiddenSize, dataType};
-        modelConfig.setSizePerHead(sizePerHead);
-        modelConfig.setNbKvHeads(numKvHeads);
-
-        if (mlpHiddenSize.has_value())
-        {
-            modelConfig.setMlpHiddenSize(mlpHiddenSize.value() / tensorParallelism);
-        }
-
-        if (loraTargetModules.has_value())
-        {
-
-            modelConfig.setLoraModules(LoraModule::createLoraModules(loraTargetModules.value(),
-                modelConfig.getHiddenSize(), modelConfig.getMlpHiddenSize(), modelConfig.getNbHeads(),
-                modelConfig.getNbKvHeads(), modelConfig.getSizePerHead(), tensorParallelism));
-        }
-
-        modelConfig.setMaxLoraRank(loraMaxRank);
-
-        return modelConfig;
+        if (!precision.compare("float32"))
+            return nvinfer1::DataType::kFLOAT;
+        else if (!precision.compare("float16"))
+            return nvinfer1::DataType::kHALF;
+        else if (!precision.compare("bfloat16"))
+            return nvinfer1::DataType::kBF16;
+        else
+            TLLM_THROW("Model data type '%s' not supported", precision.c_str());
     }();
 
-    auto const maxBatchSize = parseJsonFieldOr(builderConfig, "max_batch_size", 0);
-    auto const maxBeamWidth = parseJsonFieldOr(builderConfig, "max_beam_width", 0);
-    auto const maxInputLen = parseJsonFieldOr(builderConfig, "max_input_len", 0);
-    auto const maxSequenceLen = maxInputLen + parseJsonFieldOr(builderConfig, "max_output_len", 0);
-    auto const maxDraftLen = parseJsonFieldOr(builderConfig, "max_draft_len", 0);
-    auto const maxNumTokens = parseJsonFieldOptional<SizeType>(builderConfig, "max_num_tokens");
-    auto const maxPromptEmbeddingTableSize
-        = parseJsonFieldOr<SizeType>(builderConfig, "max_prompt_embedding_table_size", 0);
-    auto const computeContextLogits = parseJsonFieldOr(builderConfig, "gather_context_logits", false);
-    auto const computeGenerationLogits = parseJsonFieldOr(builderConfig, "gather_generation_logits", false);
+    auto modelConfig = createModelConfig(json, engineVersionNone, tensorParallelism, dataType);
 
-    modelConfig.setMaxBatchSize(maxBatchSize);
-    modelConfig.setMaxBeamWidth(maxBeamWidth);
-    modelConfig.setMaxInputLen(maxInputLen);
-    modelConfig.setMaxSequenceLen(maxSequenceLen);
-    modelConfig.setMaxNumTokens(maxNumTokens);
-    modelConfig.setMaxDraftLen(maxDraftLen);
-    modelConfig.setMaxPromptEmbeddingTableSize(maxPromptEmbeddingTableSize);
-    modelConfig.computeContextLogits(computeContextLogits);
-    modelConfig.computeGenerationLogits(computeGenerationLogits);
+    parseBuilderConfig(modelConfig, builderConfig);
 
     auto const& pluginConfig = engineVersionNone ? json.at("plugin_config") : builderConfig.at("plugin_config");
+    parsePluginConfig(modelConfig, pluginConfig);
 
-    auto const useGptAttentionPlugin = !pluginConfig.at("gpt_attention_plugin").is_null();
-    auto const removeInputPadding = pluginConfig.at("remove_input_padding").template get<bool>();
-    auto const pagedKvCache = pluginConfig.at("paged_kv_cache");
-    auto const tokensPerBlock = pluginConfig.at("tokens_per_block");
-    auto const useCustomAllReduce = pluginConfig.at("use_custom_all_reduce").template get<bool>();
-    auto const useContextFMHAForGeneration = pluginConfig.at("use_context_fmha_for_generation").template get<bool>();
-    auto const pagedContextFMHA = pluginConfig.at("use_paged_context_fmha").template get<bool>();
-
-    modelConfig.useGptAttentionPlugin(useGptAttentionPlugin);
-    modelConfig.usePackedInput(removeInputPadding);
-    modelConfig.usePagedKvCache(pagedKvCache);
-    modelConfig.setTokensPerBlock(tokensPerBlock);
-    modelConfig.useCustomAllReduce(useCustomAllReduce);
-    modelConfig.setUseContextFMHAForGeneration(useContextFMHAForGeneration);
-    modelConfig.setPagedContextFMHA(pagedContextFMHA);
-
-    auto useLoraPlugin = !pluginConfig.at("lora_plugin").is_null();
-    if (useLoraPlugin)
-    {
-
-        if (modelConfig.getLoraModules().empty() || modelConfig.getMaxLoraRank() == 0)
-        {
-            TLLM_LOG_WARNING("lora_plugin enabled, but no lora module enabled: setting useLoraPlugin to false");
-            useLoraPlugin = false;
-        }
-    }
-    modelConfig.useLoraPlugin(useLoraPlugin);
+    parseLora(modelConfig, json, pluginConfig, engineVersionNone, tensorParallelism);
 
     if (engineVersionNone)
     {
@@ -249,6 +279,55 @@ GptJsonConfig parseJson(InputType&& i)
         }
     }
 
+    if (!engineVersionNone)
+    {
+        auto const& pretrainedConfig = json.at("pretrained_config");
+        auto const medusaHeads = parseJsonFieldOptional<SizeType>(pretrainedConfig, "num_medusa_heads");
+        auto const maxDraftLen = parseJsonFieldOptional<SizeType>(pretrainedConfig, "max_draft_len");
+        TLLM_CHECK_WITH_INFO((medusaHeads.has_value() ^ maxDraftLen.has_value()) == 0,
+            "Either both num_medusa_heads and max_draft_len or none have to be provided");
+        if (medusaHeads.has_value() && medusaHeads.value() > 0)
+        {
+            modelConfig.setMaxDraftLen(maxDraftLen.value());
+            auto medusaModule = MedusaModule(medusaHeads.value(), maxDraftLen.value());
+            modelConfig.setMedusaModule(medusaModule);
+        }
+    }
+
+    // Mamba config
+    if (!engineVersionNone)
+    {
+        auto const& pretrainedConfig = json.at("pretrained_config");
+        auto const architecture = pretrainedConfig.at("architecture").template get<std::string>();
+        if (architecture == std::string("MambaLMHeadModel"))
+        {
+            modelConfig.setModelVariant(GptModelConfig::ModelVariant::kMamba);
+            auto const& ssmCfg = pretrainedConfig.at("ssm_cfg");
+            auto const& mambaDState = ssmCfg.at("d_state").template get<SizeType>();
+            auto const& mambaDConv = ssmCfg.at("d_conv").template get<SizeType>();
+            auto const& mambaExpand = ssmCfg.at("expand").template get<SizeType>();
+            MambaConfig mambaConfig{};
+            mambaConfig.dState = mambaDState;
+            mambaConfig.dConv = mambaDConv;
+            mambaConfig.expand = mambaExpand;
+            modelConfig.setMambaConfig(mambaConfig);
+        }
+    }
+    else
+    {
+        if (name.size() >= 6 && name.substr(0, 6) == "mamba_")
+        {
+            modelConfig.setModelVariant(GptModelConfig::ModelVariant::kMamba);
+            auto const& mambaDState = builderConfig.at("mamba_d_state").template get<SizeType>();
+            auto const& mambaDConv = builderConfig.at("mamba_d_conv").template get<SizeType>();
+            auto const& mambaExpand = builderConfig.at("mamba_expand").template get<SizeType>();
+            MambaConfig mambaConfig{};
+            mambaConfig.dState = mambaDState;
+            mambaConfig.dConv = mambaDConv;
+            mambaConfig.expand = mambaExpand;
+            modelConfig.setMambaConfig(mambaConfig);
+        }
+    }
     return GptJsonConfig{name, engineVersion, precision, tensorParallelism, pipelineParallelism, modelConfig};
 }
 

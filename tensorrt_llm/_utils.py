@@ -13,17 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
+import gc
 import json
 import math
-import os
 import struct
 import tarfile
 import weakref
+from dataclasses import asdict
+from enum import EnumMeta
 from functools import partial
 from pathlib import Path, PosixPath
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
+import yaml
 from packaging import version
 
 # isort: off
@@ -49,11 +52,11 @@ def torch_to_numpy(x: torch.Tensor):
 
 def numpy_to_torch(x):
     if x.dtype == np_bfloat16:
-        return torch.tensor(x.view(np.int16)).view(torch.bfloat16)
+        return torch.from_numpy(x.view(np.int16)).view(torch.bfloat16)
     elif x.dtype == np_float8:
-        return torch.tensor(x.view(np.int8)).view(torch.float8_e4m3fn)
+        return torch.from_numpy(x.view(np.int8)).view(torch.float8_e4m3fn)
     else:
-        return torch.tensor(x)
+        return torch.from_numpy(x)
 
 
 def numpy_to_dtype(x, dtype: str):
@@ -393,42 +396,86 @@ def has_extra_attr(obj, attr_name):
     return attr_name in _extra_attrs_by_object[id(obj)]
 
 
-def unpack_nemo_ckpt(nemo_archive_path: Union[str, Path],
-                     out_dir_path: Union[str, Path]):
-    nemo_archive_path = Path(nemo_archive_path)
-    if not nemo_archive_path.exists():
-        raise FileNotFoundError(f"{nemo_archive_path} does not exist")
-
-    for tar_mode in ["r:", "r:gz"]:
+def unpack_nemo_weights(nemo_archive_path):
+    with tarfile.open(nemo_archive_path) as tar:
         try:
-            with tarfile.open(nemo_archive_path, mode=tar_mode) as tar_file:
+            model_weights = tar.extractfile("model_weights.ckpt")
+            model_config = tar.extractfile("model_config.yaml")
+        except KeyError:
+            try:
+                model_weights = tar.extractfile("./model_weights.ckpt")
+                model_config = tar.extractfile("./model_config.yaml")
+            except KeyError:
+                err_str = "Both model_weights paths not found in the tar archive."
+                raise Exception(err_str)
+        return yaml.safe_load(model_config), torch.load(
+            model_weights, map_location=torch.device("cpu"))
 
-                def is_within_directory(directory, target):
 
-                    abs_directory = os.path.abspath(directory)
-                    abs_target = os.path.abspath(target)
+def set_obj_attrs(
+    obj: torch.Tensor,
+    ojb_attrs: Optional[Dict[str, Any]],
+):
+    """Set attributes on a object.
 
-                    prefix = os.path.commonprefix([abs_directory, abs_target])
+    This method is used to set attributes on a object. This method
+    will not overwrite existing attributes.
+    """
+    if ojb_attrs is None:
+        return
+    for key, value in ojb_attrs.items():
+        assert not hasattr(
+            obj, key), (f"Overwriting existing tensor attribute: {key}")
+        setattr(obj, key, value)
 
-                    return prefix == abs_directory
 
-                def safe_members(tar_file):
-                    members = []
-                    for member in tar_file.getmembers():
-                        member_path = os.path.join(out_dir_path, member.name)
-                        if not is_within_directory(out_dir_path, member_path):
-                            raise Exception(
-                                "Attempted Path Traversal in Tar File")
-                        members.append(member)
-                    return members
+def release_gc():
+    ''' Release memory allocated by PyTorch and Python garbage collector explicitly and immediately.
+    This could be used when some states might be kept in memory even after the variables are deleted.
+    '''
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
-                tar_file.extractall(  # nosec B202
-                    out_dir_path,
-                    members=safe_members(tar_file),
-                    numeric_owner=False)
 
-            return out_dir_path
-        except tarfile.ReadError:
-            pass
+class DictConversion:
 
-    raise RuntimeError(f"Could not unpack {nemo_archive_path}")
+    @classmethod
+    def from_dict(cls, config: Dict[str, Any]):
+        obj = cls()
+        fields = obj.__dataclass_fields__
+        for key, value in config.items():
+            assert hasattr(obj, key)
+            field_cls = fields[key].type
+            if (isinstance(field_cls, type)
+                    and issubclass(field_cls, DictConversion)
+                    and isinstance(value, dict)):
+                value = field_cls.from_dict(value)
+            setattr(obj, key, value)
+        return obj
+
+    def to_dict(self):
+        return asdict(self)
+
+    @classmethod
+    def from_json_file(cls, file):
+        with open(file) as f:
+            return cls.from_dict(json.load(f))
+
+    def set_defaults(self, **kwargs):
+        for key, default in kwargs.items():
+            value = getattr(self, key)
+            if (value is None
+                    or (isinstance(value, (list, dict)) and len(value) == 0)):
+                setattr(self, key, default)
+
+
+class BaseEnumMeta(EnumMeta):
+
+    def __contains__(cls, item):
+        try:
+            cls(item)
+        except ValueError:
+            return False
+        return True

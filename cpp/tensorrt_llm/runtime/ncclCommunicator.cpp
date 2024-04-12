@@ -78,7 +78,7 @@ ncclComm_t NcclCommunicator::createComm(int worldSize, int rank, mpi::MpiComm co
     {
         ncclGetUniqueId(&id);
     }
-    mpiComm.bcast(id, 0);
+    mpiComm.bcastValue(id, 0);
     ncclComm_t comm;
     TLLM_NCCL_CHECK(ncclCommInitRank(&comm, worldSize, id, rank));
     return comm;

@@ -407,7 +407,7 @@ public:
 
     /// Executes one GEMM
     CUTLASS_DEVICE
-    void operator()(Params const& params, SharedStorage& shared_storage)
+    void run_kernel_(Params const& params, SharedStorage& shared_storage)
     {
 
         // Compute threadblock location
@@ -533,6 +533,48 @@ public:
 
         // Execute the epilogue operator to update the destination tensor.
         epilogue(epilogue_visitor, accumulators);
+    }
+
+    template <typename CompilationArch>
+    CUTLASS_DEVICE void run_kernel(Params const& params, SharedStorage& shared_storage)
+    {
+        if constexpr (platform::is_same<ArchTag, CompilationArch>::value)
+        {
+            run_kernel_(params, shared_storage);
+        }
+        else
+        {
+            CUTLASS_NOT_IMPLEMENTED();
+        }
+    }
+
+    /*
+        To improve compilation speed, we do not compile the device operator if the CUDA_ARCH does not correspond
+        to the ArchTag of the cutlass kernel operator.
+      */
+    /// Executes one GEMM
+    CUTLASS_DEVICE
+    void operator()(Params const& params, SharedStorage& shared_storage)
+    {
+#if defined(__CUDA_ARCH__)
+#if (__CUDA_ARCH__ >= 700) && (__CUDA_ARCH__ < 720)
+        run_kernel<arch::Sm70>(params, shared_storage);
+#elif (__CUDA_ARCH__ >= 720) && (__CUDA_ARCH__ < 750)
+        run_kernel<arch::Sm72>(params, shared_storage);
+#elif (__CUDA_ARCH__ >= 750) && (__CUDA_ARCH__ < 800)
+        run_kernel<arch::Sm75>(params, shared_storage);
+#elif (__CUDA_ARCH__ >= 800) && (__CUDA_ARCH__ < 900)
+        run_kernel<arch::Sm80>(params, shared_storage);
+#elif (__CUDA_ARCH__ >= 900)
+        // TODO - replace with CUTLASS_NOT_IMPLEMENTED() and upgrade to 3.x kernels.
+        run_kernel<arch::Sm80>(params, shared_storage);
+#else
+        static_assert(
+            false, "Invalid architecture being compiled. Only Volta+ supported in weight-only quantization kernels.");
+#endif
+#else
+        CUTLASS_NOT_IMPLEMENTED();
+#endif
     }
 };
 

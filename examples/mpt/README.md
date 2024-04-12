@@ -2,6 +2,28 @@
 
 This document explains how to build the [MPT](https://huggingface.co/mosaicml/mpt-7b) model using TensorRT-LLM and run on a single GPU and a single node with multiple GPUs.
 
+- [MPT](#mpt)
+  - [Overview](#overview)
+  - [Support Matrix](#support-matrix)
+    - [MPT 7B](#mpt-7b)
+      - [1.1 Convert from HF Transformers in FP](#11-convert-from-hf-transformers-in-fp)
+      - [1.2 Convert from HF Transformers with weight-only quantization](#12-convert-from-hf-transformers-with-weight-only-quantization)
+      - [1.3 Convert from HF Transformers with SmoothQuant quantization](#13-convert-from-hf-transformers-with-smoothquant-quantization)
+      - [1.4 Convert from HF Transformers with INT8 KV cache quantization](#14-convert-from-hf-transformers-with-int8-kv-cache-quantization)
+      - [1.5 AWQ weight-only quantization with AMMO](#15-awq-weight-only-quantization-with-ammo)
+      - [1.6 FP8 Post-Training Quantization with AMMO](#16-fp8-post-training-quantization-with-ammo)
+      - [1.6 Weight-only quantization with AMMO](#16-weight-only-quantization-with-ammo)
+      - [1.7 SmoothQuant and INT8 KV cache with AMMO](#17-smoothquant-and-int8-kv-cache-with-ammo)
+    - [2.1 Build TensorRT engine(s)](#21-build-tensorrt-engines)
+    - [MPT 30B](#mpt-30b)
+      - [1. Convert weights from HF Transformers to TRTLLM format](#1-convert-weights-from-hf-transformers-to-trtllm-format)
+      - [2. Build TensorRT engine(s)](#2-build-tensorrt-engines)
+      - [3. Run TRT engine to check if the build was correct](#3-run-trt-engine-to-check-if-the-build-was-correct)
+    - [Replit Code V-1.5 3B](#replit-code-v-15-3b)
+      - [1. Convert weights from HF Transformers to TRTLLM format](#1-convert-weights-from-hf-transformers-to-trtllm-format-1)
+      - [2. Build TensorRT engine(s)](#2-build-tensorrt-engines-1)
+      - [3. Run TRT engine to check if the build was correct](#3-run-trt-engine-to-check-if-the-build-was-correct-1)
+
 ## Overview
 
 The TensorRT-LLM MPT implementation can be found in [`tensorrt_llm/models/mpt/model.py`](../../tensorrt_llm/models/mpt/model.py). The TensorRT-LLM MPT example code is located in [`examples/mpt`](./). There is one main file:
@@ -25,40 +47,46 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 
 ### MPT 7B
 
+Please install required packages first:
+
+```bash
+pip install -r requirements.txt
+```
+
 The [`convert_checkpoint.py`](./convert_checkpoint.py) script allows you to convert weights from HF Transformers format to TRTLLM checkpoints.
 
 #### 1.1 Convert from HF Transformers in FP
 
 ```bash
 # Generate FP16 checkpoints.
-python convert_checkpoint.py --model_dir mosaicml/mpt-7b --output_dir ./ft_ckpts/mpt-7b/fp16/ --dtype float16
+python convert_checkpoint.py --model_dir mosaicml/mpt-7b --output_dir ./ckpts/mpt-7b/fp16/ --dtype float16
 
 # Generate FP32 checkpoints with TP=4.
-python convert_checkpoint.py --model_dir mosaicml/mpt-7b --output_dir ./ft_ckpts/mpt-7b/fp32_tp4/ --dtype float32 --tp_size 4
+python convert_checkpoint.py --model_dir mosaicml/mpt-7b --output_dir ./ckpts/mpt-7b/fp32_tp4/ --dtype float32 --tp_size 4
 ```
 
 #### 1.2 Convert from HF Transformers with weight-only quantization
 
 ```bash
 # Use int8 weight-only quantization.
-python convert_checkpoint.py --model_dir mosaicml/mpt-7b --output_dir ./ft_ckpts/mpt-7b/int8_wo/ --use_weight_only
+python convert_checkpoint.py --model_dir mosaicml/mpt-7b --output_dir ./ckpts/mpt-7b/int8_wo/ --use_weight_only
 
 # Use int4 weight-only quantization.
-python convert_checkpoint.py --model_dir mosaicml/mpt-7b --output_dir ./ft_ckpts/mpt-7b/int4_wo/ --use_weight_only --weight_only_precision int4
+python convert_checkpoint.py --model_dir mosaicml/mpt-7b --output_dir ./ckpts/mpt-7b/int4_wo/ --use_weight_only --weight_only_precision int4
 ```
 
 #### 1.3 Convert from HF Transformers with SmoothQuant quantization
 
 ```bash
 # Use int8 smoothquant (weight and activation) quantization.
-python convert_checkpoint.py --model_dir mosaicml/mpt-7b --output_dir ./ft_ckpts/mpt-7b/int8_sq/ --smoothquant 0.5
+python convert_checkpoint.py --model_dir mosaicml/mpt-7b --output_dir ./ckpts/mpt-7b/int8_sq/ --smoothquant 0.5
 ```
 
 #### 1.4 Convert from HF Transformers with INT8 KV cache quantization
 
 ```bash
 # Use int8 kv cache quantization.
-python convert_checkpoint.py --model_dir mosaicml/mpt-7b --output_dir ./ft_ckpts/mpt-7b/fp16_int8kv/ --dtype float16 --calibrate_kv_cache
+python convert_checkpoint.py --model_dir mosaicml/mpt-7b --output_dir ./ckpts/mpt-7b/fp16_int8kv/ --dtype float16 --calibrate_kv_cache
 ```
 ***INT8-KV-cache can be used with SQ and Weight-only at the same time***
 
@@ -70,31 +98,31 @@ First make sure AMMO toolkit is installed (see [examples/quantization/README.md]
 
 ```bash
 # INT4 AWQ quantization using AMMO.
-python ../quantization/quantize.py --model_dir mosaicml/mpt-7b --output_dir ./ft_ckpts/mpt-7b/int4_awq/ --qformat int4_awq
+python ../quantization/quantize.py --model_dir mosaicml/mpt-7b --output_dir ./ckpts/mpt-7b/int4_awq/ --qformat int4_awq
 ```
 
 #### 1.6 FP8 Post-Training Quantization with AMMO
 
 ```bash
 # FP8 quantization using AMMO.
-python ../quantization/quantize.py --model_dir mosaicml/mpt-7b --output_dir ./ft_ckpts/mpt-7b/fp8/ --qformat fp8 --kv_cache_dtype fp8
+python ../quantization/quantize.py --model_dir mosaicml/mpt-7b --output_dir ./ckpts/mpt-7b/fp8/ --qformat fp8 --kv_cache_dtype fp8
 ```
 
 #### 1.6 Weight-only quantization with AMMO
 
 ```bash
 # INT8 Weight-only quantization using AMMO with TP=2.
-python ../quantization/quantize.py --model_dir mosaicml/mpt-7b --output_dir ./ft_ckpts/mpt-7b/int8_wo/ --qformat int8_wo --tp_size 2
+python ../quantization/quantize.py --model_dir mosaicml/mpt-7b --output_dir ./ckpts/mpt-7b/int8_wo/ --qformat int8_wo --tp_size 2
 
 # INT4 Weight-only quantization using AMMO.
-python ../quantization/quantize.py --model_dir mosaicml/mpt-7b --output_dir ./ft_ckpts/mpt-7b/int4_wo/ --qformat int4_wo
+python ../quantization/quantize.py --model_dir mosaicml/mpt-7b --output_dir ./ckpts/mpt-7b/int4_wo/ --qformat int4_wo
 ```
 
 #### 1.7 SmoothQuant and INT8 KV cache with AMMO
 
 ```bash
 # Use int4 awq quantization.
-python ../quantization/quantize.py --model_dir mosaicml/mpt-7b --output_dir ./ft_ckpts/mpt-7b/sq_int8kv/ --qformat int8_sq --kv_cache_dtype int8
+python ../quantization/quantize.py --model_dir mosaicml/mpt-7b --output_dir ./ckpts/mpt-7b/sq_int8kv/ --qformat int8_sq --kv_cache_dtype int8
 ```
 ***INT8-KV-cache can also be used with Weight-only at the same time***
 
@@ -105,13 +133,13 @@ All of the checkpoint generated by `convert_checkpoint.py` or `quantize.py` (AMM
 
 ```bash
 # Build a single-GPU float16 engine using TRTLLM checkpoints.
-trtllm-build --checkpoint_dir=./ft_ckpts/mpt-7b/fp16/1-gpu \
+trtllm-build --checkpoint_dir=./ckpts/mpt-7b/fp16 \
              --max_batch_size 32 \
              --max_input_len 1024 \
              --max_output_len 512 \
-             --gemm_plugin
+             --gemm_plugin float16 \
              --workers 1 \
-             --output_dir ./trt_engines/mpt-7b/fp16/1-gpu
+             --output_dir ./trt_engines/mpt-7b/fp16
 ```
 
 ### MPT 30B
@@ -123,7 +151,7 @@ Same commands can be changed to convert MPT 30B to TRT LLM format. Below is an e
 The [`convert_checkpoint.py`](./convert_checkpoint.py) script allows you to convert weights from HF Transformers format to TRTLLM format.
 
 ```bash
-python convert_checkpoint.py --model_dir mosaicml/mpt-30b --output_dir ./ft_ckpts/mpt-30b/fp16_tp4/ --tp_szie 4 --dtype float16
+python convert_checkpoint.py --model_dir mosaicml/mpt-30b --output_dir ./ckpts/mpt-30b/fp16_tp4/ --tp_szie 4 --dtype float16
 ```
 
 #### 2. Build TensorRT engine(s)
@@ -132,11 +160,11 @@ Examples of build invocations:
 
 ```bash
 # Build 4-GPU MPT-30B float16 engines
-trtllm-build --checkpoint_dir ./ft_ckpts/mpt-30b/fp16_tp4 \
+trtllm-build --checkpoint_dir ./ckpts/mpt-30b/fp16_tp4 \
              --max_batch_size 32 \
              --max_input_len 1024 \
              --max_output_len 512 \
-             --gemm_plugin
+             --gemm_plugin float16 \
              --workers 4 \
              --output_dir ./trt_engines/mpt-30b/fp16_tp4
 ```
@@ -159,7 +187,7 @@ Same commands can be changed to convert [Replit Code V-1.5 3B](https://huggingfa
 The [`convert_checkpoint.py`](./convert_checkpoint.py) script allows you to convert weights from HF Transformers format to TRTLLM format.
 
 ```bash
-python convert_checkpoint.py --model_dir ./replit-code-v1_5-3b --output_dir ./ft_ckpts/replit-code-v1_5-3b/bf16_tp2/ --tp_size 2 --dtype bfloat16
+python convert_checkpoint.py --model_dir ./replit-code-v1_5-3b --output_dir ./ckpts/replit-code-v1_5-3b/bf16_tp2/ --tp_size 2 --dtype bfloat16
 ```
 
 #### 2. Build TensorRT engine(s)
@@ -168,11 +196,12 @@ Examples of build invocations:
 
 ```bash
 # Build 2-GPU Replit Code V-1.5 3B bfloat16 engines
-trtllm-build --checkpoint_dir ./ft_ckpts/replit-code-v1_5-3b/bf16_tp2 \
+trtllm-build --checkpoint_dir ./ckpts/replit-code-v1_5-3b/bf16_tp2 \
              --max_batch_size 32 \
              --max_input_len 1024 \
              --max_output_len 512 \
-             --gemm_plugin \
+             --gpt_attention_plugin bfloat16 \
+             --gemm_plugin bfloat16 \
              --workers 2 \
              --output_dir ./trt_engines/replit-code-v1_5-3b/bf16_tp2
 ```

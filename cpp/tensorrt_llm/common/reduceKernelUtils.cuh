@@ -63,11 +63,11 @@ struct BytesToType<16>
 };
 
 template <int Bytes>
-__device__ inline void copy(const void* local, void* data)
+__device__ inline void copy(void const* local, void* data)
 {
     using T = typename BytesToType<Bytes>::type;
 
-    const T* in = static_cast<const T*>(local);
+    T const* in = static_cast<T const*>(local);
     T* out = static_cast<T*>(data);
     *out = *in;
 }
@@ -257,8 +257,8 @@ __inline__ __device__ void cgBlockReduceSumElements(float* element_list, float* 
     cg::thread_block cta = cg::this_thread_block();
     cg::thread_block_tile<32> tile = cg::tiled_partition<32>(cta);
 
-    const int tid = cta.thread_rank();
-    const int blockz = blockDim.x;
+    int const tid = cta.thread_rank();
+    int const blockz = blockDim.x;
     for (int i = 0; i < NUM; i++)
     {
 #if ((__CUDACC_VER_MAJOR__ > 11) || (__CUDACC_VER_MAJOR__ == 11 && __CUDACC_VER_MINOR__ >= 0))
@@ -291,43 +291,46 @@ __inline__ __device__ void cgBlockReduceSumElements(float* element_list, float* 
 template <typename T, int MAX_K>
 struct TopK
 {
-    int p[MAX_K];
-    T u[MAX_K];
+    int p[MAX_K]; // index, being -1 at the tail if the array is not full
+    T u[MAX_K];   // value in descend order, being -MAX_T_VAL if the element is invalid
 
-    __device__ __forceinline__ void insert(T elem, int elem_id)
+    __device__ __forceinline__ void insert(T const elem, int const elem_id)
     {
         if (elem_id < 0)
         {
             return;
         }
-
-        if (elem > u[MAX_K - 1] || (p[MAX_K - 1] == -1) || ((elem == u[MAX_K - 1]) && (elem_id < p[MAX_K - 1])))
-        // if (elem > u[MAX_K-1] || ((elem == u[MAX_K-1]) && (elem_id < p[MAX_K-1])))
+        // Condition of updating the array
+        // 1. array is not full
+        // 2. elem is greater than the smallest (last) element in the array
+        // 3. elem is equal to the smallest (last) element in the array but its elem_id is smaller
+        bool const need_update
+            = (p[MAX_K - 1] == -1 || elem > u[MAX_K - 1] || elem == u[MAX_K - 1] && elem_id < p[MAX_K - 1]);
+        if (!need_update)
         {
-            u[MAX_K - 1] = elem;
-            p[MAX_K - 1] = elem_id;
+            return;
         }
-
-        for (int k = MAX_K - 2; k >= 0; --k)
+        // Find suitable index for the new element
+        int i;
+        for (i = MAX_K - 2; i >= 0; --i)
         {
-            if ((u[k + 1] > u[k]) || (p[k] == -1) || ((u[k + 1] == u[k]) && (p[k + 1] < p[k])))
-            // if ((u[k+1] > u[k]) || ((u[k+1] == u[k])&&(p[k+1] < p[k])))
-            {
-                T u2 = u[k];
-                int p2 = p[k];
-                u[k] = u[k + 1];
-                p[k] = p[k + 1];
-                u[k + 1] = u2;
-                p[k + 1] = p2;
-            }
+            bool const need_decrease = (p[i] == -1 || elem > u[i] || elem == u[i] && elem_id < p[i]);
+            if (!need_decrease)
+                break;
         }
+        // Move elements to correct positions
+        for (int k = MAX_K - 2; k >= i; --k)
+        {
+            p[k + 1] = p[k];
+            u[k + 1] = u[k];
+        }
+        p[i] = elem_id;
+        u[i] = elem;
     }
 
     __device__ __forceinline__ void init()
     {
-        const bool IS_FP16 = std::is_same<T, half>::value;
-        const T MAX_T_VAL = (IS_FP16) ? HALF_FLT_MAX : FLT_MAX;
-
+        T const MAX_T_VAL = (std::is_same<T, half>::value) ? HALF_FLT_MAX : FLT_MAX;
         for (int i = 0; i < MAX_K; i++)
         {
             p[i] = -1;
@@ -337,7 +340,7 @@ struct TopK
 };
 
 template <typename T, int MAX_K>
-__device__ __forceinline__ TopK<T, MAX_K> reduce_topk_op(const TopK<T, MAX_K>& a, const TopK<T, MAX_K>& b)
+__device__ __forceinline__ TopK<T, MAX_K> reduce_topk_op(TopK<T, MAX_K> const& a, TopK<T, MAX_K> const& b)
 {
     TopK<T, MAX_K> res = a;
     for (int i = 0; i < MAX_K; ++i)
@@ -368,19 +371,19 @@ struct TopK_2
 };
 
 template <typename T>
-__device__ __forceinline__ TopK_2<T> reduce_topk_op_2(const TopK_2<T>& a, const TopK_2<T>& b)
+__device__ __forceinline__ TopK_2<T> reduce_topk_op_2(TopK_2<T> const& a, TopK_2<T> const& b)
 {
     return a.u > b.u ? a : b;
 }
 
 template <typename T>
-__device__ __forceinline__ T clamp_inf_for_half(const float input)
+__device__ __forceinline__ T clamp_inf_for_half(float const input)
 {
     return input;
 }
 
 template <>
-__device__ __forceinline__ half clamp_inf_for_half(const float input)
+__device__ __forceinline__ half clamp_inf_for_half(float const input)
 {
     // clamp inf values to enable fp16 training
     return input > 0.0f ? (half) min(input, HALF_FLT_MAX - 1000) : (half) max(input, -HALF_FLT_MAX + 1000);

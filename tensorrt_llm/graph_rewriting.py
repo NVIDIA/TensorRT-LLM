@@ -191,16 +191,16 @@ class PatternRewriter(_Pattern):
     def __init__(self,
                  name: str,
                  root_layer: Optional[Set[trt.LayerType]] = None,
-                 seperate_match_rewrite=False):
+                 separate_match_rewrite=False):
         '''
         Parameters:
             name: the name of the rewrite pattern
             root_layer: the root layer types to start the pattern matching, if not provided, the pattern will traverse all the layers in the graph.
-            seperate_match_rewrite: if set to True, the pattern should override match() and rewrite() separately, otherwise, the pattern should override match_and_rewrite()
+            separate_match_rewrite: if set to True, the pattern should override match() and rewrite() separately, otherwise, the pattern should override match_and_rewrite()
         '''
         super().__init__(name)
         self.root_layer = root_layer
-        self._seperate_match_rewrite = seperate_match_rewrite
+        self._separate_match_rewrite = separate_match_rewrite
 
     def match(self, layer: Layer) -> bool:
         raise NotImplementedError()
@@ -261,7 +261,7 @@ class RewritePatternManager(_PatternManager):
 
                     if pattern.root_layer is not None and layer.type not in pattern.root_layer:
                         continue
-                    if pattern._seperate_match_rewrite:
+                    if pattern._separate_match_rewrite:
                         if pattern.match(layer):
                             pattern.rewrite(layer)
                             modified = True
@@ -574,7 +574,7 @@ class FuseAttentionWithBiasPass(PatternRewriter):
 
     def __init__(self):
         super().__init__(name="fuse_attention_with_bias",
-                         seperate_match_rewrite=False)
+                         separate_match_rewrite=False)
 
     @staticmethod
     def is_attention_plugin(layer: Layer) -> bool:

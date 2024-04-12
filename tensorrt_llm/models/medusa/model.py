@@ -103,7 +103,7 @@ class MedusaForCausalLm(LLaMAForCausalLM):
                        mapping=config.mapping)
             for _ in range(self.num_medusa_heads)
         ])
-        self.max_medusa_token_len = config.max_medusa_token_len
+        self.max_medusa_token_len = config.max_draft_len
 
     def forward(self, *args, **kwargs):
         output_original = True
@@ -141,6 +141,7 @@ class MedusaForCausalLm(LLaMAForCausalLM):
             return hidden_states
 
     def prepare_inputs(self, *args, **kwargs):
+        kwargs['max_draft_len'] = self.max_medusa_token_len
         inputs = super().prepare_inputs(*args, **kwargs)
         num_profiles = len(inputs['input_ids'].profiles)
         max_gen_token_len = self.max_medusa_token_len + 1

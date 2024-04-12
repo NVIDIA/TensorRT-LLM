@@ -184,7 +184,7 @@ public:
     CUTLASS_DEVICE
     DqMmaPipelined(typename Base::SharedStorage&
                        shared_storage, ///< Shared storage needed for internal use by threadblock-scoped GEMM
-        const int group_size, ///< Will not be used, just to adapt to finegrained modifications and make the compilation
+        int const group_size, ///< Will not be used, just to adapt to finegrained modifications and make the compilation
                               ///< successful. Because DqMmaPipelined is only enabled for sm<80, so even if this
                               ///< argument is not added, it does not affect compilation for sm>=80.
         int thread_idx,       ///< ID within the threadblock
@@ -353,8 +353,8 @@ public:
                 this->warp_tile_iterator_A_.load(warp_frag_A[(warp_mma_k + 1) % 2]);
                 ++this->warp_tile_iterator_A_;
 
-                const int warp_tileB_k_compute_offset = warp_mma_k % Base::kNumKIterationsPerWarpBLoad;
-                const int warp_tileB_k_load_offset = warp_mma_k / Base::kNumKIterationsPerWarpBLoad;
+                int const warp_tileB_k_compute_offset = warp_mma_k % Base::kNumKIterationsPerWarpBLoad;
+                int const warp_tileB_k_load_offset = warp_mma_k / Base::kNumKIterationsPerWarpBLoad;
                 // We are just about to finish computing on a fragment of B, so initiate the load for the next fragment.
                 if (warp_tileB_k_compute_offset == Base::kNumKIterationsPerWarpBLoad - 1)
                 {

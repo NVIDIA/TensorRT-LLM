@@ -31,13 +31,14 @@ from tensorrt_llm import Builder
 from tensorrt_llm._utils import str_dtype_to_trt, trt_dtype_to_str
 from tensorrt_llm.models.llama.weight import (load_from_hf_llama,
                                               load_from_meta_llama)
-from tensorrt_llm.models.modeling_utils import PretrainedConfig
+from tensorrt_llm.models.modeling_utils import PretrainedConfig, optimize_model
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root
-from utils.util import getSMVersion
+from utils.util import (skip_bf16_pre_ampere, skip_fp32_accum_pre_ampere,
+                        unittest_name_func)
 
 
 class TestLLaMA(unittest.TestCase):
@@ -81,14 +82,11 @@ class TestLLaMA(unittest.TestCase):
                 },
                 'use_parallel_embedding': False,
                 'embedding_sharding_dim': 0,
-                'use_prompt_tuning': False,
                 'moe_num_experts': 0,
                 'moe_top_k': 0,
                 'moe_tp_mode': 2,
                 'moe_normalization_mode': 1,
                 'use_fused_mlp': False,
-                'enable_pos_shift': False,
-                'dense_context_fmha': False,
             }
 
             # Initialize model
@@ -208,25 +206,13 @@ class TestLLaMA(unittest.TestCase):
                            False, 'float16', 4))  # GQA
         return test_cases
 
-    def custom_name_func(testcase_func, param_num, param):
-        return "%s_%s" % (
-            testcase_func.__name__,
-            parameterized.to_safe_name("_".join(str(x) for x in param.args)),
-        )
-
-    @parameterized.expand(load_test_cases, name_func=custom_name_func)
+    @parameterized.expand(load_test_cases, name_func=unittest_name_func)
     def test_llama(self, use_refit, fast_building, context_fmha_flag,
                    enable_remove_input_padding, dtype, num_kv_heads):
 
         # Skip tests that are not supported in pre-ampere architecture
-        if getSMVersion() < 80:
-            if context_fmha_flag == ContextFMHAType.enabled_with_fp32_acc:
-                pytest.skip(
-                    "ContextFMHAType with fp32 acc is not supported in pre-ampere architecture"
-                )
-            if dtype == 'bfloat16':
-                pytest.skip(
-                    "bfloat16 is not supported in pre-ampere architecture")
+        skip_bf16_pre_ampere(dtype)
+        skip_fp32_accum_pre_ampere(context_fmha_flag)
 
         PRECHECKED_GOOD_RANDOM_SEEDS = [1, 4, 5, 8]
         model = 'llama'
@@ -341,13 +327,14 @@ class TestLLaMA(unittest.TestCase):
 
         kv_shape = (batch_size, 2, llama_config.num_key_value_heads,
                     max_seq_len, head_size)
+        ctx_buffer[f'host_max_attention_window_sizes'] = torch.tensor(
+            [max_seq_len] * llama_config.num_hidden_layers, dtype=torch.int32)
+        ctx_shape[f'host_max_attention_window_sizes'] = (
+            llama_config.num_hidden_layers, )
         for i in range(llama_config.num_hidden_layers):
             ctx_shape[f'past_key_value_{i}'] = kv_shape
             ctx_buffer[f'past_key_value_{i}'] = key_value_cache_buffers[i]
             ctx_buffer[f'present_key_value_{i}'] = key_value_cache_buffers[i]
-            ctx_buffer[f'host_max_attention_window_size_{i}'] = torch.tensor(
-                [max_seq_len], dtype=torch.int32)
-            ctx_shape[f'host_max_attention_window_size_{i}'] = (1, )
         ctx_buffer['sequence_length'] = sequence_length_buffer
         ctx_shape['sequence_length'] = ctx_buffer['sequence_length'].shape
         ctx_shape['host_past_key_value_lengths'] = (batch_size, )
@@ -405,17 +392,18 @@ class TestLLaMA(unittest.TestCase):
 
         step1_shape = {k: v.shape for k, v in step1_buffer.items()}
 
+        step1_shape[f'host_max_attention_window_sizes'] = (
+            llama_config.num_hidden_layers, )
         for i in range(llama_config.num_hidden_layers):
             step1_shape[f'past_key_value_{i}'] = kv_shape
-            step1_shape[f'host_max_attention_window_size_{i}'] = (1, )
         step1_shape['sequence_length'] = (batch_size, )
         step1_shape['host_past_key_value_lengths'] = (batch_size, )
         step1_shape['host_sink_token_length'] = (1, )
+        step1_buffer[f'host_max_attention_window_sizes'] = torch.tensor(
+            [max_seq_len] * llama_config.num_hidden_layers, dtype=torch.int32)
         for i in range(llama_config.num_hidden_layers):
             step1_buffer[f'past_key_value_{i}'] = key_value_cache_buffers[i]
             step1_buffer[f'present_key_value_{i}'] = key_value_cache_buffers[i]
-            step1_buffer[f'host_max_attention_window_size_{i}'] = torch.tensor(
-                [max_seq_len], dtype=torch.int32)
         step1_buffer[
             'host_past_key_value_lengths'] = sequence_length_buffer.cpu()
         sequence_length_buffer = torch.add(sequence_length_buffer, step)
@@ -461,18 +449,7 @@ class TestLLaMA(unittest.TestCase):
                 ], [(8, 0), (8, 7)], [-1, 0, 1])))
         return test_cases
 
-    def loader_name_func(testcase_func, param_num, param):
-        expand_params = lambda params: '_'.join([
-            expand_params(x) if isinstance(x, (list, tuple)) else str(x)
-            for x in params
-        ])
-        name = expand_params(param.args)
-        return "%s_%s" % (
-            testcase_func.__name__,
-            parameterized.to_safe_name(name),
-        )
-
-    @parameterized.expand(get_loader_test_cases, name_func=loader_name_func)
+    @parameterized.expand(get_loader_test_cases, name_func=unittest_name_func)
     def test_loaders(self, paths, tp_info, emb_sharding_dim):
         model_root = llm_models_root()
         if model_root is None:
@@ -551,17 +528,17 @@ class TestLLaMA(unittest.TestCase):
             },
             'use_parallel_embedding': use_parallel_embedding,
             'embedding_sharding_dim': embedding_sharding_dim,
-            'use_prompt_tuning': False,
             'moe_num_experts': 0,
             'moe_top_k': 0,
             'moe_tp_mode': 1,
             'moe_normalization_mode': 1,
             'use_fused_mlp': False,
-            'enable_pos_shift': False,
-            'dense_context_fmha': False,
         }
         cfg = PretrainedConfig.from_dict(config)
         tensorrt_llm_llama_wHF = tensorrt_llm.models.LLaMAForCausalLM(cfg)
+        tensorrt_llm_llama_wHF = optimize_model(
+            tensorrt_llm_llama_wHF,
+            use_parallel_embedding=use_parallel_embedding)
         # print_layers(tensorrt_llm_llama_wHF)
         weights_wHF = load_from_hf_llama(tensorrt_llm_llama_wHF,
                                          hf_llama,
@@ -574,6 +551,9 @@ class TestLLaMA(unittest.TestCase):
         # print_layers(tensorrt_llm_llama_wHF)
 
         tensorrt_llm_llama_wMETA = tensorrt_llm.models.LLaMAForCausalLM(cfg)
+        tensorrt_llm_llama_wMETA = optimize_model(
+            tensorrt_llm_llama_wMETA,
+            use_parallel_embedding=use_parallel_embedding)
         # print_layers(tensorrt_llm_llama_wMETA)
         weights_wMETA = load_from_meta_llama(meta_path,
                                              mapping=tensorrt_llm.Mapping(

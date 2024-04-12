@@ -2,6 +2,28 @@
 
 This document explains how to build the [ChatGLM-6B](https://huggingface.co/THUDM/chatglm-6b), [ChatGLM2-6B](https://huggingface.co/THUDM/chatglm2-6b), [ChatGLM2-6B-32k](https://huggingface.co/THUDM/chatglm2-6b-32k), [ChatGLM3-6B](https://huggingface.co/THUDM/chatglm3-6b), [ChatGLM3-6B-Base](https://huggingface.co/THUDM/chatglm3-6b-base), [ChatGLM3-6B-32k](https://huggingface.co/THUDM/chatglm3-6b-32k) models using TensorRT-LLM and run on a single GPU, a single node with multiple GPUs or multiple nodes with multiple GPUs.
 
+- [ChatGLM](#chatglm)
+  - [Overview](#overview)
+  - [Support Matrix](#support-matrix)
+  - [Model comparison](#model-comparison)
+  - [Tokenizer and special tokens comparison](#tokenizer-and-special-tokens-comparison)
+  - [Usage](#usage)
+    - [1. Download repo and weights from HuggingFace Transformers](#1-download-repo-and-weights-from-huggingface-transformers)
+    - [2. Convert weights from HF Transformers to TensorRT-LLM format](#2-convert-weights-from-hf-transformers-to-tensorrt-llm-format)
+    - [3. Build TensorRT engine(s)](#3-build-tensorrt-engines)
+      - [Enable plugins](#enable-plugins)
+      - [In-flight batching](#in-flight-batching)
+    - [4. Run inference](#4-run-inference)
+      - [Single node, single GPU](#single-node-single-gpu)
+      - [Single node, multi GPU](#single-node-multi-gpu)
+    - [5. Run summarization task](#5-run-summarization-task)
+    - [Weight Only quantization](#weight-only-quantization)
+    - [Smooth Quantization (SQ)](#smooth-quantization-sq)
+    - [Activation-aware Weight Quantization (AWQ)](#activation-aware-weight-quantization-awq)
+    - [FP8 Quantization](#fp8-quantization)
+  - [Benchmark](#benchmark)
+
+
 ## Overview
 
 The TensorRT-LLM ChatGLM implementation can be found in [`tensorrt_llm/models/chatglm/model.py`](../../tensorrt_llm/models/chatglm/model.py).
@@ -96,12 +118,13 @@ git clone https://huggingface.co/THUDM/chatglm3-6b-base chatglm3_6b_base
 git clone https://huggingface.co/THUDM/chatglm3-6b-32k  chatglm3_6b_32k
 git clone https://huggingface.co/THUDM/glm-10b          glm_10b
 
-# replace tokenizationfile if using transformers-4.36.1 for model ChatGLM-6B (this might be needless in the future)
+# replace tokenization file if using transformers-4.36.1 for model ChatGLM-6B (this might be needless in the future)
 cp chatglm_6b/tokenization_chatglm.py chatglm_6b/tokenization_chatglm.py-backup
 cp tokenization_chatglm.py chatglm_6b
 ```
 
 ### 2. Convert weights from HF Transformers to TensorRT-LLM format
+
 The [`convert_checkpoint.py`](./convert_checkpoint.py) script converts HF weights to TensorRT-LLM checkpoints. The number of checkpoint files (in .safetensors format) is same to the number of GPUs used to run inference.
 
 ```bash
@@ -121,8 +144,8 @@ python3 convert_checkpoint.py --model_dir chatglm_6b --output_dir trt_ckpt/chatg
 python3 convert_checkpoint.py --model_dir glm_10b --output_dir trt_ckpt/glm_10b/fp16/1-gpu
 ```
 
-
 ### 3. Build TensorRT engine(s)
+
 The `trtllm-build` command builds TensorRT-LLM engines from TensorRT-LLM checkpoints. The number of engine files is also same to the number of GPUs used to run inference.
 
 Normally, the `trtllm-build` command only requires a single GPU, but you can enable parallel building by passing the number of GPUs to the `--workers` argument.
@@ -157,7 +180,8 @@ trtllm-build --checkpoint_dir trt_ckpt/glm_10b/fp16/1-gpu \
 ```
 
 If the engines are run successfully, you will see output like (ChatGLM3-6B as the example):
-```
+
+```txt
 ......
 [01/26/2024-02:40:36] [TRT] [I] Engine generation completed in 136.52 seconds.
 [01/26/2024-02:40:36] [TRT] [I] [MemUsageStats] Peak memory usage of TRT CPU/GPU memory allocators: CPU 1016 MiB, GPU 11909 MiB
@@ -169,22 +193,20 @@ If the engines are run successfully, you will see output like (ChatGLM3-6B as th
 [01/26/2024-02:42:30] [TRT-LLM] [I] Total time of building all engines: 00:05:19
 ```
 
-
 #### Enable plugins
 
 * Use `--gpt_attention_plugin <DataType>` to configure GPT Attention plugin (default as float16)
 * Use `--gemm_plugin <DataType>` to configure GEMM plugin (default as float16)
 * Use `--context_fmha enable` or `--context_fmha_fp32_acc enable` to enable FMHA kernels, which can provide better performance and low GPU memory occupation.
-    * `--gpt_attention_plugin float16` must be used when using FMHA.
-    * `--context_fmha enable` uses FP16 accumulator, which might cause low accuracy. In this case, `--context_fmha_fp32_acc enable` should be used to protect accuracy at a cost of small performance drop.
+  * `--gpt_attention_plugin float16` must be used when using FMHA.
+  * `--context_fmha enable` uses FP16 accumulator, which might cause low accuracy. In this case, `--context_fmha_fp32_acc enable` should be used to protect accuracy at a cost of small performance drop.
 
 #### In-flight batching
 
 * The engine(s) must be built accordingly if [in-flight batching in C++ runtime](../../docs/in_flight_batching.md) will be used.
 * Use `--gpt_attention_plugin float16`, `--paged_kv_cache enable`, `--remove_input_padding enable` to build engine(s) supporting In-flight Batching.
-    * It is possible to use `--gpt_attention_plugin float32` In-flight Batching.
-    * The size of the block in paged KV cache can be conteoled additionally by using `--tokens_per_block=N`.
-
+  * It is possible to use `--gpt_attention_plugin float32` In-flight Batching.
+  * The size of the block in paged KV cache can be controlled additionally by using `--tokens_per_block=N`.
 
 ### 4. Run inference
 
@@ -226,7 +248,8 @@ mpirun -n 2 \
 * `--allow-run-as-root` might be needed if using `mpirun` as root.
 
 If the engines are run successfully, you will see output like (ChatGLM3-6B as the example):
-```
+
+```txt
 ......
 Input [Text 0]: "[gMASK]sop What's new between ChatGLM3-6B and ChatGLM2-6B?"
 Output [Text 0 Beam 0]: "There is no new information provided in the official documentation, but I found some differences in the code. The ChatGLM3-6B has an additional parameter called 'config', which is not present in ChatGLM2-6B. Additionally"
@@ -242,7 +265,8 @@ python3 ../summarize.py --test_trt_llm \
 ```
 
 If the engines are run successfully, you will see output like (ChatGLM3-6B as the example):
-```
+
+```txt
 ......
 [01/26/2024-02:51:56] [TRT-LLM] [I] TensorRT-LLM (total latency: 12.688004493713379 sec)
 [01/26/2024-02:51:56] [TRT-LLM] [I] TensorRT-LLM (total output tokens: 1390)
@@ -256,7 +280,7 @@ If the engines are run successfully, you will see output like (ChatGLM3-6B as th
 
 ### Weight Only quantization
 
-Use `--use_weight_only` to enable INT8-Weight-Only quantization, this will siginficantly lower the latency and memory footprint. Furthermore, use `--weight_only_precision int8` or `--weight_only_precision int4` to configure the data type of the weights.
+Use `--use_weight_only` to enable INT8-Weight-Only quantization, this will significantly lower the latency and memory footprint. Furthermore, use `--weight_only_precision int8` or `--weight_only_precision int4` to configure the data type of the weights.
 
 ```bash
 # ChatGLM3-6B: single gpu, int8 weight only quantization
@@ -276,7 +300,6 @@ python3 ../run.py --input_text "What's new between ChatGLM3-6B and ChatGLM2-6B?"
         --tokenizer_dir chatglm3_6b \
         --engine_dir trt_engines/chatglm3_6b/int8_wo/1-gpu
 ```
-
 
 ### Smooth Quantization (SQ)
 
@@ -349,7 +372,6 @@ python3 ../run.py --input_text "What's new between ChatGLM3-6B and ChatGLM2-6B?"
         --tokenizer_dir chatglm3_6b \
         --engine_dir trt_engines/chatglm3_6b/fp8/1-gpu
 ```
-
 
 ## Benchmark
 

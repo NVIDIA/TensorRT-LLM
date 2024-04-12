@@ -23,8 +23,8 @@ using namespace tensorrt_llm::common;
 using tensorrt_llm::plugins::RmsnormQuantizationPluginCreator;
 using tensorrt_llm::plugins::RmsnormQuantizationPlugin;
 
-static const char* RMSNORM_QUANTIZATION_PLUGIN_VERSION{"1"};
-static const char* RMSNORM_QUANTIZATION_PLUGIN_NAME{"RmsnormQuantization"};
+static char const* RMSNORM_QUANTIZATION_PLUGIN_VERSION{"1"};
+static char const* RMSNORM_QUANTIZATION_PLUGIN_NAME{"RmsnormQuantization"};
 PluginFieldCollection RmsnormQuantizationPluginCreator::mFC{};
 std::vector<nvinfer1::PluginField> RmsnormQuantizationPluginCreator::mPluginAttributes;
 
@@ -36,9 +36,9 @@ RmsnormQuantizationPlugin::RmsnormQuantizationPlugin(float eps, bool dynamicActi
 }
 
 // Parameterized constructor
-RmsnormQuantizationPlugin::RmsnormQuantizationPlugin(const void* data, size_t length)
+RmsnormQuantizationPlugin::RmsnormQuantizationPlugin(void const* data, size_t length)
 {
-    const char *d = reinterpret_cast<const char*>(data), *a = d;
+    char const *d = reinterpret_cast<char const*>(data), *a = d;
     read(d, mEps);
     read(d, mDynActScaling);
     read(d, mType);
@@ -58,7 +58,7 @@ nvinfer1::IPluginV2DynamicExt* RmsnormQuantizationPlugin::clone() const noexcept
 }
 
 nvinfer1::DimsExprs RmsnormQuantizationPlugin::getOutputDimensions(
-    int outputIndex, const nvinfer1::DimsExprs* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
+    int outputIndex, nvinfer1::DimsExprs const* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
 {
     if (outputIndex == 0)
     {
@@ -79,7 +79,7 @@ nvinfer1::DimsExprs RmsnormQuantizationPlugin::getOutputDimensions(
         ret.d[ret.nbDims - 1] = exprBuilder.constant(1);
         return ret;
     }
-    catch (const std::exception& e)
+    catch (std::exception const& e)
     {
         caughtError(e);
     }
@@ -87,9 +87,9 @@ nvinfer1::DimsExprs RmsnormQuantizationPlugin::getOutputDimensions(
 }
 
 bool RmsnormQuantizationPlugin::supportsFormatCombination(
-    int pos, const nvinfer1::PluginTensorDesc* inOut, int nbInputs, int nbOutputs) noexcept
+    int pos, nvinfer1::PluginTensorDesc const* inOut, int nbInputs, int nbOutputs) noexcept
 {
-    const int totalPoses = 6 + static_cast<int>(mDynActScaling);
+    int const totalPoses = 6 + static_cast<int>(mDynActScaling);
     TLLM_CHECK(0 <= pos && pos < totalPoses);
     TLLM_CHECK(nbInputs == 4);
     if (pos < nbInputs)
@@ -111,19 +111,19 @@ bool RmsnormQuantizationPlugin::supportsFormatCombination(
     return (inOut[pos].type == nvinfer1::DataType::kFLOAT) && (inOut[pos].format == TensorFormat::kLINEAR);
 }
 
-void RmsnormQuantizationPlugin::configurePlugin(const nvinfer1::DynamicPluginTensorDesc* in, int nbInputs,
-    const nvinfer1::DynamicPluginTensorDesc* out, int nbOutputs) noexcept
+void RmsnormQuantizationPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int nbInputs,
+    nvinfer1::DynamicPluginTensorDesc const* out, int nbOutputs) noexcept
 {
 }
 
-size_t RmsnormQuantizationPlugin::getWorkspaceSize(const nvinfer1::PluginTensorDesc* inputs, int nbInputs,
-    const nvinfer1::PluginTensorDesc* outputs, int nbOutputs) const noexcept
+size_t RmsnormQuantizationPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* inputs, int nbInputs,
+    nvinfer1::PluginTensorDesc const* outputs, int nbOutputs) const noexcept
 {
     return 0;
 }
 
-int RmsnormQuantizationPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc,
-    const nvinfer1::PluginTensorDesc* outputDesc, const void* const* inputs, void* const* outputs, void* workspace,
+int RmsnormQuantizationPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
+    nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
     cudaStream_t stream) noexcept
 {
     // inputs
@@ -140,24 +140,24 @@ int RmsnormQuantizationPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDe
     {
         m *= inputDesc[0].dims.d[i];
     }
-    const int n = inputDesc[1].dims.d[0];
+    int const n = inputDesc[1].dims.d[0];
 
-    const float* scale = reinterpret_cast<const float*>(inputs[3]);
+    float const* scale = reinterpret_cast<float const*>(inputs[3]);
     int8_t* output = reinterpret_cast<int8_t*>(outputs[0]);
     float* dynamic_scale = mDynActScaling ? reinterpret_cast<float*>(outputs[1]) : nullptr;
 
     if (mType == DataType::kHALF)
     {
-        const half* input = reinterpret_cast<const half*>(inputs[0]);
-        const half* weight = reinterpret_cast<const half*>(inputs[1]);
-        const half* bias = reinterpret_cast<const half*>(inputs[2]);
+        half const* input = reinterpret_cast<half const*>(inputs[0]);
+        half const* weight = reinterpret_cast<half const*>(inputs[1]);
+        half const* bias = reinterpret_cast<half const*>(inputs[2]);
         invokeGeneralRmsNorm((half*) nullptr, input, weight, bias, mEps, m, n, stream, scale, dynamic_scale, output);
     }
     else if (mType == DataType::kFLOAT)
     {
-        const float* input = reinterpret_cast<const float*>(inputs[0]);
-        const float* weight = reinterpret_cast<const float*>(inputs[1]);
-        const float* bias = reinterpret_cast<const float*>(inputs[2]);
+        float const* input = reinterpret_cast<float const*>(inputs[0]);
+        float const* weight = reinterpret_cast<float const*>(inputs[1]);
+        float const* bias = reinterpret_cast<float const*>(inputs[2]);
         invokeGeneralRmsNorm((float*) nullptr, input, weight, bias, mEps, m, n, stream, scale, dynamic_scale, output);
     }
 
@@ -166,7 +166,7 @@ int RmsnormQuantizationPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDe
 
 // IPluginV2Ext Methods
 nvinfer1::DataType RmsnormQuantizationPlugin::getOutputDataType(
-    int index, const nvinfer1::DataType* inputTypes, int nbInputs) const noexcept
+    int index, nvinfer1::DataType const* inputTypes, int nbInputs) const noexcept
 {
     assert((mDynActScaling && index < 2) || (!mDynActScaling && index == 0));
     if (index == 0)
@@ -180,12 +180,12 @@ nvinfer1::DataType RmsnormQuantizationPlugin::getOutputDataType(
 
 // IPluginV2 Methods
 
-const char* RmsnormQuantizationPlugin::getPluginType() const noexcept
+char const* RmsnormQuantizationPlugin::getPluginType() const noexcept
 {
     return RMSNORM_QUANTIZATION_PLUGIN_NAME;
 }
 
-const char* RmsnormQuantizationPlugin::getPluginVersion() const noexcept
+char const* RmsnormQuantizationPlugin::getPluginVersion() const noexcept
 {
     return RMSNORM_QUANTIZATION_PLUGIN_VERSION;
 }
@@ -235,45 +235,45 @@ RmsnormQuantizationPluginCreator::RmsnormQuantizationPluginCreator()
     mFC.fields = mPluginAttributes.data();
 }
 
-const char* RmsnormQuantizationPluginCreator::getPluginName() const noexcept
+char const* RmsnormQuantizationPluginCreator::getPluginName() const noexcept
 {
     return RMSNORM_QUANTIZATION_PLUGIN_NAME;
 }
 
-const char* RmsnormQuantizationPluginCreator::getPluginVersion() const noexcept
+char const* RmsnormQuantizationPluginCreator::getPluginVersion() const noexcept
 {
     return RMSNORM_QUANTIZATION_PLUGIN_VERSION;
 }
 
-const PluginFieldCollection* RmsnormQuantizationPluginCreator::getFieldNames() noexcept
+PluginFieldCollection const* RmsnormQuantizationPluginCreator::getFieldNames() noexcept
 {
     return &mFC;
 }
 
-IPluginV2* RmsnormQuantizationPluginCreator::createPlugin(const char* name, const PluginFieldCollection* fc) noexcept
+IPluginV2* RmsnormQuantizationPluginCreator::createPlugin(char const* name, PluginFieldCollection const* fc) noexcept
 {
-    const PluginField* fields = fc->fields;
+    PluginField const* fields = fc->fields;
     float eps;
     nvinfer1::DataType type;
     bool dynamicActivationScaling;
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {
-        const char* attrName = fields[i].name;
+        char const* attrName = fields[i].name;
         if (!strcmp(attrName, "eps"))
         {
             TLLM_CHECK(fields[i].type == PluginFieldType::kFLOAT32);
-            eps = static_cast<float>(*(static_cast<const float*>(fields[i].data)));
+            eps = static_cast<float>(*(static_cast<float const*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "type_id"))
         {
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
-            type = static_cast<nvinfer1::DataType>(*(static_cast<const nvinfer1::DataType*>(fields[i].data)));
+            type = static_cast<nvinfer1::DataType>(*(static_cast<nvinfer1::DataType const*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "dyn_act_scaling"))
         {
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
-            dynamicActivationScaling = static_cast<bool>(*(static_cast<const bool*>(fields[i].data)));
+            dynamicActivationScaling = static_cast<bool>(*(static_cast<bool const*>(fields[i].data)));
         }
     }
     try
@@ -282,7 +282,7 @@ IPluginV2* RmsnormQuantizationPluginCreator::createPlugin(const char* name, cons
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }
-    catch (const std::exception& e)
+    catch (std::exception const& e)
     {
         caughtError(e);
     }
@@ -290,7 +290,7 @@ IPluginV2* RmsnormQuantizationPluginCreator::createPlugin(const char* name, cons
 }
 
 IPluginV2* RmsnormQuantizationPluginCreator::deserializePlugin(
-    const char* name, const void* serialData, size_t serialLength) noexcept
+    char const* name, void const* serialData, size_t serialLength) noexcept
 {
     // This object will be deleted when the network is destroyed, which will
     // call RmsnormQuantizationPlugin::destroy()
@@ -300,7 +300,7 @@ IPluginV2* RmsnormQuantizationPluginCreator::deserializePlugin(
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }
-    catch (const std::exception& e)
+    catch (std::exception const& e)
     {
         caughtError(e);
     }

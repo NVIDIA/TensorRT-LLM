@@ -155,6 +155,38 @@ def attention_qkvpacked_ref(qkv,
                          reorder_ops=reorder_ops)
 
 
+def mamba_conv1d_ref(x, past_conv_state, conv_weight, conv_bias):
+    """
+    Arguments:
+        x: [batch_size, dim, seq_len]
+        past_conv_state: [batch_size, dim, dconv-1]
+        conv_weight: [dim, 1, dconv]
+        conv_bias: [dim]
+    Output:
+        y: [batch_size, dim, seq_len]
+        present_conv_state: [batch_size, dim, dconv-1]
+    """
+    assert x.dim() == 3
+    assert past_conv_state.dim() == 3
+    assert conv_weight.dim() == 3
+    assert conv_bias.dim() == 1
+    batch_size, dim, seq_len = x.shape
+    assert past_conv_state.shape[0] == batch_size
+    assert past_conv_state.shape[1] == dim
+    dconv = past_conv_state.shape[2] + 1
+    assert conv_weight.shape[0] == dim
+    assert conv_weight.shape[1] == 1
+    assert conv_weight.shape[2] == dconv
+    assert conv_weight.shape[0] == dim
+
+    padded_x = torch.cat([past_conv_state, x], dim=2)
+    present_conv_state = padded_x[:, :, -(dconv - 1):]
+    x_conv = F.conv1d(padded_x, conv_weight, bias=conv_bias, groups=dim)
+
+    y = F.silu(x_conv)
+    return y, present_conv_state
+
+
 def selective_scan_ref(u,
                        delta,
                        A,
@@ -165,44 +197,45 @@ def selective_scan_ref(u,
                        delta_bias=None,
                        delta_softplus=False):
     """
-    u: (B D L)
-    delta: (B D L)
-    A: (D N)
-    B: (B N L)
-    C: (B N L)
+    u: (B L D)
+    delta: (B L D)
+    A: (N D)
+    B: (B L N)
+    C: (B L N)
     D: (D)
-    z: (B D L)
+    z: (B L D)
     delta_bias: (D), fp32
 
-    out: (B D L)
-    last_state (optional): (B D dstate), fp32
+    out: (B L D)
+    last_state (optional): (B dstate D), fp32
     """
     dtype_in = u.dtype
     u = u.float()
     delta = delta.float()
     if delta_bias is not None:
-        delta = delta + delta_bias[..., None].float()
+        delta = delta + delta_bias.unsqueeze(0).unsqueeze(1).float()
     if delta_softplus:
         delta = F.softplus(delta)
-    batch, dim, dstate = u.shape[0], A.shape[0], A.shape[1]
+    batch, dstate, dim = u.shape[0], A.shape[0], A.shape[1]
     B = B.float()
     C = C.float()
-    x = A.new_zeros((batch, dim, dstate))
+    x = A.new_zeros((batch, dstate, dim))
     ys = []
-    deltaA = torch.exp(torch.einsum('bdl,dn->bdln', delta, A))
-    deltaB_u = torch.einsum('bdl,bnl,bdl->bdln', delta, B, u)
+    deltaA = torch.exp(torch.einsum('bld,nd->blnd', delta, A))
+    deltaB_u = torch.einsum('bld,bln,bld->blnd', delta, B, u)
     last_state = None
-    for i in range(u.shape[2]):
-        x = deltaA[:, :, i] * x + deltaB_u[:, :, i]
-        y = torch.einsum('bdn,bn->bd', x, C[:, :, i])
-        if i == u.shape[2] - 1:
+    for i in range(u.shape[1]):
+        x = deltaA[:, i, :] * x + deltaB_u[:, i, :]
+        y = torch.einsum('bnd,bn->bd', x, C[:, i, :])
+        if i == u.shape[1] - 1:
             last_state = x
         ys.append(y)
-    y = torch.stack(ys, dim=2)  # (batch dim L)
-    out = y if D is None else y + u * rearrange(D, "d -> d 1")
+    y = torch.stack(ys, dim=1)  # (batch L dim)
+    out = y if D is None else y + u * rearrange(D, "d -> 1 d")
     if z is not None:
         out = out * F.silu(z.float())
     out = out.to(dtype=dtype_in)
+    last_state = last_state.to(dtype=dtype_in)
     return out, last_state
 
 
@@ -218,10 +251,10 @@ def selective_state_update_ref(state,
                                dt_softplus=False):
     """
     Argument:
-        state: (batch, dim, dstate)
+        state: (batch, dstate, dim)
         x: (batch, dim)
         dt: (batch, dim)
-        A: (dim, dstate)
+        A: (dstate, dim)
         B: (batch, dstate)
         C: (batch, dstate)
         D: (dim,)
@@ -230,10 +263,10 @@ def selective_state_update_ref(state,
     Return:
         out: (batch, dim)
     """
-    batch, dim, dstate = state.shape
+    batch, dstate, dim = state.shape
     assert x.shape == (batch, dim)
     assert dt.shape == x.shape
-    assert A.shape == (dim, dstate)
+    assert A.shape == (dstate, dim)
     assert B.shape == (batch, dstate)
     assert C.shape == B.shape
     if D is not None:
@@ -244,13 +277,13 @@ def selective_state_update_ref(state,
         assert dt_bias.shape == (dim, )
         dt = dt + dt_bias
     dt = F.softplus(dt) if dt_softplus else dt
-    dA = torch.exp(rearrange(dt, "b d -> b d 1") * A)  # (batch, dim, dstate)
-    dB = rearrange(dt, "b d -> b d 1") * rearrange(
-        B.float(), "b n -> b 1 n")  # (batch, dim, dstate)
+    dA = torch.exp(rearrange(dt, "b d -> b 1 d") * A)  # (batch, dstate, dim)
+    dB = rearrange(dt, "b d -> b 1 d") * rearrange(
+        B.float(), "b n -> b n 1")  # (batch, dstate, dim)
     state_new = state * dA + dB * rearrange(
-        x, "b d -> b d 1")  # (batch, dim, dstate)
+        x, "b d -> b 1 d")  # (batch, dstate, dim)
     state.copy_(state_new.to(state.dtype))
-    out = torch.einsum("bdn,bn->bd", state_new, C.float())
+    out = torch.einsum("bnd,bn->bd", state_new, C.float())
     if D is not None:
         out += x * D
     return (out if z is None else out * F.silu(z.float())).to(x.dtype)
@@ -321,14 +354,48 @@ class mamba_ref(nn.Module):
 
     def forward(self,
                 hidden_states,
-                conv_state=None,
-                ssm_state=None,
+                last_token_ids,
+                conv_state,
+                ssm_state,
+                remove_padding,
+                batch_size,
                 seqlen_offset=0):
+        out, present_conv_state, present_ssm_state = [], [], []
+        for i in range(batch_size):
+            start_id = 0 if (i == 0
+                             or not remove_padding) else last_token_ids[i - 1]
+            end_id = last_token_ids[i]
+            if remove_padding:
+                hidden_states_i = hidden_states[start_id:end_id, :].unsqueeze(0)
+            else:
+                hidden_states_i = hidden_states[i:i + 1, start_id:end_id, :]
+            conv_state_i = conv_state[i:i + 1, :]
+            ssm_state_i = ssm_state[i:i + 1, :]
+            out_i, conv_state_i, ssm_state_i = self.forward_impl(
+                hidden_states_i, conv_state_i, ssm_state_i, seqlen_offset)
+            if remove_padding:
+                out_i = out_i.squeeze(0)
+            else:
+                padding_num = hidden_states.shape[1] - out_i.shape[1]
+                out_i = F.pad(out_i, (0, 0, 0, padding_num, 0, 0), value=0)
+            out.append(out_i)
+            present_conv_state.append(conv_state_i)
+            present_ssm_state.append(ssm_state_i)
+        out = torch.concat(out, dim=0)
+        present_conv_state = torch.concat(present_conv_state, dim=0)
+        present_ssm_state = torch.concat(present_ssm_state, dim=0)
+        return out, present_conv_state, present_ssm_state
+
+    def forward_impl(self,
+                     hidden_states,
+                     conv_state,
+                     ssm_state,
+                     seqlen_offset=0):
         """
         hidden_states: (B, L, D)
         Returns: same shape as hidden_states
         """
-        batch, seqlen, dim = hidden_states.shape
+        _, seqlen, _ = hidden_states.shape
 
         if seqlen_offset > 0:
             # The states are updated inplace
@@ -338,13 +405,13 @@ class mamba_ref(nn.Module):
 
         # in_proj
         xz = torch.nn.functional.linear(hidden_states, self.in_proj.weight)
-        xz = xz.permute(0, 2, 1)
         if self.in_proj.bias is not None:
             xz = xz + rearrange(self.in_proj.bias.to(dtype=xz.dtype),
-                                "d -> d 1")
+                                "d -> 1 d")
 
         # Conv
-        x, z = xz.chunk(2, dim=1)
+        x, z = xz.chunk(2, dim=2)
+        x = x.permute(0, 2, 1)
         if conv_state is not None:
             conv_state.copy_(F.pad(x, (self.d_conv - x.shape[-1], 0)))
         x_conv = self.conv1d(x)[..., :seqlen]
@@ -356,11 +423,12 @@ class mamba_ref(nn.Module):
                                [self.dt_rank, self.d_state, self.d_state],
                                dim=-1)
         dt = self.dt_proj.weight @ dt.t()
-        dt = rearrange(dt, "d (b l) -> b d l", l=seqlen)
-        B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
-        C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
+        dt = rearrange(dt, "d (b l) -> b l d", l=seqlen).contiguous()
+        B = rearrange(B, "(b l) dstate -> b l dstate", l=seqlen).contiguous()
+        C = rearrange(C, "(b l) dstate -> b l dstate", l=seqlen).contiguous()
 
         # Selective scan
+        x = x.permute(0, 2, 1)
         y, last_state = selective_scan_ref(x,
                                            dt,
                                            self.A,
@@ -373,7 +441,6 @@ class mamba_ref(nn.Module):
         ssm_state.copy_(last_state)
 
         # out_proj
-        y = rearrange(y, "b d l -> b l d")
         out = self.out_proj(y)
         return out, conv_state, ssm_state
 

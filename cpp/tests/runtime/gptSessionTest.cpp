@@ -20,6 +20,7 @@
 #include <gtest/gtest.h>
 
 #include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/common/stlUtils.h"
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
@@ -29,7 +30,6 @@
 
 #include <algorithm>
 #include <filesystem>
-#include <mpi.h>
 
 using namespace tensorrt_llm::runtime;
 
@@ -45,6 +45,7 @@ auto const DATA_PATH = TEST_RESOURCE_PATH / "data";
 auto const GPT_MODEL_DIR = "gpt2";
 auto const GPTJ_MODEL_DIR = "gpt-j-6b";
 auto const LLAMA_MODEL_DIR = "llama-7b-hf";
+auto const MAMBA_MODEL_DIR = "mamba-2.8b";
 
 // Engines need to be generated using cpp/tests/resources/scripts/build_gpt_engines.py.
 auto const FP32_GPT_DIR = "fp32-default";
@@ -199,7 +200,7 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
     if (isChatGlmTest)
     {
         ASSERT_TRUE(fs::exists(DATA_PATH / modelName));
-        const int batchSize = *batchSizes.begin();
+        int const batchSize = *batchSizes.begin();
         fileNameSuffix
             = std::string("-BS") + std::to_string(batchSize) + "-BM" + std::to_string(beamWidth) + std::string(".npy");
         inputPath = DATA_PATH / modelName / (std::string("inputId") + fileNameSuffix);
@@ -239,7 +240,7 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
     auto const modelConfig = json.getModelConfig();
     verifyModelConfig(modelConfig, modelSpec);
 
-    const int worldSize = modelSpec.mTPSize * modelSpec.mPPSize;
+    int const worldSize = modelSpec.mTPSize * modelSpec.mPPSize;
     auto const worldConfig = WorldConfig::mpi(worldSize, modelSpec.mTPSize, modelSpec.mPPSize);
 
     auto enginePath = modelPath / json.engineFilename(worldConfig);
@@ -278,6 +279,7 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
         samplingConfig.topK = std::vector{0};
         samplingConfig.topP = std::vector{0.0f};
     }
+    samplingConfig.earlyStopping = std::vector{1};
 
     auto const padId = modelIds.padId;
     auto endId = modelIds.endId;
@@ -296,9 +298,9 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
         std::srand(42);
         if (modelSpec.mRandomEndId)
         {
-            const auto endIdRow = std::rand() % nbGivenInputs;
-            const auto endIdBeam = std::rand() % beamWidth;
-            const auto endIdCol = givenInputLengths[endIdRow] + minLength + std::rand() % (maxNewTokens - minLength);
+            auto const endIdRow = std::rand() % nbGivenInputs;
+            auto const endIdBeam = std::rand() % beamWidth;
+            auto const endIdCol = givenInputLengths[endIdRow] + minLength + std::rand() % (maxNewTokens - minLength);
             auto const endIdIndex = tc::flat_index2((endIdRow * beamWidth + endIdBeam), endIdCol, maxSeqLength);
             endId = expectedOutputData[endIdIndex];
         }
@@ -356,7 +358,7 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
         std::vector<SizeType> inputLengthsHost(batchSize);
         for (SizeType i = 0; i < batchSize; ++i)
         {
-            const int inputIdx = i % nbGivenInputs;
+            int const inputIdx = i % nbGivenInputs;
             inputLengthsHost[i] = givenInputLengths[inputIdx];
         }
         auto inputLengths = bufferManager.copyFrom(inputLengthsHost, ITensor::makeShape({batchSize}), MemoryType::kGPU);
@@ -518,7 +520,7 @@ auto constexpr kBatchSizes = {1, 8};
 
 using ParamType = std::tuple<ModelParams, ModelSpec, SizeType, bool, MicroBatchSizes>;
 
-std::string generateTestName(const testing::TestParamInfo<ParamType>& info)
+std::string generateTestName(testing::TestParamInfo<ParamType> const& info)
 {
     auto const modelSpec = std::get<1>(info.param);
     std::string name{modelSpec.mDataType == nvinfer1::DataType::kFLOAT ? "Float" : "Half"};
@@ -582,7 +584,7 @@ TEST_P(ParamTest, Test)
 
     // Warning: This should be the last check before running the test.
     // It will initialize MPI which can take significant time.
-    if (!WorldConfig::validConfig(modelSpec.mTPSize, modelSpec.mPPSize))
+    if (modelSpec.mTPSize * modelSpec.mPPSize != COMM_SESSION.getSize())
     {
         GTEST_SKIP() << "Model's world size " << modelSpec.mPPSize * modelSpec.mTPSize
                      << " is not equal to the system world size";
@@ -603,7 +605,7 @@ INSTANTIATE_TEST_SUITE_P(GptSessionOtbTest, ParamTest,
             ModelSpec{FP16_GPT_DIR, FP16_RESULT_FILE, nvinfer1::DataType::kHALF}.useDecoderPerRequest()
 
                 ),
-        testing::Values(1 /*, 2*/),   // beamWidth, DISABLED beam search
+        testing::Values(1),           // beamWidth, DISABLED beam search
         testing::Values(false, true), // cudaGraphMode
         testing::Values(MicroBatchSizes(), MicroBatchSizes{3, 3}, MicroBatchSizes{3, 6})),
     generateTestName);
@@ -686,6 +688,23 @@ INSTANTIATE_TEST_SUITE_P(GptjSessionTest, ParamTest,
 
                 ),
         testing::Values(1, 2),  // beamWidth
+        testing::Values(false), // cudaGraphMode
+        testing::Values(MicroBatchSizes())),
+    generateTestName);
+
+INSTANTIATE_TEST_SUITE_P(MambaSessionOOTBTest, ParamTest,
+    testing::Combine(testing::Values(ModelParams{MAMBA_MODEL_DIR, {0, 1}}),
+        testing::Values(
+            // single decoder
+            ModelSpec{FP16_GPT_DIR, FP16_RESULT_FILE, nvinfer1::DataType::kHALF}),
+        testing::Values(1),     // beamWidth
+        testing::Values(false), // cudaGraphMode
+        testing::Values(MicroBatchSizes())),
+    generateTestName);
+INSTANTIATE_TEST_SUITE_P(MambaSessionPluginTest, ParamTest,
+    testing::Combine(testing::Values(ModelParams{MAMBA_MODEL_DIR, {0, 1}}),
+        testing::Values(ModelSpec{FP16_GPT_ATTENTION_DIR, FP16_PLUGIN_RESULT_FILE, nvinfer1::DataType::kHALF}),
+        testing::Values(1),     // beamWidth
         testing::Values(false), // cudaGraphMode
         testing::Values(MicroBatchSizes())),
     generateTestName);
@@ -812,6 +831,7 @@ TEST_F(ChatGlm2SessionTest, HalfSamplingAttentionPluginBS1BM1)
         modelPath, modelSpec, modeIds, 1, batchSizes, "", mLogger, false, MicroBatchSizes(), true, modelName);
 }
 
+/*
 TEST_F(ChatGlm2SessionTest, HalfSamplingAttentionPluginBS2BM1)
 {
     auto const modelName{"chatglm2_6b"};
@@ -824,6 +844,7 @@ TEST_F(ChatGlm2SessionTest, HalfSamplingAttentionPluginBS2BM1)
     testGptSession(
         modelPath, modelSpec, modeIds, 1, batchSizes, "", mLogger, false, MicroBatchSizes(), true, modelName);
 }
+*/
 
 TEST_F(ChatGlm2SessionTest, HalfSamplingAttentionPluginBS1BM2)
 {

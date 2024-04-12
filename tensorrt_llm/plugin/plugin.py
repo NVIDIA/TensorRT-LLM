@@ -78,6 +78,8 @@ class PluginConfig:
     weight_only_quant_matmul_plugin: str = None
     quantize_per_token_plugin: bool = False
     quantize_tensor_plugin: bool = False
+    moe_plugin: str = "float16"
+    mamba_conv1d_plugin: str = "float16"
 
     # Features
     context_fmha: bool = True
@@ -91,7 +93,11 @@ class PluginConfig:
     attention_qk_half_accumulation: bool = False
     tokens_per_block: int = 128
     use_paged_context_fmha: bool = False
+    use_fp8_context_fmha: bool = False
     use_context_fmha_for_generation: bool = False
+    multiple_profiles: bool = False
+    paged_state: bool = True
+    streamingllm: bool = False
 
     def set_plugin(self, name: str, value: Union[str, bool, int]):
         assert hasattr(self, name), f"Plugin name doesn't exist: {name}"
@@ -214,6 +220,14 @@ class PluginConfig:
         self.set_plugin("gemm_plugin", dtype)
         return self
 
+    def set_moe_plugin(self, dtype='float16'):
+        self.moe_plugin = dtype
+        return self
+
+    def set_mamba_conv1d_plugin(self, dtype='float16'):
+        self.mamba_conv1d_plugin = dtype
+        return self
+
     def set_smooth_quant_gemm_plugin(self, dtype='float16'):
         self.set_plugin("smooth_quant_gemm_plugin", dtype)
         return self
@@ -267,6 +281,10 @@ class PluginConfig:
         self.set_plugin("use_context_fmha_for_generation", True)
         return self
 
+    def set_streamingllm(self):
+        self.set_plugin("streamingllm", True)
+        return self
+
 
 cli_plugin_args = [
     # Plugins
@@ -275,6 +293,8 @@ cli_plugin_args = [
     "gemm_plugin",
     "lookup_plugin",
     "lora_plugin",
+    "moe_plugin",
+    "mamba_conv1d_plugin",
 
     # Features
     "context_fmha",
@@ -287,7 +307,11 @@ cli_plugin_args = [
     "attention_qk_half_accumulation",
     "tokens_per_block",
     "use_paged_context_fmha",
+    "use_fp8_context_fmha",
     "use_context_fmha_for_generation",
+    "multiple_profiles",
+    "paged_state",
+    "streamingllm",
 ]
 
 plugin_options = ["float16", "float32", "bfloat16", "disable"]
@@ -330,7 +354,7 @@ class CustomAllReduceHelper:
 
         workspace: Tensor
             When using CUSTOM or AUTO mode, a tensor containing pointers to memory
-            visible to all GPUs. It should be 3 poitners per TP rank -
+            visible to all GPUs. It should be 3 pointers per TP rank -
             ptr to data buffer, ptr to barriers in, ptr to barriers out.
             It must be initialized using IpcMemory class.
 
@@ -352,16 +376,14 @@ class CustomAllReduceHelper:
 
     def set_workspace_tensor(self,
                              mapping: Mapping,
-                             two_opt_profiles: Optional[bool] = None):
+                             num_profiles: Optional[int] = None):
         from ..functional import Tensor
         workspace_size = self.POINTERS_PER_RANK * mapping.tp_size
 
         dim_range = None
-        if two_opt_profiles is not None:
-            dim_range = OrderedDict([
-                ('all_reduce_size', [workspace_size, workspace_size]
-                 if two_opt_profiles else [workspace_size])
-            ])
+        if num_profiles is not None:
+            dim_range = OrderedDict([('all_reduce_size',
+                                      [workspace_size] * num_profiles)])
 
         self.workspace = Tensor(
             name='all_reduce_workspace',
@@ -380,15 +402,17 @@ class CustomAllReduceHelper:
     def allocate_workspace(mapping: Mapping,
                            size: int) -> Tuple[List[IpcMemory], "torch.tensor"]:
         import torch
-        ipc_buffers_ping = IpcMemory(mapping, size)
-        ipc_buffers_pong = IpcMemory(mapping, size)
+        ipc_buffers_ping = IpcMemory(mapping, size * mapping.world_size)
+        ipc_buffers_pong = IpcMemory(mapping, size * mapping.world_size)
         ipc_barriers_in = IpcMemory(
             mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size)
         ipc_barriers_out = IpcMemory(
             mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size)
         buffers = [
-            ipc_buffers_ping, ipc_buffers_pong, ipc_barriers_in,
-            ipc_buffers_ping
+            ipc_buffers_ping,
+            ipc_buffers_pong,
+            ipc_barriers_in,
+            ipc_barriers_out,
         ]
 
         return buffers, torch.tensor(

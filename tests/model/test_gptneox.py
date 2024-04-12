@@ -19,7 +19,6 @@ import unittest
 from itertools import product
 
 import numpy as np
-import pytest
 
 # isort: off
 import torch
@@ -34,10 +33,13 @@ from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
+import os
+import sys
+
 from examples.gptneox.convert_checkpoint import convert_hf_gptneox
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import getSMVersion
+from utils.util import skip_fp32_accum_pre_ampere, unittest_name_func
 
 
 def compare_max_abs_error(ref, res, str):
@@ -91,10 +93,6 @@ class TestGPTNeoX(unittest.TestCase):
             "rotary_emb_base": 10000,
             "rotary_pct": gpt_config.rotary_pct,
             "hidden_act": hidden_act,
-            "quantization": {
-                "use_weight_only": False,
-                "weight_only_precision": "int8"
-            },
             "mapping": {
                 "world_size": tensor_parallel,
                 "tp_size": tensor_parallel
@@ -193,16 +191,12 @@ class TestGPTNeoX(unittest.TestCase):
         ], [False, True])
         return test_cases
 
-    @parameterized.expand(load_test_cases)
+    @parameterized.expand(load_test_cases, name_func=unittest_name_func)
     def test_gptneox_plugin(self, context_fmha_flag,
                             enable_remove_input_padding):
 
         # Skip tests that are not supported in pre-ampere architecture
-        if getSMVersion() < 80:
-            if context_fmha_flag == ContextFMHAType.enabled_with_fp32_acc:
-                pytest.skip(
-                    "ContextFMHAType with fp32 acc is not supported in pre-ampere architecture"
-                )
+        skip_fp32_accum_pre_ampere(context_fmha_flag)
 
         torch.random.manual_seed(0)
         use_refit = False
@@ -303,13 +297,14 @@ class TestGPTNeoX(unittest.TestCase):
         ctx_shape = {k: v.shape for k, v in ctx_buffer.items()}
         shape = (batch_size, 2, gpt_config.num_attention_heads, total_seq_len,
                  gpt_config.hidden_size // gpt_config.num_attention_heads)
+        ctx_buffer[f'host_max_attention_window_sizes'] = torch.tensor(
+            [total_seq_len] * gpt_config.num_hidden_layers, dtype=torch.int32)
+        ctx_shape[f'host_max_attention_window_sizes'] = (
+            gpt_config.num_hidden_layers, )
         for i in range(gpt_config.num_hidden_layers):
             ctx_shape[f'past_key_value_{i}'] = shape
             ctx_buffer[f'past_key_value_{i}'] = key_value_cache_buffers[i]
             ctx_buffer[f'present_key_value_{i}'] = key_value_cache_buffers[i]
-            ctx_buffer[f'host_max_attention_window_size_{i}'] = torch.tensor(
-                [total_seq_len], dtype=torch.int32)
-            ctx_shape[f'host_max_attention_window_size_{i}'] = (1, )
         ctx_buffer['sequence_length'] = sequence_length_buffer
         sequence_length_buffer = torch.add(sequence_length_buffer, step)
         ctx_shape['sequence_length'] = ctx_buffer['sequence_length'].shape
@@ -401,17 +396,18 @@ class TestGPTNeoX(unittest.TestCase):
         if enable_remove_input_padding:
             step1_buffer['host_context_lengths'] = gen_context_lengths.cpu()
         step1_shape = {k: v.shape for k, v in step1_buffer.items()}
+        step1_shape[f'host_max_attention_window_sizes'] = (
+            gpt_config.num_hidden_layers, )
         for i in range(gpt_config.num_hidden_layers):
             step1_shape[f'past_key_value_{i}'] = shape
-            step1_shape[f'host_max_attention_window_size_{i}'] = (1, )
         step1_shape['sequence_length'] = (batch_size, )
         step1_shape['host_past_key_value_lengths'] = (batch_size, )
         step1_shape['host_sink_token_length'] = (1, )
+        step1_buffer[f'host_max_attention_window_sizes'] = torch.tensor(
+            [total_seq_len] * gpt_config.num_hidden_layers, dtype=torch.int32)
         for i in range(gpt_config.num_hidden_layers):
             step1_buffer[f'past_key_value_{i}'] = key_value_cache_buffers[i]
             step1_buffer[f'present_key_value_{i}'] = key_value_cache_buffers[i]
-            step1_buffer[f'host_max_attention_window_size_{i}'] = torch.tensor(
-                [total_seq_len], dtype=torch.int32)
         # For step 1, the sequence_lengths = context_lengths + 1.
         sequence_length_buffer = torch.add(sequence_length_buffer, step)
         step1_buffer['sequence_length'] = sequence_length_buffer

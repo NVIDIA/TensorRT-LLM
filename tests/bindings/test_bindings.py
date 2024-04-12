@@ -3,6 +3,7 @@ import json
 import pickle
 import tempfile
 from pathlib import Path
+from typing import List
 
 import numpy as np
 import torch
@@ -147,6 +148,39 @@ def test_quant_mode():
     assert _tb.QuantMode.none() == _tb.QuantMode.none()
 
 
+def test_decoding_mode():
+    assert _tb.DecodingMode.none().is_none
+    assert not _tb.DecodingMode.none().is_top_k
+    assert not _tb.DecodingMode.none().is_top_p
+    assert not _tb.DecodingMode.none().is_beam_search
+
+    assert _tb.DecodingMode.top_k().is_top_k
+    assert _tb.DecodingMode.top_k().is_top_k_or_top_p
+    assert not _tb.DecodingMode.top_k().is_top_p
+    assert not _tb.DecodingMode.top_k().is_top_k_and_top_p
+    assert not _tb.DecodingMode.top_k().is_none
+    assert not _tb.DecodingMode.top_k().is_beam_search
+
+    assert _tb.DecodingMode.top_p().is_top_p
+    assert _tb.DecodingMode.top_p().is_top_k_or_top_p
+    assert not _tb.DecodingMode.top_p().is_top_k
+    assert not _tb.DecodingMode.top_p().is_top_k_and_top_p
+    assert not _tb.DecodingMode.top_p().is_none
+    assert not _tb.DecodingMode.top_p().is_beam_search
+
+    assert _tb.DecodingMode.top_k_top_p().is_top_p
+    assert _tb.DecodingMode.top_k_top_p().is_top_k
+    assert _tb.DecodingMode.top_k_top_p().is_top_k_or_top_p
+    assert _tb.DecodingMode.top_k_top_p().is_top_k_and_top_p
+    assert not _tb.DecodingMode.top_k_top_p().is_none
+    assert not _tb.DecodingMode.top_k_top_p().is_beam_search
+
+    assert _tb.DecodingMode.beam_search().is_beam_search
+    assert not _tb.DecodingMode.beam_search().is_none
+    assert not _tb.DecodingMode.beam_search().is_top_k
+    assert not _tb.DecodingMode.beam_search().is_top_p
+
+
 def test_gpt_model_config():
     vocab_size = 10000
     num_layers = 12
@@ -287,6 +321,7 @@ def test_sampling_config():
     check_empty_then_set("top_p_reset_ids", size_t_array)
     check_empty_then_set("beam_search_diversity_rate", float_array)
     check_empty_then_set("length_penalty", float_array)
+    check_empty_then_set("early_stopping", size_t_array)
 
 
 def test_gpt_json_config():
@@ -403,7 +438,7 @@ def test_llm_request():
     assert llm_request.is_streaming
     assert llm_request.pad_id == 99
     assert llm_request.end_id == 100
-    assert llm_request.seq_slot == -1  # seq_slot is still uninitialized
+    assert llm_request.seq_slot == None
     assert torch.equal(llm_request.prompt_embedding_table,
                        kwargs["prompt_embedding_table"])
     assert llm_request.prompt_vocab_size == 2
@@ -457,8 +492,14 @@ def test_llm_request():
 
 def test_inference_request():
     input_ids = torch.tensor((10, 10))
-    vm = {_tb.tensor_names.INPUT_IDS: input_ids}
-    ir = _tb.InferenceRequest(42, vm)
+
+    def logits_post_processor(req_id: int, logits: torch.Tensor,
+                              ids: List[List[int]]):
+        del req_id, ids
+
+    ir = _tb.InferenceRequest(42, logits_post_processor)
+    setattr(ir, _tb.tensor_names.INPUT_IDS, input_ids)
+
     assert ir.request_id == 42
     assert ir.input_ids is not None
     assert torch.equal(ir.input_ids, input_ids)
@@ -496,6 +537,10 @@ def test_inference_request():
     assert ir.length_penalty is None
     ir.length_penalty = data_tensor
     assert torch.equal(ir.length_penalty, data_tensor)
+
+    assert ir.early_stopping is None
+    ir.early_stopping = data_tensor
+    assert torch.equal(ir.early_stopping, data_tensor)
 
     assert ir.max_new_tokens is None
     ir.max_new_tokens = data_tensor
@@ -561,6 +606,7 @@ def test_inference_request():
     ir.temperature = data_tensor
     assert torch.equal(ir.temperature, data_tensor)
 
+    ir.logits_post_processor = None
     serialized = pickle.dumps(ir)
     deserialized = pickle.loads(serialized)
 
@@ -583,3 +629,66 @@ def test_trt_gpt_model_optional_params():
     assert opt_params.device_ids is None
     opt_params.device_ids = [0, 1]
     assert opt_params.device_ids == [0, 1]
+
+
+def test_KvCacheConfig_pickle():
+    cache = _tb.KvCacheConfig(free_gpu_memory_fraction=0.4)
+    cache1 = pickle.dumps(cache)
+    cache2 = pickle.loads(cache1)
+
+    assert cache2 == cache
+
+
+def test_TrtGptModelOptionalParams_pickle():
+    cache = _tb.KvCacheConfig(free_gpu_memory_fraction=0.4)
+    params1 = _tb.TrtGptModelOptionalParams(
+        kv_cache_config=cache,
+        enable_trt_overlap=True,
+    )
+    params1.enable_chunked_context = True
+    params2 = pickle.loads(pickle.dumps(params1))
+
+    assert params2 == params1
+
+    params1 = _tb.TrtGptModelOptionalParams()
+    params2 = pickle.loads(pickle.dumps(params1))
+
+    assert params2 == params1
+
+
+def test_Mpicomm():
+    size1 = _tb.MpiComm.getSize()
+    rank1 = _tb.MpiComm.getRank()
+
+    session_size = (size1 + 1) // 2
+    session_color = rank1 // session_size
+    session_rank = rank1 % session_size
+    _tb.MpiComm.split(session_color, session_rank)
+
+    rank2 = _tb.MpiComm.getRank()
+    size2 = _tb.MpiComm.getSize()
+
+    assert rank2 == session_rank
+    assert size2 == session_size
+
+
+def test_SamplingConfig_pickle():
+    config = _tb.SamplingConfig()
+    config.beam_width = 2
+    config.temperature = [1.0, 2.0]
+    config.top_k = [1, 2]
+    config.top_p = [0.1, 0.2]
+    config.random_seed = [1, 2]
+    config.repetition_penalty = [1.0, 2.0]
+    config.presence_penalty = [1.0, 2.0]
+    config.frequency_penalty = [1.0, 2.0]
+    config.length_penalty = [1.0, 2.0]
+    config.early_stopping = [1, 2]
+    config.top_p_decay = [1.0, 2.0]
+    config.top_p_min = [1.0, 2.0]
+    config.top_p_reset_ids = [1, 2]
+    config.beam_search_diversity_rate = [1.0, 2.0]
+
+    config1 = pickle.loads(pickle.dumps(config))
+
+    assert config1 == config

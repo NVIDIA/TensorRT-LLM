@@ -31,8 +31,8 @@ using tensorrt_llm::plugins::MixtureOfExpertsPlugin;
 using tensorrt_llm::plugins::read;
 using tensorrt_llm::plugins::write;
 
-static const char* MIXTURE_OF_EXPERTS_PLUGIN_VERSION{"1"};
-static const char* MIXTURE_OF_EXPERTS_PLUGIN_NAME{"MixtureOfExperts"};
+static char const* MIXTURE_OF_EXPERTS_PLUGIN_VERSION{"1"};
+static char const* MIXTURE_OF_EXPERTS_PLUGIN_NAME{"MixtureOfExperts"};
 nvinfer1::PluginFieldCollection MixtureOfExpertsPluginCreator::mFC{};
 std::vector<nvinfer1::PluginField> MixtureOfExpertsPluginCreator::mPluginAttributes;
 
@@ -60,7 +60,7 @@ MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(int number_of_experts, int top_k,
     init();
 }
 
-tensorrt_llm::plugins::MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(const MixtureOfExpertsPlugin& other)
+tensorrt_llm::plugins::MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(MixtureOfExpertsPlugin const& other)
     : mMOERunner()
     , mNumExperts(other.mNumExperts)
     , mK(other.mK)
@@ -94,11 +94,11 @@ size_t MixtureOfExpertsPlugin::getSerializationSize() const noexcept
 }
 
 MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(
-    const void* data, size_t length, MixtureOfExpertsPluginProfilerPtr plugin_profiler_ptr)
+    void const* data, size_t length, MixtureOfExpertsPluginProfilerPtr plugin_profiler_ptr)
     : mPluginProfiler(plugin_profiler_ptr)
 {
-    const char* d = reinterpret_cast<const char*>(data);
-    const char* a = d;
+    char const* d = reinterpret_cast<char const*>(data);
+    char const* a = d;
     read(d, mNumExperts);
     read(d, mK);
     read(d, mExpertHiddenSize);
@@ -208,14 +208,14 @@ nvinfer1::IPluginV2DynamicExt* MixtureOfExpertsPlugin::clone() const noexcept
 }
 
 nvinfer1::DimsExprs MixtureOfExpertsPlugin::getOutputDimensions(
-    int outputIndex, const nvinfer1::DimsExprs* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
+    int outputIndex, nvinfer1::DimsExprs const* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
 {
     assert(outputIndex == getOutputTensorIndex());
     return inputs[getInputTensorIndex()];
 }
 
 bool MixtureOfExpertsPlugin::supportsFormatCombination(
-    int pos, const nvinfer1::PluginTensorDesc* inOut, int nbInputs, int nbOutputs) noexcept
+    int pos, nvinfer1::PluginTensorDesc const* inOut, int nbInputs, int nbOutputs) noexcept
 {
     TLLM_CHECK(0 <= pos && pos < getNbInputs() + getNbOutputs());
     TLLM_CHECK(nbInputs == getNbInputs());
@@ -246,23 +246,23 @@ bool MixtureOfExpertsPlugin::supportsFormatCombination(
     return false;
 }
 
-void MixtureOfExpertsPlugin::configurePlugin(const nvinfer1::DynamicPluginTensorDesc* in, int nbInputs,
-    const nvinfer1::DynamicPluginTensorDesc* out, int nbOutputs) noexcept
+void MixtureOfExpertsPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int nbInputs,
+    nvinfer1::DynamicPluginTensorDesc const* out, int nbOutputs) noexcept
 {
     auto in_tensor = in[getInputTensorIndex()];
 
-    const auto minM
+    auto const minM
         = std::accumulate(in_tensor.min.d, in_tensor.min.d + in_tensor.min.nbDims - 1, 1, std::multiplies<int>());
-    const auto maxM
+    auto const maxM
         = std::accumulate(in_tensor.max.d, in_tensor.max.d + in_tensor.max.nbDims - 1, 1, std::multiplies<int>());
 
     auto weights_1 = in[getExpertWeights1Index()];
     auto weights_2 = in[getExpertWeights2Index()];
     int inner_dim_idx = getGemmShapeInnerDimIndex();
-    const int maxK = weights_1.max.d[inner_dim_idx];
-    const int maxN = weights_2.max.d[inner_dim_idx];
-    const int minK = weights_1.min.d[inner_dim_idx];
-    const int minN = weights_2.min.d[inner_dim_idx];
+    int const maxK = weights_1.max.d[inner_dim_idx];
+    int const maxN = weights_2.max.d[inner_dim_idx];
+    int const minK = weights_1.min.d[inner_dim_idx];
+    int const minN = weights_2.min.d[inner_dim_idx];
 
     TLLM_CHECK_WITH_INFO(minN == maxN, "Variable out channels is not allowed");
     TLLM_CHECK_WITH_INFO(minK == maxK, "Variable in channels is not allowed");
@@ -320,7 +320,7 @@ auto MixtureOfExpertsPlugin::setupWorkspace(void* base_ptr, int num_tokens) cons
     return info;
 }
 
-int MixtureOfExpertsPlugin::getNumTokens(const nvinfer1::PluginTensorDesc* input_tensors) const
+int MixtureOfExpertsPlugin::getNumTokens(nvinfer1::PluginTensorDesc const* input_tensors) const
 {
     int ndim = input_tensors[getInputTensorIndex()].dims.nbDims;
     TLLM_CHECK_WITH_INFO(
@@ -333,10 +333,10 @@ int MixtureOfExpertsPlugin::getNumTokens(const nvinfer1::PluginTensorDesc* input
     return num_tokens;
 }
 
-size_t MixtureOfExpertsPlugin::getWorkspaceSize(const nvinfer1::PluginTensorDesc* inputs, int nbInputs,
-    const nvinfer1::PluginTensorDesc* outputs, int nbOutputs) const noexcept
+size_t MixtureOfExpertsPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* inputs, int nbInputs,
+    nvinfer1::PluginTensorDesc const* outputs, int nbOutputs) const noexcept
 {
-    const int num_tokens = getNumTokens(inputs);
+    int const num_tokens = getNumTokens(inputs);
     return setupWorkspace(nullptr, num_tokens).size;
 }
 
@@ -354,12 +354,12 @@ MOEParallelismConfig MixtureOfExpertsPlugin::getParallelismConfig() const
     return {};
 }
 
-int MixtureOfExpertsPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc,
-    const nvinfer1::PluginTensorDesc* outputDesc, const void* const* inputs, void* const* outputs, void* workspace_ptr,
+int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
+    nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace_ptr,
     cudaStream_t stream) noexcept
 {
-    const int num_tokens = getNumTokens(inputDesc);
-    const int num_not_finished = num_tokens; // TODO Take this as an input
+    int const num_tokens = getNumTokens(inputDesc);
+    int const num_not_finished = num_tokens; // TODO Take this as an input
     auto parallelism_config = getParallelismConfig();
 
     auto workspace = setupWorkspace(workspace_ptr, num_tokens);
@@ -389,7 +389,7 @@ int MixtureOfExpertsPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc,
     TLLM_CHECK(w2_desc.dims.d[outer_dim_idx] * packed_elements == mExpertHiddenSize);
 
     mMOERunner->setTactic(mPluginProfiler->getBestConfig(num_tokens, mGemmId));
-    mMOERunner->runMoe(inputs[getInputTensorIndex()], static_cast<const float*>(inputs[getRoutingTensorIndex()]),
+    mMOERunner->runMoe(inputs[getInputTensorIndex()], static_cast<float const*>(inputs[getRoutingTensorIndex()]),
         inputs[getExpertWeights1Index()], hasExpertQuantScales() ? inputs[getExpertQuantScale1Index()] : nullptr,
         hasBias() ? inputs[getExpertBias1Index()] : nullptr, mActivationType, inputs[getExpertWeights2Index()],
         hasExpertQuantScales() ? inputs[getExpertQuantScale2Index()] : nullptr,
@@ -397,7 +397,7 @@ int MixtureOfExpertsPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc,
         mNumExperts, mK, static_cast<char*>(workspace.workspace),
         // Outputs
         outputs[getOutputTensorIndex()], workspace.fc2_output,
-        hasFinishedTensor() ? static_cast<const bool*>(inputs[getFinishedTensorIndex()]) : nullptr, num_not_finished,
+        hasFinishedTensor() ? static_cast<bool const*>(inputs[getFinishedTensorIndex()]) : nullptr, num_not_finished,
         workspace.scale_probs, static_cast<int*>(workspace.src_to_dest_map),
         static_cast<int*>(workspace.selected_experts), parallelism_config, mNormalizationMode, stream);
 
@@ -406,7 +406,7 @@ int MixtureOfExpertsPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc,
 
 // IPluginV2Ext Methods
 nvinfer1::DataType MixtureOfExpertsPlugin::getOutputDataType(
-    int index, const nvinfer1::DataType* inputTypes, int nbInputs) const noexcept
+    int index, nvinfer1::DataType const* inputTypes, int nbInputs) const noexcept
 {
     assert(index == getOutputTensorIndex());
     assert(inputTypes[getInputTensorIndex()] == mType);
@@ -414,12 +414,12 @@ nvinfer1::DataType MixtureOfExpertsPlugin::getOutputDataType(
 }
 
 // IPluginV2 Methods
-const char* MixtureOfExpertsPlugin::getPluginType() const noexcept
+char const* MixtureOfExpertsPlugin::getPluginType() const noexcept
 {
     return MIXTURE_OF_EXPERTS_PLUGIN_NAME;
 }
 
-const char* MixtureOfExpertsPlugin::getPluginVersion() const noexcept
+char const* MixtureOfExpertsPlugin::getPluginVersion() const noexcept
 {
     return MIXTURE_OF_EXPERTS_PLUGIN_VERSION;
 }
@@ -438,29 +438,29 @@ void MixtureOfExpertsPlugin::destroy() noexcept
     delete this;
 }
 
-void MixtureOfExpertsPlugin::setPluginNamespace(const char* libNamespace) noexcept
+void MixtureOfExpertsPlugin::setPluginNamespace(char const* libNamespace) noexcept
 {
     mNamespace = libNamespace;
 }
 
-const char* MixtureOfExpertsPlugin::getPluginNamespace() const noexcept
+char const* MixtureOfExpertsPlugin::getPluginNamespace() const noexcept
 {
     return mNamespace.c_str();
 }
 
 ///////////////
 
-const char* MixtureOfExpertsPluginCreator::getPluginName() const noexcept
+char const* MixtureOfExpertsPluginCreator::getPluginName() const noexcept
 {
     return MIXTURE_OF_EXPERTS_PLUGIN_NAME;
 }
 
-const char* MixtureOfExpertsPluginCreator::getPluginVersion() const noexcept
+char const* MixtureOfExpertsPluginCreator::getPluginVersion() const noexcept
 {
     return MIXTURE_OF_EXPERTS_PLUGIN_VERSION;
 }
 
-const nvinfer1::PluginFieldCollection* MixtureOfExpertsPluginCreator::getFieldNames() noexcept
+nvinfer1::PluginFieldCollection const* MixtureOfExpertsPluginCreator::getFieldNames() noexcept
 {
     return &mFC;
 }
@@ -495,9 +495,9 @@ MixtureOfExpertsPluginCreator::MixtureOfExpertsPluginCreator()
 }
 
 IPluginV2* MixtureOfExpertsPluginCreator::createPlugin(
-    const char* name, const nvinfer1::PluginFieldCollection* fc) noexcept
+    char const* name, nvinfer1::PluginFieldCollection const* fc) noexcept
 {
-    const nvinfer1::PluginField* fields = fc->fields;
+    nvinfer1::PluginField const* fields = fc->fields;
     int mNumExperts{};
     int mK{};
     int mExpertHiddenSize{};
@@ -514,7 +514,7 @@ IPluginV2* MixtureOfExpertsPluginCreator::createPlugin(
     int mNormalizationMode{};
 
     // Read configurations from each fields
-    using MapPair = std::pair<const char*, std::reference_wrapper<int>>;
+    using MapPair = std::pair<char const*, std::reference_wrapper<int>>;
     const std::array input_map{
         MapPair{"number_of_experts", std::ref(mNumExperts)},
         MapPair{"top_k", std::ref(mK)},
@@ -533,13 +533,13 @@ IPluginV2* MixtureOfExpertsPluginCreator::createPlugin(
     };
     for (int i = 0; i < fc->nbFields; ++i)
     {
-        const char* attrName = fields[i].name;
-        for (const auto& item : input_map)
+        char const* attrName = fields[i].name;
+        for (auto const& item : input_map)
         {
             if (!strcmp(item.first, attrName))
             {
                 TLLM_CHECK(fields[i].type == nvinfer1::PluginFieldType::kINT32);
-                item.second.get() = static_cast<int>(*(static_cast<const int*>(fields[i].data)));
+                item.second.get() = static_cast<int>(*(static_cast<int const*>(fields[i].data)));
             }
         }
     }
@@ -556,7 +556,7 @@ IPluginV2* MixtureOfExpertsPluginCreator::createPlugin(
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }
-    catch (const std::exception& e)
+    catch (std::exception const& e)
     {
         caughtError(e);
     }
@@ -564,7 +564,7 @@ IPluginV2* MixtureOfExpertsPluginCreator::createPlugin(
 }
 
 IPluginV2* MixtureOfExpertsPluginCreator::deserializePlugin(
-    const char* name, const void* serialData, size_t serialLength) noexcept
+    char const* name, void const* serialData, size_t serialLength) noexcept
 {
     // This object will be deleted when the network is destroyed, which will
     // call MixtureOfExpertsPlugin::destroy()
@@ -577,26 +577,26 @@ IPluginV2* MixtureOfExpertsPluginCreator::deserializePlugin(
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }
-    catch (const std::exception& e)
+    catch (std::exception const& e)
     {
         caughtError(e);
     }
     return nullptr;
 }
 
-void MixtureOfExpertsPluginCreator::setPluginNamespace(const char* libNamespace) noexcept
+void MixtureOfExpertsPluginCreator::setPluginNamespace(char const* libNamespace) noexcept
 {
     mNamespace = libNamespace;
 }
 
-const char* MixtureOfExpertsPluginCreator::getPluginNamespace() const noexcept
+char const* MixtureOfExpertsPluginCreator::getPluginNamespace() const noexcept
 {
     return mNamespace.c_str();
 }
 
 std::vector<size_t> MixtureOfExpertsGemmProfiler::getProfilerWorkspaces(int maxM)
 {
-    const auto& plugin = *mRunner;
+    auto const& plugin = *mRunner;
 
     size_t num_tokens = maxM;
 
@@ -634,13 +634,13 @@ void MixtureOfExpertsGemmProfiler::computeTmpSize(int maxM, int n, int k)
     this->setTmpWorkspaceSizeInBytes(bytes);
 }
 
-void MixtureOfExpertsGemmProfiler::runTactic(int m, int n, int k, const MixtureOfExpertsGemmProfiler::Config& tactic,
+void MixtureOfExpertsGemmProfiler::runTactic(int m, int n, int k, MixtureOfExpertsGemmProfiler::Config const& tactic,
     char* workspace_ptr_char, cudaStream_t const& stream)
 {
     assert(mRunner);
     auto& plugin = *mRunner;
     auto parallelism_config = plugin.getParallelismConfig();
-    const int num_tokens = m;
+    int const num_tokens = m;
 
     int8_t* workspace_ptr = reinterpret_cast<int8_t*>(workspace_ptr_char);
     auto workspaces = getProfilerWorkspaces(m);
@@ -659,17 +659,17 @@ void MixtureOfExpertsGemmProfiler::runTactic(int m, int n, int k, const MixtureO
     // Routing goes first as we need to manually initialise it in initTmpData, everything else can be uninit
     // If we didn't init routing all the values could go to one expert, causing the profile to be unreliable (e.g. for
     // expert parallelism)
-    const float* routing = static_cast<const float*>(getNext());
+    float const* routing = static_cast<float const*>(getNext());
 
-    const void* input = getNext();
-    const void* weights_1 = getNext();
-    const void* scale_1 = getNext();
-    const void* bias_1 = getNext();
-    const void* weights_2 = getNext();
-    const void* scale_2 = getNext();
-    const void* bias_2 = getNext();
+    void const* input = getNext();
+    void const* weights_1 = getNext();
+    void const* scale_1 = getNext();
+    void const* bias_1 = getNext();
+    void const* weights_2 = getNext();
+    void const* scale_2 = getNext();
+    void const* bias_2 = getNext();
     void* output = getNext();
-    const bool* finished = nullptr; // No finished, we want to benchmark all tokens
+    bool const* finished = nullptr; // No finished, we want to benchmark all tokens
 
     auto workspace = plugin.setupWorkspace(getNext(), num_tokens);
 

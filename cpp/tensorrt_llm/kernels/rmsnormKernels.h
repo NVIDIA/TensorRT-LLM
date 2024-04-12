@@ -27,8 +27,8 @@ namespace kernels
 {
 
 template <typename T>
-void invokeGeneralRmsNorm(T* out, const T* input, const T* gamma, const T* beta, const float eps, const int tokens,
-    const int hidden_dim, cudaStream_t stream = 0, const float* scale = nullptr, float* dynamic_scale = nullptr,
+void invokeGeneralRmsNorm(T* out, T const* input, T const* gamma, T const* beta, float const eps, int const tokens,
+    int const hidden_dim, cudaStream_t stream = 0, float const* scale = nullptr, float* dynamic_scale = nullptr,
     int8_t* out_quant = nullptr);
 
 } // namespace kernels

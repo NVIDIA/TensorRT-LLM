@@ -2,6 +2,20 @@
 
 This document explains how to build the [GPT-J](https://huggingface.co/EleutherAI/gpt-j-6b) model using TensorRT-LLM and run on a single GPU.
 
+- [GPT-J](#gpt-j)
+  - [Overview](#overview)
+  - [Support Matrix](#support-matrix)
+  - [Usage](#usage)
+    - [1. Download weights from HuggingFace (HF) Transformers](#1-download-weights-from-huggingface-hf-transformers)
+    - [2. Build TensorRT engine(s)](#2-build-tensorrt-engines)
+      - [FP8 Post-Training Quantization](#fp8-post-training-quantization)
+      - [AWQ INT4 weight only quantization](#awq-int4-weight-only-quantization)
+      - [SmoothQuant (W8A8) quantization](#smoothquant-w8a8-quantization)
+      - [Fused MultiHead Attention (FMHA)](#fused-multihead-attention-fmha)
+      - [INT8 KV cache](#int8-kv-cache)
+    - [3. Run](#3-run)
+  - [Summarization using the GPT-J model](#summarization-using-the-gpt-j-model)
+
 ## Overview
 
 The TensorRT-LLM GPT-J implementation can be found in [`tensorrt_llm/models/gptj/model.py`](../../tensorrt_llm/models/gptj/model.py). The TensorRT-LLM GPT-J example
@@ -20,10 +34,17 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
   * FP8 (with FP8 kv cache)
   * Groupwise quantization (AWQ)
   * INT8 KV CACHE (+ AWQ/per-channel weight-only)
+  * INT8 SmoothQuant
 
 ## Usage
 
 ### 1. Download weights from HuggingFace (HF) Transformers
+
+Please install required packages first:
+
+```bash
+pip install -r requirements.txt
+```
 
 ```bash
 # 1. Weights & config
@@ -107,6 +128,7 @@ python ../quantization/quantize.py --model_dir ./gpt-j-6b \
                                    --calib_size 512
 ```
 Building command is identical to the common one above.
+Note that you can enable fp8 context fmha to get further acceleration by setting `--use_fp8_context_fmha enable` when building the engines.
 
 #### AWQ INT4 weight only quantization
 

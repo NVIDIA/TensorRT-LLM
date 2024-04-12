@@ -42,7 +42,9 @@ from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime import GenerationSequence, KVCacheManager
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import getSMVersion
+from utils.util import (getSMVersion, skip_bf16_fp32_accum,
+                        skip_bf16_pre_ampere, skip_fp8_pre_ada,
+                        skip_fp32_accum_pre_ampere, unittest_name_func)
 
 
 class TestFunctional(unittest.TestCase):
@@ -71,8 +73,8 @@ class TestFunctional(unittest.TestCase):
             product(['llama_attention'], [
                 ContextFMHAType.enabled, ContextFMHAType.enabled_with_fp32_acc
             ], ['float16', 'bfloat16'], [None], [2], [90, 1024], [4],
-                    [32, 64, 80, 112, 128], [0], [False], [False, True], [1],
-                    [False], [False]))
+                    [32, 64, 80, 96, 104, 112, 128], [0], [False],
+                    [False, True], [1], [False], [False]))
 
         # Test cases for gptj rotary embedding.
         # The previous test cases have covered the gptneox rotary embedding.
@@ -190,7 +192,7 @@ class TestFunctional(unittest.TestCase):
             product(['llama_attention'], [ContextFMHAType.disabled],
                     ['float16'], [None], [2], [128], [4], [64], [0], [False],
                     [False], [1, 4], [True, False], [False], [10000.0], [None],
-                    [4], [False, True]))
+                    [4]))
 
         # add gpu_arch_lists for testing (help reducing workload if there are duplicates).
         test_cases = [("all", ) + case for case in test_cases]
@@ -260,7 +262,7 @@ class TestFunctional(unittest.TestCase):
         # For warp-specialized kernels on Hopper.
         test_cases += list(
             product(
-                ['h100_only'],
+                ['h100_only_part_0'],
                 [90],
                 ['llama_attention'],
                 [
@@ -272,7 +274,7 @@ class TestFunctional(unittest.TestCase):
                 [4],
                 [68, 2543],
                 [16],
-                [32, 64, 128, 256],
+                [32, 64, 96, 112, 128, 160, 256],
                 [2],
                 [False],
                 [False],
@@ -288,7 +290,7 @@ class TestFunctional(unittest.TestCase):
         # all arches use the same kernel traits, we can assign some workloads to h100-only.
         test_cases += list(
             product(
-                ['h100_only'],
+                ['h100_only_part_1'],
                 [90],
                 ['llama_attention'],
                 [ContextFMHAType.enabled],
@@ -312,7 +314,7 @@ class TestFunctional(unittest.TestCase):
         # d = 256 xqa kernels (limited number of tests).
         test_cases += list(
             product(
-                ['h100_only'],
+                ['h100_only_part_2'],
                 [90],
                 ['llama_attention'],
                 [ContextFMHAType.enabled],
@@ -335,13 +337,7 @@ class TestFunctional(unittest.TestCase):
 
         return test_cases
 
-    def custom_name_func(testcase_func, param_num, param):
-        return "%s_%s" % (
-            testcase_func.__name__,
-            parameterized.to_safe_name("_".join(str(x) for x in param.args)),
-        )
-
-    @parameterized.expand(load_test_cases, name_func=custom_name_func)
+    @parameterized.expand(load_test_cases, name_func=unittest_name_func)
     def test_gpt_attention(self,
                            test_partition,
                            gpu_arch,
@@ -361,8 +357,7 @@ class TestFunctional(unittest.TestCase):
                            fuse_bias,
                            rope_base=10000.0,
                            rope_scaling=None,
-                           sink_token_len=0,
-                           enable_pos_shift=False):
+                           sink_token_len=0):
         # if attention_type != "gpt_bigcode_attention" and attention_type != "llama_attention":
         #     assert num_kv_heads == 0 # safe guard against bad test case configs
 
@@ -379,28 +374,14 @@ class TestFunctional(unittest.TestCase):
                     "Skip the test as the target gpu arch doesn't match this gpu arch."
                 )
 
+        # Skip tests that are not supported or duplicate
+        skip_bf16_pre_ampere(dtype)
+        skip_fp32_accum_pre_ampere(context_fmha_type)
+        skip_bf16_fp32_accum(dtype, context_fmha_type)
+        skip_fp8_pre_ada(use_fp8_kv_cache)
+
         if num_kv_heads == 0:
             num_kv_heads = num_heads
-
-        # Skip tests that are not supported in pre-ampere architecture
-        if getSMVersion() < 80:
-            if context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
-                pytest.skip(
-                    "ContextFMHAType with fp32 acc is not supported in pre-ampere architecture"
-                )
-            if dtype == 'bfloat16':
-                pytest.skip(
-                    "bfloat16 is not supported in pre-ampere architecture")
-
-        if getSMVersion() < 89:
-            if use_fp8_kv_cache:
-                pytest.skip("FP8 is not supported on pre-Ada architectures")
-
-        # Skip duplicated tests.
-        if context_fmha_type == ContextFMHAType.enabled_with_fp32_acc and \
-            dtype == 'bfloat16':
-            pytest.skip("bfloat16 Context FMHA will always accumulate on FP32, \
-                so it has been tested with ContextFMHAType.enabled")
 
         session = None
         if use_int8_kv_cache or use_fp8_kv_cache or True:
@@ -569,6 +550,7 @@ class TestFunctional(unittest.TestCase):
                     context_lengths=context_lengths_tensor,
                     cache_indirection=cache_indirection_tensor,
                     host_request_types=host_request_types_tensor,
+                    layer_idx=0,
                     num_heads=num_heads,
                     num_kv_heads=num_kv_heads,
                     hidden_size_per_head=head_size,
@@ -589,8 +571,7 @@ class TestFunctional(unittest.TestCase):
                     kv_cache_block_pointers=pointer_array_tensor,
                     host_kv_cache_block_pointers=host_pointer_array_tensor,
                     max_context_length=max_context_length,
-                    qkv_bias=qkv_bias,
-                    enable_pos_shift=enable_pos_shift)
+                    qkv_bias=qkv_bias)
 
                 net._mark_output(outputs[0],
                                  'output',
@@ -639,6 +620,7 @@ class TestFunctional(unittest.TestCase):
             builder_config = builder.create_builder_config(
                 name=attention_type,
                 precision=dtype,
+                opt_level=0,
                 int8=int8_trt_flag,
                 quant_mode=quant_mode)
 
@@ -957,7 +939,7 @@ class TestFunctional(unittest.TestCase):
         def verify_kv_cache(torch_present):
             if not use_int8_kv_cache and not use_fp8_kv_cache and num_kv_heads == num_heads and beam_width == 1:
                 if paged_kv_cache:
-                    kv_cache_cont = manager.blocks_manager.get_continous_caches(
+                    kv_cache_cont = manager.blocks_manager.get_continuous_caches(
                         0)
                     kv_cache_cont = kv_cache_cont.permute(1, 0, 2)
                 else:
@@ -1019,7 +1001,7 @@ class TestFunctional(unittest.TestCase):
             pointer_array = None
             if paged_kv_cache:
                 # Get arrays of pointers to the "pages" of KV values
-                pointer_array = manager.get_pointer_arrays(beam_width)[0]
+                pointer_array = manager.get_block_pointers(beam_width)[0]
 
             if step == 0:
                 host_request_types = torch.tensor([0] * batch_size,

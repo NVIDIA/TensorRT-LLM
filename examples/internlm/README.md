@@ -2,10 +2,23 @@
 
 This document shows how to build and run InternLM 7B / 20B models in TensorRT-LLM on both single GPU, single node multi-GPU and multi-node multi-GPU.
 
+- [InternLM](#internlm)
+  - [Overview](#overview)
+  - [Support Matrix](#support-matrix)
+  - [Usage](#usage)
+    - [Build TensorRT engine(s)](#build-tensorrt-engines)
+      - [INT8 weight only + INT8 KV cache](#int8-weight-only--int8-kv-cache)
+      - [SmoothQuant](#smoothquant)
+    - [Run](#run)
+    - [Summarization using the InternLM model](#summarization-using-the-internlm-model)
+
 ## Overview
 
-The TensorRT-LLM InternLM implementation can be found in [tensorrt_llm/models/internlm/model.py](../../tensorrt_llm/models/internlm/model.py). The TensorRT-LLM InternLM example code is located in [`examples/internlm`](./). There is one main file:
+The TensorRT-LLM InternLM implementation is based on the LLaMA model. The implementation can
+be found in [tensorrt_llm/models/llama/model.py](../../tensorrt_llm/models/llama/model.py).
+The TensorRT-LLM InternLM example code lies in [`examples/llama`](./):
 
+* [`convert_checkpoint.py`](../llama/convert_checkpoint.py) converts the Huggingface Model of Skywork into TensorRT-LLM checkpoint.
 * [`convert_checkpoint.py`] to to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT-LLM format
 
 In addition, there are two shared files in the parent folder [`examples`](../) for inference and evaluation:
@@ -26,13 +39,19 @@ The TensorRT-LLM InternLM example code locates at [examples/internlm](./). It ta
 
 ### Build TensorRT engine(s)
 
+Please install required packages first:
+
+```bash
+pip install -r requirements.txt
+```
+
 TensorRT-LLM InternLM builds TensorRT engine(s) from HF checkpoint. If no checkpoint directory is specified, TensorRT-LLM will build engine(s) with dummy weights.
 
 InternLM has released several checkpoints of different size or capabilities under https://huggingface.co/internlm. Users can pick any one repository and follow instructions to prepare the checkpoint.
 
 Below examples use [internlm-chat-7b](https://huggingface.co/internlm/internlm-chat-7b) and [internlm-chat-20b](https://huggingface.co/internlm/internlm-chat-20b) and assume these repositories are cloned or linked under this directory, for example `./internlm-chat-7b/`.
 
-Normally `trtllm-build` only requires single GPU, but if you've already got all the GPUs needed while inferencing, you could enable parallel building to make the engine building process faster by adding `--workers` argument. Please note that currently `--workers` feature only supports single node.
+Normally `trtllm-build` only requires single GPU, but if you've already got all the GPUs needed for inference, you could enable parallel building to make the engine building process faster by adding `--workers` argument. Please note that currently `--workers` feature only supports single node.
 
 Here're some examples:
 
@@ -40,6 +59,7 @@ Here're some examples:
 # Build a single-GPU float16 engine from HF weights.
 # gpt_attention_plugin is necessary in InternLM.
 # Try use_gemm_plugin to prevent accuracy issue.
+cd examples/llama
 
 # Convert the InternLM 7B model using a single GPU and FP16.
 python convert_checkpoint.py --model_dir ./internlm-chat-7b/ \
@@ -97,6 +117,8 @@ and then export the scaling factors needed for INT8 KV cache inference.
 Example:
 
 ```bash
+cd examples/llama
+
 # For 7B models
 python convert_checkpoint.py --model_dir ./internlm-chat-7b  \
                              --output_dir ./internlm-chat-7b/smooth_internlm/int8_kv_cache/ \
@@ -108,14 +130,17 @@ python convert_checkpoint.py --model_dir ./internlm-chat-7b  \
 # Build 7B model with both INT8 weight-only and INT8 KV cache enabled
 trtllm-build --checkpoint_dir ./internlm-chat-7b/smooth_internlm/int8_kv_cache/ \
              --output_dir ./engine_outputs \
-             --gemm_plugin float16
+             --gemm_plugin float16 \
+             --strongly_typed
 ```
 
 
 ```bash
+cd examples/llama
+
 # For 20B models
 python convert_checkpoint.py --model_dir ./internlm-chat-20b  \
-                            --output_dir ./internlm-chat-20b/smooth_internlm/int8_kv_cache/ \
+                             --output_dir ./internlm-chat-20b/smooth_internlm/int8_kv_cache/ \
                              --dtype float16  \
                              --use_weight_only \
                              --weight_only_precision int8 \
@@ -125,6 +150,7 @@ python convert_checkpoint.py --model_dir ./internlm-chat-20b  \
 trtllm-build --checkpoint_dir ./internlm-chat-20b/smooth_internlm/int8_kv_cache/ \
   --output_dir ./engine_outputs \
   --gemm_plugin float16 \
+  --strongly_typed
 ```
 
 
@@ -158,6 +184,8 @@ Unlike the FP16 build where the HF weights are processed and loaded into the Ten
 
 Example:
 ```bash
+cd examples/llama
+
 # For 7B models
 python convert_checkpoint.py --model_dir ./internlm-chat-7b  --output_dir ./internlm-chat-7b/smooth_internlm/sq0.5/ --dtype float16 --smoothquant 0.5
 # Build the engine
@@ -166,6 +194,8 @@ trtllm-build --checkpoint_dir ./internlm-chat-7b/smooth_internlm/sq0.5/ \
              --gemm_plugin float16
 
 # For 20B models
+cd examples/llama
+
 python convert_checkpoint.py --model_dir ./internlm-chat-20b  --output_dir ./internlm-chat-20b/smooth_internlm/sq0.5/ --dtype float16 --smoothquant 0.5
 trtllm-build --checkpoint_dir ./internlm-chat-20b/smooth_internlm/sq0.5/ \
              --output_dir ./engine_outputs \
@@ -183,6 +213,8 @@ Examples of build invocations:
 
 ```bash
 # Build model for SmoothQuant in the _per_token_ + _per_channel_ mode
+cd examples/llama
+
 # 7B model
 python convert_checkpoint.py --model_dir ./internlm-chat-7b  --output_dir ./internlm-chat-7b/smooth_internlm/sq0.5/ --dtype float16 --smoothquant 0.5 --per_channel --per_token
 

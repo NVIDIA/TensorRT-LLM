@@ -327,9 +327,16 @@ def main(args):
 
         torch.cuda.empty_cache()
         latencies = []
+        # Disable Host memory monitor when cuda graph is enabled for cuda graph performance.
+        disable_host_mem_monitor = False
+        if args.enable_cuda_graph:
+            logger.warning(
+                'Disable host memory monitor when cuda graph is enabled.')
+            disable_host_mem_monitor = True
 
         if not disable_mem_monitor:
-            memory_monitor = MemoryMonitor()
+            memory_monitor = MemoryMonitor(
+                disable_host_mem_monitor=disable_host_mem_monitor)
             memory_monitor.start()
 
         iter_idx = 0

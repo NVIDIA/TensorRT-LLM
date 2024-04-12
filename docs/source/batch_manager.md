@@ -117,6 +117,21 @@ When using V1 batching, the following additional statistics are reported per V1 
   * `Total Context Tokens`, total number of tokens across requests in context phase
   * `Empty Generation Slots`, total number of padded Slots during generation phase
 
+### Logits Post-Processor (optional)
+
+Users can alter the logits produced the network, with a callback attached to an `InferenceRequest`:
+
+```
+  using LogitsPostProcessor = std::function<TensorPtr(RequestIdType, TensorPtr&, BeamTokens const&, TStream)>;
+```
+
+The first argument is the request id, second is the logits tensor, third are the tokens produced by the request so far, and last one is the operation stream used by the logits tensor.
+
+Users *must* use the stream to access the logits tensor. For example, performing a addition with a bias tensor should be enqueued on that stream.
+Alternatively, users may call `stream->synchronize()`, however, that will slow down the entire execution pipeline.
+
+Note: this feature isn't supported with the `V1` batching scheme for the moment.
+
 ### Other mandatory GptManager parameters
 * `trtEnginePath`, path to the directory containing the TRT-LLM engine that GptManager wraps
 * `modelType`, batching scheme - V1, InflightBatching or InflightFusedBatching.
@@ -137,6 +152,18 @@ When using V1 batching, the following additional statistics are reported per V1 
     - `enableBlockReuse` (default: `false`) allow reuse of previously computed KV cache blocks across requests. This is expected to optimize memory use and computation.
   - `enableTrtOverlap` (default: `false`) when `true`, GptManager partitions available requests into 2 'microbatches' that can be run concurrently to hide exposed CPU runtime. However, it may not give performance benefits when the size of the model is not big enough to overlap the host overhead, or when the number of requests is too small.
   - `enableChunkedContext` (default: `false`) Whether to enable context chunking. Context chunking increases the possibility of batching the context and generation phases, which in turn improves performance. When set to `false`, it indicates that the context chunk is disabled.
+  - `peftCacheManagerConfig` (currently only supports LoRA, and requires `--use_lora_plugin` during engine build)
+    - `numHostModuleLayer` (default: 0) number of adapter_size 1 single module single layer LoRA weight rows the host cache can hold.  Overrides `hostCacheSize` if non-zero.
+    - `numDeviceModuleLayer` (default: 0) number of adapter_size 1 single module single layer LoRA weight rows the device cache can hold.  Overrides `deviceCachePercent` if non-zero.
+    - `optimalAdapterSize` (default: 8) Used to size cache pages. Typically optimally sized adapters will fix exactly into 1 cache page.
+    - `maxAdapterSize` (default: 64) Used to set the minimum size of a cache page.  Pages must be at least large enough to fit a single module, single later adapter_size `maxAdapterSize` row of weights.
+    - `numPutWorkers` (default: 1) Number of CPU workers used to put weights into host cache.
+    - `numEnsureWorkers` (default: 1) Number of CPU workers used to ensure all weights needed for the next forward pass are in the GPU cache.
+    - `numCopyStreams` (default: 1) Number of CUDA streams used for H2D copies of cache pages
+    - `maxPagesPerBlockHost` (default: 24) Number of cache pages per host memory allocation
+    - `maxPagesPerBlockDevice` (default: 24) Number of cache pages per device memory allocation
+    - `deviceCachePercent` (default: 0.05) percent of device memory used for PEFT cache after engine load and KV cache allocation
+    - `hostCacheSize` (default: 1G) size in bytes of the host PEFT cache
 
 ### Responses content
 The responses from `SendResponseCallback` are stored in a `std::shared_ptr<Tensor>` list, which contains the following tensors of a specific request:

@@ -22,8 +22,8 @@
 namespace tensorrt_llm::plugins
 {
 
-void logError(const char* msg, const char* file, const char* fn, int line);
+void logError(char const* msg, char const* file, char const* fn, int line);
 
-void caughtError(const std::exception& e);
+void caughtError(std::exception const& e);
 
 } // namespace tensorrt_llm::plugins

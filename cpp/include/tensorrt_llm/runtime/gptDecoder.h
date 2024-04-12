@@ -16,14 +16,16 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/cudaAllocator.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
+#include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/decodingInput.h"
+#include "tensorrt_llm/runtime/decodingMode.h"
 #include "tensorrt_llm/runtime/decodingOutput.h"
+#include "tensorrt_llm/runtime/gptModelConfig.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
+#include "tensorrt_llm/runtime/worldConfig.h"
 #include <curand_kernel.h>
 
-#include <cstdint>
 #include <memory>
 
 #include <NvInferRuntime.h>
@@ -44,9 +46,13 @@ namespace runtime
 class IGptDecoder
 {
 public:
+    using TensorPtr = std::shared_ptr<ITensor>;
+
     virtual ~IGptDecoder() = default;
 
-    virtual void setup(SamplingConfig const& samplingConfig, size_t batchSize, SizeType maxSequenceLength) = 0;
+    virtual void setup(SamplingConfig const& samplingConfig, size_t batchSize, SizeType maxSequenceLength,
+        std::optional<TensorPtr> const& batchSlots = std::nullopt)
+        = 0;
 
     virtual bool forward(DecodingOutput& output, DecodingInput const& input) = 0;
 
@@ -56,20 +62,27 @@ public:
         DecodingInput const& decodingInput, BufferManager const& manager)
         = 0;
 
-    virtual const SamplingConfig& getSamplingConfig() = 0;
+    virtual SamplingConfig const& getSamplingConfig() = 0;
 
-    static void acceptDraftTokensByIds(const ITensor& targetTokenIds, const ITensor& draftTokenIds,
-        const ITensor& contextLengths, const ITensor& numDraftTokens, ITensor& sequenceLengths,
-        const ITensor& finishedVec, ITensor& finishedFinal, ITensor& finishedSum,
+    static void acceptDraftTokensByIds(ITensor const& targetTokenIds, ITensor const& draftTokenIds,
+        ITensor const& contextLengths, ITensor const& numDraftTokens, ITensor& sequenceLengths,
+        ITensor const& finishedVec, ITensor& finishedFinal, ITensor& finishedSum, ITensor const& batchSlots,
         BufferManager::CudaStreamPtr const& stream);
 
-    static void acceptDraftTokensByLogits(ITensor& draftLogits, const ITensor& targetLogits, ITensor& draftProbs,
-        ITensor& targetProbs, const ITensor& numDraftTokens, ITensor& finished, SizeType vocabSize,
-        SizeType vocabSizePadded, bool useRandomAcceptThreshold, float randomAcceptThreshold,
+    static void acceptDraftTokensByLogits(ITensor& draftLogits, ITensor const& targetLogits, ITensor& draftProbs,
+        ITensor& targetProbs, ITensor const& numDraftTokens, ITensor& finished, ITensor const& batchSlots,
+        SizeType vocabSize, SizeType vocabSizePadded, bool useRandomAcceptThreshold, float randomAcceptThreshold,
         curandState_t* curandState, BufferManager::CudaStreamPtr const& stream);
 
-    static std::unique_ptr<IGptDecoder> create(nvinfer1::DataType dtype, size_t maxBatchSize, size_t vocabSize,
-        size_t vocabSizePadded, BufferManager::CudaStreamPtr const& stream);
+    static void updateKVCacheBasedOnAcceptedTokens(ITensor const& acceptedOffsets, ITensor const& packedAcceptedIds,
+        ITensor const& pointerArray, ITensor const& pastKeyValueLengths, GptModelConfig const& modelConfig,
+        WorldConfig const& worldConfig, BufferManager::CudaStreamPtr stream, SizeType rewindDraftTokenCount,
+        SizeType maxAttentionWindow, SizeType maxBlocksPerSeq, nvinfer1::DataType dtype);
+
+    static std::unique_ptr<IGptDecoder> create(DecodingMode const& mode, nvinfer1::DataType dtype, size_t maxBatchSize,
+        size_t maxBeamWidth, size_t vocabSize, size_t vocabSizePadded, size_t maxSequenceLength,
+        BufferManager::CudaStreamPtr const& stream, std::optional<runtime::SizeType> maxTokensPerStep = std::nullopt,
+        std::optional<runtime::SizeType> maxNumMedusaHeads = std::nullopt);
 };
 
 template <typename T>
@@ -80,9 +93,13 @@ public:
     using CudaStreamPtr = BufferManager::CudaStreamPtr;
     using TensorPtr = std::shared_ptr<ITensor>;
 
-    GptDecoder(size_t maxBatchSize, size_t vocabSize, size_t vocabSizePadded, CudaStreamPtr const& stream);
+    GptDecoder(DecodingMode const& mode, size_t maxBatchSize, size_t maxBeamWidth, size_t vocabSize,
+        size_t vocabSizePadded, size_t maxSequenceLength, CudaStreamPtr const& stream,
+        std::optional<runtime::SizeType> maxTokensPerStep = std::nullopt,
+        std::optional<runtime::SizeType> maxNumMedusaHeads = std::nullopt);
 
-    void setup(SamplingConfig const& samplingConfig, size_t batchSize, SizeType maxSequenceLength) override;
+    void setup(SamplingConfig const& samplingConfig, size_t batchSize, SizeType maxSequenceLength,
+        std::optional<TensorPtr> const& batchSlots = std::nullopt) override;
 
     bool forward(DecodingOutput& output, DecodingInput const& input) override;
 
@@ -91,7 +108,7 @@ public:
     void gatherTree(ITensor& finalOutputIds, DecodingOutput const& decodingOutput, DecodingInput const& decodingInput,
         BufferManager const& manager) override;
 
-    const SamplingConfig& getSamplingConfig() override
+    SamplingConfig const& getSamplingConfig() override
     {
         return mSamplingConfig;
     }
@@ -103,17 +120,25 @@ private:
     TensorPtr mLogProbsTiled; // Buffer used to store the transpose of the logProbs. Needed because the kernels have
                               // been written to use that shape.
     SamplingConfig mSamplingConfig;
+
+    cudaDeviceProp mProp; // Avoid dangling pointers in mDynamicDecodeLayer
+
+    size_t mMaxBatchSize;
 };
 
-inline std::unique_ptr<IGptDecoder> IGptDecoder::create(nvinfer1::DataType dtype, size_t maxBatchSize, size_t vocabSize,
-    size_t vocabSizePadded, BufferManager::CudaStreamPtr const& stream)
+inline std::unique_ptr<IGptDecoder> IGptDecoder::create(DecodingMode const& mode, nvinfer1::DataType dtype,
+    size_t maxBatchSize, size_t maxBeamWidth, size_t vocabSize, size_t vocabSizePadded, size_t maxSequenceLength,
+    BufferManager::CudaStreamPtr const& stream, std::optional<runtime::SizeType> maxTokensPerStep,
+    std::optional<runtime::SizeType> maxNumMedusaHeads)
 {
     switch (dtype)
     {
     case nvinfer1::DataType::kFLOAT:
-        return std::make_unique<GptDecoder<float>>(maxBatchSize, vocabSize, vocabSizePadded, stream);
+        return std::make_unique<GptDecoder<float>>(mode, maxBatchSize, maxBeamWidth, vocabSize, vocabSizePadded,
+            maxSequenceLength, stream, maxTokensPerStep, maxNumMedusaHeads);
     case nvinfer1::DataType::kHALF:
-        return std::make_unique<GptDecoder<half>>(maxBatchSize, vocabSize, vocabSizePadded, stream);
+        return std::make_unique<GptDecoder<half>>(mode, maxBatchSize, maxBeamWidth, vocabSize, vocabSizePadded,
+            maxSequenceLength, stream, maxTokensPerStep, maxNumMedusaHeads);
     default: return nullptr;
     }
 }

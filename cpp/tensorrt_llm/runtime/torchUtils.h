@@ -123,7 +123,7 @@ public:
         }
     }
 
-    static at::cuda::CUDAStream stream(runtime::CudaStream& cudaStream)
+    static at::cuda::CUDAStream stream(runtime::CudaStream const& cudaStream)
     {
         return at::cuda::getStreamFromExternal(cudaStream.get(), static_cast<at::DeviceIndex>(cudaStream.getDevice()));
     }

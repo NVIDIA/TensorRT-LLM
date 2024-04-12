@@ -25,7 +25,7 @@ namespace tensorrt_llm::common
 // XQA kernels (optimized kernels for generation phase).
 bool forceXQAKernels()
 {
-    const char* force_xqa_env_var = getenv("TRTLLM_FORCE_XQA");
+    char const* force_xqa_env_var = getenv("TRTLLM_FORCE_XQA");
     static bool forceXQA = false;
     if (force_xqa_env_var != nullptr)
     {
@@ -45,7 +45,7 @@ bool getEnvMmhaMultiblockDebug()
     if (!init)
     {
         init = true;
-        const char* enable_mmha_debug_var = std::getenv("TRTLLM_ENABLE_MMHA_MULTI_BLOCK_DEBUG");
+        char const* enable_mmha_debug_var = std::getenv("TRTLLM_ENABLE_MMHA_MULTI_BLOCK_DEBUG");
         if (enable_mmha_debug_var)
         {
             if (enable_mmha_debug_var[0] == '1' && enable_mmha_debug_var[1] == '\0')
@@ -64,7 +64,7 @@ int getEnvMmhaBlocksPerSequence()
     if (!init)
     {
         init = true;
-        const char* mmhaBlocksPerSequenceEnv = std::getenv("TRTLLM_MMHA_BLOCKS_PER_SEQUENCE");
+        char const* mmhaBlocksPerSequenceEnv = std::getenv("TRTLLM_MMHA_BLOCKS_PER_SEQUENCE");
         if (mmhaBlocksPerSequenceEnv)
         {
             mmhaBlocksPerSequence = std::atoi(mmhaBlocksPerSequenceEnv);

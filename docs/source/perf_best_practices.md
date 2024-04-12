@@ -157,10 +157,20 @@ for details.
 ### Horizontal Fusion in Gated-MLP
 
 Horizontal fusion in Gated-MLP combines two Matmul operations into a single one
-followed by a separate SwiGLU kernel. If both model and batch sizes are large,
-it is recommended to enable the feature by using the `--use_fused_mlp` argument
-with `trtllm-build`. When the workload is very small, it is not recommended to
-enable that feature.
+followed by a separate SwiGLU kernel. However, for FP8 PTQ, the
+downside is slight reduction of accuracy because one of the quantization scaling
+factors are discarded.
+
+If both model and batch sizes are large, it is recommended to enable the feature
+by using the `--use_fused_mlp` argument with `trtllm-build`. When the workload
+is very small, or if you're using FP8 PTQ and the accuracy after enabling it
+does not satisfy your requirement, it is not recommended to enable that feature.
+
+### GEMM Plugin
+
+The GEMM plugin utilizes NVIDIA cuBLASLt to perform GEMM operations. On FP16 and
+BF16, it's recommended to be enabled for better performance and smaller GPU
+memory usage. On FP8, it's recommended to be disabled.
 
 ### BERT Attention Plugin and Context Fused Multi-Head Attention
 

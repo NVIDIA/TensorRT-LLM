@@ -19,6 +19,9 @@ from collections import OrderedDict
 import torch
 import tensorrt as trt
 # isort: on
+import os
+import sys
+
 from parameterized import parameterized
 
 import tensorrt_llm
@@ -27,6 +30,9 @@ from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.functional import gpt_attention
 from tensorrt_llm.models.generation_mixin import GenerationMixin
 from tensorrt_llm.plugin.plugin import ContextFMHAType
+
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.util import unittest_name_func
 
 
 class TestPluginNoCache(unittest.TestCase):
@@ -73,8 +79,7 @@ class TestPluginNoCache(unittest.TestCase):
                 kv_dtype=kv_dtype,
                 remove_input_padding=remove_input_padding,
                 use_gpt_attention_plugin=True,
-                use_gemm_plugin=
-                True,  # because we don't want two optimization profiles
+                enable_ctx_gen_opt_profiles=False,
                 use_cache=use_cache,
             )
 
@@ -101,7 +106,7 @@ class TestPluginNoCache(unittest.TestCase):
             sequence_length = inputs['sequence_length']
             host_context_lengths = inputs['host_context_lengths']
             host_max_attention_window_sizes = inputs[
-                'host_max_attention_window_sizes'][0]
+                'host_max_attention_window_sizes']
             host_sink_token_length = inputs['host_sink_token_length']
             context_lengths = inputs['context_lengths']
             host_request_types = inputs['host_request_types']
@@ -122,6 +127,7 @@ class TestPluginNoCache(unittest.TestCase):
                 context_lengths=context_lengths,
                 cache_indirection=cache_indirection,
                 host_request_types=host_request_types,
+                layer_idx=0,
                 num_heads=num_kv_heads,
                 num_kv_heads=num_kv_heads,
                 hidden_size_per_head=head_size,
@@ -143,7 +149,8 @@ class TestPluginNoCache(unittest.TestCase):
         return builder.build_engine(net, builder_config)
 
     @parameterized.expand([("float16", True, ContextFMHAType.disabled),
-                           ("float16", False, ContextFMHAType.enabled)])
+                           ("float16", False, ContextFMHAType.enabled)],
+                          name_func=unittest_name_func)
     def test_plugin_no_cache(self, dtype: str, remove_input_padding: bool,
                              fmha_type: ContextFMHAType):
 
@@ -220,7 +227,7 @@ class TestPluginNoCache(unittest.TestCase):
         session = tensorrt_llm.runtime.Session.from_serialized_engine(engine)
         inputs = {
             'qkv': qkv,
-            'host_max_attention_window_size_0': host_max_attention_window_sizes,
+            'host_max_attention_window_sizes': host_max_attention_window_sizes,
             'host_sink_token_length': host_sink_token_length,
             'context_lengths': context_lengths,
             'host_request_types': host_request_types,
@@ -258,7 +265,7 @@ class TestPluginNoCache(unittest.TestCase):
             'qkv': qkv,
             'sequence_length': sequence_length,
             'host_past_key_value_lengths': host_past_key_value_lengths,
-            'host_max_attention_window_size_0': host_max_attention_window_sizes,
+            'host_max_attention_window_sizes': host_max_attention_window_sizes,
             'host_sink_token_length': host_sink_token_length,
             'context_lengths': context_lengths,
             'cache_indirection': cache_indirection,

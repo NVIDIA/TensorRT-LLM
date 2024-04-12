@@ -19,7 +19,6 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -30,7 +29,6 @@
 
 #include <algorithm>
 #include <cstdlib>
-#include <limits>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -240,6 +238,7 @@ private:
 using CpuBorrowingAllocator = BorrowingAllocator<MemoryType::kCPU>;
 using GpuBorrowingAllocator = BorrowingAllocator<MemoryType::kGPU>;
 using PinnedBorrowingAllocator = BorrowingAllocator<MemoryType::kPINNED>;
+using ManagedBorrowingAllocator = BorrowingAllocator<MemoryType::kUVM>;
 
 // using UVMBorrowingAllocator = BorrowingAllocator<MemoryType::kUVM>;
 
@@ -379,7 +378,7 @@ void MemoryPool<TAllocator>::allocateImpl(MemoryPool::PointerType* ptr, MemoryPo
 
     // Finds first free segment providing sufficient space
     auto it = std::find_if(mMemorySegments.begin(), mMemorySegments.end(),
-        [alignedRequest](const auto& ms) { return ms.tag == nullptr && ms.size >= alignedRequest; });
+        [alignedRequest](auto const& ms) { return ms.tag == nullptr && ms.size >= alignedRequest; });
 
     if (it == mMemorySegments.end())
     {
@@ -422,7 +421,7 @@ void MemoryPool<TAllocator>::deallocateImpl(PointerType tag, SizeType n)
 {
     std::lock_guard<std::mutex> lock(mLock);
     auto it = std::find_if(mMemorySegments.begin(), mMemorySegments.end(),
-        [&tag](const MemorySegment& segment) { return segment.tag == tag; });
+        [&tag](MemorySegment const& segment) { return segment.tag == tag; });
 
     TLLM_CHECK_WITH_INFO(it != mMemorySegments.end(), "MemoryPool free: Requested tag %p could not be found", tag);
 
@@ -669,6 +668,7 @@ private:
 };
 
 using DeviceBuffer = GenericBuffer<CudaAllocatorAsync>;
+using StaticDeviceBuffer = GenericBuffer<CudaAllocator>;
 using HostBuffer = GenericBuffer<HostAllocator>;
 using PinnedBuffer = GenericBuffer<PinnedAllocator>;
 using PinnedPoolBuffer = GenericBuffer<PinnedPoolAllocator>;
@@ -758,6 +758,7 @@ private:
 };
 
 using DeviceTensor = GenericTensor<CudaAllocatorAsync>;
+using StaticDeviceTensor = GenericTensor<CudaAllocator>;
 using HostTensor = GenericTensor<HostAllocator>;
 using PinnedTensor = GenericTensor<PinnedAllocator>;
 using PinnedPoolTensor = GenericTensor<PinnedPoolAllocator>;

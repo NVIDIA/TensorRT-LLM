@@ -35,11 +35,12 @@ MemoryType IBuffer::memoryType(void const* data)
     switch (attributes.type)
     {
     case cudaMemoryTypeHost: return MemoryType::kPINNED;
-    case cudaMemoryTypeDevice:
-    case cudaMemoryTypeManaged: return MemoryType::kGPU;
+    case cudaMemoryTypeDevice: return MemoryType::kGPU;
+    case cudaMemoryTypeManaged: return MemoryType::kUVM;
     case cudaMemoryTypeUnregistered: return MemoryType::kCPU;
-    default: TLLM_THROW("Unsupported memory type");
     }
+
+    TLLM_THROW("Unsupported memory type");
 }
 
 IBuffer::UniquePtr IBuffer::slice(IBuffer::SharedPtr buffer, std::size_t offset, std::size_t size)

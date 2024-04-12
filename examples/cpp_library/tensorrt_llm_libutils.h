@@ -33,7 +33,7 @@ tSymbolSignature getTrtLLMFunction(std::string libFileSoName, std::string symbol
     void* handle = dlopen(libFileSoName.c_str(), RTLD_LAZY | RTLD_GLOBAL);
 
     // 2. Check for errors
-    const char* dl_error1 = dlerror();
+    char const* dl_error1 = dlerror();
     if (!handle)
     {
         throw std::runtime_error("Cannot open library: " + std::string(dl_error1));
@@ -46,7 +46,7 @@ tSymbolSignature getTrtLLMFunction(std::string libFileSoName, std::string symbol
     *(void**) (&symbolFctn) = dlsym(handle, symbol.c_str());
 
     // 4. Check for errors
-    const char* dl_error2 = dlerror();
+    char const* dl_error2 = dlerror();
     if (dl_error2)
     {
         dlclose(handle);

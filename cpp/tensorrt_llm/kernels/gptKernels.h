@@ -72,9 +72,9 @@ struct BuildDecoderInfoParams
     AttentionMaskDataType* attentionMask;
 
     // The Q length of each sequence in the batch. Shape: [batchSize].
-    const int* seqQLengths;
+    int const* seqQLengths;
     // The KV length of each sequence in the batch. Shape: [batchSize].
-    const int* seqKVLengths;
+    int const* seqKVLengths;
 
     // The number of sequences in the batch.
     int batchSize;
@@ -92,7 +92,7 @@ struct BuildDecoderInfoParams
 };
 
 template <typename T>
-void invokeBuildDecoderInfo(const BuildDecoderInfoParams<T>& params, cudaStream_t stream);
+void invokeBuildDecoderInfo(BuildDecoderInfoParams<T> const& params, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm

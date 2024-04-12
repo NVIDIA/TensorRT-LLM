@@ -19,6 +19,7 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/gptModelConfig.h"
+#include "tensorrt_llm/runtime/loraCache.h"
 #include "tensorrt_llm/runtime/loraModule.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 #include <unordered_map>
@@ -40,6 +41,8 @@ public:
     using LoraConfigTensorPtr = TensorPtr;
     using LoraReqTensors = std::tuple<LoraWeightsTensorPtr, LoraConfigTensorPtr>;
     using TaskIdType = std::int64_t;
+    using PeftValues = std::shared_ptr<std::vector<runtime::LoraCache::TaskLayerModuleConfig>> const;
+    using PeftTable = std::map<uint64_t, std::shared_ptr<std::vector<runtime::LoraCache::TaskLayerModuleConfig>>>;
 
     explicit LoraManager() {}
 
@@ -52,42 +55,11 @@ public:
     void create(GptModelConfig const& modelConfig, WorldConfig const& worldConfig, BufferManager const& manager);
 
     /**
-     * \brief Add Task (LoRA tensor to manager)
-     * \details weights and config are assumed to be in the proper format
-     *          and to have been formatted with formatTaskTensors
-     * \param[in] taskId: id associated with these lora weights
-     * \param[in] weights: LoRA weights tensor [num_modules_layers, D x Hi + Ho x D].
-     *                     Each row contains the flattened in / out LoRA weights for a single module / layer.
-     *                     D=adapter size (R value); Hi=hidden dim of in weights; Ho=hidden dim of out weights
-     * \param[in] config: LoRA config tensor [num_modules_layers, 3]
-     *                    each row contains 3 values (module_id, layer_idx, D)
-     *                    See LoraModule::ModelType for module_id details
-     */
-    void addTask(TaskIdType taskId, LoraWeightsTensorPtr weights, LoraConfigTensorPtr config);
-
-    /**
-     * \brief getTask by taskId
-     * \param[in] taskId: task id
-     */
-    LoraReqTensors& getTask(TaskIdType taskId);
-
-    /**
-     * \brief format tensors for addTask.  See addTask for details on expected format
-     * \param[out] weights: LoRA weights tensor. See addTask for details
-     * \param[out] config: LoRA config tensor. See addTask for details
-     * \param[in] modelConfig: A GptModelConfig
-     * \param[in] worldConfig: A WorldConfig
-     * \param[in]: manager: A BufferManager
-     */
-    void formatTaskTensors(LoraWeightsTensorPtr weights, LoraConfigTensorPtr config, GptModelConfig const& modelConfig,
-        WorldConfig const& worldConfig, BufferManager const& manager);
-
-    /**
      * \brief same as fillInputTensors but for an entire batch
      */
-    void fillInputTensors(TensorPtr weightsPtrs, TensorPtr adapterSizes, ReqIdsVec const& reqIds,
-        std::vector<SizeType> const& reqBeamWidth, std::vector<bool> const& loraEnabled, SizeType numContextRequests,
-        GptModelConfig const& modelConfig, WorldConfig const& worldConfig);
+    void fillInputTensors(TensorPtr weightsPtrs, TensorPtr adapterSizes, PeftTable const& peftTable,
+        ReqIdsVec const& reqIds, std::vector<SizeType> const& reqBeamWidth, GptModelConfig const& modelConfig,
+        WorldConfig const& worldConfig);
 
     /**
      * \brief fill batch input tensors for LoRA.  This method fills on batch slot.
@@ -95,16 +67,14 @@ public:
      *                          (ie for `*_lora_weights_pointers_*` fields)
      * \param[out] adapterSizes: the adapter sizes tensor to fill
      *                           (ie for `*lora_low_rank_*` fields)
+     * \param[in] peftTable: reqId to LoraCache::Values
      * \param[in] batchIdx: the request batch index
-     * \param[in] taskId: the LoRA task id to use
      * \param[in] beamWidth: the request beam width
-     * \param[in] firstLayerId: firstLaterId in this rank for pipeline parallel models
-     * \param[in] lastLayerId: firstLayerId in this rank for pipeline parallel models
-     * \param[in] tpSize: tensor parallel size
-     * \param[in] tpRank: tensor parallel rank
+     * \param[in] modelConfig: a GptModelConfig
+     * \param[in] worldConfig: a WorldConfig
      */
-    void fillInputTensors(TensorPtr weightsPtrs, TensorPtr adapterSizes, SizeType batchIdx, TaskIdType taskId,
-        SizeType beamWidth, SizeType firstLayerId, SizeType lastLayerId, SizeType tpSize, SizeType tpRank);
+    void fillInputTensors(TensorPtr weightsPtrs, TensorPtr adapterSizes, PeftValues const peftValues, SizeType batchIdx,
+        SizeType beamWidth, GptModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
     /**
      * \brief fill tensor map for trt engine context
@@ -117,12 +87,8 @@ public:
     void insertInputTensors(TensorMap& inputTensors, TensorPtr weightsPtrs, TensorPtr adapterSizes,
         GptModelConfig const& modelConfig, WorldConfig const& worldConfig) const;
 
-    void reset();
-
 private:
-    TensorPtr mWorkspace;
-    std::unordered_map<TaskIdType, LoraReqTensors> mLoras;
     std::unordered_map<SizeType, LoraModule> mModuleIdToModule;
-    std::unordered_map<SizeType, SizeType> mModuleOffest;
+    std::unordered_map<SizeType, SizeType> mModuleOffset;
 };
 } // namespace tensorrt_llm::runtime

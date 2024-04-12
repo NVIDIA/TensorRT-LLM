@@ -179,7 +179,7 @@ class Argument:
 @dataclass
 class InputArg(Argument):
     '''
-    Suger for creating an input argument.
+    Sugar for creating an input argument.
     '''
     arg_type: ClassVar = Argument.ArgType.INPUT
 
@@ -618,7 +618,7 @@ class PluginPyCodegen:
             f.write(content)
 
     def get_arg_list(self) -> Iterable[Argument]:
-        # NOTE: for easizer argument passing, here DONT follow the argument order in the original Triton kernel
+        # NOTE: for easier argument passing, here DONT follow the argument order in the original Triton kernel
         for arg in self.meta_data.get_params():
             yield arg
         for arg in self.meta_data.get_inputs():

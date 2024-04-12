@@ -16,6 +16,7 @@ import copy
 import json
 import math
 import os
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,12 +24,20 @@ from typing import Dict, Optional, Union
 
 import tensorrt as trt
 
-from ._common import _is_building
-from ._utils import support_strongly_type, to_dict, to_json_file
+from ._common import _is_building, serialize_engine
+from ._utils import (str_dtype_to_trt, support_strongly_type, to_dict,
+                     to_json_file)
+from .auto_parallel import auto_parallel
+from .auto_parallel.config import AutoParallelConfig
+from .graph_rewriting import optimize
 from .logger import logger
-from .network import Network
+from .lora_manager import LoraBuildConfig
+from .models import PretrainedConfig, PretrainedModel
+from .models.modeling_utils import optimize_model
+from .network import Network, net_guard
 from .plugin import PluginConfig
-from .quantization import QuantMode
+from .quantization import QuantAlgo, QuantMode
+from .version import __version__
 
 
 class BuilderConfig(object):
@@ -75,10 +84,6 @@ class BuilderConfig(object):
             assert isinstance(self.plugin_config, PluginConfig), \
                 f"Found unexpected plugin_config object with type: {type(self.plugin_config)}"
             config['plugin_config'] = to_dict(self.plugin_config)
-        if self.auto_parallel_config is not None:
-            config['auto_parallel_config'] = self.auto_parallel_config
-            config['builder_config']['tensor_parallel'] = math.prod(
-                self.auto_parallel_config['mesh'])
         return config
 
 
@@ -151,7 +156,7 @@ class Builder():
         if use_refit and int8:
             # TRT folds weights into Myelin graph because network contains int8 tensor or Q/DQ nodes
             # These folded weights can not be refitted
-            logger.error(f"can't use refit and int8 mode at the same time")
+            logger.error("can't use refit and int8 mode at the same time")
 
         config = self.trt_builder.create_builder_config()
         if not self.strongly_typed:
@@ -206,6 +211,11 @@ class Builder():
         # so the cache should never None here
         assert cache is not None and isinstance(cache, trt.ITimingCache)
         config.set_timing_cache(cache, ignore_mismatch=False)
+
+        # set weight sparsity
+        weight_sparsity = kwargs.get("weight_sparsity", False)
+        if weight_sparsity:
+            config.set_flag(trt.BuilderFlag.SPARSE_WEIGHTS)
 
         return BuilderConfig()._init(config,
                                      precision=precision,
@@ -296,7 +306,7 @@ class Builder():
             @return: A serialized TRT engine if refit successfully, None otherwise
         '''
         assert isinstance(network, Network)
-        logger.info(f'Refit TRT engine')
+        logger.info('Refit TRT engine')
         runtime = trt.Runtime(logger.trt_logger)
         engine = runtime.deserialize_cuda_engine(engine_buffer)
 
@@ -313,12 +323,11 @@ class Builder():
                     return None
         else:
             logger.error(
-                f'Please set named parameters before building multiple engines.'
-            )
+                'Please set named parameters before building multiple engines.')
             return None
 
         if not refitter.refit_cuda_engine():
-            logger.error(f'Failed to refit engine.')
+            logger.error('Failed to refit engine.')
             return None
 
         tok = time.time()
@@ -339,6 +348,10 @@ class Builder():
         assert isinstance(network, Network)
         builder_config.plugin_config = network.plugin_config
         builder_config.auto_parallel_config = network.auto_parallel_config
+        if builder_config.auto_parallel_config is not None:
+            mapping = builder_config.auto_parallel_config["mapping"]
+            builder_config.tensor_parallel = mapping.tp_size
+            builder_config.pipeline_parallel = mapping.pp_size
         if builder_config.trt_builder_config.num_optimization_profiles == 0:
             self._add_optimization_profile(network, builder_config)
         engine = None
@@ -346,8 +359,12 @@ class Builder():
         # Rename weights
         if network.named_parameters is not None:
             for name, param in network.named_parameters:
-                if param._get_weights(
-                ) is None or not network.trt_network.set_weights_name(
+                if param._get_weights() is None:
+                    logger.info(
+                        f"Parameter {name} {param.raw_value.shape} {param.raw_value.dtype} was not materialized to TRT network"
+                    )
+                    continue
+                if not network.trt_network.set_weights_name(
                         param._get_weights(), name):
                     raise RuntimeError(f'Failed to set weight: {name}')
 
@@ -400,6 +417,7 @@ class BuildConfig:
     max_batch_size: int = 8
     max_beam_width: int = 1
     max_num_tokens: Optional[int] = None
+    opt_num_tokens: Optional[int] = None
     max_prompt_embedding_table_size: int = 0
     gather_context_logits: int = False
     gather_generation_logits: int = False
@@ -407,7 +425,15 @@ class BuildConfig:
     builder_opt: Optional[int] = None
     profiling_verbosity: str = 'layer_names_only'
     enable_debug_output: bool = False
+    max_draft_len: int = 0
+    use_refit: bool = False
+    input_timing_cache: str = None
+    output_timing_cache: str = None
+    lora_config: LoraBuildConfig = LoraBuildConfig()
+    auto_parallel_config: AutoParallelConfig = AutoParallelConfig()
+    weight_sparsity: bool = False
     plugin_config: PluginConfig = PluginConfig()
+    use_fused_mlp: bool = False
 
     @classmethod
     def from_dict(cls, config, plugin_config=None):
@@ -416,15 +442,24 @@ class BuildConfig:
         max_batch_size = config.pop('max_batch_size')
         max_beam_width = config.pop('max_beam_width')
         max_num_tokens = config.pop('max_num_tokens')
+        opt_num_tokens = config.pop('opt_num_tokens')
         max_prompt_embedding_table_size = config.pop(
             'max_prompt_embedding_table_size', 0)
         gather_context_logits = config.pop('gather_context_logits', False)
         gather_generation_logits = config.pop('gather_generation_logits', False)
         strongly_typed = config.pop('strongly_typed', False)
         builder_opt = config.pop('builder_opt', None)
+        weight_sparsity = config.pop('weight_sparsity', False)
         profiling_verbosity = config.pop('profiling_verbosity',
                                          'layer_names_only')
         enable_debug_output = config.pop('enable_debug_output', False)
+        max_draft_len = config.pop('max_draft_len', 0)
+        use_refit = config.pop('use_refit', False)
+        input_timing_cache = config.pop('input_timing_cache', None)
+        output_timing_cache = config.pop('output_timing_cache', None)
+        lora_config = LoraBuildConfig.from_dict(config.get('lora_config', {}))
+        auto_parallel_config = AutoParallelConfig.from_dict(
+            config.get('auto_parallel_config', {}))
 
         if plugin_config is None:
             plugin_config = PluginConfig()
@@ -436,6 +471,7 @@ class BuildConfig:
             max_batch_size=max_batch_size,
             max_beam_width=max_beam_width,
             max_num_tokens=max_num_tokens,
+            opt_num_tokens=opt_num_tokens,
             max_prompt_embedding_table_size=max_prompt_embedding_table_size,
             gather_context_logits=gather_context_logits,
             gather_generation_logits=gather_generation_logits,
@@ -443,6 +479,13 @@ class BuildConfig:
             builder_opt=builder_opt,
             profiling_verbosity=profiling_verbosity,
             enable_debug_output=enable_debug_output,
+            max_draft_len=max_draft_len,
+            use_refit=use_refit,
+            input_timing_cache=input_timing_cache,
+            output_timing_cache=output_timing_cache,
+            lora_config=lora_config,
+            auto_parallel_config=auto_parallel_config,
+            weight_sparsity=weight_sparsity,
             plugin_config=plugin_config)
 
     @classmethod
@@ -456,4 +499,219 @@ class BuildConfig:
         plugin_config = output.pop('plugin_config')
         plugin_config_dict = copy.deepcopy(plugin_config.__dict__)
         output['plugin_config'] = plugin_config_dict
+        output['lora_config'] = output['lora_config'].to_dict()
+        output['auto_parallel_config'] = output['auto_parallel_config'].to_dict(
+        )
         return output
+
+
+class EngineConfig:
+
+    def __init__(self, pretrained_config: 'PretrainedConfig',
+                 build_config: 'BuildConfig', version: str):
+        self.pretrained_config = pretrained_config
+        self.build_config = build_config
+        self.version = version
+
+    @classmethod
+    def from_json_file(cls, config_file):
+        with open(config_file) as f:
+            config = json.load(f)
+            return cls(PretrainedConfig.from_dict(config['pretrained_config']),
+                       BuildConfig.from_dict(config['build_config']),
+                       config['version'])
+
+    def to_dict(self):
+        return {
+            'version': self.version,
+            'pretrained_config': self.pretrained_config.to_dict(),
+            'build_config': self.build_config.to_dict(),
+        }
+
+
+class Engine:
+
+    def __init__(self, config: EngineConfig, engine: trt.IHostMemory):
+        self.config = config
+        self.engine = engine
+
+    def save(self, engine_dir: str):
+        os.makedirs(engine_dir, exist_ok=True)
+        lora_config = self.config.build_config.lora_config
+        lora_dirs = lora_config.lora_dir
+        root_lora_dir = os.path.join(engine_dir, 'lora')
+        if len(lora_dirs) > 0:
+            os.makedirs(root_lora_dir, exist_ok=True)
+            for index, lora_dir in enumerate(lora_dirs):
+                if lora_config.lora_ckpt_source == 'hf':
+                    target_lora_dir = f"{root_lora_dir}/{index}"
+                    os.makedirs(target_lora_dir, exist_ok=True)
+                    shutil.copy2(os.path.join(lora_dir, 'adapter_config.json'),
+                                 target_lora_dir)
+                    shutil.copy2(os.path.join(lora_dir, 'adapter_model.bin'),
+                                 target_lora_dir)
+                    lora_config.lora_dir[index] = f"lora/{index}"
+                elif lora_config.lora_ckpt_source == 'nemo':
+                    target_lora_file = f"{root_lora_dir}/{index}.nemo"
+                    shutil.copyfile(lora_dir, target_lora_file)
+                    lora_config.lora_dir[index] = f"lora/{index}.nemo"
+        else:
+            if os.path.exists(root_lora_dir) and os.path.isdir(root_lora_dir):
+                shutil.rmtree(root_lora_dir)
+        if self.config.pretrained_config.mapping.rank == 0:
+            with open(os.path.join(engine_dir, 'config.json'),
+                      "w",
+                      encoding="utf-8") as f:
+                json.dump(self.config.to_dict(), f, indent=4)
+        serialize_engine(
+            self.engine,
+            os.path.join(
+                engine_dir,
+                f'rank{self.config.pretrained_config.mapping.rank}.engine'))
+
+    @classmethod
+    def from_dir(cls, engine_dir: str, rank: int = 0):
+        with open(os.path.join(engine_dir, f'rank{rank}.engine'), 'rb') as f:
+            engine_buffer = f.read()
+
+        config = EngineConfig.from_json_file(
+            os.path.join(engine_dir, 'config.json'))
+        config.pretrained_config.set_rank(rank)
+
+        return cls(config, engine_buffer)
+
+
+def get_engine_version(engine_dir: str) -> Union[None, str]:
+    engine_dir = Path(engine_dir)
+    config_path = engine_dir / "config.json"
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+
+    if 'version' not in config:
+        return None
+
+    return config['version']
+
+
+def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
+    '''Build engine from given model and optimization options specified in the build_config
+       WARNING: this function may change the given \p model object state in some optimization passes
+       to avoid cloning a model since normally the LLM models consumes large memory.
+       Create a new fresh model object if you need to build with different options.
+
+    '''
+    build_config = copy.deepcopy(
+        build_config)  # avoid changing the input config
+    if model.config.quantization.quant_algo == QuantAlgo.FP8 or \
+        model.config.quantization.kv_cache_quant_algo == QuantAlgo.FP8:
+        build_config.strongly_typed = True
+
+    if hasattr(model.config, 'max_medusa_token_len'):
+        build_config.max_draft_len = model.config.max_medusa_token_len
+
+    use_auto_parallel = build_config.auto_parallel_config.enabled
+    model = optimize_model(
+        model,
+        use_fused_mlp=(build_config.use_fused_mlp and not use_auto_parallel),
+        use_prompt_tuning=(build_config.max_prompt_embedding_table_size > 0))
+
+    if build_config.plugin_config.lora_plugin is not None:
+        model.use_lora(build_config.lora_config)
+        model = optimize_model(
+            model,
+            use_lora=True,
+            max_lora_rank=build_config.lora_config.max_lora_rank,
+        )
+
+    builder = Builder()
+    builder_config = builder.create_builder_config(
+        precision=model.config.dtype,
+        use_refit=build_config.use_refit,
+        timing_cache=build_config.input_timing_cache,
+        int8=(model.config.quant_mode.has_act_or_weight_quant()
+              and not model.config.quant_mode.has_per_group_scaling())
+        or model.config.quant_mode.has_int8_kv_cache(),
+        strongly_typed=build_config.strongly_typed,
+        opt_level=build_config.builder_opt,
+        profiling_verbosity=build_config.profiling_verbosity,
+        quant_mode=model.config.quant_mode,
+        weight_sparsity=build_config.weight_sparsity,
+    )
+
+    network = builder.create_network()
+    network.plugin_config = build_config.plugin_config
+
+    use_weight_only = model.config.quant_mode.is_weight_only()
+    per_group = model.config.quant_mode.has_per_group_scaling()
+    use_smooth_quant = model.config.quant_mode.has_act_and_weight_quant()
+    disable_weight_only_quant_plugin = model.config.disable_weight_only_quant_plugin if hasattr(
+        model.config, 'disable_weight_only_quant_plugin') else False
+
+    if use_weight_only and not disable_weight_only_quant_plugin:
+        if per_group:
+            network.plugin_config.set_plugin(
+                "weight_only_groupwise_quant_matmul_plugin", model.config.dtype)
+        else:
+            network.plugin_config.set_plugin("weight_only_quant_matmul_plugin",
+                                             model.config.dtype)
+    if use_smooth_quant and model.config.quantization.use_plugin_sq:
+        network.plugin_config.set_smooth_quant_plugins()
+    if (model.config.quant_mode.has_fp8_kv_cache()
+            or model.config.quant_mode.has_int8_kv_cache()
+        ) and network.plugin_config.use_paged_context_fmha:
+        raise RuntimeError(
+            "Paged Context FMHA doesn't work with fp8/int8 kv cache currently.")
+    nccl_plugin = model.config.dtype if model.config.mapping.world_size > 1 else None
+    network.plugin_config.set_nccl_plugin(
+        nccl_plugin, network.plugin_config.use_custom_all_reduce)
+
+    use_auto_parallel = build_config.auto_parallel_config.enabled
+    model = optimize_model(model, use_unfused_qkv_gemm=use_auto_parallel)
+
+    with net_guard(network):
+        # Prepare
+        network.set_named_parameters(model.named_parameters())
+
+        # Forward
+        inputs = model.prepare_inputs(
+            max_batch_size=build_config.max_batch_size,
+            max_input_len=build_config.max_input_len,
+            max_seq_len=build_config.max_input_len +
+            build_config.max_output_len,
+            use_cache=True,
+            max_beam_width=build_config.max_beam_width,
+            max_num_tokens=build_config.max_num_tokens,
+            opt_num_tokens=build_config.opt_num_tokens,
+            prompt_embedding_table_size=build_config.
+            max_prompt_embedding_table_size,
+            max_draft_len=build_config.max_draft_len,
+            gather_context_logits=build_config.gather_context_logits,
+            gather_generation_logits=build_config.gather_generation_logits,
+            lora_target_modules=build_config.lora_config.lora_target_modules)
+        model(**inputs)
+
+        if build_config.enable_debug_output:
+            for k, v in model.named_network_outputs():
+                network._mark_output(v, k, str_dtype_to_trt(model.config.dtype))
+
+    optimize(network)
+
+    if use_auto_parallel:
+        config = build_config.auto_parallel_config
+        config.builder_flags = builder_config.trt_builder_config.flags
+        sharded_networks = auto_parallel(network, config)
+        network = sharded_networks[model.config.mapping.rank]
+        if not build_config.auto_parallel_config.debug_mode:
+            mapping = network.auto_parallel_config["mapping"]
+            model.config.mapping = mapping
+
+    # Network -> Engine
+    engine = builder.build_engine(network, builder_config)
+    engine_config = EngineConfig(model.config, build_config, __version__)
+
+    if build_config.output_timing_cache is not None and model.config.mapping.rank == 0:
+        ok = builder.save_timing_cache(builder_config,
+                                       build_config.output_timing_cache)
+        assert ok, "Failed to save timing cache."
+
+    return Engine(engine_config, engine)

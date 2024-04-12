@@ -18,6 +18,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
+#include "tensorrt_llm/kernels/parallelDecoding/kvCacheUpdateKernels.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 
 #include <cub/cub.cuh>
@@ -60,6 +61,7 @@ void invokeFill(IBuffer& buffer, T const value, CudaStream const& stream)
 }
 
 // template instantiation
+template void invokeFill(IBuffer&, std::int64_t, CudaStream const&);
 template void invokeFill(IBuffer&, std::int32_t, CudaStream const&);
 template void invokeFill(IBuffer&, std::int8_t, CudaStream const&);
 template void invokeFill(IBuffer&, std::uint8_t, CudaStream const&);
@@ -111,7 +113,7 @@ template void invokeFillBatch<std::int32_t>(IBuffer&, IBuffer const&, std::size_
 namespace
 {
 template <typename VecT>
-__global__ void copyBatch(const uint8_t* srcData, uint8_t* dstData, std::int32_t const* srcOffsets,
+__global__ void copyBatch(uint8_t const* srcData, uint8_t* dstData, std::int32_t const* srcOffsets,
     std::int32_t const* dstOffsets, std::int32_t const* sizes, std::int32_t const dataTypeSize)
 {
     constexpr auto VEC_ELTS = static_cast<int32_t>(sizeof(VecT));
@@ -127,7 +129,7 @@ __global__ void copyBatch(const uint8_t* srcData, uint8_t* dstData, std::int32_t
 
     for (; srcIdx < srcEndIdx; srcIdx += stride, dstIdx += stride)
     {
-        *reinterpret_cast<VecT*>(&dstData[dstIdx]) = *reinterpret_cast<const VecT*>(&srcData[srcIdx]);
+        *reinterpret_cast<VecT*>(&dstData[dstIdx]) = *reinterpret_cast<VecT const*>(&srcData[srcIdx]);
     }
 }
 } // namespace
@@ -135,7 +137,7 @@ __global__ void copyBatch(const uint8_t* srcData, uint8_t* dstData, std::int32_t
 void invokeCopyBatch(IBuffer const& srcBuffer, IBuffer& dstBuffer, IBuffer const& srcOffsets, IBuffer const& dstOffsets,
     IBuffer const& sizes, std::size_t maxStride, CudaStream const& stream)
 {
-    auto srcDataPtr = reinterpret_cast<const uint8_t*>(srcBuffer.data());
+    auto srcDataPtr = reinterpret_cast<uint8_t const*>(srcBuffer.data());
     auto dstDataPtr = reinterpret_cast<uint8_t*>(dstBuffer.data());
     auto srcOffsetsPtr = bufferCast<std::int32_t>(srcOffsets);
     auto dstOffsetsPtr = bufferCast<std::int32_t>(dstOffsets);
@@ -415,6 +417,21 @@ void invokeInclusiveSum(IBuffer& output, IBuffer const& input, BufferManager con
     auto tempStorage = manager.gpu(tempStorageBytes, nvinfer1::DataType::kUINT8);
     auto* tempStorageData = bufferCast<std::uint8_t>(*tempStorage);
     cub::DeviceScan::InclusiveSum(tempStorageData, tempStorageBytes, inputData, outputData, size, stream.get());
+}
+
+void invokeInclusiveSum(IBuffer& output, IBuffer& tmpBuffer, IBuffer const& input, CudaStream const& stream)
+{
+    TLLM_CHECK_WITH_INFO(nvinfer1::DataType::kUINT8 == tmpBuffer.getDataType(), "tmpBuffer has wrong data type");
+
+    auto const size = input.getSize();
+    auto const* inputData = bufferCast<SizeType>(input);
+    auto* outputData = bufferCast<SizeType>(output);
+
+    std::size_t tempStorageBytes{0};
+    cub::DeviceScan::InclusiveSum(nullptr, tempStorageBytes, inputData, outputData, size, stream.get());
+    tmpBuffer.resize(tempStorageBytes);
+    auto* tmpBufferPtr = bufferCast<std::uint8_t>(tmpBuffer);
+    cub::DeviceScan::InclusiveSum(tmpBufferPtr, tempStorageBytes, inputData, outputData, size, stream.get());
 }
 
 namespace
@@ -752,7 +769,7 @@ void initOutputIds(ITensor& outputIds, ITensor const& inputIds, ITensor const& i
     ITensor const& inputOffsets, TokenIdType const padId, TokenIdType const endId, SizeType const maxInputLength,
     bool const inputPacked, CudaStream const& stream)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     kernels::invokeFill(outputIds, endId, stream);
 
     if (inputPacked)
@@ -763,7 +780,7 @@ void initOutputIds(ITensor& outputIds, ITensor const& inputIds, ITensor const& i
     {
         kernels::invokeCopyInputToOutput(outputIds, inputIds, inputLengths, padId, stream);
     }
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 namespace
@@ -1103,7 +1120,7 @@ void gatherLastTokenLogits(ITensor& output, ITensor const& input, ITensor const&
 // block copies a `vocabSizePadded` length logits tensor from the "inputLogits (microBatchSize, beamWidth,
 // vocabSizePadded)" to the "outputGenerationLogits (batchSize, beamWidth, outputLen, vocabSizePadded)"
 template <typename T>
-__global__ void mergeLogitsFragmentsKernel(T* output, T** fragmentsVector, const int outputLen, int firstBatchSlotIdx,
+__global__ void mergeLogitsFragmentsKernel(T* output, T** fragmentsVector, int const outputLen, int firstBatchSlotIdx,
     int microBatchSize, int beamWidth, int vocabSizePadded, int stepOffset)
 {
     // output: shape: [batchSize, beamWidth, outputLen, vocabSize]
@@ -1122,13 +1139,13 @@ __global__ void mergeLogitsFragmentsKernel(T* output, T** fragmentsVector, const
     int mbeamIdx = blockIdx.x % beamWidth;
 
     // The output pointer
-    const unsigned int outputOffset
+    unsigned int const outputOffset
         = (absoluteBatchSlotIdx * beamWidth * outputLen + mbeamIdx * outputLen + curStep + stepOffset)
         * vocabSizePadded;
 
     T* outputPtr = &output[outputOffset];
 
-    const unsigned int inputOffset = (relativeBatchSlotIdx * beamWidth + mbeamIdx) * vocabSizePadded;
+    unsigned int const inputOffset = (relativeBatchSlotIdx * beamWidth + mbeamIdx) * vocabSizePadded;
     // The input pointer.
     T const* inputPtr = &fragmentsVector[curStep][inputOffset];
 
@@ -1197,6 +1214,19 @@ void mergeLogitsFragments(BufferManager const& bufferManager, ITensor& output, s
 #endif // ENABLE_FP8
     default: TLLM_CHECK_WITH_INFO(false, "data type not supported");
     }
+}
+
+void invokeUpdateKVBlockArrayDraftTokenLocation(ITensor const& seqAcceptedDraftTokenOffsets,
+    ITensor const& packedAcceptedDraftTokensIndices, ITensor const& pastKeyValueLengths, int64_t* const* pointerArray,
+    SizeType layerCount, SizeType seqCount, SizeType numKVHeads, SizeType sizeInBytesPerKVHead,
+    SizeType rewindDraftTokenCommonCount, int* rewindDraftTokenSeparateAdjustments, ITensor const& seqSlotRemapping,
+    SizeType maxKVCacheLen, SizeType maxBlocksPerSeq, SizeType tokensPerBlock, cudaStream_t stream)
+{
+    tensorrt_llm::kernels::parallel_decoding::updateKVBlockArrayDraftTokenLocation(
+        bufferCast<SizeType>(seqAcceptedDraftTokenOffsets), bufferCast<SizeType>(packedAcceptedDraftTokensIndices),
+        bufferCast<SizeType>(pastKeyValueLengths), pointerArray, layerCount, seqCount, numKVHeads, sizeInBytesPerKVHead,
+        rewindDraftTokenCommonCount, rewindDraftTokenSeparateAdjustments, bufferCast<SizeType>(seqSlotRemapping),
+        maxKVCacheLen, maxBlocksPerSeq, tokensPerBlock, stream);
 }
 
 } // namespace tensorrt_llm::runtime::kernels

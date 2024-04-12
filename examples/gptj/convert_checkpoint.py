@@ -12,6 +12,7 @@ from transformers import AutoModelForCausalLM, GPTJConfig, GPTJForCausalLM
 
 import tensorrt_llm
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.quantization import QuantAlgo
 
 
 def parse_arguments():
@@ -285,10 +286,10 @@ def main():
     plugin_weight_only_quant_type = None
     if args.use_weight_only and args.weight_only_precision == 'int8':
         plugin_weight_only_quant_type = torch.int8
-        quant_algo = 'W8A16'
+        quant_algo = QuantAlgo.W8A16
     elif args.use_weight_only and args.weight_only_precision == 'int4':
         plugin_weight_only_quant_type = torch.quint4x2
-        quant_algo = 'W4A16'
+        quant_algo = QuantAlgo.W4A16
 
     if args.model_dir is not None:
         hf_config = load_gptj_config(args.model_dir)
@@ -331,14 +332,16 @@ def main():
     if args.model_dir is None:
         return
 
+    hf_model = AutoModelForCausalLM.from_pretrained(args.model_dir,
+                                                    trust_remote_code=True,
+                                                    torch_dtype="auto")
+
     def covert_and_save(rank):
         mapping = Mapping(world_size=world_size,
                           rank=rank,
                           tp_size=args.tp_size,
                           pp_size=args.pp_size)
-        hf_model = AutoModelForCausalLM.from_pretrained(args.model_dir,
-                                                        trust_remote_code=True,
-                                                        torch_dtype="auto")
+
         weights = convert_hf_gptj(
             hf_model,
             hf_config,
@@ -346,7 +349,6 @@ def main():
             dtype=args.dtype,
             use_weight_only=args.use_weight_only,
             plugin_weight_only_quant_type=plugin_weight_only_quant_type)
-        del hf_model
 
         safetensors.torch.save_file(
             weights, os.path.join(args.output_dir, f'rank{rank}.safetensors'))
@@ -370,6 +372,7 @@ def main():
                 exceptions
             ) == 0, "Checkpoint conversion failed, please check error log."
 
+    del hf_model
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     print(f'Total time of converting checkpoints: {t}')

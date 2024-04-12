@@ -20,6 +20,7 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
+#include "tensorrt_llm/runtime/decodingMode.h"
 #include "tensorrt_llm/runtime/generationInput.h"
 #include "tensorrt_llm/runtime/generationOutput.h"
 #include "tensorrt_llm/runtime/gptModelConfig.h"
@@ -82,16 +83,73 @@ public:
         {
         }
 
+        // The maximum number of sequences in a batch
         SizeType maxBatchSize;
+        // The maximum width of the beams in beam-search
         SizeType maxBeamWidth;
+        // The length of the longest input sequence
         SizeType maxSequenceLength;
+        // Whether the session will use a different decoder per request.
+        // It must be set to `true` when running in-flight batching
         bool decoderPerRequest{false};
+        // Whether the session will use CUDA graphs for the engine   execution in generation phase
         bool cudaGraphMode{false};
         KvCacheConfig kvCacheConfig{};
+        // The micro batch size to be used in context phase.
+        // Batches entered in `GptSession::generation` will be split into smaller micro batches of this size
         std::optional<SizeType> ctxMicroBatchSize = std::nullopt;
+        // The micro batch size to be used in generation phase.
+        // Batches entered in `GptSession::generation` will be split into smaller micro batches of this size.
         std::optional<SizeType> genMicroBatchSize = std::nullopt;
+        std::optional<DecodingMode> decodingMode = std::nullopt;
+        bool normalizeLogProbs = true;
     };
 
+    //! @brief Optional profiler class to profile the generation phase of an inference request
+    class GenerationProfiler
+    {
+    public:
+        // Use a constexpr variable to resolve the ambiguous match for overloaded CudaEvent constructor
+        static constexpr unsigned int flags{cudaEventDefault};
+
+        GenerationProfiler()
+            : start(flags)
+            , end(flags)
+        {
+        }
+
+        CudaEvent const& getStart() const
+        {
+            return start;
+        }
+
+        CudaEvent const& getEnd() const
+        {
+            return end;
+        }
+
+        float getElapsedTimeMs()
+        {
+            start.synchronize();
+            end.synchronize();
+
+            float result;
+            TLLM_CUDA_CHECK(::cudaEventElapsedTime(&result, start.get(), end.get()));
+
+            return result;
+        }
+
+    private:
+        CudaEvent start;
+        CudaEvent end;
+    };
+
+    //! @param sessionConfig Configuration of the session,
+    //! @param modelConfig   Description of the model,
+    //! @param worldConfig   Description of the environment,
+    //! @param engineBuffer  The compiled TensorRT engine (const void*),
+    //! @param engineSize    The size in bytes of the TensorRT engine (size_t),
+    //! @param logger        The optional logger.
     GptSession(Config const& sessionConfig, GptModelConfig const& modelConfig, WorldConfig const& worldConfig,
         void const* engineBuffer, std::size_t engineSize, LoggerPtr logger = nullptr);
 
@@ -127,9 +185,40 @@ public:
         return mDevice;
     }
 
+    [[nodiscard]] bool getNormalizeLogProbs() const noexcept
+    {
+        return mNormalizeLogProbs;
+    }
+
     [[nodiscard]] nvinfer1::DataType getLogitDataType() const;
 
-    void generate(GenerationOutput& outputs, GenerationInput const& inputs, SamplingConfig const& samplingConfig);
+    //! @brief This function performs the generation loop.
+    //! @details Given input tensors to read from, output tensors to populate, that member function
+    //!          can be produced or each sequence has reached completion (due to the production
+    //!          will run the generation loop until it reaches the maximum number of tokens that
+    //!          of "end-of-sequence" or a word in the list of "stop words"). The pseudo-code of
+    //!          that function looks like (member function names were changed to keep the
+    //!          presentation simple):
+    //!
+    //!    ```cpp
+    //!    // Have all the sequences in the batch reached completion?
+    //!    bool allFinished = false;
+    //!
+    //!    // Until all sequences are finished or the number of steps reaches the limit...
+    //!    for (int step = 0; !allFinished && step < maxNewTokens; ++step) {
+    //!
+    //!    // Trigger the computation of the logits...
+    //!    computeLogits(...);
+    //!
+    //!    // Run the sampling to produce a token (for each active sequence) from the logits.
+    //!    allFinished = generateTokensFromLogits(...);
+    //!
+    //!    // Callback to stream the output tokens while the generation loop continues.
+    //!    onTokenGenerated(...);
+    //!    }
+    //!    ```
+    void generate(GenerationOutput& outputs, GenerationInput const& inputs, SamplingConfig const& samplingConfig,
+        std::shared_ptr<GenerationProfiler> const generationProfiler = nullptr);
 
 private:
     [[nodiscard]] bool useCudaGraphs()
@@ -139,14 +228,15 @@ private:
 
     void generateBatched(std::vector<GenerationOutput>& microBatchesOutputs,
         std::vector<GenerationInput> const& microBatchesInputs, SamplingConfig const& samplingConfig,
-        TokenGeneratedCallback const& onTokenGenerated);
+        TokenGeneratedCallback const& onTokenGenerated, std::shared_ptr<GenerationProfiler> const generationProfiler);
 
     void setup(Config const& sessionConfig);
 
     void createContexts();
     void createBuffers(SizeType numMicroBatches);
     void createDecoders(SizeType batchSize, SizeType beamWidth, SizeType maxAttentionWindow, SizeType sinkTokenLength,
-        SizeType maxSequenceLength, nvinfer1::DataType logitsType, bool decoderPerRequest, SizeType numMicroBatches);
+        SizeType maxSequenceLength, nvinfer1::DataType logitsType, bool decoderPerRequest, SizeType numMicroBatches,
+        DecodingMode const& decodingMode);
     void createKvCacheManager(SizeType batchSize, SizeType beamWidth, SizeType maxAttentionWindow,
         SizeType sinkTokenLength, SizeType maxSequenceLength, KvCacheConfig const& config);
     void createCustomAllReduceWorkspace(SizeType batchSize, SizeType beamWidth, SizeType maxSequenceLength);
@@ -271,6 +361,8 @@ private:
     bool mCudaGraphMode{false};
     // ping-pong instances
     std::vector<CudaGraphExecutor> mCudaGraphInstances;
+
+    bool mNormalizeLogProbs = true;
 };
 
 } // namespace tensorrt_llm::runtime

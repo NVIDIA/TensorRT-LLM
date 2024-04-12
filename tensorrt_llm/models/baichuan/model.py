@@ -15,7 +15,7 @@
 from ..._utils import pad_vocab_size
 from ...functional import Tensor
 from ...layers import (Attention, AttentionMaskType, ColumnLinear, Embedding,
-                       GatedMLP, PromptTuningEmbedding, RmsNorm)
+                       GatedMLP, RmsNorm)
 from ...module import Module
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
                               PretrainedConfig)
@@ -38,9 +38,12 @@ class BaichuanDecoderLayer(Module):
         self.input_layernorm = RmsNorm(normalized_shape=hidden_size,
                                        eps=config.norm_epsilon,
                                        dtype=dtype)
+        layers_range = config.mapping.pp_layers(config.num_hidden_layers)
+        local_layer_idx = layer_idx - layers_range[0]
         self.attention = Attention(
-            hidden_size,
-            config.num_attention_heads,
+            local_layer_idx=local_layer_idx,
+            hidden_size=hidden_size,
+            num_attention_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             max_position_embeddings=config.max_position_embeddings,
             dtype=dtype,
@@ -100,25 +103,15 @@ class BaichuanModel(Module):
     def __init__(self, config: PretrainedConfig):
         super().__init__()
         hidden_size = config.hidden_size
-        dtype = config.dtype
-        self.use_prompt_tuning = config.use_prompt_tuning
 
-        EmbeddingCls = PromptTuningEmbedding if config.use_prompt_tuning else Embedding
-        self.vocab_embedding = EmbeddingCls(
-            config.vocab_size,
-            config.hidden_size,
-            dtype=config.dtype,
-            tp_size=config.mapping.tp_size
-            if config.use_parallel_embedding else 1,
-            tp_group=config.mapping.tp_group
-            if config.use_parallel_embedding else None,
-            sharding_dim=config.embedding_sharding_dim,
-            tp_rank=config.mapping.tp_rank)
+        self.vocab_embedding = Embedding(config.vocab_size,
+                                         config.hidden_size,
+                                         dtype=config.dtype)
 
         self.layers = DecoderLayerList(BaichuanDecoderLayer, config)
         self.ln_f = RmsNorm(normalized_shape=hidden_size,
                             eps=config.norm_epsilon,
-                            dtype=dtype)
+                            dtype=config.dtype)
 
     def forward(self,
                 input_ids: Tensor,
@@ -131,7 +124,7 @@ class BaichuanModel(Module):
                 prompt_tasks=None,
                 prompt_vocab_size=None):
         args = [prompt_embedding_table, prompt_tasks, prompt_vocab_size
-                ] if self.use_prompt_tuning else []
+                ] if prompt_embedding_table is not None else []
         hidden_states = self.vocab_embedding(input_ids, *args)
 
         hidden_states = self.layers(hidden_states,

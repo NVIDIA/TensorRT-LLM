@@ -29,7 +29,9 @@ from tensorrt_llm.functional import AllReduceStrategy, allreduce
 from tensorrt_llm.plugin.plugin import current_all_reduce_helper
 
 
-def allreduce_benchmark(dtype: str, test_range: str = "10,10000000,10"):
+def allreduce_benchmark(dtype: str,
+                        test_range: str = "10,10000000,10",
+                        no_header: bool = False):
     tllm.logger.set_level('error')
     world_size = tllm.mpi_world_size()
     rank = tllm.mpi_rank()
@@ -48,11 +50,15 @@ def allreduce_benchmark(dtype: str, test_range: str = "10,10000000,10"):
 
     size = min_size
     dtype_size = torch.finfo(torch_dtype).bits // 8
+    if mapping.rank == 0 and not no_header:
+        print(
+            f"{'world_size':<15}, {'dtype':<10}, {'message size':<15}, {'strategy':<15}, {'duration (ms)':<10}"
+        )
     while size < max_size:
         input = torch.ones(size, dtype=torch_dtype, device="cuda")
 
         for strategy in [
-                AllReduceStrategy.RING, AllReduceStrategy.ONESHOT,
+                AllReduceStrategy.NCCL, AllReduceStrategy.ONESHOT,
                 AllReduceStrategy.TWOSHOT
         ]:
             builder = tllm.Builder()
@@ -95,33 +101,40 @@ def allreduce_benchmark(dtype: str, test_range: str = "10,10000000,10"):
             session = tllm.runtime.Session.from_engine(build_engine())
             _, start = cuda.cuEventCreate(0)
             _, stop = cuda.cuEventCreate(0)
+            runtimes = []
             with peer_access(mapping):
                 MPI.COMM_WORLD.barrier()
 
-                cuda.cuEventRecord(start, stream.cuda_stream)
-                session.run(inputs=feed_dict,
-                            outputs={"output": output},
-                            stream=stream.cuda_stream)
-                cuda.cuEventRecord(stop, stream.cuda_stream)
-            torch.cuda.synchronize()
-            _, ms = cuda.cuEventElapsedTime(start, stop)
+                for _ in range(10):
+                    cuda.cuEventRecord(start, stream.cuda_stream)
+                    session.run(inputs=feed_dict,
+                                outputs={"output": output},
+                                stream=stream.cuda_stream)
+                    cuda.cuEventRecord(stop, stream.cuda_stream)
+                    torch.cuda.synchronize()
+                    _, ms = cuda.cuEventElapsedTime(start, stop)
+                    runtimes.append(ms)
+
+            median_ms = sorted(runtimes)[len(runtimes) // 2]
             assert torch.allclose(output, (input * world_size)**inner_loop)
 
             if mapping.rank == 0:
-                print(f"{size=}, {strategy=}, {ms=}")
+                print(
+                    f"{mapping.world_size:<15}, {dtype:<10}, {size:<15}, {strategy.name:<15}, {median_ms:<10.2f}"
+                )
 
         size *= ratio
-        if mapping.rank == 0:
-            print("")
 
 
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--dtype", "-t", default="float16")
-    parser.add_argument("--range",
-                        "-r",
-                        default="256,25600000,10",
-                        help="min_size,max_size,multiplicative_ratio")
+    parser.add_argument(
+        "--range",
+        "-r",
+        default="256,256000000,10",  # 256 to 256M
+        help="min_size,max_size,multiplicative_ratio")
+    parser.add_argument("--no-header", action="store_true")
     args = parser.parse_args()
 
-    allreduce_benchmark(args.dtype, args.range)
+    allreduce_benchmark(args.dtype, args.range, args.no_header)

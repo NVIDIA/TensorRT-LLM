@@ -237,10 +237,11 @@ def get_tokenizer(ckpt_path, max_seq_len):
 
 class Pipeline:
 
-    def __init__(self, tokenizer, model, pad_id, end_id,
+    def __init__(self, tokenizer, model, model_name, pad_id, end_id,
                  max_attention_window_size):
         self.tokenizer = tokenizer
         self.model = model
+        self.model_name = model_name
         self.pad_id = pad_id
         self.end_id = end_id
         self.max_attention_window_size = max_attention_window_size
@@ -294,6 +295,8 @@ class Pipeline:
         return self.tokenizer.decode(output_ids, skip_special_tokens=True)
 
     def check_valid_length(self, prompt):
+        if isinstance(self.model, nn.Module):
+            return True
         return len(self.tokenizer.encode(prompt)) <= self.model.max_input_len
 
 
@@ -333,11 +336,17 @@ def parse_args():
         type=int,
         default=None,
         help=
-        'The attention window size that controls the sliding window attention / cyclic kv cache behaviour'
+        'The attention window size that controls the sliding window attention / cyclic kv cache behavior'
     )
-
+    parser.add_argument(
+        '--tokenizer_dir',
+        default=None,
+        help='tokenizer path; defaults to hf_model_dir if left unspecified')
+    parser.add_argument('--vocab_file')
     parser.add_argument("--test_trt_llm", action="store_true")
     parser.add_argument("--test_hf", action="store_true")
+    parser.add_argument('--check_accuracy', action='store_true')
+    parser.add_argument('--accuracy_threshold', type=float, default=0.3)
 
     args = parser.parse_args()
     return args
@@ -345,6 +354,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.tokenizer_dir is None:
+        args.tokenizer_dir = args.hf_model_dir
     random.seed(RAND_SEED)
     np.random.seed(RAND_SEED)
     runtime_rank = tensorrt_llm.mpi_rank()
@@ -365,10 +376,14 @@ def main():
     }
     cat_cors = {cat: [] for cat in get_categories()}
 
-    model_ckpt_path = args.hf_model_dir
-    model_name = read_model_name(args.engine_dir)
-    tokenizer, pad_id, end_id = load_tokenizer(model_ckpt_path,
-                                               model_name=model_name)
+    model_name, model_version = read_model_name(args.engine_dir)
+    tokenizer, pad_id, end_id = load_tokenizer(
+        tokenizer_dir=args.tokenizer_dir,
+        vocab_file=args.vocab_file,
+        model_name=model_name,
+        model_version=model_version,
+    )
+
     if args.test_trt_llm:
         assert not args.test_hf, "Cannot test both TRT-LLM and HF"
         model = ModelRunner.from_dir(args.engine_dir,
@@ -376,10 +391,10 @@ def main():
                                      debug_mode=args.debug_mode)
     else:
         assert args.test_hf, "Must test either TRT-LLM or HF"
-        if model_name.startswith("chatglm"):
-            auto_model_cls = AutoModel
-        elif model_name.startswith("glm"):
+        if model_name == 'ChatGLMForCausalLM' and model_version == 'glm':
             auto_model_cls = AutoModelForSeq2SeqLM
+        elif model_name == 'ChatGLMForCausalLM' and model_version == 'chatglm':
+            auto_model_cls = AutoModel
         else:
             auto_model_cls = AutoModelForCausalLM
         model = auto_model_cls.from_pretrained(
@@ -394,7 +409,7 @@ def main():
             model.generation_config = GenerationConfig.from_pretrained(
                 args.hf_model_dir, trust_remote_code=True)
 
-    pipeline = Pipeline(tokenizer, model, pad_id, end_id,
+    pipeline = Pipeline(tokenizer, model, model_name, pad_id, end_id,
                         args.max_attention_window_size)
 
     for subject in tqdm(subjects):
@@ -424,6 +439,8 @@ def main():
 
     weighted_acc = np.mean(np.concatenate(all_cors))
     print("Average accuracy: {:.3f}".format(weighted_acc))
+    if args.check_accuracy:
+        assert weighted_acc > args.accuracy_threshold, f"Expected accuracy > {args.accuracy_threshold} while got {weighted_acc}"
     return weighted_acc
 
 

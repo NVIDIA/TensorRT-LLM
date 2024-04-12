@@ -17,9 +17,9 @@ import math
 import numpy as np
 
 from ..._common import default_net
-from ...functional import (ACT2FN, bert_attention, concat, constant, expand,
-                           expand_mask, matmul, select, shape, slice, softmax,
-                           split, unsqueeze)
+from ...functional import (ACT2FN, bert_attention, cast, concat, constant,
+                           expand, expand_mask, matmul, select, shape, slice,
+                           softmax, split, unsqueeze)
 from ...layers import MLP, ColumnLinear, Embedding, LayerNorm, Linear, RowLinear
 from ...mapping import Mapping
 from ...module import Module, ModuleList
@@ -111,6 +111,7 @@ class BertAttention(Module):
             attention_scores = attention_scores / self.norm_factor
 
             if attention_mask is not None:
+                attention_mask = cast(attention_mask, attention_scores.dtype)
                 attention_scores = attention_scores + attention_mask
 
             attention_probs = softmax(attention_scores, dim=-1)
@@ -246,7 +247,7 @@ class BertModel(Module):
                                      sizes=seq_len_2d)
                 position_ids = expand(position_ids, shape(input_ids))
 
-        # creat extended_attention_mask as https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_utils.py
+        # create extended_attention_mask as https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_utils.py
         extended_attention_mask = expand_mask(mask, tgt_len=1)  # BxL -> Bx1x1xL
 
         # create token_type_ids

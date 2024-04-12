@@ -22,8 +22,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import yaml
-from utils.convert import cpu_map_location
-from utils.nemo import unpack_nemo_ckpt
+from convert_checkpoint import cpu_map_location, unpack_nemo_ckpt
 
 from tensorrt_llm._utils import torch_to_numpy
 

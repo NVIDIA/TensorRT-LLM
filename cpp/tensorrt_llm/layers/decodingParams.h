@@ -50,11 +50,10 @@ public:
     // mandatory parameters
     int step;
     int ite;
-    tc::Tensor logits;                          // [local_batch_size, beam_width, vocab_size_padded]
-    tc::Tensor end_ids;                         // [local_batch_size]
-    std::optional<tc::Tensor> batch_slots;      // [local_batch_size]
-    std::optional<tc::Tensor> batch_slots_host; // [local_batch_size]
-    std::optional<tc::Tensor> finished;         // [batch_size * beam_width]
+    tc::Tensor logits;                     // [local_batch_size, beam_width, vocab_size_padded]
+    tc::Tensor end_ids;                    // [local_batch_size]
+    std::optional<tc::Tensor> batch_slots; // [local_batch_size], on pinned memory
+    std::optional<tc::Tensor> finished;    // [batch_size * beam_width]
 };
 
 class DecodingOutputParams
@@ -77,6 +76,12 @@ public:
     std::optional<tc::Tensor> parent_ids; // [max_seq_len, batch_size * beam_width], necessary in beam search
 
     tc::Tensor output_ids_ptr;            // [batch_size] int* (2-d array), each int* has [beam_width, max_seq_len]
+
+    // Medusa params
+    std::optional<tc::Tensor> nextDraftTokens;       // [batch_size, max_draft_tokens_per_step]
+    std::optional<tc::Tensor> acceptedLengths;       // [batch_size]
+    std::optional<tc::Tensor> acceptedLengthsCumSum; // [batch_size + 1]
+    std::optional<tc::Tensor> medusaPathsOffsets;    // [batch_size * max_medusa_heads]
 };
 
 } // namespace tensorrt_llm::layers

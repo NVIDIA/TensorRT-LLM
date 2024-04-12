@@ -42,8 +42,8 @@ public:
     ~NcclCommunicator();
 
     // no copy
-    NcclCommunicator(const NcclCommunicator&) = delete;
-    NcclCommunicator& operator=(const NcclCommunicator&) = delete;
+    NcclCommunicator(NcclCommunicator const&) = delete;
+    NcclCommunicator& operator=(NcclCommunicator const&) = delete;
 
     void send(IBuffer const& buf, int peer, CudaStream const& stream) const
     {

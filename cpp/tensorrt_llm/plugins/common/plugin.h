@@ -46,7 +46,7 @@ namespace tensorrt_llm::plugins
 class BasePlugin : public nvinfer1::IPluginV2DynamicExt
 {
 public:
-    void setPluginNamespace(const char* libNamespace) noexcept override
+    void setPluginNamespace(char const* libNamespace) noexcept override
     {
         mNamespace = libNamespace;
     }
@@ -63,7 +63,7 @@ protected:
 class BaseCreator : public nvinfer1::IPluginCreator
 {
 public:
-    void setPluginNamespace(const char* libNamespace) noexcept override
+    void setPluginNamespace(char const* libNamespace) noexcept override
     {
         mNamespace = libNamespace;
     }
@@ -79,7 +79,7 @@ protected:
 
 // Write values into buffer
 template <typename T>
-void write(char*& buffer, const T& val)
+void write(char*& buffer, T const& val)
 {
     std::memcpy(buffer, &val, sizeof(T));
     buffer += sizeof(T);
@@ -87,7 +87,7 @@ void write(char*& buffer, const T& val)
 
 // Read values from buffer
 template <typename T>
-void read(const char*& buffer, T& val)
+void read(char const*& buffer, T& val)
 {
     std::memcpy(&val, buffer, sizeof(T));
     buffer += sizeof(T);

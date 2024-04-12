@@ -90,6 +90,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                  max_beam_width: Optional[int] = None,
                  max_attention_window_size: Optional[int] = None,
                  sink_token_length: Optional[int] = None,
+                 free_gpu_memory_fraction: Optional[float] = None,
                  debug_mode: bool = False,
                  lora_ckpt_source: str = "hf") -> 'ModelRunnerCpp':
         """
@@ -119,9 +120,11 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 be larger than the engine's max_beam_width; otherwise, the engine's max_beam_width
                 will be used.
             max_attention_window_size (int):
-                The attention window size that controls the sliding window attention / cyclic kv cache behaviour.
+                The attention window size that controls the sliding window attention / cyclic kv cache behavior.
             sink_token_length (int) :
                 The sink token length, default=0.
+            free_gpu_memory_fraction (float) :
+                Free GPU memory fraction that KV cache used.
             debug_mode (bool):
                 Whether or not to turn on the debug mode.
             lora_ckpt_source (str):
@@ -164,6 +167,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                                           max_beam_width=max_beam_width,
                                           max_sequence_length=max_seq_len)
         session_config.kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=free_gpu_memory_fraction,
             max_attention_window=max_attention_window_size,
             sink_token_length=sink_token_length)
         session = GptSession(config=session_config,
@@ -282,7 +286,9 @@ class ModelRunnerCpp(ModelRunnerMixin):
             sampling_config = copy.deepcopy(sampling_config)
         sampling_config.update(**kwargs)
         self._check_inputs(batch_input_ids, sampling_config)
-        gpt_sampling_config = _populate_sampling_config(sampling_config)
+        batch_size = len(batch_input_ids)
+        gpt_sampling_config = _populate_sampling_config(sampling_config,
+                                                        batch_size)
         if lora_uids is not None:
             raise RuntimeError("LoRA is not supported in C++ session.")
         if streaming:
@@ -294,7 +300,6 @@ class ModelRunnerCpp(ModelRunnerMixin):
             raise RuntimeError(
                 "Logits processor is not supported in C++ session.")
 
-        batch_size = len(batch_input_ids)
         batch_input_ids, input_lengths = self._prepare_inputs(
             batch_input_ids, sampling_config.pad_id)
 
@@ -326,10 +331,22 @@ class ModelRunnerCpp(ModelRunnerMixin):
                                      dtype=torch.int32,
                                      device=cuda_device)
         generation_output = GenerationOutput(output_ids, output_lengths)
-        if self.gather_generation_logits:
+        if sampling_config.output_cum_log_probs:
+            generation_output.cum_log_probs = torch.empty(
+                (batch_size, sampling_config.num_beams),
+                dtype=torch.float32,
+                device=cuda_device)
+        if sampling_config.output_log_probs:
+            generation_output.log_probs = torch.empty(
+                (batch_size, sampling_config.num_beams,
+                 self.max_input_len + sampling_config.max_new_tokens),
+                dtype=torch.float32,
+                device=cuda_device)
+        if self.gather_context_logits:
             generation_output.context_logits = torch.empty(
                 (batch_size, self.max_input_len, self.vocab_size_padded),
                 device=cuda_device)
+        if self.gather_generation_logits:
             generation_output.generation_logits = torch.zeros(
                 (batch_size, sampling_config.num_beams,
                  sampling_config.max_new_tokens, self.vocab_size_padded),
@@ -341,6 +358,10 @@ class ModelRunnerCpp(ModelRunnerMixin):
             outputs = {'output_ids': generation_output.ids}
             if sampling_config.output_sequence_lengths:
                 outputs['sequence_lengths'] = generation_output.lengths
+            if sampling_config.output_cum_log_probs:
+                outputs['cum_log_probs'] = generation_output.cum_log_probs
+            if sampling_config.output_log_probs:
+                outputs['log_probs'] = generation_output.log_probs
             if self.gather_context_logits:
                 outputs['context_logits'] = generation_output.context_logits
             if self.gather_generation_logits:
@@ -352,29 +373,129 @@ class ModelRunnerCpp(ModelRunnerMixin):
         return outputs
 
 
-def _populate_sampling_config(
-        sampling_config: SamplingConfig) -> GptSamplingConfig:
+def _populate_sampling_config(sampling_config: SamplingConfig,
+                              batch_size: int) -> GptSamplingConfig:
     gpt_sampling_config = GptSamplingConfig(sampling_config.num_beams)
-    gpt_sampling_config.beam_search_diversity_rate = [
-        sampling_config.beam_search_diversity_rate
-    ]
-    gpt_sampling_config.length_penalty = [sampling_config.length_penalty]
-    gpt_sampling_config.min_length = [sampling_config.min_length]
-    # TODO: cannot set presence_penalty and frequency_penalty?
-    # gpt_sampling_config.presence_penalty = [sampling_config.presence_penalty]
-    # gpt_sampling_config.frequency_penalty = [sampling_config.frequency_penalty]
-    if sampling_config.random_seed is not None:
+
+    if isinstance(sampling_config.beam_search_diversity_rate, torch.Tensor):
+        assert sampling_config.beam_search_diversity_rate.dtype == torch.float32, f"sampling_config.beam_search_diversity_rate.dtype ({sampling_config.beam_search_diversity_rate.dtype}) must be torch.float32"
+        assert sampling_config.beam_search_diversity_rate.shape[
+            0] == batch_size, f"sampling_config.beam_search_diversity_rate.shape[0] ({sampling_config.beam_search_diversity_rate.shape[0]}) must equal to batch_size ({batch_size})"
+        gpt_sampling_config.beam_search_diversity_rate = sampling_config.beam_search_diversity_rate.tolist(
+        )
+    elif sampling_config.beam_search_diversity_rate is not None:
+        gpt_sampling_config.beam_search_diversity_rate = [
+            sampling_config.beam_search_diversity_rate
+        ]
+    else:
+        gpt_sampling_config.beam_search_diversity_rate = None
+
+    if isinstance(sampling_config.length_penalty, torch.Tensor):
+        assert sampling_config.length_penalty.dtype == torch.float32, f"sampling_config.length_penalty.dtype ({sampling_config.length_penalty.dtype}) must be torch.float32"
+        assert sampling_config.length_penalty.shape[
+            0] == batch_size, f"sampling_config.length_penalty.shape[0] ({sampling_config.length_penalty.shape[0]}) must equal to batch_size ({batch_size})"
+        gpt_sampling_config.length_penalty = sampling_config.length_penalty.tolist(
+        )
+    elif sampling_config.length_penalty == 1.0:
+        gpt_sampling_config.length_penalty = None
+    else:
+        gpt_sampling_config.length_penalty = [sampling_config.length_penalty]
+
+    if isinstance(sampling_config.early_stopping, torch.Tensor):
+        assert sampling_config.early_stopping.dtype == torch.int32, f"sampling_config.early_stopping.dtype ({sampling_config.early_stopping.dtype}) must be torch.int32"
+        assert sampling_config.early_stopping.shape[
+            0] == batch_size, f"sampling_config.early_stopping.shape[0] ({sampling_config.early_stopping.shape[0]}) must equal to batch_size ({batch_size})"
+        gpt_sampling_config.early_stopping = sampling_config.early_stopping.tolist(
+        )
+    else:
+        gpt_sampling_config.early_stopping = [sampling_config.early_stopping]
+
+    if isinstance(sampling_config.min_length, torch.Tensor):
+        assert sampling_config.min_length.dtype == torch.int32, f"sampling_config.min_length.dtype ({sampling_config.min_length.dtype}) must be torch.int32"
+        assert sampling_config.min_length.shape[
+            0] == batch_size, f"sampling_config.min_length.shape[0] ({sampling_config.min_length.shape[0]}) must equal to batch_size ({batch_size})"
+        gpt_sampling_config.min_length = sampling_config.min_length.tolist()
+    else:
+        gpt_sampling_config.min_length = [sampling_config.min_length]
+
+    if isinstance(sampling_config.presence_penalty, torch.Tensor):
+        assert sampling_config.presence_penalty.dtype == torch.float32, f"sampling_config.presence_penalty.dtype ({sampling_config.presence_penalty.dtype}) must be torch.float32"
+        assert sampling_config.presence_penalty.shape[
+            0] == batch_size, f"sampling_config.presence_penalty.shape[0] ({sampling_config.presence_penalty.shape[0]}) must equal to batch_size ({batch_size})"
+        gpt_sampling_config.presence_penalty = sampling_config.presence_penalty.tolist(
+        )
+    elif sampling_config.presence_penalty == 0.0:
+        gpt_sampling_config.presence_penalty = None
+    else:
+        gpt_sampling_config.presence_penalty = [
+            sampling_config.presence_penalty
+        ]
+
+    if isinstance(sampling_config.frequency_penalty, torch.Tensor):
+        assert sampling_config.frequency_penalty.dtype == torch.float32, f"sampling_config.frequency_penalty.dtype ({sampling_config.frequency_penalty.dtype}) must be torch.float32"
+        assert sampling_config.frequency_penalty.shape[
+            0] == batch_size, f"sampling_config.frequency_penalty.shape[0] ({sampling_config.frequency_penalty.shape[0]}) must equal to batch_size ({batch_size})"
+        gpt_sampling_config.frequency_penalty = sampling_config.frequency_penalty.tolist(
+        )
+    elif sampling_config.frequency_penalty == 0.0:
+        gpt_sampling_config.frequency_penalty = None
+    else:
+        gpt_sampling_config.frequency_penalty = [
+            sampling_config.frequency_penalty
+        ]
+
+    if isinstance(sampling_config.random_seed, torch.Tensor):
+        assert sampling_config.random_seed.dtype == torch.int64, f"sampling_config.random_seed.dtype ({sampling_config.random_seed.dtype}) must be torch.int64"
+        assert sampling_config.random_seed.shape[
+            0] == batch_size, f"sampling_config.random_seed.shape[0] ({sampling_config.random_seed.shape[0]}) must equal to batch_size ({batch_size})"
+        gpt_sampling_config.random_seed = sampling_config.random_seed.tolist()
+    elif sampling_config.random_seed is not None:
         gpt_sampling_config.random_seed = [sampling_config.random_seed]
-    gpt_sampling_config.repetition_penalty = [
-        sampling_config.repetition_penalty
-    ]
-    gpt_sampling_config.temperature = [sampling_config.temperature]
-    gpt_sampling_config.top_k = [sampling_config.top_k]
-    gpt_sampling_config.top_p = [sampling_config.top_p]
+    else:
+        gpt_sampling_config.random_seed = None
+
+    if isinstance(sampling_config.repetition_penalty, torch.Tensor):
+        assert sampling_config.repetition_penalty.dtype == torch.float32, f"sampling_config.repetition_penalty.dtype ({sampling_config.repetition_penalty.dtype}) must be torch.float32"
+        assert sampling_config.repetition_penalty.shape[
+            0] == batch_size, f"sampling_config.repetition_penalty.shape[0] ({sampling_config.repetition_penalty.shape[0]}) must equal to batch_size ({batch_size})"
+        gpt_sampling_config.repetition_penalty = sampling_config.repetition_penalty.tolist(
+        )
+    elif sampling_config.repetition_penalty == 1.0:
+        gpt_sampling_config.repetition_penalty = None
+    else:
+        gpt_sampling_config.repetition_penalty = [
+            sampling_config.repetition_penalty
+        ]
+
+    if isinstance(sampling_config.temperature, torch.Tensor):
+        assert sampling_config.temperature.dtype == torch.float32, f"sampling_config.temperature.dtype ({sampling_config.temperature.dtype}) must be torch.float32"
+        assert sampling_config.temperature.shape[
+            0] == batch_size, f"sampling_config.temperature.shape[0] ({sampling_config.temperature.shape[0]}) must equal to batch_size ({batch_size})"
+        gpt_sampling_config.temperature = sampling_config.temperature.tolist()
+    else:
+        gpt_sampling_config.temperature = [sampling_config.temperature]
+
+    if isinstance(sampling_config.top_k, torch.Tensor):
+        assert sampling_config.top_k.dtype == torch.int32, f"sampling_config.top_k.dtype ({sampling_config.top_k.dtype}) must be torch.int32"
+        assert sampling_config.top_k.shape[
+            0] == batch_size, f"sampling_config.top_k.shape[0] ({sampling_config.top_k.shape[0]}) must equal to batch_size ({batch_size})"
+        gpt_sampling_config.top_k = sampling_config.top_k.tolist()
+    else:
+        gpt_sampling_config.top_k = [sampling_config.top_k]
+
+    if isinstance(sampling_config.top_p, torch.Tensor):
+        assert sampling_config.top_p.dtype == torch.float32, f"sampling_config.top_p.dtype ({sampling_config.top_p.dtype}) must be torch.float32"
+        assert sampling_config.top_p.shape[
+            0] == batch_size, f"sampling_config.top_p.shape[0] ({sampling_config.top_p.shape[0]}) must equal to batch_size ({batch_size})"
+        gpt_sampling_config.top_p = sampling_config.top_p.tolist()
+    else:
+        gpt_sampling_config.top_p = [sampling_config.top_p]
+
     if sampling_config.top_p_decay is not None:
-        gpt_sampling_config.top_p_decay = [sampling_config.top_p_decay]
+        gpt_sampling_config.top_p_decay = sampling_config.top_p_decay.tolist()
     if sampling_config.top_p_min is not None:
-        gpt_sampling_config.top_p_min = [sampling_config.top_p_min]
+        gpt_sampling_config.top_p_min = sampling_config.top_p_min.tolist()
     if sampling_config.top_p_reset_ids is not None:
-        gpt_sampling_config.top_p_reset_ids = [sampling_config.top_p_reset_ids]
+        gpt_sampling_config.top_p_reset_ids = sampling_config.top_p_reset_ids.tolist(
+        )
     return gpt_sampling_config

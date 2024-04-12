@@ -19,7 +19,6 @@ import unittest
 from itertools import product
 
 import numpy as np
-import pytest
 
 # isort: off
 import torch
@@ -34,10 +33,11 @@ from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-from examples.gptj.convert_checkpoint import convert_hf_gptj  # isort:skip
+
+from examples.gptj.convert_checkpoint import convert_hf_gptj
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import getSMVersion
+from utils.util import skip_fp32_accum_pre_ampere, unittest_name_func
 
 
 class TestGPTJ(unittest.TestCase):
@@ -167,15 +167,11 @@ class TestGPTJ(unittest.TestCase):
 
         return test_cases
 
-    @parameterized.expand(load_test_cases)
+    @parameterized.expand(load_test_cases, name_func=unittest_name_func)
     def test_gptj_plugin(self, context_fmha_flag, enable_remove_input_padding):
 
         # Skip tests that are not supported in pre-ampere architecture
-        if getSMVersion() < 80:
-            if context_fmha_flag == ContextFMHAType.enabled_with_fp32_acc:
-                pytest.skip(
-                    "ContextFMHAType with fp32 acc is not supported in pre-ampere architecture"
-                )
+        skip_fp32_accum_pre_ampere(context_fmha_flag)
 
         torch.random.manual_seed(0)
         use_refit = False
@@ -248,10 +244,10 @@ class TestGPTJ(unittest.TestCase):
                 'sequence_length': sequence_length,
                 'host_sink_token_length': host_sink_token_length,
             }
+            ctx_buffer[
+                f'host_max_attention_window_sizes'] = host_max_attention_window_sizes
             for i in range(gpt_config.n_layer):
                 ctx_buffer[f'past_key_value_{i}'] = key_value_cache_buffers[i]
-                ctx_buffer[
-                    f'host_max_attention_window_size_{i}'] = host_max_attention_window_sizes
                 ctx_buffer[f'present_key_value_{i}'] = key_value_cache_buffers[
                     i]
 
@@ -325,7 +321,8 @@ class TestGPTJ(unittest.TestCase):
                                               dtype=torch.int32).cpu()
             host_past_key_value_lengths = torch.tensor([0] * batch_size,
                                                        dtype=torch.int32)
-            host_max_attention_window_sizes = torch.tensor([total_seq_len],
+            host_max_attention_window_sizes = torch.tensor([total_seq_len] *
+                                                           gpt_config.n_layer,
                                                            dtype=torch.int32)
             host_sink_token_length = torch.tensor([0], dtype=torch.int32)
 
@@ -406,7 +403,8 @@ class TestGPTJ(unittest.TestCase):
             host_past_key_value_lengths = torch.tensor([seq_len] * batch_size,
                                                        dtype=torch.int32)
 
-            host_max_attention_window_sizes = torch.tensor([total_seq_len],
+            host_max_attention_window_sizes = torch.tensor([total_seq_len] *
+                                                           gpt_config.n_layer,
                                                            dtype=torch.int32)
 
             host_sink_token_length = torch.tensor([0], dtype=torch.int32)

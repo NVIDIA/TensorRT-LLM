@@ -22,7 +22,7 @@
 namespace
 {
 
-__global__ void checkTensorNanKernel(const float* data, std::size_t size, int* foundNan)
+__global__ void checkTensorNanKernel(float const* data, std::size_t size, int* foundNan)
 {
     auto tidx = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -47,18 +47,18 @@ namespace tc = tensorrt_llm::common;
 namespace tensorrt_llm::runtime::utils
 {
 
-void invokeCheckTensorNanKernel(const float* data, std::size_t size, int* foundNan, cudaStream_t stream)
+void invokeCheckTensorNanKernel(float const* data, std::size_t size, int* foundNan, cudaStream_t stream)
 {
     constexpr uint32_t kThreadsPerCta = 256;
     checkTensorNanKernel<<<tc::ceilDiv(size, kThreadsPerCta), kThreadsPerCta, 0, stream>>>(data, size, foundNan);
 }
 
-bool tensorHasNan(const IBuffer& tensor, BufferManager& manager)
+bool tensorHasNan(IBuffer const& tensor, BufferManager& manager)
 {
     auto foundNan = manager.pinned(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
     auto foundNanPtr = bufferCast<int32_t>(*foundNan);
     foundNanPtr[0] = 0;
-    const auto size = tensor.getSize();
+    auto const size = tensor.getSize();
     invokeCheckTensorNanKernel(bufferCast<float>(tensor), size, foundNanPtr, manager.getStream().get());
     manager.getStream().synchronize();
     return static_cast<bool>(foundNanPtr[0]);

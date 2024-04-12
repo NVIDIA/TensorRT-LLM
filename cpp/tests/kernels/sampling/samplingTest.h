@@ -22,6 +22,7 @@
 
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/penaltyKernels.h"
+#include "tensorrt_llm/kernels/samplingAirTopPKernels.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
 #include "tensorrt_llm/kernels/samplingTopPKernels.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
@@ -35,6 +36,7 @@ namespace tensorrt_llm::tests::kernels::sampling
 typedef testing::Types<float, half> FloatAndHalfTypes;
 
 constexpr float EPSILON = 1e-20f;
+constexpr float HALF_FLT_MAX = 65504.f;
 
 inline bool almostEqual(float a, float b, float atol = 1e-5, float rtol = 1e-8)
 {
@@ -119,7 +121,7 @@ bool checkResult(std::string name, T* out, T* ref, size_t size)
 /////////////////////////////////// Tests //////////////////////////////////////////
 
 template <typename T>
-void computeProb(T* probs, const T* logits, int batchSize, int vocabSize)
+void computeProb(T* probs, T const* logits, int batchSize, int vocabSize)
 {
     // Compute the log probability from logits.
     //   logits = batchSize x vocabSize.
@@ -152,7 +154,7 @@ void computeProb(T* probs, const T* logits, int batchSize, int vocabSize)
 }
 
 template <typename T>
-void computeLogProb(T* logprobs, const T* logits, int batchSize, int vocabSize)
+void computeLogProb(T* logprobs, T const* logits, int batchSize, int vocabSize)
 {
     // Compute the log probability from logits.
     //   logits = batchSize x vocabSize.
@@ -188,10 +190,14 @@ struct SamplingKernelTestParam
 {
     int32_t batchSize;
     int32_t vocabSize;
-    uint32_t topK;
-    float topP;
-    int32_t outputLen;
-    bool normalizeLogProbs = false;
+    uint32_t topK{1};
+    float topP{0.f};
+    bool normalizeLogProbs{false};
+    bool logitsHasProbs{true};
+    int32_t maxTokensPerStep{1};
+    bool returnAllTopK{false};
+    bool useLogitsPtrs{false};
+    bool isDeterministicTopP{false};
 
     SamplingKernelTestParam& setBatchSize(int32_t bs)
     {
@@ -217,16 +223,35 @@ struct SamplingKernelTestParam
         return *this;
     }
 
-    SamplingKernelTestParam& setOutputLen(int32_t ol)
+    SamplingKernelTestParam& setMaxTokensPerStep(int32_t ts)
     {
-        outputLen = ol;
+        maxTokensPerStep = ts;
+        return *this;
+    }
+
+    SamplingKernelTestParam& setReturnAllTopK()
+    {
+        returnAllTopK = true;
+        return *this;
+    }
+
+    SamplingKernelTestParam& setUseLogitsPtrs()
+    {
+        useLogitsPtrs = true;
+        return *this;
+    }
+
+    SamplingKernelTestParam& setDeterministicTopP(bool isDeter)
+    {
+        isDeterministicTopP = isDeter;
         return *this;
     }
 
     std::string toString() const
     {
-        return tensorrt_llm::common::fmtstr("SamplingKernelTestParam[batch=%d, vocab=%d, k=%u, p=%3.1f, output_len=%d]",
-            batchSize, vocabSize, topK, topP, outputLen);
+        return tensorrt_llm::common::fmtstr(
+            "SamplingKernelTestParam[batch=%d, vocab=%d, k=%u, p=%3.1f, tokens_per_step=%d]", batchSize, vocabSize,
+            topK, topP, maxTokensPerStep);
     }
 };
 
@@ -239,34 +264,28 @@ public:
     void SetUp() override;
     void TearDown() override;
 
-    void runTest(const SamplingKernelTestParam& param);
+    void runTest(SamplingKernelTestParam const& param);
 
 protected:
-    virtual size_t getWorkspaceSize(const SamplingKernelTestParam& param)
+    virtual size_t getWorkspaceSize(SamplingKernelTestParam const& param)
     {
         throw std::logic_error("Not implemented");
     };
 
-    virtual void callTestedFunction(
-        const SamplingKernelTestParam& param, bool hasDiffRuntimeArgs, size_t workspaceSize, TensorPtr& workspaceDevice)
+    virtual void callTestedFunction(SamplingKernelTestParam const& param, TensorPtr& workspaceDevice)
     {
         throw std::logic_error("Not implemented");
     }
 
-    void allocateBuffers(
-        int32_t batchSize, int32_t maxBatchSize, int32_t vocabSize, int32_t maxSeqLen, int32_t outputLen);
-
-    void setupBuffers(int32_t batchSize, int32_t maxBatchSize, int32_t vocabSize, int32_t maxSeqLen, int32_t outputLen,
-        int32_t topK, float topP, bool useSkipDecode, bool hasDiffRuntimeArgs, std::mt19937& gen,
-        std::uniform_int_distribution<>& endIdsDistr);
-
-    void verifyCurrentStep(int32_t batchSize, int32_t maxBatchSize, int32_t vocabSize, int32_t maxSeqLen, int32_t step,
-        bool greedySearch, bool useSkipDecode, bool hasDiffRuntimeArgs,
-        std::vector<tensorrt_llm::kernels::FinishedState>& refFinished, std::vector<int32_t>& refSeqLength,
-        const std::vector<tensorrt_llm::kernels::FinishedState>& finishedCurrentStep);
-
 private:
-    void runTest(const SamplingKernelTestParam& param, bool hasDiffRuntimeArgs, bool useSkipDecode);
+    void allocateBuffers(SamplingKernelTestParam const& param);
+
+    void setupBuffers(SamplingKernelTestParam const& param);
+
+    void verifyResult(SamplingKernelTestParam const& param);
+
+    std::vector<int32_t> computeTopKTopPVariants(
+        int32_t bi, int32_t batchSlot, int32_t ti, int32_t tokensPerStep, int32_t vocabSize);
 
 protected:
     std::shared_ptr<tensorrt_llm::runtime::BufferManager> mBufferManager;
@@ -286,6 +305,7 @@ protected:
 
     TensorPtr mProbsHost;
     TensorPtr mProbsDevice;
+    TensorPtr mProbsPtrsDevice;
 
     TensorPtr mCumLogProbsDevice;
     TensorPtr mOutputLogProbsDevice;
@@ -310,14 +330,17 @@ protected:
     TensorPtr mSkipDecodeHost;
     TensorPtr mSkipDecodeDevice;
 
+    TensorPtr mTokensPerStep;
+
     TensorPtr mBatchSlots;
 
     TensorPtr mExpectedCumLogProbsHost;
 
-    int32_t mMaxTopK;
-    float mMaxTopP;
+    TensorPtr mCurandStatesDevice;
 
-    curandState_t* mCurandStatesDevice;
+    int32_t mMaxTopK;
+    static constexpr int32_t mMaxSeqLen = 2048;
+    float mMaxTopP;
 };
 
 } // namespace tensorrt_llm::tests::kernels::sampling
