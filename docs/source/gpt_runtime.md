@@ -125,14 +125,14 @@ value for a given parameter, the vector can be limited to a single element
  * `temperature`, a vector of floating-point numbers to control the
    modulation of logits when sampling new tokens. It can have any value `> 0.0f`. The default value is `1.0f`(no modulation).
  * `minLength`, a vector of integers to set a lower-bound on the number of tokens
-   generated. It can have any value. Values `< 1` have no effect, the first generated token can be EOS. The default value is `1` (at least one non-EOS token is generated).
+   generated. It can have any value `>= 0`. Value `0` has no effect, the first generated token can be EOS. The default value is `1` (at least one non-EOS token is generated).
  * `repetitionPenalty`, a vector of float-point numbers to penalize tokens
-   based on how often they appear in the sequence. It can have any value `> 0.0f`. Repetition penalty `< 1.0f` encourages repetition, `> 1.0f` discourages it. The default value is `1.0f` (no effect).
+    (irrespective of the number of appearances). It is multiplicative penalty. It can have any value `> 0.0f`. Repetition penalty `< 1.0f` encourages repetition, `> 1.0f` discourages it. The default value is `1.0f` (no effect).
  * `presencePenalty`, a vector of float-point numbers to penalize tokens
-   already present in the sequence (irrespective of the number of appearances).
+   already present in the sequence (irrespective of the number of appearances). It is additive penalty.
    It can have any value, values `< 0.0f` encourage repetition, `> 0.f` discourage it. The default value is `0.0f` (no effect).
  * `frequencyPenalty`, a vector of float-point numbers to penalize tokens
-   already present in the sequence (dependent on the number of appearances). It can have any value, values `< 0.0f` encourage repetition, `> 0.0f` discourage it.
+   already present in the sequence (dependent on the number of appearances). It is additive penalty. It can have any value, values `< 0.0f` encourage repetition, `> 0.0f` discourage it.
    The default value is `0.0f`(no effect).
 
 The parameters `repetitionPenalty`, `presencePenalty`, and `frequencyPenalty` are not mutually
@@ -143,18 +143,21 @@ exclusive.
  * `randomSeed`, a vector of 64-bit integers to control the random seed used by
    the random number generator in sampling. Its default value is `0`,
  * `topK`, a vector of integers to control the number of logits to sample from.
-   Its default value is `0`. If different values are provided for the
+   Must be in range of `[0, 1024]`. Its default value is `0`.
+   Note that if different values are provided for the
    different sequences in the batch, the performance of the implementation will
    depend on the largest value. For efficiency reasons, we recommend to batch
    requests with similar `topK` values together,
  * `topP`, a vector of floating-point values to control the top-P probability
-   to sample from. Its default value is `0.f`,
+   to sample from. Must be in range of `[0.f, 1.f]`. Its default value is `0.f`,
  * `topPDecay`, `topPMin` and `topPResetIds`, vectors to control the decay in
    the `topP` algorithm. The `topP` values are modulated by
    a decay that exponentially depends on the length of the sequence as explained in
    [_Factuality Enhanced Language Models for Open-Ended Text Generation_](https://arxiv.org/abs/2206.04624).
    `topPDecay` is the decay, `topPMin` is the lower-bound and `topPResetIds`
-   indicates where to reset the decay. Defaults are `1.f`, `1.0e-6,f`, and `-1`,
+   indicates where to reset the decay.
+   `topPDecay`, `topPMin` must be in ranges of `(0.f, 1.f]` and `(0.f, 1.f]` respectively.
+   Defaults are `1.f`, `1.0e-6,f` and `-1`,
 
 If both `topK` and `topP` fields are set, the `topK` method will be run for
 sequences with a `topK` value greater than `0.f`. In that case, the `topP`
@@ -169,7 +172,7 @@ sequences. If both `topK` and `topP` are zero, greedy search is performed.
    is no explicit upper-bound on the beam width but increasing the beam width
    will likely increase the latency. Use `1` to disable beam-search,
  * `beamSearchDiversityRate`, a floating-point value that controls the
-   diversity in beam-search. Its default value is `0.f`,
+   diversity in beam-search. It can have any value  `>= 0.0f`. The default value is `0.f`,
  * `lengthPenalty`, a floating-point value that controls how to penalize the
    longer sequences in beam-search (the log-probability of a sequence will be
    penalized by a factor that depends on `1.f / (length ^ lengthPenalty)`). The

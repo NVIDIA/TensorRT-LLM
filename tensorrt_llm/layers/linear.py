@@ -118,7 +118,6 @@ class Linear(Module):
                  out_features,
                  bias=True,
                  dtype=None,
-                 use_fp8=False,
                  tp_group=None,
                  tp_size=1,
                  gather_output=True,
@@ -129,12 +128,11 @@ class Linear(Module):
         self.in_features = in_features
         self.out_features = out_features // tp_size
         self.dtype = dtype
-        self.use_fp8 = use_fp8
         self.pad_lda = pad_lda
 
         if not share_weight:
             self.weight = Parameter(shape=(self.out_features, self.in_features),
-                                    dtype=('fp8' if use_fp8 else dtype))
+                                    dtype=dtype)
             set_obj_attrs(self.weight, {
                 "weight_loader": self.weight_loader,
             })
@@ -154,18 +152,20 @@ class Linear(Module):
         else:
             self.register_parameter('bias', None)
 
-    def multiply_gather(self,
-                        x,
-                        weight,
-                        gemm_plugin,
-                        lora_runtime_params: LoraRuntimeParams = None):
+    def multiply_gather(
+            self,
+            x,
+            weight,
+            gemm_plugin: Optional[str] = None,
+            use_fp8: bool = False,
+            lora_runtime_params: Optional[LoraRuntimeParams] = None):
         hidden_state = x
         if gemm_plugin:
             x = _gemm_plugin(x,
                              weight,
                              transb=True,
                              pad_lda=self.pad_lda,
-                             use_fp8=self.use_fp8,
+                             use_fp8=use_fp8,
                              strict_dtype=self.strict_dtype)
         else:
             x = matmul(x, weight, transb=True)
@@ -185,11 +185,14 @@ class Linear(Module):
 
         return x
 
-    def forward(self, x, lora_runtime_params: LoraRuntimeParams = None):
-        return self.multiply_gather(x,
-                                    self.weight.value,
-                                    default_net().plugin_config.gemm_plugin,
-                                    lora_runtime_params=lora_runtime_params)
+    def forward(self,
+                x,
+                lora_runtime_params: Optional[LoraRuntimeParams] = None):
+        return self.multiply_gather(
+            x,
+            self.weight.value,
+            gemm_plugin=default_net().plugin_config.gemm_plugin,
+            lora_runtime_params=lora_runtime_params)
 
     def weight_loader(self, mapping: Mapping, param: Parameter,
                       loaded_weight: torch.Tensor):
@@ -253,7 +256,6 @@ class RowLinear(Module):
                  out_features,
                  bias=True,
                  dtype=None,
-                 use_fp8=False,
                  tp_group=None,
                  tp_size=1,
                  strict_dtype: bool = False,
@@ -262,11 +264,10 @@ class RowLinear(Module):
         self.in_features = in_features // tp_size
         self.out_features = out_features
         self.dtype = dtype
-        self.use_fp8 = use_fp8
         self.pad_lda = pad_lda
 
         self.weight = Parameter(shape=(self.out_features, self.in_features),
-                                dtype=('fp8' if use_fp8 else dtype))
+                                dtype=dtype)
         set_obj_attrs(self.weight, {
             "weight_loader": self.weight_loader,
         })
@@ -280,19 +281,20 @@ class RowLinear(Module):
         self.tp_size = tp_size
         self.strict_dtype = self.dtype if strict_dtype else None
 
-    def multiply_reduce(self,
-                        x,
-                        weight,
-                        gemm_plugin,
-                        use_fp8=False,
-                        lora_runtime_params: LoraRuntimeParams = None):
+    def multiply_reduce(
+            self,
+            x,
+            weight,
+            gemm_plugin: Optional[str] = None,
+            use_fp8: bool = False,
+            lora_runtime_params: Optional[LoraRuntimeParams] = None):
         hidden_state = x
         if gemm_plugin:
             x = _gemm_plugin(x,
                              weight,
                              transb=True,
                              pad_lda=self.pad_lda,
-                             use_fp8=self.use_fp8,
+                             use_fp8=use_fp8,
                              strict_dtype=self.strict_dtype)
         else:
             x = matmul(x, weight, transb=True)
@@ -311,11 +313,14 @@ class RowLinear(Module):
 
         return x
 
-    def forward(self, x, lora_runtime_params: LoraRuntimeParams = None):
-        return self.multiply_reduce(x,
-                                    self.weight.value,
-                                    default_net().plugin_config.gemm_plugin,
-                                    lora_runtime_params=lora_runtime_params)
+    def forward(self,
+                x,
+                lora_runtime_params: Optional[LoraRuntimeParams] = None):
+        return self.multiply_reduce(
+            x,
+            self.weight.value,
+            gemm_plugin=default_net().plugin_config.gemm_plugin,
+            lora_runtime_params=lora_runtime_params)
 
     def weight_loader(self, mapping: Mapping, param: Parameter,
                       loaded_weight: torch.Tensor):

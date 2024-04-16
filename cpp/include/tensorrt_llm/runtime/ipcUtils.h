@@ -31,7 +31,8 @@ class IpcMemory
 public:
     using TensorPtr = ITensor::SharedPtr;
 
-    size_t static constexpr FLAGS_SIZE = kernels::MAX_ALL_REDUCE_BLOCKS * sizeof(uint32_t);
+    // MAX_ALL_REDUCE_BLOCKS for block_barrier, 1 for multi_gpu_barrier
+    size_t static constexpr FLAGS_SIZE = (kernels::MAX_ALL_REDUCE_BLOCKS + 1) * sizeof(uint32_t);
 
     IpcMemory(WorldConfig const& worldConfig, std::size_t bufferSize);
     ~IpcMemory();

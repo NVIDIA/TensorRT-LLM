@@ -311,7 +311,7 @@ public:
         tk::invokeLengthCriterion(
             reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*mFinished)),
             bufferCast<SizeType>(*mFinishedSum),
-            reinterpret_cast<uint32_t const*>(bufferCast<SizeType>(*mSequenceLengthLimits)),
+            reinterpret_cast<SizeType32 const*>(bufferCast<SizeType>(*mSequenceLengthLimits)),
             bufferCast<SizeType>(*mSequenceLengths), bufferCast<int32_t>(*mBatchSlots), batchSize, beamWidth,
             mStream->get());
 

@@ -60,11 +60,11 @@ struct BeamHypotheses
     float* cum_log_probs{nullptr};      // [BS, BM]         %% self.cum_log_probs
 
     // Pointers of CBA
-    int* output_ids_cba{nullptr};       // [BS, BM*2, mSL]  %% self.beam_hyps_output_ids_tgt
-    float* log_probs_cba{nullptr};      // [BS, BM*2, mSL]  %% self.beam_hyps_log_probs
-    int* seq_len_cba{nullptr};          // [BS, BM*2]       %% self.beam_hyps_sequence_lengths_tgt
-    float* cum_log_probs_cba{nullptr};  // [BS, BM*2]       %% self.beam_hyps_cum_log_probs
-    float* normed_scores_cba{nullptr};  // [BS, BM*2]       %% self.beam_hyps_normed_scores
+    int* output_ids_cba{nullptr};       // [BS, BM*2, mSL]  %% self.beam_hyps_output_ids_cba
+    float* log_probs_cba{nullptr};      // [BS, BM*2, mSL]  %% self.beam_hyps_log_probs_cba
+    int* seq_len_cba{nullptr};          // [BS, BM*2]       %% self.beam_hyps_seq_len_cba
+    float* cum_log_probs_cba{nullptr};  // [BS, BM*2]       %% self.beam_hyps_cum_log_probs_cba
+    float* normed_scores_cba{nullptr};  // [BS, BM*2]       %% self.beam_hyps_normed_scores_cba
     int* num_beams{nullptr};            // [BS]             %% self.beam_hyps_num_beams             number of beams in CBA
     float* min_normed_scores{nullptr};  // [BS]             %% self.beam_hyps_min_normed_scores     worst score in CBA
 

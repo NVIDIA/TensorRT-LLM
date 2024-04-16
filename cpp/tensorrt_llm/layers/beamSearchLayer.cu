@@ -18,6 +18,7 @@
 #include "tensorrt_llm/kernels/beamSearchKernels.h"
 #include "tensorrt_llm/layers/beamSearchLayer.h"
 #include "tensorrt_llm/layers/fillBuffers.h"
+#include <limits>
 
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::kernels;
@@ -66,10 +67,17 @@ void BeamSearchLayer<T>::setup(
     mEarlyStoppingHost.resize(batch_size);
     allocateBuffer(batch_size, beam_width);
 
+    auto constexpr fltMax = std::numeric_limits<float>::max();
+    auto constexpr fltMin = std::numeric_limits<float>::lowest();
+    auto constexpr fltEpsilon = std::numeric_limits<float>::epsilon();
+
     FillBuffers const fillBuffers{batch_size, batch_size, mStream};
-    fillBuffers(setupParams.beam_search_diversity_rate, 0.0f, mDiversityRateHost, mDiversityRateDevice, (int*) nullptr);
-    fillBuffers(setupParams.length_penalty, 0.0f, mLengthPenaltyHost, mLengthPenaltyDevice, (int*) nullptr);
-    fillBuffers(setupParams.early_stopping, 1, mEarlyStoppingHost, mEarlyStoppingDevice, (int*) nullptr);
+    fillBuffers(setupParams.beam_search_diversity_rate, 0.0f, mDiversityRateHost, mDiversityRateDevice, (int*) nullptr,
+        std::make_pair(-fltEpsilon, fltMax), "diveristy rate");
+    fillBuffers(setupParams.length_penalty, 0.0f, mLengthPenaltyHost, mLengthPenaltyDevice, (int*) nullptr,
+        std::make_pair(fltMin, fltMax), "length penalty");
+    fillBuffers(setupParams.early_stopping, 1, mEarlyStoppingHost, mEarlyStoppingDevice, (int*) nullptr,
+        std::make_pair(fltMin, fltMax), "early stopping");
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -131,7 +139,7 @@ void BeamSearchLayer<T>::forward(OutputParams& op, ForwardParams const& fp)
     TLLM_CHECK_WITH_INFO(fp.ite == 0, "Pipeline Parallelism is not supported yet !");
 
     BeamHypotheses& bh{*op.beamHypotheses};
-    bh.batch_size = static_cast<std::int32_t>(fp.end_ids.shape[0]);
+    bh.batch_size = static_cast<std::int32_t>(op.output_ids_ptr.shape[0]);
     bh.beam_width = static_cast<std::int32_t>(op.output_ids_ptr.shape[1]);
     bh.ite = fp.ite;
     bh.local_batch_size = fp.logits.shape[0];

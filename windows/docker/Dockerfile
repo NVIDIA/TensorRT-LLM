@@ -13,7 +13,8 @@ SHELL ["cmd", "/S", "/C"]
 
 RUN powershell -Command \
     $ErrorActionPreference = 'Stop'; \
-    Invoke-WebRequest -Uri https://developer.download.nvidia.com/compute/cuda/12.2.2/local_installers/cuda_12.2.2_537.13_windows.exe \
+    $ProgressPreference = 'SilentlyContinue'; \
+    Invoke-WebRequest -Uri https://developer.download.nvidia.com/compute/cuda/12.3.2/local_installers/cuda_12.3.2_546.12_windows.exe \
     -OutFile "cuda_installer.exe"; \
     Start-Process cuda_installer.exe -Wait -ArgumentList '-s'; \
     Remove-Item cuda_installer.exe -Force
@@ -25,6 +26,7 @@ RUN powershell -Command \
 # Download and install Python
 RUN powershell -Command \
     $ErrorActionPreference = 'Stop'; \
+    $ProgressPreference = 'SilentlyContinue'; \
     Invoke-WebRequest -Uri https://www.python.org/ftp/python/3.10.11/python-3.10.11-amd64.exe -OutFile python-3.10.11.exe ; \
     Start-Process python-3.10.11.exe -Wait -ArgumentList '/quiet InstallAllUsers=1 PrependPath=1' ; \
     Remove-Item python-3.10.11.exe -Force
@@ -43,6 +45,7 @@ RUN powershell -Command \
 # We use 10.1.1 which has a release on the GitHub page
 RUN powershell -Command \
     $ErrorActionPreference = 'Stop'; \
+    $ProgressPreference = 'SilentlyContinue'; \
     Invoke-WebRequest -Uri https://github.com/microsoft/Microsoft-MPI/releases/download/v10.1.1/msmpisetup.exe \
     -OutFile "msmpisetup.exe"; \
     Start-Process .\msmpisetup.exe -Wait ; \
@@ -54,6 +57,7 @@ RUN setx Path "%Path%;C:\Program Files\Microsoft MPI\Bin"
 # Download the MSMPI SDK
 RUN powershell -Command \
     $ErrorActionPreference = 'Stop'; \
+    $ProgressPreference = 'SilentlyContinue'; \
     Invoke-WebRequest -Uri https://github.com/microsoft/Microsoft-MPI/releases/download/v10.1.1/msmpisdk.msi \
     -OutFile "msmpisdk.msi"; \
     Start-Process msiexec.exe -Wait -ArgumentList '/I msmpisdk.msi /quiet'; \
@@ -65,6 +69,7 @@ RUN powershell -Command \
 
 RUN powershell -Command \
     $ErrorActionPreference = 'Stop'; \
+    $ProgressPreference = 'SilentlyContinue'; \
     Invoke-WebRequest -Uri https://github.com/Kitware/CMake/releases/download/v3.27.7/cmake-3.27.7-windows-x86_64.msi \
     -OutFile "cmake.msi"; \
     Start-Process msiexec.exe -Wait -ArgumentList '/I cmake.msi /quiet'; \
@@ -102,6 +107,7 @@ RUN \
 
 RUN powershell -Command \
     $ErrorActionPreference = 'Stop'; \
+    $ProgressPreference = 'SilentlyContinue'; \
     Invoke-WebRequest -Uri https://ftp.nluug.nl/pub/vim/pc/gvim90.exe \
     -OutFile "install_vim.exe"; \
     Start-Process install_vim.exe -Wait -ArgumentList '/S'; \
@@ -137,21 +143,20 @@ RUN powershell -Command \
 # -----------------------------------------------------------------------------
 
 # Install CUDA 11.8 NVTX
+RUN powershell -Command \
+    $ErrorActionPreference = 'Stop'; \
+    $ProgressPreference = 'SilentlyContinue'; \
+    Invoke-WebRequest -Uri https://developer.download.nvidia.com/compute/cuda/11.8.0/network_installers/cuda_11.8.0_windows_network.exe \
+    -OutFile cuda_11.8.0_windows_network.exe; \
+    Invoke-WebRequest -Uri https://7-zip.org/a/7zr.exe \
+    -OutFile 7zr.exe
 
-#RUN powershell -Command \
-#    $ErrorActionPreference = 'Stop'; \
-#    Invoke-WebRequest -Uri https://developer.download.nvidia.com/compute/cuda/11.8.0/network_installers/cuda_11.8.0_windows_network.exe \
-#    -OutFile "cuda_11_installer.exe"; \
-#    Start-Process cuda_11_installer.exe -Wait -ArgumentList '-s nvtx_11.8'; \
-#    Remove-Item cuda_11_installer.exe -Force
-
-# The above command-line installation method installs NVTX headers at
-# C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\include\nvtx3\
-# CMake can't find this location for some reason.
-# Instead, we just copy the older NvToolsExt version to where CMake expects.
-# This assumes NvToolsExt was installed on the host machine using the
-# CUDA 11.8 GUI installer and copied to the build context
-COPY ["NvToolsExt", "C:\\\\Program Files\\\\NVIDIA Corporation\\\\NvToolsExt"]
+RUN \
+    7zr.exe e -i!"nsight_nvtx\nsight_nvtx\NVIDIA NVTX Installer.x86_64.Release.v1.21018621.Win64.msi" cuda_11.8.0_windows_network.exe &&\
+    msiexec.exe /i "NVIDIA NVTX Installer.x86_64.Release.v1.21018621.Win64.msi" /norestart /quiet &&\
+    del "NVIDIA NVTX Installer.x86_64.Release.v1.21018621.Win64.msi" &&\
+    del 7zr.exe &&\
+    del cuda_11.8.0_windows_network.exe
 
 # -----------------------------------------------------------------------------
 
@@ -160,27 +165,39 @@ WORKDIR "C:\\\\workspace"
 
 # -----------------------------------------------------------------------------
 
-# Download and unzip TensorrRT 9.2.0.5 for TensorRT-LLM
+# Download and unzip TensorrRT 9.3.0.1 for TensorRT-LLM
 RUN powershell -Command \
     $ErrorActionPreference = 'Stop'; \
-    Invoke-WebRequest -Uri https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/9.2.0/tensorrt-9.2.0.5.windows10.x86_64.cuda-12.2.llm.beta.zip \
-    -OutFile TensorRT-9.2.0.5.zip; \
-    Expand-Archive .\TensorRT-9.2.0.5.zip -DestinationPath .; \
-    Remove-Item TensorRT-9.2.0.5.zip -Force
+    $ProgressPreference = 'SilentlyContinue'; \
+    Invoke-WebRequest -Uri https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/9.3.0/tensorrt-9.3.0.1.windows10.win10.cuda-12.2.llm.beta.zip \
+    -OutFile TensorRT-9.3.0.1.zip; \
+    Expand-Archive .\TensorRT-9.3.0.1.zip -DestinationPath .; \
+    Move-Item -Path .\TensorRT-9.3.0.1.Windows10.win10.cuda-12.2.llm.beta\TensorRT-9.3.0.1 -Destination .; \
+    Remove-Item TensorRT-9.3.0.1.Windows10.win10.cuda-12.2.llm.beta -Force; \
+    Remove-Item TensorRT-9.3.0.1.zip -Force
 
 # Add TensorRT libs to Path
-RUN setx Path "%Path%;C:\workspace\TensorRT-9.2.0.5\lib"
+RUN setx Path "%Path%;C:\workspace\TensorRT-9.3.0.1\lib"
 
 # Install TensorRT Python wheel
 RUN powershell -Command \
     $ErrorActionPreference = 'Stop'; \
-    pip install TensorRT-9.2.0.5\python\tensorrt-9.2.0.post12.dev5-cp310-none-win_amd64.whl
+    pip install TensorRT-9.3.0.1\python\tensorrt-9.3.0.post12.dev1-cp310-none-win_amd64.whl
 
 # -----------------------------------------------------------------------------
 
-# Copy cuDNN into the working directory
-# This assumes cuDNN exists on the host machine in the build context
-COPY ["cuDNN", "cuDNN"]
+# Download and unzip cuDNN 8.9.7.29 for TensorRT-LLM
+# https://developer.nvidia.com/downloads/compute/cudnn/secure/8.9.7/local_installers/12.x/cudnn-windows-x86_64-8.9.7.29_cuda12-archive.zip
+RUN powershell -Command \
+    $ErrorActionPreference = 'Stop'; \
+    $ProgressPreference = 'SilentlyContinue'; \
+    Invoke-WebRequest -Uri https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-8.9.7.29_cuda12-archive.zip \
+    -OutFile cuDNN.zip; \
+    Expand-Archive .\cuDNN.zip -DestinationPath .; \
+    New-Item -Path cuDNN -ItemType Directory; \
+    Move-Item -Path .\cudnn-windows-x86_64-8.9.7.29_cuda12-archive\* -Destination .\cuDNN; \
+    Remove-Item cudnn-windows-x86_64-8.9.7.29_cuda12-archive -Force; \
+    Remove-Item cuDNN.zip -Force
 
 # Add cuDNN libs and bin to Path.
 RUN setx Path "%Path%;C:\workspace\cuDNN\lib;C:\workspace\cuDNN\bin;"

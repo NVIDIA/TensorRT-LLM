@@ -87,6 +87,16 @@ public:
         return *mEngine;
     }
 
+    nvinfer1::IEngineInspector& getEngineInspector()
+    {
+        return *mEngineInspector;
+    }
+
+    nvinfer1::IEngineInspector const& getEngineInspector() const
+    {
+        return *mEngineInspector;
+    }
+
     BufferManager& getBufferManager()
     {
         return mBufferManager;
@@ -105,5 +115,6 @@ private:
     BufferManager::IBufferPtr mEngineBuffer;
     std::vector<std::unique_ptr<nvinfer1::IExecutionContext>> mContexts;
     std::unique_ptr<ITensor> mDummyTensor;
+    std::unique_ptr<nvinfer1::IEngineInspector> mEngineInspector;
 };
 } // namespace tensorrt_llm::runtime

@@ -132,18 +132,18 @@ public:
     SizeType beamWidth;
 
     OptVec<FloatType> temperature;       // [1] or [batch_size] on cpu
-    OptVec<SizeType> minLength;          // [1] or [batch_size] on cpu
+    OptVec<SizeType32> minLength;        // [1] or [batch_size] on cpu
     OptVec<FloatType> repetitionPenalty; // [1] or [batch_size] on cpu
     OptVec<FloatType> presencePenalty;   // [1] or [batch_size] on cpu
     OptVec<FloatType> frequencyPenalty;  // [1] or [batch_size] on cpu
 
     // sampling layers
-    OptVec<SizeType> topK;         // [1] or [batch_size] on cpu
-    OptVec<FloatType> topP;        // [1] or [batch_size] on cpu
-    OptVec<uint64_t> randomSeed;   // [1] or [batch_size] on cpu
-    OptVec<FloatType> topPDecay;   // [batch_size], must between [0, 1]
-    OptVec<FloatType> topPMin;     // [batch_size], must between [0, 1]
-    OptVec<SizeType> topPResetIds; // [batch_size]
+    OptVec<SizeType32> topK;          // [1] or [batch_size] on cpu
+    OptVec<FloatType> topP;           // [1] or [batch_size] on cpu
+    OptVec<uint64_t> randomSeed;      // [1] or [batch_size] on cpu
+    OptVec<FloatType> topPDecay;      // [batch_size], must between [0, 1]
+    OptVec<FloatType> topPMin;        // [batch_size], must between [0, 1]
+    OptVec<TokenIdType> topPResetIds; // [batch_size]
 
     // beam search layer
     OptVec<FloatType> beamSearchDiversityRate; // [1] or [batch_size]

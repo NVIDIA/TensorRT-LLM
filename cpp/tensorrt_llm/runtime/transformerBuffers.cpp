@@ -32,8 +32,9 @@ TransformerBuffers::TransformerBuffers()
 
     presentKeysVals.clear();
     presentKeysValsAlt.clear();
-    kvCacheBlockPointersHost = nullptr;
-    kvCacheBlockPointersDevice = nullptr;
+    kvCacheBlockPoolPointers = nullptr;
+    kvCacheBlockOffsetsHost = nullptr;
+    kvCacheBlockOffsetsDevice = nullptr;
 }
 
 TransformerBuffers::TransformerBuffers(
@@ -61,9 +62,9 @@ TransformerBuffers::TransformerBuffers(
 
     if (modelConfig.usePagedKvCache())
     {
-        auto const kvCacheBlockPointersType = engine.getTensorDataType("kv_cache_block_pointers");
-        kvCacheBlockPointersHost = manager.emptyTensor(MemoryType::kCPU, kvCacheBlockPointersType);
-        kvCacheBlockPointersDevice = manager.emptyTensor(MemoryType::kGPU, kvCacheBlockPointersType);
+        auto const kvCacheBlockOffsetsType = engine.getTensorDataType("kv_cache_block_offsets");
+        kvCacheBlockOffsetsHost = manager.emptyTensor(MemoryType::kCPU, kvCacheBlockOffsetsType);
+        kvCacheBlockOffsetsDevice = manager.emptyTensor(MemoryType::kGPU, kvCacheBlockOffsetsType);
     }
     else
     {
@@ -101,16 +102,16 @@ void TransformerBuffers::reshape(GenerationConfig const& generationConfig, KvCac
     {
         TLLM_CHECK(kvCacheManager);
 
-        auto const localNbLayers = modelConfig.getNbLayers(worldConfig.getPipelineParallelism());
-
         auto const maxBlocksPerSeq = kvCacheManager->getMaxBlocksPerSeq();
         // reserve batchSize * beamWidth and resize to batchSize
-        auto cacheBlockPointersShape = ITensor::makeShape({localNbLayers, batchSize * beamWidth, 2, maxBlocksPerSeq});
-        kvCacheBlockPointersHost->reshape(cacheBlockPointersShape);
-        kvCacheBlockPointersDevice->reshape(cacheBlockPointersShape);
-        cacheBlockPointersShape.d[1] = batchSize;
-        kvCacheBlockPointersHost->reshape(cacheBlockPointersShape);
-        kvCacheBlockPointersDevice->reshape(cacheBlockPointersShape);
+        auto cacheBlockOffsetsShape = ITensor::makeShape({batchSize * beamWidth, 2, maxBlocksPerSeq});
+        kvCacheBlockOffsetsHost->reshape(cacheBlockOffsetsShape);
+        kvCacheBlockOffsetsDevice->reshape(cacheBlockOffsetsShape);
+        cacheBlockOffsetsShape.d[0] = batchSize;
+        kvCacheBlockOffsetsHost->reshape(cacheBlockOffsetsShape);
+        kvCacheBlockOffsetsDevice->reshape(cacheBlockOffsetsShape);
+
+        kvCacheBlockPoolPointers = kvCacheManager->getBlockPoolPointers();
     }
     else
     {
@@ -146,23 +147,22 @@ TransformerBuffers TransformerBuffers::sliceTo(
     auto const generationBatchSize = generationConfig.batchSize;
     if (modelConfig.usePagedKvCache())
     {
-        auto const& realCacheBlockPointersShape = kvCacheBlockPointersHost->getShape();
-        auto const localNbLayers = realCacheBlockPointersShape.d[0];
-        auto const maxBlocksPerSeq = realCacheBlockPointersShape.d[3];
+        auto const& realCacheBlockOffsetsShape = kvCacheBlockOffsetsHost->getShape();
+        auto const maxBlocksPerSeq = realCacheBlockOffsetsShape.d[2];
 
         // enable slicing by moving generationBatchSize to first dim
-        auto const fakeCacheBlockPointersShape
-            = ITensor::makeShape({generationBatchSize, localNbLayers, 2, maxBlocksPerSeq});
-        TensorPtr kvCacheBlockPointersHostView{ITensor::view(kvCacheBlockPointersHost, fakeCacheBlockPointersShape)};
-        TensorPtr kvCacheBlockPointersDeviceView{
-            ITensor::view(kvCacheBlockPointersDevice, fakeCacheBlockPointersShape)};
+        auto const fakeCacheBlockOffsetsShape = ITensor::makeShape({generationBatchSize, 2, maxBlocksPerSeq});
+        TensorPtr kvCacheBlockOffsetsHostView{ITensor::view(kvCacheBlockOffsetsHost, fakeCacheBlockOffsetsShape)};
+        TensorPtr kvCacheBlockOffsetsDeviceView{ITensor::view(kvCacheBlockOffsetsDevice, fakeCacheBlockOffsetsShape)};
 
         // slice and reshape to correct shape
-        auto const cacheBlockPointersShape = ITensor::makeShape({localNbLayers, batchSize, 2, maxBlocksPerSeq});
-        buffers.kvCacheBlockPointersHost = ITensor::slice(kvCacheBlockPointersHostView, offset, batchSize);
-        buffers.kvCacheBlockPointersHost->reshape(cacheBlockPointersShape);
-        buffers.kvCacheBlockPointersDevice = ITensor::slice(kvCacheBlockPointersDeviceView, offset, batchSize);
-        buffers.kvCacheBlockPointersDevice->reshape(cacheBlockPointersShape);
+        auto const cacheBlockOffsetsShape = ITensor::makeShape({batchSize, 2, maxBlocksPerSeq});
+        buffers.kvCacheBlockOffsetsHost = ITensor::slice(kvCacheBlockOffsetsHostView, offset, batchSize);
+        buffers.kvCacheBlockOffsetsHost->reshape(cacheBlockOffsetsShape);
+        buffers.kvCacheBlockOffsetsDevice = ITensor::slice(kvCacheBlockOffsetsDeviceView, offset, batchSize);
+        buffers.kvCacheBlockOffsetsDevice->reshape(cacheBlockOffsetsShape);
+
+        buffers.kvCacheBlockPoolPointers = kvCacheBlockPoolPointers;
     }
     else
     {
@@ -357,9 +357,9 @@ void TransformerBuffers::prepareContextStep(RuntimeBuffers* runtimeBuffers, Tens
     if (modelConfig.useGptAttentionPlugin() && modelConfig.usePagedKvCache())
     {
         auto constexpr contextBeamWidth = 1;
-        kvCacheManager->getBlockPointersOfBatch(
-            *kvCacheBlockPointersHost, firstBatchSlotIdx, batchSize, contextBeamWidth);
-        manager.copy(*kvCacheBlockPointersHost, *kvCacheBlockPointersDevice);
+        kvCacheManager->getBlockOffsetsOfBatch(
+            *kvCacheBlockOffsetsHost, firstBatchSlotIdx, batchSize, contextBeamWidth);
+        manager.copy(*kvCacheBlockOffsetsHost, *kvCacheBlockOffsetsDevice);
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -514,10 +514,10 @@ void TransformerBuffers::postContextStep(RuntimeBuffers* runtimeBuffers,
 
     if (modelConfig.useGptAttentionPlugin() && modelConfig.usePagedKvCache())
     {
-        auto cacheBlockPointersShape = kvCacheBlockPointersHost->getShape();
-        cacheBlockPointersShape.d[1] = batchSize * beamWidth;
-        kvCacheBlockPointersHost->reshape(cacheBlockPointersShape);
-        kvCacheBlockPointersDevice->reshape(cacheBlockPointersShape);
+        auto cacheBlockOffsetsShape = kvCacheBlockOffsetsHost->getShape();
+        cacheBlockOffsetsShape.d[0] = batchSize * beamWidth;
+        kvCacheBlockOffsetsHost->reshape(cacheBlockOffsetsShape);
+        kvCacheBlockOffsetsDevice->reshape(cacheBlockOffsetsShape);
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -635,8 +635,8 @@ void TransformerBuffers::prepareNextStep(RuntimeBuffers* runtimeBuffers, SizeTyp
         {
             kvCacheManager->addToken(batchIdx);
         }
-        kvCacheManager->getBlockPointersOfBatch(*kvCacheBlockPointersHost, firstBatchSlotIdx, batchSize, beamWidth);
-        manager.copy(*kvCacheBlockPointersHost, *kvCacheBlockPointersDevice);
+        kvCacheManager->getBlockOffsetsOfBatch(*kvCacheBlockOffsetsHost, firstBatchSlotIdx, batchSize, beamWidth);
+        manager.copy(*kvCacheBlockOffsetsHost, *kvCacheBlockOffsetsDevice);
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -700,8 +700,9 @@ void TransformerBuffers::getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers,
         }
         if (modelConfig.usePagedKvCache())
         {
-            inputBuffers.insert_or_assign("kv_cache_block_pointers", kvCacheBlockPointersDevice);
-            inputBuffers.insert_or_assign("host_kv_cache_block_pointers", kvCacheBlockPointersHost);
+            inputBuffers.insert_or_assign("kv_cache_block_offsets", kvCacheBlockOffsetsDevice);
+            inputBuffers.insert_or_assign("host_kv_cache_block_offsets", kvCacheBlockOffsetsHost);
+            inputBuffers.insert_or_assign("host_kv_cache_pool_pointers", kvCacheBlockPoolPointers);
         }
         else
         {

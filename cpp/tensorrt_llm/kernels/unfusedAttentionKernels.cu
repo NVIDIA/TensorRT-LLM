@@ -1907,12 +1907,12 @@ __global__ void shiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCa
 }
 
 template <typename T, typename KVCacheBuffer>
-void invokeShiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCacheBuffer, const KvCacheDataType cache_type,
-    int const sizePerHead, int const timestep, int const batch_beam, int const kv_head_num, int const beam_width,
-    int const maxKCacheLen, int const sinkTokenLen, float const* kScaleQuantOrig, int const* sequence_lengths,
-    int const* input_lengths, int const rotary_embedding_dim, float rotary_embedding_base,
-    RotaryScalingType const rotary_scale_type, float rotary_embedding_scale, int const rotary_embedding_max_positions,
-    PositionEmbeddingType const position_embedding_type, cudaStream_t stream)
+void invokeShiftKCache(KVCacheBuffer const& kvCacheBuffer, KVLinearBuffer const& shiftKCacheBuffer,
+    const KvCacheDataType cache_type, int const sizePerHead, int const timestep, int const batch_beam,
+    int const kv_head_num, int const beam_width, int const maxKCacheLen, int const sinkTokenLen,
+    float const* kScaleQuantOrig, int const* sequence_lengths, int const* input_lengths, int const rotary_embedding_dim,
+    float rotary_embedding_base, RotaryScalingType const rotary_scale_type, float rotary_embedding_scale,
+    int const rotary_embedding_max_positions, PositionEmbeddingType const position_embedding_type, cudaStream_t stream)
 {
     // Block handles K tile.
     int const token_num_in_k = (timestep <= maxKCacheLen) ? timestep : maxKCacheLen;
@@ -1948,10 +1948,10 @@ void invokeShiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCacheBu
 }
 
 #define INSTANTIATE_SHIFT_K_CACHE_CACHE_TYPE(T, KVCacheBuffer)                                                         \
-    template void invokeShiftKCache<T, KVCacheBuffer>(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCacheBuffer,   \
-        const KvCacheDataType cache_type, const int sizePerHead, const int timestep, const int batch_beam,             \
-        const int kv_head_num, const int beam_width, const int maxKCacheLen, const int sinkTokenLen,                   \
-        const float* kScaleQuantOrig, const int* sequence_lengths, const int* input_lengths,                           \
+    template void invokeShiftKCache<T, KVCacheBuffer>(KVCacheBuffer const& kvCacheBuffer,                              \
+        KVLinearBuffer const& shiftKCacheBuffer, const KvCacheDataType cache_type, const int sizePerHead,              \
+        const int timestep, const int batch_beam, const int kv_head_num, const int beam_width, const int maxKCacheLen, \
+        const int sinkTokenLen, const float* kScaleQuantOrig, const int* sequence_lengths, const int* input_lengths,   \
         const int rotary_embedding_dim, float rotary_embedding_base, RotaryScalingType const rotary_scale_type,        \
         float rotary_embedding_scale, const int rotary_embedding_max_positions,                                        \
         PositionEmbeddingType const position_embedding_type, cudaStream_t stream)

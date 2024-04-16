@@ -305,10 +305,12 @@ class DecoderLayerList(ModuleList):
                     host_max_attention_window_sizes,
                     host_sink_token_length=kv_cache_params.
                     host_sink_token_length,
-                    kv_cache_block_pointers=kv_cache_params.
-                    kv_cache_block_pointers,
-                    host_kv_cache_block_pointers=kv_cache_params.
-                    host_kv_cache_block_pointers,
+                    kv_cache_block_offsets=kv_cache_params.
+                    kv_cache_block_offsets,
+                    host_kv_cache_block_offsets=kv_cache_params.
+                    host_kv_cache_block_offsets,
+                    host_kv_cache_pool_pointers=kv_cache_params.
+                    host_kv_cache_pool_pointers,
                     cache_indirection=kv_cache_params.cache_indirection),
                 attention_params=attention_params,
                 **kwargs)
@@ -511,9 +513,11 @@ class PretrainedModel(Module,
                 host_max_attention_window_sizes=model_inputs[
                     'host_max_attention_window_sizes'],
                 host_sink_token_length=model_inputs['host_sink_token_length'],
-                kv_cache_block_pointers=model_inputs['kv_cache_block_pointers'],
-                host_kv_cache_block_pointers=model_inputs[
-                    'host_kv_cache_block_pointers'],
+                kv_cache_block_offsets=model_inputs['kv_cache_block_offsets'],
+                host_kv_cache_block_offsets=model_inputs[
+                    'host_kv_cache_block_offsets'],
+                host_kv_cache_pool_pointers=model_inputs[
+                    'host_kv_cache_pool_pointers'],
                 cache_indirection=model_inputs['cache_indirection'],
             ),
             'attention_params':
@@ -659,6 +663,8 @@ class DecoderModelForCausalLM(PretrainedModel):
 
 
 def fuse_gate_mlp(model):
+    from ..quantization.quantize import fp8_quantize
+
     for layer in model.transformer.layers:
         if not hasattr(layer, 'mlp'):
             continue
@@ -676,6 +682,9 @@ def fuse_gate_mlp(model):
                 quant_mode=layer.mlp.quant_mode)
 
             if quant_algo == QuantAlgo.FP8:
+                fused_layer = fp8_quantize(fused_layer,
+                                           model.config.quantization)
+
                 if isinstance(layer.mlp.dtype, str):
                     dtype = str_dtype_to_torch(layer.mlp.dtype)
                 else:
@@ -739,7 +748,8 @@ def unfuse_qkv_gemm(model: PretrainedModel) -> PretrainedModel:
             if layer.unfuse_qkv_gemm:
                 continue
             layer.unfuse_qkv_gemm = True
-            linear_class = FP8Linear if layer.use_fp8_qdq else ColumnLinear
+            linear_class = FP8Linear if layer.quant_mode.has_fp8_qdq(
+            ) else ColumnLinear
             q = linear_class(layer.hidden_size,
                              layer.attention_hidden_size,
                              bias=layer.bias,

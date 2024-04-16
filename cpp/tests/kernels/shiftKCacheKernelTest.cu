@@ -9,7 +9,9 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
+#include <numeric>
 #include <random>
+#include <type_traits>
 
 using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::kernels;
@@ -146,10 +148,10 @@ __global__ void applyRoPE(KVCacheBuffer kCacheRead, KVLinearBuffer kCacheWrite, 
 }
 
 template <typename T, typename KVCacheBuffer>
-void invokeApplyRoPE(KVCacheBuffer kCacheRead, KVLinearBuffer kCacheWrite, int const sizePerHead, int const batch_beam,
-    int const kv_head_num, int const beam_width, int const* token_read_idxs, int const* token_write_idxs,
-    int const* token_pos_idxs, int const* token_seq_idxs, int const token_num, int const* sequence_lengths,
-    int const* input_lengths, int const rotary_embedding_dim, float rotary_embedding_base,
+void invokeApplyRoPE(KVCacheBuffer const& kCacheRead, KVLinearBuffer const& kCacheWrite, int const sizePerHead,
+    int const batch_beam, int const kv_head_num, int const beam_width, int const* token_read_idxs,
+    int const* token_write_idxs, int const* token_pos_idxs, int const* token_seq_idxs, int const token_num,
+    int const* sequence_lengths, int const* input_lengths, int const rotary_embedding_dim, float rotary_embedding_base,
     RotaryScalingType const rotary_scale_type, float rotary_embedding_scale, int const rotary_embedding_max_positions,
     PositionEmbeddingType const position_embedding_type, cudaStream_t stream)
 {
@@ -232,10 +234,12 @@ public:
             mInputDataDevice = mBufferManager->gpu(
                 ITensor::makeShape({batchSize, beamWidth, 2, maxBlocksPerSeq, numHeads * tokensPerBlock * headSize}),
                 TRTDataType<T>::value);
-            mInputBlockPtrsHost = mBufferManager->pinned(
-                ITensor::makeShape({batchSize, beamWidth, 2, maxBlocksPerSeq}), nvinfer1::DataType::kINT64);
-            mInputBlockPtrsDevice = mBufferManager->gpu(
-                ITensor::makeShape({batchSize, beamWidth, 2, maxBlocksPerSeq}), nvinfer1::DataType::kINT64);
+            mInputBlockOffsetsHost
+                = mBufferManager->pinned(ITensor::makeShape({batchSize, beamWidth, 2, maxBlocksPerSeq}),
+                    TRTDataType<std::remove_const_t<KVBlockArray::DataType>>::value);
+            mInputBlockOffsetsDevice
+                = mBufferManager->gpu(ITensor::makeShape({batchSize, beamWidth, 2, maxBlocksPerSeq}),
+                    TRTDataType<std::remove_const_t<KVBlockArray::DataType>>::value);
         }
         else
         {
@@ -282,15 +286,10 @@ public:
 
         if (pagedKvCache)
         {
-            auto inputDataDevicePtr = bufferCast<T>(*mInputDataDevice);
-            auto inputBlockPtrsHostPtr = reinterpret_cast<T**>(bufferCast<int64_t>(*mInputBlockPtrsHost));
-            const int32_t num_per_block = tokensPerBlock * numHeads * headSize;
-            inputBlockPtrsHostPtr[0] = inputDataDevicePtr;
-            for (SizeType idx = 1; idx < batchBeam * 2 * maxBlocksPerSeq; idx++)
-            {
-                inputBlockPtrsHostPtr[idx] = inputBlockPtrsHostPtr[idx - 1] + num_per_block;
-            }
-            mBufferManager->copy(*mInputBlockPtrsHost, *mInputBlockPtrsDevice);
+            auto inputBlockOffsetsHostRange
+                = BufferRange<std::remove_const_t<KVBlockArray::DataType>>(*mInputBlockOffsetsHost);
+            std::iota(inputBlockOffsetsHostRange.begin(), inputBlockOffsetsHostRange.end(), 0);
+            mBufferManager->copy(*mInputBlockOffsetsHost, *mInputBlockOffsetsDevice);
         }
 
         mBufferManager->copy(*mInputDataHost, *mInputDataDevice);
@@ -302,8 +301,8 @@ public:
         mBufferManager->copy(*mTokenSeqIdxsHost, *mTokenSeqIdxsDevice);
     }
 
-    float compareResults(KVLinearBuffer kCacheOut, KVLinearBuffer kCacheRef, int32_t batchBeam, int32_t beamWidth,
-        int32_t numHeads, int32_t headSize, int32_t validTokenNum, int32_t const* seqLengths,
+    float compareResults(KVLinearBuffer const& kCacheOut, KVLinearBuffer const& kCacheRef, int32_t batchBeam,
+        int32_t beamWidth, int32_t numHeads, int32_t headSize, int32_t validTokenNum, int32_t const* seqLengths,
         int32_t const* inputLengths, int32_t const* tokenWriteIdxs, int32_t const* tokenSeqIdxs)
     {
         mBufferManager->copy(*mOutputDataDevice, *mOutputDataHost);
@@ -359,14 +358,13 @@ public:
         // get kv cache
         const int32_t batchBeam = batchSize * beamWidth;
         auto const elemSize = sizeof(T);
+        auto const sizePerToken = numHeads * headSize * elemSize;
 
-        KVLinearBuffer shiftKCacheBuffer = KVLinearBuffer(batchBeam, 1, maxAttentionWindow,
-            numHeads * headSize * elemSize, maxAttentionWindow, sinkTokenLength, true);
-        shiftKCacheBuffer.data = reinterpret_cast<int8_t*>(bufferCast<T>(*mOutputDataDevice));
+        auto shiftKCacheBuffer = KVLinearBuffer(batchBeam, maxAttentionWindow, sizePerToken, maxAttentionWindow,
+            sinkTokenLength, true, reinterpret_cast<int8_t*>(bufferCast<T>(*mOutputDataDevice)));
 
-        KVLinearBuffer refShiftKCacheBuffer = KVLinearBuffer(batchBeam, 1, maxAttentionWindow,
-            numHeads * headSize * elemSize, maxAttentionWindow, sinkTokenLength, true);
-        refShiftKCacheBuffer.data = reinterpret_cast<int8_t*>(bufferCast<T>(*mRefOutputDataDevice));
+        auto refShiftKCacheBuffer = KVLinearBuffer(batchBeam, maxAttentionWindow, sizePerToken, maxAttentionWindow,
+            sinkTokenLength, true, reinterpret_cast<int8_t*>(bufferCast<T>(*mRefOutputDataDevice)));
 
         // run shift k cache
         const KvCacheDataType kv_cache_type = KvCacheDataType::BASE;
@@ -374,9 +372,11 @@ public:
 
         if (pagedKvCache)
         {
-            KVBlockArray kvCacheBuffer = KVBlockArray(batchBeam, maxBlocksPerSeq, tokensPerBlock,
-                numHeads * headSize * elemSize, maxAttentionWindow, sinkTokenLength, false);
-            kvCacheBuffer.data = reinterpret_cast<int64_t*>(bufferCast<int64_t>(*mInputBlockPtrsDevice));
+            auto inputDataDevicePtr = bufferCast<T>(*mInputDataDevice);
+
+            auto const kvCacheBuffer = KVBlockArray(batchBeam, maxBlocksPerSeq, tokensPerBlock, sizePerToken,
+                maxAttentionWindow, sinkTokenLength, inputDataDevicePtr, nullptr,
+                bufferCast<KVBlockArray::DataType>(*mInputBlockOffsetsDevice));
             invokeShiftKCache<DataType, KVBlockArray>(kvCacheBuffer, shiftKCacheBuffer, kv_cache_type, headSize,
                 pastKCacheLength, batchBeam, numHeads, beamWidth, maxAttentionWindow, sinkTokenLength,
                 bufferCast<float>(*mKScaleQuantOrigDevice), bufferCast<int32_t>(*mSeqLengthsDevice),
@@ -392,10 +392,10 @@ public:
         }
         else
         {
-            KVLinearBuffer kvCacheBuffer = KVLinearBuffer(batchBeam, 1, maxAttentionWindow,
-                numHeads * headSize * elemSize, maxAttentionWindow, sinkTokenLength, false);
+            auto const kvCacheBuffer
+                = KVLinearBuffer(batchBeam, maxAttentionWindow, numHeads * headSize * elemSize, maxAttentionWindow,
+                    sinkTokenLength, false, reinterpret_cast<int8_t*>(bufferCast<T>(*mInputDataDevice)));
             // run shift k cache
-            kvCacheBuffer.data = reinterpret_cast<int8_t*>(bufferCast<T>(*mInputDataDevice));
             invokeShiftKCache<DataType, KVLinearBuffer>(kvCacheBuffer, shiftKCacheBuffer, kv_cache_type, headSize,
                 pastKCacheLength, batchBeam, numHeads, beamWidth, maxAttentionWindow, sinkTokenLength,
                 bufferCast<float>(*mKScaleQuantOrigDevice), bufferCast<int32_t>(*mSeqLengthsDevice),
@@ -431,8 +431,8 @@ protected:
     TensorPtr mInputLengthsHost;
     TensorPtr mInputLengthsDevice;
 
-    TensorPtr mInputBlockPtrsHost;
-    TensorPtr mInputBlockPtrsDevice;
+    TensorPtr mInputBlockOffsetsHost;
+    TensorPtr mInputBlockOffsetsDevice;
 
     TensorPtr mKScaleQuantOrigDevice;
 

@@ -16,6 +16,7 @@
 
 #include "tensorrt_llm/kernels/parallelDecoding/kvCacheUpdateKernels.h"
 #include "tensorrt_llm/thop/thUtils.h"
+#include <cstdint>
 
 namespace th = torch;
 
@@ -24,11 +25,12 @@ namespace torch_ext
 
 void updateKVCacheDraftTokenLocation(torch::Tensor seqAcceptedDraftTokenOffsetsTensor,
     torch::Tensor packedAcceptedDraftTokensIndicesTensor, torch::Tensor pastKeyValueLengthsTensor, bool usePagedKVCache,
-    int64_t numKVHeads, int64_t headSizeInBytes, int64_t rewindDraftTokenCount, int64_t maxKVCacheLen,
-    th::optional<torch::Tensor> rewindDraftTokenTensor,
+    int64_t layerCount, int64_t numKVHeads, int64_t headSizeInBytes, int64_t rewindDraftTokenCount,
+    int64_t maxKVCacheLen, th::optional<torch::Tensor> rewindDraftTokenTensor,
     th::optional<std::vector<torch::Tensor>> pastKeyValueListOpt = th::nullopt,
-    th::optional<torch::Tensor> pointerArrayOpt = th::nullopt, th::optional<int64_t> maxBlocksPerSeqOpt = th::nullopt,
-    th::optional<int64_t> tokensPerBlockOpt = th::nullopt, th::optional<int64_t> stream_ptr = th::nullopt)
+    th::optional<torch::Tensor> pointerArrayOpt = th::nullopt, th::optional<torch::Tensor> offsetArrayOpt = th::nullopt,
+    th::optional<int64_t> maxBlocksPerSeqOpt = th::nullopt, th::optional<int64_t> tokensPerBlockOpt = th::nullopt,
+    th::optional<int64_t> stream_ptr = th::nullopt)
 {
     TLLM_CHECK_WITH_INFO(
         at::cuda::is_available(), "update_kv_cache_draft_token_location should be called with cuda enabled.");
@@ -67,32 +69,26 @@ void updateKVCacheDraftTokenLocation(torch::Tensor seqAcceptedDraftTokenOffsetsT
     if (usePagedKVCache)
     {
         TLLM_CHECK_WITH_INFO(
-            pointerArrayOpt.has_value(), "block_pointer_array should be set when using paged KV cache.");
+            pointerArrayOpt.has_value(), "pool_pointer_array should be set when using paged KV cache.");
+        TLLM_CHECK_WITH_INFO(offsetArrayOpt.has_value(), "block_offset_array should be set when using paged KV cache.");
         TLLM_CHECK_WITH_INFO(
             maxBlocksPerSeqOpt.has_value(), "max_blocks_per_seq should be set when using paged KV cache.");
         TLLM_CHECK_WITH_INFO(
             tokensPerBlockOpt.has_value(), "tokens_per_block should be set when using paged KV cache.");
 
         auto const& pointerArray = pointerArrayOpt.value();
-        int layerCount = pointerArray.size(0);
-        std::vector<int64_t*> pointerArrayList(layerCount);
-        auto* const pointerArrayPtr = pointerArray.data_ptr<int64_t>();
-        auto const stride = pointerArray.stride(0);
-        for (int layer = 0; layer < layerCount; ++layer)
-        {
-            pointerArrayList[layer] = pointerArrayPtr + layer * stride;
-        }
+        auto const& offsetArray = offsetArrayOpt.value();
         tensorrt_llm::kernels::parallel_decoding::updateKVBlockArrayDraftTokenLocation(
             seqAcceptedDraftTokenOffsetsTensor.data_ptr<int>(), packedAcceptedDraftTokensIndicesTensor.data_ptr<int>(),
-            pastKeyValueLengthsTensor.data_ptr<int>(), pointerArrayList.data(), layerCount, seqCount, numKVHeads,
-            headSizeInBytes, rewindDraftTokenCount, rewindDraftTokenTensorPtr, nullptr, maxKVCacheLen,
-            maxBlocksPerSeqOpt.value(), tokensPerBlockOpt.value(), stream);
+            pastKeyValueLengthsTensor.data_ptr<int>(), reinterpret_cast<void* const*>(pointerArray.data_ptr<int64_t>()),
+            offsetArray.data_ptr<int32_t>(), layerCount, seqCount, numKVHeads, headSizeInBytes, rewindDraftTokenCount,
+            rewindDraftTokenTensorPtr, nullptr, maxKVCacheLen, maxBlocksPerSeqOpt.value(), tokensPerBlockOpt.value(),
+            stream);
     }
     else
     {
         TLLM_CHECK_WITH_INFO(
             pastKeyValueListOpt.has_value(), "block_pointer_array should be set when using linear KV cache.");
-        int layerCount = pastKeyValueListOpt.value().size();
         std::vector<int8_t*> pastKeyValueList;
         pastKeyValueList.reserve(layerCount);
         for (auto& pastKeyValueTensor : pastKeyValueListOpt.value())

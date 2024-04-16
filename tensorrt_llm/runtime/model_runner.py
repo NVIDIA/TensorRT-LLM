@@ -15,6 +15,7 @@
 
 import copy
 import json
+import math
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
@@ -23,7 +24,8 @@ import tensorrt as trt
 import torch
 
 from .. import profiler
-from .._utils import mpi_world_size
+from .._utils import mpi_comm, mpi_world_size
+from ..bindings import GptSession
 from ..builder import Engine, get_engine_version
 from ..logger import logger
 from ..mapping import Mapping
@@ -235,47 +237,123 @@ class ModelRunnerMixin:
         if outputs is not None:
             batch_size = input_lengths.size(0)
             if 'context_logits' in outputs:
-                context_logits = outputs['context_logits']
-                if self.remove_input_padding:
-                    context_logits = context_logits.flatten(end_dim=-2)
+                if self.mapping.has_pp():
+                    # If pp size > 1, the context logits and generation logits are both in last pp
+                    # Last pp rank send context logits and generation logits to rank 0
+                    if self.mapping.is_last_pp_rank():
+                        context_logits = outputs['context_logits']
+                        context_logits_host = context_logits.cpu()
+                        mpi_comm().send(context_logits_host, dest=0)
+                    elif self.mapping.is_first_pp_rank():
+                        context_logits_host = mpi_comm().recv(
+                            source=self.mapping.prev_pp_rank()
+                        )  # Prev pp rank of rank=0 is the last pp
+                        context_logits = context_logits_host.to(
+                            torch.device('cuda:0'))
+                        outputs['context_logits'] = context_logits
 
-                    seg_points = [0] + input_lengths.cumsum(dim=0).tolist()
-                    context_logits = [
-                        context_logits[s:e]
-                        for s, e in zip(seg_points[:-1], seg_points[1:])
-                    ]
+                context_logits = outputs['context_logits']
+
+                context_logits_output = []
+                if self.remove_input_padding:
+                    if isinstance(self.session, GptSession) and batch_size > 1:
+                        # The starting position of the context logits buffer of each micro batch is separated
+                        num_batches = self.mapping.pp_size
+                        micro_batch_size = math.ceil(batch_size /
+                                                     self.mapping.pp_size)
+
+                        for i in range(num_batches):
+                            start_idx = i * micro_batch_size
+                            end_idx = min(start_idx + micro_batch_size,
+                                          batch_size)
+                            micro_context_logits = context_logits[
+                                start_idx:end_idx]
+                            micro_input_lengths = input_lengths[
+                                start_idx:end_idx]
+
+                            micro_context_logits = micro_context_logits.flatten(
+                                end_dim=-2)
+                            seg_points = [0] + micro_input_lengths.cumsum(
+                                dim=0).tolist()
+                            context_logits_output += [
+                                micro_context_logits[s:e]
+                                for s, e in zip(seg_points[:-1], seg_points[1:])
+                            ]
+                    else:
+                        context_logits = context_logits.flatten(end_dim=-2)
+
+                        seg_points = [0] + input_lengths.cumsum(dim=0).tolist()
+                        context_logits_output = [
+                            context_logits[s:e]
+                            for s, e in zip(seg_points[:-1], seg_points[1:])
+                        ]
                 else:
-                    context_logits = [
+                    context_logits_output = [
                         context_logits[bidx, :input_lengths[bidx]]
                         for bidx in range(batch_size)
                     ]
-                outputs['context_logits'] = context_logits
 
-            if 'generation_logits' in outputs and isinstance(
-                    self.session, GenerationSession):
-                generation_logits = torch.stack(outputs['generation_logits'],
-                                                dim=1)
-                batch_x_beam, max_gen_len, voc_size = generation_logits.size()
-                num_beams = batch_x_beam // batch_size
-                generation_logits = generation_logits.view(
-                    batch_size, num_beams, max_gen_len, voc_size)
-                outputs['generation_logits'] = generation_logits
+                assert len(context_logits_output) == batch_size
+                outputs['context_logits'] = context_logits_output
+
+            if 'generation_logits' in outputs:
+                if self.mapping.has_pp():
+                    if self.mapping.is_last_pp_rank():
+                        generation_logits = outputs['generation_logits']
+                        if isinstance(generation_logits, list):
+                            generation_logits_host = [
+                                logits.cpu() for logits in generation_logits
+                            ]
+                        else:
+                            generation_logits_host = generation_logits.cpu()
+                        mpi_comm().send(generation_logits_host, dest=0)
+                    elif self.mapping.is_first_pp_rank():
+                        generation_logits_host = mpi_comm().recv(
+                            source=self.mapping.prev_pp_rank()
+                        )  # Prev pp rank of rank=0 is the last pp
+                        if isinstance(generation_logits_host, list):
+                            generation_logits = [
+                                logits.to(torch.device('cuda:0'))
+                                for logits in generation_logits_host
+                            ]
+                        else:
+                            generation_logits = generation_logits_host.to(
+                                torch.device('cuda:0'))
+                        outputs['generation_logits'] = generation_logits
+
+                if isinstance(self.session, GenerationSession):
+                    # Convert logits format to be same as GptSession
+                    generation_logits = torch.stack(
+                        outputs['generation_logits'], dim=1)
+                    batch_x_beam, max_gen_len, voc_size = generation_logits.size(
+                    )
+                    num_beams = batch_x_beam // batch_size
+                    generation_logits = generation_logits.view(
+                        batch_size, num_beams, max_gen_len, voc_size)
+                    outputs['generation_logits'] = generation_logits
 
         return outputs
 
-    def _prepare_ptuning(self, prompt_table_path: str, tasks: str,
-                         batch_size: int):
+    def _prepare_ptuning(self, prompt_table: Union[str, torch.Tensor],
+                         tasks: str, batch_size: int):
         if self.max_prompt_embedding_table_size == 0:
             return {}
 
-        if prompt_table_path is not None:
-            prompt_table = torch.from_numpy(
-                np.load(prompt_table_path)).to(dtype=self.dtype)
-            _, task_vocab_size, hidden_size = prompt_table.size()
+        if prompt_table is not None:
+            if isinstance(prompt_table, str):
+                prompt_table_data = torch.from_numpy(
+                    np.load(prompt_table)).to(dtype=self.dtype)
+            else:
+                assert isinstance(
+                    prompt_table,
+                    torch.Tensor), "Prompt table should be str or torch.Tensor"
+                prompt_table_data = prompt_table.to(dtype=self.dtype)
+            _, task_vocab_size, hidden_size = prompt_table_data.size()
             task_vocab_size = torch.tensor([task_vocab_size], dtype=torch.int32)
-            prompt_table = prompt_table.view(-1, hidden_size)
+            prompt_table_data = prompt_table_data.view(-1, hidden_size)
         else:
-            prompt_table = torch.empty([1, self.hidden_size], dtype=self.dtype)
+            prompt_table_data = torch.empty([1, self.hidden_size],
+                                            dtype=self.dtype)
             task_vocab_size = torch.zeros([1], dtype=torch.int32)
 
         if tasks is not None:
@@ -288,13 +366,13 @@ class ModelRunnerMixin:
 
         if isinstance(self.session, GenerationSession):
             return {
-                'prompt_embedding_table': prompt_table.cuda(),
+                'prompt_embedding_table': prompt_table_data.cuda(),
                 'tasks': tasks.cuda(),
                 'prompt_vocab_size': task_vocab_size.cuda()
             }
         else:
             return {
-                'embedding_table': prompt_table.cuda(),
+                'embedding_table': prompt_table_data.cuda(),
                 'tasks': tasks.cuda(),
                 'vocab_size': task_vocab_size.cuda()
             }
@@ -601,6 +679,10 @@ class ModelRunner(ModelRunnerMixin):
         return self.session.max_prompt_embedding_table_size
 
     @property
+    def mapping(self) -> Mapping:
+        return self.session.mapping
+
+    @property
     def gather_context_logits(self) -> bool:
         return self.session.gather_context_logits
 
@@ -611,7 +693,7 @@ class ModelRunner(ModelRunnerMixin):
     def generate(self,
                  batch_input_ids: List[torch.Tensor],
                  sampling_config: Optional[SamplingConfig] = None,
-                 prompt_table_path: Optional[str] = None,
+                 prompt_table: Optional[Union[str, torch.Tensor]] = None,
                  prompt_tasks: Optional[str] = None,
                  lora_uids: Optional[list] = None,
                  streaming: bool = False,
@@ -631,8 +713,8 @@ class ModelRunner(ModelRunnerMixin):
                 The sampling configuration to be used as base parametrization for the generation call.
                 The passed **kwargs matching the sampling_config's attributes will override them.
                 If the sampling_config is not provided, a default will be used.
-            prompt_table_path (str):
-                The file path of prompt table (.npy format, exported by nemo_prompt_convert.py).
+            prompt_table (str or torch.Tensor):
+                The file path of prompt table (.npy format, exported by nemo_prompt_convert.py) or the prompt table itself.
             prompt_tasks (str):
                 The prompt tuning task ids for the input batch, in format of comma-separated list (e.g., 0,3,1,0).
             lora_uids (list):
@@ -681,7 +763,7 @@ class ModelRunner(ModelRunnerMixin):
 
         batch_input_ids = batch_input_ids.cuda()
         input_lengths = input_lengths.cuda()
-        ptuning_kwargs = self._prepare_ptuning(prompt_table_path, prompt_tasks,
+        ptuning_kwargs = self._prepare_ptuning(prompt_table, prompt_tasks,
                                                batch_size)
         outputs = self.session.decode(
             batch_input_ids,

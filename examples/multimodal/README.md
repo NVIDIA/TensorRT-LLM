@@ -22,33 +22,58 @@ We first describe how to run each model on a single GPU. We then provide general
     export MODEL_NAME="flan-t5-xl" # also flan-t5-xxl
     git clone https://huggingface.co/google/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
 
-    python ../enc_dec/t5/convert.py -i tmp/hf_models/${MODEL_NAME} \
-        -o tmp/trt_models/${MODEL_NAME} --weight_data_type float32 \
-        --inference_tensor_para_size 1
+    python ../enc_dec/convert_checkpoint.py --model_type t5 \
+        --model_dir tmp/hf_models/${MODEL_NAME} \
+        --output_dir tmp/trt_models/${MODEL_NAME}/bfloat16 \
+        --tp_size 1 \
+        --pp_size 1 \
+        --weight_data_type float32 \
+        --dtype bfloat16 \
+        --max_multimodal_len 256 # 8 (max_batch_size) * 32 (num_visual_features)
     ```
 
 2. Build TRT-LLM engine from TRT-LLM checkpoint
 
     ```bash
-    python ../enc_dec/build.py --model_type t5 \
-        --weight_dir tmp/trt_models/${MODEL_NAME}/tp1 \
-        --output_dir trt_engines/${MODEL_NAME}/1-gpu \
-        --engine_name ${MODEL_NAME} \
-        --remove_input_padding \
-        --use_bert_attention_plugin \
-        --use_gpt_attention_plugin \
-        --use_gemm_plugin \
-        --dtype bfloat16 \
+    trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/bfloat16/tp1/pp1/encoder \
+        --output_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/bfloat16/tp1/encoder \
+        --paged_kv_cache disable \
+        --moe_plugin disable \
+        --enable_xqa disable \
+        --use_custom_all_reduce disable \
+        --gemm_plugin bfloat16 \
+        --bert_attention_plugin bfloat16 \
+        --gpt_attention_plugin bfloat16 \
+        --remove_input_padding enable \
+        --context_fmha disable \
         --max_beam_width 1 \
         --max_batch_size 8 \
-        --max_encoder_input_len 924 \
         --max_output_len 100 \
+        --max_input_len 924 \
         --max_multimodal_len 256 # 8 (max_batch_size) * 32 (num_visual_features)
+
+    # Same command for decoder but don't set --max_multimodal_len
+    trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/bfloat16/tp1/pp1/decoder \
+        --output_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/bfloat16/tp1/decoder \
+        --paged_kv_cache disable \
+        --moe_plugin disable \
+        --enable_xqa disable \
+        --use_custom_all_reduce disable \
+        --gemm_plugin bfloat16 \
+        --bert_attention_plugin bfloat16 \
+        --gpt_attention_plugin bfloat16 \
+        --remove_input_padding enable \
+        --context_fmha disable \
+        --max_beam_width 1 \
+        --max_batch_size 8 \
+        --max_output_len 100 \
+        --max_encoder_input_len 924 \
+        --max_input_len 1
     ```
 
     **NOTE**: `max_multimodal_len = max_batch_size * num_visual_features`, so if you change max_batch_size, max multimodal length **MUST** be changed accordingly.
 
-    The built T5 engines are located in `./trt_engines/${MODEL_NAME}/1-gpu/bfloat16/tp1`.
+    The built T5 engines are located in `./tmp/trt_engines/${MODEL_NAME}/1-gpu/bfloat16/tp1`.
 
 3.  Build TensorRT engines for visual components
 
@@ -68,7 +93,7 @@ We first describe how to run each model on a single GPU. We then provide general
         --input_text "Question: which city is this? Answer:" \
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
         --visual_engine_dir visual_engines/${MODEL_NAME} \
-        --llm_engine_dir trt_engines/${MODEL_NAME}/1-gpu/bfloat16/tp1
+        --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/bfloat16/tp1
     ```
 
 ## BLIP2-OPT
@@ -261,27 +286,33 @@ OPT pipeline needs few minor changes from T5 pipeline
 
    Nougat uses mBART architecture but replaces the LLM encoder with a Swin Transformer encoder.
    To achieve this, we add an extra `--nougat` flag (over mBART example) to
-   `bart/convert.py` and `build.py` in `examples/enc_dec`.
+   `convert_checkpoint.py` in `examples/enc_dec` and `trtllm-build`.
 
     ```bash
-    python ../enc_dec/bart/convert.py -i tmp/hf_models/${MODEL_NAME} \
-        -o tmp/trt_models/${MODEL_NAME} --weight_data_type float32 \
-        --inference_tensor_para_size 1 --nougat
-
-    python ../enc_dec/build.py \
-        --model_type bart \
-        --weight_dir tmp/trt_models/${MODEL_NAME}/tp1 \
-        -o trt_engines/${MODEL_NAME}/1-gpu \
-        --engine_name $MODEL_NAME \
-        --bert_attention_plugin \
-        --use_gpt_attention_plugin \
-        --use_gemm_plugin \
+    python ../enc_dec/convert_checkpoint.py --model_type bart \
+        --model_dir tmp/hf_models/${MODEL_NAME} \
+        --output_dir tmp/trt_models/${MODEL_NAME}/bfloat16 \
+        --tp_size 1 \
+        --pp_size 1 \
+        --weight_data_type float32 \
         --dtype bfloat16 \
+        --nougat
+
+    trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/bfloat16/tp1/pp1/decoder \
+        --output_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/bfloat16/tp1/decoder \
+        --paged_kv_cache disable \
+        --moe_plugin disable \
+        --enable_xqa disable \
+        --use_custom_all_reduce disable \
+        --gemm_plugin bfloat16 \
+        --bert_attention_plugin bfloat16 \
+        --gpt_attention_plugin bfloat16 \
+        --remove_input_padding enable \
         --max_beam_width 1 \
         --max_batch_size 1 \
-        --nougat \
         --max_output_len 100 \
-        --max_multimodal_len 588 # 1 (max_batch_size) * 588 (num_visual_features)
+        --max_input_len 1 \
+        --max_encoder_input_len 588 # 1 (max_batch_size) * 588 (num_visual_features)
     ```
 
 3. Generate TensorRT engines for visual components and combine everything into final pipeline.
@@ -292,7 +323,7 @@ OPT pipeline needs few minor changes from T5 pipeline
     python run.py \
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
         --visual_engine_dir visual_engines/${MODEL_NAME} \
-        --llm_engine_dir trt_engines/${MODEL_NAME}/1-gpu/bfloat16/tp1 \
+        --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/bfloat16/tp1 \
     ```
     Note: Nougat models usually do not need a text prompt.
 

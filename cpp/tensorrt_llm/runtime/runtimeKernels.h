@@ -95,8 +95,9 @@ void mergeLogitsFragments(BufferManager const& bufferManager, ITensor& output, s
     SizeType const beamWidth, CudaStream const& stream, int stepOffset);
 
 void invokeUpdateKVBlockArrayDraftTokenLocation(ITensor const& seqAcceptedDraftTokenOffsets,
-    ITensor const& packedAcceptedDraftTokensIndices, ITensor const& pastKeyValueLengths, int64_t* const* pointerArray,
-    SizeType layerCount, SizeType seqCount, SizeType numKVHeads, SizeType sizeInBytesPerKVHead,
-    SizeType rewindDraftTokenCommonCount, int* rewindDraftTokenSeparateAdjustments, ITensor const& seqSlotRemapping,
-    SizeType maxKVCacheLen, SizeType maxBlocksPerSeq, SizeType tokensPerBlock, cudaStream_t stream);
+    ITensor const& packedAcceptedDraftTokensIndices, ITensor const& pastKeyValueLengths, void* const* pointerArray,
+    int32_t const* offsetArray, SizeType layerCount, SizeType seqCount, SizeType numKVHeads,
+    SizeType sizeInBytesPerKVHead, SizeType rewindDraftTokenCommonCount, int* rewindDraftTokenSeparateAdjustments,
+    ITensor const& seqSlotRemapping, SizeType maxKVCacheLen, SizeType maxBlocksPerSeq, SizeType tokensPerBlock,
+    cudaStream_t stream);
 } // namespace tensorrt_llm::runtime::kernels

@@ -249,6 +249,14 @@ def parse_arguments():
         default=False,
         action='store_true',
         help="Print profile information per layer (default = disabled)")
+
+    parser.add_argument(
+        '--dump_layer_info',
+        default=False,
+        action='store_true',
+        help=
+        "Print layer information of the engine to console (default = disabled)")
+
     return parser.parse_args()
 
 

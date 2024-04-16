@@ -30,9 +30,9 @@ from tensorrt_llm.layers import (MLP, Attention, AttentionMaskType,
                                  Conv1d, Embedding, FusedGatedMLP, GatedMLP,
                                  GroupNorm, KeyValueCacheParams, LayerNorm,
                                  LoraParams, PromptTuningEmbedding, RmsNorm)
+from tensorrt_llm.lora_manager import LoraBuildConfig, use_lora
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.generation_mixin import GenerationMixin
-from tensorrt_llm.models.modeling_utils import optimize_model
+from tensorrt_llm.models.modeling_utils import PretrainedConfig, PretrainedModel
 from tensorrt_llm.module import Module, ModuleList
 from tensorrt_llm.parameter import Parameter
 from tensorrt_llm.plugin.plugin import current_all_reduce_helper
@@ -503,124 +503,106 @@ class DecoderLayer(Module):
         return hidden_states
 
 
-class EncoderModel(Module, GenerationMixin):
+class EncoderModel(PretrainedModel):
 
-    def __init__(self,
-                 num_layers,
-                 num_heads,
-                 hidden_size,
-                 ffn_hidden_size,
-                 vocab_size,
-                 dtype,
-                 head_size=None,
-                 num_kv_heads=None,
-                 max_position_embeddings=None,
-                 has_position_embedding=False,
-                 relative_attention=False,
-                 max_distance=None,
-                 num_buckets=None,
-                 type_vocab_size=None,
-                 has_embedding_layernorm=False,
-                 has_embedding_scale=False,
-                 q_scaling=1.0,
-                 has_attention_qkvo_bias=False,
-                 has_mlp_bias=False,
-                 has_model_final_layernorm=False,
-                 layernorm_eps=1e-5,
-                 layernorm_position=LayerNormPositionType.pre_layernorm,
-                 layernorm_type=LayerNormType.LayerNorm,
-                 hidden_act="relu",
-                 mlp_type=MLPType.MLP,
-                 residual_scaling=1.0,
-                 use_prompt_tuning=False,
-                 use_parallel_embedding=False,
-                 embedding_sharding_dim=0,
-                 mapping=Mapping(),
-                 fp16_clamping=False,
-                 max_lora_rank=None):
-        super().__init__()
-        self.mapping = mapping
+    def __init__(self, config: PretrainedConfig):
+        super().__init__(config)
+        self.mapping = self.config.mapping
 
-        self.has_position_embedding = has_position_embedding
-        self.has_token_type_embedding = type_vocab_size is not None
+        self.has_position_embedding = self.config.has_position_embedding
+        type_vocab_size = None if not hasattr(
+            self.config, "type_vocab_size") else self.config.type_vocab_size
+        self.has_token_type_embedding = False if type_vocab_size is None else True
 
         # e.g. BART regular, T5 RMS
-        self.layernorm_type = layernorm_type
-        ln_type = layernorm_map[layernorm_type]
+        self.layernorm_type = self.config.layernorm_type
+        ln_type = layernorm_map[self.layernorm_type]
 
         # e.g. BART true, T5 false
-        self.has_attention_qkvo_bias = has_attention_qkvo_bias
-        self.has_mlp_bias = has_mlp_bias
+        self.has_attention_qkvo_bias = self.config.has_attention_qkvo_bias
+        self.has_mlp_bias = self.config.has_mlp_bias
 
         # e.g. BART false, T5 true
-        self.has_model_final_layernorm = has_model_final_layernorm
+        self.has_model_final_layernorm = self.config.has_model_final_layernorm
 
-        if isinstance(dtype, str):
-            self._dtype = str_dtype_to_trt(dtype)
+        if isinstance(self.config.dtype, str):
+            self._dtype = str_dtype_to_trt(self.config.dtype)
         else:
-            assert isinstance(dtype, trt.DataType)
-            self._dtype = dtype
+            assert isinstance(self.config.dtype, trt.DataType)
+            self._dtype = self.config.dtype
 
-        self.total_num_layers = num_layers
-        self.num_layers = num_layers // self.mapping.pp_size
+        self.total_num_layers = self.config.num_hidden_layers
+        self.num_layers = self.config.num_hidden_layers // self.mapping.pp_size
 
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
+        self.hidden_size = self.config.hidden_size
+        self.num_heads = self.config.num_attention_heads
+        num_kv_heads = self.num_heads
         if num_kv_heads is None or num_kv_heads <= 0:
-            num_kv_heads = num_heads
+            num_kv_heads = self.config.num_attention_heads
         self.num_kv_heads = num_kv_heads
-        self.head_size = self.hidden_size // self.num_heads if head_size is None else head_size
+        self.head_size = self.hidden_size // self.num_heads if self.config.head_size is None else self.config.head_size
+
+        self.fp16_clamping = (self.config.dtype
+                              == 'float16') and (self.config.model_type == 't5')
+        self.mlp_type = MLPType.MLP if not hasattr(
+            self.config, "mlp_type") else self.config.mlp_type
 
         if self.mapping.is_first_pp_rank():
             self.embedding = EncDecEmbedding(
-                vocab_size,
-                hidden_size,
-                max_position_embeddings=max_position_embeddings,
-                has_position_embedding=has_position_embedding,
+                self.config.vocab_size,
+                self.config.hidden_size,
+                max_position_embeddings=self.config.max_position_embeddings,
+                has_position_embedding=self.has_position_embedding,
                 type_vocab_size=type_vocab_size,
-                has_embedding_layernorm=has_embedding_layernorm,
-                has_embedding_scale=has_embedding_scale,
-                layernorm_eps=layernorm_eps,
-                layernorm_type=layernorm_type,
-                dtype=dtype,
-                use_prompt_tuning=use_prompt_tuning,
-                use_parallel_embedding=use_parallel_embedding,
-                embedding_sharding_dim=embedding_sharding_dim,
+                has_embedding_layernorm=self.config.has_embedding_layernorm,
+                has_embedding_scale=self.config.has_embedding_scale,
+                layernorm_eps=self.config.norm_epsilon,
+                layernorm_type=self.layernorm_type,
+                dtype=self.config.dtype,
+                use_prompt_tuning=self.config.use_prompt_tuning,
+                use_parallel_embedding=self.config.use_parallel_embedding,
+                embedding_sharding_dim=self.config.embedding_sharding_dim,
                 mapping=self.mapping)
 
         self.encoder_layers = ModuleList([
-            EncoderLayer(hidden_size=hidden_size,
-                         ffn_hidden_size=ffn_hidden_size,
-                         num_attention_heads=num_heads,
-                         num_kv_heads=num_kv_heads,
-                         head_size=self.head_size,
-                         max_position_embeddings=max_position_embeddings,
-                         q_scaling=q_scaling,
-                         has_attention_qkvo_bias=has_attention_qkvo_bias,
-                         has_mlp_bias=has_mlp_bias,
-                         layernorm_position=layernorm_position,
-                         layernorm_eps=layernorm_eps,
-                         layernorm_type=layernorm_type,
-                         hidden_act=hidden_act,
-                         mlp_type=mlp_type,
-                         mapping=self.mapping,
-                         dtype=dtype,
-                         residual_scaling=residual_scaling,
-                         relative_attention=relative_attention,
-                         max_distance=max_distance,
-                         num_buckets=num_buckets,
-                         fp16_clamping=fp16_clamping)
+            EncoderLayer(
+                hidden_size=self.hidden_size,
+                ffn_hidden_size=self.config.ffn_hidden_size,
+                num_attention_heads=self.num_heads,
+                num_kv_heads=num_kv_heads,
+                head_size=self.head_size,
+                max_position_embeddings=self.config.max_position_embeddings,
+                q_scaling=self.config.q_scaling,
+                has_attention_qkvo_bias=self.has_attention_qkvo_bias,
+                has_mlp_bias=self.has_mlp_bias,
+                layernorm_position=self.config.layernorm_position,
+                layernorm_eps=self.config.norm_epsilon,
+                layernorm_type=self.layernorm_type,
+                hidden_act=self.config.hidden_act,
+                mlp_type=self.mlp_type,
+                mapping=self.mapping,
+                dtype=self.config.dtype,
+                residual_scaling=1.0
+                if not hasattr(self.config, "residual_scaling") else
+                self.config.residual_scaling,
+                relative_attention=self.config.relative_attention,
+                max_distance=self.config.max_distance,
+                num_buckets=self.config.num_buckets,
+                fp16_clamping=self.fp16_clamping)
             for _ in self.mapping.pp_layers(self.total_num_layers)
         ])
 
         if self.mapping.is_last_pp_rank():
             if self.has_model_final_layernorm:
-                self.final_layernorm = ln_type(normalized_shape=hidden_size,
-                                               eps=layernorm_eps,
-                                               dtype=dtype)
+                self.final_layernorm = ln_type(
+                    normalized_shape=self.config.hidden_size,
+                    eps=self.config.norm_epsilon,
+                    dtype=self.config.dtype)
 
-        if max_lora_rank is not None:
-            optimize_model(self, use_lora=True, max_lora_rank=max_lora_rank)
+        self.trtllm_modules_to_hf_modules = {
+            "attn_q": "q_proj",
+            "attn_v": "v_proj",
+        }
 
     def forward(self,
                 input_ids: Tensor,
@@ -670,7 +652,9 @@ class EncoderModel(Module, GenerationMixin):
                        max_batch_size,
                        max_input_len,
                        prompt_embedding_table_size: int = 0,
-                       lora_target_modules: List[str] = None):
+                       lora_target_modules: List[str] = None,
+                       *args,
+                       **kwargs):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
 
@@ -895,172 +879,168 @@ class EncoderModel(Module, GenerationMixin):
                 host_context_lengths=host_context_lengths,
             )
 
-        return (input_ids, input_lengths, position_ids, token_type_ids,
-                hidden_states, max_input_length, prompt_embedding_table, tasks,
-                prompt_vocab_size, attention_mask, lora_params)
+        result = {
+            'input_ids': input_ids,
+            'input_lengths': input_lengths,
+            'position_ids': position_ids,
+            'token_type_ids': token_type_ids,
+            'hidden_states': hidden_states,
+            'max_input_length': max_input_length,
+            'prompt_embedding_table': prompt_embedding_table,
+            'prompt_tasks': tasks,
+            'prompt_vocab_size': prompt_vocab_size,
+            'attention_mask': attention_mask,
+            'lora_params': lora_params,
+        }
+
+        return result
+
+    def use_lora(self, lora_config: LoraBuildConfig):
+        use_lora(self, lora_config, self.trtllm_modules_to_hf_modules)
 
 
-class DecoderModel(Module, GenerationMixin):
+class DecoderModel(PretrainedModel):
 
-    def __init__(self,
-                 num_layers,
-                 num_heads,
-                 hidden_size,
-                 ffn_hidden_size,
-                 encoder_num_heads,
-                 encoder_hidden_size,
-                 vocab_size,
-                 dtype,
-                 logits_dtype='float32',
-                 head_size=None,
-                 encoder_head_size=None,
-                 num_kv_heads=None,
-                 encoder_num_kv_heads=None,
-                 max_position_embeddings=None,
-                 has_position_embedding=False,
-                 relative_attention=False,
-                 max_distance=None,
-                 num_buckets=None,
-                 type_vocab_size=None,
-                 has_embedding_layernorm=False,
-                 has_embedding_scale=False,
-                 q_scaling=1.0,
-                 has_attention_qkvo_bias=False,
-                 has_mlp_bias=False,
-                 has_model_final_layernorm=False,
-                 layernorm_eps=1e-5,
-                 layernorm_position=LayerNormPositionType.pre_layernorm,
-                 layernorm_type=LayerNormType.LayerNorm,
-                 hidden_act="relu",
-                 mlp_type=MLPType.MLP,
-                 rescale_before_lm_head=False,
-                 has_lm_head_bias=False,
-                 residual_scaling=1.0,
-                 use_parallel_embedding=False,
-                 embedding_sharding_dim=0,
-                 mapping=Mapping(),
-                 fp16_clamping=False,
-                 max_lora_rank=None,
-                 skip_cross_qkv=False):
-        super().__init__()
-        self.mapping = mapping
+    def __init__(self, config: PretrainedConfig):
+        super().__init__(config)
 
-        self.has_position_embedding = has_position_embedding  # TODO: remove dup codes
-        self.has_token_type_embedding = type_vocab_size is not None
-        self.rescale_before_lm_head = rescale_before_lm_head
+        self.mapping = Mapping() if not hasattr(
+            self.config, "mapping") else self.config.mapping
+
+        self.has_position_embedding = self.config.has_position_embedding  # TODO: remove dup codes
+        type_vocab_size = None if not hasattr(
+            self.config, "type_vocab_size") else self.config.type_vocab_size
+        self.has_token_type_embedding = False if type_vocab_size is None else True
+        self.rescale_before_lm_head = self.config.rescale_before_lm_head
 
         # e.g. BART regular, T5 RMS
-        self.layernorm_type = layernorm_type
-        ln_type = layernorm_map[layernorm_type]
+        self.layernorm_type = self.config.layernorm_type
+        ln_type = layernorm_map[self.layernorm_type]
 
         # e.g. BART true, T5 false
-        self.has_attention_qkvo_bias = has_attention_qkvo_bias
-        self.has_mlp_bias = has_mlp_bias
+        self.has_attention_qkvo_bias = self.config.has_attention_qkvo_bias
+        self.has_mlp_bias = self.config.has_mlp_bias
 
         # e.g. BART false, T5 true
-        self.has_model_final_layernorm = has_model_final_layernorm
+        self.has_model_final_layernorm = self.config.has_model_final_layernorm
 
-        if isinstance(dtype, str):
-            self._dtype = str_dtype_to_trt(dtype)
+        if isinstance(self.config.dtype, str):
+            self._dtype = str_dtype_to_trt(self.config.dtype)
         else:
-            assert isinstance(dtype, trt.DataType)
-            self._dtype = dtype
+            assert isinstance(self.config.dtype, trt.DataType)
+            self._dtype = self.config.dtype
 
         # no quantization considered for now
         self._kv_dtype = self._dtype
 
-        if isinstance(logits_dtype, str):
-            self._logits_dtype = str_dtype_to_trt(logits_dtype)
+        if isinstance(self.config.logits_dtype, str):
+            self._logits_dtype = str_dtype_to_trt(self.config.logits_dtype)
         else:
-            assert isinstance(logits_dtype, trt.DataType)
-            self._logits_dtype = logits_dtype
+            assert isinstance(self.config.logits_dtype, trt.DataType)
+            self._logits_dtype = self.config.logits_dtype
 
-        self.total_num_layers = num_layers
-        self.num_layers = num_layers // self.mapping.pp_size
+        self.total_num_layers = self.config.num_hidden_layers
+        self.num_layers = self.config.num_hidden_layers // self.mapping.pp_size
 
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
+        self.hidden_size = self.config.hidden_size
+        self.num_heads = self.config.num_attention_heads
+        num_kv_heads = self.num_heads
         if num_kv_heads is None or num_kv_heads <= 0:
-            num_kv_heads = num_heads
+            num_kv_heads = self.num_heads
         self.num_kv_heads = num_kv_heads
-        self.head_size = self.hidden_size // self.num_heads if head_size is None else head_size
+        self.head_size = self.hidden_size // self.num_heads if self.config.head_size is None else self.config.head_size
 
-        self.encoder_hidden_size = encoder_hidden_size
-        self.encoder_num_heads = encoder_num_heads
+        self.encoder_hidden_size = self.config.encoder_hidden_size
+        self.encoder_num_heads = self.config.encoder_num_heads
+        encoder_num_kv_heads = None if not hasattr(
+            self.config,
+            "encoder_num_kv_heads") else self.config.encoder_num_kv_heads
         if encoder_num_kv_heads is None or encoder_num_kv_heads <= 0:
-            encoder_num_kv_heads = encoder_num_heads
+            encoder_num_kv_heads = self.encoder_num_heads
         self.encoder_num_kv_heads = encoder_num_kv_heads
-        self.encoder_head_size = self.encoder_hidden_size // self.num_heads if encoder_head_size is None else encoder_head_size
+        self.encoder_head_size = self.encoder_hidden_size // self.num_heads if self.config.encoder_head_size is None else self.config.encoder_head_size
 
-        self.has_position_embedding = has_position_embedding
+        self.has_position_embedding = self.config.has_position_embedding
         self.has_token_type_embedding = type_vocab_size is not None
-        self.rescale_before_lm_head = rescale_before_lm_head
 
-        self.skip_cross_qkv = skip_cross_qkv
+        self.fp16_clamping = (self.config.dtype
+                              == 'float16') and (self.config.model_type == 't5')
+
+        self.skip_cross_qkv = self.config.skip_cross_qkv
+        self.mlp_type = MLPType.MLP if not hasattr(
+            self.config, "mlp_type") else self.config.mlp_type
 
         if self.mapping.is_first_pp_rank():
             self.embedding = EncDecEmbedding(
-                vocab_size,
-                hidden_size,
-                max_position_embeddings=max_position_embeddings,
-                has_position_embedding=has_position_embedding,
+                self.config.vocab_size,
+                self.config.hidden_size,
+                max_position_embeddings=self.config.max_position_embeddings,
+                has_position_embedding=self.config.has_position_embedding,
                 type_vocab_size=type_vocab_size,
-                has_embedding_layernorm=has_embedding_layernorm,
-                has_embedding_scale=has_embedding_scale,
-                layernorm_eps=layernorm_eps,
-                layernorm_type=layernorm_type,
-                dtype=dtype,
-                use_parallel_embedding=use_parallel_embedding,
-                embedding_sharding_dim=embedding_sharding_dim,
+                has_embedding_layernorm=self.config.has_embedding_layernorm,
+                has_embedding_scale=self.config.has_embedding_scale,
+                layernorm_eps=self.config.norm_epsilon,
+                layernorm_type=self.config.layernorm_type,
+                dtype=self._dtype,
+                use_parallel_embedding=self.config.use_parallel_embedding,
+                embedding_sharding_dim=self.config.embedding_sharding_dim,
                 mapping=self.mapping)
 
         layers_range = self.mapping.pp_layers(self.total_num_layers)
         self.decoder_layers = ModuleList([
             DecoderLayer(
                 local_layer_idx=layer_idx - layers_range[0],
-                hidden_size=hidden_size,
-                ffn_hidden_size=ffn_hidden_size,
-                num_attention_heads=num_heads,
+                hidden_size=self.config.hidden_size,
+                ffn_hidden_size=self.config.ffn_hidden_size,
+                num_attention_heads=self.num_heads,
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_size,
-                max_position_embeddings=max_position_embeddings,
-                q_scaling=q_scaling,
-                has_attention_qkvo_bias=has_attention_qkvo_bias,
-                has_mlp_bias=has_mlp_bias,
-                layernorm_position=layernorm_position,
-                layernorm_eps=layernorm_eps,
-                layernorm_type=layernorm_type,
-                hidden_act=hidden_act,
-                mlp_type=mlp_type,
+                max_position_embeddings=self.config.max_position_embeddings,
+                q_scaling=self.config.q_scaling,
+                has_attention_qkvo_bias=self.config.has_attention_qkvo_bias,
+                has_mlp_bias=self.config.has_mlp_bias,
+                layernorm_position=self.config.layernorm_position,
+                layernorm_eps=self.config.norm_epsilon,
+                layernorm_type=self.config.layernorm_type,
+                hidden_act=self.config.hidden_act,
+                mlp_type=self.mlp_type,
                 mapping=self.mapping,
-                dtype=dtype,
-                residual_scaling=residual_scaling,
-                relative_attention=relative_attention,
-                max_distance=max_distance,
-                num_buckets=num_buckets,
-                fp16_clamping=fp16_clamping,
-                skip_cross_qkv=skip_cross_qkv,
+                dtype=self._dtype,
+                residual_scaling=1.0
+                if not hasattr(self.config, "residual_scaling") else
+                self.config.residual_scaling,
+                relative_attention=self.config.relative_attention,
+                max_distance=self.config.max_distance,
+                num_buckets=self.config.num_buckets,
+                fp16_clamping=self.fp16_clamping,
+                skip_cross_qkv=self.skip_cross_qkv,
             ) for layer_idx in layers_range
         ])
 
         if self.mapping.is_last_pp_rank():
             if self.has_model_final_layernorm:
-                self.final_layernorm = ln_type(normalized_shape=hidden_size,
-                                               eps=layernorm_eps,
-                                               dtype=dtype)
+                self.final_layernorm = ln_type(
+                    normalized_shape=self.config.hidden_size,
+                    eps=self.config.norm_epsilon,
+                    dtype=self.config.dtype)
 
             self.lm_head = ColumnLinear(
-                hidden_size,
-                vocab_size,
-                bias=has_lm_head_bias,
-                dtype=dtype,
-                tp_group=mapping.tp_group,
-                tp_size=mapping.tp_size,
+                self.config.hidden_size,
+                self.config.vocab_size,
+                bias=False if not hasattr(self.config, "has_lm_head_bias") else
+                self.config.has_lm_head_bias,
+                dtype=self.config.dtype,
+                tp_group=self.config.mapping.tp_group,
+                tp_size=self.config.mapping.tp_size,
                 gather_output=True,
             )
 
-        if max_lora_rank is not None:
-            optimize_model(self, use_lora=True, max_lora_rank=max_lora_rank)
+        self.trtllm_modules_to_hf_modules = {
+            "attn_q": "q_proj",
+            "attn_v": "v_proj",
+            "cross_attn_q": "q_proj",
+            "cross_attn_v": "v_proj",
+        }
 
     def forward(self,
                 decoder_input_ids: Tensor,
@@ -1171,17 +1151,17 @@ class DecoderModel(Module, GenerationMixin):
                 return lm_logits
             return hidden_states
 
-    def prepare_inputs(
-        self,
-        max_batch_size,
-        max_beam_width,
-        max_decoder_input_len,
-        max_new_tokens,
-        max_encoder_input_len,
-        gather_context_logits: bool = False,
-        gather_generation_logits: bool = False,
-        lora_target_modules: List[str] = None,
-    ):
+    def prepare_inputs(self,
+                       max_batch_size,
+                       max_beam_width,
+                       max_decoder_input_len,
+                       max_seq_len,
+                       max_encoder_input_len,
+                       gather_context_logits: bool = False,
+                       gather_generation_logits: bool = False,
+                       lora_target_modules: List[str] = None,
+                       *args,
+                       **kwargs):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
 
@@ -1189,7 +1169,7 @@ class DecoderModel(Module, GenerationMixin):
         '''
 
         # Prepare inputs
-        max_output_len = max_decoder_input_len + max_new_tokens
+        max_output_len = max_decoder_input_len + max_seq_len
 
         head_size = self.head_size
         num_kv_heads = (self.num_kv_heads + self.mapping.tp_size -
@@ -1629,10 +1609,27 @@ class DecoderModel(Module, GenerationMixin):
                     ]),
                 )
 
-        return (input_ids, encoder_output, position_ids, token_type_ids, True,
-                attention_mask, cross_attention_mask, last_token_ids,
-                kv_cache_params, attention_params, hidden_states, lora_params,
-                cross_kv_cache_gen, cross_qkv_reuse)
+        result = {
+            'decoder_input_ids': input_ids,
+            'encoder_output': encoder_output,
+            'position_ids': position_ids,
+            'token_type_ids': token_type_ids,
+            'use_cache': True,
+            'attention_mask': attention_mask,
+            'cross_attention_mask': cross_attention_mask,
+            'last_token_ids': last_token_ids,
+            'kv_cache_params': kv_cache_params,
+            'attention_params': attention_params,
+            'hidden_states': hidden_states,
+            'lora_params': lora_params,
+            'cross_kv_cache_gen': cross_kv_cache_gen,
+            'cross_qkv_reuse': cross_qkv_reuse,
+        }
+
+        return result
+
+    def use_lora(self, lora_config: LoraBuildConfig):
+        use_lora(self, lora_config, self.trtllm_modules_to_hf_modules)
 
 
 class WhisperEncoder(Module):

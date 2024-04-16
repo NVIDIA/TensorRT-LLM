@@ -101,15 +101,16 @@ void DecoderXQARunner::prepareForRun(XQAParams const& xqa_params)
 }
 
 template <typename KVCacheBuffer>
-void DecoderXQARunner::run(XQAParams const& xqa_params, KVCacheBuffer& kv_cache_buffer, cudaStream_t const& stream)
+void DecoderXQARunner::run(
+    XQAParams const& xqa_params, KVCacheBuffer const& kv_cache_buffer, cudaStream_t const& stream)
 {
-    return mImpl->run(xqa_params, kv_cache_buffer, mLaunchGridBlockCache, stream);
+    return mImpl->run(xqa_params, kv_cache_buffer, stream);
 }
 
 template void DecoderXQARunner::run(
-    XQAParams const& xqa_params, KVLinearBuffer& kv_linear_buffer, cudaStream_t const& stream);
+    XQAParams const& xqa_params, KVLinearBuffer const& kv_linear_buffer, cudaStream_t const& stream);
 template void DecoderXQARunner::run(
-    XQAParams const& xqa_params, KVBlockArray& kv_block_array, cudaStream_t const& stream);
+    XQAParams const& xqa_params, KVBlockArray const& kv_block_array, cudaStream_t const& stream);
 
 } // namespace kernels
 

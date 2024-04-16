@@ -79,7 +79,17 @@ void Executor::initBindings(py::module_& m)
         .def("__exit__", &Executor::exit)
         .def("enqueue_request", &Executor::enqueueRequest, py::arg("request"))
         .def("enqueue_requests", &Executor::enqueueRequests, py::arg("requests"))
-        .def("await_responses", &Executor::awaitResponses, py::arg("id") = py::none(), py::arg("timeout") = py::none())
+        .def("await_responses",
+            py::overload_cast<std::optional<std::chrono::milliseconds> const&>(&Executor::awaitResponses),
+            py::arg("timeout") = py::none())
+        .def("await_responses",
+            py::overload_cast<tle::IdType const&, std::optional<std::chrono::milliseconds> const&>(
+                &Executor::awaitResponses),
+            py::arg("id"), py::arg("timeout") = py::none())
+        .def("await_responses",
+            py::overload_cast<std::vector<tle::IdType> const&, std::optional<std::chrono::milliseconds> const&>(
+                &Executor::awaitResponses),
+            py::arg("ids"), py::arg("timeout") = py::none())
         .def("get_num_responses_ready", &Executor::getNumResponsesReady, py::arg("id") = py::none())
         .def("cancel_request", &Executor::cancelRequest, py::arg("id") = py::none())
         .def("get_latest_iteration_stats", &Executor::getLatestIterationStats)

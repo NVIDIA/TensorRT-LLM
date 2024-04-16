@@ -565,11 +565,35 @@ public:
     [[nodiscard]] std::vector<IdType> enqueueRequests(std::vector<Request> const& requests);
 
     /// @brief Await for ready responses
-    /// @param id An optional request id. If not specified, responses for any request can be returned
+    ///
+    ///        This overload awaits for any ready responses. In particular, if several requests
+    ///        have been enqueued, this method will provide any ready responses without order guarantees.
     /// @param timeout The maximum time to wait for new responses
     /// @return A vector of responses
-    [[nodiscard]] std::vector<Response> awaitResponses(std::optional<IdType> const& requestId = std::nullopt,
+    [[nodiscard]] std::vector<Response> awaitResponses(
         std::optional<std::chrono::milliseconds> const& timeout = std::nullopt);
+
+    /// @brief Await for ready responses
+    /// @param id A request id
+    /// @param timeout The maximum time to wait for new responses
+    /// @return A vector of responses
+    [[nodiscard]] std::vector<Response> awaitResponses(
+        IdType const& requestId, std::optional<std::chrono::milliseconds> const& timeout = std::nullopt);
+
+    /// @brief Await for multiple ready responses
+    ///
+    ///        A multiple ID request behaves as if awaitResponses(IdType, timeout)
+    ///        were invoked on all IDs. The returned vector contains
+    ///        a vector of responses per ID in the same order specified by the requestIds.
+    ///        The same behaviour as awaitResponses(IdType, timeout) applies:
+    ///        * Responses may be empty.
+    ///        * If all responses have already been given for one of the requestIds,
+    ///          then this method will hang unless a timeout is specified.
+    /// @param requestIds Ids requested
+    /// @param timeout The maximum time to wait for new responses
+    /// @return A vector of vector of responses
+    [[nodiscard]] std::vector<std::vector<Response>> awaitResponses(
+        std::vector<IdType> const& requestIds, std::optional<std::chrono::milliseconds> const& timeout = std::nullopt);
 
     /// @brief Get the number of ready responses
     /// @param requestId An optional request id

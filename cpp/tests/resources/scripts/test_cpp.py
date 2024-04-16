@@ -102,7 +102,8 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
               trt_root: _tp.Optional[str] = None,
               build_only=False,
               use_ccache=False,
-              job_count: _tp.Optional[int] = None) -> None:
+              job_count: _tp.Optional[int] = None,
+              test_timeout=3600) -> None:
     root_dir = find_root_dir()
     _log.info("Using root directory: %s", str(root_dir))
 
@@ -164,7 +165,7 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
     run_command(generate_multi_lora_tp2_args, cwd=root_dir, timeout=100)
 
     if not skip_unit_tests:
-        run_unit_tests(build_dir=build_dir)
+        run_unit_tests(build_dir=build_dir, timeout=test_timeout)
     else:
         _log.info("Skipping unit tests")
 
@@ -191,7 +192,8 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
                              run_chatglm=run_chatglm,
                              run_medusa=run_medusa,
                              run_mamba=run_mamba,
-                             run_fp8=run_fp8)
+                             run_fp8=run_fp8,
+                             timeout=test_timeout)
 
         if run_gpt:
             run_benchmarks(python_exe=python_exe,
@@ -210,7 +212,7 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
         if build_only:
             return
 
-        run_multi_gpu_tests(build_dir=build_dir)
+        run_multi_gpu_tests(build_dir=build_dir, timeout=test_timeout)
 
 
 def prepare_all_model_tests(python_exe: str,
@@ -343,7 +345,7 @@ def build_tests(build_dir: _pl.Path):
     run_command(make_google_tests, cwd=build_dir, timeout=300)
 
 
-def run_unit_tests(build_dir: _pl.Path):
+def run_unit_tests(build_dir: _pl.Path, timeout=1800):
     build_tests(build_dir=build_dir)
 
     cpp_env = {**_os.environ}
@@ -359,11 +361,18 @@ def run_unit_tests(build_dir: _pl.Path):
     excluded_tests.append("Medusa")
     excluded_tests.append("Mamba")
     ctest.extend(["-E", "|".join(excluded_tests)])
-    run_command(ctest, cwd=build_dir, env=cpp_env, timeout=1800)
+    run_command(ctest, cwd=build_dir, env=cpp_env, timeout=timeout)
 
 
-def run_single_gpu_tests(build_dir: _pl.Path, run_gpt, run_gptj, run_llama,
-                         run_chatglm, run_medusa, run_mamba, run_fp8):
+def run_single_gpu_tests(build_dir: _pl.Path,
+                         run_gpt,
+                         run_gptj,
+                         run_llama,
+                         run_chatglm,
+                         run_medusa,
+                         run_mamba,
+                         run_fp8,
+                         timeout=3600):
     build_tests(build_dir=build_dir)
 
     cpp_env = {**_os.environ}
@@ -394,10 +403,10 @@ def run_single_gpu_tests(build_dir: _pl.Path, run_gpt, run_gptj, run_llama,
         ctest.extend(["-R", "|".join(included_tests)])
         if excluded_tests:
             ctest.extend(["-E", "|".join(excluded_tests)])
-        run_command(ctest, cwd=build_dir, env=cpp_env, timeout=3600)
+        run_command(ctest, cwd=build_dir, env=cpp_env, timeout=timeout)
 
 
-def run_multi_gpu_tests(build_dir: _pl.Path):
+def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
     build_tests(build_dir=build_dir)
 
     tests_dir = build_dir / "tests"
@@ -415,7 +424,7 @@ def run_multi_gpu_tests(build_dir: _pl.Path):
         "batch_manager/trtGptModelRealDecoderTest", "--gtest_filter=*TP*:*PP*"
     ]
     run_command(trt_model_test, cwd=tests_dir, env=cpp_env,
-                timeout=1500)  # expecting ~ 1200s
+                timeout=timeout)  # expecting ~ 1200s
 
 
 def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
@@ -568,6 +577,7 @@ if __name__ == "__main__":
     parser.add_argument("--build_only",
                         action="store_true",
                         help="Build only, do not run tests.")
+    parser.add_argument("--test_timeout", type=int, help="Timeout for tests.")
 
     args = parser.parse_args()
 

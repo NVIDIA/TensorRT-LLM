@@ -29,17 +29,17 @@ namespace tensorrt_llm::layers
 class DecodingSetupParams
 {
 public:
-    std::optional<std::vector<float>> temperature;        // [1] or [batch_size] on cpu
-    std::optional<std::vector<std::int32_t>> min_length;  // [1] or [batch_size] on cpu
-    std::optional<std::vector<float>> repetition_penalty; // [1] or [batch_size] on cpu
-    std::optional<std::vector<float>> presence_penalty;   // [1] or [batch_size] on cpu
-    std::optional<std::vector<float>> frequency_penalty;  // [1] or [batch_size] on cpu
+    std::optional<std::vector<float>> temperature;              // [1] or [batch_size] on cpu
+    std::optional<std::vector<runtime::SizeType32>> min_length; // [1] or [batch_size] on cpu
+    std::optional<std::vector<float>> repetition_penalty;       // [1] or [batch_size] on cpu
+    std::optional<std::vector<float>> presence_penalty;         // [1] or [batch_size] on cpu
+    std::optional<std::vector<float>> frequency_penalty;        // [1] or [batch_size] on cpu
 };
 
 class DecodingParams
 {
 public:
-    DecodingParams(int step, int ite, tc::Tensor logits, tc::Tensor end_ids)
+    DecodingParams(runtime::SizeType32 step, runtime::SizeType32 ite, tc::Tensor logits, tc::Tensor end_ids)
         : step{step}
         , ite{ite}
         , logits{std::move(logits)}
@@ -48,8 +48,8 @@ public:
     }
 
     // mandatory parameters
-    int step;
-    int ite;
+    runtime::SizeType32 step;
+    runtime::SizeType32 ite;
     tc::Tensor logits;                     // [local_batch_size, beam_width, vocab_size_padded]
     tc::Tensor end_ids;                    // [local_batch_size]
     std::optional<tc::Tensor> batch_slots; // [local_batch_size], on pinned memory

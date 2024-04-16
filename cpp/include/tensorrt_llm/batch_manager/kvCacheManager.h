@@ -89,13 +89,15 @@ struct KvCacheStats
 class KVCacheBlock
 {
 public:
-    explicit KVCacheBlock(SizeType blockIdx, SizeType blocksInPrimaryPool);
+    using OffsetType = std::int32_t;
+
+    explicit KVCacheBlock(OffsetType blockIdx, OffsetType blocksInPrimaryPool);
 
     void startScheduling();
 
-    [[nodiscard]] SizeType getBlockIdx() const;
+    [[nodiscard]] OffsetType getBlockIdx() const;
 
-    [[nodiscard]] SizeType getMemoryPoolBlockOffset() const;
+    [[nodiscard]] OffsetType getMemoryPoolBlockOffset() const;
 
     [[nodiscard]] bool isPrimary() const;
 
@@ -142,10 +144,10 @@ public:
 
 private:
     // Linear index of block in pool
-    SizeType mBlockIdx;
+    OffsetType mBlockIdx;
 
     // Block in memory pool backing this block
-    SizeType mMemoryPoolBlockOffset;
+    OffsetType mMemoryPoolBlockOffset;
 
     // Number of references to the block
     SizeType mRefCount;
@@ -169,7 +171,7 @@ private:
     bool mIsFull;
 
     // Flag indicating mMemoryPoolBlockOffset refers to secondary pool
-    static constexpr SizeType secondaryPoolFlag = static_cast<SizeType>(1) << (8 * sizeof(SizeType) - 1);
+    static constexpr OffsetType secondaryPoolFlag = static_cast<OffsetType>(1) << (8 * sizeof(OffsetType) - 1);
 };
 
 class GenerationRequest
@@ -365,11 +367,15 @@ public:
         return mPrimaryPool;
     }
 
-    //! \brief Get raw void* pointer to K block.
+    [[nodiscard]] runtime::ITensor::SharedPtr getSecondaryPool() const noexcept
+    {
+        return mSecondaryPool;
+    }
+
+    //! \brief Get offset in pool to K or V block.
     //! \param blockIdx the blockIdx as returned by getBlockIdx()
-    //! \param layerNum layer number.
     //! \param fieldIdx either 0 (K) or 1 (V),
-    [[nodiscard]] void* getKOrVBlockPointer(SizeType blockIdx, SizeType layerNum, SizeType fieldIdx) const;
+    [[nodiscard]] SizeType getKOrVBlockOffset(SizeType blockIdx, SizeType fieldIdx) const;
 
     //! \brief Bring offloaded block from secondary to primary memory.
     //! \details Does nothing of block is already in primary memory.
@@ -446,6 +452,7 @@ private:
 class KVCacheManager
 {
 public:
+    using OffsetType = KVCacheBlock::OffsetType;
     using SizeType = tensorrt_llm::runtime::SizeType;
     using SequencesPtr = GenerationRequest::SharedPtr;
     using CudaStreamPtr = std::shared_ptr<runtime::CudaStream>;
@@ -527,12 +534,14 @@ public:
 
     void schedulingRemoveSequence(SizeType seqSlotIdx);
 
-    void getBlockPointersOfBatch(
-        runtime::ITensor& dstPointers, SizeType firstBatchSlotIdx, SizeType batchSize, SizeType beamWidth) const;
+    [[nodiscard]] runtime::ITensor::UniquePtr getBlockPoolPointers() const;
 
-    // returns maxBlockCount of all beams
-    SizeType copyBlockPointers(
-        runtime::ITensor& dstPointers, SizeType dstSlotOffset, SizeType seqSlotIdx, SizeType beamWidth) const;
+    void getBlockOffsetsOfBatch(
+        runtime::ITensor& output, SizeType firstBatchSlotIdx, SizeType batchSize, SizeType beamWidth) const;
+
+    //! @return maxBlockCount of all beams
+    SizeType copyBlockOffsets(
+        runtime::ITensor& output, SizeType outputSlotOffset, SizeType seqSlotIdx, SizeType beamWidth) const;
 
     // Volume of [2, numKvHeads, tokensPerBlock, sizePerHead]
     [[nodiscard]] static SizeType constexpr calculatePageSize(tensorrt_llm::runtime::GptModelConfig const& modelConfig)
@@ -567,12 +576,12 @@ public:
     void rewindKVCache(SizeType seqSlotIdx, SizeType rewindLengths);
 
 private:
-    void setPointers(void** pointersPtr, nvinfer1::Dims const& pointersShape, SizeType layerNum, SizeType seqSlotIdx,
-        SizeType beamIdx, SizeType blockIdx, SizeType blockId);
+    void setOffsets(OffsetType* offsetsPtr, nvinfer1::Dims const& offsetsShape, SizeType seqSlotIdx, SizeType beamIdx,
+        SizeType blockIdx, SizeType blockId) const;
 
-    void resetBlockPointers(SizeType seqSlotIdx, SizeType beamWidth);
-    void cacheBlockPointers(GenerationRequest const& seq, SizeType seqSlotIdx);
-    void cacheNewBlockPointers(GenerationRequest const& seq, SizeType seqSlotIdx);
+    void resetBlockOffsets(SizeType seqSlotIdx, SizeType beamWidth);
+    void cacheBlockOffsets(GenerationRequest const& seq, SizeType seqSlotIdx);
+    void cacheNewBlockOffsets(GenerationRequest const& seq, SizeType seqSlotIdx);
     void updateNewBlockPointer(GenerationRequest const& seq, SizeType seqSlotIdx, SizeType blockIdx);
     void updateToken(SizeType seqSlotIdx, bool addToken);
 
@@ -598,8 +607,8 @@ private:
     BlockManager mBlockManager;
     // List of all sequences
     std::vector<SequencesPtr> mSequences;
-    // buffer for block pointers for all managed sequences
-    runtime::ITensor::SharedPtr mSequenceBlockPointers;
+    // buffer for block offsets for all managed sequences
+    runtime::ITensor::SharedPtr mSequenceBlockOffsets;
     // Whether to cache KV pages for reuse
     bool mEnableBlockReuse;
 };

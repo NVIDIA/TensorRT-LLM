@@ -16,6 +16,7 @@
 #pragma once
 
 #include "tensorrt_llm/kernels/decodingCommon.h"
+#include "tensorrt_llm/runtime/common.h"
 #include <cuda_runtime.h>
 
 namespace tensorrt_llm
@@ -43,9 +44,10 @@ namespace kernels
 //! \param beamWidth beam width
 //! \param maxSeqLen maximum length of the sequence
 //! \param stream stream
-void invokeStopWordsCriterion(int32_t const** outputIds, int32_t const** parentIds, int32_t const** stopWords,
-    FinishedState* finished, int32_t const* sequenceLengths, int32_t const* batchSlots, int32_t const* stopWordsLen,
-    int32_t maxStopWordsLen, int32_t batchSize, int32_t beamWidth, int32_t maxSeqLen, cudaStream_t stream);
+void invokeStopWordsCriterion(runtime::TokenIdType const** outputIds, runtime::SizeType32 const** parentIds,
+    runtime::TokenIdType const** stopWords, FinishedState* finished, runtime::SizeType32 const* sequenceLengths,
+    runtime::SizeType32 const* batchSlots, runtime::SizeType32 const* stopWordsLen, runtime::SizeType maxStopWordsLen,
+    runtime::SizeType batchSize, runtime::SizeType beamWidth, runtime::SizeType maxSeqLen, cudaStream_t stream);
 
 //! \brief Sets finished states based on the sequenceLimitLength and computes number of finished sequences in the batch.
 //!
@@ -60,7 +62,9 @@ void invokeStopWordsCriterion(int32_t const** outputIds, int32_t const** parentI
 //! \param batchSize batch size
 //! \param beamWidth beam width
 //! \param stream stream
-void invokeLengthCriterion(FinishedState* finished, int32_t* finishedSum, uint32_t const* sequenceLimitLength,
-    int32_t* sequenceLengths, int32_t const* batchSlots, int32_t batchSize, int32_t beamWidth, cudaStream_t stream);
+void invokeLengthCriterion(FinishedState* finished, runtime::SizeType32* finishedSum,
+    runtime::SizeType32 const* sequenceLimitLength, runtime::SizeType32* sequenceLengths,
+    runtime::SizeType32 const* batchSlots, runtime::SizeType batchSize, runtime::SizeType beamWidth,
+    cudaStream_t stream);
 } // namespace kernels
 } // namespace tensorrt_llm

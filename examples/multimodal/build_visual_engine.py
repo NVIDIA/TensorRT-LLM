@@ -16,6 +16,63 @@ from transformers import (AutoProcessor, Blip2ForConditionalGeneration,
                           NougatProcessor, VisionEncoderDecoderModel)
 
 
+def parse_arguments():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model_type',
+                        type=str,
+                        default=None,
+                        choices=[
+                            'opt-2.7b', 'opt-6.7b', 'flan-t5-xl', 'flan-t5-xxl',
+                            'llava', 'vila', 'nougat'
+                        ],
+                        help="Model type")
+    parser.add_argument('--model_path',
+                        type=str,
+                        default=None,
+                        help="Huggingface repo or local directory with weights")
+    parser.add_argument('--vila_path',
+                        type=str,
+                        default=None,
+                        help="Path to VILA source code directory")
+    parser.add_argument('--output_dir',
+                        type=str,
+                        default=None,
+                        help="Directory where visual TRT engines are saved")
+    parser.add_argument('--max_batch_size',
+                        type=int,
+                        default=4,
+                        help="Maximum batch size for input images")
+    return parser.parse_args()
+
+
+class VisionEngineBuilder:
+
+    def __init__(self, args):
+        args.device = torch.device(
+            "cuda") if torch.cuda.is_available() else "cpu"
+        if args.output_dir is None:
+            args.output_dir = 'visual_engines/%s' % (
+                args.model_path.split('/')[-1])
+        if not os.path.exists(args.output_dir):
+            os.makedirs(args.output_dir)
+
+        self.args = args
+
+    def build(self):
+        args = self.args
+        if 'opt' in args.model_type or 't5' in args.model_type:
+            build_blip2_engine(args)
+        elif args.model_type == 'llava':
+            build_llava_engine(args)
+        elif args.model_type == 'vila':
+            assert args.vila_path is not None, "Please clone and provide VILA source code path"
+            build_vila_engine(args)
+        elif args.model_type == 'nougat':
+            build_nougat_engine(args)
+        else:
+            raise RuntimeError(f"Invalid model type {args.model_type}")
+
+
 def export_visual_wrapper_onnx(visual_wrapper, image, output_dir):
     logger.log(trt.Logger.INFO, "Exporting onnx")
     os.makedirs(f'{output_dir}/onnx', exist_ok=True)
@@ -218,49 +275,6 @@ def build_nougat_engine(args):
 
 if __name__ == '__main__':
     logger = trt.Logger(trt.Logger.INFO)
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--model_type',
-                        type=str,
-                        default=None,
-                        choices=[
-                            'opt-2.7b', 'opt-6.7b', 'flan-t5-xl', 'flan-t5-xxl',
-                            'llava', 'vila', 'nougat'
-                        ],
-                        help="Model type")
-    parser.add_argument('--model_path',
-                        type=str,
-                        default=None,
-                        help="Huggingface repo or local directory with weights")
-    parser.add_argument('--vila_path',
-                        type=str,
-                        default=None,
-                        help="Path to VILA source code directory")
-    parser.add_argument('--output_dir',
-                        type=str,
-                        default=None,
-                        help="Directory where visual TRT engines are saved")
-    parser.add_argument('--max_batch_size',
-                        type=int,
-                        default=4,
-                        help="Maximum batch size for input images")
-    args = parser.parse_args()
-
-    args.device = torch.device("cuda") if torch.cuda.is_available() else "cpu"
-
-    if args.output_dir is None:
-        args.output_dir = 'visual_engines/%s' % (args.model_path.split('/')[-1])
-    if not os.path.exists(args.output_dir):
-        os.makedirs(args.output_dir)
-
-    if 'opt' in args.model_type or 't5' in args.model_type:
-        build_blip2_engine(args)
-    elif args.model_type == 'llava':
-        build_llava_engine(args)
-    elif args.model_type == 'vila':
-        assert args.vila_path is not None, "Please clone and provide VILA source code path"
-        build_vila_engine(args)
-    elif args.model_type == 'nougat':
-        build_nougat_engine(args)
-    else:
-        raise RuntimeError(f"Invalid model type {args.model_type}")
+    args = parse_arguments()
+    builder = VisionEngineBuilder(args)
+    builder.build()

@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/runtime/common.h"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -25,10 +26,11 @@ namespace kernels
 {
 
 template <typename T>
-void invokeBanBadWords(T* logits, int32_t const** output_ids_ptr, int32_t const** parent_ids_ptr,
-    int32_t const* batch_slot, int32_t batch_size, int32_t beam_width, int32_t const** bad_words,
-    int32_t const* bad_words_len, int32_t max_bad_words_len, int32_t vocab_size_padded, int32_t const* sequence_lengths,
-    int32_t max_seq_len, cudaStream_t stream);
+void invokeBanBadWords(T* logits, runtime::TokenIdType const** output_ids_ptr, runtime::SizeType const** parent_ids_ptr,
+    runtime::SizeType32 const* batch_slot, runtime::SizeType batch_size, runtime::SizeType beam_width,
+    runtime::TokenIdType const** bad_words, runtime::SizeType32 const* bad_words_len,
+    runtime::SizeType max_bad_words_len, runtime::SizeType vocab_size_padded, runtime::SizeType const* sequence_lengths,
+    runtime::SizeType max_seq_len, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm

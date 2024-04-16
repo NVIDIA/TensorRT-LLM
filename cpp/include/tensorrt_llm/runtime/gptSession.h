@@ -190,6 +190,8 @@ public:
         return mNormalizeLogProbs;
     }
 
+    [[nodiscard]] nvinfer1::IEngineInspector& getEngineInspector() const;
+
     [[nodiscard]] nvinfer1::DataType getLogitDataType() const;
 
     //! @brief This function performs the generation loop.

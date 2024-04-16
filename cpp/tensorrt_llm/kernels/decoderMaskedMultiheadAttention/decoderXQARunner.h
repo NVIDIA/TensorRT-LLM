@@ -170,12 +170,20 @@ public:
     }
 
     template <typename KVCacheBuffer>
-    void dispatch(XQAParams const& xqa_params, KVCacheBuffer& kv_cache_buffer, cudaStream_t const& stream)
+    void dispatch(XQAParams const& xqa_params, KVCacheBuffer const& kv_cache_buffer, cudaStream_t const& stream)
     {
+        /*
+        TODO(minwei): re-enabling mPreparCalled checked once we figure out the root cause.
+
+        See https://github.com/NVIDIA/TensorRT-LLM/issues/1256.
+        It is safe to remove the check for now, because this->prepareForRun() is effectively a no-op. It calls into
+        DecoderXQAImplPrecompiled::prepare(), which does nothing in its body.
+
         if (!mPrepareCalled)
         {
             TLLM_THROW("DecoderXQARunner::prepare() hasn't been called before DecoderXQARunner::dispatch().");
         }
+        */
         sync_check_cuda_error();
         this->run(xqa_params, kv_cache_buffer, stream);
     }
@@ -185,13 +193,9 @@ private:
     void prepareForRun(XQAParams const& xqa_params);
 
     template <typename KVCacheBuffer>
-    void run(XQAParams const& xqa_params, KVCacheBuffer& kv_cache_buffer, cudaStream_t const& stream);
+    void run(XQAParams const& xqa_params, KVCacheBuffer const& kv_cache_buffer, cudaStream_t const& stream);
 
     static constexpr int kMaxBeamWidth = 4;
-
-    // Cache the grid_size and block_size that gives the highest occupancy for
-    //  invokeApplyBiasRopeUpdateKVCache.
-    int2 mLaunchGridBlockCache = make_int2(0, 0);
 
     bool mPrepareCalled;
 

@@ -49,11 +49,25 @@ public:
         return mExecutor->enqueueRequests(std::move(requests));
     }
 
-    [[nodiscard]] std::vector<tle::Response> awaitResponses(std::optional<tle::IdType> const& requestId = std::nullopt,
+    [[nodiscard]] std::vector<tle::Response> awaitResponses(
         std::optional<std::chrono::milliseconds> const& timeout = std::nullopt)
     {
 
+        return mExecutor->awaitResponses(timeout);
+    }
+
+    [[nodiscard]] std::vector<tle::Response> awaitResponses(
+        tle::IdType const& requestId, std::optional<std::chrono::milliseconds> const& timeout = std::nullopt)
+    {
+
         return mExecutor->awaitResponses(requestId, timeout);
+    }
+
+    [[nodiscard]] std::vector<std::vector<tle::Response>> awaitResponses(std::vector<tle::IdType> const& requestIds,
+        std::optional<std::chrono::milliseconds> const& timeout = std::nullopt)
+    {
+
+        return mExecutor->awaitResponses(requestIds, timeout);
     }
 
     [[nodiscard]] tle::SizeType getNumResponsesReady(std::optional<tle::IdType> const& requestId = std::nullopt) const

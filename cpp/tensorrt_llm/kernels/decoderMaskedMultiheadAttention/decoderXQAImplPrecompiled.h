@@ -33,15 +33,15 @@ public:
     void prepare(XQAParams const& xqa_params) override;
 
 protected:
-    void runWithKVLinearBuffer(XQAParams const& xqa_params, KVLinearBuffer& kv_linear_buffer,
-        int2& rotary_kernel_launch_cache, cudaStream_t const& stream) override;
-    void runWithKVBlockArray(XQAParams const& xqa_params, KVBlockArray& kv_block_array,
-        int2& rotary_kernel_launch_cache, cudaStream_t const& stream) override;
+    void runWithKVLinearBuffer(
+        XQAParams const& xqa_params, KVLinearBuffer const& kv_linear_buffer, cudaStream_t const& stream) override;
+    void runWithKVBlockArray(
+        XQAParams const& xqa_params, KVBlockArray const& kv_block_array, cudaStream_t const& stream) override;
 
 private:
     template <typename KVCacheBuffer>
-    void runDispatchBuffer(XQAParams const& xqa_params, KVCacheBuffer& kv_cache_buffer,
-        int2& rotary_kernel_launch_cache, cudaStream_t const& stream);
+    void runDispatchBuffer(
+        XQAParams const& xqa_params, KVCacheBuffer const& kv_cache_buffer, cudaStream_t const& stream);
 };
 
 } // namespace kernels

@@ -64,6 +64,7 @@ TllmRuntime::TllmRuntime(void const* engineData, std::size_t engineSize, nvinfer
     , mBufferManager{mStream, true} // Ensure to trim the memory pool on destruction.
     , mRuntime{nvinfer1::createInferRuntime(logger)}
     , mEngine{mRuntime->deserializeCudaEngine(engineData, engineSize)}
+    , mEngineInspector{mEngine->createEngineInspector()}
 {
     TLLM_CHECK_WITH_INFO(mEngine != nullptr, "Failed to deserialize cuda engine");
     auto const devMemorySize = mEngine->getDeviceMemorySize();
@@ -85,6 +86,11 @@ nvinfer1::IExecutionContext& TllmRuntime::addContext(std::int32_t profileIndex)
     auto& context = *mContexts.back();
     context.setDeviceMemory(mEngineBuffer->data());
     context.setOptimizationProfileAsync(profileIndex, mStream->get());
+    // If nvtx verbosity is DETAILED, change it to LAYER_NAMES_ONLY for inference performance
+    if (context.getNvtxVerbosity() == nvinfer1::ProfilingVerbosity::kDETAILED)
+    {
+        context.setNvtxVerbosity(nvinfer1::ProfilingVerbosity::kLAYER_NAMES_ONLY);
+    }
     return context;
 }
 

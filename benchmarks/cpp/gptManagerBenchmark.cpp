@@ -36,6 +36,8 @@
 #include <iostream>
 #include <memory>
 #include <nlohmann/json.hpp>
+#include <numeric>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -294,9 +296,6 @@ struct BenchInfo
         : inputLength(_inputLength)
         , outputLength(_outputLength)
         , start(_start)
-        , latency()
-        , firstTokenLatency()
-        , avgGenT2TLatency()
     {
     }
 
@@ -305,11 +304,11 @@ struct BenchInfo
     std::chrono::time_point<std::chrono::steady_clock> start;
     std::chrono::time_point<std::chrono::steady_clock> end;
     std::chrono::time_point<std::chrono::steady_clock> firstTokenTs;
-    float latency; // millisecond
-    bool hasError;
-    float firstTokenLatency;
-    float avgGenT2TLatency;
-    bool firstTokenSeen = false;
+    float latency{}; // millisecond
+    bool hasError{false};
+    float firstTokenLatency{};
+    std::optional<float> avgGenT2TLatency{};
+    bool firstTokenSeen{false};
 };
 
 class Recorder
@@ -366,11 +365,7 @@ public:
 
     void recordToken(uint64_t requestId)
     {
-        if (mRequestBenchInfos[requestId].firstTokenSeen)
-        {
-            return;
-        }
-        else
+        if (!mRequestBenchInfos[requestId].firstTokenSeen)
         {
             mRequestBenchInfos[requestId].firstTokenTs = std::chrono::steady_clock::now();
             mRequestBenchInfos[requestId].firstTokenSeen = true;
@@ -422,43 +417,43 @@ public:
                 reqInfo.second.firstTokenLatency
                     = std::chrono::duration<float, std::milli>(reqInfo.second.firstTokenTs - reqInfo.second.start)
                           .count();
-                reqInfo.second.avgGenT2TLatency
-                    = std::chrono::duration<float, std::milli>(reqInfo.second.end - reqInfo.second.firstTokenTs).count()
-                    / (reqInfo.second.outputLength - 1);
+                if (reqInfo.second.outputLength > 1)
+                {
+                    reqInfo.second.avgGenT2TLatency
+                        = std::chrono::duration<float, std::milli>(reqInfo.second.end - reqInfo.second.firstTokenTs)
+                              .count()
+                        / static_cast<float>(reqInfo.second.outputLength - 1);
+                }
             }
         }
     }
 
     void calculateMetrics()
     {
-        mTotalLatency = std::chrono::duration<float, std::milli>(mEnd - mStart).count();
-
-        mSeqThroughput = mNumSamples / (mTotalLatency / 1000);
-        mAvgSeqLatency = mAvgFtLatency = mAvgGenT2TLatency = 0;
-
         calculateLatencies();
 
         std::vector<float> reqLatencies;
         std::vector<float> ftLatencies;
         std::vector<float> genT2TLatencies;
 
-        int totalOutputTokens = 0;
+        int totalOutputTokens{0};
         mNumErrorSamples = 0;
         mNumSamples = 0;
         for (auto reqInfo : mRequestBenchInfos)
         {
             if (!reqInfo.second.hasError)
             {
-                mAvgSeqLatency += reqInfo.second.latency;
                 reqLatencies.push_back(reqInfo.second.latency);
                 totalOutputTokens += reqInfo.second.outputLength;
 
                 if (mStreaming)
                 {
-                    mAvgFtLatency += reqInfo.second.firstTokenLatency;
-                    mAvgGenT2TLatency += reqInfo.second.avgGenT2TLatency;
                     ftLatencies.push_back(reqInfo.second.firstTokenLatency);
-                    genT2TLatencies.push_back(reqInfo.second.avgGenT2TLatency);
+
+                    if (reqInfo.second.avgGenT2TLatency)
+                    {
+                        genT2TLatencies.push_back(reqInfo.second.avgGenT2TLatency.value());
+                    }
                 }
                 ++mNumSamples;
             }
@@ -468,9 +463,11 @@ public:
             }
         }
 
+        mTotalLatency = std::chrono::duration<float, std::milli>(mEnd - mStart).count();
         mSeqThroughput = mNumSamples / (mTotalLatency / 1000);
-        mAvgSeqLatency /= mNumSamples;
         mTokenThroughput = totalOutputTokens / (mTotalLatency / 1000);
+
+        mAvgSeqLatency = std::accumulate(reqLatencies.begin(), reqLatencies.end(), 0.F) / reqLatencies.size();
 
         std::sort(reqLatencies.begin(), reqLatencies.end());
 
@@ -482,11 +479,9 @@ public:
 
         if (mStreaming)
         {
-            mAvgFtLatency /= mNumSamples;
-            mAvgGenT2TLatency /= mNumSamples;
+            mAvgFtLatency = std::accumulate(ftLatencies.begin(), ftLatencies.end(), 0.F) / ftLatencies.size();
 
             std::sort(ftLatencies.begin(), ftLatencies.end());
-            std::sort(genT2TLatencies.begin(), genT2TLatencies.end());
 
             mP99FtLatency = calcPercentile(ftLatencies, 99);
             mP90FtLatency = calcPercentile(ftLatencies, 90);
@@ -494,11 +489,19 @@ public:
             mMaxFtLatency = ftLatencies.back();
             mMinFtLatency = ftLatencies.front();
 
-            mP99GenT2TLatency = calcPercentile(genT2TLatencies, 99);
-            mP90GenT2TLatency = calcPercentile(genT2TLatencies, 90);
-            mP50GenT2TLatency = calcPercentile(genT2TLatencies, 50);
-            mMaxGenT2TLatency = genT2TLatencies.back();
-            mMinGenT2TLatency = genT2TLatencies.front();
+            if (!genT2TLatencies.empty())
+            {
+                mAvgGenT2TLatency
+                    = std::accumulate(genT2TLatencies.begin(), genT2TLatencies.end(), 0.F) / genT2TLatencies.size();
+
+                std::sort(genT2TLatencies.begin(), genT2TLatencies.end());
+
+                mP99GenT2TLatency = calcPercentile(genT2TLatencies, 99);
+                mP90GenT2TLatency = calcPercentile(genT2TLatencies, 90);
+                mP50GenT2TLatency = calcPercentile(genT2TLatencies, 50);
+                mMaxGenT2TLatency = genT2TLatencies.back();
+                mMinGenT2TLatency = genT2TLatencies.front();
+            }
         }
     }
 
@@ -725,27 +728,23 @@ public:
         SizeType numFinished = 0;
         while (mActiveCount || (numFinished < numRequests))
         {
-            auto responses = mExecutor->awaitResponses(std::nullopt, mWaitSleep);
+            auto responses = mExecutor->awaitResponses(mWaitSleep);
             for (auto const& response : responses)
             {
-                if (response.hasError() || response.getResult().isFinal)
+                auto const reqId = response.getRequestId();
+
+                if (!warmup && !response.hasError())
                 {
-                    auto reqId = response.getRequestId();
-                    if (response.getResult().isFinal)
+                    mRecorder->recordToken(reqId);
+                }
+
+                if (response.getResult().isFinal)
+                {
+                    mActiveCount--;
+                    numFinished++;
+                    if (!warmup)
                     {
-                        mActiveCount--;
-                        numFinished++;
-                        if (!warmup)
-                        {
-                            mRecorder->recordEnd(reqId, response.hasError());
-                        }
-                    }
-                    else
-                    {
-                        if (!warmup)
-                        {
-                            mRecorder->recordToken(reqId);
-                        }
+                        mRecorder->recordEnd(reqId, response.hasError());
                     }
                 }
             }
@@ -974,15 +973,16 @@ public:
         // them.
         try
         {
+            if (errMsg.empty())
+            {
+                mRecorder->recordToken(requestId);
+            }
+
             if (final_response)
             {
                 mWorkItemsQueue.markFinished(requestId);
                 mRecorder->recordEnd(requestId, response_tensors, !errMsg.empty());
                 mActiveCount--;
-            }
-            else
-            {
-                mRecorder->recordToken(requestId);
             }
         }
         catch (std::exception const& e)

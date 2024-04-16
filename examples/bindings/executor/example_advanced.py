@@ -51,7 +51,7 @@ def wait_for_responses(args: argparse.Namespace, request_ids: list[int],
     iter = 0
     while (num_finished < len(request_ids) and iter < args.timeout_ms):
         responses = executor.await_responses(
-            None, datetime.timedelta(milliseconds=args.timeout_ms))
+            datetime.timedelta(milliseconds=args.timeout_ms))
         for response in responses:
             req_id = response.request_id
             if not response.has_error():

@@ -1043,8 +1043,6 @@ def enc_dec_build_helper(component, config, args):
                       tp_size=world_size,
                       pp_size=1)  # TP only
 
-    fp16_clamping = (args.dtype == 'float16') and ('t5' in family)
-
     if component == 'encoder':
         if family == 'whisper':
             tllm_model = tensorrt_llm.models.WhisperEncoder(
@@ -1057,68 +1055,145 @@ def enc_dec_build_helper(component, config, args):
             if use_weight_only:
                 tllm_model = quantize(tllm_model, quant_config)
         else:
-            tllm_model = tensorrt_llm.models.EncoderModel(
-                num_layers=config['num_layers'],
-                num_heads=config['num_heads'],
-                num_kv_heads=config['num_heads'],
-                head_size=config['head_size'],
-                hidden_size=config['hidden_size'],
-                ffn_hidden_size=config['ffn_hidden_size'],
-                vocab_size=config['vocab_size'],
-                max_position_embeddings=config.get('n_positions', 0),
-                has_position_embedding=has_position_embedding,
-                relative_attention=relative_attention,
-                max_distance=config.get('max_distance', 0),
-                num_buckets=config.get('num_buckets', 0),
-                has_embedding_layernorm=has_embedding_layernorm,
-                has_embedding_scale=config.get('has_embedding_scale', False),
-                q_scaling=q_scaling,
-                has_attention_qkvo_bias=has_attention_qkvo_bias,
-                has_mlp_bias=has_mlp_bias,
-                has_model_final_layernorm=has_model_final_layernorm,
-                layernorm_eps=1e-6,
-                layernorm_position=layernorm_position,
-                layernorm_type=layernorm_type,
-                hidden_act=config['hidden_act'],
-                dtype=dtype,
-                use_parallel_embedding=False,  # by default
-                embedding_sharding_dim=0,  # by default
-                mapping=mapping,
-                fp16_clamping=fp16_clamping)
+            pretrained_config = PretrainedConfig.from_dict({
+                'architecture':
+                "EncoderModel",
+                'dtype':
+                args.dtype,
+                'logits_dtype':
+                logits_dtype,
+                'num_hidden_layers':
+                config['num_layers'],
+                'num_attention_heads':
+                config['num_heads'],
+                'hidden_size':
+                config['hidden_size'],
+                'norm_epsilon':
+                1e-6,
+                'vocab_size':
+                config['vocab_size'],
+                'hidden_act':
+                config['hidden_act'],
+                'mapping': {
+                    'world_size': mapping.world_size,
+                    'tp_size': mapping.tp_size,
+                    'pp_size': mapping.pp_size,
+                },
+                'use_parallel_embedding':
+                False,
+                'embedding_sharding_dim':
+                0,
+                'max_position_embeddings':
+                config.get('n_positions', 0),
+                'use_prompt_tuning':
+                False,
+                'head_size':
+                config['head_size'],
+                'has_position_embedding':
+                has_position_embedding,
+                'layernorm_type':
+                layernorm_type,
+                'has_attention_qkvo_bias':
+                has_attention_qkvo_bias,
+                'has_mlp_bias':
+                has_mlp_bias,
+                'has_model_final_layernorm':
+                has_model_final_layernorm,
+                'has_embedding_layernorm':
+                has_embedding_layernorm,
+                'has_embedding_scale':
+                config.get('has_embedding_scale', False),
+                'ffn_hidden_size':
+                config['ffn_hidden_size'],
+                'q_scaling':
+                q_scaling,
+                'layernorm_position':
+                layernorm_position,
+                'relative_attention':
+                relative_attention,
+                'max_distance':
+                config.get('max_distance', 0),
+                'num_buckets':
+                config.get('num_buckets', 0),
+                'model_type':
+                family,
+            })
+            tllm_model = tensorrt_llm.models.EncoderModel(pretrained_config)
     elif component == 'decoder':
-        tllm_model = tensorrt_llm.models.DecoderModel(
-            num_layers=config['num_layers'],
-            num_heads=config['num_heads'],
-            num_kv_heads=config['num_heads'],
-            head_size=config['head_size'],
-            hidden_size=config['hidden_size'],
-            ffn_hidden_size=config['ffn_hidden_size'],
-            encoder_hidden_size=config['hidden_size'],
-            encoder_num_heads=config['num_heads'],
-            encoder_head_size=config['head_size'],
-            vocab_size=config['vocab_size'],
-            max_position_embeddings=config.get('n_positions', 0),
-            has_position_embedding=has_position_embedding,
-            relative_attention=relative_attention,
-            max_distance=config.get('max_distance', 0),
-            num_buckets=config.get('num_buckets', 0),
-            has_embedding_layernorm=has_embedding_layernorm,
-            has_embedding_scale=config.get('has_embedding_scale', False),
-            q_scaling=q_scaling,
-            has_attention_qkvo_bias=has_attention_qkvo_bias,
-            has_mlp_bias=has_mlp_bias,
-            has_model_final_layernorm=has_model_final_layernorm,
-            layernorm_eps=1e-6,
-            layernorm_position=layernorm_position,
-            layernorm_type=layernorm_type,
-            hidden_act=config['hidden_act'],
-            dtype=dtype,
-            use_parallel_embedding=False,  # by default
-            embedding_sharding_dim=0,  # by default
-            mapping=mapping,
-            rescale_before_lm_head=rescale_before_lm_head,
-            logits_dtype=logits_dtype,  # by default
-            fp16_clamping=fp16_clamping)
+        pretrained_config = PretrainedConfig.from_dict({
+            'architecture':
+            "DecoderModel",
+            'dtype':
+            args.dtype,
+            'logits_dtype':
+            logits_dtype,
+            'num_hidden_layers':
+            config['num_layers'],
+            'num_attention_heads':
+            config['num_heads'],
+            'hidden_size':
+            config['hidden_size'],
+            'norm_epsilon':
+            1e-6,
+            'vocab_size':
+            config['vocab_size'],
+            'hidden_act':
+            config['hidden_act'],
+            'mapping': {
+                'world_size': mapping.world_size,
+                'tp_size': mapping.tp_size,
+                'pp_size': mapping.pp_size,
+            },
+            'use_parallel_embedding':
+            False,
+            'embedding_sharding_dim':
+            0,
+            'max_position_embeddings':
+            config.get('n_positions', 0),
+            'use_prompt_tuning':
+            False,
+            'head_size':
+            config['head_size'],
+            'has_position_embedding':
+            has_position_embedding,
+            'layernorm_type':
+            layernorm_type,
+            'has_attention_qkvo_bias':
+            has_attention_qkvo_bias,
+            'has_mlp_bias':
+            has_mlp_bias,
+            'has_model_final_layernorm':
+            has_model_final_layernorm,
+            'has_embedding_layernorm':
+            has_embedding_layernorm,
+            'has_embedding_scale':
+            config.get('has_embedding_scale', False),
+            'ffn_hidden_size':
+            config['ffn_hidden_size'],
+            'q_scaling':
+            q_scaling,
+            'layernorm_position':
+            layernorm_position,
+            'relative_attention':
+            relative_attention,
+            'max_distance':
+            config.get('max_distance', 0),
+            'num_buckets':
+            config.get('num_buckets', 0),
+            'model_type':
+            family,
+            'rescale_before_lm_head':
+            rescale_before_lm_head,
+            'encoder_hidden_size':
+            config['hidden_size'],
+            'encoder_num_heads':
+            config['num_heads'],
+            'encoder_head_size':
+            config['head_size'],
+            'skip_cross_qkv':
+            config['skip_cross_qkv']
+        })
+        tllm_model = tensorrt_llm.models.DecoderModel(pretrained_config)
         if use_weight_only and family == 'whisper':
             tllm_model = quantize(tllm_model, quant_config)
 
@@ -1154,30 +1229,33 @@ def enc_dec_build_helper(component, config, args):
             if family == 'whisper':
                 inputs = tllm_model.prepare_inputs(
                     max_batch_size=config['max_batch_size'], )
+                tllm_model(*inputs)
             else:
                 inputs = tllm_model.prepare_inputs(
                     max_batch_size=config['max_batch_size'],
                     max_input_len=config['max_encoder_input_len'],
                 )
+                tllm_model(**inputs)
         elif component == 'decoder':
             if family == 'whisper':
                 inputs = tllm_model.prepare_inputs(
                     max_batch_size=config['max_batch_size'],
                     max_beam_width=config['max_beam_width'],
                     max_decoder_input_len=config['max_decoder_input_len'],
-                    max_new_tokens=config['max_output_len'],
+                    max_seq_len=config['max_output_len'],
                     max_encoder_input_len=1500,  # n_audio_ctx
                 )
+                tllm_model(**inputs)
             else:
                 inputs = tllm_model.prepare_inputs(
                     max_batch_size=config['max_batch_size'],
                     max_beam_width=config['max_beam_width'],
                     max_decoder_input_len=config['max_decoder_input_len'],
-                    max_new_tokens=config['max_output_len'],
+                    max_seq_len=config['max_output_len'],
                     max_encoder_input_len=config['max_encoder_input_len'],
                 )
 
-        tllm_model(*inputs)
+                tllm_model(**inputs)
 
     start = time.time()
     engine = builder.build_engine(network, builder_config)

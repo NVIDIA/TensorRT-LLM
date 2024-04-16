@@ -21,11 +21,13 @@ class IdxEntry(Enum):
     CONTEXT_LENGTHS = auto()
     CACHE_INDIR = auto()
     REQUEST_TYPES = auto()
-    KV_CACHE_BLOCK_POINTERS = auto()
-    HOST_KV_CACHE_BLOCK_POINTERS = auto()
+    KV_CACHE_BLOCK_OFFSETS = auto()
+    HOST_KV_CACHE_BLOCK_OFFSETS = auto()
+    HOST_KV_CACHE_POOL_POINTERS = auto()
     PAST_KEY_VALUE = auto()
     KV_CACHE_QUANTIZATION_SCALE = auto()
     KV_CACHE_DEQUANTIZATION_SCALE = auto()
+    ROTARY_COS_SIN = auto()
     ALIBI_SLOPES = auto()
     RELATIVE_ATTENTION_BIAS = auto()
     CROSS_QKV = auto()
@@ -81,9 +83,11 @@ class IdxEntryParser:
             return self.use_cache
         elif entry == IdxEntry.REQUEST_TYPES:
             return True
-        elif entry == IdxEntry.KV_CACHE_BLOCK_POINTERS:
+        elif entry == IdxEntry.KV_CACHE_BLOCK_OFFSETS:
             return self.use_cache and self.paged_kv_cache
-        elif entry == IdxEntry.HOST_KV_CACHE_BLOCK_POINTERS:
+        elif entry == IdxEntry.HOST_KV_CACHE_BLOCK_OFFSETS:
+            return self.use_cache and self.paged_kv_cache
+        elif entry == IdxEntry.HOST_KV_CACHE_POOL_POINTERS:
             return self.use_cache and self.paged_kv_cache
         elif entry == IdxEntry.PAST_KEY_VALUE:
             return self.use_cache and not self.paged_kv_cache
@@ -93,6 +97,8 @@ class IdxEntryParser:
         elif entry == IdxEntry.KV_CACHE_DEQUANTIZATION_SCALE:
             return self.use_cache and self.kv_cache_quant_mode.has_kv_cache_quant(
             )
+        elif entry == IdxEntry.ROTARY_COS_SIN:
+            return self.position_embedding_type.is_rope()
         elif entry == IdxEntry.ALIBI_SLOPES:
             return self.position_embedding_type.is_alibi()
         elif entry == IdxEntry.RELATIVE_ATTENTION_BIAS:
@@ -148,10 +154,10 @@ class GPTAttentionPlugin(PluginNode):
         self.parser = IdxEntryParser(self.plugin_info)
         assert self.num_inputs == len(
             self.parser.entry_to_index
-        ), f'the plugin inputs number {self.num_inputs} is invalid'
+        ), f'the number of plugin inputs ({self.num_inputs}) is invalid'
         assert self.num_outputs == (
-            2 if self.parser.is_entry_used(IdxEntry.PAST_KEY_VALUE) else
-            1), f'the plugin outputs number {self.num_outputs} has been changed'
+            2 if self.parser.is_entry_used(IdxEntry.PAST_KEY_VALUE) else 1
+        ), f'the number of plugin outputs ({self.num_outputs}) has been changed'
 
     def _tp_strategy(self, device_mesh):
         strategies_vector = StrategiesVector(self)

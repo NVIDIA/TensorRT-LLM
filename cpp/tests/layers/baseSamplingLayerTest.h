@@ -126,6 +126,7 @@ protected:
     TensorPtr mEmbeddingBiasDevice;
 
     TensorPtr mCumLogProbsDevice;
+    TensorPtr mOutputLogProbsDevice;
 
     TensorPtr mCurandStatesDevice;
     TensorPtr mPenaltyWorkspaceDevice;

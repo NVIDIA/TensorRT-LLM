@@ -3499,8 +3499,234 @@ def bert_attention(tensor: Tensor,
     return output
 
 
+class RopeEmbeddingUtils:
+
+    @staticmethod
+    def create_sinusoidal_positions(num_pos: int,
+                                    dim: int,
+                                    theta: float = 10000.0,
+                                    dtype=np.float32):
+        inv_freq = 1.0 / (theta**(np.arange(0, dim, 2) / dim)).astype(dtype)
+        sinusoid_inp = np.einsum("i , j -> i j",
+                                 np.arange(num_pos, dtype=dtype),
+                                 inv_freq,
+                                 dtype=dtype)
+        concat = np.concatenate((np.sin(sinusoid_inp), np.cos(sinusoid_inp)),
+                                axis=1)
+        return np.expand_dims(concat, axis=0).astype(dtype)
+
+    @staticmethod
+    def create_sinusoidal_positions_for_attention_plugin(
+            num_pos: int,
+            dim: int,
+            theta: float = 10000.0,
+            scale: float = 1.0,
+            scale_type: RotaryScalingType = RotaryScalingType.none,
+            dtype=np.float32):
+        if scale_type == RotaryScalingType.linear:
+            scale = 1.0 / scale
+        inv_freq = scale / (theta**(np.arange(0, dim, 2) / dim)).astype(dtype)
+        sinusoid_inp = np.expand_dims(np.einsum("i , j -> i j",
+                                                np.arange(num_pos, dtype=dtype),
+                                                inv_freq,
+                                                dtype=dtype),
+                                      axis=-1)
+        # fuse cos/sin into float2 (cos, sin).
+        concat = np.concatenate((np.cos(sinusoid_inp), np.sin(sinusoid_inp)),
+                                axis=-1)
+
+        return concat.reshape(1, -1).astype(dtype)
+
+    @staticmethod
+    def rotate_every_two(tensor: Tensor) -> Tensor:
+        assert tensor.ndim() == 4
+
+        shape_tensor = concat([
+            shape(tensor, i) / 2 if i == (tensor.ndim() -
+                                          1) else shape(tensor, i)
+            for i in range(tensor.ndim())
+        ])
+        x1 = slice(tensor, [0, 0, 0, 0], shape_tensor, [1, 1, 1, 2])
+        x2 = slice(tensor, [0, 0, 0, 1], shape_tensor, [1, 1, 1, 2])
+        x1 = expand_dims(x1, 4)
+        x2 = expand_dims(x2, 4)
+        zero = constant(
+            np.ascontiguousarray(
+                np.zeros([1], dtype=trt_dtype_to_np(tensor.dtype))))
+        x2 = zero - x2
+        x = concat([x2, x1], 4)
+        return view(
+            x, concat([shape(x, 0),
+                       shape(x, 1),
+                       shape(x, 2),
+                       shape(x, 3) * 2]))
+
+    @staticmethod
+    def rotate_half(tensor: Tensor) -> Tensor:
+        # [bs, num_attention_kv_heads, seqlen, attention_head_size]
+        assert tensor.ndim() == 4
+        shape_tensor = concat([
+            shape(tensor, i) / 2 if i == (tensor.ndim() -
+                                          1) else shape(tensor, i)
+            for i in range(tensor.ndim())
+        ])
+        last_dim = shape(tensor, tensor.ndim() - 1) / 2
+        x1 = slice(tensor, [0, 0, 0, 0], shape_tensor, [1, 1, 1, 1])
+        x2 = slice(tensor, concat([0, 0, 0, last_dim]), shape_tensor,
+                   [1, 1, 1, 1])
+        zero = constant(
+            np.ascontiguousarray(
+                np.zeros([1], dtype=trt_dtype_to_np(tensor.dtype))))
+        x2 = zero - x2
+        x = concat([x2, x1], 3)
+        return x
+
+    @staticmethod
+    def apply_rotary_pos_emb(
+        tensor: Tensor,
+        position_embedding: List[Tensor] = None,
+        pos_emb_type: PositionEmbeddingType = PositionEmbeddingType.rope_gptj
+    ) -> Tensor:
+
+        rotate_func = None
+        if pos_emb_type == PositionEmbeddingType.rope_gpt_neox:
+            assert len(position_embedding) == 2
+            cos, sin = position_embedding
+            sin = expand_dims(sin, 2)
+            cos = expand_dims(cos, 2)
+            sin = concat([sin, sin], 3)
+            cos = concat([cos, cos], 3)
+            rotate_func = RopeEmbeddingUtils.rotate_half
+        elif pos_emb_type == PositionEmbeddingType.rope_gptj:
+            assert len(position_embedding) == 2
+            cos, sin = position_embedding
+            sin = expand_dims(sin, 2)
+            cos = expand_dims(cos, 2)
+            sin = repeat_interleave(sin, 2, 3)
+            cos = repeat_interleave(cos, 2, 3)
+            rotate_func = RopeEmbeddingUtils.rotate_every_two
+        elif pos_emb_type == PositionEmbeddingType.chatglm:
+            assert len(position_embedding) == 4
+            cos0, cos1, sin0, sin1 = position_embedding
+            shape_tensor = concat([
+                shape(tensor, i) / 2 if i == (tensor.ndim() -
+                                              1) else shape(tensor, i)
+                for i in range(tensor.ndim())
+            ])
+            last_dim = shape(tensor, tensor.ndim() - 1) / 2
+            x_part0 = slice(tensor, [0, 0, 0, 0], shape_tensor, [1, 1, 1, 1])
+            x_part1 = slice(tensor, concat([0, 0, 0, last_dim]), shape_tensor,
+                            [1, 1, 1, 1])
+
+            y_part0 = (x_part0 *
+                       cos0) + (RopeEmbeddingUtils.rotate_half(x_part0) * sin0)
+            y_part1 = (x_part1 *
+                       cos1) + (RopeEmbeddingUtils.rotate_half(x_part1) * sin1)
+
+            result = concat([y_part0, y_part1], dim=3)
+            return result.view(shape(tensor))
+
+        else:
+            raise ValueError('The PositionEmbeddingType is not RoPE')
+        return (tensor * cos) + (rotate_func(tensor) * sin)
+
+    @staticmethod
+    def apply_rotary_pos_emb_chatglm(qkv, position_embedding,
+                                     num_attention_heads, attention_head_size,
+                                     max_position_embeddings,
+                                     rotary_embedding_scale,
+                                     remove_input_padding) -> Tensor:
+
+        half_head_size = attention_head_size // 2
+        input = qkv[0] if isinstance(qkv, list) else qkv
+        input_shape = shape(input)
+        batch_size = 1 if remove_input_padding else shape(input, 0)
+        seqlen = shape(input, 0 if remove_input_padding else 1)
+        if isinstance(qkv, list):
+            query, key, value = qkv
+        else:
+            qkv = qkv.view(
+                concat([
+                    batch_size,
+                    seqlen,
+                    num_attention_heads,
+                    3,
+                    attention_head_size,
+                ]))
+            query, key, value = split(qkv, 1, dim=3)
+        q_shape = concat([
+            batch_size,
+            seqlen,
+            num_attention_heads,
+            attention_head_size,
+        ])
+        query = query.view(q_shape)
+        key = key.view(q_shape)
+        value = value.view(q_shape)
+
+        embedding_weight = RopeEmbeddingUtils.create_sinusoidal_positions(
+            max_position_embeddings, half_head_size)
+        embedding_weight /= rotary_embedding_scale
+        embedding_weight = np.split(embedding_weight.squeeze(0), 2, axis=1)
+        embedding_weight = np.concatenate(
+            [
+                embedding_weight[0],
+                embedding_weight[0],
+                embedding_weight[1],
+                embedding_weight[1],
+            ],
+            axis=1,
+        )
+
+        if remove_input_padding:
+            position_embedding = unsqueeze(position_embedding, 0)
+
+        embedding_weight = embedding_weight.astype(trt_dtype_to_np(query.dtype))
+        embedding_weight = constant(embedding_weight)
+        position_embedding = embedding(position_embedding, embedding_weight)
+        position_embedding, block_embedding = split(
+            position_embedding,
+            1,
+            dim=1,
+        )
+        sin0, cos0 = split(position_embedding, half_head_size, dim=3)
+        sin1, cos1 = split(block_embedding, half_head_size, dim=3)
+
+        new_shape = concat([
+            batch_size,
+            seqlen,
+            1,
+            half_head_size,
+        ])
+        position_embedding = [
+            tensor.view(new_shape) for tensor in [cos0, cos1, sin0, sin1]
+        ]
+
+        query = RopeEmbeddingUtils.apply_rotary_pos_emb(
+            tensor=query,
+            position_embedding=position_embedding,
+            pos_emb_type=PositionEmbeddingType.chatglm)
+        key = RopeEmbeddingUtils.apply_rotary_pos_emb(
+            tensor=key,
+            position_embedding=position_embedding,
+            pos_emb_type=PositionEmbeddingType.chatglm)
+
+        if isinstance(qkv, list):
+            qkv = [
+                query.view(input_shape),
+                key.view(input_shape),
+                value.view(input_shape),
+            ]
+        else:
+            qkv = concat([query, key, value], dim=2)
+            qkv = qkv.view(input_shape)
+
+        return qkv
+
+
 @gw.record_signature
 def gpt_attention(
+    *,
     qkv: Tensor,
     past_key_value: Tensor,
     sequence_length: Tensor,
@@ -3522,6 +3748,7 @@ def gpt_attention(
     rotary_embedding_max_positions: int = 1024,
     position_embedding_type: PositionEmbeddingType = PositionEmbeddingType.
     learned_absolute,
+    rotary_cos_sin: Optional[Tensor] = None,
     kv_orig_quant_scale: Optional[Tensor] = None,
     kv_quant_orig_scale: Optional[Tensor] = None,
     attention_output_orig_quant_scale: Optional[Tensor] = None,
@@ -3531,8 +3758,9 @@ def gpt_attention(
     alibi_slopes: Optional[Tensor] = None,
     tp_size: int = 1,
     tp_rank: int = 0,
-    kv_cache_block_pointers: Optional[Tensor] = None,
-    host_kv_cache_block_pointers: Tensor = None,
+    kv_cache_block_offsets: Optional[Tensor] = None,
+    host_kv_cache_block_offsets: Tensor = None,
+    host_kv_cache_pool_pointers: Tensor = None,
     do_cross_attention: bool = False,
     cross_qkv: Optional[Tensor] = None,  # for cross attention
     cross_qkv_length: Optional[Tensor] = None,  # for cross attention
@@ -3596,7 +3824,7 @@ def gpt_attention(
             in docs/gpt_attention.md,
 
         layer_idx: int
-            The index of this attention layer, used to access kv_cache_block_pointers,
+            The index of this attention layer, used to access kv_cache_block_offsets,
 
         num_heads: int
             The number of heads,
@@ -3628,6 +3856,10 @@ def gpt_attention(
             The scale value to use for linear/dynamic scaling in RoPE.
             Ignored when position_embedding_type is not RoPE.
             Must be set to 1 (default) if rotary_embedding_scale_type is `none`.
+
+        rotary_cos_sin: float2(cos/sin) Tensor
+            The rotary cos/sin cache, which will be reused among different requests.
+            It is taken as constant tensor.
 
         rotary_embedding_max_positions: int
             Needed only for `dynamic` RoPE scaling. Ignored otherwise.
@@ -3679,13 +3911,17 @@ def gpt_attention(
         tp_rank: int
             The rank of that process (when running tensor parallelism),
 
-        kv_cache_block_pointers:
-            The tensor of block pointers for the KV cache. Its shape is
-            [num_layers, max_batch_size, max_beam_width, 2, max_blocks_per_sequence * 2]
-            See KV cache section in docs/gpt_attention.md, on gpu
+        kv_cache_block_offsets:
+            The tensor of block offsets for the KV cache. Its shape is
+            [num_layers, max_batch_size, max_beam_width, 2, max_blocks_per_sequence * 2],
+            See KV cache section in docs/gpt_attention.md, on gpu,
 
-        host_kv_cache_block_pointers:
-            The same as kv_cache_block_pointers, but on cpu,
+        host_kv_cache_block_offsets:
+            The same as kv_cache_block_offsets, but on cpu,
+
+        host_kv_cache_pool_pointers:
+            The tensor of pool pointers for the KV cache. Its shape is [2],
+            See KV cache section in docs/gpt_attention.md, on gpu,
 
         do_cross_attention: bool = False
             Do we use this as cross attention instead of self attention,
@@ -3904,10 +4140,12 @@ def gpt_attention(
         ]
     if use_cache:
         if paged_kv_cache_flag:
-            assert kv_cache_block_pointers is not None, "Paged kv cache is enabled, the kv_cache_block_pointers tensor shall not be None"
-            assert host_kv_cache_block_pointers is not None, "Paged kv cache is enabled, the host_kv_cache_block_pointers tensor shall not be None"
+            assert kv_cache_block_offsets is not None, "Paged kv cache is enabled, the kv_cache_block_offsets tensor shall not be None"
+            assert host_kv_cache_block_offsets is not None, "Paged kv cache is enabled, the host_kv_cache_block_offsets tensor shall not be None"
+            assert host_kv_cache_pool_pointers is not None, "Paged kv cache is enabled, the host_kv_cache_pool_pointers tensor shall not be None"
             plug_inputs += [
-                kv_cache_block_pointers, host_kv_cache_block_pointers
+                kv_cache_block_offsets, host_kv_cache_block_offsets,
+                host_kv_cache_pool_pointers
             ]
         else:
             plug_inputs += [past_key_value]
@@ -3919,6 +4157,9 @@ def gpt_attention(
         assert default_net(
         ).plugin_config.use_fp8_context_fmha, "FP8 Context FMHA needs to be enabled"
         plug_inputs += [attention_output_orig_quant_scale]
+
+    if rotary_cos_sin is not None:
+        plug_inputs += [rotary_cos_sin]
 
     if alibi_slopes is not None:
         plug_inputs += [alibi_slopes]
@@ -3959,12 +4200,16 @@ def gpt_attention(
         f"Plugin outputs number mismatch with expected, got {layer.num_outputs}, expected {expected_outputs}"
 
     if kv_cache_quant_mode.has_int8_kv_cache(
-    ) and not paged_kv_cache_flag and not default_net().strongly_typed:
-        # past key value
-        layer.get_input(8).set_dynamic_range(-127, 127)
-        # present key value
-        layer.get_output(1).set_dynamic_range(-127, 127)
-
+    ) and not default_net().strongly_typed:
+        if not paged_kv_cache_flag:
+            # past key value
+            layer.get_input(8).set_dynamic_range(-127, 127)
+            # present key value
+            layer.get_output(1).set_dynamic_range(-127, 127)
+        else:
+            layer.get_input(0).set_dynamic_range(-127, 127)
+            layer.get_input(1).set_dynamic_range(-127, 127)
+            layer.get_output(0).set_dynamic_range(-127, 127)
     assert output is not None
     return output, present_key_value
 

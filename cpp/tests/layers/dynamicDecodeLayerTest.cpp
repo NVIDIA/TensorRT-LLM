@@ -996,7 +996,7 @@ TYPED_TEST(DynamicDecodeLayerTest, InvalidArgsBatchTopKBatchTopPContainZero)
 
 TYPED_TEST(DynamicDecodeLayerTest, TopPTemperature)
 {
-    float temperature = 0.05f;
+    float temperature = 0.01f;
     SamplingParams params;
     params.temperatures = {temperature};
     params.topPs = {1.0f};
@@ -1011,7 +1011,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopPTemperature)
 
 TYPED_TEST(DynamicDecodeLayerTest, TopPTemperatureBatch)
 {
-    std::vector<float> temperatures = {0.05f, 1e3f, 1.0f, 1.0f, 0.05f, 1.0f};
+    std::vector<float> temperatures = {0.01f, 1e3f, 1.0f, 1.0f, 0.01f, 1.0f};
     SamplingParams params;
     params.temperatures = temperatures;
     params.topPs = {0.5f};

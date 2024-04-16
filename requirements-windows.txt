@@ -12,8 +12,7 @@ psutil
 pynvml>=11.5.0
 pulp
 pandas
-h5py
-StrEnum
+h5py==3.10.0
 pywin32
 StrEnum
 sentencepiece>=0.1.99

@@ -1,6 +1,5 @@
 import os
 import sys
-import tempfile
 
 from tensorrt_llm.hlapi.llm import LLM, ModelConfig
 from tensorrt_llm.quantization import QuantAlgo
@@ -19,8 +18,12 @@ def test_llm_int4_awq_quantization():
     assert config.quant_config.quant_mode.has_any_quant()
 
     llm = LLM(config)
-    with tempfile.TemporaryDirectory() as tmpdir:
-        llm.save(tmpdir)
+
+    sampling_config = llm.get_default_sampling_config()
+    sampling_config.max_new_tokens = 6
+    for output in llm.generate(["A B C"], sampling_config=sampling_config):
+        print(output)
+        assert output.text == "<s> A B C D E F G H I"
 
 
 @skip_pre_hopper
@@ -33,8 +36,11 @@ def test_llm_fp8_quantization():
     assert config.quant_config.quant_mode.has_any_quant()
 
     llm = LLM(config)
-    with tempfile.TemporaryDirectory() as tmpdir:
-        llm.save(tmpdir)
+    sampling_config = llm.get_default_sampling_config()
+    sampling_config.max_new_tokens = 6
+    for output in llm.generate(["A B C"], sampling_config=sampling_config):
+        print(output)
+        assert output.text == "<s> A B C D E F G H I"
 
 
 if __name__ == "__main__":

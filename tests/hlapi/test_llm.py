@@ -19,7 +19,6 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root
 from utils.util import force_ampere
 
-from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.llama.model import LLaMAForCausalLM
 
 
@@ -79,35 +78,6 @@ def test_llm_loading_from_ckpt():
         del llama
 
         config = ModelConfig(ckpt_dir)
-        llm = LLM(
-            config,
-            tokenizer=tokenizer,
-            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
-        )
-
-        sampling_config = llm.get_default_sampling_config()
-        assert sampling_config is not None
-
-        for output in llm.generate(prompts):
-            print(output)
-            assert output.text == "<s> A B C D E F G H I J K L M N O P Q R S T U V W X Y Z\nA B C D E F G H"
-
-
-@skip_single_gpu
-def test_llm_loading_from_ckpt_for_tp2():
-    tokenizer = TransformersTokenizer.from_pretrained(llama_model_path)
-    assert tokenizer is not None
-    tp_size = 2
-    with tempfile.TemporaryDirectory() as ckpt_dir:
-        for rank in range(tp_size):
-            mapping = Mapping(world_size=tp_size, tp_size=tp_size, rank=rank)
-            llama = LLaMAForCausalLM.from_hugging_face(llama_model_path,
-                                                       mapping=mapping)
-            llama.save_checkpoint(ckpt_dir, save_config=(rank == 0))
-            del llama
-
-        config = ModelConfig(ckpt_dir)
-        assert config.parallel_config.tp_size == tp_size
         llm = LLM(
             config,
             tokenizer=tokenizer,
@@ -182,37 +152,6 @@ def test_llm_without_tokenizer():
         print(output)
 
 
-@skip_single_gpu
-def test_llm_build_engine_for_tp2(model_name=default_model_name):
-    config = ModelConfig(get_model_path(model_name))
-    config.parallel_config.tp_size = 2
-    llm = LLM(
-        config,
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
-    )
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        llm.save(tmpdir)
-
-
-@skip_single_gpu
-@pytest.mark.parametrize("use_auto_parallel", [True, False],
-                         ids=["enable_auto_parallel", "disable_auto_parallel"])
-def test_llm_generate_for_tp2(use_auto_parallel):
-    config = ModelConfig(llama_model_path)
-    if use_auto_parallel:
-        config.parallel_config.world_size = 2
-        config.parallel_config.auto_parallel = True
-    else:
-        config.parallel_config.tp_size = 2
-    llm = LLM(
-        config,
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
-    )
-    for output in llm.generate(prompts):
-        print(output)
-
-
 # TODO[chunweiy]: Move mixtral test to the e2e test
 def is_memory_enough_for_mixtral():
     if torch.cuda.device_count() < 2:
@@ -225,23 +164,10 @@ def is_memory_enough_for_mixtral():
         return False
 
 
-@skip_single_gpu
-@pytest.mark.skipif(not is_memory_enough_for_mixtral(),
-                    reason="The test needs at least 160GB memory, skipping")
-def test_llm_generate_mixtral_for_tp2():
-    config = ModelConfig(get_model_path(mixtral_model_name))
-    config.parallel_config.tp_size = 2
-    llm = LLM(
-        config,
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
-    )
-    for output in llm.generate(prompts):
-        print(output)
-
-
 def test_llm_generate_async(model_name=default_model_name,
                             tp_size: int = 1,
-                            use_auto_parallel: bool = False):
+                            use_auto_parallel: bool = False,
+                            tokenizer=None):
     if "Mixtral" in model_name and use_auto_parallel:
         pytest.skip("Auto parallel is not supported for Mixtral models")
     config = ModelConfig(llama_model_path)
@@ -258,6 +184,7 @@ def test_llm_generate_async(model_name=default_model_name,
 
     llm = LLM(
         config,
+        tokenizer=tokenizer,
         kv_cache_config=kv_cache_config,
     )
 
@@ -334,15 +261,6 @@ def test_llm_generate_async(model_name=default_model_name,
     test_future(streaming=False)
     test_future_async()
     test_non_streaming_usage_wait()
-
-
-@skip_single_gpu
-@pytest.mark.parametrize("use_auto_parallel", [True, False],
-                         ids=["enable_auto_parallel", "disable_auto_parallel"])
-def test_llm_generate_async_tp2(use_auto_parallel):
-    test_llm_generate_async(default_model_name,
-                            tp_size=2,
-                            use_auto_parallel=use_auto_parallel)
 
 
 @force_ampere

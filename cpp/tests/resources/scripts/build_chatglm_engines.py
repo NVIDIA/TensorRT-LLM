@@ -23,87 +23,90 @@ from pathlib import Path
 
 from build_engines_utils import run_command, wincopy
 
-resources_dir = Path(
-    __file__).parent.parent.parent.parent.parent / "examples/chatglm"
-sys.path.insert(0, str(resources_dir))
-
-engine_target_path = Path(__file__).parent.parent / "models/rt_engine"
+resources_dir = Path(__file__).parent.resolve().parent
+model_dir = resources_dir / "models"
+chatglm_example_dir = Path("examples/chatglm")
+bCopyModel = True  # "False" to remove redundant copy of model from model_cache
 
 
 def convert_ckpt(model_dir: str, output_dir: str, world_size: int):
     convert_cmd = [
         sys.executable,
-        str(resources_dir / "convert_checkpoint.py"), "--dtype=float16",
+        str(chatglm_example_dir / "convert_checkpoint.py"), "--dtype=float32",
         f"--model_dir={model_dir}", f"--output_dir={output_dir}",
         f"--tp_size={world_size}"
     ]
     run_command(convert_cmd)
 
 
-def build_engine(ckpt_dir: str, engine_dir: str):
+def build_engine(ckpt_dir: str, engine_dir: str, is_chatglm_6b: bool = False):
     build_cmd = [
         "trtllm-build", f"--checkpoint_dir={ckpt_dir}",
-        f"--output_dir={engine_dir}", "--log_level=error", "--max_batch_size=2",
-        "--max_beam_width=4", "--max_input_len=512", "--max_output_len=512",
-        "--gpt_attention_plugin=float16", "--gemm_plugin=float16",
+        f"--output_dir={engine_dir}", "--log_level=error", "--max_batch_size=8",
+        "--max_beam_width=2", "--max_input_len=256", "--max_output_len=128",
+        "--gpt_attention_plugin=float32", "--gemm_plugin=float32",
         "--builder_opt=0", "--remove_input_padding=disable",
         "--paged_kv_cache=disable"
     ]
+    if is_chatglm_6b:
+        print("Disable Context FMHA for ChatGLM-6B")
+        build_cmd.append("--context_fmha=disable")
+
     run_command(build_cmd)
 
 
 def build_engines(model_cache: typing.Optional[str] = None,
                   world_size: int = 1):
-    Path(engine_target_path).mkdir(parents=True, exist_ok=True)
 
-    run_command(
-        ["pip", "install", "-r",
-         str(resources_dir) + "/requirements.txt"],
-        cwd=resources_dir)
-
-    for model_name in ["chatglm_6b", "chatglm2_6b", "chatglm3_6b"]:
-        # Get original model
-        model_cache_dir = Path(model_cache) / model_name.replace("_", "-")
+    for model_name in ["chatglm-6b", "chatglm2-6b", "chatglm3-6b"]:
+        model_cache_dir = Path(model_cache) / model_name
         if model_cache_dir.is_dir():
-            print("Copy model from model_cache")
-            if platform.system() == "Windows":
-                wincopy(source=str(model_cache_dir),
-                        dest=model_name,
-                        isdir=True,
-                        cwd=resources_dir)
+            if bCopyModel or model_name == "chatglm-6b":
+                print("Copy model from model_cache")
+                hf_dir = model_dir / model_name
+                if platform.system() == "Windows":
+                    wincopy(source=str(model_cache_dir),
+                            dest=model_name,
+                            isdir=True,
+                            cwd=model_dir)
+                else:
+                    run_command(["rsync", "-av",
+                                 str(model_cache_dir), "."],
+                                cwd=model_dir)
             else:
-                run_command(
-                    ["rsync", "-av", str(model_cache_dir), "."],
-                    cwd=resources_dir)
-            shutil.move(resources_dir / model_name.replace("_", "-"),
-                        resources_dir / model_name)
+                print("Use model from model_cache directly except ChatGLM-6B")
+                hf_dir = Path(model_cache)
+
         else:
             print("Clone model from HF")
+            hf_dir = model_dir / model_name
             run_command(
                 [
                     "git", "clone",
-                    f"https://huggingface.co/THUDM/{model_name.replace('_', '-')}",
-                    model_name
+                    f"https://huggingface.co/THUDM/{model_name}", model_name
                 ],
-                cwd=resources_dir,
+                cwd=model_dir,
             )
 
         # Build engines
         print(f"Building {model_name}")
-        weight_dir = Path(resources_dir) / model_name
-        ckpt_dir = Path(resources_dir) / "trt_ckpt" / model_name
-        trt_dir = Path(resources_dir) / "trt_engines" / model_name
+        ckpt_dir = Path(model_dir) / "c-model" / model_name
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        engine_dir = Path(
+            model_dir
+        ) / "rt_engine" / model_name / "fp32-plugin" / "tp1-pp1-gpu"
+        engine_dir.mkdir(parents=True, exist_ok=True)
 
-        # fix remained error in chatglm_6b, hope to remove this in the future
-        if model_name == "chatglm_6b":
+        # Fix HF error in ChatGLM-6B, hope to remove this in the future
+        if model_name == "chatglm-6b":
             shutil.copy(
-                Path(resources_dir) / "tokenization_chatglm.py",
-                weight_dir,
+                chatglm_example_dir / "tokenization_chatglm.py",
+                hf_dir,
             )
 
-        convert_ckpt(weight_dir, ckpt_dir, world_size)
-        build_engine(ckpt_dir, trt_dir)
-        shutil.move(trt_dir, engine_target_path)
+        convert_ckpt(hf_dir, ckpt_dir / model_name, world_size)
+        build_engine(ckpt_dir / model_name, engine_dir,
+                     model_name == "chatglm-6b")
 
     print("Done")
 

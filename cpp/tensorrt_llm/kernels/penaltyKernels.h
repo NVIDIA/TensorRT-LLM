@@ -45,14 +45,14 @@ struct InvokeBatchApplyPenaltyParams
     runtime::SizeType const vocabSize;
     runtime::SizeType const vocabSizePadded;
     runtime::TokenIdType const** outputIdsPtr;
-    runtime::SizeType const** parentIdsPtr;
-    runtime::SizeType const* inputLengths;
-    runtime::SizeType const* sequenceLengths;
-    runtime::SizeType const* minLengths;
+    runtime::SizeType32 const** parentIdsPtr;
+    runtime::SizeType32 const* inputLengths;
+    runtime::SizeType32 const* sequenceLengths;
+    runtime::SizeType32 const* minLengths;
     runtime::TokenIdType const* endIds;
-    runtime::SizeType const* batchSlots;
+    runtime::SizeType32 const* batchSlots;
     runtime::SizeType const maxTokensPerStep;
-    runtime::SizeType const* tokensPerStep;
+    runtime::SizeType32 const* tokensPerStep;
     cudaStream_t stream;
 };
 

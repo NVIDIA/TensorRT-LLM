@@ -194,6 +194,8 @@ set(TRTLLM_LINK_LIBS
     ${TRT_LIB}
     common_src
     kernels_src
+    context_attention_src
+    decoder_attention_src
     cutlass2_src
     cutlass3_src
     layers_src

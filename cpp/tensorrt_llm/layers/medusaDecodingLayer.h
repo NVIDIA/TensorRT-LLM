@@ -39,15 +39,15 @@ class MedusaDecodingLayer : public BaseLayer
 {
 public:
     using Base = BaseLayer;
-    using PathsVec = std::vector<std::vector<std::vector<runtime::SizeType>>>;
+    using PathsVec = std::vector<std::vector<std::vector<runtime::SizeType32>>>;
 
     class MedusaSetupParams : public DecodingSetupParams
     {
     public:
-        std::optional<std::vector<runtime::SizeType>> runtimeTopK; // [1] or [batchSize] on cpu
-        std::optional<std::vector<std::vector<runtime::SizeType>>>
-            runtimeHeadsTopK;                                      // [batchSize, maxMedusaHeads] on cpu
-        std::optional<std::vector<uint64_t>> randomSeed;           // [1] or [batchSize] on cpu
+        std::optional<std::vector<runtime::SizeType32>> runtimeTopK; // [1] or [batchSize] on cpu
+        std::optional<std::vector<std::vector<runtime::SizeType32>>>
+            runtimeHeadsTopK;                                        // [batchSize, maxMedusaHeads] on cpu
+        std::optional<std::vector<uint64_t>> randomSeed;             // [1] or [batchSize] on cpu
     };
 
     class MedusaForwardParams : public DecodingParams
@@ -98,27 +98,27 @@ private:
     runtime::SizeType mMaxNumHeads;
 
     size_t mSamplingWorkspaceSize;
-    runtime::SizeType mRuntimeMaxTopK{0};
-    runtime::SizeType mRuntimeMaxTopKPerRequestPerMedusaHead{0};
+    runtime::SizeType32 mRuntimeMaxTopK{0};
+    runtime::SizeType32 mRuntimeMaxTopKPerRequestPerMedusaHead{0};
 
     curandState_t* mCurandStatesDevice{nullptr};
     void* mSetupWorkspaceDevice{nullptr};
     void* mSamplingWorkspaceDevice{nullptr};
-    runtime::SizeType* mRuntimeTopKDevice{nullptr};
+    runtime::SizeType32* mRuntimeTopKDevice{nullptr};
     runtime::TokenIdType* mTargetTokensDevice{nullptr};
     uint64_t* mRandomSeedsDevice{nullptr};
     T** mMedusaSelectedLogitsPtrsDevice{nullptr};
     curandState_t* mCurandStatesMedusaLogitsDevice{nullptr};
-    runtime::SizeType* mRuntimeTopKPerRequestPerMedusaHeadDevice{nullptr};
+    runtime::SizeType32* mRuntimeTopKPerRequestPerMedusaHeadDevice{nullptr};
     runtime::TokenIdType* mNewDraftTokensDevice{nullptr};
-    runtime::SizeType* mBestPathIdsDevice{nullptr};
+    runtime::SizeType32* mBestPathIdsDevice{nullptr};
 
     runtime::ITensor::UniquePtr mTiledBatchSlotsSetup;
     runtime::ITensor::UniquePtr mTiledBatchSlotsForward;
     runtime::ITensor::UniquePtr mDraftIdsPtrHost;
     runtime::ITensor::UniquePtr mMedusaInputLogitsPtrs;
 
-    std::vector<runtime::SizeType> mCummulativeTopK;
+    std::vector<runtime::SizeType32> mCummulativeTopK;
 };
 
 } // namespace layers

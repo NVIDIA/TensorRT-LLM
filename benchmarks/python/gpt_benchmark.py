@@ -12,11 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import os
 from dataclasses import asdict
 from math import ceil
 
 import pandas as pd
+import tensorrt as trt
 import torch
 
 import tensorrt_llm
@@ -59,6 +61,11 @@ class GPTBenchmark(BaseBenchmark):
         # the actual weights size shall be smaller because there are some other data in the engine file.
         # for large model, this approximate is close enough.
         self.weights_size_approx = 0
+
+        self.dump_layer_info = args.dump_layer_info
+        # change profiling_verbosity to detailed when enabling dump layer info
+        if self.dump_layer_info:
+            args.profiling_verbosity = "detailed"
 
         if args.engine_dir is not None:
             # Get build configs from engine directory is done in base class
@@ -347,6 +354,17 @@ class GPTBenchmark(BaseBenchmark):
                 kv_pairs = [f"{k} {v}" for k, v in report_dict.items()]
                 line = '[BENCHMARK] ' + " ".join(kv_pairs)
                 print(line)
+
+        if self.dump_layer_info:
+            engine_inspector = self.decoder.engine_inspector
+            inspector_result = engine_inspector.get_engine_information(
+                trt.LayerInformationFormat.JSON)
+            json_result = json.loads(inspector_result)
+            layers = json_result["Layers"]
+            for layer_idx, _ in enumerate(layers):
+                layer_info = engine_inspector.get_layer_information(
+                    layer_idx, trt.LayerInformationFormat.ONELINE)
+                print(layer_info)
 
         if benchmark_profiler is not None and benchmark_profiler.is_recording_perf_profile:
             perf_profile_data = self.decoder.profiler.results

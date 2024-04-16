@@ -2,15 +2,34 @@
 
 ## Table of Contents
 
-- [Overview](#overview)
-- [Quick Start](#quick-start)
-- [Detailed Setup](#detailed-setup)
-- [Building from Source](#building-from-source)
-- [Installation](#installation)
-- [Extra Steps for C++ Runtime Usage](#extra-steps-for-c-runtime-usage)
-- [Next Steps](#next-steps)
-- [Limitations](#limitations)
-- [Troubleshooting Common Errors](#troubleshooting-common-errors)
+- [TensorRT-LLM for Windows](#tensorrt-llm-for-windows)
+	- [Table of Contents](#table-of-contents)
+	- [Overview](#overview)
+	- [Quick Start](#quick-start)
+	- [Detailed Setup](#detailed-setup)
+		- [Python](#python)
+		- [CUDA](#cuda)
+		- [Microsoft MPI](#microsoft-mpi)
+		- [TensorRT-LLM Repo](#tensorrt-llm-repo)
+		- [cuDNN](#cudnn)
+	- [Building from Source](#building-from-source)
+		- [Docker Build Instructions](#docker-build-instructions)
+			- [Docker Desktop](#docker-desktop)
+			- [Acquiring an Image](#acquiring-an-image)
+			- [Running the Container](#running-the-container)
+			- [Build and Extract Files](#build-and-extract-files)
+		- [Bare-Metal Build Instructions](#bare-metal-build-instructions)
+			- [CMake](#cmake)
+			- [Visual Studio](#visual-studio)
+			- [TensorRT](#tensorrt)
+			- [Nsight NVTX](#nsight-nvtx)
+			- [64-bit Developer Powershell](#64-bit-developer-powershell)
+			- [Build](#build)
+	- [Installation](#installation)
+	- [Extra Steps for C++ Runtime Usage](#extra-steps-for-c-runtime-usage)
+	- [Next Steps](#next-steps)
+	- [Limitations](#limitations)
+	- [Troubleshooting Common Errors](#troubleshooting-common-errors)
 
 ## Overview
 
@@ -89,7 +108,7 @@ If you are using the pre-built TensorRT-LLM release wheel (recommended unless yo
 Building from source requires extra prerequisites:
 - [CMake](https://cmake.org/download/) (version 3.27.7 recommended)
 - [Visual Studio 2022](https://visualstudio.microsoft.com/)
-- [TensorRT 9.2.0.5 for TensorRT-LLM](https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/9.2.0/tensorrt-9.2.0.5.windows10.x86_64.cuda-12.2.llm.beta.zip)
+- [TensorRT 9.3.0.1 for TensorRT-LLM](https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/9.3.0/tensorrt-9.3.0.1.windows10.win10.cuda-12.2.llm.beta.zip)
 - Nsight NVTX
 
 We provide a Docker container with these prerequisites already installed. Building with Docker will require you to install [Docker Desktop on Windows](https://docs.docker.com/desktop/install/windows-install/), build the container, build TensorRT-LLM, and copy files out of the Docker container for usage on your Windows host machine. Alternatively, you may install the prerequisites on a bare-metal machine and build there. See [Docker Build Instructions](#docker-build-instructions) or [Bare-Metal Build Instructions](#bare-metal-build-instructions) to proceed.
@@ -132,7 +151,7 @@ git submodule update --init --recursive
 
 Build TensorRT-LLM
 ```
-python .\scripts\build_wheel.py -a "89-real" --trt_root C:\workspace\TensorRT-9.2.0.5\
+python .\scripts\build_wheel.py -a "89-real" --trt_root C:\workspace\TensorRT-9.3.0.1\
 ```
 
 The above command will generate `build\tensorrt_llm-*.whl`. Copy or move this into your mounted folder so it can be accessed on your host machine. If you intend to use the C++ runtime, you'll also need to gather various DLLs from the build into your mounted folder. Complete information about these files can be found below in [Extra Steps for C++ Runtime Usage](#extra-steps-for-c-runtime-usage).
@@ -163,7 +182,7 @@ Download and install [Visual Studio 2022](https://visualstudio.microsoft.com/). 
 
 #### TensorRT
 
-Download and unzip [TensorRT 9.2.0.5 for TensorRT-LLM](https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/9.2.0/tensorrt-9.2.0.5.windows10.x86_64.cuda-12.2.llm.beta.zip). Move the folder to a location you can reference later, such as `%USERPROFILE%\inference\TensorRT`.
+Download and unzip [TensorRT 9.3.0.1 for TensorRT-LLM](https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/9.3.0/tensorrt-9.3.0.1.windows10.win10.cuda-12.2.llm.beta.zip). Move the folder to a location you can reference later, such as `%USERPROFILE%\inference\TensorRT`.
 
 You'll need to add libraries for TensorRT  to your system's `Path` environment variable. Follow the same instructions used for [cuDNN](#cuDNN). Your `Path` should include a line like this:
 
