@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/cudaFp8Utils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/tllmException.h"
+#include <algorithm>
 #include <cinttypes>
 #include <cublasLt.h>
 #include <cublas_v2.h>
@@ -117,6 +118,17 @@ template <typename T>
 void check(T result, char const* const func, char const* const file, int const line)
 {
     if (result)
+    {
+        throw TllmException(
+            file, line, fmtstr("[TensorRT-LLM][ERROR] CUDA runtime error in %s: %s", func, _cudaGetErrorEnum(result)));
+    }
+}
+
+template <typename T>
+void checkEx(T result, std::initializer_list<T> const& validReturns, char const* const func, char const* const file,
+    int const line)
+{
+    if (std::all_of(std::begin(validReturns), std::end(validReturns), [&result](T const& t) { return t != result; }))
     {
         throw TllmException(
             file, line, fmtstr("[TensorRT-LLM][ERROR] CUDA runtime error in %s: %s", func, _cudaGetErrorEnum(result)));
@@ -556,4 +568,14 @@ template void printMatrix(int const* ptr, int m, int k, int stride, bool is_devi
     do                                                                                                                 \
     {                                                                                                                  \
         tensorrt_llm::common::check((stat), #stat, __FILE__, __LINE__);                                                \
+    } while (0)
+
+// We use singleton memory pool and the order of destructors depends on the compiler implementation. We find that the
+// cudaFree/cudaFreeHost is called after cudaruntime destruction on Windows. There will be an cudaErrorCudartUnloading
+// error.  However, it is safe to ignore this error because the cuda runtime is already exited, we are no more worried
+// about the memory leaks.
+#define TLLM_CUDA_CHECK_FREE_RESOURCE(stat)                                                                            \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        tensorrt_llm::common::checkEx((stat), {cudaSuccess, cudaErrorCudartUnloading}, #stat, __FILE__, __LINE__);     \
     } while (0)

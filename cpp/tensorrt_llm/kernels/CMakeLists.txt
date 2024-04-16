@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 1993-2022 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -18,18 +18,19 @@
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
 
-# Exclude files in the cutlass_kernels folder
+# Exclude files in the cutlass_kernels, contextFusedMultiHeadAttention and
+# unfusedAttentionKernels folder
 list(FILTER SRC_CPP EXCLUDE REGEX "cutlass_kernels/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "cutlass_kernels/.*")
-
-# skip mmha 48, 80, 96, 112, 144, 160, 192 and 224 for fast build
-if(FAST_BUILD)
-  list(FILTER SRC_CU EXCLUDE REGEX
-       "decoderMaskedMultiheadAttention(48|80|96|112|144|160|192|224).*cu$")
-endif()
+list(FILTER SRC_CPP EXCLUDE REGEX "contextFusedMultiHeadAttention/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "contextFusedMultiHeadAttention/.*")
+list(FILTER SRC_CPP EXCLUDE REGEX "decoderMaskedMultiheadAttention/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "decoderMaskedMultiheadAttention/.*")
 
 add_library(kernels_src STATIC ${SRC_CPP} ${SRC_CU})
 set_property(TARGET kernels_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET kernels_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
 add_subdirectory(cutlass_kernels)
+add_subdirectory(decoderMaskedMultiheadAttention)
+add_subdirectory(contextFusedMultiHeadAttention)

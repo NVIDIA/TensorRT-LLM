@@ -433,6 +433,7 @@ class BuildConfig:
     auto_parallel_config: AutoParallelConfig = AutoParallelConfig()
     weight_sparsity: bool = False
     plugin_config: PluginConfig = PluginConfig()
+    max_encoder_input_len: int = 1  # for enc-dec DecoderModel
     use_fused_mlp: bool = False
 
     @classmethod
@@ -460,6 +461,7 @@ class BuildConfig:
         lora_config = LoraBuildConfig.from_dict(config.get('lora_config', {}))
         auto_parallel_config = AutoParallelConfig.from_dict(
             config.get('auto_parallel_config', {}))
+        max_encoder_input_len = config.pop('max_encoder_input_len', 1024)
 
         if plugin_config is None:
             plugin_config = PluginConfig()
@@ -485,6 +487,7 @@ class BuildConfig:
             output_timing_cache=output_timing_cache,
             lora_config=lora_config,
             auto_parallel_config=auto_parallel_config,
+            max_encoder_input_len=max_encoder_input_len,
             weight_sparsity=weight_sparsity,
             plugin_config=plugin_config)
 
@@ -610,10 +613,14 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
         build_config.max_draft_len = model.config.max_medusa_token_len
 
     use_auto_parallel = build_config.auto_parallel_config.enabled
-    model = optimize_model(
-        model,
-        use_fused_mlp=(build_config.use_fused_mlp and not use_auto_parallel),
-        use_prompt_tuning=(build_config.max_prompt_embedding_table_size > 0))
+
+    if model.config.architecture not in ["EncoderModel", "DecoderModel"]:
+        model = optimize_model(
+            model,
+            use_fused_mlp=(build_config.use_fused_mlp
+                           and not use_auto_parallel),
+            use_prompt_tuning=(build_config.max_prompt_embedding_table_size >
+                               0))
 
     if build_config.plugin_config.lora_plugin is not None:
         model.use_lora(build_config.lora_config)
@@ -656,11 +663,15 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
                                              model.config.dtype)
     if use_smooth_quant and model.config.quantization.use_plugin_sq:
         network.plugin_config.set_smooth_quant_plugins()
-    if (model.config.quant_mode.has_fp8_kv_cache()
-            or model.config.quant_mode.has_int8_kv_cache()
-        ) and network.plugin_config.use_paged_context_fmha:
-        raise RuntimeError(
-            "Paged Context FMHA doesn't work with fp8/int8 kv cache currently.")
+    if network.plugin_config.use_paged_context_fmha:
+        if (model.config.quant_mode.has_fp8_kv_cache()
+                and not model.config.quant_mode.has_fp8_qdq()):
+            raise RuntimeError(
+                "FP8 Paged Context FMHA only works with fp8 quantization workflow currently."
+            )
+        if model.config.quant_mode.has_int8_kv_cache():
+            raise RuntimeError(
+                "Paged Context FMHA doesn't work with int8 kv cache currently.")
     nccl_plugin = model.config.dtype if model.config.mapping.world_size > 1 else None
     network.plugin_config.set_nccl_plugin(
         nccl_plugin, network.plugin_config.use_custom_all_reduce)
@@ -673,28 +684,39 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
         network.set_named_parameters(model.named_parameters())
 
         # Forward
-        inputs = model.prepare_inputs(
-            max_batch_size=build_config.max_batch_size,
-            max_input_len=build_config.max_input_len,
-            max_seq_len=build_config.max_input_len +
-            build_config.max_output_len,
-            use_cache=True,
-            max_beam_width=build_config.max_beam_width,
-            max_num_tokens=build_config.max_num_tokens,
-            opt_num_tokens=build_config.opt_num_tokens,
-            prompt_embedding_table_size=build_config.
-            max_prompt_embedding_table_size,
-            max_draft_len=build_config.max_draft_len,
-            gather_context_logits=build_config.gather_context_logits,
-            gather_generation_logits=build_config.gather_generation_logits,
-            lora_target_modules=build_config.lora_config.lora_target_modules)
+        prepare_input_args = {
+            "max_batch_size": build_config.max_batch_size,
+            "max_input_len": build_config.max_input_len,
+            "max_seq_len":
+            build_config.max_input_len + build_config.max_output_len,
+            "use_cache": True,
+            "max_beam_width": build_config.max_beam_width,
+            "max_num_tokens": build_config.max_num_tokens,
+            "opt_num_tokens": build_config.opt_num_tokens,
+            "prompt_embedding_table_size":
+            build_config.max_prompt_embedding_table_size,
+            "max_draft_len": build_config.max_draft_len,
+            "gather_context_logits": build_config.gather_context_logits,
+            "gather_generation_logits": build_config.gather_generation_logits,
+            "lora_target_modules": build_config.lora_config.lora_target_modules
+        }
+
+        if model.config.architecture == "DecoderModel":
+            prepare_input_args["max_seq_len"] = build_config.max_output_len
+            prepare_input_args[
+                "max_decoder_input_len"] = build_config.max_input_len
+            prepare_input_args[
+                "max_encoder_input_len"] = build_config.max_encoder_input_len
+
+        inputs = model.prepare_inputs(**prepare_input_args)
         model(**inputs)
 
         if build_config.enable_debug_output:
             for k, v in model.named_network_outputs():
                 network._mark_output(v, k, str_dtype_to_trt(model.config.dtype))
 
-    optimize(network)
+    if model.config.architecture != "DecoderModel":
+        optimize(network)
 
     if use_auto_parallel:
         config = build_config.auto_parallel_config

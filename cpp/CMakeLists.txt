@@ -168,6 +168,10 @@ message(STATUS "    version: ${CUDAToolkit_VERSION}")
 message(STATUS "    libraries: ${CUDAToolkit_LIBRARY_DIR}")
 message(STATUS "    include path: ${CUDAToolkit_INCLUDE_DIRS}")
 
+# Prevent CMake from creating a response file for CUDA compiler, so clangd can
+# pick up on the includes
+set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES 0)
+
 set(CUBLAS_LIB CUDA::cublas)
 set(CUBLASLT_LIB CUDA::cublasLt)
 set(CUDA_DRV_LIB CUDA::cuda_driver)

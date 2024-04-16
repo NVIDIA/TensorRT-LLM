@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/allocator.h"
 #include "tensorrt_llm/common/tensor.h"
+#include "tensorrt_llm/runtime/common.h"
 
 namespace tensorrt_llm
 {
@@ -27,6 +28,10 @@ namespace layers
 class BaseLayer
 {
 public:
+    using SizeType = runtime::SizeType;
+    using TokenIdType = runtime::TokenIdType;
+    using SizeType32 = runtime::SizeType32;
+
     BaseLayer(cudaStream_t stream, std::shared_ptr<tensorrt_llm::common::IAllocator> allocator,
         cudaDeviceProp* prop = nullptr)
         : mStream(stream)

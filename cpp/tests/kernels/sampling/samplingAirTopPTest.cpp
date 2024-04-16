@@ -60,24 +60,30 @@ private:
         int blockNum
             = tk::calcAirTopPBlockNum<T>(params.batchSize, params.vocabSize, smCnt, params.isDeterministicTopP);
 
+        tk::TopPSamplingKernelParams<T> kernelParams;
+        kernelParams.probs = bufferCast<T>(*this->mProbsDevice);
+        kernelParams.outputIds = bufferCast<int*>(*this->mIdsPtrHost);
+        kernelParams.workspace = workspaceDevice->data();
+        kernelParams.topPs = bufferCast<float>(*this->mTopPsDevice);
+        kernelParams.sequenceLength = bufferCast<int32_t>(*this->mSeqLengthsDevice);
+        kernelParams.endIds = bufferCast<int32_t>(*this->mEndIdsDevice);
+        kernelParams.batchSlots = bufferCast<int32_t>(*this->mBatchSlots);
+        kernelParams.finishedInput = reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
+            bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(*this->mFinishedDevice));
+        kernelParams.finishedOutput = reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
+            bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(*this->mFinishedDevice));
+        kernelParams.skipDecode = bufferCast<bool>(*this->mSkipDecodeDevice);
+        kernelParams.cumLogProbs = bufferCast<float>(*this->mCumLogProbsDevice);
+        kernelParams.outputLogProbs = bufferCast<float>(*this->mOutputLogProbsDevice);
+        kernelParams.curandState = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*this->mCurandStatesDevice));
+        kernelParams.batchSize = params.batchSize;
+        kernelParams.maxBatchSize = maxBatchSize;
+        kernelParams.vocabSizePadded = params.vocabSize;
+        kernelParams.blockNum = blockNum;
+        kernelParams.isDeterministic = params.isDeterministicTopP;
+
         // Perform batched TopP sampling
-        tk::invokeBatchAirTopPSampling<T>(workspaceDevice->data(), bufferCast<int*>(*this->mIdsPtrHost),
-            bufferCast<int32_t>(*this->mSeqLengthsDevice),
-            reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
-                bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(*this->mFinishedDevice)),
-            reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
-                bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(*this->mFinishedDevice)),
-            bufferCast<float>(*this->mCumLogProbsDevice), bufferCast<float>(*this->mOutputLogProbsDevice),
-            // Note that the kernel needs vocab probs instead of
-            // log-prob if cum_log_probs or output_log_probs are
-            // provided. It's because the sampling layer already
-            // preprocesses log_prob_buf when those are provided.
-            bufferCast<T>(*this->mProbsDevice),
-            reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*this->mCurandStatesDevice)), params.batchSize,
-            maxBatchSize, params.vocabSize, bufferCast<int32_t>(*this->mEndIdsDevice), this->mMaxTopP,
-            bufferCast<float>(*this->mTopPsDevice), this->mStream->get(), blockNum,
-            bufferCast<bool>(*this->mSkipDecodeDevice), bufferCast<int32_t>(*this->mBatchSlots),
-            params.isDeterministicTopP);
+        tk::invokeBatchAirTopPSampling<T>(kernelParams, this->mStream->get());
     }
 };
 

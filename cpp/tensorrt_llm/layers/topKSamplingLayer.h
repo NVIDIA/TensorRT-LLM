@@ -53,8 +53,8 @@ public:
 
 protected:
     bool mNormalizeLogProbs = true;
-    runtime::SizeType mRuntimeMaxTopK = 0;
-    runtime::SizeType* mRuntimeTopKDevice = nullptr;
+    runtime::SizeType32 mRuntimeMaxTopK = 0;
+    runtime::SizeType32* mRuntimeTopKDevice = nullptr;
     float* mRuntimeTopPDevice = nullptr;
     void* mSetupWorkspaceDevice = nullptr;
     bool* mSkipDecodeDevice = nullptr;

@@ -19,18 +19,20 @@
 #include "tensorrt_llm/kernels/stopCriteriaKernels.h"
 
 using namespace tensorrt_llm::common;
+using namespace tensorrt_llm::runtime;
 
 namespace tensorrt_llm
 {
 namespace kernels
 {
-__global__ void stopWordsCriterion(int32_t const** outputIds, int32_t const** parentIds, int32_t const** stopWords,
-    FinishedState* finished, int32_t const* sequenceLengths, int32_t const* batchSlots, int32_t const* stopWordsLens,
-    int32_t batchSize, int32_t beamWidth, int32_t maxSeqLen)
+__global__ void stopWordsCriterion(TokenIdType const** outputIds, SizeType32 const** parentIds,
+    TokenIdType const** stopWords, FinishedState* finished, SizeType32 const* sequenceLengths,
+    SizeType32 const* batchSlots, SizeType32 const* stopWordsLens, SizeType batchSize, SizeType beamWidth,
+    SizeType maxSeqLen)
 {
-    int32_t const id = blockIdx.x * blockDim.x + threadIdx.x;
-    int32_t const batchIdx = blockIdx.y / beamWidth;
-    int32_t const beamIdx = blockIdx.y % beamWidth;
+    auto const id = static_cast<SizeType>(blockIdx.x * blockDim.x + threadIdx.x);
+    auto const batchIdx = blockIdx.y / beamWidth;
+    auto const beamIdx = blockIdx.y % beamWidth;
     auto const batchSlot = batchSlots != nullptr ? batchSlots[batchIdx] : batchIdx;
     auto const batchBeamIdx = batchSlot * beamWidth + beamIdx;
 
@@ -56,10 +58,10 @@ __global__ void stopWordsCriterion(int32_t const** outputIds, int32_t const** pa
     if (currentStep + 1 >= itemSize)
     {
         shouldStop = true;
-        auto parentId = beamIdx;
+        auto parentId = static_cast<SizeType32>(beamIdx);
         bool const gatherBeam = beamWidth > 1;
 
-        for (int32_t tokenIdx = itemSize - 1; tokenIdx >= 0; tokenIdx--)
+        for (auto tokenIdx = itemSize - 1; tokenIdx >= 0; tokenIdx--)
         {
             auto const previousToken
                 = outputIds[batchSlot][parentId * maxSeqLen + currentStep - (itemSize - 1) + tokenIdx];
@@ -71,7 +73,7 @@ __global__ void stopWordsCriterion(int32_t const** outputIds, int32_t const** pa
             if (gatherBeam)
             {
                 parentId = parentIds == nullptr
-                    ? 0
+                    ? SizeType32{0}
                     : parentIds[batchSlot][parentId * maxSeqLen + currentStep - (itemSize - 1) + tokenIdx];
 
                 if (parentId < 0 || parentId >= beamWidth)
@@ -89,13 +91,14 @@ __global__ void stopWordsCriterion(int32_t const** outputIds, int32_t const** pa
     }
 }
 
-void invokeStopWordsCriterion(int32_t const** outputIds, int32_t const** parentIds, int32_t const** stopWords,
-    FinishedState* finished, int32_t const* sequenceLengths, int32_t const* batchSlots, int32_t const* stopWordsLen,
-    int32_t maxStopWordsLen, int32_t batchSize, int32_t beamWidth, int32_t maxSeqLen, cudaStream_t stream)
+void invokeStopWordsCriterion(TokenIdType const** outputIds, SizeType32 const** parentIds,
+    TokenIdType const** stopWords, FinishedState* finished, SizeType32 const* sequenceLengths,
+    SizeType32 const* batchSlots, SizeType32 const* stopWordsLen, SizeType maxStopWordsLen, SizeType batchSize,
+    SizeType beamWidth, SizeType maxSeqLen, cudaStream_t stream)
 {
     // Check if we have sampled a word from the stopWords list. If so, stop the sequence.
     dim3 block, grid;
-    constexpr int32_t maxBlockSize{256};
+    constexpr SizeType maxBlockSize{256};
 
     block.x = min(((maxStopWordsLen + 32 - 1) / 32) * 32, maxBlockSize);
     grid.x = (maxStopWordsLen + block.x - 1) / block.x;
@@ -106,14 +109,15 @@ void invokeStopWordsCriterion(int32_t const** outputIds, int32_t const** parentI
     sync_check_cuda_error();
 }
 
-__global__ void lengthCriterion(FinishedState* finished, int32_t* finishedSum, uint32_t const* sequenceLimitLength,
-    int32_t* sequenceLengths, int32_t const* batchSlots, int32_t batchSize, int32_t beamWidth)
+__global__ void lengthCriterion(FinishedState* finished, SizeType32* finishedSum, SizeType32 const* sequenceLimitLength,
+    SizeType32* sequenceLengths, SizeType32 const* batchSlots, SizeType32 batchSize, SizeType32 beamWidth)
 {
-    int32_t threadFinishedCount = 0;
+    SizeType32 threadFinishedCount = 0;
     auto const batchIdx = blockIdx.x;
     auto const batchSlot = batchSlots != nullptr ? batchSlots[batchIdx] : batchIdx;
 
-    for (int32_t beamIdx = threadIdx.x; beamIdx < beamWidth; beamIdx += blockDim.x)
+    for (auto beamIdx = static_cast<SizeType>(threadIdx.x); beamIdx < beamWidth;
+         beamIdx += static_cast<SizeType>(blockDim.x))
     {
         auto const batchSlotBeamWidthIdx = batchSlot * beamWidth + beamIdx;
 
@@ -130,7 +134,7 @@ __global__ void lengthCriterion(FinishedState* finished, int32_t* finishedSum, u
 
     if (finishedSum)
     {
-        int blockFinishedCount = 0;
+        SizeType32 blockFinishedCount = 0;
         if (blockDim.x <= 32)
         {
             blockFinishedCount = warpReduceSum(threadFinishedCount);
@@ -148,14 +152,15 @@ __global__ void lengthCriterion(FinishedState* finished, int32_t* finishedSum, u
     }
 }
 
-void invokeLengthCriterion(FinishedState* finished, int32_t* finishedSum, uint32_t const* sequenceLimitLength,
-    int32_t* sequenceLengths, int32_t const* batchSlots, int32_t batchSize, int32_t beamWidth, cudaStream_t stream)
+void invokeLengthCriterion(FinishedState* finished, SizeType32* finishedSum, SizeType32 const* sequenceLimitLength,
+    SizeType32* sequenceLengths, SizeType32 const* batchSlots, SizeType batchSize, SizeType beamWidth,
+    cudaStream_t stream)
 {
     // Check if we have attained the sequence length limit. If so, stop the
     // sequence. In addition, check if all sequences are stopped and return the
     // result in shouldStop
-    dim3 block{min(512, uint32_t(beamWidth))};
-    dim3 grid{uint32_t(batchSize)};
+    dim3 block{min(512, static_cast<uint32_t>(beamWidth))};
+    dim3 grid{static_cast<uint32_t>(batchSize)};
 
     lengthCriterion<<<grid, block, 0, stream>>>(
         finished, finishedSum, sequenceLimitLength, sequenceLengths, batchSlots, batchSize, beamWidth);

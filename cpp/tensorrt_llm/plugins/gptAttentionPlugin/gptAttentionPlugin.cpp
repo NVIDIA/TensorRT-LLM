@@ -78,12 +78,14 @@ bool GPTAttentionPlugin::isEntryUsed(IdxEntry const& entry) const
     case IdxEntry::CONTEXT_LENGTHS: return true;
     case IdxEntry::CACHE_INDIR: return useKVCache();
     case IdxEntry::REQUEST_TYPES: return true;
-    case IdxEntry::KV_CACHE_BLOCK_POINTERS: return useKVCache() && mPagedKVCache;
-    case IdxEntry::HOST_KV_CACHE_BLOCK_POINTERS: return useKVCache() && mPagedKVCache;
+    case IdxEntry::KV_CACHE_BLOCK_OFFSETS: return useKVCache() && mPagedKVCache;
+    case IdxEntry::HOST_KV_CACHE_BLOCK_OFFSETS: return useKVCache() && mPagedKVCache;
+    case IdxEntry::HOST_KV_CACHE_POOL_POINTERS: return useKVCache() && mPagedKVCache;
     case IdxEntry::PAST_KEY_VALUE: return useKVCache() && !mPagedKVCache;
     case IdxEntry::KV_CACHE_QUANTIZATION_SCALE: return useKVCache() && mKVCacheQuantMode.hasKvCacheQuant();
     case IdxEntry::KV_CACHE_DEQUANTIZATION_SCALE: return useKVCache() && mKVCacheQuantMode.hasKvCacheQuant();
     case IdxEntry::ATTENTION_OUTPUT_QUANTIZATION_SCALE: return mFP8ContextFMHA && mKVCacheQuantMode.hasFp8Qdq();
+    case IdxEntry::ROTARY_COS_SIN: return isRoPE();
     case IdxEntry::ALIBI_SLOPES: return isALiBi();
     case IdxEntry::RELATIVE_ATTENTION_BIAS: return isRelativePosition();
     case IdxEntry::CROSS_QKV: return isCrossAttention();
@@ -180,6 +182,10 @@ bool GPTAttentionPlugin::supportsFormatCombination(
     {
         return inOut[pos].type == nvinfer1::DataType::kINT32;
     }
+    else if (isRoPE() && (pos == getIdx(IdxEntry::ROTARY_COS_SIN)))
+    {
+        return inOut[pos].type == nvinfer1::DataType::kFLOAT;
+    }
     else if (useKVCache() && mKVCacheQuantMode.hasKvCacheQuant()
         && (pos == getIdx(IdxEntry::KV_CACHE_DEQUANTIZATION_SCALE)
             || pos == getIdx(IdxEntry::KV_CACHE_QUANTIZATION_SCALE)))
@@ -192,9 +198,14 @@ bool GPTAttentionPlugin::supportsFormatCombination(
         return inOut[pos].type == nvinfer1::DataType::kFLOAT && inOut[pos].format == TensorFormat::kLINEAR;
     }
     else if (mPagedKVCache
-        && (pos == getIdx(IdxEntry::KV_CACHE_BLOCK_POINTERS) || pos == getIdx(IdxEntry::HOST_KV_CACHE_BLOCK_POINTERS)))
+        && (pos == getIdx(IdxEntry::KV_CACHE_BLOCK_OFFSETS) || pos == getIdx(IdxEntry::HOST_KV_CACHE_BLOCK_OFFSETS)))
     {
-        // pointers to kv cache blocks
+        // kv cache block offsets
+        return inOut[pos].type == nvinfer1::DataType::kINT32 && inOut[pos].format == TensorFormat::kLINEAR;
+    }
+    else if (mPagedKVCache && (pos == getIdx(IdxEntry::HOST_KV_CACHE_POOL_POINTERS)))
+    {
+        // kv cache pool pointers
         return inOut[pos].type == nvinfer1::DataType::kINT64 && inOut[pos].format == TensorFormat::kLINEAR;
     }
     else if (mKVCacheQuantMode.hasInt8KvCache()
@@ -261,8 +272,10 @@ void GPTAttentionPlugin::configurePluginImpl(nvinfer1::DynamicPluginTensorDesc c
         /*alibi_slopes=*/nullptr,
         /*context_buf_=*/nullptr,
         /*key_value_cache=*/nullptr,
-        /*block_pointers=*/nullptr, max_attention_window_size, cyclic_attention_window_size, sink_token_length,
-        num_requests,
+        /*block_offsets=*/nullptr,
+        /*host_primary_pool_pointer=*/nullptr,
+        /*host_secondary_pool_pointer=*/nullptr, max_attention_window_size, cyclic_attention_window_size,
+        sink_token_length, num_requests,
         /*max_blocks_per_sequence=*/0,
         /*cache_indir=*/nullptr,
         /*workspace=*/nullptr,
@@ -423,6 +436,12 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
     {
         qkv_bias = reinterpret_cast<T const*>(inputs[getIdx(IdxEntry::QKV_BIAS_TENSOR)]);
     }
+    // Rotary cos_sin cache to avoid re-computing.
+    float2 const* rotary_cos_sin = nullptr;
+    if (isRoPE())
+    {
+        rotary_cos_sin = reinterpret_cast<float2 const*>(inputs[getIdx(IdxEntry::ROTARY_COS_SIN)]);
+    }
 
     auto const reqTypeInBatchPtr = static_cast<RequestType const*>(inputs[getIdx(IdxEntry::REQUEST_TYPES)]) + seqIdxBeg;
     bool const is_context = (reqTypeInBatchPtr[0] == RequestType::kCONTEXT);
@@ -518,24 +537,36 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
     }
 
     int max_blocks_per_sequence = 0;
-    void* block_pointers = nullptr;
-    void* host_block_pointers = nullptr;
+    kernels::KVBlockArray::DataType* block_offsets = nullptr;
+    kernels::KVBlockArray::DataType* host_block_offsets = nullptr;
+    void* host_primary_pool_pointer = nullptr;
+    void* host_secondary_pool_pointer = nullptr;
     if (useKVCache() && mPagedKVCache)
     {
-        auto const& kvCacheBlockPointers = inputDesc[getIdx(IdxEntry::KV_CACHE_BLOCK_POINTERS)];
-        auto const& kvCacheBlockPointersShape = inputDesc[getIdx(IdxEntry::KV_CACHE_BLOCK_POINTERS)].dims;
-        max_blocks_per_sequence = kvCacheBlockPointersShape.d[kvCacheBlockPointersShape.nbDims - 1];
-        auto const batchSize = kvCacheBlockPointersShape.d[1];
-        auto const seqStride = getStride(kvCacheBlockPointersShape, 1);
-        auto const layerOffset = mLayerIdx * batchSize * seqStride;
+        auto const& kvCacheBlockOffsets = inputDesc[getIdx(IdxEntry::KV_CACHE_BLOCK_OFFSETS)];
+        auto const& kvCacheBlockOffsetsShape = inputDesc[getIdx(IdxEntry::KV_CACHE_BLOCK_OFFSETS)].dims;
+        max_blocks_per_sequence = kvCacheBlockOffsetsShape.d[kvCacheBlockOffsetsShape.nbDims - 1];
+        auto const seqStride = getStride(kvCacheBlockOffsetsShape, 0);
         auto const seqOffset = seqIdxBeg * seqStride;
-        auto const offset = layerOffset + seqOffset;
-        auto const* const typed_block_pointers
-            = static_cast<void* const*>(inputs[getIdx(IdxEntry::KV_CACHE_BLOCK_POINTERS)]) + offset;
-        block_pointers = const_cast<void*>(static_cast<void const*>(typed_block_pointers));
-        auto const* const typed_host_block_pointers
-            = static_cast<void* const*>(inputs[getIdx(IdxEntry::HOST_KV_CACHE_BLOCK_POINTERS)]) + offset;
-        host_block_pointers = const_cast<void*>(static_cast<void const*>(typed_host_block_pointers));
+
+        block_offsets
+            = reinterpret_cast<kernels::KVBlockArray::DataType*>(inputs[getIdx(IdxEntry::KV_CACHE_BLOCK_OFFSETS)])
+            + seqOffset;
+
+        host_block_offsets
+            = reinterpret_cast<kernels::KVBlockArray::DataType*>(inputs[getIdx(IdxEntry::HOST_KV_CACHE_BLOCK_OFFSETS)])
+            + seqOffset;
+
+        auto const* const typed_host_pool_pointers
+            = static_cast<char* const*>(inputs[getIdx(IdxEntry::HOST_KV_CACHE_POOL_POINTERS)]);
+
+        auto const cacheElemSize = (mKVCacheQuantMode.hasKvCacheQuant() ? 1 : sizeof(T));
+        auto const blockSize = mTokensPerBlock * mNumKVHeads * mHeadSize;
+        auto const bytesPerBlock = blockSize * cacheElemSize;
+        auto const layerOffset = mLayerIdx * 2 * bytesPerBlock;
+
+        host_primary_pool_pointer = reinterpret_cast<void*>(typed_host_pool_pointers[0] + layerOffset);
+        host_secondary_pool_pointer = reinterpret_cast<void*>(typed_host_pool_pointers[1] + layerOffset);
     }
 
     T* context_buf_
@@ -601,11 +632,12 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
             }
         }
 
-        EnqueueContextParams<T, KVCacheBuffer> enqueue_params{attention_input, qkv_bias, max_context_q_len,
-            max_context_kv_len, max_attention_window_size, cyclic_attention_window_size, sink_token_length,
-            context_q_lengths, sequence_kv_length, kv_scale_orig_quant, kv_scale_quant_orig,
-            attention_output_orig_quant, alibi_slopes, context_buf_, key_value_cache, block_pointers,
-            host_block_pointers, batch_size, localNbTokens, max_blocks_per_sequence, workspace};
+        EnqueueContextParams<T, KVCacheBuffer> enqueue_params{attention_input, qkv_bias, rotary_cos_sin,
+            max_context_q_len, max_context_kv_len, max_attention_window_size, cyclic_attention_window_size,
+            sink_token_length, context_q_lengths, sequence_kv_length, kv_scale_orig_quant, kv_scale_quant_orig,
+            attention_output_orig_quant, alibi_slopes, context_buf_, key_value_cache, block_offsets, host_block_offsets,
+            host_primary_pool_pointer, host_secondary_pool_pointer, batch_size, localNbTokens, max_blocks_per_sequence,
+            workspace};
         if (isRelativePosition())
         {
             enqueue_params.relative_attention_bias
@@ -647,8 +679,9 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         EnqueueGenerationParams<T, KVCacheBuffer> enqueue_params{attention_input, qkv_bias, input_seq_length,
             sequence_kv_length, max_context_kv_len, beamWidth, context_q_lengths, kv_scale_orig_quant,
             kv_scale_quant_orig, attention_output_orig_quant, alibi_slopes, context_buf_, key_value_cache,
-            block_pointers, max_attention_window_size, cyclic_attention_window_size, sink_token_length, num_requests,
-            max_blocks_per_sequence, cache_indir, workspace, max_context_kv_len_list};
+            block_offsets, host_primary_pool_pointer, host_secondary_pool_pointer, max_attention_window_size,
+            cyclic_attention_window_size, sink_token_length, num_requests, max_blocks_per_sequence, cache_indir,
+            workspace, max_context_kv_len_list};
         enqueue_params.host_context_lengths = host_context_lengths;
         if (isRelativePosition())
         {

@@ -1,5 +1,4 @@
 import argparse
-import configparser
 import functools
 import json
 import logging
@@ -8,10 +7,10 @@ import shutil
 import tarfile
 import time
 import traceback
-from collections import defaultdict, namedtuple
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 
 import numpy as np
 import safetensors
@@ -21,7 +20,7 @@ import yaml
 from datasets import load_dataset
 from tqdm import tqdm
 from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
-                          GPT2Config, GPT2Tokenizer, T5Tokenizer)
+                          GPT2Config)
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 from transformers.pytorch_utils import Conv1D
 
@@ -1120,78 +1119,6 @@ def gpu_map_location(storage, loc):
         raise ValueError(f"Not handled {loc}")
 
 
-# The field names are the same as in .nemo config file
-# Defaults and their locations in NeMo code are given for commit 9c7926db4ae375b77dae7eb57656213de1dd76a5 in main branch
-# The commit from main is used instead of a release because there are `rotary_base` commit was introduced recently.
-NemoRotaryEmbeddingParameters = namedtuple(
-    "NemoRotaryEmbeddingParameters",
-    [
-        "position_embedding_type", "rotary_percentage",
-        "seq_len_interpolation_factor", "rotary_base"
-    ],
-    defaults=[
-        # "position_embedding_type", the default is taken from
-        # https://github.com/NVIDIA/NeMo/blob/9c7926db4ae375b77dae7eb57656213de1dd76a5/nemo/collections/nlp/models/language_modeling/megatron_gpt_model.py#L370
-        "learned_absolute",
-        # "rotary_percentage", the default is taken from
-        # https://github.com/NVIDIA/NeMo/blob/9c7926db4ae375b77dae7eb57656213de1dd76a5/nemo/collections/nlp/models/language_modeling/megatron_gpt_model.py#L370
-        1.0,
-        # "seq_len_interpolation_factor", the default is take from
-        # https://github.com/NVIDIA/NeMo/blob/9c7926db4ae375b77dae7eb57656213de1dd76a5/nemo/collections/nlp/models/language_modeling/megatron_gpt_model.py#L388
-        None,
-        # "rotary_base", the default is taken from
-        # https://github.com/NVIDIA/NeMo/blob/9c7926db4ae375b77dae7eb57656213de1dd76a5/nemo/collections/nlp/models/language_modeling/megatron_gpt_model.py#L389
-        10000,
-    ])
-
-
-def set_parameter_from_config(params: Dict[str, Any], nemo_config: Dict[str,
-                                                                        Any],
-                              param_name: str) -> None:
-    if param_name in nemo_config:
-        params[param_name] = nemo_config[param_name]
-    else:
-        LOGGER.debug(
-            f"A parameter '{param_name}' is missing in nemo checkpoint. "
-            f"The default value {repr(NemoRotaryEmbeddingParameters._field_defaults[param_name])} will be used."
-        )
-
-
-def extract_rotary_parameters_from_nemo_config(
-        nemo_config: Dict[str, Any]) -> NemoRotaryEmbeddingParameters:
-    params = {}
-    set_parameter_from_config(params, nemo_config, "position_embedding_type")
-    set_parameter_from_config(params, nemo_config, "rotary_percentage")
-    set_parameter_from_config(params, nemo_config,
-                              "seq_len_interpolation_factor")
-    set_parameter_from_config(params, nemo_config, "rotary_base")
-    return NemoRotaryEmbeddingParameters(**params)
-
-
-def nemo_to_gpt_config(nemo_model_config, vocab_size, eos_id, bos_id):
-    convertion_dict = {
-        "activation_function": "activation",
-        "layer_norm_epsilon": "layernorm_epsilon",
-        "n_embd": "hidden_size",
-        "n_head": "num_attention_heads",
-        "n_layer": "num_layers",
-        "n_positions": "max_position_embeddings",
-        "rotary_pct": "rotary_percentage",
-        "bias": "bias",
-        "intermediate_size": "ffn_hidden_size",
-    }
-
-    kwargs = {
-        key: nemo_model_config[value]
-        for key, value in convertion_dict.items() if value in nemo_model_config
-    }
-    kwargs["vocab_size"] = vocab_size
-    kwargs["eos_token_id"] = eos_id
-    kwargs["bos_token_id"] = bos_id
-
-    return GPT2Config(**kwargs)
-
-
 def copy_tokenizer_files(config, out_dir):
     basenames = {
         "model": "tokenizer",
@@ -1212,30 +1139,6 @@ def copy_tokenizer_files(config, out_dir):
         shutil.copy(path.as_posix(), dst_path.as_posix())
 
 
-def add_rotary_parameters_to_ini_config(
-        config: configparser.ConfigParser,
-        rotary_parameters: NemoRotaryEmbeddingParameters) -> None:
-    if rotary_parameters.position_embedding_type == "rope":
-        if rotary_parameters.rotary_percentage > 1.0 or rotary_parameters.rotary_percentage <= 0.0:
-            raise ValueError(
-                f"Rotary percentage has to suffice 0.0 < rotary_percentage <= 1.0, whereas "
-                f"rotary_percentage={rotary_parameters.rotary_percentage}")
-        config["gpt"]["rotary_pct"] = str(rotary_parameters.rotary_percentage)
-        config["gpt"]["rotary_base"] = str(rotary_parameters.rotary_base)
-        if rotary_parameters.seq_len_interpolation_factor is not None:
-            if rotary_parameters.seq_len_interpolation_factor <= 1.0:
-                raise ValueError(
-                    f"Rotary scaling is supported only for seq_len_interpolation_factor > 1.0. "
-                    f"Got seq_len_interpolation_factor={rotary_parameters.seq_len_interpolation_factor}"
-                )
-            config["gpt"]["rotary_scaling_type"] = "linear"
-            config["gpt"]["rotary_scaling_factor"] = str(
-                float(rotary_parameters.seq_len_interpolation_factor))
-    else:
-        # As in HF rotary_pct > 0.0 triggers RoPE. Dislabe RoPE if different embedding type is used
-        config["gpt"]["rotary_pct"] = "0.0"
-
-
 def update_tokenizer_paths(tokenizer_config: Dict,
                            tokenizer_file_paths: Dict[str, Optional[str]]):
     for key, new_path in tokenizer_file_paths.items():
@@ -1252,90 +1155,6 @@ def update_tokenizer_paths(tokenizer_config: Dict,
             )
             tokenizer_config[key] = None
     return tokenizer_config
-
-
-def build_tokenizer(tokenizer_config: Dict):
-    if tokenizer_config["library"] == "sentencepiece":
-        tokenizer = T5Tokenizer(tokenizer_config["model"], extra_ids=0)
-    elif "GPT2" in tokenizer_config["type"]:
-        tokenizer = GPT2Tokenizer(tokenizer_config["vocab_file"],
-                                  tokenizer_config["merge_file"])
-    else:
-        raise ValueError(
-            f'Tokenizer type {tokenizer_config["library"]} not handled')
-
-    if tokenizer.bos_token_id is None:
-        tokenizer.add_special_tokens({"bos_token": "<s>"})
-    if tokenizer.eos_token_id is None:
-        tokenizer.add_special_tokens({"eos_token": "</s>"})
-
-    return tokenizer
-
-
-def get_eos_bos_ids_from_tokenizer_config(
-        tokenizer_config: Dict[str, Any]) -> Tuple[int, int]:
-    tokenizer = build_tokenizer(tokenizer_config)
-    return tokenizer.eos_token_id, tokenizer.bos_token_id
-
-
-def nemo_config_to_ini_config(
-    nemo_model_config: Dict[str, Any],
-    eos_id: int,
-    bos_id: int,
-    vocab_size: int,
-    storage_type: str,
-) -> configparser.ConfigParser:
-    gpt_model_config = nemo_to_gpt_config(nemo_model_config, vocab_size, eos_id,
-                                          bos_id)
-    config = configparser.ConfigParser()
-    config["gpt"] = {k: str(v) for k, v in vars(gpt_model_config).items()}
-    config["gpt"]["storage_dtype"] = storage_type
-    add_rotary_parameters_to_ini_config(
-        config, extract_rotary_parameters_from_nemo_config(nemo_model_config))
-    return config
-
-
-def add_special_tokens_to_tokenizer(tokenizer):
-
-    # Need to add cls, sep, mask tokens to the tokenizer if they don't exist.
-    # If cls, sep and mask are not attributes of the tokenizer, add it.
-    if not hasattr(tokenizer, 'cls_token'):
-        tokenizer.add_special_tokens({'cls_token': '<cls>'})
-    if not hasattr(tokenizer.tokenizer, 'sep_id'):
-        tokenizer.add_special_tokens({'sep_token': '<sep>'})
-    if not hasattr(tokenizer.tokenizer, 'mask_id'):
-        tokenizer.add_special_tokens({'mask_token': '<mask>'})
-
-    # bos, eos, pad and unk may be present in the provided spm .model file, if they are, use it.
-    if not hasattr(tokenizer, 'pad_token'):
-        if hasattr(tokenizer.tokenizer,
-                   'pad_id') and tokenizer.tokenizer.pad_id() > 0:
-            tokenizer.pad_token = tokenizer.tokenizer.id_to_piece(
-                tokenizer.tokenizer.pad_id())
-        else:
-            tokenizer.add_special_tokens({'pad_token': '<pad>'})
-    else:
-        tokenizer.add_special_tokens({'pad_token': '<pad>'})
-
-    if not hasattr(tokenizer, 'bos_token'):
-        if hasattr(tokenizer.tokenizer,
-                   'bos_id') and tokenizer.tokenizer.bos_id() > 0:
-            tokenizer.bos_token = tokenizer.tokenizer.id_to_piece(
-                tokenizer.tokenizer.bos_id())
-        else:
-            tokenizer.add_special_tokens({'bos_token': '<bos>'})
-    else:
-        tokenizer.add_special_tokens({'bos_token': '<s>'})
-
-    if not hasattr(tokenizer, 'eos_token'):
-        if hasattr(tokenizer.tokenizer,
-                   'eos_id') and tokenizer.tokenizer.eos_id() > 0:
-            tokenizer.eos_token = tokenizer.tokenizer.id_to_piece(
-                tokenizer.tokenizer.eos_id())
-        else:
-            tokenizer.add_special_tokens({'eos_token': '<eos>'})
-    else:
-        tokenizer.add_special_tokens({'eos_token': '</s>'})
 
 
 def unpack_nemo_ckpt(nemo_archive_path: Union[str, Path],
@@ -1582,8 +1401,25 @@ def load_nemo_gpt_config(
     hf_config.bias = nemo_model_config['bias']
     # hf_config.apply_query_key_layer_scaling = nemo_model_config['apply_query_key_layer_scaling']
     hf_config.apply_query_key_layer_scaling = False
-    hf_config.position_embedding_type = 'rope_gpt_neox'
-    hf_config.rotary_pct = nemo_model_config['rotary_percentage']
+
+    hf_config.position_embedding_type = nemo_model_config.get(
+        'position_embedding_type', 'learned_absolute')
+    if hf_config.position_embedding_type == 'rope':
+        hf_config.position_embedding_type = 'rope_gpt_neox'
+    hf_config.rotary_base = nemo_model_config.get('rotary_base', 10000.0)
+    hf_config.rotary_pct = nemo_model_config.get('rotary_percentage', 1.0)
+    assert hf_config.rotary_pct >= 0 and hf_config.rotary_pct <= 1
+
+    rotary_scaling_factor = nemo_model_config.get(
+        'seq_len_interpolation_factor', None)
+    if rotary_scaling_factor is None:
+        hf_config.rotary_scaling = None
+    else:
+        assert rotary_scaling_factor > 1
+        hf_config.rotary_scaling = {
+            'type': 'linear',
+            'factor': rotary_scaling_factor
+        }
 
     tokenizer_config = update_tokenizer_paths(
         nemo_model_config["tokenizer"],
@@ -1923,6 +1759,10 @@ if __name__ == '__main__':
         getattr(hf_config, 'apply_query_key_layer_scaling', False),
         'rotary_pct':
         getattr(hf_config, 'rotary_pct', 1.0),
+        'rotary_base':
+        getattr(hf_config, 'rotary_base', 10000.0),
+        'rotary_scaling':
+        getattr(hf_config, 'rotary_scaling', None),
     }
 
     with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:

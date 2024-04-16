@@ -20,6 +20,7 @@
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunner.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
+#include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 #include "tensorrt_llm/plugins/common/checkMacrosPlugin.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
@@ -33,23 +34,6 @@ using namespace tensorrt_llm::kernels;
 namespace tc = tensorrt_llm::common;
 using tensorrt_llm::plugins::GPTAttentionPluginCreatorCommon;
 using tensorrt_llm::plugins::GPTAttentionPluginCommon;
-
-template <typename KVCacheBuffer>
-struct KVCacheBufferDataType
-{
-};
-
-template <>
-struct KVCacheBufferDataType<KVLinearBuffer>
-{
-    using Type = int8_t;
-};
-
-template <>
-struct KVCacheBufferDataType<KVBlockArray>
-{
-    using Type = int64_t;
-};
 
 template <typename T>
 struct SATypeConverter
@@ -225,7 +209,7 @@ bool GPTAttentionPluginCommon::convertMMHAParamsToXQAParams(tensorrt_llm::kernel
     xqaParams.cyclic_attention_window_size = generationsParams.cyclic_attention_window_size;
     xqaParams.max_blocks_per_sequence = generationsParams.max_blocks_per_sequence;
     xqaParams.sink_token_length = generationsParams.sink_token_length;
-    xqaParams.timestep = generationsParams.past_kv_length;
+    xqaParams.timestep = generationsParams.max_past_kv_length;
     xqaParams.qkv_bias = generationsParams.qkv_bias;
     xqaParams.sequence_lengths = generationsParams.sequence_lengths;
     xqaParams.context_lengths = generationsParams.context_lengths;
@@ -452,7 +436,6 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads,
     {
         TLLM_CHECK_WITH_INFO(mEnableContextFMHA, "FP8 FMHA cannot be enabled because Context FMHA is not supported.");
         TLLM_CHECK_WITH_INFO(mSM == 90, "FP8 FMHA cannot be enabled on Pre-Hopper Arch.");
-        TLLM_CHECK_WITH_INFO(!mPagedContextFMHA, "FP8 Context Paged KV FMHA hasn't been implemented yet.");
     }
 
     TLLM_CHECK(isRoPE() == (rotary_embedding_dim != 0));
@@ -462,12 +445,8 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads,
     // Some features have not been implemented on Volta.
     if (mSM == 70 && mEnableContextFMHA)
     {
-        // Volta only has disablePagedKVContextFMHA implement
-        TLLM_CHECK_WITH_INFO(!(mPagedKVCache && mPagedContextFMHA), "PagedKV Context FMHA is not supported on Volta");
         // Volta dose not support FP32 acc
         TLLM_CHECK_WITH_INFO(!mFMHAForceFP32Acc, "FP32 Acc is not supported on Volta");
-
-        TLLM_LOG_WARNING("Note that alibi or sliding window attention are not supported for FMHA on Volta");
     }
 
     // Pre-check whether the head size is supported by MMHA.
@@ -552,51 +531,51 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForContext(nvinfer1::DataType t
     size_t context_workspace_size = 0;
 
     int const batch_size = nbReq;
-    const size_t attention_mask_size = mEnableContextFMHA
+    size_t const attention_mask_size = mEnableContextFMHA
         ? 0
         : size * batch_size * input_seq_length * (isCrossAttention() ? cross_qkv_length : input_seq_length);
     const size_t cu_seqlens_size = sizeof(int) * (batch_size + 1);
+    const size_t rotary_inv_freq_size = sizeof(float) * batch_size * mRotaryEmbeddingDim / 2;
     const size_t q_buf_2_size = chunked_context_support
         ? size * max_num_tokens * local_hidden_units_qo
         : (!mEnableContextFMHA ? size * batch_size * input_seq_length * local_hidden_units_qo : 0);
-    const size_t k_buf_2_size = mEnableContextFMHA
+    size_t const k_buf_2_size = mEnableContextFMHA
         ? 0
         : size * batch_size * (isCrossAttention() ? cross_qkv_length : input_seq_length) * local_hidden_units_kv;
-    const size_t v_buf_2_size = mEnableContextFMHA
+    size_t const v_buf_2_size = mEnableContextFMHA
         ? 0
         : size * batch_size * (isCrossAttention() ? cross_qkv_length : input_seq_length) * local_hidden_units_kv;
-    const size_t qk_buf_size = mEnableContextFMHA
+    size_t const qk_buf_size = mEnableContextFMHA
         ? 0
         : size * batch_size * mNumHeads * input_seq_length * (isCrossAttention() ? cross_qkv_length : input_seq_length);
-    const size_t qkv_buf_2_size = mEnableContextFMHA ? 0 : size * batch_size * input_seq_length * local_hidden_units_qo;
-    const size_t qk_buf_float_size = mEnableContextFMHA ? 0
+    size_t const qkv_buf_2_size = mEnableContextFMHA ? 0 : size * batch_size * input_seq_length * local_hidden_units_qo;
+    size_t const qk_buf_float_size = mEnableContextFMHA ? 0
                                                         : sizeof(float) * batch_size * mNumHeads * input_seq_length
             * (isCrossAttention() ? cross_qkv_length : input_seq_length);
-    const size_t fp8_qkv_buffer_size = mFP8ContextFMHA && mEnableContextFMHA
+    size_t const fp8_qkv_buffer_size = mFP8ContextFMHA && mEnableContextFMHA
         ? batch_size * input_seq_length * (local_hidden_units_qo + 2 * local_hidden_units_kv)
         : 0;
-    const size_t padding_offset_size = sizeof(int) * batch_size * input_seq_length;
-    // It is assumed that the number of tokens per paged kv block should be >= 128.
-    const size_t paged_kv_tma_desc_size = mPagedKVCache && mPagedContextFMHA
-        ? batch_size * 2 * TMA_DESC_SIZE_IN_BYTE * tc::divUp(max_attention_window, mTokensPerBlock)
-        : 0;
+    size_t const padding_offset_size = sizeof(int) * batch_size * input_seq_length;
+    const size_t fmha_scheduler_counter = mEnableContextFMHA ? sizeof(uint32_t) : 0;
 
-    int const NUM_BUFFERS = 13;
+    int const NUM_BUFFERS = 14;
     size_t workspaces[NUM_BUFFERS];
     workspaces[0] = CUBLAS_WORKSPACE_SIZE;
     workspaces[1] = attention_mask_size;
     workspaces[2] = cu_seqlens_size; // cu_seqlen_q
     workspaces[3] = cu_seqlens_size; // cu_seqlen_kv
-    workspaces[4] = q_buf_2_size;
-    workspaces[5] = k_buf_2_size;
-    workspaces[6] = v_buf_2_size;
-    workspaces[7] = qk_buf_size;
-    workspaces[8] = qkv_buf_2_size;
-    workspaces[9] = qk_buf_float_size;
-    workspaces[10] = fp8_qkv_buffer_size;
-    workspaces[11] = padding_offset_size;
-    workspaces[12] = paged_kv_tma_desc_size;
+    workspaces[4] = rotary_inv_freq_size;
+    workspaces[5] = q_buf_2_size;
+    workspaces[6] = k_buf_2_size;
+    workspaces[7] = v_buf_2_size;
+    workspaces[8] = qk_buf_size;
+    workspaces[9] = qkv_buf_2_size;
+    workspaces[10] = qk_buf_float_size;
+    workspaces[11] = fp8_qkv_buffer_size;
+    workspaces[12] = padding_offset_size;
+    workspaces[13] = fmha_scheduler_counter;
     context_workspace_size = tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
+
     return context_workspace_size;
 }
 
@@ -615,11 +594,11 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForGeneration(
     int32_t const maxSeqLenTile
         = std::max(getMaxNumSeqLenTile(batch_beam), (int) tc::divUp(mMultiProcessorCount, mNumHeads));
 
-    const size_t partial_out_size = size * batch_beam * mNumHeads * mHeadSize * maxSeqLenTile;
-    const size_t partial_sum_size = sizeof(float) * batch_beam * mNumHeads * maxSeqLenTile;
-    const size_t partial_max_size = sizeof(float) * batch_beam * mNumHeads * maxSeqLenTile;
-    const size_t block_counter_size = sizeof(int) * batch_beam * mNumHeads;
-    const size_t shift_k_cache_size = (!mPosShiftEnabled || isCrossAttention())
+    size_t const partial_out_size = size * batch_beam * mNumHeads * mHeadSize * maxSeqLenTile;
+    size_t const partial_sum_size = sizeof(float) * batch_beam * mNumHeads * maxSeqLenTile;
+    size_t const partial_max_size = sizeof(float) * batch_beam * mNumHeads * maxSeqLenTile;
+    size_t const block_counter_size = sizeof(int) * batch_beam * mNumHeads;
+    size_t const shift_k_cache_size = (!mPosShiftEnabled || isCrossAttention())
         ? 0
         : size * batch_beam * mNumHeads * mHeadSize * max_attention_window;
 
@@ -635,9 +614,14 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForGeneration(
     size_t mqa_workspace_size = 0;
     if (mDecoderXQARunner.get())
     {
-        size_t mqa_workspaces[1];
+        int const XQA_NUM_BUFFERS = 3;
+        size_t mqa_workspaces[XQA_NUM_BUFFERS];
+        const size_t cu_seqlens_size = sizeof(int) * (batch_beam + 1);
+        const size_t rotary_inv_freq_size = sizeof(float) * batch_beam * mRotaryEmbeddingDim / 2;
         mqa_workspaces[0] = mDecoderXQARunner->getWorkspaceSize(batch_beam);
-        mqa_workspace_size = tc::calculateTotalWorkspaceSize(mqa_workspaces, 1);
+        mqa_workspaces[1] = cu_seqlens_size;
+        mqa_workspaces[2] = rotary_inv_freq_size;
+        mqa_workspace_size = tc::calculateTotalWorkspaceSize(mqa_workspaces, XQA_NUM_BUFFERS);
     }
 
     return std::max(generation_workspace_size, mqa_workspace_size);
@@ -663,29 +647,29 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
     int const head_size = getHeadSize();
     int const local_hidden_units_qo = num_heads * head_size;
     int const local_hidden_units_kv = num_kv_heads * head_size;
-    const PositionEmbeddingType position_embedding_type = mPositionEmbeddingType;
+    PositionEmbeddingType const position_embedding_type = mPositionEmbeddingType;
     float const q_scaling = mQScaling;
     bool const* finished = nullptr;
     bool const has_ia3 = false;
 
     KVCacheBuffer kv_cache_buffer;
-    auto const elem_size = mKVCacheQuantMode.hasKvCacheQuant() ? sizeof(int8_t) : sizeof(T);
-    int64_t* host_kv_cache_block_ptrs = nullptr;
-    if (mPagedKVCache)
+    auto const elemSize = mKVCacheQuantMode.hasKvCacheQuant() ? sizeof(int8_t) : sizeof(T);
+    auto const sizePerToken = num_kv_heads * head_size * elemSize;
+    KVBlockArray::DataType* hostKvCacheBlockOffsets = nullptr;
+    if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
     {
-        using BufferDataType = typename KVCacheBufferDataType<KVCacheBuffer>::Type;
-        kv_cache_buffer = KVCacheBuffer(params.batch_size, params.max_blocks_per_sequence, mTokensPerBlock,
-            num_kv_heads * head_size * elem_size, params.cyclic_attention_window_size, params.sink_token_length, false);
-        kv_cache_buffer.data = reinterpret_cast<BufferDataType*>(params.block_pointers);
-        host_kv_cache_block_ptrs = reinterpret_cast<int64_t*>(params.host_block_pointers);
+        kv_cache_buffer = KVBlockArray(params.batch_size, params.max_blocks_per_sequence, mTokensPerBlock, sizePerToken,
+            params.cyclic_attention_window_size, params.sink_token_length, params.host_primary_pool_pointer,
+            params.host_secondary_pool_pointer, params.block_offsets);
+        hostKvCacheBlockOffsets = params.host_block_offsets;
     }
-    else
+    else if constexpr (std::is_same_v<KVCacheBuffer, KVLinearBuffer>)
     {
-        using BufferDataType = typename KVCacheBufferDataType<KVCacheBuffer>::Type;
-        kv_cache_buffer = KVCacheBuffer(params.batch_size, 1,
-            isCrossAttention() ? params.cross_qkv_length : params.max_attention_window,
-            num_kv_heads * head_size * elem_size, params.cyclic_attention_window_size, params.sink_token_length, false);
-        kv_cache_buffer.data = reinterpret_cast<BufferDataType*>(params.key_value_cache);
+        using BufferDataType = typename KVCacheBuffer::DataType;
+        kv_cache_buffer = KVLinearBuffer(params.batch_size,
+            isCrossAttention() ? params.cross_qkv_length : params.max_attention_window, sizePerToken,
+            params.cyclic_attention_window_size, params.sink_token_length, false,
+            reinterpret_cast<BufferDataType*>(params.key_value_cache));
     }
 
     auto const quant_option = tc::QuantMode::fromDescription();
@@ -722,35 +706,34 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
     }
 #endif
 
-    const size_t attention_mask_size = mEnableContextFMHA ? 0
+    size_t const attention_mask_size = mEnableContextFMHA ? 0
                                                           : sizeof(T) * params.batch_size * params.input_seq_length
             * (isCrossAttention() ? params.cross_qkv_length : params.input_seq_length);
     const size_t cu_seqlens_size = sizeof(int) * (params.batch_size + 1);
+    const size_t rotary_inv_freq_size = sizeof(float) * params.batch_size * mRotaryEmbeddingDim / 2;
     const size_t q_buf_2_size = (mEnableContextFMHA && mPagedKVCache && mPagedContextFMHA) || !mEnableContextFMHA
         ? sizeof(T) * params.batch_size * params.input_seq_length * local_hidden_units_qo
         : 0;
-    const size_t k_buf_2_size = mEnableContextFMHA ? 0
+    size_t const k_buf_2_size = mEnableContextFMHA ? 0
                                                    : sizeof(T) * params.batch_size
             * (isCrossAttention() ? params.cross_qkv_length : params.input_seq_length) * local_hidden_units_kv;
-    const size_t v_buf_2_size = mEnableContextFMHA ? 0
+    size_t const v_buf_2_size = mEnableContextFMHA ? 0
                                                    : sizeof(T) * params.batch_size
             * (isCrossAttention() ? params.cross_qkv_length : params.input_seq_length) * local_hidden_units_kv;
-    const size_t qk_buf_size = mEnableContextFMHA ? 0
+    size_t const qk_buf_size = mEnableContextFMHA ? 0
                                                   : sizeof(T) * params.batch_size * mNumHeads * params.input_seq_length
             * (isCrossAttention() ? params.cross_qkv_length : params.input_seq_length);
-    const size_t qkv_buf_2_size
+    size_t const qkv_buf_2_size
         = mEnableContextFMHA ? 0 : sizeof(T) * params.batch_size * params.input_seq_length * local_hidden_units_qo;
-    const size_t qk_buf_float_size = mEnableContextFMHA ? 0
+    size_t const qk_buf_float_size = mEnableContextFMHA ? 0
                                                         : sizeof(float) * params.batch_size * mNumHeads
             * params.input_seq_length * (isCrossAttention() ? params.cross_qkv_length : params.input_seq_length);
-    const size_t fp8_qkv_buffer_size = mEnableContextFMHA && mFP8ContextFMHA
+    size_t const fp8_qkv_buffer_size = mEnableContextFMHA && mFP8ContextFMHA
         ? params.batch_size * params.input_seq_length * (local_hidden_units_qo + 2 * local_hidden_units_kv)
         : 0;
-    const size_t padding_offset_size
+    size_t const padding_offset_size
         = sizeof(int) * params.batch_size * (isCrossAttention() ? params.cross_qkv_length : params.input_seq_length);
-    const size_t paged_kv_tma_desc_size = mPagedKVCache && mPagedContextFMHA
-        ? params.batch_size * 2 * TMA_DESC_SIZE_IN_BYTE * params.max_blocks_per_sequence
-        : 0;
+    const size_t fmha_scheduler_counter = mEnableContextFMHA ? sizeof(uint32_t) : 0;
 
     bool const is_qk_buf_float_ = true;
 
@@ -761,6 +744,8 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
     T* attention_mask = reinterpret_cast<T*>(nextWorkspacePtr(workspace_byte_ptr, offset, attention_mask_size));
     int* cu_q_seqlens = reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, cu_seqlens_size));
     int* cu_kv_seqlens = reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, cu_seqlens_size));
+    float* rotary_inv_freq_buf
+        = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, rotary_inv_freq_size));
     T* q_buf_2_ = reinterpret_cast<T*>(nextWorkspacePtr(workspace_byte_ptr, offset, q_buf_2_size));
     T* k_buf_2_ = reinterpret_cast<T*>(nextWorkspacePtr(workspace_byte_ptr, offset, k_buf_2_size));
     T* v_buf_2_ = reinterpret_cast<T*>(nextWorkspacePtr(workspace_byte_ptr, offset, v_buf_2_size));
@@ -770,8 +755,8 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
     __nv_fp8_e4m3* fp8_qkv_buffer
         = reinterpret_cast<__nv_fp8_e4m3*>(nextWorkspacePtr(workspace_byte_ptr, offset, fp8_qkv_buffer_size));
     int* padding_offset = reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, padding_offset_size));
-    void* paged_kv_tma_desc
-        = reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, paged_kv_tma_desc_size));
+    uint32_t* fmha_tile_counter_ptr
+        = reinterpret_cast<uint32_t*>(nextWorkspacePtr(workspace_byte_ptr, offset, fmha_scheduler_counter));
 
     // build attention_mask, cu_seqlens, and padding_offset tensors
     // Note: self attn and cross attn should use different params
@@ -783,14 +768,24 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
     decoder_params.seqKVOffsets = cu_kv_seqlens;
     decoder_params.paddingOffsets = padding_offset;
     decoder_params.attentionMask = isCrossAttention() ? nullptr : attention_mask; // manually set for cross attn
+    // Fixed sequence length offset if not removing the padding (cu_q_seqlens[i] = i * seq_length).
     decoder_params.seqQLengths = isCrossAttention() ? params.encoder_input_lengths : params.q_seq_lengths;
     decoder_params.seqKVLengths = isCrossAttention() ? params.encoder_input_lengths : params.kv_seq_lengths;
     decoder_params.batchSize = params.batch_size;
-    decoder_params.maxSeqLength = isCrossAttention() ? params.cross_qkv_length : params.input_seq_length;
+    decoder_params.maxQSeqLength = isCrossAttention() ? params.cross_qkv_length : params.input_seq_length;
+    decoder_params.removePadding = mRemovePadding;
     decoder_params.attentionWindowSize = params.cyclic_attention_window_size;
     decoder_params.sinkTokenLength = params.sink_token_length;
     decoder_params.numTokens = params.num_tokens;
     decoder_params.attentionMaskType = mMaskType;
+    decoder_params.fmhaTileCounter = fmha_tile_counter_ptr;
+    // Rotary embedding inv_freq buffer.
+    decoder_params.rotaryEmbeddingScale = mRotaryEmbeddingScale;
+    decoder_params.rotaryEmbeddingBase = mRotaryEmbeddingBase;
+    decoder_params.rotaryEmbeddingDim = mRotaryEmbeddingDim;
+    decoder_params.rotaryScalingType = mRotaryEmbeddingScaleType;
+    decoder_params.rotaryEmbeddingInvFreq = rotary_inv_freq_buf;
+    decoder_params.rotaryEmbeddingMaxPositions = mRotaryEmbeddingMaxPositions;
     invokeBuildDecoderInfo(decoder_params, stream);
     sync_check_cuda_error();
 
@@ -823,11 +818,11 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
     }
 
     // write KV to cache
-    const KvCacheDataType cache_type = mKVCacheQuantMode.hasInt8KvCache()
+    KvCacheDataType const cache_type = mKVCacheQuantMode.hasInt8KvCache()
         ? KvCacheDataType::INT8
         : (mKVCacheQuantMode.hasFp8KvCache() ? KvCacheDataType::FP8 : KvCacheDataType::BASE);
 
-    const cudaDataType_t gemm_data_type = tc::CudaDataType<T>::value;
+    cudaDataType_t const gemm_data_type = tc::CudaDataType<T>::value;
     int const attention_seq_len_1 = params.input_seq_length;                                                // q length
     int const attention_seq_len_2 = isCrossAttention() ? params.cross_qkv_length : params.input_seq_length; // kv length
 
@@ -837,7 +832,7 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
     float const qk_scale
         = 1.0f / (sqrtf(getHeadSize() * 1.0f) * q_scaling); // q_scaling in denominator. by default q_scaling =1.0f
     float const qk_scale_gemm = isRelativePosition() ? qk_scale : 1.0f;
-    const T qk_scale_softmax = static_cast<T>(isRelativePosition() ? 1.0f : qk_scale);
+    T const qk_scale_softmax = static_cast<T>(isRelativePosition() ? 1.0f : qk_scale);
 
     // in context phase, currently FMHA runner has two restrictions:
     // 1. only apply to self attention. If want fused multi-head cross attention, FMHCA kernels and runner is needed
@@ -846,60 +841,54 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
     if (mEnableContextFMHA)
     {
         bool const enablePagedKVContextFMHA = mPagedKVCache && mPagedContextFMHA;
-        // Paged Context FMHA doesn't work with fp8/int8 kv cache currently.
-        TLLM_CHECK_WITH_INFO(cache_type == KvCacheDataType::BASE || !enablePagedKVContextFMHA,
-            "Paged Context FMHA doesn't work with fp8/int8 kv cache currently.");
+        TLLM_CHECK_WITH_INFO(!(mKVCacheQuantMode.hasInt8KvCache() && enablePagedKVContextFMHA),
+            "Paged Context FMHA doesn't work with int8 kv cache currently.");
+        TLLM_CHECK_WITH_INFO(
+            !(mKVCacheQuantMode.hasFp8KvCache() && !mKVCacheQuantMode.hasFp8Qdq() && enablePagedKVContextFMHA),
+            "FP8 Paged Context FMHA only works with fp8 quantization workflow currently.");
 
-        invokeApplyBiasRopeUpdateKVCache(const_cast<T*>(params.attention_input), fp8_qkv_buffer, q_buf_2_,
-            kv_cache_buffer, const_cast<T*>(params.qkv_bias), params.q_seq_lengths, params.kv_seq_lengths,
-            mRemovePadding ? padding_offset : nullptr, params.batch_size, params.input_seq_length,
-            params.cyclic_attention_window_size, params.sink_token_length, params.num_tokens, mNumHeads, mNumKVHeads,
-            getHeadSize(), mRotaryEmbeddingDim, mRotaryEmbeddingBase, mRotaryEmbeddingScaleType, mRotaryEmbeddingScale,
-            mRotaryEmbeddingMaxPositions, position_embedding_type, (int*) nullptr, mPosShiftEnabled, nullptr, 0,
-            cache_type, params.kv_scale_orig_quant, enablePagedKVContextFMHA, mFP8ContextFMHA, 1, mLaunchGridBlockCache,
-            stream);
+        QKVPreprocessingParams<T, KVCacheBuffer> preprocessingParms{const_cast<T*>(params.attention_input),
+            fp8_qkv_buffer, q_buf_2_, kv_cache_buffer, params.qkv_bias, params.q_seq_lengths, params.kv_seq_lengths,
+            cu_q_seqlens, rotary_inv_freq_buf, params.rotary_cos_sin, params.kv_scale_orig_quant, (int*) nullptr,
+            params.batch_size, params.input_seq_length, params.max_past_kv_len, params.cyclic_attention_window_size,
+            params.sink_token_length, params.num_tokens, mNumHeads, mNumKVHeads, mNumHeads / mNumKVHeads, getHeadSize(),
+            mRotaryEmbeddingDim, mRotaryEmbeddingBase, mRotaryEmbeddingScaleType, mRotaryEmbeddingScale,
+            mRotaryEmbeddingMaxPositions, position_embedding_type, mPosShiftEnabled, cache_type,
+            enablePagedKVContextFMHA, mFP8ContextFMHA, mMultiProcessorCount};
+
+        invokeQKVPreprocessing(preprocessingParms, stream);
+
         sync_check_cuda_error();
 
-        // It is not needed with packed QKV input.
-        if (enablePagedKVContextFMHA)
-        {
-            // to enable chunked attention,
-            // 1. make sure you call setup_paged_kv(batch_size, max_query_length, max_kv_length, ....)
-            // 2. make sure you call run_paged_kv(q_ptr, kv_tma_desc_device_ptr, kv_cache_block_ptrs_on_host,
-            //                                    kv_cache_buffer, cu_q_seqlens, cu_kv_seqlens, ...)
-            //    - q_ptr: [B, S, H, D], which supports variable sequence length
-            //    - kv_tma_desc_device_ptr: allocated on device based on the number of context kv blocks.
-            //    - kv_cache_block_ptrs_on_host: tma descriptors need the paged kv cache device ptrs to be in host.
-            //    - kv_cache_buffer: paged kv buffer
-            //    - cu_q_seqlens: the cumulative query sequence lengths, needed for variable sequence length.
-            //    - cu_kv_seqlens: the cumulative kv sequence lengths, needed for variable sequence length.
+        // Unified FMHA runner interface for both contiguous QKV FMHA and paged KV FMHA.
+        // to enable paged kv fmha,
+        // 1. make sure you call setup(batch_size, max_query_length, max_kv_length, ....)
+        // 2. make sure you call run(q_ptr, paged_kv_block_offsets_on_host,
+        //                           paged_kv_cache, cu_q_seqlens, cu_kv_seqlens, ...)
+        //    - q_ptr: [B, S, H, D], which supports variable sequence length
+        //    - paged_kv_block_offsets_on_host: tma descriptors need the paged kv cache offsets to be in host.
+        //    - paged_kv_cache: paged kv buffer
+        //    - cu_q_seqlens: the cumulative query sequence lengths, needed for variable sequence length.
+        //    - cu_kv_seqlens: the cumulative kv sequence lengths, needed for variable sequence length.
 
-            // the token will pay attention to previous tokens while starting from max(0, rowIdx -
-            // cyclic_attention_window_size);
-            if (params.sink_token_length > 0)
-            {
-                TLLM_LOG_ERROR("Cannot support StreamingLLM now when enabling paged KV context FMHA.");
-            }
-            // TODO: add support for fp8 paged kv fmha later.
-            mFMHARunner->setup_paged_kv(params.batch_size, params.input_seq_length, params.max_past_kv_len,
-                params.max_blocks_per_sequence, mTokensPerBlock, params.cyclic_attention_window_size, params.num_tokens,
-                isALiBi(), isAliBiWithScale(), mTpSize, mTpRank);
-            mFMHARunner->run_paged_kv(q_buf_2_, paged_kv_tma_desc, host_kv_cache_block_ptrs,
-                reinterpret_cast<KVBlockArray&>(kv_cache_buffer), cu_q_seqlens, cu_kv_seqlens, params.context_buf,
-                stream);
-        }
-        else
+        if (params.sink_token_length > 0)
         {
-            // the token will pay attention to previous tokens while starting from max(0, rowIdx -
-            // cyclic_attention_window_size);
-            int const attention_window_size
-                = mDenseContextFMHA ? params.num_tokens : params.cyclic_attention_window_size;
-            mFMHARunner->setup(params.batch_size, params.input_seq_length, attention_window_size, params.num_tokens,
-                params.attention_output_orig_quant, isALiBi(), isAliBiWithScale(), mTpSize, mTpRank);
-            void const* fmha_input_tensor = mFP8ContextFMHA ? reinterpret_cast<void const*>(fp8_qkv_buffer)
-                                                            : reinterpret_cast<void const*>(params.attention_input);
-            mFMHARunner->run(fmha_input_tensor, cu_q_seqlens, params.context_buf, stream);
+            TLLM_LOG_ERROR("Cannot support StreamingLLM now when enabling paged KV context FMHA.");
         }
+        // disable sliding window attention when it is not needed.
+        int const attention_window_size = mDenseContextFMHA ? params.num_tokens : params.cyclic_attention_window_size;
+        // use separate buffer if using fp8 fmh or paged_kv fmha.
+        void const* fmha_input_tensor = enablePagedKVContextFMHA
+            ? reinterpret_cast<void const*>(q_buf_2_)
+            : (mFP8ContextFMHA ? reinterpret_cast<void const*>(fp8_qkv_buffer)
+                               : reinterpret_cast<void const*>(params.attention_input));
+        mFMHARunner->setup(params.batch_size, params.input_seq_length, params.max_past_kv_len,
+            params.max_blocks_per_sequence, mTokensPerBlock, attention_window_size, params.num_tokens, isALiBi(),
+            isAliBiWithScale(), mTpSize, mTpRank);
+        mFMHARunner->run(fmha_input_tensor, hostKvCacheBlockOffsets, reinterpret_cast<KVBlockArray&>(kv_cache_buffer),
+            cu_q_seqlens, cu_kv_seqlens, fmha_tile_counter_ptr, params.attention_output_orig_quant, params.context_buf,
+            stream);
+
         sync_check_cuda_error();
     }
     else
@@ -1188,14 +1177,14 @@ template <typename T, typename KVCacheBuffer>
 int GPTAttentionPluginCommon::enqueueGeneration(
     EnqueueGenerationParams<T, KVCacheBuffer> const& params, cudaStream_t stream)
 {
-    int const step = params.past_kv_length + 1;
+    int const step = params.max_past_kv_length + 1;
 
     int const num_heads = mNumHeads;
     int const num_kv_heads = mNumKVHeads;
     int const head_size = getHeadSize();
     int const local_hidden_units_qo = num_heads * head_size;
     int const local_hidden_units_kv = num_kv_heads * head_size;
-    const PositionEmbeddingType position_embedding_type = mPositionEmbeddingType;
+    PositionEmbeddingType const position_embedding_type = mPositionEmbeddingType;
     float const q_scaling = mQScaling;
     T const* relative_attention_bias = isRelativePosition() ? params.relative_attention_bias : nullptr;
     int const relative_attention_bias_stride = isRelativePosition() ? params.relative_attention_bias_stride : 0;
@@ -1213,24 +1202,23 @@ int GPTAttentionPluginCommon::enqueueGeneration(
     int32_t const batch_beam = params.beam_width * params.num_requests;
 
     KVCacheBuffer kv_cache_buffer;
-    auto const elem_size = mKVCacheQuantMode.hasKvCacheQuant() ? sizeof(int8_t) : sizeof(T);
+    auto const elemSize = mKVCacheQuantMode.hasKvCacheQuant() ? sizeof(int8_t) : sizeof(T);
+    auto const sizePerToken = num_kv_heads * head_size * elemSize;
     if (useKVCache())
     {
-        if (mPagedKVCache)
+        if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
         {
-            using BufferDataType = typename KVCacheBufferDataType<KVCacheBuffer>::Type;
-            kv_cache_buffer = KVCacheBuffer(batch_beam, params.max_blocks_per_sequence, mTokensPerBlock,
-                num_kv_heads * head_size * elem_size, params.cyclic_attention_window_size, params.sink_token_length,
-                false);
-            kv_cache_buffer.data = reinterpret_cast<BufferDataType*>(params.block_pointers);
+            using BufferDataType = typename KVCacheBuffer::DataType;
+            kv_cache_buffer = KVBlockArray(batch_beam, params.max_blocks_per_sequence, mTokensPerBlock, sizePerToken,
+                params.cyclic_attention_window_size, params.sink_token_length, params.host_primary_pool_pointer,
+                params.host_secondary_pool_pointer, reinterpret_cast<BufferDataType*>(params.block_offsets));
         }
-        else
+        else if constexpr (std::is_same_v<KVCacheBuffer, KVLinearBuffer>)
         {
-            using BufferDataType = typename KVCacheBufferDataType<KVCacheBuffer>::Type;
-            kv_cache_buffer
-                = KVCacheBuffer(batch_beam, 1, params.max_attention_window, num_kv_heads * head_size * elem_size,
-                    params.cyclic_attention_window_size, params.sink_token_length, false);
-            kv_cache_buffer.data = reinterpret_cast<BufferDataType*>(params.key_value_cache);
+            using BufferDataType = typename KVCacheBuffer::DataType;
+            kv_cache_buffer = KVLinearBuffer(batch_beam, params.max_attention_window, sizePerToken,
+                params.cyclic_attention_window_size, params.sink_token_length, false,
+                reinterpret_cast<BufferDataType*>(params.key_value_cache));
         }
     }
     sync_check_cuda_error();
@@ -1255,7 +1243,7 @@ int GPTAttentionPluginCommon::enqueueGeneration(
         }
     }
 
-    int timestep = params.past_kv_length;
+    int timestep = params.max_past_kv_length;
     int const max_timesteps = mCrossAttention ? params.cyclic_attention_window_size
                                               : std::min(timestep, params.cyclic_attention_window_size);
     int estimated_min_multi_block_count
@@ -1277,14 +1265,14 @@ int GPTAttentionPluginCommon::enqueueGeneration(
     int32_t const min_num_seq_len_tiles = std::max(1, estimated_min_multi_block_count);
     bool const enable_multi_block
         = (mMultiBlockMode && max_num_seq_len_tiles > 1) || estimated_min_multi_block_count > 1;
-    const size_t partial_out_size
+    size_t const partial_out_size
         = enable_multi_block ? sizeof(T) * batch_beam * mNumHeads * mHeadSize * max_num_seq_len_tiles : 0;
-    const size_t partial_sum_size
+    size_t const partial_sum_size
         = enable_multi_block ? sizeof(float) * batch_beam * mNumHeads * max_num_seq_len_tiles : 0;
-    const size_t partial_max_size
+    size_t const partial_max_size
         = enable_multi_block ? sizeof(float) * batch_beam * mNumHeads * max_num_seq_len_tiles : 0;
-    const size_t block_counter_size = enable_multi_block ? sizeof(int) * batch_beam * mNumHeads : 0;
-    const size_t shift_k_cache_size = (!mPosShiftEnabled || isCrossAttention())
+    size_t const block_counter_size = enable_multi_block ? sizeof(int) * batch_beam * mNumHeads : 0;
+    size_t const shift_k_cache_size = (!mPosShiftEnabled || isCrossAttention())
         ? 0
         : sizeof(T) * batch_beam * mNumHeads * mHeadSize * params.max_attention_window;
 
@@ -1304,12 +1292,12 @@ int GPTAttentionPluginCommon::enqueueGeneration(
     KVLinearBuffer shift_k_cache_buffer;
     if (mPosShiftEnabled && !isCrossAttention())
     {
-        shift_k_cache_buffer = KVLinearBuffer(batch_beam, 1, params.max_attention_window,
-            num_kv_heads * head_size * elem_size, params.cyclic_attention_window_size, params.sink_token_length, true);
-        shift_k_cache_buffer.data = reinterpret_cast<int8_t*>(shift_k_cache);
+        shift_k_cache_buffer
+            = KVLinearBuffer(batch_beam, params.max_attention_window, sizePerToken, params.cyclic_attention_window_size,
+                params.sink_token_length, true, reinterpret_cast<int8_t*>(shift_k_cache));
         sync_check_cuda_error();
         // KV cache type
-        const KvCacheDataType kv_cache_type = KvCacheDataType::BASE;
+        KvCacheDataType const kv_cache_type = KvCacheDataType::BASE;
         using DataType = typename SATypeConverter<T>::Type;
         invokeShiftKCache<DataType, KVCacheBuffer>(kv_cache_buffer, shift_k_cache_buffer, kv_cache_type, getHeadSize(),
             step - 1, batch_beam, mNumKVHeads, params.beam_width, params.cyclic_attention_window_size,
@@ -1481,8 +1469,10 @@ int GPTAttentionPluginCommon::initialize() noexcept
             data_type = DATA_TYPE_E4M3;
         }
 
+        // Use Paged KV FMHA or not.
+        bool const pagedKVFMHA = mPagedKVCache && mPagedContextFMHA;
         // Load kernels for contiguous cache and paged kv cache at the same time.
-        mFMHARunner.reset(new FusedMHARunnerV2(data_type, mNumHeads, getHeadSize(false), mQScaling));
+        mFMHARunner.reset(new FusedMHARunnerV2(data_type, pagedKVFMHA, mNumHeads, getHeadSize(false), mQScaling));
         // Set flags: force_fp32_acc, is_s_padded, causal_mask, num_kv_heads.
         mFMHARunner->setup_flags(mFMHAForceFP32Acc, !mRemovePadding, true, mNumKVHeads);
     }

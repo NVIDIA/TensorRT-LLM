@@ -1,6 +1,8 @@
 import asyncio
 import secrets
+import traceback
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from multiprocessing.connection import Client, Listener
 from pathlib import Path
 from queue import Queue
@@ -12,10 +14,11 @@ import torch
 from janus import Queue as AsyncQueue
 from mpi4py import MPI
 
-from tensorrt_llm._utils import mpi_rank, mpi_world_size
+from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
 from tensorrt_llm.hlapi.mpi_session import MpiSession, find_free_port
 from tensorrt_llm.hlapi.tokenizer import TokenizerBase, tokenizer_factory
-from tensorrt_llm.hlapi.utils import GenerationOutput, SamplingConfig
+from tensorrt_llm.hlapi.utils import (ContextManager, GenerationOutput,
+                                      SamplingConfig, print_traceback_on_error)
 
 from . import bindings as tllm
 
@@ -354,6 +357,12 @@ class GenerationExecutorWorker(GenerationExecutor):
     class WorkerExit(GeneratorExit):
         pass
 
+    @dataclass
+    class WorkerInitStatus:
+        ok: bool
+        info: Optional[str] = None
+        rank: Optional[int] = None
+
     def __init__(
         self,
         engine_dir: Path,
@@ -611,6 +620,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         })
         self.dispatcher = Thread(target=self.dispatcher_thread)
 
+    @print_traceback_on_error
     @staticmethod
     def workers_main(
         engine_dir: Path,
@@ -627,15 +637,38 @@ class GenerationExecutorProxy(GenerationExecutor):
     ) -> None:
         result_queue = None
 
-        with GenerationExecutorWorker(engine_dir, tokenizer, max_beam_width,
-                                      executor_type, executor_policy,
-                                      executor_config) as executor:
-            executor.block_subordinates()
+        if mpi_rank() == 0:
+            # Only rank0 need to communicate with the Python main process
             request_queue = Fifo(request_queue_addr, is_server=False)
             result_queue = Fifo(result_queue_addr, is_server=False)
-            result_queue.put(True)  # ack that we started
 
-            executor.set_result_queue(result_queue)
+        init_status = None
+        try:
+            executor = GenerationExecutorWorker(engine_dir, tokenizer,
+                                                max_beam_width, executor_type,
+                                                executor_policy,
+                                                executor_config)
+        except Exception as e:
+            error_info = f"{str(e)}\nTraceback: {traceback.format_exc()}"
+            init_status = GenerationExecutorWorker.WorkerInitStatus(
+                ok=False, info=error_info, rank=mpi_rank())
+            # Either one of the failed rank will occupy the result_queue comm and make the Python main process raise exception
+            result_queue.put(init_status)
+            raise e
+
+        else:
+            init_status = GenerationExecutorWorker.WorkerInitStatus(ok=True)
+
+        finally:
+            init_statuses = mpi_comm().gather(init_status, root=0)
+
+            if mpi_rank() == 0 and all(status.ok for status in init_statuses):
+                result_queue.put(init_status)
+
+        with ContextManager(executor) as executor:
+            executor.block_subordinates()
+            if mpi_rank() == 0:
+                executor.set_result_queue(result_queue)
             while (req := request_queue.get()) is not None:
                 executor.submit(req)
 
@@ -657,11 +690,13 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.mpi_futures = self.mpi_session.submit(
             GenerationExecutorProxy.workers_main, **self.workers_kwargs)
         self.workers_started = True
-        ack = Thread(target=lambda: self.result_queue.get())
-        ack.start()
-        ack.join(timeout=20)
-        if ack.is_alive():
-            raise RuntimeError("GptManager seems to have crashed")
+
+        # It will get the first failure status or get a success status if all ranks are successful
+        ack: GenerationExecutorWorker.WorkerInitStatus = self.result_queue.get()
+        if not ack.ok:
+            raise RuntimeError(
+                f"#node-{ack.rank}: worker initialization failed: {ack.info}")
+
         self.dispatcher.start()
 
     def shutdown(self):

@@ -110,6 +110,11 @@ nvinfer1::DataType GptSession::getLogitDataType() const
     return mRuntime->getEngine().getTensorDataType("logits");
 }
 
+nvinfer1::IEngineInspector& GptSession::getEngineInspector() const
+{
+    return mRuntime->getEngineInspector();
+}
+
 void GptSession::createContexts()
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -203,13 +208,17 @@ void GptSession::createCustomAllReduceWorkspace(
     setPeerAccess(mWorldConfig, true);
 
     mIpcMemoryHandles.clear();
-    const std::size_t bufferSize = std::min(static_cast<std::size_t>(maxBatchSize) * maxBeamWidth * maxSequenceLength
-            * mModelConfig.getHiddenSize() * mWorldConfig.getTensorParallelism() * sizeof(float),
-        ::tensorrt_llm::utils::customAllReduceUtils::getMaxRequiredWorkspaceSize(mWorldConfig.getTensorParallelism()));
+    const std::size_t bufferSize = mWorldConfig.getTensorParallelism()
+        * std::min(static_cast<std::size_t>(maxBatchSize) * maxBeamWidth * maxSequenceLength
+                * mModelConfig.getHiddenSize() * sizeof(float),
+            ::tensorrt_llm::utils::customAllReduceUtils::getMaxRequiredWorkspaceSize(
+                mWorldConfig.getTensorParallelism()));
     mIpcMemoryHandles.emplace_back(std::make_shared<IpcMemory>(mWorldConfig, bufferSize));
     mIpcMemoryHandles.emplace_back(std::make_shared<IpcMemory>(mWorldConfig, bufferSize));
-    mIpcMemoryHandles.emplace_back(std::make_shared<IpcMemory>(mWorldConfig, IpcMemory::FLAGS_SIZE * sizeof(int32_t)));
-    mIpcMemoryHandles.emplace_back(std::make_shared<IpcMemory>(mWorldConfig, IpcMemory::FLAGS_SIZE * sizeof(int32_t)));
+    mIpcMemoryHandles.emplace_back(
+        std::make_shared<IpcMemory>(mWorldConfig, IpcMemory::FLAGS_SIZE * mWorldConfig.getTensorParallelism()));
+    mIpcMemoryHandles.emplace_back(
+        std::make_shared<IpcMemory>(mWorldConfig, IpcMemory::FLAGS_SIZE * mWorldConfig.getTensorParallelism()));
 
     mCommPtrs = BufferManager::cpu(
         ITensor::makeShape({static_cast<SizeType>(mIpcMemoryHandles.size()) * mWorldConfig.getTensorParallelism()}),
@@ -366,7 +375,6 @@ ITensor::SharedPtr GptSession::initDecoder(ITensor& outputIds, GenerationInput c
 
         auto const inputLengths = inputs.lengths;
         auto const batchSize = static_cast<SizeType>(inputLengths->getSize());
-
         auto const inputLengthsHost = manager.copyFrom(*inputLengths, MemoryType::kCPU);
         auto const* inputLengthsData = bufferCast<SizeType>(*inputLengthsHost);
         SizeType const maxInputLength = *std::max_element(inputLengthsData, inputLengthsData + inputLengths->getSize());
@@ -508,7 +516,8 @@ std::vector<GenerationInput> splitInputs(GenerationInput const& inputs, SizeType
     return inputBatches;
 }
 
-std::vector<GenerationOutput> splitOutputs(GenerationOutput& outputs, SizeType microBatchSize)
+std::vector<GenerationOutput> splitOutputs(
+    GenerationOutput& outputs, SizeType microBatchSize, WorldConfig const& mWorldConfig)
 {
     auto const numRequests = outputs.ids->getShape().d[0];
 
@@ -528,11 +537,11 @@ std::vector<GenerationOutput> splitOutputs(GenerationOutput& outputs, SizeType m
         {
             outputBatches.back().logProbs = ITensor::slice(outputs.logProbs, batchOffset, batchSize);
         }
-        if (outputs.contextLogits)
+        if (outputs.contextLogits && mWorldConfig.isLastPipelineParallelRank())
         {
             outputBatches.back().contextLogits = ITensor::slice(outputs.contextLogits, batchOffset, batchSize);
         }
-        if (outputs.generationLogits)
+        if (outputs.generationLogits && mWorldConfig.isLastPipelineParallelRank())
         {
             outputBatches.back().generationLogits = ITensor::slice(outputs.generationLogits, batchOffset, batchSize);
         }
@@ -567,6 +576,7 @@ void GptSession::generate(GenerationOutput& outputs, GenerationInput const& inpu
     auto& manager = mRuntime->getBufferManager();
 
     auto const batchSize = static_cast<SizeType>(inputLengths->getSize());
+
     auto const beamWidth = samplingConfig.beamWidth;
     outputs.ids->reshape(ITensor::makeShape({batchSize, beamWidth, mDecoderMaxSequenceLength}));
     outputs.lengths->reshape(ITensor::makeShape({batchSize, beamWidth}));
@@ -593,7 +603,6 @@ void GptSession::generate(GenerationOutput& outputs, GenerationInput const& inpu
 
             if (mModelConfig.computeContextLogits())
             {
-                // outputs.contextLogits = mBuffers.back()->cacheContextLogits;
                 if (!outputs.contextLogits)
                 {
                     outputs.contextLogits = manager.emptyTensor(MemoryType::kGPU, getLogitDataType());
@@ -647,7 +656,7 @@ void GptSession::generate(GenerationOutput& outputs, GenerationInput const& inpu
     else
     {
         auto const microBatchesInputs = splitInputs(inputs, mMicroBatchConfig.genBatchSize, manager);
-        auto microBatchesOutputs = splitOutputs(outputs, mMicroBatchConfig.genBatchSize);
+        auto microBatchesOutputs = splitOutputs(outputs, mMicroBatchConfig.genBatchSize, mWorldConfig);
         generateBatched(microBatchesOutputs, microBatchesInputs, samplingConfig, onTokenGenerated, generationProfiler);
     }
 
@@ -823,15 +832,15 @@ void GptSession::generateBatched(std::vector<GenerationOutput>& microBatchesOutp
             }
         }
         // copy generation logits fragments into a single generationLogits tensor
-        if (mModelConfig.computeGenerationLogits())
+        if (mWorldConfig.isLastPipelineParallelRank() && mModelConfig.computeGenerationLogits())
         {
             auto& buffers = *mBuffers.at(microBatchId);
             auto& microBatchOutputs = microBatchesOutputs.at(microBatchId);
 
             auto const beamWidth = generationConfig.beamWidth;
-            TensorPtr cachePointerDevice
-                = ITensor::slice(buffers.cacheGenerationFragmentPointerDevice, microBatchId, 1);
-            TensorPtr cachePointerHost = ITensor::slice(buffers.cacheGenerationFragmentPointerHost, microBatchId, 1);
+            TensorPtr cachePointerDevice = ITensor::slice(buffers.cacheGenerationFragmentPointerDevice, 0, 1);
+            TensorPtr cachePointerHost = ITensor::slice(buffers.cacheGenerationFragmentPointerHost, 0, 1);
+
             tensorrt_llm::runtime::kernels::mergeLogitsFragments(manager, *microBatchOutputs.generationLogits,
                 *buffers.generationLogitsFragments, *cachePointerDevice, *cachePointerHost, 0, microBatchSize,
                 beamWidth, manager.getStream(), 0);
@@ -886,7 +895,7 @@ void GptSession::executeContextStep(std::vector<GenerationInput> const& generati
         sync_check_cuda_error();
 
         // Save the last token logits of context into generation logits
-        if (mModelConfig.computeGenerationLogits())
+        if (mWorldConfig.isLastPipelineParallelRank() && mModelConfig.computeGenerationLogits())
         {
             auto& buffers = *mBuffers.at(generationBatchId);
             buffers.generationLogitsFragments->push_back(generationBuffers.logits);
@@ -898,7 +907,7 @@ void GptSession::executeContextStep(std::vector<GenerationInput> const& generati
 
         decoderStepAsync(decoderStep, generationBatchId);
 
-        if (mModelConfig.computeGenerationLogits())
+        if (mWorldConfig.isLastPipelineParallelRank() && mModelConfig.computeGenerationLogits())
         {
             TensorPtr newLogitBuffer = ITensor::slice(generationBuffers.allGenerationLogits, 1, 1);
             newLogitBuffer->squeeze(0);
@@ -980,7 +989,7 @@ SizeType GptSession::executeGenerationStep(SizeType step, std::vector<Generation
         }
         sync_check_cuda_error();
 
-        if (mModelConfig.computeGenerationLogits())
+        if (mWorldConfig.isLastPipelineParallelRank() && mModelConfig.computeGenerationLogits())
         {
             auto& buffers = *mBuffers.at(generationBatchId);
             buffers.generationLogitsFragments->push_back(buffers.logits);
@@ -993,7 +1002,8 @@ SizeType GptSession::executeGenerationStep(SizeType step, std::vector<Generation
 
         decoderStepAsync(decoderStep, generationBatchId);
 
-        if (mModelConfig.computeGenerationLogits() && buffers.allGenerationLogits->getShape().d[0] > step + 1)
+        if (mWorldConfig.isLastPipelineParallelRank() && mModelConfig.computeGenerationLogits()
+            && buffers.allGenerationLogits->getShape().d[0] > step + 1)
         {
             TensorPtr newLogitBuffer = ITensor::slice(buffers.allGenerationLogits, step + 1, 1);
             newLogitBuffer->squeeze(0);

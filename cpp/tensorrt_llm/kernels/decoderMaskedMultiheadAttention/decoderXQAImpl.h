@@ -48,8 +48,7 @@ public:
     //
     // Sub-classes should implement runWithKVLinearBuffer and runWithKVBlockArray.
     template <typename KVCacheBuffer>
-    void run(XQAParams const& xqa_params, KVCacheBuffer& kv_cache_buffer, int2& rotary_kernel_launch_cache,
-        cudaStream_t const& stream);
+    void run(XQAParams const& xqa_params, KVCacheBuffer const& kv_cache_buffer, cudaStream_t const& stream);
 
     enum class ImplType
     {
@@ -65,11 +64,11 @@ protected:
     {
     }
 
-    virtual void runWithKVLinearBuffer(XQAParams const& xqa_params, KVLinearBuffer& kv_linear_buffer,
-        int2& rotary_kernel_launch_cache, cudaStream_t const& stream)
+    virtual void runWithKVLinearBuffer(
+        XQAParams const& xqa_params, KVLinearBuffer const& kv_linear_buffer, cudaStream_t const& stream)
         = 0;
-    virtual void runWithKVBlockArray(XQAParams const& xqa_params, KVBlockArray& kv_block_array,
-        int2& rotary_kernel_launch_cache, cudaStream_t const& stream)
+    virtual void runWithKVBlockArray(
+        XQAParams const& xqa_params, KVBlockArray const& kv_block_array, cudaStream_t const& stream)
         = 0;
 
     DecoderXQARunner* mRunner;

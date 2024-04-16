@@ -63,7 +63,7 @@ public:
         std::optional<std::vector<float>> repetition_penalty; // [1] or [batch_size] on cpu
         std::optional<std::vector<float>> presence_penalty;   // [1] or [batch_size] on cpu
         std::optional<std::vector<float>> frequency_penalty;  // [1] or [batch_size] on cpu
-        std::optional<std::vector<std::int32_t>> min_length;  // [1] or [batch_size] on cpu
+        std::optional<std::vector<SizeType32>> min_length;    // [1] or [batch_size] on cpu
 
         // baseSamplingLayer
         std::optional<std::vector<runtime::SizeType>> runtime_top_k; // [1] or [batch_size] on cpu
@@ -71,9 +71,9 @@ public:
         std::optional<std::vector<uint64_t>> randomSeed;             // [1] or [batch_size] on cpu
 
         // topPSamplingLayer
-        std::optional<std::vector<float>> top_p_decay;            // [batch_size], must between [0, 1]
-        std::optional<std::vector<float>> top_p_min;              // [batch_size], must between [0, 1]
-        std::optional<std::vector<std::int32_t>> top_p_reset_ids; // [batch_size]
+        std::optional<std::vector<float>> top_p_decay;           // [batch_size], must between [0, 1]
+        std::optional<std::vector<float>> top_p_min;             // [batch_size], must between [0, 1]
+        std::optional<std::vector<TokenIdType>> top_p_reset_ids; // [batch_size]
 
         // BeamSearchLayer
         std::optional<std::vector<float>> beam_search_diversity_rate; // [batch_size] on cpu
@@ -86,14 +86,14 @@ public:
         std::optional<std::vector<std::vector<runtime::SizeType>>> topKMedusaHeads; // [batchSize, maxMedusaHeads]
     };
 
-    void setup(runtime::SizeType batch_size, runtime::SizeType beam_width, int const* batch_slots,
+    void setup(runtime::SizeType batch_size, runtime::SizeType beam_width, SizeType const* batch_slots,
         SetupParams const& setupParams);
 
     class ForwardParams
     {
     public:
-        ForwardParams(int step, int ite, int maxInputLength, int maxAttentionWindow, int sinkTokenLength,
-            int localBatchSize, tc::Tensor endIds)
+        ForwardParams(SizeType32 step, SizeType32 ite, SizeType maxInputLength, SizeType maxAttentionWindow,
+            SizeType sinkTokenLength, SizeType localBatchSize, tc::Tensor endIds)
             : step{step}
             , ite{ite}
             , max_input_length{maxInputLength}
@@ -107,14 +107,14 @@ public:
         }
 
         // mandatory parameters
-        int step;
-        int ite;
-        int max_input_length;
-        int max_attention_window;
-        int sink_token_length;
-        int local_batch_size;
-        int max_stop_words_len;
-        int max_bad_words_len;
+        SizeType32 step;
+        SizeType32 ite;
+        SizeType max_input_length;
+        SizeType max_attention_window;
+        SizeType sink_token_length;
+        SizeType local_batch_size;
+        SizeType max_stop_words_len;
+        SizeType max_bad_words_len;
         tc::Tensor end_ids; // [batch_size], on gpu
 
         // One of these two fields has to be set
@@ -228,7 +228,7 @@ private:
         runtime::SizeType const* batchSlots, runtime::SizeType batchSize, runtime::SizeType beamWidth,
         runtime::SizeType maxSeqLen, runtime::SizeType vocabSizePadded, cudaStream_t stream);
 
-    void checkStopCriteria(OutputParams& outputs, ForwardParams const& params, int32_t const* batchSlots,
+    void checkStopCriteria(OutputParams& outputs, ForwardParams const& params, SizeType const* batchSlots,
         runtime::SizeType batchSize, runtime::SizeType beamWidth, runtime::SizeType maxSeqLen, cudaStream_t stream);
     static void checkMaxLengthStopCriteria(OutputParams& outputs, ForwardParams const& params,
         runtime::SizeType const* batchSlots, runtime::SizeType batchSize, runtime::SizeType beamWidth,
@@ -258,9 +258,9 @@ private:
 
     cudaDeviceProp* mCudaDeviceProp;
 
-    int32_t* mZeroParentIdsDevice = nullptr;
-    int32_t* mPenaltyWorkspaceDevice = nullptr;
-    int32_t* mPenaltyWorkspacePrevDevice = nullptr;
+    TokenIdType* mZeroParentIdsDevice = nullptr;
+    TokenIdType* mPenaltyWorkspaceDevice = nullptr;
+    TokenIdType* mPenaltyWorkspacePrevDevice = nullptr;
     runtime::ITensor::SharedPtr mIdsPtrHost;
     runtime::ITensor::SharedPtr mLogitsPtrsHost;
 
@@ -268,14 +268,14 @@ private:
     float* mRepetitionPenaltyDevice = nullptr;
     float* mPresencePenaltyDevice = nullptr;
     float* mFrequencyPenaltyDevice = nullptr;
-    int32_t* mMinLengthDevice = nullptr;
+    SizeType32* mMinLengthDevice = nullptr;
     T* mRuntimeLogitsDevice = nullptr;
 
     std::vector<float> mTemperature;
     std::vector<float> mRepetitionPenalty;
     std::vector<float> mPresencePenalty;
     std::vector<float> mFrequencyPenalty;
-    std::vector<int32_t> mMinLength;
+    std::vector<SizeType32> mMinLength;
 
     bool mUseTemperature = false;
     bool mUseRepetitionPenalty = false;
@@ -284,11 +284,10 @@ private:
     bool mUseMinLength = false;
 
     bool mHasDiffRuntimeArgs = false;
-    int* h_pinned_finished_sum_ = nullptr;
 
-    int32_t mCyclicStep = 0;
-    int32_t mRuntimeMaxSeqLen = 0;
-    int32_t mConfiguredBeamWidth = -1;
+    runtime::SizeType mCyclicStep = 0;
+    runtime::SizeType mRuntimeMaxSeqLen = 0;
+    runtime::SizeType mConfiguredBeamWidth = -1;
 
     runtime::SizeType mMaxTokensPerStep;
     runtime::SizeType mMaxNumMedusaHeads;

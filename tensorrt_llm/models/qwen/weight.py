@@ -193,7 +193,7 @@ def load_from_gptq_qwen(
         weights[f'{tllm_prex}.post_layernorm.weight'] = v.to(torch_dtype)
 
     tok = time.time()
-    t = time.strftime("%h:%m:%s", time.gmtime(tok - tik))
+    t = time.strftime("%H:%M:%S", time.gmtime(tok - tik))
     logger.info(f"weights loaded. total time: {t}")
 
     return weights

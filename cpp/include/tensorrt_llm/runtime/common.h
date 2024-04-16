@@ -24,12 +24,15 @@ namespace tensorrt_llm::runtime
 {
 
 // typedefs
-// Note that we use unsigned size types as recommended by TensorRT:
+// Note that we use signed size types as recommended by TensorRT:
 // https://github.com/NVIDIA/TensorRT/blob/main/CODING-GUIDELINES.md#signed-vs-unsigned-integers
 using SizeType = std::int32_t;
 
 // Token ID type
 using TokenIdType = std::int32_t;
+
+// Type for iterators and counters
+using SizeType32 = std::int32_t;
 
 template <typename T>
 using StringPtrMap = std::unordered_map<std::string, std::shared_ptr<T>>;

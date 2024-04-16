@@ -53,7 +53,7 @@ public:
     }
 
 protected:
-    runtime::SizeType* mRuntimeTopKDevice = nullptr;
+    runtime::SizeType32* mRuntimeTopKDevice = nullptr;
     float* mRuntimeTopPDevice = nullptr;
     float mRuntimeMaxTopP{0.f};
     float* mInitialTopPDevice = nullptr;
@@ -62,9 +62,6 @@ protected:
     runtime::TokenIdType* mTopPResetIdsDevice = nullptr;
     void* mSetupWorkspaceDevice = nullptr;
 
-    runtime::TokenIdType* mTopPIdValsDevice = nullptr;
-    runtime::SizeType* mTopPOffsetDevice = nullptr;
-    runtime::SizeType* mBeginTopPOffsetDevice = nullptr;
     bool* mSkipDecodeDevice = nullptr;
     bool* mSkipDecodeHost = nullptr;
     bool mIsDeterministic = true;

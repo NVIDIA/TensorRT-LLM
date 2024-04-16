@@ -60,6 +60,8 @@ void BaseSamplingLayerTest<T>::setup(uint64_t seed, SamplingParams const& params
     mIdsPtrHost = mBufferManager->pinned(ITensor::makeShape({mMaxBatchSize}), ptrType);
 
     mCumLogProbsDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kFLOAT);
+    mOutputLogProbsDevice
+        = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize, mMaxSeqLen}), nvinfer1::DataType::kFLOAT);
 
     mBatchSlots = mBufferManager->pinned(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT32);
 
@@ -73,6 +75,7 @@ void BaseSamplingLayerTest<T>::setup(uint64_t seed, SamplingParams const& params
     trk::invokeFill(*mFinishedDevice, uint8_t{0}, *mStream);
     trk::invokeFill(*mOutputIdsDevice, int32_t{0}, *mStream);
     trk::invokeFill(*mCumLogProbsDevice, float{0.0f}, *mStream);
+    trk::invokeFill(*mOutputLogProbsDevice, float{0.0f}, *mStream);
     trk::invokeFill(*mEndIdsDevice, int32_t{mEndId}, *mStream);
 
     auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
@@ -136,6 +139,8 @@ DecodingOutputParams BaseSamplingLayerTest<T>::createOutputTensors()
     decodeOutputs.sequence_length = tcc::toTllmTensor(*mSeqLengthsDevice);
 
     decodeOutputs.finished = tcc::toTllmTensor(*mFinishedDevice);
+
+    decodeOutputs.output_log_probs = tcc::toTllmTensor(*mOutputLogProbsDevice);
 
     decodeOutputs.cum_log_probs = tcc::toTllmTensor(*mCumLogProbsDevice);
 

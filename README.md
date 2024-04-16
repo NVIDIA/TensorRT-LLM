@@ -6,9 +6,9 @@ TensorRT-LLM
 
 [![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](https://nvidia.github.io/TensorRT-LLM/)
 [![python](https://img.shields.io/badge/python-3.10.12-green)](https://www.python.org/downloads/release/python-31012/)
-[![cuda](https://img.shields.io/badge/cuda-12.2-green)](https://developer.nvidia.com/cuda-downloads)
-[![trt](https://img.shields.io/badge/TRT-9.2-green)](https://developer.nvidia.com/tensorrt)
-[![version](https://img.shields.io/badge/release-0.9.0.dev-green)](./setup.py)
+[![cuda](https://img.shields.io/badge/cuda-12.3-green)](https://developer.nvidia.com/cuda-downloads)
+[![trt](https://img.shields.io/badge/TRT-9.3-green)](https://developer.nvidia.com/tensorrt)
+[![version](https://img.shields.io/badge/release-0.9.0-green)](./setup.py)
 [![license](https://img.shields.io/badge/license-Apache%202-blue)](./LICENSE)
 
 [Architecture](./docs/source/architecture.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Results](./docs/source/performance.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Examples](./examples/)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Documentation](./docs/source/)
@@ -53,7 +53,7 @@ TensorRT-LLM
   - [Troubleshooting](#troubleshooting)
   - [Release notes](#release-notes)
     - [Change Log](#change-log)
-      - [Versions 0.8.0](#versions-080)
+      - [Versions 0.9.0](#versions-090)
       - [For history change log, please see CHANGELOG.md.](#for-history-change-log-please-see-changelogmd)
     - [Known Issues](#known-issues)
     - [Report Issues](#report-issues)
@@ -278,6 +278,7 @@ The list of supported models is:
 * [LLaMA-v2](examples/llama)
 * [Mamba](examples/mamba)
 * [mBART](examples/enc_dec)
+* [Medusa](examples/medusa)
 * [Mistral](examples/llama#mistral-v01)
 * [MPT](examples/mpt)
 * [mT5](examples/enc_dec)
@@ -404,84 +405,91 @@ For example: `mpirun -n 1 python3 examples/run.py ...`
 
 ## Release notes
 
-  * TensorRT-LLM requires TensorRT 9.2 and 23.12 containers.
+  * TensorRT-LLM requires TensorRT 9.3 and 24.02 containers.
 
 ### Change Log
 
-#### Versions 0.8.0
+#### Versions 0.9.0
 
 * Model Support
-  - Phi-1.5/2.0
-  - Mamba support (see examples/mamba/README.md)
-    - The support is limited to beam width = 1 and single-node single-GPU
-  - Nougat support (see examples/multimodal/README.md#nougat)
-  - Qwen-VL support (see examples/qwenvl/README.md)
-  - RoBERTa support, thanks to the contribution from @erenup
-  - Skywork model support
-  - Add example for multimodal models (BLIP with OPT or T5, LlaVA)
+  - Support distil-whisper, thanks to the contribution from @Bhuvanesh09 in PR #1061
+  - Support HuggingFace StarCoder2
+  - Support VILA
+  - Support Smaug-72B-v0.1
+  - Migrate BLIP-2 examples to `examples/multimodal`
 * Features
-  - Chunked context support (see docs/source/gpt_attention.md#chunked-context)
-  - LoRA support for C++ runtime (see docs/source/lora.md)
-  - Medusa decoding support (see examples/medusa/README.md)
-    - The support is limited to Python runtime for Ampere or newer GPUs with fp16 and bf16 accuracy, and the `temperature` parameter of sampling configuration should be 0
-  - StreamingLLM support for LLaMA (see docs/source/gpt_attention.md#streamingllm)
-  - Support for batch manager to return logits from context and/or generation phases
-    - Include support in the Triton backend
-  - Support AWQ and GPTQ for QWEN
-  - Support ReduceScatter plugin
-  - Support for combining `repetition_penalty` and `presence_penalty` #274
-  - Support for `frequency_penalty` #275
-  - OOTB functionality support:
-    - Baichuan
-    - InternLM
-    - Qwen
-    - BART
-  - LLaMA
-    - Support enabling INT4-AWQ along with FP8 KV Cache
-    - Support BF16 for weight-only plugin
-  - Baichuan
-    - P-tuning support
-    - INT4-AWQ and INT4-GPTQ support
-  - Decoder iteration-level profiling improvements
-  - Add `masked_select` and `cumsum` function for modeling
-  - Smooth Quantization support for ChatGLM2-6B / ChatGLM3-6B / ChatGLM2-6B-32K
-  - Add Weight-Only Support To Whisper #794, thanks to the contribution from @Eddie-Wang1120
-  - Support FP16 fMHA on NVIDIA V100 GPU
+  - Add support to context chunking to work with KV cache reuse
+  - Enable different rewind tokens per sequence for Medusa
+  - BART LoRA support (limited to the Python runtime)
+  - Enable multi-LoRA for BART LoRA
+  - Support `early_stopping=False` in beam search for C++ Runtime
+  - Add logits post processor to the batch manager (see docs/source/batch_manager.md#logits-post-processor-optional)
+  - Support import and convert HuggingFace Gemma checkpoints, thanks for the contribution from @mfuntowicz in #1147
+  - Support loading Gemma from HuggingFace
+  - Support auto parallelism planner for high-level API and unified builder workflow
+  - Support run `GptSession` without OpenMPI #1220
+  - [BREAKING CHANGE] TopP sampling optimization with deterministic AIR TopP algorithm is enabled by default
+  - Medusa IFB support
+  - [Experimental] Support FP8 FMHA, note that the performance is not optimal, and we will keep optimizing it
+  - [BREAKING CHANGE] Support embedding sharing for Gemma
+  - More head sizes support for LLaMA-like models
+    - Ampere (sm80, sm86), Ada (sm89), Hopper(sm90) all support head sizes [32, 40, 64, 80, 96, 104, 128, 160, 256] now.
+  - OOTB functionality support
+    - T5
+    - Mixtral 8x7B
 * API
-  - Add a set of High-level APIs for end-to-end generation tasks (see examples/high-level-api/README.md)
-  - **[BREAKING CHANGES]** Migrate models to the new build workflow, including LLaMA, Mistral, Mixtral, InternLM, ChatGLM, Falcon, GPT-J, GPT-NeoX, Medusa, MPT, Baichuan and Phi (see docs/source/checkpoint.md)
-  - **[BREAKING CHANGES]** Deprecate `LayerNorm` and `RMSNorm` plugins and removed corresponding build parameters
-  - **[BREAKING CHANGES]** Remove optional parameter `maxNumSequences` for GPT manager
+  - C++ `executor` API
+    - Add Python bindings, see documentation and examples in `examples/bindings`
+    - Add advanced and multi-GPU examples for Python binding of `executor` C++ API, see `examples/bindings/README.md`
+    - Add documents for C++ `executor` API, see `docs/source/executor.md`
+  - High-level API (refer to `examples/high-level-api/README.md` for guidance)
+    - [BREAKING CHANGE] Reuse the `QuantConfig` used in `trtllm-build` tool, support broader quantization features
+    - Support in `LLM()` API to accept engines built by `trtllm-build` command
+    - Add support for TensorRT-LLM checkpoint as model input
+    - Refine `SamplingConfig` used in `LLM.generate` or `LLM.generate_async` APIs, with the support of beam search, a variety of penalties, and more features
+    - Add support for the StreamingLLM feature, enable it by setting `LLM(streaming_llm=...)`
+    - Migrate Mixtral to high level API and unified builder workflow
+  - [BREAKING CHANGE] Refactored Qwen model to the unified build workflow, see `examples/qwen/README.md` for the latest commands
+  - [BREAKING CHANGE] Move LLaMA convert checkpoint script from examples directory into the core library
+  - [BREAKING CHANGE] Refactor GPT with unified building workflow, see `examples/gpt/README.md` for the latest commands
+  - [BREAKING CHANGE] Removed all the lora related flags from convert_checkpoint.py script and the checkpoint content to `trtllm-build` command, to generalize the feature better to more models
+  - [BREAKING CHANGE] Removed the use_prompt_tuning flag and options from convert_checkpoint.py script and the checkpoint content, to generalize the feature better to more models. Use the `trtllm-build --max_prompt_embedding_table_size` instead.
+  - [BREAKING CHANGE] Changed the `trtllm-build --world_size` flag to `--auto_parallel` flag, the option is used for auto parallel planner only.
+  - [BREAKING CHANGE] `AsyncLLMEngine` is removed, `tensorrt_llm.GenerationExecutor` class is refactored to work with both explicitly launching with `mpirun` in the application level, and accept an MPI communicator created by `mpi4py`
+  - [BREAKING CHANGE] `examples/server` are removed, see `examples/app` instead.
+  - [BREAKING CHANGE] Remove LoRA related parameters from convert checkpoint scripts
+  - [BREAKING CHANGE] Simplify Qwen convert checkpoint script
+  - [BREAKING CHANGE] Remove `model` parameter from `gptManagerBenchmark` and `gptSessionBenchmark`
 * Bug fixes
-  - Fix the first token being abnormal issue when `--gather_all_token_logits` is enabled #639
-  - Fix LLaMA with LoRA enabled build failure #673
-  - Fix InternLM SmoothQuant build failure #705
-  - Fix Bloom int8_kv_cache functionality  #741
-  - Fix crash in `gptManagerBenchmark` #649
-  - Fix Blip2 build error #695
-  - Add pickle support for `InferenceRequest` #701
-  - Fix Mixtral-8x7b build failure with custom_all_reduce #825
-  - Fix INT8 GEMM shape #935
-  - Minor bug fixes
+  - Fix a weight-only quant bug for Whisper to make sure that the `encoder_input_len_range` is not 0, thanks to the contribution from @Eddie-Wang1120 in #992
+  - Fix the issue that log probabilities in Python runtime are not returned #983
+  - Multi-GPU fixes for multimodal examples #1003
+  - Fix wrong `end_id` issue for Qwen #987
+  - Fix a non-stopping generation issue #1118 #1123
+  - Fix wrong link in examples/mixtral/README.md #1181
+  - Fix LLaMA2-7B bad results when int8 kv cache and per-channel int8 weight only are enabled #967
+  - Fix wrong `head_size` when importing Gemma model from HuggingFace Hub, thanks for the contribution from @mfuntowicz in #1148
+  - Fix ChatGLM2-6B building failure on INT8 #1239
+  - Fix wrong relative path in Baichuan documentation #1242
+  - Fix wrong `SamplingConfig` tensors in `ModelRunnerCpp` #1183
+  - Fix error when converting SmoothQuant LLaMA #1267
+  - Fix the issue that `examples/run.py` only load one line from `--input_file`
+  - Fix the issue that `ModelRunnerCpp` does not transfer `SamplingConfig` tensor fields correctly #1183
+* Benchmark
+  - Add emulated static batching in `gptManagerBenchmark`
+  - Support arbitrary dataset from HuggingFace for C++ benchmarks, see “Prepare dataset” section in `benchmarks/cpp/README.md`
+  - Add percentile latency report to `gptManagerBenchmark`
 * Performance
-  - **[BREAKING CHANGES]** Increase default `freeGpuMemoryFraction` parameter from 0.85 to 0.9 for higher throughput
-  - **[BREAKING CHANGES]** Disable `enable_trt_overlap` argument for GPT manager by default
-  - Performance optimization of beam search kernel
-  - Add bfloat16 and paged kv cache support for optimized generation MQA/GQA kernels
-  - Custom AllReduce plugins performance optimization
-  - Top-P sampling performance optimization
-  - LoRA performance optimization
-  - Custom allreduce performance optimization by introducing a ping-pong buffer to avoid an extra synchronization cost
-  - Integrate XQA kernels for GPT-J (beamWidth=4)
-* Documentation
-  - Batch manager arguments documentation updates
-  - Add documentation for best practices for tuning the performance of TensorRT-LLM (See docs/source/perf_best_practices.md)
-  - Add documentation for Falcon AWQ support (See examples/falcon/README.md)
-  - Update to the `docs/source/checkpoint.md` documentation
-  - Update AWQ INT4 weight only quantization documentation for GPT-J
-  - Add blog: Speed up inference with SOTA quantization techniques in TRT-LLM
-  - Refine TensorRT-LLM backend README structure #133
-  - Typo fix #739
+  - Optimize `gptDecoderBatch` to support batched sampling
+  - Enable FMHA for models in BART, Whisper and NMT family
+  - Remove router tensor parallelism to improve performance for MoE models, thanks to the contribution from @megha95 in #1091
+  - Improve custom all-reduce kernel
+* Infra
+  - Base Docker image for TensorRT-LLM is updated to `nvcr.io/nvidia/pytorch:24.02-py3`
+  - Base Docker image for TensorRT-LLM backend is updated to `nvcr.io/nvidia/tritonserver:24.02-py3`
+  - The dependent TensorRT version is updated to 9.3
+  - The dependent PyTorch version is updated to 2.2
+  - The dependent CUDA version is updated to 12.3.2 (a.k.a. 12.3 Update 2)
 
 #### For history change log, please see [CHANGELOG.md](./CHANGELOG.md).
 

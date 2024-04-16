@@ -57,7 +57,6 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
     float const diversity_rate{bh.diversity_rates[gbid]};
     float const length_penalty{bh.length_penalties[gbid]};
     int const early_stopping{bh.early_stoppings[gbid]};
-    int const* input_lengths{bh.input_lengths};
 
     __shared__ int nBeamForNextStep;
     __shared__ float smem_cum_log_probs[MAX_K2 / 2];
@@ -282,7 +281,7 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
         else
         {
             // enough beams in NonEarlyStopping mode
-            int seq_len = bh.seq_len[bid * K] + 1 - input_lengths[gbid * K];
+            int seq_len = bh.seq_len[bid * K] + 1 - bh.input_lengths[gbid * K];
             float const best_sum_logprobs = cta_topk[0].value;
             // According to semantics of HF, cta_topk[0].value is used as best_sum_logprobs
             // But maybe bh.cum_log_probs[bid * K + i] is more suitable?
@@ -290,13 +289,14 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
             if (early_stopping != 0 && length_penalty > 0.0f)
             {
                 // Specialization for early_stopping == "never" and length_penalty > 0 in HF
-                seq_len = bh.max_seq_len - input_lengths[gbid * K];
+                seq_len = bh.max_seq_len - bh.input_lengths[gbid * K];
             }
             float const highest_attainable_score = applyLengthPenalty(best_sum_logprobs, seq_len, length_penalty);
             bh.is_done[bid] = bh.min_normed_scores[gbid] >= highest_attainable_score;
         }
     }
     __syncthreads();
+
     // Update sequence_lengths, parent_ids, output_ids and finished
     __shared__ int s_sequence_lengths[MAX_K2 / 2];
     if (tid < K)

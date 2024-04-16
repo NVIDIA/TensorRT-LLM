@@ -54,6 +54,69 @@ enum class KvCacheDataType
     FP8
 };
 
+enum class RotaryPositionEmbeddingType
+{
+    NONE = 0,
+    GPTJ,
+    GPT_NEOX,
+};
+
+template <typename T, typename KVCacheBuffer>
+struct QKVPreprocessingParams
+{
+    // Buffers.
+    T* QKV;
+    // Only used by fp8 quantized output currently.
+    void* QuantizedQKV;
+    T* Q;
+    KVCacheBuffer const kv_cache_buffer;
+    T const* qkv_bias;
+    int const* seq_lens;
+    int const* cache_seq_lens;
+    int const* cu_seq_lens;
+    float const* rotary_embedding_inv_freq;
+    float2 const* rotary_coef_cache_buffer;
+    float const* kvScaleOrigQuant;
+    int const* medusa_position_offsets;
+
+    // Scalars.
+    int const batch_size;
+    int const max_input_seq_len;
+    int const max_kv_seq_len;
+    int const cyclic_kv_cache_len;
+    int const sink_token_len;
+    int const token_num;
+    int const head_num;
+    int const kv_head_num;
+    int const qheads_per_kv_head;
+    int const size_per_head;
+    int const rotary_embedding_dim;
+    float const rotary_embedding_base;
+    RotaryScalingType const rotary_scale_type;
+    float rotary_embedding_scale;
+    int const rotary_embedding_max_positions;
+    PositionEmbeddingType const position_embedding_type;
+    bool const position_shift_enabled;
+    const KvCacheDataType cache_type;
+    bool const enable_paged_kv_fmha;
+    bool const quantized_fp8_output;
+    int const multi_processor_count;
+
+    // Pre-compute on host.
+    int half_rotary_dim;
+    int q_hidden_size;
+    int kv_hidden_size;
+    int hidden_size;
+
+    void setCommonParameters()
+    {
+        half_rotary_dim = rotary_embedding_dim / 2;
+        q_hidden_size = head_num * size_per_head;
+        kv_hidden_size = kv_head_num * size_per_head;
+        hidden_size = q_hidden_size + 2 * kv_hidden_size;
+    }
+};
+
 template <typename T, typename T_IN>
 void invokeMaskedSoftmax(MaskedSoftmaxParam<T, T_IN>& param, cudaStream_t stream);
 
@@ -106,17 +169,29 @@ void invokeTranspose4dBatchMajor(T const* k_src, T const* v_src, KVCacheBuffer& 
     int const seq_len, int const max_attention_window_size, int const size_per_head, int const local_head_num,
     const KvCacheDataType cache_type, float const* kvScaleOrigQuant, int const* sequence_lengths, cudaStream_t stream);
 
+template <typename T, typename T_cache, typename KVCacheBuffer>
+void invokeApplyBiasRopeUpdateKVCacheDispatch(QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStream_t stream);
+
 // NOTE: this kernel is in-place, QKV will be modified, if other kernels need that, may need copy or use before it.
-template <typename T, typename KVCacheBuffer, bool IsGenerate = false>
-void invokeApplyBiasRopeUpdateKVCache(T* QKV, void* O, T* Q, KVCacheBuffer& kvTable, T const* qkv_bias,
-    int const* seq_lens, int const* kv_seq_lens, int const* padding_offset, int const batch_size, int const seq_len,
-    int const cyclic_kv_cache_len, int const sink_token_len, int const token_num, int const head_num,
-    int const kv_head_num, int const size_per_head, int const rotary_embedding_dim, float const rotary_embedding_base,
-    const RotaryScalingType rotary_scale_type, float const rotary_embedding_scale,
-    int const rotary_embedding_max_positions, const PositionEmbeddingType position_embedding_type,
-    int const* medusa_position_offsets, bool const position_shift_enabled, float const* scale, int const int8_mode,
-    const KvCacheDataType cache_type, float const* kvScaleOrigQuant, bool const enable_paged_kv_fmha,
-    bool const quantized_fp8_output, int const beam_width, int2& grid_block_cache, cudaStream_t stream);
+template <typename T, typename KVCacheBuffer>
+void invokeQKVPreprocessing(QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStream_t stream)
+{
+    params.setCommonParameters();
+    if (params.cache_type == KvCacheDataType::INT8)
+    {
+        invokeApplyBiasRopeUpdateKVCacheDispatch<T, int8_t, KVCacheBuffer>(params, stream);
+    }
+#ifdef ENABLE_FP8
+    else if (params.cache_type == KvCacheDataType::FP8)
+    {
+        invokeApplyBiasRopeUpdateKVCacheDispatch<T, __nv_fp8_e4m3, KVCacheBuffer>(params, stream);
+    }
+#endif // ENABLE_FP8
+    else
+    {
+        invokeApplyBiasRopeUpdateKVCacheDispatch<T, T, KVCacheBuffer>(params, stream);
+    }
+}
 
 template <typename T, typename BT>
 void invokeAddRelativeAttentionBiasUnaligned(T* qk_buf, const BT* relative_attention_bias, int const batch_size,
@@ -124,11 +199,11 @@ void invokeAddRelativeAttentionBiasUnaligned(T* qk_buf, const BT* relative_atten
     int num_buckets = 0, int max_distance = 0, bool bidirectional = true);
 
 template <typename T, typename KVCacheBuffer>
-void invokeShiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCacheBuffer, const KvCacheDataType cache_type,
-    int const sizePerHead, int const timestep, int const batch_beam, int const kv_head_num, int const beam_width,
-    int const maxKCacheLen, int const sinkTokenLen, float const* kScaleQuantOrig, int const* sequence_lengths,
-    int const* input_lengths, int const rotary_embedding_dim, float rotary_embedding_base,
-    RotaryScalingType const rotary_scale_type, float rotary_embedding_scale, int const rotary_embedding_max_positions,
-    PositionEmbeddingType const position_embedding_type, cudaStream_t stream);
+void invokeShiftKCache(KVCacheBuffer const& kvCacheBuffer, KVLinearBuffer const& shiftKCacheBuffer,
+    const KvCacheDataType cache_type, int const sizePerHead, int const timestep, int const batch_beam,
+    int const kv_head_num, int const beam_width, int const maxKCacheLen, int const sinkTokenLen,
+    float const* kScaleQuantOrig, int const* sequence_lengths, int const* input_lengths, int const rotary_embedding_dim,
+    float rotary_embedding_base, RotaryScalingType const rotary_scale_type, float rotary_embedding_scale,
+    int const rotary_embedding_max_positions, PositionEmbeddingType const position_embedding_type, cudaStream_t stream);
 } // namespace kernels
 } // namespace tensorrt_llm

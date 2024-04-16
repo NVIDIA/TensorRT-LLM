@@ -40,26 +40,31 @@ struct FillBuffers
 
     template <typename T>
     void operator()(std::optional<std::vector<T>> const& optParam, T const defaultValue, std::vector<T>& hostBuffer,
-        T* deviceBuffer, runtime::SizeType const* batchSlots) const
+        T* deviceBuffer, runtime::SizeType const* batchSlots, std::pair<float, float> const& limits,
+        std::string const& name) const
     {
         using tensorrt_llm::common::cudaAutoCpy;
 
         for (size_t bi = 0; bi < batchSize; ++bi)
         {
+            auto value = defaultValue;
             auto const batchSlot = batchSlots ? batchSlots[bi] : bi;
-            if (!optParam)
+            if (optParam)
             {
-                hostBuffer[batchSlot] = defaultValue;
+                if (optParam->size() == 1)
+                {
+                    value = optParam->front();
+                }
+                else
+                {
+                    TLLM_CHECK_WITH_INFO(optParam->size() == batchSize, "Argument vector size mismatch.");
+                    value = optParam.value()[bi];
+                }
             }
-            else if (optParam->size() == 1)
-            {
-                hostBuffer[batchSlot] = optParam->front();
-            }
-            else
-            {
-                TLLM_CHECK_WITH_INFO(optParam->size() == batchSize, "Argument vector size mismatch.");
-                hostBuffer[batchSlot] = optParam.value()[bi];
-            }
+            TLLM_CHECK_WITH_INFO(limits.first < static_cast<float>(value) && static_cast<float>(value) <= limits.second,
+                "%s param (%f) is out of limits (%f, %f]", name.c_str(), static_cast<float>(value), limits.first,
+                limits.second);
+            hostBuffer[batchSlot] = value;
         }
 
         if (batchSlots)

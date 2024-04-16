@@ -29,6 +29,7 @@
 using namespace tensorrt_llm::runtime;
 
 namespace tc = tensorrt_llm::common;
+namespace tk = tensorrt_llm::kernels;
 namespace tl = tensorrt_llm::layers;
 
 class SamplingTest : public ::testing::Test // NOLINT(cppcoreguidelines-pro-type-member-init)
@@ -69,6 +70,7 @@ typename tl::DynamicDecodeLayer<float>::OutputParams dynamicDecodeTest(BufferMan
     int* gpuSequenceLengths = nullptr;
     int* gpuNewTokens = nullptr;
     int* gpuNoRepeatNgramSize = nullptr;
+    tk::FinishedState::UnderlyingType* gpuFinished = nullptr;
 
     gpuLogits = allocator->reMalloc(gpuLogits, batchSize * beamWidth * vocabSizePadded * sizeof(float));
     gpuEndIds = allocator->reMalloc(gpuEndIds, batchSize * sizeof(int));
@@ -76,6 +78,7 @@ typename tl::DynamicDecodeLayer<float>::OutputParams dynamicDecodeTest(BufferMan
     gpuSequenceLengths = allocator->reMalloc(gpuSequenceLengths, batchSize * sizeof(int));
     gpuNewTokens = allocator->reMalloc(gpuNewTokens, batchSize * beamWidth * sizeof(int));
     gpuNoRepeatNgramSize = allocator->reMalloc(gpuNoRepeatNgramSize, batchSize * sizeof(int));
+    gpuFinished = allocator->reMalloc(gpuFinished, batchSize * beamWidth * sizeof(tk::FinishedState::UnderlyingType));
 
     cudaMemcpy(gpuLogits, cpuLogits.data(), cpuLogits.size() * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(gpuEndIds, cpuEndIds.data(), cpuEndIds.size() * sizeof(int), cudaMemcpyHostToDevice);
@@ -91,6 +94,7 @@ typename tl::DynamicDecodeLayer<float>::OutputParams dynamicDecodeTest(BufferMan
     tc::Tensor sequenceLengths{tc::MEMORY_GPU, tc::TYPE_INT32, {batchSize}, gpuSequenceLengths};
     tc::Tensor newTokens{tc::MEMORY_GPU, tc::TYPE_INT32, {batchSize}, gpuNewTokens};
     tc::Tensor noRepeatNgramSize{tc::MEMORY_GPU, tc::TYPE_INT32, {batchSize}, gpuNoRepeatNgramSize};
+    tc::Tensor finished{tc::MEMORY_GPU, tc::TYPE_INT8, {batchSize, beamWidth}, gpuFinished};
 
     auto const decodingMode = beamWidth == 1 ? DecodingMode::TopKTopP() : DecodingMode::BeamSearch();
     auto ddLayer = tl::DynamicDecodeLayer<float>(
@@ -108,6 +112,7 @@ typename tl::DynamicDecodeLayer<float>::OutputParams dynamicDecodeTest(BufferMan
     typename tl::DynamicDecodeLayer<float>::OutputParams outputParams(outputIds);
     outputParams.sequence_length = sequenceLengths;
     outputParams.newTokens = newTokens;
+    outputParams.finished = finished;
 
     ddLayer.forward(outputParams, forwardParams);
 

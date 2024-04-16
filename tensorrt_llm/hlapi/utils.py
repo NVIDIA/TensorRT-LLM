@@ -114,3 +114,16 @@ def get_device_count() -> int:
 
 def get_total_gpu_memory(device: int) -> float:
     return torch.cuda.get_device_properties(device).total_memory
+
+
+class ContextManager:
+    ''' A helper to create a context manager for a resource. '''
+
+    def __init__(self, resource):
+        self.resource = resource
+
+    def __enter__(self):
+        return self.resource.__enter__()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return self.resource.__exit__(exc_type, exc_value, traceback)

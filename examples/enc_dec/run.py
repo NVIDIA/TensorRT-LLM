@@ -33,11 +33,8 @@ from tensorrt_llm.lora_manager import LoraManager
 from tensorrt_llm.runtime import ModelConfig, SamplingConfig
 
 
-def get_engine_name(model, dtype, tp_size, pp_size, rank):
-    if pp_size == 1:
-        return '{}_{}_tp{}_rank{}.engine'.format(model, dtype, tp_size, rank)
-    return '{}_{}_tp{}_pp{}_rank{}.engine'.format(model, dtype, tp_size,
-                                                  pp_size, rank)
+def get_engine_name(rank):
+    return 'rank{}.engine'.format(rank)
 
 
 def print_tensor(tensor_name, tensor, num_elements=10):
@@ -58,38 +55,40 @@ def read_config(config_path: Path):
     with open(config_path, "r") as f:
         config = json.load(f)
 
-    builder_config = config['builder_config']
-    plugin_config = config['plugin_config']
+    builder_config = config['build_config']
+    plugin_config = builder_config['plugin_config']
+    pretrained_config = config['pretrained_config']
+    lora_config = builder_config['lora_config']
+    auto_parallel_config = builder_config['auto_parallel_config']
     use_gpt_attention_plugin = plugin_config["gpt_attention_plugin"]
     remove_input_padding = plugin_config["remove_input_padding"]
     use_lora_plugin = plugin_config["lora_plugin"]
-    tp_size = builder_config['tensor_parallel']
-    pp_size = builder_config['pipeline_parallel']
-    gpus_per_node = builder_config['gpus_per_node']
+    tp_size = pretrained_config['mapping']['tp_size']
+    pp_size = pretrained_config['mapping']['pp_size']
+    gpus_per_node = auto_parallel_config['gpus_per_node']
     world_size = tp_size * pp_size
     assert world_size == tensorrt_llm.mpi_world_size(), \
         f'Engine world size ({world_size}) != Runtime world size ({tensorrt_llm.mpi_world_size()})'
-    num_heads = builder_config["num_heads"]
-    hidden_size = builder_config["hidden_size"]
-    head_size = builder_config["head_size"]
-    vocab_size = builder_config["vocab_size"]
+    num_heads = pretrained_config["num_attention_heads"]
+    hidden_size = pretrained_config["hidden_size"]
+    head_size = pretrained_config["head_size"]
+    vocab_size = pretrained_config["vocab_size"]
     max_batch_size = builder_config["max_batch_size"]
     max_beam_width = builder_config["max_beam_width"]
-    num_layers = builder_config["num_layers"]
-    num_kv_heads = builder_config.get('num_kv_heads', num_heads)
+    num_layers = pretrained_config["num_hidden_layers"]
+    num_kv_heads = pretrained_config.get('num_kv_heads', num_heads)
 
     assert (num_heads % tp_size) == 0
     num_heads = num_heads // tp_size
     hidden_size = hidden_size // tp_size
     num_kv_heads = (num_kv_heads + tp_size - 1) // tp_size
 
-    cross_attention = builder_config["cross_attention"]
-    skip_cross_qkv = builder_config.get('skip_cross_qkv', False)
-    has_position_embedding = builder_config["has_position_embedding"]
-    has_token_type_embedding = builder_config["has_token_type_embedding"]
-    use_custom_all_reduce = config['plugin_config'].get('use_custom_all_reduce',
-                                                        False)
-    dtype = builder_config["precision"]
+    cross_attention = pretrained_config["architecture"] == "DecoderModel"
+    skip_cross_qkv = pretrained_config.get('skip_cross_qkv', False)
+    has_position_embedding = pretrained_config["has_position_embedding"]
+    has_token_type_embedding = hasattr(pretrained_config, "type_vocab_size")
+    use_custom_all_reduce = plugin_config.get('use_custom_all_reduce', False)
+    dtype = pretrained_config["dtype"]
 
     gather_context_logits = builder_config.get('gather_context_logits', False)
     gather_generation_logits = builder_config.get('gather_generation_logits',
@@ -117,8 +116,8 @@ def read_config(config_path: Path):
         gather_generation_logits=gather_generation_logits,
         max_prompt_embedding_table_size=max_prompt_embedding_table_size,
         lora_plugin=use_lora_plugin,
-        lora_target_modules=builder_config.get('lora_target_modules'),
-        trtllm_modules_to_hf_modules=builder_config.get(
+        lora_target_modules=lora_config.get('lora_target_modules'),
+        trtllm_modules_to_hf_modules=lora_config.get(
             'trtllm_modules_to_hf_modules'),
         skip_cross_qkv=skip_cross_qkv,
     )
@@ -200,8 +199,7 @@ class TRTLLMEncDecModel:
                                                    gpus_per_node=gpus_per_node)
 
             # load engine
-            engine_fname = get_engine_name(engine_name, dtype, tp_size, pp_size,
-                                           runtime_rank)
+            engine_fname = get_engine_name(runtime_rank)
             with open(engine_dir / component / engine_fname, "rb") as f:
                 engine_buffer = f.read()
 
@@ -674,18 +672,20 @@ def test_fairseq_models(args):
     else:
         tllm_output_ids = tllm_output
 
-    output_ids = tllm_output_ids[:, 0, :]
-    output_ids = output_ids[output_ids != eos_token_id]
-    fairseq_output_ids = fairseq_output_ids[fairseq_output_ids != eos_token_id]
+    if tensorrt_llm.mpi_rank() == 0:
+        output_ids = tllm_output_ids[:, 0, :]
+        output_ids = output_ids[output_ids != eos_token_id]
+        fairseq_output_ids = fairseq_output_ids[
+            fairseq_output_ids != eos_token_id]
 
-    print("--------------------------------------")
-    print("TRT-LLM output_ids: ", output_ids)
-    print(f"TRT-LLM E2E time {(tok-tik)*1000}ms")
-    print("Precision:", inference_dtype)
-    print("--------------------------------------")
+        print("--------------------------------------")
+        print("TRT-LLM output_ids: ", output_ids)
+        print(f"TRT-LLM E2E time {(tok-tik)*1000}ms")
+        print("Precision:", inference_dtype)
+        print("--------------------------------------")
 
-    assert output_ids.tolist() == fairseq_output_ids.tolist(
-    ), f"TRT-LLM output ids {output_ids} does not match Fairseq ids {fairseq_output_ids}"
+        assert output_ids.tolist() == fairseq_output_ids.tolist(
+        ), f"TRT-LLM output ids {output_ids} does not match Fairseq ids {fairseq_output_ids}"
 
 
 if __name__ == "__main__":

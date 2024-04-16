@@ -23,12 +23,10 @@ This document shows how to build and run an Encoder-Decoder (Enc-Dec) model in T
 
 The TensorRT-LLM Enc-Dec implementation can be found in [tensorrt_llm/models/enc_dec/model.py](../../tensorrt_llm/models/enc_dec/model.py). The TensorRT-LLM Enc-Dec example code is located in [`examples/enc_dec`](./):
 
- * [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the Enc-Dec model,
+ * `trtllm-build` to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the Enc-Dec model,
  * [`run.py`](./run.py) to run the inference on an example input text.
- * Enc-Dec models can have specific implementations, such as the popular T5 family (T5, mT5, Flan-T5), BART family (BART, mBART), and FairSeq family (WMTs). They are located under subfolders `/t5`, `/bart`, and `/nmt`, each containing:
-   * [`<model_type>/convert.py`](./t5/convert.py) to convert weights from HuggingFace or FairSeq format to TRT-LLM format, and split weights for multi-GPU inference,
-   * [`<model_type>/weight.py`](./t5/weight.py) to map the converted & split weights to TRT-LLM model.
-
+ * Enc-Dec models can have specific implementations, such as the popular T5 family (T5, mT5, Flan-T5), BART family (BART, mBART), and FairSeq family (WMTs). They are now merged into a single convert script:
+   * [`convert_checkpoint.py`](./convert_checkpoint.py) to convert weights from HuggingFace or FairSeq format to TRT-LLM format, and split weights for multi-GPU inference,
 ## Usage
 
 The TensorRT-LLM Enc-Dec example code locates at [examples/enc_dec](./). It takes HuggingFace or FairSeq model name as input, and builds the corresponding TensorRT engines. On each GPU, there will be two TensorRT engines, one for Encoder and one for Decoder.
@@ -58,91 +56,140 @@ git clone https://huggingface.co/facebook/mbart-large-50-many-to-one-mmt tmp/hf_
 ```
 
 ### Convert and Split Weights
-The `<model_type>/convert.py` script converts weights from HuggingFace or FairSeq format to TRT-LLM format, and splits weights for multi-GPU inference. `--inference_tensor_para_size` specifies the number of GPUs for tensor parallelism during inference.
+The `convert_checkpoint.py` script converts weights from HuggingFace or FairSeq format to TRT-LLM format, and splits weights for multi-GPU inference. `--tp_size` specifies the number of GPUs for tensor parallelism during inference. Pipeline Parallelism size can be set with `--pp_size` for distributed inference.
 
-It is fine to save one copy of converted weights at high precision, e.g. float32, if disk space allows. During the following engine building phase, engines of any inference precision can be built by weight dtype casting on the fly. Therefore, you can just keep one set of saved weights and build engines freely at different precisions, instead of saving weights for each inference precision.
+The HuggingFace or Fairseq checkpoints of the enc-dec models mentioned in this Readme are all float32 precision. Use `--dtype` to set the target inference precision during the weight conversion.
 
-After weight conversion, TensorRT-LLM converted weights and model configuration will be saved under `<out_dir>/<tpX>` directory, which is the `--weight_dir` input path you should give to the **next** engine building phase. `X` is Tensor Parallelim size for distributed inference.
+After weight conversion, TensorRT-LLM converted weights and model configuration will be saved under `<out_dir>/<tpX>` directory, which is the `--checkpoint_dir` input path you should give to the **next** engine building phase.
+
+Take T5 for example:
 
 ```bash
-# For T5
-python t5/convert.py -i tmp/hf_models/t5-small -o tmp/trt_models/t5-small --weight_data_type float32 --inference_tensor_para_size <X>
-
-# For BART or mBART
-python bart/convert.py -i tmp/hf_models/bart-large-cnn -o tmp/trt_models/bart-large-cnn --weight_data_type float32 --inference_tensor_para_size <X>
+# Example: build t5-small using 4-way tensor parallelism on a node with 8 GPUs (but only use 4 of them, for demonstration purpose), BF16, enabling beam search up to width=1.
+export MODEL_NAME="t5-small" # or "flan-t5-small"
+export MODEL_TYPE="t5"
+export INFERENCE_PRECISION="bfloat16"
+export TP_SIZE=4
+export PP_SIZE=1
+export WORLD_SIZE=4
+export MAX_BEAM_WIDTH=1
+python convert_checkpoint.py --model_type ${MODEL_TYPE} \
+                --model_dir tmp/hf_models/${MODEL_NAME} \
+                --output_dir tmp/trt_models/${MODEL_NAME}/${INFERENCE_PRECISION} \
+                --tp_size ${TP_SIZE} \
+                --pp_size ${PP_SIZE} \
+                --weight_data_type float32 \
+                --dtype ${INFERENCE_PRECISION}
 ```
 
 ### Build TensorRT engine(s)
 
 TensorRT-LLM builds TensorRT engine(s) with flexible controls on different types of optimizations. Note that these are just examples to demonstrate multi-GPU inference. For small models like T5-small, single GPU is usually sufficient.
 
-After engine building, TensorRT engines will be saved under `<out_dir>/<dtype>/<tpX>` directory, which is the `--engine_dir` path you should give to the next engine running phase. It is recommended to have `/<Y-gpu>` in the output path where `Y` is number of total GPU ranks in a multi-node, multi-GPU setup, because the same `Y` number GPUs could be executed with different TP (Tensor Parallelism) and PP (Pipeline Parallelism) combinations.
+After engine building, TensorRT engines will be saved under `<out_dir>/<tpX>` directory, which is the `--engine_dir` path you should give to the next engine running phase. It is recommended to have `/<Y-gpu>` in the output path where `Y` is number of total GPU ranks in a multi-node, multi-GPU setup, because the same `Y` number GPUs could be executed with different TP (Tensor Parallelism) and PP (Pipeline Parallelism) combinations.
 
 We should distinguish between `X` - TP size and `Y` - total number of GPU ranks:
 * When `X = Y`, only TP is enabled
 * When `X < Y`, both TP and PP are enabled. In such case, please make sure you have completed weight conversion step for `TP=X`.
 
+The default value of `--max_input_len` is 1024. When building DecoderModel, specify decoder input length with `--max_input_len=1` for encoder-decoder model to start generation from decoder_start_token_id of length 1. If the start token is a single token (the default behavior of T5/BART/etc.), you should set `--max_input_len` as 1; if you want the decoder-only type of generation, set `--max_input_len` above 1 to get similar behavior as HF's `decoder_forced_input_ids`.
+
+DecoderModel takes `--max_encoder_input_len` and `--max_input_len` as model inputs, `--max_encoder_input_len` is set to 1024 as default since `--max_input_len` is 1024 for EncoderModel.
+
+To be noted: for T5, add `--context_fmha disable`, and `--bert_attention_plugin`, `--gpt_attention_plugin`, `--remove_input_padding`, `--gemm_plugin` require explicit disabling and setting.
+
 ```bash
-# Example 1: build t5-small using a single GPU, FP32, running greedy search
-# use_gpt_attention_plugin is necessary in Enc-Dec.
-# Try use_gemm_plugin to prevent accuracy issue.
-# It is recommended to use --remove_input_padding along with --use_gpt_attention_plugin for better performance
-python build.py --model_type t5 \
-                --weight_dir tmp/trt_models/t5-small/tp1 \
-                -o tmp/trt_engines/t5-small/1-gpu \
-                --engine_name t5-small \
-                --remove_input_padding \
-                --use_bert_attention_plugin \
-                --use_gpt_attention_plugin \
-                --use_gemm_plugin \
-                --dtype float32 \
-                --max_beam_width 1
+# --gpt_attention_plugin is necessary in Enc-Dec.
+# Try --gemm_plugin to prevent accuracy issue.
+# It is recommended to use --remove_input_padding along with --gpt_attention_plugin for better performance
+trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/${INFERENCE_PRECISION}/tp${TP_SIZE}/pp${PP_SIZE}/encoder \
+                --output_dir tmp/trt_engines/${MODEL_NAME}/${WORLD_SIZE}-gpu/${INFERENCE_PRECISION}/tp${TP_SIZE}/encoder \
+                --paged_kv_cache disable \
+                --moe_plugin disable \
+                --enable_xqa disable \
+                --use_custom_all_reduce disable \
+                --max_beam_width ${MAX_BEAM_WIDTH} \
+                --max_batch_size 8 \
+                --max_output_len 200 \
+                --gemm_plugin ${INFERENCE_PRECISION} \
+                --bert_attention_plugin ${INFERENCE_PRECISION} \
+                --gpt_attention_plugin ${INFERENCE_PRECISION} \
+                --remove_input_padding enable \
+                --context_fmha disable
 
-# Example 2: build t5-small using 4-way tensor parallelism on a node with 8 GPUs (but only use 4 of them, for demonstration purpose), BF16, enabling beam search up to width=3
-python build.py --model_type t5 \
-                --world_size 4 \
-                --tp_size 4 \
-                --gpus_per_node 4 \
-                --weight_dir tmp/trt_models/t5-small/tp4 \
-                -o tmp/trt_engines/t5-small/4-gpu \
-                --engine_name t5-small \
-                --remove_input_padding \
-                --use_bert_attention_plugin \
-                --use_gpt_attention_plugin \
-                --use_gemm_plugin \
-                --dtype bfloat16 \
-                --max_beam_width 3
+# For decoder, refer to the above content and set --max_input_len correctly
+trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/${INFERENCE_PRECISION}/tp${TP_SIZE}/pp${PP_SIZE}/decoder \
+                --output_dir tmp/trt_engines/${MODEL_NAME}/${WORLD_SIZE}-gpu/${INFERENCE_PRECISION}/tp${TP_SIZE}/decoder \
+                --paged_kv_cache disable \
+                --moe_plugin disable \
+                --enable_xqa disable \
+                --use_custom_all_reduce disable \
+                --max_beam_width ${MAX_BEAM_WIDTH} \
+                --max_batch_size 8 \
+                --max_output_len 200 \
+                --gemm_plugin ${INFERENCE_PRECISION} \
+                --bert_attention_plugin ${INFERENCE_PRECISION} \
+                --gpt_attention_plugin ${INFERENCE_PRECISION} \
+                --remove_input_padding enable \
+                --context_fmha disable \
+                --max_input_len 1
 
-# Example 3: build flan-t5-small using 2-way tensor parallelism and 2-way pipeline parallelism on a node with 8 GPUs, BF16, enabling beam search up to width=3
-python build.py --model_type t5 \
-                --world_size 4 \
-                --tp_size 2 \
-                --pp_size 2 \
-                --gpus_per_node 8 \
-                --weight_dir tmp/trt_models/flan-t5-small/tp2 \
-                -o tmp/trt_engines/flan-t5-small/4-gpu \
-                --engine_name flan-t5-small \
-                --remove_input_padding \
-                --use_bert_attention_plugin \
-                --use_gpt_attention_plugin \
-                --use_gemm_plugin \
-                --dtype bfloat16 \
-                --max_beam_width 3
-
-# Example 4: build bart-large-cnn using a single GPU, FP32, running greedy search
-# Note: non-T5 models can enable FMHA for the encoder part, for FP16/BF16
-python build.py --model_type bart \
-                --weight_dir tmp/trt_models/bart-large-cnn/tp1 \
-                -o tmp/trt_engines/bart-large-cnn/1-gpu \
-                --engine_name bart-large-cnn \
-                --remove_input_padding \
-                --use_bert_attention_plugin \
-                --use_gpt_attention_plugin \
-                --enable_context_fmha \
-                --use_gemm_plugin \
-                --dtype float32 \
-                --max_beam_width 1
 ```
+
+For BART, `--context_fmha` can be enabled. `trtllm-build` has the default setting to enable it.
+
+```bash
+# Example: build bart-large-cnn using a single GPU, FP32, running greedy search
+export MODEL_NAME="bart-large-cnn" # or "mbart-large-50-many-to-one-mmt"
+export MODEL_TYPE="bart"
+export INFERENCE_PRECISION="float32"
+export TP_SIZE=1
+export PP_SIZE=1
+export WORLD_SIZE=1
+export MAX_BEAM_WIDTH=1
+python convert_checkpoint.py --model_type ${MODEL_TYPE} \
+                --model_dir tmp/hf_models/${MODEL_NAME} \
+                --output_dir tmp/trt_models/${MODEL_NAME}/${INFERENCE_PRECISION} \
+                --tp_size ${TP_SIZE} \
+                --pp_size ${PP_SIZE} \
+                --weight_data_type float32 \
+                --dtype ${INFERENCE_PRECISION}
+
+# Note: non-T5 models can enable FMHA for the encoder part, for FP16/BF16, the default is enabled
+trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/${INFERENCE_PRECISION}/tp${TP_SIZE}/pp${PP_SIZE}/encoder \
+                --output_dir tmp/trt_engines/${MODEL_NAME}/${WORLD_SIZE}-gpu/${INFERENCE_PRECISION}/tp${TP_SIZE}/encoder \
+                --paged_kv_cache disable \
+                --moe_plugin disable \
+                --enable_xqa disable \
+                --use_custom_all_reduce disable \
+                --max_beam_width ${MAX_BEAM_WIDTH} \
+                --max_batch_size 8 \
+                --max_output_len 200 \
+                --gemm_plugin ${INFERENCE_PRECISION} \
+                --bert_attention_plugin ${INFERENCE_PRECISION} \
+                --gpt_attention_plugin ${INFERENCE_PRECISION} \
+                --remove_input_padding enable
+                # --context_fmha disable should be removed
+
+# Use the same command for decoder engine
+trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/${INFERENCE_PRECISION}/tp${TP_SIZE}/pp${PP_SIZE}/decoder \
+                --output_dir tmp/trt_engines/${MODEL_NAME}/${WORLD_SIZE}-gpu/${INFERENCE_PRECISION}/tp${TP_SIZE}/decoder \
+                --paged_kv_cache disable \
+                --moe_plugin disable \
+                --enable_xqa disable \
+                --use_custom_all_reduce disable \
+                --max_beam_width ${MAX_BEAM_WIDTH} \
+                --max_batch_size 8 \
+                --max_output_len 200 \
+                --gemm_plugin ${INFERENCE_PRECISION} \
+                --bert_attention_plugin ${INFERENCE_PRECISION} \
+                --gpt_attention_plugin ${INFERENCE_PRECISION} \
+                --remove_input_padding enable \
+                --max_input_len 1
+                # --context_fmha disable should be removed
+
+```
+
 
 ### Run
 
@@ -150,17 +197,11 @@ Run a TensorRT-LLM Enc-Dec model using the engines generated by build.py.
 Note that during model deployment, only the TensorRT engine files are needed. Previously downloaded model checkpoints and converted weights can be removed.
 
 ```bash
-# Example 1: For T5, inference w/ single GPU, FP32, greedy search, compare results with HuggingFace FP32
-python3 run.py --engine_dir tmp/trt_engines/t5-small/1-gpu/float32/tp1 --engine_name t5-small --model_name t5-small --max_new_token=64 --num_beams=1 --compare_hf_fp32
+# Inferencing w/ single GPU greedy search, compare results with HuggingFace FP32
+python3 run.py --engine_dir tmp/trt_engines/${MODEL_NAME}/${WORLD_SIZE}-gpu/${INFERENCE_PRECISION}/tp${TP_SIZE} --engine_name ${MODEL_NAME} --model_name tmp/hf_models/${MODEL_NAME} --max_new_token=64 --num_beams=1 --compare_hf_fp32
 
-# Example 2: For T5, inference w/ 4 GPUs (4-way TP, as configured during the engine building step), BF16, greedy search, compare results with HuggingFace FP32
-mpirun --allow-run-as-root -np 4 python3 run.py --engine_dir tmp/trt_engines/t5-small/4-gpu/bfloat16/tp4 --engine_name t5-small --model_name t5-small --max_new_token=64 --num_beams=1 --compare_hf_fp32
-
-# Example 3: For T5, inference w/ 4 GPUs (2-way TP and 2-way PP, as configured during the engine building step), BF16, greedy search
-mpirun --allow-run-as-root -np 4 python3 run.py --engine_dir tmp/trt_engines/flan-t5-small/4-gpu/bfloat16/tp2 --engine_name flan-t5-small --model_name google/flan-t5-small --max_new_token=64 --num_beams=1
-
-# Example 4: For BART, inference w/ single GPU, FP32, greedy search, compare results with HuggingFace FP32
-python3 run.py --engine_dir tmp/trt_engines/bart-large-cnn/1-gpu/float32/tp1 --engine_name bart-large-cnn --model_name tmp/hf_models/bart-large-cnn --max_new_token=64 --num_beams=1 --compare_hf_fp32
+# Inferencing w/ 4 GPUs (4-way TP, as configured during the engine building step), greedy search, compare results with HuggingFace FP32
+mpirun --allow-run-as-root -np ${WORLD_SIZE} python3 run.py --engine_dir tmp/trt_engines/${MODEL_NAME}/${WORLD_SIZE}-gpu/${INFERENCE_PRECISION}/tp${TP_SIZE} --engine_name ${MODEL_NAME} --model_name tmp/hf_models/${MODEL_NAME} --max_new_token=64 --num_beams=1 --compare_hf_fp32
 ```
 
 ### Benchmark
@@ -183,7 +224,7 @@ mpirun --allow-run-as-root -np 4 python benchmark.py \
     -m t5_small \
     --batch_size "1;8" \
     --input_output_len "60,20;128,20" \
-    --dtype bfloat16 \
+    --dtype float32 \
     --csv # optional
 ```
 
@@ -201,35 +242,61 @@ If using customize models, just put both the base model and lora model dirs into
 * Convert and Split Weights, setting `--hf_lora_dir`.
 
 ```bash
-python bart/convert.py \
-        -i tmp/hf_models/bart-large-cnn \
-        -o tmp/trt_models/bart-large-cnn/ \
-        --weight_data_type float16 \
-        --inference_tensor_para_size 1 \
-        --hf_lora_dir tmp/hf_models/bart-large-cnn-samsum-lora/
+export INFERENCE_PRECISION="float16"
+python convert_checkpoint.py --model_type bart \
+                --model_dir tmp/hf_models/bart-large-cnn \
+                --output_dir tmp/trt_models/bart-large-cnn/${INFERENCE_PRECISION} \
+                --tp_size 1 \
+                --pp_size 1 \
+                --weight_data_type float32 \
+                --dtype ${INFERENCE_PRECISION}
 ```
 
 * Build engine, setting `--use_lora_plugin`.
 
 ```bash
-python build.py --model_type bart \
-                --weight_dir tmp/trt_models/bart-large-cnn/tp1 \
-                -o tmp/trt_engines/bart-large-cnn/1-gpu/ \
-                --engine_name bart-large-cnn \
-                --use_bert_attention_plugin \
-                --use_gpt_attention_plugin \
-                --enable_context_fmha \
-                --use_gemm_plugin \
-                --use_lora_plugin \
-                --dtype float16 \
-                --max_beam_width 1
+
+trtllm-build --checkpoint_dir tmp/trt_models/bart-large-cnn/${INFERENCE_PRECISION}/tp1/pp1/encoder \
+                --output_dir tmp/trt_engines/bart-large-cnn/1-gpu/${INFERENCE_PRECISION}/tp1/encoder \
+                --paged_kv_cache disable \
+                --moe_plugin disable \
+                --enable_xqa disable \
+                --use_custom_all_reduce disable \
+                --max_beam_width 1 \
+                --max_batch_size 8 \
+                --max_output_len 200 \
+                --gemm_plugin ${INFERENCE_PRECISION} \
+                --bert_attention_plugin ${INFERENCE_PRECISION} \
+                --gpt_attention_plugin ${INFERENCE_PRECISION} \
+                --remove_input_padding disable \
+                --lora_plugin ${INFERENCE_PRECISION} \
+                --lora_dir tmp/hf_models/bart-large-cnn-samsum-lora/ \
+                --lora_target_modules attn_q attn_v
+
+trtllm-build --checkpoint_dir tmp/trt_models/bart-large-cnn/${INFERENCE_PRECISION}/tp1/pp1/decoder \
+                --output_dir tmp/trt_engines/bart-large-cnn/1-gpu/${INFERENCE_PRECISION}/tp1/decoder \
+                --paged_kv_cache disable \
+                --moe_plugin disable \
+                --enable_xqa disable \
+                --use_custom_all_reduce disable \
+                --max_beam_width 1 \
+                --max_batch_size 8 \
+                --max_output_len 200 \
+                --gemm_plugin ${INFERENCE_PRECISION} \
+                --bert_attention_plugin ${INFERENCE_PRECISION} \
+                --gpt_attention_plugin ${INFERENCE_PRECISION} \
+                --remove_input_padding disable \
+                --max_input_len 1 \
+                --lora_plugin ${INFERENCE_PRECISION} \
+                --lora_dir tmp/hf_models/bart-large-cnn-samsum-lora/ \
+                --lora_target_modules attn_q cross_attn_q attn_v cross_attn_v
 ```
 
 * Run the engine, setting `--lora_dir` and `--lora_task_uids`. `--lora_task_uids` should be set as a list of uids which length equals to batch size. The following example is for batch size = 3:
 
 ```bash
 python run.py \
-        --engine_dir tmp/trt_engines/bart-large-cnn/1-gpu/float16/tp1/ \
+        --engine_dir tmp/trt_engines/bart-large-cnn/1-gpu/${INFERENCE_PRECISION}/tp1/ \
         --engine_name bart-large-cnn \
         --model_name tmp/hf_models/bart-large-cnn \
         --max_new_token=64 \
@@ -242,7 +309,7 @@ python run.py \
 
 ```bash
 python run.py \
-        --engine_dir tmp/trt_engines/bart-large-cnn/1-gpu/float16/tp1/ \
+        --engine_dir tmp/trt_engines/bart-large-cnn/1-gpu/${INFERENCE_PRECISION}/tp1/ \
         --engine_name bart-large-cnn \
         --model_name tmp/hf_models/bart-large-cnn \
         --max_new_token=64 \
@@ -267,8 +334,8 @@ norm_factor = 1.f / (q_scaling * sqrt(head_size))
 In the Multi-Head Attention (MHA) mechanism, the output of the `Q*K^T` product is scaled by this constant value `norm_factor` as `norm_factor * (Q*K^T)` for `softmax`. This scaling factor can be adjusted or neutralized based on the model's requirements.
 
 Handling in Different Models:
-- BART/FairSeq NMT: For the BART model, `q_scaling` is set to `1.f`. Therefore, the `norm_factor` for BART becomes `1.f / sqrt(head_size)`. TRT-LLM uses the default value `q_scaling = 1.f` as seen in [`bart/convert.py`](./bart/convert.py). Similar to FairSeq NMT models.
-- T5: For the T5 model, `q_scaling` is `1.f/sqrt(head_size)`, leading to a `norm_factor` of `1.f`. This is handled in T5 by the TRT-LLM's `get_offset_q_scaling()` function in [`t5/convert.py`](./t5/convert.py#L158-163), which reads `head_size` from the T5 model configuration and sets `q_scaling = 1.f/sqrt(head_size)` to effectively offset the `norm_factor` to `1.f`.
+- BART/FairSeq NMT: For the BART models, `q_scaling` is set to `1.f`. Therefore, the `norm_factor` for BART becomes `1.f / sqrt(head_size)`. TRT-LLM uses the default value `q_scaling = 1.f`. Similar to FairSeq NMT models.
+- T5: For the T5 models, `q_scaling` is `1.f/sqrt(head_size)`, leading to a `norm_factor` of `1.f`. This is handled in T5 by the TRT-LLM's `get_offset_q_scaling()` function, which reads `head_size` from the T5 model configuration and sets `q_scaling = 1.f/sqrt(head_size)` to effectively offset the `norm_factor` to `1.f`.
 
 ### Run FairSeq NMT (Neural Machine Translation) models
 
@@ -284,20 +351,46 @@ mkdir -p tmp/fairseq_models && curl https://dl.fbaipublicfiles.com/fairseq/model
 pushd tmp && (git clone https://github.com/facebookresearch/fairseq.git || true) && pushd fairseq && sed -i '/torch>=/d;/torchaudio>=/d' setup.py && pip install -e . && pip install sacremoses subword_nmt && popd && popd
 
 # Convert and Split Weights, single GPU example
-python nmt/convert.py -i tmp/fairseq_models/wmt14 -o tmp/trt_models/wmt14 --weight_data_type float32 --inference_tensor_para_size 1
+export TP_SIZE=1
+export PP_SIZE=1
+export WORLD_SIZE=1
+export INFERENCE_PRECISION="float32"
+python convert_checkpoint.py --model_type nmt \
+                --model_dir tmp/fairseq_models/wmt14 \
+                --output_dir tmp/trt_models/wmt14/${INFERENCE_PRECISION} \
+                --tp_size ${TP_SIZE} \
+                --pp_size ${PP_SIZE} \
+                --weight_data_type float32 \
+                --dtype ${INFERENCE_PRECISION}
 
 # Build TensorRT engine(s)
 # Note: non-T5 models can enable FMHA for the encoder part, although only FP16/BF16 precisions are valid
-python build.py --model_type nmt \
-        --weight_dir tmp/trt_models/wmt14/tp1/  \
-        -o  tmp/trt_engines/wmt14/1-gpu  \
-        --engine_name wmt14 \
-        --use_bert_attention_plugin \
-        --use_gpt_attention_plugin \
-        --enable_context_fmha \
-        --dtype float32 \
-        --max_beam_width 1
+trtllm-build --checkpoint_dir tmp/trt_models/wmt14/${INFERENCE_PRECISION}/tp${TP_SIZE}/pp${PP_SIZE}/encoder \
+                --output_dir tmp/trt_engines/wmt14/${WORLD_SIZE}-gpu/${INFERENCE_PRECISION}/tp${TP_SIZE}/encoder \
+                --paged_kv_cache disable \
+                --moe_plugin disable \
+                --enable_xqa disable \
+                --use_custom_all_reduce disable \
+                --max_beam_width 1 \
+                --max_batch_size 8 \
+                --max_output_len 200 \
+                --bert_attention_plugin ${INFERENCE_PRECISION} \
+                --gpt_attention_plugin ${INFERENCE_PRECISION} \
+                --remove_input_padding disable
 
+trtllm-build --checkpoint_dir tmp/trt_models/wmt14/${INFERENCE_PRECISION}/tp${TP_SIZE}/pp${PP_SIZE}/decoder \
+                --output_dir tmp/trt_engines/wmt14/${WORLD_SIZE}-gpu/${INFERENCE_PRECISION}/tp${TP_SIZE}/decoder \
+                --paged_kv_cache disable \
+                --moe_plugin disable \
+                --enable_xqa disable \
+                --use_custom_all_reduce disable \
+                --max_beam_width 1 \
+                --max_batch_size 8 \
+                --max_output_len 200 \
+                --bert_attention_plugin ${INFERENCE_PRECISION} \
+                --gpt_attention_plugin ${INFERENCE_PRECISION} \
+                --remove_input_padding disable \
+                --max_input_len 1
 # Run
-python3 run.py --engine_dir tmp/trt_engines/wmt14/1-gpu/float32/tp1 --engine_name wmt14 --model_name tmp/fairseq_models/wmt14 --max_new_token=24 --num_beams=1
+mpirun --allow-run-as-root -np ${WORLD_SIZE} python3 run.py --engine_dir tmp/trt_engines/wmt14/${WORLD_SIZE}-gpu/${INFERENCE_PRECISION}/tp${TP_SIZE} --engine_name wmt14 --model_name tmp/fairseq_models/wmt14/${WORLD_SIZE}-gpu/${INFERENCE_PRECISION}/tp${TP_SIZE} --max_new_token=24 --num_beams=1
 ```

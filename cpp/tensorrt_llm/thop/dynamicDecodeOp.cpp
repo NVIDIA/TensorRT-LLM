@@ -144,9 +144,9 @@ void FtDynamicDecode<T>::forward(th::Tensor const& logits, int const step, int c
     th::optional<th::Tensor> sequence_lengths_opt, th::optional<th::Tensor> cum_log_probs_opt,
     th::optional<th::Tensor> output_log_probs_opt, th::optional<th::Tensor> output_log_probs_tiled_opt,
     th::optional<th::Tensor> parent_ids_opt, th::optional<th::Tensor> tgt_cache_indirection_opt,
-    th::optional<th::Tensor> beam_hyps_output_ids_tgt_opt, th::optional<th::Tensor> beam_hyps_sequence_lengths_tgt_opt,
-    th::optional<th::Tensor> beam_hyps_cum_log_probs_opt, th::optional<th::Tensor> beam_hyps_normed_scores_opt,
-    th::optional<th::Tensor> beam_hyps_log_probs_opt, th::optional<th::Tensor> beam_hyps_min_normed_scores_opt,
+    th::optional<th::Tensor> beam_hyps_output_ids_cba_opt, th::optional<th::Tensor> beam_hyps_seq_len_cba_opt,
+    th::optional<th::Tensor> beam_hyps_cum_log_probs_cba_opt, th::optional<th::Tensor> beam_hyps_normed_scores_cba_opt,
+    th::optional<th::Tensor> beam_hyps_log_probs_cba_opt, th::optional<th::Tensor> beam_hyps_min_normed_scores_opt,
     th::optional<th::Tensor> beam_hyps_num_beams_opt, th::optional<th::Tensor> beam_hyps_is_done_opt,
     bool const use_beam_hyps)
 {
@@ -196,13 +196,13 @@ void FtDynamicDecode<T>::forward(th::Tensor const& logits, int const step, int c
         // Additional parameters for beam search
         outputParams.beamHypotheses = std::make_shared<tensorrt_llm::kernels::BeamHypotheses>();
         safeUpdatePtr<bool>(beam_hyps_is_done_opt, outputParams.beamHypotheses->is_done);
-        safeUpdatePtr<float>(beam_hyps_cum_log_probs_opt, outputParams.beamHypotheses->cum_log_probs_cba);
-        safeUpdatePtr<float>(beam_hyps_log_probs_opt, outputParams.beamHypotheses->log_probs_cba);
+        safeUpdatePtr<float>(beam_hyps_cum_log_probs_cba_opt, outputParams.beamHypotheses->cum_log_probs_cba);
+        safeUpdatePtr<float>(beam_hyps_log_probs_cba_opt, outputParams.beamHypotheses->log_probs_cba);
         safeUpdatePtr<float>(beam_hyps_min_normed_scores_opt, outputParams.beamHypotheses->min_normed_scores);
-        safeUpdatePtr<float>(beam_hyps_normed_scores_opt, outputParams.beamHypotheses->normed_scores_cba);
+        safeUpdatePtr<float>(beam_hyps_normed_scores_cba_opt, outputParams.beamHypotheses->normed_scores_cba);
         safeUpdatePtr<int>(beam_hyps_num_beams_opt, outputParams.beamHypotheses->num_beams);
-        safeUpdatePtr<int>(beam_hyps_output_ids_tgt_opt, outputParams.beamHypotheses->output_ids_cba);
-        safeUpdatePtr<int>(beam_hyps_sequence_lengths_tgt_opt, outputParams.beamHypotheses->seq_len_cba);
+        safeUpdatePtr<int>(beam_hyps_output_ids_cba_opt, outputParams.beamHypotheses->output_ids_cba);
+        safeUpdatePtr<int>(beam_hyps_seq_len_cba_opt, outputParams.beamHypotheses->seq_len_cba);
         // TODO: move the assignment below into beamSearchLayer.cu
         safeUpdatePtr<int32_t const>(input_lengths_opt, outputParams.beamHypotheses->input_lengths);
     }
@@ -309,25 +309,25 @@ th::Tensor DynamicDecodeOp::forward(
     th::optional<th::Tensor> no_repeat_ngram_size_opt,  // [BS], int
     th::optional<th::Tensor> src_cache_indirection_opt, // [local_BS, BM, mSL], int
     // Outputs
-    th::Tensor output_token_ids,                           // [BS, BM, mSL], variables for output
-    th::Tensor newTokens,                                  // [BS, BM, 1], int
-    th::optional<th::Tensor> finished_input,               // [BS, BM], uint8
-    th::optional<th::Tensor> finished_output,              // [BS, BM], uint8
-    th::optional<th::Tensor> sequence_lengths_opt,         // [BS*BM], int, length of the current sequences
-    th::optional<th::Tensor> cum_log_probs_opt,            // [BS, BM], float
-    th::optional<th::Tensor> output_log_probs_opt,         // [BS, BM, mSL], float
-    th::optional<th::Tensor> output_log_probs_tiled_opt,   // [mSL, BS, BM], float, transpose of output_log_probs_opt
-    th::optional<th::Tensor> parent_ids_opt,               // [BS, BM, mSL], int
-    th::optional<th::Tensor> tgt_cache_indirection_opt,    // [local_BS, BM, mSL], int
-    th::optional<th::Tensor> beam_hyps_output_ids_tgt_opt, // [BS, BM*2, mSL], int
-    th::optional<th::Tensor> beam_hyps_sequence_lengths_tgt_opt, // [BS, BM*2], int
-    th::optional<th::Tensor> beam_hyps_cum_log_probs_opt,        // [BS, BM*2], float
-    th::optional<th::Tensor> beam_hyps_normed_scores_opt,        // [BS, BM*2], float
-    th::optional<th::Tensor> beam_hyps_log_probs_opt,            // [BS, BM*2, mSL], float
-    th::optional<th::Tensor> beam_hyps_min_normed_scores_opt,    // [BS], float
-    th::optional<th::Tensor> beam_hyps_num_beams_opt,            // [BS], int
-    th::optional<th::Tensor> beam_hyps_is_done_opt,              // [BS], bool
-    bool const use_beam_hyps                                     //
+    th::Tensor output_token_ids,                              // [BS, BM, mSL], variables for output
+    th::Tensor newTokens,                                     // [BS, BM, 1], int
+    th::optional<th::Tensor> finished_input,                  // [BS, BM], uint8
+    th::optional<th::Tensor> finished_output,                 // [BS, BM], uint8
+    th::optional<th::Tensor> sequence_lengths_opt,            // [BS*BM], int, length of the current sequences
+    th::optional<th::Tensor> cum_log_probs_opt,               // [BS, BM], float
+    th::optional<th::Tensor> output_log_probs_opt,            // [BS, BM, mSL], float
+    th::optional<th::Tensor> output_log_probs_tiled_opt,      // [mSL, BS, BM], float, transpose of output_log_probs_opt
+    th::optional<th::Tensor> parent_ids_opt,                  // [BS, BM, mSL], int
+    th::optional<th::Tensor> tgt_cache_indirection_opt,       // [local_BS, BM, mSL], int
+    th::optional<th::Tensor> beam_hyps_output_ids_cba_opt,    // [BS, BM*2, mSL], int
+    th::optional<th::Tensor> beam_hyps_seq_len_cba_opt,       // [BS, BM*2], int
+    th::optional<th::Tensor> beam_hyps_cum_log_probs_cba_opt, // [BS, BM*2], float
+    th::optional<th::Tensor> beam_hyps_normed_scores_cba_opt, // [BS, BM*2], float
+    th::optional<th::Tensor> beam_hyps_log_probs_cba_opt,     // [BS, BM*2, mSL], float
+    th::optional<th::Tensor> beam_hyps_min_normed_scores_opt, // [BS], float
+    th::optional<th::Tensor> beam_hyps_num_beams_opt,         // [BS], int
+    th::optional<th::Tensor> beam_hyps_is_done_opt,           // [BS], bool
+    bool const use_beam_hyps                                  //
 )
 {
     CHECK_INPUT(logits, scalar_type_);
@@ -370,9 +370,9 @@ th::Tensor DynamicDecodeOp::forward(
         // Outputs
         output_token_ids, newTokens, should_stop, finished_input, finished_output, sequence_lengths_opt,
         cum_log_probs_opt, output_log_probs_opt, output_log_probs_tiled_opt, parent_ids_opt, tgt_cache_indirection_opt,
-        beam_hyps_output_ids_tgt_opt, beam_hyps_sequence_lengths_tgt_opt, beam_hyps_cum_log_probs_opt,
-        beam_hyps_normed_scores_opt, beam_hyps_log_probs_opt, beam_hyps_min_normed_scores_opt, beam_hyps_num_beams_opt,
-        beam_hyps_is_done_opt, use_beam_hyps);
+        beam_hyps_output_ids_cba_opt, beam_hyps_seq_len_cba_opt, beam_hyps_cum_log_probs_cba_opt,
+        beam_hyps_normed_scores_cba_opt, beam_hyps_log_probs_cba_opt, beam_hyps_min_normed_scores_opt,
+        beam_hyps_num_beams_opt, beam_hyps_is_done_opt, use_beam_hyps);
 
     return should_stop;
 }

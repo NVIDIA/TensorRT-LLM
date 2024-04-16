@@ -16,120 +16,80 @@
 
 from pathlib import Path
 
-import numpy as np
 import run
-import torch
+
+resources_dir = Path(__file__).parent.resolve().parent
+model_path = resources_dir / "models"
 
 
 def generate_output(
     model_name: str = "",
-    engine_kind: str = "fp16-plugin",
-    num_batchs: int = 1,
     num_beams: int = 1,
-    max_output_len: int = 512,
+    max_output_len: int = 8,
+    engine_kind: str = "fp32-plugin",
     output_logits: bool = False,
+    output_cum_log_probs: bool = False,
+    output_log_probs: bool = False,
 ):
-
-    examples_chatglm_dir = Path(
-        __file__).parent.parent.parent.parent.parent / "examples/chatglm"
-    resources_dir = Path(__file__).parent.parent.resolve()
-
-    engine_dir = resources_dir / 'models' / 'rt_engine' / model_name
-    '''
+    hf_path = model_path / model_name
     # we do not distinguish TP / PP / engine_kind yet
     tp_size = 1
     pp_size = 1
-    tp_pp_dir = 'tp' + str(tp_size) + '-pp' + str(pp_size) + '-gpu/'
-    engine_dir = engine_dir / engine_kind / tp_pp_dir
-    '''
-    data_output_dir = resources_dir / 'data' / model_name
-    data_output_dir.mkdir(exist_ok=True, parents=True)
-    data_input_file_name = f"inputId-BS{num_batchs}-BM{num_beams}.npy"
-    data_output_file_name = f"outputId-BS{num_batchs}-BM{num_beams}.npy"
-    input_text = [
-        "Born in north-east France, Soyer trained as a",
-        "Jen-Hsun Huang was born in Tainan, Taiwan, in 1963. His family",
-    ]
-
-    if num_batchs <= 2:
-        input_text = input_text[:num_batchs]
+    tp_pp_dir = f"tp{tp_size}-pp{pp_size}-gpu/"
+    engine_dir = model_path / 'rt_engine' / model_name / engine_kind / tp_pp_dir
+    data_input_file_name = resources_dir / "data" / f"input_tokens_{model_name}.npy"
+    if num_beams <= 1:
+        output_dir = resources_dir / "data" / model_name / "sampling"
     else:
-        input_text = input_text + input_text[-1] * (num_batchs - 2)
+        output_dir = resources_dir / "data" / model_name / f"beam_search_{num_beams}"
+    output_dir.mkdir(exist_ok=True, parents=True)
+    data_output_npy_file_name = output_dir / f"output_tokens.npy"
+    data_output_csv_file_name = output_dir / f"output_tokens.csv"
 
-    args = run.parse_arguments([
+    args_list = [
         '--engine_dir',
         str(engine_dir),
         '--tokenizer_dir',
-        str(examples_chatglm_dir / model_name),
-        '--input_text',
-        *input_text,
+        str(hf_path),
+        '--input_file',
+        str(data_input_file_name),
         '--output_npy',
-        str(data_output_dir / data_output_file_name),
+        str(data_output_npy_file_name),
+        '--output_csv',
+        str(data_output_csv_file_name),
         '--max_output_len',
         str(max_output_len),
         '--num_beams',
         str(num_beams),
-    ])
+        #'--use_py_session',
+    ]
 
-    # Since main in run.py does not save input_ids, we save it manually
-    model_name, model_version = run.read_model_name(args.engine_dir)
-    tokenizer, pad_id, end_id = run.load_tokenizer(
-        tokenizer_dir=args.tokenizer_dir,
-        model_name=model_name,
-        model_version=model_version,
-    )
-    batch_input_ids = run.parse_input(
-        tokenizer,
-        input_text=input_text,
-        prompt_template=None,
-        input_file=None,
-        add_special_tokens=True,
-        max_input_length=512,
-        pad_id=pad_id,
-        num_prepend_vtokens=[],
-        model_name=model_name,
-        model_version=model_version,
-    )
-    input_len = [x.size(0) for x in batch_input_ids]
-    max_input_len = max(input_len)
+    output_logits_npy = None
+    if output_logits:
+        output_logits_npy = str(output_dir / 'logits.npy')
+        args_list.extend(['--output_logits_npy', str(output_logits_npy)])
 
-    batch_input_ids_padding = torch.zeros([num_batchs, max_input_len],
-                                          dtype=torch.int32) + end_id
+    output_cum_log_probs_npy = None
+    if output_cum_log_probs:
+        output_cum_log_probs_npy = str(output_dir / 'cum_log_probs.npy')
+        args_list.extend(
+            ['--output_cum_log_probs_npy',
+             str(output_cum_log_probs_npy)])
 
-    for i, sample in enumerate(batch_input_ids):
-        # padding to left
-        batch_input_ids_padding[i, :len(sample)] = sample
-        """
-        # padding to right
-        nPadding = 0
-        for token in sample:
-            if token == pad_id:
-                nPadding += 1
-            else:
-                break
-        batch_input_ids_padding[i, :len(sample[nPadding:])] = sample[nPadding:]
-        """
-    batch_input_ids = batch_input_ids_padding
+    output_log_probs_npy = None
+    if output_log_probs:
+        output_log_probs_npy = str(output_dir / 'log_probs.npy')
+        args_list.extend(['--output_log_probs_npy', str(output_log_probs_npy)])
 
-    np.save(data_output_dir / data_input_file_name,
-            batch_input_ids.detach().cpu().numpy())
-
+    args = run.parse_arguments(args_list)
     run.main(args)
-
-    output_data = np.load(args.output_npy)
-    np.save(args.output_npy, output_data.reshape(num_batchs, num_beams, -1))
 
 
 if __name__ == '__main__':
-
-    generate_output(model_name='chatglm_6b', num_batchs=1, num_beams=1)
-
-    generate_output(model_name='chatglm2_6b', num_batchs=1, num_beams=1)
-    generate_output(model_name='chatglm2_6b', num_batchs=2, num_beams=1)
-    generate_output(model_name='chatglm2_6b', num_batchs=1, num_beams=2)
-
-    generate_output(model_name='chatglm3_6b', num_batchs=1, num_beams=1)
-    generate_output(model_name='chatglm3_6b', num_batchs=2, num_beams=1)
-    generate_output(model_name='chatglm3_6b', num_batchs=1, num_beams=2)
-
+    generate_output(model_name='chatglm-6b', num_beams=1)
+    generate_output(model_name='chatglm-6b', num_beams=2)
+    generate_output(model_name='chatglm2-6b', num_beams=1)
+    generate_output(model_name='chatglm2-6b', num_beams=2)
+    generate_output(model_name='chatglm3-6b', num_beams=1)
+    generate_output(model_name='chatglm3-6b', num_beams=2)
     print("Done")

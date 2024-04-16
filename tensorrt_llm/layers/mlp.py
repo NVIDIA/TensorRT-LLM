@@ -16,7 +16,6 @@
 from ..functional import ACT2FN, concat
 from ..module import Module
 from ..quantization import QuantMode
-from ..quantization.layers import FP8Linear, FP8RowLinear
 from .linear import ColumnLinear, RowLinear
 from .lora import LoraRuntimeParams
 
@@ -39,40 +38,25 @@ class MLP(Module):
             raise ValueError(
                 'unsupported activation function: {}'.format(hidden_act))
         fc_output_size = 2 * ffn_hidden_size if hidden_act == 'swiglu' else ffn_hidden_size
-        self.use_fp8_qdq = quant_mode.has_fp8_qdq()
 
-        if self.use_fp8_qdq:
-            self.fc = FP8Linear(hidden_size,
-                                fc_output_size,
-                                bias=bias,
-                                dtype=dtype,
-                                tp_group=tp_group,
-                                tp_size=tp_size,
-                                gather_output=False)
-            self.proj = FP8RowLinear(ffn_hidden_size,
-                                     hidden_size,
-                                     bias=bias,
-                                     dtype=dtype,
-                                     tp_group=tp_group,
-                                     tp_size=tp_size)
-        else:
-            self.fc = ColumnLinear(hidden_size,
-                                   fc_output_size,
-                                   bias=bias,
-                                   dtype=dtype,
-                                   tp_group=tp_group,
-                                   tp_size=tp_size,
-                                   gather_output=False)
-            self.proj = RowLinear(ffn_hidden_size,
-                                  hidden_size,
-                                  bias=bias,
-                                  dtype=dtype,
-                                  tp_group=tp_group,
-                                  tp_size=tp_size)
+        self.fc = ColumnLinear(hidden_size,
+                               fc_output_size,
+                               bias=bias,
+                               dtype=dtype,
+                               tp_group=tp_group,
+                               tp_size=tp_size,
+                               gather_output=False)
+        self.proj = RowLinear(ffn_hidden_size,
+                              hidden_size,
+                              bias=bias,
+                              dtype=dtype,
+                              tp_group=tp_group,
+                              tp_size=tp_size)
 
         self.hidden_act = hidden_act
         self.dtype = dtype
         self.bias = bias
+        self.quant_mode = quant_mode
 
     def forward(self, hidden_states, lora_layer_params=None):
         mlp_fc_lora_params = None
@@ -115,29 +99,16 @@ class GatedMLP(MLP):
 
         self.hidden_size = hidden_size
         self.ffn_hidden_size = ffn_hidden_size
-        self.hidden_act = hidden_act
-        self.bias = bias
-        self.dtype = dtype
         self.tp_group = tp_group
         self.tp_size = tp_size
-        self.quant_mode = quant_mode
 
-        if self.use_fp8_qdq:
-            self.gate = FP8Linear(hidden_size,
-                                  ffn_hidden_size,
-                                  bias=bias,
-                                  dtype=dtype,
-                                  tp_group=tp_group,
-                                  tp_size=tp_size,
-                                  gather_output=False)
-        else:
-            self.gate = ColumnLinear(hidden_size,
-                                     ffn_hidden_size,
-                                     bias=bias,
-                                     dtype=dtype,
-                                     tp_group=tp_group,
-                                     tp_size=tp_size,
-                                     gather_output=False)
+        self.gate = ColumnLinear(hidden_size,
+                                 ffn_hidden_size,
+                                 bias=bias,
+                                 dtype=dtype,
+                                 tp_group=tp_group,
+                                 tp_size=tp_size,
+                                 gather_output=False)
 
     def forward(self, hidden_states, lora_layer_params=None):
 
@@ -187,40 +158,22 @@ class FusedGatedMLP(Module):
         self.tp_group = tp_group
         self.tp_size = tp_size
         self.quant_mode = quant_mode
-        self.use_fp8_qdq = quant_mode.has_fp8_qdq()
 
-        if self.use_fp8_qdq:
-            self.fused_fc = FP8Linear(
-                self.hidden_size,
-                self.ffn_hidden_size * 2,
-                bias=self.bias,
-                dtype=self.dtype,
-                tp_group=self.tp_group,
-                tp_size=self.tp_size,
-                gather_output=False,
-            )
-            self.proj = FP8RowLinear(ffn_hidden_size,
-                                     hidden_size,
-                                     bias=bias,
-                                     dtype=dtype,
-                                     tp_group=tp_group,
-                                     tp_size=tp_size)
-        else:
-            self.fused_fc = ColumnLinear(
-                self.hidden_size,
-                self.ffn_hidden_size * 2,
-                bias=self.bias,
-                dtype=self.dtype,
-                tp_group=self.tp_group,
-                tp_size=self.tp_size,
-                gather_output=False,
-            )
-            self.proj = RowLinear(ffn_hidden_size,
-                                  hidden_size,
-                                  bias=bias,
-                                  dtype=dtype,
-                                  tp_group=tp_group,
-                                  tp_size=tp_size)
+        self.fused_fc = ColumnLinear(
+            self.hidden_size,
+            self.ffn_hidden_size * 2,
+            bias=self.bias,
+            dtype=self.dtype,
+            tp_group=self.tp_group,
+            tp_size=self.tp_size,
+            gather_output=False,
+        )
+        self.proj = RowLinear(ffn_hidden_size,
+                              hidden_size,
+                              bias=bias,
+                              dtype=dtype,
+                              tp_group=tp_group,
+                              tp_size=tp_size)
 
     def forward(self, hidden_states, lora_layer_params=None):
         # Combine the following pattern

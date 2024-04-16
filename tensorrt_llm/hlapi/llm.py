@@ -17,13 +17,14 @@ from tensorrt_llm.bindings import KvCacheConfig, SchedulerPolicy
 
 from .. import bindings as tllm
 from .._utils import mpi_barrier, mpi_rank, release_gc
-from ..auto_parallel.config import AutoParallelConfig, infer_cluster_key
+from ..auto_parallel import AutoParallelConfig, infer_cluster_config
 from ..bindings import KvCacheConfig, SchedulerPolicy
 from ..builder import BuildConfig, Engine, EngineConfig, PluginConfig, build
 from ..executor import GenerationExecutor, GenerationResult
 from ..logger import logger
 from ..mapping import Mapping
-from ..models.modeling_utils import PretrainedConfig, QuantConfig, load_model
+from ..models.modeling_utils import (PretrainedConfig, QuantAlgo, QuantConfig,
+                                     load_model)
 from ..module import Module
 from .mpi_session import MPINodeState, MpiSession
 from .tokenizer import TokenizerBase, TransformersTokenizer
@@ -158,8 +159,6 @@ class ModelConfig:
         self._engine_config: Optional[EngineConfig] = None
 
         self.auto_parallel_config = AutoParallelConfig(
-            cluster_key=infer_cluster_key(
-                allow_fallback=self.parallel_config.auto_parallel),
             sharded_io_allowlist=[
                 "past_key_value_\\d+",
                 "present_key_value_\\d*",
@@ -167,6 +166,7 @@ class ModelConfig:
             same_buffer_io={
                 "past_key_value_(\\d+)": "present_key_value_\\1",
             },
+            **infer_cluster_config(),
         )
 
         # Load parallel_config from the engine.
@@ -372,6 +372,8 @@ class LLM:
 
         # Update the dependency config if necessary
         # When got an engine, the plugin config are fixed, shouldn't be altered.
+        # TODO[chunweiy]: Refine the rules here and make them easy to be updated through versions
+        # TODO[chunweiy]: Deal with the rules those depend on each other
         if self.config.model_format is not _ModelFormatKind.TLLM_ENGINE:
             if self.kv_cache_config is not None:
                 if self.kv_cache_config.enable_block_reuse:
@@ -380,6 +382,8 @@ class LLM:
                     )
                     self.config._update_plugin_config("use_paged_context_fmha",
                                                       True)
+            if self.config.quant_config.quant_algo is QuantAlgo.FP8:
+                self.enable_chunked_context = False
             if self.enable_chunked_context is not None:
                 self.config._update_plugin_config("enable_chunked_context",
                                                   self.enable_chunked_context)

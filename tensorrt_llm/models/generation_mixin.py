@@ -102,8 +102,9 @@ class GenerationMixin:
         layers_range = mapping.pp_layers(num_layers)
         num_pp_layers = len(layers_range)
         past_key_value = []
-        kv_cache_block_pointers = None
-        host_kv_cache_block_pointers = None
+        kv_cache_block_offsets = None
+        host_kv_cache_block_offsets = None
+        host_kv_cache_pool_pointers = None
         if use_cache:
             if not paged_kv_cache:
                 for i in layers_range:
@@ -140,25 +141,31 @@ class GenerationMixin:
                         math.ceil(kv_cache_range[0][2] / tokens_per_block)
                     ]] * num_profiles
 
-                kv_cache_block_pointers = Tensor(
-                    name=f'kv_cache_block_pointers',
-                    dtype=trt.int64,
-                    shape=[num_pp_layers, -1, 2, -1],
+                kv_cache_block_offsets = Tensor(name=f'kv_cache_block_offsets',
+                                                dtype=trt.int32,
+                                                shape=[-1, 2, -1],
+                                                dim_range=OrderedDict([
+                                                    ('batch_size_beam_width',
+                                                     bb_range),
+                                                    ('kv', [2] * num_profiles),
+                                                    ('max_blocks_per_seq',
+                                                     max_blocks_per_seq_range),
+                                                ]))
+                host_kv_cache_block_offsets = Tensor(
+                    name=f'host_kv_cache_block_offsets',
+                    dtype=trt.int32,
+                    shape=[-1, 2, -1],
                     dim_range=OrderedDict([
-                        ('num_layers', [num_pp_layers] * num_profiles),
                         ('batch_size_beam_width', bb_range),
                         ('kv', [2] * num_profiles),
                         ('max_blocks_per_seq', max_blocks_per_seq_range),
                     ]))
-                host_kv_cache_block_pointers = Tensor(
-                    name=f'host_kv_cache_block_pointers',
+                host_kv_cache_pool_pointers = Tensor(
+                    name=f'host_kv_cache_pool_pointers',
                     dtype=trt.int64,
-                    shape=[num_pp_layers, -1, 2, -1],
+                    shape=[2],
                     dim_range=OrderedDict([
-                        ('num_layers', [num_pp_layers] * num_profiles),
-                        ('batch_size_beam_width', bb_range),
-                        ('kv', [2] * num_profiles),
-                        ('max_blocks_per_seq', max_blocks_per_seq_range),
+                        ('num_pools', [2] * num_profiles),
                     ]))
 
                 for i in layers_range:
@@ -224,6 +231,7 @@ class GenerationMixin:
             )
 
         if use_gpt_attention_plugin:
+            # TODO(rkobus): change shape to [1]
             host_max_attention_window_sizes = Tensor(
                 name=f'host_max_attention_window_sizes',
                 dtype=trt.int32,
@@ -258,8 +266,9 @@ class GenerationMixin:
             'host_sink_token_length': host_sink_token_length,
             'past_key_value': past_key_value,
             'cache_indirection': cache_indirection,
-            'kv_cache_block_pointers': kv_cache_block_pointers,
-            'host_kv_cache_block_pointers': host_kv_cache_block_pointers,
+            'kv_cache_block_offsets': kv_cache_block_offsets,
+            'host_kv_cache_block_offsets': host_kv_cache_block_offsets,
+            'host_kv_cache_pool_pointers': host_kv_cache_pool_pointers,
             'context_lengths': context_lengths,
             'host_context_lengths': host_context_lengths,
             'host_request_types': host_request_types,

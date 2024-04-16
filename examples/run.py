@@ -398,7 +398,7 @@ def main(args):
     if args.medusa_choices is not None:
         args.medusa_choices = ast.literal_eval(args.medusa_choices)
         assert args.use_py_session, "Medusa is only supported by py_session"
-        assert args.temperature == 0, "Medusa should use temperature == 0"
+        assert args.temperature == 1.0, "Medusa should use temperature == 1.0"
         assert args.num_beams == 1, "Medusa should use num_beams == 1"
         runner_kwargs.update(medusa_choices=args.medusa_choices)
     if not args.use_py_session:
@@ -434,7 +434,7 @@ def main(args):
             output_cum_log_probs=(args.output_cum_log_probs_npy != None),
             output_log_probs=(args.output_log_probs_npy != None),
             lora_uids=args.lora_task_uids,
-            prompt_table_path=args.prompt_table_path,
+            prompt_table=args.prompt_table_path,
             prompt_tasks=args.prompt_tasks,
             streaming=args.streaming,
             output_sequence_lengths=True,
@@ -518,7 +518,7 @@ def main(args):
                     stop_words_list=stop_words_list,
                     bad_words_list=bad_words_list,
                     lora_uids=args.lora_task_uids,
-                    prompt_table_path=args.prompt_table_path,
+                    prompt_table=args.prompt_table_path,
                     prompt_tasks=args.prompt_tasks,
                     streaming=args.streaming,
                     output_sequence_lengths=True,
@@ -546,7 +546,7 @@ def main(args):
                     stop_words_list=stop_words_list,
                     bad_words_list=bad_words_list,
                     lora_uids=args.lora_task_uids,
-                    prompt_table_path=args.prompt_table_path,
+                    prompt_table=args.prompt_table_path,
                     prompt_tasks=args.prompt_tasks,
                     streaming=args.streaming,
                     output_sequence_lengths=True,

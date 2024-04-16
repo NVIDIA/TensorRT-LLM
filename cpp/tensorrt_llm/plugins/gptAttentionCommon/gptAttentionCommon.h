@@ -22,6 +22,7 @@
 #include "tensorrt_llm/kernels/contextFusedMultiHeadAttention/fused_multihead_attention_common.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunner.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
+#include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include <cassert>
 #include <set>
@@ -89,6 +90,8 @@ protected:
     {
         T const* attention_input;
         T const* qkv_bias;
+        // Rotary cos sin cache buffer to avoid re-computing.
+        float2 const* rotary_cos_sin;
         int32_t input_seq_length; // padded input length
         int32_t max_past_kv_len;
         // By default, max_attention_window == cyclic_attention_window_size
@@ -106,8 +109,10 @@ protected:
         T const* alibi_slopes;
         T* context_buf;
         void* key_value_cache;
-        void* block_pointers;
-        void* host_block_pointers;
+        kernels::KVBlockArray::DataType* block_offsets;
+        kernels::KVBlockArray::DataType* host_block_offsets;
+        void* host_primary_pool_pointer;
+        void* host_secondary_pool_pointer;
         int32_t batch_size;
         int32_t num_tokens;
         int32_t max_blocks_per_sequence;
@@ -133,7 +138,7 @@ protected:
         // NOTE: input_seq_length might be larger than one in the medusa mode.
         int32_t input_seq_length;
         int32_t const* sequence_lengths;
-        int32_t past_kv_length;
+        int32_t max_past_kv_length;
         int32_t beam_width;
         int32_t const* context_lengths;
         float const* kv_scale_orig_quant;
@@ -142,7 +147,9 @@ protected:
         T const* alibi_slopes;
         T* context_buf;
         void* key_value_cache;
-        void* block_pointers;
+        kernels::KVBlockArray::DataType* block_offsets;
+        void* host_primary_pool_pointer;
+        void* host_secondary_pool_pointer;
         // By default, max_attention_window == cyclic_attention_window_size
         // unless each layer has different cyclic kv cache length.
         // Max cache capacity (used to allocate KV cache)
@@ -261,9 +268,6 @@ protected:
     // The default copy constructor will leave it as nullptr. clone() shall initialize it.
     UniqPtrWNullCopy<tensorrt_llm::kernels::MHARunner> mFMHARunner;
     UniqPtrWNullCopy<tensorrt_llm::kernels::DecoderXQARunner> mDecoderXQARunner;
-    // Cache the grid_size and block_size that gives the highest occupancy for
-    //  invokeApplyBiasRopeUpdateKVCache.
-    int2 mLaunchGridBlockCache = make_int2(0, 0);
 
     bool mMultiBlockMode;
     bool mEnableXQA;

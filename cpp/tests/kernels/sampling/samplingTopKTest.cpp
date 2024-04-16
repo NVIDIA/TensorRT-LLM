@@ -50,27 +50,44 @@ protected:
         SamplingKernelTestParam const& params, tensorrt_llm::runtime::ITensor::SharedPtr& workspaceDevice) override
     {
         auto const maxBatchSize = 2 * params.batchSize;
+
+        tk::TopKSamplingKernelParams<T> kernelParams;
+        kernelParams.logProbs = params.useLogitsPtrs ? nullptr : bufferCast<T>(*this->mProbsDevice);
+        kernelParams.logProbsPtrs = params.useLogitsPtrs
+            ? reinterpret_cast<T const* const*>(bufferCast<int64_t>(*this->mProbsPtrsDevice))
+            : nullptr;
+        kernelParams.outputIdsPtrs = bufferCast<int32_t*>(*this->mIdsPtrHost);
+        kernelParams.workspace = workspaceDevice->data();
+        kernelParams.maxTopP = params.topP;
+        kernelParams.topPs = bufferCast<float>(*this->mTopPsDevice);
+        kernelParams.maxTopK = this->mMaxTopK;
+        kernelParams.topKs = bufferCast<int32_t>(*this->mTopKsDevice);
+        kernelParams.sequenceLengths = bufferCast<int32_t>(*this->mSeqLengthsDevice);
+        kernelParams.endIds = bufferCast<int32_t>(*this->mEndIdsDevice);
+        kernelParams.batchSlots = bufferCast<int32_t>(*this->mBatchSlots);
+        kernelParams.finishedInput = reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
+            bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(*this->mFinishedDevice));
+        kernelParams.finishedOutput = reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
+            bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(*this->mFinishedDevice));
+        kernelParams.skipDecode = bufferCast<bool>(*this->mSkipDecodeDevice);
+        kernelParams.cumLogProbs = params.returnAllTopK || params.maxTokensPerStep > 1
+            ? nullptr
+            : bufferCast<float>(*this->mCumLogProbsDevice);
+        kernelParams.outputLogProbs = params.returnAllTopK || params.maxTokensPerStep > 1
+            ? nullptr
+            : bufferCast<float>(*this->mOutputLogProbsDevice);
+        kernelParams.curandState = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*this->mCurandStatesDevice));
+        kernelParams.batchSize = params.batchSize;
+        kernelParams.maxBatchSize = maxBatchSize;
+        kernelParams.maxTokensPerStep = params.maxTokensPerStep;
+        kernelParams.tokensPerStep = bufferCast<int32_t>(*this->mTokensPerStep);
+        kernelParams.vocabSizePadded = params.vocabSize;
+        kernelParams.normalizeLogProbs = params.normalizeLogProbs;
+        kernelParams.logitsHasProbs = params.logitsHasProbs;
+        kernelParams.returnAllTopK = params.returnAllTopK;
+
         // Perform batched TopK sampling
-        tk::invokeBatchTopKSampling(workspaceDevice->data(),
-            // Note that the kernel needs vocab probs instead of
-            // log-prob if cum_log_probs or output_log_probs are
-            // provided. It's because the sampling layer already
-            // preprocesses log_prob_buf when those are provided.
-            params.useLogitsPtrs ? nullptr : bufferCast<T>(*this->mProbsDevice),
-            params.useLogitsPtrs ? reinterpret_cast<T const* const*>(bufferCast<int64_t>(*this->mProbsPtrsDevice))
-                                 : nullptr,
-            bufferCast<int32_t*>(*this->mIdsPtrHost), nullptr, bufferCast<int32_t>(*this->mSeqLengthsDevice),
-            reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
-                bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(*this->mFinishedDevice)),
-            reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
-                bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(*this->mFinishedDevice)),
-            bufferCast<float>(*this->mCumLogProbsDevice), bufferCast<float>(*this->mOutputLogProbsDevice),
-            reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*this->mCurandStatesDevice)), this->mMaxTopK,
-            bufferCast<int32_t>(*this->mTopKsDevice), params.topP, bufferCast<float>(*this->mTopPsDevice),
-            params.vocabSize, bufferCast<int32_t>(*this->mEndIdsDevice), bufferCast<int32_t>(*this->mBatchSlots),
-            this->mStream->get(), params.batchSize, maxBatchSize, bufferCast<int32_t>(*this->mTokensPerStep),
-            params.maxTokensPerStep, 0, bufferCast<bool>(*this->mSkipDecodeDevice), params.normalizeLogProbs,
-            params.logitsHasProbs, params.returnAllTopK);
+        tk::invokeBatchTopKSampling(kernelParams, this->mStream->get());
     }
 };
 

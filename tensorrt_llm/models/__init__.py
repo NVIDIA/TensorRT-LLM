@@ -91,5 +91,7 @@ MODEL_MAP = {
     'SkyworkForCausalLM': LLaMAForCausalLM,
     'GemmaForCausalLM': GemmaForCausalLM,
     'QWenForCausalLM': QWenForCausalLM,
+    'EncoderModel': EncoderModel,
+    'DecoderModel': DecoderModel,
     'DbrxForCausalLM': DbrxForCausalLM,
 }

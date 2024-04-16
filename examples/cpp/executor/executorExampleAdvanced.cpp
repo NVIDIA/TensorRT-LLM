@@ -194,7 +194,7 @@ std::unordered_map<tle::IdType, tle::BeamTokens> waitForResponses(
     {
         std::chrono::milliseconds waitTime(1);
         // Wait for any response
-        auto responses = executor.awaitResponses(std::nullopt, waitTime);
+        auto responses = executor.awaitResponses(waitTime);
         // Loop over the responses
         for (auto const& response : responses)
         {

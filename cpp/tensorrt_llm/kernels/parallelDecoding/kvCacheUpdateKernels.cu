@@ -17,10 +17,11 @@
 
 #include "kvCacheUpdateKernels.h"
 
-#include <array>
-
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
+
+#include <array>
+#include <vector>
 
 namespace tensorrt_llm::kernels::parallel_decoding
 {
@@ -232,11 +233,11 @@ void updateLinearKVCacheDraftTokenLocation(int const* seqAcceptedDraftTokenOffse
 {
     std::vector<KVLinearBuffer> kvLinearBuffers;
     kvLinearBuffers.reserve(layerCount);
-    int sizePerToken = numKVHeads * sizeInBytesPerKVHead;
+    auto const sizePerToken = numKVHeads * sizeInBytesPerKVHead;
     for (int i = 0; i < layerCount; i++)
     {
-        kvLinearBuffers.emplace_back(seqCount, 0, maxKVCacheLen, sizePerToken, maxKVCacheLen, 0, false);
-        kvLinearBuffers.back().data = pastKeyValueList[i];
+        kvLinearBuffers.emplace_back(
+            seqCount, maxKVCacheLen, sizePerToken, maxKVCacheLen, 0, false, pastKeyValueList[i]);
     }
     updateKVCacheDraftTokenLocation(kvLinearBuffers.data(), seqAcceptedDraftTokenOffsets,
         packedAcceptedDraftTokensIndices, pastKeyValueLengths, layerCount, seqCount, numKVHeads, sizeInBytesPerKVHead,
@@ -244,18 +245,25 @@ void updateLinearKVCacheDraftTokenLocation(int const* seqAcceptedDraftTokenOffse
 }
 
 void updateKVBlockArrayDraftTokenLocation(int const* seqAcceptedDraftTokenOffsets,
-    IndexType const* packedAcceptedDraftTokensIndices, int32_t const* pastKeyValueLengths, int64_t* const* pointerArray,
-    int layerCount, int seqCount, int numKVHeads, int sizeInBytesPerKVHead, int rewindDraftTokenCommonCount,
-    int* rewindDraftTokenSeparateAdjustments, int const* seqSlotRemapping, int maxKVCacheLen, int maxBlocksPerSeq,
-    int tokensPerBlock, cudaStream_t stream)
+    IndexType const* packedAcceptedDraftTokensIndices, int32_t const* pastKeyValueLengths, void* const* pointerArray,
+    KVBlockArray::DataType* offsetArray, int layerCount, int seqCount, int numKVHeads, int sizeInBytesPerKVHead,
+    int rewindDraftTokenCommonCount, int* rewindDraftTokenSeparateAdjustments, int const* seqSlotRemapping,
+    int maxKVCacheLen, int maxBlocksPerSeq, int tokensPerBlock, cudaStream_t stream)
 {
     std::vector<KVBlockArray> kvBlockArrays;
     kvBlockArrays.reserve(layerCount);
-    int sizePerToken = numKVHeads * sizeInBytesPerKVHead;
-    for (int i = 0; i < layerCount; i++)
+    auto const bytesPerToken = numKVHeads * sizeInBytesPerKVHead;
+    auto const bytesPerBlock = tokensPerBlock * bytesPerToken;
+    for (int layerIdx = 0; layerIdx < layerCount; layerIdx++)
     {
-        kvBlockArrays.emplace_back(seqCount, maxBlocksPerSeq, tokensPerBlock, sizePerToken, maxKVCacheLen, 0, false);
-        kvBlockArrays.back().data = pointerArray[i];
+        auto const layerOffset = layerIdx * 2 * bytesPerBlock;
+        auto* const primaryPoolPointer
+            = reinterpret_cast<void*>(reinterpret_cast<char*>(pointerArray[0]) + layerOffset);
+        auto* const secondaryPoolPointer
+            = reinterpret_cast<void*>(reinterpret_cast<char*>(pointerArray[1]) + layerOffset);
+
+        kvBlockArrays.emplace_back(seqCount, maxBlocksPerSeq, tokensPerBlock, bytesPerToken, maxKVCacheLen, 0,
+            primaryPoolPointer, secondaryPoolPointer, offsetArray);
     }
     updateKVCacheDraftTokenLocation(kvBlockArrays.data(), seqAcceptedDraftTokenOffsets,
         packedAcceptedDraftTokensIndices, pastKeyValueLengths, layerCount, seqCount, numKVHeads, sizeInBytesPerKVHead,
@@ -273,12 +281,13 @@ void updateLinearKVCacheDraftTokenLocationCommonRewind(int const* seqAcceptedDra
 }
 
 void updateKVBlockArrayDraftTokenLocationCommonRewind(int const* seqAcceptedDraftTokenOffsets,
-    IndexType const* packedAcceptedDraftTokensIndices, int32_t const* pastKeyValueLengths, int64_t* const* pointerArray,
-    int layerCount, int seqCount, int numKVHeads, int sizeInBytesPerKVHead, int rewindDraftTokenCount,
-    int const* seqSlotRemapping, int maxKVCacheLen, int maxBlocksPerSeq, int tokensPerBlock, cudaStream_t stream)
+    IndexType const* packedAcceptedDraftTokensIndices, int32_t const* pastKeyValueLengths, void* const* pointerArray,
+    KVBlockArray::DataType* offsetArray, int layerCount, int seqCount, int numKVHeads, int sizeInBytesPerKVHead,
+    int rewindDraftTokenCount, int const* seqSlotRemapping, int maxKVCacheLen, int maxBlocksPerSeq, int tokensPerBlock,
+    cudaStream_t stream)
 {
     updateKVBlockArrayDraftTokenLocation(seqAcceptedDraftTokenOffsets, packedAcceptedDraftTokensIndices,
-        pastKeyValueLengths, pointerArray, layerCount, seqCount, numKVHeads, sizeInBytesPerKVHead,
+        pastKeyValueLengths, pointerArray, offsetArray, layerCount, seqCount, numKVHeads, sizeInBytesPerKVHead,
         rewindDraftTokenCount, nullptr, seqSlotRemapping, maxKVCacheLen, maxBlocksPerSeq, tokensPerBlock, stream);
 }
 
@@ -293,12 +302,13 @@ void updateLinearKVCacheDraftTokenLocationSeparateRewind(int const* seqAcceptedD
 }
 
 void updateKVBlockArrayDraftTokenLocationSeparateRewind(int const* seqAcceptedDraftTokenOffsets,
-    IndexType const* packedAcceptedDraftTokensIndices, int32_t const* pastKeyValueLengths, int64_t* const* pointerArray,
-    int layerCount, int seqCount, int numKVHeads, int sizeInBytesPerKVHead, int* rewindDraftTokenCounts,
-    int const* seqSlotRemapping, int maxKVCacheLen, int maxBlocksPerSeq, int tokensPerBlock, cudaStream_t stream)
+    IndexType const* packedAcceptedDraftTokensIndices, int32_t const* pastKeyValueLengths, void* const* pointerArray,
+    KVBlockArray::DataType* offsetArray, int layerCount, int seqCount, int numKVHeads, int sizeInBytesPerKVHead,
+    int* rewindDraftTokenCounts, int const* seqSlotRemapping, int maxKVCacheLen, int maxBlocksPerSeq,
+    int tokensPerBlock, cudaStream_t stream)
 {
     updateKVBlockArrayDraftTokenLocation(seqAcceptedDraftTokenOffsets, packedAcceptedDraftTokensIndices,
-        pastKeyValueLengths, pointerArray, layerCount, seqCount, numKVHeads, sizeInBytesPerKVHead, 0,
+        pastKeyValueLengths, pointerArray, offsetArray, layerCount, seqCount, numKVHeads, sizeInBytesPerKVHead, 0,
         rewindDraftTokenCounts, seqSlotRemapping, maxKVCacheLen, maxBlocksPerSeq, tokensPerBlock, stream);
 }
 

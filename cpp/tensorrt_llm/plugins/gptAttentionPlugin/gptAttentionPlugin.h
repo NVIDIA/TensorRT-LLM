@@ -54,8 +54,9 @@ namespace tensorrt_llm::plugins
 //     mode,
 //                      all elements must be identical.
 //     8.  past_key_value_pool [batch_size, 2, local_num_kv_heads, max_seq_len, head_size] or
-//         block_pointers [num_layers, batch_size, 2, max_blocks_per_seq] if paged kv cache (optional)
-//     8.1 host_block_pointers [num_layers, batch_size, 2, max_blocks_per_seq] if paged kv cache (optional)
+//         block_offsets [batch_size, 2, max_blocks_per_seq] if paged kv cache (optional)
+//     8.1 host_block_offsets [batch_size, 2, max_blocks_per_seq] if paged kv cache (optional)
+//     8.2 host_pool_pointers [2] if paged kv cache (optional)
 //     9.  kv_cache_quantization_scale [1] (optional)
 //     10. kv_cache_dequantization_scale [1] (optional)
 //     11. alibi_slopes [num_heads] (optional for ALiBi position embedding)
@@ -159,12 +160,14 @@ private:
         CONTEXT_LENGTHS,
         CACHE_INDIR,
         REQUEST_TYPES,
-        KV_CACHE_BLOCK_POINTERS,
-        HOST_KV_CACHE_BLOCK_POINTERS,
+        KV_CACHE_BLOCK_OFFSETS,
+        HOST_KV_CACHE_BLOCK_OFFSETS,
+        HOST_KV_CACHE_POOL_POINTERS,
         PAST_KEY_VALUE,
         KV_CACHE_QUANTIZATION_SCALE,
         KV_CACHE_DEQUANTIZATION_SCALE,
         ATTENTION_OUTPUT_QUANTIZATION_SCALE,
+        ROTARY_COS_SIN,
         ALIBI_SLOPES,
         RELATIVE_ATTENTION_BIAS,
         CROSS_QKV,

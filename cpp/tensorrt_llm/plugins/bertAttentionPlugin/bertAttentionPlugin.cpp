@@ -169,8 +169,9 @@ size_t BertAttentionPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* i
     const size_t qk_buf_float_size
         = mEnableContextFMHA ? 0 : sizeof(float) * batch_size * mNumHeads * input_seq_len * input_seq_len;
     const size_t padding_offset_size = sizeof(int) * batch_size * input_seq_len;
+    const size_t fmha_scheduler_counter = mEnableContextFMHA ? sizeof(uint32_t) : 0;
 
-    int const NUM_BUFFERS = 10;
+    int const NUM_BUFFERS = 11;
     size_t workspaces[NUM_BUFFERS];
     workspaces[0] = CUBLAS_WORKSPACE_SIZE;
     workspaces[1] = attention_mask_size;
@@ -182,6 +183,7 @@ size_t BertAttentionPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* i
     workspaces[7] = qkv_buf_2_size;
     workspaces[8] = qk_buf_float_size;
     workspaces[9] = padding_offset_size;
+    workspaces[10] = fmha_scheduler_counter;
 
     return tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
 }
@@ -246,6 +248,7 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
     const size_t qk_buf_float_size
         = mEnableContextFMHA ? 0 : sizeof(float) * batch_size * mNumHeads * input_seq_len * input_seq_len;
     const size_t padding_offset_size = sizeof(int) * batch_size * input_seq_len;
+    const size_t fmha_scheduler_counter = mEnableContextFMHA ? sizeof(uint32_t) : 0;
 
     // Workspace pointer shift
     int8_t* workspace_byte_ptr = reinterpret_cast<int8_t*>(workspace);
@@ -261,6 +264,8 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
     float* qk_buf_float_
         = reinterpret_cast<float*>(tc::nextWorkspacePtr(workspace_byte_ptr, offset, qk_buf_float_size));
     int* padding_offset = reinterpret_cast<int*>(tc::nextWorkspacePtr(workspace_byte_ptr, offset, padding_offset_size));
+    uint32_t* fmha_tile_counter_ptr
+        = reinterpret_cast<uint32_t*>(tc::nextWorkspacePtr(workspace_byte_ptr, offset, fmha_scheduler_counter));
 
     // build attention_mask, cu_seqlens, and padding_offset tensors
     BuildDecoderInfoParams<T> params;
@@ -270,9 +275,11 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
     params.attentionMask = attention_mask;
     params.seqQLengths = input_lengths;
     params.batchSize = batch_size;
-    params.maxSeqLength = input_seq_len;
+    params.maxQSeqLength = input_seq_len;
     params.numTokens = num_tokens;
+    params.removePadding = mRemovePadding;
     params.attentionMaskType = AttentionMaskType::PADDING;
+    params.fmhaTileCounter = fmha_tile_counter_ptr;
     invokeBuildDecoderInfo(params, stream);
     sync_check_cuda_error();
 
@@ -296,7 +303,8 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
     {
         // b, max_seqlen, actual_total_seqlen
         mFMHARunner->setup(request_batch_size, request_seq_len, request_seq_len, request_batch_size * request_seq_len);
-        mFMHARunner->run(const_cast<T*>(attention_input), cu_seqlens, context_buf_, stream);
+        mFMHARunner->run(
+            const_cast<T*>(attention_input), cu_seqlens, fmha_tile_counter_ptr, nullptr, context_buf_, stream);
     }
     else
     {
@@ -483,7 +491,8 @@ int BertAttentionPlugin::initialize() noexcept
         {
             TLLM_CHECK_WITH_INFO(false, "GPTAttentionPlugin received wrong data type.");
         }
-        mFMHARunner.reset(new FusedMHARunnerV2(data_type, mNumHeads, mHeadSize, mQScaling));
+        // Paged KV FMHA it not needed.
+        mFMHARunner.reset(new FusedMHARunnerV2(data_type, false, mNumHeads, mHeadSize, mQScaling));
         // set flags: force_fp32_acc, is_s_padded, causal_mask, num_kv_heads = num_heads
         mFMHARunner->setup_flags(mFMHAForceFP32Acc, !mRemovePadding, false, mNumHeads);
     }

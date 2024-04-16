@@ -14,7 +14,8 @@
 # limitations under the License.
 
 from ..._utils import pad_vocab_size
-from ...functional import Tensor, is_gated_activation, non_gated_version
+from ...functional import (Tensor, is_gated_activation, non_gated_version, recv,
+                           send)
 from ...layers import (MLP, MOE, Attention, AttentionMaskType, ColumnLinear,
                        Embedding, GatedMLP, LayerNorm, MoeConfig,
                        PositionEmbeddingType)
@@ -167,20 +168,23 @@ class GPTModel(Module):
         self.mapping = config.mapping
         self.position_embedding_type = config.position_embedding_type
 
-        self.vocab_embedding = Embedding(config.vocab_size,
-                                         config.hidden_size,
-                                         dtype=config.dtype)
+        if config.mapping.is_first_pp_rank():
+            self.vocab_embedding = Embedding(config.vocab_size,
+                                             config.hidden_size,
+                                             dtype=config.dtype)
 
-        if config.position_embedding_type == PositionEmbeddingType.learned_absolute:
-            self.position_embedding = Embedding(
-                num_embeddings=config.max_position_embeddings,
-                embedding_dim=config.hidden_size,
-                dtype=config.dtype)
+            if config.position_embedding_type == PositionEmbeddingType.learned_absolute:
+                self.position_embedding = Embedding(
+                    num_embeddings=config.max_position_embeddings,
+                    embedding_dim=config.hidden_size,
+                    dtype=config.dtype)
+
         self.layers = DecoderLayerList(GPTDecoderLayer, config)
 
-        self.ln_f = LayerNorm(normalized_shape=config.hidden_size,
-                              eps=config.norm_epsilon,
-                              dtype=config.dtype)
+        if config.mapping.is_last_pp_rank():
+            self.ln_f = LayerNorm(normalized_shape=config.hidden_size,
+                                  eps=config.norm_epsilon,
+                                  dtype=config.dtype)
 
     def forward(self,
                 input_ids,
@@ -189,17 +193,21 @@ class GPTModel(Module):
                 attention_mask=None,
                 kv_cache_params=None,
                 attention_params=None,
+                hidden_states=None,
                 prompt_embedding_table=None,
                 prompt_tasks=None,
                 prompt_vocab_size=None,
                 lora_params=None):
-        ptuning_args = [
-            prompt_embedding_table, prompt_tasks, prompt_vocab_size
-        ] if prompt_embedding_table is not None else []
-        hidden_states = self.vocab_embedding(input_ids, *ptuning_args)
-        if self.position_embedding_type == PositionEmbeddingType.learned_absolute:
-            hidden_states = hidden_states + self.position_embedding(
-                position_ids)
+        if self.mapping.is_first_pp_rank():
+            ptuning_args = [
+                prompt_embedding_table, prompt_tasks, prompt_vocab_size
+            ] if prompt_embedding_table is not None else []
+            hidden_states = self.vocab_embedding(input_ids, *ptuning_args)
+            if self.position_embedding_type == PositionEmbeddingType.learned_absolute:
+                hidden_states = hidden_states + self.position_embedding(
+                    position_ids)
+        else:
+            hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
 
         hidden_states = self.layers(hidden_states,
                                     use_cache=use_cache,
@@ -210,7 +218,10 @@ class GPTModel(Module):
         if use_cache:
             hidden_states, presents = hidden_states
 
-        hidden_states = self.ln_f(hidden_states)
+        if self.mapping.is_last_pp_rank():
+            hidden_states = self.ln_f(hidden_states)
+        else:
+            hidden_states = send(hidden_states, self.mapping.next_pp_rank())
 
         if use_cache:
             return (hidden_states, tuple(presents))
@@ -222,16 +233,19 @@ class GPTForCausalLM(DecoderModelForCausalLM):
     def __init__(self, config: PretrainedConfig):
         self.check_config(config)
         transformer = GPTModel(config)
-        vocab_size_padded = pad_vocab_size(config.vocab_size,
-                                           config.mapping.tp_size)
 
-        lm_head = ColumnLinear(config.hidden_size,
-                               vocab_size_padded,
-                               bias=False,
-                               dtype=config.dtype,
-                               tp_group=config.mapping.tp_group,
-                               tp_size=config.mapping.tp_size,
-                               gather_output=True)
+        if config.mapping.is_last_pp_rank():
+            vocab_size_padded = pad_vocab_size(config.vocab_size,
+                                               config.mapping.tp_size)
+            lm_head = ColumnLinear(config.hidden_size,
+                                   vocab_size_padded,
+                                   bias=False,
+                                   dtype=config.dtype,
+                                   tp_group=config.mapping.tp_group,
+                                   tp_size=config.mapping.tp_size,
+                                   gather_output=True)
+        else:
+            lm_head = None
         super().__init__(config, transformer, lm_head)
 
     def check_config(self, config: PretrainedConfig):

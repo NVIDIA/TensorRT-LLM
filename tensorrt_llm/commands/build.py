@@ -25,7 +25,8 @@ from typing import Union
 import torch
 
 from .._common import check_max_num_tokens
-from ..auto_parallel.config import _cluster_infos, infer_cluster_key
+from ..auto_parallel import infer_cluster_config
+from ..auto_parallel.cluster_info import cluster_infos
 from ..builder import BuildConfig, Engine, build
 from ..logger import logger
 from ..lora_manager import LoraBuildConfig
@@ -171,6 +172,8 @@ def parse_arguments():
             "mlp_h_to_4h",
             "mlp_gate",
             "mlp_4h_to_h",
+            "cross_attn_q",
+            "cross_attn_v",
         ],
         help=
         "Add lora in which modules. Only be activated when use_lora_plugin is enabled."
@@ -196,9 +199,16 @@ def parse_arguments():
         '--cluster_key',
         type=str,
         default=None,
-        choices=_cluster_infos.keys(),
+        choices=cluster_infos.keys(),
         help=
         'Unique name for target GPU type. Inferred from current GPU type if not specified.'
+    )
+    parser.add_argument(
+        '--max_encoder_input_len',
+        type=int,
+        default=1024,
+        help=
+        'Specify max encoder input length when using enc-dec models. Set max_input_len to 1 to start generation from decoder_start_token_id of length 1.'
     )
 
     plugin_config_parser = parser.add_argument_group("plugin_config")
@@ -395,6 +405,10 @@ def main():
             remove_input_padding=(args.remove_input_padding == "enable"),
             enable_context_fmha=(args.context_fmha == "enable"),
             tokens_per_block=args.tokens_per_block)
+        if args.cluster_key is not None:
+            cluster_config = dict(cluster_key=args.cluster_key)
+        else:
+            cluster_config = infer_cluster_config()
         build_config = BuildConfig.from_dict(
             {
                 'max_input_len': args.max_input_len,
@@ -420,9 +434,6 @@ def main():
                     args.auto_parallel,
                     'gpus_per_node':
                     args.gpus_per_node,
-                    'cluster_key':
-                    args.cluster_key
-                    or infer_cluster_key(allow_fallback=args.auto_parallel > 1),
                     'sharded_io_allowlist': [
                         'past_key_value_\\d+',
                         'present_key_value_\\d*',
@@ -430,7 +441,9 @@ def main():
                     'same_buffer_io': {
                         'past_key_value_(\\d+)': 'present_key_value_\\1',
                     },
+                    **cluster_config,
                 },
+                'max_encoder_input_len': args.max_encoder_input_len,
             },
             plugin_config=plugin_config)
     else:

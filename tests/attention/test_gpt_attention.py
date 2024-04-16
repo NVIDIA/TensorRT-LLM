@@ -36,7 +36,8 @@ import tensorrt_llm
 from tensorrt_llm import Tensor
 from tensorrt_llm._utils import (str_dtype_to_np, str_dtype_to_torch,
                                  torch_to_numpy)
-from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
+from tensorrt_llm.functional import (PositionEmbeddingType, RopeEmbeddingUtils,
+                                     RotaryScalingType)
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime import GenerationSequence, KVCacheManager
@@ -246,13 +247,41 @@ class TestFunctional(unittest.TestCase):
 
         # Test case for GPT-J beam_width=4, used in MLPerf.
         test_cases += list(
-            product([80], ['gptj_attention'], [ContextFMHAType.disabled],
-                    ['float16'], ['float16'], [2], [128], [4], [256], [0],
-                    [False], [False], [4], [True], [False]))
+            product(
+                [80],
+                ['gptj_attention'],
+                [ContextFMHAType.disabled],
+                ['float16'],
+                ['float16'],
+                [2],
+                [128],
+                [4],
+                [256],
+                [0],
+                [False],
+                [False],
+                [4],
+                [True],
+                [False],
+            ))
         test_cases += list(
-            product([90], ['gptj_attention'], [ContextFMHAType.disabled],
-                    ['float16'], ['fp8'], [2], [128], [4], [256], [0], [False],
-                    [False], [4], [True], [False]))
+            product(
+                [90],
+                ['gptj_attention'],
+                [ContextFMHAType.disabled],
+                ['float16'],
+                ['fp8'],
+                [2],
+                [128],
+                [4],
+                [256],
+                [0],
+                [False],
+                [False],
+                [4],
+                [True],
+                [False],
+            ))
 
         # split test cases into 4 partitions
         test_cases = [(f"partition{int(i % 4)}", ) + case
@@ -391,16 +420,35 @@ class TestFunctional(unittest.TestCase):
         tokens_per_block = 128 if paged_kv_cache else -1
 
         def _construct_execution(
-                session, input_tensor, weight, bias, past_key_value,
-                host_pointer_array, sequence_length,
-                host_past_key_value_lengths, host_max_attention_window_sizes,
-                host_sink_token_length, context_lengths, host_context_lengths,
-                cache_indirection, host_request_types, num_heads, hidden_size,
-                num_kv_heads, output, dtype, max_context_length, shape_dict,
-                kv_int8_quant_scale, kv_int8_dequant_scale, configuration):
-            pointer_array = None
+            session,
+            input_tensor,
+            weight,
+            bias,
+            past_key_value,
+            host_kv_cache_block_offsets,
+            host_kv_cache_pool_pointers,
+            sequence_length,
+            host_past_key_value_lengths,
+            host_max_attention_window_sizes,
+            host_sink_token_length,
+            context_lengths,
+            host_context_lengths,
+            cache_indirection,
+            host_request_types,
+            num_heads,
+            hidden_size,
+            num_kv_heads,
+            output,
+            dtype,
+            max_context_length,
+            shape_dict,
+            kv_int8_quant_scale,
+            kv_int8_dequant_scale,
+            configuration,
+        ):
+            kv_cache_block_offsets = None
             if paged_kv_cache:
-                pointer_array = host_pointer_array.to('cuda')
+                kv_cache_block_offsets = host_kv_cache_block_offsets.to('cuda')
             head_size = hidden_size // num_heads
             # construct trt network
             builder = tensorrt_llm.Builder()
@@ -420,7 +468,7 @@ class TestFunctional(unittest.TestCase):
             else:
                 net.plugin_config.set_plugin("multi_block_mode", False)
             # always enable xqa kernels for test.
-            net.plugin_config.enable_xqa_optimization()
+            net.plugin_config.set_plugin("enable_xqa", True)
 
             with tensorrt_llm.net_guard(net):
                 x_tensor = Tensor(name='input',
@@ -461,16 +509,21 @@ class TestFunctional(unittest.TestCase):
                     dtype=tensorrt_llm.str_dtype_to_trt('int32'))
 
                 past_key_value_tensor = None
-                pointer_array_tensor = None
-                host_pointer_array_tensor = None
+                kv_cache_block_offsets_tensor = None
+                host_kv_cache_block_offsets_tensor = None
+                host_kv_cache_pool_pointers_tensor = None
                 if paged_kv_cache:
-                    pointer_array_tensor = Tensor(
-                        name='kv_cache_block_pointers',
-                        shape=tuple(pointer_array.shape),
-                        dtype=tensorrt_llm.str_dtype_to_trt('int64'))
-                    host_pointer_array_tensor = Tensor(
-                        name='host_kv_cache_block_pointers',
-                        shape=tuple(pointer_array.shape),
+                    kv_cache_block_offsets_tensor = Tensor(
+                        name='kv_cache_block_offsets',
+                        shape=tuple(kv_cache_block_offsets.shape),
+                        dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+                    host_kv_cache_block_offsets_tensor = Tensor(
+                        name='host_kv_cache_block_offsets',
+                        shape=tuple(kv_cache_block_offsets.shape),
+                        dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+                    host_kv_cache_pool_pointers_tensor = Tensor(
+                        name='host_kv_cache_pool_pointers',
+                        shape=(1, ),
                         dtype=tensorrt_llm.str_dtype_to_trt('int64'))
                 else:
                     past_key_value_tensor = Tensor(
@@ -538,6 +591,12 @@ class TestFunctional(unittest.TestCase):
                             "dynamic": RotaryScalingType.dynamic
                         }[configuration.rope_scaling["type"]]
                         rope_scale = configuration.rope_scaling["factor"]
+                embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
+                    configuration.max_position_embeddings, rotary_embedding_dim,
+                    rope_base, rope_scale)
+                rotary_cos_sin = tensorrt_llm.functional.constant(
+                    embed_positions_for_gpt_attention
+                ) if position_embedding_type.is_rope() else None
                 outputs = tensorrt_llm.functional.gpt_attention(
                     qkv=qkv,
                     past_key_value=past_key_value_tensor,
@@ -562,14 +621,18 @@ class TestFunctional(unittest.TestCase):
                     rotary_embedding_max_positions=configuration.
                     max_position_embeddings,
                     position_embedding_type=position_embedding_type,
+                    rotary_cos_sin=rotary_cos_sin,
                     kv_orig_quant_scale=kv_quant_scale_tensor,
                     kv_quant_orig_scale=kv_dequant_scale_tensor,
                     host_context_lengths=host_context_lengths_tensor,
                     kv_cache_quant_mode=QuantMode.from_description(
                         use_int8_kv_cache=use_int8_kv_cache,
                         use_fp8_kv_cache=use_fp8_kv_cache),
-                    kv_cache_block_pointers=pointer_array_tensor,
-                    host_kv_cache_block_pointers=host_pointer_array_tensor,
+                    kv_cache_block_offsets=kv_cache_block_offsets_tensor,
+                    host_kv_cache_block_offsets=
+                    host_kv_cache_block_offsets_tensor,
+                    host_kv_cache_pool_pointers=
+                    host_kv_cache_pool_pointers_tensor,
                     max_context_length=max_context_length,
                     qkv_bias=qkv_bias)
 
@@ -594,8 +657,11 @@ class TestFunctional(unittest.TestCase):
                 'host_request_types': host_request_types
             }
             if paged_kv_cache:
-                inputs['kv_cache_block_pointers'] = pointer_array
-                inputs['host_kv_cache_block_pointers'] = host_pointer_array
+                inputs['kv_cache_block_offsets'] = kv_cache_block_offsets
+                inputs[
+                    'host_kv_cache_block_offsets'] = host_kv_cache_block_offsets
+                inputs[
+                    'host_kv_cache_pool_pointers'] = host_kv_cache_pool_pointers
             else:
                 inputs['past_key_value'] = past_key_value
 
@@ -649,7 +715,7 @@ class TestFunctional(unittest.TestCase):
         bubble_len = tokens_per_block - sink_tokens_in_last_block if sink_tokens_in_last_block > 0 else 0
         max_blocks_per_seq = math.ceil(
             (max_seq_len + bubble_len) / tokens_per_block)
-        blocks = batch_size * beam_width * max_blocks_per_seq
+        num_blocks = batch_size * beam_width * max_blocks_per_seq
         shape_dict = {
             'weight': (hidden_size, qkv_hidden_size),
             'bias': (qkv_hidden_size, ),
@@ -664,7 +730,7 @@ class TestFunctional(unittest.TestCase):
             'host_request_types': (batch_size)
         }
         if paged_kv_cache:
-            shape_dict['past_key_value'] = (blocks, 2, plugin_kv_num_heads,
+            shape_dict['past_key_value'] = (num_blocks, 2, plugin_kv_num_heads,
                                             tokens_per_block, head_size)
         else:
             shape_dict['past_key_value'] = (batch_size, 2, plugin_kv_num_heads,
@@ -681,19 +747,25 @@ class TestFunctional(unittest.TestCase):
         present_key_value = torch.zeros(shape_dict['past_key_value'],
                                         dtype=torch_kv_cache_dtype,
                                         device='cuda')
+        host_kv_cache_pool_pointers = None
         # Init KV cache block manager
         if paged_kv_cache:
-            manager = KVCacheManager([present_key_value],
-                                     blocks,
-                                     tokens_per_block,
-                                     max_blocks_per_seq,
-                                     max_seq_len,
-                                     sink_token_len,
-                                     beam_width=beam_width)
+            block_size = plugin_kv_num_heads * tokens_per_block * head_size
+            kv_cache_manager = KVCacheManager(
+                num_layers=1,
+                num_blocks=num_blocks,
+                block_size=block_size,
+                tokens_per_block=tokens_per_block,
+                max_blocks_per_seq=max_blocks_per_seq,
+                max_attention_window_size=max_seq_len,
+                sink_token_len=sink_token_len,
+                beam_width=beam_width)
+            host_kv_cache_pool_pointers = torch.tensor(
+                [present_key_value.data_ptr(), 0], dtype=torch.int64)
 
-            # Add sequences to the manager
+            # Add sequences to the kv_cache_manager
             for bi in range(batch_size):
-                manager.add_sequence(
+                kv_cache_manager.add_sequence(
                     GenerationSequence(seq_idx=bi, batch_idx=bi), in_len)
 
         weight = torch.randn(shape_dict['weight'],
@@ -939,8 +1011,8 @@ class TestFunctional(unittest.TestCase):
         def verify_kv_cache(torch_present):
             if not use_int8_kv_cache and not use_fp8_kv_cache and num_kv_heads == num_heads and beam_width == 1:
                 if paged_kv_cache:
-                    kv_cache_cont = manager.blocks_manager.get_continuous_caches(
-                        0)
+                    kv_cache_cont = kv_cache_manager.blocks_manager.get_continuous_caches(
+                        present_key_value)
                     kv_cache_cont = kv_cache_cont.permute(1, 0, 2)
                 else:
                     kv_cache_cont = present_key_value
@@ -998,18 +1070,19 @@ class TestFunctional(unittest.TestCase):
             # The sequence_lengths = context_lengths + step for generation stage.
             sequence_length = torch.add(input_lengths, step)
 
-            pointer_array = None
+            kv_cache_block_offsets = None
             if paged_kv_cache:
                 # Get arrays of pointers to the "pages" of KV values
-                pointer_array = manager.get_block_pointers(beam_width)[0]
+                kv_cache_block_offsets = kv_cache_manager.get_block_offsets(
+                    beam_width)
 
             if step == 0:
                 host_request_types = torch.tensor([0] * batch_size,
                                                   dtype=torch.int32)
                 if paged_kv_cache:
                     # Reassemble pointer array to have KV cache for bs context invocations instead of batch_beam
-                    pointer_array = pointer_array[:, 0, :, :]
-                    pointer_array = pointer_array.reshape(
+                    kv_cache_block_offsets = kv_cache_block_offsets[:, 0, :, :]
+                    kv_cache_block_offsets = kv_cache_block_offsets.reshape(
                         batch_size, 1, 2, max_blocks_per_seq)
 
                 # Context stage
@@ -1098,7 +1171,8 @@ class TestFunctional(unittest.TestCase):
 
                 session, output, present_key_value = _construct_execution(
                     session, input_tensor, weight_plugin, bias_plugin,
-                    present_key_value, pointer_array, sequence_length,
+                    present_key_value, kv_cache_block_offsets,
+                    host_kv_cache_pool_pointers, sequence_length,
                     host_past_key_value_lengths,
                     host_max_attention_window_sizes, host_sink_token_length,
                     input_lengths, host_context_lengths, cache_indirection,
@@ -1255,8 +1329,9 @@ class TestFunctional(unittest.TestCase):
 
                 session, tiled_output, present_key_value = _construct_execution(
                     session, tiled_input_tensor, weight_plugin, bias_plugin,
-                    tiled_present_key_value, pointer_array,
-                    tiled_sequence_length, tiled_host_past_key_value_lengths,
+                    tiled_present_key_value, kv_cache_block_offsets,
+                    host_kv_cache_pool_pointers, tiled_sequence_length,
+                    tiled_host_past_key_value_lengths,
                     host_max_attention_window_sizes, host_sink_token_length,
                     tiled_input_lengths, tiled_host_context_lengths,
                     cache_indirection, tiled_host_request_types, num_heads,
@@ -1276,7 +1351,7 @@ class TestFunctional(unittest.TestCase):
             if paged_kv_cache:
                 # Iterate to the next step. Increase number of tokens for all unfinished sequences
                 # And allocate new blocks if needed
-                manager.step([False] * batch_size)
+                kv_cache_manager.step([False] * batch_size)
         # assert False, "Force fail"
         return
 

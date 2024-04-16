@@ -73,7 +73,7 @@ template <typename T>
 DynamicDecodeLayer<T>::DynamicDecodeLayer(DecodingMode const& mode, SizeType const maxBatchSize,
     SizeType const maxBeamWidth, SizeType const vocabSize, SizeType const vocabSizePadded, cudaStream_t stream,
     std::shared_ptr<IAllocator> allocator, cudaDeviceProp* cudaDeviceProp,
-    std::optional<runtime::SizeType> maxTokensPerStep, std::optional<runtime::SizeType> maxNumMedusaHeads)
+    std::optional<runtime::SizeType32> maxTokensPerStep, std::optional<runtime::SizeType32> maxNumMedusaHeads)
     : BaseLayer(stream, std::move(allocator))
     , mDecodingMode(mode)
     , mMaxBatchSize(maxBatchSize)
@@ -125,7 +125,7 @@ void DynamicDecodeLayer<T>::initialize()
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    mIdsPtrHost = runtime::BufferManager::pinned(ITensor::makeShape({}), runtime::TRTDataType<int*>::value);
+    mIdsPtrHost = runtime::BufferManager::pinned(ITensor::makeShape({}), runtime::TRTDataType<TokenIdType*>::value);
     mLogitsPtrsHost = runtime::BufferManager::pinned(ITensor::makeShape({}), runtime::TRTDataType<T*>::value);
 
     allocateBuffer();
@@ -154,12 +154,12 @@ void DynamicDecodeLayer<T>::allocateBuffer()
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    mZeroParentIdsDevice = mAllocator->reMalloc(mZeroParentIdsDevice, sizeof(int*) * 2 * mMaxBatchSize, false);
+    mZeroParentIdsDevice = mAllocator->reMalloc(mZeroParentIdsDevice, sizeof(TokenIdType*) * 2 * mMaxBatchSize, false);
     mTemperatureDevice = mAllocator->reMalloc(mTemperatureDevice, sizeof(float) * mMaxBatchSize, false);
     mRepetitionPenaltyDevice = mAllocator->reMalloc(mRepetitionPenaltyDevice, sizeof(float) * mMaxBatchSize, false);
     mPresencePenaltyDevice = mAllocator->reMalloc(mPresencePenaltyDevice, sizeof(float) * mMaxBatchSize, false);
     mFrequencyPenaltyDevice = mAllocator->reMalloc(mFrequencyPenaltyDevice, sizeof(float) * mMaxBatchSize, false);
-    mMinLengthDevice = mAllocator->reMalloc(mMinLengthDevice, sizeof(int32_t) * mMaxBatchSize, false);
+    mMinLengthDevice = mAllocator->reMalloc(mMinLengthDevice, sizeof(SizeType32) * mMaxBatchSize, false);
     mRuntimeLogitsDevice = mAllocator->reMalloc(
         mRuntimeLogitsDevice, sizeof(T) * mMaxBatchSize * mMaxTokensPerStep * mMaxBeamWidth * mVocabSizePadded, false);
 
@@ -253,7 +253,7 @@ void DynamicDecodeLayer<T>::setup(
 
 template <typename T>
 void DynamicDecodeLayer<T>::setupLayers(
-    SizeType batchSize, SizeType beamWidth, int32_t const* batchSlots, SetupParams const& setupParams)
+    SizeType batchSize, SizeType beamWidth, SizeType const* batchSlots, SetupParams const& setupParams)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     if (mDecodingMode.isTopKorTopP())
@@ -306,7 +306,7 @@ void DynamicDecodeLayer<T>::setupPenalties(
     SizeType batchSize, SizeType const* batchSlots, SetupParams const& setupParams)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    std::vector<int32_t> batchSlotsVec(batchSize);
+    std::vector<SizeType> batchSlotsVec(batchSize);
     std::iota(batchSlotsVec.begin(), batchSlotsVec.end(), 0);
     auto batchSlotsHost = batchSlots ? batchSlots : batchSlotsVec.data();
 
@@ -321,27 +321,32 @@ void DynamicDecodeLayer<T>::setupPenalties(
     if (mUseTemperature)
     {
         fillBuffers(setupParams.temperature, getDefaultPenaltyValue(DecodingPenaltyType::Temperature), mTemperature,
-            mTemperatureDevice, batchSlotsHost);
+            mTemperatureDevice, batchSlotsHost, getLimitsPenalty(DecodingPenaltyType::Temperature),
+            "temperature penalty");
     }
     if (mUseRepetitionPenalty)
     {
         fillBuffers(setupParams.repetition_penalty, getDefaultPenaltyValue(DecodingPenaltyType::Repetition),
-            mRepetitionPenalty, mRepetitionPenaltyDevice, batchSlotsHost);
+            mRepetitionPenalty, mRepetitionPenaltyDevice, batchSlotsHost,
+            getLimitsPenalty(DecodingPenaltyType::Repetition), "repetition penalty");
     }
     if (mUsePresencePenalty)
     {
         fillBuffers(setupParams.presence_penalty, getDefaultPenaltyValue(DecodingPenaltyType::Presence),
-            mPresencePenalty, mPresencePenaltyDevice, batchSlotsHost);
+            mPresencePenalty, mPresencePenaltyDevice, batchSlotsHost, getLimitsPenalty(DecodingPenaltyType::Presence),
+            "presence penalty");
     }
     if (mUseFrequencyPenalty)
     {
         fillBuffers(setupParams.frequency_penalty, getDefaultPenaltyValue(DecodingPenaltyType::Frequency),
-            mFrequencyPenalty, mFrequencyPenaltyDevice, batchSlotsHost);
+            mFrequencyPenalty, mFrequencyPenaltyDevice, batchSlotsHost,
+            getLimitsPenalty(DecodingPenaltyType::Frequency), "frequency penalty");
     }
     if (mUseMinLength)
     {
-        fillBuffers(setupParams.min_length, (int) getDefaultPenaltyValue(DecodingPenaltyType::MinLength), mMinLength,
-            mMinLengthDevice, batchSlotsHost);
+        fillBuffers(setupParams.min_length,
+            static_cast<SizeType32>(getDefaultPenaltyValue(DecodingPenaltyType::MinLength)), mMinLength,
+            mMinLengthDevice, batchSlotsHost, getLimitsPenalty(DecodingPenaltyType::MinLength), "minLength");
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -394,10 +399,11 @@ void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& 
         mRuntimeMaxSeqLen = maxSeqLen;
     }
 
-    std::vector<int32_t> batchSlotsVec(batchSize);
+    std::vector<SizeType> batchSlotsVec(batchSize);
     std::iota(batchSlotsVec.begin(), batchSlotsVec.end(), 0);
-    auto batchSlotsHost = params.batch_slots ? params.batch_slots->template getPtr<int const>() : batchSlotsVec.data();
-    auto batchSlots = params.batch_slots ? params.batch_slots->template getPtr<int const>() : nullptr;
+    auto batchSlotsHost
+        = params.batch_slots ? params.batch_slots->template getPtr<SizeType const>() : batchSlotsVec.data();
+    auto batchSlots = params.batch_slots ? params.batch_slots->template getPtr<SizeType const>() : nullptr;
 
     mCyclicStep = mCyclicStep % mRuntimeMaxSeqLen;
     prepareIdsPtrs(outputs, batchSlotsHost, batchSize, beamWidth, maxSeqLen);
@@ -431,7 +437,7 @@ void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& 
 
 template <typename T>
 void DynamicDecodeLayer<T>::layersForward(Tensor& logits, OutputParams& outputs, ForwardParams const& params,
-    int32_t const* batchSlots, SizeType batchSize, SizeType beamWidth, SizeType maxSeqLen)
+    SizeType const* batchSlots, SizeType batchSize, SizeType beamWidth, SizeType maxSeqLen)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto const ite = params.ite;
@@ -506,7 +512,7 @@ void DynamicDecodeLayer<T>::layersForward(Tensor& logits, OutputParams& outputs,
         Tensor const logits_slice{logits.slice({localBatchSize, static_cast<size_t>(beamWidth), logits.shape[2]}, 0)};
         Tensor const end_id_slice{endIds.slice({localBatchSize}, 0)};
         typename BaseSamplingLayer<T>::ForwardParams decode_input_tensors{
-            step, ite, logits_slice, end_id_slice, static_cast<std::int32_t>(maxSeqLen)};
+            step, ite, logits_slice, end_id_slice, static_cast<SizeType>(maxSeqLen)};
 
         decode_input_tensors.finished = params.finished;
 
@@ -569,14 +575,14 @@ void DynamicDecodeLayer<T>::layersForward(Tensor& logits, OutputParams& outputs,
 
 template <typename T>
 void DynamicDecodeLayer<T>::applyPenalties(OutputParams& outputs, ForwardParams const& params,
-    int32_t const* batchSlotsHost, int32_t const* batchSlots, SizeType batchSize, SizeType beamWidth,
+    SizeType const* batchSlotsHost, SizeType const* batchSlots, SizeType batchSize, SizeType beamWidth,
     SizeType maxSeqLen)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto logitsPtrsHost = ITensor::slice(mLogitsPtrsHost, mCyclicStep, 1);
     auto logitsPtrsHostData = reinterpret_cast<T const**>(runtime::bufferCast<int64_t>(*logitsPtrsHost));
-    for (int32_t bi = 0; bi < batchSize; bi++)
+    for (SizeType bi = 0; bi < batchSize; bi++)
     {
         if (params.logits_vec)
         {
@@ -590,11 +596,11 @@ void DynamicDecodeLayer<T>::applyPenalties(OutputParams& outputs, ForwardParams 
         }
     }
 
-    int32_t const* inputLengths = nullptr;
+    SizeType32 const* inputLengths = nullptr;
     if (params.input_lengths)
     {
         auto& input_lengths = params.input_lengths.value();
-        inputLengths = input_lengths.template getPtr<int const>();
+        inputLengths = input_lengths.template getPtr<SizeType32 const>();
     }
     auto* embeddingBias = params.embedding_bias ? params.embedding_bias->template getPtr<T const>() : nullptr;
 #define GET_PENALTIES(capital_name, penalty_name, type)                                                                \
@@ -608,20 +614,22 @@ void DynamicDecodeLayer<T>::applyPenalties(OutputParams& outputs, ForwardParams 
     auto* repetitionPenalties = GET_PENALTIES(RepetitionPenalty, Repetition, float);
     auto* presencePenalties = GET_PENALTIES(PresencePenalty, Presence, float);
     auto* frequencyPenalties = GET_PENALTIES(FrequencyPenalty, Frequency, float);
-    auto* minLengths = GET_PENALTIES(MinLength, MinLength, int32_t);
+    auto* minLengths = GET_PENALTIES(MinLength, MinLength, SizeType32);
 
 #undef GET_PENALTIES
 
-    auto const tokensPerStep
-        = params.medusaInputs ? params.medusaInputs->medusaCurTokensPerStep.template getPtr<SizeType const>() : nullptr;
+    auto const tokensPerStep = params.medusaInputs
+        ? params.medusaInputs->medusaCurTokensPerStep.template getPtr<SizeType32 const>()
+        : nullptr;
     InvokeBatchApplyPenaltyParams<T> penaltyParams{reinterpret_cast<T const* const*>(logitsPtrsHostData),
         mRuntimeLogitsDevice, embeddingBias, mPenaltyWorkspaceDevice, mPenaltyWorkspacePrevDevice, temperatures,
         repetitionPenalties, presencePenalties, frequencyPenalties,
         (mUseRepetitionPenalty || mUsePresencePenalty || mUseFrequencyPenalty), batchSize,
-        static_cast<int32_t>(beamWidth), static_cast<int32_t>(maxSeqLen), mVocabSize, mVocabSizePadded,
-        outputs.output_ids_ptr.template getPtr<int const*>(), outputs.parent_ids_ptr.template getPtr<int const*>(),
-        inputLengths, outputs.sequence_length->template getPtr<int const>(), minLengths,
-        params.end_ids.template getPtr<int const>(), batchSlots, mMaxTokensPerStep, tokensPerStep, mStream};
+        static_cast<SizeType>(beamWidth), static_cast<SizeType>(maxSeqLen), mVocabSize, mVocabSizePadded,
+        outputs.output_ids_ptr.template getPtr<TokenIdType const*>(),
+        outputs.parent_ids_ptr.template getPtr<TokenIdType const*>(), inputLengths,
+        outputs.sequence_length->template getPtr<SizeType32 const>(), minLengths,
+        params.end_ids.template getPtr<TokenIdType const>(), batchSlots, mMaxTokensPerStep, tokensPerStep, mStream};
     invokeBatchApplyPenalty(penaltyParams);
     sync_check_cuda_error();
 
@@ -630,7 +638,7 @@ void DynamicDecodeLayer<T>::applyPenalties(OutputParams& outputs, ForwardParams 
 
 template <typename T>
 void DynamicDecodeLayer<T>::banWords(Tensor& logits, OutputParams& outputs, ForwardParams const& params,
-    int32_t const* batchSlots, SizeType batchSize, SizeType beamWidth, SizeType maxSeqLen, SizeType vocabSizePadded,
+    SizeType const* batchSlots, SizeType batchSize, SizeType beamWidth, SizeType maxSeqLen, SizeType vocabSizePadded,
     cudaStream_t stream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -649,28 +657,29 @@ void DynamicDecodeLayer<T>::banWords(Tensor& logits, OutputParams& outputs, Forw
 
 template <typename T>
 void DynamicDecodeLayer<T>::banRepeatNGrams(Tensor& logits, OutputParams& outputs, ForwardParams const& params,
-    int32_t const* batchSlots, SizeType batchSize, SizeType beamWidth, SizeType maxSeqLen, SizeType vocabSizePadded,
+    SizeType const* batchSlots, SizeType batchSize, SizeType beamWidth, SizeType maxSeqLen, SizeType vocabSizePadded,
     cudaStream_t stream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto const max_step = params.step;
     if (params.no_repeat_ngram_size)
     {
-        int const* noRepeatNgramSizeBuf = params.no_repeat_ngram_size.value().template getPtr<int const>();
+        SizeType32 const* noRepeatNgramSizeBuf
+            = params.no_repeat_ngram_size.value().template getPtr<SizeType32 const>();
 
-        invokeBanRepeatNgram(logits.template getPtr<T>(), outputs.output_ids_ptr.template getPtr<int const*>(),
+        invokeBanRepeatNgram(logits.template getPtr<T>(), outputs.output_ids_ptr.template getPtr<TokenIdType const*>(),
             reinterpret_cast<FinishedState*>(
                 params.finished.value_or(Tensor{}).template getPtr<FinishedState::UnderlyingType>()),
-            outputs.parent_ids_ptr.template getPtr<int const*>(), batchSlots,
-            outputs.sequence_length->template getPtr<int>(), batchSize, beamWidth, maxSeqLen,
-            params.no_repeat_ngram_size.value().template getPtr<int const>(), vocabSizePadded, max_step, stream);
+            outputs.parent_ids_ptr.template getPtr<TokenIdType const*>(), batchSlots,
+            outputs.sequence_length->template getPtr<SizeType32>(), batchSize, beamWidth, maxSeqLen,
+            params.no_repeat_ngram_size.value().template getPtr<SizeType32 const>(), vocabSizePadded, max_step, stream);
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
 void DynamicDecodeLayer<T>::banBadWords(Tensor& logits, OutputParams& outputs, ForwardParams const& params,
-    int32_t const* batchSlots, SizeType batchSize, SizeType beamWidth, SizeType maxSeqLen, SizeType vocabSizePadded,
+    SizeType const* batchSlots, SizeType batchSize, SizeType beamWidth, SizeType maxSeqLen, SizeType vocabSizePadded,
     cudaStream_t stream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -678,20 +687,20 @@ void DynamicDecodeLayer<T>::banBadWords(Tensor& logits, OutputParams& outputs, F
     if (maxBadWordsLength)
     {
         auto const** badWordsPtr = params.bad_words_ptr->template getPtr<TokenIdType const*>();
-        auto const* badWordsLens = params.bad_words_lengths->template getPtr<SizeType>();
+        auto const* badWordsLens = params.bad_words_lengths->template getPtr<SizeType32>();
 
         invokeBanBadWords((T*) logits.template getPtr<T>(),
             outputs.output_ids_ptr.template getPtr<TokenIdType const*>(),
-            beamWidth > 1 ? outputs.parent_ids_ptr.template getPtr<SizeType const*>() : nullptr, batchSlots, batchSize,
-            beamWidth, badWordsPtr, badWordsLens, maxBadWordsLength, vocabSizePadded,
-            outputs.sequence_length->template getPtr<int>(), maxSeqLen, stream);
+            beamWidth > 1 ? outputs.parent_ids_ptr.template getPtr<SizeType32 const*>() : nullptr, batchSlots,
+            batchSize, beamWidth, badWordsPtr, badWordsLens, maxBadWordsLength, vocabSizePadded,
+            outputs.sequence_length->template getPtr<SizeType32>(), maxSeqLen, stream);
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
 void DynamicDecodeLayer<T>::checkStopCriteria(OutputParams& outputs, ForwardParams const& params,
-    int32_t const* batchSlots, SizeType batchSize, SizeType beamWidth, SizeType maxSeqLen, cudaStream_t stream)
+    SizeType const* batchSlots, SizeType batchSize, SizeType beamWidth, SizeType maxSeqLen, cudaStream_t stream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -708,18 +717,18 @@ void DynamicDecodeLayer<T>::checkStopCriteria(OutputParams& outputs, ForwardPara
 
 template <typename T>
 void DynamicDecodeLayer<T>::checkStopWordsStopCriteria(OutputParams& outputs, ForwardParams const& params,
-    int32_t const* batchSlots, SizeType batchSize, SizeType beamWidth, SizeType maxSeqLen, cudaStream_t stream)
+    SizeType const* batchSlots, SizeType batchSize, SizeType beamWidth, SizeType maxSeqLen, cudaStream_t stream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto const maxStopWordsLength = params.max_stop_words_len;
     if (maxStopWordsLength)
     {
-        invokeStopWordsCriterion(outputs.output_ids_ptr.template getPtr<int32_t const*>(),
-            outputs.parent_ids_ptr.template getPtr<int32_t const*>(),
-            params.stop_words_ptr->template getPtr<int32_t const*>(),
+        invokeStopWordsCriterion(outputs.output_ids_ptr.template getPtr<TokenIdType const*>(),
+            outputs.parent_ids_ptr.template getPtr<SizeType32 const*>(),
+            params.stop_words_ptr->template getPtr<TokenIdType const*>(),
             reinterpret_cast<FinishedState*>(outputs.finished->template getPtr<FinishedState::UnderlyingType>()),
-            outputs.sequence_length->template getPtr<int32_t>(), batchSlots,
-            params.stop_words_lengths->template getPtr<int32_t const>(), maxStopWordsLength, batchSize, beamWidth,
+            outputs.sequence_length->template getPtr<SizeType32>(), batchSlots,
+            params.stop_words_lengths->template getPtr<SizeType32 const>(), maxStopWordsLength, batchSize, beamWidth,
             maxSeqLen, stream);
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -727,16 +736,16 @@ void DynamicDecodeLayer<T>::checkStopWordsStopCriteria(OutputParams& outputs, Fo
 
 template <typename T>
 void DynamicDecodeLayer<T>::checkMaxLengthStopCriteria(OutputParams& outputs, ForwardParams const& params,
-    int32_t const* batchSlots, SizeType batchSize, SizeType beamWidth, SizeType maxSeqLen, cudaStream_t stream)
+    SizeType const* batchSlots, SizeType batchSize, SizeType beamWidth, SizeType maxSeqLen, cudaStream_t stream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     if (params.sequence_limit_length)
     {
         invokeLengthCriterion(
             reinterpret_cast<FinishedState*>(outputs.finished->template getPtr<FinishedState::UnderlyingType>()),
-            outputs.finished_sum ? outputs.finished_sum->template getPtr<int>() : nullptr,
-            params.sequence_limit_length->template getPtr<uint32_t const>(),
-            outputs.sequence_length->template getPtr<int>(), batchSlots, batchSize, beamWidth, stream);
+            outputs.finished_sum ? outputs.finished_sum->template getPtr<SizeType32>() : nullptr,
+            params.sequence_limit_length->template getPtr<SizeType32 const>(),
+            outputs.sequence_length->template getPtr<SizeType32>(), batchSlots, batchSize, beamWidth, stream);
         sync_check_cuda_error();
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -749,19 +758,19 @@ void DynamicDecodeLayer<T>::prepareIdsPtrs(
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto idsPtrHostSlice = ITensor::slice(mIdsPtrHost, mCyclicStep, 1);
     auto idsPtrHost = reinterpret_cast<TokenIdType**>(runtime::bufferCast<int64_t>(*idsPtrHostSlice));
-    for (int bi = 0; bi < batchSize; bi++)
+    for (SizeType bi = 0; bi < batchSize; bi++)
     {
         auto const batchSlot = batchSlots[bi];
         idsPtrHost[batchSlot]
             = outputs.output_ids.template getPtrWithOffset<TokenIdType>(batchSlot * beamWidth * maxSeqLen);
     }
-    for (int bi = 0; bi < batchSize; bi++)
+    for (SizeType bi = 0; bi < batchSize; bi++)
     {
         auto const batchSlot = batchSlots[bi];
         if (beamWidth > 1)
         {
             idsPtrHost[mMaxBatchSize + batchSlot]
-                = outputs.parent_ids.value().template getPtrWithOffset<SizeType>(bi * beamWidth * maxSeqLen);
+                = outputs.parent_ids.value().template getPtrWithOffset<TokenIdType>(bi * beamWidth * maxSeqLen);
         }
         else
         {
@@ -787,11 +796,10 @@ void DynamicDecodeLayer<T>::prepareOutputData(OutputParams& outputs, ForwardPara
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto idsPtrHostSlice = ITensor::slice(idsPtrsHost, cyclicStep, 1);
     auto idsPtrHost = reinterpret_cast<TokenIdType**>(runtime::bufferCast<int64_t>(*idsPtrHostSlice));
-    auto const numNewTokens = outputs.medusaOutputs
-        ? outputs.medusaOutputs->acceptedLengths.template getPtr<SizeType const>()
-        : static_cast<SizeType*>(nullptr);
+    auto const numNewTokens
+        = outputs.medusaOutputs ? outputs.medusaOutputs->acceptedLengths.template getPtr<SizeType32 const>() : nullptr;
     invokeCopyNextStepIds(outputs.newTokens.template getPtr<TokenIdType>(), idsPtrHost,
-        outputs.sequence_length->template getPtr<SizeType>(), numNewTokens, batchSlots, batchSize, maxBatchSize,
+        outputs.sequence_length->template getPtr<SizeType32>(), numNewTokens, batchSlots, batchSize, maxBatchSize,
         beamWidth, maxSeqLen, maxTokensPerStep, stream);
 
     // Transpose the output log probs from [maxSeqLen, bs, beamWidth] to [batchSize, beamWidth, maxSeqLen]
@@ -801,7 +809,7 @@ void DynamicDecodeLayer<T>::prepareOutputData(OutputParams& outputs, ForwardPara
 
         invokeTransposeLogProbs(outputs.output_log_probs.value().template getPtr<float>(),
             outputs.output_log_probs_tiled.value().template getPtr<float>(),
-            outputs.sequence_length->template getPtr<SizeType>(), batchSlots, batchSize, maxBatchSize, beamWidth,
+            outputs.sequence_length->template getPtr<SizeType32>(), batchSlots, batchSize, maxBatchSize, beamWidth,
             logProbsMaxSeqLen, stream);
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);

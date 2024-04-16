@@ -26,6 +26,7 @@ from ..bindings import (DataType, GenerationInput, GenerationOutput,
 from ..bindings import SamplingConfig as GptSamplingConfig
 from ..bindings import WorldConfig
 from ..logger import logger
+from ..mapping import Mapping
 from .generation import (LogitsProcessor, LoraManager, SamplingConfig,
                          StoppingCriteria)
 from .model_runner import ModelRunnerMixin
@@ -78,6 +79,16 @@ class ModelRunnerCpp(ModelRunnerMixin):
         self.max_seq_len = max_seq_len
         self.max_beam_width = max_beam_width
         self.lora_manager = lora_manager
+        self.mapping = Mapping(
+            world_size=session.world_config.tensor_parallelism *
+            session.world_config.pipeline_parallelism,
+            rank=session.world_config.rank,
+            gpus_per_node=session.world_config.gpus_per_node,
+            tp_size=session.world_config.tensor_parallelism,
+            pp_size=session.world_config.pipeline_parallelism)
+        self.session_config = GptSessionConfig(max_batch_size=max_batch_size,
+                                               max_beam_width=max_beam_width,
+                                               max_sequence_length=max_seq_len)
 
     @classmethod
     def from_dir(cls,
@@ -238,7 +249,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
     def generate(self,
                  batch_input_ids: List[torch.Tensor],
                  sampling_config: Optional[SamplingConfig] = None,
-                 prompt_table_path: Optional[str] = None,
+                 prompt_table: Optional[Union[str, torch.Tensor]] = None,
                  prompt_tasks: Optional[str] = None,
                  lora_uids: Optional[list] = None,
                  streaming: bool = False,
@@ -257,8 +268,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 The sampling configuration to be used as base parametrization for the generation call.
                 The passed **kwargs matching the sampling_config's attributes will override them.
                 If the sampling_config is not provided, a default will be used.
-            prompt_table_path (str):
-                The file path of prompt table (.npy format, exported by nemo_prompt_convert.py).
+            prompt_table (str or torch.Tensor):
+                The file path of prompt table (.npy format, exported by nemo_prompt_convert.py) or the prompt table itself.
             prompt_tasks (str):
                 The prompt tuning task ids for the input batch, in format of comma-separated list (e.g., 0,3,1,0).
             lora_uids (list):
@@ -314,8 +325,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
         generation_input.stop_words_list = sampling_config.stop_words_list
 
         if self.max_prompt_embedding_table_size > 0:
-            ptuning_kwargs = self._prepare_ptuning(prompt_table_path,
-                                                   prompt_tasks, batch_size)
+            ptuning_kwargs = self._prepare_ptuning(prompt_table, prompt_tasks,
+                                                   batch_size)
             generation_input.prompt_tuning_params = PromptTuningParams(
                 **ptuning_kwargs)
             generation_input.prompt_tuning_params.prompt_tuning_enabled = [
@@ -331,10 +342,22 @@ class ModelRunnerCpp(ModelRunnerMixin):
                                      dtype=torch.int32,
                                      device=cuda_device)
         generation_output = GenerationOutput(output_ids, output_lengths)
-        if self.gather_generation_logits:
+        if sampling_config.output_cum_log_probs:
+            generation_output.cum_log_probs = torch.empty(
+                (batch_size, sampling_config.num_beams),
+                dtype=torch.float32,
+                device=cuda_device)
+        if sampling_config.output_log_probs:
+            generation_output.log_probs = torch.empty(
+                (batch_size, sampling_config.num_beams,
+                 self.max_input_len + sampling_config.max_new_tokens),
+                dtype=torch.float32,
+                device=cuda_device)
+        if self.gather_context_logits:
             generation_output.context_logits = torch.empty(
                 (batch_size, self.max_input_len, self.vocab_size_padded),
                 device=cuda_device)
+        if self.gather_generation_logits:
             generation_output.generation_logits = torch.zeros(
                 (batch_size, sampling_config.num_beams,
                  sampling_config.max_new_tokens, self.vocab_size_padded),
@@ -346,6 +369,10 @@ class ModelRunnerCpp(ModelRunnerMixin):
             outputs = {'output_ids': generation_output.ids}
             if sampling_config.output_sequence_lengths:
                 outputs['sequence_lengths'] = generation_output.lengths
+            if sampling_config.output_cum_log_probs:
+                outputs['cum_log_probs'] = generation_output.cum_log_probs
+            if sampling_config.output_log_probs:
+                outputs['log_probs'] = generation_output.log_probs
             if self.gather_context_logits:
                 outputs['context_logits'] = generation_output.context_logits
             if self.gather_generation_logits:

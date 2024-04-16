@@ -86,8 +86,9 @@ public:
     std::vector<TensorPtr> presentKeysValsAlt; // without attention plugin
     TensorPtr maxAttentionWindows;             // with attention plugin, host tensor
     TensorPtr sinkTokenLengths;                // with attention plugin, host tensor
-    TensorPtr kvCacheBlockPointersHost;        // [numLayers, batchSize * beamWidth, 2, maxBlocksPerSeq * 2]
-    TensorPtr kvCacheBlockPointersDevice;      // [numLayers, batchSize * beamWidth, 2, maxBlocksPerSeq * 2]
+    TensorPtr kvCacheBlockPoolPointers;
+    TensorPtr kvCacheBlockOffsetsHost;         // [batchSize * beamWidth, 2, maxBlocksPerSeq * 2]
+    TensorPtr kvCacheBlockOffsetsDevice;       // [batchSize * beamWidth, 2, maxBlocksPerSeq * 2]
 };
 
 } // namespace tensorrt_llm::runtime
