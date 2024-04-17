@@ -298,7 +298,7 @@ def from_cli_args(args):
     return config
 
 
-def preload_model(model_dir):
+def preload_model(model_dir, load_model_on_cpu):
     from transformers import AutoConfig, AutoModelForCausalLM
     if "vila" in model_dir:
         sys.path.append(model_dir + "/../VILA")
@@ -315,7 +315,7 @@ def preload_model(model_dir):
     else:
         model = AutoModelForCausalLM.from_pretrained(
             model_dir,
-            device_map='auto',
+            device_map='auto' if not load_model_on_cpu else 'cpu',
             torch_dtype='auto',
             trust_remote_code=True,
         )
@@ -352,7 +352,7 @@ def convert_and_save_hf(args):
     else:
         # When not loading by shard, preload one complete model and then slice per rank weights from this
         # this saves the disk reloading time
-        hf_model = preload_model(model_dir) if not args.load_by_shard else None
+        hf_model = preload_model(model_dir, args.load_model_on_cpu) if not args.load_by_shard else None
 
         def convert_and_save_rank(args, rank):
             mapping = Mapping(world_size=world_size,
