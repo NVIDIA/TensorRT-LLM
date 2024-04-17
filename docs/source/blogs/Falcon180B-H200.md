@@ -17,7 +17,7 @@ H200's large capacity & high memory bandwidth, utilizing INT4 AWQ to reduce
 memory footprint, allows for great performance on Falcon-180B on a single GPU.
 
 
-<img src="./media/Falcon180B-H200_tps.png" alt="Falcon-180B performance comparison" width="450" height="auto">
+<img src="https://github.com/NVIDIA/TensorRT-LLM/blob/rel/docs/source/blogs/media/Falcon180B-H200_tps.png?raw=true" alt="Falcon-180B performance comparison" width="450" height="auto">
 
 <sup>Preliminary measured Performance, subject to change. TP1 does not represent peak performance on H200. </sup>
 <sup>
@@ -33,7 +33,7 @@ Often quantization can have adverse impacts on the accuracy of the model,
 however, TensorRT-LLM's AWQ decreases memory footprint of the model by **4x**
 while maintaining high accuracy.
 
-<img src="./media/Falcon180B-H200_acc.png" alt="Falcon-180B accuracy comparison" width="600" height="auto">
+<img src="https://github.com/NVIDIA/TensorRT-LLM/blob/rel/docs/source/blogs/media/Falcon180B-H200_acc.png?raw=true" alt="Falcon-180B accuracy comparison" width="600" height="auto">
 
 
 <sup>Preliminary measured accuracy, subject to change. </sup>
@@ -68,7 +68,7 @@ than A100.
 
 **H200 6.7x A100**
 
-<img src="./media/Falcon180B-H200_H200vA100.png" alt="Llama-70B H200 vs A100 comparison" width="600" height="auto">
+<img src="https://github.com/NVIDIA/TensorRT-LLM/blob/rel/docs/source/blogs/media/Falcon180B-H200_H200vA100.png?raw=true" alt="Llama-70B H200 vs A100 comparison" width="600" height="auto">
 
 
 |Model     |GPUs | Input Length | Output Length | Throughput (out tok/s/GPU)|
@@ -93,7 +93,7 @@ BS: (in order) 960, 960, 192, 560, 96, 640 </sup>
 
 **TensorRT-LLM GQA now 2.4x faster on H200**
 
-<img src="./media/Falcon180B-H200_DecvOct.png" alt="Llama-70B H200 December vs Oct." width="400" height="auto">
+<img src="https://github.com/NVIDIA/TensorRT-LLM/blob/rel/docs/source/blogs/media/Falcon180B-H200_DecvOct.png?raw=true" alt="Llama-70B H200 December vs Oct." width="400" height="auto">
 
 <sup>Preliminary measured performance, subject to change.</sup>
 <sup>

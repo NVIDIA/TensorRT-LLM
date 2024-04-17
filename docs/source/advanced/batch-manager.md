@@ -1,3 +1,5 @@
+(batch-manager)=
+
 # The Batch Manager in TensorRT-LLM
 
 TensorRT-LLM relies on a component, called the Batch Manager, to support
@@ -17,7 +19,7 @@ how it returns completed requests to the user.
 
 A software component (called the client in the text that follows) can interact
 with the batch manager using two mandatory, and several optional callbacks. Their signatures are defined
-in the [`callbacks.h`](source:cpp/include/tensorrt_llm/batch_manager/callbacks.h) file.
+in the [`callbacks.h`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/batch_manager/callbacks.h) file.
 
 These callbacks are invoked in the generation loop at regular intervals and serve a variety of functions described below.
 
@@ -40,9 +42,7 @@ tensors and a 64-bit unsigned number (`uint64_t`) that will uniquely identify
 the request. That identifier is called the *request ID* in the text that
 follows (and in the code of the batch manager). The input tensors are collected
 in a map (`std::map<std::string, Tensor>`) that associates input names to
-tensor. See
-[`InferenceRequest.h`](source:cpp/include/tensorrt_llm/batch_manager/InferenceRequest.h)
-for more details.
+tensor. Refer to [`InferenceRequest.h`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/batch_manager/inferenceRequest.h) for more information.
 
 Responses are delivered to the client through a callback of type
 `SendResponseCallback`. A conforming callback must accept the 64-bit
@@ -58,7 +58,7 @@ Its signature is:
 using SendResponseCallback = std::function<void(uint64_t, std::list<std::shared_ptr<Tensor>> const&, bool, const std::string&)>;
 ```
 
-Note that the batch manager will reject any request sent using the
+The batch manager will reject any request sent using the
 `GetInferenceRequestsCallback` callback if the request ID passed by the
 client corresponds to the request ID of a request that is being processed
 by the batch manager.  A request ID can be reused after it appears in a

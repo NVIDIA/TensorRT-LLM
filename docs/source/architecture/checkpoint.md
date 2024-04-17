@@ -2,9 +2,7 @@
 
 ## Overview
 
-The earlier versions (pre-0.8 version) of TensorRT-LLM were developed with a very aggressive timeline. For those versions, emphasis was not put
-on defining a unified workflow. Now that TensorRT-LLM has reached some level of feature richness, the development team has
-decided to put more effort into unifying the APIs and workflow of TensorRT-LLM. This file documents the workflow around TensorRT-LLM checkpoint and the set of CLI tools to generate checkpoint, build engines, and evaluate engines.
+The earlier versions (pre-0.8 version) of TensorRT-LLM were developed with a very aggressive timeline. For those versions, emphasis was not put on defining a unified workflow. Now that TensorRT-LLM has reached some level of feature richness, the development team has decided to put more effort into unifying the APIs and workflow of TensorRT-LLM. This file documents the workflow around TensorRT-LLM checkpoint and the set of CLI tools to generate checkpoint, build engines, and evaluate engines.
 
 There are three steps in the workflow:
 
@@ -170,10 +168,8 @@ Here is the AWQ scaling factors of `mlp.fc` linear layer:
 - `transformer.layers.0.mlp.fc.weights_scaling_factor`
 - `transformer.layers.0.mlp.fc.prequant_scaling_factor`
 
-```{note}
-The linear weights in TensorRT-LLM checkpoint always follows (`out_feature`, `in_feature`) shape,
-whereas some quantized linear in TensorRT-LLM implemented by plugin may use (`in_feature`, `out_fature`) shape.
-The `trtllm-build` command adds a transpose operation to post-process it.
+    ```{note}
+    The linear weights in TensorRT-LLM checkpoint always follows (`out_feature`, `in_feature`) shape, whereas some quantized linear in TensorRT-LLM implemented by plugin may use (`in_feature`, `out_fature`) shape. The `trtllm-build` command adds a transpose operation to post-process it.
 
 ### Example
 

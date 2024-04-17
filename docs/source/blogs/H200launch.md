@@ -21,7 +21,7 @@ TensorRT-LLM evaluation of the [new H200 GPU](https://nvidianews.nvidia.com/news
 
 <sup>*(1) Largest batch supported on given TP configuration by power of 2.*</sup> <sup>*(2) TP = Tensor Parallelism*</sup>
 
-Additional Performance data is available on the [NVIDIA Data Center Deep Learning Product Performance](https://developer.nvidia.com/deep-learning-performance-training-inference/ai-inference) page, & soon in [TensorRT-LLM's Performance Documentation](https://nvidia.github.io/TensorRT-LLM/performance.html).
+Additional Performance data is available on the [NVIDIA Data Center Deep Learning Product Performance](https://developer.nvidia.com/deep-learning-performance-training-inference/ai-inference) page, & soon in [TensorRT-LLM's Performance Documentation](../performance/perf-overview.md).
 
 ### H200 vs H100
 
@@ -35,7 +35,7 @@ For practical examples of H200's performance:
 **Max Throughput TP8:**
 an online chat agent scenario (ISL/OSL=80/200) with GPT3-175B on a full HGX (TP8) H200 is 1.6x more performant than H100.
 
-<img src="media/H200launch_tps.png" alt="H200 TPS" width="500" height="auto">
+<img src="https://github.com/NVIDIA/TensorRT-LLM/blob/rel/docs/source/blogs/media/H200launch_tps.png?raw=true" alt="H200 TPS" width="500" height="auto">
 
 <sub>Preliminary measured performance, subject to change.
 TensorRT-LLM v0.5.0, TensorRT v9.1.0.4. | Llama-70B: H100 FP8 BS 8, H200 FP8 BS 32 | GPT3-175B: H100 FP8 BS 64, H200 FP8 BS 128 </sub>
@@ -44,7 +44,7 @@ TensorRT-LLM v0.5.0, TensorRT v9.1.0.4. | Llama-70B: H100 FP8 BS 8, H200 FP8 BS 
 **Max Throughput across TP/BS:**
 Max throughput<sup>(3)</sup> on H200 vs H100 varies by model, sequence lengths, BS, and TP. Below results shown for maximum throughput per GPU across all these variables.
 
-<img src="media/H200launch_H200vsH100_tps.png" alt="max throughput llama sweep" width="500" height="auto">
+<img src="https://github.com/NVIDIA/TensorRT-LLM/blob/rel/docs/source/blogs/media/H200launch_H200vsH100_tps.png?raw=true" alt="max throughput llama sweep" width="500" height="auto">
 
 <sub>Preliminary measured performance, subject to change.
 TensorRT-LLM v0.5.0, TensorRT v9.1.0.4 | H200, H100 FP8. </sub>

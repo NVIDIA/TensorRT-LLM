@@ -1,7 +1,10 @@
+(inference-request)=
+
 # Inference Request
 
 The main class to describe requests to `GptManager` is `InferenceRequest`. This is structured as a map of tensors and a `uint64_t requestId`.
-The mandatory tensors to create a valid `InferenceRequest` object are described below. Sampling Config params are documented in more detail [here](gpt_runtime.md#sampling-parameters), and descriptions are omitted in the table:
+The mandatory tensors to create a valid `InferenceRequest` object are described below. Sampling config params are documented in the {ref}`gpt-runtime` section. Descriptions have been omitted in the table.
+
 | Name | Shape | Type | Description |
 | :----------------------: | :----------------------------: | :-----------------------------: | :-----------------------------: |
 | `request_output_len` | [1,1] | `int32_t` | Max number of output tokens |
@@ -30,8 +33,8 @@ Optional tensors that can be supplied to `InferenceRequest` are shown below. Def
 | `prompt_embedding_table` | [1] | `float16` | P-tuning prompt embedding table |
 | `prompt_vocab_size` | [1] | `int32_t` | P-tuning prompt vocab size |
 | `lora_task_id` | [1] | `uint64_t` | Task ID for the given lora_weights.  This ID is expected to be globally unique.  To perform inference with a specific LoRA for the first time `lora_task_id` `lora_weights` and `lora_config` must all be given.  The LoRA will be cached, so that subsequent requests for the same task only require `lora_task_id`. If the cache is full the oldest LoRA will be evicted to make space for new ones.  An error is returned if `lora_task_id` is not cached |
-| `lora_weights` | [ num_lora_modules_layers, D x Hi + Ho x D ] | `float` (model data type) | weights for a lora adapter. see [lora docs](lora.md#lora-tensor-format-details) for more details. |
-| `lora_config` | [num_lora_modules_layers, 3] | `int32_t` | lora configuration tensor. `[ module_id, layer_idx, adapter_size (D aka R value) ]` see [lora docs](lora.md#lora-tensor-format-details) for more details. |
+| `lora_weights` | [num_lora_modules_layers, D x Hi + Ho x D] | `float` (model data type) | weights for a LoRA adapter. Refer to {ref}`lora` for more information. |
+| `lora_config` | [num_lora_modules_layers, 3] | `int32_t` | LoRA configuration tensor. `[ module_id, layer_idx, adapter_size (D aka R value) ]` Refer to {ref}`lora` for more information. |
 | `return_log_probs` | [1] | `bool` | When `true`, include log probs in the output |
 | `return_context_logits` | [1] | `bool` | When `true`, include context logits in the output |
 | `return_generation_logits` | [1] | `bool` | When `true`, include generation logits in the output |
