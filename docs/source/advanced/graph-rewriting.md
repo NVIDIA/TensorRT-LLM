@@ -1,12 +1,16 @@
+(graph-rewriting)=
+
+
 # Graph Rewriting Module
 
-TensorRT-LLM adopts a declarative approach to define a neural network. It provides a wrapper similar to PyTorch's Module. When a user invokes the `forward` method, the layers are lowered to TensorRT's `ILayer`s and become part of an `INetworkDefinition`. The Graph Rewriting (GW) module can be used to manipulate the network at the `ILayer`/`INetworkDefinition` level.
+TensorRT-LLM uses a declarative approach to define neural networks and contains
+techniques to optimize the underlying graph.  It provides a wrapper similar to PyTorch's Module. When a user invokes the `forward` method, the layers are lowered to TensorRT's `ILayer`s and become part of an `INetworkDefinition`. The Graph Rewriting (GW) module can be used to manipulate the network at the `ILayer`/`INetworkDefinition` level.
 
 ## When to Use Graph Rewriting?
 
 For network manipulation, there are two options in TensorRT-LLM:
 
-1. **Module Rewriting:** This method modifies the members of `Module` instances before triggering the `forward` method(i.e. creating the TensorRT graph). It works on the highest level of the network representation and facilitates the modification of sequences of operations (like modifying the GEMM + activation for SmoothQuant),
+1. **Module Rewriting:** This method modifies the members of `Module` instances before triggering the `forward` method (that is, creating the TensorRT graph). It works on the highest level of the network representation and facilitates the modification of sequences of operations (like modifying the GEMM + activation for SmoothQuant),
 
 2. **Graph Rewriting:** Graph Rewriting manipulates TensorRT's `INetworkDefinition` after the `forward` method is triggered. It operates at a finer-grained `ILayer` level and can alter the structure across multiple Module instances. It is typically used for layer fusion.
 

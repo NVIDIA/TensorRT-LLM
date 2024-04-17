@@ -1,3 +1,5 @@
+(lora)=
+
 ## Run gpt-2b + LoRA using GptManager / cpp runtime
 
 First build a model with LoRA and inflight-batching enabled.
@@ -28,41 +30,40 @@ trtllm-build --checkpoint_dir /tmp/llama_7b/trt_ckpt/fp16/1-gpu/ \
 ```
 
 To pass LoRAs into the cpp runtime they must be converted to the format below.
-The script below will convert a huggingface LoRA model to the correct numpy tensors.
+The script below will convert a Hugging Face LoRA model to the correct NumPy tensor.
 
 ```bash
 python3 tensorrt_llm/examples/hf_lora_convert.py -i Japanese-Alpaca-LoRA-7b-v0 -o Japanese-Alpaca-LoRA-7b-v0-weights --storage-type float16
 python3 tensorrt_llm/examples/hf_lora_convert.py -i luotuo-lora-7b-0.1 -o luotuo-lora-7b-0.1-weights --storage-type float16
 ```
 
-See tensorrtllm_backend [docs](https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/inflight_batcher_llm/README.md) for a Multi-LoRA example using Triton.
+Refer to the [tensorrtllm_backend documentation](https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/inflight_batcher_llm/README.md) for a Multi-LoRA example using Triton.
 
 ### LoRA tensor format details
 
-To run inference with LoRA weights using GptManager, InferenceRequests must have LoraWeights (lora_weights) and LoraConfig (lora_config) parameters.
+To run inference with `LoraWeights` using `GptManager`, `InferenceRequests` must have `LoraWeights` (`lora_weights`) and `LoraConfig` (`lora_config`) parameters.
 
-'LoraTaskId` the unique task ID for the given LoRA.
+`LoraTaskId` the unique task ID for the given LoRA.
 
-To perform inference with a specific LoRA for the first time `lora_task_id` `lora_weights` and `lora_config` must all be given.
-The LoRA will be cached, so that subsequent requests for the same task only require `lora_task_id`.
-If the cache is full the oldest LoRA will be evicted to make space for new ones.  An error is returned if `lora_task_id` is not cached.
+To perform inference with a specific LoRA for the first time, `lora_task_id`, `lora_weights`, and `lora_config` must all be given. The LoRA will be cached, so that subsequent requests for the same task only require `lora_task_id`.
+If the cache is full, the oldest LoRA will be evicted to make space for new ones. An error is returned if `lora_task_id` is not cached.
 
-`LoraWeights` contains the weights for all the LoRAs. Currently this should include weight for all tp and pp ranks.
-The weights tensor has the shape `[ num_lora_modules_layers, D x Hi + Ho x D ]`. the last dimension holds the in / out adapter weights for the associated module (e.g. attn_qkv) and model layer.
+`LoraWeights` contains the weights for all the LoRAs. Currently, this should include weights for all TP and PP ranks.
+The weights tensor has the shape `[num_lora_modules_layers, D x Hi + Ho x D ]`. The last dimension holds the in / out adapter weights for the associated module (for example, `attn_qkv`) and model layer.
+
 Each of the in / out tensors are first flattened and then concatenated together in the format above.
-The first dimension (of size `num_lora_module_layers`) has an entry for each module-layer (ie there is an entry for attn_q layer1 and another for attn_k layer1).
+The first dimension (of size `num_lora_module_layers`) has an entry for each module-layer (that is, there is an entry for `attn_q layer1` and another for `attn_k layer1`).
 
 `D=adapter_size (i.e. R value), Hi=hidden_size_in, Ho=hidden_size_out.`
 
-`LoraConfig` is a configuration tensor which identifies the moduleId, layerId, and adapter size of each element of `LoraWeights`.
-It has the shape `[num_lora_modules_layers, 3]`.
-The last dimension holds `[ module_id, layer_idx, adapter_size D (i.e. R value) ]`
+`LoraConfig` is a configuration tensor which identifies the moduleId, layerId, and adapter size of each element of `LoraWeights`. It has the shape `[num_lora_modules_layers, 3]`. The last dimension holds `[module_id, layer_idx, adapter_size D (i.e. R value)]`.
 
-Reference: This feature supports LoRAs as described in https://arxiv.org/pdf/2106.09685.pdf
+This feature supports LoRAs as described in https://arxiv.org/pdf/2106.09685.pdf
 
 #### Example LoRA tensors
-Here is an example of loraWeights and loraConfig tensors for a model with tp=1, pp=1, 4 layers, and a hidden size of 4.
-The tensors below are for a LoRA which has a `q` and `k` adapter.
+
+Here is an example of `LoraWeights` and `LoraConfig` tensors for a model with tp=1, pp=1, 4 layers, and a hidden size of 4.
+The following tensors are for a LoRA which has a `q` and `k` adapter.
 
 ```
 # loraConfig
@@ -92,9 +93,7 @@ The tensors below are for a LoRA which has a `q` and `k` adapter.
 
 #### LoRA Module id mapping
 
-See LoraModule::ModuleType for model id mapping
-
-| module name (as specified in convert_checkpoint.py scripts) | module id | description |
+| module name (as specified in `convert_checkpoint.py` scripts) | module id | description |
 | --------------------------------------------- | --------- | ----------- |
 | attn_qkv | 0 | compbined qkv adapter |
 | attn_q | 1 | q adapter |
@@ -113,5 +112,7 @@ See LoraModule::ModuleType for model id mapping
 #### LoraCache configuration
 
 The core idea is that we will have a fixed size, 2-level LoRA cache in TRT-LLM. The higher level cache resides on the host and the lower level is on GPU (distinct from the existing KV cache). Sizes of both are user configurable.
+
 The CPU cache is configured to be a max size.  The GPU cache is configured to a percentage of free GPU memory after engine load. As requests come in LoRAs are stored in the host cache.
-As requests are scheduled for execution LoRAs are loaded into the GPU cache. See [batch_manager docs](/docs/source/batch_manager.md) for more details.
+
+As requests are scheduled for execution LoRAs are loaded into the GPU cache. Refer to the {ref}`batch-manager` section for more information.

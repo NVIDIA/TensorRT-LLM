@@ -8,7 +8,7 @@ Support matrix and usage flags are described in [docs/source/gpt_attention](/doc
 Looking at the Throughput-Latency curves below, we see that the enabling of XQA optimization increases throughput. Higher throughput equates to serving more users, and we can see that TPOT on the Y-axis flattens out when XQA gets enabled.
 
 
-<img src="./media/XQA_ThroughputvsLatency.png" alt="XQA increased throughput within same latency budget" width="950" height="auto">
+<img src="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/media/XQA_ThroughputvsLatency.png" alt="XQA increased throughput within same latency budget" width="950" height="auto">
 
 <sub>Preliminary measured Performance, subject to change. TPOT lower is better. FP8, 8xH100 GPUs, Single Engine, ISL/OSL: 512/2048, BS: 1 - 256, TensorRT-LLM v0.8a</sub>
 

@@ -1,44 +1,8 @@
-# TensorRT-LLM Architecture
+(core-concepts)=
 
-TensorRT-LLM is a toolkit to assemble optimized solutions to perform Large
-Language Model (LLM) inference. It offers a Python API to define models and
-compile efficient [TensorRT](https://developer.nvidia.com/tensorrt) engines for
-NVIDIA GPUs. It also contains Python and C++ components to build runtimes to
-execute those engines as well as backends for the [Triton Inference
-Server](https://developer.nvidia.com/nvidia-triton-inference-server) to easily
-create web-based services for LLMs. TensorRT-LLM supports multi-GPU and
-multi-node configurations (through MPI).
+# Model Definition
 
-As a user, the very first step to create an inference solution is to either
-define your own model or select a pre-defined network architecture (see
-[here]() for the list of models supported by TensorRT-LLM). Once defined, that
-model must be trained using a training framework (training is outside of the
-scope of TensorRT-LLM). For pre-defined models, checkpoints can be downloaded
-from various providers.  To illustrate that point, a lot of examples in
-TensorRT-LLM use model weights obtained from the
-[HuggingFace](https://huggingface.co) hub and trained using [NVIDIA
-Nemo](https://developer.nvidia.com/nemo) or [PyTorch](https://pytorch.org).
-
-Equipped with the model definition and the weights, a user must use
-TensorRT-LLM's Python API to recreate the model in a way that can be compiled
-by TensorRT into an efficient engine. For ease of use, TensorRT-LLM already
-supports a handful of standard models.
-
-Together with the Python API to describe models, TensorRT-LLM provides users
-with components to create a runtime that executes the efficient TensorRT
-engine. Runtime components offer beam-search, along with extensive sampling
-functionalities such as top-K and top-P sampling. The exhaustive list can be
-found in the documentation of the [Runtime](./gpt_runtime.md). The C++ runtime
-is the recommended runtime.
-
-TensorRT-LLM also includes Python and C++ backends for NVIDIA Triton Inference
-Server to assemble solutions for LLM online serving. The C++ backend implements
-in-flight batching as explained in the [Batch Manager](./batch_manager.md)
-documentation and is the recommended backend.
-
-## Model Definition
-
-As mentioned above, TensorRT-LLM has a Python API that can be used to define
+TensorRT-LLM has a Python API that can be used to define
 Large Language Models. This API is built on top of the powerful
 [TensorRT Python API](https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/index.html#)
 to create graph representations of deep neural networks in TensorRT. To become
@@ -96,7 +60,7 @@ traversal API exposed by the
 class. That graph will also be optimized by TensorRT during the compilation of
 the engine, as explained in the next section.
 
-## Compilation
+# Compilation
 
 Once populated, the instance of the
 [`tensorrt.INetworkDefinition`](https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Graph/Network.html#tensorrt.INetworkDefinition),
@@ -112,7 +76,21 @@ object. That call, if everything works as expected, produces an instance of the
 class. That object is an optimized TensorRT engine that can be stored as a
 binary file.
 
-### Weight Bindings
+## TensorRT Compiler
+
+The TensorRT compiler can sweep through the graph to choose the best kernel for each operation and available GPU. Crucially, it can also identify patterns in the graph where multiple operations are good candidates for being fused into a single kernel. This reduces the required amount of memory movement and the overhead of launching multiple GPU kernels.
+
+TensorRT also compiles the graph of operations into a single [CUDA Graph](https://developer.nvidia.com/blog/cuda-graphs/) that can be launched all at one time, further reducing the kernel launch overhead.
+
+The TensorRT compiler is extremely powerful for fusing layers and increasing execution speed, but there are some complex layer fusions—like [FlashAttention](https://arxiv.org/abs/2307.08691) — that involve interleaving many operations together and which can’t be automatically discovered. For those, you can explicitly replace parts of the graph with [plugins](https://nvidia.github.io/TensorRT-LLM/architecture.html#plugins) at compile time.
+
+## Model Engine
+
+The engine file contains the information that you need for executing the model, but LLM usage in practice requires much more than a single forward pass through the model. TensorRT-LLM includes a highly optimized C++ runtime for executing built LLM engines and managing processes like sampling tokens from the model output, managing the KV cache, and batching requests together.
+
+You can use that runtime directly to execute the model locally, or you can use the TensorRT-LLM runtime backend for NVIDIA Triton Inference Server to serve the model for multiple users.
+
+## Weight Bindings
 
 TensorRT engines embed the network weights, that must be known for compilation.
 For that reason, the weights must be bound to parameters in the model
@@ -136,7 +114,7 @@ engines to update the weights after compilation. This feature is available to
 TensorRT-LLM users through the `refit_engine` method in the
 `tensorrt_llm.Builder` class.
 
-### Pattern-Matching and Fusion
+## Pattern-Matching and Fusion
 
 One of the key steps performed by TensorRT when it compiles the network graph
 is the fusion of operations. Fusion is a well-known technique to improve the
@@ -172,7 +150,7 @@ called _pattern-matching_. TensorRT has a powerful pattern-matching algorithm
 that can identify a lot of possible fusions. All the identified patterns are
 converted into more efficient kernels by an advanced kernel compiler.
 
-### Plugins
+## Plugins
 
 The number of possible fusions is almost infinite and some useful fusions
 involve very advanced modifications of the graph. A well-known example
@@ -229,7 +207,7 @@ void invokeQuantization(...) {
 For more details on how TensorRT-LLM implements the GPT Attention operator, see
 the [Multi-head, Multi-query and Group-query Attention](gpt_attention.md) document.
 
-## Runtime
+# Runtime
 
 TensorRT-LLM includes an API to implement Python and C++ runtimes. The role of
 the runtime components is to load the TensorRT engines and drive their
@@ -238,7 +216,9 @@ charge of loading the engine that implements both the processing of the input
 sequence as well as the body of the generation loop. See the [GPT C++
 Runtime](gpt_runtime.md) document for details on the C++ Runtime.
 
-### Multi-GPU and Multi-Node Support
+(multi-gpu-multi-node)=
+
+# Multi-GPU and Multi-Node Support
 
 Even if TensorRT is designed for single-GPU systems, TensorRT-LLM adds the
 support for systems with multiple GPUs and nodes. It is enabled
@@ -274,9 +254,3 @@ subsets of layers. Tensor Parallelism usually leads to more balanced executions
 but requires more memory bandwidth between the GPUs. Pipeline Parallelism
 reduces the need for high-bandwidth communication but may incur load-balancing
 issues and may be less efficient in terms of GPU utilization.
-
-## In-flight Batching
-
-TensorRT-LLM supports in-flight batching of requests (also known as continuous
-batching or iteration-level batching) for higher serving throughput. See the
-[Batch Manager](./batch_manager.md) document for more details.
