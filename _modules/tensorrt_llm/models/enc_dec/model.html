@@ -41,24 +41,56 @@
   </form>
 </div>
         </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
-              <p class="caption" role="heading"><span class="caption-text">Contents:</span></p>
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
 <ul>
-<li class="toctree-l1"><a class="reference internal" href="../../../../architecture.html">TensorRT-LLM Architecture</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../gpt_runtime.html">C++ GPT Runtime</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../batch_manager.html">The Batch Manager in TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../inference_request.html">Inference Request</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../gpt_attention.html">Multi-head, Multi-query and Group-query Attention</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../precision.html">Numerical Precision</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../build_from_source.html">Build from Source</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../performance.html">Performance of TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../2023-05-19-how-to-debug.html">How to debug</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../2023-05-17-how-to-add-a-new-model.html">How to add a new model</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../graph-rewriting.html">Graph Rewriting Module</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../memory.html">Memory Usage of TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../new_workflow.html">New Workflow</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../perf_best_practices.html">Best Practices for Tuning the Performance of TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../performance_analysis.html">Performance Analysis of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../release-notes.html">Release Notes</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../installation/windows.html">Installing on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../architecture/core-concepts.html">Model Definition</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../architecture/core-concepts.html#compilation">Compilation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../architecture/core-concepts.html#runtime">Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../architecture/core-concepts.html#multi-gpu-and-multi-node-support">Multi-GPU and Multi-Node Support</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/inference-request.html">Inference Request</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../performance/perf-best-practices.html">Best Practices for Tuning the Performance of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../performance/perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Python API</span></p>
 <ul>
@@ -69,16 +101,13 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
 </ul>
-<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="../../../../_cpp_gen/runtime.html">Runtime</a></li>
-</ul>
 <p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
 </ul>
 
         </div>
@@ -122,7 +151,7 @@
 <span class="c1"># limitations under the License.</span>
 <span class="kn">import</span> <span class="nn">math</span>
 <span class="kn">from</span> <span class="nn">collections</span> <span class="kn">import</span> <span class="n">OrderedDict</span>
-<span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="n">Optional</span>
+<span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="n">List</span><span class="p">,</span> <span class="n">Optional</span>
 
 <span class="kn">import</span> <span class="nn">tensorrt</span> <span class="k">as</span> <span class="nn">trt</span>
 
@@ -131,14 +160,16 @@
 <span class="kn">from</span> <span class="nn">tensorrt_llm.functional</span> <span class="kn">import</span> <span class="p">(</span><span class="n">LayerNormPositionType</span><span class="p">,</span> <span class="n">LayerNormType</span><span class="p">,</span>
                                      <span class="n">MLPType</span><span class="p">,</span> <span class="n">PositionEmbeddingType</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span>
                                      <span class="n">assertion</span><span class="p">,</span> <span class="n">gather_last_token_logits</span><span class="p">,</span> <span class="n">gelu</span><span class="p">,</span>
-                                     <span class="n">recv</span><span class="p">,</span> <span class="n">send</span><span class="p">,</span> <span class="n">shape</span><span class="p">,</span> <span class="n">transpose</span><span class="p">)</span>
+                                     <span class="n">maximum</span><span class="p">,</span> <span class="n">minimum</span><span class="p">,</span> <span class="n">recv</span><span class="p">,</span> <span class="n">send</span><span class="p">,</span> <span class="n">shape</span><span class="p">,</span>
+                                     <span class="n">transpose</span><span class="p">)</span>
 <span class="kn">from</span> <span class="nn">tensorrt_llm.layers</span> <span class="kn">import</span> <span class="p">(</span><span class="n">MLP</span><span class="p">,</span> <span class="n">Attention</span><span class="p">,</span> <span class="n">AttentionMaskType</span><span class="p">,</span>
                                  <span class="n">AttentionParams</span><span class="p">,</span> <span class="n">BertAttention</span><span class="p">,</span> <span class="n">ColumnLinear</span><span class="p">,</span>
                                  <span class="n">Conv1d</span><span class="p">,</span> <span class="n">Embedding</span><span class="p">,</span> <span class="n">FusedGatedMLP</span><span class="p">,</span> <span class="n">GatedMLP</span><span class="p">,</span>
                                  <span class="n">GroupNorm</span><span class="p">,</span> <span class="n">KeyValueCacheParams</span><span class="p">,</span> <span class="n">LayerNorm</span><span class="p">,</span>
-                                 <span class="n">PromptTuningEmbedding</span><span class="p">,</span> <span class="n">RmsNorm</span><span class="p">)</span>
+                                 <span class="n">LoraParams</span><span class="p">,</span> <span class="n">PromptTuningEmbedding</span><span class="p">,</span> <span class="n">RmsNorm</span><span class="p">)</span>
 <span class="kn">from</span> <span class="nn">tensorrt_llm.mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
 <span class="kn">from</span> <span class="nn">tensorrt_llm.models.generation_mixin</span> <span class="kn">import</span> <span class="n">GenerationMixin</span>
+<span class="kn">from</span> <span class="nn">tensorrt_llm.models.modeling_utils</span> <span class="kn">import</span> <span class="n">optimize_model</span>
 <span class="kn">from</span> <span class="nn">tensorrt_llm.module</span> <span class="kn">import</span> <span class="n">Module</span><span class="p">,</span> <span class="n">ModuleList</span>
 <span class="kn">from</span> <span class="nn">tensorrt_llm.parameter</span> <span class="kn">import</span> <span class="n">Parameter</span>
 <span class="kn">from</span> <span class="nn">tensorrt_llm.plugin.plugin</span> <span class="kn">import</span> <span class="n">current_all_reduce_helper</span>
@@ -235,7 +266,7 @@
                 <span class="n">prompt_tasks</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">prompt_vocab_size</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
         <span class="c1"># position_ids and token_type_ids are provided inputs</span>
-        <span class="c1"># and should not be formulated determinisitically</span>
+        <span class="c1"># and should not be formulated deterministically</span>
 
         <span class="n">ptuning_args</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_prompt_tuning</span><span class="p">:</span>
@@ -281,7 +312,8 @@
                  <span class="n">residual_scaling</span><span class="o">=</span><span class="mf">1.0</span><span class="p">,</span>
                  <span class="n">relative_attention</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                  <span class="n">max_distance</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
-                 <span class="n">num_buckets</span><span class="o">=</span><span class="mi">0</span><span class="p">):</span>
+                 <span class="n">num_buckets</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+                 <span class="n">fp16_clamping</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
 
         <span class="c1"># e.g. BART regular, T5 RMS</span>
@@ -331,11 +363,17 @@
 
         <span class="bp">self</span><span class="o">.</span><span class="n">residual_scaling</span> <span class="o">=</span> <span class="n">residual_scaling</span>
 
+        <span class="c1"># T5-series model(e.g. t5-large, t5-3b, flan-t5-small) has accuracy issue due to fp16 overflow</span>
+        <span class="c1"># after residual add. We add workaround for clamping fp16 range [-64000, 64000] after every</span>
+        <span class="c1"># residual add to avoid accuracy drop.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">fp16_clamping</span> <span class="o">=</span> <span class="n">fp16_clamping</span>
+
     <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                 <span class="n">hidden_states</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
                 <span class="n">attention_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">input_lengths</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">max_input_length</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+                <span class="n">max_input_length</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">lora_layer_params</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
         <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">)</span>
 
         <span class="c1"># self attention</span>
@@ -347,11 +385,16 @@
         <span class="n">attention_output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span>
                                           <span class="n">attention_mask</span><span class="o">=</span><span class="n">attention_mask</span><span class="p">,</span>
                                           <span class="n">input_lengths</span><span class="o">=</span><span class="n">input_lengths</span><span class="p">,</span>
-                                          <span class="n">max_input_length</span><span class="o">=</span><span class="n">max_input_length</span><span class="p">)</span>
+                                          <span class="n">max_input_length</span><span class="o">=</span><span class="n">max_input_length</span><span class="p">,</span>
+                                          <span class="n">lora_layer_params</span><span class="o">=</span><span class="n">lora_layer_params</span><span class="p">)</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">register_network_output</span><span class="p">(</span><span class="s1">&#39;attention_output&#39;</span><span class="p">,</span> <span class="n">attention_output</span><span class="p">)</span>
 
         <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">residual</span> <span class="o">+</span> <span class="n">attention_output</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">fp16_clamping</span><span class="p">:</span>
+            <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">maximum</span><span class="p">(</span><span class="o">-</span><span class="mf">64000.0</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">)</span>
+            <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">minimum</span><span class="p">(</span><span class="mf">64000.0</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">layernorm_position</span> <span class="o">==</span> <span class="n">LayerNormPositionType</span><span class="o">.</span><span class="n">post_layernorm</span><span class="p">:</span>
             <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_layernorm</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
@@ -362,11 +405,16 @@
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">layernorm_position</span> <span class="o">==</span> <span class="n">LayerNormPositionType</span><span class="o">.</span><span class="n">pre_layernorm</span><span class="p">:</span>
             <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mlp_layernorm</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
 
-        <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+        <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span>
+                                 <span class="n">lora_layer_params</span><span class="o">=</span><span class="n">lora_layer_params</span><span class="p">)</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">register_network_output</span><span class="p">(</span><span class="s1">&#39;mlp_output&#39;</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">)</span>
 
         <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">residual</span> <span class="o">+</span> <span class="n">hidden_states</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">fp16_clamping</span><span class="p">:</span>
+            <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">maximum</span><span class="p">(</span><span class="o">-</span><span class="mf">64000.0</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">)</span>
+            <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">minimum</span><span class="p">(</span><span class="mf">64000.0</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">layernorm_position</span> <span class="o">==</span> <span class="n">LayerNormPositionType</span><span class="o">.</span><span class="n">post_layernorm</span><span class="p">:</span>
             <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mlp_layernorm</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
@@ -377,6 +425,8 @@
 <span class="k">class</span> <span class="nc">DecoderLayer</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
     <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                 <span class="o">*</span><span class="p">,</span>
+                 <span class="n">local_layer_idx</span><span class="p">,</span>
                  <span class="n">hidden_size</span><span class="p">,</span>
                  <span class="n">ffn_hidden_size</span><span class="p">,</span>
                  <span class="n">num_attention_heads</span><span class="p">,</span>
@@ -396,7 +446,9 @@
                  <span class="n">residual_scaling</span><span class="o">=</span><span class="mf">1.0</span><span class="p">,</span>
                  <span class="n">relative_attention</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                  <span class="n">max_distance</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
-                 <span class="n">num_buckets</span><span class="o">=</span><span class="mi">0</span><span class="p">):</span>
+                 <span class="n">num_buckets</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+                 <span class="n">fp16_clamping</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                 <span class="n">skip_cross_qkv</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
 
         <span class="c1"># e.g. BART regular, T5 RMS</span>
@@ -408,8 +460,9 @@
 
         <span class="c1"># e.g. BART q_scaling = 1.f, T5 q_scaling = 1.f/sqrt(head_size)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">self_attention</span> <span class="o">=</span> <span class="n">Attention</span><span class="p">(</span>
-            <span class="n">hidden_size</span><span class="p">,</span>
-            <span class="n">num_attention_heads</span><span class="p">,</span>
+            <span class="n">local_layer_idx</span><span class="o">=</span><span class="n">local_layer_idx</span><span class="p">,</span>
+            <span class="n">hidden_size</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
+            <span class="n">num_attention_heads</span><span class="o">=</span><span class="n">num_attention_heads</span><span class="p">,</span>
             <span class="n">attention_head_size</span><span class="o">=</span><span class="n">head_size</span><span class="p">,</span>
             <span class="n">num_kv_heads</span><span class="o">=</span><span class="n">num_kv_heads</span><span class="p">,</span>
             <span class="n">max_position_embeddings</span><span class="o">=</span><span class="n">max_position_embeddings</span><span class="p">,</span>
@@ -439,8 +492,9 @@
         <span class="c1">#</span>
         <span class="c1"># e.g. BART q_scaling = 1.f, T5 q_scaling = 1.f/sqrt(head_size)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">cross_attention</span> <span class="o">=</span> <span class="n">Attention</span><span class="p">(</span>
-            <span class="n">hidden_size</span><span class="p">,</span>
-            <span class="n">num_attention_heads</span><span class="p">,</span>
+            <span class="n">local_layer_idx</span><span class="o">=</span><span class="n">local_layer_idx</span><span class="p">,</span>
+            <span class="n">hidden_size</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
+            <span class="n">num_attention_heads</span><span class="o">=</span><span class="n">num_attention_heads</span><span class="p">,</span>
             <span class="n">attention_head_size</span><span class="o">=</span><span class="n">head_size</span><span class="p">,</span>
             <span class="n">num_kv_heads</span><span class="o">=</span><span class="n">num_kv_heads</span><span class="p">,</span>
             <span class="n">max_position_embeddings</span><span class="o">=</span><span class="n">max_position_embeddings</span><span class="p">,</span>
@@ -456,7 +510,8 @@
             <span class="kc">False</span><span class="p">,</span>  <span class="c1"># Cross attention has no relative attention bias</span>
             <span class="n">max_distance</span><span class="o">=</span><span class="n">max_distance</span><span class="p">,</span>
             <span class="n">num_buckets</span><span class="o">=</span><span class="n">num_buckets</span><span class="p">,</span>
-            <span class="n">position_embedding_type</span><span class="o">=</span><span class="n">PositionEmbeddingType</span><span class="o">.</span><span class="n">learned_absolute</span><span class="p">)</span>
+            <span class="n">position_embedding_type</span><span class="o">=</span><span class="n">PositionEmbeddingType</span><span class="o">.</span><span class="n">learned_absolute</span><span class="p">,</span>
+            <span class="n">skip_cross_qkv</span><span class="o">=</span><span class="n">skip_cross_qkv</span><span class="p">)</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">cross_attention_layernorm</span> <span class="o">=</span> <span class="n">ln_type</span><span class="p">(</span><span class="n">normalized_shape</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
                                                  <span class="n">eps</span><span class="o">=</span><span class="n">layernorm_eps</span><span class="p">,</span>
@@ -481,6 +536,11 @@
 
         <span class="bp">self</span><span class="o">.</span><span class="n">residual_scaling</span> <span class="o">=</span> <span class="n">residual_scaling</span>
 
+        <span class="c1"># T5-series model(e.g. t5-large, t5-3b, flan-t5-small) has accuracy issue due to fp16 overflow</span>
+        <span class="c1"># after residual add. We add workaround for clamping fp16 range [-64000, 64000] after every</span>
+        <span class="c1"># residual add to avoid accuracy drop.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">fp16_clamping</span> <span class="o">=</span> <span class="n">fp16_clamping</span>
+
     <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                 <span class="n">hidden_states</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
                 <span class="n">encoder_output</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -488,7 +548,10 @@
                 <span class="n">cross_attention_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">use_cache</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                 <span class="n">kv_cache_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">attention_params</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+                <span class="n">attention_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">lora_layer_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">cross_kv_cache_gen</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                <span class="n">cross_qkv_reuse</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
         <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="n">encoder_output</span><span class="p">:</span>
@@ -505,7 +568,8 @@
             <span class="n">attention_mask</span><span class="o">=</span><span class="n">attention_mask</span><span class="p">,</span>
             <span class="n">use_cache</span><span class="o">=</span><span class="n">use_cache</span><span class="p">,</span>
             <span class="n">kv_cache_params</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="p">,</span>
-            <span class="n">attention_params</span><span class="o">=</span><span class="n">attention_params</span><span class="p">)</span>
+            <span class="n">attention_params</span><span class="o">=</span><span class="n">attention_params</span><span class="p">,</span>
+            <span class="n">lora_layer_params</span><span class="o">=</span><span class="n">lora_layer_params</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
             <span class="n">attention_output</span><span class="p">,</span> <span class="n">presents_self</span> <span class="o">=</span> <span class="n">attention_output</span>
@@ -513,6 +577,10 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">register_network_output</span><span class="p">(</span><span class="s1">&#39;self_attention_output&#39;</span><span class="p">,</span> <span class="n">attention_output</span><span class="p">)</span>
 
         <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">residual</span> <span class="o">+</span> <span class="n">attention_output</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">fp16_clamping</span><span class="p">:</span>
+            <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">maximum</span><span class="p">(</span><span class="o">-</span><span class="mf">64000.0</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">)</span>
+            <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">minimum</span><span class="p">(</span><span class="mf">64000.0</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">layernorm_position</span> <span class="o">==</span> <span class="n">LayerNormPositionType</span><span class="o">.</span><span class="n">post_layernorm</span><span class="p">:</span>
             <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">self_attention_layernorm</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
@@ -529,7 +597,10 @@
             <span class="n">encoder_output</span><span class="o">=</span><span class="n">encoder_output</span><span class="p">,</span>
             <span class="n">use_cache</span><span class="o">=</span><span class="n">use_cache</span><span class="p">,</span>
             <span class="n">kv_cache_params</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="p">,</span>
-            <span class="n">attention_params</span><span class="o">=</span><span class="n">attention_params</span><span class="p">)</span>
+            <span class="n">attention_params</span><span class="o">=</span><span class="n">attention_params</span><span class="p">,</span>
+            <span class="n">lora_layer_params</span><span class="o">=</span><span class="n">lora_layer_params</span><span class="p">,</span>
+            <span class="n">cross_kv_cache_gen</span><span class="o">=</span><span class="n">cross_kv_cache_gen</span><span class="p">,</span>
+            <span class="n">cross_qkv_reuse</span><span class="o">=</span><span class="n">cross_qkv_reuse</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
             <span class="n">attention_output</span><span class="p">,</span> <span class="n">presents_cross</span> <span class="o">=</span> <span class="n">attention_output</span>
@@ -537,6 +608,10 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">register_network_output</span><span class="p">(</span><span class="s1">&#39;cross_attention_output&#39;</span><span class="p">,</span> <span class="n">attention_output</span><span class="p">)</span>
 
         <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">residual</span> <span class="o">+</span> <span class="n">attention_output</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">fp16_clamping</span><span class="p">:</span>
+            <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">maximum</span><span class="p">(</span><span class="o">-</span><span class="mf">64000.0</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">)</span>
+            <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">minimum</span><span class="p">(</span><span class="mf">64000.0</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">layernorm_position</span> <span class="o">==</span> <span class="n">LayerNormPositionType</span><span class="o">.</span><span class="n">post_layernorm</span><span class="p">:</span>
             <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">cross_attention_layernorm</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
@@ -547,10 +622,15 @@
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">layernorm_position</span> <span class="o">==</span> <span class="n">LayerNormPositionType</span><span class="o">.</span><span class="n">pre_layernorm</span><span class="p">:</span>
             <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mlp_layernorm</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
 
-        <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+        <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span>
+                                 <span class="n">lora_layer_params</span><span class="o">=</span><span class="n">lora_layer_params</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">register_network_output</span><span class="p">(</span><span class="s1">&#39;mlp_output&#39;</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">)</span>
 
         <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">residual</span> <span class="o">+</span> <span class="n">hidden_states</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">fp16_clamping</span><span class="p">:</span>
+            <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">maximum</span><span class="p">(</span><span class="o">-</span><span class="mf">64000.0</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">)</span>
+            <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">minimum</span><span class="p">(</span><span class="mf">64000.0</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">layernorm_position</span> <span class="o">==</span> <span class="n">LayerNormPositionType</span><span class="o">.</span><span class="n">post_layernorm</span><span class="p">:</span>
             <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mlp_layernorm</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
@@ -594,7 +674,9 @@
                  <span class="n">use_prompt_tuning</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                  <span class="n">use_parallel_embedding</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                  <span class="n">embedding_sharding_dim</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
-                 <span class="n">mapping</span><span class="o">=</span><span class="n">Mapping</span><span class="p">()):</span>
+                 <span class="n">mapping</span><span class="o">=</span><span class="n">Mapping</span><span class="p">(),</span>
+                 <span class="n">fp16_clamping</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                 <span class="n">max_lora_rank</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span> <span class="o">=</span> <span class="n">mapping</span>
 
@@ -665,7 +747,8 @@
                          <span class="n">residual_scaling</span><span class="o">=</span><span class="n">residual_scaling</span><span class="p">,</span>
                          <span class="n">relative_attention</span><span class="o">=</span><span class="n">relative_attention</span><span class="p">,</span>
                          <span class="n">max_distance</span><span class="o">=</span><span class="n">max_distance</span><span class="p">,</span>
-                         <span class="n">num_buckets</span><span class="o">=</span><span class="n">num_buckets</span><span class="p">)</span>
+                         <span class="n">num_buckets</span><span class="o">=</span><span class="n">num_buckets</span><span class="p">,</span>
+                         <span class="n">fp16_clamping</span><span class="o">=</span><span class="n">fp16_clamping</span><span class="p">)</span>
             <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">pp_layers</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">total_num_layers</span><span class="p">)</span>
         <span class="p">])</span>
 
@@ -674,6 +757,9 @@
                 <span class="bp">self</span><span class="o">.</span><span class="n">final_layernorm</span> <span class="o">=</span> <span class="n">ln_type</span><span class="p">(</span><span class="n">normalized_shape</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
                                                <span class="n">eps</span><span class="o">=</span><span class="n">layernorm_eps</span><span class="p">,</span>
                                                <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">max_lora_rank</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">optimize_model</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">use_lora</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">max_lora_rank</span><span class="o">=</span><span class="n">max_lora_rank</span><span class="p">)</span>
 
 <div class="viewcode-block" id="EncoderModel.forward">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.EncoderModel.forward">[docs]</a>
@@ -687,7 +773,8 @@
                 <span class="n">prompt_embedding_table</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">prompt_tasks</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">prompt_vocab_size</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">attention_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+                <span class="n">attention_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">lora_params</span><span class="p">:</span> <span class="n">LoraParams</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
 
         <span class="c1"># In PP, layer 0 has ids as inputs, all other layers have hidden_states as inputs</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_first_pp_rank</span><span class="p">():</span>
@@ -700,11 +787,15 @@
         <span class="k">else</span><span class="p">:</span>
             <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">recv</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">prev_pp_rank</span><span class="p">())</span>
 
-        <span class="k">for</span> <span class="n">encoder_layer</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_layers</span><span class="p">:</span>
+        <span class="k">for</span> <span class="n">layer_idx</span><span class="p">,</span> <span class="n">encoder_layer</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">encoder_layers</span><span class="p">):</span>
+            <span class="n">lora_layer_params</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="k">if</span> <span class="n">lora_params</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">lora_params</span><span class="o">.</span><span class="n">lora_ranks</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">lora_layer_params</span> <span class="o">=</span> <span class="n">lora_params</span><span class="o">.</span><span class="n">get_layer_params</span><span class="p">(</span><span class="n">layer_idx</span><span class="p">)</span>
             <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">encoder_layer</span><span class="p">(</span><span class="n">hidden_states</span><span class="o">=</span><span class="n">hidden_states</span><span class="p">,</span>
                                           <span class="n">attention_mask</span><span class="o">=</span><span class="n">attention_mask</span><span class="p">,</span>
                                           <span class="n">input_lengths</span><span class="o">=</span><span class="n">input_lengths</span><span class="p">,</span>
-                                          <span class="n">max_input_length</span><span class="o">=</span><span class="n">max_input_length</span><span class="p">)</span>
+                                          <span class="n">max_input_length</span><span class="o">=</span><span class="n">max_input_length</span><span class="p">,</span>
+                                          <span class="n">lora_layer_params</span><span class="o">=</span><span class="n">lora_layer_params</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_last_pp_rank</span><span class="p">():</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">has_model_final_layernorm</span><span class="p">:</span>
@@ -722,7 +813,8 @@
     <span class="k">def</span> <span class="nf">prepare_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                        <span class="n">max_batch_size</span><span class="p">,</span>
                        <span class="n">max_input_len</span><span class="p">,</span>
-                       <span class="n">prompt_embedding_table_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">):</span>
+                       <span class="n">prompt_embedding_table_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
+                       <span class="n">lora_target_modules</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&#39;&#39;&#39;@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the</span>
 <span class="sd">            ranges of the dimensions of when using TRT dynamic shapes.</span>
 
@@ -743,6 +835,7 @@
         <span class="n">remove_input_padding</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">remove_input_padding</span>
         <span class="n">use_custom_all_reduce</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">(</span>
         <span class="p">)</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">use_custom_all_reduce</span>
+        <span class="n">use_lora_plugin</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">lora_plugin</span>
 
         <span class="n">attention_mask</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="k">if</span> <span class="n">remove_input_padding</span><span class="p">:</span>
@@ -824,8 +917,7 @@
                 <span class="p">)</span>
 
         <span class="k">if</span> <span class="n">use_custom_all_reduce</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
-            <span class="n">current_all_reduce_helper</span><span class="p">()</span><span class="o">.</span><span class="n">set_workspace_tensor</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
+            <span class="n">current_all_reduce_helper</span><span class="p">()</span><span class="o">.</span><span class="n">set_workspace_tensor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
 
         <span class="n">input_lengths</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
             <span class="n">name</span><span class="o">=</span><span class="s2">&quot;input_lengths&quot;</span><span class="p">,</span>
@@ -868,17 +960,88 @@
                                <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
                                <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">],</span>
                                <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
-                                   <span class="p">(</span><span class="s1">&#39;batch_size_beam_width&#39;</span><span class="p">,</span> <span class="n">bs_range</span><span class="p">),</span>
+                                   <span class="p">(</span><span class="s1">&#39;batch_size&#39;</span><span class="p">,</span> <span class="n">bs_range</span><span class="p">),</span>
                                    <span class="p">(</span><span class="s1">&#39;broadcast_dim&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">1</span><span class="p">]),</span>
                                <span class="p">]))</span>
             <span class="n">prompt_vocab_size</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;prompt_vocab_size&#39;</span><span class="p">,</span>
                                        <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
                                        <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span>
                                        <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;size&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">1</span><span class="p">])]))</span>
+<span class="w">        </span><span class="sd">&#39;&#39;&#39;</span>
+<span class="sd">        LoRA plugin related inputs:</span>
+<span class="sd">        lora_target_modules for BART-encoder:</span>
+<span class="sd">            [&#39;attn_q&#39;, &#39;attn_v&#39;]</span>
+<span class="sd">        For BART-decoder, the lora_target_modules is different.</span>
+<span class="sd">        See comments in the DecoderModel.prepare_inputs() for more details.</span>
+<span class="sd">        &#39;&#39;&#39;</span>
+        <span class="n">lora_weights_pointers</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">lora_ranks</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">lora_params</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">use_lora_plugin</span><span class="p">:</span>
+            <span class="n">lora_weights_pointers</span> <span class="o">=</span> <span class="p">[]</span>
+            <span class="n">lora_ranks</span> <span class="o">=</span> <span class="p">[]</span>
+            <span class="c1"># In current design, q_lora_params, k_lora_params and v_lora_params should be all enabled or all disabled at the same time.</span>
+            <span class="c1"># However, BART lora modules only contain two of them, so we use zero tensor to fill the missing ones.</span>
+            <span class="n">missing_qkv_modules</span> <span class="o">=</span> <span class="p">[]</span>
+            <span class="k">if</span> <span class="nb">any</span><span class="p">(</span><span class="n">x</span> <span class="ow">in</span> <span class="n">lora_target_modules</span>
+                   <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;attn_q&quot;</span><span class="p">,</span> <span class="s2">&quot;attn_k&quot;</span><span class="p">,</span> <span class="s2">&quot;attn_v&quot;</span><span class="p">]):</span>
+                <span class="k">for</span> <span class="n">lora_module</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;attn_q&quot;</span><span class="p">,</span> <span class="s2">&quot;attn_k&quot;</span><span class="p">,</span> <span class="s2">&quot;attn_v&quot;</span><span class="p">]:</span>
+                    <span class="k">if</span> <span class="n">lora_module</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">lora_target_modules</span><span class="p">:</span>
+                        <span class="n">missing_qkv_modules</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">lora_module</span><span class="p">)</span>
+
+            <span class="n">layers_range</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">pp_layers</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">total_num_layers</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">layers_range</span><span class="p">:</span>
+                <span class="n">lora_weight_pointer_dict</span> <span class="o">=</span> <span class="p">{}</span>
+                <span class="n">lora_rank_dict</span> <span class="o">=</span> <span class="p">{}</span>
+                <span class="k">for</span> <span class="n">lora_module</span> <span class="ow">in</span> <span class="p">(</span><span class="n">lora_target_modules</span> <span class="o">+</span> <span class="n">missing_qkv_modules</span><span class="p">):</span>
+                    <span class="n">lora_weight_pointer</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
+                        <span class="n">name</span><span class="o">=</span><span class="sa">f</span><span class="s1">&#39;</span><span class="si">{</span><span class="n">lora_module</span><span class="si">}</span><span class="s1">_lora_weights_pointers_</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">,</span>
+                        <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int64</span><span class="p">,</span>
+                        <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">],</span>
+                        <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;batch_size&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">bs_range</span><span class="p">]),</span>
+                                               <span class="p">(</span><span class="s1">&#39;in_out&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">2</span><span class="p">])]))</span>
+                    <span class="n">lora_weight_pointer_dict</span><span class="o">.</span><span class="n">update</span><span class="p">({</span>
+                        <span class="sa">f</span><span class="s1">&#39;</span><span class="si">{</span><span class="n">lora_module</span><span class="si">}</span><span class="s1">_lora_weights_pointers&#39;</span><span class="p">:</span>
+                        <span class="n">lora_weight_pointer</span>
+                    <span class="p">})</span>
+
+                    <span class="n">lora_rank</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="sa">f</span><span class="s1">&#39;</span><span class="si">{</span><span class="n">lora_module</span><span class="si">}</span><span class="s1">_lora_ranks_</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">,</span>
+                                       <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                                       <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                                       <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;batch_size&#39;</span><span class="p">,</span>
+                                                               <span class="p">[</span><span class="n">bs_range</span><span class="p">])]))</span>
+                    <span class="n">lora_rank_dict</span><span class="o">.</span><span class="n">update</span><span class="p">(</span>
+                        <span class="p">{</span><span class="sa">f</span><span class="s1">&#39;</span><span class="si">{</span><span class="n">lora_module</span><span class="si">}</span><span class="s1">_lora_ranks&#39;</span><span class="p">:</span> <span class="n">lora_rank</span><span class="p">})</span>
+
+                <span class="n">lora_weights_pointers</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">lora_weight_pointer_dict</span><span class="p">)</span>
+                <span class="n">lora_ranks</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">lora_rank_dict</span><span class="p">)</span>
+
+            <span class="n">host_request_types</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;host_request_types&#39;</span><span class="p">,</span>
+                                        <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                                        <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                                        <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;batch_size&#39;</span><span class="p">,</span>
+                                                                <span class="p">[</span><span class="n">bs_range</span><span class="p">])]))</span>
+
+            <span class="n">host_context_lengths</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="k">if</span> <span class="n">remove_input_padding</span><span class="p">:</span>
+                <span class="n">host_context_lengths</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;host_context_lengths&#39;</span><span class="p">,</span>
+                                              <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                                              <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                                              <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
+                                                  <span class="p">(</span><span class="s1">&#39;batch_size&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">bs_range</span><span class="p">])</span>
+                                              <span class="p">]))</span>
+
+            <span class="n">lora_params</span> <span class="o">=</span> <span class="n">LoraParams</span><span class="p">(</span>
+                <span class="n">lora_ranks</span><span class="o">=</span><span class="n">lora_ranks</span><span class="p">,</span>
+                <span class="n">lora_weights_pointers</span><span class="o">=</span><span class="n">lora_weights_pointers</span><span class="p">,</span>
+                <span class="n">max_context_length</span><span class="o">=</span><span class="n">max_input_len</span><span class="p">,</span>
+                <span class="n">host_request_types</span><span class="o">=</span><span class="n">host_request_types</span><span class="p">,</span>
+                <span class="n">host_context_lengths</span><span class="o">=</span><span class="n">host_context_lengths</span><span class="p">,</span>
+            <span class="p">)</span>
 
         <span class="k">return</span> <span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="n">input_lengths</span><span class="p">,</span> <span class="n">position_ids</span><span class="p">,</span> <span class="n">token_type_ids</span><span class="p">,</span>
                 <span class="n">hidden_states</span><span class="p">,</span> <span class="n">max_input_length</span><span class="p">,</span> <span class="n">prompt_embedding_table</span><span class="p">,</span> <span class="n">tasks</span><span class="p">,</span>
-                <span class="n">prompt_vocab_size</span><span class="p">,</span> <span class="n">attention_mask</span><span class="p">)</span></div>
+                <span class="n">prompt_vocab_size</span><span class="p">,</span> <span class="n">attention_mask</span><span class="p">,</span> <span class="n">lora_params</span><span class="p">)</span></div>
 </div>
 
 
@@ -923,7 +1086,10 @@
                  <span class="n">residual_scaling</span><span class="o">=</span><span class="mf">1.0</span><span class="p">,</span>
                  <span class="n">use_parallel_embedding</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                  <span class="n">embedding_sharding_dim</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
-                 <span class="n">mapping</span><span class="o">=</span><span class="n">Mapping</span><span class="p">()):</span>
+                 <span class="n">mapping</span><span class="o">=</span><span class="n">Mapping</span><span class="p">(),</span>
+                 <span class="n">fp16_clamping</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                 <span class="n">max_lora_rank</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                 <span class="n">skip_cross_qkv</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span> <span class="o">=</span> <span class="n">mapping</span>
 
@@ -978,6 +1144,8 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">has_token_type_embedding</span> <span class="o">=</span> <span class="n">type_vocab_size</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">rescale_before_lm_head</span> <span class="o">=</span> <span class="n">rescale_before_lm_head</span>
 
+        <span class="bp">self</span><span class="o">.</span><span class="n">skip_cross_qkv</span> <span class="o">=</span> <span class="n">skip_cross_qkv</span>
+
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_first_pp_rank</span><span class="p">():</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">embedding</span> <span class="o">=</span> <span class="n">EncDecEmbedding</span><span class="p">(</span>
                 <span class="n">vocab_size</span><span class="p">,</span>
@@ -994,28 +1162,33 @@
                 <span class="n">embedding_sharding_dim</span><span class="o">=</span><span class="n">embedding_sharding_dim</span><span class="p">,</span>
                 <span class="n">mapping</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="p">)</span>
 
+        <span class="n">layers_range</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">pp_layers</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">total_num_layers</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">decoder_layers</span> <span class="o">=</span> <span class="n">ModuleList</span><span class="p">([</span>
-            <span class="n">DecoderLayer</span><span class="p">(</span><span class="n">hidden_size</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
-                         <span class="n">ffn_hidden_size</span><span class="o">=</span><span class="n">ffn_hidden_size</span><span class="p">,</span>
-                         <span class="n">num_attention_heads</span><span class="o">=</span><span class="n">num_heads</span><span class="p">,</span>
-                         <span class="n">num_kv_heads</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">num_kv_heads</span><span class="p">,</span>
-                         <span class="n">head_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">head_size</span><span class="p">,</span>
-                         <span class="n">max_position_embeddings</span><span class="o">=</span><span class="n">max_position_embeddings</span><span class="p">,</span>
-                         <span class="n">q_scaling</span><span class="o">=</span><span class="n">q_scaling</span><span class="p">,</span>
-                         <span class="n">has_attention_qkvo_bias</span><span class="o">=</span><span class="n">has_attention_qkvo_bias</span><span class="p">,</span>
-                         <span class="n">has_mlp_bias</span><span class="o">=</span><span class="n">has_mlp_bias</span><span class="p">,</span>
-                         <span class="n">layernorm_position</span><span class="o">=</span><span class="n">layernorm_position</span><span class="p">,</span>
-                         <span class="n">layernorm_eps</span><span class="o">=</span><span class="n">layernorm_eps</span><span class="p">,</span>
-                         <span class="n">layernorm_type</span><span class="o">=</span><span class="n">layernorm_type</span><span class="p">,</span>
-                         <span class="n">hidden_act</span><span class="o">=</span><span class="n">hidden_act</span><span class="p">,</span>
-                         <span class="n">mlp_type</span><span class="o">=</span><span class="n">mlp_type</span><span class="p">,</span>
-                         <span class="n">mapping</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="p">,</span>
-                         <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
-                         <span class="n">residual_scaling</span><span class="o">=</span><span class="n">residual_scaling</span><span class="p">,</span>
-                         <span class="n">relative_attention</span><span class="o">=</span><span class="n">relative_attention</span><span class="p">,</span>
-                         <span class="n">max_distance</span><span class="o">=</span><span class="n">max_distance</span><span class="p">,</span>
-                         <span class="n">num_buckets</span><span class="o">=</span><span class="n">num_buckets</span><span class="p">)</span>
-            <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">pp_layers</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">total_num_layers</span><span class="p">)</span>
+            <span class="n">DecoderLayer</span><span class="p">(</span>
+                <span class="n">local_layer_idx</span><span class="o">=</span><span class="n">layer_idx</span> <span class="o">-</span> <span class="n">layers_range</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span>
+                <span class="n">hidden_size</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
+                <span class="n">ffn_hidden_size</span><span class="o">=</span><span class="n">ffn_hidden_size</span><span class="p">,</span>
+                <span class="n">num_attention_heads</span><span class="o">=</span><span class="n">num_heads</span><span class="p">,</span>
+                <span class="n">num_kv_heads</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">num_kv_heads</span><span class="p">,</span>
+                <span class="n">head_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">head_size</span><span class="p">,</span>
+                <span class="n">max_position_embeddings</span><span class="o">=</span><span class="n">max_position_embeddings</span><span class="p">,</span>
+                <span class="n">q_scaling</span><span class="o">=</span><span class="n">q_scaling</span><span class="p">,</span>
+                <span class="n">has_attention_qkvo_bias</span><span class="o">=</span><span class="n">has_attention_qkvo_bias</span><span class="p">,</span>
+                <span class="n">has_mlp_bias</span><span class="o">=</span><span class="n">has_mlp_bias</span><span class="p">,</span>
+                <span class="n">layernorm_position</span><span class="o">=</span><span class="n">layernorm_position</span><span class="p">,</span>
+                <span class="n">layernorm_eps</span><span class="o">=</span><span class="n">layernorm_eps</span><span class="p">,</span>
+                <span class="n">layernorm_type</span><span class="o">=</span><span class="n">layernorm_type</span><span class="p">,</span>
+                <span class="n">hidden_act</span><span class="o">=</span><span class="n">hidden_act</span><span class="p">,</span>
+                <span class="n">mlp_type</span><span class="o">=</span><span class="n">mlp_type</span><span class="p">,</span>
+                <span class="n">mapping</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+                <span class="n">residual_scaling</span><span class="o">=</span><span class="n">residual_scaling</span><span class="p">,</span>
+                <span class="n">relative_attention</span><span class="o">=</span><span class="n">relative_attention</span><span class="p">,</span>
+                <span class="n">max_distance</span><span class="o">=</span><span class="n">max_distance</span><span class="p">,</span>
+                <span class="n">num_buckets</span><span class="o">=</span><span class="n">num_buckets</span><span class="p">,</span>
+                <span class="n">fp16_clamping</span><span class="o">=</span><span class="n">fp16_clamping</span><span class="p">,</span>
+                <span class="n">skip_cross_qkv</span><span class="o">=</span><span class="n">skip_cross_qkv</span><span class="p">,</span>
+            <span class="p">)</span> <span class="k">for</span> <span class="n">layer_idx</span> <span class="ow">in</span> <span class="n">layers_range</span>
         <span class="p">])</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_last_pp_rank</span><span class="p">():</span>
@@ -1034,6 +1207,9 @@
                 <span class="n">gather_output</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
             <span class="p">)</span>
 
+        <span class="k">if</span> <span class="n">max_lora_rank</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">optimize_model</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">use_lora</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">max_lora_rank</span><span class="o">=</span><span class="n">max_lora_rank</span><span class="p">)</span>
+
 <div class="viewcode-block" id="DecoderModel.forward">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.DecoderModel.forward">[docs]</a>
     <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
@@ -1047,7 +1223,10 @@
                 <span class="n">last_token_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">kv_cache_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">attention_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">hidden_states</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+                <span class="n">hidden_states</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">lora_params</span><span class="p">:</span> <span class="n">LoraParams</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                <span class="n">cross_kv_cache_gen</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                <span class="n">cross_qkv_reuse</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_first_pp_rank</span><span class="p">():</span>
             <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">decoder_input_ids</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
@@ -1067,9 +1246,13 @@
         <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
             <span class="n">presents</span> <span class="o">=</span> <span class="p">[]</span>
 
-        <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="p">(</span><span class="n">decoder_layer</span><span class="p">,</span> <span class="n">past</span><span class="p">,</span> <span class="n">max_attention_window_size</span><span class="p">)</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span>
-                <span class="nb">zip</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">decoder_layers</span><span class="p">,</span> <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">past_key_value</span><span class="p">,</span>
-                    <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">host_max_attention_window_sizes</span><span class="p">)):</span>
+        <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="p">(</span><span class="n">decoder_layer</span><span class="p">,</span> <span class="n">past</span><span class="p">)</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span>
+                <span class="nb">zip</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">decoder_layers</span><span class="p">,</span> <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">past_key_value</span><span class="p">)):</span>
+
+            <span class="n">lora_layer_params</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="k">if</span> <span class="n">lora_params</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">lora_params</span><span class="o">.</span><span class="n">lora_ranks</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">lora_layer_params</span> <span class="o">=</span> <span class="n">lora_params</span><span class="o">.</span><span class="n">get_layer_params</span><span class="p">(</span><span class="n">i</span><span class="p">)</span>
+
             <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">decoder_layer</span><span class="p">(</span>
                 <span class="n">hidden_states</span><span class="p">,</span>
                 <span class="n">encoder_output</span><span class="o">=</span><span class="n">encoder_output</span><span class="p">,</span>
@@ -1080,11 +1263,15 @@
                     <span class="n">past_key_value</span><span class="o">=</span><span class="n">past</span><span class="p">,</span>
                     <span class="n">host_past_key_value_lengths</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
                     <span class="n">host_past_key_value_lengths</span><span class="p">,</span>
-                    <span class="n">host_max_attention_window_sizes</span><span class="o">=</span><span class="n">max_attention_window_size</span><span class="p">,</span>
+                    <span class="n">host_max_attention_window_sizes</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
+                    <span class="n">host_max_attention_window_sizes</span><span class="p">,</span>
                     <span class="n">host_sink_token_length</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
                     <span class="n">host_sink_token_length</span><span class="p">,</span>
                     <span class="n">cache_indirection</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span><span class="n">cache_indirection</span><span class="p">),</span>
-                <span class="n">attention_params</span><span class="o">=</span><span class="n">attention_params</span><span class="p">)</span>
+                <span class="n">attention_params</span><span class="o">=</span><span class="n">attention_params</span><span class="p">,</span>
+                <span class="n">lora_layer_params</span><span class="o">=</span><span class="n">lora_layer_params</span><span class="p">,</span>
+                <span class="n">cross_kv_cache_gen</span><span class="o">=</span><span class="n">cross_kv_cache_gen</span><span class="p">,</span>
+                <span class="n">cross_qkv_reuse</span><span class="o">=</span><span class="n">cross_qkv_reuse</span><span class="p">)</span>
 
             <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
                 <span class="n">presents_self</span><span class="p">,</span> <span class="n">presents_cross</span> <span class="o">=</span> <span class="n">hidden_states</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="n">hidden_states</span><span class="p">[</span>
@@ -1146,6 +1333,7 @@
         <span class="n">max_encoder_input_len</span><span class="p">,</span>
         <span class="n">gather_context_logits</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
         <span class="n">gather_generation_logits</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+        <span class="n">lora_target_modules</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
 <span class="w">        </span><span class="sd">&#39;&#39;&#39;@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the</span>
 <span class="sd">            ranges of the dimensions of when using TRT dynamic shapes.</span>
@@ -1194,7 +1382,7 @@
         <span class="c1"># No enable_two_optimization_profiles support yet</span>
 
         <span class="n">encoder_input_len_range</span> <span class="o">=</span> <span class="p">[</span>
-            <span class="mi">0</span><span class="p">,</span> <span class="p">(</span><span class="n">max_encoder_input_len</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="mi">2</span><span class="p">,</span> <span class="n">max_encoder_input_len</span>
+            <span class="mi">1</span><span class="p">,</span> <span class="p">(</span><span class="n">max_encoder_input_len</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="mi">2</span><span class="p">,</span> <span class="n">max_encoder_input_len</span>
         <span class="p">]</span>
         <span class="n">past_key_value</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="n">sequence_length</span> <span class="o">=</span> <span class="kc">None</span>
@@ -1206,6 +1394,7 @@
         <span class="n">remove_input_padding</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">remove_input_padding</span>
         <span class="n">use_custom_all_reduce</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">(</span>
         <span class="p">)</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">use_custom_all_reduce</span>
+        <span class="n">use_lora_plugin</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">lora_plugin</span>
 
         <span class="n">input_ids</span><span class="p">,</span> <span class="n">position_ids</span><span class="p">,</span> <span class="n">token_type_ids</span><span class="p">,</span> <span class="n">hidden_states</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="kc">None</span>
         <span class="k">if</span> <span class="n">remove_input_padding</span><span class="p">:</span>
@@ -1402,28 +1591,108 @@
         <span class="p">)</span>
 
         <span class="k">if</span> <span class="n">use_custom_all_reduce</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
-            <span class="n">current_all_reduce_helper</span><span class="p">()</span><span class="o">.</span><span class="n">set_workspace_tensor</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
+            <span class="n">current_all_reduce_helper</span><span class="p">()</span><span class="o">.</span><span class="n">set_workspace_tensor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
 
         <span class="n">layers_range</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">pp_layers</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">total_num_layers</span><span class="p">)</span>
+        <span class="n">num_pp_layers</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">layers_range</span><span class="p">)</span>
 
         <span class="n">host_max_attention_window_sizes</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="n">host_sink_token_length</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="k">if</span> <span class="n">use_gpt_attention_plugin</span><span class="p">:</span>
-            <span class="n">host_max_attention_window_sizes</span> <span class="o">=</span> <span class="p">[]</span>
-            <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">layers_range</span><span class="p">:</span>
-                <span class="n">host_attention_window_size_tensor</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
-                    <span class="n">name</span><span class="o">=</span><span class="sa">f</span><span class="s1">&#39;host_max_attention_window_size_</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">,</span>
-                    <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
-                    <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span>
-                    <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;scalar&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">1</span><span class="p">])]))</span>
-                <span class="n">host_max_attention_window_sizes</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
-                    <span class="n">host_attention_window_size_tensor</span><span class="p">)</span>
+            <span class="n">host_max_attention_window_sizes</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
+                <span class="n">name</span><span class="o">=</span><span class="sa">f</span><span class="s1">&#39;host_max_attention_window_sizes&#39;</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="n">num_pp_layers</span><span class="p">],</span>
+                <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;num_layers&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">num_pp_layers</span><span class="p">])]))</span>
             <span class="n">host_sink_token_length</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;host_sink_token_length&#39;</span><span class="p">,</span>
                                             <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
                                             <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span>
                                             <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;scalar&#39;</span><span class="p">,</span>
                                                                     <span class="p">[</span><span class="mi">1</span><span class="p">])]))</span>
+<span class="w">        </span><span class="sd">&#39;&#39;&#39;</span>
+<span class="sd">        LoRA plugin related inputs:</span>
+<span class="sd">        lora_target_modules for BART-decoder:</span>
+<span class="sd">            [&#39;attn_q&#39;, &#39;cross_attn_q&#39;,</span>
+<span class="sd">             &#39;attn_v&#39;, &#39;cross_attn_v&#39;]</span>
+<span class="sd">        This is NOT directly loaded from the adapter-config file</span>
+<span class="sd">        We make it this way because BART has LoRA weights for both self-attention and cross-attention in decoder</span>
+<span class="sd">        &#39;&#39;&#39;</span>
+        <span class="n">lora_weights_pointers</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">lora_ranks</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">lora_params</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">use_lora_plugin</span><span class="p">:</span>
+            <span class="n">lora_weights_pointers</span> <span class="o">=</span> <span class="p">[]</span>
+            <span class="n">lora_ranks</span> <span class="o">=</span> <span class="p">[]</span>
+            <span class="c1"># In current design, q_lora_params, k_lora_params and v_lora_params should be all enabled or all disabled at the same time.</span>
+            <span class="c1"># However, BART lora modules only contain two of them, so we use zero tensor to fill the missing ones.</span>
+            <span class="n">missing_qkv_modules</span> <span class="o">=</span> <span class="p">[]</span>
+            <span class="k">if</span> <span class="nb">any</span><span class="p">(</span><span class="n">x</span> <span class="ow">in</span> <span class="n">lora_target_modules</span>
+                   <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;attn_q&quot;</span><span class="p">,</span> <span class="s2">&quot;attn_k&quot;</span><span class="p">,</span> <span class="s2">&quot;attn_v&quot;</span><span class="p">]):</span>
+                <span class="k">for</span> <span class="n">lora_module</span> <span class="ow">in</span> <span class="p">[</span>
+                        <span class="s2">&quot;attn_q&quot;</span><span class="p">,</span>
+                        <span class="s2">&quot;attn_k&quot;</span><span class="p">,</span>
+                        <span class="s2">&quot;attn_v&quot;</span><span class="p">,</span>
+                <span class="p">]:</span>
+                    <span class="k">if</span> <span class="n">lora_module</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">lora_target_modules</span><span class="p">:</span>
+                        <span class="n">missing_qkv_modules</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">lora_module</span><span class="p">)</span>
+            <span class="k">if</span> <span class="nb">any</span><span class="p">(</span><span class="n">x</span> <span class="ow">in</span> <span class="n">lora_target_modules</span>
+                   <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;cross_attn_q&quot;</span><span class="p">,</span> <span class="s2">&quot;cross_attn_k&quot;</span><span class="p">,</span> <span class="s2">&quot;cross_attn_v&quot;</span><span class="p">]):</span>
+                <span class="k">for</span> <span class="n">lora_module</span> <span class="ow">in</span> <span class="p">[</span>
+                        <span class="s2">&quot;cross_attn_q&quot;</span><span class="p">,</span> <span class="s2">&quot;cross_attn_k&quot;</span><span class="p">,</span> <span class="s2">&quot;cross_attn_v&quot;</span>
+                <span class="p">]:</span>
+                    <span class="k">if</span> <span class="n">lora_module</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">lora_target_modules</span><span class="p">:</span>
+                        <span class="n">missing_qkv_modules</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">lora_module</span><span class="p">)</span>
+
+            <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">layers_range</span><span class="p">:</span>
+                <span class="n">lora_weight_pointer_dict</span> <span class="o">=</span> <span class="p">{}</span>
+                <span class="n">lora_rank_dict</span> <span class="o">=</span> <span class="p">{}</span>
+                <span class="k">for</span> <span class="n">lora_module</span> <span class="ow">in</span> <span class="p">(</span><span class="n">lora_target_modules</span> <span class="o">+</span> <span class="n">missing_qkv_modules</span><span class="p">):</span>
+                    <span class="n">lora_weight_pointer</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
+                        <span class="n">name</span><span class="o">=</span><span class="sa">f</span><span class="s1">&#39;</span><span class="si">{</span><span class="n">lora_module</span><span class="si">}</span><span class="s1">_lora_weights_pointers_</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">,</span>
+                        <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int64</span><span class="p">,</span>
+                        <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">],</span>
+                        <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;batch_size_beam_width&#39;</span><span class="p">,</span>
+                                                <span class="p">[</span><span class="n">bb_range</span><span class="p">]),</span> <span class="p">(</span><span class="s1">&#39;in_out&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">2</span><span class="p">])]))</span>
+                    <span class="n">lora_weight_pointer_dict</span><span class="o">.</span><span class="n">update</span><span class="p">({</span>
+                        <span class="sa">f</span><span class="s1">&#39;</span><span class="si">{</span><span class="n">lora_module</span><span class="si">}</span><span class="s1">_lora_weights_pointers&#39;</span><span class="p">:</span>
+                        <span class="n">lora_weight_pointer</span>
+                    <span class="p">})</span>
+
+                    <span class="n">lora_rank</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="sa">f</span><span class="s1">&#39;</span><span class="si">{</span><span class="n">lora_module</span><span class="si">}</span><span class="s1">_lora_ranks_</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">,</span>
+                                       <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                                       <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                                       <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
+                                           <span class="p">(</span><span class="s1">&#39;batch_size_beam_width&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">bb_range</span><span class="p">])</span>
+                                       <span class="p">]))</span>
+                    <span class="n">lora_rank_dict</span><span class="o">.</span><span class="n">update</span><span class="p">(</span>
+                        <span class="p">{</span><span class="sa">f</span><span class="s1">&#39;</span><span class="si">{</span><span class="n">lora_module</span><span class="si">}</span><span class="s1">_lora_ranks&#39;</span><span class="p">:</span> <span class="n">lora_rank</span><span class="p">})</span>
+
+                <span class="n">lora_weights_pointers</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">lora_weight_pointer_dict</span><span class="p">)</span>
+                <span class="n">lora_ranks</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">lora_rank_dict</span><span class="p">)</span>
+
+            <span class="c1"># For cross attention, we need to use encoder_input_lengths (in CPU) to pass</span>
+            <span class="c1"># as the host_context_lengths to the lora_plugin. But for self attention, we</span>
+            <span class="c1"># should keep using the original host_context_lengths. Therefore, we keep both</span>
+            <span class="c1"># of them in the lora_params.</span>
+            <span class="n">host_encoder_input_lengths</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="k">if</span> <span class="n">remove_input_padding</span><span class="p">:</span>
+                <span class="n">host_encoder_input_lengths</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
+                    <span class="n">name</span><span class="o">=</span><span class="s2">&quot;host_encoder_input_lengths&quot;</span><span class="p">,</span>
+                    <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                    <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                    <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s2">&quot;batch_size_beam_width&quot;</span><span class="p">,</span> <span class="p">[</span><span class="n">bb_range</span><span class="p">])</span>
+                                           <span class="p">]),</span>
+                <span class="p">)</span>
+
+            <span class="n">lora_params</span> <span class="o">=</span> <span class="n">LoraParams</span><span class="p">(</span>
+                <span class="n">lora_ranks</span><span class="o">=</span><span class="n">lora_ranks</span><span class="p">,</span>
+                <span class="n">lora_weights_pointers</span><span class="o">=</span><span class="n">lora_weights_pointers</span><span class="p">,</span>
+                <span class="n">host_context_lengths</span><span class="o">=</span><span class="n">host_context_lengths</span><span class="p">,</span>
+                <span class="n">max_context_length</span><span class="o">=</span><span class="n">max_decoder_input_len</span><span class="p">,</span>
+                <span class="n">max_encoder_context_length</span><span class="o">=</span><span class="n">max_encoder_input_len</span><span class="p">,</span>
+                <span class="n">host_request_types</span><span class="o">=</span><span class="n">host_request_types</span><span class="p">,</span>
+                <span class="n">host_encoder_input_lengths</span><span class="o">=</span><span class="n">host_encoder_input_lengths</span><span class="p">,</span>
+            <span class="p">)</span>
 
         <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">layers_range</span><span class="p">:</span>
             <span class="n">kv_dim_range</span> <span class="o">=</span> <span class="n">OrderedDict</span><span class="p">([</span>
@@ -1480,9 +1749,43 @@
                 <span class="n">encoder_max_input_length</span><span class="o">=</span><span class="n">encoder_max_input_length</span><span class="p">,</span>
             <span class="p">)</span>
 
+        <span class="n">cross_kv_cache_gen</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;cross_kv_cache_gen&#39;</span><span class="p">,</span>
+                                    <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">bool</span><span class="p">,</span>
+                                    <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span>
+                                    <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
+                                        <span class="p">(</span><span class="s1">&#39;boolean&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">1</span><span class="p">]),</span>
+                                    <span class="p">]))</span>
+        <span class="n">cross_qkv_reuse</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">num_heads</span> <span class="o">=</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">num_heads</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">-</span>
+                     <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span>
+        <span class="n">cross_qkv_out_dim</span> <span class="o">=</span> <span class="n">num_heads</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">head_size</span> <span class="o">+</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">num_kv_heads</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">head_size</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">skip_cross_qkv</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">remove_input_padding</span><span class="p">:</span>
+                <span class="n">cross_qkv_reuse</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
+                    <span class="n">name</span><span class="o">=</span><span class="s2">&quot;cross_qkv_reuse&quot;</span><span class="p">,</span>
+                    <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_dtype</span><span class="p">,</span>
+                    <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">cross_qkv_out_dim</span><span class="p">],</span>
+                    <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
+                        <span class="p">(</span><span class="s2">&quot;encoder_num_tokens&quot;</span><span class="p">,</span> <span class="p">[</span><span class="n">encoder_num_tokens_range</span><span class="p">]),</span>
+                        <span class="p">(</span><span class="s2">&quot;encoder_qkv_size&quot;</span><span class="p">,</span> <span class="p">[</span><span class="n">cross_qkv_out_dim</span><span class="p">]),</span>
+                    <span class="p">]),</span>
+                <span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">cross_qkv_reuse</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
+                    <span class="n">name</span><span class="o">=</span><span class="s2">&quot;cross_qkv_reuse&quot;</span><span class="p">,</span>
+                    <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_dtype</span><span class="p">,</span>
+                    <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">cross_qkv_out_dim</span><span class="p">],</span>
+                    <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
+                        <span class="p">(</span><span class="s2">&quot;batch_size_beam_width_encoder&quot;</span><span class="p">,</span> <span class="p">[</span><span class="n">bb_range</span><span class="p">]),</span>
+                        <span class="p">(</span><span class="s2">&quot;encoder_input_len&quot;</span><span class="p">,</span> <span class="p">[</span><span class="n">encoder_input_len_range</span><span class="p">]),</span>
+                        <span class="p">(</span><span class="s2">&quot;encoder_qkv_size&quot;</span><span class="p">,</span> <span class="p">[</span><span class="n">cross_qkv_out_dim</span><span class="p">]),</span>
+                    <span class="p">]),</span>
+                <span class="p">)</span>
+
         <span class="k">return</span> <span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="n">encoder_output</span><span class="p">,</span> <span class="n">position_ids</span><span class="p">,</span> <span class="n">token_type_ids</span><span class="p">,</span> <span class="kc">True</span><span class="p">,</span>
                 <span class="n">attention_mask</span><span class="p">,</span> <span class="n">cross_attention_mask</span><span class="p">,</span> <span class="n">last_token_ids</span><span class="p">,</span>
-                <span class="n">kv_cache_params</span><span class="p">,</span> <span class="n">attention_params</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">)</span></div>
+                <span class="n">kv_cache_params</span><span class="p">,</span> <span class="n">attention_params</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">lora_params</span><span class="p">,</span>
+                <span class="n">cross_kv_cache_gen</span><span class="p">,</span> <span class="n">cross_qkv_reuse</span><span class="p">)</span></div>
 </div>
 
 

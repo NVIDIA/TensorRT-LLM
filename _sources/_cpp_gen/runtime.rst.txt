@@ -142,3 +142,27 @@ _____________
 .. doxygenfile:: worldConfig.h
    :project: TensorRT-LLM
 
+decodingMode.h
+______________
+
+.. doxygenfile:: decodingMode.h
+   :project: TensorRT-LLM
+
+loraCache.h
+___________
+
+.. doxygenfile:: loraCache.h
+   :project: TensorRT-LLM
+
+loraCachePageManagerConfig.h
+____________________________
+
+.. doxygenfile:: loraCachePageManagerConfig.h
+   :project: TensorRT-LLM
+
+loraModule.h
+____________
+
+.. doxygenfile:: loraModule.h
+   :project: TensorRT-LLM
+

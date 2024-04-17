@@ -41,24 +41,56 @@
   </form>
 </div>
         </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
-              <p class="caption" role="heading"><span class="caption-text">Contents:</span></p>
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
 <ul>
-<li class="toctree-l1"><a class="reference internal" href="../../../../architecture.html">TensorRT-LLM Architecture</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../gpt_runtime.html">C++ GPT Runtime</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../batch_manager.html">The Batch Manager in TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../inference_request.html">Inference Request</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../gpt_attention.html">Multi-head, Multi-query and Group-query Attention</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../precision.html">Numerical Precision</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../build_from_source.html">Build from Source</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../performance.html">Performance of TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../2023-05-19-how-to-debug.html">How to debug</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../2023-05-17-how-to-add-a-new-model.html">How to add a new model</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../graph-rewriting.html">Graph Rewriting Module</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../memory.html">Memory Usage of TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../new_workflow.html">New Workflow</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../perf_best_practices.html">Best Practices for Tuning the Performance of TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../performance_analysis.html">Performance Analysis of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../release-notes.html">Release Notes</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../installation/windows.html">Installing on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../architecture/core-concepts.html">Model Definition</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../architecture/core-concepts.html#compilation">Compilation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../architecture/core-concepts.html#runtime">Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../architecture/core-concepts.html#multi-gpu-and-multi-node-support">Multi-GPU and Multi-Node Support</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/inference-request.html">Inference Request</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../performance/perf-best-practices.html">Best Practices for Tuning the Performance of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../performance/perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Python API</span></p>
 <ul>
@@ -69,16 +101,13 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
 </ul>
-<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="../../../../_cpp_gen/runtime.html">Runtime</a></li>
-</ul>
 <p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
 </ul>
 
         </div>
@@ -120,30 +149,22 @@
 <span class="c1"># WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.</span>
 <span class="c1"># See the License for the specific language governing permissions and</span>
 <span class="c1"># limitations under the License.</span>
-<span class="kn">import</span> <span class="nn">tempfile</span>
+<span class="kn">import</span> <span class="nn">json</span>
 <span class="kn">from</span> <span class="nn">pathlib</span> <span class="kn">import</span> <span class="n">Path</span>
 <span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="n">Optional</span>
 
-<span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">AutoConfig</span>
-
-<span class="kn">from</span> <span class="nn">tensorrt_llm.models.llama.weight</span> <span class="kn">import</span> <span class="p">(</span><span class="n">load_from_awq_llama</span><span class="p">,</span>
-                                              <span class="n">load_from_fp8_llama</span><span class="p">)</span>
-
-<span class="kn">from</span> <span class="nn">...</span> <span class="kn">import</span> <span class="n">profiler</span>
 <span class="kn">from</span> <span class="nn">..._utils</span> <span class="kn">import</span> <span class="n">pad_vocab_size</span>
-<span class="kn">from</span> <span class="nn">...functional</span> <span class="kn">import</span> <span class="n">RotaryScalingType</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">recv</span><span class="p">,</span> <span class="n">send</span>
+<span class="kn">from</span> <span class="nn">...functional</span> <span class="kn">import</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">recv</span><span class="p">,</span> <span class="n">send</span>
 <span class="kn">from</span> <span class="nn">...layers</span> <span class="kn">import</span> <span class="p">(</span><span class="n">MOE</span><span class="p">,</span> <span class="n">Attention</span><span class="p">,</span> <span class="n">AttentionMaskType</span><span class="p">,</span> <span class="n">ColumnLinear</span><span class="p">,</span>
                        <span class="n">Embedding</span><span class="p">,</span> <span class="n">GatedMLP</span><span class="p">,</span> <span class="n">MoeConfig</span><span class="p">,</span> <span class="n">PositionEmbeddingType</span><span class="p">,</span>
-                       <span class="n">PromptTuningEmbedding</span><span class="p">,</span> <span class="n">RmsNorm</span><span class="p">)</span>
+                       <span class="n">RmsNorm</span><span class="p">)</span>
+<span class="kn">from</span> <span class="nn">...lora_manager</span> <span class="kn">import</span> <span class="n">LoraBuildConfig</span><span class="p">,</span> <span class="n">use_lora</span>
 <span class="kn">from</span> <span class="nn">...mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
 <span class="kn">from</span> <span class="nn">...module</span> <span class="kn">import</span> <span class="n">Module</span>
 <span class="kn">from</span> <span class="nn">...plugin</span> <span class="kn">import</span> <span class="n">init_all_reduce_helper</span>
-<span class="kn">from</span> <span class="nn">...quantization</span> <span class="kn">import</span> <span class="n">QuantMode</span>
-<span class="kn">from</span> <span class="nn">...runtime.lora_manager</span> <span class="kn">import</span> <span class="n">LoraConfig</span>
-<span class="kn">from</span> <span class="nn">...top_model_mixin</span> <span class="kn">import</span> <span class="n">TopModelMixin</span>
+<span class="kn">from</span> <span class="nn">...quantization</span> <span class="kn">import</span> <span class="n">W8A8_SQ_PLUGIN_LIST</span><span class="p">,</span> <span class="n">QuantAlgo</span>
 <span class="kn">from</span> <span class="nn">..modeling_utils</span> <span class="kn">import</span> <span class="p">(</span><span class="n">DecoderLayerList</span><span class="p">,</span> <span class="n">DecoderModelForCausalLM</span><span class="p">,</span>
-                              <span class="n">PretrainedConfig</span><span class="p">)</span>
-<span class="kn">from</span> <span class="nn">.weight</span> <span class="kn">import</span> <span class="n">load_from_hf_llama</span>
+                              <span class="n">PretrainedConfig</span><span class="p">,</span> <span class="n">QuantConfig</span><span class="p">)</span>
 
 
 <span class="k">class</span> <span class="nc">LLaMADecoderLayer</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
@@ -157,10 +178,13 @@
                                        <span class="n">eps</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">norm_epsilon</span><span class="p">,</span>
                                        <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
 
+        <span class="n">layers_range</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">pp_layers</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">num_hidden_layers</span><span class="p">)</span>
+        <span class="n">local_layer_idx</span> <span class="o">=</span> <span class="n">layer_idx</span> <span class="o">-</span> <span class="n">layers_range</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">attention</span> <span class="o">=</span> <span class="n">Attention</span><span class="p">(</span>
-            <span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
-            <span class="n">config</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">,</span>
-            <span class="n">config</span><span class="o">.</span><span class="n">num_key_value_heads</span><span class="p">,</span>
+            <span class="n">local_layer_idx</span><span class="o">=</span><span class="n">local_layer_idx</span><span class="p">,</span>
+            <span class="n">hidden_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+            <span class="n">num_attention_heads</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">,</span>
+            <span class="n">num_kv_heads</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">num_key_value_heads</span><span class="p">,</span>
             <span class="n">max_position_embeddings</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">,</span>
             <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
             <span class="n">attention_mask_type</span><span class="o">=</span><span class="n">AttentionMaskType</span><span class="o">.</span><span class="n">causal</span><span class="p">,</span>
@@ -171,10 +195,7 @@
             <span class="n">tp_group</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_group</span><span class="p">,</span>
             <span class="n">tp_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
             <span class="n">tp_rank</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_rank</span><span class="p">,</span>
-            <span class="n">quant_mode</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">quant_mode</span><span class="p">,</span>
-            <span class="n">enable_pos_shift</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">enable_pos_shift</span><span class="p">,</span>
-            <span class="n">dense_context_fmha</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dense_context_fmha</span><span class="p">,</span>
-            <span class="n">max_lora_rank</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">max_lora_rank</span><span class="p">)</span>
+            <span class="n">quant_mode</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">quant_mode</span><span class="p">)</span>
 
         <span class="n">mlp_hidden_size</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span> <span class="o">*</span> <span class="mi">4</span> <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">intermediate_size</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">config</span><span class="o">.</span><span class="n">intermediate_size</span>
 
@@ -202,7 +223,6 @@
                           <span class="n">tp_group</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_group</span><span class="p">,</span>
                           <span class="n">tp_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
                           <span class="n">quant_mode</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">quant_mode</span><span class="p">,</span>
-                          <span class="n">max_lora_rank</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">max_lora_rank</span><span class="p">,</span>
                           <span class="o">**</span><span class="n">mlp_kwargs</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">post_layernorm</span> <span class="o">=</span> <span class="n">RmsNorm</span><span class="p">(</span><span class="n">normalized_shape</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
                                       <span class="n">eps</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">norm_epsilon</span><span class="p">,</span>
@@ -257,20 +277,10 @@
         <span class="n">init_all_reduce_helper</span><span class="p">()</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">use_prompt_tuning</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">use_prompt_tuning</span>
-        <span class="n">EmbeddingCls</span> <span class="o">=</span> <span class="n">PromptTuningEmbedding</span> <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">use_prompt_tuning</span> <span class="k">else</span> <span class="n">Embedding</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_first_pp_rank</span><span class="p">():</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">vocab_embedding</span> <span class="o">=</span> <span class="n">EmbeddingCls</span><span class="p">(</span>
-                <span class="n">num_embeddings</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span>
-                <span class="n">embedding_dim</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
-                <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
-                <span class="n">tp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span>
-                <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">use_parallel_embedding</span> <span class="k">else</span> <span class="mi">1</span><span class="p">,</span>
-                <span class="n">tp_group</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_group</span>
-                <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">use_parallel_embedding</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
-                <span class="n">sharding_dim</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">embedding_sharding_dim</span><span class="p">,</span>
-                <span class="n">tp_rank</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_rank</span><span class="p">,</span>
-            <span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">vocab_embedding</span> <span class="o">=</span> <span class="n">Embedding</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span>
+                                             <span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+                                             <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">layers</span> <span class="o">=</span> <span class="n">DecoderLayerList</span><span class="p">(</span><span class="n">LLaMADecoderLayer</span><span class="p">,</span> <span class="n">config</span><span class="p">)</span>
 
@@ -297,14 +307,9 @@
             <span class="n">prompt_vocab_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
             <span class="n">lora_params</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
 
-        <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">fill_none_tensor_list</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">layers</span><span class="p">))</span>
-
-        <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
-            <span class="n">presents</span> <span class="o">=</span> <span class="p">[]</span>
-
         <span class="n">ptuning_args</span> <span class="o">=</span> <span class="p">[</span>
             <span class="n">prompt_embedding_table</span><span class="p">,</span> <span class="n">prompt_tasks</span><span class="p">,</span> <span class="n">prompt_vocab_size</span>
-        <span class="p">]</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_prompt_tuning</span> <span class="k">else</span> <span class="p">[]</span>
+        <span class="p">]</span> <span class="k">if</span> <span class="n">prompt_embedding_table</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="p">[]</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_first_pp_rank</span><span class="p">():</span>
             <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">vocab_embedding</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="o">*</span><span class="n">ptuning_args</span><span class="p">)</span>
@@ -338,7 +343,7 @@
 
 <div class="viewcode-block" id="LLaMAForCausalLM">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.LLaMAForCausalLM">[docs]</a>
-<span class="k">class</span> <span class="nc">LLaMAForCausalLM</span><span class="p">(</span><span class="n">DecoderModelForCausalLM</span><span class="p">,</span> <span class="n">TopModelMixin</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">LLaMAForCausalLM</span><span class="p">(</span><span class="n">DecoderModelForCausalLM</span><span class="p">):</span>
 
     <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">check_config</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
@@ -366,8 +371,6 @@
         <span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;attn_bias&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
         <span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;rotary_base&#39;</span><span class="p">,</span> <span class="mf">10000.0</span><span class="p">)</span>
         <span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;rotary_scaling&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
-        <span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;enable_pos_shift&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
-        <span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;dense_context_fmha&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
         <span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;moe_num_experts&#39;</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
         <span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;moe_top_k&#39;</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
         <span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;moe_tp_mode&#39;</span><span class="p">,</span>
@@ -384,196 +387,22 @@
                           <span class="n">hf_model_dir</span><span class="p">,</span>
                           <span class="n">dtype</span><span class="o">=</span><span class="s1">&#39;float16&#39;</span><span class="p">,</span>
                           <span class="n">mapping</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Mapping</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-                          <span class="n">quant_mode</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">QuantMode</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                           <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
-        <span class="kn">import</span> <span class="nn">transformers</span>
-        <span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">LlamaConfig</span>
-
-        <span class="kn">from</span> <span class="nn">...models.modeling_utils</span> <span class="kn">import</span> <span class="n">PretrainedConfig</span>
-        <span class="n">cfg</span> <span class="o">=</span> <span class="n">LlamaConfig</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">hf_model_dir</span><span class="p">)</span>
-
-        <span class="n">num_kv_heads</span> <span class="o">=</span> <span class="n">cfg</span><span class="o">.</span><span class="n">num_key_value_heads</span> <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">cfg</span><span class="p">,</span> <span class="s2">&quot;num_key_value_heads&quot;</span><span class="p">)</span> \
-            <span class="k">else</span> <span class="n">cfg</span><span class="o">.</span><span class="n">num_attention_heads</span>
+        <span class="kn">from</span> <span class="nn">.</span> <span class="kn">import</span> <span class="n">convert</span>
         <span class="k">if</span> <span class="n">mapping</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">mapping</span> <span class="o">=</span> <span class="n">Mapping</span><span class="p">()</span>
-        <span class="k">if</span> <span class="n">quant_mode</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">quant_mode</span> <span class="o">=</span> <span class="n">QuantMode</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
-
-        <span class="n">cfg</span><span class="o">.</span><span class="n">mapping</span> <span class="o">=</span> <span class="n">mapping</span>
-
-        <span class="n">cfg</span><span class="o">.</span><span class="n">dtype</span> <span class="o">=</span> <span class="n">dtype</span>
-        <span class="n">cfg</span><span class="o">.</span><span class="n">quant_mode</span> <span class="o">=</span> <span class="n">quant_mode</span>
-        <span class="n">moe_config</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;moe_config&quot;</span><span class="p">,</span> <span class="n">MoeConfig</span><span class="p">())</span>
-
-        <span class="n">cfg</span><span class="o">.</span><span class="n">norm_epsilon</span> <span class="o">=</span> <span class="n">cfg</span><span class="o">.</span><span class="n">rms_norm_eps</span>
-
-        <span class="n">config</span> <span class="o">=</span> <span class="p">{</span>
-            <span class="s1">&#39;architecture&#39;</span><span class="p">:</span> <span class="n">cfg</span><span class="o">.</span><span class="n">architectures</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span>
-            <span class="s1">&#39;dtype&#39;</span><span class="p">:</span> <span class="n">cfg</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
-            <span class="s1">&#39;logits_dtype&#39;</span><span class="p">:</span> <span class="s1">&#39;float32&#39;</span><span class="p">,</span>
-            <span class="s1">&#39;num_hidden_layers&#39;</span><span class="p">:</span> <span class="n">cfg</span><span class="o">.</span><span class="n">num_hidden_layers</span><span class="p">,</span>
-            <span class="s1">&#39;num_attention_heads&#39;</span><span class="p">:</span> <span class="n">cfg</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">,</span>
-            <span class="s1">&#39;hidden_size&#39;</span><span class="p">:</span> <span class="n">cfg</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
-            <span class="s1">&#39;intermediate_size&#39;</span><span class="p">:</span> <span class="n">cfg</span><span class="o">.</span><span class="n">intermediate_size</span><span class="p">,</span>
-            <span class="s1">&#39;num_key_value_heads&#39;</span><span class="p">:</span> <span class="n">cfg</span><span class="o">.</span><span class="n">num_key_value_heads</span><span class="p">,</span>
-            <span class="s1">&#39;vocab_size&#39;</span><span class="p">:</span> <span class="n">cfg</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span>
-            <span class="s1">&#39;position_embedding_type&#39;</span><span class="p">:</span> <span class="s1">&#39;rope_gpt_neox&#39;</span><span class="p">,</span>
-            <span class="s1">&#39;max_position_embeddings&#39;</span><span class="p">:</span> <span class="n">cfg</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">,</span>
-            <span class="s1">&#39;hidden_act&#39;</span><span class="p">:</span> <span class="n">cfg</span><span class="o">.</span><span class="n">hidden_act</span><span class="p">,</span>
-            <span class="s1">&#39;rotary_base&#39;</span><span class="p">:</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">cfg</span><span class="p">,</span> <span class="s1">&#39;rotary_base&#39;</span><span class="p">,</span> <span class="mf">10000.0</span><span class="p">),</span>
-            <span class="s1">&#39;rotary_scaling&#39;</span><span class="p">:</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">cfg</span><span class="p">,</span> <span class="s1">&#39;rotary_scaling&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">),</span>
-            <span class="s1">&#39;norm_epsilon&#39;</span><span class="p">:</span> <span class="n">cfg</span><span class="o">.</span><span class="n">rms_norm_eps</span><span class="p">,</span>
-            <span class="s1">&#39;quantization&#39;</span><span class="p">:</span> <span class="p">{</span>
-                <span class="s1">&#39;group_size&#39;</span><span class="p">:</span> <span class="mi">128</span><span class="p">,</span>
-            <span class="p">},</span>
-            <span class="s1">&#39;mapping&#39;</span><span class="p">:</span> <span class="p">{</span>
-                <span class="s1">&#39;world_size&#39;</span><span class="p">:</span> <span class="n">mapping</span><span class="o">.</span><span class="n">world_size</span><span class="p">,</span>
-                <span class="s1">&#39;tp_size&#39;</span><span class="p">:</span> <span class="n">mapping</span><span class="o">.</span><span class="n">world_size</span><span class="p">,</span>
-            <span class="p">},</span>
-            <span class="s1">&#39;use_parallel_embedding&#39;</span><span class="p">:</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;use_parallel_embedding&quot;</span><span class="p">,</span>
-                                                 <span class="kc">False</span><span class="p">),</span>
-            <span class="s1">&#39;embedding_sharding_dim&#39;</span><span class="p">:</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;embedding_sharding_dim&quot;</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span>
-            <span class="s1">&#39;use_prompt_tuning&#39;</span><span class="p">:</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;use_prompt_tuning&quot;</span><span class="p">,</span> <span class="kc">False</span><span class="p">),</span>
-            <span class="s1">&#39;moe_num_experts&#39;</span><span class="p">:</span> <span class="n">moe_config</span><span class="o">.</span><span class="n">num_experts</span><span class="p">,</span>
-            <span class="s1">&#39;moe_top_k&#39;</span><span class="p">:</span> <span class="n">moe_config</span><span class="o">.</span><span class="n">top_k</span><span class="p">,</span>
-            <span class="s1">&#39;moe_tp_mode&#39;</span><span class="p">:</span> <span class="n">moe_config</span><span class="o">.</span><span class="n">tp_mode</span><span class="p">,</span>
-            <span class="s1">&#39;moe_normalization_mode&#39;</span><span class="p">:</span> <span class="n">moe_config</span><span class="o">.</span><span class="n">normalization_mode</span><span class="p">,</span>
-            <span class="s1">&#39;use_fused_mlp&#39;</span><span class="p">:</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;use_fused_mlp&quot;</span><span class="p">,</span> <span class="kc">False</span><span class="p">),</span>
-            <span class="s1">&#39;enable_pos_shift&#39;</span><span class="p">:</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;enable_pos_shift&quot;</span><span class="p">,</span> <span class="kc">False</span><span class="p">),</span>
-            <span class="s1">&#39;dense_context_fmha&#39;</span><span class="p">:</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;dense_context_fmha&quot;</span><span class="p">,</span> <span class="kc">False</span><span class="p">),</span>
-        <span class="p">}</span>
-        <span class="k">if</span> <span class="n">quant_mode</span><span class="o">.</span><span class="n">is_int4_weight_only_per_group</span><span class="p">():</span>
-            <span class="n">config</span><span class="p">[</span><span class="s1">&#39;quantization&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">update</span><span class="p">({</span>
-                <span class="s1">&#39;quant_algo&#39;</span><span class="p">:</span> <span class="s1">&#39;W4A8_AWQ&#39;</span><span class="p">,</span>
-                <span class="s1">&#39;has_zero_point&#39;</span><span class="p">:</span> <span class="kc">False</span><span class="p">,</span>
-                <span class="s1">&#39;pre_quant_scale&#39;</span><span class="p">:</span> <span class="kc">True</span><span class="p">,</span>
-                <span class="s1">&#39;exclude_modules&#39;</span><span class="p">:</span> <span class="p">[],</span>
-            <span class="p">})</span>
-        <span class="k">elif</span> <span class="n">quant_mode</span><span class="o">.</span><span class="n">has_fp8_qdq</span><span class="p">()</span> <span class="ow">and</span> <span class="n">quant_mode</span><span class="o">.</span><span class="n">has_fp8_kv_cache</span><span class="p">():</span>
-            <span class="n">config</span><span class="p">[</span><span class="s1">&#39;quantization&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">update</span><span class="p">({</span>
-                <span class="s1">&#39;quant_algo&#39;</span><span class="p">:</span> <span class="s1">&#39;FP8&#39;</span><span class="p">,</span>
-                <span class="s1">&#39;kv_cache_quant_algo&#39;</span><span class="p">:</span> <span class="s1">&#39;FP8&#39;</span>
-            <span class="p">})</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="k">if</span> <span class="n">quant_mode</span> <span class="o">!=</span> <span class="n">QuantMode</span><span class="p">(</span><span class="mi">0</span><span class="p">):</span>
-                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Unsupported quantization mode: </span><span class="si">{</span><span class="n">quant_mode</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
-
-        <span class="n">tllm_llama</span> <span class="o">=</span> <span class="n">LLaMAForCausalLM</span><span class="p">(</span><span class="n">PretrainedConfig</span><span class="o">.</span><span class="n">from_dict</span><span class="p">(</span><span class="n">config</span><span class="p">))</span>
-        <span class="n">q_weights</span> <span class="o">=</span> <span class="p">{}</span>
-        <span class="k">if</span> <span class="n">quant_mode</span><span class="o">.</span><span class="n">has_any_quant</span><span class="p">():</span>
-            <span class="n">q_weights</span> <span class="o">=</span> <span class="n">tllm_llama</span><span class="o">.</span><span class="n">_quantize</span><span class="p">(</span><span class="n">hf_model_dir</span><span class="p">,</span> <span class="n">dtype</span><span class="p">,</span> <span class="n">cfg</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
-
-        <span class="c1"># For debug purpose, skip weights loading to be faster</span>
-        <span class="k">if</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;skip_loading_weights&quot;</span><span class="p">,</span> <span class="kc">False</span><span class="p">):</span>
-            <span class="k">return</span> <span class="n">tllm_llama</span>
-
-        <span class="c1"># TODO: support mixtral</span>
-
-        <span class="c1"># weights already loaded in _quantize for int4 weight only</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="n">quant_mode</span><span class="o">.</span><span class="n">is_int4_weight_only_per_group</span><span class="p">():</span>
-            <span class="n">hf_model</span> <span class="o">=</span> <span class="n">transformers</span><span class="o">.</span><span class="n">LlamaForCausalLM</span>
-            <span class="n">profiler</span><span class="o">.</span><span class="n">start</span><span class="p">(</span><span class="s2">&quot;Loading weights from HF&quot;</span><span class="p">)</span>
-            <span class="n">hf_llama</span> <span class="o">=</span> <span class="n">hf_model</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
-                <span class="n">hf_model_dir</span><span class="p">,</span>
-                <span class="n">device_map</span><span class="o">=</span><span class="p">{</span>
-                    <span class="s2">&quot;model&quot;</span><span class="p">:</span> <span class="s2">&quot;cpu&quot;</span><span class="p">,</span>
-                    <span class="s2">&quot;lm_head&quot;</span><span class="p">:</span> <span class="s2">&quot;cpu&quot;</span><span class="p">,</span>
-                    <span class="s2">&quot;embed_tokens&quot;</span><span class="p">:</span> <span class="s2">&quot;cpu&quot;</span><span class="p">,</span>
-                    <span class="s2">&quot;layers&quot;</span><span class="p">:</span> <span class="s2">&quot;cpu&quot;</span><span class="p">,</span>
-                    <span class="s2">&quot;norm&quot;</span><span class="p">:</span> <span class="s2">&quot;cpu&quot;</span><span class="p">,</span>
-                <span class="p">},</span>  <span class="c1"># Load to CPU memory</span>
-                <span class="n">torch_dtype</span><span class="o">=</span><span class="s1">&#39;auto&#39;</span><span class="p">,</span>
-            <span class="p">)</span>
-
-            <span class="n">weights</span> <span class="o">=</span> <span class="n">load_from_hf_llama</span><span class="p">(</span>
-                <span class="n">tllm_llama</span><span class="p">,</span>
-                <span class="n">hf_llama</span><span class="p">,</span>
-                <span class="n">mapping</span><span class="o">=</span><span class="n">mapping</span><span class="p">,</span>
-                <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
-                <span class="c1"># TODO: these shall be outside from_hugging_face too.</span>
-                <span class="n">use_gemm_woq_plugin</span><span class="o">=</span><span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;use_gemm_woq_plugin&quot;</span><span class="p">,</span> <span class="kc">False</span><span class="p">),</span>
-                <span class="n">lora_config</span><span class="o">=</span><span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;lora_config&quot;</span><span class="p">,</span> <span class="n">LoraConfig</span><span class="p">()),</span>
-            <span class="p">)</span>
-            <span class="n">profiler</span><span class="o">.</span><span class="n">stop</span><span class="p">(</span><span class="s2">&quot;Loading weights from HF&quot;</span><span class="p">)</span>
-            <span class="k">del</span> <span class="n">hf_llama</span>
-            <span class="n">weights</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">q_weights</span><span class="p">)</span>
-            <span class="n">tllm_llama</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">weights</span><span class="p">)</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="n">tllm_llama</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">q_weights</span><span class="p">)</span>
-        <span class="k">return</span> <span class="n">tllm_llama</span></div>
-
-
-    <span class="k">def</span> <span class="nf">_quantize</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hf_model_dir</span><span class="p">,</span> <span class="n">dtype</span><span class="p">,</span> <span class="n">cfg</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
-<span class="w">        </span><span class="sd">&#39;&#39;&#39;Given the quant_mode set in the Module object, read from given hf model</span>
-<span class="sd">           call AMMO to generate quantization scales, and set the scales back the module parameters.</span>
-<span class="sd">        &#39;&#39;&#39;</span>
-        <span class="c1"># use self destructed temporary path if kwargs[quantization_cache_dir] is not specified</span>
-        <span class="c1"># sometimes the quantization checkpoint path needs to be saved for debug purpose</span>
-        <span class="n">quantized_temp_dir</span> <span class="o">=</span> <span class="n">tempfile</span><span class="o">.</span><span class="n">TemporaryDirectory</span><span class="p">(</span><span class="s2">&quot;llama-quantized&quot;</span><span class="p">)</span>
-        <span class="n">quantized_checkpoint_path</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;quantization_cache_dir&quot;</span><span class="p">,</span>
-                                               <span class="n">quantized_temp_dir</span><span class="o">.</span><span class="n">name</span><span class="p">)</span>
-        <span class="n">quantize_lm_head</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;quantize_lm_head&quot;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
-        <span class="n">quant_mode</span> <span class="o">=</span> <span class="n">cfg</span><span class="o">.</span><span class="n">quant_mode</span>
-        <span class="n">ammo_qformat</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="n">calib_size</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="k">if</span> <span class="n">quant_mode</span><span class="o">.</span><span class="n">has_fp8_qdq</span><span class="p">()</span> <span class="ow">or</span> <span class="n">quant_mode</span><span class="o">.</span><span class="n">has_fp8_kv_cache</span><span class="p">():</span>
-            <span class="n">ammo_qformat</span> <span class="o">=</span> <span class="s1">&#39;fp8&#39;</span>
-            <span class="n">calib_size</span> <span class="o">=</span> <span class="mi">512</span>
-        <span class="c1"># TODO: how to distinguish from quant_mode about int4_awq or int4_gptq?</span>
-        <span class="k">elif</span> <span class="n">quant_mode</span><span class="o">.</span><span class="n">is_int4_weight_only_per_group</span><span class="p">():</span>
-            <span class="n">ammo_qformat</span> <span class="o">=</span> <span class="s1">&#39;int4_awq&#39;</span>
-            <span class="n">calib_size</span> <span class="o">=</span> <span class="mi">32</span>
-        <span class="k">assert</span> <span class="n">ammo_qformat</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
-
-        <span class="c1"># local import to avoid pytest issue when importing AMMO and transformers lib</span>
-        <span class="kn">from</span> <span class="nn">.quantize</span> <span class="kn">import</span> <span class="n">quantize_llama_and_export</span>
-        <span class="n">quantize_llama_and_export</span><span class="p">(</span><span class="n">hf_model_dir</span><span class="p">,</span>
-                                  <span class="n">quantized_checkpoint_path</span><span class="p">,</span>
-                                  <span class="n">ammo_qformat</span><span class="p">,</span>
-                                  <span class="n">dtype</span><span class="p">,</span>
-                                  <span class="n">calib_size</span><span class="o">=</span><span class="n">calib_size</span><span class="p">,</span>
-                                  <span class="n">quantize_lm_head</span><span class="o">=</span><span class="n">quantize_lm_head</span><span class="p">)</span>
-
-        <span class="n">ckpt</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">quantized_checkpoint_path</span><span class="p">)</span> <span class="o">/</span> <span class="s2">&quot;llama_tp1_rank0.npz&quot;</span>
-        <span class="k">assert</span> <span class="n">ckpt</span><span class="o">.</span><span class="n">exists</span><span class="p">(),</span> <span class="sa">f</span><span class="s2">&quot;The expecting checkpoint path </span><span class="si">{</span><span class="n">ckpt</span><span class="si">}</span><span class="s2"> does not exist&quot;</span> \
-                  <span class="s2">&quot;it&#39;s likely quantization failed, pls check error logs&quot;</span>
-        <span class="n">hf_config</span> <span class="o">=</span> <span class="n">AutoConfig</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">hf_model_dir</span><span class="p">,</span>
-                                               <span class="n">trust_remote_code</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">ammo_qformat</span> <span class="o">==</span> <span class="s1">&#39;fp8&#39;</span><span class="p">:</span>
-            <span class="k">return</span> <span class="n">load_from_fp8_llama</span><span class="p">(</span>
-                <span class="nb">str</span><span class="p">(</span><span class="n">ckpt</span><span class="p">),</span>
-                <span class="n">hf_config</span><span class="o">.</span><span class="n">num_hidden_layers</span><span class="p">,</span>
-                <span class="n">cfg</span><span class="o">.</span><span class="n">mapping</span><span class="p">,</span>
-                <span class="n">fp8_kv_cache</span><span class="o">=</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_fp8_kv_cache</span><span class="p">())</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="k">return</span> <span class="n">load_from_awq_llama</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">ckpt</span><span class="p">),</span>
-                                       <span class="n">hf_config</span><span class="o">.</span><span class="n">num_hidden_layers</span><span class="p">,</span>
-                                       <span class="n">hf_config</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span>
-                                       <span class="n">cfg</span><span class="o">.</span><span class="n">mapping</span><span class="p">,</span>
-                                       <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
-
-    <span class="c1"># llama specific setters, user shall has the chance to change the module attributes after</span>
-    <span class="c1"># from_hugging_face factory method created the model when these attributes is not included in the huggingface checkpoint</span>
-
-<div class="viewcode-block" id="LLaMAForCausalLM.rotary_base">
-<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.LLaMAForCausalLM.rotary_base">[docs]</a>
-    <span class="k">def</span> <span class="nf">rotary_base</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">val</span><span class="p">):</span>
-        <span class="k">for</span> <span class="n">decoder</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">layers</span><span class="p">:</span>
-            <span class="n">decoder</span><span class="o">.</span><span class="n">attention</span><span class="o">.</span><span class="n">rotary_embedding_base</span> <span class="o">=</span> <span class="n">val</span>
-        <span class="k">return</span> <span class="bp">self</span></div>
-
-
-<div class="viewcode-block" id="LLaMAForCausalLM.rotary_scaling">
-<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.LLaMAForCausalLM.rotary_scaling">[docs]</a>
-    <span class="k">def</span> <span class="nf">rotary_scaling</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">scaling_type</span><span class="p">,</span> <span class="n">factor</span><span class="p">):</span>
-        <span class="c1"># TODO: what if there are some other behaviors triggered by the these changes?</span>
-        <span class="c1"># should implement these assignment as setters of the Attention Module</span>
-        <span class="k">assert</span> <span class="n">scaling_type</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">&quot;linear&quot;</span><span class="p">,</span> <span class="s2">&quot;dynamic&quot;</span><span class="p">),</span> <span class="sa">f</span><span class="s2">&quot;Got </span><span class="si">{</span><span class="n">scaling_type</span><span class="si">}</span><span class="s2">&quot;</span>
-        <span class="k">assert</span> <span class="n">factor</span> <span class="o">&gt;</span> <span class="mf">1.0</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;Got </span><span class="si">{</span><span class="n">factor</span><span class="si">}</span><span class="s2">&quot;</span>
-        <span class="k">for</span> <span class="n">decoder</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">layers</span><span class="p">:</span>
-            <span class="n">decoder</span><span class="o">.</span><span class="n">attention</span><span class="o">.</span><span class="n">rotary_embedding_scale_type</span> <span class="o">=</span> <span class="n">RotaryScalingType</span><span class="o">.</span><span class="n">linear</span> <span class="k">if</span> <span class="n">scaling_type</span> <span class="o">==</span> <span class="s2">&quot;linear&quot;</span> <span class="k">else</span> <span class="n">RotaryScalingType</span><span class="o">.</span><span class="n">dynamic</span>
-            <span class="n">decoder</span><span class="o">.</span><span class="n">attention</span><span class="o">.</span><span class="n">rotary_embedding_scale</span> <span class="o">=</span> <span class="n">factor</span>
-        <span class="k">return</span> <span class="bp">self</span></div>
+        <span class="n">llama</span> <span class="o">=</span> <span class="n">convert</span><span class="o">.</span><span class="n">from_hugging_face</span><span class="p">(</span>
+            <span class="bp">cls</span><span class="p">,</span>
+            <span class="n">hf_model_dir</span><span class="p">,</span>
+            <span class="n">dtype</span><span class="p">,</span>
+            <span class="n">mapping</span><span class="o">=</span><span class="n">mapping</span><span class="p">,</span>
+            <span class="n">quantization</span><span class="o">=</span><span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;quantization&#39;</span><span class="p">,</span> <span class="n">QuantConfig</span><span class="p">()),</span>
+            <span class="n">load_by_shard</span><span class="o">=</span><span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;load_by_shard&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">),</span>
+            <span class="n">load_model_on_cpu</span><span class="o">=</span><span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;load_model_on_cpu&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">),</span>
+            <span class="n">override_fields</span><span class="o">=</span><span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;override_fields&#39;</span><span class="p">,</span> <span class="p">{}),</span>
+            <span class="n">skip_loading_weights</span><span class="o">=</span><span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;skip_loading_weights&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">),</span>
+            <span class="n">preloaded_model</span><span class="o">=</span><span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;preloaded_model&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">))</span>
+        <span class="k">return</span> <span class="n">llama</span></div>
 
 
 <div class="viewcode-block" id="LLaMAForCausalLM.default_plugin_config">
@@ -583,6 +412,128 @@
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">is_int4_weight_only_per_group</span><span class="p">():</span>
             <span class="n">plugin_config</span><span class="o">.</span><span class="n">set_weight_only_groupwise_quant_matmul_plugin</span><span class="p">()</span>
         <span class="k">return</span> <span class="n">plugin_config</span></div>
+
+
+<div class="viewcode-block" id="LLaMAForCausalLM.from_meta_ckpt">
+<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.LLaMAForCausalLM.from_meta_ckpt">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span> <span class="nf">from_meta_ckpt</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span>
+                       <span class="n">meta_ckpt_dir</span><span class="p">,</span>
+                       <span class="n">dtype</span><span class="p">,</span>
+                       <span class="n">mapping</span><span class="p">,</span>
+                       <span class="n">use_parallel_embedding</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+                       <span class="n">embedding_sharding_dim</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="mi">0</span><span class="p">):</span>
+        <span class="n">meta_config</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">Path</span><span class="p">(</span><span class="n">meta_ckpt_dir</span><span class="p">,</span> <span class="s2">&quot;params.json&quot;</span><span class="p">))</span> <span class="k">as</span> <span class="n">fp</span><span class="p">:</span>
+            <span class="n">meta_config</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">fp</span><span class="p">)</span>
+        <span class="k">assert</span> <span class="n">meta_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+        <span class="n">config</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="n">n_embd</span> <span class="o">=</span> <span class="n">meta_config</span><span class="p">[</span><span class="s2">&quot;dim&quot;</span><span class="p">]</span>
+        <span class="n">n_head</span> <span class="o">=</span> <span class="n">meta_config</span><span class="p">[</span><span class="s2">&quot;n_heads&quot;</span><span class="p">]</span>
+        <span class="n">n_kv_head</span> <span class="o">=</span> <span class="n">meta_config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;n_kv_heads&quot;</span><span class="p">,</span> <span class="n">n_head</span><span class="p">)</span>
+        <span class="k">if</span> <span class="s2">&quot;hidden_dim&quot;</span> <span class="ow">in</span> <span class="n">meta_config</span><span class="p">:</span>
+            <span class="n">inter_size</span> <span class="o">=</span> <span class="n">meta_config</span><span class="p">[</span><span class="s2">&quot;hidden_dim&quot;</span><span class="p">]</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">multiple_of</span> <span class="o">=</span> <span class="n">meta_config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;multiple_of&quot;</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+            <span class="n">n_embd_</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="mi">4</span> <span class="o">*</span> <span class="n">n_embd</span> <span class="o">*</span> <span class="mi">2</span> <span class="o">/</span> <span class="mi">3</span><span class="p">)</span>
+            <span class="n">ffn_dim_multiplier</span> <span class="o">=</span> <span class="n">meta_config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;ffn_dim_multiplier&quot;</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+            <span class="n">inter_size</span> <span class="o">=</span> <span class="n">multiple_of</span> <span class="o">*</span> <span class="p">(</span>
+                <span class="p">(</span><span class="nb">int</span><span class="p">(</span><span class="n">n_embd_</span> <span class="o">*</span> <span class="n">ffn_dim_multiplier</span><span class="p">)</span> <span class="o">+</span> <span class="n">multiple_of</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span>
+                <span class="n">multiple_of</span><span class="p">)</span>
+        <span class="c1"># meta checkpoint don&#39;t have vocab_size|hidden_act|rotary_base specified, use same default value as HF</span>
+        <span class="n">config</span><span class="o">.</span><span class="n">update</span><span class="p">({</span>
+            <span class="s1">&#39;architecture&#39;</span><span class="p">:</span> <span class="s2">&quot;LlamaForCausalLM&quot;</span><span class="p">,</span>
+            <span class="s1">&#39;dtype&#39;</span><span class="p">:</span> <span class="n">dtype</span><span class="p">,</span>
+            <span class="s1">&#39;logits_dtype&#39;</span><span class="p">:</span> <span class="s1">&#39;float32&#39;</span><span class="p">,</span>
+            <span class="s1">&#39;num_hidden_layers&#39;</span><span class="p">:</span> <span class="n">meta_config</span><span class="p">[</span><span class="s2">&quot;n_layers&quot;</span><span class="p">],</span>
+            <span class="s1">&#39;num_attention_heads&#39;</span><span class="p">:</span> <span class="n">n_head</span><span class="p">,</span>
+            <span class="s1">&#39;hidden_size&#39;</span><span class="p">:</span> <span class="n">n_embd</span><span class="p">,</span>
+            <span class="s1">&#39;intermediate_size&#39;</span><span class="p">:</span> <span class="n">inter_size</span><span class="p">,</span>
+            <span class="s1">&#39;num_key_value_heads&#39;</span><span class="p">:</span> <span class="n">n_kv_head</span><span class="p">,</span>
+            <span class="s1">&#39;vocab_size&#39;</span><span class="p">:</span> <span class="mi">32000</span><span class="p">,</span>
+            <span class="s1">&#39;position_embedding_type&#39;</span><span class="p">:</span> <span class="s1">&#39;rope_gpt_neox&#39;</span><span class="p">,</span>
+            <span class="s1">&#39;max_position_embeddings&#39;</span><span class="p">:</span> <span class="mi">2048</span><span class="p">,</span>
+            <span class="s1">&#39;hidden_act&#39;</span><span class="p">:</span> <span class="s1">&#39;silu&#39;</span><span class="p">,</span>
+            <span class="s1">&#39;rotary_base&#39;</span><span class="p">:</span> <span class="mf">10000.0</span><span class="p">,</span>
+            <span class="s1">&#39;norm_epsilon&#39;</span><span class="p">:</span> <span class="n">meta_config</span><span class="p">[</span><span class="s2">&quot;norm_eps&quot;</span><span class="p">],</span>
+            <span class="s1">&#39;mapping&#39;</span><span class="p">:</span> <span class="p">{</span>
+                <span class="s1">&#39;world_size&#39;</span><span class="p">:</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">pp_size</span><span class="p">,</span>
+                <span class="s1">&#39;tp_size&#39;</span><span class="p">:</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
+                <span class="s1">&#39;pp_size&#39;</span><span class="p">:</span> <span class="n">mapping</span><span class="o">.</span><span class="n">pp_size</span><span class="p">,</span>
+            <span class="p">},</span>
+        <span class="p">})</span>
+        <span class="n">pretrained_config</span> <span class="o">=</span> <span class="n">PretrainedConfig</span><span class="o">.</span><span class="n">from_dict</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
+        <span class="n">pretrained_config</span><span class="o">.</span><span class="n">use_parallel_embedding</span> <span class="o">=</span> <span class="n">use_parallel_embedding</span>
+        <span class="n">pretrained_config</span><span class="o">.</span><span class="n">embedding_sharding_dim</span> <span class="o">=</span> <span class="n">embedding_sharding_dim</span>
+        <span class="n">pretrained_config</span><span class="o">.</span><span class="n">set_rank</span><span class="p">(</span><span class="n">mapping</span><span class="o">.</span><span class="n">rank</span><span class="p">)</span>
+
+        <span class="n">llama</span> <span class="o">=</span> <span class="bp">cls</span><span class="p">(</span><span class="n">pretrained_config</span><span class="p">)</span>
+        <span class="kn">from</span> <span class="nn">.weight</span> <span class="kn">import</span> <span class="n">load_from_meta_llama</span>
+        <span class="n">weights</span> <span class="o">=</span> <span class="n">load_from_meta_llama</span><span class="p">(</span><span class="n">meta_ckpt_dir</span><span class="p">,</span> <span class="n">mapping</span><span class="p">,</span>
+                                       <span class="n">pretrained_config</span><span class="p">)</span>
+        <span class="n">llama</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">weights</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">llama</span></div>
+
+
+<div class="viewcode-block" id="LLaMAForCausalLM.quantize">
+<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.LLaMAForCausalLM.quantize">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span> <span class="nf">quantize</span><span class="p">(</span>
+        <span class="bp">cls</span><span class="p">,</span>
+        <span class="n">hf_model_dir</span><span class="p">,</span>
+        <span class="n">output_dir</span><span class="p">,</span>
+        <span class="n">quant_config</span><span class="p">:</span> <span class="n">QuantConfig</span><span class="p">,</span>
+        <span class="o">*</span><span class="p">,</span>
+        <span class="n">dtype</span><span class="o">=</span><span class="s1">&#39;float16&#39;</span><span class="p">,</span>
+        <span class="n">mapping</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Mapping</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">calib_batches</span><span class="o">=</span><span class="mi">512</span><span class="p">,</span>
+        <span class="n">calib_batch_size</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+        <span class="n">random_seed</span><span class="o">=</span><span class="mi">1234</span><span class="p">,</span>
+        <span class="n">tokenizer_max_seq_length</span><span class="o">=</span><span class="mi">2048</span><span class="p">,</span>
+        <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
+    <span class="p">):</span>
+        <span class="n">DEFAULT_AMMO_FLOW</span> <span class="o">=</span> <span class="p">[</span>
+            <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A16_AWQ</span><span class="p">,</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8</span><span class="p">,</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W8A8_SQ_PER_CHANNEL</span><span class="p">,</span>
+            <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A8_AWQ</span>
+        <span class="p">]</span>
+        <span class="n">use_ammo_quantization</span> <span class="o">=</span> <span class="n">quant_config</span><span class="o">.</span><span class="n">quant_algo</span> <span class="ow">in</span> <span class="n">DEFAULT_AMMO_FLOW</span>
+        <span class="k">if</span> <span class="n">use_ammo_quantization</span><span class="p">:</span>
+            <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">quantize</span><span class="p">(</span><span class="n">hf_model_dir</span><span class="p">,</span>
+                             <span class="n">output_dir</span><span class="p">,</span>
+                             <span class="n">quant_config</span><span class="p">,</span>
+                             <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+                             <span class="n">mapping</span><span class="o">=</span><span class="n">mapping</span><span class="p">,</span>
+                             <span class="n">calib_batches</span><span class="o">=</span><span class="n">calib_batches</span><span class="p">,</span>
+                             <span class="n">calib_batch_size</span><span class="o">=</span><span class="n">calib_batch_size</span><span class="p">,</span>
+                             <span class="n">random_seed</span><span class="o">=</span><span class="n">random_seed</span><span class="p">,</span>
+                             <span class="n">tokenizer_max_seq_length</span><span class="o">=</span><span class="n">tokenizer_max_seq_length</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="c1"># non-ammo, the legacy TRT-LLM native quantization algorithm:</span>
+            <span class="c1"># sq, int4/int8 weights only, int8 kv cache</span>
+            <span class="n">NATIVE_QUANT_FLOW</span> <span class="o">=</span> <span class="p">[</span><span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A16</span><span class="p">,</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W8A16</span><span class="p">,</span> <span class="kc">None</span>
+                                 <span class="p">]</span> <span class="o">+</span> <span class="n">W8A8_SQ_PLUGIN_LIST</span>
+            <span class="n">is_valid_native_quant</span> <span class="o">=</span> <span class="p">(</span><span class="n">quant_config</span><span class="o">.</span><span class="n">quant_algo</span> <span class="ow">in</span> <span class="n">NATIVE_QUANT_FLOW</span><span class="p">)</span> <span class="ow">and</span> \
+                <span class="p">(</span><span class="n">quant_config</span><span class="o">.</span><span class="n">kv_cache_quant_algo</span> <span class="ow">in</span> <span class="p">[</span><span class="n">QuantAlgo</span><span class="o">.</span><span class="n">INT8</span><span class="p">,</span> <span class="kc">None</span><span class="p">])</span>
+            <span class="k">assert</span> <span class="n">quant_config</span><span class="o">.</span><span class="n">quant_algo</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">quant_config</span><span class="o">.</span><span class="n">kv_cache_quant_algo</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> \
+                <span class="s2">&quot;There is no point to call the quantize function if both quant_algo and kv_cache_quant_algo is None&quot;</span>
+            <span class="k">assert</span> <span class="n">is_valid_native_quant</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;Internal error: shall call AMMO for this quantization </span><span class="si">{</span><span class="n">quant_config</span><span class="si">}</span><span class="s2">&quot;</span>
+
+            <span class="kn">from</span> <span class="nn">.</span> <span class="kn">import</span> <span class="n">convert</span>
+            <span class="n">convert</span><span class="o">.</span><span class="n">quantize</span><span class="p">(</span>
+                <span class="n">dtype</span><span class="p">,</span>
+                <span class="n">hf_model_dir</span><span class="p">,</span>
+                <span class="n">output_dir</span><span class="p">,</span>
+                <span class="n">mapping</span><span class="p">,</span>
+                <span class="n">quant_config</span><span class="p">,</span>
+                <span class="n">override_fields</span><span class="o">=</span><span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;override_fields&#39;</span><span class="p">,</span> <span class="p">{}),</span>
+                <span class="n">dataset_cache_dir</span><span class="o">=</span><span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;dataset_cache_dir&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">),</span>
+            <span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="LLaMAForCausalLM.use_lora">
+<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.LLaMAForCausalLM.use_lora">[docs]</a>
+    <span class="k">def</span> <span class="nf">use_lora</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">lora_config</span><span class="p">:</span> <span class="n">LoraBuildConfig</span><span class="p">):</span>
+        <span class="n">use_lora</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">lora_config</span><span class="p">)</span></div>
 </div>
 
 </pre></div>

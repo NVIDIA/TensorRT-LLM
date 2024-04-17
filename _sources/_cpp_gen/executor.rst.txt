@@ -1,0 +1,24 @@
+Executor
+==========
+
+.. Here are files in the cpp/include/executor
+.. We manually add subsection to enable detailed description in the future
+.. It is also doable to automatically generate this file and list all the modules in the conf.py
+executor.h
+__________
+
+.. doxygenfile:: executor.h
+   :project: TensorRT-LLM
+
+tensor.h
+________
+
+.. doxygenfile:: tensor.h
+   :project: TensorRT-LLM
+
+types.h
+_______
+
+.. doxygenfile:: types.h
+   :project: TensorRT-LLM
+

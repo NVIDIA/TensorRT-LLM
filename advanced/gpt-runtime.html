@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>C++ GPT Runtime &mdash; tensorrt_llm  documentation</title>
+      <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=80d5e7a1" />
+      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=19f00094" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script src="../_static/jquery.js?v=5d32c60e"></script>
+        <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+        <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+        <script src="../_static/doctools.js?v=888ff710"></script>
+        <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="Graph Rewriting Module" href="graph-rewriting.html" />
+    <link rel="prev" title="Multi-Head, Multi-Query, and Group-Query Attention" href="gpt-attention.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../index.html" class="icon icon-home">
+            tensorrt_llm
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/windows.html">Installing on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html">Model Definition</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html#compilation">Compilation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html#runtime">Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html#multi-gpu-and-multi-node-support">Multi-GPU and Multi-Node Support</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">C++ GPT Runtime</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#overview">Overview</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#model-configuration">Model Configuration</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#world-configuration">World Configuration</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#sampling-parameters">Sampling Parameters</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#the-session">The Session</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#internal-components">Internal Components</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#in-flight-batching-support">In-flight Batching Support</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#know-issues-and-future-changes">Know Issues and Future Changes</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="inference-request.html">Inference Request</a></li>
+<li class="toctree-l1"><a class="reference internal" href="lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-best-practices.html">Best Practices for Tuning the Performance of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Python API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../index.html">tensorrt_llm</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">C++ GPT Runtime</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="../_sources/advanced/gpt-runtime.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="c-gpt-runtime">
+<span id="gpt-runtime"></span><h1>C++ GPT Runtime<a class="headerlink" href="#c-gpt-runtime" title="Link to this heading"></a></h1>
+<p>TensorRT-LLM includes a C++ component to execute TensorRT engines built with
+the Python API as described in the <a class="reference internal" href="../architecture/overview.html#architecture-overview"><span class="std std-ref">TensorRT-LLM Architecture</span></a> section.
+That component is called the C++ runtime.</p>
+<p>The API of the C++ runtime is composed of the classes declared in
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/include/tensorrt_llm/runtime"><code class="docutils literal notranslate"><span class="pre">cpp/include/tensorrt_llm/runtime</span></code></a> and
+implemented in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/runtime"><code class="docutils literal notranslate"><span class="pre">cpp/tensorrt_llm/runtime</span></code></a>.</p>
+<p>Even if the different components described in that document mention GPT in
+their name, they are not restricted to this specific model. Those classes can
+be used to implement auto-regressive models like BLOOM, GPT-J, GPT-NeoX or
+LLaMA, for example.</p>
+<p>Complete support of encoder-decoder models, like T5, will be added to
+TensorRT-LLM in a future release. An experimental version, only in Python for
+now, can be found in the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec"><code class="docutils literal notranslate"><span class="pre">examples/enc_dec</span></code></a> folder.</p>
+<section id="overview">
+<h2>Overview<a class="headerlink" href="#overview" title="Link to this heading"></a></h2>
+<p>Runtime models are described by an instance of the
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/runtime/gptModelConfig.h"><code class="docutils literal notranslate"><span class="pre">GptModelConfig</span></code></a>
+class and a pointer to the TensorRT engine that must be
+executed to perform the inference.
+The environment is configured through the
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/runtime/worldConfig.h"><code class="docutils literal notranslate"><span class="pre">WorldConfig</span></code></a>
+(that name comes from
+<a class="reference external" href="https://en.wikipedia.org/wiki/Message_Passing_Interface">MPI</a> and its “famous”
+<code class="docutils literal notranslate"><span class="pre">MPI_COMM_WORLD</span></code> default communicator).
+The <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/runtime/samplingConfig.h"><code class="docutils literal notranslate"><span class="pre">SamplingConfig</span></code></a>
+class encapsulates parameters that control the
+<a class="reference external" href="https://huggingface.co/blog/how-to-generate">generation</a> of new tokens.</p>
+<section id="model-configuration">
+<h3>Model Configuration<a class="headerlink" href="#model-configuration" title="Link to this heading"></a></h3>
+<p>The model configuration is an instance of the
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/runtime/gptModelConfig.h"><code class="docutils literal notranslate"><span class="pre">GptModelConfig</span></code></a> class.
+That class encapsulates the following parameters (they are declared as private
+member variables and exposed through getters and setters):</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">vocabSize</span></code>, the size of the vocabulary,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">numLayers</span></code>, the number of layers in the model,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">numHeads</span></code>, the number of heads in the attention block,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">numKvHeads</span></code>, the number of heads for K and V in the attention component.
+When the number of K/V heads is the same as the number of (Q) heads, the
+model uses multi-head attention. When the number of K/V heads is 1, it uses
+multi-query attention. Otherwise, it uses group-query attention. Refer to <a class="reference internal" href="gpt-attention.html#gpt-attention"><span class="std std-ref">Multi-Head, Multi-Query, and Group-Query Attention</span></a> for more information,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">hiddenSize</span></code>, the size of the hidden dimension,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">dataType</span></code>, the datatype that was used to build the TensorRT engine and that
+must be used to run the model during inference,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">useGptAttentionPlugin</span></code>, indicates if the <a class="reference internal" href="gpt-attention.html#gpt-attention"><span class="std std-ref">Multi-Head, Multi-Query, and Group-Query Attention</span></a> operator was compiled using the
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/plugins/gptAttentionPlugin">GPT Attention plugin</a>,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">inputPacked</span></code>, indicates that the input must be packed (or padded when set
+to <code class="docutils literal notranslate"><span class="pre">false</span></code>). For performance reasons, it is recommended to always use packed,
+even if its default is set to <code class="docutils literal notranslate"><span class="pre">false</span></code> (will be changed in a future release).
+Refer to <a class="reference internal" href="gpt-attention.html#gpt-attention"><span class="std std-ref">Multi-Head, Multi-Query, and Group-Query Attention</span></a> for more information,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">pagedKvCache</span></code>, indicates if the K/V cache uses paging.
+Refer to <a class="reference internal" href="gpt-attention.html#gpt-attention"><span class="std std-ref">Multi-Head, Multi-Query, and Group-Query Attention</span></a> for more information,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">tokensPerBlock</span></code>, is the number of tokens in each block of the K/V cache.
+It’s relevant when the paged K/V cache is enabled. By default, the value is
+64. Refer to <a class="reference internal" href="gpt-attention.html#gpt-attention"><span class="std std-ref">Multi-Head, Multi-Query, and Group-Query Attention</span></a> for more information,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">quantMode</span></code>, controls the quantization method. Refer to <a class="reference internal" href="../reference/precision.html#precision"><span class="std std-ref">Numerical Precision</span></a> for more information.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">maxBatchSize</span></code>, indicates the maximum batch size that the TensorRT engine
+was built for,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">maxInputLen</span></code>, the maximum size of the input sequences,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">maxSequenceLen</span></code>, the maximum total size (input+output) of the sequences.</p></li>
+</ul>
+</section>
+<section id="world-configuration">
+<h3>World Configuration<a class="headerlink" href="#world-configuration" title="Link to this heading"></a></h3>
+<p>Familiarity with
+<a class="reference external" href="https://en.wikipedia.org/wiki/Message_Passing_Interface">MPI</a>, is not required
+to utilize the TensorRT-LMM C++ runtime. There are two main things
+you need to know:</p>
+<ul class="simple">
+<li><p>The C++ Runtime in TensorRT-LLM uses
+<a class="reference external" href="https://en.wikipedia.org/wiki/Process_(computing)">processes</a> to execute
+TensorRT engines on the different GPUs. Those GPUs can be located on a single
+node as well as on different nodes in a cluster. Each process is called a
+<em>rank</em> in MPI.</p></li>
+<li><p>The ranks are grouped in communication groups. The
+TensorRT-LLM C++ Runtime calls that group the <em>world</em>.</p></li>
+</ul>
+<p>The world configuration is an instance of the
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/runtime/worldConfig.h"><code class="docutils literal notranslate"><span class="pre">WorldConfig</span></code></a>
+class, which encapsulates the following parameters:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">tensorParallelism</span></code>, the number of ranks that collaborate together to
+implement Tensor Parallelism (TP). With TP, each GPU performs computations for
+all the layers of the model. Some of those computations are distributed
+across the GPU. TP is more balanced than Pipeline Parallelism (PP), in most cases, but
+requires higher bandwidth between the GPUs. It is the recommended setting in
+the presence of NVLINK between GPUs,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">pipelineParallelism</span></code>, the number of ranks that collaborate together to
+implement Pipeline Parallelism (PP). With PP, each GPU works on a subset of
+consecutive layers. Communications between the GPUs happen only at the
+boundaries of the subsets of layers. It is harder to guarantee the full
+utilization of the GPUs with PP but it requires less memory bandwidth. It
+is the recommended setting in the absence of NVLINK between GPUs,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">rank</span></code>, the unique identifier of the rank,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">gpusPerNode</span></code>, indicates the number of GPUs on each node. Having that
+information allows the C++ runtime to optimize communications between GPUs in
+a node (like taking advantage of the
+<a class="reference external" href="https://www.nvidia.com/en-us/data-center/nvlink/">NVLINK</a>
+interconnect between GPUs of an A100
+<a class="reference external" href="https://www.nvidia.com/en-us/data-center/dgx-platform/">DGX</a>
+node).</p></li>
+</ul>
+</section>
+<section id="sampling-parameters">
+<h3>Sampling Parameters<a class="headerlink" href="#sampling-parameters" title="Link to this heading"></a></h3>
+<p>The <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/runtime/samplingConfig.h"><code class="docutils literal notranslate"><span class="pre">SamplingConfig</span></code></a>
+class encapsulates parameters that control the
+<a class="reference external" href="https://huggingface.co/blog/how-to-generate">generation</a> of new tokens.
+Except for the <code class="docutils literal notranslate"><span class="pre">beamWidth</span></code> parameter, all the fields are optional and the
+runtime will use a default value if no values are provided by the user. For
+vector fields, the TensorRT-LLM runtime supports one value per sequence (that is,
+the vector contains <code class="docutils literal notranslate"><span class="pre">batchSize</span></code> values). If all the sequences use the same
+value for a given parameter, the vector can be limited to a single element
+(that is, <code class="docutils literal notranslate"><span class="pre">size()</span> <span class="pre">==</span> <span class="pre">1</span></code>).</p>
+<p><em><strong>General</strong></em></p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">temperature</span></code>, a vector of floating-point numbers to control the
+modulation of logits when sampling new tokens. It can have any value <code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">0.0f</span></code>. The default value is <code class="docutils literal notranslate"><span class="pre">1.0f</span></code>(no modulation).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">minLength</span></code>, a vector of integers to set a lower-bound on the number of tokens
+generated. It can have any value. Values <code class="docutils literal notranslate"><span class="pre">&lt;</span> <span class="pre">1</span></code> have no effect, the first generated token can be EOS. The default value is <code class="docutils literal notranslate"><span class="pre">1</span></code> (at least one non-EOS token is generated).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">repetitionPenalty</span></code>, a vector of float-point numbers to penalize tokens
+based on how often they appear in the sequence. It can have any value <code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">0.0f</span></code>. Repetition penalty <code class="docutils literal notranslate"><span class="pre">&lt;</span> <span class="pre">1.0f</span></code> encourages repetition, <code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">1.0f</span></code> discourages it. The default value is <code class="docutils literal notranslate"><span class="pre">1.0f</span></code> (no effect).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">presencePenalty</span></code>, a vector of float-point numbers to penalize tokens
+already present in the sequence (irrespective of the number of appearances).
+It can have any value, values <code class="docutils literal notranslate"><span class="pre">&lt;</span> <span class="pre">0.0f</span></code> encourage repetition, <code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">0.f</span></code> discourage it. The default value is <code class="docutils literal notranslate"><span class="pre">0.0f</span></code> (no effect).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">frequencyPenalty</span></code>, a vector of float-point numbers to penalize tokens
+already present in the sequence (dependent on the number of appearances). It can have any value, values <code class="docutils literal notranslate"><span class="pre">&lt;</span> <span class="pre">0.0f</span></code> encourage repetition, <code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">0.0f</span></code> discourage it.
+The default value is <code class="docutils literal notranslate"><span class="pre">0.0f</span></code>(no effect).</p></li>
+</ul>
+<p>The parameters <code class="docutils literal notranslate"><span class="pre">repetitionPenalty</span></code>, <code class="docutils literal notranslate"><span class="pre">presencePenalty</span></code>, and <code class="docutils literal notranslate"><span class="pre">frequencyPenalty</span></code> are not mutually
+exclusive.</p>
+<p><em><strong>Sampling</strong></em></p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">randomSeed</span></code>, a vector of 64-bit integers to control the random seed used by
+the random number generator in sampling. Its default value is <code class="docutils literal notranslate"><span class="pre">0</span></code>,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">topK</span></code>, a vector of integers to control the number of logits to sample from.
+Its default value is <code class="docutils literal notranslate"><span class="pre">0</span></code>. If different values are provided for the
+different sequences in the batch, the performance of the implementation will
+depend on the largest value. For efficiency reasons, we recommend to batch
+requests with similar <code class="docutils literal notranslate"><span class="pre">topK</span></code> values together,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">topP</span></code>, a vector of floating-point values to control the top-P probability
+to sample from. Its default value is <code class="docutils literal notranslate"><span class="pre">0.f</span></code>,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">topPDecay</span></code>, <code class="docutils literal notranslate"><span class="pre">topPMin</span></code> and <code class="docutils literal notranslate"><span class="pre">topPResetIds</span></code>, vectors to control the decay in
+the <code class="docutils literal notranslate"><span class="pre">topP</span></code> algorithm. The <code class="docutils literal notranslate"><span class="pre">topP</span></code> values are modulated by
+a decay that exponentially depends on the length of the sequence as explained in
+<a class="reference external" href="https://arxiv.org/abs/2206.04624"><em>Factuality Enhanced Language Models for Open-Ended Text Generation</em></a>.
+<code class="docutils literal notranslate"><span class="pre">topPDecay</span></code> is the decay, <code class="docutils literal notranslate"><span class="pre">topPMin</span></code> is the lower-bound and <code class="docutils literal notranslate"><span class="pre">topPResetIds</span></code>
+indicates where to reset the decay. Defaults are <code class="docutils literal notranslate"><span class="pre">1.f</span></code>, <code class="docutils literal notranslate"><span class="pre">1.0e-6,f</span></code>, and <code class="docutils literal notranslate"><span class="pre">-1</span></code>,</p></li>
+</ul>
+<p>If both <code class="docutils literal notranslate"><span class="pre">topK</span></code> and <code class="docutils literal notranslate"><span class="pre">topP</span></code> fields are set, the <code class="docutils literal notranslate"><span class="pre">topK</span></code> method will be run for
+sequences with a <code class="docutils literal notranslate"><span class="pre">topK</span></code> value greater than <code class="docutils literal notranslate"><span class="pre">0.f</span></code>. In that case, the <code class="docutils literal notranslate"><span class="pre">topP</span></code>
+value for that sequence also influences the result. If the <code class="docutils literal notranslate"><span class="pre">topK</span></code> values for
+some sequences are <code class="docutils literal notranslate"><span class="pre">0.f</span></code>, the <code class="docutils literal notranslate"><span class="pre">topP</span></code> method will be used for those remaining
+sequences. If both <code class="docutils literal notranslate"><span class="pre">topK</span></code> and <code class="docutils literal notranslate"><span class="pre">topP</span></code> are zero, greedy search is performed.</p>
+<p><em><strong>Beam-search</strong></em></p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">beamWidth</span></code>, is the width used for the <a class="reference external" href="https://en.wikipedia.org/wiki/Beam_search">beam
+search</a> sampling algorithm. There
+is no explicit upper-bound on the beam width but increasing the beam width
+will likely increase the latency. Use <code class="docutils literal notranslate"><span class="pre">1</span></code> to disable beam-search,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">beamSearchDiversityRate</span></code>, a floating-point value that controls the
+diversity in beam-search. Its default value is <code class="docutils literal notranslate"><span class="pre">0.f</span></code>,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">lengthPenalty</span></code>, a floating-point value that controls how to penalize the
+longer sequences in beam-search (the log-probability of a sequence will be
+penalized by a factor that depends on <code class="docutils literal notranslate"><span class="pre">1.f</span> <span class="pre">/</span> <span class="pre">(length</span> <span class="pre">^</span> <span class="pre">lengthPenalty)</span></code>). The
+default is value <code class="docutils literal notranslate"><span class="pre">0.f</span></code>,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">earlyStopping</span></code>, a integer value that controls whether the generation process
+finishes once <code class="docutils literal notranslate"><span class="pre">beamWidth</span></code> sentences are generated (end up with <code class="docutils literal notranslate"><span class="pre">end_token</span></code>).
+Default value <code class="docutils literal notranslate"><span class="pre">1</span></code> means <code class="docutils literal notranslate"><span class="pre">earlyStopping</span></code> is enabled, value <code class="docutils literal notranslate"><span class="pre">0</span></code> means <code class="docutils literal notranslate"><span class="pre">earlyStopping</span></code>
+is disable, other values  means the generation process is depended on
+<code class="docutils literal notranslate"><span class="pre">length_penalty</span></code>.
+The <code class="docutils literal notranslate"><span class="pre">beamWidth</span></code> parameter is a scalar value. It means that in this release of
+TensorRT-LLM, it is not possible to specify a different width for each input
+sequence. This limitation is likely to be removed in a future release.</p></li>
+</ul>
+</section>
+</section>
+<section id="the-session">
+<h2>The Session<a class="headerlink" href="#the-session" title="Link to this heading"></a></h2>
+<p><em>The runtime session is deprecated in favor of the <a class="reference internal" href="../executor.html#executor"><span class="std std-ref">Executor API</span></a>.
+It will be removed in a future release of TensorRT-LLM.</em></p>
+<p>An example of how to use the <code class="docutils literal notranslate"><span class="pre">GptSession</span></code> to run a GPT-like auto-regressive model can be found in
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tests/runtime/gptSessionTest.cpp"><code class="docutils literal notranslate"><span class="pre">cpp/tests/runtime/gptSessionTest.cpp</span></code></a>.</p>
+<section id="internal-components">
+<h3>Internal Components<a class="headerlink" href="#internal-components" title="Link to this heading"></a></h3>
+<p>The <code class="docutils literal notranslate"><span class="pre">GptSession</span></code> class encapsulates two main components. The
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/runtime/tllmRuntime.h"><code class="docutils literal notranslate"><span class="pre">TllmRuntime</span></code></a> is in charge of the
+execution of the TensorRT engine. The
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/runtime/gptDecoder.h"><code class="docutils literal notranslate"><span class="pre">GptDecoder</span></code></a>
+does the generation of the tokens from the logits.  The <code class="docutils literal notranslate"><span class="pre">TllmRuntime</span></code> class is
+an internal component and you are not expected to use that class directly.
+The <code class="docutils literal notranslate"><span class="pre">GptDecoder</span></code> can be used directly to implement custom generation loop
+and for use cases that cannot be satisfied by the implementation in
+<code class="docutils literal notranslate"><span class="pre">GptSession</span></code>.</p>
+</section>
+</section>
+<section id="in-flight-batching-support">
+<h2>In-flight Batching Support<a class="headerlink" href="#in-flight-batching-support" title="Link to this heading"></a></h2>
+<p>In-flight batching is supported using separate decoders per
+request. The biggest difference compared to using a single decoder is in how
+the token generation from logits is managed. A batch is split into <code class="docutils literal notranslate"><span class="pre">batchSize</span></code>
+individual requests and kernels are issued using separated CUDA streams.
+This behavior may be revisited in a future release to maintain the structure
+of the batch and improve efficiency.</p>
+</section>
+<section id="know-issues-and-future-changes">
+<h2>Know Issues and Future Changes<a class="headerlink" href="#know-issues-and-future-changes" title="Link to this heading"></a></h2>
+<ul class="simple">
+<li><p>In the current release of TensorRT-LLM, the C++ and Python runtimes are two
+separate software components and the C++ runtime is being more actively
+developed (with features like in-flight batching). An objective, for a
+future release, could be to rebuild the Python runtime on top of the C++
+one.</p></li>
+</ul>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="gpt-attention.html" class="btn btn-neutral float-left" title="Multi-Head, Multi-Query, and Group-Query Attention" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="graph-rewriting.html" class="btn btn-neutral float-right" title="Graph Rewriting Module" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2023, NVidia.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

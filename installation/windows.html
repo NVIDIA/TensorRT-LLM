@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Installing on Windows &mdash; tensorrt_llm  documentation</title>
+      <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=80d5e7a1" />
+      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=19f00094" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script src="../_static/jquery.js?v=5d32c60e"></script>
+        <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+        <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+        <script src="../_static/doctools.js?v=888ff710"></script>
+        <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="Building from Source Code on Windows" href="build-from-source-windows.html" />
+    <link rel="prev" title="Building from Source Code on Linux" href="build-from-source-linux.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../index.html" class="icon icon-home">
+            tensorrt_llm
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">Installing on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="build-from-source-windows.html">Building from Source Code on Windows</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html">Model Definition</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html#compilation">Compilation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html#runtime">Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html#multi-gpu-and-multi-node-support">Multi-GPU and Multi-Node Support</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html">Inference Request</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-best-practices.html">Best Practices for Tuning the Performance of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Python API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../index.html">tensorrt_llm</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">Installing on Windows</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="../_sources/installation/windows.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="installing-on-windows">
+<span id="windows"></span><h1>Installing on Windows<a class="headerlink" href="#installing-on-windows" title="Link to this heading"></a></h1>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>The Windows release of TensorRT-LLM is currently in beta. We recommend using the <code class="docutils literal notranslate"><span class="pre">rel</span></code> branch for the most stable experience.</p>
+</div>
+<p><strong>Prerequisites</strong></p>
+<ol class="arabic">
+<li><p>Clone this repository using <a class="reference external" href="https://git-scm.com/download/win">Git for Windows</a>.</p></li>
+<li><p>Install the dependencies one of two ways:</p>
+<ol class="arabic simple">
+<li><p>Run the provided PowerShell script; <code class="docutils literal notranslate"><span class="pre">setup_env.ps1</span></code>, which installs Python, CUDA 12.2, and Microsoft MPI automatically with default settings. Run PowerShell as Administrator to use the script.</p></li>
+</ol>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>./setup_env.ps1<span class="w"> </span><span class="o">[</span>-skipCUDA<span class="o">]</span><span class="w"> </span><span class="o">[</span>-skipPython<span class="o">]</span><span class="w"> </span><span class="o">[</span>-skipMPI<span class="o">]</span>
+</pre></div>
+</div>
+<ol class="arabic simple" start="2">
+<li><p>Install the dependencies one at a time.</p>
+<ol class="arabic simple">
+<li><p>Install <a class="reference external" href="https://www.python.org/downloads/windows/">Python 3.10</a>.</p>
+<ol class="arabic simple">
+<li><p>Select <strong>Add python.exe to PATH</strong> at the start of the installation. The installation may only add the <code class="docutils literal notranslate"><span class="pre">python</span></code> command, but not the <code class="docutils literal notranslate"><span class="pre">python3</span></code> command.</p></li>
+<li><p>Navigate to the installation path <code class="docutils literal notranslate"><span class="pre">%USERPROFILE%\AppData\Local\Programs\Python\Python310</span></code> (<code class="docutils literal notranslate"><span class="pre">AppData</span></code> is a hidden folder) and copy <code class="docutils literal notranslate"><span class="pre">python.exe</span></code> to <code class="docutils literal notranslate"><span class="pre">python3.exe</span></code>.</p></li>
+</ol>
+</li>
+</ol>
+</li>
+<li><p>Install <a class="reference external" href="https://developer.nvidia.com/cuda-12-2-2-download-archive?target_os=Windows&amp;amp;target_arch=x86_64">CUDA 12.2 Toolkit</a>. Use the Express Installation option. Installation may require a restart.</p></li>
+<li><p>Download and install <a class="reference external" href="https://www.microsoft.com/en-us/download/details.aspx?id=57467">Microsoft MPI</a>. You will be prompted to choose between an <code class="docutils literal notranslate"><span class="pre">exe</span></code>, which installs the MPI executable, and an <code class="docutils literal notranslate"><span class="pre">msi</span></code>, which installs the MPI SDK. Download and install both.</p></li>
+</ol>
+</li>
+<li><p>Download and unzip <a class="reference external" href="https://developer.nvidia.com/cudnn">cuDNN</a>.</p>
+<ol class="arabic">
+<li><p>Move the folder to a location you can reference later, such as <code class="docutils literal notranslate"><span class="pre">%USERPROFILE%\inference\cuDNN</span></code>.</p></li>
+<li><p>Add the libraries and binaries for cuDNN to your system’s <code class="docutils literal notranslate"><span class="pre">Path</span></code> environment variable.</p>
+<ol class="arabic simple">
+<li><p>Click the Windows button and search for <em>environment variables</em>.</p></li>
+<li><p>Click <strong>Edit the system environment variables</strong> &gt; <strong>Environment Variables</strong>.</p></li>
+<li><p>In the new window under <em>System variables</em>, click <strong>Path</strong> &gt; <strong>Edit</strong>. Add <strong>New</strong> lines for the <code class="docutils literal notranslate"><span class="pre">bin</span></code> and <code class="docutils literal notranslate"><span class="pre">lib</span></code> directories of cuDNN. Your <code class="docutils literal notranslate"><span class="pre">Path</span></code> should include lines like this:</p></li>
+</ol>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>%USERPROFILE%<span class="se">\i</span>nference<span class="se">\c</span>uDNN<span class="se">\b</span>in
+%SERPROFILE%<span class="se">\i</span>nference<span class="se">\c</span>uDNN<span class="se">\l</span>ib
+</pre></div>
+</div>
+<ol class="arabic simple" start="4">
+<li><p>Click <strong>OK</strong> on all the open dialog windows.</p></li>
+<li><p>Close and re-open any existing PowerShell or Git Bash windows so they pick up the new <code class="docutils literal notranslate"><span class="pre">Path</span></code>.</p></li>
+</ol>
+</li>
+</ol>
+</li>
+</ol>
+<p><strong>Steps</strong></p>
+<ol class="arabic simple">
+<li><p>Install TensorRT-LLM.</p></li>
+</ol>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span>tensorrt_llm<span class="w"> </span>--extra-index-url<span class="w"> </span>https://pypi.nvidia.com<span class="w"> </span>--extra-index-url<span class="w"> </span>https://download.pytorch.org/whl/cu121
+</pre></div>
+</div>
+<p>Run the following command to verify that your TensorRT-LLM installation is working properly.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;import tensorrt_llm; print(tensorrt_llm._utils.trt_version())&quot;</span>
+</pre></div>
+</div>
+<ol class="arabic simple" start="2">
+<li><p>Build the model.</p></li>
+<li><p>Deploy the model.</p></li>
+</ol>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="build-from-source-linux.html" class="btn btn-neutral float-left" title="Building from Source Code on Linux" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="build-from-source-windows.html" class="btn btn-neutral float-right" title="Building from Source Code on Windows" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2023, NVidia.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>
