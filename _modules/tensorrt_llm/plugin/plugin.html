@@ -41,24 +41,56 @@
   </form>
 </div>
         </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
-              <p class="caption" role="heading"><span class="caption-text">Contents:</span></p>
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
 <ul>
-<li class="toctree-l1"><a class="reference internal" href="../../../architecture.html">TensorRT-LLM Architecture</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../gpt_runtime.html">C++ GPT Runtime</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../batch_manager.html">The Batch Manager in TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../inference_request.html">Inference Request</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../gpt_attention.html">Multi-head, Multi-query and Group-query Attention</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../precision.html">Numerical Precision</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../build_from_source.html">Build from Source</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../performance.html">Performance of TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../2023-05-19-how-to-debug.html">How to debug</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../2023-05-17-how-to-add-a-new-model.html">How to add a new model</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../graph-rewriting.html">Graph Rewriting Module</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../memory.html">Memory Usage of TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../new_workflow.html">New Workflow</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../perf_best_practices.html">Best Practices for Tuning the Performance of TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../performance_analysis.html">Performance Analysis of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../release-notes.html">Release Notes</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../installation/windows.html">Installing on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/core-concepts.html">Model Definition</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/core-concepts.html#compilation">Compilation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/core-concepts.html#runtime">Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/core-concepts.html#multi-gpu-and-multi-node-support">Multi-GPU and Multi-Node Support</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/inference-request.html">Inference Request</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-best-practices.html">Best Practices for Tuning the Performance of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Python API</span></p>
 <ul>
@@ -69,16 +101,13 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
 </ul>
-<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="../../../_cpp_gen/runtime.html">Runtime</a></li>
-</ul>
 <p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
 </ul>
 
         </div>
@@ -188,6 +217,8 @@
     <span class="n">weight_only_quant_matmul_plugin</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">quantize_per_token_plugin</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="n">quantize_tensor_plugin</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="n">moe_plugin</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;float16&quot;</span>
+    <span class="n">mamba_conv1d_plugin</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;float16&quot;</span>
 
     <span class="c1"># Features</span>
     <span class="n">context_fmha</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
@@ -201,7 +232,11 @@
     <span class="n">attention_qk_half_accumulation</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="n">tokens_per_block</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">128</span>
     <span class="n">use_paged_context_fmha</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="n">use_fp8_context_fmha</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="n">use_context_fmha_for_generation</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="n">multiple_profiles</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="n">paged_state</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="n">streamingllm</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
     <span class="k">def</span> <span class="nf">set_plugin</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">value</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">bool</span><span class="p">,</span> <span class="nb">int</span><span class="p">]):</span>
         <span class="k">assert</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">),</span> <span class="sa">f</span><span class="s2">&quot;Plugin name doesn&#39;t exist: </span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2">&quot;</span>
@@ -327,6 +362,14 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">set_plugin</span><span class="p">(</span><span class="s2">&quot;gemm_plugin&quot;</span><span class="p">,</span> <span class="n">dtype</span><span class="p">)</span>
         <span class="k">return</span> <span class="bp">self</span>
 
+    <span class="k">def</span> <span class="nf">set_moe_plugin</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="s1">&#39;float16&#39;</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">moe_plugin</span> <span class="o">=</span> <span class="n">dtype</span>
+        <span class="k">return</span> <span class="bp">self</span>
+
+    <span class="k">def</span> <span class="nf">set_mamba_conv1d_plugin</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="s1">&#39;float16&#39;</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">mamba_conv1d_plugin</span> <span class="o">=</span> <span class="n">dtype</span>
+        <span class="k">return</span> <span class="bp">self</span>
+
     <span class="k">def</span> <span class="nf">set_smooth_quant_gemm_plugin</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="s1">&#39;float16&#39;</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">set_plugin</span><span class="p">(</span><span class="s2">&quot;smooth_quant_gemm_plugin&quot;</span><span class="p">,</span> <span class="n">dtype</span><span class="p">)</span>
         <span class="k">return</span> <span class="bp">self</span>
@@ -378,6 +421,10 @@
 
     <span class="k">def</span> <span class="nf">set_context_fmha_for_generation</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">set_plugin</span><span class="p">(</span><span class="s2">&quot;use_context_fmha_for_generation&quot;</span><span class="p">,</span> <span class="kc">True</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span>
+
+    <span class="k">def</span> <span class="nf">set_streamingllm</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">set_plugin</span><span class="p">(</span><span class="s2">&quot;streamingllm&quot;</span><span class="p">,</span> <span class="kc">True</span><span class="p">)</span>
         <span class="k">return</span> <span class="bp">self</span></div>
 
 
@@ -389,6 +436,8 @@
     <span class="s2">&quot;gemm_plugin&quot;</span><span class="p">,</span>
     <span class="s2">&quot;lookup_plugin&quot;</span><span class="p">,</span>
     <span class="s2">&quot;lora_plugin&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;moe_plugin&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;mamba_conv1d_plugin&quot;</span><span class="p">,</span>
 
     <span class="c1"># Features</span>
     <span class="s2">&quot;context_fmha&quot;</span><span class="p">,</span>
@@ -401,7 +450,11 @@
     <span class="s2">&quot;attention_qk_half_accumulation&quot;</span><span class="p">,</span>
     <span class="s2">&quot;tokens_per_block&quot;</span><span class="p">,</span>
     <span class="s2">&quot;use_paged_context_fmha&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;use_fp8_context_fmha&quot;</span><span class="p">,</span>
     <span class="s2">&quot;use_context_fmha_for_generation&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;multiple_profiles&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;paged_state&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;streamingllm&quot;</span><span class="p">,</span>
 <span class="p">]</span>
 
 <span class="n">plugin_options</span> <span class="o">=</span> <span class="p">[</span><span class="s2">&quot;float16&quot;</span><span class="p">,</span> <span class="s2">&quot;float32&quot;</span><span class="p">,</span> <span class="s2">&quot;bfloat16&quot;</span><span class="p">,</span> <span class="s2">&quot;disable&quot;</span><span class="p">]</span>
@@ -444,7 +497,7 @@
 
 <span class="sd">        workspace: Tensor</span>
 <span class="sd">            When using CUSTOM or AUTO mode, a tensor containing pointers to memory</span>
-<span class="sd">            visible to all GPUs. It should be 3 poitners per TP rank -</span>
+<span class="sd">            visible to all GPUs. It should be 3 pointers per TP rank -</span>
 <span class="sd">            ptr to data buffer, ptr to barriers in, ptr to barriers out.</span>
 <span class="sd">            It must be initialized using IpcMemory class.</span>
 
@@ -466,16 +519,14 @@
 
     <span class="k">def</span> <span class="nf">set_workspace_tensor</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                              <span class="n">mapping</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">,</span>
-                             <span class="n">two_opt_profiles</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+                             <span class="n">num_profiles</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
         <span class="kn">from</span> <span class="nn">..functional</span> <span class="kn">import</span> <span class="n">Tensor</span>
         <span class="n">workspace_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">POINTERS_PER_RANK</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span>
 
         <span class="n">dim_range</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="k">if</span> <span class="n">two_opt_profiles</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">dim_range</span> <span class="o">=</span> <span class="n">OrderedDict</span><span class="p">([</span>
-                <span class="p">(</span><span class="s1">&#39;all_reduce_size&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">workspace_size</span><span class="p">,</span> <span class="n">workspace_size</span><span class="p">]</span>
-                 <span class="k">if</span> <span class="n">two_opt_profiles</span> <span class="k">else</span> <span class="p">[</span><span class="n">workspace_size</span><span class="p">])</span>
-            <span class="p">])</span>
+        <span class="k">if</span> <span class="n">num_profiles</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">dim_range</span> <span class="o">=</span> <span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;all_reduce_size&#39;</span><span class="p">,</span>
+                                      <span class="p">[</span><span class="n">workspace_size</span><span class="p">]</span> <span class="o">*</span> <span class="n">num_profiles</span><span class="p">)])</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">workspace</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
             <span class="n">name</span><span class="o">=</span><span class="s1">&#39;all_reduce_workspace&#39;</span><span class="p">,</span>
@@ -494,15 +545,17 @@
     <span class="k">def</span> <span class="nf">allocate_workspace</span><span class="p">(</span><span class="n">mapping</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">,</span>
                            <span class="n">size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="n">IpcMemory</span><span class="p">],</span> <span class="s2">&quot;torch.tensor&quot;</span><span class="p">]:</span>
         <span class="kn">import</span> <span class="nn">torch</span>
-        <span class="n">ipc_buffers_ping</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">size</span><span class="p">)</span>
-        <span class="n">ipc_buffers_pong</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">size</span><span class="p">)</span>
+        <span class="n">ipc_buffers_ping</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">size</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">world_size</span><span class="p">)</span>
+        <span class="n">ipc_buffers_pong</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">size</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">world_size</span><span class="p">)</span>
         <span class="n">ipc_barriers_in</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span>
             <span class="n">mapping</span><span class="p">,</span> <span class="n">IpcMemory</span><span class="o">.</span><span class="n">IPC_BARRIERS_SIZE_PER_GPU</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">)</span>
         <span class="n">ipc_barriers_out</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span>
             <span class="n">mapping</span><span class="p">,</span> <span class="n">IpcMemory</span><span class="o">.</span><span class="n">IPC_BARRIERS_SIZE_PER_GPU</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">)</span>
         <span class="n">buffers</span> <span class="o">=</span> <span class="p">[</span>
-            <span class="n">ipc_buffers_ping</span><span class="p">,</span> <span class="n">ipc_buffers_pong</span><span class="p">,</span> <span class="n">ipc_barriers_in</span><span class="p">,</span>
-            <span class="n">ipc_buffers_ping</span>
+            <span class="n">ipc_buffers_ping</span><span class="p">,</span>
+            <span class="n">ipc_buffers_pong</span><span class="p">,</span>
+            <span class="n">ipc_barriers_in</span><span class="p">,</span>
+            <span class="n">ipc_barriers_out</span><span class="p">,</span>
         <span class="p">]</span>
 
         <span class="k">return</span> <span class="n">buffers</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span>

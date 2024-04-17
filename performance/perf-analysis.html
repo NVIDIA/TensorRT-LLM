@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Performance Analysis &mdash; tensorrt_llm  documentation</title>
+      <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=80d5e7a1" />
+      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=19f00094" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script src="../_static/jquery.js?v=5d32c60e"></script>
+        <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+        <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+        <script src="../_static/doctools.js?v=888ff710"></script>
+        <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="Troubleshooting" href="../reference/troubleshooting.html" />
+    <link rel="prev" title="Best Practices for Tuning the Performance of TensorRT-LLM" href="perf-best-practices.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../index.html" class="icon icon-home">
+            tensorrt_llm
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/windows.html">Installing on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html">Model Definition</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html#compilation">Compilation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html#runtime">Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html#multi-gpu-and-multi-node-support">Multi-GPU and Multi-Node Support</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html">Inference Request</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="perf-best-practices.html">Best Practices for Tuning the Performance of TensorRT-LLM</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">Performance Analysis</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#feature-descriptions">Feature Descriptions</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#usage">Usage</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#inference-time-command-line-options">Inference Time Command Line Options</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#inference-time-environment-variables">Inference Time Environment Variables</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#coordinating-with-nvidia-nsight-systems-launch">Coordinating with NVIDIA Nsight Systems Launch</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#examples">Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#profiling-a-single-ifb-iteration-executing-on-a-single-rank-of-a-multi-gpu-model">Profiling a single IFB iteration executing on a single rank of a multi-GPU model</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Python API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../index.html">tensorrt_llm</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">Performance Analysis</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="../_sources/performance/perf-analysis.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="performance-analysis">
+<span id="perf-analysis"></span><h1>Performance Analysis<a class="headerlink" href="#performance-analysis" title="Link to this heading"></a></h1>
+<p>NVIDIA Nsight Systems reports at the application level are highly informative. Metric sampling capabilities have increased over generations and provide a clean middle-ground between timing analysis and kernel-level deep dives with NVIDIA Nsight Compute.</p>
+<p>Given the potential long runtimes of Large Languages Models (LLMs) and the diversity of workloads a model may experience during a single inference pass or binary execution, we have added features to TensorRT-LLM to get the most out of Nsight Systems capabilities. This document outlines those features as well as provides examples of how to best utilize them to understand your application.</p>
+<section id="feature-descriptions">
+<h2>Feature Descriptions<a class="headerlink" href="#feature-descriptions" title="Link to this heading"></a></h2>
+<p>The main functionality here:</p>
+<ul class="simple">
+<li><p>Relies on toggling the CUDA profiler runtime API on and off.</p></li>
+<li><p>Provides a means to understand which regions a user may want to focus on.</p></li>
+</ul>
+<p>Toggling the CUDA profiler runtime API on and off:</p>
+<ul class="simple">
+<li><p>Allows users to know specifically what the profiled region corresponds to.</p></li>
+<li><p>Results in smaller files to post-process (for metric extraction or similar).</p></li>
+</ul>
+</section>
+<section id="usage">
+<h2>Usage<a class="headerlink" href="#usage" title="Link to this heading"></a></h2>
+<section id="inference-time-command-line-options">
+<h3>Inference Time Command Line Options<a class="headerlink" href="#inference-time-command-line-options" title="Link to this heading"></a></h3>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">--log_iteration_data</span></code>, for use with gptManagerBenchmark. The runtime decides the specifics of each decoder iteration launch. This option prints to stdout metadata on each decoder iteration:</p></li>
+</ul>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="p">[</span><span class="n">TensorRT</span><span class="o">-</span><span class="n">LLM</span><span class="p">][</span><span class="n">INFO</span><span class="p">]</span> <span class="p">{</span><span class="s2">&quot;Active Request Count&quot;</span><span class="p">:</span><span class="mi">249</span><span class="p">,</span><span class="s2">&quot;Context Requests&quot;</span><span class="p">:</span><span class="mi">8</span><span class="p">,</span><span class="s2">&quot;Free KV cache blocks&quot;</span><span class="p">:</span><span class="mi">0</span><span class="p">,</span><span class="s2">&quot;Generation Requests&quot;</span><span class="p">:</span><span class="mi">231</span><span class="p">,</span><span class="s2">&quot;Iteration Counter&quot;</span><span class="p">:</span><span class="mi">90</span><span class="p">,</span><span class="s2">&quot;Max KV cache blocks&quot;</span><span class="p">:</span><span class="mi">2448</span><span class="p">,</span><span class="s2">&quot;Max Request Count&quot;</span><span class="p">:</span><span class="mi">256</span><span class="p">,</span><span class="s2">&quot;MicroBatch ID&quot;</span><span class="p">:</span><span class="mi">0</span><span class="p">,</span><span class="s2">&quot;Runtime CPU Memory Usage&quot;</span><span class="p">:</span><span class="mi">28784</span><span class="p">,</span><span class="s2">&quot;Runtime GPU Memory Usage&quot;</span><span class="p">:</span><span class="mi">540173600</span><span class="p">,</span><span class="s2">&quot;Runtime Pinned Memory Usage&quot;</span><span class="p">:</span><span class="mi">0</span><span class="p">,</span><span class="s2">&quot;Scheduled Requests&quot;</span><span class="p">:</span><span class="mi">239</span><span class="p">,</span><span class="s2">&quot;Timestamp&quot;</span><span class="p">:</span><span class="s2">&quot;12-13-2023 14:55:14&quot;</span><span class="p">,</span><span class="s2">&quot;Tokens per KV cache block&quot;</span><span class="p">:</span><span class="mi">128</span><span class="p">,</span><span class="s2">&quot;Total Context Tokens&quot;</span><span class="p">:</span><span class="mi">6904</span><span class="p">,</span><span class="s2">&quot;Used KV cache blocks&quot;</span><span class="p">:</span><span class="mi">2448</span><span class="p">}</span>
+</pre></div>
+</div>
+</section>
+<section id="inference-time-environment-variables">
+<h3>Inference Time Environment Variables<a class="headerlink" href="#inference-time-environment-variables" title="Link to this heading"></a></h3>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">TLLM_GPTM_PROFILE_START_STOP</span></code>, a csv of iterations to trigger start/stop for gptManagerBenchmark (corresponds to “Iteration Counter” in output above</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">TLLM_GPTS_PROFILE_START_STOP</span></code>, a csv of static batching iteration indexes to trigger start/stop for gptSessionBenchmark</p></li>
+</ul>
+</section>
+</section>
+<section id="coordinating-with-nvidia-nsight-systems-launch">
+<h2>Coordinating with NVIDIA Nsight Systems Launch<a class="headerlink" href="#coordinating-with-nvidia-nsight-systems-launch" title="Link to this heading"></a></h2>
+<p>Consult the Nsight Systems User Guide for full overview of options.</p>
+<p>Say we want to profile the context phase and the first output token computation of a model with gptSessionBenchmark.</p>
+<p>To profile just those iterations, in addition to setting <code class="docutils literal notranslate"><span class="pre">TLLM_GPTS_PROFILE_START_STOP=&quot;0,1&quot;</span></code>:</p>
+<ul class="simple">
+<li><p>We need to tell Nsight Systems to look for explicit API triggers to profile (<code class="docutils literal notranslate"><span class="pre">-c</span> <span class="pre">cudaProfilerApi</span></code>)</p></li>
+<li><p>We need to tell Nsight Systems to keep profiling after seeing a profile stop API call (<code class="docutils literal notranslate"><span class="pre">--capture-range-end=&quot;repeat[]&quot;</span></code>)</p></li>
+</ul>
+</section>
+<section id="examples">
+<h2>Examples<a class="headerlink" href="#examples" title="Link to this heading"></a></h2>
+<p>Consult the Nsight Systems User Guide for full overview of MPI-related options.</p>
+</section>
+<section id="profiling-a-single-ifb-iteration-executing-on-a-single-rank-of-a-multi-gpu-model">
+<h2>Profiling a single IFB iteration executing on a single rank of a multi-GPU model<a class="headerlink" href="#profiling-a-single-ifb-iteration-executing-on-a-single-rank-of-a-multi-gpu-model" title="Link to this heading"></a></h2>
+<p>Say we have run once using <code class="docutils literal notranslate"><span class="pre">--log_iteration_data</span></code> and want to analyze iterations 0, 63 and 127 based on the metadata output. We also want to capture metrics at an increased resolution. To do this we create a bash file as describe in the Nsight Systems User Guide:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="ch">#!/bin/bash</span>
+
+<span class="c1"># Use $PMI_RANK for MPICH and $SLURM_PROCID with srun.</span>
+<span class="k">if</span><span class="w"> </span><span class="o">[</span><span class="w"> </span><span class="nv">$OMPI_COMM_WORLD_LOCAL_RANK</span><span class="w"> </span>-eq<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="o">]</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">  </span>nsys<span class="w"> </span>profile<span class="w"> </span>-e<span class="w"> </span><span class="s2">&quot;NSYS_MPI_STORE_TEAMS_PER_RANK=1&quot;</span><span class="w"> </span>-t<span class="w"> </span>cuda,nvtx<span class="w"> </span>--gpu-metrics-device<span class="o">=</span><span class="si">${</span><span class="nv">OMPI_COMM_WORLD_LOCAL_RANK</span><span class="si">}</span><span class="w"> </span>-c<span class="w"> </span>cudaProfilerApi<span class="w"> </span>--capture-range-end<span class="o">=</span><span class="s2">&quot;repeat[]&quot;</span><span class="w"> </span>--gpu-metrics-frequency<span class="o">=</span><span class="m">100000</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$@</span><span class="s2">&quot;</span>
+<span class="k">else</span>
+<span class="w">  </span><span class="s2">&quot;</span><span class="nv">$@</span><span class="s2">&quot;</span>
+<span class="k">fi</span>
+</pre></div>
+</div>
+<p>We name this file <code class="docutils literal notranslate"><span class="pre">profile_rank_0.bash</span></code> and then launch our application specifying the iterations to capture:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>mpirun<span class="w"> </span>-n<span class="w"> </span><span class="m">2</span><span class="w"> </span>env<span class="w"> </span><span class="nv">TLLM_GPTM_PROFILE_START_STOP</span><span class="o">=</span><span class="s2">&quot;0,63,127&quot;</span><span class="w"> </span>./profile_rank_0.bash<span class="w"> </span>./benchmarks/gptManagerBenchmark<span class="w"> </span>&lt;benchmark/model<span class="w"> </span>options&gt;
+</pre></div>
+</div>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="perf-best-practices.html" class="btn btn-neutral float-left" title="Best Practices for Tuning the Performance of TensorRT-LLM" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="../reference/troubleshooting.html" class="btn btn-neutral float-right" title="Troubleshooting" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2023, NVidia.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

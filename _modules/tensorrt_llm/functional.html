@@ -41,24 +41,56 @@
   </form>
 </div>
         </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
-              <p class="caption" role="heading"><span class="caption-text">Contents:</span></p>
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
 <ul>
-<li class="toctree-l1"><a class="reference internal" href="../../architecture.html">TensorRT-LLM Architecture</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../gpt_runtime.html">C++ GPT Runtime</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../batch_manager.html">The Batch Manager in TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../inference_request.html">Inference Request</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../gpt_attention.html">Multi-head, Multi-query and Group-query Attention</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../precision.html">Numerical Precision</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../build_from_source.html">Build from Source</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../performance.html">Performance of TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../2023-05-19-how-to-debug.html">How to debug</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../2023-05-17-how-to-add-a-new-model.html">How to add a new model</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../graph-rewriting.html">Graph Rewriting Module</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../memory.html">Memory Usage of TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../new_workflow.html">New Workflow</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../perf_best_practices.html">Best Practices for Tuning the Performance of TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../performance_analysis.html">Performance Analysis of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../release-notes.html">Release Notes</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../installation/windows.html">Installing on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/core-concepts.html">Model Definition</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/core-concepts.html#compilation">Compilation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/core-concepts.html#runtime">Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/core-concepts.html#multi-gpu-and-multi-node-support">Multi-GPU and Multi-Node Support</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/inference-request.html">Inference Request</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../performance/perf-best-practices.html">Best Practices for Tuning the Performance of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../performance/perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Python API</span></p>
 <ul>
@@ -69,16 +101,13 @@
 <li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
 </ul>
-<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="../../_cpp_gen/runtime.html">Runtime</a></li>
-</ul>
 <p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
 </ul>
 
         </div>
@@ -123,7 +152,7 @@
 <span class="kn">import</span> <span class="nn">math</span>
 <span class="kn">import</span> <span class="nn">weakref</span>
 <span class="kn">from</span> <span class="nn">collections</span> <span class="kn">import</span> <span class="n">OrderedDict</span>
-<span class="kn">from</span> <span class="nn">enum</span> <span class="kn">import</span> <span class="n">IntEnum</span>
+<span class="kn">from</span> <span class="nn">enum</span> <span class="kn">import</span> <span class="n">IntEnum</span><span class="p">,</span> <span class="n">IntFlag</span><span class="p">,</span> <span class="n">auto</span>
 <span class="kn">from</span> <span class="nn">functools</span> <span class="kn">import</span> <span class="n">partial</span>
 <span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="n">List</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">,</span> <span class="n">Tuple</span><span class="p">,</span> <span class="n">Union</span>
 
@@ -571,6 +600,15 @@
         <span class="k">return</span> <span class="n">sqrt</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span></div>
 
 
+<div class="viewcode-block" id="Tensor.log">
+<a class="viewcode-back" href="../../python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.Tensor.log">[docs]</a>
+    <span class="k">def</span> <span class="nf">log</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&#39;&#39;&#39;</span>
+<span class="sd">        See functional.log.</span>
+<span class="sd">        &#39;&#39;&#39;</span>
+        <span class="k">return</span> <span class="n">log</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span></div>
+
+
 <div class="viewcode-block" id="Tensor.cast">
 <a class="viewcode-back" href="../../python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.Tensor.cast">[docs]</a>
     <span class="k">def</span> <span class="nf">cast</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dtype</span><span class="p">):</span>
@@ -942,7 +980,7 @@
 
 <span class="sd">    That function takes a tensor, splits it into two halves along the last</span>
 <span class="sd">    dimension, applies SiLU to the second half and multiply the results. The</span>
-<span class="sd">    behaviour is undefined if the last dimension is not even.</span>
+<span class="sd">    behavior is undefined if the last dimension is not even.</span>
 
 <span class="sd">    Parameters:</span>
 <span class="sd">        input : Tensor</span>
@@ -1290,7 +1328,7 @@
 <span class="sd">    the 2nd row (because start[0] == 1) and two columns (size[1] == 2) starting</span>
 <span class="sd">    from the 1st column (because start[1] == 0).</span>
 
-<span class="sd">    In pseudo-code the behaviour of that operation can be described as follows</span>
+<span class="sd">    In pseudo-code the behavior of that operation can be described as follows</span>
 <span class="sd">    for a 2D tensor (and easily be extended to more dimensions):</span>
 
 <span class="sd">        output = Tensor(shape=sizes)</span>
@@ -1356,6 +1394,37 @@
         <span class="n">layer</span><span class="o">.</span><span class="n">set_input</span><span class="p">(</span><span class="mi">3</span><span class="p">,</span> <span class="n">strides</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">)</span>
 
     <span class="k">return</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="conditional">
+<a class="viewcode-back" href="../../python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.conditional">[docs]</a>
+<span class="k">def</span> <span class="nf">conditional</span><span class="p">(</span><span class="n">condition</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">true_input</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+                <span class="n">false_input</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&#39;&#39;&#39;</span>
+<span class="sd">    Add an operation to conditionally execute two code paths/subgraphs.</span>
+
+<span class="sd">    Parameters:</span>
+<span class="sd">        condition : Tensor</span>
+<span class="sd">            The condition tensor. If the condition is true, the operation will</span>
+<span class="sd">            return the true_input tensor, otherwise the false_input tensor.</span>
+
+<span class="sd">        true_input : Tensor</span>
+<span class="sd">            The tensor to return if the condition is true.</span>
+
+<span class="sd">        false_input : Tensor</span>
+<span class="sd">            The tensor to return if the condition is false.</span>
+<span class="sd">    &#39;&#39;&#39;</span>
+    <span class="k">if</span> <span class="n">condition</span><span class="o">.</span><span class="n">ndim</span><span class="p">()</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="n">condition</span> <span class="o">=</span> <span class="n">view</span><span class="p">(</span><span class="n">condition</span><span class="p">,</span> <span class="p">[])</span>
+    <span class="n">cond_trt_</span> <span class="o">=</span> <span class="n">condition</span><span class="o">.</span><span class="n">trt_tensor</span>
+    <span class="n">layer</span> <span class="o">=</span> <span class="n">default_trtnet</span><span class="p">()</span><span class="o">.</span><span class="n">add_if_conditional</span><span class="p">()</span>
+    <span class="n">layer</span><span class="o">.</span><span class="n">set_condition</span><span class="p">(</span><span class="n">cond_trt_</span><span class="p">)</span>
+    <span class="n">true_subgraph</span> <span class="o">=</span> <span class="n">layer</span><span class="o">.</span><span class="n">add_input</span><span class="p">(</span><span class="n">true_input</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">)</span>
+    <span class="n">false_subgraph</span> <span class="o">=</span> <span class="n">layer</span><span class="o">.</span><span class="n">add_input</span><span class="p">(</span><span class="n">false_input</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">)</span>
+    <span class="n">output</span> <span class="o">=</span> <span class="n">layer</span><span class="o">.</span><span class="n">add_output</span><span class="p">(</span><span class="n">true_subgraph</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span>
+                              <span class="n">false_subgraph</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">0</span><span class="p">))</span>
+    <span class="k">return</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">output</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="n">output</span><span class="p">)</span></div>
 
 
 
@@ -1449,7 +1518,7 @@
 
 <span class="sd">        expand(input, [3, 2, 2])</span>
 
-<span class="sd">    will produce a tensor of shape [3, 2, 2]. That behaviour is subject to</span>
+<span class="sd">    will produce a tensor of shape [3, 2, 2]. That behavior is subject to</span>
 <span class="sd">    change in the future.</span>
 
 <span class="sd">    Parameters:</span>
@@ -1500,7 +1569,7 @@
 <span class="sd">    The equation specifies ASCII lower-case letters for each dimension in the</span>
 <span class="sd">    inputs in the same order as the dimensions, separated by comma for each</span>
 <span class="sd">    input. The dimensions labeled with the same subscript must match or be</span>
-<span class="sd">    broadcastable. Repeated subscript labels in one input take the diagonal.</span>
+<span class="sd">    able to be broadcasted. Repeated subscript labels in one input take the diagonal.</span>
 <span class="sd">    Repeating a label across multiple inputs means that those axes will be</span>
 <span class="sd">    multiplied. Omitting a label from the output means values along those axes</span>
 <span class="sd">    will be summed. In implicit mode, the indices which appear once in the</span>
@@ -1546,7 +1615,7 @@
 <span class="w">    </span><span class="sd">&#39;&#39;&#39;</span>
 <span class="sd">    Add an operation to permute the dimensions of a tensor.</span>
 
-<span class="sd">    The dimensions of the input tensor are permutted according to the sequence</span>
+<span class="sd">    The dimensions of the input tensor are permuted according to the sequence</span>
 <span class="sd">    of dimensions in &#39;dims&#39;. That operation maps to tensorrt.IShuffleLayer where</span>
 <span class="sd">    the second transposition is described by the indices in &#39;dims&#39;.</span>
 
@@ -2082,7 +2151,7 @@
 <span class="sd">    a new tensor. The output tensor is a 1-D tensor.</span>
 
 <span class="sd">    The input tensor must have rank &gt;= 1. The shapes of the input tensor and</span>
-<span class="sd">    the mask tensor don’t need to match, but they must be broadcastable.</span>
+<span class="sd">    the mask tensor don’t need to match, but they must be able to be broadcasted.</span>
 
 <span class="sd">    For example, on input=[[4, 2, 5], [2, 1, 2], [4, 7, 1]], which has a shape</span>
 <span class="sd">    [3, 3],</span>
@@ -2208,6 +2277,47 @@
                                                    <span class="n">dim</span><span class="p">)</span>
     <span class="n">loop_output_layer</span><span class="o">.</span><span class="n">set_input</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">trip_limit</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">loop_output_layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="n">loop_output_layer</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="masked_scatter">
+<a class="viewcode-back" href="../../python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.masked_scatter">[docs]</a>
+<span class="k">def</span> <span class="nf">masked_scatter</span><span class="p">(</span><span class="nb">input</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">mask</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">source</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&#39;&#39;&#39;</span>
+<span class="sd">    Add the masked_scatter base on PyTorch definition.</span>
+
+<span class="sd">    See https://pytorch.org/docs/stable/generated/torch.Tensor.masked_scatter_.html#torch.Tensor.masked_scatter_ for a</span>
+<span class="sd">    description of that function.</span>
+
+<span class="sd">    Parameters:</span>
+<span class="sd">        input : Tensor</span>
+<span class="sd">            The input tensor.</span>
+
+<span class="sd">        mask : Tensor</span>
+<span class="sd">            The boolean mask tensor that indicates elements to select.</span>
+
+<span class="sd">        source: Tensor</span>
+<span class="sd">            The tensor to copy from</span>
+<span class="sd">    Returns:</span>
+<span class="sd">        The tensor containing the source tensor selected by mask.</span>
+
+<span class="sd">    &#39;&#39;&#39;</span>
+    <span class="k">assert</span> <span class="nb">input</span><span class="o">.</span><span class="n">rank</span><span class="p">()</span> <span class="o">&gt;=</span> <span class="mi">1</span><span class="p">,</span> <span class="s2">&quot;input should have rank &gt;= 1&quot;</span>
+    <span class="nb">input</span><span class="p">,</span> <span class="n">mask</span> <span class="o">=</span> <span class="n">broadcast_helper</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="n">mask</span><span class="p">)</span>
+    <span class="n">expanded_mask</span> <span class="o">=</span> <span class="n">expand</span><span class="p">(</span><span class="n">mask</span><span class="p">,</span> <span class="n">shape</span><span class="p">(</span><span class="nb">input</span><span class="p">))</span>
+
+    <span class="n">non_zero_layer</span> <span class="o">=</span> <span class="n">default_trtnet</span><span class="p">()</span><span class="o">.</span><span class="n">add_non_zero</span><span class="p">(</span><span class="n">expanded_mask</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">)</span>
+
+    <span class="n">shuffle_layer</span> <span class="o">=</span> <span class="n">default_trtnet</span><span class="p">()</span><span class="o">.</span><span class="n">add_shuffle</span><span class="p">(</span><span class="n">non_zero_layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">0</span><span class="p">))</span>
+    <span class="n">shuffle_layer</span><span class="o">.</span><span class="n">second_transpose</span> <span class="o">=</span> <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+    <span class="n">source</span> <span class="o">=</span> <span class="n">source</span><span class="o">.</span><span class="n">view</span><span class="p">([</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span>
+
+    <span class="n">scatter_layer</span> <span class="o">=</span> <span class="n">default_trtnet</span><span class="p">()</span><span class="o">.</span><span class="n">add_scatter</span><span class="p">(</span><span class="nb">input</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">,</span>
+                                                 <span class="n">shuffle_layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span>
+                                                 <span class="n">source</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">,</span>
+                                                 <span class="n">mode</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">ScatterMode</span><span class="o">.</span><span class="n">ND</span><span class="p">)</span>
+
+    <span class="k">return</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">scatter_layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="n">scatter_layer</span><span class="p">)</span></div>
 
 
 
@@ -2684,6 +2794,7 @@
 <span class="sd">        sin     for op=trt.UnaryOperation.SIN</span>
 <span class="sd">        cos     for op=trt.UnaryOperation.COS</span>
 <span class="sd">        abs     for op=trt.UnaryOperation.ABS</span>
+<span class="sd">        log     for op=trt.UnaryOperation.LOG</span>
 
 <span class="sd">    It is implemented using the IUnaryLayer from TensorRT.</span>
 
@@ -2708,6 +2819,7 @@
 <span class="n">sin</span> <span class="o">=</span> <span class="n">partial</span><span class="p">(</span><span class="n">unary</span><span class="p">,</span> <span class="n">op</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">UnaryOperation</span><span class="o">.</span><span class="n">SIN</span><span class="p">)</span>
 <span class="n">cos</span> <span class="o">=</span> <span class="n">partial</span><span class="p">(</span><span class="n">unary</span><span class="p">,</span> <span class="n">op</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">UnaryOperation</span><span class="o">.</span><span class="n">COS</span><span class="p">)</span>
 <span class="nb">abs</span> <span class="o">=</span> <span class="n">partial</span><span class="p">(</span><span class="n">unary</span><span class="p">,</span> <span class="n">op</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">UnaryOperation</span><span class="o">.</span><span class="n">ABS</span><span class="p">)</span>
+<span class="n">log</span> <span class="o">=</span> <span class="n">partial</span><span class="p">(</span><span class="n">unary</span><span class="p">,</span> <span class="n">op</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">UnaryOperation</span><span class="o">.</span><span class="n">LOG</span><span class="p">)</span>
 
 
 <div class="viewcode-block" id="mean">
@@ -2774,6 +2886,41 @@
 
     <span class="n">layer</span> <span class="o">=</span> <span class="n">default_trtnet</span><span class="p">()</span><span class="o">.</span><span class="n">add_reduce</span><span class="p">(</span><span class="nb">input</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">,</span>
                                         <span class="n">trt</span><span class="o">.</span><span class="n">ReduceOperation</span><span class="o">.</span><span class="n">MAX</span><span class="p">,</span>
+                                        <span class="n">axes</span><span class="p">,</span>
+                                        <span class="n">keep_dims</span><span class="o">=</span><span class="n">keepdim</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="sum">
+<a class="viewcode-back" href="../../python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.sum">[docs]</a>
+<span class="k">def</span> <span class="nf">sum</span><span class="p">(</span><span class="nb">input</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">dim</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">keepdim</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&#39;&#39;&#39;</span>
+<span class="sd">    Add an operation to compute the sum along a dimension.</span>
+
+<span class="sd">    Computes the sum along the dimension &#39;dim&#39; of the input tensor.</span>
+
+<span class="sd">    It is implemented using the IReduceLayer from TensorRT.</span>
+
+<span class="sd">    Parameters:</span>
+<span class="sd">        input : Tensor</span>
+<span class="sd">            The input tensor.</span>
+
+<span class="sd">        dim : int</span>
+<span class="sd">            The dimension along which the mean is computed.</span>
+
+<span class="sd">        keepdim : bool</span>
+<span class="sd">            Is the dimension kept in the reduced tensor? When True the</span>
+<span class="sd">            dimension is kept, it is removed from the shape otherwise.</span>
+
+<span class="sd">    Returns:</span>
+<span class="sd">        The tensor produced by this reduction operation.</span>
+<span class="sd">    &#39;&#39;&#39;</span>
+    <span class="n">dim</span> <span class="o">=</span> <span class="n">dim_resolve_negative</span><span class="p">(</span><span class="n">dim</span><span class="p">,</span> <span class="nb">input</span><span class="o">.</span><span class="n">ndim</span><span class="p">())</span>
+    <span class="n">axes</span> <span class="o">=</span> <span class="n">dim_to_trt_axes</span><span class="p">(</span><span class="n">dim</span><span class="p">)</span>
+
+    <span class="n">layer</span> <span class="o">=</span> <span class="n">default_trtnet</span><span class="p">()</span><span class="o">.</span><span class="n">add_reduce</span><span class="p">(</span><span class="nb">input</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">,</span>
+                                        <span class="n">trt</span><span class="o">.</span><span class="n">ReduceOperation</span><span class="o">.</span><span class="n">SUM</span><span class="p">,</span>
                                         <span class="n">axes</span><span class="p">,</span>
                                         <span class="n">keep_dims</span><span class="o">=</span><span class="n">keepdim</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span></div>
@@ -2899,7 +3046,7 @@
 
 <span class="sd">    That function takes a tensor, splits it into two halves along the last</span>
 <span class="sd">    dimension, applies GELU to the second half and multiply the results. The</span>
-<span class="sd">    behaviour is undefined if the last dimension is not even.</span>
+<span class="sd">    behavior is undefined if the last dimension is not even.</span>
 
 <span class="sd">    Parameters:</span>
 <span class="sd">        input : Tensor</span>
@@ -3340,18 +3487,33 @@
 <span class="sd">    Warning: actual definition is in cpp/tensorrt_llm/kernels/customAllReduceKernels.h</span>
 <span class="sd">             they must be kept in sync</span>
 <span class="sd">    &quot;&quot;&quot;</span>
-    <span class="n">RING</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="n">NCCL</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="n">ONESHOT</span> <span class="o">=</span> <span class="mi">1</span>
     <span class="n">TWOSHOT</span> <span class="o">=</span> <span class="mi">2</span>
     <span class="n">AUTO</span> <span class="o">=</span> <span class="mi">3</span></div>
 
 
 
+<div class="viewcode-block" id="AllReduceConfig">
+<a class="viewcode-back" href="../../python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.AllReduceConfig">[docs]</a>
+<span class="k">class</span> <span class="nc">AllReduceConfig</span><span class="p">(</span><span class="n">IntFlag</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    Warning: actual definition is in cpp/tensorrt_llm/kernels/customAllReduceKernels.h</span>
+<span class="sd">             they must be kept in sync</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">USE_MEMCPY</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
+    <span class="n">PUSH_MODE</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span></div>
+
+
+
 <div class="viewcode-block" id="allreduce">
 <a class="viewcode-back" href="../../python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.allreduce">[docs]</a>
-<span class="k">def</span> <span class="nf">allreduce</span><span class="p">(</span><span class="n">tensor</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
-              <span class="n">group</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
-              <span class="n">strategy</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">AllReduceStrategy</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span><span class="p">:</span>
+<span class="k">def</span> <span class="nf">allreduce</span><span class="p">(</span>
+    <span class="n">tensor</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+    <span class="n">group</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
+    <span class="n">strategy</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">AllReduceStrategy</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">config</span><span class="p">:</span> <span class="n">AllReduceConfig</span> <span class="o">=</span> <span class="n">AllReduceConfig</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">&#39;&#39;&#39;</span>
 <span class="sd">    Add an operation that performs a collective all-reduce.</span>
 
@@ -3379,7 +3541,7 @@
 <span class="sd">            The ranks participating into the all-reduce operation.</span>
 
 <span class="sd">        strategy: AllReduceStrategy</span>
-<span class="sd">            RING delegates all-reduce to NCCL while ONESHOT and TWOSHOT are custom latency-optimal algorithms.</span>
+<span class="sd">            NCCL delegates all-reduce to NCCL while ONESHOT and TWOSHOT are custom latency-optimal algorithms.</span>
 <span class="sd">            AUTO chooses amongst the three based on a message-size heuristic.</span>
 
 <span class="sd">    Returns:</span>
@@ -3393,12 +3555,12 @@
         <span class="k">if</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">use_custom_all_reduce</span><span class="p">:</span>
             <span class="n">strategy</span> <span class="o">=</span> <span class="n">AllReduceStrategy</span><span class="o">.</span><span class="n">AUTO</span>
         <span class="k">else</span><span class="p">:</span>
-            <span class="n">strategy</span> <span class="o">=</span> <span class="n">AllReduceStrategy</span><span class="o">.</span><span class="n">RING</span>
+            <span class="n">strategy</span> <span class="o">=</span> <span class="n">AllReduceStrategy</span><span class="o">.</span><span class="n">NCCL</span>
 
     <span class="n">counter</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="n">workspace</span> <span class="o">=</span> <span class="kc">None</span>
 
-    <span class="k">if</span> <span class="n">strategy</span> <span class="o">!=</span> <span class="n">AllReduceStrategy</span><span class="o">.</span><span class="n">RING</span><span class="p">:</span>
+    <span class="k">if</span> <span class="n">strategy</span> <span class="o">!=</span> <span class="n">AllReduceStrategy</span><span class="o">.</span><span class="n">NCCL</span><span class="p">:</span>
         <span class="n">counter</span> <span class="o">=</span> <span class="n">current_all_reduce_helper</span><span class="p">()</span><span class="o">.</span><span class="n">gen_id</span><span class="p">()</span>
         <span class="n">workspace</span> <span class="o">=</span> <span class="n">current_all_reduce_helper</span><span class="p">()</span><span class="o">.</span><span class="n">workspace</span>
 
@@ -3415,6 +3577,9 @@
     <span class="n">p_strategy</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span><span class="s2">&quot;strategy&quot;</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">([</span><span class="nb">int</span><span class="p">(</span><span class="n">strategy</span><span class="p">)],</span> <span class="n">np</span><span class="o">.</span><span class="n">int8</span><span class="p">),</span>
                                  <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT8</span><span class="p">)</span>
     <span class="n">pfc</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">p_strategy</span><span class="p">)</span>
+    <span class="n">p_config</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span><span class="s2">&quot;config&quot;</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">([</span><span class="nb">int</span><span class="p">(</span><span class="n">config</span><span class="p">)],</span> <span class="n">np</span><span class="o">.</span><span class="n">int8</span><span class="p">),</span>
+                               <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT8</span><span class="p">)</span>
+    <span class="n">pfc</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">p_config</span><span class="p">)</span>
     <span class="n">p_counter</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span><span class="s2">&quot;counter&quot;</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">([</span><span class="n">counter</span><span class="p">],</span> <span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
                                 <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT32</span><span class="p">)</span>
     <span class="n">pfc</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">p_counter</span><span class="p">)</span>
@@ -3422,7 +3587,7 @@
     <span class="n">pfc</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldCollection</span><span class="p">(</span><span class="n">pfc</span><span class="p">)</span>
     <span class="n">ar_plug</span> <span class="o">=</span> <span class="n">allreduce_plg_creator</span><span class="o">.</span><span class="n">create_plugin</span><span class="p">(</span><span class="s2">&quot;allreduce&quot;</span><span class="p">,</span> <span class="n">pfc</span><span class="p">)</span>
     <span class="n">plug_inputs</span> <span class="o">=</span> <span class="p">[</span><span class="n">tensor</span><span class="o">.</span><span class="n">cast</span><span class="p">(</span><span class="n">p_dtype</span><span class="p">)</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">]</span>
-    <span class="k">if</span> <span class="n">strategy</span> <span class="o">!=</span> <span class="n">AllReduceStrategy</span><span class="o">.</span><span class="n">RING</span><span class="p">:</span>
+    <span class="k">if</span> <span class="n">strategy</span> <span class="o">!=</span> <span class="n">AllReduceStrategy</span><span class="o">.</span><span class="n">NCCL</span><span class="p">:</span>
         <span class="n">plug_inputs</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">workspace</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">)</span>
 
     <span class="n">layer</span> <span class="o">=</span> <span class="n">default_trtnet</span><span class="p">()</span><span class="o">.</span><span class="n">add_plugin_v2</span><span class="p">(</span><span class="n">plug_inputs</span><span class="p">,</span> <span class="n">ar_plug</span><span class="p">)</span>
@@ -3628,7 +3793,7 @@
 <span class="w">    </span><span class="sd">&#39;&#39;&#39;</span>
 <span class="sd">    Add an operation that performs the multi-head attention in BERT.</span>
 
-<span class="sd">    The multihead-attention (MHA) is the sequence of a batched matmul, a</span>
+<span class="sd">    The multi-head attention (MHA) is the sequence of a batched matmul, a</span>
 <span class="sd">    softmax and a batched matmul as described in</span>
 <span class="sd">    https://arxiv.org/abs/1706.03762. That function adds an operation that</span>
 <span class="sd">    performs those computations using a single GPU kernel.</span>
@@ -3756,6 +3921,7 @@
     <span class="n">context_lengths</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">],</span>
     <span class="n">cache_indirection</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">],</span>
     <span class="n">host_request_types</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+    <span class="n">layer_idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
     <span class="n">num_heads</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
     <span class="n">num_kv_heads</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
     <span class="n">hidden_size_per_head</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
@@ -3769,6 +3935,7 @@
     <span class="n">learned_absolute</span><span class="p">,</span>
     <span class="n">kv_orig_quant_scale</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="n">kv_quant_orig_scale</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">attention_output_orig_quant_scale</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="n">kv_cache_quant_mode</span><span class="p">:</span> <span class="n">QuantMode</span> <span class="o">=</span> <span class="n">QuantMode</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span>
     <span class="n">max_context_length</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="n">mask_type</span><span class="p">:</span> <span class="n">AttentionMaskType</span> <span class="o">=</span> <span class="n">AttentionMaskType</span><span class="o">.</span><span class="n">causal</span><span class="p">,</span>
@@ -3784,10 +3951,6 @@
     <span class="n">relative_attention_bias</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>  <span class="c1"># for relative attention</span>
     <span class="n">max_distance</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>  <span class="c1"># for relative attention</span>
     <span class="n">host_context_lengths</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>  <span class="c1"># for pad-free input mode</span>
-    <span class="n">enable_pos_shift</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span>
-        <span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>  <span class="c1"># for position shift attention mode in streamingllm</span>
-    <span class="n">dense_context_fmha</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span>
-        <span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>  <span class="c1"># for dense fmha in context phase</span>
     <span class="n">qkv_bias</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="n">use_cache</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
     <span class="n">medusa_position_offsets</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -3843,6 +4006,9 @@
 <span class="sd">            generation phase. Its shape is [batch_size]. See Inflight Batching</span>
 <span class="sd">            in docs/gpt_attention.md,</span>
 
+<span class="sd">        layer_idx: int</span>
+<span class="sd">            The index of this attention layer, used to access kv_cache_block_pointers,</span>
+
 <span class="sd">        num_heads: int</span>
 <span class="sd">            The number of heads,</span>
 
@@ -3896,6 +4062,10 @@
 <span class="sd">            INT8/FP8 in the KV cache. Its shape is [1]. See INT8/FP8 KV Cache</span>
 <span class="sd">            in docs/gpt_attention.md,</span>
 
+<span class="sd">        attention_output_orig_quant_scale: Tensor</span>
+<span class="sd">            The tensor to store the scaling factor for quantization to FP8</span>
+<span class="sd">            in the KV cache. Its shape is [1].</span>
+
 <span class="sd">        kv_cache_quant_mode: QuantMode (int flags)</span>
 <span class="sd">            Do we enable the INT8 or FP8 KV cache?</span>
 
@@ -3922,7 +4092,7 @@
 
 <span class="sd">        kv_cache_block_pointers:</span>
 <span class="sd">            The tensor of block pointers for the KV cache. Its shape is</span>
-<span class="sd">            [max_batch_size, max_beam_width, 2, max_blocks_per_sequence * 2]</span>
+<span class="sd">            [num_layers, max_batch_size, max_beam_width, 2, max_blocks_per_sequence * 2]</span>
 <span class="sd">            See KV cache section in docs/gpt_attention.md, on gpu</span>
 
 <span class="sd">        host_kv_cache_block_pointers:</span>
@@ -3953,12 +4123,6 @@
 
 <span class="sd">        host_context_lengths: Tensor = None (On CPU)</span>
 <span class="sd">            A host tensor that contains the lengths of the different inputs,</span>
-
-<span class="sd">        enable_pos_shift: bool = False</span>
-<span class="sd">            Do we enable position shift in attention to support streamingllm method,</span>
-
-<span class="sd">        dense_context_fmha: bool = False</span>
-<span class="sd">            Do we use dense fmha in context phase,</span>
 
 <span class="sd">        qkv_bias: Tensor = None,</span>
 <span class="sd">            The qkv bias tensor.</span>
@@ -3997,6 +4161,9 @@
         <span class="s2">&quot;unfuse_qkv_gemm&quot;</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">int8</span><span class="p">(</span><span class="n">is_unfuse_qkv_gemm</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int8</span><span class="p">),</span>
         <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT8</span><span class="p">)</span>
 
+    <span class="n">layer_idx</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span><span class="s2">&quot;layer_idx&quot;</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">layer_idx</span><span class="p">,</span>
+                                                      <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
+                                <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT32</span><span class="p">)</span>
     <span class="n">nheads</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span><span class="s2">&quot;num_heads&quot;</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">num_heads</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
                              <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT32</span><span class="p">)</span>
     <span class="n">num_kv_heads</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span><span class="s2">&quot;num_kv_heads&quot;</span><span class="p">,</span>
@@ -4080,12 +4247,13 @@
                                          <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">max_context_length</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
                                          <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT32</span><span class="p">)</span>
     <span class="n">pos_shift_enabled</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span>
-        <span class="s2">&quot;pos_shift_enabled&quot;</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">int8</span><span class="p">(</span><span class="n">enable_pos_shift</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int8</span><span class="p">),</span>
-        <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT8</span><span class="p">)</span>
+        <span class="s2">&quot;pos_shift_enabled&quot;</span><span class="p">,</span>
+        <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">int8</span><span class="p">(</span><span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">streamingllm</span><span class="p">),</span>
+                 <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int8</span><span class="p">),</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT8</span><span class="p">)</span>
     <span class="n">dense_context_fmha</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span>
         <span class="s2">&quot;dense_context_fmha&quot;</span><span class="p">,</span>
-        <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">int8</span><span class="p">(</span><span class="n">dense_context_fmha</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int8</span><span class="p">),</span>
-        <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT8</span><span class="p">)</span>
+        <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">int8</span><span class="p">(</span><span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">streamingllm</span><span class="p">),</span>
+                 <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int8</span><span class="p">),</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT8</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">qkv_bias</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">qkv_bias_enabled</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span><span class="s2">&quot;qkv_bias_enabled&quot;</span><span class="p">,</span>
                                            <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int8</span><span class="p">),</span>
@@ -4105,12 +4273,16 @@
         <span class="s2">&quot;use_paged_context_fmha&quot;</span><span class="p">,</span>
         <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">int8</span><span class="p">(</span><span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">use_paged_context_fmha</span><span class="p">),</span>
                  <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int8</span><span class="p">),</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT8</span><span class="p">)</span>
+    <span class="n">use_fp8_context_fmha_field</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span>
+        <span class="s2">&quot;use_fp8_context_fmha&quot;</span><span class="p">,</span>
+        <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">int8</span><span class="p">(</span><span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">use_fp8_context_fmha</span><span class="p">),</span>
+                 <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int8</span><span class="p">),</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT8</span><span class="p">)</span>
     <span class="n">use_cache_pf</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span><span class="s2">&quot;use_cache&quot;</span><span class="p">,</span>
                                    <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">([</span><span class="n">use_cache</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
                                    <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT32</span><span class="p">)</span>
 
     <span class="n">pfc</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldCollection</span><span class="p">([</span>
-        <span class="n">nheads</span><span class="p">,</span> <span class="n">num_kv_heads</span><span class="p">,</span> <span class="n">head_size</span><span class="p">,</span> <span class="n">unidirectional</span><span class="p">,</span> <span class="n">q_scaling</span><span class="p">,</span>
+        <span class="n">layer_idx</span><span class="p">,</span> <span class="n">nheads</span><span class="p">,</span> <span class="n">num_kv_heads</span><span class="p">,</span> <span class="n">head_size</span><span class="p">,</span> <span class="n">unidirectional</span><span class="p">,</span> <span class="n">q_scaling</span><span class="p">,</span>
         <span class="n">position_embedding_type</span><span class="p">,</span> <span class="n">rotary_embedding_dim</span><span class="p">,</span> <span class="n">rotary_embedding_base</span><span class="p">,</span>
         <span class="n">rotary_embedding_scale_type</span><span class="p">,</span> <span class="n">rotary_embedding_scale</span><span class="p">,</span>
         <span class="n">rotary_embedding_max_positions</span><span class="p">,</span> <span class="n">tp_size</span><span class="p">,</span> <span class="n">tp_rank</span><span class="p">,</span> <span class="n">unfuse_qkv_gemm</span><span class="p">,</span>
@@ -4119,7 +4291,7 @@
         <span class="n">paged_kv_cache</span><span class="p">,</span> <span class="n">tokens_per_block</span><span class="p">,</span> <span class="n">pf_type</span><span class="p">,</span> <span class="n">max_context_length</span><span class="p">,</span>
         <span class="n">qkv_bias_enabled</span><span class="p">,</span> <span class="n">do_cross_attention_field</span><span class="p">,</span> <span class="n">max_distance</span><span class="p">,</span>
         <span class="n">pos_shift_enabled</span><span class="p">,</span> <span class="n">dense_context_fmha</span><span class="p">,</span> <span class="n">use_paged_context_fmha_field</span><span class="p">,</span>
-        <span class="n">use_cache_pf</span><span class="p">,</span> <span class="n">is_medusa_enabled</span>
+        <span class="n">use_fp8_context_fmha_field</span><span class="p">,</span> <span class="n">use_cache_pf</span><span class="p">,</span> <span class="n">is_medusa_enabled</span>
     <span class="p">])</span>
 
     <span class="n">attn_plug</span> <span class="o">=</span> <span class="n">attn_plg_creator</span><span class="o">.</span><span class="n">create_plugin</span><span class="p">(</span><span class="s2">&quot;causal_attn&quot;</span><span class="p">,</span> <span class="n">pfc</span><span class="p">)</span>
@@ -4153,6 +4325,11 @@
 
     <span class="k">if</span> <span class="n">use_cache</span> <span class="ow">and</span> <span class="n">kv_cache_quant_mode</span><span class="o">.</span><span class="n">has_kv_cache_quant</span><span class="p">():</span>
         <span class="n">plug_inputs</span> <span class="o">+=</span> <span class="p">[</span><span class="n">kv_orig_quant_scale</span><span class="p">,</span> <span class="n">kv_quant_orig_scale</span><span class="p">]</span>
+
+    <span class="k">if</span> <span class="n">attention_output_orig_quant_scale</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">assert</span> <span class="n">default_net</span><span class="p">(</span>
+        <span class="p">)</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">use_fp8_context_fmha</span><span class="p">,</span> <span class="s2">&quot;FP8 Context FMHA needs to be enabled&quot;</span>
+        <span class="n">plug_inputs</span> <span class="o">+=</span> <span class="p">[</span><span class="n">attention_output_orig_quant_scale</span><span class="p">]</span>
 
     <span class="k">if</span> <span class="n">alibi_slopes</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">plug_inputs</span> <span class="o">+=</span> <span class="p">[</span><span class="n">alibi_slopes</span><span class="p">]</span>
@@ -4379,7 +4556,8 @@
                           <span class="n">dtype</span><span class="p">:</span> <span class="n">trt</span><span class="o">.</span><span class="n">DataType</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">float32</span><span class="p">,</span>
                           <span class="n">tp_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
                           <span class="n">tp_rank</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
-                          <span class="n">alibi_scale</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1.0</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span><span class="p">:</span>
+                          <span class="n">alibi_scale</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1.0</span><span class="p">,</span>
+                          <span class="n">alibi_bias_max</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">8</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">&#39;&#39;&#39;</span>
 <span class="sd">    Compute the ALiBi slopes as described in https://arxiv.org/abs/2211.05100.</span>
 
@@ -4411,12 +4589,15 @@
     <span class="k">for</span> <span class="n">h_id</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">start_head_id</span><span class="p">,</span> <span class="n">end_head_id</span><span class="p">):</span>
         <span class="k">if</span> <span class="n">h_id</span> <span class="o">&lt;</span> <span class="n">closest_power_of_2</span><span class="p">:</span>
             <span class="n">slopes_ft</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
-                <span class="n">np</span><span class="o">.</span><span class="n">power</span><span class="p">(</span><span class="mi">2</span><span class="o">**</span><span class="p">(</span><span class="o">-</span><span class="p">(</span><span class="mi">2</span><span class="o">**-</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">log2</span><span class="p">(</span><span class="n">closest_power_of_2</span><span class="p">)</span> <span class="o">-</span> <span class="mi">3</span><span class="p">))),</span>
-                         <span class="n">h_id</span> <span class="o">+</span> <span class="mi">1</span><span class="p">))</span>
+                <span class="n">np</span><span class="o">.</span><span class="n">power</span><span class="p">(</span>
+                    <span class="mi">2</span><span class="o">**</span><span class="p">(</span><span class="o">-</span><span class="p">(</span><span class="mi">2</span><span class="o">**-</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">log2</span><span class="p">(</span><span class="n">closest_power_of_2</span><span class="p">)</span> <span class="o">-</span>
+                               <span class="n">np</span><span class="o">.</span><span class="n">log2</span><span class="p">(</span><span class="n">alibi_bias_max</span><span class="p">)))),</span> <span class="n">h_id</span> <span class="o">+</span> <span class="mi">1</span><span class="p">))</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">slopes_ft</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
-                <span class="n">np</span><span class="o">.</span><span class="n">power</span><span class="p">(</span><span class="mi">2</span><span class="o">**</span><span class="p">(</span><span class="o">-</span><span class="p">(</span><span class="mi">2</span><span class="o">**-</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">log2</span><span class="p">(</span><span class="n">closest_power_of_2</span> <span class="o">*</span> <span class="mi">2</span><span class="p">)</span> <span class="o">-</span> <span class="mi">3</span><span class="p">))),</span>
-                         <span class="p">(</span><span class="n">h_id</span> <span class="o">-</span> <span class="n">closest_power_of_2</span><span class="p">)</span> <span class="o">*</span> <span class="mi">2</span> <span class="o">+</span> <span class="mi">1</span><span class="p">))</span>
+                <span class="n">np</span><span class="o">.</span><span class="n">power</span><span class="p">(</span>
+                    <span class="mi">2</span><span class="o">**</span><span class="p">(</span><span class="o">-</span><span class="p">(</span><span class="mi">2</span><span class="o">**-</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">log2</span><span class="p">(</span><span class="n">closest_power_of_2</span> <span class="o">*</span> <span class="mi">2</span><span class="p">)</span> <span class="o">-</span>
+                               <span class="n">np</span><span class="o">.</span><span class="n">log2</span><span class="p">(</span><span class="n">alibi_bias_max</span><span class="p">)))),</span>
+                    <span class="p">(</span><span class="n">h_id</span> <span class="o">-</span> <span class="n">closest_power_of_2</span><span class="p">)</span> <span class="o">*</span> <span class="mi">2</span> <span class="o">+</span> <span class="mi">1</span><span class="p">))</span>
     <span class="n">slopes</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">asarray</span><span class="p">(</span><span class="n">slopes_ft</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
 
     <span class="n">slopes</span> <span class="o">=</span> <span class="n">alibi_scale</span> <span class="o">*</span> <span class="n">slopes</span>
@@ -4440,7 +4621,7 @@
 <span class="sd">    Compute the ALiBi biases as described in https://arxiv.org/abs/2211.05100.</span>
 
 <span class="sd">    The ALiBi biases are added to the result of the Q*K^T product in the</span>
-<span class="sd">    multihead-attention block.</span>
+<span class="sd">    multi-head attention block.</span>
 
 <span class="sd">    Parameters:</span>
 <span class="sd">        slopes : Tensor</span>
@@ -4473,7 +4654,7 @@
 <span class="sd">    shape &#39;[batch_size, src_seq_len]&#39; to a tensor of shape</span>
 <span class="sd">    &#39;[batch_size, 1, tgt_seq_len, src_seq_len]&#39;. It can be used to create the</span>
 <span class="sd">    mask applied to the Q*K^T product before the softmax operation in the</span>
-<span class="sd">    multihead-attention block.</span>
+<span class="sd">    multi-head attention block.</span>
 
 <span class="sd">    Parameters:</span>
 <span class="sd">        mask : Tensor</span>
@@ -4594,6 +4775,7 @@
     <span class="s1">&#39;gelu_new&#39;</span><span class="p">:</span> <span class="n">gelu</span><span class="p">,</span>
     <span class="s1">&#39;gelu_fast&#39;</span><span class="p">:</span> <span class="n">gelu</span><span class="p">,</span>
     <span class="s1">&#39;geglu&#39;</span><span class="p">:</span> <span class="n">geglu</span><span class="p">,</span>
+    <span class="s1">&#39;identity&#39;</span><span class="p">:</span> <span class="n">identity</span><span class="p">,</span>
     <span class="s1">&#39;silu&#39;</span><span class="p">:</span> <span class="n">silu</span><span class="p">,</span>
     <span class="s1">&#39;softplus&#39;</span><span class="p">:</span> <span class="n">softplus</span><span class="p">,</span>
     <span class="s1">&#39;squared-relu&#39;</span><span class="p">:</span> <span class="n">squared_relu</span><span class="p">,</span>
@@ -4774,65 +4956,168 @@
 
 
 
-<div class="viewcode-block" id="selective_scan">
-<a class="viewcode-back" href="../../python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.selective_scan">[docs]</a>
-<span class="k">def</span> <span class="nf">selective_scan</span><span class="p">(</span>
-    <span class="nb">input</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
-    <span class="n">state</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
-    <span class="n">delta</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
-    <span class="n">delta_bias</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
-    <span class="n">A</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
-    <span class="n">B</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
-    <span class="n">C</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
-    <span class="n">D</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
-    <span class="n">z</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
-    <span class="n">host_request_types</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
-    <span class="n">dim</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-    <span class="n">dstate</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-    <span class="n">is_variable_B</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
-    <span class="n">is_variable_C</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
-    <span class="n">delta_softplus</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
-    <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
-<span class="p">):</span>
+<div class="viewcode-block" id="mamba_conv1d">
+<a class="viewcode-back" href="../../python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.mamba_conv1d">[docs]</a>
+<span class="k">def</span> <span class="nf">mamba_conv1d</span><span class="p">(</span><span class="nb">input</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+                 <span class="n">conv_state_or_ptr</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+                 <span class="n">conv_weight</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+                 <span class="n">conv_bias</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+                 <span class="n">host_request_types</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+                 <span class="n">last_token_ids</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+                 <span class="n">dim</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+                 <span class="n">dconv</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+                 <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+                 <span class="n">host_context_lengths</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">slot_mapping</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&#39;&#39;&#39;</span>
 <span class="sd">    Parameters:</span>
 <span class="sd">        input : Tensor (On GPU)</span>
-<span class="sd">            The input tensor. Its shape is [batch_size, dim, seq_len]</span>
+<span class="sd">            The input tensor. Its shape is [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding</span>
 
-<span class="sd">        state : Tensor (On GPU)</span>
-<span class="sd">            The ssm state tensor. Its shape is [batch_size, dim, dstate]</span>
+<span class="sd">        conv_state_or_ptr : Tensor (On GPU or CPU)</span>
+<span class="sd">            The conv state tensor. Its shape is [batch_size, dconv - 1, dim]</span>
+<span class="sd">            Or the CPU tensor of shape [1] for the pointer of paged states.</span>
 
-<span class="sd">        delta : Tensor (On GPU)</span>
-<span class="sd">            The delta tensor. Its shape is [batch_size, dim, seq_len]</span>
+<span class="sd">        conv_weight : Tensor (On GPU)</span>
+<span class="sd">            The weight tensor. Its shape is [1, dconv, dim]</span>
 
-<span class="sd">        delta_bias : Tensor (On GPU)</span>
-<span class="sd">            The delta bias tensor. Its shape is [dim]</span>
-
-<span class="sd">        A : Tensor (On GPU)</span>
-<span class="sd">            A matrix. Its shape is [dim, dstate]</span>
-
-<span class="sd">        B : Tensor (On GPU)</span>
-<span class="sd">            B matrix. Its shape is [batch_size, dstate, seq_len]</span>
-
-<span class="sd">        C : Tensor (On GPU)</span>
-<span class="sd">            C matrix. Its shape is [batch_size, dstate, seq_len]</span>
-
-<span class="sd">        D : Tensor (On GPU)</span>
-<span class="sd">            D matrix. Its shape is [dim]</span>
-
-<span class="sd">        z : Tensor (On GPU)</span>
-<span class="sd">            The z tensor. Its shape is [batch_size, dim, seq_len]</span>
+<span class="sd">        conv_bias : Tensor (On GPU)</span>
+<span class="sd">            The bias tensor. Its shape is [dim]</span>
 
 <span class="sd">        host_request_types : Tensor (On CPU)</span>
 <span class="sd">            The tensor on the host that indicates if a request is in context or</span>
 <span class="sd">            generation phase. Its shape is [batch_size]. See Inflight Batching</span>
 <span class="sd">            in docs/gpt_attention.md,</span>
 
+<span class="sd">        last_token_ids : Tensor (On GPU)</span>
+<span class="sd">            The inclusive prefix-sum of the lengths or the lengths of the</span>
+<span class="sd">            sequences in the batch.</span>
+
+<span class="sd">        dim : int</span>
+<span class="sd">            The hidden dimension of conv1d</span>
+
+<span class="sd">        dconv : int</span>
+<span class="sd">            The window size of conv1d</span>
+
+<span class="sd">        dtype: str</span>
+<span class="sd">            data type</span>
+
+<span class="sd">        host_context_lengths: Tensor (On CPU) (Optional)</span>
+<span class="sd">            A host tensor that contains the lengths of the different inputs,</span>
+
+<span class="sd">        slot_mapping: Tensor (On GPU) (Optional)</span>
+<span class="sd">            Real page index in state. Its shape is [dim], used for paged state, each page shape is [dconv, dim]</span>
+<span class="sd">    &#39;&#39;&#39;</span>
+    <span class="k">assert</span> <span class="n">host_request_types</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+    <span class="n">mamba_conv1d_plg_creator</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">get_plugin_registry</span><span class="p">()</span><span class="o">.</span><span class="n">get_plugin_creator</span><span class="p">(</span>
+        <span class="s1">&#39;MambaConv1d&#39;</span><span class="p">,</span> <span class="s1">&#39;1&#39;</span><span class="p">,</span> <span class="n">TRT_LLM_PLUGIN_NAMESPACE</span><span class="p">)</span>
+    <span class="k">assert</span> <span class="n">mamba_conv1d_plg_creator</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+
+    <span class="n">dim</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span><span class="s2">&quot;dim&quot;</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">dim</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
+                          <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT32</span><span class="p">)</span>
+    <span class="n">dconv</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span><span class="s2">&quot;dconv&quot;</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">dconv</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
+                            <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT32</span><span class="p">)</span>
+    <span class="n">pf_type</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span>
+        <span class="s2">&quot;type_id&quot;</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">([</span><span class="nb">int</span><span class="p">(</span><span class="n">str_dtype_to_trt</span><span class="p">(</span><span class="n">dtype</span><span class="p">))],</span> <span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
+        <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT32</span><span class="p">)</span>
+    <span class="n">remove_input_padding</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span>
+        <span class="s2">&quot;remove_input_padding&quot;</span><span class="p">,</span>
+        <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">int8</span><span class="p">(</span><span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">remove_input_padding</span><span class="p">),</span>
+                 <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int8</span><span class="p">),</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT8</span><span class="p">)</span>
+    <span class="n">paged_state</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span>
+        <span class="s2">&quot;paged_state&quot;</span><span class="p">,</span>
+        <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">int8</span><span class="p">(</span><span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">paged_state</span><span class="p">),</span>
+                 <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int8</span><span class="p">),</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT8</span><span class="p">)</span>
+
+    <span class="n">pfc</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldCollection</span><span class="p">(</span>
+        <span class="p">[</span><span class="n">dim</span><span class="p">,</span> <span class="n">dconv</span><span class="p">,</span> <span class="n">pf_type</span><span class="p">,</span> <span class="n">remove_input_padding</span><span class="p">,</span> <span class="n">paged_state</span><span class="p">])</span>
+    <span class="n">mamba_conv1d_plug</span> <span class="o">=</span> <span class="n">mamba_conv1d_plg_creator</span><span class="o">.</span><span class="n">create_plugin</span><span class="p">(</span>
+        <span class="s2">&quot;mamba_conv1d&quot;</span><span class="p">,</span> <span class="n">pfc</span><span class="p">)</span>
+    <span class="n">plug_inputs</span> <span class="o">=</span> <span class="p">[</span>
+        <span class="nb">input</span><span class="p">,</span> <span class="n">conv_state_or_ptr</span><span class="p">,</span> <span class="n">conv_weight</span><span class="p">,</span> <span class="n">conv_bias</span><span class="p">,</span> <span class="n">host_request_types</span><span class="p">,</span>
+        <span class="n">last_token_ids</span>
+    <span class="p">]</span>
+    <span class="k">if</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">remove_input_padding</span><span class="p">:</span>
+        <span class="n">plug_inputs</span> <span class="o">+=</span> <span class="p">[</span><span class="n">host_context_lengths</span><span class="p">]</span>
+    <span class="k">if</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">paged_state</span><span class="p">:</span>
+        <span class="n">plug_inputs</span> <span class="o">+=</span> <span class="p">[</span><span class="n">slot_mapping</span><span class="p">]</span>
+    <span class="n">plug_inputs</span> <span class="o">=</span> <span class="p">[</span><span class="n">i</span><span class="o">.</span><span class="n">trt_tensor</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">plug_inputs</span><span class="p">]</span>
+
+    <span class="n">layer</span> <span class="o">=</span> <span class="n">default_trtnet</span><span class="p">()</span><span class="o">.</span><span class="n">add_plugin_v2</span><span class="p">(</span><span class="n">plug_inputs</span><span class="p">,</span> <span class="n">mamba_conv1d_plug</span><span class="p">)</span>
+    <span class="n">_add_plugin_info</span><span class="p">(</span><span class="n">layer</span><span class="p">,</span> <span class="n">mamba_conv1d_plg_creator</span><span class="p">,</span> <span class="s2">&quot;mamba_conv1d&quot;</span><span class="p">,</span> <span class="n">pfc</span><span class="p">)</span>
+    <span class="n">output</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">paged_state</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">output</span><span class="p">,</span> <span class="kc">None</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">present_state</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">output</span><span class="p">,</span> <span class="n">present_state</span></div>
+
+
+
+<div class="viewcode-block" id="selective_scan">
+<a class="viewcode-back" href="../../python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.selective_scan">[docs]</a>
+<span class="k">def</span> <span class="nf">selective_scan</span><span class="p">(</span><span class="nb">input</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+                   <span class="n">state_or_ptr</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+                   <span class="n">delta</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+                   <span class="n">delta_bias</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+                   <span class="n">A</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+                   <span class="n">BC</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+                   <span class="n">D</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+                   <span class="n">z</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+                   <span class="n">host_request_types</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+                   <span class="n">last_token_ids</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+                   <span class="n">dim</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+                   <span class="n">dstate</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+                   <span class="n">dt_rank</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+                   <span class="n">is_variable_B</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
+                   <span class="n">is_variable_C</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
+                   <span class="n">delta_softplus</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
+                   <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+                   <span class="n">slot_mapping</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&#39;&#39;&#39;</span>
+<span class="sd">    Parameters:</span>
+<span class="sd">        input : Tensor (On GPU)</span>
+<span class="sd">            The input tensor. Its shape is [batch_size, seq_len, dim]</span>
+
+<span class="sd">        state_or_ptr : Tensor (On GPU or CPU)</span>
+<span class="sd">            The ssm state tensor. Its shape is [batch_size, dstate, dim]</span>
+<span class="sd">            Or the CPU tensor of shape [1] for the pointer of paged states.</span>
+
+<span class="sd">        delta : Tensor (On GPU)</span>
+<span class="sd">            The delta tensor. Its shape is [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding</span>
+
+<span class="sd">        delta_bias : Tensor (On GPU)</span>
+<span class="sd">            The delta bias tensor. Its shape is [dim]</span>
+
+<span class="sd">        A : Tensor (On GPU)</span>
+<span class="sd">            A matrix. Its shape is [dstate, dim]</span>
+
+<span class="sd">        BC : Tensor (On GPU)</span>
+<span class="sd">            B matrix. Its shape is [batch_size, seq_len, dstate * 2] or [num_tokens, dstate * 2] for remove_input_padding</span>
+
+<span class="sd">        D : Tensor (On GPU)</span>
+<span class="sd">            D matrix. Its shape is [dim]</span>
+
+<span class="sd">        z : Tensor (On GPU)</span>
+<span class="sd">            The z tensor. Its shape is [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding</span>
+
+<span class="sd">        host_request_types : Tensor (On CPU)</span>
+<span class="sd">            The tensor on the host that indicates if a request is in context or</span>
+<span class="sd">            generation phase. Its shape is [batch_size]. See Inflight Batching</span>
+<span class="sd">            in docs/gpt_attention.md,</span>
+
+<span class="sd">        last_token_ids : Tensor (On GPU)</span>
+<span class="sd">            The inclusive prefix-sum of the lengths or the lengths of the</span>
+<span class="sd">            sequences in the batch.</span>
+
 <span class="sd">        dim : int</span>
 <span class="sd">            The inner dimension of SSM block</span>
 
 <span class="sd">        dstate : int</span>
 <span class="sd">            The state dimension of SSM block</span>
+
+<span class="sd">        dt_rank: int</span>
+<span class="sd">            The rank dimension of dt_proj</span>
 
 <span class="sd">        is_variable_B : bool</span>
 <span class="sd">            Is the matrix B a variable? Set to &#39;True&#39; if B is a dynamic matrix</span>
@@ -4847,6 +5132,9 @@
 
 <span class="sd">        dtype: str</span>
 <span class="sd">            data type</span>
+
+<span class="sd">        slot_mapping: Tensor (On GPU) (Optional)</span>
+<span class="sd">            Real page index in state. Its shape is [dim], used for paged state, each page shape is [dstate, dim]</span>
 <span class="sd">    &#39;&#39;&#39;</span>
     <span class="k">assert</span> <span class="n">host_request_types</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
     <span class="n">selective_scan_plg_creator</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">get_plugin_registry</span><span class="p">()</span><span class="o">.</span><span class="n">get_plugin_creator</span><span class="p">(</span>
@@ -4857,6 +5145,8 @@
                           <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT32</span><span class="p">)</span>
     <span class="n">dstate</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span><span class="s2">&quot;dstate&quot;</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">dstate</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
                              <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT32</span><span class="p">)</span>
+    <span class="n">dt_rank</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span><span class="s2">&quot;dt_rank&quot;</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">dt_rank</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
+                              <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT32</span><span class="p">)</span>
     <span class="n">is_variable_B</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span>
         <span class="s2">&quot;is_variable_B&quot;</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">int8</span><span class="p">(</span><span class="n">is_variable_B</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int8</span><span class="p">),</span>
         <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT8</span><span class="p">)</span>
@@ -4869,22 +5159,83 @@
     <span class="n">pf_type</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span>
         <span class="s2">&quot;type_id&quot;</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">([</span><span class="nb">int</span><span class="p">(</span><span class="n">str_dtype_to_trt</span><span class="p">(</span><span class="n">dtype</span><span class="p">))],</span> <span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
         <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT32</span><span class="p">)</span>
+    <span class="n">remove_input_padding</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span>
+        <span class="s2">&quot;remove_input_padding&quot;</span><span class="p">,</span>
+        <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">int8</span><span class="p">(</span><span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">remove_input_padding</span><span class="p">),</span>
+                 <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int8</span><span class="p">),</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT8</span><span class="p">)</span>
+    <span class="n">paged_state</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span>
+        <span class="s2">&quot;paged_state&quot;</span><span class="p">,</span>
+        <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">int8</span><span class="p">(</span><span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">paged_state</span><span class="p">),</span>
+                 <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int8</span><span class="p">),</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT8</span><span class="p">)</span>
 
-    <span class="n">pfc</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldCollection</span><span class="p">(</span>
-        <span class="p">[</span><span class="n">dim</span><span class="p">,</span> <span class="n">dstate</span><span class="p">,</span> <span class="n">is_variable_B</span><span class="p">,</span> <span class="n">is_variable_C</span><span class="p">,</span> <span class="n">delta_softplus</span><span class="p">,</span> <span class="n">pf_type</span><span class="p">])</span>
+    <span class="n">pfc</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldCollection</span><span class="p">([</span>
+        <span class="n">dim</span><span class="p">,</span> <span class="n">dstate</span><span class="p">,</span> <span class="n">dt_rank</span><span class="p">,</span> <span class="n">is_variable_B</span><span class="p">,</span> <span class="n">is_variable_C</span><span class="p">,</span> <span class="n">delta_softplus</span><span class="p">,</span>
+        <span class="n">pf_type</span><span class="p">,</span> <span class="n">remove_input_padding</span><span class="p">,</span> <span class="n">paged_state</span>
+    <span class="p">])</span>
     <span class="n">selective_scan_plug</span> <span class="o">=</span> <span class="n">selective_scan_plg_creator</span><span class="o">.</span><span class="n">create_plugin</span><span class="p">(</span>
-        <span class="s2">&quot;selectives_can&quot;</span><span class="p">,</span> <span class="n">pfc</span><span class="p">)</span>
+        <span class="s2">&quot;selective_scan&quot;</span><span class="p">,</span> <span class="n">pfc</span><span class="p">)</span>
 
     <span class="n">plug_inputs</span> <span class="o">=</span> <span class="p">[</span>
-        <span class="nb">input</span><span class="p">,</span> <span class="n">state</span><span class="p">,</span> <span class="n">delta</span><span class="p">,</span> <span class="n">delta_bias</span><span class="p">,</span> <span class="n">A</span><span class="p">,</span> <span class="n">B</span><span class="p">,</span> <span class="n">C</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">z</span><span class="p">,</span> <span class="n">host_request_types</span>
+        <span class="nb">input</span><span class="p">,</span> <span class="n">state_or_ptr</span><span class="p">,</span> <span class="n">delta</span><span class="p">,</span> <span class="n">delta_bias</span><span class="p">,</span> <span class="n">A</span><span class="p">,</span> <span class="n">BC</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">z</span><span class="p">,</span> <span class="n">host_request_types</span><span class="p">,</span>
+        <span class="n">last_token_ids</span>
     <span class="p">]</span>
+    <span class="k">if</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">paged_state</span><span class="p">:</span>
+        <span class="n">plug_inputs</span> <span class="o">+=</span> <span class="p">[</span><span class="n">slot_mapping</span><span class="p">]</span>
     <span class="n">plug_inputs</span> <span class="o">=</span> <span class="p">[</span><span class="n">i</span><span class="o">.</span><span class="n">trt_tensor</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">plug_inputs</span><span class="p">]</span>
 
     <span class="n">layer</span> <span class="o">=</span> <span class="n">default_trtnet</span><span class="p">()</span><span class="o">.</span><span class="n">add_plugin_v2</span><span class="p">(</span><span class="n">plug_inputs</span><span class="p">,</span> <span class="n">selective_scan_plug</span><span class="p">)</span>
-    <span class="n">_add_plugin_info</span><span class="p">(</span><span class="n">layer</span><span class="p">,</span> <span class="n">selective_scan_plg_creator</span><span class="p">,</span> <span class="s2">&quot;selectives_can&quot;</span><span class="p">,</span> <span class="n">pfc</span><span class="p">)</span>
+    <span class="n">_add_plugin_info</span><span class="p">(</span><span class="n">layer</span><span class="p">,</span> <span class="n">selective_scan_plg_creator</span><span class="p">,</span> <span class="s2">&quot;selective_scan&quot;</span><span class="p">,</span> <span class="n">pfc</span><span class="p">)</span>
     <span class="n">output</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
-    <span class="n">present_state</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">output</span><span class="p">,</span> <span class="n">present_state</span></div>
+    <span class="k">if</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">paged_state</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">output</span><span class="p">,</span> <span class="kc">None</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">present_state</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">output</span><span class="p">,</span> <span class="n">present_state</span></div>
+
+
+
+<div class="viewcode-block" id="topk">
+<a class="viewcode-back" href="../../python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.topk">[docs]</a>
+<span class="k">def</span> <span class="nf">topk</span><span class="p">(</span><span class="nb">input</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+         <span class="n">k</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+         <span class="n">dim</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+         <span class="n">largest</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">&#39;&#39;&#39;</span>
+<span class="sd">    Add an topk operation.</span>
+
+<span class="sd">    Retrieve the top-K largest elements along a specified axis.</span>
+<span class="sd">    Given an input tensor of shape [a_1, a_2, ..., a_n, r]</span>
+<span class="sd">    and integer argument k, return two outputs:</span>
+<span class="sd">    Value tensor of shape [a_1, a_2, ..., a_{axis-1}, k, a_{axis+1}, ... a_n] which contains the values of the top k elements along the specified axis</span>
+<span class="sd">    Index tensor of shape [a_1, a_2, ..., a_{axis-1}, k, a_{axis+1}, ... a_n] which contains the indices of the top k elements (original indices from the input tensor).</span>
+
+<span class="sd">    Parameters:</span>
+<span class="sd">        input : Tensor</span>
+<span class="sd">            The input tensor.</span>
+
+<span class="sd">        k : int</span>
+<span class="sd">            A single positive value corresponding to the number of top elements to retrieve</span>
+
+<span class="sd">        dim: int</span>
+<span class="sd">            The dimension in which to compute the topk indices.</span>
+
+<span class="sd">        largest: bool</span>
+<span class="sd">            Controls whether to return largest or smallest elements</span>
+
+
+<span class="sd">    Returns:</span>
+<span class="sd">        The tensor produced by this argmax operation.</span>
+<span class="sd">    &#39;&#39;&#39;</span>
+    <span class="n">dim</span> <span class="o">=</span> <span class="n">dim_resolve_negative</span><span class="p">(</span><span class="n">dim</span><span class="p">,</span> <span class="nb">input</span><span class="o">.</span><span class="n">ndim</span><span class="p">())</span>
+    <span class="n">axes</span> <span class="o">=</span> <span class="n">dim_to_trt_axes</span><span class="p">(</span><span class="n">dim</span><span class="p">)</span>
+    <span class="n">layer</span> <span class="o">=</span> <span class="n">default_trtnet</span><span class="p">()</span><span class="o">.</span><span class="n">add_topk</span><span class="p">(</span>
+        <span class="nb">input</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">,</span>
+        <span class="n">trt</span><span class="o">.</span><span class="n">TopKOperation</span><span class="o">.</span><span class="n">MAX</span> <span class="k">if</span> <span class="n">largest</span> <span class="k">else</span> <span class="n">trt</span><span class="o">.</span><span class="n">TopKOperation</span><span class="o">.</span><span class="n">MIN</span><span class="p">,</span>
+        <span class="n">k</span><span class="o">=</span><span class="n">k</span><span class="p">,</span>
+        <span class="n">axes</span><span class="o">=</span><span class="n">axes</span><span class="p">)</span>
+
+    <span class="k">return</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span>
+                          <span class="n">layer</span><span class="p">),</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span></div>
 
 </pre></div>
 

@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>The Batch Manager in TensorRT-LLM &mdash; tensorrt_llm  documentation</title>
+      <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=80d5e7a1" />
+      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=19f00094" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script src="../_static/jquery.js?v=5d32c60e"></script>
+        <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+        <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+        <script src="../_static/doctools.js?v=888ff710"></script>
+        <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="Inference Request" href="inference-request.html" />
+    <link rel="prev" title="Graph Rewriting Module" href="graph-rewriting.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../index.html" class="icon icon-home">
+            tensorrt_llm
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/windows.html">Installing on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html">Model Definition</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html#compilation">Compilation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html#runtime">Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html#multi-gpu-and-multi-node-support">Multi-GPU and Multi-Node Support</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">The Batch Manager in TensorRT-LLM</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#the-batch-manager-api">The Batch Manager API</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#get-and-send-callbacks">Get and Send Callbacks</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#request-interruption">Request Interruption</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#statistics">Statistics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#logits-post-processor-optional">Logits Post-Processor (optional)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#other-mandatory-gptmanager-parameters">Other mandatory GptManager parameters</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#optional-gptmanager-parameters">Optional GptManager parameters</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#responses-content">Responses content</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#gptmanager-design">GptManager Design</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#multi-gpu-execution">Multi-GPU execution</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#in-flight-batching-with-the-triton-inference-server">In-flight Batching with the Triton Inference Server</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="inference-request.html">Inference Request</a></li>
+<li class="toctree-l1"><a class="reference internal" href="lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-best-practices.html">Best Practices for Tuning the Performance of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Python API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../index.html">tensorrt_llm</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">The Batch Manager in TensorRT-LLM</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="../_sources/advanced/batch-manager.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="the-batch-manager-in-tensorrt-llm">
+<span id="batch-manager"></span><h1>The Batch Manager in TensorRT-LLM<a class="headerlink" href="#the-batch-manager-in-tensorrt-llm" title="Link to this heading"></a></h1>
+<p>TensorRT-LLM relies on a component, called the Batch Manager, to support
+in-flight batching of requests (also known in the community as continuous
+batching or iteration-level batching). That technique that aims at reducing
+wait times in queues, eliminating the need for padding requests and allowing
+for higher GPU utilization.</p>
+<p>In more details, this feature allows for the inclusion of newly arrived
+requests and the return of newly completed requests at each iteration of the
+token generation loop. In-flight batching is accessed via a TensorRT-LLM component
+called the <em>Batch Manager</em>. That batch manager exposes hooks for the user to
+register function pointers to define how TensorRT-LLM reads in new requests and
+how it returns completed requests to the user.</p>
+<section id="the-batch-manager-api">
+<h2>The Batch Manager API<a class="headerlink" href="#the-batch-manager-api" title="Link to this heading"></a></h2>
+<p>A software component (called the client in the text that follows) can interact
+with the batch manager using two mandatory, and several optional callbacks. Their signatures are defined
+in the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/batch_manager/callbacks.h"><code class="docutils literal notranslate"><span class="pre">callbacks.h</span></code></a> file.</p>
+<p>These callbacks are invoked in the generation loop at regular intervals and serve a variety of functions described below.</p>
+<section id="get-and-send-callbacks">
+<h3>Get and Send Callbacks<a class="headerlink" href="#get-and-send-callbacks" title="Link to this heading"></a></h3>
+<p>The entry point to pass new requests to the batch manager is a callback of type
+<code class="docutils literal notranslate"><span class="pre">GetInferenceRequestsCallback</span></code>. An implementation of that callback must return
+a list of requests (<code class="docutils literal notranslate"><span class="pre">std::list&lt;std::shared_ptr&lt;InferenceRequest&gt;</span></code>) to be
+processed by the batch manager. It takes a parameter indicating the maximum
+number of requests that can be accepted (a negative value indicates that an
+unbounded number of requests can be accepted). The complete signature of that
+callback is:</p>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="k">using</span><span class="w"> </span><span class="n">GetInferenceRequestsCallback</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">function</span><span class="o">&lt;</span><span class="n">std</span><span class="o">::</span><span class="n">list</span><span class="o">&lt;</span><span class="n">std</span><span class="o">::</span><span class="n">shared_ptr</span><span class="o">&lt;</span><span class="n">InferenceRequest</span><span class="o">&gt;&gt;</span><span class="p">(</span><span class="kt">int32_t</span><span class="p">)</span><span class="o">&gt;</span><span class="p">;</span>
+</pre></div>
+</div>
+<p>For each new request, the client must provide the batch manager with its input
+tensors and a 64-bit unsigned number (<code class="docutils literal notranslate"><span class="pre">uint64_t</span></code>) that will uniquely identify
+the request. That identifier is called the <em>request ID</em> in the text that
+follows (and in the code of the batch manager). The input tensors are collected
+in a map (<code class="docutils literal notranslate"><span class="pre">std::map&lt;std::string,</span> <span class="pre">Tensor&gt;</span></code>) that associates input names to
+tensor. Refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/batch_manager/inferenceRequest.h"><code class="docutils literal notranslate"><span class="pre">InferenceRequest.h</span></code></a> for more information.</p>
+<p>Responses are delivered to the client through a callback of type
+<code class="docutils literal notranslate"><span class="pre">SendResponseCallback</span></code>. A conforming callback must accept the 64-bit
+request ID that uniquely identifies the request, the list of output tensors,
+a boolean (identifying the last response for the request when set to
+<code class="docutils literal notranslate"><span class="pre">true</span></code>) and a potentially non-empty error message.
+A non-empty error message indicates that an error has been encountered.
+In that case, the boolean indicating that this is the last response will be set to true,
+and the callback must properly handle the error.
+Its signature is:</p>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="k">using</span><span class="w"> </span><span class="n">SendResponseCallback</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">function</span><span class="o">&lt;</span><span class="kt">void</span><span class="p">(</span><span class="kt">uint64_t</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">list</span><span class="o">&lt;</span><span class="n">std</span><span class="o">::</span><span class="n">shared_ptr</span><span class="o">&lt;</span><span class="n">Tensor</span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="k">const</span><span class="o">&amp;</span><span class="p">,</span><span class="w"> </span><span class="kt">bool</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="o">&amp;</span><span class="p">)</span><span class="o">&gt;</span><span class="p">;</span>
+</pre></div>
+</div>
+<p>The batch manager will reject any request sent using the
+<code class="docutils literal notranslate"><span class="pre">GetInferenceRequestsCallback</span></code> callback if the request ID passed by the
+client corresponds to the request ID of a request that is being processed
+by the batch manager.  A request ID can be reused after it appears in a
+call to the <code class="docutils literal notranslate"><span class="pre">SendResponseCallback</span></code> callback marked as final (third argument set
+to <code class="docutils literal notranslate"><span class="pre">true</span></code>).</p>
+</section>
+<section id="request-interruption">
+<h3>Request Interruption<a class="headerlink" href="#request-interruption" title="Link to this heading"></a></h3>
+<p>The batch manager allows users to stop the execution of requests currently in-flight.
+The set of request IDs to be stopped can be passed to the batch manager
+through the callback:</p>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="k">using</span><span class="w"> </span><span class="n">PollStopSignalCallback</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">function</span><span class="o">&lt;</span><span class="n">std</span><span class="o">::</span><span class="n">unordered_set</span><span class="o">&lt;</span><span class="kt">uint64_t</span><span class="o">&gt;</span><span class="p">()</span><span class="o">&gt;</span><span class="p">;</span>
+</pre></div>
+</div>
+<p>When an active request appears in the set of requests to be interrupted, the
+batch manager will ensure that it is properly stopped.</p>
+</section>
+<section id="statistics">
+<h3>Statistics<a class="headerlink" href="#statistics" title="Link to this heading"></a></h3>
+<p>The batch manager can report execution statistics when provided with the following
+callback:</p>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="k">using</span><span class="w"> </span><span class="n">ReturnBatchManagerStatsCallback</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">function</span><span class="o">&lt;</span><span class="kt">void</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="o">&amp;</span><span class="p">)</span><span class="o">&gt;</span><span class="p">;</span>
+</pre></div>
+</div>
+<p>The statistics are packaged as a JSON string. That string contains the following fields:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">Timestamp</span></code>, the timestamp of the request (obtained using
+<code class="docutils literal notranslate"><span class="pre">std::put_time(&amp;tm,</span> <span class="pre">&quot;%m-%d-%Y</span> <span class="pre">%H:%M:%S&quot;)</span></code>),</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">Iteration</span> <span class="pre">Counter</span></code>, a global step counter value that increases monotonically over time</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">Active</span> <span class="pre">Request</span> <span class="pre">Count</span></code>, the number of active requests in batch manager</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">Max</span> <span class="pre">Request</span> <span class="pre">Count</span></code>, the max number of requests batch manager can support at a time</p></li>
+</ul>
+<p>When using paged KV cache, following statistics are reported:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">Max</span> <span class="pre">KV</span> <span class="pre">cache</span> <span class="pre">blocks</span></code>, the maximum number of KV cache blocks per GPU</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">Free</span> <span class="pre">KV</span> <span class="pre">cache</span> <span class="pre">blocks</span></code>, number of free KV cache blocks per GPU</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">Used</span> <span class="pre">KV</span> <span class="pre">cache</span> <span class="pre">blocks</span></code>, number of used KV cache blocks per GPU</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">Tokens</span> <span class="pre">per</span> <span class="pre">KV</span> <span class="pre">cache</span> <span class="pre">block</span></code>, number of tokens per KV cache block</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">Scheduled</span> <span class="pre">Requests</span></code>, number of requests scheduled this iteration</p></li>
+</ul>
+<p>When using in-flight batching, the following additional statistics are reported per step/iteration:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">Scheduled</span> <span class="pre">Requests</span></code>, number of total requests scheduled</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">Context</span> <span class="pre">Requests</span></code>, number of requests in Context phase</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">Generation</span> <span class="pre">Requests</span></code>, number of requests in Generation phase</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">Total</span> <span class="pre">Context</span> <span class="pre">Tokens</span></code>, total number of tokens across requests in context phase</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">MicroBatch</span> <span class="pre">ID</span></code>, micro batch ID</p></li>
+</ul>
+<p>When using V1 batching, the following additional statistics are reported per V1 iteration:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">Scheduled</span> <span class="pre">Requests</span></code>, number of total requests scheduled</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">Context</span> <span class="pre">Requests</span></code>, number of requests in Context phase</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">Total</span> <span class="pre">Generation</span> <span class="pre">Tokens</span></code>, Total number of tokens generated</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">Total</span> <span class="pre">Context</span> <span class="pre">Tokens</span></code>, total number of tokens across requests in context phase</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">Empty</span> <span class="pre">Generation</span> <span class="pre">Slots</span></code>, total number of padded Slots during generation phase</p></li>
+</ul>
+</section>
+<section id="logits-post-processor-optional">
+<h3>Logits Post-Processor (optional)<a class="headerlink" href="#logits-post-processor-optional" title="Link to this heading"></a></h3>
+<p>Users can alter the logits produced the network, with a callback attached to an <code class="docutils literal notranslate"><span class="pre">InferenceRequest</span></code>:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>  <span class="n">using</span> <span class="n">LogitsPostProcessor</span> <span class="o">=</span> <span class="n">std</span><span class="p">::</span><span class="n">function</span><span class="o">&lt;</span><span class="n">TensorPtr</span><span class="p">(</span><span class="n">RequestIdType</span><span class="p">,</span> <span class="n">TensorPtr</span><span class="o">&amp;</span><span class="p">,</span> <span class="n">BeamTokens</span> <span class="n">const</span><span class="o">&amp;</span><span class="p">,</span> <span class="n">TStream</span><span class="p">)</span><span class="o">&gt;</span><span class="p">;</span>
+</pre></div>
+</div>
+<p>The first argument is the request id, second is the logits tensor, third are the tokens produced by the request so far, and last one is the operation stream used by the logits tensor.</p>
+<p>Users <em>must</em> use the stream to access the logits tensor. For example, performing a addition with a bias tensor should be enqueued on that stream.
+Alternatively, users may call <code class="docutils literal notranslate"><span class="pre">stream-&gt;synchronize()</span></code>, however, that will slow down the entire execution pipeline.</p>
+<p>Note: this feature isn’t supported with the <code class="docutils literal notranslate"><span class="pre">V1</span></code> batching scheme for the moment.</p>
+</section>
+<section id="other-mandatory-gptmanager-parameters">
+<h3>Other mandatory GptManager parameters<a class="headerlink" href="#other-mandatory-gptmanager-parameters" title="Link to this heading"></a></h3>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">trtEnginePath</span></code>, path to the directory containing the TRT-LLM engine that GptManager wraps</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">modelType</span></code>, batching scheme - V1, InflightBatching or InflightFusedBatching.</p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">V1</span></code> refers to the traditional batching scheme with a batch of requests running in lockstep until the full generation for all of them is complete. Requests in a batch are all padded up to the maximum input and output sequence length of any member of the batch.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">InflightBatching</span></code> refers to a scheme where newly arrived requests are dynamically incorporated into the batch under execution, and requests are returned as soon as the end condition is met without any padding.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">InflightFusedBatching</span></code> is an improvement on <code class="docutils literal notranslate"><span class="pre">InflightBatching</span></code>, leveraging additional operation fusion opportunities and is expected to be strictly superior to it.</p></li>
+</ul>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">maxBeamWidth</span></code>, the maximum beam width GptManager will allow for any request.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">schedulerPolicy</span></code>, policy used to select the subset available requests in each iteration of the InflightBatching generation loop.</p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">MAX_UTILIZATION</span></code> packs as many requests as the underlying TRT engine can support in any iteration of the InflightBatching generation loop. While this is expected to maximize GPU throughput, it might require that some requests be paused and restarted depending on peak KV cache memory availability.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">GUARANTEED_NO_EVICT</span></code> uses KV cache more conservatively guaranteeing that a request, once started, will run to completion without eviction.</p></li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="optional-gptmanager-parameters">
+<h3>Optional GptManager parameters<a class="headerlink" href="#optional-gptmanager-parameters" title="Link to this heading"></a></h3>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">TrtGptModelOptionalParams</span></code> class encapsulates the following fields:</p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">kvCacheConfig</span></code></p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">maxTokens</span></code> (default: unspecified) refers to the maximum number of tokens reserved for KV cache across all requests. If specified, the final allocated KV cache considers this parameter as well as <code class="docutils literal notranslate"><span class="pre">freeGpuMemoryFraction</span></code> below.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">maxAttentionWindow</span></code> (default: unspecified) refers to the maximum number of tokens attended to in the model when using features like sliding window attention or StreamingLLM. If unspecified, each generated tokens attends to all previous tokens like traditional MHA or MQA.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">freeGpuMemoryFraction</span></code> (default: 0.9) a number between 0 and 1 to indicate the maximum fraction of GPU memory (after loading the model) that may be used for KV cache. If <code class="docutils literal notranslate"><span class="pre">maxTokens</span></code> is specified, allocated KV cache is the minimum of <code class="docutils literal notranslate"><span class="pre">maxTokens</span></code> and the value inferred from <code class="docutils literal notranslate"><span class="pre">freeGpuMemoryFraction</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">enableBlockReuse</span></code> (default: <code class="docutils literal notranslate"><span class="pre">false</span></code>) allow reuse of previously computed KV cache blocks across requests. This is expected to optimize memory use and computation.</p></li>
+</ul>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">enableTrtOverlap</span></code> (default: <code class="docutils literal notranslate"><span class="pre">false</span></code>) when <code class="docutils literal notranslate"><span class="pre">true</span></code>, GptManager partitions available requests into 2 ‘microbatches’ that can be run concurrently to hide exposed CPU runtime. However, it may not give performance benefits when the size of the model is not big enough to overlap the host overhead, or when the number of requests is too small.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">enableChunkedContext</span></code> (default: <code class="docutils literal notranslate"><span class="pre">false</span></code>) Whether to enable context chunking. Context chunking increases the possibility of batching the context and generation phases, which in turn improves performance. When set to <code class="docutils literal notranslate"><span class="pre">false</span></code>, it indicates that the context chunk is disabled.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">peftCacheManagerConfig</span></code> (currently only supports LoRA, and requires <code class="docutils literal notranslate"><span class="pre">--use_lora_plugin</span></code> during engine build)</p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">numHostModuleLayer</span></code> (default: 0) number of adapter_size 1 single module single layer LoRA weight rows the host cache can hold.  Overrides <code class="docutils literal notranslate"><span class="pre">hostCacheSize</span></code> if non-zero.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">numDeviceModuleLayer</span></code> (default: 0) number of adapter_size 1 single module single layer LoRA weight rows the device cache can hold.  Overrides <code class="docutils literal notranslate"><span class="pre">deviceCachePercent</span></code> if non-zero.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">optimalAdapterSize</span></code> (default: 8) Used to size cache pages. Typically optimally sized adapters will fix exactly into 1 cache page.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">maxAdapterSize</span></code> (default: 64) Used to set the minimum size of a cache page.  Pages must be at least large enough to fit a single module, single later adapter_size <code class="docutils literal notranslate"><span class="pre">maxAdapterSize</span></code> row of weights.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">numPutWorkers</span></code> (default: 1) Number of CPU workers used to put weights into host cache.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">numEnsureWorkers</span></code> (default: 1) Number of CPU workers used to ensure all weights needed for the next forward pass are in the GPU cache.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">numCopyStreams</span></code> (default: 1) Number of CUDA streams used for H2D copies of cache pages</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">maxPagesPerBlockHost</span></code> (default: 24) Number of cache pages per host memory allocation</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">maxPagesPerBlockDevice</span></code> (default: 24) Number of cache pages per device memory allocation</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">deviceCachePercent</span></code> (default: 0.05) percent of device memory used for PEFT cache after engine load and KV cache allocation</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">hostCacheSize</span></code> (default: 1G) size in bytes of the host PEFT cache</p></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="responses-content">
+<h3>Responses content<a class="headerlink" href="#responses-content" title="Link to this heading"></a></h3>
+<p>The responses from <code class="docutils literal notranslate"><span class="pre">SendResponseCallback</span></code> are stored in a <code class="docutils literal notranslate"><span class="pre">std::shared_ptr&lt;Tensor&gt;</span></code> list, which contains the following tensors of a specific request:</p>
+<ul class="simple">
+<li><p>output Ids: a CPU tensor that contains the output token IDs. Its shape is
+[1, beamWidth, maxSeqLength].</p></li>
+<li><p>sequence length: a CPU tensor that indicates the length of inputID + outputID. Its shape is [1, 1].</p></li>
+<li><p>context logits: a CPU tensor that contains context logits. Its shape is [1, promptLength, vocabSizePadded] if the engine is built with <code class="docutils literal notranslate"><span class="pre">gather_context_logits</span></code> or <code class="docutils literal notranslate"><span class="pre">gather_all_token_logits</span></code>. Otherwise, it is a dummy tensor with shape [1, 1, 1].</p></li>
+<li><p>generation logits:  a CPU tensor that contains generation logits. Its shape is [1, beamWidth, outputLength, vocabSizePadded]. if the engine is built with <code class="docutils literal notranslate"><span class="pre">gather_generation_logits</span></code> or <code class="docutils literal notranslate"><span class="pre">gather_all_token_logits</span></code>. Otherwise, it is a dummy tensor with shape [1, 1, 1, 1]. If you are using gptManagerBenchmark.cpp, please remember to pass corresponding parameters <code class="docutils literal notranslate"><span class="pre">--return-context-logits</span></code> and/or <code class="docutils literal notranslate"><span class="pre">--return-generation-logits</span></code> to obtain these logits. Note that enabling return logits will require more device memory for converting and storing logits. To reduce redundant memory buffer allocation as much as possible, we recommend that the <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>, <code class="docutils literal notranslate"><span class="pre">max_beam_width</span></code>, <code class="docutils literal notranslate"><span class="pre">max_input_len</span></code>, <code class="docutils literal notranslate"><span class="pre">max_output_len</span></code>, and other parameters set when building the engine are close to the values required during actual inference.</p></li>
+<li><p>logProb: a CPU tensor that stores the log-prob of the generated tokens. Its shape is [1, beamWidth, outputLength]</p></li>
+<li><p>cumLogProb: a CPU tensor that stores the cumLogProb. Its shape is [1, beamWidth]</p></li>
+</ul>
+</section>
+<section id="gptmanager-design">
+<h3>GptManager Design<a class="headerlink" href="#gptmanager-design" title="Link to this heading"></a></h3>
+<p>Batch Manager is designed to integrate into an inference server that’s executing a pool of
+active work items populated by a stream of requests actively received
+by the server. GptManager assumes a GPT-style autoregressive model architecture.
+GptManager spawns a worker thread in its constructor that then
+persistently runs the token generation loop. The worker thread invokes <code class="docutils literal notranslate"><span class="pre">GetInferenceRequestsCallback</span></code>
+at the start of each loop iteration, which is intended to read new
+requests. It invokes <code class="docutils literal notranslate"><span class="pre">SendResponseCallback</span></code> at the end of each iteration when one or
+more requests have generated a response to send back to the user. This response
+can be a single token in the case of requests that have streaming mode enabled or
+the full response when streaming mode is disabled.
+<code class="docutils literal notranslate"><span class="pre">PollStopSignalCallback</span></code> and <code class="docutils literal notranslate"><span class="pre">ReturnBatchManagerStatsCallback</span></code>, if provided, are both invoked at the end of each
+iteration loop. <code class="docutils literal notranslate"><span class="pre">ReturnBatchManagerStatsCallback</span></code> is not called when the system has no active requests.
+The server can safely retire requests from its pool of work
+items when notified of completion (via the final_response boolean argument) by the batch manager in
+<code class="docutils literal notranslate"><span class="pre">SendResponseCallback</span></code>.  All TensorRT-LLM internal state related to that
+request will have been freed before this point.
+An instance of the batch manager to serve an
+auto-regressive model like GPT can be created as follows:</p>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;tensorrt_llm/batch_manager/GptManager.h&gt;</span>
+
+<span class="k">using</span><span class="w"> </span><span class="k">namespace</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="o">::</span><span class="nn">batch_manager</span><span class="p">;</span>
+
+<span class="n">GptManager</span><span class="w"> </span><span class="n">batchManager</span><span class="p">(</span><span class="n">pathToTrtEngine</span><span class="p">,</span><span class="w">                   </span><span class="c1">// Path to the TensorRT engine of the model,</span>
+<span class="w">                        </span><span class="n">TrtGptModelType</span><span class="o">::</span><span class="n">InflightFusedBatching</span><span class="p">,</span><span class="w"> </span><span class="c1">// Use in-flight batching,</span>
+<span class="w">                        </span><span class="n">maxBeamWidth</span><span class="p">,</span><span class="w">                      </span><span class="c1">// Maximum beam width (must be &gt;= 1),</span>
+<span class="w">                        </span><span class="n">schedulerPolicy</span><span class="p">,</span><span class="w">                   </span><span class="c1">// Scheduling policy (see below),</span>
+<span class="w">                        </span><span class="n">getInferenceRequestsCb</span><span class="p">,</span><span class="w">            </span><span class="c1">// The Get callback (see above),</span>
+<span class="w">                        </span><span class="n">sendResponseCb</span><span class="p">,</span><span class="w">                    </span><span class="c1">// The Send callback (see above),</span>
+<span class="w">                        </span><span class="n">pollStopSignalCb</span><span class="p">,</span><span class="w">                  </span><span class="c1">// The Stop signals callback (see above),</span>
+<span class="w">                        </span><span class="n">returnBatchManagerStatsCb</span><span class="p">);</span><span class="w">        </span><span class="c1">// The Return stats callback (see above),</span>
+</pre></div>
+</div>
+<p>The scheduler policy helps the batch manager adjust how requests are scheduled
+for execution. The batch manager can try to maximize the utilization of the
+GPUs by aggressively scheduling requests (<code class="docutils literal notranslate"><span class="pre">schedulerPolicy</span></code> set to
+<code class="docutils literal notranslate"><span class="pre">MAX_UTILIZATION</span></code>) at the risk of having to pause requests if it runs short on
+memory for KV caches. Note that any paused request will be automatically resumed
+and the only user-visible effect may be increased latency.
+It can also adopt a more conservative approach and schedule requests only when it
+knows that the memory allocation will be sufficient to process all active requests
+even in the worst case of KV cache consumption. That mode corresponds to a
+<code class="docutils literal notranslate"><span class="pre">schedulerPolicy</span></code> set to <code class="docutils literal notranslate"><span class="pre">GUARANTEED_NO_EVICT</span></code>.</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">GptManager</span></code>’s worker thread terminates when the <code class="docutils literal notranslate"><span class="pre">GptManager</span></code> destructor is
+called and there are no more active requests.</p>
+</section>
+<section id="multi-gpu-execution">
+<h3>Multi-GPU execution<a class="headerlink" href="#multi-gpu-execution" title="Link to this heading"></a></h3>
+<p>When running on multiple GPUs using either tensor or pipeline parallelism, it
+is assumed that the server launches as many processes as GPU ranks, and each
+process runs its own instance of <code class="docutils literal notranslate"><span class="pre">GptManager</span></code>. The number of GPUs visible on a given
+node can be controlled using the <code class="docutils literal notranslate"><span class="pre">CUDA_VISIBLE_DEVICES</span></code> environment variable.</p>
+<p>Care must be taken to ensure all ranks see the same inputs at each iteration of
+the generation loop. In TensorRT-LLM Triton backend, an MPI broadcast is
+performed in <code class="docutils literal notranslate"><span class="pre">GetInferenceRequestsCallback</span></code> to ensure the same set of requests
+is seen by each of the MPI ranks.  <code class="docutils literal notranslate"><span class="pre">ReturnBatchManagerStatsCallback</span></code> need only
+be called from a single rank; all ranks hold identical copies of the final
+results.</p>
+</section>
+</section>
+<section id="in-flight-batching-with-the-triton-inference-server">
+<h2>In-flight Batching with the Triton Inference Server<a class="headerlink" href="#in-flight-batching-with-the-triton-inference-server" title="Link to this heading"></a></h2>
+<p>A Triton Inference Server C++ backend is provided with TensorRT-LLM that
+includes the mechanisms needed to serve models using in-flight batching. That
+backend is also a good starting example how to implement in-flight batching using
+the TensorRT-LLM batch manager.</p>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="graph-rewriting.html" class="btn btn-neutral float-left" title="Graph Rewriting Module" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="inference-request.html" class="btn btn-neutral float-right" title="Inference Request" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2023, NVidia.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

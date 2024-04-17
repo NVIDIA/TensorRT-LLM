@@ -41,24 +41,56 @@
   </form>
 </div>
         </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
-              <p class="caption" role="heading"><span class="caption-text">Contents:</span></p>
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
 <ul>
-<li class="toctree-l1"><a class="reference internal" href="../../../../architecture.html">TensorRT-LLM Architecture</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../gpt_runtime.html">C++ GPT Runtime</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../batch_manager.html">The Batch Manager in TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../inference_request.html">Inference Request</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../gpt_attention.html">Multi-head, Multi-query and Group-query Attention</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../precision.html">Numerical Precision</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../build_from_source.html">Build from Source</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../performance.html">Performance of TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../2023-05-19-how-to-debug.html">How to debug</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../2023-05-17-how-to-add-a-new-model.html">How to add a new model</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../graph-rewriting.html">Graph Rewriting Module</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../memory.html">Memory Usage of TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../new_workflow.html">New Workflow</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../perf_best_practices.html">Best Practices for Tuning the Performance of TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../performance_analysis.html">Performance Analysis of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../release-notes.html">Release Notes</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../installation/windows.html">Installing on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../architecture/core-concepts.html">Model Definition</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../architecture/core-concepts.html#compilation">Compilation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../architecture/core-concepts.html#runtime">Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../architecture/core-concepts.html#multi-gpu-and-multi-node-support">Multi-GPU and Multi-Node Support</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/inference-request.html">Inference Request</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../performance/perf-best-practices.html">Best Practices for Tuning the Performance of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../performance/perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Python API</span></p>
 <ul>
@@ -69,16 +101,13 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
 </ul>
-<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="../../../../_cpp_gen/runtime.html">Runtime</a></li>
-</ul>
 <p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
 </ul>
 
         </div>
@@ -120,6 +149,7 @@
 <span class="c1"># WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.</span>
 <span class="c1"># See the License for the specific language governing permissions and</span>
 <span class="c1"># limitations under the License.</span>
+<span class="kn">import</span> <span class="nn">dataclasses</span>
 <span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="n">Any</span>
 
 <span class="kn">import</span> <span class="nn">numpy</span> <span class="k">as</span> <span class="nn">np</span>
@@ -128,7 +158,9 @@
 <span class="kn">from</span> <span class="nn">...module</span> <span class="kn">import</span> <span class="n">Module</span>
 <span class="kn">from</span> <span class="nn">...quantization</span> <span class="kn">import</span> <span class="n">QuantMode</span>
 <span class="kn">from</span> <span class="nn">...quantization.layers</span> <span class="kn">import</span> <span class="n">FP8Linear</span><span class="p">,</span> <span class="n">FP8RowLinear</span>
+<span class="kn">from</span> <span class="nn">...quantization.mode</span> <span class="kn">import</span> <span class="n">QuantAlgo</span>
 <span class="kn">from</span> <span class="nn">...quantization.quantize</span> <span class="kn">import</span> <span class="n">weight_only_quantize</span>
+<span class="kn">from</span> <span class="nn">..modeling_utils</span> <span class="kn">import</span> <span class="n">QuantConfig</span>
 
 <span class="c1"># isort: off</span>
 <span class="kn">from</span> <span class="nn">...quantization.layers</span> <span class="kn">import</span> <span class="p">(</span><span class="n">SmoothQuantAttention</span><span class="p">,</span> <span class="n">SmoothQuantGatedMLP</span><span class="p">,</span>
@@ -141,7 +173,7 @@
 
 <span class="k">def</span> <span class="nf">_smooth_quantize_gpt</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">quant_mode</span><span class="p">):</span>
     <span class="k">assert</span> <span class="n">quant_mode</span><span class="o">.</span><span class="n">has_act_and_weight_quant</span><span class="p">()</span>
-    <span class="k">for</span> <span class="n">layer</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">layers</span><span class="p">:</span>
+    <span class="k">for</span> <span class="n">layer_idx</span><span class="p">,</span> <span class="n">layer</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">layers</span><span class="p">):</span>
         <span class="k">assert</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">layer</span><span class="p">,</span>
                        <span class="s2">&quot;input_layernorm&quot;</span><span class="p">),</span> <span class="s2">&quot;The layer has no input_layernorm&quot;</span>
         <span class="n">layer</span><span class="o">.</span><span class="n">input_layernorm</span> <span class="o">=</span> <span class="n">SmoothQuantLayerNorm</span><span class="p">(</span>
@@ -150,7 +182,8 @@
             <span class="n">quant_mode</span><span class="o">=</span><span class="n">quant_mode</span><span class="p">)</span>
         <span class="k">assert</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">layer</span><span class="p">,</span> <span class="s2">&quot;attention&quot;</span><span class="p">),</span> <span class="s2">&quot;The layer has no attention&quot;</span>
         <span class="n">layer</span><span class="o">.</span><span class="n">attention</span> <span class="o">=</span> <span class="n">SmoothQuantAttention</span><span class="p">(</span>
-            <span class="n">layer</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+            <span class="n">layer_idx</span><span class="o">=</span><span class="n">layer_idx</span><span class="p">,</span>
+            <span class="n">hidden_size</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
             <span class="n">num_attention_heads</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">,</span>
             <span class="n">num_kv_heads</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">attention</span><span class="o">.</span><span class="n">num_attention_kv_heads</span> <span class="o">*</span> <span class="n">layer</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
             <span class="n">max_position_embeddings</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">,</span>
@@ -187,7 +220,7 @@
 
 <span class="k">def</span> <span class="nf">_smooth_quantize_llama</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">quant_mode</span><span class="p">):</span>
     <span class="k">assert</span> <span class="n">quant_mode</span><span class="o">.</span><span class="n">has_act_and_weight_quant</span><span class="p">()</span>
-    <span class="k">for</span> <span class="n">layer</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">layers</span><span class="p">:</span>
+    <span class="k">for</span> <span class="n">layer_idx</span><span class="p">,</span> <span class="n">layer</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">layers</span><span class="p">):</span>
         <span class="k">assert</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">layer</span><span class="p">,</span>
                        <span class="s2">&quot;input_layernorm&quot;</span><span class="p">),</span> <span class="s2">&quot;The layer has no input_layernorm&quot;</span>
         <span class="n">layer</span><span class="o">.</span><span class="n">input_layernorm</span> <span class="o">=</span> <span class="n">SmoothQuantRmsNorm</span><span class="p">(</span>
@@ -196,7 +229,8 @@
             <span class="n">quant_mode</span><span class="o">=</span><span class="n">quant_mode</span><span class="p">)</span>
         <span class="k">assert</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">layer</span><span class="p">,</span> <span class="s2">&quot;attention&quot;</span><span class="p">),</span> <span class="s2">&quot;The layer has no attention&quot;</span>
         <span class="n">layer</span><span class="o">.</span><span class="n">attention</span> <span class="o">=</span> <span class="n">SmoothQuantAttention</span><span class="p">(</span>
-            <span class="n">layer</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+            <span class="n">layer_idx</span><span class="o">=</span><span class="n">layer_idx</span><span class="p">,</span>
+            <span class="n">hidden_size</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
             <span class="n">num_attention_heads</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">,</span>
             <span class="n">num_kv_heads</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">num_kv_heads</span><span class="p">,</span>
             <span class="n">max_position_embeddings</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">,</span>
@@ -222,9 +256,8 @@
                                         <span class="n">tp_size</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
                                         <span class="n">quant_mode</span><span class="o">=</span><span class="n">quant_mode</span><span class="p">,</span>
                                         <span class="n">bias</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">mlp</span><span class="o">.</span><span class="n">fc</span><span class="o">.</span><span class="n">bias</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">)</span>
-        <span class="k">assert</span> <span class="nb">hasattr</span><span class="p">(</span>
-            <span class="n">layer</span><span class="p">,</span>
-            <span class="s2">&quot;post_layernorm&quot;</span><span class="p">),</span> <span class="s2">&quot;The layer has no post_rmspost_layernormnorm&quot;</span>
+        <span class="k">assert</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">layer</span><span class="p">,</span>
+                       <span class="s2">&quot;post_layernorm&quot;</span><span class="p">),</span> <span class="s2">&quot;The layer has no post_layernorm&quot;</span>
         <span class="n">layer</span><span class="o">.</span><span class="n">post_layernorm</span> <span class="o">=</span> <span class="n">SmoothQuantRmsNorm</span><span class="p">(</span>
             <span class="n">normalized_shape</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
             <span class="n">dtype</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
@@ -235,7 +268,7 @@
 
 <span class="k">def</span> <span class="nf">_smooth_quantize_bloom</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">quant_mode</span><span class="p">):</span>
     <span class="k">assert</span> <span class="n">quant_mode</span><span class="o">.</span><span class="n">has_act_and_weight_quant</span><span class="p">()</span>
-    <span class="k">for</span> <span class="n">layer</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">layers</span><span class="p">:</span>
+    <span class="k">for</span> <span class="n">layer_idx</span><span class="p">,</span> <span class="n">layer</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">layers</span><span class="p">):</span>
         <span class="k">assert</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">layer</span><span class="p">,</span>
                        <span class="s2">&quot;input_layernorm&quot;</span><span class="p">),</span> <span class="s2">&quot;The layer has no input_layernorm&quot;</span>
         <span class="n">layer</span><span class="o">.</span><span class="n">input_layernorm</span> <span class="o">=</span> <span class="n">SmoothQuantLayerNorm</span><span class="p">(</span>
@@ -244,7 +277,8 @@
             <span class="n">quant_mode</span><span class="o">=</span><span class="n">quant_mode</span><span class="p">)</span>
         <span class="k">assert</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">layer</span><span class="p">,</span> <span class="s2">&quot;attention&quot;</span><span class="p">),</span> <span class="s2">&quot;The layer has no attention&quot;</span>
         <span class="n">layer</span><span class="o">.</span><span class="n">attention</span> <span class="o">=</span> <span class="n">SmoothQuantAttention</span><span class="p">(</span>
-            <span class="n">layer</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+            <span class="n">layer_idx</span><span class="o">=</span><span class="n">layer_idx</span><span class="p">,</span>
+            <span class="n">hidden_size</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
             <span class="n">num_attention_heads</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">,</span>
             <span class="n">max_position_embeddings</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">,</span>
             <span class="n">num_layers</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">num_layers</span><span class="p">,</span>
@@ -264,9 +298,8 @@
                                    <span class="n">tp_group</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">tp_group</span><span class="p">,</span>
                                    <span class="n">tp_size</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
                                    <span class="n">quant_mode</span><span class="o">=</span><span class="n">quant_mode</span><span class="p">)</span>
-        <span class="k">assert</span> <span class="nb">hasattr</span><span class="p">(</span>
-            <span class="n">layer</span><span class="p">,</span>
-            <span class="s2">&quot;post_layernorm&quot;</span><span class="p">),</span> <span class="s2">&quot;The layer has no post_rmspost_layernormnorm&quot;</span>
+        <span class="k">assert</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">layer</span><span class="p">,</span>
+                       <span class="s2">&quot;post_layernorm&quot;</span><span class="p">),</span> <span class="s2">&quot;The layer has no post_layernorm&quot;</span>
         <span class="n">layer</span><span class="o">.</span><span class="n">post_layernorm</span> <span class="o">=</span> <span class="n">SmoothQuantLayerNorm</span><span class="p">(</span>
             <span class="n">normalized_shape</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
             <span class="n">dtype</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
@@ -278,7 +311,7 @@
 
 <span class="k">def</span> <span class="nf">_smooth_quantize_baichuan</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">quant_mode</span><span class="p">):</span>
     <span class="k">assert</span> <span class="n">quant_mode</span><span class="o">.</span><span class="n">has_act_and_weight_quant</span><span class="p">()</span>
-    <span class="k">for</span> <span class="n">layer</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">layers</span><span class="p">:</span>
+    <span class="k">for</span> <span class="n">layer_idx</span><span class="p">,</span> <span class="n">layer</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">layers</span><span class="p">):</span>
         <span class="k">assert</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">layer</span><span class="p">,</span>
                        <span class="s2">&quot;input_layernorm&quot;</span><span class="p">),</span> <span class="s2">&quot;The layer has no input_layernorm&quot;</span>
         <span class="n">layer</span><span class="o">.</span><span class="n">input_layernorm</span> <span class="o">=</span> <span class="n">SmoothQuantRmsNorm</span><span class="p">(</span>
@@ -287,7 +320,8 @@
             <span class="n">quant_mode</span><span class="o">=</span><span class="n">quant_mode</span><span class="p">)</span>
         <span class="k">assert</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">layer</span><span class="p">,</span> <span class="s2">&quot;attention&quot;</span><span class="p">),</span> <span class="s2">&quot;The layer has no attention&quot;</span>
         <span class="n">layer</span><span class="o">.</span><span class="n">attention</span> <span class="o">=</span> <span class="n">SmoothQuantAttention</span><span class="p">(</span>
-            <span class="n">layer</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+            <span class="n">layer_idx</span><span class="o">=</span><span class="n">layer_idx</span><span class="p">,</span>
+            <span class="n">hidden_size</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
             <span class="n">num_attention_heads</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">,</span>
             <span class="n">num_kv_heads</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">num_kv_heads</span><span class="p">,</span>
             <span class="n">max_position_embeddings</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">,</span>
@@ -314,9 +348,8 @@
                                         <span class="n">tp_size</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
                                         <span class="n">quant_mode</span><span class="o">=</span><span class="n">quant_mode</span><span class="p">,</span>
                                         <span class="n">bias</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">mlp</span><span class="o">.</span><span class="n">fc</span><span class="o">.</span><span class="n">bias</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">)</span>
-        <span class="k">assert</span> <span class="nb">hasattr</span><span class="p">(</span>
-            <span class="n">layer</span><span class="p">,</span>
-            <span class="s2">&quot;post_layernorm&quot;</span><span class="p">),</span> <span class="s2">&quot;The layer has no post_rmspost_layernormnorm&quot;</span>
+        <span class="k">assert</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">layer</span><span class="p">,</span>
+                       <span class="s2">&quot;post_layernorm&quot;</span><span class="p">),</span> <span class="s2">&quot;The layer has no post_layernorm&quot;</span>
         <span class="n">layer</span><span class="o">.</span><span class="n">post_layernorm</span> <span class="o">=</span> <span class="n">SmoothQuantRmsNorm</span><span class="p">(</span>
             <span class="n">normalized_shape</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
             <span class="n">dtype</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
@@ -327,7 +360,7 @@
 
 <span class="k">def</span> <span class="nf">_smooth_quantize_internlm</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">quant_mode</span><span class="p">):</span>
     <span class="k">assert</span> <span class="n">quant_mode</span><span class="o">.</span><span class="n">has_act_and_weight_quant</span><span class="p">()</span>
-    <span class="k">for</span> <span class="n">layer</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">layers</span><span class="p">:</span>
+    <span class="k">for</span> <span class="n">layer_idx</span><span class="p">,</span> <span class="n">layer</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">layers</span><span class="p">):</span>
         <span class="k">assert</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">layer</span><span class="p">,</span>
                        <span class="s2">&quot;input_layernorm&quot;</span><span class="p">),</span> <span class="s2">&quot;The layer has no input_layernorm&quot;</span>
         <span class="n">layer</span><span class="o">.</span><span class="n">input_layernorm</span> <span class="o">=</span> <span class="n">SmoothQuantRmsNorm</span><span class="p">(</span>
@@ -336,7 +369,8 @@
             <span class="n">quant_mode</span><span class="o">=</span><span class="n">quant_mode</span><span class="p">)</span>
         <span class="k">assert</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">layer</span><span class="p">,</span> <span class="s2">&quot;attention&quot;</span><span class="p">),</span> <span class="s2">&quot;The layer has no attention&quot;</span>
         <span class="n">layer</span><span class="o">.</span><span class="n">attention</span> <span class="o">=</span> <span class="n">SmoothQuantAttention</span><span class="p">(</span>
-            <span class="n">layer</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+            <span class="n">layer_idx</span><span class="o">=</span><span class="n">layer_idx</span><span class="p">,</span>
+            <span class="n">hidden_size</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
             <span class="n">num_attention_heads</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">,</span>
             <span class="n">num_kv_heads</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">num_kv_heads</span><span class="p">,</span>
             <span class="n">max_position_embeddings</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">,</span>
@@ -358,9 +392,8 @@
                                         <span class="n">tp_size</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
                                         <span class="n">quant_mode</span><span class="o">=</span><span class="n">quant_mode</span><span class="p">,</span>
                                         <span class="n">bias</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-        <span class="k">assert</span> <span class="nb">hasattr</span><span class="p">(</span>
-            <span class="n">layer</span><span class="p">,</span>
-            <span class="s2">&quot;post_layernorm&quot;</span><span class="p">),</span> <span class="s2">&quot;The layer has no post_rmspost_layernormnorm&quot;</span>
+        <span class="k">assert</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">layer</span><span class="p">,</span>
+                       <span class="s2">&quot;post_layernorm&quot;</span><span class="p">),</span> <span class="s2">&quot;The layer has no post_layernorm&quot;</span>
         <span class="n">layer</span><span class="o">.</span><span class="n">post_layernorm</span> <span class="o">=</span> <span class="n">SmoothQuantRmsNorm</span><span class="p">(</span>
             <span class="n">normalized_shape</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
             <span class="n">dtype</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
@@ -372,15 +405,16 @@
 
 <span class="k">def</span> <span class="nf">_smooth_quantize_qwen</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">quant_mode</span><span class="p">):</span>
     <span class="k">assert</span> <span class="n">quant_mode</span><span class="o">.</span><span class="n">has_act_and_weight_quant</span><span class="p">()</span>
-    <span class="k">for</span> <span class="n">layer</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">layers</span><span class="p">:</span>
+    <span class="k">for</span> <span class="n">layer_idx</span><span class="p">,</span> <span class="n">layer</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">layers</span><span class="p">):</span>
         <span class="k">assert</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">layer</span><span class="p">,</span> <span class="s2">&quot;ln_1&quot;</span><span class="p">),</span> <span class="s2">&quot;The layer has no ln_1&quot;</span>
         <span class="n">layer</span><span class="o">.</span><span class="n">ln_1</span> <span class="o">=</span> <span class="n">SmoothQuantRmsNorm</span><span class="p">(</span><span class="n">normalized_shape</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
                                         <span class="n">dtype</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
                                         <span class="n">quant_mode</span><span class="o">=</span><span class="n">quant_mode</span><span class="p">)</span>
         <span class="k">assert</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">layer</span><span class="p">,</span> <span class="s2">&quot;attention&quot;</span><span class="p">),</span> <span class="s2">&quot;The layer has no attention&quot;</span>
         <span class="n">layer</span><span class="o">.</span><span class="n">attention</span> <span class="o">=</span> <span class="n">SmoothQuantAttention</span><span class="p">(</span>
-            <span class="n">layer</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
-            <span class="n">layer</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">,</span>
+            <span class="n">layer_idx</span><span class="o">=</span><span class="n">layer_idx</span><span class="p">,</span>
+            <span class="n">hidden_size</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+            <span class="n">num_attention_heads</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">,</span>
             <span class="n">max_position_embeddings</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">,</span>
             <span class="n">num_layers</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">num_layers</span><span class="p">,</span>
             <span class="n">apply_query_key_layer_scaling</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">apply_query_key_layer_scaling</span><span class="p">,</span>
@@ -413,7 +447,7 @@
 
 <span class="k">def</span> <span class="nf">_smooth_quantize_chatglm</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">quant_mode</span><span class="p">):</span>
     <span class="k">assert</span> <span class="n">quant_mode</span><span class="o">.</span><span class="n">has_act_and_weight_quant</span><span class="p">()</span>
-    <span class="k">for</span> <span class="n">layer</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">layers</span><span class="p">:</span>
+    <span class="k">for</span> <span class="n">layer_idx</span><span class="p">,</span> <span class="n">layer</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">layers</span><span class="p">):</span>
         <span class="k">assert</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">layer</span><span class="p">,</span>
                        <span class="s2">&quot;input_layernorm&quot;</span><span class="p">),</span> <span class="s2">&quot;The layer has no input_layernorm&quot;</span>
         <span class="n">layer</span><span class="o">.</span><span class="n">input_layernorm</span> <span class="o">=</span> <span class="n">SmoothQuantRmsNorm</span><span class="p">(</span>
@@ -423,6 +457,7 @@
         <span class="p">)</span>
         <span class="k">assert</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">layer</span><span class="p">,</span> <span class="s2">&quot;attention&quot;</span><span class="p">),</span> <span class="s2">&quot;The layer has no attention&quot;</span>
         <span class="n">layer</span><span class="o">.</span><span class="n">attention</span> <span class="o">=</span> <span class="n">SmoothQuantAttention</span><span class="p">(</span>
+            <span class="n">layer_idx</span><span class="o">=</span><span class="n">layer_idx</span><span class="p">,</span>
             <span class="n">hidden_size</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
             <span class="n">num_attention_heads</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">num_heads</span><span class="p">,</span>
             <span class="n">num_kv_heads</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">num_kv_heads</span><span class="p">,</span>
@@ -462,13 +497,13 @@
 
 <span class="k">def</span> <span class="nf">_smooth_quantize</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">quant_mode</span><span class="p">):</span>
     <span class="kn">from</span> <span class="nn">...models</span> <span class="kn">import</span> <span class="p">(</span><span class="n">BaichuanForCausalLM</span><span class="p">,</span> <span class="n">BloomForCausalLM</span><span class="p">,</span>
-                           <span class="n">ChatGLMForCausalLM</span><span class="p">,</span> <span class="n">GPTLMHeadModel</span><span class="p">,</span> <span class="n">LLaMAForCausalLM</span><span class="p">,</span>
+                           <span class="n">ChatGLMForCausalLM</span><span class="p">,</span> <span class="n">GPTForCausalLM</span><span class="p">,</span> <span class="n">LLaMAForCausalLM</span><span class="p">,</span>
                            <span class="n">QWenForCausalLM</span><span class="p">)</span>
-    <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">GPTLMHeadModel</span><span class="p">)</span> <span class="ow">or</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">LLaMAForCausalLM</span><span class="p">)</span> \
+    <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">GPTForCausalLM</span><span class="p">)</span> <span class="ow">or</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">LLaMAForCausalLM</span><span class="p">)</span> \
             <span class="ow">or</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">BloomForCausalLM</span><span class="p">)</span> <span class="ow">or</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">BaichuanForCausalLM</span><span class="p">)</span> \
             <span class="ow">or</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">QWenForCausalLM</span><span class="p">)</span> <span class="ow">or</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">ChatGLMForCausalLM</span><span class="p">),</span> \
-            <span class="s2">&quot;Only GPTLMHeadModel, LLaMAForCausalLM BloomForCausalLM and BaichuanForCausalLM are well tested now&quot;</span>
-    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">GPTLMHeadModel</span><span class="p">):</span>
+            <span class="s2">&quot;Only GPTForCausalLM, LLaMAForCausalLM BloomForCausalLM and BaichuanForCausalLM are well tested now&quot;</span>
+    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">GPTForCausalLM</span><span class="p">):</span>
         <span class="k">return</span> <span class="n">_smooth_quantize_gpt</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">quant_mode</span><span class="p">)</span>
     <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">LLaMAForCausalLM</span><span class="p">):</span>
         <span class="k">return</span> <span class="n">_smooth_quantize_llama</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">quant_mode</span><span class="p">)</span>
@@ -489,6 +524,7 @@
                                     <span class="n">group_size</span><span class="o">=</span><span class="mi">128</span><span class="p">,</span>
                                     <span class="n">pre_quant_scale</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                                     <span class="n">zero</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                                    <span class="n">weight_only_precision</span><span class="o">=</span><span class="s2">&quot;int4_awq&quot;</span><span class="p">,</span>
                                     <span class="n">exclude_modules</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                                     <span class="n">current_key_name</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
     <span class="n">exclude_modules</span> <span class="o">=</span> <span class="p">[</span><span class="s1">&#39;lm_head&#39;</span>
@@ -502,6 +538,7 @@
         <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="nb">list</span><span class="p">(</span><span class="n">module</span><span class="o">.</span><span class="n">children</span><span class="p">()))</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
             <span class="n">_weight_only_groupwise_quantize</span><span class="p">(</span><span class="n">module</span><span class="p">,</span> <span class="n">quant_mode</span><span class="p">,</span> <span class="n">group_size</span><span class="p">,</span>
                                             <span class="n">pre_quant_scale</span><span class="p">,</span> <span class="n">zero</span><span class="p">,</span>
+                                            <span class="n">weight_only_precision</span><span class="p">,</span>
                                             <span class="n">exclude_modules</span><span class="p">,</span> <span class="n">current_key_name</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">module</span><span class="p">,</span> <span class="n">ColumnLinear</span><span class="p">)</span> <span class="ow">and</span> <span class="n">name</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">exclude_modules</span><span class="p">:</span>
@@ -514,6 +551,7 @@
                     <span class="n">pre_quant_scale</span><span class="o">=</span><span class="n">pre_quant_scale</span><span class="p">,</span>
                     <span class="n">zero</span><span class="o">=</span><span class="n">zero</span><span class="p">,</span>
                     <span class="n">bias</span><span class="o">=</span><span class="n">module</span><span class="o">.</span><span class="n">bias</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span>
+                    <span class="n">use_w4a8_awq</span><span class="o">=</span><span class="n">weight_only_precision</span> <span class="o">==</span> <span class="s1">&#39;w4a8_awq&#39;</span><span class="p">,</span>
                     <span class="n">dtype</span><span class="o">=</span><span class="n">module</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
                     <span class="n">tp_group</span><span class="o">=</span><span class="n">module</span><span class="o">.</span><span class="n">tp_group</span><span class="p">,</span>
                     <span class="n">tp_size</span><span class="o">=</span><span class="n">module</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
@@ -528,6 +566,7 @@
                     <span class="n">pre_quant_scale</span><span class="o">=</span><span class="n">pre_quant_scale</span><span class="p">,</span>
                     <span class="n">zero</span><span class="o">=</span><span class="n">zero</span><span class="p">,</span>
                     <span class="n">bias</span><span class="o">=</span><span class="n">module</span><span class="o">.</span><span class="n">bias</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span>
+                    <span class="n">use_w4a8_awq</span><span class="o">=</span><span class="n">weight_only_precision</span> <span class="o">==</span> <span class="s1">&#39;w4a8_awq&#39;</span><span class="p">,</span>
                     <span class="n">dtype</span><span class="o">=</span><span class="n">module</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
                     <span class="n">tp_group</span><span class="o">=</span><span class="n">module</span><span class="o">.</span><span class="n">tp_group</span><span class="p">,</span>
                     <span class="n">tp_size</span><span class="o">=</span><span class="n">module</span><span class="o">.</span><span class="n">tp_size</span><span class="p">)</span>
@@ -544,7 +583,10 @@
         <span class="k">if</span> <span class="n">quant_mode</span><span class="o">.</span><span class="n">has_per_group_scaling</span><span class="p">():</span>
             <span class="n">model</span> <span class="o">=</span> <span class="n">_weight_only_groupwise_quantize</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">quant_mode</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
-            <span class="n">model</span> <span class="o">=</span> <span class="n">weight_only_quantize</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">quant_mode</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+            <span class="n">quant_algo</span> <span class="o">=</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A16</span> <span class="k">if</span> <span class="n">quant_mode</span><span class="o">.</span><span class="n">is_int4_weight_only</span><span class="p">(</span>
+            <span class="p">)</span> <span class="k">else</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W8A16</span>
+            <span class="n">model</span> <span class="o">=</span> <span class="n">weight_only_quantize</span><span class="p">(</span>
+                <span class="n">model</span><span class="p">,</span> <span class="n">dataclasses</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="n">QuantConfig</span><span class="p">(</span><span class="n">quant_algo</span><span class="p">),</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">))</span>
     <span class="k">elif</span> <span class="n">quant_mode</span><span class="o">.</span><span class="n">has_fp8_qdq</span><span class="p">()</span> <span class="ow">or</span> <span class="n">quant_mode</span><span class="o">.</span><span class="n">has_fp8_kv_cache</span><span class="p">():</span>
         <span class="n">model</span> <span class="o">=</span> <span class="n">_fp8_quantize</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">quant_mode</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
     <span class="k">elif</span> <span class="n">quant_mode</span><span class="o">.</span><span class="n">has_act_and_weight_quant</span><span class="p">():</span>
@@ -640,8 +682,8 @@
 
 <span class="k">def</span> <span class="nf">_fp8_quantize</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">quant_mode</span><span class="p">:</span> <span class="n">QuantMode</span><span class="p">,</span> <span class="n">quant_scales</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
     <span class="kn">from</span> <span class="nn">...models</span> <span class="kn">import</span> <span class="p">(</span><span class="n">BaichuanForCausalLM</span><span class="p">,</span> <span class="n">FalconForCausalLM</span><span class="p">,</span>
-                           <span class="n">GPTJForCausalLM</span><span class="p">,</span> <span class="n">GPTLMHeadModel</span><span class="p">,</span> <span class="n">LLaMAForCausalLM</span><span class="p">)</span>
-    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="p">(</span><span class="n">FalconForCausalLM</span><span class="p">,</span> <span class="n">GPTJForCausalLM</span><span class="p">,</span> <span class="n">GPTLMHeadModel</span><span class="p">,</span>
+                           <span class="n">GPTForCausalLM</span><span class="p">,</span> <span class="n">GPTJForCausalLM</span><span class="p">,</span> <span class="n">LLaMAForCausalLM</span><span class="p">)</span>
+    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="p">(</span><span class="n">FalconForCausalLM</span><span class="p">,</span> <span class="n">GPTJForCausalLM</span><span class="p">,</span> <span class="n">GPTForCausalLM</span><span class="p">,</span>
                           <span class="n">LLaMAForCausalLM</span><span class="p">,</span> <span class="n">BaichuanForCausalLM</span><span class="p">)):</span>
         <span class="k">return</span> <span class="n">_default_fp8_quantize</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">quant_mode</span><span class="p">,</span> <span class="n">quant_scales</span><span class="p">)</span>
     <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span>

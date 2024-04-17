@@ -41,24 +41,56 @@
   </form>
 </div>
         </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
-              <p class="caption" role="heading"><span class="caption-text">Contents:</span></p>
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
 <ul>
-<li class="toctree-l1"><a class="reference internal" href="../../../architecture.html">TensorRT-LLM Architecture</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../gpt_runtime.html">C++ GPT Runtime</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../batch_manager.html">The Batch Manager in TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../inference_request.html">Inference Request</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../gpt_attention.html">Multi-head, Multi-query and Group-query Attention</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../precision.html">Numerical Precision</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../build_from_source.html">Build from Source</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../performance.html">Performance of TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../2023-05-19-how-to-debug.html">How to debug</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../2023-05-17-how-to-add-a-new-model.html">How to add a new model</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../graph-rewriting.html">Graph Rewriting Module</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../memory.html">Memory Usage of TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../new_workflow.html">New Workflow</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../perf_best_practices.html">Best Practices for Tuning the Performance of TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../performance_analysis.html">Performance Analysis of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../release-notes.html">Release Notes</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../installation/windows.html">Installing on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/core-concepts.html">Model Definition</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/core-concepts.html#compilation">Compilation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/core-concepts.html#runtime">Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/core-concepts.html#multi-gpu-and-multi-node-support">Multi-GPU and Multi-Node Support</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/inference-request.html">Inference Request</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-best-practices.html">Best Practices for Tuning the Performance of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Python API</span></p>
 <ul>
@@ -69,16 +101,13 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
 </ul>
-<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="../../../_cpp_gen/runtime.html">Runtime</a></li>
-</ul>
 <p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
 </ul>
 
         </div>
@@ -313,7 +342,7 @@
 
     <span class="k">def</span> <span class="nf">get_pointer_array</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">pool_idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">beam_width</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">        Returns array of [batch size, beam_width, 2, max_blocks_per_seq] of poitners</span>
+<span class="sd">        Returns array of [batch size, beam_width, 2, max_blocks_per_seq] of pointers</span>
 <span class="sd">        to the allocated blocks in memory pool</span>
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="k">assert</span> <span class="p">(</span><span class="n">beam_width</span> <span class="o">&lt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">beam_width</span><span class="p">)</span>
@@ -341,21 +370,21 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">pointer_array</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">pointer_array</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int64</span><span class="p">)</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">pointer_array</span>
 
-    <span class="k">def</span> <span class="nf">get_continous_caches</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">pool_idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">get_continuous_caches</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">pool_idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">        Returns countinous KV caches.</span>
+<span class="sd">        Returns continuous KV caches.</span>
 <span class="sd">        Used only for debug purposes.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">beam_width</span> <span class="o">==</span> <span class="mi">1</span>
 
         <span class="n">elts_per_block</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">elts_per_blocks</span><span class="p">[</span><span class="n">pool_idx</span><span class="p">]</span>
         <span class="n">pool</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">memory_pools</span><span class="p">[</span><span class="n">pool_idx</span><span class="p">]</span><span class="o">.</span><span class="n">flatten</span><span class="p">()</span>
-        <span class="n">continous_kv_cache</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">allocated_blocks</span><span class="p">),</span>
-                                         <span class="mi">2</span><span class="p">,</span>
-                                         <span class="bp">self</span><span class="o">.</span><span class="n">max_blocks_per_seq</span> <span class="o">*</span>
-                                         <span class="n">elts_per_block</span><span class="p">,</span>
-                                         <span class="n">dtype</span><span class="o">=</span><span class="n">pool</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
-                                         <span class="n">device</span><span class="o">=</span><span class="s2">&quot;cuda&quot;</span><span class="p">)</span>
+        <span class="n">continuous_kv_cache</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">allocated_blocks</span><span class="p">),</span>
+                                          <span class="mi">2</span><span class="p">,</span>
+                                          <span class="bp">self</span><span class="o">.</span><span class="n">max_blocks_per_seq</span> <span class="o">*</span>
+                                          <span class="n">elts_per_block</span><span class="p">,</span>
+                                          <span class="n">dtype</span><span class="o">=</span><span class="n">pool</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
+                                          <span class="n">device</span><span class="o">=</span><span class="s2">&quot;cuda&quot;</span><span class="p">)</span>
         <span class="k">for</span> <span class="n">owner</span><span class="p">,</span> <span class="n">beam_blocks</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">allocated_blocks</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
             <span class="k">for</span> <span class="n">bi</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">beam_width</span><span class="p">):</span>
                 <span class="k">for</span> <span class="n">block_linear_idx</span><span class="p">,</span> <span class="n">block</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">beam_blocks</span><span class="p">[</span><span class="n">bi</span><span class="p">]):</span>
@@ -368,14 +397,14 @@
                     <span class="c1"># The first index in the pool for V.</span>
                     <span class="n">v_start</span> <span class="o">=</span> <span class="n">k_start</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">blocks</span> <span class="o">*</span> <span class="n">elts_per_block</span>
 
-                    <span class="n">continous_kv_cache</span><span class="p">[</span><span class="n">batch_idx</span><span class="p">][</span><span class="mi">0</span><span class="p">][</span>
+                    <span class="n">continuous_kv_cache</span><span class="p">[</span><span class="n">batch_idx</span><span class="p">][</span><span class="mi">0</span><span class="p">][</span>
                         <span class="n">block_offset</span><span class="p">:</span><span class="n">block_offset</span> <span class="o">+</span>
                         <span class="n">elts_per_block</span><span class="p">]</span> <span class="o">=</span> <span class="n">pool</span><span class="p">[</span><span class="n">k_start</span><span class="p">:</span><span class="n">k_start</span> <span class="o">+</span> <span class="n">elts_per_block</span><span class="p">]</span>
-                    <span class="n">continous_kv_cache</span><span class="p">[</span><span class="n">batch_idx</span><span class="p">][</span><span class="mi">1</span><span class="p">][</span>
+                    <span class="n">continuous_kv_cache</span><span class="p">[</span><span class="n">batch_idx</span><span class="p">][</span><span class="mi">1</span><span class="p">][</span>
                         <span class="n">block_offset</span><span class="p">:</span><span class="n">block_offset</span> <span class="o">+</span>
                         <span class="n">elts_per_block</span><span class="p">]</span> <span class="o">=</span> <span class="n">pool</span><span class="p">[</span><span class="n">v_start</span><span class="p">:</span><span class="n">v_start</span> <span class="o">+</span> <span class="n">elts_per_block</span><span class="p">]</span>
 
-        <span class="k">return</span> <span class="n">continous_kv_cache</span>
+        <span class="k">return</span> <span class="n">continuous_kv_cache</span>
 
 
 <div class="viewcode-block" id="KVCacheManager">
@@ -499,9 +528,9 @@
                 <span class="n">sequence</span><span class="p">,</span> <span class="n">share_across_beam</span><span class="o">=</span><span class="n">i</span> <span class="o">!=</span> <span class="n">unshared_block_idx</span><span class="p">)</span></div>
 
 
-<div class="viewcode-block" id="KVCacheManager.get_pointer_arrays">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.KVCacheManager.get_pointer_arrays">[docs]</a>
-    <span class="k">def</span> <span class="nf">get_pointer_arrays</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">beam_width</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]:</span>
+<div class="viewcode-block" id="KVCacheManager.get_block_pointers">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.KVCacheManager.get_block_pointers">[docs]</a>
+    <span class="k">def</span> <span class="nf">get_block_pointers</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">beam_width</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">        Returns arrays of pointers for all memory pools</span>
 <span class="sd">        &quot;&quot;&quot;</span>
@@ -510,7 +539,8 @@
             <span class="n">pointer_arrays</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">blocks_manager</span><span class="o">.</span><span class="n">get_pointer_array</span><span class="p">(</span>
                     <span class="n">pool</span><span class="p">,</span> <span class="n">beam_width</span><span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int64</span><span class="p">))</span>
-        <span class="k">return</span> <span class="n">pointer_arrays</span></div>
+
+        <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">(</span><span class="n">pointer_arrays</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span></div>
 </div>
 
 
@@ -546,13 +576,17 @@
     <span class="k">def</span> <span class="nf">update</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">accepted_draft_token_offsets</span><span class="p">,</span>
                <span class="n">packed_accepted_draft_tokens_indices</span><span class="p">,</span> <span class="n">sequence_length_buffer</span><span class="p">,</span>
                <span class="n">rewind_tokens</span><span class="p">):</span>
+        <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">rewind_tokens</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="ow">or</span> <span class="nb">isinstance</span><span class="p">(</span>
+            <span class="n">rewind_tokens</span><span class="p">,</span> <span class="nb">int</span><span class="p">)</span>
+        <span class="n">rewind_tokens_tensor</span> <span class="o">=</span> <span class="n">rewind_tokens</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span>
+            <span class="n">rewind_tokens</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="k">else</span> <span class="kc">None</span>
+        <span class="n">rewind_tokens_count</span> <span class="o">=</span> <span class="n">rewind_tokens</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">rewind_tokens</span><span class="p">,</span>
+                                                          <span class="nb">int</span><span class="p">)</span> <span class="k">else</span> <span class="mi">0</span>
         <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_paged_kv_cache</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_paged_kv_cache</span><span class="p">:</span>
-            <span class="n">host_kv_cache_block_pointers</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_manager</span><span class="o">.</span><span class="n">get_pointer_arrays</span><span class="p">(</span>
+            <span class="n">host_kv_cache_block_pointers</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_manager</span><span class="o">.</span><span class="n">get_block_pointers</span><span class="p">(</span>
                 <span class="mi">1</span><span class="p">)</span>
-            <span class="n">kv_cache_block_pointers</span> <span class="o">=</span> <span class="p">[</span>
-                <span class="n">x</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="s1">&#39;cuda&#39;</span><span class="p">)</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">host_kv_cache_block_pointers</span>
-            <span class="p">]</span>
+            <span class="n">kv_cache_block_pointers</span> <span class="o">=</span> <span class="n">host_kv_cache_block_pointers</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="s1">&#39;cuda&#39;</span><span class="p">)</span>
             <span class="n">torch</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">tensorrt_llm</span><span class="o">.</span><span class="n">update_kv_cache_draft_token_location</span><span class="p">(</span>
                 <span class="n">accepted_draft_token_offsets</span><span class="p">,</span>
                 <span class="n">packed_accepted_draft_tokens_indices</span><span class="p">,</span>
@@ -560,8 +594,9 @@
                 <span class="kc">True</span><span class="p">,</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">num_kv_heads</span><span class="p">,</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">head_dim</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">elt_size</span><span class="p">,</span>
-                <span class="n">rewind_tokens</span><span class="p">,</span>
+                <span class="n">rewind_tokens_count</span><span class="p">,</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_manager</span><span class="o">.</span><span class="n">max_attention_window_size</span><span class="p">,</span>
+                <span class="n">rewind_tokens_tensor</span><span class="p">,</span>
                 <span class="kc">None</span><span class="p">,</span>
                 <span class="n">kv_cache_block_pointers</span><span class="p">,</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_manager</span><span class="o">.</span><span class="n">blocks_manager</span><span class="o">.</span><span class="n">max_blocks_per_seq</span><span class="p">,</span>
@@ -576,8 +611,9 @@
                 <span class="kc">False</span><span class="p">,</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">num_kv_heads</span><span class="p">,</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">head_dim</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">elt_size</span><span class="p">,</span>
-                <span class="n">rewind_tokens</span><span class="p">,</span>
+                <span class="n">rewind_tokens_count</span><span class="p">,</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">max_kv_cache_length</span><span class="p">,</span>
+                <span class="n">rewind_tokens_tensor</span><span class="p">,</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">past_key_value_list</span><span class="p">,</span>
                 <span class="kc">None</span><span class="p">,</span>
                 <span class="kc">None</span><span class="p">,</span>
