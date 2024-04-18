@@ -33,6 +33,9 @@ tensorrt_llm/libs
 tensorrt_llm/bindings.pyi
 tensorrt_llm/bindings/*.pyi
 
+# Debugging Purpose
+.env
+
 # Testing
 .coverage.*
 results_trt/

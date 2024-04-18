@@ -88,6 +88,7 @@ def main(args):
     dataset = load_dataset(dataset_name,
                            dataset_revision,
                            cache_dir=args.dataset_path,
+                           trust_remote_code=True,
                            split=dataset_split)
 
     max_batch_size = args.batch_size
@@ -363,7 +364,7 @@ def main(args):
                 max_output_len=output_len,
                 max_beam_width=num_beams,
                 max_attention_window_size=max_attention_window_size,
-                free_gpu_memory_fraction=0.75,
+                free_gpu_memory_fraction=0.6,
                 sink_token_length=sink_token_length)
         runner = runner_cls.from_dir(**runner_kwargs)
         assert not (args.eval_ppl and not (runner.gather_context_logits and runner.gather_generation_logits)), \
