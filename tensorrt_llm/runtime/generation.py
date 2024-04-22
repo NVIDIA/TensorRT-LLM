@@ -3067,7 +3067,7 @@ class GenerationSession(object):
             stop_words_list_ptrs = torch.zeros((batch_size), dtype=torch.int64)
             for bi in range(batch_size):
                 stop_words_list_ptrs[bi] = stop_words_list.data_ptr(
-                ) + bi * 2 * max_stop_words_len
+                ) + bi * 2 * max_stop_words_len * stop_words_list.element_size()
             stop_words_list_ptrs = stop_words_list_ptrs.to('cuda')
         stop_words_data = (stop_words_list_ptrs, stop_words_lens,
                            max_stop_words_len)
@@ -3083,7 +3083,7 @@ class GenerationSession(object):
             bad_words_list_ptrs = torch.zeros((batch_size), dtype=torch.int64)
             for bi in range(batch_size):
                 bad_words_list_ptrs[bi] = bad_words_list.data_ptr(
-                ) + bi * 2 * max_bad_words_len
+                ) + bi * 2 * max_bad_words_len * bad_words_list.element_size()
             bad_words_list_ptrs = bad_words_list_ptrs.to('cuda')
         bad_words_data = (bad_words_list_ptrs, bad_words_lens,
                           max_bad_words_len)
