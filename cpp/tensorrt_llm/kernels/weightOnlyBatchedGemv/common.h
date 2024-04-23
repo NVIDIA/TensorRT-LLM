@@ -24,6 +24,10 @@
 #include <cuda_runtime_api.h>
 #include <iostream>
 
+#ifdef __CUDACC__
+#include <cooperative_groups/memcpy_async.h>
+#endif
+
 namespace tensorrt_llm
 {
 namespace kernels
