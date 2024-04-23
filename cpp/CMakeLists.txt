@@ -273,6 +273,16 @@ if(FAST_MATH)
   message("CMAKE_CUDA_FLAGS: ${CMAKE_CUDA_FLAGS}")
 endif()
 
+# Add the option with CMAKE_CUDA_FLAGS causes error.
+if(${CMAKE_BUILD_TYPE} MATCHES "Debug")
+  add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:-G>"
+                      "$<$<COMPILE_LANGUAGE:CUDA>:--host-linker-script>")
+elseif(${CMAKE_BUILD_TYPE} MATCHES "RelWithDebInfo")
+  add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>"
+                      "$<$<COMPILE_LANGUAGE:CUDA>:--host-linker-script>")
+endif()
+
+
 set(COMMON_HEADER_DIRS ${PROJECT_SOURCE_DIR} ${CUDAToolkit_INCLUDE_DIR})
 message(STATUS "COMMON_HEADER_DIRS: ${COMMON_HEADER_DIRS}")
 
@@ -324,6 +334,10 @@ if(BUILD_PYT)
   message(STATUS "Found Python libraries at ${Python3_LIBRARY_DIRS}")
   link_directories("${Python3_LIBRARY_DIRS}")
   list(APPEND COMMON_HEADER_DIRS ${Python3_INCLUDE_DIRS})
+
+  # Let torch find the cudnn and cusparselt libraries
+  set(CAFFE2_USE_CUDNN ON)
+  set(CAFFE2_USE_CUSPARSELT ON)
 
   execute_process(
     COMMAND

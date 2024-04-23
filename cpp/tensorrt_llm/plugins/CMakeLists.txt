@@ -101,7 +101,7 @@ else()
     ${PLUGIN_SHARED_TARGET}
     PROPERTIES
       LINK_FLAGS
-      "-Wl,--exclude-libs,ALL -Wl,--version-script=${PLUGIN_EXPORT_MAP} -Wl,-rpath,'$ORIGIN' ${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}"
+      "-Wl,--no-relax -Wl,--exclude-libs,ALL -Wl,--version-script=${PLUGIN_EXPORT_MAP} -Wl,-rpath,'$ORIGIN' ${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}"
   )
 endif()
 
