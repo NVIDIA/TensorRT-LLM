@@ -127,3 +127,7 @@ class ContextManager:
 
     def __exit__(self, exc_type, exc_value, traceback):
         return self.resource.__exit__(exc_type, exc_value, traceback)
+
+
+def is_directory_empty(directory: Path) -> bool:
+    return not any(directory.iterdir())

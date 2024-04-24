@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/executor/executor.h"
+#include "tensorrt_llm/layers/defaultDecodingParams.h"
 #include "tensorrt_llm/runtime/common.h"
 
 #include <functional>
@@ -36,25 +37,21 @@ private:
 
     template <typename T>
     static OptVec<T> fuseValues(
-        std::vector<SamplingConfig> const& configs, std::function<OptVec<T>(SizeType ci)> accessor)
+        std::vector<SamplingConfig> const& configs, std::function<OptVec<T>(size_t ci)> accessor, T defaultValue)
     {
         std::vector<T> values;
-        auto const hasValues = accessor(0).has_value();
         for (size_t ci = 0; ci < configs.size(); ++ci)
         {
+            auto value = defaultValue;
             auto const& configValue = accessor(ci);
-            TLLM_CHECK(hasValues == configValue.has_value());
-            if (hasValues)
+            if (configValue.has_value())
             {
                 TLLM_CHECK(configValue.value().size() == 1);
-                values.push_back(configValue.value().front());
+                value = configValue.value().front();
             }
+            values.push_back(value);
         }
 
-        if (!hasValues)
-        {
-            return std::nullopt;
-        }
         return std::make_optional<std::vector<T>>(values);
     }
 
@@ -72,26 +69,52 @@ public:
         TLLM_CHECK(configs.size() > 0);
         beamWidth = configs.front().beamWidth;
         normalizeLogProbs = configs.front().normalizeLogProbs;
-        temperature = fuseValues<FloatType>(configs, [&configs](SizeType ci) { return configs[ci].temperature; });
-        minLength = fuseValues<SizeType>(configs, [&configs](SizeType ci) { return configs[ci].minLength; });
-        repetitionPenalty
-            = fuseValues<FloatType>(configs, [&configs](SizeType ci) { return configs[ci].repetitionPenalty; });
-        presencePenalty
-            = fuseValues<FloatType>(configs, [&configs](SizeType ci) { return configs[ci].presencePenalty; });
-        topK = fuseValues<SizeType>(configs, [&configs](SizeType ci) { return configs[ci].topK; });
-        topP = fuseValues<FloatType>(configs, [&configs](SizeType ci) { return configs[ci].topP; });
-        randomSeed = fuseValues<uint64_t>(configs, [&configs](SizeType ci) { return configs[ci].randomSeed; });
-        topPDecay = fuseValues<FloatType>(configs, [&configs](SizeType ci) { return configs[ci].topPDecay; });
-        topPMin = fuseValues<FloatType>(configs, [&configs](SizeType ci) { return configs[ci].topPMin; });
-        topPResetIds = fuseValues<SizeType>(configs, [&configs](SizeType ci) { return configs[ci].topPResetIds; });
-        beamSearchDiversityRate
-            = fuseValues<FloatType>(configs, [&configs](SizeType ci) { return configs[ci].beamSearchDiversityRate; });
-        lengthPenalty = fuseValues<FloatType>(configs, [&configs](SizeType ci) { return configs[ci].lengthPenalty; });
-        earlyStopping = fuseValues<SizeType>(configs, [&configs](SizeType ci) { return configs[ci].earlyStopping; });
-        draftAcceptanceThreshold
-            = fuseValues<FloatType>(configs, [&configs](SizeType ci) { return configs[ci].draftAcceptanceThreshold; });
-        topKMedusaHeads = fuseValues<std::vector<runtime::SizeType>>(
-            configs, [&configs](SizeType ci) { return configs[ci].topKMedusaHeads; });
+        temperature = fuseValues<FloatType>(
+            configs, [&configs](size_t ci) { return configs[ci].temperature; },
+            layers::DefaultDecodingParams::getTemperature());
+        minLength = fuseValues<SizeType32>(
+            configs, [&configs](size_t ci) { return configs[ci].minLength; },
+            layers::DefaultDecodingParams::getMinLength());
+        repetitionPenalty = fuseValues<FloatType>(
+            configs, [&configs](size_t ci) { return configs[ci].repetitionPenalty; },
+            layers::DefaultDecodingParams::getRepetitionPenalty());
+        presencePenalty = fuseValues<FloatType>(
+            configs, [&configs](size_t ci) { return configs[ci].presencePenalty; },
+            layers::DefaultDecodingParams::getPresencePenalty());
+        frequencyPenalty = fuseValues<FloatType>(
+            configs, [&configs](size_t ci) { return configs[ci].frequencyPenalty; },
+            layers::DefaultDecodingParams::getFrequencyPenalty());
+        topK = fuseValues<SizeType32>(
+            configs, [&configs](size_t ci) { return configs[ci].topK; }, layers::DefaultDecodingParams::getTopK());
+        topP = fuseValues<FloatType>(
+            configs, [&configs](size_t ci) { return configs[ci].topP; }, layers::DefaultDecodingParams::getTopP());
+        randomSeed = fuseValues<uint64_t>(
+            configs, [&configs](size_t ci) { return configs[ci].randomSeed; },
+            layers::DefaultDecodingParams::getSeed());
+        topPDecay = fuseValues<FloatType>(
+            configs, [&configs](size_t ci) { return configs[ci].topPDecay; },
+            layers::DefaultDecodingParams::getTopPDecay());
+        topPMin = fuseValues<FloatType>(
+            configs, [&configs](size_t ci) { return configs[ci].topPMin; },
+            layers::DefaultDecodingParams::getTopPMin());
+        topPResetIds = fuseValues<TokenIdType>(
+            configs, [&configs](size_t ci) { return configs[ci].topPResetIds; },
+            layers::DefaultDecodingParams::getTopPResetId());
+        beamSearchDiversityRate = fuseValues<FloatType>(
+            configs, [&configs](size_t ci) { return configs[ci].beamSearchDiversityRate; },
+            layers::DefaultDecodingParams::getBeamSearchDiversity());
+        lengthPenalty = fuseValues<FloatType>(
+            configs, [&configs](size_t ci) { return configs[ci].lengthPenalty; },
+            layers::DefaultDecodingParams::getLengthPenalty());
+        earlyStopping = fuseValues<SizeType32>(
+            configs, [&configs](size_t ci) { return configs[ci].earlyStopping; },
+            layers::DefaultDecodingParams::getEarlyStopping());
+        topKMedusaHeads = fuseValues<std::vector<SizeType32>>(
+            configs, [&configs](size_t ci) { return configs[ci].topKMedusaHeads; },
+            layers::DefaultDecodingParams::getTopKMedusaHeads());
+        // Only used for tests.
+        draftAcceptanceThreshold = fuseValues<FloatType>(
+            configs, [&configs](size_t ci) { return configs[ci].draftAcceptanceThreshold; }, 0);
     }
 
     explicit SamplingConfig(executor::SamplingConfig const& samplingConfig,
@@ -148,13 +171,13 @@ public:
     // beam search layer
     OptVec<FloatType> beamSearchDiversityRate; // [1] or [batch_size]
     OptVec<FloatType> lengthPenalty;           // [1] or [batch_size]
-    OptVec<SizeType> earlyStopping;            // [1] or [batch_size]
+    OptVec<SizeType32> earlyStopping;          // [1] or [batch_size]
 
     // speculative decoding, only the first value is used (in gptDecoderBatch.cpp)
     OptVec<FloatType> draftAcceptanceThreshold; // [1] or [batch_size]
 
     // medusa params
-    OptVec<std::vector<runtime::SizeType>> topKMedusaHeads; // [batchSize, maxMedusaHeads]
+    OptVec<std::vector<runtime::SizeType32>> topKMedusaHeads; // [batchSize, maxMedusaHeads]
 
     std::optional<bool> normalizeLogProbs;
 

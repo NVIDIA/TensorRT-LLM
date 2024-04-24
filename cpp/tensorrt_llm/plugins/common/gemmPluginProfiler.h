@@ -288,6 +288,8 @@ private:
 
     char* mWorkspaceTmp{nullptr};
 
+    cudaStream_t mStream;
+
     GemmDims mDims{};
 
     bool mSkip{false};

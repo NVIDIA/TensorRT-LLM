@@ -426,6 +426,22 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
     run_command(trt_model_test, cwd=tests_dir, env=cpp_env,
                 timeout=timeout)  # expecting ~ 1200s
 
+    #Executor test in leader mode
+    new_env = cpp_env
+    new_env["RUN_LLAMA_MULTI_GPU"] = "true"
+    trt_model_test = [
+        "mpirun", "-n", "4", "--allow-run-as-root", "executor/executorTest",
+        "--gtest_filter=*LlamaExecutorTest*LeaderMode*"
+    ]
+    run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
+
+    #Executor test in orchestrator mode
+    trt_model_test = [
+        "mpirun", "-n", "1", "--allow-run-as-root", "executor/executorTest",
+        "--gtest_filter=*LlamaExecutorTest*OrchMode*"
+    ]
+    run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
+
 
 def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
                    resources_dir: _pl.Path):

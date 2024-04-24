@@ -225,9 +225,7 @@ python examples/llama/convert_checkpoint.py --model_dir ${MODEL_CHECKPOINT} \
                               --output_dir ${CONVERTED_CHECKPOINT} \
                               --dtype ${DTYPE} \
                               --tp_size ${TP} \
-                              --pp_size 1 \
-                              --lora_target_modules attn_qkv \
-                              --max_lora_rank ${MAX_LORA_RANK}
+                              --pp_size 1
 
 ${HOME}/.local/bin/trtllm-build \
     --checkpoint_dir ${CONVERTED_CHECKPOINT} \
@@ -235,13 +233,11 @@ ${HOME}/.local/bin/trtllm-build \
     --max_batch_size ${MAX_BATCH} \
     --max_input_len $MAX_LEN \
     --max_output_len $MAX_LEN \
-    --gpt_attention_plugin float16 \
-    --paged_kv_cache enable \
-    --remove_input_padding enable \
     --gemm_plugin float16 \
     --lora_plugin float16 \
     --use_paged_context_fmha enable \
-    --use_custom_all_reduce disable
+    --lora_target_modules attn_qkv \
+    --max_lora_rank ${MAX_LORA_RANK}
 
 NUM_LORAS=(8 16 24 32 64 128 256)
 NUM_REQUESTS=1024

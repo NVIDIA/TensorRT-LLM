@@ -74,5 +74,11 @@ protected:
     DecoderXQARunner* mRunner;
 };
 
+enum class XQAKernelType : int32_t
+{
+    kAMPERE_WARP_SPECIALIZED = 0,
+    kHOPPER_WARP_SPECIALIZED = 1
+};
+
 } // namespace kernels
 } // namespace tensorrt_llm

@@ -14,7 +14,7 @@
 # limitations under the License.
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import List
+from typing import List, Union
 
 import numpy as np
 import tensorrt as trt
@@ -22,13 +22,15 @@ import tensorrt as trt
 from tensorrt_llm._utils import str_dtype_to_trt
 
 from .._common import default_net, default_trtnet
-from ..functional import (_create_tensor, allreduce, cast, is_gated_activation,
-                          non_gated_version, softmax, sum, topk)
+from ..functional import (_create_tensor, allreduce, cast, div,
+                          is_gated_activation, non_gated_version, softmax, sum,
+                          topk)
 from ..layers import MLP, GatedMLP
 from ..module import Module
 from ..parameter import Parameter
 from ..plugin import TRT_LLM_PLUGIN_NAMESPACE
 from ..quantization import QuantMode
+from ..quantization.functional import quantize
 from .linear import RowLinear
 
 activation_str_to_int_map = {
@@ -81,11 +83,14 @@ def _moe_plugin(moe_config,
                 expert_bias_2,
                 expert_scale_1,
                 expert_scale_2,
+                expert_scale_3,
+                expert_scale_4,
                 hidden_size,
                 ffn_hidden_size,
                 act_fn,
                 dtype,
                 weight_dtype,
+                output_dtype,
                 quant_mode=QuantMode(0),
                 tp_size=1,
                 tp_rank=0):
@@ -94,6 +99,24 @@ def _moe_plugin(moe_config,
 
     if isinstance(weight_dtype, str):
         weight_dtype = str_dtype_to_trt(weight_dtype)
+
+    if isinstance(output_dtype, str):
+        output_dtype = str_dtype_to_trt(output_dtype)
+
+    def from_parameter(x):
+        if isinstance(x, Parameter):
+            return x.value
+        return x
+
+    expert_weight_1 = from_parameter(expert_weight_1)
+    expert_weight_2 = from_parameter(expert_weight_2)
+    expert_bias_1 = from_parameter(expert_bias_1)
+    expert_bias_2 = from_parameter(expert_bias_2)
+    expert_scale_1 = from_parameter(expert_scale_1)
+    expert_scale_2 = from_parameter(expert_scale_2)
+    expert_scale_3 = from_parameter(expert_scale_3)
+    expert_scale_4 = from_parameter(expert_scale_4)
+
     # Create the plugin with our required state
     num_experts = moe_config.num_experts
     # We pass the full number of experts (not divided by tp_size) even for EP mode
@@ -120,6 +143,9 @@ def _moe_plugin(moe_config,
     p_weight_type_id = trt.PluginField(
         "weight_type_id", np.array([int(weight_dtype)], dtype=np.int32),
         trt.PluginFieldType.INT32)
+    p_output_type_id = trt.PluginField(
+        "output_type_id", np.array([int(output_dtype)], dtype=np.int32),
+        trt.PluginFieldType.INT32)
     p_quant_mode = trt.PluginField("quant_mode",
                                    np.array([int(quant_mode)], dtype=np.int32),
                                    trt.PluginFieldType.INT32)
@@ -143,9 +169,9 @@ def _moe_plugin(moe_config,
 
     pfc = trt.PluginFieldCollection([
         p_num_experts, p_top_k, p_expert_hidden_size, p_expert_inter_size,
-        p_activation_type, p_type_id, p_weight_type_id, p_quant_mode,
-        p_use_finished, p_use_bias, p_tp_size, p_tp_rank, p_parallelism_mode,
-        p_normalization_mode
+        p_activation_type, p_type_id, p_weight_type_id, p_output_type_id,
+        p_quant_mode, p_use_finished, p_use_bias, p_tp_size, p_tp_rank,
+        p_parallelism_mode, p_normalization_mode
     ])
 
     # Create the plugin with our constant inputs to the constructor
@@ -155,21 +181,30 @@ def _moe_plugin(moe_config,
     moe_plugin = plugin_creator.create_plugin("mixture_of_experts", pfc)
 
     # Instantiate the plugin with our specific inputs
-    plugin_inputs = [
-        hidden_states, routing, expert_weight_1.value, expert_weight_2.value
-    ]
+    plugin_inputs = [hidden_states, routing, expert_weight_1, expert_weight_2]
 
     if expert_bias_1:
         assert expert_bias_2
-        plugin_inputs += [expert_bias_1.value, expert_bias_2.value]
+        plugin_inputs += [expert_bias_1, expert_bias_2]
 
     if finished is not None:
         plugin_inputs += [finished]
 
     # Add conditional inputs
-    if expert_scale_1 is not None:
+    if quant_mode.has_any_quant():
+        assert expert_scale_1
         assert expert_scale_2
-        plugin_inputs += [expert_scale_1.value, expert_scale_2.value]
+        plugin_inputs += [expert_scale_1, expert_scale_2]
+
+    # Add conditional inputs
+    if quant_mode.has_fp8_qdq():
+        assert expert_scale_3
+        plugin_inputs += [expert_scale_3]
+
+    if expert_scale_4 is not None:
+        assert quant_mode.has_fp8_qdq()
+        assert output_dtype == trt.fp8
+        plugin_inputs += [expert_scale_4]
 
     plugin_inputs = [i.trt_tensor for i in plugin_inputs]
     layer = default_trtnet().add_plugin_v2(plugin_inputs, moe_plugin)
@@ -179,6 +214,49 @@ def _moe_plugin(moe_config,
                 layer.get_input(ii).set_dynamic_range(-127, 127)
     output = _create_tensor(layer.get_output(0), layer)
     return output
+
+
+# This exists so that MOE can have the same name format as a regular MLP, just with different shaped weight tensors
+class MOEWeightWrapper(Module):
+
+    def __init__(self, in_features: int, out_features: int,
+                 experts_per_node: int, quant_mode: QuantMode,
+                 dtype: Union[str, trt.DataType],
+                 weight_dtype: Union[str, trt.DataType], has_bias: bool):
+        super().__init__()
+        self.quant_mode = quant_mode
+        self.expert_shape = (experts_per_node, out_features, in_features)
+        self.dtype = dtype
+        self.weight_dtype = weight_dtype
+        self.has_bias = has_bias
+
+        if quant_mode.is_weight_only():
+            bytes_per_col_scale = 2 if quant_mode.is_int4_weight_only() else 1
+            # We use a different shape here because the quantized weights have their own layout
+            self.expert_shape = (experts_per_node, in_features,
+                                 out_features // bytes_per_col_scale)
+            self.per_channel_scale = Parameter(shape=(experts_per_node,
+                                                      out_features),
+                                               dtype=dtype)
+        else:
+            self.register_parameter('per_channel_scale', None)
+
+        self.weight = Parameter(shape=self.expert_shape, dtype=weight_dtype)
+
+        if has_bias:
+            self.bias = Parameter(shape=(experts_per_node, out_features),
+                                  dtype=dtype)
+        else:
+            self.register_parameter('bias', None)
+
+        if quant_mode.has_fp8_qdq():
+            self.activation_scaling_factor = Parameter(shape=(1, ),
+                                                       dtype=trt.float32)
+            self.weights_scaling_factor = Parameter(shape=(experts_per_node, 1),
+                                                    dtype=trt.float32)
+        else:
+            self.register_parameter('activation_scaling_factor', None)
+            self.register_parameter('weights_scaling_factor', None)
 
 
 class MixtureOfExperts(Module):
@@ -227,8 +305,15 @@ class MixtureOfExperts(Module):
                 )
             self.ffn_hidden_size = self.ffn_hidden_size // tp_size
 
+        if quant_mode.has_fp8_qdq() and self.has_bias:
+            # TODO (dastokes) We will need to revisit this if we have a use case for it
+            raise ValueError(
+                f"MixtureOfExperts - Bias is not supported with FP8")
+
         if quant_mode.is_weight_only():
             self.weight_dtype = trt.int8
+        elif quant_mode.has_fp8_qdq():
+            self.weight_dtype = trt.fp8
 
         # Since output dimension is usually low (in the order of 10s), no TP at
         # all is more efficient as no allreduce required in the end.
@@ -242,8 +327,7 @@ class MixtureOfExperts(Module):
             float32,  # Routing is sensitive since it conditions what experts are used
             tp_group=None,
             tp_size=1,
-            strict_dtype=True,
-        )
+            strict_dtype=True)
 
         # Note we use horizontal fusion for gated activation to do the operation in one GEMM invocation
         #  The left matrix is a linear projection (no activation applied)
@@ -252,44 +336,13 @@ class MixtureOfExperts(Module):
         expert_1_out_size = self.ffn_hidden_size * 2 if is_gated_activation(
             hidden_act) else self.ffn_hidden_size
 
-        expert_1_shape = (self.experts_per_node, expert_1_out_size, hidden_size)
-        expert_2_shape = (self.experts_per_node, hidden_size,
-                          self.ffn_hidden_size)
-
-        if quant_mode.is_weight_only():
-            bytes_per_col_scale = 2 if quant_mode.is_int4_weight_only() else 1
-            # We use a different shape here because the quantized weights have their own layout
-            expert_1_shape = (self.experts_per_node, hidden_size,
-                              expert_1_out_size // bytes_per_col_scale)
-            expert_2_shape = (self.experts_per_node, self.ffn_hidden_size,
-                              hidden_size // bytes_per_col_scale)
-
-            self.experts_scale_1 = Parameter(shape=(self.experts_per_node,
-                                                    expert_1_out_size),
-                                             dtype=dtype)
-            self.experts_scale_2 = Parameter(shape=(self.experts_per_node,
-                                                    hidden_size),
-                                             dtype=dtype)
-        else:
-            self.register_parameter('experts_scale_1', None)
-            self.register_parameter('experts_scale_2', None)
-
-        self.experts_weight_1 = Parameter(shape=expert_1_shape,
-                                          dtype=self.weight_dtype)
-        self.experts_weight_2 = Parameter(shape=expert_2_shape,
-                                          dtype=self.weight_dtype)
-
-        # Note: the bias uses dtype NOT weight_dtype, i.e. it is not quantized
-        if bias:
-            self.experts_bias_1 = Parameter(shape=(self.experts_per_node,
-                                                   expert_1_out_size),
-                                            dtype=dtype)
-            self.experts_bias_2 = Parameter(shape=(self.experts_per_node,
-                                                   hidden_size),
-                                            dtype=dtype)
-        else:
-            self.register_parameter('experts_bias_1', None)
-            self.register_parameter('experts_bias_2', None)
+        self.fc = MOEWeightWrapper(hidden_size, expert_1_out_size,
+                                   self.experts_per_node, self.quant_mode,
+                                   self.dtype, self.weight_dtype, self.has_bias)
+        self.proj = MOEWeightWrapper(self.ffn_hidden_size, hidden_size,
+                                     self.experts_per_node, self.quant_mode,
+                                     self.dtype, self.weight_dtype,
+                                     self.has_bias)
 
         ClsMLP = GatedMLP if is_gated_activation(self.hidden_act) else MLP
 
@@ -313,7 +366,7 @@ class MixtureOfExperts(Module):
             is_gated_act = is_gated_activation(self.hidden_act)
             # Gated weight pack in expert1 weights
             # expert_weight_1
-            experts_weight_1_raw = self.experts_weight_1.raw_value
+            experts_weight_1_raw = self.fc.weight.raw_value
             expert.fc.weight.value = experts_weight_1_raw[
                 i, -self.ffn_hidden_size:, :]
             if is_gated_act:
@@ -321,15 +374,15 @@ class MixtureOfExperts(Module):
                     i, :self.ffn_hidden_size, :]
 
             # expert_weight_2
-            experts_weight_2_raw = self.experts_weight_2.raw_value
+            experts_weight_2_raw = self.proj.weight.raw_value
             expert.proj.weight.value = experts_weight_2_raw[i, :, :]
 
             has_bias = self.has_bias
             if has_bias:
-                experts_bias_1_raw = self.experts_bias_1.raw_value
+                experts_bias_1_raw = self.fc.bias.raw_value
                 expert.fc.bias.value = experts_bias_1_raw[
                     i, -self.ffn_hidden_size:]
-                experts_bias_2_raw = self.experts_bias_2.raw_value
+                experts_bias_2_raw = self.proj.bias.raw_value
                 expert.proj.bias.value = experts_bias_2_raw[i, :]
                 if is_gated_act:
                     expert.gate.bias.value = experts_bias_1_raw[
@@ -374,21 +427,66 @@ class MixtureOfExperts(Module):
                 output = allreduce(output, self.tp_group)
 
         else:
+            if self.quant_mode.has_fp8_qdq():
+                assert self.fc.weight.value.dtype == trt.fp8, (
+                    "mlp fc weight dtype should be fp8 in the fp8 quantization mode."
+                )
+                assert self.proj.weight.value.dtype == trt.fp8, (
+                    "mlp proj weight dtype should be fp8 in the fp8 quantization mode."
+                )
+                hidden_states_quant = hidden_states
+                if hidden_states_quant.dtype != trt.fp8:
+                    hidden_states_quant = quantize(
+                        hidden_states, self.fc.activation_scaling_factor.value,
+                        'fp8')
+
+                dtype_quant = trt.fp8
+                weight_dtype_quant = trt.fp8
+
+                fc1_dequant = self.fc.weights_scaling_factor.value * self.fc.activation_scaling_factor.value
+                fc2_quant = div(1.0, self.proj.activation_scaling_factor.value)
+                fc2_dequant = self.proj.weights_scaling_factor.value * self.proj.activation_scaling_factor.value
+
+                scale_1 = fc1_dequant
+                scale_2 = fc2_quant
+                scale_3 = fc2_dequant
+                scale_4 = None
+
+                output_dtype_quant = self.dtype
+
+                if output_dtype_quant == trt.fp8 and scale_4 is None:
+                    raise RuntimeError(
+                        "Cannot output FP8 value without knowing quantization parameter"
+                    )
+
+            else:
+                hidden_states_quant = hidden_states
+                dtype_quant = self.dtype
+                weight_dtype_quant = self.weight_dtype
+                output_dtype_quant = self.dtype
+
+                scale_1 = self.fc.per_channel_scale
+                scale_2 = self.proj.per_channel_scale
+                scale_3 = None
+                scale_4 = None
             output = _moe_plugin(self.moe_config,
-                                 hidden_states,
+                                 hidden_states_quant,
                                  routing,
-                                 expert_weight_1=self.experts_weight_1,
-                                 expert_weight_2=self.experts_weight_2,
-                                 expert_bias_1=self.experts_bias_1,
-                                 expert_bias_2=self.experts_bias_2,
-                                 expert_scale_1=self.experts_scale_1,
-                                 expert_scale_2=self.experts_scale_2,
+                                 expert_weight_1=self.fc.weight.value,
+                                 expert_weight_2=self.proj.weight.value,
+                                 expert_bias_1=self.fc.bias,
+                                 expert_bias_2=self.proj.bias,
+                                 expert_scale_1=scale_1,
+                                 expert_scale_2=scale_2,
+                                 expert_scale_3=scale_3,
+                                 expert_scale_4=scale_4,
                                  finished=finished,
                                  hidden_size=self.hidden_size,
                                  ffn_hidden_size=self.ffn_hidden_size,
                                  act_fn=self.hidden_act,
-                                 dtype=self.dtype,
-                                 weight_dtype=self.weight_dtype,
+                                 dtype=dtype_quant,
+                                 weight_dtype=weight_dtype_quant,
+                                 output_dtype=output_dtype_quant,
                                  quant_mode=self.quant_mode,
                                  tp_size=self.tp_size,
                                  tp_rank=self.tp_rank)

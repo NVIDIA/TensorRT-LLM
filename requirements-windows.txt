@@ -3,9 +3,9 @@ accelerate==0.25.0
 build
 colored
 cuda-python==12.3.0
-diffusers==0.15.0
+diffusers==0.27.0
 mpi4py
-numpy
+numpy<2
 onnx>=1.12.0
 polygraphy
 psutil

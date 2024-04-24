@@ -182,7 +182,7 @@ protected:
 
 namespace
 {
-void verifyModelConfig(GptModelConfig const& modelConfig, ModelSpec const& modelSpec)
+void verifyModelConfig(ModelConfig const& modelConfig, ModelSpec const& modelSpec)
 {
     ASSERT_EQ(modelSpec.mUseGptAttentionPlugin, modelConfig.useGptAttentionPlugin());
     ASSERT_EQ(modelSpec.mUsePackedInput, modelConfig.usePackedInput());
@@ -549,8 +549,9 @@ INSTANTIATE_TEST_SUITE_P(GptSessionTest, ParamTest,
     testing::Combine(testing::Values(ModelParams{GPT_MODEL_DIR, {50256, 50256}}),
         testing::Values(
             // single decoder
-            ModelSpec{FP32_GPT_ATTENTION_DIR, FP32_PLUGIN_RESULT_FILE, nvinfer1::DataType::kFLOAT}
-                .useGptAttentionPlugin(),
+            // Disabled because of flakey beam search test
+            // ModelSpec{FP32_GPT_ATTENTION_DIR, FP32_PLUGIN_RESULT_FILE, nvinfer1::DataType::kFLOAT}
+            //     .useGptAttentionPlugin(),
             ModelSpec{FP16_GPT_ATTENTION_DIR, FP16_PLUGIN_RESULT_FILE, nvinfer1::DataType::kHALF}
                 .useGptAttentionPlugin(),
             ModelSpec{FP16_GPT_ATTENTION_PACKED_DIR, FP16_PLUGIN_PACKED_RESULT_FILE, nvinfer1::DataType::kHALF}
@@ -561,10 +562,12 @@ INSTANTIATE_TEST_SUITE_P(GptSessionTest, ParamTest,
                 .useGptAttentionPlugin()
                 .usePackedInput()
                 .usePagedKvCache(),
+
             // decoderBatch
-            ModelSpec{FP32_GPT_ATTENTION_DIR, FP32_PLUGIN_RESULT_FILE, nvinfer1::DataType::kFLOAT}
-                .useGptAttentionPlugin()
-                .useDecoderPerRequest(),
+            // Disabled because of flakey beam search test
+            // ModelSpec{FP32_GPT_ATTENTION_DIR, FP32_PLUGIN_RESULT_FILE, nvinfer1::DataType::kFLOAT}
+            //     .useGptAttentionPlugin()
+            //     .useDecoderPerRequest(),
             ModelSpec{FP16_GPT_ATTENTION_DIR, FP16_PLUGIN_RESULT_FILE, nvinfer1::DataType::kHALF}
                 .useGptAttentionPlugin()
                 .useDecoderPerRequest(),

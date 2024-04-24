@@ -14,6 +14,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
+/*****************************************************************************
+ *
+ * GptSession is going to be deprecated soon.
+ * Please do not add new functionality in this file!
+ *
+ *****************************************************************************/
+
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"

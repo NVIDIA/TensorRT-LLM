@@ -1,6 +1,6 @@
 # Qwen
 
-This document shows how to build and run a Qwen model in TensorRT-LLM on both single GPU, single node multi-GPU.
+This document shows how to build and run a [Qwen](https://huggingface.co/Qwen) model in TensorRT-LLM on both single GPU, single node multi-GPU.
 
 - [Qwen](#qwen)
   - [Overview](#overview)
@@ -18,7 +18,7 @@ This document shows how to build and run a Qwen model in TensorRT-LLM on both si
 
 ## Overview
 
-The TensorRT-LLM Qwen implementation can be found in [model.py](../../tensorrt_llm/models/qwen/model.py). The TensorRT-LLM Qwen example code is located in [`examples/qwen`](./). There is one main file:
+The TensorRT-LLM Qwen implementation can be found in [models/qwen](../../tensorrt_llm/models/qwen/). The TensorRT-LLM Qwen example code is located in [`examples/qwen`](./). There is one main file:
 
 * [`convert_checkpoint.py`](./convert_checkpoint.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the Qwen model.
 
@@ -28,23 +28,29 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 * [`../summarize.py`](../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
 
 ## Support Matrix
-|   Model Name    | FP16  | FMHA  |  WO   |  AWQ  | GPTQ  |  SQ   |  TP   |  PP   |  ST   | C++ Runtime | benchmark |  IFB  |  Arch   |
-| :-------------: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---------: | :-------: | :---: | :-----: |
-| Qwen-7B(-Chat)  |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |      Y      |     Y     |   Y   | Ampere+ |
-| Qwen-14B(-Chat) |   Y   |   Y   |   Y   |  Y*   |   Y   |   Y   |   Y   |   Y   |   Y   |      Y      |     Y     |   Y   | Ampere+ |
-| Qwen-72B(-Chat) |   Y   |   Y   |   Y   |   -   |   Y   |   Y   |   Y   |   Y   |   Y   |      Y      |     Y     |   Y   | Ampere+ |
+|   Model Name       | FP16/BF16  |  WO   |  AWQ  | GPTQ  |  SQ   |  TP   |  PP   |  Arch   |
+| :-------------:    |   :---:    | :---: | :---: | :---: | :---: | :---: | :---: | :-----: |
+| Qwen-1_8B(-Chat)   |     Y      |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen-7B(-Chat)     |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen-14B(-Chat)    |     Y      |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen-72B(-Chat)    |     Y      |   Y   |   -   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen1.5-0.5B(-Chat)|     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen1.5-1.8B(-Chat)|     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen1.5-4B(-Chat)  |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen1.5-7B(-Chat)  |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen1.5-14B(-Chat) |     Y      |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen1.5-32B(-Chat) |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen1.5-72B(-Chat) |     Y      |   Y   |   -   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
 
-*Please note that Qwen-14B-Chat model supports AWQ only with single GPU.
+*Please note that these models supports AWQ only with single GPU.
+
 * Model Name: the name of the model, the same as the name on HuggingFace
-* FMHA: Fused MultiHead Attention
 * WO: Weight Only Quantization (int8 / int4)
 * AWQ: Activation Aware Weight Quantization (int4)
 * GPTQ: Generative Pretrained Transformer Quantization (int4)
-* SQ: Smooth Quantization
+* SQ: Smooth Quantization (int8)
 * TP: Tensor Parallel
 * PP: Pipeline Parallel
-* ST: Strongly Typed
-* IFB: In-flight Batching
 
 *Currently Qwen models does not support dynamic NTK and logn attention. Therefore, accuracy on long sequence input for the 7B and 14B model is not promised.
 

@@ -191,6 +191,9 @@ enum class CommunicationMode
     kLEADER, // With the leader mode, only the leader can enqueue requests. The requests will be
              // broadcasted to the workers. All participants can get response via awaitResponses. The leader is the
              // first participant in the provided participant IDS, or 0 if participant ID is not provided
+    kORCHESTRATOR, // With the orchestrator mode, only the orchestrator can enqueue requests and await responses. The
+                   // requests will be broadcasted to the workers. The orchestrator will spawn new processes for the
+                   // execution of the model
 };
 
 /// @brief Struct that holds the stats of a KV cache manager
@@ -303,6 +306,19 @@ struct RequestStatsPerIteration
     IterationType iter;
     /// @brief The stats of all active requests for this iteration
     std::vector<RequestStats> requestStats;
+};
+
+/// @brief Decoding mode
+enum class DecodingMode
+{
+    /// @brief No mode specified. Config will be determined from the beam width of the first request at runtime
+    /// TopKTopP if beamWidth == 1, BeamSearch otherwise
+    kNONE,
+    kTOP_K,
+    kTOP_P,
+    kBEAM_SEARCH,
+    kMEDUSA,
+    kTOP_K_TOP_P,
 };
 
 } // namespace tensorrt_llm::executor

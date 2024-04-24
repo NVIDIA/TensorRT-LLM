@@ -1,12 +1,14 @@
+(gpt-runtime)=
+
 # C++ GPT Runtime
 
 TensorRT-LLM includes a C++ component to execute TensorRT engines built with
-the Python API as described in the [Architecture](architecture.md) document.
+the Python API as described in the {ref}`architecture-overview` section.
 That component is called the C++ runtime.
 
 The API of the C++ runtime is composed of the classes declared in
-[`cpp/include/tensorrt_llm/runtime`](source:cpp/include/tensorrt_llm/runtime) and
-implemented in [`cpp/tensorrt_llm/runtime`](source:cpp/tensorrt_llm/runtime).
+[`cpp/include/tensorrt_llm/runtime`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/include/tensorrt_llm/runtime) and
+implemented in [`cpp/tensorrt_llm/runtime`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/runtime).
 
 Even if the different components described in that document mention GPT in
 their name, they are not restricted to this specific model. Those classes can
@@ -15,27 +17,27 @@ LLaMA, for example.
 
 Complete support of encoder-decoder models, like T5, will be added to
 TensorRT-LLM in a future release. An experimental version, only in Python for
-now, can be found in the [`examples/enc_dec`](source:examples/enc_dec) folder.
+now, can be found in the [`examples/enc_dec`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec) folder.
 
 ## Overview
 
 Runtime models are described by an instance of the
-[`GptModelConfig`](source:cpp/include/tensorrt_llm/runtime/gptModelConfig.h)
+[`ModelConfig`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/runtime//modelConfig.h)
 class and a pointer to the TensorRT engine that must be
 executed to perform the inference.
 The environment is configured through the
-[`WorldConfig`](source:cpp/include/tensorrt_llm/runtime/worldConfig.h)
+[`WorldConfig`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/runtime/worldConfig.h)
 (that name comes from
 [MPI](https://en.wikipedia.org/wiki/Message_Passing_Interface) and its "famous"
 `MPI_COMM_WORLD` default communicator).
-The [`SamplingConfig`](source:cpp/include/tensorrt_llm/runtime/samplingConfig.h)
+The [`SamplingConfig`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/runtime/samplingConfig.h)
 class encapsulates parameters that control the
 [generation](https://huggingface.co/blog/how-to-generate) of new tokens.
 
 ### Model Configuration
 
 The model configuration is an instance of the
-[`GptModelConfig`](source:cpp/include/tensorrt_llm/runtime/gptModelConfig.h) class.
+[`ModelConfig`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/runtime//modelConfig.h) class.
 That class encapsulates the following parameters (they are declared as private
 member variables and exposed through getters and setters):
 
@@ -45,25 +47,22 @@ member variables and exposed through getters and setters):
  * `numKvHeads`, the number of heads for K and V in the attention component.
    When the number of K/V heads is the same as the number of (Q) heads, the
    model uses multi-head attention. When the number of K/V heads is 1, it uses
-   multi-query attention. Otherwise, it uses group-query attention. Refer to [GPT
-   Attention](gpt_attention.md) for more information,
+   multi-query attention. Otherwise, it uses group-query attention. Refer to {ref}`gpt-attention` for more information,
  * `hiddenSize`, the size of the hidden dimension,
  * `dataType`, the datatype that was used to build the TensorRT engine and that
    must be used to run the model during inference,
- * `useGptAttentionPlugin`, indicates if the [GPT Attention](gpt_attention.md)
-   operator was compiled using the
-   [GPT Attention plugin](source:cpp/tensorrt_llm/plugins/gptAttentionPlugin),
+ * `useGptAttentionPlugin`, indicates if the {ref}`gpt-attention` operator was compiled using the
+   [GPT Attention plugin](https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/plugins/gptAttentionPlugin),
  * `inputPacked`, indicates that the input must be packed (or padded when set
    to `false`). For performance reasons, it is recommended to always use packed,
    even if its default is set to `false` (will be changed in a future release).
-   Refer to [GPT Attention](gpt_attention.md) for more information,
+   Refer to {ref}`gpt-attention` for more information,
  * `pagedKvCache`, indicates if the K/V cache uses paging.
-   See [GPT Attention](gpt_attention.md),
+   Refer to {ref}`gpt-attention` for more information,
  * `tokensPerBlock`, is the number of tokens in each block of the K/V cache.
    It's relevant when the paged K/V cache is enabled. By default, the value is
-   64. See [GPT Attention](gpt_attention.md),
- * `quantMode`, controls the quantization method. See
-   [Numerical Precision](precision.md).
+   64. Refer to {ref}`gpt-attention` for more information,
+ * `quantMode`, controls the quantization method. Refer to {ref}`precision` for more information.
  * `maxBatchSize`, indicates the maximum batch size that the TensorRT engine
    was built for,
  * `maxInputLen`, the maximum size of the input sequences,
@@ -84,7 +83,7 @@ node as well as on different nodes in a cluster. Each process is called a
 TensorRT-LLM C++ Runtime calls that group the *world*.
 
 The world configuration is an instance of the
-[`WorldConfig`](source:cpp/include/tensorrt_llm/runtime/worldConfig.h)
+[`WorldConfig`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/runtime/worldConfig.h)
 class, which encapsulates the following parameters:
 
 * `tensorParallelism`, the number of ranks that collaborate together to
@@ -110,7 +109,7 @@ class, which encapsulates the following parameters:
 
 ### Sampling Parameters
 
-The [`SamplingConfig`](source:cpp/include/tensorrt_llm/runtime/samplingConfig.h)
+The [`SamplingConfig`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/runtime/samplingConfig.h)
 class encapsulates parameters that control the
 [generation](https://huggingface.co/blog/how-to-generate) of new tokens.
 Except for the `beamWidth` parameter, all the fields are optional and the
@@ -188,18 +187,18 @@ sequence. This limitation is likely to be removed in a future release.
 
 ## The Session
 
-*The runtime session is deprecated in favor of the [Executor API](executor.md).
+*The runtime session is deprecated in favor of the {ref}`executor`.
  It will be removed in a future release of TensorRT-LLM.*
 
 An example of how to use the `GptSession` to run a GPT-like auto-regressive model can be found in
-[`cpp/tests/runtime/gptSessionTest.cpp`](source:cpp/tests/runtime/gptSessionTest.cpp).
+[`cpp/tests/runtime/gptSessionTest.cpp`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tests/runtime/gptSessionTest.cpp).
 
 ### Internal Components
 
 The `GptSession` class encapsulates two main components. The
-[`TllmRuntime`](source:cpp/tensorrt_llm/runtime/tllmRuntime.h) is in charge of the
+[`TllmRuntime`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/runtime/tllmRuntime.h) is in charge of the
 execution of the TensorRT engine. The
-[`GptDecoder`](source:cpp/include/tensorrt_llm/runtime/gptDecoder.h)
+[`GptDecoder`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/runtime/gptDecoder.h)
 does the generation of the tokens from the logits.  The `TllmRuntime` class is
 an internal component and you are not expected to use that class directly.
 The `GptDecoder` can be used directly to implement custom generation loop

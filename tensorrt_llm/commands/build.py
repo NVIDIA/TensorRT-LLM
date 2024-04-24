@@ -210,6 +210,20 @@ def parse_arguments():
         help=
         'Specify max encoder input length when using enc-dec models. Set max_input_len to 1 to start generation from decoder_start_token_id of length 1.'
     )
+    parser.add_argument(
+        '--visualize_network',
+        default=False,
+        action='store_true',
+        help=
+        'TRT Networks will be exported to ONNX prior to Engine build for debugging. '
+    )
+    parser.add_argument(
+        '--dry_run',
+        default=False,
+        action='store_true',
+        help=
+        'Run through the build process except the actual Engine build for debugging. '
+    )
 
     plugin_config_parser = parser.add_argument_group("plugin_config")
     add_plugin_argument(plugin_config_parser)
@@ -443,6 +457,8 @@ def main():
                     },
                     **cluster_config,
                 },
+                'dry_run': args.dry_run,
+                'visualize_network': args.visualize_network,
                 'max_encoder_input_len': args.max_encoder_input_len,
             },
             plugin_config=plugin_config)

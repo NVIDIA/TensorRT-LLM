@@ -109,5 +109,7 @@ if(BUILD_BATCH_MANAGER)
 endif()
 
 if(BUILD_EXECUTOR)
-  add_subdirectory(executor)
+  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/executor)
+    add_subdirectory(executor)
+  endif()
 endif()

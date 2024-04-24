@@ -1,3 +1,5 @@
+(perf-best-practice)=
+
 # Best Practices for Tuning the Performance of TensorRT-LLM
 
 This document provides some best practices for tuning the performance of TensorRT-LLM.

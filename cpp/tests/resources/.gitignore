@@ -1,3 +1,4 @@
 models/**/
 data/*/**/*.npy
 data/*.json
+!data/test_model_lora_config.json

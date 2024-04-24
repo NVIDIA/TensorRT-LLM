@@ -143,9 +143,9 @@ void select_gs(Params& params, cudaStream_t s)
     }
 }
 
-#define INSTANTIATE_WEIGHT_ONLY_CUDA_DISPATCHERS(KType, A, B, Layout, ConverterInterleave)                             \
-    template void select_gs<kernel_type_traits<KType>::isGroupwise, KernelDetails<A, B, Layout, ConverterInterleave>>( \
-        Params & params, cudaStream_t s);
+#define INSTANTIATE_WEIGHT_ONLY_CUDA_DISPATCHERS(KType, A, B, Layout, ConverterInterleave, KTile)                      \
+    template void select_gs<kernel_type_traits<KType>::isGroupwise,                                                    \
+        KernelDetails<A, B, Layout, ConverterInterleave, KTile>>(Params & params, cudaStream_t s);
 } // namespace weight_only
 } // namespace kernels
 } // namespace tensorrt_llm

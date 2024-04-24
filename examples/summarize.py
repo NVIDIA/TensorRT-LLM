@@ -147,7 +147,7 @@ def main(args):
                 input_ids = tokenizer.encode(curr_text,
                                              return_tensors='pt').squeeze(0)
                 input_ids = input_ids[:test_token_num]
-            elif model_name == 'QWenForCausalLM':
+            elif model_name == 'QWenForCausalLM' and model_version == 'qwen':
                 # use make_content to generate prompt
                 system_prompt = "You are a useful assistant, please directly output the corresponding summary according to the article entered by the user."
                 _, input_id_list = make_context(
@@ -159,6 +159,16 @@ def main(args):
                 )
                 input_ids = torch.tensor(input_id_list)
             else:
+                if model_name == 'QWenForCausalLM' and model_version == 'qwen2':
+                    messages = [{
+                        "role": "system",
+                        "content": "You are a helpful assistant."
+                    }, {
+                        "role": "user",
+                        "content": curr_text
+                    }]
+                    curr_text = tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True)
                 input_ids = tokenizer.encode(
                     curr_text,
                     return_tensors='pt',

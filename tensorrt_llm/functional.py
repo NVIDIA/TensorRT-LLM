@@ -28,10 +28,10 @@ import tensorrt as trt
 
 from . import graph_rewriting as gw
 from ._common import default_net, default_trtnet, precision
-from ._utils import (bf16_array, dim_resolve_negative, dim_to_trt_axes,
-                     fp16_array, fp32_array, int32_array, np_dtype_to_trt,
-                     str_dtype_to_trt, torch_to_numpy, trt_dtype_to_np,
-                     trt_dtype_to_torch)
+from ._utils import (bf16_array, bool_array, dim_resolve_negative,
+                     dim_to_trt_axes, fp16_array, fp32_array, int32_array,
+                     np_dtype_to_trt, str_dtype_to_trt, torch_to_numpy,
+                     trt_dtype_to_np, trt_dtype_to_torch)
 from .network import PluginInfo, set_np_weight, set_plugin_info
 from .plugin import TRT_LLM_PLUGIN_NAMESPACE, current_all_reduce_helper
 from .quantization import QuantMode
@@ -357,6 +357,18 @@ class Tensor(object):
         '''
         return div(self, b)
 
+    def __floordiv__(self, b):
+        '''
+        See functional.floordiv.
+        '''
+        return floordiv(self, b)
+
+    def __mod__(self, b):
+        '''
+        See functional.floordiv.
+        '''
+        return modulo(self, b)
+
     def __lt__(self, b):
         '''
         See functional.lt.
@@ -586,6 +598,7 @@ def _create_tensor(trt_tensor: trt.ITensor,
     # centralized location to pass the name from
     # module space to the TRT IR
     default_net()._set_layer_name(producer)
+    # tb.print_stack(limit=10) # FOR DEBUGGING: filter producer.name if needed
     if default_net().dtype is not None and not default_net().strongly_typed:
         if producer.type not in [
                 trt.LayerType.SHAPE, trt.LayerType.CONSTANT,
@@ -1135,6 +1148,73 @@ def slice(input: Tensor,
     return _create_tensor(layer.get_output(0), layer)
 
 
+def rand(shape: Tensor,
+         low: float = 0,
+         high: float = 1,
+         dtype: Union[str, trt.DataType] = 'float32') -> Tensor:
+    '''
+    This operation adds a fill layer that generates a random (uniform) tensor with the specified shape and data type.
+
+    Parameters:
+        shape: Tensor
+            The shape of the tensor needed to be generated.
+        low: float
+            The minimum value (inclusive) of the range used for random.
+        high: float
+            The maximum value (inclusive) of the range used for random.
+        dtype: Union[str, trt.DataType]
+            The desired data type for the output tensor.
+    Returns:
+        The generated random tensor produced by the fill layer.
+    '''
+    # NOTE: DISABLED FOR NOW UNTIL THE FILL LAYER (RANDOM_UNIFORM) in TRT IS FIXED
+    assert False, "The rand() op is temporarily disabled."
+    low = constant(fp32_array(low))
+    high = constant(fp32_array(high))
+    trt_dtype = dtype if isinstance(dtype,
+                                    trt.DataType) else str_dtype_to_trt(dtype)
+
+    layer = default_trtnet().add_fill([0], trt.FillOperation.RANDOM_UNIFORM,
+                                      trt_dtype)
+
+    layer.set_input(0, shape.trt_tensor)
+    layer.set_input(1, low.trt_tensor)
+    layer.set_input(2, high.trt_tensor)
+    return _create_tensor(layer.get_output(0), layer)
+
+
+def categorical_sample(probs: Tensor, rand_data: Tensor = None) -> Tensor:
+    '''
+    This is a sampling operation and an equivalent of torch.distributions.Categorical.sample()
+    i.e. given a probability distribution tensor, it samples an index of that tensor.
+    See: https://pytorch.org/docs/stable/distributions.html#torch.distributions.categorical.Categorical.sample
+    NOTE: This assumes that the given probabilities are **not** normalized.
+
+    Parameters:
+        probs: Tensor
+            A 1-D floating point tensor representing the probability distributions.
+        rand_data: Tensor (optional)
+            A random tensor of same shape as `probs` tensor.
+            If not provided, this function will add a rand() op to generate it and use for sampling.
+    Returns:
+        A tensor containing a single index of the `probs` tensor representing the sample.
+    '''
+    probs = probs / sum(probs, dim=-1, keepdim=True)
+    rand_shape = []
+    assert probs.ndim() > 0
+    for i in range(probs.ndim() - 1):
+        rand_shape.append(shape(probs, i))
+    rand_shape = concat(rand_shape)
+    if rand_data is None:
+        rand_data = rand(rand_shape, low=0, high=1, dtype=probs.dtype)
+    assert rand_shape == shape(rand_data)
+    rand_data = expand(unsqueeze(rand_data, -1), shape(probs))
+    cum_probs = cumsum(probs, dim=-1)
+    cmp = cast(cum_probs >= rand_data, probs.dtype)
+    samples = argmax(cmp, dim=-1)
+    return samples
+
+
 def conditional(condition: Tensor, true_input: Tensor,
                 false_input: Tensor) -> Tensor:
     '''
@@ -1480,7 +1560,7 @@ def expand_dims(input: Tensor, dim: Union[int, Sequence[int]]) -> Tensor:
 
     out_ndim = len(dim) + input.ndim()
 
-    input_shape = shape(input)
+    input_shape = cast(shape(input), 'int32')
     out_shapes = []
     j = 0
     for i in range(out_ndim):
@@ -1492,7 +1572,52 @@ def expand_dims(input: Tensor, dim: Union[int, Sequence[int]]) -> Tensor:
 
     out_shape = concat(out_shapes)
 
-    return view(input, out_shape)
+    return view(input, out_shape, zero_is_placeholder=False)
+
+
+# NOTE: Jointly added with Apple
+def squeeze(input: Tensor,
+            dim: Optional[Union[int, Sequence[int]]] = None,
+            zero_is_placeholder: bool = False):
+    '''
+    Add an operation to remove singleton dimensions of a tensor.
+
+    This functions creates an operation that removes singleton dimension
+    (dimension of size 1) at positions 'dim' in the input tensor. It works with
+    negative values for the 'dim'.
+
+    For example, for a tensor 'input' of shape [1, 4, 1, 4]:
+
+        squeeze(input,  0) will produce an output of shape [4, 1, 4],
+        squeeze(input,  2) will produce an output of shape [1, 4, 4],
+        squeeze(input, [0, 2]) will produce an output of shape [4, 4],
+        squeeze(input, [-2]) will produce an output of shape [1, 4, 4],
+
+    Parameters:
+        input : Tensor
+            The input tensor for which the singleton dimensions will be removed.
+
+        dim : Union[int, Sequence[int]]
+            The index of the singleton dimensions in the input tensor.
+
+    Returns:
+        The tensor produced by the layer.
+    '''
+    if dim is None:
+        dim = list(range(input.ndim()))
+    if isinstance(dim, int):
+        dim = (dim, )
+    dim = dim_resolve_negative(dim, input.ndim())
+
+    new_shape = []
+    for i, s in enumerate(input.shape):
+        if s == 1 and i in dim:
+            continue
+        new_shape.append(shape(input, i))
+
+    input = input.view(concat(new_shape),
+                       zero_is_placeholder=zero_is_placeholder)
+    return input
 
 
 def unsqueeze(input: Tensor, axis: int):
@@ -1500,7 +1625,7 @@ def unsqueeze(input: Tensor, axis: int):
     Add an operation to insert a singleton dimension to a tensor.
 
     That functions creates an operation that insert a singleton dimension
-    (dimension of size 1) at position 'dim' in the output tensor. It works with
+    (dimension of size 1) at position 'axis' in the output tensor. It works with
     negative values for the 'axis'.
 
     For example, for a tensor 'input' of shape [4, 4]:
@@ -1832,6 +1957,80 @@ def index_select(input: Tensor, dim: int, index: Tensor) -> Tensor:
     return _create_tensor(layer.get_output(0), layer).view(concat(new_shape))
 
 
+# NOTE: Jointly added with Apple
+def scatter(input: Tensor, dim: int, indices: Tensor,
+            updates: Tensor) -> Tensor:
+    '''
+    This operation adds a layer that creates an output tensor by element-wise
+    copying values from the input tensor and then updating values by the given
+     `indices` and `updates` tensors.
+     For a 2D input tensor, it first copies the input to output,
+     then updates the output tensor like the following for each entry in `updates`:
+        output[indices[i][j]][j] = updates[i][j] if dim=0
+        output[i][indices[i][j]] = updates[i][j] if dim=1
+     If the `input` tensor is [[1, 2, 3], [4, 5, 6]],
+     the indices tensor is [[1, 2], [0, 1]],
+     the updates tensor is [[-1, -2], [-3, -4]], and dim=1
+     the output tensor will be [[1, -1, -2], [-3, -4, 6]].
+     Parameters:
+        input: Tensor
+            The input data that needs to be updated.
+        dim: int
+            The axis on which the scatter is to be performed.
+        indices: Tensor
+            An integer tensor of the same rank as input that indicates the positions to be updated.
+        updates: Tensor
+            A data tensor of same shape as the `indices` tensor that contains the update values.
+     Returns:
+        A tensor created by the element-wise scatter layer.
+    '''
+    layer = default_trtnet().add_scatter(input.trt_tensor,
+                                         indices.trt_tensor,
+                                         updates.trt_tensor,
+                                         mode=trt.ScatterMode.ELEMENT)
+    layer.axis = dim
+    return _create_tensor(layer.get_output(0), layer)
+
+
+def gather_nd(input: Tensor, indices: Tensor, batch_dims: int = 1) -> Tensor:
+    '''
+    Adds a layer that performs a gather with some element-wise dimensions.
+    See: https://onnx.ai/onnx/operators/onnx__GatherND.html
+    The gather is performed on dim=batch_dims.
+
+    Parameters:
+        input: Tensor
+            The tensor on which the gather operation is performed.
+        indices: Tensor
+            The tensor that indicates which entries to be gathered.
+        batch_dims: int
+            The number of first dimensions that should be skipped before gather starts.
+    Returns:
+        A tensor created by the gather layer with GatherMode.ND.
+    '''
+    gather_layer = default_trtnet().add_gather_v2(input.trt_tensor,
+                                                  indices.trt_tensor,
+                                                  mode=trt.GatherMode.ND)
+    gather_layer.num_elementwise_dims = batch_dims
+    return _create_tensor(gather_layer.get_output(0), gather_layer)
+
+
+def nonzero(input: Tensor) -> Tensor:
+    '''
+    Adds a layer that finds the indices of non-zero values of the input tensor.
+
+    Parameters:
+        input: Tensor
+            The input tensor for which we need to find the indices of non-zero values.
+    Returns:
+        A tensor of shape [D, C] where D is the number of dimensions of `input` and
+        C is the number of non-zero values in it.
+        Each column of this 2D tensor represents the index tuple for each non-zero value.
+    '''
+    non_zero_layer = default_trtnet().add_non_zero(input.trt_tensor)
+    return _create_tensor(non_zero_layer.get_output(0), non_zero_layer)
+
+
 def masked_select(input: Tensor, mask: Tensor) -> Tensor:
     '''
     Add an operation to select elements from a tensor according to a boolean
@@ -1938,7 +2137,7 @@ def cumsum(input: Tensor, dim: int) -> Tensor:
         if i != dim:
             slice_shape.append(shape(input, i))
 
-    zero_tensor = constant(np.array(0, dtype=trt_dtype_to_np(input.dtype)))
+    zero_tensor = constant_to_tensor_(0, input.dtype, False)
     if len(slice_shape) > 0:
         zero_tensor = expand_dims(zero_tensor,
                                   [i for i in range(len(slice_shape))])
@@ -2061,7 +2260,7 @@ def concat(inputs: Sequence[Union[Tensor, int]], dim: int = 0) -> Tensor:
             tmp.append(i)
 
     layer = default_trtnet().add_concatenation([i.trt_tensor for i in tmp])
-    layer.axis = dim
+    layer.axis = dim_resolve_negative(dim, tmp[0].ndim())[0]
     return _create_tensor(layer.get_output(0), layer)
 
 
@@ -2260,18 +2459,31 @@ def embedding(input: Tensor,
     return x
 
 
-def constant_to_tensor_(input: Union[Tensor, int, float],
-                        dtype: trt.DataType = trt.float32) -> Tensor:
-    if isinstance(input, int):
-        return constant(int32_array([input]))
-    elif isinstance(input, float):
+def constant_to_tensor_(input: Union[Tensor, int, float, bool],
+                        dtype: Union[trt.DataType, str] = None,
+                        to_array=True) -> Tensor:
+    if dtype is None:
+        # deduce the type from the given value
+        # NOTE: bool is a subtype of int, so bool needs to be checked first
+        if isinstance(input, bool):
+            dtype = trt.bool
+        elif isinstance(input, int):
+            dtype = trt.int32
+        else:
+            dtype = trt.float32
+
+    if not isinstance(input, Tensor):
+        if isinstance(dtype, str):
+            dtype = str_dtype_to_trt(dtype)
         array_fn_dict = {
+            trt.int32: int32_array,
             trt.float32: fp32_array,
             trt.float16: fp16_array,
             trt.bfloat16: bf16_array,
+            trt.bool: bool_array,
         }
         assert dtype in array_fn_dict
-        return constant(array_fn_dict[dtype]([input]))
+        return constant(array_fn_dict[dtype]([input] if to_array else input))
 
     return input
 
@@ -2330,18 +2542,19 @@ def elementwise_binary(left: Union[Tensor, int,
 
     The following closures are defined in functional.*:
 
-        add     for op=trt.ElementWiseOperation.SUM
-        sub     for op=trt.ElementWiseOperation.SUB
-        mul     for op=trt.ElementWiseOperation.PROD
-        div     for op=trt.ElementWiseOperation.DIV
-        gt      for op=trt.ElementWiseOperation.GREATER
-        lt      for op=trt.ElementWiseOperation.LESS
-        op_and  for op=trt.ElementWiseOperation.AND
-        op_or   for op=trt.ElementWiseOperation.OR
-        eq      for op=trt.ElementWiseOperation.EQUAL
-        minimum for op=trt.ElementWiseOperation.MIN
-        maximum for op=trt.ElementWiseOperation.MAX
-        pow     for op=trt.ElementWiseOperation.POW
+        add      for op=trt.ElementWiseOperation.SUM
+        sub      for op=trt.ElementWiseOperation.SUB
+        mul      for op=trt.ElementWiseOperation.PROD
+        div      for op=trt.ElementWiseOperation.DIV
+        floordiv for op=trt.ElementWiseOperation.FLOOR_DIV
+        gt       for op=trt.ElementWiseOperation.GREATER
+        lt       for op=trt.ElementWiseOperation.LESS
+        op_and   for op=trt.ElementWiseOperation.AND
+        op_or    for op=trt.ElementWiseOperation.OR
+        eq       for op=trt.ElementWiseOperation.EQUAL
+        minimum  for op=trt.ElementWiseOperation.MIN
+        maximum  for op=trt.ElementWiseOperation.MAX
+        pow      for op=trt.ElementWiseOperation.POW
 
     It is implemented using the IElementWiseLayer from TensorRT.
 
@@ -2370,6 +2583,7 @@ add = partial(elementwise_binary, op=trt.ElementWiseOperation.SUM)
 sub = partial(elementwise_binary, op=trt.ElementWiseOperation.SUB)
 mul = partial(elementwise_binary, op=trt.ElementWiseOperation.PROD)
 div = partial(elementwise_binary, op=trt.ElementWiseOperation.DIV)
+floordiv = partial(elementwise_binary, op=trt.ElementWiseOperation.FLOOR_DIV)
 gt = partial(elementwise_binary, op=trt.ElementWiseOperation.GREATER)
 lt = partial(elementwise_binary, op=trt.ElementWiseOperation.LESS)
 op_and = partial(elementwise_binary, op=trt.ElementWiseOperation.AND)
@@ -2380,7 +2594,19 @@ maximum = partial(elementwise_binary, op=trt.ElementWiseOperation.MAX)
 pow = partial(elementwise_binary, op=trt.ElementWiseOperation.POW)
 
 
-def where(condition: Union[Tensor, int, float], left: Union[Tensor, int, float],
+def modulo(x: Tensor, y: Union[Tensor, int]) -> Tensor:
+    '''
+    This function adds an element-wise modulo (x % y) operation for a given tensor.
+    Since there is no TensorRT layer that can directly perform this,
+    this function implements it using some of the basic operations.
+
+    Returns:
+        A tensor that represents (x % y) modulo operation.
+    '''
+    return x - (x // y) * y
+
+
+def where(condition: Union[Tensor, bool], left: Union[Tensor, int, float],
           right: Union[Tensor, int, float]) -> Tensor:
     '''
     Add a where (aka select or if-then-else) operation.
@@ -2391,16 +2617,16 @@ def where(condition: Union[Tensor, int, float], left: Union[Tensor, int, float],
         for ii in range(mul(condition.shape)):
             output[ii] = left[ii] if condition[ii] else right[ii]
 
-    For each input, that function first creates a constant tensor if the input
-    is an integer or a float. Then, if needed, it expands the smaller tensor to
-    make sure its rank is the same as the larger one. Then, it performs the
-    selection.
+    For each input, that function first creates a constant tensor if the
+    condition is boolean or the left/right input is an integer or a float.
+    Then, if needed, it expands the smaller tensor to make sure its
+    rank is the same as the larger one. Then, it performs the selection.
 
     It is implemented using the ISelectLayer from TensorRT.
 
     Parameters:
-        left : Union[Tensor, int, float]
-            The condition. If that input is an integer or a float, the function
+        condition : Union[Tensor, bool]
+            The condition. If that input is a boolean, the function
             creates a constant tensor.
 
         left : Union[Tensor, int, float]
@@ -2411,11 +2637,8 @@ def where(condition: Union[Tensor, int, float], left: Union[Tensor, int, float],
             The second input. If that input is an integer or a float, the
             function creates a constant tensor.
 
-        op : trt.ElementWiseOperation
-            The binary operation to perform.
-
     Returns:
-        The tensor produced by this select operation.
+        The tensor produced by this where operation.
     '''
     # Convert to tensors.
     condition = constant_to_tensor_(condition)
@@ -2480,6 +2703,66 @@ sin = partial(unary, op=trt.UnaryOperation.SIN)
 cos = partial(unary, op=trt.UnaryOperation.COS)
 abs = partial(unary, op=trt.UnaryOperation.ABS)
 log = partial(unary, op=trt.UnaryOperation.LOG)
+not_op = partial(unary, op=trt.UnaryOperation.NOT)
+
+
+def log_softmax(input: Tensor, dim: int) -> Tensor:
+    '''
+    This function is equivalent of torch.nn.functional.log_softmax() i.e.
+    it performs log(softmax(input)) in a safer and faster way.
+
+    Parameters:
+        input: Tensor
+            The data tensor on which log_softmax to be computed.
+        dim: int
+            The dimension of the input tensor along which log_softmax will be computed.
+    Returns:
+        A tensor of same shape as input with log_softmax computed on the specified dim.
+    '''
+    x_max = max(input, dim=dim, keepdim=True)
+    x = input - x_max
+    return x - log(sum(exp(x), dim=dim, keepdim=True))
+
+
+def reduce(input: Tensor,
+           op: trt.ReduceOperation,
+           dim: int,
+           keepdim: bool = False) -> Tensor:
+    '''
+    Add an reduction operation to do along a dimension.
+
+    It is implemented using the IReduceLayer from TensorRT.
+
+    Parameters:
+        input : Tensor
+            The input tensor.
+
+        op : trt.ReduceOperation
+            The reduction operation to perform.
+            Options: SUM, PROD, MAX, MIN, AVG
+
+        dim : int
+            The dimension along which the reduction is performed.
+
+        keepdim : bool
+            Is the dimension kept in the reduced tensor? When True the
+            dimension is kept, it is removed from the shape otherwise.
+
+    Returns:
+        The tensor produced by this reduction operation.
+    '''
+    dim = dim_resolve_negative(dim, input.ndim())
+    axes = dim_to_trt_axes(dim)
+
+    layer = default_trtnet().add_reduce(input.trt_tensor,
+                                        op,
+                                        axes,
+                                        keep_dims=keepdim)
+    return _create_tensor(layer.get_output(0), layer)
+
+
+prod = partial(reduce, op=trt.ReduceOperation.PROD)
+min = partial(reduce, op=trt.ReduceOperation.MIN)
 
 
 def mean(input: Tensor, dim: int, keepdim: bool = False) -> Tensor:
@@ -2504,14 +2787,7 @@ def mean(input: Tensor, dim: int, keepdim: bool = False) -> Tensor:
     Returns:
         The tensor produced by this reduction operation.
     '''
-    dim = dim_resolve_negative(dim, input.ndim())
-    axes = dim_to_trt_axes(dim)
-
-    layer = default_trtnet().add_reduce(input.trt_tensor,
-                                        trt.ReduceOperation.AVG,
-                                        axes,
-                                        keep_dims=keepdim)
-    return _create_tensor(layer.get_output(0), layer)
+    return reduce(input, op=trt.ReduceOperation.AVG, dim=dim, keepdim=keepdim)
 
 
 def max(input: Tensor, dim: int, keepdim: bool = False) -> Tensor:
@@ -2536,14 +2812,7 @@ def max(input: Tensor, dim: int, keepdim: bool = False) -> Tensor:
     Returns:
         The tensor produced by this reduction operation.
     '''
-    dim = dim_resolve_negative(dim, input.ndim())
-    axes = dim_to_trt_axes(dim)
-
-    layer = default_trtnet().add_reduce(input.trt_tensor,
-                                        trt.ReduceOperation.MAX,
-                                        axes,
-                                        keep_dims=keepdim)
-    return _create_tensor(layer.get_output(0), layer)
+    return reduce(input, op=trt.ReduceOperation.MAX, dim=dim, keepdim=keepdim)
 
 
 def sum(input: Tensor, dim: int, keepdim: bool = False) -> Tensor:
@@ -2568,14 +2837,7 @@ def sum(input: Tensor, dim: int, keepdim: bool = False) -> Tensor:
     Returns:
         The tensor produced by this reduction operation.
     '''
-    dim = dim_resolve_negative(dim, input.ndim())
-    axes = dim_to_trt_axes(dim)
-
-    layer = default_trtnet().add_reduce(input.trt_tensor,
-                                        trt.ReduceOperation.SUM,
-                                        axes,
-                                        keep_dims=keepdim)
-    return _create_tensor(layer.get_output(0), layer)
+    return reduce(input, op=trt.ReduceOperation.SUM, dim=dim, keepdim=keepdim)
 
 
 def identity(input: Tensor) -> Tensor:
@@ -2642,13 +2904,14 @@ def argmax(input: Tensor, dim: int, keepdim: bool = False) -> Tensor:
     if keepdim:
         return _create_tensor(output, layer)
 
-    a = list(range(len(input.ndim())))
-    a.pop(dim)
-    indices = constant(int32_array([a]))
+    output = _create_tensor(output, layer)
+    a = list(range(input.ndim()))
+    for d in dim:
+        a.pop(d)
+    indices = constant(int32_array(a))
     output_shape = shape(output)
     new_shape = gather(output_shape, 0, indices)
-    layer = view(output, new_shape)
-    return _create_tensor(layer.get_output(0), layer)
+    return view(output, new_shape)
 
 
 def gelu(x: Tensor) -> Tensor:
@@ -2722,10 +2985,10 @@ def group_norm(input: Tensor,
     x = input.view(new_shape)
 
     reduce_dim = tuple(range(2, ndim + 1))
-    ux = x.mean(reduce_dim, keepdim=True)
+    ux = x.mean(dim=reduce_dim, keepdim=True)
     numerator = x - ux
     varx = numerator * numerator
-    varx = varx.mean(reduce_dim, keepdim=True)
+    varx = varx.mean(dim=reduce_dim, keepdim=True)
 
     denom = varx + eps
     denom = denom.sqrt()
@@ -3955,13 +4218,17 @@ def gpt_attention(
         use_cache: bool = False
             Do we need to store kv cache ? not needed if there is no generation phase.
 
+        medusa_generation_lengths: Tensor = None,
+            The generation phase tokens' lengths for each sequence.
+            Shape: [Batch_size]
+
         medusa_position_offsets: Tensor = None,
-            The medusa tokens's position offsets (shared by all sequences).
-            Shape: [Num_medusa_tokens + 1].
+            The generation phase tokens's position offsets (can be different for each sequences).
+            Shape: [bs, max_num_medusa_tokens + 1].
 
         medusa_packed_mask: Tensor = None,
-            The medusa tokens's attention mask (packed into uint32_t bits).
-            Shape: [Num_medusa_tokens + 1, divUp(Num_medusa_tokens + 1, 32)].
+            The generation phase tokens's packed attention mask (can be different for each sequences).
+            Shape: [bs*(max_num_medusa_tokens+1), divUp(max_num_medusa_tokens + 1, 32)].
 
     Returns:
         The tensor produced by that layer.
@@ -4326,7 +4593,7 @@ def rms_norm(input: Tensor,
         fp32_input = cast(input, "float32")
         varx = pow(fp32_input, 2.0)
 
-        varx = varx.mean(dim, keepdim=True)
+        varx = varx.mean(dim=dim, keepdim=True)
         denom = varx + eps
         denom = denom.sqrt()
         fp32_y = fp32_input / denom
@@ -4334,7 +4601,7 @@ def rms_norm(input: Tensor,
     else:
         with precision("float32"):
             varx = pow(input, 2.0)
-            varx = varx.mean(dim, keepdim=True)
+            varx = varx.mean(dim=dim, keepdim=True)
             denom = varx + eps
             denom = denom.sqrt()
             y = input / denom
@@ -5004,6 +5271,13 @@ def topk(input: Tensor,
     '''
     Add an topk operation.
 
+    As explained in the ONNX documentation,
+
+        https://github.com/onnx/onnx/blob/main/docs/Operators.md#topk
+
+    NOTE: One distinction from the ONNX topk op, the output is always sorted
+    with TensorRT layer.
+
     Retrieve the top-K largest elements along a specified axis.
     Given an input tensor of shape [a_1, a_2, ..., a_n, r]
     and integer argument k, return two outputs:
@@ -5025,7 +5299,7 @@ def topk(input: Tensor,
 
 
     Returns:
-        The tensor produced by this argmax operation.
+        The tensors (values, indices) produced by this topk operation.
     '''
     dim = dim_resolve_negative(dim, input.ndim())
     axes = dim_to_trt_axes(dim)
@@ -5034,6 +5308,7 @@ def topk(input: Tensor,
         trt.TopKOperation.MAX if largest else trt.TopKOperation.MIN,
         k=k,
         axes=axes)
+    values = layer.get_output(0)
+    indices = layer.get_output(1)
 
-    return _create_tensor(layer.get_output(0),
-                          layer), _create_tensor(layer.get_output(1), layer)
+    return _create_tensor(values, layer), _create_tensor(indices, layer)

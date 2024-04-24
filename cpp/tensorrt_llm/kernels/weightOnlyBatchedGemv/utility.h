@@ -166,7 +166,7 @@ template <typename Details, int K>
 __device__ __forceinline__ void pack_to_vec2(void* dst, void* src, int n)
 {
     using Type = typename MathWrapper<typename Details::TypeDetailsA>::Type;
-    typename Details::LayoutDeatils::Mapper mapper;
+    typename Details::LayoutDetails::Mapper mapper;
     int n0 = n & ~0x1, n1 = n & 0x1;
     for (int k = 0; k < K; ++k)
     {

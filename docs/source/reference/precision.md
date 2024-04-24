@@ -1,7 +1,9 @@
+(precision)=
+
 # Numerical Precision
 
-This document describes the different methods implemented in TensorRT-LLM and
-contains a support matrix for the different models.
+This document describes the different quantization recipes implemented in TensorRT-LLM and contains a support matrix
+for the different models.
 
 ## FP32, FP16 and BF16
 
@@ -135,6 +137,7 @@ This release of TensorRT-LLM contains the following examples:
 | LLaMA-v2   |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     Y      |
 | Mamba      |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | Mistral    |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     .      |
+| Mixtral    |   Y   |   Y   |   Y   |   Y   |    .    |   Y   |   Y   |     .     |     .      |
 | MPT        |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     .      |
 | OPT        |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | Phi        |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
@@ -146,17 +149,13 @@ This release of TensorRT-LLM contains the following examples:
 | StarCoder2 |   Y   |   Y   |   Y   |   .   |    .    |   Y   |   Y   |     .     |     .      |
 | T5         |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | Whisper    |   Y   |   Y   |   Y   |   .   |    .    |   Y   |   Y   |     .     |     .      |
-
-
-The list of supported multi-modal examples is:
-
 | BLIP2-OPT  |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | BLIP2-T5   |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | LLaVA      |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     Y      |
 | VILA       |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     Y      |
 | Nougat     |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 
-Note: The vision component of multi-modal models uses FP16 by default.
+Note: The vision component of multi-modal models(BLIP2-OPT/BLIP2-T5/LLaVA/VILA/Nougat) uses FP16 by default.
 The language component decides which quantization methods are supported by a given multi-modal model.
 
 ## Technical Detail: The `QuantMode` Flags

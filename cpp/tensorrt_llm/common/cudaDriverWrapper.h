@@ -70,6 +70,11 @@ public:
         unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ, unsigned int sharedMemBytes,
         CUstream hStream, void** kernelParams, void** extra) const;
 
+    CUresult cuTensorMapEncodeTiled(CUtensorMap* tensorMap, CUtensorMapDataType tensorDataType, cuuint32_t tensorRank,
+        void* globalAddress, cuuint64_t const* globalDim, cuuint64_t const* globalStrides, cuuint32_t const* boxDim,
+        cuuint32_t const* elementStrides, CUtensorMapInterleave interleave, CUtensorMapSwizzle swizzle,
+        CUtensorMapL2promotion l2Promotion, CUtensorMapFloatOOBfill oobFill) const;
+
 private:
     void* handle;
     CUresult (*_cuGetErrorName)(CUresult, char const**);
@@ -89,6 +94,10 @@ private:
     CUresult (*_cuLaunchKernel)(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
         unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ, unsigned int sharedMemBytes,
         CUstream hStream, void** kernelParams, void** extra);
+    CUresult (*_cuTensorMapEncodeTiled)(CUtensorMap* tensorMap, CUtensorMapDataType tensorDataType,
+        cuuint32_t tensorRank, void* globalAddress, cuuint64_t const* globalDim, cuuint64_t const* globalStrides,
+        cuuint32_t const* boxDim, cuuint32_t const* elementStrides, CUtensorMapInterleave interleave,
+        CUtensorMapSwizzle swizzle, CUtensorMapL2promotion l2Promotion, CUtensorMapFloatOOBfill oobFill);
 };
 
 inline void cuErrCheck_(CUresult stat, CUDADriverWrapper const& wrap, char const* file, int line)

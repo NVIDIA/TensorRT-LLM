@@ -160,7 +160,7 @@ void GptDecoderBatch::allocateMedusaBuffers()
 
 void GptDecoderBatch::setup(DecodingMode const& mode, SizeType maxBatchSize, SizeType maxBeamWidth,
     SizeType maxAttentionWindow, SizeType sinkTokenLength, SizeType maxSequenceLength, SizeType maxTokensPerEngineStep,
-    bool fusedDecoder, nvinfer1::DataType dtype, GptModelConfig const& modelConfig)
+    bool fusedDecoder, nvinfer1::DataType dtype, ModelConfig const& modelConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK(maxBatchSize > 0);
@@ -302,7 +302,7 @@ void GptDecoderBatch::setup(DecodingMode const& mode, SizeType maxBatchSize, Siz
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void GptDecoderBatch::setupMedusa(GptModelConfig const& modelConfig)
+void GptDecoderBatch::setupMedusa(ModelConfig const& modelConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 

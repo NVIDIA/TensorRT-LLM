@@ -176,7 +176,7 @@ bool GPTAttentionPluginCommon::convertMMHAParamsToXQAParams(tensorrt_llm::kernel
     xqaParams.qkv_bias_enabled = mQKVBiasEnabled;
     xqaParams.cross_attention = mCrossAttention;
     xqaParams.max_distance = mMaxDistance;
-    xqaParams.multi_block_mode = false; // WAR for bug 4565783. Real fix is blocked and will be integrated later.
+    xqaParams.multi_block_mode = mMultiBlockMode;
     // Medusa mode will have multiple query tokens.
     xqaParams.multi_query_tokens = mIsMedusaEnabled;
 
@@ -191,6 +191,11 @@ bool GPTAttentionPluginCommon::convertMMHAParamsToXQAParams(tensorrt_llm::kernel
     else
     {
         xqaParams.kv_cache_data_type = xqaParams.data_type;
+    }
+    if (xqaParams.kv_cache_data_type == DATA_TYPE_INT8
+        || (xqaParams.kv_cache_data_type == DATA_TYPE_E4M3 && mSM != kSM_90))
+    {
+        xqaParams.multi_block_mode = false;
     }
 
     xqaParams.output = generationsParams.context_buf;
@@ -553,7 +558,7 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForContext(nvinfer1::DataType t
                                                         : sizeof(float) * batch_size * mNumHeads * input_seq_length
             * (isCrossAttention() ? cross_qkv_length : input_seq_length);
     size_t const fp8_qkv_buffer_size = mFP8ContextFMHA && mEnableContextFMHA
-        ? batch_size * input_seq_length * (local_hidden_units_qo + 2 * local_hidden_units_kv)
+        ? batch_size * input_seq_length * size_t(local_hidden_units_qo + 2 * local_hidden_units_kv)
         : 0;
     size_t const padding_offset_size = sizeof(int) * batch_size * input_seq_length;
     const size_t fmha_scheduler_counter = mEnableContextFMHA ? sizeof(uint32_t) : 0;

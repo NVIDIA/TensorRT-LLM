@@ -21,6 +21,7 @@
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/decodingKernels.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
+#include "tensorrt_llm/layers/defaultDecodingParams.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 
@@ -170,7 +171,8 @@ void MedusaDecodingLayer<T>::setup(SizeType batchSize, SizeType const* batchSlot
         else
         {
             // Initialize curand states using the default seed 0.
-            invokeCurandInitialize(statesDevice, batchSlots, batchSize, 0, this->mStream);
+            invokeCurandInitialize(
+                statesDevice, batchSlots, batchSize, DefaultDecodingParams::getSeed(), this->mStream);
         }
     };
 
@@ -225,7 +227,7 @@ void MedusaDecodingLayer<T>::setup(SizeType batchSize, SizeType const* batchSlot
     {
         auto runtimeHeadsTopK = setupParams.runtimeHeadsTopK;
         std::vector<SizeType32> runtimeHeadsTopKFlatten;
-        if (runtimeHeadsTopK.has_value())
+        if (runtimeHeadsTopK.has_value() && runtimeHeadsTopK->size())
         {
             for (auto const& sub : runtimeHeadsTopK.value())
             {

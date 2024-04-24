@@ -30,16 +30,6 @@ namespace kernels
 namespace cutlass_kernels
 {
 
-int get_bits_in_quant_type(QuantType quant_type)
-{
-    switch (quant_type)
-    {
-    case QuantType::INT8_WEIGHT_ONLY: return 8;
-    case QuantType::PACKED_INT4_WEIGHT_ONLY: return 4;
-    default: TLLM_CHECK_WITH_INFO(false, "Invalid quant_type"); return -1;
-    }
-}
-
 struct LayoutDetails
 {
     enum class Layout
@@ -96,11 +86,11 @@ struct getLayoutDetails<cutlass::layout::ColumnMajorTileInterleave<RowsPerTile, 
     }
 };
 
-template <typename cutlassArch, typename TypeB>
+template <typename cutlassArch, typename TypeA, typename TypeB>
 LayoutDetails getLayoutDetailsForArchAndQuantType()
 {
 
-    using CompileTraits = cutlass::gemm::kernel::LayoutDetailsB<TypeB, cutlassArch>;
+    using CompileTraits = cutlass::gemm::kernel::LayoutDetailsB<TypeA, TypeB, cutlassArch>;
     using LayoutB = typename CompileTraits::Layout;
     using MmaOperator = typename CompileTraits::Operator;
     LayoutDetails details = getLayoutDetails<LayoutB>()();
@@ -111,18 +101,20 @@ LayoutDetails getLayoutDetailsForArchAndQuantType()
 template <typename cutlassArch>
 LayoutDetails getLayoutDetailsForArch(QuantType quant_type)
 {
+    int const bits_per_weight_element = get_weight_quant_bits(quant_type);
     LayoutDetails details;
-    if (quant_type == QuantType::INT8_WEIGHT_ONLY)
+    switch (quant_type)
     {
-        details = getLayoutDetailsForArchAndQuantType<cutlassArch, uint8_t>();
-    }
-    else if (quant_type == QuantType::PACKED_INT4_WEIGHT_ONLY)
-    {
-        details = getLayoutDetailsForArchAndQuantType<cutlassArch, cutlass::uint4b_t>();
-    }
-    else
-    {
-        TLLM_CHECK_WITH_INFO(false, "Unsupported quantization type");
+    case QuantType::W8_A16:
+        details = getLayoutDetailsForArchAndQuantType<cutlassArch, cutlass::half_t, uint8_t>();
+        break;
+    case QuantType::W4_A16:
+        details = getLayoutDetailsForArchAndQuantType<cutlassArch, cutlass::half_t, cutlass::uint4b_t>();
+        break;
+    case QuantType::W4_AFP8:
+        details = getLayoutDetailsForArchAndQuantType<cutlassArch, cutlass::float_e4m3_t, cutlass::uint4b_t>();
+        break;
+    default: TLLM_THROW("Unsupported quantization type");
     }
     return details;
 }
@@ -137,7 +129,7 @@ LayoutDetails getLayoutDetailsForTransform(QuantType quant_type, int arch)
     {
         return getLayoutDetailsForArch<cutlass::arch::Sm75>(quant_type);
     }
-    else if (arch >= 80 && arch <= 89)
+    else if (arch >= 80 && arch < 90)
     {
         return getLayoutDetailsForArch<cutlass::arch::Sm80>(quant_type);
     }
@@ -152,25 +144,54 @@ LayoutDetails getLayoutDetailsForTransform(QuantType quant_type, int arch)
     }
 }
 
-// Permutes the rows of B for Turing and Ampere. Throws an error for other architectures.
+// Permutes the rows of B in a way that is compatible with Turing+ architectures.
+//
+// Throws an error for other architectures.
 // The data is permuted such that:
-// For int8, each group of 16 rows is permuted using the map below:
+// For W8_A16, each group of 16 rows is permuted using the map below:
 //  0 1 8 9 2 3 10 11 4 5 12 13 6 7 14 15
-// For int4, each group of 32 rows is permuted using the map below:
+// For W4_A16, each group of 32 rows is permuted using the map below:
 //  0 1 8 9 16 17 24 25 2 3 10 11 18 19 26 27 4 5 12 13 20 21 28 29 6 7 14 15 22 23 30 31
+// For W4_A8, see the map in the code. The idea is similar to above.
+// The goal of this permutation is to ensure data ends up in the correct threads after
+// we execute LDSM. It counteracts the effect of the data being of different widths.
+// For more information about the expected layouts, see the MMA section in the PTX docs.
+std::vector<int> get_permutation_map(QuantType quant_type)
+{
+
+    if (quant_type == QuantType::W8_A16)
+    {
+        return {0, 1, 8, 9, 2, 3, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15};
+    }
+    else if (quant_type == QuantType::W4_A16)
+    {
+        return {0, 1, 8, 9, 16, 17, 24, 25, 2, 3, 10, 11, 18, 19, 26, 27, 4, 5, 12, 13, 20, 21, 28, 29, 6, 7, 14, 15,
+            22, 23, 30, 31};
+    }
+    else if (quant_type == QuantType::W4_AFP8)
+    {
+        return {0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7, 20, 21, 22, 23, 8, 9, 10, 11, 24, 25, 26, 27, 12, 13, 14, 15,
+            28, 29, 30, 31};
+    }
+    else
+    {
+        TLLM_THROW("Invalid quantization type for LDSM permutation");
+    }
+}
+
 void permute_B_rows_for_mixed_gemm(int8_t* permuted_quantized_tensor, int8_t const* quantized_tensor,
-    std::vector<size_t> const& shape, QuantType quant_type, const int64_t arch_version)
+    std::vector<size_t> const& shape, QuantType quant_type, int64_t const arch_version)
 {
 
     // We only want to run this step for weight only quant.
-    TLLM_CHECK(quant_type == QuantType::PACKED_INT4_WEIGHT_ONLY || quant_type == QuantType::INT8_WEIGHT_ONLY);
+    std::vector<int> row_permutation = get_permutation_map(quant_type);
 
     TLLM_CHECK_WITH_INFO(shape.size() == 2 || shape.size() == 3, "Shape must be 2-D or 3-D");
     const size_t num_experts = shape.size() == 2 ? 1 : shape[0];
     const size_t num_rows = shape.size() == 2 ? shape[0] : shape[1];
     const size_t num_cols = shape.size() == 2 ? shape[1] : shape[2];
 
-    int const BITS_PER_ELT = get_bits_in_quant_type(quant_type);
+    int const BITS_PER_ELT = get_weight_quant_bits(quant_type);
     int const K = 16 / BITS_PER_ELT;
     int const ELTS_PER_BYTE = 8 / BITS_PER_ELT;
     int const ELTS_PER_REG = 32 / BITS_PER_ELT;
@@ -194,7 +215,8 @@ void permute_B_rows_for_mixed_gemm(int8_t* permuted_quantized_tensor, int8_t con
         fmtstr("Invalid shape for quantized tensor. On turing/Ampere, the number of cols must be a multiple of %d.",
             MMA_SHAPE_N));
 
-    // The code is written as below so it works for both int8 and packed int4.
+    TLLM_CHECK_WITH_INFO(size_t(B_ROWS_PER_MMA) == row_permutation.size(), "Unexpected number of LDSM rows permuted.");
+
     for (int expert = 0; expert < num_experts; ++expert)
     {
         const int64_t matrix_offset = expert * int64_t(num_rows) * int64_t(num_vec_cols);
@@ -206,8 +228,7 @@ void permute_B_rows_for_mixed_gemm(int8_t* permuted_quantized_tensor, int8_t con
                 for (int write_col = 0; write_col < num_vec_cols; ++write_col)
                 {
                     int const write_row = base_row + tile_row;
-                    int const tile_read_row
-                        = 8 * (((tile_row % ELTS_PER_REG) / 2)) + tile_row % 2 + 2 * (tile_row / ELTS_PER_REG);
+                    int const tile_read_row = row_permutation[tile_row];
                     int const read_row = base_row + tile_read_row;
                     int const read_col = write_col;
 
@@ -229,7 +250,7 @@ template <QuantType quant_type>
 void subbyte_transpose_impl(
     int8_t* transposed_quantized_tensor, int8_t const* quantized_tensor, std::vector<size_t> const& shape)
 {
-    int const bits_per_elt = get_bits_in_quant_type(quant_type);
+    constexpr int bits_per_elt = get_weight_quant_bits(quant_type);
 
     TLLM_CHECK_WITH_INFO(shape.size() == 2 || shape.size() == 3, "Shape must be 2-D or 3-D");
     const size_t num_experts = shape.size() == 2 ? 1 : shape[0];
@@ -243,8 +264,7 @@ void subbyte_transpose_impl(
     uint8_t const* input_byte_ptr = reinterpret_cast<uint8_t const*>(quantized_tensor);
     uint8_t* output_byte_ptr = reinterpret_cast<uint8_t*>(transposed_quantized_tensor);
 
-    static_assert(quant_type == QuantType::INT8_WEIGHT_ONLY || quant_type == QuantType::PACKED_INT4_WEIGHT_ONLY, "");
-    static constexpr int ELTS_PER_BYTE = quant_type == QuantType::INT8_WEIGHT_ONLY ? 1 : 2;
+    static constexpr int ELTS_PER_BYTE = 8 / bits_per_elt;
 
     static constexpr int M_TILE_L1 = 64;
     static constexpr int N_TILE_L1 = M_TILE_L1 / ELTS_PER_BYTE;
@@ -294,7 +314,7 @@ void subbyte_transpose_impl(
                     }
                 }
 
-                if (quant_type == QuantType::INT8_WEIGHT_ONLY)
+                if constexpr (bits_per_elt == 8)
                 {
                     for (int ii = 0; ii < M_TILE_L1; ++ii)
                     {
@@ -304,7 +324,7 @@ void subbyte_transpose_impl(
                         }
                     }
                 }
-                else if (quant_type == QuantType::PACKED_INT4_WEIGHT_ONLY)
+                else if constexpr (bits_per_elt == 4)
                 {
 
                     for (int ii = 0; ii < M_TILE_L1; ++ii)
@@ -368,14 +388,17 @@ void subbyte_transpose(int8_t* transposed_quantized_tensor, int8_t const* quanti
     std::vector<size_t> const& shape, QuantType quant_type)
 {
 
-    if (quant_type == QuantType::INT8_WEIGHT_ONLY)
+    if (quant_type == QuantType::W8_A16)
     {
-        subbyte_transpose_impl<QuantType::INT8_WEIGHT_ONLY>(transposed_quantized_tensor, quantized_tensor, shape);
+        subbyte_transpose_impl<QuantType::W8_A16>(transposed_quantized_tensor, quantized_tensor, shape);
     }
-    else if (quant_type == QuantType::PACKED_INT4_WEIGHT_ONLY)
+    else if (quant_type == QuantType::W4_A16)
     {
-        subbyte_transpose_impl<QuantType::PACKED_INT4_WEIGHT_ONLY>(
-            transposed_quantized_tensor, quantized_tensor, shape);
+        subbyte_transpose_impl<QuantType::W4_A16>(transposed_quantized_tensor, quantized_tensor, shape);
+    }
+    else if (quant_type == QuantType::W4_AFP8)
+    {
+        subbyte_transpose_impl<QuantType::W4_AFP8>(transposed_quantized_tensor, quantized_tensor, shape);
     }
     else
     {
@@ -464,12 +487,16 @@ void add_bias_and_interleave_int4s_inplace(int8_t* packed_int4_tensor, const siz
 
 void add_bias_and_interleave_quantized_tensor_inplace(int8_t* tensor, const size_t num_elts, QuantType quant_type)
 {
-    if (quant_type == QuantType::INT8_WEIGHT_ONLY)
+    if (quant_type == QuantType::W8_A16)
     {
         add_bias_and_interleave_int8s_inplace(tensor, num_elts);
     }
-    else if (quant_type == QuantType::PACKED_INT4_WEIGHT_ONLY)
+    else if (quant_type == QuantType::W4_A16 || quant_type == QuantType::W4_AFP8)
     {
+        // W4_AFP8 uses the same preprocessor as W4_A16 because the FP8 data must
+        // be converted to FP16 before the scales can be applied using CUDA cores.
+        // As a result, we still want permute the data so that it is well aligned
+        // for conversion to FP16.
         add_bias_and_interleave_int4s_inplace(tensor, num_elts);
     }
     else
@@ -482,15 +509,12 @@ void interleave_column_major_tensor(int8_t* interleaved_quantized_tensor, int8_t
     std::vector<size_t> const& shape, QuantType quant_type, LayoutDetails details)
 {
 
-    // We only want to run this step for weight only quant.
-    TLLM_CHECK(quant_type == QuantType::PACKED_INT4_WEIGHT_ONLY || quant_type == QuantType::INT8_WEIGHT_ONLY);
-
     TLLM_CHECK_WITH_INFO(shape.size() == 2 || shape.size() == 3, "Shape must be 2-D or 3-D");
     const size_t num_experts = shape.size() == 2 ? 1 : shape[0];
     const size_t num_rows = shape.size() == 2 ? shape[0] : shape[1];
     const size_t num_cols = shape.size() == 2 ? shape[1] : shape[2];
 
-    int const BITS_PER_ELT = get_bits_in_quant_type(quant_type);
+    int const BITS_PER_ELT = get_weight_quant_bits(quant_type);
     int const elts_in_int32 = 32 / BITS_PER_ELT;
 
     int const rows_per_tile = details.rows_per_column_tile;
@@ -551,7 +575,7 @@ void preprocess_weights_for_mixed_gemm(int8_t* preprocessed_quantized_weight, in
         num_elts *= dim;
     }
 
-    const size_t num_bytes = num_elts * get_bits_in_quant_type(quant_type) / 8;
+    const size_t num_bytes = num_elts * get_weight_quant_bits(quant_type) / 8;
 
     std::vector<int8_t> src_buf(num_bytes);
     std::vector<int8_t> dst_buf(num_bytes);
@@ -633,8 +657,10 @@ void symmetric_quantize(int8_t* processed_quantized_weight, int8_t* unprocessed_
     const size_t num_rows = shape.size() == 2 ? shape[0] : shape[1];
     const size_t num_cols = shape.size() == 2 ? shape[1] : shape[2];
 
-    int const bits_in_type = get_bits_in_quant_type(quant_type);
+    int const bits_in_type = get_weight_quant_bits(quant_type);
     int const bytes_per_out_col = num_cols * bits_in_type / 8;
+
+    int const bits_per_weigtht_element = get_weight_quant_bits(quant_type);
 
     std::vector<int8_t> weight_buf;
     if (unprocessed_quantized_weight == nullptr)
@@ -685,15 +711,15 @@ void symmetric_quantize(int8_t* processed_quantized_weight, int8_t* unprocessed_
             for (int jj = 0; jj < bytes_per_out_col; ++jj)
             {
 
-                if (quant_type == QuantType::INT8_WEIGHT_ONLY)
+                if (bits_per_weigtht_element == 8)
                 {
                     float const col_scale = per_col_max[jj];
                     float const weight_elt = float(current_weight_row[jj]);
-                    float const scaled_weight = round(weight_elt / col_scale);
+                    float const scaled_weight = (col_scale != 0.0f) ? round(weight_elt / col_scale) : 0.0f;
                     const int8_t clipped_weight = int8_t(std::max(-128.f, std::min(127.f, scaled_weight)));
                     current_quantized_weight_row[jj] = clipped_weight;
                 }
-                else if (quant_type == QuantType::PACKED_INT4_WEIGHT_ONLY)
+                else if (bits_per_weigtht_element == 4)
                 {
 
                     // We will pack two int4 elements per iteration of the inner loop.
@@ -705,7 +731,7 @@ void symmetric_quantize(int8_t* processed_quantized_weight, int8_t* unprocessed_
                         {
                             float const col_scale = per_col_max[input_idx];
                             float const weight_elt = float(current_weight_row[input_idx]);
-                            float const scaled_weight = round(weight_elt / col_scale);
+                            float const scaled_weight = (col_scale != 0.0f) ? round(weight_elt / col_scale) : 0.0f;
                             int int_weight = int(scaled_weight);
                             const int8_t clipped_weight = std::max(-8, std::min(7, int_weight));
 

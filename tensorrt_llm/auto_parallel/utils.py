@@ -3,7 +3,7 @@ import threading
 
 try:
     from types import NoneType
-except importError:
+except ImportError:
     NoneType = type(None)
 from typing import ByteString, Iterable, MutableMapping
 

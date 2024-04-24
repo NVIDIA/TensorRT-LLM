@@ -18,6 +18,7 @@
 #pragma once
 #include "cutlass/gemm/gemm.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels.h"
 #include "tensorrt_llm/plugins/common/gemmPluginProfiler.h"
 #include <cuda_runtime_api.h>
@@ -126,11 +127,35 @@ struct MOEParallelismConfig
     int const ep_rank = 0;
 };
 
+struct QuantParams
+{
+    // Int weight only quantization params
+    void const* fc1_weight_scales = nullptr;
+    void const* fc2_weight_scales = nullptr;
+
+    // FP8 quantization params
+    float const* dequant_fc1 = nullptr;
+    float const* quant_fc2 = nullptr;
+    float const* dequant_fc2 = nullptr;
+    float const* quant_final = nullptr;
+
+    static QuantParams FP8(
+        float const* dequant_fc1, float const* quant_fc2, float const* dequant_fc2, float const* quant_final = nullptr)
+    {
+        return QuantParams{nullptr, nullptr, dequant_fc1, quant_fc2, dequant_fc2, quant_final};
+    }
+
+    static QuantParams Int(void const* fc1_weight_scales, void const* fc2_weight_scales)
+    {
+        return QuantParams{fc1_weight_scales, fc2_weight_scales, nullptr, nullptr, nullptr, nullptr};
+    }
+};
+
 class CutlassMoeFCRunnerInterface
 {
 public:
     virtual ~CutlassMoeFCRunnerInterface() = default;
-    virtual size_t getWorkspaceSize(int const num_rows, int const hidden_size, int const fc1_output_size,
+    virtual size_t getWorkspaceSize(int const num_rows, int const hidden_size, int const inter_size,
         int const num_experts, int const k, ActivationType activation_type,
         MOEParallelismConfig parallelism_config) const
         = 0;
@@ -138,27 +163,33 @@ public:
     virtual std::vector<cutlass_extensions::CutlassGemmConfig> getTactics() = 0;
 
     virtual void runMoe(void const* input_activations, float const* gating_output, void const* fc1_expert_weights,
-        void const* fc1_scales, void const* fc1_expert_biases, ActivationType fc1_activation_type,
-        void const* fc2_expert_weights, void const* fc2_scales, void const* fc2_expert_biases, int const num_rows,
-        int const hidden_size, int const inter_size, int const num_experts, int const k, char* workspace_ptr,
-        void* final_output, void* fc2_result, bool const* finished, int const active_rows, void* expert_scales,
-        int* expanded_source_row_to_expanded_dest_row, int* expert_for_source_row,
-        MOEParallelismConfig parallelism_config, MOEExpertScaleNormalizationMode normalization_mode,
-        cudaStream_t stream)
+        void const* fc1_expert_biases, ActivationType fc1_activation_type, void const* fc2_expert_weights,
+        void const* fc2_expert_biases, QuantParams quant_params, int const num_rows, int const hidden_size,
+        int const inter_size, int const num_experts, int const k, char* workspace_ptr, void* final_output,
+        bool const* finished, int const active_rows, void* expert_scales, int* expanded_source_row_to_expanded_dest_row,
+        int* expert_for_source_row, MOEParallelismConfig parallelism_config,
+        MOEExpertScaleNormalizationMode normalization_mode, cudaStream_t stream)
         = 0;
+
+    bool is_profiler = false;
 };
 
 // Assumes inputs activations are row major. Weights need to be preprocessed by th_op/weight_quantize.cc .
 // Nested in a class to avoid multiple calls to cudaGetDeviceProperties as this call can be expensive.
 // Avoid making several duplicates of this class.
-template <typename T,    /*The type used for activations/scales/compute*/
-    typename WeightType, /* The type for the MoE weights */
+template <typename T,        /*The type used for activations/scales/compute*/
+    typename WeightType,     /* The type for the MoE weights */
+    typename OutputType = T, /* The type for the MoE weights */
     typename Enable = void>
 class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface
 {
 public:
     CutlassMoeFCRunner() = default;
+
     ~CutlassMoeFCRunner() override = default;
+
+    static_assert(
+        std::is_same_v<T, WeightType> || !std::is_same_v<T, float>, "Does not support float with quantized weights");
 
     size_t getWorkspaceSize(int const num_rows, int const hidden_size, int const fc1_output_size, int const num_experts,
         int const k, ActivationType activation_type, MOEParallelismConfig parallelism_config) const override;
@@ -174,69 +205,52 @@ public:
     }
 
     void runMoe(void const* input_activations, float const* gating_output, void const* fc1_expert_weights,
-        void const* fc1_scales, void const* fc1_expert_biases, ActivationType fc1_activation_type,
-        void const* fc2_expert_weights, void const* fc2_scales, void const* fc2_expert_biases, int const num_rows,
-        int const hidden_size, int const inter_size, int const num_experts, int const k, char* workspace_ptr,
-        void* final_output, void* fc2_result, bool const* finished, int const active_rows, void* expert_scales,
-        int* expanded_source_row_to_expanded_dest_row, int* expert_for_source_row,
-        MOEParallelismConfig parallelism_config, MOEExpertScaleNormalizationMode normalization_mode,
-        cudaStream_t stream) override;
+        void const* fc1_expert_biases, ActivationType fc1_activation_type, void const* fc2_expert_weights,
+        void const* fc2_expert_biases, QuantParams quant_params, int const num_rows, int const hidden_size,
+        int const inter_size, int const num_experts, int const k, char* workspace_ptr, void* final_output,
+        bool const* finished, int const active_rows, void* expert_scales, int* expanded_source_row_to_expanded_dest_row,
+        int* expert_for_source_row, MOEParallelismConfig parallelism_config,
+        MOEExpertScaleNormalizationMode normalization_mode, cudaStream_t stream) override;
 
 private:
+    using HopperGemmOutputType = typename HopperGroupedGemmInput::OutputTypeAdaptor_t<T>;
+
     void computeTotalRowsBeforeExpert(int const* sorted_indices, int const total_indices, int const num_experts,
         int64_t* total_rows_before_expert, cudaStream_t stream);
+    HopperGroupedGemmInput computeStridesHopper(int64_t const* total_rows_before_expert,
+        HopperGroupedGemmInput layout_info, int gemm_n, int gemm_k, int const num_experts, T const* in,
+        WeightType const* weights, float const* fp8_dequant, T const* bias, HopperGemmOutputType* output,
+        cudaStream_t stream);
     std::vector<size_t> getWorkspaceBufferSizes(int const num_rows, int const hidden_size, int const inter_size,
         int const num_experts, int const num_experts_per_node, int const k, ActivationType activation_type) const;
     void configureWsPtrs(char* ws_ptr, int const num_rows, int const hidden_size, int const inter_size,
         int const num_experts, int const num_experts_per_node, int const k, ActivationType activation_type);
 
 private:
+    bool mayHaveDifferentGEMMOutputType() const
+    {
+        // We just check if its supported because we need to know when calculating workspace size
+        return moe_gemm_runner_.supportsHopperSpecialisation() && !std::is_same_v<T, HopperGemmOutputType>;
+    }
+
     CubKeyValueSorter sorter_;
     MoeGemmRunner<T, WeightType> moe_gemm_runner_;
 
     // Pointers
-    int* source_rows_;
-    int* permuted_rows_;
-    int* permuted_experts_;
-    char* sorter_ws_;
-    T* permuted_data_;
-    float* softmax_out_;
+    int* source_rows_{};
+    int* permuted_rows_{};
+    int* permuted_experts_{};
+    char* sorter_ws_{};
+    T* permuted_data_{};
+    float* softmax_out_{};
 
-    int64_t* total_rows_before_expert_;
+    int64_t* total_rows_before_expert_{};
 
-    T* fc1_result_;
-    T* glu_inter_result_;
-};
+    void* glu_inter_result_{};
+    void* fc2_result_{};
+    T* fc1_result_{};
 
-template <typename WeightType>
-class CutlassMoeFCRunner<float, WeightType, typename std::enable_if_t<!std::is_same<float, WeightType>::value>>
-    : public CutlassMoeFCRunnerInterface
-{
-public:
-    CutlassMoeFCRunner() = default;
-
-    size_t getWorkspaceSize(int const num_rows, int const hidden_size, int const fc1_output_size, int const num_experts,
-        int const k, ActivationType activation_type, MOEParallelismConfig parallelism_config) const override
-    {
-        return 0;
-    }
-
-    void setTactic(std::optional<cutlass_extensions::CutlassGemmConfig> gemm_config) override
-    {
-        return;
-    }
-
-    void runMoe(void const* input_activations, float const* gating_output, void const* fc1_expert_weights,
-        void const* fc1_scales, void const* fc1_expert_biases, ActivationType fc1_activation_type,
-        void const* fc2_expert_weights, void const* fc2_scales, void const* fc2_expert_biases, int const num_rows,
-        int const hidden_size, int const inter_size, int const num_experts, int const k, char* workspace_ptr,
-        void* final_output, void* fc2_result, bool const* finished, int const active_rows, void* expert_scales,
-        int* expanded_source_row_to_expanded_dest_row, int* expert_for_source_row,
-        MOEParallelismConfig parallelism_config, MOEExpertScaleNormalizationMode normalization_mode,
-        cudaStream_t stream) override
-    {
-        TLLM_THROW("FP32 MoE with different precision weights is not supported.");
-    }
+    HopperGroupedGemmInput hopper_grouped_gemm_input_;
 };
 
 void makeLoadBalancedRoutingConfiguration(

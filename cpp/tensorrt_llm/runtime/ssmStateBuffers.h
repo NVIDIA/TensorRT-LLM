@@ -19,8 +19,8 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/generationConfig.h"
-#include "tensorrt_llm/runtime/gptModelConfig.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/tllmRuntime.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
@@ -54,12 +54,12 @@ public:
 
     SsmStateBuffers();
 
-    SsmStateBuffers(TllmRuntime const& runtime, runtime::GptModelConfig const& modelConfig,
-        runtime::WorldConfig const& worldConfig);
+    SsmStateBuffers(
+        TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig);
 
     void reshape(SizeType batchSize);
     void reshape(
-        GenerationConfig const& generationConfig, GptModelConfig const& modelConfig, WorldConfig const& worldConfig);
+        GenerationConfig const& generationConfig, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
     void reset(BufferManager& manager);
 
@@ -68,14 +68,14 @@ public:
     void prepareContextStep(RuntimeBuffers* runtimeBuffers, BufferManager& manager);
 
     void postContextStep(RuntimeBuffers* runtimeBuffers, std::vector<RuntimeBuffers> const& contextBuffers,
-        BufferManager& manager, GptModelConfig const& modelConfig, WorldConfig const& worldConfig);
+        BufferManager& manager, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
     void getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers, TensorMap& inputBuffers, TensorMap& outputBuffers,
-        SizeType const step, TensorPtr const& inputIds, TensorPtr const& commPtrs, GptModelConfig const& modelConfig,
+        SizeType const step, TensorPtr const& inputIds, TensorPtr const& commPtrs, ModelConfig const& modelConfig,
         WorldConfig const& worldConfig) const;
 
 protected:
-    void tile(RuntimeBuffers* runtimeBuffers, BufferManager& manager, GptModelConfig const& modelConfig,
+    void tile(RuntimeBuffers* runtimeBuffers, BufferManager& manager, ModelConfig const& modelConfig,
         WorldConfig const& worldConfig);
 
     void fillStatePtrs();

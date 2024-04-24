@@ -17,7 +17,6 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/utils/multiDeviceUtils.h"
 
 #ifdef ENABLE_FP8
@@ -35,6 +34,11 @@
 #include <vector>
 
 #define MPICHECK(cmd) TLLM_MPI_CHECK(cmd)
+
+namespace tensorrt_llm::runtime
+{
+class IBuffer;
+}
 
 // A wrapper module of the MPI library.
 namespace tensorrt_llm::mpi
@@ -234,18 +238,11 @@ public:
 
     std::shared_ptr<MpiRequest> bcastAsync(void* buffer, size_t size, MpiType dtype, int root) const;
 
-    std::shared_ptr<MpiRequest> bcastAsync(runtime::IBuffer& buf, int root) const
-    {
-        TLLM_CHECK(buf.getMemoryType() != runtime::MemoryType::kGPU);
-        return bcastAsync(buf.data(), buf.getSizeInBytes(), MpiType::kBYTE, root);
-    }
+    std::shared_ptr<MpiRequest> bcastAsync(runtime::IBuffer& buf, int root) const;
 
     void bcast(void* buffer, size_t size, MpiType dtype, int root) const;
 
-    void bcast(runtime::IBuffer& buf, int root) const
-    {
-        bcast(buf.data(), buf.getSizeInBytes(), MpiType::kBYTE, root);
-    }
+    void bcast(runtime::IBuffer& buf, int root) const;
 
     template <typename T>
     void bcastValue(T& value, int root) const
@@ -281,11 +278,7 @@ public:
 
     void send(void const* buffer, std::size_t size, MpiType dtype, int dest, int tag) const;
 
-    void send(runtime::IBuffer const& buf, int dest, int tag) const
-    {
-        TLLM_CHECK(buf.getMemoryType() != runtime::MemoryType::kGPU);
-        send(buf.data(), buf.getSizeInBytes(), MpiType::kBYTE, dest, tag);
-    }
+    void send(runtime::IBuffer const& buf, int dest, int tag) const;
 
     template <typename T>
     void send(T const& value, int dest, int tag) const
@@ -302,11 +295,7 @@ public:
 
     MPI_Status recv(void* buffer, size_t size, MpiType dtype, int source, int tag) const;
 
-    MPI_Status recv(runtime::IBuffer& buf, int source, int tag) const
-    {
-        TLLM_CHECK(buf.getMemoryType() != runtime::MemoryType::kGPU);
-        return recv(buf.data(), buf.getSizeInBytes(), MpiType::kBYTE, source, tag);
-    }
+    MPI_Status recv(runtime::IBuffer& buf, int source, int tag) const;
 
     template <typename T>
     MPI_Status recv(T& value, int source, int tag) const

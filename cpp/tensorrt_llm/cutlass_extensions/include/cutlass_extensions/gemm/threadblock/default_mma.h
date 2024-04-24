@@ -29,7 +29,7 @@ namespace threadblock
 
 ////////////////////////////////////////////////////////////////////////////////
 
-/// Specialization for row-major output (OperatorClass TensorOp), fp16 activation & int8 weight
+/// Specialization for row-major output (OperatorClass TensorOp), fp16 activation & int8 weight, mma pipelined (stage=2)
 template <
     /// Layout type for A matrix operand
     typename LayoutA,
@@ -77,7 +77,7 @@ public:
 };
 
 ////////////////////////////////////////////////////////////////////////////////
-/// Specialization for row-major output (OperatorClass TensorOp), fp16 activation & int4 weight
+/// Specialization for row-major output (OperatorClass TensorOp), fp16 activation & int4 weight, mma pipelined (stage=2)
 template <
     /// Layout type for A matrix operand
     typename LayoutA,
@@ -124,6 +124,9 @@ public:
     using ThreadblockMma = typename Mma::ThreadblockMma;
 };
 
+////////////////////////////////////////////////////////////////////////////////
+/// Specialization for row-major output (OperatorClass TensorOp), fp16 activation & int8 weight, mma multistage
+/// (stage>=3)
 template <
     /// Layout type for A matrix operand
     typename LayoutA,
@@ -176,7 +179,8 @@ public:
 };
 
 ////////////////////////////////////////////////////////////////////////////////
-/// Specialization for row-major output (OperatorClass TensorOp), fp16 activation & int4 weight
+/// Specialization for row-major output (OperatorClass TensorOp), fp16 activation & int4 weight, mma multistage
+/// (stage>=3)
 template <
     /// Layout type for A matrix operand
     typename LayoutA,
@@ -227,6 +231,63 @@ public:
     // Define the threadblock-scoped pipelined matrix multiply
     using ThreadblockMma = typename Mma::ThreadblockMma;
 };
+
+#ifdef ENABLE_FP8
+////////////////////////////////////////////////////////////////////////////////
+/// Specialization for row-major output (OperatorClass TensorOp), fp8 activation & int4 weight, mma multistage
+/// (stage>=3)
+template <
+    /// Layout type for A matrix operand
+    typename LayoutA,
+    /// Access granularity of A matrix in units of elements
+    int kAlignmentA,
+    /// Layout type for B matrix operand
+    typename LayoutB,
+    /// Access granularity of B matrix in units of elements
+    int kAlignmentB,
+    /// Element type for internal accumulation
+    typename ElementAccumulator,
+    /// Tag indicating architecture to tune for
+    typename ArchTag,
+    /// Threadblock-level tile size (concept: GemmShape)
+    typename ThreadblockShape,
+    /// Warp-level tile size (concept: GemmShape)
+    typename WarpShape,
+    /// Instruction-level tile size (concept: GemmShape)
+    typename InstructionShape,
+    /// Operation performed by GEMM
+    typename Operator,
+    ///
+    int kStages,
+    /// Shared memory clear option
+    SharedMemoryClearOption SharedMemoryClear>
+struct DefaultMma<cutlass::float_e4m3_t, LayoutA, kAlignmentA, uint4b_t, LayoutB, kAlignmentB, ElementAccumulator,
+    layout::RowMajor, arch::OpClassTensorOp, ArchTag, ThreadblockShape, WarpShape, InstructionShape, kStages, Operator,
+    false, SharedMemoryClear>
+{
+
+private:
+    static constexpr int kAlignmentScale = 128 / sizeof_bits<half_t>::value;
+
+    using Mma = DqMma<cutlass::float_e4m3_t, LayoutA, kAlignmentA, uint4b_t, LayoutB, kAlignmentB, half_t,
+        layout::RowMajor, kAlignmentScale, ElementAccumulator, layout::RowMajor, arch::OpClassTensorOp, ArchTag,
+        ThreadblockShape, WarpShape, InstructionShape, kStages, Operator, SharedMemoryClear>;
+
+public:
+    // Define the MmaCore components
+    using MmaCore = typename Mma::MmaCore;
+
+    // Define iterators over tiles from the A operand
+    using IteratorA = typename Mma::IteratorA;
+
+    // Define iterators over tiles from the B operand
+    using IteratorB = typename Mma::IteratorB;
+
+    // Define the threadblock-scoped pipelined matrix multiply
+    using ThreadblockMma = typename Mma::ThreadblockMma;
+};
+
+#endif
 
 // fp16 x fp16 specialization on Ampere to use mma multistage for 2 stage. Helps avoid reg spills on
 // large tile when not enough shared mem is present to do 3+ stage

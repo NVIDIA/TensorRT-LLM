@@ -27,18 +27,18 @@ namespace torch_ext
 {
 
 // Must be similar to [cpp/tensorrt_llm/runtime/gptSession.cpp] GptDecoder<T>::gatherTree
-th::Tensor gatherTree(                                    // BS: batch_size, BM: beam_width, mSL: max_seq_length
+th::Tensor gatherTree(                                    // BS: batch_size, BM: beam_width, MSL: max_seq_length
     th::Tensor& sequence_lengths,                         // [BS*BM], int
-    th::Tensor& output_ids,                               // [BS, BM, mSL],int
-    th::Tensor& parent_ids,                               // [BS, BM, mSL], int
+    th::Tensor& output_ids,                               // [BS, BM, MSL],int
+    th::Tensor& parent_ids,                               // [BS, BM, MSL], int
     th::Tensor& end_ids,                                  // [BS*BM], int
     th::Tensor& tiled_input_lengths,                      // [BS*BM], int
     th::optional<th::Tensor> cum_log_probs_opt,           // [BS, BM], float
-    th::optional<th::Tensor> beam_hyps_output_ids_cba,    // [BS, BM*2, mSL], int
+    th::optional<th::Tensor> beam_hyps_output_ids_cba,    // [BS, BM*2, MSL], int
     th::optional<th::Tensor> beam_hyps_seq_len_cba,       // [BS, BM*2], int
     th::optional<th::Tensor> beam_hyps_cum_log_probs_cba, // [BS, BM*2], float
     th::optional<th::Tensor> beam_hyps_normed_scores_cba, // [BS, BM*2], float
-    th::optional<th::Tensor> beam_hyps_log_probs_cba,     // [BS, BM*2, mSL], float
+    th::optional<th::Tensor> beam_hyps_log_probs_cba,     // [BS, BM*2, MSL], float
     th::optional<th::Tensor> beam_hyps_min_normed_scores, // [BS], float
     th::optional<th::Tensor> beam_hyps_num_beams,         // [BS], int
     th::optional<th::Tensor> beam_hyps_is_done,           // [BS], bool
@@ -60,27 +60,27 @@ th::Tensor gatherTree(                                    // BS: batch_size, BM:
             final_output_ids_ptr, get_ptr<int32_t>(end_ids), batch_size * beam_width, max_seq_len, stream);
 
         tk::BeamHypotheses bh;
-        bh.batch_size = batch_size;
-        bh.beam_width = beam_width;
-        bh.max_seq_len = max_seq_len;
-        bh.length_penalties = get_ptr<float>(length_penalty);
-        bh.input_lengths = get_ptr<int32_t>(tiled_input_lengths);
-        bh.final_output_ids = final_output_ids_ptr;
-        bh.log_probs = nullptr;
-        bh.seq_len = get_ptr<int32_t>(sequence_lengths);
-        bh.cum_log_probs = cum_log_probs_opt.has_value() ? get_ptr<float>(cum_log_probs_opt.value()) : nullptr;
-        bh.output_ids_cba = get_ptr<int32_t>(beam_hyps_output_ids_cba.value());
-        bh.log_probs_cba = get_ptr<float>(beam_hyps_log_probs_cba.value());
-        bh.seq_len_cba = get_ptr<int32_t>(beam_hyps_seq_len_cba.value());
-        bh.cum_log_probs_cba = get_ptr<float>(beam_hyps_cum_log_probs_cba.value());
-        bh.normed_scores_cba = get_ptr<float>(beam_hyps_normed_scores_cba.value());
-        bh.num_beams = get_ptr<int32_t>(beam_hyps_num_beams.value());
-        bh.min_normed_scores = get_ptr<float>(beam_hyps_min_normed_scores.value());
-        bh.is_done = get_ptr<bool>(beam_hyps_is_done.value());
+        bh.nBatchSize = batch_size;
+        bh.nBeamWidth = beam_width;
+        bh.nMaxSeqLen = max_seq_len;
+        bh.lengthPenalties = get_ptr<float>(length_penalty);
+        bh.inputLengths = get_ptr<int32_t>(tiled_input_lengths);
+        bh.outputIds = final_output_ids_ptr;
+        bh.logProbs = nullptr; //  TODO (wili): add this output?
+        bh.sequenceLengths = get_ptr<int32_t>(sequence_lengths);
+        bh.cumLogProbs = cum_log_probs_opt.has_value() ? get_ptr<float>(cum_log_probs_opt.value()) : nullptr;
+        bh.outputIdsCBA = get_ptr<int32_t>(beam_hyps_output_ids_cba.value());
+        bh.logProbsCBA = get_ptr<float>(beam_hyps_log_probs_cba.value());
+        bh.sequenceLengthsCBA = get_ptr<int32_t>(beam_hyps_seq_len_cba.value());
+        bh.cumLogProbsCBA = get_ptr<float>(beam_hyps_cum_log_probs_cba.value());
+        bh.normedScoresCBA = get_ptr<float>(beam_hyps_normed_scores_cba.value());
+        bh.numBeamsCBA = get_ptr<int32_t>(beam_hyps_num_beams.value());
+        bh.minNormedScoresCBA = get_ptr<float>(beam_hyps_min_normed_scores.value());
+        bh.batchDones = get_ptr<bool>(beam_hyps_is_done.value());
         bh.finished
             = reinterpret_cast<tk::FinishedState*>(get_ptr<tk::FinishedState::UnderlyingType>(finished.value()));
-        bh.output_ids_src = get_ptr<int32_t>(output_ids);
-        bh.parent_ids_src = get_ptr<int32_t>(parent_ids);
+        bh.outputIdsUnfinish = get_ptr<int32_t>(output_ids);
+        bh.parentIdsUnfinish = get_ptr<int32_t>(parent_ids);
 
         tk::invokeInsertUnfinishedPath(bh, stream);
         sync_check_cuda_error();

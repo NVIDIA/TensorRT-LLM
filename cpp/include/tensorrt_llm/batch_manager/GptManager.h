@@ -21,7 +21,7 @@
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/schedulerPolicy.h"
 #include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
-#include "tensorrt_llm/runtime/gptModelConfig.h"
+#include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <atomic>
@@ -79,9 +79,13 @@ public:
     virtual ~GptManager();
 
 protected:
+    /* Synchronizes the decoder */
+    virtual BatchManagerErrorCode_t forwardSync();
+
     /* Invokes one step of backend
        Updates state of all requests */
-    virtual BatchManagerErrorCode_t step(RequestList& activeRequests, std::set<uint64_t>& activeRequestsIds);
+    virtual BatchManagerErrorCode_t forwardAsync(
+        RequestList& activeRequests, std::unordered_set<uint64_t>& activeRequestsIds);
 
 private:
     [[nodiscard]] SizeType getMaxInputLen() const;
@@ -89,7 +93,7 @@ private:
     [[nodiscard]] SizeType getMaxNumSequences() const;
 
     void validateLlmRequest(
-        LlmRequest& newReq, runtime::GptModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig) const;
+        LlmRequest& newReq, runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig) const;
     static std::shared_ptr<LlmRequest> fillLlmRequest(std::shared_ptr<InferenceRequest> newReq);
     static std::shared_ptr<std::vector<TokenIdType>> getReqInputTokens(std::shared_ptr<InferenceRequest> newReq);
     static SizeType getMaxNewTokens(std::shared_ptr<InferenceRequest> newReq);
@@ -108,7 +112,7 @@ private:
     // List of live requests
     RequestList mActiveRequests;
     // IDs of live requests
-    std::set<uint64_t> mActiveRequestsIds;
+    std::unordered_set<uint64_t> mActiveRequestsIds;
     // Boolean that controls if prompt should be included in output tokens for non-streaming
     bool mExcludeInputInOutput;
 

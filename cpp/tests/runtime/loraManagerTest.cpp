@@ -21,13 +21,13 @@
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
-#include "tensorrt_llm/runtime/gptModelConfig.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/loraCache.h"
 #include "tensorrt_llm/runtime/loraManager.h"
 #include "tensorrt_llm/runtime/loraModule.h"
 #include "tensorrt_llm/runtime/loraUtils.h"
+#include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include "tensorrt_llm/runtime/utils/numpyUtils.h"
@@ -59,7 +59,7 @@ class LoraManagerTest : public ::testing::Test // NOLINT(cppcoreguidelines-pro-t
 {
 protected:
     LoraManagerTest()
-        : mModelConfig(1, 2, 1, 4, nvinfer1::DataType::kFLOAT)
+        : mModelConfig(1, 2, 0, 1, 4, nvinfer1::DataType::kFLOAT)
     {
     }
 
@@ -75,12 +75,12 @@ protected:
 
     std::unique_ptr<BufferManager> mManager;
     BufferManager::CudaStreamPtr mStream;
-    GptModelConfig mModelConfig;
+    ModelConfig mModelConfig;
     WorldConfig mWorldConfig;
 
     PeftTable getPeftTable(SizeType tpRank = 0)
     {
-        auto modelConfig = GptModelConfig(0, 2, 1, 16, nvinfer1::DataType::kFLOAT);
+        auto modelConfig = ModelConfig(0, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
         modelConfig.setMlpHiddenSize(32);
         auto worldConfig = WorldConfig(2, 2, 3);
         std::vector<LoraModule> modules{
@@ -143,15 +143,15 @@ TEST_F(LoraManagerTest, moduleParsing)
 
 static void checkLoraTensors(LoraManager const& loraManager, std::vector<int64_t> const& targetPtrs,
     TensorPtr weightsPtrs, std::vector<int32_t> const& targetAdapterSizes, TensorPtr adapterSizes,
-    GptModelConfig const& modelConfig, WorldConfig const& worldConfig, std::vector<LoraModule> const& modules,
+    ModelConfig const& modelConfig, WorldConfig const& worldConfig, std::vector<LoraModule> const& modules,
     SizeType numModules, SizeType numLayers, SizeType numSeqs, bool checkPointers = true)
 {
     auto adapterSizesPtr = bufferCast<SizeType>(*adapterSizes);
     auto weightsPtrsPtr = bufferCast<int64_t>(*weightsPtrs);
     ASSERT_EQ(targetPtrs.size(), weightsPtrs->getSize());
     ASSERT_EQ(targetAdapterSizes.size(), adapterSizes->getSize());
-    auto firstLayerId
-        = modelConfig.getNbLayers(worldConfig.getPipelineParallelism()) * worldConfig.getPipelineParallelRank();
+    auto firstLayerId = modelConfig.getNbAttentionLayers(worldConfig.getPipelineParallelism())
+        * worldConfig.getPipelineParallelRank();
     LoraManager::TensorMap expectedTensors;
 
     for (SizeType m = 0; m < numModules; ++m)
@@ -292,7 +292,7 @@ static std::tuple<std::vector<int32_t>, std::vector<int64_t>, PeftTable> createF
 TEST_F(LoraManagerTest, fillInputTensors)
 {
     LoraManager loraManager;
-    auto modelConfig = GptModelConfig(0, 2, 1, 16, nvinfer1::DataType::kFLOAT);
+    auto modelConfig = ModelConfig(0, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
     modelConfig.setMlpHiddenSize(32);
     auto worldConfig = WorldConfig(1, 1, 0);
     std::vector<LoraModule> modules{
@@ -313,7 +313,7 @@ TEST_F(LoraManagerTest, fillInputTensors)
     modelConfig.setLoraModules(modules);
     loraManager.create(modelConfig, worldConfig, *mManager);
     auto numModules = static_cast<SizeType>(modelConfig.getLoraModules().size());
-    auto numLayers = static_cast<SizeType>(modelConfig.getNbLayers());
+    auto numLayers = static_cast<SizeType>(modelConfig.getNbAttentionLayers());
     SizeType numSeqs = 4;
     TensorPtr weightsPtrs
         = mManager->cpu(ITensor::makeShape({numModules, numLayers, numSeqs, 2}), nvinfer1::DataType::kINT64);

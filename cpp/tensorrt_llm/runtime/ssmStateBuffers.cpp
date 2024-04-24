@@ -33,7 +33,7 @@ SsmStateBuffers::SsmStateBuffers()
 }
 
 SsmStateBuffers::SsmStateBuffers(
-    TllmRuntime const& runtime, runtime::GptModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig)
+    TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK(modelConfig.isSsmBased());
@@ -49,7 +49,7 @@ SsmStateBuffers::SsmStateBuffers(
     auto hiddenSize = modelConfig.getHiddenSize();
     mDInner = expand * hiddenSize;
     auto dType = modelConfig.getDataType();
-    auto const localNbLayers = modelConfig.getNbLayers(worldConfig.getPipelineParallelism());
+    auto const localNbLayers = modelConfig.getNbSsmLayers(worldConfig.getPipelineParallelism());
     mLocalNbLayers = localNbLayers;
     mMaxBeamWidth = maxBeamWidth;
     mUseMambaConv1dPlugin = modelConfig.useMambaConv1dPlugin();
@@ -165,7 +165,7 @@ void SsmStateBuffers::fillStatePtrs()
 }
 
 void SsmStateBuffers::reshape(
-    GenerationConfig const& generationConfig, GptModelConfig const& modelConfig, WorldConfig const& worldConfig)
+    GenerationConfig const& generationConfig, ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     auto const batchSize = generationConfig.batchSize;
 
@@ -223,7 +223,7 @@ void SsmStateBuffers::prepareContextStep(RuntimeBuffers* runtimeBuffers, BufferM
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
-void SsmStateBuffers::tile(RuntimeBuffers* runtimeBuffers, BufferManager& manager, GptModelConfig const& modelConfig,
+void SsmStateBuffers::tile(RuntimeBuffers* runtimeBuffers, BufferManager& manager, ModelConfig const& modelConfig,
     WorldConfig const& worldConfig)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
@@ -252,7 +252,7 @@ void SsmStateBuffers::tile(RuntimeBuffers* runtimeBuffers, BufferManager& manage
 }
 
 void SsmStateBuffers::postContextStep(RuntimeBuffers* runtimeBuffers, std::vector<RuntimeBuffers> const& contextBuffers,
-    BufferManager& manager, GptModelConfig const& modelConfig, WorldConfig const& worldConfig)
+    BufferManager& manager, ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     auto& generationConfig = runtimeBuffers->generationConfig;
@@ -285,7 +285,7 @@ void SsmStateBuffers::postContextStep(RuntimeBuffers* runtimeBuffers, std::vecto
 
 void SsmStateBuffers::getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers, TensorMap& inputBuffers,
     TensorMap& outputBuffers, SizeType const step, TensorPtr const& inputIds, TensorPtr const& commPtrs,
-    GptModelConfig const& modelConfig, WorldConfig const& worldConfig) const
+    ModelConfig const& modelConfig, WorldConfig const& worldConfig) const
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     auto& logits = runtimeBuffers->logits;
@@ -314,7 +314,7 @@ void SsmStateBuffers::getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers, Te
 
     inputBuffers.insert_or_assign("last_token_ids", lastTokenIds);
 
-    auto const localNbLayers = modelConfig.getNbLayers(worldConfig.getPipelineParallelism());
+    auto const localNbLayers = modelConfig.getNbSsmLayers(worldConfig.getPipelineParallelism());
     auto const firstLayerId = worldConfig.getPipelineParallelRank() * localNbLayers;
 
     if (modelConfig.usePagedState())

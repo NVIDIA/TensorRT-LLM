@@ -92,6 +92,7 @@ public:
         , mCumLogProbs(samplingConfig.beamWidth)
         , mDraftTokens(draftTokens.value_or(std::make_shared<VecTokens>()))
         , mDraftLogits(draftLogits)
+        , mNumTokensPerIteration(1)
         , mReturnContextLogits(returnContextLogits)
         , mReturnGenerationLogits(returnGenerationLogits)
         , mExcludeInputFromOutput(excludeInputFromOutput)
@@ -189,9 +190,9 @@ public:
         {
             auto const maxNewTokens = maxSequenceLen - mPromptLen;
             TLLM_LOG_WARNING(
-                "Number of requested output tokens (%d) exceeds maximum sequence length (%d). "
+                "Prompt length + number of requested output tokens (%d + %d) exceeds maximum sequence length (%d). "
                 "Number of requested output tokens is changed to (%d).",
-                mMaxNewTokens, maxSequenceLen, maxNewTokens);
+                mPromptLen, mMaxNewTokens, maxSequenceLen, maxNewTokens);
             mMaxNewTokens = maxNewTokens;
         }
 
@@ -494,6 +495,16 @@ public:
         return mDraftTokens->size();
     }
 
+    void setNumTokensPerIteration(SizeType numTokensPerIteration)
+    {
+        mNumTokensPerIteration = numTokensPerIteration;
+    }
+
+    SizeType getNumTokensPerIteration() const
+    {
+        return mNumTokensPerIteration;
+    }
+
     void setReturnContextLogits(bool const returnContextLogits)
     {
         mReturnContextLogits = returnContextLogits;
@@ -766,6 +777,7 @@ protected:
     VecLogProbs mCumLogProbs;           // [beamSize]
     std::shared_ptr<VecTokens> mDraftTokens;
     std::optional<TensorPtr> mDraftLogits;
+    SizeType mNumTokensPerIteration;
 
     // Save logits
     bool mReturnContextLogits;

@@ -21,7 +21,7 @@
 #include "tensorrt_llm/runtime/decodingInput.h"
 #include "tensorrt_llm/runtime/decodingMode.h"
 #include "tensorrt_llm/runtime/decodingOutput.h"
-#include "tensorrt_llm/runtime/gptModelConfig.h"
+#include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 #include <curand_kernel.h>

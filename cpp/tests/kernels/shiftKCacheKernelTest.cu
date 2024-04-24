@@ -287,7 +287,7 @@ public:
         if (pagedKvCache)
         {
             auto inputBlockOffsetsHostRange
-                = BufferRange<std::remove_const_t<KVBlockArray::DataType>>(*mInputBlockOffsetsHost);
+                = BufferRange<std::remove_const_t<KVBlockArray::DataType::UnderlyingType>>(*mInputBlockOffsetsHost);
             std::iota(inputBlockOffsetsHostRange.begin(), inputBlockOffsetsHostRange.end(), 0);
             mBufferManager->copy(*mInputBlockOffsetsHost, *mInputBlockOffsetsDevice);
         }

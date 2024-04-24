@@ -38,14 +38,14 @@ TransformerBuffers::TransformerBuffers()
 }
 
 TransformerBuffers::TransformerBuffers(
-    TllmRuntime const& runtime, runtime::GptModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig)
+    TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK(modelConfig.isTransformerBased());
     auto& manager = runtime.getBufferManager();
     auto& engine = runtime.getEngine();
 
-    auto const localNbLayers = modelConfig.getNbLayers(worldConfig.getPipelineParallelism());
+    auto const localNbLayers = modelConfig.getNbAttentionLayers(worldConfig.getPipelineParallelism());
     auto const firstLayerId = worldConfig.getPipelineParallelRank() * localNbLayers;
 
     nvinfer1::DataType kvDtype;
@@ -86,7 +86,7 @@ TransformerBuffers::TransformerBuffers(
 }
 
 void TransformerBuffers::reshape(GenerationConfig const& generationConfig, KvCacheManager const* kvCacheManager,
-    GptModelConfig const& modelConfig, WorldConfig const& worldConfig)
+    ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto const batchSize = generationConfig.batchSize;
@@ -118,7 +118,7 @@ void TransformerBuffers::reshape(GenerationConfig const& generationConfig, KvCac
         utils::reshapeBufferVector(presentKeysVals, kvCacheReserve);
     }
 
-    auto const localNbLayers = modelConfig.getNbLayers(worldConfig.getPipelineParallelism());
+    auto const localNbLayers = modelConfig.getNbAttentionLayers(worldConfig.getPipelineParallelism());
 
     if (modelConfig.useGptAttentionPlugin())
     {
@@ -140,7 +140,7 @@ void TransformerBuffers::reshape(GenerationConfig const& generationConfig, KvCac
 void TransformerBuffers::reset(BufferManager& manager) {}
 
 TransformerBuffers TransformerBuffers::sliceTo(
-    GenerationConfig const& generationConfig, GptModelConfig const& modelConfig, SizeType offset, SizeType batchSize)
+    GenerationConfig const& generationConfig, ModelConfig const& modelConfig, SizeType offset, SizeType batchSize)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TransformerBuffers buffers;
@@ -236,7 +236,7 @@ static std::vector<SizeType> getPositionIdsContextPhaseGlm(SizeType const& batch
 
 void TransformerBuffers::prepareContextStep(RuntimeBuffers* runtimeBuffers, TensorPtr const& inputIds,
     TokenIdType const padId, BufferManager& manager, KvCacheManager const* kvCacheManager, SizeType firstBatchSlotIdx,
-    GptModelConfig const& modelConfig, WorldConfig const& worldConfig)
+    ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto& generationConfig = runtimeBuffers->generationConfig;
@@ -251,7 +251,7 @@ void TransformerBuffers::prepareContextStep(RuntimeBuffers* runtimeBuffers, Tens
     auto const& inputShape = inputIds->getShape();
 
     // get local number of layers.
-    auto const localNbLayers = modelConfig.getNbLayers(worldConfig.getPipelineParallelism());
+    auto const localNbLayers = modelConfig.getNbAttentionLayers(worldConfig.getPipelineParallelism());
 
     if (modelConfig.useGptAttentionPlugin())
     {
@@ -270,7 +270,7 @@ void TransformerBuffers::prepareContextStep(RuntimeBuffers* runtimeBuffers, Tens
         auto const contextLengthsHostPtr = bufferCast<SizeType const>(*contextLengthsHost);
         auto const modelVariant = modelConfig.getModelVariant();
 
-        if (modelVariant == GptModelConfig::ModelVariant::kGpt)
+        if (modelVariant == ModelConfig::ModelVariant::kGpt)
         {
             auto const inputSize = inputIds->getSize();
             std::vector<SizeType> positionIdsVec(inputSize);
@@ -283,7 +283,7 @@ void TransformerBuffers::prepareContextStep(RuntimeBuffers* runtimeBuffers, Tens
             }
             positionIds = manager.copyFrom(positionIdsVec, inputShape, MemoryType::kGPU);
         }
-        else if (modelVariant == GptModelConfig::ModelVariant::kGlm)
+        else if (modelVariant == ModelConfig::ModelVariant::kGlm)
         {
             auto const positionIdsVec = getPositionIdsContextPhaseGlm(batchSize, maxInputLength, contextLengthsHostPtr,
                 modelConfig.useGptAttentionPlugin(), modelConfig.usePackedInput());
@@ -435,7 +435,7 @@ void TransformerBuffers::copyAttentionMasks(
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void TransformerBuffers::tile(RuntimeBuffers* runtimeBuffers, BufferManager& manager, GptModelConfig const& modelConfig,
+void TransformerBuffers::tile(RuntimeBuffers* runtimeBuffers, BufferManager& manager, ModelConfig const& modelConfig,
     WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -479,7 +479,7 @@ void TransformerBuffers::tile(RuntimeBuffers* runtimeBuffers, BufferManager& man
 }
 
 void TransformerBuffers::postContextStep(RuntimeBuffers* runtimeBuffers,
-    std::vector<RuntimeBuffers> const& contextBuffers, BufferManager& manager, GptModelConfig const& modelConfig,
+    std::vector<RuntimeBuffers> const& contextBuffers, BufferManager& manager, ModelConfig const& modelConfig,
     WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -524,7 +524,7 @@ void TransformerBuffers::postContextStep(RuntimeBuffers* runtimeBuffers,
 }
 
 void TransformerBuffers::prepareNextStep(RuntimeBuffers* runtimeBuffers, SizeType const step, BufferManager& manager,
-    KvCacheManager* kvCacheManager, SizeType firstBatchSlotIdx, GptModelConfig const& modelConfig,
+    KvCacheManager* kvCacheManager, SizeType firstBatchSlotIdx, ModelConfig const& modelConfig,
     WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -562,13 +562,13 @@ void TransformerBuffers::prepareNextStep(RuntimeBuffers* runtimeBuffers, SizeTyp
 
         auto const modelVariant = modelConfig.getModelVariant();
 
-        if (modelVariant == GptModelConfig::ModelVariant::kGpt)
+        if (modelVariant == ModelConfig::ModelVariant::kGpt)
         {
             positionIds->reshape(inputShape);
             manager.copy(*contextLengthsDevice, *positionIds);
             kernels::invokeAdd(*positionIds, step, stream);
         }
-        else if (modelVariant == GptModelConfig::ModelVariant::kGlm)
+        else if (modelVariant == ModelConfig::ModelVariant::kGlm)
         {
             auto const positionIdsVec = getPositionIdsGenerationPhaseGlm(batchSize, beamWidth, step,
                 contextLengthsHostPtr, modelConfig.useGptAttentionPlugin(), modelConfig.usePackedInput());
@@ -643,7 +643,7 @@ void TransformerBuffers::prepareNextStep(RuntimeBuffers* runtimeBuffers, SizeTyp
 
 void TransformerBuffers::getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers, TensorMap& inputBuffers,
     TensorMap& outputBuffers, SizeType const step, TensorPtr const& inputIds, TensorPtr const& commPtrs,
-    GptModelConfig const& modelConfig, WorldConfig const& worldConfig) const
+    ModelConfig const& modelConfig, WorldConfig const& worldConfig) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     inputBuffers.clear();
@@ -682,7 +682,7 @@ void TransformerBuffers::getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers,
     }
     inputBuffers.insert_or_assign("position_ids", positionIds);
 
-    auto const localNbLayers = modelConfig.getNbLayers(worldConfig.getPipelineParallelism());
+    auto const localNbLayers = modelConfig.getNbAttentionLayers(worldConfig.getPipelineParallelism());
     auto const firstLayerId = worldConfig.getPipelineParallelRank() * localNbLayers;
 
     if (modelConfig.useGptAttentionPlugin())

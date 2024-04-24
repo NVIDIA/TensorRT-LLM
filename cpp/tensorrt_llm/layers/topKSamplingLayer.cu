@@ -20,6 +20,7 @@
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
 #include "tensorrt_llm/kernels/samplingTopPKernels.h"
+#include "tensorrt_llm/layers/defaultDecodingParams.h"
 #include "tensorrt_llm/layers/topKSamplingLayer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
@@ -136,8 +137,8 @@ void TopKSamplingLayer<T>::setup(SizeType const batchSize, SizeType const* batch
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    SizeType32 constexpr defaultTopK = 0;
-    auto runtimeTopK = setupParams.runtime_top_k.value_or(std::vector<SizeType32>{defaultTopK});
+    auto const defaultTopK = DefaultDecodingParams::getTopK();
+    auto runtimeTopK = setupParams.runtime_top_k.value_or(std::vector<SizeType32>(batchSize, defaultTopK));
     auto runtimeTopP = setupParams.runtime_top_p.value_or(std::vector<float>{});
 
     auto const runtimeTopKSize = runtimeTopK.size();
@@ -163,7 +164,7 @@ void TopKSamplingLayer<T>::setup(SizeType const batchSize, SizeType const* batch
     }
 
     auto const topK = *std::max_element(std::begin(runtimeTopK), std::end(runtimeTopK));
-    auto const topP = (runtimeTopPSize == 0) ? 0.0f : runtimeTopP.front();
+    auto const topP = (runtimeTopPSize == 0) ? DefaultDecodingParams::getTopP() : runtimeTopP.front();
 
     if (runtimeTopKSize > 1)
     {

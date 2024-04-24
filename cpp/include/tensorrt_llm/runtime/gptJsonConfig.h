@@ -17,7 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/runtime/common.h"
-#include "tensorrt_llm/runtime/gptModelConfig.h"
+#include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <filesystem>
@@ -32,13 +32,13 @@ class GptJsonConfig
 {
 public:
     GptJsonConfig(std::string name, std::string version, std::string precision, SizeType tensorParallelism,
-        SizeType pipelineParallelism, GptModelConfig const& modelConfig)
+        SizeType pipelineParallelism, ModelConfig const& modelConfig)
         : mName(std::move(name))
         , mVersion(std::move(version))
         , mPrecision(std::move(precision))
         , mTensorParallelism{tensorParallelism}
         , mPipelineParallelism{pipelineParallelism}
-        , mGptModelConfig(modelConfig)
+        , mModelConfig(modelConfig)
     {
     }
 
@@ -48,9 +48,9 @@ public:
 
     static GptJsonConfig parse(std::filesystem::path const& path);
 
-    [[nodiscard]] GptModelConfig getModelConfig() const
+    [[nodiscard]] ModelConfig getModelConfig() const
     {
-        return mGptModelConfig;
+        return mModelConfig;
     }
 
     [[nodiscard]] std::string const& getName() const
@@ -96,7 +96,7 @@ private:
     std::string const mPrecision;
     SizeType const mTensorParallelism;
     SizeType const mPipelineParallelism;
-    GptModelConfig const mGptModelConfig;
+    ModelConfig const mModelConfig;
 };
 
 } // namespace tensorrt_llm::runtime

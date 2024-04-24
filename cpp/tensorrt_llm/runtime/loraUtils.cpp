@@ -13,8 +13,8 @@
 #include "tensorrt_llm/runtime/loraUtils.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/runtime/common.h"
-#include "tensorrt_llm/runtime/gptModelConfig.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 #include <string>
 
@@ -52,7 +52,7 @@ void loraValidateRequestTensorDims(std::optional<ITensor::SharedPtr> const& optR
 
 void loraValidateRequestTensors(std::optional<std::uint64_t> const& optTaskId,
     std::optional<ITensor::SharedPtr> const& optReqLoraWeights,
-    std::optional<ITensor::SharedPtr> const& optReqLoraConfig, runtime::GptModelConfig const& modelConfig,
+    std::optional<ITensor::SharedPtr> const& optReqLoraConfig, runtime::ModelConfig const& modelConfig,
     runtime::WorldConfig const& worldConfig)
 {
     TLLM_CHECK_WITH_INFO(optTaskId.has_value(), "lora_task_id must be set for LoRA inference");
@@ -62,7 +62,7 @@ void loraValidateRequestTensors(std::optional<std::uint64_t> const& optTaskId,
 
         auto weights = optReqLoraWeights.value();
         auto config = optReqLoraConfig.value();
-        SizeType nbModelLayers = modelConfig.getNbLayers();
+        SizeType nbModelLayers = modelConfig.getNbAttentionLayers();
         TLLM_CHECK_WITH_INFO(weights->getDataType() == modelConfig.getDataType(),
             "Expected lora weights to be the same data type as base model");
 

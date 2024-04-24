@@ -63,6 +63,8 @@ public:
             && hostCacheSize == other.hostCacheSize && onboardBlocks == other.onboardBlocks;
     }
 
+    friend std::ostream& operator<<(std::ostream& os, KvCacheConfig const& self);
+
     std::optional<SizeType> maxTokens;
     std::optional<SizeType> maxAttentionWindow;
     std::optional<SizeType> sinkTokenLength;

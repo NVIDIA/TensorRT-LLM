@@ -435,6 +435,8 @@ class BuildConfig:
     plugin_config: PluginConfig = PluginConfig()
     max_encoder_input_len: int = 1  # for enc-dec DecoderModel
     use_fused_mlp: bool = False
+    dry_run: bool = False
+    visualize_network: bool = False
 
     @classmethod
     def from_dict(cls, config, plugin_config=None):
@@ -467,6 +469,10 @@ class BuildConfig:
             plugin_config = PluginConfig()
         if "plugin_config" in config.keys():
             plugin_config.update_from_dict(config["plugin_config"])
+
+        dry_run = config.pop('dry_run', False)
+        visualize_network = config.pop('visualize_network', False)
+
         return cls(
             max_input_len=max_input_len,
             max_output_len=max_output_len,
@@ -489,7 +495,9 @@ class BuildConfig:
             auto_parallel_config=auto_parallel_config,
             max_encoder_input_len=max_encoder_input_len,
             weight_sparsity=weight_sparsity,
-            plugin_config=plugin_config)
+            plugin_config=plugin_config,
+            dry_run=dry_run,
+            visualize_network=visualize_network)
 
     @classmethod
     def from_json_file(cls, config_file, plugin_config=None):
@@ -525,16 +533,21 @@ class EngineConfig:
                        config['version'])
 
     def to_dict(self):
+        build_config = self.build_config.to_dict()
+        build_config.pop('dry_run', None)  # Not an Engine Characteristic
+        build_config.pop('visualize_network',
+                         None)  # Not an Engine Characteristic
         return {
             'version': self.version,
             'pretrained_config': self.pretrained_config.to_dict(),
-            'build_config': self.build_config.to_dict(),
+            'build_config': build_config,
         }
 
 
 class Engine:
 
-    def __init__(self, config: EngineConfig, engine: trt.IHostMemory):
+    def __init__(self, config: EngineConfig, engine: Union[trt.IHostMemory,
+                                                           None]):
         self.config = config
         self.engine = engine
 
@@ -566,11 +579,12 @@ class Engine:
                       "w",
                       encoding="utf-8") as f:
                 json.dump(self.config.to_dict(), f, indent=4)
-        serialize_engine(
-            self.engine,
-            os.path.join(
-                engine_dir,
-                f'rank{self.config.pretrained_config.mapping.rank}.engine'))
+        if self.engine is not None:
+            serialize_engine(
+                self.engine,
+                os.path.join(
+                    engine_dir,
+                    f'rank{self.config.pretrained_config.mapping.rank}.engine'))
 
     @classmethod
     def from_dir(cls, engine_dir: str, rank: int = 0):
@@ -669,6 +683,11 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
             raise RuntimeError(
                 "FP8 Paged Context FMHA only works with fp8 quantization workflow currently."
             )
+        if (model.config.quant_mode.has_fp8_kv_cache()
+                and not network.plugin_config.use_fp8_context_fmha):
+            raise RuntimeError(
+                "Please also set --use_fp8_context_fmha=enable to make sure that Paged Context FMHA works with fp8 kv cache."
+            )
         if model.config.quant_mode.has_int8_kv_cache():
             raise RuntimeError(
                 "Paged Context FMHA doesn't work with int8 kv cache currently.")
@@ -727,8 +746,12 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
             mapping = network.auto_parallel_config["mapping"]
             model.config.mapping = mapping
 
+    if build_config.visualize_network:
+        network.to_dot(f'rank{model.config.mapping.rank}.dot')
+
     # Network -> Engine
-    engine = builder.build_engine(network, builder_config)
+    engine = None if build_config.dry_run else builder.build_engine(
+        network, builder_config)
     engine_config = EngineConfig(model.config, build_config, __version__)
 
     if build_config.output_timing_cache is not None and model.config.mapping.rank == 0:

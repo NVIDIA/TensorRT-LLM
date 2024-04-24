@@ -1,4 +1,6 @@
-# Performance Analysis of TensorRT-LLM
+(perf-analysis)=
+
+# Performance Analysis
 
 NVIDIA Nsight Systems reports at the application level are highly informative. Metric sampling capabilities have increased over generations and provide a clean middle-ground between timing analysis and kernel-level deep dives with NVIDIA Nsight Compute.
 

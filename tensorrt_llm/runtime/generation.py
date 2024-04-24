@@ -16,6 +16,7 @@
 import copy
 import csv
 import math
+import platform
 from dataclasses import dataclass, field
 from functools import reduce, wraps
 from pathlib import Path
@@ -2415,7 +2416,9 @@ class GenerationSession(object):
 
         if not ok:
             raise RuntimeError(f"Executing TRT engine failed step={step}!")
-        if self.debug_mode:
+
+        # TODO: remove this Windows WAR after https://nvbugs/4460474 is fixed.
+        if platform.system() == "Windows" or self.debug_mode:
             torch.cuda.synchronize()
 
         context_logits = None

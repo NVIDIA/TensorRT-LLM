@@ -914,13 +914,18 @@ def preprocess_weights(
     # INT4_AWQ
     if quant_algo == QuantAlgo.W4A8_AWQ or quant_algo == QuantAlgo.W4A16_AWQ:
         preprocessor = torch.ops.trtllm.preprocess_weights_for_mixed_gemm
+        if quant_algo == QuantAlgo.W4A8_AWQ:
+            activation_type = torch.float8_e4m3fn
+        elif quant_algo == QuantAlgo.W4A16_AWQ:
+            activation_type = torch.float16
         for name, param in weights.items():
             if name.endswith('weight') and param.dtype == torch.int8:
                 dtype = torch.float16
                 if model_config.dtype == "bfloat16":
                     dtype = torch.bfloat16
                 weights[name] = preprocessor(param.T.contiguous(),
-                                             torch.quint4x2).view(dtype)
+                                             torch.quint4x2,
+                                             activation_type).view(dtype)
             if name.endswith('weights_scaling_factor'):
                 weights[name] = param.T.contiguous().to(
                     str_dtype_to_torch(model_config.dtype))
@@ -1037,6 +1042,14 @@ def load_model(
         else:
             logger.warning(
                 f"Cannot find {model_path}. Use dummy model weights.")
+
+    if model_config.share_embedding_table:
+        if "lm_head.weight" in weights and "transformer.vocab_embedding.weight" in weights:
+            assert not (
+                weights["lm_head.weight"] -
+                weights["transformer.vocab_embedding.weight"]
+            ).any(
+            ), "When share_embedding_table is enabled, lm_head.weight and transformer.vocab_embedding.weight must be same."
 
     # Currently, use_parallel_embedding and share_embedding_table should be enabled before weight loading;
     # otherwise, the model will be inconsistent with the weights loaded from checkpoint.

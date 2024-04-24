@@ -42,6 +42,9 @@ struct RuntimeOptions
     tle::SizeType maxNewTokens;
     tle::SizeType beamWidth;
     tle::SizeType timeoutMs;
+
+    bool useOrchestratorMode;
+    std::string workerExecutablePath;
 };
 
 // Utility function to parse input arguments
@@ -71,6 +74,15 @@ int main(int argc, char* argv[])
 
     // Create the executor for this engine
     auto executorConfig = tle::ExecutorConfig(runtimeOpts.beamWidth);
+
+    if (runtimeOpts.useOrchestratorMode)
+    {
+        auto orchestratorConfig = tle::OrchestratorConfig(true, runtimeOpts.workerExecutablePath);
+        auto parallelConfig = tle::ParallelConfig(tle::CommunicationType::kMPI, tle::CommunicationMode::kORCHESTRATOR,
+            std::nullopt, std::nullopt, orchestratorConfig);
+        executorConfig.setParallelConfig(parallelConfig);
+    }
+
     auto executor = tle::Executor(runtimeOpts.trtEnginePath, tle::ModelType::kDECODER_ONLY, executorConfig);
 
     if (executor.canEnqueueRequests())
@@ -110,6 +122,10 @@ RuntimeOptions parseArgs(int argc, char* argv[])
         cxxopts::value<std::string>()->default_value("outputTokens.csv"));
     options.add_options()("timeout_ms", "The maximum time to wait for all responses, in milliseconds.",
         cxxopts::value<int>()->default_value("10000"));
+    options.add_options()("use_orchestrator_mode", "Use orchestrator communication mode.",
+        cxxopts::value<bool>()->default_value("false"));
+    options.add_options()("worker_executable_path", "The location of the worker executable.",
+        cxxopts::value<std::string>()->default_value(""));
 
     auto parsedOptions = options.parse(argc, argv);
 
@@ -148,6 +164,9 @@ RuntimeOptions parseArgs(int argc, char* argv[])
     runtimeOpts.beamWidth = parsedOptions["beam_width"].as<int>();
     runtimeOpts.timeoutMs = parsedOptions["timeout_ms"].as<int>();
     runtimeOpts.outputTokensCsvFile = parsedOptions["output_tokens_csv_file"].as<std::string>();
+
+    runtimeOpts.useOrchestratorMode = parsedOptions["use_orchestrator_mode"].as<bool>();
+    runtimeOpts.workerExecutablePath = parsedOptions["worker_executable_path"].as<std::string>();
 
     return runtimeOpts;
 }

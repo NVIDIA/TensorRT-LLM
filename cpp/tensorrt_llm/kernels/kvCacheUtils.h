@@ -16,6 +16,8 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/kernels/kvCacheIndex.h"
+
 #include <cmath>
 #include <cstdint>
 #include <cuda_fp16.h>
@@ -36,7 +38,7 @@ enum class KVIdxType : int32_t
 // only the fields necessary for context FMHA
 struct KVBlockArrayForContextFMHA
 {
-    using DataType = int32_t const;
+    using DataType = KVCacheIndex const;
 
     // Current number of sequences
     int32_t mMaxSeqs;
@@ -138,18 +140,18 @@ struct KVBlockArray : public KVBlockArrayForContextFMHA
         return tokenIdx;
     }
 
-    __host__ __device__ [[nodiscard]] inline int32_t const* getRowPtr(KVIdxType kvIdx, int32_t seqIdx) const
+    __host__ __device__ [[nodiscard]] inline DataType const* getRowPtr(KVIdxType kvIdx, int32_t seqIdx) const
     {
         // Returns pointer to array of offsets to K or V cache for one specific sequence seqIdx.
         // seqIdx is in range [0; B]
         return data + (seqIdx * mMaxBlocksPerSeq * 2 + static_cast<int32_t>(kvIdx) * mMaxBlocksPerSeq);
     }
 
-    __host__ __device__ inline void* getBlockPtr(int32_t const* offsets, int32_t tokenIdx) const
+    __host__ __device__ inline void* getBlockPtr(DataType const* offsets, int32_t tokenIdx) const
     {
         auto const offset = offsets[tokenIdx >> mTokensPerBlockLog2];
-        return reinterpret_cast<void*>(reinterpret_cast<char*>(getPoolPtr(offset))
-            + getBlockOffset(offset) * static_cast<uint64_t>(mBytesPerBlock));
+        return reinterpret_cast<void*>(
+            reinterpret_cast<char*>(getPoolPtr(offset)) + offset.get() * static_cast<uint64_t>(mBytesPerBlock));
     }
 
     __host__ __device__ [[nodiscard]] inline void* getBlockPtr(int32_t seqIdx, int32_t tokenIdx, KVIdxType kvIdx) const
@@ -183,21 +185,9 @@ struct KVBlockArray : public KVBlockArrayForContextFMHA
     }
 
 private:
-    static constexpr DataType secondaryPoolFlag = static_cast<DataType>(1) << (8 * sizeof(DataType) - 1);
-
-    __host__ __device__ [[nodiscard]] DataType getBlockOffset(DataType offset) const
-    {
-        return offset & (~secondaryPoolFlag);
-    }
-
-    __host__ __device__ [[nodiscard]] static bool isPrimary(DataType offset)
-    {
-        return (offset & secondaryPoolFlag) == 0;
-    }
-
     __host__ __device__ [[nodiscard]] void* getPoolPtr(DataType offset) const
     {
-        return isPrimary(offset) ? mPrimaryPoolPtr : mSecondaryPoolPtr;
+        return offset.isPrimary() ? mPrimaryPoolPtr : mSecondaryPoolPtr;
     }
 };
 

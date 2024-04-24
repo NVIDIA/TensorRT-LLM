@@ -146,24 +146,24 @@ void WeightOnlyGroupwiseQuantMatmulPlugin::init(nvinfer1::DataType type, int qua
     {
         if (quant_algo & FP8_ALPHA)
         {
-            // Hopper style kernels
-            if (mArch < 90)
+            // Ada & Hopper style kernels
+            if (mArch < 89)
             {
-                TLLM_THROW("W4A(fp)8 kernel is unsupported on pre-Hopper architectures!");
+                TLLM_THROW("W4A(fp)8 kernel is unsupported on pre-Ada (sm<89) architectures!");
             }
             if (quant_algo & ZERO)
             {
                 // has zeros
-                m_weightOnlyGroupwiseGemmRunner
-                    = std::make_shared<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<__nv_fp8_e4m3,
-                        cutlass::int4b_t, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS, half, half, half>>();
+                m_weightOnlyGroupwiseGemmRunner = std::make_shared<
+                    tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<__nv_fp8_e4m3, cutlass::uint4b_t,
+                        cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS, half, half, half>>();
             }
             else
             {
                 // no zeros
                 m_weightOnlyGroupwiseGemmRunner
                     = std::make_shared<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<__nv_fp8_e4m3,
-                        cutlass::int4b_t, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY, half, half, half>>();
+                        cutlass::uint4b_t, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY, half, half, half>>();
             }
         }
         else
@@ -192,10 +192,10 @@ void WeightOnlyGroupwiseQuantMatmulPlugin::init(nvinfer1::DataType type, int qua
     {
         if (quant_algo & FP8_ALPHA)
         {
-            // Hopper style kernels
-            if (mArch < 90)
+            // FP8 requires at least sm89 devices
+            if (mArch < 89)
             {
-                TLLM_THROW("FP8 is unsupported on pre-Hopper architectures!");
+                TLLM_THROW("W4A(fp)8 kernel is unsupported on pre-Ada (sm<89) architectures!");
             }
             TLLM_THROW("FP8 is unsupported on with BF16 scales and zero-points!");
         }
@@ -435,7 +435,6 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(nvinfer1::PluginTensorDesc con
         void const* cuda_kernel_zeros_ptr = zeros_ptr;
         void const* cuda_kernel_bias_ptr = biases_ptr;
         void* cuda_kernel_out_ptr = outputs[0];
-
         tensorrt_llm::kernels::weight_only::Params params{cuda_kernel_act_ptr, cuda_kernel_act_scale_ptr,
             cuda_kernel_weight_ptr, cuda_kernel_scales_ptr, cuda_kernel_zeros_ptr, cuda_kernel_bias_ptr,
             cuda_kernel_out_ptr, alpha, m, real_n, k, mGroupSize, mCudaKernelType,

@@ -23,7 +23,7 @@ namespace kernels
 namespace weight_only
 {
 INSTANTIATE_WEIGHT_ONLY_CUDA_DISPATCHERS(
-    KernelType::BF16Int4Groupwise, BF16DetailsA, Int4DetailsW, ColumnMajorInterleaved, true);
+    KernelType::BF16Int4Groupwise, BF16DetailsA, Int4DetailsW, ColumnMajorInterleaved, true, 64);
 } // namespace weight_only
 } // namespace kernels
 } // namespace tensorrt_llm

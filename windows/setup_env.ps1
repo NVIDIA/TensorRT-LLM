@@ -46,17 +46,17 @@ if (-not $skipCUDA){
         Write-Output "Removing CUDA installer"
         Remove-Item -Path 'cuda_installer.exe' -Force
         Write-Output "Done CUDA installation at 'C:\Program Files\NVIDIA Corporation' and 'C:\Program Files\NVIDIA GPU Computing Toolkit'"
-        Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog_test.txt -Value "0"
-        Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog_test.txt -Value $cudaVer
+        Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog.txt -Value "0"
+        Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog.txt -Value $cudaVer
     } else {
         Write-Output "CUDA Installation already exists"
-        Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog_test.txt -Value "1"
-        Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog_test.txt -Value "CUDA present"
+        Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog.txt -Value "1"
+        Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog.txt -Value "CUDA present"
     }
 } else {
         Write-Output "Skipping CUDA installation"
-        Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog_test.txt -Value "1"
-        Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog_test.txt -Value "CUDA present"
+        Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog.txt -Value "1"
+        Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog.txt -Value "CUDA present"
 }
 
 #Install Python 3.10
@@ -72,21 +72,21 @@ if(-not $skipPython){
         Copy-Item -Path 'C:\Program Files\Python310\python.exe' -Destination 'C:\Program Files\Python310\python3.exe'
         Write-Output "Done Python installation at 'C:\Program Files\Python310'"
         [Environment]::SetEnvironmentVariable('Path', "C:\Program Files\Python310;$env:Path", [EnvironmentVariableTarget]::Machine)
-        Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog_test.txt -Value "0"
+        Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog.txt -Value "0"
     } else {
         Write-Output "Python installation already exists"
-        Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog_test.txt -Value "1"
+        Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog.txt -Value "1"
     }
 } else {
         Write-Output "Skipping Python installation"
-        Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog_test.txt -Value "1"
+        Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog.txt -Value "1"
 }
 
 # Install Microsoft MPI
 if (-not ($skipMPI)) {
     if (-not (Test-Path -Path 'C:\Program Files\Microsoft MPI\Bin')) {
         Write-Output "Downloading Microsoft MPI not detected"
-        Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog_test.txt -Value "0"
+        Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog.txt -Value "0"
         Write-Output "Downloading Microsoft MPI installer"
         Invoke-WebRequest -Uri 'https://github.com/microsoft/Microsoft-MPI/releases/download/v10.1.1/msmpisetup.exe' -OutFile 'msmpisetup.exe'
         Write-Output "Installing Microsoft MPI"
@@ -94,7 +94,7 @@ if (-not ($skipMPI)) {
         Write-Output "Removing MPI installer"
         Remove-Item -Path 'msmpisetup.exe' -Force
         Write-Output "Adding MPI to system Path"
-        Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog_test.txt -Value "0"
+        Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog.txt -Value "0"
         [Environment]::SetEnvironmentVariable('Path', "$env:Path;C:\Program Files\Microsoft MPI\Bin", [EnvironmentVariableTarget]::Machine)
         Write-Output "Downloading Microsoft MPI SDK installer"
         Invoke-WebRequest -Uri 'https://github.com/microsoft/Microsoft-MPI/releases/download/v10.1.1/msmpisdk.msi' -OutFile 'msmpisdk.msi'
@@ -105,7 +105,7 @@ if (-not ($skipMPI)) {
         Write-Output "Done MPI installation at 'C:\Program Files\Microsoft MPI' and 'C:\Program Files (x86)\Microsoft SDKs\MPI'"
     } else {
         Write-Output "Microsoft MPI found"
-        Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog_test.txt -Value "1"
+        Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog.txt -Value "1"
 
         #Check if its part of PATH:
         $pathContent = [Environment]::GetEnvironmentVariable('path', 'Machine')
@@ -114,26 +114,25 @@ if (-not ($skipMPI)) {
         if ($pathContent -split ';'  -contains  $myPath)
         {
             Write-Output "MPI exists in PATH"
-            Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog_test.txt -Value "1"
+            Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog.txt -Value "1"
         } else {
             Write-Output "MPI does not exist in PATH, adding..."
-            Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog_test.txt -Value "0"
+            Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog.txt -Value "0"
             [Environment]::SetEnvironmentVariable('Path', "$env:Path;C:\Program Files\Microsoft MPI\Bin", [EnvironmentVariableTarget]::Machine)
         }
     }
 } else {
     Write-Output "Skipping MPI installation"
-    Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog_test.txt -Value "1"
-    Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog_test.txt -Value "1"
+    Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog.txt -Value "1"
+    Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog.txt -Value "1"
 }
 
 if(-not $skipCUDNN){
     $CUDA_PATH = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\' + $cudaVersion + '\lib\x64\cudnn.lib'
     if(-not(Test-Path -Path $CUDA_PATH)){
         Write-Output "Installing CUDNN"
-        Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog_test.txt -Value "0"
+        Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog.txt -Value "0"
         New-Item -Path $env:LOCALAPPDATA\CUDNN -ItemType Directory -Force
-        New-Item -Path $env:LOCALAPPDATA\CUDNN -ItemType Directory
         $ProgressPreference = 'SilentlyContinue'
         Invoke-WebRequest -Uri 'https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-8.9.7.29_cuda12-archive.zip' -OutFile $env:LOCALAPPDATA\CUDNN\cudnn.zip
         Expand-Archive -Path $env:LOCALAPPDATA\CUDNN\cudnn.zip -DestinationPath $env:LOCALAPPDATA\CUDNN\cudnn_unzip
@@ -156,11 +155,11 @@ if(-not $skipCUDNN){
         Remove-Item -Recurse -Force $env:LOCALAPPDATA\CUDNN\cudnn_unzip
     } else {
         Write-Output "CUDNN already present"
-        Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog_test.txt -Value "1"
+        Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog.txt -Value "1"
     }
 } else {
     Write-Output "Skipping CUDNN installation"
-    Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog_test.txt -Value "1"
+    Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog.txt -Value "1"
 }
 
 Write-Output "Grabbing TensorRT..."

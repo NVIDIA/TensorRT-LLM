@@ -284,80 +284,80 @@ void invokeGatherTree(gatherTreeParam param)
 __global__ void insertUnfinishedPath(BeamHypotheses bh)
 {
     int const bid = blockIdx.x;
-    int const nBS{bh.batch_size};
-    int const nBM{bh.beam_width};
+    int const nBS{bh.nBatchSize};
+    int const nBM{bh.nBeamWidth};
 
-    int const tgt_start_idx{bh.num_beams[bid]};
-    int const nMaxSeqLen{bh.max_seq_len};
+    int const tgt_start_idx{bh.numBeamsCBA[bid]};
+    int const nMaxSeqLen{bh.nMaxSeqLen};
     // TODO: nullptr is from [gptDecoder.cpp] GptDecoder<T>::gatherTree, need to be fixed
-    float const length_penalty{bh.length_penalties == nullptr ? 1.0f : bh.length_penalties[bid]};
+    float const length_penalty{bh.lengthPenalties == nullptr ? 1.0f : bh.lengthPenalties[bid]};
 
-    if (bh.is_done[bid])
+    if (bh.batchDones[bid])
     {
         return;
     }
 
-    // Move ALL unfinished beams from bh.output_ids_src to bh.output_ids_cba
-    // So there might be more than `nBM` beams in bh.output_ids_cba
+    // Move ALL unfinished beams from bh.outputIdsUnfinish to bh.outputIdsCBA
+    // So there might be more than `nBM` beams in bh.outputIdsCBA
     for (int i = 0; i < nBM; ++i)
     {
         int const src_beam_idx = bid * nBM + i;
         int const tgt_beam_idx = bid * nBM * 2 + i + tgt_start_idx;
-        int const current_step = bh.seq_len[src_beam_idx] - 1;
-        bh.output_ids_cba[tgt_beam_idx * nMaxSeqLen + current_step]
-            = bh.output_ids_src[src_beam_idx * nMaxSeqLen + current_step];
-        if (bh.log_probs_cba != nullptr && bh.log_probs != nullptr)
+        int const current_step = bh.sequenceLengths[src_beam_idx] - 1;
+        bh.outputIdsCBA[tgt_beam_idx * nMaxSeqLen + current_step]
+            = bh.outputIdsUnfinish[src_beam_idx * nMaxSeqLen + current_step];
+        if (bh.logProbsCBA != nullptr && bh.logProbs != nullptr)
         {
-            bh.log_probs_cba[tgt_beam_idx * nMaxSeqLen + current_step]
-                = bh.log_probs[current_step * nBS * nBM + src_beam_idx];
+            bh.logProbsCBA[tgt_beam_idx * nMaxSeqLen + current_step]
+                = bh.logProbs[current_step * nBS * nBM + src_beam_idx];
         }
-        int prev_id = bh.parent_ids_src[src_beam_idx * nMaxSeqLen + current_step];
+        int prev_id = bh.parentIdsUnfinish[src_beam_idx * nMaxSeqLen + current_step];
         for (int j = current_step - 1; j >= 0; --j)
         {
-            bh.output_ids_cba[tgt_beam_idx * nMaxSeqLen + j]
-                = bh.output_ids_src[bid * nBM * nMaxSeqLen + prev_id * nMaxSeqLen + j];
-            if (bh.log_probs_cba != nullptr && bh.log_probs != nullptr)
+            bh.outputIdsCBA[tgt_beam_idx * nMaxSeqLen + j]
+                = bh.outputIdsUnfinish[bid * nBM * nMaxSeqLen + prev_id * nMaxSeqLen + j];
+            if (bh.logProbsCBA != nullptr && bh.logProbs != nullptr)
             {
-                bh.log_probs_cba[tgt_beam_idx * nMaxSeqLen + j] = bh.log_probs[j * nBS * nBM + bid * nBM + prev_id];
+                bh.logProbsCBA[tgt_beam_idx * nMaxSeqLen + j] = bh.logProbs[j * nBS * nBM + bid * nBM + prev_id];
             }
-            prev_id = bh.parent_ids_src[bid * nBM * nMaxSeqLen + prev_id * nMaxSeqLen + j];
+            prev_id = bh.parentIdsUnfinish[bid * nBM * nMaxSeqLen + prev_id * nMaxSeqLen + j];
         }
-        if (bh.log_probs_cba != nullptr && bh.log_probs != nullptr)
+        if (bh.logProbsCBA != nullptr && bh.logProbs != nullptr)
         {
-            prev_id = bh.parent_ids_src[src_beam_idx * nMaxSeqLen + current_step];
+            prev_id = bh.parentIdsUnfinish[src_beam_idx * nMaxSeqLen + current_step];
             for (int j = current_step - 1; j >= 0; --j)
             {
-                bh.log_probs_cba[tgt_beam_idx * nMaxSeqLen + j] = bh.log_probs[j * nBS * nBM + bid * nBM + prev_id];
-                prev_id = bh.parent_ids_src[bid * nBM * nMaxSeqLen + prev_id * nMaxSeqLen + j];
+                bh.logProbsCBA[tgt_beam_idx * nMaxSeqLen + j] = bh.logProbs[j * nBS * nBM + bid * nBM + prev_id];
+                prev_id = bh.parentIdsUnfinish[bid * nBM * nMaxSeqLen + prev_id * nMaxSeqLen + j];
             }
         }
-        bh.seq_len_cba[tgt_beam_idx] = bh.seq_len[src_beam_idx];
-        bh.normed_scores_cba[tgt_beam_idx] = applyLengthPenalty(
-            bh.cum_log_probs[src_beam_idx], current_step - bh.input_lengths[src_beam_idx], length_penalty);
-        bh.cum_log_probs_cba[tgt_beam_idx] = bh.cum_log_probs[src_beam_idx];
-        bh.num_beams[bid]++;
+        bh.sequenceLengthsCBA[tgt_beam_idx] = bh.sequenceLengths[src_beam_idx];
+        bh.normedScoresCBA[tgt_beam_idx] = applyLengthPenalty(
+            bh.cumLogProbs[src_beam_idx], current_step - bh.inputLengths[src_beam_idx], length_penalty);
+        bh.cumLogProbsCBA[tgt_beam_idx] = bh.cumLogProbs[src_beam_idx];
+        bh.numBeamsCBA[bid]++;
     }
 }
 
 void invokeInsertUnfinishedPath(BeamHypotheses& bh, cudaStream_t stream)
 {
-    insertUnfinishedPath<<<bh.batch_size, 1, 0, stream>>>(bh);
+    insertUnfinishedPath<<<bh.nBatchSize, 1, 0, stream>>>(bh);
 }
 
 __global__ void finalizeKernel(BeamHypotheses bh)
 {
-    // Do index sort on bh.normed_scores_cba, then move buffers from CBA to output by the order of index
-    // bh.output_ids_cba    -> bh.final_output_ids
-    // bh.seq_len_cba       -> bh.seq_len
-    // bh.cum_log_probs_cba -> bh.cum_log_probs
-    // bh.log_probs_cba     -> bh.log_probs
+    // Do index sort on bh.normedScoresCBA, then move buffers from CBA to output by the order of index
+    // bh.outputIdsCBA    -> bh.outputIds
+    // bh.sequenceLengthsCBA       -> bh.sequenceLengths
+    // bh.cumLogProbsCBA -> bh.cumLogProbs
+    // bh.logProbsCBA     -> bh.logProbs
 
     int const bid = blockIdx.x;
     int const tid = threadIdx.x;
-    int const nBM{bh.beam_width};
-    int const nMaxSeqLen{bh.max_seq_len};
-    int const nBeam{bh.num_beams[bid]};
-    int const* inputLengths{bh.input_lengths};
+    int const nBM{bh.nBeamWidth};
+    int const nMaxSeqLen{bh.nMaxSeqLen};
+    int const nBeam{bh.numBeamsCBA[bid]};
+    int const* inputLengths{bh.inputLengths};
 
     extern __shared__ char array[];
     int* sRank = (int*) (array);                        // [nBM]
@@ -366,7 +366,7 @@ __global__ void finalizeKernel(BeamHypotheses bh)
 
     if (tid < nBeam)
     {
-        sScores[tid] = bh.normed_scores_cba[bid * nBM * 2 + tid];
+        sScores[tid] = bh.normedScoresCBA[bid * nBM * 2 + tid];
     }
     __syncthreads();
 
@@ -421,7 +421,7 @@ __global__ void finalizeKernel(BeamHypotheses bh)
     {
         for (int i = 0; i < nBM; ++i)
         {
-            float const score = tid < bh.num_beams[bid] ? sScores[tid] : -FLT_MAX;
+            float const score = tid < bh.numBeamsCBA[bid] ? sScores[tid] : -FLT_MAX;
             float const maxScore = blockReduceMax<float>(score);
             if (tid == 0)
             {
@@ -441,11 +441,11 @@ __global__ void finalizeKernel(BeamHypotheses bh)
 
     if (tid < nBM)
     {
-        sSequenceLengths[tid] = bh.seq_len_cba[bid * nBM * 2 + sRank[tid]];
-        bh.seq_len[bid * nBM + tid] = sSequenceLengths[tid];
-        if (bh.cum_log_probs != nullptr)
+        sSequenceLengths[tid] = bh.sequenceLengthsCBA[bid * nBM * 2 + sRank[tid]];
+        bh.sequenceLengths[bid * nBM + tid] = sSequenceLengths[tid];
+        if (bh.cumLogProbs != nullptr)
         {
-            bh.cum_log_probs[bid * nBM + tid] = bh.cum_log_probs_cba[bid * nBM * 2 + sRank[tid]];
+            bh.cumLogProbs[bid * nBM + tid] = bh.cumLogProbsCBA[bid * nBM * 2 + sRank[tid]];
         }
     }
     __syncthreads();
@@ -455,15 +455,15 @@ __global__ void finalizeKernel(BeamHypotheses bh)
         // start from step 1 to skip the start token
         for (int i = tid; i < sSequenceLengths[beamIdx]; i += blockDim.x)
         {
-            bh.final_output_ids[bid * nBM * nMaxSeqLen + beamIdx * nMaxSeqLen + i]
-                = bh.output_ids_cba[bid * (nBM * 2) * nMaxSeqLen + sRank[beamIdx] * nMaxSeqLen + i];
-            if (bh.log_probs != nullptr)
+            bh.outputIds[bid * nBM * nMaxSeqLen + beamIdx * nMaxSeqLen + i]
+                = bh.outputIdsCBA[bid * (nBM * 2) * nMaxSeqLen + sRank[beamIdx] * nMaxSeqLen + i];
+            if (bh.logProbs != nullptr)
             {
                 int const inputLen = inputLengths[bid * nBM + beamIdx];
                 if (i >= inputLen)
                 {
-                    bh.log_probs[bid * nBM * nMaxSeqLen + beamIdx * nMaxSeqLen + i - inputLen]
-                        = bh.log_probs_cba[bid * (nBM * 2) * nMaxSeqLen + sRank[beamIdx] * nMaxSeqLen + i];
+                    bh.logProbs[bid * nBM * nMaxSeqLen + beamIdx * nMaxSeqLen + i - inputLen]
+                        = bh.logProbsCBA[bid * (nBM * 2) * nMaxSeqLen + sRank[beamIdx] * nMaxSeqLen + i];
                 }
             }
         }
@@ -474,9 +474,9 @@ void invokeFinalize(BeamHypotheses& bh, cudaStream_t stream)
 {
     TLLM_LOG_DEBUG("%s %s start", __FILE__, __PRETTY_FUNCTION__);
 
-    int const nBM = bh.beam_width;
+    int const nBM = bh.nBeamWidth;
     size_t const smem_size = sizeof(int) * nBM * 2 + sizeof(float) * nBM * 2;
-    finalizeKernel<<<bh.batch_size, roundUp(nBM * 2, 32), smem_size, stream>>>(bh);
+    finalizeKernel<<<bh.nBatchSize, roundUp(nBM * 2, 32), smem_size, stream>>>(bh);
 }
 
 __global__ void initializeOutput(TokenIdType* finalOutputIds, TokenIdType const* endIds, SizeType const nMaxSeqLen)

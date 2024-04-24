@@ -232,6 +232,7 @@ def build_gpt(args):
         builder_config_extra_kwargs['mamba_expand'] = build_config[
             'mamba_expand']
         builder_config_extra_kwargs['max_beam_width'] = max_beam_width
+        builder_config_extra_kwargs['layer_types'] = ['recurrent']
     builder_config = builder.create_builder_config(
         name=args.model,
         precision=args.dtype,
@@ -715,6 +716,51 @@ def build_gpt(args):
             build_config["moe_num_experts"],
             'moe_top_k':
             build_config["moe_top_k"],
+            'qwen_type':
+            'qwen',
+        }
+        config = PretrainedConfig.from_dict(config)
+        tensorrt_llm_model = tensorrt_llm.models.QWenForCausalLM(config)
+    elif family == "qwen2":
+        config = {
+            'architecture':
+            'QWenForCausalLM',
+            'dtype':
+            args.dtype,
+            'num_hidden_layers':
+            build_config['num_layers'],
+            'num_attention_heads':
+            build_config['num_heads'],
+            'num_key_value_heads':
+            build_config['num_heads'] if build_config['num_kv_heads'] is None
+            else build_config['num_kv_heads'],
+            'hidden_size':
+            build_config['hidden_size'],
+            'intermediate_size':
+            build_config['inter_size'],
+            'vocab_size':
+            build_config['vocab_size'],
+            'position_embedding_type':
+            'rope_gpt_neox',
+            'max_position_embeddings':
+            build_config['n_positions'],
+            'hidden_act':
+            build_config['hidden_act'],
+            'quantization': {
+                'group_size': 128,
+                'quant_algo': quant_algo,
+                'kv_cache_quant_algo': kv_cache_quant_algo
+            },
+            'mapping': {
+                'world_size': world_size,
+                'tp_size': world_size
+            },
+            'moe_num_experts':
+            build_config["moe_num_experts"],
+            'moe_top_k':
+            build_config["moe_top_k"],
+            'qwen_type':
+            'qwen2',
         }
         config = PretrainedConfig.from_dict(config)
         tensorrt_llm_model = tensorrt_llm.models.QWenForCausalLM(config)

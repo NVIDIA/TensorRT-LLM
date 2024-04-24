@@ -1,4 +1,6 @@
-# Performance of TensorRT-LLM
+(perf-overview)=
+
+# Overview
 
 This document summarizes performance measurements of TensorRT-LLM on H100
 (Hopper), L40S (Ada) and A100 (Ampere) GPUs for a few key models.
@@ -34,11 +36,6 @@ All data was generated using version 0.9.0
 | Mistral 7B                   | 64         | 1         | 2048         | 128           |                      2,423 |
 | Mistral 7B                   | 56         | 1         | 2048         | 2048          |                      3,867 |
 |                              |            |           |              |               |                            |
-| Mixtral 8x7B                 | 1024       | 2         | 128          | 128           |                      5,444 |
-| Mixtral 8x7B                 | 256        | 2         | 128          | 2048          |                      4,973 |
-| Mixtral 8x7B                 | 64         | 2         | 2048         | 128           |                        605 |
-| Mixtral 8x7B                 | 64         | 2         | 2048         | 2048          |                      1,821 |
-|                              |            |           |              |               |                            |
 | LLaMA 7B                     | 896        | 1         | 128          | 128           |                     20,618 |
 | LLaMA 7B                     | 120        | 1         | 128          | 2048          |                      8,348 |
 | LLaMA 7B                     | 64         | 1         | 2048         | 128           |                      2,391 |
@@ -70,11 +67,6 @@ All data was generated using version 0.9.0
 | Mistral 7B                   | 84         | 1         | 2048         | 128           |                      2,405 |
 | Mistral 7B                   | 56         | 1         | 2048         | 2048          |                      3,731 |
 |                              |            |           |              |               |                            |
-| Mixtral 8x7B                 | 512        | 2         | 128          | 128           |                      5,255 |
-| Mixtral 8x7B                 | 128        | 2         | 128          | 2048          |                      3,408 |
-| Mixtral 8x7B                 | 64         | 2         | 2048         | 128           |                        588 |
-| Mixtral 8x7B                 | 32         | 2         | 2048         | 2048          |                      1,317 |
-|                              |            |           |              |               |                            |
 | LLaMA 7B                     | 896        | 1         | 128          | 128           |                     19,854 |
 | LLaMA 7B                     | 120        | 1         | 128          | 2048          |                      6,944 |
 | LLaMA 7B                     | 84         | 1         | 2048         | 128           |                      2,163 |
@@ -104,11 +96,6 @@ All data was generated using version 0.9.0
 | Mistral 7B                   | 120        | 1         | 128          | 2048          |                  4,387 |
 | Mistral 7B                   | 84         | 1         | 2048         | 128           |                    971 |
 | Mistral 7B                   | 56         | 1         | 2048         | 2048          |                  1,721 |
-|                              |            |           |              |               |                        |
-| Mixtral 8x7B                 | 256        | 4         | 128          | 128           |                  1,266 |
-| Mixtral 8x7B                 | 256        | 4         | 128          | 2048          |                  1,490 |
-| Mixtral 8x7B                 | 64         | 4         | 2048         | 128           |                    155 |
-| Mixtral 8x7B                 | 32         | 4         | 2048         | 2048          |                    412 |
 |                              |            |           |              |               |                        |
 | LLaMA 7B                     | 256        | 1         | 128          | 128           |                  5,885 |
 | LLaMA 7B                     | 64         | 1         | 128          | 2048          |                  1,654 |
@@ -181,9 +168,6 @@ tasks.
 | Mistral 7B                   | 1          | 1         | 128          |                    5.9 |
 | Mistral 7B                   | 1          | 1         | 2048         |                   31.7 |
 |                              |            |           |              |                        |
-| Mixtral 8x7B                 | 1          | 2         | 128          |                   12.1 |
-| Mixtral 8x7B                 | 1          | 2         | 2048         |                   87.7 |
-|                              |            |           |              |                        |
 | LLaMA 7B                     | 1          | 1         | 128          |                    5.7 |
 | LLaMA 7B                     | 1          | 1         | 2048         |                   30.2 |
 |                              |            |           |              |                        |
@@ -203,9 +187,6 @@ tasks.
 | Mistral 7B                   | 1          | 1         | 128          |                    6.5 |
 | Mistral 7B                   | 1          | 1         | 2048         |                   32.4 |
 |                              |            |           |              |                        |
-| Mixtral 8x7B                 | 1          | 2         | 128          |                   13.4 |
-| Mixtral 8x7B                 | 1          | 2         | 2048         |                   89.5 |
-|                              |            |           |              |                        |
 | LLaMA 7B                     | 1          | 1         | 128          |                    6.3 |
 | LLaMA 7B                     | 1          | 1         | 2048         |                   30.8 |
 |                              |            |           |              |                        |
@@ -224,9 +205,6 @@ tasks.
 |                              |            |           |              |                        |
 | Mistral 7B                   | 1          | 1         | 128          |                   15.4 |
 | Mistral 7B                   | 1          | 1         | 2048         |                   87.3 |
-|                              |            |           |              |                        |
-| Mixtral 8x7B                 | 1          | 4         | 128          |                   19.5 |
-| Mixtral 8x7B                 | 1          | 4         | 2048         |                  165.6 |
 |                              |            |           |              |                        |
 | LLaMA 7B                     | 1          | 1         | 128          |                   14.1 |
 | LLaMA 7B                     | 1          | 1         | 2048         |                   80.1 |
