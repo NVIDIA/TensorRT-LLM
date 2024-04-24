@@ -222,7 +222,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
     py::class_<tr::WorldConfig>(m, "WorldConfig")
         .def(py::init<SizeType, SizeType, SizeType, SizeType, std::optional<std::vector<SizeType>> const&>(),
             py::arg("tensor_parallelism") = 1, py::arg("pipeline_parallelism") = 1, py::arg("rank") = 0,
-            py::arg("gpus_per_node") = tr::WorldConfig::kDefaultGpusPerNode, py::arg("device_ids") = py::none())
+            py::arg("gpus_per_node") = tc::getDeviceCount(), py::arg("device_ids") = py::none())
         .def_property_readonly("size", &tr::WorldConfig::getSize)
         .def_property_readonly("tensor_parallelism", &tr::WorldConfig::getTensorParallelism)
         .def_property_readonly("pipeline_parallelism", &tr::WorldConfig::getPipelineParallelism)
@@ -237,7 +237,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_static("mpi",
             py::overload_cast<SizeType, std::optional<SizeType>, std::optional<SizeType>,
                 std::optional<std::vector<SizeType>> const&>(&tr::WorldConfig::mpi),
-            py::arg("gpus_per_node") = tr::WorldConfig::kDefaultGpusPerNode, py::arg("tensor_parallelism") = py::none(),
+            py::arg("gpus_per_node") = tc::getDeviceCount(), py::arg("tensor_parallelism") = py::none(),
             py::arg("pipeline_parallelism") = py::none(), py::arg("device_ids") = py::none());
 
     auto SamplingConfigGetState = [](tr::SamplingConfig const& config) -> py::tuple

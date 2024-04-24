@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from typing import List
-
+from cuda import cudart
+status, gpus_per_node = cudart.cudaGetDeviceCount()
+assert status == 0, f"cudaGetDeviceCount failed with error: {status}"
 
 class Mapping(object):
     '''
@@ -35,7 +37,7 @@ class Mapping(object):
     def __init__(self,
                  world_size=1,
                  rank=0,
-                 gpus_per_node=8,
+                 gpus_per_node=gpus_per_node,
                  tp_size=1,
                  pp_size=1):
         self.tp_size = tp_size
