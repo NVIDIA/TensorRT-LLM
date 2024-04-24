@@ -139,7 +139,7 @@ python convert_checkpoint.py --model_version v1_13b \
 
 The examples below uses the NVIDIA AMMO (AlgorithMic Model Optimization) toolkit for the model quantization process.
 
-First make sure AMMO(version>=0.7.0) toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
+First make sure AMMO toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
 
 ```bash
 # Quantize HF Baichuan v2 13B into FP8 and export a single-rank checkpoint

@@ -115,6 +115,7 @@ MODEL_NAME_PATTERN_MAP = {
     "ChatGLM": "chatglm",
     "QWen": "qwen",
     "Gemma": "gemma",
+    "MixtralForCausalLM": "llama",
 }
 
 
@@ -254,7 +255,7 @@ def quantize_and_export(*, model_dir, dtype, device, qformat, kv_cache_dtype,
             "Failed to import ammo, pls check the AMMO installation. Currently it is known to be unsupported on Windows OS"
         )
         raise e
-    from ammo.torch.export import export_model_config
+    from ammo.torch.export import export_tensorrt_llm_checkpoint
     from ammo.torch.export.tensorrt_llm_utils import MODEL_NAME_TO_HF_ARCH_MAP
     MODEL_NAME_TO_HF_ARCH_MAP.update({"gpt2": "GPTForCausalLM"})
 
@@ -312,8 +313,6 @@ def quantize_and_export(*, model_dir, dtype, device, qformat, kv_cache_dtype,
                     value.update({"num_bits": (4, 3)})  # type: ignore
             quant_cfg["quant_cfg"].update(KV_CACHE_CFG)  # type: ignore
 
-        print(quant_cfg)
-
         model = quantize_model(model, quant_cfg, calib_dataloader)
 
     with torch.inference_mode():
@@ -326,18 +325,18 @@ def quantize_and_export(*, model_dir, dtype, device, qformat, kv_cache_dtype,
         export_path = output_dir
         start_time = time.time()
 
-        export_model_config(model,
-                            model_type,
-                            getattr(torch, dtype),
-                            export_dir=export_path,
-                            inference_tensor_parallel=tp_size,
-                            inference_pipeline_parallel=pp_size,
-                            export_tensorrt_llm_config=True)
+        export_tensorrt_llm_checkpoint(model,
+                                       model_type,
+                                       getattr(torch, dtype),
+                                       export_dir=export_path,
+                                       inference_tensor_parallel=tp_size,
+                                       inference_pipeline_parallel=pp_size)
+
+        with open(f"{export_path}/config.json", "r") as f:
+            tensorrt_llm_config = json.load(f)
 
         # Workaround for wo quantization
         if qformat in ["int8_wo", "int4_wo", "full_prec"]:
-            with open(f"{export_path}/config.json", "r") as f:
-                tensorrt_llm_config = json.load(f)
             if qformat == "int8_wo":
                 tensorrt_llm_config["quantization"][
                     "quant_algo"] = QuantAlgo.W8A16
@@ -346,6 +345,26 @@ def quantize_and_export(*, model_dir, dtype, device, qformat, kv_cache_dtype,
                     "quant_algo"] = QuantAlgo.W4A16
             else:
                 tensorrt_llm_config["quantization"]["quant_algo"] = None
+
+        # Workaround for MOE router quantization
+        if "moe_num_experts" in tensorrt_llm_config and qformat != "full_prec":
+            if "exclude_modules" not in tensorrt_llm_config["quantization"]:
+                # Append router and lm_head because we need both excluded
+                tensorrt_llm_config["quantization"]["exclude_modules"] = [
+                    "router", "lm_head"
+                ]
+            else:
+                tensorrt_llm_config["quantization"]["exclude_modules"].append(
+                    "router")
+
+        with open(f"{export_path}/config.json", "w") as f:
+            json.dump(tensorrt_llm_config, f, indent=4)
+
+        # Workaround for AMMO 0.9.x fp8_kv_cache knob issue
+        if qformat == 'fp8' and kv_cache_dtype is None:
+            with open(f"{export_path}/config.json", "r") as f:
+                tensorrt_llm_config = json.load(f)
+            tensorrt_llm_config["quantization"]["kv_cache_quant_algo"] = None
             with open(f"{export_path}/config.json", "w") as f:
                 json.dump(tensorrt_llm_config, f, indent=4)
 
@@ -378,6 +397,18 @@ def quantize_and_export(*, model_dir, dtype, device, qformat, kv_cache_dtype,
                             'transformer.positional_embedding.weight')
                 safetensors.torch.save_file(
                     weights, f"{export_path}/rank{rank}.safetensors")
+
+        # Workaround for qwen version
+        if model_type == 'qwen':
+            with open(f"{export_path}/config.json", "r") as f:
+                tensorrt_llm_config = json.load(f)
+            qwen_config = AutoConfig.from_pretrained(model_dir,
+                                                     trust_remote_code=True)
+            tensorrt_llm_config["qwen_type"] = qwen_config.model_type
+            tensorrt_llm_config[
+                "intermediate_size"] = qwen_config.intermediate_size
+            with open(f"{export_path}/config.json", "w") as f:
+                json.dump(tensorrt_llm_config, f, indent=4)
 
         torch.cuda.empty_cache(
         )  # otherwise torch is keeping using GPU, other routine like build engine has less free GPU to use

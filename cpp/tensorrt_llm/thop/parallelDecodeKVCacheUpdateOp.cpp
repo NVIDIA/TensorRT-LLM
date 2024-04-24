@@ -14,8 +14,10 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/kernels/kvCacheIndex.h"
 #include "tensorrt_llm/kernels/parallelDecoding/kvCacheUpdateKernels.h"
 #include "tensorrt_llm/thop/thUtils.h"
+
 #include <cstdint>
 
 namespace th = torch;
@@ -81,9 +83,10 @@ void updateKVCacheDraftTokenLocation(torch::Tensor seqAcceptedDraftTokenOffsetsT
         tensorrt_llm::kernels::parallel_decoding::updateKVBlockArrayDraftTokenLocation(
             seqAcceptedDraftTokenOffsetsTensor.data_ptr<int>(), packedAcceptedDraftTokensIndicesTensor.data_ptr<int>(),
             pastKeyValueLengthsTensor.data_ptr<int>(), reinterpret_cast<void* const*>(pointerArray.data_ptr<int64_t>()),
-            offsetArray.data_ptr<int32_t>(), layerCount, seqCount, numKVHeads, headSizeInBytes, rewindDraftTokenCount,
-            rewindDraftTokenTensorPtr, nullptr, maxKVCacheLen, maxBlocksPerSeqOpt.value(), tokensPerBlockOpt.value(),
-            stream);
+            reinterpret_cast<tensorrt_llm::kernels::KVCacheIndex*>(
+                offsetArray.data_ptr<tensorrt_llm::kernels::KVCacheIndex::UnderlyingType>()),
+            layerCount, seqCount, numKVHeads, headSizeInBytes, rewindDraftTokenCount, rewindDraftTokenTensorPtr,
+            nullptr, maxKVCacheLen, maxBlocksPerSeqOpt.value(), tokensPerBlockOpt.value(), stream);
     }
     else
     {

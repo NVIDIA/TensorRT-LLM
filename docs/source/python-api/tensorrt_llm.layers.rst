@@ -55,7 +55,7 @@ MLP
    :show-inheritance:
 
 Normalization
-------------
+---------------
 .. automodule:: tensorrt_llm.layers.normalization
    :members:
    :undoc-members:

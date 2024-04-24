@@ -1429,6 +1429,20 @@ def load_nemo_gpt_config(
 
 
 @torch.no_grad()
+def load_torch_checkpoints(checkpoints_paths, merge_factor, tp_rank, pp_rank,
+                           map_location_fn, handle_model_level_weights):
+    models = []
+    for k in range(merge_factor):
+        rank_weights = checkpoints_paths[tp_rank * merge_factor + k][pp_rank]
+        model = torch.load(rank_weights, map_location=map_location_fn)
+        handle_model_level_weights(model, tp_rank * merge_factor + k, pp_rank)
+        layers = extract_layers_with_prefix(model,
+                                            "model.language_model.encoder.")
+        models.append(layers)
+    return models
+
+
+@torch.no_grad()
 def convert_nemo_gpt(unpacked_checkpoints_dir: UnpackedNemoCheckpointDir,
                      mapping: Mapping,
                      dtype: str = 'float32'):
@@ -1448,9 +1462,9 @@ def convert_nemo_gpt(unpacked_checkpoints_dir: UnpackedNemoCheckpointDir,
     # load position_embedding from rank 0
     model_00 = torch.load(checkpoints_paths[0][0], map_location=map_location_fn)
     model_00 = model_00.get("state_dict", model_00)
-
     has_position_embedding = "model.language_model.embedding.position_embeddings.weight" in model_00
     has_lm_head = "model.language_model.output_layer.weight" in model_00
+    del model_00
 
     num_layers = nemo_model_config["num_layers"]
     training_tp_size = nemo_model_config.get("tensor_model_parallel_size", 1)
@@ -1499,18 +1513,10 @@ def convert_nemo_gpt(unpacked_checkpoints_dir: UnpackedNemoCheckpointDir,
     tp_rank = inference_tp_rank // split_factor
     # for tp_rank in range(training_tp_size // merge_factor):
     for pp_rank in range(training_pp_size):
-        models = []
-        for k in range(merge_factor):
-            rank_weights = checkpoints_paths[tp_rank * merge_factor +
-                                             k][pp_rank]
-            model = torch.load(rank_weights, map_location=map_location_fn)
-            handle_model_level_weights(model, tp_rank * merge_factor + k,
-                                       pp_rank)
-            layers = extract_layers_with_prefix(
-                model, "model.language_model.encoder.")
-            models.append(layers)
-
-        for name in models[0].keys():
+        models = load_torch_checkpoints(checkpoints_paths, merge_factor,
+                                        tp_rank, pp_rank, map_location_fn,
+                                        handle_model_level_weights)
+        for name in list(models[0].keys()):
             params = [model[name] for model in models]
             if transpose_weights and params[0].ndim == 2:
                 params = [p.T for p in params]
@@ -1644,14 +1650,14 @@ def convert_nemo_gpt(unpacked_checkpoints_dir: UnpackedNemoCheckpointDir,
                     weights['transformer.ln_f.weight'] = params[0]
                 else:
                     weights['transformer.ln_f.bias'] = params[0]
-
-    for key, params in model_level_weights.items():
-        weights[key] = torch.concat(params, dim=0)
-
-    weights = {
-        key: param.to(dtype).contiguous()
-        for key, param in weights.items()
-    }
+            for model in models:
+                del model[name]
+        del models
+    for key in list(model_level_weights.keys()):
+        weights[key] = torch.concat(model_level_weights[key], dim=0)
+        del model_level_weights[key]
+    for key, param in weights.items():
+        weights[key] = weights[key].to(dtype).contiguous()
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))

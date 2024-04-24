@@ -233,19 +233,9 @@ class TestFunctional(unittest.TestCase):
 
         output_cpu = outputs['output'].to(torch.float32).cpu()
         present_state_cpu = outputs['present_state'].to(torch.float32).cpu()
-        if req_type == 'context' and remove_padding:
-            np.testing.assert_allclose(out_ref.to(torch.float32).cpu().numpy(),
-                                       output_cpu.numpy(),
-                                       atol=dtype_atol[dtype])
-            np.testing.assert_allclose(state_ref.to(
-                torch.float32).cpu().numpy(),
-                                       present_state_cpu.numpy(),
-                                       atol=dtype_atol[dtype])
-        else:
-            np.testing.assert_allclose(out_ref.to(torch.float32).cpu().numpy(),
-                                       output_cpu.numpy(),
-                                       atol=dtype_atol[dtype])
-            np.testing.assert_allclose(state_ref.to(
-                torch.float32).cpu().numpy(),
-                                       present_state_cpu.numpy(),
-                                       atol=dtype_atol[dtype])
+        np.testing.assert_allclose(out_ref.to(torch.float32).cpu().numpy(),
+                                   output_cpu.numpy(),
+                                   atol=dtype_atol[dtype])
+        np.testing.assert_allclose(state_ref.to(torch.float32).cpu().numpy(),
+                                   present_state_cpu.numpy(),
+                                   atol=dtype_atol[dtype])

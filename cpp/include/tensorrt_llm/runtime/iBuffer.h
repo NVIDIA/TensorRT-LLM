@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/arrayView.h"
 #include "tensorrt_llm/common/dataType.h"
+#include "tensorrt_llm/kernels/kvCacheIndex.h"
 
 #include <NvInferRuntime.h>
 
@@ -306,6 +307,12 @@ struct TRTDataType<__nv_fp8_e4m3>
     static constexpr auto value = nvinfer1::DataType::kFP8;
 };
 #endif
+
+template <>
+struct TRTDataType<kernels::KVCacheIndex>
+{
+    static constexpr auto value = TRTDataType<kernels::KVCacheIndex::UnderlyingType>::value;
+};
 
 template <>
 struct TRTDataType<void*>

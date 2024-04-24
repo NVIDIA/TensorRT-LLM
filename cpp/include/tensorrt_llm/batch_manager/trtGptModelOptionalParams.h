@@ -57,7 +57,9 @@ public:
     explicit TrtGptModelOptionalParams(executor::ExecutorConfig const& executorConfig)
         : TrtGptModelOptionalParams(KvCacheConfig(executorConfig.getKvCacheConfig()), false,
             executorConfig.getParallelConfig().value_or(executor::ParallelConfig()).getDeviceIds(),
-            executorConfig.getNormalizeLogProbs(), executorConfig.getEnableChunkedContext(), std::nullopt,
+            executorConfig.getNormalizeLogProbs(), executorConfig.getEnableChunkedContext(),
+            runtime::DecodingMode::fromExecutor(
+                executorConfig.getDecodingMode().value_or(executor::DecodingMode::kNONE)),
             PeftCacheManagerConfig(executorConfig.getPeftCacheConfig().value_or(executor::PeftCacheConfig())),
             executorConfig.getMedusaChoices())
     {
@@ -69,6 +71,8 @@ public:
             && deviceIds == other.deviceIds && normalizeLogProbs == other.normalizeLogProbs
             && enableChunkedContext == other.enableChunkedContext && decodingMode == other.decodingMode;
     }
+
+    friend std::ostream& operator<<(std::ostream& os, TrtGptModelOptionalParams const& self);
 
     KvCacheConfig kvCacheConfig;
 

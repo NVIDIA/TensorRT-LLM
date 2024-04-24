@@ -1,14 +1,32 @@
-# How to debug
+(troubleshooting)=
+
+# Troubleshooting
 
 This document describes how to debug in TensorRT-LLM.
-
-## Overview
 
 Usually, we want to print the intermediate tensor values when debugging a TensorRT-LLM model.
 TensorRT-LLM obeys define-and-run paradigm, we should mark the interested intermediate tensors as the network outputs.
 Then, we print the values at runtime.
 
-## Debug on unit tests
+## Build Errors
+
+Many build errors can be resolved by simply deleting the build tree. Try running the build script with `--clean` or running `rm -r cpp/build`.
+
+## cuDNN Linking Errors
+
+If you encounter errors such as "Entry Point Not Found" (see for example [#1062](https://github.com/NVIDIA/TensorRT-LLM/issues/1062)) the issue might be a mismatch in the `cuDNN` libraries shipped from `torch` and `tensorrt`. To rectify this, please try the following steps
+
+```
+python -m pip uninstall -y tensorrt_llm
+python -m pip install --upgrade pip
+python -m pip install nvidia-cudnn-cu11==8.9.4.25 --no-cache-dir
+python -m pip install --pre --extra-index-url https://pypi.nvidia.com/ tensorrt==9.2.0.post12.dev5 --no-cache-dir
+python -m pip uninstall -y nvidia-cudnn-cu11
+python -m pip install tensorrt_llm  --extra-index-url https://pypi.nvidia.com/ --extra-index-url https://pypi.nvidia.com/ --extra-index-url https://download.pytorch.org/whl/cu121
+```
+
+
+## Debug on Unit Tests
 
 1. Register the intermediate tensors as the network outputs with `register_network_output` API.
 
@@ -61,7 +79,7 @@ print(outputs['inter'])
 Here is the [full example](source:tests/test_debugging_api.py).
 
 
-## Debug on E2E models
+## Debug on E2E Models
 
 Here is an example to print the values of the MLP output tensor in the GPT model.
 
@@ -185,7 +203,63 @@ Input [Text 0]: "Born in north-east France, Soyer trained as a"
 Output [Text 0 Beam 0]: " chef before moving to London in the early"
 ```
 
-## Debug execution errors
+## Debug Execution Errors
 
 - If you use plugins, use can set the environment variable `CUDA_LAUNCH_BLOCKING=1` so that kernels are launch synchronously, with their return status checked immediately.
 - If you see memory errors, make sure that the engine inputs respect the build-time shapes and that they reside **on the correct device** (CPU/GPU).
+
+## Installation Errors
+
+Many build errors can be resolved by simply deleting the build tree. Try running the build script with `--clean` or running `rm -r cpp/build`.
+
+
+## Tips
+
+* It's recommended to add options `–shm-size=1g –ulimit memlock=-1` to the
+  docker or nvidia-docker run command.  Otherwise you may see NCCL errors when
+  running multiple GPU inferences. See
+  https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/troubleshooting.html#errors
+  for details.
+
+* When building models, memory-related issues such as
+```
+[09/23/2023-03:13:00] [TRT] [E] 9: GPTLMHeadModel/layers/0/attention/qkv/PLUGIN_V2_Gemm_0: could not find any supported formats consistent with input/output data types
+[09/23/2023-03:13:00] [TRT] [E] 9: [pluginV2Builder.cpp::reportPluginError::24] Error Code 9: Internal Error (GPTLMHeadModel/layers/0/attention/qkv/PLUGIN_V2_Gemm_0: could not find any supported formats consistent with input/output data types)
+```
+may happen. One possible solution is to reduce the amount of memory needed by
+reducing the maximum batch size, input and output lengths. Another option is to
+enable plugins, for example: `--gpt_attention_plugin`.
+
+* MPI + Slurm
+
+TensorRT-LLM is a
+[MPI](https://en.wikipedia.org/wiki/Message_Passing_Interface)-aware package
+that uses [`mpi4py`](https://mpi4py.readthedocs.io/en/stable/). If you are
+running scripts in a [Slurm](https://slurm.schedmd.com/) environment, you might
+encounter interferences:
+```
+--------------------------------------------------------------------------
+PMI2_Init failed to initialize.  Return code: 14
+--------------------------------------------------------------------------
+--------------------------------------------------------------------------
+The application appears to have been direct launched using "srun",
+but OMPI was not built with SLURM's PMI support and therefore cannot
+execute. There are several options for building PMI support under
+SLURM, depending upon the SLURM version you are using:
+
+  version 16.05 or later: you can use SLURM's PMIx support. This
+  requires that you configure and build SLURM --with-pmix.
+
+  Versions earlier than 16.05: you must use either SLURM's PMI-1 or
+  PMI-2 support. SLURM builds PMI-1 by default, or you can manually
+  install PMI-2. You must then build Open MPI using --with-pmi pointing
+  to the SLURM PMI library location.
+
+Please configure as appropriate and try again.
+--------------------------------------------------------------------------
+```
+As a rule of thumb, if you are running TensorRT-LLM interactively on a Slurm
+node, prefix your commands with `mpirun -n 1` to run TensorRT-LLM in a
+dedicated MPI environment, not the one provided by your Slurm allocation.
+
+For example: `mpirun -n 1 python3 examples/gpt/build.py ...`

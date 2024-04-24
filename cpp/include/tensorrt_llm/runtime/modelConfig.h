@@ -32,7 +32,7 @@ struct MambaConfig
     SizeType expand = 0;
 };
 
-class GptModelConfig
+class ModelConfig
 {
 public:
     enum class ModelVariant : std::int32_t
@@ -42,10 +42,11 @@ public:
         kMamba = 2, // https://github.com/state-spaces/mamba
     };
 
-    explicit GptModelConfig(
-        SizeType vocabSize, SizeType nbLayers, SizeType nbHeads, SizeType hiddenSize, nvinfer1::DataType dtype)
+    explicit ModelConfig(SizeType vocabSize, SizeType nbAttentionLayers, SizeType nbSsmLayers, SizeType nbHeads,
+        SizeType hiddenSize, nvinfer1::DataType dtype)
         : mVocabSize(vocabSize)
-        , mNbLayers(nbLayers)
+        , mNbAttentionLayers(nbAttentionLayers)
+        , mNbSsmLayers(nbSsmLayers)
         , mNbHeads(nbHeads)
         , mNbKvHeads(nbHeads)
         , mHiddenSize(hiddenSize)
@@ -71,6 +72,7 @@ public:
         , mMaxDraftLen(0)
         , mUseContextFMHAForGeneration(false)
         , mPagedContextFMHA(false)
+        , mUseXQA{false}
         , mUseLoraPlugin(false)
         , mMlpHiddenSize(0)
         , mMedusaModule(std::nullopt)
@@ -87,10 +89,16 @@ public:
         return (mVocabSize + worldSize - 1) / worldSize * worldSize;
     }
 
-    [[nodiscard]] SizeType constexpr getNbLayers(SizeType pipelineParallelism = 1) const
+    [[nodiscard]] SizeType constexpr getNbAttentionLayers(SizeType pipelineParallelism = 1) const
     {
-        TLLM_CHECK(mNbLayers % pipelineParallelism == 0);
-        return mNbLayers / pipelineParallelism;
+        TLLM_CHECK(mNbAttentionLayers % pipelineParallelism == 0);
+        return mNbAttentionLayers / pipelineParallelism;
+    }
+
+    [[nodiscard]] SizeType constexpr getNbSsmLayers(SizeType pipelineParallelism = 1) const
+    {
+        TLLM_CHECK(mNbSsmLayers % pipelineParallelism == 0);
+        return mNbSsmLayers / pipelineParallelism;
     }
 
     [[nodiscard]] SizeType constexpr getNbHeads() const noexcept
@@ -344,6 +352,16 @@ public:
         return mPagedContextFMHA;
     }
 
+    void constexpr useXQA(bool useXQA) noexcept
+    {
+        mUseXQA = useXQA;
+    }
+
+    [[nodiscard]] bool constexpr useXQA() const noexcept
+    {
+        return mUseXQA;
+    }
+
     [[nodiscard]] bool constexpr useLoraPlugin() const noexcept
     {
         return mUseLoraPlugin;
@@ -354,7 +372,7 @@ public:
         mUseLoraPlugin = useLoraPlugin;
     }
 
-    std::vector<LoraModule> const& getLoraModules() const noexcept
+    [[nodiscard]] std::vector<LoraModule> const& getLoraModules() const noexcept
     {
         return mLoraModules;
     }
@@ -442,7 +460,8 @@ public:
 
 private:
     SizeType mVocabSize;
-    SizeType mNbLayers;
+    SizeType mNbAttentionLayers;
+    SizeType mNbSsmLayers;
     SizeType mNbHeads;
     SizeType mNbKvHeads;
     SizeType mHiddenSize;
@@ -471,6 +490,7 @@ private:
 
     bool mUseContextFMHAForGeneration;
     bool mPagedContextFMHA;
+    bool mUseXQA;
 
     bool mUseLoraPlugin;
     std::vector<LoraModule> mLoraModules;

@@ -29,6 +29,11 @@
 #include <string>
 #include <vector>
 
+namespace tensorrt_llm::mpi
+{
+class MpiComm;
+}
+
 namespace tensorrt_llm::executor
 {
 
@@ -310,6 +315,7 @@ public:
     [[nodiscard]] Result getResult() const;
 
 private:
+    friend class Serialization;
     class Impl;
     std::unique_ptr<Impl> mImpl;
 };
@@ -323,6 +329,8 @@ public:
     [[nodiscard]] SchedulerPolicy getPolicy() const;
 
 private:
+    friend class Serialization;
+
     /// @brief The scheduler policy. See SchedulerPolicy.
     SchedulerPolicy mPolicy;
 };
@@ -346,6 +354,8 @@ public:
     [[nodiscard]] bool getOnboardBlocks() const;
 
 private:
+    friend class Serialization;
+
     /// @brief Controls if KV cache blocks can be reused for different requests
     bool mEnableBlockReuse;
 
@@ -378,6 +388,26 @@ SizeType const kDefaultIterStatsMaxIterations = 1000;
 // Per request stats may have additional overhead due to going through all requests. Turned off by default.
 SizeType const kDefaultRequestStatsMaxIterations = 0;
 
+class OrchestratorConfig
+{
+public:
+    explicit OrchestratorConfig(bool isOrchestrator = true, std::string workerExecutablePath = "",
+        std::shared_ptr<mpi::MpiComm> orchLeaderComm = nullptr);
+
+    [[nodiscard]] bool getIsOrchestrator() const;
+    [[nodiscard]] std::string getWorkerExecutablePath() const;
+    [[nodiscard]] std::shared_ptr<mpi::MpiComm> getOrchLeaderComm() const;
+
+    void setIsOrchestrator(bool isOrchestrator);
+    void setWorkerExecutablePath(std::string const& workerExecutablePath);
+    void setOrchLeaderComm(std::shared_ptr<mpi::MpiComm> const& orchLeaderComm);
+
+private:
+    bool mIsOrchestrator;
+    std::string mWorkerExecutablePath;
+    std::shared_ptr<mpi::MpiComm> mOrchLeaderComm;
+};
+
 /// @brief A configuration class for the parallel execution parameters
 ///        Currently only supports commType = CommunicationType::kMPI
 class ParallelConfig
@@ -392,19 +422,24 @@ public:
     explicit ParallelConfig(CommunicationType commType = CommunicationType::kMPI,
         CommunicationMode commMode = CommunicationMode::kLEADER,
         std::optional<std::vector<SizeType>> deviceIds = std::nullopt,
-        std::optional<std::vector<SizeType>> participantIds = std::nullopt);
+        std::optional<std::vector<SizeType>> participantIds = std::nullopt,
+        std::optional<OrchestratorConfig> const& orchestratorConfig = std::nullopt);
 
     [[nodiscard]] CommunicationType getCommunicationType() const;
     [[nodiscard]] CommunicationMode getCommunicationMode() const;
     [[nodiscard]] std::optional<std::vector<SizeType>> getDeviceIds() const;
     [[nodiscard]] std::optional<std::vector<SizeType>> getParticipantIds() const;
+    [[nodiscard]] std::optional<OrchestratorConfig> getOrchestratorConfig() const;
 
     void setCommunicationType(CommunicationType type);
     void setCommunicationMode(CommunicationMode mode);
     void setDeviceIds(std::vector<SizeType> const& deviceIds);
     void setParticipantIds(std::vector<SizeType> const& participantIds);
+    void setOrchestratorConfig(OrchestratorConfig const& orchestratorConfig);
 
 private:
+    friend class Serialization;
+
     /// @brief The type of communication protocol used. Default is MPI.
     CommunicationType mCommType;
 
@@ -416,6 +451,9 @@ private:
 
     /// @brief The participant ids (MPI ranks for example) used for executing this model
     std::optional<std::vector<SizeType>> mParticipantIds;
+
+    /// @brief Optional orchestrator configuration
+    std::optional<OrchestratorConfig> mOrchestratorConfig;
 };
 
 /// @brief config for PeftCacheManager
@@ -427,6 +465,8 @@ public:
         SizeType numEnsureWorkers = 1, SizeType numCopyStreams = 1, SizeType maxPagesPerBlockHost = 24,
         SizeType maxPagesPerBlockDevice = 8, std::optional<float> const& deviceCachePercent = std::nullopt,
         std::optional<size_t> const& hostCacheSize = std::nullopt);
+
+    bool operator==(PeftCacheConfig const& other) const;
 
     [[nodiscard]] SizeType getNumHostModuleLayer() const;
     [[nodiscard]] SizeType getNumDeviceModuleLayer() const;
@@ -441,6 +481,8 @@ public:
     [[nodiscard]] std::optional<size_t> getHostCacheSize() const;
 
 private:
+    friend class Serialization;
+
     // number of max sized 1-layer 1-module adapterSize=1 sets of weights that can be stored in host cache
     SizeType mNumHostModuleLayer;
     // number of max sized 1-layer 1-module sets of weights that can be stored in host cache
@@ -460,7 +502,7 @@ private:
     // Number of cache pages per allocation block (device)
     SizeType mMaxPagesPerBlockDevice;
     // percent of memory after engine load to use for cache
-    std::optional<float> mDeviceCachePercent;
+    std::optional<FloatType> mDeviceCachePercent;
     // size in bytes to use for host cache
     std::optional<size_t> mHostCacheSize;
 };
@@ -477,7 +519,8 @@ public:
         std::optional<ParallelConfig> parallelConfig = std::nullopt,
         std::optional<PeftCacheConfig> const& peftCacheConfig = std::nullopt,
         std::optional<LogitsPostProcessorMap> logitsPostProcessorMap = std::nullopt,
-        std::optional<MedusaChoices> medusaChoices = std::nullopt);
+        std::optional<MedusaChoices> medusaChoices = std::nullopt,
+        std::optional<DecodingMode> decodingMode = std::nullopt);
 
     [[nodiscard]] SizeType getMaxBeamWidth() const;
     [[nodiscard]] SchedulerConfig getSchedulerConfig() const;
@@ -491,6 +534,7 @@ public:
     [[nodiscard]] std::optional<PeftCacheConfig> getPeftCacheConfig() const;
     [[nodiscard]] std::optional<LogitsPostProcessorMap> getLogitsPostProcessorMap() const;
     [[nodiscard]] std::optional<MedusaChoices> getMedusaChoices() const;
+    [[nodiscard]] std::optional<DecodingMode> getDecodingMode() const;
 
     void setMaxBeamWidth(SizeType maxBeamWidth);
     void setSchedulerConfig(SchedulerConfig const& schedulerConfig);
@@ -504,8 +548,11 @@ public:
     void setPeftCacheConfig(PeftCacheConfig const& peftCacheConfig);
     void setLogitsPostProcessorMap(LogitsPostProcessorMap const& logitsPostProcessorMap);
     void setMedusaChoices(MedusaChoices const& medusaChoices);
+    void setDecodingMode(DecodingMode decodingMode);
 
 private:
+    friend class Serialization;
+
     /// @brief The beam width value of requests that will be sent to the executor
     SizeType mMaxBeamWidth;
 
@@ -535,6 +582,7 @@ private:
     std::optional<PeftCacheConfig> mPeftCacheConfig;
     std::optional<LogitsPostProcessorMap> mLogitsPostProcessorMap;
     std::optional<MedusaChoices> mMedusaChoices;
+    std::optional<DecodingMode> mDecodingMode;
 };
 
 /// @brief The executor is responsible for receiving new requests and sending responses, and running the inference

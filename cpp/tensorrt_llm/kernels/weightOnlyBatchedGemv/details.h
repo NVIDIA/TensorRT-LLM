@@ -47,7 +47,7 @@ struct Int4DetailsW
     static constexpr int kElemBits = 4;
 };
 
-template <typename TypeDetailsA, typename TypeDetailsW>
+template <typename TypeDetailsA, typename TypeDetailsW, int TileSizeK>
 struct ColumnMajor
 {
     using DetailsA = TypeDetailsA;
@@ -56,7 +56,7 @@ struct ColumnMajor
     using AccessTypeW = int;
     static constexpr int kAccessSize = 128;
     static constexpr int kStepK = kAccessSize / TypeDetailsA::kElemBits;
-    static constexpr int kTileSize = 64;
+    static constexpr int kTileSize = TileSizeK;
     static constexpr int kInterleave = 1;
 
     struct Mapper
@@ -68,7 +68,7 @@ struct ColumnMajor
     };
 };
 
-template <typename TypeDetailsA, typename TypeDetailsW>
+template <typename TypeDetailsA, typename TypeDetailsW, int TileSizeK>
 struct ColumnMajorInterleaved
 {
     using DetailsA = TypeDetailsA;
@@ -77,36 +77,43 @@ struct ColumnMajorInterleaved
     using AccessTypeW = int4;
     static constexpr int kAccessSize = 128;
     static constexpr int kStepK = kAccessSize / TypeDetailsW::kElemBits;
-    static constexpr int kTileSize = 64;
-    static constexpr int kInterleave = 128 * 8 / (kTileSize * TypeDetailsW::kElemBits);
+    static constexpr int kTileSize = TileSizeK;
+    static constexpr int kInterleave = 128 * 8 / (TileSizeK * TypeDetailsW::kElemBits);
+
+    // constants for mapper
+    static constexpr int kElementGroupSizeA = TileSizeK / 32;
+    static constexpr int kElementGroupSizeW = kInterleave * kElementGroupSizeA;
+    static constexpr int kGroupOffsetA = 4 * kElementGroupSizeA;
 
     struct Mapper
     {
         __device__ __forceinline__ int operator()(int i)
         {
-            return (i % 8) / 2 * kInterleave * 2 + i % 2 + i / 8 * 2;
+            return i % kElementGroupSizeA + (i % kGroupOffsetA) / kElementGroupSizeA * kElementGroupSizeW
+                + i / kGroupOffsetA * kElementGroupSizeA;
         }
     };
 };
 
-template <typename TypeDetailsA_, typename TypeDetailsW_, template <typename, typename> class LayoutDeatils_,
-    bool UseInterleavedConverter>
+template <typename TypeDetailsA_, typename TypeDetailsW_, template <typename, typename, int> class LayoutDetails_,
+    bool UseInterleavedConverter, int TileSizeK>
 struct KernelDetails
 {
     using TypeDetailsA = TypeDetailsA_;
     using TypeDetailsW = TypeDetailsW_;
-    using LayoutDeatils = LayoutDeatils_<TypeDetailsA, TypeDetailsW>;
-    using AccessTypeA = typename LayoutDeatils::AccessTypeA;
-    using AccessTypeW = typename LayoutDeatils::AccessTypeW;
+    using LayoutDetails = LayoutDetails_<TypeDetailsA, TypeDetailsW, TileSizeK>;
+    using AccessTypeA = typename LayoutDetails::AccessTypeA;
+    using AccessTypeW = typename LayoutDetails::AccessTypeW;
     static constexpr int kWarpSize = 32;
-    static constexpr int kStepK = LayoutDeatils::kStepK;
+    static constexpr int kStepK = LayoutDetails::kStepK;
     static constexpr int kAccessNumA = kStepK * TypeDetailsA::kElemBits / (sizeof(AccessTypeA) * 8);
     static constexpr int kAccessNumW = kStepK * TypeDetailsW::kElemBits / (sizeof(AccessTypeW) * 8);
-    static constexpr int kInterleave = LayoutDeatils::kInterleave;
-    static constexpr int kThreadsPerInterleavedTile = LayoutDeatils::kTileSize / kStepK;
+    static constexpr int kInterleave = LayoutDetails::kInterleave;
+    static constexpr int kThreadsPerInterleavedTile = LayoutDetails::kTileSize / kStepK;
     static constexpr int kElemsPerByteW = 8 / TypeDetailsW::kElemBits;
     static constexpr bool kUseInterleavedConverter = UseInterleavedConverter;
 };
+
 } // namespace weight_only
 } // namespace kernels
 } // namespace tensorrt_llm

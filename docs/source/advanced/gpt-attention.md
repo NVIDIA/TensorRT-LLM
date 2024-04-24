@@ -1,16 +1,13 @@
-# Multi-head, Multi-query and Group-query Attention
+(gpt-attention)=
 
-This document details the implementation of multihead attention (MHA),
-multiquery attention (MQA) and group-query attention (GQA) for auto-regressive
-GPT-like models in TensorRT-LLM.  As a quick reminder, the multihead attention
+# Multi-Head, Multi-Query, and Group-Query Attention
+
+This document details the implementation of multi-head attention (MHA),
+multi-query attention (MQA) and group-query attention (GQA) for auto-regressive
+GPT-like models in TensorRT-LLM.  As a quick reminder, the multi-head attention
 is the sequence of a batched matmul, a softmax and another batched matmul
 described in the
-[Attention Is All You Need](https://arxiv.org/abs/1706.03762) article.
-Multi-query Attention (MQA) [[https://arxiv.org/abs/1911.02150](https://arxiv.org/abs/1911.02150)]
-Group-query Attention (GQA) [[https://arxiv.org/abs/2307.09288](https://arxiv.org/abs/2307.09288)]
-are variants of MHA that use fewer, so-called, K/V head than the number of
-query heads.  TensorRT-LLM, MHA, MQA and GQA are implemented by the operator
-[`tensorrt_llm.functional.gpt_attention`](source:tensorrt_llm/functional.py).
+[Attention Is All You Need](https://arxiv.org/abs/1706.03762) article. [Multi-query Attention (MQA)](https://arxiv.org/abs/1911.02150) and [Group-query Attention (GQA)](https://arxiv.org/abs/2307.09288) are variants of MHA that use fewer, so-called, K/V head than the number of query heads. TensorRT-LLM, MHA, MQA and GQA are implemented by the operator [`tensorrt_llm.functional.gpt_attention`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/functional.py).
 
 ## Important Note
 
@@ -24,9 +21,9 @@ future***.
 In TensorRT-LLM, the GPT attention operator supports two different types
 of QKV inputs: Padded and packed (i.e. non padded) inputs. The mode is
 determined by the global configuration parameter `remove_input_padding` defined
-in [`tensorrt_llm.plugin`](source:tensorrt_llm/plugin/plugin.py).
+in [`tensorrt_llm.plugin`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/plugin/plugin.py).
 
-When padding is enabled (i.e. `remove_input_padding` is `False`), the sequences
+When padding is enabled (that is, `remove_input_padding` is `False`), the sequences
 that are shorter than the `max_sequence_length` are padded to that maximum
 length. It may result in excessive memory consumption as well as unneeded
 computations on padding tokens (in the various matrix multiplications that
@@ -34,7 +31,7 @@ surround the MHA block).
 
 To overcome that problem, TensorRT-LLM supports a mode without padding where
 the different tokens are packed together and the user provides the operator
-with a 1D tensor containing the lengths of the different sequences.  It is
+with a 1D tensor containing the lengths of the different sequences. It is
 recommended that users to always use packed mode (and support for the padded
 mode may be removed in the future).
 
@@ -45,8 +42,8 @@ context and generation phases in auto-regressive models like GPT.
 
 ### Context Phase
 
-If the `context_fmha_type` is set to `disabled` (see
-[`tensorrt_llm.plugin`](source:tensorrt_llm/plugin/plugin.py)),
+If the `context_fmha_type` is set to `disabled` (refer to
+[`tensorrt_llm.plugin`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/plugin/plugin.py)),
 the implementation maps to a sequence of GPU kernels that will store the
 intermediate `Q*K^T` tensor in memory before calling the softmax operator. It
 is the slowest method and the memory footprint is significant (quadratically
@@ -58,9 +55,9 @@ FP32), that function will trigger a kernel that performs the MHA/MQA block
 using a single kernel. For short sequences, that kernel uses a vanilla
 implementation of MHA/MQA. For larger sequences, this kernel uses the Flash
 Attention algorithm as described in
-[https://arxiv.org/abs/2205.14135](https://arxiv.org/abs/2205.14135)
+[FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness](https://arxiv.org/abs/2205.14135)
 and
-[https://arxiv.org/abs/2307.08691](https://arxiv.org/abs/2307.08691).
+[FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning](https://arxiv.org/abs/2307.08691).
 
 Currently, the implementation triggers extra kernels that apply pre-processing
 to the elements (like RoPE) and populate the KV cache (see below). In a future
@@ -72,18 +69,22 @@ improve the overall performance.
 When FP8 quantization is activated, the attention can be further accelerated by
 enabling FP8 Context FMHA (`use_fp8_context_fmha = enable`).
 
+FP8 Paged Context FMHA is also supported with the fp8 quantization workflow.
+You need to specify `use_fp8_context_fmha = enable` and
+`use_paged_context_fmha = enable` at the same time.
+
 Please be aware that this is an experimental feature only supported on Hopper.
 If you notice a significant decrease in accuracy, it is recommended to disable
-it..
+it.
 
 ### Generation Phase
 
-The generation phase is implemented using a single kernel, called the masked
-multihead attention in TensorRT-LLM. That kernel is able to apply
-pre-processing on the Q, K and V elements on-the-fly: Add the QKV bias, apply
-RoPE, do dequantization/quantization. TensorRT-LLM will continue to add (or
+The generation phase is implemented using a single kernel called the masked
+multi-head attention in TensorRT-LLM. That kernel is able to apply
+pre-processing on the Q, K, and V elements on-the-fly: adds the QKV bias, applies
+RoPE, and performs dequantization and quantization. TensorRT-LLM will continue to add (or
 enable) additional features in future releases. For example, enable the support
-for ALiBi or IA3.
+for IA3.
 
 _The masked MHA kernel has a special version that distributes the work across
 multiple CUDA thread-blocks on the GPU for cases where the GPU occupancy is
@@ -131,9 +132,12 @@ of class `DecoderXQARunner` in
 `cpp/tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunner.h`.
 
 
-## Inflight batching
+(inflight-batching)=
 
-TensorRT-LLM supports a feature called in-flight batching. With that feature,
+## In-flight Batching
+
+TensorRT-LLM supports in-flight batching of requests (also known as continuous
+batching or iteration-level batching) for higher serving throughput. With this feature,
 sequences in context phase can be processed together with sequences in
 generation phase. The purpose of that technique is to better interleave
 requests to reduce latency as well as make better use the of the GPUs.
@@ -150,6 +154,8 @@ be relaxed in a future version.
 _(1) Padding sequences in the generation phase, that contain a single token, to
 the length of the maximum input sequence is inefficient use of resources_.
 
+
+
 ## Chunked Context
 
 In the original state, the common behavior was to process all context tokens at
@@ -158,10 +164,10 @@ context chunks can be batched with more tokens during the generation phase,
 which is expected to increase the total throughput. Chunking contexts also removes
 constraints on input length. To enable this feature, the FMHA paged kv-cache also
 needs to be enabled. Except for the last one, the size of the context chunk needs
-to be an integer multiple of the kv-cache block size. Please refer to
+to be an integer multiple of the kv-cache block size. Refer to
 [the performance best practices](perf_best_practices.md#chunked-context) for usage.
 
-## KV Cache(s)
+## KV Cache
 
 In the generation phase, a common optimization is to provide the MHA kernel
 with a cache containing the values of the past K and V elements that have
@@ -290,6 +296,7 @@ sequences in generation phase, there are `beam_width` tokens per sequence. The
 beam width can be different for each sequence.
 
 In other words, the pseudo-code to compute the number of tokens is:
+
 ```python
 num_tokens = 0
 

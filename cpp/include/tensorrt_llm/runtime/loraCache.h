@@ -18,10 +18,10 @@
 
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
-#include "tensorrt_llm/runtime/gptModelConfig.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/loraCachePageManagerConfig.h"
 #include "tensorrt_llm/runtime/loraModule.h"
+#include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 #include <NvInferRuntimeBase.h>
 #include <deque>
@@ -159,11 +159,11 @@ public:
 
     /**
      * param[in] pageManagerConfig: a LoraCachePageManagerConfig
-     * param[in] modelConfig: a GptModelConfig
+     * param[in] modelConfig: a ModelConfig
      * param[in] worldConfig: a WorldConfig
      * param[in] bufferManager: a BufferManager only used to allocate page blocks
      */
-    LoraCache(LoraCachePageManagerConfig const& pageManagerConfig, GptModelConfig const& modelConfig,
+    LoraCache(LoraCachePageManagerConfig const& pageManagerConfig, ModelConfig const& modelConfig,
         WorldConfig const& worldConfig, BufferManager const& bufferManager);
 
     /**
@@ -277,7 +277,7 @@ public:
      * \brief Copy task weights to cache pages.
      * \param[in] weights: task weights
      * \param[in] config: task config tensor
-     * \param[in] modelConfig: a GptModelConfig
+     * \param[in] modelConfig: a ModelConfig
      * \param[in] worldConfig: a WorldConfig
      * \param[in] modelIdToModel: map from lora module id to LoraModule
      * \param[in] manager: a BufferManager the manager to use to perform the copies
@@ -286,7 +286,7 @@ public:
      * \returns -- list of cache Values objects
      */
     static std::vector<LoraCache::TaskLayerModuleConfig> copyToPages(TensorPtr weights, TensorPtr config,
-        GptModelConfig const& modelConfig, WorldConfig const& worldConfig,
+        ModelConfig const& modelConfig, WorldConfig const& worldConfig,
         std::unordered_map<SizeType, LoraModule> moduleIdToModel, BufferManager const& manager,
         std::vector<TensorPtr> const& pages, std::vector<std::size_t> const& pageIds);
 
@@ -385,7 +385,7 @@ private:
     };
 
     LoraCachePageManagerConfig mPageManagerConfig;
-    GptModelConfig mModelConfig;
+    ModelConfig mModelConfig;
     WorldConfig mWorldConfig;
 
     // Protects mCachePageManager

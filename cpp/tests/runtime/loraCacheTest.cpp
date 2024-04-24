@@ -59,7 +59,7 @@ protected:
 
     void SetUp() override
     {
-        mModelConfig = std::make_unique<GptModelConfig>(0, 2, 1, 16, nvinfer1::DataType::kFLOAT);
+        mModelConfig = std::make_unique<ModelConfig>(0, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
         mModelConfig->setMlpHiddenSize(32);
         mWorldConfig = std::make_unique<WorldConfig>(2, 1, 0);
         std::vector<LoraModule> modules{
@@ -93,7 +93,7 @@ protected:
 
     std::shared_ptr<BufferManager> mManager;
     BufferManager::CudaStreamPtr mStream;
-    std::unique_ptr<GptModelConfig> mModelConfig;
+    std::unique_ptr<ModelConfig> mModelConfig;
     std::unique_ptr<WorldConfig> mWorldConfig;
     std::unique_ptr<LoraCache> mLoraCache;
     std::unique_ptr<LoraCache> mLoraCache2;
@@ -163,7 +163,7 @@ TEST_F(LoraCacheTest, LoraCachePageManagerTest)
 
 TEST_F(LoraCacheTest, determineNumPages)
 {
-    GptModelConfig modelConfig(0, 2, 1, 4, nvinfer1::DataType::kFLOAT);
+    ModelConfig modelConfig(0, 2, 0, 1, 4, nvinfer1::DataType::kFLOAT);
     modelConfig.setLoraModules(LoraModule::createLoraModules({"attn_dense", "attn_qkv"}, 4, 4, 1, 1, 2, 2));
     WorldConfig worldConfig(1, 1, 0);
 
@@ -355,7 +355,7 @@ TEST_F(LoraCacheTest, basicPutGet)
 
 TEST_F(LoraCacheTest, splitTransposeCpu)
 {
-    auto modelConfig = GptModelConfig(0, 2, 1, 16, nvinfer1::DataType::kFLOAT);
+    auto modelConfig = ModelConfig(0, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
     auto worldConfig = WorldConfig(2, 1, 0);
 
     SizeType const split{2};
@@ -418,7 +418,7 @@ TEST_F(LoraCacheTest, splitTransposeCpu)
 
 TEST_F(LoraCacheTest, copyToPages_tp1)
 {
-    auto modelConfig = GptModelConfig(0, 2, 1, 16, nvinfer1::DataType::kFLOAT);
+    auto modelConfig = ModelConfig(0, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
     modelConfig.setMlpHiddenSize(32);
     auto worldConfig = WorldConfig(1, 1, 0);
     std::vector<LoraModule> modules{
@@ -476,7 +476,7 @@ TEST_F(LoraCacheTest, copyToPages_tp1)
 
 TEST_F(LoraCacheTest, copyToPages_tp2_rank0)
 {
-    auto modelConfig = GptModelConfig(0, 2, 1, 16, nvinfer1::DataType::kFLOAT);
+    auto modelConfig = ModelConfig(0, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
     modelConfig.setMlpHiddenSize(32);
     auto worldConfig = WorldConfig(2, 1, 0);
     std::vector<LoraModule> modules{
@@ -533,7 +533,7 @@ TEST_F(LoraCacheTest, copyToPages_tp2_rank0)
 
 TEST_F(LoraCacheTest, copyToPages_tp2_rank1)
 {
-    auto modelConfig = GptModelConfig(0, 2, 1, 16, nvinfer1::DataType::kFLOAT);
+    auto modelConfig = ModelConfig(0, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
     modelConfig.setMlpHiddenSize(32);
     auto worldConfig = WorldConfig(2, 1, 1);
     std::vector<LoraModule> modules{

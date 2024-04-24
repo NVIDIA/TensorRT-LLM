@@ -21,6 +21,7 @@
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
 #include "tensorrt_llm/kernels/samplingTopPKernels.h"
+#include "tensorrt_llm/layers/defaultDecodingParams.h"
 #include "tensorrt_llm/layers/topPSamplingLayer.h"
 
 #include <algorithm>
@@ -149,20 +150,20 @@ void TopPSamplingLayer<T>::setup(SizeType const batchSize, SizeType const* batch
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    SizeType32 const defaultTopK = 0;
-    auto runtimeTopK = setupParams.runtime_top_k.value_or(std::vector<SizeType32>{defaultTopK});
+    auto const defaultTopK = DefaultDecodingParams::getTopK();
+    auto runtimeTopK = setupParams.runtime_top_k.value_or(std::vector<SizeType32>(batchSize, defaultTopK));
     auto runtimeTopP = setupParams.runtime_top_p.value_or(std::vector<float>{});
 
     auto const runtimeTopKSize = runtimeTopK.size();
     auto const runtimeTopPSize = runtimeTopP.size();
 
-    auto const defaultTopPDecay{1.0f};
+    auto const defaultTopPDecay = DefaultDecodingParams::getTopPDecay();
     auto decayVec = setupParams.top_p_decay.value_or(std::vector<float>(batchSize, defaultTopPDecay));
 
-    auto const defaultTopPMin{1e-6f}; // prevent topp becoming 0.0
+    auto const defaultTopPMin = DefaultDecodingParams::getTopPMin(); // prevent TopP becoming 0.0
     auto topPMinVec = setupParams.top_p_min.value_or(std::vector<float>(batchSize, defaultTopPMin));
 
-    TokenIdType const defaultTopPResetId{-1};
+    auto const defaultTopPResetId = DefaultDecodingParams::getTopPResetId();
     auto topPResetIdsVec
         = setupParams.top_p_reset_ids.value_or(std::vector<TokenIdType>(batchSize, defaultTopPResetId));
 
@@ -194,8 +195,9 @@ void TopPSamplingLayer<T>::setup(SizeType const batchSize, SizeType const* batch
     {
         if (decay <= 0.f || decay > 1.0f)
         {
-            TLLM_LOG_WARNING("Decay (%f) is out of range ((0.0, 1.0f]). Change to 1.0.", decay);
-            decay = 1.0f;
+            TLLM_LOG_WARNING(
+                "Decay (%f) is out of range ((0.0, 1.0f]). Change to default (%f).", decay, defaultTopPDecay);
+            decay = defaultTopPDecay;
         }
     }
 
@@ -203,8 +205,9 @@ void TopPSamplingLayer<T>::setup(SizeType const batchSize, SizeType const* batch
     {
         if (topPMin <= 0.f || topPMin > 1.0f)
         {
-            TLLM_LOG_WARNING("TopP min (%f) is out of range ([0.0, 1.0f]). Change to 0.5.", topPMin);
-            topPMin = 0.5f;
+            TLLM_LOG_WARNING(
+                "TopP min (%f) is out of range ([0.0, 1.0f]). Change to default (%f).", topPMin, defaultTopPMin);
+            topPMin = defaultTopPMin;
         }
     }
 

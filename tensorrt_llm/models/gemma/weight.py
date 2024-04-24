@@ -443,7 +443,7 @@ def load_from_hf_gemma(tensorrt_llm_gemma: 'GemmaForCausalLM',
     vocab_size = hf_gemma.config.vocab_size
     weights = {}
     for k, v in model_params.items():
-        t_dtype = torch_dtype if "block_sparse_moe.gate" not in k else torch.float32
+        t_dtype = torch_dtype
         if isinstance(v, list):
             v = [torch_to_numpy(vv.to(t_dtype).detach().cpu()) for vv in v]
         else:
@@ -620,45 +620,6 @@ def load_from_hf_gemma(tensorrt_llm_gemma: 'GemmaForCausalLM',
                     # dst.value = np.ascontiguousarray(split_v)
                     weights['transformer.layers.{}.mlp.fc.weight'.format(
                         idx)] = split_v
-            elif 'experts.w2.weight' in k:
-                # Note: no need for splitting, it's already been done above
-                split_v = v
-                if use_weight_only:
-                    v = np.ascontiguousarray(
-                        np.transpose(split_v, axes=(0, 2, 1)))
-                    processed_torch_weights, torch_weight_scales = \
-                        torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
-                            numpy_to_torch(v), plugin_weight_only_quant_type)
-                    weights['transformer.layers.{}.mlp.experts_weight_2'.format(
-                        idx)] = processed_torch_weights
-                    weights['transformer.layers.{}.mlp.experts_scale_2'.format(
-                        idx)] = torch_weight_scales
-
-                else:
-                    weights['transformer.layers.{}.mlp.experts_weight_2'.format(
-                        idx)] = v
-            elif 'experts.w3w1.weight' in k:
-                # Note: no need for splitting, it's already been done above
-                split_v = v
-                if use_weight_only:
-                    v = np.ascontiguousarray(
-                        np.transpose(split_v, axes=(0, 2, 1)))
-                    processed_torch_weights, torch_weight_scales = \
-                        torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
-                            numpy_to_torch(v), plugin_weight_only_quant_type)
-                    weights['transformer.layers.{}.mlp.experts_weight_1'.format(
-                        idx)] = processed_torch_weights
-                    weights['transformer.layers.{}.mlp.experts_scale_1'.format(
-                        idx)] = torch_weight_scales
-
-                else:
-                    weights['transformer.layers.{}.mlp.experts_weight_1'.format(
-                        idx)] = v
-
-            elif 'block_sparse_moe.gate' in k:
-                v = split(v, mapping.tp_size, mapping.tp_rank, dim=-1)
-                weights['transformer.layers.{}.mlp.router.weight'.format(
-                    idx)] = v
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))

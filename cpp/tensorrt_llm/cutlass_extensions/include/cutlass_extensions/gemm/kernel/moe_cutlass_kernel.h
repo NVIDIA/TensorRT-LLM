@@ -35,6 +35,8 @@
 #include "cutlass_extensions/gemm/kernel/gemm_moe_problem_visitor.h"
 #include "cutlass_extensions/tile_interleaved_layout.h"
 
+#include "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_sm90_traits.h"
+
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass
@@ -502,8 +504,7 @@ public:
 #elif (__CUDA_ARCH__ >= 800) && (__CUDA_ARCH__ < 900)
         run_kernel<arch::Sm80>(params, shared_storage);
 #elif (__CUDA_ARCH__ >= 900)
-        run_kernel<arch::Sm80>(
-            params, shared_storage); // Don't compile these for Hopper or later. Use CUTLASS 3.x kernels.
+        run_kernel<arch::Sm80>(params, shared_storage);
 #else
         static_assert(
             false, "Invalid architecture being compiled. Only Volta+ supported in weight-only quantization kernels.");

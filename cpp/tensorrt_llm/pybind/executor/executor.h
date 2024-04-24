@@ -52,21 +52,27 @@ public:
     [[nodiscard]] std::vector<tle::Response> awaitResponses(
         std::optional<std::chrono::milliseconds> const& timeout = std::nullopt)
     {
-
+        // Await responses blocks until a response is received. Release GIL so that it can be ran in a background
+        // thread.
+        pybind11::gil_scoped_release release;
         return mExecutor->awaitResponses(timeout);
     }
 
     [[nodiscard]] std::vector<tle::Response> awaitResponses(
         tle::IdType const& requestId, std::optional<std::chrono::milliseconds> const& timeout = std::nullopt)
     {
-
+        // Await responses blocks until a response is received. Release GIL so that it can be ran in a background
+        // thread.
+        pybind11::gil_scoped_release release;
         return mExecutor->awaitResponses(requestId, timeout);
     }
 
     [[nodiscard]] std::vector<std::vector<tle::Response>> awaitResponses(std::vector<tle::IdType> const& requestIds,
         std::optional<std::chrono::milliseconds> const& timeout = std::nullopt)
     {
-
+        // Await responses blocks until a response is received. Release GIL so that it can be ran in a background
+        // thread.
+        pybind11::gil_scoped_release release;
         return mExecutor->awaitResponses(requestIds, timeout);
     }
 

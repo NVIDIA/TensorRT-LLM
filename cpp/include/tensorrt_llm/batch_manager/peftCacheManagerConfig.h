@@ -60,6 +60,7 @@ struct PeftCacheManagerConfig
         , optimalAdapterSize(cfg.getOptimalAdapterSize())
         , maxAdapterSize(cfg.getMaxAdapterSize())
         , numPutWorkers(cfg.getNumPutWorkers())
+        , numEnsureWorkers(cfg.getNumEnsureWorkers())
         , numCopyStreams(cfg.getNumCopyStreams())
         , maxPagesPerBlockHost(cfg.getMaxPagesPerBlockHost())
         , maxPagesPerBlockDevice(cfg.getMaxPagesPerBlockDevice())

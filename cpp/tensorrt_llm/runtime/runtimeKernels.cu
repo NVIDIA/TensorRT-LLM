@@ -1218,10 +1218,10 @@ void mergeLogitsFragments(BufferManager const& bufferManager, ITensor& output, s
 
 void invokeUpdateKVBlockArrayDraftTokenLocation(ITensor const& seqAcceptedDraftTokenOffsets,
     ITensor const& packedAcceptedDraftTokensIndices, ITensor const& pastKeyValueLengths, void* const* pointerArray,
-    int32_t const* offsetArray, SizeType layerCount, SizeType seqCount, SizeType numKVHeads,
-    SizeType sizeInBytesPerKVHead, SizeType rewindDraftTokenCommonCount, int* rewindDraftTokenSeparateAdjustments,
-    ITensor const& seqSlotRemapping, SizeType maxKVCacheLen, SizeType maxBlocksPerSeq, SizeType tokensPerBlock,
-    cudaStream_t stream)
+    ::tensorrt_llm::kernels::KVCacheIndex const* offsetArray, SizeType layerCount, SizeType seqCount,
+    SizeType numKVHeads, SizeType sizeInBytesPerKVHead, SizeType rewindDraftTokenCommonCount,
+    int* rewindDraftTokenSeparateAdjustments, ITensor const& seqSlotRemapping, SizeType maxKVCacheLen,
+    SizeType maxBlocksPerSeq, SizeType tokensPerBlock, cudaStream_t stream)
 {
     tensorrt_llm::kernels::parallel_decoding::updateKVBlockArrayDraftTokenLocation(
         bufferCast<SizeType>(seqAcceptedDraftTokenOffsets), bufferCast<SizeType>(packedAcceptedDraftTokensIndices),

@@ -26,62 +26,62 @@ void DecodingOutput::BeamHypotheses::empty(BufferManager& manager)
     auto constexpr nvFloatType = TRTDataType<float>::value;
     auto constexpr nvBoolType = TRTDataType<bool>::value;
 
-    outputIdsTgt = manager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
-    sequenceLengthsTgt = manager.emptyTensor(MemoryType::kGPU, nvSizeType);
-    cumLogProbs = manager.emptyTensor(MemoryType::kGPU, nvFloatType);
-    normedScores = manager.emptyTensor(MemoryType::kGPU, nvFloatType);
-    logProbs = manager.emptyTensor(MemoryType::kGPU, nvFloatType);
-    minNormedScores = manager.emptyTensor(MemoryType::kGPU, nvFloatType);
-    numBeams = manager.emptyTensor(MemoryType::kGPU, nvSizeType);
-    isDone = manager.emptyTensor(MemoryType::kGPU, nvBoolType);
+    outputIdsCBA = manager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
+    sequenceLengthsCBA = manager.emptyTensor(MemoryType::kGPU, nvSizeType);
+    cumLogProbsCBA = manager.emptyTensor(MemoryType::kGPU, nvFloatType);
+    normedScoresCBA = manager.emptyTensor(MemoryType::kGPU, nvFloatType);
+    logProbsCBA = manager.emptyTensor(MemoryType::kGPU, nvFloatType);
+    minNormedScoresCBA = manager.emptyTensor(MemoryType::kGPU, nvFloatType);
+    numBeamsCBA = manager.emptyTensor(MemoryType::kGPU, nvSizeType);
+    batchDones = manager.emptyTensor(MemoryType::kGPU, nvBoolType);
 }
 
 void DecodingOutput::BeamHypotheses::reshape(SizeType batchSize, SizeType beamWidth, SizeType maxSequenceLength)
 {
-    outputIdsTgt->reshape(ITensor::makeShape({batchSize, 2 * beamWidth, maxSequenceLength}));
-    sequenceLengthsTgt->reshape(ITensor::makeShape({batchSize, 2 * beamWidth}));
-    cumLogProbs->reshape(ITensor::makeShape({batchSize, 2 * beamWidth}));
-    normedScores->reshape(ITensor::makeShape({batchSize, 2 * beamWidth}));
-    logProbs->reshape(ITensor::makeShape({batchSize, 2 * beamWidth, maxSequenceLength}));
-    minNormedScores->reshape(ITensor::makeShape({batchSize}));
-    numBeams->reshape(ITensor::makeShape({batchSize}));
-    isDone->reshape(ITensor::makeShape({batchSize}));
+    outputIdsCBA->reshape(ITensor::makeShape({batchSize, 2 * beamWidth, maxSequenceLength}));
+    sequenceLengthsCBA->reshape(ITensor::makeShape({batchSize, 2 * beamWidth}));
+    cumLogProbsCBA->reshape(ITensor::makeShape({batchSize, 2 * beamWidth}));
+    normedScoresCBA->reshape(ITensor::makeShape({batchSize, 2 * beamWidth}));
+    logProbsCBA->reshape(ITensor::makeShape({batchSize, 2 * beamWidth, maxSequenceLength}));
+    minNormedScoresCBA->reshape(ITensor::makeShape({batchSize}));
+    numBeamsCBA->reshape(ITensor::makeShape({batchSize}));
+    batchDones->reshape(ITensor::makeShape({batchSize}));
 }
 
 void DecodingOutput::BeamHypotheses::init(BufferManager& manager, TokenIdType endId)
 {
-    kernels::invokeFill(*outputIdsTgt, endId, manager.getStream());
-    manager.setZero(*sequenceLengthsTgt);
-    manager.setZero(*cumLogProbs);
-    manager.setZero(*normedScores);
-    manager.setZero(*logProbs);
-    manager.setZero(*minNormedScores);
-    manager.setZero(*numBeams);
-    manager.setZero(*isDone);
+    kernels::invokeFill(*outputIdsCBA, endId, manager.getStream());
+    manager.setZero(*sequenceLengthsCBA);
+    manager.setZero(*cumLogProbsCBA);
+    manager.setZero(*normedScoresCBA);
+    manager.setZero(*logProbsCBA);
+    manager.setZero(*minNormedScoresCBA);
+    manager.setZero(*numBeamsCBA);
+    manager.setZero(*batchDones);
 }
 
 DecodingOutput::BeamHypotheses DecodingOutput::BeamHypotheses::slice(SizeType batchIndex, SizeType size) const
 {
     DecodingOutput::BeamHypotheses bh{};
-    bh.outputIdsTgt = ITensor::slice(outputIdsTgt, batchIndex, size);
-    bh.sequenceLengthsTgt = ITensor::slice(sequenceLengthsTgt, batchIndex, size);
-    bh.cumLogProbs = ITensor::slice(cumLogProbs, batchIndex, size);
-    bh.normedScores = ITensor::slice(normedScores, batchIndex, size);
-    bh.logProbs = ITensor::slice(logProbs, batchIndex, size);
-    bh.minNormedScores = ITensor::slice(minNormedScores, batchIndex, size);
-    bh.numBeams = ITensor::slice(numBeams, batchIndex, size);
-    bh.isDone = ITensor::slice(isDone, batchIndex, size);
+    bh.outputIdsCBA = ITensor::slice(outputIdsCBA, batchIndex, size);
+    bh.sequenceLengthsCBA = ITensor::slice(sequenceLengthsCBA, batchIndex, size);
+    bh.cumLogProbsCBA = ITensor::slice(cumLogProbsCBA, batchIndex, size);
+    bh.normedScoresCBA = ITensor::slice(normedScoresCBA, batchIndex, size);
+    bh.logProbsCBA = ITensor::slice(logProbsCBA, batchIndex, size);
+    bh.minNormedScoresCBA = ITensor::slice(minNormedScoresCBA, batchIndex, size);
+    bh.numBeamsCBA = ITensor::slice(numBeamsCBA, batchIndex, size);
+    bh.batchDones = ITensor::slice(batchDones, batchIndex, size);
     return bh;
 }
 
 void DecodingOutput::BeamHypotheses::release()
 {
-    outputIdsTgt->release();
-    sequenceLengthsTgt->release();
-    cumLogProbs->release();
-    normedScores->release();
-    logProbs->release();
-    minNormedScores->release();
-    numBeams->release();
-    isDone->release();
+    outputIdsCBA->release();
+    sequenceLengthsCBA->release();
+    cumLogProbsCBA->release();
+    normedScoresCBA->release();
+    logProbsCBA->release();
+    minNormedScoresCBA->release();
+    numBeamsCBA->release();
+    batchDones->release();
 }

@@ -13,8 +13,8 @@
 #pragma once
 
 #include "tensorrt_llm/runtime/common.h"
-#include "tensorrt_llm/runtime/gptModelConfig.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 namespace tensorrt_llm::runtime::lora
@@ -32,6 +32,6 @@ void loraValidateRequestTensorDims(std::optional<ITensor::SharedPtr> const& optR
 
 void loraValidateRequestTensors(std::optional<std::uint64_t> const& optTaskId,
     std::optional<ITensor::SharedPtr> const& optReqLoraWeights,
-    std::optional<ITensor::SharedPtr> const& optReqLoraConfig, runtime::GptModelConfig const& modelConfig,
+    std::optional<ITensor::SharedPtr> const& optReqLoraConfig, runtime::ModelConfig const& modelConfig,
     runtime::WorldConfig const& worldConfig);
 } // namespace tensorrt_llm::runtime::lora

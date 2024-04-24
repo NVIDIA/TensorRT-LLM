@@ -44,7 +44,9 @@ __global__ void updateKVCacheDraftTokenLocationBatchedKernel(std::array<KVCacheB
     int seqDraftTokenEnd = seqAcceptedDraftTokenOffsets[seqIdx + 1];
     auto const seqSlot = seqSlotRemapping == nullptr ? seqIdx : seqSlotRemapping[seqIdx];
     int seqDraftCount = seqDraftTokenEnd - seqDraftTokenStart;
-    if (seqDraftCount == 0)
+    int maxEltCountPerMove = kUpdateKVCacheKernelShmSize / sizeof(MoveEltType) / seqDraftCount;
+    int eltCountPerMove = min(maxEltCountPerMove, eltCountPerHead);
+    if (seqDraftCount == 0 || eltCountPerMove == 0)
     {
         return;
     }
@@ -54,8 +56,6 @@ __global__ void updateKVCacheDraftTokenLocationBatchedKernel(std::array<KVCacheB
     {
         tokenStartIdx -= rewindDraftTokenSeparateAdjustments[seqSlot];
     }
-    int maxEltCountPerMove = kUpdateKVCacheKernelShmSize / sizeof(MoveEltType) / seqDraftCount;
-    int eltCountPerMove = min(maxEltCountPerMove, eltCountPerHead);
     __shared__ char loadSmemBuffer[kUpdateKVCacheKernelShmSize];
     auto* eltLoadSmemBuffer = reinterpret_cast<MoveEltType*>(&loadSmemBuffer[0]);
     for (int startChannelOffset = 0; startChannelOffset < eltCountPerHead; startChannelOffset += eltCountPerMove)

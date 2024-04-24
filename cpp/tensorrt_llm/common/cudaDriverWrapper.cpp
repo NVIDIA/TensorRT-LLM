@@ -62,6 +62,7 @@ CUDADriverWrapper::CUDADriverWrapper()
     *(void**) (&_cuLinkAddData) = load_sym(handle, "cuLinkAddData_v2");
     *(void**) (&_cuLaunchCooperativeKernel) = load_sym(handle, "cuLaunchCooperativeKernel");
     *(void**) (&_cuLaunchKernel) = load_sym(handle, "cuLaunchKernel");
+    *(void**) (&_cuTensorMapEncodeTiled) = load_sym(handle, "cuTensorMapEncodeTiled");
 }
 
 CUDADriverWrapper::~CUDADriverWrapper()
@@ -141,6 +142,15 @@ CUresult CUDADriverWrapper::cuLaunchKernel(CUfunction f, unsigned int gridDimX, 
 {
     return (*_cuLaunchKernel)(
         f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream, kernelParams, extra);
+}
+
+CUresult CUDADriverWrapper::cuTensorMapEncodeTiled(CUtensorMap* tensorMap, CUtensorMapDataType tensorDataType,
+    cuuint32_t tensorRank, void* globalAddress, cuuint64_t const* globalDim, cuuint64_t const* globalStrides,
+    cuuint32_t const* boxDim, cuuint32_t const* elementStrides, CUtensorMapInterleave interleave,
+    CUtensorMapSwizzle swizzle, CUtensorMapL2promotion l2Promotion, CUtensorMapFloatOOBfill oobFill) const
+{
+    return (*_cuTensorMapEncodeTiled)(tensorMap, tensorDataType, tensorRank, globalAddress, globalDim, globalStrides,
+        boxDim, elementStrides, interleave, swizzle, l2Promotion, oobFill);
 }
 
 } // namespace common

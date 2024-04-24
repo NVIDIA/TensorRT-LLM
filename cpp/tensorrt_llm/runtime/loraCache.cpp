@@ -435,7 +435,7 @@ SizeType LoraCache::determineNumPages(TaskIdType taskId) const
 SizeType LoraCache::determineNumPages(TensorPtr loraConfig) const
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
-    auto const localNumLayers = mModelConfig.getNbLayers(mWorldConfig.getPipelineParallelism());
+    auto const localNumLayers = mModelConfig.getNbAttentionLayers(mWorldConfig.getPipelineParallelism());
     auto const firstLayerId = mWorldConfig.getPipelineParallelRank() * localNumLayers;
     auto const lastLayerId = firstLayerId + localNumLayers;
 
@@ -466,7 +466,7 @@ SizeType LoraCache::determineNumPages(TensorPtr loraConfig) const
     return currPage + 1;
 }
 
-LoraCache::LoraCache(LoraCachePageManagerConfig const& pageManagerConfig, GptModelConfig const& modelConfig,
+LoraCache::LoraCache(LoraCachePageManagerConfig const& pageManagerConfig, ModelConfig const& modelConfig,
     WorldConfig const& worldConfig, BufferManager const& bufferManager)
     : mPageManagerConfig(pageManagerConfig)
     , mModelConfig(modelConfig)
@@ -532,7 +532,7 @@ void LoraCache::splitTransposeCpu(ITensor& output, ITensor const& input, SizeTyp
 }
 
 std::vector<LoraCache::TaskLayerModuleConfig> LoraCache::copyToPages(TensorPtr sourceWeights, TensorPtr sourceConfig,
-    GptModelConfig const& modelConfig, WorldConfig const& worldConfig,
+    ModelConfig const& modelConfig, WorldConfig const& worldConfig,
     std::unordered_map<SizeType, LoraModule> moduleIdToModule, BufferManager const& manager,
     std::vector<TensorPtr> const& pages, std::vector<std::size_t> const& pageIds)
 {
@@ -558,7 +558,7 @@ std::vector<LoraCache::TaskLayerModuleConfig> LoraCache::copyToPages(TensorPtr s
     auto const tpRank = worldConfig.getTensorParallelRank();
     auto const ppSize = worldConfig.getPipelineParallelism();
     auto const ppRank = worldConfig.getPipelineParallelRank();
-    auto const localNumLayers = modelConfig.getNbLayers(ppSize);
+    auto const localNumLayers = modelConfig.getNbAttentionLayers(ppSize);
     auto const firstLayerId = ppRank * localNumLayers;
     auto const lastLayerId = firstLayerId + localNumLayers;
 

@@ -12,9 +12,6 @@ from typing import Any, Dict, Iterable, List, Optional, Union
 import tensorrt as trt
 import torch
 
-import tensorrt_llm.bindings as tllm
-from tensorrt_llm.bindings import KvCacheConfig, SchedulerPolicy
-
 from .. import bindings as tllm
 from .._utils import mpi_barrier, mpi_rank, release_gc
 from ..auto_parallel import AutoParallelConfig, infer_cluster_config
@@ -329,7 +326,7 @@ class LLM:
 
         # Read the additional options
         self.normalize_log_probs = _additional_options.pop(
-            'normalize_log_probs', None)
+            'normalize_log_probs', True)
         # TODO[chunweiy]: Turn on the custom all reduce by default later
         self.use_custom_all_reduce = _additional_options.pop(
             'use_custom_all_reduce', False if plugin_config_alterable else None)
@@ -496,7 +493,8 @@ class LLM:
             raise RuntimeError("The engine is not built yet.")
         src_engine_dir = self._engine_dir.name if isinstance(
             self._engine_dir, tempfile.TemporaryDirectory) else self._engine_dir
-        if src_engine_dir != engine_dir:
+
+        if os.path.abspath(src_engine_dir) != os.path.abspath(engine_dir):
             shutil.copytree(src_engine_dir, engine_dir, dirs_exist_ok=True)
 
     def shutdown(self):
@@ -615,7 +613,9 @@ class LLM:
             executor_config=executor_config,
             executor_policy=self.scheduling_policy,
             model_world_size=self.config.world_size,
-            mpi_session=self.mpi_session)
+            mpi_session=self.mpi_session,
+            executor_type=tllm.TrtGptModelType.InflightFusedBatching,
+        )
 
     @print_traceback_on_error
     @staticmethod
@@ -752,6 +752,7 @@ class ModelLoader:
         default_config = self.config.auto_parallel_config
         self.auto_parallel_config.set_defaults(
             cluster_key=default_config.cluster_key,
+            cluster_info=default_config.cluster_info,
             same_buffer_io=default_config.same_buffer_io,
             sharded_io_allowlist=default_config.sharded_io_allowlist,
         )

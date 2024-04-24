@@ -18,9 +18,9 @@
 
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
-#include "tensorrt_llm/runtime/gptModelConfig.h"
 #include "tensorrt_llm/runtime/loraCache.h"
 #include "tensorrt_llm/runtime/loraModule.h"
+#include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 #include <unordered_map>
 
@@ -48,17 +48,17 @@ public:
 
     /**
      * \brief Sets up and configures LoraManager. Allocates and needed device / host memory
-     * \param[in] modelConfig: a GptModelConfig.
+     * \param[in] modelConfig: a ModelConfig.
      * \param[in] worldConfig: a WorldConfig
      * \param[in] manager: and BufferManager used to allocate memory
      */
-    void create(GptModelConfig const& modelConfig, WorldConfig const& worldConfig, BufferManager const& manager);
+    void create(ModelConfig const& modelConfig, WorldConfig const& worldConfig, BufferManager const& manager);
 
     /**
      * \brief same as fillInputTensors but for an entire batch
      */
     void fillInputTensors(TensorPtr weightsPtrs, TensorPtr adapterSizes, PeftTable const& peftTable,
-        ReqIdsVec const& reqIds, std::vector<SizeType> const& reqBeamWidth, GptModelConfig const& modelConfig,
+        ReqIdsVec const& reqIds, std::vector<SizeType> const& reqBeamWidth, ModelConfig const& modelConfig,
         WorldConfig const& worldConfig);
 
     /**
@@ -70,22 +70,22 @@ public:
      * \param[in] peftTable: reqId to LoraCache::Values
      * \param[in] batchIdx: the request batch index
      * \param[in] beamWidth: the request beam width
-     * \param[in] modelConfig: a GptModelConfig
+     * \param[in] modelConfig: a ModelConfig
      * \param[in] worldConfig: a WorldConfig
      */
     void fillInputTensors(TensorPtr weightsPtrs, TensorPtr adapterSizes, PeftValues const peftValues, SizeType batchIdx,
-        SizeType beamWidth, GptModelConfig const& modelConfig, WorldConfig const& worldConfig);
+        SizeType beamWidth, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
     /**
      * \brief fill tensor map for trt engine context
      * \param[out] inputTensors: the tensor map to fill
      * \param[in] weightsPtrs: tensor of weights pointers as filled in fillInputTensors
      * \param[in] adapterSizes: tensor of adapter sizes as filled in fillInputTensors
-     * \param[in] modelConfig: a GptModelConfig
+     * \param[in] modelConfig: a ModelConfig
      * \param[in] worldConfig: a WorldConfig
      */
     void insertInputTensors(TensorMap& inputTensors, TensorPtr weightsPtrs, TensorPtr adapterSizes,
-        GptModelConfig const& modelConfig, WorldConfig const& worldConfig) const;
+        ModelConfig const& modelConfig, WorldConfig const& worldConfig) const;
 
 private:
     std::unordered_map<SizeType, LoraModule> mModuleIdToModule;

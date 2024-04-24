@@ -18,11 +18,11 @@
 #include <gtest/gtest.h>
 
 #include "tensorrt_llm/runtime/bufferManager.h"
-#include "tensorrt_llm/runtime/gptModelConfig.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/loraModule.h"
 #include "tensorrt_llm/runtime/loraUtils.h"
+#include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 #include <NvInferRuntimeBase.h>
 
@@ -85,7 +85,7 @@ TEST_F(LoraUtilsTest, dims_mem_type)
 
 TEST_F(LoraUtilsTest, loraValidateRequestTensors)
 {
-    auto modelConfig = GptModelConfig(0, 2, 1, 4, nvinfer1::DataType::kFLOAT);
+    auto modelConfig = ModelConfig(0, 2, 0, 1, 4, nvinfer1::DataType::kFLOAT);
     auto worldConfig = WorldConfig();
 
     std::optional<TensorPtr> optReqLoraWeights

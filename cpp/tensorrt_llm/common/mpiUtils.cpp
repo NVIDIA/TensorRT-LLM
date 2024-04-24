@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/iBuffer.h"
 
 #include <csignal>
 #include <mpi.h>
@@ -35,7 +36,7 @@ namespace tensorrt_llm::mpi
 
 MPI_Datatype getMpiDtype(MpiType dtype)
 {
-    static const std::unordered_map<MpiType, MPI_Datatype> dtype_map{
+    static std::unordered_map<MpiType, MPI_Datatype> const dtype_map{
 
         {MpiType::kBYTE, MPI_BYTE},
         {MpiType::kHALF, MPI_UINT16_T},
@@ -57,7 +58,7 @@ MPI_Datatype getMpiDtype(MpiType dtype)
 
 MPI_Op getMpiOp(MpiOp op)
 {
-    static const std::unordered_map<MpiOp, MPI_Op> op_map{
+    static std::unordered_map<MpiOp, MPI_Op> const op_map{
         {MpiOp::NULLOP, MPI_OP_NULL},
         {MpiOp::MAX, MPI_MAX},
         {MpiOp::MIN, MPI_MIN},
@@ -122,9 +123,20 @@ std::shared_ptr<MpiRequest> MpiComm::bcastAsync(void* buffer, size_t size, MpiTy
     return r;
 }
 
+std::shared_ptr<MpiRequest> MpiComm::bcastAsync(runtime::IBuffer& buf, int root) const
+{
+    TLLM_CHECK(buf.getMemoryType() != runtime::MemoryType::kGPU);
+    return bcastAsync(buf.data(), buf.getSizeInBytes(), MpiType::kBYTE, root);
+}
+
 void MpiComm::bcast(void* buffer, size_t size, MpiType dtype, int root) const
 {
     MPICHECK(MPI_Bcast(buffer, size, getMpiDtype(dtype), root, mComm));
+}
+
+void MpiComm::bcast(runtime::IBuffer& buf, int root) const
+{
+    bcast(buf.data(), buf.getSizeInBytes(), MpiType::kBYTE, root);
 }
 
 void MpiComm::send(void const* buffer, size_t size, MpiType dtype, int dest, int tag) const
@@ -132,11 +144,23 @@ void MpiComm::send(void const* buffer, size_t size, MpiType dtype, int dest, int
     MPICHECK(MPI_Send(buffer, size, getMpiDtype(dtype), dest, tag, mComm));
 }
 
+void MpiComm::send(runtime::IBuffer const& buf, int dest, int tag) const
+{
+    TLLM_CHECK(buf.getMemoryType() != runtime::MemoryType::kGPU);
+    send(buf.data(), buf.getSizeInBytes(), MpiType::kBYTE, dest, tag);
+}
+
 MPI_Status MpiComm::recv(void* buffer, size_t size, MpiType dtype, int source, int tag) const
 {
     MPI_Status status{};
     MPICHECK(MPI_Recv(buffer, size, getMpiDtype(dtype), source, tag, mComm, &status));
     return status;
+}
+
+MPI_Status MpiComm::recv(runtime::IBuffer& buf, int source, int tag) const
+{
+    TLLM_CHECK(buf.getMemoryType() != runtime::MemoryType::kGPU);
+    return recv(buf.data(), buf.getSizeInBytes(), MpiType::kBYTE, source, tag);
 }
 
 MpiComm MpiComm::split(int color, int key) const

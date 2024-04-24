@@ -1,6 +1,8 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/cutlass_preprocessors.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
+
 #include <algorithm>
 #include <gtest/gtest.h>
 #include <numeric>
@@ -12,8 +14,10 @@ using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
 
+constexpr static float FP8_MAX = 440; // FP8_E4M3_MAX;
+
 template <class T>
-__global__ void initWeightsKernel(T* data, int w, int h, T scalar)
+__global__ void initWeightsKernel(T* data, int w, int h, float scalar)
 {
     size_t expert_id = blockIdx.z;
     T* start_offset = data + expert_id * w * h;
@@ -21,7 +25,22 @@ __global__ void initWeightsKernel(T* data, int w, int h, T scalar)
     size_t x = blockIdx.x * blockDim.x + threadIdx.x;
     size_t y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x < w && y < h)
-        start_offset[y * w + x] = (x == y) ? scalar : 0;
+        start_offset[y * w + x] = (x == y) ? T(scalar) : T(0.f);
+}
+
+template <class T>
+__global__ void initWeightsGatedKernel(T* data, int w, int h, float scalar_1, float scalar_2)
+{
+    size_t expert_id = blockIdx.z;
+    T* start_offset = data + expert_id * w * h * 2;
+
+    size_t x = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x < w && y < h)
+    {
+        start_offset[y * w + x] = (x == y) ? T(scalar_1) : T(0.f);
+        start_offset[(y + h) * w + x] = (x == y) ? T(scalar_2) : T(0.f);
+    }
 }
 
 template <class T>
@@ -32,13 +51,43 @@ __global__ void initBiasToExpertIdKernel(T* data, int w)
 
     size_t x = blockIdx.x * blockDim.x + threadIdx.x;
     if (x < w)
-        start_offset[x] = expert_id;
+        start_offset[x] = T(expert_id);
 }
 
+template <class T>
+__global__ void initBiasToExpertIdGatedKernel(T* data, int w)
+{
+    size_t expert_id = blockIdx.y;
+    T* start_offset = data + expert_id * w * 2;
+
+    size_t x = blockIdx.x * blockDim.x + threadIdx.x;
+    if (x < w)
+    {
+        start_offset[x] = T(expert_id);
+        start_offset[x + w] = T(expert_id + 1);
+    }
+}
+
+#ifdef ENABLE_FP8
+using SafeFP8 = __nv_fp8_e4m3;
+#else
+using SafeFP8 = void;
+#endif
+
+template <class TypeTuple_>
 class MixtureOfExpertsTest : public ::testing::Test
 {
 protected:
-    using DataType = float;
+    using DataType = typename TypeTuple_::DataType;
+    using WeightType = typename TypeTuple_::WeightType;
+    using OutputType = typename TypeTuple_::OutputType;
+    constexpr static bool INT4 = std::is_same_v<WeightType, cutlass::uint4b_t>;
+    constexpr static bool FP8 = std::is_same_v<DataType, SafeFP8>;
+    constexpr static bool INT_QUANT = !std::is_same_v<DataType, WeightType>;
+    using WeightStorage = std::conditional_t<INT_QUANT, uint8_t, WeightType>;
+    constexpr static int WEIGHT_ELEM_PER_BYTE = INT4 ? 2 : 1;
+    int const HIDDEN_SIZE_MULTIPLIER = 1;
+    int const DEFAULT_HIDDEN_SIZE = HIDDEN_SIZE_MULTIPLIER * 64 / sizeof(WeightType) * WEIGHT_ELEM_PER_BYTE;
 
     static BufferManager::CudaStreamPtr mStream;
     static std::unique_ptr<BufferManager> mBufferManager;
@@ -48,24 +97,42 @@ protected:
     float* mInputProbabilities{};
     DataType* mInputTensor{};
 
-    int mMaxSeqLen = 0;
-
     int mHiddenSize{};
     int mNumExperts{};
     int mK{};
 
+    float getTolerance(float scale = 1.f)
+    {
+        float tol = std::is_same_v<DataType, float> ? 0.001
+            : std::is_same_v<DataType, half>        ? 0.01
+            : std::is_same_v<DataType, SafeFP8>     ? (mIsGated ? 0.06 : 0.02)
+                                                    : 0.1;
+
+        // Keep the scale in a sane range
+        scale = std::clamp(scale, 1.f, 30.f);
+        return scale * tol;
+    }
+
+    static bool shouldSkip()
+    {
+#ifndef ENABLE_FP8
+        static_assert(!FP8, "FP8 Tests enabled on unsupported CUDA version");
+#endif
+        bool should_skip_no_device = mDeviceCount <= 0;
+        bool should_skip_unsupported_fp8 = getSMVersion() < 90 && FP8;
+        return should_skip_no_device || should_skip_unsupported_fp8;
+    }
+
     static void SetUpTestCase()
     {
         mDeviceCount = getDeviceCount();
-        if (mDeviceCount > 0)
-        {
-            mStream = std::make_shared<CudaStream>();
-            mBufferManager = std::make_unique<BufferManager>(mStream);
-        }
-        else
+        if (shouldSkip())
         {
             GTEST_SKIP();
         }
+
+        mStream = std::make_shared<CudaStream>();
+        mBufferManager = std::make_unique<BufferManager>(mStream);
     }
 
     static void TearDownTestCase()
@@ -77,7 +144,7 @@ protected:
     void SetUp() override
     {
         assert(mBufferManager);
-        if (mDeviceCount == 0)
+        if (shouldSkip())
         {
             GTEST_SKIP();
         }
@@ -88,8 +155,11 @@ protected:
         managed_buffers.clear();
     }
 
-    void initWeights(DataType* buffer, int w, int h, DataType scalar)
+    void initWeights(DataType* buffer, int w, int h, float scalar)
     {
+        if constexpr (FP8)
+            scalar = FP8_MAX; // Automatically set it to max
+
         dim3 block(16, 16, 1);
         dim3 grid(divUp(w, block.x), divUp(h, block.y), mNumExperts);
         initWeightsKernel<DataType><<<grid, block, 0, mStream->get()>>>(buffer, w, h, scalar);
@@ -102,19 +172,56 @@ protected:
         initBiasToExpertIdKernel<DataType><<<grid, block, 0, mStream->get()>>>(buffer, w);
     }
 
-    CutlassMoeFCRunner<DataType, DataType> mMoERunner{};
+    void initWeightsGated(DataType* buffer, int w, int h, float scalar_1, float scalar_2)
+    {
+        if (!mIsGated)
+            return initWeights(buffer, w, h, scalar_1);
+
+        if constexpr (FP8)
+        {
+            float max_scalar = getFP8Scalar(std::max(scalar_1, scalar_2));
+            scalar_1 *= max_scalar;
+            scalar_2 *= max_scalar;
+        }
+
+        h /= 2;
+        dim3 block(16, 16, 1);
+        dim3 grid(divUp(w, block.x), divUp(h, block.y), mNumExperts);
+        initWeightsGatedKernel<DataType><<<grid, block, 0, mStream->get()>>>(buffer, w, h, scalar_1, scalar_2);
+    }
+
+    void initBiasGated(DataType* buffer, int w)
+    {
+        if (!mIsGated)
+            return initBias(buffer, w);
+
+        w /= 2;
+        dim3 block(256, 1, 1);
+        dim3 grid(divUp(w, block.x), mNumExperts);
+        initBiasToExpertIdGatedKernel<DataType><<<grid, block, 0, mStream->get()>>>(buffer, w);
+    }
+
+    CutlassMoeFCRunner<DataType, WeightType, OutputType> mMoERunner{};
     char* mWorkspace{};
-    DataType* mScaleProbs{};
-    DataType* mExpertWeight1{};
-    DataType* mExpertWeight2{};
+    float* mScaleProbs{};
+    DataType* mRawExpertWeight1{};
+    DataType* mRawExpertWeight2{};
+    WeightStorage* mExpertWeight1{};
+    WeightStorage* mExpertWeight2{};
+    DataType* mExpertIntScale1{};
+    DataType* mExpertIntScale2{};
+
+    float* mExpertFP8Scale1{};
+    float* mExpertFP8Scale2{};
+    float* mExpertFP8Scale3{};
+
     DataType* mExpertBias1{};
     DataType* mExpertBias2{};
 
-    DataType* mTpExpertScratch{}; // Copy the experts here when slicing up inputs
+    void* mTpExpertScratch{}; // Copy the experts here when slicing up inputs
     size_t mTpExpertScratchSize{};
 
-    DataType* mExpertOutput{};
-    DataType* mFinalOutput{};
+    OutputType* mFinalOutput{};
     int* mSourceToExpandedMap;
     int* mSelectedExpert;
     bool* mFinished{};
@@ -124,16 +231,26 @@ protected:
 
     bool mUseBias = true;
 
+    bool mIsGated = false;
+    int mGatedMultiplier = 1;
+
     tensorrt_llm::ActivationType mActType = tensorrt_llm::ActivationType::Relu;
     MOEExpertScaleNormalizationMode mNormMode = MOEExpertScaleNormalizationMode::NONE;
 
-    int mExpertWDiag1 = 1;
-    int mExpertWDiag2 = 2;
+    std::optional<tensorrt_llm::cutlass_extensions::CutlassGemmConfig> mSelectedConfig = std::nullopt;
+
+    // Keep to simple power of two so we can have tight bounds on precision for quantized modes
+    float const mExpertWDiag1{0.5};
+    float const mExpertWDiagGated{1};
+    float const mExpertWDiag2{2};
+
+    float mMaxInput{};
 
     template <class T>
     T* allocBuffer(size_t size)
     {
-        managed_buffers.emplace_back(mBufferManager->gpu(size * sizeof(T)));
+        managed_buffers.emplace_back(mBufferManager->managed(size * sizeof(T)));
+        EXPECT_EQ(cudaGetLastError(), cudaSuccess) << "Error allocating buffer of size: " << size;
         T* ptr = static_cast<T*>(managed_buffers.back()->data());
         return ptr;
     }
@@ -148,6 +265,9 @@ protected:
         mInterSize = hidden_size * 4;
         mNumExperts = num_experts;
         mK = k;
+        mIsGated = tensorrt_llm::isGatedActivation(mActType);
+        mGatedMultiplier = mIsGated ? 2 : 1;
+        auto const gated_inter = mInterSize * mGatedMultiplier;
 
         mTotalTokens = 0;
         std::vector<int> h_seq_lens;
@@ -158,7 +278,6 @@ protected:
             int num_tokens = sequence.size() / hidden_size;
             h_seq_lens.emplace_back(h_seq_lens.back() + num_tokens);
             mTotalTokens += num_tokens;
-            mMaxSeqLen = std::max(mMaxSeqLen, num_tokens);
         }
 
         size_t workspace_size = mMoERunner.getWorkspaceSize(
@@ -167,28 +286,53 @@ protected:
         auto const stream = mStream->get();
 
         mWorkspace = allocBuffer<char>(workspace_size);
+        // Memset to an obviously incorrect value, so we detect any issues with uninitialised fields
         check_cuda_error(cudaMemsetAsync(mWorkspace, 0xD5, workspace_size, stream));
         const size_t expert_matrix_size = mNumExperts * mHiddenSize * mInterSize;
 
-        mExpertWeight1 = allocBuffer<DataType>(expert_matrix_size);
-        mExpertWeight2 = allocBuffer<DataType>(expert_matrix_size);
+        mRawExpertWeight1 = allocBuffer<DataType>(expert_matrix_size * mGatedMultiplier);
+        mRawExpertWeight2 = allocBuffer<DataType>(expert_matrix_size);
 
-        mTpExpertScratchSize = 2 * expert_matrix_size / parallelism_config.tp_size;
+        mTpExpertScratchSize = expert_matrix_size * mGatedMultiplier / parallelism_config.tp_size;
+        mTpExpertScratchSize += expert_matrix_size / parallelism_config.tp_size;
 
         mExpertBias1 = nullptr;
         mExpertBias2 = nullptr;
         if (mUseBias)
         {
             // Allow space for the slice of bias1 in the scratch
-            mTpExpertScratchSize += mNumExperts * mInterSize / parallelism_config.tp_size;
-            mExpertBias1 = allocBuffer<DataType>(mNumExperts * mInterSize);
+            mTpExpertScratchSize += mNumExperts * gated_inter / parallelism_config.tp_size;
+            mExpertBias1 = allocBuffer<DataType>(mNumExperts * gated_inter);
             mExpertBias2 = allocBuffer<DataType>(mNumExperts * mHiddenSize);
 
-            check_cuda_error(cudaMemsetAsync(mExpertBias1, 0x0, mNumExperts * mInterSize * sizeof(DataType), stream));
+            check_cuda_error(cudaMemsetAsync(mExpertBias1, 0x0, mNumExperts * gated_inter * sizeof(DataType), stream));
             check_cuda_error(cudaMemsetAsync(mExpertBias2, 0x0, mNumExperts * mHiddenSize * sizeof(DataType), stream));
         }
 
-        mExpertOutput = allocBuffer<DataType>(mTotalTokens * mHiddenSize * mK);
+        if constexpr (INT_QUANT)
+        {
+            mExpertWeight1 = allocBuffer<WeightStorage>(expert_matrix_size * mGatedMultiplier / WEIGHT_ELEM_PER_BYTE);
+            mExpertWeight2 = allocBuffer<WeightStorage>(expert_matrix_size / WEIGHT_ELEM_PER_BYTE);
+
+            mTpExpertScratchSize += mNumExperts * gated_inter / parallelism_config.tp_size;
+            mExpertIntScale1 = allocBuffer<DataType>(mNumExperts * gated_inter);
+            mExpertIntScale2 = allocBuffer<DataType>(mNumExperts * mHiddenSize);
+        }
+        else
+        {
+            mExpertWeight1 = mRawExpertWeight1;
+            mExpertWeight2 = mRawExpertWeight2;
+        }
+
+        if constexpr (FP8)
+        {
+            mExpertFP8Scale1 = allocBuffer<float>(mNumExperts);
+            mExpertFP8Scale2 = allocBuffer<float>(1);
+            mExpertFP8Scale3 = allocBuffer<float>(mNumExperts);
+
+            ASSERT_NE(mMaxInput, 0.0f);
+            initFP8Scales(mMaxInput);
+        }
 
         mTpExpertScratch = nullptr;
         if (parallelism_config.tp_size > 1)
@@ -208,9 +352,9 @@ protected:
         }
 
         mInputProbabilities = allocBuffer<float>(mTotalTokens * mNumExperts);
-        mScaleProbs = allocBuffer<DataType>(mTotalTokens * mK);
+        mScaleProbs = allocBuffer<float>(mTotalTokens * mK);
         mInputTensor = allocBuffer<DataType>(mTotalTokens * mHiddenSize);
-        mFinalOutput = allocBuffer<DataType>(mTotalTokens * mHiddenSize);
+        mFinalOutput = allocBuffer<OutputType>(mTotalTokens * mHiddenSize);
 
         mSourceToExpandedMap = allocBuffer<int>(mTotalTokens * mK);
         mSelectedExpert = allocBuffer<int>(mTotalTokens * mK);
@@ -231,15 +375,59 @@ protected:
             hidden_states_ptr += sequence.size();
         }
 
-        // Init the diagonals of our matrix, this will set to the scalar value * expert_id
-        initWeights(mExpertWeight1, mHiddenSize, mInterSize, mExpertWDiag1);
-        initWeights(mExpertWeight2, mInterSize, mHiddenSize, mExpertWDiag2);
+        check_cuda_error(cudaStreamSynchronize(stream));
+
+        // Init the diagonals of our matrix, this will set to the scalar value
+        initWeightsGated(mRawExpertWeight1, mHiddenSize, gated_inter, mExpertWDiag1, mExpertWDiagGated);
+        initWeights(mRawExpertWeight2, mInterSize, mHiddenSize, mExpertWDiag2);
 
         if (mUseBias)
         {
-            initBias(mExpertBias1, mInterSize);
+            initBiasGated(mExpertBias1, gated_inter);
             initBias(mExpertBias2, mHiddenSize);
         }
+
+        check_cuda_error(cudaStreamSynchronize(stream));
+
+        // Runs on the CPU, must be after stream sync
+        if constexpr (INT_QUANT)
+        {
+            cutlass_kernels::QuantType quant_type
+                = INT4 ? cutlass_kernels::QuantType::W4_A16 : cutlass_kernels::QuantType::W8_A16;
+            std::vector<size_t> shape1 = {(size_t) mNumExperts, (size_t) mHiddenSize, (size_t) gated_inter};
+            cutlass_kernels::symmetric_quantize(reinterpret_cast<int8_t*>(mExpertWeight1), mExpertIntScale1,
+                mRawExpertWeight1, shape1, quant_type, true);
+
+            std::vector<size_t> shape2 = {(size_t) mNumExperts, (size_t) mInterSize, (size_t) mHiddenSize};
+            cutlass_kernels::symmetric_quantize(reinterpret_cast<int8_t*>(mExpertWeight2), mExpertIntScale2,
+                mRawExpertWeight2, shape2, quant_type, true);
+        }
+    }
+
+    constexpr static float getFP8Scalar(float in)
+    {
+        return FP8_MAX / in;
+    }
+
+    void initFP8Scales(float max_input)
+    {
+        check_cuda_error(cudaStreamSynchronize(mStream->get()));
+
+        float maxW1 = mIsGated ? std::max(mExpertWDiag1, mExpertWDiagGated) : mExpertWDiag1;
+        float scaleW1 = getFP8Scalar(maxW1);
+        float scaleW2 = getFP8Scalar(mExpertWDiag2);
+        float scaleAct1 = getFP8Scalar(max_input);
+
+        float maxFC1Output = calcMLPVal(max_input, 0) / mExpertWDiag2;
+        float scaleAct2 = getFP8Scalar(maxFC1Output);
+
+        ASSERT_NE(mExpertFP8Scale1, nullptr);
+        ASSERT_NE(mExpertFP8Scale2, nullptr);
+        ASSERT_NE(mExpertFP8Scale3, nullptr);
+        // Dequant values for each expert are 1/(w_i*a_i) calculated above
+        std::fill_n(mExpertFP8Scale1, mNumExperts, 1.f / (scaleW1 * scaleAct1));
+        std::fill_n(mExpertFP8Scale3, mNumExperts, 1.f / (scaleW2 * scaleAct2));
+        *mExpertFP8Scale2 = scaleAct2;
 
         check_cuda_error(cudaStreamSynchronize(mStream->get()));
     }
@@ -253,11 +441,56 @@ protected:
         check_cuda_error(cudaMemsetAsync(mFinalOutput, 0x0, mTotalTokens * mHiddenSize * sizeof(DataType), stream));
         check_cuda_error(cudaMemsetAsync(mSourceToExpandedMap, 0x0, sizeof(int) * mTotalTokens * mK, stream));
         check_cuda_error(cudaMemsetAsync(mSelectedExpert, 0x0, sizeof(int) * mTotalTokens * mK, stream));
-        check_cuda_error(cudaMemsetAsync(mScaleProbs, 0x0, sizeof(DataType) * mTotalTokens * mK, stream));
-        check_cuda_error(
-            cudaMemsetAsync(mExpertOutput, 0x0, mTotalTokens * mHiddenSize * mK * sizeof(DataType), stream));
+        check_cuda_error(cudaMemsetAsync(mScaleProbs, 0x0, sizeof(float) * mTotalTokens * mK, stream));
 
-        check_cuda_error(cudaStreamSynchronize(mStream->get()));
+        check_cuda_error(cudaStreamSynchronize(stream));
+    }
+
+    void resizeRouterInputs(std::vector<std::vector<float>>& h_router_results, int num_experts, int num_tokens_per_seq)
+    {
+        for (int i = 0; i < h_router_results.size(); i++)
+        {
+            auto& seq_routing = h_router_results[i];
+            int num_tokens = num_tokens_per_seq;
+            auto hardcoded_experts = seq_routing.size() / num_tokens;
+            ASSERT_EQ(seq_routing.size(), hardcoded_experts * num_tokens);
+            if (num_experts > hardcoded_experts)
+            {
+                auto pos = seq_routing.begin() + hardcoded_experts;
+                for (int i = 0; i < num_tokens; i++, pos += num_experts)
+                {
+                    pos = seq_routing.insert(pos, num_experts - hardcoded_experts, 0);
+                }
+            }
+            ASSERT_EQ(seq_routing.size(), num_experts * num_tokens);
+        }
+    }
+
+    template <class T>
+    auto populateTokens(std::vector<T>& hidden_states)
+    {
+        if constexpr (std::is_same_v<T, SafeFP8>)
+        {
+            std::vector<OutputType> internal_states(hidden_states.size());
+            populateTokens(internal_states);
+
+            mMaxInput = *std::max_element(internal_states.begin(), internal_states.end());
+            float scalar = getFP8Scalar(mMaxInput);
+            std::transform(internal_states.begin(), internal_states.end(), hidden_states.begin(),
+                [scalar](OutputType in) -> T { return static_cast<T>((float) in * scalar); });
+            // Do the reverse transformation since we only have so much precision and this is a pretty broad range
+            std::transform(hidden_states.begin(), hidden_states.end(), internal_states.begin(),
+                [scalar](T in) -> OutputType { return static_cast<OutputType>(((float) in) / scalar); });
+            return internal_states;
+        }
+        else
+        {
+            std::iota(hidden_states.begin(), hidden_states.end(), 0.0f);
+            // Lambda subtracts a small value so we have some < 0 to test the activation for negatives
+            std::transform(hidden_states.begin(), hidden_states.end(), hidden_states.begin(),
+                [l = hidden_states.size()](auto a) { return a / (T) l - T(0.01f); });
+            return hidden_states;
+        }
     }
 
     void runMoEPermute(std::vector<std::vector<DataType>> h_hidden_states,
@@ -271,49 +504,86 @@ protected:
 
     auto getWeights(MOEParallelismConfig parallelism_config)
     {
+        void* scale_1 = FP8 ? (void*) mExpertFP8Scale1 : (void*) mExpertIntScale1;
+        void* scale_2 = FP8 ? (void*) mExpertFP8Scale2 : (void*) mExpertIntScale2;
+        void* scale_3 = FP8 ? mExpertFP8Scale3 : nullptr;
+
         if (parallelism_config.tp_size > 1)
         {
             int const tp_size = parallelism_config.tp_size;
             int const tp_rank = parallelism_config.tp_rank;
 
             const size_t matrix_size = mHiddenSize * mInterSize / tp_size;
+            const size_t gated_matrix_size = mHiddenSize * mInterSize * mGatedMultiplier / tp_size;
+            const size_t row_size_inter = mInterSize / tp_size;
+            const size_t gated_row_size_inter = mInterSize * mGatedMultiplier / tp_size;
+            const size_t gated_bias_size = mUseBias ? gated_row_size_inter : 0;
 
-            auto* weight_1 = mTpExpertScratch;
-            auto* weight_2 = weight_1 + mNumExperts * matrix_size;
-            auto* bias_1 = mUseBias ? weight_2 + mNumExperts * matrix_size : nullptr;
+            auto* weight_1 = reinterpret_cast<WeightStorage*>(mTpExpertScratch);
+            auto* weight_2 = weight_1 + mNumExperts * gated_matrix_size;
+            auto* bias_1 = reinterpret_cast<DataType*>(weight_2 + mNumExperts * matrix_size);
+            auto* int_scale_1 = bias_1 + mNumExperts * gated_bias_size;
 
             // 2D memcpy just the slices we care about
-            const size_t row_size_1 = matrix_size * sizeof(DataType);
+            // TODO Re-quantize here with matrices divided
+            const size_t row_size_1 = matrix_size * sizeof(WeightStorage) / WEIGHT_ELEM_PER_BYTE;
             check_cuda_error(cudaMemcpy2DAsync(weight_1, row_size_1, (uint8_t*) mExpertWeight1 + row_size_1 * tp_rank,
-                row_size_1 * tp_size, row_size_1, mNumExperts, cudaMemcpyDeviceToDevice, mStream->get()));
+                row_size_1 * tp_size, row_size_1, mNumExperts * mGatedMultiplier, cudaMemcpyDeviceToDevice,
+                mStream->get()));
 
-            const size_t row_size_2 = mInterSize / tp_size * sizeof(DataType);
+            const size_t row_size_2 = row_size_inter * sizeof(WeightStorage) / WEIGHT_ELEM_PER_BYTE;
             check_cuda_error(cudaMemcpy2DAsync(weight_2, row_size_2, (uint8_t*) mExpertWeight2 + row_size_2 * tp_rank,
                 row_size_2 * tp_size, row_size_2, mNumExperts * mHiddenSize, cudaMemcpyDeviceToDevice, mStream->get()));
 
             if (mUseBias)
             {
-                const size_t row_size_bias = mInterSize / tp_size * sizeof(DataType);
-                check_cuda_error(
-                    cudaMemcpy2DAsync(bias_1, row_size_bias, (uint8_t*) mExpertBias1 + row_size_bias * tp_rank,
-                        row_size_bias * tp_size, row_size_bias, mNumExperts, cudaMemcpyDeviceToDevice, mStream->get()));
+                const size_t row_size_bias = row_size_inter * sizeof(DataType);
+                check_cuda_error(cudaMemcpy2DAsync(bias_1, row_size_bias,
+                    (uint8_t*) mExpertBias1 + row_size_bias * tp_rank, row_size_bias * tp_size, row_size_bias,
+                    mNumExperts * mGatedMultiplier, cudaMemcpyDeviceToDevice, mStream->get()));
             }
 
-            return std::tuple{weight_1, weight_2, bias_1, mExpertBias2};
+            if constexpr (INT_QUANT)
+            {
+                scale_2 = mExpertIntScale2;
+                const size_t row_size_scale = row_size_inter * sizeof(DataType);
+                check_cuda_error(cudaMemcpy2DAsync(scale_1, row_size_scale,
+                    (uint8_t*) mExpertIntScale1 + row_size_scale * tp_rank, row_size_scale * tp_size, row_size_scale,
+                    mNumExperts * mGatedMultiplier, cudaMemcpyDeviceToDevice, mStream->get()));
+            }
+
+            bias_1 = mUseBias ? bias_1 : nullptr;
+            return std::tuple{weight_1, weight_2, bias_1, mExpertBias2, scale_1, scale_2, scale_3};
         }
         else if (parallelism_config.ep_size > 1)
         {
+            const size_t gated_inter = mInterSize * mGatedMultiplier;
             const size_t experts_per_node = mNumExperts / parallelism_config.ep_size;
-            const size_t weight_matrix_size = mHiddenSize * mInterSize * experts_per_node;
-            const size_t bias_fc1_size = mInterSize * experts_per_node;
+            const size_t weight_matrix_size = mHiddenSize * mInterSize * experts_per_node / WEIGHT_ELEM_PER_BYTE;
+            const size_t bias_fc1_size = gated_inter * experts_per_node;
             const size_t bias_fc2_size = mHiddenSize * experts_per_node;
-            auto* weight1_ptr = mExpertWeight1 + weight_matrix_size * parallelism_config.ep_rank;
+            const size_t scale1_size = gated_inter * experts_per_node;
+            const size_t scale2_size = mHiddenSize * experts_per_node;
+            auto* weight1_ptr = mExpertWeight1 + weight_matrix_size * mGatedMultiplier * parallelism_config.ep_rank;
             auto* weight2_ptr = mExpertWeight2 + weight_matrix_size * parallelism_config.ep_rank;
             auto* bias1_ptr = mUseBias ? mExpertBias1 + bias_fc1_size * parallelism_config.ep_rank : nullptr;
             auto* bias2_ptr = mUseBias ? mExpertBias2 + bias_fc2_size * parallelism_config.ep_rank : nullptr;
-            return std::tuple{weight1_ptr, weight2_ptr, bias1_ptr, bias2_ptr};
+
+            if (INT_QUANT)
+            {
+                scale_1 = mExpertIntScale1 + scale1_size * parallelism_config.ep_rank;
+                scale_2 = mExpertIntScale2 + scale2_size * parallelism_config.ep_rank;
+            }
+            if constexpr (FP8)
+            {
+                scale_1 = mExpertFP8Scale1 + experts_per_node * parallelism_config.ep_rank;
+                scale_3 = mExpertFP8Scale3 + experts_per_node * parallelism_config.ep_rank;
+            }
+
+            return std::tuple{weight1_ptr, weight2_ptr, bias1_ptr, bias2_ptr, scale_1, scale_2, scale_3};
         }
-        return std::tuple{mExpertWeight1, mExpertWeight2, mExpertBias1, mExpertBias2};
+
+        return std::tuple{mExpertWeight1, mExpertWeight2, mExpertBias1, mExpertBias2, scale_1, scale_2, scale_3};
     }
 
     void runMoEPermute(MOEParallelismConfig parallelism_config)
@@ -321,15 +591,34 @@ protected:
         // Clear the buffers to blank so we can assume zero if not written
         resetOutBuffers();
 
-        auto const [weight1_ptr, weight2_ptr, bias1_ptr, bias2_ptr] = getWeights(parallelism_config);
+        auto const [weight1_ptr, weight2_ptr, bias1_ptr, bias2_ptr, scale1_ptr, scale2_ptr, scale3_ptr]
+            = getWeights(parallelism_config);
 
         auto stream = mStream->get();
-        mMoERunner.setTactic(std::nullopt);
-        mMoERunner.runMoe(mInputTensor, mInputProbabilities, weight1_ptr, nullptr, bias1_ptr, mActType, weight2_ptr,
-            nullptr, bias2_ptr, mTotalTokens, mHiddenSize, mInterSize / parallelism_config.tp_size, mNumExperts, mK,
-            mWorkspace, mFinalOutput, mExpertOutput, mFinished, mActiveRows, mScaleProbs, mSourceToExpandedMap,
-            mSelectedExpert, parallelism_config, mNormMode, stream);
-        check_cuda_error(cudaStreamSynchronize(mStream->get()));
+        auto tactic = mSelectedConfig;
+        if (!tactic)
+        {
+            tactic = mMoERunner.getTactics()[0];
+        }
+
+        QuantParams quant_params;
+        if constexpr (INT_QUANT)
+        {
+            quant_params = QuantParams::Int(scale1_ptr, scale2_ptr);
+        }
+        else
+        {
+            quant_params = QuantParams::FP8(static_cast<float const*>(scale1_ptr),
+                static_cast<float const*>(scale2_ptr), static_cast<float const*>(scale3_ptr));
+        }
+
+        mMoERunner.setTactic(tactic);
+        mMoERunner.runMoe(mInputTensor, mInputProbabilities, weight1_ptr, bias1_ptr, mActType, weight2_ptr, bias2_ptr,
+            quant_params, mTotalTokens, mHiddenSize, mInterSize / parallelism_config.tp_size, mNumExperts, mK,
+            mWorkspace, mFinalOutput, mFinished, mActiveRows, mScaleProbs, mSourceToExpandedMap, mSelectedExpert,
+            parallelism_config, mNormMode, stream);
+
+        check_cuda_error(cudaStreamSynchronize(stream));
     }
 
     template <class T>
@@ -367,23 +656,34 @@ protected:
             auto data = getDataFromDevice(array, size);                                                                \
             std::cout << #array << ": ";                                                                               \
             for (auto v : data)                                                                                        \
-                std::cout << cast(v) << ", ";                                                                          \
+            {                                                                                                          \
+                if (cast(v))                                                                                           \
+                    std::cout << cast(v) << ", ";                                                                      \
+                else                                                                                                   \
+                    std::cout << "., ";                                                                                \
+            }                                                                                                          \
             std::cout << std::endl;                                                                                    \
         }                                                                                                              \
     while (0)
 #define PRINT(array, size) PRINT_CAST(array, size, )
 
-        PRINT(mExpertWeight1, mNumExperts * mHiddenSize * mInterSize);
-        PRINT(mExpertWeight2, mNumExperts * mHiddenSize * mInterSize);
-        PRINT(mExpertBias1, mNumExperts * mInterSize);
-        PRINT(mExpertBias2, mNumExperts * mHiddenSize);
-        PRINT(mExpertOutput, mTotalTokens * mK * mHiddenSize);
-        PRINT(mFinalOutput, mTotalTokens * mK * mHiddenSize);
+        using WeightPrintType = std::conditional_t<INT_QUANT, uint8_t, WeightStorage>;
+        PRINT_CAST((WeightPrintType*) mExpertWeight1,
+            mNumExperts * mHiddenSize * mInterSize * mGatedMultiplier / WEIGHT_ELEM_PER_BYTE, float);
+        PRINT_CAST(
+            (WeightPrintType*) mExpertWeight2, mNumExperts * mHiddenSize * mInterSize / WEIGHT_ELEM_PER_BYTE, float);
+        // PRINT_CAST(mRawExpertWeight1, mNumExperts * mHiddenSize * mInterSize * mGatedMultiplier, float);
+        // PRINT_CAST(mRawExpertWeight2, mNumExperts * mHiddenSize * mInterSize, float);
+        PRINT_CAST(mExpertBias1, mNumExperts * mInterSize * mGatedMultiplier, float);
+        PRINT_CAST(mExpertBias2, mNumExperts * mHiddenSize, float);
+        PRINT_CAST(mExpertIntScale1, mNumExperts * mInterSize * mGatedMultiplier, float);
+        PRINT_CAST(mExpertIntScale2, mNumExperts * mHiddenSize, float);
+        PRINT(mFinalOutput, mTotalTokens * mHiddenSize);
         PRINT_CAST((uint8_t*) mFinished, mTotalTokens, (int) );
         PRINT(mInputProbabilities, mTotalTokens * mNumExperts);
         PRINT(mScaleProbs, mTotalTokens * mK);
         PRINT(mInputProbabilities, mTotalTokens * mNumExperts);
-        PRINT(mInputTensor, mTotalTokens * mHiddenSize);
+        PRINT_CAST(mInputTensor, mTotalTokens * mHiddenSize, float);
         PRINT(mSourceToExpandedMap, mTotalTokens * mK);
         PRINT(mSelectedExpert, mTotalTokens * mK);
 
@@ -391,66 +691,93 @@ protected:
 #undef PRINT
     }
 
-    DataType actfn(DataType in)
+    template <class T>
+    T actfn(T in)
     {
         if (mActType == tensorrt_llm::ActivationType::Identity)
             return in;
         if (mActType == tensorrt_llm::ActivationType::Relu)
-            return std::max(in, 0.0f);
+            return std::max(in, T(0.0f));
+        if (mActType == tensorrt_llm::ActivationType::Gelu || mActType == tensorrt_llm::ActivationType::Geglu)
+            return (std::erf(float(in) * float(sqrt(0.5))) + 1) * 0.5f * float(in);
         assert(false);
         return in;
     }
 
-    DataType calcMLPVal(DataType input, int expert_id, bool final_bias = false)
+    float calcMLPVal(float input, int expert_id, bool final_bias = false)
     {
         if (expert_id >= mNumExperts)
             return 0;
-        auto fc1 = input * mExpertWDiag1 + (DataType) (mUseBias ? expert_id : 0);
-        auto activated = actfn(fc1) * mExpertWDiag2;
-        return activated + (DataType) (final_bias ? expert_id : 0);
+
+        float w1_bias = mUseBias ? expert_id : 0.f;
+        float activated = 0;
+        if (mIsGated)
+        {
+            float scalar = mExpertWDiag1;
+            float fc1 = (float) input * scalar + (float) w1_bias;
+
+            float gated_scalar = mExpertWDiagGated;
+            float gated_bias = mUseBias ? (float) w1_bias + 1.f : 0.f;
+            float gate = (float) input * gated_scalar + gated_bias;
+
+            activated = fc1 * actfn(gate);
+        }
+        else
+        {
+            float fc1 = input * mExpertWDiag1 + w1_bias;
+            activated = actfn(fc1);
+        }
+
+        EXPECT_TRUE(mUseBias || !final_bias);
+        return activated * mExpertWDiag2 + (float) (final_bias ? expert_id : 0);
     }
 
-    DataType calcMLPValWithFinalBias(DataType input, int expert_id)
+    float calcMLPValWithFinalBias(float input, int expert_id)
     {
         return calcMLPVal(input, expert_id, mUseBias);
     }
 
-    void comparePermuted(std::vector<int> const& expected_experts, std::vector<int> const& expected_permutation,
-        std::vector<DataType> const& input_data)
+    // NOTE This is a useful function for debugging routing failures. But you need to know the exact offset of
+    //   this info in the workspace so having a test depend on something so internal is suboptimal
+    //
+    // void comparePermuted(const std::vector<int>& expected_experts, const std::vector<int>& expected_permutation,
+    //     const std::vector<DataType>& input_data)
+    //{
+    //     auto states = getDataFromDevice(magic incantation into workspace, mTotalTokens * mK * mHiddenSize);
+    //
+    //    // Loop for the number of times each token is duplicated
+    //    for (int k_idx = 0; k_idx < mK; k_idx++)
+    //    {
+    //        for (int token_id = 0; token_id < mTotalTokens; token_id++)
+    //        {
+    //            // Permutation has the position of the first copy of all token,
+    //            // followed by the position of the second copy of all tokens etc.
+    //            const int permuted_position = expected_permutation[k_idx * mTotalTokens + token_id];
+    //
+    //            // Expected experts has all the selected experts for token one,
+    //            // followed by all the selected experts for token two etc.
+    //            const int expert_id = expected_experts[token_id * mK + k_idx];
+    //
+    //            // Compare the copied tokens with the projection applied
+    //            for (int hidden_id = 0; hidden_id < mHiddenSize; hidden_id++)
+    //            {
+    //                auto ref = calcMLPVal(input_data[token_id * mHiddenSize + hidden_id], expert_id);
+    //                auto actual = states[permuted_position * mHiddenSize + hidden_id];
+    //                ASSERT_NEAR(ref, actual, getTolerance(ref))
+    //                    << "Incorrect value at position: mK: " << k_idx << ", token: " << token_id
+    //                    << ", permuted dest: " << permuted_position << ", expert id: " << expert_id
+    //                    << ", hidden id: " << hidden_id;
+    //            }
+    //        }
+    //    }
+    //}
+
+    std::vector<float> softmax(std::vector<float> const& expected_probs)
     {
-        auto states = getDataFromDevice(mExpertOutput, mTotalTokens * mK * mHiddenSize);
-
-        // Loop for the number of times each token is duplicated
-        for (int k_idx = 0; k_idx < mK; k_idx++)
-        {
-            for (int token_id = 0; token_id < mTotalTokens; token_id++)
-            {
-                // Permutation has the position of the first copy of all token,
-                // followed by the position of the second copy of all tokens etc.
-                int const permuted_position = expected_permutation[k_idx * mTotalTokens + token_id];
-
-                // Expected experts has all the selected experts for token one,
-                // followed by all the selected experts for token two etc.
-                int const expert_id = expected_experts[token_id * mK + k_idx];
-
-                // Compare the copied tokens with the projection applied
-                for (int hidden_id = 0; hidden_id < mHiddenSize; hidden_id++)
-                {
-                    EXPECT_FLOAT_EQ(calcMLPVal(input_data[token_id * mHiddenSize + hidden_id], expert_id),
-                        states[permuted_position * mHiddenSize + hidden_id])
-                        << "Incorrect value at position: mK: " << k_idx << ", token: " << token_id
-                        << ", permuted dest: " << permuted_position << ", expert id: " << expert_id;
-                }
-            }
-        }
-    }
-
-    std::vector<DataType> softmax(std::vector<DataType> const& expected_probs)
-    {
-        std::vector<DataType> result;
+        std::vector<float> softmax;
         // All values we test are 0-1 so we can skip the normalization step
-        std::transform(expected_probs.begin(), expected_probs.end(), std::back_inserter(result),
-            [&](const DataType in)
+        std::transform(expected_probs.begin(), expected_probs.end(), std::back_inserter(softmax),
+            [&](float const in) -> float
             {
                 auto res = exp(in);
                 return res;
@@ -458,17 +785,17 @@ protected:
 
         for (int token = 0; token < mTotalTokens; token++)
         {
-            auto start = result.begin() + token * mNumExperts;
+            auto start = softmax.begin() + token * mNumExperts;
             auto end = start + mNumExperts;
-            auto sum = std::accumulate(start, end, (DataType) 0);
+            auto sum = std::accumulate(start, end, 0.f);
             std::transform(start, end, start, [=](auto in) { return in / sum; });
         }
 
-        return result;
+        return softmax;
     }
 
-    void compareSoftmax(std::vector<int> const& expected_experts, std::vector<DataType> const& expected_probs,
-        std::vector<DataType> scale_probs = {})
+    void compareSoftmax(std::vector<int> const& expected_experts, std::vector<float> const& expected_probs,
+        std::vector<float> scale_probs = {})
     {
         if (scale_probs.empty())
             scale_probs = getDataFromDevice(mScaleProbs, mTotalTokens * mK);
@@ -480,8 +807,8 @@ protected:
                 int selected_expert = expected_experts[token_id * mK + k_idx];
                 if (selected_expert < mNumExperts) // Ignore 'finished' values
                 {
-                    ASSERT_FLOAT_EQ(
-                        softmax_probs[token_id * mNumExperts + selected_expert], scale_probs[token_id * mK + k_idx])
+                    ASSERT_NEAR(softmax_probs[token_id * mNumExperts + selected_expert],
+                        scale_probs[token_id * mK + k_idx], getTolerance())
                         << "Scales mismatched for token: " << token_id << " k: " << k_idx
                         << " selected_expert: " << selected_expert;
                 }
@@ -489,24 +816,24 @@ protected:
         }
     }
 
-    void renormScales(DataType* probs, int const* experts)
+    void renormScales(float* probs, int const* experts)
     {
         if (mNormMode == MOEExpertScaleNormalizationMode::NONE)
             return;
-        DataType sum = 0;
+        float sum = 0;
         for (int k_idx = 0; k_idx < mK; k_idx++)
         {
             sum += probs[experts[k_idx]];
         }
-        DataType norm_factor = 1.0 / sum;
+        float norm_factor = 1.0f / sum;
         for (int k_idx = 0; k_idx < mK; k_idx++)
         {
             probs[experts[k_idx]] *= norm_factor;
         }
     }
 
-    void compareFinal(std::vector<int> const& expected_experts, std::vector<DataType> const& expected_probs,
-        std::vector<DataType> const& input_data, std::vector<DataType> final_results = {})
+    void compareFinal(std::vector<int> const& expected_experts, std::vector<float> const& expected_probs,
+        std::vector<OutputType> const& input_data, std::vector<OutputType> final_results = {})
     {
         if (final_results.empty())
             final_results = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
@@ -514,21 +841,21 @@ protected:
         auto softmax_probs = softmax(expected_probs);
         for (int token_id = 0; token_id < mTotalTokens; token_id++)
         {
-            // Compare the copied tokens with the projection applied
+            renormScales(&softmax_probs[token_id * mNumExperts], &expected_experts[token_id * mK]);
+
             for (int hidden_id = 0; hidden_id < mHiddenSize; hidden_id++)
             {
-                renormScales(&softmax_probs[token_id * mNumExperts], &expected_experts[token_id * mK]);
-
-                DataType sum = 0.0f;
+                float sum = 0.0f;
                 // Loop for the number of times each token is duplicated
                 for (int k_idx = 0; k_idx < mK; k_idx++)
                 {
                     int selected_expert = expected_experts[token_id * mK + k_idx];
-                    sum += calcMLPValWithFinalBias(input_data[token_id * mHiddenSize + hidden_id], selected_expert)
+                    sum += float(calcMLPValWithFinalBias(
+                               static_cast<float>(input_data[token_id * mHiddenSize + hidden_id]), selected_expert))
                         * softmax_probs[token_id * mNumExperts + selected_expert];
                 }
 
-                EXPECT_FLOAT_EQ(sum, final_results[token_id * mHiddenSize + hidden_id])
+                ASSERT_NEAR(OutputType{sum}, final_results[token_id * mHiddenSize + hidden_id], getTolerance(sum))
                     << "Incorrect final value at position: " << token_id * mHiddenSize + hidden_id;
             }
         }
@@ -542,20 +869,51 @@ protected:
     void TensorParallelTest(int k = 1);
 };
 
-BufferManager::CudaStreamPtr MixtureOfExpertsTest::mStream{};
-std::unique_ptr<BufferManager> MixtureOfExpertsTest::mBufferManager{};
-int MixtureOfExpertsTest::mDeviceCount{};
-
-int const DEFAULT_HIDDEN_SIZE = 4;
-
-void MixtureOfExpertsTest::BasicPermuteTest(int k)
+template <class DataType_, class WeightType_ = DataType_, class OutputType_ = DataType_>
+struct WeightParams
 {
+    using DataType = DataType_;
+    using WeightType = WeightType_;
+    using OutputType = OutputType_;
+};
+
+// TODO Fix int quantized
+using Types = ::testing::Types<
+#ifdef ENABLE_BF16
+    WeightParams<__nv_bfloat16>,
+#endif
+#ifdef ENABLE_FP8
+    WeightParams<SafeFP8, SafeFP8, half>,
+#endif
+    WeightParams<half>, WeightParams<float>
+
+    //, WeightParams<half, uint8_t>, WeightParams<half, cutlass::uint4b_t>
+
+    >;
+TYPED_TEST_SUITE(MixtureOfExpertsTest, Types);
+
+template <class TypeParam_>
+BufferManager::CudaStreamPtr MixtureOfExpertsTest<TypeParam_>::mStream{};
+template <class TypeParam_>
+std::unique_ptr<BufferManager> MixtureOfExpertsTest<TypeParam_>::mBufferManager{};
+template <class TypeParam_>
+int MixtureOfExpertsTest<TypeParam_>::mDeviceCount{};
+
+template <class TypeParam_>
+void MixtureOfExpertsTest<TypeParam_>::BasicPermuteTest(int k)
+{
+    if constexpr (FP8)
+    {
+        // TODO Remove this when bias + FP8 is supported
+        mUseBias = false;
+    }
+
     int hidden_size = DEFAULT_HIDDEN_SIZE;
     int num_experts = 4;
     int num_tokens = 3;
 
-    std::vector<DataType> hidden_states(hidden_size * num_tokens, 0);
-    std::iota(hidden_states.begin(), hidden_states.end(), 0.0f);
+    std::vector<DataType> hidden_states(hidden_size * num_tokens);
+    auto raw_unquant_input = populateTokens(hidden_states);
 
     std::vector<float> probs = {
         0.5, 0.1, 0.25, 0.15,   //
@@ -563,7 +921,11 @@ void MixtureOfExpertsTest::BasicPermuteTest(int k)
         0.25, 0.21, 0.35, 0.19, //
     };
 
-    runMoEPermute({hidden_states}, {probs}, hidden_size, num_experts, k);
+    std::vector<std::vector<DataType>> hidden_input = {hidden_states};
+    std::vector<std::vector<float>> router_input = {probs};
+    resizeRouterInputs(router_input, num_experts, num_tokens);
+
+    runMoEPermute(hidden_input, router_input, hidden_size, num_experts, k);
 
     std::vector<int> expected_experts{0, 3, 2};
     if (k == 2)
@@ -583,51 +945,65 @@ void MixtureOfExpertsTest::BasicPermuteTest(int k)
     if (k == 3)
         permute_map = {0, 8, 6, 4, 2, 1, 7, 5, 3};
     ASSERT_EQ(permute_map, proj_map);
-    comparePermuted(selected_expert, permute_map, hidden_states);
-    compareSoftmax(selected_expert, probs);
-    compareFinal(selected_expert, probs, hidden_states);
+    compareSoftmax(selected_expert, router_input[0]);
+    compareFinal(selected_expert, router_input[0], raw_unquant_input);
 }
 
-TEST_F(MixtureOfExpertsTest, Permute)
+TYPED_TEST(MixtureOfExpertsTest, Permute)
 {
-    BasicPermuteTest();
+    this->BasicPermuteTest();
 }
 
-TEST_F(MixtureOfExpertsTest, PermuteK2)
+TYPED_TEST(MixtureOfExpertsTest, PermuteK2)
 {
-    BasicPermuteTest(2);
+    this->BasicPermuteTest(2);
 }
 
-TEST_F(MixtureOfExpertsTest, PermuteK3)
+TYPED_TEST(MixtureOfExpertsTest, PermuteK3)
 {
-    BasicPermuteTest(3);
+    this->BasicPermuteTest(3);
 }
 
-TEST_F(MixtureOfExpertsTest, PermuteNoBias)
+TYPED_TEST(MixtureOfExpertsTest, PermuteNoBias)
 {
-    mUseBias = false;
-    BasicPermuteTest();
-    BasicPermuteTest(2);
-    BasicPermuteTest(3);
+    this->mUseBias = false;
+    this->BasicPermuteTest();
+    this->BasicPermuteTest(2);
+    this->BasicPermuteTest(3);
 }
 
-TEST_F(MixtureOfExpertsTest, PermuteRenormalization)
+TYPED_TEST(MixtureOfExpertsTest, PermuteRenormalization)
 {
-    mNormMode = tensorrt_llm::kernels::MOEExpertScaleNormalizationMode::RENORMALIZE;
-    BasicPermuteTest();
-    BasicPermuteTest(2);
-    BasicPermuteTest(3);
+    this->mNormMode = tensorrt_llm::kernels::MOEExpertScaleNormalizationMode::RENORMALIZE;
+    this->BasicPermuteTest();
+    this->BasicPermuteTest(2);
+    this->BasicPermuteTest(3);
 }
 
-TEST_F(MixtureOfExpertsTest, Finished)
+TYPED_TEST(MixtureOfExpertsTest, PermuteGeglu)
 {
-    int hidden_size = DEFAULT_HIDDEN_SIZE;
+    this->mActType = tensorrt_llm::ActivationType::Geglu;
+    this->BasicPermuteTest();
+    this->BasicPermuteTest(2);
+    this->BasicPermuteTest(3);
+}
+
+TYPED_TEST(MixtureOfExpertsTest, Finished)
+{
+    if (this->FP8)
+    {
+        // TODO Remove this when bias + FP8 is supported
+        this->mUseBias = false;
+    }
+
+    using DataType = typename TypeParam::DataType;
+    int hidden_size = this->DEFAULT_HIDDEN_SIZE;
     int num_experts = 4;
     int num_tokens = 3;
     int k = 2;
 
-    std::vector<DataType> hidden_states(hidden_size * num_tokens, 0);
-    std::iota(hidden_states.begin(), hidden_states.end(), 0.0f);
+    std::vector<DataType> hidden_states(hidden_size * num_tokens);
+    auto raw_unquant_input = this->populateTokens(hidden_states);
 
     std::vector<float> probs = {
         0.5, 0.1, 0.25, 0.15, //
@@ -635,9 +1011,9 @@ TEST_F(MixtureOfExpertsTest, Finished)
         0.25, 0.2, 0.35, 0.2, //
     };
 
-    runMoEPermute({hidden_states}, {probs}, hidden_size, num_experts, k, {0, 0, 1});
+    this->runMoEPermute({hidden_states}, {probs}, hidden_size, num_experts, k, {0, 0, 1});
 
-    auto selected_expert = getDataFromDevice(mSelectedExpert, num_tokens * k);
+    auto selected_expert = this->getDataFromDevice(this->mSelectedExpert, num_tokens * k);
     // Token 1
     EXPECT_EQ(selected_expert[0], 0);
     EXPECT_EQ(selected_expert[1], 2);
@@ -648,17 +1024,18 @@ TEST_F(MixtureOfExpertsTest, Finished)
     EXPECT_EQ(selected_expert[4], num_experts); // One past the end
     EXPECT_EQ(selected_expert[5], num_experts);
 
-    auto proj_map = getDataFromDevice(mSourceToExpandedMap, num_tokens * k);
+    auto proj_map = this->getDataFromDevice(this->mSourceToExpandedMap, num_tokens * k);
     // This is the final position of:
     // Token 1 Expert 1, T2E1, T3E1, T1E2, T2E2, T3E3
     std::vector<int> permute_map{0, 3, 4, 2, 1, 5};
     ASSERT_EQ(permute_map, proj_map);
-    comparePermuted(selected_expert, permute_map, hidden_states);
-    compareSoftmax(selected_expert, probs);
-    compareFinal(selected_expert, probs, hidden_states);
+    this->compareSoftmax(selected_expert, probs);
+    this->compareFinal(selected_expert, probs, raw_unquant_input);
 }
 
-std::vector<int> MixtureOfExpertsTest::calcPermuteMapExpertParallel(std::vector<int> const& expected_experts)
+template <class TypeParam_>
+std::vector<int> MixtureOfExpertsTest<TypeParam_>::calcPermuteMapExpertParallel(
+    std::vector<int> const& expected_experts)
 {
     std::vector<int> map(expected_experts.size());
     auto getInterleavedIndex = [this](int i) { return (i % mK) * mTotalTokens + i / mK; };
@@ -675,15 +1052,22 @@ std::vector<int> MixtureOfExpertsTest::calcPermuteMapExpertParallel(std::vector<
     return map;
 }
 
-void MixtureOfExpertsTest::ExpertParallelTest(int k)
+template <class TypeParam_>
+void MixtureOfExpertsTest<TypeParam_>::ExpertParallelTest(int k)
 {
+    if (FP8)
+    {
+        // TODO Remove this when bias + FP8 is supported
+        mUseBias = false;
+    }
+
     int hidden_size = DEFAULT_HIDDEN_SIZE;
     int parallelism = 2;
     int num_experts = 4;
     int num_tokens = 3;
 
-    std::vector<DataType> hidden_states(hidden_size * num_tokens, 0);
-    std::iota(hidden_states.begin(), hidden_states.end(), 0.0f);
+    std::vector<DataType> hidden_states(hidden_size * num_tokens);
+    auto raw_unquant_input = populateTokens(hidden_states);
 
     std::vector<float> probs = {
         0.5, 0.1, 0.25, 0.15,   //
@@ -696,7 +1080,7 @@ void MixtureOfExpertsTest::ExpertParallelTest(int k)
         expected_experts = {0, 2, 3, 1, 2, 0};
     else if (k == 3)
         expected_experts = {0, 2, 3, 3, 1, 2, 2, 0, 1};
-    std::vector<DataType> results(hidden_states.size(), 0);
+    std::vector<OutputType> results(hidden_states.size(), 0);
     for (int i = 0; i < parallelism; i++)
     {
         if (i == 0)
@@ -722,7 +1106,6 @@ void MixtureOfExpertsTest::ExpertParallelTest(int k)
         auto proj_map = getDataFromDevice(mSourceToExpandedMap, num_tokens * k);
         auto permute_map = calcPermuteMapExpertParallel(masked_expected_experts);
         ASSERT_EQ(permute_map, proj_map) << "Iteration " << i;
-        comparePermuted(masked_expected_experts, permute_map, hidden_states);
         compareSoftmax(expected_experts, probs);
 
         // Do the final reduce
@@ -730,42 +1113,56 @@ void MixtureOfExpertsTest::ExpertParallelTest(int k)
         std::transform(iter_results.cbegin(), iter_results.cend(), results.cbegin(), results.begin(), std::plus<>{});
     }
 
-    compareFinal(expected_experts, probs, hidden_states, results);
+    compareFinal(expected_experts, probs, raw_unquant_input, results);
 }
 
-TEST_F(MixtureOfExpertsTest, ExpertParallel)
+TYPED_TEST(MixtureOfExpertsTest, ExpertParallel)
 {
-    ExpertParallelTest();
+    this->ExpertParallelTest();
 }
 
-TEST_F(MixtureOfExpertsTest, ExpertParallelK2)
+TYPED_TEST(MixtureOfExpertsTest, ExpertParallelK2)
 {
-    ExpertParallelTest(2);
+    this->ExpertParallelTest(2);
 }
 
-TEST_F(MixtureOfExpertsTest, ExpertParallelNoBias)
+TYPED_TEST(MixtureOfExpertsTest, ExpertParallelNoBias)
 {
-    mUseBias = false;
-    ExpertParallelTest();
-    ExpertParallelTest(2);
+    this->mUseBias = false;
+    this->ExpertParallelTest();
+    this->ExpertParallelTest(2);
 }
 
-TEST_F(MixtureOfExpertsTest, ExpertParallelRenorm)
+TYPED_TEST(MixtureOfExpertsTest, ExpertParallelRenorm)
 {
-    mNormMode = MOEExpertScaleNormalizationMode::RENORMALIZE;
-    ExpertParallelTest();
-    ExpertParallelTest(2);
+    this->mNormMode = MOEExpertScaleNormalizationMode::RENORMALIZE;
+    this->ExpertParallelTest();
+    this->ExpertParallelTest(2);
 }
 
-void MixtureOfExpertsTest::TensorParallelTest(int k)
+TYPED_TEST(MixtureOfExpertsTest, ExpertParallelGeglu)
 {
+    this->mActType = tensorrt_llm::ActivationType::Geglu;
+    this->ExpertParallelTest();
+    this->ExpertParallelTest(2);
+}
+
+template <class TypeParam_>
+void MixtureOfExpertsTest<TypeParam_>::TensorParallelTest(int k)
+{
+    if (FP8)
+    {
+        // TODO Remove this when bias + FP8 is supported
+        mUseBias = false;
+    }
+
     int hidden_size = DEFAULT_HIDDEN_SIZE;
     int parallelism = 8;
     int num_experts = 4;
     int num_tokens = 3;
 
-    std::vector<DataType> hidden_states(hidden_size * num_tokens, 0);
-    std::iota(hidden_states.begin(), hidden_states.end(), 0.0f);
+    std::vector<DataType> hidden_states(hidden_size * num_tokens);
+    auto raw_unquant_input = populateTokens(hidden_states);
 
     std::vector<float> probs = {
         0.5, 0.1, 0.25, 0.15,   //
@@ -778,7 +1175,7 @@ void MixtureOfExpertsTest::TensorParallelTest(int k)
         expected_experts = {0, 2, 3, 1, 2, 0};
     else if (k == 3)
         expected_experts = {0, 2, 3, 3, 1, 2, 2, 0, 1};
-    std::vector<DataType> results(hidden_states.size(), 0);
+    std::vector<OutputType> results(hidden_states.size(), 0);
     for (int i = 0; i < parallelism; i++)
     {
         if (i == 0)
@@ -809,36 +1206,77 @@ void MixtureOfExpertsTest::TensorParallelTest(int k)
         std::transform(iter_results.cbegin(), iter_results.cend(), results.cbegin(), results.begin(), std::plus<>{});
     }
 
-    compareFinal(expected_experts, probs, hidden_states, results);
+    compareFinal(expected_experts, probs, raw_unquant_input, results);
 }
 
-TEST_F(MixtureOfExpertsTest, TensorParallel)
+TYPED_TEST(MixtureOfExpertsTest, TensorParallel)
 {
-    TensorParallelTest();
+    this->TensorParallelTest();
 }
 
-TEST_F(MixtureOfExpertsTest, TensorParallelK2)
+TYPED_TEST(MixtureOfExpertsTest, TensorParallelK2)
 {
-    TensorParallelTest(2);
+    this->TensorParallelTest(2);
 }
 
-TEST_F(MixtureOfExpertsTest, TensorParallelK3)
+TYPED_TEST(MixtureOfExpertsTest, TensorParallelK3)
 {
-    TensorParallelTest(3);
+    this->TensorParallelTest(3);
 }
 
-TEST_F(MixtureOfExpertsTest, TensorParallelNoBias)
+TYPED_TEST(MixtureOfExpertsTest, TensorParallelNoBias)
 {
-    mUseBias = false;
-    TensorParallelTest();
-    TensorParallelTest(2);
-    TensorParallelTest(3);
+    this->mUseBias = false;
+    this->TensorParallelTest();
+    this->TensorParallelTest(2);
+    this->TensorParallelTest(3);
 }
 
-TEST_F(MixtureOfExpertsTest, TensorParallelRenorm)
+TYPED_TEST(MixtureOfExpertsTest, TensorParallelRenorm)
 {
-    mNormMode = MOEExpertScaleNormalizationMode::RENORMALIZE;
-    TensorParallelTest();
-    TensorParallelTest(2);
-    TensorParallelTest(3);
+    this->mNormMode = MOEExpertScaleNormalizationMode::RENORMALIZE;
+    this->TensorParallelTest();
+    this->TensorParallelTest(2);
+    this->TensorParallelTest(3);
+}
+
+TYPED_TEST(MixtureOfExpertsTest, TensorParallelGeglu)
+{
+    this->mActType = tensorrt_llm::ActivationType::Geglu;
+    this->TensorParallelTest();
+    this->TensorParallelTest(2);
+    this->TensorParallelTest(3);
+}
+
+TYPED_TEST(MixtureOfExpertsTest, ConfigSweep)
+{
+    auto configs = this->mMoERunner.getTactics();
+    for (auto conf : configs)
+    {
+        using namespace tensorrt_llm::cutlass_extensions;
+        std::stringstream tactic;
+        tactic << "Failed " << (conf.is_sm90 ? "SM90+" : "<SM90") << " tactic with tile shape ";
+        if (conf.tile_config_sm90 != CutlassTileConfigSM90::ChooseWithHeuristic)
+        {
+            tactic << (int) conf.tile_config_sm90 << " and cluster shape " << (int) conf.cluster_shape
+                   << " mainloop sched " << (int) conf.mainloop_schedule << " epi sched "
+                   << (int) conf.epilogue_schedule;
+        }
+        else if (conf.tile_config != CutlassTileConfig::ChooseWithHeuristic)
+        {
+            tactic << (int) conf.tile_config << " and stages " << (int) conf.stages << " split k "
+                   << (int) conf.split_k_factor;
+        }
+        else
+        {
+            FAIL() << "Uninitialised tactic encountered";
+        }
+
+        EXPECT_NO_THROW({
+            this->mSelectedConfig = conf;
+            this->BasicPermuteTest();
+            if (::testing::Test::HasFailure())
+                throw std::runtime_error("Test Failed");
+        }) << tactic.str();
+    }
 }

@@ -3,6 +3,7 @@ import argparse
 import json
 import logging
 import math
+import os
 import pathlib
 import re
 import time
@@ -110,7 +111,7 @@ def parse_arguments():
         help='tokenizer path; defaults to jax_model_dir if left unspecified')
 
     args = parser.parse_args()
-
+    args.use_embedding_sharing = True
     return args
 
 
@@ -118,6 +119,7 @@ class JAXParser:
 
     def load_parameters(self, checkpoint_path: pathlib.Path):
         checkpoint_path = checkpoint_path.absolute()
+        os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
         return utils.params.nest_params(
             utils.params.param_remapper(
                 utils.params.load_params(checkpoint_path)))
@@ -808,10 +810,6 @@ def convert_from_checkpoint(
                     add_trt_llm_weight(weights, "lm_head.weight",
                                        np.copy(lm_head), trt_llm_config.dtype)
 
-                param = np.multiply(
-                    param.astype(np.float32),
-                    math.sqrt(trt_llm_config.hidden_size),
-                )
                 if trt_llm_config.use_parallel_embedding:
                     assert trt_llm_config.vocab_size % tp_size == 0
                     param = split_matrix_tp(
@@ -856,6 +854,13 @@ def convert(worker_rank, args, convert_kwargs):
             dataset = load_dataset("ccdv/cnn_dailymail", '3.0.0')
             assert args.tokenizer_dir is not None, "Must set tokenizer_dir to do calibration"
             tokenizer = sp.SentencePieceProcessor(model_file=args.tokenizer_dir)
+            if "transformer.vocab_embedding.weight" in weights:
+                # To use the HF to do SmoothQuant, we need to scale the embedding.
+                weights["transformer.vocab_embedding.weight"] = torch.multiply(
+                    weights["transformer.vocab_embedding.weight"].to(
+                        torch.float32),
+                    math.sqrt(trt_llm_config.hidden_size),
+                )
             hf_model = create_model_from_config(trt_llm_config, weights)
             act_range = capture_activation_range(hf_model, tokenizer, dataset)
             if args.use_smooth_quant_plugin is not None:
@@ -869,6 +874,18 @@ def convert(worker_rank, args, convert_kwargs):
                 torch.quint4x2, args.use_smooth_quant_plugin is not None,
                 args.per_channel, args.per_token, args.calibrate_kv_cache,
                 act_range, qkv_para, smoother)
+            if "transformer.vocab_embedding.weight" in weights:
+                # Revert the scaling of embedding
+                weights["transformer.vocab_embedding.weight"] = torch.divide(
+                    weights["transformer.vocab_embedding.weight"].to(
+                        torch.float32),
+                    math.sqrt(trt_llm_config.hidden_size),
+                ).to(str_dtype_to_torch(args.dtype))
+            if trt_llm_config.share_embedding_table and "lm_head.weight" in weights:
+                # When share_embedding_table is enabled, we add lm_head into weights
+                # to do quantization in HF. Remove lm_head before saving it in unified
+                # checkpoint.
+                del weights["lm_head.weight"]
             safetensors.torch.save_file(
                 weights, args.output_model_dir / f"rank{rank}.safetensors")
             return
@@ -983,6 +1000,7 @@ def main():
         tp_size=args.world_size,
         pp_size=1,
         quantization=quant_config,
+        share_embedding_table=args.use_embedding_sharing,
     )
 
     trt_llm_config_dict = trt_llm_config.to_dict()

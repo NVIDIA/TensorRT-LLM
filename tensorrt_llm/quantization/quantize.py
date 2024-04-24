@@ -15,7 +15,7 @@ def weight_only_quantize(model,
                          current_key_name=None):
     assert quant_config.quant_mode.is_weight_only()
 
-    exclude_modules = quant_config.exclude_modules or ['lm_head']
+    exclude_modules = quant_config.exclude_modules or ['lm_head', 'router']
 
     for name, module in model.named_children():
         if current_key_name is None:
@@ -60,7 +60,7 @@ def weight_only_groupwise_quantize(model,
                                    current_key_name=None):
     assert quant_config.quant_mode.is_weight_only()
 
-    exclude_modules = quant_config.exclude_modules or ['lm_head']
+    exclude_modules = quant_config.exclude_modules or ['lm_head', 'router']
 
     for name, module in model.named_children():
         if current_key_name is None:
@@ -112,7 +112,7 @@ def smooth_quantize_ootb(
     quant_config: QuantConfig,
     current_key_name=None,
 ):
-    exclude_modules = quant_config.exclude_modules or ['lm_head']
+    exclude_modules = quant_config.exclude_modules or ['lm_head', 'router']
 
     for name, module in model.named_children():
         if current_key_name is None:
@@ -234,7 +234,7 @@ def smooth_quantize(model, quant_config: QuantConfig):
 def fp8_quantize(model, quant_config: QuantConfig, current_key_name=None):
     assert quant_config.quant_mode.has_fp8_qdq()
 
-    exclude_modules = quant_config.exclude_modules or ['lm_head']
+    exclude_modules = quant_config.exclude_modules or ['lm_head', 'router']
     for name, module in model.named_children():
         if current_key_name is None:
             current_key_name = []

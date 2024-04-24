@@ -73,7 +73,7 @@ auto const kProfileMbIdxs = populateMicrobatchIndexes();
 
 } // namespace
 
-GptSession::GptSession(Config const& sessionConfig, GptModelConfig const& modelConfig, WorldConfig const& worldConfig,
+GptSession::GptSession(Config const& sessionConfig, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
     void const* engineBuffer, std::size_t engineSize, LoggerPtr logger)
     : mModelConfig{modelConfig}
     , mWorldConfig{worldConfig}
@@ -190,7 +190,7 @@ void GptSession::createKvCacheManager(SizeType batchSize, SizeType beamWidth, Si
     // tokens, when enabling cyclic kv cache.
     auto const useOneMoreBlock = beamWidth > 1 && maxSequenceLength > maxAttentionWindow;
 
-    auto const localNbLayers = mModelConfig.getNbLayers(mWorldConfig.getPipelineParallelism());
+    auto const localNbLayers = mModelConfig.getNbAttentionLayers(mWorldConfig.getPipelineParallelism());
     auto const nbKvHeads = mModelConfig.getNbKvHeads();
     auto const sizePerHead = mModelConfig.getSizePerHead();
     bool constexpr enableBlockReuse{false};

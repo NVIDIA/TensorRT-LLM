@@ -12,10 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 from typing import Optional
 
 from ..._utils import pad_vocab_size
-from ...functional import Tensor, recv, send
+from ...functional import Tensor, cast, recv, send
 from ...layers import (Attention, AttentionMaskType, ColumnLinear, Embedding,
                        GatedMLP, PositionEmbeddingType, RmsNorm)
 from ...mapping import Mapping
@@ -127,6 +128,7 @@ class GemmaModel(Module):
             self.ln_f = RmsNorm(normalized_shape=config.hidden_size,
                                 eps=config.norm_epsilon,
                                 dtype=config.dtype)
+        self.hidden_size = config.hidden_size
 
     def forward(self,
                 input_ids,
@@ -147,6 +149,8 @@ class GemmaModel(Module):
 
         if self.mapping.is_first_pp_rank():
             hidden_states = self.vocab_embedding(input_ids, *ptuning_args)
+            hidden_states = cast(hidden_states * math.sqrt(self.hidden_size),
+                                 hidden_states.dtype)
         else:
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
 
@@ -181,6 +185,19 @@ class GemmaForCausalLM(DecoderModelForCausalLM):
 
         vocab_size_padded = pad_vocab_size(config.vocab_size,
                                            config.mapping.tp_size)
+
+        try:
+            import ammo
+            major, minor, patch = ammo.__version__.split(".")
+            major = int(major)
+            minor = int(minor)
+            patch = int(patch)
+            if minor > 9 or (minor == 9 and patch > 4):
+                assert config.share_embedding_table, "Gemma only supports share_embedding_table"
+        except:
+            # Not find ammo, assume not use ammo quantized model
+            assert config.share_embedding_table, "Gemma only supports share_embedding_table"
+
         if config.mapping.is_last_pp_rank():
             lm_head = ColumnLinear(config.hidden_size,
                                    vocab_size_padded,

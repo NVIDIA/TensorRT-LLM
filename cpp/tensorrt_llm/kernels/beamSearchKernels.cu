@@ -24,18 +24,18 @@ namespace tensorrt_llm
 namespace kernels
 {
 
-template <typename T, int MAX_K>
-void topK_softMax_kernelLauncher(
+template <typename T, int PAD_K>
+void topKSoftMaxKernelLauncher(
     T const* logits, T const* bias, void* workspace, BeamHypotheses& bh, cudaStream_t stream);
 
-#define CASE_K(MAX_K)                                                                                                  \
-    topK_softMax_kernelLauncher<T, MAX_K>(logits, bias, workspace, bh, stream);                                        \
+#define CASE_K(PAD_K)                                                                                                  \
+    topKSoftMaxKernelLauncher<T, PAD_K>(logits, bias, workspace, bh, stream);                                          \
     break;
 
 template <typename T>
 void invokeTopkSoftMax(T const* logits, T const* bias, void* workspace, BeamHypotheses& bh, cudaStream_t stream)
 {
-    switch (padToNextPowerOfTwo(bh.beam_width))
+    switch (padToNextPowerOfTwo(bh.nBeamWidth)) // PAD_K must be a compilation-time constant
     {
     case 1:
     case 2:
@@ -52,8 +52,9 @@ void invokeTopkSoftMax(T const* logits, T const* bias, void* workspace, BeamHypo
         CASE_K(64)
 #endif             // FAST_BUILD
     default:
-        throw std::runtime_error(fmtstr(
-            "%s:%d Topk kernel of beam search does not support beam_width=%d", __FILE__, __LINE__, bh.beam_width));
+        throw std::runtime_error(
+            fmtstr("%s:%d Maximum beam width supported for beam search (%d) is larger than beam_width now use (%d)",
+                __FILE__, __LINE__, nMaxBeamWidth, bh.nBeamWidth));
     }
 }
 

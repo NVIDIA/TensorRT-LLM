@@ -58,6 +58,8 @@ def read_model_name(engine_dir: str):
     model_version = None
     if model_arch == 'ChatGLMForCausalLM':
         model_version = config['pretrained_config']['chatglm_version']
+    if model_arch == 'QWenForCausalLM':
+        model_version = config['pretrained_config']['qwen_type']
     return model_arch, model_version
 
 
@@ -102,15 +104,11 @@ def load_tokenizer(tokenizer_dir: Optional[str] = None,
                                 truncation_side='left',
                                 legacy=False)
 
-    if model_name == 'QWenForCausalLM':
+    if model_name == 'QWenForCausalLM' and model_version == 'qwen':
         with open(Path(tokenizer_dir) / "generation_config.json") as f:
             gen_config = json.load(f)
-        chat_format = gen_config['chat_format']
-        if chat_format == 'raw' or chat_format == 'chatml':
-            pad_id = gen_config['pad_token_id']
-            end_id = gen_config['eos_token_id']
-        else:
-            raise Exception(f"unknown chat format: {chat_format}")
+        pad_id = gen_config['pad_token_id']
+        end_id = gen_config['eos_token_id']
     elif model_name == 'ChatGLMForCausalLM' and model_version == 'glm':
         pad_id = tokenizer.pad_token_id
         end_id = tokenizer.eop_token_id

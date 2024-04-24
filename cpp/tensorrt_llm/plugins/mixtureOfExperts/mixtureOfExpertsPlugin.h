@@ -87,9 +87,9 @@ public:
     MixtureOfExpertsPlugin() = delete;
     MixtureOfExpertsPlugin(int number_of_experts, int top_k, int expert_hidden_size, int expert_inter_size,
         tensorrt_llm::ActivationType activation_type, nvinfer1::DataType type, nvinfer1::DataType weight_type,
-        tensorrt_llm::common::QuantMode quant_mode, bool use_finished, bool use_bias, int tp_size, int tp_rank,
-        MOEParallelismMode parallelism_mode, MOEExpertScaleNormalizationMode normalization_mode,
-        MixtureOfExpertsPluginProfilerPtr plugin_profiler_ptr);
+        nvinfer1::DataType output_type, tensorrt_llm::common::QuantMode quant_mode, bool use_finished, bool use_bias,
+        int tp_size, int tp_rank, MOEParallelismMode parallelism_mode,
+        MOEExpertScaleNormalizationMode normalization_mode, MixtureOfExpertsPluginProfilerPtr plugin_profiler_ptr);
     MixtureOfExpertsPlugin(void const* data, size_t length, MixtureOfExpertsPluginProfilerPtr plugin_profiler_ptr);
     MixtureOfExpertsPlugin(MixtureOfExpertsPlugin const&);
 
@@ -141,6 +141,7 @@ private:
     tensorrt_llm::ActivationType mActivationType;
     nvinfer1::DataType mType{};
     nvinfer1::DataType mWeightType{};
+    nvinfer1::DataType mOutputType{};
     tensorrt_llm::common::QuantMode mQuantMode;
     bool mUseFinished{};
     bool mUseBias{};
@@ -173,6 +174,8 @@ private:
     WorkspaceInfo setupWorkspace(void* base_ptr, int num_tokens) const;
 
     kernels::MOEParallelismConfig getParallelismConfig() const;
+    kernels::QuantParams getQuantParams(
+        void const* scale_1, void const* scale_2, void const* scale_3 = nullptr, void const* scale_4 = nullptr) const;
 
     using IndexType = std::int32_t;
 
@@ -208,9 +211,19 @@ private:
         return mUseFinished;
     }
 
-    bool hasExpertQuantScales() const
+    bool hasExpertIntQuantScales() const
     {
         return mQuantMode.hasInt4Weights() || mQuantMode.hasInt8Weights();
+    }
+
+    bool hasExpertFp8QuantScales() const
+    {
+        return mQuantMode.hasFp8Qdq();
+    }
+
+    bool hasExpertFp8FinalQuantScales() const
+    {
+        return hasExpertFp8QuantScales() && mOutputType == nvinfer1::DataType::kFP8;
     }
 
     IndexType getExpertBias1Index() const
@@ -228,19 +241,39 @@ private:
         return getExpertBias2Index() + hasFinishedTensor();
     }
 
-    IndexType getExpertQuantScale1Index() const
+    IndexType getExpertIntQuantScale1Index() const
     {
-        return getFinishedTensorIndex() + hasExpertQuantScales();
+        return getFinishedTensorIndex() + hasExpertIntQuantScales();
     }
 
-    IndexType getExpertQuantScale2Index() const
+    IndexType getExpertIntQuantScale2Index() const
     {
-        return getExpertQuantScale1Index() + hasExpertQuantScales();
+        return getExpertIntQuantScale1Index() + hasExpertIntQuantScales();
+    }
+
+    IndexType getExpertFP8Dequant1Index() const
+    {
+        return getExpertIntQuantScale2Index() + hasExpertFp8QuantScales();
+    }
+
+    IndexType getExpertFP8Quant2Index() const
+    {
+        return getExpertFP8Dequant1Index() + hasExpertFp8QuantScales();
+    }
+
+    IndexType getExpertFP8Dequant2Index() const
+    {
+        return getExpertFP8Quant2Index() + hasExpertFp8QuantScales();
+    }
+
+    IndexType getExpertFP8QuantFinalIndex() const
+    {
+        return getExpertFP8Dequant2Index() + hasExpertFp8FinalQuantScales();
     }
 
     IndexType getNbInputs() const
     {
-        return getExpertQuantScale2Index() + 1;
+        return getExpertFP8QuantFinalIndex() + 1;
     }
 
     // Outputs
@@ -255,7 +288,7 @@ private:
     int getGemmShapeInnerDimIndex() const
     {
         // In weight only mode the shape is transposed
-        return hasExpertQuantScales() ? 1 : 2;
+        return hasExpertIntQuantScales() ? 1 : 2;
     }
 
     /**
@@ -264,7 +297,7 @@ private:
     int getGemmShapeOuterDimIndex() const
     {
         // In weight only mode the shape is transposed
-        return hasExpertQuantScales() ? 2 : 1;
+        return hasExpertIntQuantScales() ? 2 : 1;
     }
 
     /**

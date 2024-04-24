@@ -38,9 +38,9 @@ std::vector<nvinfer1::PluginField> MixtureOfExpertsPluginCreator::mPluginAttribu
 
 MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(int number_of_experts, int top_k, int expert_hidden_size,
     int expert_inter_size, tensorrt_llm::ActivationType activation_type, nvinfer1::DataType type,
-    nvinfer1::DataType weight_type, QuantMode quant_mode, bool use_finished, bool use_bias, int tp_size, int tp_rank,
-    MOEParallelismMode parallelism_mode, MOEExpertScaleNormalizationMode normalization_mode,
-    MixtureOfExpertsPluginProfilerPtr plugin_profiler_ptr)
+    nvinfer1::DataType weight_type, nvinfer1::DataType output_type, QuantMode quant_mode, bool use_finished,
+    bool use_bias, int tp_size, int tp_rank, MOEParallelismMode parallelism_mode,
+    MOEExpertScaleNormalizationMode normalization_mode, MixtureOfExpertsPluginProfilerPtr plugin_profiler_ptr)
     : mNumExperts(number_of_experts)
     , mK(top_k)
     , mExpertHiddenSize(expert_hidden_size)
@@ -48,6 +48,7 @@ MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(int number_of_experts, int top_k,
     , mActivationType(activation_type)
     , mType(type)
     , mWeightType(weight_type)
+    , mOutputType(output_type)
     , mQuantMode(quant_mode)
     , mUseFinished(use_finished)
     , mUseBias(use_bias)
@@ -69,6 +70,7 @@ tensorrt_llm::plugins::MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(MixtureOfE
     , mActivationType(other.mActivationType)
     , mType(other.mType)
     , mWeightType(other.mWeightType)
+    , mOutputType(other.mOutputType)
     , mQuantMode(other.mQuantMode)
     , mUseFinished(other.mUseFinished)
     , mUseBias(other.mUseBias)
@@ -88,9 +90,10 @@ tensorrt_llm::plugins::MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(MixtureOfE
 size_t MixtureOfExpertsPlugin::getSerializationSize() const noexcept
 {
     return sizeof(mNumExperts) + sizeof(mK) + sizeof(mExpertHiddenSize) + sizeof(mExpertInterSize)
-        + sizeof(mActivationType) + sizeof(mType) + sizeof(mWeightType) + sizeof(QuantMode::BaseType)
-        + sizeof(mUseFinished) + sizeof(mUseBias) + sizeof(mTPSize) + sizeof(mTPRank) + sizeof(mParallelismMode)
-        + sizeof(mNormalizationMode) + sizeof(mDims) + mPluginProfiler->getSerializationSize(mGemmId);
+        + sizeof(mActivationType) + sizeof(mType) + sizeof(mWeightType) + sizeof(mOutputType)
+        + sizeof(QuantMode::BaseType) + sizeof(mUseFinished) + sizeof(mUseBias) + sizeof(mTPSize) + sizeof(mTPRank)
+        + sizeof(mParallelismMode) + sizeof(mNormalizationMode) + sizeof(mDims)
+        + mPluginProfiler->getSerializationSize(mGemmId);
 }
 
 MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(
@@ -106,6 +109,7 @@ MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(
     read(d, mActivationType);
     read(d, mType);
     read(d, mWeightType);
+    read(d, mOutputType);
     QuantMode::BaseType quant_mode;
     read(d, quant_mode);
     mQuantMode = QuantMode{quant_mode};
@@ -138,6 +142,7 @@ void MixtureOfExpertsPlugin::serialize(void* buffer) const noexcept
     write(d, mActivationType);
     write(d, mType);
     write(d, mWeightType);
+    write(d, mOutputType);
     write(d, mQuantMode.value());
     write(d, mUseFinished);
     write(d, mUseBias);
@@ -154,6 +159,9 @@ void MixtureOfExpertsPlugin::serialize(void* buffer) const noexcept
 
 void MixtureOfExpertsPlugin::init()
 {
+    TLLM_CHECK_WITH_INFO(
+        mType == DataType::kFP8 || mOutputType == mType, "MOE plugin only supports a different output type for FP8");
+
     if (mType == DataType::kHALF && mWeightType == DataType::kHALF)
     {
         mMOERunner = std::make_unique<CutlassMoeFCRunner<half, half>>();
@@ -190,6 +198,26 @@ void MixtureOfExpertsPlugin::init()
         }
     }
 #endif
+#ifdef ENABLE_FP8
+    else if (mType == DataType::kFP8 && mWeightType == DataType::kFP8)
+    {
+        switch (mOutputType)
+        {
+        case nvinfer1::DataType::kFP8:
+            mMOERunner = std::make_unique<CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp8_e4m3>>();
+            break;
+        case nvinfer1::DataType::kHALF:
+            mMOERunner = std::make_unique<CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp8_e4m3, half>>();
+            break;
+#ifdef ENABLE_BF16
+        case nvinfer1::DataType::kBF16:
+            mMOERunner = std::make_unique<CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp8_e4m3, __nv_bfloat16>>();
+            break;
+#endif
+        default: TLLM_THROW("Invalid output type specified for FP8");
+        }
+    }
+#endif
     else
     {
         TLLM_THROW("Could not construct the mixture of experts plugin with the requested input combination");
@@ -218,8 +246,8 @@ bool MixtureOfExpertsPlugin::supportsFormatCombination(
     int pos, nvinfer1::PluginTensorDesc const* inOut, int nbInputs, int nbOutputs) noexcept
 {
     TLLM_CHECK(0 <= pos && pos < getNbInputs() + getNbOutputs());
-    TLLM_CHECK(nbInputs == getNbInputs());
-    TLLM_CHECK(nbOutputs == getNbOutputs());
+    TLLM_CHECK_WITH_INFO(nbInputs == getNbInputs(), "Required input to plugin is missing");
+    TLLM_CHECK_WITH_INFO(nbOutputs == getNbOutputs(), "Required output to plugin is missing");
 
     if (inOut[pos].format != TensorFormat::kLINEAR)
     {
@@ -238,6 +266,14 @@ bool MixtureOfExpertsPlugin::supportsFormatCombination(
     {
         return (inOut[pos].type == DataType::kFLOAT);
     }
+    else if (pos == nbInputs + getOutputTensorIndex())
+    {
+        return inOut[pos].type == mOutputType;
+    }
+    else if (hasExpertFp8QuantScales() && getExpertFP8Dequant1Index() <= pos && pos <= getExpertFP8QuantFinalIndex())
+    {
+        return inOut[pos].type == DataType::kFLOAT;
+    }
     else
     {
         return (inOut[pos].type == mType);
@@ -249,6 +285,9 @@ bool MixtureOfExpertsPlugin::supportsFormatCombination(
 void MixtureOfExpertsPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int nbInputs,
     nvinfer1::DynamicPluginTensorDesc const* out, int nbOutputs) noexcept
 {
+    TLLM_CHECK_WITH_INFO(nbInputs == getNbInputs(), "Required input to plugin is missing");
+    TLLM_CHECK_WITH_INFO(nbOutputs == getNbOutputs(), "Required output to plugin is missing");
+
     auto in_tensor = in[getInputTensorIndex()];
 
     auto const minM
@@ -266,8 +305,9 @@ void MixtureOfExpertsPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc c
 
     TLLM_CHECK_WITH_INFO(minN == maxN, "Variable out channels is not allowed");
     TLLM_CHECK_WITH_INFO(minK == maxK, "Variable in channels is not allowed");
-    TLLM_CHECK_WITH_INFO(maxK == mExpertHiddenSize, "Configured tensor sizes does not match constructor param size");
-    TLLM_CHECK_WITH_INFO(maxN == mExpertInterSize, "Configured tensor sizes does not match constructor param size");
+    TLLM_CHECK_WITH_INFO(maxK == mExpertHiddenSize && maxN == mExpertInterSize,
+        "Configured tensor sizes %dx%d does not match constructor param size %dx%d", maxK, maxN, mExpertHiddenSize,
+        mExpertInterSize);
 
     if (!mDims.isInitialized())
     {
@@ -279,7 +319,6 @@ void MixtureOfExpertsPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc c
 
 auto MixtureOfExpertsPlugin::setupWorkspace(void* base_ptr, int num_tokens) const -> WorkspaceInfo
 {
-
     size_t dtype_size = tensorrt_llm::common::getDTypeSize(mType);
 
     size_t moe_workspace_size = mMOERunner->getWorkspaceSize(
@@ -287,9 +326,6 @@ auto MixtureOfExpertsPlugin::setupWorkspace(void* base_ptr, int num_tokens) cons
 
     // Output of post-softmax routing probabilities
     size_t scale_probabilities_size = num_tokens * mNumExperts * sizeof(float);
-
-    // Hidden states buffer for GEMM result
-    size_t fc2_output_size = mK * mExpertHiddenSize * num_tokens * dtype_size;
 
     // Permutation map
     size_t src_to_dest_map_size = mK * num_tokens * sizeof(int);
@@ -300,7 +336,6 @@ auto MixtureOfExpertsPlugin::setupWorkspace(void* base_ptr, int num_tokens) cons
     std::vector<size_t> workspaces{
         moe_workspace_size,
         scale_probabilities_size,
-        fc2_output_size,
         src_to_dest_map_size,
         selected_expert_size,
     };
@@ -312,8 +347,7 @@ auto MixtureOfExpertsPlugin::setupWorkspace(void* base_ptr, int num_tokens) cons
     {
         info.workspace = base_ptr;
         info.scale_probs = nextWorkspacePtr((int8_t*) info.workspace, moe_workspace_size);
-        info.fc2_output = nextWorkspacePtr((int8_t*) info.scale_probs, scale_probabilities_size);
-        info.src_to_dest_map = nextWorkspacePtr((int8_t*) info.fc2_output, fc2_output_size);
+        info.src_to_dest_map = nextWorkspacePtr((int8_t*) info.scale_probs, scale_probabilities_size);
         info.selected_experts = nextWorkspacePtr((int8_t*) info.src_to_dest_map, src_to_dest_map_size);
     }
 
@@ -336,6 +370,9 @@ int MixtureOfExpertsPlugin::getNumTokens(nvinfer1::PluginTensorDesc const* input
 size_t MixtureOfExpertsPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* inputs, int nbInputs,
     nvinfer1::PluginTensorDesc const* outputs, int nbOutputs) const noexcept
 {
+    TLLM_CHECK_WITH_INFO(nbInputs == getNbInputs(), "Required input to plugin is missing");
+    TLLM_CHECK_WITH_INFO(nbOutputs == getNbOutputs(), "Required output to plugin is missing");
+
     int const num_tokens = getNumTokens(inputs);
     return setupWorkspace(nullptr, num_tokens).size;
 }
@@ -351,6 +388,24 @@ MOEParallelismConfig MixtureOfExpertsPlugin::getParallelismConfig() const
         return MOEParallelismConfig::TensorParallelism(mTPSize, mTPRank);
     }
     assert(false);
+    return {};
+}
+
+QuantParams tensorrt_llm::plugins::MixtureOfExpertsPlugin::getQuantParams(
+    void const* scale_1, void const* scale_2, void const* scale_3, void const* scale_4) const
+{
+    if (hasExpertIntQuantScales())
+    {
+        TLLM_CHECK(scale_1 && scale_2);
+        return QuantParams::Int(scale_1, scale_2);
+    }
+    else if (hasExpertFp8QuantScales())
+    {
+        TLLM_CHECK(scale_1 && scale_2 && scale_3);
+        TLLM_CHECK(scale_4 || !hasExpertFp8FinalQuantScales());
+        return QuantParams::FP8(static_cast<float const*>(scale_1), static_cast<float const*>(scale_2),
+            static_cast<float const*>(scale_3), static_cast<float const*>(scale_4));
+    }
     return {};
 }
 
@@ -388,15 +443,27 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     TLLM_CHECK(w2_desc.dims.d[inner_dim_idx] == mExpertInterSize);
     TLLM_CHECK(w2_desc.dims.d[outer_dim_idx] * packed_elements == mExpertHiddenSize);
 
+    QuantParams quant_params{};
+    if (hasExpertIntQuantScales())
+    {
+        quant_params = getQuantParams(inputs[getExpertIntQuantScale1Index()], inputs[getExpertIntQuantScale2Index()]);
+    }
+    else if (hasExpertFp8QuantScales())
+    {
+        quant_params = getQuantParams(           //
+            inputs[getExpertFP8Dequant1Index()], //
+            inputs[getExpertFP8Quant2Index()],   //
+            inputs[getExpertFP8Dequant2Index()], //
+            hasExpertFp8FinalQuantScales() ? inputs[getExpertFP8QuantFinalIndex()] : nullptr);
+    }
+
     mMOERunner->setTactic(mPluginProfiler->getBestConfig(num_tokens, mGemmId));
     mMOERunner->runMoe(inputs[getInputTensorIndex()], static_cast<float const*>(inputs[getRoutingTensorIndex()]),
-        inputs[getExpertWeights1Index()], hasExpertQuantScales() ? inputs[getExpertQuantScale1Index()] : nullptr,
-        hasBias() ? inputs[getExpertBias1Index()] : nullptr, mActivationType, inputs[getExpertWeights2Index()],
-        hasExpertQuantScales() ? inputs[getExpertQuantScale2Index()] : nullptr,
-        hasBias() ? inputs[getExpertBias2Index()] : nullptr, num_tokens, mExpertHiddenSize, mExpertInterSize,
-        mNumExperts, mK, static_cast<char*>(workspace.workspace),
+        inputs[getExpertWeights1Index()], hasBias() ? inputs[getExpertBias1Index()] : nullptr, mActivationType,
+        inputs[getExpertWeights2Index()], hasBias() ? inputs[getExpertBias2Index()] : nullptr, quant_params, num_tokens,
+        mExpertHiddenSize, mExpertInterSize, mNumExperts, mK, static_cast<char*>(workspace.workspace),
         // Outputs
-        outputs[getOutputTensorIndex()], workspace.fc2_output,
+        outputs[getOutputTensorIndex()],
         hasFinishedTensor() ? static_cast<bool const*>(inputs[getFinishedTensorIndex()]) : nullptr, num_not_finished,
         workspace.scale_probs, static_cast<int*>(workspace.src_to_dest_map),
         static_cast<int*>(workspace.selected_experts), parallelism_config, mNormalizationMode, stream);
@@ -408,9 +475,9 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
 nvinfer1::DataType MixtureOfExpertsPlugin::getOutputDataType(
     int index, nvinfer1::DataType const* inputTypes, int nbInputs) const noexcept
 {
-    assert(index == getOutputTensorIndex());
-    assert(inputTypes[getInputTensorIndex()] == mType);
-    return mType;
+    TLLM_CHECK(index == getOutputTensorIndex());
+    TLLM_CHECK(inputTypes[getInputTensorIndex()] == mType);
+    return mOutputType;
 }
 
 // IPluginV2 Methods
@@ -505,17 +572,25 @@ IPluginV2* MixtureOfExpertsPluginCreator::createPlugin(
     int mActivationType{};
     int mType{};
     int mWeightType{};
+    int mOutputType{INT_MAX};
     int mQuantMode{};
-    int mUseFinished{};
-    int mUseBias{};
+    int mUseFinished{0};
+    int mUseBias{0};
     int mTPSize{};
     int mTPRank{};
     int mParallelismMode{};
     int mNormalizationMode{};
 
     // Read configurations from each fields
-    using MapPair = std::pair<char const*, std::reference_wrapper<int>>;
-    const std::array input_map{
+    struct MapPair
+    {
+        char const* key;
+        int& field;
+        bool optional = false;
+        bool set = false;
+    };
+
+    std::array input_map{
         MapPair{"number_of_experts", std::ref(mNumExperts)},
         MapPair{"top_k", std::ref(mK)},
         MapPair{"expert_hidden_size", std::ref(mExpertHiddenSize)},
@@ -524,25 +599,42 @@ IPluginV2* MixtureOfExpertsPluginCreator::createPlugin(
         MapPair{"type_id", std::ref(mType)},
         MapPair{"weight_type_id", std::ref(mWeightType)},
         MapPair{"quant_mode", std::ref(mQuantMode)},
-        MapPair{"use_finished", std::ref(mUseFinished)},
-        MapPair{"use_bias", std::ref(mUseBias)},
         MapPair{"tp_size", std::ref(mTPSize)},
         MapPair{"tp_rank", std::ref(mTPRank)},
         MapPair{"parallelism_mode", std::ref(mParallelismMode)},
         MapPair{"normalization_mode", std::ref(mNormalizationMode)},
+
+        // Optional
+        MapPair{"use_finished", std::ref(mUseFinished), true},
+        MapPair{"use_bias", std::ref(mUseBias), true},
+        MapPair{"output_type_id", std::ref(mOutputType), true},
     };
     for (int i = 0; i < fc->nbFields; ++i)
     {
         char const* attrName = fields[i].name;
-        for (auto const& item : input_map)
+        for (auto& item : input_map)
         {
-            if (!strcmp(item.first, attrName))
+            if (!strcmp(item.key, attrName))
             {
                 TLLM_CHECK(fields[i].type == nvinfer1::PluginFieldType::kINT32);
-                item.second.get() = static_cast<int>(*(static_cast<int const*>(fields[i].data)));
+                TLLM_CHECK_WITH_INFO(!item.set, "Parameter %s was set twice", item.key);
+                item.field = static_cast<int>(*(static_cast<int const*>(fields[i].data)));
+                item.set = true;
             }
         }
     }
+
+    for (auto& item : input_map)
+    {
+        TLLM_CHECK_WITH_INFO(item.set || item.optional, "Parameter %s is required but not set", item.key);
+    }
+
+    // Output type is optional, if not set it to the same as mType
+    if (mOutputType == INT_MAX)
+    {
+        mOutputType = mType;
+    }
+
     try
     {
         auto pluginProfiler = moePluginProfiler.createGemmPluginProfiler(/* inference */ false);
@@ -550,8 +642,9 @@ IPluginV2* MixtureOfExpertsPluginCreator::createPlugin(
             // Constructor parameters
             mNumExperts, mK, mExpertHiddenSize, mExpertInterSize,
             static_cast<tensorrt_llm::ActivationType>(mActivationType), static_cast<nvinfer1::DataType>(mType),
-            static_cast<nvinfer1::DataType>(mWeightType), QuantMode(mQuantMode), mUseFinished != 0, mUseBias != 0,
-            mTPSize, mTPRank, static_cast<MOEParallelismMode>(mParallelismMode),
+            static_cast<nvinfer1::DataType>(mWeightType), static_cast<nvinfer1::DataType>(mOutputType),
+            QuantMode(mQuantMode), mUseFinished != 0, mUseBias != 0, mTPSize, mTPRank,
+            static_cast<MOEParallelismMode>(mParallelismMode),
             static_cast<MOEExpertScaleNormalizationMode>(mNormalizationMode), pluginProfiler);
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
@@ -602,29 +695,44 @@ std::vector<size_t> MixtureOfExpertsGemmProfiler::getProfilerWorkspaces(int maxM
 
     size_t dtype_bytes = tensorrt_llm::common::getDTypeSize(plugin.mType);
     size_t weight_bytes = tensorrt_llm::common::getDTypeSize(plugin.mWeightType);
+    size_t output_bytes = tensorrt_llm::common::getDTypeSize(plugin.mOutputType);
 
     size_t hidden_size = plugin.mExpertHiddenSize;
     size_t inter_size = plugin.mExpertInterSize;
     size_t num_experts = plugin.mNumExperts;
 
+    size_t fc1_out_size = inter_size;
+    if (isGatedActivation(plugin.mActivationType))
+    {
+        fc1_out_size = inter_size * 2;
+    }
+
     size_t input_size = hidden_size * num_tokens * dtype_bytes;
     size_t routing_weights = num_experts * num_tokens * sizeof(float);
 
-    size_t weights_1 = hidden_size * inter_size * num_experts * weight_bytes;
+    size_t weights_1 = hidden_size * fc1_out_size * num_experts * weight_bytes;
 
-    size_t quant_1 = plugin.hasExpertQuantScales() ? inter_size * num_experts * dtype_bytes : 0;
-    size_t bias_1 = plugin.hasBias() ? inter_size * num_experts * dtype_bytes : 0;
+    size_t quant_1 = plugin.hasExpertIntQuantScales() ? fc1_out_size * num_experts * dtype_bytes : 0;
+    quant_1 = plugin.hasExpertFp8QuantScales() ? num_experts * sizeof(float) : quant_1;
+
+    size_t bias_1 = plugin.hasBias() ? fc1_out_size * num_experts * dtype_bytes : 0;
 
     size_t weights_2 = hidden_size * inter_size * num_experts * weight_bytes;
 
-    size_t quant_2 = plugin.hasExpertQuantScales() ? hidden_size * num_experts * dtype_bytes : 0;
+    size_t quant_2 = plugin.hasExpertIntQuantScales() ? hidden_size * num_experts * dtype_bytes : 0;
+    quant_2 = plugin.hasExpertFp8QuantScales() ? sizeof(float) : quant_2;
+
     size_t bias_2 = plugin.hasBias() ? hidden_size * num_experts * dtype_bytes : 0;
 
-    size_t output = hidden_size * num_tokens * dtype_bytes;
+    size_t quant_3 = plugin.hasExpertFp8QuantScales() ? num_experts * sizeof(float) : 0;
+    size_t quant_4 = plugin.hasExpertFp8FinalQuantScales() ? sizeof(float) : 0;
+
+    size_t output = hidden_size * num_tokens * output_bytes;
 
     size_t ws_size = plugin.setupWorkspace(nullptr, maxM).size;
+
     return {routing_weights, // Put this first because we initialise this but nothing else
-        input_size, weights_1, quant_1, bias_1, weights_2, quant_2, bias_2, output, ws_size};
+        input_size, weights_1, quant_1, bias_1, weights_2, quant_2, bias_2, quant_3, quant_4, output, ws_size};
 }
 
 void MixtureOfExpertsGemmProfiler::computeTmpSize(int maxM, int n, int k)
@@ -657,9 +765,9 @@ void MixtureOfExpertsGemmProfiler::runTactic(int m, int n, int k, MixtureOfExper
     };
 
     // Routing goes first as we need to manually initialise it in initTmpData, everything else can be uninit
-    // If we didn't init routing all the values could go to one expert, causing the profile to be unreliable (e.g. for
-    // expert parallelism)
-    float const* routing = static_cast<float const*>(getNext());
+    // If we didn't init routing all the values could go to one expert, causing the profile to be unreliable (e.g.
+    // for expert parallelism)
+    auto const* routing = static_cast<float const*>(getNext());
 
     void const* input = getNext();
     void const* weights_1 = getNext();
@@ -668,19 +776,25 @@ void MixtureOfExpertsGemmProfiler::runTactic(int m, int n, int k, MixtureOfExper
     void const* weights_2 = getNext();
     void const* scale_2 = getNext();
     void const* bias_2 = getNext();
+    void const* scale_3 = getNext();
+    void const* scale_4 = getNext();
     void* output = getNext();
     bool const* finished = nullptr; // No finished, we want to benchmark all tokens
 
     auto workspace = plugin.setupWorkspace(getNext(), num_tokens);
 
+    QuantParams quant_params = plugin.getQuantParams(scale_1, scale_2, scale_3, scale_4);
+
+    plugin.mMOERunner->is_profiler = true;
+    // TODO(dastokes) We should probably profile the two GEMMs separately as the optimal config may differ
     plugin.mMOERunner->setTactic(tactic);
-    plugin.mMOERunner->runMoe(input, routing, weights_1, scale_1, bias_1, plugin.mActivationType, weights_2, scale_2,
-        bias_2, num_tokens, plugin.mExpertHiddenSize, plugin.mExpertInterSize, plugin.mNumExperts, plugin.mK,
+    plugin.mMOERunner->runMoe(input, routing, weights_1, bias_1, plugin.mActivationType, weights_2, bias_2,
+        quant_params, num_tokens, plugin.mExpertHiddenSize, plugin.mExpertInterSize, plugin.mNumExperts, plugin.mK,
         static_cast<char*>(workspace.workspace),
         // Outputs
-        output, workspace.fc2_output, finished, num_tokens, workspace.scale_probs,
-        static_cast<int*>(workspace.src_to_dest_map), static_cast<int*>(workspace.selected_experts), parallelism_config,
-        plugin.mNormalizationMode, stream);
+        output, finished, num_tokens, workspace.scale_probs, static_cast<int*>(workspace.src_to_dest_map),
+        static_cast<int*>(workspace.selected_experts), parallelism_config, plugin.mNormalizationMode, stream);
+    plugin.mMOERunner->is_profiler = false;
 
     sync_check_cuda_error();
 }
@@ -691,12 +805,13 @@ auto MixtureOfExpertsGemmProfiler::getTactics(int m, int n, int k) const -> std:
     return mRunner->mMOERunner->getTactics();
 }
 
-void MixtureOfExpertsGemmProfiler::initTmpData(int m, int, int, char* workspace, size_t, cudaStream_t stream)
+void MixtureOfExpertsGemmProfiler::initTmpData(int m, int, int, char* workspace, size_t ws_size, cudaStream_t stream)
 {
     assert(mRunner);
     auto& plugin = *mRunner;
     int num_tokens = m;
     void* routing_workspace = workspace;
+    tensorrt_llm::common::check_cuda_error(cudaMemsetAsync(workspace, 0x0, ws_size, stream));
     makeLoadBalancedRoutingConfiguration(
         routing_workspace, plugin.mNumExperts, num_tokens, plugin.mK, DataType::kFLOAT, stream);
 }

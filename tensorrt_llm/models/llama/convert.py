@@ -811,29 +811,19 @@ def convert_hf_llama(hf_model,
                 model_params, prefix + 'block_sparse_moe.experts.w2', dtype)
             weights.update(
                 get_tllm_linear_weight(moe_experts_w2_weights,
-                                       tllm_prex + 'mlp.experts_weight_2',
-                                       None,
+                                       tllm_prex + 'mlp.proj.', None,
                                        use_weight_only,
-                                       plugin_weight_only_quant_type,
-                                       dtype,
-                                       use_gemm_woq_plugin,
-                                       postfix='',
-                                       quant_scale_name=tllm_prex +
-                                       'mlp.experts_scale_2'))
+                                       plugin_weight_only_quant_type, dtype,
+                                       use_gemm_woq_plugin))
             ##block_sparse_moe.experts.w3w1.weight
             moe_experts_w3w1_weights = get_weight(
                 model_params, prefix + 'block_sparse_moe.experts.w3w1', dtype)
             weights.update(
                 get_tllm_linear_weight(moe_experts_w3w1_weights,
-                                       tllm_prex + 'mlp.experts_weight_1',
-                                       None,
+                                       tllm_prex + 'mlp.fc.', None,
                                        use_weight_only,
-                                       plugin_weight_only_quant_type,
-                                       dtype,
-                                       use_gemm_woq_plugin,
-                                       postfix='',
-                                       quant_scale_name=tllm_prex +
-                                       'mlp.experts_scale_1'))
+                                       plugin_weight_only_quant_type, dtype,
+                                       use_gemm_woq_plugin))
 
             moe_experts_gate_weights = get_weight(
                 model_params, prefix + 'block_sparse_moe.gate', torch.float32)
@@ -1125,7 +1115,7 @@ def create_config_from_hugging_face(hf_model,
                            config['moe_tp_mode'],
                            config['moe_normalization_mode']).validate()
     use_weight_only = config['quantization']['quant_algo'] in [
-        QuantAlgo.W8A16, QuantAlgo.W4A16
+        QuantAlgo.W8A16, QuantAlgo.W4A16, QuantAlgo.FP8
     ]
     if use_weight_only and moe_config.has_moe():
         config['quantization']['exclude_modules'].append('router')

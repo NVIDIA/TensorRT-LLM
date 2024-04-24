@@ -20,10 +20,10 @@
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
-#include "tensorrt_llm/runtime/gptModelConfig.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/loraUtils.h"
+#include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/utils/sessionUtils.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 #include <NvInferRuntimeBase.h>
@@ -31,8 +31,7 @@
 namespace tensorrt_llm::runtime
 {
 
-void LoraManager::create(
-    GptModelConfig const& modelConfig, WorldConfig const& worldConfig, BufferManager const& manager)
+void LoraManager::create(ModelConfig const& modelConfig, WorldConfig const& worldConfig, BufferManager const& manager)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -48,7 +47,7 @@ void LoraManager::create(
 }
 
 void LoraManager::fillInputTensors(TensorPtr weightsPtrs, TensorPtr adapterSizes, PeftTable const& peftTable,
-    ReqIdsVec const& reqIds, std::vector<SizeType> const& reqBeamWidth, GptModelConfig const& modelConfig,
+    ReqIdsVec const& reqIds, std::vector<SizeType> const& reqBeamWidth, ModelConfig const& modelConfig,
     WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -67,13 +66,13 @@ void LoraManager::fillInputTensors(TensorPtr weightsPtrs, TensorPtr adapterSizes
 }
 
 void LoraManager::fillInputTensors(TensorPtr weightsPtrs, TensorPtr adapterSizes, PeftValues const peftValues,
-    SizeType batchIdx, SizeType beamWidth, GptModelConfig const& modelConfig, WorldConfig const& worldConfig)
+    SizeType batchIdx, SizeType beamWidth, ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto const ppSize = worldConfig.getPipelineParallelism();
     auto const ppRank = worldConfig.getPipelineParallelRank();
-    auto const localNumLayers = modelConfig.getNbLayers(ppSize);
+    auto const localNumLayers = modelConfig.getNbAttentionLayers(ppSize);
     auto const firstLayerId = ppRank * localNumLayers;
 
     auto weightsPointersPtr = bufferCast<int64_t>(*weightsPtrs);
@@ -119,10 +118,10 @@ void LoraManager::fillInputTensors(TensorPtr weightsPtrs, TensorPtr adapterSizes
 }
 
 void LoraManager::insertInputTensors(TensorMap& inputTensors, TensorPtr weightsPtrs, TensorPtr adapterSizes,
-    GptModelConfig const& modelConfig, WorldConfig const& worldConfig) const
+    ModelConfig const& modelConfig, WorldConfig const& worldConfig) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto localNbLayers = modelConfig.getNbLayers(worldConfig.getPipelineParallelism());
+    auto localNbLayers = modelConfig.getNbAttentionLayers(worldConfig.getPipelineParallelism());
     auto firstLayerId = worldConfig.getPipelineParallelRank() * localNbLayers;
 
     for (auto const& [modId, mod] : mModuleIdToModule)

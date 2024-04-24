@@ -427,8 +427,10 @@ class Network(object):
             )
             return
 
-        dot = graphviz.Digraph(comment='TensorRT Graph',
-                               format=format if format != 'text' else None)
+        dot = graphviz.Digraph(
+            comment=
+            f'TensorRT Graph of {self._get_network_hash(lightweight=False)}',
+            format=format if format != 'text' else None)
 
         inputs_names = set([x.name for x in self.get_inputs()])
         output_names = set([x.name for x in self.get_outputs()])
@@ -469,10 +471,12 @@ class Network(object):
 
             return tensor_to_alias[tensor]
 
-        def create_tensor_node(tensor: str):
+        def create_tensor_node(tensor: str, dtype=None, shape=None):
             tensor_alias = get_alias(tensor, tensor_id)
             if tensor_alias not in nodes:
-                dot.node(tensor_alias, tensor_alias, **node_style)
+                dot.node(tensor_alias,
+                         str(dtype) + "\n" + tensor_alias + "\n" + str(shape),
+                         **node_style)
                 nodes.add(tensor_alias)
             return tensor_alias
 
@@ -482,18 +486,20 @@ class Network(object):
                 nodes.add(layer)
 
         for tensor, layer in state.tensor_to_producer.items():
-            tensor_alias = create_tensor_node(tensor.name)
+            tensor_alias = create_tensor_node(tensor.name, tensor.dtype,
+                                              tensor.shape)
             create_layer_node(layer.name)
             dot.edge(layer.name, tensor_alias)
         for tensor, layers in state.tensor_to_consumers.items():
-            tensor_alias = create_tensor_node(tensor.name)
+            tensor_alias = create_tensor_node(tensor.name, tensor.dtype,
+                                              tensor.shape)
             for layer in layers:
                 create_layer_node(layer.name)
                 dot.edge(tensor_alias, layer.name)
 
         if format == "text":
             return dot.source
-        dot.render(path)
+        dot.save(path)
 
     def _get_graph(self) -> "Network._GraphState":
         '''

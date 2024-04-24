@@ -30,6 +30,7 @@ add_subdirectory(common)
 add_subdirectory(kernels)
 add_subdirectory(layers)
 add_subdirectory(runtime)
+add_subdirectory(executor_worker)
 
 set(BATCH_MANAGER_TARGET tensorrt_llm_batch_manager_static)
 set(BATCH_MANAGER_TARGET_ARCH "unknown")
@@ -196,8 +197,9 @@ set(TRTLLM_LINK_LIBS
     kernels_src
     context_attention_src
     decoder_attention_src
-    cutlass2_src
-    cutlass3_src
+    fpA_intB_gemm_src
+    moe_gemm_src
+    cutlass_src
     layers_src
     runtime_src)
 
@@ -218,43 +220,30 @@ set_target_properties(
   PROPERTIES CXX_STANDARD "17" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
              LINK_FLAGS "${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
 
+function(link_whole_archive TARGET LIBRARY_TO_LINK)
+  if(WIN32)
+    target_link_libraries(${TARGET} PUBLIC $<TARGET_FILE:${LIBRARY_TO_LINK}>)
+    set_target_properties(
+      ${TARGET} PROPERTIES LINK_FLAGS "/WHOLEARCHIVE:${LIBRARY_TO_LINK}")
+  else()
+    # Assume everything else is like gcc
+    target_link_libraries(
+      ${TARGET} PRIVATE "-Wl,--whole-archive" $<TARGET_FILE:${LIBRARY_TO_LINK}>
+                        "-Wl,--no-whole-archive")
+  endif()
+endfunction()
+
 target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
 
-if(WIN32)
-  target_link_libraries(${SHARED_TARGET}
-                        PUBLIC $<TARGET_FILE:${BATCH_MANAGER_TARGET}>)
-  set_target_properties(
-    ${SHARED_TARGET} PROPERTIES LINK_FLAGS
-                                "/WHOLEARCHIVE:${BATCH_MANAGER_TARGET}")
-else()
-  # Assume everything else is like gcc
-  target_link_libraries(
-    ${SHARED_TARGET}
-    PRIVATE "-Wl,--whole-archive" $<TARGET_FILE:${BATCH_MANAGER_TARGET}>
-            "-Wl,--no-whole-archive")
-endif()
-
-if(WIN32)
-  target_link_libraries(${SHARED_TARGET}
-                        PUBLIC $<TARGET_FILE:${EXECUTOR_TARGET}>)
-  set_target_properties(
-    ${SHARED_TARGET} PROPERTIES LINK_FLAGS "/WHOLEARCHIVE:${EXECUTOR_TARGET}")
-else()
-  # Assume everything else is like gcc
-  target_link_libraries(
-    ${SHARED_TARGET}
-    PRIVATE "-Wl,--whole-archive" $<TARGET_FILE:${EXECUTOR_TARGET}>
-            "-Wl,--no-whole-archive")
-endif()
+link_whole_archive(${SHARED_TARGET} ${BATCH_MANAGER_TARGET})
+link_whole_archive(${SHARED_TARGET} ${EXECUTOR_TARGET})
+# Cyclic dependency of batch manager on TRT-LLM
+target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE ${SHARED_TARGET})
+# Cyclic dependency of executor on TRT-LLM
+target_link_libraries(${EXECUTOR_TARGET} INTERFACE ${SHARED_TARGET})
 
 add_dependencies(${SHARED_TARGET} check_symbol)
 add_dependencies(${SHARED_TARGET} check_symbol_executor)
-
-# Cyclic dependency of batch manager on TRT-LLM
-target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE ${SHARED_TARGET})
-
-# Cyclic dependency of executor on TRT-LLM
-target_link_libraries(${EXECUTOR_TARGET} INTERFACE ${SHARED_TARGET})
 
 if(BUILD_PYT)
   add_subdirectory(thop)

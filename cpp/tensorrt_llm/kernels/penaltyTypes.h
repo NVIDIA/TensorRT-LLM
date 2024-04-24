@@ -36,20 +36,6 @@ enum class DecodingPenaltyType
     MinLength,   // the min length penalty
 };
 
-inline float getDefaultPenaltyValue(DecodingPenaltyType penaltyType)
-{
-    switch (penaltyType)
-    {
-    case DecodingPenaltyType::Temperature: return 1.0f;
-    case DecodingPenaltyType::Repetition: return 1.0f;
-    case DecodingPenaltyType::Presence: return 0.0f;
-    case DecodingPenaltyType::Frequency: return 0.0f;
-    case DecodingPenaltyType::MinLength: return 1.0f;
-    default: break;
-    }
-    return 0.0f;
-}
-
 inline std::pair<float, float> getLimitsPenalty(DecodingPenaltyType penaltyType)
 {
     auto constexpr fltMax = std::numeric_limits<float>::max();

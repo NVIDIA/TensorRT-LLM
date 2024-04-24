@@ -424,11 +424,25 @@ def ipc_per_sm(compute_cap: Tuple[int, int]) -> MathThroughput:
     return ipc_table.get(compute_cap, MathThroughput())
 
 
+def nvlink_version(version_enum: int) -> int:
+    nvl_version_table = {
+        1: 1,
+        2: 2,
+        3: 2,
+        4: 2,
+        5: 3,
+        6: 3,
+        7: 4,
+    }
+    return nvl_version_table[version_enum]
+
+
 def nvlink_bandwidth(nvlink_version: int) -> int:
     nvl_bw_table = {
+        1: 80,
         2: 150,
-        5: 300,
-        7: 450,
+        3: 300,
+        4: 450,
     }
     return nvl_bw_table[nvlink_version]
 
@@ -482,12 +496,13 @@ def infer_cluster_info() -> ClusterInfo:
 
         intra_node_sharp = False
         if is_nvl_active:
-            nvl_version = pynvml.nvmlDeviceGetNvLinkVersion(handle, 0)
+            nvl_version_enum = pynvml.nvmlDeviceGetNvLinkVersion(handle, 0)
+            nvl_version = nvlink_version(nvl_version_enum)
             logger.info(f"NVLink version: {nvl_version}")
             nvl_bw = nvlink_bandwidth(nvl_version)
             logger.info(f"NVLink bandwidth: {nvl_bw} GB/s")
             intra_node_bw = nvl_bw
-            if nvl_version >= 7:
+            if nvl_version >= 4:
                 intra_node_sharp = True
         else:
             if pynvml.__version__ < '11.5.0':

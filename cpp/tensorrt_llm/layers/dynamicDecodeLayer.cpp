@@ -22,6 +22,7 @@
 #include "tensorrt_llm/kernels/penaltyKernels.h"
 #include "tensorrt_llm/kernels/stopCriteriaKernels.h"
 #include "tensorrt_llm/layers/beamSearchLayer.h"
+#include "tensorrt_llm/layers/defaultDecodingParams.h"
 #include "tensorrt_llm/layers/fillBuffers.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
@@ -320,33 +321,31 @@ void DynamicDecodeLayer<T>::setupPenalties(
     mUseMinLength = static_cast<bool>(setupParams.min_length);
     if (mUseTemperature)
     {
-        fillBuffers(setupParams.temperature, getDefaultPenaltyValue(DecodingPenaltyType::Temperature), mTemperature,
-            mTemperatureDevice, batchSlotsHost, getLimitsPenalty(DecodingPenaltyType::Temperature),
-            "temperature penalty");
+        fillBuffers(setupParams.temperature, DefaultDecodingParams::getTemperature(), mTemperature, mTemperatureDevice,
+            batchSlotsHost, getLimitsPenalty(DecodingPenaltyType::Temperature), "temperature penalty");
     }
     if (mUseRepetitionPenalty)
     {
-        fillBuffers(setupParams.repetition_penalty, getDefaultPenaltyValue(DecodingPenaltyType::Repetition),
-            mRepetitionPenalty, mRepetitionPenaltyDevice, batchSlotsHost,
-            getLimitsPenalty(DecodingPenaltyType::Repetition), "repetition penalty");
+        fillBuffers(setupParams.repetition_penalty, DefaultDecodingParams::getRepetitionPenalty(), mRepetitionPenalty,
+            mRepetitionPenaltyDevice, batchSlotsHost, getLimitsPenalty(DecodingPenaltyType::Repetition),
+            "repetition penalty");
     }
     if (mUsePresencePenalty)
     {
-        fillBuffers(setupParams.presence_penalty, getDefaultPenaltyValue(DecodingPenaltyType::Presence),
-            mPresencePenalty, mPresencePenaltyDevice, batchSlotsHost, getLimitsPenalty(DecodingPenaltyType::Presence),
+        fillBuffers(setupParams.presence_penalty, DefaultDecodingParams::getPresencePenalty(), mPresencePenalty,
+            mPresencePenaltyDevice, batchSlotsHost, getLimitsPenalty(DecodingPenaltyType::Presence),
             "presence penalty");
     }
     if (mUseFrequencyPenalty)
     {
-        fillBuffers(setupParams.frequency_penalty, getDefaultPenaltyValue(DecodingPenaltyType::Frequency),
-            mFrequencyPenalty, mFrequencyPenaltyDevice, batchSlotsHost,
-            getLimitsPenalty(DecodingPenaltyType::Frequency), "frequency penalty");
+        fillBuffers(setupParams.frequency_penalty, DefaultDecodingParams::getFrequencyPenalty(), mFrequencyPenalty,
+            mFrequencyPenaltyDevice, batchSlotsHost, getLimitsPenalty(DecodingPenaltyType::Frequency),
+            "frequency penalty");
     }
     if (mUseMinLength)
     {
-        fillBuffers(setupParams.min_length,
-            static_cast<SizeType32>(getDefaultPenaltyValue(DecodingPenaltyType::MinLength)), mMinLength,
-            mMinLengthDevice, batchSlotsHost, getLimitsPenalty(DecodingPenaltyType::MinLength), "minLength");
+        fillBuffers(setupParams.min_length, DefaultDecodingParams::getMinLength(), mMinLength, mMinLengthDevice,
+            batchSlotsHost, getLimitsPenalty(DecodingPenaltyType::MinLength), "minLength");
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -603,18 +602,18 @@ void DynamicDecodeLayer<T>::applyPenalties(OutputParams& outputs, ForwardParams 
         inputLengths = input_lengths.template getPtr<SizeType32 const>();
     }
     auto* embeddingBias = params.embedding_bias ? params.embedding_bias->template getPtr<T const>() : nullptr;
-#define GET_PENALTIES(capital_name, penalty_name, type)                                                                \
+#define GET_PENALTIES(capital_name, type)                                                                              \
     (mUse##capital_name                                                                                                \
         && !allOfBatchSlots(batchSlotsHost, m##capital_name.data(), batchSize,                                         \
-            static_cast<type>(getDefaultPenaltyValue(DecodingPenaltyType::penalty_name))))                             \
+            static_cast<type>(DefaultDecodingParams::get##capital_name())))                                            \
         ? m##capital_name##Device                                                                                      \
         : nullptr;
 
-    auto* temperatures = GET_PENALTIES(Temperature, Temperature, float);
-    auto* repetitionPenalties = GET_PENALTIES(RepetitionPenalty, Repetition, float);
-    auto* presencePenalties = GET_PENALTIES(PresencePenalty, Presence, float);
-    auto* frequencyPenalties = GET_PENALTIES(FrequencyPenalty, Frequency, float);
-    auto* minLengths = GET_PENALTIES(MinLength, MinLength, SizeType32);
+    auto* temperatures = GET_PENALTIES(Temperature, float);
+    auto* repetitionPenalties = GET_PENALTIES(RepetitionPenalty, float);
+    auto* presencePenalties = GET_PENALTIES(PresencePenalty, float);
+    auto* frequencyPenalties = GET_PENALTIES(FrequencyPenalty, float);
+    auto* minLengths = GET_PENALTIES(MinLength, SizeType32);
 
 #undef GET_PENALTIES
 

@@ -36,10 +36,11 @@ namespace kernel
 template <typename TypeA, typename TypeB, typename arch, typename Enable = void>
 struct MixedGemmArchTraits
 {
+    static_assert(dependent_false<arch>, "Unrecognised parameterization");
 };
 
-template <typename arch>
-struct MixedGemmArchTraits<float, float, arch>
+template <typename Arch>
+struct MixedGemmArchTraits<float, float, Arch>
 {
     static constexpr int Stages = 2;
     using OperatorClass = cutlass::arch::OpClassSimt;
@@ -66,7 +67,7 @@ struct MixedGemmArchTraits<TypeA, TypeB, cutlass::arch::Sm70,
         || cutlass::platform::is_same<TypeA, cutlass::bfloat16_t>::value>::type>
 {
 private:
-    using LayoutDetails = LayoutDetailsB<TypeB, cutlass::arch::Sm70>;
+    using LayoutDetails = LayoutDetailsB<TypeA, TypeB, cutlass::arch::Sm70>;
 
 public:
     static constexpr int ThreadblockK = LayoutDetails::ThreadblockK;
@@ -92,7 +93,7 @@ struct MixedGemmArchTraits<TypeA, TypeB, cutlass::arch::Sm75,
         || cutlass::platform::is_same<TypeA, cutlass::bfloat16_t>::value>::type>
 {
 private:
-    using LayoutDetails = LayoutDetailsB<TypeB, cutlass::arch::Sm75>;
+    using LayoutDetails = LayoutDetailsB<TypeA, TypeB, cutlass::arch::Sm75>;
 
 public:
     static constexpr int ThreadblockK = LayoutDetails::ThreadblockK;
@@ -116,7 +117,7 @@ struct MixedGemmArchTraits<TypeA, TypeB, cutlass::arch::Sm80,
         || cutlass::platform::is_same<TypeA, cutlass::bfloat16_t>::value>::type>
 {
 private:
-    using LayoutDetails = LayoutDetailsB<TypeB, cutlass::arch::Sm80>;
+    using LayoutDetails = LayoutDetailsB<TypeA, TypeB, cutlass::arch::Sm80>;
 
 public:
     static constexpr int ThreadblockK = LayoutDetails::ThreadblockK;
@@ -129,6 +130,34 @@ public:
     static constexpr int ElementsPerAccessB = LayoutDetails::ElementsPerAccess;
     static constexpr int ElementsPerAccessC = 128 / cutlass::sizeof_bits<TypeA>::value;
     using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
+
+    using Operator = typename LayoutDetails::Operator;
+};
+
+// ======================= Ada Traits ==============================
+template <typename TypeA, typename TypeB>
+struct MixedGemmArchTraits<TypeA, TypeB, cutlass::arch::Sm89,
+    typename cutlass::platform::enable_if<cutlass::platform::is_same<TypeA, cutlass::half_t>::value
+        || cutlass::platform::is_same<TypeA, cutlass::bfloat16_t>::value
+#ifdef ENABLE_FP8
+        || cutlass::platform::is_same<TypeA, cutlass::float_e4m3_t>::value>::type
+#endif
+    >
+{
+private:
+    using LayoutDetails = LayoutDetailsB<TypeA, TypeB, cutlass::arch::Sm89>;
+
+public:
+    static constexpr int ThreadblockK = LayoutDetails::ThreadblockK;
+
+    using OperatorClass = cutlass::arch::OpClassTensorOp;
+    using AccType = float;
+    using LayoutB = typename LayoutDetails::Layout;
+
+    static constexpr int ElementsPerAccessA = 128 / cutlass::sizeof_bits<TypeA>::value;
+    static constexpr int ElementsPerAccessB = LayoutDetails::ElementsPerAccess;
+    static constexpr int ElementsPerAccessC = 128 / cutlass::sizeof_bits<TypeA>::value;
+    using InstructionShape = cutlass::gemm::GemmShape<16, 8, 256 / cutlass::sizeof_bits<TypeA>::value>;
 
     using Operator = typename LayoutDetails::Operator;
 };

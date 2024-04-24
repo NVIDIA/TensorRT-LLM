@@ -16,6 +16,12 @@ from tensorrt_llm.quantization import QuantAlgo
 def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_dir', type=str, default=None)
+    parser.add_argument(
+        '--qwen_type',
+        default='qwen',
+        choices=['qwen', 'qwen2'],
+        help="Used only if model_dir is not provided."
+        "In this case users should explicitly passing the version.")
     parser.add_argument('--tp_size',
                         type=int,
                         default=1,
@@ -229,6 +235,7 @@ def from_cli_args(args):
         'hidden_act': args.hidden_act,
         'rotary_base': args.rotary_base,
         'norm_epsilon': args.rms_norm_eps,
+        'qwen_type': args.qwen_type,
         'mapping': {
             'world_size': args.tp_size * args.pp_size,
             'tp_size': args.tp_size,

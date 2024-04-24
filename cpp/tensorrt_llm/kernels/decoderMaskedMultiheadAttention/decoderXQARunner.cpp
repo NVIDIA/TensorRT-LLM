@@ -78,14 +78,20 @@ size_t DecoderXQARunner::getWorkspaceSize(int max_batch_beam_size)
         int workspaces[4];
         int const max_num_request = max_batch_beam_size;
         uint32_t const nbSeq = mNumKVHeads * max_num_request;
-        uint32_t const nbSubSeq = kMaxNbCtaPerKVHeadFactor * nbSeq;
+        uint32_t const nbSubSeq = xqaMaxNbCtaPerKVHeadFactor() * nbSeq;
         int group_size = mNumHeads / mNumKVHeads;
         workspaces[0] = sizeof(uint32_t) * nbSeq;
         workspaces[1] = sizeof(float) * roundUp(group_size, 32) * nbSubSeq;
         workspaces[2] = sizeof(float) * roundUp(group_size, 32) * nbSubSeq;
-        workspaces[3] = sizeof(__half) * group_size * mHeadSize * nbSubSeq;
-        workspace_size = roundUp(workspaces[0], 128) + roundUp(workspaces[1], 128) + roundUp(workspaces[2], 128)
-            + roundUp(workspaces[3], 128);
+        int32_t const multi_block_workspace_alignment
+            = roundUp<int32_t>(sizeof(__half) * kMaxBeamWidth * group_size * mHeadSize, 128);
+        workspaces[3] = multi_block_workspace_alignment * xqaMaxNbCtaPerKVHeadFactor() * mNumKVHeads
+            * divUp(max_batch_beam_size, kMaxBeamWidth);
+        workspace_size = roundUp(workspaces[0], multi_block_workspace_alignment)
+            + roundUp(workspaces[1], multi_block_workspace_alignment)
+            + roundUp(workspaces[2], multi_block_workspace_alignment)
+            + roundUp(workspaces[3], multi_block_workspace_alignment)
+            + multi_block_workspace_alignment; // extra space reserved for alignment
     }
     return workspace_size;
 }

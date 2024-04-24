@@ -1,5 +1,5 @@
 --extra-index-url https://pypi.nvidia.com
-tensorrt_llm==0.10.0.dev2024041600
+tensorrt_llm==0.10.0.dev2024042300
 tiktoken
 datasets
 kaldialign

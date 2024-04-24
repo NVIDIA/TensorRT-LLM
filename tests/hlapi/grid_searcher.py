@@ -1,3 +1,7 @@
+#!/usr/bin/env python
+import operator
+import time
+from functools import reduce
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -17,6 +21,7 @@ class GridSearcher:
 
     def __init__(self, prune_space_for_debug: int = 1e8):
         self.prune_space_for_debug = prune_space_for_debug
+        self.latest_latency_per_case: Optional[float] = None
 
     def evaluate(self,
                  model_config: ModelConfig,
@@ -32,10 +37,16 @@ class GridSearcher:
             report_dir.mkdir(parents=True, exist_ok=True)
         skip_configs = set([tuple(d.items()) for d in (skip_configs or [])])
 
-        space = specified_configs or self.gen_space()
+        self.model_config = model_config
+        space = specified_configs or self.generate_cases(self.tunable_space)
+
+        print_colored("Tunable options: ", color="green")
+        for key, value in self.tunable_space.items():
+            print_colored(f"  - {key}: {value}\n", color="green")
+        print_colored("\n")
 
         for no, llm_kwargs in enumerate(space):
-            if no > self.prune_space_for_debug:
+            if no >= self.prune_space_for_debug:
                 break
             if no < skip_steps:
                 continue
@@ -59,10 +70,15 @@ class GridSearcher:
             kvcache = KvCacheConfig()
             kvcache.enable_block_reuse = llm_kwargs.pop('kvcache_reuse_blocks')
 
-            print_colored(
-                f"Running {no}th experiment with {origin_llm_kwargs}\n",
-                color="green")
+            print_colored(f"Testing ", color="green")
+            print_colored(f"{no}/{self.space_size}", color="bold_red")
+            print_colored(f" case with {origin_llm_kwargs}\n", color="green")
+            if self.latest_latency_per_case is not None:
+                print_colored(
+                    f"Estimated remaining time: {self.latest_latency_per_case * (self.space_size - no):.2f} min\n"
+                )
 
+            _start_time = time.time()
             with LLMPerfEvaluator.create(
                     model_config,
                     samples_path,
@@ -78,23 +94,34 @@ class GridSearcher:
                 report = perf_evaluator.run()
                 report.display()
                 report.save_json(report_path, config=origin_llm_kwargs)
+            self.latest_latency_per_case = (time.time() -
+                                            _start_time) / 60  # min
 
-    def gen_space(self) -> Iterable[Dict[str, Any]]:
-
+    @property
+    def tunable_space(self):
         tunable_options = dict(
-            use_custom_all_reduce=[False, True],
             multi_block_mode=[False, True],
             kvcache_reuse_blocks=[False, True],
             scheduling_policy=[
                 SchedulerPolicy.GUARANTEED_NO_EVICT,
                 SchedulerPolicy.MAX_UTILIZATION
             ],
+            enable_chunked_context=[False, True],
         )
+        if self.model_config.is_multi_gpu:
+            tunable_options["use_custom_all_reduce"] = [False, True]
 
+        self.space_size = reduce(operator.mul,
+                                 [len(v) for v in tunable_options.values()], 1)
+        self.space_size = min(self.space_size, self.prune_space_for_debug)
+
+        return tunable_options
+
+    def generate_cases(self, tunable_options) -> Iterable[Dict[str, Any]]:
         if self.prune_space_for_debug:
             logger.warning("Pruning the space for debugging purpose")
 
-        options = list(tunable_options.items())
+        options = list(self.tunable_space.items())
 
         def gen_configs(options, config: dict):
             if not options:

@@ -22,6 +22,7 @@ from tqdm import tqdm
 from ..._utils import str_dtype_to_torch
 from ...logger import logger
 from ...mapping import Mapping
+from .utils import get_qwen_key_list
 
 
 def split(v, tp_size, idx, dim=0):
@@ -35,6 +36,7 @@ def split(v, tp_size, idx, dim=0):
 
 def load_from_gptq_qwen(
         model,
+        qwen_type,
         num_hidden_layers=None,
         mapping=Mapping(),
         dtype="float16",
@@ -45,6 +47,9 @@ def load_from_gptq_qwen(
 
     model_params = {k: v for k, v in model.state_dict().items()}
     torch.cuda.empty_cache()
+
+    layer_prefix = "transformer.h." if qwen_type == 'qwen' else "model.layers."
+    key_list = get_qwen_key_list(qwen_type)
 
     def torch_split(v, dim):
         if v.shape[dim] % mapping.tp_size != 0:
@@ -83,7 +88,8 @@ def load_from_gptq_qwen(
         qweight_unpacked_int8 = unpack_int32_into_int8(
             qweight_int32.T).T.contiguous() - 8
         qweight_interleaved = preprocessor(packer(qweight_unpacked_int8),
-                                           torch.quint4x2).view(torch.float16)
+                                           torch.quint4x2,
+                                           torch.float16).view(torch.float16)
         # zeros = zeros * scales
         qzeros_unpacked_int32 = unpack_int32_into_int8(qzeros_int32)
         if not USE_UINT4_INPUT:
@@ -108,12 +114,12 @@ def load_from_gptq_qwen(
 
     # Load weights from GPTQ checkpoint into TRT-LLM module
     # 1. vocab_embedding
-    v = model_params['transformer.wte.weight']
+    v = model_params[key_list[7] + '.weight']
     if mapping.is_first_pp_rank():
         weights['transformer.vocab_embedding.weight'] = v.to(torch_dtype)
 
     # 2. ln_f
-    v = model_params['transformer.ln_f.weight']
+    v = model_params[key_list[8] + '.weight']
     if mapping.is_last_pp_rank():
         weights['transformer.ln_f.weight'] = v.to(torch_dtype)
 
@@ -127,23 +133,47 @@ def load_from_gptq_qwen(
     layers_range = list(
         range(mapping.pp_rank * layers_per_pipeline_stage,
               (mapping.pp_rank + 1) * layers_per_pipeline_stage, 1))
-    suffixs = ["qweight", "qzeros", "scales"]
+    suffixs = [".qweight", ".qzeros", ".scales"]
 
     for l in tqdm(layers_range, desc="loading weight in each layer..."):
         layer_idx = l - mapping.pp_rank * layers_per_pipeline_stage
-        prefix = "transformer.h." + str(layer_idx) + "."
+        prefix = layer_prefix + str(layer_idx) + "."
         tllm_prex = f'transformer.layers.{l-layers_range[0]}'
         # 4.1 attention.qkv
         qkv_weight_list = []
-        for suf in suffixs:
-            qkv_part = model_params[prefix + "attn.c_attn." + suf]
-            qkv_weight_list.append(qkv_part)
+        if qwen_type == 'qwen':
+            for suf in suffixs:
+                qkv_part = model_params[prefix + key_list[0] + suf]
+                q_emb = qkv_part.shape[1] // 3
+                model_emb = qkv_part.shape[0]
+                qkv_part = qkv_part.reshape(model_emb, 3, q_emb)
+                qkv_part = torch_split(qkv_part, 2)
+                qkv_part = qkv_part.reshape(model_emb,
+                                            3 * (q_emb // mapping.tp_size))
+                qkv_weight_list.append(qkv_part)
+        else:
+            for suf in suffixs:
+                qkv_list = []
+                for comp in ["q_proj", "k_proj", "v_proj"]:
+                    comp_part = model_params[prefix + key_list[0] + comp + suf]
+                    comp_part = torch_split(comp_part, 1)
+                    qkv_list.append(comp_part)
+                qkv_weight_list.append(torch.cat(qkv_list, dim=1))
         weights.update(
             process_and_assign_weight(qkv_weight_list,
                                       f'{tllm_prex}.attention.qkv'))
         # 4.2 attention.bias
-        qkv_bias = model_params[prefix + "attn.c_attn.bias"].to(
-            torch_dtype).cpu().contiguous()
+        suf = ".bias"
+        if qwen_type == 'qwen':
+            qkv_bias = model_params[prefix + key_list[0] +
+                                    suf].to(torch_dtype).cpu().contiguous()
+        else:
+            qkv_bias_list = []
+            for comp in ["q_proj", "k_proj", "v_proj"]:
+                comp_part = model_params[prefix + key_list[0] + comp + suf].to(
+                    torch_dtype).cpu().contiguous()
+                qkv_bias_list.append(comp_part)
+            qkv_bias = torch.cat(qkv_bias_list, dim=0)
         q_emb = qkv_bias.shape[0] // 3
         qkv_bias = qkv_bias.reshape(3, q_emb)
         split_v = split(qkv_bias, mapping.tp_size, mapping.rank, dim=1)
@@ -152,7 +182,7 @@ def load_from_gptq_qwen(
         # 4.3 attention.dense
         qkv_dense_list = []
         for suf in suffixs:
-            qkv_dense_part = model_params[prefix + "attn.c_proj." + suf]
+            qkv_dense_part = model_params[prefix + key_list[1] + suf]
             qkv_dense_list.append(qkv_dense_part)
         weights.update(
             process_and_assign_weight(qkv_dense_list,
@@ -161,35 +191,35 @@ def load_from_gptq_qwen(
         # 4.4 mlp.gate
         mlp_gate_list = []
         for suf in suffixs:
-            mlp_gate_part = model_params[prefix + "mlp.w1." + suf]
+            mlp_gate_part = model_params[prefix + key_list[2] + suf]
             mlp_gate_list.append(mlp_gate_part)
         weights.update(
             process_and_assign_weight(mlp_gate_list,
                                       f'{tllm_prex}.mlp.gate',
                                       tp_dim=1))
-        # 4.5 mlp.proj
-        mlp_proj_list = []
-        for suf in suffixs:
-            mlp_proj_part = model_params[prefix + "mlp.c_proj." + suf]
-            mlp_proj_list.append(mlp_proj_part)
-        weights.update(
-            process_and_assign_weight(mlp_proj_list,
-                                      f'{tllm_prex}.mlp.proj',
-                                      tp_dim=0))
-        # 4.6 mlp.fc
+        # 4.5 mlp.fc
         mlp_fc_list = []
         for suf in suffixs:
-            mlp_fc_part = model_params[prefix + "mlp.w2." + suf]
+            mlp_fc_part = model_params[prefix + key_list[3] + suf]
             mlp_fc_list.append(mlp_fc_part)
         weights.update(
             process_and_assign_weight(mlp_fc_list,
                                       f'{tllm_prex}.mlp.fc',
                                       tp_dim=1))
+        # 4.6 mlp.proj
+        mlp_proj_list = []
+        for suf in suffixs:
+            mlp_proj_part = model_params[prefix + key_list[4] + suf]
+            mlp_proj_list.append(mlp_proj_part)
+        weights.update(
+            process_and_assign_weight(mlp_proj_list,
+                                      f'{tllm_prex}.mlp.proj',
+                                      tp_dim=0))
         # 4.7 input_layernorm
-        v = model_params[prefix + "ln_1.weight"]
+        v = model_params[prefix + key_list[5] + '.weight']
         weights[f'{tllm_prex}.input_layernorm.weight'] = v.to(torch_dtype)
         # 4.8 post_layernorm
-        v = model_params[prefix + "ln_2.weight"]
+        v = model_params[prefix + key_list[6] + '.weight']
         weights[f'{tllm_prex}.post_layernorm.weight'] = v.to(torch_dtype)
 
     tok = time.time()

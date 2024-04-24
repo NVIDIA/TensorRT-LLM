@@ -365,10 +365,15 @@ void CutlassInt8GemmRunner<T>::gemm(int8_t const* A, int8_t const* B, tk::QuantM
 template <typename T>
 std::vector<tkc::CutlassGemmConfig> CutlassInt8GemmRunner<T>::getConfigs() const
 {
-    static constexpr bool isWeightOnly = false;
-    std::vector<tkc::CutlassGemmConfig> candidateConfigs
-        = get_candidate_configs(mSm, isWeightOnly, mSm <= 70, /* SIMT configs */
-            true, SPLIT_K_LIMIT);                             /* INT8 configs */
+
+    auto config_type_param = tkc::CutlassGemmConfig::CandidateConfigTypeParam::INT8_ONLY;
+    if (mSm <= 70)
+    {
+        config_type_param = static_cast<tkc::CutlassGemmConfig::CandidateConfigTypeParam>(
+            config_type_param | tkc::CutlassGemmConfig::CandidateConfigTypeParam::SIMT_ONLY);
+    }
+
+    std::vector<tkc::CutlassGemmConfig> candidateConfigs = get_candidate_configs(mSm, SPLIT_K_LIMIT, config_type_param);
     return candidateConfigs;
 }
 

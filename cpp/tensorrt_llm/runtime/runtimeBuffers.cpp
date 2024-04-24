@@ -61,7 +61,7 @@ void RuntimeBuffers::clearTensorMaps()
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void RuntimeBuffers::create(TllmRuntime& runtime, GptModelConfig const& modelConfig, WorldConfig const& worldConfig)
+void RuntimeBuffers::create(TllmRuntime& runtime, ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto& manager = runtime.getBufferManager();
@@ -132,7 +132,7 @@ void RuntimeBuffers::initFromInput(ITensor const& inputIds, TensorPtr const& inp
 }
 
 void RuntimeBuffers::reshape(
-    KvCacheManager const* kvCacheManager, GptModelConfig const& modelConfig, WorldConfig const& worldConfig)
+    KvCacheManager const* kvCacheManager, ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -229,7 +229,7 @@ void RuntimeBuffers::reset(BufferManager& manager)
 }
 
 std::vector<RuntimeBuffers> RuntimeBuffers::split(
-    SizeType contextBatchSize, GptModelConfig const& modelConfig, WorldConfig const& worldConfig)
+    SizeType contextBatchSize, ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -300,7 +300,7 @@ std::vector<RuntimeBuffers> RuntimeBuffers::split(
 }
 
 void RuntimeBuffers::gatherLastTokenLogits(
-    BufferManager& manager, GptModelConfig const& modelConfig, WorldConfig const& worldConfig)
+    BufferManager& manager, ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK_WITH_INFO(modelConfig.computeContextLogits(),
@@ -326,7 +326,7 @@ void RuntimeBuffers::gatherLastTokenLogits(
 }
 
 void RuntimeBuffers::postContextStep(std::vector<RuntimeBuffers> const& contextBuffers, BufferManager& manager,
-    GptModelConfig const& modelConfig, WorldConfig const& worldConfig)
+    ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto const batchSize = generationConfig.batchSize;
@@ -365,7 +365,7 @@ void RuntimeBuffers::postContextStep(std::vector<RuntimeBuffers> const& contextB
 
 void RuntimeBuffers::prepareContextStep(TensorPtr const& inputIds, TokenIdType const padId, BufferManager& manager,
     batch_manager::kv_cache_manager::KVCacheManager const* kvCacheManager, SizeType firstBatchSlotIdx,
-    GptModelConfig const& modelConfig, WorldConfig const& worldConfig)
+    ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto& stream = manager.getStream();
@@ -398,7 +398,7 @@ void RuntimeBuffers::prepareContextStep(TensorPtr const& inputIds, TokenIdType c
 
 RuntimeBuffers::TensorPtr RuntimeBuffers::prepareNextStep(SizeType const step, BufferManager& manager,
     batch_manager::kv_cache_manager::KVCacheManager* kvCacheManager, SizeType firstBatchSlotIdx,
-    GptModelConfig const& modelConfig, WorldConfig const& worldConfig)
+    ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto& stream = manager.getStream();
@@ -437,7 +437,7 @@ RuntimeBuffers::TensorPtr RuntimeBuffers::prepareNextStep(SizeType const step, B
 }
 
 void RuntimeBuffers::getRuntimeBuffers(TensorMap& inputBuffers, TensorMap& outputBuffers, SizeType const step,
-    TensorPtr const& inputIds, TensorPtr const& commPtrs, GptModelConfig const& modelConfig,
+    TensorPtr const& inputIds, TensorPtr const& commPtrs, ModelConfig const& modelConfig,
     WorldConfig const& worldConfig) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);

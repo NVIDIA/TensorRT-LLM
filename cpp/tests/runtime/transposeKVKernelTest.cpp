@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 
 #include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/kernels/kvCacheIndex.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 
@@ -50,16 +51,16 @@ void randomInitVector(std::vector<T>& vec, float range)
 template void randomInitVector(std::vector<float>& vec, float scale);
 template void randomInitVector(std::vector<half>& vec, float scale);
 
-std::vector<int32_t> offsetsArrayFromPageTable(
+std::vector<KVCacheIndex> offsetsArrayFromPageTable(
     std::unordered_map<int, int> const& pageTable, int32_t batchSize, int32_t blocksPerSeq, int32_t blocksPerPool)
 {
     auto const offsetsArrayElts = pageTable.size();
-    std::vector<int32_t> offsets(2 * offsetsArrayElts);
+    std::vector<KVCacheIndex> offsets(2 * offsetsArrayElts, KVCacheIndex{0});
     for (int i = 0; i < offsetsArrayElts; ++i)
     {
         int const pageIdx = pageTable.find(i)->second;
-        auto const kOffset = pageIdx;
-        auto const vOffset = pageIdx + blocksPerPool;
+        auto const kOffset = KVCacheIndex{pageIdx};
+        auto const vOffset = KVCacheIndex{pageIdx + blocksPerPool};
         int const batchIdx = i / batchSize;
         int const seqIdx = i % blocksPerSeq;
         offsets[batchIdx * blocksPerSeq * 2 + 0 * blocksPerSeq + seqIdx] = kOffset;
