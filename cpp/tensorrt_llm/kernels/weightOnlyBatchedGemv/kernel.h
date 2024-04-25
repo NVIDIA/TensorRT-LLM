@@ -73,9 +73,11 @@ __global__ void kernel(TypeA* act, TypeA* act_scale, uint8_t* weight, TypeA* sca
         interleaved_k / Details::kElemsPerByteW);
     SHMemIterator<Mandatory, CtaN * Details::kInterleave, TypeA> scales_iterator(scales,
         (GroupSize != 0 ? real_offset_k / GroupSize * n : 0) + interleaved_offset_n * Details::kInterleave,
-        ((tid * StepK / Details::LayoutDeatils::kTileSize) % Details::kInterleave),
+        ((tid / Details::kThreadsPerInterleavedTile) % Details::kInterleave),
         (GroupSize != 0 ? CtaK / Details::kInterleave / GroupSize * n : 0), Details::kInterleave,
-        (GroupSize != 0 ? real_offset_k / GroupSize : 0));
+        (GroupSize != 0 ? real_offset_k / GroupSize : 0),
+        (GroupSize != 0 ? GroupSize / Details::kInterleave / Details::kThreadsPerInterleavedTile : CtaN * Details::kInterleave)
+        );
     GMemIterator<EnableZero, TypeA, CtaN, 1, TypeA> zeros_iterator(zeros,
         (GroupSize != 0 ? real_offset_k / GroupSize * n : 0) + real_offset_n,
         (GroupSize != 0 ? CtaK / Details::kInterleave / GroupSize * n : 0), Details::kInterleave);
@@ -98,13 +100,12 @@ __global__ void kernel(TypeA* act, TypeA* act_scale, uint8_t* weight, TypeA* sca
         TypeA vec_zero[CtaN];
         TypeA tile_a[StepK], tile_w[StepK], tile_w_pack2[CtaN * StepK];
         uint8_t tile_w_quantized[StepK / Details::kElemsPerByteW];
-
 #pragma unroll
         for (int i = 0; i < CtaN; ++i)
         {
             zeros_iterator.load(vec_zero + i, iter, i);
         }
-        scales_iterator.load(vec_scale, iter);
+        scales_iterator.load(vec_scale, iter, tid);
         act_scale_iterator.load(vec_act_scale, iter);
 #pragma unroll
         for (int i = 0; i < CtaN; ++i)
