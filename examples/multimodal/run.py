@@ -158,6 +158,7 @@ class MultimodalModelRunner:
         if post_prompt[0] is not None:
             post_input_ids = self.tokenizer(post_prompt,
                                             return_tensors="pt",
+                                            add_special_tokens=False,
                                             padding=True).input_ids
             length = pre_input_ids.shape[1] + post_input_ids.shape[
                 1] + visual_atts.shape[1]
@@ -269,7 +270,7 @@ class MultimodalModelRunner:
         if post_input_ids is not None:
             input_ids = [pre_input_ids, fake_prompt_id, post_input_ids]
         else:
-            input_ids = [fake_prompt_id, pre_input_ids]
+            input_ids = [pre_input_ids, fake_prompt_id]
         input_ids = torch.cat(input_ids, dim=1).contiguous().to(torch.int32)
 
         if self.decoder_llm or self.runtime_mapping.is_first_pp_rank():
