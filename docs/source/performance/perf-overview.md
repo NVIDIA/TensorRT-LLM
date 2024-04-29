@@ -1,5 +1,3 @@
-(perf-overview)=
-
 # Overview
 
 This document summarizes performance measurements of TensorRT-LLM on H100
