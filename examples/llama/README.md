@@ -25,6 +25,7 @@ This document shows how to build and run a LLaMA model in TensorRT-LLM on both s
   - [Run LLaMa with LoRA](#run-llama-with-lora)
     - [Run LLaMa with several lora checkpoints](#run-llama-with-several-lora-checkpoints)
   - [Run LLaMa with StreamingLLM](#run-llama-with-streamingllm)
+  - [LLaMa v3](#llama-v3)
 
 ## Overview
 
@@ -766,3 +767,20 @@ python3 ../run.py --max_output_len=50 \
 ```
 
 Note that the sink tokens is included in the sliding attention tokens, and there are at most `max_attention_window_size` tokens are stored in the KV cache.
+
+## LLaMa v3
+
+LLaMA v3 has an increased vocab size, you must pass `--vocab_size 128256` to the build script, e.g:
+
+```
+python examples/llama/build.py \
+  --model_dir /models/download/meta-llama_Meta-Llama-3-8B-Instruct \
+  --output_dir /models/meta-llama_Meta-Llama-3-8B-Instruct/tensorrt_llm/1 \
+  --dtype float16 \
+  --use_gpt_attention_plugin float16 \
+  --use_gemm_plugin float16 \
+  --enable_context_fmha \
+  --use_weight_only \
+  --use_inflight_batching \
+  --vocab_size 128256
+```
