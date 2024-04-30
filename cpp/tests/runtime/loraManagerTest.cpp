@@ -246,7 +246,7 @@ static std::tuple<std::vector<int32_t>, std::vector<int64_t>, PeftTable> createF
 
     int64_t pointerAddr = 777001;
 
-    for (size_t bid = 0; bid < configs.size(); ++bid)
+    for (int bid = 0; bid < configs.size(); ++bid)
     {
         valuesWorkspace.push_back(std::make_shared<std::vector<LoraCache::TaskLayerModuleConfig>>());
         auto beamWidth = reqBeamWidth[bid];
@@ -311,7 +311,7 @@ TEST_F(LoraManagerTest, fillInputTensors)
         LoraModule(LoraModule::ModuleType::kCROSS_ATTN_DENSE, 16, 16, false, true, 1, -1),
     };
     modelConfig.setLoraModules(modules);
-    loraManager.create(modelConfig, worldConfig, *mManager);
+    loraManager.create(modelConfig);
     auto numModules = static_cast<SizeType>(modelConfig.getLoraModules().size());
     auto numLayers = static_cast<SizeType>(modelConfig.getNbAttentionLayers());
     SizeType numSeqs = 4;

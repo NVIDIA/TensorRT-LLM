@@ -74,7 +74,7 @@ void scatterBufferReplace(ITensor::SharedPtr& tensor, SizeType beamWidth, Buffer
 
 void tileBufferReplace(ITensor::SharedPtr& tensor, SizeType beamWidth, BufferManager& manager);
 
-void tileCpuBufferReplace(ITensor::SharedPtr& tensor, SizeType beamWidth, BufferManager& manager);
+void tileCpuBufferReplace(ITensor::SharedPtr& tensor, SizeType beamWidth);
 
 } // namespace utils
 } // namespace tensorrt_llm::runtime

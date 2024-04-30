@@ -53,9 +53,9 @@ void invokeCheckTensorNanKernel(float const* data, std::size_t size, int* foundN
     checkTensorNanKernel<<<tc::ceilDiv(size, kThreadsPerCta), kThreadsPerCta, 0, stream>>>(data, size, foundNan);
 }
 
-bool tensorHasNan(IBuffer const& tensor, BufferManager& manager)
+bool tensorHasNan(IBuffer const& tensor, BufferManager const& manager)
 {
-    auto foundNan = manager.pinned(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
+    auto foundNan = BufferManager::pinned(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
     auto foundNanPtr = bufferCast<int32_t>(*foundNan);
     foundNanPtr[0] = 0;
     auto const size = tensor.getSize();

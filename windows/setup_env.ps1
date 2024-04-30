@@ -2,7 +2,7 @@
 param (
     [switch]$skipCUDA,
     [switch]$skipPython,
-    [switch]$skipMPI,
+    [switch]$skipMPI = $true,
     [switch]$skipCUDNN,
     [string]$cudaVersion #CUDA version defaults to 12.3, specify otherwise, however only 12.2 and 12.3 have uris
 )

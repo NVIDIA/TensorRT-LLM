@@ -18,6 +18,7 @@ import argparse as _arg
 import logging as _log
 import os as _os
 import pathlib as _pl
+import platform
 import subprocess as _sp
 import sys as _sys
 import typing as _tp
@@ -97,6 +98,7 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
               run_chatglm=False,
               run_medusa=False,
               run_mamba=False,
+              run_encoder=False,
               run_fp8=False,
               only_multi_gpu=False,
               trt_root: _tp.Optional[str] = None,
@@ -180,6 +182,7 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
                                 run_chatglm=run_chatglm,
                                 run_medusa=run_medusa,
                                 run_mamba=run_mamba,
+                                run_encoder=run_encoder,
                                 run_fp8=run_fp8)
 
         if build_only:
@@ -192,6 +195,7 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
                              run_chatglm=run_chatglm,
                              run_medusa=run_medusa,
                              run_mamba=run_mamba,
+                             run_encoder=run_encoder,
                              run_fp8=run_fp8,
                              timeout=test_timeout)
 
@@ -203,7 +207,7 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
         else:
             _log.info("Skipping benchmarks")
 
-    else:
+    elif platform.system() != "Windows":
         prepare_multi_gpu_model_tests(python_exe=python_exe,
                                       root_dir=root_dir,
                                       resources_dir=resources_dir,
@@ -225,6 +229,7 @@ def prepare_all_model_tests(python_exe: str,
                             run_chatglm=False,
                             run_medusa=False,
                             run_mamba=False,
+                            run_encoder=False,
                             run_fp8=False):
     model_cache_arg = ["--model_cache", model_cache] if model_cache else []
 
@@ -290,6 +295,15 @@ def prepare_all_model_tests(python_exe: str,
     else:
         _log.info("Skipping Mamba tests")
 
+    if run_encoder:
+        prepare_model_tests(model_name="enc_dec",
+                            python_exe=python_exe,
+                            root_dir=root_dir,
+                            resources_dir=resources_dir,
+                            model_cache_arg=model_cache_arg)
+    else:
+        _log.info("Skipping encoder tests")
+
 
 def prepare_multi_gpu_model_tests(python_exe: str,
                                   root_dir: _pl.Path,
@@ -327,6 +341,8 @@ def prepare_model_tests(model_name: str,
         python_exe,
         str(scripts_dir / f"generate_expected_{model_name}_output.py")
     ] + only_fp8_arg + only_multi_gpu_arg
+    if "enc_dec" in model_name:
+        generate_expected_output += model_cache_arg
     if only_multi_gpu_arg:
         generate_expected_output = [
             "mpirun", "-n", "4", "--allow-run-as-root", "--timeout", "600"
@@ -360,6 +376,7 @@ def run_unit_tests(build_dir: _pl.Path, timeout=1800):
     excluded_tests.append("ChatGlm")
     excluded_tests.append("Medusa")
     excluded_tests.append("Mamba")
+    excluded_tests.append("Encoder")
     ctest.extend(["-E", "|".join(excluded_tests)])
     run_command(ctest, cwd=build_dir, env=cpp_env, timeout=timeout)
 
@@ -371,6 +388,7 @@ def run_single_gpu_tests(build_dir: _pl.Path,
                          run_chatglm,
                          run_medusa,
                          run_mamba,
+                         run_encoder,
                          run_fp8,
                          timeout=3600):
     build_tests(build_dir=build_dir)
@@ -394,6 +412,8 @@ def run_single_gpu_tests(build_dir: _pl.Path,
         included_tests.append("Medusa")
     if run_mamba:
         included_tests.append("Mamba")
+    if run_encoder:
+        included_tests.append("EncoderModelTestSingleGPU")
 
     excluded_tests = []
     if not run_fp8:
@@ -514,6 +534,8 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
                     str(data_dir / tokens_f)
                 ]
                 run_command(benchmark, cwd=root_dir, timeout=600)
+                req_rate_benchmark = benchmark + ["--request_rate", "100"]
+                run_command(req_rate_benchmark, cwd=root_dir, timeout=600)
 
         benchmark = [
             str(benchmark_exe_dir / "gptManagerBenchmark"), "--engine_dir",
@@ -528,6 +550,15 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
             str(gpt_engine_dir / "fp16-plugin-packed-paged" / "tp1-pp1-gpu"),
             "--type", "IFB", "--dataset",
             str(data_dir / tokens_f), "--api", "gptManager", "--streaming"
+        ]
+        run_command(benchmark, cwd=root_dir, timeout=600)
+
+        benchmark = [
+            str(benchmark_exe_dir / "gptManagerBenchmark"), "--engine_dir",
+            str(gpt_engine_dir / "fp16-plugin-packed-paged" / "tp1-pp1-gpu"),
+            "--type", "IFB", "--dataset",
+            str(data_dir / tokens_f), "--api", "gptManager", "--streaming",
+            "request_rate", "100", "--enable_exp_delays"
         ]
         run_command(benchmark, cwd=root_dir, timeout=600)
 
@@ -582,6 +613,9 @@ if __name__ == "__main__":
     parser.add_argument("--run_mamba",
                         action="store_true",
                         help="Run the tests for Mamba")
+    parser.add_argument("--run_encoder",
+                        action="store_true",
+                        help="Run the tests for BART encoder")
     parser.add_argument(
         "--run_fp8",
         action="store_true",
@@ -603,6 +637,7 @@ if __name__ == "__main__":
         args.run_llama = True
         args.run_chatglm = True
         args.run_mamba = True
+        args.run_encoder = True
 
     del args.run_all_models
 

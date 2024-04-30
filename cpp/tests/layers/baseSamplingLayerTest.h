@@ -75,7 +75,7 @@ void computeProb(T* probs, T const* logits, int batchSize, int vocabSize)
     }
 }
 
-struct SamplingParams
+struct TestSamplingParams
 {
     std::vector<runtime::SizeType> topKs;
     std::vector<float> topPs;
@@ -138,23 +138,24 @@ protected:
     std::shared_ptr<tensorrt_llm::runtime::CudaStream> mStream;
     std::shared_ptr<tensorrt_llm::runtime::BufferManager> mBufferManager;
     std::shared_ptr<tensorrt_llm::common::CudaAllocator> mAllocator;
-    std::shared_ptr<tensorrt_llm::layers::BaseSamplingLayer<T>> mSamplingLayer;
+    std::shared_ptr<tensorrt_llm::layers::BaseLayer> mSamplingLayer;
 
     std::vector<T> mTestLogitsInit;
 
-    void setup(uint64_t seed, SamplingParams const& params);
+    void setup(uint64_t seed, TestSamplingParams const& params);
 
-    virtual void initLayer(SamplingParams const& params) = 0;
+    virtual void initLayer(TestSamplingParams const& params) = 0;
 
-    typename tensorrt_llm::layers::BaseSamplingLayer<T>::ForwardParams createInputTensors(int32_t step);
+    std::shared_ptr<tensorrt_llm::layers::SamplingInputParams> createInputTensors(int32_t step);
 
-    tensorrt_llm::layers::DecodingOutputParams createOutputTensors();
+    std::shared_ptr<tensorrt_llm::layers::SamplingOutputParams> createOutputTensors();
 
     void batchCopy(int32_t step);
     bool checkResult(int32_t* outputIds, std::vector<std::set<int32_t>>& expectedIds);
 
 public:
-    void runTest(std::vector<std::set<int32_t>> expectedOutputIds, SamplingParams const& params, int32_t endId = -1);
+    void runTest(
+        std::vector<std::set<int32_t>> expectedOutputIds, TestSamplingParams const& params, int32_t endId = -1);
 };
 
 typedef testing::Types<float, half> FloatAndHalfTypes;

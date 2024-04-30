@@ -28,9 +28,31 @@
 
 #include <cstdlib>
 #include <memory>
+
+#if ENABLE_MULTI_DEVICE
 #include <mpi.h>
+#else
+// Dummy defines to avoid #if in wider places.
+typedef int MPI_Datatype;
+typedef int MPI_Comm;
+typedef int MPI_Request;
+typedef int MPI_Message;
+typedef int MPI_Op;
+
+typedef struct MPI_Status
+{
+    int dummy;
+} MPI_Status;
+
+#define MPI_THREAD_SINGLE 0
+#define MPI_THREAD_FUNNELED 1
+#define MPI_THREAD_SERIALIZED 2
+#define MPI_THREAD_MULTIPLE 3
+#define MPI_COMM_WORLD ((MPI_Comm) 0x44000000)
+#define MPI_COMM_NULL ((MPI_Comm) 0x04000000)
+#endif // ENABLE_MULTI_DEVICE
+
 #include <type_traits>
-#include <unordered_map>
 #include <vector>
 
 #define MPICHECK(cmd) TLLM_MPI_CHECK(cmd)
@@ -197,8 +219,12 @@ public:
 
     void wait()
     {
+#if ENABLE_MULTI_DEVICE
         // TODO: Don't ignore return status
         MPI_Wait(&mRequest, MPI_STATUS_IGNORE);
+#else
+        TLLM_THROW("Multi device support is disabled.");
+#endif
     }
 
     MPI_Request mRequest{};
@@ -276,12 +302,16 @@ public:
         }
     }
 
+    std::shared_ptr<MpiRequest> sendAsync(void const* buffer, std::size_t size, MpiType dtype, int dest, int tag) const;
+
+    std::shared_ptr<MpiRequest> sendAsync(runtime::IBuffer const& buf, int dest, int tag) const;
+
     void send(void const* buffer, std::size_t size, MpiType dtype, int dest, int tag) const;
 
     void send(runtime::IBuffer const& buf, int dest, int tag) const;
 
     template <typename T>
-    void send(T const& value, int dest, int tag) const
+    void sendValue(T const& value, int dest, int tag) const
     {
         if constexpr (std::is_fundamental_v<std::remove_cv_t<T>>)
         {
@@ -298,8 +328,9 @@ public:
     MPI_Status recv(runtime::IBuffer& buf, int source, int tag) const;
 
     template <typename T>
-    MPI_Status recv(T& value, int source, int tag) const
+    MPI_Status recvValue(T& value, int source, int tag) const
     {
+#if ENABLE_MULTI_DEVICE
         if constexpr (std::is_fundamental_v<std::remove_cv_t<T>>)
         {
             return recv(&value, 1, MpiTypeConverter<std::remove_cv_t<T>>::value, source, tag);
@@ -308,6 +339,9 @@ public:
         {
             return recv(&value, sizeof(T), MpiType::kBYTE, source, tag);
         }
+#else
+        TLLM_THROW("Multi device support is disabled.");
+#endif
     }
 
     void allreduce(void const* sendbuf, void* recvbuf, int count, MpiType dtype, MpiOp op) const;

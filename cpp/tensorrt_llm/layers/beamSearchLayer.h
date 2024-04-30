@@ -34,71 +34,73 @@ namespace tensorrt_llm
 namespace layers
 {
 
+// BS: batch_size, lBS: local_batch_size, BM: beam_width, mSL: max_seq_length
+class BeamSearchSetupParams : public BaseSetupParams
+{
+public:
+    std::optional<std::vector<float>> beam_search_diversity_rate; // [BS] on cpu
+    std::optional<std::vector<float>> length_penalty;             // [BS] on cpu
+    std::optional<std::vector<int>> early_stopping;               // [BS] on cpu
+};
+
+class BeamSearchInputParams : public BaseInputParams
+{
+public:
+    explicit BeamSearchInputParams(runtime::SizeType step, runtime::SizeType ite, tc::Tensor logits, tc::Tensor endIds,
+        tc::Tensor src_cache_indirection, runtime::SizeType max_attention_window, runtime::SizeType sink_token_length,
+        runtime::SizeType max_seq_len)
+        : BaseInputParams(step, ite, std::move(endIds))
+        , logits{std::move(logits)}
+        , max_attention_window{max_attention_window}
+        , sink_token_length{sink_token_length}
+        , max_seq_len{max_seq_len}
+        , src_cache_indirection{std::move(src_cache_indirection)}
+    {
+    }
+
+    // mandatory parameters
+    tc::Tensor logits; // [maxBatchSize, beamWidth, vocabSizePadded]
+    runtime::SizeType max_attention_window;
+    runtime::SizeType sink_token_length;
+    runtime::SizeType max_seq_len;
+    tc::Tensor src_cache_indirection;        // [BS, BM, mSL]
+    std::optional<tc::Tensor> input_lengths; // [BS, BM]
+};
+
+class BeamSearchOutputParams : public BaseOutputParams
+{
+public:
+    explicit BeamSearchOutputParams(tc::Tensor outputIds, tc::Tensor parentIds, tc::Tensor tgt_cache_indirection)
+        : BaseOutputParams{std::move(outputIds)}
+        , parent_ids{std::move(parentIds)}
+        , tgt_cache_indirection{std::move(tgt_cache_indirection)}
+    {
+    }
+
+    std::shared_ptr<kernels::BeamHypotheses> beamHypotheses;
+    tc::Tensor parent_ids;            // [BS, BM, mSL]
+    tc::Tensor tgt_cache_indirection; // [BS, BM, mSL]
+    tc::Tensor parent_ids_ptr;        // [BS][BM, mSL]
+};
+
 template <typename T>
 class BeamSearchLayer : public BaseLayer
 {
+    using Base = BaseLayer;
+
 public:
-    // BS: batch_size, lBS: local_batch_size, BM: beam_width, mSL: max_seq_length
-    class SetupParams : public DecodingSetupParams
-    {
-    public:
-        std::optional<std::vector<float>> beam_search_diversity_rate; // [BS] on cpu
-        std::optional<std::vector<float>> length_penalty;             // [BS] on cpu
-        std::optional<std::vector<int>> early_stopping;               // [BS] on cpu
-    };
-
-    class ForwardParams : public DecodingParams
-    {
-    public:
-        explicit ForwardParams(runtime::SizeType step, runtime::SizeType ite, tc::Tensor logits, tc::Tensor endIds,
-            tc::Tensor src_cache_indirection, runtime::SizeType max_attention_window,
-            runtime::SizeType sink_token_length, runtime::SizeType max_seq_len)
-            : DecodingParams(step, ite, std::move(logits), std::move(endIds))
-            , src_cache_indirection{std::move(src_cache_indirection)}
-            , max_attention_window{max_attention_window}
-            , sink_token_length{sink_token_length}
-            , max_seq_len{max_seq_len}
-        {
-        }
-
-        // mandatory parameters
-        runtime::SizeType max_attention_window;
-        runtime::SizeType sink_token_length;
-        runtime::SizeType max_seq_len;
-        std::optional<tc::Tensor> input_lengths; // [BS, BM]
-        tc::Tensor src_cache_indirection;        // [BS, BM, mSL]
-    };
-
-    class OutputParams : public DecodingOutputParams
-    {
-    public:
-        explicit OutputParams(tc::Tensor outputIds, tc::Tensor parentIds, tc::Tensor tgt_cache_indirection)
-            : DecodingOutputParams{std::move(outputIds)}
-            , parent_ids{std::move(parentIds)}
-            , tgt_cache_indirection{std::move(tgt_cache_indirection)}
-        {
-        }
-
-        std::shared_ptr<kernels::BeamHypotheses> beamHypotheses;
-        tc::Tensor parent_ids;            // [BS, BM, mSL]
-        tc::Tensor tgt_cache_indirection; // [BS, BM, mSL]
-        tc::Tensor parent_ids_ptr;        // [BS][BM, mSL]
-    };
-
-    BeamSearchLayer(runtime::SizeType const vocab_size, runtime::SizeType const vocab_size_padded, cudaStream_t stream,
-        std::shared_ptr<tc::IAllocator> allocator);
-
-    BeamSearchLayer(BeamSearchLayer<T> const& beam_search_layer);
+    BeamSearchLayer(DecoderDomain const& decoderDomain, cudaStream_t stream, std::shared_ptr<tc::IAllocator> allocator);
 
     ~BeamSearchLayer() override;
 
-    void setup(runtime::SizeType const batch_size, runtime::SizeType const beam_width, SetupParams const& setupParams);
+    void setup(runtime::SizeType const batch_size, runtime::SizeType const beamWidth,
+        runtime::SizeType const* batchSlots, std::shared_ptr<BaseSetupParams> setupParams) override;
 
-    void forward(OutputParams& outputs, ForwardParams const& params);
+    void forward(std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs) override;
 
-protected:
-    using BaseLayer::mAllocator;
-    using BaseLayer::mStream;
+private:
+    using Base::mAllocator;
+    using Base::mStream;
 
     bool mIsAllocateBuffer;
     runtime::SizeType mVocabSize{0};
@@ -113,7 +115,6 @@ protected:
     std::vector<float> mLengthPenaltyHost;
     std::vector<int> mEarlyStoppingHost;
 
-private:
     void allocateBuffer(runtime::SizeType const batch_size, runtime::SizeType const beam_width);
     void freeBuffer();
 };

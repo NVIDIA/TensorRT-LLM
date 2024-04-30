@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/logger.h"
 #include <NvInferRuntime.h>
 
 namespace tensorrt_llm::common
@@ -34,6 +35,10 @@ constexpr static size_t getDTypeSize(nvinfer1::DataType type)
     case nvinfer1::DataType::kUINT8: [[fallthrough]];
     case nvinfer1::DataType::kINT8: [[fallthrough]];
     case nvinfer1::DataType::kFP8: return 1;
+#if NV_TENSORRT_MAJOR >= 10
+    case nvinfer1::DataType::kINT4: TLLM_THROW("Cannot determine size of INT4 data type");
+#endif
+    default: return 0;
     }
     return 0;
 }

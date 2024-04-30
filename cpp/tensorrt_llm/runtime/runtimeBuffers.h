@@ -110,13 +110,13 @@ public:
     void clear();
     void clearTensorMaps();
 
-    void create(TllmRuntime& runtime, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
+    void create(TllmRuntime const& runtime, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
     void initFromInput(ITensor const& inputIds, TensorPtr const& inputLengths, bool inputPacked, SizeType beamWidth,
         SizeType maxAttentionWindow, SizeType sinkTokenLength, SizeType maxSequenceLength, BufferManager& manager);
 
     //! \brief Reshape buffers based on current GenerationConfig
-    void reshape(KvCacheManager const* kvCacheManager, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
+    void reshape(ModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
     void reset(BufferManager& manager);
 

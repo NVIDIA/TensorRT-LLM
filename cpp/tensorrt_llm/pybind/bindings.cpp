@@ -68,6 +68,9 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
     tpr::GenerationInput::initBindings(m);
     tpr::GenerationOutput::initBindings(m);
 
+    auto buildInfo = m.def_submodule("BuildInfo");
+    buildInfo.attr("ENABLE_MULTI_DEVICE") = py::int_(ENABLE_MULTI_DEVICE);
+
     auto kvCacheConfigGetstate = [](tbk::KvCacheConfig const& config)
     {
         return py::make_tuple(config.maxTokens, config.maxAttentionWindow, config.sinkTokenLength,
@@ -292,9 +295,9 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def("__eq__", &tr::SamplingConfig::operator==);
 
     py::class_<tr::GptJsonConfig>(m, "GptJsonConfig")
-        .def(py::init<std::string, std::string, std::string, SizeType, SizeType, tr::ModelConfig>(), py::arg("name"),
-            py::arg("version"), py::arg("precision"), py::arg("tensor_parallelism"), py::arg("pipeline_parallelism"),
-            py::arg("model_config"))
+        .def(py::init<std::string, std::string, std::string, SizeType, SizeType, SizeType, tr::ModelConfig>(),
+            py::arg("name"), py::arg("version"), py::arg("precision"), py::arg("tensor_parallelism"),
+            py::arg("pipeline_parallelism"), py::arg("gpus_per_node"), py::arg("model_config"))
         .def_static("parse", py::overload_cast<std::string const&>(&tr::GptJsonConfig::parse), py::arg("json"))
         .def_static(
             "parse_file", py::overload_cast<std::filesystem::path const&>(&tr::GptJsonConfig::parse), py::arg("path"))
@@ -304,6 +307,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property_readonly("precision", &tr::GptJsonConfig::getPrecision)
         .def_property_readonly("tensor_parallelism", &tr::GptJsonConfig::getTensorParallelism)
         .def_property_readonly("pipeline_parallelism", &tr::GptJsonConfig::getPipelineParallelism)
+        .def_property_readonly("gpus_per_node", &tr::GptJsonConfig::getGpusPerNode)
         .def_property_readonly("world_size", &tr::GptJsonConfig::getWorldSize)
         .def("engine_filename",
             py::overload_cast<tr::WorldConfig const&, std::string const&>(
@@ -338,7 +342,9 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .value("REQUEST_STATE_UNKNOWN", tb::LlmRequestState_t::REQUEST_STATE_UNKNOWN)
         .value("REQUEST_STATE_CONTEXT_INIT", tb::LlmRequestState_t::REQUEST_STATE_CONTEXT_INIT)
         .value("REQUEST_STATE_GENERATION_IN_PROGRESS", tb::LlmRequestState_t::REQUEST_STATE_GENERATION_IN_PROGRESS)
-        .value("REQUEST_STATE_GENERATION_COMPLETE", tb::LlmRequestState_t::REQUEST_STATE_GENERATION_COMPLETE);
+        .value("REQUEST_STATE_GENERATION_TO_COMPLETE", tb::LlmRequestState_t::REQUEST_STATE_GENERATION_TO_COMPLETE)
+        .value("REQUEST_STATE_GENERATION_COMPLETE", tb::LlmRequestState_t::REQUEST_STATE_GENERATION_COMPLETE)
+        .value("REQUEST_STATE_ENC_INIT", tb::LlmRequestState_t::REQUEST_STATE_ENC_INIT);
 
     tpb::NamedTensor::initBindings(m);
     tpb::LlmRequest::initBindings(m);

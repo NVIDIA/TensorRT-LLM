@@ -478,6 +478,12 @@ class ModelRunner(ModelRunnerMixin):
                 pretrained_config, 'num_medusa_heads') else 0,
             use_custom_all_reduce=build_config.plugin_config.
             use_custom_all_reduce,
+            conv_kernel=pretrained_config.conv_kernel if hasattr(
+                pretrained_config, 'conv_kernel') else 0,
+            layer_types=pretrained_config.layer_types if hasattr(
+                pretrained_config, 'layer_types') else [],
+            rnn_hidden_size=pretrained_config.rnn_hidden_size if hasattr(
+                pretrained_config, 'rnn_hidden_size') else 0,
         )
         max_batch_size = build_config.max_batch_size
         max_input_len = build_config.max_input_len

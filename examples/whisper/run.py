@@ -38,7 +38,7 @@ from tensorrt_llm.runtime.session import Session, TensorInfo
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--log_level', type=str, default='error')
+    parser.add_argument('--log_level', type=str, default='warning')
     parser.add_argument('--engine_dir', type=str, default='whisper_outputs')
     parser.add_argument('--results_dir', type=str, default='tmp')
     parser.add_argument('--assets_dir', type=str, default=None)

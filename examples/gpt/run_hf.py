@@ -26,7 +26,7 @@ import tensorrt_llm
 def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument('--max_output_len', type=int, required=True)
-    parser.add_argument('--log_level', type=str, default='error')
+    parser.add_argument('--log_level', type=str, default='warning')
     parser.add_argument('--model_dir', type=str, default='gpt2')
     parser.add_argument('--data_type',
                         type=str,

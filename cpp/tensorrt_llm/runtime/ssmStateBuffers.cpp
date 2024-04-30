@@ -246,7 +246,7 @@ void SsmStateBuffers::tile(RuntimeBuffers* runtimeBuffers, BufferManager& manage
     }
 
     utils::tileBufferReplace(contextLengthsDevice, beamWidth, manager);
-    utils::tileCpuBufferReplace(contextLengthsHost, beamWidth, manager);
+    utils::tileCpuBufferReplace(contextLengthsHost, beamWidth);
 
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }

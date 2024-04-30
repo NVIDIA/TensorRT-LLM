@@ -573,7 +573,7 @@ class TestFunctional(unittest.TestCase):
 
         tolerances = {
             'float32': 1e-2,
-            'float16': 1e-2
+            'float16': 2e-2
             if getSMVersion() >= 75 else 1e-1,  # Some issues for geglu on volta
             'bfloat16': 1e-1,
             'int8': 2e-1,

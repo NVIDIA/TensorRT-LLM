@@ -150,8 +150,10 @@ class ModelRunnerCpp(ModelRunnerMixin):
 
         tp_size = json_config.tensor_parallelism
         pp_size = json_config.pipeline_parallelism
+        gpus_per_node = json_config.gpus_per_node
         world_config = WorldConfig.mpi(tensor_parallelism=tp_size,
-                                       pipeline_parallelism=pp_size)
+                                       pipeline_parallelism=pp_size,
+                                       gpus_per_node=gpus_per_node)
         assert rank == world_config.rank
         engine_filename = json_config.engine_filename(world_config)
         serialize_path = Path(engine_dir) / engine_filename

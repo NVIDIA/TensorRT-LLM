@@ -4,7 +4,6 @@ build
 colored
 cuda-python==12.3.0
 diffusers==0.27.0
-mpi4py
 numpy<2
 onnx>=1.12.0
 polygraphy
@@ -18,7 +17,7 @@ StrEnum
 sentencepiece>=0.1.99
 # WAR the new posting of "nvidia-cudnn-cu12~=9.0".
 # "tensorrt==9.3.0.post12.dev1" specifies "nvidia-cudnn-cu12" but actually requires "nvidia-cudnn-cu12~=8.9".
-nvidia-cudnn-cu12~=8.9; platform_machine == "x86_64"
+nvidia-cudnn-cu12~=8.9; platform_machine == "AMD64"
 tensorrt==9.3.0.post12.dev1
 tokenizers>=0.14
 # Default torch is CPU-only on Windows, so need to specify a torch version with GPU support

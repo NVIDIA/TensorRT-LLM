@@ -51,6 +51,13 @@ public:
     using Shape = nvinfer1::Dims;
     using DimType = std::remove_reference_t<decltype(Shape::d[0])>;
 
+#ifdef TRT_LLM_USE_DIM64
+    static_assert(
+        std::is_same_v<DimType, std::int64_t>, "TRT_LLM_USE_DIM64 must be defined when TRT uses int64 as DimType");
+#else
+    static_assert(
+        std::is_same_v<DimType, std::int32_t>, "TRT_LLM_USE_DIM64 must be undefined when TRT uses int32 as DimType");
+#endif
     ~ITensor() override = default;
 
     //!
@@ -231,7 +238,7 @@ public:
     //!
     //! \brief A convenience function to create a tensor shape with the given dimensions.
     //!
-    static Shape makeShape(std::initializer_list<SizeType> const& dims);
+    static Shape makeShape(std::initializer_list<DimType> const& dims);
 
     //!
     //! \brief A convenience function for converting a tensor shape to a `string`.

@@ -128,7 +128,7 @@ int RecvPlugin::initialize() noexcept
         return 0;
     }
     ncclUniqueId id;
-    COMM_SESSION.recv(id, mSrcRank, 0);
+    COMM_SESSION.recvValue(id, mSrcRank, 0);
     NCCLCHECK(ncclCommInitRank(&mComm, 2, id, 1));
     return 0;
 }

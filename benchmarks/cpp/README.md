@@ -67,7 +67,7 @@ If you want to get the logits, you could run gptSessionBenchmark with `--print_a
 
 #### Prepare dataset
 
-Run a preprocessing script to prepare/generate dataset into a json that gptManagerBenchmark can consume later. The processed output json has *input token ids, output tokens length and time delays* to control request rate by gptManagerBenchmark.
+Run a preprocessing script to prepare/generate dataset into a json that gptManagerBenchmark can consume later. The processed output json has *input tokens length, input token ids and output tokens length*
 
 This tool can be used in 2 different modes of traffic generation.
 
@@ -79,8 +79,6 @@ The tool will tokenize the words and instruct the model to generate a specified 
 python3 prepare_dataset.py \
     --tokenizer <path/to/tokenizer> \
     --output preprocessed_dataset.json
-    [--request-rate 10] \
-    [--time-delay-dist exponential_dist] \
     dataset
     --dataset-name <name of the dataset> \
     --dataset-split <split of the dataset to use> \
@@ -118,8 +116,6 @@ For example, setting mean=100 and std dev=10 would generate requests where 95.4%
 ```
 python prepare_dataset.py \
   --output token-norm-dist.json \
-  --request-rate 10 \
-  --time-delay-dist constant \
   --tokenizer <path/to/tokenizer> \
    token-norm-dist \
    --num-requests 100 \
@@ -148,6 +144,7 @@ Take GPT-350M as an example for single GPU V1 batching
 ./benchmarks/gptManagerBenchmark \
     --engine_dir ../../examples/gpt/trt_engine/gpt2/fp16/1-gpu/ \
     --type V1 \
+    --request_rate 10 \
     --dataset ../../benchmarks/cpp/preprocessed_dataset.json
     --max_num_samples 500
 ```
@@ -157,6 +154,7 @@ Take GPT-350M as an example for 2-GPU inflight batching
 mpirun -n 2 ./benchmarks/gptManagerBenchmark \
     --engine_dir ../../examples/gpt/trt_engine/gpt2-ib/fp16/2-gpu/ \
     --type IFB \
+    --request_rate 10 \
     --dataset ../../benchmarks/cpp/preprocessed_dataset.json
     --max_num_samples 500
 ```

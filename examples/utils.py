@@ -89,7 +89,7 @@ def load_tokenizer(tokenizer_dir: Optional[str] = None,
                                                   trust_remote_code=True,
                                                   tokenizer_type=tokenizer_type,
                                                   use_fast=use_fast)
-    elif model_name == 'GemmaForCausalLM':
+    elif model_name == 'GemmaForCausalLM' or model_name == 'RecurrentGemmaForCausalLM':
         from transformers import GemmaTokenizer
 
         # Initialize tokenizer from vocab file.

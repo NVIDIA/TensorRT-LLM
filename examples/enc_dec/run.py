@@ -21,6 +21,7 @@ from pathlib import Path
 import torch
 import tensorrt as trt
 # isort: on
+import numpy as np
 from transformers import (AutoConfig, AutoModelForSeq2SeqLM, AutoTokenizer,
                           BartForConditionalGeneration,
                           MBartForConditionalGeneration,
@@ -90,6 +91,9 @@ def read_config(config_path: Path):
     use_custom_all_reduce = plugin_config.get('use_custom_all_reduce', False)
     dtype = pretrained_config["dtype"]
 
+    paged_kv_cache = plugin_config['paged_kv_cache']
+    tokens_per_block = plugin_config['tokens_per_block']
+
     gather_context_logits = builder_config.get('gather_context_logits', False)
     gather_generation_logits = builder_config.get('gather_generation_logits',
                                                   False)
@@ -107,6 +111,8 @@ def read_config(config_path: Path):
         num_layers=num_layers,
         gpt_attention_plugin=use_gpt_attention_plugin,
         remove_input_padding=remove_input_padding,
+        paged_kv_cache=paged_kv_cache,
+        tokens_per_block=tokens_per_block,
         cross_attention=cross_attention,
         has_position_embedding=has_position_embedding,
         has_token_type_embedding=has_token_type_embedding,
@@ -147,6 +153,11 @@ def parse_arguments():
                         action='store_true')
     parser.add_argument('--lora_dir', type=str, default=None, nargs="+")
     parser.add_argument('--lora_task_uids', type=str, default=None, nargs="+")
+    parser.add_argument(
+        "--output_encoder_npy",
+        help=
+        "Store tensors like encoder outputs used for testing enc-dec C++ runtime.",
+        action="store_true")
     return parser.parse_args()
 
 
@@ -501,23 +512,22 @@ class TRTLLMEncDecModel:
 
         return encoder_output
 
-    def generate(
-        self,
-        encoder_input_ids,
-        decoder_input_ids,
-        max_new_tokens,
-        num_beams=1,
-        pad_token_id=None,
-        eos_token_id=None,
-        bos_token_id=None,
-        debug_mode=False,
-        return_dict=False,
-        prompt_embedding_table=None,
-        prompt_tasks=None,
-        prompt_vocab_size=None,
-        attention_mask=None,
-        time_encoder=False,
-    ):
+    def generate(self,
+                 encoder_input_ids,
+                 decoder_input_ids,
+                 max_new_tokens,
+                 num_beams=1,
+                 pad_token_id=None,
+                 eos_token_id=None,
+                 bos_token_id=None,
+                 debug_mode=False,
+                 return_dict=False,
+                 prompt_embedding_table=None,
+                 prompt_tasks=None,
+                 prompt_vocab_size=None,
+                 attention_mask=None,
+                 time_encoder=False,
+                 return_encoder_output=False):
         ## ensure all externally provided tensors are on the correct device.
         encoder_input_ids = encoder_input_ids.to(self.device)
         decoder_input_ids = decoder_input_ids.to(self.device)
@@ -602,7 +612,8 @@ class TRTLLMEncDecModel:
             encoder_input_lengths=encoder_input_lengths,
             return_dict=return_dict,
             cross_attention_mask=cross_attention_mask)
-
+        if return_encoder_output:
+            return output, encoder_output
         return output
 
 
@@ -666,6 +677,7 @@ def test_fairseq_models(args):
         debug_mode=args.debug_mode,
     )
     tok = time.time()
+    torch.cuda.synchronize()
 
     if return_dict:
         tllm_output_ids = tllm_output['output_ids']
@@ -716,6 +728,19 @@ if __name__ == "__main__":
             "During its construction, the Eiffel Tower surpassed the Washington Monument to become the tallest man-made structure in the world",
         ]
 
+    # TRT-LLM runtime
+    tllm_model = TRTLLMEncDecModel.from_engine(args.engine_name,
+                                               args.engine_dir,
+                                               args.lora_dir,
+                                               args.lora_task_uids,
+                                               debug_mode=args.debug_mode)
+
+    inference_dtype = tllm_model.encoder_model_config.dtype
+    if inference_dtype == 'float32':
+        input_text.append(
+            "Summarize this article in one sentence.\n\nKristine Watts (Molie Weeks) is broken apart, missing her lover; she is not able to overcome her love for him that is lost in the past. She hires a stranger (Douglas Davis) and gives a list of her mistakes to him with things to fix. But time is irreversible and sometimes the cure for the pain is a tragic end.\n\nThe first point that impresses in \"The Cure\" is the stylish cinematography that alternates black and white with color. The concise and sharp screenplay is capable to develop a tragic and bleak tale of love with an unexpected plot point in the very end in less than eight minutes. The soundtrack is beautiful but the volume is a little loud and associated to the fact that English is not my native language, in some moments I needed to repeat some words whispered by the narrator. The unknown lead actress has magnificent performance and is extremely gorgeous. I hope to have a chance to see her again on the screen. Last but not the least, the debut of the director and writer Ryan Jafri could not be better. My vote is nine.\n\nTitle (Brazil): Not Available",
+        )
+
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name)  # TODO: use model path instead
     tokenized_inputs = tokenizer(input_text, return_tensors="pt", padding=True)
@@ -725,7 +750,21 @@ if __name__ == "__main__":
         'cuda')  # [batch_size, padded_length]
     # by default int64, must cast to int32! otherwise C++ kernel will interpret as [a, 0, b, 0, c, 0, ...]
 
+    CPP_RESULTS_SAVED_DIR = 'cpp/tests/resources/data/enc_dec'
     if tensorrt_llm.mpi_rank() == 0:
+        if args.output_encoder_npy:
+            if not os.path.isdir(CPP_RESULTS_SAVED_DIR):
+                os.mkdir(os.path.join(CPP_RESULTS_SAVED_DIR))
+            np_input_ids = tokenized_inputs.input_ids.type(torch.IntTensor)
+            np_input_ids = np_input_ids.numpy()
+            np.save(os.path.join(CPP_RESULTS_SAVED_DIR, 'enc_input_ids.npy'),
+                    np_input_ids)
+            input_lengths = tokenized_inputs.attention_mask.sum(dim=1).type(
+                torch.IntTensor).numpy()
+            np.save(
+                os.path.join(CPP_RESULTS_SAVED_DIR, 'enc_input_lengths.npy'),
+                input_lengths)
+
         print("--------------------------------------")
         print(
             f"BOS={tokenizer.bos_token_id}, PAD={tokenizer.pad_token_id}, EOS={tokenizer.eos_token_id}"
@@ -800,13 +839,6 @@ if __name__ == "__main__":
             print(f"HF E2E time {(tok-tik)*1000}ms")
             print("--------------------------------------")
 
-    # TRT-LLM runtime
-    tllm_model = TRTLLMEncDecModel.from_engine(args.engine_name,
-                                               args.engine_dir,
-                                               args.lora_dir,
-                                               args.lora_task_uids,
-                                               debug_mode=args.debug_mode)
-
     return_dict = False  # when set return_dict=True, get outputs by key
     tik = time.time()
     tllm_output = tllm_model.generate(
@@ -820,15 +852,20 @@ if __name__ == "__main__":
         debug_mode=args.debug_mode,
         return_dict=return_dict,
         attention_mask=tokenized_inputs.attention_mask,
-        time_encoder=True)
+        time_encoder=True,
+        return_encoder_output=args.output_encoder_npy
+        and tensorrt_llm.mpi_rank() == 0)
     tok = time.time()
+    if args.output_encoder_npy and tensorrt_llm.mpi_rank() == 0:
+        tllm_output, encoder_output = tllm_output
+        encoder_output = encoder_output.cpu().numpy()
+        np.save(os.path.join(CPP_RESULTS_SAVED_DIR, 'encoder_output.npy'),
+                encoder_output)
 
     if return_dict:
         tllm_output_ids = tllm_output['output_ids']
     else:
         tllm_output_ids = tllm_output
-
-    inference_dtype = tllm_model.encoder_model_config.dtype
 
     if tensorrt_llm.mpi_rank() == 0:
         output_ids = tllm_output_ids[:, 0, :]
@@ -858,7 +895,9 @@ if __name__ == "__main__":
                 print(
                     f"[CAVEAT] Comparing TRT-LLM {inference_dtype} results with HF float32 results. Close match are not expected!"
                 )
-            assert match_rate > 0.8, f"Incorrect results! Match rate {match_rate}"
+                assert match_rate > 0.8, f"Incorrect results! Match rate {match_rate}"
+            else:
+                assert match_rate > 0.95, f"Incorrect results! Match rate {match_rate}"
             print(
                 f"TRT-LLM results match HF FP32 results with literal match rate {match_rate}"
             )

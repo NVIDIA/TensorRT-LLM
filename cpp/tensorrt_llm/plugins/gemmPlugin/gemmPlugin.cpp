@@ -16,6 +16,7 @@
  */
 #include "gemmPlugin.h"
 #include "plugin.h"
+#include "tensorrt_llm/runtime/iTensor.h"
 #include <NvInferRuntimeBase.h>
 
 using namespace nvinfer1;
@@ -290,7 +291,7 @@ bool GemmPlugin::supportsFormatCombination(
     return desc.type == mType || desc.type == nvinfer1::DataType::kFLOAT;
 }
 
-int32_t computeMDimension(bool transA, const int32_t nbDims, int32_t const* dims)
+int32_t computeMDimension(bool transA, const int32_t nbDims, tensorrt_llm::runtime::ITensor::DimType const* dims)
 {
     int32_t M = 1;
     if (transA)
@@ -310,7 +311,7 @@ int32_t computeMDimension(bool transA, const int32_t nbDims, int32_t const* dims
     return M;
 }
 
-int32_t computeNDimension(bool transB, const int32_t nbDims, int32_t const* dims)
+int32_t computeNDimension(bool transB, const int32_t nbDims, tensorrt_llm::runtime::ITensor::DimType const* dims)
 {
     int32_t N = 1;
     if (transB)
@@ -343,7 +344,7 @@ void GemmPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, in
 
     if (!mDims.isInitialized())
     {
-        mDims = {minM, maxM, N, K};
+        mDims = {minM, maxM, N, static_cast<runtime::SizeType>(K)};
     }
     mGemmId.n = N;
     mGemmId.k = K;

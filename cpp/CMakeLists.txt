@@ -222,20 +222,41 @@ if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "11.8")
   )
 endif()
 
-# MPI MPI isn't used until tensorrt_llm/CMakeLists.txt is invoked. However, if
-# it's not called before "CMAKE_CXX_FLAGS" is set, it breaks on Windows for some
-# reason, so we just call it here as a workaround.
-find_package(MPI REQUIRED)
-add_definitions("-DOMPI_SKIP_MPICXX")
+if(ENABLE_MULTI_DEVICE)
+  # MPI MPI isn't used until tensorrt_llm/CMakeLists.txt is invoked. However, if
+  # it's not called before "CMAKE_CXX_FLAGS" is set, it breaks on Windows for
+  # some reason, so we just call it here as a workaround.
+  find_package(MPI REQUIRED)
+  add_definitions("-DOMPI_SKIP_MPICXX")
+endif()
 
 # C++17
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_CUDA_STANDARD ${CMAKE_CXX_STANDARD})
+
+if(UNIX)
+  set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -Og")
+endif()
+
+# Note: The following are desirable settings that should be enabled if we
+# decrease shared library size. See e.g.
+# https://github.com/rapidsai/cudf/pull/6134 for a similar issue in another
+# project. set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO
+# "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO} --generate-line-info")
+# set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -G")
 
 set(CMAKE_CXX_FLAGS
     "${CMAKE_CXX_FLAGS} -DBUILD_SYSTEM=cmake_oss -DENABLE_MULTI_DEVICE=${ENABLE_MULTI_DEVICE}"
 )
+
+# Fix linking issue with TRT 10, the detailed description about `--mcmodel` can
+# be found in
+# https://gcc.gnu.org/onlinedocs/gcc/x86-Options.html#index-mcmodel_003dmedium-1
+if(CMAKE_SYSTEM_PROCESSOR STREQUAL x86_64)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mcmodel=medium  -Wl,--no-relax")
+endif()
 
 # Disable deprecated declarations warnings
 if(NOT WIN32)
@@ -243,7 +264,17 @@ if(NOT WIN32)
 else()
   # /wd4996 is the Windows equivalent to turn off warnings for deprecated
   # declarations
-  set(CMAKE_CXX_FLAGS "/wd4996 ${CMAKE_CXX_FLAGS}")
+
+  # /wd4505
+  # https://learn.microsoft.com/en-us/cpp/overview/cpp-conformance-improvements-2019?view=msvc-170#warning-for-unused-internal-linkage-functions
+  # "warning C4505: <>: unreferenced function with internal linkage has been
+  # removed"
+
+  # /wd4100
+  # https://learn.microsoft.com/en-us/cpp/error-messages/compiler-warnings/compiler-warning-level-4-c4100?view=msvc-170
+  # warning C4100: 'c': unreferenced formal parameter
+
+  set(CMAKE_CXX_FLAGS "/wd4996 /wd4505 /wd4100 ${CMAKE_CXX_FLAGS}")
 endif()
 
 # A Windows header file defines max() and min() macros, which break our macro
@@ -392,6 +423,12 @@ message(
   STATUS
     "Building for TensorRT version: ${TRT_VERSION}, library version: ${TRT_SOVERSION}"
 )
+
+if(${TRT_MAJOR} GREATER_EQUAL 10)
+  add_definitions("-DTRT_LLM_USE_DIM64")
+  message(
+    STATUS "TensorRT version ${TRT_MAJOR} >= 10, int64 dimension is enabled")
+endif()
 
 list(APPEND COMMON_HEADER_DIRS)
 include_directories(${COMMON_HEADER_DIRS})

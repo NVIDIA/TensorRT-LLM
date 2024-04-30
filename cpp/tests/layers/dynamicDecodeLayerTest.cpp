@@ -112,14 +112,10 @@ void DynamicDecodeLayerTest<T>::SetUp()
     mBufferManager = std::make_shared<tensorrt_llm::runtime::BufferManager>(mStream);
 
     mAllocator = std::make_shared<tensorrt_llm::common::CudaAllocator>(*mBufferManager);
-
-    int device;
-    cudaGetDevice(&device);
-    cudaGetDeviceProperties(&mDeviceProp, device);
 }
 
 template <typename T>
-void DynamicDecodeLayerTest<T>::allocateData(SamplingParams const& params)
+void DynamicDecodeLayerTest<T>::allocateData(TestSamplingParams const& params)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -142,9 +138,11 @@ void DynamicDecodeLayerTest<T>::allocateData(SamplingParams const& params)
         }
     }();
 
-    mDecodeLayer = std::make_shared<tensorrt_llm::layers::DynamicDecodeLayer<T>>(decodingMode, mMaxBatchSize,
-        mBeamWidth, mVocabSize, mVocabSizePadded, mStream->get(), mAllocator, &mDeviceProp, mMaxTokensPerStep,
-        params.maxNumMedusaHeads);
+    auto const decodingDomain = tensorrt_llm::layers::DecoderDomain(
+        mMaxBatchSize, mBeamWidth, mVocabSize, mVocabSizePadded, mMaxTokensPerStep, params.maxNumMedusaHeads);
+
+    mDecodeLayer = std::make_unique<tensorrt_llm::layers::DynamicDecodeLayer<T>>(
+        decodingMode, decodingDomain, mStream->get(), mAllocator);
 
     auto const dataType = TRTDataType<T>::value;
 
@@ -200,7 +198,7 @@ void DynamicDecodeLayerTest<T>::allocateData(SamplingParams const& params)
 }
 
 template <typename T>
-void DynamicDecodeLayerTest<T>::allocateMedusaData(SamplingParams const& params)
+void DynamicDecodeLayerTest<T>::allocateMedusaData(TestSamplingParams const& params)
 {
     auto const dataType = TRTDataType<T>::value;
     mMaxMedusaHeads = params.maxNumMedusaHeads.value();
@@ -221,7 +219,7 @@ void DynamicDecodeLayerTest<T>::allocateMedusaData(SamplingParams const& params)
 }
 
 template <typename T>
-void DynamicDecodeLayerTest<T>::setup(uint64_t seed, SamplingParams const& params)
+void DynamicDecodeLayerTest<T>::setup(uint64_t seed, TestSamplingParams const& params)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -328,33 +326,34 @@ void DynamicDecodeLayerTest<T>::setup(uint64_t seed, SamplingParams const& param
         }
     }
 
-    typename DynamicDecodeLayer<T>::SetupParams setupParams;
-    setupParams.randomSeed = std::make_optional<std::vector<uint64_t>>({seed});
-    setupParams.temperature
+    auto setupParams = std::make_shared<DynamicDecodeSetupParams>();
+    setupParams->penaltyParams.temperature
         = params.temperatures.size() ? std::make_optional<std::vector<float>>(params.temperatures) : std::nullopt;
-    setupParams.runtime_top_k
-        = params.topKs.size() ? std::make_optional<std::vector<SizeType>>(params.topKs) : std::nullopt;
-    setupParams.runtime_top_p
-        = params.topPs.size() ? std::make_optional<std::vector<float>>(params.topPs) : std::nullopt;
-    setupParams.repetition_penalty = params.repetitionPenalties.size()
+    setupParams->penaltyParams.repetitionPenalty = params.repetitionPenalties.size()
         ? std::make_optional<std::vector<float>>(params.repetitionPenalties)
         : std::nullopt;
-    setupParams.presence_penalty = params.presencePenalties.size()
+    setupParams->penaltyParams.presencePenalty = params.presencePenalties.size()
         ? std::make_optional<std::vector<float>>(params.presencePenalties)
         : std::nullopt;
-    setupParams.frequency_penalty = params.frequencyPenalties.size()
+    setupParams->penaltyParams.frequencyPenalty = params.frequencyPenalties.size()
         ? std::make_optional<std::vector<float>>(params.frequencyPenalties)
         : std::nullopt;
-    setupParams.min_length
+    setupParams->penaltyParams.minLength
         = params.minLengths.size() ? std::make_optional<std::vector<SizeType>>(params.minLengths) : std::nullopt;
-    setupParams.top_p_decay = params.decay.size() ? std::make_optional<std::vector<float>>(params.decay) : std::nullopt;
-    setupParams.top_p_min
+    setupParams->randomSeed = std::make_optional<std::vector<uint64_t>>({seed});
+    setupParams->samplingParams.runtime_top_k
+        = params.topKs.size() ? std::make_optional<std::vector<SizeType>>(params.topKs) : std::nullopt;
+    setupParams->samplingParams.runtime_top_p
+        = params.topPs.size() ? std::make_optional<std::vector<float>>(params.topPs) : std::nullopt;
+    setupParams->samplingParams.top_p_decay
+        = params.decay.size() ? std::make_optional<std::vector<float>>(params.decay) : std::nullopt;
+    setupParams->samplingParams.top_p_min
         = params.minTopP.size() ? std::make_optional<std::vector<float>>(params.minTopP) : std::nullopt;
-    setupParams.top_p_reset_ids
+    setupParams->samplingParams.top_p_reset_ids
         = params.topPResetIds.size() ? std::make_optional<std::vector<TokenIdType>>(params.topPResetIds) : std::nullopt;
-    setupParams.normalize_log_probs = {false};
+    setupParams->samplingParams.normalize_log_probs = {false};
 
-    setupParams.topKMedusaHeads = params.topKMedusaHeads;
+    setupParams->medusaParams.topKMedusaHeads = params.topKMedusaHeads;
 
     initXWordsTensors(batchSlotsPtr, bufferCast<SizeType>(*mBadWords),
         reinterpret_cast<SizeType**>(bufferCast<int64_t>(*mBadWordsPtrs)), bufferCast<SizeType>(*mBadWordsLens),
@@ -424,9 +423,9 @@ void DynamicDecodeLayerTest<T>::initXWordsTensors(SizeType* batchSlotsPtr, SizeT
 }
 
 template <typename T>
-typename DynamicDecodeLayer<T>::ForwardParams::MedusaInputs DynamicDecodeLayerTest<T>::createMedusaInputs()
+DynamicDecodeInputParams::MedusaInputs DynamicDecodeLayerTest<T>::createMedusaInputs()
 {
-    typename DynamicDecodeLayer<T>::ForwardParams::MedusaInputs medusaInputs;
+    DynamicDecodeInputParams::MedusaInputs medusaInputs;
     auto batchSlots = BufferRange<SizeType>(*mBatchSlots);
     std::vector<std::vector<tc::Tensor>> medusaLogits(mMaxBatchSize);
     auto const medusaLogitsPtr = bufferCast<T>(*mMedusaLogitsDevice);
@@ -454,40 +453,40 @@ typename DynamicDecodeLayer<T>::ForwardParams::MedusaInputs DynamicDecodeLayerTe
 }
 
 template <typename T>
-typename DynamicDecodeLayer<T>::ForwardParams DynamicDecodeLayerTest<T>::createInputTensors(SizeType step)
+std::shared_ptr<DynamicDecodeInputParams> DynamicDecodeLayerTest<T>::createInputTensors(SizeType step)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     constexpr SizeType ite = 0;
-    typename DynamicDecodeLayer<T>::ForwardParams forwardParams(
+    auto forwardParams = std::make_shared<DynamicDecodeInputParams>(
         step, ite, mMaxInputLen, mMaxSeqLen, mSinkTokenLength, mBatchSize, tcc::toTllmTensor(*mEndIdsDevice));
 
-    forwardParams.embedding_bias = tcc::toTllmTensor(*mEmbeddingBiasDevice);
+    forwardParams->embedding_bias = tcc::toTllmTensor(*mEmbeddingBiasDevice);
 
-    forwardParams.finished = tcc::toTllmTensor(*mFinishedDevice);
+    forwardParams->finished = tcc::toTllmTensor(*mFinishedDevice);
 
-    forwardParams.batch_slots = tcc::toTllmTensor(*mBatchSlots);
+    forwardParams->batch_slots = tcc::toTllmTensor(*mBatchSlots);
 
     if (mUseLogitsVec)
     {
-        forwardParams.logits_vec = mLogitsVec;
+        forwardParams->logits_vec = mLogitsVec;
     }
     else
     {
-        forwardParams.logits = tcc::toTllmTensor(*mLogitsDevice);
+        forwardParams->logits = tcc::toTllmTensor(*mLogitsDevice);
     }
 
-    forwardParams.bad_words_ptr = tcc::toTllmTensor(*mBadWordsPtrs);
-    forwardParams.bad_words_lengths = tcc::toTllmTensor(*mBadWordsLens);
-    forwardParams.max_bad_words_len = mMaxBadWordsLen;
+    forwardParams->bad_words_ptr = tcc::toTllmTensor(*mBadWordsPtrs);
+    forwardParams->bad_words_lengths = tcc::toTllmTensor(*mBadWordsLens);
+    forwardParams->max_bad_words_len = mMaxBadWordsLen;
 
-    forwardParams.stop_words_ptr = tcc::toTllmTensor(*mStopWordsPtrs);
-    forwardParams.stop_words_lengths = tcc::toTllmTensor(*mStopWordsLens);
-    forwardParams.max_stop_words_len = mMaxStopWordsLen;
+    forwardParams->stop_words_ptr = tcc::toTllmTensor(*mStopWordsPtrs);
+    forwardParams->stop_words_lengths = tcc::toTllmTensor(*mStopWordsLens);
+    forwardParams->max_stop_words_len = mMaxStopWordsLen;
 
     if (mUseMedusa)
     {
-        forwardParams.medusaInputs = createMedusaInputs();
+        forwardParams->medusaInputs = createMedusaInputs();
     }
 
     // TODO(nkorobov): extend to
@@ -503,47 +502,47 @@ typename DynamicDecodeLayer<T>::ForwardParams DynamicDecodeLayerTest<T>::createI
 }
 
 template <typename T>
-typename DynamicDecodeLayer<T>::OutputParams::MedusaOutputs DynamicDecodeLayerTest<T>::createMedusaOutputs()
+DynamicDecodeOutputParams::MedusaOutputs DynamicDecodeLayerTest<T>::createMedusaOutputs()
 {
-    typename DynamicDecodeLayer<T>::OutputParams::MedusaOutputs medusaOutputs;
+    DynamicDecodeOutputParams::MedusaOutputs medusaOutputs;
     medusaOutputs.nextDraftTokens = tcc::toTllmTensor(*mNextDraftTokensDevice);
 
     medusaOutputs.acceptedLengths = tcc::toTllmTensor(*mAcceptedLengths);
 
-    medusaOutputs.medusaAcceptedLengthsCumSum = tcc::toTllmTensor(*mAcceptedLengthCumSumDevice);
+    medusaOutputs.acceptedLengthsCumSum = tcc::toTllmTensor(*mAcceptedLengthCumSumDevice);
 
-    medusaOutputs.medusaPathsOffsets = tcc::toTllmTensor(*mPackedPathsDevice);
+    medusaOutputs.pathsOffsets = tcc::toTllmTensor(*mPackedPathsDevice);
     return medusaOutputs;
 }
 
 template <typename T>
-typename DynamicDecodeLayer<T>::OutputParams DynamicDecodeLayerTest<T>::createOutputTensors()
+std::shared_ptr<DynamicDecodeOutputParams> DynamicDecodeLayerTest<T>::createOutputTensors()
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    typename DynamicDecodeLayer<T>::OutputParams outputParams(tcc::toTllmTensor(*mOutputIdsDevice));
+    auto outputParams = std::make_shared<DynamicDecodeOutputParams>(tcc::toTllmTensor(*mOutputIdsDevice));
 
-    outputParams.sequence_length = tcc::toTllmTensor(*mSeqLengthsDevice);
+    outputParams->sequence_length = tcc::toTllmTensor(*mSeqLengthsDevice);
 
-    outputParams.finished = tcc::toTllmTensor(*mFinishedDevice);
+    outputParams->finished = tcc::toTllmTensor(*mFinishedDevice);
 
-    outputParams.finished_sum = tcc::toTllmTensor(*mFinishedSumDevice);
+    outputParams->finished_sum = tcc::toTllmTensor(*mFinishedSumDevice);
 
-    outputParams.newTokens = tcc::toTllmTensor(*mNewTokens);
+    outputParams->newTokens = tcc::toTllmTensor(*mNewTokens);
 
     if (!mUseMedusa)
     {
         // Output log probs are not supported in Medusa
-        outputParams.cum_log_probs = tcc::toTllmTensor(*mCumLogProbsDevice);
+        outputParams->cum_log_probs = tcc::toTllmTensor(*mCumLogProbsDevice);
 
-        outputParams.output_log_probs = tcc::toTllmTensor(*mOutputLogProbsDevice);
+        outputParams->output_log_probs = tcc::toTllmTensor(*mOutputLogProbsDevice);
 
-        outputParams.output_log_probs_tiled = tcc::toTllmTensor(*mOutputLogProbsTiledDevice);
+        outputParams->output_log_probs_tiled = tcc::toTllmTensor(*mOutputLogProbsTiledDevice);
     }
 
     if (mUseMedusa)
     {
-        outputParams.medusaOutputs = createMedusaOutputs();
+        outputParams->medusaOutputs = createMedusaOutputs();
     }
 
     // TODO(nkorobov): extend to
@@ -635,7 +634,7 @@ void DynamicDecodeLayerTest<T>::fillRefLogits(
 
 template <typename T>
 void DynamicDecodeLayerTest<T>::runTestImpl(
-    std::vector<std::set<TokenIdType>> const& expectedOutputIds, SamplingParams const& params, TokenIdType endId)
+    std::vector<std::set<TokenIdType>> const& expectedOutputIds, TestSamplingParams const& params, TokenIdType endId)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -659,7 +658,17 @@ void DynamicDecodeLayerTest<T>::runTestImpl(
         {
             // Reset by the test value since the sampling layer internally update the logit buffer.
             batchCopy(step);
-            inputTensors.step = step;
+            if (mUseLogitsVec)
+            {
+                inputTensors->logits_vec = mLogitsVec;
+                inputTensors->logits = std::nullopt;
+            }
+            else
+            {
+                inputTensors->logits = tcc::toTllmTensor(*mLogitsDevice);
+                inputTensors->logits_vec = std::nullopt;
+            }
+            inputTensors->step = step;
             mDecodeLayer->forward(outputTensors, inputTensors);
             mStream->synchronize();
             auto const newTokensHost = mBufferManager->copyFrom(*mNewTokens, tensorrt_llm::runtime::MemoryType::kCPU);
@@ -728,7 +737,7 @@ void DynamicDecodeLayerTest<T>::runTestImpl(
 
 template <typename T>
 void DynamicDecodeLayerTest<T>::runTest(
-    std::vector<std::set<TokenIdType>> const& expectedOutputIds, SamplingParams const& params, TokenIdType endId)
+    std::vector<std::set<TokenIdType>> const& expectedOutputIds, TestSamplingParams const& params, TokenIdType endId)
 {
     if (!params.useMedusa)
     {
@@ -750,7 +759,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopK)
 {
     SizeType topK = 2;
     float topP = 0.0f;
-    SamplingParams params;
+    TestSamplingParams params;
     params.topKs = {topK};
     params.topPs = {topP};
     std::vector<std::set<TokenIdType>> expectedOutputIds{
@@ -767,7 +776,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopK1TopP0)
 {
     SizeType topK = 1;
     float topP = 0.0f;
-    SamplingParams params;
+    TestSamplingParams params;
     params.topKs = {topK};
     params.topPs = {topP};
     std::vector<std::set<TokenIdType>> expectedOutputIds{
@@ -783,7 +792,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopK1TopP0)
 TYPED_TEST(DynamicDecodeLayerTest, BatchTopK)
 {
     std::vector<SizeType> topKs = {2, 1, 1, 2, 1, 1};
-    SamplingParams params;
+    TestSamplingParams params;
     params.topKs = topKs;
     params.topPs = {1.0f};
     std::vector<std::set<TokenIdType>> expectedOutputIds{
@@ -800,7 +809,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopKTopP)
 {
     SizeType topK = 2;
     float topP = 0.3;
-    SamplingParams params;
+    TestSamplingParams params;
     params.topKs = {topK};
     params.topPs = {topP};
     std::vector<std::set<TokenIdType>> expectedOutputIds{
@@ -817,7 +826,7 @@ TYPED_TEST(DynamicDecodeLayerTest, BatchTopKTopP)
 {
     std::vector<SizeType> topKs = {2, 2, 1, 2, 2, 1};
     float topP = 0.3;
-    SamplingParams params;
+    TestSamplingParams params;
     params.topKs = topKs;
     params.topPs = {topP};
     std::vector<std::set<TokenIdType>> expectedOutputIds{
@@ -834,7 +843,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopKBatchTopP)
 {
     SizeType topK = 2;
     std::vector<float> topPs = {0.5, 0.3, 0.5, 0.5, 0.3, 0.5};
-    SamplingParams params;
+    TestSamplingParams params;
     params.topKs = {topK};
     params.topPs = topPs;
     std::vector<std::set<TokenIdType>> expectedOutputIds{
@@ -851,7 +860,7 @@ TYPED_TEST(DynamicDecodeLayerTest, BatchTopKBatchTopP)
 {
     std::vector<SizeType> topKs = {2, 2, 0, 2, 2, 1};
     std::vector<float> topPs = {0.0, 0.3, 0.5, 0.0, 0.3, 0.5};
-    SamplingParams params;
+    TestSamplingParams params;
     params.topKs = topKs;
     params.topPs = topPs;
     std::vector<std::set<TokenIdType>> expectedOutputIds{
@@ -867,7 +876,7 @@ TYPED_TEST(DynamicDecodeLayerTest, BatchTopKBatchTopP)
 TYPED_TEST(DynamicDecodeLayerTest, InvalidArgsZeroTopK)
 {
     SizeType topK = 0;
-    SamplingParams params;
+    TestSamplingParams params;
     params.topKs = {topK};
     std::vector<std::set<TokenIdType>> expectedOutputIds{
         // batch
@@ -882,7 +891,7 @@ TYPED_TEST(DynamicDecodeLayerTest, InvalidArgsZeroTopK)
 TYPED_TEST(DynamicDecodeLayerTest, InvalidArgsZeroTopP)
 {
     float topP = 0;
-    SamplingParams params;
+    TestSamplingParams params;
     params.topPs = {topP};
     std::vector<std::set<TokenIdType>> expectedOutputIds{
         // batch
@@ -898,7 +907,7 @@ TYPED_TEST(DynamicDecodeLayerTest, InvalidArgsZeroTopKTopP)
 {
     SizeType topK = 0;
     float topP = 0;
-    SamplingParams params;
+    TestSamplingParams params;
     params.topPs = {topP};
     params.topKs = {topK};
     std::vector<std::set<TokenIdType>> expectedOutputIds{
@@ -915,7 +924,7 @@ TYPED_TEST(DynamicDecodeLayerTest, InvalidArgsZeroBatchTopKTopP)
 {
     std::vector<SizeType> topKs = {0, 0, 0, 0, 0, 0};
     float topP = 0;
-    SamplingParams params;
+    TestSamplingParams params;
     params.topPs = {topP};
     params.topKs = topKs;
     std::vector<std::set<TokenIdType>> expectedOutputIds{
@@ -932,7 +941,7 @@ TYPED_TEST(DynamicDecodeLayerTest, InvalidArgsZeroTopKBatchTopP)
 {
     SizeType topK = 0;
     std::vector<float> topPs = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-    SamplingParams params;
+    TestSamplingParams params;
     params.topPs = topPs;
     params.topKs = {topK};
     std::vector<std::set<TokenIdType>> expectedOutputIds{
@@ -948,7 +957,7 @@ TYPED_TEST(DynamicDecodeLayerTest, InvalidArgsZeroTopKBatchTopP)
 TYPED_TEST(DynamicDecodeLayerTest, InvalidArgsBatchTopKContainZero)
 {
     std::vector<SizeType> topKs = {2, 1, 0, 0, 2, 1};
-    SamplingParams params;
+    TestSamplingParams params;
     params.topKs = topKs;
     std::vector<std::set<TokenIdType>> expectedOutputIds{
         // batch
@@ -964,7 +973,7 @@ TYPED_TEST(DynamicDecodeLayerTest, InvalidArgsBatchTopKTopPContainZero)
 {
     std::vector<SizeType> topKs = {2, 2, 1, 0, 2, 0};
     float topP = 0.0;
-    SamplingParams params;
+    TestSamplingParams params;
     params.topPs = {topP};
     params.topKs = topKs;
     std::vector<std::set<TokenIdType>> expectedOutputIds{
@@ -981,7 +990,7 @@ TYPED_TEST(DynamicDecodeLayerTest, InvalidArgsBatchTopKBatchTopPContainZero)
 {
     std::vector<SizeType> topKs = {0, 2, 1, 2, 2, 0};
     std::vector<float> topPs = {0.0, 0.3, 0.9, 0.0, 0.3, 0.5};
-    SamplingParams params;
+    TestSamplingParams params;
     params.topPs = topPs;
     params.topKs = topKs;
     std::vector<std::set<TokenIdType>> expectedOutputIds{
@@ -997,7 +1006,7 @@ TYPED_TEST(DynamicDecodeLayerTest, InvalidArgsBatchTopKBatchTopPContainZero)
 TYPED_TEST(DynamicDecodeLayerTest, TopPTemperature)
 {
     float temperature = 0.01f;
-    SamplingParams params;
+    TestSamplingParams params;
     params.temperatures = {temperature};
     params.topPs = {1.0f};
     std::vector<std::set<TokenIdType>> expectedOutputIds{
@@ -1012,7 +1021,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopPTemperature)
 TYPED_TEST(DynamicDecodeLayerTest, TopPTemperatureBatch)
 {
     std::vector<float> temperatures = {0.01f, 1e3f, 1.0f, 1.0f, 0.01f, 1.0f};
-    SamplingParams params;
+    TestSamplingParams params;
     params.temperatures = temperatures;
     params.topPs = {0.5f};
     std::vector<std::set<TokenIdType>> expectedOutputIds{
@@ -1028,7 +1037,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopPRepetitionPenalty)
 {
     SizeType topK = 1;
     float repetitionPenalty = 1e9f;
-    SamplingParams params;
+    TestSamplingParams params;
     params.repetitionPenalties = {repetitionPenalty};
     params.topPs = {0.3f};
     std::vector<std::set<TokenIdType>> expectedOutputIds{
@@ -1044,7 +1053,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopPRepetitionPenalty)
 TYPED_TEST(DynamicDecodeLayerTest, TopPRepetitionPenaltiesBatch)
 {
     std::vector<float> repetitionPenalties = {1e9f, 1e9f, 1.0f, 1.0f, 1.0f, 1e9f};
-    SamplingParams params;
+    TestSamplingParams params;
     params.repetitionPenalties = repetitionPenalties;
     params.topPs = {0.3f};
     std::vector<std::set<TokenIdType>> expectedOutputIds{
@@ -1060,7 +1069,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopPRepetitionPenaltiesBatch)
 TYPED_TEST(DynamicDecodeLayerTest, TopPPresencePenalty)
 {
     float presencePenalty = 1e9f;
-    SamplingParams params;
+    TestSamplingParams params;
     params.presencePenalties = {presencePenalty};
     params.topPs = {0.3f};
     std::vector<std::set<TokenIdType>> expectedOutputIds{
@@ -1076,7 +1085,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopPPresencePenalty)
 TYPED_TEST(DynamicDecodeLayerTest, TopPPresencePenaltiesBatch)
 {
     std::vector<float> presencePenalties = {1e9f, 1e9f, 0.0f, 0.0f, 0.0f, 1e9f};
-    SamplingParams params;
+    TestSamplingParams params;
     params.presencePenalties = presencePenalties;
     params.topPs = {0.3f};
     std::vector<std::set<TokenIdType>> expectedOutputIds{
@@ -1092,7 +1101,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopPPresencePenaltiesBatch)
 TYPED_TEST(DynamicDecodeLayerTest, TopPFrequencyPenalty)
 {
     float frequencyPenalty = 1e9f;
-    SamplingParams params;
+    TestSamplingParams params;
     params.frequencyPenalties = {frequencyPenalty};
     params.topPs = {0.3f};
     std::vector<std::set<TokenIdType>> expectedOutputIds{
@@ -1108,7 +1117,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopPFrequencyPenalty)
 TYPED_TEST(DynamicDecodeLayerTest, TopPFrequencyPenaltiesBatch)
 {
     std::vector<float> frequencyPenalties = {1e9f, 1e9f, 0.0f, 0.0f, 0.0f, 1e9f};
-    SamplingParams params;
+    TestSamplingParams params;
     params.frequencyPenalties = frequencyPenalties;
     params.topPs = {0.3f};
     std::vector<std::set<TokenIdType>> expectedOutputIds{
@@ -1125,7 +1134,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopPRepetitionPresencePenalty)
 {
     float repetitionPenalty = 1e9f;
     float presencePenalty = 1e9f;
-    SamplingParams params;
+    TestSamplingParams params;
     params.repetitionPenalties = {repetitionPenalty};
     params.presencePenalties = {presencePenalty};
     params.topPs = {0.3f};
@@ -1143,7 +1152,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopPRepetitionPresencePenaltiesBatch)
 {
     std::vector<float> repetitionPenalties = {1e9f, 1e9f, 1.0f, 1.0f, 1.0f, 1e9f};
     std::vector<float> presencePenalties = {1e9f, 1e9f, 0.0f, 0.0f, 0.0f, 1e9f};
-    SamplingParams params;
+    TestSamplingParams params;
     params.repetitionPenalties = {repetitionPenalties};
     params.presencePenalties = {presencePenalties};
     params.topPs = {0.3f};
@@ -1161,7 +1170,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopPRepetitionFrequencyPenalty)
 {
     float repetitionPenalty = 1e9f;
     float frequencyPenalty = 1e9f;
-    SamplingParams params;
+    TestSamplingParams params;
     params.repetitionPenalties = {repetitionPenalty};
     params.frequencyPenalties = {frequencyPenalty};
     params.topPs = {0.3f};
@@ -1179,7 +1188,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopPRepetitionFrequencyPenaltiesBatch)
 {
     std::vector<float> repetitionPenalties = {1e9f, 1e9f, 1.0f, 1.0f, 1.0f, 1e9f};
     std::vector<float> frequencyPenalties = {1e9f, 1e9f, 0.0f, 0.0f, 0.0f, 1e9f};
-    SamplingParams params;
+    TestSamplingParams params;
     params.repetitionPenalties = {repetitionPenalties};
     params.frequencyPenalties = {frequencyPenalties};
     params.topPs = {0.3f};
@@ -1197,7 +1206,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopPPresenceFrequencyPenalty)
 {
     float presencePenalty = 1e9f;
     float frequencyPenalty = 1e9f;
-    SamplingParams params;
+    TestSamplingParams params;
     params.presencePenalties = {presencePenalty};
     params.frequencyPenalties = {frequencyPenalty};
     params.topPs = {0.3f};
@@ -1215,7 +1224,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopPPresenceFrequencyPenaltiesBatch)
 {
     std::vector<float> presencePenalties = {1e9f, 1e9f, 0.0f, 0.0f, 0.0f, 1e9f};
     std::vector<float> frequencyPenalties = {1e9f, 1e9f, 0.0f, 0.0f, 0.0f, 1e9f};
-    SamplingParams params;
+    TestSamplingParams params;
     params.presencePenalties = {presencePenalties};
     params.frequencyPenalties = {frequencyPenalties};
     params.topPs = {0.3f};
@@ -1234,7 +1243,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopPFullPenalty)
     float repetitionPenalty = 1e9f;
     float presencePenalty = 1e9f;
     float frequencyPenalty = 1e9f;
-    SamplingParams params;
+    TestSamplingParams params;
     params.repetitionPenalties = {repetitionPenalty};
     params.presencePenalties = {presencePenalty};
     params.frequencyPenalties = {frequencyPenalty};
@@ -1254,7 +1263,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopPFullPenaltiesBatch)
     std::vector<float> repetitionPenalties = {1e9f, 1e9f, 1.0f, 1.0f, 1.0f, 1e9f};
     std::vector<float> presencePenalties = {1e9f, 1e9f, 0.0f, 0.0f, 0.0f, 1e9f};
     std::vector<float> frequencyPenalties = {1e9f, 1e9f, 0.0f, 0.0f, 0.0f, 1e9f};
-    SamplingParams params;
+    TestSamplingParams params;
     params.repetitionPenalties = {repetitionPenalties};
     params.presencePenalties = {presencePenalties};
     params.frequencyPenalties = {frequencyPenalties};
@@ -1272,7 +1281,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopPFullPenaltiesBatch)
 TYPED_TEST(DynamicDecodeLayerTest, TopPMinLengthBatch)
 {
     std::vector<SizeType> minLengths = {3, 1, 1, 3, 0, 3};
-    SamplingParams params;
+    TestSamplingParams params;
     params.minLengths = minLengths;
     params.topPs = {0.3f};
     TokenIdType const endId = 0;
@@ -1288,7 +1297,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopPMinLengthBatch)
 
 TYPED_TEST(DynamicDecodeLayerTest, TopPBias)
 {
-    SamplingParams params;
+    TestSamplingParams params;
     params.topPs = {0.5f};
     params.useBias = true;
     std::vector<std::set<TokenIdType>> expectedOutputIds{
@@ -1304,8 +1313,8 @@ TYPED_TEST(DynamicDecodeLayerTest, TopPBias)
 TYPED_TEST(DynamicDecodeLayerTest, TopKTemperature)
 {
     SizeType topK = 2;
-    float temperature = 0.05f;
-    SamplingParams params;
+    float temperature = 0.01f;
+    TestSamplingParams params;
     params.temperatures = {temperature};
     params.topKs = {topK};
     params.topPs = {1.0f};
@@ -1321,8 +1330,8 @@ TYPED_TEST(DynamicDecodeLayerTest, TopKTemperature)
 TYPED_TEST(DynamicDecodeLayerTest, TopKTemperatureBatch)
 {
     SizeType topK = 2;
-    std::vector<float> temperatures = {0.05f, 1e3f, 1.0f, 0.5f, 0.05f, 1.0f};
-    SamplingParams params;
+    std::vector<float> temperatures = {0.01f, 1e3f, 1.0f, 0.5f, 0.01f, 1.0f};
+    TestSamplingParams params;
     params.temperatures = temperatures;
     params.topKs = {topK};
     params.topPs = {1.0f};
@@ -1339,7 +1348,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopKRepetitionPenalty)
 {
     SizeType topK = 1;
     float repetitionPenalty = 1e9f;
-    SamplingParams params;
+    TestSamplingParams params;
     params.repetitionPenalties = {repetitionPenalty};
     params.topKs = {topK};
     params.topPs = {1.0f};
@@ -1357,7 +1366,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopKRepetitionPenaltiesBatch)
 {
     SizeType topK = 1;
     std::vector<float> repetitionPenalties = {1e9f, 1e9f, 1.0f, 1.0f, 1.0f, 1e9f};
-    SamplingParams params;
+    TestSamplingParams params;
     params.repetitionPenalties = repetitionPenalties;
     params.topKs = {topK};
     params.topPs = {1.0f};
@@ -1375,7 +1384,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopKPresencePenalty)
 {
     SizeType topK = 1;
     float presencePenalty = 1e9f;
-    SamplingParams params;
+    TestSamplingParams params;
     params.presencePenalties = {presencePenalty};
     params.topKs = {topK};
     params.topPs = {1.0f};
@@ -1393,7 +1402,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopKPresencePenaltiesBatch)
 {
     SizeType topK = 1;
     std::vector<float> presencePenalties = {1e9f, 1e9f, 0.0f, 0.0f, 0.0f, 1e9f};
-    SamplingParams params;
+    TestSamplingParams params;
     params.presencePenalties = presencePenalties;
     params.topKs = {topK};
     params.topPs = {1.0f};
@@ -1411,7 +1420,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopKFrequencyPenalty)
 {
     SizeType topK = 1;
     float frequencyPenalty = 1e9f;
-    SamplingParams params;
+    TestSamplingParams params;
     params.frequencyPenalties = {frequencyPenalty};
     params.topKs = {topK};
     params.topPs = {1.0f};
@@ -1429,7 +1438,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopKFrequencyPenaltiesBatch)
 {
     SizeType topK = 1;
     std::vector<float> frequencyPenalties = {1e9f, 1e9f, 0.0f, 0.0f, 0.0f, 1e9f};
-    SamplingParams params;
+    TestSamplingParams params;
     params.frequencyPenalties = frequencyPenalties;
     params.topKs = {topK};
     params.topPs = {1.0f};
@@ -1448,7 +1457,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopKRepetitionPresencePenalty)
     SizeType topK = 1;
     float repetitionPenalty = 1e9f;
     float presencePenalty = 1e9f;
-    SamplingParams params;
+    TestSamplingParams params;
     params.repetitionPenalties = {repetitionPenalty};
     params.presencePenalties = {presencePenalty};
     params.topKs = {topK};
@@ -1468,7 +1477,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopKRepetitionPresencePenaltiesBatch)
     SizeType topK = 1;
     std::vector<float> repetitionPenalties = {1e9f, 1e9f, 1.0f, 1.0f, 1.0f, 1e9f};
     std::vector<float> presencePenalties = {1e9f, 1e9f, 0.0f, 0.0f, 0.0f, 1e9f};
-    SamplingParams params;
+    TestSamplingParams params;
     params.repetitionPenalties = {repetitionPenalties};
     params.presencePenalties = {presencePenalties};
     params.topKs = {topK};
@@ -1488,7 +1497,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopKRepetitionFrequencyPenalty)
     SizeType topK = 1;
     float repetitionPenalty = 1e9f;
     float frequencyPenalty = 1e9f;
-    SamplingParams params;
+    TestSamplingParams params;
     params.repetitionPenalties = {repetitionPenalty};
     params.frequencyPenalties = {frequencyPenalty};
     params.topKs = {topK};
@@ -1508,7 +1517,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopKRepetitionFrequencyPenaltiesBatch)
     SizeType topK = 1;
     std::vector<float> repetitionPenalties = {1e9f, 1e9f, 1.0f, 1.0f, 1.0f, 1e9f};
     std::vector<float> frequencyPenalties = {1e9f, 1e9f, 0.0f, 0.0f, 0.0f, 1e9f};
-    SamplingParams params;
+    TestSamplingParams params;
     params.repetitionPenalties = {repetitionPenalties};
     params.frequencyPenalties = {frequencyPenalties};
     params.topKs = {topK};
@@ -1528,7 +1537,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopKPresenceFrequencyPenalty)
     SizeType topK = 1;
     float presencePenalty = 1e9f;
     float frequencyPenalty = 1e9f;
-    SamplingParams params;
+    TestSamplingParams params;
     params.presencePenalties = {presencePenalty};
     params.frequencyPenalties = {frequencyPenalty};
     params.topKs = {topK};
@@ -1548,7 +1557,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopKPresenceFrequencyPenaltiesBatch)
     SizeType topK = 1;
     std::vector<float> presencePenalties = {1e9f, 1e9f, 0.0f, 0.0f, 0.0f, 1e9f};
     std::vector<float> frequencyPenalties = {1e9f, 1e9f, 0.0f, 0.0f, 0.0f, 1e9f};
-    SamplingParams params;
+    TestSamplingParams params;
     params.presencePenalties = {presencePenalties};
     params.frequencyPenalties = {frequencyPenalties};
     params.topKs = {topK};
@@ -1569,7 +1578,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopKFullPenalty)
     float repetitionPenalty = 1e9f;
     float presencePenalty = 1e9f;
     float frequencyPenalty = 1e9f;
-    SamplingParams params;
+    TestSamplingParams params;
     params.repetitionPenalties = {repetitionPenalty};
     params.presencePenalties = {presencePenalty};
     params.frequencyPenalties = {frequencyPenalty};
@@ -1591,7 +1600,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopKFullPenaltiesBatch)
     std::vector<float> repetitionPenalties = {1e9f, 1e9f, 1.0f, 1.0f, 1.0f, 1e9f};
     std::vector<float> presencePenalties = {1e9f, 1e9f, 0.0f, 0.0f, 0.0f, 1e9f};
     std::vector<float> frequencyPenalties = {1e9f, 1e9f, 0.0f, 0.0f, 0.0f, 1e9f};
-    SamplingParams params;
+    TestSamplingParams params;
     params.repetitionPenalties = {repetitionPenalties};
     params.presencePenalties = {presencePenalties};
     params.frequencyPenalties = {frequencyPenalties};
@@ -1611,7 +1620,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopKMinLengthBatch)
 {
     SizeType topK = 1;
     std::vector<SizeType> minLengths = {3, 1, 1, 3, 0, 3};
-    SamplingParams params;
+    TestSamplingParams params;
     params.minLengths = minLengths;
     params.topKs = {topK};
     params.topPs = {1.0f};
@@ -1629,7 +1638,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopKMinLengthBatch)
 TYPED_TEST(DynamicDecodeLayerTest, TopKBias)
 {
     SizeType topK = 2;
-    SamplingParams params;
+    TestSamplingParams params;
     params.topKs = {topK};
     params.topPs = {1.0f};
     params.useBias = true;
@@ -1646,7 +1655,7 @@ TYPED_TEST(DynamicDecodeLayerTest, TopKBias)
 TYPED_TEST(DynamicDecodeLayerTest, BadWords)
 {
     SizeType topK = 1;
-    SamplingParams params;
+    TestSamplingParams params;
     params.topKs = {topK};
     params.topPs = {1.0f};
     params.badWords = {{{4, 0}, {2}}, {{0, 2}}, {{4, 0, 2}, {4, 0, 3, 0}}, {{3}}, {{4}, {5}}, {{0}, {3}}};
@@ -1663,7 +1672,7 @@ TYPED_TEST(DynamicDecodeLayerTest, BadWords)
 TYPED_TEST(DynamicDecodeLayerTest, StopWords)
 {
     SizeType topK = 1;
-    SamplingParams params;
+    TestSamplingParams params;
     params.topKs = {topK};
     params.topPs = {1.0f};
     params.stopWords = {{{4, 0}, {2}}, {{0, 2}}, {{4, 0, 2}}, {{3}}, {{4}, {5}}, {{4, 0, 2, 0}}};
@@ -1679,7 +1688,7 @@ TYPED_TEST(DynamicDecodeLayerTest, StopWords)
 
 TYPED_TEST(DynamicDecodeLayerTest, MedusaSimpleTest)
 {
-    SamplingParams params;
+    TestSamplingParams params;
     params.topKs = {1, 1, 1, 1, 1, 1};
     params.topKMedusaHeads = {{3, 1}, {1, 3}, {3, 1}, {2, 2}, {2, 2}, {1, 3}};
     params.tokensPerStep = {4, 4, 4, 4, 4, 4};

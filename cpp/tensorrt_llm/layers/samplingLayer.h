@@ -20,10 +20,12 @@
 #include <curand_kernel.h>
 
 #include "tensorrt_llm/common/tensor.h"
-#include "tensorrt_llm/layers/baseSamplingLayer.h"
+#include "tensorrt_llm/layers/baseLayer.h"
 #include "tensorrt_llm/layers/decodingParams.h"
+#include "tensorrt_llm/layers/samplingParams.h"
 #include "tensorrt_llm/layers/topKSamplingLayer.h"
 #include "tensorrt_llm/layers/topPSamplingLayer.h"
+#include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/decodingMode.h"
 
 namespace tc = tensorrt_llm::common;
@@ -33,58 +35,45 @@ namespace tensorrt_llm
 namespace layers
 {
 
-template <typename T>
-inline bool allOfBatchSlots(
-    runtime::SizeType const* batchSlotsHost, T const* data, runtime::SizeType batchSize, T value)
-{
-    return std::all_of(
-        batchSlotsHost, batchSlotsHost + batchSize, [&](runtime::SizeType b) { return data[b] == value; });
-};
-
 //! \brief Top class for sampling layers.
 //! It sets up and executes TopKSamplingLayer and TopPSamplingLayer samplings
 template <typename T>
-class SamplingLayer : public BaseSamplingLayer<T>
+class SamplingLayer : public BaseLayer
 {
 public:
-    using Base = BaseSamplingLayer<T>;
-    using SetupParams = typename Base::SetupParams;
-    using ForwardParams = typename Base::ForwardParams;
+    using Base = BaseLayer;
 
-    SamplingLayer(runtime::DecodingMode const& mode, runtime::SizeType maxBatchSize, runtime::SizeType vocabSize,
-        runtime::SizeType vocabSizePadded, cudaStream_t stream,
-        std::shared_ptr<tensorrt_llm::common::IAllocator> allocator, cudaDeviceProp* prop);
+    SamplingLayer(runtime::DecodingMode const& mode, DecoderDomain const& decoderDomain, cudaStream_t stream,
+        std::shared_ptr<tensorrt_llm::common::IAllocator> allocator);
 
     ~SamplingLayer() override = default;
 
-    void forward(DecodingOutputParams& outputs, ForwardParams& inputs) override;
+    void setup(runtime::SizeType batchSize, runtime::SizeType beamWidth, runtime::SizeType const* batchSlots,
+        std::shared_ptr<BaseSetupParams> setupParams) override;
 
-    void setup(
-        runtime::SizeType batchSize, runtime::SizeType const* batchSlots, SetupParams const& setupParams) override;
+    void forward(std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs) override;
 
 private:
-    using Base::mMaxBatchSize;
-    using Base::mVocabSize;
-    using Base::mVocabSizePadded;
-    using Base::mSamplingWorkspaceSize;
+    using Base::mWorkspaceSize;
     using Base::mAllocatedSize;
 
     using Base::mStream;
     using Base::mAllocator;
 
+    using Base::mDecoderDomain;
+
     runtime::DecodingMode mDecodingMode;
 
-    void* mSamplingWorkspaceDevice = nullptr;
-    curandState_t* mCurandStatesDevice = nullptr;
-    uint64_t* mRandomSeedsDevice = nullptr;
+    void* mSamplingWorkspaceDevice{nullptr};
+    curandState_t* mCurandStatesDevice{nullptr};
+    uint64_t* mRandomSeedsDevice{nullptr};
 
-    bool* mSkipDecodeDevice = nullptr;
+    bool* mSkipDecodeDevice{nullptr};
 
-    bool* mSkipDecodeHost = nullptr;
-    bool mSkipAny = false;
+    bool* mSkipDecodeHost{nullptr};
+    bool mSkipAny{false};
 
-    std::unique_ptr<TopKSamplingLayer<T>> mTopKDecode;
-    std::unique_ptr<TopPSamplingLayer<T>> mTopPDecode;
+    std::vector<std::unique_ptr<BaseLayer>> mSamplingLayers;
 
 private:
     void allocateBuffer(runtime::SizeType batchSize);

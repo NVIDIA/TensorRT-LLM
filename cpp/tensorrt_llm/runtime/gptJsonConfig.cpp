@@ -113,6 +113,7 @@ ModelConfig createModelConfig(
 {
     auto const& config = engineVersionNone ? json.at("builder_config") : json.at("pretrained_config");
 
+    auto const useCrossAttention = parseJsonFieldOptional<bool>(config, "cross_attention");
     auto const* const numLayersField = engineVersionNone ? "num_layers" : "num_hidden_layers";
     auto const* const numHeadsField = engineVersionNone ? "num_heads" : "num_attention_heads";
     auto const* const numKvHeadsField = engineVersionNone ? "num_kv_heads" : "num_key_value_heads";
@@ -138,6 +139,11 @@ ModelConfig createModelConfig(
     auto modelConfig = ModelConfig{vocabSize, numAttentionLayers, numSsmLayers, numHeads, hiddenSize, dataType};
     modelConfig.setSizePerHead(sizePerHead);
     modelConfig.setNbKvHeads(numKvHeads);
+
+    if (useCrossAttention.has_value())
+    {
+        modelConfig.useCrossAttention(useCrossAttention.value());
+    }
 
     if (mlpHiddenSize.has_value())
     {
@@ -259,6 +265,9 @@ GptJsonConfig parseJson(InputType&& input)
     auto const pipelineParallelism = engineVersionNone
         ? parseJsonFieldOr(builderConfig, "pipeline_parallel", 1)
         : parseJsonFieldOr(json.at("pretrained_config").at("mapping"), "pp_size", 1);
+    auto const gpusPerNode = engineVersionNone ? WorldConfig::kDefaultGpusPerNode
+                                               : parseJsonFieldOr(json.at("pretrained_config").at("mapping"),
+                                                   "gpus_per_node", WorldConfig::kDefaultGpusPerNode);
 
     auto const precision = engineVersionNone ? builderConfig.at("precision").template get<std::string>()
                                              : json.at("pretrained_config").at("dtype").template get<std::string>();
@@ -370,7 +379,8 @@ GptJsonConfig parseJson(InputType&& input)
             modelConfig.setMambaConfig(mambaConfig);
         }
     }
-    return GptJsonConfig{name, engineVersion, precision, tensorParallelism, pipelineParallelism, modelConfig};
+    return GptJsonConfig{
+        name, engineVersion, precision, tensorParallelism, pipelineParallelism, gpusPerNode, modelConfig};
 }
 
 } // namespace

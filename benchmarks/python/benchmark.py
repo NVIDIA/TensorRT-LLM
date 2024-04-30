@@ -90,6 +90,17 @@ def parse_arguments():
                         default="0",
                         help=('Specify Top-P value of decoding.'))
     parser.add_argument(
+        '--input_timing_cache',
+        type=str,
+        default=None,
+        help=
+        'The path to read timing cache, will be ignored if the file does not exist'
+    )
+    parser.add_argument('--output_timing_cache',
+                        type=str,
+                        default='model.cache',
+                        help='The path to write timing cache')
+    parser.add_argument(
         '--profiling_verbosity',
         type=str,
         default='layer_names_only',

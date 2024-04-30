@@ -138,7 +138,14 @@ class GPTBenchmark(BaseBenchmark):
             remove_input_padding=self.remove_input_padding,
             quant_mode=self.quant_mode,
             use_custom_all_reduce=self.use_custom_all_reduce,
+            tokens_per_block=self.tokens_per_block if hasattr(
+                self, 'tokens_per_block') else 64,
             mamba_conv1d_plugin=self.use_mamba_conv1d_plugin,
+            conv_kernel=self.conv_kernel if hasattr(self, 'conv_kernel') else 0,
+            layer_types=self.layer_types
+            if hasattr(self, 'layer_types') else [],
+            rnn_hidden_size=self.rnn_hidden_size if hasattr(
+                self, 'rnn_hidden_size') else 0,
         )
         if args.model == 'chatglm_6b':
             self.sampling_config = tensorrt_llm.runtime.SamplingConfig(
@@ -267,9 +274,17 @@ class GPTBenchmark(BaseBenchmark):
         batch_size, inlen, outlen = io_shapes[0], io_shapes[1], io_shapes[2]
         kv_cache_size_in_bytes = batch_size*self.num_beams*(inlen + outlen)* \
             self.kv_cache_elem_per_token(self.build_config, self.runtime_mapping.tp_size, self.runtime_mapping.pp_size) * element_size(self.kv_dtype)
-        # when MHA is OOTB, it requires 2x KV cache size, one for past as engine input, one for present as engine output
+        # when MHA is OOTB, it requires extra KV cache size, because OOTB don't support inplace updating KV cache.
         if not self.use_gpt_attention_plugin:
-            kv_cache_size_in_bytes *= 2
+            if os.getenv('TRTLLM_DISABLE_OOTB_KVCACHE_REUSE') != 'ON':
+                local_n_layer = ceil(self.build_config.num_layers /
+                                     self.runtime_mapping.pp_size)
+                kv_cache_size_in_bytes = kv_cache_size_in_bytes / local_n_layer * (
+                    local_n_layer + 1)
+            else:
+                # without reusing, we need one for past as engine inputs, one for present as engine outputs.
+                kv_cache_size_in_bytes *= 2
+
         kv_cache_size_in_mb = bytes_to_target_unit(kv_cache_size_in_bytes,
                                                    "MiB")
         activation_size_in_mb = bytes_to_target_unit(

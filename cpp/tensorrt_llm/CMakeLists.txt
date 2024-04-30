@@ -19,12 +19,15 @@ set(SHARED_TARGET
     PARENT_SCOPE)
 set(API_INCLUDE_DIR ${PROJECT_SOURCE_DIR}/include)
 
-find_package(MPI REQUIRED)
-message(STATUS "Using MPI_C_INCLUDE_DIRS: ${MPI_C_INCLUDE_DIRS}")
-message(STATUS "Using MPI_C_LIBRARIES: ${MPI_C_LIBRARIES}")
-
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/cutlass_extensions/include
-                    ${API_INCLUDE_DIR} ${MPI_C_INCLUDE_DIRS})
+                    ${API_INCLUDE_DIR})
+
+if(ENABLE_MULTI_DEVICE EQUAL 1)
+  find_package(MPI REQUIRED)
+  message(STATUS "Using MPI_C_INCLUDE_DIRS: ${MPI_C_INCLUDE_DIRS}")
+  message(STATUS "Using MPI_C_LIBRARIES: ${MPI_C_LIBRARIES}")
+  include_directories(${MPI_C_INCLUDE_DIRS})
+endif()
 
 add_subdirectory(common)
 add_subdirectory(kernels)
@@ -190,8 +193,6 @@ set(TRTLLM_LINK_LIBS
     ${CUBLAS_LIB}
     ${CUBLASLT_LIB}
     ${CMAKE_DL_LIBS}
-    ${MPI_C_LIBRARIES}
-    ${NCCL_LIB}
     ${TRT_LIB}
     common_src
     kernels_src
@@ -202,6 +203,10 @@ set(TRTLLM_LINK_LIBS
     cutlass_src
     layers_src
     runtime_src)
+
+if(ENABLE_MULTI_DEVICE EQUAL 1)
+  set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} ${MPI_C_LIBRARIES} ${NCCL_LIB})
+endif()
 
 if(NOT WIN32) # Unix-like compilers
   set(UNDEFINED_FLAG "-Wl,--no-undefined")

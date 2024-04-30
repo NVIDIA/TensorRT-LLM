@@ -29,8 +29,9 @@ import tensorrt as trt
 from . import graph_rewriting as gw
 from ._common import default_net, default_trtnet, precision
 from ._utils import (bf16_array, bool_array, dim_resolve_negative,
-                     dim_to_trt_axes, fp16_array, fp32_array, int32_array,
-                     np_dtype_to_trt, str_dtype_to_trt, torch_to_numpy,
+                     dim_to_trt_axes, dims_array, fp16_array, fp32_array,
+                     int32_array, int64_array, np_dtype_to_trt,
+                     preview_trt_version, str_dtype_to_trt, torch_to_numpy,
                      trt_dtype_to_np, trt_dtype_to_torch)
 from .network import PluginInfo, set_np_weight, set_plugin_info
 from .plugin import TRT_LLM_PLUGIN_NAMESPACE, current_all_reduce_helper
@@ -998,7 +999,7 @@ def matmul(input: Tensor,
     use_fp32_acc = use_fp32_acc and input.dtype == trt.DataType.HALF and mat2.dtype == trt.DataType.HALF
 
     # TODO: fp32 accum has issues with strongly_typed and it will be fixed in TensorRT 10.0
-    if default_net().strongly_typed:
+    if default_net().strongly_typed and not preview_trt_version():
         use_fp32_acc = False
 
     if use_fp32_acc:
@@ -1730,7 +1731,7 @@ def expand_dims_like(left: Union[Tensor, int, float], right: Tensor) -> Tensor:
         The tensor produced by the shuffle layer.
     '''
     if isinstance(left, int):
-        left = constant(int32_array([left]))
+        left = constant(dims_array([left]))
     elif isinstance(left, float):
         if isinstance(right, Tensor) and right.dtype == trt.DataType.HALF:
             left = constant(fp16_array([left]))
@@ -2251,10 +2252,9 @@ def concat(inputs: Sequence[Union[Tensor, int]], dim: int = 0) -> Tensor:
         A tensor that contains the concatenation of the tensors.
     '''
     tmp = []
+    inputs = constants_to_tensors_(*inputs)
     for i in inputs:
-        if isinstance(i, int):
-            tmp.append(constant(int32_array([i])))
-        elif i.rank() == 0:
+        if i.rank() == 0:
             tmp.append(i.view([1]))
         else:
             tmp.append(i)
@@ -2476,6 +2476,7 @@ def constant_to_tensor_(input: Union[Tensor, int, float, bool],
         if isinstance(dtype, str):
             dtype = str_dtype_to_trt(dtype)
         array_fn_dict = {
+            trt.int64: int64_array,
             trt.int32: int32_array,
             trt.float32: fp32_array,
             trt.float16: fp16_array,
@@ -2486,6 +2487,42 @@ def constant_to_tensor_(input: Union[Tensor, int, float, bool],
         return constant(array_fn_dict[dtype]([input] if to_array else input))
 
     return input
+
+
+def constants_to_tensors_(
+        *inputs: Union[Tensor, int, float]) -> Tuple[Tensor, ...]:
+    '''
+    Helper function to create tensors from multiple inputs.
+
+    For each inputs, that function first creates a constant tensor if the input
+    is an integer or a float. Then, if any input is int64, it upcasts other
+    integer inputs to int64.
+
+    Parameters:
+        inputs : Tuple[Union[Tensor, int, float], ...]
+            The inputs to create tensors from.
+
+    Returns:
+        A tuple of tensors.
+    '''
+    has_int64: bool = False
+    for i in inputs:
+        if isinstance(i, int) and (i >= 2**31 or i < -2**31)\
+                or isinstance(i, Tensor) and i.dtype == trt.int64:
+            has_int64 = True
+            break
+
+    if not has_int64:
+        return tuple(constant_to_tensor_(i) for i in inputs)
+
+    result = []
+    for i in inputs:
+        if isinstance(i, int) or isinstance(i, Tensor) and i.dtype == trt.int32:
+            result.append(
+                constant_to_tensor_(i, trt.int64 if has_int64 else trt.int32))
+        else:
+            result.append(constant_to_tensor_(i))
+    return tuple(result)
 
 
 def broadcast_helper(left: Union[Tensor, int, float],
@@ -2574,6 +2611,11 @@ def elementwise_binary(left: Union[Tensor, int,
         The tensor produced by this elementwise operation.
     '''
     left, right = broadcast_helper(left, right)
+    if (left.dtype == trt.int32
+            and right.dtype == trt.int64) or (left.dtype == trt.int64
+                                              and right.dtype == trt.int32):
+        left = cast(left, trt.int64)
+        right = cast(right, trt.int64)
     layer = default_trtnet().add_elementwise(left.trt_tensor, right.trt_tensor,
                                              op)
     return _create_tensor(layer.get_output(0), layer)
@@ -2642,8 +2684,7 @@ def where(condition: Union[Tensor, bool], left: Union[Tensor, int, float],
     '''
     # Convert to tensors.
     condition = constant_to_tensor_(condition)
-    left = constant_to_tensor_(left)
-    right = constant_to_tensor_(right)
+    left, right = constants_to_tensors_(left, right)
 
     # Find the tensor with the largest rank of the three.
     largest = condition
@@ -3287,18 +3328,18 @@ def split(tensor: Tensor,
     if dim < 0:
         dim += ndim
     dim_value = tensor.size()[dim]
-    starts = [constant(int32_array([0])) for _ in range(ndim)]
+    starts = [constant(dims_array([0])) for _ in range(ndim)]
     sizes = [shape(tensor, i) for i in range(ndim)]
 
     if isinstance(split_size_or_sections, int):
         # TODO: support non-divisible cases
         assert dim_value % split_size_or_sections == 0
         num_sections = dim_value // split_size_or_sections
-        sizes[dim] = constant(int32_array([split_size_or_sections]))
+        sizes[dim] = constant(dims_array([split_size_or_sections]))
 
         outputs = []
         for i in range(num_sections):
-            starts[dim] = constant(int32_array([split_size_or_sections * i]))
+            starts[dim] = constant(dims_array([split_size_or_sections * i]))
             outputs.append(slice(tensor, concat(starts), concat(sizes)))
         return outputs
     else:
@@ -3312,7 +3353,7 @@ def split(tensor: Tensor,
         for i in range(num_sections):
             if i > 0:
                 starts[dim] = starts[dim] + sizes[dim]
-            sizes[dim] = constant(int32_array([split_size_or_sections[i]]))
+            sizes[dim] = constant(dims_array([split_size_or_sections[i]]))
             outputs.append(slice(tensor, concat(starts), concat(sizes)))
         return outputs
 
@@ -3536,7 +3577,7 @@ def allgather(tensor: Tensor, group: List[int], gather_dim: int = 0) -> Tensor:
         # 2.1 split
         split_size = shape(x, dim=0) / group_size
         ndim = x.ndim()
-        starts = [constant(int32_array([0])) for _ in range(ndim)]
+        starts = [constant(dims_array([0])) for _ in range(ndim)]
         sizes = [shape(x, dim=d) for d in range(ndim)]
         sizes[0] = split_size
         sections = []
@@ -5256,6 +5297,124 @@ def selective_scan(input: Tensor,
 
     layer = default_trtnet().add_plugin_v2(plug_inputs, selective_scan_plug)
     _add_plugin_info(layer, selective_scan_plg_creator, "selective_scan", pfc)
+    output = _create_tensor(layer.get_output(0), layer)
+    if default_net().plugin_config.paged_state:
+        return output, None
+    else:
+        present_state = _create_tensor(layer.get_output(1), layer)
+        return output, present_state
+
+
+def rg_lru(input: Tensor,
+           gate_x: Tensor,
+           gate_a: Tensor,
+           A: Tensor,
+           state_or_ptr: Tensor,
+           host_request_types: Tensor,
+           last_token_ids: Tensor,
+           dim: int,
+           dtype: str,
+           y: Optional[Tensor] = None,
+           y_bias: Optional[Tensor] = None,
+           slot_mapping: Optional[Tensor] = None):
+    '''
+    Parameters:
+        input : Tensor (On GPU)
+            The input tensor. Its shape is [batch_size, seq_len, dim]
+
+        gate_x : Tensor (On GPU)
+            The gate_x tensor. Its shape is [batch_size, seq_len, dim]
+
+        gate_a : Tensor (On GPU)
+            The gate_a tensor. Its shape is [batch_size, seq_len, dim]
+
+        A : Tensor (On GPU)
+            A matrix. Its shape is [dim]
+
+        state_or_ptr : Tensor (On GPU or CPU)
+            The lru state tensor. Its shape is [batch_size, dstate, dim]
+            Or the CPU tensor of shape [1] for the pointer of paged states.
+
+        host_request_types : Tensor (On CPU)
+            The tensor on the host that indicates if a request is in context or
+            generation phase. Its shape is [batch_size]. See Inflight Batching
+            in docs/gpt_attention.md,
+
+        last_token_ids : Tensor (On GPU)
+            The inclusive prefix-sum of the lengths or the lengths of the
+            sequences in the batch.
+
+        dim : int
+            The inner dimension of RG_LRU block
+
+        dtype: str
+            data type
+
+        y : Tensor (On GPU) (Optional)
+            The y tensor. Its shape is [batch_size, seq_len, dim]
+
+        y_bias : Tensor (On GPU) (Optional)
+            The y_bias tensor. Its shape is [dim]. If y_bias is not None, we
+            will fuse GELU(y + y_bias) in this function.
+
+        slot_mapping: Tensor (On GPU) (Optional)
+            Real page index in state. Its shape is [dim], used for paged state, each page shape is [dstate, dim]
+    '''
+    assert host_request_types is not None
+    lru_plg_creator = trt.get_plugin_registry().get_plugin_creator(
+        'LRU', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert lru_plg_creator is not None
+
+    dim = trt.PluginField("dim", np.array(dim, dtype=np.int32),
+                          trt.PluginFieldType.INT32)
+    pf_type = trt.PluginField(
+        "type_id", np.array([int(str_dtype_to_trt(dtype))], np.int32),
+        trt.PluginFieldType.INT32)
+    remove_input_padding = trt.PluginField(
+        "remove_input_padding",
+        np.array(np.int8(default_net().plugin_config.remove_input_padding),
+                 dtype=np.int8), trt.PluginFieldType.INT8)
+    paged_state = trt.PluginField(
+        "paged_state",
+        np.array(np.int8(default_net().plugin_config.paged_state),
+                 dtype=np.int8), trt.PluginFieldType.INT8)
+
+    if y is None:
+        y_enabled = trt.PluginField("y_enabled", np.array(0, dtype=np.int8),
+                                    trt.PluginFieldType.INT8)
+    else:
+        y_enabled = trt.PluginField("y_enabled", np.array(1, dtype=np.int8),
+                                    trt.PluginFieldType.INT8)
+
+    if y_bias is None:
+        y_bias_enabled = trt.PluginField("y_bias_enabled",
+                                         np.array(0, dtype=np.int8),
+                                         trt.PluginFieldType.INT8)
+    else:
+        y_bias_enabled = trt.PluginField("y_bias_enabled",
+                                         np.array(1, dtype=np.int8),
+                                         trt.PluginFieldType.INT8)
+
+    pfc = trt.PluginFieldCollection([
+        dim, pf_type, remove_input_padding, paged_state, y_enabled,
+        y_bias_enabled
+    ])
+    lru_plug = lru_plg_creator.create_plugin("rg_lru", pfc)
+
+    plug_inputs = [
+        input, gate_x, gate_a, A, state_or_ptr, host_request_types,
+        last_token_ids
+    ]
+    if default_net().plugin_config.paged_state:
+        plug_inputs += [slot_mapping]
+    if y is not None:
+        plug_inputs += [y]
+        if y_bias is not None:
+            plug_inputs += [y_bias]
+    plug_inputs = [i.trt_tensor for i in plug_inputs]
+
+    layer = default_trtnet().add_plugin_v2(plug_inputs, lru_plug)
+    _add_plugin_info(layer, lru_plg_creator, "rg_lru", pfc)
     output = _create_tensor(layer.get_output(0), layer)
     if default_net().plugin_config.paged_state:
         return output, None

@@ -1097,7 +1097,19 @@ class DecoderModel(PretrainedModel):
                     host_max_attention_window_sizes,
                     host_sink_token_length=kv_cache_params.
                     host_sink_token_length,
-                    cache_indirection=kv_cache_params.cache_indirection),
+                    cache_indirection=kv_cache_params.cache_indirection,
+                    kv_cache_block_offsets=kv_cache_params.
+                    kv_cache_block_offsets,
+                    host_kv_cache_block_offsets=kv_cache_params.
+                    host_cross_kv_cache_block_offsets,
+                    host_kv_cache_pool_pointers=kv_cache_params.
+                    host_kv_cache_pool_pointers,
+                    cross_kv_cache_block_offsets=kv_cache_params.
+                    cross_kv_cache_block_offsets,
+                    host_cross_kv_cache_block_offsets=kv_cache_params.
+                    host_cross_kv_cache_block_offsets,
+                    host_cross_kv_cache_pool_pointers=kv_cache_params.
+                    host_cross_kv_cache_pool_pointers),
                 attention_params=attention_params,
                 lora_layer_params=lora_layer_params,
                 cross_kv_cache_gen=cross_kv_cache_gen,
@@ -1160,6 +1172,7 @@ class DecoderModel(PretrainedModel):
                        gather_context_logits: bool = False,
                        gather_generation_logits: bool = False,
                        lora_target_modules: List[str] = None,
+                       use_cache=True,
                        *args,
                        **kwargs):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
@@ -1219,6 +1232,8 @@ class DecoderModel(PretrainedModel):
         use_gpt_attention_plugin = default_net(
         ).plugin_config.gpt_attention_plugin
         remove_input_padding = default_net().plugin_config.remove_input_padding
+        paged_kv_cache = default_net().plugin_config.paged_kv_cache
+        tokens_per_block = default_net().plugin_config.tokens_per_block
         use_custom_all_reduce = default_net(
         ).plugin_config.use_custom_all_reduce
         use_lora_plugin = default_net().plugin_config.lora_plugin
@@ -1521,36 +1536,128 @@ class DecoderModel(PretrainedModel):
                 host_encoder_input_lengths=host_encoder_input_lengths,
             )
 
-        for i in layers_range:
-            kv_dim_range = OrderedDict([
-                ('batch_size_beam_width', [bb_range]),
-                ('kv', [2]),
-                ('num_heads', [num_kv_heads]),
-                ('past_key_len', [max_output_len_range]),
-                ('head_size', [head_size]),
-            ])
-            kv = Tensor(name=f'past_key_value_{i}',
-                        dtype=self._kv_dtype,
-                        shape=[-1, 2, num_kv_heads, -1, head_size],
-                        dim_range=kv_dim_range)
+        kv_cache_block_offsets = None
+        host_kv_cache_block_offsets = None
+        host_kv_cache_pool_pointers = None
 
-            if use_gpt_attention_plugin:
-                cross_kv_dim_range = OrderedDict([
-                    ('batch_size_beam_width', [bb_range]),
-                    ('kv', [2]),
-                    ('cross_num_heads', [encoder_num_kv_heads]),
-                    ('cross_past_key_len', [encoder_input_len_range]),
-                    ('cross_head_size', [encoder_head_size]),
-                ])
-                cross_kv = Tensor(
-                    name=f'cross_past_key_value_{i}',
-                    dtype=self._kv_dtype,
-                    shape=[-1, 2, encoder_num_kv_heads, -1, encoder_head_size],
-                    dim_range=cross_kv_dim_range)
-                past_key_value.append((kv, cross_kv))
-            else:
-                # use encoder_output directly, no need to save cross_past_key_value
-                past_key_value.append((kv, ))
+        cross_kv_cache_block_offsets = None
+        host_cross_kv_cache_block_offsets = None
+        host_cross_kv_cache_pool_pointers = None
+
+        if use_cache:
+            if not paged_kv_cache:
+                for i in layers_range:
+                    kv_dim_range = OrderedDict([
+                        ('batch_size_beam_width', [bb_range]),
+                        ('kv', [2]),
+                        ('num_heads', [num_kv_heads]),
+                        ('past_key_len', [max_output_len_range]),
+                        ('head_size', [head_size]),
+                    ])
+                    kv = Tensor(name=f'past_key_value_{i}',
+                                dtype=self._kv_dtype,
+                                shape=[-1, 2, num_kv_heads, -1, head_size],
+                                dim_range=kv_dim_range)
+
+                    if use_gpt_attention_plugin:
+                        cross_kv_dim_range = OrderedDict([
+                            ('batch_size_beam_width', [bb_range]),
+                            ('kv', [2]),
+                            ('cross_num_heads', [encoder_num_kv_heads]),
+                            ('cross_past_key_len', [encoder_input_len_range]),
+                            ('cross_head_size', [encoder_head_size]),
+                        ])
+                        cross_kv = Tensor(name=f'cross_past_key_value_{i}',
+                                          dtype=self._kv_dtype,
+                                          shape=[
+                                              -1, 2, encoder_num_kv_heads, -1,
+                                              encoder_head_size
+                                          ],
+                                          dim_range=cross_kv_dim_range)
+                        past_key_value.append((kv, cross_kv))
+                    else:
+                        # use encoder_output directly, no need to save cross_past_key_value
+                        past_key_value.append((kv, ))
+
+            else:  # paged_kv_cache == True
+                # PagedKV setup for KV cache of self-attention
+                max_blocks_per_seq_range = [[
+                    math.ceil(max_output_len_range[0] / tokens_per_block),
+                    math.ceil(max_output_len_range[1] / tokens_per_block),
+                    math.ceil(max_output_len_range[2] / tokens_per_block)
+                ]]
+                max_blocks_per_seq_range = [[
+                    x for x in max_blocks_per_seq_range[0]
+                ]]
+
+                # PagedKV setup for KV cache of cross-attention
+                max_cross_blocks_per_seq_range = [[
+                    math.ceil(encoder_input_len_range[0] / tokens_per_block),
+                    math.ceil(encoder_input_len_range[1] / tokens_per_block),
+                    math.ceil(encoder_input_len_range[2] / tokens_per_block)
+                ]]
+                max_cross_blocks_per_seq_range = [[
+                    x for x in max_cross_blocks_per_seq_range[0]
+                ]]
+
+                kv_cache_block_offsets = Tensor(name=f'kv_cache_block_offsets',
+                                                dtype=trt.int32,
+                                                shape=[-1, 2, -1],
+                                                dim_range=OrderedDict([
+                                                    ('batch_size_beam_width',
+                                                     [bb_range]),
+                                                    ('kv', [2]),
+                                                    ('max_blocks_per_seq',
+                                                     max_blocks_per_seq_range),
+                                                ]))
+                host_kv_cache_block_offsets = Tensor(
+                    name=f'host_kv_cache_block_offsets',
+                    dtype=trt.int32,
+                    shape=[-1, 2, -1],
+                    dim_range=OrderedDict([
+                        ('batch_size_beam_width', [bb_range]),
+                        ('kv', [2]),
+                        ('max_blocks_per_seq', max_blocks_per_seq_range),
+                    ]))
+                host_kv_cache_pool_pointers = Tensor(
+                    name=f'host_kv_cache_pool_pointers',
+                    dtype=trt.int64,
+                    shape=[2],
+                    dim_range=OrderedDict([
+                        ('num_pools', [2]),
+                    ]))
+
+                # paged blocks for cross kv
+                cross_kv_cache_block_offsets = Tensor(
+                    name=f'cross_kv_cache_block_offsets',
+                    dtype=trt.int32,
+                    shape=[-1, 2, -1],
+                    dim_range=OrderedDict([
+                        ('batch_size_beam_width', [bb_range]),
+                        ('kv', [2]),
+                        ('max_cross_blocks_per_seq',
+                         max_cross_blocks_per_seq_range),
+                    ]))
+                host_cross_kv_cache_block_offsets = Tensor(
+                    name=f'host_cross_kv_cache_block_offsets',
+                    dtype=trt.int32,
+                    shape=[-1, 2, -1],
+                    dim_range=OrderedDict([
+                        ('batch_size_beam_width', [bb_range]),
+                        ('kv', [2]),
+                        ('max_cross_blocks_per_seq',
+                         max_cross_blocks_per_seq_range),
+                    ]))
+                host_cross_kv_cache_pool_pointers = Tensor(
+                    name=f'host_cross_kv_cache_pool_pointers',
+                    dtype=trt.int64,
+                    shape=[2],
+                    dim_range=OrderedDict([
+                        ('num_pools', [2]),
+                    ]))
+
+                for i in layers_range:
+                    past_key_value.append(None)
 
             # TODO: Remove this when TRT fix the named dimension
             if not remove_input_padding:
@@ -1564,7 +1671,16 @@ class DecoderModel(PretrainedModel):
                 host_past_key_value_lengths=host_past_key_value_lengths,
                 host_max_attention_window_sizes=host_max_attention_window_sizes,
                 host_sink_token_length=host_sink_token_length,
-                cache_indirection=cache_indirection)
+                cache_indirection=cache_indirection,
+                kv_cache_block_offsets=kv_cache_block_offsets,
+                host_kv_cache_block_offsets=host_kv_cache_block_offsets,
+                host_kv_cache_pool_pointers=host_kv_cache_pool_pointers,
+                cross_kv_cache_block_offsets=cross_kv_cache_block_offsets,
+                host_cross_kv_cache_block_offsets=
+                host_cross_kv_cache_block_offsets,
+                host_cross_kv_cache_pool_pointers=
+                host_cross_kv_cache_pool_pointers,
+            )
 
             attention_params = AttentionParams(
                 sequence_length=sequence_length,

@@ -20,6 +20,7 @@
 #include "tensorrt_llm/kernels/groupGemm.h"
 #include "tensorrt_llm/kernels/splitkGroupGemm.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
+#include "tensorrt_llm/runtime/iTensor.h"
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cublasMMWrapper.h"
@@ -243,7 +244,7 @@ bool LoraPlugin::supportsFormatCombination(
     }
 }
 
-int32_t _computeMDimension(bool transA, const int32_t nbDims, int32_t const* dims)
+int32_t _computeMDimension(bool transA, const int32_t nbDims, tensorrt_llm::runtime::ITensor::DimType const* dims)
 {
     int32_t M = 1;
     if (transA)
@@ -263,7 +264,7 @@ int32_t _computeMDimension(bool transA, const int32_t nbDims, int32_t const* dim
     return M;
 }
 
-int32_t _computeNDimension(bool transB, const int32_t nbDims, int32_t const* dims)
+int32_t _computeNDimension(bool transB, const int32_t nbDims, tensorrt_llm::runtime::ITensor::DimType const* dims)
 {
     int32_t N = 1;
     if (transB)
@@ -297,7 +298,7 @@ void LoraPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, in
 
     if (!mDims.isInitialized())
     {
-        mDims = {minM, maxM, N, K};
+        mDims = {minM, maxM, N, static_cast<runtime::SizeType>(K)};
     }
     mGemmId.n = N;
     mGemmId.k = K;

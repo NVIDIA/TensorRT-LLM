@@ -23,6 +23,7 @@
 #include "tensorrt_llm/plugins/gptAttentionCommon/gptAttentionCommon.h"
 #include "tensorrt_llm/plugins/gptAttentionCommon/gptAttentionCommonImpl.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
+#include "tensorrt_llm/runtime/iTensor.h"
 #include <algorithm>
 #include <cstdint>
 #include <functional>
@@ -247,7 +248,8 @@ void GPTAttentionPlugin::configurePluginImpl(nvinfer1::DynamicPluginTensorDesc c
 {
     TLLM_CHECK(mHeadSize > 0);
 
-    int const beamWidth = useKVCache() ? in[getIdx(IdxEntry::CACHE_INDIR)].desc.dims.d[1] : 1;
+    int const beamWidth
+        = isCrossAttention() ? 1 : (useKVCache() ? in[getIdx(IdxEntry::CACHE_INDIR)].desc.dims.d[1] : 1);
     // Commonly, cyclic_attention_window_size, and max_attention_window_size will be the same
     // unless each layer has different attention window sizes.
     // the kv_cache capacity.
@@ -282,6 +284,14 @@ void GPTAttentionPlugin::configurePluginImpl(nvinfer1::DynamicPluginTensorDesc c
         /*max_context_kv_len_list=*/nullptr};
 
     prepareEnqueueGeneration(enqueueParams);
+
+    if (mMultiBlockMode)
+    {
+        auto const& ctxLenTensor = in[getIdx(IdxEntry::CONTEXT_LENGTHS)];
+        TLLM_CHECK_DEBUG(ctxLenTensor.max.nbDims == 1);
+        int32_t const max_batch_beam = in[getIdx(IdxEntry::CONTEXT_LENGTHS)].max.d[0];
+        reserveSemaphoreArray(mNumHeads * max_batch_beam);
+    }
 }
 
 template <typename T>
@@ -487,7 +497,7 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
     {
         if (!mRemovePadding)
         {
-            return inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims.d[1];
+            return static_cast<int>(inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims.d[1]);
         }
         auto const host_context_lengths
             = static_cast<int32_t const*>(inputs[getIdx(IdxEntry::HOST_CONTEXT_LENGTH)]) + seqIdxBeg;
@@ -503,7 +513,8 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
     // -- max_seq_len: max allowed len of decoder output, i.e. final results
     // -- max_encoder_context_len: len of encoder input (in cross attn). Also called encoder_input_seq_length
 
-    int const beamWidth = useKVCache() ? inputDesc[getIdx(IdxEntry::CACHE_INDIR)].dims.d[1] : 1;
+    int const beamWidth
+        = isCrossAttention() ? 1 : (useKVCache() ? inputDesc[getIdx(IdxEntry::CACHE_INDIR)].dims.d[1] : 1);
 
     // Commonly, cyclic_attention_window_size, and max_attention_window_size will be the same
     // unless each layer has different attention window sizes.
@@ -672,7 +683,7 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         auto qkvDims = inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims;
         TLLM_CHECK_WITH_INFO(input_seq_length == 1 || mIsMedusaEnabled,
             "Only Medusa mode supports input length > 1 in the generation phase, input_seq_length=%d, "
-            "mIsMedusaEnabled=%s, nDims=%d, (%d, %d, %d)",
+            "mIsMedusaEnabled=%s, nDims=%d, (" FMT_DIM ", " FMT_DIM ", " FMT_DIM ")",
             input_seq_length, mIsMedusaEnabled ? "true" : "false", qkvDims.nbDims, qkvDims.d[0], qkvDims.d[1],
             qkvDims.d[2]);
         TLLM_CHECK_WITH_INFO(input_seq_length == num_medusa_tokens + 1, "The generation input length is not expected.");

@@ -59,7 +59,8 @@ class GenerationMixin:
                                  tokens_per_block=64,
                                  mapping=Mapping(),
                                  use_cache=True,
-                                 streamingllm=False):
+                                 streamingllm=False,
+                                 attn_layer_idx=None):
 
         default_range = GenerationMixin.default_range
         bb_range_cxt = default_range(max_batch_size)
@@ -101,6 +102,8 @@ class GenerationMixin:
         num_kv_heads = (num_kv_heads + mapping.tp_size - 1) // mapping.tp_size
         layers_range = mapping.pp_layers(num_layers)
         num_pp_layers = len(layers_range)
+        if attn_layer_idx is None:
+            attn_layer_idx = [i for i in range(num_layers)]
         past_key_value = []
         kv_cache_block_offsets = None
         host_kv_cache_block_offsets = None
@@ -115,7 +118,7 @@ class GenerationMixin:
                         ('past_key_len', kv_cache_range),
                         ('head_size', [head_size] * num_profiles),
                     ])
-                    kv = Tensor(name=f'past_key_value_{i}',
+                    kv = Tensor(name=f'past_key_value_{attn_layer_idx[i]}',
                                 dtype=kv_dtype,
                                 shape=[-1, 2, num_kv_heads, -1, head_size],
                                 dim_range=kv_dim_range)
@@ -324,18 +327,20 @@ class GenerationMixin:
             use_gpt_attention_plugin, use_gemm_plugin, remove_input_padding,
             paged_kv_cache)
         if max_num_tokens is None:
+            # Draft tokens cannot be combined with beam search
             max_num_tokens = max(
-                max_input_len * max_batch_size,
-                max_beam_width * (max_draft_len + 1) * max_batch_size)
+                max_batch_size * max_input_len,
+                max_batch_size * max(1 + max_draft_len, max_beam_width))
         if enable_ctx_gen_opt_profiles:
             num_profiles = 2
             bb_range = [bb_range_cxt, bb_range_gen]
             bbd_range = [bbd_range_ctx, bbd_range_gen]
             inlen_range = [inlen_range_cxt, inlen_range_gen]
             position_ids_inlen_range = [inlen_range_cxt, [1, 1, 1]]
-            num_tokens_range_ctx = default_range(max_num_tokens)
+            num_tokens_range_ctx = default_range(max_batch_size * max_input_len)
+            # Draft tokens cannot be combined with beam search
             num_tokens_range_gen = default_range(
-                max_batch_size * (max_draft_len + 1) * max_beam_width)
+                max_batch_size * max(1 + max_draft_len, max_beam_width))
             num_tokens_range = [num_tokens_range_ctx, num_tokens_range_gen]
         else:
             max_bs_x_max_bw = max_batch_size * max_beam_width

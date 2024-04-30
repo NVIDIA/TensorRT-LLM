@@ -1963,9 +1963,10 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
                 int num_buckets = relative_attention_bias_stride;
                 // Special logic in T5 relative attention, both encoder & decoder use this, because
                 // relative_attention_bias is pre-computed once and passed around.
-                num_buckets /= 2;
-                relative_buckets += relative_position > 0 ? num_buckets : 0;
-                relative_position = abs(relative_position);
+                // T5 decoder attention now only uses bidirectional=False relative position logic
+                // (ref: tensorrt_llm/layers/attention.py compute_relative_bias())
+                relative_position = relative_position >= 0 ? 0 : -relative_position;
+
                 int max_exact = num_buckets / 2;
                 bool is_small = relative_position < max_exact;
                 int relative_position_if_large = max_exact
@@ -2092,9 +2093,10 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
                 int num_buckets = relative_attention_bias_stride;
                 // Special logic in T5 relative attention, both encoder & decoder use this, because
                 // relative_attention_bias is pre-computed once and passed around.
-                num_buckets /= 2;
-                relative_buckets += relative_position > 0 ? num_buckets : 0;
-                relative_position = abs(relative_position);
+                // T5 decoder attention now only uses bidirectional=False relative position logic
+                // (ref: tensorrt_llm/layers/attention.py compute_relative_bias())
+                relative_position = relative_position >= 0 ? 0 : -relative_position;
+
                 int max_exact = num_buckets / 2;
                 bool is_small = relative_position < max_exact;
                 int relative_position_if_large = max_exact

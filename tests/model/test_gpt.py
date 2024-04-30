@@ -178,6 +178,8 @@ class TestGPT(unittest.TestCase):
 
     @parameterized.expand([("other", False)], name_func=unittest_name_func)
     def test_gpt_float32(self, test_partition, use_refit):
+        torch.manual_seed(42)
+
         model = 'gpt'
         log_level = 'error'
         dtype = 'float32'
@@ -847,6 +849,8 @@ class TestGPT(unittest.TestCase):
     @parameterized.expand([("other", False, False), ("other", False, True)],
                           name_func=unittest_name_func)
     def test_greedy_search_float32(self, test_partition, use_refit, streaming):
+        torch.manual_seed(42)
+
         model = 'gpt'
         log_level = 'error'
         dtype = 'float32'

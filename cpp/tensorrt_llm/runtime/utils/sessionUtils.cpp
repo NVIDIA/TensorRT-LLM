@@ -141,7 +141,7 @@ void setRawPointers(ITensor& pointers, ITensor::SharedPtr const& input)
     auto const& inputRows = input->getShape().d[0];
     auto const pointersLength = static_cast<int32_t>(pointers.getSizeInBytes() / sizeof(void**));
     TLLM_CHECK_WITH_INFO(inputRows == pointersLength,
-        tc::fmtstr("Input dim 0 (%d) does not match pointers length (%d).", inputRows, pointersLength));
+        tc::fmtstr("Input dim 0 (" FMT_DIM ") does not match pointers length (%d).", inputRows, pointersLength));
 
     for (SizeType inputSlot = 0; inputSlot < inputRows; ++inputSlot)
     {
@@ -180,7 +180,7 @@ void tileBufferReplace(ITensor::SharedPtr& tensor, SizeType beamWidth, BufferMan
 namespace
 {
 template <typename T>
-void tileCpuBufferReplaceImpl(ITensor::SharedPtr& tensor, SizeType beamWidth, BufferManager& manager)
+void tileCpuBufferReplaceImpl(ITensor::SharedPtr& tensor, SizeType beamWidth)
 {
     TLLM_CHECK(tensor != nullptr);
     TLLM_CHECK(tensor->getDataType() == TRTDataType<T>::value);
@@ -190,8 +190,8 @@ void tileCpuBufferReplaceImpl(ITensor::SharedPtr& tensor, SizeType beamWidth, Bu
     ITensor::SharedPtr tiledTensor;
     switch (tensor->getMemoryType())
     {
-    case MemoryType::kCPU: tiledTensor = std::shared_ptr(manager.cpu(shape, tensor->getDataType())); break;
-    case MemoryType::kPINNED: tiledTensor = std::shared_ptr(manager.pinned(shape, tensor->getDataType())); break;
+    case MemoryType::kCPU: tiledTensor = std::shared_ptr(BufferManager::cpu(shape, tensor->getDataType())); break;
+    case MemoryType::kPINNED: tiledTensor = std::shared_ptr(BufferManager::pinned(shape, tensor->getDataType())); break;
     default: TLLM_THROW("Tensor is not using CPU memory."); break;
     }
     auto const src = bufferCast<T>(*tensor);
@@ -205,19 +205,19 @@ void tileCpuBufferReplaceImpl(ITensor::SharedPtr& tensor, SizeType beamWidth, Bu
 }
 } // namespace
 
-void tileCpuBufferReplace(ITensor::SharedPtr& tensor, SizeType beamWidth, BufferManager& manager)
+void tileCpuBufferReplace(ITensor::SharedPtr& tensor, SizeType beamWidth)
 {
     if (tensor)
     {
         switch (tensor->getDataType())
         {
-        case nvinfer1::DataType::kINT32: tileCpuBufferReplaceImpl<int32_t>(tensor, beamWidth, manager); break;
-        case nvinfer1::DataType::kFLOAT: tileCpuBufferReplaceImpl<float>(tensor, beamWidth, manager); break;
-        case nvinfer1::DataType::kHALF: tileCpuBufferReplaceImpl<half>(tensor, beamWidth, manager); break;
-        case nvinfer1::DataType::kINT8: tileCpuBufferReplaceImpl<int8_t>(tensor, beamWidth, manager); break;
-        case nvinfer1::DataType::kBOOL: tileCpuBufferReplaceImpl<bool>(tensor, beamWidth, manager); break;
-        case nvinfer1::DataType::kUINT8: tileCpuBufferReplaceImpl<uint8_t>(tensor, beamWidth, manager); break;
-        case nvinfer1::DataType::kINT64: tileCpuBufferReplaceImpl<int64_t>(tensor, beamWidth, manager); break;
+        case nvinfer1::DataType::kINT32: tileCpuBufferReplaceImpl<int32_t>(tensor, beamWidth); break;
+        case nvinfer1::DataType::kFLOAT: tileCpuBufferReplaceImpl<float>(tensor, beamWidth); break;
+        case nvinfer1::DataType::kHALF: tileCpuBufferReplaceImpl<half>(tensor, beamWidth); break;
+        case nvinfer1::DataType::kINT8: tileCpuBufferReplaceImpl<int8_t>(tensor, beamWidth); break;
+        case nvinfer1::DataType::kBOOL: tileCpuBufferReplaceImpl<bool>(tensor, beamWidth); break;
+        case nvinfer1::DataType::kUINT8: tileCpuBufferReplaceImpl<uint8_t>(tensor, beamWidth); break;
+        case nvinfer1::DataType::kINT64: tileCpuBufferReplaceImpl<int64_t>(tensor, beamWidth); break;
         default: TLLM_THROW("unsupported data type");
         }
     }

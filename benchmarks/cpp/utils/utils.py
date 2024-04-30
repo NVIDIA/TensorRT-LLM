@@ -8,9 +8,9 @@ from pydantic import BaseModel
 
 
 class Sample(BaseModel):
+    input_len: int
     input_ids: List[int]
     output_len: int
-    delay: float
     task_id: int
 
 
@@ -32,26 +32,18 @@ class Workload(BaseModel):
         self.metadata.setdefault('workload_name', workload_name)
 
 
-def dataset_dump(input_ids, output_lens, delays, task_ids, metadata,
+def dataset_dump(input_lens, input_ids, output_lens, task_ids, metadata,
                  output_file):
     samples = []
     for i in range(len(input_ids)):
         samples.append(
-            Sample(input_ids=input_ids[i],
+            Sample(input_len=input_lens[i],
+                   input_ids=input_ids[i],
                    output_len=output_lens[i],
-                   delay=delays[i],
                    task_id=task_ids[i]))
     workload = Workload(metadata=metadata, samples=samples)
     with open(output_file, 'w') as f:
         json.dump(workload.dict(), f)
-
-
-def get_req_time_interval(req_rate):
-    if req_rate == -1:
-        mean_time_bet_reqs = 0
-    else:
-        mean_time_bet_reqs = 1.0 / req_rate
-    return mean_time_bet_reqs
 
 
 def get_list_of_delays(delay_dist, mean_time_bet_reqs, num_reqs, random_seed):
@@ -79,18 +71,25 @@ def get_norm_dist_tokens(mean, stdev, num_reqs, random_seed):
 
 
 def gen_random_tokens(ip_lens, tokenizer, random_seed):
+
+    def get_sample_from_population(population_range, sample_size):
+        # random.sample can not sample a value more than once. hence the check
+        if sample_size < len(population_range):
+            sample = random.sample(population_range, sample_size)
+        else:
+            sample = random.choices(population_range, k=sample_size)
+
+        return sample
+
     input_ids = []
     random.seed(random_seed)
     for ip_len in ip_lens:
-        start_ids = [
-            random.randint(0, tokenizer.vocab_size - 1) for _ in range(ip_len)
-        ]
+        start_ids = get_sample_from_population(range(0, tokenizer.vocab_size),
+                                               ip_len)
         # Make sure it does not contain EOS token
         while set(tokenizer.encode(tokenizer.eos_token)).issubset(start_ids):
-            start_ids = [
-                random.randint(0, tokenizer.vocab_size - 1)
-                for _ in range(ip_len)
-            ]
+            start_ids = get_sample_from_population(
+                range(0, tokenizer.vocab_size), ip_len)
         input_ids.append(start_ids)
 
     return input_ids

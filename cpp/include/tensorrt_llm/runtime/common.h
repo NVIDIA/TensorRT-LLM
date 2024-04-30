@@ -23,6 +23,12 @@
 namespace tensorrt_llm::runtime
 {
 
+#ifdef TRT_LLM_USE_DIM64
+#define FMT_DIM "%ld"
+#else
+#define FMT_DIM "%d"
+#endif
+
 // typedefs
 // Note that we use signed size types as recommended by TensorRT:
 // https://github.com/NVIDIA/TensorRT/blob/main/CODING-GUIDELINES.md#signed-vs-unsigned-integers

@@ -18,7 +18,7 @@
 #include "tensorrt_llm/kernels/beamSearchKernels.h"
 #include "tensorrt_llm/layers/beamSearchLayer.h"
 #include "tensorrt_llm/layers/defaultDecodingParams.h"
-#include "tensorrt_llm/layers/fillBuffers.h"
+#include "tensorrt_llm/layers/layerUtils.h"
 #include <limits>
 
 using namespace tensorrt_llm::common;
@@ -30,21 +30,11 @@ namespace layers
 {
 
 template <typename T>
-BeamSearchLayer<T>::BeamSearchLayer(runtime::SizeType vocab_size, runtime::SizeType vocab_size_padded,
-    cudaStream_t stream, std::shared_ptr<IAllocator> allocator)
-    : BaseLayer(stream, std::move(allocator), nullptr)
-    , mVocabSize(vocab_size)
-    , mVocabSizePadded(vocab_size_padded)
-{
-    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
-}
-
-template <typename T>
-BeamSearchLayer<T>::BeamSearchLayer(BeamSearchLayer<T> const& beam_search_layer)
-    : BaseLayer(beam_search_layer)
-    , mVocabSize(beam_search_layer.mVocabSize)
-    , mVocabSizePadded(beam_search_layer.mVocabSizePadded)
-    , mWorkspaceSize(beam_search_layer.mWorkspaceSize)
+BeamSearchLayer<T>::BeamSearchLayer(
+    DecoderDomain const& decoderDomain, cudaStream_t stream, std::shared_ptr<IAllocator> allocator)
+    : BaseLayer(decoderDomain, stream, std::move(allocator))
+    , mVocabSize(decoderDomain.getVocabSize())
+    , mVocabSizePadded(decoderDomain.getVocabSizePadded())
 {
     TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
 }
@@ -56,12 +46,14 @@ BeamSearchLayer<T>::~BeamSearchLayer()
 }
 
 template <typename T>
-void BeamSearchLayer<T>::setup(
-    runtime::SizeType const batch_size, runtime::SizeType const beam_width, SetupParams const& setupParams)
+void BeamSearchLayer<T>::setup(runtime::SizeType const batch_size, runtime::SizeType const beam_width,
+    runtime::SizeType const* batchSlots, std::shared_ptr<BaseSetupParams> baseSetupParams)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK_WITH_INFO(
         beam_width <= nMaxBeamWidth, std::string("Beam width is larger than the maximum supported (64)."));
+
+    auto setupParams = std::dynamic_pointer_cast<BeamSearchSetupParams>(baseSetupParams);
 
     mDiversityRateHost.resize(batch_size);
     mLengthPenaltyHost.resize(batch_size);
@@ -73,12 +65,12 @@ void BeamSearchLayer<T>::setup(
     auto constexpr fltEpsilon = std::numeric_limits<float>::epsilon();
 
     FillBuffers const fillBuffers{batch_size, batch_size, mStream};
-    fillBuffers(setupParams.beam_search_diversity_rate, DefaultDecodingParams::getBeamSearchDiversity(),
+    fillBuffers(setupParams->beam_search_diversity_rate, DefaultDecodingParams::getBeamSearchDiversity(),
         mDiversityRateHost, mDiversityRateDevice, (int*) nullptr, std::make_pair(-fltEpsilon, fltMax),
         "diveristy rate");
-    fillBuffers(setupParams.length_penalty, DefaultDecodingParams::getLengthPenalty(), mLengthPenaltyHost,
+    fillBuffers(setupParams->length_penalty, DefaultDecodingParams::getLengthPenalty(), mLengthPenaltyHost,
         mLengthPenaltyDevice, (int*) nullptr, std::make_pair(fltMin, fltMax), "length penalty");
-    fillBuffers(setupParams.early_stopping, DefaultDecodingParams::getEarlyStopping(), mEarlyStoppingHost,
+    fillBuffers(setupParams->early_stopping, DefaultDecodingParams::getEarlyStopping(), mEarlyStoppingHost,
         mEarlyStoppingDevice, (int*) nullptr, std::make_pair(fltMin, fltMax), "early stopping");
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -130,41 +122,45 @@ void updateIndirCacheKernelLauncher(int* tgt_cache_indirection, int const* src_c
 }
 
 template <typename T>
-void BeamSearchLayer<T>::forward(OutputParams& op, ForwardParams const& fp)
+void BeamSearchLayer<T>::forward(
+    std::shared_ptr<BaseOutputParams> baseOutputs, std::shared_ptr<BaseInputParams> baseInputs)
 {
     TLLM_LOG_TRACE("%s", __PRETTY_FUNCTION__);
 
-    TLLM_CHECK_WITH_INFO(op.beamHypotheses, std::string("Output BeamHypotheses is not set."));
-    TLLM_CHECK_WITH_INFO(op.sequence_length->template getPtr<int>() != nullptr || mLengthPenaltyDevice == nullptr,
-        std::string("Current sequence lengths must be set for length penalty computation."));
-    TLLM_CHECK_WITH_INFO(fp.ite == 0, "Pipeline Parallelism is not supported yet !");
+    auto fp = std::dynamic_pointer_cast<BeamSearchInputParams>(baseInputs);
+    auto op = std::dynamic_pointer_cast<BeamSearchOutputParams>(baseOutputs);
 
-    BeamHypotheses& bh{*op.beamHypotheses};
-    bh.nBatchSize = static_cast<std::int32_t>(op.output_ids_ptr.shape[0]);
-    bh.nBeamWidth = static_cast<std::int32_t>(op.output_ids_ptr.shape[1]);
-    bh.nIte = fp.ite;
-    bh.nBatchSizeLocal = fp.logits.shape[0];
-    bh.nMaxSeqLen = static_cast<std::int32_t>(op.output_ids_ptr.shape[2]);
+    TLLM_CHECK_WITH_INFO(op->beamHypotheses, std::string("Output BeamHypotheses is not set."));
+    TLLM_CHECK_WITH_INFO(op->sequence_length->template getPtr<int>() != nullptr || mLengthPenaltyDevice == nullptr,
+        std::string("Current sequence lengths must be set for length penalty computation."));
+    TLLM_CHECK_WITH_INFO(fp->ite == 0, "Pipeline Parallelism is not supported yet !");
+
+    BeamHypotheses& bh{*op->beamHypotheses};
+    bh.nBatchSize = static_cast<std::int32_t>(op->output_ids_ptr.shape[0]);
+    bh.nBeamWidth = static_cast<std::int32_t>(op->output_ids_ptr.shape[1]);
+    bh.nIte = fp->ite;
+    bh.nBatchSizeLocal = fp->logits.shape[0];
+    bh.nMaxSeqLen = static_cast<std::int32_t>(op->output_ids_ptr.shape[2]);
     bh.nVocabSize = mVocabSizePadded;
     bh.diversityRates = mDiversityRateDevice;
     bh.lengthPenalties = mLengthPenaltyDevice;
     bh.earlyStoppings = mEarlyStoppingDevice;
-    // bh.inputLengths = (fp.input_lengths) ? fp.input_lengths->template getPtr<int const>() : nullptr;
+    // bh.inputLengths = (fp->input_lengths) ? fp->input_lengths->template getPtr<int const>() : nullptr;
     // TODO: unify the assignment of inputLengths
-    bh.endIds = fp.end_ids.template getPtr<int const>();
-    bh.logProbs = (op.output_log_probs) ? op.output_log_probs->template getPtr<float>() : nullptr;
+    bh.endIds = fp->end_ids.template getPtr<int const>();
+    bh.logProbs = (op->output_log_probs) ? op->output_log_probs->template getPtr<float>() : nullptr;
     // TODO (wili): here is a error in C++ workflow
     // In Python workflow, `op.output_log_probs` here is assigned by `outputs.output_log_probs_tiled` [MSL, BS, BM]
     // (function layersForward in file cpp/tensorrt_llm/layers/dynamicDecodeLayer.cpp)
     // But in C++ workflow, `op.output_log_probs` here is assigned by `output.logProbs` [BS, BM, MSL]
     // (function prepareOutputs in file cpp/tensorrt_llm/runtime/gptDecoder.cpp)
-    bh.sequenceLengths = op.sequence_length->template getPtr<int>();
-    bh.cumLogProbs = op.cum_log_probs->template getPtr<float>();
-    bh.finished = reinterpret_cast<FinishedState*>(op.finished->template getPtr<FinishedState::UnderlyingType>());
-    bh.outputIdsPtr = op.output_ids_ptr.template getPtr<int*>();
-    bh.parentIdsPtr = op.parent_ids_ptr.template getPtr<int*>();
+    bh.sequenceLengths = op->sequence_length->template getPtr<int>();
+    bh.cumLogProbs = op->cum_log_probs->template getPtr<float>();
+    bh.finished = reinterpret_cast<FinishedState*>(op->finished->template getPtr<FinishedState::UnderlyingType>());
+    bh.outputIdsPtr = op->output_ids_ptr.template getPtr<int*>();
+    bh.parentIdsPtr = op->parent_ids_ptr.template getPtr<int*>();
 
-    T const* logits = fp.logits.template getPtr<T>();
+    T const* logits = fp->logits.template getPtr<T>();
     T const* bias = static_cast<T const*>(nullptr);
     TLLM_CHECK_WITH_INFO(mWorkspaceSize >= 2 * bh.nBatchSize * bh.nBeamWidth * bh.nBeamWidth * 2,
         std::string("Workspace size is not enough for topk softmax."));
@@ -174,12 +170,12 @@ void BeamSearchLayer<T>::forward(OutputParams& op, ForwardParams const& fp)
 
     if (bh.nBeamWidth > 1)
     {
-        auto* const inputLengths = fp.input_lengths ? fp.input_lengths->template getPtr<int const>() : nullptr;
-        auto tgt_ci = op.tgt_cache_indirection.template getPtr<int>();
-        auto src_ci = fp.src_cache_indirection.template getPtr<int const>();
+        auto* const inputLengths = fp->input_lengths ? fp->input_lengths->template getPtr<int const>() : nullptr;
+        auto tgt_ci = op->tgt_cache_indirection.template getPtr<int>();
+        auto src_ci = fp->src_cache_indirection.template getPtr<int const>();
 
         updateIndirCacheKernelLauncher(
-            tgt_ci, src_ci, bh, inputLengths, fp.max_attention_window, fp.sink_token_length, mStream);
+            tgt_ci, src_ci, bh, inputLengths, fp->max_attention_window, fp->sink_token_length, mStream);
         sync_check_cuda_error();
     }
 }
