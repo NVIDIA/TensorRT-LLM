@@ -18,7 +18,9 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#if defined(ENABLE_FP8)
 #include <cuda_fp8.h>
+#endif
 
 #include "cutlass/bfloat16.h"
 #include "cutlass/float8.h"

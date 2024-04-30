@@ -440,6 +440,245 @@ struct FastInterleavedAndBiasedNumericArrayConverter<bfloat16_t, uint4b_t, N>
     }
 };
 
+template <>
+struct FastInterleavedAndBiasedNumericArrayConverter<half_t, uint2b_t, 16>
+{
+    using result_type = Array<half_t, 16>;
+    using source_type = Array<uint2b_t, 16>;
+
+    CUTLASS_DEVICE
+    static result_type convert(source_type const& source)
+    {
+        result_type result;
+
+        uint32_t* h = reinterpret_cast<uint32_t*>(&result);
+        uint32_t const i2s = reinterpret_cast<uint32_t const&>(source);
+
+        // First, we extract the i4s and construct an intermediate fp16 number.
+        static constexpr uint32_t immLut = (0xf0 & 0xcc) | 0xaa;
+        static constexpr uint32_t BOTTOM0_MASK = 0x00030003;
+        static constexpr uint32_t BOTTOM1_MASK = 0x000c000c;
+        static constexpr uint32_t TOP0_MASK = 0x00300030;
+        static constexpr uint32_t TOP1_MASK = 0x00c000c0;
+        static constexpr uint32_t I2s_TO_F16s_MAGIC_NUM = 0x64006400;
+
+        // Shift right by 8 to now consider elt_45 and elt_67. Issue first to hide RAW dependency if we issue
+        // immediately before required.
+        const uint32_t top_i2s = i2s >> 8;
+        // Extract elt_01 - (i2s & 0x00020002) | 0x64006400
+        asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+                     : "=r"(h[0])
+                     : "r"(i2s), "n"(BOTTOM0_MASK), "n"(I2s_TO_F16s_MAGIC_NUM), "n"(immLut));
+        asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+                     : "=r"(h[1])
+                     : "r"(i2s), "n"(BOTTOM1_MASK), "n"(I2s_TO_F16s_MAGIC_NUM), "n"(immLut));
+        asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+                     : "=r"(h[2])
+                     : "r"(i2s), "n"(TOP0_MASK), "n"(I2s_TO_F16s_MAGIC_NUM), "n"(immLut));
+        asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+                     : "=r"(h[3])
+                     : "r"(i2s), "n"(TOP1_MASK), "n"(I2s_TO_F16s_MAGIC_NUM), "n"(immLut));
+
+        // Extract elt_89 - (i2s & 0x00020002) | 0x64006400
+        asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+                     : "=r"(h[4])
+                     : "r"(top_i2s), "n"(BOTTOM0_MASK), "n"(I2s_TO_F16s_MAGIC_NUM), "n"(immLut));
+        asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+                     : "=r"(h[5])
+                     : "r"(top_i2s), "n"(BOTTOM1_MASK), "n"(I2s_TO_F16s_MAGIC_NUM), "n"(immLut));
+        asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+                     : "=r"(h[6])
+                     : "r"(top_i2s), "n"(TOP0_MASK), "n"(I2s_TO_F16s_MAGIC_NUM), "n"(immLut));
+        asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+                     : "=r"(h[7])
+                     : "r"(top_i2s), "n"(TOP1_MASK), "n"(I2s_TO_F16s_MAGIC_NUM), "n"(immLut));
+
+        // I use inline PTX below because I am not sure if the compiler will emit float2half instructions if I use the
+        // half2 ctor. In this case, I chose performance reliability over code readability.
+
+        // This is the half2 {1026, 1026} represented as an integer.
+        static constexpr uint32_t FP16_TOP_MAGIC_NUM = 0x64026402;
+        // This is the half2 {1 / 4, 1 / 4} represented as an integer.
+        static constexpr uint32_t ONE_FOUR = 0x34003400;
+        static constexpr uint32_t ONE_SIXTEENTH = 0x2c002c00;
+        static constexpr uint32_t ONE_SIXTY_FOUR = 0x24002400;
+        // This is the half2 {-72, -72} represented as an integer.
+        //static constexpr uint32_t NEG_72 = 0xd480d480;
+        static constexpr uint32_t NEG_258 = 0xdc08dc08;
+        static constexpr uint32_t NEG_66 = 0xd420d420;
+        static constexpr uint32_t NEG_18 = 0xcc80cc80;
+
+        // Finally, we construct the output numbers.
+        // Convert elt_01
+        asm volatile("sub.f16x2 %0, %1, %2;\n" : "=r"(h[0]) : "r"(h[0]), "r"(FP16_TOP_MAGIC_NUM));
+        // Convert elt_23
+        asm volatile("fma.rn.f16x2 %0, %1, %2, %3;\n" : "=r"(h[1]) : "r"(h[1]), "r"(ONE_FOUR), "r"(NEG_258));
+        // Convert elt_45
+        asm volatile("fma.rn.f16x2 %0, %1, %2, %3;\n" : "=r"(h[2]) : "r"(h[2]), "r"(ONE_SIXTEENTH), "r"(NEG_66));
+        // Convert elt_67
+        asm volatile("fma.rn.f16x2 %0, %1, %2, %3;\n" : "=r"(h[3]) : "r"(h[3]), "r"(ONE_SIXTY_FOUR), "r"(NEG_18));
+
+        asm volatile("sub.f16x2 %0, %1, %2;\n" : "=r"(h[4]) : "r"(h[4]), "r"(FP16_TOP_MAGIC_NUM));
+        // Convert elt_23
+        asm volatile("fma.rn.f16x2 %0, %1, %2, %3;\n" : "=r"(h[5]) : "r"(h[5]), "r"(ONE_FOUR), "r"(NEG_258));
+        // Convert elt_45
+        asm volatile("fma.rn.f16x2 %0, %1, %2, %3;\n" : "=r"(h[6]) : "r"(h[6]), "r"(ONE_SIXTEENTH), "r"(NEG_66));
+        // Convert elt_67
+        asm volatile("fma.rn.f16x2 %0, %1, %2, %3;\n" : "=r"(h[7]) : "r"(h[7]), "r"(ONE_SIXTY_FOUR), "r"(NEG_18));
+
+        return result;
+    }
+
+    CUTLASS_DEVICE
+    result_type operator()(source_type const& s)
+    {
+        return convert(s);
+    }
+};
+
+template <int N>
+struct FastInterleavedAndBiasedNumericArrayConverter<half_t, uint2b_t, N>
+{
+    static constexpr int VEC_WIDTH = 16;
+    static_assert(!(N % VEC_WIDTH), "N must be multiple of 16.");
+
+    using result_type = Array<half_t, N>;
+    using source_type = Array<uint2b_t, N>;
+
+    CUTLASS_DEVICE
+    static result_type convert(source_type const& source)
+    {
+        using scalar_result_type = typename result_type::Element;
+        using scalar_source_type = typename source_type::Element;
+        FastInterleavedAndBiasedNumericArrayConverter<scalar_result_type, scalar_source_type, VEC_WIDTH>
+            convert_vector_;
+
+        result_type result;
+        using vec_result = Array<scalar_result_type, VEC_WIDTH>;
+        using vec_source = Array<scalar_source_type, VEC_WIDTH>;
+
+        vec_result* result_ptr = reinterpret_cast<vec_result*>(&result);
+        vec_source const* source_ptr = reinterpret_cast<vec_source const*>(&source);
+
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < N / VEC_WIDTH; ++i)
+        {
+            result_ptr[i] = convert_vector_(source_ptr[i]);
+        }
+
+        return result;
+    }
+
+    CUTLASS_DEVICE
+    result_type operator()(source_type const& s)
+    {
+        return convert(s);
+    }
+};
+
+template <>
+struct FastInterleavedAndBiasedNumericArrayConverter<bfloat16_t, uint2b_t, 16>
+{
+    using result_type = Array<bfloat16_t, 16>;
+    using source_type = Array<uint2b_t, 16>;
+
+    CUTLASS_DEVICE
+    static result_type convert(source_type const& source)
+    {
+        result_type result;
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
+
+        uint32_t* h = reinterpret_cast<uint32_t*>(&result);
+        uint32_t source_i2s = reinterpret_cast<uint32_t const&>(source);
+
+        static constexpr uint32_t immLut = (0xf0 & 0xcc) | 0xaa;
+        static constexpr uint32_t MASK = 0x00030003;
+        static constexpr uint32_t I2s_TO_BF16s_MAGIC_NUM = 0x43004300;
+
+        // We don't have enough mantissa to remove as much shift overhead as FP16, so we must loop.
+        // No shift needed for first item.
+        uint32_t i2s = source_i2s;
+        asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+                     : "=r"(h[0])
+                     : "r"(i2s), "n"(MASK), "n"(I2s_TO_BF16s_MAGIC_NUM), "n"(immLut));
+        CUTLASS_PRAGMA_UNROLL
+        for (int ii = 1; ii < result_type::kElements / 2; ++ii)
+        {
+            i2s >>= sizeof_bits<typename source_type::Element>::value;
+            asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+                         : "=r"(h[ii])
+                         : "r"(i2s), "n"(MASK), "n"(I2s_TO_BF16s_MAGIC_NUM), "n"(immLut));
+        }
+
+        // This is the BF16 {-130, -130} represented as an integer.
+        static constexpr uint32_t BF16_BIAS = 0xC302C302;
+        static constexpr uint32_t BF16_ONE = 0x3F803F80;
+
+        // Finally, we construct the output numbers.
+        CUTLASS_PRAGMA_UNROLL
+        for (int ii = 0; ii < result_type::kElements / 2; ++ii)
+        {
+            // Since this section is for Ampere+, we use bf16 fma to do the bias subtraction
+            asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(h[ii]) : "r"(h[ii]), "r"(BF16_ONE), "r"(BF16_BIAS));
+        }
+        //*/
+#else
+        // Disable this on architectures older than Ampere since they lack hardware for bf16 mma. If one wishes to use
+        // HMMA on older hardware, they should Convert directly to FP16 using FP16 converters.
+        arch::device_breakpoint();
+        result.clear(); // Suppress compiler warning.
+#endif
+        return result;
+    }
+
+    CUTLASS_DEVICE
+    result_type operator()(source_type const& s)
+    {
+        return convert(s);
+    }
+};
+
+template <int N>
+struct FastInterleavedAndBiasedNumericArrayConverter<bfloat16_t, uint2b_t, N>
+{
+    static constexpr int VEC_WIDTH = 16;
+    static_assert(!(N % VEC_WIDTH), "N must be multiple of 16.");
+
+    using result_type = Array<bfloat16_t, N>;
+    using source_type = Array<uint2b_t, N>;
+
+    CUTLASS_DEVICE
+    static result_type convert(source_type const& source)
+    {
+        //printf("convert uint2 to bfloat16\n");
+        using scalar_result_type = typename result_type::Element;
+        using scalar_source_type = typename source_type::Element;
+        FastInterleavedAndBiasedNumericArrayConverter<scalar_result_type, scalar_source_type, VEC_WIDTH>
+            convert_vector_;
+
+        result_type result;
+        using vec_result = Array<scalar_result_type, VEC_WIDTH>;
+        using vec_source = Array<scalar_source_type, VEC_WIDTH>;
+
+        vec_result* result_ptr = reinterpret_cast<vec_result*>(&result);
+        vec_source const* source_ptr = reinterpret_cast<vec_source const*>(&source);
+
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < N / VEC_WIDTH; ++i)
+        {
+            result_ptr[i] = convert_vector_(source_ptr[i]);
+        }
+
+        return result;
+    }
+
+    CUTLASS_DEVICE
+    result_type operator()(source_type const& s)
+    {
+        return convert(s);
+    }
+};
+
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 } // namespace cutlass

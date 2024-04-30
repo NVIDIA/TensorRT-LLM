@@ -264,6 +264,9 @@ def generate_sm90_mixed_gemm_operations():
          DataType.bf16),
         (DataType.f16, DataType.u8, DataType.f16, DataType.f16, DataType.f16),
         (DataType.bf16, DataType.u8, DataType.bf16, DataType.bf16,
+         DataType.bf16),
+        (DataType.f16, DataType.u2, DataType.f16, DataType.f16, DataType.f16),
+        (DataType.bf16, DataType.u2, DataType.bf16, DataType.bf16,
          DataType.bf16)
     ]
 

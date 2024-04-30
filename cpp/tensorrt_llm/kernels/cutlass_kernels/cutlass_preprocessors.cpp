@@ -114,6 +114,9 @@ LayoutDetails getLayoutDetailsForArch(QuantType quant_type)
     case QuantType::W4_AFP8:
         details = getLayoutDetailsForArchAndQuantType<cutlassArch, cutlass::float_e4m3_t, cutlass::uint4b_t>();
         break;
+    case QuantType::W2_A16:
+        details = getLayoutDetailsForArchAndQuantType<cutlassArch, cutlass::half_t, cutlass::uint2b_t>();
+        break;
     default: TLLM_THROW("Unsupported quantization type");
     }
     return details;
@@ -172,6 +175,12 @@ std::vector<int> get_permutation_map(QuantType quant_type)
     {
         return {0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7, 20, 21, 22, 23, 8, 9, 10, 11, 24, 25, 26, 27, 12, 13, 14, 15,
             28, 29, 30, 31};
+    }
+    else if (quant_type == QuantType::W2_A16)
+    {
+        return {0,  1,  8,  9, 16, 17, 24, 25, 32, 33, 40, 41, 48, 49, 56, 57, 2,  3, 10, 11, 18, 19, 26, 27, 34, 35,
+            42, 43, 50, 51, 58, 59, 4,  5, 12, 13, 20, 21, 28, 29, 36, 37, 44, 45, 52, 53, 60, 61, 6,  7, 14, 15, 22,
+            23, 30, 31, 38, 39, 46, 47, 54, 55, 62, 63};
     }
     else
     {
@@ -350,6 +359,32 @@ void subbyte_transpose_impl(
                         }
                     }
                 }
+                else if constexpr (bits_per_elt == 2)
+                {
+
+                    for (int ii = 0; ii < M_TILE_L1; ++ii)
+                    {
+                        // Using M_TILE_L1 here is deliberate since we assume that the cache tile
+                        // is square in the number of elements (not necessarily the number of bytes).
+                        for (int jj = ii + 1; jj < M_TILE_L1; ++jj)
+                        {
+                            const int ii_byte = ii / ELTS_PER_BYTE;
+                            const int ii_bit_offset = ii % ELTS_PER_BYTE;
+
+                            const int jj_byte = jj / ELTS_PER_BYTE;
+                            const int jj_bit_offset = jj % ELTS_PER_BYTE;
+
+                            uint8_t src_elt = 0x3 & (cache_buf[ii][jj_byte] >> (2 * jj_bit_offset));
+                            uint8_t tgt_elt = 0x3 & (cache_buf[jj][ii_byte] >> (2 * ii_bit_offset));
+
+                            cache_buf[ii][jj_byte] &= (~(0x3 << (2 * jj_bit_offset)));
+                            cache_buf[jj][ii_byte] &= (~(0x3 << (2 * ii_bit_offset)));
+
+                            cache_buf[ii][jj_byte] |= (tgt_elt << (2 * jj_bit_offset));
+                            cache_buf[jj][ii_byte] |= (src_elt << (2 * ii_bit_offset));
+                        }
+                    }
+                }
                 else
                 {
                     TLLM_CHECK_WITH_INFO(false, "Unsupported quantization type.");
@@ -399,6 +434,10 @@ void subbyte_transpose(int8_t* transposed_quantized_tensor, int8_t const* quanti
     else if (quant_type == QuantType::W4_AFP8)
     {
         subbyte_transpose_impl<QuantType::W4_AFP8>(transposed_quantized_tensor, quantized_tensor, shape);
+    }
+    else if (quant_type == QuantType::W2_A16)
+    {
+        subbyte_transpose_impl<QuantType::W2_A16>(transposed_quantized_tensor, quantized_tensor, shape);
     }
     else
     {
@@ -485,6 +524,70 @@ void add_bias_and_interleave_int4s_inplace(int8_t* packed_int4_tensor, const siz
     }
 }
 
+void add_bias_and_interleave_int2s_inplace(int8_t* packed_int2_tensor, const size_t num_elts)
+{
+    const int num_bytes = num_elts / 4;
+
+    // Step 1 will be to transform all the int4s to unsigned in order to make the dequantize take as little
+    // instructions as possible in the CUDA code.
+    for (size_t ii = 0; ii < num_bytes; ++ii)
+    {
+        int8_t transformed_packed_int2s = 0;
+        int8_t transformed_elt0
+            = (int8_t(packed_int2_tensor[ii] << 6) >> 6) + 2; // The double shift here is to ensure sign extension
+        int8_t transformed_elt1
+            = (int8_t(packed_int2_tensor[ii] << 4) >> 6) + 2; // The double shift here is to ensure sign extension
+        int8_t transformed_elt2
+            = (int8_t(packed_int2_tensor[ii] << 2) >> 6) + 2; // The double shift here is to ensure sign extension
+        int8_t transformed_elt3 = (packed_int2_tensor[ii] >> 6) + 2;
+
+        TLLM_CHECK_WITH_INFO(
+            transformed_elt0 >= 0 && transformed_elt0 <= 3, "Illegal result for int2 transform (elt0)");
+        TLLM_CHECK_WITH_INFO(
+            transformed_elt1 >= 0 && transformed_elt1 <= 3, "Illegal result for int2 transform (elt1)");
+        TLLM_CHECK_WITH_INFO(
+            transformed_elt2 >= 0 && transformed_elt2 <= 3, "Illegal result for int2 transform (elt2)");
+        TLLM_CHECK_WITH_INFO(
+            transformed_elt3 >= 0 && transformed_elt3 <= 3, "Illegal result for int2 transform (elt3)");
+
+        // We don't need to mask in these ops since everything should be in the range 0-3
+        transformed_packed_int2s |= transformed_elt0;
+        transformed_packed_int2s |= (transformed_elt1 << 2);
+        transformed_packed_int2s |= (transformed_elt2 << 4);
+        transformed_packed_int2s |= (transformed_elt3 << 6);
+        packed_int2_tensor[ii] = transformed_packed_int2s;
+    }
+
+    // Step 2 will transform the layout of a 32-bit register in CUDA in order to minimize the number of shift & logical
+    // instructions That are needed to extract the int4s in the GEMM main loop. Pictorially, the loop below will do the
+    // following: Take as input a 32 bit register with layout: bit 32 0
+    //      [elt15 ... elt_7  elt_6  elt_5  elt_4  elt_3  elt_2  elt_1  elt_0] (each elt occupies 4 bits)
+    //
+    // And it will rearrange the output 32 bit register to be the following:
+    // bit 32                                                      0
+    //      [elt_15  ... elt_5  elt_3  elt_1  elt_14 ...  elt_4  elt_2  elt_0] (each elt occupies 4 bits)
+
+    TLLM_CHECK_WITH_INFO(num_bytes % 4 == 0, "Dimensions of int2 tensor must be a multiple of 16 for register relayout");
+    const size_t num_registers = num_bytes / 4;
+
+    uint32_t* register_ptr = reinterpret_cast<uint32_t*>(packed_int2_tensor);
+    for (size_t ii = 0; ii < num_registers; ++ii)
+    {
+        const uint32_t current_register = register_ptr[ii];
+        uint32_t transformed_register = 0;
+
+        for (int dest_idx = 0; dest_idx < 16; ++dest_idx)
+        {
+            const int src_idx = dest_idx < 8 ? 2 * dest_idx : 2 * (dest_idx - 8) + 1;
+            const int src_shift = 2 * src_idx;
+            const int dest_shift = 2 * dest_idx;
+
+            const uint32_t src_bits = (current_register >> src_shift) & 0x3;
+            transformed_register |= (src_bits << dest_shift);
+        }
+        register_ptr[ii] = transformed_register;
+    }
+}
 void add_bias_and_interleave_quantized_tensor_inplace(int8_t* tensor, const size_t num_elts, QuantType quant_type)
 {
     if (quant_type == QuantType::W8_A16)
@@ -498,6 +601,10 @@ void add_bias_and_interleave_quantized_tensor_inplace(int8_t* tensor, const size
         // As a result, we still want permute the data so that it is well aligned
         // for conversion to FP16.
         add_bias_and_interleave_int4s_inplace(tensor, num_elts);
+    }
+    else if (quant_type == QuantType::W2_A16)
+    {
+        add_bias_and_interleave_int2s_inplace(tensor, num_elts);
     }
     else
     {
