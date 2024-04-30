@@ -40,19 +40,36 @@ private:
         std::vector<SamplingConfig> const& configs, std::function<OptVec<T>(size_t ci)> accessor, T defaultValue)
     {
         std::vector<T> values;
+        bool atLeastOneHasValue{false};
         for (size_t ci = 0; ci < configs.size(); ++ci)
         {
-            auto value = defaultValue;
             auto const& configValue = accessor(ci);
             if (configValue.has_value())
             {
-                TLLM_CHECK(configValue.value().size() == 1);
-                value = configValue.value().front();
+                atLeastOneHasValue = true;
+                break;
             }
-            values.push_back(value);
         }
+        if (atLeastOneHasValue)
+        {
+            for (size_t ci = 0; ci < configs.size(); ++ci)
+            {
+                auto value = defaultValue;
+                auto const& configValue = accessor(ci);
+                if (configValue.has_value())
+                {
+                    TLLM_CHECK(configValue.value().size() == 1);
+                    value = configValue.value().front();
+                }
+                values.push_back(value);
+            }
 
-        return std::make_optional<std::vector<T>>(values);
+            return std::make_optional<std::vector<T>>(values);
+        }
+        else
+        {
+            return std::nullopt;
+        }
     }
 
     template <typename T>

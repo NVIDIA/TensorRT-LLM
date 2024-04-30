@@ -26,6 +26,7 @@
 #include "tensorrt_llm/executor/tensor.h"
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
 #include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/gptJsonConfig.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
 #include "tensorrt_llm/runtime/utils/numpyUtils.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
@@ -38,6 +39,7 @@
 #include <nlohmann/json.hpp>
 #include <numeric>
 #include <optional>
+#include <random>
 #include <string>
 #include <thread>
 #include <utility>
@@ -146,6 +148,9 @@ struct BenchmarkParams
     bool enableBlockReuse{false};
     bool enableChunkedContext{false};
     bool streaming{false};
+    bool enableExpDelays{false};
+    std::optional<float> requestRate{std::nullopt};
+    int randomSeed = 430;
 
     // lora / peft params
     std::optional<std::string> loraDir{std::nullopt};
@@ -156,7 +161,80 @@ struct BenchmarkParams
     size_t kvHostCacheSize{0};
     bool kvOnboardBlocks{true};
 };
+
+class InferenceRequestsAsyncSend
+{
+public:
+    InferenceRequestsAsyncSend(std::shared_ptr<tensorrt_llm::mpi::MpiComm> comm,
+        std::list<std::shared_ptr<InferenceRequest>> const& inferenceRequests, int const peer)
+    {
+        TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+        TLLM_LOG_DEBUG("start send requests to rank %d", peer);
+        mNumNewWorkItems = static_cast<int64_t>(inferenceRequests.size());
+        mRequest1 = comm->sendAsync(&mNumNewWorkItems, 1, mpi::MpiType::kINT64, peer, 0);
+        if (mNumNewWorkItems > 0)
+        {
+            for (auto const& infReq : inferenceRequests)
+            {
+                auto vpacked = infReq->serialize();
+                mPacked.push_back(static_cast<int64_t>(vpacked.size()));
+                mPacked.insert(mPacked.end(), std::move_iterator(vpacked.begin()), std::move_iterator(vpacked.end()));
+            }
+            mVecSize = static_cast<int64_t>(mPacked.size());
+            mRequest2 = comm->sendAsync(&mVecSize, 1, mpi::MpiType::kINT64, peer, 1);
+            mRequest3 = comm->sendAsync(mPacked.data(), mPacked.size(), mpi::MpiType::kINT64, peer, 2);
+        }
+        TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+    }
+
+    ~InferenceRequestsAsyncSend()
+    {
+        TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+        mRequest1->wait();
+        if (mRequest2)
+            mRequest2->wait();
+        if (mRequest3)
+            mRequest3->wait();
+        TLLM_LOG_DEBUG("end send requests");
+        TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+    }
+
+private:
+    int64_t mNumNewWorkItems;
+    int64_t mVecSize;
+    std::vector<int64_t> mPacked;
+    std::shared_ptr<tensorrt_llm::mpi::MpiRequest> mRequest1;
+    std::shared_ptr<tensorrt_llm::mpi::MpiRequest> mRequest2;
+    std::shared_ptr<tensorrt_llm::mpi::MpiRequest> mRequest3;
+};
 } // namespace
+
+void inferenceRequestsRecv(std::shared_ptr<tensorrt_llm::mpi::MpiComm> comm,
+    std::list<std::shared_ptr<InferenceRequest>>& inferenceRequests, int const peer)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("start recv requests from rank %d", peer);
+    int64_t numNewWorkItems = 0;
+    comm->recv(&numNewWorkItems, 1, mpi::MpiType::kINT64, peer, 0);
+    if (numNewWorkItems > 0)
+    {
+        std::vector<int64_t> packed;
+        int64_t vecSize;
+        comm->recv(&vecSize, 1, mpi::MpiType::kINT64, peer, 1);
+        packed.resize(vecSize);
+        comm->recv(packed.data(), packed.size(), mpi::MpiType::kINT64, peer, 2);
+        int64_t* packed_ptr = packed.data();
+        for (int64_t count = 0; count < numNewWorkItems; ++count)
+        {
+            int64_t n = *(packed_ptr++);
+            auto infReq = InferenceRequest::deserialize(packed_ptr);
+            packed_ptr += n;
+            inferenceRequests.emplace_back(infReq);
+        }
+    }
+    TLLM_LOG_DEBUG("end recv requests from rank %d", peer);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
 
 // Class holding all infos regarding a single work item.
 // This includes the original request, associated response factor
@@ -789,7 +867,19 @@ public:
         , mStaticEmulatedBatchSize(staticEmulatedBatchSize)
         , mBatchTimeout(batchTimeout.value_or(std::chrono::milliseconds{0}))
         , mActiveCount(0)
+        , mInferReqAsyncSndHdl(nullptr)
     {
+        auto const jsonConfig = GptJsonConfig::parse(trtEnginePath / "config.json");
+        SizeType deviceCount{0};
+        TLLM_CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
+        mWorldConfig = WorldConfig::mpi(deviceCount, jsonConfig.getTensorParallelism(),
+            jsonConfig.getPipelineParallelism(), optionalParams.deviceIds);
+        auto& comm = COMM_SESSION;
+        mCommTensorParallel = std::make_shared<tensorrt_llm::mpi::MpiComm>(
+            comm.split(mWorldConfig.getPipelineParallelRank(), mWorldConfig.getTensorParallelRank()));
+        mCommPipelineParallel = std::make_shared<tensorrt_llm::mpi::MpiComm>(
+            comm.split(mWorldConfig.getTensorParallelRank(), mWorldConfig.getPipelineParallelRank()));
+
         ReturnBatchManagerStatsCallback iterationDataCallback = [this, logIterationData](std::string const& log)
         {
             if (logIterationData)
@@ -871,11 +961,11 @@ public:
     // Return up to max_num_requests inference requests.
     std::list<std::shared_ptr<InferenceRequest>> getInferenceRequests(int const max_num_requests)
     {
+        mInferReqAsyncSndHdl = nullptr;
         std::list<std::shared_ptr<InferenceRequest>> inferenceRequests;
         auto& comm = COMM_SESSION;
         if (max_num_requests > 0)
         {
-            auto world_size = comm.getSize();
             auto rank = comm.getRank();
             if (rank == 0)
             {
@@ -923,10 +1013,13 @@ public:
                         }
                     }
                 }
-                if (world_size > 1)
+                if (mWorldConfig.isTensorParallel())
                 {
                     auto numNewWorkItems = static_cast<int64_t>(inferenceRequests.size());
-                    comm.bcast(&numNewWorkItems, 1, mpi::MpiType::kINT64, 0);
+                    if (numNewWorkItems > 0 || mBatchManager->getNumActiveRequests() > 0)
+                    {
+                        mCommTensorParallel->bcast(&numNewWorkItems, 1, mpi::MpiType::kINT64, 0);
+                    }
                     if (numNewWorkItems > 0)
                     {
                         std::vector<int64_t> packed;
@@ -937,28 +1030,42 @@ public:
                             packed.insert(
                                 packed.end(), std::move_iterator(vpacked.begin()), std::move_iterator(vpacked.end()));
                         }
-                        comm.bcast(packed, 0);
+                        mCommTensorParallel->bcast(packed, 0);
                     }
                 }
             }
             else
             {
                 // subordinate ranks hang until master rank sends work
-                int64_t numNewWorkItems = 0;
-                comm.bcast(&numNewWorkItems, 1, mpi::MpiType::kINT64, 0);
-                if (numNewWorkItems > 0)
+                if (mWorldConfig.isFirstPipelineParallelRank())
                 {
-                    std::vector<int64_t> packed;
-                    comm.bcast(packed, 0);
-                    int64_t* packed_ptr = packed.data();
-                    for (int64_t count = 0; count < numNewWorkItems; ++count)
+                    int64_t numNewWorkItems = 0;
+                    mCommTensorParallel->bcast(&numNewWorkItems, 1, mpi::MpiType::kINT64, 0);
+                    if (numNewWorkItems > 0)
                     {
-                        int64_t n = *(packed_ptr++);
-                        auto infReq = InferenceRequest::deserialize(packed_ptr);
-                        packed_ptr += n;
-                        inferenceRequests.emplace_back(infReq);
+                        std::vector<int64_t> packed;
+                        mCommTensorParallel->bcast(packed, 0);
+                        int64_t* packed_ptr = packed.data();
+                        for (int64_t count = 0; count < numNewWorkItems; ++count)
+                        {
+                            int64_t n = *(packed_ptr++);
+                            auto infReq = InferenceRequest::deserialize(packed_ptr);
+                            packed_ptr += n;
+                            inferenceRequests.emplace_back(infReq);
+                        }
                     }
                 }
+                else
+                {
+                    auto const peer = mWorldConfig.getPipelineParallelRank() - 1;
+                    inferenceRequestsRecv(mCommPipelineParallel, inferenceRequests, peer);
+                }
+            }
+            if (!mWorldConfig.isLastPipelineParallelRank())
+            {
+                auto const peer = mWorldConfig.getPipelineParallelRank() + 1;
+                mInferReqAsyncSndHdl
+                    = std::make_shared<InferenceRequestsAsyncSend>(mCommPipelineParallel, inferenceRequests, peer);
             }
         }
         return inferenceRequests;
@@ -1001,6 +1108,10 @@ private:
     std::chrono::milliseconds mBatchTimeout;
     std::atomic<std::chrono::steady_clock::time_point::duration> mBatchDeadline;
     std::atomic<uint64_t> mActiveCount;
+    WorldConfig mWorldConfig;
+    std::shared_ptr<tensorrt_llm::mpi::MpiComm> mCommTensorParallel;
+    std::shared_ptr<tensorrt_llm::mpi::MpiComm> mCommPipelineParallel;
+    std::shared_ptr<InferenceRequestsAsyncSend> mInferReqAsyncSndHdl;
 
 }; // class GptServer
 
@@ -1011,7 +1122,6 @@ struct Sample
 {
     std::vector<int32_t> inputIds;
     int32_t outputLen;
-    float delay;
     int32_t taskId;
 };
 
@@ -1038,9 +1148,51 @@ Samples parseWorkloadJson(
         {
             input_ids.resize(maxPromptLen.value());
         }
-        samples.emplace_back(Sample{std::move(input_ids), sample["output_len"], sample["delay"], taskId});
+        samples.emplace_back(Sample{std::move(input_ids), sample["output_len"], taskId});
     }
     return samples;
+}
+
+std::vector<double> generateRandomExponentialValues(int count, float lambda, int seed)
+{
+    // Set a constant seed for reproducibility
+    std::mt19937 gen(seed);
+
+    // Create an exponential distribution object
+    std::exponential_distribution<double> distribution(lambda);
+
+    // Generate random numbers from the exponential distribution
+    std::vector<double> randomValues;
+    for (int i = 0; i < count; ++i)
+    {
+        double randomValue = distribution(gen);
+        randomValues.push_back(randomValue);
+    }
+
+    return randomValues;
+}
+
+std::vector<double> computeTimeDelays(BenchmarkParams const& benchmarkParams, int numDelays)
+{
+    std::vector<double> timeDelays;
+    if (benchmarkParams.requestRate.has_value() && benchmarkParams.requestRate.value() > 0.0)
+    {
+        if (benchmarkParams.enableExpDelays)
+        {
+            timeDelays = generateRandomExponentialValues(
+                numDelays, benchmarkParams.requestRate.value(), benchmarkParams.randomSeed);
+        }
+        else
+        {
+            timeDelays.assign(numDelays, 1.0 / benchmarkParams.requestRate.value());
+        }
+    }
+    else
+    {
+        timeDelays.assign(numDelays, 0.0);
+    }
+
+    return timeDelays;
 }
 
 std::shared_ptr<InferenceRequest> makeRequest(std::uint64_t reqId, Sample const& sample, bool streaming,
@@ -1117,8 +1269,6 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
     bool logIterationData, bool excludeInputInOutput, std::string const& responsesJsonFile,
     std::optional<SizeType> const maxPromptLen)
 {
-    auto const worldConfig = WorldConfig::mpi();
-
     TrtGptModelOptionalParams optionalParams;
 
     if (benchmarkParams.maxTokensInPagedKvCache)
@@ -1139,6 +1289,12 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
     optionalParams.peftCacheManagerConfig.numCopyStreams = 4;
     optionalParams.kvCacheConfig.hostCacheSize = benchmarkParams.kvHostCacheSize;
     optionalParams.kvCacheConfig.onboardBlocks = benchmarkParams.kvOnboardBlocks;
+
+    auto const jsonConfig = GptJsonConfig::parse(engineDir / "config.json");
+    SizeType deviceCount{0};
+    TLLM_CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
+    auto const worldConfig = WorldConfig::mpi(
+        deviceCount, jsonConfig.getTensorParallelism(), jsonConfig.getPipelineParallelism(), optionalParams.deviceIds);
 
     BufferManager bufferManager{std::make_shared<CudaStream>()}; // the stream is not used
 
@@ -1184,7 +1340,7 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
                 {
                     reqId++;
                 }
-                Sample s{std::vector<int32_t>{1, 2, 3, 4, 5}, 1, 0.f, static_cast<int32_t>(taskId)};
+                Sample s{std::vector<int32_t>{1, 2, 3, 4, 5}, 1, static_cast<int32_t>(taskId)};
                 auto r = makeRequest(reqId, s, benchmarkParams.streaming, beamWidthTensor, eosIdTensor, padIdTensor,
                     bufferManager, nullptr, nullptr, p.first, p.second);
                 gptServer->enqueue(r);
@@ -1209,18 +1365,22 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
         }
         gptServer->waitForEmpty();
 
+        // Time delay
+        auto timeDelays = computeTimeDelays(benchmarkParams, numSamples - 1);
+
         // Benchmark
         recorder->initialize();
         gptServer->resetBatchDeadline();
+
         for (std::size_t i = 0; i < numSamples; ++i)
         {
             auto request = makeRequest(i + 1, samples[i], benchmarkParams.streaming, beamWidthTensor, eosIdTensor,
                 padIdTensor, bufferManager, returnContextLogitsFlagTensor, returnGenerationLogitsFlagTensor);
             gptServer->enqueue(request);
-            auto delayInMs = static_cast<int>(samples[i].delay * 1000);
 
-            if (delayInMs != 0)
+            if (i < numSamples - 1)
             {
+                auto delayInMs = static_cast<int>(timeDelays.at(i) * 1000);
                 std::chrono::milliseconds delay(delayInMs);
                 std::this_thread::sleep_for(delay);
             }
@@ -1269,7 +1429,7 @@ void benchmarkExecutor(std::filesystem::path const& engineDir, TrtGptModelType m
             {
                 texec::LoraConfig loraConfig(
                     taskId, texec::detail::ofITensor(p.first), texec::detail::ofITensor(p.second));
-                Sample s{std::vector<int32_t>{1, 2, 3, 4, 5}, 1, 0.f, static_cast<int32_t>(taskId)};
+                Sample s{std::vector<int32_t>{1, 2, 3, 4, 5}, 1, static_cast<int32_t>(taskId)};
                 requests.emplace_back(makeExecutorRequest(s, beamWidth, eosId, padId, false, false, false, loraConfig));
             }
             executorServer->enqueue(std::move(requests), true);
@@ -1292,10 +1452,12 @@ void benchmarkExecutor(std::filesystem::path const& engineDir, TrtGptModelType m
 
         // Benchmark
         {
+            auto timeDelays = computeTimeDelays(benchmarkParams, numSamples - 1);
+
             // Create requests
             recorder->initialize();
             std::vector<texec::Request> requests;
-            std::vector<int> delays;
+
             for (std::size_t i = 0; i < numSamples; ++i)
             {
                 std::optional<texec::LoraConfig> loraConfig;
@@ -1305,10 +1467,10 @@ void benchmarkExecutor(std::filesystem::path const& engineDir, TrtGptModelType m
                 }
                 requests.emplace_back(makeExecutorRequest(samples[i], beamWidth, eosId, padId,
                     benchmarkParams.streaming, returnContextLogits, returnGenerationLogits, loraConfig));
-                delays.push_back(static_cast<int>(samples[i].delay * 1000));
             }
 
-            bool hasDelay = std::any_of(delays.begin(), delays.end(), [](auto const& delay) { return delay > 0; });
+            bool hasDelay
+                = std::any_of(timeDelays.begin(), timeDelays.end(), [](auto const& delay) { return delay > 0.0; });
             if (hasDelay && staticEmulatedBatchSize)
             {
                 TLLM_THROW("Executor benchmark doesn't support delays with emulated static batch sizes");
@@ -1347,7 +1509,11 @@ void benchmarkExecutor(std::filesystem::path const& engineDir, TrtGptModelType m
                 for (std::size_t i = 0; i < numSamples; ++i)
                 {
                     executorServer->enqueue({std::move(requests.at(i))});
-                    std::this_thread::sleep_for(std::chrono::milliseconds(delays.at(i)));
+                    if (i < numSamples - 1)
+                    {
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(static_cast<int>(timeDelays.at(i) * 1000)));
+                    }
                 }
                 waitThread.join();
             }
@@ -1372,8 +1538,8 @@ int main(int argc, char* argv[])
     options.add_options()("engine_dir", "Directory that store the engines.", cxxopts::value<std::string>());
     options.add_options()(
         "api", "API type: gptManager or executor.", cxxopts::value<std::string>()->default_value("gptManager"));
-    options.add_options()(
-        "type", "Batching type: IFB or V1(non-IFB) batching.", cxxopts::value<std::string>()->default_value("IFB"));
+    options.add_options()("type", "Batching type: IFB, UIFB (unfused IFB) or V1 (non-IFB) batching.",
+        cxxopts::value<std::string>()->default_value("IFB"));
     options.add_options()("dataset", "Dataset that is used for benchmarking BatchManager.",
         cxxopts::value<std::string>()->default_value(""));
     options.add_options()(
@@ -1389,8 +1555,15 @@ int main(int argc, char* argv[])
     options.add_options()("pad_id", "Specify the padding token id.", cxxopts::value<TokenIdType>());
     options.add_options()("max_tokens_in_paged_kvcache", "Max tokens in paged K-V Cache.", cxxopts::value<int>());
     options.add_options()(
+        "random_seed", "integer random seed for exponential time delays.", cxxopts::value<int>()->default_value("420"));
+    options.add_options()(
         "kv_cache_free_gpu_mem_fraction", "K-V Cache Free Gpu Mem Fraction.", cxxopts::value<float>());
+    options.add_options()("request_rate",
+        "request rate in reqs/sec. Skipping this arg or negative value will trigger offline/0-delay.",
+        cxxopts::value<float>());
     options.add_options()("enable_trt_overlap", "Overlap TRT context preparation and execution",
+        cxxopts::value<bool>()->default_value("false"));
+    options.add_options()("enable_exp_delays", "Enables exponential delay distr to mimic real world request arrival",
         cxxopts::value<bool>()->default_value("false"));
     options.add_options()("streaming", "Operate in streaming mode", cxxopts::value<bool>()->default_value("false"));
     options.add_options()(
@@ -1467,6 +1640,10 @@ int main(int argc, char* argv[])
     {
         modelType = TrtGptModelType::V1;
     }
+    else if (type == "UIFB")
+    {
+        modelType = TrtGptModelType::InflightBatching;
+    }
     else if (type == "IFB")
     {
         modelType = TrtGptModelType::InflightFusedBatching;
@@ -1496,6 +1673,12 @@ int main(int argc, char* argv[])
     {
         benchmarkParams.maxTokensInPagedKvCache = result["max_tokens_in_paged_kvcache"].as<int>();
     }
+
+    if (result.count("random_seed"))
+    {
+        benchmarkParams.randomSeed = result["random_seed"].as<int>();
+    }
+
     // Argument: K-V Cache Free Gpu Mem Fraction
     if (result.count("kv_cache_free_gpu_mem_fraction"))
     {
@@ -1509,6 +1692,14 @@ int main(int argc, char* argv[])
 
     // Argument: streaming
     benchmarkParams.streaming = result["streaming"].as<bool>();
+
+    // Argument: request rate
+    if (result.count("request_rate"))
+    {
+        benchmarkParams.requestRate = result["request_rate"].as<float>();
+    }
+
+    benchmarkParams.enableExpDelays = result["enable_exp_delays"].as<bool>();
 
     // Argument: Enable batch stats output
     bool logIterationData = result["log_iteration_data"].as<bool>();

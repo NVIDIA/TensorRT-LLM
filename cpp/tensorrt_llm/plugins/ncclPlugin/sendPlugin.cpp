@@ -131,7 +131,7 @@ int SendPlugin::initialize() noexcept
 
     ncclUniqueId id;
     ncclGetUniqueId(&id);
-    COMM_SESSION.send(id, mTgtRank, 0);
+    COMM_SESSION.sendValue(id, mTgtRank, 0);
     NCCLCHECK(ncclCommInitRank(&mComm, 2, id, 0));
     return 0;
 }

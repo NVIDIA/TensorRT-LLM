@@ -4,7 +4,10 @@ import sys
 from concurrent.futures import Future
 from typing import Any, List, Optional
 
-from mpi4py.futures import MPIPoolExecutor
+from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
+
+if ENABLE_MULTI_DEVICE:
+    from mpi4py.futures import MPIPoolExecutor
 
 
 class MPINodeState:

@@ -581,7 +581,7 @@ void invokeCopyInputToOutputTransposed(ITensor& outputIds, ITensor const& inputI
             std::size_t(batchSize)));
     TLLM_CHECK_WITH_INFO(batchSize == outputShape.d[1],
         common::fmtstr(
-            "Output ids batch size (%d) does not match inputLengths size (%d)", outputShape.d[1], batchSize));
+            "Output ids batch size (" FMT_DIM ") does not match inputLengths size (%d)", outputShape.d[1], batchSize));
     TLLM_CHECK_WITH_INFO(maxInputLength < maxSeqLength,
         common::fmtstr(
             "Output sequence length (%d) has to be larger than max input length (%d)", maxSeqLength, maxInputLength));
@@ -634,8 +634,8 @@ void invokeCopyPackedInputToOutputTransposed(ITensor& outputIds, ITensor const& 
     SizeType const beamWidth = outputShape.d[2];
 
     TLLM_CHECK_WITH_INFO(batchSize == outputShape.d[1],
-        common::fmtstr(
-            "Output ids batch size (%d) does not match inputOffsets batch size (%d)", outputShape.d[1], batchSize));
+        common::fmtstr("Output ids batch size (" FMT_DIM ") does not match inputOffsets batch size (%d)",
+            outputShape.d[1], batchSize));
     TLLM_CHECK_WITH_INFO(maxInputLength < maxSeqLength,
         common::fmtstr(
             "Output sequence length (%d) has to be larger than max input length (%d)", maxSeqLength, maxInputLength));
@@ -695,7 +695,7 @@ void invokeCopyInputToOutput(ITensor& outputIds, ITensor const& inputIds, ITenso
             std::size_t(batchSize)));
     TLLM_CHECK_WITH_INFO(batchSize == outputShape.d[0],
         common::fmtstr(
-            "Output ids batch size (%d) does not match inputLengths size (%d)", outputShape.d[0], batchSize));
+            "Output ids batch size (" FMT_DIM ") does not match inputLengths size (%d)", outputShape.d[0], batchSize));
     TLLM_CHECK_WITH_INFO(maxInputLength < maxSeqLength,
         common::fmtstr(
             "Output sequence length (%d) has to be larger than max input length (%d)", maxSeqLength, maxInputLength));
@@ -751,8 +751,8 @@ void invokeCopyPackedInputToOutput(ITensor& outputIds, ITensor const& inputIds, 
     SizeType const maxSeqLength = outputShape.d[2];
 
     TLLM_CHECK_WITH_INFO(batchSize == outputShape.d[0],
-        common::fmtstr(
-            "Output ids batch size (%d) does not match inputOffsets batch size (%d)", outputShape.d[0], batchSize));
+        common::fmtstr("Output ids batch size (" FMT_DIM ") does not match inputOffsets batch size (%d)",
+            outputShape.d[0], batchSize));
     TLLM_CHECK_WITH_INFO(maxInputLength < maxSeqLength,
         common::fmtstr(
             "Output sequence length (%d) has to be larger than max input length (%d)", maxSeqLength, maxInputLength));

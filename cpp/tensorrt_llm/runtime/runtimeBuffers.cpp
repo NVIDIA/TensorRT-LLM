@@ -18,7 +18,6 @@
 
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/stlUtils.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tensorrt_llm/runtime/tllmRuntime.h"
 #include "tensorrt_llm/runtime/utils/sessionUtils.h"
@@ -61,11 +60,11 @@ void RuntimeBuffers::clearTensorMaps()
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void RuntimeBuffers::create(TllmRuntime& runtime, ModelConfig const& modelConfig, WorldConfig const& worldConfig)
+void RuntimeBuffers::create(TllmRuntime const& runtime, ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto& manager = runtime.getBufferManager();
-    auto& engine = runtime.getEngine();
+    auto const& manager = runtime.getBufferManager();
+    auto const& engine = runtime.getEngine();
 
     if (worldConfig.isLastPipelineParallelRank())
     {
@@ -131,8 +130,7 @@ void RuntimeBuffers::initFromInput(ITensor const& inputIds, TensorPtr const& inp
         inputIds, *contextLengthsHost, inputPacked, beamWidth, maxAttentionWindow, sinkTokenLength, maxSequenceLength);
 }
 
-void RuntimeBuffers::reshape(
-    KvCacheManager const* kvCacheManager, ModelConfig const& modelConfig, WorldConfig const& worldConfig)
+void RuntimeBuffers::reshape(ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -184,7 +182,7 @@ void RuntimeBuffers::reshape(
         {
             requestTypes->reshape(ITensor::makeShape({batchSize}));
         }
-        transformerBuffers->reshape(generationConfig, kvCacheManager, modelConfig, worldConfig);
+        transformerBuffers->reshape(generationConfig, modelConfig, worldConfig);
     }
 
     if (ssmStateBuffers)
@@ -368,7 +366,7 @@ void RuntimeBuffers::prepareContextStep(TensorPtr const& inputIds, TokenIdType c
     ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto& stream = manager.getStream();
+    auto const& stream = manager.getStream();
 
     // use context lengths only in context step
     sequenceLengths = contextLengthsDevice;
@@ -401,7 +399,7 @@ RuntimeBuffers::TensorPtr RuntimeBuffers::prepareNextStep(SizeType const step, B
     ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto& stream = manager.getStream();
+    auto const& stream = manager.getStream();
     SizeType const batchSize = generationConfig.batchSize;
     SizeType const beamWidth = generationConfig.beamWidth;
 
@@ -456,7 +454,7 @@ void RuntimeBuffers::getRuntimeBuffers(TensorMap& inputBuffers, TensorMap& outpu
             this, inputBuffers, outputBuffers, step, inputIds, commPtrs, modelConfig, worldConfig);
     }
 
-    if (modelConfig.useCustomAllReduce() && worldConfig.getTensorParallelism())
+    if (modelConfig.useCustomAllReduce() && worldConfig.isTensorParallel())
     {
         inputBuffers.insert_or_assign("all_reduce_workspace", commPtrs);
     }

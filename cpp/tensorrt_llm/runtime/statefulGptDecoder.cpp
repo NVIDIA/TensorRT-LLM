@@ -65,7 +65,7 @@ StatefulGptDecoder::StatefulGptDecoder(std::size_t vocabSize, std::size_t vocabS
     dInput->badWordsPtrs = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<int32_t*>::value);
     dInput->badWordsLens = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<SizeType>::value);
 
-    mFinishedSum = mBufferManager.pinned(ITensor::makeShape({1}), nvSizeType);
+    mFinishedSum = BufferManager::pinned(ITensor::makeShape({1}), nvSizeType);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

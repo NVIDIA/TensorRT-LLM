@@ -29,6 +29,8 @@ import numpy as np
 import yaml
 from packaging import version
 
+from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
+
 # isort: off
 import torch
 import tensorrt as trt
@@ -72,7 +74,17 @@ def numpy_to_dtype(x, dtype: str):
 fp32_array = partial(np.array, dtype=np.float32)
 fp16_array = partial(np.array, dtype=np.float16)
 int32_array = partial(np.array, dtype=np.int32)
+int64_array = partial(np.array, dtype=np.int64)
 bool_array = partial(np.array, dtype=np.bool_)
+
+
+def dims_array(x):
+    is_int64_dims = True
+    try:
+        trt.Dims([np.iinfo(np.int64).max])
+    except TypeError:
+        is_int64_dims = False
+    return int64_array(x) if is_int64_dims else int32_array(x)
 
 
 def bf16_array(x):
@@ -329,11 +341,11 @@ def mpi_comm():
 
 
 def mpi_rank():
-    return mpi_comm().Get_rank()
+    return mpi_comm().Get_rank() if ENABLE_MULTI_DEVICE else 0
 
 
 def mpi_world_size():
-    return mpi_comm().Get_size()
+    return mpi_comm().Get_size() if ENABLE_MULTI_DEVICE else 1
 
 
 def mpi_barrier():

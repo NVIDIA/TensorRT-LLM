@@ -63,7 +63,7 @@ public:
         return shape;
     }
 
-    static std::vector<SizeType> makeShape(std::initializer_list<runtime::SizeType> sizes)
+    static std::vector<SizeType> makeShape(std::initializer_list<runtime::ITensor::DimType> sizes)
     {
         return shape(ITensor::makeShape(sizes));
     }

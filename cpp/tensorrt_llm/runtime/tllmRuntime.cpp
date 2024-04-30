@@ -24,21 +24,19 @@ using namespace tensorrt_llm::runtime;
 
 namespace
 {
-using DimType = std::remove_reference_t<decltype(std::declval<nvinfer1::Dims>().d[0])>;
-static_assert(sizeof(SizeType) >= sizeof(DimType), "SizeType is too small");
 static_assert(std::is_signed<SizeType>::value, "SizeType must be signed");
 
 nvinfer1::Dims shapeToDims(std::vector<std::size_t> const& shape)
 {
     TLLM_CHECK(shape.size() <= nvinfer1::Dims::MAX_DIMS);
     nvinfer1::Dims dims;
-    auto constexpr dim_max = std::numeric_limits<DimType>::max();
+    auto constexpr dim_max = std::numeric_limits<ITensor::DimType>::max();
     dims.nbDims = static_cast<std::int32_t>(shape.size());
     for (std::size_t i = 0; i < shape.size(); ++i)
     {
         // shape[i] >= 0 because it has unsigned type. Check upper bound:
         TLLM_CHECK(shape[i] <= static_cast<std::size_t>(dim_max));
-        dims.d[i] = static_cast<DimType>(shape[i]);
+        dims.d[i] = static_cast<ITensor::DimType>(shape[i]);
     }
     return dims;
 }

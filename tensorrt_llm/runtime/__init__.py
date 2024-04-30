@@ -23,10 +23,13 @@ from .model_runner import ModelRunner
 from .session import Session, TensorInfo
 
 try:
-    from .model_runner_cpp import ModelRunnerCpp
+    import tensorrt_llm.bindings  # NOQA
     PYTHON_BINDINGS = True
 except ImportError:
     PYTHON_BINDINGS = False
+
+if PYTHON_BINDINGS:
+    from .model_runner_cpp import ModelRunnerCpp
 
 __all__ = [
     'ModelConfig',

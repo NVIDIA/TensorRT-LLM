@@ -46,27 +46,32 @@ public:
     TransformerBuffers(
         TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig);
 
-    void reshape(GenerationConfig const& generationConfig, KvCacheManager const* kvCacheManager,
-        ModelConfig const& modelConfig, WorldConfig const& worldConfig);
+    void reshape(
+        GenerationConfig const& generationConfig, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
-    void reset(BufferManager& manager);
+    void reshapeKvTensors(
+        SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxBlocksPerSeq, runtime::TllmRuntime const& runtime);
+
+    void setKvPoolPointers(KvCacheManager const* kvCacheManager);
+
+    void reset(BufferManager& manager){};
 
     TransformerBuffers sliceTo(
         GenerationConfig const& generationConfig, ModelConfig const& modelConfig, SizeType offset, SizeType batchSize);
 
-    void prepareContextStep(RuntimeBuffers* runtimeBuffers, TensorPtr const& inputIds, TokenIdType const padId,
+    void prepareContextStep(RuntimeBuffers* runtimeBuffers, TensorPtr const& inputIds, TokenIdType padId,
         BufferManager& manager, KvCacheManager const* kvCacheManager, SizeType firstBatchSlotIdx,
         ModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
     void postContextStep(RuntimeBuffers* runtimeBuffers, std::vector<RuntimeBuffers> const& contextBuffers,
         BufferManager& manager, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
-    void prepareNextStep(RuntimeBuffers* runtimeBuffers, SizeType const step, BufferManager& manager,
+    void prepareNextStep(RuntimeBuffers* runtimeBuffers, SizeType step, BufferManager& manager,
         KvCacheManager* kvCacheManager, SizeType firstBatchSlotIdx, ModelConfig const& modelConfig,
         WorldConfig const& worldConfig);
 
     void getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers, TensorMap& inputBuffers, TensorMap& outputBuffers,
-        SizeType const step, TensorPtr const& inputIds, TensorPtr const& commPtrs, ModelConfig const& modelConfig,
+        SizeType step, TensorPtr const& inputIds, TensorPtr const& commPtrs, ModelConfig const& modelConfig,
         WorldConfig const& worldConfig) const;
 
 protected:

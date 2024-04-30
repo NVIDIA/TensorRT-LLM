@@ -354,6 +354,7 @@ def test_gpt_json_config():
         "precision": "float32",
         "tensor_parallelism": 1,
         "pipeline_parallelism": 1,
+        "gpus_per_node": 8,
         "model_config": trt_model_config
     }
 

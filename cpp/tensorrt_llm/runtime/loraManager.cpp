@@ -31,7 +31,7 @@
 namespace tensorrt_llm::runtime
 {
 
-void LoraManager::create(ModelConfig const& modelConfig, WorldConfig const& worldConfig, BufferManager const& manager)
+void LoraManager::create(ModelConfig const& modelConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -92,7 +92,7 @@ void LoraManager::fillInputTensors(TensorPtr weightsPtrs, TensorPtr adapterSizes
         auto const inWeightsPtr = peftValue.weightsInPointer;
         auto const outWeightsPtr = peftValue.weightsOutPointer;
 
-        auto weightsPointersPtrOffset = common::flat_index4(modOff, layerIdx - firstLayerId, batchIdx, 0,
+        auto weightsPointersPtrOffset = common::flat_index4(modOff, layerIdx - firstLayerId, batchIdx, SizeType{0},
             weightsPtrs->getShape().d[1], weightsPtrs->getShape().d[2], weightsPtrs->getShape().d[3]);
         auto adapterSizesPtrOffset = common::flat_index3(
             modOff, layerIdx - firstLayerId, batchIdx, adapterSizes->getShape().d[1], adapterSizes->getShape().d[2]);

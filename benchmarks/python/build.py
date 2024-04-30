@@ -80,6 +80,18 @@ def parse_arguments():
         help="Optimize the model with specified quantization recipe")
 
     parser.add_argument(
+        '--input_timing_cache',
+        type=str,
+        default=None,
+        help=
+        'The path to read timing cache, will be ignored if the file does not exist'
+    )
+    parser.add_argument('--output_timing_cache',
+                        type=str,
+                        default='model.cache',
+                        help='The path to write timing cache')
+
+    parser.add_argument(
         '--profiling_verbosity',
         type=str,
         default='layer_names_only',
@@ -231,12 +243,18 @@ def build_gpt(args):
             'mamba_d_conv']
         builder_config_extra_kwargs['mamba_expand'] = build_config[
             'mamba_expand']
-        builder_config_extra_kwargs['max_beam_width'] = max_beam_width
         builder_config_extra_kwargs['layer_types'] = ['recurrent']
+    elif get_model_family(args.model) == 'recurrentgemma':
+        builder_config_extra_kwargs['conv_kernel'] = build_config['conv_kernel']
+        builder_config_extra_kwargs['layer_types'] = build_config['layer_types']
+        builder_config_extra_kwargs['rnn_hidden_size'] = build_config[
+            'rnn_hidden_size']
+        builder_config_extra_kwargs['logits_soft_cap'] = build_config[
+            'logits_soft_cap']
     builder_config = builder.create_builder_config(
         name=args.model,
         precision=args.dtype,
-        timing_cache=None,
+        timing_cache=args.input_timing_cache,
         profiling_verbosity=args.profiling_verbosity,
         tensor_parallel=world_size,  # TP only
         parallel_build=True,
@@ -249,6 +267,7 @@ def build_gpt(args):
         max_position_embeddings=build_config['n_positions'],
         apply_query_key_layer_scaling=apply_query_key_layer_scaling,
         max_batch_size=max_batch_size,
+        max_beam_width=max_beam_width,
         max_input_len=max_input_len,
         max_output_len=max_output_len,
         int8=(quant_mode.has_act_and_weight_quant()
@@ -784,6 +803,39 @@ def build_gpt(args):
         }
         config = PretrainedConfig.from_dict(config)
         tensorrt_llm_model = tensorrt_llm.models.MambaLMHeadModel(config)
+    elif family == "recurrentgemma":
+        config = {
+            'architecture': 'RecurrentGemmaForCausalLM',
+            'dtype': args.dtype,
+            'vocab_size': build_config['vocab_size'],
+            'hidden_size': build_config['hidden_size'],
+            'num_hidden_layers': build_config['num_layers'],
+            'num_attention_heads': build_config['num_heads'],
+            'num_key_value_heads': build_config['num_kv_heads'],
+            'hidden_act': build_config['hidden_act'],
+            'intermediate_size': build_config['inter_size'],
+            'rms_norm': True,
+            'norm_epsilon': 1e-6,
+            'quantization': {
+                'group_size': 128,
+                'quant_algo': quant_algo,
+                'kv_cache_quant_algo': kv_cache_quant_algo
+            },
+            'mapping': {
+                'world_size': world_size,
+                'tp_size': world_size
+            },
+            'position_embedding_type': build_config['position_embedding_type'],
+            'rotary_percentage': build_config['rotary_pct'],
+            'max_position_embeddings': build_config['n_positions'],
+            'conv_kernel': build_config['conv_kernel'],
+            'layer_types': build_config['layer_types'],
+            'rnn_hidden_size': build_config['rnn_hidden_size'],
+            'logits_soft_cap': build_config['logits_soft_cap'],
+        }
+        config = PretrainedConfig.from_dict(config)
+        tensorrt_llm_model = tensorrt_llm.models.RecurrentGemmaForCausalLM(
+            config)
 
     else:
         raise Exception(f'Unexpected model: {args.model}')
@@ -835,6 +887,9 @@ def build_gpt(args):
         network.set_named_parameters(tensorrt_llm_model.named_parameters())
 
         # Forward
+        print(
+            f"max_batch_size: {max_batch_size}, max_input_len: {max_input_len}, max_output_len: {max_output_len}, max_beam_width: {max_beam_width}"
+        )
         inputs = tensorrt_llm_model.prepare_inputs(
             max_batch_size=max_batch_size,
             max_input_len=max_input_len,
@@ -861,6 +916,16 @@ def build_gpt(args):
             config_path = os.path.join(args.output_dir, 'config.json')
             builder_config.plugin_config = network.plugin_config
             builder.save_config(builder_config, config_path)
+            if args.output_timing_cache:
+                # Save timing cache to output_dir if not absolute path
+                timing_cache_path = args.output_timing_cache if os.path.isabs(
+                    args.output_timing_cache) else os.path.join(
+                        args.output_dir, args.output_timing_cache)
+                ok = builder.save_timing_cache(builder_config,
+                                               timing_cache_path)
+                if not ok:
+                    logger.warning("Failed to save timing cache.")
+
     return engine, build_time
 
 
@@ -893,7 +958,7 @@ def build_bert(args):
     builder_config = builder.create_builder_config(
         name=args.model,
         precision=args.dtype,
-        timing_cache=None,
+        timing_cache=args.input_timing_cache,
         profiling_verbosity=args.profiling_verbosity,
         tensor_parallel=world_size,  # TP only
         parallel_build=True,
@@ -986,6 +1051,16 @@ def build_bert(args):
             config_path = os.path.join(args.output_dir, 'config.json')
             builder_config.plugin_config = network.plugin_config
             builder.save_config(builder_config, config_path)
+            if args.output_timing_cache:
+                # Save timing cache to output_dir if not absolute path
+                timing_cache_path = args.output_timing_cache if os.path.isabs(
+                    args.output_timing_cache) else os.path.join(
+                        args.output_dir, args.output_timing_cache)
+                ok = builder.save_timing_cache(builder_config,
+                                               timing_cache_path)
+                if not ok:
+                    logger.warning("Failed to save timing cache.")
+
     return engine, build_time
 
 
@@ -1051,8 +1126,8 @@ def enc_dec_build_helper(component, config, args):
     builder_config = builder.create_builder_config(
         name=args.model,
         precision=args.dtype,
-        timing_cache=None,
-        profiling_verbosity='layer_names_only',  # by default
+        timing_cache=args.input_timing_cache,
+        profiling_verbosity=args.profiling_verbosity,
         tensor_parallel=world_size,  # TP only
         parallel_build=True,
         num_layers=config['num_layers'],
@@ -1341,7 +1416,15 @@ def enc_dec_build_helper(component, config, args):
             config_path = os.path.join(output_dir, 'config.json')
             builder_config.plugin_config = network.plugin_config
             builder.save_config(builder_config, config_path)
-
+            if args.output_timing_cache:
+                # Save timing cache to output_dir if not absolute path
+                timing_cache_path = args.output_timing_cache if os.path.isabs(
+                    args.output_timing_cache) else os.path.join(
+                        args.output_dir, args.output_timing_cache)
+                ok = builder.save_timing_cache(builder_config,
+                                               timing_cache_path)
+                if not ok:
+                    logger.warning("Failed to save timing cache.")
     return engine, model_config, build_time
 
 

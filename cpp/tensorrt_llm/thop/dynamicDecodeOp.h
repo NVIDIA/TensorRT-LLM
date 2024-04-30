@@ -61,8 +61,6 @@ template <typename T>
 class FtDynamicDecode : public IFtDynamicDecode
 {
 public:
-    using SetupParams = typename tensorrt_llm::layers::DynamicDecodeLayer<T>::SetupParams;
-
     FtDynamicDecode(size_t const max_batch_size, size_t const max_beam_width, size_t const vocab_size,
         size_t const vocab_size_padded, int const tensor_para_size, int const pipeline_para_size);
 

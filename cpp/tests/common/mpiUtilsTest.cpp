@@ -128,12 +128,12 @@ void testSendRecv()
     auto constexpr tag = 0;
     if (rank == 0)
     {
-        comm.send(expectedValue, 1, tag);
+        comm.sendValue(expectedValue, 1, tag);
     }
     else if (rank == 1)
     {
         T value{};
-        comm.recv(value, 0, tag);
+        comm.recvValue(value, 0, tag);
         EXPECT_EQ(value, expectedValue);
     }
 }
@@ -165,7 +165,7 @@ void testSendMRecv()
     auto constexpr tag = 0;
     if (rank == 0)
     {
-        comm.send(expectedValue, 1, tag);
+        comm.sendValue(expectedValue, 1, tag);
     }
     else if (rank == 1)
     {

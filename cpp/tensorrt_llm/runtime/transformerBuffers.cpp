@@ -20,6 +20,7 @@
 #include "tensorrt_llm/runtime/runtimeBuffers.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tensorrt_llm/runtime/utils/sessionUtils.h"
+#include <cstdlib> // std::getenv
 
 using namespace tensorrt_llm::runtime;
 namespace tc = tensorrt_llm::common;
@@ -79,39 +80,41 @@ TransformerBuffers::TransformerBuffers(
     }
     else
     {
-        presentKeysValsAlt = utils::createBufferVector(runtime, localNbLayers, MemoryType::kGPU, kvDtype);
+        char* disableReuseChar = std::getenv("TRTLLM_DISABLE_OOTB_KVCACHE_REUSE");
+        bool reuse = (disableReuseChar == nullptr || std::string(disableReuseChar) != "ON");
+
+        int32_t extraKeyValBufferNum = reuse ? 1 : localNbLayers;
+        presentKeysValsAlt = utils::createBufferVector(runtime, extraKeyValBufferNum, MemoryType::kGPU, kvDtype);
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void TransformerBuffers::reshape(GenerationConfig const& generationConfig, KvCacheManager const* kvCacheManager,
-    ModelConfig const& modelConfig, WorldConfig const& worldConfig)
+void TransformerBuffers::reshape(
+    GenerationConfig const& generationConfig, ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto const batchSize = generationConfig.batchSize;
-    auto const beamWidth = generationConfig.beamWidth;
     auto const maxInputLength = generationConfig.maxInputLength;
     auto const maxAttentionWindow = generationConfig.maxAttentionWindow;
 
-    auto kvCacheReserve = ITensor::makeShape(
+    auto const kvCacheReserve = ITensor::makeShape(
         {batchSize, 2, modelConfig.getNbKvHeads(), maxAttentionWindow, modelConfig.getSizePerHead()});
-    auto kvCacheShape
+    auto const kvCacheShape
         = ITensor::makeShape({batchSize, 2, modelConfig.getNbKvHeads(), maxInputLength, modelConfig.getSizePerHead()});
     if (modelConfig.usePagedKvCache())
     {
-        TLLM_CHECK(kvCacheManager);
-
-        auto const maxBlocksPerSeq = kvCacheManager->getMaxBlocksPerSeq();
-        // reserve batchSize * beamWidth and resize to batchSize
-        auto cacheBlockOffsetsShape = ITensor::makeShape({batchSize * beamWidth, 2, maxBlocksPerSeq});
-        kvCacheBlockOffsetsHost->reshape(cacheBlockOffsetsShape);
-        kvCacheBlockOffsetsDevice->reshape(cacheBlockOffsetsShape);
-        cacheBlockOffsetsShape.d[0] = batchSize;
-        kvCacheBlockOffsetsHost->reshape(cacheBlockOffsetsShape);
-        kvCacheBlockOffsetsDevice->reshape(cacheBlockOffsetsShape);
-
-        kvCacheBlockPoolPointers = kvCacheManager->getBlockPoolPointers();
+        auto cacheBlockOffsetsShape = kvCacheBlockOffsetsHost->getShape();
+        if (cacheBlockOffsetsShape.nbDims > 0)
+        {
+            cacheBlockOffsetsShape.d[0] = batchSize;
+            kvCacheBlockOffsetsHost->reshape(cacheBlockOffsetsShape);
+            kvCacheBlockOffsetsDevice->reshape(cacheBlockOffsetsShape);
+        }
+        else
+        {
+            TLLM_LOG_DEBUG("kvCacheBlockOffsets not allocated yet");
+        }
     }
     else
     {
@@ -128,7 +131,7 @@ void TransformerBuffers::reshape(GenerationConfig const& generationConfig, KvCac
     }
     else
     {
-        utils::reshapeBufferVector(presentKeysValsAlt, kvCacheReserve);
+        utils::reshapeBufferVector(presentKeysValsAlt, kvCacheShape);
         // present KV cache tensors will be reshaped by shape inference.
         // reshape to the required shape here to make context batch slicing work correctly.
         utils::reshapeBufferVector(presentKeysVals, kvCacheShape);
@@ -137,7 +140,24 @@ void TransformerBuffers::reshape(GenerationConfig const& generationConfig, KvCac
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void TransformerBuffers::reset(BufferManager& manager) {}
+void TransformerBuffers::reshapeKvTensors(
+    SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxBlocksPerSeq, runtime::TllmRuntime const& runtime)
+{
+    auto const& manager = runtime.getBufferManager();
+
+    auto const cacheBlockOffsetsShape = ITensor::makeShape({maxBatchSize * maxBeamWidth, 2, maxBlocksPerSeq});
+
+    kvCacheBlockOffsetsHost->reshape(cacheBlockOffsetsShape);
+    manager.setZero(*kvCacheBlockOffsetsHost);
+
+    kvCacheBlockOffsetsDevice->reshape(cacheBlockOffsetsShape);
+    manager.setZero(*kvCacheBlockOffsetsDevice);
+}
+
+void TransformerBuffers::setKvPoolPointers(KvCacheManager const* kvCacheManager)
+{
+    kvCacheBlockPoolPointers = kvCacheManager->getBlockPoolPointers();
+}
 
 TransformerBuffers TransformerBuffers::sliceTo(
     GenerationConfig const& generationConfig, ModelConfig const& modelConfig, SizeType offset, SizeType batchSize)
@@ -460,8 +480,8 @@ void TransformerBuffers::tile(RuntimeBuffers* runtimeBuffers, BufferManager& man
 
     if (modelConfig.useGptAttentionPlugin())
     {
-        utils::tileCpuBufferReplace(contextLengthsHost, beamWidth, manager);
-        utils::tileCpuBufferReplace(pastKeyValueLengths, beamWidth, manager);
+        utils::tileCpuBufferReplace(contextLengthsHost, beamWidth);
+        utils::tileCpuBufferReplace(pastKeyValueLengths, beamWidth);
     }
     else
     {
@@ -714,25 +734,59 @@ void TransformerBuffers::getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers,
     {
         inputBuffers.insert_or_assign("attention_mask", attentionMask);
         inputBuffers.insert_or_assign("cache_indirection", runtimeBuffers->cacheIndirectionDecoderOutput);
-        utils::insertTensorVector(
-            outputBuffers, "present_key_value_", (step % 2) ? presentKeysValsAlt : presentKeysVals, firstLayerId);
 
+        nvinfer1::Dims kvCacheShape{0};
         if (step == 0)
         {
-            auto kvCacheShape = presentKeysValsAlt.at(0)->getShape();
+            kvCacheShape = presentKeysValsAlt.at(0)->getShape();
             kvCacheShape.d[3] = 0;
-
-            for (SizeType i = 0; i < localNbLayers; ++i)
-            {
-                std::string name = "past_key_value_" + std::to_string(firstLayerId + i);
-                TensorPtr tmp = ITensor::view(presentKeysValsAlt.at(i), kvCacheShape);
-                inputBuffers.insert_or_assign(name, std::move(tmp));
-            }
         }
-        else
+        char* disableReuseChar = std::getenv("TRTLLM_DISABLE_OOTB_KVCACHE_REUSE");
+        bool reuse = (disableReuseChar == nullptr || std::string(disableReuseChar) != "ON");
+
+        for (int32_t idx = 0; idx < localNbLayers; ++idx)
         {
-            utils::insertTensorVector(
-                inputBuffers, "past_key_value_", (step % 2) ? presentKeysVals : presentKeysValsAlt, firstLayerId);
+            TensorPtr input;
+            TensorPtr output;
+            if (reuse)
+            {
+                // We will make current layer's output KV-cache overwrite previous layers input KV-cache
+                // buffer id: ...  5,  6,  7,  8,  9, ...
+                // layer n:        out in
+                // layer n+1:          out in
+                // layer n+2               out in
+                // And when finish a step, we will make every layer's in/out buffer index subtract 1 in
+                // a circular buffer way to make sure current outputs become next step's inputs.
+                int32_t input_ind = idx - (step % (localNbLayers + 1)); // Subtract 1 for every step.
+                if (input_ind < 0)
+                {
+                    // When underflow, go to the back to achieve a circular buffers.
+                    input_ind = localNbLayers + 1 + input_ind;
+                }
+                // Output buffer is just before input buffer. When input is buffer 0,
+                // output should use the back buffer to achieve circular buffers.
+                int32_t output_ind = input_ind > 0 ? input_ind - 1 : localNbLayers;
+
+                // We only allocate localNbLayers of normal buffers. If index is overflow, use the extra buffer.
+                input = input_ind < localNbLayers ? presentKeysVals[input_ind] : presentKeysValsAlt[0];
+                output = output_ind < localNbLayers ? presentKeysVals[output_ind] : presentKeysValsAlt[0];
+            }
+            else
+            {
+                input = step % 2 ? presentKeysVals[idx] : presentKeysValsAlt[idx];
+                output = step % 2 ? presentKeysValsAlt[idx] : presentKeysVals[idx];
+            }
+
+            if (step == 0)
+            {
+                TensorPtr tmp = ITensor::view(input, kvCacheShape);
+                inputBuffers.insert_or_assign("past_key_value_" + std::to_string(firstLayerId + idx), std::move(tmp));
+            }
+            else
+            {
+                inputBuffers.insert_or_assign("past_key_value_" + std::to_string(firstLayerId + idx), input);
+            }
+            outputBuffers.insert_or_assign("present_key_value_" + std::to_string(firstLayerId + idx), output);
         }
     }
 

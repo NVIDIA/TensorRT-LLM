@@ -493,7 +493,7 @@ void LoraCache::splitTransposeCpuInner(ITensor& output, ITensor const& input, Si
 {
     auto const adapterSize = input.getShape().d[0];
     auto const hiddenSize = input.getShape().d[1];
-    auto const splitHiddenSize = hiddenSize / tpSize;
+    auto const splitHiddenSize = static_cast<SizeType>(hiddenSize / tpSize);
 
     auto outputPtr = bufferCast<T>(output);
     auto const inputPtr = bufferCast<T>(input);
@@ -665,10 +665,10 @@ std::vector<LoraCache::TaskLayerModuleConfig> LoraCache::copyToPages(TensorPtr s
                 manager.copy(*source, *targetWeightsOut);
             }
 
-            pageLocations[i]
-                = LoraCache::TaskLayerModuleConfig{pageIds.at(currPage), currSlot, localInSize, localOutSize, modId,
-                    layerId, adapterSize, rowSlots, reinterpret_cast<std::int64_t>(targetWeightsIn->data()),
-                    reinterpret_cast<std::int64_t>(targetWeightsOut->data())};
+            pageLocations[i] = LoraCache::TaskLayerModuleConfig{pageIds.at(currPage), currSlot, localInSize,
+                localOutSize, modId, layerId, adapterSize, static_cast<SizeType>(rowSlots),
+                reinterpret_cast<std::int64_t>(targetWeightsIn->data()),
+                reinterpret_cast<std::int64_t>(targetWeightsOut->data())};
         };
         copyFn();
     }

@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-#include "mpi.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/executor/executor.h"
@@ -25,6 +24,7 @@ namespace tle = tensorrt_llm::executor;
 
 int main(int argc, char* argv[])
 {
+#if ENABLE_MULTI_DEVICE
     // Register the TRT-LLM plugins
     initTrtLlmPlugins();
 
@@ -75,6 +75,8 @@ int main(int argc, char* argv[])
     auto executor = tle::Executor(modelPath, modelType, executorConfig);
 
     TLLM_LOG_INFO("Executor worker exiting");
+
+#endif // ENABLE_MULTI_DEVICE
 
     return 0;
 }

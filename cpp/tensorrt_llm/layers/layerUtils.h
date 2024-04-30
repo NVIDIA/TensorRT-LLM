@@ -82,6 +82,14 @@ struct FillBuffers
     cudaStream_t stream;
 };
 
+template <typename T>
+inline bool allOfBatchSlots(
+    runtime::SizeType const* batchSlotsHost, T const* data, runtime::SizeType batchSize, T value)
+{
+    return std::all_of(
+        batchSlotsHost, batchSlotsHost + batchSize, [&](runtime::SizeType b) { return data[b] == value; });
+};
+
 } // namespace layers
 
 } // namespace tensorrt_llm

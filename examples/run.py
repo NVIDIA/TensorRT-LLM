@@ -46,7 +46,7 @@ def parse_arguments(args=None):
                         type=int,
                         default=None,
                         help='The sink token length.')
-    parser.add_argument('--log_level', type=str, default='error')
+    parser.add_argument('--log_level', type=str, default='warning')
     parser.add_argument('--engine_dir', type=str, default='engine_outputs')
     parser.add_argument('--use_py_session',
                         default=False,

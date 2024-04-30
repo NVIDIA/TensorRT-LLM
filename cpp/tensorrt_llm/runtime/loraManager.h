@@ -52,7 +52,7 @@ public:
      * \param[in] worldConfig: a WorldConfig
      * \param[in] manager: and BufferManager used to allocate memory
      */
-    void create(ModelConfig const& modelConfig, WorldConfig const& worldConfig, BufferManager const& manager);
+    void create(ModelConfig const& modelConfig);
 
     /**
      * \brief same as fillInputTensors but for an entire batch

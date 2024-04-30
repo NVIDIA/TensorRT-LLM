@@ -16,6 +16,8 @@
 cmake_minimum_required(VERSION 3.1)
 
 set(TRTLLM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../..")
+include(${TRTLLM_DIR}/cpp/cmake/modules/set_ifndef.cmake)
+include(${TRTLLM_DIR}/cpp/cmake/modules/find_library_create_target.cmake)
 if(NOT TRTLLM_BUILD_DIR)
   set(TRTLLM_BUILD_DIR "${TRTLLM_DIR}/cpp/build")
 endif()
@@ -55,6 +57,14 @@ message(STATUS "CUDA library status:")
 message(STATUS "    version: ${CUDAToolkit_VERSION}")
 message(STATUS "    libraries: ${CUDAToolkit_LIBRARY_DIR}")
 message(STATUS "    include path: ${CUDAToolkit_INCLUDE_DIRS}")
+
+# TRT dependencies
+set_ifndef(TRT_LIB_DIR ${CMAKE_BINARY_DIR})
+set_ifndef(TRT_INCLUDE_DIR /usr/include/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu)
+set(TRT_LIB nvinfer)
+find_library_create_target(${TRT_LIB} nvinfer SHARED ${TRT_LIB_DIR})
+message(${TRT_INCLUDE_DIR})
+include_directories("${TRT_INCLUDE_DIR}")
 
 if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "11")
   add_definitions("-DENABLE_BF16")

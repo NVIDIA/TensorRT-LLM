@@ -261,7 +261,7 @@ def main(build_type: str = "Release",
         dist_dir.mkdir(parents=True)
     if not skip_building_wheel:
         build_run(
-            f'python3 -m build {project_dir} --skip-dependency-check --no-isolation --wheel --outdir "{dist_dir}"'
+            f'\"{sys.executable}\" -m build {project_dir} --skip-dependency-check --no-isolation --wheel --outdir "{dist_dir}"'
         )
 
     if install:

@@ -278,6 +278,7 @@ def build_model(build_config: BuildConfig,
         "StreamingLLM is only supported in the llama model."
     real_rank = rank
 
+    model_config.mapping.gpus_per_node = build_config.auto_parallel_config.gpus_per_node
     if build_config.auto_parallel_config.enabled:
         assert rank < build_config.auto_parallel_config.world_size
         assert model_config.mapping.pp_size == 1 and model_config.mapping.tp_size == 1, \
@@ -305,6 +306,7 @@ def build_model(build_config: BuildConfig,
     # tells the low level build api to only build rank-th shard of the model
     if build_config.auto_parallel_config.enabled:
         model.config.mapping.rank = real_rank
+
     return build(model, build_config)
 
 

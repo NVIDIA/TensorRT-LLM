@@ -217,6 +217,10 @@ protected:
         return mUseKVCache;
     }
 
+    void reserveSemaphoreArray(int32_t size);
+
+    void debugCheckSemaphores(cudaStream_t stream);
+
 protected:
     static constexpr int kReservedMaxSeqLenTilePerSeq = 64;
 
@@ -276,6 +280,20 @@ protected:
     // The default copy constructor will leave it as nullptr. clone() shall initialize it.
     UniqPtrWNullCopy<tensorrt_llm::common::CublasMMWrapper> mCublasWrapper;
     bool mUseKVCache = true;
+
+    // This is implementation details which we want to save when serializing, but not expose as
+    // a plugin field or a constructor parameter
+    int32_t mNbMultiBlockSemaphores = 0;
+
+    struct Deleter
+    {
+        void operator()(void* ptr)
+        {
+            cudaFree(ptr);
+        }
+    };
+
+    UniqPtrWNullCopy<int32_t[], Deleter> mMultiBlockSemaphores = {};
 };
 
 class GPTAttentionPluginCreatorCommon : public BaseCreator

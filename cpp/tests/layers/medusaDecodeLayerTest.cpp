@@ -53,8 +53,10 @@ void MedusaDecodingLayerTest<T>::SetUp()
 template <typename T>
 void MedusaDecodingLayerTest<T>::allocateBuffers()
 {
-    mMedusaDecodingLayer = std::make_shared<tensorrt_llm::layers::MedusaDecodingLayer<T>>(
-        mMaxBatchSize, mVocabSize, mVocabSizePadded, mMaxTokensPerStep, mMaxNumHeads, mStream->get(), mAllocator);
+    auto const decodingDomain = tensorrt_llm::layers::DecoderDomain(
+        mMaxBatchSize, 1, mVocabSize, mVocabSizePadded, mMaxTokensPerStep, mMaxNumHeads);
+    mMedusaDecodingLayer
+        = std::make_shared<tensorrt_llm::layers::MedusaDecodingLayer<T>>(decodingDomain, mStream->get(), mAllocator);
 
     auto const dataType = TRTDataType<T>::value;
 
@@ -256,31 +258,31 @@ void MedusaDecodingLayerTest<T>::setup(SamplingParams& params)
         mBufferManager->copy(*treeIdsBatchHost, *treeIdsBatchDeviceSlice);
     }
 
-    typename MedusaDecodingLayer<T>::MedusaSetupParams setupParams;
-    setupParams.runtimeTopK = std::make_optional<std::vector<SizeType>>(params.runtimeTopK);
-    setupParams.runtimeHeadsTopK = std::make_optional<std::vector<std::vector<SizeType>>>(params.runtimeHeadsTopK);
-    setupParams.randomSeed = {{0}};
+    auto setupParams = std::make_shared<MedusaSetupParams>();
+    setupParams->runtimeTopK = std::make_optional<std::vector<SizeType>>(params.runtimeTopK);
+    setupParams->runtimeHeadsTopK = std::make_optional<std::vector<std::vector<SizeType>>>(params.runtimeHeadsTopK);
+    setupParams->randomSeed = {{0}};
 
-    mMedusaDecodingLayer->setup(mBatchSize, batchSlotsPtr, setupParams);
+    mMedusaDecodingLayer->setup(mBatchSize, 1, batchSlotsPtr, setupParams);
 
     mStream->synchronize();
 }
 
 template <typename T>
-typename MedusaDecodingLayer<T>::MedusaForwardParams MedusaDecodingLayerTest<T>::createInputTensors()
+std::shared_ptr<MedusaInputParams> MedusaDecodingLayerTest<T>::createInputTensors()
 {
-    typename MedusaDecodingLayer<T>::MedusaForwardParams forwardParams(
+    auto forwardParams = std::make_shared<MedusaInputParams>(
         tcc::toTllmTensor(*mTargetLogitsDevice), tcc::toTllmTensor(*mEndIdsDevice));
 
     auto batchSlots = BufferRange<SizeType>(*mBatchSlots);
 
-    forwardParams.finished = tcc::toTllmTensor(*mFinishedDevice);
+    forwardParams->finished = tcc::toTllmTensor(*mFinishedDevice);
 
-    forwardParams.batch_slots = tcc::toTllmTensor(*mBatchSlots);
+    forwardParams->batch_slots = tcc::toTllmTensor(*mBatchSlots);
 
-    forwardParams.paths = tcc::toTllmTensor(*mPathsDevice);
+    forwardParams->paths = tcc::toTllmTensor(*mPathsDevice);
 
-    forwardParams.treeIds = tcc::toTllmTensor(*mTreeIdsDevice);
+    forwardParams->treeIds = tcc::toTllmTensor(*mTreeIdsDevice);
 
     std::vector<std::vector<tc::Tensor>> medusaLogits(mMaxBatchSize);
     auto const medusaLogitsPtr = bufferCast<T>(*mMedusaLogitsDevice);
@@ -298,31 +300,32 @@ typename MedusaDecodingLayer<T>::MedusaForwardParams MedusaDecodingLayerTest<T>:
             medusaLogits[batchSlots[bi]][hi] = tcc::toTllmTensor(*logitsHeadBatch);
         }
     }
-    forwardParams.medusaLogits = medusaLogits;
+    forwardParams->medusaLogits = medusaLogits;
 
-    forwardParams.medusaCurTokensPerStep = tcc::toTllmTensor(*mTokensPerStepDevice);
+    forwardParams->medusaCurTokensPerStep = tcc::toTllmTensor(*mTokensPerStepDevice);
 
-    forwardParams.medusaTargetTokensPerStep = tcc::toTllmTensor(*mTokensPerStepDevice);
+    forwardParams->medusaTargetTokensPerStep = tcc::toTllmTensor(*mTokensPerStepDevice);
 
     return forwardParams;
 }
 
 template <typename T>
-DecodingOutputParams MedusaDecodingLayerTest<T>::createOutputTensors()
+std::shared_ptr<MedusaOutputParams> MedusaDecodingLayerTest<T>::createOutputTensors()
 {
-    DecodingOutputParams outputParams(tcc::toTllmTensor(*mOutputIdsDevice));
+    auto outputParams = std::make_shared<MedusaOutputParams>(tcc::toTllmTensor(*mOutputIdsDevice));
 
-    outputParams.sequence_length = tcc::toTllmTensor(*mSeqLengthsDevice);
+    outputParams->sequence_length = tcc::toTllmTensor(*mSeqLengthsDevice);
 
-    outputParams.finished = tcc::toTllmTensor(*mFinishedDevice);
+    outputParams->finished = tcc::toTllmTensor(*mFinishedDevice);
 
-    outputParams.nextDraftTokens = tcc::toTllmTensor(*mNextDraftTokensDevice);
+    outputParams->medusaOutputs = MedusaOutputParams::MedusaOutputs();
+    outputParams->medusaOutputs->nextDraftTokens = tcc::toTllmTensor(*mNextDraftTokensDevice);
 
-    outputParams.acceptedLengths = tcc::toTllmTensor(*mAcceptedLengths);
+    outputParams->medusaOutputs->acceptedLengths = tcc::toTllmTensor(*mAcceptedLengths);
 
-    outputParams.acceptedLengthsCumSum = tcc::toTllmTensor(*mAcceptedLengthCumSumDevice);
+    outputParams->medusaOutputs->acceptedLengthsCumSum = tcc::toTllmTensor(*mAcceptedLengthCumSumDevice);
 
-    outputParams.medusaPathsOffsets = tcc::toTllmTensor(*mPackedPathsDevice);
+    outputParams->medusaOutputs->pathsOffsets = tcc::toTllmTensor(*mPackedPathsDevice);
 
     return outputParams;
 }

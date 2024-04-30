@@ -96,6 +96,9 @@ char const* IBuffer::getDataTypeName() const
     case nvinfer1::DataType::kUINT8: return DataTypeTraits<nvinfer1::DataType::kUINT8>::name;
     case nvinfer1::DataType::kINT8: return DataTypeTraits<nvinfer1::DataType::kINT8>::name;
     case nvinfer1::DataType::kFP8: return DataTypeTraits<nvinfer1::DataType::kFP8>::name;
+#if NV_TENSORRT_MAJOR >= 10
+    case nvinfer1::DataType::kINT4: /* do nothing */;
+#endif
     }
     TLLM_THROW("Unknown data type");
 }

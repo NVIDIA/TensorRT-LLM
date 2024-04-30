@@ -32,12 +32,13 @@ class GptJsonConfig
 {
 public:
     GptJsonConfig(std::string name, std::string version, std::string precision, SizeType tensorParallelism,
-        SizeType pipelineParallelism, ModelConfig const& modelConfig)
+        SizeType pipelineParallelism, SizeType gpusPerNode, ModelConfig const& modelConfig)
         : mName(std::move(name))
         , mVersion(std::move(version))
         , mPrecision(std::move(precision))
         , mTensorParallelism{tensorParallelism}
         , mPipelineParallelism{pipelineParallelism}
+        , mGpusPerNode{gpusPerNode}
         , mModelConfig(modelConfig)
     {
     }
@@ -78,6 +79,11 @@ public:
         return mPipelineParallelism;
     }
 
+    [[nodiscard]] SizeType constexpr getGpusPerNode() const
+    {
+        return mGpusPerNode;
+    }
+
     [[nodiscard]] SizeType constexpr getWorldSize() const
     {
         return mTensorParallelism * mPipelineParallelism;
@@ -96,6 +102,7 @@ private:
     std::string const mPrecision;
     SizeType const mTensorParallelism;
     SizeType const mPipelineParallelism;
+    SizeType const mGpusPerNode;
     ModelConfig const mModelConfig;
 };
 

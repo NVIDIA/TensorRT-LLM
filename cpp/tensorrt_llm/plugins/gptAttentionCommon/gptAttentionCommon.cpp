@@ -17,6 +17,7 @@
 #include "gptAttentionCommon.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunner.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
@@ -511,6 +512,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(void const* data, size_t leng
     read(d, mFP8ContextFMHA);
     read(d, mUseKVCache);
     read(d, mIsMedusaEnabled);
+    read(d, mNbMultiBlockSemaphores);
 
     mKVCacheQuantMode = tc::QuantMode(kvCacheQuantMode);
 
@@ -822,7 +824,6 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
             stream);
     }
 
-    // write KV to cache
     KvCacheDataType const cache_type = mKVCacheQuantMode.hasInt8KvCache()
         ? KvCacheDataType::INT8
         : (mKVCacheQuantMode.hasFp8KvCache() ? KvCacheDataType::FP8 : KvCacheDataType::BASE);
@@ -1228,6 +1229,10 @@ int GPTAttentionPluginCommon::enqueueGeneration(
     }
     sync_check_cuda_error();
 
+#ifndef NDEBUG
+    debugCheckSemaphores(stream);
+#endif
+
     // Try XQA optimization first.
     {
         // NOTE: input_seq_length = num_medusa_tokens + 1 (new generated one from the original LM head)
@@ -1515,6 +1520,11 @@ int GPTAttentionPluginCommon::initialize() noexcept
         TLLM_CHECK_WITH_INFO(false, "Medusa mode doesn't support the data type or cross attention.");
     }
 
+    if (mNbMultiBlockSemaphores != 0)
+    {
+        reserveSemaphoreArray(mNbMultiBlockSemaphores);
+    }
+
     return 0;
 }
 
@@ -1534,7 +1544,7 @@ size_t GPTAttentionPluginCommon::getCommonSerializationSize() noexcept
         + sizeof(mRemovePadding) + sizeof(mMaskType) + sizeof(mPagedKVCache) + sizeof(mTokensPerBlock) + sizeof(mType)
         + sizeof(mMaxContextLength) + sizeof(mQKVBiasEnabled) + sizeof(mCrossAttention) + sizeof(mMaxDistance)
         + sizeof(mPosShiftEnabled) + sizeof(mDenseContextFMHA) + sizeof(mPagedContextFMHA) + sizeof(mFP8ContextFMHA)
-        + sizeof(mUseKVCache) + sizeof(mUnfuseQkvGemm) + sizeof(mIsMedusaEnabled);
+        + sizeof(mUseKVCache) + sizeof(mUnfuseQkvGemm) + sizeof(mIsMedusaEnabled) + sizeof(mNbMultiBlockSemaphores);
 }
 
 void GPTAttentionPluginCommon::serializeCommon(void* buffer) const noexcept
@@ -1575,12 +1585,42 @@ void GPTAttentionPluginCommon::serializeCommon(void* buffer) const noexcept
     write(d, mFP8ContextFMHA);
     write(d, mUseKVCache);
     write(d, mIsMedusaEnabled);
+    write(d, mNbMultiBlockSemaphores);
     assert(d == a + getCommonSerializationSize());
 }
 
 void GPTAttentionPluginCommon::terminate() noexcept
 {
     // Do nothing, destroy will always be called, so release the resources there.
+}
+
+void GPTAttentionPluginCommon::reserveSemaphoreArray(int32_t size)
+{
+    if (size == 0 || (size <= mNbMultiBlockSemaphores && mMultiBlockSemaphores != nullptr))
+    {
+        return;
+    }
+    int32_t* ptr;
+    deviceMalloc(&ptr, size, false);
+    deviceMemSetZero(ptr, size);
+    mMultiBlockSemaphores.reset(ptr);
+    mNbMultiBlockSemaphores = size;
+}
+
+void GPTAttentionPluginCommon::debugCheckSemaphores(cudaStream_t stream)
+{
+#ifdef NDEBUG
+    TLLM_CHECK_WITH_INFO(false, "debugCheckSemaphores should not be called in release build");
+#endif
+    if (mNbMultiBlockSemaphores == 0)
+    {
+        return;
+    }
+    std::vector<uint32_t> hostBuf(mNbMultiBlockSemaphores);
+    TLLM_CUDA_CHECK(cudaMemcpyAsync(hostBuf.data(), mMultiBlockSemaphores.get(),
+        sizeof(uint32_t) * mNbMultiBlockSemaphores, cudaMemcpyDeviceToHost, stream));
+    TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
+    TLLM_CHECK(std::count(hostBuf.begin(), hostBuf.end(), 0U) == mNbMultiBlockSemaphores);
 }
 
 ///////////////

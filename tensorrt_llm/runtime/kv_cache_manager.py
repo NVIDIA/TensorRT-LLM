@@ -328,7 +328,10 @@ class KVCacheManager(object):
                 batch_idx += 1
         self.sequences = new_sequences
 
-    def add_sequence(self, sequence: GenerationSequence, context_len: int):
+    def add_sequence(self,
+                     sequence: GenerationSequence,
+                     context_len: int,
+                     always_share_across_beam: bool = False):
         """
         Add sequence to the manager and allocate minimum amount of blocks for context
         """
@@ -356,7 +359,9 @@ class KVCacheManager(object):
         # Allocate blocks
         for i in range(context_blocks):
             self.blocks_manager.allocate(
-                sequence, share_across_beam=i != unshared_block_idx)
+                sequence,
+                share_across_beam=True if always_share_across_beam else
+                (i != unshared_block_idx))
 
     def get_block_offsets(self, beam_width: int) -> torch.Tensor:
         """

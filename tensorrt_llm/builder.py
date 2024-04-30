@@ -156,7 +156,7 @@ class Builder():
         if use_refit and int8:
             # TRT folds weights into Myelin graph because network contains int8 tensor or Q/DQ nodes
             # These folded weights can not be refitted
-            logger.error("can't use refit and int8 mode at the same time")
+            logger.error(f"can't use refit and int8 mode at the same time")
 
         config = self.trt_builder.create_builder_config()
         if not self.strongly_typed:

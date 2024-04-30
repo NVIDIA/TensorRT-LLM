@@ -180,7 +180,10 @@ class KeyValueCacheParams:
                  host_kv_cache_block_offsets: Tensor = None,
                  host_kv_cache_pool_pointers: Tensor = None,
                  cache_indirection: Tensor = None,
-                 past_key_value_length: Tensor = None):
+                 past_key_value_length: Tensor = None,
+                 cross_kv_cache_block_offsets: Tensor = None,
+                 host_cross_kv_cache_block_offsets: Tensor = None,
+                 host_cross_kv_cache_pool_pointers: Tensor = None):
         self.past_key_value = past_key_value
         self.host_past_key_value_lengths = host_past_key_value_lengths
         self.host_max_attention_window_sizes = host_max_attention_window_sizes
@@ -188,6 +191,9 @@ class KeyValueCacheParams:
         self.kv_cache_block_offsets = kv_cache_block_offsets
         self.host_kv_cache_block_offsets = host_kv_cache_block_offsets
         self.host_kv_cache_pool_pointers = host_kv_cache_pool_pointers
+        self.cross_kv_cache_block_offsets = cross_kv_cache_block_offsets
+        self.host_cross_kv_cache_block_offsets = host_cross_kv_cache_block_offsets
+        self.host_cross_kv_cache_pool_pointers = host_cross_kv_cache_pool_pointers
         self.cache_indirection = cache_indirection
         # self.past_key_value_length = past_key_value_length
 
@@ -603,11 +609,15 @@ class Attention(Module):
                 alibi_slopes=alibi_slopes,
                 tp_size=self.tp_size,
                 tp_rank=self.tp_rank,
-                kv_cache_block_offsets=kv_cache_params.kv_cache_block_offsets,
+                kv_cache_block_offsets=kv_cache_params.kv_cache_block_offsets
+                if not self.cross_attention else
+                kv_cache_params.cross_kv_cache_block_offsets,
                 host_kv_cache_block_offsets=kv_cache_params.
-                host_kv_cache_block_offsets,
+                host_kv_cache_block_offsets if not self.cross_attention else
+                kv_cache_params.host_cross_kv_cache_block_offsets,
                 host_kv_cache_pool_pointers=kv_cache_params.
-                host_kv_cache_pool_pointers,
+                host_kv_cache_pool_pointers if not self.cross_attention else
+                kv_cache_params.host_cross_kv_cache_pool_pointers,
                 do_cross_attention=self.cross_attention,
                 cross_qkv=cross_qkv,
                 cross_qkv_length=attention_params.encoder_max_input_length,

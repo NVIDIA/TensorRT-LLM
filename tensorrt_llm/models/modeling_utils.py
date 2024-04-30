@@ -108,6 +108,7 @@ class PretrainedConfig:
                  world_size: int,
                  tp_size: int,
                  pp_size: int,
+                 gpus_per_node: int,
                  quantization: Union[QuantConfig, dict],
                  use_parallel_embedding: bool = False,
                  embedding_sharding_dim: int = 0,
@@ -135,7 +136,8 @@ class PretrainedConfig:
         self.share_embedding_table = share_embedding_table
         self.mapping = Mapping(world_size=world_size,
                                tp_size=tp_size,
-                               pp_size=pp_size)
+                               pp_size=pp_size,
+                               gpus_per_node=gpus_per_node)
         if isinstance(quantization, dict):
             self.quantization = dataclasses.replace(QuantConfig(),
                                                     **quantization)
@@ -184,14 +186,11 @@ class PretrainedConfig:
         embedding_sharding_dim = config.pop('embedding_sharding_dim', 0)
         share_embedding_table = config.pop('share_embedding_table', False)
 
-        mapping = config.pop('mapping', {
-            'world_size': 1,
-            'tp_size': 1,
-            'pp_size': 1
-        })
+        mapping = config.pop('mapping', {})
         world_size = mapping.get('world_size', 1)
         tp_size = mapping.get('tp_size', 1)
         pp_size = mapping.get('pp_size', 1)
+        gpus_per_node = mapping.get('gpus_per_node', 8)
 
         if share_embedding_table and tp_size > 1:
             if (not use_parallel_embedding) or (use_parallel_embedding and
@@ -221,7 +220,7 @@ class PretrainedConfig:
                    max_position_embeddings, hidden_size, num_hidden_layers,
                    num_attention_heads, num_key_value_heads, hidden_act,
                    intermediate_size, norm_epsilon, position_embedding_type,
-                   world_size, tp_size, pp_size, quant_config,
+                   world_size, tp_size, pp_size, gpus_per_node, quant_config,
                    use_parallel_embedding, embedding_sharding_dim,
                    share_embedding_table, **config)
 
@@ -239,6 +238,7 @@ class PretrainedConfig:
             'world_size': self.mapping.world_size,
             'tp_size': self.mapping.tp_size,
             'pp_size': self.mapping.pp_size,
+            'gpus_per_node': self.mapping.gpus_per_node,
         }
         output['quantization'] = dataclasses.asdict(self.quantization)
 
@@ -252,7 +252,8 @@ class PretrainedConfig:
         self.mapping = Mapping(self.mapping.world_size,
                                rank=rank,
                                tp_size=self.mapping.tp_size,
-                               pp_size=self.mapping.pp_size)
+                               pp_size=self.mapping.pp_size,
+                               gpus_per_node=self.mapping.gpus_per_node)
 
 
 class DecoderLayerList(ModuleList):
@@ -1058,7 +1059,6 @@ def load_model(
         use_parallel_embedding=model_config.use_parallel_embedding,
         share_embedding_table=model_config.share_embedding_table,
     )
-
     if weights is not None:
         preprocess_weights(weights, model_config)
         model.load(weights)

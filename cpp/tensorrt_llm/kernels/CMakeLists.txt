@@ -27,6 +27,10 @@ list(FILTER SRC_CU EXCLUDE REGEX "contextFusedMultiHeadAttention/.*")
 list(FILTER SRC_CPP EXCLUDE REGEX "decoderMaskedMultiheadAttention/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "decoderMaskedMultiheadAttention/.*")
 
+if(ENABLE_MULTI_DEVICE EQUAL 0)
+  list(FILTER SRC_CU EXCLUDE REGEX "customAllReduceKernels*.*cu$")
+endif()
+
 add_library(kernels_src STATIC ${SRC_CPP} ${SRC_CU})
 set_property(TARGET kernels_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET kernels_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)

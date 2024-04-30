@@ -19,11 +19,9 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/stringUtils.h"
 
-#include <mpi.h>
-
 #if ENABLE_MULTI_DEVICE
+#include <mpi.h>
 #include <nccl.h>
-#endif // ENABLE_MULTI_DEVICE
 
 #define TLLM_MPI_CHECK(cmd)                                                                                            \
     do                                                                                                                 \
@@ -32,7 +30,6 @@
         TLLM_CHECK_WITH_INFO(e == MPI_SUCCESS, "Failed: MPI error %s:%d '%d'", __FILE__, __LINE__, e);                 \
     } while (0)
 
-#if ENABLE_MULTI_DEVICE
 #define TLLM_NCCL_CHECK(cmd)                                                                                           \
     do                                                                                                                 \
     {                                                                                                                  \

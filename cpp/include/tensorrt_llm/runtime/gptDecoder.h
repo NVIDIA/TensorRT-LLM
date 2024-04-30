@@ -116,8 +116,6 @@ private:
                               // been written to use that shape.
     SamplingConfig mSamplingConfig;
 
-    cudaDeviceProp mProp; // Avoid dangling pointers in mDynamicDecodeLayer
-
     size_t mMaxBatchSize;
 };
 

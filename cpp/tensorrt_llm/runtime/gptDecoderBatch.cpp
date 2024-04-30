@@ -110,7 +110,7 @@ GptDecoderBatch::GptDecoderBatch(
     mBatchSlotsAcceptLogits = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<SizeType>::value);
     // use batchSize many entries instead of the usual 1
     dOutput->finishedSum = mBufferManager.emptyTensor(MemoryType::kPINNED, nvSizeType);
-    mFinishedSum = mBufferManager.pinned(ITensor::makeShape({1}), nvSizeType);
+    mFinishedSum = BufferManager::pinned(ITensor::makeShape({1}), nvSizeType);
     // we don't need dOutput->lengths because lengths are passed from outside
     dOutput->cumLogProbs = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
     dOutput->logProbs = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
@@ -351,7 +351,7 @@ void GptDecoderBatch::newRequest(
     auto const maxBeamWidth = jointOutputIdsShape.d[1];
     auto const beamWidth = samplingConfig.beamWidth;
     TLLM_CHECK_WITH_INFO(beamWidth <= maxBeamWidth,
-        tc::fmtstr("Beam width (%d) must be smaller than maxBeamWidth (%d) passed to decoder setup function.",
+        tc::fmtstr("Beam width (%d) must be smaller than maxBeamWidth (" FMT_DIM ") passed to decoder setup function.",
             beamWidth, maxBeamWidth));
     auto const& requestIds = request.ids;
     auto const inputLength = request.inputLen;
@@ -407,7 +407,7 @@ void GptDecoderBatch::newRequest(
                 = bufferCast<SizeType>(*requestWordsList);
             bufferCast<SizeType>(*constPointerCast(jointWordsLens))[batchIdx] = wordsLen;
             // FIXME(nkorobov): this is monotonically growing size
-            maxWordsLen = std::max(wordsLen, maxWordsLen);
+            maxWordsLen = std::max(static_cast<SizeType>(wordsLen), maxWordsLen);
             if (!fusedDecoder)
             {
                 wordsPtrs = ITensor::slice(jointWordsPtrs, batchIdx, localBatchSize);

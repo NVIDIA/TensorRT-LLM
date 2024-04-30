@@ -50,7 +50,7 @@ Examples of build invocations:
 ```bash
 # Build a float16 engine using a single GPU and HF weights.
 # Enable several TensorRT-LLM plugins to increase runtime performance. It also helps with build time.
-# workers == tp_size
+# --tp_size and --pp_size are the model shard size
 trtllm-build \
     --checkpoint_dir ./phi-2-checkpoint \
     --output_dir ./phi-2-engine \
@@ -58,7 +58,8 @@ trtllm-build \
     --max_batch_size 8 \
     --max_input_len 1024 \
     --max_output_len 1024 \
-    --workers 1
+    --tp_size 1 \
+    --pp_size 1
 ```
 
 #### Fused MultiHead Attention (FMHA)

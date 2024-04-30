@@ -36,6 +36,7 @@ WorldConfig::WorldConfig(SizeType tensorParallelism, SizeType pipelineParallelis
     , mGpusPerNode{gpusPerNode}
     , mDeviceIds{deviceIds.value_or(std::vector<SizeType>(mGpusPerNode))}
 {
+#if ENABLE_MULTI_DEVICE
     auto const numDevices = mDeviceIds.size();
     TLLM_CHECK(numDevices > 0);
 
@@ -70,6 +71,13 @@ WorldConfig::WorldConfig(SizeType tensorParallelism, SizeType pipelineParallelis
 
     TLLM_CHECK(mTensorParallelism > 0);
     TLLM_CHECK(mPipelineParallelism > 0);
+#else
+    // Overriding to default - single GPU
+    mRank = 0;
+    mGpusPerNode = 1;
+    mTensorParallelism = 1;
+    mPipelineParallelism = 1;
+#endif
 }
 
 bool WorldConfig::validMpiConfig() const
@@ -80,6 +88,7 @@ bool WorldConfig::validMpiConfig() const
 WorldConfig WorldConfig::mpi(SizeType gpusPerNode, std::optional<SizeType> tensorParallelism,
     std::optional<SizeType> pipelineParallelism, std::optional<std::vector<SizeType>> const& deviceIds)
 {
+#if ENABLE_MULTI_DEVICE
     auto& comm = COMM_SESSION;
     auto const mpiSize = comm.getSize();
     auto const mpiRank = comm.getRank();
@@ -90,6 +99,9 @@ WorldConfig WorldConfig::mpi(SizeType gpusPerNode, std::optional<SizeType> tenso
     TLLM_CHECK(mpiSize == tp * pp);
 
     return WorldConfig{tp, pp, mpiRank, gpusPerNode, deviceIds};
+#else
+    return WorldConfig();
+#endif
 }
 
 std::vector<SizeType> WorldConfig::getPipelineParallelGroup() const

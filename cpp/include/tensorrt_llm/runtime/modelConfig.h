@@ -76,6 +76,9 @@ public:
         , mUseLoraPlugin(false)
         , mMlpHiddenSize(0)
         , mMedusaModule(std::nullopt)
+        , mUseCrossAttention(false)
+        , mUsePositionEmbedding(true) // TODO: remove these two properties?
+        , mUseTokenTypeEmbedding(false)
     {
     }
 
@@ -392,6 +395,46 @@ public:
         mMlpHiddenSize = mlpHiddenSize;
     }
 
+    [[nodiscard]] bool constexpr useCrossAttention() const noexcept
+    {
+        return mUseCrossAttention;
+    }
+
+    void constexpr useCrossAttention(bool newCrossAttention) noexcept
+    {
+        mUseCrossAttention = newCrossAttention;
+    }
+
+    [[nodiscard]] bool constexpr usePositionEmbedding() const noexcept
+    {
+        return mUsePositionEmbedding;
+    }
+
+    void constexpr usePositionEmbedding(bool newPositionEmbedding) noexcept
+    {
+        mUsePositionEmbedding = newPositionEmbedding;
+    }
+
+    [[nodiscard]] bool constexpr useTokenTypeEmbedding() const noexcept
+    {
+        return mUseTokenTypeEmbedding;
+    }
+
+    void constexpr useTokenTypeEmbedding(bool newTokenTypeEmbedding) noexcept
+    {
+        mUseTokenTypeEmbedding = newTokenTypeEmbedding;
+    }
+
+    [[nodiscard]] SizeType constexpr getFfnHiddenSize() const noexcept
+    {
+        return mFfnHiddenSize;
+    }
+
+    void constexpr setFfnHiddenSize(SizeType ffnHiddenSize) noexcept
+    {
+        mFfnHiddenSize = ffnHiddenSize;
+    }
+
     [[nodiscard]] SizeType constexpr getMaxLoraRank() const noexcept
     {
         return mMaxLoraRank;
@@ -498,7 +541,13 @@ private:
     SizeType mMaxLoraRank;
 
     std::optional<MedusaModule> mMedusaModule;
-
     std::optional<MambaConfig> mMambaConfig;
+
+    // Configs related to encoder / enc-dec models
+    bool mUseCrossAttention;
+    bool mUsePositionEmbedding;
+    bool mUseTokenTypeEmbedding;
+    SizeType mFfnHiddenSize; // indicates encoder output hidden size
 };
+
 } // namespace tensorrt_llm::runtime

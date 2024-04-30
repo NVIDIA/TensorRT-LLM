@@ -927,11 +927,11 @@ void testCopyBatch(SizeType stride, BufferManager& manager, CudaStream& stream)
 
     auto const bufferShape = ITensor::makeShape({rows, stride});
     auto const indicesShape = ITensor::makeShape({numIndices});
-    auto srcBufferHost = manager.cpu(bufferShape, nvinfer1::DataType::kINT32);
+    auto srcBufferHost = BufferManager::cpu(bufferShape, nvinfer1::DataType::kINT32);
     auto dstBufferDevice = manager.gpu(bufferShape, nvinfer1::DataType::kINT32);
-    auto srcOffsets = manager.pinned(indicesShape, nvinfer1::DataType::kINT32);
-    auto dstOffsets = manager.pinned(indicesShape, nvinfer1::DataType::kINT32);
-    auto sizes = manager.pinned(indicesShape, nvinfer1::DataType::kINT32);
+    auto srcOffsets = BufferManager::pinned(indicesShape, nvinfer1::DataType::kINT32);
+    auto dstOffsets = BufferManager::pinned(indicesShape, nvinfer1::DataType::kINT32);
+    auto sizes = BufferManager::pinned(indicesShape, nvinfer1::DataType::kINT32);
     kernels::invokeFill(*dstBufferDevice, 0, stream);
 
     auto srcBufferHostPtr = bufferCast<std::int32_t>(*srcBufferHost);

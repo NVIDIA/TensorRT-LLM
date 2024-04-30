@@ -13,7 +13,11 @@ from typing import Any, Dict, Generator, List, Optional, Set, Tuple, Union
 import numpy as np
 import torch
 from janus import Queue as AsyncQueue
-from mpi4py import MPI
+
+from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
+
+if ENABLE_MULTI_DEVICE:
+    from mpi4py import MPI
 
 from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
 from tensorrt_llm.hlapi.mpi_session import MpiSession, find_free_port

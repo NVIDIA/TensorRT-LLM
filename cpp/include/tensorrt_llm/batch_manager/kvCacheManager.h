@@ -288,10 +288,12 @@ public:
     using SizeType = tensorrt_llm::runtime::SizeType;
 
     explicit BlockManager(SizeType numLayers, SizeType numKvHeads, SizeType sizePerHead, SizeType tokensPerBlock,
-        SizeType blocksInPrimaryPool, SizeType blocksInSecondaryPool, nvinfer1::DataType dtype,
-        std::shared_ptr<runtime::CudaStream> stream, bool useUvm, bool onboardBlocks);
+        SizeType blocksInPrimaryPool, SizeType blocksInSecondaryPool, std::shared_ptr<runtime::CudaStream> stream,
+        bool onboardBlocks);
 
     ~BlockManager();
+
+    void allocatePools(nvinfer1::DataType dtype, bool useUvm);
 
     void startScheduling();
 
@@ -420,6 +422,9 @@ private:
     void copyBlock(BlockPtr src, BlockPtr dst);
 
 private:
+    // Number of blocks in pools
+    SizeType mNumPrimaryBlocks;
+    SizeType mNumSecondaryBlocks;
     // List of free blocks. Blocks are either backed by fast primary memory or slow secondary memory,
     // we maintain separate queues for these.
     FreeBlocksQueue mFreePrimaryBlocks;
@@ -458,8 +463,10 @@ public:
 
     KVCacheManager(SizeType numLayers, SizeType numKvHeads, SizeType sizePerHead, SizeType tokensPerBlock,
         SizeType blocksInPrimaryPool, SizeType blocksInSecondaryPool, SizeType maxNumSequences, SizeType maxBeamWidth,
-        SizeType maxAttentionWindow, SizeType sinkTokenLength, bool useOneMoreBlock, nvinfer1::DataType dtype,
-        CudaStreamPtr stream, bool enableBlockReuse = false, bool useUvm = false, bool onboardBlocks = true);
+        SizeType maxAttentionWindow, SizeType sinkTokenLength, bool useOneMoreBlock, CudaStreamPtr stream,
+        bool enableBlockReuse = false, bool onboardBlocks = true);
+
+    void allocatePools(nvinfer1::DataType dtype, bool useUvm = false);
 
     void startScheduling();
 

@@ -74,6 +74,7 @@ class MambaConv1d(Module):
                 host_request_types, last_token_ids, self.d_inner, self.d_conv,
                 self.dtype, host_context_lengths, slot_mapping, self.apply_silu)
         else:
+            assert not default_net().plugin_config.paged_state
             assert len(
                 x.shape
             ) == 3, "remove_input_padding is not supported by OOTB for Mamba."
