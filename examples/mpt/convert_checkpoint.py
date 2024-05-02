@@ -640,6 +640,7 @@ def get_tllm_param(
 
 
 def convert_hf_mpt_legacy(hf_model,
+                          hf_config,
                           mapping,
                           rank=0,
                           dtype='float32',
@@ -1059,6 +1060,7 @@ if __name__ == '__main__':
         if args.smoothquant is not None or args.calibrate_kv_cache:
             weights = convert_hf_mpt_legacy(
                 hf_model,
+                hf_config,
                 mapping,
                 rank,
                 dtype=args.dtype,
