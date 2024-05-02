@@ -1188,8 +1188,20 @@ if __name__ == '__main__':
                                    mapping=Mapping(),
                                    dtype='float32'):
                     logger.info("Loading Medusa heads' weights ...")
+                    is_ckpt_safetensors = False
+
                     ckpt_file = Path(medusa_path) / "medusa_lm_head.pt"
-                    state_dict = torch.load(ckpt_file, map_location="cpu")
+                    if not ckpt_file.exists():
+                        ckpt_file = Path(medusa_path) / "medusa_lm_head.safetensors"
+                        is_ckpt_safetensors = True
+                    
+                    if is_ckpt_safetensors:
+                        print("Safetensors Found ...")
+                        from safetensors.torch import load_file
+                        state_dict = load_file(ckpt_file)
+                    else:
+                        state_dict = torch.load(ckpt_file, map_location="cpu")
+
                     torch_dtype = str_dtype_to_torch(dtype)
                     weights = {}
 
