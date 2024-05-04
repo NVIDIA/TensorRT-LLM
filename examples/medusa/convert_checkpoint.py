@@ -571,9 +571,9 @@ def get_tllm_linear_weight(weight,
                            postfix='weight'):
     results = {}
     if use_weight_only:
-        v = weight.t().contiguous()
+        v = weight.t().contiguous().cpu()
         processed_torch_weights, torch_weight_scales = \
-            torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+            torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                 v, plugin_weight_only_quant_type)
         results[prefix + postfix] = processed_torch_weights
         results[prefix + 'per_channel_scale'] = torch_weight_scales
@@ -1210,10 +1210,13 @@ if __name__ == '__main__':
                             w = state_dict[f"{h}.{l}.linear.weight"].clone().to(
                                 torch_dtype)
 
-                            weights[
-                                'medusa_heads.{}.medusa_layers.{}.linear.weight'
-                                .format(h, l)] = split(w, mapping.tp_size,
-                                                       mapping.tp_rank)
+                            split_v = split(w, mapping.tp_size, mapping.tp_rank)
+                            weights.update(
+                                get_tllm_linear_weight(split_v,
+                                                       f'medusa_heads.{h}.medusa_layers.{l}.linear.',
+                                                       None, args.use_weight_only, plugin_weight_only_quant_type
+                                                       )
+                            )
 
                             b = state_dict[f"{h}.{l}.linear.bias"].clone().to(
                                 torch_dtype)
