@@ -23,6 +23,8 @@ import numpy as np
 import tensorrt as trt
 import torch
 
+from tensorrt_llm._utils import numpy_to_torch
+
 from .. import profiler
 from .._utils import mpi_comm, mpi_world_size
 from ..bindings import GptSession
@@ -334,6 +336,18 @@ class ModelRunnerMixin:
 
         return outputs
 
+    def _prepare_embedding_table(self, prompt_table: Union[str, torch.Tensor]):
+        if isinstance(prompt_table, str):
+            prompt_table_data = numpy_to_torch(
+                np.load(prompt_table)).to(dtype=self.dtype)
+        else:
+            assert isinstance(
+                prompt_table,
+                torch.Tensor), "Prompt table should be str or torch.Tensor"
+            prompt_table_data = prompt_table.to(dtype=self.dtype)
+
+        return prompt_table_data.cuda()
+
     def _prepare_ptuning(self, prompt_table: Union[str, torch.Tensor],
                          tasks: str, batch_size: int):
         if self.max_prompt_embedding_table_size == 0:
@@ -341,7 +355,7 @@ class ModelRunnerMixin:
 
         if prompt_table is not None:
             if isinstance(prompt_table, str):
-                prompt_table_data = torch.from_numpy(
+                prompt_table_data = numpy_to_torch(
                     np.load(prompt_table)).to(dtype=self.dtype)
             else:
                 assert isinstance(

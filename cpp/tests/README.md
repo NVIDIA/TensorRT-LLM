@@ -19,7 +19,7 @@ An example call may look like this:
 ```bash
 CPP_BUILD_DIR=cpp/build
 MODEL_CACHE=/path/to/model_cache
-python3 cpp/tests/resources/scripts/test_cpp.py -a "80-real;86-real" --build_dir ${CPP_BUILD_DIR} --trt_root /usr/local/tensorrt --model_cache ${MODEL_CACHE} --only_gptj
+python3 cpp/tests/resources/scripts/test_cpp.py -a "80-real;86-real" --build_dir ${CPP_BUILD_DIR} --trt_root /usr/local/tensorrt --model_cache ${MODEL_CACHE} --run_gptj --skip_unit_tests
 ```
 
 ## Manual steps

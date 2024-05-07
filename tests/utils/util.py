@@ -114,19 +114,19 @@ def skip_bf16_fp32_accum(dtype, context_fmha_type):
         )
 
 
-def ammo_installed():
+def modelopt_installed():
     try:
         # isort: off
-        import ammo.torch.quantization as atq  # NOQA
-        from ammo.torch.export import export_tensorrt_llm_checkpoint  # NOQA
+        import modelopt.torch.quantization as atq  # NOQA
+        from modelopt.torch.export import export_tensorrt_llm_checkpoint  # NOQA
         # isort: on
         return True
     except Exception:
         return False
 
 
-skip_no_ammo = unittest.skipIf(not ammo_installed(),
-                               reason="AMMO is not installed")
+skip_no_modelopt = unittest.skipIf(not modelopt_installed(),
+                                   reason="Modelopt is not installed")
 
 
 # This function names will make all unit tests names to show the values of all parameters in @parameterized.expand

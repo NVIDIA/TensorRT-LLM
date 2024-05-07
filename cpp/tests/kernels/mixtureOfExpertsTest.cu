@@ -17,7 +17,7 @@ using namespace tensorrt_llm::runtime;
 constexpr static float FP8_MAX = 440; // FP8_E4M3_MAX;
 
 template <class T>
-__global__ void initWeightsKernel(T* data, int w, int h, float scalar)
+__global__ void initWeightsKernel(T* data, int64_t w, int64_t h, float scalar)
 {
     size_t expert_id = blockIdx.z;
     T* start_offset = data + expert_id * w * h;
@@ -44,7 +44,7 @@ __global__ void initWeightsGatedKernel(T* data, int w, int h, float scalar_1, fl
 }
 
 template <class T>
-__global__ void initBiasToExpertIdKernel(T* data, int w)
+__global__ void initBiasToExpertIdKernel(T* data, int64_t w)
 {
     size_t expert_id = blockIdx.y;
     T* start_offset = data + expert_id * w;
@@ -86,8 +86,8 @@ protected:
     constexpr static bool INT_QUANT = !std::is_same_v<DataType, WeightType>;
     using WeightStorage = std::conditional_t<INT_QUANT, uint8_t, WeightType>;
     constexpr static int WEIGHT_ELEM_PER_BYTE = INT4 ? 2 : 1;
-    int const HIDDEN_SIZE_MULTIPLIER = 1;
-    int const DEFAULT_HIDDEN_SIZE = HIDDEN_SIZE_MULTIPLIER * 64 / sizeof(WeightType) * WEIGHT_ELEM_PER_BYTE;
+    int64_t const HIDDEN_SIZE_MULTIPLIER = 8;
+    int64_t const DEFAULT_HIDDEN_SIZE = HIDDEN_SIZE_MULTIPLIER * 64 / sizeof(WeightType) * WEIGHT_ELEM_PER_BYTE;
 
     static BufferManager::CudaStreamPtr mStream;
     static std::unique_ptr<BufferManager> mBufferManager;
@@ -97,9 +97,9 @@ protected:
     float* mInputProbabilities{};
     DataType* mInputTensor{};
 
-    int mHiddenSize{};
-    int mNumExperts{};
-    int mK{};
+    int64_t mHiddenSize{};
+    int64_t mNumExperts{};
+    int64_t mK{};
 
     float getTolerance(float scale = 1.f)
     {
@@ -128,7 +128,7 @@ protected:
         mDeviceCount = getDeviceCount();
         if (shouldSkip())
         {
-            GTEST_SKIP();
+            GTEST_SKIP() << "Skipping due to no/unsupported GPU";
         }
 
         mStream = std::make_shared<CudaStream>();
@@ -146,7 +146,7 @@ protected:
         assert(mBufferManager);
         if (shouldSkip())
         {
-            GTEST_SKIP();
+            GTEST_SKIP() << "Skipping due to no/unsupported GPU";
         }
     }
 
@@ -155,7 +155,7 @@ protected:
         managed_buffers.clear();
     }
 
-    void initWeights(DataType* buffer, int w, int h, float scalar)
+    void initWeights(DataType* buffer, int64_t w, int64_t h, float scalar)
     {
         if constexpr (FP8)
             scalar = FP8_MAX; // Automatically set it to max
@@ -225,9 +225,9 @@ protected:
     int* mSourceToExpandedMap;
     int* mSelectedExpert;
     bool* mFinished{};
-    int mInterSize{};
-    int mTotalTokens{};
-    int mActiveRows{};
+    int64_t mInterSize{};
+    int64_t mTotalTokens{};
+    int64_t mActiveRows{};
 
     bool mUseBias = true;
 
@@ -256,7 +256,7 @@ protected:
     }
 
     void initBuffersPermute(std::vector<std::vector<DataType>> h_hidden_states,
-        std::vector<std::vector<float>> h_router_results, int hidden_size, int num_experts, int k,
+        std::vector<std::vector<float>> h_router_results, int64_t hidden_size, int64_t num_experts, int64_t k,
         std::vector<uint8_t> finished, MOEParallelismConfig parallelism_config)
     {
         managed_buffers.clear();
@@ -270,12 +270,13 @@ protected:
         auto const gated_inter = mInterSize * mGatedMultiplier;
 
         mTotalTokens = 0;
+
         std::vector<int> h_seq_lens;
         h_seq_lens.push_back(0);
         for (auto& sequence : h_hidden_states)
         {
             assert(sequence.size() % hidden_size == 0);
-            int num_tokens = sequence.size() / hidden_size;
+            int64_t num_tokens = sequence.size() / hidden_size;
             h_seq_lens.emplace_back(h_seq_lens.back() + num_tokens);
             mTotalTokens += num_tokens;
         }
@@ -330,7 +331,7 @@ protected:
             mExpertFP8Scale2 = allocBuffer<float>(1);
             mExpertFP8Scale3 = allocBuffer<float>(mNumExperts);
 
-            ASSERT_NE(mMaxInput, 0.0f);
+            EXPECT_NE(mMaxInput, 0.0f);
             initFP8Scales(mMaxInput);
         }
 
@@ -494,7 +495,7 @@ protected:
     }
 
     void runMoEPermute(std::vector<std::vector<DataType>> h_hidden_states,
-        std::vector<std::vector<float>> h_router_results, int hidden_size, int num_experts, int k,
+        std::vector<std::vector<float>> h_router_results, int64_t hidden_size, int64_t num_experts, int64_t k,
         std::vector<uint8_t> finished = {}, MOEParallelismConfig parallelism_config = {})
     {
         initBuffersPermute(std::move(h_hidden_states), std::move(h_router_results), hidden_size, num_experts, k,
@@ -642,7 +643,7 @@ protected:
             {
                 if (entry >= num_experts_per_node * tp_rank && entry < num_experts_per_node * (tp_rank + 1))
                     return entry;
-                return mNumExperts;
+                return (int) mNumExperts;
             });
         return result;
     }
@@ -1279,4 +1280,58 @@ TYPED_TEST(MixtureOfExpertsTest, ConfigSweep)
                 throw std::runtime_error("Test Failed");
         }) << tactic.str();
     }
+}
+
+TYPED_TEST(MixtureOfExpertsTest, PermuteVeryLongSequence)
+{
+    this->mUseBias = !this->FP8;
+
+    using DataType = typename TypeParam::DataType;
+    // Sequence * hidden size > INT32_MAX
+    int64_t hidden_size = 2048ll;
+    int64_t num_experts = 4;
+    int64_t k = 1;
+    int64_t num_tokens = 1024ll * 1024ll + 1ll;
+    ASSERT_GT(hidden_size * num_tokens, (uint64_t) std::numeric_limits<int>::max() + 1ull);
+
+    // Skip the test if the GPU does not have enough memory
+    size_t workspace_size = this->mMoERunner.getWorkspaceSize(
+        num_tokens, hidden_size, hidden_size * 4, num_experts, k, this->mActType, {});
+    auto const [freeMem, totalMem] = tensorrt_llm::common::getDeviceMemoryInfo(false);
+    if (freeMem < workspace_size)
+    {
+        GTEST_SKIP() << "Insufficient free memory for workspace size";
+    }
+
+    std::vector<DataType> hidden_states(hidden_size * num_tokens);
+    this->mMaxInput = 1.f; // Any arbitrary non-zero value
+
+    // All tokens to expert 0
+    float const token_probs[] = {1.f, 0.5f, 0.f, 0.f};
+    std::vector<float> probs;
+    probs.reserve(num_tokens * num_experts);
+    for (size_t i = 0; i < num_tokens; i++)
+    {
+        probs.insert(probs.cend(), std::begin(token_probs), std::end(token_probs));
+    }
+
+    this->runMoEPermute({hidden_states}, {probs}, hidden_size, num_experts, k);
+
+    // Just look at the first few tokens
+    this->mTotalTokens = 10;
+
+    probs.resize(num_experts * this->mTotalTokens);
+    hidden_states.resize(hidden_size * this->mTotalTokens);
+
+    auto selected_expert = this->getDataFromDevice(this->mSelectedExpert, k * this->mTotalTokens);
+    // All tokens should go to expert 0
+    for (auto& item : selected_expert)
+    {
+        ASSERT_EQ(item, 0);
+    }
+
+    this->compareSoftmax(selected_expert, probs);
+    // Create a default vector for the reference outputs of the correct type for FP8
+    std::vector<typename TypeParam::OutputType> unquant_states(this->mTotalTokens * hidden_size);
+    this->compareFinal(selected_expert, probs, unquant_states);
 }

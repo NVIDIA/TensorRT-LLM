@@ -1061,8 +1061,8 @@ class SmoothQuantAttention(Module):
         self,
         hidden_states: Tensor,
         attention_mask=None,
-        medusa_packed_mask=None,
-        medusa_position_offsets=None,
+        spec_decoding_packed_mask=None,
+        spec_decoding_position_offsets=None,
         use_cache=False,
         kv_cache_params=None,
         attention_params=None,
@@ -1149,8 +1149,8 @@ class SmoothQuantAttention(Module):
                 host_kv_cache_pool_pointers=kv_cache_params.
                 host_kv_cache_pool_pointers,
                 host_context_lengths=attention_params.host_context_lengths,
-                medusa_position_offsets=medusa_position_offsets,
-                medusa_packed_mask=medusa_packed_mask)
+                spec_decoding_position_offsets=spec_decoding_position_offsets,
+                spec_decoding_packed_mask=spec_decoding_packed_mask)
         else:
             assert self.paged_kv_cache == False
 

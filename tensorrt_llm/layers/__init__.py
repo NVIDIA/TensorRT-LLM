@@ -14,7 +14,7 @@
 # limitations under the License.
 from .activation import Mish
 from .attention import (Attention, AttentionMaskType, AttentionParams,
-                        BertAttention, KeyValueCacheParams,
+                        BertAttention, CogVLMAttention, KeyValueCacheParams,
                         PositionEmbeddingType)
 from .cast import Cast
 from .conv import Conv1d, Conv2d, ConvTranspose2d
@@ -41,6 +41,7 @@ __all__ = [
     'PositionEmbeddingType',
     'Attention',
     'BertAttention',
+    'CogVLMAttention',
     'GroupNorm',
     'Embedding',
     'PromptTuningEmbedding',

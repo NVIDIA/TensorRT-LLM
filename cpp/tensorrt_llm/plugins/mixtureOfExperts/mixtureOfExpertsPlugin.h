@@ -35,8 +35,8 @@ struct GemmIDMoe
 {
     int num_experts{};
     int moe_k{};
-    int hidden{};
-    int inter{};
+    int64_t hidden{};
+    int64_t inter{};
     tensorrt_llm::ActivationType actfn{};
     nvinfer1::DataType dtype{};
     nvinfer1::DataType wdtype{};
@@ -136,8 +136,8 @@ private:
     std::unique_ptr<kernels::CutlassMoeFCRunnerInterface> mMOERunner{};
     int mNumExperts{};
     int mK{};
-    int mExpertHiddenSize{};
-    int mExpertInterSize{};
+    int64_t mExpertHiddenSize{};
+    int64_t mExpertInterSize{};
     tensorrt_llm::ActivationType mActivationType;
     nvinfer1::DataType mType{};
     nvinfer1::DataType mWeightType{};
@@ -170,8 +170,8 @@ private:
         size_t size{};
     };
 
-    int getNumTokens(nvinfer1::PluginTensorDesc const* input_tensor) const;
-    WorkspaceInfo setupWorkspace(void* base_ptr, int num_tokens) const;
+    int64_t getNumTokens(nvinfer1::PluginTensorDesc const* input_tensor) const;
+    WorkspaceInfo setupWorkspace(void* base_ptr, int64_t num_tokens) const;
 
     kernels::MOEParallelismConfig getParallelismConfig() const;
     kernels::QuantParams getQuantParams(

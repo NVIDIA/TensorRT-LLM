@@ -67,6 +67,8 @@ class BuildConfig:
     layer_types: List[str] = field(default_factory=list)
     rnn_hidden_size: int = 0
     logits_soft_cap: float = 0.0
+    opt_batch_size: Optional[int] = None
+    opt_num_tokens: Optional[int] = None
 
 
 @dataclass

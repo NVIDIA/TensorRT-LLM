@@ -1,7 +1,9 @@
+import argparse
 import copy
 import dataclasses
 import json
 import os
+from enum import IntFlag, auto
 from functools import cached_property
 from typing import Dict, List, Optional, Union
 
@@ -31,6 +33,27 @@ from .generation_mixin import GenerationMixin
 WEIGHT_LOADER_MODELS = {"PhiForCausalLM"}
 
 
+class SpeculativeDecodingMode(IntFlag):
+    # [WARNING] KEEP BELOW DEFINITION IN SYNC WITH cpp/tensorrt_llm/runtime/speculativeDecodingMode.h
+    NONE = auto()
+    DRAFT_TOKENS_EXTERNAL = auto()
+    MEDUSA = auto()
+    LOOKAHEAD_DECODING = auto()
+
+    @staticmethod
+    def from_arguments(args: argparse.Namespace):
+        if args.speculative_decoding_mode is None:
+            return SpeculativeDecodingMode.NONE
+        elif args.speculative_decoding_mode == "draft_tokens_external":
+            return SpeculativeDecodingMode.DRAFT_TOKENS_EXTERNAL
+        elif args.speculative_decoding_mode == "medusa":
+            return SpeculativeDecodingMode.MEDUSA
+        elif args.speculative_decoding_mode == "lookahead_decoding":
+            return SpeculativeDecodingMode.LOOKAHEAD_DECODING
+        else:
+            assert False, "Unknown speculative_decoding_mode " + args.speculative_decoding_mode
+
+
 @dataclasses.dataclass
 class QuantConfig:
     '''Serializable quantization configuration class, part of the PretrainedConfig
@@ -55,8 +78,8 @@ class QuantConfig:
             self.kv_cache_quant_algo,
         )
 
-    def quant_algo_to_ammo_qformat(self):
-        algo_to_ammo_map = {
+    def quant_algo_to_modelopt_qformat(self):
+        algo_to_modelopt_map = {
             QuantAlgo.W8A16: "int8_wo",
             QuantAlgo.W4A16: "int4_wo",
             QuantAlgo.W4A16_AWQ: "int4_awq",
@@ -65,8 +88,8 @@ class QuantConfig:
             QuantAlgo.W8A8_SQ_PER_CHANNEL: 'int8_sq',
         }
         if self.quant_algo is not None:
-            assert self.quant_algo in algo_to_ammo_map, f"We don't use AMMO for quantization algorithm {self.quant_algo}, you probably shall not call this"
-            qformat = algo_to_ammo_map[self.quant_algo]
+            assert self.quant_algo in algo_to_modelopt_map, f"We don't use Modelopt for quantization algorithm {self.quant_algo}, you probably shall not call this"
+            qformat = algo_to_modelopt_map[self.quant_algo]
         else:
             qformat = 'full_prec'
         return qformat
@@ -114,6 +137,7 @@ class PretrainedConfig:
                  embedding_sharding_dim: int = 0,
                  share_embedding_table: bool = False,
                  head_size: int = None,
+                 qk_layernorm: bool = False,
                  **kwargs):
         self.architecture = architecture
         self.dtype = dtype
@@ -126,6 +150,7 @@ class PretrainedConfig:
         self.num_attention_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
         self.head_size = hidden_size // num_attention_heads if head_size is None else head_size
+        self.qk_layernorm = qk_layernorm
         self.hidden_act = hidden_act
         self.intermediate_size = intermediate_size
         self.norm_epsilon = norm_epsilon
@@ -270,8 +295,8 @@ class DecoderLayerList(ModuleList):
                 attention_params=None,
                 position_ids=None,
                 lora_params=None,
-                medusa_position_offsets=None,
-                medusa_packed_mask=None):
+                spec_decoding_position_offsets=None,
+                spec_decoding_packed_mask=None):
         kv_cache_params.fill_none_tensor_list(len(self.layer_list))
 
         if use_cache:
@@ -289,10 +314,11 @@ class DecoderLayerList(ModuleList):
                 kwargs['position_ids'] = position_ids
             if lora_layer_params is not None:
                 kwargs['lora_layer_params'] = lora_layer_params
-            if medusa_position_offsets is not None:
-                kwargs['medusa_position_offsets'] = medusa_position_offsets
-            if medusa_packed_mask is not None:
-                kwargs['medusa_packed_mask'] = medusa_packed_mask
+            if spec_decoding_position_offsets is not None:
+                kwargs[
+                    'spec_decoding_position_offsets'] = spec_decoding_position_offsets
+            if spec_decoding_packed_mask is not None:
+                kwargs['spec_decoding_packed_mask'] = spec_decoding_packed_mask
 
             hidden_states = layer(
                 hidden_states,
@@ -443,9 +469,11 @@ class PretrainedModel(Module,
                        prompt_embedding_table_size: int = 0,
                        position_encoding_2d: bool = False,
                        max_draft_len: int = 0,
+                       speculative_decoding_draft_tokens_external: bool = False,
                        gather_context_logits: bool = False,
                        gather_generation_logits: bool = False,
-                       lora_target_modules: List[str] = None):
+                       lora_target_modules: List[str] = None,
+                       opt_batch_size: int = 0):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
 
@@ -491,9 +519,12 @@ class PretrainedModel(Module,
             use_custom_all_reduce=use_custom_all_reduce,
             use_lora_plugin=use_lora_plugin,
             max_draft_len=max_draft_len,
+            speculative_decoding_draft_tokens_external=
+            speculative_decoding_draft_tokens_external,
             lora_target_modules=lora_target_modules,
             multiple_profiles=multiple_profiles,
-            streamingllm=streamingllm)
+            streamingllm=streamingllm,
+            opt_batch_size=opt_batch_size)
 
         result = {
             'input_ids':
@@ -544,6 +575,11 @@ class PretrainedModel(Module,
                 host_context_lengths=model_inputs['host_context_lengths'],
                 max_context_length=max_input_len,
                 host_request_types=model_inputs['host_request_types'])
+        if model_inputs['spec_decoding_packed_mask'] is not None:
+            result['spec_decoding_position_offsets'] = model_inputs[
+                'spec_decoding_position_offsets']
+            result['spec_decoding_packed_mask'] = model_inputs[
+                'spec_decoding_packed_mask']
 
         return result
 
@@ -563,9 +599,9 @@ class PretrainedModel(Module,
     ):
         if mapping is None:  # single gpu
             mapping = Mapping()
-        ammo_qformat = quant_config.quant_algo_to_ammo_qformat()
+        modelopt_qformat = quant_config.quant_algo_to_modelopt_qformat()
         kv_cache_dtype = quant_config.kv_cache_quant_algo
-        assert ammo_qformat is not None
+        assert modelopt_qformat is not None
         from ..quantization import quantize_and_export
         hf_model_dir = str(
             hf_model_dir)  # quantize_and_export has some code can not take Path
@@ -573,7 +609,7 @@ class PretrainedModel(Module,
             model_dir=hf_model_dir,
             dtype=dtype,
             device='cuda',
-            qformat=ammo_qformat,
+            qformat=modelopt_qformat,
             kv_cache_dtype=kv_cache_dtype,
             calib_size=calib_batches,
             batch_size=calib_batch_size,
@@ -606,8 +642,8 @@ class DecoderModelForCausalLM(PretrainedModel):
                 prompt_tasks: Optional[Tensor] = None,
                 prompt_vocab_size: Optional[Tensor] = None,
                 lora_params=None,
-                medusa_position_offsets=None,
-                medusa_packed_mask=None):
+                spec_decoding_position_offsets=None,
+                spec_decoding_packed_mask=None):
         kwargs = {
             'input_ids': input_ids,
             'position_ids': position_ids,
@@ -627,10 +663,11 @@ class DecoderModelForCausalLM(PretrainedModel):
         if prompt_vocab_size is not None:
             kwargs['prompt_vocab_size'] = prompt_vocab_size
 
-        if medusa_position_offsets is not None:
-            kwargs['medusa_position_offsets'] = medusa_position_offsets
-        if medusa_packed_mask is not None:
-            kwargs['medusa_packed_mask'] = medusa_packed_mask
+        if spec_decoding_position_offsets is not None:
+            kwargs[
+                'spec_decoding_position_offsets'] = spec_decoding_position_offsets
+        if spec_decoding_packed_mask is not None:
+            kwargs['spec_decoding_packed_mask'] = spec_decoding_packed_mask
 
         hidden_states = self.transformer.forward(**kwargs)
 

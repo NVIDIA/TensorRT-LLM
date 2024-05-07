@@ -55,6 +55,25 @@ std::optional<int32_t> envXqaNbCtaPerKVHead()
     return ret;
 }
 
+bool getEnvDisableXQAJIT()
+{
+    static bool init = false;
+    static bool disableXQAJIT = false;
+    if (!init)
+    {
+        init = true;
+        char const* disable_xqa_jit_var = std::getenv("TRTLLM_DISABLE_XQA_JIT");
+        if (disable_xqa_jit_var)
+        {
+            if (disable_xqa_jit_var[0] == '1' && disable_xqa_jit_var[1] == '\0')
+            {
+                disableXQAJIT = true;
+            }
+        }
+    }
+    return disableXQAJIT;
+}
+
 // Tune the number of blocks per sequence for accuracy/performance purpose.
 bool getEnvMmhaMultiblockDebug()
 {

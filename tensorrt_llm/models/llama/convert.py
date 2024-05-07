@@ -304,6 +304,35 @@ def smooth_llama_model(model, scales, alpha, llama_qkv_para, llama_smoother):
         scales[layer_name]["w"] = module.mlp.down_proj.weight.abs().max(
             dim=1)[0]
 
+        # ==================================================================
+        if hasattr(module, 'residual_mlp'):
+            fc1_layer_name = name + ".residual_mlp.w1"
+            gate_layer_name = name + ".residual_mlp.w3"
+
+            smoother = smooth_gemm_fc1_gate(module.residual_mlp.w1.weight,
+                                            module.residual_mlp.w3.weight,
+                                            scales[fc1_layer_name]["x"],
+                                            module.residual_layernorm.weight,
+                                            None, alpha)
+
+            scales[fc1_layer_name]["x"] = scales[fc1_layer_name]["x"] / smoother
+            scales[fc1_layer_name]["w"] = module.residual_mlp.w1.weight.abs(
+            ).max(dim=1)[0]
+
+            scales[gate_layer_name][
+                "x"] = scales[gate_layer_name]["x"] / smoother
+            scales[gate_layer_name]["w"] = module.residual_mlp.w3.weight.abs(
+            ).max(dim=1)[0]
+
+            # ==================================================================
+            layer_name = name + ".residual_mlp.w2"
+            smoother = smooth_gemm(module.residual_mlp.w2.weight,
+                                   scales[layer_name]["x"], None, None, alpha)
+            llama_smoother[layer_name] = smoother.float()
+            scales[layer_name]["x"] = scales[layer_name]["x"] / smoother
+            scales[layer_name]["w"] = module.residual_mlp.w2.weight.abs().max(
+                dim=1)[0]
+
 
 @torch.no_grad()
 def capture_activation_range(model,
@@ -615,6 +644,7 @@ def convert_hf_llama(hf_model,
                      sharding_dim=0,
                      use_weight_only=False,
                      share_embedding_table=False,
+                     residual_mlp=False,
                      use_gemm_woq_plugin=False,
                      plugin_weight_only_quant_type=torch.int8,
                      use_smooth_quant=False,
@@ -827,6 +857,112 @@ def convert_hf_llama(hf_model,
 
             moe_experts_gate_weights = get_weight(
                 model_params, prefix + 'block_sparse_moe.gate', torch.float32)
+
+            if residual_mlp:
+                residual_mlp_gate_weights = get_weight(
+                    model_params, prefix + 'residual_mlp.w3', dtype)
+                if use_smooth_quant:
+                    residual_mlp_gate_weights = residual_mlp_gate_weights.t()
+                    int8_weights = generate_int8(
+                        residual_mlp_gate_weights,
+                        act_range.get(prefix + 'residual_mlp.w3'))
+                    weights.update(
+                        get_tllm_linear_sq_weight(
+                            int8_weights,
+                            tllm_prex + 'residual_mlp.gate.',
+                            [1, hidden_size // tensor_parallel],
+                            tensor_parallel,
+                            is_qkv=False,
+                            per_token=per_token,
+                            per_channel=per_channel,
+                            last_prefix=tllm_prex +
+                            'post_layernorm.scale_to_int',
+                            smoother_value=None,
+                            smoother_shape=None,
+                            rank=mapping.tp_rank,
+                            cat_dim=-1))
+                else:
+                    split_v = split_matrix_tp(residual_mlp_gate_weights,
+                                              tensor_parallel,
+                                              mapping.tp_rank,
+                                              dim=0)
+                    weights.update(
+                        get_tllm_linear_weight(split_v,
+                                               tllm_prex + 'residual_mlp.gate.',
+                                               None, use_weight_only,
+                                               plugin_weight_only_quant_type,
+                                               dtype, use_gemm_woq_plugin))
+
+                residual_mlp_fc_weight = get_weight(model_params,
+                                                    prefix + 'residual_mlp.w1',
+                                                    dtype)
+                if use_smooth_quant:
+                    residual_mlp_fc_weight = residual_mlp_fc_weight.t(
+                    )  #verified
+                    int8_weights = generate_int8(
+                        residual_mlp_fc_weight,
+                        act_range.get(prefix + 'residual_mlp.w1'))
+                    weights.update(
+                        get_tllm_linear_sq_weight(
+                            int8_weights,
+                            tllm_prex + 'residual_mlp.fc.',
+                            [1, hidden_size // tensor_parallel],
+                            tensor_parallel,
+                            is_qkv=False,
+                            per_token=per_token,
+                            per_channel=per_channel,
+                            last_prefix=tllm_prex +
+                            'post_layernorm.scale_to_int',
+                            smoother_value=None,
+                            smoother_shape=None,
+                            rank=mapping.tp_rank,
+                            cat_dim=-1))
+                else:
+                    split_v = split_matrix_tp(residual_mlp_fc_weight,
+                                              tensor_parallel,
+                                              mapping.tp_rank,
+                                              dim=0)
+                    weights.update(
+                        get_tllm_linear_weight(split_v,
+                                               tllm_prex + 'residual_mlp.fc.',
+                                               None, use_weight_only,
+                                               plugin_weight_only_quant_type,
+                                               dtype, use_gemm_woq_plugin))
+
+                residual_mlp_proj_weight = get_weight(
+                    model_params, prefix + 'residual_mlp.w2', dtype)
+
+                if use_smooth_quant:
+                    residual_mlp_proj_weight = residual_mlp_proj_weight.t()
+                    int8_weights = generate_int8(
+                        residual_mlp_proj_weight,
+                        act_range.get(prefix + 'residual_mlp.w2'))
+                    weights.update(
+                        get_tllm_linear_sq_weight(
+                            int8_weights,
+                            tllm_prex + 'residual_mlp.proj.', [1, hidden_size],
+                            tensor_parallel,
+                            is_qkv=False,
+                            per_token=per_token,
+                            per_channel=per_channel,
+                            last_prefix=tllm_prex +
+                            'residual_mlp.quantization_scaling_factor',
+                            smoother_value=smoother[prefix + 'residual_mlp.w2'],
+                            smoother_shape=[1, hidden_size // tensor_parallel],
+                            rank=mapping.tp_rank,
+                            cat_dim=0))
+                else:
+                    split_v = split_matrix_tp(residual_mlp_proj_weight,
+                                              tensor_parallel,
+                                              mapping.tp_rank,
+                                              dim=1)
+                    weights.update(
+                        get_tllm_linear_weight(split_v,
+                                               tllm_prex + 'residual_mlp.proj.',
+                                               None, use_weight_only,
+                                               plugin_weight_only_quant_type,
+                                               dtype, use_gemm_woq_plugin))
+
             weights.update(
                 get_tllm_linear_weight(
                     moe_experts_gate_weights.to(torch.float32),
@@ -943,6 +1079,14 @@ def convert_hf_llama(hf_model,
         post_ln_weight = get_weight(model_params,
                                     prefix + 'post_attention_layernorm', dtype)
         weights[tllm_prex + 'post_layernorm.weight'] = post_ln_weight
+
+        if residual_mlp:
+            residual_ln_weight = get_weight(model_params,
+                                            prefix + 'residual_layernorm',
+                                            dtype)
+            weights[tllm_prex +
+                    'residual_layernorm.weight'] = residual_ln_weight
+
         cur_block_weights = [
             weight_name for weight_name in model_params
             if weight_name.find(prefix) != -1
@@ -1064,7 +1208,8 @@ def create_config_from_hugging_face(hf_model,
     hidden_act = hf_config.hidden_act
     config['rotary_scaling'] = getattr(hf_config, "rope_scaling", None)
     rotary_base = getattr(hf_config, "rope_theta", 10000.0)
-    if hf_config.model_type == "mixtral":
+    config['residual_mlp'] = getattr(hf_config, "parallel_attn_mlp_res", False)
+    if hf_config.model_type == "mixtral" or hf_config.model_type == "arctic":
         # HF LLaMA-type models are implicitly using gated activation.
         # With our MoE implementation, we must make it explicit
         hidden_act = "swiglu"
@@ -1198,7 +1343,7 @@ def quantize(dtype,
     '''
         Quantize the save the model as TRT-LLM checkpoint to output_dir
     '''
-    #TODO: currently only smooth quant and kv cache quantization are supported, needs to support mode quant algorithm calling ammo
+    #TODO: currently only smooth quant and kv cache quantization are supported, needs to support mode quant algorithm calling modelopt
     config = create_config_from_hugging_face(model_dir,
                                              dtype,
                                              mapping,
@@ -1295,6 +1440,7 @@ def load_weights_from_hf(*,
         use_parallel_embedding=config.get('use_parallel_embedding', False),
         sharding_dim=config.get('embedding_sharding_dim', 0),
         share_embedding_table=config.get('share_embedding_table', False),
+        residual_mlp=config['residual_mlp'],
         use_smooth_quant=use_smooth_quant,
         per_channel=per_channel_sq,
         per_token=per_token_sq,

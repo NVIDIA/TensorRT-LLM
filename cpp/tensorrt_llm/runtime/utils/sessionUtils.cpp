@@ -97,10 +97,24 @@ std::vector<ITensor::SharedPtr> sliceBufferVector(
 }
 
 void insertTensorVector(StringPtrMap<ITensor>& map, std::string const& key, std::vector<ITensor::SharedPtr> const& vec,
-    SizeType const indexOffset)
+    SizeType indexOffset, std::vector<ModelConfig::LayerType> const& layerTypes, ModelConfig::LayerType type)
 {
-    for (std::size_t i = 0; i < vec.size(); ++i)
-        map.insert_or_assign(key + std::to_string(indexOffset + i), vec[i]);
+    if (layerTypes.empty())
+    {
+        for (std::size_t i = 0; i < vec.size(); ++i)
+            map.insert_or_assign(key + std::to_string(indexOffset + i), vec[i]);
+    }
+    else
+    {
+        std::size_t vecIndex = 0;
+        for (std::size_t i = 0; i < layerTypes.size(); ++i)
+        {
+            if (layerTypes[i] == type)
+            {
+                map.insert_or_assign(key + std::to_string(indexOffset + i), vec.at(vecIndex++));
+            }
+        }
+    }
 }
 
 void insertTensorSlices(

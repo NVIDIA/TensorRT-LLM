@@ -22,7 +22,6 @@
 #include <mutex>
 #include <unordered_map>
 
-#include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/cubin/xqa_kernel_cubin.h"
@@ -36,9 +35,9 @@ namespace tensorrt_llm
 namespace kernels
 {
 
-DecoderXQARunner::DecoderXQARunner(
-    const XQADataType data_type, int num_heads, int num_kv_heads, int head_size, bool multi_block_mode)
-    : mPrepareCalled(false)
+DecoderXQARunner::DecoderXQARunner(Resource* resource, const XQADataType data_type, int num_heads, int num_kv_heads,
+    int head_size, bool multi_block_mode)
+    : mResource(resource)
     , mDataType(data_type)
     , mNumHeads(num_heads)
     , mNumKVHeads(num_kv_heads)
@@ -46,9 +45,12 @@ DecoderXQARunner::DecoderXQARunner(
     , mMultiBlockMode(multi_block_mode)
 {
     mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
-    // The initialization of mImpl must be the last line because *this needs to be fully initialized before calling
-    // DecoderXQAImpl::create().
-    mImpl = DecoderXQAImpl::create(this, DecoderXQAImpl::ImplType::kPrecompiled);
+
+    // TODO(minwei): needs both impls because medusa kernels haven't been migrated to JIT yet (which should be).
+    // mJITImpl/mPrecompiledImpl assignments must be the last lines of this constructor. DecoderXQAImpl::create() relies
+    // on *this being fully initialized.
+    mJITImpl = DecoderXQAImpl::create(this, DecoderXQAImpl::ImplType::kJIT);
+    mPrecompiledImpl = DecoderXQAImpl::create(this, DecoderXQAImpl::ImplType::kPrecompiled);
 }
 
 DecoderXQARunner::~DecoderXQARunner() = default;
@@ -96,27 +98,82 @@ size_t DecoderXQARunner::getWorkspaceSize(int max_batch_beam_size)
     return workspace_size;
 }
 
-bool DecoderXQARunner::shouldUseImpl(XQAParams const& xqaParams)
+DecoderXQAImpl* DecoderXQARunner::getImplFromXQAParams(XQAParams const& xqaParams)
 {
-    return mImpl->shouldUse(xqaParams);
+    if (tensorrt_llm::common::getEnvDisableXQAJIT())
+    {
+        // Always use Precompiled impl if TRTLLM_DISABLE_XQA_JIT is ON.
+        return mPrecompiledImpl.get();
+    }
+    if (xqaParams.multi_query_tokens)
+    {
+        // Use precompiled cubin for medusa, because medusa cubins are generated from a different CUDA source file than
+        // non-medusa.
+        return mPrecompiledImpl.get();
+    }
+    else
+    {
+        return mJITImpl.get();
+    }
+}
+
+bool DecoderXQARunner::shouldUseImpl(XQAParams const& xqa_params, bool for_configure_plugin)
+{
+    return getImplFromXQAParams(xqa_params)->shouldUse(xqa_params, for_configure_plugin);
 }
 
 void DecoderXQARunner::prepareForRun(XQAParams const& xqa_params)
 {
-    return mImpl->prepare(xqa_params);
+    return getImplFromXQAParams(xqa_params)->prepare(xqa_params);
 }
 
 template <typename KVCacheBuffer>
 void DecoderXQARunner::run(
     XQAParams const& xqa_params, KVCacheBuffer const& kv_cache_buffer, cudaStream_t const& stream)
 {
-    return mImpl->run(xqa_params, kv_cache_buffer, stream);
+    return getImplFromXQAParams(xqa_params)->run(xqa_params, kv_cache_buffer, stream);
 }
 
 template void DecoderXQARunner::run(
     XQAParams const& xqa_params, KVLinearBuffer const& kv_linear_buffer, cudaStream_t const& stream);
 template void DecoderXQARunner::run(
     XQAParams const& xqa_params, KVBlockArray const& kv_block_array, cudaStream_t const& stream);
+
+//// DecoderXQARunner::Resource
+DecoderXQARunner::Resource::Resource()
+    : mCubinObjRegistry(std::make_unique<jit::CubinObjRegistry>())
+{
+}
+
+DecoderXQARunner::Resource::Resource(DecoderXQARunner::Resource const& other)
+    : mCubinObjRegistry(other.mCubinObjRegistry->clone())
+{
+}
+
+DecoderXQARunner::Resource& DecoderXQARunner::Resource::operator=(DecoderXQARunner::Resource const& other)
+{
+    if (this == &other)
+    {
+        return *this;
+    }
+    mCubinObjRegistry = other.mCubinObjRegistry->clone();
+    return *this;
+}
+
+DecoderXQARunner::Resource::Resource(void const* buffer, size_t buffer_size)
+    : mCubinObjRegistry(std::make_unique<jit::CubinObjRegistry>(buffer, buffer_size))
+{
+}
+
+size_t DecoderXQARunner::Resource::getSerializationSize() const noexcept
+{
+    return mCubinObjRegistry->getSerializationSize();
+}
+
+void DecoderXQARunner::Resource::serialize(void* buffer, size_t buffer_size) const noexcept
+{
+    mCubinObjRegistry->serialize(buffer, buffer_size);
+}
 
 } // namespace kernels
 

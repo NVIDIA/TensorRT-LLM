@@ -36,6 +36,7 @@
 #include "tensorrt_llm/plugins/ncclPlugin/reduceScatterPlugin.h"
 #include "tensorrt_llm/plugins/ncclPlugin/sendPlugin.h"
 #endif // ENABLE_MULTI_DEVICE
+#include "tensorrt_llm/plugins/cumsumLastDimPlugin/cumsumLastDimPlugin.h"
 #include "tensorrt_llm/plugins/quantizePerTokenPlugin/quantizePerTokenPlugin.h"
 #include "tensorrt_llm/plugins/quantizeTensorPlugin/quantizeTensorPlugin.h"
 #include "tensorrt_llm/plugins/rmsnormQuantizationPlugin/rmsnormQuantizationPlugin.h"
@@ -193,6 +194,7 @@ extern "C"
         static tensorrt_llm::plugins::SelectiveScanPluginCreator selectiveScanPluginCreator;
         static tensorrt_llm::plugins::MambaConv1dPluginCreator mambaConv1DPluginCreator;
         static tensorrt_llm::plugins::lruPluginCreator lruPluginCreator;
+        static tensorrt_llm::plugins::CumsumLastDimPluginCreator cumsumLastDimPluginCreator;
 
         static std::array pluginCreators
             = { creatorPtr(identityPluginCreator),
@@ -219,6 +221,7 @@ extern "C"
                   creatorPtr(selectiveScanPluginCreator),
                   creatorPtr(mambaConv1DPluginCreator),
                   creatorPtr(lruPluginCreator),
+                  creatorPtr(cumsumLastDimPluginCreator),
               };
         nbCreators = pluginCreators.size();
         return pluginCreators.data();

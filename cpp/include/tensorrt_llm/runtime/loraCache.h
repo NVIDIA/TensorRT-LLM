@@ -23,7 +23,9 @@
 #include "tensorrt_llm/runtime/loraModule.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
-#include <NvInferRuntimeBase.h>
+
+#include <NvInferRuntime.h>
+
 #include <deque>
 #include <list>
 #include <map>

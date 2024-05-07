@@ -77,7 +77,7 @@ struct QKVPreprocessingParams
     float const* rotary_embedding_inv_freq;
     float2 const* rotary_coef_cache_buffer;
     float const* kvScaleOrigQuant;
-    int const* medusa_position_offsets;
+    int const* spec_decoding_position_offsets;
 
     // Scalars.
     int const batch_size;
@@ -101,6 +101,8 @@ struct QKVPreprocessingParams
     bool const enable_paged_kv_fmha;
     bool const quantized_fp8_output;
     int const multi_processor_count;
+    int const rotary_vision_start;
+    int const rotary_vision_length;
 
     // Pre-compute on host.
     int half_rotary_dim;

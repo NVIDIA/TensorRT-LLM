@@ -108,7 +108,7 @@ class GridSearcher:
             ],
             enable_chunked_context=[False, True],
         )
-        if self.model_config.is_multi_gpu:
+        if self.model_config.parallel_config.is_multi_gpu:
             tunable_options["use_custom_all_reduce"] = [False, True]
 
         self.space_size = reduce(operator.mul,

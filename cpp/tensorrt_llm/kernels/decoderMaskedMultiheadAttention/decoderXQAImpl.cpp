@@ -15,6 +15,7 @@
  */
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImpl.h"
 
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/decoderXQAImplJIT.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplPrecompiled.h"
 
 #include <cassert>
@@ -44,12 +45,10 @@ std::unique_ptr<DecoderXQAImpl> DecoderXQAImpl::create(DecoderXQARunner* runner,
     switch (implType)
     {
     case ImplType::kPrecompiled: return std::unique_ptr<DecoderXQAImpl>(new DecoderXQAImplPrecompiled(runner));
-    // TODO(minwei): JIT impl.
-    case ImplType::kJIT: return nullptr;
+    case ImplType::kJIT: return std::unique_ptr<DecoderXQAImpl>(new DecoderXQAImplJIT(runner));
     }
     // Shouldn't reach here.
-    assert(false);
-    return nullptr;
+    TLLM_THROW("Unknown DecoderXQAImpl::ImplType");
 }
 
 } // namespace kernels

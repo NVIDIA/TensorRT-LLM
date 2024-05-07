@@ -18,6 +18,7 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/layerProfiler.h"
 #include <NvInferRuntime.h>
 
 #include <cstdint>
@@ -107,6 +108,11 @@ public:
         return mBufferManager;
     }
 
+    void setLayerProfiler();
+    bool hasLayerProfiler(SizeType contextId) const;
+    std::string getLayerProfileInfo() const;
+    void reportToProfiler(SizeType contextId);
+
 private:
     BufferManager::CudaStreamPtr mStream;
     BufferManager mBufferManager;
@@ -116,5 +122,6 @@ private:
     std::vector<std::unique_ptr<nvinfer1::IExecutionContext>> mContexts;
     std::unique_ptr<ITensor> mDummyTensor;
     std::unique_ptr<nvinfer1::IEngineInspector> mEngineInspector;
+    std::unique_ptr<LayerProfiler> mLayerProfiler;
 };
 } // namespace tensorrt_llm::runtime

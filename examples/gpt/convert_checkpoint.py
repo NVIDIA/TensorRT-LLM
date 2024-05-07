@@ -44,7 +44,9 @@ def parse_arguments():
     parser.add_argument(
         '--gpt_variant',
         default=None,
-        choices=[None, 'gpt2', 'santacoder', 'starcoder', 'starcoder2'],
+        choices=[
+            None, 'gpt2', 'santacoder', 'starcoder', 'starcoder2', 'persimmon'
+        ],
         help=
         "By default the script will try to infer the gpt_variant from model_dir. "
         "Or users may overwrite gpt_variant by explicitly passing the variant.")
@@ -160,26 +162,30 @@ def load_gpt_config(model_dir: str,
 
     if gpt_variant is None:
         print("Inferring gpt variant from path...")
-        for v in ['starcoder2', 'starcoder', 'santacoder', 'gpt2']:
-            if v in config._name_or_path:
+        for v in ['starcoder2', 'starcoder', 'santacoder', 'gpt2', 'persimmon']:
+            if v in config._name_or_path or ('fuyu' in config._name_or_path
+                                             and v == 'persimmon'):
                 gpt_variant = v
                 break
-    assert gpt_variant in ['gpt2', 'santacoder', 'starcoder', 'starcoder2']
+    assert gpt_variant in [
+        'gpt2', 'santacoder', 'starcoder', 'starcoder2', 'persimmon'
+    ]
     print(f"Gpt variant: {gpt_variant}")
 
-    if gpt_variant == 'starcoder2':
+    if gpt_variant in ['starcoder2', 'persimmon']:
         config.n_embd = config.hidden_size
         config.n_inner = config.intermediate_size
         config.n_head = config.num_attention_heads
-        config.n_kv_head = config.num_key_value_heads
+        config.n_kv_head = config.num_key_value_heads if hasattr(
+            config, 'num_key_value_heads') else config.n_head
         config.n_layer = config.num_hidden_layers
         config.n_positions = config.max_position_embeddings
-        config.activation_function = 'gelu'
-        config.layer_norm_epsilon = config.norm_epsilon
-        config.bias = config.use_bias
+        config.activation_function = 'gelu' if gpt_variant == 'starcoder2' else 'squared-relu'
+        config.layer_norm_epsilon = config.norm_epsilon if gpt_variant == 'starcoder2' else config.layer_norm_eps
+        config.bias = config.use_bias if gpt_variant == 'starcoder2' else True
         config.position_embedding_type = 'rope_gpt_neox'
         config.rotary_base = config.rope_theta
-        config.rotary_pct = 1.0
+        config.rotary_pct = getattr(config, 'partial_rotary_factor', 1.0)
     else:
         if config.n_inner is None:
             config.n_inner = config.n_embd * 4
@@ -345,6 +351,9 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
     for l in layers_range:
         if gpt_variant == 'starcoder2':
             prefix = f'model.layers.{l}'
+        elif gpt_variant == 'persimmon':
+            is_fuyu = f'language_model.model.embed_tokens.weight' in model_params
+            prefix = f'language_model.model.layers.{l}' if is_fuyu else f'model.layers.{l}'
         else:
             prefix = f'transformer.h.{l}'
         tllm_prex = f'transformer.layers.{l-layers_range[0]}'
@@ -364,15 +373,30 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
                                            f'{prefix}.self_attn.v_proj', dtype)
             qkv_w = torch.cat([q_w, k_w, v_w], dim=0)
             qkv_b = torch.cat([q_b, k_b, v_b], dim=0)
+        elif gpt_variant == 'persimmon':
+            qkv_w, qkv_b = get_weight_and_bias(
+                model_params, f'{prefix}.self_attn.query_key_value', dtype)
         else:
             qkv_w, qkv_b = get_weight_and_bias(model_params,
                                                f'{prefix}.attn.c_attn', dtype)
         if gpt_variant in ['gpt2', 'santacoder']:
             qkv_w = qkv_w.t().contiguous()  # transpose for Conv1D
-        qkv_w = split_qkv(qkv_w, mapping.tp_rank, mapping.tp_size, hidden_size,
-                          num_attention_heads, num_kv_heads)
-        qkv_b = split_qkv(qkv_b, mapping.tp_rank, mapping.tp_size, hidden_size,
-                          num_attention_heads, num_kv_heads)
+
+        if gpt_variant == 'persimmon':
+            qkv_w = split(qkv_w,
+                          mapping.tp_rank,
+                          mapping.tp_size,
+                          is_column=True)
+
+            qkv_b = split(qkv_b,
+                          mapping.tp_rank,
+                          mapping.tp_size,
+                          is_column=True)
+        else:
+            qkv_w = split_qkv(qkv_w, mapping.tp_rank, mapping.tp_size,
+                              hidden_size, num_attention_heads, num_kv_heads)
+            qkv_b = split_qkv(qkv_b, mapping.tp_rank, mapping.tp_size,
+                              hidden_size, num_attention_heads, num_kv_heads)
 
         weights.update(
             get_tllm_linear_weight(qkv_w, f'{tllm_prex}.attention.qkv', qkv_b,
@@ -382,6 +406,9 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
         if gpt_variant == 'starcoder2':
             attn_dense_w, attn_dense_b = get_weight_and_bias(
                 model_params, f'{prefix}.self_attn.o_proj', dtype)
+        elif gpt_variant == 'persimmon':
+            attn_dense_w, attn_dense_b = get_weight_and_bias(
+                model_params, f'{prefix}.self_attn.dense', dtype)
         else:
             attn_dense_w, attn_dense_b = get_weight_and_bias(
                 model_params, f'{prefix}.attn.c_proj', dtype)
@@ -396,8 +423,13 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
                                    attn_dense_b, use_weight_only,
                                    plugin_weight_only_quant_type))
 
-        mlp_fc_w, mlp_fc_b = get_weight_and_bias(model_params,
-                                                 f'{prefix}.mlp.c_fc', dtype)
+        if gpt_variant == 'persimmon':
+            mlp_fc_w, mlp_fc_b = get_weight_and_bias(
+                model_params, f'{prefix}.mlp.dense_h_to_4h', dtype)
+        else:
+            mlp_fc_w, mlp_fc_b = get_weight_and_bias(model_params,
+                                                     f'{prefix}.mlp.c_fc',
+                                                     dtype)
         if gpt_variant in ['gpt2', 'santacoder']:
             mlp_fc_w = mlp_fc_w.t().contiguous()  # transpose for Conv1D
         mlp_fc_w = split(mlp_fc_w,
@@ -413,9 +445,12 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
                                    use_weight_only,
                                    plugin_weight_only_quant_type))
 
-        mlp_proj_w, mlp_proj_b = get_weight_and_bias(model_params,
-                                                     f'{prefix}.mlp.c_proj',
-                                                     dtype)
+        if gpt_variant == 'persimmon':
+            mlp_proj_w, mlp_proj_b = get_weight_and_bias(
+                model_params, f'{prefix}.mlp.dense_4h_to_h', dtype)
+        else:
+            mlp_proj_w, mlp_proj_b = get_weight_and_bias(
+                model_params, f'{prefix}.mlp.c_proj', dtype)
         if gpt_variant in ['gpt2', 'santacoder']:
             mlp_proj_w = mlp_proj_w.t().contiguous()  # transpose for Conv1D
         mlp_proj_w = split(mlp_proj_w,
@@ -427,7 +462,7 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
                                    mlp_proj_b, use_weight_only,
                                    plugin_weight_only_quant_type))
 
-        if gpt_variant == 'starcoder2':
+        if gpt_variant in ['starcoder2', 'persimmon']:
             input_ln_w, input_ln_b = get_weight_and_bias(
                 model_params, f'{prefix}.input_layernorm', dtype)
         else:
@@ -437,7 +472,7 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
         if input_ln_b is not None:
             weights[f'{tllm_prex}.input_layernorm.bias'] = input_ln_b
 
-        if gpt_variant == 'starcoder2':
+        if gpt_variant in ['starcoder2', 'persimmon']:
             post_ln_w, post_ln_b = get_weight_and_bias(
                 model_params, f'{prefix}.post_attention_layernorm', dtype)
         else:
@@ -447,9 +482,26 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
         if post_ln_b is not None:
             weights[f'{tllm_prex}.post_layernorm.bias'] = post_ln_b
 
+        if gpt_variant == 'persimmon':
+            q_layernorm_w, q_layernorm_b = get_weight_and_bias(
+                model_params, f'{prefix}.self_attn.q_layernorm', dtype)
+
+            weights[f'{tllm_prex}.attention.q_layernorm.weight'] = q_layernorm_w
+            weights[f'{tllm_prex}.attention.q_layernorm.bias'] = q_layernorm_b
+
+            k_layernorm_w, k_layernorm_b = get_weight_and_bias(
+                model_params, f'{prefix}.self_attn.k_layernorm', dtype)
+
+            weights[f'{tllm_prex}.attention.k_layernorm.weight'] = k_layernorm_w
+            weights[f'{tllm_prex}.attention.k_layernorm.bias'] = k_layernorm_b
+
     if mapping.is_first_pp_rank():
         if gpt_variant == 'starcoder2':
             embed_w = get_weight(model_params, 'model.embed_tokens', dtype)
+        elif gpt_variant == 'persimmon':
+            embed_w = get_weight(model_params,
+                                 ('language_model.' if is_fuyu else '') +
+                                 'model.embed_tokens', dtype)
         else:
             embed_w = get_weight(model_params, 'transformer.wte', dtype)
         weights['transformer.vocab_embedding.weight'] = split_embedding(
@@ -473,6 +525,10 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
             embed_w = get_weight(model_params, 'lm_head', dtype)
             if embed_w is None:
                 embed_w = get_weight(model_params, 'model.embed_tokens', dtype)
+        elif gpt_variant == 'persimmon':
+            embed_w = get_weight(model_params,
+                                 ('language_model.' if is_fuyu else '') +
+                                 'lm_head', dtype)
         else:
             embed_w = get_weight(model_params, 'transformer.wte', dtype)
         if not share_embedding_table:
@@ -488,6 +544,10 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
         if gpt_variant == 'starcoder2':
             ln_f_w, ln_f_b = get_weight_and_bias(model_params, 'model.norm',
                                                  dtype)
+        elif gpt_variant == 'persimmon':
+            ln_f_w, ln_f_b = get_weight_and_bias(
+                model_params, ('language_model.' if is_fuyu else '') +
+                'model.final_layernorm', dtype)
         else:
             ln_f_w, ln_f_b = get_weight_and_bias(model_params,
                                                  'transformer.ln_f', dtype)
@@ -1769,6 +1829,8 @@ if __name__ == '__main__':
         getattr(hf_config, 'rotary_base', 10000.0),
         'rotary_scaling':
         getattr(hf_config, 'rotary_scaling', None),
+        'qk_layernorm':
+        args.model_dir is not None and gpt_variant == 'persimmon'
     }
 
     with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:

@@ -14,17 +14,17 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 #include "loraPlugin.h"
+
+#include "pluginUtils.h"
+#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/groupGemm.h"
 #include "tensorrt_llm/kernels/splitkGroupGemm.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
-#include "tensorrt_llm/runtime/iTensor.h"
 
-#include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/cublasMMWrapper.h"
-#include "tensorrt_llm/common/cublasVersionCheck.h"
 #include <algorithm>
 
 namespace tk = tensorrt_llm::kernels;
@@ -244,61 +244,20 @@ bool LoraPlugin::supportsFormatCombination(
     }
 }
 
-int32_t _computeMDimension(bool transA, const int32_t nbDims, tensorrt_llm::runtime::ITensor::DimType const* dims)
-{
-    int32_t M = 1;
-    if (transA)
-    {
-        for (int i = nbDims - 1; i > 0; --i)
-        {
-            M *= dims[i];
-        }
-    }
-    else
-    {
-        for (int i = 0; i < nbDims - 1; ++i)
-        {
-            M *= dims[i];
-        }
-    }
-    return M;
-}
-
-int32_t _computeNDimension(bool transB, const int32_t nbDims, tensorrt_llm::runtime::ITensor::DimType const* dims)
-{
-    int32_t N = 1;
-    if (transB)
-    {
-        for (int i = 0; i < nbDims - 1; ++i)
-        {
-            N *= dims[i];
-        }
-    }
-    else
-    {
-        for (int i = nbDims - 1; i > 0; --i)
-        {
-            N *= dims[i];
-        }
-    }
-    return N;
-}
-
 void LoraPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int nbInputs,
     nvinfer1::DynamicPluginTensorDesc const* out, int nbOutputs) noexcept
 {
     TLLM_LOG_DEBUG("%s", __PRETTY_FUNCTION__);
     int const nbDimsA = in[0].max.nbDims;
-    int const nbDimsB = in[1].max.nbDims;
 
-    auto const minM = _computeMDimension(mTransA, nbDimsA, in[0].min.d);
-    auto const maxM = _computeMDimension(mTransA, nbDimsA, in[0].max.d);
-    auto const N = _computeNDimension(mTransB, nbDimsB, in[1].max.d);
-    auto const K = mTransA ? in[0].max.d[0] : in[0].max.d[nbDimsA - 1];
+    auto const minM = utils::computeMDimension(mTransA, in[0].min);
+    auto const maxM = utils::computeMDimension(mTransA, in[0].max);
+    auto const N = utils::computeNDimension(mTransB, in[1].max);
+    auto const K = static_cast<utils::DimType>(mTransA ? in[0].max.d[0] : in[0].max.d[nbDimsA - 1]);
 
     if (!mDims.isInitialized())
     {
-        mDims = {minM, maxM, N, static_cast<runtime::SizeType>(K)};
+        mDims = {minM, maxM, N, K};
     }
     mGemmId.n = N;
     mGemmId.k = K;

@@ -170,8 +170,6 @@ Given a `static_emulated_batch_size` of `n` the server will wait for `n` request
 ```
  python prepare_dataset.py \
   --output tokens-fixed-lengths.json \
-  --request-rate -1 \
-  --time-delay-dist constant \
   --tokenizer <path/to/tokenizer> \
    token-norm-dist \
    --num-requests 128 \
@@ -184,6 +182,7 @@ Take GPT-350M as an example for single GPU with static batching
 ./benchmarks/gptManagerBenchmark \
     --engine_dir ../../examples/gpt/trt_engine/gpt2/fp16/1-gpu/ \
     --type IFB \
+    --request-rate -1 \
     --static_emulated_batch_size 32 \
     --static_emulated_timeout 100 \
     --dataset ../../benchmarks/cpp/tokens-fixed-lengths.json
@@ -212,6 +211,7 @@ PP=1
 MAX_LEN=1024
 MAX_BATCH=32
 MAX_LORA_RANK=32
+NUM_LORA_MODS=7
 
 SOURCE_LORA=chinese-llama-2-lora-13b
 CPP_LORA=chinese-llama-2-lora-13b-cpp
@@ -241,10 +241,9 @@ NUM_LORAS=(8 16 24 32 64 128 256)
 NUM_REQUESTS=1024
 
 # Convert LoRA to cpp format
-python examples/gpt/nemo_lora_convert.py \
+python examples/hf_lora_convert.py \
     -i $SOURCE_LORA \
     --storage-type $DTYPE \
-    --write-cpp-runtime-tensors \
     -o $CPP_LORA
 
 # Prepare datasets

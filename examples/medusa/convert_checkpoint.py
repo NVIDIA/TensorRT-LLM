@@ -102,7 +102,7 @@ def parse_arguments():
         'By default, we use dtype for KV cache. int8_kv_cache chooses int8 quantization for KV'
     )
     parser.add_argument(
-        '--ammo_quant_ckpt_path',
+        '--modelopt_quant_ckpt_path',
         type=str,
         default=None,
         help='Path of a quantized model checkpoint in .npz format')

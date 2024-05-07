@@ -265,7 +265,7 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_gptq \
 To run the AWQ Qwen example, the following steps are required:
 1. Weight quantization
 
-    NVIDIA AMMO toolkit is used for AWQ weight quantization. Please see [examples/quantization/README.md](/examples/quantization/README.md#preparation) for AMMO installation instructions.
+    NVIDIA Modelopt toolkit is used for AWQ weight quantization. Please see [examples/quantization/README.md](/examples/quantization/README.md#preparation) for Modelopt installation instructions.
 
     ```bash
     # Quantize Qwen-7B-Chat checkpoint into INT4 AWQ format

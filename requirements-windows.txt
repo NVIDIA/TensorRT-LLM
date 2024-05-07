@@ -2,7 +2,7 @@
 accelerate==0.25.0
 build
 colored
-cuda-python==12.3.0
+cuda-python==12.4.0
 diffusers==0.27.0
 numpy<2
 onnx>=1.12.0
@@ -15,10 +15,7 @@ h5py==3.10.0
 pywin32
 StrEnum
 sentencepiece>=0.1.99
-# WAR the new posting of "nvidia-cudnn-cu12~=9.0".
-# "tensorrt==9.3.0.post12.dev1" specifies "nvidia-cudnn-cu12" but actually requires "nvidia-cudnn-cu12~=8.9".
-nvidia-cudnn-cu12~=8.9; platform_machine == "AMD64"
-tensorrt==9.3.0.post12.dev1
+tensorrt==10.0.1
 tokenizers>=0.14
 # Default torch is CPU-only on Windows, so need to specify a torch version with GPU support
 torch==2.2.0+cu121

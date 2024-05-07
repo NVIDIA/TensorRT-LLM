@@ -18,6 +18,9 @@
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
 
+# Exclude files in nvrtcWrapper folder.
+list(FILTER SRC_CPP EXCLUDE REGEX ".*nvrtcWrapper/src.*")
+
 # skip mmha 48, 80, 96, 112, 144, 160, 192 and 224 for fast build
 if(FAST_BUILD)
   list(FILTER SRC_CU EXCLUDE REGEX

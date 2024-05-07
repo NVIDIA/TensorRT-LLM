@@ -65,7 +65,7 @@ def parse_arguments():
         "By default, we use dtype for KV cache. fp8_kv_cache chooses fp8 quantization for KV",
     )
     parser.add_argument(
-        "--ammo_quant_ckpt_path",
+        "--modelopt_quant_ckpt_path",
         default=None,
         help=
         "Path of a directory to quantized model checkpoints in .safetensors format or \
@@ -904,7 +904,7 @@ def convert(worker_rank, args, convert_kwargs):
             weight_scales = quantize_fp8_weights(
                 weights, trt_llm_config.num_hidden_layers,
                 trt_llm_config.mapping)
-            scales = load_from_fp8_gemma(args.ammo_quant_ckpt_path,
+            scales = load_from_fp8_gemma(args.modelopt_quant_ckpt_path,
                                          trt_llm_config.num_hidden_layers,
                                          trt_llm_config.mapping,
                                          args.fp8_kv_cache, weight_scales)

@@ -268,6 +268,25 @@ def parse_arguments():
         help=
         "Print layer information of the engine to console (default = disabled)")
 
+    parser.add_argument(
+        '--opt_batch_size',
+        type=int,
+        default=None,
+        help=
+        "If opt_batch_size option is specified, it will override the opt batch size."
+        "This flag only takes effect when `--mode=ootb` is added. For other modes, please use --opt_num_tokens to replace it."
+    )
+
+    parser.add_argument(
+        '--opt_num_tokens',
+        type=int,
+        default=None,
+        help="It equals to max_batch_size*max_beam_width by default, set this "
+        "value as close as possible to the actual number of tokens on your workload. "
+        "Note that this argument might be removed in the future."
+        "This flag only takes effect when `--mode` is not `ootb`. For ootb mode, please use --opt_batch_size to replace it."
+    )
+
     return parser.parse_args()
 
 
@@ -333,9 +352,6 @@ def main(args):
 
     if args.build_only:
         return
-
-    if args.dump_profile and benchmark_profiler is not None:
-        benchmark_profiler.set_recording_perf_profile(True)
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
@@ -431,6 +447,39 @@ def main(args):
                            peak_gpu_used,
                            csv=args.csv,
                            benchmark_profiler=benchmark_profiler)
+
+        # Rerun for dumping profile per layer.
+        if args.dump_profile and benchmark_profiler is not None:
+            benchmark_profiler.set_recording_perf_profile(True)
+            logger.info(f'Dump profile information per layer')
+            iter_idx = 0
+            try:
+                # Warm up
+                for _ in range(args.warm_up):
+                    benchmarker.run(inputs, config)
+                if benchmark_profiler is not None:
+                    benchmark_profiler.clean()
+                    benchmark_profiler.start()
+                cur_duration = 0
+                start_time = time()
+                while iter_idx < args.num_runs or cur_duration < args.duration:
+                    start.record()
+                    benchmarker.run(inputs,
+                                    config,
+                                    benchmark_profiler=benchmark_profiler)
+                    end.record()
+                    torch.cuda.synchronize()
+                    latencies.append(start.elapsed_time(end))
+                    iter_idx += 1
+                    cur_duration = round(time() - start_time, 3)
+                benchmarker.report_profiler(
+                    benchmark_profiler=benchmark_profiler)
+            except Exception as e:
+                logger.error("Found exception during benchmarking",
+                             e.with_traceback())
+                if not disable_mem_monitor:
+                    memory_monitor.kill()
+                raise e
 
 
 if __name__ == '__main__':

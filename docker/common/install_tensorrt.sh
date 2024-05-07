@@ -2,16 +2,17 @@
 
 set -ex
 
-# Use https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-02.html#rel-24-02
-TRT_VER="9.3.0.1"
-CUDA_VER="12.3"
+TRT_VER="10.0.1.6"
+# Align with the pre-installed cuDNN / cuBLAS / NCCL versions from
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-03.html#rel-24-03
+CUDA_VER="12.4" # 12.4.0
+# cuDNN v8 is still needed by PyTorch v2.2.2
 CUDNN_VER="8.9.7.29-1+cuda12.2"
-# v2.19.4 doesn't exist in https://developer.download.nvidia.cn/compute/cuda/repos/
-NCCL_VER="2.19.3-1+cuda12.3"
-CUBLAS_VER="12.3.4.1-1"
-# Align with the pre-installed CUDA / NVCC version.
-# https://docs.nvidia.com/cuda/archive/12.3.2/cuda-toolkit-release-notes/index.html
-NVRTC_VER="12.3.107-1"
+NCCL_VER="2.20.5-1+cuda12.4"
+CUBLAS_VER="12.4.2.65-1"
+# Align with the pre-installed CUDA / NVCC / NVRTC versions from
+# https://docs.nvidia.com/cuda/archive/12.4.0/cuda-toolkit-release-notes/index.html
+NVRTC_VER="12.4.99-1"
 
 for i in "$@"; do
     case $i in
@@ -77,7 +78,7 @@ install_centos_requirements() {
 install_tensorrt() {
     PY_VERSION=$(python3 -c 'import sys; print(".".join(map(str, sys.version_info[0:2])))')
     PARSED_PY_VERSION=$(echo "${PY_VERSION//./}")
-    TRT_CUDA_VERSION="12.2"
+    TRT_CUDA_VERSION="12.4"
 
     if [ -z "$RELEASE_URL_TRT" ];then
         ARCH=${TRT_TARGETARCH}
@@ -86,7 +87,8 @@ install_tensorrt() {
         if [ "$ARCH" = "amd64" ];then ARCH="x86_64";fi
         if [ "$ARCH" = "x86_64" ];then DIR_NAME="x64-agnostic"; else DIR_NAME=${ARCH};fi
         if [ "$ARCH" = "aarch64" ];then OS1="Ubuntu22_04" && OS2="Ubuntu-22.04" && OS="ubuntu-22.04"; else OS1="Linux" && OS2="Linux" && OS="linux";fi
-        RELEASE_URL_TRT=https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/9.3.0/tensorrt-${TRT_VER}.${OS}.${ARCH}-gnu.cuda-${TRT_CUDA_VERSION}.tar.gz;
+        RELEASE_URL_TRT=https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.0.1/tars/TensorRT-${TRT_VER}.${OS2}.${ARCH}-gnu.cuda-${TRT_CUDA_VERSION}.tar.gz
+
     fi
     wget --no-verbose ${RELEASE_URL_TRT} -O /tmp/TensorRT.tar
     tar -xf /tmp/TensorRT.tar -C /usr/local/

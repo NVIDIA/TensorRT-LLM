@@ -33,7 +33,7 @@ from .graph_rewriting import optimize
 from .logger import logger
 from .lora_manager import LoraBuildConfig
 from .models import PretrainedConfig, PretrainedModel
-from .models.modeling_utils import optimize_model
+from .models.modeling_utils import SpeculativeDecodingMode, optimize_model
 from .network import Network, net_guard
 from .plugin import PluginConfig
 from .quantization import QuantAlgo, QuantMode
@@ -414,6 +414,7 @@ class Builder():
 class BuildConfig:
     max_input_len: int = 256
     max_output_len: int = 256
+    opt_batch_size: int = 8
     max_batch_size: int = 8
     max_beam_width: int = 1
     max_num_tokens: Optional[int] = None
@@ -426,6 +427,7 @@ class BuildConfig:
     profiling_verbosity: str = 'layer_names_only'
     enable_debug_output: bool = False
     max_draft_len: int = 0
+    speculative_decoding_mode: SpeculativeDecodingMode = SpeculativeDecodingMode.NONE
     use_refit: bool = False
     input_timing_cache: str = None
     output_timing_cache: str = None
@@ -446,6 +448,7 @@ class BuildConfig:
         max_beam_width = config.pop('max_beam_width')
         max_num_tokens = config.pop('max_num_tokens')
         opt_num_tokens = config.pop('opt_num_tokens')
+        opt_batch_size = config.pop('opt_batch_size', None)
         max_prompt_embedding_table_size = config.pop(
             'max_prompt_embedding_table_size', 0)
         gather_context_logits = config.pop('gather_context_logits', False)
@@ -457,6 +460,8 @@ class BuildConfig:
                                          'layer_names_only')
         enable_debug_output = config.pop('enable_debug_output', False)
         max_draft_len = config.pop('max_draft_len', 0)
+        speculative_decoding_mode = config.pop('speculative_decoding_mode',
+                                               SpeculativeDecodingMode.NONE)
         use_refit = config.pop('use_refit', False)
         input_timing_cache = config.pop('input_timing_cache', None)
         output_timing_cache = config.pop('output_timing_cache', None)
@@ -480,6 +485,7 @@ class BuildConfig:
             max_beam_width=max_beam_width,
             max_num_tokens=max_num_tokens,
             opt_num_tokens=opt_num_tokens,
+            opt_batch_size=opt_batch_size,
             max_prompt_embedding_table_size=max_prompt_embedding_table_size,
             gather_context_logits=gather_context_logits,
             gather_generation_logits=gather_generation_logits,
@@ -488,6 +494,7 @@ class BuildConfig:
             profiling_verbosity=profiling_verbosity,
             enable_debug_output=enable_debug_output,
             max_draft_len=max_draft_len,
+            speculative_decoding_mode=speculative_decoding_mode,
             use_refit=use_refit,
             input_timing_cache=input_timing_cache,
             output_timing_cache=output_timing_cache,
@@ -514,6 +521,16 @@ class BuildConfig:
         output['auto_parallel_config'] = output['auto_parallel_config'].to_dict(
         )
         return output
+
+    def update_from_dict(self, config: dict):
+        for name, value in config.items():
+            if not hasattr(self, name):
+                raise AttributeError(
+                    f"{self.__class__} object has no attribute {name}")
+            setattr(self, name, value)
+
+    def update(self, **kwargs):
+        self.update_from_dict(kwargs)
 
 
 class EngineConfig:
@@ -625,6 +642,11 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
 
     if hasattr(model.config, 'max_medusa_token_len'):
         build_config.max_draft_len = model.config.max_medusa_token_len
+        if build_config.speculative_decoding_mode != SpeculativeDecodingMode.MEDUSA:
+            logger.warn(
+                'speculative_decoding_mode is not Medusa for Medusa model. Overwriting speculative_decoding_mode'
+            )
+        build_config.speculative_decoding_mode = SpeculativeDecodingMode.MEDUSA
 
     use_auto_parallel = build_config.auto_parallel_config.enabled
 
@@ -704,20 +726,33 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
 
         # Forward
         prepare_input_args = {
-            "max_batch_size": build_config.max_batch_size,
-            "max_input_len": build_config.max_input_len,
+            "max_batch_size":
+            build_config.max_batch_size,
+            "max_input_len":
+            build_config.max_input_len,
             "max_seq_len":
             build_config.max_input_len + build_config.max_output_len,
-            "use_cache": True,
-            "max_beam_width": build_config.max_beam_width,
-            "max_num_tokens": build_config.max_num_tokens,
-            "opt_num_tokens": build_config.opt_num_tokens,
+            "use_cache":
+            True,
+            "max_beam_width":
+            build_config.max_beam_width,
+            "max_num_tokens":
+            build_config.max_num_tokens,
+            "opt_num_tokens":
+            build_config.opt_num_tokens,
             "prompt_embedding_table_size":
             build_config.max_prompt_embedding_table_size,
-            "max_draft_len": build_config.max_draft_len,
-            "gather_context_logits": build_config.gather_context_logits,
-            "gather_generation_logits": build_config.gather_generation_logits,
-            "lora_target_modules": build_config.lora_config.lora_target_modules
+            "max_draft_len":
+            build_config.max_draft_len,
+            "speculative_decoding_draft_tokens_external":
+            build_config.speculative_decoding_mode ==
+            SpeculativeDecodingMode.DRAFT_TOKENS_EXTERNAL,
+            "gather_context_logits":
+            build_config.gather_context_logits,
+            "gather_generation_logits":
+            build_config.gather_generation_logits,
+            "lora_target_modules":
+            build_config.lora_config.lora_target_modules
         }
 
         if model.config.architecture == "DecoderModel":

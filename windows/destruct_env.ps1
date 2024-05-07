@@ -14,6 +14,7 @@ foreach($line in Get-Content -Path $env:LOCALAPPDATA\trt_env_outlog.txt) {
 #3 = Python
 #4 = MPI Presence
 #5 = CUDNN
+#6 = TRT
 
 if ($defaultEnv[0].Equals("0")) {
     Write-Output "Removing CUDA"
@@ -39,8 +40,12 @@ if ($defaultEnv[4].Equals("0")) {
     [System.Environment]::SetEnvironmentVariable("path", $path,'Machine')
 }
 
-
 if ($defaultEnv[5].Equals("0")) {
     Write-Output "Removing CUDNN"
     [Environment]::SetEnvironmentVariable('CUDNN', '', [EnvironmentVariableTarget]::Machine)
+}
+
+if ($defaultEnv[6].Equals("0")) {
+    Write-Output "Removing TRT"
+    [Environment]::SetEnvironmentVariable('TRT', '', [EnvironmentVariableTarget]::Machine)
 }

@@ -71,8 +71,7 @@ public:
         WorldConfig const& worldConfig);
 
     void getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers, TensorMap& inputBuffers, TensorMap& outputBuffers,
-        SizeType step, TensorPtr const& inputIds, TensorPtr const& commPtrs, ModelConfig const& modelConfig,
-        WorldConfig const& worldConfig) const;
+        SizeType step, TensorPtr const& inputIds, ModelConfig const& modelConfig, WorldConfig const& worldConfig) const;
 
 protected:
     void copyAttentionMasks(

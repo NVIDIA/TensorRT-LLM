@@ -99,7 +99,7 @@ def parse_arguments():
         'By default, we use dtype for KV cache. int8_kv_cache chooses int8 quantization for KV'
     )
     parser.add_argument(
-        '--ammo_quant_ckpt_path',
+        '--modelopt_quant_ckpt_path',
         type=str,
         default=None,
         help='Path of a quantized model checkpoint in .npz format')
@@ -388,7 +388,7 @@ def convert_and_save_gptq(args, rank):
         mapping=mapping,
         quantization=args_to_quantization(args),
         skip_loading_weights=True)
-    weights = load_from_gptq_llama(llama.config, args.ammo_quant_ckpt_path)
+    weights = load_from_gptq_llama(llama.config, args.modelopt_quant_ckpt_path)
     llama.load(weights)
     llama.save_checkpoint(args.output_dir, rank == 0)
 
@@ -432,11 +432,11 @@ def main():
         execute(args.workers, [convert_and_save_meta] * world_size, args)
     elif args.weight_only_precision == 'int4_gptq':
         assert args.model_dir is not None
-        assert args.ammo_quant_ckpt_path is not None
+        assert args.modelopt_quant_ckpt_path is not None
         execute(args.workers, [convert_and_save_gptq] * world_size, args)
     else:  # all other non-gptq paths from hf model
         assert args.model_dir is not None
-        assert args.ammo_quant_ckpt_path is None, "only gptq weights only needs this option"
+        assert args.modelopt_quant_ckpt_path is None, "only gptq weights only needs this option"
         convert_and_save_hf(args)
 
     tok = time.time()

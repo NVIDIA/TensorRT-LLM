@@ -35,11 +35,7 @@ add_subdirectory(layers)
 add_subdirectory(runtime)
 add_subdirectory(executor_worker)
 
-set(BATCH_MANAGER_TARGET tensorrt_llm_batch_manager_static)
-set(BATCH_MANAGER_TARGET_ARCH "unknown")
-
-set(EXECUTOR_TARGET tensorrt_llm_executor_static)
-set(EXECUTOR_TARGET_ARCH "unknown")
+set(TARGET_ARCH "unknown")
 
 message(STATUS "CMAKE_SYSTEM_PROCESSOR: ${CMAKE_SYSTEM_PROCESSOR}")
 if(NOT WIN32) # Linux
@@ -58,11 +54,9 @@ if(NOT WIN32) # Linux
   message(STATUS "Operating System: ${OS_ID}, ${OS_VERSION_ID}")
 
   if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
-    set(BATCH_MANAGER_TARGET_ARCH "x86_64-linux-gnu")
-    set(EXECUTOR_TARGET_ARCH "x86_64-linux-gnu")
+    set(TARGET_ARCH "x86_64-linux-gnu")
   elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
-    set(BATCH_MANAGER_TARGET_ARCH "aarch64-linux-gnu")
-    set(EXECUTOR_TARGET_ARCH "aarch64-linux-gnu")
+    set(TARGET_ARCH "aarch64-linux-gnu")
     if(NOT ${OS_ID} MATCHES "ubuntu" OR ${OS_VERSION_ID} VERSION_LESS 22.04)
       message(
         FATAL_ERROR
@@ -76,14 +70,16 @@ if(NOT WIN32) # Linux
 else() # Windows
   # AMD64, IA64, ARM64, EM64T, X86
   if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64")
-    set(BATCH_MANAGER_TARGET_ARCH "x86_64-windows-msvc")
-    set(EXECUTOR_TARGET_ARCH "x86_64-windows-msvc")
+    set(TARGET_ARCH "x86_64-windows-msvc")
   else()
     message(
       FATAL_ERROR
         "The system processor type is unsupported: ${CMAKE_SYSTEM_PROCESSOR}")
   endif()
 endif()
+
+set(BATCH_MANAGER_TARGET tensorrt_llm_batch_manager_static)
+set(BATCH_MANAGER_TARGET_ARCH ${TARGET_ARCH})
 
 if(BUILD_BATCH_MANAGER)
   add_subdirectory(batch_manager)
@@ -114,6 +110,9 @@ else()
     )
   endif()
 endif()
+
+set(EXECUTOR_TARGET tensorrt_llm_executor_static)
+set(EXECUTOR_TARGET_ARCH ${TARGET_ARCH})
 
 if(BUILD_EXECUTOR)
   add_subdirectory(executor)
@@ -189,6 +188,45 @@ else()
   add_custom_target(check_symbol_executor)
 endif()
 
+set(NVRTC_WRAPPER_TARGET tensorrt_llm_nvrtc_wrapper)
+set(NVRTC_WRAPPER_TARGET_ARCH ${TARGET_ARCH})
+
+if(BUILD_NVRTC_WRAPPER)
+  add_subdirectory(
+    kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper)
+else()
+  add_library(${NVRTC_WRAPPER_TARGET} SHARED IMPORTED)
+  if(NOT WIN32) # Linux
+    set(NVRTC_WRAPPER_LIB_SOURCE_REL_LOC
+        "kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/${NVRTC_WRAPPER_TARGET_ARCH}/libtensorrt_llm_nvrtc_wrapper.so"
+    )
+    set(NVRTC_WRAPPER_LIB_BINARY_REL_LOC
+        "kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/libtensorrt_llm_nvrtc_wrapper.so"
+    )
+  else()
+    set(NVRTC_WRAPPER_LIB_SOURCE_REL_LOC
+        "kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/${NVRTC_WRAPPER_TARGET_ARCH}/libtensorrt_llm_nvrtc_wrapper.dll"
+    )
+    set(NVRTC_WRAPPER_LIB_BINARY_REL_LOC
+        "kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/libtensorrt_llm_nvrtc_wrapper.dll"
+    )
+  endif()
+  set(NVRTC_WRAPPER_LIB_LOC
+      "${CMAKE_CURRENT_SOURCE_DIR}/${NVRTC_WRAPPER_LIB_SOURCE_REL_LOC}")
+  # Copy the .so to build directory, which is needed in build_wheel.py.
+  configure_file(${NVRTC_WRAPPER_LIB_SOURCE_REL_LOC}
+                 ${NVRTC_WRAPPER_LIB_BINARY_REL_LOC} COPYONLY)
+  set_property(TARGET ${NVRTC_WRAPPER_TARGET} PROPERTY IMPORTED_LOCATION
+                                                       ${NVRTC_WRAPPER_LIB_LOC})
+  file(SIZE ${NVRTC_WRAPPER_LIB_LOC} NVRTC_WRAPPER_LIB_SIZE)
+  if(NVRTC_WRAPPER_LIB_SIZE LESS 1024)
+    message(
+      FATAL_ERROR
+        "The nvrtc wrapper library is truncated or incomplete. This is usually caused by using Git LFS (Large File Storage) incorrectly. Please try running command `git lfs install && git lfs pull`."
+    )
+  endif()
+endif()
+
 set(TRTLLM_LINK_LIBS
     ${CUBLAS_LIB}
     ${CUBLASLT_LIB}
@@ -246,6 +284,13 @@ link_whole_archive(${SHARED_TARGET} ${EXECUTOR_TARGET})
 target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE ${SHARED_TARGET})
 # Cyclic dependency of executor on TRT-LLM
 target_link_libraries(${EXECUTOR_TARGET} INTERFACE ${SHARED_TARGET})
+
+if(NOT WIN32)
+  set_target_properties(${SHARED_TARGET} PROPERTIES LINK_FLAGS
+                                                    "-Wl,-rpath='$ORIGIN'")
+endif()
+
+target_link_libraries(${SHARED_TARGET} PUBLIC ${NVRTC_WRAPPER_TARGET})
 
 add_dependencies(${SHARED_TARGET} check_symbol)
 add_dependencies(${SHARED_TARGET} check_symbol_executor)

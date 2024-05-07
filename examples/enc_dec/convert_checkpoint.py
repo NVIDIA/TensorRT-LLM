@@ -4,6 +4,7 @@ import copy
 import json
 import logging
 import os
+import types
 from ast import literal_eval
 from datetime import datetime
 from pathlib import Path
@@ -11,6 +12,7 @@ from pathlib import Path
 import safetensors
 from helper import convert_weight_to_dtype, fuse_qkv_one_layer, reshape, split
 from transformers import (AutoModelForSeq2SeqLM, MBartForConditionalGeneration,
+                          Pix2StructForConditionalGeneration,
                           T5ForConditionalGeneration, VisionEncoderDecoderModel)
 
 from tensorrt_llm._utils import str_dtype_to_torch
@@ -26,6 +28,12 @@ layernorm_position_map = {i.name: i.value for i in LayerNormPositionType}
 mlp_type_map = {i.name: i.value for i in MLPType}
 
 
+def copy_args_to_component_config(component_config, args):
+    for arg in vars(args):
+        setattr(component_config, arg, getattr(args, arg))
+    return component_config
+
+
 def parse_t5_config(args, hf_model):
     config = configparser.ConfigParser()
 
@@ -36,23 +44,14 @@ def parse_t5_config(args, hf_model):
 
     # manually set q_scaling to offset attention scaling's effect.
     # TODO: modify kernels to control whether to disable attention scaling
-    def get_offset_q_scaling(config) -> str:
-        d_model = config.d_model
-        num_heads = config.num_heads
-        head_size = d_model / num_heads
-        scaling = 1 / head_size**.5
-        return str(scaling)
-
-    config["encoder"]["q_scaling"] = get_offset_q_scaling(
-        hf_model.encoder.config)
+    def get_offset_q_scaling(config):
+        scaling = 1 / config.head_size**.5
+        return scaling
 
     config["decoder"] = {}
     for key, val in hf_model.decoder.config.to_dict().items():
         config["decoder"][key] = f"{val}"
     config["decoder"]["weight_data_type"] = args.weight_data_type
-
-    config["decoder"]["q_scaling"] = get_offset_q_scaling(
-        hf_model.decoder.config)
 
     config["structure"] = dict()
     config["structure"]["t5_with_bias"] = "false"
@@ -62,133 +61,96 @@ def parse_t5_config(args, hf_model):
     config["structure"]["model_type"] = args.model_type
 
     def parse_t5_config_by_component(config, component, args):
+        component_config = types.SimpleNamespace()
+        component_config = copy_args_to_component_config(component_config, args)
+        component_config.n_head = config.getint(component, 'num_heads')
+        component_config.head_size = config.getint(component, 'd_kv')
+        component_config.hidden_size = config.getint(component, 'd_model')
+        component_config.ffn_hidden_size = config.getint(component, 'd_ff')
+        component_config.vocab_size = config.getint(component, 'vocab_size')
+        component_config.n_positions = config.getint(component,
+                                                     'n_positions',
+                                                     fallback=512)
+        component_config.has_position_embedding = config.getboolean(
+            component, 'has_position_embedding',
+            fallback=False)  # TODO: hardcoded here
+
+        component_config.has_token_type_embedding = config.getboolean(
+            component, 'has_token_type_embedding', fallback=False)
+        component_config.has_embedding_layernorm = config.getboolean(
+            component, 'has_embedding_layernorm', fallback=False)
+        component_config.has_embedding_scale = config.getboolean(
+            component, 'has_embedding_scale', fallback=False)
+        component_config.q_scaling = get_offset_q_scaling(component_config)
+        component_config.has_attention_qkvo_bias = config.getboolean(
+            component, 'has_attention_qkvo_bias',
+            fallback=False)  # TODO: hardcoded here
+        component_config.has_mlp_bias = config.getboolean(component,
+                                                          'has_mlp_bias',
+                                                          fallback=False)
+        component_config.has_model_final_layernorm = config.getboolean(
+            component, 'has_model_final_layernorm', fallback=True)
+        component_config.layernorm_eps = config.getfloat(
+            component, 'layer_norm_epsilon')
+        component_config.layernorm_position = layernorm_position_map[config.get(
+            component, 'layernorm_position',
+            fallback='pre_layernorm')]  # TODO: hardcoded here
+        component_config.layernorm_type = layernorm_type_map[config.get(
+            component, 'layernorm_type', fallback='RmsNorm')]
+        component_config.hidden_act = config.get(component, 'dense_act_fn')
+        component_config.gated_act = config.getboolean(component,
+                                                       'is_gated_act')
+        component_config.mlp_type = mlp_type_map['GatedMLP' if component_config.
+                                                 gated_act else 'MLP']
+        component_config.num_buckets = config.getint(
+            component, 'relative_attention_num_buckets')
+        component_config.max_distance = config.getint(
+            component, 'relative_attention_max_distance')
+        component_config.position_embedding_type = config.get(
+            'structure', 'position_embedding_type')
+        component_config.logits_dtype = config.get(component,
+                                                   'logits_dtype',
+                                                   fallback='float32')
+        component_config.ckpt_weight_dtype = config.get(component,
+                                                        'weight_data_type')
+
         if component == 'encoder':
-            args.n_layer = config.getint(component, 'num_layers')
-            args.n_head = config.getint(component, 'num_heads')
-            args.head_size = config.getint(component, 'd_kv')
-            args.hidden_size = config.getint(component, 'd_model')
-            args.ffn_hidden_size = config.getint(component, 'd_ff')
-            args.vocab_size = config.getint(component, 'vocab_size')
-            args.n_positions = config.getint(component,
-                                             'n_positions',
-                                             fallback=512)
-            args.has_position_embedding = config.getboolean(
-                component, 'has_position_embedding',
-                fallback=False)  # TODO: hardcoded here
-            args.has_token_type_embedding = config.getboolean(
-                component, 'has_token_type_embedding', fallback=False)
-            args.has_embedding_layernorm = config.getboolean(
-                component, 'has_embedding_layernorm', fallback=False)
-            args.has_embedding_scale = config.getboolean(component,
-                                                         'has_embedding_scale',
-                                                         fallback=False)
-            args.q_scaling = config.getfloat(component,
-                                             'q_scaling',
-                                             fallback=1.0)
-            args.has_attention_qkvo_bias = config.getboolean(
-                component, 'has_attention_qkvo_bias',
-                fallback=False)  # TODO: hardcoded here
-            args.has_mlp_bias = config.getboolean(component,
-                                                  'has_mlp_bias',
-                                                  fallback=False)
-            args.has_model_final_layernorm = config.getboolean(
-                component, 'has_model_final_layernorm', fallback=True)
-            args.layernorm_eps = config.getfloat(component,
-                                                 'layer_norm_epsilon')
-            args.layernorm_position = layernorm_position_map[config.get(
-                component, 'layernorm_position',
-                fallback='pre_layernorm')]  # TODO: hardcoded here
-            args.layernorm_type = layernorm_type_map[config.get(
-                component, 'layernorm_type',
-                fallback='RmsNorm')]  # TODO: hardcoded here
-            args.hidden_act = config.get(component, 'dense_act_fn')
-            args.gated_act = config.getboolean(component, 'is_gated_act')
-            args.mlp_type = mlp_type_map['GatedMLP' if args.
-                                         gated_act else 'MLP']
-            args.relative_attention = config.get(
+            component_config.n_layer = config.getint(component, 'num_layers')
+
+            component_config.relative_attention = config.get(
                 'structure', 'position_embedding_type') == 'relative'
-            args.num_buckets = config.getint(component,
-                                             'relative_attention_num_buckets')
-            args.max_distance = config.getint(
-                component, 'relative_attention_max_distance')
-            args.ckpt_weight_dtype = config.get(component, 'weight_data_type')
-            args.position_embedding_type = config.get(
-                'structure', 'position_embedding_type')
+
+            component_config.ckpt_weight_dtype = config.get(
+                component, 'weight_data_type')
 
         elif component == 'decoder':
-            args.n_layer = config.getint(component, 'num_decoder_layers')
-            args.n_head = config.getint(component, 'num_heads')
-            args.head_size = config.getint(component, 'd_kv')
-            args.hidden_size = config.getint(component, 'd_model')
-            args.ffn_hidden_size = config.getint(component, 'd_ff')
-            args.vocab_size = config.getint(component, 'vocab_size')
-            args.n_positions = config.getint(component,
-                                             'n_positions',
-                                             fallback=512)
-            args.has_position_embedding = config.getboolean(
-                component, 'has_position_embedding',
-                fallback=False)  # TODO: hardcoded here
-            args.has_token_type_embedding = config.getboolean(
-                component, 'has_token_type_embedding', fallback=False)
-            args.has_embedding_layernorm = config.getboolean(
-                component, 'has_embedding_layernorm', fallback=False)
-            args.has_embedding_scale = config.getboolean(component,
-                                                         'has_embedding_scale',
-                                                         fallback=False)
-            args.q_scaling = config.getfloat(component,
-                                             'q_scaling',
-                                             fallback=1.0)
-            args.has_attention_qkvo_bias = config.getboolean(
-                component, 'has_attention_qkvo_bias', fallback=False)
-            args.has_mlp_bias = config.getboolean(component,
-                                                  'has_mlp_bias',
-                                                  fallback=False)
-            args.has_model_final_layernorm = config.getboolean(
-                component, 'has_model_final_layernorm', fallback=True)
-            args.layernorm_eps = config.getfloat(component,
-                                                 'layer_norm_epsilon')
-            args.layernorm_position = layernorm_position_map[config.get(
-                component, 'layernorm_position',
-                fallback='pre_layernorm')]  # TODO: hardcoded here
-            args.layernorm_type = layernorm_type_map[config.get(
-                component, 'layernorm_type', fallback='RmsNorm')]
-            args.hidden_act = config.get(component, 'dense_act_fn')
-            args.gated_act = config.getboolean(component, 'is_gated_act')
-            args.mlp_type = mlp_type_map['GatedMLP' if args.
-                                         gated_act else 'MLP']
-            args.has_lm_head_bias = config.getboolean(
+            component_config.n_layer = config.getint(component,
+                                                     'num_decoder_layers')
+            component_config.has_lm_head_bias = config.getboolean(
                 component,  # TODO: T5 with bias
                 'has_lm_head_bias',
                 fallback=False)
-            args.relative_attention = config.getboolean(component,
-                                                        'relative_attention',
-                                                        fallback=True)
-            args.num_buckets = config.getint(component,
-                                             'relative_attention_num_buckets')
-            args.max_distance = config.getint(
-                component, 'relative_attention_max_distance')
-            args.logits_dtype = config.get(component,
-                                           'logits_dtype',
-                                           fallback='float32')
-            args.rescale_before_lm_head = config.getboolean(
+            component_config.relative_attention = config.getboolean(
+                component, 'relative_attention', fallback=True)
+            component_config.rescale_before_lm_head = config.getboolean(
                 component, 'tie_word_embeddings'
             )  # default is True (for T5), but False for Flan-T5
-            args.encoder_hidden_size = config.getint('encoder', 'd_model')
-            args.encoder_num_heads = config.getint('encoder', 'num_heads')
-            args.encoder_head_size = config.getint('encoder', 'd_kv')
-            args.ckpt_weight_dtype = config.get(component, 'weight_data_type')
-            args.position_embedding_type = config.get(
-                'structure', 'position_embedding_type')
+            component_config.encoder_hidden_size = config.getint(
+                'encoder', 'd_model')
+            component_config.encoder_num_heads = config.getint(
+                'encoder', 'num_heads')
+            component_config.encoder_head_size = config.getint(
+                'encoder', 'd_kv')
 
         else:
             assert False, 'Unsupported component!'
 
-        return args
+        return component_config
 
-    encoder_args = parse_t5_config_by_component(config, "encoder", args)
-    decoder_args = parse_t5_config_by_component(config, "decoder", args)
+    encoder_config = parse_t5_config_by_component(config, "encoder", args)
+    decoder_config = parse_t5_config_by_component(config, "decoder", args)
 
-    return encoder_args, decoder_args
+    return encoder_config, decoder_config
 
 
 def convert_t5_weights_to_tllm_safetensors(config, component, params):
@@ -380,87 +342,93 @@ def parse_nmt_config(args, model):
 
     def parse_nmt_config_by_component(config, component, args):
         assert component in ('encoder', 'decoder'), 'Unsupported component!'
-        args.n_layer = config.getint(component, f'{component}_layers')
-        args.n_head = config.getint(component, f'{component}_attention_heads')
-        args.hidden_size = config.getint(
+        component_config = types.SimpleNamespace()
+        component_config = copy_args_to_component_config(component_config, args)
+        component_config.n_layer = config.getint(component,
+                                                 f'{component}_layers')
+        component_config.n_head = config.getint(component,
+                                                f'{component}_attention_heads')
+        component_config.hidden_size = config.getint(
             component, f'{component}_embed_dim')  # fairseq naming
-        args.head_size = config.getint(component,
-                                       'd_kv',
-                                       fallback=args.hidden_size // args.n_head)
-        args.ffn_hidden_size = config.getint(
+        component_config.head_size = config.getint(
+            component,
+            'd_kv',
+            fallback=component_config.hidden_size // component_config.n_head)
+        component_config.ffn_hidden_size = config.getint(
             component, f'{component}_ffn_embed_dim')  # fairseq naming
-        args.vocab_size = config.getint(component, 'vocab_size')
-        args.n_positions = config.getint(
+        component_config.vocab_size = config.getint(component, 'vocab_size')
+        component_config.n_positions = config.getint(
             component, 'max_source_positions')  # fairseq naming
-        args.has_position_embedding = not config.getboolean(
+        component_config.has_position_embedding = not config.getboolean(
             component, 'no_token_positional_embeddings',
             fallback=False)  # fairseq naming
-        args.has_token_type_embedding = config.getboolean(
+        component_config.has_token_type_embedding = config.getboolean(
             component, 'has_token_type_embedding', fallback=False)
-        args.has_embedding_layernorm = config.getboolean(
+        component_config.has_embedding_layernorm = config.getboolean(
             component, 'layernorm_embedding', fallback=True)  # fairseq naming
-        args.has_embedding_scale = not config.getboolean(
+        component_config.has_embedding_scale = not config.getboolean(
             component, 'no_scale_embedding')  # fairseq naming
-        args.q_scaling = config.getfloat(component, 'q_scaling', fallback=1.0)
-        args.has_attention_qkvo_bias = config.getboolean('structure',
-                                                         't5_with_bias',
-                                                         fallback=True)
-        args.has_mlp_bias = config.getboolean('structure',
-                                              't5_with_bias',
-                                              fallback=True)
-        args.has_model_final_layernorm = config.getboolean(
+        component_config.q_scaling = config.getfloat(component,
+                                                     'q_scaling',
+                                                     fallback=1.0)
+        component_config.has_attention_qkvo_bias = config.getboolean(
+            'structure', 't5_with_bias', fallback=True)
+        component_config.has_mlp_bias = config.getboolean('structure',
+                                                          't5_with_bias',
+                                                          fallback=True)
+        component_config.has_model_final_layernorm = config.getboolean(
             component, 'has_model_final_layernorm')
-        args.layernorm_eps = config.getfloat(component,
-                                             'layer_norm_epsilon',
-                                             fallback=1e-5)  # fairseq naming
+        component_config.layernorm_eps = config.getfloat(
+            component, 'layer_norm_epsilon', fallback=1e-5)  # fairseq naming
 
         normalize_before = config.getboolean(
             component, f'{component}_normalize_before')  # fairseq naming
-        args.layernorm_position = layernorm_position_map[
+        component_config.layernorm_position = layernorm_position_map[
             'pre_layernorm' if normalize_before else 'post_layernorm']
 
-        args.layernorm_type = layernorm_type_map[config.get(
+        component_config.layernorm_type = layernorm_type_map[config.get(
             component, 'layernorm_type', fallback='LayerNorm')]
-        args.hidden_act = config.get(component,
-                                     'activation_fn')  # fairseq naming
-        args.gated_act = config.getboolean(component,
-                                           'is_gated_act',
-                                           fallback=False)
-        args.mlp_type = mlp_type_map['GatedMLP' if args.gated_act else 'MLP']
-        args.relative_attention = config.get(
+        component_config.hidden_act = config.get(
+            component, 'activation_fn')  # fairseq naming
+        component_config.gated_act = config.getboolean(component,
+                                                       'is_gated_act',
+                                                       fallback=False)
+        component_config.mlp_type = mlp_type_map['GatedMLP' if component_config.
+                                                 gated_act else 'MLP']
+        component_config.relative_attention = config.get(
             'structure', 'position_embedding_type') == 'relative'
 
-        args.num_buckets = config.getint(component,
-                                         'relative_attention_num_buckets',
-                                         fallback=0)
-        args.max_distance = config.getint(component,
-                                          'relative_attention_max_distance',
-                                          fallback=0)
-        args.ckpt_weight_dtype = config.get(component, 'weight_data_type')
-        args.position_embedding_type = config.get('structure',
-                                                  'position_embedding_type')
-
+        component_config.num_buckets = config.getint(
+            component, 'relative_attention_num_buckets', fallback=0)
+        component_config.max_distance = config.getint(
+            component, 'relative_attention_max_distance', fallback=0)
+        component_config.ckpt_weight_dtype = config.get(component,
+                                                        'weight_data_type')
+        component_config.position_embedding_type = config.get(
+            'structure', 'position_embedding_type')
+        component_config.logits_dtype = config.get(component,
+                                                   'logits_dtype',
+                                                   fallback='float32')
         if component == 'decoder':
-            args.rescale_before_lm_head = config.getboolean(
+            component_config.rescale_before_lm_head = config.getboolean(
                 component, 'rescale_before_lm_head')
-            args.logits_dtype = config.get(component,
-                                           'logits_dtype',
-                                           fallback='float32')
-            args.encoder_hidden_size = config.getint(
+
+            component_config.encoder_hidden_size = config.getint(
                 'encoder', 'encoder_embed_dim')  # fairseq naming
-            args.encoder_num_heads = config.getint('encoder',
-                                                   'encoder_attention_heads')
-            args.encoder_head_size = config.getint(
+            component_config.encoder_num_heads = config.getint(
+                'encoder', 'encoder_attention_heads')
+            component_config.encoder_head_size = config.getint(
                 'encoder',
                 'd_kv',
-                fallback=args.encoder_hidden_size // args.encoder_num_heads)
+                fallback=component_config.encoder_hidden_size //
+                component_config.encoder_num_heads)
 
-        return args
+        return component_config
 
-    encoder_args = parse_nmt_config_by_component(config, "encoder", args)
-    decoder_args = parse_nmt_config_by_component(config, "decoder", args)
+    encoder_config = parse_nmt_config_by_component(config, "encoder", args)
+    decoder_config = parse_nmt_config_by_component(config, "decoder", args)
 
-    return encoder_args, decoder_args
+    return encoder_config, decoder_config
 
 
 def convert_nmt_weights_to_tllm_safetensors(config, component, params,
@@ -659,95 +627,106 @@ def parse_bart_config(args, hf_model):
 
     def parse_bart_config_by_component(config, component, args):
         assert component in ('encoder', 'decoder'), 'Unsupported component!'
-        args.n_layer = config.getint(component, f'{component}_layers')
-        args.n_head = config.getint(component, f'{component}_attention_heads')
-        args.hidden_size = config.getint(component, 'd_model')
-        args.head_size = config.getint(component,
-                                       'd_kv',
-                                       fallback=args.hidden_size // args.n_head)
-        args.ffn_hidden_size = config.getint(component, f'{component}_ffn_dim')
-        args.vocab_size = config.getint(component, 'vocab_size')
-        args.n_positions = config.getint(component, 'max_position_embeddings')
-        args.has_position_embedding = config.getboolean(
+        component_config = types.SimpleNamespace()
+        component_config = copy_args_to_component_config(component_config, args)
+        component_config.n_layer = config.getint(component,
+                                                 f'{component}_layers')
+        component_config.n_head = config.getint(component,
+                                                f'{component}_attention_heads')
+        component_config.hidden_size = config.getint(component, 'd_model')
+        component_config.head_size = config.getint(
+            component,
+            'd_kv',
+            fallback=component_config.hidden_size // component_config.n_head)
+        component_config.ffn_hidden_size = config.getint(
+            component, f'{component}_ffn_dim')
+        component_config.vocab_size = config.getint(component, 'vocab_size')
+        component_config.n_positions = config.getint(component,
+                                                     'max_position_embeddings')
+        component_config.has_position_embedding = config.getboolean(
             component, 'has_position_embedding',
             fallback=True)  # TODO: hardcoded here
-        args.has_token_type_embedding = config.getboolean(
+        component_config.has_token_type_embedding = config.getboolean(
             component, 'has_token_type_embedding', fallback=False)
-        args.has_embedding_layernorm = config.getboolean(
+        component_config.has_embedding_layernorm = config.getboolean(
             component, 'has_embedding_layernorm', fallback=True)
-        args.has_embedding_scale = config.getboolean(component,
-                                                     'scale_embedding')
-        args.q_scaling = config.getfloat(component, 'q_scaling', fallback=1.0)
-        args.has_attention_qkvo_bias = config.getboolean('structure',
-                                                         't5_with_bias',
-                                                         fallback=True)
-        args.has_mlp_bias = config.getboolean('structure',
-                                              't5_with_bias',
-                                              fallback=True)
-        args.has_model_final_layernorm = config.getboolean(
+        component_config.has_embedding_scale = config.getboolean(
+            component, 'scale_embedding')
+        component_config.q_scaling = config.getfloat(component,
+                                                     'q_scaling',
+                                                     fallback=1.0)
+        component_config.has_attention_qkvo_bias = config.getboolean(
+            'structure', 't5_with_bias', fallback=True)
+        component_config.has_mlp_bias = config.getboolean('structure',
+                                                          't5_with_bias',
+                                                          fallback=True)
+        component_config.has_model_final_layernorm = config.getboolean(
             component, 'has_model_final_layernorm')
-        args.layernorm_eps = config.getfloat(component,
-                                             'layer_norm_epsilon',
-                                             fallback=False)
+        component_config.layernorm_eps = config.getfloat(component,
+                                                         'layer_norm_epsilon',
+                                                         fallback=False)
 
         normalize_before = config.getboolean(component, 'normalize_before')
-        args.layernorm_position = layernorm_position_map[
+        component_config.layernorm_position = layernorm_position_map[
             'pre_layernorm' if normalize_before else 'post_layernorm']
 
-        args.layernorm_type = layernorm_type_map[config.get(
+        component_config.layernorm_type = layernorm_type_map[config.get(
             component, 'layernorm_type', fallback='LayerNorm')]
-        args.hidden_act = config.get(component, 'activation_function')
-        args.gated_act = config.getboolean(component,
-                                           'is_gated_act',
-                                           fallback=False)
-        args.mlp_type = mlp_type_map['GatedMLP' if args.gated_act else 'MLP']
-        args.relative_attention = config.get(
+        component_config.hidden_act = config.get(component,
+                                                 'activation_function')
+        component_config.gated_act = config.getboolean(component,
+                                                       'is_gated_act',
+                                                       fallback=False)
+        component_config.mlp_type = mlp_type_map['GatedMLP' if component_config.
+                                                 gated_act else 'MLP']
+        component_config.relative_attention = config.get(
             'structure', 'position_embedding_type') == 'relative'
 
-        args.num_buckets = config.getint(component,
-                                         'relative_attention_num_buckets',
-                                         fallback=0)
-        args.max_distance = config.getint(component,
-                                          'relative_attention_max_distance',
-                                          fallback=0)
-        args.ckpt_weight_dtype = config.get(component, 'weight_data_type')
-        args.max_lora_rank = config.getint(component,
-                                           'max_lora_rank',
-                                           fallback=0)
-        args.lora_target_modules = literal_eval(
+        component_config.num_buckets = config.getint(
+            component, 'relative_attention_num_buckets', fallback=0)
+        component_config.max_distance = config.getint(
+            component, 'relative_attention_max_distance', fallback=0)
+        component_config.ckpt_weight_dtype = config.get(component,
+                                                        'weight_data_type')
+        component_config.max_lora_rank = config.getint(component,
+                                                       'max_lora_rank',
+                                                       fallback=0)
+        component_config.lora_target_modules = literal_eval(
             config.get(component, 'lora_target_modules', fallback="[]"))
-        args.hf_modules_to_trtllm_modules = literal_eval(
+        component_config.hf_modules_to_trtllm_modules = literal_eval(
             config.get(component, 'hf_modules_to_trtllm_modules',
                        fallback="{}"))
-        args.trtllm_modules_to_hf_modules = literal_eval(
+        component_config.trtllm_modules_to_hf_modules = literal_eval(
             config.get(component, 'trtllm_modules_to_hf_modules',
                        fallback="{}"))
-        args.logits_dtype = config.get(component,
-                                       'logits_dtype',
-                                       fallback='float32')
-        args.position_embedding_type = config.get('structure',
-                                                  'position_embedding_type')
+        component_config.logits_dtype = config.get(component,
+                                                   'logits_dtype',
+                                                   fallback='float32')
+        component_config.position_embedding_type = config.get(
+            'structure', 'position_embedding_type')
 
         if component == 'decoder':
-            args.rescale_before_lm_head = config.getboolean(
+            component_config.rescale_before_lm_head = config.getboolean(
                 component, 'rescale_before_lm_head')
 
-            args.encoder_hidden_size = config.getint('encoder', 'd_model')
-            args.encoder_num_heads = config.getint('encoder',
-                                                   'encoder_attention_heads')
-            args.encoder_head_size = config.getint(
+            component_config.encoder_hidden_size = config.getint(
+                'encoder', 'd_model')
+            component_config.encoder_num_heads = config.getint(
+                'encoder', 'encoder_attention_heads')
+            component_config.encoder_head_size = config.getint(
                 'encoder',
                 'd_kv',
-                fallback=args.encoder_hidden_size // args.encoder_num_heads)
+                fallback=component_config.encoder_hidden_size //
+                component_config.encoder_num_heads)
 
-        return args
+        return component_config
 
-    encoder_args = None
+    encoder_config = None
     if not args.nougat:
-        encoder_args = parse_bart_config_by_component(config, "encoder", args)
-    decoder_args = parse_bart_config_by_component(config, "decoder", args)
+        encoder_config = parse_bart_config_by_component(config, "encoder", args)
+    decoder_config = parse_bart_config_by_component(config, "decoder", args)
 
-    return encoder_args, decoder_args
+    return encoder_config, decoder_config
 
 
 def convert_bart_weights_to_tllm_safetensors(config, component, params):
@@ -940,6 +919,247 @@ def convert_bart_weights_to_tllm_safetensors(config, component, params):
     return weights
 
 
+def parse_pix2struct_config(args, hf_model):
+    # manually set q_scaling to offset attention scaling's effect.
+    # TODO: modify kernels to control whether to disable attention scaling
+    config = configparser.ConfigParser()
+
+    def get_offset_q_scaling(config) -> str:
+        d_model = config.hidden_size
+        num_heads = config.num_heads
+        head_size = d_model / num_heads
+        scaling = 1 / head_size**.5
+        return str(scaling)
+
+    config["decoder"] = {}
+    for key, val in hf_model.decoder.config.to_dict().items():
+        config["decoder"][key] = f"{val}"
+    config["decoder"]["weight_data_type"] = args.weight_data_type
+
+    config["decoder"]["q_scaling"] = get_offset_q_scaling(
+        hf_model.decoder.config)
+
+    config["structure"] = dict()
+    config["structure"]["pix2struct_with_bias"] = "false"
+    config["structure"]["use_gated_activation"] = "false"
+    config["structure"]["position_embedding_type"] = "relative"
+    config["structure"]["model_type"] = args.model_type
+
+    def parse_pix2struct_config_by_component(config, component, args):
+        if component == 'decoder':
+            args.n_layer = config.getint(component, 'num_layers')
+            args.n_head = config.getint(component, 'num_heads')
+            args.head_size = config.getint(component, 'd_kv')
+            args.hidden_size = config.getint(component, 'hidden_size')
+            args.ffn_hidden_size = config.getint(component, 'd_ff')
+            args.vocab_size = config.getint(component, 'vocab_size')
+            args.n_positions = config.getint(component,
+                                             'n_positions',
+                                             fallback=512)
+            args.has_position_embedding = config.getboolean(
+                component, 'has_position_embedding',
+                fallback=False)  # TODO: hardcoded here
+            args.has_token_type_embedding = config.getboolean(
+                component, 'has_token_type_embedding', fallback=False)
+            args.has_embedding_layernorm = config.getboolean(
+                component, 'has_embedding_layernorm', fallback=False)
+            args.has_embedding_scale = config.getboolean(component,
+                                                         'has_embedding_scale',
+                                                         fallback=False)
+            args.q_scaling = config.getfloat(component,
+                                             'q_scaling',
+                                             fallback=1.0)
+            args.has_attention_qkvo_bias = config.getboolean(
+                component, 'has_attention_qkvo_bias', fallback=False)
+            args.has_mlp_bias = config.getboolean(component,
+                                                  'has_mlp_bias',
+                                                  fallback=False)
+            args.has_model_final_layernorm = config.getboolean(
+                component, 'has_model_final_layernorm', fallback=True)
+            args.layernorm_eps = config.getfloat(component,
+                                                 'layer_norm_epsilon')
+            args.layernorm_position = layernorm_position_map[config.get(
+                component, 'layernorm_position',
+                fallback='pre_layernorm')]  # TODO: hardcoded here
+            args.layernorm_type = layernorm_type_map[config.get(
+                component, 'layernorm_type', fallback='RmsNorm')]
+            args.hidden_act = config.get(component, 'dense_act_fn')
+            args.gated_act = True
+            args.mlp_type = mlp_type_map['GatedMLP' if args.
+                                         gated_act else 'MLP']
+            args.has_lm_head_bias = config.getboolean(
+                component,  # TODO: T5 with bias
+                'has_lm_head_bias',
+                fallback=False)
+            args.relative_attention = config.getboolean(component,
+                                                        'relative_attention',
+                                                        fallback=True)
+            args.num_buckets = config.getint(component,
+                                             'relative_attention_num_buckets')
+            args.max_distance = config.getint(
+                component, 'relative_attention_max_distance')
+            args.logits_dtype = config.get(component,
+                                           'logits_dtype',
+                                           fallback='float32')
+            args.rescale_before_lm_head = config.getboolean(
+                component, 'tie_word_embeddings'
+            )  # default is True (for T5), but False for Flan-T5
+            args.encoder_hidden_size = config.getint('decoder', 'hidden_size')
+            args.encoder_num_heads = config.getint('decoder', 'num_heads')
+            args.encoder_head_size = config.getint('decoder', 'd_kv')
+            args.ckpt_weight_dtype = config.get(component, 'weight_data_type')
+            args.position_embedding_type = config.get(
+                'structure', 'position_embedding_type')
+
+        else:
+            assert False, 'Unsupported component!'
+        return args
+
+    decoder_args = parse_pix2struct_config_by_component(config, "decoder", args)
+    return None, decoder_args
+
+
+def convert_pix2struct_weights_to_tllm_safetensors(config, component, params):
+    weights = {}
+
+    mapping = config.mapping
+
+    convert_weight_to_dtype(params, config.dtype)
+    hidden_size = config.hidden_size
+    ffn_hidden_size = config.ffn_hidden_size
+    num_layers = config.num_hidden_layers
+    n_head = config.num_attention_heads
+    head_size = config.head_size
+    attention_hidden_size = n_head * head_size  # head size * num_heads not necessarily equals hidden_dim, such as Flan-T5
+
+    hf_param_prefix = f'{component}'
+    trtllm_layer_name = f'{component}_layers'
+    trtllm_attn_layer_name = 'self_attention'
+    trtllm_attn_layernorm_name = 'self_attention_layernorm'
+
+    def get_attn_module_name(component, layer, attn_type):
+        return f'{component}.layer.{int(layer)}.{attn_type}.attention'
+
+    weights['embedding.vocab_embedding.weight'] = reshape(
+        params[f'{hf_param_prefix}.embed_tokens.weight'].clone(), None)
+
+    layers_range = mapping.pp_layers(num_layers)
+    for layer_idx in layers_range:
+        local_layer_idx = layer_idx - layers_range[0]
+        trtllm_layer_name_prefix = f'{trtllm_layer_name}.{local_layer_idx}'
+        hf_layer_name_prefix = f'{hf_param_prefix}.layer.{layer_idx}'
+
+        hidden_layer_name_split = {
+            f'{hf_layer_name_prefix}.self_attention.attention.output.weight': {
+                "name":
+                f'{trtllm_layer_name_prefix}.{trtllm_attn_layer_name}.dense.weight',
+                "shape":
+                (hidden_size, attention_hidden_size // mapping.tp_size),
+                "split_dim": -1
+            },
+            f'{hf_layer_name_prefix}.mlp.DenseReluDense.wo.weight': {
+                "name": f'{trtllm_layer_name_prefix}.mlp.proj.weight',
+                "shape": (hidden_size, ffn_hidden_size // mapping.tp_size),
+                "split_dim": -1
+            },
+            f'{hf_layer_name_prefix}.mlp.DenseReluDense.wi_0.weight': {
+                "name": f'{trtllm_layer_name_prefix}.mlp.fc.weight',
+                "shape": (ffn_hidden_size // mapping.tp_size, hidden_size),
+                "split_dim": 0
+            },
+        }
+
+        hidden_layer_name_no_split = {
+            f'{hf_layer_name_prefix}.self_attention.layer_norm.weight': {
+                "name":
+                f'{trtllm_layer_name_prefix}.{trtllm_attn_layernorm_name}.weight',
+                "shape": None
+            },
+            f'{hf_layer_name_prefix}.mlp.layer_norm.weight': {
+                "name": f'{trtllm_layer_name_prefix}.mlp_layernorm.weight',
+                "shape": None
+            },
+        }
+
+        if config.gated_act:
+            hidden_layer_name_split.update({
+                f'{hf_layer_name_prefix}.mlp.DenseReluDense.wi_1.weight': {
+                    "name": f'{trtllm_layer_name_prefix}.mlp.gate.weight',
+                    "shape": (ffn_hidden_size // mapping.tp_size, hidden_size),
+                    "split_dim": 0
+                },
+            })
+
+        hidden_layer_name_split.update({
+            f'{hf_layer_name_prefix}.encoder_decoder_attention.attention.output.weight':
+            {
+                "name":
+                f'{trtllm_layer_name_prefix}.cross_attention.dense.weight',
+                "shape":
+                (hidden_size, attention_hidden_size // mapping.tp_size),
+                "split_dim": -1
+            },
+        })
+        hidden_layer_name_no_split.update({
+            f'{hf_layer_name_prefix}.encoder_decoder_attention.layer_norm.weight':
+            {
+                "name":
+                f'{trtllm_layer_name_prefix}.cross_attention_layernorm.weight',
+                "shape": None
+            },
+        })
+        self_attn_module_name = get_attn_module_name(
+            component, layer_idx, 'encoder_decoder_attention')
+        weights.update(
+            fuse_qkv_one_layer(
+                params, self_attn_module_name,
+                f'{trtllm_layer_name_prefix}.cross_attention', mapping.tp_size,
+                mapping.tp_rank, config.model_type,
+                (attention_hidden_size * 3 // mapping.tp_size, hidden_size),
+                None))
+
+        self_attn_module_name = get_attn_module_name(component, layer_idx,
+                                                     'self_attention')
+        weights.update(
+            fuse_qkv_one_layer(
+                params, self_attn_module_name,
+                f'{trtllm_layer_name_prefix}.{trtllm_attn_layer_name}',
+                mapping.tp_size, mapping.tp_rank, config.model_type,
+                (attention_hidden_size * 3 // mapping.tp_size, hidden_size),
+                None))
+
+        weights[
+            f'{trtllm_layer_name_prefix}.{trtllm_attn_layer_name}.rel_attn_table'] = reshape(
+                split(
+                    params[
+                        f'{component}.layer.0.self_attention.attention.relative_attention_bias.weight']
+                    .T, mapping.tp_size, mapping.tp_rank, 0),
+                (n_head // mapping.tp_size, config.num_buckets))
+
+        for hf_weight_name, weight_info in hidden_layer_name_split.items():
+            if hf_weight_name in params.keys():
+                weights[weight_info["name"]] = reshape(
+                    split(params[hf_weight_name],
+                          mapping.tp_size,
+                          mapping.tp_rank,
+                          dim=weight_info["split_dim"]), weight_info["shape"])
+        for hf_weight_name, weight_info in hidden_layer_name_no_split.items():
+            if hf_weight_name in params.keys():
+                weights[weight_info["name"]] = reshape(
+                    params[hf_weight_name].clone(), shape=weight_info["shape"])
+
+    weights[f'final_layernorm.weight'] = reshape(
+        params[f'{component}.final_layer_norm.weight'].clone(), None)
+
+    weights['lm_head.weight'] = reshape(
+        split(params[f'{component}.lm_head.weight'],
+              mapping.tp_size,
+              mapping.tp_rank,
+              dim=0), (config.vocab_size // mapping.tp_size, hidden_size))
+
+    return weights
+
+
 def get_model(args):
     if args.model_type == "t5":
         model = T5ForConditionalGeneration.from_pretrained(args.model_dir)
@@ -952,6 +1172,9 @@ def get_model(args):
             model = model.get_decoder()
         else:
             model = AutoModelForSeq2SeqLM.from_pretrained(args.model_dir)
+    elif args.model_type == "pix2struct":
+        model = Pix2StructForConditionalGeneration.from_pretrained(
+            args.model_dir)
     return model
 
 
@@ -979,7 +1202,7 @@ def convert_checkpoint(args):
 
     additional_settings = ["gated_act"]
 
-    if not args.nougat:
+    if not args.nougat and args.model_type != "pix2struct":
         tllm_encoder_config = {
             'architecture': "EncoderModel",
             'dtype': args.dtype,
@@ -1113,7 +1336,7 @@ def convert_checkpoint(args):
         decoder_convert_args["sin_pos_embedding"] = sin_pos_embedding
 
     if args.workers == 1:
-        if not args.nougat:
+        if not args.nougat and args.model_type != "pix2struct":
             convert(0, world_size, args, tllm_encoder_config,
                     encoder_convert_args, encoder_saved_dir)
         convert(0, world_size, args, tllm_decoder_config, decoder_convert_args,
@@ -1123,7 +1346,7 @@ def convert_checkpoint(args):
             args.workers = world_size
         LOGGER.info(f'Convert checkpoint using {args.workers} workers.')
         import torch.multiprocessing as mp
-        if not args.nougat:
+        if not args.nougat and args.model_type != "pix2struct":
             mp.spawn(convert,
                      nprocs=args.workers,
                      args=(world_size, args, tllm_encoder_config,
@@ -1152,7 +1375,7 @@ if __name__ == "__main__":
     parser.add_argument('--model_type',
                         type=str,
                         default='t5',
-                        choices=['t5', 'nmt', 'bart'],
+                        choices=['t5', 'nmt', 'bart', 'pix2struct'],
                         help='Model to be converted.')
     parser.add_argument('--world_size',
                         type=int,

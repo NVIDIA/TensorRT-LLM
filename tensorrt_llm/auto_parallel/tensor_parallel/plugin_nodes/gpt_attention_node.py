@@ -35,8 +35,8 @@ class IdxEntry(Enum):
     ENCODER_INPUT_LENGTH = auto()
     HOST_CONTEXT_LENGTH = auto()
     QKV_BIAS_TENSOR = auto()
-    MEDUSA_PACKED_MASK = auto()
-    MEDUSA_POSITION_OFFSETS = auto()
+    SPEC_DECODING_PACKED_MASK = auto()
+    SPEC_DECODING_POSITION_OFFSETS = auto()
 
 
 class IdxEntryParser:
@@ -57,8 +57,8 @@ class IdxEntryParser:
             plugin_info.pfc_as_list['kv_cache_quant_mode'][0])
         self.position_embedding_type = PositionEmbeddingType(
             plugin_info.pfc_as_list['position_embedding_type'][0])
-        self.is_medusa_enabled = bool(
-            plugin_info.pfc_as_list['is_medusa_enabled'][0])
+        self.is_spec_decoding_enabled = bool(
+            plugin_info.pfc_as_list['is_spec_decoding_enabled'][0])
         self.init_entry_to_index()
 
     # WARNING: Must in sync with GPTAttentionPlugin::isEntryUsed in cpp/tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.cpp
@@ -113,10 +113,10 @@ class IdxEntryParser:
             return self.remove_input_padding
         elif entry == IdxEntry.QKV_BIAS_TENSOR:
             return self.qkv_bias_enabled
-        elif entry == IdxEntry.MEDUSA_PACKED_MASK:
-            return self.is_medusa_enabled
-        elif entry == IdxEntry.MEDUSA_POSITION_OFFSETS:
-            return self.is_medusa_enabled
+        elif entry == IdxEntry.SPEC_DECODING_PACKED_MASK:
+            return self.is_spec_decoding_enabled
+        elif entry == IdxEntry.SPEC_DECODING_POSITION_OFFSETS:
+            return self.is_spec_decoding_enabled
         else:
             return False
 

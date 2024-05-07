@@ -196,6 +196,10 @@ class PluginConfig:
         self.set_plugin("tokens_per_block", tokens_per_block)
         return self
 
+    def enable_paged_state(self):
+        self.set_plugin("paged_state", True)
+        return self
+
     def set_gpt_attention_plugin(self, dtype='float16'):
         self.set_plugin("gpt_attention_plugin", dtype)
         return self

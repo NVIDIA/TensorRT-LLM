@@ -14,13 +14,20 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 #include "gemmPlugin.h"
+
+#include "gemmPluginProfiler.h"
 #include "plugin.h"
-#include "tensorrt_llm/runtime/iTensor.h"
-#include <NvInferRuntimeBase.h>
+#include "pluginUtils.h"
+
+#include <NvInferRuntime.h>
+
+#include <cassert>
 
 using namespace nvinfer1;
 using namespace tensorrt_llm::common;
+using tensorrt_llm::plugins::GemmDims;
 using tensorrt_llm::plugins::GemmPluginCreator;
 using tensorrt_llm::plugins::GemmPlugin;
 using tensorrt_llm::plugins::CublasLtGemmPluginProfiler;
@@ -47,10 +54,13 @@ void getProblemParams(cublasOperation_t& transa, cublasOperation_t& transb, int&
 }
 
 void runGemm(int const M, int const N, int const K, bool const transA, bool const transB, int const padLda,
-    int const padLdb, const nvinfer1::DataType type, CublasGemmWrapperPtr const& cublasWrapperPtr, void const* act,
+    int const padLdb, nvinfer1::DataType const type, CublasGemmWrapperPtr const& cublasWrapperPtr, void const* act,
     void const* weight, void* output, std::optional<cublasLtMatmulHeuristicResult_t> const& heuristic, void* workspace,
     cudaStream_t stream)
 {
+    if (M == 0 || N == 0 || K == 0)
+        return;
+
     cublasWrapperPtr->setStream(stream);
     cublasWrapperPtr->setWorkspace(workspace);
 
@@ -291,60 +301,19 @@ bool GemmPlugin::supportsFormatCombination(
     return desc.type == mType || desc.type == nvinfer1::DataType::kFLOAT;
 }
 
-int32_t computeMDimension(bool transA, const int32_t nbDims, tensorrt_llm::runtime::ITensor::DimType const* dims)
-{
-    int32_t M = 1;
-    if (transA)
-    {
-        for (int i = nbDims - 1; i > 0; --i)
-        {
-            M *= dims[i];
-        }
-    }
-    else
-    {
-        for (int i = 0; i < nbDims - 1; ++i)
-        {
-            M *= dims[i];
-        }
-    }
-    return M;
-}
-
-int32_t computeNDimension(bool transB, const int32_t nbDims, tensorrt_llm::runtime::ITensor::DimType const* dims)
-{
-    int32_t N = 1;
-    if (transB)
-    {
-        for (int i = 0; i < nbDims - 1; ++i)
-        {
-            N *= dims[i];
-        }
-    }
-    else
-    {
-        for (int i = nbDims - 1; i > 0; --i)
-        {
-            N *= dims[i];
-        }
-    }
-    return N;
-}
-
 void GemmPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int nbInputs,
     nvinfer1::DynamicPluginTensorDesc const* out, int nbOutputs) noexcept
 {
-    int const nbDimsA = in[0].max.nbDims;
-    int const nbDimsB = in[1].max.nbDims;
+    auto const nbDimsA = in[0].max.nbDims;
 
-    auto const minM = computeMDimension(mTransA, nbDimsA, in[0].min.d);
-    auto const maxM = computeMDimension(mTransA, nbDimsA, in[0].max.d);
-    auto const N = computeNDimension(mTransB, nbDimsB, in[1].max.d);
-    auto const K = mTransA ? in[0].max.d[0] : in[0].max.d[nbDimsA - 1];
+    auto const minM = utils::computeMDimension(mTransA, in[0].min);
+    auto const maxM = utils::computeMDimension(mTransA, in[0].max);
+    auto const N = utils::computeNDimension(mTransB, in[1].max);
+    auto const K = static_cast<utils::DimType>(mTransA ? in[0].max.d[0] : in[0].max.d[nbDimsA - 1]);
 
     if (!mDims.isInitialized())
     {
-        mDims = {minM, maxM, N, static_cast<runtime::SizeType>(K)};
+        mDims = {minM, maxM, N, K};
     }
     mGemmId.n = N;
     mGemmId.k = K;
@@ -370,13 +339,13 @@ int GemmPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::P
     setGemmConfig();
 
     int const nbDimsA = inputDesc[0].dims.nbDims;
-    int const nbDimsB = inputDesc[1].dims.nbDims;
     int const padM = mTransA ? mPadLda : 0;
     int const padN = mTransB ? 0 : mPadLdb;
     int const padK = mTransA ? 0 : mPadLda;
-    auto const M = computeMDimension(mTransA, nbDimsA, inputDesc[0].dims.d) - padM;
-    auto const N = computeNDimension(mTransB, nbDimsB, inputDesc[1].dims.d) - padN;
-    int const K = mTransA ? inputDesc[0].dims.d[0] - padK : inputDesc[0].dims.d[nbDimsA - 1] - padK;
+    auto const M = utils::computeMDimension(mTransA, inputDesc[0].dims) - padM;
+    auto const N = utils::computeNDimension(mTransB, inputDesc[1].dims) - padN;
+    int const K = static_cast<utils::DimType>(
+        mTransA ? inputDesc[0].dims.d[0] - padK : inputDesc[0].dims.d[nbDimsA - 1] - padK);
 
     auto bestTactic = mPluginProfiler->getBestConfig(M, mGemmId);
     runGemm(M, N, K, mTransA, mTransB, mPadLda, mPadLdb, mType, mCublasWrapper, inputs[0], inputs[1], outputs[0],

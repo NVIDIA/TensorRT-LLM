@@ -525,7 +525,8 @@ size_t MoeGemmRunner<T, WeightType>::calcMaxWorkspaceSize(int num_experts) const
         return max_size;
     }
 
-    assert(false); // Unreachable
+    TLLM_CHECK_WITH_INFO(false, "Unsupported MoE GEMM configuration"); // Unreachable
+    return 0;
 }
 
 template <typename T, typename WeightType>

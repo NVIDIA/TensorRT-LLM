@@ -96,7 +96,8 @@ class GPTDecoderLayer(Module):
             tp_group=tp_group,
             tp_size=tp_size,
             tp_rank=tp_rank,
-            quant_mode=config.quant_mode)
+            quant_mode=config.quant_mode,
+            qk_layernorm=config.qk_layernorm)
 
         mlp_hidden_size = config.hidden_size * 4 if config.intermediate_size is None else config.intermediate_size
 
@@ -129,7 +130,9 @@ class GPTDecoderLayer(Module):
                 use_cache=False,
                 kv_cache_params=None,
                 attention_params=None,
-                lora_layer_params=None):
+                lora_layer_params=None,
+                spec_decoding_position_offsets=None,
+                spec_decoding_packed_mask=None):
 
         assert isinstance(hidden_states, Tensor)
 
@@ -137,12 +140,15 @@ class GPTDecoderLayer(Module):
 
         hidden_states = self.input_layernorm(hidden_states)
 
-        attention_output = self.attention(hidden_states,
-                                          attention_mask=attention_mask,
-                                          use_cache=use_cache,
-                                          kv_cache_params=kv_cache_params,
-                                          attention_params=attention_params,
-                                          lora_layer_params=lora_layer_params)
+        attention_output = self.attention(
+            hidden_states,
+            attention_mask=attention_mask,
+            use_cache=use_cache,
+            kv_cache_params=kv_cache_params,
+            attention_params=attention_params,
+            lora_layer_params=lora_layer_params,
+            spec_decoding_position_offsets=spec_decoding_position_offsets,
+            spec_decoding_packed_mask=spec_decoding_packed_mask)
 
         if use_cache:
             attention_output, presents = attention_output
@@ -197,7 +203,9 @@ class GPTModel(Module):
                 prompt_embedding_table=None,
                 prompt_tasks=None,
                 prompt_vocab_size=None,
-                lora_params=None):
+                lora_params=None,
+                spec_decoding_position_offsets=None,
+                spec_decoding_packed_mask=None):
         if self.mapping.is_first_pp_rank():
             ptuning_args = [
                 prompt_embedding_table, prompt_tasks, prompt_vocab_size
@@ -209,12 +217,15 @@ class GPTModel(Module):
         else:
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
 
-        hidden_states = self.layers(hidden_states,
-                                    use_cache=use_cache,
-                                    attention_mask=attention_mask,
-                                    kv_cache_params=kv_cache_params,
-                                    attention_params=attention_params,
-                                    lora_params=lora_params)
+        hidden_states = self.layers(
+            hidden_states,
+            use_cache=use_cache,
+            attention_mask=attention_mask,
+            kv_cache_params=kv_cache_params,
+            attention_params=attention_params,
+            lora_params=lora_params,
+            spec_decoding_position_offsets=spec_decoding_position_offsets,
+            spec_decoding_packed_mask=spec_decoding_packed_mask)
         if use_cache:
             hidden_states, presents = hidden_states
 

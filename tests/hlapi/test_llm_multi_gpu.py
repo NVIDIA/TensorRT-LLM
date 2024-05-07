@@ -127,6 +127,19 @@ def test_llm_generate_mixtral_for_tp2():
         print(output)
 
 
+def test_llm_pp2():
+    config = ModelConfig(llama_model_path)
+    config.parallel_config.pp_size = 2
+    config.parallel_config.auto_parallel = False
+    llm = LLM(
+        config,
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+    )
+    for output in llm.generate(prompts):
+        assert output.text == "<s> A B C D E F G H I J K L M N O P Q R S T U V W X Y Z\nA B C D E F G H"
+
+
 if __name__ == '__main__':
     test_llm_generate_async_tp2(use_auto_parallel=True)
     test_llm_generate_async_tp2(use_auto_parallel=False)
+    test_llm_pp2()

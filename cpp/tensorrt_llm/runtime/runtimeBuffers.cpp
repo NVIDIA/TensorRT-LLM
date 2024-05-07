@@ -87,8 +87,6 @@ void RuntimeBuffers::create(TllmRuntime const& runtime, ModelConfig const& model
     bool transformerBased = modelConfig.isTransformerBased();
     bool ssmBased = modelConfig.isSsmBased();
 
-    TLLM_CHECK_WITH_INFO(transformerBased ^ ssmBased, "Model should be either Transformer based or SSM based now.");
-
     contextLengthsHost = manager.emptyTensor(MemoryType::kPINNED, nvinfer1::DataType::kINT32);
     if (transformerBased)
     {
@@ -445,13 +443,12 @@ void RuntimeBuffers::getRuntimeBuffers(TensorMap& inputBuffers, TensorMap& outpu
     if (transformerBuffers)
     {
         transformerBuffers->getRuntimeBuffers(
-            this, inputBuffers, outputBuffers, step, inputIds, commPtrs, modelConfig, worldConfig);
+            this, inputBuffers, outputBuffers, step, inputIds, modelConfig, worldConfig);
     }
 
     if (ssmStateBuffers)
     {
-        ssmStateBuffers->getRuntimeBuffers(
-            this, inputBuffers, outputBuffers, step, inputIds, commPtrs, modelConfig, worldConfig);
+        ssmStateBuffers->getRuntimeBuffers(this, inputBuffers, outputBuffers, step, inputIds, modelConfig, worldConfig);
     }
 
     if (modelConfig.useCustomAllReduce() && worldConfig.isTensorParallel())

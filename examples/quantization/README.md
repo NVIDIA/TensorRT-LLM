@@ -17,11 +17,11 @@ The detailed LLM quantization recipe is distributed to the README.md of the corr
 docker run --gpus all --ipc=host --ulimit memlock=-1 --shm-size=20g -it <the docker image with TensorRT-LLM installed> bash
 ```
 
-2. Install the quantization toolkit `ammo` and the related dependencies on top of the TensorRT-LLM installation or docker file.
+2. Install the quantization toolkit `modelopt` and the related dependencies on top of the TensorRT-LLM installation or docker file.
 
 ```bash
-# Install AMMO
-pip install --no-cache-dir --extra-index-url https://pypi.nvidia.com nvidia-ammo==0.9.3
+# Install Modelopt
+pip install --no-cache-dir --extra-index-url https://pypi.nvidia.com nvidia-modelopt==0.9.3
 # Install the additional requirements
 cd <this example folder>
 pip install -r requirements.txt
@@ -44,7 +44,7 @@ PTQ can be achieved with simple calibration on a small set of training or evalua
 import torch
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM
-import ammo.torch.quantization as atq
+import modelopt.torch.quantization as atq
 
 model = AutoModelForCausalLM.from_pretrained(...)
 
@@ -74,7 +74,7 @@ After the model is quantized, it can be exported to a TensorRT-LLM checkpoint, w
 The export API is
 
 ```python
-from ammo.torch.export import export_tensorrt_llm_checkpoint
+from modelopt.torch.export import export_tensorrt_llm_checkpoint
 
 with torch.inference_mode():
     export_tensorrt_llm_checkpoint(

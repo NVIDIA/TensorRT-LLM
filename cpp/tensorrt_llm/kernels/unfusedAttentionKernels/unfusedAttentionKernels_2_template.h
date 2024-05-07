@@ -217,7 +217,8 @@ struct Rotary_base_t<float, RotaryPositionEmbeddingType::GPTJ>
 template <typename VecType, typename T, int VEC_SIZE, bool RECOMPUTE>
 inline __device__ void apply_rotary_embedding_gptneox(VecType& q, VecType& q_pair, VecType& k, VecType& k_pair,
     bool first_half, float2 (&rotary_coef_cache)[VEC_SIZE], float const* rotary_inv_freq_buffer,
-    int const rotary_dim_idx, int const half_rotary_dim, int const rotary_position)
+    int const rotary_dim_idx, int const half_rotary_dim, int const rotary_position, int const vision_start = -1,
+    int const vision_length = -1)
 {
     // Each thread holds NUM_ELTS elements.
     // Currently we apply the rotary embedding in float data type for accuracy reasons.
@@ -234,8 +235,25 @@ inline __device__ void apply_rotary_embedding_gptneox(VecType& q, VecType& q_pai
 
         if (RECOMPUTE)
         {
-            float const rotary_inv_freq
-                = float(rotary_position) * rotary_inv_freq_buffer[min(rotary_dim_idx + elt_id, half_rotary_dim - 1)];
+            int real_rotary_position = rotary_position;
+            if (vision_start != -1 && vision_length != -1)
+            {
+                int t_step_int = rotary_position;
+                if (t_step_int <= vision_start)
+                {
+                    real_rotary_position = t_step_int;
+                }
+                else if (t_step_int > vision_start && t_step_int <= (vision_length + vision_start))
+                {
+                    real_rotary_position = vision_start + 1;
+                }
+                else
+                {
+                    real_rotary_position = t_step_int - (vision_length - 1);
+                }
+            }
+            float const rotary_inv_freq = float(real_rotary_position)
+                * rotary_inv_freq_buffer[min(rotary_dim_idx + elt_id, half_rotary_dim - 1)];
             rotary_coef_cache[elt_id] = make_float2(cosf(rotary_inv_freq), sinf(rotary_inv_freq));
         }
 
@@ -356,10 +374,10 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
             int const token_idx_in_seq = (cache_seq_len - actual_seq_len) + local_token_idx;
             bool const valid_token = token_idx_in_seq < cache_seq_len;
 
-            // NOTE: only Medusa needs the position offsets.
+            // NOTE: only spec decoding needs the position offsets.
             // In the generation phase, we assume all sequences should have the same input length.
-            int const rotary_position = params.medusa_position_offsets != nullptr
-                ? (params.medusa_position_offsets[local_token_idx + batch_idx * params.max_input_seq_len]
+            int const rotary_position = params.spec_decoding_position_offsets != nullptr
+                ? (params.spec_decoding_position_offsets[local_token_idx + batch_idx * params.max_input_seq_len]
                     + cache_seq_len - actual_seq_len)
                 : token_idx_in_seq;
 
@@ -445,7 +463,8 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
                     apply_rotary_embedding_gptneox<VecType, BaseType, ROTARY_COEF_VEC_SIZE, true>(q, q_pair, k, k_pair,
                         first_half, rotary_coef_cache,
                         params.rotary_embedding_inv_freq + batch_idx * params.half_rotary_dim, gptneox_rotary_dim_idx,
-                        params.half_rotary_dim, rotary_position);
+                        params.half_rotary_dim, rotary_position, params.rotary_vision_start,
+                        params.rotary_vision_length);
                     cached_rotary_position = rotary_position;
                 }
                 else
@@ -453,7 +472,8 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
                     apply_rotary_embedding_gptneox<VecType, BaseType, ROTARY_COEF_VEC_SIZE, false>(q, q_pair, k, k_pair,
                         first_half, rotary_coef_cache,
                         params.rotary_embedding_inv_freq + batch_idx * params.half_rotary_dim, gptneox_rotary_dim_idx,
-                        params.half_rotary_dim, rotary_position);
+                        params.half_rotary_dim, rotary_position, params.rotary_vision_start,
+                        params.rotary_vision_length);
                 }
                 break;
             }
@@ -670,11 +690,11 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
         local_token_idx = std::min(local_token_idx, actual_seq_len - 1);
         int const global_token_idx = local_token_idx + global_token_offset;
 
-        // NOTE: only Medusa needs the position offsets.
+        // NOTE: only spec decoding needs the position offsets.
         // In the generation phase, we assume all sequences should have the same input length.
-        int const rotary_position = params.medusa_position_offsets != nullptr
-            ? (params.medusa_position_offsets[local_token_idx + batch_idx * params.max_input_seq_len] + cache_seq_len
-                - actual_seq_len)
+        int const rotary_position = params.spec_decoding_position_offsets != nullptr
+            ? (params.spec_decoding_position_offsets[local_token_idx + batch_idx * params.max_input_seq_len]
+                + cache_seq_len - actual_seq_len)
             : token_idx_in_kv_cache;
 
         // head_num == kv_head_num:
@@ -837,7 +857,8 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
     dim3 grid(params.max_input_seq_len, params.head_num);                                                              \
     grid.z = std::min(int(divUp(params.multi_processor_count * WARPS_PER_SM, grid.x * grid.y)),                        \
         int(divUp(params.batch_size, MIN_SEQUENCES_PER_WARP)));                                                        \
-    if (params.position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX)                                       \
+    if (params.position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX                                        \
+        || params.position_embedding_type == PositionEmbeddingType::kLONG_ROPE)                                        \
     {                                                                                                                  \
         applyBiasRopeUpdateKVCache<T, TCache, Dh_MAX, ADD_BIAS, STORE_QKV, KVCacheBuffer,                              \
             RotaryPositionEmbeddingType::GPT_NEOX, DYNAMIC_ROTARY_SCALING><<<grid, block, 0, stream>>>(params);        \
@@ -863,7 +884,8 @@ void kernelDispatchHeadSize(QKVPreprocessingParams<T, KVCacheBuffer> params, cud
 
     constexpr int VEC_SIZE = Rotary_vec_t<T, Dh_MAX>::size;
     // Make sure we have multiple of paired vectors so that the access is aligned.
-    TLLM_CHECK_WITH_INFO(params.position_embedding_type != PositionEmbeddingType::kROPE_GPT_NEOX
+    TLLM_CHECK_WITH_INFO((params.position_embedding_type != PositionEmbeddingType::kROPE_GPT_NEOX
+                             && params.position_embedding_type != PositionEmbeddingType::kLONG_ROPE)
             || params.half_rotary_dim % VEC_SIZE == 0,
         "Rotary dim size is not supported.");
 
@@ -946,7 +968,8 @@ void kernelV1Dispatch(QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStrea
 #define APPLY_BIAS_ROPE_UPDATE_KV_CACHE_V2(ADD_BIAS, STORE_QKV)                                                        \
     dim3 block(BLOCK_SIZE);                                                                                            \
     dim3 grid(int(divUp(params.max_input_seq_len, tokens_per_cuda_block)), params.batch_size, params.head_num);        \
-    if (params.position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX)                                       \
+    if (params.position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX                                        \
+        || params.position_embedding_type == PositionEmbeddingType::kLONG_ROPE)                                        \
     {                                                                                                                  \
         applyBiasRopeUpdateKVCacheV2<T, TCache, BLOCK_SIZE, Dh, ADD_BIAS, STORE_QKV, KVCacheBuffer,                    \
             RotaryPositionEmbeddingType::GPT_NEOX><<<grid, block, 0, stream>>>(params);                                \
@@ -1010,7 +1033,8 @@ void invokeApplyBiasRopeUpdateKVCacheDispatch(QKVPreprocessingParams<T, KVCacheB
     bool const has_rotary_cos_sin_cache = params.rotary_coef_cache_buffer != nullptr;
     bool const has_sink_tokens = params.sink_token_len > 0;
     // V2 implementation requires multiple of paired 16 bytes for gpt-neox rotation.
-    bool const support_rotary_for_v2 = params.position_embedding_type != PositionEmbeddingType::kROPE_GPT_NEOX
+    bool const support_rotary_for_v2 = (params.position_embedding_type != PositionEmbeddingType::kROPE_GPT_NEOX
+                                           && params.position_embedding_type != PositionEmbeddingType::kLONG_ROPE)
         || params.rotary_embedding_dim % 16 == 0;
 
     if (long_seq_rotary_support || !has_rotary_cos_sin_cache || has_sink_tokens || !support_rotary_for_v2)

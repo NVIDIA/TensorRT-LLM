@@ -2,13 +2,18 @@
 
 # Installing on Linux
 
-1. Install the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit).
-2. Install TensorRT-LLM.
+1. Retrieve and launch the docker container (optional).
+
+    You can pre-install the environment using the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit) to avoid manual environment configuration.
 
     ```bash
     # Obtain and start the basic docker image environment (optional).
     docker run --rm --runtime=nvidia --gpus all --entrypoint /bin/bash -it nvidia/cuda:12.1.0-devel-ubuntu22.04
+    ```
 
+2. Install TensorRT-LLM.
+
+    ```bash
     # Install dependencies, TensorRT-LLM requires Python 3.10
     apt-get update && apt-get -y install python3.10 python3-pip openmpi-bin libopenmpi-dev git
 
@@ -21,7 +26,7 @@
     python3 -c "import tensorrt_llm"
     ```
 
-3. Install the requirements inside the Docker container.
+3. Install the requirements for running the example.
 
     ```bash
     git clone https://github.com/NVIDIA/TensorRT-LLM.git

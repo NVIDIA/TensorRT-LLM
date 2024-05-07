@@ -191,7 +191,7 @@ def _moe_plugin(moe_config,
         plugin_inputs += [finished]
 
     # Add conditional inputs
-    if quant_mode.has_any_quant():
+    if quant_mode.is_weight_only() or quant_mode.has_fp8_qdq():
         assert expert_scale_1
         assert expert_scale_2
         plugin_inputs += [expert_scale_1, expert_scale_2]
@@ -319,6 +319,7 @@ class MixtureOfExperts(Module):
         # all is more efficient as no allreduce required in the end.
         # Note that if we see models that have large number of experts, we may
         # need to consider add TP back here.
+        # TODO: Arctic has large # experts, we may need to add TP back here.
         self.router = RowLinear(
             hidden_size,
             self.num_experts,

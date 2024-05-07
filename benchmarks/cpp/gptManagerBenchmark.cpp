@@ -151,6 +151,7 @@ struct BenchmarkParams
     bool enableExpDelays{false};
     std::optional<float> requestRate{std::nullopt};
     int randomSeed = 430;
+    std::optional<int> maxAttentionWindow{std::nullopt};
 
     // lora / peft params
     std::optional<std::string> loraDir{std::nullopt};
@@ -746,8 +747,8 @@ public:
 
         texec::SchedulerConfig schedulerConfig(batch_scheduler::batchManagerToExecSchedPolicy(schedulerPolicy));
         texec::KvCacheConfig kvCacheConfig(benchmarkParams.enableBlockReuse, benchmarkParams.maxTokensInPagedKvCache,
-            std::nullopt, std::nullopt, benchmarkParams.freeGpuMemoryFraction, benchmarkParams.kvHostCacheSize,
-            benchmarkParams.kvOnboardBlocks);
+            benchmarkParams.maxAttentionWindow, std::nullopt, benchmarkParams.freeGpuMemoryFraction,
+            benchmarkParams.kvHostCacheSize, benchmarkParams.kvOnboardBlocks);
         texec::PeftCacheConfig peftCacheConfig(0, benchmarkParams.loraDeviceNumModLayers, 8, 64, 4, 4, 4, 24, 8,
             std::nullopt, benchmarkParams.loraHostCacheSize);
         texec::ExecutorConfig executorConfig(
@@ -907,6 +908,16 @@ public:
     ~GptServer()
     {
         mWorkItemsQueue.clear();
+    }
+
+    std::string getLayerProfileInfo()
+    {
+        return mBatchManager->getLayerProfileInfo();
+    }
+
+    void setLayerProfiler()
+    {
+        return mBatchManager->setLayerProfiler();
     }
 
     void enqueue(std::shared_ptr<InferenceRequest> const& request)
@@ -1267,7 +1278,7 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
     std::chrono::milliseconds waitSleep, bool returnContextLogits, bool returnGenerationLogits,
     std::optional<SizeType> const staticEmulatedBatchSize, std::optional<std::chrono::milliseconds> const batchTimeout,
     bool logIterationData, bool excludeInputInOutput, std::string const& responsesJsonFile,
-    std::optional<SizeType> const maxPromptLen)
+    std::optional<SizeType> const maxPromptLen, bool dumpProfile)
 {
     TrtGptModelOptionalParams optionalParams;
 
@@ -1278,6 +1289,10 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
     if (benchmarkParams.freeGpuMemoryFraction)
     {
         optionalParams.kvCacheConfig.freeGpuMemoryFraction = benchmarkParams.freeGpuMemoryFraction;
+    }
+    if (benchmarkParams.maxAttentionWindow)
+    {
+        optionalParams.kvCacheConfig.maxAttentionWindow = benchmarkParams.maxAttentionWindow;
     }
     optionalParams.kvCacheConfig.enableBlockReuse = benchmarkParams.enableBlockReuse;
     optionalParams.enableChunkedContext = benchmarkParams.enableChunkedContext;
@@ -1391,6 +1406,23 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
         recorder->report();
         recorder->writeOpMetricsToCsv();
         recorder->dumpResponseSeqs();
+        if (dumpProfile)
+        {
+            // Do per-layer profiling after normal benchmarking to avoid introducing perf overhead.
+            gptServer->resetBatchDeadline();
+            gptServer->setLayerProfiler();
+            for (std::size_t i = 0; i < numSamples; ++i)
+            {
+                auto request = makeRequest(i + 1, samples[i], benchmarkParams.streaming, beamWidthTensor, eosIdTensor,
+                    padIdTensor, bufferManager, returnContextLogitsFlagTensor, returnGenerationLogitsFlagTensor);
+                gptServer->enqueue(request);
+            }
+            gptServer->waitForEmpty();
+            if (worldConfig.getRank() == 0)
+            {
+                printf("[BENCHMARK] Per layer performance profile\n%s\n", gptServer->getLayerProfileInfo().c_str());
+            }
+        }
         // Send terminateReqId to terminate servers on all ranks
         // Server on rank 0 will broadcast the terminate signal to other servers on multi-GPU cases
         gptServer->enqueue(std::make_shared<InferenceRequest>(terminateReqId));
@@ -1554,6 +1586,7 @@ int main(int argc, char* argv[])
         "eos_id", "Specify the end-of-sequence token id.", cxxopts::value<TokenIdType>()->default_value("-1"));
     options.add_options()("pad_id", "Specify the padding token id.", cxxopts::value<TokenIdType>());
     options.add_options()("max_tokens_in_paged_kvcache", "Max tokens in paged K-V Cache.", cxxopts::value<int>());
+    options.add_options()("max_attention_window", "Max KV cache length per sequence", cxxopts::value<int>());
     options.add_options()(
         "random_seed", "integer random seed for exponential time delays.", cxxopts::value<int>()->default_value("420"));
     options.add_options()(
@@ -1614,6 +1647,8 @@ int main(int argc, char* argv[])
     options.add_options()(
         "max_prompt_len", "Truncate all prompts from dataset to the length specified.", cxxopts::value<SizeType>());
 
+    options.add_options()("dump_profile", "Print profile information per layer.", cxxopts::value<bool>());
+
     auto result = options.parse(argc, argv);
 
     if (result.count("help"))
@@ -1672,6 +1707,12 @@ int main(int argc, char* argv[])
     if (result.count("max_tokens_in_paged_kvcache"))
     {
         benchmarkParams.maxTokensInPagedKvCache = result["max_tokens_in_paged_kvcache"].as<int>();
+    }
+
+    // Argument: Max KV cache length
+    if (result.count("max_attention_window"))
+    {
+        benchmarkParams.maxAttentionWindow = result["max_attention_window"].as<int>();
     }
 
     if (result.count("random_seed"))
@@ -1811,6 +1852,9 @@ int main(int argc, char* argv[])
         return 1;
     }
 
+    // Argument: dump profile
+    bool dumpProfile = result["dump_profile"].as<bool>();
+
     initTrtLlmPlugins(logger.get());
 
     if (api == "gptManager")
@@ -1821,7 +1865,7 @@ int main(int argc, char* argv[])
                 maxNumSamples, beamWidth, result["warm_up"].as<int>(), eosId, padId, benchmarkParams, schedulerPolicy,
                 waitSleep, returnContextLogits, returnGenerationLogits, staticEmulatedBatchSize, batchTimeout,
                 logIterationData, result["exclude_input_in_output_seq"].as<bool>(),
-                result["responses_json_file"].as<std::string>(), maxPromptLen);
+                result["responses_json_file"].as<std::string>(), maxPromptLen, dumpProfile);
         }
         catch (std::exception const& e)
         {

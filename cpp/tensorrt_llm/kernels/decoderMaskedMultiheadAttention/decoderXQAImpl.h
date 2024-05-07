@@ -33,15 +33,15 @@ class DecoderXQARunner;
  * We need this layer of abstraction for abstracting out implementation details. Two possible implementations:
  *   1. Precompiled, i.e. kernels are compiled and saved as cubins in advance.
  *   2. JIT, i.e. kernels are compiled on the fly via NVRTC.
- *
- * This class is written as Composition over Inheritance, primarily because C++ does not support virtual template
- * functions.
  */
 class DecoderXQAImpl
 {
 public:
+    // TODO(minwei): shouldUse()/prepare() should be templated with KVCacheBuffer.
     // Whether it is beneficial to use this XQA codepath.
-    virtual bool shouldUse(XQAParams const& xqaParams) = 0;
+    //
+    // forConfigurePlugin: whether this method is called in configure plugin phase.
+    virtual bool shouldUse(XQAParams const& xqaParams, bool forConfigurePlugin) = 0;
     // Prepares for the kernel running. Must be called before calling run.
     virtual void prepare(XQAParams const& xqa_params) = 0;
     // Run XQA kernel with KVCacheBuffer.

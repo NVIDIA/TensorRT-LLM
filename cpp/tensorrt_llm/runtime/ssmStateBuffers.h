@@ -36,7 +36,8 @@ public:
     using TensorMap = StringPtrMap<ITensor>;
 
     // Mamba states:  mamba_d_inner = mamba_expand * hidden_size
-    TensorPtr mambaSsmStates;                 // [layer_count * batch_beam, mamba_d_state, mamba_d_inner]
+    TensorPtr mambaSsmStates;                 // [layer_count * batch_beam, mamba_d_state, mamba_d_inner] for Mamba
+                                              // [layer_count * batch_beam, rnn_hidden_size] for recurrentgemma
     TensorPtr mambaConvStates;                // [layer_count * batch_beam, mamba_d_conv - 1, mamba_d_inner]
     TensorPtr mambaConvStatesAlt;             // [layer_count * batch_beam, mamba_d_conv - 1, mamba_d_inner]
 
@@ -71,7 +72,7 @@ public:
         BufferManager& manager, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
     void getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers, TensorMap& inputBuffers, TensorMap& outputBuffers,
-        SizeType const step, TensorPtr const& inputIds, TensorPtr const& commPtrs, ModelConfig const& modelConfig,
+        SizeType const step, TensorPtr const& inputIds, ModelConfig const& modelConfig,
         WorldConfig const& worldConfig) const;
 
 protected:
@@ -82,13 +83,15 @@ protected:
 
 private:
     SizeType mDConv = 0;
-    SizeType mDState = 0;
+    SizeType mDState = 0; // only valid for Mamba
     SizeType mDInner = 0;
 
     int mLocalNbLayers = 0;
     int mMaxBeamWidth = 0;
 
     bool mUseMambaConv1dPlugin = true;
+
+    bool mIsRecurrentGemma = false;
 };
 
 } // namespace tensorrt_llm::runtime

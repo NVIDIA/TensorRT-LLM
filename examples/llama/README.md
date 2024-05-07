@@ -8,6 +8,7 @@ This document shows how to build and run a LLaMA model in TensorRT-LLM on both s
   - [Usage](#usage)
     - [Build TensorRT engine(s)](#build-tensorrt-engines)
       - [LLaMA v2 Updates](#llama-v2-updates)
+      - [LLaMA v3 Updates](#llama-v3-updates)
     - [Using RoPE Scaling](#using-rope-scaling)
     - [Long context length](#long-context-length)
       - [INT8 KV cache](#int8-kv-cache)
@@ -66,7 +67,7 @@ TensorRT-LLM LLaMA builds TensorRT engine(s) from HF checkpoint. If no checkpoin
 
 Normally `trtllm-build` only requires single GPU, but if you've already got all the GPUs needed for inference, you could enable parallel building to make the engine building process faster by adding `--workers` argument. Please note that currently `workers` feature only supports single node.
 
-`--use_fused_mlp` enables GEMM horizontal fusion in gated MLP layer, which reduces input traffic and potentially improves performance. For FP8 PTQ, the downside is slight reduction of accuracy because one of the quantization scaling factors are discarded (accuracy 0.45734 vs 0.45755 for LLaMA-v2 7B using ammo/examples/hf/instruct_eval/mmlu.py).
+`--use_fused_mlp` enables GEMM horizontal fusion in gated MLP layer, which reduces input traffic and potentially improves performance. For FP8 PTQ, the downside is slight reduction of accuracy because one of the quantization scaling factors are discarded (accuracy 0.45734 vs 0.45755 for LLaMA-v2 7B using modelopt/examples/hf/instruct_eval/mmlu.py).
 
 Here're some examples:
 
@@ -189,6 +190,69 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_8gpu_tp8 \
 ```
 
 Same instructions can be applied to fine-tuned versions of the LLaMA v2 models (e.g. 7Bf or llama-2-7b-chat).
+
+#### LLaMA v3 Updates
+The LLaMA v3 models with 8B and 70b are compatible with the LLaMA v2 implementation. The above
+commands still work.
+
+Note that the `rope_theta` and `vocab_size` are larger in LLaMA v3 models and these values are now inferred
+or pickup up from the `params.json` when using the `meta_ckpt_dir`.
+
+```bash
+# Build LLaMA v3 8B TP=1 using HF checkpoints directly.
+python convert_checkpoint.py --model_dir ./tmp/llama/8B/hf/ \
+                            --output_dir ./tllm_checkpoint_1gpu_tp1 \
+                            --dtype float16 \
+                            --tp_size 1
+
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_tp1 \
+            --output_dir ./tmp/llama/8B/trt_engines/fp16/1-gpu/ \
+            --gemm_plugin float16 \
+
+# Build LLaMA v3 8B TP=1 using Meta checkpoints directly.
+python convert_checkpoint.py --meta_ckpt_dir ./tmp/llama/8B/ \
+                            --output_dir ./tllm_checkpoint_1gpu_tp1 \
+                            --dtype float16 \
+                            --tp_size 1
+
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_tp1 \
+            --output_dir ./tmp/llama/8B/trt_engines/fp16/1-gpu/ \
+            --gemm_plugin float16 \
+
+# Build LLaMA v3 70B using 8-way tensor parallelism.
+python convert_checkpoint.py --model_dir ./tmp/llama/70B/hf/ \
+                            --output_dir ./tllm_checkpoint_8gpu_tp8 \
+                            --dtype float16 \
+                            --tp_size 8
+
+trtllm-build --checkpoint_dir ./tllm_checkpoint_8gpu_tp8 \
+            --output_dir ./tmp/llama/70B/trt_engines/fp16/8-gpu/ \
+            --gemm_plugin float16
+
+# Build LLaMA v3 70B using 4-way tensor parallelism and 2-way pipeline parallelism.
+python convert_checkpoint.py --model_dir ./tmp/llama/70B/hf/ \
+                            --output_dir ./tllm_checkpoint_8gpu_tp4_pp2 \
+                            --dtype float16 \
+                            --tp_size 4 \
+                            --pp_size 2
+
+trtllm-build --checkpoint_dir ./tllm_checkpoint_8gpu_tp4_pp2 \
+            --output_dir ./tmp/llama/70B/trt_engines/fp16/8-gpu/ \
+            --gemm_plugin float16
+
+# Build LLaMA v3 70B TP=8 using Meta checkpoints directly.
+python convert_checkpoint.py --meta_ckpt_dir ./tmp/llama/70B/ \
+                            --output_dir ./tllm_checkpoint_8gpu_tp8 \
+                            --dtype float16 \
+                            --tp_size 8
+
+trtllm-build --checkpoint_dir ./tllm_checkpoint_8gpu_tp8 \
+            --output_dir ./tmp/llama/70B/trt_engines/fp16/8-gpu/ \
+            --gemm_plugin float16 \
+```
+
+Same instructions can be applied to fine-tuned versions of the LLaMA v2 models (e.g. 7Bf or llama-2-7b-chat).
+
 
 ### Using RoPE Scaling
 RoPE scaling is supported through GPT Attention Plugin. You can add `--rotary_scaling <type> <factor>` during the build command to enable it.
@@ -369,9 +433,9 @@ trtllm-build --checkpoint_dir /tmp/tllm_checkpoint_1gpu_sq \
 
 #### FP8 Post-Training Quantization
 
-The examples below uses the NVIDIA AMMO (AlgorithMic Model Optimization) toolkit for the model quantization process.
+The examples below uses the NVIDIA Modelopt (AlgorithMic Model Optimization) toolkit for the model quantization process.
 
-First make sure AMMO toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
+First make sure Modelopt toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
 
 
 ```bash
@@ -403,7 +467,7 @@ One can enable AWQ/GPTQ INT4 weight only quantization with these options when bu
 - `--use_weight_only` enables weight only GEMMs in the network.
 - `--per_group` enable groupwise weight only quantization, for GPT-J example, we support AWQ with the group size default as 128.
 - `--weight_only_precision` should specify the weight only quantization format. Supported formats are `int4_awq` or `int4_gptq`.
-- `--ammo_quant_ckpt_path` passes the quantized checkpoint to build the engine.
+- `--modelopt_quant_ckpt_path` passes the quantized checkpoint to build the engine.
 
 AWQ/GPTQ examples below involves 2 steps:
 1. Weight quantization
@@ -412,7 +476,7 @@ AWQ/GPTQ examples below involves 2 steps:
 ##### AWQ
 1. Weight quantization:
 
-    NVIDIA AMMO toolkit is used for AWQ weight quantization. Please see [examples/quantization/README.md](/examples/quantization/README.md#preparation) for AMMO installation instructions.
+    NVIDIA Modelopt toolkit is used for AWQ weight quantization. Please see [examples/quantization/README.md](/examples/quantization/README.md#preparation) for Modelopt installation instructions.
 
     ```bash
     # Quantize HF LLaMA 7B checkpoint into INT4 AWQ format
@@ -459,7 +523,7 @@ To run the GPTQ LLaMa example, the following steps are required:
     python convert_checkpoint.py --model_dir /tmp/llama-7b-hf \
                                  --output_dir ./tllm_checkpoint_2gpu_gptq \
                                  --dtype float16 \
-                                 --ammo_quant_ckpt_path ./llama-7b-4bit-gs128.safetensors  \
+                                 --modelopt_quant_ckpt_path ./llama-7b-4bit-gs128.safetensors  \
                                  --use_weight_only \
                                  --weight_only_precision int4_gptq \
                                  --per_group \

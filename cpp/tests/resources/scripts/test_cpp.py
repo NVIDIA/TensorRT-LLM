@@ -98,6 +98,7 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
               run_chatglm=False,
               run_medusa=False,
               run_mamba=False,
+              run_recurrentgemma=False,
               run_encoder=False,
               run_fp8=False,
               only_multi_gpu=False,
@@ -133,6 +134,20 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
                     timeout=300)
         run_command(
             [python_exe, "-m", "pip", "install", "--force-reinstall", "build"],
+            cwd=root_dir,
+            env=_os.environ,
+            timeout=300)
+
+    if run_recurrentgemma:
+        run_command([
+            "git", "clone",
+            "https://github.com/google-deepmind/recurrentgemma.git"
+        ],
+                    cwd=root_dir,
+                    env=_os.environ,
+                    timeout=300)
+        run_command(
+            [python_exe, "-m", "pip", "install", "./recurrentgemma[full]"],
             cwd=root_dir,
             env=_os.environ,
             timeout=300)
@@ -182,6 +197,7 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
                                 run_chatglm=run_chatglm,
                                 run_medusa=run_medusa,
                                 run_mamba=run_mamba,
+                                run_recurrentgemma=run_recurrentgemma,
                                 run_encoder=run_encoder,
                                 run_fp8=run_fp8)
 
@@ -195,6 +211,7 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
                              run_chatglm=run_chatglm,
                              run_medusa=run_medusa,
                              run_mamba=run_mamba,
+                             run_recurrentgemma=run_recurrentgemma,
                              run_encoder=run_encoder,
                              run_fp8=run_fp8,
                              timeout=test_timeout)
@@ -229,6 +246,7 @@ def prepare_all_model_tests(python_exe: str,
                             run_chatglm=False,
                             run_medusa=False,
                             run_mamba=False,
+                            run_recurrentgemma=False,
                             run_encoder=False,
                             run_fp8=False):
     model_cache_arg = ["--model_cache", model_cache] if model_cache else []
@@ -294,6 +312,15 @@ def prepare_all_model_tests(python_exe: str,
                             model_cache_arg=model_cache_arg)
     else:
         _log.info("Skipping Mamba tests")
+
+    if run_recurrentgemma:
+        prepare_model_tests(model_name="recurrentgemma",
+                            python_exe=python_exe,
+                            root_dir=root_dir,
+                            resources_dir=resources_dir,
+                            model_cache_arg=model_cache_arg)
+    else:
+        _log.info("Skipping RecurrentGemma tests")
 
     if run_encoder:
         prepare_model_tests(model_name="enc_dec",
@@ -376,6 +403,7 @@ def run_unit_tests(build_dir: _pl.Path, timeout=1800):
     excluded_tests.append("ChatGlm")
     excluded_tests.append("Medusa")
     excluded_tests.append("Mamba")
+    excluded_tests.append("RecurrentGemma")
     excluded_tests.append("Encoder")
     ctest.extend(["-E", "|".join(excluded_tests)])
     run_command(ctest, cwd=build_dir, env=cpp_env, timeout=timeout)
@@ -388,6 +416,7 @@ def run_single_gpu_tests(build_dir: _pl.Path,
                          run_chatglm,
                          run_medusa,
                          run_mamba,
+                         run_recurrentgemma,
                          run_encoder,
                          run_fp8,
                          timeout=3600):
@@ -412,6 +441,8 @@ def run_single_gpu_tests(build_dir: _pl.Path,
         included_tests.append("Medusa")
     if run_mamba:
         included_tests.append("Mamba")
+    if run_recurrentgemma:
+        included_tests.append("RecurrentGemma")
     if run_encoder:
         included_tests.append("EncoderModelTestSingleGPU")
 
@@ -613,6 +644,9 @@ if __name__ == "__main__":
     parser.add_argument("--run_mamba",
                         action="store_true",
                         help="Run the tests for Mamba")
+    parser.add_argument("--run_recurrentgemma",
+                        action="store_true",
+                        help="Run the tests for RecurrentGemma")
     parser.add_argument("--run_encoder",
                         action="store_true",
                         help="Run the tests for BART encoder")
@@ -637,6 +671,7 @@ if __name__ == "__main__":
         args.run_llama = True
         args.run_chatglm = True
         args.run_mamba = True
+        args.run_recurrentgemma = True
         args.run_encoder = True
 
     del args.run_all_models

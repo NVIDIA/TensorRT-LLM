@@ -11,9 +11,13 @@ from tensorrt_llm.builder import Builder
 # isort: on
 
 from PIL import Image
-from transformers import (AutoProcessor, Blip2ForConditionalGeneration,
-                          Blip2Processor, LlavaForConditionalGeneration,
-                          NougatProcessor, VisionEncoderDecoderModel)
+from torchvision import transforms
+from transformers import (AutoConfig, AutoModelForCausalLM, AutoProcessor,
+                          Blip2ForConditionalGeneration, Blip2Processor,
+                          FuyuForCausalLM, FuyuProcessor,
+                          LlavaForConditionalGeneration, NougatProcessor,
+                          Pix2StructForConditionalGeneration,
+                          VisionEncoderDecoderModel)
 
 
 def parse_arguments():
@@ -23,7 +27,8 @@ def parse_arguments():
                         default=None,
                         choices=[
                             'opt-2.7b', 'opt-6.7b', 'flan-t5-xl', 'flan-t5-xxl',
-                            'llava', 'vila', 'nougat'
+                            'llava', 'vila', 'nougat', 'cogvlm', 'fuyu',
+                            'pix2struct'
                         ],
                         help="Model type")
     parser.add_argument('--model_path',
@@ -62,6 +67,8 @@ class VisionEngineBuilder:
         args = self.args
         if 'opt' in args.model_type or 't5' in args.model_type:
             build_blip2_engine(args)
+        elif args.model_type == 'pix2struct':
+            build_pix2struct_engine(args)
         elif args.model_type == 'llava':
             build_llava_engine(args)
         elif args.model_type == 'vila':
@@ -69,26 +76,37 @@ class VisionEngineBuilder:
             build_vila_engine(args)
         elif args.model_type == 'nougat':
             build_nougat_engine(args)
+        elif args.model_type == 'cogvlm':
+            build_cogvlm_engine(args)
+        elif args.model_type == 'fuyu':
+            build_fuyu_engine(args)
         else:
             raise RuntimeError(f"Invalid model type {args.model_type}")
 
 
-def export_visual_wrapper_onnx(visual_wrapper, image, output_dir):
+def export_visual_wrapper_onnx(visual_wrapper,
+                               input,
+                               output_dir,
+                               input_names=['input'],
+                               dynamic_axes={'input': {
+                                   0: 'batch'
+                               }}):
     logger.log(trt.Logger.INFO, "Exporting onnx")
     os.makedirs(f'{output_dir}/onnx', exist_ok=True)
     torch.onnx.export(visual_wrapper,
-                      image,
+                      input,
                       f'{output_dir}/onnx/visual_encoder.onnx',
                       opset_version=17,
-                      input_names=['input'],
+                      input_names=input_names,
                       output_names=['output'],
-                      dynamic_axes={'input': {
-                          0: 'batch'
-                      }})
+                      dynamic_axes=dynamic_axes)
 
 
-def build_trt_engine(model_type, img_height, img_width, output_dir,
-                     max_batch_size):
+def build_trt_engine(model_type,
+                     input_sizes,
+                     output_dir,
+                     max_batch_size,
+                     dtype=torch.float16):
     part_name = 'visual_encoder'
     onnx_file = '%s/onnx/%s.onnx' % (output_dir, part_name)
     engine_file = '%s/%s.engine' % (output_dir, part_name)
@@ -99,8 +117,9 @@ def build_trt_engine(model_type, img_height, img_width, output_dir,
     network = builder.create_network(
         1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
     profile = builder.create_optimization_profile()
-    config_wrapper = Builder().create_builder_config(precision="float16",
-                                                     model_type=model_type)
+    config_wrapper = Builder().create_builder_config(
+        precision="float16" if dtype == torch.float16 else "bfloat16",
+        model_type=model_type)
     config = config_wrapper.trt_builder_config
 
     parser = trt.OnnxParser(network, logger)
@@ -120,13 +139,31 @@ def build_trt_engine(model_type, img_height, img_width, output_dir,
     nOptBS = max(nMinBS, int(max_batch_size / 2))
     nMaxBS = max_batch_size
 
-    logger.log(trt.Logger.INFO,
-               f"Processed image dims {img_height}x{img_width}")
-    H, W = img_height, img_width
     inputT = network.get_input(0)
-    inputT.shape = [nBS, 3, H, W]
-    profile.set_shape(inputT.name, [nMinBS, 3, H, W], [nOptBS, 3, H, W],
-                      [nMaxBS, 3, H, W])
+
+    # input sizes can be a list of ints (e.g., [3, H, W]) when inputs are images,
+    # or a list of three int lists (e.g., [[1, 1, 2700], [1, 500, 2700], [1, 4096, 2700]]).
+    assert isinstance(input_sizes, list), "input_sizes must be a list"
+    if isinstance(input_sizes[0], int):
+        logger.log(trt.Logger.INFO, f"Processed input sizes {input_sizes}")
+        inputT.shape = [nBS, *input_sizes]
+        min_size = opt_size = max_size = input_sizes
+    elif len(input_sizes) == 3 and isinstance(input_sizes[0], list):
+        min_size, opt_size, max_size = input_sizes
+        logger.log(
+            trt.Logger.INFO,
+            f"Processed min/opt/max input sizes {min_size}/{opt_size}/{max_size}"
+        )
+    else:
+        raise ValueError(f"invalid input sizes: {input_sizes}")
+
+    profile.set_shape(inputT.name, [nMinBS, *min_size], [nOptBS, *opt_size],
+                      [nMaxBS, *max_size])
+    if model_type == "pix2struct":
+        inputT = network.get_input(1)
+        P = input_sizes[0]  # Number of patches
+        inputT.shape = [nBS, P]
+        profile.set_shape(inputT.name, [nMinBS, P], [nOptBS, P], [nMaxBS, P])
     config.add_optimization_profile(profile)
 
     t0 = time()
@@ -176,8 +213,61 @@ def build_blip2_engine(args):
     wrapper.to(args.device)
 
     export_visual_wrapper_onnx(wrapper, image, args.output_dir)
-    build_trt_engine(model_type, image.shape[2], image.shape[3],
-                     args.output_dir, args.max_batch_size)
+    build_trt_engine(
+        model_type,
+        [image.shape[1], image.shape[2], image.shape[3]],  # [3, H, W]
+        args.output_dir,
+        args.max_batch_size)
+
+
+def build_pix2struct_engine(args):
+    processor = AutoProcessor.from_pretrained(args.model_path)
+    raw_image = Image.new('RGB', [10, 10])  # dummy image
+    dtype = torch.float16
+    inputs = processor(text="dummy", images=raw_image, return_tensors="pt")
+    image = inputs['flattened_patches'].to(args.device, dtype)
+    attention_mask = inputs['attention_mask'].to(args.device, torch.int)
+
+    class pix2structVisionWrapper(torch.nn.Module):
+
+        def __init__(self, encoder):
+            super().__init__()
+            self.encoder = encoder
+
+        def forward(self, image, attention_mask):
+            vision_x = self.encoder.embeddings(image)
+            img_features = self.encoder.encoder(vision_x,
+                                                attention_mask=attention_mask)
+            img_features = self.encoder.layernorm(img_features[0])
+            return img_features
+
+    model = Pix2StructForConditionalGeneration.from_pretrained(
+        args.model_path, torch_dtype=dtype)
+
+    wrapper = pix2structVisionWrapper(model.encoder.to(args.device))
+    # input shape: batch size, number of patches, hidden dimension
+    # attention mask shape: batch size, number of patches
+    # The number of image patches can vary depending on the image size, but it typically
+    # falls within a relatively narrow range. To improve performance, we can avoid using
+    # dynamic axis for the input patches and instead use a fixed number of patches along
+    # with an attention mask.
+    export_visual_wrapper_onnx(wrapper, (image, attention_mask),
+                               args.output_dir,
+                               input_names=['input', 'attention_mask'],
+                               dynamic_axes={
+                                   'input': {
+                                       0: 'batch'
+                                   },
+                                   'attention_mask': {
+                                       0: 'batch'
+                                   }
+                               })
+    build_trt_engine(
+        args.model_type,
+        [image.shape[1], image.shape[2]],  # Number of Patches, Hidden Dimension
+        args.output_dir,
+        args.max_batch_size,
+        torch.bfloat16)
 
 
 def build_llava_engine(args):
@@ -208,8 +298,11 @@ def build_llava_engine(args):
                                  model.config.vision_feature_layer)
 
     export_visual_wrapper_onnx(wrapper, image, args.output_dir)
-    build_trt_engine(args.model_type, image.shape[2], image.shape[3],
-                     args.output_dir, args.max_batch_size)
+    build_trt_engine(
+        args.model_type,
+        [image.shape[1], image.shape[2], image.shape[3]],  # [3, H, W]
+        args.output_dir,
+        args.max_batch_size)
 
 
 def build_vila_engine(args):
@@ -244,8 +337,11 @@ def build_vila_engine(args):
         model.get_model().mm_projector.to(args.device))
 
     export_visual_wrapper_onnx(wrapper, image, args.output_dir)
-    build_trt_engine(args.model_type, image.shape[2], image.shape[3],
-                     args.output_dir, args.max_batch_size)
+    build_trt_engine(
+        args.model_type,
+        [image.shape[1], image.shape[2], image.shape[3]],  # [3, H, W]
+        args.output_dir,
+        args.max_batch_size)
 
 
 def build_nougat_engine(args):
@@ -269,8 +365,90 @@ def build_nougat_engine(args):
     wrapper = SwinEncoderWrapper(swin_encoder)
 
     export_visual_wrapper_onnx(wrapper, image, args.output_dir)
-    build_trt_engine(args.model_type, image.shape[2], image.shape[3],
-                     args.output_dir, args.max_batch_size)
+    build_trt_engine(
+        args.model_type,
+        [image.shape[1], image.shape[2], image.shape[3]],  # [3, H, W]
+        args.output_dir,
+        args.max_batch_size)
+
+
+def build_cogvlm_engine(args):
+    raw_image = Image.new('RGB', [10, 10])  # dummy image
+    hf_config = AutoConfig.from_pretrained(args.model_path,
+                                           trust_remote_code=True)
+    image_size = hf_config.vision_config['image_size']
+    dtype = hf_config.torch_dtype
+    transform = transforms.Compose([
+        transforms.Resize((image_size, image_size),
+                          interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.ToTensor(),
+        transforms.Normalize((0.48145466, 0.4578275, 0.40821073),
+                             (0.26862954, 0.26130258, 0.27577711)),
+    ])
+    image = transform(raw_image).unsqueeze(0).to(args.device, dtype)
+
+    class CogVlmVisionWrapper(torch.nn.Module):
+
+        def __init__(self, encoder):
+            super().__init__()
+            self.encoder = encoder
+
+        def forward(self, image):
+            return self.encoder(image)
+
+    cogvlm = AutoModelForCausalLM.from_pretrained(args.model_path,
+                                                  torch_dtype=dtype,
+                                                  trust_remote_code=True)
+    vit_encoder = cogvlm.model.vision.to(args.device).eval()
+
+    wrapper = CogVlmVisionWrapper(vit_encoder)
+    export_visual_wrapper_onnx(wrapper, image, args.output_dir)
+    build_trt_engine(
+        args.model_type,
+        [image.shape[1], image.shape[2], image.shape[3]],  # [3, H, W]
+        args.output_dir,
+        args.max_batch_size,
+        dtype)
+
+
+def build_fuyu_engine(args):
+    processor = FuyuProcessor.from_pretrained(args.model_path)
+    raw_image = Image.new('RGB', [10, 10])
+    image = processor(text="dummy", images=raw_image,
+                      return_tensors="pt")['image_patches'][0].to(
+                          args.device, torch.float16).unsqueeze(0)
+
+    class FuyuEncoderWrapper(torch.nn.Module):
+
+        def __init__(self, linear):
+            super().__init__()
+            self.linear = linear.to(torch.float16)
+
+        def forward(self, patches):
+            return self.linear(patches).flatten(0, 1)
+
+    model = FuyuForCausalLM.from_pretrained(args.model_path,
+                                            torch_dtype=torch.float16)
+
+    vision_encoder = model.vision_embed_tokens
+    wrapper = FuyuEncoderWrapper(vision_encoder).to(args.device)
+
+    export_visual_wrapper_onnx(wrapper,
+                               image,
+                               args.output_dir,
+                               dynamic_axes={'input': {
+                                   0: 'batch',
+                                   2: 'patch'
+                               }})
+    build_trt_engine(
+        args.model_type,
+        # [nImgs, nImgPatches, nDims]
+        # nImgs is always one since each query has exactly one image
+        # nImgPatches depends on image size (patch size: 30x30)
+        # nDims is 30x30x3=2700 (patch size x color channels)
+        [[1, 1, 2700], [1, 500, 2700], [1, 4096, 2700]],
+        args.output_dir,
+        args.max_batch_size)
 
 
 if __name__ == '__main__':
