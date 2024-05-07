@@ -635,9 +635,9 @@ class ModelRunner(ModelRunnerMixin):
                         f"{engine_dir}/{dir}" for dir in config_lora_dir
                     ]
                     lora_ckpt_source = engine.config.build_config.lora_config.lora_ckpt_source
-            runner = ModelRunner.from_engine(engine, lora_dir, rank, debug_mode,
-                                             lora_ckpt_source, medusa_choices,
-                                             stream)
+            runner = cls.from_engine(engine, lora_dir, rank, debug_mode,
+                                     lora_ckpt_source, medusa_choices,
+                                     stream)
             profiler.stop('load tensorrt_llm engine')
             loading_time = profiler.elapsed_time_in_sec(
                 "load tensorrt_llm engine")
