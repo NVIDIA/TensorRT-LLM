@@ -37,6 +37,7 @@ option(WARNING_IS_ERROR "Treat all warnings as errors" OFF)
 option(FAST_BUILD "Skip compiling some kernels to accelerate compiling" OFF)
 option(FAST_MATH "Compiling in fast math mode" OFF)
 option(INDEX_RANGE_CHECK "Compiling with index range checks" OFF)
+option(USE_SHARED_NVRTC "Use shared NVRTC library instead of static" OFF)
 
 if(NVTX_DISABLE)
   add_compile_definitions("NVTX_DISABLE")
@@ -73,6 +74,23 @@ if(BUILD_EXECUTOR)
   message(STATUS "Building executor")
 else()
   message(STATUS "Importing executor")
+endif()
+
+if(EXISTS
+   "${CMAKE_CURRENT_SOURCE_DIR}/tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/CMakeLists.txt"
+)
+  set(BUILD_NVRTC_WRAPPER_DEFAULT ON)
+else()
+  set(BUILD_NVRTC_WRAPPER_DEFAULT OFF)
+endif()
+
+option(BUILD_NVRTC_WRAPPER "Build nvrtc wrapper from source"
+       ${BUILD_NVRTC_WRAPPER_DEFAULT})
+
+if(BUILD_NVRTC_WRAPPER)
+  message(STATUS "Building nvrtc wrapper")
+else()
+  message(STATUS "Importing nvrtc wrapper")
 endif()
 
 if(BUILD_PYT)
@@ -172,6 +190,41 @@ message(STATUS "    include path: ${CUDAToolkit_INCLUDE_DIRS}")
 # pick up on the includes
 set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES 0)
 
+if(USE_SHARED_NVRTC)
+  if(WIN32)
+    message(FATAL_ERROR "Cannot use NVRTC shared library on Windows.")
+  else()
+    find_library(
+      NVRTC_LIB nvrtc
+      HINTS ${CUDAToolkit_LIBRARY_DIR}
+      PATH_SUFFIXES lib64 lib lib/x64)
+    find_library(
+      NVRTC_BUILTINS_LIB nvrtc-builtins
+      HINTS ${CUDAToolkit_LIBRARY_DIR}
+      PATH_SUFFIXES lib64 lib lib/x64)
+  endif()
+else()
+  if(WIN32)
+    find_library(
+      NVRTC_LIB nvrtc
+      HINTS ${CUDAToolkit_LIBRARY_DIR}
+      PATH_SUFFIXES lib64 lib lib/x64)
+  else()
+    find_library(
+      NVRTC_LIB nvrtc_static
+      HINTS ${CUDAToolkit_LIBRARY_DIR}
+      PATH_SUFFIXES lib64 lib lib/x64)
+    find_library(
+      NVRTC_BUILTINS_LIB nvrtc-builtins_static
+      HINTS ${CUDAToolkit_LIBRARY_DIR}
+      PATH_SUFFIXES lib64 lib lib/x64)
+    find_library(
+      NVPTXCOMPILER_LIB nvptxcompiler_static
+      HINTS ${CUDAToolkit_LIBRARY_DIR}
+      PATH_SUFFIXES lib64 lib lib/x64)
+  endif()
+endif()
+
 set(CUBLAS_LIB CUDA::cublas)
 set(CUBLASLT_LIB CUDA::cublasLt)
 set(CUDA_DRV_LIB CUDA::cuda_driver)
@@ -204,7 +257,15 @@ include_directories(
 set_ifndef(TRT_LIB_DIR ${CMAKE_BINARY_DIR})
 set_ifndef(TRT_INCLUDE_DIR /usr/include/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu)
 set(TRT_LIB nvinfer)
-find_library_create_target(${TRT_LIB} nvinfer SHARED ${TRT_LIB_DIR})
+
+# On Windows major version is appended to nvinfer libs.
+if(WIN32)
+  set(TRT_LIB_NAME nvinfer_10)
+else()
+  set(TRT_LIB_NAME nvinfer)
+endif()
+
+find_library_create_target(${TRT_LIB} ${TRT_LIB_NAME} SHARED ${TRT_LIB_DIR})
 
 if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "11")
   add_definitions("-DENABLE_BF16")

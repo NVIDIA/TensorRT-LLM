@@ -59,8 +59,8 @@ def build_engines(model_cache: typing.Optional[str] = None,
                   world_size: int = 1):
 
     for model_name in ["chatglm-6b", "chatglm2-6b", "chatglm3-6b"]:
-        model_cache_dir = Path(model_cache) / model_name
-        if model_cache_dir.is_dir():
+        if model_cache and (Path(model_cache) / model_name).is_dir():
+            model_cache_dir = Path(model_cache) / model_name
             if bCopyModel or model_name == "chatglm-6b":
                 print("Copy model from model_cache")
                 hf_dir = model_dir / model_name

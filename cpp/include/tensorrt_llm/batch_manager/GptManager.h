@@ -78,6 +78,10 @@ public:
 
     virtual ~GptManager();
 
+    void setLayerProfiler();
+
+    [[nodiscard]] std::string getLayerProfileInfo() const;
+
 protected:
     /* Synchronizes the decoder */
     virtual BatchManagerErrorCode_t forwardSync();
@@ -91,6 +95,7 @@ private:
     [[nodiscard]] SizeType getMaxInputLen() const;
     [[nodiscard]] SizeType getMaxSequenceLen() const;
     [[nodiscard]] SizeType getMaxNumSequences() const;
+    [[nodiscard]] SizeType getMaxDraftLen() const;
 
     void validateLlmRequest(
         LlmRequest& newReq, runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig) const;

@@ -1104,7 +1104,7 @@ def quantize(dtype,
     '''
         Quantize the save the model as TRT-LLM checkpoint to output_dir
     '''
-    #TODO: currently only smooth quant and kv cache quantization are supported, needs to support mode quant algorithm calling ammo
+    #TODO: currently only smooth quant and kv cache quantization are supported, needs to support mode quant algorithm calling modelopt
     config = create_config_from_hugging_face(model_dir,
                                              dtype,
                                              mapping,

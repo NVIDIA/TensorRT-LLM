@@ -61,7 +61,7 @@ def generate_output(
         str(max_output_len),
         '--num_beams',
         str(num_beams),
-        #'--use_py_session',
+        '--use_py_session',
     ]
 
     output_logits_npy = None

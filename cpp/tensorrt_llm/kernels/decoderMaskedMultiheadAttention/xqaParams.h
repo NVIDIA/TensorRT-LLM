@@ -44,11 +44,11 @@ struct XQAParams
     int32_t sink_token_length = 0;
     int timestep = 0;
     void const* qkv_bias;
-    int32_t const* sequence_lengths;    //
-    int32_t const* context_lengths;     // maybe not used now
-    void const* alibi_slopes;           // maybe not used now
-    int32_t const* medusa_packed_mask;
-    int const* medusa_position_offsets; // rotary embedding.
+    int32_t const* sequence_lengths;           //
+    int32_t const* context_lengths;            // maybe not used now
+    void const* alibi_slopes;                  // maybe not used now
+    int32_t const* spec_decoding_packed_mask;
+    int const* spec_decoding_position_offsets; // rotary embedding.
 
     // almost copy from GPTAttentionPluginCommon.
     // maybe use one struct for parameters in GPTAttentionPluginCommon and share the same here.

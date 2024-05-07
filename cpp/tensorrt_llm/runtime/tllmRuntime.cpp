@@ -228,3 +228,29 @@ CudaStream const& TllmRuntime::getStream() const
 {
     return *mStream;
 }
+
+bool TllmRuntime::hasLayerProfiler(SizeType contextId) const
+{
+    return mContexts[contextId]->getProfiler() != nullptr;
+}
+
+void TllmRuntime::setLayerProfiler()
+{
+    mLayerProfiler.reset(new LayerProfiler);
+    for (auto& context : mContexts)
+    {
+        context->setProfiler(mLayerProfiler.get());
+        context->setEnqueueEmitsProfile(false);
+    }
+}
+
+std::string TllmRuntime::getLayerProfileInfo() const
+{
+    TLLM_CHECK(mLayerProfiler);
+    return mLayerProfiler->getLayerProfile();
+}
+
+void TllmRuntime::reportToProfiler(SizeType contextId)
+{
+    mContexts[contextId]->reportToProfiler();
+}

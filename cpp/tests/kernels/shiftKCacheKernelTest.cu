@@ -100,7 +100,7 @@ __global__ void applyRoPE(KVCacheBuffer kCacheRead, KVLinearBuffer kCacheWrite, 
     case PositionEmbeddingType::kROPE_GPTJ:
     {
         mmha::apply_rotary_embedding(
-            k, tidx, rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale, token_pos_idx);
+            k, tidx, rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale, 0, nullptr, token_pos_idx);
         break;
     }
     case PositionEmbeddingType::kROPE_GPT_NEOX:
@@ -127,7 +127,7 @@ __global__ void applyRoPE(KVCacheBuffer kCacheRead, KVLinearBuffer kCacheWrite, 
         {
             mmha::vec_from_smem_transpose(k, k_smem, transpose_idx, smem_pitch);
             mmha::apply_rotary_embedding(k, transpose_idx / tidx_factor, rotary_embedding_dim, rotary_embedding_base,
-                rotary_embedding_scale, token_pos_idx);
+                rotary_embedding_scale, 0, nullptr, token_pos_idx);
             mmha::write_smem_transpose(k, k_smem, transpose_idx, smem_pitch);
         }
 

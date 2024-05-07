@@ -77,6 +77,10 @@ def get_qkv_module_name(model_type):
         q = "q_proj"
         k = "k_proj"
         v = "v_proj"
+    elif model_type == "pix2struct":
+        q = "query"
+        k = "key"
+        v = "value"
     return {"q": q, "k": k, "v": v}
 
 

@@ -61,7 +61,7 @@ namespace utils
 std::vector<uint8_t> loadEngine(std::string const& enginePath);
 }
 
-class IpcMemory;
+class AllReduceBuffers;
 class IStatefulGptDecoder;
 class NcclCommunicator;
 class RuntimeBuffers;
@@ -229,6 +229,12 @@ public:
     void generate(GenerationOutput& outputs, GenerationInput const& inputs, SamplingConfig const& samplingConfig,
         std::shared_ptr<GenerationProfiler> const generationProfiler = nullptr);
 
+    //! @brief Set LayerProfiler to collect performance per layer.
+    void setLayerProfiler();
+
+    //! @brief Print profile information per layer.
+    [[nodiscard]] std::string getLayerProfileInfo() const;
+
 private:
     [[nodiscard]] bool useCudaGraphs()
     {
@@ -349,9 +355,7 @@ private:
     std::shared_ptr<CudaStream> mCommStream;
     CudaEvent mCommEvent{};
 
-    // tensor parallelism with custom allreduce plugin
-    ITensor::SharedPtr mCommPtrs;
-    std::vector<std::shared_ptr<IpcMemory>> mIpcMemoryHandles;
+    std::shared_ptr<AllReduceBuffers> mAllReduceBuffers;
 
     SizeType mDecoderMaxSequenceLength{};
     SizeType mDecoderMaxAttentionWindow{};

@@ -16,30 +16,32 @@
  */
 #pragma once
 
+#include "pluginUtils.h"
+#include "tensorrt_llm/common/logger.h"
+
+#include <cuda_runtime.h>
+
 #include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <sstream>
 #include <unordered_map>
 #include <vector>
-
-#include <cuda_runtime.h>
-
-#include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/plugins/common/plugin.h"
 
 namespace tensorrt_llm::plugins
 {
 
 struct GemmDims
 {
-    int32_t minM;
-    int32_t maxM;
-    int32_t n;
-    int32_t k;
+    using DimType = utils::DimType;
+
+    DimType minM;
+    DimType maxM;
+    DimType n;
+    DimType k;
 
     GemmDims()
         : minM(-1)
@@ -49,7 +51,7 @@ struct GemmDims
     {
     }
 
-    GemmDims(int32_t minM_, int32_t maxM_, int32_t n_, int32_t k_)
+    GemmDims(DimType minM_, DimType maxM_, DimType n_, DimType k_)
         : minM(minM_)
         , maxM(maxM_)
         , n(n_)
@@ -57,7 +59,7 @@ struct GemmDims
     {
     }
 
-    bool isInitialized() const
+    [[nodiscard]] bool isInitialized() const
     {
         return minM >= 0 && maxM >= 0 && n >= 0 && k >= 0;
     }

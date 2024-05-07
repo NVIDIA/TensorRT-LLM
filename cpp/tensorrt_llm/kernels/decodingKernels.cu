@@ -508,12 +508,12 @@ __global__ void copyNextStepIds(TokenIdType* nextStepIds, TokenIdType const* con
         auto const newTokens = numNewTokens == nullptr ? 1 : numNewTokens[batchSlot];
         auto const batchBeamIdx = batchSlot * beamWidth + beamIdx;
         auto const tokenBatchBeamIdx = tokenIdx * maxBatchSize * beamWidth + batchSlot * beamWidth + beamIdx;
-        if (tokenIdx >= newTokens)
+        auto const index_src = beamIdx * maxSeqLen + sequenceLengths[batchBeamIdx] - newTokens + tokenIdx;
+        if (tokenIdx >= newTokens || index_src < 0)
         {
             continue;
         }
-        nextStepIds[tokenBatchBeamIdx]
-            = outputIdsPtr[batchSlot][beamIdx * maxSeqLen + sequenceLengths[batchBeamIdx] - newTokens + tokenIdx];
+        nextStepIds[tokenBatchBeamIdx] = outputIdsPtr[batchSlot][index_src];
     }
 }
 

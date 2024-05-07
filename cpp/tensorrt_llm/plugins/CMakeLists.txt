@@ -47,7 +47,8 @@ set(PLUGIN_LISTS
     mixtureOfExperts
     selectiveScanPlugin
     mambaConv1dPlugin
-    lruPlugin)
+    lruPlugin
+    cumsumLastDimPlugin)
 
 foreach(PLUGIN_ITER ${PLUGIN_LISTS})
   include_directories(${PLUGIN_ITER})

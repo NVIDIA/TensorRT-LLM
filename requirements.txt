@@ -1,9 +1,10 @@
 --extra-index-url https://pypi.nvidia.com
-accelerate==0.25.0
+--extra-index-url https://gitlab-master.nvidia.com/api/v4/projects/95421/packages/pypi/simple
+accelerate>=0.25.0
 build
 colored
 cuda-python # Do not override the custom version of cuda-python installed in the NGC PyTorch image.
-diffusers==0.27.0
+diffusers>=0.27.0
 lark
 mpi4py
 numpy<2
@@ -16,17 +17,14 @@ pandas
 h5py==3.10.0
 StrEnum
 sentencepiece>=0.1.99
-# WAR the new posting of "nvidia-cudnn-cu12~=9.0".
-# "tensorrt==9.3.0.post12.dev1" specifies "nvidia-cudnn-cu12" but actually requires "nvidia-cudnn-cu12~=8.9".
-nvidia-cudnn-cu12~=8.9; platform_machine == "x86_64"
-tensorrt==9.3.0.post12.dev1
-# https://github.com/pytorch/pytorch/blob/v2.2.1/version.txt still uses 2.2.0a0.
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-02.html#rel-24-02 uses 2.3.0a0.
+tensorrt==10.0.1
+# https://github.com/pytorch/pytorch/blob/v2.2.2/version.txt still uses 2.2.0a0.
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-03.html#rel-24-03 uses 2.3.0a0.
 torch>=2.2.0a,<=2.3.0a
-nvidia-ammo==0.9.3
-transformers==4.38.2
+nvidia-modelopt~=0.11
+transformers>=4.38.2
 wheel
 optimum
 evaluate
 janus
-mpmath==1.3.0
+mpmath>=1.3.0

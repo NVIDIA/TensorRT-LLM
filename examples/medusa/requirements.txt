@@ -1,5 +1,5 @@
 --extra-index-url https://pypi.nvidia.com
-tensorrt_llm==0.10.0.dev2024043000
+tensorrt_llm==0.10.0.dev2024050700
 datasets~=2.14.5
 rouge_score~=0.1.2
 sentencepiece~=0.1.99

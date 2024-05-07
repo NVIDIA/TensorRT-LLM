@@ -21,8 +21,14 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(googletest)
 include(GoogleTest)
 
-find_library_create_target(nvonnxparser nvonnxparser SHARED ${TRT_OUT_DIR}
-                           ${TRT_LIB_DIR})
+# On Windows major version is appended to nvinfer libs.
+if(WIN32)
+  set(ONNX_PARSER_LIB_NAME nvonnxparser_10)
+else()
+  set(ONNX_PARSER_LIB_NAME nvonnxparser)
+endif()
+find_library_create_target(nvonnxparser ${ONNX_PARSER_LIB_NAME} SHARED
+                           ${TRT_OUT_DIR} ${TRT_LIB_DIR})
 
 include_directories(
   ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/include
@@ -103,6 +109,7 @@ set(SAMPLING_LAYER_TEST_SRC
 add_gtest(samplingLayerTest "${SAMPLING_LAYER_TEST_SRC}")
 add_gtest(dynamicDecodeLayerTest layers/dynamicDecodeLayerTest.cpp)
 add_gtest(medusaDecodeLayerTest layers/medusaDecodeLayerTest.cpp)
+add_gtest(lookaheadPoolManagerTest layers/lookaheadPoolManagerTest.cpp)
 
 if(BUILD_BATCH_MANAGER)
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/batch_manager)

@@ -23,11 +23,14 @@
 #include "tensorrt_llm/runtime/loraUtils.h"
 #include "tensorrt_llm/runtime/utils/numpyUtils.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
-#include <NvInferRuntimeBase.h>
-#include <filesystem>
+
+#include <NvInferRuntime.h>
+
 #include <gmock/gmock-matchers.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+
+#include <filesystem>
 #include <memory>
 
 namespace fs = std::filesystem;

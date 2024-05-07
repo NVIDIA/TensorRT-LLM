@@ -23,11 +23,8 @@ namespace tensorrt_llm::utils::customAllReduceUtils
 
 constexpr size_t NUM_POINTERS_PER_RANK = 4;
 
-namespace
-{
-
 // WARNING: MUST BE KEPT IN SYNC with tensorrt_llm/plugin/plugin.py
-size_t getMaxRequiredWorkspaceSize(int worldSize) noexcept
+inline size_t getMaxRequiredWorkspaceSize(int worldSize) noexcept
 {
     if (worldSize <= 2)
     {
@@ -35,6 +32,5 @@ size_t getMaxRequiredWorkspaceSize(int worldSize) noexcept
     }
     return 8 * 1000 * 1000;
 }
-} // namespace
 
 } // namespace tensorrt_llm::utils::customAllReduceUtils

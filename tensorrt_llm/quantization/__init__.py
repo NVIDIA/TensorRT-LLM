@@ -14,7 +14,7 @@
 # limitations under the License.
 from .mode import (KV_CACHE_QUANT_ALGO_LIST, QUANT_ALGO_LIST,
                    W8A8_SQ_PLUGIN_LIST, QuantAlgo, QuantMode)
-from .quantize_by_ammo import quantize_and_export
+from .quantize_by_modelopt import quantize_and_export
 
 __all__ = [
     'QUANT_ALGO_LIST',

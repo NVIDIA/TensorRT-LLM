@@ -19,7 +19,9 @@
 
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
-#include <NvInferRuntimeBase.h>
+
+#include <NvInferRuntime.h>
+
 #include <ostream>
 #include <sstream>
 #include <type_traits>

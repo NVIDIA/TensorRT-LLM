@@ -68,7 +68,11 @@ struct FusedQKVMaskedAttentionDispatchParams
     float rotary_embedding_base;
     RotaryScalingType rotary_embedding_scale_type;
     float rotary_embedding_scale;
+    float rotary_embedding_m_scale;
+    float const* rotary_embedding_scaling_factors;
     int rotary_embedding_max_positions;
+    int rotary_cogvlm_vision_start;
+    int rotary_cogvlm_vision_length;
     PositionEmbeddingType position_embedding_type;
     bool position_shift_enabled;
     int max_attention_window;
@@ -179,7 +183,7 @@ bool GPTAttentionPluginCommon::convertMMHAParamsToXQAParams(tensorrt_llm::kernel
     xqaParams.max_distance = mMaxDistance;
     xqaParams.multi_block_mode = mMultiBlockMode;
     // Medusa mode will have multiple query tokens.
-    xqaParams.multi_query_tokens = mIsMedusaEnabled;
+    xqaParams.multi_query_tokens = mIsSpecDecodingEnabled;
 
     if (mKVCacheQuantMode.hasInt8KvCache())
     {
@@ -209,7 +213,7 @@ bool GPTAttentionPluginCommon::convertMMHAParamsToXQAParams(tensorrt_llm::kernel
     xqaParams.workspaces = generationsParams.workspace;
     xqaParams.batch_size = generationsParams.num_requests;
     xqaParams.beam_width = generationsParams.beam_width;
-    // Medusa mode has generation input_length > 1.
+    // Speculative decoding mode has generation input_length > 1.
     xqaParams.generation_input_length = generationsParams.input_seq_length;
     xqaParams.max_attention_window_size = generationsParams.max_attention_window;
     xqaParams.cyclic_attention_window_size = generationsParams.cyclic_attention_window_size;
@@ -222,12 +226,12 @@ bool GPTAttentionPluginCommon::convertMMHAParamsToXQAParams(tensorrt_llm::kernel
     xqaParams.alibi_slopes = generationsParams.alibi_slopes;
     if (!forConfigurePlugin)
     {
-        // Medusa (need to take new generated ids into consideration).
-        TLLM_CHECK_WITH_INFO(!mIsMedusaEnabled || generationsParams.medusa_packed_mask != nullptr,
-            "Medusa mode needs a valid packed_mask input tensor.");
+        // Speculative decoding (need to take new generated ids into consideration).
+        TLLM_CHECK_WITH_INFO(!mIsSpecDecodingEnabled || generationsParams.spec_decoding_packed_mask != nullptr,
+            "Speculative decoding mode needs a valid packed_mask input tensor.");
     }
-    xqaParams.medusa_packed_mask = generationsParams.medusa_packed_mask;
-    xqaParams.medusa_position_offsets = generationsParams.medusa_position_offsets;
+    xqaParams.spec_decoding_packed_mask = generationsParams.spec_decoding_packed_mask;
+    xqaParams.spec_decoding_position_offsets = generationsParams.spec_decoding_position_offsets;
     return true;
 }
 
@@ -290,7 +294,11 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
     params.rotary_embedding_base = input_params.rotary_embedding_base;
     params.rotary_embedding_scale_type = input_params.rotary_embedding_scale_type;
     params.rotary_embedding_scale = input_params.rotary_embedding_scale;
+    params.rotary_embedding_m_scale = input_params.rotary_embedding_m_scale;
+    params.rotary_embedding_scaling_factors = input_params.rotary_embedding_scaling_factors;
     params.rotary_embedding_max_positions = input_params.rotary_embedding_max_positions;
+    params.rotary_cogvlm_vision_start = input_params.rotary_cogvlm_vision_start;
+    params.rotary_cogvlm_vision_length = input_params.rotary_cogvlm_vision_length;
     params.position_embedding_type = input_params.position_embedding_type;
     params.position_shift_enabled = input_params.position_shift_enabled;
     // Note: keep norm factor (sqrt(K_dim)) when adopting megatron T5 structure (may adjust)
@@ -358,19 +366,23 @@ INSTANTIATE_MMHA_DISPATCH(__nv_bfloat16, __nv_bfloat16)
 #endif
 #undef INSTANTIATE_MMHA_DISPATCH
 
-GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads, int num_kv_heads, int head_size,
-    int unidirectional, float q_scaling, tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
+GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads, int vision_start, int vision_length,
+    int num_kv_heads, int head_size, int unidirectional, float q_scaling,
+    tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
     int rotary_embedding_dim, // for RoPE. Use 0 for non-RoPE
     float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
-    float rotary_embedding_scale, int rotary_embedding_max_positions, int tp_size, int tp_rank, // for ALiBi
-    bool unfuse_qkv_gemm,                                                                       // for AutoPP
+    float rotary_embedding_scale, float rotary_embedding_m_scale, int rotary_embedding_max_positions, int tp_size,
+    int tp_rank,          // for ALiBi
+    bool unfuse_qkv_gemm, // for AutoPP
     tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool multi_block_mode, bool enable_xqa,
     int kv_cache_quant_mode, bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type,
     bool paged_kv_cache, int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length,
     bool qkv_bias_enabled, bool cross_attention, int max_distance, bool pos_shift_enabled, bool dense_context_fmha,
-    bool use_paged_context_fmha, bool use_fp8_context_fmha, bool use_cache, bool is_medusa_enabled)
+    bool use_paged_context_fmha, bool use_fp8_context_fmha, bool use_cache, bool is_spec_decoding_enabled)
     : mLayerIdx(layer_idx)
     , mNumHeads(num_heads)
+    , mVisionStart(vision_start)
+    , mVisionLength(vision_length)
     , mNumKVHeads(num_kv_heads)
     , mHeadSize(head_size)
     , mUnidirectional(unidirectional)
@@ -379,6 +391,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads,
     , mRotaryEmbeddingBase(rotary_embedding_base)
     , mRotaryEmbeddingScaleType(rotary_embedding_scale_type)
     , mRotaryEmbeddingScale(rotary_embedding_scale)
+    , mRotaryEmbeddingMscale(rotary_embedding_m_scale)
     , mRotaryEmbeddingMaxPositions(rotary_embedding_max_positions)
     , mPositionEmbeddingType(position_embedding_type)
     , mEnableContextFMHA(context_fmha_type != ContextFMHAType::DISABLED)
@@ -404,7 +417,8 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads,
     , mPagedContextFMHA(use_paged_context_fmha)
     , mFP8ContextFMHA(use_fp8_context_fmha)
     , mUseKVCache(use_cache)
-    , mIsMedusaEnabled(is_medusa_enabled)
+    , mIsSpecDecodingEnabled(is_spec_decoding_enabled)
+    , mDriver(CUDADriverWrapper::getInstance())
 {
     // Pre-check whether FMHA is supported in order to save memory allocation.
     if (mEnableContextFMHA)
@@ -473,12 +487,15 @@ int const GPTAttentionPluginCommon::getHeadSize(bool checkInit) const
 
 // Parameterized constructor
 GPTAttentionPluginCommon::GPTAttentionPluginCommon(void const* data, size_t length)
+    : mDriver(CUDADriverWrapper::getInstance())
 {
     char const *d = reinterpret_cast<char const*>(data), *a = d;
     unsigned int kvCacheQuantMode;
 
     read(d, mLayerIdx);
     read(d, mNumHeads);
+    read(d, mVisionStart);
+    read(d, mVisionLength);
     read(d, mNumKVHeads);
     read(d, mHeadSize);
     read(d, mUnidirectional);
@@ -488,6 +505,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(void const* data, size_t leng
     read(d, mRotaryEmbeddingBase);
     read(d, mRotaryEmbeddingScaleType);
     read(d, mRotaryEmbeddingScale);
+    read(d, mRotaryEmbeddingMscale);
     read(d, mRotaryEmbeddingMaxPositions);
     read(d, mTpSize);
     read(d, mTpRank);
@@ -511,10 +529,15 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(void const* data, size_t leng
     read(d, mPagedContextFMHA);
     read(d, mFP8ContextFMHA);
     read(d, mUseKVCache);
-    read(d, mIsMedusaEnabled);
+    read(d, mIsSpecDecodingEnabled);
     read(d, mNbMultiBlockSemaphores);
 
     mKVCacheQuantMode = tc::QuantMode(kvCacheQuantMode);
+
+    uint32_t decoderXQARunnerResourceSerializedSize;
+    read(d, decoderXQARunnerResourceSerializedSize);
+    mDecoderXQARunnerResource = DecoderXQARunner::Resource(d, decoderXQARunnerResourceSerializedSize);
+    d += decoderXQARunnerResourceSerializedSize;
 
     TLLM_CHECK_WITH_INFO(d == a + length,
         "Expected length (%d) != real length (%d). This is often "
@@ -860,7 +883,7 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
             params.sink_token_length, params.num_tokens, mNumHeads, mNumKVHeads, mNumHeads / mNumKVHeads, getHeadSize(),
             mRotaryEmbeddingDim, mRotaryEmbeddingBase, mRotaryEmbeddingScaleType, mRotaryEmbeddingScale,
             mRotaryEmbeddingMaxPositions, position_embedding_type, mPosShiftEnabled, cache_type,
-            enablePagedKVContextFMHA, mFP8ContextFMHA, mMultiProcessorCount};
+            enablePagedKVContextFMHA, mFP8ContextFMHA, mMultiProcessorCount, mVisionStart, mVisionLength};
 
         invokeQKVPreprocessing(preprocessingParms, stream);
 
@@ -1247,9 +1270,9 @@ int GPTAttentionPluginCommon::enqueueGeneration(
             mDecoderXQARunner->template dispatch<KVCacheBuffer>(xqaParams, kv_cache_buffer, stream);
             return 0;
         }
-        else if (mIsMedusaEnabled)
+        else if (mIsSpecDecodingEnabled)
         {
-            TLLM_CHECK_WITH_INFO(false, "No available XQA kernels are found for medusa mode.");
+            TLLM_CHECK_WITH_INFO(false, "No available XQA kernels are found for speculative decoding mode.");
         }
     }
 
@@ -1367,8 +1390,12 @@ int GPTAttentionPluginCommon::enqueueGeneration(
     dispatch_params.rotary_embedding_base = mRotaryEmbeddingBase;
     dispatch_params.rotary_embedding_scale_type = mRotaryEmbeddingScaleType;
     dispatch_params.rotary_embedding_scale = mRotaryEmbeddingScale;
+    dispatch_params.rotary_embedding_m_scale = mRotaryEmbeddingMscale;
+    dispatch_params.rotary_embedding_scaling_factors = params.rotary_embedding_scaling_factors;
     dispatch_params.rotary_embedding_max_positions = mRotaryEmbeddingMaxPositions;
     dispatch_params.position_shift_enabled = mPosShiftEnabled;
+    dispatch_params.rotary_cogvlm_vision_start = mVisionStart;
+    dispatch_params.rotary_cogvlm_vision_length = mVisionLength;
     dispatch_params.cross_attention = mCrossAttention;
     dispatch_params.memory_length_per_sample = params.encoder_input_lengths;
 
@@ -1487,7 +1514,7 @@ int GPTAttentionPluginCommon::initialize() noexcept
         mFMHARunner->setup_flags(mFMHAForceFP32Acc, !mRemovePadding, true, mNumKVHeads);
     }
 
-    bool useXQAKernels = (mEnableXQA || mIsMedusaEnabled) && !mCrossAttention
+    bool useXQAKernels = (mEnableXQA || mIsSpecDecodingEnabled) && !mCrossAttention
         && (mType == nvinfer1::DataType::kHALF || mType == nvinfer1::DataType::kBF16);
 
     if (useXQAKernels)
@@ -1502,22 +1529,22 @@ int GPTAttentionPluginCommon::initialize() noexcept
             xqa_runner_data_type = DATA_TYPE_BF16;
         }
         TLLM_LOG_DEBUG("Enabling XQA kernels for GPTAttention.");
-        if (mIsMedusaEnabled)
+        if (mIsSpecDecodingEnabled)
         {
             TLLM_CHECK_WITH_INFO(mNumHeads % mNumKVHeads == 0, "mNumHeads should be multiples of mNumKVHeads.");
             int numQHeadsPerKV = mNumHeads / mNumKVHeads;
             bool isPowerOfTwo = ((numQHeadsPerKV & (numQHeadsPerKV - 1)) == 0);
             TLLM_CHECK_WITH_INFO(isPowerOfTwo,
-                "numQHeadsPerKV should be power of 2 for Medusa, mNumHeads=%d, mNumKVHeads=%d.", mNumHeads,
-                mNumKVHeads);
+                "numQHeadsPerKV should be power of 2 for Speculative decoding, mNumHeads=%d, mNumKVHeads=%d.",
+                mNumHeads, mNumKVHeads);
         }
 
-        mDecoderXQARunner.reset(
-            new DecoderXQARunner(xqa_runner_data_type, mNumHeads, mNumKVHeads, mHeadSize, mMultiBlockMode));
+        mDecoderXQARunner.reset(new DecoderXQARunner(
+            &mDecoderXQARunnerResource, xqa_runner_data_type, mNumHeads, mNumKVHeads, mHeadSize, mMultiBlockMode));
     }
-    else if (mIsMedusaEnabled)
+    else if (mIsSpecDecodingEnabled)
     {
-        TLLM_CHECK_WITH_INFO(false, "Medusa mode doesn't support the data type or cross attention.");
+        TLLM_CHECK_WITH_INFO(false, "Speculative decoding mode doesn't support the data type or cross attention.");
     }
 
     if (mNbMultiBlockSemaphores != 0)
@@ -1533,18 +1560,20 @@ void GPTAttentionPluginCommon::destroy() noexcept
     delete this;
 }
 
-size_t GPTAttentionPluginCommon::getCommonSerializationSize() noexcept
+size_t GPTAttentionPluginCommon::getCommonSerializationSize() const noexcept
 {
-    return sizeof(mLayerIdx) + sizeof(mNumHeads) + sizeof(mNumKVHeads) + sizeof(mHeadSize) + sizeof(mUnidirectional)
-        + sizeof(mQScaling) + sizeof(mPositionEmbeddingType) + sizeof(mRotaryEmbeddingDim)
-        + sizeof(mRotaryEmbeddingBase) + sizeof(mRotaryEmbeddingScaleType) + sizeof(mRotaryEmbeddingScale)
-        + sizeof(mRotaryEmbeddingMaxPositions) + sizeof(mTpSize) + sizeof(mTpRank) + sizeof(mEnableContextFMHA)
-        + sizeof(mFMHAForceFP32Acc) + sizeof(mMultiBlockMode) + sizeof(mEnableXQA)
-        + sizeof(unsigned int) // mKVCacheQuantMode
+    return sizeof(mLayerIdx) + sizeof(mNumHeads) + +sizeof(mVisionStart) + sizeof(mVisionLength) + sizeof(mNumKVHeads)
+        + sizeof(mHeadSize) + sizeof(mUnidirectional) + sizeof(mQScaling) + sizeof(mPositionEmbeddingType)
+        + sizeof(mRotaryEmbeddingDim) + sizeof(mRotaryEmbeddingBase) + sizeof(mRotaryEmbeddingScaleType)
+        + sizeof(mRotaryEmbeddingScale) + sizeof(mRotaryEmbeddingMscale) + sizeof(mRotaryEmbeddingMaxPositions)
+        + sizeof(mTpSize) + sizeof(mTpRank) + sizeof(mEnableContextFMHA) + sizeof(mFMHAForceFP32Acc)
+        + sizeof(mMultiBlockMode) + sizeof(mEnableXQA) + sizeof(unsigned int) // mKVCacheQuantMode
         + sizeof(mRemovePadding) + sizeof(mMaskType) + sizeof(mPagedKVCache) + sizeof(mTokensPerBlock) + sizeof(mType)
         + sizeof(mMaxContextLength) + sizeof(mQKVBiasEnabled) + sizeof(mCrossAttention) + sizeof(mMaxDistance)
         + sizeof(mPosShiftEnabled) + sizeof(mDenseContextFMHA) + sizeof(mPagedContextFMHA) + sizeof(mFP8ContextFMHA)
-        + sizeof(mUseKVCache) + sizeof(mUnfuseQkvGemm) + sizeof(mIsMedusaEnabled) + sizeof(mNbMultiBlockSemaphores);
+        + sizeof(mUseKVCache) + sizeof(mUnfuseQkvGemm) + sizeof(mIsSpecDecodingEnabled)
+        + sizeof(mNbMultiBlockSemaphores) + sizeof(uint32_t) // size of mDecoderXQARunnerResource buffer.
+        + mDecoderXQARunnerResource.getSerializationSize();
 }
 
 void GPTAttentionPluginCommon::serializeCommon(void* buffer) const noexcept
@@ -1552,6 +1581,8 @@ void GPTAttentionPluginCommon::serializeCommon(void* buffer) const noexcept
     char *d = static_cast<char*>(buffer), *a = d;
     write(d, mLayerIdx);
     write(d, mNumHeads);
+    write(d, mVisionStart);
+    write(d, mVisionLength);
     write(d, mNumKVHeads);
     write(d, mHeadSize);
     write(d, mUnidirectional);
@@ -1561,6 +1592,7 @@ void GPTAttentionPluginCommon::serializeCommon(void* buffer) const noexcept
     write(d, mRotaryEmbeddingBase);
     write(d, mRotaryEmbeddingScaleType);
     write(d, mRotaryEmbeddingScale);
+    write(d, mRotaryEmbeddingMscale);
     write(d, mRotaryEmbeddingMaxPositions);
     write(d, mTpSize);
     write(d, mTpRank);
@@ -1584,8 +1616,15 @@ void GPTAttentionPluginCommon::serializeCommon(void* buffer) const noexcept
     write(d, mPagedContextFMHA);
     write(d, mFP8ContextFMHA);
     write(d, mUseKVCache);
-    write(d, mIsMedusaEnabled);
+    write(d, mIsSpecDecodingEnabled);
     write(d, mNbMultiBlockSemaphores);
+
+    // An uint32_t that specifies the size of the serialized buffer, followed by the actual content.
+    uint32_t decoderXQARunnerResourceSerializedSize = mDecoderXQARunnerResource.getSerializationSize();
+    write(d, decoderXQARunnerResourceSerializedSize);
+    mDecoderXQARunnerResource.serialize(d, decoderXQARunnerResourceSerializedSize);
+    d += decoderXQARunnerResourceSerializedSize;
+
     assert(d == a + getCommonSerializationSize());
 }
 
@@ -1630,6 +1669,8 @@ GPTAttentionPluginCreatorCommon::GPTAttentionPluginCreatorCommon()
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
     mPluginAttributes.emplace_back(PluginField("num_heads", nullptr, PluginFieldType::kINT32, -1));
+    mPluginAttributes.emplace_back(PluginField("vision_start", nullptr, PluginFieldType::kINT32, -1));
+    mPluginAttributes.emplace_back(PluginField("vision_length", nullptr, PluginFieldType::kINT32, -1));
     mPluginAttributes.emplace_back(PluginField("num_kv_heads", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("head_size", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("unidirectional", nullptr, PluginFieldType::kINT32, 1));
@@ -1639,6 +1680,7 @@ GPTAttentionPluginCreatorCommon::GPTAttentionPluginCreatorCommon()
     mPluginAttributes.emplace_back(PluginField("rotary_embedding_base", nullptr, PluginFieldType::kFLOAT32, 0));
     mPluginAttributes.emplace_back(PluginField("rotary_embedding_scale_type", nullptr, PluginFieldType::kINT8, 0));
     mPluginAttributes.emplace_back(PluginField("rotary_embedding_scale", nullptr, PluginFieldType::kFLOAT32, 0));
+    mPluginAttributes.emplace_back(PluginField("rotary_embedding_m_scale", nullptr, PluginFieldType::kFLOAT32, 0));
     mPluginAttributes.emplace_back(PluginField("rotary_embedding_max_positions", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("tp_size", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("tp_rank", nullptr, PluginFieldType::kINT32, 0));
@@ -1661,7 +1703,7 @@ GPTAttentionPluginCreatorCommon::GPTAttentionPluginCreatorCommon()
     mPluginAttributes.emplace_back(PluginField("use_paged_context_fmha", nullptr, PluginFieldType::kINT8, 0));
     mPluginAttributes.emplace_back(PluginField("use_fp8_context_fmha", nullptr, PluginFieldType::kINT8, 0));
     mPluginAttributes.emplace_back(PluginField("use_cache", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("is_medusa_enabled", nullptr, PluginFieldType::kINT8, 0));
+    mPluginAttributes.emplace_back(PluginField("is_spec_decoding_enabled", nullptr, PluginFieldType::kINT8, 0));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }

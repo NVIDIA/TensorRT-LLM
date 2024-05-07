@@ -121,13 +121,14 @@ This release of TensorRT-LLM contains the following examples:
 | Baichuan   |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     Y      |
 | BERT       |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | BLIP-2     |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
-| BLOOM      |   Y   |   Y   |   Y   |   .   |    Y    |   Y   |   Y   |     .     |     .      |
+| BLOOM      |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     .     |     .      |
 | ChatGLM    |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | ChatGLM-v2 |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | ChatGLM-v3 |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | DBRX       |   Y   |   Y   |   Y   |   .   |    .    |   Y   |   Y   |     .     |     .      |
 | Falcon     |   Y   |   Y   |   Y   |   Y   |    .    |   Y   |   Y   |     Y     |     .      |
 | Flan-T5    |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
+| Gemma      |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     .      |
 | GPT        |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     .     |     .      |
 | GPT-J      |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     .      |
 | GPT-NeMo   |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |

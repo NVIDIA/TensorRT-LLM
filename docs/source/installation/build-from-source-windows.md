@@ -10,7 +10,7 @@ This section is for advanced users. Skip this section if you plan to use the pre
 
 1. Install [CMake](https://cmake.org/download/), version 3.27.7 is recommended, and select the option to add it to the system path.
 2. Download and install [Visual Studio 2022](https://visualstudio.microsoft.com/).
-3. Download and unzip [TensorRT 9.3.0.1 for TensorRT-LLM](https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/9.3.0/tensorrt-9.3.0.1.windows10.win10.cuda-12.2.llm.beta.zip).
+3. Download and unzip [TensorRT 10.0.1.6](https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.0.1/zip/TensorRT-10.0.1.6.Windows10.win10.cuda-12.4.zip).
 
 ## Building a TensorRT-LLM Docker Image
 
@@ -35,7 +35,13 @@ After building, copy the files out of your container. `docker cp` is not support
 
 ### Acquire an Image
 
-The Docker container will be hosted for public download in a future release. At this time, it must be built manually. Refer to [windows/docker/README.md](/windows/docker/README.md) for the image build instructions.
+The Docker container will be hosted for public download in a future release. At this time, it must be built manually. From the `TensorRT-LLM\windows\` folder, run the build command:
+
+```bash
+docker build -f .\docker\Dockerfile -t tensorrt-llm-windows-build:latest .
+```
+
+And your image is now ready for use.
 
 ### Run the Container
 
@@ -58,7 +64,7 @@ git submodule update --init --recursive
 2. Build TensorRT-LLM. This command generates `build\tensorrt_llm-*.whl`.
 
 ```bash
-python .\scripts\build_wheel.py -a "89-real" --trt_root C:\workspace\TensorRT-9.2.0.5\
+python .\scripts\build_wheel.py -a "89-real" --trt_root C:\workspace\TensorRT-10.0.1.6\
 ```
 
 3. Copy or move `build\tensorrt_llm-*.whl` into your mounted folder so it can be accessed on your host machine. If you intend to use the C++ runtime, you'll also need to gather various DLLs from the build into your mounted folder. For more information, refer to [C++ Runtime Usage](#c-runtime-usage).
@@ -95,7 +101,7 @@ python .\scripts\build_wheel.py -a "89-real" --trt_root C:\workspace\TensorRT-9.
 
         1. Install [CMake](https://cmake.org/download/), version 3.27.7 is recommended, and select the option to add it to the system path.
         2. Download and install [Visual Studio 2022](https://visualstudio.microsoft.com/). When prompted to select more Workloads, check **Desktop development with C++**.
-        3. Download and unzip [TensorRT 9.2.0.5 for TensorRT-LLM](https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/9.2.0/tensorrt-9.2.0.5.windows10.x86_64.cuda-12.2.llm.beta.zip). Move the folder to a location you can reference later, such as `%USERPROFILE%\inference\TensorRT`.
+        3. Download and unzip [TensorRT 10.0.1.6](https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.0.1/zip/TensorRT-10.0.1.6.Windows10.win10.cuda-12.4.zip). Move the folder to a location you can reference later, such as `%USERPROFILE%\inference\TensorRT`.
 
             1. Add the libraries for TensorRT  to your system's `Path` environment variable. Your `Path` should include a line like this:
 

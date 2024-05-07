@@ -38,23 +38,26 @@ using tensorrt_llm::plugins::GPTAttentionPlugin;
 static char const* GPT_ATTENTION_PLUGIN_VERSION{"1"};
 static char const* GPT_ATTENTION_PLUGIN_NAME{"GPTAttention"};
 
-GPTAttentionPlugin::GPTAttentionPlugin(int layer_idx, int num_heads, int num_kv_heads, int head_size,
-    int unidirectional, float q_scaling, tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
+GPTAttentionPlugin::GPTAttentionPlugin(int layer_idx, int num_heads, int vision_start, int vision_length,
+    int num_kv_heads, int head_size, int unidirectional, float q_scaling,
+    tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
     int rotary_embedding_dim, // for RoPE. 0 for non-RoPE
     float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
-    float rotary_embedding_scale, int rotary_embedding_max_positions, int tp_size, int tp_rank, // for ALiBi
-    bool unfuse_qkv_gemm,                                                                       // for AutoPP
+    float rotary_embedding_scale, float rotary_embedding_m_scale, int rotary_embedding_max_positions, int tp_size,
+    int tp_rank,          // for ALiBi
+    bool unfuse_qkv_gemm, // for AutoPP
     tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool multi_block_mode, bool enable_xqa,
     int kv_cache_quant_mode, bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type,
     bool paged_kv_cache, int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length,
     bool qkv_bias_enabled, bool cross_attention, int max_distance, bool pos_shift_enabled, bool dense_context_fmha,
-    bool use_paged_context_fmha, bool use_fp8_context_fmha, bool use_cache, bool is_medusa_enabled)
-    : GPTAttentionPluginCommon(layer_idx, num_heads, num_kv_heads, head_size, unidirectional, q_scaling,
-        position_embedding_type, rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale_type,
-        rotary_embedding_scale, rotary_embedding_max_positions, tp_size, tp_rank, unfuse_qkv_gemm, context_fmha_type,
-        multi_block_mode, enable_xqa, kv_cache_quant_mode, remove_input_padding, mask_type, paged_kv_cache,
-        tokens_per_block, type, max_context_length, qkv_bias_enabled, cross_attention, max_distance, pos_shift_enabled,
-        dense_context_fmha, use_paged_context_fmha, use_fp8_context_fmha, use_cache, is_medusa_enabled)
+    bool use_paged_context_fmha, bool use_fp8_context_fmha, bool use_cache, bool is_spec_decoding_enabled)
+    : GPTAttentionPluginCommon(layer_idx, num_heads, vision_start, vision_length, num_kv_heads, head_size,
+        unidirectional, q_scaling, position_embedding_type, rotary_embedding_dim, rotary_embedding_base,
+        rotary_embedding_scale_type, rotary_embedding_scale, rotary_embedding_m_scale, rotary_embedding_max_positions,
+        tp_size, tp_rank, unfuse_qkv_gemm, context_fmha_type, multi_block_mode, enable_xqa, kv_cache_quant_mode,
+        remove_input_padding, mask_type, paged_kv_cache, tokens_per_block, type, max_context_length, qkv_bias_enabled,
+        cross_attention, max_distance, pos_shift_enabled, dense_context_fmha, use_paged_context_fmha,
+        use_fp8_context_fmha, use_cache, is_spec_decoding_enabled)
 {
     initEntryIdx();
 }
@@ -87,6 +90,7 @@ bool GPTAttentionPlugin::isEntryUsed(IdxEntry const& entry) const
     case IdxEntry::KV_CACHE_DEQUANTIZATION_SCALE: return useKVCache() && mKVCacheQuantMode.hasKvCacheQuant();
     case IdxEntry::ATTENTION_OUTPUT_QUANTIZATION_SCALE: return mFP8ContextFMHA && mKVCacheQuantMode.hasFp8Qdq();
     case IdxEntry::ROTARY_COS_SIN: return isRoPE();
+    case IdxEntry::ROTARY_EMBEDDING_SCALING_FACTORS: return isLongRoPE();
     case IdxEntry::ALIBI_SLOPES: return isALiBi();
     case IdxEntry::RELATIVE_ATTENTION_BIAS: return isRelativePosition();
     case IdxEntry::CROSS_QKV: return isCrossAttention();
@@ -94,8 +98,8 @@ bool GPTAttentionPlugin::isEntryUsed(IdxEntry const& entry) const
     case IdxEntry::ENCODER_INPUT_LENGTH: return isCrossAttention();
     case IdxEntry::HOST_CONTEXT_LENGTH: return mRemovePadding;
     case IdxEntry::QKV_BIAS_TENSOR: return mQKVBiasEnabled;
-    case IdxEntry::MEDUSA_PACKED_MASK: return mIsMedusaEnabled;
-    case IdxEntry::MEDUSA_POSITION_OFFSETS: return mIsMedusaEnabled;
+    case IdxEntry::SPEC_DECODING_PACKED_MASK: return mIsSpecDecodingEnabled;
+    case IdxEntry::SPEC_DECODING_POSITION_OFFSETS: return mIsSpecDecodingEnabled;
     default: return false;
     }
 }
@@ -129,7 +133,7 @@ static int getPackedTensorHiddenDimIndex(bool removePadding)
     return removePadding ? 1 : 2;
 }
 
-// NOTE: generation input length might be larger than one in the Medusa mode.
+// NOTE: generation input length might be larger than one in the spec decoding mode.
 int GPTAttentionPlugin::getGenerationInputSequenceLength(
     nvinfer1::PluginTensorDesc const* inputDesc, int32_t localNbSeq, int32_t localNbTokens) const
 {
@@ -172,8 +176,9 @@ bool GPTAttentionPlugin::supportsFormatCombination(
 {
     if (pos == getIdx(IdxEntry::CONTEXT_LENGTHS) || pos == getIdx(IdxEntry::REQUEST_TYPES)
         || pos == getIdx(IdxEntry::HOST_MAX_ATTENTION_WINDOW) || pos == getIdx(IdxEntry::HOST_SINK_TOKEN_LENGTH)
-        || (isEntryUsed(IdxEntry::MEDUSA_PACKED_MASK) && pos == getIdx(IdxEntry::MEDUSA_PACKED_MASK))
-        || (isEntryUsed(IdxEntry::MEDUSA_POSITION_OFFSETS) && pos == getIdx(IdxEntry::MEDUSA_POSITION_OFFSETS)))
+        || (isEntryUsed(IdxEntry::SPEC_DECODING_PACKED_MASK) && pos == getIdx(IdxEntry::SPEC_DECODING_PACKED_MASK))
+        || (isEntryUsed(IdxEntry::SPEC_DECODING_POSITION_OFFSETS)
+            && pos == getIdx(IdxEntry::SPEC_DECODING_POSITION_OFFSETS)))
     {
         return inOut[pos].type == nvinfer1::DataType::kINT32;
     }
@@ -184,6 +189,10 @@ bool GPTAttentionPlugin::supportsFormatCombination(
         return inOut[pos].type == nvinfer1::DataType::kINT32;
     }
     else if (isRoPE() && (pos == getIdx(IdxEntry::ROTARY_COS_SIN)))
+    {
+        return inOut[pos].type == nvinfer1::DataType::kFLOAT;
+    }
+    else if (isLongRoPE() && (pos == getIdx(IdxEntry::ROTARY_EMBEDDING_SCALING_FACTORS)))
     {
         return inOut[pos].type == nvinfer1::DataType::kFLOAT;
     }
@@ -271,6 +280,7 @@ void GPTAttentionPlugin::configurePluginImpl(nvinfer1::DynamicPluginTensorDesc c
         /*kv_scale_orig_quant=*/nullptr,
         /*kv_scale_quant_orig=*/nullptr,
         /*attention_out_orig_quant=*/nullptr,
+        /*rotary_embedding_scaling_factors*/ nullptr,
         /*alibi_slopes=*/nullptr,
         /*context_buf_=*/nullptr,
         /*key_value_cache=*/nullptr,
@@ -453,6 +463,13 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         rotary_cos_sin = reinterpret_cast<float2 const*>(inputs[getIdx(IdxEntry::ROTARY_COS_SIN)]);
     }
 
+    float const* rotary_embedding_scaling_factors = nullptr;
+    if (isLongRoPE())
+    {
+        rotary_embedding_scaling_factors
+            = reinterpret_cast<float const*>(inputs[getIdx(IdxEntry::ROTARY_EMBEDDING_SCALING_FACTORS)]);
+    }
+
     auto const reqTypeInBatchPtr = static_cast<RequestType const*>(inputs[getIdx(IdxEntry::REQUEST_TYPES)]) + seqIdxBeg;
     bool const is_context = (reqTypeInBatchPtr[0] == RequestType::kCONTEXT);
 
@@ -599,20 +616,21 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
 
     T const* alibi_slopes = isALiBi() ? static_cast<T const*>(inputs[getIdx(IdxEntry::ALIBI_SLOPES)]) : nullptr;
 
-    int const* medusa_packed_mask = nullptr;
-    int const* medusa_position_offsets = nullptr;
-    int num_medusa_tokens = 0;
-    if (mIsMedusaEnabled)
+    int const* spec_decoding_packed_mask = nullptr;
+    int const* spec_decoding_position_offsets = nullptr;
+    int num_spec_decoding_tokens = 0;
+    if (mIsSpecDecodingEnabled)
     {
-        // Second dimension of medusa_packed_mask is num_medusa_tokens + 1.
-        // [batch_size, num_medusa_tokens + 1, divUp(num_medusa_tokens + 1, 32)]
-        num_medusa_tokens = inputDesc[getIdx(IdxEntry::MEDUSA_PACKED_MASK)].dims.d[1] - 1;
-        if (num_medusa_tokens > 0)
+        // Second dimension of spec_decoding_packed_mask is num_spec_decoding_tokens + 1.
+        // [batch_size, num_spec_decoding_tokens + 1, divUp(num_spec_decoding_tokens + 1, 32)]
+        num_spec_decoding_tokens = inputDesc[getIdx(IdxEntry::SPEC_DECODING_PACKED_MASK)].dims.d[1] - 1;
+        if (num_spec_decoding_tokens > 0)
         {
-            medusa_packed_mask = static_cast<int const*>(inputs[getIdx(IdxEntry::MEDUSA_PACKED_MASK)])
-                + seqIdxBeg * getStride(inputDesc[getIdx(IdxEntry::MEDUSA_PACKED_MASK)].dims, 0);
-            medusa_position_offsets = static_cast<int const*>(inputs[getIdx(IdxEntry::MEDUSA_POSITION_OFFSETS)])
-                + seqIdxBeg * getStride(inputDesc[getIdx(IdxEntry::MEDUSA_POSITION_OFFSETS)].dims, 0);
+            spec_decoding_packed_mask = static_cast<int const*>(inputs[getIdx(IdxEntry::SPEC_DECODING_PACKED_MASK)])
+                + seqIdxBeg * getStride(inputDesc[getIdx(IdxEntry::SPEC_DECODING_PACKED_MASK)].dims, 0);
+            spec_decoding_position_offsets
+                = static_cast<int const*>(inputs[getIdx(IdxEntry::SPEC_DECODING_POSITION_OFFSETS)])
+                + seqIdxBeg * getStride(inputDesc[getIdx(IdxEntry::SPEC_DECODING_POSITION_OFFSETS)].dims, 0);
         }
     }
 
@@ -681,18 +699,19 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
 
         int const input_seq_length = getGenerationInputSequenceLength(inputDesc, localNbSeq, localNbTokens);
         auto qkvDims = inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims;
-        TLLM_CHECK_WITH_INFO(input_seq_length == 1 || mIsMedusaEnabled,
-            "Only Medusa mode supports input length > 1 in the generation phase, input_seq_length=%d, "
-            "mIsMedusaEnabled=%s, nDims=%d, (" FMT_DIM ", " FMT_DIM ", " FMT_DIM ")",
-            input_seq_length, mIsMedusaEnabled ? "true" : "false", qkvDims.nbDims, qkvDims.d[0], qkvDims.d[1],
+        TLLM_CHECK_WITH_INFO(input_seq_length == 1 || mIsSpecDecodingEnabled,
+            "Only speculative decoding mode supports input length > 1 in the generation phase, input_seq_length=%d, "
+            "mIsSpecDecodingEnabled=%s, nDims=%d, (" FMT_DIM ", " FMT_DIM ", " FMT_DIM ")",
+            input_seq_length, mIsSpecDecodingEnabled ? "true" : "false", qkvDims.nbDims, qkvDims.d[0], qkvDims.d[1],
             qkvDims.d[2]);
-        TLLM_CHECK_WITH_INFO(input_seq_length == num_medusa_tokens + 1, "The generation input length is not expected.");
+        TLLM_CHECK_WITH_INFO(
+            input_seq_length == num_spec_decoding_tokens + 1, "The generation input length is not expected.");
         EnqueueGenerationParams<T, KVCacheBuffer> enqueue_params{attention_input, qkv_bias, input_seq_length,
             sequence_kv_length, max_context_kv_len, beamWidth, context_q_lengths, kv_scale_orig_quant,
-            kv_scale_quant_orig, attention_output_orig_quant, alibi_slopes, context_buf_, key_value_cache,
-            block_offsets, host_primary_pool_pointer, host_secondary_pool_pointer, max_attention_window_size,
-            cyclic_attention_window_size, sink_token_length, num_requests, max_blocks_per_sequence, cache_indir,
-            workspace, max_context_kv_len_list};
+            kv_scale_quant_orig, attention_output_orig_quant, rotary_embedding_scaling_factors, alibi_slopes,
+            context_buf_, key_value_cache, block_offsets, host_primary_pool_pointer, host_secondary_pool_pointer,
+            max_attention_window_size, cyclic_attention_window_size, sink_token_length, num_requests,
+            max_blocks_per_sequence, cache_indir, workspace, max_context_kv_len_list};
         enqueue_params.host_context_lengths = host_context_lengths;
         if (isRelativePosition())
         {
@@ -706,10 +725,10 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
             enqueue_params.encoder_input_lengths
                 = reinterpret_cast<int const*>(inputs[getIdx(IdxEntry::ENCODER_INPUT_LENGTH)]) + seqIdxBeg;
         }
-        if (mIsMedusaEnabled)
+        if (mIsSpecDecodingEnabled)
         {
-            enqueue_params.medusa_packed_mask = medusa_packed_mask;
-            enqueue_params.medusa_position_offsets = medusa_position_offsets;
+            enqueue_params.spec_decoding_packed_mask = spec_decoding_packed_mask;
+            enqueue_params.spec_decoding_position_offsets = spec_decoding_position_offsets;
         }
 
         enqueueGeneration<T, KVCacheBuffer>(enqueue_params, stream);
@@ -831,13 +850,15 @@ IPluginV2* GPTAttentionPluginCreator::createPlugin(char const* name, PluginField
     try
     {
         auto* obj = new GPTAttentionPlugin(p.getScalar<int32_t>("layer_idx").value(),
-            p.getScalar<int32_t>("num_heads").value(), p.getScalar<int32_t>("num_kv_heads").value(),
+            p.getScalar<int32_t>("num_heads").value(), p.getScalar<int32_t>("vision_start").value(),
+            p.getScalar<int32_t>("vision_length").value(), p.getScalar<int32_t>("num_kv_heads").value(),
             p.getScalar<int32_t>("head_size").value(), p.getScalar<int32_t>("unidirectional").value(),
             p.getScalar<float>("q_scaling").value(),
             static_cast<PositionEmbeddingType>(p.getScalar<int8_t>("position_embedding_type").value()),
             p.getScalar<int32_t>("rotary_embedding_dim").value(), p.getScalar<float>("rotary_embedding_base").value(),
             static_cast<RotaryScalingType>(p.getScalar<int8_t>("rotary_embedding_scale_type").value()),
             p.getScalar<float>("rotary_embedding_scale").value(),
+            p.getScalar<float>("rotary_embedding_m_scale").value(),
             p.getScalar<int32_t>("rotary_embedding_max_positions").value(),
             static_cast<int32_t>(p.getScalar<int32_t>("tp_size").value()),
             static_cast<int32_t>(p.getScalar<int32_t>("tp_rank").value()),
@@ -860,7 +881,7 @@ IPluginV2* GPTAttentionPluginCreator::createPlugin(char const* name, PluginField
             static_cast<bool>(p.getScalar<int8_t>("use_paged_context_fmha").value()),
             static_cast<bool>(p.getScalar<int8_t>("use_fp8_context_fmha").value()),
             static_cast<bool>(p.getScalar<int32_t>("use_cache").value()),
-            static_cast<bool>(p.getScalar<int8_t>("is_medusa_enabled").value()));
+            static_cast<bool>(p.getScalar<int8_t>("is_spec_decoding_enabled").value()));
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }

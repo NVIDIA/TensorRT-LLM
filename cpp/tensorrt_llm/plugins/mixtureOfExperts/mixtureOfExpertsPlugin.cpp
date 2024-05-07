@@ -220,7 +220,10 @@ void MixtureOfExpertsPlugin::init()
 #endif
     else
     {
-        TLLM_THROW("Could not construct the mixture of experts plugin with the requested input combination");
+        TLLM_THROW(
+            "Could not construct the mixture of experts plugin with the requested input combination Activation: %d "
+            "Weight: %d",
+            static_cast<int>(mType), static_cast<int>(mWeightType));
     }
 
     mGemmId = GemmIDMoe{mNumExperts, mK, mExpertHiddenSize, mExpertInterSize, mActivationType, mType, mWeightType,
@@ -317,7 +320,7 @@ void MixtureOfExpertsPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc c
         mQuantMode, mParallelismMode};
 }
 
-auto MixtureOfExpertsPlugin::setupWorkspace(void* base_ptr, int num_tokens) const -> WorkspaceInfo
+auto MixtureOfExpertsPlugin::setupWorkspace(void* base_ptr, int64_t num_tokens) const -> WorkspaceInfo
 {
     size_t dtype_size = tensorrt_llm::common::getDTypeSize(mType);
 
@@ -354,12 +357,12 @@ auto MixtureOfExpertsPlugin::setupWorkspace(void* base_ptr, int num_tokens) cons
     return info;
 }
 
-int MixtureOfExpertsPlugin::getNumTokens(nvinfer1::PluginTensorDesc const* input_tensors) const
+int64_t MixtureOfExpertsPlugin::getNumTokens(nvinfer1::PluginTensorDesc const* input_tensors) const
 {
     int ndim = input_tensors[getInputTensorIndex()].dims.nbDims;
     TLLM_CHECK_WITH_INFO(
         3 == ndim || 2 == ndim, "hidden_state dimension should be either 2 [b*s, hidden], or 3 [b, s, hidden]");
-    int num_tokens = input_tensors[getInputTensorIndex()].dims.d[0];
+    int64_t num_tokens = input_tensors[getInputTensorIndex()].dims.d[0];
     if (ndim == 3)
     {
         num_tokens *= input_tensors[getInputTensorIndex()].dims.d[1];
@@ -413,8 +416,8 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace_ptr,
     cudaStream_t stream) noexcept
 {
-    int const num_tokens = getNumTokens(inputDesc);
-    int const num_not_finished = num_tokens; // TODO Take this as an input
+    int64_t const num_tokens = getNumTokens(inputDesc);
+    int64_t const num_not_finished = num_tokens; // TODO Take this as an input
     auto parallelism_config = getParallelismConfig();
 
     auto workspace = setupWorkspace(workspace_ptr, num_tokens);

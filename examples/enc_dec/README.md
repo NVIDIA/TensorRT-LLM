@@ -25,7 +25,7 @@ The TensorRT-LLM Enc-Dec implementation can be found in [tensorrt_llm/models/enc
 
  * `trtllm-build` to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the Enc-Dec model,
  * [`run.py`](./run.py) to run the inference on an example input text.
- * Enc-Dec models can have specific implementations, such as the popular T5 family (T5, mT5, Flan-T5), BART family (BART, mBART), and FairSeq family (WMTs). They are now merged into a single convert script:
+ * Enc-Dec models can have specific implementations, such as the popular T5 family (T5, mT5, Flan-T5, ByT5), BART family (BART, mBART), and FairSeq family (WMTs). They are now merged into a single convert script:
    * [`convert_checkpoint.py`](./convert_checkpoint.py) to convert weights from HuggingFace or FairSeq format to TRT-LLM format, and split weights for multi-GPU inference,
 ## Usage
 
@@ -40,6 +40,7 @@ The implementation is designed to support generic encoder-decoder models by abst
 - [BART](https://huggingface.co/docs/transformers/model_doc/bart)
 - [mBART](https://huggingface.co/docs/transformers/model_doc/mbart)
 - [FairSeq NMT](https://pytorch.org/hub/pytorch_fairseq_translation/)
+- [ByT5](https://huggingface.co/docs/transformers/main/en/model_doc/byt5)
 - [UL2 (coming)](https://huggingface.co/docs/transformers/model_doc/ul2) and [Flan-UL2 (coming)](https://huggingface.co/docs/transformers/model_doc/flan-ul2)
 
 It also supports full Tensor Parallelism (TP), Pipeline Parallelism (PP), and a hybrid of the two. Currently, Fused Multi-Head Attention (FMHA) is not yet enabled for T5 family due to its relative attention design.
@@ -53,6 +54,7 @@ git clone https://huggingface.co/t5-small tmp/hf_models/t5-small
 git clone https://huggingface.co/google/flan-t5-small tmp/hf_models/flan-t5-small
 git clone https://huggingface.co/facebook/bart-large-cnn tmp/hf_models/bart-large-cnn
 git clone https://huggingface.co/facebook/mbart-large-50-many-to-one-mmt tmp/hf_models/mbart-large-50-many-to-one-mmt
+git clone https://huggingface.co/google/byt5-small tmp/hf_models/byt5-small
 ```
 
 ### Convert and Split Weights

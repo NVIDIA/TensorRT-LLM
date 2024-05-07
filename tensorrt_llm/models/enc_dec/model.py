@@ -964,7 +964,8 @@ class DecoderModel(PretrainedModel):
         self.has_token_type_embedding = type_vocab_size is not None
 
         self.fp16_clamping = (self.config.dtype
-                              == 'float16') and (self.config.model_type == 't5')
+                              == 'float16') and (self.config.model_type
+                                                 in ['t5', 'pix2struct'])
 
         self.skip_cross_qkv = self.config.skip_cross_qkv
         self.mlp_type = MLPType.MLP if not hasattr(

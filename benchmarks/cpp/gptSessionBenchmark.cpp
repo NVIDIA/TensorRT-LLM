@@ -68,7 +68,7 @@ size_t monitorMemory(std::atomic_bool& done)
 void benchmarkGptSession(std::filesystem::path const& dataPath, std::vector<int> const& batchSizes, int beamWidth,
     std::vector<std::vector<int>> const& inOutLen, std::shared_ptr<nvinfer1::ILogger> const& logger, int warmUp,
     int numRuns, int duration, GptSession::Config& sessionConfig, bool cudaGraphMode, bool printAllLogits,
-    bool disableForceMaxTokens, bool dumpLayerInfo)
+    bool disableForceMaxTokens, bool dumpLayerInfo, bool dumpProfile)
 {
     std::filesystem::path jsonFileName = dataPath / "config.json";
     auto const json = GptJsonConfig::parse(jsonFileName);
@@ -298,6 +298,46 @@ void benchmarkGptSession(std::filesystem::path const& dataPath, std::vector<int>
                                   << std::endl;
                     }
                 }
+                // Do per-layer profiling after normal benchmarking to avoid introducing perf overhead.
+                if (dumpProfile)
+                {
+                    session.setLayerProfiler();
+                    iterIdx = 0;
+
+                    while (iterIdx < numRuns)
+                    {
+                        auto const start = std::chrono::steady_clock::now();
+                        SizeType numSteps = 0;
+                        generationOutput.onTokenGenerated
+                            = [&numSteps, maxNewTokens](GenerationOutput::TensorPtr const& outputIds, SizeType step,
+                                  bool finished) { ++numSteps; };
+                        session.generate(generationOutput, generationInput, samplingConfig, generationProfiler);
+                        bufferManager.getStream().synchronize();
+                        auto const end = std::chrono::steady_clock::now();
+
+                        iterIdx += 1;
+                        float latency = std::chrono::duration<float, std::milli>(end - start).count();
+                        curDuration += latency;
+                        latencies.emplace_back(latency);
+                        generationTimes.emplace_back(generationProfiler->getElapsedTimeMs());
+
+                        bool durationLimitReached{curDuration / 1000 >= duration};
+                        if (worldConfig.getSize() > 1)
+                        {
+                            bool result{false};
+                            comm.allreduce(&durationLimitReached, &result, 1, tmpi::MpiType::kBOOL, tmpi::MpiOp::LOR);
+                            durationLimitReached = result;
+                        }
+                        if (durationLimitReached)
+                        {
+                            break;
+                        }
+                    }
+                    if (worldConfig.getRank() == 0)
+                    {
+                        printf("%s\n", session.getLayerProfileInfo().c_str());
+                    }
+                }
             }
             catch (std::runtime_error& e)
             {
@@ -377,6 +417,7 @@ int main(int argc, char* argv[])
     options.add_options()("print_all_logits", "Print all context and generation logits.");
     options.add_options()("disable_force_max_tokens", "Disable force the engine generating new max_tokens.");
     options.add_options()("dump_layer_info", "Print layer information of the engine to console.");
+    options.add_options()("dump_profile", "Print profile information per layer.");
 
     auto result = options.parse(argc, argv);
 
@@ -487,6 +528,7 @@ int main(int argc, char* argv[])
     auto printAllLogits = result.count("print_all_logits") > 0;
     auto disableForceMaxTokens = result.count("disable_force_max_tokens") > 0;
     auto dumpLayerInfo = result.count("dump_layer_info") > 0;
+    auto dumpProfile = result.count("dump_profile") > 0;
 
     initTrtLlmPlugins(logger.get());
 
@@ -494,7 +536,7 @@ int main(int argc, char* argv[])
     {
         benchmarkGptSession(result["engine_dir"].as<std::string>(), batchSizes, beamWidth, inOutLen, logger,
             result["warm_up"].as<int>(), result["num_runs"].as<int>(), result["duration"].as<int>(), sessionConfig,
-            enableCudaGraph, printAllLogits, disableForceMaxTokens, dumpLayerInfo);
+            enableCudaGraph, printAllLogits, disableForceMaxTokens, dumpLayerInfo, dumpProfile);
     }
     catch (std::exception const& e)
     {

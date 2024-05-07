@@ -33,26 +33,6 @@ static inline size_t pad_to_multiple_of_16(size_t const& input)
     return ALIGNMENT * ((input + ALIGNMENT - 1) / ALIGNMENT);
 }
 
-/*
-  Launches the topk gating softmax required for the MoE layers.
-
-  Params:
-  input - a [num_rows x num_experts]
-  finished - [num_rows] vector with 1 if the sentence at this row is done translating and 0 otherwise.
-  output - a buffer of shape [num_rows x k] containing the top-k values of the softmax for each row.
-  indices - a matrix of shape [num_rows x k] containing the top-k experts each row should get routed to.
-  source_rows - a matrix of shape [num_rows x k] used internally for permuting. source_rows[row][k] =  k * num_rows +
-  row. It is constructed like this so we can track where each of the original rows end up in order to perform the
-                "k-way" reduction later in the routing.
-
-  num_rows - The number of rows in the matrix
-  num_experts - The number of expert layers present
-  k - k value in topk
-*/
-template <typename T>
-void topk_gating_softmax_kernelLauncher(T const* input, bool const* finished, T* output, T* softmax_temp_out,
-    int* indices, int* source_row, int const num_rows, int const num_experts, int const k, cudaStream_t stream);
-
 class CubKeyValueSorter
 {
 public:
@@ -155,7 +135,7 @@ class CutlassMoeFCRunnerInterface
 {
 public:
     virtual ~CutlassMoeFCRunnerInterface() = default;
-    virtual size_t getWorkspaceSize(int const num_rows, int const hidden_size, int const inter_size,
+    virtual size_t getWorkspaceSize(int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size,
         int const num_experts, int const k, ActivationType activation_type,
         MOEParallelismConfig parallelism_config) const
         = 0;
@@ -164,11 +144,12 @@ public:
 
     virtual void runMoe(void const* input_activations, float const* gating_output, void const* fc1_expert_weights,
         void const* fc1_expert_biases, ActivationType fc1_activation_type, void const* fc2_expert_weights,
-        void const* fc2_expert_biases, QuantParams quant_params, int const num_rows, int const hidden_size,
-        int const inter_size, int const num_experts, int const k, char* workspace_ptr, void* final_output,
-        bool const* finished, int const active_rows, void* expert_scales, int* expanded_source_row_to_expanded_dest_row,
-        int* expert_for_source_row, MOEParallelismConfig parallelism_config,
-        MOEExpertScaleNormalizationMode normalization_mode, cudaStream_t stream)
+        void const* fc2_expert_biases, QuantParams quant_params, int64_t const num_rows, int64_t const hidden_size,
+        int64_t const inter_size, int const num_experts, int const k, char* workspace_ptr, void* final_output,
+        bool const* finished, int64_t const active_rows, void* expert_scales,
+        int* expanded_source_row_to_expanded_dest_row, int* expert_for_source_row,
+        MOEParallelismConfig parallelism_config, MOEExpertScaleNormalizationMode normalization_mode,
+        cudaStream_t stream)
         = 0;
 
     bool is_profiler = false;
@@ -191,8 +172,9 @@ public:
     static_assert(
         std::is_same_v<T, WeightType> || !std::is_same_v<T, float>, "Does not support float with quantized weights");
 
-    size_t getWorkspaceSize(int const num_rows, int const hidden_size, int const fc1_output_size, int const num_experts,
-        int const k, ActivationType activation_type, MOEParallelismConfig parallelism_config) const override;
+    size_t getWorkspaceSize(int64_t const num_rows, int64_t const hidden_size, int64_t const fc1_output_size,
+        int const num_experts, int const k, ActivationType activation_type,
+        MOEParallelismConfig parallelism_config) const override;
 
     void setTactic(std::optional<cutlass_extensions::CutlassGemmConfig> gemm_config) override
     {
@@ -206,11 +188,12 @@ public:
 
     void runMoe(void const* input_activations, float const* gating_output, void const* fc1_expert_weights,
         void const* fc1_expert_biases, ActivationType fc1_activation_type, void const* fc2_expert_weights,
-        void const* fc2_expert_biases, QuantParams quant_params, int const num_rows, int const hidden_size,
-        int const inter_size, int const num_experts, int const k, char* workspace_ptr, void* final_output,
-        bool const* finished, int const active_rows, void* expert_scales, int* expanded_source_row_to_expanded_dest_row,
-        int* expert_for_source_row, MOEParallelismConfig parallelism_config,
-        MOEExpertScaleNormalizationMode normalization_mode, cudaStream_t stream) override;
+        void const* fc2_expert_biases, QuantParams quant_params, int64_t const num_rows, int64_t const hidden_size,
+        int64_t const inter_size, int const num_experts, int const k, char* workspace_ptr, void* final_output,
+        bool const* finished, int64_t const active_rows, void* expert_scales,
+        int* expanded_source_row_to_expanded_dest_row, int* expert_for_source_row,
+        MOEParallelismConfig parallelism_config, MOEExpertScaleNormalizationMode normalization_mode,
+        cudaStream_t stream) override;
 
 private:
     using HopperGemmOutputType = typename HopperGroupedGemmInput::OutputTypeAdaptor_t<T>;
@@ -218,12 +201,13 @@ private:
     void computeTotalRowsBeforeExpert(int const* sorted_indices, int const total_indices, int const num_experts,
         int64_t* total_rows_before_expert, cudaStream_t stream);
     HopperGroupedGemmInput computeStridesHopper(int64_t const* total_rows_before_expert,
-        HopperGroupedGemmInput layout_info, int gemm_n, int gemm_k, int const num_experts, T const* in,
+        HopperGroupedGemmInput layout_info, int64_t gemm_n, int64_t gemm_k, int const num_experts, T const* in,
         WeightType const* weights, float const* fp8_dequant, T const* bias, HopperGemmOutputType* output,
         cudaStream_t stream);
-    std::vector<size_t> getWorkspaceBufferSizes(int const num_rows, int const hidden_size, int const inter_size,
-        int const num_experts, int const num_experts_per_node, int const k, ActivationType activation_type) const;
-    void configureWsPtrs(char* ws_ptr, int const num_rows, int const hidden_size, int const inter_size,
+    std::vector<size_t> getWorkspaceBufferSizes(int64_t const num_rows, int64_t const hidden_size,
+        int64_t const inter_size, int const num_experts, int const num_experts_per_node, int const k,
+        ActivationType activation_type) const;
+    void configureWsPtrs(char* ws_ptr, int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size,
         int const num_experts, int const num_experts_per_node, int const k, ActivationType activation_type);
 
 private:

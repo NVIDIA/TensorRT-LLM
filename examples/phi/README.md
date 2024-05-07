@@ -1,6 +1,6 @@
 # Phi
 
-This document explains how to build the [Phi](https://huggingface.co/microsoft/phi-2) model using TensorRT-LLM and run on a single GPU.
+This document explains how to build the [phi-2](https://huggingface.co/microsoft/phi-2), [Phi-3-mini-4k-instruct](https://huggingface.co/microsoft/Phi-3-mini-4k-instruct) and [Phi-3-mini-128k-instruct](https://huggingface.co/microsoft/Phi-3-mini-128k-instruct) models using TensorRT-LLM and run on a single GPU.
 
 - [Phi](#phi)
   - [Overview](#overview)
@@ -13,7 +13,7 @@ This document explains how to build the [Phi](https://huggingface.co/microsoft/p
 
 ## Overview
 
-The TensorRT-LLM Phi implementation can be found in [`tensorrt_llm/models/phi/model.py`](../../tensorrt_llm/models/phi/model.py). The TensorRT-LLM Phi example code is located in [`examples/phi`](./). There is one file:
+The TensorRT-LLM Phi implementation can be found in [`tensorrt_llm/models/phi/model.py`](../../tensorrt_llm/models/phi/model.py) and [`tensorrt_llm/models/phi3/model.py`](../../tensorrt_llm/models/phi3/model.py). The TensorRT-LLM Phi example code is located in [`examples/phi`](./). There is one file:
 
 * [`convert_checkpoint.py`](./convert_checkpoint.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT-LLM format
 
@@ -26,6 +26,16 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
   * FP16
   * BF16
   * Tensor Parallel
+  ## Support Matrix
+
+|    Model Name    | FP16  | BF16  |  TP   |
+| :--------------: | :---: | :---: | :---: |
+|    phi-2    |   Y   |   Y    |   Y   |
+| Phi-3-mini-4k-instruct    |   Y   |   Y   |     |
+| Phi-3-mini-128k-instruct  |   Y   |   Y   |    |
+
+* Model Name: the name of the model, the same as the name on HuggingFace
+* TP: Tensor Parallel
 
 ## Usage
 
@@ -38,7 +48,11 @@ pip install -r requirements.txt
 ```
 
 ```bash
-python ./convert_checkpoint.py --model_dir "microsoft/phi-2" --output_dir ./phi-2-checkpoint --dtype float16
+export MODEL_TYPE="phi-2" # or Phi-3-mini-4k-instruct, Phi-3-mini-128k-instruct
+python ./convert_checkpoint.py --model_type ${MODEL_TYPE} \
+                    --model_dir "microsoft/${MODEL_TYPE}" \
+                    --output_dir ./phi-checkpoint \
+                    --dtype float16
 ```
 
 ### 2. Build TensorRT engine(s)
@@ -52,8 +66,8 @@ Examples of build invocations:
 # Enable several TensorRT-LLM plugins to increase runtime performance. It also helps with build time.
 # --tp_size and --pp_size are the model shard size
 trtllm-build \
-    --checkpoint_dir ./phi-2-checkpoint \
-    --output_dir ./phi-2-engine \
+    --checkpoint_dir ./phi-checkpoint \
+    --output_dir ./phi-engine \
     --gemm_plugin float16 \
     --max_batch_size 8 \
     --max_input_len 1024 \
@@ -85,8 +99,8 @@ The summarization can be done using the [`../summarize.py`](../summarize.py) scr
 
 ```bash
 # Run the summarization task using a TensorRT-LLM model and a single GPU.
-python3 ../summarize.py --engine_dir ./phi-2-engine \
-                        --hf_model_dir "microsoft/phi-2" \
+python3 ../summarize.py --engine_dir ./phi-engine \
+                        --hf_model_dir "microsoft/$(MODEL_TYPE)" \
                         --batch_size 1 \
                         --test_trt_llm \
                         --test_hf \
@@ -96,8 +110,8 @@ python3 ../summarize.py --engine_dir ./phi-2-engine \
 
 # Run the summarization task using a TensorRT-LLM model and 2-way tensor parallelism.
 mpirun -n 2 --allow-run-as-root                             \
-python3 ../summarize.py --engine_dir ./phi-2-engine-tp2  \
-                        --hf_model_dir "microsoft/phi-2"    \
+python3 ../summarize.py --engine_dir ./phi-engine-tp2  \
+                        --hf_model_dir "microsoft/$(MODEL_TYPE)"    \
                         --batch_size 1                      \
                         --test_hf                           \
                         --test_trt_llm                      \

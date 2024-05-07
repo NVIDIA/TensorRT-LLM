@@ -115,12 +115,22 @@ public:
         , mPadId(req.getPadId())
         , mOrigPromptLen(mPromptLen)
         , mMaxSentTokenPos(mPromptLen - 1)
+        , mEmbeddingBias(std::nullopt)
+        , mBadWordsList(std::nullopt)
+        , mStopWordsList(std::nullopt)
+        , mPromptEmbeddingTable(std::nullopt)
+        , mPromptVocabSize(std::nullopt)
+        , mLoraTaskId(std::nullopt)
+        , mLoraWeights(std::nullopt)
+        , mLoraConfig(std::nullopt)
         , mReturnLogProbs(req.getOutputConfig().returnLogProbs)
         , mContextChunkSize(std::nullopt)
         , mContextCurrentPosition(0)
         , mLogProbs(mSamplingConfig.beamWidth)
         , mCumLogProbs(mSamplingConfig.beamWidth)
         , mDraftTokens(std::make_shared<VecTokens>())
+        , mDraftLogits(std::nullopt)
+        , mNumTokensPerIteration(1)
         , mReturnContextLogits(req.getOutputConfig().returnContextLogits)
         , mReturnGenerationLogits(req.getOutputConfig().returnGenerationLogits)
         , mExcludeInputFromOutput(req.getOutputConfig().excludeInputFromOutput)
@@ -183,20 +193,42 @@ public:
         initialize(req.getInputTokenIds());
     }
 
-    void validate(SizeType maxInputLen, SizeType maxSequenceLen)
+    void validate(SizeType maxInputLen, SizeType maxSequenceLen, SizeType maxDraftLen)
     {
         if (mPromptLen > maxInputLen)
         {
             TLLM_THROW("Prompt length (%d) exceeds maximum input length (%d).", mPromptLen, maxInputLen);
         }
 
-        if (mPromptLen + mMaxNewTokens > maxSequenceLen)
+        // Maximum number of draft tokens per request we pass to the engine for single runtime iteration.
+        // It depends on the speculative decoding mode.
+        auto draftLenPerEngineStep = maxDraftLen;
+        auto const& draftTokens = getDraftTokens();
+        if (draftTokens && !draftTokens->empty())
         {
-            auto const maxNewTokens = maxSequenceLen - mPromptLen;
+            auto const inputDraftTokensLen = static_cast<SizeType>(draftTokens->size());
+            if (inputDraftTokensLen > maxDraftLen)
+            {
+                TLLM_THROW("Draft tokens length (%d) exceeds maximum draft tokens length (%d).", inputDraftTokensLen,
+                    maxDraftLen);
+            }
+            draftLenPerEngineStep = inputDraftTokensLen;
+
+            if (mPromptLen + draftLenPerEngineStep > maxInputLen)
+            {
+                TLLM_THROW("Prompt length + number of draft tokens (%d + %d) exceeds maximum input length (%d).",
+                    mPromptLen, draftLenPerEngineStep, maxInputLen);
+            }
+        }
+
+        if (mPromptLen + mMaxNewTokens + draftLenPerEngineStep > maxSequenceLen)
+        {
+            auto const maxNewTokens = maxSequenceLen - mPromptLen - draftLenPerEngineStep;
             TLLM_LOG_WARNING(
-                "Prompt length + number of requested output tokens (%d + %d) exceeds maximum sequence length (%d). "
+                "Prompt length + number of requested output tokens + draft tokens per step (%d + %d + %d) exceeds "
+                "maximum sequence length (%d). "
                 "Number of requested output tokens is changed to (%d).",
-                mPromptLen, mMaxNewTokens, maxSequenceLen, maxNewTokens);
+                mPromptLen, mMaxNewTokens, draftLenPerEngineStep, maxSequenceLen, maxNewTokens);
             mMaxNewTokens = maxNewTokens;
         }
 
@@ -537,9 +569,16 @@ public:
         mReturnGenerationLogits = returnGenerationLogits;
     }
 
+    // Return all generation logits for model w/o draft token
     [[nodiscard]] bool getReturnGenerationLogits() const
     {
-        return mReturnGenerationLogits;
+        return mReturnGenerationLogits && (getNumDraftTokens() == 0);
+    }
+
+    // Return accepted tokens logits for target model
+    [[nodiscard]] bool getReturnTargetModelAcceptedLogits() const
+    {
+        return mReturnGenerationLogits && (getNumDraftTokens() > 0);
     }
 
     [[nodiscard]] TensorPtr const& getContextLogitsHost() const
@@ -701,7 +740,8 @@ public:
             auto maxNbTokens = getMaxBeamNumTokens();
             // FIXME(nkorobov): For streaming we do not allow beam search and
             // streaming index calculation here applies only for sampling
-            int nbTokensOut = mIsStreaming ? 1 : maxNbTokens;
+            // getNumTokensPerIteration takes accepted draft tokens into account
+            int nbTokensOut = mIsStreaming ? std::max(getNumTokensPerIteration(), 1) : maxNbTokens;
             if (mExcludeInputFromOutput && !mIsStreaming)
             {
                 nbTokensOut -= getOrigPromptLen();
@@ -722,6 +762,11 @@ public:
                 {
                     auto tokens = getTokens(beam);
                     auto nbTokens = mIsStreaming ? (tokenPos - getMaxSentTokenPos()) : tokens.size();
+
+                    // Take accepted draft tokens into account when streaming
+                    auto const numAcceptedTokens = std::max(0, getNumTokensPerIteration() - 1);
+                    nbTokens += mIsStreaming ? numAcceptedTokens : 0;
+
                     if (mExcludeInputFromOutput && !mIsStreaming)
                     {
                         nbTokens -= getOrigPromptLen();
@@ -731,6 +776,8 @@ public:
                         result.outputTokenIds.at(beam).assign(
                             tokens.data() + tokenPos, tokens.data() + tokenPos + nbTokens);
                     }
+                    // Correct next token position by accepted draft tokens
+                    tokenPos += numAcceptedTokens;
                 }
 
                 if (returnLogProbs())

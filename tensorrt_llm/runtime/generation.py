@@ -775,7 +775,8 @@ class GenerationSession(object):
 
         if model_config.num_medusa_heads > 0:
             expected_tensor_names += [
-                'medusa_position_offsets', 'medusa_packed_mask', 'medusa_logits'
+                'spec_decoding_position_offsets', 'spec_decoding_packed_mask',
+                'medusa_logits'
             ]
 
         found_tensor_names = [
@@ -1629,9 +1630,9 @@ class GenerationSession(object):
                 atten_idx += 1
 
         if self.is_medusa_mode:
-            self.buffer['medusa_packed_mask'] = self.medusa_packed_mask
+            self.buffer['spec_decoding_packed_mask'] = self.medusa_packed_mask
             self.buffer[
-                'medusa_position_offsets'] = self.medusa_position_offsets
+                'spec_decoding_position_offsets'] = self.medusa_position_offsets
         self.buffer_allocated = True
         if self.is_medusa_mode:
             return self.num_medusa_tokens
@@ -1892,9 +1893,10 @@ class GenerationSession(object):
                            'host_encoder_input_lengths')
         if self.is_medusa_mode:
             # Medusa mask and position offsets are fixed for the whole session.
-            add_tensor(self.buffer['medusa_packed_mask'], 'medusa_packed_mask')
-            add_tensor(self.buffer['medusa_position_offsets'],
-                       'medusa_position_offsets')
+            add_tensor(self.buffer['spec_decoding_packed_mask'],
+                       'spec_decoding_packed_mask')
+            add_tensor(self.buffer['spec_decoding_position_offsets'],
+                       'spec_decoding_position_offsets')
 
         return tensors
 
@@ -2196,9 +2198,10 @@ class GenerationSession(object):
 
         if self.is_medusa_mode:
             # Medusa mask and position offsets are fixed for the whole session.
-            add_tensor(self.buffer['medusa_packed_mask'], 'medusa_packed_mask')
-            add_tensor(self.buffer['medusa_position_offsets'],
-                       'medusa_position_offsets')
+            add_tensor(self.buffer['spec_decoding_packed_mask'],
+                       'spec_decoding_packed_mask')
+            add_tensor(self.buffer['spec_decoding_position_offsets'],
+                       'spec_decoding_position_offsets')
 
         return tensors
 

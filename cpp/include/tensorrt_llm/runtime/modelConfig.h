@@ -25,21 +25,34 @@
 namespace tensorrt_llm::runtime
 {
 
-struct MambaConfig
-{
-    SizeType dState = 0;
-    SizeType dConv = 0;
-    SizeType expand = 0;
-};
-
 class ModelConfig
 {
 public:
     enum class ModelVariant : std::int32_t
     {
         kGpt = 0,
-        kGlm = 1,   // https://github.com/THUDM/GLM and https://github.com/THUDM/ChatGLM-6B
-        kMamba = 2, // https://github.com/state-spaces/mamba
+        kGlm = 1,            // https://github.com/THUDM/GLM and https://github.com/THUDM/ChatGLM-6B
+        kMamba = 2,          // https://github.com/state-spaces/mamba
+        kRecurrentGemma = 3, // https://github.com/google-deepmind/recurrentgemma
+    };
+
+    struct MambaConfig
+    {
+        SizeType dState = 0;
+        SizeType dConv = 0;
+        SizeType expand = 0;
+    };
+
+    struct RnnConfig
+    {
+        SizeType dConv = 0;
+        SizeType hiddenSize = 0;
+    };
+
+    enum class LayerType : std::int32_t
+    {
+        kATTENTION,
+        kRECURRENT,
     };
 
     explicit ModelConfig(SizeType vocabSize, SizeType nbAttentionLayers, SizeType nbSsmLayers, SizeType nbHeads,
@@ -478,7 +491,8 @@ public:
 
     [[nodiscard]] bool constexpr isTransformerBased() const noexcept
     {
-        return mModelVariant == ModelVariant::kGpt || mModelVariant == ModelVariant::kGlm;
+        return mModelVariant == ModelVariant::kGpt || mModelVariant == ModelVariant::kGlm
+            || mModelVariant == ModelVariant::kRecurrentGemma;
     }
 
     [[nodiscard]] bool hasMambaConfig() const noexcept
@@ -498,7 +512,32 @@ public:
 
     [[nodiscard]] bool constexpr isSsmBased() const noexcept
     {
-        return mModelVariant == ModelVariant::kMamba;
+        return mModelVariant == ModelVariant::kMamba || mModelVariant == ModelVariant::kRecurrentGemma;
+    }
+
+    [[nodiscard]] bool hasRnnConfig() const noexcept
+    {
+        return mRnnConfig.has_value();
+    }
+
+    [[nodiscard]] std::optional<RnnConfig> getRnnConfig() const noexcept
+    {
+        return mRnnConfig;
+    }
+
+    void setRnnConfig(RnnConfig const& rnnConfig) noexcept
+    {
+        mRnnConfig = rnnConfig;
+    }
+
+    [[nodiscard]] std::vector<LayerType> const& getLayerTypes() const noexcept
+    {
+        return mLayerTypes;
+    }
+
+    void setLayerTypes(std::vector<LayerType> const& layerTypes) noexcept
+    {
+        mLayerTypes = layerTypes;
     }
 
 private:
@@ -548,6 +587,10 @@ private:
     bool mUsePositionEmbedding;
     bool mUseTokenTypeEmbedding;
     SizeType mFfnHiddenSize; // indicates encoder output hidden size
+
+    std::optional<RnnConfig> mRnnConfig;
+
+    std::vector<LayerType> mLayerTypes;
 };
 
 } // namespace tensorrt_llm::runtime

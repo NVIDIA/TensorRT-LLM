@@ -56,11 +56,12 @@ The following table shows the supported software for TensorRT-LLM.
         - Volta (SM70) - FP32, FP16, INT8(1), INT4(2)
     * - Models
       -
+        - [Arctic](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/arctic)
         - [Baichuan](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/baichuan)
         - [BART](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec)
         - [BERT](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/bert)
-        - [Blip2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
         - [BLOOM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/bloom)
+        - [ByT5](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec)
         - [ChatGLM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/chatglm)
         - [DBRX](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/dbrx)
         - [FairSeq NMT](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec)
@@ -80,7 +81,7 @@ The following table shows the supported software for TensorRT-LLM.
         - [MPT](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mpt)
         - [mT5](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec)
         - [OPT](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/opt)
-        - [Phi-1.5/Phi-2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/phi)
+        - [Phi-1.5/Phi-2/Phi-3](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/phi)
         - [Qwen](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/qwen)
         - [Qwen-VL](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/qwenvl)
         - [Replit Code](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mpt)
@@ -95,8 +96,12 @@ The following table shows the supported software for TensorRT-LLM.
       -
         - [BLIP2 w/ OPT-2.7B](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
         - [BLIP2 w/ T5-XL](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
+        - [CogVLM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)(6)
+        - [Deplot](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
+        - [Fuyu](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
         - [LLaVA-v1.5-7B](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
         - [Nougat family](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal) Nougat-small, Nougat-base
+        - [VILA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
 ```
 
 (1) INT8 SmoothQuant is not supported on SM70 and SM75.<br>
@@ -104,6 +109,7 @@ The following table shows the supported software for TensorRT-LLM.
 (3) INT4 AWQ and GPTQ with FP8 activations require SM >= 89.<br>
 (4) [Encoder-Decoder](https://github.com/NVIDIA/TensorRT-LLM/tree/main/main/examples/enc_dec) provides general encoder-decoder functionality that supports many encoder-decoder models such as T5 family, BART family, Whisper family, NMT family, and so on.
 (5) Multi-modal provides general multi-modal functionality that supports many multi-modal architectures such as BLIP family, LLaVA family, and so on.
+(6) Only supports bfloat16 precision.
 
 
 ```{note}

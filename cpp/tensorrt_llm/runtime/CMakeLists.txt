@@ -19,6 +19,7 @@ set(SRCS
     utils/sessionUtils.cpp
     utils/debugUtils.cu
     bufferManager.cpp
+    layerProfiler.cpp
     loraManager.cpp
     loraUtils.cpp
     loraModule.cpp

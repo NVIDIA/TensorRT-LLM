@@ -22,7 +22,7 @@
       - [Run 7B inference under SmoothQuant for jax checkpoint](#run-7b-inference-under-smoothquant-for-jax-checkpoint)
       - [Run inference under weight only for keras checkpoint](#run-inference-under-weight-only-for-keras-checkpoint)
       - [Run inference under INT8 KV caches for keras checkpoint](#run-inference-under-int8-kv-caches-for-keras-checkpoint)
-    - [Run AMMO Quantization](#run-ammo-quantization)
+    - [Run Modelopt Quantization](#run-modelopt-quantization)
       - [Requirements](#requirements)
       - [Quantize Checkpoints](#quantize-checkpoints)
       - [Build Engines](#build-engines)
@@ -187,7 +187,7 @@ python3 ../summarize.py --test_trt_llm \
 
 #### Run inference under FP8 for keras checkpoint
 
-WARNING: This way of running FP8 will introduce noticeable accuracy drop. To avoid that, use AMMO quantization mentioned in this readme.
+WARNING: This way of running FP8 will introduce noticeable accuracy drop. To avoid that, use Modelopt quantization mentioned in this readme.
 
 In this example, we demonstrate how to run FP8 inference on Gemma. Note that `convert_checkpoint.py` only uses identity activation scales, so the accuracy might be little worse than higher precision in some cases, but it is still very good because we don't do any calibration. This also shows the stability of FP8 compared to INT8.
 
@@ -466,7 +466,7 @@ Average accuracy: 0.630
 
 #### Run inference under FP8 for jax checkpoint
 
-WARNING: This way of running FP8 will introduce noticeable accuracy drop. To avoid that, use AMMO quantization mentioned in this readme.
+WARNING: This way of running FP8 will introduce noticeable accuracy drop. To avoid that, use Modelopt quantization mentioned in this readme.
 
 In this example, we demonstrate how to run FP8 inference on Gemma. Note that `convert_checkpoint.py` only uses identity activation scales, so the accuracy might be little worse than higher precision in some cases, but it is still very good because we don't do any calibration. This also shows the stability of FP8 compared to INT8.
 
@@ -689,11 +689,11 @@ python3 ../summarize.py --test_trt_llm \
 [02/08/2024-07:51:11] [TRT-LLM] [I]   rougeLsum : 17.94213019528988
 ```
 
-### Run AMMO Quantization
+### Run Modelopt Quantization
 
 #### Requirements
 
-AMMO toolkit also provides quantization solutions. To enable it, have the latest ammo and transformers Python package installed to support Gemma. Then run the following commands.
+Modelopt toolkit also provides quantization solutions. To enable it, have the latest modelopt and transformers Python package installed to support Gemma. Then run the following commands.
 
 #### Quantize Checkpoints
 
@@ -736,7 +736,7 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
 
 #### Accuracy Results on MMLU
 
-| Model         | fp8   | int4_awq | int8_sq (AMMO) | int8_sq (Native per-channel) |
+| Model         | fp8   | int4_awq | int8_sq (Modelopt) | int8_sq (Native per-channel) |
 |---------------|-------|----------|----------------|------------------|
 | 2B Pretrained | 0.407 | 0.378    |    0.338       |     0.338        |
 | 7B Pretrained | 0.643 | 0.615    |    0.448       |     0.595        |

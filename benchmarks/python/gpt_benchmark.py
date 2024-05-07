@@ -381,6 +381,7 @@ class GPTBenchmark(BaseBenchmark):
                     layer_idx, trt.LayerInformationFormat.ONELINE)
                 print(layer_info)
 
+    def report_profiler(self, benchmark_profiler=None):
         if benchmark_profiler is not None and benchmark_profiler.is_recording_perf_profile:
             perf_profile_data = self.decoder.profiler.results
             if not perf_profile_data:
@@ -418,8 +419,9 @@ class GPTBenchmark(BaseBenchmark):
             def dump_kernel_profile_table(name: str, profile_data: list,
                                           iter_cnt: int):
                 table = pd.DataFrame(
-                    [[k, '{:0.3f}'.format(v)] for k, v in profile_data.items()],
-                    columns=['{} Phase LayerName'.format(name), 'times (ms)'])
+                    [['{:0.3f}'.format(v), k]
+                     for k, v in profile_data.items() if v != 0.0],
+                    columns=['times (ms)', '{} Phase LayerName'.format(name)])
 
                 def ljust(s):
                     s = s.astype(str).str.strip()

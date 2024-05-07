@@ -71,41 +71,41 @@ std::optional<FieldType> parseJsonFieldOptional(Json const& json, std::string_vi
     return value;
 }
 
-// Return { number of attention layers, number of recurrent (SSM) layers }
-std::tuple<SizeType, SizeType> getNumLayersByType(SizeType const numLayers, std::vector<std::string> const& layerTypes)
+std::vector<ModelConfig::LayerType> buildLayerTypes(
+    std::size_t const numLayers, std::vector<std::string> const& layerStringTypes)
 {
-    if (layerTypes.empty())
+    std::vector<ModelConfig::LayerType> result{numLayers, ModelConfig::LayerType::kATTENTION};
+    if (layerStringTypes.empty())
     {
-        return {numLayers, 0};
+        return result;
     }
 
-    auto constexpr attentionLayerName = "attention";
-    auto constexpr ssmLayerName = "recurrent";
-
-    SizeType numAttentionLayers{0};
-    SizeType numSsmLayers{0};
+    auto constexpr layerNameAttention = "attention";
+    auto constexpr layerNameRecurrent = "recurrent";
 
     // The json field specifies a "group" of layers, which gets repeated multiple times
     // Note that the total number of layers does not need to be a multiple of a layer
     // group size (i.e. the last group will be incomplete).
     // For instance, Griffin has groups of 3 layers (2 recurrent + 1 attention) and 26
     // layers total (the last group has no attention layer)
-    auto const groupSize = layerTypes.size();
-    TLLM_CHECK(groupSize <= static_cast<std::size_t>(numLayers));
-    auto const numLayersInLastGroup = numLayers % groupSize;
-    auto const numFullLayersGroups = numLayers / groupSize;
-    std::map<std::string, SizeType> layerCount = {{attentionLayerName, 0}, {ssmLayerName, 0}};
-    for (std::size_t i = 0; i < groupSize; ++i)
+    auto const groupSize = layerStringTypes.size();
+    for (std::size_t i = 0; i < numLayers; ++i)
     {
-        layerCount[layerTypes[i]] += (i < numLayersInLastGroup) ? numFullLayersGroups + 1 : numFullLayersGroups;
+        if (layerStringTypes[i % groupSize] == layerNameAttention)
+        {
+            result[i] = ModelConfig::LayerType::kATTENTION;
+        }
+        else if (layerStringTypes[i % groupSize] == layerNameRecurrent)
+        {
+            result[i] = ModelConfig::LayerType::kRECURRENT;
+        }
+        else
+        {
+            TLLM_LOG_ERROR("Unknown layer type: %s", layerStringTypes[i % groupSize].c_str());
+        }
     }
 
-    numAttentionLayers = layerCount[attentionLayerName];
-    numSsmLayers = layerCount[ssmLayerName];
-
-    TLLM_CHECK(numAttentionLayers + numSsmLayers == numLayers);
-
-    return {numAttentionLayers, numSsmLayers};
+    return result;
 }
 
 ModelConfig createModelConfig(
@@ -121,9 +121,13 @@ ModelConfig createModelConfig(
 
     auto const numLayers = config.at(numLayersField).template get<SizeType>();
     auto const numHeads = config.at(numHeadsField).template get<SizeType>() / tensorParallelism;
-    auto const layerTypes
+    auto const layerStringTypes
         = parseJsonFieldOr<std::vector<std::string>>(config, "layer_types", std::vector<std::string>());
-    auto const [numAttentionLayers, numSsmLayers] = getNumLayersByType(numLayers, layerTypes);
+    auto const layerTypes = buildLayerTypes(numLayers, layerStringTypes);
+    auto const numAttentionLayers
+        = static_cast<SizeType>(std::count(layerTypes.begin(), layerTypes.end(), ModelConfig::LayerType::kATTENTION));
+    auto const numSsmLayers
+        = static_cast<SizeType>(std::count(layerTypes.begin(), layerTypes.end(), ModelConfig::LayerType::kRECURRENT));
 
     auto const vocabSize = config.at("vocab_size").template get<SizeType>();
     auto const hiddenSize = config.at("hidden_size").template get<SizeType>() / tensorParallelism;
@@ -139,6 +143,7 @@ ModelConfig createModelConfig(
     auto modelConfig = ModelConfig{vocabSize, numAttentionLayers, numSsmLayers, numHeads, hiddenSize, dataType};
     modelConfig.setSizePerHead(sizePerHead);
     modelConfig.setNbKvHeads(numKvHeads);
+    modelConfig.setLayerTypes(layerTypes);
 
     if (useCrossAttention.has_value())
     {
@@ -357,11 +362,21 @@ GptJsonConfig parseJson(InputType&& input)
             auto const& mambaDState = ssmCfg.at("d_state").template get<SizeType>();
             auto const& mambaDConv = ssmCfg.at("d_conv").template get<SizeType>();
             auto const& mambaExpand = ssmCfg.at("expand").template get<SizeType>();
-            MambaConfig mambaConfig{};
+            ModelConfig::MambaConfig mambaConfig{};
             mambaConfig.dState = mambaDState;
             mambaConfig.dConv = mambaDConv;
             mambaConfig.expand = mambaExpand;
             modelConfig.setMambaConfig(mambaConfig);
+        }
+        else if (architecture == std::string("RecurrentGemmaForCausalLM"))
+        {
+            modelConfig.setModelVariant(ModelConfig::ModelVariant::kRecurrentGemma);
+            auto const& dConv = pretrainedConfig.at("conv_kernel").template get<SizeType>();
+            auto const& rnnHiddenSize = pretrainedConfig.at("rnn_hidden_size").template get<SizeType>();
+            ModelConfig::RnnConfig rnnConfig{};
+            rnnConfig.dConv = dConv;
+            rnnConfig.hiddenSize = rnnHiddenSize;
+            modelConfig.setRnnConfig(rnnConfig);
         }
     }
     else
@@ -372,7 +387,7 @@ GptJsonConfig parseJson(InputType&& input)
             auto const& mambaDState = builderConfig.at("mamba_d_state").template get<SizeType>();
             auto const& mambaDConv = builderConfig.at("mamba_d_conv").template get<SizeType>();
             auto const& mambaExpand = builderConfig.at("mamba_expand").template get<SizeType>();
-            MambaConfig mambaConfig{};
+            ModelConfig::MambaConfig mambaConfig{};
             mambaConfig.dState = mambaDState;
             mambaConfig.dConv = mambaDConv;
             mambaConfig.expand = mambaExpand;

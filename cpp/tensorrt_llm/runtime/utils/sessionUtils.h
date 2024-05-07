@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/runtime/bufferManager.h"
+#include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <NvInferRuntime.h>
@@ -59,7 +60,7 @@ std::vector<ITensor::SharedPtr> sliceBufferVector(
     std::vector<ITensor::SharedPtr> const& vector, SizeType offset, SizeType size);
 
 void insertTensorVector(StringPtrMap<ITensor>& map, std::string const& key, std::vector<ITensor::SharedPtr> const& vec,
-    SizeType indexOffset);
+    SizeType indexOffset, std::vector<ModelConfig::LayerType> const& layerTypes, ModelConfig::LayerType type);
 
 void insertTensorSlices(
     StringPtrMap<ITensor>& map, std::string const& key, ITensor::SharedPtr const& tensor, SizeType indexOffset);

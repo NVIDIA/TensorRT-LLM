@@ -895,6 +895,22 @@ def load_from_meta_llama(meta_ckpt_dir, mapping, config):
     if not hasattr(load_from_meta_llama, "saved_embed"):
         load_from_meta_llama.saved_embed = None
 
+    def combine_embeddings(embeds, num_ckpts):
+        if len(embeds) == 1:
+            return embeds[0]
+        assert [
+            embeds[i].shape == embeds[i + 1].shape
+            for i in range(len(embeds) - 1)
+        ]
+        if embeds[0].shape[0] == config.vocab_size // num_ckpts:
+            merge_dim = 0
+        elif embeds[0].shape[1] == config.hidden_size // num_ckpts:
+            merge_dim = 1
+        else:
+            logger.error("Unable to infer embedding split dimension")
+            assert False, "Unable to infer embedding split dimension"
+        return torch.cat(embeds, dim=merge_dim)
+
     def gather_embedding(cur_embed, name: str, num_ckpts):
         if mapping.tp_size == 1:
             # even if num_ckpts > 1, get_current_weights will already have it gathered
@@ -906,7 +922,7 @@ def load_from_meta_llama(meta_ckpt_dir, mapping, config):
                                        f"consolidated.{i:02d}.pth"),
                                   map_location="cpu")
                 embeds[i] = ckpt[name]
-            embed = torch.cat(embeds, dim=1).to(torch_dtype)
+            embed = combine_embeddings(embeds, num_ckpts).to(torch_dtype)
             load_from_meta_llama.saved_embed = embed
 
         return load_from_meta_llama.saved_embed

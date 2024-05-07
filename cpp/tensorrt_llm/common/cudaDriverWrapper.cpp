@@ -38,6 +38,28 @@ namespace tensorrt_llm
 namespace common
 {
 
+std::shared_ptr<CUDADriverWrapper> CUDADriverWrapper::getInstance()
+{
+    static std::mutex mutex;
+    static std::weak_ptr<CUDADriverWrapper> instance;
+    std::shared_ptr<CUDADriverWrapper> result = instance.lock();
+    if (result)
+    {
+        return result;
+    }
+    else
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        result = instance.lock();
+        if (!result)
+        {
+            result = std::shared_ptr<CUDADriverWrapper>(new CUDADriverWrapper());
+            instance = result;
+        }
+        return result;
+    }
+}
+
 CUDADriverWrapper::CUDADriverWrapper()
 {
     handle = dllOpen(CUDA_LIB_NAME);
@@ -63,6 +85,7 @@ CUDADriverWrapper::CUDADriverWrapper()
     *(void**) (&_cuLaunchCooperativeKernel) = load_sym(handle, "cuLaunchCooperativeKernel");
     *(void**) (&_cuLaunchKernel) = load_sym(handle, "cuLaunchKernel");
     *(void**) (&_cuTensorMapEncodeTiled) = load_sym(handle, "cuTensorMapEncodeTiled");
+    *(void**) (&_cuMemcpyDtoH) = load_sym(handle, "cuMemcpyDtoH_v2");
 }
 
 CUDADriverWrapper::~CUDADriverWrapper()
@@ -151,6 +174,11 @@ CUresult CUDADriverWrapper::cuTensorMapEncodeTiled(CUtensorMap* tensorMap, CUten
 {
     return (*_cuTensorMapEncodeTiled)(tensorMap, tensorDataType, tensorRank, globalAddress, globalDim, globalStrides,
         boxDim, elementStrides, interleave, swizzle, l2Promotion, oobFill);
+}
+
+CUresult CUDADriverWrapper::cuMemcpyDtoH(void* dstHost, CUdeviceptr srcDevice, size_t ByteCount) const
+{
+    return (*_cuMemcpyDtoH)(dstHost, srcDevice, ByteCount);
 }
 
 } // namespace common

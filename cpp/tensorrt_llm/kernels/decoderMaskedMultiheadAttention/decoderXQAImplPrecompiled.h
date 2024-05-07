@@ -29,7 +29,7 @@ public:
     {
     }
 
-    bool shouldUse(XQAParams const& xqaParams) override;
+    bool shouldUse(XQAParams const& xqaParams, bool forConfigurePlugin) override;
     void prepare(XQAParams const& xqa_params) override;
 
 protected:

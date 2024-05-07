@@ -22,7 +22,6 @@
 #include "common.h"
 #include "iBuffer.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
-#include "tensorrt_llm/common/customAllReduceUtils.h"
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/runtime/gptDecoderBatch.h"
 #include "tensorrt_llm/runtime/ipcUtils.h"
@@ -221,34 +220,13 @@ void GptSession::createCustomAllReduceWorkspace(
     SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxSequenceLength)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    setPeerAccess(mWorldConfig, true);
 
-    mIpcMemoryHandles.clear();
-    std::size_t const bufferSize = mWorldConfig.getTensorParallelism()
-        * std::min(static_cast<std::size_t>(maxBatchSize) * maxBeamWidth * maxSequenceLength
-                * mModelConfig.getHiddenSize() * sizeof(float),
-            ::tensorrt_llm::utils::customAllReduceUtils::getMaxRequiredWorkspaceSize(
-                mWorldConfig.getTensorParallelism()));
-    mIpcMemoryHandles.emplace_back(std::make_shared<IpcMemory>(mWorldConfig, bufferSize));
-    mIpcMemoryHandles.emplace_back(std::make_shared<IpcMemory>(mWorldConfig, bufferSize));
-    mIpcMemoryHandles.emplace_back(
-        std::make_shared<IpcMemory>(mWorldConfig, IpcMemory::FLAGS_SIZE * mWorldConfig.getTensorParallelism()));
-    mIpcMemoryHandles.emplace_back(
-        std::make_shared<IpcMemory>(mWorldConfig, IpcMemory::FLAGS_SIZE * mWorldConfig.getTensorParallelism()));
+    auto& manager = mRuntime->getBufferManager();
+    auto const hiddenSize = mModelConfig.getHiddenSize();
 
-    mCommPtrs = BufferManager::cpu(
-        ITensor::makeShape({static_cast<SizeType>(mIpcMemoryHandles.size()) * mWorldConfig.getTensorParallelism()}),
-        nvinfer1::DataType::kINT64);
-    auto* const commPtrsData = bufferCast<void*>(*mCommPtrs);
+    mAllReduceBuffers = std::make_shared<AllReduceBuffers>(
+        maxBatchSize, maxBeamWidth, maxSequenceLength, hiddenSize, manager, mWorldConfig);
 
-    for (size_t memIdx = 0; memIdx < mIpcMemoryHandles.size(); memIdx++)
-    {
-        auto const& memCommPtrs = mIpcMemoryHandles[memIdx]->getCommPtrsTensor();
-        for (SizeType tpIdx = 0; tpIdx < mWorldConfig.getTensorParallelism(); tpIdx++)
-        {
-            commPtrsData[memIdx * mWorldConfig.getTensorParallelism() + tpIdx] = memCommPtrs[tpIdx];
-        }
-    }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -872,6 +850,8 @@ void GptSession::executeContextStep(std::vector<GenerationInput> const& generati
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto& manager = mRuntime->getBufferManager();
 
+    auto allReduceCommPtrs = mAllReduceBuffers ? mAllReduceBuffers->mAllReduceCommPtrs : TensorPtr{};
+
     auto const numGenerationBatches = static_cast<SizeType>(generationBatchesInputs.size());
     auto constexpr step = 0;
     auto constexpr contextId = 0;
@@ -896,13 +876,15 @@ void GptSession::executeContextStep(std::vector<GenerationInput> const& generati
 
             buffers.prepareContextStep(inputIds.at(contextBatchId), generationBatchInputs.padId, manager,
                 kvCacheManager, batchOffset, mModelConfig, mWorldConfig);
-            buffers.getRuntimeBuffers(
-                inputBuffer, outputBuffer, step, inputIds.at(contextBatchId), mCommPtrs, mModelConfig, mWorldConfig);
+            buffers.getRuntimeBuffers(inputBuffer, outputBuffer, step, inputIds.at(contextBatchId), allReduceCommPtrs,
+                mModelConfig, mWorldConfig);
             mRuntime->setInputTensors(contextId, inputBuffer);
             mRuntime->setOutputTensors(contextId, outputBuffer);
 
             TLLM_CHECK_WITH_INFO(mRuntime->executeContext(contextId), "Executing TRT engine in context step failed!");
             sync_check_cuda_error();
+            buffers.clearTensorMaps(); // inputBuffer and outputBuffer are not needed anymore, we explicitly clear them
+                                       // to release memory
         }
 
         generationBuffers.postContextStep(contextBuffers, manager, mModelConfig, mWorldConfig);
@@ -928,6 +910,10 @@ void GptSession::executeContextStep(std::vector<GenerationInput> const& generati
             generationBuffers.logits = newLogitBuffer;
         }
     }
+    if (mRuntime->hasLayerProfiler(contextId))
+    {
+        mRuntime->reportToProfiler(contextId);
+    }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -938,6 +924,8 @@ SizeType GptSession::executeGenerationStep(SizeType step, std::vector<Generation
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK(microBatchesInputs.size() == microBatchesOutputs.size());
     auto& manager = mRuntime->getBufferManager();
+
+    auto allReduceCommPtrs = mAllReduceBuffers ? mAllReduceBuffers->mAllReduceCommPtrs : TensorPtr{};
 
     auto const numMicroBatches = static_cast<SizeType>(microBatchesInputs.size());
     SizeType numBatchesFinished{0};
@@ -958,7 +946,8 @@ SizeType GptSession::executeGenerationStep(SizeType step, std::vector<Generation
 
         auto nextInputIds = buffers.prepareNextStep(
             step - 1, manager, kvCacheManager, microBatchOffsets.at(generationBatchId), mModelConfig, mWorldConfig);
-        buffers.getRuntimeBuffers(inputBuffer, outputBuffer, step, nextInputIds, mCommPtrs, mModelConfig, mWorldConfig);
+        buffers.getRuntimeBuffers(
+            inputBuffer, outputBuffer, step, nextInputIds, allReduceCommPtrs, mModelConfig, mWorldConfig);
         mRuntime->setInputTensors(contextId, inputBuffer);
         mRuntime->setOutputTensors(contextId, outputBuffer);
 
@@ -988,6 +977,12 @@ SizeType GptSession::executeGenerationStep(SizeType step, std::vector<Generation
             microBatchesFinished.at(generationBatchId) = true;
             numBatchesFinished += 1;
             continue;
+        }
+
+        // report profile data
+        if (mRuntime->hasLayerProfiler(contextId))
+        {
+            mRuntime->reportToProfiler(contextId);
         }
 
         if (useCudaGraphs() && mCudaGraphInstances.size() > (size_t) graphId
@@ -1206,6 +1201,18 @@ void GptSession::finalize(SizeType microBatchId)
 
     sync_check_cuda_error();
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void GptSession::setLayerProfiler()
+{
+    TLLM_CHECK(mRuntime);
+    mRuntime->setLayerProfiler();
+}
+
+std::string GptSession::getLayerProfileInfo() const
+{
+    TLLM_CHECK(mRuntime);
+    return mRuntime->getLayerProfileInfo();
 }
 
 void GptSession::CudaGraphExecutor::create(cudaGraph_t const& graph)

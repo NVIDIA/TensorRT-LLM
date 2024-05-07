@@ -32,7 +32,7 @@ from ..logger import logger
 from ..lora_manager import LoraBuildConfig
 from ..models import PretrainedConfig
 from ..models.modeling_utils import (WEIGHT_LOADER_MODELS, QuantConfig,
-                                     load_model)
+                                     SpeculativeDecodingMode, load_model)
 from ..plugin import PluginConfig, add_plugin_argument
 from ..quantization import QuantAlgo
 
@@ -105,7 +105,7 @@ def parse_arguments():
         help=
         'Enable horizontal fusion in GatedMLP, reduces layer input traffic and potentially improves performance. '
         'For FP8 PTQ, the downside is slight reduction of accuracy because one of the quantization scaling factors are discarded. '
-        '(An example for reference only: 0.45734 vs 0.45755 for LLaMA-v2 7B using `ammo/examples/hf/instruct_eval/mmlu.py`).'
+        '(An example for reference only: 0.45734 vs 0.45755 for LLaMA-v2 7B using `modelopt/examples/hf/instruct_eval/mmlu.py`).'
     )
     parser.add_argument(
         '--gather_all_token_logits',
@@ -224,6 +224,13 @@ def parse_arguments():
         help=
         'Run through the build process except the actual Engine build for debugging. '
     )
+    parser.add_argument('--speculative_decoding_mode',
+                        default=None,
+                        choices=[
+                            "draft_tokens_external",
+                            "medusa",
+                        ],
+                        help='Mode of speculative decoding.')
 
     plugin_config_parser = parser.add_argument_group("plugin_config")
     add_plugin_argument(plugin_config_parser)
@@ -233,6 +240,11 @@ def parse_arguments():
         args.gather_context_logits = True
         args.gather_generation_logits = True
 
+    if args.gather_context_logits and args.max_draft_len > 0:
+        raise RuntimeError(
+            "Gather context logits is not support with draft len > 0. "
+            "If want to get the accepted tokens' logits from target model, please just enable gather_generation_logits"
+        )
     return args
 
 
@@ -407,6 +419,7 @@ def main():
         'max_lora_rank': args.max_lora_rank,
         'lora_target_modules': args.lora_target_modules,
     }
+    speculative_decoding_mode = SpeculativeDecodingMode.from_arguments(args)
     if args.build_config is None:
         if args.multiple_profiles == "enable" and args.opt_num_tokens is not None:
             raise RuntimeError(
@@ -443,6 +456,7 @@ def main():
                 'profiling_verbosity': args.profiling_verbosity,
                 'enable_debug_output': args.enable_debug_output,
                 'max_draft_len': args.max_draft_len,
+                'speculative_decoding_mode': speculative_decoding_mode,
                 'input_timing_cache': args.input_timing_cache,
                 'output_timing_cache': args.output_timing_cache,
                 'auto_parallel_config': {

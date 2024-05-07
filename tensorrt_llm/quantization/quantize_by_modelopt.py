@@ -88,7 +88,7 @@ KV_CACHE_CFG = {
 
 
 def quant_cfg_choices():
-    import ammo.torch.quantization as atq
+    import modelopt.torch.quantization as atq
     QUANT_CFG_CHOICES = {
         "int8_sq": atq.INT8_SMOOTHQUANT_CFG,
         "fp8": atq.FP8_DEFAULT_CFG,
@@ -116,6 +116,7 @@ MODEL_NAME_PATTERN_MAP = {
     "QWen": "qwen",
     "Gemma": "gemma",
     "MixtralForCausalLM": "llama",
+    "ArcticForCausalLM": "llama",
 }
 
 
@@ -161,10 +162,11 @@ def get_model(ckpt_path, dtype="fp16", device="cuda"):
         AutoModelForCausalLM.register(LlavaConfig, LlavaLlamaForCausalLM)
 
     model_kwargs = {"torch_dtype": "auto"}
-    model = AutoModelForCausalLM.from_pretrained(ckpt_path,
-                                                 device_map="auto",
-                                                 **model_kwargs,
-                                                 trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        ckpt_path,
+        device_map="auto" if device != "cpu" else "cpu",
+        **model_kwargs,
+        trust_remote_code=True)
     model.eval()
 
     model_dtype = next(model.parameters()).dtype
@@ -219,7 +221,7 @@ def get_calib_dataloader(data="cnn_dailymail",
 
 
 def quantize_model(model, quant_cfg, calib_dataloader=None):
-    import ammo.torch.quantization as atq
+    import modelopt.torch.quantization as atq
 
     def calibrate_loop():
         if calib_dataloader is None:
@@ -245,19 +247,18 @@ def quantize_and_export(*, model_dir, dtype, device, qformat, kv_cache_dtype,
                         calib_size, batch_size, awq_block_size, output_dir,
                         tp_size, pp_size, seed, max_seq_length):
     '''
-        Load model from the model_dir, call AMMO to quantize the model, and then export
+        Load model from the model_dir, call Modelopt to quantize the model, and then export
         the quantized model as TRT-LLM checkpoint
     '''
     try:
-        import ammo  # noqa
+        import modelopt  # noqa
     except ImportError as e:
         logger.error(
-            "Failed to import ammo, pls check the AMMO installation. Currently it is known to be unsupported on Windows OS"
+            "Failed to import modelopt, pls check the Modelopt installation. Currently it is known to be unsupported on Windows OS"
         )
         raise e
-    from ammo.torch.export import export_tensorrt_llm_checkpoint
-    from ammo.torch.export.tensorrt_llm_utils import MODEL_NAME_TO_HF_ARCH_MAP
-    MODEL_NAME_TO_HF_ARCH_MAP.update({"gpt2": "GPTForCausalLM"})
+
+    from modelopt.torch.export import export_tensorrt_llm_checkpoint
 
     if not torch.cuda.is_available():
         raise EnvironmentError("GPU is required for inference.")
@@ -360,7 +361,7 @@ def quantize_and_export(*, model_dir, dtype, device, qformat, kv_cache_dtype,
         with open(f"{export_path}/config.json", "w") as f:
             json.dump(tensorrt_llm_config, f, indent=4)
 
-        # Workaround for AMMO 0.9.x fp8_kv_cache knob issue
+        # Workaround for Modelopt 0.9.x fp8_kv_cache knob issue
         if qformat == 'fp8' and kv_cache_dtype is None:
             with open(f"{export_path}/config.json", "r") as f:
                 tensorrt_llm_config = json.load(f)

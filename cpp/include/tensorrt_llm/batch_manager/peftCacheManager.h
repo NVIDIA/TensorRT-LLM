@@ -19,7 +19,9 @@
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/workerPool.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
-#include <NvInferRuntimeBase.h>
+
+#include <NvInferRuntime.h>
+
 #include <future>
 #include <memory>
 #include <unordered_map>

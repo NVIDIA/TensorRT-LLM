@@ -47,7 +47,7 @@ Configuring and executing the Draft model within the Inflight Fused Batching (IF
 follows the same procedure as for any other model within IFB.
 The `maxNewTokens` parameter should be set to the number of draft tokens in the `LlmRequest` for the Draft model query.
 
-When building the Target model, it is necessary to specify the `--max_draft_len <K>` option to the `trtllm-build` command.
+When building the Target model, it is necessary to specify the `--max_draft_len <K> --speculative_decoding_mode draft_tokens_external` option to the `trtllm-build` command.
 During the Target model's inference phase in IFB, `maxNewTokens` should be set to `1`,
 and the draft tokens must be set in the `draftTokens` field of the `LlmRequest` for the Target model query.
 

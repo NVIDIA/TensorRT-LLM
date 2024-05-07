@@ -1347,10 +1347,11 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
     {
     case PositionEmbeddingType::kROPE_GPTJ:
     {
-        mmha::apply_rotary_embedding(
-            q, k, tidx, rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale, dst_kv_seq_idx);
+        mmha::apply_rotary_embedding(q, k, tidx, rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale, 0,
+            nullptr, dst_kv_seq_idx);
         break;
     }
+    case PositionEmbeddingType::kLONG_ROPE:
     case PositionEmbeddingType::kROPE_GPT_NEOX:
     {
         bool const do_rotary = !is_masked && vec_size * tidx < rotary_embedding_dim;
@@ -1379,7 +1380,7 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
             mmha::vec_from_smem_transpose(k, k_smem, transpose_idx, smem_pitch);
 
             mmha::apply_rotary_embedding(q, k, transpose_idx / tidx_factor, rotary_embedding_dim, rotary_embedding_base,
-                rotary_embedding_scale, dst_kv_seq_idx);
+                rotary_embedding_scale, 0, nullptr, dst_kv_seq_idx);
 
             mmha::write_smem_transpose(q, q_smem, transpose_idx, smem_pitch);
             mmha::write_smem_transpose(k, k_smem, transpose_idx, smem_pitch);
@@ -1469,9 +1470,10 @@ void invokeAddFusedQKVBiasTranspose(T* q_buf, T* k_buf, T* v_buf, T* QKV, T cons
         // To implement rotary embeddings, each thread processes two QKV elems:
         dim3 block((size_per_head / Vec_t<T>::size + 31) / 32 * 32);
         dim3 grid(token_num, head_num);
-        size_t smem_size
-            = (position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX ? 2 * rotary_embedding_dim * sizeof(T)
-                                                                                : 0);
+        size_t smem_size = (position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX
+                    || position_embedding_type == PositionEmbeddingType::kLONG_ROPE
+                ? 2 * rotary_embedding_dim * sizeof(T)
+                : 0);
         // NOTE: add offset for rotary embedding
         if (qkv_bias != nullptr)
         {
@@ -1858,9 +1860,10 @@ __global__ void shiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCa
     case PositionEmbeddingType::kROPE_GPTJ:
     {
         mmha::apply_rotary_embedding(
-            k, tidx, rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale, token_pos_idx);
+            k, tidx, rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale, 0, nullptr, token_pos_idx);
         break;
     }
+    case PositionEmbeddingType::kLONG_ROPE:
     case PositionEmbeddingType::kROPE_GPT_NEOX:
     {
         bool const do_rotary = vec_size * tidx < rotary_embedding_dim;
@@ -1885,7 +1888,7 @@ __global__ void shiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCa
         {
             mmha::vec_from_smem_transpose(k, k_smem, transpose_idx, smem_pitch);
             mmha::apply_rotary_embedding(k, transpose_idx / tidx_factor, rotary_embedding_dim, rotary_embedding_base,
-                rotary_embedding_scale, token_pos_idx);
+                rotary_embedding_scale, 0, nullptr, token_pos_idx);
             mmha::write_smem_transpose(k, k_smem, transpose_idx, smem_pitch);
         }
 
@@ -1919,8 +1922,10 @@ void invokeShiftKCache(KVCacheBuffer const& kvCacheBuffer, KVLinearBuffer const&
     int const vec_size = 16u / sizeof(T);
     dim3 block((sizePerHead / vec_size + 31) / 32 * 32);
     dim3 grid(token_num_in_k, kv_head_num, batch_beam);
-    size_t smem_size
-        = (position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX ? 2 * rotary_embedding_dim * sizeof(T) : 0);
+    size_t smem_size = (position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX
+                || position_embedding_type == PositionEmbeddingType::kLONG_ROPE
+            ? 2 * rotary_embedding_dim * sizeof(T)
+            : 0);
 
     if (cache_type == KvCacheDataType::INT8)
     {

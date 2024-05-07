@@ -8,6 +8,7 @@ import click
 
 from tensorrt_llm.hlapi import ModelConfig
 from tensorrt_llm.hlapi._perf_evaluator import LLMPerfEvaluator
+from tensorrt_llm.hlapi.llm import ModelLoader, _ModelFormatKind
 from tensorrt_llm.hlapi.utils import print_colored
 
 try:
@@ -66,8 +67,12 @@ def benchmark_main(model_path: str,
     if engine_output_dir:
         engine_output_dir = Path(engine_output_dir)
     elif cpp_executable:
-        temp_dir = tempfile.TemporaryDirectory()
-        engine_output_dir = Path(temp_dir.name)
+        if ModelLoader.get_model_format(
+                model_path) is _ModelFormatKind.TLLM_ENGINE:
+            engine_output_dir = model_path
+        else:
+            temp_dir = tempfile.TemporaryDirectory()
+            engine_output_dir = Path(temp_dir.name)
 
     def run_hlapi():
         print_colored(f"Running HLAPI benchmark ...\n", "bold_green")

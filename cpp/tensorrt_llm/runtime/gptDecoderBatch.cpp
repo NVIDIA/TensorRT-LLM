@@ -355,10 +355,15 @@ void GptDecoderBatch::newRequest(
             beamWidth, maxBeamWidth));
     auto const& requestIds = request.ids;
     auto const inputLength = request.inputLen;
-    auto const maxNewTokens = request.maxNewTokens.value_or(mMaxSequenceLength - inputLength);
-    TLLM_CHECK_WITH_INFO(inputLength + maxNewTokens <= mMaxSequenceLength,
-        tc::fmtstr("Input length (%d) + max new tokens (%d) must be less than max sequence length (%d).", inputLength,
-            maxNewTokens, mMaxSequenceLength));
+    auto const generatedTokensPerEngineStep = request.generatedTokensPerEngineStep;
+    auto const draftTokensPerEngineStep = generatedTokensPerEngineStep - 1;
+    auto const maxNewTokens
+        = request.maxNewTokens.value_or(mMaxSequenceLength - inputLength - draftTokensPerEngineStep);
+
+    TLLM_CHECK_WITH_INFO(inputLength + maxNewTokens + draftTokensPerEngineStep <= mMaxSequenceLength,
+        tc::fmtstr(
+            "Input length (%d) + max new tokens (%d) + draft tokens (%d) must be less than max sequence length (%d).",
+            inputLength, maxNewTokens, draftTokensPerEngineStep, mMaxSequenceLength));
     TLLM_CHECK(requestIds->getDataType() == TRTDataType<TokenIdType>::value);
     auto const endId = request.endId.value_or(-1);
 
@@ -498,7 +503,6 @@ void GptDecoderBatch::newRequest(
         dOutput->beamHypotheses.init(manager, endId);
     }
 
-    auto generatedTokensPerEngineStep = request.generatedTokensPerEngineStep;
     // Speculative execution
     if (generatedTokensPerEngineStep > 1)
     {

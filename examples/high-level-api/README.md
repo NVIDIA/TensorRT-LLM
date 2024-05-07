@@ -13,7 +13,14 @@ pip install -r requirements.txt
 You can refer to [llm_examples.py](llm_examples.py) for all of the examples, and run it with the [run_examples.py](./run_examples.py) script, the command is as follows:
 
 ```sh
-python3 ./run_examples.py <llama-model-path>
+# To run examples with single GPU:
+python3 ./run_examples.py run_single_gpu --model_dir <llama-model-path>
+
+# Run the multi-GPU examples
+python3 ./run_examples.py run_multi_gpu --model_dir <llama-model-path>
+
+# Run the quantization examples
+python3 ./run_examples.py run_quant --model_dir <llama-model-path>
 ```
 
 For 7B, 13B models those could be held in a single GPU, it should run all the examples automatically and print the results.

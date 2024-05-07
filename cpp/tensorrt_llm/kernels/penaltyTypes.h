@@ -49,8 +49,9 @@ inline std::pair<float, float> getLimitsPenalty(DecodingPenaltyType penaltyType)
     case DecodingPenaltyType::Presence: return std::make_pair(fltMin, fltMax);
     case DecodingPenaltyType::Frequency: return std::make_pair(fltMin, fltMax);
     case DecodingPenaltyType::MinLength: return std::make_pair(-fltEpsilon, fltMax);
-    default: TLLM_CHECK_WITH_INFO(false, "Unknown penalty type %d", static_cast<int32_t>(penaltyType));
     }
+    TLLM_CHECK_WITH_INFO(false, "Unknown penalty type %d", static_cast<int32_t>(penaltyType));
+    return std::make_pair(fltMin, fltMax);
 }
 } // namespace kernels
 } // namespace tensorrt_llm

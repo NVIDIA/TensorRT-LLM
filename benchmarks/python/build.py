@@ -168,6 +168,24 @@ def parse_arguments():
         help=
         "The number of gpus to be used for inference, only used when --serial_build is specified"
     )
+    parser.add_argument(
+        '--opt_batch_size',
+        type=int,
+        default=None,
+        help=
+        "If opt_batch_size option is specified, it will override the opt batch size."
+        "This flag only takes effect when `--mode=ootb` is added. For other modes, please use --opt_num_tokens to replace it."
+    )
+
+    parser.add_argument(
+        '--opt_num_tokens',
+        type=int,
+        default=None,
+        help="It equals to max_batch_size*max_beam_width by default, set this "
+        "value as close as possible to the actual number of tokens on your workload. "
+        "Note that this argument might be removed in the future."
+        "This flag only takes effect when `--mode` is not `ootb`. For ootb mode, please use --opt_batch_size to replace it."
+    )
 
     return parser.parse_args()
 
@@ -228,6 +246,21 @@ def build_gpt(args):
         if args.max_output_len is None else args.max_output_len
     max_beam_width = build_config['max_beam_width'] \
         if args.max_beam_width is None else args.max_beam_width
+
+    opt_batch_size = build_config[
+        'opt_batch_size'] if args.opt_batch_size is None else args.opt_batch_size
+
+    opt_num_tokens = build_config[
+        'opt_num_tokens'] if args.opt_num_tokens is None else args.opt_num_tokens
+
+    if args.mode != "ootb" and opt_batch_size is not None:
+        raise Exception(
+            f'--opt_batch_size only used when mode is ootb. Please using --opt_num_tokens instead it.'
+        )
+    if args.mode == "ootb" and opt_num_tokens is not None:
+        raise Exception(
+            f'--opt_num_tokens does not support ootb mode. Please using --opt_batch_size instead it.'
+        )
 
     quant_config = get_quant_config(args.quantization)
     quant_algo = quant_config.quant_algo
@@ -873,9 +906,11 @@ def build_gpt(args):
         # Inflight batching
         if args.mode == 'plugin-ifb':
             network.plugin_config.enable_paged_kv_cache()
+            network.plugin_config.enable_paged_state()
     elif args.mode == 'ootb-except-mha':
         network.plugin_config.set_gpt_attention_plugin(dtype=args.dtype)
         network.plugin_config.set_context_fmha(ContextFMHAType.enabled)
+        network.plugin_config.enable_remove_input_padding()
 
     if world_size > 1:
         network.plugin_config.set_nccl_plugin(
@@ -895,7 +930,9 @@ def build_gpt(args):
             max_input_len=max_input_len,
             max_seq_len=max_input_len + max_output_len,
             use_cache=True,
-            max_beam_width=max_beam_width)
+            max_beam_width=max_beam_width,
+            opt_batch_size=opt_batch_size,
+            opt_num_tokens=opt_num_tokens)
 
         tensorrt_llm_model(**inputs)
 

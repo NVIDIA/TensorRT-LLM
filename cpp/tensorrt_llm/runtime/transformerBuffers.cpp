@@ -47,7 +47,14 @@ TransformerBuffers::TransformerBuffers(
     auto& engine = runtime.getEngine();
 
     auto const localNbLayers = modelConfig.getNbAttentionLayers(worldConfig.getPipelineParallelism());
-    auto const firstLayerId = worldConfig.getPipelineParallelRank() * localNbLayers;
+    auto firstAttentionLayerId = worldConfig.getPipelineParallelRank() * localNbLayers;
+
+    auto const& layerTypes = modelConfig.getLayerTypes();
+    if (!layerTypes.empty())
+    {
+        firstAttentionLayerId
+            = std::find(layerTypes.begin(), layerTypes.end(), ModelConfig::LayerType::kATTENTION) - layerTypes.begin();
+    }
 
     nvinfer1::DataType kvDtype;
     if (modelConfig.usePagedKvCache())
@@ -58,7 +65,7 @@ TransformerBuffers::TransformerBuffers(
     {
         kvDtype = modelConfig.getQuantMode().hasFp8KvCache()
             ? nvinfer1::DataType::kFP8
-            : engine.getTensorDataType(("present_key_value_" + std::to_string(firstLayerId)).c_str());
+            : engine.getTensorDataType(("present_key_value_" + std::to_string(firstAttentionLayerId)).c_str());
     }
 
     if (modelConfig.usePagedKvCache())
@@ -290,7 +297,8 @@ void TransformerBuffers::prepareContextStep(RuntimeBuffers* runtimeBuffers, Tens
         auto const contextLengthsHostPtr = bufferCast<SizeType const>(*contextLengthsHost);
         auto const modelVariant = modelConfig.getModelVariant();
 
-        if (modelVariant == ModelConfig::ModelVariant::kGpt)
+        if (modelVariant == ModelConfig::ModelVariant::kGpt
+            || modelVariant == ModelConfig::ModelVariant::kRecurrentGemma)
         {
             auto const inputSize = inputIds->getSize();
             std::vector<SizeType> positionIdsVec(inputSize);
@@ -582,7 +590,8 @@ void TransformerBuffers::prepareNextStep(RuntimeBuffers* runtimeBuffers, SizeTyp
 
         auto const modelVariant = modelConfig.getModelVariant();
 
-        if (modelVariant == ModelConfig::ModelVariant::kGpt)
+        if (modelVariant == ModelConfig::ModelVariant::kGpt
+            || modelVariant == ModelConfig::ModelVariant::kRecurrentGemma)
         {
             positionIds->reshape(inputShape);
             manager.copy(*contextLengthsDevice, *positionIds);
@@ -662,8 +671,8 @@ void TransformerBuffers::prepareNextStep(RuntimeBuffers* runtimeBuffers, SizeTyp
 }
 
 void TransformerBuffers::getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers, TensorMap& inputBuffers,
-    TensorMap& outputBuffers, SizeType const step, TensorPtr const& inputIds, TensorPtr const& commPtrs,
-    ModelConfig const& modelConfig, WorldConfig const& worldConfig) const
+    TensorMap& outputBuffers, SizeType const step, TensorPtr const& inputIds, ModelConfig const& modelConfig,
+    WorldConfig const& worldConfig) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     inputBuffers.clear();
@@ -704,6 +713,7 @@ void TransformerBuffers::getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers,
 
     auto const localNbLayers = modelConfig.getNbAttentionLayers(worldConfig.getPipelineParallelism());
     auto const firstLayerId = worldConfig.getPipelineParallelRank() * localNbLayers;
+    auto const& layerTypes = modelConfig.getLayerTypes();
 
     if (modelConfig.useGptAttentionPlugin())
     {
@@ -726,8 +736,10 @@ void TransformerBuffers::getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers,
         }
         else
         {
-            utils::insertTensorVector(inputBuffers, "past_key_value_", presentKeysVals, firstLayerId);
-            utils::insertTensorVector(outputBuffers, "present_key_value_", presentKeysVals, firstLayerId);
+            utils::insertTensorVector(inputBuffers, "past_key_value_", presentKeysVals, firstLayerId, layerTypes,
+                ModelConfig::LayerType::kATTENTION);
+            utils::insertTensorVector(outputBuffers, "present_key_value_", presentKeysVals, firstLayerId, layerTypes,
+                ModelConfig::LayerType::kATTENTION);
         }
     }
     else
@@ -744,6 +756,7 @@ void TransformerBuffers::getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers,
         char* disableReuseChar = std::getenv("TRTLLM_DISABLE_OOTB_KVCACHE_REUSE");
         bool reuse = (disableReuseChar == nullptr || std::string(disableReuseChar) != "ON");
 
+        // TODO: fix for recurrentgemma
         for (int32_t idx = 0; idx < localNbLayers; ++idx)
         {
             TensorPtr input;

@@ -37,18 +37,20 @@ class GPTAttentionPluginCommon : public BasePlugin
 public:
     GPTAttentionPluginCommon() = delete;
 
-    GPTAttentionPluginCommon(int layer_idx, int num_heads, int num_kv_heads, int head_size, int unidirectional,
-        float q_scaling, tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
+    GPTAttentionPluginCommon(int layer_idx, int num_heads, int vision_start, int vision_length, int num_kv_heads,
+        int head_size, int unidirectional, float q_scaling,
+        tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
         int rotary_embedding_dim, // for RoPE. Use 0 for non-RoPE
         float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
-        float rotary_embedding_scale, int rotary_embedding_max_positions, int tp_size, int tp_rank, // for ALiBi
-        bool unfuse_qkv_gemm,                                                                       // for AutoPP
+        float rotary_embedding_scale, float rotary_embedding_m_scale, int rotary_embedding_max_positions, int tp_size,
+        int tp_rank,          // for ALiBi
+        bool unfuse_qkv_gemm, // for AutoPP
         tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool multi_block_mode, bool enable_xqa,
         int kv_cache_quant_mode, bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type,
         bool paged_kv_cache, int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length,
         bool qkv_bias_enabled, bool cross_attention = false, int max_distance = 0, bool pos_shift_enabled = false,
         bool dense_context_fmha = false, bool use_paged_context_fmha = false, bool use_fp8_context_fmha = false,
-        bool use_cache = true, bool is_medusa_enabled = false);
+        bool use_cache = true, bool is_spec_decoding_enabled = false);
 
     GPTAttentionPluginCommon(void const* data, size_t length);
 
@@ -73,7 +75,7 @@ public:
     //! So plugin should put the resource release inside destroy.
     void destroy() noexcept override;
 
-    static size_t getCommonSerializationSize() noexcept;
+    size_t getCommonSerializationSize() const noexcept;
     void serializeCommon(void* buffer) const noexcept;
     int const getHeadSize(bool checkInit = true) const;
 
@@ -144,6 +146,7 @@ protected:
         float const* kv_scale_orig_quant;
         float const* kv_scale_quant_orig;
         float const* attention_output_orig_quant;
+        float const* rotary_embedding_scaling_factors;
         T const* alibi_slopes;
         T* context_buf;
         void* key_value_cache;
@@ -168,10 +171,10 @@ protected:
         // optional when cross attention
         int32_t const* encoder_input_lengths = nullptr;
         int32_t const* host_context_lengths = nullptr;
-        // optional when medusa is used.
-        bool const* medusa_mask = nullptr;
-        int32_t const* medusa_packed_mask = nullptr;
-        int32_t const* medusa_position_offsets = nullptr;
+        // optional when speculative decoding is used.
+        bool const* spec_decoding_mask = nullptr;
+        int32_t const* spec_decoding_packed_mask = nullptr;
+        int32_t const* spec_decoding_position_offsets = nullptr;
     };
 
     template <typename T, typename KVCacheBuffer>
@@ -204,7 +207,13 @@ protected:
     bool isRoPE() const
     {
         return mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kROPE_GPTJ
-            || mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kROPE_GPT_NEOX;
+            || mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kROPE_GPT_NEOX
+            || mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kLONG_ROPE;
+    }
+
+    bool isLongRoPE() const
+    {
+        return mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kLONG_ROPE;
     }
 
     bool isCrossAttention() const
@@ -228,6 +237,8 @@ protected:
 
     int mLayerIdx;
     int mNumHeads;
+    int mVisionStart;
+    int mVisionLength;
     int mNumKVHeads;
     int mHeadSize;
     int mUnidirectional;
@@ -236,6 +247,7 @@ protected:
     float mRotaryEmbeddingBase;
     tensorrt_llm::kernels::RotaryScalingType mRotaryEmbeddingScaleType;
     float mRotaryEmbeddingScale;
+    float mRotaryEmbeddingMscale;
     int mRotaryEmbeddingMaxPositions;
     tensorrt_llm::kernels::PositionEmbeddingType mPositionEmbeddingType;
     bool mRemovePadding = false;
@@ -256,11 +268,11 @@ protected:
     bool mPagedContextFMHA = false;
     bool mFP8ContextFMHA = false;
     bool mDenseContextFMHA = false;
-    bool mIsMedusaEnabled = false;
+    bool mIsSpecDecodingEnabled = false;
 
-    // Medusa packed mask.
-    uint4* mMedusaPackedMask;
-    uint4* mMedusaPackedHostMask;
+    // Speculative decoding packed mask.
+    uint4* mSpecDecodingPackedMask;
+    uint4* mSpecDecodingPackedHostMask;
 
     // fmha runner (disable by default)
     // flag: disabled = 0, enabled = 1, enabled with fp32 accumulation = 2
@@ -270,7 +282,9 @@ protected:
     int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
     int mMaxSharedMemoryPerBlockOptin = tensorrt_llm::common::getMaxSharedMemoryPerBlockOptin();
     // The default copy constructor will leave it as nullptr. clone() shall initialize it.
+    std::shared_ptr<CUDADriverWrapper> mDriver;
     UniqPtrWNullCopy<tensorrt_llm::kernels::MHARunner> mFMHARunner;
+    tensorrt_llm::kernels::DecoderXQARunner::Resource mDecoderXQARunnerResource;
     UniqPtrWNullCopy<tensorrt_llm::kernels::DecoderXQARunner> mDecoderXQARunner;
 
     bool mMultiBlockMode;
