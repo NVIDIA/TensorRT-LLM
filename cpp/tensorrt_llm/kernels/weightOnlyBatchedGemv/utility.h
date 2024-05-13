@@ -306,6 +306,58 @@ private:
     int step_;
     int stride_;
 };
+
+template <bool Enable, typename TVec, int Continuous, typename T>
+class SHMemIterator
+{
+public:
+    __device__ __forceinline__  SHMemIterator(T* g_addr, int g_offset, T* sh_addr, int sh_offset,
+    int step, int stride, int sz_size)
+        : g_addr_(Enable ? (g_addr + g_offset) : nullptr)
+        , sh_addr_(Enable ? sh_addr : nullptr)
+        , sh_offset_(sh_offset)
+        , step_(step)
+        , stride_(stride)
+        , sz_size_(sz_size)
+    {
+
+    }
+
+    __device__ __forceinline__ void load(int iter)
+    {
+        if constexpr (Enable)
+        {
+#pragma unroll
+            for (int i = threadIdx.x % sz_size_; i < Continuous; i += sz_size_) {
+                __pipeline_memcpy_async(
+                    reinterpret_cast<TVec*>(sh_addr_) + i,
+                    reinterpret_cast<TVec*>(g_addr_ + iter * step_) + i,
+                    sizeof(TVec),
+                    0
+                );                    
+                __pipeline_commit();
+            }
+            __pipeline_wait_prior(0);
+        }
+    }
+
+    __device__ __forceinline__ T* iter(int ii = 0)
+    {
+        if constexpr (Enable) {
+            return &sh_addr_[ii * stride_ + sh_offset_];
+        }
+        return nullptr;
+    }
+
+private:
+    T* g_addr_;
+    int step_;
+    T* sh_addr_;
+    int sh_offset_;
+    int stride_;
+    int sz_size_;
+};
+
 } // namespace weight_only
 } // namespace kernels
 } // namespace tensorrt_llm

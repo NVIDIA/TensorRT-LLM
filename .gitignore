@@ -35,6 +35,9 @@ tensorrt_llm/bindings/*.pyi
 *docs/source/_cpp_gen*
 *.swp
 
+# Debugging Purpose
+.env
+
 # Testing
 .coverage.*
 results_trt/

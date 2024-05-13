@@ -58,12 +58,22 @@ __global__ void kernel(TypeA* act, TypeA* act_scale, uint8_t* weight, TypeA* sca
 
     int const tile_id_m = blockIdx.x, tile_id_n = blockIdx.y, tid = threadIdx.x;
     int const offset_m = tile_id_m * CtaM, interleaved_offset_n = tile_id_n * CtaN;
-    int const real_offset_n = interleaved_offset_n * Details::kInterleave
-        + ((tid * StepK / Details::LayoutDetails::kTileSize) % Details::kInterleave);
+    int const blk_offset_n = interleaved_offset_n * Details::kInterleave;
+    int const thr_offset_n = (tid / Details::kThreadsPerInterleavedTile) % Details::kInterleave;
     int const real_offset_k
         = (tid * StepK / (Details::kInterleave * Details::LayoutDetails::kTileSize)) * Details::LayoutDetails::kTileSize
         + ((tid * StepK) % Details::LayoutDetails::kTileSize);
+    int const offset_k_group = (GroupSize != 0 ? real_offset_k / GroupSize : 0);
 
+    extern __shared__ TypeA shmem_sz[];
+    // dimension of each is [kInterleave * CtaN, {Threads * kInterleave * kThreadsPerInterleavedTile / GroupSize or 1}]
+    TypeA* vec_scale = shmem_sz + CtaN * Details::kInterleave * offset_k_group;
+    TypeA* vec_zero = nullptr;
+    if constexpr (EnableZero)
+    {
+        vec_zero = shmem_sz + CtaN * Details::kInterleave * (GroupSize != 0 ? Threads * Details::kInterleave * Details::kThreadsPerInterleavedTile / GroupSize : 1);
+        vec_zero += CtaN * Details::kInterleave * offset_k_group;
+    }
     GMemIterator<Mandatory, AccessTypeA, CtaM, Details::kAccessNumA, TypeA> act_iterator(
         act, offset_m * origin_k + real_offset_k, CtaK / Details::kInterleave, origin_k);
     GMemIterator<EnableActScale, AccessTypeA, 1, Details::kAccessNumA, TypeA> act_scale_iterator(
@@ -71,12 +81,16 @@ __global__ void kernel(TypeA* act, TypeA* act_scale, uint8_t* weight, TypeA* sca
     GMemIterator<Mandatory, AccessTypeW, CtaN, Details::kAccessNumW, uint8_t> weight_iterator(weight,
         (interleaved_offset_n * interleaved_k + tid * StepK) / Details::kElemsPerByteW, CtaK / Details::kElemsPerByteW,
         interleaved_k / Details::kElemsPerByteW);
-    GMemIterator<Mandatory, TypeA, CtaN, 1, TypeA> scales_iterator(scales,
-        (GroupSize != 0 ? real_offset_k / GroupSize * n : 0) + real_offset_n,
-        (GroupSize != 0 ? CtaK / Details::kInterleave / GroupSize * n : 0), Details::kInterleave);
-    GMemIterator<EnableZero, TypeA, CtaN, 1, TypeA> zeros_iterator(zeros,
-        (GroupSize != 0 ? real_offset_k / GroupSize * n : 0) + real_offset_n,
-        (GroupSize != 0 ? CtaK / Details::kInterleave / GroupSize * n : 0), Details::kInterleave);
+    SHMemIterator<Mandatory, AccessTypeA, CtaN * Details::kInterleave * sizeof(TypeA) / sizeof(AccessTypeA), TypeA> scales_iterator(scales,
+        offset_k_group * n + blk_offset_n, vec_scale, thr_offset_n,
+        (GroupSize != 0 ? CtaK / Details::kInterleave / GroupSize * n : 0), Details::kInterleave,
+        (GroupSize != 0 ? GroupSize / Details::kInterleave / Details::kThreadsPerInterleavedTile : CtaN * Details::kInterleave)
+        );
+    SHMemIterator<EnableZero, AccessTypeA, CtaN * Details::kInterleave * sizeof(TypeA) / sizeof(AccessTypeA), TypeA> zeros_iterator(zeros,
+        offset_k_group * n + blk_offset_n, vec_zero, thr_offset_n,
+        (GroupSize != 0 ? CtaK / Details::kInterleave / GroupSize * n : 0), Details::kInterleave,
+        (GroupSize != 0 ? GroupSize / Details::kInterleave / Details::kThreadsPerInterleavedTile : CtaN * Details::kInterleave)
+        );
 
     out += offset_m * n + tile_id_n * CtaN * Details::kInterleave;
     if constexpr (EnableBias)
@@ -90,22 +104,19 @@ __global__ void kernel(TypeA* act, TypeA* act_scale, uint8_t* weight, TypeA* sca
     for (int idx_k = tid * StepK, iter = 0; idx_k < interleaved_k; idx_k += CtaK, ++iter)
     {
         TypeA vec_act_scale[StepK];
-        TypeA vec_scale[CtaN], vec_zero[CtaN];
         TypeA tile_a[StepK], tile_w[StepK], tile_w_pack2[CtaN * StepK];
         uint8_t tile_w_quantized[StepK / Details::kElemsPerByteW];
-#pragma unroll
-        for (int i = 0; i < CtaN; ++i)
-        {
-            scales_iterator.load(vec_scale + i, iter, i);
-            zeros_iterator.load(vec_zero + i, iter, i);
-        }
+
+        scales_iterator.load(iter);
+        zeros_iterator.load(iter);
         act_scale_iterator.load(vec_act_scale, iter);
 #pragma unroll
         for (int i = 0; i < CtaN; ++i)
         {
             weight_iterator.load(tile_w_quantized, iter, i);
             dequantize<Details, 1, StepK, EnableZero, ApplyAlphaInAdvance>(
-                tile_w, tile_w_quantized, vec_scale + i, vec_zero + i, alpha);
+                tile_w, tile_w_quantized, scales_iterator.iter(i),
+                zeros_iterator.iter(i), alpha);
             pack_to_vec2<Details, StepK>(tile_w_pack2, tile_w, i);
         }
 #pragma unroll
@@ -130,8 +141,11 @@ void exec_kernel(Params& params, cudaStream_t s)
     }
     dim3 grid(params.m / CtaM, params.n / (CtaN * Details::kInterleave));
     dim3 block(Threads);
+    int const shmem_size = (EnableZero ? 2 : 1) * CtaN * Details::kInterleave * sizeof(T)
+        * (GroupSize != 0 ? Threads * Details::kInterleave * Details::kThreadsPerInterleavedTile / GroupSize : 1);
     // clang-format off
-    kernel<Details, CtaM, CtaN, Threads, GroupSize, EnableActScale, EnableZero, EnableBias, ApplyAlphaInAdvance><<<grid, block, 0, s>>>(
+    kernel<Details, CtaM, CtaN, Threads, GroupSize, EnableActScale, EnableZero, EnableBias, ApplyAlphaInAdvance><<<
+        grid, block, shmem_size, s>>>(
         reinterpret_cast<T*>(params.act),
         reinterpret_cast<T*>(params.act_scale),
         reinterpret_cast<uint8_t*>(params.weight),
