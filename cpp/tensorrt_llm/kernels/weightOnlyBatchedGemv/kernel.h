@@ -58,20 +58,21 @@ __global__ void kernel(TypeA* act, TypeA* act_scale, uint8_t* weight, TypeA* sca
 
     int const tile_id_m = blockIdx.x, tile_id_n = blockIdx.y, tid = threadIdx.x;
     int const offset_m = tile_id_m * CtaM, interleaved_offset_n = tile_id_n * CtaN;
-    int const real_offset_n = interleaved_offset_n * Details::kInterleave
-        + (tid / Details::kThreadsPerInterleavedTile) % Details::kInterleave;
+    int const blk_offset_n = interleaved_offset_n * Details::kInterleave;
+    int const thr_offset_n = (tid / Details::kThreadsPerInterleavedTile) % Details::kInterleave;
     int const real_offset_k
         = (tid * StepK / (Details::kInterleave * Details::LayoutDeatils::kTileSize)) * Details::LayoutDeatils::kTileSize
         + ((tid * StepK) % Details::LayoutDeatils::kTileSize);
+    int const offset_k_group = (GroupSize != 0 ? real_offset_k / GroupSize : 0);
 
     extern __shared__ TypeA shmem_sz[];
     // dimension of each is [kInterleave * CtaN, {Threads * kInterleave * kThreadsPerInterleavedTile / GroupSize or 1}]
-    TypeA* vec_scale = shmem_sz + CtaN * Details::kInterleave * (GroupSize != 0 ? real_offset_k / GroupSize : 0);
+    TypeA* vec_scale = shmem_sz + CtaN * Details::kInterleave * offset_k_group;
     TypeA* vec_zero = nullptr;
     if constexpr (EnableZero)
     {
         vec_zero = shmem_sz + CtaN * Details::kInterleave * (GroupSize != 0 ? Threads * Details::kInterleave * Details::kThreadsPerInterleavedTile / GroupSize : 1);
-        vec_zero += CtaN * Details::kInterleave * (GroupSize != 0 ? real_offset_k / GroupSize : 0);
+        vec_zero += CtaN * Details::kInterleave * offset_k_group;
     }
     GMemIterator<Mandatory, AccessTypeA, CtaM, Details::kAccessNumA, TypeA> act_iterator(
         act, offset_m * origin_k + real_offset_k, CtaK / Details::kInterleave, origin_k);
@@ -81,14 +82,12 @@ __global__ void kernel(TypeA* act, TypeA* act_scale, uint8_t* weight, TypeA* sca
         (interleaved_offset_n * interleaved_k + tid * StepK) / Details::kElemsPerByteW, CtaK / Details::kElemsPerByteW,
         interleaved_k / Details::kElemsPerByteW);
     SHMemIterator<Mandatory, AccessTypeA, CtaN * Details::kInterleave * sizeof(TypeA) / sizeof(AccessTypeA), TypeA> scales_iterator(scales,
-        (GroupSize != 0 ? real_offset_k / GroupSize * n : 0) + interleaved_offset_n * Details::kInterleave,
-        vec_scale, (tid / Details::kThreadsPerInterleavedTile) % Details::kInterleave,
+        offset_k_group * n + blk_offset_n, vec_scale, thr_offset_n,
         (GroupSize != 0 ? CtaK / Details::kInterleave / GroupSize * n : 0), Details::kInterleave,
         (GroupSize != 0 ? GroupSize / Details::kInterleave / Details::kThreadsPerInterleavedTile : CtaN * Details::kInterleave)
         );
     SHMemIterator<EnableZero, AccessTypeA, CtaN * Details::kInterleave * sizeof(TypeA) / sizeof(AccessTypeA), TypeA> zeros_iterator(zeros,
-        (GroupSize != 0 ? real_offset_k / GroupSize * n : 0) + interleaved_offset_n * Details::kInterleave,
-        vec_zero, (tid / Details::kThreadsPerInterleavedTile) % Details::kInterleave,
+        offset_k_group * n + blk_offset_n, vec_zero, thr_offset_n,
         (GroupSize != 0 ? CtaK / Details::kInterleave / GroupSize * n : 0), Details::kInterleave,
         (GroupSize != 0 ? GroupSize / Details::kInterleave / Details::kThreadsPerInterleavedTile : CtaN * Details::kInterleave)
         );
@@ -142,10 +141,9 @@ void exec_kernel(Params& params, cudaStream_t s)
     }
     dim3 grid(params.m / CtaM, params.n / (CtaN * Details::kInterleave));
     dim3 block(Threads);
-    const int shmem_size =
-        (EnableZero ? 2 : 1) * CtaN * Details::kInterleave * sizeof(T)
+    int const shmem_size = (EnableZero ? 2 : 1) * CtaN * Details::kInterleave * sizeof(T)
         * (GroupSize != 0 ? Threads * Details::kInterleave * Details::kThreadsPerInterleavedTile / GroupSize : 1);
-        // clang-format off
+    // clang-format off
     kernel<Details, CtaM, CtaN, Threads, GroupSize, EnableActScale, EnableZero, EnableBias, ApplyAlphaInAdvance><<<
         grid, block, shmem_size, s>>>(
         reinterpret_cast<T*>(params.act),
