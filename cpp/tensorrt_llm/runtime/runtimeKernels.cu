@@ -581,7 +581,7 @@ void invokeCopyInputToOutputTransposed(ITensor& outputIds, ITensor const& inputI
             std::size_t(batchSize)));
     TLLM_CHECK_WITH_INFO(batchSize == outputShape.d[1],
         common::fmtstr(
-            "Output ids batch size (%d) does not match inputLengths size (%d)", outputShape.d[1], batchSize));
+            "Output ids batch size (" FMT_DIM ") does not match inputLengths size (%d)", outputShape.d[1], batchSize));
     TLLM_CHECK_WITH_INFO(maxInputLength < maxSeqLength,
         common::fmtstr(
             "Output sequence length (%d) has to be larger than max input length (%d)", maxSeqLength, maxInputLength));
@@ -634,8 +634,8 @@ void invokeCopyPackedInputToOutputTransposed(ITensor& outputIds, ITensor const& 
     SizeType const beamWidth = outputShape.d[2];
 
     TLLM_CHECK_WITH_INFO(batchSize == outputShape.d[1],
-        common::fmtstr(
-            "Output ids batch size (%d) does not match inputOffsets batch size (%d)", outputShape.d[1], batchSize));
+        common::fmtstr("Output ids batch size (" FMT_DIM ") does not match inputOffsets batch size (%d)",
+            outputShape.d[1], batchSize));
     TLLM_CHECK_WITH_INFO(maxInputLength < maxSeqLength,
         common::fmtstr(
             "Output sequence length (%d) has to be larger than max input length (%d)", maxSeqLength, maxInputLength));
@@ -695,7 +695,7 @@ void invokeCopyInputToOutput(ITensor& outputIds, ITensor const& inputIds, ITenso
             std::size_t(batchSize)));
     TLLM_CHECK_WITH_INFO(batchSize == outputShape.d[0],
         common::fmtstr(
-            "Output ids batch size (%d) does not match inputLengths size (%d)", outputShape.d[0], batchSize));
+            "Output ids batch size (" FMT_DIM ") does not match inputLengths size (%d)", outputShape.d[0], batchSize));
     TLLM_CHECK_WITH_INFO(maxInputLength < maxSeqLength,
         common::fmtstr(
             "Output sequence length (%d) has to be larger than max input length (%d)", maxSeqLength, maxInputLength));
@@ -751,8 +751,8 @@ void invokeCopyPackedInputToOutput(ITensor& outputIds, ITensor const& inputIds, 
     SizeType const maxSeqLength = outputShape.d[2];
 
     TLLM_CHECK_WITH_INFO(batchSize == outputShape.d[0],
-        common::fmtstr(
-            "Output ids batch size (%d) does not match inputOffsets batch size (%d)", outputShape.d[0], batchSize));
+        common::fmtstr("Output ids batch size (" FMT_DIM ") does not match inputOffsets batch size (%d)",
+            outputShape.d[0], batchSize));
     TLLM_CHECK_WITH_INFO(maxInputLength < maxSeqLength,
         common::fmtstr(
             "Output sequence length (%d) has to be larger than max input length (%d)", maxSeqLength, maxInputLength));
@@ -1217,16 +1217,17 @@ void mergeLogitsFragments(BufferManager const& bufferManager, ITensor& output, s
 }
 
 void invokeUpdateKVBlockArrayDraftTokenLocation(ITensor const& seqAcceptedDraftTokenOffsets,
-    ITensor const& packedAcceptedDraftTokensIndices, ITensor const& pastKeyValueLengths, int64_t* const* pointerArray,
-    SizeType layerCount, SizeType seqCount, SizeType numKVHeads, SizeType sizeInBytesPerKVHead,
-    SizeType rewindDraftTokenCommonCount, int* rewindDraftTokenSeparateAdjustments, ITensor const& seqSlotRemapping,
-    SizeType maxKVCacheLen, SizeType maxBlocksPerSeq, SizeType tokensPerBlock, cudaStream_t stream)
+    ITensor const& packedAcceptedDraftTokensIndices, ITensor const& pastKeyValueLengths, void* const* pointerArray,
+    ::tensorrt_llm::kernels::KVCacheIndex const* offsetArray, SizeType layerCount, SizeType seqCount,
+    SizeType numKVHeads, SizeType sizeInBytesPerKVHead, SizeType rewindDraftTokenCommonCount,
+    int* rewindDraftTokenSeparateAdjustments, ITensor const& seqSlotRemapping, SizeType maxKVCacheLen,
+    SizeType maxBlocksPerSeq, SizeType tokensPerBlock, cudaStream_t stream)
 {
     tensorrt_llm::kernels::parallel_decoding::updateKVBlockArrayDraftTokenLocation(
         bufferCast<SizeType>(seqAcceptedDraftTokenOffsets), bufferCast<SizeType>(packedAcceptedDraftTokensIndices),
-        bufferCast<SizeType>(pastKeyValueLengths), pointerArray, layerCount, seqCount, numKVHeads, sizeInBytesPerKVHead,
-        rewindDraftTokenCommonCount, rewindDraftTokenSeparateAdjustments, bufferCast<SizeType>(seqSlotRemapping),
-        maxKVCacheLen, maxBlocksPerSeq, tokensPerBlock, stream);
+        bufferCast<SizeType>(pastKeyValueLengths), pointerArray, offsetArray, layerCount, seqCount, numKVHeads,
+        sizeInBytesPerKVHead, rewindDraftTokenCommonCount, rewindDraftTokenSeparateAdjustments,
+        bufferCast<SizeType>(seqSlotRemapping), maxKVCacheLen, maxBlocksPerSeq, tokensPerBlock, stream);
 }
 
 } // namespace tensorrt_llm::runtime::kernels

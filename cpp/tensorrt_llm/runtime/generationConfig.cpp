@@ -41,14 +41,14 @@ GenerationConfig GenerationConfig::fromInput(ITensor const& inputIds, ITensor& i
         {
             TLLM_CHECK_WITH_INFO(inputShape.d[0] == inputLengthSum,
                 "Packed 1D input must have shape [<sum of input lengths>]. Expected (Infer from inputLengths): [%d], "
-                "supplied: [%d]",
+                "supplied: [" FMT_DIM "]",
                 inputLengthSum, inputShape.d[0]);
         }
         else if (inputShape.nbDims == 2)
         {
             TLLM_CHECK_WITH_INFO(inputShape.d[1] == inputLengthSum,
                 "Packed 2D input must have shape [1, <sum of input lengths>]. Expected (Infer from inputLengths): [1, "
-                "%d], supplied: [%d, %d]",
+                "%d], supplied: [" FMT_DIM ", " FMT_DIM "]",
                 inputLengthSum, inputShape.d[0], inputShape.d[1]);
         }
     }

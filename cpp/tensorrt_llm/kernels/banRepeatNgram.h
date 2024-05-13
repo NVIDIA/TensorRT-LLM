@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/kernels/decodingCommon.h"
+#include "tensorrt_llm/runtime/common.h"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -26,9 +27,11 @@ namespace kernels
 {
 
 template <typename T>
-void invokeBanRepeatNgram(T* logits, int const** output_ids_buf, FinishedState const* finished_buf,
-    int const** parent_ids_buf, int const* batch_slot, int const* sequence_lengths, int batch_size, int beam_width,
-    int max_seq_len, int const* no_repeat_ngram_size_buf, int vocab_size_padded, size_t max_step, cudaStream_t stream);
+void invokeBanRepeatNgram(T* logits, runtime::TokenIdType const** output_ids_buf, FinishedState const* finished_buf,
+    runtime::SizeType32 const** parent_ids_buf, runtime::SizeType32 const* batch_slot,
+    runtime::SizeType32 const* sequence_lengths, runtime::SizeType batch_size, runtime::SizeType beam_width,
+    runtime::SizeType max_seq_len, runtime::SizeType32 const* no_repeat_ngram_size_buf,
+    runtime::SizeType vocab_size_padded, runtime::SizeType max_step, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm

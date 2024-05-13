@@ -190,8 +190,9 @@ private:
     using WarpFragmentB = typename Operator::FragmentB;
     Dequantizer warp_dequantizer_;
 
+    using ElementA = typename IteratorA::Element;
     using ElementB = typename IteratorB::Element;
-    using LayoutDetailsForB = kernel::LayoutDetailsB<ElementB, ArchTag>;
+    using LayoutDetailsForB = kernel::LayoutDetailsB<ElementA, ElementB, ArchTag>;
 
     static constexpr bool RequiresTileInterleave
         = layout::IsColumnMajorTileInterleave<typename LayoutDetailsForB::Layout>::value;
@@ -482,7 +483,7 @@ public:
             }
         }
 
-        // Waits until kStages-2 stages have committed.
+        // Wait until we have at least one committed global fetch stage. (#uncommitted = Base::kStages - 1 - #committed)
         cutlass::arch::cp_async_wait<Base::kStages - 2>();
         __syncthreads();
 
@@ -548,8 +549,17 @@ public:
                     = lds_converter(warp_frag_B[warp_tileB_k_load_offset % 2]);
                 warp_dequantizer_.dequantize(converted_frag_B, warp_frag_scales);
 
-                run_warp_mma(
-                    warp_mma, accum, warp_frag_A[warp_mma_k % 2], converted_frag_B, accum, warp_tileB_k_compute_offset);
+                using FragmentOperandB = cutlass::Array<ElementA, Operator::FragmentB::kElements>;
+                constexpr cutlass::FloatRoundStyle RoundStyle = cutlass::FloatRoundStyle::round_to_nearest;
+                constexpr int ConversionVectorWidth = TransformBAfterLDS::result_type::kElements;
+                static_assert(ConversionVectorWidth == FragmentOperandB::kElements);
+
+                using Converter
+                    = cutlass::NumericArrayConverter<ElementA, ElementScale, ConversionVectorWidth, RoundStyle>;
+
+                FragmentOperandB converted_frag_B_operand = Converter::convert(converted_frag_B);
+                run_warp_mma(warp_mma, accum, warp_frag_A[warp_mma_k % 2], converted_frag_B_operand, accum,
+                    warp_tileB_k_compute_offset);
 
                 // Issue global->shared copies for the this stage
                 if (warp_mma_k < Base::kWarpGemmIterations - 1)
@@ -573,7 +583,8 @@ public:
                     // Inserts a memory fence between stages of cp.async instructions.
                     cutlass::arch::cp_async_fence();
 
-                    // Waits until kStages-2 stages have committed.
+                    // Wait until we have at least one committed global fetch stage. (#uncommitted = Base::kStages - 1 -
+                    // #committed)
                     arch::cp_async_wait<Base::kStages - 2>();
                     __syncthreads();
 

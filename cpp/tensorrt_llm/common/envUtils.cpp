@@ -22,19 +22,56 @@
 namespace tensorrt_llm::common
 {
 
+static std::optional<int32_t> getIntEnv(char const* name)
+{
+    char const* const env = std::getenv(name);
+    if (env == nullptr)
+    {
+        return std::nullopt;
+    }
+    int32_t const val = std::stoi(env);
+    if (val <= 0)
+    {
+        return std::nullopt;
+    }
+    return {val};
+};
+
 // XQA kernels (optimized kernels for generation phase).
 bool forceXQAKernels()
 {
-    char const* force_xqa_env_var = getenv("TRTLLM_FORCE_XQA");
-    static bool forceXQA = false;
-    if (force_xqa_env_var != nullptr)
+    static bool const forceXQA = (getIntEnv("TRTLLM_FORCE_XQA").value_or(0) != 0);
+    return forceXQA;
+}
+
+int32_t xqaMaxNbCtaPerKVHeadFactor()
+{
+    return envXqaNbCtaPerKVHead().value_or(8);
+}
+
+std::optional<int32_t> envXqaNbCtaPerKVHead()
+{
+    static std::optional<int32_t> const ret = getIntEnv("TRTLLM_XQA_BLOCKS_PER_SEQUENCE");
+    return ret;
+}
+
+bool getEnvDisableXQAJIT()
+{
+    static bool init = false;
+    static bool disableXQAJIT = false;
+    if (!init)
     {
-        if (force_xqa_env_var[0] == '1' && force_xqa_env_var[1] == '\0')
+        init = true;
+        char const* disable_xqa_jit_var = std::getenv("TRTLLM_DISABLE_XQA_JIT");
+        if (disable_xqa_jit_var)
         {
-            forceXQA = true;
+            if (disable_xqa_jit_var[0] == '1' && disable_xqa_jit_var[1] == '\0')
+            {
+                disableXQAJIT = true;
+            }
         }
     }
-    return forceXQA;
+    return disableXQAJIT;
 }
 
 // Tune the number of blocks per sequence for accuracy/performance purpose.

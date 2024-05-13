@@ -94,11 +94,13 @@ setup(
     package_data={
         'tensorrt_llm': ([
             'libs/th_common.dll', 'libs/tensorrt_llm.dll',
-            'libs/nvinfer_plugin_tensorrt_llm.dll', 'bindings.*.pyd'
+            'libs/nvinfer_plugin_tensorrt_llm.dll',
+            'libs/tensorrt_llm_nvrtc_wrapper.dll', 'bindings.*.pyd'
         ] if on_windows else [
             'libs/libtensorrt_llm.so',
             'libs/libth_common.so',
             'libs/libnvinfer_plugin_tensorrt_llm.so',
+            'libs/libtensorrt_llm_nvrtc_wrapper.so',
             'bindings.*.so',
         ]) + ['bindings/*.pyi', 'tools/plugin_gen/templates/*'],
     },

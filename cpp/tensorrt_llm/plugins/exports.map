@@ -21,6 +21,7 @@
     initTrtLlmPlugins;
     setLoggerFinder;
     getPluginCreators;
+    getCreators;
     extern "C++" {
       nvinfer1::IPluginCreator::*;
       nvinfer1::IPluginV2Ext::*;

@@ -46,7 +46,7 @@ def generate_int8(weights, act_range, is_qkv=False, multi_query_mode=False):
     """
 
     # compute weight scaling factors for fp->int8 and int8->fp
-    fp32_weight = weights.to(torch.float32)
+    fp32_weight = weights.to(torch.float32).cpu()
     if is_qkv and not multi_query_mode:
         scale_w_orig_quant_t = 127. / act_range["w"].reshape(3, -1).max(
             dim=-1, keepdims=True)[0].cpu().numpy()
@@ -182,7 +182,7 @@ def capture_activation_range(model,
                              dataset,
                              num_samples=1,
                              seq_len=512):
-    model.eval()
+    model.cuda().eval()
     device = next(model.parameters()).device
     act_scales = defaultdict(lambda: {"x": None, "y": None, "w": None})
 
@@ -758,6 +758,9 @@ def create_model_from_config(trt_llm_config, weights):
             weights[new_name.replace('attention.qkv', 'self_attn.v_proj')] = vw
         else:
             weights[new_name] = param
+
+    if "lm_head.weight" not in weights:
+        weights["lm_head.weight"] = weights["model.embed_tokens.weight"].clone()
     model.load_state_dict(weights)
     return model
 

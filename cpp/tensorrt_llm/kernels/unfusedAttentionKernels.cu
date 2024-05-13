@@ -1347,10 +1347,11 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
     {
     case PositionEmbeddingType::kROPE_GPTJ:
     {
-        mmha::apply_rotary_embedding(
-            q, k, tidx, rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale, dst_kv_seq_idx);
+        mmha::apply_rotary_embedding(q, k, tidx, rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale, 0,
+            nullptr, dst_kv_seq_idx);
         break;
     }
+    case PositionEmbeddingType::kLONG_ROPE:
     case PositionEmbeddingType::kROPE_GPT_NEOX:
     {
         bool const do_rotary = !is_masked && vec_size * tidx < rotary_embedding_dim;
@@ -1379,7 +1380,7 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
             mmha::vec_from_smem_transpose(k, k_smem, transpose_idx, smem_pitch);
 
             mmha::apply_rotary_embedding(q, k, transpose_idx / tidx_factor, rotary_embedding_dim, rotary_embedding_base,
-                rotary_embedding_scale, dst_kv_seq_idx);
+                rotary_embedding_scale, 0, nullptr, dst_kv_seq_idx);
 
             mmha::write_smem_transpose(q, q_smem, transpose_idx, smem_pitch);
             mmha::write_smem_transpose(k, k_smem, transpose_idx, smem_pitch);
@@ -1469,9 +1470,10 @@ void invokeAddFusedQKVBiasTranspose(T* q_buf, T* k_buf, T* v_buf, T* QKV, T cons
         // To implement rotary embeddings, each thread processes two QKV elems:
         dim3 block((size_per_head / Vec_t<T>::size + 31) / 32 * 32);
         dim3 grid(token_num, head_num);
-        size_t smem_size
-            = (position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX ? 2 * rotary_embedding_dim * sizeof(T)
-                                                                                : 0);
+        size_t smem_size = (position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX
+                    || position_embedding_type == PositionEmbeddingType::kLONG_ROPE
+                ? 2 * rotary_embedding_dim * sizeof(T)
+                : 0);
         // NOTE: add offset for rotary embedding
         if (qkv_bias != nullptr)
         {
@@ -1858,9 +1860,10 @@ __global__ void shiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCa
     case PositionEmbeddingType::kROPE_GPTJ:
     {
         mmha::apply_rotary_embedding(
-            k, tidx, rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale, token_pos_idx);
+            k, tidx, rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale, 0, nullptr, token_pos_idx);
         break;
     }
+    case PositionEmbeddingType::kLONG_ROPE:
     case PositionEmbeddingType::kROPE_GPT_NEOX:
     {
         bool const do_rotary = vec_size * tidx < rotary_embedding_dim;
@@ -1885,7 +1888,7 @@ __global__ void shiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCa
         {
             mmha::vec_from_smem_transpose(k, k_smem, transpose_idx, smem_pitch);
             mmha::apply_rotary_embedding(k, transpose_idx / tidx_factor, rotary_embedding_dim, rotary_embedding_base,
-                rotary_embedding_scale, token_pos_idx);
+                rotary_embedding_scale, 0, nullptr, token_pos_idx);
             mmha::write_smem_transpose(k, k_smem, transpose_idx, smem_pitch);
         }
 
@@ -1907,20 +1910,22 @@ __global__ void shiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCa
 }
 
 template <typename T, typename KVCacheBuffer>
-void invokeShiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCacheBuffer, const KvCacheDataType cache_type,
-    int const sizePerHead, int const timestep, int const batch_beam, int const kv_head_num, int const beam_width,
-    int const maxKCacheLen, int const sinkTokenLen, float const* kScaleQuantOrig, int const* sequence_lengths,
-    int const* input_lengths, int const rotary_embedding_dim, float rotary_embedding_base,
-    RotaryScalingType const rotary_scale_type, float rotary_embedding_scale, int const rotary_embedding_max_positions,
-    PositionEmbeddingType const position_embedding_type, cudaStream_t stream)
+void invokeShiftKCache(KVCacheBuffer const& kvCacheBuffer, KVLinearBuffer const& shiftKCacheBuffer,
+    const KvCacheDataType cache_type, int const sizePerHead, int const timestep, int const batch_beam,
+    int const kv_head_num, int const beam_width, int const maxKCacheLen, int const sinkTokenLen,
+    float const* kScaleQuantOrig, int const* sequence_lengths, int const* input_lengths, int const rotary_embedding_dim,
+    float rotary_embedding_base, RotaryScalingType const rotary_scale_type, float rotary_embedding_scale,
+    int const rotary_embedding_max_positions, PositionEmbeddingType const position_embedding_type, cudaStream_t stream)
 {
     // Block handles K tile.
     int const token_num_in_k = (timestep <= maxKCacheLen) ? timestep : maxKCacheLen;
     int const vec_size = 16u / sizeof(T);
     dim3 block((sizePerHead / vec_size + 31) / 32 * 32);
     dim3 grid(token_num_in_k, kv_head_num, batch_beam);
-    size_t smem_size
-        = (position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX ? 2 * rotary_embedding_dim * sizeof(T) : 0);
+    size_t smem_size = (position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX
+                || position_embedding_type == PositionEmbeddingType::kLONG_ROPE
+            ? 2 * rotary_embedding_dim * sizeof(T)
+            : 0);
 
     if (cache_type == KvCacheDataType::INT8)
     {
@@ -1948,10 +1953,10 @@ void invokeShiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCacheBu
 }
 
 #define INSTANTIATE_SHIFT_K_CACHE_CACHE_TYPE(T, KVCacheBuffer)                                                         \
-    template void invokeShiftKCache<T, KVCacheBuffer>(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCacheBuffer,   \
-        const KvCacheDataType cache_type, const int sizePerHead, const int timestep, const int batch_beam,             \
-        const int kv_head_num, const int beam_width, const int maxKCacheLen, const int sinkTokenLen,                   \
-        const float* kScaleQuantOrig, const int* sequence_lengths, const int* input_lengths,                           \
+    template void invokeShiftKCache<T, KVCacheBuffer>(KVCacheBuffer const& kvCacheBuffer,                              \
+        KVLinearBuffer const& shiftKCacheBuffer, const KvCacheDataType cache_type, const int sizePerHead,              \
+        const int timestep, const int batch_beam, const int kv_head_num, const int beam_width, const int maxKCacheLen, \
+        const int sinkTokenLen, const float* kScaleQuantOrig, const int* sequence_lengths, const int* input_lengths,   \
         const int rotary_embedding_dim, float rotary_embedding_base, RotaryScalingType const rotary_scale_type,        \
         float rotary_embedding_scale, const int rotary_embedding_max_positions,                                        \
         PositionEmbeddingType const position_embedding_type, cudaStream_t stream)

@@ -61,8 +61,8 @@ __global__ void kernel(TypeA* act, TypeA* act_scale, uint8_t* weight, TypeA* sca
     int const blk_offset_n = interleaved_offset_n * Details::kInterleave;
     int const thr_offset_n = (tid / Details::kThreadsPerInterleavedTile) % Details::kInterleave;
     int const real_offset_k
-        = (tid * StepK / (Details::kInterleave * Details::LayoutDeatils::kTileSize)) * Details::LayoutDeatils::kTileSize
-        + ((tid * StepK) % Details::LayoutDeatils::kTileSize);
+        = (tid * StepK / (Details::kInterleave * Details::LayoutDetails::kTileSize)) * Details::LayoutDetails::kTileSize
+        + ((tid * StepK) % Details::LayoutDetails::kTileSize);
     int const offset_k_group = (GroupSize != 0 ? real_offset_k / GroupSize : 0);
 
     extern __shared__ TypeA shmem_sz[];

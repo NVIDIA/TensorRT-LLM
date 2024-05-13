@@ -35,9 +35,9 @@ __global__ void batchApplyPenalty(T const* const* inputLogits, T* outputLogits, 
     TokenIdType* penaltyWorkspace, TokenIdType const* penaltyWorkspacePrev, float const* temperatures,
     float const* repetitionPenalties, float const* presencePenalties, float const* frequencyPenalties,
     bool accumulateVocab, SizeType maxSeqLen, SizeType vocabSize, SizeType vocabSizePadded,
-    TokenIdType const** outputIdsPtr, SizeType const** parentIdsPtr, SizeType const* inputLengths,
-    SizeType const* sequenceLengths, SizeType const* minLengths, TokenIdType const* endIds, SizeType const* batchSlots,
-    SizeType const* tokensPerStep)
+    TokenIdType const** outputIdsPtr, SizeType32 const** parentIdsPtr, SizeType const* inputLengths,
+    SizeType32 const* sequenceLengths, SizeType32 const* minLengths, TokenIdType const* endIds,
+    SizeType32 const* batchSlots, SizeType32 const* tokensPerStep)
 {
     auto const beamWidth = static_cast<SizeType>(gridDim.y);
     auto const maxTokensPerStep = static_cast<SizeType>(gridDim.z);
@@ -141,7 +141,7 @@ __global__ void batchApplyPenalty(T const* const* inputLogits, T* outputLogits, 
             {
                 logit *= invTemperature;
             }
-            SizeType numOccurences = penaltyWorkspace[index];
+            SizeType32 numOccurences = penaltyWorkspace[index];
             if (numOccurences > 0)
             {
                 // Repetition

@@ -49,12 +49,11 @@ public:
         th::optional<th::Tensor> sequence_lengths_opt, th::optional<th::Tensor> cum_log_probs_opt,
         th::optional<th::Tensor> output_log_probs_opt, th::optional<th::Tensor> output_log_probs_tiled_opt,
         th::optional<th::Tensor> parent_ids_opt, th::optional<th::Tensor> tgt_cache_indirection_opt,
-        th::optional<th::Tensor> beam_hyps_output_ids_tgt_opt,
-        th::optional<th::Tensor> beam_hyps_sequence_lengths_tgt_opt,
-        th::optional<th::Tensor> beam_hyps_cum_log_probs_opt, th::optional<th::Tensor> beam_hyps_normed_scores_opt,
-        th::optional<th::Tensor> beam_hyps_log_probs_opt, th::optional<th::Tensor> beam_hyps_min_normed_scores_opt,
-        th::optional<th::Tensor> beam_hyps_num_beams_opt, th::optional<th::Tensor> beam_hyps_is_done_opt,
-        bool const use_beam_hyps)
+        th::optional<th::Tensor> beam_hyps_output_ids_cba_opt, th::optional<th::Tensor> beam_hyps_seq_len_cba_opt,
+        th::optional<th::Tensor> beam_hyps_cum_log_probs_cba_opt,
+        th::optional<th::Tensor> beam_hyps_normed_scores_cba_opt, th::optional<th::Tensor> beam_hyps_log_probs_cba_opt,
+        th::optional<th::Tensor> beam_hyps_min_normed_scores_opt, th::optional<th::Tensor> beam_hyps_num_beams_opt,
+        th::optional<th::Tensor> beam_hyps_is_done_opt, bool const use_beam_hyps)
         = 0;
 };
 
@@ -62,8 +61,6 @@ template <typename T>
 class FtDynamicDecode : public IFtDynamicDecode
 {
 public:
-    using SetupParams = typename tensorrt_llm::layers::DynamicDecodeLayer<T>::SetupParams;
-
     FtDynamicDecode(size_t const max_batch_size, size_t const max_beam_width, size_t const vocab_size,
         size_t const vocab_size_padded, int const tensor_para_size, int const pipeline_para_size);
 
@@ -88,12 +85,11 @@ public:
         th::optional<th::Tensor> sequence_lengths_opt, th::optional<th::Tensor> cum_log_probs_opt,
         th::optional<th::Tensor> output_log_probs_opt, th::optional<th::Tensor> output_log_probs_tiled_opt,
         th::optional<th::Tensor> parent_ids_opt, th::optional<th::Tensor> tgt_cache_indirection_opt,
-        th::optional<th::Tensor> beam_hyps_output_ids_tgt_opt,
-        th::optional<th::Tensor> beam_hyps_sequence_lengths_tgt_opt,
-        th::optional<th::Tensor> beam_hyps_cum_log_probs_opt, th::optional<th::Tensor> beam_hyps_normed_scores_opt,
-        th::optional<th::Tensor> beam_hyps_log_probs_opt, th::optional<th::Tensor> beam_hyps_min_normed_scores_opt,
-        th::optional<th::Tensor> beam_hyps_num_beams_opt, th::optional<th::Tensor> beam_hyps_is_done_opt,
-        bool const use_beam_hyps) override;
+        th::optional<th::Tensor> beam_hyps_output_ids_cba_opt, th::optional<th::Tensor> beam_hyps_seq_len_cba_opt,
+        th::optional<th::Tensor> beam_hyps_cum_log_probs_cba_opt,
+        th::optional<th::Tensor> beam_hyps_normed_scores_cba_opt, th::optional<th::Tensor> beam_hyps_log_probs_cba_opt,
+        th::optional<th::Tensor> beam_hyps_min_normed_scores_opt, th::optional<th::Tensor> beam_hyps_num_beams_opt,
+        th::optional<th::Tensor> beam_hyps_is_done_opt, bool const use_beam_hyps) override;
 
 private:
     tensorrt_llm::runtime::ITensor::SharedPtr finished_sum_; // [batch_size] pinned
@@ -128,12 +124,11 @@ public:
         th::optional<th::Tensor> finished_output, th::optional<th::Tensor> sequence_lengths_opt,
         th::optional<th::Tensor> cum_log_probs_opt, th::optional<th::Tensor> output_log_probs_opt,
         th::optional<th::Tensor> output_log_probs_tiled_opt, th::optional<th::Tensor> parent_ids_opt,
-        th::optional<th::Tensor> tgt_cache_indirection_opt, th::optional<th::Tensor> beam_hyps_output_ids_tgt_opt,
-        th::optional<th::Tensor> beam_hyps_sequence_lengths_tgt_opt,
-        th::optional<th::Tensor> beam_hyps_cum_log_probs_opt, th::optional<th::Tensor> beam_hyps_normed_scores_opt,
-        th::optional<th::Tensor> beam_hyps_log_probs_opt, th::optional<th::Tensor> beam_hyps_min_normed_scores_opt,
-        th::optional<th::Tensor> beam_hyps_num_beams_opt, th::optional<th::Tensor> beam_hyps_is_done_opt,
-        bool const use_beam_hyps);
+        th::optional<th::Tensor> tgt_cache_indirection_opt, th::optional<th::Tensor> beam_hyps_output_ids_cba_opt,
+        th::optional<th::Tensor> beam_hyps_seq_len_cba_opt, th::optional<th::Tensor> beam_hyps_cum_log_probs_cba_opt,
+        th::optional<th::Tensor> beam_hyps_normed_scores_cba_opt, th::optional<th::Tensor> beam_hyps_log_probs_cba_opt,
+        th::optional<th::Tensor> beam_hyps_min_normed_scores_opt, th::optional<th::Tensor> beam_hyps_num_beams_opt,
+        th::optional<th::Tensor> beam_hyps_is_done_opt, bool const use_beam_hyps);
 
 private:
     // Members initialized in constructor and used in call of createInstance()

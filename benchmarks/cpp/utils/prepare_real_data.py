@@ -6,7 +6,7 @@ from typing import Optional
 import click
 from datasets import load_dataset
 from pydantic import BaseModel, model_validator
-from utils.utils import dataset_dump, get_list_of_delays, get_norm_dist_tokens
+from utils.utils import dataset_dump, get_norm_dist_tokens
 
 
 def validate_output_len_dist(ctx, param, value):
@@ -176,6 +176,7 @@ def dataset(root_args, **kwargs):
            for k, v in kwargs.items() if k.startswith('dataset_')})
 
     input_ids = []
+    input_lens = []
     output_lens = []
     task_ids = []
     req_cnt = 0
@@ -188,6 +189,7 @@ def dataset(root_args, **kwargs):
         if kwargs['max_input_len'] and len(line) > kwargs['max_input_len']:
             continue
         input_ids.append(line)
+        input_lens.append(len(line))
 
         # output if fetch from golden
         if kwargs['output_len_dist'] is None:
@@ -218,15 +220,11 @@ def dataset(root_args, **kwargs):
     logging.debug(f"Input lengths: {[len(i) for i in input_ids]}")
     logging.debug(f"Output lengths: {output_lens}")
 
-    delays = get_list_of_delays(root_args.time_delay_dist,
-                                root_args.mean_time_bet_reqs, len(input_ids),
-                                root_args.random_seed)
-
     dataset_dump(
-        input_ids, output_lens, delays, task_ids, {
+        input_lens, input_ids, output_lens, task_ids, {
             "workload_type": "dataset",
             "tokenizer": root_args.tokenizer.__class__.__name__,
             "num_requests": len(input_ids),
-            "delay_distr": root_args.time_delay_dist,
-            "request_rate": root_args.request_rate
+            "max_input_len": max(input_lens),
+            "max_output_len": max(output_lens)
         }, root_args.output)

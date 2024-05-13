@@ -16,16 +16,8 @@
 
 #pragma once
 
-#include <cstdint>
+#include <NvInferRuntime.h>
 #include <mutex>
-
-// Forward declarations
-namespace nvinfer1
-{
-class ILoggerFinder;
-class IPluginCreator;
-class ILogger;
-} // namespace nvinfer1
 
 namespace tensorrt_llm::plugins::api
 {
@@ -51,7 +43,11 @@ private:
     nvinfer1::ILoggerFinder* mLoggerFinder{nullptr};
     std::mutex mMutex;
 };
-
+#if NV_TENSORRT_MAJOR >= 10
+using IPluginCreatorInterface = nvinfer1::IPluginCreatorInterface;
+#else
+using IPluginCreatorInterface = nvinfer1::IPluginCreator;
+#endif // NV_TENSORRT_MAJOR >= 10
 } // namespace tensorrt_llm::plugins::api
 
 extern "C"

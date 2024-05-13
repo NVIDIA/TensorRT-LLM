@@ -75,7 +75,7 @@ public:
     //! Setup the decoder before calling `forward()`, also calls reshapeBuffers
     virtual void setup(DecodingMode const& mode, SizeType maxBatchSize, SizeType maxBeamWidth,
         SizeType maxAttentionWindow, SizeType sinkTokenLength, SizeType maxSequenceLength, SizeType maxTokensPerStep,
-        bool fusedDecoder, nvinfer1::DataType dtype, GptModelConfig const& modelConfig)
+        bool fusedDecoder, nvinfer1::DataType dtype, ModelConfig const& modelConfig)
         = 0;
 
     //! @brief Initialize the decoder with new batch of inputs.

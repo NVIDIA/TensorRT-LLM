@@ -1,5 +1,4 @@
 import argparse
-import configparser
 import functools
 import json
 import logging
@@ -8,10 +7,10 @@ import shutil
 import tarfile
 import time
 import traceback
-from collections import defaultdict, namedtuple
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 
 import numpy as np
 import safetensors
@@ -21,7 +20,7 @@ import yaml
 from datasets import load_dataset
 from tqdm import tqdm
 from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
-                          GPT2Config, GPT2Tokenizer, T5Tokenizer)
+                          GPT2Config)
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 from transformers.pytorch_utils import Conv1D
 
@@ -45,7 +44,9 @@ def parse_arguments():
     parser.add_argument(
         '--gpt_variant',
         default=None,
-        choices=[None, 'gpt2', 'santacoder', 'starcoder', 'starcoder2'],
+        choices=[
+            None, 'gpt2', 'santacoder', 'starcoder', 'starcoder2', 'persimmon'
+        ],
         help=
         "By default the script will try to infer the gpt_variant from model_dir. "
         "Or users may overwrite gpt_variant by explicitly passing the variant.")
@@ -161,26 +162,30 @@ def load_gpt_config(model_dir: str,
 
     if gpt_variant is None:
         print("Inferring gpt variant from path...")
-        for v in ['starcoder2', 'starcoder', 'santacoder', 'gpt2']:
-            if v in config._name_or_path:
+        for v in ['starcoder2', 'starcoder', 'santacoder', 'gpt2', 'persimmon']:
+            if v in config._name_or_path or ('fuyu' in config._name_or_path
+                                             and v == 'persimmon'):
                 gpt_variant = v
                 break
-    assert gpt_variant in ['gpt2', 'santacoder', 'starcoder', 'starcoder2']
+    assert gpt_variant in [
+        'gpt2', 'santacoder', 'starcoder', 'starcoder2', 'persimmon'
+    ]
     print(f"Gpt variant: {gpt_variant}")
 
-    if gpt_variant == 'starcoder2':
+    if gpt_variant in ['starcoder2', 'persimmon']:
         config.n_embd = config.hidden_size
         config.n_inner = config.intermediate_size
         config.n_head = config.num_attention_heads
-        config.n_kv_head = config.num_key_value_heads
+        config.n_kv_head = config.num_key_value_heads if hasattr(
+            config, 'num_key_value_heads') else config.n_head
         config.n_layer = config.num_hidden_layers
         config.n_positions = config.max_position_embeddings
-        config.activation_function = 'gelu'
-        config.layer_norm_epsilon = config.norm_epsilon
-        config.bias = config.use_bias
+        config.activation_function = 'gelu' if gpt_variant == 'starcoder2' else 'squared-relu'
+        config.layer_norm_epsilon = config.norm_epsilon if gpt_variant == 'starcoder2' else config.layer_norm_eps
+        config.bias = config.use_bias if gpt_variant == 'starcoder2' else True
         config.position_embedding_type = 'rope_gpt_neox'
         config.rotary_base = config.rope_theta
-        config.rotary_pct = 1.0
+        config.rotary_pct = getattr(config, 'partial_rotary_factor', 1.0)
     else:
         if config.n_inner is None:
             config.n_inner = config.n_embd * 4
@@ -346,6 +351,9 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
     for l in layers_range:
         if gpt_variant == 'starcoder2':
             prefix = f'model.layers.{l}'
+        elif gpt_variant == 'persimmon':
+            is_fuyu = f'language_model.model.embed_tokens.weight' in model_params
+            prefix = f'language_model.model.layers.{l}' if is_fuyu else f'model.layers.{l}'
         else:
             prefix = f'transformer.h.{l}'
         tllm_prex = f'transformer.layers.{l-layers_range[0]}'
@@ -365,15 +373,30 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
                                            f'{prefix}.self_attn.v_proj', dtype)
             qkv_w = torch.cat([q_w, k_w, v_w], dim=0)
             qkv_b = torch.cat([q_b, k_b, v_b], dim=0)
+        elif gpt_variant == 'persimmon':
+            qkv_w, qkv_b = get_weight_and_bias(
+                model_params, f'{prefix}.self_attn.query_key_value', dtype)
         else:
             qkv_w, qkv_b = get_weight_and_bias(model_params,
                                                f'{prefix}.attn.c_attn', dtype)
         if gpt_variant in ['gpt2', 'santacoder']:
             qkv_w = qkv_w.t().contiguous()  # transpose for Conv1D
-        qkv_w = split_qkv(qkv_w, mapping.tp_rank, mapping.tp_size, hidden_size,
-                          num_attention_heads, num_kv_heads)
-        qkv_b = split_qkv(qkv_b, mapping.tp_rank, mapping.tp_size, hidden_size,
-                          num_attention_heads, num_kv_heads)
+
+        if gpt_variant == 'persimmon':
+            qkv_w = split(qkv_w,
+                          mapping.tp_rank,
+                          mapping.tp_size,
+                          is_column=True)
+
+            qkv_b = split(qkv_b,
+                          mapping.tp_rank,
+                          mapping.tp_size,
+                          is_column=True)
+        else:
+            qkv_w = split_qkv(qkv_w, mapping.tp_rank, mapping.tp_size,
+                              hidden_size, num_attention_heads, num_kv_heads)
+            qkv_b = split_qkv(qkv_b, mapping.tp_rank, mapping.tp_size,
+                              hidden_size, num_attention_heads, num_kv_heads)
 
         weights.update(
             get_tllm_linear_weight(qkv_w, f'{tllm_prex}.attention.qkv', qkv_b,
@@ -383,6 +406,9 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
         if gpt_variant == 'starcoder2':
             attn_dense_w, attn_dense_b = get_weight_and_bias(
                 model_params, f'{prefix}.self_attn.o_proj', dtype)
+        elif gpt_variant == 'persimmon':
+            attn_dense_w, attn_dense_b = get_weight_and_bias(
+                model_params, f'{prefix}.self_attn.dense', dtype)
         else:
             attn_dense_w, attn_dense_b = get_weight_and_bias(
                 model_params, f'{prefix}.attn.c_proj', dtype)
@@ -397,8 +423,13 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
                                    attn_dense_b, use_weight_only,
                                    plugin_weight_only_quant_type))
 
-        mlp_fc_w, mlp_fc_b = get_weight_and_bias(model_params,
-                                                 f'{prefix}.mlp.c_fc', dtype)
+        if gpt_variant == 'persimmon':
+            mlp_fc_w, mlp_fc_b = get_weight_and_bias(
+                model_params, f'{prefix}.mlp.dense_h_to_4h', dtype)
+        else:
+            mlp_fc_w, mlp_fc_b = get_weight_and_bias(model_params,
+                                                     f'{prefix}.mlp.c_fc',
+                                                     dtype)
         if gpt_variant in ['gpt2', 'santacoder']:
             mlp_fc_w = mlp_fc_w.t().contiguous()  # transpose for Conv1D
         mlp_fc_w = split(mlp_fc_w,
@@ -414,9 +445,12 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
                                    use_weight_only,
                                    plugin_weight_only_quant_type))
 
-        mlp_proj_w, mlp_proj_b = get_weight_and_bias(model_params,
-                                                     f'{prefix}.mlp.c_proj',
-                                                     dtype)
+        if gpt_variant == 'persimmon':
+            mlp_proj_w, mlp_proj_b = get_weight_and_bias(
+                model_params, f'{prefix}.mlp.dense_4h_to_h', dtype)
+        else:
+            mlp_proj_w, mlp_proj_b = get_weight_and_bias(
+                model_params, f'{prefix}.mlp.c_proj', dtype)
         if gpt_variant in ['gpt2', 'santacoder']:
             mlp_proj_w = mlp_proj_w.t().contiguous()  # transpose for Conv1D
         mlp_proj_w = split(mlp_proj_w,
@@ -428,7 +462,7 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
                                    mlp_proj_b, use_weight_only,
                                    plugin_weight_only_quant_type))
 
-        if gpt_variant == 'starcoder2':
+        if gpt_variant in ['starcoder2', 'persimmon']:
             input_ln_w, input_ln_b = get_weight_and_bias(
                 model_params, f'{prefix}.input_layernorm', dtype)
         else:
@@ -438,7 +472,7 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
         if input_ln_b is not None:
             weights[f'{tllm_prex}.input_layernorm.bias'] = input_ln_b
 
-        if gpt_variant == 'starcoder2':
+        if gpt_variant in ['starcoder2', 'persimmon']:
             post_ln_w, post_ln_b = get_weight_and_bias(
                 model_params, f'{prefix}.post_attention_layernorm', dtype)
         else:
@@ -448,9 +482,26 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
         if post_ln_b is not None:
             weights[f'{tllm_prex}.post_layernorm.bias'] = post_ln_b
 
+        if gpt_variant == 'persimmon':
+            q_layernorm_w, q_layernorm_b = get_weight_and_bias(
+                model_params, f'{prefix}.self_attn.q_layernorm', dtype)
+
+            weights[f'{tllm_prex}.attention.q_layernorm.weight'] = q_layernorm_w
+            weights[f'{tllm_prex}.attention.q_layernorm.bias'] = q_layernorm_b
+
+            k_layernorm_w, k_layernorm_b = get_weight_and_bias(
+                model_params, f'{prefix}.self_attn.k_layernorm', dtype)
+
+            weights[f'{tllm_prex}.attention.k_layernorm.weight'] = k_layernorm_w
+            weights[f'{tllm_prex}.attention.k_layernorm.bias'] = k_layernorm_b
+
     if mapping.is_first_pp_rank():
         if gpt_variant == 'starcoder2':
             embed_w = get_weight(model_params, 'model.embed_tokens', dtype)
+        elif gpt_variant == 'persimmon':
+            embed_w = get_weight(model_params,
+                                 ('language_model.' if is_fuyu else '') +
+                                 'model.embed_tokens', dtype)
         else:
             embed_w = get_weight(model_params, 'transformer.wte', dtype)
         weights['transformer.vocab_embedding.weight'] = split_embedding(
@@ -474,6 +525,10 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
             embed_w = get_weight(model_params, 'lm_head', dtype)
             if embed_w is None:
                 embed_w = get_weight(model_params, 'model.embed_tokens', dtype)
+        elif gpt_variant == 'persimmon':
+            embed_w = get_weight(model_params,
+                                 ('language_model.' if is_fuyu else '') +
+                                 'lm_head', dtype)
         else:
             embed_w = get_weight(model_params, 'transformer.wte', dtype)
         if not share_embedding_table:
@@ -489,6 +544,10 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
         if gpt_variant == 'starcoder2':
             ln_f_w, ln_f_b = get_weight_and_bias(model_params, 'model.norm',
                                                  dtype)
+        elif gpt_variant == 'persimmon':
+            ln_f_w, ln_f_b = get_weight_and_bias(
+                model_params, ('language_model.' if is_fuyu else '') +
+                'model.final_layernorm', dtype)
         else:
             ln_f_w, ln_f_b = get_weight_and_bias(model_params,
                                                  'transformer.ln_f', dtype)
@@ -1120,78 +1179,6 @@ def gpu_map_location(storage, loc):
         raise ValueError(f"Not handled {loc}")
 
 
-# The field names are the same as in .nemo config file
-# Defaults and their locations in NeMo code are given for commit 9c7926db4ae375b77dae7eb57656213de1dd76a5 in main branch
-# The commit from main is used instead of a release because there are `rotary_base` commit was introduced recently.
-NemoRotaryEmbeddingParameters = namedtuple(
-    "NemoRotaryEmbeddingParameters",
-    [
-        "position_embedding_type", "rotary_percentage",
-        "seq_len_interpolation_factor", "rotary_base"
-    ],
-    defaults=[
-        # "position_embedding_type", the default is taken from
-        # https://github.com/NVIDIA/NeMo/blob/9c7926db4ae375b77dae7eb57656213de1dd76a5/nemo/collections/nlp/models/language_modeling/megatron_gpt_model.py#L370
-        "learned_absolute",
-        # "rotary_percentage", the default is taken from
-        # https://github.com/NVIDIA/NeMo/blob/9c7926db4ae375b77dae7eb57656213de1dd76a5/nemo/collections/nlp/models/language_modeling/megatron_gpt_model.py#L370
-        1.0,
-        # "seq_len_interpolation_factor", the default is take from
-        # https://github.com/NVIDIA/NeMo/blob/9c7926db4ae375b77dae7eb57656213de1dd76a5/nemo/collections/nlp/models/language_modeling/megatron_gpt_model.py#L388
-        None,
-        # "rotary_base", the default is taken from
-        # https://github.com/NVIDIA/NeMo/blob/9c7926db4ae375b77dae7eb57656213de1dd76a5/nemo/collections/nlp/models/language_modeling/megatron_gpt_model.py#L389
-        10000,
-    ])
-
-
-def set_parameter_from_config(params: Dict[str, Any], nemo_config: Dict[str,
-                                                                        Any],
-                              param_name: str) -> None:
-    if param_name in nemo_config:
-        params[param_name] = nemo_config[param_name]
-    else:
-        LOGGER.debug(
-            f"A parameter '{param_name}' is missing in nemo checkpoint. "
-            f"The default value {repr(NemoRotaryEmbeddingParameters._field_defaults[param_name])} will be used."
-        )
-
-
-def extract_rotary_parameters_from_nemo_config(
-        nemo_config: Dict[str, Any]) -> NemoRotaryEmbeddingParameters:
-    params = {}
-    set_parameter_from_config(params, nemo_config, "position_embedding_type")
-    set_parameter_from_config(params, nemo_config, "rotary_percentage")
-    set_parameter_from_config(params, nemo_config,
-                              "seq_len_interpolation_factor")
-    set_parameter_from_config(params, nemo_config, "rotary_base")
-    return NemoRotaryEmbeddingParameters(**params)
-
-
-def nemo_to_gpt_config(nemo_model_config, vocab_size, eos_id, bos_id):
-    convertion_dict = {
-        "activation_function": "activation",
-        "layer_norm_epsilon": "layernorm_epsilon",
-        "n_embd": "hidden_size",
-        "n_head": "num_attention_heads",
-        "n_layer": "num_layers",
-        "n_positions": "max_position_embeddings",
-        "rotary_pct": "rotary_percentage",
-        "bias": "bias",
-        "intermediate_size": "ffn_hidden_size",
-    }
-
-    kwargs = {
-        key: nemo_model_config[value]
-        for key, value in convertion_dict.items() if value in nemo_model_config
-    }
-    kwargs["vocab_size"] = vocab_size
-    kwargs["eos_token_id"] = eos_id
-    kwargs["bos_token_id"] = bos_id
-
-    return GPT2Config(**kwargs)
-
-
 def copy_tokenizer_files(config, out_dir):
     basenames = {
         "model": "tokenizer",
@@ -1212,30 +1199,6 @@ def copy_tokenizer_files(config, out_dir):
         shutil.copy(path.as_posix(), dst_path.as_posix())
 
 
-def add_rotary_parameters_to_ini_config(
-        config: configparser.ConfigParser,
-        rotary_parameters: NemoRotaryEmbeddingParameters) -> None:
-    if rotary_parameters.position_embedding_type == "rope":
-        if rotary_parameters.rotary_percentage > 1.0 or rotary_parameters.rotary_percentage <= 0.0:
-            raise ValueError(
-                f"Rotary percentage has to suffice 0.0 < rotary_percentage <= 1.0, whereas "
-                f"rotary_percentage={rotary_parameters.rotary_percentage}")
-        config["gpt"]["rotary_pct"] = str(rotary_parameters.rotary_percentage)
-        config["gpt"]["rotary_base"] = str(rotary_parameters.rotary_base)
-        if rotary_parameters.seq_len_interpolation_factor is not None:
-            if rotary_parameters.seq_len_interpolation_factor <= 1.0:
-                raise ValueError(
-                    f"Rotary scaling is supported only for seq_len_interpolation_factor > 1.0. "
-                    f"Got seq_len_interpolation_factor={rotary_parameters.seq_len_interpolation_factor}"
-                )
-            config["gpt"]["rotary_scaling_type"] = "linear"
-            config["gpt"]["rotary_scaling_factor"] = str(
-                float(rotary_parameters.seq_len_interpolation_factor))
-    else:
-        # As in HF rotary_pct > 0.0 triggers RoPE. Dislabe RoPE if different embedding type is used
-        config["gpt"]["rotary_pct"] = "0.0"
-
-
 def update_tokenizer_paths(tokenizer_config: Dict,
                            tokenizer_file_paths: Dict[str, Optional[str]]):
     for key, new_path in tokenizer_file_paths.items():
@@ -1252,90 +1215,6 @@ def update_tokenizer_paths(tokenizer_config: Dict,
             )
             tokenizer_config[key] = None
     return tokenizer_config
-
-
-def build_tokenizer(tokenizer_config: Dict):
-    if tokenizer_config["library"] == "sentencepiece":
-        tokenizer = T5Tokenizer(tokenizer_config["model"], extra_ids=0)
-    elif "GPT2" in tokenizer_config["type"]:
-        tokenizer = GPT2Tokenizer(tokenizer_config["vocab_file"],
-                                  tokenizer_config["merge_file"])
-    else:
-        raise ValueError(
-            f'Tokenizer type {tokenizer_config["library"]} not handled')
-
-    if tokenizer.bos_token_id is None:
-        tokenizer.add_special_tokens({"bos_token": "<s>"})
-    if tokenizer.eos_token_id is None:
-        tokenizer.add_special_tokens({"eos_token": "</s>"})
-
-    return tokenizer
-
-
-def get_eos_bos_ids_from_tokenizer_config(
-        tokenizer_config: Dict[str, Any]) -> Tuple[int, int]:
-    tokenizer = build_tokenizer(tokenizer_config)
-    return tokenizer.eos_token_id, tokenizer.bos_token_id
-
-
-def nemo_config_to_ini_config(
-    nemo_model_config: Dict[str, Any],
-    eos_id: int,
-    bos_id: int,
-    vocab_size: int,
-    storage_type: str,
-) -> configparser.ConfigParser:
-    gpt_model_config = nemo_to_gpt_config(nemo_model_config, vocab_size, eos_id,
-                                          bos_id)
-    config = configparser.ConfigParser()
-    config["gpt"] = {k: str(v) for k, v in vars(gpt_model_config).items()}
-    config["gpt"]["storage_dtype"] = storage_type
-    add_rotary_parameters_to_ini_config(
-        config, extract_rotary_parameters_from_nemo_config(nemo_model_config))
-    return config
-
-
-def add_special_tokens_to_tokenizer(tokenizer):
-
-    # Need to add cls, sep, mask tokens to the tokenizer if they don't exist.
-    # If cls, sep and mask are not attributes of the tokenizer, add it.
-    if not hasattr(tokenizer, 'cls_token'):
-        tokenizer.add_special_tokens({'cls_token': '<cls>'})
-    if not hasattr(tokenizer.tokenizer, 'sep_id'):
-        tokenizer.add_special_tokens({'sep_token': '<sep>'})
-    if not hasattr(tokenizer.tokenizer, 'mask_id'):
-        tokenizer.add_special_tokens({'mask_token': '<mask>'})
-
-    # bos, eos, pad and unk may be present in the provided spm .model file, if they are, use it.
-    if not hasattr(tokenizer, 'pad_token'):
-        if hasattr(tokenizer.tokenizer,
-                   'pad_id') and tokenizer.tokenizer.pad_id() > 0:
-            tokenizer.pad_token = tokenizer.tokenizer.id_to_piece(
-                tokenizer.tokenizer.pad_id())
-        else:
-            tokenizer.add_special_tokens({'pad_token': '<pad>'})
-    else:
-        tokenizer.add_special_tokens({'pad_token': '<pad>'})
-
-    if not hasattr(tokenizer, 'bos_token'):
-        if hasattr(tokenizer.tokenizer,
-                   'bos_id') and tokenizer.tokenizer.bos_id() > 0:
-            tokenizer.bos_token = tokenizer.tokenizer.id_to_piece(
-                tokenizer.tokenizer.bos_id())
-        else:
-            tokenizer.add_special_tokens({'bos_token': '<bos>'})
-    else:
-        tokenizer.add_special_tokens({'bos_token': '<s>'})
-
-    if not hasattr(tokenizer, 'eos_token'):
-        if hasattr(tokenizer.tokenizer,
-                   'eos_id') and tokenizer.tokenizer.eos_id() > 0:
-            tokenizer.eos_token = tokenizer.tokenizer.id_to_piece(
-                tokenizer.tokenizer.eos_id())
-        else:
-            tokenizer.add_special_tokens({'eos_token': '<eos>'})
-    else:
-        tokenizer.add_special_tokens({'eos_token': '</s>'})
 
 
 def unpack_nemo_ckpt(nemo_archive_path: Union[str, Path],
@@ -1582,14 +1461,45 @@ def load_nemo_gpt_config(
     hf_config.bias = nemo_model_config['bias']
     # hf_config.apply_query_key_layer_scaling = nemo_model_config['apply_query_key_layer_scaling']
     hf_config.apply_query_key_layer_scaling = False
-    hf_config.position_embedding_type = 'rope_gpt_neox'
-    hf_config.rotary_pct = nemo_model_config['rotary_percentage']
+
+    hf_config.position_embedding_type = nemo_model_config.get(
+        'position_embedding_type', 'learned_absolute')
+    if hf_config.position_embedding_type == 'rope':
+        hf_config.position_embedding_type = 'rope_gpt_neox'
+    hf_config.rotary_base = nemo_model_config.get('rotary_base', 10000.0)
+    hf_config.rotary_pct = nemo_model_config.get('rotary_percentage', 1.0)
+    assert hf_config.rotary_pct >= 0 and hf_config.rotary_pct <= 1
+
+    rotary_scaling_factor = nemo_model_config.get(
+        'seq_len_interpolation_factor', None)
+    if rotary_scaling_factor is None:
+        hf_config.rotary_scaling = None
+    else:
+        assert rotary_scaling_factor > 1
+        hf_config.rotary_scaling = {
+            'type': 'linear',
+            'factor': rotary_scaling_factor
+        }
 
     tokenizer_config = update_tokenizer_paths(
         nemo_model_config["tokenizer"],
         unpacked_checkpoints_dir.get_all_tokenizer_file_paths())
 
     return hf_config, tokenizer_config
+
+
+@torch.no_grad()
+def load_torch_checkpoints(checkpoints_paths, merge_factor, tp_rank, pp_rank,
+                           map_location_fn, handle_model_level_weights):
+    models = []
+    for k in range(merge_factor):
+        rank_weights = checkpoints_paths[tp_rank * merge_factor + k][pp_rank]
+        model = torch.load(rank_weights, map_location=map_location_fn)
+        handle_model_level_weights(model, tp_rank * merge_factor + k, pp_rank)
+        layers = extract_layers_with_prefix(model,
+                                            "model.language_model.encoder.")
+        models.append(layers)
+    return models
 
 
 @torch.no_grad()
@@ -1612,9 +1522,9 @@ def convert_nemo_gpt(unpacked_checkpoints_dir: UnpackedNemoCheckpointDir,
     # load position_embedding from rank 0
     model_00 = torch.load(checkpoints_paths[0][0], map_location=map_location_fn)
     model_00 = model_00.get("state_dict", model_00)
-
     has_position_embedding = "model.language_model.embedding.position_embeddings.weight" in model_00
     has_lm_head = "model.language_model.output_layer.weight" in model_00
+    del model_00
 
     num_layers = nemo_model_config["num_layers"]
     training_tp_size = nemo_model_config.get("tensor_model_parallel_size", 1)
@@ -1663,18 +1573,10 @@ def convert_nemo_gpt(unpacked_checkpoints_dir: UnpackedNemoCheckpointDir,
     tp_rank = inference_tp_rank // split_factor
     # for tp_rank in range(training_tp_size // merge_factor):
     for pp_rank in range(training_pp_size):
-        models = []
-        for k in range(merge_factor):
-            rank_weights = checkpoints_paths[tp_rank * merge_factor +
-                                             k][pp_rank]
-            model = torch.load(rank_weights, map_location=map_location_fn)
-            handle_model_level_weights(model, tp_rank * merge_factor + k,
-                                       pp_rank)
-            layers = extract_layers_with_prefix(
-                model, "model.language_model.encoder.")
-            models.append(layers)
-
-        for name in models[0].keys():
+        models = load_torch_checkpoints(checkpoints_paths, merge_factor,
+                                        tp_rank, pp_rank, map_location_fn,
+                                        handle_model_level_weights)
+        for name in list(models[0].keys()):
             params = [model[name] for model in models]
             if transpose_weights and params[0].ndim == 2:
                 params = [p.T for p in params]
@@ -1808,14 +1710,14 @@ def convert_nemo_gpt(unpacked_checkpoints_dir: UnpackedNemoCheckpointDir,
                     weights['transformer.ln_f.weight'] = params[0]
                 else:
                     weights['transformer.ln_f.bias'] = params[0]
-
-    for key, params in model_level_weights.items():
-        weights[key] = torch.concat(params, dim=0)
-
-    weights = {
-        key: param.to(dtype).contiguous()
-        for key, param in weights.items()
-    }
+            for model in models:
+                del model[name]
+        del models
+    for key in list(model_level_weights.keys()):
+        weights[key] = torch.concat(model_level_weights[key], dim=0)
+        del model_level_weights[key]
+    for key, param in weights.items():
+        weights[key] = weights[key].to(dtype).contiguous()
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
@@ -1923,6 +1825,12 @@ if __name__ == '__main__':
         getattr(hf_config, 'apply_query_key_layer_scaling', False),
         'rotary_pct':
         getattr(hf_config, 'rotary_pct', 1.0),
+        'rotary_base':
+        getattr(hf_config, 'rotary_base', 10000.0),
+        'rotary_scaling':
+        getattr(hf_config, 'rotary_scaling', None),
+        'qk_layernorm':
+        args.model_dir is not None and gpt_variant == 'persimmon'
     }
 
     with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:

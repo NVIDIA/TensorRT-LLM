@@ -196,6 +196,10 @@ class PluginConfig:
         self.set_plugin("tokens_per_block", tokens_per_block)
         return self
 
+    def enable_paged_state(self):
+        self.set_plugin("paged_state", True)
+        return self
+
     def set_gpt_attention_plugin(self, dtype='float16'):
         self.set_plugin("gpt_attention_plugin", dtype)
         return self
@@ -204,8 +208,8 @@ class PluginConfig:
         self.set_plugin("multi_block_mode", True)
         return self
 
-    def enable_xqa_optimization(self):
-        self.set_plugin("enable_xqa", True)
+    def disable_xqa_optimization(self):
+        self.set_plugin("enable_xqa", False)
         return self
 
     def set_bert_attention_plugin(self, dtype='float16'):
@@ -403,8 +407,8 @@ class CustomAllReduceHelper:
     def allocate_workspace(mapping: Mapping,
                            size: int) -> Tuple[List[IpcMemory], "torch.tensor"]:
         import torch
-        ipc_buffers_ping = IpcMemory(mapping, size * mapping.world_size)
-        ipc_buffers_pong = IpcMemory(mapping, size * mapping.world_size)
+        ipc_buffers_ping = IpcMemory(mapping, size * mapping.tp_size)
+        ipc_buffers_pong = IpcMemory(mapping, size * mapping.tp_size)
         ipc_barriers_in = IpcMemory(
             mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size)
         ipc_barriers_out = IpcMemory(

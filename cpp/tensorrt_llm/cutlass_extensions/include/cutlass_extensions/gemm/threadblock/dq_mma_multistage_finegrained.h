@@ -86,7 +86,7 @@ template <
     typename SmemIteratorScale_,
     /// Data type of accumulator matrix
     typename ElementC_,
-    /// Data type of accumulator matrix
+    /// Layout of accumulator matrix
     typename LayoutC_,
     /// Policy describing tuning details (concept: MmaPolicy)
     typename Policy_,
@@ -189,8 +189,9 @@ private:
     using WarpFragmentB = typename Operator::FragmentB;
     Dequantizer warp_dequantizer_;
 
+    using ElementA = typename IteratorA::Element;
     using ElementB = typename IteratorB::Element;
-    using LayoutDetailsForB = kernel::LayoutDetailsB<ElementB, ArchTag>;
+    using LayoutDetailsForB = kernel::LayoutDetailsB<ElementA, ElementB, ArchTag>;
 
     static constexpr bool RequiresTileInterleave
         = layout::IsColumnMajorTileInterleave<typename LayoutDetailsForB::Layout>::value;
@@ -218,7 +219,7 @@ public:
         ///< Shared storage needed for internal use by threadblock-scoped GEMM
         typename Base::SharedStorage& shared_storage,
         /// The group size for quantization
-        int group_size,
+        int const group_size,
         ///< ID within the threadblock
         int thread_idx,
         ///< ID of warp
@@ -279,9 +280,20 @@ public:
         }
         else if (iterator_scale.group_size_ == 128)
         {
-            if (iterator_scale.row_groupsize64_ & 0x1)
+            if constexpr (Shape::kK == 128)
             {
                 iterator_scale.add_tile_offset({1, 0});
+            }
+            else if constexpr (Shape::kK == 64)
+            {
+                if (iterator_scale.row_groupsize64_ & 0x1)
+                {
+                    iterator_scale.add_tile_offset({1, 0});
+                }
+            }
+            else
+            {
+                static_assert(Shape::kK == 0, "Unsupported k tile shape, can only be 64 or 128");
             }
         }
 
@@ -291,8 +303,8 @@ public:
     }
 
     CUTLASS_DEVICE
-    void copy_tiles_and_advance(IteratorA& iterator_A, IteratorB& iterator_B, IteratorScale& iterator_scale,
-        int group_start_A = 0, int group_start_B = 0)
+    void copy_tiles_and_advance(
+        IteratorA& iterator_A, IteratorB& iterator_B, int group_start_A = 0, int group_start_B = 0)
     {
         iterator_A.set_iteration_index(group_start_A * IteratorA::kAccessesPerVector);
         this->smem_iterator_A_.set_iteration_index(group_start_A);
@@ -413,8 +425,6 @@ public:
                 {
                     int const kSrcBytes = sizeof_bits<typename IteratorA::Element>::value
                         * IteratorA::ThreadMap::kElementsPerAccess / IteratorA::kAccessesPerVector / 8;
-
-                    int src_bytes = (iterator_A.valid() ? kSrcBytes : 0);
 
                     cutlass::arch::cp_async_zfill<kSrcBytes, kCacheOpA>(
                         dst_ptr + v, iterator_A.get(), iterator_A.valid());
@@ -586,8 +596,17 @@ public:
                     = lds_converter(warp_frag_B[warp_tileB_k_load_offset % 2]);
                 warp_dequantizer_.dequantize(converted_frag_B, warp_frag_scales, warp_frag_zeros);
 
-                run_warp_mma(
-                    warp_mma, accum, warp_frag_A[warp_mma_k % 2], converted_frag_B, accum, warp_tileB_k_compute_offset);
+                using FragmentOperandB = cutlass::Array<ElementA, Operator::FragmentB::kElements>;
+                constexpr cutlass::FloatRoundStyle RoundStyle = cutlass::FloatRoundStyle::round_to_nearest;
+                constexpr int ConversionVectorWidth = TransformBAfterLDS::result_type::kElements;
+                static_assert(ConversionVectorWidth == FragmentOperandB::kElements);
+
+                using Converter
+                    = cutlass::NumericArrayConverter<ElementA, ElementScale, ConversionVectorWidth, RoundStyle>;
+
+                FragmentOperandB converted_frag_B_operand = Converter::convert(converted_frag_B);
+                run_warp_mma(warp_mma, accum, warp_frag_A[warp_mma_k % 2], converted_frag_B_operand, accum,
+                    warp_tileB_k_compute_offset);
 
                 // Issue global->shared copies for the this stage
                 if (warp_mma_k < Base::kWarpGemmIterations - 1)
@@ -597,8 +616,7 @@ public:
                     group_start_iteration_A = warp_mma_k * Detail::kAccessesPerGroupA;
                     group_start_iteration_B = warp_mma_k * Detail::kAccessesPerGroupB;
 
-                    copy_tiles_and_advance(
-                        iterator_A, iterator_B, iterator_scale, group_start_iteration_A, group_start_iteration_B);
+                    copy_tiles_and_advance(iterator_A, iterator_B, group_start_iteration_A, group_start_iteration_B);
 
                     // This is the first group of a given stage, so we issue the loads for the B scales immediately.
                     if (group_start_iteration_B == 0)
@@ -613,8 +631,7 @@ public:
                     group_start_iteration_A = (warp_mma_k + 1) * Detail::kAccessesPerGroupA;
                     group_start_iteration_B = (warp_mma_k + 1) * Detail::kAccessesPerGroupB;
 
-                    copy_tiles_and_advance(
-                        iterator_A, iterator_B, iterator_scale, group_start_iteration_A, group_start_iteration_B);
+                    copy_tiles_and_advance(iterator_A, iterator_B, group_start_iteration_A, group_start_iteration_B);
 
                     // Inserts a memory fence between stages of cp.async instructions.
                     cutlass::arch::cp_async_fence();

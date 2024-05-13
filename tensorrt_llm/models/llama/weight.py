@@ -588,13 +588,13 @@ def load_from_hf_llama(tensorrt_llm_llama: 'LLaMAForCausalLM',
                     processed_torch_weights, torch_weight_scales = \
                         torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                             numpy_to_torch(v), plugin_weight_only_quant_type)
-                    weights['transformer.layers.{}.mlp.experts_weight_2'.format(
+                    weights['transformer.layers.{}.mlp.proj.weight'.format(
                         idx)] = processed_torch_weights
-                    weights['transformer.layers.{}.mlp.experts_scale_2'.format(
-                        idx)] = torch_weight_scales
+                    weights['transformer.layers.{}.mlp.proj.per_channel_scale'.
+                            format(idx)] = torch_weight_scales
 
                 else:
-                    weights['transformer.layers.{}.mlp.experts_weight_2'.format(
+                    weights['transformer.layers.{}.mlp.proj.weight'.format(
                         idx)] = v
             elif 'experts.w3w1.weight' in k:
                 # Note: no need for splitting, it's already been done above
@@ -605,13 +605,13 @@ def load_from_hf_llama(tensorrt_llm_llama: 'LLaMAForCausalLM',
                     processed_torch_weights, torch_weight_scales = \
                         torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                             numpy_to_torch(v), plugin_weight_only_quant_type)
-                    weights['transformer.layers.{}.mlp.experts_weight_1'.format(
+                    weights['transformer.layers.{}.mlp.fc.weight'.format(
                         idx)] = processed_torch_weights
-                    weights['transformer.layers.{}.mlp.experts_scale_1'.format(
-                        idx)] = torch_weight_scales
+                    weights['transformer.layers.{}.mlp.fc.per_channel_scale'.
+                            format(idx)] = torch_weight_scales
 
                 else:
-                    weights['transformer.layers.{}.mlp.experts_weight_1'.format(
+                    weights['transformer.layers.{}.mlp.fc.weight'.format(
                         idx)] = v
 
             elif 'block_sparse_moe.gate' in k:
@@ -700,7 +700,8 @@ def load_from_gptq_llama(config: PretrainedConfig, quant_ckpt_path):
         qweight_unpacked_int8 = unpack_int32_into_int8(
             qweight_int32.T).T.contiguous() - 8
         qweight_interleaved = preprocessor(packer(qweight_unpacked_int8),
-                                           torch.quint4x2).view(torch.float16)
+                                           torch.quint4x2,
+                                           torch.float16).view(torch.float16)
         # zeros = zeros * scales
         qzeros_unpacked_int32 = unpack_int32_into_int8(qzeros_int32)
         if not USE_UINT4_INPUT:
@@ -894,6 +895,22 @@ def load_from_meta_llama(meta_ckpt_dir, mapping, config):
     if not hasattr(load_from_meta_llama, "saved_embed"):
         load_from_meta_llama.saved_embed = None
 
+    def combine_embeddings(embeds, num_ckpts):
+        if len(embeds) == 1:
+            return embeds[0]
+        assert [
+            embeds[i].shape == embeds[i + 1].shape
+            for i in range(len(embeds) - 1)
+        ]
+        if embeds[0].shape[0] == config.vocab_size // num_ckpts:
+            merge_dim = 0
+        elif embeds[0].shape[1] == config.hidden_size // num_ckpts:
+            merge_dim = 1
+        else:
+            logger.error("Unable to infer embedding split dimension")
+            assert False, "Unable to infer embedding split dimension"
+        return torch.cat(embeds, dim=merge_dim)
+
     def gather_embedding(cur_embed, name: str, num_ckpts):
         if mapping.tp_size == 1:
             # even if num_ckpts > 1, get_current_weights will already have it gathered
@@ -905,7 +922,7 @@ def load_from_meta_llama(meta_ckpt_dir, mapping, config):
                                        f"consolidated.{i:02d}.pth"),
                                   map_location="cpu")
                 embeds[i] = ckpt[name]
-            embed = torch.cat(embeds, dim=1).to(torch_dtype)
+            embed = combine_embeddings(embeds, num_ckpts).to(torch_dtype)
             load_from_meta_llama.saved_embed = embed
 
         return load_from_meta_llama.saved_embed

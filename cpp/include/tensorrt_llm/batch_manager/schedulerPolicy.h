@@ -31,4 +31,6 @@ SchedulerPolicy execToBatchManagerSchedPolicy(executor::SchedulerPolicy policy);
 
 executor::SchedulerPolicy batchManagerToExecSchedPolicy(SchedulerPolicy policy);
 
+std::ostream& operator<<(std::ostream& os, SchedulerPolicy policy);
+
 } // namespace tensorrt_llm::batch_manager::batch_scheduler

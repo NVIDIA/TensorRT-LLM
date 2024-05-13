@@ -102,6 +102,10 @@ struct Fused_multihead_attention_params_v2
     // The scaling factors for the kernel.
     uint32_t scale_bmm1, scale_softmax, scale_bmm2;
 
+    // The scaling factors in the device memory.
+    uint32_t const* scale_bmm1_d;
+    uint32_t const* scale_bmm2_d;
+
     // Do we use trick to avoid I2F/F2I in the INT8 kernel.
     bool enable_i2f_trick;
 
@@ -116,18 +120,15 @@ struct Fused_multihead_attention_params_v2
     bool has_alibi = false;
     AlibiParams alibi_params{};
 
-    // The number of heads computed by one iteration of the wave.
-    int heads_per_wave;
-    // Buffers to perform a global sync and a critical section.
-    int *counters, *max_barriers, *sum_barriers, *locks;
-    // Scratch buffers to finalize softmax.
-    float *max_scratch_ptr, *sum_scratch_ptr;
-
-    // Scale bmm2 in the device memory.
-    uint32_t const* scale_bmm2_d;
+    // M tile id counter for dynamic scheduling
+    uint32_t* tile_id_counter_ptr;
+    uint32_t num_tiles;
+    uint32_t num_tiles_per_head;
+    bool use_balanced_scheduling;
 
     // In multi-query or grouped-query attention (MQA/GQA), several Q heads are associated with one KV head
     int h_kv;
+    int h_q_per_kv;
 
     // Sliding Window Attention
     // Only pay attention to [max(0, query_idx - sliding_window_size), query_idx].
@@ -160,6 +161,9 @@ struct Fused_multihead_attention_params_v2
         scale_softmax = 0;
         scale_bmm2 = 0;
 
+        scale_bmm1_d = nullptr;
+        scale_bmm2_d = nullptr;
+
         enable_i2f_trick = false;
 
         cu_seqlens = nullptr;
@@ -167,6 +171,7 @@ struct Fused_multihead_attention_params_v2
         use_int8_scale_max = false;
 
         h_kv = 0;
+        h_q_per_kv = 1;
         sliding_window_size = INT_MAX;
         is_s_padded = false;
 
@@ -199,10 +204,15 @@ struct Fused_multihead_attention_paged_kv_params_v2
     int b, h, s, d;
     // The scaling factors for the kernel.
     uint32_t scale_bmm1, scale_softmax, scale_bmm2;
+    // The scaling factors in the device memory (required by TRT-LLM + FP8 FMHA).
+    uint32_t const* scale_bmm1_d;
+    uint32_t const* scale_bmm2_d;
 
-    // TODO: add fp8 paged kv fmha later.
-    // Scale bmm2 in the device memory.
-    // uint32_t const* scale_bmm2_d;
+    // M tile id counter for dynamic scheduling
+    uint32_t* tile_id_counter_ptr;
+    uint32_t num_tiles;
+    uint32_t num_tiles_per_head;
+    bool use_balanced_scheduling;
 
     // Do we use Niall's trick to avoid I2F/F2I in the INT8 kernel.
     // See https://confluence.nvidia.com/pages/viewpage.action?pageId=302779721 for details.
@@ -223,17 +233,15 @@ struct Fused_multihead_attention_paged_kv_params_v2
     // q with shape [B, S, H, D] in const cache.
     cudaTmaDesc tma_desc_q;
     // Tma descriptors for paged kv cache.
-    // paged kv has [B, 2, Num_blocks] buffers,
-    //  and each points to [Tokens_per_block, H, D] contiguous memory.
-    cudaTmaDesc* tma_desc_paged_kv;
+    cudaTmaDesc tma_desc_paged_kv;
 
     // Paged KV load.
     int blocks_per_tma_load;
     int blocks_per_tma_load_log2;
 
     // In multi-query or grouped-query attention (MQA/GQA), several Q heads are associated with one KV head
-    int h_kv = 0;
-    int h_q_per_kv = 0;
+    int h_kv;
+    int h_q_per_kv;
 
     // Sliding Window Attention
     // Only pay attention to [max(0, query_idx - sliding_window_size), query_idx].
@@ -261,6 +269,14 @@ struct Fused_multihead_attention_paged_kv_params_v2
         scale_bmm1 = 0;
         scale_softmax = 0;
         scale_bmm2 = 0;
+
+        scale_bmm1_d = nullptr;
+        scale_bmm2_d = nullptr;
+
+        tile_id_counter_ptr = nullptr;
+        num_tiles = 1;
+        num_tiles_per_head = 1;
+        use_balanced_scheduling = false;
 
         enable_i2f_trick = false;
 
@@ -305,14 +321,18 @@ struct Launch_params
     int* seqlens = nullptr;
     // number of paged kv blocks for context sequence.
     int blocks_per_context_sequence = 0;
-    // device ptrs on the host for paged kv cache.
-    int64_t const* paged_kv_block_ptrs = nullptr;
+    // device ptr on the host for paged kv cache.
+    void* paged_kv_pool_ptr = nullptr;
+    // offsets on the host for paged kv cache.
+    int32_t const* paged_kv_block_offsets = nullptr;
     // if flash attention is used (only FP16)
     bool flash_attention = false;
     // if warp_specialized kernels are used (only SM90 HGMMA + TMA)
     bool warp_specialization = false;
     // granular tiling flash attention kernels
     bool granular_tiling = false;
+    // dynamic tile scheduling.
+    bool dynamic_scheduler = false;
     // mask type: padding, causal, sliding_window_causal
     ContextAttentionMaskType attention_mask_type = ContextAttentionMaskType::PADDING;
     // use specialized kernels without alibi support.
@@ -320,9 +340,13 @@ struct Launch_params
     // enable exp2 optimization (which helps improve performance).
     // note that this is not compatible with alibi bias due to the accuracy issues.
     bool useBase2ExpTrick = false;
+    // use paged_kv_fmha kernels.
+    bool paged_kv_input = false;
     // harward properties to determine how to launch blocks
     int multi_processor_count = 0;
     int device_l2_cache_size = 0;
+    // total device memory (used by TMA loading of paged kv cache).
+    size_t total_device_memory = 0;
 
     void set_default_kernel_selection_params()
     {
@@ -334,11 +358,13 @@ struct Launch_params
         flash_attention = false;
         warp_specialization = false;
         granular_tiling = false;
+        dynamic_scheduler = false;
         attention_mask_type = (attention_mask_type == ContextAttentionMaskType::PADDING)
             ? ContextAttentionMaskType::PADDING
             : ContextAttentionMaskType::CAUSAL;
         useKernelWithoutAlibi = false;
         useBase2ExpTrick = false;
+        paged_kv_input = false;
     }
 };
 

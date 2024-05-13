@@ -6,7 +6,6 @@ __pycache__/
 *.nsys-rep
 .VSCodeCounter
 build*/
-*.so
 *.egg-info/
 .coverage
 *.csv
@@ -32,6 +31,9 @@ cpp/.ccache/
 tensorrt_llm/libs
 tensorrt_llm/bindings.pyi
 tensorrt_llm/bindings/*.pyi
+*docs/cpp_docs*
+*docs/source/_cpp_gen*
+*.swp
 
 # Debugging Purpose
 .env

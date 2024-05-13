@@ -213,24 +213,27 @@ class MambaLMHeadModel(PretrainedModel):
 
         return (lm_logits, present_convs, present_ssms)
 
-    def prepare_inputs(self,
-                       max_batch_size,
-                       max_input_len,
-                       max_seq_len,
-                       use_cache,
-                       max_beam_width: int = 1,
-                       max_num_tokens: int = None,
-                       opt_num_tokens: int = None,
-                       prompt_embedding_table_size: int = 0,
-                       max_draft_len: int = 0,
-                       gather_context_logits: bool = False,
-                       gather_generation_logits: bool = False,
-                       lora_target_modules: List[str] = None):
+    def prepare_inputs(
+            self,
+            max_batch_size,
+            max_input_len,
+            max_seq_len,
+            use_cache,
+            max_beam_width: int = 1,
+            max_num_tokens: int = None,
+            opt_num_tokens: int = None,
+            prompt_embedding_table_size: int = 0,
+            max_draft_len: int = 0,
+            gather_context_logits: bool = False,
+            gather_generation_logits: bool = False,
+            lora_target_modules: List[str] = None,
+            speculative_decoding_draft_tokens_external: bool = False):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
 
             @return: a list contains values which can be fed into the self.forward()
         '''
+        assert speculative_decoding_draft_tokens_external == False, "Speculative decoding is not supported in Mamba"
         remove_input_padding = default_net().plugin_config.remove_input_padding
         use_mamba_conv1d_plugin = default_net(
         ).plugin_config.mamba_conv1d_plugin

@@ -33,12 +33,14 @@ class TrtLlm_QuantOp(enum.Enum):
     per_column_scale_only = enum_auto()
     finegrained_scale_only = enum_auto()
     finegrained_scale_and_zeros = enum_auto()
+    none = enum_auto()
 
 
 QuantOpNames = {
     TrtLlm_QuantOp.per_column_scale_only: "cs",
     TrtLlm_QuantOp.finegrained_scale_only: "fgs",
-    TrtLlm_QuantOp.finegrained_scale_and_zeros: "fgsz"
+    TrtLlm_QuantOp.finegrained_scale_and_zeros: "fgsz",
+    TrtLlm_QuantOp.none: "noquant"
 }
 
 QuantOpTag = {
@@ -47,7 +49,8 @@ QuantOpTag = {
     TrtLlm_QuantOp.finegrained_scale_only:
     "cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY",
     TrtLlm_QuantOp.finegrained_scale_and_zeros:
-    "cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS"
+    "cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS",
+    TrtLlm_QuantOp.none: "void"
 }
 
 ################################################################################
@@ -56,7 +59,8 @@ QuantOpTag = {
 CudaTypeName = {
     DataType.e4m3: "__nv_fp8_e4m3",
     DataType.bf16: "__nv_bfloat16",
-    DataType.f16: "half"
+    DataType.f16: "half",
+    DataType.f32: "float"
 }
 
 
@@ -64,22 +68,10 @@ CudaTypeName = {
 # A data structure holding all info to instantiate gemm launchers in TRT LLM.
 class TrtLlm_GemmLauncher:
 
-    def __init__(self,
-                 gemm_kind,
-                 arch,
-                 act_type,
-                 weight_type,
-                 scalezero_type,
-                 bias_type,
-                 output_type,
-                 quant_op,
-                 epi_tag,
-                 cta_shape,
-                 warp_shape,
-                 stages,
-                 cga_shape=None,
-                 mainloop_schedule=None,
-                 epi_schedule=None):
+    def __init__(self, gemm_kind, arch, act_type, weight_type, scalezero_type,
+                 bias_type, output_type, quant_op, epi_tag, cta_shape,
+                 warp_shape, stages, cga_shape, mainloop_schedule,
+                 epi_schedule):
         self.gemm_kind = gemm_kind
         self.arch = arch
         self.act_type = act_type
@@ -124,9 +116,7 @@ def tuple_to_cute_shape(shape):
 
 
 def instantiate_operation(operation):
-
     act_tag = CudaTypeName[operation.act_type]
-    weight_tag = DataTypeTag[operation.weight_type]
     scale_zero_tag = CudaTypeName[operation.scalezero_type]
     bias_tag = CudaTypeName[operation.bias_type]
     out_tag = CudaTypeName[operation.output_type]
@@ -138,18 +128,21 @@ def instantiate_operation(operation):
     cute_cga_shape = tuple_to_cute_shape(operation.cga_shape)
 
     kernel_sched = KernelScheduleTag[operation.mainloop_schedule]
-
-    # Here, we must append MixedInput depending on the schedule, since we know the types are different.
-    # It is a work around since the CUTLASS library did not have the MixedInput schedules at the time of writing.
-    if operation.mainloop_schedule in [
-            KernelScheduleType.TmaWarpSpecializedCooperative,
-            KernelScheduleType.TmaWarpSpecializedPingpong,
-            KernelScheduleType.TmaWarpSpecialized
-    ]:
-        kernel_sched += "MixedInput"
     epi_sched = EpilogueScheduleTag[operation.epi_schedule]
 
-    instantiation = f"""
+    if operation.gemm_kind == GemmKind.Gemm:
+        if operation.mainloop_schedule in [
+                KernelScheduleType.TmaWarpSpecializedCooperative,
+                KernelScheduleType.TmaWarpSpecializedPingpong,
+                KernelScheduleType.TmaWarpSpecialized
+        ] and DataTypeSize[operation.act_type] != DataTypeSize[
+                operation.weight_type]:
+            # Here, we must append MixedInput depending on the schedule, since we know the types are different.
+            # It is a work around since the CUTLASS library did not have the MixedInput schedules at the time of writing.
+            kernel_sched += "MixedInput"
+
+        weight_tag = DataTypeTag[operation.weight_type]
+        instantiation = f"""
 template void sm90_generic_mixed_gemm_kernelLauncher<{act_tag}, {weight_tag}, {scale_zero_tag}, {bias_tag}, {out_tag},
 {quant_op}, {epi_tag},
 {cute_cta_shape}, {cute_cga_shape},
@@ -158,11 +151,27 @@ const {act_tag}*, const {weight_tag}*, const {scale_zero_tag}*, const {scale_zer
 {out_tag}*, int, int, int, const int, tensorrt_llm::cutlass_extensions::CutlassGemmConfig, char*, size_t, cudaStream_t, int*
 );
 """
+    elif operation.gemm_kind == GemmKind.Grouped:
+        # Similar to MixedInput above, we must modify the tags for grouped gemm as CUTLASS library does not have the updated schedules
+        assert operation.mainloop_schedule in [
+            KernelScheduleType.TmaWarpSpecializedCooperative,
+            KernelScheduleType.TmaWarpSpecializedCooperativeFP8FastAccum
+        ]
+        assert operation.epi_schedule == EpilogueScheduleType.NoSmemWarpSpecialized
+        kernel_sched.replace("::Kernel", "::KernelGrouped")
+        epi_sched += "Grouped"
+
+        weight_tag = CudaTypeName[operation.weight_type]
+
+        instantiation = f"""
+        template void sm90_generic_moe_gemm_kernelLauncher<{act_tag}, {weight_tag},
+                {epi_tag}, {cute_cta_shape}, {cute_cga_shape}, false>
+                (HopperGroupedGemmInput, int, int, cudaStream_t, int*, size_t*);
+"""
     return instantiation
 
 
 def get_file_content(launcher_inl_files, operations):
-
     include_list = list()
     for file in launcher_inl_files:
         include_list.append(f"#include \"{file}\"")
@@ -191,11 +200,12 @@ namespace cutlass_kernels
 
 
 def write_file(launcher_inl_files, operations, output_file):
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
     with open(output_file, mode="w") as f:
         f.write(get_file_content(launcher_inl_files, operations))
 
 
-def is_op_valid(op):
+def is_gemm_op_valid(op):
     tile_m, tile_n, _ = op.cta_shape
     cga_m, cga_n, _ = op.cga_shape
 
@@ -214,14 +224,41 @@ def is_op_valid(op):
     return False
 
 
+def is_grouped_gemm_op_valid(op):
+    if not is_gemm_op_valid(op):
+        return False
+
+    if op.epi_tag != TrtLlm_EpilogueTag.epilogue_op_default:
+        return False
+
+    if op.epi_schedule != EpilogueScheduleType.NoSmemWarpSpecialized:
+        return False
+
+    if op.mainloop_schedule not in [
+            KernelScheduleType.TmaWarpSpecializedCooperative,
+            KernelScheduleType.TmaWarpSpecializedCooperativeFP8FastAccum
+    ]:
+        return False
+
+    return True
+
+
+def is_op_valid(op):
+    if op.gemm_kind == GemmKind.Gemm:
+        return is_gemm_op_valid(op)
+    if op.gemm_kind == GemmKind.Grouped:
+        return is_grouped_gemm_op_valid(op)
+
+
 ################################################################################
-def generate_sm90_operations():
+def generate_sm90_mixed_gemm_operations():
     arch = 90
 
-    # For legacy reasons, we use unsigned types for fp16 / bf16 activations.
+    # For legacy reasons, we use unsigned types for the weights. The instanitated template
+    # will remap those back to the signed type.
     # Takes the form (activation_type, weight_type, scalezero_type, bias_type, output_type)
     supported_dtypes = [
-        (DataType.e4m3, DataType.s4, DataType.f16, DataType.f16, DataType.f16),
+        (DataType.e4m3, DataType.u4, DataType.f16, DataType.f16, DataType.f16),
         (DataType.f16, DataType.u4, DataType.f16, DataType.f16, DataType.f16),
         (DataType.bf16, DataType.u4, DataType.bf16, DataType.bf16,
          DataType.bf16),
@@ -260,11 +297,56 @@ def generate_sm90_operations():
         mainloop_schedule = KernelScheduleType.TmaWarpSpecializedCooperative if use_coop else KernelScheduleType.TmaWarpSpecializedPingpong
         epi_schedule = EpilogueScheduleType.TmaWarpSpecializedCooperative if use_coop else EpilogueScheduleType.TmaWarpSpecialized
 
-        operation = TrtLlm_GemmLauncher(GemmKind.Gemm, arch, *dtype_combo, quant_op, epi_tag, cta_shape_mnk, \
-                                        warp_shape, stages, cga_shape, mainloop_schedule, epi_schedule)
+        fpA_intB_operation = TrtLlm_GemmLauncher(GemmKind.Gemm, arch, *dtype_combo, quant_op, epi_tag, cta_shape_mnk, \
+                                                 warp_shape, stages, cga_shape, mainloop_schedule, epi_schedule)
 
-        if is_op_valid(operation):
-            operations.append(operation)
+        if is_op_valid(fpA_intB_operation):
+            operations.append(fpA_intB_operation)
+
+    return operations
+
+
+def generate_sm90_grouped_gemm_operations():
+    arch = 90
+    supported_dtypes = [
+        DataType.f16, DataType.bf16, DataType.f32, DataType.e4m3
+    ]
+    quant_ops = [TrtLlm_QuantOp.none]
+    epi_tags = [TrtLlm_EpilogueTag.epilogue_op_default]
+    M_TILES = [128]  # Currently M tile must be 128 for Grouped GEMM
+    N_TILES = [16, 32, 64, 128, 256]
+    cta_shapes_mn = product(M_TILES, N_TILES)
+
+    warp_shape = [0, 0, 0]  # ignored except for naming
+    stages = 0  # auto
+
+    cga_shapes = product([1, 2], [1, 2], [1])
+
+    partial_args = product(supported_dtypes, quant_ops, epi_tags, cta_shapes_mn,
+                           cga_shapes)
+
+    operations = list()
+    for dtype, quant_op, epi_tag, cta_shape_mn, cga_shape in partial_args:
+        max_k_bits = 128 * 8
+        cta_shape_k = max_k_bits // DataTypeSize[dtype]
+        cta_shape_mnk = cta_shape_mn + (cta_shape_k, )
+
+        mainloop_schedule = KernelScheduleType.TmaWarpSpecializedCooperative if dtype else KernelScheduleType.TmaWarpSpecializedCooperativeFP8FastAccum
+        epi_schedule = EpilogueScheduleType.NoSmemWarpSpecialized
+
+        moe_gemm_operation = TrtLlm_GemmLauncher(
+            GemmKind.Grouped, arch, dtype, dtype, dtype, dtype, dtype, quant_op,
+            epi_tag, cta_shape_mnk, warp_shape, stages, cga_shape,
+            mainloop_schedule, epi_schedule)
+
+        if is_op_valid(moe_gemm_operation):
+            operations.append(moe_gemm_operation)
+    return operations
+
+
+def generate_sm90_operations():
+    operations = generate_sm90_mixed_gemm_operations()
+    operations.extend(generate_sm90_grouped_gemm_operations())
     return operations
 
 
@@ -284,7 +366,10 @@ if __name__ == "__main__":
     # Get the absolute path of the provided directory
     output_dir = os.path.abspath(args.output_dir)
 
-    hopper_inl = "tensorrt_llm/kernels/cutlass_kernels/fpA_intB_gemm/launchers/fpA_intB_launcher_sm90.inl"
+    fpA_intB_inl = "tensorrt_llm/kernels/cutlass_kernels/fpA_intB_gemm/launchers/fpA_intB_launcher_sm90.inl"
+    moe_gemm_inl = "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/launchers/moe_gemm_launcher_sm90.inl"
+
+    inl_map = {GemmKind.Gemm: [fpA_intB_inl], GemmKind.Grouped: [moe_gemm_inl]}
 
     # The goal here is to group kernels with common instantiations together in order to reduce template instantiation overheads.
     # Template instantiation dominates the time in a compilation unit, so it is the most important factor to improve.
@@ -298,7 +383,9 @@ if __name__ == "__main__":
 
     file_counter = 1
     for key, value in op_groups.items():
+        gemm_kind, _, _ = key
         out_file = os.path.join(
-            output_dir, f"cutlass_kernel_file_{file_counter}.generated.cu")
-        write_file([hopper_inl], value, out_file)
+            output_dir, GemmKindNames[gemm_kind],
+            f"cutlass_kernel_file_{file_counter}.generated.cu")
+        write_file(inl_map[gemm_kind], value, out_file)
         file_counter += 1

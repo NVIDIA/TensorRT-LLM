@@ -29,8 +29,8 @@ Please install required packages first and setup `git-lfs`:
 
 ```bash
 pip install -r requirements.txt
-git clone --branch v1.1.1 https://github.com/Dao-AILab/causal-conv1d.git
-git clone --branch v1.1.1 https://github.com/state-spaces/mamba.git
+git clone --branch v1.1.3 https://github.com/Dao-AILab/causal-conv1d.git
+git clone --branch v1.1.3 https://github.com/state-spaces/mamba.git
 pip install ./causal-conv1d/ ./mamba/
 
 # Setup git-lfs

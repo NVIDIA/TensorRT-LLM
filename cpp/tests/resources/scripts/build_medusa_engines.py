@@ -36,10 +36,15 @@ def build_engine(weight_dir: _pl.Path, medusa_dir: _pl.Path,
     build_args = ["trtllm-build"] + (
         ['--checkpoint_dir', str(engine_dir)] if engine_dir else []) + [
             '--output_dir',
-            str(engine_dir), '--gpt_attention_plugin=float16',
-            '--gemm_plugin=float16', '--max_batch_size=8',
-            '--max_input_len=512', '--max_output_len=20', '--log_level=error',
-            '--paged_kv_cache=enable', '--remove_input_padding=enable'
+            str(engine_dir),
+            '--gemm_plugin=float16',
+            '--max_batch_size=8',
+            '--max_input_len=512',
+            '--max_output_len=20',
+            '--log_level=error',
+            '--paged_kv_cache=enable',
+            '--remove_input_padding=enable',
+            '--speculative_decoding_mode=medusa',
         ]
 
     run_command(build_args)

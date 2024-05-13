@@ -80,6 +80,18 @@ def parse_arguments():
         help="Optimize the model with specified quantization recipe")
 
     parser.add_argument(
+        '--input_timing_cache',
+        type=str,
+        default=None,
+        help=
+        'The path to read timing cache, will be ignored if the file does not exist'
+    )
+    parser.add_argument('--output_timing_cache',
+                        type=str,
+                        default='model.cache',
+                        help='The path to write timing cache')
+
+    parser.add_argument(
         '--profiling_verbosity',
         type=str,
         default='layer_names_only',
@@ -156,6 +168,24 @@ def parse_arguments():
         help=
         "The number of gpus to be used for inference, only used when --serial_build is specified"
     )
+    parser.add_argument(
+        '--opt_batch_size',
+        type=int,
+        default=None,
+        help=
+        "If opt_batch_size option is specified, it will override the opt batch size."
+        "This flag only takes effect when `--mode=ootb` is added. For other modes, please use --opt_num_tokens to replace it."
+    )
+
+    parser.add_argument(
+        '--opt_num_tokens',
+        type=int,
+        default=None,
+        help="It equals to max_batch_size*max_beam_width by default, set this "
+        "value as close as possible to the actual number of tokens on your workload. "
+        "Note that this argument might be removed in the future."
+        "This flag only takes effect when `--mode` is not `ootb`. For ootb mode, please use --opt_batch_size to replace it."
+    )
 
     return parser.parse_args()
 
@@ -217,6 +247,21 @@ def build_gpt(args):
     max_beam_width = build_config['max_beam_width'] \
         if args.max_beam_width is None else args.max_beam_width
 
+    opt_batch_size = build_config[
+        'opt_batch_size'] if args.opt_batch_size is None else args.opt_batch_size
+
+    opt_num_tokens = build_config[
+        'opt_num_tokens'] if args.opt_num_tokens is None else args.opt_num_tokens
+
+    if args.mode != "ootb" and opt_batch_size is not None:
+        raise Exception(
+            f'--opt_batch_size only used when mode is ootb. Please using --opt_num_tokens instead it.'
+        )
+    if args.mode == "ootb" and opt_num_tokens is not None:
+        raise Exception(
+            f'--opt_num_tokens does not support ootb mode. Please using --opt_batch_size instead it.'
+        )
+
     quant_config = get_quant_config(args.quantization)
     quant_algo = quant_config.quant_algo
     kv_cache_quant_algo = quant_config.kv_cache_quant_algo
@@ -231,11 +276,18 @@ def build_gpt(args):
             'mamba_d_conv']
         builder_config_extra_kwargs['mamba_expand'] = build_config[
             'mamba_expand']
-        builder_config_extra_kwargs['max_beam_width'] = max_beam_width
+        builder_config_extra_kwargs['layer_types'] = ['recurrent']
+    elif get_model_family(args.model) == 'recurrentgemma':
+        builder_config_extra_kwargs['conv_kernel'] = build_config['conv_kernel']
+        builder_config_extra_kwargs['layer_types'] = build_config['layer_types']
+        builder_config_extra_kwargs['rnn_hidden_size'] = build_config[
+            'rnn_hidden_size']
+        builder_config_extra_kwargs['logits_soft_cap'] = build_config[
+            'logits_soft_cap']
     builder_config = builder.create_builder_config(
         name=args.model,
         precision=args.dtype,
-        timing_cache=None,
+        timing_cache=args.input_timing_cache,
         profiling_verbosity=args.profiling_verbosity,
         tensor_parallel=world_size,  # TP only
         parallel_build=True,
@@ -248,6 +300,7 @@ def build_gpt(args):
         max_position_embeddings=build_config['n_positions'],
         apply_query_key_layer_scaling=apply_query_key_layer_scaling,
         max_batch_size=max_batch_size,
+        max_beam_width=max_beam_width,
         max_input_len=max_input_len,
         max_output_len=max_output_len,
         int8=(quant_mode.has_act_and_weight_quant()
@@ -715,6 +768,51 @@ def build_gpt(args):
             build_config["moe_num_experts"],
             'moe_top_k':
             build_config["moe_top_k"],
+            'qwen_type':
+            'qwen',
+        }
+        config = PretrainedConfig.from_dict(config)
+        tensorrt_llm_model = tensorrt_llm.models.QWenForCausalLM(config)
+    elif family == "qwen2":
+        config = {
+            'architecture':
+            'QWenForCausalLM',
+            'dtype':
+            args.dtype,
+            'num_hidden_layers':
+            build_config['num_layers'],
+            'num_attention_heads':
+            build_config['num_heads'],
+            'num_key_value_heads':
+            build_config['num_heads'] if build_config['num_kv_heads'] is None
+            else build_config['num_kv_heads'],
+            'hidden_size':
+            build_config['hidden_size'],
+            'intermediate_size':
+            build_config['inter_size'],
+            'vocab_size':
+            build_config['vocab_size'],
+            'position_embedding_type':
+            'rope_gpt_neox',
+            'max_position_embeddings':
+            build_config['n_positions'],
+            'hidden_act':
+            build_config['hidden_act'],
+            'quantization': {
+                'group_size': 128,
+                'quant_algo': quant_algo,
+                'kv_cache_quant_algo': kv_cache_quant_algo
+            },
+            'mapping': {
+                'world_size': world_size,
+                'tp_size': world_size
+            },
+            'moe_num_experts':
+            build_config["moe_num_experts"],
+            'moe_top_k':
+            build_config["moe_top_k"],
+            'qwen_type':
+            'qwen2',
         }
         config = PretrainedConfig.from_dict(config)
         tensorrt_llm_model = tensorrt_llm.models.QWenForCausalLM(config)
@@ -738,6 +836,39 @@ def build_gpt(args):
         }
         config = PretrainedConfig.from_dict(config)
         tensorrt_llm_model = tensorrt_llm.models.MambaLMHeadModel(config)
+    elif family == "recurrentgemma":
+        config = {
+            'architecture': 'RecurrentGemmaForCausalLM',
+            'dtype': args.dtype,
+            'vocab_size': build_config['vocab_size'],
+            'hidden_size': build_config['hidden_size'],
+            'num_hidden_layers': build_config['num_layers'],
+            'num_attention_heads': build_config['num_heads'],
+            'num_key_value_heads': build_config['num_kv_heads'],
+            'hidden_act': build_config['hidden_act'],
+            'intermediate_size': build_config['inter_size'],
+            'rms_norm': True,
+            'norm_epsilon': 1e-6,
+            'quantization': {
+                'group_size': 128,
+                'quant_algo': quant_algo,
+                'kv_cache_quant_algo': kv_cache_quant_algo
+            },
+            'mapping': {
+                'world_size': world_size,
+                'tp_size': world_size
+            },
+            'position_embedding_type': build_config['position_embedding_type'],
+            'rotary_percentage': build_config['rotary_pct'],
+            'max_position_embeddings': build_config['n_positions'],
+            'conv_kernel': build_config['conv_kernel'],
+            'layer_types': build_config['layer_types'],
+            'rnn_hidden_size': build_config['rnn_hidden_size'],
+            'logits_soft_cap': build_config['logits_soft_cap'],
+        }
+        config = PretrainedConfig.from_dict(config)
+        tensorrt_llm_model = tensorrt_llm.models.RecurrentGemmaForCausalLM(
+            config)
 
     else:
         raise Exception(f'Unexpected model: {args.model}')
@@ -775,9 +906,11 @@ def build_gpt(args):
         # Inflight batching
         if args.mode == 'plugin-ifb':
             network.plugin_config.enable_paged_kv_cache()
+            network.plugin_config.enable_paged_state()
     elif args.mode == 'ootb-except-mha':
         network.plugin_config.set_gpt_attention_plugin(dtype=args.dtype)
         network.plugin_config.set_context_fmha(ContextFMHAType.enabled)
+        network.plugin_config.enable_remove_input_padding()
 
     if world_size > 1:
         network.plugin_config.set_nccl_plugin(
@@ -789,12 +922,17 @@ def build_gpt(args):
         network.set_named_parameters(tensorrt_llm_model.named_parameters())
 
         # Forward
+        print(
+            f"max_batch_size: {max_batch_size}, max_input_len: {max_input_len}, max_output_len: {max_output_len}, max_beam_width: {max_beam_width}"
+        )
         inputs = tensorrt_llm_model.prepare_inputs(
             max_batch_size=max_batch_size,
             max_input_len=max_input_len,
             max_seq_len=max_input_len + max_output_len,
             use_cache=True,
-            max_beam_width=max_beam_width)
+            max_beam_width=max_beam_width,
+            opt_batch_size=opt_batch_size,
+            opt_num_tokens=opt_num_tokens)
 
         tensorrt_llm_model(**inputs)
 
@@ -815,6 +953,16 @@ def build_gpt(args):
             config_path = os.path.join(args.output_dir, 'config.json')
             builder_config.plugin_config = network.plugin_config
             builder.save_config(builder_config, config_path)
+            if args.output_timing_cache:
+                # Save timing cache to output_dir if not absolute path
+                timing_cache_path = args.output_timing_cache if os.path.isabs(
+                    args.output_timing_cache) else os.path.join(
+                        args.output_dir, args.output_timing_cache)
+                ok = builder.save_timing_cache(builder_config,
+                                               timing_cache_path)
+                if not ok:
+                    logger.warning("Failed to save timing cache.")
+
     return engine, build_time
 
 
@@ -847,7 +995,7 @@ def build_bert(args):
     builder_config = builder.create_builder_config(
         name=args.model,
         precision=args.dtype,
-        timing_cache=None,
+        timing_cache=args.input_timing_cache,
         profiling_verbosity=args.profiling_verbosity,
         tensor_parallel=world_size,  # TP only
         parallel_build=True,
@@ -940,6 +1088,16 @@ def build_bert(args):
             config_path = os.path.join(args.output_dir, 'config.json')
             builder_config.plugin_config = network.plugin_config
             builder.save_config(builder_config, config_path)
+            if args.output_timing_cache:
+                # Save timing cache to output_dir if not absolute path
+                timing_cache_path = args.output_timing_cache if os.path.isabs(
+                    args.output_timing_cache) else os.path.join(
+                        args.output_dir, args.output_timing_cache)
+                ok = builder.save_timing_cache(builder_config,
+                                               timing_cache_path)
+                if not ok:
+                    logger.warning("Failed to save timing cache.")
+
     return engine, build_time
 
 
@@ -1005,8 +1163,8 @@ def enc_dec_build_helper(component, config, args):
     builder_config = builder.create_builder_config(
         name=args.model,
         precision=args.dtype,
-        timing_cache=None,
-        profiling_verbosity='layer_names_only',  # by default
+        timing_cache=args.input_timing_cache,
+        profiling_verbosity=args.profiling_verbosity,
         tensor_parallel=world_size,  # TP only
         parallel_build=True,
         num_layers=config['num_layers'],
@@ -1043,8 +1201,6 @@ def enc_dec_build_helper(component, config, args):
                       tp_size=world_size,
                       pp_size=1)  # TP only
 
-    fp16_clamping = (args.dtype == 'float16') and ('t5' in family)
-
     if component == 'encoder':
         if family == 'whisper':
             tllm_model = tensorrt_llm.models.WhisperEncoder(
@@ -1057,68 +1213,145 @@ def enc_dec_build_helper(component, config, args):
             if use_weight_only:
                 tllm_model = quantize(tllm_model, quant_config)
         else:
-            tllm_model = tensorrt_llm.models.EncoderModel(
-                num_layers=config['num_layers'],
-                num_heads=config['num_heads'],
-                num_kv_heads=config['num_heads'],
-                head_size=config['head_size'],
-                hidden_size=config['hidden_size'],
-                ffn_hidden_size=config['ffn_hidden_size'],
-                vocab_size=config['vocab_size'],
-                max_position_embeddings=config.get('n_positions', 0),
-                has_position_embedding=has_position_embedding,
-                relative_attention=relative_attention,
-                max_distance=config.get('max_distance', 0),
-                num_buckets=config.get('num_buckets', 0),
-                has_embedding_layernorm=has_embedding_layernorm,
-                has_embedding_scale=config.get('has_embedding_scale', False),
-                q_scaling=q_scaling,
-                has_attention_qkvo_bias=has_attention_qkvo_bias,
-                has_mlp_bias=has_mlp_bias,
-                has_model_final_layernorm=has_model_final_layernorm,
-                layernorm_eps=1e-6,
-                layernorm_position=layernorm_position,
-                layernorm_type=layernorm_type,
-                hidden_act=config['hidden_act'],
-                dtype=dtype,
-                use_parallel_embedding=False,  # by default
-                embedding_sharding_dim=0,  # by default
-                mapping=mapping,
-                fp16_clamping=fp16_clamping)
+            pretrained_config = PretrainedConfig.from_dict({
+                'architecture':
+                "EncoderModel",
+                'dtype':
+                args.dtype,
+                'logits_dtype':
+                logits_dtype,
+                'num_hidden_layers':
+                config['num_layers'],
+                'num_attention_heads':
+                config['num_heads'],
+                'hidden_size':
+                config['hidden_size'],
+                'norm_epsilon':
+                1e-6,
+                'vocab_size':
+                config['vocab_size'],
+                'hidden_act':
+                config['hidden_act'],
+                'mapping': {
+                    'world_size': mapping.world_size,
+                    'tp_size': mapping.tp_size,
+                    'pp_size': mapping.pp_size,
+                },
+                'use_parallel_embedding':
+                False,
+                'embedding_sharding_dim':
+                0,
+                'max_position_embeddings':
+                config.get('n_positions', 0),
+                'use_prompt_tuning':
+                False,
+                'head_size':
+                config['head_size'],
+                'has_position_embedding':
+                has_position_embedding,
+                'layernorm_type':
+                layernorm_type,
+                'has_attention_qkvo_bias':
+                has_attention_qkvo_bias,
+                'has_mlp_bias':
+                has_mlp_bias,
+                'has_model_final_layernorm':
+                has_model_final_layernorm,
+                'has_embedding_layernorm':
+                has_embedding_layernorm,
+                'has_embedding_scale':
+                config.get('has_embedding_scale', False),
+                'ffn_hidden_size':
+                config['ffn_hidden_size'],
+                'q_scaling':
+                q_scaling,
+                'layernorm_position':
+                layernorm_position,
+                'relative_attention':
+                relative_attention,
+                'max_distance':
+                config.get('max_distance', 0),
+                'num_buckets':
+                config.get('num_buckets', 0),
+                'model_type':
+                family,
+            })
+            tllm_model = tensorrt_llm.models.EncoderModel(pretrained_config)
     elif component == 'decoder':
-        tllm_model = tensorrt_llm.models.DecoderModel(
-            num_layers=config['num_layers'],
-            num_heads=config['num_heads'],
-            num_kv_heads=config['num_heads'],
-            head_size=config['head_size'],
-            hidden_size=config['hidden_size'],
-            ffn_hidden_size=config['ffn_hidden_size'],
-            encoder_hidden_size=config['hidden_size'],
-            encoder_num_heads=config['num_heads'],
-            encoder_head_size=config['head_size'],
-            vocab_size=config['vocab_size'],
-            max_position_embeddings=config.get('n_positions', 0),
-            has_position_embedding=has_position_embedding,
-            relative_attention=relative_attention,
-            max_distance=config.get('max_distance', 0),
-            num_buckets=config.get('num_buckets', 0),
-            has_embedding_layernorm=has_embedding_layernorm,
-            has_embedding_scale=config.get('has_embedding_scale', False),
-            q_scaling=q_scaling,
-            has_attention_qkvo_bias=has_attention_qkvo_bias,
-            has_mlp_bias=has_mlp_bias,
-            has_model_final_layernorm=has_model_final_layernorm,
-            layernorm_eps=1e-6,
-            layernorm_position=layernorm_position,
-            layernorm_type=layernorm_type,
-            hidden_act=config['hidden_act'],
-            dtype=dtype,
-            use_parallel_embedding=False,  # by default
-            embedding_sharding_dim=0,  # by default
-            mapping=mapping,
-            rescale_before_lm_head=rescale_before_lm_head,
-            logits_dtype=logits_dtype,  # by default
-            fp16_clamping=fp16_clamping)
+        pretrained_config = PretrainedConfig.from_dict({
+            'architecture':
+            "DecoderModel",
+            'dtype':
+            args.dtype,
+            'logits_dtype':
+            logits_dtype,
+            'num_hidden_layers':
+            config['num_layers'],
+            'num_attention_heads':
+            config['num_heads'],
+            'hidden_size':
+            config['hidden_size'],
+            'norm_epsilon':
+            1e-6,
+            'vocab_size':
+            config['vocab_size'],
+            'hidden_act':
+            config['hidden_act'],
+            'mapping': {
+                'world_size': mapping.world_size,
+                'tp_size': mapping.tp_size,
+                'pp_size': mapping.pp_size,
+            },
+            'use_parallel_embedding':
+            False,
+            'embedding_sharding_dim':
+            0,
+            'max_position_embeddings':
+            config.get('n_positions', 0),
+            'use_prompt_tuning':
+            False,
+            'head_size':
+            config['head_size'],
+            'has_position_embedding':
+            has_position_embedding,
+            'layernorm_type':
+            layernorm_type,
+            'has_attention_qkvo_bias':
+            has_attention_qkvo_bias,
+            'has_mlp_bias':
+            has_mlp_bias,
+            'has_model_final_layernorm':
+            has_model_final_layernorm,
+            'has_embedding_layernorm':
+            has_embedding_layernorm,
+            'has_embedding_scale':
+            config.get('has_embedding_scale', False),
+            'ffn_hidden_size':
+            config['ffn_hidden_size'],
+            'q_scaling':
+            q_scaling,
+            'layernorm_position':
+            layernorm_position,
+            'relative_attention':
+            relative_attention,
+            'max_distance':
+            config.get('max_distance', 0),
+            'num_buckets':
+            config.get('num_buckets', 0),
+            'model_type':
+            family,
+            'rescale_before_lm_head':
+            rescale_before_lm_head,
+            'encoder_hidden_size':
+            config['hidden_size'],
+            'encoder_num_heads':
+            config['num_heads'],
+            'encoder_head_size':
+            config['head_size'],
+            'skip_cross_qkv':
+            config['skip_cross_qkv']
+        })
+        tllm_model = tensorrt_llm.models.DecoderModel(pretrained_config)
         if use_weight_only and family == 'whisper':
             tllm_model = quantize(tllm_model, quant_config)
 
@@ -1154,30 +1387,33 @@ def enc_dec_build_helper(component, config, args):
             if family == 'whisper':
                 inputs = tllm_model.prepare_inputs(
                     max_batch_size=config['max_batch_size'], )
+                tllm_model(*inputs)
             else:
                 inputs = tllm_model.prepare_inputs(
                     max_batch_size=config['max_batch_size'],
                     max_input_len=config['max_encoder_input_len'],
                 )
+                tllm_model(**inputs)
         elif component == 'decoder':
             if family == 'whisper':
                 inputs = tllm_model.prepare_inputs(
                     max_batch_size=config['max_batch_size'],
                     max_beam_width=config['max_beam_width'],
                     max_decoder_input_len=config['max_decoder_input_len'],
-                    max_new_tokens=config['max_output_len'],
+                    max_seq_len=config['max_output_len'],
                     max_encoder_input_len=1500,  # n_audio_ctx
                 )
+                tllm_model(**inputs)
             else:
                 inputs = tllm_model.prepare_inputs(
                     max_batch_size=config['max_batch_size'],
                     max_beam_width=config['max_beam_width'],
                     max_decoder_input_len=config['max_decoder_input_len'],
-                    max_new_tokens=config['max_output_len'],
+                    max_seq_len=config['max_output_len'],
                     max_encoder_input_len=config['max_encoder_input_len'],
                 )
 
-        tllm_model(*inputs)
+                tllm_model(**inputs)
 
     start = time.time()
     engine = builder.build_engine(network, builder_config)
@@ -1217,7 +1453,15 @@ def enc_dec_build_helper(component, config, args):
             config_path = os.path.join(output_dir, 'config.json')
             builder_config.plugin_config = network.plugin_config
             builder.save_config(builder_config, config_path)
-
+            if args.output_timing_cache:
+                # Save timing cache to output_dir if not absolute path
+                timing_cache_path = args.output_timing_cache if os.path.isabs(
+                    args.output_timing_cache) else os.path.join(
+                        args.output_dir, args.output_timing_cache)
+                ok = builder.save_timing_cache(builder_config,
+                                               timing_cache_path)
+                if not ok:
+                    logger.warning("Failed to save timing cache.")
     return engine, model_config, build_time
 
 

@@ -65,7 +65,9 @@ def set_peer_access(mapping: Mapping, enabled: bool = True):
 
 class IpcMemory():
 
-    IPC_BARRIERS_SIZE_PER_GPU = 25 * 4  # Max all reduce blocks * sizeof(float)
+    # WARNING: Must in sync with FLAGS_SIZE in cpp/include/tensorrt_llm/runtime/ipcUtils.h
+    # (Max all reduce blocks + 1) * sizeof(int)
+    IPC_BARRIERS_SIZE_PER_GPU = (24 + 1) * 4
 
     def __init__(self, mapping, size):
         self.mapping = mapping

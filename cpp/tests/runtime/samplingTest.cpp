@@ -29,6 +29,7 @@
 using namespace tensorrt_llm::runtime;
 
 namespace tc = tensorrt_llm::common;
+namespace tk = tensorrt_llm::kernels;
 namespace tl = tensorrt_llm::layers;
 
 class SamplingTest : public ::testing::Test // NOLINT(cppcoreguidelines-pro-type-member-init)
@@ -50,7 +51,7 @@ protected:
     std::shared_ptr<nvinfer1::ILogger> mLogger{};
 };
 
-typename tl::DynamicDecodeLayer<float>::OutputParams dynamicDecodeTest(BufferManager& manager,
+std::shared_ptr<tl::DynamicDecodeOutputParams> dynamicDecodeTest(BufferManager& manager,
     std::shared_ptr<tc::CudaAllocator> allocator, size_t vocabSize, size_t vocabSizePadded, size_t batchSize,
     size_t beamWidth, int step, int ite, int maxInputLength, size_t maxSeqLength, size_t sinkTokenLength,
     int localBatchSize, std::vector<int>& cpuOutputIds, std::vector<float> cpuLogits, int noRepeatNgramSizeValue = 0)
@@ -69,6 +70,7 @@ typename tl::DynamicDecodeLayer<float>::OutputParams dynamicDecodeTest(BufferMan
     int* gpuSequenceLengths = nullptr;
     int* gpuNewTokens = nullptr;
     int* gpuNoRepeatNgramSize = nullptr;
+    tk::FinishedState::UnderlyingType* gpuFinished = nullptr;
 
     gpuLogits = allocator->reMalloc(gpuLogits, batchSize * beamWidth * vocabSizePadded * sizeof(float));
     gpuEndIds = allocator->reMalloc(gpuEndIds, batchSize * sizeof(int));
@@ -76,6 +78,7 @@ typename tl::DynamicDecodeLayer<float>::OutputParams dynamicDecodeTest(BufferMan
     gpuSequenceLengths = allocator->reMalloc(gpuSequenceLengths, batchSize * sizeof(int));
     gpuNewTokens = allocator->reMalloc(gpuNewTokens, batchSize * beamWidth * sizeof(int));
     gpuNoRepeatNgramSize = allocator->reMalloc(gpuNoRepeatNgramSize, batchSize * sizeof(int));
+    gpuFinished = allocator->reMalloc(gpuFinished, batchSize * beamWidth * sizeof(tk::FinishedState::UnderlyingType));
 
     cudaMemcpy(gpuLogits, cpuLogits.data(), cpuLogits.size() * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(gpuEndIds, cpuEndIds.data(), cpuEndIds.size() * sizeof(int), cudaMemcpyHostToDevice);
@@ -91,23 +94,25 @@ typename tl::DynamicDecodeLayer<float>::OutputParams dynamicDecodeTest(BufferMan
     tc::Tensor sequenceLengths{tc::MEMORY_GPU, tc::TYPE_INT32, {batchSize}, gpuSequenceLengths};
     tc::Tensor newTokens{tc::MEMORY_GPU, tc::TYPE_INT32, {batchSize}, gpuNewTokens};
     tc::Tensor noRepeatNgramSize{tc::MEMORY_GPU, tc::TYPE_INT32, {batchSize}, gpuNoRepeatNgramSize};
+    tc::Tensor finished{tc::MEMORY_GPU, tc::TYPE_INT8, {batchSize, beamWidth}, gpuFinished};
 
     auto const decodingMode = beamWidth == 1 ? DecodingMode::TopKTopP() : DecodingMode::BeamSearch();
-    auto ddLayer = tl::DynamicDecodeLayer<float>(
-        decodingMode, batchSize, beamWidth, vocabSize, vocabSizePadded, manager.getStream().get(), allocator, &prop);
+    auto const decodingDomain = tensorrt_llm::layers::DecoderDomain(batchSize, beamWidth, vocabSize, vocabSizePadded);
+    auto ddLayer = tl::DynamicDecodeLayer<float>(decodingMode, decodingDomain, manager.getStream().get(), allocator);
 
-    typename tl::DynamicDecodeLayer<float>::SetupParams setupParams;
+    auto setupParams = std::make_shared<tl::DynamicDecodeSetupParams>();
 
     ddLayer.setup(batchSize, beamWidth, nullptr, setupParams);
 
-    typename tl::DynamicDecodeLayer<float>::ForwardParams forwardParams(
+    auto forwardParams = std::make_shared<tl::DynamicDecodeInputParams>(
         step, ite, maxInputLength, static_cast<int>(maxSeqLength), sinkTokenLength, localBatchSize, endIds);
-    forwardParams.logits = logits;
-    forwardParams.no_repeat_ngram_size = noRepeatNgramSize;
+    forwardParams->logits = logits;
+    forwardParams->no_repeat_ngram_size = noRepeatNgramSize;
 
-    typename tl::DynamicDecodeLayer<float>::OutputParams outputParams(outputIds);
-    outputParams.sequence_length = sequenceLengths;
-    outputParams.newTokens = newTokens;
+    auto outputParams = std::make_shared<tl::DynamicDecodeOutputParams>(outputIds);
+    outputParams->sequence_length = sequenceLengths;
+    outputParams->newTokens = newTokens;
+    outputParams->finished = finished;
 
     ddLayer.forward(outputParams, forwardParams);
 
@@ -148,7 +153,7 @@ TEST_F(SamplingTest, SamplingWithNoRepeatNGramSize)
     auto outputParams = dynamicDecodeTest(manager, allocator, vocabSize, vocabSizePadded, batchSize, beamWidth, step,
         ite, maxInputLength, maxSeqLength, sinkTokenLength, localBatchSize, cpuOutputIds, cpuLogits, noRepeatNgramSize);
 
-    cudaMemcpy(cpuOutputIds.data(), outputParams.output_ids.getPtr<int>(), cpuOutputIds.size() * sizeof(int),
+    cudaMemcpy(cpuOutputIds.data(), outputParams->output_ids.getPtr<int>(), cpuOutputIds.size() * sizeof(int),
         cudaMemcpyDeviceToHost);
 
     EXPECT_EQ(cpuOutputIds[maxSeqLength - 1], 43);

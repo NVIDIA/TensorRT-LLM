@@ -29,7 +29,7 @@ class TestKVCacheManager(unittest.TestCase):
         tensorrt_llm.logger.set_level('error')
 
     def test_block(self):
-        block = Block(block_idx=0, k_ptrs=[123321], v_ptrs=[321123])
+        block = Block(block_idx=0)
         block.add_link()
         self.assertEqual(block.ref_count, 1)
 
@@ -43,9 +43,6 @@ class TestKVCacheManager(unittest.TestCase):
         block.remove_link()
         self.assertEqual(block.ref_count, 0)
         self.assertFalse(block.has_link())
-
-        self.assertEqual(block.get_k_ptr(0), 123321)
-        self.assertEqual(block.get_v_ptr(0), 321123)
 
     def test_sequence(self):
         seq = GenerationSequence(seq_idx=1, batch_idx=0)
@@ -68,30 +65,22 @@ class TestKVCacheManager(unittest.TestCase):
         # All blocks should be allocated by now
         self.assertFalse(manager.has_free_block())
 
-    def verify_pointer_array(self,
-                             manager,
-                             sequences,
-                             block_len,
-                             total_blocks,
-                             max_blocks_per_seq,
-                             block_elts,
-                             memory_pool,
-                             pool_idx=0):
-        pointers = manager.get_pointer_array(pool_idx, beam_width=1)
+    def verify_offset_array(self, manager, sequences, block_len, total_blocks,
+                            max_blocks_per_seq):
+        offsets = manager.get_offset_array(beam_width=1)
 
-        self.assertEqual(pointers.shape,
+        self.assertEqual(offsets.shape,
                          torch.Size([len(sequences), 1, 2, max_blocks_per_seq]))
 
-        # Check if pointer array is correct
+        # Check if offset array is correct
         for seq in sequences:
             for block in range(block_len):
-                linear_block_idx = (block * len(sequences) +
-                                    seq.get_batch_idx())
-                self.assertEqual(pointers[seq.get_batch_idx()][0][0][block], memory_pool.data_ptr() + \
-                                 linear_block_idx * block_elts * self._sizeof[memory_pool.dtype])
-                self.assertEqual(pointers[seq.get_batch_idx()][0][1][block], memory_pool.data_ptr() + \
-                                 (linear_block_idx * block_elts + total_blocks * block_elts) * \
-                                    self._sizeof[memory_pool.dtype])
+                linear_block_idx = 2 * (block * len(sequences) +
+                                        seq.get_batch_idx())
+                self.assertEqual(offsets[seq.get_batch_idx()][0][0][block],
+                                 linear_block_idx)
+                self.assertEqual(offsets[seq.get_batch_idx()][0][1][block],
+                                 linear_block_idx + 1)
 
     def free_blocks(self, manager, sequences, block_len):
         for seq in sequences:
@@ -101,12 +90,11 @@ class TestKVCacheManager(unittest.TestCase):
                              (seq.get_batch_idx() + 1) * block_len)
 
     def full_allocate_free_test(self, manager, sequences, block_len,
-                                total_blocks, max_blocks_per_seq, block_elts,
-                                memory_pool):
+                                total_blocks, max_blocks_per_seq):
         self.allocate_blocks(manager, sequences, block_len)
 
-        self.verify_pointer_array(manager, sequences, block_len, total_blocks,
-                                  max_blocks_per_seq, block_elts, memory_pool)
+        self.verify_offset_array(manager, sequences, block_len, total_blocks,
+                                 max_blocks_per_seq)
 
         self.free_blocks(manager, sequences, block_len)
 
@@ -114,20 +102,15 @@ class TestKVCacheManager(unittest.TestCase):
         max_seq = 32
         max_blocks_per_seq = 32
         block_elts = 64
-        memory_pool = torch.zeros(max_seq,
-                                  2,
-                                  max_blocks_per_seq,
-                                  block_elts,
-                                  dtype=torch.float,
-                                  device='cuda')
 
         sequences = [
             GenerationSequence(seq_idx=idx, batch_idx=idx)
             for idx in range(max_seq)
         ]
 
-        manager = BlocksManager(memory_pools=[memory_pool],
-                                blocks=max_seq * max_blocks_per_seq,
+        manager = BlocksManager(num_layers=1,
+                                num_blocks=max_seq * max_blocks_per_seq,
+                                block_size=block_elts,
                                 max_blocks_per_seq=max_blocks_per_seq)
 
         self.assertEqual(len(manager.free_blocks), max_seq * max_blocks_per_seq)
@@ -136,11 +119,11 @@ class TestKVCacheManager(unittest.TestCase):
         # Allocate maximum amount of blocks for maximum amount of sequences
         self.full_allocate_free_test(manager, sequences, max_blocks_per_seq,
                                      max_seq * max_blocks_per_seq,
-                                     max_blocks_per_seq, block_elts,
-                                     memory_pool)
+                                     max_blocks_per_seq)
 
-        manager = BlocksManager(memory_pools=[memory_pool],
-                                blocks=max_seq * max_blocks_per_seq,
+        manager = BlocksManager(num_layers=1,
+                                num_blocks=max_seq * max_blocks_per_seq,
+                                block_size=block_elts,
                                 max_blocks_per_seq=max_blocks_per_seq)
 
         # Allocate 2x more sequences with 2 times smaller num of blocks
@@ -151,11 +134,11 @@ class TestKVCacheManager(unittest.TestCase):
         self.full_allocate_free_test(manager, sequences_2x,
                                      max_blocks_per_seq // 2,
                                      max_seq * max_blocks_per_seq,
-                                     max_blocks_per_seq, block_elts,
-                                     memory_pool)
+                                     max_blocks_per_seq)
 
-        manager = BlocksManager(memory_pools=[memory_pool],
-                                blocks=max_seq * max_blocks_per_seq,
+        manager = BlocksManager(num_layers=1,
+                                num_blocks=max_seq * max_blocks_per_seq,
+                                block_size=block_elts,
                                 max_blocks_per_seq=max_blocks_per_seq)
 
         # Allocate maximum amount of blocks for maximum amount of sequences
@@ -167,73 +150,21 @@ class TestKVCacheManager(unittest.TestCase):
         self.assertEqual("Can't allocate new block for KV cache",
                          str(context.exception))
 
-    def test_blocks_manager_multi_pool(self):
-        max_seq = 32
-        max_blocks_per_seq = 32
-        block_elts_1 = 64
-        block_elts_2 = 128
-        memory_pool_1 = torch.zeros(max_seq,
-                                    2,
-                                    max_blocks_per_seq,
-                                    block_elts_1,
-                                    dtype=torch.float,
-                                    device='cuda')
-        memory_pool_2 = torch.zeros(max_seq,
-                                    2,
-                                    max_blocks_per_seq,
-                                    block_elts_2,
-                                    dtype=torch.float,
-                                    device='cuda')
-
-        sequences = [
-            GenerationSequence(seq_idx=idx, batch_idx=idx)
-            for idx in range(max_seq)
-        ]
-
-        manager = BlocksManager(memory_pools=[memory_pool_1, memory_pool_2],
-                                blocks=max_seq * max_blocks_per_seq,
-                                max_blocks_per_seq=max_blocks_per_seq)
-
-        self.allocate_blocks(manager, sequences, max_blocks_per_seq)
-
-        # Verify that pointers to the both pools are ok
-        self.verify_pointer_array(manager,
-                                  sequences,
-                                  max_blocks_per_seq,
-                                  max_seq * max_blocks_per_seq,
-                                  max_blocks_per_seq,
-                                  block_elts_1,
-                                  memory_pool_1,
-                                  pool_idx=0)
-        self.verify_pointer_array(manager,
-                                  sequences,
-                                  max_blocks_per_seq,
-                                  max_seq * max_blocks_per_seq,
-                                  max_blocks_per_seq,
-                                  block_elts_2,
-                                  memory_pool_2,
-                                  pool_idx=1)
-
     def test_blocks_manager_beam(self):
         max_seq = 32
         max_blocks_per_seq = 32
         block_elts = 64
         beam_width = 4
-        blocks = max_seq * max_blocks_per_seq
-        memory_pool = torch.zeros(max_seq * beam_width,
-                                  2,
-                                  max_blocks_per_seq,
-                                  block_elts,
-                                  dtype=torch.float,
-                                  device='cuda')
+        num_blocks = max_seq * max_blocks_per_seq
 
         sequences = [
             GenerationSequence(seq_idx=idx, batch_idx=idx)
             for idx in range(max_seq)
         ]
 
-        manager = BlocksManager(memory_pools=[memory_pool],
-                                blocks=blocks,
+        manager = BlocksManager(num_layers=1,
+                                num_blocks=num_blocks,
+                                block_size=block_elts,
                                 max_blocks_per_seq=max_blocks_per_seq,
                                 beam_width=beam_width)
 
@@ -256,31 +187,21 @@ class TestKVCacheManager(unittest.TestCase):
         self.assertEqual(beams_blocks[3][0].ref_count, 1)
 
         manager.free(sequences[1])
-        self.assertEqual(len(manager.free_blocks), blocks - 1)
+        self.assertEqual(len(manager.free_blocks), num_blocks - 1)
 
         manager.free(sequences[0])
-        self.assertEqual(len(manager.free_blocks), blocks)
+        self.assertEqual(len(manager.free_blocks), num_blocks)
 
     def test_kv_cache_manager(self):
-        blocks = 128
+        num_blocks = 128
         tokens_per_block = 32
         max_blocks_per_seq = 16
-        dims_per_head_1 = 64
-        dims_per_head_2 = 128
-        memory_pool_1 = torch.zeros(2,
-                                    blocks,
-                                    tokens_per_block,
-                                    dims_per_head_1,
-                                    dtype=torch.float,
-                                    device='cuda')
-        memory_pool_2 = torch.zeros(2,
-                                    blocks,
-                                    tokens_per_block,
-                                    dims_per_head_2,
-                                    dtype=torch.float,
-                                    device='cuda')
-        manager = KVCacheManager(memory_pools=[memory_pool_1, memory_pool_2],
-                                 blocks=blocks,
+        dims_per_head = 64
+
+        block_size = tokens_per_block * dims_per_head
+        manager = KVCacheManager(num_layers=1,
+                                 num_blocks=num_blocks,
+                                 block_size=block_size,
                                  tokens_per_block=tokens_per_block,
                                  max_blocks_per_seq=max_blocks_per_seq,
                                  max_attention_window_size=max_blocks_per_seq *
@@ -290,21 +211,22 @@ class TestKVCacheManager(unittest.TestCase):
         manager.add_sequence(GenerationSequence(seq_idx=1, batch_idx=1), 35)
         manager.add_sequence(GenerationSequence(seq_idx=2, batch_idx=2), 31)
 
-        def check_amount_of_blocks(sequence, expected_blocks):
+        def check_amount_of_blocks(sequence,
+                                   expected_blocks,
+                                   is_first: bool = False):
             for bi in range(max_blocks_per_seq):
-                if bi < expected_blocks:
+                if is_first and bi == 0:
+                    self.assertEqual(sequence[bi], 0)
+                elif bi < expected_blocks:
                     self.assertNotEqual(sequence[bi], 0)
                 else:
                     self.assertEqual(sequence[bi], 0)
 
-        array = manager.get_block_pointers(beam_width=1)
-        array = array.view(dtype=torch.int64)
+        array = manager.get_block_offsets(beam_width=1)
 
-        # Expect array for 2 layers
-        self.assertEqual(array.size(0), 2)
-        check_amount_of_blocks(array[0][0][0][0], 1)
-        check_amount_of_blocks(array[0][1][0][0], 2)
-        check_amount_of_blocks(array[0][2][0][0], 1)
+        check_amount_of_blocks(array[0][0][0], 1, True)
+        check_amount_of_blocks(array[1][0][0], 2)
+        check_amount_of_blocks(array[2][0][0], 1)
         self.assertEqual(manager.lens[0], 30)
         self.assertEqual(manager.lens[1], 35)
         self.assertEqual(manager.lens[2], 31)
@@ -313,11 +235,10 @@ class TestKVCacheManager(unittest.TestCase):
         for _ in range(3):
             manager.step([False, False, False])
 
-        array = manager.get_block_pointers(beam_width=1)
-        array = array.view(dtype=torch.int64)
-        check_amount_of_blocks(array[0][0][0][0], 2)
-        check_amount_of_blocks(array[0][1][0][0], 2)
-        check_amount_of_blocks(array[0][2][0][0], 2)
+        array = manager.get_block_offsets(beam_width=1)
+        check_amount_of_blocks(array[0][0][0], 2, True)
+        check_amount_of_blocks(array[1][0][0], 2)
+        check_amount_of_blocks(array[2][0][0], 2)
         self.assertEqual(manager.lens[0], 33)
         self.assertEqual(manager.lens[1], 38)
         self.assertEqual(manager.lens[2], 34)
@@ -327,26 +248,24 @@ class TestKVCacheManager(unittest.TestCase):
 
         self.assertEqual(len(manager.sequences), 2)
         self.assertEqual(len(manager.lens), 2)
-        array = manager.get_block_pointers(beam_width=1)
-        array = array.view(dtype=torch.int64)
+        array = manager.get_block_offsets(beam_width=1)
 
         self.assertEqual(manager.lens[0], 34)
         self.assertEqual(manager.lens[1], 35)
 
-        check_amount_of_blocks(array[0][0][0][0], 2)
-        check_amount_of_blocks(array[0][1][0][0], 2)
+        check_amount_of_blocks(array[0][0][0], 2, True)
+        check_amount_of_blocks(array[1][0][0], 2)
 
         # Second sequence finishes
         manager.step([False, True])
 
         self.assertEqual(len(manager.sequences), 1)
         self.assertEqual(len(manager.lens), 1)
-        array = manager.get_block_pointers(beam_width=1)
-        array = array.view(dtype=torch.int64)
+        array = manager.get_block_offsets(beam_width=1)
 
         self.assertEqual(manager.lens[0], 35)
 
-        check_amount_of_blocks(array[0][0][0][0], 2)
+        check_amount_of_blocks(array[0][0][0], 2, True)
 
 
 if __name__ == '__main__':

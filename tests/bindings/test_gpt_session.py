@@ -94,7 +94,7 @@ def test_gpt_session(variant, results_file, load_bytearray, llm_root: _pl.Path,
                                  full_engine_path)
 
     assert isinstance(session, _tb.GptSession)
-    assert isinstance(session.model_config, _tb.GptModelConfig)
+    assert isinstance(session.model_config, _tb.ModelConfig)
     assert isinstance(session.world_config, _tb.WorldConfig)
     assert session.device == world_config.device
     cuda_device = _tor.device("cuda", world_config.device)

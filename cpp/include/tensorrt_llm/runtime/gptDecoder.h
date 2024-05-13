@@ -21,7 +21,7 @@
 #include "tensorrt_llm/runtime/decodingInput.h"
 #include "tensorrt_llm/runtime/decodingMode.h"
 #include "tensorrt_llm/runtime/decodingOutput.h"
-#include "tensorrt_llm/runtime/gptModelConfig.h"
+#include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 #include <curand_kernel.h>
@@ -74,11 +74,6 @@ public:
         SizeType vocabSize, SizeType vocabSizePadded, bool useRandomAcceptThreshold, float randomAcceptThreshold,
         curandState_t* curandState, BufferManager::CudaStreamPtr const& stream);
 
-    static void updateKVCacheBasedOnAcceptedTokens(ITensor const& acceptedOffsets, ITensor const& packedAcceptedIds,
-        ITensor const& pointerArray, ITensor const& pastKeyValueLengths, GptModelConfig const& modelConfig,
-        WorldConfig const& worldConfig, BufferManager::CudaStreamPtr stream, SizeType rewindDraftTokenCount,
-        SizeType maxAttentionWindow, SizeType maxBlocksPerSeq, nvinfer1::DataType dtype);
-
     static std::unique_ptr<IGptDecoder> create(DecodingMode const& mode, nvinfer1::DataType dtype, size_t maxBatchSize,
         size_t maxBeamWidth, size_t vocabSize, size_t vocabSizePadded, size_t maxSequenceLength,
         BufferManager::CudaStreamPtr const& stream, std::optional<runtime::SizeType> maxTokensPerStep = std::nullopt,
@@ -120,8 +115,6 @@ private:
     TensorPtr mLogProbsTiled; // Buffer used to store the transpose of the logProbs. Needed because the kernels have
                               // been written to use that shape.
     SamplingConfig mSamplingConfig;
-
-    cudaDeviceProp mProp; // Avoid dangling pointers in mDynamicDecodeLayer
 
     size_t mMaxBatchSize;
 };

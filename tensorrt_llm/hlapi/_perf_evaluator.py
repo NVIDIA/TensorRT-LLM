@@ -16,7 +16,7 @@ from tensorrt_llm import logger
 from .._utils import release_gc
 from ..profiler import device_memory_info, host_memory_info
 from .llm import LLM, ModelConfig, SamplingConfig
-from .utils import print_colored
+from .utils import is_directory_empty, print_colored
 
 
 @dataclass
@@ -174,7 +174,10 @@ class LLMPerfEvaluator:
         '''
 
         from_cache = False
-        if engine_cache_path is not None and Path.exists(engine_cache_path):
+        if engine_cache_path and Path.exists(
+                engine_cache_path
+        ) and not is_directory_empty(engine_cache_path):
+            print(f"Loading engine from {engine_cache_path}\n")
             from_cache = True
             model_config.model_dir = engine_cache_path
 
@@ -193,6 +196,7 @@ class LLMPerfEvaluator:
             raise e
 
         if engine_cache_path is not None and not from_cache:
+            print_colored(f"Saving engine to {engine_cache_path}\n", "green")
             llm.save(engine_cache_path)
 
         samples: List[Sample] = list(cls.load_dataset(samples_path))

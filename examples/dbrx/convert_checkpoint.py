@@ -504,76 +504,62 @@ def convert_hf_dbrx(model_params: dict,
         weights[f'{tllm_prex}.post_layernorm.weight'] = post_ln_weight
 
         if moe_config and moe_config.has_moe():
-            # experts mlp w1
-            experts_weights_1 = get_weight(model_params,
-                                           f'{prefix}.ffn.experts.mlp.w1',
-                                           dtype)
-            experts_weights_1 = torch.reshape(experts_weights_1,
-                                              (-1, mlp_hidden_size, num_hidden))
+            # experts mlp w1 -> mlp gate
+            mlp_gate_weight = get_weight(model_params,
+                                         f'{prefix}.ffn.experts.mlp.w1', dtype)
+            mlp_gate_weight = mlp_gate_weight.reshape(-1, mlp_hidden_size,
+                                                      num_hidden)
             if moe_config.tp_mode == MoeConfig.ParallelismMode.TENSOR_PARALLEL:
-                experts_weights_1_proj_w = split_matrix(experts_weights_1,
-                                                        mapping.tp_size,
-                                                        mapping.tp_rank,
-                                                        dim=1)
+                mlp_gate_w = split_matrix(mlp_gate_weight,
+                                          mapping.tp_size,
+                                          mapping.tp_rank,
+                                          dim=1)
             else:
-                experts_weights_1_proj_w = split_matrix(experts_weights_1,
-                                                        mapping.tp_size,
-                                                        mapping.tp_rank,
-                                                        dim=0)
-            # experts mlp v1
-            experts_weights_3 = get_weight(model_params,
-                                           f'{prefix}.ffn.experts.mlp.v1',
-                                           dtype)
-            experts_weights_3 = torch.reshape(experts_weights_3,
-                                              (-1, mlp_hidden_size, num_hidden))
+                mlp_gate_w = split_matrix(mlp_gate_weight,
+                                          mapping.tp_size,
+                                          mapping.tp_rank,
+                                          dim=0)
+            # experts mlp v1 -> mlp fc
+            mlp_fc_weight = get_weight(model_params,
+                                       f'{prefix}.ffn.experts.mlp.v1', dtype)
+            mlp_fc_weight = mlp_fc_weight.reshape(-1, mlp_hidden_size,
+                                                  num_hidden)
             if moe_config.tp_mode == MoeConfig.ParallelismMode.TENSOR_PARALLEL:
-                experts_weights_3_proj_w = split_matrix(experts_weights_3,
-                                                        mapping.tp_size,
-                                                        mapping.tp_rank,
-                                                        dim=1)
+                mlp_fc_w = split_matrix(mlp_fc_weight,
+                                        mapping.tp_size,
+                                        mapping.tp_rank,
+                                        dim=1)
             else:
-                experts_weights_3_proj_w = split_matrix(experts_weights_3,
-                                                        mapping.tp_size,
-                                                        mapping.tp_rank,
-                                                        dim=0)
-            experts_weights_1_proj_w = torch.concat(
-                [experts_weights_3_proj_w, experts_weights_1_proj_w], dim=-2)
+                mlp_fc_w = split_matrix(mlp_fc_weight,
+                                        mapping.tp_size,
+                                        mapping.tp_rank,
+                                        dim=0)
+            mlp_fc_w = torch.concat([mlp_fc_w, mlp_gate_w], dim=-2)
             weights.update(
-                get_tllm_linear_weight(
-                    experts_weights_1_proj_w,
-                    f'{tllm_prex}.mlp.experts_weight_1',
-                    None,
-                    use_weight_only,
-                    plugin_weight_only_quant_type,
-                    postfix="",
-                    quant_scale_name=f'{tllm_prex}.mlp.experts_scale_1'))
+                get_tllm_linear_weight(mlp_fc_w, f'{tllm_prex}.mlp.fc.', None,
+                                       use_weight_only,
+                                       plugin_weight_only_quant_type))
 
-            # experts mlp w2
-            experts_weights_2 = get_weight(model_params,
-                                           f'{prefix}.ffn.experts.mlp.w2',
-                                           dtype)
-            experts_weights_2 = torch.reshape(
-                experts_weights_2,
-                (-1, mlp_hidden_size, num_hidden)).transpose(1, 2)
+            # experts mlp w2 -> mlp proj
+            mlp_proj_weight = get_weight(model_params,
+                                         f'{prefix}.ffn.experts.mlp.w2', dtype)
+            mlp_proj_weight = mlp_proj_weight.reshape(-1, mlp_hidden_size,
+                                                      num_hidden).transpose(
+                                                          1, 2)
             if moe_config.tp_mode == MoeConfig.ParallelismMode.TENSOR_PARALLEL:
-                experts_weights_2_proj_w = split_matrix(experts_weights_2,
-                                                        mapping.tp_size,
-                                                        mapping.tp_rank,
-                                                        dim=2)
+                mlp_proj_w = split_matrix(mlp_proj_weight,
+                                          mapping.tp_size,
+                                          mapping.tp_rank,
+                                          dim=2)
             else:
-                experts_weights_2_proj_w = split_matrix(experts_weights_2,
-                                                        mapping.tp_size,
-                                                        mapping.tp_rank,
-                                                        dim=0)
+                mlp_proj_w = split_matrix(mlp_proj_weight,
+                                          mapping.tp_size,
+                                          mapping.tp_rank,
+                                          dim=0)
             weights.update(
-                get_tllm_linear_weight(
-                    experts_weights_2_proj_w,
-                    f'{tllm_prex}.mlp.experts_weight_2',
-                    None,
-                    use_weight_only,
-                    plugin_weight_only_quant_type,
-                    postfix="",
-                    quant_scale_name=f'{tllm_prex}.mlp.experts_scale_2'))
+                get_tllm_linear_weight(mlp_proj_w, f'{tllm_prex}.mlp.proj.',
+                                       None, use_weight_only,
+                                       plugin_weight_only_quant_type))
 
             # router mlp
             router_weights = get_weight(model_params,

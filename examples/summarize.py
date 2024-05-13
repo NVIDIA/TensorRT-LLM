@@ -148,7 +148,7 @@ def main(args):
                 input_ids = tokenizer.encode(curr_text,
                                              return_tensors='pt').squeeze(0)
                 input_ids = input_ids[:test_token_num]
-            elif model_name == 'QWenForCausalLM':
+            elif model_name == 'QWenForCausalLM' and model_version == 'qwen':
                 # use make_content to generate prompt
                 system_prompt = "You are a useful assistant, please directly output the corresponding summary according to the article entered by the user."
                 _, input_id_list = make_context(
@@ -160,6 +160,16 @@ def main(args):
                 )
                 input_ids = torch.tensor(input_id_list)
             else:
+                if model_name == 'QWenForCausalLM' and model_version == 'qwen2':
+                    messages = [{
+                        "role": "system",
+                        "content": "You are a helpful assistant."
+                    }, {
+                        "role": "user",
+                        "content": curr_text
+                    }]
+                    curr_text = tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True)
                 input_ids = tokenizer.encode(
                     curr_text,
                     return_tensors='pt',
@@ -354,7 +364,7 @@ def main(args):
         if args.medusa_choices is not None:
             args.medusa_choices = ast.literal_eval(args.medusa_choices)
             assert args.use_py_session, "Medusa is only supported by py_session"
-            assert args.temperature == 0, "Medusa should use temperature == 0"
+            assert args.temperature == 1.0, "Medusa should use temperature == 1.0"
             assert args.num_beams == 1, "Medusa should use num_beams == 1"
             runner_kwargs.update(medusa_choices=args.medusa_choices)
         if not args.use_py_session:

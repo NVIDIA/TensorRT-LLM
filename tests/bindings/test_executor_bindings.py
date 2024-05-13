@@ -1,4 +1,5 @@
 import datetime
+import json
 import os
 import random
 import sys
@@ -230,7 +231,7 @@ def test_multi_request(streaming: bool, exclude_input_from_output: bool,
     max_wait_ms = 10000
     while num_finished < num_requests and i < max_wait_ms:
         wait_time = datetime.timedelta(milliseconds=1)
-        responses = executor.await_responses(None, wait_time)
+        responses = executor.await_responses(wait_time)
         for response in responses:
             num_responses += 1
             assert not response.has_error(
@@ -240,6 +241,64 @@ def test_multi_request(streaming: bool, exclude_input_from_output: bool,
             new_tokens = result.output_token_ids[beam_width - 1]
             tokens[response.request_id].extend(new_tokens)
         i += 1
+    assert i < max_wait_ms
+
+    for request_id in expected_num_tokens:
+        assert len(tokens[request_id]) == expected_num_tokens[request_id]
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("exclude_input_from_output", [False])
+@skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
+def test_multi_request_with_ids(streaming: bool,
+                                exclude_input_from_output: bool, model_files,
+                                model_path):
+    output_config = trtllm.OutputConfig()
+    output_config.exclude_input_from_output = exclude_input_from_output
+
+    # Create executor
+    beam_width = 1
+    executor_config = trtllm.ExecutorConfig(beam_width)
+    executor = trtllm.Executor(model_path, trtllm.ModelType.DECODER_ONLY,
+                               executor_config)
+
+    num_requests = 20
+    max_prompt_len = 20
+    max_max_new_tokens = 20
+    end_id = -1
+
+    # Enqueue the requests
+    tokens = {}
+    expected_num_tokens = {}
+    for i in range(num_requests):
+        prompt_len = random.randint(1, max_prompt_len)
+        max_new_tokens = random.randint(1, max_max_new_tokens)
+        input_tokens = [1] * prompt_len
+        request = trtllm.Request(input_tokens, max_new_tokens, streaming,
+                                 trtllm.SamplingConfig(), output_config, end_id)
+        request_id = executor.enqueue_request(request)
+        tokens[request_id] = []
+        expected_num_tokens[request_id] = get_expected_num_tokens(
+            prompt_len, max_new_tokens, streaming, exclude_input_from_output)
+
+    # Get the new tokens for each request
+    num_finished = 0
+    i = 0
+    num_responses = 0
+    max_wait_ms = 10000
+    while num_finished < num_requests and i < max_wait_ms:
+        wait_time = datetime.timedelta(milliseconds=1)
+        id_responses = executor.await_responses(list(tokens.keys()), wait_time)
+        for responses in id_responses:
+            for response in responses:
+                num_responses += 1
+                assert not response.has_error(
+                ), f"Request id {response.request_id} failed with err {response.error_msg}"
+                result = response.result
+                num_finished += result.is_final
+                new_tokens = result.output_token_ids[beam_width - 1]
+                tokens[response.request_id].extend(new_tokens)
+            i += 1
     assert i < max_wait_ms
 
     for request_id in expected_num_tokens:
@@ -448,7 +507,7 @@ def test_token_comparison(batching_type: trtllm.BatchingType, streaming: bool,
     max_wait_ms = 10000
     while num_finished < num_requests and i < max_wait_ms:
         wait_time = datetime.timedelta(milliseconds=1)
-        responses = executor.await_responses(None, wait_time)
+        responses = executor.await_responses(wait_time)
         for response in responses:
             num_responses += 1
             assert not response.has_error(
@@ -481,7 +540,7 @@ def test_gpt_executor_timed_out(model_files, model_path):
     assert num_responses_ready == 0
 
     wait_time = datetime.timedelta(milliseconds=10)
-    responses = executor.await_responses(None, wait_time)
+    responses = executor.await_responses(wait_time)
     assert len(responses) == 0
 
 
@@ -713,6 +772,7 @@ def test_executor_config():
     assert isinstance(config.peft_cache_config, trtllm.PeftCacheConfig)
     assert config.logits_post_processor_map is None
     assert config.medusa_choices is None
+    assert config.decoding_mode is None
 
     kwargs = {
         "max_beam_width":
@@ -735,6 +795,8 @@ def test_executor_config():
         trtllm.PeftCacheConfig(10),
         "logits_post_processor_map": {},
         "medusa_choices": [[1, 2, 3]],
+        "decoding_mode":
+        trtllm.DecodingMode.TOP_K_TOP_P,
     }
     config = trtllm.ExecutorConfig(**kwargs)
     for k, v in kwargs.items():
@@ -758,6 +820,18 @@ def test_parallel_config():
     assert parallel_config.communication_mode == comm_mode
     assert parallel_config.device_ids == device_ids
     assert parallel_config.participant_ids == participant_ids
+
+    comm_mode = trtllm.CommunicationMode.ORCHESTRATOR
+    #Dummy path to worker executable
+    worker_path = os.path.abspath(__file__)
+    orchestrator_config = trtllm.OrchestratorConfig(True, str(worker_path))
+    parallel_config = trtllm.ParallelConfig(comm_type, comm_mode, device_ids,
+                                            participant_ids,
+                                            orchestrator_config)
+    assert parallel_config.communication_mode == comm_mode
+    assert parallel_config.orchestrator_config.is_orchestrator == True
+    assert parallel_config.orchestrator_config.worker_executable_path == str(
+        worker_path)
 
 
 def test_peft_cache_config():
@@ -844,3 +918,54 @@ def test_logits_post_processor(model_files, model_path):
     # check that all output tokens are 42
     print(tokens)
     assert tokens[-max_new_tokens:] == [42] * max_new_tokens
+
+
+def test_iteration_stats():
+    stats = trtllm.IterationStats()
+    stats.timestamp = "01:23:56"
+    stats.iter = 1
+    stats.num_active_requests = 2
+    stats.max_num_active_requests = 3
+    stats.gpu_mem_usage = 1024
+    stats.cpu_mem_usage = 2048
+    stats.pinned_mem_usage = 4096
+    stats_json = json.loads(stats.to_json_str())
+    assert stats_json["timestamp"] == stats.timestamp
+    assert stats_json["iter"] == stats.iter
+    assert stats_json["numActiveRequests"] == stats.num_active_requests
+    assert stats_json["maxNumActiveRequests"] == stats.max_num_active_requests
+    assert stats_json["gpuMemUsage"] == stats.gpu_mem_usage
+    assert stats_json["cpuMemUsage"] == stats.cpu_mem_usage
+    assert stats_json["pinnedMemUsage"] == stats.pinned_mem_usage
+    assert stats_json["kvCacheStats"] is None
+    assert stats_json["staticBatchingStats"] is None
+    assert stats_json["inflightBatchingStats"] is None
+
+
+def test_request_stats():
+    stats = trtllm.RequestStats()
+    stats.id = 1
+    stats.stage = trtllm.RequestStage.CONTEXT_IN_PROGRESS
+    stats.context_prefill_position = 2
+    stats.num_generated_tokens = 3
+    stats.scheduled = True
+    stats.paused = False
+    stats_json = json.loads(stats.to_json_str())
+    assert stats_json["id"] == stats.id
+    assert stats_json["stage"] == "CONTEXT_IN_PROGRESS"
+    assert stats_json[
+        "contextPrefillPosition"] == stats.context_prefill_position
+    assert stats_json["numGeneratedTokens"] == stats.num_generated_tokens
+    assert stats_json["scheduled"] == stats.scheduled
+    assert stats_json["paused"] == stats.paused
+
+
+def test_request_stats_per_iteration():
+    stats = trtllm.RequestStatsPerIteration()
+    stats.iter = 1
+    req_stat = trtllm.RequestStats()
+    req_stat.id = 1
+    stats.request_stats = [req_stat]
+    stats_json = json.loads(stats.to_json_str())
+    assert stats_json["iter"] == 1
+    assert stats_json["requestStats"][0]["id"] == 1

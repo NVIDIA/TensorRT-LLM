@@ -65,14 +65,14 @@ StatefulGptDecoder::StatefulGptDecoder(std::size_t vocabSize, std::size_t vocabS
     dInput->badWordsPtrs = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<int32_t*>::value);
     dInput->badWordsLens = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<SizeType>::value);
 
-    mFinishedSum = mBufferManager.pinned(ITensor::makeShape({1}), nvSizeType);
+    mFinishedSum = BufferManager::pinned(ITensor::makeShape({1}), nvSizeType);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 void StatefulGptDecoder::setup(DecodingMode const& mode, SizeType maxBatchSize, SizeType maxBeamWidth,
     SizeType maxAttentionWindow, SizeType sinkTokenLength, SizeType maxSequenceLength, SizeType maxTokensPerStep,
-    bool fusedDecoder, nvinfer1::DataType dtype, GptModelConfig const& modelConfig)
+    bool fusedDecoder, nvinfer1::DataType dtype, ModelConfig const& modelConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK(maxTokensPerStep == 1);

@@ -14,7 +14,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
+/*****************************************************************************
+ *
+ * GptSession is going to be deprecated soon.
+ * Please do not add new functionality in this file!
+ *
+ *****************************************************************************/
+
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
 #include "tensorrt_llm/runtime/gptSession.h"
@@ -34,6 +43,7 @@
 using namespace tensorrt_llm::runtime;
 
 namespace tc = tensorrt_llm::common;
+namespace tmpi = tensorrt_llm::mpi;
 namespace trt = nvinfer1;
 
 namespace
@@ -58,7 +68,7 @@ size_t monitorMemory(std::atomic_bool& done)
 void benchmarkGptSession(std::filesystem::path const& dataPath, std::vector<int> const& batchSizes, int beamWidth,
     std::vector<std::vector<int>> const& inOutLen, std::shared_ptr<nvinfer1::ILogger> const& logger, int warmUp,
     int numRuns, int duration, GptSession::Config& sessionConfig, bool cudaGraphMode, bool printAllLogits,
-    bool disableForceMaxTokens)
+    bool disableForceMaxTokens, bool dumpLayerInfo, bool dumpProfile)
 {
     std::filesystem::path jsonFileName = dataPath / "config.json";
     auto const json = GptJsonConfig::parse(jsonFileName);
@@ -67,6 +77,7 @@ void benchmarkGptSession(std::filesystem::path const& dataPath, std::vector<int>
     SizeType deviceCount{0};
     TLLM_CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
     auto const worldConfig = WorldConfig::mpi(deviceCount, json.getTensorParallelism(), json.getPipelineParallelism());
+    auto& comm = COMM_SESSION;
     auto const enginePath = dataPath / json.engineFilename(worldConfig);
     auto const dtype = modelConfig.getDataType();
     auto const maxNumTokens = modelConfig.getMaxNumTokens();
@@ -184,7 +195,7 @@ void benchmarkGptSession(std::filesystem::path const& dataPath, std::vector<int>
                 std::vector<float> latencies;
                 std::vector<float> generationTimes;
                 auto generationProfiler = std::make_shared<GptSession::GenerationProfiler>();
-                while (iterIdx < numRuns || curDuration / 1000 < duration)
+                while (iterIdx < numRuns)
                 {
                     auto const start = std::chrono::steady_clock::now();
                     SizeType numSteps = 0;
@@ -200,12 +211,30 @@ void benchmarkGptSession(std::filesystem::path const& dataPath, std::vector<int>
                     curDuration += latency;
                     latencies.emplace_back(latency);
                     generationTimes.emplace_back(generationProfiler->getElapsedTimeMs());
+
+                    bool durationLimitReached{curDuration / 1000 >= duration};
+                    if (worldConfig.getSize() > 1)
+                    {
+                        bool result{false};
+                        comm.allreduce(&durationLimitReached, &result, 1, tmpi::MpiType::kBOOL, tmpi::MpiOp::LOR);
+                        durationLimitReached = result;
+                    }
+                    if (durationLimitReached)
+                    {
+                        break;
+                    }
                 }
 
                 TLLM_LOG_INFO(memoryCounter.toString());
                 done = true;
                 peakMemFuture.wait();
                 peakMem = peakMemFuture.get();
+                if (dumpLayerInfo)
+                {
+                    printf("Dump layer information:\n");
+                    printf("%s\n",
+                        session.getEngineInspector().getEngineInformation(nvinfer1::LayerInformationFormat::kONELINE));
+                }
 
                 printf("Benchmarking done. Iteration: %d, duration: %.2f sec.\n", iterIdx, curDuration / 1000);
 
@@ -267,6 +296,46 @@ void benchmarkGptSession(std::filesystem::path const& dataPath, std::vector<int>
 
                         std::cout << "generationOutput.generationLogits: " << *generationOutput.generationLogits
                                   << std::endl;
+                    }
+                }
+                // Do per-layer profiling after normal benchmarking to avoid introducing perf overhead.
+                if (dumpProfile)
+                {
+                    session.setLayerProfiler();
+                    iterIdx = 0;
+
+                    while (iterIdx < numRuns)
+                    {
+                        auto const start = std::chrono::steady_clock::now();
+                        SizeType numSteps = 0;
+                        generationOutput.onTokenGenerated
+                            = [&numSteps, maxNewTokens](GenerationOutput::TensorPtr const& outputIds, SizeType step,
+                                  bool finished) { ++numSteps; };
+                        session.generate(generationOutput, generationInput, samplingConfig, generationProfiler);
+                        bufferManager.getStream().synchronize();
+                        auto const end = std::chrono::steady_clock::now();
+
+                        iterIdx += 1;
+                        float latency = std::chrono::duration<float, std::milli>(end - start).count();
+                        curDuration += latency;
+                        latencies.emplace_back(latency);
+                        generationTimes.emplace_back(generationProfiler->getElapsedTimeMs());
+
+                        bool durationLimitReached{curDuration / 1000 >= duration};
+                        if (worldConfig.getSize() > 1)
+                        {
+                            bool result{false};
+                            comm.allreduce(&durationLimitReached, &result, 1, tmpi::MpiType::kBOOL, tmpi::MpiOp::LOR);
+                            durationLimitReached = result;
+                        }
+                        if (durationLimitReached)
+                        {
+                            break;
+                        }
+                    }
+                    if (worldConfig.getRank() == 0)
+                    {
+                        printf("%s\n", session.getLayerProfileInfo().c_str());
                     }
                 }
             }
@@ -347,6 +416,8 @@ int main(int argc, char* argv[])
     options.add_options()("enable_cuda_graph", "Execute GPT session with CUDA graph.");
     options.add_options()("print_all_logits", "Print all context and generation logits.");
     options.add_options()("disable_force_max_tokens", "Disable force the engine generating new max_tokens.");
+    options.add_options()("dump_layer_info", "Print layer information of the engine to console.");
+    options.add_options()("dump_profile", "Print profile information per layer.");
 
     auto result = options.parse(argc, argv);
 
@@ -456,6 +527,8 @@ int main(int argc, char* argv[])
     auto enableCudaGraph = result.count("enable_cuda_graph") > 0;
     auto printAllLogits = result.count("print_all_logits") > 0;
     auto disableForceMaxTokens = result.count("disable_force_max_tokens") > 0;
+    auto dumpLayerInfo = result.count("dump_layer_info") > 0;
+    auto dumpProfile = result.count("dump_profile") > 0;
 
     initTrtLlmPlugins(logger.get());
 
@@ -463,7 +536,7 @@ int main(int argc, char* argv[])
     {
         benchmarkGptSession(result["engine_dir"].as<std::string>(), batchSizes, beamWidth, inOutLen, logger,
             result["warm_up"].as<int>(), result["num_runs"].as<int>(), result["duration"].as<int>(), sessionConfig,
-            enableCudaGraph, printAllLogits, disableForceMaxTokens);
+            enableCudaGraph, printAllLogits, disableForceMaxTokens, dumpLayerInfo, dumpProfile);
     }
     catch (std::exception const& e)
     {

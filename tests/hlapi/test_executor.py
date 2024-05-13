@@ -82,15 +82,18 @@ def llama_7b_tp2_path(engine_path: Path, llm_model_root: Path) -> Path:
     return path
 
 
+@pytest.mark.parametrize("use_executor_bindings", [False, True])
 @pytest.mark.skipif(WORLD_SIZE != 1, reason="Must run on single MPI rank")
-def test_generation_bs2(llama_7b_bs2_path: Path):
+def test_generation_bs2(use_executor_bindings: bool, llama_7b_bs2_path: Path):
     tokenizer = llama_7b_bs2_path
     prompt = "A B C D"
     max_new_tokens = 4
 
-    with GenerationExecutorWorker(llama_7b_bs2_path,
-                                  tokenizer,
-                                  max_beam_width=2) as executor:
+    with GenerationExecutor.create(
+            llama_7b_bs2_path,
+            tokenizer,
+            max_beam_width=2,
+            use_executor_bindings=use_executor_bindings) as executor:
         result = executor.generate(prompt,
                                    sampling_config=SamplingConfig(
                                        max_new_tokens=max_new_tokens,
@@ -99,8 +102,9 @@ def test_generation_bs2(llama_7b_bs2_path: Path):
         assert result.text[1] == "<s> A B C D E F G I"
 
 
+@pytest.mark.parametrize("use_executor_bindings", [False, True])
 @pytest.mark.skipif(WORLD_SIZE != 1, reason="Must run on single MPI rank")
-def test_sync_generation(llama_7b_path: Path):
+def test_sync_generation(use_executor_bindings: bool, llama_7b_path: Path):
     tokenizer = llama_7b_path
     prompt = "A B C D"
     expected_output = " E F G H"
@@ -108,7 +112,9 @@ def test_sync_generation(llama_7b_path: Path):
     split_output = ["E", " F", " G", " H", " I", " J", " K", " L"]
     sampling_config0 = SamplingConfig(max_new_tokens=4)
     sampling_config1 = SamplingConfig(max_new_tokens=8)
-    with GenerationExecutorWorker(llama_7b_path, tokenizer) as executor:
+    with GenerationExecutor.create(
+            llama_7b_path, tokenizer,
+            use_executor_bindings=use_executor_bindings) as executor:
         # Simple generations (synchronous)
         result = executor.generate(prompt, sampling_config=sampling_config0)
         assert result.text == "<s> " + prompt + expected_output
@@ -169,14 +175,18 @@ def test_sync_generation_tp_all_nodes(llama_7b_tp2_path: Path):
     executor.shutdown()
 
 
+@pytest.mark.parametrize("use_executor_bindings", [False, True])
 @pytest.mark.skipif(torch.cuda.device_count() < 2 or WORLD_SIZE != 2,
                     reason="Must run on 2 MPI ranks with at least 2 GPUs")
-def test_sync_generation_tp_main_node_only(llama_7b_tp2_path: Path):
+def test_sync_generation_tp_main_node_only(use_executor_bindings: bool,
+                                           llama_7b_tp2_path: Path):
     prompt = "deep learning"
     sampling_config = SamplingConfig(max_new_tokens=4)
 
-    with GenerationExecutorWorker(llama_7b_tp2_path,
-                                  llama_7b_tp2_path) as executor:
+    with GenerationExecutor.create(
+            llama_7b_tp2_path,
+            llama_7b_tp2_path,
+            use_executor_bindings=use_executor_bindings) as executor:
 
         executor.block_subordinates()
         # from now on, only rank0 lives in the with statement
@@ -186,16 +196,20 @@ def test_sync_generation_tp_main_node_only(llama_7b_tp2_path: Path):
         assert result.text == "<s> deep learning, neural network,"
 
 
+@pytest.mark.parametrize("use_executor_bindings", [False, True])
 @pytest.mark.skipif(torch.cuda.device_count() < 2 or WORLD_SIZE != 1,
                     reason="Must run on 1 MPI rank with at least 2 GPUs")
-def test_sync_generation_tp_inner(llama_7b_tp2_path: Path):
+def test_sync_generation_tp_inner(use_executor_bindings: bool,
+                                  llama_7b_tp2_path: Path):
     prompt = "deep learning"
     tp_size = 2
     sampling_config = SamplingConfig(max_new_tokens=4)
 
-    executor = GenerationExecutor.create(llama_7b_tp2_path,
-                                         llama_7b_tp2_path,
-                                         model_world_size=tp_size)
+    executor = GenerationExecutor.create(
+        llama_7b_tp2_path,
+        llama_7b_tp2_path,
+        model_world_size=tp_size,
+        use_executor_bindings=use_executor_bindings)
     result = executor.generate(prompt, sampling_config=sampling_config)
     assert result.text == "<s> deep learning, neural network,"
     executor.shutdown()

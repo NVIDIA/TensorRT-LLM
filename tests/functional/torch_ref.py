@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -482,3 +483,267 @@ class mamba_ref(nn.Module):
                                        dt_softplus=True)
         out = self.out_proj(y)
         return out.unsqueeze(1), conv_state, ssm_state
+
+
+def rnn_scan(x: torch.Tensor, a: torch.Tensor, reset: torch.Tensor,
+             h0: torch.Tensor):
+    """Runs the recurrence of a linear RNN."""
+    assert x.ndim == 3
+    assert a.shape == x.shape[-a.ndim:]
+    assert a.dtype == x.dtype
+    assert type(a) is type(x)
+
+    # Multiply `a` by the reset
+    a = a * (1 - reset)
+
+    if x.shape[1] == 1:
+        # Using scan in sampling mode.
+        y = a * h0[:, None] + x
+    else:
+        # Using scan in linear mode.
+        h_t = h0
+        y = torch.zeros_like(x)
+        for t in range(x.shape[1]):
+            y[:, t] = a[:, t] * h_t + x[:, t]
+            h_t = y[:, t].type_as(x)
+    h_last = y[:, -1]
+
+    return y, h_last
+
+
+def rg_lru_ref(x, input_gate_x, a_gate_x, y, y_bias, segment_pos, prev_h,
+               a_param):
+
+    bs, l, d = x.shape
+    assert segment_pos.shape == (bs, l)
+    reset = (segment_pos == 0).type(torch.int32)[..., None]
+    prev_h = torch.zeros(size=(bs, d)) if prev_h is None else prev_h
+
+    # Gates for x and a.
+    gate_x = torch.sigmoid(input_gate_x.float())
+    gate_a = torch.sigmoid(a_gate_x.float())
+
+    # Compute the parameter `A` of the recurrence
+    c = -8.0 * nn.functional.softplus(a_param.float())
+    log_a = c * gate_a
+    a = torch.exp(log_a)
+
+    # Gate the input
+    gated_x = x * gate_x
+
+    # Apply gamma normalization to the input
+    multiplier = torch.sqrt(1 - torch.exp(2 * log_a))
+    multiplier = reset + (1 - reset) * multiplier
+    normalized_x = gated_x * multiplier
+
+    # rnn scan
+    out, last_h = rnn_scan(
+        x=normalized_x,
+        a=a,
+        reset=reset,
+        h0=prev_h,
+    )
+
+    # y branch
+    if y_bias is not None:
+        out = out * torch.nn.functional.gelu(y + y_bias)
+    elif y is not None:
+        out = out * y
+    else:
+        out = out
+    return out.type(x.dtype), last_h
+
+
+def rg_lru_batch_ref(x, input_gate_x, a_gate_x, y, y_bias, segment_pos, prev_h,
+                     a_param, batch_size, remove_padding, last_token_ids):
+    outputs, lru_states = [], []
+    for i in range(batch_size):
+        start_id = 0 if (i == 0 or not remove_padding) else last_token_ids[i -
+                                                                           1]
+        end_id = last_token_ids[i]
+        if remove_padding:
+            x_i = x[start_id:end_id, :].unsqueeze(0)
+            input_gate_x_i = input_gate_x[start_id:end_id, :].unsqueeze(0)
+            a_gate_x_i = a_gate_x[start_id:end_id, :].unsqueeze(0)
+            y_i = y[start_id:end_id, :].unsqueeze(0) if y is not None else None
+        else:
+            x_i = x[i:i + 1, start_id:end_id, :]
+            input_gate_x_i = input_gate_x[i:i + 1, start_id:end_id, :]
+            a_gate_x_i = a_gate_x[i:i + 1, start_id:end_id, :]
+            y_i = y[i:i + 1, start_id:end_id, :] if y is not None else None
+        segment_pos_i = segment_pos[i:i + 1, 0:end_id - start_id]
+        prev_h_i = prev_h[i:i + 1, :]
+
+        out_i, lru_state_i = rg_lru_ref(x_i, input_gate_x_i, a_gate_x_i, y_i,
+                                        y_bias, segment_pos_i, prev_h_i,
+                                        a_param)
+        if remove_padding:
+            out_i = out_i.squeeze(0)
+        else:
+            padding_num = x.shape[1] - out_i.shape[1]
+            out_i = F.pad(out_i, (0, 0, 0, padding_num, 0, 0), value=0)
+        outputs.append(out_i)
+        lru_states.append(lru_state_i)
+    out = torch.concat(outputs, dim=0)
+    last_h = torch.concat(lru_states, dim=0)
+    return out, last_h
+
+
+class BlockDiagonalLinear(nn.Module):
+    """Block-diagonal linear layer."""
+
+    def __init__(self, num_blocks: int, width: int, device=None, dtype=None):
+        factory_kwargs = {'device': device, 'dtype': dtype}
+        super().__init__()
+        self.num_blocks = num_blocks
+        self.width = width
+        block_width = self.width // self.num_blocks
+
+        # Parameters
+        self.w = nn.Parameter(
+            torch.randn([self.num_blocks, block_width, block_width],
+                        **factory_kwargs))
+        self.b = nn.Parameter(
+            torch.randn([self.num_blocks, block_width], **factory_kwargs))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Split x to blocks
+        x = rearrange(x, "... (h i) -> ... h i", h=self.num_blocks)
+
+        # Linear layer over each block + bias
+        y = torch.einsum("... h i, h i j -> ... h j", x, self.w) + self.b
+
+        # Flatten the output
+        return rearrange(y, "... h j -> ... (h j)", h=self.num_blocks)
+
+
+class recurrent_ref(nn.Module):
+
+    def __init__(self,
+                 width,
+                 lru_width,
+                 num_heads,
+                 d_conv,
+                 device=None,
+                 dtype=None):
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        self.d_conv = d_conv
+        self.a_param = nn.Parameter(torch.randn([lru_width], device=device))
+
+        self.linear_x = nn.Linear(width, lru_width, **factory_kwargs)
+        self.linear_y = nn.Linear(width,
+                                  lru_width,
+                                  bias=False,
+                                  **factory_kwargs)
+        self.y_bias = nn.Parameter(torch.randn([1, 1, lru_width],
+                                               device=device))
+
+        self.conv1d = nn.Conv1d(
+            in_channels=lru_width,
+            out_channels=lru_width,
+            bias=True,
+            kernel_size=d_conv,
+            groups=lru_width,
+            padding=d_conv - 1,
+            **factory_kwargs,
+        )
+
+        self.input_gate = BlockDiagonalLinear(
+            num_blocks=num_heads,
+            width=lru_width,
+            **factory_kwargs,
+        )
+        self.a_gate = BlockDiagonalLinear(
+            num_blocks=num_heads,
+            width=lru_width,
+            **factory_kwargs,
+        )
+
+        self.linear_out = nn.Linear(lru_width, width, **factory_kwargs)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        segment_pos: torch.Tensor,
+        batch_size: int,
+        remove_padding: bool,
+        last_token_ids: torch.Tensor,
+        conv_state: Optional[torch.Tensor] = None,
+        lru_state: Optional[torch.Tensor] = None,
+        conv_idx: Optional[torch.Tensor] = None,
+    ):
+        outputs, conv_states, lru_states = [], [], []
+        for i in range(batch_size):
+            start_id = 0 if (i == 0
+                             or not remove_padding) else last_token_ids[i - 1]
+            end_id = last_token_ids[i]
+            if remove_padding:
+                x_i = x[start_id:end_id, :].unsqueeze(0)
+            else:
+                x_i = x[i:i + 1, start_id:end_id, :]
+            segment_pos_i = segment_pos[i:i + 1, 0:end_id - start_id]
+            conv_state_i = None if conv_state is None else conv_state[i:i + 1, ]
+            lru_state_i = None if lru_state is None else lru_state[i:i + 1, ]
+            conv_idx_i = None if conv_idx is None else conv_idx[i:i + 1, ]
+            out_i, conv_state_i, lru_state_i = self.forward_impl(
+                x_i, segment_pos_i, conv_state_i, lru_state_i, conv_idx_i)
+            if remove_padding:
+                out_i = out_i.squeeze(0)
+            else:
+                padding_num = x.shape[1] - out_i.shape[1]
+                out_i = F.pad(out_i, (0, 0, 0, padding_num, 0, 0), value=0)
+            outputs.append(out_i)
+            conv_states.append(conv_state_i)
+            lru_states.append(lru_state_i)
+        out = torch.concat(outputs, dim=0)
+        conv_state = torch.concat(conv_states, dim=0)
+        lru_state = torch.concat(lru_states, dim=0)
+        return out, conv_state, lru_state
+
+    def forward_impl(
+        self,
+        x: torch.Tensor,
+        segment_pos: torch.Tensor,
+        conv_state: Optional[torch.Tensor] = None,
+        lru_state: Optional[torch.Tensor] = None,
+        conv_indices: Optional[torch.Tensor] = None,
+    ):
+        _, seqlen, _ = x.shape
+
+        # y branch
+        y = self.linear_y(x)
+
+        # x branch
+        x = self.linear_x(x)
+
+        # conv1d
+        if conv_state is None:
+            x = x.permute([0, 2, 1])
+            conv_state = F.pad(x, (self.d_conv - 1, 0))
+            conv_state = torch.gather(conv_state,
+                                      dim=2,
+                                      index=conv_indices.type(torch.int64))
+            x = self.conv1d(x)[..., :seqlen].permute([0, 2, 1])
+        else:
+            x = x.squeeze(1)
+            conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))
+            conv_state[:, :, -1] = x
+            x = torch.sum(conv_state *
+                          rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                          dim=-1)
+            if self.conv1d.bias is not None:
+                x = x + self.conv1d.bias
+            x = x.unsqueeze(1)
+
+        # rg lru
+        gate_x = self.input_gate(x)
+        gate_a = self.a_gate(x)
+
+        x, lru_state = rg_lru_ref(x, gate_x, gate_a, y, self.y_bias,
+                                  segment_pos, lru_state, self.a_param)
+
+        # Join branches.
+        x = self.linear_out(x)
+
+        return x, conv_state, lru_state

@@ -61,8 +61,7 @@ class TestPhi(unittest.TestCase):
                                                 trust_remote_code=True)
         gpt_config.num_hidden_layers = 2
         model = AutoModelForCausalLM.from_config(
-            gpt_config, code_revision=HF_CODE_REVISION,
-            trust_remote_code=True).cuda().to(
+            gpt_config, trust_remote_code=True).cuda().to(
                 tensorrt_llm._utils.str_dtype_to_torch(dtype)).eval()
         return gpt_config, model
 

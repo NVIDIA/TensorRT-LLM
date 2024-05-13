@@ -19,7 +19,7 @@
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/gptDecoder.h"
-#include "tensorrt_llm/runtime/gptModelConfig.h"
+#include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 using namespace tensorrt_llm::runtime;
@@ -38,10 +38,11 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
 
     SizeType constexpr vocabSize{51200};
     SizeType constexpr nbLayers{2};
+    SizeType constexpr nbSsmLayers{0};
     SizeType constexpr nbHeads{16};
     SizeType constexpr hiddenSize{1024};
     SizeType constexpr batchSize{4};
-    GptModelConfig modelConfig{vocabSize, nbLayers, nbHeads, hiddenSize, dtype};
+    ModelConfig modelConfig{vocabSize, nbLayers, nbSsmLayers, nbHeads, hiddenSize, dtype};
     modelConfig.useGptAttentionPlugin(false);
 
     SizeType constexpr maxInputLength{8};

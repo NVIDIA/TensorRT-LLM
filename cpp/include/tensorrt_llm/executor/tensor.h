@@ -43,13 +43,19 @@ namespace detail
 {
 std::shared_ptr<runtime::ITensor> const& toITensor(Tensor const& tensor);
 Tensor ofITensor(std::shared_ptr<runtime::ITensor> tensor);
+#ifdef TRT_LLM_USE_DIM64
+using DimType = int64_t;
+#else
+using DimType = int32_t;
+#endif
+
 } // namespace detail
 
 // A thin wrapper around span that supports constructions with an initializer list.
-class Shape : public tensorrt_llm::common::ArrayView<std::int32_t const>
+class Shape : public tensorrt_llm::common::ArrayView<detail::DimType const>
 {
 public:
-    using Base = tensorrt_llm::common::ArrayView<std::int32_t const>;
+    using Base = tensorrt_llm::common::ArrayView<detail::DimType const>;
     using DimType = typename std::remove_cv_t<Base::value_type>;
 
     Shape()

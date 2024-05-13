@@ -18,6 +18,7 @@ import argparse as _arg
 import logging as _log
 import os as _os
 import pathlib as _pl
+import platform
 import subprocess as _sp
 import sys as _sys
 import typing as _tp
@@ -97,12 +98,15 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
               run_chatglm=False,
               run_medusa=False,
               run_mamba=False,
+              run_recurrentgemma=False,
+              run_encoder=False,
               run_fp8=False,
               only_multi_gpu=False,
               trt_root: _tp.Optional[str] = None,
               build_only=False,
               use_ccache=False,
-              job_count: _tp.Optional[int] = None) -> None:
+              job_count: _tp.Optional[int] = None,
+              test_timeout=3600) -> None:
     root_dir = find_root_dir()
     _log.info("Using root directory: %s", str(root_dir))
 
@@ -130,6 +134,20 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
                     timeout=300)
         run_command(
             [python_exe, "-m", "pip", "install", "--force-reinstall", "build"],
+            cwd=root_dir,
+            env=_os.environ,
+            timeout=300)
+
+    if run_recurrentgemma:
+        run_command([
+            "git", "clone",
+            "https://github.com/google-deepmind/recurrentgemma.git"
+        ],
+                    cwd=root_dir,
+                    env=_os.environ,
+                    timeout=300)
+        run_command(
+            [python_exe, "-m", "pip", "install", "./recurrentgemma[full]"],
             cwd=root_dir,
             env=_os.environ,
             timeout=300)
@@ -164,7 +182,7 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
     run_command(generate_multi_lora_tp2_args, cwd=root_dir, timeout=100)
 
     if not skip_unit_tests:
-        run_unit_tests(build_dir=build_dir)
+        run_unit_tests(build_dir=build_dir, timeout=test_timeout)
     else:
         _log.info("Skipping unit tests")
 
@@ -179,6 +197,8 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
                                 run_chatglm=run_chatglm,
                                 run_medusa=run_medusa,
                                 run_mamba=run_mamba,
+                                run_recurrentgemma=run_recurrentgemma,
+                                run_encoder=run_encoder,
                                 run_fp8=run_fp8)
 
         if build_only:
@@ -191,7 +211,10 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
                              run_chatglm=run_chatglm,
                              run_medusa=run_medusa,
                              run_mamba=run_mamba,
-                             run_fp8=run_fp8)
+                             run_recurrentgemma=run_recurrentgemma,
+                             run_encoder=run_encoder,
+                             run_fp8=run_fp8,
+                             timeout=test_timeout)
 
         if run_gpt:
             run_benchmarks(python_exe=python_exe,
@@ -201,7 +224,7 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
         else:
             _log.info("Skipping benchmarks")
 
-    else:
+    elif platform.system() != "Windows":
         prepare_multi_gpu_model_tests(python_exe=python_exe,
                                       root_dir=root_dir,
                                       resources_dir=resources_dir,
@@ -210,7 +233,7 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
         if build_only:
             return
 
-        run_multi_gpu_tests(build_dir=build_dir)
+        run_multi_gpu_tests(build_dir=build_dir, timeout=test_timeout)
 
 
 def prepare_all_model_tests(python_exe: str,
@@ -223,6 +246,8 @@ def prepare_all_model_tests(python_exe: str,
                             run_chatglm=False,
                             run_medusa=False,
                             run_mamba=False,
+                            run_recurrentgemma=False,
+                            run_encoder=False,
                             run_fp8=False):
     model_cache_arg = ["--model_cache", model_cache] if model_cache else []
 
@@ -288,6 +313,24 @@ def prepare_all_model_tests(python_exe: str,
     else:
         _log.info("Skipping Mamba tests")
 
+    if run_recurrentgemma:
+        prepare_model_tests(model_name="recurrentgemma",
+                            python_exe=python_exe,
+                            root_dir=root_dir,
+                            resources_dir=resources_dir,
+                            model_cache_arg=model_cache_arg)
+    else:
+        _log.info("Skipping RecurrentGemma tests")
+
+    if run_encoder:
+        prepare_model_tests(model_name="enc_dec",
+                            python_exe=python_exe,
+                            root_dir=root_dir,
+                            resources_dir=resources_dir,
+                            model_cache_arg=model_cache_arg)
+    else:
+        _log.info("Skipping encoder tests")
+
 
 def prepare_multi_gpu_model_tests(python_exe: str,
                                   root_dir: _pl.Path,
@@ -325,6 +368,8 @@ def prepare_model_tests(model_name: str,
         python_exe,
         str(scripts_dir / f"generate_expected_{model_name}_output.py")
     ] + only_fp8_arg + only_multi_gpu_arg
+    if "enc_dec" in model_name:
+        generate_expected_output += model_cache_arg
     if only_multi_gpu_arg:
         generate_expected_output = [
             "mpirun", "-n", "4", "--allow-run-as-root", "--timeout", "600"
@@ -343,7 +388,7 @@ def build_tests(build_dir: _pl.Path):
     run_command(make_google_tests, cwd=build_dir, timeout=300)
 
 
-def run_unit_tests(build_dir: _pl.Path):
+def run_unit_tests(build_dir: _pl.Path, timeout=1800):
     build_tests(build_dir=build_dir)
 
     cpp_env = {**_os.environ}
@@ -358,12 +403,23 @@ def run_unit_tests(build_dir: _pl.Path):
     excluded_tests.append("ChatGlm")
     excluded_tests.append("Medusa")
     excluded_tests.append("Mamba")
+    excluded_tests.append("RecurrentGemma")
+    excluded_tests.append("Encoder")
     ctest.extend(["-E", "|".join(excluded_tests)])
-    run_command(ctest, cwd=build_dir, env=cpp_env, timeout=1800)
+    run_command(ctest, cwd=build_dir, env=cpp_env, timeout=timeout)
 
 
-def run_single_gpu_tests(build_dir: _pl.Path, run_gpt, run_gptj, run_llama,
-                         run_chatglm, run_medusa, run_mamba, run_fp8):
+def run_single_gpu_tests(build_dir: _pl.Path,
+                         run_gpt,
+                         run_gptj,
+                         run_llama,
+                         run_chatglm,
+                         run_medusa,
+                         run_mamba,
+                         run_recurrentgemma,
+                         run_encoder,
+                         run_fp8,
+                         timeout=3600):
     build_tests(build_dir=build_dir)
 
     cpp_env = {**_os.environ}
@@ -385,6 +441,10 @@ def run_single_gpu_tests(build_dir: _pl.Path, run_gpt, run_gptj, run_llama,
         included_tests.append("Medusa")
     if run_mamba:
         included_tests.append("Mamba")
+    if run_recurrentgemma:
+        included_tests.append("RecurrentGemma")
+    if run_encoder:
+        included_tests.append("EncoderModelTestSingleGPU")
 
     excluded_tests = []
     if not run_fp8:
@@ -394,10 +454,10 @@ def run_single_gpu_tests(build_dir: _pl.Path, run_gpt, run_gptj, run_llama,
         ctest.extend(["-R", "|".join(included_tests)])
         if excluded_tests:
             ctest.extend(["-E", "|".join(excluded_tests)])
-        run_command(ctest, cwd=build_dir, env=cpp_env, timeout=3600)
+        run_command(ctest, cwd=build_dir, env=cpp_env, timeout=timeout)
 
 
-def run_multi_gpu_tests(build_dir: _pl.Path):
+def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
     build_tests(build_dir=build_dir)
 
     tests_dir = build_dir / "tests"
@@ -415,7 +475,23 @@ def run_multi_gpu_tests(build_dir: _pl.Path):
         "batch_manager/trtGptModelRealDecoderTest", "--gtest_filter=*TP*:*PP*"
     ]
     run_command(trt_model_test, cwd=tests_dir, env=cpp_env,
-                timeout=1500)  # expecting ~ 1200s
+                timeout=timeout)  # expecting ~ 1200s
+
+    #Executor test in leader mode
+    new_env = cpp_env
+    new_env["RUN_LLAMA_MULTI_GPU"] = "true"
+    trt_model_test = [
+        "mpirun", "-n", "4", "--allow-run-as-root", "executor/executorTest",
+        "--gtest_filter=*LlamaExecutorTest*LeaderMode*"
+    ]
+    run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
+
+    #Executor test in orchestrator mode
+    trt_model_test = [
+        "mpirun", "-n", "1", "--allow-run-as-root", "executor/executorTest",
+        "--gtest_filter=*LlamaExecutorTest*OrchMode*"
+    ]
+    run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
 
 
 def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
@@ -489,6 +565,8 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
                     str(data_dir / tokens_f)
                 ]
                 run_command(benchmark, cwd=root_dir, timeout=600)
+                req_rate_benchmark = benchmark + ["--request_rate", "100"]
+                run_command(req_rate_benchmark, cwd=root_dir, timeout=600)
 
         benchmark = [
             str(benchmark_exe_dir / "gptManagerBenchmark"), "--engine_dir",
@@ -503,6 +581,15 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
             str(gpt_engine_dir / "fp16-plugin-packed-paged" / "tp1-pp1-gpu"),
             "--type", "IFB", "--dataset",
             str(data_dir / tokens_f), "--api", "gptManager", "--streaming"
+        ]
+        run_command(benchmark, cwd=root_dir, timeout=600)
+
+        benchmark = [
+            str(benchmark_exe_dir / "gptManagerBenchmark"), "--engine_dir",
+            str(gpt_engine_dir / "fp16-plugin-packed-paged" / "tp1-pp1-gpu"),
+            "--type", "IFB", "--dataset",
+            str(data_dir / tokens_f), "--api", "gptManager", "--streaming",
+            "request_rate", "100", "--enable_exp_delays"
         ]
         run_command(benchmark, cwd=root_dir, timeout=600)
 
@@ -557,6 +644,12 @@ if __name__ == "__main__":
     parser.add_argument("--run_mamba",
                         action="store_true",
                         help="Run the tests for Mamba")
+    parser.add_argument("--run_recurrentgemma",
+                        action="store_true",
+                        help="Run the tests for RecurrentGemma")
+    parser.add_argument("--run_encoder",
+                        action="store_true",
+                        help="Run the tests for BART encoder")
     parser.add_argument(
         "--run_fp8",
         action="store_true",
@@ -568,6 +661,7 @@ if __name__ == "__main__":
     parser.add_argument("--build_only",
                         action="store_true",
                         help="Build only, do not run tests.")
+    parser.add_argument("--test_timeout", type=int, help="Timeout for tests.")
 
     args = parser.parse_args()
 
@@ -577,6 +671,8 @@ if __name__ == "__main__":
         args.run_llama = True
         args.run_chatglm = True
         args.run_mamba = True
+        args.run_recurrentgemma = True
+        args.run_encoder = True
 
     del args.run_all_models
 

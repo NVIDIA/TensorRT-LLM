@@ -14,6 +14,13 @@
  * limitations under the License.
  */
 
+/*****************************************************************************
+ *
+ * GptSession is going to be deprecated soon.
+ * Please do not add new functionality in this file!
+ *
+ *****************************************************************************/
+
 #pragma once
 
 #include "tensorrt_llm/batch_manager/kvCacheConfig.h"
@@ -23,8 +30,8 @@
 #include "tensorrt_llm/runtime/decodingMode.h"
 #include "tensorrt_llm/runtime/generationInput.h"
 #include "tensorrt_llm/runtime/generationOutput.h"
-#include "tensorrt_llm/runtime/gptModelConfig.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
@@ -54,7 +61,7 @@ namespace utils
 std::vector<uint8_t> loadEngine(std::string const& enginePath);
 }
 
-class IpcMemory;
+class AllReduceBuffers;
 class IStatefulGptDecoder;
 class NcclCommunicator;
 class RuntimeBuffers;
@@ -150,17 +157,17 @@ public:
     //! @param engineBuffer  The compiled TensorRT engine (const void*),
     //! @param engineSize    The size in bytes of the TensorRT engine (size_t),
     //! @param logger        The optional logger.
-    GptSession(Config const& sessionConfig, GptModelConfig const& modelConfig, WorldConfig const& worldConfig,
+    GptSession(Config const& sessionConfig, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
         void const* engineBuffer, std::size_t engineSize, LoggerPtr logger = nullptr);
 
-    GptSession(Config const& sessionConfig, GptModelConfig const& modelConfig, WorldConfig const& worldConfig,
+    GptSession(Config const& sessionConfig, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
         std::vector<uint8_t> const& engineBuffer, LoggerPtr logger = nullptr)
         : GptSession(
             sessionConfig, modelConfig, worldConfig, engineBuffer.data(), engineBuffer.size(), std::move(logger))
     {
     }
 
-    GptSession(Config const& sessionConfig, GptModelConfig const& modelConfig, WorldConfig const& worldConfig,
+    GptSession(Config const& sessionConfig, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
         std::string const& engineFile, LoggerPtr logger = nullptr)
         : GptSession(sessionConfig, modelConfig, worldConfig, utils::loadEngine(engineFile), std::move(logger))
     {
@@ -170,7 +177,7 @@ public:
 
     [[nodiscard]] BufferManager const& getBufferManager() const;
 
-    [[nodiscard]] GptModelConfig const& getModelConfig() const
+    [[nodiscard]] ModelConfig const& getModelConfig() const
     {
         return mModelConfig;
     }
@@ -189,6 +196,8 @@ public:
     {
         return mNormalizeLogProbs;
     }
+
+    [[nodiscard]] nvinfer1::IEngineInspector& getEngineInspector() const;
 
     [[nodiscard]] nvinfer1::DataType getLogitDataType() const;
 
@@ -219,6 +228,12 @@ public:
     //!    ```
     void generate(GenerationOutput& outputs, GenerationInput const& inputs, SamplingConfig const& samplingConfig,
         std::shared_ptr<GenerationProfiler> const generationProfiler = nullptr);
+
+    //! @brief Set LayerProfiler to collect performance per layer.
+    void setLayerProfiler();
+
+    //! @brief Print profile information per layer.
+    [[nodiscard]] std::string getLayerProfileInfo() const;
 
 private:
     [[nodiscard]] bool useCudaGraphs()
@@ -333,16 +348,14 @@ private:
     friend class batch_manager::TrtGptModelV1;
 
 private:
-    GptModelConfig const mModelConfig;
+    ModelConfig const mModelConfig;
     WorldConfig const mWorldConfig;
     int mDevice{-1};
     std::shared_ptr<NcclCommunicator> mPipelineComm;
     std::shared_ptr<CudaStream> mCommStream;
     CudaEvent mCommEvent{};
 
-    // tensor parallelism with custom allreduce plugin
-    ITensor::SharedPtr mCommPtrs;
-    std::vector<std::shared_ptr<IpcMemory>> mIpcMemoryHandles;
+    std::shared_ptr<AllReduceBuffers> mAllReduceBuffers;
 
     SizeType mDecoderMaxSequenceLength{};
     SizeType mDecoderMaxAttentionWindow{};

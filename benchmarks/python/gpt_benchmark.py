@@ -12,11 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import os
 from dataclasses import asdict
 from math import ceil
 
 import pandas as pd
+import tensorrt as trt
 import torch
 
 import tensorrt_llm
@@ -59,6 +61,11 @@ class GPTBenchmark(BaseBenchmark):
         # the actual weights size shall be smaller because there are some other data in the engine file.
         # for large model, this approximate is close enough.
         self.weights_size_approx = 0
+
+        self.dump_layer_info = args.dump_layer_info
+        # change profiling_verbosity to detailed when enabling dump layer info
+        if self.dump_layer_info:
+            args.profiling_verbosity = "detailed"
 
         if args.engine_dir is not None:
             # Get build configs from engine directory is done in base class
@@ -131,7 +138,14 @@ class GPTBenchmark(BaseBenchmark):
             remove_input_padding=self.remove_input_padding,
             quant_mode=self.quant_mode,
             use_custom_all_reduce=self.use_custom_all_reduce,
+            tokens_per_block=self.tokens_per_block if hasattr(
+                self, 'tokens_per_block') else 64,
             mamba_conv1d_plugin=self.use_mamba_conv1d_plugin,
+            conv_kernel=self.conv_kernel if hasattr(self, 'conv_kernel') else 0,
+            layer_types=self.layer_types
+            if hasattr(self, 'layer_types') else [],
+            rnn_hidden_size=self.rnn_hidden_size if hasattr(
+                self, 'rnn_hidden_size') else 0,
         )
         if args.model == 'chatglm_6b':
             self.sampling_config = tensorrt_llm.runtime.SamplingConfig(
@@ -260,9 +274,17 @@ class GPTBenchmark(BaseBenchmark):
         batch_size, inlen, outlen = io_shapes[0], io_shapes[1], io_shapes[2]
         kv_cache_size_in_bytes = batch_size*self.num_beams*(inlen + outlen)* \
             self.kv_cache_elem_per_token(self.build_config, self.runtime_mapping.tp_size, self.runtime_mapping.pp_size) * element_size(self.kv_dtype)
-        # when MHA is OOTB, it requires 2x KV cache size, one for past as engine input, one for present as engine output
+        # when MHA is OOTB, it requires extra KV cache size, because OOTB don't support inplace updating KV cache.
         if not self.use_gpt_attention_plugin:
-            kv_cache_size_in_bytes *= 2
+            if os.getenv('TRTLLM_DISABLE_OOTB_KVCACHE_REUSE') != 'ON':
+                local_n_layer = ceil(self.build_config.num_layers /
+                                     self.runtime_mapping.pp_size)
+                kv_cache_size_in_bytes = kv_cache_size_in_bytes / local_n_layer * (
+                    local_n_layer + 1)
+            else:
+                # without reusing, we need one for past as engine inputs, one for present as engine outputs.
+                kv_cache_size_in_bytes *= 2
+
         kv_cache_size_in_mb = bytes_to_target_unit(kv_cache_size_in_bytes,
                                                    "MiB")
         activation_size_in_mb = bytes_to_target_unit(
@@ -348,6 +370,18 @@ class GPTBenchmark(BaseBenchmark):
                 line = '[BENCHMARK] ' + " ".join(kv_pairs)
                 print(line)
 
+        if self.dump_layer_info:
+            engine_inspector = self.decoder.engine_inspector
+            inspector_result = engine_inspector.get_engine_information(
+                trt.LayerInformationFormat.JSON)
+            json_result = json.loads(inspector_result)
+            layers = json_result["Layers"]
+            for layer_idx, _ in enumerate(layers):
+                layer_info = engine_inspector.get_layer_information(
+                    layer_idx, trt.LayerInformationFormat.ONELINE)
+                print(layer_info)
+
+    def report_profiler(self, benchmark_profiler=None):
         if benchmark_profiler is not None and benchmark_profiler.is_recording_perf_profile:
             perf_profile_data = self.decoder.profiler.results
             if not perf_profile_data:
@@ -385,8 +419,9 @@ class GPTBenchmark(BaseBenchmark):
             def dump_kernel_profile_table(name: str, profile_data: list,
                                           iter_cnt: int):
                 table = pd.DataFrame(
-                    [[k, '{:0.3f}'.format(v)] for k, v in profile_data.items()],
-                    columns=['{} Phase LayerName'.format(name), 'times (ms)'])
+                    [['{:0.3f}'.format(v), k]
+                     for k, v in profile_data.items() if v != 0.0],
+                    columns=['times (ms)', '{} Phase LayerName'.format(name)])
 
                 def ljust(s):
                     s = s.astype(str).str.strip()

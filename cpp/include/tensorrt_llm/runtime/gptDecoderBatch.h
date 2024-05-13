@@ -43,7 +43,7 @@ public:
     //! Setup the decoder before calling `forward()`
     void setup(DecodingMode const& mode, SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxAttentionWindow,
         SizeType sinkTokenLength, SizeType maxSequenceLength, SizeType maxTokensPerStep, bool fusedDecoder,
-        nvinfer1::DataType dtype, GptModelConfig const& modelConfig) override;
+        nvinfer1::DataType dtype, ModelConfig const& modelConfig) override;
 
     void newBatch(
         GenerationInput const& inputs, GenerationOutput const& outputs, SamplingConfig const& samplingConfig) override;
@@ -182,7 +182,7 @@ private:
     void allocateMedusaBuffers();
 
     //! @brief Setup buffers for medusa decoding.
-    void setupMedusa(GptModelConfig const& modelConfig);
+    void setupMedusa(ModelConfig const& modelConfig);
 
     //! @brief Setups decoder internal tensors for new speculative decoding request
     void newRequestSpeculativeDecoding(

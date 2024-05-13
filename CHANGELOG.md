@@ -1,5 +1,80 @@
 # Change Log
 
+## Versions 0.8.0
+
+* Model Support
+  - Phi-1.5/2.0
+  - Mamba support (see examples/mamba/README.md)
+    - The support is limited to beam width = 1 and single-node single-GPU
+  - Nougat support (see examples/multimodal/README.md#nougat)
+  - Qwen-VL support (see examples/qwenvl/README.md)
+  - RoBERTa support, thanks to the contribution from @erenup
+  - Skywork model support
+  - Add example for multimodal models (BLIP with OPT or T5, LlaVA)
+* Features
+  - Chunked context support (see docs/source/gpt_attention.md#chunked-context)
+  - LoRA support for C++ runtime (see docs/source/lora.md)
+  - Medusa decoding support (see examples/medusa/README.md)
+    - The support is limited to Python runtime for Ampere or newer GPUs with fp16 and bf16 accuracy, and the `temperature` parameter of sampling configuration should be 0
+  - StreamingLLM support for LLaMA (see docs/source/gpt_attention.md#streamingllm)
+  - Support for batch manager to return logits from context and/or generation phases
+    - Include support in the Triton backend
+  - Support AWQ and GPTQ for QWEN
+  - Support ReduceScatter plugin
+  - Support for combining `repetition_penalty` and `presence_penalty` #274
+  - Support for `frequency_penalty` #275
+  - OOTB functionality support:
+    - Baichuan
+    - InternLM
+    - Qwen
+    - BART
+  - LLaMA
+    - Support enabling INT4-AWQ along with FP8 KV Cache
+    - Support BF16 for weight-only plugin
+  - Baichuan
+    - P-tuning support
+    - INT4-AWQ and INT4-GPTQ support
+  - Decoder iteration-level profiling improvements
+  - Add `masked_select` and `cumsum` function for modeling
+  - Smooth Quantization support for ChatGLM2-6B / ChatGLM3-6B / ChatGLM2-6B-32K
+  - Add Weight-Only Support To Whisper #794, thanks to the contribution from @Eddie-Wang1120
+  - Support FP16 fMHA on NVIDIA V100 GPU
+* API
+  - Add a set of High-level APIs for end-to-end generation tasks (see examples/high-level-api/README.md)
+  - **[BREAKING CHANGES]** Migrate models to the new build workflow, including LLaMA, Mistral, Mixtral, InternLM, ChatGLM, Falcon, GPT-J, GPT-NeoX, Medusa, MPT, Baichuan and Phi (see docs/source/checkpoint.md)
+  - **[BREAKING CHANGES]** Deprecate `LayerNorm` and `RMSNorm` plugins and removed corresponding build parameters
+  - **[BREAKING CHANGES]** Remove optional parameter `maxNumSequences` for GPT manager
+* Bug fixes
+  - Fix the first token being abnormal issue when `--gather_all_token_logits` is enabled #639
+  - Fix LLaMA with LoRA enabled build failure #673
+  - Fix InternLM SmoothQuant build failure #705
+  - Fix Bloom int8_kv_cache functionality  #741
+  - Fix crash in `gptManagerBenchmark` #649
+  - Fix Blip2 build error #695
+  - Add pickle support for `InferenceRequest` #701
+  - Fix Mixtral-8x7b build failure with custom_all_reduce #825
+  - Fix INT8 GEMM shape #935
+  - Minor bug fixes
+* Performance
+  - **[BREAKING CHANGES]** Increase default `freeGpuMemoryFraction` parameter from 0.85 to 0.9 for higher throughput
+  - **[BREAKING CHANGES]** Disable `enable_trt_overlap` argument for GPT manager by default
+  - Performance optimization of beam search kernel
+  - Add bfloat16 and paged kv cache support for optimized generation MQA/GQA kernels
+  - Custom AllReduce plugins performance optimization
+  - Top-P sampling performance optimization
+  - LoRA performance optimization
+  - Custom allreduce performance optimization by introducing a ping-pong buffer to avoid an extra synchronization cost
+  - Integrate XQA kernels for GPT-J (beamWidth=4)
+* Documentation
+  - Batch manager arguments documentation updates
+  - Add documentation for best practices for tuning the performance of TensorRT-LLM (See docs/source/perf_best_practices.md)
+  - Add documentation for Falcon AWQ support (See examples/falcon/README.md)
+  - Update to the `docs/source/checkpoint.md` documentation
+  - Update AWQ INT4 weight only quantization documentation for GPT-J
+  - Add blog: Speed up inference with SOTA quantization techniques in TRT-LLM
+  - Refine TensorRT-LLM backend README structure #133
+  - Typo fix #739
+
 ## Versions 0.7.0 / 0.7.1
 
 * Models

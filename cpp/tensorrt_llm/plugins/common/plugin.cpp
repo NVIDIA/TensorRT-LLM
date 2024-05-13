@@ -74,12 +74,12 @@ void initCommMap(std::set<int> const& group)
         ncclGetUniqueId(&id);
         for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it)
         {
-            comm.send(id, *it, 0);
+            comm.sendValue(id, *it, 0);
         }
     }
     else
     {
-        comm.recv(id, *group.begin(), 0);
+        comm.recvValue(id, *group.begin(), 0);
     }
 
     commMap[group] = nullptr;

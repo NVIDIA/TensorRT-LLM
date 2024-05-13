@@ -31,10 +31,21 @@ namespace cutlass_kernels
 
 enum class QuantType
 {
-    INT8_WEIGHT_ONLY,
-    PACKED_INT4_WEIGHT_ONLY
+    W8_A16,
+    W4_A16,
+    W4_AFP8
 };
-int get_bits_in_quant_type(QuantType quant_type);
+
+constexpr int get_weight_quant_bits(QuantType quant_type)
+{
+    switch (quant_type)
+    {
+    case QuantType::W8_A16: return 8;
+    case QuantType::W4_A16: return 4;
+    case QuantType::W4_AFP8: return 4;
+    default: TLLM_CHECK_WITH_INFO(false, "Invalid quant_type"); return -1;
+    }
+}
 
 // Shapes here can be 2 or 3D. 2-D shapes are [num_rows, num_cols]
 // 3-D shapes are [num_experts, num_rows, num_cols]

@@ -12,7 +12,8 @@ This document shows how to build and run a BLOOM model in TensorRT-LLM on both s
     - [Build TensorRT engine(s)](#build-tensorrt-engines)
       - [INT8 weight only + INT8 KV cache](#int8-weight-only--int8-kv-cache)
       - [SmoothQuant](#smoothquant)
-    - [4. Run](#4-run)
+      - [FP8 Post-Training Quantization](#fp8-post-training-quantization)
+    - [Run](#run)
 
 ## Overview
 
@@ -31,6 +32,7 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
   * INT8 KV CACHE
   * Smooth Quant
   * Tensor Parallel
+  * FP8 and FP8 KV cache
 
 ## Usage
 
@@ -188,7 +190,27 @@ Note that GPT attention plugin is required to be enabled for SmoothQuant for now
 
 Note we use `--bin_model_dir` instead of `--model_dir` since SmoothQuant model needs INT8 weights and various scales from the binary files.
 
-### 4. Run
+#### FP8 Post-Training Quantization
+
+```
+# Quantize HF Bloom 3B into FP8 and export trtllm checkpoint
+python ../quantization/quantize.py --model_dir /home/scratch.trt_llm_data/llm-models/bloom-3b \
+                                   --dtype float16 \
+                                   --qformat fp8 \
+                                   --kv_cache_dtype fp8 \
+                                   --output_dir /tmp/bloom/3b/trt_ckpts/fp8/1-gpu/ \
+                                   --calib_size 512 \
+                                   --tp_size 1
+
+trtllm-build --checkpoint_dir /tmp/bloom/3b/trt_ckpts/fp8/1-gpu/ \
+             --output_dir /tmp/bloom/3b/trt_engines/fp8/1-gpu/ \
+             --gemm_plugin float16 \
+             --use_fp8_context_fmha enable \
+             --strongly_typed \
+             --workers 1
+```
+
+### Run
 
 ```bash
 python ../summarize.py --test_trt_llm \
@@ -212,4 +234,9 @@ mpirun -n 8 --allow-run-as-root \
                            --hf_model_dir ./bloom/176B/ \
                            --data_type fp16 \
                            --engine_dir ./bloom/176B/trt_engines/fp16/8-gpu/
+
+python ../summarize.py --test_trt_llm \
+                       --hf_model_dir /home/scratch.trt_llm_data/llm-models/bloom-3b \
+                       --data_type fp16 \
+                       --engine_dir /tmp/bloom/3b/trt_engines/fp8/1-gpu/
 ```

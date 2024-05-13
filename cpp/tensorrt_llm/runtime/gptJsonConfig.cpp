@@ -17,7 +17,7 @@
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
 
 #include "common.h"
-#include "gptModelConfig.h"
+#include "modelConfig.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/stringUtils.h"
@@ -71,11 +71,49 @@ std::optional<FieldType> parseJsonFieldOptional(Json const& json, std::string_vi
     return value;
 }
 
-GptModelConfig createModelConfig(
+std::vector<ModelConfig::LayerType> buildLayerTypes(
+    std::size_t const numLayers, std::vector<std::string> const& layerStringTypes)
+{
+    std::vector<ModelConfig::LayerType> result{numLayers, ModelConfig::LayerType::kATTENTION};
+    if (layerStringTypes.empty())
+    {
+        return result;
+    }
+
+    auto constexpr layerNameAttention = "attention";
+    auto constexpr layerNameRecurrent = "recurrent";
+
+    // The json field specifies a "group" of layers, which gets repeated multiple times
+    // Note that the total number of layers does not need to be a multiple of a layer
+    // group size (i.e. the last group will be incomplete).
+    // For instance, Griffin has groups of 3 layers (2 recurrent + 1 attention) and 26
+    // layers total (the last group has no attention layer)
+    auto const groupSize = layerStringTypes.size();
+    for (std::size_t i = 0; i < numLayers; ++i)
+    {
+        if (layerStringTypes[i % groupSize] == layerNameAttention)
+        {
+            result[i] = ModelConfig::LayerType::kATTENTION;
+        }
+        else if (layerStringTypes[i % groupSize] == layerNameRecurrent)
+        {
+            result[i] = ModelConfig::LayerType::kRECURRENT;
+        }
+        else
+        {
+            TLLM_LOG_ERROR("Unknown layer type: %s", layerStringTypes[i % groupSize].c_str());
+        }
+    }
+
+    return result;
+}
+
+ModelConfig createModelConfig(
     Json const& json, bool engineVersionNone, SizeType tensorParallelism, nvinfer1::DataType dataType)
 {
     auto const& config = engineVersionNone ? json.at("builder_config") : json.at("pretrained_config");
 
+    auto const useCrossAttention = parseJsonFieldOptional<bool>(config, "cross_attention");
     auto const* const numLayersField = engineVersionNone ? "num_layers" : "num_hidden_layers";
     auto const* const numHeadsField = engineVersionNone ? "num_heads" : "num_attention_heads";
     auto const* const numKvHeadsField = engineVersionNone ? "num_kv_heads" : "num_key_value_heads";
@@ -83,6 +121,13 @@ GptModelConfig createModelConfig(
 
     auto const numLayers = config.at(numLayersField).template get<SizeType>();
     auto const numHeads = config.at(numHeadsField).template get<SizeType>() / tensorParallelism;
+    auto const layerStringTypes
+        = parseJsonFieldOr<std::vector<std::string>>(config, "layer_types", std::vector<std::string>());
+    auto const layerTypes = buildLayerTypes(numLayers, layerStringTypes);
+    auto const numAttentionLayers
+        = static_cast<SizeType>(std::count(layerTypes.begin(), layerTypes.end(), ModelConfig::LayerType::kATTENTION));
+    auto const numSsmLayers
+        = static_cast<SizeType>(std::count(layerTypes.begin(), layerTypes.end(), ModelConfig::LayerType::kRECURRENT));
 
     auto const vocabSize = config.at("vocab_size").template get<SizeType>();
     auto const hiddenSize = config.at("hidden_size").template get<SizeType>() / tensorParallelism;
@@ -95,9 +140,15 @@ GptModelConfig createModelConfig(
 
     auto const mlpHiddenSize = parseJsonFieldOptional<SizeType>(config, mlpHiddenSizeField);
 
-    auto modelConfig = GptModelConfig{vocabSize, numLayers, numHeads, hiddenSize, dataType};
+    auto modelConfig = ModelConfig{vocabSize, numAttentionLayers, numSsmLayers, numHeads, hiddenSize, dataType};
     modelConfig.setSizePerHead(sizePerHead);
     modelConfig.setNbKvHeads(numKvHeads);
+    modelConfig.setLayerTypes(layerTypes);
+
+    if (useCrossAttention.has_value())
+    {
+        modelConfig.useCrossAttention(useCrossAttention.value());
+    }
 
     if (mlpHiddenSize.has_value())
     {
@@ -107,7 +158,7 @@ GptModelConfig createModelConfig(
     return modelConfig;
 };
 
-void parseBuilderConfig(GptModelConfig& modelConfig, Json const& builderConfig)
+void parseBuilderConfig(ModelConfig& modelConfig, Json const& builderConfig)
 {
     auto const maxBatchSize = parseJsonFieldOr(builderConfig, "max_batch_size", 0);
     auto const maxBeamWidth = parseJsonFieldOr(builderConfig, "max_beam_width", 0);
@@ -131,7 +182,7 @@ void parseBuilderConfig(GptModelConfig& modelConfig, Json const& builderConfig)
     modelConfig.computeGenerationLogits(computeGenerationLogits);
 }
 
-void parsePluginConfig(GptModelConfig& modelConfig, Json const& pluginConfig)
+void parsePluginConfig(ModelConfig& modelConfig, Json const& pluginConfig)
 {
     auto const useGptAttentionPlugin = !pluginConfig.at("gpt_attention_plugin").is_null();
     auto const useMambaConv1dPlugin
@@ -142,7 +193,8 @@ void parsePluginConfig(GptModelConfig& modelConfig, Json const& pluginConfig)
     auto const useCustomAllReduce = pluginConfig.at("use_custom_all_reduce").template get<bool>();
     auto const useContextFMHAForGeneration = pluginConfig.at("use_context_fmha_for_generation").template get<bool>();
     auto const pagedContextFMHA = pluginConfig.at("use_paged_context_fmha").template get<bool>();
-    auto const& pagedState = parseJsonFieldOr(pluginConfig, "paged_state", false);
+    auto const pagedState = parseJsonFieldOr(pluginConfig, "paged_state", false);
+    auto const useXQA = parseJsonFieldOr(pluginConfig, "enable_xqa", false);
 
     modelConfig.useGptAttentionPlugin(useGptAttentionPlugin);
     modelConfig.useMambaConv1dPlugin(useMambaConv1dPlugin);
@@ -153,9 +205,10 @@ void parsePluginConfig(GptModelConfig& modelConfig, Json const& pluginConfig)
     modelConfig.useCustomAllReduce(useCustomAllReduce);
     modelConfig.setUseContextFMHAForGeneration(useContextFMHAForGeneration);
     modelConfig.setPagedContextFMHA(pagedContextFMHA);
+    modelConfig.useXQA(useXQA);
 }
 
-void parseLora(GptModelConfig& modelConfig, Json const& json, Json const& pluginConfig, bool engineVersionNone,
+void parseLora(ModelConfig& modelConfig, Json const& json, Json const& pluginConfig, bool engineVersionNone,
     SizeType tensorParallelism)
 {
     auto const& config = engineVersionNone ? json.at("builder_config") : json.at("build_config").at("lora_config");
@@ -217,6 +270,9 @@ GptJsonConfig parseJson(InputType&& input)
     auto const pipelineParallelism = engineVersionNone
         ? parseJsonFieldOr(builderConfig, "pipeline_parallel", 1)
         : parseJsonFieldOr(json.at("pretrained_config").at("mapping"), "pp_size", 1);
+    auto const gpusPerNode = engineVersionNone ? WorldConfig::kDefaultGpusPerNode
+                                               : parseJsonFieldOr(json.at("pretrained_config").at("mapping"),
+                                                   "gpus_per_node", WorldConfig::kDefaultGpusPerNode);
 
     auto const precision = engineVersionNone ? builderConfig.at("precision").template get<std::string>()
                                              : json.at("pretrained_config").at("dtype").template get<std::string>();
@@ -261,7 +317,7 @@ GptJsonConfig parseJson(InputType&& input)
     {
         if (name == std::string("chatglm_6b") || name == std::string("glm_10b"))
         {
-            modelConfig.setModelVariant(GptModelConfig::ModelVariant::kGlm);
+            modelConfig.setModelVariant(ModelConfig::ModelVariant::kGlm);
             // kGlm is only for ChatGLM-6B and GLM-10B
         }
     }
@@ -273,7 +329,7 @@ GptJsonConfig parseJson(InputType&& input)
             auto const chatglmVersion = pretrainedConfig.at("chatglm_version").template get<std::string>();
             if (chatglmVersion == "glm" || chatglmVersion == "chatglm")
             {
-                modelConfig.setModelVariant(GptModelConfig::ModelVariant::kGlm);
+                modelConfig.setModelVariant(ModelConfig::ModelVariant::kGlm);
                 // kGlm is only for ChatGLM-6B and GLM-10B
             }
         }
@@ -301,34 +357,45 @@ GptJsonConfig parseJson(InputType&& input)
         auto const architecture = pretrainedConfig.at("architecture").template get<std::string>();
         if (architecture == std::string("MambaLMHeadModel"))
         {
-            modelConfig.setModelVariant(GptModelConfig::ModelVariant::kMamba);
+            modelConfig.setModelVariant(ModelConfig::ModelVariant::kMamba);
             auto const& ssmCfg = pretrainedConfig.at("ssm_cfg");
             auto const& mambaDState = ssmCfg.at("d_state").template get<SizeType>();
             auto const& mambaDConv = ssmCfg.at("d_conv").template get<SizeType>();
             auto const& mambaExpand = ssmCfg.at("expand").template get<SizeType>();
-            MambaConfig mambaConfig{};
+            ModelConfig::MambaConfig mambaConfig{};
             mambaConfig.dState = mambaDState;
             mambaConfig.dConv = mambaDConv;
             mambaConfig.expand = mambaExpand;
             modelConfig.setMambaConfig(mambaConfig);
+        }
+        else if (architecture == std::string("RecurrentGemmaForCausalLM"))
+        {
+            modelConfig.setModelVariant(ModelConfig::ModelVariant::kRecurrentGemma);
+            auto const& dConv = pretrainedConfig.at("conv_kernel").template get<SizeType>();
+            auto const& rnnHiddenSize = pretrainedConfig.at("rnn_hidden_size").template get<SizeType>();
+            ModelConfig::RnnConfig rnnConfig{};
+            rnnConfig.dConv = dConv;
+            rnnConfig.hiddenSize = rnnHiddenSize;
+            modelConfig.setRnnConfig(rnnConfig);
         }
     }
     else
     {
         if (name.size() >= 6 && name.substr(0, 6) == "mamba_")
         {
-            modelConfig.setModelVariant(GptModelConfig::ModelVariant::kMamba);
+            modelConfig.setModelVariant(ModelConfig::ModelVariant::kMamba);
             auto const& mambaDState = builderConfig.at("mamba_d_state").template get<SizeType>();
             auto const& mambaDConv = builderConfig.at("mamba_d_conv").template get<SizeType>();
             auto const& mambaExpand = builderConfig.at("mamba_expand").template get<SizeType>();
-            MambaConfig mambaConfig{};
+            ModelConfig::MambaConfig mambaConfig{};
             mambaConfig.dState = mambaDState;
             mambaConfig.dConv = mambaDConv;
             mambaConfig.expand = mambaExpand;
             modelConfig.setMambaConfig(mambaConfig);
         }
     }
-    return GptJsonConfig{name, engineVersion, precision, tensorParallelism, pipelineParallelism, modelConfig};
+    return GptJsonConfig{
+        name, engineVersion, precision, tensorParallelism, pipelineParallelism, gpusPerNode, modelConfig};
 }
 
 } // namespace

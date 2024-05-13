@@ -42,11 +42,12 @@ enum class PositionEmbeddingType : int8_t
     kLEARNED_ABSOLUTE = 0,
     kROPE_GPTJ = 1,
     kROPE_GPT_NEOX = 2,
+    kLONG_ROPE = 3,
     // Workflow: (bmm1_output * scale_bmm1 + alibi).
-    kALIBI = 3,
+    kALIBI = 4,
     // Workflow: (bmm1_output + alibi) * scale_bmm1.
-    kALIBI_WITH_SCALE = 4,
-    kRELATIVE = 5
+    kALIBI_WITH_SCALE = 5,
+    kRELATIVE = 6,
 };
 
 enum class RotaryScalingType : int8_t
@@ -76,10 +77,15 @@ struct BuildDecoderInfoParams
     // The KV length of each sequence in the batch. Shape: [batchSize].
     int const* seqKVLengths;
 
+    // The fmha tile counter ptr (set to 0 before fmha).
+    uint32_t* fmhaTileCounter;
+
     // The number of sequences in the batch.
     int batchSize;
-    // The maximum length of a sequence; it includes input and output.
-    int maxSeqLength;
+    // The maximum query length of a sequence; it includes input and output.
+    int maxQSeqLength;
+    // Whether remove the input padding or not.
+    bool removePadding;
     // The kv cache capacity.
     // We will apply the limited_length_causal mask when there are not enough kv cache.
     int attentionWindowSize;
@@ -89,6 +95,17 @@ struct BuildDecoderInfoParams
     int numTokens;
     // The type of attention.
     AttentionMaskType attentionMaskType;
+
+    // Rotary Embedding inv_freq.
+    // [batch_size, halfRotaryDim] variable across different requests due to dynamic scaling.
+    float rotaryEmbeddingScale;
+    float rotaryEmbeddingBase;
+    int rotaryEmbeddingDim;
+    RotaryScalingType rotaryScalingType;
+    float* rotaryEmbeddingInvFreq;
+    float2* rotaryEmbeddingCoeffCache;
+    // Dynamic scaling;
+    int rotaryEmbeddingMaxPositions;
 };
 
 template <typename T>

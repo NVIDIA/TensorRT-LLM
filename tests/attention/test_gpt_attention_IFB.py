@@ -40,7 +40,8 @@ from transformers.models.llama.modeling_llama import LlamaAttention
 import tensorrt_llm
 from tensorrt_llm import Tensor
 from tensorrt_llm._utils import str_dtype_to_np, torch_to_numpy
-from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
+from tensorrt_llm.functional import (PositionEmbeddingType, RopeEmbeddingUtils,
+                                     RotaryScalingType)
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime import GenerationSequence, KVCacheManager
@@ -53,7 +54,7 @@ from utils.util import (skip_bf16_fp32_accum, skip_bf16_pre_ampere,
 class TestFunctional(unittest.TestCase):
 
     def setUp(self):
-        tensorrt_llm.logger.set_level('error')
+        tensorrt_llm.logger.set_level('warning')
 
     def _build_trt_engine(self, trt_network, trt_builder, dtype, shape_dict,
                           use_int8):
@@ -188,14 +189,30 @@ class TestFunctional(unittest.TestCase):
         remove_input_padding = True
 
         def _construct_execution(
-                session, input_tensor, weight, bias, host_pointer_array,
-                sequence_length, host_past_key_value_lengths,
-                host_max_attention_window_sizes, host_sink_token_length,
-                context_lengths, max_context_length, cache_indirection,
-                num_heads, hidden_size, num_kv_heads, output, dtype,
-                kv_int8_quant_scale, kv_int8_dequant_scale,
-                host_context_lengths, host_request_types):
-            pointer_array = host_pointer_array.to('cuda')
+            session,
+            input_tensor,
+            weight,
+            bias,
+            host_kv_cache_block_offsets,
+            host_kv_cache_pool_pointers,
+            sequence_length,
+            host_past_key_value_lengths,
+            host_max_attention_window_sizes,
+            host_sink_token_length,
+            context_lengths,
+            max_context_length,
+            cache_indirection,
+            num_heads,
+            hidden_size,
+            num_kv_heads,
+            output,
+            dtype,
+            kv_int8_quant_scale,
+            kv_int8_dequant_scale,
+            host_context_lengths,
+            host_request_types,
+        ):
+            kv_cache_block_offsets = host_kv_cache_block_offsets.to('cuda')
             head_size = hidden_size // num_heads
             # construct trt network
             builder = tensorrt_llm.Builder()
@@ -239,13 +256,17 @@ class TestFunctional(unittest.TestCase):
                     name='host_request_types',
                     shape=tuple(host_request_types.shape),
                     dtype=tensorrt_llm.str_dtype_to_trt('int32'))
-                pointer_array_tensor = Tensor(
-                    name='kv_cache_block_pointers',
-                    shape=tuple(pointer_array.shape),
-                    dtype=tensorrt_llm.str_dtype_to_trt('int64'))
-                host_pointer_array_tensor = Tensor(
-                    name='host_kv_cache_block_pointers',
-                    shape=tuple(pointer_array.shape),
+                kv_cache_block_offsets_tensor = Tensor(
+                    name='kv_cache_block_offsets',
+                    shape=tuple(kv_cache_block_offsets.shape),
+                    dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+                host_kv_cache_block_offsets_tensor = Tensor(
+                    name='host_kv_cache_block_offsets',
+                    shape=tuple(kv_cache_block_offsets.shape),
+                    dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+                host_kv_cache_pool_pointers_tensor = Tensor(
+                    name='host_kv_cache_pool_pointers',
+                    shape=(1, ),
                     dtype=tensorrt_llm.str_dtype_to_trt('int64'))
                 kv_int8_quant_scale_tensor = None
                 kv_int8_dequant_scale_tensor = None
@@ -313,6 +334,12 @@ class TestFunctional(unittest.TestCase):
                             "dynamic": RotaryScalingType.dynamic
                         }[configuration.rope_scaling["type"]]
                         rope_scale = configuration.rope_scaling["factor"]
+                embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
+                    configuration.max_position_embeddings, rotary_embedding_dim,
+                    rope_base, rope_scale)
+                rotary_cos_sin = tensorrt_llm.functional.constant(
+                    embed_positions_for_gpt_attention
+                ) if position_embedding_type.is_rope() else None
                 outputs = tensorrt_llm.functional.gpt_attention(
                     qkv=qkv,
                     past_key_value=None,
@@ -337,13 +364,17 @@ class TestFunctional(unittest.TestCase):
                     rotary_embedding_max_positions=configuration.
                     max_position_embeddings,
                     position_embedding_type=position_embedding_type,
+                    rotary_cos_sin=rotary_cos_sin,
                     kv_orig_quant_scale=kv_int8_quant_scale_tensor,
                     kv_quant_orig_scale=kv_int8_dequant_scale_tensor,
                     kv_cache_quant_mode=QuantMode.from_description(
                         use_int8_kv_cache=use_int8_kv_cache),
                     max_context_length=max_context_length,
-                    kv_cache_block_pointers=pointer_array_tensor,
-                    host_kv_cache_block_pointers=host_pointer_array_tensor,
+                    kv_cache_block_offsets=kv_cache_block_offsets_tensor,
+                    host_kv_cache_block_offsets=
+                    host_kv_cache_block_offsets_tensor,
+                    host_kv_cache_pool_pointers=
+                    host_kv_cache_pool_pointers_tensor,
                     host_context_lengths=host_context_lengths_tensor,
                     qkv_bias=qkv_bias)
 
@@ -361,8 +392,9 @@ class TestFunctional(unittest.TestCase):
                 'context_lengths': context_lengths,
                 'cache_indirection': cache_indirection,
                 'host_request_types': host_request_types,
-                'kv_cache_block_pointers': pointer_array,
-                'host_kv_cache_block_pointers': host_pointer_array
+                'kv_cache_block_offsets': kv_cache_block_offsets,
+                'host_kv_cache_block_offsets': host_kv_cache_block_offsets,
+                'host_kv_cache_pool_pointers': host_kv_cache_pool_pointers
             }
             if use_int8_kv_cache:
                 inputs['kv_int8_quant_scale'] = kv_int8_quant_scale
@@ -409,7 +441,7 @@ class TestFunctional(unittest.TestCase):
         bubble_len = tokens_per_block - sink_tokens_in_last_block if sink_tokens_in_last_block > 0 else 0
         max_blocks_per_seq = math.ceil(
             (max_seq_len + bubble_len) / tokens_per_block)
-        blocks = num_req * beam_width * max_blocks_per_seq
+        num_blocks = num_req * beam_width * max_blocks_per_seq
         shape_dict = {
             'weight': (hidden_size, qkv_hidden_size),
             'bias': (qkv_hidden_size, ),
@@ -417,7 +449,7 @@ class TestFunctional(unittest.TestCase):
             'kv_int8_dequant_scale': (1, ),
             'cache_indirection': (num_req, beam_width, max_seq_len),
             'past_key_value':
-            (blocks, 2, plugin_kv_num_heads, tokens_per_block, head_size)
+            (num_blocks, 2, plugin_kv_num_heads, tokens_per_block, head_size)
         }
         shape_dict['present_key_value'] = shape_dict['past_key_value']
 
@@ -705,13 +737,18 @@ class TestFunctional(unittest.TestCase):
             return torch_output, torch_present
 
         # Init KV cache block manager
-        kv_cache_manager = KVCacheManager([ordered_key_value],
-                                          blocks,
-                                          tokens_per_block,
-                                          max_blocks_per_seq,
-                                          max_seq_len,
-                                          sink_token_len,
+        block_size = plugin_kv_num_heads * tokens_per_block * head_size
+        kv_cache_manager = KVCacheManager(num_layers=1,
+                                          num_blocks=num_blocks,
+                                          block_size=block_size,
+                                          tokens_per_block=tokens_per_block,
+                                          max_blocks_per_seq=max_blocks_per_seq,
+                                          max_attention_window_size=max_seq_len,
+                                          sink_token_len=sink_token_len,
                                           beam_width=beam_width)
+        host_kv_cache_pool_pointers = torch.tensor(
+            [ordered_key_value.data_ptr(), 0], dtype=torch.int64)
+        print("pool ptr ", ordered_key_value.data_ptr())
 
         torch_cache_list = [None] * num_req
         cache_num_req = 0
@@ -770,8 +807,13 @@ class TestFunctional(unittest.TestCase):
                 kv_cache_manager.add_sequence(sequence, in_len_req.clone())
 
             # Get arrays of pointers to the "pages" of KV values
-            pointer_arrays = kv_cache_manager.get_block_pointers(beam_width)[0]
-            dense_pointer_arrays = pointer_arrays[sequence_selection]
+            offset_array = kv_cache_manager.get_block_offsets(beam_width)
+
+            print("offset_array", offset_array)
+
+            dense_offset_array = offset_array[sequence_selection]
+
+            print("dense_offset_array", dense_offset_array)
 
             host_input_lengths = np.concatenate(input_length_list)
             host_input_lengths = torch.tensor(host_input_lengths,
@@ -805,7 +847,7 @@ class TestFunctional(unittest.TestCase):
                 'input': (total_num_tokens, hidden_size),
                 'output': (total_num_tokens, hidden_size),
                 'past_key_value':
-                (blocks, 2, num_kv_heads, tokens_per_block, head_size),
+                (num_blocks, 2, num_kv_heads, tokens_per_block, head_size),
                 'sequence_length': (num_seq, ),
                 'host_context_lengths': (num_seq, ),
                 'host_request_types': (num_seq, ),
@@ -829,11 +871,12 @@ class TestFunctional(unittest.TestCase):
 
             session, output = _construct_execution(
                 session, input_tensor, weight_plugin, bias_plugin,
-                dense_pointer_arrays, sequence_lengths,
-                host_past_key_value_lengths, host_max_attention_window_sizes,
-                host_sink_token_length, context_lengths, max_context_length,
-                cache_indirection, num_heads, hidden_size, num_kv_heads, output,
-                dtype, kv_int8_quant_scale, kv_int8_dequant_scale,
+                dense_offset_array, host_kv_cache_pool_pointers,
+                sequence_lengths, host_past_key_value_lengths,
+                host_max_attention_window_sizes, host_sink_token_length,
+                context_lengths, max_context_length, cache_indirection,
+                num_heads, hidden_size, num_kv_heads, output, dtype,
+                kv_int8_quant_scale, kv_int8_dequant_scale,
                 host_context_lengths, host_request_types)
 
             del session

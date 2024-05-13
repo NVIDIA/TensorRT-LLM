@@ -33,10 +33,12 @@ class TopKSamplingLayerTest : public BaseSamplingLayerTest<T>
         this->mAllocator = std::make_shared<tensorrt_llm::common::CudaAllocator>(*this->mBufferManager);
     }
 
-    void initLayer(SamplingParams const& params) override
+    void initLayer(TestSamplingParams const& params) override
     {
+        auto const decodingDomain
+            = tensorrt_llm::layers::DecoderDomain(this->mMaxBatchSize, 1, this->mVocabSize, this->mVocabSizePadded);
         this->mSamplingLayer = std::make_shared<tensorrt_llm::layers::TopKSamplingLayer<T>>(
-            this->mMaxBatchSize, this->mVocabSize, this->mVocabSizePadded, this->mStream->get(), this->mAllocator);
+            decodingDomain, this->mStream->get(), this->mAllocator);
     }
 };
 
@@ -46,7 +48,7 @@ TYPED_TEST(TopKSamplingLayerTest, TopK)
 {
     SizeType topK = 2;
     float topP = 0.0f;
-    SamplingParams params;
+    TestSamplingParams params;
     params.topKs = {topK};
     params.topPs = {topP};
     std::vector<std::set<int32_t>> expectedOutputIds{
@@ -63,7 +65,7 @@ TYPED_TEST(TopKSamplingLayerTest, TopK1TopP0)
 {
     SizeType topK = 1;
     float topP = 0.0f;
-    SamplingParams params;
+    TestSamplingParams params;
     params.topKs = {topK};
     params.topPs = {topP};
     std::vector<std::set<int32_t>> expectedOutputIds{
@@ -79,7 +81,7 @@ TYPED_TEST(TopKSamplingLayerTest, TopK1TopP0)
 TYPED_TEST(TopKSamplingLayerTest, BatchTopK)
 {
     std::vector<SizeType> topKs = {2, 1, 1, 2, 1, 1};
-    SamplingParams params;
+    TestSamplingParams params;
     params.topKs = topKs;
     params.topPs = {1.0f};
     std::vector<std::set<int32_t>> expectedOutputIds{
@@ -96,7 +98,7 @@ TYPED_TEST(TopKSamplingLayerTest, SkipDecode)
 {
     // Skip topK decode
     float topP = 0.3;
-    SamplingParams params;
+    TestSamplingParams params;
     params.topPs = {topP};
     std::vector<std::set<int32_t>> expectedOutputIds{
         // batch
@@ -112,7 +114,7 @@ TYPED_TEST(TopKSamplingLayerTest, TopKTopP)
 {
     SizeType topK = 2;
     float topP = 0.3;
-    SamplingParams params;
+    TestSamplingParams params;
     params.topKs = {topK};
     params.topPs = {topP};
     std::vector<std::set<int32_t>> expectedOutputIds{
@@ -129,7 +131,7 @@ TYPED_TEST(TopKSamplingLayerTest, BatchTopKTopP)
 {
     std::vector<SizeType> topKs = {2, 2, 1, 2, 2, 1};
     float topP = 0.3;
-    SamplingParams params;
+    TestSamplingParams params;
     params.topKs = topKs;
     params.topPs = {topP};
     std::vector<std::set<int32_t>> expectedOutputIds{
@@ -146,7 +148,7 @@ TYPED_TEST(TopKSamplingLayerTest, TopKBatchTopP)
 {
     SizeType topK = 2;
     std::vector<float> topPs = {0.5, 0.3, 0.5, 0.5, 0.3, 0.5};
-    SamplingParams params;
+    TestSamplingParams params;
     params.topKs = {topK};
     params.topPs = topPs;
     std::vector<std::set<int32_t>> expectedOutputIds{
@@ -163,7 +165,7 @@ TYPED_TEST(TopKSamplingLayerTest, BatchTopKBatchTopP)
 {
     std::vector<SizeType> topKs = {2, 2, 1, 2, 2, 1};
     std::vector<float> topPs = {0.0, 0.3, 0.5, 0.0, 0.3, 0.5};
-    SamplingParams params;
+    TestSamplingParams params;
     params.topKs = topKs;
     params.topPs = topPs;
     std::vector<std::set<int32_t>> expectedOutputIds{
@@ -179,7 +181,7 @@ TYPED_TEST(TopKSamplingLayerTest, BatchTopKBatchTopP)
 TYPED_TEST(TopKSamplingLayerTest, InvalidArgsZeroTopK)
 {
     SizeType topK = 0;
-    SamplingParams params;
+    TestSamplingParams params;
     params.topKs = {topK};
     std::vector<std::set<int32_t>> expectedOutputIds{
         // batch
@@ -194,7 +196,7 @@ TYPED_TEST(TopKSamplingLayerTest, InvalidArgsZeroTopK)
 TYPED_TEST(TopKSamplingLayerTest, InvalidArgsZeroTopP)
 {
     float topP = 0;
-    SamplingParams params;
+    TestSamplingParams params;
     params.topPs = {topP};
     std::vector<std::set<int32_t>> expectedOutputIds{
         // batch
@@ -210,7 +212,7 @@ TYPED_TEST(TopKSamplingLayerTest, InvalidArgsZeroTopKTopP)
 {
     SizeType topK = 0;
     float topP = 0;
-    SamplingParams params;
+    TestSamplingParams params;
     params.topPs = {topP};
     params.topKs = {topK};
     std::vector<std::set<int32_t>> expectedOutputIds{
@@ -227,7 +229,7 @@ TYPED_TEST(TopKSamplingLayerTest, InvalidArgsZeroBatchTopKTopP)
 {
     std::vector<SizeType> topKs = {0, 0, 0, 0, 0, 0};
     float topP = 0;
-    SamplingParams params;
+    TestSamplingParams params;
     params.topPs = {topP};
     params.topKs = topKs;
     std::vector<std::set<int32_t>> expectedOutputIds{
@@ -244,7 +246,7 @@ TYPED_TEST(TopKSamplingLayerTest, InvalidArgsZeroTopKBatchTopP)
 {
     SizeType topK = 0;
     std::vector<float> topPs = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-    SamplingParams params;
+    TestSamplingParams params;
     params.topPs = topPs;
     params.topKs = {topK};
     std::vector<std::set<int32_t>> expectedOutputIds{
@@ -260,7 +262,7 @@ TYPED_TEST(TopKSamplingLayerTest, InvalidArgsZeroTopKBatchTopP)
 TYPED_TEST(TopKSamplingLayerTest, InvalidArgsBatchTopKContainZero)
 {
     std::vector<SizeType> topKs = {2, 1, 0, 0, 2, 1};
-    SamplingParams params;
+    TestSamplingParams params;
     params.topKs = topKs;
     std::vector<std::set<int32_t>> expectedOutputIds{
         // batch
@@ -276,7 +278,7 @@ TYPED_TEST(TopKSamplingLayerTest, InvalidArgsBatchTopKTopPContainZero)
 {
     std::vector<SizeType> topKs = {2, 2, 1, 0, 2, 0};
     float topP = 0.0;
-    SamplingParams params;
+    TestSamplingParams params;
     params.topPs = {topP};
     params.topKs = topKs;
     std::vector<std::set<int32_t>> expectedOutputIds{
@@ -293,7 +295,7 @@ TYPED_TEST(TopKSamplingLayerTest, InvalidArgsBatchTopKBatchTopPContainZero)
 {
     std::vector<SizeType> topKs = {0, 2, 1, 2, 2, 0};
     std::vector<float> topPs = {0.0, 0.3, 0.9, 0.0, 0.3, 0.5};
-    SamplingParams params;
+    TestSamplingParams params;
     params.topPs = topPs;
     params.topKs = topKs;
     std::vector<std::set<int32_t>> expectedOutputIds{

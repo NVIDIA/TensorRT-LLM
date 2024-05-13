@@ -48,13 +48,23 @@ void InitBindings(pybind11::module_& m)
         .value("STATIC", tle::BatchingType::kSTATIC)
         .value("INFLIGHT", tle::BatchingType::kINFLIGHT);
 
+    py::enum_<tle::DecodingMode>(m, "DecodingMode")
+        .value("NONE", tle::DecodingMode::kNONE)
+        .value("TOP_K", tle::DecodingMode::kTOP_K)
+        .value("TOP_P", tle::DecodingMode::kTOP_P)
+        .value("BEAM_SEARCH", tle::DecodingMode::kBEAM_SEARCH)
+        .value("MEDUSA", tle::DecodingMode::kMEDUSA)
+        .value("TOP_K_TOP_P", tle::DecodingMode::kTOP_K_TOP_P);
+
     py::enum_<tle::SchedulerPolicy>(m, "SchedulerPolicy")
         .value("MAX_UTILIZATION", tle::SchedulerPolicy::kMAX_UTILIZATION)
         .value("GUARANTEED_NO_EVICT", tle::SchedulerPolicy::kGUARANTEED_NO_EVICT);
 
     py::enum_<tle::CommunicationType>(m, "CommunicationType").value("MPI", tle::CommunicationType::kMPI);
 
-    py::enum_<tle::CommunicationMode>(m, "CommunicationMode").value("LEADER", tle::CommunicationMode::kLEADER);
+    py::enum_<tle::CommunicationMode>(m, "CommunicationMode")
+        .value("LEADER", tle::CommunicationMode::kLEADER)
+        .value("ORCHESTRATOR", tle::CommunicationMode::kORCHESTRATOR);
 
     py::class_<tle::KvCacheStats>(m, "KvCacheStats")
         .def(py::init<>())
@@ -91,7 +101,10 @@ void InitBindings(pybind11::module_& m)
         .def_readwrite("pinned_mem_usage", &tle::IterationStats::pinnedMemUsage)
         .def_readwrite("kv_cache_stats", &tle::IterationStats::kvCacheStats)
         .def_readwrite("static_batching_stats", &tle::IterationStats::staticBatchingStats)
-        .def_readwrite("inflight_batching_stats", &tle::IterationStats::inflightBatchingStats);
+        .def_readwrite("inflight_batching_stats", &tle::IterationStats::inflightBatchingStats)
+        .def("to_json_str",
+            [](tle::IterationStats const& iterationStats)
+            { return tle::JsonSerialization::toJsonStr(iterationStats); });
 
     py::enum_<tle::RequestStage>(m, "RequestStage")
         .value("QUEUED", tle::RequestStage::kQUEUED)
@@ -106,12 +119,17 @@ void InitBindings(pybind11::module_& m)
         .def_readwrite("context_prefill_position", &tle::RequestStats::contextPrefillPosition)
         .def_readwrite("num_generated_tokens", &tle::RequestStats::numGeneratedTokens)
         .def_readwrite("scheduled", &tle::RequestStats::scheduled)
-        .def_readwrite("paused", &tle::RequestStats::paused);
+        .def_readwrite("paused", &tle::RequestStats::paused)
+        .def("to_json_str",
+            [](tle::RequestStats const& iterationStats) { return tle::JsonSerialization::toJsonStr(iterationStats); });
 
     py::class_<tle::RequestStatsPerIteration>(m, "RequestStatsPerIteration")
         .def(py::init<>())
         .def_readwrite("iter", &tle::RequestStatsPerIteration::iter)
-        .def_readwrite("request_stats", &tle::RequestStatsPerIteration::requestStats);
+        .def_readwrite("request_stats", &tle::RequestStatsPerIteration::requestStats)
+        .def("to_json_str",
+            [](tle::RequestStatsPerIteration const& iterationStats)
+            { return tle::JsonSerialization::toJsonStr(iterationStats); });
 
     py::class_<tle::SamplingConfig>(m, "SamplingConfig")
         .def(py::init<SizeType, std::optional<SizeType> const&, std::optional<FloatType> const&,
@@ -175,13 +193,14 @@ void InitBindings(pybind11::module_& m)
                  std::optional<SizeType> const&, std::optional<SizeType> const&, std::optional<std::list<VecTokens>>,
                  std::optional<std::list<VecTokens>>, std::optional<Tensor>,
                  std::optional<tle::SpeculativeDecodingConfig>, std::optional<tle::PromptTuningConfig>,
-                 std::optional<tle::LoraConfig>>(),
+                 std::optional<tle::LoraConfig>, std::optional<std::string>>(),
             py::arg("input_token_ids"), py::arg("max_new_tokens"), py::arg("streaming") = false,
             py::arg_v("sampling_config", tle::SamplingConfig(), "SamplingConfig()"),
             py::arg_v("output_config", tle::OutputConfig(), "OutputConfig()"), py::arg("end_id") = py::none(),
             py::arg("pad_id") = py::none(), py::arg("bad_words") = py::none(), py::arg("stop_words") = py::none(),
             py::arg("embedding_bias") = py::none(), py::arg("speculative_decoding_config") = py::none(),
-            py::arg("prompt_tuning_config") = py::none(), py::arg("lora_config") = py::none())
+            py::arg("prompt_tuning_config") = py::none(), py::arg("lora_config") = py::none(),
+            py::arg("logits_post_processor_name") = py::none())
         .def_property_readonly("input_token_ids", &tle::Request::getInputTokenIds)
         .def_property_readonly("max_new_tokens", &tle::Request::getMaxNewTokens)
         .def_property("streaming", &tle::Request::getStreaming, &tle::Request::setStreaming)
@@ -237,19 +256,29 @@ void InitBindings(pybind11::module_& m)
         .def_property_readonly("host_cache_size", &tle::KvCacheConfig::getHostCacheSize)
         .def_property_readonly("onboard_blocks", &tle::KvCacheConfig::getOnboardBlocks);
 
+    py::class_<tle::OrchestratorConfig>(m, "OrchestratorConfig")
+        .def(py::init<bool, std::string>(), py::arg("is_orchestrator") = true, py::arg("worker_executable_path") = "")
+        .def_property(
+            "is_orchestrator", &tle::OrchestratorConfig::getIsOrchestrator, &tle::OrchestratorConfig::setIsOrchestrator)
+        .def_property("worker_executable_path", &tle::OrchestratorConfig::getWorkerExecutablePath,
+            &tle::OrchestratorConfig::setWorkerExecutablePath);
+
     py::class_<tle::ParallelConfig>(m, "ParallelConfig")
         .def(py::init<tle::CommunicationType, tle::CommunicationMode, std::optional<std::vector<SizeType>> const&,
-                 std::optional<std::vector<SizeType>> const&>(),
+                 std::optional<std::vector<SizeType>> const&, std::optional<tle::OrchestratorConfig> const&>(),
             py::arg_v("communication_type", tle::CommunicationType::kMPI, "CommunicationType.MPI"),
             py::arg_v("communication_mode", tle::CommunicationMode::kLEADER, "CommunicationMode.LEADER"),
-            py::arg("device_ids") = py::none(), py::arg("participant_ids") = py::none())
+            py::arg("device_ids") = py::none(), py::arg("participant_ids") = py::none(),
+            py::arg("orchestrator_config") = py::none())
         .def_property("communication_type", &tle::ParallelConfig::getCommunicationType,
             &tle::ParallelConfig::setCommunicationType)
         .def_property("communication_mode", &tle::ParallelConfig::getCommunicationMode,
             &tle::ParallelConfig::setCommunicationMode)
         .def_property("device_ids", &tle::ParallelConfig::getDeviceIds, &tle::ParallelConfig::setDeviceIds)
         .def_property(
-            "participant_ids", &tle::ParallelConfig::getParticipantIds, &tle::ParallelConfig::setParticipantIds);
+            "participant_ids", &tle::ParallelConfig::getParticipantIds, &tle::ParallelConfig::setParticipantIds)
+        .def_property("orchestrator_config", &tle::ParallelConfig::getOrchestratorConfig,
+            &tle::ParallelConfig::setOrchestratorConfig);
 
     py::class_<tle::PeftCacheConfig>(m, "PeftCacheConfig")
         .def(py::init<SizeType, SizeType, SizeType, SizeType, SizeType, SizeType, SizeType, SizeType, SizeType,
@@ -274,7 +303,8 @@ void InitBindings(pybind11::module_& m)
     py::class_<tle::ExecutorConfig>(m, "ExecutorConfig")
         .def(py::init<SizeType, tle::SchedulerConfig const&, tle::KvCacheConfig const&, bool, bool, SizeType, SizeType,
                  tle::BatchingType, std::optional<tle::ParallelConfig>, tle::PeftCacheConfig const&,
-                 std::optional<tle::LogitsPostProcessorMap>, std::optional<tle::MedusaChoices>>(),
+                 std::optional<tle::LogitsPostProcessorMap>, std::optional<tle::MedusaChoices>,
+                 std::optional<tle::DecodingMode>>(),
             py::arg("max_beam_width") = 1, py::arg_v("scheduler_config", tle::SchedulerConfig(), "SchedulerConfig()"),
             py::arg_v("kv_cache_config", tle::KvCacheConfig(), "KvCacheConfig()"),
             py::arg("enable_chunked_context") = false, py::arg("normalize_log_probs") = true,
@@ -283,7 +313,8 @@ void InitBindings(pybind11::module_& m)
             py::arg_v("batching_type", tle::BatchingType::kINFLIGHT, "BatchingType.INFLIGHT"),
             py::arg("parallel_config") = py::none(),
             py::arg_v("peft_cache_config", tle::PeftCacheConfig(), "PeftCacheConfig()"),
-            py::arg("logits_post_processor_map") = py::none(), py::arg("medusa_choices") = py::none())
+            py::arg("logits_post_processor_map") = py::none(), py::arg("medusa_choices") = py::none(),
+            py::arg("decoding_mode") = py::none())
         .def_property("max_beam_width", &tle::ExecutorConfig::getMaxBeamWidth, &tle::ExecutorConfig::setMaxBeamWidth)
         .def_property(
             "scheduler_config", &tle::ExecutorConfig::getSchedulerConfig, &tle::ExecutorConfig::setSchedulerConfig)
@@ -303,7 +334,8 @@ void InitBindings(pybind11::module_& m)
             "peft_cache_config", &tle::ExecutorConfig::getPeftCacheConfig, &tle::ExecutorConfig::setPeftCacheConfig)
         .def_property("logits_post_processor_map", &tle::ExecutorConfig::getLogitsPostProcessorMap,
             &tle::ExecutorConfig::setLogitsPostProcessorMap)
-        .def_property("medusa_choices", &tle::ExecutorConfig::getMedusaChoices, &tle::ExecutorConfig::setMedusaChoices);
+        .def_property("medusa_choices", &tle::ExecutorConfig::getMedusaChoices, &tle::ExecutorConfig::setMedusaChoices)
+        .def_property("decoding_mode", &tle::ExecutorConfig::getDecodingMode, &tle::ExecutorConfig::setDecodingMode);
 
     tensorrt_llm::pybind::executor::Executor::initBindings(m);
 }

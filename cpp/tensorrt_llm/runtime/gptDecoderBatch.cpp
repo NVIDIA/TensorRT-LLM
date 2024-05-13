@@ -110,7 +110,7 @@ GptDecoderBatch::GptDecoderBatch(
     mBatchSlotsAcceptLogits = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<SizeType>::value);
     // use batchSize many entries instead of the usual 1
     dOutput->finishedSum = mBufferManager.emptyTensor(MemoryType::kPINNED, nvSizeType);
-    mFinishedSum = mBufferManager.pinned(ITensor::makeShape({1}), nvSizeType);
+    mFinishedSum = BufferManager::pinned(ITensor::makeShape({1}), nvSizeType);
     // we don't need dOutput->lengths because lengths are passed from outside
     dOutput->cumLogProbs = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
     dOutput->logProbs = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
@@ -160,7 +160,7 @@ void GptDecoderBatch::allocateMedusaBuffers()
 
 void GptDecoderBatch::setup(DecodingMode const& mode, SizeType maxBatchSize, SizeType maxBeamWidth,
     SizeType maxAttentionWindow, SizeType sinkTokenLength, SizeType maxSequenceLength, SizeType maxTokensPerEngineStep,
-    bool fusedDecoder, nvinfer1::DataType dtype, GptModelConfig const& modelConfig)
+    bool fusedDecoder, nvinfer1::DataType dtype, ModelConfig const& modelConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK(maxBatchSize > 0);
@@ -302,7 +302,7 @@ void GptDecoderBatch::setup(DecodingMode const& mode, SizeType maxBatchSize, Siz
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void GptDecoderBatch::setupMedusa(GptModelConfig const& modelConfig)
+void GptDecoderBatch::setupMedusa(ModelConfig const& modelConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -351,14 +351,19 @@ void GptDecoderBatch::newRequest(
     auto const maxBeamWidth = jointOutputIdsShape.d[1];
     auto const beamWidth = samplingConfig.beamWidth;
     TLLM_CHECK_WITH_INFO(beamWidth <= maxBeamWidth,
-        tc::fmtstr("Beam width (%d) must be smaller than maxBeamWidth (%d) passed to decoder setup function.",
+        tc::fmtstr("Beam width (%d) must be smaller than maxBeamWidth (" FMT_DIM ") passed to decoder setup function.",
             beamWidth, maxBeamWidth));
     auto const& requestIds = request.ids;
     auto const inputLength = request.inputLen;
-    auto const maxNewTokens = request.maxNewTokens.value_or(mMaxSequenceLength - inputLength);
-    TLLM_CHECK_WITH_INFO(inputLength + maxNewTokens <= mMaxSequenceLength,
-        tc::fmtstr("Input length (%d) + max new tokens (%d) must be less than max sequence length (%d).", inputLength,
-            maxNewTokens, mMaxSequenceLength));
+    auto const generatedTokensPerEngineStep = request.generatedTokensPerEngineStep;
+    auto const draftTokensPerEngineStep = generatedTokensPerEngineStep - 1;
+    auto const maxNewTokens
+        = request.maxNewTokens.value_or(mMaxSequenceLength - inputLength - draftTokensPerEngineStep);
+
+    TLLM_CHECK_WITH_INFO(inputLength + maxNewTokens + draftTokensPerEngineStep <= mMaxSequenceLength,
+        tc::fmtstr(
+            "Input length (%d) + max new tokens (%d) + draft tokens (%d) must be less than max sequence length (%d).",
+            inputLength, maxNewTokens, draftTokensPerEngineStep, mMaxSequenceLength));
     TLLM_CHECK(requestIds->getDataType() == TRTDataType<TokenIdType>::value);
     auto const endId = request.endId.value_or(-1);
 
@@ -407,7 +412,7 @@ void GptDecoderBatch::newRequest(
                 = bufferCast<SizeType>(*requestWordsList);
             bufferCast<SizeType>(*constPointerCast(jointWordsLens))[batchIdx] = wordsLen;
             // FIXME(nkorobov): this is monotonically growing size
-            maxWordsLen = std::max(wordsLen, maxWordsLen);
+            maxWordsLen = std::max(static_cast<SizeType>(wordsLen), maxWordsLen);
             if (!fusedDecoder)
             {
                 wordsPtrs = ITensor::slice(jointWordsPtrs, batchIdx, localBatchSize);
@@ -498,7 +503,6 @@ void GptDecoderBatch::newRequest(
         dOutput->beamHypotheses.init(manager, endId);
     }
 
-    auto generatedTokensPerEngineStep = request.generatedTokensPerEngineStep;
     // Speculative execution
     if (generatedTokensPerEngineStep > 1)
     {

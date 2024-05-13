@@ -32,7 +32,7 @@ def get_ckpt_without_quatization(model_dir, output_dir):
     run_command(build_args)
 
 
-def get_ckpt_with_ammo_quant(model_dir, output_dir):
+def get_ckpt_with_modelopt_quant(model_dir, output_dir):
     build_args = [_sys.executable, "examples/quantization/quantize.py"] + [
         '--model_dir={}'.format(model_dir),
         '--output_dir={}'.format(output_dir), '--qformat=fp8',
@@ -121,9 +121,9 @@ def build_engines(model_cache: _tp.Optional[str] = None, only_fp8=False):
         )
         # TODO: use dummy scales atm; to re-enable when data is uploaded to the model cache
         # quantized_fp8_model_arg = '--quantized_fp8_model_path=' + \
-        #     str(_pl.Path(model_cache) / 'fp8-quantized-ammo' / 'gptj_tp1_rank0.npz')
+        #     str(_pl.Path(model_cache) / 'fp8-quantized-modelopt' / 'gptj_tp1_rank0.npz')
         fp8_ckpt_path = engine_dir / 'fp8' / tp_pp_dir
-        get_ckpt_with_ammo_quant(hf_dir, fp8_ckpt_path)
+        get_ckpt_with_modelopt_quant(hf_dir, fp8_ckpt_path)
         build_engine(fp8_ckpt_path, engine_dir / 'fp8-plugin' / tp_pp_dir,
                      '--gpt_attention_plugin=float16',
                      '--paged_kv_cache=enable', '--remove_input_padding=enable',

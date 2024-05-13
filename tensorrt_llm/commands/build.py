@@ -25,13 +25,14 @@ from typing import Union
 import torch
 
 from .._common import check_max_num_tokens
-from ..auto_parallel.config import _cluster_infos, infer_cluster_key
+from ..auto_parallel import infer_cluster_config
+from ..auto_parallel.cluster_info import cluster_infos
 from ..builder import BuildConfig, Engine, build
 from ..logger import logger
 from ..lora_manager import LoraBuildConfig
 from ..models import PretrainedConfig
 from ..models.modeling_utils import (WEIGHT_LOADER_MODELS, QuantConfig,
-                                     load_model)
+                                     SpeculativeDecodingMode, load_model)
 from ..plugin import PluginConfig, add_plugin_argument
 from ..quantization import QuantAlgo
 
@@ -104,7 +105,7 @@ def parse_arguments():
         help=
         'Enable horizontal fusion in GatedMLP, reduces layer input traffic and potentially improves performance. '
         'For FP8 PTQ, the downside is slight reduction of accuracy because one of the quantization scaling factors are discarded. '
-        '(An example for reference only: 0.45734 vs 0.45755 for LLaMA-v2 7B using `ammo/examples/hf/instruct_eval/mmlu.py`).'
+        '(An example for reference only: 0.45734 vs 0.45755 for LLaMA-v2 7B using `modelopt/examples/hf/instruct_eval/mmlu.py`).'
     )
     parser.add_argument(
         '--gather_all_token_logits',
@@ -171,6 +172,8 @@ def parse_arguments():
             "mlp_h_to_4h",
             "mlp_gate",
             "mlp_4h_to_h",
+            "cross_attn_q",
+            "cross_attn_v",
         ],
         help=
         "Add lora in which modules. Only be activated when use_lora_plugin is enabled."
@@ -196,10 +199,38 @@ def parse_arguments():
         '--cluster_key',
         type=str,
         default=None,
-        choices=_cluster_infos.keys(),
+        choices=cluster_infos.keys(),
         help=
         'Unique name for target GPU type. Inferred from current GPU type if not specified.'
     )
+    parser.add_argument(
+        '--max_encoder_input_len',
+        type=int,
+        default=1024,
+        help=
+        'Specify max encoder input length when using enc-dec models. Set max_input_len to 1 to start generation from decoder_start_token_id of length 1.'
+    )
+    parser.add_argument(
+        '--visualize_network',
+        default=False,
+        action='store_true',
+        help=
+        'TRT Networks will be exported to ONNX prior to Engine build for debugging. '
+    )
+    parser.add_argument(
+        '--dry_run',
+        default=False,
+        action='store_true',
+        help=
+        'Run through the build process except the actual Engine build for debugging. '
+    )
+    parser.add_argument('--speculative_decoding_mode',
+                        default=None,
+                        choices=[
+                            "draft_tokens_external",
+                            "medusa",
+                        ],
+                        help='Mode of speculative decoding.')
 
     plugin_config_parser = parser.add_argument_group("plugin_config")
     add_plugin_argument(plugin_config_parser)
@@ -209,6 +240,11 @@ def parse_arguments():
         args.gather_context_logits = True
         args.gather_generation_logits = True
 
+    if args.gather_context_logits and args.max_draft_len > 0:
+        raise RuntimeError(
+            "Gather context logits is not support with draft len > 0. "
+            "If want to get the accepted tokens' logits from target model, please just enable gather_generation_logits"
+        )
     return args
 
 
@@ -254,6 +290,7 @@ def build_model(build_config: BuildConfig,
         "StreamingLLM is only supported in the llama model."
     real_rank = rank
 
+    model_config.mapping.gpus_per_node = build_config.auto_parallel_config.gpus_per_node
     if build_config.auto_parallel_config.enabled:
         assert rank < build_config.auto_parallel_config.world_size
         assert model_config.mapping.pp_size == 1 and model_config.mapping.tp_size == 1, \
@@ -281,6 +318,7 @@ def build_model(build_config: BuildConfig,
     # tells the low level build api to only build rank-th shard of the model
     if build_config.auto_parallel_config.enabled:
         model.config.mapping.rank = real_rank
+
     return build(model, build_config)
 
 
@@ -381,6 +419,7 @@ def main():
         'max_lora_rank': args.max_lora_rank,
         'lora_target_modules': args.lora_target_modules,
     }
+    speculative_decoding_mode = SpeculativeDecodingMode.from_arguments(args)
     if args.build_config is None:
         if args.multiple_profiles == "enable" and args.opt_num_tokens is not None:
             raise RuntimeError(
@@ -395,6 +434,10 @@ def main():
             remove_input_padding=(args.remove_input_padding == "enable"),
             enable_context_fmha=(args.context_fmha == "enable"),
             tokens_per_block=args.tokens_per_block)
+        if args.cluster_key is not None:
+            cluster_config = dict(cluster_key=args.cluster_key)
+        else:
+            cluster_config = infer_cluster_config()
         build_config = BuildConfig.from_dict(
             {
                 'max_input_len': args.max_input_len,
@@ -413,6 +456,7 @@ def main():
                 'profiling_verbosity': args.profiling_verbosity,
                 'enable_debug_output': args.enable_debug_output,
                 'max_draft_len': args.max_draft_len,
+                'speculative_decoding_mode': speculative_decoding_mode,
                 'input_timing_cache': args.input_timing_cache,
                 'output_timing_cache': args.output_timing_cache,
                 'auto_parallel_config': {
@@ -420,9 +464,6 @@ def main():
                     args.auto_parallel,
                     'gpus_per_node':
                     args.gpus_per_node,
-                    'cluster_key':
-                    args.cluster_key
-                    or infer_cluster_key(allow_fallback=args.auto_parallel > 1),
                     'sharded_io_allowlist': [
                         'past_key_value_\\d+',
                         'present_key_value_\\d*',
@@ -430,7 +471,11 @@ def main():
                     'same_buffer_io': {
                         'past_key_value_(\\d+)': 'present_key_value_\\1',
                     },
+                    **cluster_config,
                 },
+                'dry_run': args.dry_run,
+                'visualize_network': args.visualize_network,
+                'max_encoder_input_len': args.max_encoder_input_len,
             },
             plugin_config=plugin_config)
     else:

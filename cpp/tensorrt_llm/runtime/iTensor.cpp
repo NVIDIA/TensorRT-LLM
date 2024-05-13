@@ -40,7 +40,7 @@ ITensor::UniquePtr ITensor::view(IBuffer::SharedPtr buffer, nvinfer1::Dims const
     return std::make_unique<TensorView>(std::move(buffer), 0, size, dims);
 }
 
-nvinfer1::Dims ITensor::makeShape(std::initializer_list<SizeType> const& dims)
+nvinfer1::Dims ITensor::makeShape(std::initializer_list<ITensor::DimType> const& dims)
 {
     TLLM_CHECK_WITH_INFO(dims.size() <= nvinfer1::Dims::MAX_DIMS, "Number of dimensions is too large");
     nvinfer1::Dims shape{};

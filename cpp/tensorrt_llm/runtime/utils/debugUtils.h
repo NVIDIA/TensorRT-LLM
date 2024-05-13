@@ -16,14 +16,10 @@
 #pragma once
 
 #include "tensorrt_llm/runtime/bufferManager.h"
-#include "tensorrt_llm/runtime/runtimeKernels.h"
 
-namespace tensorrt_llm::runtime
-{
-namespace utils
+namespace tensorrt_llm::runtime::utils
 {
 
-bool tensorHasNan(IBuffer const& tensor, BufferManager& manager);
+bool tensorHasNan(IBuffer const& tensor, BufferManager const& manager);
 
 }
-} // namespace tensorrt_llm::runtime

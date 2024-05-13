@@ -7,19 +7,19 @@ from typing import List
 
 import pytest
 import torch
+from parameterized import parameterized
 from transformers import AutoTokenizer
 
 from tensorrt_llm.hlapi.llm import (LLM, KvCacheConfig, ModelConfig,
-                                    SamplingConfig, StreamingLLMParam,
-                                    TokenizerBase)
+                                    ParallelConfig, SamplingConfig,
+                                    StreamingLLMParam, TokenizerBase)
 from tensorrt_llm.hlapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.hlapi.utils import get_total_gpu_memory
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root
-from utils.util import force_ampere
+from utils.util import force_ampere, unittest_name_func
 
-from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.llama.model import LLaMAForCausalLM
 
 
@@ -32,10 +32,17 @@ def get_model_path(model_name):
 
 default_model_name = "llama-models/llama-7b-hf"
 mixtral_model_name = "Mixtral-8x7B-v0.1"
+tinyllama_model_name = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 
 llama_model_path = get_model_path(default_model_name)
 llm_engine_dir = os.environ.get('LLM_ENGINE_DIR', './tmp.engine')
 prompts = ["A B C"]
+output_text_refs = {
+    default_model_name:
+    "<s> A B C D E F G H I J K L M N O P Q R S T U V W X Y Z\nA B C D E F G H",
+    tinyllama_model_name:
+    "<s> A B C D E F G H I J K L M N O P Q R S T U V W X Y Z\n\nI hope this helps! Let me",
+}
 
 cur_dir = os.path.dirname(os.path.abspath(__file__))
 models_root = os.path.join(cur_dir, '../../models')
@@ -49,7 +56,7 @@ def test_llm_loading_from_hf():
     config = ModelConfig(llama_model_path)
     # The performance-related flags are turned on eagerly to check the functionality
 
-    devices = config.parallel_config.get_devices()
+    devices = config.parallel_config.devices
     if torch.cuda.get_device_properties(devices[0]).major >= 8:
         # only available for A100 or newer GPUs
         config.multi_block_mode = True
@@ -66,7 +73,7 @@ def test_llm_loading_from_hf():
 
     for output in llm.generate(prompts):
         print(output)
-        assert output.text == "<s> A B C D E F G H I J K L M N O P Q R S T U V W X Y Z\nA B C D E F G H"
+        assert output.text == output_text_refs[default_model_name]
 
 
 @force_ampere
@@ -90,36 +97,31 @@ def test_llm_loading_from_ckpt():
 
         for output in llm.generate(prompts):
             print(output)
-            assert output.text == "<s> A B C D E F G H I J K L M N O P Q R S T U V W X Y Z\nA B C D E F G H"
+            assert output.text == output_text_refs[default_model_name]
 
 
-@skip_single_gpu
-def test_llm_loading_from_ckpt_for_tp2():
-    tokenizer = TransformersTokenizer.from_pretrained(llama_model_path)
-    assert tokenizer is not None
-    tp_size = 2
-    with tempfile.TemporaryDirectory() as ckpt_dir:
-        for rank in range(tp_size):
-            mapping = Mapping(world_size=tp_size, tp_size=tp_size, rank=rank)
-            llama = LLaMAForCausalLM.from_hugging_face(llama_model_path,
-                                                       mapping=mapping)
-            llama.save_checkpoint(ckpt_dir, save_config=(rank == 0))
-            del llama
+def llm_end2end_cases():
+    yield ({}, )  # Default options
+    yield ({'trt_strongly_typed': False}, )
 
-        config = ModelConfig(ckpt_dir)
-        assert config.parallel_config.tp_size == tp_size
-        llm = LLM(
-            config,
-            tokenizer=tokenizer,
-            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
-        )
 
-        sampling_config = llm.get_default_sampling_config()
-        assert sampling_config is not None
+@parameterized.expand(llm_end2end_cases(), name_func=unittest_name_func)
+def test_llm_end2end(llm_additional_options):
+    model_path = get_model_path(tinyllama_model_name)
+    config = ModelConfig(model_path)
+    llm = LLM(config, **llm_additional_options)
 
-        for output in llm.generate(prompts):
-            print(output)
-            assert output.text == "<s> A B C D E F G H I J K L M N O P Q R S T U V W X Y Z\nA B C D E F G H"
+    if 'trt_strongly_typed' in llm_additional_options:
+        assert llm._build_config.strongly_typed == llm_additional_options.pop(
+            'trt_strongly_typed')
+    else:
+        assert llm._build_config.strongly_typed is True
+
+    assert len(llm_additional_options) == 0
+
+    for output in llm.generate(prompts):
+        print(output)
+        assert output.text == output_text_refs[tinyllama_model_name]
 
 
 class MyTokenizer(TokenizerBase):
@@ -182,37 +184,6 @@ def test_llm_without_tokenizer():
         print(output)
 
 
-@skip_single_gpu
-def test_llm_build_engine_for_tp2(model_name=default_model_name):
-    config = ModelConfig(get_model_path(model_name))
-    config.parallel_config.tp_size = 2
-    llm = LLM(
-        config,
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
-    )
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        llm.save(tmpdir)
-
-
-@skip_single_gpu
-@pytest.mark.parametrize("use_auto_parallel", [True, False],
-                         ids=["enable_auto_parallel", "disable_auto_parallel"])
-def test_llm_generate_for_tp2(use_auto_parallel):
-    config = ModelConfig(llama_model_path)
-    if use_auto_parallel:
-        config.parallel_config.world_size = 2
-        config.parallel_config.auto_parallel = True
-    else:
-        config.parallel_config.tp_size = 2
-    llm = LLM(
-        config,
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
-    )
-    for output in llm.generate(prompts):
-        print(output)
-
-
 # TODO[chunweiy]: Move mixtral test to the e2e test
 def is_memory_enough_for_mixtral():
     if torch.cuda.device_count() < 2:
@@ -225,39 +196,27 @@ def is_memory_enough_for_mixtral():
         return False
 
 
-@skip_single_gpu
-@pytest.mark.skipif(not is_memory_enough_for_mixtral(),
-                    reason="The test needs at least 160GB memory, skipping")
-def test_llm_generate_mixtral_for_tp2():
-    config = ModelConfig(get_model_path(mixtral_model_name))
-    config.parallel_config.tp_size = 2
-    llm = LLM(
-        config,
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
-    )
-    for output in llm.generate(prompts):
-        print(output)
-
-
 def test_llm_generate_async(model_name=default_model_name,
                             tp_size: int = 1,
-                            use_auto_parallel: bool = False):
+                            use_auto_parallel: bool = False,
+                            tokenizer=None):
     if "Mixtral" in model_name and use_auto_parallel:
         pytest.skip("Auto parallel is not supported for Mixtral models")
     config = ModelConfig(llama_model_path)
     if use_auto_parallel:
-        config.parallel_config.world_size = tp_size
         config.parallel_config.auto_parallel = True
+        config.parallel_config.world_size = tp_size
     else:
         config.parallel_config.tp_size = tp_size
 
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
-    devices = config.parallel_config.get_devices()
+    devices = config.parallel_config.devices
     if torch.cuda.get_device_properties(devices[0]).major >= 8:
         kv_cache_config.enable_block_reuse = True
 
     llm = LLM(
         config,
+        tokenizer=tokenizer,
         kv_cache_config=kv_cache_config,
     )
 
@@ -334,15 +293,6 @@ def test_llm_generate_async(model_name=default_model_name,
     test_future(streaming=False)
     test_future_async()
     test_non_streaming_usage_wait()
-
-
-@skip_single_gpu
-@pytest.mark.parametrize("use_auto_parallel", [True, False],
-                         ids=["enable_auto_parallel", "disable_auto_parallel"])
-def test_llm_generate_async_tp2(use_auto_parallel):
-    test_llm_generate_async(default_model_name,
-                            tp_size=2,
-                            use_auto_parallel=use_auto_parallel)
 
 
 @force_ampere
@@ -462,13 +412,21 @@ def test_sampling_config():
     assert sc0.max_new_tokens == 1024
 
 
+def test_parallel_config():
+    config = ParallelConfig()
+    config.tp_size = 2
+    config.pp_size = 2
+    assert config.world_size == 4
+    config.world_size = 4  # should not raise exception
+
+
 # TODO[chunweiy]: Add test for loading inmemory model
 
 if __name__ == '__main__':
+    test_llm_loading_from_hf()
+    test_llm_generate_async()
     test_llm_without_tokenizer()
     test_generate_with_streaming_llm()
     test_generate_with_sampling_config()
     test_llm_loading_from_hf()
-    test_llm_generate_async_tp2(use_auto_parallel=True)
-    test_llm_generate_async_tp2(use_auto_parallel=False)
     test_sampling_config()

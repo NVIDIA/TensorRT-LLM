@@ -26,8 +26,8 @@ def parse_arguments():
     parser.add_argument(
         '--output_dir',
         type=Path,
-        default='baichuan_tllm_checkpoint',
-        help='The path to save the baichuan TensorRT-LLM checkpoint')
+        default='mamba_tllm_checkpoint',
+        help='The path to save the mamba TensorRT-LLM checkpoint')
     parser.add_argument('--log_level', type=str, default='info')
     args = parser.parse_args()
     return args
@@ -227,6 +227,7 @@ def main():
         'logits_dtype': 'float32',
         'hidden_size': hf_config.d_model,
         'num_hidden_layers': hf_config.n_layer,
+        'layer_types': ['recurrent'],
         'vocab_size': vocab_size,
         'ssm_cfg': MambaParameters(**hf_config.ssm_cfg).__dict__,
         'rms_norm': hf_config.rms_norm,

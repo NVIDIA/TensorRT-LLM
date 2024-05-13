@@ -18,6 +18,7 @@
 #include "tensorrt_llm/kernels/banRepeatNgram.h"
 
 using namespace tensorrt_llm::common;
+using namespace tensorrt_llm::runtime;
 
 namespace tensorrt_llm
 {
@@ -25,9 +26,10 @@ namespace kernels
 {
 
 template <typename T>
-__global__ void ban_repeat_ngram(T* logits, int const** output_ids_buf, FinishedState const* finished_buf,
-    int const** parent_ids_buf, int const* batch_slots, int batch_size, int beam_width, int max_seq_len,
-    int const* no_repeat_ngram_size_buf, int vocab_size_padded, int const* sequence_lengths)
+__global__ void ban_repeat_ngram(T* logits, TokenIdType const** output_ids_buf, FinishedState const* finished_buf,
+    SizeType32 const** parent_ids_buf, SizeType32 const* batch_slots, SizeType batch_size, SizeType beam_width,
+    SizeType max_seq_len, SizeType32 const* no_repeat_ngram_size_buf, SizeType vocab_size_padded,
+    SizeType32 const* sequence_lengths)
 {
     /**
      * Find subsequences that match the last (ngram_size - 1) generated tokens. The next-tokens of those matching
@@ -46,13 +48,13 @@ __global__ void ban_repeat_ngram(T* logits, int const** output_ids_buf, Finished
      * in-bound positions only. For leftside out-of-boundary tokens, access by global memory.
      */
 
-    int const output_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int const local_batch_idx = blockIdx.y / beam_width;
+    auto const output_idx = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
+    auto const local_batch_idx = blockIdx.y / beam_width;
     auto const batch_slot = batch_slots != nullptr ? batch_slots[local_batch_idx] : local_batch_idx;
-    int const beam_idx = blockIdx.y % beam_width;
+    auto const beam_idx = blockIdx.y % beam_width;
     bool const beam_search = beam_width > 1;
-    int const no_repeat_ngram_size = no_repeat_ngram_size_buf[batch_slot];
-    int const step = sequence_lengths[batch_slot];
+    auto const no_repeat_ngram_size = no_repeat_ngram_size_buf[batch_slot];
+    auto const step = sequence_lengths[batch_slot];
 
     // case 1: ngram_size == 0 --> this means no ngram limit
     // case 2: generated length must be greater than ngram_size to do ngram check
@@ -69,22 +71,22 @@ __global__ void ban_repeat_ngram(T* logits, int const** output_ids_buf, Finished
 
     // shared mem layout: per-thread token that each thread is mapped to, plus (ngram_size - 1) extra tokens beyond
     // block boundary, plus (ngram_size - 1) most recent generated tokens in the beam
-    extern __shared__ int shared_tokens[];
-    int shared_tokens_length = blockDim.x + no_repeat_ngram_size - 1;
-    int* last_tokens = &shared_tokens[shared_tokens_length];
-    int last_tokens_length = no_repeat_ngram_size - 1;
+    extern __shared__ TokenIdType shared_tokens[];
+    auto const shared_tokens_length = blockDim.x + no_repeat_ngram_size - 1;
+    auto* last_tokens = &shared_tokens[shared_tokens_length];
+    auto const last_tokens_length = no_repeat_ngram_size - 1;
 
     // retrieve the entire beam by backtracking from last token to current token  (in reverse order)
     // single thread vs parallel thread is equivalent as it's bound by the longest iteration
     if (threadIdx.x == 0)
     {
-        int parent_id = beam_idx;
-        int start_record_idx = min(output_idx + shared_tokens_length, (int) step);
-        int shared_token_idx = start_record_idx == step ? step - output_idx - 1 : shared_tokens_length - 1;
-        int last_token_idx = last_tokens_length - 1;
+        auto parent_id = beam_idx;
+        auto const start_record_idx = min(output_idx + shared_tokens_length, static_cast<SizeType32>(step));
+        auto shared_token_idx = start_record_idx == step ? step - output_idx - 1 : shared_tokens_length - 1;
+        auto last_token_idx = last_tokens_length - 1;
         // write to shared mem in reverse order; boundary condition when thread block covers more than step
 
-        for (int curr_idx = step - 1; curr_idx >= output_idx; curr_idx--)
+        for (auto curr_idx = step - 1; curr_idx >= output_idx; curr_idx--)
         {
             if (last_token_idx >= 0)
             {
@@ -114,7 +116,7 @@ __global__ void ban_repeat_ngram(T* logits, int const** output_ids_buf, Finished
     bool ban_ngram = true;
 
     // ngram check (in regular order)
-    for (int ngram_idx = 0; ngram_idx < no_repeat_ngram_size - 1; ngram_idx++)
+    for (SizeType32 ngram_idx = 0; ngram_idx < no_repeat_ngram_size - 1; ngram_idx++)
     {
         if (shared_tokens[threadIdx.x + ngram_idx] != last_tokens[ngram_idx])
         {
@@ -126,16 +128,18 @@ __global__ void ban_repeat_ngram(T* logits, int const** output_ids_buf, Finished
     // erase banned next token's prob as -INF
     if (ban_ngram)
     {
-        int banned_token = shared_tokens[threadIdx.x + no_repeat_ngram_size - 1]; // ban the last token in the ngram
+        auto const banned_token
+            = shared_tokens[threadIdx.x + no_repeat_ngram_size - 1]; // ban the last token in the ngram
         logits[local_batch_idx * beam_width * vocab_size_padded + beam_idx * vocab_size_padded + banned_token]
             = static_cast<T>(-INFINITY); // note: "logits" passed in is already with batchxbeam offset
     }
 }
 
 template <typename T>
-void invokeBanRepeatNgram(T* logits, int const** output_ids_buf, FinishedState const* finished_buf,
-    int const** parent_ids_buf, int const* batch_slot, int const* sequence_lengths, int batch_size, int beam_width,
-    int max_seq_len, int const* no_repeat_ngram_size_buf, int vocab_size_padded, size_t max_step, cudaStream_t stream)
+void invokeBanRepeatNgram(T* logits, TokenIdType const** output_ids_buf, FinishedState const* finished_buf,
+    SizeType32 const** parent_ids_buf, SizeType32 const* batch_slot, SizeType32 const* sequence_lengths,
+    SizeType batch_size, SizeType beam_width, SizeType max_seq_len, SizeType32 const* no_repeat_ngram_size_buf,
+    SizeType vocab_size_padded, SizeType max_step, cudaStream_t stream)
 {
     // each input in the local batch can have different no_repeat_ngram_size. Use max for shmem allocation
     // getting the max of current batch and allocate shmem as needed is ideal. But here the ngram_buf is on GPU, while
@@ -145,7 +149,7 @@ void invokeBanRepeatNgram(T* logits, int const** output_ids_buf, FinishedState c
 
     // step (current generated length, except start token) is from 1 ~ max_seq_len
     dim3 block, grid;
-    constexpr size_t max_blocks{256};
+    constexpr SizeType max_blocks{256};
     block.x = min(((max_step + 32 - 1) / 32) * 32, max_blocks);
     grid.x = (max_step + block.x - 1) / block.x;
     grid.y = batch_size * beam_width;
@@ -159,9 +163,10 @@ void invokeBanRepeatNgram(T* logits, int const** output_ids_buf, FinishedState c
 }
 
 #define INVOKE_BAN_REPEAT_NGRAM(T)                                                                                     \
-    template void invokeBanRepeatNgram(T* logits, const int** output_ids_buf, const FinishedState* finished_buf,       \
-        const int** parent_ids_buf, const int* batch_slot, const int* sequence_lengths, int batch_size,                \
-        int beam_width, int max_seq_len, const int* no_repeat_ngram_size_buf, int vocab_size_padded, size_t max_step,  \
+    template void invokeBanRepeatNgram(T* logits, TokenIdType const** output_ids_buf,                                  \
+        const FinishedState* finished_buf, SizeType32 const** parent_ids_buf, SizeType32 const* batch_slot,            \
+        SizeType32 const* sequence_lengths, SizeType batch_size, SizeType beam_width, SizeType max_seq_len,            \
+        SizeType32 const* no_repeat_ngram_size_buf, SizeType vocab_size_padded, SizeType max_step,                     \
         cudaStream_t stream);
 
 INVOKE_BAN_REPEAT_NGRAM(float)
