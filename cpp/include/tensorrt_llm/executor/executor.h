@@ -46,51 +46,51 @@ class SamplingConfig
 public:
     /// @brief Constructor for SamplingConfig
     /// See description of parameters below
-    explicit SamplingConfig(SizeType beamWidth = 1, std::optional<SizeType> const& topK = std::nullopt,
+    explicit SamplingConfig(SizeType32 beamWidth = 1, std::optional<SizeType32> const& topK = std::nullopt,
         std::optional<FloatType> const& topP = std::nullopt, std::optional<FloatType> const& topPMin = std::nullopt,
-        std::optional<SizeType> const& topPResetIds = std::nullopt,
+        std::optional<TokenIdType> const& topPResetIds = std::nullopt,
         std::optional<FloatType> const& topPDecay = std::nullopt,
         std::optional<RandomSeedType> const& randomSeed = std::nullopt,
         std::optional<FloatType> const& temperature = std::nullopt,
-        std::optional<SizeType> const& minLength = std::nullopt,
+        std::optional<SizeType32> const& minLength = std::nullopt,
         std::optional<FloatType> const& beamSearchDiversityRate = std::nullopt,
         std::optional<FloatType> const& repetitionPenalty = std::nullopt,
         std::optional<FloatType> const& presencePenalty = std::nullopt,
         std::optional<FloatType> const& frequencyPenalty = std::nullopt,
         std::optional<FloatType> const& lengthPenalty = std::nullopt,
-        std::optional<SizeType> const& earlyStopping = std::nullopt);
+        std::optional<SizeType32> const& earlyStopping = std::nullopt);
 
     bool operator==(SamplingConfig const& other) const;
 
-    [[nodiscard]] SizeType getBeamWidth() const;
-    [[nodiscard]] std::optional<SizeType> getTopK() const;
+    [[nodiscard]] SizeType32 getBeamWidth() const;
+    [[nodiscard]] std::optional<SizeType32> getTopK() const;
     [[nodiscard]] std::optional<FloatType> getTopP() const;
     [[nodiscard]] std::optional<FloatType> getTopPMin() const;
-    [[nodiscard]] std::optional<SizeType> getTopPResetIds() const;
+    [[nodiscard]] std::optional<SizeType32> getTopPResetIds() const;
     [[nodiscard]] std::optional<FloatType> getTopPDecay() const;
     [[nodiscard]] std::optional<RandomSeedType> getRandomSeed() const;
     [[nodiscard]] std::optional<FloatType> getTemperature() const;
-    [[nodiscard]] std::optional<SizeType> getMinLength() const;
+    [[nodiscard]] std::optional<SizeType32> getMinLength() const;
     [[nodiscard]] std::optional<FloatType> getBeamSearchDiversityRate() const;
     [[nodiscard]] std::optional<FloatType> getRepetitionPenalty() const;
     [[nodiscard]] std::optional<FloatType> getPresencePenalty() const;
     [[nodiscard]] std::optional<FloatType> getFrequencyPenalty() const;
     [[nodiscard]] std::optional<FloatType> getLengthPenalty() const;
-    [[nodiscard]] std::optional<SizeType> getEarlyStopping() const;
+    [[nodiscard]] std::optional<SizeType32> getEarlyStopping() const;
 
 private:
     friend class Serialization;
 
     /// @brief The beam width. Default is 1 which disables beam search.
-    SizeType mBeamWidth;
+    SizeType32 mBeamWidth;
     /// @brief Controls number of logits to sample from. Default is 0 (all logits).
-    std::optional<SizeType> mTopK;
+    std::optional<SizeType32> mTopK;
     /// @brief Controls the top-P probability to sample from. Default is 0.f
     std::optional<FloatType> mTopP;
     /// @brief Controls decay in the top-P algorithm. topPMin is lower-bound. Default is 1.e-6.
     std::optional<FloatType> mTopPMin;
     /// @brief Controls decay in the top-P algorithm. Indicates where to reset the decay. Default is 1.
-    std::optional<SizeType> mTopPResetIds;
+    std::optional<TokenIdType> mTopPResetIds;
     /// @brief Controls decay in the top-P algorithm. The decay value. Default is 1.f
     std::optional<FloatType> mTopPDecay;
     /// @brief Controls the random seed used by the random number generator in sampling
@@ -98,7 +98,7 @@ private:
     /// @brief Controls the modulation of logits when sampling new tokens. It can have values > 0.f. Default is 1.0f
     std::optional<FloatType> mTemperature;
     /// @brief Lower bound on the number of tokens to generate. Values < 1 have no effect. Default is 1.
-    std::optional<SizeType> mMinLength;
+    std::optional<SizeType32> mMinLength;
     /// @brief Controls the diversity in beam search.
     std::optional<FloatType> mBeamSearchDiversityRate;
     /// @brief Used to penalize tokens based on how often they appear in the sequence. It can have any value > 0.f.
@@ -114,7 +114,7 @@ private:
     std::optional<FloatType> mLengthPenalty;
     /// @brief Controls whether the generation process finishes once beamWidth sentences are generated (ends with
     /// end_token)
-    std::optional<SizeType> mEarlyStopping;
+    std::optional<SizeType32> mEarlyStopping;
 };
 
 /// @brief Configuration that controls the outputs of a Result
@@ -214,9 +214,9 @@ public:
     /// @param loraConfig The LoRA configuration
     /// @param logitsPostProcessorName The logits postprocessor name. Must correspond to one of the logits postprocessor
     /// name provided to the ExecutorConfig.
-    Request(VecTokens inputTokenIds, SizeType maxNewTokens, bool streaming = false,
+    Request(VecTokens inputTokenIds, SizeType32 maxNewTokens, bool streaming = false,
         SamplingConfig const& samplingConfig = SamplingConfig(), OutputConfig const& outputConfig = OutputConfig(),
-        std::optional<SizeType> const& endId = std::nullopt, std::optional<SizeType> const& padId = std::nullopt,
+        std::optional<SizeType32> const& endId = std::nullopt, std::optional<SizeType32> const& padId = std::nullopt,
         std::optional<std::list<VecTokens>> badWords = std::nullopt,
         std::optional<std::list<VecTokens>> stopWords = std::nullopt,
         std::optional<Tensor> embeddingBias = std::nullopt,
@@ -232,12 +232,12 @@ public:
     ~Request();
 
     [[nodiscard]] VecTokens getInputTokenIds() const;
-    [[nodiscard]] SizeType getMaxNewTokens() const;
+    [[nodiscard]] SizeType32 getMaxNewTokens() const;
     [[nodiscard]] bool getStreaming() const;
     [[nodiscard]] SamplingConfig getSamplingConfig() const;
     [[nodiscard]] OutputConfig getOutputConfig() const;
-    [[nodiscard]] std::optional<SizeType> getEndId() const;
-    [[nodiscard]] std::optional<SizeType> getPadId() const;
+    [[nodiscard]] std::optional<SizeType32> getEndId() const;
+    [[nodiscard]] std::optional<SizeType32> getPadId() const;
     [[nodiscard]] std::optional<std::list<VecTokens>> getBadWords() const;
     [[nodiscard]] std::optional<std::list<VecTokens>> getStopWords() const;
     [[nodiscard]] std::optional<Tensor> getEmbeddingBias() const;
@@ -249,8 +249,8 @@ public:
     void setStreaming(bool streaming);
     void setSamplingConfig(SamplingConfig const& config);
     void setOutputConfig(OutputConfig const& outputConfig);
-    void setEndId(SizeType endId);
-    void setPadId(SizeType padId);
+    void setEndId(SizeType32 endId);
+    void setPadId(SizeType32 padId);
     void setBadWords(std::list<VecTokens> const& badWords);
     void setStopWords(std::list<VecTokens> const& stopWords);
     void setEmbeddingBias(Tensor const& embeddingBias);
@@ -324,31 +324,38 @@ private:
 class SchedulerConfig
 {
 public:
-    explicit SchedulerConfig(SchedulerPolicy policy = SchedulerPolicy::kGUARANTEED_NO_EVICT);
+    explicit SchedulerConfig(
+        CapacitySchedulerPolicy capacitySchedulerPolicy = CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT,
+        std::optional<ContextChunkingPolicy> contextChunkingPolicy = std::nullopt);
 
-    [[nodiscard]] SchedulerPolicy getPolicy() const;
+    [[nodiscard]] CapacitySchedulerPolicy getCapacitySchedulerPolicy() const;
+
+    [[nodiscard]] std::optional<ContextChunkingPolicy> getContextChunkingPolicy() const;
 
 private:
     friend class Serialization;
 
-    /// @brief The scheduler policy. See SchedulerPolicy.
-    SchedulerPolicy mPolicy;
+    /// @brief The capacity scheduler policy. See CapacitySchedulerPolicy.
+    CapacitySchedulerPolicy mCapacitySchedulerPolicy;
+
+    /// @brief The context chunking policy. See ContextChunkingPolicy.
+    std::optional<ContextChunkingPolicy> mContextChunkingPolicy;
 };
 
 /// @brief Configuration class for the KV cache
 class KvCacheConfig
 {
 public:
-    explicit KvCacheConfig(bool enableBlockReuse = false, std::optional<SizeType> const& maxTokens = std::nullopt,
-        std::optional<SizeType> const& maxAttentionWindow = std::nullopt,
-        std::optional<SizeType> const& sinkTokenLength = std::nullopt,
+    explicit KvCacheConfig(bool enableBlockReuse = false, std::optional<SizeType32> const& maxTokens = std::nullopt,
+        std::optional<SizeType32> const& maxAttentionWindow = std::nullopt,
+        std::optional<SizeType32> const& sinkTokenLength = std::nullopt,
         std::optional<FloatType> const& freeGpuMemoryFraction = std::nullopt,
         std::optional<size_t> const& hostCacheSize = std::nullopt, bool onboardBlocks = true);
 
     [[nodiscard]] bool getEnableBlockReuse() const;
-    [[nodiscard]] std::optional<SizeType> getMaxTokens() const;
-    [[nodiscard]] std::optional<SizeType> getMaxAttentionWindow() const;
-    [[nodiscard]] std::optional<SizeType> getSinkTokenLength() const;
+    [[nodiscard]] std::optional<SizeType32> getMaxTokens() const;
+    [[nodiscard]] std::optional<SizeType32> getMaxAttentionWindow() const;
+    [[nodiscard]] std::optional<SizeType32> getSinkTokenLength() const;
     [[nodiscard]] std::optional<FloatType> getFreeGpuMemoryFraction() const;
     [[nodiscard]] std::optional<size_t> getHostCacheSize() const;
     [[nodiscard]] bool getOnboardBlocks() const;
@@ -362,14 +369,14 @@ private:
     /// @brief The maximum number of tokens that should be stored in the KV cache
     /// If both mMaxTokens and mFreeGpuMemoryFraction are specified, memory corresponding to the minimum will be
     /// allocated.
-    std::optional<SizeType> mMaxTokens;
+    std::optional<SizeType32> mMaxTokens;
 
     /// @brief Size of the attention window for each sequence. Only the last mMaxAttentionWindow tokens of each sequence
     /// will be stored in the KV cache.
-    std::optional<SizeType> mMaxAttentionWindow;
+    std::optional<SizeType32> mMaxAttentionWindow;
 
     /// @brief Number of sink tokens (tokens to always keep in attention window)
-    std::optional<SizeType> mSinkTokenLength;
+    std::optional<SizeType32> mSinkTokenLength;
 
     /// @brief The fraction of GPU memory fraction that should be allocated for the KV cache. Default is 90%.
     /// If both mMaxTokens and mFreeGpuMemoryFraction are specified, memory corresponding to the minimum will be
@@ -384,9 +391,9 @@ private:
     bool mOnboardBlocks;
 };
 
-SizeType const kDefaultIterStatsMaxIterations = 1000;
+SizeType32 const kDefaultIterStatsMaxIterations = 1000;
 // Per request stats may have additional overhead due to going through all requests. Turned off by default.
-SizeType const kDefaultRequestStatsMaxIterations = 0;
+SizeType32 const kDefaultRequestStatsMaxIterations = 0;
 
 class OrchestratorConfig
 {
@@ -421,20 +428,20 @@ public:
     /// model. The first participant is considered to be the leader.
     explicit ParallelConfig(CommunicationType commType = CommunicationType::kMPI,
         CommunicationMode commMode = CommunicationMode::kLEADER,
-        std::optional<std::vector<SizeType>> deviceIds = std::nullopt,
-        std::optional<std::vector<SizeType>> participantIds = std::nullopt,
+        std::optional<std::vector<SizeType32>> deviceIds = std::nullopt,
+        std::optional<std::vector<SizeType32>> participantIds = std::nullopt,
         std::optional<OrchestratorConfig> const& orchestratorConfig = std::nullopt);
 
     [[nodiscard]] CommunicationType getCommunicationType() const;
     [[nodiscard]] CommunicationMode getCommunicationMode() const;
-    [[nodiscard]] std::optional<std::vector<SizeType>> getDeviceIds() const;
-    [[nodiscard]] std::optional<std::vector<SizeType>> getParticipantIds() const;
+    [[nodiscard]] std::optional<std::vector<SizeType32>> getDeviceIds() const;
+    [[nodiscard]] std::optional<std::vector<SizeType32>> getParticipantIds() const;
     [[nodiscard]] std::optional<OrchestratorConfig> getOrchestratorConfig() const;
 
     void setCommunicationType(CommunicationType type);
     void setCommunicationMode(CommunicationMode mode);
-    void setDeviceIds(std::vector<SizeType> const& deviceIds);
-    void setParticipantIds(std::vector<SizeType> const& participantIds);
+    void setDeviceIds(std::vector<SizeType32> const& deviceIds);
+    void setParticipantIds(std::vector<SizeType32> const& participantIds);
     void setOrchestratorConfig(OrchestratorConfig const& orchestratorConfig);
 
 private:
@@ -447,10 +454,10 @@ private:
     CommunicationMode mCommMode;
 
     /// @brief The GPU device ids to use for executing this model
-    std::optional<std::vector<SizeType>> mDeviceIds;
+    std::optional<std::vector<SizeType32>> mDeviceIds;
 
     /// @brief The participant ids (MPI ranks for example) used for executing this model
-    std::optional<std::vector<SizeType>> mParticipantIds;
+    std::optional<std::vector<SizeType32>> mParticipantIds;
 
     /// @brief Optional orchestrator configuration
     std::optional<OrchestratorConfig> mOrchestratorConfig;
@@ -460,23 +467,23 @@ private:
 class PeftCacheConfig
 {
 public:
-    explicit PeftCacheConfig(SizeType numHostModuleLayer = 0, SizeType numDeviceModuleLayer = 0,
-        SizeType optimalAdapterSize = 8, SizeType maxAdapterSize = 64, SizeType numPutWorkers = 1,
-        SizeType numEnsureWorkers = 1, SizeType numCopyStreams = 1, SizeType maxPagesPerBlockHost = 24,
-        SizeType maxPagesPerBlockDevice = 8, std::optional<float> const& deviceCachePercent = std::nullopt,
+    explicit PeftCacheConfig(SizeType32 numHostModuleLayer = 0, SizeType32 numDeviceModuleLayer = 0,
+        SizeType32 optimalAdapterSize = 8, SizeType32 maxAdapterSize = 64, SizeType32 numPutWorkers = 1,
+        SizeType32 numEnsureWorkers = 1, SizeType32 numCopyStreams = 1, SizeType32 maxPagesPerBlockHost = 24,
+        SizeType32 maxPagesPerBlockDevice = 8, std::optional<float> const& deviceCachePercent = std::nullopt,
         std::optional<size_t> const& hostCacheSize = std::nullopt);
 
     bool operator==(PeftCacheConfig const& other) const;
 
-    [[nodiscard]] SizeType getNumHostModuleLayer() const;
-    [[nodiscard]] SizeType getNumDeviceModuleLayer() const;
-    [[nodiscard]] SizeType getOptimalAdapterSize() const;
-    [[nodiscard]] SizeType getMaxAdapterSize() const;
-    [[nodiscard]] SizeType getNumPutWorkers() const;
-    [[nodiscard]] SizeType getNumEnsureWorkers() const;
-    [[nodiscard]] SizeType getNumCopyStreams() const;
-    [[nodiscard]] SizeType getMaxPagesPerBlockHost() const;
-    [[nodiscard]] SizeType getMaxPagesPerBlockDevice() const;
+    [[nodiscard]] SizeType32 getNumHostModuleLayer() const;
+    [[nodiscard]] SizeType32 getNumDeviceModuleLayer() const;
+    [[nodiscard]] SizeType32 getOptimalAdapterSize() const;
+    [[nodiscard]] SizeType32 getMaxAdapterSize() const;
+    [[nodiscard]] SizeType32 getNumPutWorkers() const;
+    [[nodiscard]] SizeType32 getNumEnsureWorkers() const;
+    [[nodiscard]] SizeType32 getNumCopyStreams() const;
+    [[nodiscard]] SizeType32 getMaxPagesPerBlockHost() const;
+    [[nodiscard]] SizeType32 getMaxPagesPerBlockDevice() const;
     [[nodiscard]] std::optional<float> getDeviceCachePercent() const;
     [[nodiscard]] std::optional<size_t> getHostCacheSize() const;
 
@@ -484,23 +491,23 @@ private:
     friend class Serialization;
 
     // number of max sized 1-layer 1-module adapterSize=1 sets of weights that can be stored in host cache
-    SizeType mNumHostModuleLayer;
+    SizeType32 mNumHostModuleLayer;
     // number of max sized 1-layer 1-module sets of weights that can be stored in host cache
-    SizeType mNumDeviceModuleLayer;
+    SizeType32 mNumDeviceModuleLayer;
     // optimal adapter size used to set page width
-    SizeType mOptimalAdapterSize;
+    SizeType32 mOptimalAdapterSize;
     // max supported adapter size. Used to compute minimum
-    SizeType mMaxAdapterSize;
+    SizeType32 mMaxAdapterSize;
     // number of worker threads used to put weights into host cache
-    SizeType mNumPutWorkers;
+    SizeType32 mNumPutWorkers;
     // number of worker threads used to copy weights from host to device
-    SizeType mNumEnsureWorkers;
+    SizeType32 mNumEnsureWorkers;
     // number of streams used to copy weights from host to device
-    SizeType mNumCopyStreams;
+    SizeType32 mNumCopyStreams;
     // Number of cache pages per allocation block (host)
-    SizeType mMaxPagesPerBlockHost;
+    SizeType32 mMaxPagesPerBlockHost;
     // Number of cache pages per allocation block (device)
-    SizeType mMaxPagesPerBlockDevice;
+    SizeType32 mMaxPagesPerBlockDevice;
     // percent of memory after engine load to use for cache
     std::optional<FloatType> mDeviceCachePercent;
     // size in bytes to use for host cache
@@ -511,50 +518,52 @@ private:
 class ExecutorConfig
 {
 public:
-    explicit ExecutorConfig(SizeType maxBeamWidth = 1, SchedulerConfig const& schedulerConfig = SchedulerConfig(),
+    explicit ExecutorConfig(SizeType32 maxBeamWidth = 1, SchedulerConfig const& schedulerConfig = SchedulerConfig(),
         KvCacheConfig const& kvCacheConfig = KvCacheConfig(), bool enableChunkedContext = false,
-        bool normalizeLogProbs = true, SizeType iterStatsMaxIterations = kDefaultIterStatsMaxIterations,
-        SizeType requestStatsMaxIterations = kDefaultRequestStatsMaxIterations,
+        bool normalizeLogProbs = true, SizeType32 iterStatsMaxIterations = kDefaultIterStatsMaxIterations,
+        SizeType32 requestStatsMaxIterations = kDefaultRequestStatsMaxIterations,
         BatchingType batchingType = BatchingType::kINFLIGHT,
         std::optional<ParallelConfig> parallelConfig = std::nullopt,
         std::optional<PeftCacheConfig> const& peftCacheConfig = std::nullopt,
         std::optional<LogitsPostProcessorMap> logitsPostProcessorMap = std::nullopt,
         std::optional<MedusaChoices> medusaChoices = std::nullopt,
-        std::optional<DecodingMode> decodingMode = std::nullopt);
+        std::optional<DecodingMode> decodingMode = std::nullopt, float gpuWeightsPercent = 1);
 
-    [[nodiscard]] SizeType getMaxBeamWidth() const;
+    [[nodiscard]] SizeType32 getMaxBeamWidth() const;
     [[nodiscard]] SchedulerConfig getSchedulerConfig() const;
     [[nodiscard]] KvCacheConfig getKvCacheConfig() const;
     [[nodiscard]] bool getEnableChunkedContext() const;
     [[nodiscard]] bool getNormalizeLogProbs() const;
-    [[nodiscard]] SizeType getIterStatsMaxIterations() const;
-    [[nodiscard]] SizeType getRequestStatsMaxIterations() const;
+    [[nodiscard]] SizeType32 getIterStatsMaxIterations() const;
+    [[nodiscard]] SizeType32 getRequestStatsMaxIterations() const;
     [[nodiscard]] BatchingType getBatchingType() const;
     [[nodiscard]] std::optional<ParallelConfig> getParallelConfig() const;
     [[nodiscard]] std::optional<PeftCacheConfig> getPeftCacheConfig() const;
     [[nodiscard]] std::optional<LogitsPostProcessorMap> getLogitsPostProcessorMap() const;
     [[nodiscard]] std::optional<MedusaChoices> getMedusaChoices() const;
     [[nodiscard]] std::optional<DecodingMode> getDecodingMode() const;
+    [[nodiscard]] float getGpuWeightsPercent() const;
 
-    void setMaxBeamWidth(SizeType maxBeamWidth);
+    void setMaxBeamWidth(SizeType32 maxBeamWidth);
     void setSchedulerConfig(SchedulerConfig const& schedulerConfig);
     void setKvCacheConfig(KvCacheConfig const& kvCacheConfig);
     void setEnableChunkedContext(bool enableChunkedContext);
     void setNormalizeLogProbs(bool normalizeLogProbs);
-    void setIterStatsMaxIterations(SizeType iterStatsMaxIterations);
-    void setRequestStatsMaxIterations(SizeType requestStatsMaxIterations);
+    void setIterStatsMaxIterations(SizeType32 iterStatsMaxIterations);
+    void setRequestStatsMaxIterations(SizeType32 requestStatsMaxIterations);
     void setBatchingType(BatchingType batchingType);
     void setParallelConfig(ParallelConfig const& parallelConfig);
     void setPeftCacheConfig(PeftCacheConfig const& peftCacheConfig);
     void setLogitsPostProcessorMap(LogitsPostProcessorMap const& logitsPostProcessorMap);
     void setMedusaChoices(MedusaChoices const& medusaChoices);
     void setDecodingMode(DecodingMode decodingMode);
+    void setGpuWeightsPercent(float const& gpuWeightsPercent);
 
 private:
     friend class Serialization;
 
     /// @brief The beam width value of requests that will be sent to the executor
-    SizeType mMaxBeamWidth;
+    SizeType32 mMaxBeamWidth;
 
     /// @brief The scheduler configuration.
     SchedulerConfig mSchedulerConfig;
@@ -569,10 +578,10 @@ private:
     bool mNormalizeLogProbs;
 
     /// @brief Controls the maximum number of iterations for which to keep statistics.
-    SizeType mIterStatsMaxIterations;
+    SizeType32 mIterStatsMaxIterations;
 
     /// @brief Controls the maximum number of iterations for which to keep per-request statistics.
-    SizeType mRequestStatsMaxIterations;
+    SizeType32 mRequestStatsMaxIterations;
 
     /// @brief The type of batching strategy to use. See BatchingType.
     BatchingType mBatchingType;
@@ -583,6 +592,7 @@ private:
     std::optional<LogitsPostProcessorMap> mLogitsPostProcessorMap;
     std::optional<MedusaChoices> mMedusaChoices;
     std::optional<DecodingMode> mDecodingMode;
+    float mGpuWeightsPercent;
 };
 
 /// @brief The executor is responsible for receiving new requests and sending responses, and running the inference
@@ -646,7 +656,7 @@ public:
     /// @brief Get the number of ready responses
     /// @param requestId An optional request id
     /// @return The number of ready responses
-    [[nodiscard]] SizeType getNumResponsesReady(std::optional<IdType> const& requestId = std::nullopt) const;
+    [[nodiscard]] SizeType32 getNumResponsesReady(std::optional<IdType> const& requestId = std::nullopt) const;
 
     /// @brief Cancel the request with provided request id
     /// @param id The request id for which to cancel the response

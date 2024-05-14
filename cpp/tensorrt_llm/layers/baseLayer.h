@@ -29,9 +29,8 @@ namespace layers
 class BaseLayer
 {
 public:
-    using SizeType = runtime::SizeType;
-    using TokenIdType = runtime::TokenIdType;
     using SizeType32 = runtime::SizeType32;
+    using TokenIdType = runtime::TokenIdType;
 
     BaseLayer(DecoderDomain const& decoderDomain, cudaStream_t stream,
         std::shared_ptr<tensorrt_llm::common::IAllocator> allocator)
@@ -78,8 +77,8 @@ public:
     //! \param batchSlots input tensor [maxBatchSize], address map of the new requests, in pinned memory
     //! \param setupParams shared pointer to params inherited from BaseSetupParams
     // clang-format on
-    virtual void setup(runtime::SizeType batchSize, runtime::SizeType beamWidth, runtime::SizeType const* batchSlots,
-        std::shared_ptr<BaseSetupParams> setupParams)
+    virtual void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth,
+        runtime::SizeType32 const* batchSlots, std::shared_ptr<BaseSetupParams> setupParams)
         = 0;
 
     // clang-format off

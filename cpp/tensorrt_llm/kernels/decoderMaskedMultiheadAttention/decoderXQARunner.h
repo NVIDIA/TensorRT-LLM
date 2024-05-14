@@ -144,17 +144,10 @@ public:
         int const nbQHeads = xqaParams.num_q_heads;
         int const nbKVHeads = xqaParams.num_kv_heads;
         int const nbQHeadsPerKV = nbQHeads / nbKVHeads;
+        // MultiQueryTokens mode (Medusa mode) can support any nbQHeadsPerKV.
         if (!xqaParams.multi_query_tokens)
         {
             if (nbQHeadsPerKV != 8 && nbQHeadsPerKV != 1)
-            {
-                SUPPORT_RETURN_FALSE("nbHeads");
-            }
-        }
-        else
-        {
-            // Number of Q heads Per KV needs to be power of 2 or 1.
-            if (!(nbQHeadsPerKV % 2 == 0 || nbQHeadsPerKV == 1))
             {
                 SUPPORT_RETURN_FALSE("nbHeads");
             }

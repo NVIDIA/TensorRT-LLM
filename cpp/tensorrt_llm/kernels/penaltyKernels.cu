@@ -34,21 +34,21 @@ template <typename T>
 __global__ void batchApplyPenalty(T const* const* inputLogits, T* outputLogits, T const* biases,
     TokenIdType* penaltyWorkspace, TokenIdType const* penaltyWorkspacePrev, float const* temperatures,
     float const* repetitionPenalties, float const* presencePenalties, float const* frequencyPenalties,
-    bool accumulateVocab, SizeType maxSeqLen, SizeType vocabSize, SizeType vocabSizePadded,
-    TokenIdType const** outputIdsPtr, SizeType32 const** parentIdsPtr, SizeType const* inputLengths,
+    bool accumulateVocab, SizeType32 maxSeqLen, SizeType32 vocabSize, SizeType32 vocabSizePadded,
+    TokenIdType const** outputIdsPtr, SizeType32 const** parentIdsPtr, SizeType32 const* inputLengths,
     SizeType32 const* sequenceLengths, SizeType32 const* minLengths, TokenIdType const* endIds,
     SizeType32 const* batchSlots, SizeType32 const* tokensPerStep)
 {
-    auto const beamWidth = static_cast<SizeType>(gridDim.y);
-    auto const maxTokensPerStep = static_cast<SizeType>(gridDim.z);
-    auto const batchIdx = static_cast<SizeType>(blockIdx.x);
-    auto const beamIdx = static_cast<SizeType>(blockIdx.y);
-    auto const stepIdx = static_cast<SizeType>(blockIdx.z);
+    auto const beamWidth = static_cast<SizeType32>(gridDim.y);
+    auto const maxTokensPerStep = static_cast<SizeType32>(gridDim.z);
+    auto const batchIdx = static_cast<SizeType32>(blockIdx.x);
+    auto const beamIdx = static_cast<SizeType32>(blockIdx.y);
+    auto const stepIdx = static_cast<SizeType32>(blockIdx.z);
     auto const batchSlot = batchSlots == nullptr ? batchIdx : batchSlots[batchIdx];
     auto const batchBeamStepIdx = (batchIdx * beamWidth + beamIdx) * maxTokensPerStep + stepIdx;
     auto const batchSlotBeamIdx = batchSlot * beamWidth + beamIdx;
-    auto const inputLen = inputLengths == nullptr ? SizeType{0} : inputLengths[batchSlotBeamIdx];
-    auto const currentStep = sequenceLengths == nullptr ? SizeType{0} : sequenceLengths[batchSlotBeamIdx];
+    auto const inputLen = inputLengths == nullptr ? SizeType32{0} : inputLengths[batchSlotBeamIdx];
+    auto const currentStep = sequenceLengths == nullptr ? SizeType32{0} : sequenceLengths[batchSlotBeamIdx];
     T const* biasBase = biases + batchSlot * vocabSizePadded;
 
     if (tokensPerStep != nullptr && stepIdx >= tokensPerStep[batchSlot])
@@ -62,14 +62,14 @@ __global__ void batchApplyPenalty(T const* const* inputLogits, T* outputLogits, 
         penaltyWorkspace += batchBeamStepIdx * vocabSize;
         if (currentStep <= inputLen)
         { // Context phase
-            for (auto index = static_cast<SizeType>(threadIdx.x); index < vocabSize;
-                 index += static_cast<SizeType>(blockDim.x))
+            for (auto index = static_cast<SizeType32>(threadIdx.x); index < vocabSize;
+                 index += static_cast<SizeType32>(blockDim.x))
             {
                 penaltyWorkspace[index] = 0;
             }
             __syncthreads();
-            for (auto step = static_cast<SizeType>(threadIdx.x); step < inputLen;
-                 step += static_cast<SizeType>(blockDim.x))
+            for (auto step = static_cast<SizeType32>(threadIdx.x); step < inputLen;
+                 step += static_cast<SizeType32>(blockDim.x))
             {
                 // All beams in the context phase are identical
                 auto penaltyIndex = outputIdsPtr[batchSlot][beamIdx * maxSeqLen + step];
@@ -85,8 +85,8 @@ __global__ void batchApplyPenalty(T const* const* inputLogits, T* outputLogits, 
             {
                 auto parentBeam = parentIdsPtr[batchSlot][beamIdx * maxSeqLen + currentStep - 2];
                 penaltyWorkspacePrev += ((batchIdx * beamWidth + parentBeam) * maxTokensPerStep + stepIdx) * vocabSize;
-                for (auto index = static_cast<SizeType>(threadIdx.x); index < vocabSize;
-                     index += static_cast<SizeType>(blockDim.x))
+                for (auto index = static_cast<SizeType32>(threadIdx.x); index < vocabSize;
+                     index += static_cast<SizeType32>(blockDim.x))
                 {
                     penaltyWorkspace[index] = penaltyWorkspacePrev[index];
                 }
@@ -125,8 +125,8 @@ __global__ void batchApplyPenalty(T const* const* inputLogits, T* outputLogits, 
     {
         frequencyPenalty = frequencyPenalties[batchSlot];
     }
-    for (auto index = static_cast<SizeType>(threadIdx.x); index < vocabSizePadded;
-         index += static_cast<SizeType>(blockDim.x))
+    for (auto index = static_cast<SizeType32>(threadIdx.x); index < vocabSizePadded;
+         index += static_cast<SizeType32>(blockDim.x))
     {
         if (index < vocabSize)
         {

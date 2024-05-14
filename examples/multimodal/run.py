@@ -115,6 +115,46 @@ class MultimodalModelRunner:
         if self.model_type == 'nougat':
             self.tokenizer = NougatTokenizerFast.from_pretrained(
                 self.args.hf_model_dir)
+        elif self.model_type == 'neva':
+            from sentencepiece import SentencePieceProcessor
+
+            sp = SentencePieceProcessor(
+                os.path.join(self.args.hf_model_dir, 'tokenizer.model'))
+
+            class return_obj:
+
+                def __init__(self, input_ids):
+                    self.input_ids = input_ids
+
+                def __getitem__(self, name):
+                    if name in "input_ids":
+                        return self.input_ids
+                    else:
+                        raise AttributeError(
+                            f"'return_obj' has no item '{name}'")
+
+            # sentencepiece does not follow the same interface as HF
+            class HFTokenizerInterface():
+
+                def encode(self, x, return_tensors=None, **kwargs):
+                    out = sp.encode(x)
+                    if return_tensors == "pt":
+                        out = torch.tensor(out)
+                    return return_obj(out)
+
+                def __call__(self, x, return_tensors=None, **kwargs):
+                    return self.encode(x, return_tensors, **kwargs)
+
+                def decode(self, x, **kwargs):
+                    return sp.decode(x.tolist())
+
+                def batch_decode(self, x, **kwargs):
+                    return self.decode(x, **kwargs)
+
+            self.tokenizer = HFTokenizerInterface()
+            self.tokenizer.eos_token_id = sp.eos_id()
+            self.tokenizer.bos_token_id = sp.bos_id()
+            self.tokenizer.pad_token_id = sp.pad_id()
         else:
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.args.hf_model_dir, use_fast=False, use_legacy=False)
@@ -155,9 +195,22 @@ class MultimodalModelRunner:
 
     def preprocess(self, warmup, pre_prompt, post_prompt, image,
                    attention_mask):
+        if self.model_type == 'kosmos-2':
+            input_ids = image['input_ids'].clone()
+            image_mask = image["image_embeds_position_mask"]
+            image = image['pixel_values']
+            input_ids += image_mask * (self.model_config.vocab_size - 4)
+            input_ids = input_ids.expand(self.args.batch_size,
+                                         *input_ids.shape[1:])
+            length = input_ids.shape[1]
+
+        if not warmup:
+            profiler.start("Vision")
+
         visual_features, visual_atts = self.get_visual_features(
             torch.stack(image['image_patches'], dim=0)
             if self.model_type == 'fuyu' else image, attention_mask)
+
         if not warmup:
             profiler.stop("Vision")
 
@@ -176,6 +229,8 @@ class MultimodalModelRunner:
                                                 image_patches_indices)
             input_ids = torch.stack(input_ids, dim=0).to('cpu')
             length = input_ids.shape[1]
+        elif self.model_type == 'kosmos-2':
+            visual_features = visual_features.squeeze()
         else:
             pre_input_ids = self.tokenizer(pre_prompt,
                                            return_tensors="pt",
@@ -193,7 +248,7 @@ class MultimodalModelRunner:
         input_lengths = torch.IntTensor([length] * args.batch_size).to(
             torch.int32)
 
-        if self.model_type == 'fuyu':
+        if self.model_type in ['fuyu', 'kosmos-2']:
             return input_ids, input_lengths, [visual_features], visual_features
 
         input_ids, ptuning_args = self.setup_fake_prompts(
@@ -205,7 +260,6 @@ class MultimodalModelRunner:
                  max_new_tokens, attention_mask, warmup):
         if not warmup:
             profiler.start("Generate")
-            profiler.start("Vision")
 
         input_ids, input_lengths, ptuning_args, visual_features = self.preprocess(
             warmup, pre_prompt, post_prompt, image, attention_mask)
@@ -229,7 +283,7 @@ class MultimodalModelRunner:
                 max_new_tokens=max_new_tokens,
                 end_id=end_id,
                 pad_id=self.tokenizer.pad_token_id
-                if self.tokenizer.pad_token_id else
+                if self.tokenizer.pad_token_id is not None else
                 self.tokenizer.all_special_ids[0],
                 top_k=self.args.top_k,
                 top_p=self.args.top_p,
@@ -413,6 +467,10 @@ class MultimodalModelRunner:
                                        filename="skateboard.png",
                                        repo_type='model')
             image = Image.open(filepath)
+        elif "kosmos" in self.model_type:
+            img_url = 'https://huggingface.co/microsoft/kosmos-2-patch14-224/resolve/main/snowman.png'
+            image = Image.open(requests.get(img_url,
+                                            stream=True).raw).convert('RGB')
         elif "pix2struct" in self.model_type:
             img_url = 'https://raw.githubusercontent.com/vis-nlp/ChartQA/main/ChartQA%20Dataset/val/png/multi_col_40963.png'
             image = Image.open(requests.get(img_url,
@@ -480,7 +538,24 @@ class MultimodalModelRunner:
                                                    -1).contiguous()
             pre_prompt = ""
             post_prompt = None
-        elif 'llava' in self.model_type or 'vila' in self.model_type or 'fuyu' in self.model_type:
+        elif 'neva' in self.model_type:
+            image_size = 384
+            dtype = torch.float32
+            transform = transforms.Compose([
+                transforms.Resize(
+                    (image_size, image_size),
+                    interpolation=transforms.InterpolationMode.BICUBIC),
+                transforms.ToTensor(),
+                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            ])
+            image = transform(raw_image).to(dtype).unsqueeze(0)
+
+            if input_text is None:
+                input_text = "Hi! What is in this image?"
+
+            pre_prompt = "<extra_id_0>System\n\n<extra_id_1>User\n"
+            post_prompt = f"\n{input_text}\n<extra_id_1>Assistant\n"
+        elif self.model_type in ['llava', 'vila', 'fuyu', 'kosmos-2']:
             # LLaVA and VILA
             if self.model_type == "llava":
                 pre_prompt = "USER:\n"
@@ -494,7 +569,12 @@ class MultimodalModelRunner:
                 pre_prompt = "Describe this image:"
                 if input_text is None:
                     input_text = "Answer the following VQAv2 question based on the image: How many people are in the image?\n"
-            if self.model_type != 'fuyu':
+            elif self.model_type == "kosmos-2":
+                pre_prompt = ""
+                if input_text is None:
+                    input_text = "<grounding>An image of"
+
+            if self.model_type not in ['fuyu', 'kosmos-2']:
                 post_prompt = input_text + " ASSISTANT:"
             else:
                 post_prompt = None
@@ -511,7 +591,7 @@ class MultimodalModelRunner:
             else:
                 processor = AutoProcessor.from_pretrained(
                     self.args.hf_model_dir)
-                if self.model_type == 'fuyu':
+                if self.model_type in ['fuyu', 'kosmos-2']:
                     image = processor(text=input_text,
                                       images=raw_image,
                                       return_tensors='pt')
@@ -523,7 +603,7 @@ class MultimodalModelRunner:
         # Repeat inputs to match batch size
         pre_prompt = [pre_prompt] * self.args.batch_size
         post_prompt = [post_prompt] * self.args.batch_size
-        if self.model_type not in ['fuyu', 'pix2struct']:
+        if self.model_type not in ['fuyu', 'pix2struct', 'kosmos-2']:
             image = image.expand(args.batch_size, -1, -1, -1).contiguous()
         image = image.to(self.device)
 
@@ -592,6 +672,10 @@ class MultimodalModelRunner:
                 elif self.model_type == "pix2struct":
                     assert "characteristic | cat food, day | cat food, wet | cat treats" in output_text[
                         0][0].lower()
+                elif self.model_type == 'neva':
+                    assert 'singapore' in output_text[0][0].lower()
+                elif self.model_type == 'kosmos-2':
+                    assert 'snowman' in output_text[0][0].lower()
                 else:
                     assert output_text[0][0].lower() == 'singapore'
 

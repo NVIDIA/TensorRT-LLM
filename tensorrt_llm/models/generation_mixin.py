@@ -19,6 +19,7 @@ from typing import List
 import tensorrt as trt
 
 from ..functional import Tensor
+from ..layers import SpecDecodingParams
 from ..mapping import Mapping
 from ..plugin import current_all_reduce_helper
 
@@ -40,6 +41,26 @@ class GenerationMixin:
     def default_range(max_range, offset=0):
         result = [1, (max_range + 1) // 2, max_range]
         return [elem + offset for elem in result]
+
+    @staticmethod
+    def split_num_tokens_range(max_num_tokens):
+        split_point = [64, 128, 256, 512, 1024]
+        num_tokens_ranges = []
+        for i, p in enumerate(split_point):
+            if i == 0 and max_num_tokens <= p:
+                return [1, max_num_tokens, max_num_tokens]
+            elif max_num_tokens <= p:
+                num_tokens_ranges.append(
+                    [split_point[i - 1], max_num_tokens, max_num_tokens])
+                return num_tokens_ranges
+            elif i == 0 and max_num_tokens > p:
+                num_tokens_ranges = [[1, 64, 64]]
+            else:
+                num_tokens_ranges.append(
+                    [split_point[i - 1], split_point[i], split_point[i]])
+        num_tokens_ranges.append(
+            [split_point[-1], max_num_tokens, max_num_tokens])
+        return num_tokens_ranges
 
     def prepare_attention_inputs(self,
                                  *,
@@ -323,7 +344,6 @@ class GenerationMixin:
 
         default_range = GenerationMixin.default_range
         tokens_per_engine_step = max_draft_len + 1
-        [1, tokens_per_engine_step, tokens_per_engine_step]
         tokens_per_engine_step_range = [
             1, tokens_per_engine_step, tokens_per_engine_step
         ]
@@ -371,14 +391,8 @@ class GenerationMixin:
             if opt_num_tokens is None:
                 opt_num_tokens = max_bs_x_max_bw
             if multiple_profiles:
-                if max_num_tokens > max_bs_x_max_bw:
-                    num_tokens_range = [[1, max_bs_x_max_bw, max_bs_x_max_bw],
-                                        [
-                                            max_bs_x_max_bw, max_num_tokens,
-                                            max_num_tokens
-                                        ]]
-                else:
-                    num_tokens_range = [[1, max_num_tokens, max_num_tokens]]
+                num_tokens_range = GenerationMixin.split_num_tokens_range(
+                    max_num_tokens)
             else:
                 num_tokens_range = [[1, opt_num_tokens, max_num_tokens]]
             num_profiles = len(num_tokens_range)
@@ -584,16 +598,29 @@ class GenerationMixin:
                     ]),
                 )
 
-        speculative_decoding_position_offsets = None
-        speculative_decoding_packed_mask = None
+        spec_decoding_params = None
         # Use positional offsets and packed mask only when not in SpS spec decoding
         if speculative_decoding_draft_tokens_external == False and max_draft_len > 0:
             # 32 bits packed mask aligned.
             num_packed_masks = (tokens_per_engine_step + 32 - 1) // 32
             packed_mask_len_range = [[0, 1, num_packed_masks]] * num_profiles
+            # total number of spec decoding tokens for all sequences (sequence length can be variable).
+            num_gen_tokens_range = [
+                default_range(
+                    max_batch_size * max_beam_width * tokens_per_engine_step)
+            ] * num_profiles
+
+            # support variable sequence lengths for medusa.
+            spec_decoding_generation_lengths = Tensor(
+                name='spec_decoding_generation_lengths',
+                dtype=trt.int32,
+                shape=[-1],
+                dim_range=OrderedDict([('batch_size_beam_width', bb_range)]),
+            )
+
             # position offsets that are fixed during the whole session.
             # it will be shared among all sequences.
-            speculative_decoding_position_offsets = Tensor(
+            spec_decoding_position_offsets = Tensor(
                 name='spec_decoding_position_offsets',
                 dtype=trt.int32,
                 shape=[-1, -1],
@@ -604,17 +631,18 @@ class GenerationMixin:
                 ]),
             )
 
-            speculative_decoding_packed_mask = Tensor(
+            spec_decoding_packed_mask = Tensor(
                 name='spec_decoding_packed_mask',
                 dtype=trt.int32,
-                shape=[-1, -1, -1],
+                shape=[-1, -1],
                 dim_range=OrderedDict([
-                    ('batch_size_beam_width', bb_range),
-                    ('spec_decoding_packed_mask_dim0',
-                     tokens_per_engine_step_range),
+                    ('spec_decoding_packed_mask_dim0', num_gen_tokens_range),
                     ('spec_decoding_packed_mask_dim1', packed_mask_len_range),
                 ]),
             )
+            spec_decoding_params = SpecDecodingParams(
+                spec_decoding_generation_lengths,
+                spec_decoding_position_offsets, spec_decoding_packed_mask)
 
         basic_inputs = {
             'input_ids': input_ids,
@@ -626,9 +654,7 @@ class GenerationMixin:
             'prompt_vocab_size': prompt_vocab_size,
             'lora_ranks': lora_ranks,
             'lora_weights_pointers': lora_weights_pointers,
-            'spec_decoding_position_offsets':
-            speculative_decoding_position_offsets,
-            'spec_decoding_packed_mask': speculative_decoding_packed_mask
+            'spec_decoding_params': spec_decoding_params
         }
 
         attention_inputs = self.prepare_attention_inputs(

@@ -6,7 +6,6 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Optional
 
 import safetensors
 import torch
@@ -16,7 +15,6 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 import tensorrt_llm
 from tensorrt_llm.layers import MoeConfig
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_manager import LoraConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.cogvlm.convert import convert_hf_cogvlm
 from tensorrt_llm.models.llama.convert import (capture_activation_range,
@@ -115,7 +113,7 @@ def parse_arguments():
         'By default, we use dtype for KV cache. int8_kv_cache chooses int8 quantization for KV'
     )
     parser.add_argument(
-        '--ammo_quant_ckpt_path',
+        '--modelopt_quant_ckpt_path',
         type=str,
         default=None,
         help='Path of a quantized model checkpoint in .npz format')
@@ -237,30 +235,6 @@ def parse_arguments():
         'Enable dense fmha in context phase, otherwise sliding window attention.'
         'If dense_context_fmha=False, the sliding window size is the max attention window size.'
     )
-    parser.add_argument('--hf_lora_dir', type=str, default=None)
-    parser.add_argument(
-        '--lora_target_modules',
-        nargs='+',
-        default=None,
-        choices=[
-            "attn_qkv",
-            "attn_q",
-            "attn_k",
-            "attn_v",
-            "attn_dense",
-            "mlp_h_to_4h",
-            "mlp_gate",
-            "mlp_4h_to_h",
-        ],
-        help=
-        "Add lora in which modules. Only be activated when use_lora_plugin is enabled."
-    )
-    parser.add_argument(
-        '--max_lora_rank',
-        type=int,
-        default=64,
-        help='maximum lora rank for different lora modules. '
-        'It is used to compute the workspace size of lora plugin.')
     args = parser.parse_args()
     return args
 
@@ -305,8 +279,7 @@ def update_quantization_from_args(config: dict, args: argparse.Namespace):
         })
 
 
-def create_config_from_args(args: argparse.Namespace,
-                            lora_config: Optional[LoraConfig] = None):
+def create_config_from_args(args: argparse.Namespace):
     config = {
         'architecture': args.architecture,
         'dtype': args.dtype,
@@ -346,59 +319,8 @@ def create_config_from_args(args: argparse.Namespace,
         'enable_pos_shift': args.enable_pos_shift,
         'dense_context_fmha': args.dense_context_fmha,
     }
-    if lora_config is not None:
-        config.update({
-            'max_lora_rank':
-            args.max_lora_rank,
-            'lora_target_modules':
-            lora_config.lora_target_modules,
-            'hf_modules_to_trtllm_modules':
-            lora_config.hf_modules_to_trtllm_modules,
-            'trtllm_modules_to_hf_modules':
-            lora_config.trtllm_modules_to_hf_modules,
-            'disable_weight_only_quant_plugin':
-            args.disable_weight_only_quant_plugin
-        })
-        # the lora checkpoint might finetune the embedding
-        if lora_config.vocab_size != 0:
-            config['vocab_size'] = lora_config.vocab_size
     update_quantization_from_args(config, args)
     return config
-
-
-def create_lora_config(args: argparse.Namespace):
-    '''update args based on lora dir
-    '''
-    hf_modules_to_trtllm_modules = {
-        "q_proj": "attn_q",
-        "k_proj": "attn_k",
-        "v_proj": "attn_v",
-        "o_proj": "attn_dense",
-        "gate_proj": "mlp_h_to_4h",
-        "down_proj": "mlp_4h_to_h",
-        "up_proj": "mlp_gate"
-    }  # lora modules on llama
-
-    trtllm_modules_to_hf_modules = {
-        "attn_q": "q_proj",
-        "attn_k": "k_proj",
-        "attn_v": "v_proj",
-        "attn_dense": "o_proj",
-        "mlp_h_to_4h": "gate_proj",
-        "mlp_4h_to_h": "down_proj",
-        "mlp_gate": "up_proj",
-    }
-
-    lora_config = LoraConfig.from_hf(args.hf_lora_dir,
-                                     hf_modules_to_trtllm_modules,
-                                     trtllm_modules_to_hf_modules)
-
-    if lora_config.is_valid and lora_config.vocab_size != 0:
-        if args.lora_target_modules is not None:
-            # command line options is preferred over the modules in the lora dir
-            lora_config.lora_target_modules = args.lora_target_modules
-    # can be invalid
-    return lora_config
 
 
 def smooth_quant(model, args):
@@ -529,8 +451,7 @@ def main():
         assert rotary_scaling["factor"] > 1.0
         args.rotary_scaling = rotary_scaling
 
-    lora_config = create_lora_config(args)
-    config = create_config_from_args(args, lora_config)
+    config = create_config_from_args(args)
 
     with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
         json.dump(config, f, indent=4)
@@ -564,7 +485,7 @@ def main():
                           pp_size=args.pp_size)
 
         if args.use_weight_only and args.weight_only_precision == 'int4_gptq':
-            weights = load_from_gptq_llama(args.ammo_quant_ckpt_path,
+            weights = load_from_gptq_llama(args.modelopt_quant_ckpt_path,
                                            args.n_layer,
                                            args.vocab_size,
                                            mapping,
@@ -579,8 +500,7 @@ def main():
             if args.load_by_shard:
                 weights = load_from_hf_checkpoint(
                     args.model_dir, mapping,
-                    PretrainedConfig.from_dict(copy.deepcopy(config)),
-                    lora_config)
+                    PretrainedConfig.from_dict(copy.deepcopy(config)))
 
             else:
                 if args.weight_only_precision == 'int8':
@@ -606,8 +526,7 @@ def main():
                     act_range=act_range,
                     qkv_para=llama_qkv_para,
                     smoother=llama_smoother,
-                    moe_config=args.moe_config,
-                    lora_config=lora_config)
+                    moe_config=args.moe_config)
 
         safetensors.torch.save_file(
             weights, os.path.join(args.output_dir, f'rank{rank}.safetensors'))

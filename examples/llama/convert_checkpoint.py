@@ -299,8 +299,10 @@ def from_cli_args(args):
 
 
 def preload_model(model_dir, load_model_on_cpu):
+    use_safetensors = True
     from transformers import AutoConfig, AutoModelForCausalLM
     if "vila" in model_dir:
+        use_safetensors = False
         sys.path.append(model_dir + "/../VILA")
         from llava.model import LlavaConfig, LlavaLlamaForCausalLM
         AutoConfig.register("llava_llama", LlavaConfig)
@@ -309,8 +311,14 @@ def preload_model(model_dir, load_model_on_cpu):
     hf_config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
     model_cls = AutoModelForCausalLM
     if hf_config.model_type == "llava":
+        use_safetensors = False
         from transformers import LlavaForConditionalGeneration
         model_cls = LlavaForConditionalGeneration
+    use_safetensors = any(
+        [f.endswith(".safetensors")
+         for f in os.listdir(model_dir)]) and use_safetensors
+    if use_safetensors:
+        return None
     model = model_cls.from_pretrained(
         model_dir,
         device_map='auto' if not load_model_on_cpu else 'cpu',
@@ -372,9 +380,9 @@ def convert_and_save_hf(args):
             )
             llama.save_checkpoint(args.output_dir, save_config=(rank == 0))
             del llama
-            release_gc()
 
         execute(args.workers, [convert_and_save_rank] * world_size, args)
+        release_gc()
 
 
 def convert_and_save_gptq(args, rank):

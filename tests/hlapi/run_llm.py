@@ -1,34 +1,29 @@
 #!/usr/bin/env python3
+import os
+
 import click
 
-from tensorrt_llm.hlapi.llm import LLM, ModelConfig, ModelLoader
+from tensorrt_llm.hlapi import LLM, ModelConfig, SamplingConfig
 
 
 @click.command()
-@click.option('--model_dir',
-              type=str,
-              required=True,
-              help='Path to the model directory')
-@click.option('--tokenizer_dir',
-              type=str,
-              default=None,
-              help='Path to the tokenizer directory')
-@click.option('--prompt',
-              type=str,
-              default="Tell a story",
-              help='Prompt to generate text from')
-def main(model_dir: str, tokenizer_dir: str, prompt: str):
+@click.option("--model_dir", type=str, required=True)
+@click.option("--tp_size", type=int, required=True)
+@click.option("--engine_dir", type=str, default=None)
+def main(model_dir: str, tp_size: int, engine_dir: str):
     config = ModelConfig(model_dir)
+    config.parallel_config.tp_size = tp_size
 
-    if tokenizer_dir is None:
-        tokenizer_dir = model_dir
+    llm = LLM(config)
 
-    tokenizer = ModelLoader.load_hf_tokenizer(tokenizer_dir)
+    if engine_dir is not None and os.path.abspath(
+            engine_dir) != os.path.abspath(model_dir):
+        llm.save(engine_dir)
 
-    llm = LLM(config, tokenizer=tokenizer)
-
-    for output in llm.generate([prompt]):
-        print("OUTPUT:", output.text)
+    prompt = [45, 12, 13]
+    sampling_config = SamplingConfig(max_new_tokens=10)
+    for output in llm.generate([prompt], sampling_config=sampling_config):
+        print(output)
 
 
 if __name__ == '__main__':

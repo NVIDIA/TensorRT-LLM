@@ -1,4 +1,5 @@
-from ..layers import MLP, ColumnLinear, GatedMLP, LayerNorm, RmsNorm, RowLinear
+from ..layers import (MLP, Attention, ColumnLinear, GatedMLP, LayerNorm,
+                      RmsNorm, RowLinear)
 from ..models.modeling_utils import QuantConfig
 from ..parameter import Parameter
 from .layers import (FP8Linear, FP8RowLinear, Int8SmoothQuantLinear,
@@ -273,10 +274,10 @@ def fp8_quantize(model, quant_config: QuantConfig, current_key_name=None):
 
 def kv_cache_quantize(model, quant_config: QuantConfig):
     assert quant_config.quant_mode.has_kv_cache_quant()
-
-    for layer in model.transformer.layers:
-        layer.attention.kv_cache_scaling_factor = Parameter(shape=(1, ),
-                                                            dtype='float32')
+    for name, module in model.named_modules(remove_duplicate=True):
+        if isinstance(module, (Attention, SmoothQuantAttention)):
+            module.kv_cache_scaling_factor = Parameter(shape=(1, ),
+                                                       dtype='float32')
 
 
 def quantize(model, quant_config: QuantConfig):

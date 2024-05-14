@@ -20,9 +20,11 @@ from ..layers import (AttentionParams, Embedding, FusedGatedMLP, GatedMLP,
 from ..layers.attention import Attention, BertAttention
 from ..layers.linear import ColumnLinear, Linear, RowLinear
 from ..layers.lora import Lora
+from ..layers.moe import MOE, MoeOOTB
 from ..logger import logger
 from ..mapping import Mapping
 from ..module import Module, ModuleList
+from ..parameter import Parameter
 from ..quantization import QuantMode
 from ..quantization.layers import FP8Linear
 from ..quantization.mode import W8A8_SQ_PLUGIN_LIST, QuantAlgo
@@ -295,8 +297,7 @@ class DecoderLayerList(ModuleList):
                 attention_params=None,
                 position_ids=None,
                 lora_params=None,
-                spec_decoding_position_offsets=None,
-                spec_decoding_packed_mask=None):
+                spec_decoding_params=None):
         kv_cache_params.fill_none_tensor_list(len(self.layer_list))
 
         if use_cache:
@@ -314,12 +315,8 @@ class DecoderLayerList(ModuleList):
                 kwargs['position_ids'] = position_ids
             if lora_layer_params is not None:
                 kwargs['lora_layer_params'] = lora_layer_params
-            if spec_decoding_position_offsets is not None:
-                kwargs[
-                    'spec_decoding_position_offsets'] = spec_decoding_position_offsets
-            if spec_decoding_packed_mask is not None:
-                kwargs['spec_decoding_packed_mask'] = spec_decoding_packed_mask
-
+            if spec_decoding_params is not None:
+                kwargs['spec_decoding_params'] = spec_decoding_params
             hidden_states = layer(
                 hidden_states,
                 use_cache=use_cache,
@@ -411,26 +408,40 @@ class PretrainedModel(Module,
 
         return model
 
-    def load(self, weights):
-        expected_names = set([name for name, param in self.named_parameters()])
+    def load(self, weights, from_pruned=False):
+        expected_names = set()
+        for name, param in self.named_parameters():
+            if not param.is_inited():
+                expected_names.add(name)
+
         provided_names = set(weights.keys())
-        assert expected_names.issubset(
-            provided_names
-        ), f"Expected but not provided tensors:{expected_names.difference(provided_names)}"
+        if not expected_names.issubset(provided_names):
+            raise RuntimeError(
+                f"Expected but not provided tensors:{expected_names.difference(provided_names)}"
+            )
+        if not provided_names.issubset(expected_names):
+            logger.warning(
+                f"Provided but not expected tensors: {provided_names.difference(expected_names)}"
+            )
 
         if self.config.architecture in WEIGHT_LOADER_MODELS:
             mapping = self.config.mapping
             for name, param in self.named_parameters():
-                weight_loader = getattr(param, "weight_loader",
-                                        default_weight_loader)
-                weight_loader(mapping, param, weights[name])
+                if name in expected_names:
+                    weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader)
+                    weight_loader(mapping, param, weights[name])
         else:
             for name, param in self.named_parameters():
-                try:
-                    param.value = weights[name]
-                except Exception as e:
-                    raise RuntimeError(
-                        f"Encounter error '{e}' for parameter '{name}'")
+                if name in expected_names:
+                    if not from_pruned:
+                        try:
+                            param.value = weights[name]
+                        except Exception as e:
+                            raise RuntimeError(
+                                f"Encounter error '{e}' for parameter '{name}'")
+                    else:
+                        param.set_value_or_dummy(weights[name])
 
     def load_partial_weights(self, weights: dict):
         params = {name: param for name, param in self.named_parameters()}
@@ -575,11 +586,9 @@ class PretrainedModel(Module,
                 host_context_lengths=model_inputs['host_context_lengths'],
                 max_context_length=max_input_len,
                 host_request_types=model_inputs['host_request_types'])
-        if model_inputs['spec_decoding_packed_mask'] is not None:
-            result['spec_decoding_position_offsets'] = model_inputs[
-                'spec_decoding_position_offsets']
-            result['spec_decoding_packed_mask'] = model_inputs[
-                'spec_decoding_packed_mask']
+        if model_inputs['spec_decoding_params'] is not None:
+            result['spec_decoding_params'] = model_inputs[
+                'spec_decoding_params']
 
         return result
 
@@ -592,8 +601,10 @@ class PretrainedModel(Module,
         *,
         dtype='float16',
         mapping: Optional[Mapping] = None,
+        calib_dataset='cnn_dailymail',
         calib_batches=512,
         calib_batch_size=1,
+        calib_max_seq_length=512,
         random_seed=1234,
         tokenizer_max_seq_length=2048,
     ):
@@ -607,18 +618,19 @@ class PretrainedModel(Module,
             hf_model_dir)  # quantize_and_export has some code can not take Path
         quantize_and_export(
             model_dir=hf_model_dir,
+            calib_dataset=calib_dataset,
             dtype=dtype,
-            device='cuda',
             qformat=modelopt_qformat,
             kv_cache_dtype=kv_cache_dtype,
             calib_size=calib_batches,
             batch_size=calib_batch_size,
+            calib_max_seq_length=calib_max_seq_length,
+            awq_block_size=quant_config.group_size,
             output_dir=output_dir,
             tp_size=mapping.tp_size,
             pp_size=mapping.pp_size,
             seed=random_seed,
-            max_seq_length=tokenizer_max_seq_length,
-            awq_block_size=quant_config.group_size,
+            tokenizer_max_seq_length=tokenizer_max_seq_length,
         )
 
 
@@ -642,8 +654,7 @@ class DecoderModelForCausalLM(PretrainedModel):
                 prompt_tasks: Optional[Tensor] = None,
                 prompt_vocab_size: Optional[Tensor] = None,
                 lora_params=None,
-                spec_decoding_position_offsets=None,
-                spec_decoding_packed_mask=None):
+                spec_decoding_params=None):
         kwargs = {
             'input_ids': input_ids,
             'position_ids': position_ids,
@@ -663,11 +674,8 @@ class DecoderModelForCausalLM(PretrainedModel):
         if prompt_vocab_size is not None:
             kwargs['prompt_vocab_size'] = prompt_vocab_size
 
-        if spec_decoding_position_offsets is not None:
-            kwargs[
-                'spec_decoding_position_offsets'] = spec_decoding_position_offsets
-        if spec_decoding_packed_mask is not None:
-            kwargs['spec_decoding_packed_mask'] = spec_decoding_packed_mask
+        if spec_decoding_params is not None:
+            kwargs['spec_decoding_params'] = spec_decoding_params
 
         hidden_states = self.transformer.forward(**kwargs)
 
@@ -898,6 +906,18 @@ def add_lora(model: PretrainedModel,
     return model
 
 
+def to_ootb_moe(model: PretrainedModel) -> PretrainedModel:
+    ''' Use OOTB MoE instead of MoE plugin, return the changed model
+    '''
+    for name, module in model.named_modules(remove_duplicate=True):
+        if not hasattr(module, 'mlp'):
+            continue
+        layer = module.mlp
+        if isinstance(layer, MOE):
+            module.mlp = layer.to(MoeOOTB, model.config)
+    return model
+
+
 def parallelize_embedding(model: DecoderModelForCausalLM):
     if model.config.mapping.is_first_pp_rank():
         for name, module in model.transformer.named_children():
@@ -920,14 +940,25 @@ def share_embedding(model: DecoderModelForCausalLM):
     return model
 
 
+def set_fp8_context_fhma(model: DecoderModelForCausalLM):
+    for layer in model.transformer.layers:
+        scale = [1.0
+                 ] / layer.attention.dense.activation_scaling_factor.raw_value
+        layer.attention.attention_output_orig_quant_scale = Parameter(
+            value=scale.astype(np.float32))
+    return model
+
+
 def optimize_model(model: DecoderModelForCausalLM,
                    use_parallel_embedding: bool = False,
                    share_embedding_table: bool = False,
                    use_fused_mlp: bool = False,
                    use_unfused_qkv_gemm: bool = False,
+                   use_ootb_moe: bool = False,
                    use_prompt_tuning: bool = False,
                    use_lora: bool = False,
-                   max_lora_rank: Optional[int] = None):
+                   max_lora_rank: Optional[int] = None,
+                   use_fp8_context_fmha: bool = False):
     if use_parallel_embedding:
         model = parallelize_embedding(model)
     if share_embedding_table:
@@ -936,10 +967,14 @@ def optimize_model(model: DecoderModelForCausalLM,
         model = fuse_gate_mlp(model)
     if use_unfused_qkv_gemm:
         model = unfuse_qkv_gemm(model)
+    if use_ootb_moe:
+        model = to_ootb_moe(model)
     if use_prompt_tuning:
         model = set_prompt_tuning(model)
     if use_lora:
         model = add_lora(model, max_lora_rank)
+    if use_fp8_context_fmha:
+        model = set_fp8_context_fhma(model)
     return model
 
 
@@ -1096,8 +1131,9 @@ def load_model(
         use_parallel_embedding=model_config.use_parallel_embedding,
         share_embedding_table=model_config.share_embedding_table,
     )
+    is_checkpoint_pruned = getattr(model_config, 'is_pruned', False)
     if weights is not None:
         preprocess_weights(weights, model_config)
-        model.load(weights)
+        model.load(weights, from_pruned=is_checkpoint_pruned)
 
     return model

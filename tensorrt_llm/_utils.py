@@ -17,16 +17,13 @@ import gc
 import json
 import math
 import struct
-import tarfile
 import weakref
 from dataclasses import asdict
 from enum import EnumMeta
 from functools import partial
-from pathlib import Path, PosixPath
 from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
-import yaml
 from packaging import version
 
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
@@ -114,13 +111,13 @@ def trt_version():
     return trt.__version__
 
 
-# TRT supports strongly_type in 9.1
+# TRT supports strongly_typed in 9.1
 def support_strongly_type():
     return version.parse(trt_version()) >= version.parse("9.1.0")
 
 
-# Preview change in TRT 10.0
-def preview_trt_version():
+# Check if TRT version >= 10
+def trt_gte_10():
     return version.parse(trt_version()).major > 9
 
 
@@ -290,6 +287,7 @@ _torch_to_trt_dtype_dict = {
     torch.int64: trt.int64,
     torch.int32: trt.int32,
     torch.int8: trt.int8,
+    torch.qint8: trt.int8,
     torch.bool: trt.bool,
     torch.bfloat16: trt.bfloat16
 }
@@ -390,21 +388,6 @@ def numpy_fp32_to_bf16(src):
     return dst.reshape(original_shape).view(np_bfloat16)
 
 
-def fromfile(dir_path, name, shape=None, dtype=None):
-    dtype = np_dtype if dtype is None else dtype
-    p = dir_path
-    if not isinstance(p, PosixPath):
-        p = Path(p)
-    p = p / name
-
-    if Path(p).exists():
-        t = np.fromfile(p, dtype=dtype)
-        if shape is not None:
-            t = t.reshape(shape)
-        return t
-    return None
-
-
 _extra_attrs_by_object: Dict[int, Dict[str, Any]] = {}
 
 
@@ -431,22 +414,6 @@ def has_extra_attr(obj, attr_name):
     if id(obj) not in _extra_attrs_by_object:
         return False
     return attr_name in _extra_attrs_by_object[id(obj)]
-
-
-def unpack_nemo_weights(nemo_archive_path):
-    with tarfile.open(nemo_archive_path) as tar:
-        try:
-            model_weights = tar.extractfile("model_weights.ckpt")
-            model_config = tar.extractfile("model_config.yaml")
-        except KeyError:
-            try:
-                model_weights = tar.extractfile("./model_weights.ckpt")
-                model_config = tar.extractfile("./model_config.yaml")
-            except KeyError:
-                err_str = "Both model_weights paths not found in the tar archive."
-                raise Exception(err_str)
-        return yaml.safe_load(model_config), torch.load(
-            model_weights, map_location=torch.device("cpu"))
 
 
 def set_obj_attrs(

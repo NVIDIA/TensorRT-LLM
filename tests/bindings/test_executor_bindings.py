@@ -1,6 +1,7 @@
 import datetime
 import json
 import os
+import pickle
 import random
 import sys
 import time
@@ -292,12 +293,18 @@ def test_multi_request_with_ids(streaming: bool,
         for responses in id_responses:
             for response in responses:
                 num_responses += 1
-                assert not response.has_error(
-                ), f"Request id {response.request_id} failed with err {response.error_msg}"
-                result = response.result
-                num_finished += result.is_final
-                new_tokens = result.output_token_ids[beam_width - 1]
-                tokens[response.request_id].extend(new_tokens)
+
+                # Allow response with error only if await_response processed a terminated request id
+                if response.has_error():
+                    terminated_request_error = "ReqId " + str(
+                        response.request_id
+                    ) + " has already been processed and was terminated."
+                    assert response.error_msg == terminated_request_error, f"Request id {response.request_id} failed with err {response.error_msg}"
+                else:
+                    result = response.result
+                    num_finished += result.is_final
+                    new_tokens = result.output_token_ids[beam_width - 1]
+                    tokens[response.request_id].extend(new_tokens)
             i += 1
     assert i < max_wait_ms
 
@@ -658,6 +665,35 @@ def test_lora_config():
     assert (lora_config.config == config).all()
 
 
+@skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
+def test_wakeup(model_files, model_path):
+    import threading
+
+    def resp_thread(stop_signal: threading.Event, executor: trtllm.Executor):
+        while not stop_signal.is_set():
+            timeout = None
+            responses = executor.await_responses(timeout=timeout)
+            if stop_signal.is_set():
+                return
+            for response in responses:
+                response.result.output_token_ids
+
+    executor = trtllm.Executor(model_path, trtllm.ModelType.DECODER_ONLY,
+                               trtllm.ExecutorConfig())
+    stop_signal = threading.Event()
+    thread = threading.Thread(target=resp_thread, args=(stop_signal, executor))
+    thread.start()
+    request = trtllm.Request(input_token_ids=[1, 2, 3, 4],
+                             max_new_tokens=5,
+                             streaming=True)
+    executor.enqueue_request(request)
+    time.sleep(2)
+    stop_signal.set()
+    executor.shutdown()
+    thread.join()
+    assert not thread.is_alive()
+
+
 def test_request():
     kwargs = {
         "input_token_ids": [1, 2, 3],
@@ -726,13 +762,13 @@ def test_response():
 
 
 def test_scheduler_config():
-    policy = trtllm.SchedulerPolicy.MAX_UTILIZATION
+    policy = trtllm.CapacitySchedulerPolicy.MAX_UTILIZATION
     config = trtllm.SchedulerConfig(policy)
-    assert config.policy == policy
+    assert config.capacity_scheduler_policy == policy
 
-    policy = trtllm.SchedulerPolicy.GUARANTEED_NO_EVICT
+    policy = trtllm.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
     config = trtllm.SchedulerConfig(policy)
-    assert config.policy == policy
+    assert config.capacity_scheduler_policy == policy
 
 
 def test_kv_cache_config():
@@ -778,7 +814,7 @@ def test_executor_config():
         "max_beam_width":
         2,
         "scheduler_config":
-        trtllm.SchedulerConfig(trtllm.SchedulerPolicy.MAX_UTILIZATION),
+        trtllm.SchedulerConfig(trtllm.CapacitySchedulerPolicy.MAX_UTILIZATION),
         "kv_cache_config":
         trtllm.KvCacheConfig(),
         "enable_chunked_context":
@@ -803,7 +839,7 @@ def test_executor_config():
         if "config" not in k:
             assert getattr(config, k) == v
     assert isinstance(config.scheduler_config, trtllm.SchedulerConfig)
-    assert config.scheduler_config.policy == trtllm.SchedulerPolicy.MAX_UTILIZATION
+    assert config.scheduler_config.capacity_scheduler_policy == trtllm.CapacitySchedulerPolicy.MAX_UTILIZATION
     assert isinstance(config.kv_cache_config, trtllm.KvCacheConfig)
     assert isinstance(config.parallel_config, trtllm.ParallelConfig)
     assert isinstance(config.peft_cache_config, trtllm.PeftCacheConfig)
@@ -969,3 +1005,11 @@ def test_request_stats_per_iteration():
     stats_json = json.loads(stats.to_json_str())
     assert stats_json["iter"] == 1
     assert stats_json["requestStats"][0]["id"] == 1
+
+
+def test_scheduler_config_pickle():
+    policy = trtllm.CapacitySchedulerPolicy.MAX_UTILIZATION
+    config = trtllm.SchedulerConfig(policy)
+    config_str = pickle.dumps(config)
+    config_copy = pickle.loads(config_str)
+    assert config.capacity_scheduler_policy == config_copy.capacity_scheduler_policy

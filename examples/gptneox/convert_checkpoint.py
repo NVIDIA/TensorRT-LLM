@@ -285,7 +285,8 @@ def load_from_gptq_gptneox(quant_ckpt_path,
         GPTQ_FLAG = 1
 
         qweight_interleaved = preprocessor(packer(qweight_unpacked_int8),
-                                           torch.quint4x2).view(torch.float16)
+                                           torch.quint4x2,
+                                           torch.float16).view(torch.float16)
 
         # zeros = zeros * scales
         zeros_x_scales_fp16 = (-qzeros_unpacked_int8 + 8 * UINT4_TO_INT4_FLAG -

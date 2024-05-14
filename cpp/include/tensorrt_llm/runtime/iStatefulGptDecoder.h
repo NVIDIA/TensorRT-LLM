@@ -73,9 +73,9 @@ public:
     using TensorPtr = std::shared_ptr<ITensor>;
 
     //! Setup the decoder before calling `forward()`, also calls reshapeBuffers
-    virtual void setup(DecodingMode const& mode, SizeType maxBatchSize, SizeType maxBeamWidth,
-        SizeType maxAttentionWindow, SizeType sinkTokenLength, SizeType maxSequenceLength, SizeType maxTokensPerStep,
-        bool fusedDecoder, nvinfer1::DataType dtype, ModelConfig const& modelConfig)
+    virtual void setup(DecodingMode const& mode, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
+        SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength,
+        SizeType32 maxTokensPerStep, bool fusedDecoder, nvinfer1::DataType dtype, ModelConfig const& modelConfig)
         = 0;
 
     //! @brief Initialize the decoder with new batch of inputs.
@@ -111,7 +111,7 @@ public:
     //! @brief Get tokens generated in one step of last forward pass
     //! @param iter The iteration within [0; maxTokensPerStep) for which to get the tokens
     //! @returns [batchSize, beamWidth], tokens generated in `iter` (per beam), on gpu
-    [[nodiscard]] virtual TensorPtr getNewTokens(SizeType iter = 0) const = 0;
+    [[nodiscard]] virtual TensorPtr getNewTokens(SizeType32 iter = 0) const = 0;
 
     //! @brief Get maxTokensPerStep tokens generated in the last forward pass
     //! @returns [maxTokensPerStep, batchSize, maxBeamWidth], tokens generated in last forward pass, on gpu

@@ -76,7 +76,7 @@ private:
     using Vec = std::vector<T>;
 
 public:
-    explicit SamplingConfig(SizeType beamWidth = 1)
+    explicit SamplingConfig(SizeType32 beamWidth = 1)
         : beamWidth{beamWidth}
     {
     }
@@ -151,25 +151,25 @@ public:
         varName = Vec<VarType>{samplingConfig.get##VarName().value()};                                                 \
     }
 
-        SET_FROM_OPTIONAL(topK, TopK, SizeType)
+        SET_FROM_OPTIONAL(topK, TopK, SizeType32)
         SET_FROM_OPTIONAL(topP, TopP, FloatType)
         SET_FROM_OPTIONAL(topPMin, TopPMin, FloatType)
-        SET_FROM_OPTIONAL(topPResetIds, TopPResetIds, SizeType)
+        SET_FROM_OPTIONAL(topPResetIds, TopPResetIds, TokenIdType)
         SET_FROM_OPTIONAL(topPDecay, TopPDecay, FloatType)
         SET_FROM_OPTIONAL(randomSeed, RandomSeed, uint64_t)
         SET_FROM_OPTIONAL(temperature, Temperature, FloatType)
-        SET_FROM_OPTIONAL(minLength, MinLength, SizeType)
+        SET_FROM_OPTIONAL(minLength, MinLength, SizeType32)
         SET_FROM_OPTIONAL(beamSearchDiversityRate, BeamSearchDiversityRate, FloatType)
         SET_FROM_OPTIONAL(repetitionPenalty, RepetitionPenalty, FloatType)
         SET_FROM_OPTIONAL(presencePenalty, PresencePenalty, FloatType)
         SET_FROM_OPTIONAL(frequencyPenalty, FrequencyPenalty, FloatType)
         SET_FROM_OPTIONAL(lengthPenalty, LengthPenalty, FloatType)
-        SET_FROM_OPTIONAL(earlyStopping, EarlyStopping, SizeType)
+        SET_FROM_OPTIONAL(earlyStopping, EarlyStopping, SizeType32)
 #undef SET_FROM_OPTIONAL
     }
 
 public:
-    SizeType beamWidth;
+    SizeType32 beamWidth;
 
     OptVec<FloatType> temperature;       // [1] or [batch_size] on cpu
     OptVec<SizeType32> minLength;        // [1] or [batch_size] on cpu

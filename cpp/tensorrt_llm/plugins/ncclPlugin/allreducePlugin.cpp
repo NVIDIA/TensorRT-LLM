@@ -22,6 +22,7 @@
 #include "tensorrt_llm/common/tensor.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include <nccl.h>
+#include <unordered_set>
 
 using namespace nvinfer1;
 using tensorrt_llm::plugins::AllreducePluginCreator;
@@ -116,6 +117,22 @@ size_t AllreducePlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* input
 AllReduceStrategyType AllreducePlugin::selectImplementation(
     size_t messageSize, int worldSize, nvinfer1::DataType type) noexcept
 {
+    bool const isAuto = (mStrategy == AllReduceStrategyType::AUTO);
+
+    if (!mIsP2PSupported)
+    {
+        if (!isAuto)
+        {
+            TLLM_LOG_WARNING("Since Peer to Peer not supported, fallback to AllReduceStrategy: NCCL");
+        }
+        return AllReduceStrategyType::NCCL;
+    }
+
+    if (isAuto && !mIsNVLINKSupported)
+    {
+        return AllReduceStrategyType::NCCL;
+    }
+
     auto const maxWorkspaceSize = utils::customAllReduceUtils::getMaxRequiredWorkspaceSize(worldSize);
 
     AllReduceStrategyType strat = AllReduceStrategyType::NCCL;
@@ -123,6 +140,10 @@ AllReduceStrategyType AllreducePlugin::selectImplementation(
 
     if (messageSizeBytes <= maxWorkspaceSize)
     {
+        if (!isAuto)
+        {
+            return mStrategy;
+        }
 
         if (worldSize <= 2)
         {
@@ -150,10 +171,22 @@ AllReduceStrategyType AllreducePlugin::selectImplementation(
                 strat = AllReduceStrategyType::TWOSHOT;
             }
         }
-    }
 
-    if (!kernels::configurationSupported(strat, messageSize, worldSize, type))
+        if (!kernels::configurationSupported(strat, messageSize, worldSize, type))
+        {
+            if (!isAuto)
+            {
+                TLLM_LOG_WARNING("Since not alignment, fallback to AllReduceStrategy: NCCL");
+            }
+            strat = AllReduceStrategyType::NCCL;
+        }
+    }
+    else
     {
+        if (!isAuto)
+        {
+            TLLM_LOG_WARNING("Since messageSize > maxWorkspace, fallback to AllReduceStrategy: NCCL");
+        }
         strat = AllReduceStrategyType::NCCL;
     }
 
@@ -174,10 +207,36 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
     }
     auto const sizePerElem = common::getDTypeSize(mType);
 
-    auto runtimeStrategy = mStrategy;
-    if (runtimeStrategy == AllReduceStrategyType::AUTO)
+    kernels::AllReduceStrategyType runtimeStrategy;
+
+    if (mStrategy == AllReduceStrategyType::NCCL)
+    {
+        runtimeStrategy = AllReduceStrategyType::NCCL;
+    }
+    else
     {
         runtimeStrategy = selectImplementation(size, mGroup.size(), mType);
+    }
+
+    // Log runtime strategy
+    switch (runtimeStrategy)
+    {
+    case AllReduceStrategyType::NCCL:
+    {
+        TLLM_LOG_DEBUG("AllReducePlugin strategy: AllReduceStrategyType::NCCL");
+        break;
+    }
+    case AllReduceStrategyType::ONESHOT:
+    {
+        TLLM_LOG_DEBUG("AllReducePlugin strategy: AllReduceStrategyType::ONESHOT");
+        break;
+    }
+    case AllReduceStrategyType::TWOSHOT:
+    {
+        TLLM_LOG_DEBUG("AllReducePlugin strategy: AllReduceStrategyType::TWOSHOT");
+        break;
+    }
+    default: break;
     }
 
     if (runtimeStrategy == AllReduceStrategyType::NCCL)
@@ -242,9 +301,131 @@ bool AllreducePlugin::isCustomAllReduceSuported(int ranks_per_node) const noexce
         && (ranks_per_node > 0);
 }
 
+class NvmlManager
+{
+public:
+    NvmlManager()
+    {
+        NVML_CHECK(nvmlInit());
+    }
+
+    ~NvmlManager()
+    {
+        NVML_CHECK(nvmlShutdown());
+    }
+};
+
+void AllreducePlugin::initGroupTopology() noexcept
+{
+    NvmlManager nvmlManager;
+
+    nvmlReturn_t result;
+
+    mIsP2PSupported = true;
+    mIsNVLINKSupported = true;
+
+    std::unordered_set<int> visitedDevice;
+
+    // Use cudaDeviceCanAccessPeer to determine whether p2p is supported,
+    // and use nvml to determine whether there are nvlink links between ranks.
+    for (int firstDeviceId : mGroup)
+    {
+        for (int secondDeviceId : mGroup)
+        {
+            if (firstDeviceId == secondDeviceId || visitedDevice.find(secondDeviceId) != visitedDevice.end())
+            {
+                continue;
+            }
+
+            int canAccessPeer = 0;
+            TLLM_CUDA_CHECK(cudaDeviceCanAccessPeer(&canAccessPeer, firstDeviceId, secondDeviceId));
+
+            if (!canAccessPeer)
+            {
+                mIsP2PSupported = false;
+                mIsNVLINKSupported = false;
+
+                return;
+            }
+
+            nvmlDevice_t firstDevice;
+            NVML_CHECK(nvmlDeviceGetHandleByIndex(firstDeviceId, &firstDevice));
+
+            bool isNVLINK = false;
+
+            for (unsigned int link = 0; link < NVML_NVLINK_MAX_LINKS; link++)
+            {
+                nvmlPciInfo_t remotePciInfo;
+                if (nvmlDeviceGetNvLinkRemotePciInfo_v2(firstDevice, link, &remotePciInfo) != NVML_SUCCESS)
+                {
+                    continue;
+                }
+
+                nvmlDevice_t remoteDevice;
+                result = nvmlDeviceGetHandleByPciBusId_v2(remotePciInfo.busId, &remoteDevice);
+
+                if (result == NVML_SUCCESS)
+                {
+                    // Two GPUs are connected directly through nvlink
+                    unsigned int remoteDeviceId;
+                    NVML_CHECK(nvmlDeviceGetIndex(remoteDevice, &remoteDeviceId));
+
+                    if (remoteDeviceId == secondDeviceId)
+                    {
+                        isNVLINK = true;
+                    }
+                }
+                else if (result == NVML_ERROR_NOT_FOUND)
+                {
+                    // Maybe Two GPUs are connected via nvswitch,
+                    // now remotePciInfo represents the pci information of nvswitch,
+                    // determine whether nvlink is supported by whether two GPUs are connected to the same nvswitch.
+                    nvmlDevice_t secondDevice;
+                    NVML_CHECK(nvmlDeviceGetHandleByIndex(secondDeviceId, &secondDevice));
+
+                    for (unsigned int secondLink = 0; secondLink < NVML_NVLINK_MAX_LINKS; secondLink++)
+                    {
+                        nvmlPciInfo_t secondRemotePciInfo;
+                        if (nvmlDeviceGetNvLinkRemotePciInfo_v2(secondDevice, secondLink, &secondRemotePciInfo)
+                            != NVML_SUCCESS)
+                        {
+                            continue;
+                        }
+
+                        if (strcmp(remotePciInfo.busId, secondRemotePciInfo.busId) == 0)
+                        {
+                            isNVLINK = true;
+                            break;
+                        }
+                    }
+                }
+                else
+                {
+                    NVML_CHECK(result);
+                }
+
+                if (isNVLINK)
+                {
+                    break;
+                }
+            }
+
+            mIsNVLINKSupported &= isNVLINK;
+        }
+        visitedDevice.insert(firstDeviceId);
+    }
+}
+
 int AllreducePlugin::initialize() noexcept
 {
-    if (isBuilding() || mStrategy == AllReduceStrategyType::ONESHOT || mStrategy == AllReduceStrategyType::TWOSHOT)
+    if (isBuilding())
+    {
+        return 0;
+    }
+
+    initGroupTopology();
+
+    if (mStrategy == AllReduceStrategyType::ONESHOT || mStrategy == AllReduceStrategyType::TWOSHOT)
     {
         return 0;
     }

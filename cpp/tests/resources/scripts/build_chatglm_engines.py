@@ -39,18 +39,41 @@ def convert_ckpt(model_dir: str, output_dir: str, world_size: int):
     run_command(convert_cmd)
 
 
-def build_engine(ckpt_dir: str, engine_dir: str, is_chatglm_6b: bool = False):
+def build_engine(ckpt_dir: str,
+                 engine_dir: str,
+                 is_ifb: bool = False,
+                 is_chatglm_6b: bool = False):
     build_cmd = [
-        "trtllm-build", f"--checkpoint_dir={ckpt_dir}",
-        f"--output_dir={engine_dir}", "--log_level=error", "--max_batch_size=8",
-        "--max_beam_width=2", "--max_input_len=256", "--max_output_len=128",
-        "--gpt_attention_plugin=float32", "--gemm_plugin=float32",
-        "--builder_opt=0", "--remove_input_padding=disable",
-        "--paged_kv_cache=disable"
+        "trtllm-build",
+        f"--checkpoint_dir={ckpt_dir}",
+        f"--output_dir={engine_dir}",
+        "--log_level=error",
+        "--max_batch_size=8",
+        "--max_beam_width=2",
+        "--max_input_len=256",
+        "--max_output_len=128",
+        "--gpt_attention_plugin=float32",
+        "--gemm_plugin=float32",
+        "--builder_opt=0",
     ]
+    if is_ifb:
+        build_cmd.extend([
+            "--remove_input_padding=enable",
+            "--paged_kv_cache=enable",
+            "--context_fmha=enable",
+            "--context_fmha_fp32_acc=enable",
+            "--use_paged_context_fmha=enable",
+        ])
+    else:
+        build_cmd.extend([
+            "--remove_input_padding=disable",
+            "--paged_kv_cache=disable",
+        ])
+
     if is_chatglm_6b:
         print("Disable Context FMHA for ChatGLM-6B")
-        build_cmd.append("--context_fmha=disable")
+        build_cmd.extend(
+            ["--context_fmha=disable", "--context_fmha_fp32_acc=disable"])
 
     run_command(build_cmd)
 
@@ -92,10 +115,6 @@ def build_engines(model_cache: typing.Optional[str] = None,
         print(f"Building {model_name}")
         ckpt_dir = Path(model_dir) / "c-model" / model_name
         ckpt_dir.mkdir(parents=True, exist_ok=True)
-        engine_dir = Path(
-            model_dir
-        ) / "rt_engine" / model_name / "fp32-plugin" / "tp1-pp1-gpu"
-        engine_dir.mkdir(parents=True, exist_ok=True)
 
         # Fix HF error in ChatGLM-6B, hope to remove this in the future
         if model_name == "chatglm-6b":
@@ -104,9 +123,16 @@ def build_engines(model_cache: typing.Optional[str] = None,
                 hf_dir,
             )
 
-        convert_ckpt(hf_dir, ckpt_dir / model_name, world_size)
-        build_engine(ckpt_dir / model_name, engine_dir,
-                     model_name == "chatglm-6b")
+        convert_ckpt(hf_dir, ckpt_dir, world_size)
+
+        for engine_kind in ["fp32-plugin", "fp32-plugin-packed-paged"]:
+            engine_dir = Path(
+                model_dir
+            ) / "rt_engine" / model_name / engine_kind / "tp1-pp1-gpu"
+            engine_dir.mkdir(parents=True, exist_ok=True)
+
+            build_engine(ckpt_dir, engine_dir, "paged" in engine_kind,
+                         model_name == "chatglm-6b")
 
     print("Done")
 

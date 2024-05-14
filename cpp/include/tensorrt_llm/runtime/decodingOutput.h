@@ -47,13 +47,13 @@ public:
 
         void empty(BufferManager& manager);
 
-        void reshape(SizeType batchSize, SizeType beamWidth, SizeType maxSequenceLength);
+        void reshape(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 maxSequenceLength);
 
         void release();
 
         void init(BufferManager& manager, TokenIdType endId);
 
-        BeamHypotheses slice(SizeType batchIndex, SizeType size) const;
+        BeamHypotheses slice(SizeType32 batchIndex, SizeType32 size) const;
     };
 
     static float constexpr kNegativeInfinity = -1e20f;

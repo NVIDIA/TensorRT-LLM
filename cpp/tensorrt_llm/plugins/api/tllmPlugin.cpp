@@ -227,11 +227,8 @@ extern "C"
         return pluginCreators.data();
     }
 
-#if NV_TENSORRT_MAJOR >= 10
-    [[maybe_unused]] tensorrt_llm::plugins::api::IPluginCreatorInterface* const* getCreators(std::int32_t& nbCreators)
+    [[maybe_unused]] nvinfer1::IPluginCreatorInterface* const* getCreators(std::int32_t& nbCreators)
     {
-        return reinterpret_cast<tensorrt_llm::plugins::api::IPluginCreatorInterface* const*>(
-            getPluginCreators(nbCreators));
+        return reinterpret_cast<nvinfer1::IPluginCreatorInterface* const*>(getPluginCreators(nbCreators));
     }
-#endif // NV_TENSORRT_MAJOR >= 10
 } // extern "C"

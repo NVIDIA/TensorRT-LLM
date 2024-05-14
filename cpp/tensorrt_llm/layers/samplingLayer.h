@@ -48,7 +48,7 @@ public:
 
     ~SamplingLayer() override = default;
 
-    void setup(runtime::SizeType batchSize, runtime::SizeType beamWidth, runtime::SizeType const* batchSlots,
+    void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 const* batchSlots,
         std::shared_ptr<BaseSetupParams> setupParams) override;
 
     void forward(std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs) override;
@@ -76,7 +76,7 @@ private:
     std::vector<std::unique_ptr<BaseLayer>> mSamplingLayers;
 
 private:
-    void allocateBuffer(runtime::SizeType batchSize);
+    void allocateBuffer(runtime::SizeType32 batchSize);
     void freeBuffer();
 };
 

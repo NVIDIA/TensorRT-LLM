@@ -89,7 +89,7 @@ void PenaltyLayer<T>::allocateWorkspace()
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto const workspaceSize = sizeof(SizeType) * mDecoderDomain.getMaxBatchSize()
+    auto const workspaceSize = sizeof(SizeType32) * mDecoderDomain.getMaxBatchSize()
         * mDecoderDomain.getMaxTokensPerStep() * mConfiguredBeamWidth * mDecoderDomain.getVocabSize();
     mPenaltyWorkspaceDevice = mAllocator->reMalloc(mPenaltyWorkspaceDevice, workspaceSize, false);
 
@@ -148,7 +148,7 @@ void PenaltyLayer<T>::freeBuffer()
 }
 
 template <typename T>
-void PenaltyLayer<T>::setup(SizeType batchSize, SizeType beamWidth, SizeType const* batchSlots,
+void PenaltyLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 const* batchSlots,
     std::shared_ptr<BaseSetupParams> baseSetupParams)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -165,7 +165,7 @@ void PenaltyLayer<T>::setup(SizeType batchSize, SizeType beamWidth, SizeType con
         allocateWorkspace();
     }
 
-    std::vector<SizeType> batchSlotsVec(batchSize);
+    std::vector<SizeType32> batchSlotsVec(batchSize);
     std::iota(batchSlotsVec.begin(), batchSlotsVec.end(), 0);
     auto batchSlotsHost = batchSlots ? batchSlots : batchSlotsVec.data();
 
@@ -229,9 +229,9 @@ void PenaltyLayer<T>::forward(
     auto outputs = std::dynamic_pointer_cast<DynamicDecodeOutputParams>(baseOutputs);
     auto params = std::dynamic_pointer_cast<DynamicDecodeInputParams>(baseInputs);
 
-    SizeType batchSize{0};
-    SizeType beamWidth{0};
-    SizeType vocabSize{0};
+    SizeType32 batchSize{0};
+    SizeType32 beamWidth{0};
+    SizeType32 vocabSize{0};
     if (params->logits)
     {
         auto const& logitsShape = params->logits->shape;
@@ -253,7 +253,7 @@ void PenaltyLayer<T>::forward(
     }
     auto const maxSeqLen = outputs->output_ids.shape[outputs->output_ids.shape.size() - 1];
     auto batchSlots = params->batch_slots ? params->batch_slots->template getPtr<SizeType32 const>() : nullptr;
-    std::vector<SizeType> batchSlotsVec(batchSize);
+    std::vector<SizeType32> batchSlotsVec(batchSize);
     std::iota(batchSlotsVec.begin(), batchSlotsVec.end(), 0);
     auto batchSlotsHost
         = params->batch_slots ? params->batch_slots->template getPtr<SizeType32 const>() : batchSlotsVec.data();
@@ -271,7 +271,7 @@ void PenaltyLayer<T>::forward(
 
     auto logitsPtrsHost = ITensor::slice(mLogitsPtrsHost, mCyclicStep, 1);
     auto logitsPtrsHostData = reinterpret_cast<T const**>(runtime::bufferCast<int64_t>(*logitsPtrsHost));
-    for (SizeType bi = 0; bi < batchSize; bi++)
+    for (SizeType32 bi = 0; bi < batchSize; bi++)
     {
         if (params->logits_vec)
         {
@@ -315,7 +315,7 @@ void PenaltyLayer<T>::forward(
         mRuntimeLogitsDevice, embeddingBias, mPenaltyWorkspaceDevice, mPenaltyWorkspacePrevDevice, temperatures,
         repetitionPenalties, presencePenalties, frequencyPenalties,
         (mUseRepetitionPenalty || mUsePresencePenalty || mUseFrequencyPenalty), batchSize,
-        static_cast<SizeType>(beamWidth), static_cast<SizeType>(maxSeqLen), mDecoderDomain.getVocabSize(),
+        static_cast<SizeType32>(beamWidth), static_cast<SizeType32>(maxSeqLen), mDecoderDomain.getVocabSize(),
         mDecoderDomain.getVocabSizePadded(), outputs->output_ids_ptr.template getPtr<TokenIdType const*>(),
         outputs->parent_ids_ptr.template getPtr<SizeType32 const*>(), inputLengths,
         outputs->sequence_length->template getPtr<SizeType32 const>(), minLengths,

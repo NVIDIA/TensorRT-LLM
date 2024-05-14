@@ -50,7 +50,7 @@ public:
 
     virtual ~IGptDecoder() = default;
 
-    virtual void setup(SamplingConfig const& samplingConfig, size_t batchSize, SizeType maxSequenceLength,
+    virtual void setup(SamplingConfig const& samplingConfig, size_t batchSize, SizeType32 maxSequenceLength,
         std::optional<TensorPtr> const& batchSlots = std::nullopt)
         = 0;
 
@@ -71,13 +71,13 @@ public:
 
     static void acceptDraftTokensByLogits(ITensor& draftLogits, ITensor const& targetLogits, ITensor& draftProbs,
         ITensor& targetProbs, ITensor const& numDraftTokens, ITensor& finished, ITensor const& batchSlots,
-        SizeType vocabSize, SizeType vocabSizePadded, bool useRandomAcceptThreshold, float randomAcceptThreshold,
+        SizeType32 vocabSize, SizeType32 vocabSizePadded, bool useRandomAcceptThreshold, float randomAcceptThreshold,
         curandState_t* curandState, BufferManager::CudaStreamPtr const& stream);
 
     static std::unique_ptr<IGptDecoder> create(DecodingMode const& mode, nvinfer1::DataType dtype, size_t maxBatchSize,
         size_t maxBeamWidth, size_t vocabSize, size_t vocabSizePadded, size_t maxSequenceLength,
-        BufferManager::CudaStreamPtr const& stream, std::optional<runtime::SizeType> maxTokensPerStep = std::nullopt,
-        std::optional<runtime::SizeType> maxNumMedusaHeads = std::nullopt);
+        BufferManager::CudaStreamPtr const& stream, std::optional<runtime::SizeType32> maxTokensPerStep = std::nullopt,
+        std::optional<runtime::SizeType32> maxNumMedusaHeads = std::nullopt);
 };
 
 template <typename T>
@@ -90,10 +90,10 @@ public:
 
     GptDecoder(DecodingMode const& mode, size_t maxBatchSize, size_t maxBeamWidth, size_t vocabSize,
         size_t vocabSizePadded, size_t maxSequenceLength, CudaStreamPtr const& stream,
-        std::optional<runtime::SizeType> maxTokensPerStep = std::nullopt,
-        std::optional<runtime::SizeType> maxNumMedusaHeads = std::nullopt);
+        std::optional<runtime::SizeType32> maxTokensPerStep = std::nullopt,
+        std::optional<runtime::SizeType32> maxNumMedusaHeads = std::nullopt);
 
-    void setup(SamplingConfig const& samplingConfig, size_t batchSize, SizeType maxSequenceLength,
+    void setup(SamplingConfig const& samplingConfig, size_t batchSize, SizeType32 maxSequenceLength,
         std::optional<TensorPtr> const& batchSlots = std::nullopt) override;
 
     bool forward(DecodingOutput& output, DecodingInput const& input) override;
@@ -121,8 +121,8 @@ private:
 
 inline std::unique_ptr<IGptDecoder> IGptDecoder::create(DecodingMode const& mode, nvinfer1::DataType dtype,
     size_t maxBatchSize, size_t maxBeamWidth, size_t vocabSize, size_t vocabSizePadded, size_t maxSequenceLength,
-    BufferManager::CudaStreamPtr const& stream, std::optional<runtime::SizeType> maxTokensPerStep,
-    std::optional<runtime::SizeType> maxNumMedusaHeads)
+    BufferManager::CudaStreamPtr const& stream, std::optional<runtime::SizeType32> maxTokensPerStep,
+    std::optional<runtime::SizeType32> maxNumMedusaHeads)
 {
     switch (dtype)
     {

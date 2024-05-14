@@ -31,6 +31,7 @@ class LoraRuntimeParams(object):
         max_context_length: Tensor = None,
         max_encoder_context_length: Tensor = None,
         host_encoder_input_lengths: Tensor = None,
+        weight_index: int = 0,
     ):
 
         self.lora_ranks = lora_ranks
@@ -40,6 +41,7 @@ class LoraRuntimeParams(object):
         self.max_context_length = max_context_length
         self.max_encoder_context_length = max_encoder_context_length
         self.host_encoder_input_lengths = host_encoder_input_lengths
+        self.weight_index = weight_index
 
 
 class Lora(Module):
@@ -75,7 +77,9 @@ class Lora(Module):
                 lora_runtime_params.max_encoder_context_length,
                 max_low_rank=self.max_low_rank,
                 lora_ranks=lora_runtime_params.lora_ranks,
-                lora_weights_pointers=lora_runtime_params.lora_weights_pointers)
+                lora_weights_pointers=lora_runtime_params.lora_weights_pointers,
+                weight_index=lora_runtime_params.weight_index,
+            )
         else:
             assert False, "Not support lora without plugin"
 
@@ -85,14 +89,15 @@ class Lora(Module):
 class LoraParams(object):
 
     def __init__(
-            self,
-            lora_ranks=None,  # : List[dict[Tensor]]
-            lora_weights_pointers=None,  # : List[dict[Tensor]]
-            host_context_lengths: Tensor = None,
-            max_context_length: Tensor = None,
-            max_encoder_context_length: Tensor = None,  # For cross attention
-            host_request_types: Tensor = None,
-            host_encoder_input_lengths: Tensor = None,  # For cross attention
+        self,
+        lora_ranks=None,  # : List[dict[Tensor]]
+        lora_weights_pointers=None,  # : List[dict[Tensor]]
+        host_context_lengths: Tensor = None,
+        max_context_length: Tensor = None,
+        max_encoder_context_length: Tensor = None,  # For cross attention
+        host_request_types: Tensor = None,
+        host_encoder_input_lengths: Tensor = None,  # For cross attention
+        weight_index: int = 0,
     ):
 
         self.lora_ranks = lora_ranks
@@ -103,6 +108,7 @@ class LoraParams(object):
         self.max_encoder_context_length = max_encoder_context_length
         self.host_request_types = host_request_types
         self.host_encoder_input_lengths = host_encoder_input_lengths
+        self.weight_index = weight_index
 
     def get_layer_params(self, layer_idx: int):
         return LoraParams(
@@ -113,6 +119,7 @@ class LoraParams(object):
             max_encoder_context_length=self.max_encoder_context_length,
             host_request_types=self.host_request_types,
             host_encoder_input_lengths=self.host_encoder_input_lengths,
+            weight_index=self.weight_index,
         )
 
     def get_runtime_params(self, layer_idx: int, lora_module: str):
@@ -130,6 +137,7 @@ class LoraParams(object):
                 max_encoder_context_length=self.max_encoder_context_length,
                 host_request_types=self.host_request_types,
                 host_encoder_input_lengths=self.host_encoder_input_lengths,
+                weight_index=self.weight_index,
             )
         else:
             return None

@@ -60,8 +60,9 @@ class TestFunctional(unittest.TestCase):
                              dtype=tensorrt_llm.str_dtype_to_trt('int32'))
 
             key_len = tensorrt_llm.functional.shape(trt_key, 0)
-            slopes = tensorrt_llm.functional.generate_alibi_slopes(
-                num_heads=num_heads)
+            slopes = tensorrt_llm.functional.constant(
+                tensorrt_llm.functional.generate_alibi_slopes(
+                    num_heads=num_heads))
             output = tensorrt_llm.functional.generate_alibi_biases(
                 slopes, key_len).trt_tensor
             output.name = 'output'

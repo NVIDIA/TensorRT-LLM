@@ -35,7 +35,7 @@ TensorPtr initTensor(
     std::shared_ptr<BufferManager>& mBufferManager, std::string str, std::optional<ITensor::Shape> shape = std::nullopt)
 {
     std::vector<TokenIdType> data(str.begin(), str.end());
-    auto shape1d = ITensor::makeShape({static_cast<SizeType>(data.size())});
+    auto shape1d = ITensor::makeShape({static_cast<SizeType32>(data.size())});
     if (shape)
     {
         TLLM_CHECK(ITensor::volume(shape1d) == ITensor::volume(shape.value()));
@@ -45,7 +45,7 @@ TensorPtr initTensor(
 
 bool isTensorEqString(TensorPtr const& a, std::string b)
 {
-    TLLM_CHECK(ITensor::volume(a->getShape()) == static_cast<SizeType>(b.size()));
+    TLLM_CHECK(ITensor::volume(a->getShape()) == static_cast<SizeType32>(b.size()));
     auto ar = BufferRange<TokenIdType>(*a);
     return std::equal(ar.begin(), ar.end(), b.begin());
 }
@@ -55,9 +55,9 @@ TEST(LookaheadPoolManagerTest, fillAndUpdate)
     std::shared_ptr<CudaStream> mStream = std::make_shared<CudaStream>();
     std::shared_ptr<BufferManager> mBufferManager = std::make_shared<BufferManager>(mStream);
 
-    SizeType constexpr W{5};
-    SizeType constexpr N{4};
-    SizeType constexpr G{5};
+    SizeType32 constexpr W{5};
+    SizeType32 constexpr N{4};
+    SizeType32 constexpr G{5};
     auto prompt = initTensor(mBufferManager, "hello world; hello world. live is life.");
     LookaheadPoolManager pm(G, mBufferManager);
     pm.fillWithPrompt(prompt, N);

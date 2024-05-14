@@ -49,29 +49,30 @@ public:
     void reshape(
         GenerationConfig const& generationConfig, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
-    void reshapeKvTensors(
-        SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxBlocksPerSeq, runtime::TllmRuntime const& runtime);
+    void reshapeKvTensors(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxBlocksPerSeq,
+        runtime::TllmRuntime const& runtime);
 
     void setKvPoolPointers(KvCacheManager const* kvCacheManager);
 
     void reset(BufferManager& manager){};
 
-    TransformerBuffers sliceTo(
-        GenerationConfig const& generationConfig, ModelConfig const& modelConfig, SizeType offset, SizeType batchSize);
+    TransformerBuffers sliceTo(GenerationConfig const& generationConfig, ModelConfig const& modelConfig,
+        SizeType32 offset, SizeType32 batchSize);
 
     void prepareContextStep(RuntimeBuffers* runtimeBuffers, TensorPtr const& inputIds, TokenIdType padId,
-        BufferManager& manager, KvCacheManager const* kvCacheManager, SizeType firstBatchSlotIdx,
+        BufferManager& manager, KvCacheManager const* kvCacheManager, SizeType32 firstBatchSlotIdx,
         ModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
     void postContextStep(RuntimeBuffers* runtimeBuffers, std::vector<RuntimeBuffers> const& contextBuffers,
         BufferManager& manager, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
-    void prepareNextStep(RuntimeBuffers* runtimeBuffers, SizeType step, BufferManager& manager,
-        KvCacheManager* kvCacheManager, SizeType firstBatchSlotIdx, ModelConfig const& modelConfig,
+    void prepareNextStep(RuntimeBuffers* runtimeBuffers, SizeType32 step, BufferManager& manager,
+        KvCacheManager* kvCacheManager, SizeType32 firstBatchSlotIdx, ModelConfig const& modelConfig,
         WorldConfig const& worldConfig);
 
     void getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers, TensorMap& inputBuffers, TensorMap& outputBuffers,
-        SizeType step, TensorPtr const& inputIds, ModelConfig const& modelConfig, WorldConfig const& worldConfig) const;
+        SizeType32 step, TensorPtr const& inputIds, ModelConfig const& modelConfig,
+        WorldConfig const& worldConfig) const;
 
 protected:
     void copyAttentionMasks(

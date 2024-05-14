@@ -21,7 +21,7 @@ from ...functional import Tensor, non_gated_version, recv, send
 from ...layers import (MOE, Attention, AttentionMaskType, ColumnLinear,
                        Embedding, GatedMLP, MoeConfig, PositionEmbeddingType,
                        RmsNorm)
-from ...lora_manager import LoraBuildConfig, use_lora
+from ...lora_manager import LoraConfig, use_lora
 from ...mapping import Mapping
 from ...module import Module
 from ...plugin import init_all_reduce_helper
@@ -117,26 +117,22 @@ class LLaMADecoderLayer(Module):
                 tp_size=config.mapping.tp_size,
                 quant_mode=config.quant_mode)
 
-    def forward(
-            self,
-            hidden_states,
-            attention_mask=None,
-            spec_decoding_packed_mask=None,  # For Medusa support
-            spec_decoding_position_offsets=None,
-            use_cache=False,
-            kv_cache_params=None,
-            attention_params=None,
-            lora_layer_params=None):
+    def forward(self,
+                hidden_states,
+                attention_mask=None,
+                use_cache=False,
+                spec_decoding_params=None,
+                kv_cache_params=None,
+                attention_params=None,
+                lora_layer_params=None):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
         attention_output = self.attention(
             hidden_states,
             attention_mask=attention_mask,
-            spec_decoding_packed_mask=
-            spec_decoding_packed_mask,  # For Medusa support
-            spec_decoding_position_offsets=spec_decoding_position_offsets,
             use_cache=use_cache,
+            spec_decoding_params=spec_decoding_params,
             kv_cache_params=kv_cache_params,
             attention_params=attention_params,
             lora_layer_params=lora_layer_params)
@@ -193,21 +189,19 @@ class LLaMAModel(Module):
                                 eps=config.norm_epsilon,
                                 dtype=config.dtype)
 
-    def forward(
-            self,
-            input_ids,
-            position_ids=None,
-            use_cache=False,
-            attention_mask=None,
-            spec_decoding_position_offsets=None,  # For Medusa support
-            spec_decoding_packed_mask=None,  # For Medusa support
-            kv_cache_params=None,
-            attention_params=None,
-            hidden_states=None,
-            prompt_embedding_table: Optional[Tensor] = None,
-            prompt_tasks: Optional[Tensor] = None,
-            prompt_vocab_size: Optional[Tensor] = None,
-            lora_params=None):
+    def forward(self,
+                input_ids,
+                position_ids=None,
+                use_cache=False,
+                attention_mask=None,
+                spec_decoding_params=None,
+                kv_cache_params=None,
+                attention_params=None,
+                hidden_states=None,
+                prompt_embedding_table: Optional[Tensor] = None,
+                prompt_tasks: Optional[Tensor] = None,
+                prompt_vocab_size: Optional[Tensor] = None,
+                lora_params=None):
 
         ptuning_args = [
             prompt_embedding_table, prompt_tasks, prompt_vocab_size
@@ -225,8 +219,7 @@ class LLaMAModel(Module):
             kv_cache_params=kv_cache_params,
             attention_params=attention_params,
             lora_params=lora_params,
-            spec_decoding_position_offsets=spec_decoding_position_offsets,
-            spec_decoding_packed_mask=spec_decoding_packed_mask)
+            spec_decoding_params=spec_decoding_params)
 
         if use_cache:
             hidden_states, presents = hidden_states
@@ -419,5 +412,5 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
                 dataset_cache_dir=kwargs.get('dataset_cache_dir', None),
             )
 
-    def use_lora(self, lora_config: LoraBuildConfig):
+    def use_lora(self, lora_config: LoraConfig):
         use_lora(self, lora_config)

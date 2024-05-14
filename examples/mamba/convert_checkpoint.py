@@ -1,19 +1,18 @@
 import argparse
+import copy
 import json
 import time
 from pathlib import Path
 from typing import Union
 
-import safetensors
+import safetensors.torch
 import torch
-from mamba_ssm.models.config_mamba import MambaConfig
-from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
-from mamba_ssm.utils.hf import load_config_hf
+from transformers import AutoConfig, AutoModelForCausalLM
 
 import tensorrt_llm
 from tensorrt_llm import logger
-from tensorrt_llm.layers.ssm import MambaParameters
-from tensorrt_llm.models.llama.utils import iterate_shard_files, load_state_dict
+from tensorrt_llm.models.convert_utils import (iterate_shard_files,
+                                               load_state_dict)
 
 
 def parse_arguments():
@@ -64,7 +63,7 @@ def convert_hf_mamba(hf_mamba, rank=0, dtype='float32'):
     dtype = getattr(torch, dtype)
 
     # Parameter names in mamba block
-    for l in range(hf_mamba.config.n_layer):
+    for l in range(hf_mamba.config.num_hidden_layers):
         # ssm layer
         prefix = f'backbone.layers.{l}.mixer.'
         tllm_prex = f'backbone.layers.{l}.ssm.'
@@ -109,14 +108,14 @@ def convert_hf_mamba(hf_mamba, rank=0, dtype='float32'):
             weights[tllm_prex + 'bias'] = bias
 
     # others
-    for layer in ['backbone.embedding', 'backbone.norm_f']:
+    for layer in ['backbone.embeddings', 'backbone.norm_f']:
         weight, bias = get_weight_and_bias(model_params, layer, dtype, dtype)
-        layer = layer.replace('embedding', 'vocab_embedding')
+        layer = layer.replace('embeddings', 'vocab_embedding')
         weights[layer + '.weight'] = weight
         if bias is not None:
             weights[layer + '.bias'] = bias
     weights['lm_head.weight'], _ = get_weight_and_bias(model_params,
-                                                       'backbone.embedding',
+                                                       'backbone.embeddings',
                                                        dtype, dtype)
 
     tok = time.time()
@@ -127,8 +126,8 @@ def convert_hf_mamba(hf_mamba, rank=0, dtype='float32'):
 
 def rename_hf_to_tllm(name: str):
     """ Rename a HF parameter name by the corresponding TRT-LLM style name. """
-    if 'embedding.' in name:
-        name = name.replace('embedding', 'vocab_embedding')
+    if 'embeddings.' in name:
+        name = name.replace('embeddings', 'vocab_embedding')
     if 'mixer.' in name:
         name = name.replace('mixer.', 'ssm.')
     elif 'norm.' in name:
@@ -155,17 +154,15 @@ def convert_from_hf_checkpoint(model_dir: Union[str, Path],
     for model_file in iterate_shard_files(model_dir, 0):
         logger.debug(f'Loading file {str(model_file)}...')
         model_params = load_state_dict(model_file, dtype=dtype)
-        model_params_fp32 = load_state_dict(model_file, dtype=torch.float32)
         for name, param in model_params.items():
             logger.debug(f'Converting weight {name}...')
             tllm_name = rename_hf_to_tllm(name)
             param = param.detach().cpu()
-            param_fp32 = model_params_fp32[name].detach().cpu()
             if 'A_log' in name:
-                param = -torch.exp(param_fp32)
+                param = -torch.exp(param.float())
                 param = param.permute(1, 0).contiguous()
             elif 'D' in name:
-                param = param_fp32
+                param = param.float()
             elif 'dt_proj.bias' in name:
                 param = param.float()
             elif 'conv1d.weight' in name:
@@ -178,7 +175,11 @@ def convert_from_hf_checkpoint(model_dir: Union[str, Path],
             else:
                 weights[tllm_name] = param
         del model_params
-        del model_params_fp32
+
+    # lm_head
+    if 'lm_head.weight' not in weights:
+        weights['lm_head.weight'] = copy.deepcopy(
+            weights['backbone.vocab_embedding.weight'])
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
@@ -212,9 +213,8 @@ def main():
 
     args.output_dir.mkdir(exist_ok=True, parents=True)
 
-    config_data = load_config_hf(args.model_dir)
-    hf_config = MambaConfig(**config_data)
-
+    hf_config = AutoConfig.from_pretrained(args.model_dir,
+                                           trust_remote_code=True)
     vocab_size = hf_config.vocab_size
     pad_vocab_size_multiple = hf_config.pad_vocab_size_multiple
     if vocab_size % pad_vocab_size_multiple != 0:
@@ -222,19 +222,22 @@ def main():
                                                  pad_vocab_size_multiple)
 
     config = {
-        'architecture': 'MambaLMHeadModel',
+        'architecture': 'MambaForCausalLM',
         'dtype': args.dtype,
         'logits_dtype': 'float32',
-        'hidden_size': hf_config.d_model,
-        'num_hidden_layers': hf_config.n_layer,
+        'hidden_size': hf_config.hidden_size,
+        'num_hidden_layers': hf_config.num_hidden_layers,
         'layer_types': ['recurrent'],
         'vocab_size': vocab_size,
-        'ssm_cfg': MambaParameters(**hf_config.ssm_cfg).__dict__,
         'rms_norm': hf_config.rms_norm,
         'residual_in_fp32': hf_config.residual_in_fp32,
         'pad_vocab_size_multiple': hf_config.pad_vocab_size_multiple,
         'hidden_act': 'silu',
         'num_attention_heads': 1,
+        'rnn_hidden_size': hf_config.intermediate_size,
+        'state_size': hf_config.state_size,
+        'conv_kernel': hf_config.conv_kernel,
+        'use_bias': hf_config.use_bias,
     }
 
     with (args.output_dir / 'config.json').open('w') as f:
@@ -243,10 +246,10 @@ def main():
     convert_from_ckpt = do_convert_from_ckpt(args)
     if not convert_from_ckpt:
         logger.info(f'Convert by using model')
-        hf_mamba = MambaLMHeadModel(hf_config,
-                                    device="auto",
-                                    torch_dtype="auto",
-                                    trust_remote_code=True)
+        hf_mamba = AutoModelForCausalLM.from_pretrained(args.model_dir,
+                                                        device_map="auto",
+                                                        torch_dtype="auto",
+                                                        trust_remote_code=True)
     else:
         logger.info(f'Convert by using checkpoint')
         hf_mamba = None

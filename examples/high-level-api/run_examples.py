@@ -63,12 +63,17 @@ def run_single_gpu(
               type=str,
               help='The directory of the engine.',
               default="/tmp/hlapi.engine.example")
+@click.option('--run_autopp',
+              type=bool,
+              help='Whether to run with auto parallel.',
+              default=True)
 def run_multi_gpu(
     prompt: str,
     model_dir: str,
     examples_root: str,
     llm_examples: str,
     engine_dir: str,
+    run_autopp: bool = True,
 ):
     run_example(
         "Running LLM from HuggingFace model with TP enabled",
@@ -80,10 +85,11 @@ def run_multi_gpu(
         f"{sys.executable} {llm_examples} run_llm_generate_async_example --prompt=\"{prompt}\" --model_dir={engine_dir}.tp2 --streaming"
     )  # Loading the engine with TP=2.
 
-    run_example(
-        "Running LLM with auto parallel",
-        f"{sys.executable} {llm_examples} run_llm_with_auto_parallel --prompt=\"{prompt}\" --model_dir={model_dir} --world_size=2"
-    )
+    if run_autopp:
+        run_example(
+            "Running LLM with auto parallel",
+            f"{sys.executable} {llm_examples} run_llm_with_auto_parallel --prompt=\"{prompt}\" --model_dir={model_dir} --world_size=2"
+        )
 
 
 @click.command("run_quant")

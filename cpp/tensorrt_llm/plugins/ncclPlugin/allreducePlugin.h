@@ -66,13 +66,17 @@ public:
     void serialize(void* buffer) const noexcept override;
     void destroy() noexcept override;
 
+private:
     bool isCustomAllReduceSuported(int ranks_per_node) const noexcept;
+    void initGroupTopology() noexcept;
+    kernels::AllReduceStrategyType selectImplementation(
+        size_t messageSize, int worldSize, nvinfer1::DataType type) noexcept;
 
 private:
-    static kernels::AllReduceStrategyType selectImplementation(
-        size_t messageSize, int worldSize, nvinfer1::DataType type) noexcept;
     std::string const mLayerName;
     std::set<int> mGroup;
+    bool mIsNVLINKSupported;
+    bool mIsP2PSupported;
     nvinfer1::DataType mType;
     kernels::AllReduceStrategyType mStrategy;
     kernels::AllReduceStrategyConfig mConfig;

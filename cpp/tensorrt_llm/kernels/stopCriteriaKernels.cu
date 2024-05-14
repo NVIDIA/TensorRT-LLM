@@ -27,10 +27,10 @@ namespace kernels
 {
 __global__ void stopWordsCriterion(TokenIdType const** outputIds, SizeType32 const** parentIds,
     TokenIdType const** stopWords, FinishedState* finished, SizeType32 const* sequenceLengths,
-    SizeType32 const* batchSlots, SizeType32 const* stopWordsLens, SizeType batchSize, SizeType beamWidth,
-    SizeType maxSeqLen)
+    SizeType32 const* batchSlots, SizeType32 const* stopWordsLens, SizeType32 batchSize, SizeType32 beamWidth,
+    SizeType32 maxSeqLen)
 {
-    auto const id = static_cast<SizeType>(blockIdx.x * blockDim.x + threadIdx.x);
+    auto const id = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
     auto const batchIdx = blockIdx.y / beamWidth;
     auto const beamIdx = blockIdx.y % beamWidth;
     auto const batchSlot = batchSlots != nullptr ? batchSlots[batchIdx] : batchIdx;
@@ -93,12 +93,12 @@ __global__ void stopWordsCriterion(TokenIdType const** outputIds, SizeType32 con
 
 void invokeStopWordsCriterion(TokenIdType const** outputIds, SizeType32 const** parentIds,
     TokenIdType const** stopWords, FinishedState* finished, SizeType32 const* sequenceLengths,
-    SizeType32 const* batchSlots, SizeType32 const* stopWordsLen, SizeType maxStopWordsLen, SizeType batchSize,
-    SizeType beamWidth, SizeType maxSeqLen, cudaStream_t stream)
+    SizeType32 const* batchSlots, SizeType32 const* stopWordsLen, SizeType32 maxStopWordsLen, SizeType32 batchSize,
+    SizeType32 beamWidth, SizeType32 maxSeqLen, cudaStream_t stream)
 {
     // Check if we have sampled a word from the stopWords list. If so, stop the sequence.
     dim3 block, grid;
-    constexpr SizeType maxBlockSize{256};
+    constexpr SizeType32 maxBlockSize{256};
 
     block.x = min(((maxStopWordsLen + 32 - 1) / 32) * 32, maxBlockSize);
     grid.x = (maxStopWordsLen + block.x - 1) / block.x;
@@ -116,8 +116,8 @@ __global__ void lengthCriterion(FinishedState* finished, SizeType32* finishedSum
     auto const batchIdx = blockIdx.x;
     auto const batchSlot = batchSlots != nullptr ? batchSlots[batchIdx] : batchIdx;
 
-    for (auto beamIdx = static_cast<SizeType>(threadIdx.x); beamIdx < beamWidth;
-         beamIdx += static_cast<SizeType>(blockDim.x))
+    for (auto beamIdx = static_cast<SizeType32>(threadIdx.x); beamIdx < beamWidth;
+         beamIdx += static_cast<SizeType32>(blockDim.x))
     {
         auto const batchSlotBeamWidthIdx = batchSlot * beamWidth + beamIdx;
 
@@ -153,7 +153,7 @@ __global__ void lengthCriterion(FinishedState* finished, SizeType32* finishedSum
 }
 
 void invokeLengthCriterion(FinishedState* finished, SizeType32* finishedSum, SizeType32 const* sequenceLimitLength,
-    SizeType32* sequenceLengths, SizeType32 const* batchSlots, SizeType batchSize, SizeType beamWidth,
+    SizeType32* sequenceLengths, SizeType32 const* batchSlots, SizeType32 batchSize, SizeType32 beamWidth,
     cudaStream_t stream)
 {
     // Check if we have attained the sequence length limit. If so, stop the

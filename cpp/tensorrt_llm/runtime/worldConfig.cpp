@@ -28,13 +28,13 @@
 using namespace tensorrt_llm::runtime;
 namespace tc = tensorrt_llm::common;
 
-WorldConfig::WorldConfig(SizeType tensorParallelism, SizeType pipelineParallelism, SizeType rank, SizeType gpusPerNode,
-    std::optional<std::vector<SizeType>> const& deviceIds)
+WorldConfig::WorldConfig(SizeType32 tensorParallelism, SizeType32 pipelineParallelism, SizeType32 rank,
+    SizeType32 gpusPerNode, std::optional<std::vector<SizeType32>> const& deviceIds)
     : mTensorParallelism{tensorParallelism}
     , mPipelineParallelism{pipelineParallelism}
     , mRank{rank}
     , mGpusPerNode{gpusPerNode}
-    , mDeviceIds{deviceIds.value_or(std::vector<SizeType>(mGpusPerNode))}
+    , mDeviceIds{deviceIds.value_or(std::vector<SizeType32>(mGpusPerNode))}
 {
 #if ENABLE_MULTI_DEVICE
     auto const numDevices = mDeviceIds.size();
@@ -48,7 +48,7 @@ WorldConfig::WorldConfig(SizeType tensorParallelism, SizeType pipelineParallelis
     else
     {
         // total number is at most mGpusPerNode
-        TLLM_CHECK_WITH_INFO(static_cast<SizeType>(numDevices) <= mGpusPerNode,
+        TLLM_CHECK_WITH_INFO(static_cast<SizeType32>(numDevices) <= mGpusPerNode,
             "Number of device IDs %zu is greater than GPUs per node %d", numDevices, mGpusPerNode);
 
         // all deviceIds is within the range
@@ -56,7 +56,7 @@ WorldConfig::WorldConfig(SizeType tensorParallelism, SizeType pipelineParallelis
         TLLM_CHECK(*std::min_element(mDeviceIds.begin(), mDeviceIds.end()) >= 0);
 
         // all ids are unique
-        std::set<SizeType> const deviceIdSet(mDeviceIds.begin(), mDeviceIds.end());
+        std::set<SizeType32> const deviceIdSet(mDeviceIds.begin(), mDeviceIds.end());
         TLLM_CHECK_WITH_INFO(
             deviceIdSet.size() == numDevices, "Device IDs are not unique %zu != %zu", deviceIdSet.size(), numDevices);
 
@@ -85,8 +85,8 @@ bool WorldConfig::validMpiConfig() const
     return COMM_SESSION.getSize() == getSize();
 }
 
-WorldConfig WorldConfig::mpi(SizeType gpusPerNode, std::optional<SizeType> tensorParallelism,
-    std::optional<SizeType> pipelineParallelism, std::optional<std::vector<SizeType>> const& deviceIds)
+WorldConfig WorldConfig::mpi(SizeType32 gpusPerNode, std::optional<SizeType32> tensorParallelism,
+    std::optional<SizeType32> pipelineParallelism, std::optional<std::vector<SizeType32>> const& deviceIds)
 {
 #if ENABLE_MULTI_DEVICE
     auto& comm = COMM_SESSION;
@@ -104,14 +104,14 @@ WorldConfig WorldConfig::mpi(SizeType gpusPerNode, std::optional<SizeType> tenso
 #endif
 }
 
-std::vector<SizeType> WorldConfig::getPipelineParallelGroup() const
+std::vector<SizeType32> WorldConfig::getPipelineParallelGroup() const
 {
     auto const pp = getPipelineParallelism();
     auto const tp = getTensorParallelism();
     auto const worldSize = getSize();
-    std::vector<SizeType> group;
+    std::vector<SizeType32> group;
     group.reserve(pp);
-    for (SizeType idx = getTensorParallelRank(); idx < worldSize; idx += tp)
+    for (SizeType32 idx = getTensorParallelRank(); idx < worldSize; idx += tp)
     {
         group.push_back(idx);
     }

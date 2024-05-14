@@ -199,7 +199,7 @@ class TestFunctional(unittest.TestCase):
                              dtype=tensorrt_llm.str_dtype_to_trt(dtype))
             net._mark_output(outputs[1],
                              'present_state',
-                             dtype=tensorrt_llm.str_dtype_to_trt(dtype))
+                             dtype=tensorrt_llm.str_dtype_to_trt('float32'))
 
         # trt run
         inputs = {

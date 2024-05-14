@@ -92,8 +92,9 @@ bool lruPlugin::supportsFormatCombination(
     {
         return inOut[pos].type == nvinfer1::DataType::kINT64;
     }
-    else if (pos == getStateIdx())
+    else if (pos == getStateIdx() || pos == (nbInputs + 1))
     {
+        // Use float for both input and output state
         return (inOut[pos].type == nvinfer1::DataType::kFLOAT) && (inOut[pos].format == TensorFormat::kLINEAR);
     }
     else

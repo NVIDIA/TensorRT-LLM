@@ -36,12 +36,12 @@ namespace tensorrt_llm::plugins
 
 struct GemmDims
 {
-    using DimType = utils::DimType;
+    using DimType64 = utils::DimType64;
 
-    DimType minM;
-    DimType maxM;
-    DimType n;
-    DimType k;
+    DimType64 minM;
+    DimType64 maxM;
+    DimType64 n;
+    DimType64 k;
 
     GemmDims()
         : minM(-1)
@@ -51,7 +51,7 @@ struct GemmDims
     {
     }
 
-    GemmDims(DimType minM_, DimType maxM_, DimType n_, DimType k_)
+    GemmDims(DimType64 minM_, DimType64 maxM_, DimType64 n_, DimType64 k_)
         : minM(minM_)
         , maxM(maxM_)
         , n(n_)

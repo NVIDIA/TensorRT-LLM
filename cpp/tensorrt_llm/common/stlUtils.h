@@ -84,4 +84,38 @@ constexpr TOutputIt exclusiveScan(TInputIt first, TInputIt last, TOutputIt dFirs
 #endif
 }
 
+template <typename T, typename = void>
+struct HasOperatorOutput : std::false_type
+{
+};
+
+template <typename T>
+struct HasOperatorOutput<T, std::void_t<decltype((std::declval<std::ostream&>() << std::declval<T>()))>>
+    : std::true_type
+{
+};
+
+template <typename T>
+std::string toString(T const& t, typename std::enable_if_t<HasOperatorOutput<T>::value, int> = 0)
+{
+    std::ostringstream oss;
+    oss << t;
+    return oss.str();
+}
+
+template <typename T>
+std::string toString(std::optional<T> const& t, typename std::enable_if_t<HasOperatorOutput<T>::value, int> = 0)
+{
+    std::ostringstream oss;
+    if (t)
+    {
+        oss << t.value();
+    }
+    else
+    {
+        oss << "None";
+    }
+    return oss.str();
+}
+
 } // namespace tensorrt_llm::common::stl_utils

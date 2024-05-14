@@ -501,8 +501,6 @@ size_t MoeGemmRunner<T, WeightType>::calcMaxWorkspaceSize(int num_experts) const
     {
         return 0;
     }
-    TLLM_CHECK_WITH_INFO((kernels::cutlass_kernels::isValidHopperMOESpecialisation<T, WeightType>()),
-        "Configuration is specialised for Hopper but not supported");
     if constexpr (kernels::cutlass_kernels::isValidHopperMOESpecialisation<T, WeightType>())
     {
         auto configs = getHopperConfigs();
@@ -524,9 +522,11 @@ size_t MoeGemmRunner<T, WeightType>::calcMaxWorkspaceSize(int num_experts) const
         TLLM_CHECK_WITH_INFO(has_config, "Could not find valid config when calculating workspace size");
         return max_size;
     }
-
-    TLLM_CHECK_WITH_INFO(false, "Unsupported MoE GEMM configuration"); // Unreachable
-    return 0;
+    else
+    {
+        TLLM_THROW("Attempting to calculate Hopper GEMM workspace size with unsupported weight combination");
+        return 0;
+    }
 }
 
 template <typename T, typename WeightType>

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from tensorrt_llm import ModelConfig, logger
-from tensorrt_llm.hlapi import KvCacheConfig, SchedulerPolicy
+from tensorrt_llm.hlapi import CapacitySchedulerPolicy, KvCacheConfig
 from tensorrt_llm.hlapi._perf_evaluator import LLMPerfEvaluator
 from tensorrt_llm.hlapi.utils import print_colored
 
@@ -55,17 +55,18 @@ class GridSearcher:
             if tuple(llm_kwargs.items()) in skip_configs:
                 continue
 
-            def scheduleing_policy_str(policy: SchedulerPolicy):
-                if policy == SchedulerPolicy.GUARANTEED_NO_EVICT:
+            def capacity_scheduling_policy_str(policy: CapacitySchedulerPolicy):
+                if policy == CapacitySchedulerPolicy.GUARANTEED_NO_EVICT:
                     return "guaranteed_no_evict"
-                elif policy == SchedulerPolicy.MAX_UTILIZATION:
+                elif policy == CapacitySchedulerPolicy.MAX_UTILIZATION:
                     return "max_utilization"
                 else:
                     raise ValueError(f"Unknown policy {policy}")
 
             origin_llm_kwargs = llm_kwargs.copy()
-            origin_llm_kwargs["scheduling_policy"] = scheduleing_policy_str(
-                origin_llm_kwargs["scheduling_policy"])
+            origin_llm_kwargs[
+                "capacity_scheduling_policy"] = capacity_scheduling_policy_str(
+                    origin_llm_kwargs["capacity_scheduling_policy"])
 
             kvcache = KvCacheConfig()
             kvcache.enable_block_reuse = llm_kwargs.pop('kvcache_reuse_blocks')
@@ -102,9 +103,9 @@ class GridSearcher:
         tunable_options = dict(
             multi_block_mode=[False, True],
             kvcache_reuse_blocks=[False, True],
-            scheduling_policy=[
-                SchedulerPolicy.GUARANTEED_NO_EVICT,
-                SchedulerPolicy.MAX_UTILIZATION
+            capacity_scheduling_policy=[
+                CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
+                CapacitySchedulerPolicy.MAX_UTILIZATION
             ],
             enable_chunked_context=[False, True],
         )

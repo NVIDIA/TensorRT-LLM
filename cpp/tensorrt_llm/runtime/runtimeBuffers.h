@@ -21,7 +21,7 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/promptTuningParams.h"
-#include "tensorrt_llm/runtime/ssmStateBuffers.h"
+#include "tensorrt_llm/runtime/rnnStateBuffers.h"
 #include "tensorrt_llm/runtime/transformerBuffers.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
@@ -59,7 +59,7 @@ public:
     TensorPtr logits;
     TensorPtr sequenceLengths; // with attention plugin
     TensorPtr lastTokenIds;
-    TensorPtr requestTypes;    // Host tensor, with attention plugin for transformer-based model or for SSM based-model
+    TensorPtr requestTypes;    // Host tensor, with attention plugin for transformer-based model or for RNN based-model
     TensorPtr allGenerationLogits; // pre-allocate a buffer to save all generation logits, device tensor
     TensorPtr originalLogitsPtr;   // Record the initially created buffer address.
     // `logits` will point to new buffer (i.e. `allGenerationLogits`) for each iteration to
@@ -94,8 +94,8 @@ public:
     PromptTuningParams promptTuningParams;
     TensorPtr promptTuningTasksHost; // Tensor to hold tasks on host
 
-    // SSM model buffer
-    std::optional<SsmStateBuffers> ssmStateBuffers;
+    // RNN model buffer
+    std::optional<RnnStateBuffers> rnnStateBuffers;
 
     // generation logit pointer list
     std::shared_ptr<std::vector<TensorPtr>> generationLogitsFragments;
@@ -112,8 +112,9 @@ public:
 
     void create(TllmRuntime const& runtime, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
-    void initFromInput(ITensor const& inputIds, TensorPtr const& inputLengths, bool inputPacked, SizeType beamWidth,
-        SizeType maxAttentionWindow, SizeType sinkTokenLength, SizeType maxSequenceLength, BufferManager& manager);
+    void initFromInput(ITensor const& inputIds, TensorPtr const& inputLengths, bool inputPacked, SizeType32 beamWidth,
+        SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength,
+        BufferManager& manager);
 
     //! \brief Reshape buffers based on current GenerationConfig
     void reshape(ModelConfig const& modelConfig, WorldConfig const& worldConfig);
@@ -121,18 +122,18 @@ public:
     void reset(BufferManager& manager);
 
     std::vector<RuntimeBuffers> split(
-        SizeType contextBatchSize, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
+        SizeType32 contextBatchSize, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
     void postContextStep(std::vector<RuntimeBuffers> const& contextBuffers, BufferManager& manager,
         ModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
     void prepareContextStep(TensorPtr const& inputIds, TokenIdType padId, BufferManager& manager,
-        KvCacheManager const* kvCacheManager, SizeType firstBatchSlotIdx, ModelConfig const& modelConfig,
+        KvCacheManager const* kvCacheManager, SizeType32 firstBatchSlotIdx, ModelConfig const& modelConfig,
         WorldConfig const& worldConfig);
-    TensorPtr prepareNextStep(SizeType step, BufferManager& manager, KvCacheManager* kvCacheManager,
-        SizeType firstBatchSlotIdx, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
+    TensorPtr prepareNextStep(SizeType32 step, BufferManager& manager, KvCacheManager* kvCacheManager,
+        SizeType32 firstBatchSlotIdx, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
-    void getRuntimeBuffers(TensorMap& inputBuffers, TensorMap& outputBuffers, SizeType const step,
+    void getRuntimeBuffers(TensorMap& inputBuffers, TensorMap& outputBuffers, SizeType32 const step,
         TensorPtr const& inputIds, TensorPtr const& commPtrs, ModelConfig const& modelConfig,
         WorldConfig const& worldConfig) const;
 

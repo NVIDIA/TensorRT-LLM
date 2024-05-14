@@ -206,6 +206,7 @@ struct XQALaunchParam
     float const* kv_scale_quant_orig = nullptr;
     int* cu_seq_lens = nullptr;
     float* rotary_inv_freq_buf = nullptr;
+    int32_t* semaphores = nullptr;
     void* scratch = nullptr;
 };
 
@@ -222,6 +223,7 @@ void buildXQALaunchParams(
     launchParams.qkv = static_cast<uint8_t const*>(params.qkv);
     launchParams.batch_size = params.batch_size;
     launchParams.kv_scale_quant_orig = params.kv_scale_quant_orig;
+    launchParams.semaphores = params.semaphores;
 
     // Workspace.
     size_t offset = 0;

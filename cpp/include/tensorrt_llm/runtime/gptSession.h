@@ -67,12 +67,12 @@ class NcclCommunicator;
 class RuntimeBuffers;
 class TllmRuntime;
 
-class GptSession
+class [[deprecated("Use the executor API instead.")]] GptSession
 {
     using KvCacheManager = batch_manager::kv_cache_manager::KVCacheManager;
     using KvCacheConfig = batch_manager::kv_cache_manager::KvCacheConfig;
     using TensorPtr = runtime::ITensor::SharedPtr;
-    using TokenGeneratedCallback = std::function<void(SizeType step, bool finished)>;
+    using TokenGeneratedCallback = std::function<void(SizeType32 step, bool finished)>;
 
 public:
     using LoggerPtr = std::shared_ptr<nvinfer1::ILogger>;
@@ -83,19 +83,23 @@ public:
     class Config
     {
     public:
-        Config(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxSequenceLength)
+        Config(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxSequenceLength,
+            float gpuWeightsPercent = 1.0)
             : maxBatchSize{maxBatchSize}
             , maxBeamWidth{maxBeamWidth}
             , maxSequenceLength{maxSequenceLength}
+            , gpuWeightsPercent{gpuWeightsPercent}
         {
         }
 
         // The maximum number of sequences in a batch
-        SizeType maxBatchSize;
+        SizeType32 maxBatchSize;
         // The maximum width of the beams in beam-search
-        SizeType maxBeamWidth;
+        SizeType32 maxBeamWidth;
         // The length of the longest input sequence
-        SizeType maxSequenceLength;
+        SizeType32 maxSequenceLength;
+        // Percentage of weights on the gpu at runtime
+        float gpuWeightsPercent;
         // Whether the session will use a different decoder per request.
         // It must be set to `true` when running in-flight batching
         bool decoderPerRequest{false};
@@ -104,10 +108,10 @@ public:
         KvCacheConfig kvCacheConfig{};
         // The micro batch size to be used in context phase.
         // Batches entered in `GptSession::generation` will be split into smaller micro batches of this size
-        std::optional<SizeType> ctxMicroBatchSize = std::nullopt;
+        std::optional<SizeType32> ctxMicroBatchSize = std::nullopt;
         // The micro batch size to be used in generation phase.
         // Batches entered in `GptSession::generation` will be split into smaller micro batches of this size.
-        std::optional<SizeType> genMicroBatchSize = std::nullopt;
+        std::optional<SizeType32> genMicroBatchSize = std::nullopt;
         std::optional<DecodingMode> decodingMode = std::nullopt;
         bool normalizeLogProbs = true;
     };
@@ -248,35 +252,35 @@ private:
     void setup(Config const& sessionConfig);
 
     void createContexts();
-    void createBuffers(SizeType numMicroBatches);
-    void createDecoders(SizeType batchSize, SizeType beamWidth, SizeType maxAttentionWindow, SizeType sinkTokenLength,
-        SizeType maxSequenceLength, nvinfer1::DataType logitsType, bool decoderPerRequest, SizeType numMicroBatches,
-        DecodingMode const& decodingMode);
-    void createKvCacheManager(SizeType batchSize, SizeType beamWidth, SizeType maxAttentionWindow,
-        SizeType sinkTokenLength, SizeType maxSequenceLength, KvCacheConfig const& config);
-    void createCustomAllReduceWorkspace(SizeType batchSize, SizeType beamWidth, SizeType maxSequenceLength);
+    void createBuffers(SizeType32 numMicroBatches);
+    void createDecoders(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 maxAttentionWindow,
+        SizeType32 sinkTokenLength, SizeType32 maxSequenceLength, nvinfer1::DataType logitsType, bool decoderPerRequest,
+        SizeType32 numMicroBatches, DecodingMode const& decodingMode);
+    void createKvCacheManager(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 maxAttentionWindow,
+        SizeType32 sinkTokenLength, SizeType32 maxSequenceLength, KvCacheConfig const& config);
+    void createCustomAllReduceWorkspace(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 maxSequenceLength);
 
     void executeContextStep(std::vector<GenerationInput> const& generationBatchesInputs,
-        std::vector<SizeType> const& generationBatchesOffsets, KvCacheManager const* kvCacheManager);
-    SizeType executeGenerationStep(SizeType step, std::vector<GenerationInput> const& microBatchesInputs,
-        std::vector<GenerationOutput>& microBatchesOutputs, std::vector<SizeType> const& microBatchOffsets,
+        std::vector<SizeType32> const& generationBatchesOffsets, KvCacheManager const* kvCacheManager);
+    SizeType32 executeGenerationStep(SizeType32 step, std::vector<GenerationInput> const& microBatchesInputs,
+        std::vector<GenerationOutput>& microBatchesOutputs, std::vector<SizeType32> const& microBatchOffsets,
         KvCacheManager* kvCacheManager, std::vector<bool>& microBatchesFinished);
 
     //! @brief Execute decoder on last PP rank, receive decoder output on other PP ranks.
-    void decoderStepAsync(SizeType decoderStep, SizeType microBatchId);
+    void decoderStepAsync(SizeType32 decoderStep, SizeType32 microBatchId);
 
     //! @brief Synchronize with the decoder and return the `shouldStop` flag.
-    bool shouldStopSync(SizeType batchSize, SizeType beamWidth, SizeType microBatchId);
+    bool shouldStopSync(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 microBatchId);
 
     //! @brief Collect final output ids and log probs on last PP rank and send them to first PP rank.
     //! @details Receives are asynchronous on host, so synchronization is required before access.
-    void finalize(SizeType microBatchId);
+    void finalize(SizeType32 microBatchId);
 
-    void kvCacheAddSequences(SizeType beamWidth, SizeType microBatchId, SizeType firstBatchIdx);
+    void kvCacheAddSequences(SizeType32 beamWidth, SizeType32 microBatchId, SizeType32 firstBatchIdx);
 
     //! @brief Populate outputIds and return reference to newTokens tensor
     ITensor::SharedPtr initDecoder(ITensor& outputIds, GenerationInput const& inputs, GenerationOutput const& outputs,
-        SamplingConfig const& samplingConfig, SizeType microBatchId) const;
+        SamplingConfig const& samplingConfig, SizeType32 microBatchId) const;
 
     TokenGeneratedCallback createOnTokenGeneratedCallback(GenerationOutput& outputs);
 
@@ -303,7 +307,7 @@ private:
         }
 
         void clear();
-        void prepareNextGraph(TllmRuntime const& runtime, SizeType nextContextId);
+        void prepareNextGraph(TllmRuntime const& runtime, SizeType32 nextContextId);
         void launch(CudaStream const& stream);
 
     private:
@@ -325,24 +329,24 @@ private:
         {
         }
 
-        explicit MicroBatchConfig(SizeType maxBatchSize, SizeType pipelineParallelism,
-            std::optional<SizeType> genMicroBatchSize, std::optional<SizeType> ctxMicroBatchSize);
+        explicit MicroBatchConfig(SizeType32 maxBatchSize, SizeType32 pipelineParallelism,
+            std::optional<SizeType32> genMicroBatchSize, std::optional<SizeType32> ctxMicroBatchSize);
 
-        constexpr SizeType numCtxPerGen() const
+        constexpr SizeType32 numCtxPerGen() const
         {
             return numCtxBatches / numGenBatches;
         }
 
         //! @details flip-flop between 2 graph instances for each generation batch.
-        constexpr SizeType getGenGraphId(SizeType flipFlopId, SizeType generationBatchId) const
+        constexpr SizeType32 getGenGraphId(SizeType32 flipFlopId, SizeType32 generationBatchId) const
         {
             return flipFlopId * numGenBatches + generationBatchId;
         }
 
-        SizeType numCtxBatches;
-        SizeType numGenBatches;
-        SizeType ctxBatchSize;
-        SizeType genBatchSize;
+        SizeType32 numCtxBatches;
+        SizeType32 numGenBatches;
+        SizeType32 ctxBatchSize;
+        SizeType32 genBatchSize;
     };
 
     friend class batch_manager::TrtGptModelV1;
@@ -357,9 +361,9 @@ private:
 
     std::shared_ptr<AllReduceBuffers> mAllReduceBuffers;
 
-    SizeType mDecoderMaxSequenceLength{};
-    SizeType mDecoderMaxAttentionWindow{};
-    SizeType mDecoderSinkTokenLength{};
+    SizeType32 mDecoderMaxSequenceLength{};
+    SizeType32 mDecoderMaxAttentionWindow{};
+    SizeType32 mDecoderSinkTokenLength{};
 
     LoggerPtr mLogger;
     std::shared_ptr<TllmRuntime> mRuntime;

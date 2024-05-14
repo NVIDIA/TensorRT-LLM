@@ -18,6 +18,7 @@ from ..module import Module
 from ..quantization import QuantMode
 from .linear import ColumnLinear, RowLinear
 from .lora import LoraRuntimeParams
+from .normalization import LayerNorm
 
 
 class MLP(Module):
@@ -32,13 +33,16 @@ class MLP(Module):
             tp_group=None,
             tp_size=1,
             quant_mode=QuantMode(0),
+            inner_layernorm=False,
+            eps=1e-05,
     ):
         super().__init__()
         if hidden_act not in ACT2FN:
             raise ValueError(
                 'unsupported activation function: {}'.format(hidden_act))
         fc_output_size = 2 * ffn_hidden_size if hidden_act == 'swiglu' else ffn_hidden_size
-
+        self.inner_layernorm = LayerNorm(ffn_hidden_size, dtype=dtype,
+                                         eps=eps) if inner_layernorm else None
         self.fc = ColumnLinear(hidden_size,
                                fc_output_size,
                                bias=bias,
@@ -71,6 +75,8 @@ class MLP(Module):
 
         inter = self.fc(hidden_states, mlp_fc_lora_params)
         inter = ACT2FN[self.hidden_act](inter)
+        if self.inner_layernorm is not None:
+            inter = self.inner_layernorm(inter)
         output = self.proj(inter, lora_runtime_params=mlp_proj_lora_params)
         return output
 
@@ -87,6 +93,8 @@ class GatedMLP(MLP):
             tp_group=None,
             tp_size=1,
             quant_mode=QuantMode(0),
+            inner_layernorm=False,
+            eps=1e-05,
     ):
         super().__init__(hidden_size,
                          ffn_hidden_size,
@@ -95,7 +103,9 @@ class GatedMLP(MLP):
                          dtype=dtype,
                          tp_group=tp_group,
                          tp_size=tp_size,
-                         quant_mode=quant_mode)
+                         quant_mode=quant_mode,
+                         inner_layernorm=inner_layernorm,
+                         eps=eps)
 
         self.hidden_size = hidden_size
         self.ffn_hidden_size = ffn_hidden_size
@@ -131,6 +141,8 @@ class GatedMLP(MLP):
         inter = ACT2FN[self.hidden_act](inter)
         gate = self.gate(hidden_states, mlp_gate_lora_params)
         intermediate = inter * gate
+        if self.inner_layernorm is not None:
+            intermediate = self.inner_layernorm(intermediate)
         output = self.proj(intermediate,
                            lora_runtime_params=mlp_proj_lora_params)
         return output

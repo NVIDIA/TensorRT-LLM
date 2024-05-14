@@ -89,11 +89,14 @@ def test_gpt_session_config():
     max_batch_size = 1000
     max_beam_width = 64
     max_sequence_length = 1 << 20
+    gpu_weights_percent = 0.5
     gpt_session_config = _tb.GptSessionConfig(max_batch_size, max_beam_width,
-                                              max_sequence_length)
+                                              max_sequence_length,
+                                              gpu_weights_percent)
     assert gpt_session_config.max_batch_size == max_batch_size
     assert gpt_session_config.max_beam_width == max_beam_width
     assert gpt_session_config.max_sequence_length == max_sequence_length
+    assert gpt_session_config.gpu_weights_percent == gpu_weights_percent
 
     assert gpt_session_config.kv_cache_config is not None
     assert gpt_session_config.kv_cache_config.max_tokens is None
@@ -195,16 +198,16 @@ def test_decoding_mode():
 def test_model_config():
     vocab_size = 10000
     num_attention_layers = 12
-    num_ssm_layers = 2
+    num_rnn_layers = 2
     num_heads = 16
     hidden_size = 768
     data_type = _tb.DataType.FLOAT
     model_config = _tb.ModelConfig(vocab_size, num_attention_layers,
-                                   num_ssm_layers, num_heads, hidden_size,
+                                   num_rnn_layers, num_heads, hidden_size,
                                    data_type)
     assert model_config.vocab_size == vocab_size
     assert model_config.num_attention_layers() == num_attention_layers
-    assert model_config.num_ssm_layers() == num_ssm_layers
+    assert model_config.num_rnn_layers() == num_rnn_layers
     assert model_config.num_heads == num_heads
     assert model_config.hidden_size == hidden_size
     assert model_config.data_type == data_type
@@ -342,7 +345,7 @@ def test_gpt_json_config():
     model_config = {
         "vocab_size": 1000,
         "num_attention_layers": 12,
-        "num_ssm_layers": 2,
+        "num_rnn_layers": 2,
         "num_heads": 4,
         "hidden_size": 512,
         "data_type": _tb.DataType.FLOAT,
@@ -391,7 +394,6 @@ def test_gpt_json_config():
             "gpt_attention_plugin": False,
             "remove_input_padding": False,
             "use_custom_all_reduce": False,
-            "use_context_fmha_for_generation": False,
             "use_paged_context_fmha": False,
             "lora_plugin": False,
         }

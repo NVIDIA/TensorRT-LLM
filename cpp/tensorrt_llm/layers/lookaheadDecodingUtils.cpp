@@ -14,21 +14,21 @@ void printTokens2d(char const* name, TensorPtr const& tensor)
 {
     auto M = tensor->getShape().d[0];
     auto N = tensor->getShape().d[1];
-    auto tr = BufferRange<TokenIdType>(*tensor);
+    auto tensorRange = BufferRange<TokenIdType>(*tensor);
     std::ostringstream buf;
     buf << name << ": " << tensor->getShape() << "(\n";
-    for (SizeType mi = 0; mi < M; mi++)
+    for (SizeType32 mi = 0; mi < M; mi++)
     {
-        for (SizeType ni = 0; ni < N; ni++)
+        for (SizeType32 ni = 0; ni < N; ni++)
         {
-            auto token = tr[mi * N + ni];
+            auto token = tensorRange[mi * N + ni];
             if (token >= 0 && token <= 255)
             {
                 buf << "'" << static_cast<char>(token) << "'";
             }
             else
             {
-                buf << token << "'";
+                buf << token;
             }
             buf << (ni == (N - 1) ? ';' : ',');
         }

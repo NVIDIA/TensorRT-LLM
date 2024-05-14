@@ -15,9 +15,9 @@ void LookaheadPoolManager::insertOne(Key key, TensorPtr ngram)
         search->second.remove_if(
             [&ngram](TensorPtr const& item)
             {
-                auto ar = BufferRange<TokenIdType>(*ngram);
-                auto br = BufferRange<TokenIdType>(*item);
-                return std::equal(ar.begin(), ar.end(), br.begin());
+                auto ngramRange = BufferRange<TokenIdType>(*ngram);
+                auto itemRange = BufferRange<TokenIdType>(*item);
+                return std::equal(ngramRange.begin(), ngramRange.end(), itemRange.begin());
             });
         if (mGuessSetSize >= 0 && search->second.size() >= mGuessSetSize)
         {
@@ -31,20 +31,20 @@ void LookaheadPoolManager::insertOne(Key key, TensorPtr ngram)
     }
 }
 
-void LookaheadPoolManager::fillWithPrompt(TensorPtr prompt, SizeType level)
+void LookaheadPoolManager::fillWithPrompt(TensorPtr prompt, SizeType32 level)
 {
-    SizeType length = prompt->getShape().d[0];
-    auto pr = BufferRange<Key>(*prompt);
-    for (SizeType ti = 0; ti + level - 1 < length; ti++)
+    SizeType32 length = prompt->getShape().d[0];
+    auto promptRange = BufferRange<Key>(*prompt);
+    for (SizeType32 ti = 0; ti + level - 1 < length; ti++)
     {
-        auto key = pr[ti];
+        auto key = promptRange[ti];
         TensorPtr ngram
             = mBufferManager->copyFrom(*ITensor::slice(prompt, ti + 1, level - 1), runtime::MemoryType::kCPU);
         insertOne(key, ngram);
     }
 }
 
-std::list<LookaheadPoolManager::TensorPtr> LookaheadPoolManager::guess(Key lastToken, SizeType guessSize) const
+std::list<LookaheadPoolManager::TensorPtr> LookaheadPoolManager::guess(Key lastToken, SizeType32 guessSize) const
 {
     auto search = mTokenMap.find(lastToken);
     if (search != mTokenMap.end())
@@ -69,14 +69,14 @@ std::list<LookaheadPoolManager::TensorPtr> LookaheadPoolManager::guess(Key lastT
 void LookaheadPoolManager::update(TensorPtr keyTokens, TensorPtr ngramTokens)
 {
     TLLM_CHECK(keyTokens->getShape().d[0] == ngramTokens->getShape().d[0]);
-    auto kr = BufferRange<Key>(*keyTokens);
+    auto keyRange = BufferRange<Key>(*keyTokens);
     auto window = ngramTokens->getShape().d[0];
 
-    for (SizeType wi = 0; wi < window; wi++)
+    for (SizeType32 wi = 0; wi < window; wi++)
     {
         TensorPtr ngram = mBufferManager->copyFrom(*ITensor::slice(ngramTokens, wi, 1), runtime::MemoryType::kCPU);
         ngram->squeeze(0);
-        insertOne(kr[wi], ngram);
+        insertOne(keyRange[wi], ngram);
     }
 }
 

@@ -43,8 +43,8 @@ BanWordsLayer<T>::BanWordsLayer(DecodingMode const& mode, DecoderDomain const& d
 }
 
 template <typename T>
-void BanWordsLayer<T>::setup(
-    SizeType batchSize, SizeType beamWidth, SizeType const* batchSlots, std::shared_ptr<BaseSetupParams> setupParams)
+void BanWordsLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 const* batchSlots,
+    std::shared_ptr<BaseSetupParams> setupParams)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -52,8 +52,8 @@ void BanWordsLayer<T>::setup(
 
 template <typename T>
 void BanWordsLayer<T>::banRepeatNGrams(Tensor& logits, std::shared_ptr<DynamicDecodeOutputParams> const& outputs,
-    std::shared_ptr<DynamicDecodeInputParams> const& inputs, SizeType32 const* batchSlots, SizeType batchSize,
-    SizeType beamWidth, SizeType maxSeqLen, SizeType vocabSizePadded, cudaStream_t stream)
+    std::shared_ptr<DynamicDecodeInputParams> const& inputs, SizeType32 const* batchSlots, SizeType32 batchSize,
+    SizeType32 beamWidth, SizeType32 maxSeqLen, SizeType32 vocabSizePadded, cudaStream_t stream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto const max_step = inputs->step;
@@ -75,8 +75,8 @@ void BanWordsLayer<T>::banRepeatNGrams(Tensor& logits, std::shared_ptr<DynamicDe
 
 template <typename T>
 void BanWordsLayer<T>::banBadWords(Tensor& logits, std::shared_ptr<DynamicDecodeOutputParams> const& outputs,
-    std::shared_ptr<DynamicDecodeInputParams> const& inputs, SizeType32 const* batchSlots, SizeType batchSize,
-    SizeType beamWidth, SizeType maxSeqLen, SizeType vocabSizePadded, cudaStream_t stream)
+    std::shared_ptr<DynamicDecodeInputParams> const& inputs, SizeType32 const* batchSlots, SizeType32 batchSize,
+    SizeType32 beamWidth, SizeType32 maxSeqLen, SizeType32 vocabSizePadded, cudaStream_t stream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto const maxBadWordsLength = inputs->max_bad_words_len;
@@ -103,9 +103,9 @@ void BanWordsLayer<T>::forward(
     auto inputs = std::dynamic_pointer_cast<DynamicDecodeInputParams>(baseInputs);
     auto outputs = std::dynamic_pointer_cast<DynamicDecodeOutputParams>(baseOutputs);
 
-    SizeType batchSize{0};
-    SizeType beamWidth{0};
-    SizeType vocabSize{0};
+    SizeType32 batchSize{0};
+    SizeType32 beamWidth{0};
+    SizeType32 vocabSize{0};
     auto const maxSeqLen = outputs->output_ids.shape[outputs->output_ids.shape.size() - 1];
     auto batchSlots = inputs->batch_slots ? inputs->batch_slots->template getPtr<SizeType32 const>() : nullptr;
     if (inputs->logits)

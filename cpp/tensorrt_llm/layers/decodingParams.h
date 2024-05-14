@@ -31,9 +31,9 @@ namespace tensorrt_llm::layers
 class DecoderDomain
 {
 public:
-    DecoderDomain(runtime::SizeType maxBatchSize, runtime::SizeType maxBeamWidth, runtime::SizeType vocabSize,
-        runtime::SizeType vocabSizePadded, std::optional<runtime::SizeType> maxTokensPerStep = std::nullopt,
-        std::optional<runtime::SizeType> maxNumMedusaHeads = std::nullopt)
+    DecoderDomain(runtime::SizeType32 maxBatchSize, runtime::SizeType32 maxBeamWidth, runtime::SizeType32 vocabSize,
+        runtime::SizeType32 vocabSizePadded, std::optional<runtime::SizeType32> maxTokensPerStep = std::nullopt,
+        std::optional<runtime::SizeType32> maxNumMedusaHeads = std::nullopt)
         : mMaxBatchSize(maxBatchSize)
         , mMaxBeamWidth(maxBeamWidth)
         , mVocabSize(vocabSize)
@@ -43,43 +43,43 @@ public:
     {
     }
 
-    [[nodiscard]] runtime::SizeType getMaxBatchSize() const
+    [[nodiscard]] runtime::SizeType32 getMaxBatchSize() const
     {
         return mMaxBatchSize;
     }
 
-    [[nodiscard]] runtime::SizeType getMaxBeamWidth() const
+    [[nodiscard]] runtime::SizeType32 getMaxBeamWidth() const
     {
         return mMaxBeamWidth;
     }
 
-    [[nodiscard]] runtime::SizeType getVocabSize() const
+    [[nodiscard]] runtime::SizeType32 getVocabSize() const
     {
         return mVocabSize;
     }
 
-    [[nodiscard]] runtime::SizeType getVocabSizePadded() const
+    [[nodiscard]] runtime::SizeType32 getVocabSizePadded() const
     {
         return mVocabSizePadded;
     }
 
-    [[nodiscard]] runtime::SizeType getMaxTokensPerStep() const
+    [[nodiscard]] runtime::SizeType32 getMaxTokensPerStep() const
     {
         return mMaxTokensPerStep;
     }
 
-    [[nodiscard]] runtime::SizeType getMaxNumMedusaHeads() const
+    [[nodiscard]] runtime::SizeType32 getMaxNumMedusaHeads() const
     {
         return mMaxNumMedusaHeads;
     }
 
 private:
-    runtime::SizeType mMaxBatchSize;
-    runtime::SizeType mMaxBeamWidth;
-    runtime::SizeType mVocabSize;
-    runtime::SizeType mVocabSizePadded;
-    runtime::SizeType mMaxTokensPerStep;
-    runtime::SizeType mMaxNumMedusaHeads;
+    runtime::SizeType32 mMaxBatchSize;
+    runtime::SizeType32 mMaxBeamWidth;
+    runtime::SizeType32 mVocabSize;
+    runtime::SizeType32 mVocabSizePadded;
+    runtime::SizeType32 mMaxTokensPerStep;
+    runtime::SizeType32 mMaxNumMedusaHeads;
 };
 
 class BaseSetupParams
@@ -104,8 +104,8 @@ public:
     struct SamplingParams
     {
         // baseSamplingLayer
-        std::optional<std::vector<runtime::SizeType>> runtime_top_k; // [1] or [batch_size] on cpu
-        std::optional<std::vector<float>> runtime_top_p;             // [1] or [batch_size] on cpu
+        std::optional<std::vector<runtime::SizeType32>> runtime_top_k; // [1] or [batch_size] on cpu
+        std::optional<std::vector<float>> runtime_top_p;               // [1] or [batch_size] on cpu
 
         // topPSamplingLayer
         std::optional<std::vector<float>> top_p_decay;                    // [batch_size], must between [0, 1]
@@ -125,7 +125,7 @@ public:
     struct MedusaParams
     {
         // Medusa params
-        std::optional<std::vector<std::vector<runtime::SizeType>>> topKMedusaHeads; // [batchSize, maxMedusaHeads]
+        std::optional<std::vector<std::vector<runtime::SizeType32>>> topKMedusaHeads; // [batchSize, maxMedusaHeads]
     };
 
     std::optional<std::vector<uint64_t>> randomSeed; // [1] or [batch_size] on cpu
@@ -162,8 +162,8 @@ public:
 class DynamicDecodeInputParams : public BaseInputParams
 {
 public:
-    DynamicDecodeInputParams(runtime::SizeType32 step, runtime::SizeType32 ite, runtime::SizeType maxInputLength,
-        runtime::SizeType maxAttentionWindow, runtime::SizeType sinkTokenLength, runtime::SizeType localBatchSize,
+    DynamicDecodeInputParams(runtime::SizeType32 step, runtime::SizeType32 ite, runtime::SizeType32 maxInputLength,
+        runtime::SizeType32 maxAttentionWindow, runtime::SizeType32 sinkTokenLength, runtime::SizeType32 localBatchSize,
         tc::Tensor endIds)
         : BaseInputParams(step, ite, std::move(endIds))
         , max_input_length{maxInputLength}
@@ -176,12 +176,12 @@ public:
     }
 
     // mandatory parameters
-    runtime::SizeType max_input_length;
-    runtime::SizeType max_attention_window;
-    runtime::SizeType sink_token_length;
-    runtime::SizeType local_batch_size;
-    runtime::SizeType max_stop_words_len;
-    runtime::SizeType max_bad_words_len;
+    runtime::SizeType32 max_input_length;
+    runtime::SizeType32 max_attention_window;
+    runtime::SizeType32 sink_token_length;
+    runtime::SizeType32 local_batch_size;
+    runtime::SizeType32 max_stop_words_len;
+    runtime::SizeType32 max_bad_words_len;
 
     // One of these two fields has to be set
     // DynamicDecodeLayer::forward checks for it

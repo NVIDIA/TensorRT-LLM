@@ -57,7 +57,7 @@ public:
 
     ~DynamicDecodeLayer() override;
 
-    void setup(runtime::SizeType batchSize, runtime::SizeType beamWidth, runtime::SizeType32 const* batchSlots,
+    void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 const* batchSlots,
         std::shared_ptr<BaseSetupParams> setupParams) override;
 
     void forward(std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs) override;
@@ -77,13 +77,13 @@ private:
     void initializeLayers();
 
     void prepareIdsPtrs(std::shared_ptr<DynamicDecodeOutputParams> const& outputs,
-        runtime::SizeType32 const* batchSlots, runtime::SizeType batchSize, runtime::SizeType beamWidth,
-        runtime::SizeType maxSeqLen);
+        runtime::SizeType32 const* batchSlots, runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth,
+        runtime::SizeType32 maxSeqLen);
     static void prepareOutputData(std::shared_ptr<DynamicDecodeOutputParams> const& outputs,
         std::shared_ptr<DynamicDecodeInputParams> const& params, runtime::ITensor::SharedPtr const& idsPtrsHost,
-        runtime::SizeType32 const* batchSlots, runtime::SizeType batchSize, runtime::SizeType maxBatchSize,
-        runtime::SizeType beamWidth, runtime::SizeType maxSeqLen, runtime::SizeType maxTokensPerStep,
-        runtime::SizeType cyclicStep, cudaStream_t stream);
+        runtime::SizeType32 const* batchSlots, runtime::SizeType32 batchSize, runtime::SizeType32 maxBatchSize,
+        runtime::SizeType32 beamWidth, runtime::SizeType32 maxSeqLen, runtime::SizeType32 maxTokensPerStep,
+        runtime::SizeType32 cyclicStep, cudaStream_t stream);
 
 private:
     using Base::mAllocator;
@@ -99,9 +99,9 @@ private:
 
     bool mHasDiffRuntimeArgs{false};
 
-    runtime::SizeType mCyclicStep{0};
-    runtime::SizeType mRuntimeMaxSeqLen{0};
-    runtime::SizeType mConfiguredBeamWidth{-1};
+    runtime::SizeType32 mCyclicStep{0};
+    runtime::SizeType32 mRuntimeMaxSeqLen{0};
+    runtime::SizeType32 mConfiguredBeamWidth{-1};
 };
 
 } // namespace layers

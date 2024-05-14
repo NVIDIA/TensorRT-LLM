@@ -39,7 +39,7 @@ set(SRCS
     promptTuningParams.cpp
     runtimeBuffers.cpp
     runtimeKernels.cu
-    ssmStateBuffers.cpp
+    rnnStateBuffers.cpp
     statefulGptDecoder.cpp
     tllmBuffers.cpp
     tllmRuntime.cpp

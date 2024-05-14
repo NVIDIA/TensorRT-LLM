@@ -27,9 +27,9 @@ namespace kernels
 
 template <typename T>
 __global__ void ban_bad_words(T* logits, TokenIdType const** output_ids_ptr, SizeType32 const** parent_ids_ptr,
-    SizeType32 const* batch_slots, SizeType beam_width, TokenIdType const** bad_words_ptrs,
-    SizeType32 const* bad_words_lens, SizeType vocab_size_padded, SizeType32 const* sequence_lengths,
-    SizeType max_seq_len)
+    SizeType32 const* batch_slots, SizeType32 beam_width, TokenIdType const** bad_words_ptrs,
+    SizeType32 const* bad_words_lens, SizeType32 vocab_size_padded, SizeType32 const* sequence_lengths,
+    SizeType32 max_seq_len)
 {
     auto const id = blockIdx.x * blockDim.x + threadIdx.x;
     auto const batch_idx = blockIdx.y / beam_width;
@@ -99,12 +99,12 @@ __global__ void ban_bad_words(T* logits, TokenIdType const** output_ids_ptr, Siz
 
 template <typename T>
 void invokeBanBadWords(T* logits, TokenIdType const** output_ids_ptr, SizeType32 const** parent_ids_ptr,
-    SizeType32 const* batch_slot, SizeType batch_size, SizeType beam_width, TokenIdType const** bad_words,
-    SizeType32 const* bad_words_lens, SizeType max_bad_words_len, SizeType vocab_size_padded,
-    SizeType32 const* sequence_lengths, SizeType max_seq_len, cudaStream_t stream)
+    SizeType32 const* batch_slot, SizeType32 batch_size, SizeType32 beam_width, TokenIdType const** bad_words,
+    SizeType32 const* bad_words_lens, SizeType32 max_bad_words_len, SizeType32 vocab_size_padded,
+    SizeType32 const* sequence_lengths, SizeType32 max_seq_len, cudaStream_t stream)
 {
     dim3 block, grid;
-    constexpr SizeType max_blocks{256};
+    constexpr SizeType32 max_blocks{256};
     block.x = min(((max_bad_words_len + 32 - 1) / 32) * 32, max_blocks);
     grid.x = (max_bad_words_len + block.x - 1) / block.x;
     grid.y = batch_size * beam_width;
@@ -115,19 +115,19 @@ void invokeBanBadWords(T* logits, TokenIdType const** output_ids_ptr, SizeType32
 }
 
 template void invokeBanBadWords(half* logits, TokenIdType const** output_ids_ptr, SizeType32 const** parent_ids_ptr,
-    SizeType32 const* batch_slot, SizeType batch_size, SizeType beam_width, TokenIdType const** bad_words,
-    SizeType32 const* bad_words_lens, SizeType max_bad_words_len, SizeType vocab_size_padded,
-    SizeType32 const* sequence_lengths, SizeType max_seq_len, cudaStream_t stream);
+    SizeType32 const* batch_slot, SizeType32 batch_size, SizeType32 beam_width, TokenIdType const** bad_words,
+    SizeType32 const* bad_words_lens, SizeType32 max_bad_words_len, SizeType32 vocab_size_padded,
+    SizeType32 const* sequence_lengths, SizeType32 max_seq_len, cudaStream_t stream);
 #ifdef ENABLE_BF16
 template void invokeBanBadWords(__nv_bfloat16* logits, TokenIdType const** output_ids_ptr,
-    SizeType32 const** parent_ids_ptr, SizeType32 const* batch_slot, SizeType batch_size, SizeType beam_width,
-    TokenIdType const** bad_words, SizeType32 const* bad_words_lens, SizeType max_bad_words_len,
-    SizeType vocab_size_padded, SizeType32 const* sequence_lengths, SizeType max_seq_len, cudaStream_t stream);
+    SizeType32 const** parent_ids_ptr, SizeType32 const* batch_slot, SizeType32 batch_size, SizeType32 beam_width,
+    TokenIdType const** bad_words, SizeType32 const* bad_words_lens, SizeType32 max_bad_words_len,
+    SizeType32 vocab_size_padded, SizeType32 const* sequence_lengths, SizeType32 max_seq_len, cudaStream_t stream);
 #endif
 template void invokeBanBadWords(float* logits, TokenIdType const** output_ids_ptr, SizeType32 const** parent_ids_ptr,
-    SizeType32 const* batch_slot, SizeType batch_size, SizeType beam_width, TokenIdType const** bad_words,
-    SizeType32 const* bad_words_lens, SizeType max_bad_words_len, SizeType vocab_size_padded,
-    SizeType32 const* sequence_lengths, SizeType max_seq_len, cudaStream_t stream);
+    SizeType32 const* batch_slot, SizeType32 batch_size, SizeType32 beam_width, TokenIdType const** bad_words,
+    SizeType32 const* bad_words_lens, SizeType32 max_bad_words_len, SizeType32 vocab_size_padded,
+    SizeType32 const* sequence_lengths, SizeType32 max_seq_len, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm

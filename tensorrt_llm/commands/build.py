@@ -29,7 +29,7 @@ from ..auto_parallel import infer_cluster_config
 from ..auto_parallel.cluster_info import cluster_infos
 from ..builder import BuildConfig, Engine, build
 from ..logger import logger
-from ..lora_manager import LoraBuildConfig
+from ..lora_manager import LoraConfig, LoraManager
 from ..models import PretrainedConfig
 from ..models.modeling_utils import (WEIGHT_LOADER_MODELS, QuantConfig,
                                      SpeculativeDecodingMode, load_model)
@@ -104,7 +104,7 @@ def parse_arguments():
         action='store_true',
         help=
         'Enable horizontal fusion in GatedMLP, reduces layer input traffic and potentially improves performance. '
-        'For FP8 PTQ, the downside is slight reduction of accuracy because one of the quantization scaling factors are discarded. '
+        'For FP8 PTQ, the downside is slight reduction of accuracy because one of the quantization scaling factors is discarded. '
         '(An example for reference only: 0.45734 vs 0.45755 for LLaMA-v2 7B using `modelopt/examples/hf/instruct_eval/mmlu.py`).'
     )
     parser.add_argument(
@@ -163,18 +163,7 @@ def parse_arguments():
         '--lora_target_modules',
         nargs='+',
         default=None,
-        choices=[
-            "attn_qkv",
-            "attn_q",
-            "attn_k",
-            "attn_v",
-            "attn_dense",
-            "mlp_h_to_4h",
-            "mlp_gate",
-            "mlp_4h_to_h",
-            "cross_attn_q",
-            "cross_attn_v",
-        ],
+        choices=LoraManager.LORA_MODULE_IDS.keys(),
         help=
         "Add lora in which modules. Only be activated when use_lora_plugin is enabled."
     )
@@ -204,6 +193,13 @@ def parse_arguments():
         'Unique name for target GPU type. Inferred from current GPU type if not specified.'
     )
     parser.add_argument(
+        '--strip_plan',
+        default=False,
+        action='store_true',
+        help=
+        'Whether to strip weights from the final TRT engine under the assumption that the refit weights will be identical to those provided at build time.'
+    )
+    parser.add_argument(
         '--max_encoder_input_len',
         type=int,
         default=1024,
@@ -231,6 +227,13 @@ def parse_arguments():
                             "medusa",
                         ],
                         help='Mode of speculative decoding.')
+    parser.add_argument(
+        '--weight_streaming',
+        default=False,
+        action='store_true',
+        help=
+        'Specify whether offloading weights to CPU and streaming loading at runtime.',
+    )
 
     plugin_config_parser = parser.add_argument_group("plugin_config")
     add_plugin_argument(plugin_config_parser)
@@ -303,12 +306,12 @@ def build_model(build_config: BuildConfig,
     rank_config = copy.deepcopy(model_config)
     rank_config.set_rank(rank)
     model = load_model(rank_config, ckpt_dir, model_cls)
+    is_checkpoint_pruned = getattr(rank_config, 'is_pruned', False)
 
     if build_config.plugin_config.lora_plugin is not None:
-        lora_config = LoraBuildConfig(
-            lora_dir=kwargs['lora_dir'] or [],
-            lora_ckpt_source=kwargs['lora_ckpt_source'],
-            max_lora_rank=kwargs['max_lora_rank'])
+        lora_config = LoraConfig(lora_dir=kwargs['lora_dir'] or [],
+                                 lora_ckpt_source=kwargs['lora_ckpt_source'],
+                                 max_lora_rank=kwargs['max_lora_rank'])
         if kwargs['lora_target_modules'] is not None:
             # command line options is preferred over the modules in the lora dir
             lora_config.lora_target_modules = kwargs['lora_target_modules']
@@ -318,6 +321,10 @@ def build_model(build_config: BuildConfig,
     # tells the low level build api to only build rank-th shard of the model
     if build_config.auto_parallel_config.enabled:
         model.config.mapping.rank = real_rank
+
+    if is_checkpoint_pruned or kwargs.pop('strip_plan', False):
+        build_config.use_strip_plan = True
+    build_config.use_refit = kwargs.get('refit', False)
 
     return build(model, build_config)
 
@@ -418,6 +425,8 @@ def main():
         'lora_ckpt_source': args.lora_ckpt_source,
         'max_lora_rank': args.max_lora_rank,
         'lora_target_modules': args.lora_target_modules,
+        'strip_plan': args.strip_plan,
+        'refit': False,
     }
     speculative_decoding_mode = SpeculativeDecodingMode.from_arguments(args)
     if args.build_config is None:
@@ -476,6 +485,7 @@ def main():
                 'dry_run': args.dry_run,
                 'visualize_network': args.visualize_network,
                 'max_encoder_input_len': args.max_encoder_input_len,
+                'weight_streaming': args.weight_streaming,
             },
             plugin_config=plugin_config)
     else:

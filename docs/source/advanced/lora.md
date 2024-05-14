@@ -108,6 +108,10 @@ The following tensors are for a LoRA which has a `q` and `k` adapter.
 | cross_attn_k | 10 | k adapter for cross attention |
 | cross_attn_v | 11 | v adapter for cross attention |
 | cross_attn_dense | 12 | adapter for the dense layer in cross attention |
+| moe_h_to_4h | 13 | for mixtral adapter for expert mlp layer: up projection |
+| moe_4h_to_h | 14 | for mixtral adapter for expert mlp layer: down projection |
+| moe_gate | 15 | for mixtral adapter for expert mlp layer: gate |
+| moe_router | 16 | for mixtral adapter for expert router layer |
 
 #### LoraCache configuration
 

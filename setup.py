@@ -97,6 +97,7 @@ setup(
             'libs/nvinfer_plugin_tensorrt_llm.dll',
             'libs/tensorrt_llm_nvrtc_wrapper.dll', 'bindings.*.pyd'
         ] if on_windows else [
+            'bin/executorWorker',
             'libs/libtensorrt_llm.so',
             'libs/libth_common.so',
             'libs/libnvinfer_plugin_tensorrt_llm.so',
@@ -105,8 +106,13 @@ setup(
         ]) + ['bindings/*.pyi', 'tools/plugin_gen/templates/*'],
     },
     entry_points={
-        'console_scripts': ['trtllm-build=tensorrt_llm.commands.build:main'],
+        'console_scripts': [
+            'trtllm-build=tensorrt_llm.commands.build:main',
+            'trtllm-prune=tensorrt_llm.commands.prune:main',
+            'trtllm-refit=tensorrt_llm.commands.refit:main',
+        ],
     },
+    scripts=['tensorrt_llm/hlapi/trtllm-hlapi-launch'],
     extras_require={
         "devel": devel_deps,
         "benchmarking": [

@@ -356,13 +356,14 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(nvinfer1::PluginTensorDesc con
     // outputs
     //   mat                [M, N]
 
-    int m = 1;
+    int64_t m64 = 1;
     for (int ii = 0; ii < inputDesc[0].dims.nbDims - 1; ++ii)
     {
-        m *= inputDesc[0].dims.d[ii];
+        m64 *= inputDesc[0].dims.d[ii];
     }
-    int const n = inputDesc[mWeightInputIdx].dims.d[1];
-    int const k = inputDesc[0].dims.d[inputDesc[0].dims.nbDims - 1];
+    int const m = TLLM_INT32_CAST(m64);
+    int const n = TLLM_INT32_CAST(inputDesc[mWeightInputIdx].dims.d[1]);
+    int const k = TLLM_INT32_CAST(inputDesc[0].dims.d[inputDesc[0].dims.nbDims - 1]);
 
     bool use_cuda_kernel = m < SMALL_M_FAST_PATH && mCudaKernelEnabled;
     bool use_pre_quant_scale = mQuantAlgo & PRE_QUANT_SCALE;

@@ -35,14 +35,15 @@ class TrtGptModelOptionalParams
     using KvCacheConfig = kv_cache_manager::KvCacheConfig;
 
 public:
-    using SizeType = tensorrt_llm::runtime::SizeType;
+    using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
     explicit TrtGptModelOptionalParams(KvCacheConfig const& kvCacheConfig = KvCacheConfig{},
-        bool enableTrtOverlap = false, std::optional<std::vector<SizeType>> const& deviceIds = std::nullopt,
+        bool enableTrtOverlap = false, std::optional<std::vector<SizeType32>> const& deviceIds = std::nullopt,
         bool normalizeLogProbs = true, bool enableChunkedContext = false,
         std::optional<runtime::DecodingMode> const& decodingMode = std::nullopt,
         PeftCacheManagerConfig const& peftCacheManagerConfig = PeftCacheManagerConfig{},
-        std::optional<runtime::MedusaModule::MedusaChoices> const& medusaChoices = std::nullopt)
+        std::optional<runtime::MedusaModule::MedusaChoices> const& medusaChoices = std::nullopt,
+        float gpuWeightsPercent = 1)
         : kvCacheConfig{kvCacheConfig}
         , enableTrtOverlap{enableTrtOverlap}
         , deviceIds(deviceIds)
@@ -51,6 +52,7 @@ public:
         , decodingMode{decodingMode}
         , peftCacheManagerConfig(peftCacheManagerConfig)
         , medusaChoices(medusaChoices)
+        , gpuWeightsPercent(gpuWeightsPercent)
     {
     }
 
@@ -61,7 +63,7 @@ public:
             runtime::DecodingMode::fromExecutor(
                 executorConfig.getDecodingMode().value_or(executor::DecodingMode::kNONE)),
             PeftCacheManagerConfig(executorConfig.getPeftCacheConfig().value_or(executor::PeftCacheConfig())),
-            executorConfig.getMedusaChoices())
+            executorConfig.getMedusaChoices(), executorConfig.getGpuWeightsPercent())
     {
     }
 
@@ -77,12 +79,14 @@ public:
     KvCacheConfig kvCacheConfig;
 
     bool enableTrtOverlap;
-    std::optional<std::vector<SizeType>> deviceIds;
+    std::optional<std::vector<SizeType32>> deviceIds;
     bool normalizeLogProbs;
     bool enableChunkedContext;
     std::optional<runtime::DecodingMode> decodingMode;
     PeftCacheManagerConfig peftCacheManagerConfig;
     std::optional<runtime::MedusaModule::MedusaChoices> medusaChoices;
+    // Percentage of weights on the gpu at runtime
+    float gpuWeightsPercent;
 };
 
 } // namespace tensorrt_llm::batch_manager

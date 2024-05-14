@@ -13,20 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import contextlib
+import os
+import sys
 import unittest
 
 import _utils
 import numpy as np
-
-# isort: off
-import torch
 import tensorrt as trt
-# isort: on
-import os
-import sys
-
+import torch
 from parameterized import parameterized
-from polygraphy.backend.trt import CreateConfig, EngineFromNetwork, TrtRunner
 from transformers import GPT2Config
 
 import tensorrt_llm
@@ -34,7 +29,8 @@ from tensorrt_llm import Tensor
 from tensorrt_llm.quantization import QuantMode
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import skip_pre_ampere, unittest_name_func
+from utils.util import (create_session, run_session, skip_pre_ampere,
+                        unittest_name_func)
 
 
 class GPT2AttentionSmoothQuant(torch.nn.Module):
@@ -229,15 +225,23 @@ class TestSmoothQuant(unittest.TestCase):
         test_shape = [2, 3, 5, d_h]
 
         # Init operands for multiplication in int8
-        x_data = torch.randint(-128, 128, test_shape, dtype=torch.int8)
-        fc1 = torch.randint(-128, 128, (ffn_h, d_h), dtype=torch.int8)
+        x_data = torch.randint(-128,
+                               128,
+                               test_shape,
+                               dtype=torch.int8,
+                               device="cuda")
+        fc1 = torch.randint(-128,
+                            128, (ffn_h, d_h),
+                            dtype=torch.int8,
+                            device="cuda")
 
         bias_data = None
         if bias:
             bias_data = torch.randint(
                 -5,
                 5, (ffn_h, ),
-                dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype)) * 0.1
+                dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
+                device="cuda") * 0.1
 
         m = test_shape[0] * test_shape[1] * test_shape[2]
         test_shape[3]
@@ -248,22 +252,32 @@ class TestSmoothQuant(unittest.TestCase):
 
         def init_scales(n):
             scale_a_shape = (m, 1) if per_token_scaling else (1, 1)
-            scale_a = torch.ones(scale_a_shape, dtype=torch.float32) * 1e-2
-            scale_a *= torch.randint(1, 10, scale_a_shape, dtype=torch.float32)
+            scale_a = torch.ones(
+                scale_a_shape, dtype=torch.float32, device="cuda") * 1e-2
+            scale_a *= torch.randint(1,
+                                     10,
+                                     scale_a_shape,
+                                     dtype=torch.float32,
+                                     device="cuda")
             scale_b_shape = (1, n) if per_channel_scaling else (1, 1)
-            scale_b = torch.ones(scale_b_shape, dtype=torch.float32) * 1e-2
-            scale_b *= torch.randint(1, 10, scale_b_shape, dtype=torch.float32)
+            scale_b = torch.ones(
+                scale_b_shape, dtype=torch.float32, device="cuda") * 1e-2
+            scale_b *= torch.randint(1,
+                                     10,
+                                     scale_b_shape,
+                                     dtype=torch.float32,
+                                     device="cuda")
             return scale_a, scale_b
 
         scale_fc1_out, scale_fc1_w = init_scales(c_1)
 
         # construct trt network
         builder = tensorrt_llm.Builder()
-        net = builder.create_network()
+        network = builder.create_network()
         # Allow SQ plugin of dtype type
-        net.plugin_config.set_smooth_quant_gemm_plugin(dtype)
-        with tensorrt_llm.net_guard(net):
-            network = tensorrt_llm.default_trtnet()
+        network.plugin_config.set_smooth_quant_gemm_plugin(dtype)
+        with tensorrt_llm.net_guard(network):
+
             x = Tensor(name='x',
                        shape=x_data.shape,
                        dtype=tensorrt_llm.str_dtype_to_trt('int8'))
@@ -288,7 +302,7 @@ class TestSmoothQuant(unittest.TestCase):
 
             input = x
             # If we have dynamic scaling, Linear expects Tuple input:
-            # (auntized tensor, scales per token)
+            # (quantized tensor, scales per token)
             if quant_mode.has_per_token_dynamic_scaling():
                 scale_dynamic = Tensor(
                     name='scale_dynamic',
@@ -297,23 +311,22 @@ class TestSmoothQuant(unittest.TestCase):
 
                 input = (x, scale_dynamic)
 
-            output = gm.forward(input).trt_tensor
-            output.name = 'output'
-            network.mark_output(output)
+            output = gm.forward(input)
+            output.mark_output('output')
 
         # trt run
-        build_engine = EngineFromNetwork(
-            (builder.trt_builder, net.trt_network),
-            config=CreateConfig(
-                int8=True,
-                fp16=(dtype == "float16"),
-                memory_pool_limits={trt.MemoryPoolType.WORKSPACE: 33554432}))
+        session = create_session(builder,
+                                 network,
+                                 precision=dtype,
+                                 int8=True,
+                                 memory_pool_limit=33554432)
+        inputs = {
+            'x': x_data,
+        }
+        if quant_mode.has_per_token_dynamic_scaling():
+            inputs['scale_dynamic'] = scale_fc1_out
 
-        with TrtRunner(build_engine) as runner:
-            feed_dict = {'x': x_data.numpy()}
-            if quant_mode.has_per_token_dynamic_scaling():
-                feed_dict['scale_dynamic'] = scale_fc1_out.numpy()
-            outputs = runner.infer(feed_dict=feed_dict)
+        outputs = run_session(session, inputs)
 
         # pytorch run
         with torch.no_grad():
@@ -321,7 +334,7 @@ class TestSmoothQuant(unittest.TestCase):
                                                 scale_fc1_w, dtype, bias_data)
 
         # compare diff
-        np.testing.assert_allclose(ref.cpu().numpy(), outputs['output'])
+        torch.testing.assert_close(ref, outputs['output'])
 
     @parameterized.expand(
         [(tensorrt_llm.quantization.layers.SmoothQuantLinear),
@@ -341,9 +354,8 @@ class TestSmoothQuant(unittest.TestCase):
         # Create builder
         builder = tensorrt_llm.Builder()
         # Create empty network
-        net = builder.create_network()
-        with tensorrt_llm.net_guard(net):
-            tensorrt_llm.default_trtnet()
+        network = builder.create_network()
+        with tensorrt_llm.net_guard(network):
             # Get output tensor for SQ Linear
             with self.assertRaisesRegex(
                     ValueError,
@@ -369,9 +381,19 @@ class TestSmoothQuant(unittest.TestCase):
         torch.manual_seed(42)
 
         # Init operands for multiplication in int8
-        x_data = torch.randint(-8, 8, test_shape, dtype=torch.int8)
-        fc1 = torch.randint(-16, 16, (ffn_h, d_h), dtype=torch.int8)
-        fc2 = torch.randint(-16, 16, (d_h, ffn_h), dtype=torch.int8)
+        x_data = torch.randint(-8,
+                               8,
+                               test_shape,
+                               dtype=torch.int8,
+                               device="cuda")
+        fc1 = torch.randint(-16,
+                            16, (ffn_h, d_h),
+                            dtype=torch.int8,
+                            device="cuda")
+        fc2 = torch.randint(-16,
+                            16, (d_h, ffn_h),
+                            dtype=torch.int8,
+                            device="cuda")
 
         m = test_shape[0] * test_shape[1] * test_shape[2]
         c_1 = ffn_h
@@ -382,24 +404,35 @@ class TestSmoothQuant(unittest.TestCase):
 
         def init_scales(n):
             scale_a_shape = (m, 1) if per_token_scaling else (1, 1)
-            scale_a = torch.ones(scale_a_shape, dtype=torch.float32) * 1e-2
-            scale_a *= torch.randint(1, 10, scale_a_shape, dtype=torch.float32)
+            scale_a = torch.ones(
+                scale_a_shape, dtype=torch.float32, device="cuda") * 1e-2
+            scale_a *= torch.randint(1,
+                                     10,
+                                     scale_a_shape,
+                                     dtype=torch.float32,
+                                     device="cuda")
             scale_b_shape = (1, n) if per_channel_scaling else (1, 1)
-            scale_b = torch.ones(scale_b_shape, dtype=torch.float32) * 1e-2
-            scale_b *= torch.randint(1, 10, scale_b_shape, dtype=torch.float32)
+            scale_b = torch.ones(
+                scale_b_shape, dtype=torch.float32, device="cuda") * 1e-2
+            scale_b *= torch.randint(1,
+                                     10,
+                                     scale_b_shape,
+                                     dtype=torch.float32,
+                                     device="cuda")
             return scale_a, scale_b
 
         scale_fc1_out, scale_fc1_w = init_scales(c_1)
         scale_fc2_out, scale_fc2_w = init_scales(c_2)
-        scale_fc2_in = torch.randint(3, 7, (1, ), dtype=torch.float32) * 0.1
+        scale_fc2_in = torch.randint(
+            3, 7, (1, ), dtype=torch.float32, device="cuda") * 0.1
 
         # construct trt network
         builder = tensorrt_llm.Builder()
-        net = builder.create_network()
+        network = builder.create_network()
         # Allow SQ plugin of dtype type
-        net.plugin_config.set_smooth_quant_gemm_plugin(dtype)
-        with tensorrt_llm.net_guard(net):
-            network = tensorrt_llm.default_trtnet()
+        network.plugin_config.set_smooth_quant_gemm_plugin(dtype)
+        with tensorrt_llm.net_guard(network):
+
             x = Tensor(name='x',
                        shape=x_data.shape,
                        dtype=tensorrt_llm.str_dtype_to_trt('int8'))
@@ -445,23 +478,22 @@ class TestSmoothQuant(unittest.TestCase):
 
                 input = (x, scale_dynamic)
 
-            output = gm.forward(input).trt_tensor
-            output.name = 'output'
-            network.mark_output(output)
+            output = gm.forward(input)
+            output.mark_output("output")
 
         # trt run
-        build_engine = EngineFromNetwork(
-            (builder.trt_builder, net.trt_network),
-            config=CreateConfig(
-                int8=True,
-                fp16=(dtype == "float16"),
-                memory_pool_limits={trt.MemoryPoolType.WORKSPACE: 33554432}))
+        session = create_session(builder,
+                                 network,
+                                 precision=dtype,
+                                 int8=True,
+                                 memory_pool_limit=33554432)
+        inputs = {
+            'x': x_data,
+        }
+        if quant_mode.has_per_token_dynamic_scaling():
+            inputs['scale_dynamic'] = scale_fc1_out
 
-        with TrtRunner(build_engine) as runner:
-            feed_dict = {'x': x_data.numpy()}
-            if quant_mode.has_per_token_dynamic_scaling():
-                feed_dict['scale_dynamic'] = scale_fc1_out.numpy()
-            outputs = runner.infer(feed_dict=feed_dict)
+        outputs = run_session(session, inputs)
 
         # pytorch run
         with torch.no_grad():
@@ -477,7 +509,7 @@ class TestSmoothQuant(unittest.TestCase):
             if quant_mode.has_per_token_dynamic_scaling():
                 hidden, scale_act = _utils.gt_quantize_per_token(hidden)
             else:
-                hidden = (hidden * scale_fc2_in.cuda()).round().clip(
+                hidden = (hidden * scale_fc2_in).round().clip(
                     -128, 127).to(dtype=torch.int8)
 
             # FC 2
@@ -485,9 +517,7 @@ class TestSmoothQuant(unittest.TestCase):
                                                 scale_fc2_w, dtype)
 
         # compare diff
-        np.testing.assert_allclose(ref.cpu().numpy(),
-                                   outputs['output'],
-                                   atol=5e-2)
+        torch.testing.assert_close(ref, outputs['output'], atol=5e-2, rtol=0)
 
     @parameterized.expand([('float16', True, True), ('float16', True, False)],
                           name_func=unittest_name_func)
@@ -498,18 +528,25 @@ class TestSmoothQuant(unittest.TestCase):
         hidden_size = 1024
         x_data = torch.randn(
             (8, 128, hidden_size),
-            dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype)).cuda()
+            dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
+            device="cuda")
         eps = 1e-5
 
         m = torch.nn.LayerNorm(
             hidden_size,
             eps=eps,
             dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
-            elementwise_affine=elementwise_affine).cuda()
+            elementwise_affine=elementwise_affine,
+            device="cuda")
 
         # Scale to int
-        scale_data = torch.randint(2, 32, (1, ), dtype=torch.float32).cuda()
-        scale_to_int_data = torch.ones((1, ), dtype=torch.float32).cuda()
+        scale_data = torch.randint(2,
+                                   32, (1, ),
+                                   dtype=torch.float32,
+                                   device="cuda")
+        scale_to_int_data = torch.ones((1, ),
+                                       dtype=torch.float32,
+                                       device="cuda")
 
         quant_mode = QuantMode.from_description(quantize_weights=True,
                                                 quantize_activations=True,
@@ -518,9 +555,9 @@ class TestSmoothQuant(unittest.TestCase):
 
         # construct trt network
         builder = tensorrt_llm.Builder()
-        net = builder.create_network()
-        net.plugin_config.set_layernorm_quantization_plugin(dtype)
-        with tensorrt_llm.net_guard(net):
+        network = builder.create_network()
+        network.plugin_config.set_layernorm_quantization_plugin(dtype)
+        with tensorrt_llm.net_guard(network):
             x = Tensor(name='x',
                        shape=x_data.shape,
                        dtype=tensorrt_llm.str_dtype_to_trt(dtype))
@@ -543,18 +580,16 @@ class TestSmoothQuant(unittest.TestCase):
 
             if per_token_scaling:
                 output, dynamic_scales = output
-                net._mark_output(dynamic_scales, 'dynamic_scales', trt.float32)
-            net._mark_output(output, 'output', trt.int8)
+                dynamic_scales.mark_output('dynamic_scales', trt.float32)
+            output.mark_output('output', trt.int8)
 
         # trt run
-        build_engine = EngineFromNetwork(
-            (builder.trt_builder, net.trt_network),
-            config=CreateConfig(int8=True,
-                                fp16=(dtype == 'float16'),
-                                precision_constraints="obey"))
-        assert build_engine is not None, "Build engine failed"
-        with TrtRunner(build_engine) as runner:
-            outputs = runner.infer(feed_dict={'x': x_data.cpu().numpy()})
+        session = create_session(builder, network, precision=dtype, int8=True)
+        inputs = {
+            'x': x_data,
+        }
+
+        outputs = run_session(session, inputs)
 
         def cast_to_int8_with_sat(tensor):
             return tensor.round().clip(-128, 127).to(dtype=torch.int8)
@@ -571,16 +606,17 @@ class TestSmoothQuant(unittest.TestCase):
 
         # compare diff of quantized output
         # Set absolute tolerance to 1 to mitigate some rounding error
-        np.testing.assert_allclose(ref_quantized.cpu().numpy(),
+        torch.testing.assert_close(ref_quantized,
                                    outputs['output'],
                                    atol=1,
                                    rtol=0)
 
         # compare diff of dynamic activation scales
         if per_token_scaling:
-            np.testing.assert_allclose(dynamic_scale.cpu().numpy(),
+            torch.testing.assert_close(dynamic_scale,
                                        outputs['dynamic_scales'],
-                                       atol=1e-2)
+                                       atol=1e-2,
+                                       rtol=1e-2)
 
     @parameterized.expand(
         [('float16', 1, False,
@@ -606,15 +642,17 @@ class TestSmoothQuant(unittest.TestCase):
         ref_torch_weights, processed_torch_weights, torch_weight_scales = _utils.woq_conversion(
             weight, wTypeId)
         if wTypeId == 2:
+            # Weights must be a CPU Tensor
             ref_torch_weights = torch.ops.trtllm.unpack_int4_packed_tensor_to_int8(
-                ref_torch_weights)
+                ref_torch_weights.cpu())
 
         bias_data = None
         if bias:
             bias_data = torch.randint(
                 -5,
                 5, (n, ),
-                dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype)) * 0.1
+                dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
+                device="cuda") * 0.1
 
         quant_mode = QuantMode.from_description(quantize_weights=True,
                                                 quantize_activations=False,
@@ -624,10 +662,10 @@ class TestSmoothQuant(unittest.TestCase):
 
         # construct trt network
         builder = tensorrt_llm.Builder()
-        net = builder.create_network()
-        net.plugin_config.set_weight_only_quant_matmul_plugin(dtype)
-        with tensorrt_llm.net_guard(net):
-            network = tensorrt_llm.default_trtnet()
+        network = builder.create_network()
+        network.plugin_config.set_weight_only_quant_matmul_plugin(dtype)
+        with tensorrt_llm.net_guard(network):
+
             x = Tensor(name='x',
                        shape=mat1.shape,
                        dtype=tensorrt_llm._utils.str_dtype_to_trt(dtype))
@@ -645,30 +683,29 @@ class TestSmoothQuant(unittest.TestCase):
 
             input = x
 
-            output = gm.forward(input).trt_tensor
-            output.name = 'output'
-            network.mark_output(output)
+            output = gm.forward(input)
+            output.mark_output('output')
 
         # trt run
-        build_engine = EngineFromNetwork(
-            (builder.trt_builder, net.trt_network),
-            config=CreateConfig(
-                int8=True,
-                fp16=(dtype == "float16"),
-                memory_pool_limits={trt.MemoryPoolType.WORKSPACE: 33554432}))
+        session = create_session(builder,
+                                 network,
+                                 precision=dtype,
+                                 int8=True,
+                                 memory_pool_limit=33554432)
+        inputs = {
+            'x': mat1,
+        }
 
-        with TrtRunner(build_engine) as runner:
-            feed_dict = {'x': mat1.numpy()}
-            output = torch.tensor(runner.infer(feed_dict=feed_dict)["output"])
+        outputs = run_session(session, inputs)
 
         # pytorch run
         with torch.no_grad():
-            ref = _utils.woq_gt_matmul(m, mat1, ref_torch_weights,
-                                       torch_weight_scales, dtype, bias_data)
+            ref = _utils.woq_gt_matmul(m, mat1, ref_torch_weights.cuda(),
+                                       torch_weight_scales.cuda(), dtype,
+                                       bias_data)
 
         # compare diff
-        _utils.woq_assert_near_eq(ref.to(torch.float32),
-                                  output.to(torch.float32), wTypeId)
+        _utils.woq_assert_near_eq(ref, outputs['output'], wTypeId)
 
     @parameterized.expand([('float16', QuantMode.PER_CHANNEL),
                            ('float16', QuantMode.PER_TOKEN),
@@ -682,10 +719,10 @@ class TestSmoothQuant(unittest.TestCase):
 
         def _construct_execution():
             builder = tensorrt_llm.Builder()
-            net = builder.create_network()
-            net.plugin_config.set_smooth_quant_gemm_plugin(dtype)
-            net.plugin_config.set_gpt_attention_plugin(dtype)
-            with tensorrt_llm.net_guard(net):
+            network = builder.create_network()
+            network.plugin_config.set_smooth_quant_gemm_plugin(dtype)
+            network.plugin_config.set_gpt_attention_plugin(dtype)
+            with tensorrt_llm.net_guard(network):
                 hidden_states_tensor = Tensor(
                     name='hidden_states',
                     shape=tuple(input.shape),
@@ -769,60 +806,34 @@ class TestSmoothQuant(unittest.TestCase):
                     input_lengths=input_lengths_tensor,
                     cache_indirection=cache_indirection_tensor)
 
-                trt_dtype = tensorrt_llm.str_dtype_to_trt(dtype)
-                net._mark_output(outputs[0], 'output', trt_dtype)
-                net._mark_output(outputs[1][0], 'present_key', trt_dtype)
-                net._mark_output(outputs[1][1], 'present_value', trt_dtype)
-
-            # Apply dynamic range to int8 connections
-            for l in net.trt_network:
-                for ii in range(l.num_inputs):
-                    if l.get_input(
-                            ii).dtype == tensorrt_llm._utils.str_dtype_to_trt(
-                                "int8"):
-                        l.get_input(ii).set_dynamic_range(-127, 127)
-                for oi in range(l.num_outputs):
-                    if l.get_output(
-                            oi).dtype == tensorrt_llm._utils.str_dtype_to_trt(
-                                "int8"):
-                        l.get_output(oi).set_dynamic_range(-127, 127)
+                outputs[0].mark_output('output', dtype)
+                outputs[1][0].mark_output('present_key', dtype)
+                output[1][1].mark_output('present_value', dtype)
 
             # trt build engine
-            build_engine = EngineFromNetwork(
-                (builder.trt_builder, net.trt_network),
-                config=CreateConfig(int8=True,
-                                    fp16=(dtype == "float16"),
-                                    precision_constraints="obey",
-                                    memory_pool_limits={
-                                        trt.MemoryPoolType.WORKSPACE:
-                                        48 * (2**30)
-                                    }))
+            session = create_session(builder,
+                                     network,
+                                     precision=dtype,
+                                     int8=True,
+                                     memory_pool_limit=48 * (2**30))
+            inputs = {
+                'hidden_states': input,
+                'cache_indirection': cache_indirection
+            }
 
-            # Infer engine
-            with TrtRunner(build_engine) as runner:
-                feed_dict = {'hidden_states': input.cpu().numpy()}
+            if use_past_key_value or use_gpt_attention_plugin:
+                inputs['past_key'] = present_key
+                inputs['past_value'] = present_value
 
-                if use_past_key_value or use_gpt_attention_plugin:
-                    feed_dict['past_key'] = present_key if isinstance(
-                        present_key, np.ndarray) else present_key.cpu().numpy()
-                    feed_dict['past_value'] = present_value if isinstance(
-                        present_value,
-                        np.ndarray) else present_value.cpu().numpy()
+            if use_gpt_attention_plugin:
+                inputs['sequence_length'] = sequence_length
+                inputs['past_key_value_length'] = past_key_value_length
+                inputs['input_lengths'] = input_lengths
 
-                if use_gpt_attention_plugin:
-                    feed_dict['sequence_length'] = sequence_length.cpu().numpy()
-                    feed_dict[
-                        'past_key_value_length'] = past_key_value_length.cpu(
-                        ).numpy()
-                    feed_dict['input_lengths'] = input_lengths.cpu().numpy()
+            if quant_mode.has_per_token_dynamic_scaling():
+                inputs['scale_dynamic'] = scale_attn_out
 
-                if quant_mode.has_per_token_dynamic_scaling():
-                    feed_dict['scale_dynamic'] = scale_attn_out.cpu().numpy()
-
-                feed_dict['cache_indirection'] = cache_indirection.cpu().numpy()
-
-                outputs = runner.infer(feed_dict=feed_dict)
-
+            outputs = run_session(session, inputs)
             return outputs
 
         batch_size = 4
@@ -972,9 +983,7 @@ class TestSmoothQuant(unittest.TestCase):
 
                 print(output, torch_output)
 
-                np.testing.assert_allclose(output,
-                                           torch_output.cpu().numpy(),
-                                           atol=1e-2)
+                torch.testing.assert_close(output, torch_output, atol=1e-2)
 
             else:
                 # Generation stage
@@ -1004,51 +1013,47 @@ class TestSmoothQuant(unittest.TestCase):
 
                 print(output, torch_output)
 
-                np.testing.assert_allclose(output,
-                                           torch_output.cpu().numpy(),
-                                           atol=1e-2)
+                torch.testing.assert_close(output, torch_output, atol=1e-2)
 
     def test_quantize_per_tensor(self):
         dtype = 'float32'
-        x_data = torch.randn((1, 2, 2, 4), dtype=torch.float32)
+        x_data = torch.randn((1, 2, 2, 4), dtype=torch.float32, device="cuda")
         scaling_factor_data = torch.tensor(0.4, dtype=torch.float32)
         builder = tensorrt_llm.Builder()
-        net = builder.create_network()
-        config = builder.trt_builder.create_builder_config()
-        config.set_flag(trt.BuilderFlag.INT8)
-        config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
-        with tensorrt_llm.net_guard(net):
+        network = builder.create_network()
+
+        with tensorrt_llm.net_guard(network):
             x = Tensor(name='x',
                        shape=x_data.shape,
                        dtype=tensorrt_llm.str_dtype_to_trt(dtype))
             q_layer = tensorrt_llm.quantization.layers.Quantize('int8')
             q_layer.scaling_factor.value = scaling_factor_data.numpy()
             output = q_layer.forward(x)
-            net._mark_output(output, 'output', trt.int8)
+            output.mark_output('output', trt.int8)
 
-        build_engine = EngineFromNetwork((builder.trt_builder, net.trt_network),
-                                         config)
-        with TrtRunner(build_engine) as runner:
-            outputs = runner.infer(feed_dict={'x': x_data.numpy()})
+        session = create_session(builder, network, precision=dtype, int8=True)
+        inputs = {
+            'x': x_data,
+        }
 
-        ref = torch.quantize_per_tensor(x_data, scaling_factor_data, 0,
+        outputs = run_session(session, inputs)
+
+        ref = torch.quantize_per_tensor(x_data, scaling_factor_data.cuda(), 0,
                                         torch.qint8)
 
-        np.testing.assert_allclose(ref.int_repr().cpu().numpy(),
-                                   outputs['output'])
+        # Avoid comparing between is_quantized
+        torch.testing.assert_close(ref.int_repr(), outputs['output'])
 
     def test_quantize_per_channel(self):
         dtype = 'float32'
-        x_data = torch.randn((2, 4, 4, 8), dtype=torch.float32)
+        x_data = torch.randn((2, 4, 4, 8), dtype=torch.float32, device="cuda")
         scaling_factor_data = torch.tensor((0.4, 0.1, 0.3, 0.2),
                                            dtype=torch.float32)
         builder = tensorrt_llm.Builder()
-        net = builder.create_network()
-        config = builder.trt_builder.create_builder_config()
-        config.set_flag(trt.BuilderFlag.INT8)
-        config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
-        with tensorrt_llm.net_guard(net):
-            network = tensorrt_llm.default_trtnet()
+        network = builder.create_network()
+
+        with tensorrt_llm.net_guard(network):
+
             x = Tensor(name='x',
                        shape=x_data.shape,
                        dtype=tensorrt_llm.str_dtype_to_trt(dtype))
@@ -1057,100 +1062,93 @@ class TestSmoothQuant(unittest.TestCase):
                 'int8', 'float32', x_data.shape[axis], axis)
             q_layer.scaling_factor.value = scaling_factor_data.detach().cpu(
             ).numpy()
-            output = q_layer.forward(x).trt_tensor
-            output.name = 'output'
-            network.mark_output(output)
+            output = q_layer.forward(x)
+            output.mark_output('output')
 
-        build_engine = EngineFromNetwork((builder.trt_builder, net.trt_network),
-                                         config)
-        with TrtRunner(build_engine) as runner:
-            outputs = runner.infer(feed_dict={'x': x_data.numpy()})
+        session = create_session(builder, network, precision=dtype, int8=True)
+        inputs = {
+            'x': x_data,
+        }
 
-        ref = torch.quantize_per_channel(x_data, scaling_factor_data,
-                                         torch.tensor([0, 0, 0, 0]), 1,
-                                         torch.qint8)
+        outputs = run_session(session, inputs)
 
-        np.testing.assert_allclose(ref.int_repr().cpu().numpy(),
-                                   outputs['output'])
+        ref = torch.quantize_per_channel(
+            x_data, scaling_factor_data.cuda(),
+            torch.tensor([0, 0, 0, 0], device="cuda"), 1, torch.qint8)
+        # Avoid comparing between is_quantized
+        torch.testing.assert_close(ref.int_repr(), outputs['output'])
 
     @parameterized.expand([('float16'), ('float32')],
                           name_func=unittest_name_func)
     def test_quantize_per_token(self, dtype):
         x_data = torch.randn(
-            (2, 4, 4, 8), dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype))
+            (2, 4, 4, 8),
+            dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
+            device="cuda")
 
         builder = tensorrt_llm.Builder()
-        net = builder.create_network()
+        network = builder.create_network()
 
-        config = builder.trt_builder.create_builder_config()
-        config.set_flag(trt.BuilderFlag.INT8)
-        config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
+        with tensorrt_llm.net_guard(network):
 
-        with tensorrt_llm.net_guard(net):
-            network = tensorrt_llm.default_trtnet()
             x = Tensor(name='x',
                        shape=x_data.shape,
                        dtype=tensorrt_llm.str_dtype_to_trt(dtype))
             q_layer = tensorrt_llm.quantization.layers.QuantizePerToken()
             output, scale = q_layer.forward(x)
 
-            output = output.trt_tensor
-            output.name = 'output'
-            network.mark_output(output)
+            output.mark_output('output')
+            scale.mark_output('scale')
 
-            scale = scale.trt_tensor
-            scale.name = 'scale'
-            network.mark_output(scale)
+        session = create_session(builder, network, precision=dtype, int8=True)
+        inputs = {
+            'x': x_data,
+        }
 
-        build_engine = EngineFromNetwork((builder.trt_builder, net.trt_network),
-                                         config)
-
-        with TrtRunner(build_engine) as runner:
-            outputs = runner.infer(feed_dict={'x': x_data.numpy()})
+        outputs = run_session(session, inputs)
 
         ref, ref_scale = _utils.gt_quantize_per_token(x_data)
         ref = ref.reshape(outputs['output'].shape)
         ref_scale = ref_scale.reshape(outputs['scale'].shape)
 
-        np.testing.assert_allclose(ref.cpu().numpy(), outputs['output'])
+        torch.testing.assert_close(ref, outputs['output'], atol=1, rtol=1e-1)
 
-        np.testing.assert_allclose(ref_scale.cpu().numpy(),
-                                   outputs['scale'],
-                                   atol=1e-2)
+        torch.testing.assert_close(ref_scale.float(),
+                                   outputs['scale'].float(),
+                                   atol=1e-2,
+                                   rtol=1e-1)
 
     def test_dequantize(self):
-        dtype = 'int8'
-        quantized_torch_tensor = torch.quantize_per_tensor(
-            torch.tensor([-1.0, 0.0, 1.0, 2.0], dtype=torch.float32), 0.1, 0,
-            torch.qint8)
-        quantized_data = quantized_torch_tensor.int_repr()
+        dtype = 'float32'
+        x_data = torch.quantize_per_tensor(
+            torch.tensor([-1.0, 0.0, 1.0, 2.0],
+                         dtype=torch.float32,
+                         device="cuda"), 0.1, 0, torch.qint8)
         scaling_factor_data = torch.tensor(0.1, dtype=torch.float32)
 
         builder = tensorrt_llm.Builder()
-        net = builder.create_network()
-        config = builder.trt_builder.create_builder_config()
-        config.set_flag(trt.BuilderFlag.INT8)
-        config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
-        with tensorrt_llm.net_guard(net):
-            network = tensorrt_llm.default_trtnet()
+        network = builder.create_network()
+        with tensorrt_llm.net_guard(network):
+
             x = Tensor(name='x',
-                       shape=quantized_data.shape,
-                       dtype=tensorrt_llm.str_dtype_to_trt(dtype))
+                       shape=x_data.shape,
+                       dtype=tensorrt_llm.str_dtype_to_trt('int8'))
             dq_layer = tensorrt_llm.quantization.layers.Dequantize()
 
             dq_layer.scaling_factor.value = scaling_factor_data.numpy()
-            output = dq_layer.forward(x).trt_tensor
-            output.name = 'output'
-            network.mark_output(output)
+            output = dq_layer.forward(x)
+            output.mark_output('output', dtype)
 
-        build_engine = EngineFromNetwork((builder.trt_builder, net.trt_network),
-                                         config)
-        with TrtRunner(build_engine) as runner:
-            outputs = runner.infer(
-                feed_dict={'x': quantized_data.cpu().numpy()})
-        ref = torch.dequantize(quantized_torch_tensor)
+        session = create_session(builder, network, precision=dtype, int8=True)
+        inputs = {
+            'x': x_data,
+        }
 
-        np.testing.assert_allclose(ref.cpu().numpy(), outputs['output'])
+        outputs = run_session(session, inputs)
+
+        ref = torch.dequantize(x_data)
+
+        torch.testing.assert_close(ref, outputs['output'])
 
 
 if __name__ == '__main__':

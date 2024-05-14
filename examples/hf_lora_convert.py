@@ -26,6 +26,7 @@ import torch
 
 from tensorrt_llm._utils import str_dtype_to_torch, torch_to_numpy
 from tensorrt_llm.lora_manager import LoraManager
+from tensorrt_llm.models.convert_utils import get_model_path, load_state_dict
 
 log_format = "%(asctime)s %(name)s [%(levelname)s] %(message)s"
 logging.basicConfig(format=log_format)
@@ -79,7 +80,7 @@ def convert_hf_model(model_dir, dtype, out_dir):
     with open(f"{model_dir}/adapter_config.json", "r") as f:
         config = json.load(f)
         config["r"]
-    lora_model = torch.load(f"{model_dir}/adapter_model.bin")
+    lora_model = load_state_dict(get_model_path(model_dir, "adapter_model"))
     all_weights = get_all_lora_weights(lora_model)
     converted_weights = []
     converted_config = []

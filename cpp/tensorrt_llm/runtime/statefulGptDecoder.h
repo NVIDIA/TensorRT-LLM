@@ -35,9 +35,10 @@ public:
     StatefulGptDecoder(std::size_t vocabSize, std::size_t vocabSizePadded, CudaStreamPtr stream);
 
     //! Setup the decoder before calling `forward()`
-    void setup(DecodingMode const& mode, SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxAttentionWindow,
-        SizeType sinkTokenLength, SizeType maxSequenceLength, SizeType maxTokensPerStep, bool fusedDecoder,
-        nvinfer1::DataType dtype, ModelConfig const& modelConfig) override;
+    void setup(DecodingMode const& mode, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
+        SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength,
+        SizeType32 maxTokensPerStep, bool fusedDecoder, nvinfer1::DataType dtype,
+        ModelConfig const& modelConfig) override;
 
     //! @brief Initialize the decoder with new batch of inputs.
     void newBatch(
@@ -73,7 +74,7 @@ public:
     //! @brief Get tokens generated in one step of last forward pass
     //! @param iter The iteration within [0; maxTokensPerStep) for which to get the tokens
     //! @returns [batchSize, beamWidth], tokens generated in `iter` (per beam), on gpu
-    [[nodiscard]] TensorPtr getNewTokens(SizeType iter = 0) const override
+    [[nodiscard]] TensorPtr getNewTokens(SizeType32 iter = 0) const override
     {
         TLLM_CHECK(iter == 0);
         return mDecodingOutput->newTokens;
@@ -95,8 +96,8 @@ public:
     }
 
 private:
-    void reshapeBuffers(SizeType batchSize, SizeType beamWidth, SizeType mMaxAttentionWindow, SizeType mSinkTokenLength,
-        SizeType maxSequenceLength);
+    void reshapeBuffers(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 mMaxAttentionWindow,
+        SizeType32 mSinkTokenLength, SizeType32 maxSequenceLength);
 
 private:
     std::size_t const mVocabSize;
@@ -114,9 +115,9 @@ private:
 
     TensorPtr mFinishedSum;
 
-    SizeType mNbSteps;
-    SizeType mMaxSequenceLength{};
-    SizeType mMaxAttentionWindow{};
-    SizeType mSinkTokenLength{};
+    SizeType32 mNbSteps;
+    SizeType32 mMaxSequenceLength{};
+    SizeType32 mMaxAttentionWindow{};
+    SizeType32 mSinkTokenLength{};
 };
 } // namespace tensorrt_llm::runtime

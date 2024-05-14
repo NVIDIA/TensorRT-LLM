@@ -1,5 +1,5 @@
 # High-level API
-We are working on a high-level API for LLM workflow, which is still in incubation and may change later.
+We are working on a Python high-level API(HLAPI) for LLM workflow, which is still in incubation and may change later.
 Here we show you a preview of how it works and how to use it.
 
 Note that the APIs are not stable and only support the LLaMA model. We appreciate your patience and understanding as we improve this API.
@@ -34,19 +34,19 @@ python3 llm_examples.py --task run_llm_on_tensor_parallel \
 ```
 
 ## Model preparation
-The high-level API supports three kinds of model formats:
+The HLAPI supports three kinds of model formats:
 
 1. HuggingFace models
-2. TensorRT-LLM engine built by trtllm-build tool or saved by the high-level API
+2. TensorRT-LLM engine built by trtllm-build tool or saved by the HLAPI
 3. TensorRT-LLM checkpoints, converted by `convert_checkpoint.py` in examples
 
-All kinds of models could be used directly by the high-level API, and the `ModelConfig(<any-model-path>)` could accept any kind of them.
+All kinds of models could be used directly by the HLAPI, and the `ModelConfig(<any-model-path>)` could accept any kind of them.
 
 Let's elaborate on the preparation of the three kinds of model formats.
 
 ### Option 1: From HuggingFace models
 
-Given its popularity, the TRT-LLM high-level API chooses to support HuggingFace format as one of the start points, to use the high-level API on LLaMA models, you need to run the following conversion script provided in [transformers/llama](https://huggingface.co/docs/transformers/main/model_doc/llama) or [transformers/llama2](https://huggingface.co/docs/transformers/main/model_doc/llama2) to convert the Meta checkpoint to HuggingFace format.
+Given its popularity, the TRT-LLM HLAPI chooses to support HuggingFace format as one of the start points, to use the HLAPI on LLaMA models, you need to run the following conversion script provided in [transformers/llama](https://huggingface.co/docs/transformers/main/model_doc/llama) or [transformers/llama2](https://huggingface.co/docs/transformers/main/model_doc/llama2) to convert the Meta checkpoint to HuggingFace format.
 
 For instance, when targeting the LLaMA2 7B model, the official way to retrieve the model is to visit the [LLaMA2 7B model page](https://huggingface.co/transformers/llama2-7B), normally you need to submit a request for the model file.
 For a quick start, you can also download the model checkpoint files directly from [modelscope.cn](https://www.modelscope.cn/models/shakechen/Llama-2-7b/files), the command is as follows:
@@ -68,13 +68,13 @@ python <transformers-dir>/src/transformers/models/llama/convert_llama_weights_to
     --input_dir Llama-2-7b --model_size 7B --output_dir llama-hf-7b
 ```
 
-That should produce a HuggingFace format model in `./llama-hf-7b`, which could be used by the high-level API.
+That should produce a HuggingFace format model in `./llama-hf-7b`, which could be used by the HLAPI.
 
 ### Option 2: From TensorRT-LLM engine
 There are two ways to build the TensorRT-LLM engine:
 
 1. You can build the TensorRT-LLM engine from the HuggingFace model directly with the `trtllm-build` tool, and save the engine to disk for later use.  Please consult the LLaMA's [README](../llama/README.md).
-2. Use the Python high-level API to save one:
+2. Use the HLAPI to save one:
 
 ```python
 config = ModelConfig(<model-path>)
@@ -86,7 +86,7 @@ llm.save(<engine-dir>)
 
 ### Option 3: From TensorRT-LLM checkpoint
 In each model example, there is a `convert_checkpoint.py` to convert third-party models to TensorRT-LLM checkpoint for further usage.
-The Python high-level API could seamlessly accept the checkpoint, and build the engine in the backend.
+The HLAPI could seamlessly accept the checkpoint, and build the engine in the backend.
 For step-by-step guidance on checkpoint conversion, please refer to the LLaMA's [README](../llama/README.md).
 
 
@@ -148,13 +148,22 @@ llm = LLM(config)
 ## Parallelism
 
 ### Tensor Parallelism
-It is easy to enable Tensor Parallelism in the high-level API. For example, setting `parallel_config.tp_size=2` to perform a 2-way parallelism:
+It is easy to enable Tensor Parallelism in the HLAPI. For example, setting `parallel_config.tp_size=2` to perform a 2-way parallelism:
 
 ```python
 from tensorrt_llm import LLM, ModelConfig
 
 config = ModelConfig(model_dir=<llama_model_path>)
 config.parallel_config.tp_size = 2
+```
+
+### Pipeline Parallelism
+Similar to Tensor Parallelism, you can enable Pipeline Parallelism in the HLAPI with following code:
+
+```python
+config.parallel_config.pp_size = 4
+# you can also mix TP and PP
+# config.parallel_config.tp_size = 2
 ```
 
 ### Automatic Parallelism (in preview)
@@ -168,6 +177,53 @@ config = ModelConfig(model_dir=<llama_model_path>)
 config.parallel_config.auto_parallel = True
 config.parallel_config.world_size = 2
 ```
+
+### Multi-GPU multi-node (MGMN) support
+By default, the HLAPI will spawn MPI processes under the hood to support single-node-multi-gpu scenarios, what you need to do is to set the `parallel_config.tp_size/pp_size` to the number of GPUs you want to use.
+
+But for MGMN scenarios, since the jobs are managed by some cluster management systems, such as [Slurm](https://slurm.schedmd.com/documentation.html), you need to submit HLAPI tasks differently.
+
+Firstly, it is suggested to build the engine offline with the `trtllm-build` tools, please refer to [LLaMA's README](../llama/README.md) for more details.
+
+Secondly, you need to prepare a Python file containing the HLAPI task, a naive example is as below, note that, this Python script will be executed only once on MPI rank0, and it looks nothing special compared to the single-node-multi-gpu scenario, such as TP or PP.
+
+```python
+config = ModelConfig(model_dir=<llama_model_path>)
+# Set the parallel_config to the number of GPUs you want to use
+config.parallel_config.tp_size = 4
+config.parallel_config.pp_size = 2
+
+llm = LLM(config)
+for output in llm.generate([[32, 12]]):
+    print(output)
+```
+
+Thirdly, you need to prepare a Slurm script to submit the task, the script contains the following lines:
+
+```sh
+#SBATCH -N 2                                 # number of nodes
+#SBATCH --ntasks-per-node=4
+
+srun --container-image="<docker-image>" \
+     --mpi=pmix \
+     ... \ # much details here
+     trtllm-hlapi-launch python3 <your-python-script>.py
+```
+
+The `trtllm-hlapi-launch` is a script provided by the HLAPI to launch the task and take care of the MPI runtime, you can find it in the local `bin` directory once you install the TensorRT-LLM package.
+
+Finally, you can submit the task with `sbatch <your-slurm-script>.sh`.
+
+Considering the Slurm or other cluster management systems may be highly customized and the task-submit command may be variant, the forementioned example is just a naive example. The key point is to submit the Python script with the MPI runtime, and the HLAPI will take care of the rest.
+
+## Fine grain control (Danger Zone)
+The high-level API is designed to be easy to use with hiding and auto-configuring most of the details, ideally, you don't need to touch the low-level details. However, if you want to fine-tune the underlying details, it is still possible to do so with two temporary APIs:
+
+1. `ModelConfig._set_additional_options` to set additional options for the model, such as some TensorRT shape range.
+2. `LLM(..., **_additional_options)` to set extra options for the LLM pipeline, such as some runtime optimization knobs.
+
+Note that, both APIs are not stable and we aim to gradually remove them, please use them with caution.
+
 
 ## Generation
 ### `asyncio`-based generation
@@ -235,18 +291,18 @@ You can set other fields in the `SamplingConfig` object to customize the samplin
 
 ### Runtime customization
 
-For `kv_cache_config`, `scheduling_policy` and `streaming_llm` features, please refer to LLaMA's [README](../llama/README.md) for more details, the high-level API supports these features as well by setting the corresponding fields in the `LLM()` constructor.
+For `kv_cache_config`, `capacity_scheduling_policy` and `streaming_llm` features, please refer to LLaMA's [README](../llama/README.md) for more details, the high-level API supports these features as well by setting the corresponding fields in the `LLM()` constructor.
 
 ```python
 from tensorrt_llm import ModelConfig, LLM
-from tensorrt_llm.hlapi import KvCacheConfig, SchedulerPolicy
+from tensorrt_llm.hlapi import KvCacheConfig, CapacitySchedulerPolicy
 
 config = ModelConfig(model_dir=<llama_model_path>)
 llm = LLM(config,
           kv_cache_config=KvCacheConfig(
                             max_new_tokens=128,
                             free_gpu_memory_fraction=0.8),
-          scheduling_policy=SchedulerPolicy.GUARANTEED_NO_EVICT)
+          capacity_scheduling_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT)
 ```
 
 ### Tokenizer customization
@@ -279,11 +335,3 @@ for output in llm.generate([[32, 12]]):
 ```
 
 You will get something like `GenerationResult(text='', token_ids=[23, 14, 3, 29871, 3], ...)`, note that the `text` field is empty since the tokenizer is not activated.
-
-## Fine grain control (Danger Zone)
-The high-level API is designed to be easy to use with hiding and auto-configuring most of the details, ideally, you don't need to touch the low-level details. However, if you want to fine-tune the underlying details, it is still possible to do so with two temporary APIs:
-
-1. `ModelConfig._set_additional_options` to set additional options for the model, such as some TensorRT shape range.
-2. `LLM(..., **_additional_options)` to set extra options for the LLM pipeline, such as some runtime optimization knobs.
-
-Note that, both APIs are not stable and we aim to gradually remove them, please use them with caution.

@@ -45,60 +45,60 @@ void reduce(IBuffer& output, IBuffer const& input, CudaStream const& stream);
 void invokeTranspose(ITensor& output, ITensor const& input, CudaStream const& stream);
 
 void invokeTransposeWithOutputOffset(
-    ITensor& output, ITensor const& input, SizeType outputOffset, CudaStream const& stream);
+    ITensor& output, ITensor const& input, SizeType32 outputOffset, CudaStream const& stream);
 
 void invokeTransposeWithInputOffset(
-    ITensor& output, ITensor const& input, SizeType inputOffset, CudaStream const& stream);
+    ITensor& output, ITensor const& input, SizeType32 inputOffset, CudaStream const& stream);
 
 void invokeInclusiveSum(IBuffer& output, IBuffer const& input, BufferManager const& manager, CudaStream const& stream);
 
 void invokeInclusiveSum(IBuffer& output, IBuffer& tmpBuffer, IBuffer const& input, CudaStream const& stream);
 
 void invokeBuildTokenMask(
-    ITensor& tokenMask, ITensor const& inputLengths, SizeType maxInputLength, CudaStream const& stream);
+    ITensor& tokenMask, ITensor const& inputLengths, SizeType32 maxInputLength, CudaStream const& stream);
 
-void invokeBuildAttentionMask(ITensor& attentionMask, SizeType padId, CudaStream const& stream);
+void invokeBuildAttentionMask(ITensor& attentionMask, TokenIdType padId, CudaStream const& stream);
 
 void invokeExtendAttentionMask(ITensor& newMask, ITensor const& oldMask, CudaStream const& stream);
 
-void invokeCopyInputToOutputTransposed(
-    ITensor& outputIds, ITensor const& inputIds, ITensor const& inputLengths, SizeType padId, CudaStream const& stream);
+void invokeCopyInputToOutputTransposed(ITensor& outputIds, ITensor const& inputIds, ITensor const& inputLengths,
+    TokenIdType padId, CudaStream const& stream);
 
 void invokeCopyPackedInputToOutputTransposed(ITensor& outputIds, ITensor const& inputIds, ITensor const& inputOffsets,
-    SizeType maxInputLength, SizeType padId, CudaStream const& stream);
+    SizeType32 maxInputLength, TokenIdType padId, CudaStream const& stream);
 
-void invokeCopyInputToOutput(
-    ITensor& outputIds, ITensor const& inputIds, ITensor const& inputLengths, SizeType padId, CudaStream const& stream);
-
-void invokeCopyPackedInputToOutput(ITensor& outputIds, ITensor const& inputIds, ITensor const& inputOffsets,
-    SizeType maxInputLength, SizeType padId, CudaStream const& stream);
-
-void initOutputIds(ITensor& outputIds, ITensor const& inputIds, ITensor const& inputLengths,
-    ITensor const& inputOffsets, TokenIdType padId, TokenIdType endId, SizeType maxInputLength, bool inputPacked,
+void invokeCopyInputToOutput(ITensor& outputIds, ITensor const& inputIds, ITensor const& inputLengths, SizeType32 padId,
     CudaStream const& stream);
 
-void scatterTensor(ITensor& output, ITensor const& input, SizeType beamWidth, CudaStream const& stream);
+void invokeCopyPackedInputToOutput(ITensor& outputIds, ITensor const& inputIds, ITensor const& inputOffsets,
+    SizeType32 maxInputLength, TokenIdType padId, CudaStream const& stream);
 
-void splitTransposed(ITensor& output, ITensor const& input, SizeType split, CudaStream const& stream);
+void initOutputIds(ITensor& outputIds, ITensor const& inputIds, ITensor const& inputLengths,
+    ITensor const& inputOffsets, TokenIdType padId, TokenIdType endId, SizeType32 maxInputLength, bool inputPacked,
+    CudaStream const& stream);
 
-void tileTensor(ITensor& output, ITensor const& input, SizeType beamWidth, CudaStream const& stream);
+void scatterTensor(ITensor& output, ITensor const& input, SizeType32 beamWidth, CudaStream const& stream);
 
-void tileTensorInplace(ITensor& tensor, SizeType beamWidth, CudaStream const& stream);
+void splitTransposed(ITensor& output, ITensor const& input, SizeType32 split, CudaStream const& stream);
+
+void tileTensor(ITensor& output, ITensor const& input, SizeType32 beamWidth, CudaStream const& stream);
+
+void tileTensorInplace(ITensor& tensor, SizeType32 beamWidth, CudaStream const& stream);
 
 void gatherLastTokenLogits(
     ITensor& output, ITensor const& input, ITensor const& lastTokenIds, CudaStream const& stream);
 
-void copyLatestTokenLogitsInGeneration(ITensor& output, ITensor const& input, SizeType step, SizeType firstBatchSlotIdx,
-    SizeType microBatchSize, SizeType beamWidth, CudaStream const& stream);
+void copyLatestTokenLogitsInGeneration(ITensor& output, ITensor const& input, SizeType32 step,
+    SizeType32 firstBatchSlotIdx, SizeType32 microBatchSize, SizeType32 beamWidth, CudaStream const& stream);
 
 void mergeLogitsFragments(BufferManager const& bufferManager, ITensor& output, std::vector<TensorPtr> inputVector,
-    ITensor& cachePointerDevice, ITensor& cachePointerHost, SizeType firstBatchSlotIdx, SizeType const microBatchSize,
-    SizeType const beamWidth, CudaStream const& stream, int stepOffset);
+    ITensor& cachePointerDevice, ITensor& cachePointerHost, SizeType32 firstBatchSlotIdx,
+    SizeType32 const microBatchSize, SizeType32 const beamWidth, CudaStream const& stream, int stepOffset);
 
 void invokeUpdateKVBlockArrayDraftTokenLocation(ITensor const& seqAcceptedDraftTokenOffsets,
     ITensor const& packedAcceptedDraftTokensIndices, ITensor const& pastKeyValueLengths, void* const* pointerArray,
-    ::tensorrt_llm::kernels::KVCacheIndex const* offsetArray, SizeType layerCount, SizeType seqCount,
-    SizeType numKVHeads, SizeType sizeInBytesPerKVHead, SizeType rewindDraftTokenCommonCount,
-    int* rewindDraftTokenSeparateAdjustments, ITensor const& seqSlotRemapping, SizeType maxKVCacheLen,
-    SizeType maxBlocksPerSeq, SizeType tokensPerBlock, cudaStream_t stream);
+    ::tensorrt_llm::kernels::KVCacheIndex const* offsetArray, SizeType32 layerCount, SizeType32 seqCount,
+    SizeType32 numKVHeads, SizeType32 sizeInBytesPerKVHead, SizeType32 rewindDraftTokenCommonCount,
+    int* rewindDraftTokenSeparateAdjustments, ITensor const& seqSlotRemapping, SizeType32 maxKVCacheLen,
+    SizeType32 maxBlocksPerSeq, SizeType32 tokensPerBlock, cudaStream_t stream);
 } // namespace tensorrt_llm::runtime::kernels

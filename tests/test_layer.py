@@ -1057,7 +1057,6 @@ class TestLayer(unittest.TestCase):
         d_conv = 4
         expand = 2
         dt_rank = "auto"
-        conv_bias = True
         bias = False
         d_inner = int(expand * d_model)
         seqlen_offset = 0 if req_type == 'context' else in_seq_len
@@ -1166,7 +1165,7 @@ class TestLayer(unittest.TestCase):
                                 d_conv,
                                 expand,
                                 dt_rank,
-                                conv_bias,
+                                True,
                                 bias,
                                 device=device,
                                 dtype=torch_dtype)
@@ -1229,11 +1228,10 @@ class TestLayer(unittest.TestCase):
                 shape=trt_conv_state_shape,
                 dtype=tensorrt_llm.str_dtype_to_trt('int32'))
             mamba_layer = tensorrt_llm.layers.Mamba(d_model=d_model,
+                                                    d_inner=d_inner,
                                                     d_state=d_state,
                                                     d_conv=d_conv,
-                                                    expand=expand,
                                                     dt_rank=dt_rank,
-                                                    conv_bias=conv_bias,
                                                     bias=bias,
                                                     dtype=dtype)
             mamba_layer.A.value = torch_to_numpy(A.detach().cpu())
@@ -1254,9 +1252,8 @@ class TestLayer(unittest.TestCase):
                     mamba_torch.out_proj.bias.detach().cpu())
             mamba_layer.conv1d.weight.value = torch_to_numpy(
                 mamba_torch.conv1d.weight.detach().unsqueeze(3).cpu())
-            if conv_bias:
-                mamba_layer.conv1d.bias.value = torch_to_numpy(
-                    mamba_torch.conv1d.bias.detach().cpu())
+            mamba_layer.conv1d.bias.value = torch_to_numpy(
+                mamba_torch.conv1d.bias.detach().cpu())
             mamba_layer.x_proj.weight.value = torch_to_numpy(
                 mamba_torch.x_proj.weight.detach().cpu())
             mamba_layer.dt_proj.weight.value = torch_to_numpy(
@@ -1604,7 +1601,7 @@ class TestLayer(unittest.TestCase):
                              dtype=tensorrt_llm.str_dtype_to_trt(dtype))
             net._mark_output(outputs[2],
                              'present_lru_state',
-                             dtype=tensorrt_llm.str_dtype_to_trt(dtype))
+                             dtype=tensorrt_llm.str_dtype_to_trt('float32'))
 
         if use_plugin:
             trt_conv_state = conv_state.permute(0, 2, 1).contiguous()

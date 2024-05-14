@@ -12,8 +12,7 @@ import tensorrt as trt
 import torch
 from filelock import FileLock
 
-from tensorrt_llm._utils import (preview_trt_version, trt_dtype_to_np,
-                                 trt_dtype_to_torch)
+from tensorrt_llm._utils import trt_dtype_to_np, trt_dtype_to_torch, trt_gte_10
 from tensorrt_llm.functional import AllReduceConfig, AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -39,7 +38,7 @@ from .tensor_parallel.sharding_strategy import ShardingStrategy
 from .utils import (get_builder_flags, get_updated_plugin, to_base_class_layer,
                     to_subclass_layer, to_trt_weights)
 
-default_int_dtype = trt.int64 if preview_trt_version() else trt.int32
+default_int_dtype = trt.int64 if trt_gte_10() else trt.int32
 
 
 @dataclass

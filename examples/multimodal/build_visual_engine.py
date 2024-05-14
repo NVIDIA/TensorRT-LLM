@@ -2,17 +2,20 @@ import argparse
 import os
 import shutil
 import sys
+import tarfile
 from time import time
+
+import yaml
 
 # isort: off
 import torch
 import tensorrt as trt
 from tensorrt_llm.builder import Builder
 # isort: on
-
+import torch.nn.functional as F
 from PIL import Image
-from torchvision import transforms
-from transformers import (AutoConfig, AutoModelForCausalLM, AutoProcessor,
+from transformers import (AutoConfig, AutoModel, AutoModelForCausalLM,
+                          AutoModelForVision2Seq, AutoProcessor,
                           Blip2ForConditionalGeneration, Blip2Processor,
                           FuyuForCausalLM, FuyuProcessor,
                           LlavaForConditionalGeneration, NougatProcessor,
@@ -28,13 +31,16 @@ def parse_arguments():
                         choices=[
                             'opt-2.7b', 'opt-6.7b', 'flan-t5-xl', 'flan-t5-xxl',
                             'llava', 'vila', 'nougat', 'cogvlm', 'fuyu',
-                            'pix2struct'
+                            'pix2struct', 'neva', 'kosmos-2'
                         ],
                         help="Model type")
-    parser.add_argument('--model_path',
-                        type=str,
-                        default=None,
-                        help="Huggingface repo or local directory with weights")
+    parser.add_argument(
+        '--model_path',
+        type=str,
+        default=None,
+        help=
+        "Huggingface repo, local directory with weights or path to checkpoint file"
+    )
     parser.add_argument('--vila_path',
                         type=str,
                         default=None,
@@ -57,7 +63,7 @@ class VisionEngineBuilder:
             "cuda") if torch.cuda.is_available() else "cpu"
         if args.output_dir is None:
             args.output_dir = 'visual_engines/%s' % (
-                args.model_path.split('/')[-1])
+                args.model_path.split('/')[-1].split('.')[0])
         if not os.path.exists(args.output_dir):
             os.makedirs(args.output_dir)
 
@@ -80,6 +86,10 @@ class VisionEngineBuilder:
             build_cogvlm_engine(args)
         elif args.model_type == 'fuyu':
             build_fuyu_engine(args)
+        elif args.model_type == 'neva':
+            build_neva_engine(args)
+        elif args.model_type == 'kosmos-2':
+            build_kosmos_engine(args)
         else:
             raise RuntimeError(f"Invalid model type {args.model_type}")
 
@@ -118,8 +128,7 @@ def build_trt_engine(model_type,
         1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
     profile = builder.create_optimization_profile()
     config_wrapper = Builder().create_builder_config(
-        precision="float16" if dtype == torch.float16 else "bfloat16",
-        model_type=model_type)
+        precision=str(dtype).split('.')[-1], model_type=model_type)
     config = config_wrapper.trt_builder_config
 
     parser = trt.OnnxParser(network, logger)
@@ -373,19 +382,16 @@ def build_nougat_engine(args):
 
 
 def build_cogvlm_engine(args):
-    raw_image = Image.new('RGB', [10, 10])  # dummy image
     hf_config = AutoConfig.from_pretrained(args.model_path,
                                            trust_remote_code=True)
     image_size = hf_config.vision_config['image_size']
     dtype = hf_config.torch_dtype
-    transform = transforms.Compose([
-        transforms.Resize((image_size, image_size),
-                          interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.ToTensor(),
-        transforms.Normalize((0.48145466, 0.4578275, 0.40821073),
-                             (0.26862954, 0.26130258, 0.27577711)),
-    ])
-    image = transform(raw_image).unsqueeze(0).to(args.device, dtype)
+    image = torch.empty(1,
+                        3,
+                        image_size,
+                        image_size,
+                        dtype=dtype,
+                        device=args.device)  # dummy image
 
     class CogVlmVisionWrapper(torch.nn.Module):
 
@@ -447,6 +453,118 @@ def build_fuyu_engine(args):
         # nImgPatches depends on image size (patch size: 30x30)
         # nDims is 30x30x3=2700 (patch size x color channels)
         [[1, 1, 2700], [1, 500, 2700], [1, 4096, 2700]],
+        args.output_dir,
+        args.max_batch_size)
+
+
+def build_neva_engine(args):
+    # extract NeMo checkpoint
+    with tarfile.open(args.model_path) as tar:
+        nemo_config = yaml.safe_load(tar.extractfile("./model_config.yaml"))
+        try:
+            # trained without TP
+            mp0_weights = torch.load(tar.extractfile("./model_weights.ckpt"),
+                                     map_location=args.device)
+        except KeyError:
+            # trained with TP
+            mp0_weights = torch.load(
+                tar.extractfile("./mp_rank_00/model_weights.ckpt"),
+                map_location=args.device)
+
+    vision_config = nemo_config["mm_cfg"]["vision_encoder"]
+
+    class VisionEncoderWrapper(torch.nn.Module):
+
+        def __init__(self, encoder, connector):
+            super().__init__()
+            self.encoder = encoder
+            self.connector = connector
+
+        def forward(self, images):
+            vision_x = self.encoder(pixel_values=images,
+                                    output_hidden_states=True)
+            vision_x = vision_x.hidden_states[-2]
+            vision_x = vision_x[:, 1:]
+            vision_x = self.connector(vision_x)
+            return vision_x
+
+    encoder = AutoModel.from_pretrained(vision_config["from_pretrained"],
+                                        torch_dtype=torch.bfloat16,
+                                        trust_remote_code=True)
+    vision_encoder = encoder.vision_model
+    hf_config = encoder.config
+    dtype = hf_config.torch_dtype
+
+    # connector
+    assert nemo_config["mm_cfg"]["mm_mlp_adapter_type"] == "mlp2x_gelu"
+    vision_connector = torch.nn.Sequential(
+        torch.nn.Linear(vision_config["hidden_size"],
+                        nemo_config["hidden_size"],
+                        bias=True), torch.nn.GELU(),
+        torch.nn.Linear(nemo_config["hidden_size"],
+                        nemo_config["hidden_size"],
+                        bias=True)).to(dtype=dtype)
+
+    key_prefix = "model.embedding.word_embeddings.adapter_layer.mm_projector_adapter.mm_projector"
+    for layer in range(0, 3, 2):
+        vision_connector[layer].load_state_dict({
+            'weight':
+            mp0_weights[f"{key_prefix}.{layer}.weight"].to(dtype),
+            'bias':
+            mp0_weights[f"{key_prefix}.{layer}.bias"].to(dtype),
+        })
+
+    # export the whole wrapper
+    wrapper = VisionEncoderWrapper(vision_encoder,
+                                   vision_connector).to(args.device, dtype)
+    image_size = hf_config.vision_config.image_size
+    dummy_image = torch.empty(1,
+                              3,
+                              image_size,
+                              image_size,
+                              dtype=dtype,
+                              device=args.device)  # dummy image
+    export_visual_wrapper_onnx(wrapper, dummy_image, args.output_dir)
+    build_trt_engine(
+        args.model_type,
+        [3, image_size, image_size],  # [3, H, W]
+        args.output_dir,
+        args.max_batch_size,
+        dtype)
+
+
+def build_kosmos_engine(args):
+    processor = AutoProcessor.from_pretrained(args.model_path)
+    raw_image = Image.new('RGB', [10, 10])  # dummy image
+    image = processor(text="dummy", images=raw_image,
+                      return_tensors="pt")['pixel_values'].to(
+                          args.device, torch.float16)
+
+    class VisionEncoderWrapper(torch.nn.Module):
+
+        def __init__(self, encoder, connector):
+            super().__init__()
+            self.encoder = encoder
+            self.connector = connector
+
+        def forward(self, images):
+            vision_x = self.encoder(images, output_hidden_states=True)
+            img_features = self.encoder.model.post_layernorm(
+                vision_x.last_hidden_state)
+            img_features = F.normalize(img_features, dim=-1)
+            img_features, _ = self.connector(img_features)
+            return img_features
+
+    model = AutoModelForVision2Seq.from_pretrained(args.model_path,
+                                                   torch_dtype=torch.float16)
+    wrapper = VisionEncoderWrapper(
+        model.vision_model.to(args.device),
+        model.image_to_text_projection.to(args.device))
+
+    export_visual_wrapper_onnx(wrapper, image, args.output_dir)
+    build_trt_engine(
+        args.model_type,
+        [image.shape[1], image.shape[2], image.shape[3]],  # [3, H, W]
         args.output_dir,
         args.max_batch_size)
 

@@ -117,10 +117,10 @@ void SamplingKernelTest<T>::setupBuffers(SamplingKernelTestParam const& param)
     auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
     auto probsPtr = BufferRange<T*>(*mProbsPtrsDevice);
     auto probsDevicePtr = bufferCast<T>(*mProbsDevice);
-    for (SizeType bi = 0; bi < batchSize; ++bi)
+    for (SizeType32 bi = 0; bi < batchSize; ++bi)
     {
         batchSlotsPtr[bi] = 2 * bi;
-        for (SizeType ti = 0; ti < maxTokensPerStep; ++ti)
+        for (SizeType32 ti = 0; ti < maxTokensPerStep; ++ti)
         {
             probsPtr[bi * maxTokensPerStep + ti] = probsDevicePtr + bi * maxTokensPerStep * vocabSize + ti * vocabSize;
         }
@@ -154,7 +154,7 @@ void SamplingKernelTest<T>::setupBuffers(SamplingKernelTestParam const& param)
     auto tokensPerStepPtr = bufferCast<int32_t>(*mTokensPerStep);
     auto finishedHostPtr
         = reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*mFinishedHost));
-    for (SizeType bi = 0; bi < maxBatchSize; ++bi)
+    for (SizeType32 bi = 0; bi < maxBatchSize; ++bi)
     {
         endIdsHostPtr[bi] = endIdsDistr(gen);
         skipDecodeHostPtr[bi] = skipDecodeDist(gen) > 0.8;
@@ -174,13 +174,13 @@ void SamplingKernelTest<T>::setupBuffers(SamplingKernelTestParam const& param)
     auto zeroParentIdsDevicePtr = bufferCast<int32_t>(*mZeroParentIdsDevice);
     auto seqLensHostPtr = bufferCast<int32_t>(*mSeqLengthsHost);
     auto logProbHostPtr = bufferCast<float>(*mExpectedCumLogProbsHost);
-    for (SizeType bi = 0; bi < maxBatchSize; bi++)
+    for (SizeType32 bi = 0; bi < maxBatchSize; bi++)
     {
         idsPtrHostPtr[bi] = outputIdsDevicePtr + bi * mMaxSeqLen;
         idsPtrHostPtr[maxBatchSize + bi] = zeroParentIdsDevicePtr + bi * mMaxSeqLen;
     }
 
-    for (SizeType bi = 0; bi < maxBatchSize; bi++)
+    for (SizeType32 bi = 0; bi < maxBatchSize; bi++)
     {
         seqLensHostPtr[bi] = seqLenDist(gen);
         logProbHostPtr[bi] = logProbDist(gen);
@@ -201,7 +201,7 @@ void SamplingKernelTest<T>::setupBuffers(SamplingKernelTestParam const& param)
     // Only in greedy search we can guarantee the selected token and stop by condition
     if (topK == 1)
     {
-        for (SizeType bi = 0; bi < batchSize; ++bi)
+        for (SizeType32 bi = 0; bi < batchSize; ++bi)
         {
             auto const batchSlot = batchSlotsPtr[bi];
             for (int32_t ti = 0; ti < maxTokensPerStep; ++ti)
@@ -219,22 +219,22 @@ void SamplingKernelTest<T>::setupBuffers(SamplingKernelTestParam const& param)
 }
 
 template <typename T>
-std::vector<SizeType> SamplingKernelTest<T>::computeTopKTopPVariants(
+std::vector<SizeType32> SamplingKernelTest<T>::computeTopKTopPVariants(
     int32_t bi, int32_t batchSlot, int32_t ti, int32_t maxTokensPerStep, int32_t vocabSize)
 {
-    std::vector<SizeType> allowedTokens;
+    std::vector<SizeType32> allowedTokens;
     auto probsPtr = bufferCast<T>(*mProbsHost) + (bi * maxTokensPerStep + ti) * vocabSize;
-    std::vector<SizeType> indices(vocabSize);
+    std::vector<SizeType32> indices(vocabSize);
     std::iota(indices.begin(), indices.end(), 0);
-    std::sort(
-        indices.begin(), indices.end(), [probsPtr](SizeType i1, SizeType i2) { return probsPtr[i1] > probsPtr[i2]; });
+    std::sort(indices.begin(), indices.end(),
+        [probsPtr](SizeType32 i1, SizeType32 i2) { return probsPtr[i1] > probsPtr[i2]; });
 
     auto topK = bufferCast<int32_t>(*mTopKsHost)[batchSlot];
     auto topP = bufferCast<float>(*mTopPsHost)[batchSlot];
 
     allowedTokens.insert(allowedTokens.begin(), indices.begin(), indices.begin() + topK);
     float totalProb = 0.f;
-    SizeType idx = 0;
+    SizeType32 idx = 0;
     while (totalProb < topP && idx < vocabSize)
     {
         allowedTokens.push_back(indices[idx]);
@@ -279,15 +279,15 @@ void SamplingKernelTest<T>::verifyResult(SamplingKernelTestParam const& param)
     auto const tokensPerStepPtr = bufferCast<int32_t>(*mTokensPerStep);
     auto const expectedCumLogProbsHostPtr = bufferCast<float>(*mExpectedCumLogProbsHost);
 
-    for (SizeType bi = 0; bi < batchSize; ++bi)
+    for (SizeType32 bi = 0; bi < batchSize; ++bi)
     {
         auto const batchSlot = batchSlotsPtr[bi];
         auto const tokensPerStep = tokensPerStepPtr[batchSlot];
-        for (SizeType ti = 0; ti < tokensPerStep; ++ti)
+        for (SizeType32 ti = 0; ti < tokensPerStep; ++ti)
         {
             auto kResults = param.returnAllTopK ? bufferCast<int32_t>(*mTopKsHost)[batchSlot] : 1;
 
-            for (SizeType ki = 0; ki < kResults; ++ki)
+            for (SizeType32 ki = 0; ki < kResults; ++ki)
             {
                 // Set reference finished state to true if we finished before or at current step
                 auto const idsIdx = param.returnAllTopK ? ti * mMaxTopK + ki : seqLengthsOrigHostPtr[batchSlot] + ti;

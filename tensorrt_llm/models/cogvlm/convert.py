@@ -27,8 +27,7 @@ def convert_hf_cogvlm(hf_model,
                       act_range=[],
                       qkv_para=[],
                       smoother=[],
-                      moe_config=None,
-                      lora_config=None):
+                      moe_config=None):
 
     weights = {}
     tik = time.time()
@@ -193,8 +192,6 @@ def convert_hf_cogvlm(hf_model,
             torch.cuda.ipc_collect()
 
     v = get_weight(model_params, 'model.embed_tokens', dtype)
-    if lora_config.is_valid and lora_config.embedding_weight is not None:
-        v = lora_config.embedding_weight
     if hf_model.config.tie_word_embeddings:
         # lm_head.weight has the same weights as embedding
         if mapping.is_last_pp_rank():
@@ -222,11 +219,6 @@ def convert_hf_cogvlm(hf_model,
     lm_head_weights = get_weight(model_params, 'lm_head', dtype)
 
     if mapping.is_last_pp_rank():
-
-        if lora_config.is_valid and lora_config.lm_head_weight is not None:
-
-            lm_head_weights = lora_config.lm_head_weight
-
         if vocab_size % mapping.tp_size != 0:
             # padding
             vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)

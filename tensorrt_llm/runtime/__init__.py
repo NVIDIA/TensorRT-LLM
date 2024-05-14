@@ -14,8 +14,7 @@
 # limitations under the License.
 from .generation import SamplingConfig  # autoflake: skip
 from .generation import (ChatGLMGenerationSession, GenerationSession,
-                         LogitsProcessor, LogitsProcessorList,
-                         MambaLMHeadModelGenerationSession, ModelConfig,
+                         LogitsProcessor, LogitsProcessorList, ModelConfig,
                          QWenForCausalLMGenerationSession, StoppingCriteria,
                          StoppingCriteriaList, to_word_list_format)
 from .kv_cache_manager import GenerationSequence, KVCacheManager
@@ -49,5 +48,4 @@ __all__ = [
     'ModelRunner',
     'ModelRunnerCpp',
     'PYTHON_BINDINGS',
-    'MambaLMHeadModelGenerationSession',
 ]

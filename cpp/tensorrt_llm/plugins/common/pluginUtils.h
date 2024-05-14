@@ -21,11 +21,11 @@
 
 namespace tensorrt_llm::plugins::utils
 {
-using DimType = int32_t;
+using DimType64 = int64_t;
 
-inline DimType computeMDimension(bool transA, nvinfer1::Dims const& dims)
+inline DimType64 computeMDimension(bool transA, nvinfer1::Dims const& dims)
 {
-    DimType M{1};
+    DimType64 M{1};
     if (transA)
     {
         for (int i = dims.nbDims - 1; i > 0; --i)
@@ -43,9 +43,9 @@ inline DimType computeMDimension(bool transA, nvinfer1::Dims const& dims)
     return M;
 }
 
-inline DimType computeNDimension(bool transB, nvinfer1::Dims const& dims)
+inline DimType64 computeNDimension(bool transB, nvinfer1::Dims const& dims)
 {
-    DimType N{1};
+    DimType64 N{1};
     if (transB)
     {
         for (int32_t i = 0; i < dims.nbDims - 1; ++i)
@@ -62,5 +62,10 @@ inline DimType computeNDimension(bool transB, nvinfer1::Dims const& dims)
     }
     return N;
 }
+
+#define TLLM_INT32_CAST(value)                                                                                         \
+    ((value > 0x7FFFFFFFL || value < -0x80000000L)                                                                     \
+            ? (TLLM_LOG_ERROR("Value of " #value " is out of range for int32_t"), 0)                                   \
+            : static_cast<int32_t>(value))
 
 } // namespace tensorrt_llm::plugins::utils

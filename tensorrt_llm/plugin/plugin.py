@@ -91,10 +91,9 @@ class PluginConfig:
     multi_block_mode: bool = False
     enable_xqa: bool = True
     attention_qk_half_accumulation: bool = False
-    tokens_per_block: int = 128
+    tokens_per_block: int = 64
     use_paged_context_fmha: bool = False
     use_fp8_context_fmha: bool = False
-    use_context_fmha_for_generation: bool = False
     multiple_profiles: bool = False
     paged_state: bool = True
     streamingllm: bool = False
@@ -191,7 +190,7 @@ class PluginConfig:
         self.set_plugin("remove_input_padding", True)
         return self
 
-    def enable_paged_kv_cache(self, tokens_per_block=128):
+    def enable_paged_kv_cache(self, tokens_per_block=64):
         self.set_plugin("paged_kv_cache", True)
         self.set_plugin("tokens_per_block", tokens_per_block)
         return self
@@ -281,8 +280,9 @@ class PluginConfig:
         self.set_plugin("use_paged_context_fmha", True)
         return self
 
-    def set_context_fmha_for_generation(self):
-        self.set_plugin("use_context_fmha_for_generation", True)
+    def set_fp8_context_fmha(self):
+        self.set_plugin("use_fp8_context_fmha", True)
+        self.set_context_fmha()
         return self
 
     def set_streamingllm(self):
@@ -313,7 +313,6 @@ cli_plugin_args = [
     "tokens_per_block",
     "use_paged_context_fmha",
     "use_fp8_context_fmha",
-    "use_context_fmha_for_generation",
     "multiple_profiles",
     "paged_state",
     "streamingllm",

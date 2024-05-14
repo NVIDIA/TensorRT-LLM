@@ -63,7 +63,6 @@
     "rmsnorm_quantization_plugin": false,
     "smooth_quant_gemm_plugin": false,
     "tokens_per_block": 128,
-    "use_context_fmha_for_generation": false,
     "use_custom_all_reduce": false,
     "use_paged_context_fmha": false,
     "weight_only_groupwise_quant_matmul_plugin": false,

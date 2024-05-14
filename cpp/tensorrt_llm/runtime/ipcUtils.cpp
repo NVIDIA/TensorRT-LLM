@@ -33,7 +33,7 @@ void setPeerAccess(WorldConfig const& worldConfig, bool enable)
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto const srcNode = worldConfig.getTensorParallelRank();
 
-    for (SizeType destNode = 0; destNode < worldConfig.getTensorParallelism(); destNode++)
+    for (SizeType32 destNode = 0; destNode < worldConfig.getTensorParallelism(); destNode++)
     {
         if (destNode == srcNode)
         {
@@ -127,8 +127,8 @@ void IpcMemory::destroyIpcMemory()
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-AllReduceBuffers::AllReduceBuffers(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxSequenceLength,
-    SizeType hiddenSize, BufferManager const& manager, WorldConfig const& worldConfig)
+AllReduceBuffers::AllReduceBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxSequenceLength,
+    SizeType32 hiddenSize, BufferManager const& manager, WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     setPeerAccess(worldConfig, true);
@@ -147,7 +147,7 @@ AllReduceBuffers::AllReduceBuffers(SizeType maxBatchSize, SizeType maxBeamWidth,
     }
 
     mAllReduceCommPtrs = BufferManager::cpu(
-        ITensor::makeShape({static_cast<SizeType>(mIpcMemoryHandles.size()) * tpSize}), nvinfer1::DataType::kINT64);
+        ITensor::makeShape({static_cast<SizeType32>(mIpcMemoryHandles.size()) * tpSize}), nvinfer1::DataType::kINT64);
     auto commPtrs = BufferRange<void*>(*mAllReduceCommPtrs);
 
     for (std::size_t memIdx = 0; memIdx < mIpcMemoryHandles.size(); memIdx++)

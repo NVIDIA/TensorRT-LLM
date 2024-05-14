@@ -54,7 +54,7 @@ TYPED_TEST_SUITE(TopPSamplingLayerTest, FloatAndHalfTypes);
 
 TYPED_TEST(TopPSamplingLayerTest, TopKSkipDecode)
 {
-    SizeType topK = 2;
+    SizeType32 topK = 2;
     float topP = 0.0f;
     TestSamplingParams params;
     params.topKs = {topK};
@@ -71,7 +71,7 @@ TYPED_TEST(TopPSamplingLayerTest, TopKSkipDecode)
 
 TYPED_TEST(TopPSamplingLayerTest, TopKTopPSkipDecode)
 {
-    SizeType topK = 2;
+    SizeType32 topK = 2;
     float topP = 1.0f;
     TestSamplingParams params;
     params.topKs = {topK};
@@ -88,7 +88,7 @@ TYPED_TEST(TopPSamplingLayerTest, TopKTopPSkipDecode)
 
 TYPED_TEST(TopPSamplingLayerTest, BatchTopKTopP)
 {
-    std::vector<SizeType> topKs = {0, 1, 1, 0, 1, 0};
+    std::vector<SizeType32> topKs = {0, 1, 1, 0, 1, 0};
     std::vector<float> topPs = {0.3f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f};
     TestSamplingParams params;
     params.topKs = topKs;
@@ -105,7 +105,7 @@ TYPED_TEST(TopPSamplingLayerTest, BatchTopKTopP)
 
 TYPED_TEST(TopPSamplingLayerTest, TopP)
 {
-    SizeType topK = 0;
+    SizeType32 topK = 0;
     float topP = 0.3f;
     TestSamplingParams params;
     params.topKs = {topK};

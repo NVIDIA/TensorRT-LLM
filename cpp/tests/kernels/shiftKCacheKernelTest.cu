@@ -270,13 +270,13 @@ public:
         auto tokenWriteIdxsHostPtr = bufferCast<int32_t>(*mTokenWriteIdxsHost);
         auto tokenPosIdxsHostPtr = bufferCast<int32_t>(*mTokenPosIdxsHost);
         auto tokenSeqIdxsHostPtr = bufferCast<int32_t>(*mTokenSeqIdxsHost);
-        for (SizeType bi = 0; bi < batchSize; ++bi)
+        for (SizeType32 bi = 0; bi < batchSize; ++bi)
         {
             seqLengthsHostPtr[bi] = seqLengths[bi];
             inputLengthsHostPtr[bi] = inputLengths[bi];
         }
 
-        for (SizeType idx = 0; idx < tokenReadIdxs.size(); ++idx)
+        for (SizeType32 idx = 0; idx < tokenReadIdxs.size(); ++idx)
         {
             tokenReadIdxsHostPtr[idx] = tokenReadIdxs[idx];
             tokenWriteIdxsHostPtr[idx] = tokenWriteIdxs[idx];
@@ -313,14 +313,14 @@ public:
 
         // Compare the results
         float tot_diff = 0.f;
-        for (SizeType bi = 0; bi < batchBeam; ++bi)
+        for (SizeType32 bi = 0; bi < batchBeam; ++bi)
         {
             int const tlength = seqLengths[bi] - 1;
             int const inlength = inputLengths[bi];
             int const beam_idx = bi % beamWidth;
-            for (SizeType hi = 0; hi < numHeads; ++hi)
+            for (SizeType32 hi = 0; hi < numHeads; ++hi)
             {
-                for (SizeType ti = 0; ti < validTokenNum; ++ti)
+                for (SizeType32 ti = 0; ti < validTokenNum; ++ti)
                 {
                     int const token_seq_idx = tokenSeqIdxs[ti];
                     int const token_write_idx = tokenWriteIdxs[ti];
@@ -329,7 +329,7 @@ public:
                     {
                         continue;
                     }
-                    for (SizeType ci = 0; ci < headSize; ++ci)
+                    for (SizeType32 ci = 0; ci < headSize; ++ci)
                     {
                         T* kRes = reinterpret_cast<T*>(kCacheOut.getKBlockPtr(bi, token_write_idx));
                         int resIdx = kCacheOut.getKVLocalIdx(token_write_idx, hi, headSize, ci);
@@ -483,8 +483,8 @@ TYPED_TEST(ShiftKCacheKernelTest, UncyclicShiftKCache)
     auto pagedKvCaches = std::vector<bool>{false, true};
     for (auto pagedKvCache : pagedKvCaches)
     {
-        const SizeType maxBlocksPerSeq = (pagedKvCache) ? 2 : 0;
-        const SizeType tokensPerBlock = (pagedKvCache) ? 16 : 0;
+        const SizeType32 maxBlocksPerSeq = (pagedKvCache) ? 2 : 0;
+        const SizeType32 tokensPerBlock = (pagedKvCache) ? 16 : 0;
         // include one more token for the current time step in seqLengths.
         std::vector<int32_t> seqLengths = {timestep};
         std::vector<int32_t> inputLengths = {8};
@@ -492,7 +492,7 @@ TYPED_TEST(ShiftKCacheKernelTest, UncyclicShiftKCache)
         std::vector<int32_t> tokenWriteIdxs;
         std::vector<int32_t> tokenPosIdxs;
         std::vector<int32_t> tokenSeqIdxs;
-        for (SizeType idx = 0; idx < timestep - 1; ++idx)
+        for (SizeType32 idx = 0; idx < timestep - 1; ++idx)
         {
             tokenReadIdxs.push_back(idx);
             tokenWriteIdxs.push_back(idx);
@@ -529,8 +529,8 @@ TYPED_TEST(ShiftKCacheKernelTest, CyclicShiftKCacheSimple)
     auto pagedKvCaches = std::vector<bool>{false, true};
     for (auto pagedKvCache : pagedKvCaches)
     {
-        const SizeType maxBlocksPerSeq = (pagedKvCache) ? 2 : 0;
-        const SizeType tokensPerBlock = (pagedKvCache) ? 16 : 0;
+        const SizeType32 maxBlocksPerSeq = (pagedKvCache) ? 2 : 0;
+        const SizeType32 tokensPerBlock = (pagedKvCache) ? 16 : 0;
         // include one more token for the current time step in seqLengths.
         std::vector<int32_t> seqLengths = {timestep};
         std::vector<int32_t> inputLengths = {8};
@@ -538,7 +538,7 @@ TYPED_TEST(ShiftKCacheKernelTest, CyclicShiftKCacheSimple)
         std::vector<int32_t> tokenWriteIdxs;
         std::vector<int32_t> tokenPosIdxs;
         std::vector<int32_t> tokenSeqIdxs;
-        for (SizeType idx = pastKCacheLength - maxAttentionWindow; idx < pastKCacheLength; ++idx)
+        for (SizeType32 idx = pastKCacheLength - maxAttentionWindow; idx < pastKCacheLength; ++idx)
         {
             tokenReadIdxs.push_back(idx % maxAttentionWindow);
             tokenWriteIdxs.push_back(idx % maxAttentionWindow);
@@ -575,10 +575,10 @@ TYPED_TEST(ShiftKCacheKernelTest, CyclicShiftKCacheSink)
     auto pagedKvCaches = std::vector<bool>{false, true};
     for (auto pagedKvCache : pagedKvCaches)
     {
-        const SizeType maxBlocksPerSeq = (pagedKvCache) ? 3 : 0;
-        const SizeType tokensPerBlock = (pagedKvCache) ? 16 : 1;
-        const SizeType sinkTokensInLastBlock = sinkTokenLength % tokensPerBlock;
-        const SizeType bubbleLength = sinkTokensInLastBlock == 0 ? 0 : tokensPerBlock - sinkTokensInLastBlock;
+        const SizeType32 maxBlocksPerSeq = (pagedKvCache) ? 3 : 0;
+        const SizeType32 tokensPerBlock = (pagedKvCache) ? 16 : 1;
+        const SizeType32 sinkTokensInLastBlock = sinkTokenLength % tokensPerBlock;
+        const SizeType32 bubbleLength = sinkTokensInLastBlock == 0 ? 0 : tokensPerBlock - sinkTokensInLastBlock;
         // include one more token for the current time step in seqLengths.
         std::vector<int32_t> seqLengths = {timestep};
         std::vector<int32_t> inputLengths = {8};
@@ -588,7 +588,7 @@ TYPED_TEST(ShiftKCacheKernelTest, CyclicShiftKCacheSink)
         std::vector<int32_t> tokenSeqIdxs = {0, 1, 2, 3};
 
         int const cyclicLength = maxAttentionWindow - sinkTokenLength;
-        for (SizeType idx = pastKCacheLength - cyclicLength; idx < pastKCacheLength; ++idx)
+        for (SizeType32 idx = pastKCacheLength - cyclicLength; idx < pastKCacheLength; ++idx)
         {
             tokenReadIdxs.push_back(sinkTokenLength + bubbleLength + (idx - sinkTokenLength) % cyclicLength);
             tokenWriteIdxs.push_back(sinkTokenLength + (idx - sinkTokenLength) % cyclicLength);
@@ -638,7 +638,7 @@ TYPED_TEST(ShiftKCacheKernelTest, CyclicShiftKCacheSinkOneMoreBlock)
     auto constexpr cyclicLength = maxAttentionWindow - sinkTokenLength;
     auto constexpr rCyclicLength = maxAttentionWindow - sinkTokenLength + tokensPerBlock;
     auto constexpr wCyclicLength = cyclicLength;
-    for (SizeType idx = pastKCacheLength - cyclicLength; idx < pastKCacheLength; ++idx)
+    for (SizeType32 idx = pastKCacheLength - cyclicLength; idx < pastKCacheLength; ++idx)
     {
         tokenReadIdxs.push_back(sinkTokenLength + bubbleLength + (idx - sinkTokenLength) % rCyclicLength);
         tokenWriteIdxs.push_back(sinkTokenLength + (idx - sinkTokenLength) % wCyclicLength);

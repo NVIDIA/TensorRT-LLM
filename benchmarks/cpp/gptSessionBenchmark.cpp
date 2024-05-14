@@ -68,13 +68,13 @@ size_t monitorMemory(std::atomic_bool& done)
 void benchmarkGptSession(std::filesystem::path const& dataPath, std::vector<int> const& batchSizes, int beamWidth,
     std::vector<std::vector<int>> const& inOutLen, std::shared_ptr<nvinfer1::ILogger> const& logger, int warmUp,
     int numRuns, int duration, GptSession::Config& sessionConfig, bool cudaGraphMode, bool printAllLogits,
-    bool disableForceMaxTokens, bool dumpLayerInfo, bool dumpProfile)
+    bool disableForceMaxTokens, bool dumpLayerInfo, bool dumpProfile, std::vector<float> const& gpuWeightsPercents)
 {
     std::filesystem::path jsonFileName = dataPath / "config.json";
     auto const json = GptJsonConfig::parse(jsonFileName);
     auto const modelConfig = json.getModelConfig();
     auto const inputPacked = modelConfig.usePackedInput();
-    SizeType deviceCount{0};
+    SizeType32 deviceCount{0};
     TLLM_CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
     auto const worldConfig = WorldConfig::mpi(deviceCount, json.getTensorParallelism(), json.getPipelineParallelism());
     auto& comm = COMM_SESSION;
@@ -95,12 +95,29 @@ void benchmarkGptSession(std::filesystem::path const& dataPath, std::vector<int>
     sessionConfig.decoderPerRequest = false;
     sessionConfig.cudaGraphMode = cudaGraphMode;
 
+    struct RuntimeConfig
+    {
+        int inLen;
+        int maxNewTokens;
+        float gpuWeightsPercent;
+    };
+
+    std::vector<RuntimeConfig> benchmarkConfigs;
     for (auto inOut : inOutLen)
     {
-        auto const maxInputLength = inOut[0];
-        auto const maxNewTokens = inOut[1];
+        for (auto gpuWeightsPercent : gpuWeightsPercents)
+        {
+            benchmarkConfigs.push_back({inOut[0], inOut[1], gpuWeightsPercent});
+        }
+    }
+
+    for (auto const& bc : benchmarkConfigs)
+    {
+        auto const maxInputLength = bc.inLen;
+        auto const maxNewTokens = bc.maxNewTokens;
 
         sessionConfig.maxSequenceLength = maxInputLength + maxNewTokens;
+        sessionConfig.gpuWeightsPercent = bc.gpuWeightsPercent;
         samplingConfig.minLength = std::vector{disableForceMaxTokens ? 1 : maxNewTokens};
 
         GptSession session{sessionConfig, modelConfig, worldConfig, enginePath.string(), logger};
@@ -116,6 +133,7 @@ void benchmarkGptSession(std::filesystem::path const& dataPath, std::vector<int>
         std::atomic_bool done;
         for (auto const batchSize : batchSizes)
         {
+
             if (inputPacked && maxNumTokens != std::nullopt)
             {
                 TLLM_CHECK_WITH_INFO(maxBatchSize * maxInputLength <= maxNumTokens.value(),
@@ -130,7 +148,7 @@ void benchmarkGptSession(std::filesystem::path const& dataPath, std::vector<int>
             {
                 TLLM_LOG_INFO(memoryCounter.toString());
 
-                std::vector<SizeType> inputLengthsHost(batchSize, maxInputLength);
+                std::vector<SizeType32> inputLengthsHost(batchSize, maxInputLength);
                 auto inputLengths
                     = bufferManager.copyFrom(inputLengthsHost, ITensor::makeShape({batchSize}), MemoryType::kGPU);
 
@@ -179,9 +197,9 @@ void benchmarkGptSession(std::filesystem::path const& dataPath, std::vector<int>
 
                 for (auto r = 0; r < warmUp; ++r)
                 {
-                    SizeType numSteps = 0;
+                    SizeType32 numSteps = 0;
                     generationOutput.onTokenGenerated
-                        = [&numSteps, maxNewTokens](GenerationOutput::TensorPtr const& outputIds, SizeType step,
+                        = [&numSteps, maxNewTokens](GenerationOutput::TensorPtr const& outputIds, SizeType32 step,
                               bool finished) { ++numSteps; };
                     session.generate(generationOutput, generationInput, samplingConfig);
                     bufferManager.getStream().synchronize();
@@ -198,9 +216,9 @@ void benchmarkGptSession(std::filesystem::path const& dataPath, std::vector<int>
                 while (iterIdx < numRuns)
                 {
                     auto const start = std::chrono::steady_clock::now();
-                    SizeType numSteps = 0;
+                    SizeType32 numSteps = 0;
                     generationOutput.onTokenGenerated
-                        = [&numSteps, maxNewTokens](GenerationOutput::TensorPtr const& outputIds, SizeType step,
+                        = [&numSteps, maxNewTokens](GenerationOutput::TensorPtr const& outputIds, SizeType32 step,
                               bool finished) { ++numSteps; };
                     session.generate(generationOutput, generationInput, samplingConfig, generationProfiler);
                     bufferManager.getStream().synchronize();
@@ -307,9 +325,9 @@ void benchmarkGptSession(std::filesystem::path const& dataPath, std::vector<int>
                     while (iterIdx < numRuns)
                     {
                         auto const start = std::chrono::steady_clock::now();
-                        SizeType numSteps = 0;
+                        SizeType32 numSteps = 0;
                         generationOutput.onTokenGenerated
-                            = [&numSteps, maxNewTokens](GenerationOutput::TensorPtr const& outputIds, SizeType step,
+                            = [&numSteps, maxNewTokens](GenerationOutput::TensorPtr const& outputIds, SizeType32 step,
                                   bool finished) { ++numSteps; };
                         session.generate(generationOutput, generationInput, samplingConfig, generationProfiler);
                         bufferManager.getStream().synchronize();
@@ -418,6 +436,11 @@ int main(int argc, char* argv[])
     options.add_options()("disable_force_max_tokens", "Disable force the engine generating new max_tokens.");
     options.add_options()("dump_layer_info", "Print layer information of the engine to console.");
     options.add_options()("dump_profile", "Print profile information per layer.");
+    options.add_options()("gpu_weights_percent",
+        "Specify the percentage of weights that reside on GPU (from 0.0 to 1.0). Multiple percentages can be separated "
+        "by \";\", "
+        "example: \"0.0;0.5;1.0\".",
+        cxxopts::value<std::string>()->default_value("1.0"));
 
     auto result = options.parse(argc, argv);
 
@@ -530,13 +553,29 @@ int main(int argc, char* argv[])
     auto dumpLayerInfo = result.count("dump_layer_info") > 0;
     auto dumpProfile = result.count("dump_profile") > 0;
 
+    // Argument: GPU weights percentage
+    std::istringstream ssGpuPercentArg;
+    ssGpuPercentArg.str(result["gpu_weights_percent"].as<std::string>());
+    std::vector<float> gpuWeightsPercents;
+    for (std::string token; std::getline(ssGpuPercentArg, token, ';');)
+    {
+        auto gpuWeightsPercent = std::stof(token);
+        if (gpuWeightsPercent < 0 || gpuWeightsPercent > 1)
+        {
+            TLLM_LOG_ERROR(
+                "--gpu_weights_percent must have percents between 0.0 and 1.0 but got: %f", gpuWeightsPercent);
+            return 1;
+        }
+        gpuWeightsPercents.push_back(gpuWeightsPercent);
+    }
+
     initTrtLlmPlugins(logger.get());
 
     try
     {
         benchmarkGptSession(result["engine_dir"].as<std::string>(), batchSizes, beamWidth, inOutLen, logger,
             result["warm_up"].as<int>(), result["num_runs"].as<int>(), result["duration"].as<int>(), sessionConfig,
-            enableCudaGraph, printAllLogits, disableForceMaxTokens, dumpLayerInfo, dumpProfile);
+            enableCudaGraph, printAllLogits, disableForceMaxTokens, dumpLayerInfo, dumpProfile, gpuWeightsPercents);
     }
     catch (std::exception const& e)
     {

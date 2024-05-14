@@ -46,7 +46,7 @@ class TestModelDtype(unittest.TestCase):
         }
         config = PretrainedConfig.from_dict(config)
         tiny_model = model_cls(config)
-        for p in tiny_model.parameter():
+        for p in tiny_model.parameters():
             self.assertEqual(p.raw_value.dtype, str_dtype_to_np(dtype))
 
 

@@ -242,8 +242,8 @@ __global__ void computeAttentionMask(AttentionMaskDataType* attentionMask, int c
             break;
         case AttentionMaskType::BIDIRECTIONAL:
             // clang-format off
-             isValid = (rowIdx <  seqLength - 1 && colIdx < seqLength - 1) ||
-                       (rowIdx == seqLength - 1 && colIdx < seqLength);
+              isValid = (rowIdx <  seqLength - 1 && colIdx < seqLength - 1) ||
+                        (rowIdx == seqLength - 1 && colIdx < seqLength);
             // clang-format on
             // seq_length==4, max_seq_len==5
             // 1 1 1 0 0
@@ -253,8 +253,8 @@ __global__ void computeAttentionMask(AttentionMaskDataType* attentionMask, int c
             // 0 0 0 0 0
         case AttentionMaskType::BIDIRECTIONALGLM:
             // clang-format off
-             isValid = (colIdx < seqLength - 1) ||
-                       (rowIdx == seqLength - 1 && colIdx == seqLength - 1);
+              isValid = (colIdx < seqLength - 1) ||
+                        (rowIdx == seqLength - 1 && colIdx == seqLength - 1);
             // clang-format on
             // seq_length==4, max_seq_len==5
             // 1 1 1 1 0

@@ -55,7 +55,7 @@ The [`convert_checkpoint.py`](./convert_checkpoint.py) script converts JAX weigh
 
 ```bash
 # recurrentgemma-2b
-CKPT_2B_PATH=./recurrentgemma/recurrentgemma-2b
+CKPT_2B_PATH=./recurrentgemma_model/recurrentgemma-2b
 UNIFIED_CKPT_2B_PATH=./recurrentgemma_model/recurrentgemma-2b/trt_ckpt/fp16/1-gpu/
 python convert_checkpoint.py --model_dir ${CKPT_2B_PATH} \
                              --ckpt_type hf \
@@ -63,7 +63,7 @@ python convert_checkpoint.py --model_dir ${CKPT_2B_PATH} \
                              --output_dir ${UNIFIED_CKPT_2B_PATH}
 
 # recurrentgemma-2b-it
-CKPT_2B_IT_PATH=./recurrentgemma/recurrentgemma-2b-it
+CKPT_2B_IT_PATH=./recurrentgemma_model/recurrentgemma-2b-it
 UNIFIED_CKPT_2B_IT_PATH=./recurrentgemma_model/recurrentgemma-2b-it/trt_ckpt/fp16/1-gpu/
 python convert_checkpoint.py --model_dir ${CKPT_2B_IT_PATH} \
                              --ckpt_type hf \
@@ -150,14 +150,14 @@ Note that we need to download the dataset of MMLU first and the evaluation of MM
 
 ```bash
 # recurrentgemma-2b
-TOKENIZER_DIR_2B_PATH=./recurrentgemma/recurrentgemma-2b
+TOKENIZER_DIR_2B_PATH=./recurrentgemma_model/recurrentgemma-2b
 python3 ../run.py --max_output_len=100 \
                   --use_py_session \
                   --tokenizer_dir ${TOKENIZER_DIR_2B_PATH} \
                   --engine_dir ${ENGINE_2B_PATH}
 
 # recurrentgemma-2b-it
-TOKENIZER_DIR_2B_IT_PATH=./recurrentgemma/recurrentgemma-2b-it
+TOKENIZER_DIR_2B_IT_PATH=./recurrentgemma_model/recurrentgemma-2b-it
 python3 ../run.py --max_output_len=100 \
                   --use_py_session \
                   --tokenizer_dir ${TOKENIZER_DIR_2B_IT_PATH} \

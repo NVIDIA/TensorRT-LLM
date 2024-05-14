@@ -309,7 +309,7 @@ void GemmPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, in
     auto const minM = utils::computeMDimension(mTransA, in[0].min);
     auto const maxM = utils::computeMDimension(mTransA, in[0].max);
     auto const N = utils::computeNDimension(mTransB, in[1].max);
-    auto const K = static_cast<utils::DimType>(mTransA ? in[0].max.d[0] : in[0].max.d[nbDimsA - 1]);
+    auto const K = static_cast<utils::DimType64>(mTransA ? in[0].max.d[0] : in[0].max.d[nbDimsA - 1]);
 
     if (!mDims.isInitialized())
     {
@@ -344,7 +344,7 @@ int GemmPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::P
     int const padK = mTransA ? 0 : mPadLda;
     auto const M = utils::computeMDimension(mTransA, inputDesc[0].dims) - padM;
     auto const N = utils::computeNDimension(mTransB, inputDesc[1].dims) - padN;
-    int const K = static_cast<utils::DimType>(
+    int const K = static_cast<utils::DimType64>(
         mTransA ? inputDesc[0].dims.d[0] - padK : inputDesc[0].dims.d[nbDimsA - 1] - padK);
 
     auto bestTactic = mPluginProfiler->getBestConfig(M, mGemmId);

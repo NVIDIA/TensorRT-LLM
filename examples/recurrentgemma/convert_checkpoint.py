@@ -482,6 +482,8 @@ def main():
         gpus_per_node=8,
         quantization=quant_config,
         conv_kernel=4,
+        state_size=1,
+        state_dtype='float32',
         rotary_percentage=0.5,
         layer_types=ckpt_config["block_types"],
         rnn_hidden_size=ckpt_config["lru_width"],

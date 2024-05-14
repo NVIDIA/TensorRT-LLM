@@ -31,7 +31,7 @@
 namespace tensorrt_llm::batch_manager
 {
 
-using runtime::SizeType;
+using runtime::SizeType32;
 
 /**
  * BasePeftCacheManager
@@ -70,11 +70,11 @@ public:
 
     virtual void markRequestDone(LlmRequestPtr const& llmReq, bool pause = false) = 0;
 
-    [[nodiscard]] virtual SizeType getMaxDevicePages() const = 0;
+    [[nodiscard]] virtual SizeType32 getMaxDevicePages() const = 0;
 
-    [[nodiscard]] virtual SizeType getMaxHostPages() const = 0;
+    [[nodiscard]] virtual SizeType32 getMaxHostPages() const = 0;
 
-    [[nodiscard]] virtual SizeType determineNumPages(std::shared_ptr<LlmRequest> llmRequest) const = 0;
+    [[nodiscard]] virtual SizeType32 determineNumPages(std::shared_ptr<LlmRequest> llmRequest) const = 0;
 
     [[nodiscard]] virtual bool enabled() const = 0;
 };
@@ -99,11 +99,11 @@ public:
 
     void markRequestDone(std::shared_ptr<LlmRequest> const& llmReq, bool pause = false) override;
 
-    [[nodiscard]] SizeType getMaxDevicePages() const override;
+    [[nodiscard]] SizeType32 getMaxDevicePages() const override;
 
-    [[nodiscard]] SizeType getMaxHostPages() const override;
+    [[nodiscard]] SizeType32 getMaxHostPages() const override;
 
-    [[nodiscard]] SizeType determineNumPages(std::shared_ptr<LlmRequest> llmRequest) const override;
+    [[nodiscard]] SizeType32 determineNumPages(std::shared_ptr<LlmRequest> llmRequest) const override;
 
     inline bool enabled() const override
     {
@@ -156,11 +156,11 @@ class NoOpPeftCacheManager : public BasePeftCacheManager
 
     void markRequestDone(std::shared_ptr<LlmRequest> const& llmReq, bool pause = false) override;
 
-    [[nodiscard]] SizeType getMaxDevicePages() const override;
+    [[nodiscard]] SizeType32 getMaxDevicePages() const override;
 
-    [[nodiscard]] SizeType getMaxHostPages() const override;
+    [[nodiscard]] SizeType32 getMaxHostPages() const override;
 
-    [[nodiscard]] SizeType determineNumPages(std::shared_ptr<LlmRequest> llmRequest) const override;
+    [[nodiscard]] SizeType32 determineNumPages(std::shared_ptr<LlmRequest> llmRequest) const override;
 
     inline bool enabled() const override
     {

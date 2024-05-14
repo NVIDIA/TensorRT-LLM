@@ -79,14 +79,14 @@ void BaseSamplingLayerTest<T>::setup(uint64_t seed, TestSamplingParams const& pa
     trk::invokeFill(*mEndIdsDevice, int32_t{mEndId}, *mStream);
 
     auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
-    for (SizeType bi = 0; bi < mBatchSize; ++bi)
+    for (SizeType32 bi = 0; bi < mBatchSize; ++bi)
     {
         batchSlotsPtr[bi] = 2 * bi;
     }
 
     auto idsPtrHostPtr = BufferRange<void*>(*mIdsPtrHost);
     auto outputIdsDevicePtr = bufferCast<int32_t>(*mOutputIdsDevice);
-    for (SizeType bi = 0; bi < mMaxBatchSize; bi++)
+    for (SizeType32 bi = 0; bi < mMaxBatchSize; bi++)
     {
         idsPtrHostPtr[bi] = outputIdsDevicePtr + bi * mMaxSeqLen;
     }
@@ -94,7 +94,7 @@ void BaseSamplingLayerTest<T>::setup(uint64_t seed, TestSamplingParams const& pa
     auto setupParams = std::make_shared<SamplingSetupParams>();
     setupParams->randomSeed = std::make_optional<std::vector<uint64_t>>({seed});
     setupParams->runtime_top_k
-        = params.topKs.size() ? std::make_optional<std::vector<SizeType>>(params.topKs) : std::nullopt;
+        = params.topKs.size() ? std::make_optional<std::vector<SizeType32>>(params.topKs) : std::nullopt;
     setupParams->runtime_top_p
         = params.topPs.size() ? std::make_optional<std::vector<float>>(params.topPs) : std::nullopt;
     setupParams->top_p_decay

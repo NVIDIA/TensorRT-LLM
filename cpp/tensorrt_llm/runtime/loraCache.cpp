@@ -50,12 +50,12 @@ void LoraCachePageManager::initialize(BufferManager const& bufferManager)
     std::size_t pageIdx = 0;
     while (pageIdx < static_cast<size_t>(mConfig.getTotalNumPages()))
     {
-        auto const numLocalPages = std::min<SizeType>(
-            mConfig.getTotalNumPages() - static_cast<SizeType>(pageIdx), mConfig.getMaxPagesPerBlock());
+        auto const numLocalPages = std::min<SizeType32>(
+            mConfig.getTotalNumPages() - static_cast<SizeType32>(pageIdx), mConfig.getMaxPagesPerBlock());
         auto const blockShape = ITensor::makeShape({numLocalPages, mConfig.getSlotsPerPage(), mConfig.getPageWidth()});
         TensorPtr block = bufferManager.allocate(mConfig.getMemoryType(), blockShape, mConfig.getDataType());
         mPageBlocks.push_back(block);
-        for (SizeType i = 0; i < numLocalPages; ++i)
+        for (SizeType32 i = 0; i < numLocalPages; ++i)
         {
             mFreePageIds.push_back(pageIdx);
             ++pageIdx;
@@ -67,10 +67,10 @@ void LoraCachePageManager::initialize(BufferManager const& bufferManager)
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
-std::optional<std::vector<std::size_t>> LoraCachePageManager::claimPages(SizeType numPages)
+std::optional<std::vector<std::size_t>> LoraCachePageManager::claimPages(SizeType32 numPages)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
-    if (numPages <= static_cast<SizeType>(mFreePageIds.size()))
+    if (numPages <= static_cast<SizeType32>(mFreePageIds.size()))
     {
         std::vector<std::size_t> outputPages{};
         outputPages.reserve(numPages);
@@ -87,9 +87,9 @@ std::optional<std::vector<std::size_t>> LoraCachePageManager::claimPages(SizeTyp
     return std::nullopt;
 }
 
-SizeType LoraCachePageManager::numAvailablePages() const
+SizeType32 LoraCachePageManager::numAvailablePages() const
 {
-    return static_cast<SizeType>(mFreePageIds.size());
+    return static_cast<SizeType32>(mFreePageIds.size());
 }
 
 void LoraCachePageManager::releasePages(std::vector<std::size_t> const& pageIds)
@@ -108,7 +108,7 @@ void LoraCachePageManager::releasePages(std::vector<std::size_t> const& pageIds)
     }
 }
 
-ITensor::SharedConstPtr LoraCachePageManager::blockPtr(SizeType blockIdx) const
+ITensor::SharedConstPtr LoraCachePageManager::blockPtr(SizeType32 blockIdx) const
 {
     return mPageBlocks.at(blockIdx);
 }
@@ -277,7 +277,7 @@ void LoraCache::loadWeights(TaskValue& taskValue, TensorPtr weights, TensorPtr c
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
-std::vector<std::size_t> LoraCache::claimPagesWithEvict(SizeType numPages)
+std::vector<std::size_t> LoraCache::claimPagesWithEvict(SizeType32 numPages)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     TLLM_LOG_DEBUG("trying to claim " + std::to_string(numPages));
@@ -421,7 +421,7 @@ LoraCache::ValueStatus LoraCache::getStatus(TaskIdType taskId) const
     return kVALUE_STATUS_MISSING;
 }
 
-SizeType LoraCache::determineNumPages(TaskIdType taskId) const
+SizeType32 LoraCache::determineNumPages(TaskIdType taskId) const
 {
     std::lock_guard<std::mutex> lk(mCacheMutex);
     if (kVALUE_STATUS_MISSING == getStatus(taskId))
@@ -432,18 +432,18 @@ SizeType LoraCache::determineNumPages(TaskIdType taskId) const
     return mCacheMap.at(taskId)->pageIds.size();
 }
 
-SizeType LoraCache::determineNumPages(TensorPtr loraConfig) const
+SizeType32 LoraCache::determineNumPages(TensorPtr loraConfig) const
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     auto const localNumLayers = mModelConfig.getNbAttentionLayers(mWorldConfig.getPipelineParallelism());
     auto const firstLayerId = mWorldConfig.getPipelineParallelRank() * localNumLayers;
     auto const lastLayerId = firstLayerId + localNumLayers;
 
-    SizeType currPage = 0;
-    SizeType currSlot = 0;
-    SizeType const slotsPerPage = mPageManagerConfig.getSlotsPerPage();
-    SizeType const pageWidth = mPageManagerConfig.getPageWidth();
-    for (SizeType row = 0; row < loraConfig->getShape().d[0]; ++row)
+    SizeType32 currPage = 0;
+    SizeType32 currSlot = 0;
+    SizeType32 const slotsPerPage = mPageManagerConfig.getSlotsPerPage();
+    SizeType32 const pageWidth = mPageManagerConfig.getPageWidth();
+    for (SizeType32 row = 0; row < loraConfig->getShape().d[0]; ++row)
     {
         auto const rowPtr = bufferCast<int32_t>(*ITensor::slice(loraConfig, row, 1));
         auto const layerId = rowPtr[lora::kLORA_CONFIG_LAYER_OFF];
@@ -489,18 +489,18 @@ LoraCache::LoraCache(LoraCachePageManagerConfig const& pageManagerConfig, ModelC
 }
 
 template <typename T>
-void LoraCache::splitTransposeCpuInner(ITensor& output, ITensor const& input, SizeType tpSize, SizeType tpRank)
+void LoraCache::splitTransposeCpuInner(ITensor& output, ITensor const& input, SizeType32 tpSize, SizeType32 tpRank)
 {
     auto const adapterSize = input.getShape().d[0];
     auto const hiddenSize = input.getShape().d[1];
-    auto const splitHiddenSize = static_cast<SizeType>(hiddenSize / tpSize);
+    auto const splitHiddenSize = static_cast<SizeType32>(hiddenSize / tpSize);
 
     auto outputPtr = bufferCast<T>(output);
     auto const inputPtr = bufferCast<T>(input);
 
-    for (SizeType adapterIdx = 0; adapterIdx < adapterSize; ++adapterIdx)
+    for (SizeType32 adapterIdx = 0; adapterIdx < adapterSize; ++adapterIdx)
     {
-        for (SizeType hiddenIdx = 0; hiddenIdx < splitHiddenSize; ++hiddenIdx)
+        for (SizeType32 hiddenIdx = 0; hiddenIdx < splitHiddenSize; ++hiddenIdx)
         {
             auto outputIdx = common::flat_index2(adapterIdx, hiddenIdx, splitHiddenSize);
             auto inputIdx = common::flat_index2(adapterIdx, hiddenIdx + tpRank * splitHiddenSize, hiddenSize);
@@ -509,13 +509,13 @@ void LoraCache::splitTransposeCpuInner(ITensor& output, ITensor const& input, Si
     }
 }
 
-void LoraCache::splitTransposeCpu(ITensor& output, ITensor const& input, SizeType tpSize, SizeType tpRank)
+void LoraCache::splitTransposeCpu(ITensor& output, ITensor const& input, SizeType32 tpSize, SizeType32 tpRank)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
 
     switch (input.getDataType())
     {
-    case nvinfer1::DataType::kINT32: splitTransposeCpuInner<SizeType>(output, input, tpSize, tpRank); break;
+    case nvinfer1::DataType::kINT32: splitTransposeCpuInner<SizeType32>(output, input, tpSize, tpRank); break;
     case nvinfer1::DataType::kFLOAT: splitTransposeCpuInner<float>(output, input, tpSize, tpRank); break;
     case nvinfer1::DataType::kHALF: splitTransposeCpuInner<half>(output, input, tpSize, tpRank); break;
     case nvinfer1::DataType::kINT8: splitTransposeCpuInner<int8_t>(output, input, tpSize, tpRank); break;
@@ -533,7 +533,7 @@ void LoraCache::splitTransposeCpu(ITensor& output, ITensor const& input, SizeTyp
 
 std::vector<LoraCache::TaskLayerModuleConfig> LoraCache::copyToPages(TensorPtr sourceWeights, TensorPtr sourceConfig,
     ModelConfig const& modelConfig, WorldConfig const& worldConfig,
-    std::unordered_map<SizeType, LoraModule> moduleIdToModule, BufferManager const& manager,
+    std::unordered_map<SizeType32, LoraModule> moduleIdToModule, BufferManager const& manager,
     std::vector<TensorPtr> const& pages, std::vector<std::size_t> const& pageIds)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
@@ -562,15 +562,15 @@ std::vector<LoraCache::TaskLayerModuleConfig> LoraCache::copyToPages(TensorPtr s
     auto const firstLayerId = ppRank * localNumLayers;
     auto const lastLayerId = firstLayerId + localNumLayers;
 
-    SizeType currPage = 0;
-    SizeType currSlot = 0;
+    SizeType32 currPage = 0;
+    SizeType32 currSlot = 0;
 
-    std::vector<SizeType> rowPage;
-    std::vector<SizeType> rowSlot;
-    std::vector<SizeType> rowIndices;
+    std::vector<SizeType32> rowPage;
+    std::vector<SizeType32> rowSlot;
+    std::vector<SizeType32> rowIndices;
 
     auto const numRows = config->getShape().d[0];
-    for (SizeType row = 0; row < numRows; ++row)
+    for (SizeType32 row = 0; row < numRows; ++row)
     {
         auto const configPtr = bufferCast<int32_t>(*ITensor::slice(config, row, 1));
         auto const layerId = configPtr[lora::kLORA_CONFIG_LAYER_OFF];
@@ -596,7 +596,7 @@ std::vector<LoraCache::TaskLayerModuleConfig> LoraCache::copyToPages(TensorPtr s
     }
 
     std::vector<LoraCache::TaskLayerModuleConfig> pageLocations(rowIndices.size());
-    for (SizeType i = 0; i < static_cast<SizeType>(rowIndices.size()); ++i)
+    for (SizeType32 i = 0; i < static_cast<SizeType32>(rowIndices.size()); ++i)
     {
         auto copyFn = [i = i, &rowIndices, &rowPage, &rowSlot, &pageLocations, weights, config, &pages,
                           &moduleIdToModule, &manager, pageWidth, tpSize, tpRank, pageIds]()
@@ -638,7 +638,7 @@ std::vector<LoraCache::TaskLayerModuleConfig> LoraCache::copyToPages(TensorPtr s
                 = ITensor::view(ITensor::slice(rowWeights, inSize, outSize), ITensor::makeShape({outDim, adapterSize}));
 
             TensorPtr pageSlice = ITensor::slice(pages.at(currPage), currSlot, rowSlots);
-            SizeType pageSliceSize = ITensor::volume(pageSlice->getShape());
+            SizeType32 pageSliceSize = ITensor::volume(pageSlice->getShape());
             TensorPtr pageFlatView = ITensor::view(pageSlice, ITensor::makeShape({pageSliceSize}));
             TensorPtr targetWeightsIn = ITensor::slice(pageFlatView, 0, localInSize);
             TensorPtr targetWeightsOut = ITensor::slice(pageFlatView, localInSize, localOutSize);
@@ -666,7 +666,7 @@ std::vector<LoraCache::TaskLayerModuleConfig> LoraCache::copyToPages(TensorPtr s
             }
 
             pageLocations[i] = LoraCache::TaskLayerModuleConfig{pageIds.at(currPage), currSlot, localInSize,
-                localOutSize, modId, layerId, adapterSize, static_cast<SizeType>(rowSlots),
+                localOutSize, modId, layerId, adapterSize, static_cast<SizeType32>(rowSlots),
                 reinterpret_cast<std::int64_t>(targetWeightsIn->data()),
                 reinterpret_cast<std::int64_t>(targetWeightsOut->data())};
         };
@@ -677,13 +677,13 @@ std::vector<LoraCache::TaskLayerModuleConfig> LoraCache::copyToPages(TensorPtr s
     return pageLocations;
 }
 
-std::map<size_t, std::pair<size_t, SizeType>> LoraCache::copyTaskMapPages(TaskValue& targetTaskValue,
+std::map<size_t, std::pair<size_t, SizeType32>> LoraCache::copyTaskMapPages(TaskValue& targetTaskValue,
     TaskValue const& sourceTaskValue, std::vector<size_t> const& targetPageIds, LoraCache const& targetCache)
 {
     auto const& pageIds = sourceTaskValue.pageIds;
 
     // collect mapping from oldPageId to (newPageId, num used slots in page)
-    std::map<size_t, std::pair<size_t, SizeType>> oldToNewPageIds{};
+    std::map<size_t, std::pair<size_t, SizeType32>> oldToNewPageIds{};
     for (size_t i = 0; i < pageIds.size(); ++i)
     {
         oldToNewPageIds.insert_or_assign(pageIds[i], std::make_pair(targetPageIds[i], 0));
@@ -849,7 +849,7 @@ ITensor::SharedConstPtr LoraCache::getPagePtr(size_t pageId) const
     return mCachePageManager->pagePtr(pageId);
 }
 
-SizeType LoraCache::getNumPages() const
+SizeType32 LoraCache::getNumPages() const
 {
     return mPageManagerConfig.getTotalNumPages();
 }
@@ -857,7 +857,7 @@ SizeType LoraCache::getNumPages() const
 bool LoraCache::fits(TensorPtr config) const
 {
     auto const neededPages = determineNumPages(config);
-    SizeType availablePages;
+    SizeType32 availablePages;
     {
         std::lock_guard<std::mutex> lk(mPagesMutex);
         availablePages = mCachePageManager->numAvailablePages();

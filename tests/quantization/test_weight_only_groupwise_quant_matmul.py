@@ -18,13 +18,11 @@ import _utils
 
 # isort: off
 import torch
-import tensorrt as trt
 # isort: on
 import os
 import sys
 
 from parameterized import parameterized
-from polygraphy.backend.trt import CreateConfig, EngineFromNetwork, TrtRunner
 
 import tensorrt_llm
 from tensorrt_llm import Tensor
@@ -32,13 +30,15 @@ from tensorrt_llm.quantization.functional import \
     weight_only_groupwise_quant_matmul
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import (skip_pre_ada_unittest, skip_pre_ampere_unittest,
-                        skip_pre_hopper_unittest, unittest_name_func)
+from utils.util import (create_session, run_session, skip_pre_ada_unittest,
+                        skip_pre_ampere_unittest, skip_pre_hopper_unittest,
+                        unittest_name_func)
 
 
 class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
 
     def setUp(self):
+        torch.manual_seed(0)
         tensorrt_llm.logger.set_level('error')
 
     def _run_matmul_plugin(self,
@@ -54,10 +54,10 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
                            group_size=128):
         # Create builder
         builder = tensorrt_llm.Builder()
-        net = builder.create_network()
-        net.plugin_config.set_weight_only_groupwise_quant_matmul_plugin(dtype)
-        with tensorrt_llm.net_guard(net):
-            network = tensorrt_llm.default_trtnet()
+        network = builder.create_network()
+        network.plugin_config.set_weight_only_groupwise_quant_matmul_plugin(
+            dtype)
+        with tensorrt_llm.net_guard(network):
             # Init TensorRT-LLM tensor for activation
             activation = Tensor(
                 name='activation',
@@ -77,18 +77,27 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
                            shape=th_scale.shape,
                            dtype=tensorrt_llm._utils.str_dtype_to_trt(dtype))
             # Init TensorRT-LLM tensor for zero
-            zero = Tensor(name='zero',
-                          shape=th_zero.shape,
-                          dtype=tensorrt_llm._utils.str_dtype_to_trt(dtype))
+            if th_zero is not None:
+                zero = Tensor(name='zero',
+                              shape=th_zero.shape,
+                              dtype=tensorrt_llm._utils.str_dtype_to_trt(dtype))
+            else:
+                zero = None
             # Init TensorRT-LLM tensor for bias
-            bias = Tensor(name='bias',
-                          shape=th_bias.shape,
-                          dtype=tensorrt_llm._utils.str_dtype_to_trt(dtype))
+            if th_bias is not None:
+                bias = Tensor(name='bias',
+                              shape=th_bias.shape,
+                              dtype=tensorrt_llm._utils.str_dtype_to_trt(dtype))
+            else:
+                bias = None
             # Init TensorRT-LLM tensor for alpha
-            alpha = Tensor(
-                name='alpha',
-                shape=th_alpha.shape,
-                dtype=tensorrt_llm._utils.str_dtype_to_trt("float32"))
+            if th_alpha is not None:
+                alpha = Tensor(
+                    name='alpha',
+                    shape=th_alpha.shape,
+                    dtype=tensorrt_llm._utils.str_dtype_to_trt("float32"))
+            else:
+                alpha = None
 
             # Get output tensor for WOQ Matmul
             output = weight_only_groupwise_quant_matmul(activation,
@@ -100,31 +109,30 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
                                                         alpha,
                                                         quant_algo,
                                                         group_size,
-                                                        dtype=dtype).trt_tensor
-            output.name = 'output'
-            network.mark_output(output)
-            output.dtype = tensorrt_llm._utils.str_dtype_to_trt(dtype)
+                                                        dtype=dtype)
+            output.mark_output('output', dtype)
 
-        # Build engine consisting of only WBQ Matmul
-        build_engine = EngineFromNetwork(
-            (builder.trt_builder, net.trt_network),
-            config=CreateConfig(
-                fp16=(dtype == "float16"),
-                bf16=(dtype == "bfloat16"),
-                memory_pool_limits={trt.MemoryPoolType.WORKSPACE: 33554432}))
+        session = create_session(builder,
+                                 network,
+                                 precision=dtype,
+                                 memory_pool_limit=33554432)
+        inputs = {
+            'activation': th_activation,
+            'pre_quant_scale': th_pre_quant_scale,
+            'weight': th_weight,
+            'scale': th_scale,
+        }
 
-        # Infer engine
-        with TrtRunner(build_engine) as runner:
-            outputs = runner.infer(
-                feed_dict={
-                    'activation': th_activation,
-                    'pre_quant_scale': th_pre_quant_scale,
-                    'weight': th_weight,
-                    'scale': th_scale,
-                    'zero': th_zero,
-                    'bias': th_bias,
-                    'alpha': th_alpha
-                })
+        if th_zero is not None:
+            inputs['zero'] = th_zero
+
+        if th_bias is not None:
+            inputs['bias'] = th_bias
+
+        if th_alpha is not None:
+            inputs['alpha'] = th_alpha
+
+        outputs = run_session(session, inputs)
 
         return outputs['output']
 
@@ -140,23 +148,27 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
                               group_size=128,
                               use_w4a8_awq=False):
 
-        torch.manual_seed(0)
         activation_dtype = tensorrt_llm._utils.str_dtype_to_torch(
             activation_dtype_str)
 
         total_groups = (k + group_size - 1) // group_size
-        activation = torch.randn(m, k, dtype=activation_dtype)
-        bias = torch.randn(
-            1, n, dtype=activation_dtype) if has_bias else torch.Tensor().to(
-                activation_dtype)
+        activation = torch.randn(m, k, dtype=activation_dtype, device="cuda")
+        bias = torch.randn(1, n, dtype=activation_dtype,
+                           device="cuda") if has_bias else None
         zero = torch.randn(
-            total_groups, n, dtype=activation_dtype
-        ) if has_zero else torch.Tensor().to(activation_dtype)
+            total_groups, n, dtype=activation_dtype,
+            device="cuda") if has_zero else None
 
-        scale = torch.rand(total_groups, n, dtype=activation_dtype)
-        pre_quant_scale = torch.rand(1, k, dtype=activation_dtype)
-        fp8_alpha = torch.rand(
-            1, dtype=torch.float32) if use_w4a8_awq else torch.Tensor().float()
+        scale = torch.rand(total_groups,
+                           n,
+                           dtype=activation_dtype,
+                           device="cuda")
+        pre_quant_scale = torch.rand(1,
+                                     k,
+                                     dtype=activation_dtype,
+                                     device="cuda")
+        fp8_alpha = torch.rand(1, dtype=torch.float32,
+                               device="cuda") if use_w4a8_awq else None
 
         num_weights_in_32_bits = 0
         if quantized_weight_dtype == torch.int8:
@@ -170,19 +182,23 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
         unprocessed_int_weight = torch.randint(-2**31,
                                                2**31,
                                                (k, n // num_weights_in_32_bits),
-                                               dtype=torch.int32)
+                                               dtype=torch.int32,
+                                               device="cuda")
 
         preprocessor = torch.ops.trtllm.preprocess_weights_for_mixed_gemm
+        # Weights must be a CPU Tensor
         unpacker = torch.ops.trtllm.unpack_int4_packed_tensor_to_int8
 
         unprocessed_weight = unprocessed_int_weight.view(torch.int8)
-
-        ref_q_weight = unpacker(unprocessed_weight)
+        # Weights must be a CPU Tensor
+        ref_q_weight = unpacker(unprocessed_weight.cpu())
         if use_w4a8_awq:
             activation_type = torch.float8_e4m3fn
         else:
             activation_type = torch.float16
-        cuda_q_weight = preprocessor(unprocessed_weight, quantized_weight_dtype,
+        # Weights must be a CPU Tensor
+        cuda_q_weight = preprocessor(unprocessed_weight.cpu(),
+                                     quantized_weight_dtype,
                                      activation_type).view(activation_dtype)
 
         # Flags for indicating whether the corresponding inputs are applied in quant_algo
@@ -194,16 +210,16 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
         quant_algo = use_w4a8_awq * W4A8_AWQ + has_pre_quant * PRE_QUANT_SCALE + has_zero * ZERO + has_bias * BIAS
 
         scale_ref = scale.repeat_interleave(group_size, dim=0)[:k, :]
-        ref_th_weight = ref_q_weight.to(activation_dtype) * scale_ref
+        ref_th_weight = ref_q_weight.cuda().to(activation_dtype) * scale_ref
 
         if has_zero:
             zero_ref = zero.repeat_interleave(group_size, dim=0)[:k, :]
             ref_th_weight += zero_ref
 
         output = self._run_matmul_plugin(activation, pre_quant_scale,
-                                         cuda_q_weight, scale, zero, bias,
-                                         fp8_alpha, activation_dtype_str,
-                                         quant_algo, group_size).cpu()
+                                         cuda_q_weight.cuda(), scale, zero,
+                                         bias, fp8_alpha, activation_dtype_str,
+                                         quant_algo, group_size)
 
         if use_w4a8_awq:
             activation *= fp8_alpha

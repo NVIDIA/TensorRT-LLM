@@ -99,7 +99,9 @@ The following table shows the supported software for TensorRT-LLM.
         - [CogVLM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)(6)
         - [Deplot](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
         - [Fuyu](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
+        - [Kosmos-2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
         - [LLaVA-v1.5-7B](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
+        - [NeVA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
         - [Nougat family](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal) Nougat-small, Nougat-base
         - [VILA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
 ```

@@ -43,11 +43,13 @@ def element_size(dtype: str):
 
 class GPTBenchmark(BaseBenchmark):
 
-    def __init__(self, args, batch_sizes, in_out_lens, rank, world_size):
+    def __init__(self, args, batch_sizes, in_out_lens, gpu_weights_percents,
+                 rank, world_size):
         super().__init__(args.engine_dir, args.model, args.dtype, rank,
                          world_size, args.serial_build)
         self.batch_sizes = batch_sizes
         self.in_out_lens = in_out_lens
+        self.gpu_weights_percents = gpu_weights_percents
         self.num_beams = args.num_beams
         self.mode = args.mode
         self.build_time = 0
@@ -142,10 +144,12 @@ class GPTBenchmark(BaseBenchmark):
                 self, 'tokens_per_block') else 64,
             mamba_conv1d_plugin=self.use_mamba_conv1d_plugin,
             conv_kernel=self.conv_kernel if hasattr(self, 'conv_kernel') else 0,
+            state_size=self.state_size if hasattr(self, 'state_size') else 0,
             layer_types=self.layer_types
             if hasattr(self, 'layer_types') else [],
             rnn_hidden_size=self.rnn_hidden_size if hasattr(
                 self, 'rnn_hidden_size') else 0,
+            gpu_weights_percent=list(sorted(gpu_weights_percents))[0],
         )
         if args.model == 'chatglm_6b':
             self.sampling_config = tensorrt_llm.runtime.SamplingConfig(
@@ -165,17 +169,6 @@ class GPTBenchmark(BaseBenchmark):
                 top_p=args.top_p)
             self.decoder = tensorrt_llm.runtime.GenerationSession(
                 model_config, engine_buffer, self.runtime_mapping)
-        elif 'mamba' in args.model:
-            model_config.mamba_d_state = self.mamba_d_state
-            model_config.mamba_d_conv = self.mamba_d_conv
-            model_config.mamba_expand = self.mamba_expand
-            self.sampling_config = tensorrt_llm.runtime.SamplingConfig(
-                end_id=0, pad_id=0, top_k=args.top_k, top_p=args.top_p)
-            self.decoder = tensorrt_llm.runtime.MambaLMHeadModelGenerationSession(
-                model_config,
-                engine_buffer,
-                self.runtime_mapping,
-                cuda_graph_mode=self.cuda_graph_mode)
         else:
             end_id = 50256
             pad_id = 50256
@@ -215,7 +208,12 @@ class GPTBenchmark(BaseBenchmark):
                         f'<= max_batch_size({self.max_batch_size}) failed, skipping.'
                     )
                     continue
-                yield (batch_size, inlen, outlen)
+                for gpu_weights_percent in self.gpu_weights_percents:
+                    yield (batch_size, inlen, outlen, gpu_weights_percent)
+
+    def set_weight_streaming(self, config):
+        gpu_weights_percent = config[3]
+        self.decoder.runtime._set_weight_streaming(gpu_weights_percent)
 
     def prepare_inputs(self, config):
         batch_size, inlen, outlen = config[0], config[1], config[2]
@@ -328,7 +326,8 @@ class GPTBenchmark(BaseBenchmark):
                csv,
                benchmark_profiler=None):
         report_dict = super().get_report_dict()
-        batch_size, inlen, outlen = config[0], config[1], config[2]
+        batch_size, inlen, outlen, gpu_weights_percent = config[0], config[
+            1], config[2], config[3]
         tokens_per_sec = round(batch_size * outlen / (latency / 1000), 2)
         report_dict["num_heads"] = self.num_heads
         report_dict["num_kv_heads"] = self.num_kv_heads
@@ -336,6 +335,7 @@ class GPTBenchmark(BaseBenchmark):
         report_dict["hidden_size"] = self.hidden_size
         report_dict["vocab_size"] = self.vocab_size
         report_dict["batch_size"] = batch_size
+        report_dict["gpu_weights_percent"] = gpu_weights_percent
         report_dict["input_length"] = inlen
         report_dict["output_length"] = outlen
         report_dict["latency(ms)"] = latency

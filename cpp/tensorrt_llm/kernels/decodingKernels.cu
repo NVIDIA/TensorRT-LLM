@@ -479,7 +479,7 @@ void invokeFinalize(BeamHypotheses& bh, cudaStream_t stream)
     finalizeKernel<<<bh.nBatchSize, roundUp(nBM * 2, 32), smem_size, stream>>>(bh);
 }
 
-__global__ void initializeOutput(TokenIdType* finalOutputIds, TokenIdType const* endIds, SizeType const nMaxSeqLen)
+__global__ void initializeOutput(TokenIdType* finalOutputIds, TokenIdType const* endIds, SizeType32 const nMaxSeqLen)
 {
     for (int i = threadIdx.x; i < nMaxSeqLen; i += blockDim.x)
     {
@@ -487,18 +487,19 @@ __global__ void initializeOutput(TokenIdType* finalOutputIds, TokenIdType const*
     }
 }
 
-void invokeInitializeOutput(TokenIdType* finalOutputIds, TokenIdType const* endIds, SizeType const batchBeam,
-    SizeType const nMaxSeqLen, cudaStream_t stream)
+void invokeInitializeOutput(TokenIdType* finalOutputIds, TokenIdType const* endIds, SizeType32 const batchBeam,
+    SizeType32 const nMaxSeqLen, cudaStream_t stream)
 {
     initializeOutput<<<batchBeam, 256, 0, stream>>>(finalOutputIds, endIds, nMaxSeqLen);
 }
 
 __global__ void copyNextStepIds(TokenIdType* nextStepIds, TokenIdType const* const* outputIdsPtr,
-    SizeType32 const* sequenceLengths, SizeType32 const* numNewTokens, SizeType32 const* batchSlots, SizeType batchSize,
-    SizeType maxBatchSize, SizeType beamWidth, SizeType maxSeqLen, SizeType maxTokensPerStep)
+    SizeType32 const* sequenceLengths, SizeType32 const* numNewTokens, SizeType32 const* batchSlots,
+    SizeType32 batchSize, SizeType32 maxBatchSize, SizeType32 beamWidth, SizeType32 maxSeqLen,
+    SizeType32 maxTokensPerStep)
 {
-    for (auto index = static_cast<SizeType>(blockIdx.x * blockDim.x + threadIdx.x);
-         index < batchSize * beamWidth * maxTokensPerStep; index += static_cast<SizeType>(blockDim.x * gridDim.x))
+    for (auto index = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
+         index < batchSize * beamWidth * maxTokensPerStep; index += static_cast<SizeType32>(blockDim.x * gridDim.x))
     {
         auto const batchIdx{index / (beamWidth * maxTokensPerStep)};
         auto const batchSlot = batchSlots != nullptr ? batchSlots[batchIdx] : batchIdx;
@@ -508,18 +509,19 @@ __global__ void copyNextStepIds(TokenIdType* nextStepIds, TokenIdType const* con
         auto const newTokens = numNewTokens == nullptr ? 1 : numNewTokens[batchSlot];
         auto const batchBeamIdx = batchSlot * beamWidth + beamIdx;
         auto const tokenBatchBeamIdx = tokenIdx * maxBatchSize * beamWidth + batchSlot * beamWidth + beamIdx;
-        auto const index_src = beamIdx * maxSeqLen + sequenceLengths[batchBeamIdx] - newTokens + tokenIdx;
-        if (tokenIdx >= newTokens || index_src < 0)
+        auto const indexSrc = sequenceLengths[batchBeamIdx] - newTokens + tokenIdx;
+        if (tokenIdx >= newTokens || indexSrc < 0)
         {
             continue;
         }
-        nextStepIds[tokenBatchBeamIdx] = outputIdsPtr[batchSlot][index_src];
+        nextStepIds[tokenBatchBeamIdx] = outputIdsPtr[batchSlot][beamIdx * maxSeqLen + indexSrc];
     }
 }
 
 void invokeCopyNextStepIds(TokenIdType* nextStepIds, TokenIdType const* const* outputIdsPtr,
-    SizeType32 const* sequenceLengths, SizeType32 const* numNewTokens, SizeType32 const* batchSlots, SizeType batchSize,
-    SizeType maxBatchSize, SizeType beamWidth, SizeType maxSeqLen, SizeType maxTokensPerStep, cudaStream_t stream)
+    SizeType32 const* sequenceLengths, SizeType32 const* numNewTokens, SizeType32 const* batchSlots,
+    SizeType32 batchSize, SizeType32 maxBatchSize, SizeType32 beamWidth, SizeType32 maxSeqLen,
+    SizeType32 maxTokensPerStep, cudaStream_t stream)
 {
     auto const numElems = batchSize * beamWidth * maxTokensPerStep;
     dim3 block(min(256, numElems));
@@ -529,9 +531,10 @@ void invokeCopyNextStepIds(TokenIdType* nextStepIds, TokenIdType const* const* o
 }
 
 __global__ void transposeLogProbs(float* outputLogProbs, float* outputLogProbsTiled, SizeType32 const* sequenceLengths,
-    SizeType32 const* batchSlots, SizeType batchSize, SizeType maxBatchSize, SizeType beamWidth, SizeType maxSeqLen)
+    SizeType32 const* batchSlots, SizeType32 batchSize, SizeType32 maxBatchSize, SizeType32 beamWidth,
+    SizeType32 maxSeqLen)
 {
-    auto index = static_cast<SizeType>(blockIdx.x * blockDim.x + threadIdx.x);
+    auto index = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
 
     auto const batchIdx = index / (beamWidth * maxSeqLen);
     auto const tmpIdx = index % (beamWidth * maxSeqLen);
@@ -552,8 +555,8 @@ __global__ void transposeLogProbs(float* outputLogProbs, float* outputLogProbsTi
 }
 
 void invokeTransposeLogProbs(float* outputLogProbs, float* outputLogProbsTiled, SizeType32 const* sequenceLengths,
-    SizeType32 const* batchSlots, SizeType batchSize, SizeType maxBatchSize, SizeType beamWidth, SizeType maxSeqLen,
-    cudaStream_t stream)
+    SizeType32 const* batchSlots, SizeType32 batchSize, SizeType32 maxBatchSize, SizeType32 beamWidth,
+    SizeType32 maxSeqLen, cudaStream_t stream)
 {
     dim3 block(256);
     dim3 grid(divUp(batchSize * beamWidth * maxSeqLen, block.x));
@@ -564,9 +567,9 @@ void invokeTransposeLogProbs(float* outputLogProbs, float* outputLogProbsTiled, 
 __global__ void acceptDraftTokensByIds(TokenIdType const* draftIds, TokenIdType const* targetIds,
     SizeType32 const* contextLengths, SizeType32 const* numsDraftTokens, SizeType32* sequenceLengths,
     FinishedState const* finished, FinishedState* finishedFinal, SizeType32* finishedSum, SizeType32 const* batchSlots,
-    SizeType batchSize, SizeType maxBatchSize, SizeType maxSeqLen, SizeType maxDraftTokens)
+    SizeType32 batchSize, SizeType32 maxBatchSize, SizeType32 maxSeqLen, SizeType32 maxDraftTokens)
 {
-    for (auto batchIdx = static_cast<SizeType>(threadIdx.x); batchIdx < batchSize; batchIdx += blockDim.x)
+    for (auto batchIdx = static_cast<SizeType32>(threadIdx.x); batchIdx < batchSize; batchIdx += blockDim.x)
     {
         auto const batchSlot = batchSlots == nullptr ? batchIdx : batchSlots[batchIdx];
         auto const numDraftTokens = numsDraftTokens[batchSlot];
@@ -603,8 +606,8 @@ __global__ void acceptDraftTokensByIds(TokenIdType const* draftIds, TokenIdType 
 void invokeAcceptDraftTokensByIds(TokenIdType const* draftIds, TokenIdType const* targetIds,
     SizeType32 const* contextLengths, SizeType32 const* numsDraftTokens, SizeType32* sequenceLengths,
     FinishedState const* finished, FinishedState* finishedFinal, SizeType32* finishedSum, SizeType32 const* batchSlots,
-    SizeType batchSize, SizeType maxBatchSize, SizeType beamWidth, SizeType maxSeqLen, SizeType maxDraftTokens,
-    cudaStream_t stream)
+    SizeType32 batchSize, SizeType32 maxBatchSize, SizeType32 beamWidth, SizeType32 maxSeqLen,
+    SizeType32 maxDraftTokens, cudaStream_t stream)
 {
     TLLM_CHECK(beamWidth == 1);
     dim3 block(min(1024, batchSize));
@@ -616,9 +619,9 @@ void invokeAcceptDraftTokensByIds(TokenIdType const* draftIds, TokenIdType const
 
 template <typename T>
 __global__ void acceptDraftTokensByLogitsKernel(T const* draftProbs, T* targetProbs, SizeType32 const* numsDraftTokens,
-    FinishedState* finished, curandState_t* curandState, SizeType32 const* batchSlots, SizeType batchSize,
-    SizeType maxBatchSize, SizeType maxDraftTokens, SizeType beamWidth, SizeType vocabSize, bool randomThreshold,
-    float constantThreshold)
+    FinishedState* finished, curandState_t* curandState, SizeType32 const* batchSlots, SizeType32 batchSize,
+    SizeType32 maxBatchSize, SizeType32 maxDraftTokens, SizeType32 beamWidth, SizeType32 vocabSize,
+    bool randomThreshold, float constantThreshold)
 {
     auto const bid = blockIdx.x;
     auto const draftTokenIdx = blockIdx.y;
@@ -668,8 +671,8 @@ __global__ void acceptDraftTokensByLogitsKernel(T const* draftProbs, T* targetPr
 
 template <typename T>
 __global__ void correctAcceptedStatesAndLogits(T const* draftProbs, T* targetProbs, T** targetLogits,
-    SizeType32 const* numsDraftTokens, FinishedState* finished, SizeType32 const* batchSlots, SizeType batchSize,
-    SizeType maxBatchSize, SizeType maxDraftTokens, SizeType beamWidth, SizeType vocabSize)
+    SizeType32 const* numsDraftTokens, FinishedState* finished, SizeType32 const* batchSlots, SizeType32 batchSize,
+    SizeType32 maxBatchSize, SizeType32 maxDraftTokens, SizeType32 beamWidth, SizeType32 vocabSize)
 {
     auto const bid = blockIdx.x;
     auto const batchIdx = bid / beamWidth;
@@ -734,9 +737,9 @@ __global__ void correctAcceptedStatesAndLogits(T const* draftProbs, T* targetPro
 template <typename T>
 void acceptDraftTokensByLogits(T* draftLogits, T** targetLogits, T* draftProbs, T* targetProbs,
     SizeType32 const* numsDraftTokens, FinishedState* finished, curandState_t* curandState,
-    SizeType32 const* batchSlots, SizeType batchSize, SizeType maxBatchSize, SizeType beamWidth, SizeType vocabSize,
-    SizeType vocabSizePadded, SizeType maxDraftTokens, bool randomThreshold, float constantThreshold,
-    cudaStream_t stream)
+    SizeType32 const* batchSlots, SizeType32 batchSize, SizeType32 maxBatchSize, SizeType32 beamWidth,
+    SizeType32 vocabSize, SizeType32 vocabSizePadded, SizeType32 maxDraftTokens, bool randomThreshold,
+    float constantThreshold, cudaStream_t stream)
 {
     TLLM_CHECK(beamWidth == 1);
     {
@@ -766,27 +769,27 @@ void acceptDraftTokensByLogits(T* draftLogits, T** targetLogits, T* draftProbs, 
 
 template void acceptDraftTokensByLogits(float* draftLogits, float** targetLogits, float* draftProbs, float* targetProbs,
     SizeType32 const* numsDraftTokens, FinishedState* finished, curandState_t* curandState,
-    SizeType32 const* batchSlots, SizeType batchSize, SizeType maxBatchSize, SizeType beamWidth, SizeType vocabSize,
-    SizeType vocabSizePadded, SizeType maxDraftTokens, bool randomThreshold, float constantThreshold,
-    cudaStream_t stream);
+    SizeType32 const* batchSlots, SizeType32 batchSize, SizeType32 maxBatchSize, SizeType32 beamWidth,
+    SizeType32 vocabSize, SizeType32 vocabSizePadded, SizeType32 maxDraftTokens, bool randomThreshold,
+    float constantThreshold, cudaStream_t stream);
 template void acceptDraftTokensByLogits(half* draftLogits, half** targetLogits, half* draftProbs, half* targetProbs,
     SizeType32 const* numsDraftTokens, FinishedState* finished, curandState_t* curandState,
-    SizeType32 const* batchSlots, SizeType batchSize, SizeType maxBatchSize, SizeType beamWidth, SizeType vocabSize,
-    SizeType vocabSizePadded, SizeType maxDraftTokens, bool randomThreshold, float constantThreshold,
-    cudaStream_t stream);
+    SizeType32 const* batchSlots, SizeType32 batchSize, SizeType32 maxBatchSize, SizeType32 beamWidth,
+    SizeType32 vocabSize, SizeType32 vocabSizePadded, SizeType32 maxDraftTokens, bool randomThreshold,
+    float constantThreshold, cudaStream_t stream);
 
 __device__ __forceinline__ int4 reduceMaxInt4(int4 const& a, int4 const& b)
 {
     return a.x >= b.x ? a : b;
 }
 
-template <typename T, SizeType BLOCK_SIZE>
+template <typename T, SizeType32 BLOCK_SIZE>
 __global__ void acceptDraftTokensByIdsWithPaths(TokenIdType* outputIds, TokenIdType const* draftIds,
     TokenIdType const* targetIds, SizeType32* sequenceLengths, SizeType32* acceptedLengths,
     FinishedState* finishedFinal, SizeType32 const* batchSlots, SizeType32 const* paths, TokenIdType const* endIds,
     T const** medusaLogits, T const** logitsPtrs, SizeType32* curTokensPerStep, SizeType32 const* targetTokensPerStep,
-    SizeType32* bestPathIds, SizeType batchSize, SizeType vocabSize, SizeType maxBatchSize, SizeType maxDraftTokens,
-    SizeType maxSeqLen, SizeType maxNumHeads, SizeType maxTokensPerStep)
+    SizeType32* bestPathIds, SizeType32 batchSize, SizeType32 vocabSize, SizeType32 maxBatchSize,
+    SizeType32 maxDraftTokens, SizeType32 maxSeqLen, SizeType32 maxNumHeads, SizeType32 maxTokensPerStep)
 {
     auto const batchIdx = static_cast<SizeType32>(blockIdx.x);
     auto const batchSlot = batchSlots == nullptr ? batchIdx : batchSlots[batchIdx];
@@ -815,7 +818,7 @@ __global__ void acceptDraftTokensByIdsWithPaths(TokenIdType* outputIds, TokenIdT
         auto nextIdx = tokenId;
 
         // Go along the path
-        for (SizeType ti = 1; ti < maxNumDraftTokens; ++ti)
+        for (SizeType32 ti = 1; ti < maxNumDraftTokens; ++ti)
         {
             auto const tokenId = paths[pathOffset + ti];
             // Break if path terminates
@@ -897,7 +900,7 @@ __global__ void acceptDraftTokensByIdsWithPaths(TokenIdType* outputIds, TokenIdT
     }
 
     // Prepare logits pointers to respective logits from Medusa Heads for the all-top-K sampling kernel
-    for (auto hi = static_cast<SizeType>(threadIdx.x); hi < maxNumHeads; hi += static_cast<SizeType>(blockDim.x))
+    for (auto hi = static_cast<SizeType32>(threadIdx.x); hi < maxNumHeads; hi += static_cast<SizeType32>(blockDim.x))
     {
         logitsPtrs[batchIdx * maxNumHeads + hi]
             = medusaLogits[batchSlot * maxNumHeads + hi] + flat_index2(bestNextIdx, 0, vocabSize);
@@ -909,10 +912,10 @@ void acceptDraftTokensByIdsWithPaths(TokenIdType* outputIds, TokenIdType const* 
     SizeType32* sequenceLengths, SizeType32* acceptedLengths, FinishedState* finishedFinal,
     SizeType32 const* batchSlots, SizeType32 const* paths, TokenIdType const* endIds, T const** medusaLogits,
     T const** logitsPtrs, SizeType32* curTokensPerStep, SizeType32 const* targetTokensPerStep, SizeType32* bestPathIds,
-    SizeType batchSize, SizeType vocabSize, SizeType maxBatchSize, SizeType maxDraftTokens, SizeType maxSeqLen,
-    SizeType maxNumHeads, SizeType maxTokensPerStep, cudaStream_t stream)
+    SizeType32 batchSize, SizeType32 vocabSize, SizeType32 maxBatchSize, SizeType32 maxDraftTokens,
+    SizeType32 maxSeqLen, SizeType32 maxNumHeads, SizeType32 maxTokensPerStep, cudaStream_t stream)
 {
-    constexpr SizeType BLOCK_SIZE = 256;
+    constexpr SizeType32 BLOCK_SIZE = 256;
     dim3 block(BLOCK_SIZE);
     dim3 grid(batchSize);
     acceptDraftTokensByIdsWithPaths<T, BLOCK_SIZE><<<grid, block, 0, stream>>>(outputIds, draftIds, targetIds,
@@ -925,20 +928,20 @@ template void acceptDraftTokensByIdsWithPaths(TokenIdType* outputIds, TokenIdTyp
     TokenIdType const* targetIds, SizeType32* sequenceLengths, SizeType32* acceptedLengths,
     FinishedState* finishedFinal, SizeType32 const* batchSlots, SizeType32 const* paths, TokenIdType const* endIds,
     float const** medusaLogits, float const** logitsPtrs, SizeType32* curTokensPerStep,
-    SizeType32 const* targetTokensPerStep, SizeType32* bestPathIds, SizeType batchSize, SizeType vocabSize,
-    SizeType maxBatchSize, SizeType maxDraftTokens, SizeType maxSeqLen, SizeType maxNumHeads, SizeType maxTokensPerStep,
-    cudaStream_t stream);
+    SizeType32 const* targetTokensPerStep, SizeType32* bestPathIds, SizeType32 batchSize, SizeType32 vocabSize,
+    SizeType32 maxBatchSize, SizeType32 maxDraftTokens, SizeType32 maxSeqLen, SizeType32 maxNumHeads,
+    SizeType32 maxTokensPerStep, cudaStream_t stream);
 template void acceptDraftTokensByIdsWithPaths(TokenIdType* outputIds, TokenIdType const* draftIds,
     TokenIdType const* targetIds, SizeType32* sequenceLengths, SizeType32* acceptedLengths,
     FinishedState* finishedFinal, SizeType32 const* batchSlots, SizeType32 const* paths, TokenIdType const* endIds,
     half const** medusaLogits, half const** logitsPtrs, SizeType32* curTokensPerStep,
-    SizeType32 const* targetTokensPerStep, SizeType32* bestPathIds, SizeType batchSize, SizeType vocabSize,
-    SizeType maxBatchSize, SizeType maxDraftTokens, SizeType maxSeqLen, SizeType maxNumHeads, SizeType maxTokensPerStep,
-    cudaStream_t stream);
+    SizeType32 const* targetTokensPerStep, SizeType32* bestPathIds, SizeType32 batchSize, SizeType32 vocabSize,
+    SizeType32 maxBatchSize, SizeType32 maxDraftTokens, SizeType32 maxSeqLen, SizeType32 maxNumHeads,
+    SizeType32 maxTokensPerStep, cudaStream_t stream);
 
 __global__ void scatterMedusaDraftTokens(TokenIdType* treeDraftIds, TokenIdType const* sourceDraftIds,
     SizeType32 const* treeIds, SizeType32 const* tokensPerStepData, SizeType32 const* batchSlots,
-    SizeType maxTokensPerStep)
+    SizeType32 maxTokensPerStep)
 {
     auto const batchIdx = static_cast<SizeType32>(blockIdx.x);
     auto const batchSlot = batchSlots == nullptr ? batchIdx : batchSlots[batchIdx];
@@ -955,26 +958,26 @@ __global__ void scatterMedusaDraftTokens(TokenIdType* treeDraftIds, TokenIdType 
 }
 
 void scatterMedusaDraftTokens(TokenIdType* treeDraftIds, TokenIdType const* sourceDraftIds, SizeType32 const* treeIds,
-    SizeType32 const* tokensPerStep, SizeType32 const* batchSlots, SizeType maxDraftTokens, SizeType batchSize,
+    SizeType32 const* tokensPerStep, SizeType32 const* batchSlots, SizeType32 maxDraftTokens, SizeType32 batchSize,
     cudaStream_t stream)
 {
-    constexpr SizeType BLOCK_SIZE = 256;
+    constexpr SizeType32 BLOCK_SIZE = 256;
     scatterMedusaDraftTokens<<<batchSize, BLOCK_SIZE, 0, stream>>>(
         treeDraftIds, sourceDraftIds, treeIds, tokensPerStep, batchSlots, maxDraftTokens);
 }
 
 template <int32_t BLOCK_SIZE>
 __global__ void packAcceptedPaths(SizeType32* acceptedLengthsCumSum, SizeType32* pathsOffsets,
-    SizeType const* acceptedLengths, SizeType32 const* bestPathIds, SizeType32 const* paths,
-    SizeType32 const* batchSlots, SizeType batchSize, SizeType maxTokensPerStep, SizeType maxNumDraftTokens)
+    SizeType32 const* acceptedLengths, SizeType32 const* bestPathIds, SizeType32 const* paths,
+    SizeType32 const* batchSlots, SizeType32 batchSize, SizeType32 maxTokensPerStep, SizeType32 maxNumDraftTokens)
 {
     // Specialize BlockScan for a 1D block of 128 threads of type int
-    typedef cub::BlockScan<SizeType, BLOCK_SIZE> BlockScan;
+    typedef cub::BlockScan<SizeType32, BLOCK_SIZE> BlockScan;
 
     // Allocate shared memory for BlockScan
     __shared__ typename BlockScan::TempStorage tempStorage;
     auto const batchSizeRounded = ((batchSize + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
-    __shared__ SizeType currentCumSum;
+    __shared__ SizeType32 currentCumSum;
     if (threadIdx.x == 0)
     {
         currentCumSum = 0;
@@ -982,7 +985,8 @@ __global__ void packAcceptedPaths(SizeType32* acceptedLengthsCumSum, SizeType32*
 
     __syncthreads();
 
-    for (auto bi = static_cast<SizeType>(threadIdx.x); bi < batchSizeRounded; bi += static_cast<SizeType>(blockDim.x))
+    for (auto bi = static_cast<SizeType32>(threadIdx.x); bi < batchSizeRounded;
+         bi += static_cast<SizeType32>(blockDim.x))
     {
         auto const valid = bi < batchSize;
         auto const batchSlot = valid ? batchSlots[bi] : 0;
@@ -1014,10 +1018,10 @@ __global__ void packAcceptedPaths(SizeType32* acceptedLengthsCumSum, SizeType32*
 
 void invokePackAcceptedPaths(SizeType32* acceptedLengthsCumSum, SizeType32* pathsOffsets,
     SizeType32 const* acceptedLengths, SizeType32 const* bestPathIds, SizeType32 const* paths,
-    SizeType32 const* batchSlots, SizeType batchSize, SizeType maxTokensPerStep, SizeType maxNumDraftTokens,
+    SizeType32 const* batchSlots, SizeType32 batchSize, SizeType32 maxTokensPerStep, SizeType32 maxNumDraftTokens,
     cudaStream_t stream)
 {
-    constexpr SizeType BLOCK_SIZE = 1024;
+    constexpr SizeType32 BLOCK_SIZE = 1024;
     packAcceptedPaths<BLOCK_SIZE><<<1, BLOCK_SIZE, 0, stream>>>(acceptedLengthsCumSum, pathsOffsets, acceptedLengths,
         bestPathIds, paths, batchSlots, batchSize, maxTokensPerStep, maxNumDraftTokens);
 }

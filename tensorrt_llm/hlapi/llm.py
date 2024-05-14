@@ -15,7 +15,8 @@ import torch
 from .. import bindings as tllm
 from .._utils import mpi_barrier, mpi_rank, release_gc
 from ..auto_parallel import AutoParallelConfig, infer_cluster_config
-from ..bindings import KvCacheConfig, SchedulerPolicy
+from ..bindings import KvCacheConfig
+from ..bindings.executor import CapacitySchedulerPolicy
 from ..builder import BuildConfig, Engine, EngineConfig, PluginConfig, build
 from ..executor import GenerationExecutor, GenerationResult
 from ..logger import logger
@@ -23,11 +24,12 @@ from ..mapping import Mapping
 from ..models.modeling_utils import (PretrainedConfig, QuantAlgo, QuantConfig,
                                      load_model)
 from ..module import Module
-from .mpi_session import MPINodeState, MpiSession
+from .mpi_session import (MpiCommSession, MPINodeState, MpiPoolSession,
+                          MpiSession, external_mpi_comm_available)
 from .tokenizer import TokenizerBase, TransformersTokenizer
-from .utils import (GenerationOutput, SamplingConfig, file_with_glob_exists,
-                    file_with_suffix_exists, get_device_count, print_colored,
-                    print_traceback_on_error)
+from .utils import (GenerationOutput, GpuArch, SamplingConfig,
+                    file_with_glob_exists, file_with_suffix_exists,
+                    get_device_count, print_colored, print_traceback_on_error)
 
 
 @dataclass
@@ -311,22 +313,45 @@ class LLM:
                  **_additional_options: Any):
         '''
         Args:
-            config: The model config for the model.
-            tokenizer: User provided tokenizer, will override the default one if exists in the HF model or TRT-LLM engine.
-            kv_cache_config: The config for the paged KV cache.
-            enable_streaming_llm(bool): Whether to enable the streaming LLM mode.
-            async_engine_tmp_dir: The temporary directory to save the async engine. Only for debugging.
-            _additional_params: Additional options for the model. These options are unstable and are not suggested to be used directly.
+            config (ModelConfig):
+                The model config for the model.
+            tokenizer (TokenizerBase):
+                User provided tokenizer, will override the default one if exists in the HF model or TRT-LLM engine.
+            kv_cache_config (KvCacheConfig):
+                The config for the paged KV cache.
+            streaming_llm (bool, StreamingLLMParam):
+                Whether to enable the streaming LLM mode.
+            async_engine_tmp_dir (str):
+                The temporary directory to save the async engine. Only for debugging.
+            _additional_params:
+                Additional options for the model. These options are unstable and are not suggested to be used directly.
 
         The _additional_params are not suggested to be used directly, ideally the HLAPI will deduce them.  They are used for debugging and testing, and may be removed in the future.
         The options includes:
-            enable_trt_overlap(bool): Whether to enable the TRT overlap for the generation.
-            normalize_log_probs(bool): Whether to normalize the log probabilities.
-            use_custom_all_reduce(bool): Whether to use the custom all reduce for the multi-gpu case. Default is False.
-            multi_block_mode(bool): Switch the optimization on multi-head attention optimization for long context decoding.
-            enable_chunked_context(bool): Whether to enable the chunked context for the generation.
-            scheduling_policy(SchedulerPolicy): The scheduling policy for the generation.
-            trt_strongly_typed(bool): Whether to create a strongly typed TensorRT plan where tensor data types are inferred from network input types and operator type specification. Enabling this option will reduce the engine building time.
+            enable_trt_overlap (bool):
+                Whether to enable the TRT overlap for the generation.
+            normalize_log_probs (bool):
+                Whether to normalize the log probabilities.
+            use_custom_all_reduce (bool):
+                Whether to use the custom all reduce for the multi-gpu case. Default is False.
+            multi_block_mode (bool):
+                Switch the optimization on multi-head attention optimization for long context decoding.
+            enable_chunked_context (bool):
+                Whether to enable the chunked context for the generation.
+            capacity_scheduling_policy (CapacitySchedulerPolicy)
+                The capacity scheduling policy for the generation.
+            trt_strongly_typed (bool):
+                Whether to create a strongly typed TensorRT plan where tensor data types are inferred from network input types and operator type specification. Enabling this option will reduce the engine building time.
+            embedding_parallel_mode (str):
+                The tensor parallelism mode for embedding module(s).
+                'NONE' means parallelim disabled;
+                'SHARDING_ALONG_VOCAB' means parallelism enabled with lookup table weight sharded along the vocab dimension;
+                'SHARDING_ALONG_HIDDEN' means parallelism enabled with lookup table weight sharded along the hidden dimension.
+            share_embedding_table (bool):
+                Whether to share the weight between token embedding lookup table and lm_head.
+            use_fused_mlp (bool):
+                Whether to horizontally fuse the fc and gate layers in GatedMLP. Enabling this option will reduce layer input traffic and potentially improve performance. It may also cause slight accuracy loss for FP8 PTQ because one of the quantization scaling factors is discarded.
+            enable_executor(bool): Whether to enable the cpp Executor.
         '''
 
         self.config = config
@@ -339,7 +364,7 @@ class LLM:
         if self.enable_streaming_llm is True:
             self.enable_streaming_llm = StreamingLLMParam()
 
-        self.mpi_session = None
+        self.mpi_session: Optional[MpiSession] = None
 
         plugin_config_alterable = self.config.model_format is not _ModelFormatKind.TLLM_ENGINE
 
@@ -351,17 +376,47 @@ class LLM:
             'use_custom_all_reduce', False if plugin_config_alterable else None)
         self.multi_block_mode = _additional_options.pop('multi_block_mode',
                                                         None)
+        if not GpuArch.is_post_ampere() and self.multi_block_mode:
+            logger.warning(
+                "The multi_block_mode is only supported on GPUs that post Ampere architecture, and it is deactivated."
+            )
+            self.multi_block_mode = None
         # Chunked context is enabled by default for performance
         self.enable_chunked_context = _additional_options.pop(
             'enable_chunked_context', True if plugin_config_alterable else None)
         self.enable_trt_overlap = _additional_options.pop(
             'enable_trt_overlap', None)
-        self.scheduling_policy = _additional_options.pop(
-            'scheduling_policy', SchedulerPolicy.GUARANTEED_NO_EVICT)
+        self.capacity_scheduling_policy = _additional_options.pop(
+            'capacity_scheduling_policy',
+            CapacitySchedulerPolicy.GUARANTEED_NO_EVICT)
+        self.context_chunking_policy = _additional_options.pop(
+            'context_chunking_policy', None)
 
         self._build_config = BuildConfig()
         self._build_config.strongly_typed = _additional_options.pop(
             'trt_strongly_typed', True)
+        self._build_config.use_fused_mlp = _additional_options.pop(
+            'use_fused_mlp', False)
+
+        self._convert_checkpoint_options = {}
+        embedding_parallel_mode = _additional_options.pop(
+            'embedding_parallel_mode', 'SHARDING_ALONG_VOCAB')
+        if embedding_parallel_mode == 'NONE':
+            self._convert_checkpoint_options['use_parallel_embedding'] = False
+        elif embedding_parallel_mode == 'SHARDING_ALONG_VOCAB':
+            self._convert_checkpoint_options['use_parallel_embedding'] = True
+            self._convert_checkpoint_options['embedding_sharding_dim'] = 0
+        elif embedding_parallel_mode == 'SHARDING_ALONG_HIDDEN':
+            self._convert_checkpoint_options['use_parallel_embedding'] = True
+            self._convert_checkpoint_options['embedding_sharding_dim'] = 1
+        else:
+            raise ValueError(
+                f"Invalid embedding_parallel_mode: {embedding_parallel_mode}")
+        self._convert_checkpoint_options[
+            'share_embedding_table'] = _additional_options.pop(
+                'share_embedding_table', False)
+        self.enable_executor = _additional_options.pop('enable_executor', True)
+
         if _additional_options:
             raise ValueError(f"Unknown options {_additional_options}")
 
@@ -381,8 +436,13 @@ class LLM:
             logger.info(
                 f'start MpiSession with {self.config.parallel_config.world_size} workers'
             )
-            self.mpi_session = MpiSession(
-                n_workers=self.config.parallel_config.world_size)
+            if not external_mpi_comm_available(
+                    self.config.parallel_config.world_size):
+                self.mpi_session = MpiPoolSession(
+                    n_workers=self.config.parallel_config.world_size)
+            else:
+                self.mpi_session = MpiCommSession(
+                    n_workers=self.config.parallel_config.world_size)
 
         # Due to the gptManager can only accept a engine path, we need to save the engine to a directory
         self._engine_dir: Union[tempfile.TemporaryDirectory, str, Path,
@@ -435,7 +495,7 @@ class LLM:
         self,
         prompts: Union[Iterable[str], Iterable[List[int]]],
         sampling_config: Optional[Union[SamplingConfig,
-                                        List[SamplingConfig]]] = None
+                                        List[SamplingConfig]]] = None,
     ) -> Iterable[GenerationOutput]:
         ''' Generate the output for the given inputs.
 
@@ -451,6 +511,7 @@ class LLM:
         results = self._executor.generate(
             prompts,
             sampling_config=sampling_config,
+            exclude_input_from_output=self.enable_executor,
         )
 
         return results
@@ -470,9 +531,11 @@ class LLM:
             sampling_config = self.get_default_sampling_config()
         self._generate_check_arguments([prompt], sampling_config)
 
-        results = self._executor.generate_async(prompt,
-                                                streaming=streaming,
-                                                sampling_config=sampling_config)
+        results = self._executor.generate_async(
+            prompt,
+            streaming=streaming,
+            sampling_config=sampling_config,
+            exclude_input_from_output=self.enable_executor)
         return results
 
     def _generate_check_arguments(self, prompts,
@@ -526,7 +589,7 @@ class LLM:
             shutil.copytree(src_engine_dir, engine_dir, dirs_exist_ok=True)
 
     def shutdown(self):
-        if self._executor is not None:
+        if hasattr(self, "_executor") and self._executor is not None:
             self._executor.shutdown()
 
         if self.mpi_session is not None:
@@ -597,6 +660,8 @@ class LLM:
                     self.config,
                     self._tokenizer,
                     self._workspace.name,
+                    build_config=self._build_config,
+                    convert_checkpoint_options=self._convert_checkpoint_options,
                 )
                 self._save_engine(get_engine_dir())
 
@@ -609,6 +674,8 @@ class LLM:
                         tokenizer=self._tokenizer,
                         workspace=self._workspace.name,
                         build_config=self._build_config,
+                        convert_checkpoint_options=self.
+                        _convert_checkpoint_options,
                 ) as model_loader:
 
                     runtime_context = model_loader()
@@ -640,22 +707,33 @@ class LLM:
             tokenizer,
             max_beam_width=self.config.max_beam_width,
             executor_config=executor_config,
-            executor_policy=self.scheduling_policy,
+            scheduler_config=tllm.executor.SchedulerConfig(
+                self.capacity_scheduling_policy, self.context_chunking_policy),
             model_world_size=self.config.parallel_config.world_size,
             mpi_session=self.mpi_session,
             executor_type=tllm.TrtGptModelType.InflightFusedBatching,
+            reuse_mpi_comm=external_mpi_comm_available(
+                self.config.parallel_config.world_size),
+            use_executor_bindings=self.enable_executor,
         )
 
     @print_traceback_on_error
     @staticmethod
-    def _node_build_task(config: ModelConfig,
-                         tokenizer: Optional[TokenizerBase] = None,
-                         workspace: Optional[str] = None) -> bool:
+    def _node_build_task(
+            config: ModelConfig,
+            tokenizer: Optional[TokenizerBase] = None,
+            workspace: Optional[str] = None,
+            build_config: Optional[BuildConfig] = None,
+            convert_checkpoint_options: Optional[dict] = None) -> bool:
         if MPINodeState.is_initialized():
             raise RuntimeError("The MPI node is already initialized.")
 
-        with ModelLoader(config, tokenizer=tokenizer,
-                         workspace=workspace) as model_loader:
+        with ModelLoader(config,
+                         tokenizer=tokenizer,
+                         workspace=workspace,
+                         build_config=build_config,
+                         convert_checkpoint_options=convert_checkpoint_options
+                         ) as model_loader:
             runtime_context = model_loader()
 
         # Hold the model builder for later use
@@ -757,12 +835,14 @@ class ModelLoader:
                  config: ModelConfig,
                  tokenizer: Optional[TokenizerBase],
                  workspace: Optional[str] = None,
-                 build_config: Optional[BuildConfig] = None):
+                 build_config: Optional[BuildConfig] = None,
+                 convert_checkpoint_options: Optional[dict] = None):
         self.config = config
         self.tokenizer = tokenizer
         self.workspace = workspace
 
         self.build_config = build_config or BuildConfig()
+        self.convert_checkpoint_options = {} if convert_checkpoint_options is None else convert_checkpoint_options
         self.rank = mpi_rank() if config.parallel_config.is_multi_gpu else 0
         if config.parallel_config.is_multi_gpu and not config.parallel_config.auto_parallel:
             self.mapping = Mapping(
@@ -983,6 +1063,7 @@ class ModelLoader:
                 quantization=self.config.quant_config,
                 load_model_on_cpu=
                 True,  # TODO:TRTLLM-195 to enhance the weights loading memory usage and chose best location
+                override_fields=self.convert_checkpoint_options,
             )
 
         self.pretrained_config = self.model.config

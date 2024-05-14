@@ -50,7 +50,8 @@ def llama_7b_path(engine_path: Path, llm_model_root: Path) -> Path:
 
     if not path.exists():
         config = ModelConfig(str(llm_model_root / "llama-models/llama-7b-hf"))
-        llm = LLM(config)
+        # TODO[chunweiy]: switch to executor backend
+        llm = LLM(config, enable_executor=False)
         llm.save(str(path))
 
     return path
@@ -63,7 +64,8 @@ def llama_7b_bs2_path(engine_path: Path, llm_model_root: Path) -> Path:
     if not path.exists():
         config = ModelConfig(str(llm_model_root / "llama-models/llama-7b-hf"),
                              max_beam_width=2)
-        llm = LLM(config)
+        # TODO[chunweiy]: switch to executor backend
+        llm = LLM(config, enable_executor=False)
         llm.save(str(path))
 
     return path
@@ -76,7 +78,8 @@ def llama_7b_tp2_path(engine_path: Path, llm_model_root: Path) -> Path:
     if not path.exists():
         config = ModelConfig(str(llm_model_root / "llama-models/llama-7b-hf"))
         config.parallel_config.tp_size = 2
-        llm = LLM(config)
+        # TODO[chunweiy]: switch to executor backend
+        llm = LLM(config, enable_executor=False)
         llm.save(str(path))
 
     return path

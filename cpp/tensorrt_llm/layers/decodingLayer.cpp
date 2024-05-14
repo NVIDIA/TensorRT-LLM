@@ -98,7 +98,7 @@ DecodingLayer<T>::DecodingLayer(DecodingMode const& mode, DecoderDomain const& d
 }
 
 template <typename T>
-void DecodingLayer<T>::setup(SizeType batchSize, SizeType beamWidth, SizeType32 const* batchSlots,
+void DecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 const* batchSlots,
     std::shared_ptr<BaseSetupParams> baseSetupParams)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -160,9 +160,9 @@ void DecodingLayer<T>::forward(
     auto outputs = std::dynamic_pointer_cast<DynamicDecodeOutputParams>(baseOutputs);
     auto params = std::dynamic_pointer_cast<DynamicDecodeInputParams>(baseInputs);
 
-    SizeType batchSize{0};
-    SizeType beamWidth{0};
-    SizeType vocabSize{0};
+    SizeType32 batchSize{0};
+    SizeType32 beamWidth{0};
+    SizeType32 vocabSize{0};
     auto const maxSeqLen = outputs->output_ids.shape[outputs->output_ids.shape.size() - 1];
     auto batchSlots = params->batch_slots ? params->batch_slots->template getPtr<SizeType32 const>() : nullptr;
     if (params->logits)
@@ -259,7 +259,7 @@ void DecodingLayer<T>::forward(
             params->logits->slice({localBatchSize, static_cast<size_t>(beamWidth), params->logits->shape[2]}, 0)};
         Tensor const end_id_slice{endIds.slice({localBatchSize}, 0)};
         auto decode_input_tensors = std::make_shared<SamplingInputParams>(
-            step, ite, logits_slice, end_id_slice, static_cast<SizeType>(maxSeqLen));
+            step, ite, logits_slice, end_id_slice, static_cast<SizeType32>(maxSeqLen));
 
         decode_input_tensors->finished = params->finished;
 

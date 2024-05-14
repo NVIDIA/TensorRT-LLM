@@ -12,20 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
+import sys
 import unittest
 
 import _utils
-import numpy as np
-
-# isort: off
-import torch
 import tensorrt as trt
-# isort: on
-import os
-import sys
-
+import torch
 from parameterized import parameterized
-from polygraphy.backend.trt import EngineFromNetwork, TrtRunner
 
 import tensorrt_llm
 from tensorrt_llm import Tensor
@@ -34,184 +28,178 @@ from tensorrt_llm.quantization.functional import (dequantize, quantize,
 from tensorrt_llm.quantization.layers import quantize_tensor
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import unittest_name_func
+from utils.util import create_session, run_session, unittest_name_func
 
 
-class TestQuantization(unittest.TestCase):
+class TestQuantizationFunctional(unittest.TestCase):
 
     def setUp(self):
         torch.manual_seed(42)
         tensorrt_llm.logger.set_level('error')
 
     @parameterized.expand([('float32', True), ('float16', True),
-                           ('float32', False)],
+                           ('float32', False), ('float16', False)],
                           name_func=unittest_name_func)
     def test_quantize_tensor(self, dtype, use_plugin):
         x_data = torch.randn(
-            (1, 2, 2, 4), dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype))
+            (1, 2, 2, 4),
+            dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
+            device="cuda")
         scaling_factor_data = torch.tensor(0.4, dtype=torch.float32)
         builder = tensorrt_llm.Builder()
-        net = builder.create_network()
+        network = builder.create_network()
         if use_plugin:
-            net.plugin_config.set_quantize_tensor_plugin()
-        config = builder.trt_builder.create_builder_config()
-        config.set_flag(trt.BuilderFlag.INT8)
-        config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
-        with tensorrt_llm.net_guard(net):
+            network.plugin_config.set_quantize_tensor_plugin()
+
+        with tensorrt_llm.net_guard(network):
             x = Tensor(name='x',
                        shape=x_data.shape,
                        dtype=tensorrt_llm.str_dtype_to_trt(dtype))
             scaling_factor = tensorrt_llm.constant(scaling_factor_data.numpy())
             output = quantize_tensor(x, scaling_factor)
-            net._mark_output(output, 'output', trt.int8)
+            output.mark_output('output', trt.int8)
 
-        build_engine = EngineFromNetwork((builder.trt_builder, net.trt_network),
-                                         config)
-        with TrtRunner(build_engine) as runner:
-            outputs = runner.infer(feed_dict={'x': x_data.numpy()})
+        session = create_session(builder, network, precision=dtype, int8=True)
+        inputs = {
+            'x': x_data,
+        }
+        outputs = run_session(session, inputs)
 
-        quantized = (x_data.cuda() * scaling_factor_data.cuda()).round().clip(
+        scaling_factor_data = scaling_factor_data.cuda()
+        quantized = (x_data * scaling_factor_data).round().clip(
             -128, 127).to(dtype=torch.int8)
-        np.testing.assert_allclose(quantized.cpu().numpy(), outputs['output'])
+        torch.testing.assert_close(quantized, outputs['output'])
 
     def test_quantize_per_tensor(self):
         dtype = "float32"
         x_data = torch.randn(
-            (1, 2, 2, 4), dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype))
+            (1, 2, 2, 4),
+            dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
+            device="cuda")
         scaling_factor_data = torch.tensor(0.4, dtype=torch.float32)
         builder = tensorrt_llm.Builder()
-        net = builder.create_network()
-        config = builder.trt_builder.create_builder_config()
-        config.set_flag(trt.BuilderFlag.INT8)
-        config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
-        with tensorrt_llm.net_guard(net):
+        network = builder.create_network()
+
+        with tensorrt_llm.net_guard(network):
             x = Tensor(name='x',
                        shape=x_data.shape,
                        dtype=tensorrt_llm.str_dtype_to_trt(dtype))
             scaling_factor = tensorrt_llm.constant(scaling_factor_data.numpy())
             output = quantize(x, scaling_factor, 'int8')
-            net._mark_output(output, 'output', trt.int8)
+            output.mark_output('output', trt.int8)
 
-        build_engine = EngineFromNetwork((builder.trt_builder, net.trt_network),
-                                         config)
-        with TrtRunner(build_engine) as runner:
-            outputs = runner.infer(feed_dict={'x': x_data.numpy()})
-
+        session = create_session(builder, network, precision=dtype, int8=True)
+        inputs = {
+            'x': x_data,
+        }
+        outputs = run_session(session, inputs)
+        scaling_factor_data = scaling_factor_data.cuda()
         ref = torch.quantize_per_tensor(x_data, scaling_factor_data, 0,
                                         torch.qint8)
 
-        np.testing.assert_allclose(ref.int_repr().cpu().numpy(),
-                                   outputs['output'])
+        torch.testing.assert_close(ref.int_repr(), outputs['output'])
 
     def test_quantize_per_channel(self):
         dtype = 'float32'
-        x_data = torch.randn((4, 2, 4, 8), dtype=torch.float32)
+        x_data = torch.randn((4, 2, 4, 8), dtype=torch.float32, device="cuda")
         scaling_factor_data = torch.tensor((0.4, 0.3), dtype=torch.float32)
         builder = tensorrt_llm.Builder()
-        net = builder.create_network()
-        config = builder.trt_builder.create_builder_config()
-        config.set_flag(trt.BuilderFlag.INT8)
-        config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
-        with tensorrt_llm.net_guard(net):
+        network = builder.create_network()
+
+        with tensorrt_llm.net_guard(network):
             x = Tensor(name='x',
                        shape=x_data.shape,
                        dtype=tensorrt_llm.str_dtype_to_trt(dtype))
             scaling_factor = tensorrt_llm.constant(scaling_factor_data.numpy())
 
             output = quantize(x, scaling_factor, 'int8', 1)
-            net._mark_output(output, 'output', trt.int8)
+            output.mark_output('output', trt.int8)
 
-        build_engine = EngineFromNetwork((builder.trt_builder, net.trt_network),
-                                         config)
-        with TrtRunner(build_engine) as runner:
-            outputs = runner.infer(feed_dict={'x': x_data.numpy()})
-
+        session = create_session(builder, network, precision=dtype, int8=True)
+        inputs = {
+            'x': x_data,
+        }
+        outputs = run_session(session, inputs)
+        scaling_factor_data = scaling_factor_data.cuda()
         ref = torch.quantize_per_channel(x_data, scaling_factor_data,
-                                         torch.tensor([0, 0]), 1, torch.qint8)
+                                         torch.tensor([0, 0], device="cuda"), 1,
+                                         torch.qint8)
 
-        np.testing.assert_allclose(ref.int_repr().cpu().numpy(),
-                                   outputs['output'])
+        torch.testing.assert_close(ref.int_repr(), outputs['output'])
 
     @parameterized.expand([('float32', True), ('float16', True),
                            ('float32', False)],
                           name_func=unittest_name_func)
     def test_quantize_per_token(self, dtype, use_plugin):
         x_data = torch.randn(
-            (4, 2, 4, 8), dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype))
+            (4, 2, 4, 8),
+            dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
+            device="cuda")
 
         builder = tensorrt_llm.Builder()
-        net = builder.create_network()
+        network = builder.create_network()
         if use_plugin:
-            net.plugin_config.set_quantize_per_token_plugin()
+            network.plugin_config.set_quantize_per_token_plugin()
 
-        config = builder.trt_builder.create_builder_config()
-        config.set_flag(trt.BuilderFlag.INT8)
-        config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
-
-        with tensorrt_llm.net_guard(net):
+        with tensorrt_llm.net_guard(network):
             x = Tensor(name='x',
                        shape=x_data.shape,
                        dtype=tensorrt_llm.str_dtype_to_trt(dtype))
 
             output, scale = quantize_per_token(x)
-            net._mark_output(output, 'output', trt.int8)
-            net._mark_output(scale, 'scale',
-                             tensorrt_llm.str_dtype_to_trt(dtype))
+            output.mark_output('output', trt.int8)
+            scale.mark_output('scale', dtype)
 
-        for l in net.trt_network:
-            if l.get_output(0).dtype == tensorrt_llm._utils.str_dtype_to_trt(
-                    "int8"):
-                l.get_output(0).set_dynamic_range(-127, 127)
-
-        build_engine = EngineFromNetwork((builder.trt_builder, net.trt_network),
-                                         config)
-
-        with TrtRunner(build_engine) as runner:
-            outputs = runner.infer(feed_dict={'x': x_data.numpy()})
+        session = create_session(builder, network, precision=dtype, int8=True)
+        inputs = {
+            'x': x_data,
+        }
+        outputs = run_session(session, inputs)
 
         ref, ref_scale = _utils.gt_quantize_per_token(x_data)
         scale_shape = list(x_data.shape)
         scale_shape[-1] = 1
         ref_scale = ref_scale.reshape(scale_shape)
 
-        np.testing.assert_allclose(ref.cpu().numpy(), outputs['output'])
+        torch.testing.assert_close(ref, outputs['output'], atol=1, rtol=1e-1)
 
-        np.testing.assert_allclose(ref_scale.cpu().numpy(),
-                                   outputs['scale'],
-                                   atol=1e-2)
+        torch.testing.assert_close(ref_scale.float(),
+                                   outputs['scale'].float(),
+                                   atol=1e-2,
+                                   rtol=0)
 
     def test_dequantize(self):
         dtype = 'int8'
-        quantized_torch_tensor = torch.quantize_per_tensor(
-            torch.tensor([-1.0, 0.0, 1.0, 2.0], dtype=torch.float32), 0.1, 0,
-            torch.qint8)
-        quantized_data = quantized_torch_tensor.int_repr()
+        x_data = torch.quantize_per_tensor(
+            torch.tensor([-1.0, 0.0, 1.0, 2.0],
+                         dtype=torch.float32,
+                         device="cuda"), 0.1, 0, torch.qint8)
 
         scaling_factor_data = torch.tensor(0.1, dtype=torch.float32)
         builder = tensorrt_llm.Builder()
-        net = builder.create_network()
-        config = builder.trt_builder.create_builder_config()
-        config.set_flag(trt.BuilderFlag.INT8)
-        config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
-        with tensorrt_llm.net_guard(net):
-            network = tensorrt_llm.default_trtnet()
+        network = builder.create_network()
+
+        with tensorrt_llm.net_guard(network):
+
             x = Tensor(name='x',
-                       shape=quantized_data.shape,
+                       shape=x_data.shape,
                        dtype=tensorrt_llm.str_dtype_to_trt(dtype))
             scaling_factor = tensorrt_llm.constant(scaling_factor_data.numpy())
-            output = dequantize(x, scaling_factor).trt_tensor
-            output.name = 'output'
-            network.mark_output(output)
+            output = dequantize(x, scaling_factor, output_type='float32')
+            output.mark_output('output')
 
-        build_engine = EngineFromNetwork((builder.trt_builder, net.trt_network),
-                                         config)
-        with TrtRunner(build_engine) as runner:
-            outputs = runner.infer(
-                feed_dict={'x': quantized_data.cpu().numpy()})
+        session = create_session(builder,
+                                 network,
+                                 precision='float32',
+                                 int8=True)
+        inputs = {
+            'x': x_data,
+        }
+        outputs = run_session(session, inputs)
 
-        ref = torch.dequantize(quantized_torch_tensor)
+        ref = torch.dequantize(x_data)
 
-        np.testing.assert_allclose(ref.cpu().numpy(), outputs['output'])
+        torch.testing.assert_close(ref, outputs['output'])
 
 
 if __name__ == '__main__':

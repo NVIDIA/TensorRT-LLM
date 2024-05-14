@@ -169,6 +169,8 @@ bool GPTAttentionPluginCommon::convertMMHAParamsToXQAParams(tensorrt_llm::kernel
     xqaParams.rotary_embedding_scale_type = mRotaryEmbeddingScaleType;
     xqaParams.rotary_embedding_scale = mRotaryEmbeddingScale;
     xqaParams.rotary_embedding_max_positions = mRotaryEmbeddingMaxPositions;
+    xqaParams.rotary_vision_start = mVisionStart;
+    xqaParams.rotary_vision_length = mVisionLength;
     xqaParams.position_embedding_type = mPositionEmbeddingType;
     xqaParams.position_shift_enabled = mPosShiftEnabled;
     xqaParams.remove_padding = mRemovePadding;
@@ -210,6 +212,7 @@ bool GPTAttentionPluginCommon::convertMMHAParamsToXQAParams(tensorrt_llm::kernel
     xqaParams.kv_scale_quant_orig = generationsParams.kv_scale_quant_orig;
     xqaParams.host_past_key_value_lengths = generationsParams.host_past_key_value_lengths;
     xqaParams.host_context_lengths = generationsParams.host_context_lengths;
+    xqaParams.semaphores = generationsParams.semaphores;
     xqaParams.workspaces = generationsParams.workspace;
     xqaParams.batch_size = generationsParams.num_requests;
     xqaParams.beam_width = generationsParams.beam_width;
@@ -232,6 +235,7 @@ bool GPTAttentionPluginCommon::convertMMHAParamsToXQAParams(tensorrt_llm::kernel
     }
     xqaParams.spec_decoding_packed_mask = generationsParams.spec_decoding_packed_mask;
     xqaParams.spec_decoding_position_offsets = generationsParams.spec_decoding_position_offsets;
+    xqaParams.spec_decoding_generation_lengths = generationsParams.spec_decoding_generation_lengths;
     return true;
 }
 
@@ -560,7 +564,7 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForContext(nvinfer1::DataType t
 
     size_t context_workspace_size = 0;
 
-    int const batch_size = nbReq;
+    auto const batch_size = static_cast<size_t>(nbReq);
     size_t const attention_mask_size = mEnableContextFMHA
         ? 0
         : size * batch_size * input_seq_length * (isCrossAttention() ? cross_qkv_length : input_seq_length);
@@ -582,7 +586,7 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForContext(nvinfer1::DataType t
     size_t const qk_buf_float_size = mEnableContextFMHA ? 0
                                                         : sizeof(float) * batch_size * mNumHeads * input_seq_length
             * (isCrossAttention() ? cross_qkv_length : input_seq_length);
-    size_t const fp8_qkv_buffer_size = mFP8ContextFMHA && mEnableContextFMHA
+    size_t const fp8_qkv_buffer_size = mFP8ContextFMHA && mEnableContextFMHA && !chunked_context_support
         ? batch_size * input_seq_length * size_t(local_hidden_units_qo + 2 * local_hidden_units_kv)
         : 0;
     size_t const padding_offset_size = sizeof(int) * batch_size * input_seq_length;
@@ -736,12 +740,13 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
     }
 #endif
 
+    bool const chunked_context_support = mEnableContextFMHA && mPagedKVCache && mPagedContextFMHA;
     size_t const attention_mask_size = mEnableContextFMHA ? 0
                                                           : sizeof(T) * params.batch_size * params.input_seq_length
             * (isCrossAttention() ? params.cross_qkv_length : params.input_seq_length);
     const size_t cu_seqlens_size = sizeof(int) * (params.batch_size + 1);
     const size_t rotary_inv_freq_size = sizeof(float) * params.batch_size * mRotaryEmbeddingDim / 2;
-    const size_t q_buf_2_size = (mEnableContextFMHA && mPagedKVCache && mPagedContextFMHA) || !mEnableContextFMHA
+    const size_t q_buf_2_size = chunked_context_support || !mEnableContextFMHA
         ? sizeof(T) * params.batch_size * params.input_seq_length * local_hidden_units_qo
         : 0;
     size_t const k_buf_2_size = mEnableContextFMHA ? 0
@@ -758,7 +763,7 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
     size_t const qk_buf_float_size = mEnableContextFMHA ? 0
                                                         : sizeof(float) * params.batch_size * mNumHeads
             * params.input_seq_length * (isCrossAttention() ? params.cross_qkv_length : params.input_seq_length);
-    size_t const fp8_qkv_buffer_size = mEnableContextFMHA && mFP8ContextFMHA
+    size_t const fp8_qkv_buffer_size = mEnableContextFMHA && mFP8ContextFMHA && !chunked_context_support
         ? params.batch_size * params.input_seq_length * (local_hidden_units_qo + 2 * local_hidden_units_kv)
         : 0;
     size_t const padding_offset_size
@@ -1532,11 +1537,7 @@ int GPTAttentionPluginCommon::initialize() noexcept
         if (mIsSpecDecodingEnabled)
         {
             TLLM_CHECK_WITH_INFO(mNumHeads % mNumKVHeads == 0, "mNumHeads should be multiples of mNumKVHeads.");
-            int numQHeadsPerKV = mNumHeads / mNumKVHeads;
-            bool isPowerOfTwo = ((numQHeadsPerKV & (numQHeadsPerKV - 1)) == 0);
-            TLLM_CHECK_WITH_INFO(isPowerOfTwo,
-                "numQHeadsPerKV should be power of 2 for Speculative decoding, mNumHeads=%d, mNumKVHeads=%d.",
-                mNumHeads, mNumKVHeads);
+            TLLM_CHECK_WITH_INFO(!mMultiBlockMode, "Medusa doesn't support multi-block mode.");
         }
 
         mDecoderXQARunner.reset(new DecoderXQARunner(

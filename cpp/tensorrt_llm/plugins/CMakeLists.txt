@@ -124,6 +124,7 @@ target_link_libraries(
   ${CUBLASLT_LIB}
   nvinfer
   ${CUDA_DRV_LIB}
+  ${CUDA_NVML_LIB}
   ${CUDA_RT_LIB}
   ${CMAKE_DL_LIBS}
   ${SHARED_TARGET})

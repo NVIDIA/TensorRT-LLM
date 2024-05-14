@@ -25,10 +25,10 @@
 #include <mutex>
 #include <type_traits>
 
-// We rely on SizeType being int32_t in some places with weak type checking,
+// We rely on SizeType32 being int32_t in some places with weak type checking,
 // i.e. we're passing void ptr to some function. To prevent mysterious errors
-// in the future, we trigger a compilation error here if SizeType isn't int32_t.
-static_assert(std::is_same<tensorrt_llm::runtime::SizeType, std::int32_t>::value);
+// in the future, we trigger a compilation error here if SizeType32 isn't int32_t.
+static_assert(std::is_same<tensorrt_llm::runtime::SizeType32, std::int32_t>::value);
 
 namespace tensorrt_llm::mpi
 {

@@ -40,6 +40,8 @@ from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.quantization.quantize import quantize
 
+WEIGHT_STREAMING_DISABLED_VAL = "1.0"
+
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description='Build TensorRT-LLM models.')
@@ -153,6 +155,21 @@ def parse_arguments():
                         default=False,
                         action='store_true',
                         help='This option will reduce the building time.')
+    parser.add_argument(
+        '--multiple_profiles',
+        default=False,
+        action='store_true',
+        help=
+        'This option will benefit performance, but will increase the engine build time.'
+    )
+
+    parser.add_argument(
+        '--weight_streaming',
+        default=False,
+        action='store_true',
+        help=
+        'Specify whether offloading weights to CPU and streaming loading at runtime.',
+    )
 
     parser.add_argument(
         '--rank',
@@ -267,23 +284,17 @@ def build_gpt(args):
     kv_cache_quant_algo = quant_config.kv_cache_quant_algo
     quant_mode = quant_config.quant_mode
 
+    is_weight_streaming = getattr(args, "weight_streaming", False)
+
     builder = Builder()
     builder_config_extra_kwargs = {}
-    if get_model_family(args.model) == 'mamba':
-        builder_config_extra_kwargs['mamba_d_state'] = build_config[
-            'mamba_d_state']
-        builder_config_extra_kwargs['mamba_d_conv'] = build_config[
-            'mamba_d_conv']
-        builder_config_extra_kwargs['mamba_expand'] = build_config[
-            'mamba_expand']
-        builder_config_extra_kwargs['layer_types'] = ['recurrent']
-    elif get_model_family(args.model) == 'recurrentgemma':
-        builder_config_extra_kwargs['conv_kernel'] = build_config['conv_kernel']
-        builder_config_extra_kwargs['layer_types'] = build_config['layer_types']
-        builder_config_extra_kwargs['rnn_hidden_size'] = build_config[
-            'rnn_hidden_size']
-        builder_config_extra_kwargs['logits_soft_cap'] = build_config[
-            'logits_soft_cap']
+    extra_items = [
+        'layer_types', 'conv_kernel', 'rnn_hidden_size', 'logits_soft_cap',
+        'state_size', 'use_bias'
+    ]
+    for item in extra_items:
+        if item in build_config:
+            builder_config_extra_kwargs[item] = build_config[item]
     builder_config = builder.create_builder_config(
         name=args.model,
         precision=args.dtype,
@@ -309,6 +320,7 @@ def build_gpt(args):
         use_refit=False,
         opt_level=build_config['builder_opt'],
         strongly_typed=strongly_typed,
+        weight_streaming=is_weight_streaming,
         **builder_config_extra_kwargs)
     engine_name = get_engine_name(args.model, args.dtype, world_size,
                                   runtime_rank)
@@ -818,24 +830,23 @@ def build_gpt(args):
         tensorrt_llm_model = tensorrt_llm.models.QWenForCausalLM(config)
     elif family == "mamba":
         config = {
-            'architecture': 'MambaLMHeadModel',
+            'architecture': 'MambaForCausalLM',
             'dtype': args.dtype,
             'vocab_size': build_config['vocab_size'],
             'hidden_size': build_config['hidden_size'],
             'num_hidden_layers': build_config['num_layers'],
             'num_attention_heads': build_config['num_heads'],
             'hidden_act': build_config['hidden_act'],
-            'ssm_cfg': {
-                'd_state': build_config['mamba_d_state'],
-                'd_conv': build_config['mamba_d_conv'],
-                'expand': build_config['mamba_expand']
-            },
+            'state_size': build_config['state_size'],
+            'conv_kernel': build_config['conv_kernel'],
+            'rnn_hidden_size': build_config['rnn_hidden_size'],
             'rms_norm': True,
             'residual_in_fp32': True,
             'pad_vocab_size_multiple': 8,
+            'use_bias': build_config['use_bias'],
         }
         config = PretrainedConfig.from_dict(config)
-        tensorrt_llm_model = tensorrt_llm.models.MambaLMHeadModel(config)
+        tensorrt_llm_model = tensorrt_llm.models.MambaForCausalLM(config)
     elif family == "recurrentgemma":
         config = {
             'architecture': 'RecurrentGemmaForCausalLM',
@@ -862,6 +873,7 @@ def build_gpt(args):
             'rotary_percentage': build_config['rotary_pct'],
             'max_position_embeddings': build_config['n_positions'],
             'conv_kernel': build_config['conv_kernel'],
+            'state_size': build_config['state_size'],
             'layer_types': build_config['layer_types'],
             'rnn_hidden_size': build_config['rnn_hidden_size'],
             'logits_soft_cap': build_config['logits_soft_cap'],
@@ -916,6 +928,9 @@ def build_gpt(args):
         network.plugin_config.set_nccl_plugin(
             dtype=args.dtype,
             use_custom_all_reduce=build_config["use_custom_all_reduce"])
+
+    if args.multiple_profiles:
+        network.plugin_config.multiple_profiles = True
 
     with net_guard(network):
         # Prepare
@@ -991,6 +1006,8 @@ def build_bert(args):
     bs_range = [1, (max_batch_size + 1) // 2, max_batch_size]
     inlen_range = [1, (max_input_len + 1) // 2, max_input_len]
 
+    is_weight_streaming = getattr(args, "weight_streaming", False)
+
     builder = Builder()
     builder_config = builder.create_builder_config(
         name=args.model,
@@ -1009,7 +1026,9 @@ def build_bert(args):
         max_batch_size=max_batch_size,
         max_input_len=max_input_len,
         opt_level=build_config['builder_opt'],
-        strongly_typed=args.strongly_typed)
+        strongly_typed=args.strongly_typed,
+        weight_streaming=is_weight_streaming,
+    )
     engine_name = get_engine_name(args.model, args.dtype, world_size,
                                   runtime_rank)
 
@@ -1158,6 +1177,7 @@ def enc_dec_build_helper(component, config, args):
     quant_config = get_quant_config(args.quantization)
     quant_mode = quant_config.quant_mode
     use_weight_only = quant_mode.is_weight_only()
+    is_weight_streaming = getattr(args, "weight_streaming", False)
 
     builder = Builder()
     builder_config = builder.create_builder_config(
@@ -1191,6 +1211,7 @@ def enc_dec_build_helper(component, config, args):
         quant_mode=quant_mode,
         n_mels=n_mels,
         skip_cross_qkv=config['skip_cross_qkv'],
+        weight_streaming=is_weight_streaming,
     )
 
     # build engine

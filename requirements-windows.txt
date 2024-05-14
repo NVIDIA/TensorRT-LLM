@@ -18,7 +18,7 @@ sentencepiece>=0.1.99
 tensorrt==10.0.1
 tokenizers>=0.14
 # Default torch is CPU-only on Windows, so need to specify a torch version with GPU support
-torch==2.2.0+cu121
+torch @ https://download.pytorch.org/whl/cu121/torch-2.2.0%2Bcu121-cp310-cp310-win_amd64.whl#sha256=8f54c647ee19c8b4c0aad158c73b83b2c06cb62351e9cfa981540ce7295a9015
 transformers==4.38.2
 wheel
 optimum

@@ -41,20 +41,20 @@ TEST(samplingConfigTest, validInputs)
         EXPECT_THAT(samplingCfg.draftAcceptanceThreshold.value(), testing::ElementsAre(0.5f));
     }
     {
-        texec::SizeType topK = 1;
+        texec::SizeType32 topK = 1;
         texec::FloatType topP = 0.5;
         texec::FloatType topPMin = 0.1;
-        texec::SizeType topPResetIds = 1;
+        texec::SizeType32 topPResetIds = 1;
         texec::FloatType topPDecay = 0.6;
         uint64_t randomSeed = 7777;
         texec::FloatType temperature = 0.245;
-        texec::SizeType minLength = 1234;
+        texec::SizeType32 minLength = 1234;
         texec::FloatType beamSearchDiversityRate = 0.9999;
         texec::FloatType repetitionPenalty = 0.11;
         texec::FloatType presencePenalty = 0.22;
         texec::FloatType frequencyPenalty = 0.33;
         texec::FloatType lengthPenalty = 0.44;
-        texec::SizeType earlyStopping = 1;
+        texec::SizeType32 earlyStopping = 1;
 
         texec::SamplingConfig execSamplingCfg(1, topK, topP, topPMin, topPResetIds, topPDecay, randomSeed, temperature,
             minLength, beamSearchDiversityRate, repetitionPenalty, presencePenalty, frequencyPenalty, lengthPenalty,

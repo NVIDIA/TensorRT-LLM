@@ -45,7 +45,7 @@ std::string doubleBytesToString(double bytes, int precision)
 
 namespace tensorrt_llm::runtime
 {
-std::string MemoryCounters::bytesToString(SizeType bytes, int precision)
+std::string MemoryCounters::bytesToString(SizeType32 bytes, int precision)
 {
     return doubleBytesToString(static_cast<double>(bytes), precision);
 }
@@ -61,7 +61,7 @@ std::string MemoryCounters::toString() const
         bytesToString(this->getCpu()).c_str(), bytesToString(this->getPinned()).c_str());
 }
 
-void MemoryCounters::allocate(MemoryType memoryType, MemoryCounters::SizeType size)
+void MemoryCounters::allocate(MemoryType memoryType, MemoryCounters::SizeType32 size)
 {
     switch (memoryType)
     {
@@ -72,7 +72,7 @@ void MemoryCounters::allocate(MemoryType memoryType, MemoryCounters::SizeType si
     }
 }
 
-void MemoryCounters::deallocate(MemoryType memoryType, MemoryCounters::SizeType size)
+void MemoryCounters::deallocate(MemoryType memoryType, MemoryCounters::SizeType32 size)
 {
     switch (memoryType)
     {

@@ -259,7 +259,7 @@ void reduce(IBuffer& output, IBuffer const& input, CudaStream const& stream)
 {
     switch (input.getDataType())
     {
-    case nvinfer1::DataType::kINT32: invokeReduce<SizeType>(output, input, stream); break;
+    case nvinfer1::DataType::kINT32: invokeReduce<SizeType32>(output, input, stream); break;
     case nvinfer1::DataType::kFLOAT: invokeReduce<float>(output, input, stream); break;
     case nvinfer1::DataType::kHALF: invokeReduce<half>(output, input, stream); break;
     case nvinfer1::DataType::kINT8: invokeReduce<int8_t>(output, input, stream); break;
@@ -269,14 +269,15 @@ void reduce(IBuffer& output, IBuffer const& input, CudaStream const& stream)
 
 namespace
 {
-__global__ void transpose(SizeType* output, SizeType const* input, SizeType const batchSize, SizeType const rowSize)
+__global__ void transpose(
+    SizeType32* output, SizeType32 const* input, SizeType32 const batchSize, SizeType32 const rowSize)
 {
-    SizeType const tidx = blockIdx.x * blockDim.x + threadIdx.x;
-    SizeType const tidy = blockIdx.y * blockDim.y + threadIdx.y;
+    SizeType32 const tidx = blockIdx.x * blockDim.x + threadIdx.x;
+    SizeType32 const tidy = blockIdx.y * blockDim.y + threadIdx.y;
 
-    for (SizeType batchIdx = tidy; batchIdx < batchSize; batchIdx += blockDim.y * gridDim.y)
+    for (SizeType32 batchIdx = tidy; batchIdx < batchSize; batchIdx += blockDim.y * gridDim.y)
     {
-        for (SizeType tokenIdx = tidx; tokenIdx < rowSize; tokenIdx += blockDim.x * gridDim.x)
+        for (SizeType32 tokenIdx = tidx; tokenIdx < rowSize; tokenIdx += blockDim.x * gridDim.x)
         {
             auto const inputIdx = batchIdx * rowSize + tokenIdx;
             auto const outputIdx = tokenIdx * batchSize + batchIdx;
@@ -296,27 +297,27 @@ void invokeTranspose(ITensor& output, ITensor const& input, CudaStream const& st
     TLLM_CHECK_WITH_INFO(
         inputShape.nbDims == 2, common::fmtstr("Input shape must have 2 dimensions, but has %d", inputShape.nbDims));
 
-    SizeType const batchSize = inputShape.d[0];
-    SizeType const rowSize = inputShape.d[1];
+    SizeType32 const batchSize = inputShape.d[0];
+    SizeType32 const rowSize = inputShape.d[1];
 
     dim3 const blockSize(256, 1);
     dim3 const gridSize((rowSize + blockSize.x - 1) / blockSize.x, batchSize);
 
     transpose<<<gridSize, blockSize, 0, stream.get()>>>(
-        bufferCast<SizeType>(output), bufferCast<SizeType const>(input), batchSize, rowSize);
+        bufferCast<SizeType32>(output), bufferCast<SizeType32 const>(input), batchSize, rowSize);
 }
 
 namespace
 {
-__global__ void transposeWithOutputOffset(SizeType* output, SizeType const* input, SizeType const nbInputRows,
-    SizeType const inputRowSize, SizeType const outputRowSize, SizeType const outputOffset)
+__global__ void transposeWithOutputOffset(SizeType32* output, SizeType32 const* input, SizeType32 const nbInputRows,
+    SizeType32 const inputRowSize, SizeType32 const outputRowSize, SizeType32 const outputOffset)
 {
-    SizeType const tidx = blockIdx.x * blockDim.x + threadIdx.x;
-    SizeType const tidy = blockIdx.y * blockDim.y + threadIdx.y;
+    SizeType32 const tidx = blockIdx.x * blockDim.x + threadIdx.x;
+    SizeType32 const tidy = blockIdx.y * blockDim.y + threadIdx.y;
 
-    for (SizeType batchIdx = tidy; batchIdx < nbInputRows; batchIdx += blockDim.y * gridDim.y)
+    for (SizeType32 batchIdx = tidy; batchIdx < nbInputRows; batchIdx += blockDim.y * gridDim.y)
     {
-        for (SizeType tokenIdx = tidx; tokenIdx < inputRowSize; tokenIdx += blockDim.x * gridDim.x)
+        for (SizeType32 tokenIdx = tidx; tokenIdx < inputRowSize; tokenIdx += blockDim.x * gridDim.x)
         {
             auto const inputIdx = batchIdx * inputRowSize + tokenIdx;
             auto const outputIdx = tokenIdx * outputRowSize + outputOffset + batchIdx;
@@ -327,21 +328,21 @@ __global__ void transposeWithOutputOffset(SizeType* output, SizeType const* inpu
 } // namespace
 
 void invokeTransposeWithOutputOffset(
-    ITensor& output, ITensor const& input, SizeType const outputOffset, CudaStream const& stream)
+    ITensor& output, ITensor const& input, SizeType32 const outputOffset, CudaStream const& stream)
 {
     TLLM_CHECK_WITH_INFO(input.getDataType() == output.getDataType(), "Input and output have different data types");
 
     auto const& inputShape = input.getShape();
     TLLM_CHECK_WITH_INFO(
         inputShape.nbDims == 2, common::fmtstr("Input shape must have 2 dimensions, but has %d", inputShape.nbDims));
-    SizeType const nbInputRows = inputShape.d[0];
-    SizeType const inputRowSize = inputShape.d[1];
+    SizeType32 const nbInputRows = inputShape.d[0];
+    SizeType32 const inputRowSize = inputShape.d[1];
 
     auto const& outputShape = output.getShape();
     TLLM_CHECK_WITH_INFO(
         outputShape.nbDims == 2, common::fmtstr("Output shape must have 2 dimensions, but has %d", outputShape.nbDims));
-    SizeType const nbOutputRows = outputShape.d[0];
-    SizeType const outputRowSize = outputShape.d[1];
+    SizeType32 const nbOutputRows = outputShape.d[0];
+    SizeType32 const outputRowSize = outputShape.d[1];
 
     TLLM_CHECK_WITH_INFO(inputRowSize == nbOutputRows,
         common::fmtstr("Input dim 1 (%d) and output dim 0 (%d) differ", inputRowSize, nbOutputRows));
@@ -352,21 +353,21 @@ void invokeTransposeWithOutputOffset(
     dim3 const blockSize(256, 1);
     dim3 const gridSize((inputRowSize + blockSize.x - 1) / blockSize.x, nbInputRows);
 
-    transposeWithOutputOffset<<<gridSize, blockSize, 0, stream.get()>>>(bufferCast<SizeType>(output),
-        bufferCast<SizeType const>(input), nbInputRows, inputRowSize, outputRowSize, outputOffset);
+    transposeWithOutputOffset<<<gridSize, blockSize, 0, stream.get()>>>(bufferCast<SizeType32>(output),
+        bufferCast<SizeType32 const>(input), nbInputRows, inputRowSize, outputRowSize, outputOffset);
 }
 
 namespace
 {
-__global__ void transposeWithInputOffset(SizeType* output, SizeType const* input, SizeType const outputRowSize,
-    SizeType const nbOutputRows, SizeType const inputRowSize, SizeType const inputOffset)
+__global__ void transposeWithInputOffset(SizeType32* output, SizeType32 const* input, SizeType32 const outputRowSize,
+    SizeType32 const nbOutputRows, SizeType32 const inputRowSize, SizeType32 const inputOffset)
 {
-    SizeType const tidx = blockIdx.x * blockDim.x + threadIdx.x;
-    SizeType const tidy = blockIdx.y * blockDim.y + threadIdx.y;
+    SizeType32 const tidx = blockIdx.x * blockDim.x + threadIdx.x;
+    SizeType32 const tidy = blockIdx.y * blockDim.y + threadIdx.y;
 
-    for (SizeType batchIdx = tidy; batchIdx < outputRowSize; batchIdx += blockDim.y * gridDim.y)
+    for (SizeType32 batchIdx = tidy; batchIdx < outputRowSize; batchIdx += blockDim.y * gridDim.y)
     {
-        for (SizeType tokenIdx = tidx; tokenIdx < nbOutputRows; tokenIdx += blockDim.x * gridDim.x)
+        for (SizeType32 tokenIdx = tidx; tokenIdx < nbOutputRows; tokenIdx += blockDim.x * gridDim.x)
         {
             auto const inputIdx = batchIdx * inputRowSize + inputOffset + tokenIdx;
             auto const outputIdx = tokenIdx * outputRowSize + batchIdx;
@@ -377,21 +378,21 @@ __global__ void transposeWithInputOffset(SizeType* output, SizeType const* input
 } // namespace
 
 void invokeTransposeWithInputOffset(
-    ITensor& output, ITensor const& input, SizeType const inputOffset, CudaStream const& stream)
+    ITensor& output, ITensor const& input, SizeType32 const inputOffset, CudaStream const& stream)
 {
     TLLM_CHECK_WITH_INFO(input.getDataType() == output.getDataType(), "Input and output have different data types");
 
     auto const& inputShape = input.getShape();
     TLLM_CHECK_WITH_INFO(
         inputShape.nbDims == 2, common::fmtstr("Input shape must have 2 dimensions, but has %d", inputShape.nbDims));
-    SizeType const nbInputRows = inputShape.d[0];
-    SizeType const inputRowSize = inputShape.d[1];
+    SizeType32 const nbInputRows = inputShape.d[0];
+    SizeType32 const inputRowSize = inputShape.d[1];
 
     auto const& outputShape = output.getShape();
     TLLM_CHECK_WITH_INFO(
         outputShape.nbDims == 2, common::fmtstr("Output shape must have 2 dimensions, but has %d", outputShape.nbDims));
-    SizeType const nbOutputRows = outputShape.d[0];
-    SizeType const outputRowSize = outputShape.d[1];
+    SizeType32 const nbOutputRows = outputShape.d[0];
+    SizeType32 const outputRowSize = outputShape.d[1];
 
     TLLM_CHECK_WITH_INFO(nbInputRows == outputRowSize,
         common::fmtstr("Input dim 0 (%d) and output dim 1 (%d) differ", nbInputRows, outputRowSize));
@@ -402,15 +403,15 @@ void invokeTransposeWithInputOffset(
     dim3 const blockSize(256, 1);
     dim3 const gridSize((nbOutputRows + blockSize.x - 1) / blockSize.x, outputRowSize);
 
-    transposeWithInputOffset<<<gridSize, blockSize, 0, stream.get()>>>(bufferCast<SizeType>(output),
-        bufferCast<SizeType const>(input), outputRowSize, nbOutputRows, inputRowSize, inputOffset);
+    transposeWithInputOffset<<<gridSize, blockSize, 0, stream.get()>>>(bufferCast<SizeType32>(output),
+        bufferCast<SizeType32 const>(input), outputRowSize, nbOutputRows, inputRowSize, inputOffset);
 }
 
 void invokeInclusiveSum(IBuffer& output, IBuffer const& input, BufferManager const& manager, CudaStream const& stream)
 {
     auto const size = input.getSize();
-    auto const* inputData = bufferCast<SizeType>(input);
-    auto* outputData = bufferCast<SizeType>(output);
+    auto const* inputData = bufferCast<SizeType32>(input);
+    auto* outputData = bufferCast<SizeType32>(output);
 
     std::size_t tempStorageBytes{0};
     cub::DeviceScan::InclusiveSum(nullptr, tempStorageBytes, inputData, outputData, size, stream.get());
@@ -424,8 +425,8 @@ void invokeInclusiveSum(IBuffer& output, IBuffer& tmpBuffer, IBuffer const& inpu
     TLLM_CHECK_WITH_INFO(nvinfer1::DataType::kUINT8 == tmpBuffer.getDataType(), "tmpBuffer has wrong data type");
 
     auto const size = input.getSize();
-    auto const* inputData = bufferCast<SizeType>(input);
-    auto* outputData = bufferCast<SizeType>(output);
+    auto const* inputData = bufferCast<SizeType32>(input);
+    auto* outputData = bufferCast<SizeType32>(output);
 
     std::size_t tempStorageBytes{0};
     cub::DeviceScan::InclusiveSum(nullptr, tempStorageBytes, inputData, outputData, size, stream.get());
@@ -436,16 +437,16 @@ void invokeInclusiveSum(IBuffer& output, IBuffer& tmpBuffer, IBuffer const& inpu
 
 namespace
 {
-__global__ void buildTokenMask(SizeType* tokenMask, SizeType const* inputLengths, SizeType const batchSize,
-    SizeType const maxInputLength, SizeType const maxSeqLength)
+__global__ void buildTokenMask(SizeType32* tokenMask, SizeType32 const* inputLengths, SizeType32 const batchSize,
+    SizeType32 const maxInputLength, SizeType32 const maxSeqLength)
 {
-    SizeType const tidx = blockIdx.x * blockDim.x + threadIdx.x;
-    SizeType const tidy = blockIdx.y * blockDim.y + threadIdx.y;
+    SizeType32 const tidx = blockIdx.x * blockDim.x + threadIdx.x;
+    SizeType32 const tidy = blockIdx.y * blockDim.y + threadIdx.y;
 
-    for (SizeType batchIdx = tidy; batchIdx < batchSize; batchIdx += blockDim.y * gridDim.y)
+    for (SizeType32 batchIdx = tidy; batchIdx < batchSize; batchIdx += blockDim.y * gridDim.y)
     {
         auto const inputLength = inputLengths[batchIdx];
-        for (SizeType tokenIdx = tidx; tokenIdx < maxSeqLength; tokenIdx += blockDim.x * gridDim.x)
+        for (SizeType32 tokenIdx = tidx; tokenIdx < maxSeqLength; tokenIdx += blockDim.x * gridDim.x)
         {
             tokenMask[batchIdx * maxSeqLength + tokenIdx]
                 = (tokenIdx >= inputLength && tokenIdx < maxInputLength) ? 1 : 0;
@@ -455,15 +456,15 @@ __global__ void buildTokenMask(SizeType* tokenMask, SizeType const* inputLengths
 } // namespace
 
 void invokeBuildTokenMask(
-    ITensor& tokenMask, ITensor const& inputLengths, SizeType const maxInputLength, CudaStream const& stream)
+    ITensor& tokenMask, ITensor const& inputLengths, SizeType32 const maxInputLength, CudaStream const& stream)
 {
-    TLLM_CHECK_WITH_INFO(TRTDataType<SizeType>::value == tokenMask.getDataType(), "tokenMask has wrong data type");
+    TLLM_CHECK_WITH_INFO(TRTDataType<SizeType32>::value == tokenMask.getDataType(), "tokenMask has wrong data type");
     TLLM_CHECK_WITH_INFO(
-        TRTDataType<SizeType>::value == inputLengths.getDataType(), "inputLengths has wrong data type");
+        TRTDataType<SizeType32>::value == inputLengths.getDataType(), "inputLengths has wrong data type");
 
     auto const& shape = tokenMask.getShape();
-    SizeType const batchSize = shape.d[0];
-    SizeType const maxSeqLength = shape.d[1];
+    SizeType32 const batchSize = shape.d[0];
+    SizeType32 const maxSeqLength = shape.d[1];
 
     TLLM_CHECK_WITH_INFO(maxInputLength < maxSeqLength,
         common::fmtstr(
@@ -472,17 +473,17 @@ void invokeBuildTokenMask(
     dim3 const blockSize(256, 1);
     dim3 const gridSize((maxSeqLength + blockSize.x - 1) / blockSize.x, batchSize);
 
-    buildTokenMask<<<gridSize, blockSize, 0, stream.get()>>>(bufferCast<SizeType>(tokenMask),
-        bufferCast<SizeType const>(inputLengths), batchSize, maxInputLength, maxSeqLength);
+    buildTokenMask<<<gridSize, blockSize, 0, stream.get()>>>(bufferCast<SizeType32>(tokenMask),
+        bufferCast<SizeType32 const>(inputLengths), batchSize, maxInputLength, maxSeqLength);
 }
 
 namespace
 {
-__global__ void buildAttentionMask(SizeType* attentionMask, SizeType const size, SizeType const padId)
+__global__ void buildAttentionMask(SizeType32* attentionMask, SizeType32 const size, SizeType32 const padId)
 {
-    SizeType const tid = blockIdx.x * blockDim.x + threadIdx.x;
+    SizeType32 const tid = blockIdx.x * blockDim.x + threadIdx.x;
 
-    for (SizeType i = tid; i < size; i += blockDim.x * gridDim.x)
+    for (SizeType32 i = tid; i < size; i += blockDim.x * gridDim.x)
     {
         auto const x = attentionMask[i];
         attentionMask[i] = (x != padId);
@@ -490,32 +491,32 @@ __global__ void buildAttentionMask(SizeType* attentionMask, SizeType const size,
 }
 } // namespace
 
-void invokeBuildAttentionMask(ITensor& attentionMask, SizeType const padId, CudaStream const& stream)
+void invokeBuildAttentionMask(ITensor& attentionMask, SizeType32 const padId, CudaStream const& stream)
 {
     TLLM_CHECK_WITH_INFO(
-        TRTDataType<SizeType>::value == attentionMask.getDataType(), "attentionMask has wrong data type");
+        TRTDataType<SizeType32>::value == attentionMask.getDataType(), "attentionMask has wrong data type");
 
     auto const size = attentionMask.getSize();
     dim3 const blockSize(256);
     dim3 const gridSize((size + blockSize.x - 1) / blockSize.x);
 
-    buildAttentionMask<<<gridSize, blockSize, 0, stream.get()>>>(bufferCast<SizeType>(attentionMask), size, padId);
+    buildAttentionMask<<<gridSize, blockSize, 0, stream.get()>>>(bufferCast<SizeType32>(attentionMask), size, padId);
 }
 
 namespace
 {
 __global__ void extendAttentionMask(
-    SizeType* newMask, SizeType const* oldMask, SizeType const batchSize, SizeType const seqLength)
+    SizeType32* newMask, SizeType32 const* oldMask, SizeType32 const batchSize, SizeType32 const seqLength)
 {
-    SizeType const tidx = blockIdx.x * blockDim.x + threadIdx.x;
-    SizeType const tidy = blockIdx.y * blockDim.y + threadIdx.y;
+    SizeType32 const tidx = blockIdx.x * blockDim.x + threadIdx.x;
+    SizeType32 const tidy = blockIdx.y * blockDim.y + threadIdx.y;
 
-    for (SizeType batchIdx = tidy; batchIdx < batchSize; batchIdx += blockDim.y * gridDim.y)
+    for (SizeType32 batchIdx = tidy; batchIdx < batchSize; batchIdx += blockDim.y * gridDim.y)
     {
-        for (SizeType tokenIdx = tidx; tokenIdx < seqLength + 1; tokenIdx += blockDim.x * gridDim.x)
+        for (SizeType32 tokenIdx = tidx; tokenIdx < seqLength + 1; tokenIdx += blockDim.x * gridDim.x)
         {
-            SizeType oldIndex = batchIdx * seqLength + tokenIdx;
-            SizeType newIndex = batchIdx * (seqLength + 1) + tokenIdx;
+            SizeType32 oldIndex = batchIdx * seqLength + tokenIdx;
+            SizeType32 newIndex = batchIdx * (seqLength + 1) + tokenIdx;
             newMask[newIndex] = (tokenIdx < seqLength) ? oldMask[oldIndex] : 1;
         }
     }
@@ -524,35 +525,36 @@ __global__ void extendAttentionMask(
 
 void invokeExtendAttentionMask(ITensor& newMask, ITensor const& oldMask, CudaStream const& stream)
 {
-    TLLM_CHECK_WITH_INFO(TRTDataType<SizeType>::value == newMask.getDataType(), "attentionMask has wrong data type");
-    TLLM_CHECK_WITH_INFO(TRTDataType<SizeType>::value == oldMask.getDataType(), "attentionMask has wrong data type");
+    TLLM_CHECK_WITH_INFO(TRTDataType<SizeType32>::value == newMask.getDataType(), "attentionMask has wrong data type");
+    TLLM_CHECK_WITH_INFO(TRTDataType<SizeType32>::value == oldMask.getDataType(), "attentionMask has wrong data type");
 
     auto const& shape = oldMask.getShape();
-    SizeType const batchSize = shape.d[0];
-    SizeType const seqLength = shape.d[1];
+    SizeType32 const batchSize = shape.d[0];
+    SizeType32 const seqLength = shape.d[1];
 
     dim3 const blockSize(256, 1);
     dim3 const gridSize((seqLength + blockSize.x - 1) / blockSize.x, batchSize);
 
     extendAttentionMask<<<gridSize, blockSize, 0, stream.get()>>>(
-        bufferCast<SizeType>(newMask), bufferCast<SizeType>(oldMask), batchSize, seqLength);
+        bufferCast<SizeType32>(newMask), bufferCast<SizeType32>(oldMask), batchSize, seqLength);
 }
 
 namespace
 {
-__global__ void copyInputToOutputTransposed(SizeType* outputIds, SizeType const* inputIds, SizeType const* inputLengths,
-    SizeType const padId, SizeType const batchSize, SizeType const beamWidth, SizeType const maxInputLength)
+__global__ void copyInputToOutputTransposed(TokenIdType* outputIds, TokenIdType const* inputIds,
+    SizeType32 const* inputLengths, TokenIdType const padId, SizeType32 const batchSize, SizeType32 const beamWidth,
+    SizeType32 const maxInputLength)
 {
-    SizeType const tidx = blockIdx.x * blockDim.x + threadIdx.x;
-    SizeType const tidy = blockIdx.y * blockDim.y + threadIdx.y;
+    SizeType32 const tidx = blockIdx.x * blockDim.x + threadIdx.x;
+    SizeType32 const tidy = blockIdx.y * blockDim.y + threadIdx.y;
 
-    for (SizeType batchIdx = tidy; batchIdx < batchSize; batchIdx += blockDim.y * gridDim.y)
+    for (SizeType32 batchIdx = tidy; batchIdx < batchSize; batchIdx += blockDim.y * gridDim.y)
     {
         auto const inputLength = inputLengths[batchIdx];
-        for (SizeType tokenIdx = tidx; tokenIdx < maxInputLength; tokenIdx += blockDim.x * gridDim.x)
+        for (SizeType32 tokenIdx = tidx; tokenIdx < maxInputLength; tokenIdx += blockDim.x * gridDim.x)
         {
             auto const value = (tokenIdx < inputLength) ? inputIds[batchIdx * maxInputLength + tokenIdx] : padId;
-            for (SizeType beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
+            for (SizeType32 beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
             {
                 auto const outputIdx = tc::flat_index3(tokenIdx, batchIdx, beamIdx, batchSize, beamWidth);
                 outputIds[outputIdx] = value;
@@ -563,17 +565,17 @@ __global__ void copyInputToOutputTransposed(SizeType* outputIds, SizeType const*
 } // namespace
 
 void invokeCopyInputToOutputTransposed(ITensor& outputIds, ITensor const& inputIds, ITensor const& inputLengths,
-    SizeType const padId, CudaStream const& stream)
+    TokenIdType const padId, CudaStream const& stream)
 {
     TLLM_CHECK_WITH_INFO(
         inputIds.getDataType() == outputIds.getDataType(), "Input and output have different data types");
 
-    auto const batchSize = static_cast<SizeType>(inputLengths.getSize());
+    auto const batchSize = static_cast<SizeType32>(inputLengths.getSize());
     auto const& inputShape = inputIds.getShape();
-    SizeType const maxInputLength = inputShape.d[inputShape.nbDims - 1];
+    SizeType32 const maxInputLength = inputShape.d[inputShape.nbDims - 1];
     auto const& outputShape = outputIds.getShape();
-    SizeType const maxSeqLength = outputShape.d[0];
-    SizeType const beamWidth = outputShape.d[2];
+    SizeType32 const maxSeqLength = outputShape.d[0];
+    SizeType32 const beamWidth = outputShape.d[2];
 
     auto const inputBatchSize = inputIds.getSize() / maxInputLength;
     TLLM_CHECK_WITH_INFO(std::size_t(batchSize) == inputBatchSize,
@@ -589,30 +591,30 @@ void invokeCopyInputToOutputTransposed(ITensor& outputIds, ITensor const& inputI
     dim3 const blockSize(256, 1);
     dim3 const gridSize((maxInputLength + blockSize.x - 1) / blockSize.x, batchSize);
 
-    copyInputToOutputTransposed<<<gridSize, blockSize, 0, stream.get()>>>(bufferCast<SizeType>(outputIds),
-        bufferCast<SizeType const>(inputIds), bufferCast<SizeType const>(inputLengths), padId, batchSize, beamWidth,
-        maxInputLength);
+    copyInputToOutputTransposed<<<gridSize, blockSize, 0, stream.get()>>>(bufferCast<TokenIdType>(outputIds),
+        bufferCast<TokenIdType const>(inputIds), bufferCast<SizeType32 const>(inputLengths), padId, batchSize,
+        beamWidth, maxInputLength);
 }
 
 namespace
 {
-__global__ void copyPackedInputToOutputTransposed(SizeType* outputIds, SizeType const* inputIds,
-    SizeType const* inputOffsets, SizeType const padId, SizeType const batchSize, SizeType const beamWidth,
-    SizeType const maxInputLength)
+__global__ void copyPackedInputToOutputTransposed(TokenIdType* outputIds, TokenIdType const* inputIds,
+    SizeType32 const* inputOffsets, TokenIdType const padId, SizeType32 const batchSize, SizeType32 const beamWidth,
+    SizeType32 const maxInputLength)
 {
-    SizeType const tidx = blockIdx.x * blockDim.x + threadIdx.x;
-    SizeType const tidy = blockIdx.y * blockDim.y + threadIdx.y;
+    SizeType32 const tidx = blockIdx.x * blockDim.x + threadIdx.x;
+    SizeType32 const tidy = blockIdx.y * blockDim.y + threadIdx.y;
 
-    for (SizeType batchIdx = tidy; batchIdx < batchSize; batchIdx += blockDim.y * gridDim.y)
+    for (SizeType32 batchIdx = tidy; batchIdx < batchSize; batchIdx += blockDim.y * gridDim.y)
     {
         auto const tokenBegin = inputOffsets[batchIdx];
         auto const tokenEnd = inputOffsets[batchIdx + 1];
         auto const inputLength = tokenEnd - tokenBegin;
 
-        for (SizeType tokenIdx = tidx; tokenIdx < maxInputLength; tokenIdx += blockDim.x * gridDim.x)
+        for (SizeType32 tokenIdx = tidx; tokenIdx < maxInputLength; tokenIdx += blockDim.x * gridDim.x)
         {
             auto const value = (tokenIdx < inputLength) ? inputIds[tokenBegin + tokenIdx] : padId;
-            for (SizeType beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
+            for (SizeType32 beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
             {
                 auto const outputIdx = tc::flat_index3(tokenIdx, batchIdx, beamIdx, batchSize, beamWidth);
                 outputIds[outputIdx] = value;
@@ -623,15 +625,15 @@ __global__ void copyPackedInputToOutputTransposed(SizeType* outputIds, SizeType 
 } // namespace
 
 void invokeCopyPackedInputToOutputTransposed(ITensor& outputIds, ITensor const& inputIds, ITensor const& inputOffsets,
-    SizeType const maxInputLength, SizeType const padId, CudaStream const& stream)
+    SizeType32 const maxInputLength, TokenIdType const padId, CudaStream const& stream)
 {
     TLLM_CHECK_WITH_INFO(
         inputIds.getDataType() == outputIds.getDataType(), "Input and output have different data types");
 
-    auto const batchSize = static_cast<SizeType>(inputOffsets.getSize()) - 1;
+    auto const batchSize = static_cast<SizeType32>(inputOffsets.getSize()) - 1;
     auto const& outputShape = outputIds.getShape();
-    SizeType const maxSeqLength = outputShape.d[0];
-    SizeType const beamWidth = outputShape.d[2];
+    SizeType32 const maxSeqLength = outputShape.d[0];
+    SizeType32 const beamWidth = outputShape.d[2];
 
     TLLM_CHECK_WITH_INFO(batchSize == outputShape.d[1],
         common::fmtstr("Output ids batch size (" FMT_DIM ") does not match inputOffsets batch size (%d)",
@@ -643,27 +645,27 @@ void invokeCopyPackedInputToOutputTransposed(ITensor& outputIds, ITensor const& 
     dim3 const blockSize(256, 1);
     dim3 const gridSize((maxInputLength + blockSize.x - 1) / blockSize.x, batchSize);
 
-    copyPackedInputToOutputTransposed<<<gridSize, blockSize, 0, stream.get()>>>(bufferCast<SizeType>(outputIds),
-        bufferCast<SizeType const>(inputIds), bufferCast<SizeType const>(inputOffsets), padId, batchSize, beamWidth,
-        maxInputLength);
+    copyPackedInputToOutputTransposed<<<gridSize, blockSize, 0, stream.get()>>>(bufferCast<TokenIdType>(outputIds),
+        bufferCast<TokenIdType const>(inputIds), bufferCast<SizeType32 const>(inputOffsets), padId, batchSize,
+        beamWidth, maxInputLength);
 }
 
 namespace
 {
-__global__ void copyInputToOutput(SizeType* outputIds, SizeType const* inputIds, SizeType const* inputLengths,
-    SizeType const padId, SizeType const batchSize, SizeType const beamWidth, SizeType const maxInputLength,
-    SizeType const maxSeqLength)
+__global__ void copyInputToOutput(TokenIdType* outputIds, TokenIdType const* inputIds, SizeType32 const* inputLengths,
+    TokenIdType const padId, SizeType32 const batchSize, SizeType32 const beamWidth, SizeType32 const maxInputLength,
+    SizeType32 const maxSeqLength)
 {
-    SizeType const tidx = blockIdx.x * blockDim.x + threadIdx.x;
-    SizeType const tidy = blockIdx.y * blockDim.y + threadIdx.y;
+    SizeType32 const tidx = blockIdx.x * blockDim.x + threadIdx.x;
+    SizeType32 const tidy = blockIdx.y * blockDim.y + threadIdx.y;
 
-    for (SizeType batchIdx = tidy; batchIdx < batchSize; batchIdx += blockDim.y * gridDim.y)
+    for (SizeType32 batchIdx = tidy; batchIdx < batchSize; batchIdx += blockDim.y * gridDim.y)
     {
         auto const inputLength = inputLengths[batchIdx];
-        for (SizeType tokenIdx = tidx; tokenIdx < maxInputLength; tokenIdx += blockDim.x * gridDim.x)
+        for (SizeType32 tokenIdx = tidx; tokenIdx < maxInputLength; tokenIdx += blockDim.x * gridDim.x)
         {
             auto const value = (tokenIdx < inputLength) ? inputIds[batchIdx * maxInputLength + tokenIdx] : padId;
-            for (SizeType beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
+            for (SizeType32 beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
             {
                 auto const outputIdx = tc::flat_index3(batchIdx, beamIdx, tokenIdx, beamWidth, maxSeqLength);
                 outputIds[outputIdx] = value;
@@ -674,7 +676,7 @@ __global__ void copyInputToOutput(SizeType* outputIds, SizeType const* inputIds,
 } // namespace
 
 void invokeCopyInputToOutput(ITensor& outputIds, ITensor const& inputIds, ITensor const& inputLengths,
-    SizeType const padId, CudaStream const& stream)
+    TokenIdType const padId, CudaStream const& stream)
 {
     TLLM_CHECK_WITH_INFO(
         inputIds.getDataType() == outputIds.getDataType(), "Input and output have different data types");
@@ -684,10 +686,10 @@ void invokeCopyInputToOutput(ITensor& outputIds, ITensor const& inputIds, ITenso
     TLLM_CHECK_WITH_INFO(
         outputShape.nbDims == 3, common::fmtstr("Output shape must have 3 dimensions, but has %d", outputShape.nbDims));
 
-    auto const batchSize = static_cast<SizeType>(inputLengths.getSize());
-    SizeType const maxInputLength = inputShape.d[inputShape.nbDims - 1];
-    SizeType const beamWidth = outputShape.d[1];
-    SizeType const maxSeqLength = outputShape.d[2];
+    auto const batchSize = static_cast<SizeType32>(inputLengths.getSize());
+    SizeType32 const maxInputLength = inputShape.d[inputShape.nbDims - 1];
+    SizeType32 const beamWidth = outputShape.d[1];
+    SizeType32 const maxSeqLength = outputShape.d[2];
 
     auto const inputBatchSize = inputIds.getSize() / maxInputLength;
     TLLM_CHECK_WITH_INFO(std::size_t(batchSize) == inputBatchSize,
@@ -703,30 +705,30 @@ void invokeCopyInputToOutput(ITensor& outputIds, ITensor const& inputIds, ITenso
     dim3 const blockSize(256, 1);
     dim3 const gridSize((maxInputLength + blockSize.x - 1) / blockSize.x, batchSize);
 
-    copyInputToOutput<<<gridSize, blockSize, 0, stream.get()>>>(bufferCast<SizeType>(outputIds),
-        bufferCast<SizeType const>(inputIds), bufferCast<SizeType const>(inputLengths), padId, batchSize, beamWidth,
-        maxInputLength, maxSeqLength);
+    copyInputToOutput<<<gridSize, blockSize, 0, stream.get()>>>(bufferCast<TokenIdType>(outputIds),
+        bufferCast<TokenIdType const>(inputIds), bufferCast<SizeType32 const>(inputLengths), padId, batchSize,
+        beamWidth, maxInputLength, maxSeqLength);
 }
 
 namespace
 {
-__global__ void copyPackedInputToOutput(SizeType* outputIds, SizeType const* inputIds, SizeType const* inputOffsets,
-    SizeType const padId, SizeType const batchSize, SizeType const beamWidth, SizeType const maxInputLength,
-    SizeType const maxSeqLength)
+__global__ void copyPackedInputToOutput(TokenIdType* outputIds, TokenIdType const* inputIds,
+    SizeType32 const* inputOffsets, TokenIdType const padId, SizeType32 const batchSize, SizeType32 const beamWidth,
+    SizeType32 const maxInputLength, SizeType32 const maxSeqLength)
 {
-    SizeType const tidx = blockIdx.x * blockDim.x + threadIdx.x;
-    SizeType const tidy = blockIdx.y * blockDim.y + threadIdx.y;
+    SizeType32 const tidx = blockIdx.x * blockDim.x + threadIdx.x;
+    SizeType32 const tidy = blockIdx.y * blockDim.y + threadIdx.y;
 
-    for (SizeType batchIdx = tidy; batchIdx < batchSize; batchIdx += blockDim.y * gridDim.y)
+    for (SizeType32 batchIdx = tidy; batchIdx < batchSize; batchIdx += blockDim.y * gridDim.y)
     {
         auto const tokenBegin = inputOffsets[batchIdx];
         auto const tokenEnd = inputOffsets[batchIdx + 1];
         auto const inputLength = tokenEnd - tokenBegin;
 
-        for (SizeType tokenIdx = tidx; tokenIdx < maxInputLength; tokenIdx += blockDim.x * gridDim.x)
+        for (SizeType32 tokenIdx = tidx; tokenIdx < maxInputLength; tokenIdx += blockDim.x * gridDim.x)
         {
             auto const value = (tokenIdx < inputLength) ? inputIds[tokenBegin + tokenIdx] : padId;
-            for (SizeType beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
+            for (SizeType32 beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
             {
                 auto const outputIdx = tc::flat_index3(batchIdx, beamIdx, tokenIdx, beamWidth, maxSeqLength);
                 outputIds[outputIdx] = value;
@@ -737,7 +739,7 @@ __global__ void copyPackedInputToOutput(SizeType* outputIds, SizeType const* inp
 } // namespace
 
 void invokeCopyPackedInputToOutput(ITensor& outputIds, ITensor const& inputIds, ITensor const& inputOffsets,
-    SizeType const maxInputLength, SizeType const padId, CudaStream const& stream)
+    SizeType32 const maxInputLength, TokenIdType const padId, CudaStream const& stream)
 {
     TLLM_CHECK_WITH_INFO(
         inputIds.getDataType() == outputIds.getDataType(), "Input and output have different data types");
@@ -746,9 +748,9 @@ void invokeCopyPackedInputToOutput(ITensor& outputIds, ITensor const& inputIds, 
     TLLM_CHECK_WITH_INFO(
         outputShape.nbDims == 3, common::fmtstr("Output shape must have 3 dimensions, but has %d", outputShape.nbDims));
 
-    auto const batchSize = static_cast<SizeType>(inputOffsets.getSize()) - 1;
-    SizeType const beamWidth = outputShape.d[1];
-    SizeType const maxSeqLength = outputShape.d[2];
+    auto const batchSize = static_cast<SizeType32>(inputOffsets.getSize()) - 1;
+    SizeType32 const beamWidth = outputShape.d[1];
+    SizeType32 const maxSeqLength = outputShape.d[2];
 
     TLLM_CHECK_WITH_INFO(batchSize == outputShape.d[0],
         common::fmtstr("Output ids batch size (" FMT_DIM ") does not match inputOffsets batch size (%d)",
@@ -760,13 +762,13 @@ void invokeCopyPackedInputToOutput(ITensor& outputIds, ITensor const& inputIds, 
     dim3 const blockSize(256, 1);
     dim3 const gridSize((maxInputLength + blockSize.x - 1) / blockSize.x, batchSize);
 
-    copyPackedInputToOutput<<<gridSize, blockSize, 0, stream.get()>>>(bufferCast<SizeType>(outputIds),
-        bufferCast<SizeType const>(inputIds), bufferCast<SizeType const>(inputOffsets), padId, batchSize, beamWidth,
-        maxInputLength, maxSeqLength);
+    copyPackedInputToOutput<<<gridSize, blockSize, 0, stream.get()>>>(bufferCast<TokenIdType>(outputIds),
+        bufferCast<TokenIdType const>(inputIds), bufferCast<SizeType32 const>(inputOffsets), padId, batchSize,
+        beamWidth, maxInputLength, maxSeqLength);
 }
 
 void initOutputIds(ITensor& outputIds, ITensor const& inputIds, ITensor const& inputLengths,
-    ITensor const& inputOffsets, TokenIdType const padId, TokenIdType const endId, SizeType const maxInputLength,
+    ITensor const& inputOffsets, TokenIdType const padId, TokenIdType const endId, SizeType32 const maxInputLength,
     bool const inputPacked, CudaStream const& stream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -886,7 +888,7 @@ __global__ void tileTensorInPlace(
 } // namespace
 
 template <typename T>
-void invokeScatterTensor(ITensor& output, ITensor const& input, SizeType beamWidth, CudaStream const& stream)
+void invokeScatterTensor(ITensor& output, ITensor const& input, SizeType32 beamWidth, CudaStream const& stream)
 {
     auto const& inputShape = input.getShape();
     auto const nbInputRows = static_cast<std::uint32_t>(inputShape.d[0]);
@@ -909,11 +911,11 @@ void invokeScatterTensor(ITensor& output, ITensor const& input, SizeType beamWid
         nbInputRows, inputRowSize, outputRowSize, static_cast<uint32_t>(beamWidth));
 }
 
-void scatterTensor(ITensor& output, ITensor const& input, SizeType beamWidth, CudaStream const& stream)
+void scatterTensor(ITensor& output, ITensor const& input, SizeType32 beamWidth, CudaStream const& stream)
 {
     switch (input.getDataType())
     {
-    case nvinfer1::DataType::kINT32: invokeScatterTensor<SizeType>(output, input, beamWidth, stream); break;
+    case nvinfer1::DataType::kINT32: invokeScatterTensor<SizeType32>(output, input, beamWidth, stream); break;
     case nvinfer1::DataType::kFLOAT: invokeScatterTensor<float>(output, input, beamWidth, stream); break;
     case nvinfer1::DataType::kHALF: invokeScatterTensor<half>(output, input, beamWidth, stream); break;
     case nvinfer1::DataType::kINT8: invokeScatterTensor<int8_t>(output, input, beamWidth, stream); break;
@@ -925,7 +927,7 @@ void scatterTensor(ITensor& output, ITensor const& input, SizeType beamWidth, Cu
 }
 
 template <typename T>
-void invokeSplitTransposed(ITensor& output, ITensor const& input, SizeType split, CudaStream const& stream)
+void invokeSplitTransposed(ITensor& output, ITensor const& input, SizeType32 split, CudaStream const& stream)
 {
     auto const& inputShape = input.getShape();
     auto const nbInputRows = static_cast<std::uint32_t>(inputShape.d[0]);
@@ -950,11 +952,11 @@ void invokeSplitTransposed(ITensor& output, ITensor const& input, SizeType split
         bufferCast<T>(output), bufferCast<T const>(input), nbInputRows, inputRowSize, static_cast<uint32_t>(split));
 }
 
-void splitTransposed(ITensor& output, ITensor const& input, SizeType split, CudaStream const& stream)
+void splitTransposed(ITensor& output, ITensor const& input, SizeType32 split, CudaStream const& stream)
 {
     switch (input.getDataType())
     {
-    case nvinfer1::DataType::kINT32: invokeSplitTransposed<SizeType>(output, input, split, stream); break;
+    case nvinfer1::DataType::kINT32: invokeSplitTransposed<SizeType32>(output, input, split, stream); break;
     case nvinfer1::DataType::kFLOAT: invokeSplitTransposed<float>(output, input, split, stream); break;
     case nvinfer1::DataType::kHALF: invokeSplitTransposed<half>(output, input, split, stream); break;
     case nvinfer1::DataType::kINT8: invokeSplitTransposed<int8_t>(output, input, split, stream); break;
@@ -969,7 +971,7 @@ void splitTransposed(ITensor& output, ITensor const& input, SizeType split, Cuda
 }
 
 template <typename T>
-void invokeTileTensor(ITensor& output, ITensor const& input, SizeType const beamWidth, CudaStream const& stream)
+void invokeTileTensor(ITensor& output, ITensor const& input, SizeType32 const beamWidth, CudaStream const& stream)
 {
     auto const& inputShape = input.getShape();
     auto const nbInputRows = static_cast<std::uint32_t>(inputShape.d[0]);
@@ -992,11 +994,11 @@ void invokeTileTensor(ITensor& output, ITensor const& input, SizeType const beam
         inputRowSize, outputRowSize, static_cast<uint32_t>(beamWidth));
 }
 
-void tileTensor(ITensor& output, ITensor const& input, SizeType beamWidth, CudaStream const& stream)
+void tileTensor(ITensor& output, ITensor const& input, SizeType32 beamWidth, CudaStream const& stream)
 {
     switch (input.getDataType())
     {
-    case nvinfer1::DataType::kINT32: invokeTileTensor<SizeType>(output, input, beamWidth, stream); break;
+    case nvinfer1::DataType::kINT32: invokeTileTensor<SizeType32>(output, input, beamWidth, stream); break;
     case nvinfer1::DataType::kFLOAT: invokeTileTensor<float>(output, input, beamWidth, stream); break;
     case nvinfer1::DataType::kHALF: invokeTileTensor<half>(output, input, beamWidth, stream); break;
 #ifdef ENABLE_BF16
@@ -1011,7 +1013,7 @@ void tileTensor(ITensor& output, ITensor const& input, SizeType beamWidth, CudaS
 }
 
 template <typename T>
-void invokeTileTensorInPlace(ITensor& inputOutput, SizeType const beamWidth, CudaStream const& stream)
+void invokeTileTensorInPlace(ITensor& inputOutput, SizeType32 const beamWidth, CudaStream const& stream)
 {
     auto const& inputOutputShape = inputOutput.getShape();
     auto const nbOutputRows = static_cast<std::uint32_t>(inputOutputShape.d[0]);
@@ -1026,11 +1028,11 @@ void invokeTileTensorInPlace(ITensor& inputOutput, SizeType const beamWidth, Cud
         bufferCast<T>(inputOutput), nbInputRows, inputOutputRowSize, static_cast<std::uint32_t>(beamWidth));
 }
 
-void tileTensorInplace(ITensor& tensor, SizeType beamWidth, CudaStream const& stream)
+void tileTensorInplace(ITensor& tensor, SizeType32 beamWidth, CudaStream const& stream)
 {
     switch (tensor.getDataType())
     {
-    case nvinfer1::DataType::kINT32: invokeTileTensorInPlace<SizeType>(tensor, beamWidth, stream); break;
+    case nvinfer1::DataType::kINT32: invokeTileTensorInPlace<SizeType32>(tensor, beamWidth, stream); break;
     case nvinfer1::DataType::kFLOAT: invokeTileTensorInPlace<float>(tensor, beamWidth, stream); break;
     case nvinfer1::DataType::kHALF: invokeTileTensorInPlace<half>(tensor, beamWidth, stream); break;
     case nvinfer1::DataType::kINT8: invokeTileTensorInPlace<int8_t>(tensor, beamWidth, stream); break;
@@ -1159,7 +1161,7 @@ __global__ void mergeLogitsFragmentsKernel(T* output, T** fragmentsVector, int c
 template <typename T>
 void invokeMergeLogitsFragments(BufferManager const& bufferManager, ITensor& output,
     std::vector<TensorPtr> fragmentsVector, ITensor& cachePointerDevice, ITensor& cachePointerHost,
-    SizeType firstBatchSlotIdx, SizeType const microBatchSize, SizeType const beamWidth, CudaStream const& stream,
+    SizeType32 firstBatchSlotIdx, SizeType32 const microBatchSize, SizeType32 const beamWidth, CudaStream const& stream,
     int stepOffset)
 {
     size_t fragmentsVectorSize = fragmentsVector.size();
@@ -1176,8 +1178,8 @@ void invokeMergeLogitsFragments(BufferManager const& bufferManager, ITensor& out
     dim3 gridSize{(unsigned int) (microBatchSize * beamWidth), (unsigned int) (fragmentsVectorSize)};
 
     auto const& outputShape = output.getShape();
-    auto const vocabSizePadded = static_cast<SizeType>(outputShape.d[outputShape.nbDims - 1]);
-    auto const outputLen = static_cast<SizeType>(outputShape.d[outputShape.nbDims - 2]);
+    auto const vocabSizePadded = static_cast<SizeType32>(outputShape.d[outputShape.nbDims - 1]);
+    auto const outputLen = static_cast<SizeType32>(outputShape.d[outputShape.nbDims - 2]);
 
     TLLM_CHECK_WITH_INFO(outputLen >= fragmentsVectorSize, "Fragments size does not match outputLen size");
 
@@ -1187,8 +1189,8 @@ void invokeMergeLogitsFragments(BufferManager const& bufferManager, ITensor& out
 }
 
 void mergeLogitsFragments(BufferManager const& bufferManager, ITensor& output, std::vector<TensorPtr> fragmentsVector,
-    ITensor& cachePointerDevice, ITensor& cachePointerHost, SizeType firstBatchSlotIdx, SizeType const microBatchSize,
-    SizeType const beamWidth, CudaStream const& stream, int stepOffset)
+    ITensor& cachePointerDevice, ITensor& cachePointerHost, SizeType32 firstBatchSlotIdx,
+    SizeType32 const microBatchSize, SizeType32 const beamWidth, CudaStream const& stream, int stepOffset)
 {
     switch (output.getDataType())
     {
@@ -1218,16 +1220,16 @@ void mergeLogitsFragments(BufferManager const& bufferManager, ITensor& output, s
 
 void invokeUpdateKVBlockArrayDraftTokenLocation(ITensor const& seqAcceptedDraftTokenOffsets,
     ITensor const& packedAcceptedDraftTokensIndices, ITensor const& pastKeyValueLengths, void* const* pointerArray,
-    ::tensorrt_llm::kernels::KVCacheIndex const* offsetArray, SizeType layerCount, SizeType seqCount,
-    SizeType numKVHeads, SizeType sizeInBytesPerKVHead, SizeType rewindDraftTokenCommonCount,
-    int* rewindDraftTokenSeparateAdjustments, ITensor const& seqSlotRemapping, SizeType maxKVCacheLen,
-    SizeType maxBlocksPerSeq, SizeType tokensPerBlock, cudaStream_t stream)
+    ::tensorrt_llm::kernels::KVCacheIndex const* offsetArray, SizeType32 layerCount, SizeType32 seqCount,
+    SizeType32 numKVHeads, SizeType32 sizeInBytesPerKVHead, SizeType32 rewindDraftTokenCommonCount,
+    int* rewindDraftTokenSeparateAdjustments, ITensor const& seqSlotRemapping, SizeType32 maxKVCacheLen,
+    SizeType32 maxBlocksPerSeq, SizeType32 tokensPerBlock, cudaStream_t stream)
 {
     tensorrt_llm::kernels::parallel_decoding::updateKVBlockArrayDraftTokenLocation(
-        bufferCast<SizeType>(seqAcceptedDraftTokenOffsets), bufferCast<SizeType>(packedAcceptedDraftTokensIndices),
-        bufferCast<SizeType>(pastKeyValueLengths), pointerArray, offsetArray, layerCount, seqCount, numKVHeads,
+        bufferCast<SizeType32>(seqAcceptedDraftTokenOffsets), bufferCast<SizeType32>(packedAcceptedDraftTokensIndices),
+        bufferCast<SizeType32>(pastKeyValueLengths), pointerArray, offsetArray, layerCount, seqCount, numKVHeads,
         sizeInBytesPerKVHead, rewindDraftTokenCommonCount, rewindDraftTokenSeparateAdjustments,
-        bufferCast<SizeType>(seqSlotRemapping), maxKVCacheLen, maxBlocksPerSeq, tokensPerBlock, stream);
+        bufferCast<SizeType32>(seqSlotRemapping), maxKVCacheLen, maxBlocksPerSeq, tokensPerBlock, stream);
 }
 
 } // namespace tensorrt_llm::runtime::kernels

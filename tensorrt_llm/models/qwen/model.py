@@ -15,6 +15,8 @@
 
 from typing import Optional
 
+from tensorrt_llm.lora_manager import LoraConfig, use_lora
+
 from ..._utils import pad_vocab_size
 from ...functional import Tensor, recv, send
 from ...layers import (Attention, AttentionMaskType, ColumnLinear, Embedding,
@@ -79,6 +81,7 @@ class QWenDecoderLayer(Module):
         use_cache=False,
         kv_cache_params=None,
         attention_params=None,
+        lora_layer_params=None,
     ):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -88,6 +91,7 @@ class QWenDecoderLayer(Module):
             use_cache=use_cache,
             kv_cache_params=kv_cache_params,
             attention_params=attention_params,
+            lora_layer_params=lora_layer_params,
         )
         if use_cache:
             attention_output, presents = attention_output
@@ -98,7 +102,8 @@ class QWenDecoderLayer(Module):
 
         hidden_states = self.post_layernorm(hidden_states)
 
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states,
+                                 lora_layer_params=lora_layer_params)
 
         hidden_states = residual + hidden_states
         if use_cache:
@@ -133,7 +138,8 @@ class QWenModel(Module):
                 hidden_states=None,
                 prompt_embedding_table: Optional[Tensor] = None,
                 prompt_tasks: Optional[Tensor] = None,
-                prompt_vocab_size: Optional[Tensor] = None):
+                prompt_vocab_size: Optional[Tensor] = None,
+                lora_params=None):
 
         ptuning_args = [
             prompt_embedding_table, prompt_tasks, prompt_vocab_size
@@ -148,7 +154,8 @@ class QWenModel(Module):
                                             use_cache=use_cache,
                                             attention_mask=attention_mask,
                                             kv_cache_params=kv_cache_params,
-                                            attention_params=attention_params)
+                                            attention_params=attention_params,
+                                            lora_params=lora_params)
 
         if use_cache:
             hidden_states, presents = hidden_states
@@ -183,8 +190,18 @@ class QWenForCausalLM(DecoderModelForCausalLM):
             lm_head = None
         self.quant_mode = config.quant_mode
         self.mapping = config.mapping
+        self.trtllm_modules_to_hf_modules = {
+            "attn_qkv": "c_attn",
+            "attn_dense": "attn.c_proj",
+            "mlp_h_to_4h": "w2",
+            "mlp_4h_to_h": "mlp.c_proj",
+            "mlp_gate": "w1",
+        }
         super().__init__(config, transformer, lm_head)
 
     def check_config(self, config):
         config.set_if_not_exist('rotary_base', 10000.0)
         config.set_if_not_exist('rotary_scaling', None)
+
+    def use_lora(self, lora_config: LoraConfig):
+        use_lora(self, lora_config, self.trtllm_modules_to_hf_modules)

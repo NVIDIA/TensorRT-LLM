@@ -179,6 +179,10 @@ def build_engines(model_cache: Optional[str] = None, world_size: int = 1):
         str(engine_dir / 'fp16-plugin-packed-paged-draft-tokens' / tp_pp_dir),
         '--max_draft_len=5',
         '--speculative_decoding_mode=draft_tokens_external', *ifb_args)
+    build_engine(
+        str(fp16_ckpt_dir),
+        str(engine_dir / 'fp16-plugin-packed-paged-nprofiles' / tp_pp_dir),
+        '--multiple_profiles=enable', *ifb_args)
     build_engine(str(fp16_ckpt_dir),
                  str(engine_dir / 'fp16-plugin-packed-paged-in128' / tp_pp_dir),
                  *ifb_args,
@@ -202,13 +206,6 @@ def build_engines(model_cache: Optional[str] = None, world_size: int = 1):
         str(fp16_ckpt_dir),
         str(engine_dir / 'fp16-plugin-packed-paged-gather' / tp_pp_dir),
         '--gather_all_token_logits', *ifb_args)
-    # '--use_context_fmha_for_generation', *ifb_args) # Commented out because of `--use_context_fmha_for_generation` has bugs now: https://nvbugspro.nvidia.com/bug/4476681
-    build_engine(
-        str(fp16_ckpt_dir),
-        str(engine_dir / 'fp16-plugin-packed-paged-context-fmha-for-gen' /
-            tp_pp_dir), '--use_context_fmha_for_generation=enable',
-        '--max_draft_len=5',
-        '--speculative_decoding_mode=draft_tokens_external', *ifb_args)
 
     # build engine with lora enabled
     build_engine(str(fp16_ckpt_dir),

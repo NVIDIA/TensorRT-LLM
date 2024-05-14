@@ -14,83 +14,63 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/runtime/ssmStateBuffers.h"
+#include "tensorrt_llm/runtime/rnnStateBuffers.h"
 #include "tensorrt_llm/runtime/runtimeBuffers.h"
 #include "tensorrt_llm/runtime/utils/sessionUtils.h"
 
 using namespace tensorrt_llm::runtime;
 namespace tc = tensorrt_llm::common;
 
-SsmStateBuffers::SsmStateBuffers()
+RnnStateBuffers::RnnStateBuffers()
 {
-    mambaSsmStates = nullptr;
-    mambaConvStates = nullptr;
-    mambaConvStatesAlt = nullptr;
+    rnnStates = nullptr;
+    convStates = nullptr;
+    convStatesAlt = nullptr;
     slotMappingHost = nullptr;
     slotMappingDevice = nullptr;
-    mambaSsmStatePtrs = nullptr;
-    mambaConvStatePtrs = nullptr;
+    rnnStatePtrs = nullptr;
+    convStatePtrs = nullptr;
 }
 
-SsmStateBuffers::SsmStateBuffers(
+RnnStateBuffers::RnnStateBuffers(
     TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
-    TLLM_CHECK(modelConfig.isSsmBased());
-    // TODO: support RecurrentGemma: the code mostly works but returns incorrect tokens in the generation phase
-    TLLM_CHECK_WITH_INFO(modelConfig.hasMambaConfig(), "SSM only support Mamba for now.");
+    TLLM_CHECK(modelConfig.isRnnBased());
+    TLLM_CHECK_WITH_INFO(modelConfig.hasRnnConfig(), "RNN only support Mamba now.");
     auto maxBatchSize = modelConfig.getMaxBatchSize();
     auto maxBeamWidth = modelConfig.getMaxBeamWidth();
     auto maxBatchBeam = maxBatchSize * maxBeamWidth;
     auto rnnConfig = modelConfig.getRnnConfig();
-    mIsRecurrentGemma = rnnConfig.has_value();
-
-    if (mIsRecurrentGemma)
-    {
-        mDConv = rnnConfig->dConv;
-        mDInner = rnnConfig->hiddenSize;
-    }
-    else
-    {
-        auto mambaConfig = modelConfig.getMambaConfig();
-        mDConv = mambaConfig->dConv;
-        mDState = mambaConfig->dState;
-        auto expand = mambaConfig->expand;
-        auto hiddenSize = modelConfig.getHiddenSize();
-        mDInner = expand * hiddenSize;
-    }
-
+    TLLM_CHECK_WITH_INFO(rnnConfig.has_value(), "RnnStateBuffers should be used with rnnConfig.");
+    mConvKernel = rnnConfig->convKernel;
+    mStateSize = rnnConfig->stateSize;
+    mRnnHiddenSize = rnnConfig->rnnHiddenSize;
     auto dType = modelConfig.getDataType();
-    auto const localNbLayers = modelConfig.getNbSsmLayers(worldConfig.getPipelineParallelism());
+    auto const localNbLayers = modelConfig.getNbRnnLayers(worldConfig.getPipelineParallelism());
     mLocalNbLayers = localNbLayers;
     mMaxBeamWidth = maxBeamWidth;
     mUseMambaConv1dPlugin = modelConfig.useMambaConv1dPlugin();
-    auto const ssmStatesShape = [&]()
-    {
-        if (mIsRecurrentGemma)
-        {
-            return ITensor::makeShape({localNbLayers * maxBatchBeam, mDInner});
-        }
-        else
-        {
-            return ITensor::makeShape({localNbLayers * maxBatchBeam, mDState, mDInner});
-        }
-    }();
+    auto rnnStatesShape = ITensor::makeShape({localNbLayers * maxBatchBeam, mStateSize, mRnnHiddenSize});
     auto const convStatesShape = [&]()
     {
         if (mUseMambaConv1dPlugin)
         {
-            return ITensor::makeShape({localNbLayers * maxBatchBeam, mDConv - 1, mDInner});
+            return tensorrt_llm::runtime::ITensor::makeShape(
+                {localNbLayers * maxBatchBeam, mConvKernel - 1, mRnnHiddenSize});
         }
         else
         {
-            return ITensor::makeShape({localNbLayers * maxBatchBeam, mDInner, mDConv - 1});
+            return tensorrt_llm::runtime::ITensor::makeShape(
+                {localNbLayers * maxBatchBeam, mRnnHiddenSize, mConvKernel - 1});
         }
     }();
     auto& bufferManager = runtime.getBufferManager();
-    mambaSsmStates = bufferManager.gpu(ssmStatesShape, dType);
-    mambaConvStates = bufferManager.gpu(convStatesShape, dType);
-    mambaConvStatesAlt = bufferManager.gpu(convStatesShape, dType);
+    auto const isRecurrentGemma = modelConfig.getModelVariant() == ModelConfig::ModelVariant::kRecurrentGemma;
+    auto stateDType = isRecurrentGemma ? nvinfer1::DataType::kFLOAT : dType;
+    rnnStates = bufferManager.gpu(rnnStatesShape, stateDType);
+    convStates = bufferManager.gpu(convStatesShape, dType);
+    convStatesAlt = bufferManager.gpu(convStatesShape, dType);
 
     if (modelConfig.usePagedState())
     {
@@ -98,65 +78,57 @@ SsmStateBuffers::SsmStateBuffers(
         auto statePtrsShape = ITensor::makeShape({localNbLayers});
         slotMappingDevice = bufferManager.gpu(slotMappingShape, nvinfer1::DataType::kINT32);
         slotMappingHost = BufferManager::cpu(slotMappingShape, nvinfer1::DataType::kINT32);
-        mambaSsmStatePtrs = BufferManager::cpu(statePtrsShape, nvinfer1::DataType::kINT64);
-        mambaConvStatePtrs = BufferManager::cpu(statePtrsShape, nvinfer1::DataType::kINT64);
+        rnnStatePtrs = BufferManager::cpu(statePtrsShape, nvinfer1::DataType::kINT64);
+        convStatePtrs = BufferManager::cpu(statePtrsShape, nvinfer1::DataType::kINT64);
     }
     else
     {
         slotMappingHost = nullptr;
         slotMappingDevice = nullptr;
-        mambaSsmStatePtrs = nullptr;
-        mambaConvStatePtrs = nullptr;
+        rnnStatePtrs = nullptr;
+        convStatePtrs = nullptr;
     }
 
     reshape(maxBatchSize);
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
-void SsmStateBuffers::reshape(SizeType batchSize)
+void RnnStateBuffers::reshape(SizeType32 batchSize)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
-    auto const ssmStatesShape = [&]()
-    {
-        if (mIsRecurrentGemma)
-        {
-            return ITensor::makeShape({mLocalNbLayers * batchSize * mMaxBeamWidth, mDInner});
-        }
-        else
-        {
-            return ITensor::makeShape({mLocalNbLayers * batchSize * mMaxBeamWidth, mDState, mDInner});
-        }
-    }();
+    auto rnnStatesShape = ITensor::makeShape({mLocalNbLayers * batchSize * mMaxBeamWidth, mStateSize, mRnnHiddenSize});
     auto const convStatesShape = [&]()
     {
         if (mUseMambaConv1dPlugin)
         {
-            return ITensor::makeShape({mLocalNbLayers * batchSize * mMaxBeamWidth, mDConv - 1, mDInner});
+            return tensorrt_llm::runtime::ITensor::makeShape(
+                {mLocalNbLayers * batchSize * mMaxBeamWidth, mConvKernel - 1, mRnnHiddenSize});
         }
         else
         {
-            return ITensor::makeShape({mLocalNbLayers * batchSize * mMaxBeamWidth, mDInner, mDConv - 1});
+            return tensorrt_llm::runtime::ITensor::makeShape(
+                {mLocalNbLayers * batchSize * mMaxBeamWidth, mRnnHiddenSize, mConvKernel - 1});
         }
     }();
-    mambaSsmStates->reshape(ssmStatesShape);
-    mambaConvStates->reshape(convStatesShape);
-    mambaConvStatesAlt->reshape(convStatesShape);
+    rnnStates->reshape(rnnStatesShape);
+    convStates->reshape(convStatesShape);
+    convStatesAlt->reshape(convStatesShape);
 
-    mambaSsmState.resize(mLocalNbLayers);
-    mambaConvState.resize(mLocalNbLayers);
-    mambaConvStateAlt.resize(mLocalNbLayers);
+    rnnState.resize(mLocalNbLayers);
+    convState.resize(mLocalNbLayers);
+    convStateAlt.resize(mLocalNbLayers);
     for (int i = 0; i < mLocalNbLayers; i++)
     {
         size_t offset = batchSize * mMaxBeamWidth * i;
-        mambaSsmState[i] = ITensor::slice(mambaSsmStates, offset, batchSize * mMaxBeamWidth);
-        mambaConvState[i] = ITensor::slice(mambaConvStates, offset, batchSize * mMaxBeamWidth);
-        mambaConvStateAlt[i] = ITensor::slice(mambaConvStatesAlt, offset, batchSize * mMaxBeamWidth);
+        rnnState[i] = tensorrt_llm::runtime::ITensor::slice(rnnStates, offset, batchSize * mMaxBeamWidth);
+        convState[i] = tensorrt_llm::runtime::ITensor::slice(convStates, offset, batchSize * mMaxBeamWidth);
+        convStateAlt[i] = tensorrt_llm::runtime::ITensor::slice(convStatesAlt, offset, batchSize * mMaxBeamWidth);
     }
     if (slotMappingDevice != nullptr)
     {
         TLLM_CHECK(slotMappingHost != nullptr);
-        TLLM_CHECK(mambaSsmStates != nullptr && mambaConvStates != nullptr);
-        TLLM_CHECK(mambaSsmStatePtrs != nullptr && mambaConvStatePtrs != nullptr);
+        TLLM_CHECK(rnnStates != nullptr && convStates != nullptr);
+        TLLM_CHECK(rnnStatePtrs != nullptr && convStatePtrs != nullptr);
 
         auto slotMappingShape = ITensor::makeShape({batchSize});
         slotMappingDevice->reshape(slotMappingShape);
@@ -172,28 +144,28 @@ void SsmStateBuffers::reshape(SizeType batchSize)
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
-void SsmStateBuffers::fillStatePtrs()
+void RnnStateBuffers::fillStatePtrs()
 {
     auto statePtrsShape = ITensor::makeShape({mLocalNbLayers});
-    mambaSsmStatePtrs->reshape(statePtrsShape);
-    mambaConvStatePtrs->reshape(statePtrsShape);
+    rnnStatePtrs->reshape(statePtrsShape);
+    convStatePtrs->reshape(statePtrsShape);
 
-    mambaSsmStatePtr.resize(mLocalNbLayers);
-    mambaConvStatePtr.resize(mLocalNbLayers);
+    rnnStatePtr.resize(mLocalNbLayers);
+    convStatePtr.resize(mLocalNbLayers);
 
-    void** mambaSsmStatePtrArray = static_cast<void**>(mambaSsmStatePtrs->data());
-    void** mambaConvStatePtrArray = static_cast<void**>(mambaConvStatePtrs->data());
+    void** rnnStatePtrArray = static_cast<void**>(rnnStatePtrs->data());
+    void** convStatePtrArray = static_cast<void**>(convStatePtrs->data());
 
     for (int i = 0; i < mLocalNbLayers; i++)
     {
-        mambaSsmStatePtrArray[i] = mambaSsmState[i]->data();
-        mambaConvStatePtrArray[i] = mambaConvState[i]->data();
-        mambaSsmStatePtr[i] = ITensor::slice(mambaSsmStatePtrs, i, 1);
-        mambaConvStatePtr[i] = ITensor::slice(mambaConvStatePtrs, i, 1);
+        rnnStatePtrArray[i] = rnnState[i]->data();
+        convStatePtrArray[i] = convState[i]->data();
+        rnnStatePtr[i] = tensorrt_llm::runtime::ITensor::slice(rnnStatePtrs, i, 1);
+        convStatePtr[i] = tensorrt_llm::runtime::ITensor::slice(convStatePtrs, i, 1);
     }
 }
 
-void SsmStateBuffers::reshape(
+void RnnStateBuffers::reshape(
     GenerationConfig const& generationConfig, ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     auto const batchSize = generationConfig.batchSize;
@@ -201,27 +173,27 @@ void SsmStateBuffers::reshape(
     reshape(batchSize);
 }
 
-void SsmStateBuffers::reset(BufferManager& manager)
+void RnnStateBuffers::reset(BufferManager& manager)
 {
     // This is not need in Plugin path, but may be needed for OOTB path.
-    manager.setZero(*mambaSsmStates);
-    manager.setZero(*mambaConvStates);
-    manager.setZero(*mambaConvStatesAlt);
+    manager.setZero(*rnnStates);
+    manager.setZero(*convStates);
+    manager.setZero(*convStatesAlt);
 }
 
-SsmStateBuffers SsmStateBuffers::sliceTo(SizeType offset, SizeType size)
+RnnStateBuffers RnnStateBuffers::sliceTo(SizeType32 offset, SizeType32 size)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
-    SsmStateBuffers buffers;
-    buffers.mambaSsmState = utils::sliceBufferVector(mambaSsmState, offset, size);
-    buffers.mambaConvState = utils::sliceBufferVector(mambaConvState, offset, size);
-    buffers.mambaConvStateAlt = utils::sliceBufferVector(mambaConvStateAlt, offset, size);
+    RnnStateBuffers buffers;
+    buffers.rnnState = utils::sliceBufferVector(rnnState, offset, size);
+    buffers.convState = utils::sliceBufferVector(convState, offset, size);
+    buffers.convStateAlt = utils::sliceBufferVector(convStateAlt, offset, size);
 
     if (slotMappingDevice != nullptr)
     {
         TLLM_CHECK(slotMappingHost != nullptr);
-        TLLM_CHECK(mambaSsmStates != nullptr && mambaConvStates != nullptr);
-        TLLM_CHECK(mambaSsmStatePtrs != nullptr && mambaConvStatePtrs != nullptr);
+        TLLM_CHECK(rnnStates != nullptr && convStates != nullptr);
+        TLLM_CHECK(rnnStatePtrs != nullptr && convStatePtrs != nullptr);
         buffers.slotMappingHost = ITensor::slice(slotMappingHost, offset, size);
         buffers.slotMappingDevice = ITensor::slice(slotMappingHost, offset, size);
         int* slotMapping = static_cast<int*>(buffers.slotMappingHost->data());
@@ -235,16 +207,16 @@ SsmStateBuffers SsmStateBuffers::sliceTo(SizeType offset, SizeType size)
     return buffers;
 }
 
-void SsmStateBuffers::prepareContextStep(RuntimeBuffers* runtimeBuffers, BufferManager& manager)
+void RnnStateBuffers::prepareContextStep(RuntimeBuffers* runtimeBuffers, BufferManager& manager)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
-    SizeType const batchSize = runtimeBuffers->generationConfig.batchSize;
+    SizeType32 const batchSize = runtimeBuffers->generationConfig.batchSize;
     auto& requestTypes = runtimeBuffers->requestTypes;
     auto RequestTypesPtr = bufferCast<int32_t>(*requestTypes);
     TLLM_CHECK(requestTypes->getSize() == static_cast<std::size_t>(batchSize));
     std::fill_n(RequestTypesPtr, batchSize, 0);
 
-    manager.setZero(*mambaConvStates);
+    manager.setZero(*convStates);
     if (slotMappingDevice != nullptr)
     {
         manager.copy(*slotMappingHost, *slotMappingDevice);
@@ -252,7 +224,7 @@ void SsmStateBuffers::prepareContextStep(RuntimeBuffers* runtimeBuffers, BufferM
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
-void SsmStateBuffers::tile(RuntimeBuffers* runtimeBuffers, BufferManager& manager, ModelConfig const& modelConfig,
+void RnnStateBuffers::tile(RuntimeBuffers* runtimeBuffers, BufferManager& manager, ModelConfig const& modelConfig,
     WorldConfig const& worldConfig)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
@@ -280,7 +252,7 @@ void SsmStateBuffers::tile(RuntimeBuffers* runtimeBuffers, BufferManager& manage
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
-void SsmStateBuffers::postContextStep(RuntimeBuffers* runtimeBuffers, std::vector<RuntimeBuffers> const& contextBuffers,
+void RnnStateBuffers::postContextStep(RuntimeBuffers* runtimeBuffers, std::vector<RuntimeBuffers> const& contextBuffers,
     BufferManager& manager, ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
@@ -312,8 +284,8 @@ void SsmStateBuffers::postContextStep(RuntimeBuffers* runtimeBuffers, std::vecto
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
-void SsmStateBuffers::getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers, TensorMap& inputBuffers,
-    TensorMap& outputBuffers, SizeType const step, TensorPtr const& inputIds, ModelConfig const& modelConfig,
+void RnnStateBuffers::getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers, TensorMap& inputBuffers,
+    TensorMap& outputBuffers, SizeType32 const step, TensorPtr const& inputIds, ModelConfig const& modelConfig,
     WorldConfig const& worldConfig) const
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
@@ -343,30 +315,27 @@ void SsmStateBuffers::getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers, Te
 
     inputBuffers.insert_or_assign("last_token_ids", lastTokenIds);
 
-    auto const localNbLayers = modelConfig.getNbSsmLayers(worldConfig.getPipelineParallelism());
+    auto const localNbLayers = modelConfig.getNbRnnLayers(worldConfig.getPipelineParallelism());
     auto const firstLayerId = worldConfig.getPipelineParallelRank() * localNbLayers;
     auto const& layerTypes = modelConfig.getLayerTypes();
 
     if (modelConfig.usePagedState())
     {
-        auto const* const ssmStatePtrName = mIsRecurrentGemma ? "rnn_state_ptr_" : "ssm_state_ptr_";
         inputBuffers.insert_or_assign("slot_mapping", slotMappingDevice);
-        utils::insertTensorVector(inputBuffers, "conv_state_ptr_", mambaConvStatePtr, firstLayerId, layerTypes,
+        utils::insertTensorVector(inputBuffers, "conv_state_ptr_", convStatePtr, firstLayerId, layerTypes,
             ModelConfig::LayerType::kRECURRENT);
-        utils::insertTensorVector(inputBuffers, ssmStatePtrName, mambaSsmStatePtr, firstLayerId, layerTypes,
-            ModelConfig::LayerType::kRECURRENT);
+        utils::insertTensorVector(
+            inputBuffers, "rnn_state_ptr_", rnnStatePtr, firstLayerId, layerTypes, ModelConfig::LayerType::kRECURRENT);
     }
     else
     {
-        auto const* const ssmPastStatePtrName = mIsRecurrentGemma ? "past_rnn_state_" : "past_ssm_state_";
-        auto const* const ssmPresentStatePtrName = mIsRecurrentGemma ? "present_rnn_state_" : "present_ssm_state_";
-        utils::insertTensorVector(inputBuffers, "past_conv_state_", (step % 2) ? mambaConvState : mambaConvStateAlt,
+        utils::insertTensorVector(inputBuffers, "past_conv_state_", (step % 2) ? convState : convStateAlt, firstLayerId,
+            layerTypes, ModelConfig::LayerType::kRECURRENT);
+        utils::insertTensorVector(outputBuffers, "present_conv_state_", (step % 2) ? convStateAlt : convState,
             firstLayerId, layerTypes, ModelConfig::LayerType::kRECURRENT);
-        utils::insertTensorVector(outputBuffers, "present_conv_state_", (step % 2) ? mambaConvStateAlt : mambaConvState,
-            firstLayerId, layerTypes, ModelConfig::LayerType::kRECURRENT);
-        utils::insertTensorVector(inputBuffers, ssmPastStatePtrName, mambaSsmState, firstLayerId, layerTypes,
-            ModelConfig::LayerType::kRECURRENT);
-        utils::insertTensorVector(outputBuffers, ssmPresentStatePtrName, mambaSsmState, firstLayerId, layerTypes,
+        utils::insertTensorVector(
+            inputBuffers, "past_rnn_state_", rnnState, firstLayerId, layerTypes, ModelConfig::LayerType::kRECURRENT);
+        utils::insertTensorVector(outputBuffers, "present_rnn_state_", rnnState, firstLayerId, layerTypes,
             ModelConfig::LayerType::kRECURRENT);
     }
 

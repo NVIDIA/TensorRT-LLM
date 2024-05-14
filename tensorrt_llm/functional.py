@@ -22,7 +22,6 @@ from typing import List, Optional, Sequence, Tuple, Union
 import numpy as np
 
 # isort: off
-import torch
 import tensorrt as trt
 # isort: on
 
@@ -31,8 +30,7 @@ from ._common import default_net, default_trtnet, precision
 from ._utils import (bf16_array, bool_array, dim_resolve_negative,
                      dim_to_trt_axes, dims_array, fp16_array, fp32_array,
                      int32_array, int64_array, np_dtype_to_trt,
-                     preview_trt_version, str_dtype_to_trt, torch_to_numpy,
-                     trt_dtype_to_np, trt_dtype_to_torch)
+                     str_dtype_to_trt, trt_dtype_to_np, trt_gte_10)
 from .network import PluginInfo, set_np_weight, set_plugin_info
 from .plugin import TRT_LLM_PLUGIN_NAMESPACE, current_all_reduce_helper
 from .quantization import QuantMode
@@ -311,9 +309,8 @@ class Tensor(object):
             dtype = self.dtype
         elif isinstance(dtype, str):
             dtype = str_dtype_to_trt(dtype)
-        else:
-            assert isinstance(dtype, trt.DataType)
 
+        assert isinstance(dtype, trt.DataType)
         default_net()._mark_output(self, name, dtype)
 
     def __add__(self, b):
@@ -1000,7 +997,7 @@ def matmul(input: Tensor,
     use_fp32_acc = use_fp32_acc and input.dtype == trt.DataType.HALF and mat2.dtype == trt.DataType.HALF
 
     # TODO: fp32 accum has issues with strongly_typed and it will be fixed in TensorRT 10.0
-    if default_net().strongly_typed and not preview_trt_version():
+    if default_net().strongly_typed and not trt_gte_10():
         use_fp32_acc = False
 
     if use_fp32_acc:
@@ -2580,7 +2577,7 @@ def broadcast_helper(left: Union[Tensor, int, float],
         right = constant_to_tensor_(right)
     else:
         left = constant_to_tensor_(
-            left, right.dtype if isinstance(right, Tensor) else trt.float32)
+            left, right.dtype if isinstance(right, Tensor) else None)
         right = constant_to_tensor_(right, left.dtype)
 
     if left.rank() == right.rank():
@@ -2640,10 +2637,9 @@ def elementwise_binary(left: Union[Tensor, int,
         The tensor produced by this elementwise operation.
     '''
     left, right = broadcast_helper(left, right)
-    if (left.dtype == trt.int32
-            and right.dtype == trt.int64) or (left.dtype == trt.int64
-                                              and right.dtype == trt.int32):
+    if left.dtype == trt.int32 and right.dtype == trt.int64:
         left = cast(left, trt.int64)
+    if left.dtype == trt.int64 and right.dtype == trt.int32:
         right = cast(right, trt.int64)
     layer = default_trtnet().add_elementwise(left.trt_tensor, right.trt_tensor,
                                              op)
@@ -4178,6 +4174,7 @@ def gpt_attention(
     host_context_lengths: Optional[Tensor] = None,  # for pad-free input mode
     qkv_bias: Optional[Tensor] = None,
     use_cache: bool = True,
+    spec_decoding_generation_lengths: Tensor = None,
     spec_decoding_position_offsets: Tensor = None,
     spec_decoding_packed_mask: Tensor = None,
 ) -> Tuple[Tensor, Optional[Tensor]]:
@@ -4363,7 +4360,7 @@ def gpt_attention(
         use_cache: bool = False
             Do we need to store kv cache ? not needed if there is no generation phase.
 
-        medusa_generation_lengths: Tensor = None,
+        spec_decoding_generation_lengths: Tensor = None,
             The generation phase tokens' lengths for each sequence.
             Shape: [batch_size]
 
@@ -4604,8 +4601,10 @@ def gpt_attention(
     if spec_decoding_packed_mask is not None:
         # add position_ids as well only if speculative decoding mode
         assert spec_decoding_position_offsets is not None
+        assert spec_decoding_position_offsets is not None
         plug_inputs += [
-            spec_decoding_packed_mask, spec_decoding_position_offsets
+            spec_decoding_generation_lengths, spec_decoding_packed_mask,
+            spec_decoding_position_offsets
         ]
 
     for idx, i in enumerate(plug_inputs):
@@ -4800,11 +4799,10 @@ def repeat_interleave(tensor: Tensor, repeats: int, dim: int) -> Tensor:
 
 
 def generate_alibi_slopes(num_heads: int,
-                          dtype: trt.DataType = trt.float32,
                           tp_size: int = 1,
                           tp_rank: int = 0,
                           alibi_scale: float = 1.0,
-                          alibi_bias_max: int = 8) -> Tensor:
+                          alibi_bias_max: int = 8) -> np.ndarray:
     '''
     Compute the ALiBi slopes as described in https://arxiv.org/abs/2211.05100.
 
@@ -4848,15 +4846,7 @@ def generate_alibi_slopes(num_heads: int,
     slopes = np.asarray(slopes_ft, dtype=np.float32)
 
     slopes = alibi_scale * slopes
-    # Note that for bfloat16, we cannot case numpy tensor from float32 to bfloat16
-    # because numpy does not support bfloat16. Even if we use custom type to define
-    # the np_bfloat16, the "astype" here would be undefined.
-    # So, we must use torch to cast tensor from float32 to bfloat16, and then use torch_to_numpy
-    # to cast the tensor back.
-    slopes = torch.from_numpy(slopes)
-    slopes = slopes.to(trt_dtype_to_torch(dtype))
-    slopes = torch_to_numpy(slopes)
-    slopes = constant(slopes.reshape(1, (end_head_id - start_head_id), 1, 1))
+    slopes = slopes.reshape(1, (end_head_id - start_head_id), 1, 1)
     return slopes
 
 
@@ -5076,6 +5066,7 @@ def lora_plugin(
     max_low_rank: int = 0,
     lora_ranks: List[Tensor] = None,
     lora_weights_pointers: List[Tensor] = None,
+    weight_index: int = 0,
 ):
     '''
     Parameters:
@@ -5113,6 +5104,9 @@ def lora_plugin(
 
         lora_weights_pointers : cpu int64 Tensor with shape [batch_size, 2]
             The weights pointers of each request. Consist of in_pointer and out_pointer.
+
+        weight_index : int
+            The index of weight if the weight pointer pointing to multiple weights.
 
     Return:
         The tensor produced by that layer.
@@ -5155,6 +5149,9 @@ def lora_plugin(
     max_low_rank_field = trt.PluginField("max_low_rank",
                                          np.array(max_low_rank, dtype=np.int32),
                                          trt.PluginFieldType.INT32)
+    weight_index_field = trt.PluginField("weight_index",
+                                         np.array(weight_index, dtype=np.int32),
+                                         trt.PluginFieldType.INT32)
     num_lora_modules = len(out_hidden_sizes)
     num_lora_modules_field = trt.PluginField(
         "num_lora_modules", np.array(num_lora_modules, dtype=np.int32),
@@ -5162,11 +5159,12 @@ def lora_plugin(
 
     pfc = trt.PluginFieldCollection([
         in_hidden_size_field, transa, transb, num_lora_modules_field, pf_type,
-        remove_input_padding, max_context_length_field, max_low_rank_field
+        remove_input_padding, max_context_length_field, max_low_rank_field,
+        weight_index_field
     ] + out_hidden_size_field_list)
     lora_plug = plg_creator.create_plugin("lora", pfc)
 
-    plug_inputs = [input, host_request_types
+    plug_inputs = [input.cast(p_dtype), host_request_types
                    ] + lora_ranks + lora_weights_pointers
 
     if default_net().plugin_config.remove_input_padding:
@@ -5176,10 +5174,10 @@ def lora_plugin(
     layer = default_trtnet().add_plugin_v2(plug_inputs, lora_plug)
 
     if num_lora_modules == 1:
-        return _create_tensor(layer.get_output(0), layer)
+        return _create_tensor(layer.get_output(0), layer).cast(input.dtype)
     else:
         return [
-            _create_tensor(layer.get_output(i), layer)
+            _create_tensor(layer.get_output(i), layer).cast(input.dtype)
             for i in range(num_lora_modules)
         ]
 

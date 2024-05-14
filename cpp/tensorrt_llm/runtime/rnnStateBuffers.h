@@ -29,42 +29,40 @@ namespace tensorrt_llm::runtime
 
 class RuntimeBuffers;
 
-class SsmStateBuffers
+class RnnStateBuffers
 {
 public:
     using TensorPtr = ITensor::SharedPtr;
     using TensorMap = StringPtrMap<ITensor>;
 
-    // Mamba states:  mamba_d_inner = mamba_expand * hidden_size
-    TensorPtr mambaSsmStates;                 // [layer_count * batch_beam, mamba_d_state, mamba_d_inner] for Mamba
-                                              // [layer_count * batch_beam, rnn_hidden_size] for recurrentgemma
-    TensorPtr mambaConvStates;                // [layer_count * batch_beam, mamba_d_conv - 1, mamba_d_inner]
-    TensorPtr mambaConvStatesAlt;             // [layer_count * batch_beam, mamba_d_conv - 1, mamba_d_inner]
+    TensorPtr rnnStates;                 // [layer_count * batch_beam, state_size, rnn_hidden_size]
+    TensorPtr convStates;                // [layer_count * batch_beam, conv_kernel - 1, rnn_hidden_size]
+    TensorPtr convStatesAlt;             // [layer_count * batch_beam, conv_kernel - 1, rnn_hidden_size]
 
-    std::vector<TensorPtr> mambaSsmState;     // [batch_beam, mamba_d_state, mamba_d_inner]
-    std::vector<TensorPtr> mambaConvState;    // [batch_beam, mamba_d_conv - 1, mamba_d_inner]
-    std::vector<TensorPtr> mambaConvStateAlt; // [batch_beam, mamba_d_conv - 1, mamba_d_inner]
+    std::vector<TensorPtr> rnnState;     // [batch_beam, state_size, rnn_hidden_size]
+    std::vector<TensorPtr> convState;    // [batch_beam, conv_kernel - 1, rnn_hidden_size]
+    std::vector<TensorPtr> convStateAlt; // [batch_beam, conv_kernel - 1, rnn_hidden_size]
 
-    TensorPtr slotMappingHost;                // [batch_size]
-    TensorPtr slotMappingDevice;              // [batch_size]
-    TensorPtr mambaSsmStatePtrs;              // [layer_count]
-    TensorPtr mambaConvStatePtrs;             // [layer_count]
+    TensorPtr slotMappingHost;           // [batch_size]
+    TensorPtr slotMappingDevice;         // [batch_size]
+    TensorPtr rnnStatePtrs;              // [layer_count]
+    TensorPtr convStatePtrs;             // [layer_count]
 
-    std::vector<TensorPtr> mambaSsmStatePtr;  // [1]
-    std::vector<TensorPtr> mambaConvStatePtr; // [1]
+    std::vector<TensorPtr> rnnStatePtr;  // [1]
+    std::vector<TensorPtr> convStatePtr; // [1]
 
-    SsmStateBuffers();
+    RnnStateBuffers();
 
-    SsmStateBuffers(
+    RnnStateBuffers(
         TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig);
 
-    void reshape(SizeType batchSize);
+    void reshape(SizeType32 batchSize);
     void reshape(
         GenerationConfig const& generationConfig, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
     void reset(BufferManager& manager);
 
-    SsmStateBuffers sliceTo(SizeType offset, SizeType size);
+    RnnStateBuffers sliceTo(SizeType32 offset, SizeType32 size);
 
     void prepareContextStep(RuntimeBuffers* runtimeBuffers, BufferManager& manager);
 
@@ -72,7 +70,7 @@ public:
         BufferManager& manager, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
     void getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers, TensorMap& inputBuffers, TensorMap& outputBuffers,
-        SizeType const step, TensorPtr const& inputIds, ModelConfig const& modelConfig,
+        SizeType32 const step, TensorPtr const& inputIds, ModelConfig const& modelConfig,
         WorldConfig const& worldConfig) const;
 
 protected:
@@ -82,9 +80,9 @@ protected:
     void fillStatePtrs();
 
 private:
-    SizeType mDConv = 0;
-    SizeType mDState = 0; // only valid for Mamba
-    SizeType mDInner = 0;
+    SizeType32 mConvKernel = 0;
+    SizeType32 mStateSize = 0;
+    SizeType32 mRnnHiddenSize = 0;
 
     int mLocalNbLayers = 0;
     int mMaxBeamWidth = 0;
