@@ -21,18 +21,18 @@
 namespace tensorrt_llm::runtime
 {
 
-void MedusaModule::initMedusaTensorsFromChoices(MedusaChoices const& choices, std::vector<SizeType>& topKs,
-    TensorPtr& positionOffsets, TensorPtr& treeIds, TensorPtr& paths, TensorPtr& packedMask,
-    SizeType& totalPaths) const noexcept
+void MedusaModule::initMedusaTensorsFromChoices(MedusaChoices const& choices, std::vector<SizeType32>& topKs,
+    TensorPtr& generationInputLengths, TensorPtr& positionOffsets, TensorPtr& treeIds, TensorPtr& paths,
+    TensorPtr& packedMask, SizeType32& totalPaths) const noexcept
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto const numChoices = static_cast<SizeType>(choices.size());
+    auto const numChoices = static_cast<SizeType32>(choices.size());
 
-    std::vector<SizeType> sortedIndices(numChoices);
+    std::vector<SizeType32> sortedIndices(numChoices);
     std::iota(sortedIndices.begin(), sortedIndices.end(), 0);
     std::vector<Prefix> prefixes(numChoices);
     // Fill prefixes for all nodes
-    for (SizeType ci = 0; ci < numChoices; ++ci)
+    for (SizeType32 ci = 0; ci < numChoices; ++ci)
     {
         auto const& choice = choices[ci];
         prefixes[ci] = computePrefix(choice, choice.size());
@@ -41,7 +41,7 @@ void MedusaModule::initMedusaTensorsFromChoices(MedusaChoices const& choices, st
     // Sort indices based on depth and prefix
     // Prefix has property that on the same depth, nodes that are more left in the tree have smaller prefix
     std::sort(sortedIndices.begin(), sortedIndices.end(),
-        [&prefixes, &choices](SizeType const& a, SizeType const& b)
+        [&prefixes, &choices](SizeType32 const& a, SizeType32 const& b)
         {
             auto const aSize = choices[a].size();
             auto const bSize = choices[b].size();
@@ -51,9 +51,13 @@ void MedusaModule::initMedusaTensorsFromChoices(MedusaChoices const& choices, st
     dumpChoices(choices, sortedIndices);
 
     topKs.resize(medusaHeads(), 0);
-    auto positionOffsetsPtr = bufferCast<SizeType>(*positionOffsets);
-    auto treeIdsPtr = bufferCast<SizeType>(*treeIds);
+    auto generationInputLengthsPtr = bufferCast<SizeType32>(*generationInputLengths);
+    auto positionOffsetsPtr = bufferCast<SizeType32>(*positionOffsets);
+    auto treeIdsPtr = bufferCast<SizeType32>(*treeIds);
 
+    // Fixed sequence length currently.
+    std::fill(
+        generationInputLengthsPtr, generationInputLengthsPtr + generationInputLengths->getSize(), tokensPerStep());
     std::fill(positionOffsetsPtr, positionOffsetsPtr + positionOffsets->getSize(), -1);
     std::fill(treeIdsPtr, treeIdsPtr + treeIds->getSize(), -1);
 
@@ -65,15 +69,15 @@ void MedusaModule::initMedusaTensorsFromChoices(MedusaChoices const& choices, st
     rootNode.nodeId = -1;
 
     // Start depth from 1 because we count root node implicetely
-    SizeType depth = 1;
+    SizeType32 depth = 1;
     // Running max TopK, reset at every new level
-    SizeType maxTopK = 0;
+    SizeType32 maxTopK = 0;
     // Global node in tree idx is sum of TopKs at previous levels
-    SizeType globalNodeInTreeIdx = 0;
+    SizeType32 globalNodeInTreeIdx = 0;
     // Hash table to map prefix to linear idx at previous level
-    std::unordered_map<Prefix, SizeType> prevPrefixToLinearIdxMap;
+    std::unordered_map<Prefix, SizeType32> prevPrefixToLinearIdxMap;
     // Hash table to map prefix to linear idx at current level
-    std::unordered_map<Prefix, SizeType> curPrefixToLinearIdxMap;
+    std::unordered_map<Prefix, SizeType32> curPrefixToLinearIdxMap;
 
     // Add root node
     prevPrefixToLinearIdxMap[0] = 0;
@@ -81,12 +85,12 @@ void MedusaModule::initMedusaTensorsFromChoices(MedusaChoices const& choices, st
 
     TLLM_CHECK(numChoices <= maxMedusaTokens());
 
-    for (SizeType ci = 0; ci < numChoices; ++ci)
+    for (SizeType32 ci = 0; ci < numChoices; ++ci)
     {
         auto const index = sortedIndices[ci];
         // Access choices based on sorting
         auto const& choice = choices[index];
-        auto const curDepth = static_cast<SizeType>(choice.size());
+        auto const curDepth = static_cast<SizeType32>(choice.size());
 
         // If new depth is found (choices are sorted by depth)
         if (curDepth != depth)
@@ -138,7 +142,7 @@ void MedusaModule::initMedusaTensorsFromChoices(MedusaChoices const& choices, st
     // Write TopK for the last level
     topKs[depth - 1] = maxTopK;
 
-    for (SizeType ci = 0; ci < numChoices + 1; ++ci)
+    for (SizeType32 ci = 0; ci < numChoices + 1; ++ci)
     {
         auto& node = tree[ci];
         // For all nodes except root
@@ -153,16 +157,16 @@ void MedusaModule::initMedusaTensorsFromChoices(MedusaChoices const& choices, st
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-SizeType MedusaModule::computePathsAndMask(
+SizeType32 MedusaModule::computePathsAndMask(
     std::vector<MedusaTreeNode> const& tree, TensorPtr& packedMask, TensorPtr& paths) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto pathsPtr = bufferCast<SizeType>(*paths);
+    auto pathsPtr = bufferCast<SizeType32>(*paths);
 
     std::fill(pathsPtr, pathsPtr + paths->getSize(), -1);
-    std::fill(bufferCast<SizeType>(*packedMask), bufferCast<SizeType>(*packedMask) + packedMask->getSize(), 0);
+    std::fill(bufferCast<SizeType32>(*packedMask), bufferCast<SizeType32>(*packedMask) + packedMask->getSize(), 0);
 
-    SizeType numPaths = 0;
+    SizeType32 numPaths = 0;
     // Count leaves
     for (auto const& node : tree)
     {
@@ -174,12 +178,12 @@ SizeType MedusaModule::computePathsAndMask(
     }
 
     // Stack contains indices of the node in the 'tree' vector
-    std::stack<SizeType> stack;
+    std::stack<SizeType32> stack;
     // Add first node
     stack.push(0);
 
     // Index of the current tracked path
-    SizeType pathIdx = 0;
+    SizeType32 pathIdx = 0;
 
     // Do DFS to construct paths and mask
     while (!stack.empty())
@@ -201,7 +205,7 @@ SizeType MedusaModule::computePathsAndMask(
         if (node.childLinearIndices.size() == 0)
         {
             // Current nodeIdx
-            SizeType nodeIdx = ci;
+            SizeType32 nodeIdx = ci;
             // Until we hit the root
             while (tree[nodeIdx].nodeId != -1)
             {
@@ -225,31 +229,32 @@ SizeType MedusaModule::computePathsAndMask(
     return numPaths;
 }
 
-void MedusaModule::copyPackedMask(TensorPtr& mask, SizeType srcIdx, SizeType dstIdx) const
+void MedusaModule::copyPackedMask(TensorPtr& mask, SizeType32 srcIdx, SizeType32 dstIdx) const
 {
     auto srcRow = ITensor::slice(mask, srcIdx, 1);
     auto dstRow = ITensor::slice(mask, dstIdx, 1);
-    std::memcpy(bufferCast<SizeType>(*dstRow), bufferCast<SizeType>(*srcRow), numPackedMasks() * sizeof(SizeType));
+    std::memcpy(
+        bufferCast<SizeType32>(*dstRow), bufferCast<SizeType32>(*srcRow), numPackedMasks() * sizeof(SizeType32));
 }
 
-void MedusaModule::setOnePackedMask(TensorPtr& mask, SizeType row, SizeType col) const
+void MedusaModule::setOnePackedMask(TensorPtr& mask, SizeType32 row, SizeType32 col) const
 {
-    auto const maskIdx = static_cast<SizeType>(col / 32);
+    auto const maskIdx = static_cast<SizeType32>(col / 32);
     auto const bitIdx = col % 32;
     auto setMask = 1 << bitIdx;
-    bufferCast<SizeType>(*mask)[row * numPackedMasks() + maskIdx] |= setMask;
+    bufferCast<SizeType32>(*mask)[row * numPackedMasks() + maskIdx] |= setMask;
 }
 
-MedusaModule::Prefix MedusaModule::computePrefix(std::vector<SizeType> const& vec, SizeType len) const
+MedusaModule::Prefix MedusaModule::computePrefix(std::vector<SizeType32> const& vec, SizeType32 len) const
 {
-    SizeType constexpr BITS_PER_BYTE = 8;
+    SizeType32 constexpr BITS_PER_BYTE = 8;
     // Check that prefix fits into the underlying data type
-    TLLM_CHECK_WITH_INFO(static_cast<SizeType>(sizeof(Prefix)) * BITS_PER_BYTE / PREFIX_CHUNK_SIZE_BITS >= len,
+    TLLM_CHECK_WITH_INFO(static_cast<SizeType32>(sizeof(Prefix)) * BITS_PER_BYTE / PREFIX_CHUNK_SIZE_BITS >= len,
         "Provided choices have depth (%d) larger than Prefix can fit (%ld).", len,
         sizeof(Prefix) * BITS_PER_BYTE / PREFIX_CHUNK_SIZE_BITS);
 
     Prefix prefix = 0;
-    for (SizeType ci = 0; ci < len; ++ci)
+    for (SizeType32 ci = 0; ci < len; ++ci)
     {
         auto val = vec[ci];
         TLLM_CHECK_WITH_INFO(val <= PREFIX_MAX_VALUE,
@@ -261,7 +266,7 @@ MedusaModule::Prefix MedusaModule::computePrefix(std::vector<SizeType> const& ve
     return prefix;
 }
 
-void MedusaModule::dumpChoices(MedusaChoices const& choices, std::vector<SizeType> const& indices) const
+void MedusaModule::dumpChoices(MedusaChoices const& choices, std::vector<SizeType32> const& indices) const
 {
     std::stringstream ss;
     ss << "Medusa choices = [";

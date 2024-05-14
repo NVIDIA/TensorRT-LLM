@@ -32,6 +32,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <nvml.h>
 #include <optional>
 #include <set>
 #include <string>
@@ -299,3 +300,14 @@ private:
 
     std::unordered_map<std::string_view, Record> mMap;
 };
+
+#define NVML_CHECK(cmd)                                                                                                \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        nvmlReturn_t r = cmd;                                                                                          \
+        if (r != NVML_SUCCESS)                                                                                         \
+        {                                                                                                              \
+            printf("Failed, NVML error %s:%d '%s'\n", __FILE__, __LINE__, nvmlErrorString(r));                         \
+            exit(EXIT_FAILURE);                                                                                        \
+        }                                                                                                              \
+    } while (0)

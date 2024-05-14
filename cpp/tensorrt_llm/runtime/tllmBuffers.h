@@ -46,10 +46,10 @@ class BaseAllocator
 public:
     using ValueType = void;
     using PointerType = ValueType*;
-    using SizeType = std::size_t;
+    using SizeType32 = std::size_t;
     static auto constexpr kMemoryType = memoryType;
 
-    PointerType allocate(SizeType n)
+    PointerType allocate(SizeType32 n)
     {
         PointerType ptr{};
         static_cast<TDerived*>(this)->allocateImpl(&ptr, n);
@@ -58,7 +58,7 @@ public:
         return ptr;
     }
 
-    void deallocate(PointerType ptr, SizeType n)
+    void deallocate(PointerType ptr, SizeType32 n)
     {
         if (ptr)
         {
@@ -82,13 +82,13 @@ public:
     CudaAllocator() noexcept = default;
 
 protected:
-    void allocateImpl(PointerType* ptr, SizeType n) // NOLINT(readability-convert-member-functions-to-static)
+    void allocateImpl(PointerType* ptr, SizeType32 n) // NOLINT(readability-convert-member-functions-to-static)
     {
         TLLM_CUDA_CHECK(::cudaMalloc(ptr, n));
     }
 
     void deallocateImpl( // NOLINT(readability-convert-member-functions-to-static)
-        PointerType ptr, [[maybe_unused]] SizeType n)
+        PointerType ptr, [[maybe_unused]] SizeType32 n)
     {
         TLLM_CUDA_CHECK_FREE_RESOURCE(::cudaFree(ptr));
     }
@@ -113,12 +113,12 @@ public:
     }
 
 protected:
-    void allocateImpl(PointerType* ptr, SizeType n)
+    void allocateImpl(PointerType* ptr, SizeType32 n)
     {
         TLLM_CUDA_CHECK(::cudaMallocAsync(ptr, n, mCudaStream->get()));
     }
 
-    void deallocateImpl(PointerType ptr, [[maybe_unused]] SizeType n)
+    void deallocateImpl(PointerType ptr, [[maybe_unused]] SizeType32 n)
     {
         TLLM_CUDA_CHECK_FREE_RESOURCE(::cudaFreeAsync(ptr, mCudaStream->get()));
     }
@@ -136,14 +136,14 @@ public:
     UVMAllocator() noexcept = default;
 
 protected:
-    void allocateImpl(PointerType* ptr, SizeType n) // NOLINT(readability-convert-member-functions-to-static)
+    void allocateImpl(PointerType* ptr, SizeType32 n) // NOLINT(readability-convert-member-functions-to-static)
     {
         TLLM_CUDA_CHECK(::cudaMallocManaged(ptr, n));
         // TLLM_CUDA_CHECK(::cudaMemAdvise(ptr, n, cudaMemAdviseSetPreferredLocation, 0));
     }
 
     void deallocateImpl( // NOLINT(readability-convert-member-functions-to-static)
-        PointerType ptr, [[maybe_unused]] SizeType n)
+        PointerType ptr, [[maybe_unused]] SizeType32 n)
     {
         TLLM_CUDA_CHECK_FREE_RESOURCE(::cudaFree(ptr));
     }
@@ -158,13 +158,13 @@ public:
     PinnedAllocator() noexcept = default;
 
 protected:
-    void allocateImpl(PointerType* ptr, SizeType n) // NOLINT(readability-convert-member-functions-to-static)
+    void allocateImpl(PointerType* ptr, SizeType32 n) // NOLINT(readability-convert-member-functions-to-static)
     {
         TLLM_CUDA_CHECK(::cudaHostAlloc(ptr, n, cudaHostAllocDefault));
     }
 
     void deallocateImpl( // NOLINT(readability-convert-member-functions-to-static)
-        PointerType ptr, [[maybe_unused]] SizeType n)
+        PointerType ptr, [[maybe_unused]] SizeType32 n)
     {
         TLLM_CUDA_CHECK_FREE_RESOURCE(::cudaFreeHost(ptr));
     }
@@ -178,7 +178,7 @@ public:
     HostAllocator() noexcept = default;
 
 protected:
-    void allocateImpl(PointerType* ptr, SizeType n) // NOLINT(readability-convert-member-functions-to-static)
+    void allocateImpl(PointerType* ptr, SizeType32 n) // NOLINT(readability-convert-member-functions-to-static)
     {
         *ptr = std::malloc(n);
         if (*ptr == nullptr)
@@ -188,7 +188,7 @@ protected:
     }
 
     void deallocateImpl( // NOLINT(readability-convert-member-functions-to-static)
-        PointerType ptr, [[maybe_unused]] SizeType n)
+        PointerType ptr, [[maybe_unused]] SizeType32 n)
     {
         std::free(ptr);
     }
@@ -202,9 +202,9 @@ class BorrowingAllocator : public BaseAllocator<BorrowingAllocator<memoryType>, 
 public:
     using Base = BaseAllocator<BorrowingAllocator<memoryType>, memoryType, false>;
     using PointerType = typename Base::PointerType;
-    using SizeType = typename Base::SizeType;
+    using SizeType32 = typename Base::SizeType32;
 
-    BorrowingAllocator(void* ptr, SizeType capacity)
+    BorrowingAllocator(void* ptr, SizeType32 capacity)
         : mPtr(ptr)
         , mCapacity(capacity)
     {
@@ -213,7 +213,7 @@ public:
     }
 
 protected:
-    void allocateImpl(PointerType* ptr, SizeType n) // NOLINT(readability-convert-member-functions-to-static)
+    void allocateImpl(PointerType* ptr, SizeType32 n) // NOLINT(readability-convert-member-functions-to-static)
     {
         if (n <= mCapacity)
         {
@@ -226,13 +226,13 @@ protected:
     }
 
     void deallocateImpl( // NOLINT(readability-convert-member-functions-to-static)
-        [[maybe_unused]] PointerType ptr, [[maybe_unused]] SizeType n)
+        [[maybe_unused]] PointerType ptr, [[maybe_unused]] SizeType32 n)
     {
     }
 
 private:
     PointerType mPtr;
-    SizeType mCapacity;
+    SizeType32 mCapacity;
 };
 
 using CpuBorrowingAllocator = BorrowingAllocator<MemoryType::kCPU>;
@@ -254,17 +254,17 @@ class MemoryPool : public BaseAllocator<MemoryPool<TAllocator>, TAllocator::kMem
 public:
     using Base = BaseAllocator<MemoryPool<TAllocator>, TAllocator::kMemoryType, false>;
     using PointerType = typename Base::PointerType;
-    using SizeType = typename Base::SizeType;
+    using SizeType32 = typename Base::SizeType32;
 
     using Allocator = TAllocator;
     static_assert(std::is_same_v<typename Allocator::PointerType, PointerType>);
-    static_assert(std::is_same_v<typename Allocator::SizeType, SizeType>);
+    static_assert(std::is_same_v<typename Allocator::SizeType32, SizeType32>);
 
-    static SizeType constexpr kInitialChunkSize{SizeType{1} << 30}; // 1 GB
-    static SizeType constexpr kChunkResizeFactor{2};
-    static SizeType constexpr kAlignment{256};
+    static SizeType32 constexpr kInitialChunkSize{SizeType32{1} << 30}; // 1 GB
+    static SizeType32 constexpr kChunkResizeFactor{2};
+    static SizeType32 constexpr kAlignment{256};
 
-    explicit MemoryPool(SizeType chunkSize = kInitialChunkSize, Allocator allocator = Allocator{})
+    explicit MemoryPool(SizeType32 chunkSize = kInitialChunkSize, Allocator allocator = Allocator{})
         : mChunkSize(chunkSize)
         , mAllocator{allocator}
     {
@@ -289,36 +289,36 @@ public:
         mAllocatedChunks.clear();
     }
 
-    [[nodiscard]] SizeType getChunkSize() const
+    [[nodiscard]] SizeType32 getChunkSize() const
     {
         std::lock_guard<std::mutex> lock(mLock);
         return mChunkSize;
     }
 
-    void setChunkSize(SizeType chunkSize)
+    void setChunkSize(SizeType32 chunkSize)
     {
         std::lock_guard<std::mutex> lock(mLock);
         mChunkSize = chunkSize;
     }
 
-    [[nodiscard]] SizeType getUsedSize() const
+    [[nodiscard]] SizeType32 getUsedSize() const
     {
         std::lock_guard<std::mutex> lock(mLock);
-        return std::accumulate(mMemorySegments.cbegin(), mMemorySegments.cend(), SizeType{0},
-            [](SizeType sum, auto const& chunk) { return chunk.tag ? sum + chunk.size : sum; });
+        return std::accumulate(mMemorySegments.cbegin(), mMemorySegments.cend(), SizeType32{0},
+            [](SizeType32 sum, auto const& chunk) { return chunk.tag ? sum + chunk.size : sum; });
     }
 
-    [[nodiscard]] SizeType getReservedSize() const
+    [[nodiscard]] SizeType32 getReservedSize() const
     {
         std::lock_guard<std::mutex> lock(mLock);
-        return std::accumulate(mAllocatedChunks.cbegin(), mAllocatedChunks.cend(), SizeType{0},
-            [](SizeType sum, auto const& chunk) { return sum + std::get<1>(chunk); });
+        return std::accumulate(mAllocatedChunks.cbegin(), mAllocatedChunks.cend(), SizeType32{0},
+            [](SizeType32 sum, auto const& chunk) { return sum + std::get<1>(chunk); });
     }
 
     class MemorySegment
     {
     public:
-        MemorySegment(PointerType basePointer, SizeType size, SizeType offset = 0, PointerType tag = nullptr)
+        MemorySegment(PointerType basePointer, SizeType32 size, SizeType32 offset = 0, PointerType tag = nullptr)
             : basePointer{basePointer}
             , size{size}
             , offset{offset}
@@ -327,8 +327,8 @@ public:
         }
 
         PointerType const basePointer;
-        SizeType size;
-        SizeType offset;
+        SizeType32 size;
+        SizeType32 offset;
         PointerType tag;
     };
 
@@ -343,17 +343,17 @@ public:
     void logSegments() const;
 
 protected:
-    void allocateImpl(PointerType* ptr, SizeType requestedSize);
+    void allocateImpl(PointerType* ptr, SizeType32 requestedSize);
 
-    void deallocateImpl(PointerType tag, SizeType n);
+    void deallocateImpl(PointerType tag, SizeType32 n);
 
 private:
-    SizeType mChunkSize;
+    SizeType32 mChunkSize;
     TAllocator mAllocator;
     std::mutex mutable mLock{};
 
     std::list<MemorySegment> mMemorySegments = {};
-    std::vector<std::tuple<PointerType, SizeType>> mAllocatedChunks = {};
+    std::vector<std::tuple<PointerType, SizeType32>> mAllocatedChunks = {};
 
     void allocateChunk()
     {
@@ -365,7 +365,7 @@ private:
 };
 
 template <typename TAllocator>
-void MemoryPool<TAllocator>::allocateImpl(MemoryPool::PointerType* ptr, MemoryPool::SizeType requestedSize)
+void MemoryPool<TAllocator>::allocateImpl(MemoryPool::PointerType* ptr, MemoryPool::SizeType32 requestedSize)
 {
     std::lock_guard<std::mutex> lock(mLock);
     // Align requested size to kAlignment
@@ -417,7 +417,7 @@ void MemoryPool<TAllocator>::allocateImpl(MemoryPool::PointerType* ptr, MemoryPo
 }
 
 template <typename TAllocator>
-void MemoryPool<TAllocator>::deallocateImpl(PointerType tag, SizeType n)
+void MemoryPool<TAllocator>::deallocateImpl(PointerType tag, SizeType32 n)
 {
     std::lock_guard<std::mutex> lock(mLock);
     auto it = std::find_if(mMemorySegments.begin(), mMemorySegments.end(),
@@ -477,19 +477,19 @@ class PoolAllocator : public BaseAllocator<PoolAllocator<TAllocator>, TAllocator
 public:
     using Base = BaseAllocator<PoolAllocator<TAllocator>, TAllocator::kMemoryType, false>;
     using PointerType = typename Base::PointerType;
-    using SizeType = typename Base::SizeType;
+    using SizeType32 = typename Base::SizeType32;
     using PoolType = MemoryPool<TAllocator>;
 
     static PoolType& getPool();
 
 protected:
-    void allocateImpl(PointerType* ptr, SizeType n) // NOLINT(readability-convert-member-functions-to-static)
+    void allocateImpl(PointerType* ptr, SizeType32 n) // NOLINT(readability-convert-member-functions-to-static)
     {
         *ptr = getPool().allocate(n);
     }
 
     void deallocateImpl( // NOLINT(readability-convert-member-functions-to-static)
-        typename TAllocator::PointerType ptr, SizeType n)
+        typename TAllocator::PointerType ptr, SizeType32 n)
     {
         getPool().deallocate(ptr, n);
     }

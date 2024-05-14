@@ -75,12 +75,16 @@ auto constexpr kLoraWeights = "lora_weights";
 // "attn_dense": 4   # adapter for the dense layer in attention
 // "mlp_h_to_4h": 5  # for llama2 adapter for gated mlp layer after attention / RMSNorm: up projection
 // "mlp_4h_to_h": 6  # for llama2 adapter for gated mlp layer after attention / RMSNorm: down projection
-// "mlp_gate": 7     # for llama2 adapter for gated mlp later after attention / RMSNorm: gate
+// "mlp_gate": 7     # for llama2 adapter for gated mlp layer after attention / RMSNorm: gate
 // "cross_attn_qkv": 8 # for enc-dec adapter for cross attention in decoder
 // "cross_attn_q": 9   # for enc-dec adapter for cross attention in decoder
 // "cross_attn_k": 10  # for enc-dec adapter for cross attention in decoder
 // "cross_attn_v": 11  # for enc-dec adapter for cross attention in decoder
 // "cross_attn_dense": 12 # for enc-dec adapter for cross attention in decoder
+// "moe_h_to_4h": 13 # for mixtral adapter for expert mlp layer: up projection
+// "moe_4h_to_h": 14 # for mixtral adapter for expert mlp layer: down projection
+// "moe_gate": 15    # for mixtral adapter for expert mlp layer: gate
+// "moe_router": 16  # for mixtral adapter for expert router layer
 //
 // last dim holds [ module_id, layer_idx, adapter_size (D / R value) ]
 auto constexpr kLoraConfig = "lora_config"; // [num_lora_modules_layers, 3]

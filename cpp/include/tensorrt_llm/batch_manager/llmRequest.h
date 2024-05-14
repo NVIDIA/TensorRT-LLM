@@ -47,7 +47,7 @@ template <typename TTensor, typename TStream = runtime::BufferManager::CudaStrea
 class GenericLlmRequest
 {
 public:
-    using SizeType = runtime::SizeType;
+    using SizeType32 = runtime::SizeType32;
     using TokenIdType = runtime::TokenIdType;
     using RequestIdType = std::uint64_t;
     using LoraTaskIdType = std::uint64_t;
@@ -57,14 +57,15 @@ public:
     using TensorPtr = TTensor;
     using LogitsPostProcessor = std::function<void(RequestIdType, TensorPtr&, BeamTokens const&, TStream)>;
 
-    GenericLlmRequest(RequestIdType requestId, SizeType maxNewTokens, std::shared_ptr<VecTokens> inputTokens,
-        runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType> endId = std::nullopt,
-        std::optional<SizeType> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
+    GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::shared_ptr<VecTokens> inputTokens,
+        runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
+        std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
         std::optional<TensorPtr> badWordsList = std::nullopt, std::optional<TensorPtr> stopWordsList = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
-        std::optional<SizeType> promptVocabSize = std::nullopt, std::optional<LoraTaskIdType> loraTaskId = std::nullopt,
-        std::optional<TensorPtr> loraWeights = std::nullopt, std::optional<TensorPtr> loraConfig = std::nullopt,
-        bool returnLogProbs = false, bool returnContextLogits = false, bool returnGenerationLogits = false,
+        std::optional<SizeType32> promptVocabSize = std::nullopt,
+        std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
+        std::optional<TensorPtr> loraConfig = std::nullopt, bool returnLogProbs = false,
+        bool returnContextLogits = false, bool returnGenerationLogits = false,
         std::optional<std::shared_ptr<VecTokens>> draftTokens = std::nullopt,
         std::optional<TensorPtr> draftLogits = std::nullopt, bool excludeInputFromOutput = false,
         std::optional<LogitsPostProcessor> logitsPostProcessor = std::nullopt,
@@ -193,7 +194,7 @@ public:
         initialize(req.getInputTokenIds());
     }
 
-    void validate(SizeType maxInputLen, SizeType maxSequenceLen, SizeType maxDraftLen)
+    void validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen)
     {
         if (mPromptLen > maxInputLen)
         {
@@ -206,7 +207,7 @@ public:
         auto const& draftTokens = getDraftTokens();
         if (draftTokens && !draftTokens->empty())
         {
-            auto const inputDraftTokensLen = static_cast<SizeType>(draftTokens->size());
+            auto const inputDraftTokensLen = static_cast<SizeType32>(draftTokens->size());
             if (inputDraftTokensLen > maxDraftLen)
             {
                 TLLM_THROW("Draft tokens length (%d) exceeds maximum draft tokens length (%d).", inputDraftTokensLen,
@@ -249,19 +250,19 @@ public:
     /// @brief Get total number of tokens for this req (prompt + generated)
     /// @param beam The beam index
     /// @return  The number of tokens
-    [[nodiscard]] SizeType getNumTokens(SizeType beam) const
+    [[nodiscard]] SizeType32 getNumTokens(SizeType32 beam) const
     {
         return mTokens.at(beam).size();
     }
 
     /// @brief Get max number of tokens across all beams
     /// @return  The number of tokens
-    [[nodiscard]] SizeType getMaxBeamNumTokens() const
+    [[nodiscard]] SizeType32 getMaxBeamNumTokens() const
     {
-        SizeType maxTokens = 0;
-        for (SizeType beam = 0; beam < mSamplingConfig.beamWidth; ++beam)
+        SizeType32 maxTokens = 0;
+        for (SizeType32 beam = 0; beam < mSamplingConfig.beamWidth; ++beam)
         {
-            maxTokens = std::max(maxTokens, static_cast<SizeType>(mTokens.at(beam).size()));
+            maxTokens = std::max(maxTokens, static_cast<SizeType32>(mTokens.at(beam).size()));
         }
         return maxTokens;
     }
@@ -270,7 +271,7 @@ public:
     /// @param beam  The beam index
     /// @param pos The position of the token relative to beginning of the prompt
     /// @return  The token index
-    [[nodiscard]] TokenIdType getToken(SizeType beam, SizeType pos) const
+    [[nodiscard]] TokenIdType getToken(SizeType32 beam, SizeType32 pos) const
     {
         return mTokens.at(beam).at(pos);
     }
@@ -278,7 +279,7 @@ public:
     /// @brief Get the tokens at a given beam index
     /// @param beam The beam index
     /// @return A vector of tokens for this beam index, includes the prompt
-    [[nodiscard]] VecTokens const& getTokens(SizeType beam) const
+    [[nodiscard]] VecTokens const& getTokens(SizeType32 beam) const
     {
         return mTokens.at(beam);
     }
@@ -297,7 +298,7 @@ public:
         return mEncoderInputTokens;
     }
 
-    SizeType getEncoderInputSize() const
+    SizeType32 getEncoderInputSize() const
     {
         TLLM_CHECK_WITH_INFO(static_cast<bool>(getEncoderInputTokens()), "Encoder input tokens must not be nullptr");
         return getEncoderInputTokens()->size();
@@ -326,7 +327,7 @@ public:
 
     /// @brief Get the maximum number of generated tokens among all rays in beam
     /// @return The number of generated tokens (doesn't include the prompt tokens)
-    [[nodiscard]] SizeType getMaxNumGeneratedTokens() const
+    [[nodiscard]] SizeType32 getMaxNumGeneratedTokens() const
     {
         return getMaxBeamNumTokens() - mPromptLen;
     }
@@ -334,7 +335,7 @@ public:
     /// @brief Add new generated tokens to the vector of tokens
     /// @param token The token to add
     /// @param beam The beam to which to add the new token
-    void addNewToken(TokenIdType token, SizeType beam)
+    void addNewToken(TokenIdType token, SizeType32 beam)
     {
         mTokens.at(beam).push_back(token);
     }
@@ -367,7 +368,7 @@ public:
 
     /// @brief Pause a request by moving the generated tokens to the prompt
     /// @param maxInputLen The maximum prompt len.
-    void pause(SizeType maxInputLen)
+    void pause(SizeType32 maxInputLen)
     {
         // TODO: For beamWidth > 1, we would need to support swapping to avoid
         // recomputing from the start
@@ -386,7 +387,7 @@ public:
         }
         else
         {
-            SizeType newPromptLen = std::min(maxInputLen, mPromptLen + getMaxNumGeneratedTokens());
+            SizeType32 newPromptLen = std::min(maxInputLen, mPromptLen + getMaxNumGeneratedTokens());
             for (std::size_t beam = 0; beam < mTokens.size(); ++beam)
             {
                 auto& beamTokens = mTokens.at(beam);
@@ -410,7 +411,7 @@ public:
     /// @brief Get the maximum position of the tokens returned to the client. Use to ensure we don't return to
     /// client duplicated token positions.
     /// @return The maximum position of the tokens sent to the client
-    [[nodiscard]] SizeType getMaxSentTokenPos() const
+    [[nodiscard]] SizeType32 getMaxSentTokenPos() const
     {
         return mMaxSentTokenPos;
     }
@@ -418,7 +419,7 @@ public:
     /// @brief Sets the maximum position of the tokens returned to the client. Use to ensure we don't return to
     /// client duplicated token positions.
     /// @param pos The maximum position
-    void setMaxSentTokenPos(SizeType pos)
+    void setMaxSentTokenPos(SizeType32 pos)
     {
         mMaxSentTokenPos = pos;
     }
@@ -428,7 +429,7 @@ public:
         return mPromptEmbeddingTable;
     }
 
-    [[nodiscard]] std::optional<SizeType> getPromptVocabSize() const
+    [[nodiscard]] std::optional<SizeType32> getPromptVocabSize() const
     {
         return mPromptVocabSize;
     }
@@ -503,12 +504,12 @@ public:
         return mLogProbs;
     }
 
-    [[nodiscard]] VecLogProbs const& getLogProbs(SizeType beam) const
+    [[nodiscard]] VecLogProbs const& getLogProbs(SizeType32 beam) const
     {
         return mLogProbs.at(beam);
     }
 
-    void setLogProbs(VecLogProbs const& logProbs, SizeType beam)
+    void setLogProbs(VecLogProbs const& logProbs, SizeType32 beam)
     {
         mLogProbs.at(beam).resize(mPromptLen - mOrigPromptLen);
         mLogProbs.at(beam).insert(mLogProbs.at(beam).end(), logProbs.begin(), logProbs.end());
@@ -519,12 +520,12 @@ public:
         return mCumLogProbs;
     }
 
-    void setCumLogProb(float cumLogProb, SizeType beam)
+    void setCumLogProb(float cumLogProb, SizeType32 beam)
     {
         mCumLogProbs.at(beam) = cumLogProb;
     }
 
-    [[nodiscard]] SizeType getOrigPromptLen() const
+    [[nodiscard]] SizeType32 getOrigPromptLen() const
     {
         return mOrigPromptLen;
     }
@@ -539,17 +540,17 @@ public:
         mDraftLogits = draftLogits;
     }
 
-    SizeType getNumDraftTokens() const
+    SizeType32 getNumDraftTokens() const
     {
         return mDraftTokens->size();
     }
 
-    void setNumTokensPerIteration(SizeType numTokensPerIteration)
+    void setNumTokensPerIteration(SizeType32 numTokensPerIteration)
     {
         mNumTokensPerIteration = numTokensPerIteration;
     }
 
-    SizeType getNumTokensPerIteration() const
+    SizeType32 getNumTokensPerIteration() const
     {
         return mNumTokensPerIteration;
     }
@@ -591,7 +592,7 @@ public:
         mContextLogitsHost = std::move(contextLogitsHost);
     }
 
-    void allocContextLogitsHost(SizeType vocabSizePadded, nvinfer1::DataType logitsDataType)
+    void allocContextLogitsHost(SizeType32 vocabSizePadded, nvinfer1::DataType logitsDataType)
     {
         mContextLogitsHost = runtime::BufferManager::pinned(
             runtime::ITensor::makeShape({mPromptLen, vocabSizePadded}), logitsDataType);
@@ -607,7 +608,7 @@ public:
         mGenerationLogitsHost = std::move(generationLogitsHost);
     }
 
-    void allocGenerationLogitsHost(SizeType vocabSizePadded, nvinfer1::DataType logitsDataType)
+    void allocGenerationLogitsHost(SizeType32 vocabSizePadded, nvinfer1::DataType logitsDataType)
     {
         mGenerationLogitsHost = runtime::BufferManager::pinned(
             runtime::ITensor::makeShape({mSamplingConfig.beamWidth, mMaxNewTokens, vocabSizePadded}), logitsDataType);
@@ -623,7 +624,7 @@ public:
         mGenerationLogitsFragments.push_back(genLogits);
     }
 
-    SizeType getGenerationLogitsFragmentsSize()
+    SizeType32 getGenerationLogitsFragmentsSize()
     {
         return mGenerationLogitsFragments.size();
     }
@@ -657,13 +658,13 @@ public:
 
     /// When chunked, the position of the current chunk is returned. Otherwise, only the beginning
     /// or end of the context is returned.
-    [[nodiscard]] SizeType getContextCurrentPosition() const noexcept
+    [[nodiscard]] SizeType32 getContextCurrentPosition() const noexcept
     {
         return mContextCurrentPosition;
     }
 
     /// Return the length of the context that has not yet been processed.
-    [[nodiscard]] SizeType getContextRemainingLength() const noexcept
+    [[nodiscard]] SizeType32 getContextRemainingLength() const noexcept
     {
         return mPromptLen - getContextCurrentPosition();
     }
@@ -679,7 +680,7 @@ public:
     }
 
     /// To retrieve the context chunk size, throw an exception when the context is not chunked.
-    [[nodiscard]] SizeType getContextChunkSize() const
+    [[nodiscard]] SizeType32 getContextChunkSize() const
     {
         TLLM_CHECK_WITH_INFO(
             isContextInitState() && mContextChunkSize, "The current request is not in context chunking state.");
@@ -689,7 +690,7 @@ public:
     /// To set the context chunk size, throw an exception when the chunk size is negative. If the chunk
     /// size is greater than the remaining length of the context, the size will be reduced to fit the
     /// remaining length.
-    void setContextChunkSize(SizeType size)
+    void setContextChunkSize(SizeType32 size)
     {
         TLLM_CHECK_WITH_INFO(isContextInitState(), "Chunking is only possible during the context phase.");
         TLLM_CHECK_WITH_INFO(size >= 0, "The chunk size of context (%d) can't be negative.", size);
@@ -748,7 +749,7 @@ public:
             }
 
             result.outputTokenIds.resize(nbBeams);
-            SizeType tokenPos = maxNbTokens - nbTokensOut;
+            SizeType32 tokenPos = maxNbTokens - nbTokensOut;
 
             bool shouldSendResponse = isGenerationCompleteState() || (mIsStreaming && tokenPos > getMaxSentTokenPos());
 
@@ -758,7 +759,7 @@ public:
             }
             else
             {
-                for (SizeType beam = 0; beam < nbBeams; ++beam)
+                for (SizeType32 beam = 0; beam < nbBeams; ++beam)
                 {
                     auto tokens = getTokens(beam);
                     auto nbTokens = mIsStreaming ? (tokenPos - getMaxSentTokenPos()) : tokens.size();
@@ -810,28 +811,28 @@ public:
     }
 
     RequestIdType mRequestId;
-    SizeType mPromptLen;
-    SizeType mMaxNewTokens;
+    SizeType32 mPromptLen;
+    SizeType32 mMaxNewTokens;
     // Tokens [beam_size, mPromptLen + getMaxNumGeneratedTokens()]
     runtime::SamplingConfig mSamplingConfig;
     LlmRequestState_t mState;
     bool mIsStreaming;
     std::optional<TokenIdType> mEndId;
     std::optional<TokenIdType> mPadId;
-    std::optional<SizeType> mSeqSlot;
+    std::optional<SizeType32> mSeqSlot;
     std::optional<LogitsPostProcessor> mLogitsPostProcessor;
 
 protected:
-    SizeType mOrigPromptLen;
+    SizeType32 mOrigPromptLen;
     BeamTokens mTokens;
-    SizeType mMaxSentTokenPos;
+    SizeType32 mMaxSentTokenPos;
 
     std::optional<TensorPtr> mEmbeddingBias;
     std::optional<TensorPtr> mBadWordsList;
     std::optional<TensorPtr> mStopWordsList;
 
     std::optional<TensorPtr> mPromptEmbeddingTable;
-    std::optional<SizeType> mPromptVocabSize;
+    std::optional<SizeType32> mPromptVocabSize;
 
     std::optional<LoraTaskIdType> mLoraTaskId;
     std::optional<TensorPtr> mLoraWeights;
@@ -845,14 +846,14 @@ protected:
     // To enable chunked context, the FHMA paged kv-cache also needs to be enabled. Except for the last one,
     // the size of the context chunk needs to be an integer multiple of the kv-cache block size. The meaning
     // of null value is that the context is not chunked.
-    std::optional<SizeType> mContextChunkSize;
-    SizeType mContextCurrentPosition;
+    std::optional<SizeType32> mContextChunkSize;
+    SizeType32 mContextCurrentPosition;
 
     std::vector<VecLogProbs> mLogProbs; // [beamSize, seqLen]
     VecLogProbs mCumLogProbs;           // [beamSize]
     std::shared_ptr<VecTokens> mDraftTokens;
     std::optional<TensorPtr> mDraftLogits;
-    SizeType mNumTokensPerIteration;
+    SizeType32 mNumTokensPerIteration;
 
     // Save logits
     bool mReturnContextLogits;
@@ -891,9 +892,9 @@ private:
 
     TensorPtr createListTensor(std::list<VecTokens> const& wordsList)
     {
-        std::vector<SizeType> offsets;
+        std::vector<SizeType32> offsets;
         VecTokens words;
-        SizeType offsetCnt = 0;
+        SizeType32 offsetCnt = 0;
         for (auto const& tokens : wordsList)
         {
             offsetCnt += tokens.size();
@@ -902,7 +903,7 @@ private:
         }
         offsets.resize(words.size(), -1);
 
-        SizeType numWords = static_cast<SizeType>(words.size());
+        SizeType32 numWords = static_cast<SizeType32>(words.size());
         auto shape = runtime::ITensor::makeShape({2, numWords});
         auto tensor = runtime::BufferManager::pinnedPool(shape, nvinfer1::DataType::kINT32);
         auto data = runtime::bufferCast<int32_t>(*tensor);
@@ -920,21 +921,22 @@ class LlmRequest : public GenericLlmRequest<runtime::ITensor::SharedPtr>
 public:
     using Base = GenericLlmRequest<runtime::ITensor::SharedPtr>;
     using TensorPtr = Base::TensorPtr;
-    using SizeType = Base::SizeType;
+    using SizeType32 = Base::SizeType32;
     using TokenIdType = Base::TokenIdType;
     using RequestIdType = Base::RequestIdType;
     using VecLogProbs = Base::VecLogProbs;
     using BeamTokens = Base::BeamTokens;
     using VecTokens = Base::VecTokens;
 
-    LlmRequest(RequestIdType requestId, SizeType maxNewTokens, std::shared_ptr<VecTokens> inputTokens,
-        runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType> endId = std::nullopt,
-        std::optional<SizeType> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
+    LlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::shared_ptr<VecTokens> inputTokens,
+        runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
+        std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
         std::optional<TensorPtr> badWordsList = std::nullopt, std::optional<TensorPtr> stopWordsList = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
-        std::optional<SizeType> promptVocabSize = std::nullopt, std::optional<LoraTaskIdType> loraTaskId = std::nullopt,
-        std::optional<TensorPtr> loraWeights = std::nullopt, std::optional<TensorPtr> loraConfig = std::nullopt,
-        bool returnLogProbs = false, bool returnContextLogits = false, bool returnGenerationLogits = false,
+        std::optional<SizeType32> promptVocabSize = std::nullopt,
+        std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
+        std::optional<TensorPtr> loraConfig = std::nullopt, bool returnLogProbs = false,
+        bool returnContextLogits = false, bool returnGenerationLogits = false,
         std::optional<std::shared_ptr<VecTokens>> draftTokens = std::nullopt,
         std::optional<TensorPtr> draftLogits = std::nullopt, bool excludeInputFromOutput = false,
         std::optional<LogitsPostProcessor> logitsPostProcessor = std::nullopt,
@@ -954,15 +956,16 @@ public:
         mLogitsPostProcessor = std::move(logitsPostProcessor);
     }
 
-    static LlmRequest createEncoderRequest(RequestIdType requestId, SizeType maxNewTokens,
+    static LlmRequest createEncoderRequest(RequestIdType requestId, SizeType32 maxNewTokens,
         std::shared_ptr<VecTokens> encoderInputTokens, std::shared_ptr<VecTokens> inputTokens,
-        runtime::SamplingConfig samplingConfig, bool isStreaming, std::optional<SizeType> endId = std::nullopt,
-        std::optional<SizeType> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
+        runtime::SamplingConfig samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
+        std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
         std::optional<TensorPtr> badWordsList = std::nullopt, std::optional<TensorPtr> stopWordsList = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
-        std::optional<SizeType> promptVocabSize = std::nullopt, std::optional<LoraTaskIdType> loraTaskId = std::nullopt,
-        std::optional<TensorPtr> loraWeights = std::nullopt, std::optional<TensorPtr> loraConfig = std::nullopt,
-        bool returnLogProbs = false, bool returnContextLogits = false, bool returnGenerationLogits = false,
+        std::optional<SizeType32> promptVocabSize = std::nullopt,
+        std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
+        std::optional<TensorPtr> loraConfig = std::nullopt, bool returnLogProbs = false,
+        bool returnContextLogits = false, bool returnGenerationLogits = false,
         std::optional<std::shared_ptr<VecTokens>> draftTokens = std::nullopt,
         std::optional<TensorPtr> draftLogits = std::nullopt, bool excludeInputFromOutput = false,
         std::optional<LogitsPostProcessor> logitsPostProcessor = std::nullopt)

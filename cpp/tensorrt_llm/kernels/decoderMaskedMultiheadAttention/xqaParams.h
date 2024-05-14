@@ -36,6 +36,7 @@ struct XQAParams
     float const* kv_scale_quant_orig = nullptr;
     int32_t const* host_past_key_value_lengths = nullptr;
     int32_t const* host_context_lengths = nullptr;
+    int32_t* semaphores = nullptr;
     void* workspaces = nullptr;
     uint32_t batch_size = 0;
     int32_t beam_width = 0;
@@ -44,11 +45,12 @@ struct XQAParams
     int32_t sink_token_length = 0;
     int timestep = 0;
     void const* qkv_bias;
-    int32_t const* sequence_lengths;           //
-    int32_t const* context_lengths;            // maybe not used now
-    void const* alibi_slopes;                  // maybe not used now
+    int32_t const* sequence_lengths;             //
+    int32_t const* context_lengths;              // maybe not used now
+    void const* alibi_slopes;                    // maybe not used now
     int32_t const* spec_decoding_packed_mask;
-    int const* spec_decoding_position_offsets; // rotary embedding.
+    int const* spec_decoding_position_offsets;   // rotary embedding.
+    int const* spec_decoding_generation_lengths; // variable input lengths.
 
     // almost copy from GPTAttentionPluginCommon.
     // maybe use one struct for parameters in GPTAttentionPluginCommon and share the same here.
@@ -64,6 +66,8 @@ struct XQAParams
     tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type;
     float rotary_embedding_scale;
     int rotary_embedding_max_positions;
+    int rotary_vision_start;
+    int rotary_vision_length;
     tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type;
     bool position_shift_enabled = false;
     bool remove_padding = false;

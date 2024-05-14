@@ -3,7 +3,7 @@ param (
     [switch]$skipCUDA,
     [switch]$skipPython,
     [switch]$skipMPI = $true,
-    [switch]$skipCUDNN,
+    [switch]$skipCUDNN = $true,
     [string]$cudaVersion, #CUDA version defaults to 12.4, specify otherwise
     [switch]$skipTRT = $true
 )

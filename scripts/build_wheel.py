@@ -204,6 +204,15 @@ def main(build_type: str = "Release",
             "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/libtensorrt_llm_nvrtc_wrapper.so",
             lib_dir / "libtensorrt_llm_nvrtc_wrapper.so")
 
+    bin_dir = pkg_dir / "bin"
+    if bin_dir.exists():
+        rmtree(bin_dir)
+    bin_dir.mkdir(parents=True)
+
+    if not on_windows:
+        copy(build_dir / "tensorrt_llm/executor_worker/executorWorker",
+             bin_dir / "executorWorker")
+
     if not cpp_only:
 
         def get_pybind_lib():

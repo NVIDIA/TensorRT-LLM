@@ -75,8 +75,6 @@ class GemmaDecoderLayer(Module):
     def forward(self,
                 hidden_states: Tensor,
                 attention_mask: Optional[Tensor] = None,
-                spec_decoding_packed_mask: Optional[Tensor] = None,
-                spec_decoding_position_offsets: Optional[Tensor] = None,
                 use_cache: bool = False,
                 kv_cache_params: Optional[KeyValueCacheParams] = None,
                 attention_params: Optional[AttentionParams] = None,
@@ -84,16 +82,12 @@ class GemmaDecoderLayer(Module):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
-        attention_output = self.attention(
-            hidden_states,
-            attention_mask=attention_mask,
-            spec_decoding_packed_mask=
-            spec_decoding_packed_mask,  # For Medusa support
-            spec_decoding_position_offsets=spec_decoding_position_offsets,
-            use_cache=use_cache,
-            kv_cache_params=kv_cache_params,
-            attention_params=attention_params,
-            lora_layer_params=lora_layer_params)
+        attention_output = self.attention(hidden_states,
+                                          attention_mask=attention_mask,
+                                          use_cache=use_cache,
+                                          kv_cache_params=kv_cache_params,
+                                          attention_params=attention_params,
+                                          lora_layer_params=lora_layer_params)
 
         if use_cache:
             attention_output, presents = attention_output

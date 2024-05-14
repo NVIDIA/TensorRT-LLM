@@ -47,7 +47,7 @@ public:
 
     ~PenaltyLayer() override;
 
-    void setup(runtime::SizeType batchSize, runtime::SizeType beamWidth, runtime::SizeType const* batchSlots,
+    void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 const* batchSlots,
         std::shared_ptr<BaseSetupParams> setupParams) override;
 
     //! \brief Modifies 'outputs->logits' in-place with -INF for banned words
@@ -94,9 +94,9 @@ private:
     bool mUseFrequencyPenalty{false};
     bool mUseMinLength{false};
 
-    runtime::SizeType mCyclicStep{0};
-    runtime::SizeType mRuntimeMaxSeqLen{0};
-    runtime::SizeType mConfiguredBeamWidth{-1};
+    runtime::SizeType32 mCyclicStep{0};
+    runtime::SizeType32 mRuntimeMaxSeqLen{0};
+    runtime::SizeType32 mConfiguredBeamWidth{-1};
 
     runtime::TokenIdType* mPenaltyWorkspaceDevice{nullptr};
     runtime::TokenIdType* mPenaltyWorkspacePrevDevice{nullptr};

@@ -46,9 +46,9 @@ public:
 class BeamSearchInputParams : public BaseInputParams
 {
 public:
-    explicit BeamSearchInputParams(runtime::SizeType step, runtime::SizeType ite, tc::Tensor logits, tc::Tensor endIds,
-        tc::Tensor src_cache_indirection, runtime::SizeType max_attention_window, runtime::SizeType sink_token_length,
-        runtime::SizeType max_seq_len)
+    explicit BeamSearchInputParams(runtime::SizeType32 step, runtime::SizeType32 ite, tc::Tensor logits,
+        tc::Tensor endIds, tc::Tensor src_cache_indirection, runtime::SizeType32 max_attention_window,
+        runtime::SizeType32 sink_token_length, runtime::SizeType32 max_seq_len)
         : BaseInputParams(step, ite, std::move(endIds))
         , logits{std::move(logits)}
         , max_attention_window{max_attention_window}
@@ -60,9 +60,9 @@ public:
 
     // mandatory parameters
     tc::Tensor logits; // [maxBatchSize, beamWidth, vocabSizePadded]
-    runtime::SizeType max_attention_window;
-    runtime::SizeType sink_token_length;
-    runtime::SizeType max_seq_len;
+    runtime::SizeType32 max_attention_window;
+    runtime::SizeType32 sink_token_length;
+    runtime::SizeType32 max_seq_len;
     tc::Tensor src_cache_indirection;        // [BS, BM, mSL]
     std::optional<tc::Tensor> input_lengths; // [BS, BM]
 };
@@ -93,8 +93,8 @@ public:
 
     ~BeamSearchLayer() override;
 
-    void setup(runtime::SizeType const batch_size, runtime::SizeType const beamWidth,
-        runtime::SizeType const* batchSlots, std::shared_ptr<BaseSetupParams> setupParams) override;
+    void setup(runtime::SizeType32 const batch_size, runtime::SizeType32 const beamWidth,
+        runtime::SizeType32 const* batchSlots, std::shared_ptr<BaseSetupParams> setupParams) override;
 
     void forward(std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs) override;
 
@@ -103,8 +103,8 @@ private:
     using Base::mStream;
 
     bool mIsAllocateBuffer;
-    runtime::SizeType mVocabSize{0};
-    runtime::SizeType mVocabSizePadded{0};
+    runtime::SizeType32 mVocabSize{0};
+    runtime::SizeType32 mVocabSizePadded{0};
     size_t mWorkspaceSize{0};
     void* mWorkspace{nullptr};
     // TODO: use pinned memory to simplify the buffers?
@@ -115,7 +115,7 @@ private:
     std::vector<float> mLengthPenaltyHost;
     std::vector<int> mEarlyStoppingHost;
 
-    void allocateBuffer(runtime::SizeType const batch_size, runtime::SizeType const beam_width);
+    void allocateBuffer(runtime::SizeType32 const batch_size, runtime::SizeType32 const beam_width);
     void freeBuffer();
 };
 

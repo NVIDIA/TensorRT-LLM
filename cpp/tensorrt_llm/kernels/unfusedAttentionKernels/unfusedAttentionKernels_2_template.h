@@ -808,22 +808,25 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
             }
             if ((params.head_num == params.kv_head_num) || (head_idx == (kv_head_idx * params.qheads_per_kv_head)))
             {
-                if (params.quantized_fp8_output)
+                if constexpr (STORE_QKV)
                 {
-                    // use 1.0f scale currently for qkv input of FP8 FMHA.
-                    mmha::convert_to_fp8(reinterpret_cast<QuantizedVecType*>(
-                                             reinterpret_cast<QuantizedEltType*>(params.QuantizedQKV) + src_k_idx),
-                        k);
-                    mmha::convert_to_fp8(reinterpret_cast<QuantizedVecType*>(
-                                             reinterpret_cast<QuantizedEltType*>(params.QuantizedQKV) + src_v_idx),
-                        v);
-                }
-                else
-                {
-                    *reinterpret_cast<VecT*>(&params.QKV[src_k_idx]) = k;
-                    if constexpr (ADD_BIAS)
+                    if (params.quantized_fp8_output)
                     {
-                        *reinterpret_cast<VecT*>(&params.QKV[src_v_idx]) = v;
+                        // use 1.0f scale currently for qkv input of FP8 FMHA.
+                        mmha::convert_to_fp8(reinterpret_cast<QuantizedVecType*>(
+                                                 reinterpret_cast<QuantizedEltType*>(params.QuantizedQKV) + src_k_idx),
+                            k);
+                        mmha::convert_to_fp8(reinterpret_cast<QuantizedVecType*>(
+                                                 reinterpret_cast<QuantizedEltType*>(params.QuantizedQKV) + src_v_idx),
+                            v);
+                    }
+                    else
+                    {
+                        *reinterpret_cast<VecT*>(&params.QKV[src_k_idx]) = k;
+                        if constexpr (ADD_BIAS)
+                        {
+                            *reinterpret_cast<VecT*>(&params.QKV[src_v_idx]) = v;
+                        }
                     }
                 }
 
@@ -1024,8 +1027,10 @@ void invokeApplyBiasRopeUpdateKVCacheDispatch(QKVPreprocessingParams<T, KVCacheB
     // Use specialized kernels for different heads (better balance of work).
     TLLM_CHECK_WITH_INFO(params.size_per_head % 8 == 0, "Head size needs to be multiple of 8!");
     TLLM_CHECK_WITH_INFO(params.rotary_embedding_dim % 8 == 0, "Rotary embedding dimension needs to be multiple of 8!");
-    TLLM_CHECK_WITH_INFO(!(params.quantized_fp8_output && params.QuantizedQKV == nullptr),
-        "Separate quantized O buffer is not provided!");
+    TLLM_CHECK_WITH_INFO(
+        !(params.quantized_fp8_output && !params.enable_paged_kv_fmha && params.QuantizedQKV == nullptr)
+            && !(params.quantized_fp8_output && params.enable_paged_kv_fmha && params.Q == nullptr),
+        "Separate quantized buffer is not provided!");
 
     // Long-sequence-length that exceeds the max_position_size needs to compute the cos/sin on-the-fly.
     bool const long_seq_rotary_support = params.rotary_scale_type == RotaryScalingType::kDYNAMIC

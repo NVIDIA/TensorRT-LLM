@@ -41,8 +41,8 @@ namespace kernels
 template <typename T, int32_t BLOCK_SIZE_, int32_t BLOCKS_PER_BEAM_>
 __global__ void topKStage1(T const* __restrict logProbs, T const* const* __restrict logProbsPtrs, T* tmpLogProbs,
     SizeType32* topKTmpIdBuf, T* topKTmpValBuf, FinishedState const* finished, SizeType32 maxTopK,
-    SizeType32 const* topKs, SizeType vocabSize, TokenIdType const* endIds, bool const* skipDecode,
-    SizeType32 const* batchSlots, SizeType32 const* tokensPerStep, SizeType maxTokensPerStep)
+    SizeType32 const* topKs, SizeType32 vocabSize, TokenIdType const* endIds, bool const* skipDecode,
+    SizeType32 const* batchSlots, SizeType32 const* tokensPerStep, SizeType32 maxTokensPerStep)
 {
     typedef cub::BlockReduce<TopK_2<T>, BLOCK_SIZE_> BlockReduce;
     __shared__ typename BlockReduce::TempStorage tempStorage;
@@ -134,10 +134,10 @@ __global__ void topKStage1(T const* __restrict logProbs, T const* const* __restr
 template <typename T, int BLOCK_SIZE_, int BLOCKS_PER_BEAM_>
 __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T* topKTmpValBuf, TokenIdType** idsPtrs,
     TokenIdType* ids, SizeType32* sequenceLengths, FinishedState const* finishedInput, FinishedState* finishedOutput,
-    float* cumLogProbs, float* outputLogProbs, SizeType maxTopK, SizeType32 const* topKs, float topP,
-    float const* topPs, curandState_t* curandState, TokenIdType const* endIds, SizeType vocabSize,
-    bool const* skipDecode, SizeType32 const* batchSlots, SizeType maxBatchSize, bool normalizeLogProbs,
-    bool logitHasProbs, SizeType32 const* tokensPerStep, SizeType maxTokensPerStep, SizeType maxSeqLen,
+    float* cumLogProbs, float* outputLogProbs, SizeType32 maxTopK, SizeType32 const* topKs, float topP,
+    float const* topPs, curandState_t* curandState, TokenIdType const* endIds, SizeType32 vocabSize,
+    bool const* skipDecode, SizeType32 const* batchSlots, SizeType32 maxBatchSize, bool normalizeLogProbs,
+    bool logitHasProbs, SizeType32 const* tokensPerStep, SizeType32 maxTokensPerStep, SizeType32 maxSeqLen,
     bool returnAllTopK)
 {
     bool const IS_FP16 = std::is_same<T, half>::value;

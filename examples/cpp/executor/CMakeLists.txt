@@ -91,8 +91,9 @@ endif()
 # tensorrt_llm shared lib
 add_library(tensorrt_llm SHARED IMPORTED)
 set_property(TARGET tensorrt_llm PROPERTY IMPORTED_LOCATION ${TRTLLM_LIB_PATH})
-set_property(TARGET tensorrt_llm PROPERTY IMPORTED_LINK_INTERFACE_LIBRARIES
-                                          CUDA::cuda_driver CUDA::cudart_static)
+set_property(
+  TARGET tensorrt_llm PROPERTY IMPORTED_LINK_INTERFACE_LIBRARIES
+                               CUDA::cuda_driver CUDA::cudart_static CUDA::nvml)
 
 # nvinfer_plugin_tensorrt_llm shared lib
 add_library(nvinfer_plugin_tensorrt_llm SHARED IMPORTED)

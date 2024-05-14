@@ -8,9 +8,10 @@ This section is for advanced users. Skip this section if you plan to use the pre
 
 ## Prerequisites
 
-1. Install [CMake](https://cmake.org/download/), version 3.27.7 is recommended, and select the option to add it to the system path.
-2. Download and install [Visual Studio 2022](https://visualstudio.microsoft.com/).
-3. Download and unzip [TensorRT 10.0.1.6](https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.0.1/zip/TensorRT-10.0.1.6.Windows10.win10.cuda-12.4.zip).
+1. Install prerequisites listed in our [Installing on Windows](https://nvidia.github.io/TensorRT-LLM/installation/windows.html) document.
+2. Install [CMake](https://cmake.org/download/), version 3.27.7 is recommended, and select the option to add it to the system path.
+3. Download and install [Visual Studio 2022](https://visualstudio.microsoft.com/).
+4. Download and unzip [TensorRT 10.0.1.6](https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.0.1/zip/TensorRT-10.0.1.6.Windows10.win10.cuda-12.4.zip).
 
 ## Building a TensorRT-LLM Docker Image
 
@@ -75,7 +76,8 @@ python .\scripts\build_wheel.py -a "89-real" --trt_root C:\workspace\TensorRT-10
 
 **Prerequisites**
 
-1. Install Nsight NVTX. TensorRT-LLM on Windows currently depends on NVTX assets that do not come packaged with the CUDA 12.2 installer. To install these assets, download the [CUDA 11.8 Toolkit](https://developer.nvidia.com/cuda-11-8-0-download-archive?target_os=Windows&target_arch=x86_64).
+1. Install all prerequisites (`git`, `python`, `CUDA`) listed in our [Installing on Windows](https://nvidia.github.io/TensorRT-LLM/installation/windows.html) document.
+2. Install Nsight NVTX. TensorRT-LLM on Windows currently depends on NVTX assets that do not come packaged with the CUDA 12.4 installer. To install these assets, download the [CUDA 11.8 Toolkit](https://developer.nvidia.com/cuda-11-8-0-download-archive?target_os=Windows&target_arch=x86_64).
 
     1. During installation, select **Advanced installation**.
 
@@ -83,7 +85,7 @@ python .\scripts\build_wheel.py -a "89-real" --trt_root C:\workspace\TensorRT-10
 
     3. Deselect all packages, and select **Nsight NVTX**.
 
-2. Install the dependencies one of two ways:
+3. Install the dependencies one of two ways:
 
     1. Run the `setup_build_env.ps1` script, which installs CMake, Microsoft Visual Studio Build Tools, and TensorRT automatically with default settings.
 
@@ -161,12 +163,11 @@ This section is for advanced users. Skip this section if you do not intend to us
 
 Building from source creates libraries that can be used if you wish to directly link against the C++ runtime for TensorRT-LLM. These libraries are also required if you wish to run C++ unit tests and some benchmarks.
 
-Building from source produces the following library files:
-- `tensorrt_llm` libraries located in `cpp\build\tensorrt_llm\Release`
+Building from source produces the following library files.
+- `tensorrt_llm` libraries located in `cpp\build\tensorrt_llm`
   - `tensorrt_llm.dll` - Shared library
   - `tensorrt_llm.exp` - Export file
   - `tensorrt_llm.lib` - Stub for linking to `tensorrt_llm.dll`
-  - `tensorrt_llm_static.lib` - Static library
 - Dependency libraries (these get copied to `tensorrt_llm\libs\`)
   - `nvinfer_plugin_tensorrt_llm` libraries located in `cpp\build\tensorrt_llm\plugins\`
     - `nvinfer_plugin_tensorrt_llm.dll`

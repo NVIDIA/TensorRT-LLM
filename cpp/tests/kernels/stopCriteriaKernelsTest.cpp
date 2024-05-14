@@ -48,8 +48,8 @@ public:
 
     void TearDown() override {}
 
-    void initData(SizeType seed, std::vector<std::vector<std::vector<SizeType>>> const& stopWords,
-        SizeType maxStopWordsLen, SizeType batchSize, SizeType beamWidth)
+    void initData(SizeType32 seed, std::vector<std::vector<std::vector<SizeType32>>> const& stopWords,
+        SizeType32 maxStopWordsLen, SizeType32 batchSize, SizeType32 beamWidth)
     {
         auto const maxBatchSize = 2 * batchSize;
 
@@ -84,32 +84,32 @@ public:
         mBatchSlots = BufferManager::pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
 
         auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
-        for (SizeType bi = 0; bi < batchSize; ++bi)
+        for (SizeType32 bi = 0; bi < batchSize; ++bi)
         {
             batchSlotsPtr[bi] = 2 * bi;
         }
 
-        auto sequenceLengthsPtr = bufferCast<SizeType>(*mSequenceLengths);
-        auto sequenceLengthLimitsPtr = bufferCast<SizeType>(*mSequenceLengthLimits);
+        auto sequenceLengthsPtr = bufferCast<SizeType32>(*mSequenceLengths);
+        auto sequenceLengthLimitsPtr = bufferCast<SizeType32>(*mSequenceLengthLimits);
         auto finishedPtr
             = reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*mFinished));
-        auto finishedSumPtr = bufferCast<SizeType>(*mFinishedSum);
+        auto finishedSumPtr = bufferCast<SizeType32>(*mFinishedSum);
 
-        for (SizeType bi = 0; bi < maxBatchSize; ++bi)
+        for (SizeType32 bi = 0; bi < maxBatchSize; ++bi)
         {
-            for (SizeType ri = 0; ri < beamWidth; ri++)
+            for (SizeType32 ri = 0; ri < beamWidth; ri++)
             {
                 sequenceLengthsPtr[bi * beamWidth + ri] = maxStopWordsLen == 0
                     ? seqLenDistr(generator)
-                    : mMaxSeqLen - (static_cast<SizeType>(bi / 2) + ri) % mMaxSeqLen;
+                    : mMaxSeqLen - (static_cast<SizeType32>(bi / 2) + ri) % mMaxSeqLen;
                 finishedPtr[bi * beamWidth + ri] = tk::FinishedState::empty();
             }
         }
-        for (SizeType bi = 0; bi < maxBatchSize; ++bi)
+        for (SizeType32 bi = 0; bi < maxBatchSize; ++bi)
         {
             sequenceLengthLimitsPtr[bi] = maxStopWordsLen == 0
                 ? seqLenDistr(generator)
-                : mMaxSeqLen - static_cast<SizeType>(bi / 2) % mMaxSeqLen;
+                : mMaxSeqLen - static_cast<SizeType32>(bi / 2) % mMaxSeqLen;
             finishedSumPtr[bi] = 0;
         }
 
@@ -134,11 +134,11 @@ public:
         // bi: 5, ri: 1: [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]
         // bi: 6, ri: 0: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
         // bi: 6, ri: 1: [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
-        for (SizeType bi = 0; bi < maxBatchSize; bi++)
+        for (SizeType32 bi = 0; bi < maxBatchSize; bi++)
         {
-            for (SizeType ri = 0; ri < beamWidth; ri++)
+            for (SizeType32 ri = 0; ri < beamWidth; ri++)
             {
-                for (SizeType si = 0; si < mMaxSeqLen; si++)
+                for (SizeType32 si = 0; si < mMaxSeqLen; si++)
                 {
                     auto const idx = tc::flat_index3(bi, ri, si, beamWidth, mMaxSeqLen);
                     outputIdsData[idx] = ri * mMaxSeqLen + si;
@@ -147,7 +147,7 @@ public:
             }
         }
 
-        for (SizeType bi = 0; bi < maxBatchSize; bi++)
+        for (SizeType32 bi = 0; bi < maxBatchSize; bi++)
         {
             outputIdsPtrsData[bi] = outputIdsData + bi * beamWidth * mMaxSeqLen;
             parentIdsPtrsData[bi] = parentIdsData + bi * beamWidth * mMaxSeqLen;
@@ -156,12 +156,12 @@ public:
         // Init stop words tensor
         auto stopWordsData = bufferCast<int32_t>(*mStopWords);
         std::fill(stopWordsData, stopWordsData + maxBatchSize * 2 * maxStopWordsLen, -1);
-        for (SizeType bi = 0; bi < stopWords.size(); bi++)
+        for (SizeType32 bi = 0; bi < stopWords.size(); bi++)
         {
-            SizeType totalLen = 0;
-            for (SizeType wi = 0; wi < stopWords[bi].size(); ++wi)
+            SizeType32 totalLen = 0;
+            for (SizeType32 wi = 0; wi < stopWords[bi].size(); ++wi)
             {
-                for (SizeType si = 0; si < stopWords[bi][wi].size(); ++si)
+                for (SizeType32 si = 0; si < stopWords[bi][wi].size(); ++si)
                 {
                     stopWordsData[bi * 2 * maxStopWordsLen + 0 * maxStopWordsLen + totalLen + si]
                         = stopWords[bi][wi][si];
@@ -182,11 +182,11 @@ public:
 
         auto stopWordsPtr = BufferRange<int32_t*>(*mStopWordsPtr);
         auto stopWordsLensPtr = bufferCast<int32_t>(*mStopWordsLen);
-        for (SizeType bi = 0; bi < stopWords.size(); bi++)
+        for (SizeType32 bi = 0; bi < stopWords.size(); bi++)
         {
             stopWordsPtr[bi] = stopWordsData + bi * 2 * maxStopWordsLen;
 
-            SizeType stopWordsLen = 0;
+            SizeType32 stopWordsLen = 0;
             for (auto const& words : stopWords[bi])
             {
                 stopWordsLen += words.size();
@@ -199,22 +199,22 @@ public:
         }
     }
 
-    void verifyMaxSeqLenStopCriteriaResults(SizeType seed, SizeType batchSize, SizeType beamWidth)
+    void verifyMaxSeqLenStopCriteriaResults(SizeType32 seed, SizeType32 batchSize, SizeType32 beamWidth)
     {
         mStream->synchronize();
 
-        auto sequenceLengthsPtr = bufferCast<SizeType>(*mSequenceLengths);
-        auto sequenceLengthLimitsPtr = bufferCast<SizeType>(*mSequenceLengthLimits);
+        auto sequenceLengthsPtr = bufferCast<SizeType32>(*mSequenceLengths);
+        auto sequenceLengthLimitsPtr = bufferCast<SizeType32>(*mSequenceLengthLimits);
         auto finishedPtr
             = reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*mFinished));
-        auto finishedSumPtr = bufferCast<SizeType>(*mFinishedSum);
+        auto finishedSumPtr = bufferCast<SizeType32>(*mFinishedSum);
         auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
 
-        for (SizeType batchIdx = 0; batchIdx < batchSize; ++batchIdx)
+        for (SizeType32 batchIdx = 0; batchIdx < batchSize; ++batchIdx)
         {
             int32_t refSumFinished = 0;
             auto const batchSlot = batchSlotsPtr[batchIdx];
-            for (SizeType beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
+            for (SizeType32 beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
             {
                 auto const batchBeamIdx = batchSlot * beamWidth + beamIdx;
                 auto const limitExceeded = sequenceLengthsPtr[batchBeamIdx] >= sequenceLengthLimitsPtr[batchSlot];
@@ -229,32 +229,32 @@ public:
         }
     }
 
-    bool isSubsequence(SizeType const* sequence, SizeType n, std::vector<int> const& subsequence)
+    bool isSubsequence(SizeType32 const* sequence, SizeType32 n, std::vector<int> const& subsequence)
     {
         auto it = std::search(sequence, sequence + n, subsequence.begin(), subsequence.end());
         return it != sequence + n;
     }
 
-    void verifyStopWordsStopCriteriaResults(SizeType seed,
-        std::vector<std::vector<std::vector<SizeType>>> const& stopWords, SizeType stopWordsLen, SizeType batchSize,
-        SizeType beamWidth)
+    void verifyStopWordsStopCriteriaResults(SizeType32 seed,
+        std::vector<std::vector<std::vector<SizeType32>>> const& stopWords, SizeType32 stopWordsLen,
+        SizeType32 batchSize, SizeType32 beamWidth)
     {
         mStream->synchronize();
 
         auto outputIdsData = bufferCast<int32_t>(*mOutputIds);
         auto finishedPtr
             = reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*mFinished));
-        auto sequenceLengthsPtr = bufferCast<SizeType>(*mSequenceLengths);
+        auto sequenceLengthsPtr = bufferCast<SizeType32>(*mSequenceLengths);
         auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
 
-        for (SizeType bi = 0; bi < batchSize; bi++)
+        for (SizeType32 bi = 0; bi < batchSize; bi++)
         {
             auto const batchSlot = batchSlotsPtr[bi];
-            for (SizeType bwi = 0; bwi < beamWidth; bwi++)
+            for (SizeType32 bwi = 0; bwi < beamWidth; bwi++)
             {
                 auto outputIdsBatchBeam = outputIdsData + batchSlot * beamWidth * mMaxSeqLen + bwi * mMaxSeqLen;
                 bool found = false;
-                for (SizeType wi = 0; wi < stopWords[batchSlot].size(); ++wi)
+                for (SizeType32 wi = 0; wi < stopWords[batchSlot].size(); ++wi)
                 {
                     auto const wordLen = stopWords[batchSlot][wi].size();
                     auto const seqLen = sequenceLengthsPtr[batchSlot * beamWidth + bwi];
@@ -275,12 +275,12 @@ public:
     }
 
     void runStopWordsCriteriaTest(
-        std::vector<std::vector<std::vector<SizeType>>> const& stopWords, SizeType batchSize, SizeType beamWidth)
+        std::vector<std::vector<std::vector<SizeType32>>> const& stopWords, SizeType32 batchSize, SizeType32 beamWidth)
     {
-        SizeType maxStopWordsLen = 0;
+        SizeType32 maxStopWordsLen = 0;
         for (auto const& batchStopWords : stopWords)
         {
-            SizeType stopWordsLen = 0;
+            SizeType32 stopWordsLen = 0;
             for (auto const& words : batchStopWords)
             {
                 stopWordsLen += words.size();
@@ -298,21 +298,21 @@ public:
             reinterpret_cast<int32_t const**>(bufferCast<int64_t>(*mParentIdsPtr)),
             reinterpret_cast<int32_t const**>(bufferCast<int64_t>(*mStopWordsPtr)),
             reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*mFinished)),
-            bufferCast<SizeType>(*mSequenceLengths), bufferCast<int32_t>(*mBatchSlots),
-            bufferCast<SizeType>(*mStopWordsLen), maxStopWordsLen, batchSize, beamWidth, mMaxSeqLen, mStream->get());
+            bufferCast<SizeType32>(*mSequenceLengths), bufferCast<int32_t>(*mBatchSlots),
+            bufferCast<SizeType32>(*mStopWordsLen), maxStopWordsLen, batchSize, beamWidth, mMaxSeqLen, mStream->get());
 
         verifyStopWordsStopCriteriaResults(0, stopWords, maxStopWordsLen, batchSize, beamWidth);
     }
 
-    void runMaxLengthCriteriaTest(SizeType seed, SizeType batchSize, SizeType beamWidth)
+    void runMaxLengthCriteriaTest(SizeType32 seed, SizeType32 batchSize, SizeType32 beamWidth)
     {
         initData(seed, {}, 0, batchSize, beamWidth);
 
         tk::invokeLengthCriterion(
             reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*mFinished)),
-            bufferCast<SizeType>(*mFinishedSum),
-            reinterpret_cast<SizeType32 const*>(bufferCast<SizeType>(*mSequenceLengthLimits)),
-            bufferCast<SizeType>(*mSequenceLengths), bufferCast<int32_t>(*mBatchSlots), batchSize, beamWidth,
+            bufferCast<SizeType32>(*mFinishedSum),
+            reinterpret_cast<SizeType32 const*>(bufferCast<SizeType32>(*mSequenceLengthLimits)),
+            bufferCast<SizeType32>(*mSequenceLengths), bufferCast<int32_t>(*mBatchSlots), batchSize, beamWidth,
             mStream->get());
 
         verifyMaxSeqLenStopCriteriaResults(seed, batchSize, beamWidth);
@@ -337,16 +337,16 @@ protected:
     TensorPtr mStopWordsLen;
     TensorPtr mBatchSlots;
 
-    static constexpr SizeType mMaxSeqLen{16};
-    static constexpr SizeType mVocabSize{32};
+    static constexpr SizeType32 mMaxSeqLen{16};
+    static constexpr SizeType32 mVocabSize{32};
 };
 
 TEST_F(StopCriteriaKernelsTest, maxLengthCriteriaBS1BW1Test)
 {
-    constexpr SizeType seeds = 64;
-    constexpr SizeType batchSize = 1;
-    constexpr SizeType beamWidth = 1;
-    for (SizeType seed = 0; seed < seeds; ++seed)
+    constexpr SizeType32 seeds = 64;
+    constexpr SizeType32 batchSize = 1;
+    constexpr SizeType32 beamWidth = 1;
+    for (SizeType32 seed = 0; seed < seeds; ++seed)
     {
         this->runMaxLengthCriteriaTest(seed, batchSize, beamWidth);
     }
@@ -354,10 +354,10 @@ TEST_F(StopCriteriaKernelsTest, maxLengthCriteriaBS1BW1Test)
 
 TEST_F(StopCriteriaKernelsTest, maxLengthCriteriaBS1BW2Test)
 {
-    constexpr SizeType seeds = 64;
-    constexpr SizeType batchSize = 1;
-    constexpr SizeType beamWidth = 2;
-    for (SizeType seed = 0; seed < seeds; ++seed)
+    constexpr SizeType32 seeds = 64;
+    constexpr SizeType32 batchSize = 1;
+    constexpr SizeType32 beamWidth = 2;
+    for (SizeType32 seed = 0; seed < seeds; ++seed)
     {
         this->runMaxLengthCriteriaTest(seed, batchSize, beamWidth);
     }
@@ -365,10 +365,10 @@ TEST_F(StopCriteriaKernelsTest, maxLengthCriteriaBS1BW2Test)
 
 TEST_F(StopCriteriaKernelsTest, maxLengthCriteriaBS1024BW1Test)
 {
-    constexpr SizeType seeds = 64;
-    constexpr SizeType batchSize = 1024;
-    constexpr SizeType beamWidth = 1;
-    for (SizeType seed = 0; seed < seeds; ++seed)
+    constexpr SizeType32 seeds = 64;
+    constexpr SizeType32 batchSize = 1024;
+    constexpr SizeType32 beamWidth = 1;
+    for (SizeType32 seed = 0; seed < seeds; ++seed)
     {
         this->runMaxLengthCriteriaTest(seed, batchSize, beamWidth);
     }
@@ -376,10 +376,10 @@ TEST_F(StopCriteriaKernelsTest, maxLengthCriteriaBS1024BW1Test)
 
 TEST_F(StopCriteriaKernelsTest, maxLengthCriteriaBS1024BW2Test)
 {
-    constexpr SizeType seeds = 64;
-    constexpr SizeType batchSize = 1024;
-    constexpr SizeType beamWidth = 2;
-    for (SizeType seed = 0; seed < seeds; ++seed)
+    constexpr SizeType32 seeds = 64;
+    constexpr SizeType32 batchSize = 1024;
+    constexpr SizeType32 beamWidth = 2;
+    for (SizeType32 seed = 0; seed < seeds; ++seed)
     {
         this->runMaxLengthCriteriaTest(seed, batchSize, beamWidth);
     }
@@ -387,48 +387,48 @@ TEST_F(StopCriteriaKernelsTest, maxLengthCriteriaBS1024BW2Test)
 
 TEST_F(StopCriteriaKernelsTest, stopWordsCriteriaBS1SingleTokenSingleWordTest)
 {
-    constexpr SizeType batchSize = 1;
-    constexpr SizeType beamWidth = 1;
+    constexpr SizeType32 batchSize = 1;
+    constexpr SizeType32 beamWidth = 1;
     // Expected to not match any word
     this->runStopWordsCriteriaTest({{{2}}, {{2}}}, batchSize, beamWidth);
 }
 
 TEST_F(StopCriteriaKernelsTest, stopWordsCriteriaBS1SingleTokenMultipleWordsTest)
 {
-    constexpr SizeType batchSize = 1;
-    constexpr SizeType beamWidth = 1;
+    constexpr SizeType32 batchSize = 1;
+    constexpr SizeType32 beamWidth = 1;
     // Expected to match 15
     this->runStopWordsCriteriaTest({{{145}, {4}, {1}, {15}}, {{}}}, batchSize, beamWidth);
 }
 
 TEST_F(StopCriteriaKernelsTest, stopWordsCriteriaBS1MultipleTokensSingleWordTest)
 {
-    constexpr SizeType batchSize = 1;
-    constexpr SizeType beamWidth = 1;
+    constexpr SizeType32 batchSize = 1;
+    constexpr SizeType32 beamWidth = 1;
     // Expected to not match any word
     this->runStopWordsCriteriaTest({{{2, 3}}, {{}}}, batchSize, beamWidth);
 }
 
 TEST_F(StopCriteriaKernelsTest, stopWordsCriteriaBS1MultipleTokensMultipleWordsMatchTest)
 {
-    constexpr SizeType batchSize = 1;
-    constexpr SizeType beamWidth = 1;
+    constexpr SizeType32 batchSize = 1;
+    constexpr SizeType32 beamWidth = 1;
     // Expected to match {13, 14, 15}
     this->runStopWordsCriteriaTest({{{1, 4}, {2, 3}, {13, 14, 15}}, {{}}}, batchSize, beamWidth);
 }
 
 TEST_F(StopCriteriaKernelsTest, stopWordsCriteriaBS1MultipleTokensMultipleWordsNotMatchTest)
 {
-    constexpr SizeType batchSize = 1;
-    constexpr SizeType beamWidth = 1;
+    constexpr SizeType32 batchSize = 1;
+    constexpr SizeType32 beamWidth = 1;
     // Expected to not match any word
     this->runStopWordsCriteriaTest({{{1, 4}, {2, 3}, {12, 14, 15}}, {{}}}, batchSize, beamWidth);
 }
 
 TEST_F(StopCriteriaKernelsTest, stopWordsCriteriaBS4MultipleTokensMultipleWordsTest)
 {
-    constexpr SizeType batchSize = 4;
-    constexpr SizeType beamWidth = 1;
+    constexpr SizeType32 batchSize = 4;
+    constexpr SizeType32 beamWidth = 1;
     // Expected to match {12, 13} for the 5th instance in the batch
     this->runStopWordsCriteriaTest(
         {{{2}}, {{}}, {{}}, {{}}, {{15}, {12, 13}}, {{}}, {{1}, {8, 9}}, {{}}}, batchSize, beamWidth);
@@ -436,8 +436,8 @@ TEST_F(StopCriteriaKernelsTest, stopWordsCriteriaBS4MultipleTokensMultipleWordsT
 
 TEST_F(StopCriteriaKernelsTest, stopWordsCriteriaBS4BW2MultipleTokensMultipleWordsTest)
 {
-    constexpr SizeType batchSize = 4;
-    constexpr SizeType beamWidth = 2;
+    constexpr SizeType32 batchSize = 4;
+    constexpr SizeType32 beamWidth = 2;
     // Expected to match {12, 13} to {bi, bw}={{5, 0}}
     // Expected to match {11, 12} to {bi, bw}={{7, 0}}
     // Expected to match {27} to {bi, bw}={{5, 1}}

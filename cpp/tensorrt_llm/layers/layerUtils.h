@@ -40,7 +40,7 @@ struct FillBuffers
 
     template <typename T>
     void operator()(std::optional<std::vector<T>> const& optParam, T const defaultValue, std::vector<T>& hostBuffer,
-        T* deviceBuffer, runtime::SizeType const* batchSlots, std::pair<float, float> const& limits,
+        T* deviceBuffer, runtime::SizeType32 const* batchSlots, std::pair<float, float> const& limits,
         std::string const& name) const
     {
         using tensorrt_llm::common::cudaAutoCpy;
@@ -77,17 +77,17 @@ struct FillBuffers
         }
     }
 
-    runtime::SizeType batchSize;
-    runtime::SizeType maxBatchSize;
+    runtime::SizeType32 batchSize;
+    runtime::SizeType32 maxBatchSize;
     cudaStream_t stream;
 };
 
 template <typename T>
 inline bool allOfBatchSlots(
-    runtime::SizeType const* batchSlotsHost, T const* data, runtime::SizeType batchSize, T value)
+    runtime::SizeType32 const* batchSlotsHost, T const* data, runtime::SizeType32 batchSize, T value)
 {
     return std::all_of(
-        batchSlotsHost, batchSlotsHost + batchSize, [&](runtime::SizeType b) { return data[b] == value; });
+        batchSlotsHost, batchSlotsHost + batchSize, [&](runtime::SizeType32 b) { return data[b] == value; });
 };
 
 } // namespace layers

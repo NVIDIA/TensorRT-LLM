@@ -42,7 +42,7 @@ class Request;
 class Tensor;
 
 using TensorPtr = std::shared_ptr<Tensor>;
-using SizeType = std::int32_t;
+using SizeType32 = std::int32_t;
 using FloatType = float;
 using TokenIdType = std::int32_t;
 using VecTokens = std::vector<TokenIdType>;
@@ -54,7 +54,7 @@ using VecLogProbs = std::vector<FloatType>;
 using StreamPtr = std::shared_ptr<tensorrt_llm::runtime::CudaStream>;
 using LogitsPostProcessor = std::function<void(IdType, Tensor&, BeamTokens const&, StreamPtr&)>;
 using LogitsPostProcessorMap = std::unordered_map<std::string, LogitsPostProcessor>;
-using MedusaChoices = std::vector<std::vector<SizeType>>;
+using MedusaChoices = std::vector<std::vector<SizeType32>>;
 
 enum class DataType
 {
@@ -169,7 +169,7 @@ enum class BatchingType
 };
 
 /// @brief The policy used to select the subset of available requests in each iteration of the executor generation loop
-enum class SchedulerPolicy
+enum class CapacitySchedulerPolicy
 {
     /// @brief MAX_UTILIZATION packs as many requests as the underlying TRT engine can support in any iteration of the
     /// InflightBatching generation loop. While this is expected to maximize GPU throughput, it might require that some
@@ -180,6 +180,20 @@ enum class SchedulerPolicy
     /// to completion without eviction.
     kGUARANTEED_NO_EVICT = 1,
 };
+
+std::ostream& operator<<(std::ostream& os, CapacitySchedulerPolicy policy);
+
+enum class ContextChunkingPolicy
+{
+    /// @brief Sequential chunking, complete the unfinished context phase first.
+    kFIRST_COME_FIRST_SERVED = 0,
+
+    /// @brief Iterate through each context request in sequence and attempt to increase its chunk
+    /// count until the constraint is exceeded.
+    kEQUAL_PROGRESS = 1,
+};
+
+std::ostream& operator<<(std::ostream& os, ContextChunkingPolicy policy);
 
 enum class CommunicationType
 {
@@ -200,45 +214,45 @@ enum class CommunicationMode
 struct KvCacheStats
 {
     /// @brief Max number of blocks
-    SizeType maxNumBlocks;
+    SizeType32 maxNumBlocks;
     /// @brief Number of free blocks
-    SizeType freeNumBlocks;
+    SizeType32 freeNumBlocks;
     /// @brief Number of used blocks
-    SizeType usedNumBlocks;
+    SizeType32 usedNumBlocks;
     /// @brief Number of tokens per block
-    SizeType tokensPerBlock;
+    SizeType32 tokensPerBlock;
 };
 
 /// @brief Struct that holds the stats of static batching models for a single iteration
 struct StaticBatchingStats
 {
     /// @brief Number of scheduled requests
-    SizeType numScheduledRequests;
+    SizeType32 numScheduledRequests;
     /// @brief Number of requests in context stage
-    SizeType numContextRequests;
+    SizeType32 numContextRequests;
     /// @brief Total number of context tokens in the iteration
-    SizeType numCtxTokens;
+    SizeType32 numCtxTokens;
     /// @brief Total number of tokens to generate in the iteration
-    SizeType numGenTokens;
+    SizeType32 numGenTokens;
     /// @brief Total number of unused generation token slots
-    SizeType emptyGenSlots;
+    SizeType32 emptyGenSlots;
 };
 
 /// @brief Struct that holds the stats of inflight batching models for a single iteration
 struct InflightBatchingStats
 {
     /// @brief Number of scheduled requests
-    SizeType numScheduledRequests;
+    SizeType32 numScheduledRequests;
     /// @brief Number of requests in context stage
-    SizeType numContextRequests;
+    SizeType32 numContextRequests;
     /// @brief Number of requests in generation stage
-    SizeType numGenRequests;
+    SizeType32 numGenRequests;
     /// @brief Number of paused requests
-    SizeType numPausedRequests;
+    SizeType32 numPausedRequests;
     /// @brief Total number of context tokens in the iteration
-    SizeType numCtxTokens;
+    SizeType32 numCtxTokens;
     /// @brief Index of mirco batch
-    SizeType microBatchId;
+    SizeType32 microBatchId;
 };
 
 /// @brief Struct that holds the stats of a single iteration
@@ -249,9 +263,9 @@ struct IterationStats
     /// @brief Iteration id
     IterationType iter;
     /// @brief Number of active requests
-    SizeType numActiveRequests;
+    SizeType32 numActiveRequests;
     /// @brief Number of max active requests
-    SizeType maxNumActiveRequests;
+    SizeType32 maxNumActiveRequests;
     /// @brief GPU memory usage in bytes
     size_t gpuMemUsage;
     /// @brief CPU memory usage in bytes
@@ -289,9 +303,9 @@ struct RequestStats
     /// @brief The current stage the request is in
     RequestStage stage;
     /// @brief If using chunked context, the current context prefill position
-    SizeType contextPrefillPosition;
+    SizeType32 contextPrefillPosition;
     /// @brief The number of generated tokens so far
-    SizeType numGeneratedTokens;
+    SizeType32 numGeneratedTokens;
     /// @brief Whether the request is scheduled for the current iteration
     bool scheduled;
     /// @brief Whether the request is being paused at the current iteration due to lack of resources (KV cache blocks

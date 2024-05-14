@@ -28,9 +28,9 @@ class MedusaModule
 {
 public:
     using TensorPtr = ITensor::SharedPtr;
-    using MedusaChoices = std::vector<std::vector<SizeType>>;
+    using MedusaChoices = std::vector<std::vector<SizeType32>>;
 
-    explicit MedusaModule(SizeType medusaHeads, SizeType maxMedusaTokens) noexcept
+    explicit MedusaModule(SizeType32 medusaHeads, SizeType32 maxMedusaTokens) noexcept
         : mMedusaHeads(medusaHeads)
         , mMaxMedusaTokens(maxMedusaTokens)
         , mTokensPerStep(mMaxMedusaTokens + 1)
@@ -46,22 +46,22 @@ public:
     MedusaModule(MedusaModule const& o) = default;
     MedusaModule& operator=(MedusaModule const& o) = default;
 
-    [[nodiscard]] SizeType medusaHeads() const noexcept
+    [[nodiscard]] SizeType32 medusaHeads() const noexcept
     {
         return mMedusaHeads;
     }
 
-    [[nodiscard]] SizeType maxMedusaTokens() const noexcept
+    [[nodiscard]] SizeType32 maxMedusaTokens() const noexcept
     {
         return mMaxMedusaTokens;
     }
 
-    [[nodiscard]] SizeType tokensPerStep() const noexcept
+    [[nodiscard]] SizeType32 tokensPerStep() const noexcept
     {
         return mTokensPerStep;
     }
 
-    [[nodiscard]] SizeType numPackedMasks() const noexcept
+    [[nodiscard]] SizeType32 numPackedMasks() const noexcept
     {
         return mNumPackedMasks;
     }
@@ -71,38 +71,38 @@ public:
         return mDefaultMedusaChoices;
     }
 
-    void initMedusaTensorsFromChoices(MedusaChoices const& choices, std::vector<SizeType>& topKs,
-        TensorPtr& positionOffsets, TensorPtr& treeIds, TensorPtr& paths, TensorPtr& packedMask,
-        SizeType& totalPaths) const noexcept;
+    void initMedusaTensorsFromChoices(MedusaChoices const& choices, std::vector<SizeType32>& topKs,
+        TensorPtr& generationInputLengths, TensorPtr& positionOffsets, TensorPtr& treeIds, TensorPtr& paths,
+        TensorPtr& packedMask, SizeType32& totalPaths) const noexcept;
 
 private:
     using Prefix = uint64_t;
-    static SizeType constexpr PREFIX_CHUNK_SIZE_BITS = 4;
-    static SizeType constexpr PREFIX_MAX_VALUE = 16;
+    static SizeType32 constexpr PREFIX_CHUNK_SIZE_BITS = 4;
+    static SizeType32 constexpr PREFIX_MAX_VALUE = 16;
 
     struct MedusaTreeNode
     {
-        SizeType nodeId;
-        SizeType depth;
-        SizeType parentLinearIdx;
-        SizeType linearIdx;
-        std::vector<SizeType> childLinearIndices;
+        SizeType32 nodeId;
+        SizeType32 depth;
+        SizeType32 parentLinearIdx;
+        SizeType32 linearIdx;
+        std::vector<SizeType32> childLinearIndices;
     };
 
-    SizeType computePathsAndMask(
+    SizeType32 computePathsAndMask(
         std::vector<MedusaTreeNode> const& tree, TensorPtr& packedMask, TensorPtr& paths) const;
 
-    void copyPackedMask(TensorPtr& mask, SizeType srcIdx, SizeType dstIdx) const;
-    void setOnePackedMask(TensorPtr& mask, SizeType row, SizeType col) const;
-    Prefix computePrefix(std::vector<SizeType> const& vec, SizeType len) const;
+    void copyPackedMask(TensorPtr& mask, SizeType32 srcIdx, SizeType32 dstIdx) const;
+    void setOnePackedMask(TensorPtr& mask, SizeType32 row, SizeType32 col) const;
+    Prefix computePrefix(std::vector<SizeType32> const& vec, SizeType32 len) const;
 
-    void dumpChoices(MedusaChoices const& choices, std::vector<SizeType> const& indices) const;
+    void dumpChoices(MedusaChoices const& choices, std::vector<SizeType32> const& indices) const;
 
 private:
-    SizeType mMedusaHeads;
-    SizeType mMaxMedusaTokens;
-    SizeType mTokensPerStep;
-    SizeType mNumPackedMasks;
+    SizeType32 mMedusaHeads;
+    SizeType32 mMaxMedusaTokens;
+    SizeType32 mTokensPerStep;
+    SizeType32 mNumPackedMasks;
     // FIXME(nkorobov): this should come from outside to setup or per request
     // mc_sim_7b_63
     MedusaChoices mDefaultMedusaChoices = {{0}, {0, 0}, {1}, {0, 1}, {2}, {0, 0, 0}, {1, 0}, {0, 2}, {3}, {0, 3}, {4},

@@ -1,15 +1,42 @@
 import argparse
 
-from tensorrt_llm.quantization import quantize_and_export
+import torch.multiprocessing as mp
+
+from tensorrt_llm.quantization import (quantize_and_export,
+                                       quantize_nemo_and_export)
+
+mp.set_start_method("spawn", force=True)
 
 if __name__ == "__main__":
-    DEFAULT_RAND_SEED = 1234
-    DEFAULT_MAX_SEQ_LEN = 2048
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model_dir",
                         help="Specify where the HuggingFace model is",
-                        required=True)
-    parser.add_argument("--device", default="cuda")
+                        default=None)
+    parser.add_argument('--nemo_ckpt_path',
+                        help="Specify where the NeMo checkpoint is",
+                        default=None)
+    parser.add_argument(
+        '--decoder_type',
+        type=str,
+        default='gptnext',
+        choices=['gptnext', 'llama'],
+        help="Decoder type; effective for NeMo checkpoint only.")
+    parser.add_argument('--calib_dataset', type=str, default='cnn_dailymail')
+    parser.add_argument(
+        '--calib_tp_size',
+        type=int,
+        default=1,
+        help=
+        "Tensor parallel size for calibration; effective for NeMo checkpoint only."
+    )
+    parser.add_argument(
+        '--calib_pp_size',
+        type=int,
+        default=1,
+        help=
+        "Pipeline parallel size for calibration; effective for NeMo checkpoint only."
+    )
+
     parser.add_argument("--dtype", help="Model data type.", default="float16")
     parser.add_argument(
         "--qformat",
@@ -25,11 +52,11 @@ if __name__ == "__main__":
         help="Seed the generate random numbers, the value will be used to call"
         "random.seed(value) and numpy.random.seed(value)",
         type=int,
-        default=DEFAULT_RAND_SEED)
-    parser.add_argument("--max_seq_length",
+        default=1234)
+    parser.add_argument("--tokenizer_max_seq_length",
                         help="Max sequence length to init the tokenizers",
                         type=int,
-                        default=DEFAULT_MAX_SEQ_LEN)
+                        default=2048)
 
     parser.add_argument("--batch_size",
                         help="Batch size for calibration.",
@@ -37,6 +64,10 @@ if __name__ == "__main__":
                         default=1)
     parser.add_argument("--calib_size",
                         help="Number of samples for calibration.",
+                        type=int,
+                        default=512)
+    parser.add_argument("--calib_max_seq_length",
+                        help="Max sequence length for calibration",
                         type=int,
                         default=512)
     parser.add_argument("--output_dir", default="exported_model")
@@ -49,16 +80,40 @@ if __name__ == "__main__":
                         choices=["int8", "fp8", None])
     args = parser.parse_args()
 
-    quantize_and_export(model_dir=args.model_dir,
-                        dtype=args.dtype,
-                        output_dir=args.output_dir,
-                        device=args.device,
-                        tp_size=args.tp_size,
-                        pp_size=args.pp_size,
-                        qformat=args.qformat,
-                        kv_cache_dtype=args.kv_cache_dtype,
-                        calib_size=args.calib_size,
-                        batch_size=args.batch_size,
-                        awq_block_size=args.awq_block_size,
-                        seed=args.seed,
-                        max_seq_length=args.max_seq_length)
+    if args.model_dir is not None:
+        quantize_and_export(
+            model_dir=args.model_dir,
+            calib_dataset=args.calib_dataset,
+            dtype=args.dtype,
+            qformat=args.qformat,
+            kv_cache_dtype=args.kv_cache_dtype,
+            calib_size=args.calib_size,
+            batch_size=args.batch_size,
+            calib_max_seq_length=args.calib_max_seq_length,
+            awq_block_size=args.awq_block_size,
+            output_dir=args.output_dir,
+            tp_size=args.tp_size,
+            pp_size=args.pp_size,
+            seed=args.seed,
+            tokenizer_max_seq_length=args.tokenizer_max_seq_length)
+    elif args.nemo_ckpt_path is not None:
+        quantize_nemo_and_export(nemo_ckpt_path=args.nemo_ckpt_path,
+                                 decoder_type=args.decoder_type,
+                                 calib_dataset=args.calib_dataset,
+                                 calib_tp_size=args.calib_tp_size,
+                                 calib_pp_size=args.calib_pp_size,
+                                 dtype=args.dtype,
+                                 qformat=args.qformat,
+                                 kv_cache_dtype=args.kv_cache_dtype,
+                                 calib_size=args.calib_size,
+                                 batch_size=args.batch_size,
+                                 calib_max_seq_length=args.calib_max_seq_length,
+                                 awq_block_size=args.awq_block_size,
+                                 output_dir=args.output_dir,
+                                 tp_size=args.tp_size,
+                                 pp_size=args.pp_size,
+                                 seed=args.seed)
+    else:
+        raise ValueError(
+            "One of source checkpoint (model_dir, nemo_ckpt_path) must be specified"
+        )

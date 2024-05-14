@@ -41,13 +41,13 @@ namespace tensorrt_llm::tests::layers::sampling
 
 struct TestSamplingParams
 {
-    std::vector<runtime::SizeType> topKs;
+    std::vector<runtime::SizeType32> topKs;
     std::vector<float> topPs;
     std::vector<float> temperatures;
     std::vector<float> repetitionPenalties;
     std::vector<float> presencePenalties;
     std::vector<float> frequencyPenalties;
-    std::vector<runtime::SizeType> minLengths;
+    std::vector<runtime::SizeType32> minLengths;
     std::vector<float> decay;
     std::vector<float> minTopP;
     std::vector<runtime::TokenIdType> topPResetIds;
@@ -57,10 +57,10 @@ struct TestSamplingParams
 
     // Medusa setup
     bool useMedusa{false};
-    std::optional<runtime::SizeType> maxNumMedusaHeads{std::nullopt};
-    std::optional<std::vector<std::vector<runtime::SizeType>>> topKMedusaHeads{std::nullopt};
-    std::optional<std::vector<runtime::SizeType>> tokensPerStep{std::nullopt};
-    std::optional<std::vector<std::vector<tensorrt_llm::runtime::SizeType>>> paths;
+    std::optional<runtime::SizeType32> maxNumMedusaHeads{std::nullopt};
+    std::optional<std::vector<std::vector<runtime::SizeType32>>> topKMedusaHeads{std::nullopt};
+    std::optional<std::vector<runtime::SizeType32>> tokensPerStep{std::nullopt};
+    std::optional<std::vector<std::vector<tensorrt_llm::runtime::SizeType32>>> paths;
     std::optional<std::vector<std::vector<tensorrt_llm::runtime::TokenIdType>>> outputIds;
 };
 
@@ -74,20 +74,20 @@ private:
     using BufferPtr = tensorrt_llm::runtime::IBuffer::SharedPtr;
 
     static const uint64_t mMaxSeed{64};
-    runtime::SizeType const mBatchSize{6};
-    runtime::SizeType const mMaxBatchSize{2 * mBatchSize};
-    runtime::SizeType const mBeamWidth{1};
-    runtime::SizeType const mBatchBeam{mBatchSize * mBeamWidth};
-    runtime::SizeType const mVocabSize{9};
-    runtime::SizeType const mVocabSizePadded{mVocabSize};
+    runtime::SizeType32 const mBatchSize{6};
+    runtime::SizeType32 const mMaxBatchSize{2 * mBatchSize};
+    runtime::SizeType32 const mBeamWidth{1};
+    runtime::SizeType32 const mBatchBeam{mBatchSize * mBeamWidth};
+    runtime::SizeType32 const mVocabSize{9};
+    runtime::SizeType32 const mVocabSizePadded{mVocabSize};
 
-    runtime::SizeType const mMaxInputLen{0}; // has no effect.
-    runtime::SizeType const mMaxOutputLen{4};
-    runtime::SizeType const mMaxSeqLen{mMaxInputLen + mMaxOutputLen};
-    runtime::SizeType const mSinkTokenLength{0};
+    runtime::SizeType32 const mMaxInputLen{0}; // has no effect.
+    runtime::SizeType32 const mMaxOutputLen{4};
+    runtime::SizeType32 const mMaxSeqLen{mMaxInputLen + mMaxOutputLen};
+    runtime::SizeType32 const mSinkTokenLength{0};
     runtime::TokenIdType mEndId = mVocabSize;
-    runtime::SizeType mMaxTokensPerStep{1};
-    runtime::SizeType mMaxMedusaHeads{0};
+    runtime::SizeType32 mMaxTokensPerStep{1};
+    runtime::SizeType32 mMaxMedusaHeads{0};
 
     bool mUseLogitsVec{false};
 
@@ -140,8 +140,8 @@ private:
 
     std::vector<T> mTestLogitsInit;
 
-    runtime::SizeType mMaxBadWordsLen{0};
-    runtime::SizeType mMaxStopWordsLen{0};
+    runtime::SizeType32 mMaxBadWordsLen{0};
+    runtime::SizeType32 mMaxStopWordsLen{0};
 
     bool mUseMedusa{false};
 
@@ -151,25 +151,25 @@ private:
 
     void setup(uint64_t seed, TestSamplingParams const& params);
 
-    runtime::SizeType getMaxWordsLen(std::vector<std::vector<std::vector<runtime::TokenIdType>>> const& inputWords);
-    void initXWordsTensors(runtime::SizeType* batchSlotsPtr, runtime::TokenIdType* wordsData,
-        runtime::TokenIdType** wordsPtr, runtime::SizeType* wordsLenData, runtime::SizeType maxWordsLen,
+    runtime::SizeType32 getMaxWordsLen(std::vector<std::vector<std::vector<runtime::TokenIdType>>> const& inputWords);
+    void initXWordsTensors(runtime::SizeType32* batchSlotsPtr, runtime::TokenIdType* wordsData,
+        runtime::TokenIdType** wordsPtr, runtime::SizeType32* wordsLenData, runtime::SizeType32 maxWordsLen,
         std::vector<std::vector<std::vector<runtime::TokenIdType>>> const& inputWords);
 
-    std::shared_ptr<tensorrt_llm::layers::DynamicDecodeInputParams> createInputTensors(runtime::SizeType step);
+    std::shared_ptr<tensorrt_llm::layers::DynamicDecodeInputParams> createInputTensors(runtime::SizeType32 step);
 
     std::shared_ptr<tensorrt_llm::layers::DynamicDecodeOutputParams> createOutputTensors();
 
-    void batchCopy(runtime::SizeType step);
+    void batchCopy(runtime::SizeType32 step);
     bool checkResult(runtime::TokenIdType* outputIds, std::vector<std::set<runtime::TokenIdType>> const& expectedIds,
-        runtime::SizeType* seqLens, runtime::SizeType leadingDim, runtime::SizeType stride, runtime::SizeType step,
-        bool outputIdsTransposed = false, runtime::SizeType strideTransposed = 0);
+        runtime::SizeType32* seqLens, runtime::SizeType32 leadingDim, runtime::SizeType32 stride,
+        runtime::SizeType32 step, bool outputIdsTransposed = false, runtime::SizeType32 strideTransposed = 0);
 
     void runTestImpl(std::vector<std::set<runtime::TokenIdType>> const& expectedOutputIds,
         TestSamplingParams const& params, runtime::TokenIdType endId = -1);
 
-    void fillRefLogits(runtime::SizeType const* seqLenHost,
-        std::vector<std::set<runtime::TokenIdType>> const& expectedOutputIds, runtime::SizeType step);
+    void fillRefLogits(runtime::SizeType32 const* seqLenHost,
+        std::vector<std::set<runtime::TokenIdType>> const& expectedOutputIds, runtime::SizeType32 step);
 
     tensorrt_llm::layers::DynamicDecodeInputParams::MedusaInputs createMedusaInputs();
     tensorrt_llm::layers::DynamicDecodeOutputParams::MedusaOutputs createMedusaOutputs();

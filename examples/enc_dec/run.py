@@ -236,11 +236,11 @@ class TRTLLMEncDecModel:
             if self.encoder_model_config.lora_plugin:
                 self.encoder_lora_manager = LoraManager()
                 # TODO: this is only for bart
-                self.encoder_lora_manager.load_from_hf_bart(
-                    component='encoder',
+                self.encoder_lora_manager.load_from_hf(
                     model_dirs=lora_dir,
                     model_config=self.encoder_model_config,
                     runtime_mapping=self.encoder_runtime_mapping,
+                    component='encoder',
                 )
             else:
                 self.encoder_lora_manager = None
@@ -260,11 +260,11 @@ class TRTLLMEncDecModel:
         if self.decoder_model_config.lora_plugin:
             self.decoder_lora_manager = LoraManager()
             # TODO: this is only for bart
-            self.decoder_lora_manager.load_from_hf_bart(
-                component='decoder',
+            self.decoder_lora_manager.load_from_hf(
                 model_dirs=lora_dir,
                 model_config=self.decoder_model_config,
                 runtime_mapping=self.decoder_runtime_mapping,
+                component='decoder',
             )
         else:
             self.decoder_lora_manager = None
@@ -386,52 +386,19 @@ class TRTLLMEncDecModel:
             (max_input_length, ),
             dtype=hidden_states_dtype('max_input_length'),
             device=self.device).contiguous()
+        batch_size = input_lengths.size(0)
+        inputs['host_request_types'] = torch.IntTensor([0] *
+                                                       batch_size).to('cpu')
+        if self.encoder_model_config.remove_input_padding:
+            inputs['host_context_lengths'] = input_lengths.to('cpu')
 
         if self.encoder_model_config.lora_plugin and self.encoder_lora_manager is not None:
-            batch_size = input_lengths.size(0)
-            missing_qkv_modules = []
-            if any(x in self.encoder_model_config.lora_target_modules
-                   for x in ["attn_q", "attn_k", "attn_v"]):
-                for lora_module in ["attn_q", "attn_k", "attn_v"]:
-                    if lora_module not in self.encoder_model_config.lora_target_modules:
-                        missing_qkv_modules.append(lora_module)
-
-            for layer_idx in range(self.encoder_model_config.num_layers):
-                for lora_module in (
-                        self.encoder_model_config.lora_target_modules +
-                        missing_qkv_modules):
-                    lora_ranks = []
-                    lora_ptrs = []
-                    for batch_idx in range(batch_size):
-                        lora_uid = self.lora_task_uids[batch_idx]
-                        if lora_uid is not None and lora_uid != "-1" and self.encoder_lora_manager.uid_to_low_ranks(
-                                lora_uid)[layer_idx][lora_module] != 0:
-                            lora_ranks.append(
-                                self.encoder_lora_manager.uid_to_low_ranks(
-                                    lora_uid)[layer_idx][lora_module])
-                            lora_ptrs.append(
-                                self.encoder_lora_manager.
-                                lora_weights_pointers_list[layer_idx][lora_uid]
-                                [lora_module])
-                        else:
-                            lora_ranks.append(0)
-                            lora_ptrs.append([0, 0])
-                    inputs.update({
-                        f'{lora_module}_lora_ranks_{layer_idx}':
-                        torch.IntTensor(lora_ranks),
-                    })
-                    inputs.update({
-                        f'{lora_module}_lora_weights_pointers_{layer_idx}':
-                        torch.LongTensor(lora_ptrs),
-                    })
-            inputs.update({
-                'host_request_types':
-                torch.IntTensor([0] * batch_size).to('cpu'),
-            })
-            if self.encoder_model_config.remove_input_padding:
-                inputs.update({
-                    'host_context_lengths': input_lengths.to('cpu'),
-                })
+            inputs.update(
+                self.encoder_lora_manager.input_buffers(
+                    self.lora_task_uids,
+                    self.encoder_runtime_mapping,
+                    self.encoder_model_config.num_layers,
+                ))
 
         # Note: runtime.Session's run() method will set input/output tensor address, here we only need to provide tensor shape
         self.encoder_session.set_shapes(inputs)

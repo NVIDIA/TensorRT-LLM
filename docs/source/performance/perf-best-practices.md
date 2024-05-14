@@ -174,6 +174,19 @@ The GEMM plugin utilizes NVIDIA cuBLASLt to perform GEMM operations. On FP16 and
 BF16, it's recommended to be enabled for better performance and smaller GPU
 memory usage. On FP8, it's recommended to be disabled.
 
+### Multiple profiles
+
+`--multiple_profiles` enables multiple TensorRT optimization profiles in the
+built engines, it will benefits the performance especially when GEMM plugin is
+disabled, because more optimization profiles help TensorRT have more chances to
+select better kernels. However, it'll increase the engine build time.
+
+### FP8 Context Fused Multi-Head Attention
+
+`--use_fp8_context_fmha` enables FP8 Context fused multi-head attention, which
+is recommended to be enabled when fp8 quantization is used to improve the
+performance. Note that only NVIDIA Hopper architecture is supported.
+
 ### BERT Attention Plugin and Context Fused Multi-Head Attention
 
 BERT attention plugin and context fused multi-head attention are both
@@ -184,7 +197,7 @@ recommended for the BERT model. They are enabled by default using the
 ## Runtime Options to Optimize the Performance of TensorRT-LLM Models?
 
 This part summarizes the runtime configuration knobs that can be tweaked to
-enhance the performance of already built engines.  Note that currently the
+enhance the performance of already built engines. Note that currently the
 configurations can be modified using the
 [Batch Manager API](batch_manager.md#the-batch-manager-api)
 as well as the
@@ -241,7 +254,7 @@ aggressively scheduling requests at the risk of having to pause requests if the
 KV cache size limit is reached.
 
 For a more conservative approach with respect to the KV cache limitations in
-terms of memory allocation, `schedulerPolicy` should be set to
+terms of memory allocation, `CapacitySchedulerPolicy` should be set to
 `GUARANTEED_NO_EVICT` to guarantee that a started request is never paused.
 
 If the goal is to maximizes the throughput, users should try `MAX_UTILIZATION`.

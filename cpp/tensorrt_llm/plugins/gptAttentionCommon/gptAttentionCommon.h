@@ -163,6 +163,7 @@ protected:
         int32_t num_requests;
         int32_t max_blocks_per_sequence;
         int32_t const* cache_indir;
+        int32_t* semaphores;
         void* workspace;
         int32_t const* host_past_key_value_lengths;
         // optional when relative position
@@ -175,6 +176,7 @@ protected:
         bool const* spec_decoding_mask = nullptr;
         int32_t const* spec_decoding_packed_mask = nullptr;
         int32_t const* spec_decoding_position_offsets = nullptr;
+        int32_t const* spec_decoding_generation_lengths = nullptr;
     };
 
     template <typename T, typename KVCacheBuffer>

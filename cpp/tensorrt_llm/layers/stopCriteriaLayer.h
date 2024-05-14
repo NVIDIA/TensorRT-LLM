@@ -42,7 +42,7 @@ public:
 
     ~StopCriteriaLayer() override = default;
 
-    void setup(runtime::SizeType batchSize, runtime::SizeType beamWidth, runtime::SizeType const* batchSlots,
+    void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 const* batchSlots,
         std::shared_ptr<BaseSetupParams> setupParams) override;
 
     void forward(std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs) override;
@@ -50,10 +50,12 @@ public:
 private:
     static void checkMaxLengthStopCriteria(std::shared_ptr<DynamicDecodeOutputParams>& outputs,
         std::shared_ptr<DynamicDecodeInputParams> const& inputs, runtime::SizeType32 const* batchSlots,
-        runtime::SizeType batchSize, runtime::SizeType beamWidth, runtime::SizeType maxSeqLen, cudaStream_t stream);
+        runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 maxSeqLen,
+        cudaStream_t stream);
     static void checkStopWordsStopCriteria(std::shared_ptr<DynamicDecodeOutputParams>& outputs,
         std::shared_ptr<DynamicDecodeInputParams> const& inputs, runtime::SizeType32 const* batchSlots,
-        runtime::SizeType batchSize, runtime::SizeType beamWidth, runtime::SizeType maxSeqLen, cudaStream_t stream);
+        runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 maxSeqLen,
+        cudaStream_t stream);
 
 private:
     using BaseLayer::mWorkspaceSize;

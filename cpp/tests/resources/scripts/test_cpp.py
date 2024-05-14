@@ -84,7 +84,7 @@ def build_trt_llm(python_exe: str,
     if job_count is not None:
         build_wheel += ["-j", str(job_count)]
 
-    run_command(build_wheel, cwd=root_dir, env=_os.environ, timeout=2400)
+    run_command(build_wheel, cwd=root_dir, env=_os.environ, timeout=3600)
 
 
 def run_tests(cuda_architectures: _tp.Optional[str] = None,
@@ -124,16 +124,8 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
                   job_count=job_count)
 
     if run_mamba:
-        # adding here but not in requirements.txt to prevent break build package.
-        run_command([
-            python_exe, "-m", "pip", "install", "causal-conv1d==1.2.0.post2",
-            "mamba-ssm==1.2.0.post1"
-        ],
-                    cwd=root_dir,
-                    env=_os.environ,
-                    timeout=300)
         run_command(
-            [python_exe, "-m", "pip", "install", "--force-reinstall", "build"],
+            [python_exe, "-m", "pip", "install", "transformers>=4.39.0"],
             cwd=root_dir,
             env=_os.environ,
             timeout=300)

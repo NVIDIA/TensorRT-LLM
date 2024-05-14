@@ -44,7 +44,7 @@ public:
 
     ~BanWordsLayer() override = default;
 
-    void setup(runtime::SizeType batchSize, runtime::SizeType beamWidth, runtime::SizeType const* batchSlots,
+    void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 const* batchSlots,
         std::shared_ptr<BaseSetupParams> setupParams) override;
 
     //! \brief Modifies 'outputs->logits' in-place with -INF for banned words
@@ -53,12 +53,12 @@ public:
 private:
     static void banRepeatNGrams(tc::Tensor& logits, std::shared_ptr<DynamicDecodeOutputParams> const& outputs,
         std::shared_ptr<DynamicDecodeInputParams> const& params, runtime::SizeType32 const* batchSlots,
-        runtime::SizeType batchSize, runtime::SizeType beamWidth, runtime::SizeType maxSeqLen,
-        runtime::SizeType vocabSizePadded, cudaStream_t stream);
+        runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 maxSeqLen,
+        runtime::SizeType32 vocabSizePadded, cudaStream_t stream);
     static void banBadWords(tc::Tensor& logits, std::shared_ptr<DynamicDecodeOutputParams> const& outputs,
         std::shared_ptr<DynamicDecodeInputParams> const& params, runtime::SizeType32 const* batchSlots,
-        runtime::SizeType batchSize, runtime::SizeType beamWidth, runtime::SizeType maxSeqLen,
-        runtime::SizeType vocabSizePadded, cudaStream_t stream);
+        runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 maxSeqLen,
+        runtime::SizeType32 vocabSizePadded, cudaStream_t stream);
 
 private:
     using BaseLayer::mWorkspaceSize;

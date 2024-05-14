@@ -229,13 +229,14 @@ int SmoothQuantGemmPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     //     scale_channels [1, N] if has_per_channel_scaling else [1, 1]
     // outputs
     //     mat [M(*), N]
-    int m = 1;
+    int64_t m64 = 1;
     for (int ii = 0; ii < inputDesc[0].dims.nbDims - 1; ++ii)
     {
-        m *= inputDesc[0].dims.d[ii];
+        m64 *= inputDesc[0].dims.d[ii];
     }
-    int const n = inputDesc[1].dims.d[0];
-    int const k = inputDesc[0].dims.d[inputDesc[0].dims.nbDims - 1];
+    int const m = TLLM_INT32_CAST(m64);
+    int const n = TLLM_INT32_CAST(inputDesc[1].dims.d[0]);
+    int const k = TLLM_INT32_CAST(inputDesc[0].dims.d[inputDesc[0].dims.nbDims - 1]);
     int const wsSize = m_sqGemmRunner->getWorkspaceSize(m, n, k);
     if (m <= 4)
     {

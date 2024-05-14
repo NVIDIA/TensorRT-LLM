@@ -16,10 +16,8 @@ import os
 import sys
 import unittest
 
-import numpy as np
 import torch
 from parameterized import parameterized
-from polygraphy.backend.trt import CreateConfig, EngineFromNetwork, TrtRunner
 from transformers.models.llama.modeling_llama import LlamaRMSNorm
 
 import tensorrt_llm
@@ -27,10 +25,10 @@ from tensorrt_llm import Parameter, Tensor
 from tensorrt_llm.quantization.functional import smooth_quant_rms_norm
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import unittest_name_func
+from utils.util import create_session, run_session, unittest_name_func
 
 
-class TestFunctional(unittest.TestCase):
+class TestSmoothQuantRmsNorm(unittest.TestCase):
 
     def setUp(self):
         tensorrt_llm.logger.set_level('error')
@@ -42,11 +40,17 @@ class TestFunctional(unittest.TestCase):
         test_shape = [2, 5, 10, 10]
 
         x_data = torch.randn(
-            *test_shape, dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype))
+            *test_shape,
+            dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
+            device="cuda")
 
-        m = LlamaRMSNorm(test_shape[-1])  # LlamaRMSNorm only supports last dim
+        m = LlamaRMSNorm(
+            test_shape[-1]).cuda()  # LlamaRMSNorm only supports last dim
 
-        scale_data = torch.randint(2, 32, (1, ), dtype=torch.float32)
+        scale_data = torch.randint(2,
+                                   32, (1, ),
+                                   dtype=torch.float32,
+                                   device="cuda")
 
         with torch.no_grad():
 
@@ -66,10 +70,9 @@ class TestFunctional(unittest.TestCase):
 
         # construct trt network
         builder = tensorrt_llm.Builder()
-        net = builder.create_network()
-        net.plugin_config.set_rmsnorm_quantization_plugin(dtype)
-        with tensorrt_llm.net_guard(net):
-            network = tensorrt_llm.default_trtnet()
+        network = builder.create_network()
+        network.plugin_config.set_rmsnorm_quantization_plugin(dtype)
+        with tensorrt_llm.net_guard(network):
             x = Tensor(name='x',
                        shape=x_data.shape,
                        dtype=tensorrt_llm.str_dtype_to_trt(dtype))
@@ -84,48 +87,43 @@ class TestFunctional(unittest.TestCase):
 
             if dynamic_act_scaling:
                 output, dynamic_scales = output
-                dynamic_scales = dynamic_scales.trt_tensor
-                dynamic_scales.name = 'dynamic_scales'
-                network.mark_output(dynamic_scales)
-                dynamic_scales.dtype = tensorrt_llm.str_dtype_to_trt('float32')
+                dynamic_scales.mark_output('dynamic_scales', 'float32')
 
-            output = output.trt_tensor
-            output.name = 'output'
-            network.mark_output(output)
-            output.dtype = tensorrt_llm.str_dtype_to_trt('int8')
+            output.mark_output('output', 'int8')
 
-            # trt run
-            build_engine = EngineFromNetwork(
-                (builder.trt_builder, net.trt_network),
-                config=CreateConfig(int8=True,
-                                    fp16=(dtype == 'float16'),
-                                    precision_constraints="obey"))
-            assert build_engine is not None, "Build engine failed"
-            with TrtRunner(build_engine) as runner:
-                outputs = runner.infer(feed_dict={'x': x_data.cpu().numpy()})
+        session = create_session(builder, network, precision=dtype, int8=True)
+        inputs = {
+            'x': x_data,
+        }
 
-            # compare diff of quantized output
-            # Set absolute tolerance to 1 to mitigate some rounding error
-            np.testing.assert_allclose(ref_quantized.cpu().numpy(),
-                                       outputs['output'],
-                                       atol=1,
-                                       rtol=0)
+        outputs = run_session(session, inputs)
 
-            # compare diff of dynamic activation scales
-            if dynamic_act_scaling:
-                np.testing.assert_allclose(dynamic_scale.cpu().numpy(),
-                                           outputs['dynamic_scales'],
-                                           atol=1e-2)
+        # compare diff of quantized output
+        # Set absolute tolerance to 1 to mitigate some rounding error
+        torch.testing.assert_close(ref_quantized,
+                                   outputs['output'],
+                                   atol=1,
+                                   rtol=0)
+
+        # compare diff of dynamic activation scales
+        if dynamic_act_scaling:
+            torch.testing.assert_close(dynamic_scale,
+                                       outputs['dynamic_scales'],
+                                       atol=1e-2,
+                                       rtol=1e-2)
 
     def test_sq_rms_norm_no_plugin(self):
         # Create builder
         builder = tensorrt_llm.Builder()
         # Create empty network
-        net = builder.create_network()
-        with tensorrt_llm.net_guard(net):
-            tensorrt_llm.default_trtnet()
-            # Get output tensor for SQ gemm
+        network = builder.create_network()
+        with tensorrt_llm.net_guard(network):
+            # SQ Rmsnorm ootb should fail.
             with self.assertRaisesRegex(
                     TypeError,
                     "Smooth Quant Rms Norm is only supported with plugin"):
                 smooth_quant_rms_norm(None, 0, None, None, None, 0)
+
+
+if __name__ == '__main__':
+    unittest.main()

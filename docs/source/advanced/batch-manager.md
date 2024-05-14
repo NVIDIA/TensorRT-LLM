@@ -139,7 +139,7 @@ Note: this feature isn't supported with the `V1` batching scheme for the moment.
   - `InflightBatching` refers to a scheme where newly arrived requests are dynamically incorporated into the batch under execution, and requests are returned as soon as the end condition is met without any padding.
   - `InflightFusedBatching` is an improvement on `InflightBatching`, leveraging additional operation fusion opportunities and is expected to be strictly superior to it.
 * `maxBeamWidth`, the maximum beam width GptManager will allow for any request.
-* `schedulerPolicy`, policy used to select the subset available requests in each iteration of the InflightBatching generation loop.
+* `capacitySchedulerPolicy`, policy used to select the subset available requests in each iteration of the InflightBatching generation loop.
   - `MAX_UTILIZATION` packs as many requests as the underlying TRT engine can support in any iteration of the InflightBatching generation loop. While this is expected to maximize GPU throughput, it might require that some requests be paused and restarted depending on peak KV cache memory availability.
   - `GUARANTEED_NO_EVICT` uses KV cache more conservatively guaranteeing that a request, once started, will run to completion without eviction.
 
@@ -205,7 +205,7 @@ using namespace tensorrt_llm::batch_manager;
 GptManager batchManager(pathToTrtEngine,                   // Path to the TensorRT engine of the model,
                         TrtGptModelType::InflightFusedBatching, // Use in-flight batching,
                         maxBeamWidth,                      // Maximum beam width (must be >= 1),
-                        schedulerPolicy,                   // Scheduling policy (see below),
+                        schedulerConfig,                   // Scheduler configuration (see below),
                         getInferenceRequestsCb,            // The Get callback (see above),
                         sendResponseCb,                    // The Send callback (see above),
                         pollStopSignalCb,                  // The Stop signals callback (see above),
@@ -214,14 +214,14 @@ GptManager batchManager(pathToTrtEngine,                   // Path to the Tensor
 
 The scheduler policy helps the batch manager adjust how requests are scheduled
 for execution. The batch manager can try to maximize the utilization of the
-GPUs by aggressively scheduling requests (`schedulerPolicy` set to
-`MAX_UTILIZATION`) at the risk of having to pause requests if it runs short on
-memory for KV caches. Note that any paused request will be automatically resumed
+GPUs by aggressively scheduling requests (`SchedulerConfig::capacitySchedulerPolicy`
+set to `kMAX_UTILIZATION`) at the risk of having to pause requests if it runs short
+on memory for KV caches. Note that any paused request will be automatically resumed
 and the only user-visible effect may be increased latency.
 It can also adopt a more conservative approach and schedule requests only when it
 knows that the memory allocation will be sufficient to process all active requests
 even in the worst case of KV cache consumption. That mode corresponds to a
-`schedulerPolicy` set to `GUARANTEED_NO_EVICT`.
+`SchedulerConfig::capacitySchedulerPolicy` set to `kGUARANTEED_NO_EVICT`.
 
 The `GptManager`'s worker thread terminates when the `GptManager` destructor is
 called and there are no more active requests.

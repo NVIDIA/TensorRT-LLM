@@ -22,7 +22,7 @@ using namespace tensorrt_llm::runtime;
 void DecodingOutput::BeamHypotheses::empty(BufferManager& manager)
 {
     auto constexpr nvTokenIdType = TRTDataType<TokenIdType>::value;
-    auto constexpr nvSizeType = TRTDataType<SizeType>::value;
+    auto constexpr nvSizeType = TRTDataType<SizeType32>::value;
     auto constexpr nvFloatType = TRTDataType<float>::value;
     auto constexpr nvBoolType = TRTDataType<bool>::value;
 
@@ -36,7 +36,7 @@ void DecodingOutput::BeamHypotheses::empty(BufferManager& manager)
     batchDones = manager.emptyTensor(MemoryType::kGPU, nvBoolType);
 }
 
-void DecodingOutput::BeamHypotheses::reshape(SizeType batchSize, SizeType beamWidth, SizeType maxSequenceLength)
+void DecodingOutput::BeamHypotheses::reshape(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 maxSequenceLength)
 {
     outputIdsCBA->reshape(ITensor::makeShape({batchSize, 2 * beamWidth, maxSequenceLength}));
     sequenceLengthsCBA->reshape(ITensor::makeShape({batchSize, 2 * beamWidth}));
@@ -60,7 +60,7 @@ void DecodingOutput::BeamHypotheses::init(BufferManager& manager, TokenIdType en
     manager.setZero(*batchDones);
 }
 
-DecodingOutput::BeamHypotheses DecodingOutput::BeamHypotheses::slice(SizeType batchIndex, SizeType size) const
+DecodingOutput::BeamHypotheses DecodingOutput::BeamHypotheses::slice(SizeType32 batchIndex, SizeType32 size) const
 {
     DecodingOutput::BeamHypotheses bh{};
     bh.outputIdsCBA = ITensor::slice(outputIdsCBA, batchIndex, size);

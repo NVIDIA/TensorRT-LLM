@@ -62,7 +62,7 @@ void invokeInsertUnfinishedPath(BeamHypotheses& bh, cudaStream_t stream);
 void invokeFinalize(BeamHypotheses& bh, cudaStream_t stream);
 
 void invokeInitializeOutput(runtime::TokenIdType* finalOutputIds, runtime::TokenIdType const* endIds,
-    runtime::SizeType batchBeam, runtime::SizeType maxSeqLen, cudaStream_t stream);
+    runtime::SizeType32 batchBeam, runtime::SizeType32 maxSeqLen, cudaStream_t stream);
 
 //! \brief Copies last numNewTokens (or 1 if numNewTokens == nullptr) tokens from outputIdsPtr
 //! to nextStepIds according to sequenceLengths.
@@ -85,8 +85,9 @@ void invokeInitializeOutput(runtime::TokenIdType* finalOutputIds, runtime::Token
 //! \param stream stream
 void invokeCopyNextStepIds(runtime::TokenIdType* nextStepIds, runtime::TokenIdType const* const* outputIdsPtr,
     runtime::SizeType32 const* sequenceLengths, runtime::SizeType32 const* numNewTokens,
-    runtime::SizeType32 const* batchSlots, runtime::SizeType batchSize, runtime::SizeType maxBatchSize,
-    runtime::SizeType beamWidth, runtime::SizeType maxSeqLen, runtime::SizeType maxTokensPerStep, cudaStream_t stream);
+    runtime::SizeType32 const* batchSlots, runtime::SizeType32 batchSize, runtime::SizeType32 maxBatchSize,
+    runtime::SizeType32 beamWidth, runtime::SizeType32 maxSeqLen, runtime::SizeType32 maxTokensPerStep,
+    cudaStream_t stream);
 
 //! \brief Accepts or rejects draft tokens based on the equality of draft and target tokens
 //! for speculative decoding. Target token is accepted if targetToken == draftToken.
@@ -114,9 +115,9 @@ void invokeCopyNextStepIds(runtime::TokenIdType* nextStepIds, runtime::TokenIdTy
 void invokeAcceptDraftTokensByIds(runtime::TokenIdType const* draftIds, runtime::TokenIdType const* targetIds,
     runtime::SizeType32 const* contextLengths, runtime::SizeType32 const* numsDraftTokens,
     runtime::SizeType32* sequenceLengths, FinishedState const* finished, FinishedState* finishedFinal,
-    runtime::SizeType32* finishedSum, runtime::SizeType32 const* batchSlots, runtime::SizeType batchSize,
-    runtime::SizeType maxBatchSize, runtime::SizeType beamWidth, runtime::SizeType maxSeqLen,
-    runtime::SizeType maxDraftTokens, cudaStream_t stream);
+    runtime::SizeType32* finishedSum, runtime::SizeType32 const* batchSlots, runtime::SizeType32 batchSize,
+    runtime::SizeType32 maxBatchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 maxSeqLen,
+    runtime::SizeType32 maxDraftTokens, cudaStream_t stream);
 
 //! \brief Performs probabilistic acceptance of draft tokens based on their probability distributions.
 //! Corrects targetLogits for the next to the last accepted token
@@ -152,13 +153,14 @@ void invokeAcceptDraftTokensByIds(runtime::TokenIdType const* draftIds, runtime:
 template <typename T>
 void acceptDraftTokensByLogits(T* draftLogits, T** targetLogits, T* draftProbs, T* targetProbs,
     runtime::SizeType32 const* numsDraftTokens, FinishedState* finished, curandState_t* curandState,
-    runtime::SizeType32 const* batchSlots, runtime::SizeType batchSize, runtime::SizeType maxBatchSize,
-    runtime::SizeType beamWidth, runtime::SizeType vocabSize, runtime::SizeType vocabSizePadded,
-    runtime::SizeType maxDraftTokens, bool randomThreshold, float constantThreshold, cudaStream_t stream);
+    runtime::SizeType32 const* batchSlots, runtime::SizeType32 batchSize, runtime::SizeType32 maxBatchSize,
+    runtime::SizeType32 beamWidth, runtime::SizeType32 vocabSize, runtime::SizeType32 vocabSizePadded,
+    runtime::SizeType32 maxDraftTokens, bool randomThreshold, float constantThreshold, cudaStream_t stream);
 
 void invokeTransposeLogProbs(float* output_log_probs, float* output_log_probs_tiled,
-    runtime::SizeType32 const* sequence_lengths, runtime::SizeType32 const* batchSlots, runtime::SizeType batch_size,
-    runtime::SizeType max_batch_size, runtime::SizeType beam_width, runtime::SizeType max_seq_len, cudaStream_t stream);
+    runtime::SizeType32 const* sequence_lengths, runtime::SizeType32 const* batchSlots, runtime::SizeType32 batch_size,
+    runtime::SizeType32 max_batch_size, runtime::SizeType32 beam_width, runtime::SizeType32 max_seq_len,
+    cudaStream_t stream);
 
 //! \brief verifies draft medusa tokens given target tokens. Modifies outputIds tensor accordingly filling it with
 //! accepted tokens. Fills logitsPtrs tensor with the pointers to the respective medusa logits tensor according
@@ -195,12 +197,12 @@ void invokeTransposeLogProbs(float* output_log_probs, float* output_log_probs_ti
 template <typename T>
 void acceptDraftTokensByIdsWithPaths(runtime::TokenIdType* outputIds, runtime::TokenIdType const* draftIds,
     runtime::TokenIdType const* targetIds, runtime::SizeType32* sequenceLengths, runtime::SizeType32* acceptedLengths,
-    FinishedState* finishedFinal, runtime::SizeType const* batchSlots, runtime::SizeType32 const* paths,
+    FinishedState* finishedFinal, runtime::SizeType32 const* batchSlots, runtime::SizeType32 const* paths,
     runtime::TokenIdType const* endIds, T const** medusaLogits, T const** logitsPtrs,
     runtime::SizeType32* curTokensPerStep, runtime::SizeType32 const* targetTokensPerStep,
-    runtime::SizeType32* bestPathIds, runtime::SizeType batchSize, runtime::SizeType maxBatchSize,
-    runtime::SizeType vocabSize, runtime::SizeType maxDraftTokens, runtime::SizeType maxSeqLen,
-    runtime::SizeType maxNumHeads, runtime::SizeType maxTokensPerStep, cudaStream_t stream);
+    runtime::SizeType32* bestPathIds, runtime::SizeType32 batchSize, runtime::SizeType32 maxBatchSize,
+    runtime::SizeType32 vocabSize, runtime::SizeType32 maxDraftTokens, runtime::SizeType32 maxSeqLen,
+    runtime::SizeType32 maxNumHeads, runtime::SizeType32 maxTokensPerStep, cudaStream_t stream);
 
 //! \brief assembles draft tokens to treeDraftIds from sourceDraftIds using indices of treeIds
 //!
@@ -219,7 +221,7 @@ void acceptDraftTokensByIdsWithPaths(runtime::TokenIdType* outputIds, runtime::T
 //! \param stream cuda stream
 void scatterMedusaDraftTokens(runtime::TokenIdType* treeDraftIds, runtime::TokenIdType const* sourceDraftIds,
     runtime::SizeType32 const* treeIds, runtime::SizeType32 const* tokensPerStep, runtime::SizeType32 const* batchSlots,
-    runtime::SizeType maxDraftTokens, runtime::SizeType batchSize, cudaStream_t stream);
+    runtime::SizeType32 maxDraftTokens, runtime::SizeType32 batchSize, cudaStream_t stream);
 
 //! \brief Linearly packs accepted paths in memory according to the accceptedLengths and bestPathIds
 //!
@@ -238,7 +240,7 @@ void scatterMedusaDraftTokens(runtime::TokenIdType* treeDraftIds, runtime::Token
 //! \param stream stream
 void invokePackAcceptedPaths(runtime::SizeType32* acceptedLengthsCumSum, runtime::SizeType32* pathsOffsets,
     runtime::SizeType32 const* acceptedLengths, runtime::SizeType32 const* bestPathIds,
-    runtime::SizeType32 const* paths, runtime::SizeType32 const* batchSlots, runtime::SizeType batchSize,
-    runtime::SizeType maxTokensPerStep, runtime::SizeType maxNumDraftTokens, cudaStream_t stream);
+    runtime::SizeType32 const* paths, runtime::SizeType32 const* batchSlots, runtime::SizeType32 batchSize,
+    runtime::SizeType32 maxTokensPerStep, runtime::SizeType32 maxNumDraftTokens, cudaStream_t stream);
 } // namespace kernels
 } // namespace tensorrt_llm

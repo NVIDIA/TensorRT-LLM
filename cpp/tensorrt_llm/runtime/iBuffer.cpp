@@ -79,7 +79,7 @@ std::ostream& tensorrt_llm::runtime::operator<<(std::ostream& output, IBuffer co
 {
     auto data = const_cast<IBuffer&>(buffer).data();
     auto tensor = ITensor::wrap(data, buffer.getDataType(),
-        ITensor::makeShape({static_cast<SizeType>(buffer.getSize())}), buffer.getCapacity());
+        ITensor::makeShape({static_cast<SizeType32>(buffer.getSize())}), buffer.getCapacity());
     return output << *tensor;
 }
 
@@ -96,9 +96,7 @@ char const* IBuffer::getDataTypeName() const
     case nvinfer1::DataType::kUINT8: return DataTypeTraits<nvinfer1::DataType::kUINT8>::name;
     case nvinfer1::DataType::kINT8: return DataTypeTraits<nvinfer1::DataType::kINT8>::name;
     case nvinfer1::DataType::kFP8: return DataTypeTraits<nvinfer1::DataType::kFP8>::name;
-#if NV_TENSORRT_MAJOR >= 10
     case nvinfer1::DataType::kINT4: /* do nothing */;
-#endif
     }
     TLLM_THROW("Unknown data type");
 }

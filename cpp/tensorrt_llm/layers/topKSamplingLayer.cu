@@ -38,11 +38,11 @@ namespace layers
 {
 
 template <int32_t TOP_K_MAX>
-__global__ void setupTopKRuntimeArgs(SizeType batchSize, SizeType32 topK, SizeType32* topKs, SizeType topKsSize,
-    float topP, float* topPs, SizeType topPsSize, bool* skipDecode, SizeType const* batchSlots)
+__global__ void setupTopKRuntimeArgs(SizeType32 batchSize, SizeType32 topK, SizeType32* topKs, SizeType32 topKsSize,
+    float topP, float* topPs, SizeType32 topPsSize, bool* skipDecode, SizeType32 const* batchSlots)
 {
-    auto const index = static_cast<SizeType>(blockIdx.x * blockDim.x + threadIdx.x);
-    for (auto bi = index; bi < batchSize; bi += static_cast<SizeType>(gridDim.x * blockDim.x))
+    auto const index = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
+    for (auto bi = index; bi < batchSize; bi += static_cast<SizeType32>(gridDim.x * blockDim.x))
     {
         auto const batchSlot = batchSlots != nullptr ? batchSlots[bi] : bi;
         auto k = topKsSize > 1 ? topKs[batchSlot] : topK;
@@ -94,7 +94,7 @@ TopKSamplingLayer<T>::~TopKSamplingLayer()
 }
 
 template <typename T>
-void TopKSamplingLayer<T>::allocateBuffer(SizeType const batchSize)
+void TopKSamplingLayer<T>::allocateBuffer(SizeType32 const batchSize)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -134,7 +134,7 @@ void TopKSamplingLayer<T>::freeBuffer()
 }
 
 template <typename T>
-void TopKSamplingLayer<T>::setup(SizeType batchSize, SizeType beamWidth, SizeType const* batchSlots,
+void TopKSamplingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 const* batchSlots,
     std::shared_ptr<BaseSetupParams> baseSetupParams)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -163,7 +163,7 @@ void TopKSamplingLayer<T>::setup(SizeType batchSize, SizeType beamWidth, SizeTyp
         {
             TLLM_LOG_WARNING(
                 "TopK (%d) is larger than max supported number (%d). Clip to max supported number.", topK, TOP_K_MAX);
-            topK = std::clamp(topK, 0, static_cast<SizeType>(TOP_K_MAX));
+            topK = std::clamp(topK, 0, static_cast<SizeType32>(TOP_K_MAX));
         }
     }
 
@@ -201,7 +201,7 @@ void TopKSamplingLayer<T>::setup(SizeType batchSize, SizeType beamWidth, SizeTyp
     cudaAutoCpy(runtimeTopKs.data(), mRuntimeTopKDevice, mDecoderDomain.getMaxBatchSize(), mStream);
     {
         runtime::SizeType32 maxTopK = 0;
-        for (SizeType bi = 0; bi < batchSize; ++bi)
+        for (SizeType32 bi = 0; bi < batchSize; ++bi)
         {
             auto bid = bi;
             if (batchSlots)
@@ -229,7 +229,7 @@ void TopKSamplingLayer<T>::forward(
 
     auto logits = inputs->logits.template getPtr<T>();
     auto endIds = inputs->end_ids.template getPtr<TokenIdType const>();
-    auto batchSlots = inputs->batch_slots ? inputs->batch_slots->template getPtr<SizeType const>() : nullptr;
+    auto batchSlots = inputs->batch_slots ? inputs->batch_slots->template getPtr<SizeType32 const>() : nullptr;
     auto curandStatesDevice = inputs->curand_states;
     auto samplingWorkspaceDevice = inputs->sampling_workspace;
     auto const probsComputed = inputs->probs_computed;

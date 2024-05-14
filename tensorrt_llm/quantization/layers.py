@@ -24,6 +24,7 @@ from ..functional import (ACT2FN, AttentionMaskType, PositionEmbeddingType,
                           allgather, allreduce, cast, concat, constant,
                           generate_alibi_slopes, gpt_attention, matmul, mul,
                           shape, slice, softmax, split, where)
+from ..layers import SpecDecodingParams
 from ..layers.linear import Linear, RowLinear
 from ..module import Module
 from ..parameter import Parameter
@@ -977,7 +978,7 @@ class SmoothQuantAttention(Module):
             num_kv_heads + tp_size - 1
         ) // tp_size if num_kv_heads is not None else self.num_attention_heads
         self.hidden_size = hidden_size // tp_size
-        self.max_position_embeddings = max_position_embeddings
+        self.max_position_embeddings = 0 if max_position_embeddings is None else max_position_embeddings
         self.tp_size = tp_size
         self.tp_rank = tp_rank
 
@@ -1012,10 +1013,21 @@ class SmoothQuantAttention(Module):
         if self.position_embedding_type.is_rope():
             self.rotary_embedding_dim = int(self.attention_head_size *
                                             rotary_embedding_percentage)
-            self.embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
+            embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
                 self.max_position_embeddings, self.rotary_embedding_dim,
                 self.rotary_embedding_base, self.rotary_embedding_scale,
                 self.rotary_embedding_scale_type)
+            self.register_parameter(
+                'embed_positions_for_gpt_attention',
+                Parameter(embed_positions_for_gpt_attention))
+        elif self.position_embedding_type.is_alibi():
+            alibi_scale = 1. / self.norm_factor if self.scale_alibi_bias else 1.
+            alibi_slopes = generate_alibi_slopes(self.num_attention_heads *
+                                                 self.tp_size,
+                                                 tp_size=self.tp_size,
+                                                 tp_rank=self.tp_rank,
+                                                 alibi_scale=alibi_scale)
+            self.register_parameter('alibi_slopes', Parameter(alibi_slopes))
 
         self.quant_mode = quant_mode
         self.dtype = dtype
@@ -1061,11 +1073,10 @@ class SmoothQuantAttention(Module):
         self,
         hidden_states: Tensor,
         attention_mask=None,
-        spec_decoding_packed_mask=None,
-        spec_decoding_position_offsets=None,
         use_cache=False,
         kv_cache_params=None,
         attention_params=None,
+        spec_decoding_params=None,
         encoder_output=None,
         position_embedding=None,
         norm_before_bmm1=False,
@@ -1079,6 +1090,7 @@ class SmoothQuantAttention(Module):
 
         alibi_slopes = None
         if self.position_embedding_type == PositionEmbeddingType.alibi:
+            alibi_slopes = self.alibi_slopes.value
             dtype = trt.float32
             if default_net().plugin_config.gpt_attention_plugin or default_net(
             ).plugin_config.inflight_batching_gpt_attention_plugin:
@@ -1086,12 +1098,10 @@ class SmoothQuantAttention(Module):
                 ) else hidden_states[0].dtype
                 if dtype == trt.int8:
                     dtype = trt.float16
-            alibi_scale = 1. / self.norm_factor if self.scale_alibi_bias else 1.
-            alibi_slopes = alibi_scale * generate_alibi_slopes(
-                self.num_attention_heads * self.tp_size,
-                dtype=dtype,
-                tp_size=self.tp_size,
-                tp_rank=self.tp_rank)
+            alibi_slopes = cast(alibi_slopes, dtype)
+
+        if spec_decoding_params is None:
+            spec_decoding_params = SpecDecodingParams()
 
         if default_net().plugin_config.gpt_attention_plugin:
 
@@ -1109,9 +1119,8 @@ class SmoothQuantAttention(Module):
             else:
                 kv_orig_quant_scale = None
                 kv_quant_orig_scale = None
-            rotary_cos_sin = constant(
-                self.embed_positions_for_gpt_attention
-            ) if self.position_embedding_type.is_rope() else None
+            rotary_cos_sin = self.embed_positions_for_gpt_attention.value if self.position_embedding_type.is_rope(
+            ) else None
             context, past_key_value = gpt_attention(
                 qkv=qkv,
                 past_key_value=kv_cache_params.get_first_past_key_value(),
@@ -1149,8 +1158,12 @@ class SmoothQuantAttention(Module):
                 host_kv_cache_pool_pointers=kv_cache_params.
                 host_kv_cache_pool_pointers,
                 host_context_lengths=attention_params.host_context_lengths,
-                spec_decoding_position_offsets=spec_decoding_position_offsets,
-                spec_decoding_packed_mask=spec_decoding_packed_mask)
+                spec_decoding_generation_lengths=spec_decoding_params.
+                spec_decoding_generation_lengths,
+                spec_decoding_position_offsets=spec_decoding_params.
+                spec_decoding_position_offsets,
+                spec_decoding_packed_mask=spec_decoding_params.
+                spec_decoding_packed_mask)
         else:
             assert self.paged_kv_cache == False
 

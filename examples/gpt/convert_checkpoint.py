@@ -19,15 +19,15 @@ import torch.nn as nn
 import yaml
 from datasets import load_dataset
 from tqdm import tqdm
-from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
-                          GPT2Config)
+from transformers import (AutoConfig, AutoModelForCausalLM,
+                          AutoModelForVision2Seq, AutoTokenizer, GPT2Config)
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 from transformers.pytorch_utils import Conv1D
 
 import tensorrt_llm
 from tensorrt_llm._utils import pad_vocab_size, str_dtype_to_torch
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.llama.utils import retrieved_layer_index_from_name
+from tensorrt_llm.models.convert_utils import retrieved_layer_index_from_name
 from tensorrt_llm.quantization import QuantAlgo
 
 LOGGER = logging.getLogger(__name__)
@@ -45,7 +45,8 @@ def parse_arguments():
         '--gpt_variant',
         default=None,
         choices=[
-            None, 'gpt2', 'santacoder', 'starcoder', 'starcoder2', 'persimmon'
+            None, 'gpt2', 'santacoder', 'starcoder', 'starcoder2', 'persimmon',
+            'kosmos-2'
         ],
         help=
         "By default the script will try to infer the gpt_variant from model_dir. "
@@ -150,10 +151,33 @@ def parse_arguments():
         default=1,
         help='The number of workers for converting checkpoint in parallel')
     parser.add_argument('--log_level', type=str, default='info')
+    parser.add_argument(
+        '--nemo_rename_key',
+        type=str,
+        nargs='+',
+        default=[],
+        help=
+        "Change a layer name when loading a NeMo checkpoint. Should follow <old_name_pattern>:<new_name_pattern>"
+    )
+
     args = parser.parse_args()
 
     tensorrt_llm.logger.set_level(args.log_level)
     return args
+
+
+def rename_keys(model_state, layer_rename_config: Dict[str, str]):
+    if not layer_rename_config:
+        return model_state
+
+    new_state_dict = {}
+    for key, value in model_state.items():
+        for old, new in layer_rename_config.items():
+            key = key.replace(old, new)
+        assert key not in new_state_dict, f"Key already exists: {key}"
+        new_state_dict[key] = value
+
+    return new_state_dict
 
 
 def load_gpt_config(model_dir: str,
@@ -162,13 +186,16 @@ def load_gpt_config(model_dir: str,
 
     if gpt_variant is None:
         print("Inferring gpt variant from path...")
-        for v in ['starcoder2', 'starcoder', 'santacoder', 'gpt2', 'persimmon']:
+        for v in [
+                'starcoder2', 'starcoder', 'santacoder', 'gpt2', 'persimmon',
+                'kosmos-2'
+        ]:
             if v in config._name_or_path or ('fuyu' in config._name_or_path
                                              and v == 'persimmon'):
                 gpt_variant = v
                 break
     assert gpt_variant in [
-        'gpt2', 'santacoder', 'starcoder', 'starcoder2', 'persimmon'
+        'gpt2', 'santacoder', 'starcoder', 'starcoder2', 'persimmon', 'kosmos-2'
     ]
     print(f"Gpt variant: {gpt_variant}")
 
@@ -186,6 +213,17 @@ def load_gpt_config(model_dir: str,
         config.position_embedding_type = 'rope_gpt_neox'
         config.rotary_base = config.rope_theta
         config.rotary_pct = getattr(config, 'partial_rotary_factor', 1.0)
+    elif gpt_variant == "kosmos-2":
+        config.n_embd = config.text_config.embed_dim
+        config.n_inner = config.text_config.ffn_dim
+        config.n_head = config.text_config.attention_heads
+        config.n_kv_head = config.n_head
+        config.n_layer = config.text_config.layers
+        config.n_positions = config.text_config.max_position_embeddings
+        config.activation_function = config.text_config.activation_function
+        config.layer_norm_epsilon = config.text_config.layer_norm_eps
+        config.bias = True
+        config.vocab_size = config.text_config.vocab_size
     else:
         if config.n_inner is None:
             config.n_inner = config.n_embd * 4
@@ -354,6 +392,8 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
         elif gpt_variant == 'persimmon':
             is_fuyu = f'language_model.model.embed_tokens.weight' in model_params
             prefix = f'language_model.model.layers.{l}' if is_fuyu else f'model.layers.{l}'
+        elif gpt_variant == 'kosmos-2':
+            prefix = f'text_model.model.layers.{l}'
         else:
             prefix = f'transformer.h.{l}'
         tllm_prex = f'transformer.layers.{l-layers_range[0]}'
@@ -364,7 +404,7 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
                                              f'{prefix}.attn.kv_attn', dtype)
             qkv_w = torch.cat([q_w, kv_w], dim=-1)
             qkv_b = torch.cat([q_b, kv_b], dim=-1)
-        elif gpt_variant == 'starcoder2':
+        elif gpt_variant in ['starcoder2', 'kosmos-2']:
             q_w, q_b = get_weight_and_bias(model_params,
                                            f'{prefix}.self_attn.q_proj', dtype)
             k_w, k_b = get_weight_and_bias(model_params,
@@ -409,6 +449,9 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
         elif gpt_variant == 'persimmon':
             attn_dense_w, attn_dense_b = get_weight_and_bias(
                 model_params, f'{prefix}.self_attn.dense', dtype)
+        elif gpt_variant == 'kosmos-2':
+            attn_dense_w, attn_dense_b = get_weight_and_bias(
+                model_params, f'{prefix}.self_attn.out_proj', dtype)
         else:
             attn_dense_w, attn_dense_b = get_weight_and_bias(
                 model_params, f'{prefix}.attn.c_proj', dtype)
@@ -426,6 +469,9 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
         if gpt_variant == 'persimmon':
             mlp_fc_w, mlp_fc_b = get_weight_and_bias(
                 model_params, f'{prefix}.mlp.dense_h_to_4h', dtype)
+        elif gpt_variant == 'kosmos-2':
+            mlp_fc_w, mlp_fc_b = get_weight_and_bias(model_params,
+                                                     f'{prefix}.ffn.fc1', dtype)
         else:
             mlp_fc_w, mlp_fc_b = get_weight_and_bias(model_params,
                                                      f'{prefix}.mlp.c_fc',
@@ -448,6 +494,9 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
         if gpt_variant == 'persimmon':
             mlp_proj_w, mlp_proj_b = get_weight_and_bias(
                 model_params, f'{prefix}.mlp.dense_4h_to_h', dtype)
+        elif gpt_variant == 'kosmos-2':
+            mlp_proj_w, mlp_proj_b = get_weight_and_bias(
+                model_params, f'{prefix}.ffn.fc2', dtype)
         else:
             mlp_proj_w, mlp_proj_b = get_weight_and_bias(
                 model_params, f'{prefix}.mlp.c_proj', dtype)
@@ -465,6 +514,9 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
         if gpt_variant in ['starcoder2', 'persimmon']:
             input_ln_w, input_ln_b = get_weight_and_bias(
                 model_params, f'{prefix}.input_layernorm', dtype)
+        elif gpt_variant == 'kosmos-2':
+            input_ln_w, input_ln_b = get_weight_and_bias(
+                model_params, f'{prefix}.self_attn_layer_norm', dtype)
         else:
             input_ln_w, input_ln_b = get_weight_and_bias(
                 model_params, f'{prefix}.ln_1', dtype)
@@ -475,6 +527,9 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
         if gpt_variant in ['starcoder2', 'persimmon']:
             post_ln_w, post_ln_b = get_weight_and_bias(
                 model_params, f'{prefix}.post_attention_layernorm', dtype)
+        elif gpt_variant == 'kosmos-2':
+            post_ln_w, post_ln_b = get_weight_and_bias(
+                model_params, f'{prefix}.final_layer_norm', dtype)
         else:
             post_ln_w, post_ln_b = get_weight_and_bias(model_params,
                                                        f'{prefix}.ln_2', dtype)
@@ -495,9 +550,27 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
             weights[f'{tllm_prex}.attention.k_layernorm.weight'] = k_layernorm_w
             weights[f'{tllm_prex}.attention.k_layernorm.bias'] = k_layernorm_b
 
+        if gpt_variant == 'kosmos-2':
+            q_layernorm_w, q_layernorm_b = get_weight_and_bias(
+                model_params, f'{prefix}.self_attn.inner_attn_ln', dtype)
+
+            weights[
+                f'{tllm_prex}.attention.inner_layernorm.weight'] = q_layernorm_w
+            weights[
+                f'{tllm_prex}.attention.inner_layernorm.bias'] = q_layernorm_b
+
+            k_layernorm_w, k_layernorm_b = get_weight_and_bias(
+                model_params, f'{prefix}.ffn.ffn_layernorm', dtype)
+
+            weights[f'{tllm_prex}.mlp.inner_layernorm.weight'] = k_layernorm_w
+            weights[f'{tllm_prex}.mlp.inner_layernorm.bias'] = k_layernorm_b
+
     if mapping.is_first_pp_rank():
         if gpt_variant == 'starcoder2':
             embed_w = get_weight(model_params, 'model.embed_tokens', dtype)
+        elif gpt_variant == 'kosmos-2':
+            embed_w = get_weight(model_params, 'text_model.model.embed_tokens',
+                                 dtype)
         elif gpt_variant == 'persimmon':
             embed_w = get_weight(model_params,
                                  ('language_model.' if is_fuyu else '') +
@@ -511,7 +584,15 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
             use_parallel_embedding=use_parallel_embedding,
             sharding_dim=sharding_dim)
 
-        pos_embed_w = get_weight(model_params, 'transformer.wpe', dtype)
+        if gpt_variant == 'kosmos-2':
+            padding_idx = hf_config.text_config.pad_token_id
+            sin_pos_embedding = hf_model.text_model.model.embed_positions.get_embedding(
+                padding_idx + 1 + hf_config.text_config.max_position_embeddings,
+                hf_config.text_config.embed_dim,
+                padding_idx=padding_idx)  # [2 + num_embeddings, embed_dim]
+            pos_embed_w = sin_pos_embedding[2:].to(dtype).detach().cpu()
+        else:
+            pos_embed_w = get_weight(model_params, 'transformer.wpe', dtype)
         if pos_embed_w is not None:
             weights['transformer.position_embedding.weight'] = split_embedding(
                 pos_embed_w,
@@ -529,6 +610,9 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
             embed_w = get_weight(model_params,
                                  ('language_model.' if is_fuyu else '') +
                                  'lm_head', dtype)
+        elif gpt_variant == 'kosmos-2':
+            embed_w = get_weight(model_params, 'text_model.model.embed_tokens',
+                                 dtype)
         else:
             embed_w = get_weight(model_params, 'transformer.wte', dtype)
         if not share_embedding_table:
@@ -548,6 +632,10 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
             ln_f_w, ln_f_b = get_weight_and_bias(
                 model_params, ('language_model.' if is_fuyu else '') +
                 'model.final_layernorm', dtype)
+        elif gpt_variant == 'kosmos-2':
+            ln_f_w, ln_f_b = get_weight_and_bias(model_params,
+                                                 'text_model.model.layer_norm',
+                                                 dtype)
         else:
             ln_f_w, ln_f_b = get_weight_and_bias(model_params,
                                                  'transformer.ln_f', dtype)
@@ -1427,7 +1515,8 @@ class UnpackedNemoCheckpointDir:
 
 
 def load_nemo_gpt_config(
-        unpacked_checkpoints_dir: UnpackedNemoCheckpointDir) -> GPT2Config:
+        unpacked_checkpoints_dir: UnpackedNemoCheckpointDir,
+        layer_rename_config: Dict[str, str] = None) -> GPT2Config:
     nemo_model_config = unpacked_checkpoints_dir.model_config
 
     training_tp_size = nemo_model_config.get("tensor_model_parallel_size", 1)
@@ -1442,6 +1531,7 @@ def load_nemo_gpt_config(
     else:
         map_location_fn = gpu_map_location
     model_00 = torch.load(checkpoints_paths[0][0], map_location=map_location_fn)
+    model_00 = rename_keys(model_00, layer_rename_config)
     vocab_size = model_00[
         "model.language_model.embedding.word_embeddings.weight"].shape[
             0] * training_tp_size
@@ -1489,12 +1579,18 @@ def load_nemo_gpt_config(
 
 
 @torch.no_grad()
-def load_torch_checkpoints(checkpoints_paths, merge_factor, tp_rank, pp_rank,
-                           map_location_fn, handle_model_level_weights):
+def load_torch_checkpoints(checkpoints_paths,
+                           merge_factor,
+                           tp_rank,
+                           pp_rank,
+                           map_location_fn,
+                           handle_model_level_weights,
+                           layer_rename_config: Dict[str, str] = {}):
     models = []
     for k in range(merge_factor):
         rank_weights = checkpoints_paths[tp_rank * merge_factor + k][pp_rank]
         model = torch.load(rank_weights, map_location=map_location_fn)
+        model = rename_keys(model, layer_rename_config)
         handle_model_level_weights(model, tp_rank * merge_factor + k, pp_rank)
         layers = extract_layers_with_prefix(model,
                                             "model.language_model.encoder.")
@@ -1505,7 +1601,8 @@ def load_torch_checkpoints(checkpoints_paths, merge_factor, tp_rank, pp_rank,
 @torch.no_grad()
 def convert_nemo_gpt(unpacked_checkpoints_dir: UnpackedNemoCheckpointDir,
                      mapping: Mapping,
-                     dtype: str = 'float32'):
+                     dtype: str = 'float32',
+                     layer_rename_config: Dict[str, str] = None):
     nemo_model_config = unpacked_checkpoints_dir.model_config
 
     checkpoints_paths = unpacked_checkpoints_dir.get_checkpoints_paths(
@@ -1522,6 +1619,7 @@ def convert_nemo_gpt(unpacked_checkpoints_dir: UnpackedNemoCheckpointDir,
     # load position_embedding from rank 0
     model_00 = torch.load(checkpoints_paths[0][0], map_location=map_location_fn)
     model_00 = model_00.get("state_dict", model_00)
+    model_00 = rename_keys(model_00, layer_rename_config)
     has_position_embedding = "model.language_model.embedding.position_embeddings.weight" in model_00
     has_lm_head = "model.language_model.output_layer.weight" in model_00
     del model_00
@@ -1575,7 +1673,8 @@ def convert_nemo_gpt(unpacked_checkpoints_dir: UnpackedNemoCheckpointDir,
     for pp_rank in range(training_pp_size):
         models = load_torch_checkpoints(checkpoints_paths, merge_factor,
                                         tp_rank, pp_rank, map_location_fn,
-                                        handle_model_level_weights)
+                                        handle_model_level_weights,
+                                        layer_rename_config)
         for name in list(models[0].keys()):
             params = [model[name] for model in models]
             if transpose_weights and params[0].ndim == 2:
@@ -1771,8 +1870,12 @@ if __name__ == '__main__':
         nemo_dir = unpack_nemo_ckpt(args.nemo_ckpt_path, nemo_dir)
         unpacked_checkpoints_dir = UnpackedNemoCheckpointDir(
             nemo_dir, load_checkpoints_to_cpu=not args.load_nemo_on_gpu)
+        layer_rename_config = {
+            pattern.split(':')[0]: pattern.split(':')[1]
+            for pattern in args.nemo_rename_key
+        }
         hf_config, tokenizer_config = load_nemo_gpt_config(
-            unpacked_checkpoints_dir)
+            unpacked_checkpoints_dir, layer_rename_config)
         copy_tokenizer_files(tokenizer_config, Path(args.output_dir))
         args.use_parallel_embedding = True
         args.embedding_sharding_dim = 0
@@ -1830,17 +1933,29 @@ if __name__ == '__main__':
         'rotary_scaling':
         getattr(hf_config, 'rotary_scaling', None),
         'qk_layernorm':
-        args.model_dir is not None and gpt_variant == 'persimmon'
+        args.model_dir is not None and gpt_variant == 'persimmon',
+        'inner_layernorm':
+        args.model_dir is not None and gpt_variant == 'kosmos-2',
+        'norm_before_bmm1':
+        args.model_dir is not None and gpt_variant == 'kosmos-2',
+        'scale_embedding':
+        args.model_dir is not None and gpt_variant == 'kosmos-2'
+        and hf_config.text_config.scale_embedding,
     }
 
     with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
         json.dump(config, f, indent=4)
 
     if args.model_dir is not None:
-        hf_model = AutoModelForCausalLM.from_pretrained(args.model_dir,
-                                                        trust_remote_code=True,
-                                                        device_map="auto",
-                                                        torch_dtype="auto")
+        if gpt_variant == 'kosmos-2':
+            hf_model = AutoModelForVision2Seq.from_pretrained(
+                args.model_dir, trust_remote_code=True)
+        else:
+            hf_model = AutoModelForCausalLM.from_pretrained(
+                args.model_dir,
+                trust_remote_code=True,
+                device_map="auto",
+                torch_dtype="auto")
         if args.smoothquant is not None or args.int8_kv_cache:
             os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get(
                 "TOKENIZERS_PARALLELISM", "false")
@@ -1852,7 +1967,7 @@ if __name__ == '__main__':
             if args.smoothquant is not None:
                 smooth_gpt_model(hf_model, act_range, args.smoothquant)
 
-    def covert_and_save(rank):
+    def convert_and_save(rank):
         mapping = Mapping(world_size=world_size,
                           rank=rank,
                           tp_size=args.tp_size,
@@ -1891,18 +2006,18 @@ if __name__ == '__main__':
 
         elif args.nemo_ckpt_path is not None:
             weights = convert_nemo_gpt(unpacked_checkpoints_dir, mapping,
-                                       args.dtype)
+                                       args.dtype, layer_rename_config)
 
         safetensors.torch.save_file(
             weights, os.path.join(args.output_dir, f'rank{rank}.safetensors'))
 
     if args.workers == 1:
         for rank in range(world_size):
-            covert_and_save(rank)
+            convert_and_save(rank)
     else:
         with ThreadPoolExecutor(max_workers=args.workers) as p:
             futures = [
-                p.submit(covert_and_save, rank) for rank in range(world_size)
+                p.submit(convert_and_save, rank) for rank in range(world_size)
             ]
             exceptions = []
             for future in as_completed(futures):

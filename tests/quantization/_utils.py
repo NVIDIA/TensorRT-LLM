@@ -23,28 +23,28 @@ def woq_torch_dtype(dtype):
     elif dtype == "bfloat16":
         torch_dtype = torch.bfloat16
     else:
-        assert (False)
+        assert False, f"{dtype} does not support WoQ"
     return torch_dtype
 
 
 def woq_all_ones(n, k, dtype):
     torch_dtype = woq_torch_dtype(dtype)
     # Init operands for multiplication in int32
-    weight = torch.ones((n, k), dtype=torch_dtype)
+    weight = torch.ones((n, k), dtype=torch_dtype, device="cuda")
     return weight
 
 
 def woq_all_zeros(n, k, dtype):
     torch_dtype = woq_torch_dtype(dtype)
     # Init operands for multiplication in int32
-    weight = torch.zeros((n, k), dtype=torch_dtype)
+    weight = torch.zeros((n, k), dtype=torch_dtype, device="cuda")
     return weight
 
 
 def woq_gen_weights(n, k, dtype):
     torch_dtype = woq_torch_dtype(dtype)
     # Init operands for multiplication in int32
-    weight = torch.rand((n, k), dtype=torch_dtype) * 2 - 1.0
+    weight = torch.rand((n, k), dtype=torch_dtype, device="cuda") * 2 - 1.0
     return weight
 
 
@@ -55,16 +55,16 @@ def woq_conversion(weight, wTypeId):
     elif wTypeId == 2:
         torch_wTypeId = torch.quint4x2
     else:
-        assert (False)
+        assert False, f"wTypeId={wTypeId} is not supported by WoQ"
     return torch.ops.trtllm._symmetric_quantize_last_axis_of_batched_matrix(
-        weight, torch_wTypeId)
+        weight.cpu(), torch_wTypeId)
 
 
-def woq_groupwise_gt_matmul(mat1, ref_torch_weights, bias=torch.Tensor()):
-    ref = mat1.cuda().matmul(ref_torch_weights.cuda())
-    if bias.numel() != 0:
-        ref += bias.cuda()
-    return ref.cpu()
+def woq_groupwise_gt_matmul(mat1, ref_torch_weights, bias=None):
+    ref = torch.matmul(mat1, ref_torch_weights)
+    if bias is not None:
+        ref += bias
+    return ref
 
 
 def woq_gt_matmul(m,
@@ -74,14 +74,14 @@ def woq_gt_matmul(m,
                   dtype,
                   bias=None):
     mat1 = mat1.to(dtype=torch.float)
-    ref_torch_weights = ref_torch_weights.cuda().to(dtype=torch.float)
+    ref_torch_weights = ref_torch_weights.to(dtype=torch.float)
     # Do matmul
-    ref = torch.matmul(mat1.cpu(), ref_torch_weights.cpu())
+    ref = torch.matmul(mat1, ref_torch_weights)
 
     # Prepare per element scaling
     scaling = torch_weight_scales.expand((m, -1))
     # Scale output and cast to right type
-    ref = ref.cuda() * scaling.cuda()
+    ref = ref * scaling
 
     # Round to the nearest int to match cuda rounding
     if dtype == "int32":
@@ -91,7 +91,7 @@ def woq_gt_matmul(m,
     ref = ref.to(dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype))
 
     if bias is not None:
-        ref += bias.cuda()
+        ref += bias
 
     return ref
 
@@ -106,16 +106,18 @@ def woq_assert_near_eq(ref, act, wTypeId):
 
     max_val = torch.max(abs(ref)).item()
     atol = (max_val * quant_range_scale) * 1.5  # allow for rounding
-    torch.testing.assert_close(ref.cpu(), act.cpu(), atol=atol, rtol=1e-7)
+    torch.testing.assert_close(ref, act, atol=atol, rtol=1e-7)
 
 
 def gt_matmul_smooth_quant(mat1, mat2, scale_a_, scale_b_, dtype, bias=None):
     # Convert to int32 for PyTorch GT Matmul with accumulation in int32.
-    mat1 = mat1.to(dtype=torch.int32)
+    device = mat1.device
+    mat1 = mat1.to(dtype=torch.int32).cpu()
     # Transpose the second matrix to support the native PyTorch format
-    mat2 = mat2.cuda().transpose(0, 1).to(dtype=torch.int32)
-    # Do matmul
-    ref = torch.matmul(mat1.cpu(), mat2.cpu())
+    mat2 = mat2.transpose(0, 1).to(dtype=torch.int32).cpu()
+    # Do matmul, int32 matmul must be in CPU. GPU does not support
+    ref = torch.matmul(mat1, mat2)
+    ref = ref.to(device)
 
     m = 1
     for ii in range(len(mat1.shape) - 1):
@@ -123,11 +125,11 @@ def gt_matmul_smooth_quant(mat1, mat2, scale_a_, scale_b_, dtype, bias=None):
     n = mat2.shape[1]
 
     # Prepare per element scaling
-    scale_a = scale_a_.expand((m, 1))
-    scale_b = scale_b_.expand((1, n))
-    scaling = torch.matmul(scale_a.cuda(), scale_b.cuda()).reshape(ref.shape)
+    scale_a = scale_a_.expand((m, 1)).float()
+    scale_b = scale_b_.expand((1, n)).float()
+    scaling = torch.matmul(scale_a, scale_b).reshape(ref.shape)
     # Scale output and cast to right type
-    ref = ref.cuda() * scaling.cuda()
+    ref = ref * scaling
 
     # Round to the nearest int to match cuda rounding
     if dtype == "int32":
@@ -137,13 +139,12 @@ def gt_matmul_smooth_quant(mat1, mat2, scale_a_, scale_b_, dtype, bias=None):
     ref = ref.to(dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype))
 
     if bias is not None:
-        ref += bias.cuda()
+        ref += bias
 
     return ref
 
 
 def gt_quantize_per_token(x):
-    x = x.to(dtype=torch.float32)
     xmax, _ = x.abs().max(dim=-1, keepdim=True)
     x = (x * 127.0 / xmax).round().clip(-128, 127).to(dtype=torch.int8)
     scale_act = (xmax / 127.0).reshape(-1, 1)

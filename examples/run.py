@@ -179,6 +179,13 @@ def parse_arguments(args=None):
         help="Medusa choice to use, if not none, will use Medusa decoding."
         "   E.g.: [[0, 0, 0, 0], [0, 1, 0], [1, 0], [1, 1]] for 9 medusa tokens."
     )
+    parser.add_argument(
+        '--gpu_weights_percent',
+        default=1,
+        type=float,
+        help=
+        'Specify the percentage of weights that reside on GPU instead of CPU and streaming load during runtime.',
+    )
 
     return parser.parse_args(args=args)
 
@@ -394,10 +401,10 @@ def main(args):
                          lora_dir=args.lora_dir,
                          rank=runtime_rank,
                          debug_mode=args.debug_mode,
-                         lora_ckpt_source=args.lora_ckpt_source)
+                         lora_ckpt_source=args.lora_ckpt_source,
+                         gpu_weights_percent=args.gpu_weights_percent)
     if args.medusa_choices is not None:
         args.medusa_choices = ast.literal_eval(args.medusa_choices)
-        assert args.use_py_session, "Medusa is only supported by py_session"
         assert args.temperature == 1.0, "Medusa should use temperature == 1.0"
         assert args.num_beams == 1, "Medusa should use num_beams == 1"
         runner_kwargs.update(medusa_choices=args.medusa_choices)

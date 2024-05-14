@@ -87,9 +87,13 @@ def gen_random_tokens(ip_lens, tokenizer, random_seed):
         start_ids = get_sample_from_population(range(0, tokenizer.vocab_size),
                                                ip_len)
         # Make sure it does not contain EOS token
-        while set(tokenizer.encode(tokenizer.eos_token)).issubset(start_ids):
-            start_ids = get_sample_from_population(
-                range(0, tokenizer.vocab_size), ip_len)
+        eos_id = tokenizer.encode(tokenizer.eos_token, add_special_tokens=False)
+        while set(eos_id).issubset(start_ids):
+            tmp_id = (eos_id[0] + 1) % tokenizer.vocab_size
+            start_ids = [
+                tmp_id if element == eos_id[0] else element
+                for element in start_ids
+            ]
         input_ids.append(start_ids)
 
     return input_ids

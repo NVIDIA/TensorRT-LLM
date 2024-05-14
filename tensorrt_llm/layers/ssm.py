@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import math
-from dataclasses import dataclass
 from typing import Optional
 
 from .._common import default_net
@@ -23,16 +22,6 @@ from ..functional import (ACT2FN, Tensor, concat, conv2d, gather, mamba_conv1d,
 from ..module import Module
 from ..parameter import Parameter
 from .linear import Linear
-
-
-@dataclass
-class MambaParameters:
-    d_state: int = 16
-    d_conv: int = 4
-    expand: int = 2
-    dt_rank: str = "auto"
-    conv_bias: bool = True
-    bias: bool = False
 
 
 class MambaConv1d(Module):
@@ -112,19 +101,17 @@ class Mamba(Module):
 
     def __init__(self,
                  d_model,
+                 d_inner,
                  d_state=16,
                  d_conv=4,
-                 expand=2,
                  dt_rank="auto",
-                 conv_bias=True,
                  bias=False,
                  dtype=None):
         super().__init__()
         self.d_model = d_model
         self.d_state = d_state
         self.d_conv = d_conv
-        self.expand = expand
-        self.d_inner = int(self.expand * self.d_model)
+        self.d_inner = d_inner
         self.dt_rank = math.ceil(self.d_model /
                                  16) if dt_rank == "auto" else dt_rank
         self.dtype = dtype

@@ -37,15 +37,15 @@ namespace tensorrt_llm::tests::layers
 
 struct SamplingParams
 {
-    tensorrt_llm::runtime::SizeType batchSize;
-    std::vector<tensorrt_llm::runtime::SizeType> runtimeTopK;
-    std::vector<std::vector<tensorrt_llm::runtime::SizeType>> runtimeHeadsTopK;
+    tensorrt_llm::runtime::SizeType32 batchSize;
+    std::vector<tensorrt_llm::runtime::SizeType32> runtimeTopK;
+    std::vector<std::vector<tensorrt_llm::runtime::SizeType32>> runtimeHeadsTopK;
     std::vector<std::vector<tensorrt_llm::runtime::TokenIdType>> draftIds;
-    std::vector<std::vector<tensorrt_llm::runtime::SizeType>> paths;
-    std::vector<std::vector<tensorrt_llm::runtime::SizeType>> treeIds;
-    std::vector<tensorrt_llm::runtime::SizeType> tokensPerStep;
-    std::vector<tensorrt_llm::runtime::SizeType> acceptedCumSum;
-    std::vector<tensorrt_llm::runtime::SizeType> packedPaths;
+    std::vector<std::vector<tensorrt_llm::runtime::SizeType32>> paths;
+    std::vector<std::vector<tensorrt_llm::runtime::SizeType32>> treeIds;
+    std::vector<tensorrt_llm::runtime::SizeType32> tokensPerStep;
+    std::vector<tensorrt_llm::runtime::SizeType32> acceptedCumSum;
+    std::vector<tensorrt_llm::runtime::SizeType32> packedPaths;
     std::optional<tensorrt_llm::runtime::TokenIdType> endId;
 };
 
@@ -58,18 +58,18 @@ private:
 public:
     using TensorPtr = tensorrt_llm::runtime::ITensor::SharedPtr;
     using BufferPtr = tensorrt_llm::runtime::IBuffer::SharedPtr;
-    using SizeType = tensorrt_llm::runtime::SizeType;
+    using SizeType32 = tensorrt_llm::runtime::SizeType32;
     using TokenIdType = tensorrt_llm::runtime::TokenIdType;
 
 private:
-    SizeType mBatchSize{6};
-    SizeType mMaxBatchSize{2 * mBatchSize};
-    SizeType const mVocabSize{9};
-    SizeType const mVocabSizePadded{mVocabSize};
-    SizeType const mMaxTokensPerStep{12};
-    SizeType const mMaxNumHeads{4};
+    SizeType32 mBatchSize{6};
+    SizeType32 mMaxBatchSize{2 * mBatchSize};
+    SizeType32 const mVocabSize{9};
+    SizeType32 const mVocabSizePadded{mVocabSize};
+    SizeType32 const mMaxTokensPerStep{12};
+    SizeType32 const mMaxNumHeads{4};
 
-    SizeType const mMaxSeqLen{mMaxTokensPerStep};
+    SizeType32 const mMaxSeqLen{mMaxTokensPerStep};
     TokenIdType mEndId{mVocabSize};
 
     bool mUseLogitsVec{false};

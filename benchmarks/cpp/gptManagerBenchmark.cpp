@@ -142,7 +142,7 @@ private:
 
 struct BenchmarkParams
 {
-    std::optional<SizeType> maxTokensInPagedKvCache{std::nullopt};
+    std::optional<SizeType32> maxTokensInPagedKvCache{std::nullopt};
     std::optional<float> freeGpuMemoryFraction{std::nullopt};
     bool enableTrtOverlap{false};
     bool enableBlockReuse{false};
@@ -155,12 +155,15 @@ struct BenchmarkParams
 
     // lora / peft params
     std::optional<std::string> loraDir{std::nullopt};
-    SizeType loraDeviceNumModLayers{0};
+    SizeType32 loraDeviceNumModLayers{0};
     size_t loraHostCacheSize{1024 * 2024 * 1024};
 
     // KV cache block offloading
     size_t kvHostCacheSize{0};
     bool kvOnboardBlocks{true};
+
+    // Weights offloading
+    float gpuWeightsPercent{1.0};
 };
 
 class InferenceRequestsAsyncSend
@@ -421,7 +424,7 @@ public:
         auto const& outputLengthTensor = maxNewTokens.tensor;
         TLLM_CHECK_WITH_INFO(outputLengthTensor != nullptr && outputLengthTensor->getSize() > 0,
             "Undefined scalar vector for %s", maxNewTokens.name.c_str());
-        auto const outputLength = *bufferCast<SizeType>(*outputLengthTensor);
+        auto const outputLength = *bufferCast<SizeType32>(*outputLengthTensor);
         auto const start = std::chrono::steady_clock::now();
         mRequestBenchInfos[requestId] = BenchInfo(inputLength, outputLength, start);
     }
@@ -430,7 +433,7 @@ public:
     //   - if eos_id == -1 (default behavior), this is correct since output seq will have max permissible length.
     //   - However, if eos_id != -1, the token size of output sequence may be less than max_output_len, and token
     //   throughput may be inaccurate
-    void recordStart(SizeType inputLength, SizeType maxNewTokens, uint64_t requestId,
+    void recordStart(SizeType32 inputLength, SizeType32 maxNewTokens, uint64_t requestId,
         std::chrono::time_point<std::chrono::steady_clock> const& start)
     {
         mRequestBenchInfos[requestId] = BenchInfo(inputLength, maxNewTokens, start);
@@ -735,7 +738,7 @@ class ExecutorServer
 {
 public:
     ExecutorServer(std::filesystem::path const& trtEnginePath, TrtGptModelType modelType, int32_t maxBeamWidth,
-        batch_scheduler::SchedulerPolicy schedulerPolicy, BenchmarkParams const& benchmarkParams,
+        texec::CapacitySchedulerPolicy capacitySchedulerPolicy, BenchmarkParams const& benchmarkParams,
         std::shared_ptr<Recorder> recorder, std::chrono::milliseconds waitSleep,
         std::optional<uint64_t> const staticEmulatedBatchSize, bool logIterationData)
         : mRecorder(std::move(recorder))
@@ -745,7 +748,7 @@ public:
         , mShutdown(false)
     {
 
-        texec::SchedulerConfig schedulerConfig(batch_scheduler::batchManagerToExecSchedPolicy(schedulerPolicy));
+        texec::SchedulerConfig schedulerConfig(capacitySchedulerPolicy);
         texec::KvCacheConfig kvCacheConfig(benchmarkParams.enableBlockReuse, benchmarkParams.maxTokensInPagedKvCache,
             benchmarkParams.maxAttentionWindow, std::nullopt, benchmarkParams.freeGpuMemoryFraction,
             benchmarkParams.kvHostCacheSize, benchmarkParams.kvOnboardBlocks);
@@ -753,6 +756,7 @@ public:
             std::nullopt, benchmarkParams.loraHostCacheSize);
         texec::ExecutorConfig executorConfig(
             maxBeamWidth, schedulerConfig, kvCacheConfig, benchmarkParams.enableChunkedContext, true);
+        executorConfig.setGpuWeightsPercent(benchmarkParams.gpuWeightsPercent);
         executorConfig.setPeftCacheConfig(peftCacheConfig);
         executorConfig.setBatchingType(
             modelType == TrtGptModelType::V1 ? texec::BatchingType::kSTATIC : texec::BatchingType::kINFLIGHT);
@@ -778,8 +782,8 @@ public:
     {
         try
         {
-            std::vector<SizeType> inputLengths;
-            std::vector<SizeType> maxNewTokens;
+            std::vector<SizeType32> inputLengths;
+            std::vector<SizeType32> maxNewTokens;
             for (auto const& request : requests)
             {
                 inputLengths.push_back(request.getInputTokenIds().size());
@@ -802,9 +806,9 @@ public:
         }
     }
 
-    void waitForResponses(SizeType numRequests, bool warmup = false)
+    void waitForResponses(SizeType32 numRequests, bool warmup = false)
     {
-        SizeType numFinished = 0;
+        SizeType32 numFinished = 0;
         while (mActiveCount || (numFinished < numRequests))
         {
             auto responses = mExecutor->awaitResponses(mWaitSleep);
@@ -857,10 +861,10 @@ private:
 class GptServer
 {
 public:
-    GptServer(std::filesystem::path const& trtEnginePath, TrtGptModelType modelType, SizeType maxBeamWidth,
-        batch_scheduler::SchedulerPolicy schedulerPolicy, TrtGptModelOptionalParams const& optionalParams,
+    GptServer(std::filesystem::path const& trtEnginePath, TrtGptModelType modelType, SizeType32 maxBeamWidth,
+        texec::CapacitySchedulerPolicy capacitySchedulerPolicy, TrtGptModelOptionalParams const& optionalParams,
         std::shared_ptr<Recorder> recorder, std::optional<uint64_t> terminateReqId, std::chrono::milliseconds waitSleep,
-        std::optional<SizeType> const staticEmulatedBatchSize,
+        std::optional<SizeType32> const staticEmulatedBatchSize,
         std::optional<std::chrono::milliseconds> const batchTimeout, bool logIterationData, bool excludeInputInOutput)
         : mRecorder(std::move(recorder))
         , mTerminateReqId(terminateReqId)
@@ -871,7 +875,7 @@ public:
         , mInferReqAsyncSndHdl(nullptr)
     {
         auto const jsonConfig = GptJsonConfig::parse(trtEnginePath / "config.json");
-        SizeType deviceCount{0};
+        SizeType32 deviceCount{0};
         TLLM_CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
         mWorldConfig = WorldConfig::mpi(deviceCount, jsonConfig.getTensorParallelism(),
             jsonConfig.getPipelineParallelism(), optionalParams.deviceIds);
@@ -897,7 +901,7 @@ public:
         };
 
         mBatchManager = std::make_shared<GptManager>(
-            trtEnginePath, modelType, maxBeamWidth, schedulerPolicy,
+            trtEnginePath, modelType, maxBeamWidth, texec::SchedulerConfig{capacitySchedulerPolicy},
             [this](int max_num_requests) { return getInferenceRequests(max_num_requests); },
             [this](uint64_t requestId, std::list<NamedTensor> const& response_tensors, bool final_response,
                 std::string const& errMsg)
@@ -1115,7 +1119,7 @@ private:
     WorkItemsQueue mWorkItemsQueue;
     std::optional<uint64_t> mTerminateReqId;
     std::chrono::milliseconds mWaitSleep;
-    std::optional<SizeType> mStaticEmulatedBatchSize;
+    std::optional<SizeType32> mStaticEmulatedBatchSize;
     std::chrono::milliseconds mBatchTimeout;
     std::atomic<std::chrono::steady_clock::time_point::duration> mBatchDeadline;
     std::atomic<uint64_t> mActiveCount;
@@ -1139,7 +1143,7 @@ struct Sample
 using Samples = std::vector<Sample>;
 
 Samples parseWorkloadJson(
-    std::filesystem::path const& datasetPath, int maxNumSamples, std::optional<SizeType> const maxPromptLen)
+    std::filesystem::path const& datasetPath, int maxNumSamples, std::optional<SizeType32> const maxPromptLen)
 {
     auto constexpr allowExceptions = true;
     auto constexpr ignoreComments = true;
@@ -1215,7 +1219,7 @@ std::shared_ptr<InferenceRequest> makeRequest(std::uint64_t reqId, Sample const&
     auto request = std::make_shared<InferenceRequest>(reqId);
     auto const& inputIds = sample.inputIds;
     request->setInputIds(bufferManager.copyFrom(
-        inputIds, ITensor::makeShape({static_cast<SizeType>(inputIds.size())}), MemoryType::kCPU));
+        inputIds, ITensor::makeShape({static_cast<SizeType32>(inputIds.size())}), MemoryType::kCPU));
     auto const requestOutputLen = sample.outputLen;
     request->setMaxNewTokens(bufferManager.copyFrom(&requestOutputLen, ITensor::makeShape({1, 1}), MemoryType::kCPU));
     request->setBeamWidth(beamWidthTensor);
@@ -1255,8 +1259,8 @@ std::shared_ptr<InferenceRequest> makeRequest(std::uint64_t reqId, Sample const&
     return request;
 }
 
-texec::Request makeExecutorRequest(Sample const& sample, SizeType const& beamWidth,
-    std::optional<SizeType> const& eosId, std::optional<SizeType> const& padId, bool streaming = false,
+texec::Request makeExecutorRequest(Sample const& sample, SizeType32 const& beamWidth,
+    std::optional<SizeType32> const& eosId, std::optional<SizeType32> const& padId, bool streaming = false,
     bool const& returnContextLogits = false, bool const& returnGenerationLogits = false,
     std::optional<texec::LoraConfig> const& loraConfig = std::nullopt)
 {
@@ -1274,11 +1278,11 @@ texec::Request makeExecutorRequest(Sample const& sample, SizeType const& beamWid
 void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType modelType,
     std::string const& datasetPath, std::string const& opCsvFile, int maxNumSamples, int beamWidth, int warmUp,
     std::optional<TokenIdType> const& eosId, std::optional<TokenIdType> const& padId,
-    BenchmarkParams const& benchmarkParams, batch_scheduler::SchedulerPolicy schedulerPolicy,
+    BenchmarkParams const& benchmarkParams, texec::CapacitySchedulerPolicy capacitySchedulerPolicy,
     std::chrono::milliseconds waitSleep, bool returnContextLogits, bool returnGenerationLogits,
-    std::optional<SizeType> const staticEmulatedBatchSize, std::optional<std::chrono::milliseconds> const batchTimeout,
-    bool logIterationData, bool excludeInputInOutput, std::string const& responsesJsonFile,
-    std::optional<SizeType> const maxPromptLen, bool dumpProfile)
+    std::optional<SizeType32> const staticEmulatedBatchSize,
+    std::optional<std::chrono::milliseconds> const batchTimeout, bool logIterationData, bool excludeInputInOutput,
+    std::string const& responsesJsonFile, std::optional<SizeType32> const maxPromptLen, bool dumpProfile)
 {
     TrtGptModelOptionalParams optionalParams;
 
@@ -1304,9 +1308,10 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
     optionalParams.peftCacheManagerConfig.numCopyStreams = 4;
     optionalParams.kvCacheConfig.hostCacheSize = benchmarkParams.kvHostCacheSize;
     optionalParams.kvCacheConfig.onboardBlocks = benchmarkParams.kvOnboardBlocks;
+    optionalParams.gpuWeightsPercent = benchmarkParams.gpuWeightsPercent;
 
     auto const jsonConfig = GptJsonConfig::parse(engineDir / "config.json");
-    SizeType deviceCount{0};
+    SizeType32 deviceCount{0};
     TLLM_CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
     auto const worldConfig = WorldConfig::mpi(
         deviceCount, jsonConfig.getTensorParallelism(), jsonConfig.getPipelineParallelism(), optionalParams.deviceIds);
@@ -1324,9 +1329,9 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
     auto recorder
         = std::make_shared<Recorder>(opCsvFile, benchmarkParams.streaming, responsesJsonFile, excludeInputInOutput);
     uint64_t terminateReqId = numSamples + 1;
-    auto gptServer
-        = std::make_shared<GptServer>(engineDir, modelType, maxBeamWidth, schedulerPolicy, optionalParams, recorder,
-            terminateReqId, waitSleep, staticEmulatedBatchSize, batchTimeout, logIterationData, excludeInputInOutput);
+    auto gptServer = std::make_shared<GptServer>(engineDir, modelType, maxBeamWidth, capacitySchedulerPolicy,
+        optionalParams, recorder, terminateReqId, waitSleep, staticEmulatedBatchSize, batchTimeout, logIterationData,
+        excludeInputInOutput);
 
     ITensor::SharedPtr eosIdTensor{
         eosId ? bufferManager.copyFrom(&eosId.value(), ITensor::makeShape({1}), MemoryType::kPINNED) : nullptr};
@@ -1347,7 +1352,7 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
         {
             auto startLoraLoad = std::chrono::steady_clock::now();
             LoraLib loras(benchmarkParams.loraDir.value());
-            SizeType reqId = 0;
+            SizeType32 reqId = 0;
             for (auto const& [taskId, p] : loras.getLoras())
             {
                 reqId++;
@@ -1368,7 +1373,7 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
 
         // Warm up
         gptServer->resetBatchDeadline();
-        SizeType reqId = 0;
+        SizeType32 reqId = 0;
         for (auto i = 0; i < warmUp; ++i)
         {
             ++reqId;
@@ -1434,9 +1439,9 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
 void benchmarkExecutor(std::filesystem::path const& engineDir, TrtGptModelType modelType,
     std::string const& datasetPath, std::string const& opCsvFile, int maxNumSamples, int beamWidth, int warmUp,
     std::optional<int32_t> const& eosId, std::optional<int32_t> const& padId, BenchmarkParams const& benchmarkParams,
-    batch_scheduler::SchedulerPolicy schedulerPolicy, std::chrono::milliseconds waitSleep, bool returnContextLogits,
-    bool returnGenerationLogits, std::optional<int> const staticEmulatedBatchSize, bool logIterationData,
-    std::optional<SizeType> const maxPromptLen)
+    texec::CapacitySchedulerPolicy capacitySchedulerPolicy, std::chrono::milliseconds waitSleep,
+    bool returnContextLogits, bool returnGenerationLogits, std::optional<int> const staticEmulatedBatchSize,
+    bool logIterationData, std::optional<SizeType32> const maxPromptLen)
 {
     auto const& world = tensorrt_llm::mpi::MpiComm::world();
     auto worldRank = world.getRank();
@@ -1447,7 +1452,7 @@ void benchmarkExecutor(std::filesystem::path const& engineDir, TrtGptModelType m
 
     auto recorder = std::make_shared<Recorder>(opCsvFile, benchmarkParams.streaming);
 
-    auto executorServer = std::make_shared<ExecutorServer>(engineDir, modelType, beamWidth, schedulerPolicy,
+    auto executorServer = std::make_shared<ExecutorServer>(engineDir, modelType, beamWidth, capacitySchedulerPolicy,
         benchmarkParams, recorder, waitSleep, staticEmulatedBatchSize, logIterationData);
 
     if (worldRank == 0)
@@ -1517,9 +1522,9 @@ void benchmarkExecutor(std::filesystem::path const& engineDir, TrtGptModelType m
                 }
                 else
                 {
-                    SizeType numRequests = requests.size();
-                    SizeType maxBatchSize = staticEmulatedBatchSize.value();
-                    for (SizeType req = 0; req < numRequests; req += maxBatchSize)
+                    SizeType32 numRequests = requests.size();
+                    SizeType32 maxBatchSize = staticEmulatedBatchSize.value();
+                    for (SizeType32 req = 0; req < numRequests; req += maxBatchSize)
                     {
                         auto batchSize = std::min(maxBatchSize, numRequests - req);
 
@@ -1616,7 +1621,7 @@ int main(int argc, char* argv[])
         "batch.",
         cxxopts::value<int32_t>());
     options.add_options()("static_emulated_batch_size",
-        "Emulate static batching performance with the provided batch size.", cxxopts::value<SizeType>());
+        "Emulate static batching performance with the provided batch size.", cxxopts::value<SizeType32>());
     options.add_options()("static_emulated_timeout",
         "Timeout (ms) before launching a partial batch in emulated static batching mode",
         cxxopts::value<int32_t>()->default_value("500"));
@@ -1645,9 +1650,12 @@ int main(int argc, char* argv[])
         cxxopts::value<std::string>()->default_value(""));
 
     options.add_options()(
-        "max_prompt_len", "Truncate all prompts from dataset to the length specified.", cxxopts::value<SizeType>());
+        "max_prompt_len", "Truncate all prompts from dataset to the length specified.", cxxopts::value<SizeType32>());
 
     options.add_options()("dump_profile", "Print profile information per layer.", cxxopts::value<bool>());
+    options.add_options()("gpu_weights_percent",
+        "Specify the percentage of weights that reside on GPU (from 0.0 to 1.0).",
+        cxxopts::value<float>()->default_value("1.0"));
 
     auto result = options.parse(argc, argv);
 
@@ -1764,7 +1772,7 @@ int main(int argc, char* argv[])
     }
     if (result.count("lora_num_device_mod_layers"))
     {
-        benchmarkParams.loraDeviceNumModLayers = result["lora_num_device_mod_layers"].as<SizeType>();
+        benchmarkParams.loraDeviceNumModLayers = result["lora_num_device_mod_layers"].as<SizeType32>();
     }
 
     // Argument: How many KV cache blocks (as fraction of number of GPU kv cache blocks).
@@ -1790,38 +1798,48 @@ int main(int argc, char* argv[])
         batchTimeout = std::chrono::milliseconds{result["first_batch_delay"].as<int32_t>()};
     }
 
-    std::optional<SizeType> staticEmulatedBatchSize;
+    std::optional<SizeType32> staticEmulatedBatchSize;
     // Argument: Static emulated batch size
     if (result.count("static_emulated_batch_size"))
     {
-        staticEmulatedBatchSize = result["static_emulated_batch_size"].as<SizeType>();
+        staticEmulatedBatchSize = result["static_emulated_batch_size"].as<SizeType32>();
 
         batchTimeout = std::chrono::milliseconds{result["static_emulated_timeout"].as<int32_t>()};
     }
 
     // Argument: Scheduler policy
-    batch_scheduler::SchedulerPolicy schedulerPolicy;
-    auto const schedulerPolicyArg = result["scheduler_policy"].as<std::string>();
-    if (schedulerPolicyArg == "max_utilization")
+    texec::CapacitySchedulerPolicy capacitySchedulerPolicy;
+    auto const capacitySchedulerPolicyArg = result["scheduler_policy"].as<std::string>();
+    if (capacitySchedulerPolicyArg == "max_utilization")
     {
-        schedulerPolicy = batch_scheduler::SchedulerPolicy::MAX_UTILIZATION;
+        capacitySchedulerPolicy = texec::CapacitySchedulerPolicy::kMAX_UTILIZATION;
     }
-    else if (schedulerPolicyArg == "guaranteed_no_evict")
+    else if (capacitySchedulerPolicyArg == "guaranteed_no_evict")
     {
-        schedulerPolicy = batch_scheduler::SchedulerPolicy::GUARANTEED_NO_EVICT;
+        capacitySchedulerPolicy = texec::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT;
     }
     else
     {
-        TLLM_LOG_ERROR("Unexpected scheduler policy: " + schedulerPolicyArg);
+        TLLM_LOG_ERROR("Unexpected scheduler policy: " + capacitySchedulerPolicyArg);
         return 1;
     }
 
     // Argument: max_prompt_len
-    std::optional<SizeType> maxPromptLen;
+    std::optional<SizeType32> maxPromptLen;
     if (result.count("max_prompt_len"))
     {
-        maxPromptLen = result["max_prompt_len"].as<SizeType>();
+        maxPromptLen = result["max_prompt_len"].as<SizeType32>();
     }
+
+    // Argument: GPU weights percentage
+    std::istringstream ssGpuPercentArg;
+    auto gpuWeightsPercent = result["gpu_weights_percent"].as<float>();
+    if (gpuWeightsPercent < 0 || gpuWeightsPercent > 1)
+    {
+        TLLM_LOG_ERROR("--gpu_weights_percent must be between 0.0 and 1.0 but got: %f", gpuWeightsPercent);
+        return 1;
+    }
+    benchmarkParams.gpuWeightsPercent = gpuWeightsPercent;
 
     // Argument: Log level
     auto logger = std::make_shared<TllmLogger>();
@@ -1862,10 +1880,11 @@ int main(int argc, char* argv[])
         try
         {
             benchmarkGptManager(result["engine_dir"].as<std::string>(), modelType, datasetPath, opCsvFile,
-                maxNumSamples, beamWidth, result["warm_up"].as<int>(), eosId, padId, benchmarkParams, schedulerPolicy,
-                waitSleep, returnContextLogits, returnGenerationLogits, staticEmulatedBatchSize, batchTimeout,
-                logIterationData, result["exclude_input_in_output_seq"].as<bool>(),
-                result["responses_json_file"].as<std::string>(), maxPromptLen, dumpProfile);
+                maxNumSamples, beamWidth, result["warm_up"].as<int>(), eosId, padId, benchmarkParams,
+                capacitySchedulerPolicy, waitSleep, returnContextLogits, returnGenerationLogits,
+                staticEmulatedBatchSize, batchTimeout, logIterationData,
+                result["exclude_input_in_output_seq"].as<bool>(), result["responses_json_file"].as<std::string>(),
+                maxPromptLen, dumpProfile);
         }
         catch (std::exception const& e)
         {
@@ -1878,8 +1897,9 @@ int main(int argc, char* argv[])
         try
         {
             benchmarkExecutor(result["engine_dir"].as<std::string>(), modelType, datasetPath, opCsvFile, maxNumSamples,
-                beamWidth, result["warm_up"].as<int>(), eosId, padId, benchmarkParams, schedulerPolicy, waitSleep,
-                returnContextLogits, returnGenerationLogits, staticEmulatedBatchSize, logIterationData, maxPromptLen);
+                beamWidth, result["warm_up"].as<int>(), eosId, padId, benchmarkParams, capacitySchedulerPolicy,
+                waitSleep, returnContextLogits, returnGenerationLogits, staticEmulatedBatchSize, logIterationData,
+                maxPromptLen);
         }
         catch (std::exception const& e)
         {

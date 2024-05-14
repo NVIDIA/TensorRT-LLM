@@ -43,30 +43,26 @@ namespace detail
 {
 std::shared_ptr<runtime::ITensor> const& toITensor(Tensor const& tensor);
 Tensor ofITensor(std::shared_ptr<runtime::ITensor> tensor);
-#ifdef TRT_LLM_USE_DIM64
-using DimType = int64_t;
-#else
-using DimType = int32_t;
-#endif
+using DimType64 = int64_t;
 
 } // namespace detail
 
 // A thin wrapper around span that supports constructions with an initializer list.
-class Shape : public tensorrt_llm::common::ArrayView<detail::DimType const>
+class Shape : public tensorrt_llm::common::ArrayView<detail::DimType64 const>
 {
 public:
-    using Base = tensorrt_llm::common::ArrayView<detail::DimType const>;
-    using DimType = typename std::remove_cv_t<Base::value_type>;
+    using Base = tensorrt_llm::common::ArrayView<detail::DimType64 const>;
+    using DimType64 = typename std::remove_cv_t<Base::value_type>;
 
     Shape()
         : Base{nullptr, 0} {};
 
-    Shape(DimType const* data, Base::size_type size)
+    Shape(DimType64 const* data, Base::size_type size)
         : Base{data, size}
     {
     }
 
-    Shape(std::initializer_list<DimType> dims) // NOLINT(*-explicit-constructor)
+    Shape(std::initializer_list<DimType64> dims) // NOLINT(*-explicit-constructor)
         : Base{dims.begin(), dims.size()}
     {
     }
@@ -174,12 +170,12 @@ public:
     template <typename T>
     static Tensor of(T& data)
     {
-        using DimType = Shape::DimType;
-        if constexpr (!std::is_same_v<DimType, decltype(data.size())>)
+        using DimType64 = Shape::DimType64;
+        if constexpr (!std::is_same_v<DimType64, decltype(data.size())>)
         {
-            TLLM_CHECK(data.size() <= std::numeric_limits<DimType>::max());
+            TLLM_CHECK(data.size() <= std::numeric_limits<DimType64>::max());
         }
-        return of(data.data(), {static_cast<Shape::DimType const>(data.size())});
+        return of(data.data(), {static_cast<Shape::DimType64 const>(data.size())});
     }
 
     Tensor() noexcept = default;

@@ -20,7 +20,7 @@ from transformers.pytorch_utils import Conv1D
 import tensorrt_llm
 from tensorrt_llm import logger
 from tensorrt_llm.quantization import QuantAlgo, QuantMode
-from tensorrt_llm.models.llama.utils import iterate_shard_files, load_state_dict  #TODO: move the utils to common dir shared by models
+from tensorrt_llm.models.convert_utils import iterate_shard_files, load_state_dict
 # isort: on
 
 

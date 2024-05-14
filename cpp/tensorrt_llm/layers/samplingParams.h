@@ -43,7 +43,7 @@ class SamplingInputParams : public BaseInputParams
 {
 public:
     explicit SamplingInputParams(runtime::SizeType32 step, runtime::SizeType32 ite, tc::Tensor logits,
-        tc::Tensor end_ids, runtime::SizeType max_seq_len)
+        tc::Tensor end_ids, runtime::SizeType32 max_seq_len)
         : BaseInputParams{step, ite, std::move(end_ids)}
         , logits{std::move(logits)}
         , max_seq_len{max_seq_len}
@@ -52,7 +52,7 @@ public:
 
     // mandatory parameters
     tc::Tensor logits; // [local_batch_size, beam_width, vocab_size_padded]
-    runtime::SizeType max_seq_len;
+    runtime::SizeType32 max_seq_len;
 
     // optional parameters
     std::optional<tc::Tensor> input_lengths; // [localBatchSize]

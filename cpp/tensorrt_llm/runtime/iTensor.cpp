@@ -40,7 +40,7 @@ ITensor::UniquePtr ITensor::view(IBuffer::SharedPtr buffer, nvinfer1::Dims const
     return std::make_unique<TensorView>(std::move(buffer), 0, size, dims);
 }
 
-nvinfer1::Dims ITensor::makeShape(std::initializer_list<ITensor::DimType> const& dims)
+nvinfer1::Dims ITensor::makeShape(std::initializer_list<ITensor::DimType64> const& dims)
 {
     TLLM_CHECK_WITH_INFO(dims.size() <= nvinfer1::Dims::MAX_DIMS, "Number of dimensions is too large");
     nvinfer1::Dims shape{};
@@ -99,7 +99,7 @@ ITensor::UniquePtr ITensor::wrap(void* data, nvinfer1::DataType type, nvinfer1::
     return result;
 }
 
-ITensor::Shape ITensor::squeeze(Shape const& shape, SizeType dim)
+ITensor::Shape ITensor::squeeze(Shape const& shape, SizeType32 dim)
 {
     TLLM_CHECK_WITH_INFO(0 < shape.nbDims, "Cannot squeeze 1-dimensional tensor");
     TLLM_CHECK_WITH_INFO(
@@ -112,7 +112,7 @@ ITensor::Shape ITensor::squeeze(Shape const& shape, SizeType dim)
     return newDims;
 }
 
-ITensor::Shape ITensor::unsqueeze(Shape const& shape, SizeType dim)
+ITensor::Shape ITensor::unsqueeze(Shape const& shape, SizeType32 dim)
 {
     TLLM_CHECK_WITH_INFO(shape.nbDims < Shape::MAX_DIMS, "Too many dimensions to unsqueeze");
     TLLM_CHECK_WITH_INFO(

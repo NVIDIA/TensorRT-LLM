@@ -17,7 +17,6 @@ from collections import OrderedDict
 
 # isort: off
 import torch
-import tensorrt as trt
 # isort: on
 import os
 import sys
@@ -26,7 +25,7 @@ from parameterized import parameterized
 
 import tensorrt_llm
 from tensorrt_llm import Tensor, str_dtype_to_trt
-from tensorrt_llm._utils import str_dtype_to_torch
+from tensorrt_llm._utils import str_dtype_to_torch, torch_dtype_to_trt
 from tensorrt_llm.functional import gpt_attention
 from tensorrt_llm.models.generation_mixin import GenerationMixin
 from tensorrt_llm.plugin.plugin import ContextFMHAType
@@ -154,12 +153,6 @@ class TestPluginNoCache(unittest.TestCase):
     def test_plugin_no_cache(self, dtype: str, remove_input_padding: bool,
                              fmha_type: ContextFMHAType):
 
-        torch_dtype_to_trt = {
-            torch.float16: trt.float16,
-            torch.float32: trt.float32,
-            torch.int32: trt.int32
-        }
-
         max_batch_size = 8
         max_beam_width = 1
         max_input_len = 128
@@ -239,7 +232,7 @@ class TestPluginNoCache(unittest.TestCase):
         }
         inputs_info = [
             tensorrt_llm.runtime.TensorInfo(name,
-                                            torch_dtype_to_trt[tensor.dtype],
+                                            torch_dtype_to_trt(tensor.dtype),
                                             tensor.shape)
             for name, tensor in inputs.items()
         ]
@@ -282,7 +275,7 @@ class TestPluginNoCache(unittest.TestCase):
 
         inputs_info = [
             tensorrt_llm.runtime.TensorInfo(name,
-                                            torch_dtype_to_trt[tensor.dtype],
+                                            torch_dtype_to_trt(tensor.dtype),
                                             tensor.shape)
             for name, tensor in inputs.items()
         ]

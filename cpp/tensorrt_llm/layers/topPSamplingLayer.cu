@@ -37,16 +37,17 @@ namespace tensorrt_llm
 namespace layers
 {
 
-static __global__ void setTopPRuntimeArgs(SizeType batchSize, SizeType32 topK, SizeType32* topKs, SizeType topKsSize,
-    float topP, float* topPs, SizeType topPsSize, bool* skipDecode, SizeType const* batchSlots, float* initialTopPBuf)
+static __global__ void setTopPRuntimeArgs(SizeType32 batchSize, SizeType32 topK, SizeType32* topKs,
+    SizeType32 topKsSize, float topP, float* topPs, SizeType32 topPsSize, bool* skipDecode,
+    SizeType32 const* batchSlots, float* initialTopPBuf)
 {
     /**
      * @brief Setup the runtime arguments for topp, broadcasting top_p to top_ps
               and top_k to top_ks.
      */
 
-    auto index = static_cast<SizeType>(blockIdx.x * blockDim.x + threadIdx.x);
-    for (SizeType bi = index; bi < batchSize; bi += static_cast<SizeType>(gridDim.x * blockDim.x))
+    auto index = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
+    for (SizeType32 bi = index; bi < batchSize; bi += static_cast<SizeType32>(gridDim.x * blockDim.x))
     {
         auto const batchSlot = batchSlots != nullptr ? batchSlots[bi] : bi;
         auto k = topKsSize > 1 ? topKs[batchSlot] : topK;
@@ -95,7 +96,7 @@ TopPSamplingLayer<T>::~TopPSamplingLayer()
 }
 
 template <typename T>
-void TopPSamplingLayer<T>::allocateBuffer(SizeType batchSize)
+void TopPSamplingLayer<T>::allocateBuffer(SizeType32 batchSize)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -150,7 +151,7 @@ void TopPSamplingLayer<T>::freeBuffer()
 }
 
 template <typename T>
-void TopPSamplingLayer<T>::setup(SizeType const batchSize, SizeType const beamWidth, SizeType const* batchSlots,
+void TopPSamplingLayer<T>::setup(SizeType32 const batchSize, SizeType32 const beamWidth, SizeType32 const* batchSlots,
     std::shared_ptr<BaseSetupParams> baseSetupParams)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -176,7 +177,7 @@ void TopPSamplingLayer<T>::setup(SizeType const batchSize, SizeType const beamWi
 
     if (runtimeTopPSize == 0)
     {
-        for (SizeType bi = 0; bi < batchSize; ++bi)
+        for (SizeType32 bi = 0; bi < batchSize; ++bi)
         {
             auto bid = bi;
             if (batchSlots)
@@ -223,7 +224,7 @@ void TopPSamplingLayer<T>::setup(SizeType const batchSize, SizeType const beamWi
 
     if (runtimeTopKSize > 1)
     {
-        TLLM_CHECK_WITH_INFO(static_cast<SizeType>(runtimeTopK.size()) == batchSize,
+        TLLM_CHECK_WITH_INFO(static_cast<SizeType32>(runtimeTopK.size()) == batchSize,
             fmtstr("runtimeTopK.size() (%lu) == batchSize (%d) is not satisfied!", runtimeTopK.size(), batchSize));
         cudaAutoCpy(reinterpret_cast<SizeType32*>(mSetupWorkspaceDevice), runtimeTopK.data(), batchSize, mStream);
         invokeScatterDecodingParams(
@@ -231,7 +232,7 @@ void TopPSamplingLayer<T>::setup(SizeType const batchSize, SizeType const beamWi
     }
     if (runtimeTopPSize > 1)
     {
-        TLLM_CHECK_WITH_INFO(static_cast<SizeType>(runtimeTopP.size()) == batchSize,
+        TLLM_CHECK_WITH_INFO(static_cast<SizeType32>(runtimeTopP.size()) == batchSize,
             fmtstr("runtime_top_p.size() (%lu) == batchSize (%d) is not satisfied!", runtimeTopP.size(), batchSize));
         cudaAutoCpy(reinterpret_cast<float*>(mSetupWorkspaceDevice), runtimeTopP.data(), batchSize, mStream);
         invokeScatterDecodingParams(
@@ -241,7 +242,7 @@ void TopPSamplingLayer<T>::setup(SizeType const batchSize, SizeType const beamWi
     auto fillBuffers
         = [this, &batchSize, &batchSlots](std::string name, auto const& vector, auto deviceTmpBuffer, auto deviceBuffer)
     {
-        TLLM_CHECK_WITH_INFO(static_cast<SizeType>(vector.size()) == batchSize,
+        TLLM_CHECK_WITH_INFO(static_cast<SizeType32>(vector.size()) == batchSize,
             fmtstr("%s.size() (%lu) == batchSize (%d) is not satisfied!", name.c_str(), vector.size(), batchSize));
         cudaAutoCpy(deviceTmpBuffer, vector.data(), batchSize, mStream);
         invokeScatterDecodingParams(deviceTmpBuffer, deviceBuffer, batchSlots, batchSize, mStream);
@@ -267,7 +268,7 @@ void TopPSamplingLayer<T>::setup(SizeType const batchSize, SizeType const beamWi
     cudaAutoCpy(runtimeTopPs.data(), mRuntimeTopPDevice, mDecoderDomain.getMaxBatchSize(), mStream);
     {
         auto maxTopP = 0.f;
-        for (SizeType bi = 0; bi < batchSize; ++bi)
+        for (SizeType32 bi = 0; bi < batchSize; ++bi)
         {
             auto const bid = batchSlots ? batchSlots[bi] : bi;
             maxTopP = std::max(maxTopP, runtimeTopPs[bid]);

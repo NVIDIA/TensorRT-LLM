@@ -30,7 +30,9 @@ from tensorrt_llm.layers import (MLP, Attention, AttentionMaskType,
                                  Conv1d, Embedding, FusedGatedMLP, GatedMLP,
                                  GroupNorm, KeyValueCacheParams, LayerNorm,
                                  LoraParams, PromptTuningEmbedding, RmsNorm)
-from tensorrt_llm.lora_manager import LoraBuildConfig, use_lora
+from tensorrt_llm.lora_manager import (LoraConfig,
+                                       get_default_trtllm_modules_to_hf_modules,
+                                       use_lora)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import PretrainedConfig, PretrainedModel
 from tensorrt_llm.module import Module, ModuleList
@@ -599,11 +601,6 @@ class EncoderModel(PretrainedModel):
                     eps=self.config.norm_epsilon,
                     dtype=self.config.dtype)
 
-        self.trtllm_modules_to_hf_modules = {
-            "attn_q": "q_proj",
-            "attn_v": "v_proj",
-        }
-
     def forward(self,
                 input_ids: Tensor,
                 input_lengths=None,
@@ -895,8 +892,8 @@ class EncoderModel(PretrainedModel):
 
         return result
 
-    def use_lora(self, lora_config: LoraBuildConfig):
-        use_lora(self, lora_config, self.trtllm_modules_to_hf_modules)
+    def use_lora(self, lora_config: LoraConfig):
+        use_lora(self, lora_config)
 
 
 class DecoderModel(PretrainedModel):
@@ -1037,10 +1034,15 @@ class DecoderModel(PretrainedModel):
             )
 
         self.trtllm_modules_to_hf_modules = {
-            "attn_q": "q_proj",
-            "attn_v": "v_proj",
-            "cross_attn_q": "q_proj",
-            "cross_attn_v": "v_proj",
+            **get_default_trtllm_modules_to_hf_modules(),
+            "attn_q": "self_attn.q_proj",
+            "attn_k": "self_attn.k_proj",
+            "attn_v": "self_attn.v_proj",
+            "attn_dense": "self_attn.o_proj",
+            "cross_attn_q": "encoder_attn.q_proj",
+            "cross_attn_k": "encoder_attn.k_proj",
+            "cross_attn_v": "encoder_attn.v_proj",
+            "cross_attn_dense": "encoder_attn.o_proj",
         }
 
     def forward(self,
@@ -1745,7 +1747,7 @@ class DecoderModel(PretrainedModel):
 
         return result
 
-    def use_lora(self, lora_config: LoraBuildConfig):
+    def use_lora(self, lora_config: LoraConfig):
         use_lora(self, lora_config, self.trtllm_modules_to_hf_modules)
 
 

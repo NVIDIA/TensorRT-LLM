@@ -152,6 +152,9 @@ class Linear(Module):
         else:
             self.register_parameter('bias', None)
 
+        # see add_lora in tensorrt_llm/models/modeling_utils.py for LoRA initialization
+        self.lora = None
+
     def multiply_gather(
             self,
             x,
@@ -276,6 +279,9 @@ class RowLinear(Module):
             self.bias = Parameter(shape=(self.out_features, ), dtype=dtype)
         else:
             self.register_parameter('bias', None)
+
+        # see add_lora in tensorrt_llm/models/modeling_utils.py for LoRA initialization
+        self.lora = None
 
         self.tp_group = tp_group
         self.tp_size = tp_size

@@ -42,13 +42,13 @@ protected:
         mManager = std::make_unique<BufferManager>(mStream);
     }
 
-    void runTest(MedusaModule::MedusaChoices& choices, std::vector<SizeType> const& refTopKs,
-        std::vector<SizeType> const& refPositionOffsets, std::vector<SizeType> const& refTreeIds,
-        std::vector<std::vector<SizeType>> const& refPaths, std::vector<std::vector<int32_t>> const& refPackedMask)
+    void runTest(MedusaModule::MedusaChoices& choices, std::vector<SizeType32> const& refTopKs,
+        std::vector<SizeType32> const& refPositionOffsets, std::vector<SizeType32> const& refTreeIds,
+        std::vector<std::vector<SizeType32>> const& refPaths, std::vector<std::vector<int32_t>> const& refPackedMask)
     {
-        auto maxMedusaTokens = static_cast<SizeType>(choices.size());
-        auto medusaHeads = static_cast<SizeType>(std::max_element(choices.begin(), choices.end(),
-            [](std::vector<SizeType> const& a, std::vector<SizeType> const& b)
+        auto maxMedusaTokens = static_cast<SizeType32>(choices.size());
+        auto medusaHeads = static_cast<SizeType32>(std::max_element(choices.begin(), choices.end(),
+            [](std::vector<SizeType32> const& a, std::vector<SizeType32> const& b)
             { return a.size() < b.size(); })->size());
         std::cout << medusaHeads << " " << maxMedusaTokens << std::endl;
 
@@ -56,6 +56,8 @@ protected:
         auto const numPackedMasks = medusaModule.numPackedMasks();
         auto const tokensPerStep = medusaModule.tokensPerStep();
 
+        // batch size = 1 here.
+        TensorPtr medusaGenerationLengthsHost = mManager->pinned(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
         TensorPtr medusaPositionOffsetsHost
             = mManager->pinned(ITensor::makeShape({tokensPerStep}), nvinfer1::DataType::kINT32);
         TensorPtr medusaTreeIdsHost = mManager->pinned(ITensor::makeShape({tokensPerStep}), nvinfer1::DataType::kINT32);
@@ -64,44 +66,47 @@ protected:
         TensorPtr attentionPackedMaskHost
             = mManager->pinned(ITensor::makeShape({tokensPerStep, numPackedMasks}), nvinfer1::DataType::kINT32);
 
-        SizeType totalPaths = 0;
-        std::vector<SizeType> topKs;
-        medusaModule.initMedusaTensorsFromChoices(choices, topKs, medusaPositionOffsetsHost, medusaTreeIdsHost,
-            medusaPathsHost, attentionPackedMaskHost, totalPaths);
+        SizeType32 totalPaths = 0;
+        std::vector<SizeType32> topKs;
+        medusaModule.initMedusaTensorsFromChoices(choices, topKs, medusaGenerationLengthsHost,
+            medusaPositionOffsetsHost, medusaTreeIdsHost, medusaPathsHost, attentionPackedMaskHost, totalPaths);
 
         std::cout << "medusaPositionOffsetsHost " << *medusaPositionOffsetsHost << std::endl;
         std::cout << "medusaTreeIdsHost " << *medusaTreeIdsHost << std::endl;
         std::cout << "medusaPathsHost " << *medusaPathsHost << std::endl;
-        for (SizeType hi = 0; hi < medusaHeads; ++hi)
+        for (SizeType32 hi = 0; hi < medusaHeads; ++hi)
         {
             EXPECT_EQ(topKs[hi], refTopKs[hi]);
         }
 
-        for (SizeType hi = 0; hi < tokensPerStep; ++hi)
+        // batch size = 1 here.
+        EXPECT_EQ(bufferCast<SizeType32>(*medusaGenerationLengthsHost)[0], tokensPerStep);
+
+        for (SizeType32 hi = 0; hi < tokensPerStep; ++hi)
         {
-            EXPECT_EQ(bufferCast<SizeType>(*medusaPositionOffsetsHost)[hi], refPositionOffsets[hi]);
+            EXPECT_EQ(bufferCast<SizeType32>(*medusaPositionOffsetsHost)[hi], refPositionOffsets[hi]);
         }
 
-        for (SizeType hi = 0; hi < tokensPerStep - 1; ++hi)
+        for (SizeType32 hi = 0; hi < tokensPerStep - 1; ++hi)
         {
-            EXPECT_EQ(bufferCast<SizeType>(*medusaTreeIdsHost)[hi], refTreeIds[hi]);
+            EXPECT_EQ(bufferCast<SizeType32>(*medusaTreeIdsHost)[hi], refTreeIds[hi]);
         }
 
         ASSERT_EQ(totalPaths, refPaths.size());
-        for (SizeType ri = 0; ri < totalPaths; ++ri)
+        for (SizeType32 ri = 0; ri < totalPaths; ++ri)
         {
-            for (SizeType vi = 0; vi < medusaHeads + 1; ++vi)
+            for (SizeType32 vi = 0; vi < medusaHeads + 1; ++vi)
             {
-                auto const out = bufferCast<SizeType>(*medusaPathsHost)[ri * (medusaHeads + 1) + vi];
+                auto const out = bufferCast<SizeType32>(*medusaPathsHost)[ri * (medusaHeads + 1) + vi];
                 auto const ref = refPaths[ri][vi];
                 EXPECT_EQ(out, ref);
             }
         }
 
         auto packedMaskPtr = bufferCast<int32_t>(*attentionPackedMaskHost);
-        for (SizeType ti = 0; ti < tokensPerStep; ++ti)
+        for (SizeType32 ti = 0; ti < tokensPerStep; ++ti)
         {
-            for (SizeType mi = 0; mi < numPackedMasks; ++mi)
+            for (SizeType32 mi = 0; mi < numPackedMasks; ++mi)
             {
                 EXPECT_EQ(packedMaskPtr[ti * numPackedMasks + mi], refPackedMask[ti][mi]);
             }
@@ -117,10 +122,10 @@ TEST_F(MedusaModuleTest, simpleChoices)
     MedusaModule::MedusaChoices choices
         = {{0}, {0, 1}, {0, 0}, {0, 2}, {1, 0, 0}, {1, 0, 1}, {0, 0, 0}, {1}, {1, 0}, {1, 1}};
     // Ref is generated with python code
-    std::vector<SizeType> refTopKs = {2, 3, 2, 0};
-    std::vector<SizeType> refPositionOffsets = {0, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3};
-    std::vector<SizeType> refTreeIds = {0, 1, 2, 3, 4, 2, 3, 5, 5, 6};
-    std::vector<std::vector<SizeType>> refPaths
+    std::vector<SizeType32> refTopKs = {2, 3, 2, 0};
+    std::vector<SizeType32> refPositionOffsets = {0, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3};
+    std::vector<SizeType32> refTreeIds = {0, 1, 2, 3, 4, 2, 3, 5, 5, 6};
+    std::vector<std::vector<SizeType32>> refPaths
         = {{0, 1, 3, 8}, {0, 1, 4, -1}, {0, 1, 5, -1}, {0, 2, 6, 9}, {0, 2, 6, 10}, {0, 2, 7, -1}};
     std::vector<std::vector<int32_t>> refPackedMask
         = {{1}, {3}, {5}, {11}, {19}, {35}, {69}, {133}, {267}, {581}, {1093}};
@@ -137,14 +142,14 @@ TEST_F(MedusaModuleTest, mcSim7663Choices)
         {7, 0}, {0, 1, 2}, {2, 0, 0}, {3, 1}, {2, 2}, {8, 0}, {0, 5, 0}, {1, 5}, {1, 0, 1}, {0, 2, 1}, {9, 0},
         {0, 6, 0}, {0, 0, 0, 1}, {1, 6}, {0, 7, 0}};
     // Ref is generated with python code
-    std::vector<SizeType> refTopKs = {10, 10, 10, 2};
-    std::vector<SizeType> refPositionOffsets
+    std::vector<SizeType32> refTopKs = {10, 10, 10, 2};
+    std::vector<SizeType32> refPositionOffsets
         = {0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
             2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4};
-    std::vector<SizeType> refTreeIds = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 10, 11,
+    std::vector<SizeType32> refTreeIds = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 10, 11,
         12, 13, 14, 15, 16, 10, 11, 12, 10, 11, 10, 10, 10, 10, 10, 10, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 20, 21,
         22, 20, 21, 20, 20, 20, 20, 20, 20, 21, 20, 30, 31};
-    std::vector<std::vector<SizeType>> refPaths = {{0, 1, 11, 39, 62}, {0, 1, 11, 39, 63}, {0, 1, 11, 40, -1},
+    std::vector<std::vector<SizeType32>> refPaths = {{0, 1, 11, 39, 62}, {0, 1, 11, 39, 63}, {0, 1, 11, 40, -1},
         {0, 1, 11, 41, -1}, {0, 1, 11, 42, -1}, {0, 1, 11, 43, -1}, {0, 1, 11, 44, -1}, {0, 1, 11, 45, -1},
         {0, 1, 11, 46, -1}, {0, 1, 11, 47, -1}, {0, 1, 11, 48, -1}, {0, 1, 12, 49, -1}, {0, 1, 12, 50, -1},
         {0, 1, 12, 51, -1}, {0, 1, 13, 52, -1}, {0, 1, 13, 53, -1}, {0, 1, 14, 54, -1}, {0, 1, 15, 55, -1},

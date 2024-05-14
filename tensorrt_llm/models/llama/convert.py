@@ -8,7 +8,6 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
-import numpy as np
 import safetensors
 import torch
 import torch.nn as nn
@@ -20,10 +19,11 @@ from transformers.pytorch_utils import Conv1D
 
 from ..._utils import pad_vocab_size, release_gc
 from ...layers import MoeConfig
+from ...logger import logger
 from ...mapping import Mapping
 from ...quantization import QuantAlgo
-from ..modeling_utils import PretrainedConfig, QuantConfig
-from .weight import load_from_hf_checkpoint
+from ..modeling_utils import PretrainedConfig, QuantConfig, optimize_model
+from .weight import load_from_hf_checkpoint, load_from_hf_safetensors
 
 try:
     from transformers import LlavaConfig, LlavaForConditionalGeneration
@@ -60,14 +60,12 @@ def generate_int8(weights, act_range, is_qkv=False, multi_query_mode=False):
       as three different matrices: Q, K, and V. So per-tensor actually means one scaling factor for each Q, K and V.
       For our GEMM implementation to respect this behavior, we use per-column mode and replicate values along columns.
     """
-    weights = weights.detach().cpu().numpy()
 
     # compute weight scaling factors for fp->int8 and int8->fp
     if is_qkv and not multi_query_mode:
         scale_w_orig_quant_t = 127. / act_range["w"].reshape(3, -1).max(
-            dim=-1, keepdims=True)[0].cpu().numpy()
-        scale_w_orig_quant_c = 127. / act_range["w"].reshape(3,
-                                                             -1).cpu().numpy()
+            dim=-1, keepdims=True)[0]
+        scale_w_orig_quant_c = 127. / act_range["w"].reshape(3, -1)
     elif is_qkv and multi_query_mode:
         hidden_dim = weights.shape[0]
         local_dim = act_range["w"].shape[0]
@@ -82,46 +80,46 @@ def generate_int8(weights, act_range, is_qkv=False, multi_query_mode=False):
             scale_w_v.max(dim=0, keepdim=True)[0]
         ])
 
-        scale_w_orig_quant_t = 127. / scale_w_qkv_t.cpu().numpy()
-        scale_w_orig_quant_c = 127. / act_range["w"].cpu().numpy()
+        scale_w_orig_quant_t = 127. / scale_w_qkv_t
+        scale_w_orig_quant_c = 127. / act_range["w"]
     else:
-        scale_w_orig_quant_t = 127. / act_range["w"].max().cpu().numpy()
-        scale_w_orig_quant_c = 127. / act_range["w"].cpu().numpy()
+        scale_w_orig_quant_t = 127. / act_range["w"].max()
+        scale_w_orig_quant_c = 127. / act_range["w"]
     scale_w_quant_orig_t = 1.0 / scale_w_orig_quant_t
     scale_w_quant_orig_c = 1.0 / scale_w_orig_quant_c
 
-    scale_w_orig_quant_c = scale_w_orig_quant_c.astype(np.float32)
-    scale_w_orig_quant_t = scale_w_orig_quant_t.astype(np.float32)
+    scale_w_orig_quant_c = scale_w_orig_quant_c.to(torch.float32)
+    scale_w_orig_quant_t = scale_w_orig_quant_t.to(torch.float32)
 
     # compute the rest of needed scaling factors
-    scale_x_orig_quant_t = np.array(127. / act_range["x"].max().item())
-    scale_y_orig_quant_t = np.array(127. / act_range["y"].max().item())
-    scale_y_quant_orig_t = np.array(act_range["y"].max().item() / 127.)
+    scale_x_orig_quant_t = 127. / act_range["x"].max()
+    scale_y_orig_quant_t = 127. / act_range["y"].max()
+    scale_y_quant_orig_t = act_range["y"].max() / 127.
     scale_y_accum_quant_t = scale_y_orig_quant_t / (scale_x_orig_quant_t *
                                                     scale_w_orig_quant_t)
     scale_y_accum_quant_c = scale_y_orig_quant_t / (scale_x_orig_quant_t *
                                                     scale_w_orig_quant_c)
     if is_qkv and not multi_query_mode:
-        scale_y_accum_quant_t = np.broadcast_to(scale_y_accum_quant_t,
-                                                scale_w_orig_quant_c.shape)
-        scale_w_quant_orig_t = np.broadcast_to(scale_w_quant_orig_t,
-                                               scale_w_orig_quant_c.shape)
+        scale_y_accum_quant_t = torch.broadcast_to(scale_y_accum_quant_t,
+                                                   scale_w_orig_quant_c.shape)
+        scale_w_quant_orig_t = torch.broadcast_to(scale_w_quant_orig_t,
+                                                  scale_w_orig_quant_c.shape)
     if is_qkv and multi_query_mode:
-        scale_q_y_accum_t = np.broadcast_to(scale_y_accum_quant_t[0],
-                                            scale_w_q.shape)
-        scale_k_y_accum_t = np.broadcast_to(scale_y_accum_quant_t[1],
-                                            scale_w_k.shape)
-        scale_v_y_accum_t = np.broadcast_to(scale_y_accum_quant_t[2],
-                                            scale_w_v.shape)
-        scale_y_accum_quant_t = np.concatenate(
+        scale_q_y_accum_t = torch.broadcast_to(scale_y_accum_quant_t[0],
+                                               scale_w_q.shape)
+        scale_k_y_accum_t = torch.broadcast_to(scale_y_accum_quant_t[1],
+                                               scale_w_k.shape)
+        scale_v_y_accum_t = torch.broadcast_to(scale_y_accum_quant_t[2],
+                                               scale_w_v.shape)
+        scale_y_accum_quant_t = torch.concat(
             [scale_q_y_accum_t, scale_k_y_accum_t, scale_v_y_accum_t])
-        scale_w_quant_orig_t = np.concatenate([
-            np.broadcast_to(scale_w_quant_orig_t[0], scale_w_q.shape),
-            np.broadcast_to(scale_w_quant_orig_t[1], scale_w_k.shape),
-            np.broadcast_to(scale_w_quant_orig_t[2], scale_w_v.shape)
+        scale_w_quant_orig_t = torch.concat([
+            torch.broadcast_to(scale_w_quant_orig_t[0], scale_w_q.shape),
+            torch.broadcast_to(scale_w_quant_orig_t[1], scale_w_k.shape),
+            torch.broadcast_to(scale_w_quant_orig_t[2], scale_w_v.shape)
         ])
 
-    to_i8 = lambda x: x.round().clip(-127, 127).astype(np.int8)
+    to_i8 = lambda x: x.round().clip(-127, 127).to(torch.int8)
 
     if is_qkv and multi_query_mode:
         weight_int8 = to_i8(weights / scale_w_quant_orig_t)
@@ -130,12 +128,12 @@ def generate_int8(weights, act_range, is_qkv=False, multi_query_mode=False):
     return {
         "weight.int8": weight_int8,
         "weight.int8.col": to_i8(weights * scale_w_orig_quant_c),
-        "scale_x_orig_quant": scale_x_orig_quant_t.astype(np.float32),
-        "scale_w_quant_orig": scale_w_quant_orig_t.astype(np.float32),
-        "scale_w_quant_orig.col": scale_w_quant_orig_c.astype(np.float32),
-        "scale_y_accum_quant": scale_y_accum_quant_t.astype(np.float32),
-        "scale_y_accum_quant.col": scale_y_accum_quant_c.astype(np.float32),
-        "scale_y_quant_orig": scale_y_quant_orig_t.astype(np.float32),
+        "scale_x_orig_quant": scale_x_orig_quant_t.to(torch.float32),
+        "scale_w_quant_orig": scale_w_quant_orig_t.to(torch.float32),
+        "scale_w_quant_orig.col": scale_w_quant_orig_c.to(torch.float32),
+        "scale_y_accum_quant": scale_y_accum_quant_t.to(torch.float32),
+        "scale_y_accum_quant.col": scale_y_accum_quant_c.to(torch.float32),
+        "scale_y_quant_orig": scale_y_quant_orig_t.to(torch.float32),
     }
 
 
@@ -397,7 +395,7 @@ def split(v, tp_size, idx, dim=0):
     if len(v.shape) == 1:
         return torch.chunk(v, tp_size)[idx].contiguous()
     else:
-        return torch.chunk(v, tp_size, dim=dim)[idx].clone()
+        return torch.chunk(v, tp_size, dim=dim)[idx]
 
 
 def split_qkv_tp(v, n_head, n_hidden, tensor_parallel, rank):
@@ -407,7 +405,7 @@ def split_qkv_tp(v, n_head, n_hidden, tensor_parallel, rank):
     v = v.reshape(3, n_hidden, n_hidden)
     split_v = split(v, tensor_parallel, rank, dim=1)
     split_v = split_v.reshape(3 * (n_hidden // tensor_parallel), n_hidden)
-    return split_v.clone()
+    return split_v
 
 
 def split_qkv_bias_tp(v, n_head, n_hidden, tensor_parallel, rank):
@@ -417,7 +415,7 @@ def split_qkv_bias_tp(v, n_head, n_hidden, tensor_parallel, rank):
     v = v.reshape(3, n_hidden)
     split_v = split(v, tensor_parallel, rank, dim=1)
     split_v = split_v.reshape(3 * (n_hidden // tensor_parallel))
-    return split_v.clone()
+    return split_v
 
 
 def split_matrix_tp(v, tensor_parallel, rank, dim):
@@ -427,13 +425,13 @@ def split_matrix_tp(v, tensor_parallel, rank, dim):
 def get_weight(config, prefix, dtype):
     if config[prefix + '.weight'].dtype != dtype:
         config[prefix + '.weight'].data = config[prefix + '.weight'].to(dtype)
-    return config[prefix + '.weight'].detach().cpu()
+    return config[prefix + '.weight'].detach()
 
 
 def get_bias(config, prefix, dtype):
     if config[prefix + '.bias'].dtype != dtype:
         config[prefix + '.bias'].data = config[prefix + '.bias'].to(dtype)
-    return config[prefix + '.bias'].detach().cpu()
+    return config[prefix + '.bias'].detach()
 
 
 def get_weight_and_bias(config, prefix, dtype):
@@ -452,9 +450,9 @@ def get_tllm_linear_weight(weight,
     results = {}
     if use_weight_only:
         if weight.dim() > 2:
-            v = weight.transpose(1, 2).contiguous().clone()
+            v = weight.transpose(1, 2).contiguous()
         else:
-            v = weight.t().contiguous().clone()
+            v = weight.t().contiguous()
         processed_torch_weights, torch_weight_scales = \
             torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                 v.cpu(), plugin_weight_only_quant_type)
@@ -467,7 +465,7 @@ def get_tllm_linear_weight(weight,
         else:
             results[prefix + 'per_channel_scale'] = torch_weight_scales
     else:
-        results[prefix + postfix] = weight.clone()
+        results[prefix + postfix] = weight
 
     if bias is not None:
         results[prefix + 'bias'] = bias
@@ -502,12 +500,12 @@ def get_tllm_linear_sq_weight(vals,
     results = {}
 
     def multi_query_split(data, local_dim, head_size, tp_size, cur_rank):
-        q, k, v = np.split(data, [local_dim, local_dim + head_size], axis=-1)
-        q_split = np.split(q, tp_size, axis=-1)
-        k_split = np.split(k, tp_size, axis=-1)
-        v_split = np.split(v, tp_size, axis=-1)
+        q, k, v = torch.split(data, [local_dim, head_size, head_size], dim=-1)
+        q_split = torch.chunk(q, tp_size, dim=-1)
+        k_split = torch.chunk(k, tp_size, dim=-1)
+        v_split = torch.chunk(v, tp_size, dim=-1)
         return [
-            np.concatenate((q_split[ii], k_split[ii], v_split[ii]), axis=-1)
+            torch.concat((q_split[ii], k_split[ii], v_split[ii]), axis=-1)
             for ii in range(tp_size)
         ][cur_rank]
 
@@ -515,9 +513,9 @@ def get_tllm_linear_sq_weight(vals,
 
     if per_token:
         if per_channel:
-            original_weights = np.array(vals["weight.int8.col"])
+            original_weights = torch.Tensor(vals["weight.int8.col"]).cuda()
         else:
-            original_weights = np.array(vals["weight.int8"])
+            original_weights = torch.Tensor(vals["weight.int8"]).cuda()
         local_dim = original_weights.shape[0]
         head_size = (original_weights.shape[1] - local_dim) // 2
 
@@ -525,17 +523,15 @@ def get_tllm_linear_sq_weight(vals,
             cur_weights = multi_query_split(original_weights, local_dim,
                                             head_size, tensor_parallel, rank)
         else:
-            cur_weights = np.split(original_weights,
-                                   tensor_parallel,
-                                   axis=cat_dim)[rank]
+            cur_weights = torch.chunk(original_weights,
+                                      tensor_parallel,
+                                      dim=cat_dim)[rank]
         if is_qkv:
             hidden_dim = cur_weights.shape[0]
             cur_weights = cur_weights.reshape(hidden_dim, -1)
-        results[prefix + 'weight'] = torch.from_numpy(
-            cur_weights).t().clone().contiguous()
+        results[prefix + 'weight'] = cur_weights.t().contiguous()
         if smoother_value is None:
-            results[last_prefix] = torch.from_numpy(
-                np.array([1.0], dtype=np.float32))
+            results[last_prefix] = torch.Tensor([1.0]).to(torch.float32).cuda()
 
         if per_channel:
             cur_per_channel_value = vals["scale_w_quant_orig.col"]
@@ -545,10 +541,10 @@ def get_tllm_linear_sq_weight(vals,
                         vals["scale_w_quant_orig.col"], local_dim, head_size,
                         tensor_parallel, rank)
                 else:
-                    cur_per_channel_value = np.split(
+                    cur_per_channel_value = torch.chunk(
                         vals["scale_w_quant_orig.col"],
                         tensor_parallel,
-                        axis=cat_dim)[rank]
+                        dim=cat_dim)[rank]
         else:
             cur_per_channel_value = vals["scale_w_quant_orig"]
             if is_qkv:
@@ -557,18 +553,18 @@ def get_tllm_linear_sq_weight(vals,
                         vals["scale_w_quant_orig"], local_dim, head_size,
                         tensor_parallel, rank)
                 else:
-                    cur_per_channel_value = np.split(vals["scale_w_quant_orig"],
-                                                     tensor_parallel,
-                                                     axis=cat_dim)[rank]
+                    cur_per_channel_value = torch.chunk(
+                        vals["scale_w_quant_orig"],
+                        tensor_parallel,
+                        dim=cat_dim)[rank]
 
-        results[prefix + 'per_channel_scale'] = torch.from_numpy(
-            np.array(cur_per_channel_value,
-                     dtype=np.float32).reshape(col_shape)).contiguous()
+        results[prefix + 'per_channel_scale'] = cur_per_channel_value.reshape(
+            col_shape).contiguous()
     else:
         if per_channel:
-            original_weights = np.array(vals["weight.int8.col"])
+            original_weights = torch.Tensor(vals["weight.int8.col"]).cuda()
         else:
-            original_weights = np.array(vals["weight.int8"])
+            original_weights = torch.Tensor(vals["weight.int8"]).cuda()
         local_dim = original_weights.shape[0]
         head_size = (original_weights.shape[1] - local_dim) // 2
 
@@ -576,14 +572,13 @@ def get_tllm_linear_sq_weight(vals,
             cur_weights = multi_query_split(original_weights, local_dim,
                                             head_size, tensor_parallel, rank)
         else:
-            cur_weights = np.split(original_weights,
-                                   tensor_parallel,
-                                   axis=cat_dim)[rank]
+            cur_weights = torch.chunk(original_weights,
+                                      tensor_parallel,
+                                      dim=cat_dim)[rank]
         if is_qkv:
             hidden_dim = cur_weights.shape[0]
             cur_weights = cur_weights.reshape(hidden_dim, -1)
-        results[prefix + 'weight'] = torch.from_numpy(
-            cur_weights).t().clone().contiguous()
+        results[prefix + 'weight'] = cur_weights.t().contiguous()
 
         if per_channel:
             cur_per_channel_value = vals["scale_y_accum_quant.col"]
@@ -593,10 +588,10 @@ def get_tllm_linear_sq_weight(vals,
                         vals["scale_y_accum_quant.col"], local_dim, head_size,
                         tensor_parallel, rank)
                 else:
-                    cur_per_channel_value = np.split(
+                    cur_per_channel_value = torch.chunk(
                         vals["scale_y_accum_quant.col"],
                         tensor_parallel,
-                        axis=cat_dim)[rank]
+                        dim=cat_dim)[rank]
         else:
             cur_per_channel_value = vals["scale_y_accum_quant"]
             # QKV is always per_channel
@@ -606,27 +601,23 @@ def get_tllm_linear_sq_weight(vals,
                         vals["scale_y_accum_quant"], local_dim, head_size,
                         tensor_parallel, rank)
                 else:
-                    cur_per_channel_value = np.split(
+                    cur_per_channel_value = torch.chunk(
                         vals["scale_y_accum_quant"],
                         tensor_parallel,
-                        axis=cat_dim)[rank]
+                        dim=cat_dim)[rank]
 
-        results[prefix + 'per_channel_scale'] = torch.from_numpy(
-            np.array([cur_per_channel_value],
-                     dtype=np.float32).reshape(col_shape)).contiguous()
-
-        results[last_prefix] = torch.from_numpy(
-            np.array([vals['scale_x_orig_quant']],
-                     dtype=np.float32)).contiguous()
-
-        results[prefix + 'act_scale'] = torch.from_numpy(
-            np.array([[vals["scale_y_quant_orig"]]],
-                     dtype=np.float32)).contiguous()
+        results[prefix + 'per_channel_scale'] = torch.Tensor([
+            cur_per_channel_value
+        ]).to(torch.float32).reshape(col_shape).contiguous().cuda()
+        results[prefix + 'act_scale'] = torch.Tensor(
+            vals['scale_y_quant_orig']).to(torch.float32).contiguous().cuda()
+        results[last_prefix] = torch.Tensor(vals['scale_x_orig_quant']).to(
+            torch.float32).contiguous().cuda()
 
     if smoother_value is not None:
-        cur_smoother_value = np.split(smoother_value,
-                                      tensor_parallel,
-                                      axis=cat_dim)[rank]
+        cur_smoother_value = torch.chunk(smoother_value,
+                                         tensor_parallel,
+                                         dim=cat_dim)[rank]
         results[prefix + 'smoother'] = cur_smoother_value.reshape(
             smoother_shape).contiguous().to(torch.float32)
 
@@ -855,9 +846,6 @@ def convert_hf_llama(hf_model,
                                        plugin_weight_only_quant_type, dtype,
                                        use_gemm_woq_plugin))
 
-            moe_experts_gate_weights = get_weight(
-                model_params, prefix + 'block_sparse_moe.gate', torch.float32)
-
             if residual_mlp:
                 residual_mlp_gate_weights = get_weight(
                     model_params, prefix + 'residual_mlp.w3', dtype)
@@ -963,9 +951,11 @@ def convert_hf_llama(hf_model,
                                                plugin_weight_only_quant_type,
                                                dtype, use_gemm_woq_plugin))
 
+            moe_experts_gate_weights = get_weight(
+                model_params, prefix + 'block_sparse_moe.gate', torch.float32)
             weights.update(
                 get_tllm_linear_weight(
-                    moe_experts_gate_weights.to(torch.float32),
+                    moe_experts_gate_weights,
                     tllm_prex + 'mlp.router.',
                     None,
                     False,  # Router should never be quantized
@@ -1107,10 +1097,8 @@ def convert_hf_llama(hf_model,
                 vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
                 pad_width = vocab_size_padded - vocab_size
 
-                v = torch.from_numpy(
-                    np.pad(v.detach().cpu().numpy(), ((0, pad_width), (0, 0)),
-                           'constant',
-                           constant_values=0))
+                v = torch.nn.functional.pad(v, (0, pad_width, 0, 0), 'constant',
+                                            0)
             weights['lm_head.weight'] = split(v, mapping.tp_size,
                                               mapping.tp_rank)
 
@@ -1138,11 +1126,10 @@ def convert_hf_llama(hf_model,
             vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
             pad_width = vocab_size_padded - vocab_size
 
-            lm_head_weights = torch.from_numpy(
-                np.pad(lm_head_weights.detach().cpu().numpy(),
-                       ((0, pad_width), (0, 0)),
-                       'constant',
-                       constant_values=0))
+            lm_head_weights = torch.nn.functional.pad(lm_head_weights,
+                                                      (0, pad_width, 0, 0),
+                                                      'constant',
+                                                      value=0)
         weights['lm_head.weight'] = split_matrix_tp(lm_head_weights,
                                                     tensor_parallel,
                                                     mapping.tp_rank,
@@ -1292,6 +1279,12 @@ def from_hugging_face(cls,
         AutoConfig.register("llava_llama", LlavaConfig)
         AutoModelForCausalLM.register(LlavaConfig, LlavaLlamaForCausalLM)
 
+    if override_fields.get('share_embedding_table', False):
+        logger.warning(
+            "Llama model does not support share_embedding_table; setting share_embedding_table=False"
+        )
+        override_fields['share_embedding_table'] = False
+
     config = create_config_from_hugging_face(model_dir,
                                              dtype,
                                              mapping,
@@ -1302,11 +1295,19 @@ def from_hugging_face(cls,
     pretrained_config.set_rank(mapping.rank)  # TODO:remove this hack
 
     llama = cls.from_config(pretrained_config)
+    llama = optimize_model(
+        llama,
+        use_parallel_embedding=pretrained_config.use_parallel_embedding,
+        share_embedding_table=pretrained_config.share_embedding_table,
+    )
+
     if skip_loading_weights:
         return llama
 
     model = preloaded_model
     if model is None and not load_by_shard:  # when load by shard, no need to create complete hf model
+        have_safetensors = any(
+            [f.endswith(".safetensors") for f in os.listdir(model_dir)])
         hf_config = AutoConfig.from_pretrained(model_dir,
                                                trust_remote_code=True)
         if hf_config.model_type == "llava":
@@ -1314,19 +1315,24 @@ def from_hugging_face(cls,
                 model_dir, torch_dtype="auto")
             model = hf_llava.language_model
         else:
-            model = AutoModelForCausalLM.from_pretrained(
-                model_dir,
-                device_map='auto' if not load_model_on_cpu else 'cpu',
-                torch_dtype='auto',
-                trust_remote_code=True,
-            )
+            if not have_safetensors:
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_dir,
+                    device_map='auto' if not load_model_on_cpu else 'cpu',
+                    torch_dtype='auto',
+                    trust_remote_code=True,
+                )
 
     if load_by_shard:
         weights = load_from_hf_checkpoint(model_dir, mapping, pretrained_config)
-    else:
+    elif model is not None:
         weights = load_weights_from_hf(config=config,
                                        mapping=mapping,
                                        model=model)
+    else:
+        weights = load_from_hf_safetensors(model_dir=model_dir,
+                                           config=pretrained_config,
+                                           mapping=mapping)
 
     llama.load(weights)
     return llama
@@ -1397,7 +1403,6 @@ def quantize(dtype,
         safetensors.torch.save_file(
             weights, os.path.join(output_dir, f'rank{rank}.safetensors'))
         del weights
-        release_gc()
 
 
 def load_weights_from_hf(*,

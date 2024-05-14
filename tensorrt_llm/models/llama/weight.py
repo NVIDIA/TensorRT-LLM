@@ -27,9 +27,9 @@ from ...layers import MoeConfig
 from ...logger import logger
 from ...mapping import Mapping
 from ...quantization import QuantMode
+from ..convert_utils import (iterate_shard_files, load_state_dict,
+                             retrieved_layer_index_from_name)
 from ..modeling_utils import PretrainedConfig
-from .utils import (iterate_shard_files, load_state_dict,
-                    retrieved_layer_index_from_name)
 
 
 def gen_suffix(rank, use_smooth_quant, quant_per_channel):
@@ -1020,4 +1020,164 @@ def load_from_meta_llama(meta_ckpt_dir, mapping, config):
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     logger.info(f'Weights loaded. Total time: {t}')
+    return weights
+
+
+def load_from_hf_safetensors(model_dir: str, config: PretrainedConfig, mapping):
+    logger.info('Loading weights from Huggingface LLaMA safetensors...')
+    tik = time.time()
+    import json
+    import os
+
+    import safetensors
+    weights = {}
+
+    model_dir = model_dir if model_dir.endswith("/") else model_dir + "/"
+    safetensors_map = {}
+    try:
+        with open(model_dir + "model.safetensors.index.json", 'r') as fr:
+            sharding_map = json.load(fr)
+        for k, v in sharding_map['weight_map'].items():
+            safetensors_map[k] = int(v[6:11]) - 1
+    except FileNotFoundError:
+        pass
+    shard_files = []
+    for name in os.listdir(model_dir):
+        if name.endswith(".safetensors"):
+            shard_files.append(name)
+    shard_files.sort()
+    safetensors_ptrs = [
+        safetensors.safe_open(model_dir + shard_file,
+                              framework="pt",
+                              device="cpu") for shard_file in shard_files
+    ]
+
+    num_hidden_layers = config.num_hidden_layers
+    vocab_size = config.vocab_size
+    pad_vocab = vocab_size % mapping.tp_size != 0
+    vocab_size_padded = pad_vocab_size(config.vocab_size, mapping.tp_size)
+    dtype = config.dtype
+
+    moe_config = MoeConfig(config.moe_num_experts, config.moe_top_k,
+                           config.moe_tp_mode, config.moe_normalization_mode)
+
+    model_prefix = "model."
+    key_list = [
+        "embed_tokens.weight",  # vocab_embedding
+        "lm_head.weight",  # lm_head
+        "norm.weight",  # ln_f
+        "self_attn.",  # attention.qkv
+        "_proj.weight",  # qkv suffix
+        "self_attn.o_proj.weight",  # attention.dense
+        "mlp.up_proj.weight",  # mlp.gate
+        "mlp.down_proj.weight",  # mlp.proj
+        "mlp.gate_proj.weight",  # mlp.fc
+        "input_layernorm.weight",  # input_layernorm
+        "post_attention_layernorm.weight",  # post_layernorm
+    ]
+
+    torch_dtype = str_dtype_to_torch(dtype)
+
+    def load(key, tp_dim=-1, no_prefix=0):
+        if not no_prefix:
+            key = model_prefix + key
+        ptr_idx = safetensors_map[key] if key in safetensors_map else 0
+        if tp_dim == -1:
+            res = safetensors_ptrs[ptr_idx].get_tensor(key)
+        else:
+            tensor_slice = safetensors_ptrs[ptr_idx].get_slice(key)
+            tensor_shape = tensor_slice.get_shape()
+            if tensor_shape[tp_dim] % mapping.tp_size != 0:
+                logger.error(
+                    "Current weight shape is invalid for mapping.tp_size=" +
+                    str(mapping.tp_size))
+            slice_width = tensor_shape[tp_dim] // mapping.tp_size
+            if tp_dim == 0:
+                res = tensor_slice[slice_width * mapping.tp_rank:slice_width *
+                                   (mapping.tp_rank + 1), :]
+            elif tp_dim == 1:
+                res = tensor_slice[:,
+                                   slice_width * mapping.tp_rank:slice_width *
+                                   (mapping.tp_rank + 1)]
+            else:
+                assert False, "Invalid TP dim"
+        return res.to(torch_dtype).contiguous(
+        ) if "block_sparse_moe.gate" not in key else res.to(torch.float32)
+
+    if mapping.is_first_pp_rank():
+        weights['transformer.vocab_embedding.weight'] = load(
+            key_list[0], config.embedding_sharding_dim
+            if config.use_parallel_embedding else -1)  # vocab_embedding
+
+    if mapping.is_last_pp_rank():
+        v = load(key_list[1], -1, 1) if pad_vocab else load(key_list[1], 0,
+                                                            1)  # lm_head
+        if pad_vocab:
+            v = torch.nn.functional.pad(
+                v, (0, vocab_size_padded - vocab_size, 0, 0), 'constant', 0)
+            v = split(v, mapping.tp_size, mapping.tp_rank)
+        weights['lm_head.weight'] = v
+        weights['transformer.ln_f.weight'] = load(key_list[2])  # ln_f
+
+    layers_range = mapping.pp_layers(num_hidden_layers)
+    for l in layers_range:
+        layer_idx = l - layers_range[0]
+        prefix = f'layers.{l}.'
+        tllm_prex = f'transformer.layers.{layer_idx}'
+
+        # Attention
+        qkv_list = []
+        for comp in ["q", "k", "v"]:
+            comp_part = load(prefix + key_list[3] + comp + key_list[4], 0)
+            qkv_list.append(comp_part)
+        weights[f'{tllm_prex}.attention.qkv.weight'] = torch.cat(qkv_list, 0)
+        weights[f'{tllm_prex}.attention.dense.weight'] = load(
+            prefix + key_list[5], 1)  # attention.dense
+
+        # MLP
+        if not moe_config.has_moe():
+            weights[f'{tllm_prex}.mlp.gate.weight'] = load(
+                prefix + key_list[6], 0)  # mlp.gate
+            weights[f'{tllm_prex}.mlp.proj.weight'] = load(
+                prefix + key_list[7], 1)  # mlp.proj
+            weights[f'{tllm_prex}.mlp.fc.weight'] = load(
+                prefix + key_list[8], 0)  # mlp.fc
+
+        else:
+            weights[f'{tllm_prex}.mlp.router.weight'] = load(
+                prefix + 'block_sparse_moe.gate.weight')
+            rank_experts = list(range(moe_config.num_experts))
+            if moe_config.tp_mode == moe_config.ParallelismMode.EXPERT_PARALLEL:
+                rank_experts = mapping.ep_experts(moe_config.num_experts)
+
+            expert_weight_list = []
+            for suffix in range(3):
+                tp_dim = -1
+                if moe_config.tp_mode == moe_config.ParallelismMode.TENSOR_PARALLEL:
+                    tp_dim = 1 if suffix == 1 else 0
+                expert_weight_list.append(
+                    torch.stack(
+                        list(
+                            load(
+                                prefix +
+                                f'block_sparse_moe.experts.{expert}.w{suffix + 1}.weight',
+                                tp_dim=tp_dim) for expert in rank_experts)))
+
+            w1 = expert_weight_list[0]
+            w2 = expert_weight_list[1]
+            w3 = expert_weight_list[2]
+
+            weights[f'{tllm_prex}.mlp.fc.weight'] = \
+                torch.concat([w3, w1], dim=-2).contiguous()
+            weights[f'{tllm_prex}.mlp.proj.weight'] = w2.contiguous()
+
+        weights[f'{tllm_prex}.input_layernorm.weight'] = load(
+            prefix + key_list[9])  # input_layernorm
+        weights[f'{tllm_prex}.post_layernorm.weight'] = load(
+            prefix + key_list[10])  # post_layernorm
+
+    tok = time.time()
+    t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
+    logger.info(f'Weights loaded. Total time: {t}')
+
     return weights

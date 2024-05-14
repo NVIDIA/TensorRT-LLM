@@ -228,6 +228,7 @@ endif()
 set(CUBLAS_LIB CUDA::cublas)
 set(CUBLASLT_LIB CUDA::cublasLt)
 set(CUDA_DRV_LIB CUDA::cuda_driver)
+set(CUDA_NVML_LIB CUDA::nvml)
 set(CUDA_RT_LIB CUDA::cudart_static)
 set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
 
@@ -485,10 +486,8 @@ message(
     "Building for TensorRT version: ${TRT_VERSION}, library version: ${TRT_SOVERSION}"
 )
 
-if(${TRT_MAJOR} GREATER_EQUAL 10)
-  add_definitions("-DTRT_LLM_USE_DIM64")
-  message(
-    STATUS "TensorRT version ${TRT_MAJOR} >= 10, int64 dimension is enabled")
+if(${TRT_MAJOR} LESS 10)
+  message(FATAL_ERROR "TensorRT version must be at least 10.0")
 endif()
 
 list(APPEND COMMON_HEADER_DIRS)

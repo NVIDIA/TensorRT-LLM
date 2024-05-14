@@ -110,6 +110,9 @@ add_gtest(samplingLayerTest "${SAMPLING_LAYER_TEST_SRC}")
 add_gtest(dynamicDecodeLayerTest layers/dynamicDecodeLayerTest.cpp)
 add_gtest(medusaDecodeLayerTest layers/medusaDecodeLayerTest.cpp)
 add_gtest(lookaheadPoolManagerTest layers/lookaheadPoolManagerTest.cpp)
+set(LOOKAHEAD_ALGORITHM_TEST_SRC layers/randomLlm.cpp
+                                 layers/lookaheadAlgorithmTest.cpp)
+add_gtest(lookaheadAlgorithmTest "${LOOKAHEAD_ALGORITHM_TEST_SRC}")
 
 if(BUILD_BATCH_MANAGER)
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/batch_manager)

@@ -68,14 +68,14 @@ struct TopPSamplingKernelParams
 
     //! The appropriate block configuration calculated based on the number of multiprocessors, occupancy,
     //! batchSize and vocabSizePadded. Required for AirTopP
-    runtime::SizeType blockNum{-1};
+    runtime::SizeType32 blockNum{-1};
     //! bool, optional. Default value is false.
     //! When isDeterministic==true, the result is reproducible. Required for AirTopP
     bool isDeterministic{true};
 
-    runtime::SizeType batchSize{-1};
-    runtime::SizeType maxBatchSize{-1};
-    runtime::SizeType vocabSizePadded{-1};
+    runtime::SizeType32 batchSize{-1};
+    runtime::SizeType32 maxBatchSize{-1};
+    runtime::SizeType32 vocabSizePadded{-1};
 
     void checkParams() const
     {
@@ -98,7 +98,7 @@ struct TopPSamplingKernelParams
 //! \param batchSize batch size
 //! \param vocabSizePadded size of padded vocab
 template <typename T>
-[[nodiscard]] size_t getTopPWorkspaceSize(runtime::SizeType batchSize, runtime::SizeType vocabSizePadded);
+[[nodiscard]] size_t getTopPWorkspaceSize(runtime::SizeType32 batchSize, runtime::SizeType32 vocabSizePadded);
 
 // clang-format off
 //! \brief Given probs, performs Top P sampling. Fills sampled tokens to outputIds.
@@ -124,8 +124,8 @@ void invokeBatchTopPSampling(TopPSamplingKernelParams<T> const& params, cudaStre
 //! \param localBatchSize
 void invokeComputeToppDecay(float* runtimeTopP, float const* runtimeInitialTopP, runtime::TokenIdType const** outputIds,
     float const* topPDecay, float const* topPMin, runtime::TokenIdType const* topPResetIds,
-    runtime::SizeType32 const* sequenceLengths, runtime::SizeType32 const* batchSlots, runtime::SizeType localBatchSize,
-    cudaStream_t stream);
+    runtime::SizeType32 const* sequenceLengths, runtime::SizeType32 const* batchSlots,
+    runtime::SizeType32 localBatchSize, cudaStream_t stream);
 
 //! \brief Given probs, performs top P sampling.
 //! Note different from invokeTopPSampling() and invokeBatchTopPSampling() there two functions invokeAirTopPSampling

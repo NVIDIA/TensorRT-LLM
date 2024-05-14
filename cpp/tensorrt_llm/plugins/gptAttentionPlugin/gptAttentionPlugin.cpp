@@ -98,6 +98,7 @@ bool GPTAttentionPlugin::isEntryUsed(IdxEntry const& entry) const
     case IdxEntry::ENCODER_INPUT_LENGTH: return isCrossAttention();
     case IdxEntry::HOST_CONTEXT_LENGTH: return mRemovePadding;
     case IdxEntry::QKV_BIAS_TENSOR: return mQKVBiasEnabled;
+    case IdxEntry::SPEC_DECODING_GENERATION_LENGTHS: return mIsSpecDecodingEnabled;
     case IdxEntry::SPEC_DECODING_PACKED_MASK: return mIsSpecDecodingEnabled;
     case IdxEntry::SPEC_DECODING_POSITION_OFFSETS: return mIsSpecDecodingEnabled;
     default: return false;
@@ -139,11 +140,20 @@ int GPTAttentionPlugin::getGenerationInputSequenceLength(
 {
     if (mRemovePadding)
     {
-        // [num_tokens, local_hidden_size] where num_tokens = batch_size * generation_input_length
-        TLLM_CHECK_WITH_INFO(localNbTokens % localNbSeq == 0,
-            "seq_len should be same for all generation requests, localNbTokens=%d, localNbSeq=%d", localNbTokens,
-            localNbSeq);
-        return localNbTokens / localNbSeq;
+        // Speculative decoding mode might need variable generation input sequence length.
+        if (mIsSpecDecodingEnabled)
+        {
+            // SPEC_DECODING_POSITION_OFFSETS: [batch_size, max_generation_input_length].
+            return inputDesc[getIdx(IdxEntry::SPEC_DECODING_POSITION_OFFSETS)].dims.d[1];
+        }
+        else
+        {
+            // [num_tokens, local_hidden_size] where num_tokens = batch_size * generation_input_length
+            TLLM_CHECK_WITH_INFO(localNbTokens % localNbSeq == 0,
+                "seq_len should be same for all generation requests, localNbTokens=%d, localNbSeq=%d", localNbTokens,
+                localNbSeq);
+            return localNbTokens / localNbSeq;
+        }
     }
     else
     {
@@ -178,7 +188,9 @@ bool GPTAttentionPlugin::supportsFormatCombination(
         || pos == getIdx(IdxEntry::HOST_MAX_ATTENTION_WINDOW) || pos == getIdx(IdxEntry::HOST_SINK_TOKEN_LENGTH)
         || (isEntryUsed(IdxEntry::SPEC_DECODING_PACKED_MASK) && pos == getIdx(IdxEntry::SPEC_DECODING_PACKED_MASK))
         || (isEntryUsed(IdxEntry::SPEC_DECODING_POSITION_OFFSETS)
-            && pos == getIdx(IdxEntry::SPEC_DECODING_POSITION_OFFSETS)))
+            && pos == getIdx(IdxEntry::SPEC_DECODING_POSITION_OFFSETS))
+        || (isEntryUsed(IdxEntry::SPEC_DECODING_GENERATION_LENGTHS)
+            && pos == getIdx(IdxEntry::SPEC_DECODING_GENERATION_LENGTHS)))
     {
         return inOut[pos].type == nvinfer1::DataType::kINT32;
     }
@@ -618,19 +630,29 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
 
     int const* spec_decoding_packed_mask = nullptr;
     int const* spec_decoding_position_offsets = nullptr;
+    int const* spec_decoding_generation_lengths = nullptr;
     int num_spec_decoding_tokens = 0;
     if (mIsSpecDecodingEnabled)
     {
-        // Second dimension of spec_decoding_packed_mask is num_spec_decoding_tokens + 1.
-        // [batch_size, num_spec_decoding_tokens + 1, divUp(num_spec_decoding_tokens + 1, 32)]
-        num_spec_decoding_tokens = inputDesc[getIdx(IdxEntry::SPEC_DECODING_PACKED_MASK)].dims.d[1] - 1;
+        // Second dimension of spec_decoding_position_offsets is num_spec_decoding_tokens + 1.
+        // [batch_size, num_spec_decoding_tokens + 1]
+        num_spec_decoding_tokens = inputDesc[getIdx(IdxEntry::SPEC_DECODING_POSITION_OFFSETS)].dims.d[1] - 1;
         if (num_spec_decoding_tokens > 0)
         {
             spec_decoding_packed_mask = static_cast<int const*>(inputs[getIdx(IdxEntry::SPEC_DECODING_PACKED_MASK)])
                 + seqIdxBeg * getStride(inputDesc[getIdx(IdxEntry::SPEC_DECODING_PACKED_MASK)].dims, 0);
+            // Packed as [num_tokens, packed_mask_size]
+            // Use seqIdxBeg * (num_spec_decoding_tokens + 1) here as only generation tokens have the packed_mask
+            // buffer.
+            // TODO: support variable sequence length based on generationTokenIdxBeg.
+            spec_decoding_packed_mask = static_cast<int const*>(inputs[getIdx(IdxEntry::SPEC_DECODING_PACKED_MASK)])
+                + seqIdxBeg * (num_spec_decoding_tokens + 1)
+                    * getStride(inputDesc[getIdx(IdxEntry::SPEC_DECODING_PACKED_MASK)].dims, 0);
             spec_decoding_position_offsets
                 = static_cast<int const*>(inputs[getIdx(IdxEntry::SPEC_DECODING_POSITION_OFFSETS)])
                 + seqIdxBeg * getStride(inputDesc[getIdx(IdxEntry::SPEC_DECODING_POSITION_OFFSETS)].dims, 0);
+            spec_decoding_generation_lengths
+                = static_cast<int const*>(inputs[getIdx(IdxEntry::SPEC_DECODING_GENERATION_LENGTHS)]) + seqIdxBeg;
         }
     }
 
@@ -697,6 +719,7 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         int const* host_context_lengths
             = mRemovePadding ? reinterpret_cast<int const*>(inputs[getIdx(IdxEntry::HOST_CONTEXT_LENGTH)]) : nullptr;
 
+        // Medusa: the max input sequence length if variable sequence length is needed.
         int const input_seq_length = getGenerationInputSequenceLength(inputDesc, localNbSeq, localNbTokens);
         auto qkvDims = inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims;
         TLLM_CHECK_WITH_INFO(input_seq_length == 1 || mIsSpecDecodingEnabled,
@@ -711,7 +734,7 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
             kv_scale_quant_orig, attention_output_orig_quant, rotary_embedding_scaling_factors, alibi_slopes,
             context_buf_, key_value_cache, block_offsets, host_primary_pool_pointer, host_secondary_pool_pointer,
             max_attention_window_size, cyclic_attention_window_size, sink_token_length, num_requests,
-            max_blocks_per_sequence, cache_indir, workspace, max_context_kv_len_list};
+            max_blocks_per_sequence, cache_indir, mMultiBlockSemaphores.get(), workspace, max_context_kv_len_list};
         enqueue_params.host_context_lengths = host_context_lengths;
         if (isRelativePosition())
         {
@@ -729,6 +752,7 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         {
             enqueue_params.spec_decoding_packed_mask = spec_decoding_packed_mask;
             enqueue_params.spec_decoding_position_offsets = spec_decoding_position_offsets;
+            enqueue_params.spec_decoding_generation_lengths = spec_decoding_generation_lengths;
         }
 
         enqueueGeneration<T, KVCacheBuffer>(enqueue_params, stream);
@@ -757,6 +781,10 @@ int GPTAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
     cudaStream_t stream) noexcept
 {
+    if (isBuilding())
+    {
+        return 0;
+    }
     if (mType == nvinfer1::DataType::kHALF)
     {
         return enqueueDispatchKVCacheType<half>(inputDesc, outputDesc, inputs, outputs, workspace, stream);

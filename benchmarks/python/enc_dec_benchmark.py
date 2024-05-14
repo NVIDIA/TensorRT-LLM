@@ -30,7 +30,8 @@ from tensorrt_llm.runtime.session import TensorInfo
 
 class EncDecBenchmark(BaseBenchmark):
 
-    def __init__(self, args, batch_sizes, in_out_lens, rank, world_size):
+    def __init__(self, args, batch_sizes, in_out_lens, gpu_weights_percents,
+                 rank, world_size):
         self.engine_dir = args.engine_dir
         self.model_name = args.model
         self.mode = args.mode
@@ -50,6 +51,8 @@ class EncDecBenchmark(BaseBenchmark):
         # So we use separate variables for encoder and decoder here.
         self.encoder_engine_model_name = args.model
         self.decoder_engine_model_name = args.model
+        self.gpu_weights_percents = gpu_weights_percents
+
         # only for whisper parameter
         self.n_mels = 0
 
@@ -199,10 +202,8 @@ class EncDecBenchmark(BaseBenchmark):
         self.encoder_session = tensorrt_llm.runtime.Session.from_serialized_engine(
             encoder_engine_buffer)
         self.decoder_session = tensorrt_llm.runtime.GenerationSession(
-            self.decoder_model_config,
-            decoder_engine_buffer,
-            self.decoder_runtime_mapping,
-        )
+            self.decoder_model_config, decoder_engine_buffer,
+            self.decoder_runtime_mapping)
 
         # Print context memory size for CI/CD to track.
         context_mem_size = self.encoder_session.context_mem_size + self.decoder_session.context_mem_size
@@ -229,7 +230,13 @@ class EncDecBenchmark(BaseBenchmark):
                         f"<= max_batch_size({self.max_batch_size}) failed, skipping."
                     )
                     continue
-                yield (batch_size, inlen, outlen)
+                for gpu_weights_percent in self.gpu_weights_percents:
+                    yield (batch_size, inlen, outlen, gpu_weights_percent)
+
+    def set_weight_streaming(self, config):
+        gpu_weights_percent = config[3]
+        self.encoder_session._set_weight_streaming(gpu_weights_percent)
+        self.decoder_session._set_weight_streaming(gpu_weights_percent)
 
     def prepare_inputs(self, config):
         batch_size, encoder_input_len = config[0], config[1]
@@ -437,6 +444,7 @@ class EncDecBenchmark(BaseBenchmark):
         report_dict["batch_size"] = batch_size
         report_dict["input_length"] = encoder_input_len
         report_dict["output_length"] = output_len
+        report_dict["gpu_weights_percent"] = config[3]
         report_dict["latency(ms)"] = latency
         report_dict["build_time(s)"] = self.build_time
         report_dict["tokens_per_sec"] = tokens_per_sec

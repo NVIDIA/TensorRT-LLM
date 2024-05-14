@@ -1101,8 +1101,9 @@ if __name__ == '__main__':
     hf_model = AutoModel.from_pretrained(
         args.model_dir,
         trust_remote_code=True,
-        torch_dtype="auto",
-        device_map="auto" if chatglm_version != 'glm' else None)
+        torch_dtype='auto' if chatglm_version != 'glm' else getattr(
+            torch, args.dtype),
+        device_map='auto' if chatglm_version != 'glm' else 'cuda')
 
     act_range = {}
     # smoother for query_key_value.dense and mlp.proj

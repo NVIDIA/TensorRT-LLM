@@ -35,13 +35,13 @@ int main(int argc, char* argv[])
     }
 
     // Create the executor for this engine
-    tle::SizeType beamWidth = 1;
+    tle::SizeType32 beamWidth = 1;
     auto executorConfig = tle::ExecutorConfig(beamWidth);
     auto trtEnginePath = argv[1];
     auto executor = tle::Executor(trtEnginePath, tle::ModelType::kDECODER_ONLY, executorConfig);
 
     // Create the request
-    tle::SizeType maxNewTokens = 5;
+    tle::SizeType32 maxNewTokens = 5;
     tle::VecTokens inputTokens{1, 2, 3, 4};
     auto request = tle::Request(inputTokens, maxNewTokens);
 

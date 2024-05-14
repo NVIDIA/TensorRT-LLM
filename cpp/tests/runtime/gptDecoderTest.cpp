@@ -31,23 +31,23 @@ namespace
 
 void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingConfig)
 {
-    SizeType constexpr tensorParallelism{1};
-    SizeType constexpr pipelineParallelism{1};
-    SizeType constexpr localRank{0};
+    SizeType32 constexpr tensorParallelism{1};
+    SizeType32 constexpr pipelineParallelism{1};
+    SizeType32 constexpr localRank{0};
     WorldConfig const worldConfig{tensorParallelism, pipelineParallelism, localRank};
 
-    SizeType constexpr vocabSize{51200};
-    SizeType constexpr nbLayers{2};
-    SizeType constexpr nbSsmLayers{0};
-    SizeType constexpr nbHeads{16};
-    SizeType constexpr hiddenSize{1024};
-    SizeType constexpr batchSize{4};
-    ModelConfig modelConfig{vocabSize, nbLayers, nbSsmLayers, nbHeads, hiddenSize, dtype};
+    SizeType32 constexpr vocabSize{51200};
+    SizeType32 constexpr nbLayers{2};
+    SizeType32 constexpr nbRnnLayers{0};
+    SizeType32 constexpr nbHeads{16};
+    SizeType32 constexpr hiddenSize{1024};
+    SizeType32 constexpr batchSize{4};
+    ModelConfig modelConfig{vocabSize, nbLayers, nbRnnLayers, nbHeads, hiddenSize, dtype};
     modelConfig.useGptAttentionPlugin(false);
 
-    SizeType constexpr maxInputLength{8};
-    SizeType constexpr maxNewTokens{2};
-    SizeType constexpr sinkTokenLength{0};
+    SizeType32 constexpr maxInputLength{8};
+    SizeType32 constexpr maxNewTokens{2};
+    SizeType32 constexpr sinkTokenLength{0};
     auto constexpr maxSeqLength = maxInputLength + maxNewTokens;
 
     auto streamPtr = std::make_shared<CudaStream>();
@@ -107,7 +107,7 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
     manager.setZero(*outputs.finished);
     outputs.finishedSum = BufferManager::pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
     auto* finishedSumHost = bufferCast<std::int32_t>(*outputs.finishedSum);
-    for (SizeType bi = 0; bi < batchSize; ++bi)
+    for (SizeType32 bi = 0; bi < batchSize; ++bi)
     {
         finishedSumHost[bi] = -1;
     }
@@ -135,8 +135,8 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
     inputs.step += 1;
 
     {
-        SizeType finishedSum = 0;
-        for (SizeType bi = 0; bi < batchSize; ++bi)
+        SizeType32 finishedSum = 0;
+        for (SizeType32 bi = 0; bi < batchSize; ++bi)
         {
             finishedSum += finishedSumHost[bi];
         }
@@ -174,8 +174,8 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
     // run decoder again
     EXPECT_TRUE(decoder->forward(outputs, inputs));
     {
-        SizeType finishedSum = 0;
-        for (SizeType bi = 0; bi < batchSize; ++bi)
+        SizeType32 finishedSum = 0;
+        for (SizeType32 bi = 0; bi < batchSize; ++bi)
         {
             finishedSum += finishedSumHost[bi];
         }
@@ -185,14 +185,14 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
 
 } // namespace
 
-class ParamTest : public ::testing::TestWithParam<std::tuple<nvinfer1::DataType, SizeType>>
+class ParamTest : public ::testing::TestWithParam<std::tuple<nvinfer1::DataType, SizeType32>>
 {
 };
 
 TEST_P(ParamTest, Test)
 {
     nvinfer1::DataType const dtype{std::get<0>(GetParam())};
-    SizeType const beamWidth{std::get<1>(GetParam())};
+    SizeType32 const beamWidth{std::get<1>(GetParam())};
     SamplingConfig const samplingConfig{beamWidth};
 
     testDecoder(dtype, samplingConfig);

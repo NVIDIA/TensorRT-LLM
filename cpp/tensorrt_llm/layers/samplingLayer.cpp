@@ -58,7 +58,7 @@ SamplingLayer<T>::SamplingLayer(DecodingMode const& mode, DecoderDomain const& d
 }
 
 template <typename T>
-void SamplingLayer<T>::allocateBuffer(SizeType batchSize)
+void SamplingLayer<T>::allocateBuffer(SizeType32 batchSize)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -110,7 +110,7 @@ void SamplingLayer<T>::freeBuffer()
 }
 
 template <typename T>
-void SamplingLayer<T>::setup(SizeType batchSize, SizeType beamWidth, SizeType const* batchSlots,
+void SamplingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 const* batchSlots,
     std::shared_ptr<BaseSetupParams> baseSetupParams)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);

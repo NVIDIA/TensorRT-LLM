@@ -141,6 +141,7 @@ struct Fused_multihead_attention_params_v2
     cudaTmaDesc tma_desc_q;
     cudaTmaDesc tma_desc_k;
     cudaTmaDesc tma_desc_v;
+    cudaTmaDesc tma_desc_o;
 
     void clear()
     {
@@ -234,6 +235,8 @@ struct Fused_multihead_attention_paged_kv_params_v2
     cudaTmaDesc tma_desc_q;
     // Tma descriptors for paged kv cache.
     cudaTmaDesc tma_desc_paged_kv;
+    // Tma descriptors for o
+    cudaTmaDesc tma_desc_o;
 
     // Paged KV load.
     int blocks_per_tma_load;

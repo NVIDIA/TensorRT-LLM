@@ -76,7 +76,7 @@ public:
         return mExecutor->awaitResponses(requestIds, timeout);
     }
 
-    [[nodiscard]] tle::SizeType getNumResponsesReady(std::optional<tle::IdType> const& requestId = std::nullopt) const
+    [[nodiscard]] tle::SizeType32 getNumResponsesReady(std::optional<tle::IdType> const& requestId = std::nullopt) const
     {
         return mExecutor->getNumResponsesReady(requestId);
     }

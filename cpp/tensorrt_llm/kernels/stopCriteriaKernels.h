@@ -46,8 +46,8 @@ namespace kernels
 //! \param stream stream
 void invokeStopWordsCriterion(runtime::TokenIdType const** outputIds, runtime::SizeType32 const** parentIds,
     runtime::TokenIdType const** stopWords, FinishedState* finished, runtime::SizeType32 const* sequenceLengths,
-    runtime::SizeType32 const* batchSlots, runtime::SizeType32 const* stopWordsLen, runtime::SizeType maxStopWordsLen,
-    runtime::SizeType batchSize, runtime::SizeType beamWidth, runtime::SizeType maxSeqLen, cudaStream_t stream);
+    runtime::SizeType32 const* batchSlots, runtime::SizeType32 const* stopWordsLen, runtime::SizeType32 maxStopWordsLen,
+    runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 maxSeqLen, cudaStream_t stream);
 
 //! \brief Sets finished states based on the sequenceLimitLength and computes number of finished sequences in the batch.
 //!
@@ -64,7 +64,7 @@ void invokeStopWordsCriterion(runtime::TokenIdType const** outputIds, runtime::S
 //! \param stream stream
 void invokeLengthCriterion(FinishedState* finished, runtime::SizeType32* finishedSum,
     runtime::SizeType32 const* sequenceLimitLength, runtime::SizeType32* sequenceLengths,
-    runtime::SizeType32 const* batchSlots, runtime::SizeType batchSize, runtime::SizeType beamWidth,
+    runtime::SizeType32 const* batchSlots, runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth,
     cudaStream_t stream);
 } // namespace kernels
 } // namespace tensorrt_llm

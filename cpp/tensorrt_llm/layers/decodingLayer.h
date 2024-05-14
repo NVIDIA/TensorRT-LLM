@@ -44,7 +44,7 @@ public:
 
     ~DecodingLayer() override = default;
 
-    void setup(runtime::SizeType batchSize, runtime::SizeType beamWidth, runtime::SizeType32 const* batchSlots,
+    void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 const* batchSlots,
         std::shared_ptr<BaseSetupParams> setupParams) override;
 
     //! \brief Calls single SamplingLayer::forward in batched mode

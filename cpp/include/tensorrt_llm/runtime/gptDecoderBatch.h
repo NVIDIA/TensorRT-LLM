@@ -41,14 +41,15 @@ public:
     GptDecoderBatch(std::size_t vocabSize, std::size_t vocabSizePadded, CudaStreamPtr stream);
 
     //! Setup the decoder before calling `forward()`
-    void setup(DecodingMode const& mode, SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxAttentionWindow,
-        SizeType sinkTokenLength, SizeType maxSequenceLength, SizeType maxTokensPerStep, bool fusedDecoder,
-        nvinfer1::DataType dtype, ModelConfig const& modelConfig) override;
+    void setup(DecodingMode const& mode, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
+        SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength,
+        SizeType32 maxTokensPerStep, bool fusedDecoder, nvinfer1::DataType dtype,
+        ModelConfig const& modelConfig) override;
 
     void newBatch(
         GenerationInput const& inputs, GenerationOutput const& outputs, SamplingConfig const& samplingConfig) override;
 
-    void newRequests(std::vector<SizeType> const& seqSlots, std::vector<decoder_batch::Request> const& requests,
+    void newRequests(std::vector<SizeType32> const& seqSlots, std::vector<decoder_batch::Request> const& requests,
         std::vector<SamplingConfig> const& samplingConfigs) override;
 
     TokenPtr forwardAsync(decoder_batch::Output& output, decoder_batch::Input const& input) override;
@@ -68,7 +69,7 @@ public:
     //! @param batchIdx index of the batch
     //! @returns [maxBeamWidth, maxInputLength + maxNewTokens], contains input token ids and generated token ids without
     //! padding for request `batchIdx`, on gpu
-    [[nodiscard]] TensorPtr getOutputIds(SizeType batchIdx) const override
+    [[nodiscard]] TensorPtr getOutputIds(SizeType32 batchIdx) const override
     {
         auto tensor = ITensor::slice(mJointDecodingOutput->ids, batchIdx, 1);
         tensor->squeeze(0);
@@ -84,7 +85,7 @@ public:
 
     //! @brief Gather final beam search results for request `batchIdx`.
     //! Result will only be available after event returned.
-    [[nodiscard]] CudaEvent finalize(SizeType batchIdx) const override;
+    [[nodiscard]] CudaEvent finalize(SizeType32 batchIdx) const override;
 
     //! @brief Gather final beam search results for all requests.
     void finalize() const override;
@@ -103,7 +104,7 @@ public:
     }
 
     //! @returns [maxBeamWidth], cumulative log probabilities (per beam), on gpu
-    [[nodiscard]] TensorPtr getCumLogProbs(SizeType batchIdx) const override
+    [[nodiscard]] TensorPtr getCumLogProbs(SizeType32 batchIdx) const override
     {
         auto tensor = ITensor::slice(mJointDecodingOutput->cumLogProbs, batchIdx, 1);
         tensor->squeeze(0);
@@ -117,7 +118,7 @@ public:
     }
 
     //! @returns [maxBeamWidth, maxSequenceLength], log probabilities (per beam), on gpu
-    [[nodiscard]] TensorPtr getLogProbs(SizeType batchIdx) const override
+    [[nodiscard]] TensorPtr getLogProbs(SizeType32 batchIdx) const override
     {
         auto tensor = ITensor::slice(mJointDecodingOutput->logProbs, batchIdx, 1);
         tensor->squeeze(0);
@@ -134,7 +135,7 @@ public:
     //! @brief Get tokens generated in one step of last forward pass
     //! @param iter The iteration within [0; maxTokensPerStep) for which to get the tokens
     //! @returns [batchSize, beamWidth], tokens generated in `iter` (per beam), on gpu
-    [[nodiscard]] TensorPtr getNewTokens(SizeType iter = 0) const override
+    [[nodiscard]] TensorPtr getNewTokens(SizeType32 iter = 0) const override
     {
         TensorPtr newTokensView = ITensor::slice(mJointDecodingOutput->newTokensSteps, iter, 1);
         newTokensView->squeeze(0);
@@ -142,7 +143,7 @@ public:
     }
 
     //! @returns [batchSize], the number of generation steps executed on each request
-    [[nodiscard]] std::vector<SizeType> getNbSteps() const override
+    [[nodiscard]] std::vector<SizeType32> getNbSteps() const override
     {
         return {mNbSteps.begin(), mNbSteps.begin() + mActualBatchSize};
     }
@@ -173,10 +174,10 @@ public:
 
 private:
     //! @brief Gather final beam search results for request `batchIdx`.
-    [[nodiscard]] CudaEvent postProcessRequest(SizeType batchIdx) const;
+    [[nodiscard]] CudaEvent postProcessRequest(SizeType32 batchIdx) const;
 
     //! @brief Initialize the decoder at `batchIdx` with a new `request`.
-    void newRequest(SizeType batchIdx, decoder_batch::Request const& request, SamplingConfig const& samplingConfig);
+    void newRequest(SizeType32 batchIdx, decoder_batch::Request const& request, SamplingConfig const& samplingConfig);
 
     //! @brief Allocate buffers for medusa decoding.
     void allocateMedusaBuffers();
@@ -186,18 +187,18 @@ private:
 
     //! @brief Setups decoder internal tensors for new speculative decoding request
     void newRequestSpeculativeDecoding(
-        SizeType batchIdx, decoder_batch::Request const& request, SamplingConfig const& samplingConfig);
+        SizeType32 batchIdx, decoder_batch::Request const& request, SamplingConfig const& samplingConfig);
 
     //! @brief Setups decoder internal tensors for new Medusa request
-    void newRequestMedusa(SizeType batchIdx, decoder_batch::Request const& request);
+    void newRequestMedusa(SizeType32 batchIdx, decoder_batch::Request const& request);
 
     //! @brief Asynchronously calls unfused decoder for whole batch in loop
     void forwardAsyncUnfusedDecoder(
-        SizeType step, decoder_batch::Output& output, decoder_batch::Input const& input, CudaEvent const& eventStart);
+        SizeType32 step, decoder_batch::Output& output, decoder_batch::Input const& input, CudaEvent const& eventStart);
 
     //! @brief Asynchronously calls fused decoder for whole batch
     void forwardAsyncFusedDecoder(
-        SizeType step, decoder_batch::Output& output, decoder_batch::Input const& input, CudaEvent const& eventStart);
+        SizeType32 step, decoder_batch::Output& output, decoder_batch::Input const& input, CudaEvent const& eventStart);
 
 private:
     std::size_t const mVocabSize;
@@ -222,12 +223,12 @@ private:
     TensorPtr mNumDraftTokens;
     TensorPtr mCurandStates;
 
-    std::vector<SizeType> mNbSteps;
+    std::vector<SizeType32> mNbSteps;
     std::vector<bool> mFinished;
     TensorPtr mFinishedSum;
-    std::vector<SizeType> mMaxNewTokens;
-    std::vector<SizeType> mBeamWidths;
-    std::vector<SizeType> mGeneratedTokensPerEngineStep;
+    std::vector<SizeType32> mMaxNewTokens;
+    std::vector<SizeType32> mBeamWidths;
+    std::vector<SizeType32> mGeneratedTokensPerEngineStep;
 
     TensorPtr mFinishedSteps;   // [maxTokensPerStep, batchSize, beamWidth] finished states of type FinishedState
                                 // for each generated token of maxTokensPerStep, on gpu
@@ -243,15 +244,15 @@ private:
     TensorPtr mBatchSlotsAcceptTokens; // [maxBatchSize], int32_t, address map, pinned
     TensorPtr mBatchSlotsAcceptLogits; // [maxBatchSize], int32_t, address map, pinned
     TensorPtr mTargetLogitsPtrs;       // [maxBatchSize], float*, pointers to target logits, pinned
-    SizeType mMaxSequenceLength{};
-    SizeType mMaxAttentionWindow{};
-    SizeType mSinkTokenLength{};
-    SizeType mActualBatchSize{};
-    SizeType mMaxTokensPerEngineStep{};
-    SizeType mMaxStopWordsLen{};
-    SizeType mMaxBadWordsLen{};
+    SizeType32 mMaxSequenceLength{};
+    SizeType32 mMaxAttentionWindow{};
+    SizeType32 mSinkTokenLength{};
+    SizeType32 mActualBatchSize{};
+    SizeType32 mMaxTokensPerEngineStep{};
+    SizeType32 mMaxStopWordsLen{};
+    SizeType32 mMaxBadWordsLen{};
     // How many tokens for one request can be processed per mDecoders call
-    SizeType mMaxTokensPerDecoderStep{};
+    SizeType32 mMaxTokensPerDecoderStep{};
 
     bool mFusedDecoder{false};
     bool mUseMedusa{false};

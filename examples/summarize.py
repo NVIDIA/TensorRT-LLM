@@ -359,10 +359,10 @@ def main(args):
         runner_cls = ModelRunner if args.use_py_session else ModelRunnerCpp
         runner_kwargs = dict(engine_dir=args.engine_dir,
                              rank=runtime_rank,
-                             debug_mode=args.debug_mode)
+                             debug_mode=args.debug_mode,
+                             gpu_weights_percent=args.gpu_weights_percent)
         if args.medusa_choices is not None:
             args.medusa_choices = ast.literal_eval(args.medusa_choices)
-            assert args.use_py_session, "Medusa is only supported by py_session"
             assert args.temperature == 1.0, "Medusa should use temperature == 1.0"
             assert args.num_beams == 1, "Medusa should use num_beams == 1"
             runner_kwargs.update(medusa_choices=args.medusa_choices)
@@ -690,7 +690,13 @@ if __name__ == '__main__':
         help="Medusa choice to use, if not none, will use Medusa decoding."
         "   E.g.: [[0, 0, 0, 0], [0, 1, 0], [1, 0], [1, 1]] for 9 medusa tokens."
     )
-
+    parser.add_argument(
+        '--gpu_weights_percent',
+        default=1,
+        type=float,
+        help=
+        'Specify the percentage of weights that reside on GPU instead of CPU and streaming load during runtime.',
+    )
     args = parser.parse_args()
 
     main(args)

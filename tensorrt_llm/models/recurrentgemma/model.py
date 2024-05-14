@@ -309,7 +309,7 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
             for i, present_rnn in enumerate(present_rnns):
                 if present_rnn is not None:
                     present_rnn.mark_output(f'present_rnn_state_{i}',
-                                            self.dtype)
+                                            str_dtype_to_trt('float32'))
 
         return (lm_logits, present_kvs, present_convs, present_rnns)
 
@@ -338,6 +338,7 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
 
         rnn_state_dim_range = OrderedDict([
             ('batch_size', batch_range),
+            ('state_size', [1] * num_profiles),
             ('dim_size', [dim] * num_profiles),
         ])
         one_dim_range = OrderedDict([
@@ -358,25 +359,21 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
                                        dim_range=one_dim_range)
                 else:
                     if use_mamba_conv1d_plugin:
-                        conv_state = Tensor(name=f'past_conv_state_{i}',
-                                            dtype=self.dtype,
-                                            shape=[
-                                                -1, self.config.conv_kernel - 1,
-                                                self.config.rnn_hidden_size
-                                            ],
-                                            dim_range=conv_state_dim_range)
+                        conv_state = Tensor(
+                            name=f'past_conv_state_{i}',
+                            dtype=self.dtype,
+                            shape=[-1, self.config.conv_kernel - 1, dim],
+                            dim_range=conv_state_dim_range)
                     else:
-                        conv_state = Tensor(name=f'past_conv_state_{i}',
-                                            dtype=self.dtype,
-                                            shape=[
-                                                -1, self.config.rnn_hidden_size,
-                                                self.config.conv_kernel - 1
-                                            ],
-                                            dim_range=conv_state_dim_range)
+                        conv_state = Tensor(
+                            name=f'past_conv_state_{i}',
+                            dtype=self.dtype,
+                            shape=[-1, dim, self.config.conv_kernel - 1],
+                            dim_range=conv_state_dim_range)
 
                     rnn_state = Tensor(name=f'past_rnn_state_{i}',
                                        dtype=str_dtype_to_trt('float32'),
-                                       shape=[-1, self.config.rnn_hidden_size],
+                                       shape=[-1, 1, dim],
                                        dim_range=rnn_state_dim_range)
             else:
                 conv_state, rnn_state = None, None
@@ -408,6 +405,7 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
             max_beam_width: int = 1,
             max_num_tokens: int = None,
             opt_num_tokens: int = None,
+            opt_batch_size: int = 0,
             prompt_embedding_table_size: int = 0,
             max_draft_len: int = 0,
             gather_context_logits: bool = False,

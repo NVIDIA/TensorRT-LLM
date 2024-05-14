@@ -165,9 +165,13 @@ public:
         BuildDecoderInfoParams<T> decoder_params;
         memset(&decoder_params, 0, sizeof(decoder_params));
         decoder_params.seqQOffsets = launchParams.cu_seq_lens;
+        decoder_params.seqQLengths = xqaParams.spec_decoding_generation_lengths;
         decoder_params.seqKVLengths = xqaParams.sequence_lengths;
         decoder_params.batchSize = int(batch_beam_size);
         decoder_params.maxQSeqLength = xqaParams.generation_input_length;
+        decoder_params.removePadding = xqaParams.multi_query_tokens;
+        TLLM_CHECK_WITH_INFO(!xqaParams.multi_query_tokens || xqaParams.spec_decoding_generation_lengths != nullptr,
+            "Spec_decoding_generation_lengths must be provided.");
         // Rotary embedding inv_freq buffer.
         decoder_params.rotaryEmbeddingScale = xqaParams.rotary_embedding_scale;
         decoder_params.rotaryEmbeddingBase = xqaParams.rotary_embedding_base;
@@ -184,7 +188,8 @@ public:
         void const* xqa_q_input_ptr = xqaParams.output;
         QKVPreprocessingParams<T, KVCacheBuffer> preprocessingParms{static_cast<T*>(const_cast<void*>(xqaParams.qkv)),
             nullptr, static_cast<T*>(const_cast<void*>(xqaParams.output)), kv_cache_buffer,
-            static_cast<T const*>(xqaParams.qkv_bias), nullptr, xqaParams.sequence_lengths, nullptr,
+            static_cast<T const*>(xqaParams.qkv_bias), xqaParams.spec_decoding_generation_lengths,
+            xqaParams.sequence_lengths, xqaParams.multi_query_tokens ? launchParams.cu_seq_lens : nullptr,
             launchParams.rotary_inv_freq_buf, (float2 const*) nullptr, xqaParams.kv_scale_orig_quant,
             xqaParams.spec_decoding_position_offsets, int(batch_beam_size), xqaParams.generation_input_length,
             xqaParams.timestep, xqaParams.cyclic_attention_window_size, xqaParams.sink_token_length,
@@ -193,7 +198,7 @@ public:
             xqaParams.rotary_embedding_dim, xqaParams.rotary_embedding_base, xqaParams.rotary_embedding_scale_type,
             xqaParams.rotary_embedding_scale, xqaParams.rotary_embedding_max_positions,
             xqaParams.position_embedding_type, xqaParams.position_shift_enabled, cache_type, true, false,
-            multiprocessor_count};
+            multiprocessor_count, xqaParams.rotary_vision_start, xqaParams.rotary_vision_length};
 
         invokeQKVPreprocessing<T, KVCacheBuffer>(preprocessingParms, stream);
         sync_check_cuda_error();
@@ -220,23 +225,22 @@ public:
 
         if (xqaParams.multi_query_tokens)
         {
-            // MultiQueryTokens (generation_input_length > 1) need extra parameters (like qSeqLen, log2HeadGrpSize, and
+            // MultiQueryTokens (generation_input_length > 1) need extra parameters (like qSeqLen, headGrpSize, and
             // mask). Input parameters for MultiQueryTokens kernels.
-            unsigned int log2HeadGrpSize = log2(num_q_heads_over_kv);
-            unsigned int nbTokenBlocksPerGrp = divUp(qSeqLen << log2HeadGrpSize, mTileSize);
+            unsigned int headGrpSize = num_q_heads_over_kv;
+            unsigned int nbTokenBlocksPerGrp = divUp(qSeqLen * headGrpSize, mTileSize);
             int const* maskPtr = xqaParams.spec_decoding_packed_mask;
-            // TODO: add fp8/int8 kv cache kernels.
-            float kvCacheQuantOrig = 1.0f;
+            int const* cuQSeqLens = launchParams.cu_seq_lens;
             // TODO: merge SingleQueryToken params and MultiQueryTokens params into one kernelParams.
-            void* kernelParams[] = {&qSeqLen, &launchParams.num_k_heads, &log2HeadGrpSize, &launchParams.output,
-                &xqa_q_input_ptr, &maskPtr, &launchParams.kvCacheParams, &launchParams.batch_size, &kvCacheQuantOrig,
-                &launchParams.scratch};
+            void* kernelParams[] = {&qSeqLen, &launchParams.num_k_heads, &headGrpSize, &cuQSeqLens,
+                &launchParams.output, &xqa_q_input_ptr, &maskPtr, &launchParams.kvCacheParams, &launchParams.batch_size,
+                &launchParams.kv_scale_quant_orig, &launchParams.scratch};
             int multi_block = 1;
             if (xqaParams.multi_block_mode)
             {
                 multi_block = computeMultiBlockCount(xqaParams, xqaParams.batch_size, multiprocessor_count);
-                check_cuda_error(cudaMemsetAsync(
-                    launchParams.scratch, 0, sizeof(int) * xqaParams.batch_size * xqaParams.num_kv_heads, stream));
+                check_cuda_error(cudaMemsetAsync(xqaParams.workspaces, 0,
+                    sizeof(int) * xqaParams.batch_size * qSeqLen * xqaParams.num_kv_heads, stream));
                 sync_check_cuda_error();
             }
             cuErrCheck(mDriver->cuLaunchKernel(func, multi_block, xqaParams.num_kv_heads * nbTokenBlocksPerGrp,
@@ -249,8 +253,8 @@ public:
             TLLM_CHECK(isGmmaKernel
                 == (mSM == kSM_90 && xqaParams.kv_cache_data_type == XQADataType::DATA_TYPE_E4M3
                     && xqaParams.beam_width == 1));
-            constexpr uint32_t kMAX_NB_KERNEL_PARAMS = 10;
-            uint32_t const maxNbKernelParams = (isGmmaKernel ? 10 : 9);
+            constexpr uint32_t kMAX_NB_KERNEL_PARAMS = 11;
+            uint32_t const maxNbKernelParams = (isGmmaKernel ? 11 : 10);
             uint32_t idxNextParam = 0;
             void* kernelParams[kMAX_NB_KERNEL_PARAMS];
             auto appendParam = [&](auto* p) mutable
@@ -274,15 +278,13 @@ public:
                 tensorMap = makeTensorMapForKVCache(xqaParams, kv_cache_buffer);
                 appendParam(&tensorMap);
             }
+            appendParam(&launchParams.semaphores);
             appendParam(&launchParams.scratch);
             kernelParams[idxNextParam] = nullptr; // one extra nullptr at end as guard.
             int multi_block = 1;
             if (xqaParams.multi_block_mode)
             {
                 multi_block = computeMultiBlockCount(xqaParams, xqaParams.batch_size, multiprocessor_count);
-                check_cuda_error(cudaMemsetAsync(
-                    launchParams.scratch, 0, sizeof(int) * xqaParams.batch_size * xqaParams.num_kv_heads, stream));
-                sync_check_cuda_error();
             }
             cuErrCheck(mDriver->cuLaunchKernel(func, multi_block, xqaParams.num_kv_heads, xqaParams.batch_size, 128, 1,
                            isGmmaKernel ? 3 : 2, shared_mem_bytes, stream, kernelParams, nullptr),

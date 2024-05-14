@@ -39,11 +39,11 @@ struct InvokeBatchApplyPenaltyParams
     float const* presencePenalties;
     float const* frequencyPenalties;
     bool const accumulateVocab;
-    runtime::SizeType const batchSize;
-    runtime::SizeType const beamWidth;
-    runtime::SizeType const maxSeqLen;
-    runtime::SizeType const vocabSize;
-    runtime::SizeType const vocabSizePadded;
+    runtime::SizeType32 const batchSize;
+    runtime::SizeType32 const beamWidth;
+    runtime::SizeType32 const maxSeqLen;
+    runtime::SizeType32 const vocabSize;
+    runtime::SizeType32 const vocabSizePadded;
     runtime::TokenIdType const** outputIdsPtr;
     runtime::SizeType32 const** parentIdsPtr;
     runtime::SizeType32 const* inputLengths;
@@ -51,7 +51,7 @@ struct InvokeBatchApplyPenaltyParams
     runtime::SizeType32 const* minLengths;
     runtime::TokenIdType const* endIds;
     runtime::SizeType32 const* batchSlots;
-    runtime::SizeType const maxTokensPerStep;
+    runtime::SizeType32 const maxTokensPerStep;
     runtime::SizeType32 const* tokensPerStep;
     cudaStream_t stream;
 };

@@ -110,7 +110,7 @@ void DynamicDecodeLayer<T>::initializeLayers()
 }
 
 template <typename T>
-void DynamicDecodeLayer<T>::setup(SizeType batchSize, SizeType beamWidth, SizeType const* batchSlots,
+void DynamicDecodeLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 const* batchSlots,
     std::shared_ptr<BaseSetupParams> baseSetupParams)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -155,9 +155,9 @@ void DynamicDecodeLayer<T>::forward(
     TLLM_CHECK_WITH_INFO(
         outputs->sequence_length.has_value(), "sequence_length tensor is mandatory in DynamicDecoderLayer.");
 
-    SizeType batchSize = 0;
-    SizeType beamWidth = 0;
-    SizeType vocabSize = 0;
+    SizeType32 batchSize = 0;
+    SizeType32 beamWidth = 0;
+    SizeType32 vocabSize = 0;
     auto const maxSeqLen = outputs->output_ids.shape[outputs->output_ids.shape.size() - 1];
     if (params->logits)
     {
@@ -192,7 +192,7 @@ void DynamicDecodeLayer<T>::forward(
         mRuntimeMaxSeqLen = maxSeqLen;
     }
 
-    std::vector<SizeType> batchSlotsVec(batchSize);
+    std::vector<SizeType32> batchSlotsVec(batchSize);
     std::iota(batchSlotsVec.begin(), batchSlotsVec.end(), 0);
     auto batchSlotsHost
         = params->batch_slots ? params->batch_slots->template getPtr<SizeType32 const>() : batchSlotsVec.data();
@@ -218,18 +218,18 @@ void DynamicDecodeLayer<T>::forward(
 
 template <typename T>
 void DynamicDecodeLayer<T>::prepareIdsPtrs(std::shared_ptr<DynamicDecodeOutputParams> const& outputs,
-    SizeType const* batchSlots, SizeType batchSize, SizeType beamWidth, SizeType maxSeqLen)
+    SizeType32 const* batchSlots, SizeType32 batchSize, SizeType32 beamWidth, SizeType32 maxSeqLen)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto idsPtrHostSlice = ITensor::slice(mIdsPtrHost, mCyclicStep, 1);
     auto idsPtrHost = reinterpret_cast<TokenIdType**>(runtime::bufferCast<int64_t>(*idsPtrHostSlice));
-    for (SizeType bi = 0; bi < batchSize; bi++)
+    for (SizeType32 bi = 0; bi < batchSize; bi++)
     {
         auto const batchSlot = batchSlots[bi];
         idsPtrHost[batchSlot]
             = outputs->output_ids.template getPtrWithOffset<TokenIdType>(batchSlot * beamWidth * maxSeqLen);
     }
-    for (SizeType bi = 0; bi < batchSize; bi++)
+    for (SizeType32 bi = 0; bi < batchSize; bi++)
     {
         auto const batchSlot = batchSlots[bi];
         if (beamWidth > 1)
@@ -258,8 +258,8 @@ void DynamicDecodeLayer<T>::prepareIdsPtrs(std::shared_ptr<DynamicDecodeOutputPa
 template <typename T>
 void DynamicDecodeLayer<T>::prepareOutputData(std::shared_ptr<DynamicDecodeOutputParams> const& outputs,
     std::shared_ptr<DynamicDecodeInputParams> const& params, runtime::ITensor::SharedPtr const& idsPtrsHost,
-    SizeType32 const* batchSlots, SizeType batchSize, SizeType maxBatchSize, SizeType beamWidth, SizeType maxSeqLen,
-    SizeType maxTokensPerStep, SizeType cyclicStep, cudaStream_t stream)
+    SizeType32 const* batchSlots, SizeType32 batchSize, SizeType32 maxBatchSize, SizeType32 beamWidth,
+    SizeType32 maxSeqLen, SizeType32 maxTokensPerStep, SizeType32 cyclicStep, cudaStream_t stream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto idsPtrHostSlice = ITensor::slice(idsPtrsHost, cyclicStep, 1);

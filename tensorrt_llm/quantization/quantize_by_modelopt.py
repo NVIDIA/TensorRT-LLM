@@ -16,10 +16,15 @@
 Adapted from examples/quantization/hf_ptq.py
 """
 
+import contextlib
 import copy
 import json
+import os
 import random
+import shutil
 import sys
+import tarfile
+import tempfile
 import time
 
 import numpy as np
@@ -120,7 +125,7 @@ MODEL_NAME_PATTERN_MAP = {
 }
 
 
-def get_tokenizer(ckpt_path, max_seq_length, model_type=None):
+def get_tokenizer(ckpt_path, max_seq_length=2048, model_type=None):
     print(f"Initializing tokenizer from {ckpt_path}")
     tokenizer = AutoTokenizer.from_pretrained(
         ckpt_path,
@@ -165,7 +170,7 @@ def get_model(ckpt_path, dtype="fp16", device="cuda"):
     model = AutoModelForCausalLM.from_pretrained(
         ckpt_path,
         device_map="auto" if device != "cpu" else "cpu",
-        **model_kwargs,
+        torch_dtype="auto",
         trust_remote_code=True)
     model.eval()
 
@@ -189,8 +194,7 @@ def get_calib_dataloader(data="cnn_dailymail",
                          tokenizer=None,
                          batch_size=1,
                          calib_size=512,
-                         block_size=512,
-                         device=None):
+                         block_size=512):
     print("Loading calibration dataset")
     if data == "pileval":
         dataset = load_dataset(
@@ -209,8 +213,6 @@ def get_calib_dataloader(data="cnn_dailymail",
                                                 padding=True,
                                                 truncation=True,
                                                 max_length=block_size)
-    if device:
-        batch_encoded = batch_encoded.to(device)
     batch_encoded = batch_encoded["input_ids"]
 
     calib_dataloader = DataLoader(batch_encoded,
@@ -243,9 +245,10 @@ def quantize_model(model, quant_cfg, calib_dataloader=None):
     return model
 
 
-def quantize_and_export(*, model_dir, dtype, device, qformat, kv_cache_dtype,
-                        calib_size, batch_size, awq_block_size, output_dir,
-                        tp_size, pp_size, seed, max_seq_length):
+def quantize_and_export(*, model_dir, calib_dataset, dtype, qformat,
+                        kv_cache_dtype, calib_size, batch_size,
+                        calib_max_seq_length, awq_block_size, output_dir,
+                        tp_size, pp_size, seed, tokenizer_max_seq_length):
     '''
         Load model from the model_dir, call Modelopt to quantize the model, and then export
         the quantized model as TRT-LLM checkpoint
@@ -266,10 +269,10 @@ def quantize_and_export(*, model_dir, dtype, device, qformat, kv_cache_dtype,
     random.seed(seed)
     np.random.seed(seed)
 
-    model = get_model(model_dir, dtype, device)
+    model = get_model(model_dir, dtype)
     model_type = get_model_type(model)
     tokenizer = get_tokenizer(model_dir,
-                              max_seq_length=max_seq_length,
+                              max_seq_length=tokenizer_max_seq_length,
                               model_type=model_type)
 
     if qformat in ["full_prec", "int8_wo", "int4_wo"
@@ -289,10 +292,11 @@ def quantize_and_export(*, model_dir, dtype, device, qformat, kv_cache_dtype,
             )
 
         calib_dataloader = get_calib_dataloader(
+            data=calib_dataset,
             tokenizer=tokenizer,
             batch_size=batch_size,
             calib_size=calib_size,
-            device=device,
+            block_size=calib_max_seq_length,
         )
 
         if qformat in quant_cfg_choices():
@@ -382,23 +386,6 @@ def quantize_and_export(*, model_dir, dtype, device, qformat, kv_cache_dtype,
                 with open(f"{export_path}/config.json", "w") as f:
                     json.dump(tensorrt_llm_config, f, indent=4)
 
-        # Workaround for gpt2 position embedding
-        if model_type == 'gpt2':
-            for rank in range(tp_size):
-                weights = {}
-                with safetensors.safe_open(
-                        f"{export_path}/rank{rank}.safetensors",
-                        framework='pt',
-                        device='cpu') as f:
-                    for key in f.keys():
-                        weights[key] = f.get_tensor(key)
-                if 'transformer.positional_embedding.weight' in weights:
-                    weights[
-                        'transformer.position_embedding.weight'] = weights.pop(
-                            'transformer.positional_embedding.weight')
-                safetensors.torch.save_file(
-                    weights, f"{export_path}/rank{rank}.safetensors")
-
         # Workaround for qwen version
         if model_type == 'qwen':
             with open(f"{export_path}/config.json", "r") as f:
@@ -417,3 +404,334 @@ def quantize_and_export(*, model_dir, dtype, device, qformat, kv_cache_dtype,
         print(
             "Quantized model exported to {} \nTotal time used {:.2f} s.".format(
                 export_path, end_time - start_time))
+
+
+def load_config(model_file: str):
+    """Load model config from extracted directory or '.nemo' tarball."""
+    from modelopt.torch.utils import print_rank_0
+    from omegaconf import OmegaConf
+
+    if os.path.isfile(model_file):
+        with tempfile.TemporaryDirectory() as tmp, tarfile.open(
+                model_file, "r:") as tar:
+            try:
+                tar.extract("./model_config.yaml", path=tmp)
+            except KeyError:
+                print_rank_0("File name not found, trying legacy name...")
+                tar.extract("model_config.yaml", path=tmp)
+            model_config = OmegaConf.load(os.path.join(tmp,
+                                                       "model_config.yaml"))
+    elif os.path.isdir(model_file):
+        model_config = OmegaConf.load(
+            os.path.join(model_file, "model_config.yaml"))
+    else:
+        raise FileNotFoundError(model_file)
+
+    return model_config
+
+
+def save_artifacts(model, output_dir: str, use_abspath: bool = False) -> None:
+    """Save all model artifacts and tokenizer config to a given output directory."""
+    from modelopt.torch.utils import print_rank_0
+    from nemo.utils import AppState
+    from omegaconf import OmegaConf
+
+    app_state = AppState()
+    model_file = app_state.model_restore_path
+    model_cfg = copy.deepcopy(model.cfg)
+    if not hasattr(model, "artifacts"):
+        if hasattr(model_cfg, "tokenizer"):
+            OmegaConf.save(model_cfg.tokenizer,
+                           os.path.join(output_dir, "tokenizer_config.yaml"))
+        return
+
+    # Setup model file handling context: directory or tarball
+    if os.path.isfile(model_file):
+        model_file_handler = tarfile.open
+        kwargs = {"name": model_file, "mode": "r:"}
+    elif os.path.isdir(model_file):
+        model_file_handler = contextlib.nullcontext
+        kwargs = {}
+    else:
+        raise FileNotFoundError(model_file)
+
+    # Copy or extract artifacts depending on the context
+    with model_file_handler(**kwargs) as maybe_tar:
+        for arti_name, arti_item in model.artifacts.items():
+            _, arti_file = arti_item.path.split("nemo:")
+            arti_path = os.path.join(output_dir, arti_name)
+            if maybe_tar is not None:
+                try:
+                    maybe_tar.extract(f"./{arti_file}", path=output_dir)
+                except KeyError:
+                    print_rank_0("File name not found, trying legacy name...")
+                    maybe_tar.extract(f"{arti_file}", path=output_dir)
+                os.rename(os.path.join(output_dir, arti_file), arti_path)
+            else:
+                shutil.copy(os.path.join(model_file, arti_file), arti_path)
+            # Store artifact path as basename by default. Otherwise save absolute path but bear in mind
+            # that in this case output directory should be permanent for correct artifact recovery later
+            arti_path = os.path.abspath(
+                arti_path) if use_abspath else os.path.basename(arti_path)
+            OmegaConf.update(model_cfg, arti_name, arti_path)
+
+    if hasattr(model_cfg, "tokenizer"):
+        OmegaConf.save(model_cfg.tokenizer,
+                       os.path.join(output_dir, "tokenizer_config.yaml"))
+
+
+def unwrap_model(model, module_instances=None):
+    from megatron.core import DistributedDataParallel as DDP
+    from megatron.core.transformer.module import Float16Module
+
+    if module_instances is None:
+        module_instances = (DDP, Float16Module)
+
+    return_list = True
+    if not isinstance(model, list):
+        model = [model]
+        return_list = False
+    unwrapped_model = []
+    for model_module in model:
+        while isinstance(model_module, module_instances):
+            model_module = model_module.module
+        unwrapped_model.append(model_module)
+    if not return_list:
+        return unwrapped_model[0]
+    return unwrapped_model
+
+
+def get_nemo_calib_dataloader(data="cnn_dailymail",
+                              batch_size=64,
+                              calib_size=512,
+                              max_sequence_length=512):
+    if data == "pileval":
+        dataset = load_dataset(
+            "json",
+            data_files="https://the-eye.eu/public/AI/pile/val.jsonl.zst",
+            split="train")
+        text_column = "text"
+    elif data == "wikitext":
+        dataset = load_dataset("wikitext", "wikitext-103-v1", split="train")
+        text_column = "text"
+    elif data == "cnn_dailymail":
+        dataset = load_dataset("cnn_dailymail", name="3.0.0", split="train")
+        text_column = "article"
+    calib_size = max(min(len(dataset), calib_size), batch_size)
+    for i in range(calib_size // batch_size):
+        batch = dataset[i * batch_size:(i + 1) * batch_size][text_column]
+        for j in range(len(batch)):
+            batch[j] = batch[j][:max_sequence_length]
+        yield batch
+
+
+def quantize_nemo_and_export(*, nemo_ckpt_path, decoder_type, calib_dataset,
+                             calib_tp_size, calib_pp_size, dtype, qformat,
+                             kv_cache_dtype, calib_size, batch_size,
+                             calib_max_seq_length, awq_block_size, output_dir,
+                             tp_size, pp_size, seed):
+    try:
+        import modelopt  # noqa
+    except ImportError as e:
+        logger.error(
+            "Failed to import modelopt, pls check the modelopt installation. Currently it is known to be unsupported on Windows OS"
+        )
+        raise e
+
+    import modelopt.torch.quantization as atq
+    from megatron.core import parallel_state
+    from megatron.core.transformer.module import Float16Module
+    from modelopt.torch.export import export_tensorrt_llm_checkpoint
+    from modelopt.torch.utils import print_rank_0
+    from nemo.collections.nlp.models.language_modeling.megatron_gpt_model import \
+        MegatronGPTModel
+    from nemo.collections.nlp.parts.nlp_overrides import (
+        NLPDDPStrategy, NLPSaveRestoreConnector)
+    from omegaconf.omegaconf import open_dict
+    from pytorch_lightning.trainer.trainer import Trainer
+
+    if not torch.cuda.is_available():
+        raise EnvironmentError("GPU is required for the inference.")
+
+    random.seed(seed)
+    np.random.seed(seed)
+
+    # dtype is used for non-quantized layers
+    supported_dtype = ["float16", "bfloat16"]
+    assert (dtype in supported_dtype
+            ), f"{dtype} not supported. Supported dtypes are {supported_dtype}"
+    torch_dtype = getattr(torch, dtype)
+
+    model_cfg = load_config(nemo_ckpt_path)
+
+    with open_dict(model_cfg):
+        model_cfg.activations_checkpoint_method = None
+        model_cfg.activations_checkpoint_granularity = None
+        model_cfg.tensor_model_parallel_size = calib_tp_size
+        model_cfg.pipeline_model_parallel_size = calib_pp_size
+        model_cfg.sequence_parallel = False
+        # Only custom modelopt spec is supported for PTQ: this custom spec is largely based on local Megatron-LM
+        # layer definitions to avoid Transformer Engine implementations that are currently not supported.
+        model_cfg.name = "ammo"
+
+    # trainer required for restoring model parallel models
+    trainer_config = {
+        'devices': calib_tp_size * calib_pp_size,
+        'num_nodes': 1,
+        'accelerator': 'gpu',
+        'logger': False,
+        'precision': model_cfg.precision,
+        'enable_checkpointing': False,
+    }
+    trainer = Trainer(strategy=NLPDDPStrategy(), **trainer_config)
+    connector = NLPSaveRestoreConnector()
+
+    model = MegatronGPTModel.restore_from(
+        restore_path=nemo_ckpt_path,
+        trainer=trainer,
+        override_config_path=model_cfg,
+        save_restore_connector=connector,
+    )
+    model.freeze()
+
+    print_rank_0(model)
+    # Have to turn off activations_checkpoint_method for inference
+    try:
+        model.model.module.language_model.encoder.activations_checkpoint_method = None
+    except AttributeError:
+        pass
+
+    # Check whether the DDP is initialized
+    if parallel_state.is_unitialized():
+
+        def dummy():
+            return
+
+        if model.trainer.strategy.launcher is not None:
+            model.trainer.strategy.launcher.launch(dummy, trainer=model.trainer)
+        model.trainer.strategy.setup_environment()
+
+    inference_config = {
+        'greedy': False,
+        'top_k': 0,
+        'top_p': 0.9,
+        'temperature': 1.0,
+        'add_BOS': True,
+        'tokens_to_generate': 30,
+        'all_probs': False,
+        'repetition_penalty': 1.2,
+        'min_tokens_to_generate': 0,
+        'compute_logprob': False,
+        'batch_size': batch_size,
+        'max_context_length': calib_max_seq_length,
+    }
+    model.set_inference_config(inference_config)
+
+    if qformat in ["full_prec", "int8_wo", "int4_wo"
+                   ] and kv_cache_dtype is None:
+        print_rank_0(f"No quantization applied, export {dtype} model")
+    else:
+        if "awq" in qformat:
+            if calib_size > 32:
+                print_rank_0(
+                    "AWQ calibration could take longer with calib_size ="
+                    f" {calib_size}, Using calib_size=32 instead")
+                calib_size = 32
+            print_rank_0(
+                "\nAWQ calibration could take longer than other calibration methods. Please"
+                " increase the batch size to speed up the calibration process. Batch size can be"
+                " set by adding the argument inference.batch_size=<batch_size> to the command"
+                " line.\n")
+
+        dataloader = get_nemo_calib_dataloader(
+            data=calib_dataset,
+            batch_size=batch_size,
+            calib_size=calib_size,
+            max_sequence_length=calib_max_seq_length,
+        )
+
+        # =================== Start Quantization ====================
+        if qformat in quant_cfg_choices():
+            quant_cfg = quant_cfg_choices()[qformat]
+        else:
+            raise ValueError(f"Unsupported quantization format: {qformat}")
+
+        if "awq" in qformat:
+            quant_cfg = copy.deepcopy(quant_cfg_choices()[qformat])
+            weight_quantizer = quant_cfg["quant_cfg"][
+                "*weight_quantizer"]  # type: ignore
+            if isinstance(weight_quantizer, list):
+                weight_quantizer = weight_quantizer[0]
+            weight_quantizer["block_sizes"][-1] = awq_block_size
+
+        if kv_cache_dtype is not None:
+            if kv_cache_dtype == "fp8":
+                for value in KV_CACHE_CFG.values():
+                    value.update({"num_bits": (4, 3)})  # type: ignore
+            quant_cfg["quant_cfg"].update(KV_CACHE_CFG)  # type: ignore
+
+        print_rank_0(quant_cfg)
+
+        # Always turn on FP8 kv cache to save memory footprint.
+        # For int8_sq, we use int8 kv cache.
+        # TODO: Investigate why enabling FP8 kv cache will cause accuracy regressions for nemotron.
+        # quant_cfg["quant_cfg"]["*output_quantizer"] = {  # type: ignore[index]
+        #     "num_bits": 8 if args.qformat == "int8_sq" else (4, 3),
+        #     "axis": None,
+        #     "enable": args.decoder_type != "gptnext",
+        # }
+
+        dataloader = [data for data in dataloader]
+
+        def forward_loop(model):
+            for i, batch in enumerate(dataloader):
+                print_rank_0(f"Calibrating batch {i}")
+                model.predict_step(batch, i)
+
+        start_time = time.time()
+        model = atq.quantize(model, quant_cfg,
+                             forward_loop)  # type: ignore[arg-type]
+        end_time = time.time()
+        tot_time = end_time - start_time
+        tput = calib_size / tot_time
+        print_rank_0(
+            f"Quantization done. Total time used {tot_time}s. Throughput {tput} samples/s"
+        )
+        # =================== End Quantization ======================
+
+        if decoder_type == "gptnext":
+            # We found squared_relu may have an under-calibration problem.
+            # Clamp the scaling_factor with a min threshold to avoid under-calibration.
+            maxbound = 0
+            if qformat == "fp8":
+                maxbound = 448
+            elif qformat == "int8_sq":
+                maxbound = 127
+            model = atq.postprocess_amax(
+                model, "*input_quantizer",
+                lambda amax: torch.clamp(amax, min=0.01 * maxbound))
+
+        if torch.distributed.get_rank() == 0:
+            atq.print_quant_summary(model)
+
+    if model_cfg.megatron_amp_O2:
+        model.model = unwrap_model(model.model, Float16Module)
+
+    start_time = time.time()
+    export_tensorrt_llm_checkpoint(
+        model,
+        decoder_type,
+        torch_dtype,
+        export_dir=output_dir,
+        inference_tensor_parallel=tp_size,
+        inference_pipeline_parallel=pp_size,
+    )
+
+    torch.cuda.empty_cache(
+    )  # otherwise torch is keeping using GPU, other routine like build engine has less free GPU to use
+    end_time = time.time()
+    print_rank_0(
+        f"Model config exported to: {output_dir}. Total time used {end_time - start_time}s"
+    )
+    if torch.distributed.get_rank() == 0:
+        save_artifacts(model, output_dir, use_abspath=True)

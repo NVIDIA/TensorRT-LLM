@@ -202,6 +202,20 @@ def parse_arguments():
                         default=False,
                         action='store_true',
                         help='This option will reduce the building time.')
+    parser.add_argument(
+        '--gpu_weights_percent',
+        type=str,
+        default="1.0",
+        help='Specify the percentage of weights that reside on GPU (from 0 to 1).'
+        'Multiple percentages can be separated by \";\", '
+        'example: \"0;0.5;1\".')
+    parser.add_argument(
+        '--multiple_profiles',
+        default=False,
+        action='store_true',
+        help=
+        'This option will benefit performance, but will increase the engine build time.'
+    )
 
     parser.add_argument('--csv',
                         default=False,
@@ -317,6 +331,17 @@ def main(args):
     in_out_len_options = [[int(i) for i in io.split(',')]
                           for io in in_out_len_options]
 
+    # GPU weights percentage ratios
+    gpu_weights_percents = [
+        float(r) for r in args.gpu_weights_percent.split(";")
+    ]
+    for percent in gpu_weights_percents:
+        if percent < 0 or percent > 1:
+            raise Exception(
+                f"--gpu_weights_percent only accepts values between 0.0 and 1.0."
+            )
+    args.weight_streaming = any([p != 1 for p in gpu_weights_percents])
+
     if args.serial_build and not args.build_only:
         raise Exception(
             f"--serial_build must be used with --build_only, always need to parallel build to do inference in the same process"
@@ -340,13 +365,14 @@ def main(args):
     if args.model in get_allowed_models(benchmark_type="gpt"):
         benchmark_profiler = BenchmarkProfiler()
         benchmarker = GPTBenchmark(args, batch_size_options, in_out_len_options,
-                                   rank, world_size)
+                                   gpu_weights_percents, rank, world_size)
     elif args.model in get_allowed_models(benchmark_type="bert"):
         benchmarker = BERTBenchmark(args, batch_size_options, input_len_options,
-                                    rank, world_size)
+                                    gpu_weights_percents, rank, world_size)
     elif args.model in get_allowed_models(benchmark_type="enc_dec"):
         benchmarker = EncDecBenchmark(args, batch_size_options,
-                                      in_out_len_options, rank, world_size)
+                                      in_out_len_options, gpu_weights_percents,
+                                      rank, world_size)
     else:
         raise Exception(f'Unexpected model: {args.model}')
 
@@ -361,6 +387,10 @@ def main(args):
         if isinstance(benchmarker, GPTBenchmark):
             benchmarker.check_memory(config, raise_exception=args.debug_memory)
         try:
+            if args.weight_streaming:
+                # We pass in config instead of the gpu_weights_percent here to keep this benchmark script
+                # agnostic to the length and contents of the config.
+                benchmarker.set_weight_streaming(config)
             inputs = benchmarker.prepare_inputs(config)
         except torch.cuda.OutOfMemoryError as e:
             logger.error(

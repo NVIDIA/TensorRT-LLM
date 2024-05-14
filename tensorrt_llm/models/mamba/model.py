@@ -21,8 +21,7 @@ from ..._common import default_net
 from ..._utils import str_dtype_to_trt
 from ...functional import (Tensor, arange, cast, concat, expand,
                            gather_last_token_logits, shape, unsqueeze)
-from ...layers import (Embedding, LayerNorm, Linear, Mamba, MambaParameters,
-                       RmsNorm)
+from ...layers import Embedding, LayerNorm, Linear, Mamba, RmsNorm
 from ...module import Module, ModuleList
 from ..generation_mixin import GenerationMixin
 from ..modeling_utils import PretrainedConfig, PretrainedModel
@@ -37,7 +36,10 @@ class MambaLayer(Module):
         self.last_layer = last_layer
 
         self.ssm = Mamba(config.hidden_size,
-                         **config.ssm_cfg,
+                         config.rnn_hidden_size,
+                         d_state=config.state_size,
+                         d_conv=config.conv_kernel,
+                         bias=config.use_bias,
                          dtype=config.dtype)
         if config.rms_norm:
             self.input_layernorm = RmsNorm(normalized_shape=config.hidden_size,
@@ -55,8 +57,8 @@ class MambaLayer(Module):
                 conv_state: Tensor,
                 ssm_state: Tensor,
                 host_request_types: Tensor,
-                host_context_lengths: Tensor,
                 last_token_ids: Tensor,
+                host_context_lengths: Optional[Tensor] = None,
                 slot_mapping: Optional[Tensor] = None,
                 conv_indices: Optional[Tensor] = None):
 
@@ -88,8 +90,8 @@ class MambaModel(Module):
 
     def __init__(self, config: PretrainedConfig):
         super().__init__()
-        self.d_conv = config.ssm_cfg['d_conv']
-        self.d_inner = int(config.ssm_cfg['expand'] * config.hidden_size)
+        self.d_conv = config.conv_kernel
+        self.d_inner = config.rnn_hidden_size
         n_layer = config.num_hidden_layers
         self.residual_in_fp32 = config.residual_in_fp32
         if config.vocab_size % config.pad_vocab_size_multiple != 0:
@@ -116,8 +118,8 @@ class MambaModel(Module):
                 conv_states,
                 ssm_states,
                 host_request_types,
-                host_context_lengths,
                 last_token_ids,
+                host_context_lengths,
                 slot_mapping: Optional[Tensor] = None):
         hidden_states = self.vocab_embedding(input_ids)
 
@@ -141,9 +143,8 @@ class MambaModel(Module):
         for layer, past_conv, past_ssm in zip(self.layers, conv_states,
                                               ssm_states):
             hidden_values = layer(hidden_values[0], hidden_values[1], past_conv,
-                                  past_ssm, host_request_types,
-                                  host_context_lengths, last_token_ids,
-                                  slot_mapping, indices)
+                                  past_ssm, host_request_types, last_token_ids,
+                                  host_context_lengths, slot_mapping, indices)
             present_convs.append(hidden_values[2])
             present_ssms.append(hidden_values[3])
         hidden_states = hidden_values[0]
@@ -151,7 +152,7 @@ class MambaModel(Module):
         return hidden_states, tuple(present_convs), tuple(present_ssms)
 
 
-class MambaLMHeadModel(PretrainedModel):
+class MambaForCausalLM(PretrainedModel):
 
     def __init__(self, config: PretrainedConfig):
         super().__init__(config)
@@ -163,11 +164,10 @@ class MambaLMHeadModel(PretrainedModel):
             assert isinstance(dtype, trt.DataType)
             self.dtype = dtype
 
-        self.ssm_cfg = MambaParameters(**config.ssm_cfg)
-        self.d_inner = self.ssm_cfg.expand * config.hidden_size
-        self.d_conv = self.ssm_cfg.d_conv
-        self.d_state = self.ssm_cfg.d_state
         self.config = config
+        self.d_inner = config.rnn_hidden_size
+        self.d_conv = config.conv_kernel
+        self.d_state = config.state_size
         self.gather_context_logits = False
 
         if isinstance(logits_dtype, str):
@@ -191,12 +191,12 @@ class MambaLMHeadModel(PretrainedModel):
                 conv_states,
                 ssm_states,
                 host_request_types,
-                host_context_lengths,
                 last_token_ids,
+                host_context_lengths,
                 slot_mapping: Optional[Tensor] = None):
         hidden_states, present_convs, present_ssms = self.backbone(
             input_ids, conv_states, ssm_states, host_request_types,
-            host_context_lengths, last_token_ids, slot_mapping)
+            last_token_ids, host_context_lengths, slot_mapping)
 
         if not self.gather_context_logits:
             hidden_states = gather_last_token_logits(
@@ -209,7 +209,7 @@ class MambaLMHeadModel(PretrainedModel):
             for i, present_conv in enumerate(present_convs):
                 present_conv.mark_output(f'present_conv_state_{i}', self.dtype)
             for i, present_ssm in enumerate(present_ssms):
-                present_ssm.mark_output(f'present_ssm_state_{i}', self.dtype)
+                present_ssm.mark_output(f'present_rnn_state_{i}', self.dtype)
 
         return (lm_logits, present_convs, present_ssms)
 
@@ -222,6 +222,7 @@ class MambaLMHeadModel(PretrainedModel):
             max_beam_width: int = 1,
             max_num_tokens: int = None,
             opt_num_tokens: int = None,
+            opt_batch_size: int = 0,
             prompt_embedding_table_size: int = 0,
             max_draft_len: int = 0,
             gather_context_logits: bool = False,
@@ -293,7 +294,7 @@ class MambaLMHeadModel(PretrainedModel):
                                     shape=[1],
                                     dim_range=one_dim_range)
 
-                ssm_state = Tensor(name=f'ssm_state_ptr_{i}',
+                ssm_state = Tensor(name=f'rnn_state_ptr_{i}',
                                    dtype=str_dtype_to_trt('int64'),
                                    shape=[1],
                                    dim_range=one_dim_range)
@@ -311,7 +312,7 @@ class MambaLMHeadModel(PretrainedModel):
                         shape=[-1, self.d_inner, self.d_conv - 1],
                         dim_range=conv_state_dim_range)
 
-                ssm_state = Tensor(name=f'past_ssm_state_{i}',
+                ssm_state = Tensor(name=f'past_rnn_state_{i}',
                                    dtype=self.dtype,
                                    shape=[-1, self.d_state, self.d_inner],
                                    dim_range=ssm_state_dim_range)
@@ -326,12 +327,15 @@ class MambaLMHeadModel(PretrainedModel):
             dim_range=OrderedDict([('batch_size', batch_range)]),
         )
 
-        host_context_lengths = Tensor(
-            name='host_context_lengths',
-            dtype=trt.int32,
-            shape=[-1],
-            dim_range=OrderedDict([('batch_size', batch_range)]),
-        )
+        if use_mamba_conv1d_plugin and remove_input_padding:
+            host_context_lengths = Tensor(
+                name='host_context_lengths',
+                dtype=trt.int32,
+                shape=[-1],
+                dim_range=OrderedDict([('batch_size', batch_range)]),
+            )
+        else:
+            host_context_lengths = None
 
         last_token_ids = None
         if not gather_context_logits:

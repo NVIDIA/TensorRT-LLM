@@ -42,7 +42,7 @@ public:
         bool isAirTopP = true);
     ~TopPSamplingLayer();
 
-    void setup(runtime::SizeType batchSize, runtime::SizeType beamWidth, runtime::SizeType const* batchSlots,
+    void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 const* batchSlots,
         std::shared_ptr<BaseSetupParams> setupParams) override;
     void forward(std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs) override;
 
@@ -63,7 +63,7 @@ protected:
 
     bool* mSkipDecodeDevice{nullptr};
     bool* mSkipDecodeHost{nullptr};
-    runtime::SizeType mAirTopPBlockNum{0};
+    runtime::SizeType32 mAirTopPBlockNum{0};
 
     cudaDeviceProp mDeviceProp;
     bool mIsDeterministic{true};
@@ -78,7 +78,7 @@ protected:
     using Base::mDecoderDomain;
 
 private:
-    void allocateBuffer(runtime::SizeType batchSize);
+    void allocateBuffer(runtime::SizeType32 batchSize);
     void freeBuffer();
 };
 

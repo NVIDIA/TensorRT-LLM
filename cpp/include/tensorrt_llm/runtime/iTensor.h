@@ -49,15 +49,10 @@ public:
     using UniqueConstPtr = std::unique_ptr<ITensor const>;
     using SharedConstPtr = std::shared_ptr<ITensor const>;
     using Shape = nvinfer1::Dims;
-    using DimType = std::remove_reference_t<decltype(Shape::d[0])>;
+    using DimType64 = std::remove_reference_t<decltype(Shape::d[0])>;
 
-#ifdef TRT_LLM_USE_DIM64
-    static_assert(
-        std::is_same_v<DimType, std::int64_t>, "TRT_LLM_USE_DIM64 must be defined when TRT uses int64 as DimType");
-#else
-    static_assert(
-        std::is_same_v<DimType, std::int32_t>, "TRT_LLM_USE_DIM64 must be undefined when TRT uses int32 as DimType");
-#endif
+    static_assert(std::is_same_v<DimType64, std::int64_t>, "This version of TRT-LLM requires TensorRT 10.0 or later.");
+
     ~ITensor() override = default;
 
     //!
@@ -118,7 +113,7 @@ public:
     //! \param dim The dimension that should be removed ("squeezed").
     //! \return A new shape without the unit dimension.
     //!
-    static Shape squeeze(Shape const& shape, SizeType dim);
+    static Shape squeeze(Shape const& shape, SizeType32 dim);
 
     //!
     //! \brief Add a *unit* dimension to `shape` at the specified position.
@@ -127,12 +122,12 @@ public:
     //! \param dim The dimension where unit dimension should be added.
     //! \return A new shape with the added unit dimension.
     //!
-    static Shape unsqueeze(Shape const& shape, SizeType dim);
+    static Shape unsqueeze(Shape const& shape, SizeType32 dim);
 
     //!
     //! \brief Removes the given *unit* dimensions from this tensor.
     //!
-    void squeeze(SizeType dim)
+    void squeeze(SizeType32 dim)
     {
         reshape(squeeze(getShape(), dim));
     }
@@ -140,7 +135,7 @@ public:
     //!
     //! \brief Adds a *unit* dimension at the specified position
     //!
-    void unsqueeze(SizeType dim)
+    void unsqueeze(SizeType32 dim)
     {
         reshape(unsqueeze(getShape(), dim));
     }
@@ -238,7 +233,7 @@ public:
     //!
     //! \brief A convenience function to create a tensor shape with the given dimensions.
     //!
-    static Shape makeShape(std::initializer_list<DimType> const& dims);
+    static Shape makeShape(std::initializer_list<DimType64> const& dims);
 
     //!
     //! \brief A convenience function for converting a tensor shape to a `string`.
@@ -257,7 +252,7 @@ public:
     //! \brief A convenience function to compare shapes.
     //!
     template <typename T>
-    static bool shapeEquals(Shape const& lhs, T const* dims, SizeType count)
+    static bool shapeEquals(Shape const& lhs, T const* dims, SizeType32 count)
     {
         return lhs.nbDims == count && std::equal(lhs.d, lhs.d + lhs.nbDims, dims);
     }
@@ -267,13 +262,13 @@ public:
         return shapeEquals(getShape(), other);
     }
 
-    bool shapeEquals(std::initializer_list<SizeType> const& other) const
+    bool shapeEquals(std::initializer_list<SizeType32> const& other) const
     {
         return shapeEquals(getShape(), other.begin(), other.size());
     }
 
     template <typename T>
-    bool shapeEquals(T const* dims, SizeType count) const
+    bool shapeEquals(T const* dims, SizeType32 count) const
     {
         return shapeEquals(getShape(), dims, count);
     }
@@ -281,11 +276,11 @@ public:
 protected:
     ITensor() = default;
 
-    static DimType castSize(size_t newSize)
+    static DimType64 castSize(size_t newSize)
     {
         TLLM_CHECK_WITH_INFO(
-            newSize <= std::numeric_limits<DimType>::max(), "New size is too large. Use reshape() instead.");
-        return static_cast<DimType>(newSize);
+            newSize <= std::numeric_limits<DimType64>::max(), "New size is too large. Use reshape() instead.");
+        return static_cast<DimType64>(newSize);
     }
 };
 

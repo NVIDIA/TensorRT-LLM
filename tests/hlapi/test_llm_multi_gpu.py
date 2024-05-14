@@ -1,29 +1,34 @@
 import os
+import subprocess  # nosec B404
 import sys
 import tempfile
 
 import pytest
 import torch
+from parameterized import parameterized
 
 from tensorrt_llm.hlapi.llm import LLM, KvCacheConfig, ModelConfig
 from tensorrt_llm.hlapi.tokenizer import TransformersTokenizer
-from tensorrt_llm.hlapi.utils import get_total_gpu_memory
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+from utils.util import unittest_name_func
 
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.llama.model import LLaMAForCausalLM
 
 try:
-    from .test_llm import (default_model_name, get_model_path, llama_model_path,
-                           mixtral_model_name, skip_single_gpu,
-                           test_llm_generate_async)
+    from .test_llm import (_test_llm_generate_async, default_model_name,
+                           get_model_path, llama_model_path, mixtral_model_name,
+                           prompts)
 except ImportError:
-    from test_llm import (default_model_name, get_model_path, llama_model_path,
-                          mixtral_model_name, skip_single_gpu,
-                          test_llm_generate_async)
+    from test_llm import (_test_llm_generate_async, default_model_name,
+                          get_model_path, llama_model_path, mixtral_model_name,
+                          prompts)
 
-prompts = ["A B C"]
+skip_single_gpu = pytest.mark.skipif(
+    torch.cuda.device_count() < 2,
+    reason="The test needs at least 2 GPUs, skipping")
 
 
 @pytest.fixture(scope="module")
@@ -55,18 +60,21 @@ def engine_from_checkpoint() -> tempfile.TemporaryDirectory:
 
 @pytest.fixture(scope="module")
 @skip_single_gpu
+@pytest.mark.parametrize("enable_executor", [True, False])
 def test_llm_loading_from_ckpt_for_tp2(
-        engine_from_checkpoint: tempfile.TemporaryDirectory):
+        engine_from_checkpoint: tempfile.TemporaryDirectory,
+        enable_executor: bool):
     config = ModelConfig(engine_from_checkpoint.name)
     tokenizer = TransformersTokenizer.from_pretrained(llama_model_path)
-    llm = LLM(config, tokenizer=tokenizer)
+    llm = LLM(config, tokenizer=tokenizer, enable_executor=enable_executor)
 
     sampling_config = llm.get_default_sampling_config()
     assert sampling_config is not None
+    sampling_config.max_new_tokens = 8
 
-    for output in llm.generate(prompts):
+    for output in llm.generate(prompts, sampling_config=sampling_config):
         print(output)
-        assert output.text == "<s> A B C D E F G H I J K L M N O P Q R S T U V W X Y Z\nA B C D E F G H"
+        assert output.text == "D E F G H I J K"
 
 
 @skip_single_gpu
@@ -92,7 +100,7 @@ def test_llm_generate_async_tp2(
         use_auto_parallel, engine_from_checkpoint: tempfile.TemporaryDirectory):
     model_dir = engine_from_checkpoint.name if not use_auto_parallel else default_model_name
     tokenizer = TransformersTokenizer.from_pretrained(llama_model_path)
-    test_llm_generate_async(
+    _test_llm_generate_async(
         model_dir,
         tp_size=2,
         use_auto_parallel=use_auto_parallel,
@@ -135,11 +143,68 @@ def test_llm_pp2():
         config,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
     )
-    for output in llm.generate(prompts):
-        assert output.text == "<s> A B C D E F G H I J K L M N O P Q R S T U V W X Y Z\nA B C D E F G H"
+    sampling_config = llm.get_default_sampling_config()
+    sampling_config.max_new_tokens = 8
+    for output in llm.generate(prompts, sampling_config=sampling_config):
+        print(output)
+        assert output.text == "D E F G H I J K"
+
+
+def llm_end2end_tp2_cases():
+    yield ({}, )  # Default options
+    yield ({'embedding_parallel_mode': 'NONE'}, )
+    yield ({'embedding_parallel_mode': 'SHARDING_ALONG_HIDDEN'}, )
+    yield ({
+        'embedding_parallel_mode': 'SHARDING_ALONG_VOCAB',
+        'share_embedding_table': True
+    }, )
+
+
+@skip_single_gpu
+@parameterized.expand(llm_end2end_tp2_cases(), name_func=unittest_name_func)
+def test_llm_end2end_tp2(llm_additional_options):
+    model_path = get_model_path(default_model_name)
+    config = ModelConfig(model_path)
+    config.parallel_config.tp_size = 2
+
+    llm = LLM(config, **llm_additional_options)
+
+    embedding_parallel_mode = llm_additional_options.pop(
+        'embedding_parallel_mode', 'SHARDING_ALONG_VOCAB')
+    if embedding_parallel_mode == 'NONE':
+        assert llm._convert_checkpoint_options['use_parallel_embedding'] is False
+    elif embedding_parallel_mode == 'SHARDING_ALONG_VOCAB':
+        assert llm._convert_checkpoint_options['use_parallel_embedding'] is True
+        assert llm._convert_checkpoint_options['embedding_sharding_dim'] == 0
+    elif embedding_parallel_mode == 'SHARDING_ALONG_HIDDEN':
+        assert llm._convert_checkpoint_options['use_parallel_embedding'] is True
+        assert llm._convert_checkpoint_options['embedding_sharding_dim'] == 1
+
+    if 'share_embedding_table' in llm_additional_options:
+        assert llm._convert_checkpoint_options[
+            'share_embedding_table'] == llm_additional_options.pop(
+                'share_embedding_table')
+    else:
+        assert llm._convert_checkpoint_options['share_embedding_table'] is False
+
+    assert len(llm_additional_options) == 0
+
+    sampling_config = llm.get_default_sampling_config()
+    sampling_config.max_new_tokens = 8
+    for output in llm.generate(prompts, sampling_config=sampling_config):
+        print(output)
+        assert output.text == "D E F G H I J K"
+
+
+@skip_single_gpu
+def test_llm_multi_node(engine_from_checkpoint: tempfile.TemporaryDirectory):
+    nworkers = 2
+    test_case_file = os.path.join(os.path.dirname(__file__), "run_llm.py")
+    os.path.join(os.path.dirname(__file__), "launch.py")
+    command = f"mpirun --allow-run-as-root -n {nworkers} trtllm-hlapi-launch python3 {test_case_file} --model_dir {engine_from_checkpoint.name} --tp_size {nworkers}"
+    subprocess.run(command, shell=True, check=True,
+                   env=os.environ)  # nosec B603
 
 
 if __name__ == '__main__':
-    test_llm_generate_async_tp2(use_auto_parallel=True)
-    test_llm_generate_async_tp2(use_auto_parallel=False)
     test_llm_pp2()

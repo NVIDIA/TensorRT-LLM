@@ -28,21 +28,21 @@ class WorldConfig
 {
 public:
 #if ENABLE_MULTI_DEVICE
-    static SizeType constexpr kDefaultGpusPerNode = 8;
+    static SizeType32 constexpr kDefaultGpusPerNode = 8;
 #else
-    static SizeType constexpr kDefaultGpusPerNode = 1;
+    static SizeType32 constexpr kDefaultGpusPerNode = 1;
 #endif
 
-    explicit WorldConfig(SizeType tensorParallelism = 1, SizeType pipelineParallelism = 1, SizeType rank = 0,
-        SizeType gpusPerNode = kDefaultGpusPerNode,
-        std::optional<std::vector<SizeType>> const& deviceIds = std::nullopt);
+    explicit WorldConfig(SizeType32 tensorParallelism = 1, SizeType32 pipelineParallelism = 1, SizeType32 rank = 0,
+        SizeType32 gpusPerNode = kDefaultGpusPerNode,
+        std::optional<std::vector<SizeType32>> const& deviceIds = std::nullopt);
 
-    [[nodiscard]] SizeType constexpr getSize() const noexcept
+    [[nodiscard]] SizeType32 constexpr getSize() const noexcept
     {
         return mTensorParallelism * mPipelineParallelism;
     }
 
-    [[nodiscard]] SizeType constexpr getTensorParallelism() const noexcept
+    [[nodiscard]] SizeType32 constexpr getTensorParallelism() const noexcept
     {
         return mTensorParallelism;
     }
@@ -52,7 +52,7 @@ public:
         return mTensorParallelism > 1;
     }
 
-    [[nodiscard]] SizeType constexpr getPipelineParallelism() const noexcept
+    [[nodiscard]] SizeType32 constexpr getPipelineParallelism() const noexcept
     {
         return mPipelineParallelism;
     }
@@ -62,32 +62,32 @@ public:
         return mPipelineParallelism > 1;
     }
 
-    [[nodiscard]] SizeType constexpr getRank() const noexcept
+    [[nodiscard]] SizeType32 constexpr getRank() const noexcept
     {
         return mRank;
     }
 
-    [[nodiscard]] SizeType constexpr getGpusPerNode() const noexcept
+    [[nodiscard]] SizeType32 constexpr getGpusPerNode() const noexcept
     {
         return mGpusPerNode;
     }
 
-    [[nodiscard]] SizeType getGpusPerGroup() const noexcept
+    [[nodiscard]] SizeType32 getGpusPerGroup() const noexcept
     {
-        return static_cast<SizeType>(mDeviceIds.size());
+        return static_cast<SizeType32>(mDeviceIds.size());
     }
 
-    [[nodiscard]] SizeType getDevice() const noexcept
+    [[nodiscard]] SizeType32 getDevice() const noexcept
     {
         return mDeviceIds[mRank % getGpusPerGroup()];
     }
 
-    [[nodiscard]] SizeType constexpr getPipelineParallelRank() const noexcept
+    [[nodiscard]] SizeType32 constexpr getPipelineParallelRank() const noexcept
     {
         return mRank / mTensorParallelism;
     }
 
-    [[nodiscard]] SizeType constexpr getTensorParallelRank() const noexcept
+    [[nodiscard]] SizeType32 constexpr getTensorParallelRank() const noexcept
     {
         return mRank % mTensorParallelism;
     }
@@ -103,26 +103,26 @@ public:
         return getPipelineParallelRank() == getPipelineParallelism() - 1;
     }
 
-    [[nodiscard]] SizeType constexpr getLastRank() const noexcept
+    [[nodiscard]] SizeType32 constexpr getLastRank() const noexcept
     {
         return getSize() - 1;
     }
 
-    [[nodiscard]] std::vector<SizeType> getPipelineParallelGroup() const;
+    [[nodiscard]] std::vector<SizeType32> getPipelineParallelGroup() const;
 
-    static WorldConfig mpi(SizeType gpusPerNode = kDefaultGpusPerNode,
-        std::optional<SizeType> tensorParallelism = std::nullopt,
-        std::optional<SizeType> pipelineParallelism = std::nullopt,
-        std::optional<std::vector<SizeType>> const& deviceIds = std::nullopt);
+    static WorldConfig mpi(SizeType32 gpusPerNode = kDefaultGpusPerNode,
+        std::optional<SizeType32> tensorParallelism = std::nullopt,
+        std::optional<SizeType32> pipelineParallelism = std::nullopt,
+        std::optional<std::vector<SizeType32>> const& deviceIds = std::nullopt);
 
     [[nodiscard]] bool validMpiConfig() const;
 
 private:
-    SizeType mTensorParallelism;
-    SizeType mPipelineParallelism;
-    SizeType mRank;
-    SizeType mGpusPerNode;
-    std::vector<SizeType> mDeviceIds;
+    SizeType32 mTensorParallelism;
+    SizeType32 mPipelineParallelism;
+    SizeType32 mRank;
+    SizeType32 mGpusPerNode;
+    std::vector<SizeType32> mDeviceIds;
 };
 
 } // namespace tensorrt_llm::runtime

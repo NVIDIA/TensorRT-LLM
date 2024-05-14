@@ -36,17 +36,11 @@ public:
         kRecurrentGemma = 3, // https://github.com/google-deepmind/recurrentgemma
     };
 
-    struct MambaConfig
-    {
-        SizeType dState = 0;
-        SizeType dConv = 0;
-        SizeType expand = 0;
-    };
-
     struct RnnConfig
     {
-        SizeType dConv = 0;
-        SizeType hiddenSize = 0;
+        SizeType32 stateSize = 0;
+        SizeType32 convKernel = 0;
+        SizeType32 rnnHiddenSize = 0;
     };
 
     enum class LayerType : std::int32_t
@@ -55,11 +49,11 @@ public:
         kRECURRENT,
     };
 
-    explicit ModelConfig(SizeType vocabSize, SizeType nbAttentionLayers, SizeType nbSsmLayers, SizeType nbHeads,
-        SizeType hiddenSize, nvinfer1::DataType dtype)
+    explicit ModelConfig(SizeType32 vocabSize, SizeType32 nbAttentionLayers, SizeType32 nbRnnLayers, SizeType32 nbHeads,
+        SizeType32 hiddenSize, nvinfer1::DataType dtype)
         : mVocabSize(vocabSize)
         , mNbAttentionLayers(nbAttentionLayers)
-        , mNbSsmLayers(nbSsmLayers)
+        , mNbRnnLayers(nbRnnLayers)
         , mNbHeads(nbHeads)
         , mNbKvHeads(nbHeads)
         , mHiddenSize(hiddenSize)
@@ -83,7 +77,6 @@ public:
         , mUseCustomAllReduce(false)
         , mMaxPromptEmbeddingTableSize(0)
         , mMaxDraftLen(0)
-        , mUseContextFMHAForGeneration(false)
         , mPagedContextFMHA(false)
         , mUseXQA{false}
         , mUseLoraPlugin(false)
@@ -95,54 +88,54 @@ public:
     {
     }
 
-    [[nodiscard]] SizeType constexpr getVocabSize() const noexcept
+    [[nodiscard]] SizeType32 constexpr getVocabSize() const noexcept
     {
         return mVocabSize;
     }
 
-    [[nodiscard]] SizeType constexpr getVocabSizePadded(SizeType worldSize) const noexcept
+    [[nodiscard]] SizeType32 constexpr getVocabSizePadded(SizeType32 worldSize) const noexcept
     {
         return (mVocabSize + worldSize - 1) / worldSize * worldSize;
     }
 
-    [[nodiscard]] SizeType constexpr getNbAttentionLayers(SizeType pipelineParallelism = 1) const
+    [[nodiscard]] SizeType32 constexpr getNbAttentionLayers(SizeType32 pipelineParallelism = 1) const
     {
         TLLM_CHECK(mNbAttentionLayers % pipelineParallelism == 0);
         return mNbAttentionLayers / pipelineParallelism;
     }
 
-    [[nodiscard]] SizeType constexpr getNbSsmLayers(SizeType pipelineParallelism = 1) const
+    [[nodiscard]] SizeType32 constexpr getNbRnnLayers(SizeType32 pipelineParallelism = 1) const
     {
-        TLLM_CHECK(mNbSsmLayers % pipelineParallelism == 0);
-        return mNbSsmLayers / pipelineParallelism;
+        TLLM_CHECK(mNbRnnLayers % pipelineParallelism == 0);
+        return mNbRnnLayers / pipelineParallelism;
     }
 
-    [[nodiscard]] SizeType constexpr getNbHeads() const noexcept
+    [[nodiscard]] SizeType32 constexpr getNbHeads() const noexcept
     {
         return mNbHeads;
     }
 
-    [[nodiscard]] SizeType constexpr getNbKvHeads() const noexcept
+    [[nodiscard]] SizeType32 constexpr getNbKvHeads() const noexcept
     {
         return mNbKvHeads;
     }
 
-    void constexpr setNbKvHeads(SizeType nbKvHeads) noexcept
+    void constexpr setNbKvHeads(SizeType32 nbKvHeads) noexcept
     {
         mNbKvHeads = nbKvHeads;
     }
 
-    [[nodiscard]] SizeType constexpr getHiddenSize() const noexcept
+    [[nodiscard]] SizeType32 constexpr getHiddenSize() const noexcept
     {
         return mHiddenSize;
     }
 
-    [[nodiscard]] SizeType constexpr getSizePerHead() const noexcept
+    [[nodiscard]] SizeType32 constexpr getSizePerHead() const noexcept
     {
         return mSizePerHead;
     }
 
-    void constexpr setSizePerHead(SizeType sizePerHead) noexcept
+    void constexpr setSizePerHead(SizeType32 sizePerHead) noexcept
     {
         mSizePerHead = sizePerHead;
     }
@@ -202,12 +195,12 @@ public:
         mPagedState = pagedState;
     }
 
-    [[nodiscard]] SizeType constexpr getTokensPerBlock() const noexcept
+    [[nodiscard]] SizeType32 constexpr getTokensPerBlock() const noexcept
     {
         return mTokensPerBlock;
     }
 
-    void constexpr setTokensPerBlock(SizeType TokensPerBlock) noexcept
+    void constexpr setTokensPerBlock(SizeType32 TokensPerBlock) noexcept
     {
         mTokensPerBlock = TokensPerBlock;
     }
@@ -225,55 +218,55 @@ public:
     [[nodiscard]] bool constexpr supportsInflightBatching() const noexcept
     {
         return (isTransformerBased() && mUseGptAttentionPlugin && mInputPacked && mPagedKvCache)
-            || (isSsmBased() && mUseMambaConv1dPlugin && mInputPacked && mPagedState);
+            || (isRnnBased() && mUseMambaConv1dPlugin && mInputPacked && mPagedState);
     }
 
-    [[nodiscard]] SizeType constexpr getMaxBatchSize() const noexcept
+    [[nodiscard]] SizeType32 constexpr getMaxBatchSize() const noexcept
     {
         return mMaxBatchSize;
     }
 
-    void constexpr setMaxBatchSize(SizeType maxBatchSize) noexcept
+    void constexpr setMaxBatchSize(SizeType32 maxBatchSize) noexcept
     {
         mMaxBatchSize = maxBatchSize;
     }
 
-    [[nodiscard]] SizeType constexpr getMaxBeamWidth() const noexcept
+    [[nodiscard]] SizeType32 constexpr getMaxBeamWidth() const noexcept
     {
         return mMaxBeamWidth;
     }
 
-    void constexpr setMaxBeamWidth(SizeType maxBeamWidth) noexcept
+    void constexpr setMaxBeamWidth(SizeType32 maxBeamWidth) noexcept
     {
         mMaxBeamWidth = maxBeamWidth;
     }
 
-    [[nodiscard]] SizeType constexpr getMaxInputLen() const noexcept
+    [[nodiscard]] SizeType32 constexpr getMaxInputLen() const noexcept
     {
         return mMaxInputLen;
     }
 
-    void constexpr setMaxInputLen(SizeType maxInputLen) noexcept
+    void constexpr setMaxInputLen(SizeType32 maxInputLen) noexcept
     {
         mMaxInputLen = maxInputLen;
     }
 
-    [[nodiscard]] SizeType constexpr getMaxSequenceLen() const noexcept
+    [[nodiscard]] SizeType32 constexpr getMaxSequenceLen() const noexcept
     {
         return mMaxSequenceLen;
     }
 
-    void constexpr setMaxSequenceLen(SizeType maxSequenceLen) noexcept
+    void constexpr setMaxSequenceLen(SizeType32 maxSequenceLen) noexcept
     {
         mMaxSequenceLen = maxSequenceLen;
     }
 
-    [[nodiscard]] std::optional<SizeType> constexpr getMaxNumTokens() const noexcept
+    [[nodiscard]] std::optional<SizeType32> constexpr getMaxNumTokens() const noexcept
     {
         return mMaxNumTokens;
     }
 
-    void constexpr setMaxNumTokens(std::optional<SizeType> maxNumTokens) noexcept
+    void constexpr setMaxNumTokens(std::optional<SizeType32> maxNumTokens) noexcept
     {
         mMaxNumTokens = maxNumTokens;
     }
@@ -283,12 +276,12 @@ public:
         return mMaxPromptEmbeddingTableSize > 0;
     }
 
-    [[nodiscard]] SizeType constexpr getMaxPromptEmbeddingTableSize() const noexcept
+    [[nodiscard]] SizeType32 constexpr getMaxPromptEmbeddingTableSize() const noexcept
     {
         return mMaxPromptEmbeddingTableSize;
     }
 
-    void constexpr setMaxPromptEmbeddingTableSize(SizeType maxPromptEmbeddingTableSize) noexcept
+    void constexpr setMaxPromptEmbeddingTableSize(SizeType32 maxPromptEmbeddingTableSize) noexcept
     {
         mMaxPromptEmbeddingTableSize = maxPromptEmbeddingTableSize;
     }
@@ -333,29 +326,19 @@ public:
         mUseCustomAllReduce = customAllReduce;
     }
 
-    void constexpr setMaxDraftLen(SizeType maxDraftLen) noexcept
+    void constexpr setMaxDraftLen(SizeType32 maxDraftLen) noexcept
     {
         mMaxDraftLen = maxDraftLen;
     }
 
-    [[nodiscard]] SizeType getMaxDraftLen() const
+    [[nodiscard]] SizeType32 getMaxDraftLen() const
     {
         return mMaxDraftLen;
     }
 
-    [[nodiscard]] SizeType constexpr getMaxTokensPerStep() const noexcept
+    [[nodiscard]] SizeType32 constexpr getMaxTokensPerStep() const noexcept
     {
         return mMaxDraftLen + 1;
-    }
-
-    void constexpr setUseContextFMHAForGeneration(bool useContextFMHAForGeneration) noexcept
-    {
-        mUseContextFMHAForGeneration = useContextFMHAForGeneration;
-    }
-
-    [[nodiscard]] bool constexpr getContextFMHAForGeneration() const noexcept
-    {
-        return mUseContextFMHAForGeneration;
     }
 
     void constexpr setPagedContextFMHA(bool pagedContextFMHA) noexcept
@@ -398,12 +381,12 @@ public:
         mLoraModules = loraModules;
     }
 
-    [[nodiscard]] SizeType constexpr getMlpHiddenSize() const noexcept
+    [[nodiscard]] SizeType32 constexpr getMlpHiddenSize() const noexcept
     {
         return mMlpHiddenSize;
     }
 
-    void constexpr setMlpHiddenSize(SizeType mlpHiddenSize) noexcept
+    void constexpr setMlpHiddenSize(SizeType32 mlpHiddenSize) noexcept
     {
         mMlpHiddenSize = mlpHiddenSize;
     }
@@ -438,22 +421,22 @@ public:
         mUseTokenTypeEmbedding = newTokenTypeEmbedding;
     }
 
-    [[nodiscard]] SizeType constexpr getFfnHiddenSize() const noexcept
+    [[nodiscard]] SizeType32 constexpr getFfnHiddenSize() const noexcept
     {
         return mFfnHiddenSize;
     }
 
-    void constexpr setFfnHiddenSize(SizeType ffnHiddenSize) noexcept
+    void constexpr setFfnHiddenSize(SizeType32 ffnHiddenSize) noexcept
     {
         mFfnHiddenSize = ffnHiddenSize;
     }
 
-    [[nodiscard]] SizeType constexpr getMaxLoraRank() const noexcept
+    [[nodiscard]] SizeType32 constexpr getMaxLoraRank() const noexcept
     {
         return mMaxLoraRank;
     }
 
-    void constexpr setMaxLoraRank(SizeType maxLoraRank) noexcept
+    void constexpr setMaxLoraRank(SizeType32 maxLoraRank) noexcept
     {
         mMaxLoraRank = maxLoraRank;
     }
@@ -495,26 +478,6 @@ public:
             || mModelVariant == ModelVariant::kRecurrentGemma;
     }
 
-    [[nodiscard]] bool hasMambaConfig() const noexcept
-    {
-        return mMambaConfig.has_value();
-    }
-
-    [[nodiscard]] std::optional<MambaConfig> getMambaConfig() const noexcept
-    {
-        return mMambaConfig;
-    }
-
-    void setMambaConfig(MambaConfig const& mambaConfig) noexcept
-    {
-        mMambaConfig = mambaConfig;
-    }
-
-    [[nodiscard]] bool constexpr isSsmBased() const noexcept
-    {
-        return mModelVariant == ModelVariant::kMamba || mModelVariant == ModelVariant::kRecurrentGemma;
-    }
-
     [[nodiscard]] bool hasRnnConfig() const noexcept
     {
         return mRnnConfig.has_value();
@@ -530,6 +493,11 @@ public:
         mRnnConfig = rnnConfig;
     }
 
+    [[nodiscard]] bool constexpr isRnnBased() const noexcept
+    {
+        return mModelVariant == ModelVariant::kMamba || mModelVariant == ModelVariant::kRecurrentGemma;
+    }
+
     [[nodiscard]] std::vector<LayerType> const& getLayerTypes() const noexcept
     {
         return mLayerTypes;
@@ -541,54 +509,51 @@ public:
     }
 
 private:
-    SizeType mVocabSize;
-    SizeType mNbAttentionLayers;
-    SizeType mNbSsmLayers;
-    SizeType mNbHeads;
-    SizeType mNbKvHeads;
-    SizeType mHiddenSize;
-    SizeType mSizePerHead;
+    SizeType32 mVocabSize;
+    SizeType32 mNbAttentionLayers;
+    SizeType32 mNbRnnLayers;
+    SizeType32 mNbHeads;
+    SizeType32 mNbKvHeads;
+    SizeType32 mHiddenSize;
+    SizeType32 mSizePerHead;
     nvinfer1::DataType mDataType;
     bool mUseGptAttentionPlugin;
     bool mUseMambaConv1dPlugin;
     bool mInputPacked;
     bool mPagedKvCache;
     bool mPagedState;
-    SizeType mTokensPerBlock;
+    SizeType32 mTokensPerBlock;
     common::QuantMode mQuantMode;
-    SizeType mMaxBatchSize;
-    SizeType mMaxBeamWidth;
-    SizeType mMaxInputLen;
-    SizeType mMaxSequenceLen;
-    std::optional<SizeType> mMaxNumTokens;
+    SizeType32 mMaxBatchSize;
+    SizeType32 mMaxBeamWidth;
+    SizeType32 mMaxInputLen;
+    SizeType32 mMaxSequenceLen;
+    std::optional<SizeType32> mMaxNumTokens;
 
     bool mComputeContextLogits;
     bool mComputeGenerationLogits;
     ModelVariant mModelVariant;
     bool mUseCustomAllReduce;
 
-    SizeType mMaxPromptEmbeddingTableSize;
-    SizeType mMaxDraftLen;
+    SizeType32 mMaxPromptEmbeddingTableSize;
+    SizeType32 mMaxDraftLen;
 
-    bool mUseContextFMHAForGeneration;
     bool mPagedContextFMHA;
     bool mUseXQA;
 
     bool mUseLoraPlugin;
     std::vector<LoraModule> mLoraModules;
-    SizeType mMlpHiddenSize;
-    SizeType mMaxLoraRank;
+    SizeType32 mMlpHiddenSize;
+    SizeType32 mMaxLoraRank;
 
     std::optional<MedusaModule> mMedusaModule;
-    std::optional<MambaConfig> mMambaConfig;
+    std::optional<RnnConfig> mRnnConfig;
 
     // Configs related to encoder / enc-dec models
     bool mUseCrossAttention;
     bool mUsePositionEmbedding;
     bool mUseTokenTypeEmbedding;
-    SizeType mFfnHiddenSize; // indicates encoder output hidden size
-
-    std::optional<RnnConfig> mRnnConfig;
+    SizeType32 mFfnHiddenSize; // indicates encoder output hidden size
 
     std::vector<LayerType> mLayerTypes;
 };

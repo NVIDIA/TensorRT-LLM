@@ -37,6 +37,7 @@ class IdxEntry(Enum):
     QKV_BIAS_TENSOR = auto()
     SPEC_DECODING_PACKED_MASK = auto()
     SPEC_DECODING_POSITION_OFFSETS = auto()
+    SPEC_DECODING_GENERATION_LENGTHS = auto()
 
 
 class IdxEntryParser:
@@ -116,6 +117,8 @@ class IdxEntryParser:
         elif entry == IdxEntry.SPEC_DECODING_PACKED_MASK:
             return self.is_spec_decoding_enabled
         elif entry == IdxEntry.SPEC_DECODING_POSITION_OFFSETS:
+            return self.is_spec_decoding_enabled
+        elif entry == IdxEntry.SPEC_DECODING_GENERATION_LENGTHS:
             return self.is_spec_decoding_enabled
         else:
             return False

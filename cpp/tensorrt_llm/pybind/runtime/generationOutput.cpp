@@ -52,7 +52,7 @@ std::shared_ptr<tr::GenerationOutput> GenerationOutput::toTrtLlm() const
     if (onTokenGenerated)
     {
         output->onTokenGenerated = [delegate = onTokenGenerated](
-                                       tr::GenerationOutput::TensorPtr const& ids, tr::SizeType step, bool finished)
+                                       tr::GenerationOutput::TensorPtr const& ids, tr::SizeType32 step, bool finished)
         { delegate(tr::Torch::tensor(ids), step, finished); };
     }
     return output;

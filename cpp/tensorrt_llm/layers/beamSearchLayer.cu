@@ -46,8 +46,8 @@ BeamSearchLayer<T>::~BeamSearchLayer()
 }
 
 template <typename T>
-void BeamSearchLayer<T>::setup(runtime::SizeType const batch_size, runtime::SizeType const beam_width,
-    runtime::SizeType const* batchSlots, std::shared_ptr<BaseSetupParams> baseSetupParams)
+void BeamSearchLayer<T>::setup(runtime::SizeType32 const batch_size, runtime::SizeType32 const beam_width,
+    runtime::SizeType32 const* batchSlots, std::shared_ptr<BaseSetupParams> baseSetupParams)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK_WITH_INFO(
@@ -181,7 +181,7 @@ void BeamSearchLayer<T>::forward(
 }
 
 template <typename T>
-void BeamSearchLayer<T>::allocateBuffer(runtime::SizeType const batch_size, runtime::SizeType const beam_width)
+void BeamSearchLayer<T>::allocateBuffer(runtime::SizeType32 const batch_size, runtime::SizeType32 const beam_width)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     int const nPadBeamWidth = padToNextPowerOfTwo(beam_width);

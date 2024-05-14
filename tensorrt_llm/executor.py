@@ -20,7 +20,10 @@ if ENABLE_MULTI_DEVICE:
     from mpi4py import MPI
 
 from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
-from tensorrt_llm.hlapi.mpi_session import MpiSession, find_free_port
+from tensorrt_llm.hlapi.mpi_session import (MpiPoolSession, MpiSession,
+                                            external_mpi_comm_available,
+                                            find_free_port,
+                                            need_spawn_mpi_workers)
 from tensorrt_llm.hlapi.tokenizer import TokenizerBase, tokenizer_factory
 from tensorrt_llm.hlapi.utils import (ContextManager, GenerationOutput,
                                       SamplingConfig, print_traceback_on_error)
@@ -39,11 +42,14 @@ def has_event_loop() -> bool:
 
 class GenerationRequest:
 
-    def __init__(self,
-                 ids_or_prompt: Union[torch.Tensor, np.ndarray, list, str],
-                 streaming: bool = True,
-                 tokenizer: Optional[TokenizerBase] = None,
-                 sampling_config: Optional[SamplingConfig] = None):
+    def __init__(
+        self,
+        ids_or_prompt: Union[torch.Tensor, np.ndarray, list, str],
+        streaming: bool = True,
+        tokenizer: Optional[TokenizerBase] = None,
+        sampling_config: Optional[SamplingConfig] = None,
+        # TODO[chunweiy]: Remove this flag when gptManager path is cleaned
+        exclude_input_from_output: bool = False):
         if isinstance(ids_or_prompt, str):
             assert tokenizer is not None, "GenerationRequest constructor with str prompt requires a tokenizer argument"
             self.input_ids = (tokenizer.encode(ids_or_prompt,
@@ -64,6 +70,7 @@ class GenerationRequest:
 
         self.tokenizer = tokenizer
         self.streaming = streaming
+        self.exclude_input_from_output = exclude_input_from_output
         self.sampling_config = sampling_config or SamplingConfig()
 
         self.id = -1
@@ -145,6 +152,11 @@ class GenerationRequest:
         end_id = self.tokenizer.eos_token_id if self.tokenizer is not None else None
         pad_id = self.tokenizer.pad_token_id if self.tokenizer is not None else None
         pad_id = end_id if pad_id is None else pad_id
+
+        output_config = tllme.OutputConfig()
+        # Don't repeat prompt in the generation output
+        output_config.exclude_input_from_output = self.exclude_input_from_output
+
         request_kwargs = {
             "input_token_ids": self.input_ids.squeeze().tolist(),
             "max_new_tokens": self.sampling_config.max_new_tokens or 32,
@@ -154,7 +166,7 @@ class GenerationRequest:
             "pad_id": pad_id,
             # The following options in the Executor API are not yet exposed by the HLAPI:
             # https://jirasw.nvidia.com/browse/TRTLLM-489
-            "output_config": tllme.OutputConfig(),  # TODO
+            "output_config": output_config,
             "bad_words": None,  #TODO
             "stop_words": None,  #TODO
             "embedding_bias": None,  #TODO
@@ -314,9 +326,12 @@ class GenerationExecutor(ABC):
         pass
 
     def generate_async(
-        self, prompt: Union[str, List[int], List[str], List[List[int]]],
-        streaming: bool, sampling_config: Union[SamplingConfig,
-                                                List[SamplingConfig]]
+        self,
+        prompt: Union[str, List[int], List[str], List[List[int]]],
+        streaming: bool,
+        sampling_config: Union[SamplingConfig, List[SamplingConfig]],
+        # TODO[chunweiy]: Remove this flag when gptManager path is cleaned
+        exclude_input_from_output: bool = False,
     ) -> Union[GenerationResult, List[GenerationResult]]:
         unbatched = isinstance(prompt, str) or (isinstance(prompt, list)
                                                 and isinstance(prompt[0], int))
@@ -326,10 +341,12 @@ class GenerationExecutor(ABC):
 
         if unbatched:
             results = self.submit(
-                GenerationRequest(prompt,
-                                  streaming,
-                                  tokenizer,
-                                  sampling_config=sampling_config))
+                GenerationRequest(
+                    prompt,
+                    streaming,
+                    tokenizer,
+                    sampling_config=sampling_config,
+                    exclude_input_from_output=exclude_input_from_output))
         else:
             sampling_config = [sampling_config] * len(prompt) if not isinstance(
                 sampling_config, list) else sampling_config
@@ -341,7 +358,9 @@ class GenerationExecutor(ABC):
                             p,
                             streaming,
                             tokenizer,
-                            sampling_config=sampling_config[idx])))
+                            sampling_config=sampling_config[idx],
+                            exclude_input_from_output=exclude_input_from_output)
+                    ))
         return results
 
     def generate(
@@ -349,11 +368,15 @@ class GenerationExecutor(ABC):
         prompt: Union[str, List[int], List[str], List[List[int]]],
         streaming: bool = False,
         sampling_config: Optional[Union[SamplingConfig,
-                                        List[SamplingConfig]]] = None
+                                        List[SamplingConfig]]] = None,
+        # TODO[chunweiy]: Remove this flag when gptManager path is cleaned
+        exclude_input_from_output: bool = False,
     ) -> Union[GenerationResult, List[GenerationResult]]:
-        futures = self.generate_async(prompt,
-                                      streaming=streaming,
-                                      sampling_config=sampling_config)
+        futures = self.generate_async(
+            prompt,
+            streaming=streaming,
+            sampling_config=sampling_config,
+            exclude_input_from_output=exclude_input_from_output)
         if isinstance(futures, GenerationRequest):
             futures.result()
         else:
@@ -380,14 +403,15 @@ class GenerationExecutor(ABC):
         max_beam_width: int = 1,
         executor_type: tllm.TrtGptModelType = tllm.TrtGptModelType.
         InflightFusedBatching,
-        executor_policy: tllm.SchedulerPolicy = tllm.SchedulerPolicy.
-        GUARANTEED_NO_EVICT,
+        scheduler_config: tllme.SchedulerConfig = tllme.SchedulerConfig(
+            tllme.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT),
         executor_config: tllm.TrtGptModelOptionalParams = tllm.
         TrtGptModelOptionalParams(),
         model_world_size: int = 1,
         world_size: int = 0,
         mpi_session: Optional[MpiSession] = None,
         use_executor_bindings: bool = False,
+        reuse_mpi_comm: bool = False,
     ) -> Union["GenerationExecutorProxy", "GenerationExecutorWorker",
                "ExecutorBindingsProxy", "ExecutorBindingsWorker"]:
 
@@ -405,11 +429,17 @@ class GenerationExecutor(ABC):
             "tokenizer": tokenizer,
             "max_beam_width": max_beam_width,
             "executor_type": executor_type,
-            "executor_policy": executor_policy,
+            "scheduler_config": scheduler_config,
             "executor_config": executor_config,
         }
 
-        if world_size == 1 and model_world_size > 1:
+        # The case where the Python main process is launched by mpirun
+        mpirun_launch = external_mpi_comm_available(model_world_size)
+        # The case where the Python main process utilizes mpi4py to spawn MPI workers
+        spawn_workers = need_spawn_mpi_workers(model_world_size)
+        if spawn_workers or (mpirun_launch and reuse_mpi_comm):
+            if reuse_mpi_comm:
+                assert mpi_session is not None, "reuse_mpi_comm requires an external MPI session"
             return ExecutorBindingsProxy(
                 worker_kwargs,
                 model_world_size=model_world_size,
@@ -443,8 +473,8 @@ class GenerationExecutorWorker(GenerationExecutor):
         max_beam_width: int = 1,
         executor_type: tllm.TrtGptModelType = tllm.TrtGptModelType.
         InflightFusedBatching,
-        executor_policy: tllm.SchedulerPolicy = tllm.SchedulerPolicy.
-        GUARANTEED_NO_EVICT,
+        scheduler_config: tllme.SchedulerConfig = tllme.SchedulerConfig(
+            tllme.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT),
         executor_config: tllm.TrtGptModelOptionalParams = tllm.
         TrtGptModelOptionalParams(),
     ) -> None:
@@ -487,7 +517,7 @@ class GenerationExecutorWorker(GenerationExecutor):
         self.rank = mpi_rank()
 
         self.engine = tllm.GptManager(engine_dir, executor_type, max_beam_width,
-                                      executor_policy, self.fetch_requests,
+                                      scheduler_config, self.fetch_requests,
                                       self.handle_response,
                                       self.get_cancelled_ids, self.handle_stats,
                                       executor_config,
@@ -681,7 +711,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         self._results: Dict[int, GenerationResult] = {}
 
         if mpi_session is None:
-            self.mpi_session = MpiSession(n_workers=model_world_size)
+            self.mpi_session = MpiPoolSession(n_workers=model_world_size)
         else:
             self.mpi_session = mpi_session
         self.model_world_size = model_world_size
@@ -703,8 +733,8 @@ class GenerationExecutorProxy(GenerationExecutor):
         max_beam_width: int = 1,
         executor_type: tllm.TrtGptModelType = tllm.TrtGptModelType.
         InflightFusedBatching,
-        executor_policy: tllm.SchedulerPolicy = tllm.SchedulerPolicy.
-        GUARANTEED_NO_EVICT,
+        scheduler_config: tllme.SchedulerConfig = tllme.SchedulerConfig(
+            tllme.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT),
         executor_config: tllm.TrtGptModelOptionalParams = tllm.
         TrtGptModelOptionalParams()
     ) -> None:
@@ -719,7 +749,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         try:
             executor = GenerationExecutorWorker(engine_dir, tokenizer,
                                                 max_beam_width, executor_type,
-                                                executor_policy,
+                                                scheduler_config,
                                                 executor_config)
         except Exception as e:
             error_info = f"{str(e)}\nTraceback: {traceback.format_exc()}"
@@ -835,8 +865,8 @@ class ExecutorBindingsWorker(GenerationExecutor):
         max_beam_width: int = 1,
         executor_type: tllm.TrtGptModelType = tllm.TrtGptModelType.
         InflightFusedBatching,
-        executor_policy: tllm.SchedulerPolicy = tllm.SchedulerPolicy.
-        GUARANTEED_NO_EVICT,
+        scheduler_config: tllme.SchedulerConfig = tllme.SchedulerConfig(
+            tllme.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT),
         executor_config: tllm.TrtGptModelOptionalParams = tllm.
         TrtGptModelOptionalParams(),
     ) -> None:
@@ -851,8 +881,6 @@ class ExecutorBindingsWorker(GenerationExecutor):
         self.rank = mpi_rank()
 
         # Convert config to Executor config.
-        scheduler_config = tllme.SchedulerConfig(
-            self.convert_executor_policy(executor_policy))
         config = tllme.ExecutorConfig(
             max_beam_width,
             batching_type=self.convert_executor_type(executor_type),
@@ -890,16 +918,6 @@ class ExecutorBindingsWorker(GenerationExecutor):
         }
         assert executor_type in batching_type_map, f"executor_type={executor_type} is not supported."
         return batching_type_map[executor_type]
-
-    def convert_executor_policy(self, executor_policy):
-        policy_map = {
-            tllm.SchedulerPolicy.MAX_UTILIZATION:
-            tllme.SchedulerPolicy.MAX_UTILIZATION,
-            tllm.SchedulerPolicy.GUARANTEED_NO_EVICT:
-            tllme.SchedulerPolicy.GUARANTEED_NO_EVICT,
-        }
-        assert executor_policy in policy_map, f"executor_policy={executor_policy} is not supported."
-        return policy_map[executor_policy]
 
     def convert_decoding_mode(self, decoding_mode):
         if decoding_mode.is_none():
@@ -995,7 +1013,8 @@ class ExecutorBindingsWorker(GenerationExecutor):
         if self.engine is not None:
             self.running = False
             if self.engine.can_enqueue_requests():
-                self.awaiter_thread.join()
+                if self.awaiter_thread.is_alive():
+                    self.awaiter_thread.join()
             self.engine.shutdown()
             self.engine = None
 
@@ -1065,7 +1084,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
         self._results: Dict[int, GenerationResult] = {}
 
         if mpi_session is None:
-            self.mpi_session = MpiSession(n_workers=model_world_size)
+            self.mpi_session = MpiPoolSession(n_workers=model_world_size)
         else:
             self.mpi_session = mpi_session
         self.model_world_size = model_world_size
@@ -1088,27 +1107,30 @@ class ExecutorBindingsProxy(GenerationExecutor):
         max_beam_width: int = 1,
         executor_type: tllm.TrtGptModelType = tllm.TrtGptModelType.
         InflightFusedBatching,
-        executor_policy: tllm.SchedulerPolicy = tllm.SchedulerPolicy.
-        GUARANTEED_NO_EVICT,
+        scheduler_config: tllme.SchedulerConfig = tllme.SchedulerConfig(
+            tllme.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT),
         executor_config: tllm.TrtGptModelOptionalParams = tllm.
         TrtGptModelOptionalParams()
     ) -> None:
         result_queue = None
-        executor = ExecutorBindingsWorker(engine_dir, tokenizer, max_beam_width,
-                                          executor_type, executor_policy,
-                                          executor_config)
-        if mpi_rank() == 0:
-            request_queue = Fifo(request_queue_addr, is_server=False)
-            request_id_queue = Fifo(request_id_queue_addr, is_server=False)
-            result_queue = Fifo(result_queue_addr, is_server=False)
-            result_queue.put(True)  # ack that we started
+        with ExecutorBindingsWorker(engine_dir, tokenizer, max_beam_width,
+                                    executor_type, scheduler_config,
+                                    executor_config) as executor:
 
-            executor.set_result_queue(result_queue)
-            while (req := request_queue.get()) is not None:
-                result = executor.submit(req)
-                request_id_queue.put(result.generation_request.id)
+            if mpi_rank() == 0:
+                request_queue = Fifo(request_queue_addr, is_server=False)
+                request_id_queue = Fifo(request_id_queue_addr, is_server=False)
+                result_queue = Fifo(result_queue_addr, is_server=False)
+                result_queue.put(True)  # ack that we started
 
-            result_queue.put(None)
+                executor.set_result_queue(result_queue)
+                while (req := request_queue.get()) is not None:
+                    result = executor.submit(req)
+                    request_id_queue.put(result.generation_request.id)
+
+                result_queue.put(None)
+            else:
+                executor.block_subordinates()
 
     def dispatcher_thread(self):
         """ Collect centralized results from result queue and dispatch them in the
@@ -1135,7 +1157,8 @@ class ExecutorBindingsProxy(GenerationExecutor):
         self.request_queue.put(None)
         for f in self.mpi_futures:
             f.result()
-        self.dispatcher.join()
+        if self.dispatcher.is_alive():
+            self.dispatcher.join()
         self.workers_started = False
 
     def submit(self, request: GenerationRequest) -> GenerationResult:

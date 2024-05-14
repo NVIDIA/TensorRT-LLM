@@ -1,0 +1,16 @@
+#!/bin/bash
+set -e
+
+task_with_command="${@:1}"
+native_mpi_rank=$OMPI_COMM_WORLD_RANK
+# Works with Slurm launching with `--mpi=pmix`
+mpi_rank=${PMIX_RANK:-$native_mpi_rank}
+echo "mpi_rank: $mpi_rank" >> /dev/stderr
+
+if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
+    echo "${mpi_rank} run ${task_with_command} ..." >> /dev/stderr
+    $task_with_command
+else
+    echo "${mpi_rank} launch worker ..." >> /dev/stderr
+    python3 -m tensorrt_llm.hlapi.mgmn_worker_node
+fi

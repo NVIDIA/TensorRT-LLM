@@ -52,7 +52,7 @@ private:
     void allocateIpcMemory(std::size_t bufferSize, BufferManager const& manager, WorldConfig const& worldConfig);
     void destroyIpcMemory();
 
-    SizeType mTpRank;
+    SizeType32 mTpRank;
     std::vector<void*> mCommPtrs;
     BufferPtr mBuffer;
 };
@@ -62,8 +62,8 @@ class AllReduceBuffers
 public:
     using TensorPtr = ITensor::SharedPtr;
 
-    AllReduceBuffers(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxSequenceLength, SizeType hiddenSize,
-        BufferManager const& manager, WorldConfig const& worldConfig);
+    AllReduceBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxSequenceLength,
+        SizeType32 hiddenSize, BufferManager const& manager, WorldConfig const& worldConfig);
 
     TensorPtr mAllReduceCommPtrs;
     std::vector<runtime::IpcMemory> mIpcMemoryHandles;
