@@ -4802,7 +4802,8 @@ def generate_alibi_slopes(num_heads: int,
                           tp_size: int = 1,
                           tp_rank: int = 0,
                           alibi_scale: float = 1.0,
-                          alibi_bias_max: int = 8) -> np.ndarray:
+                          alibi_bias_max: int = 8,
+                          alibi_num_heads: int = 0) -> np.ndarray:
     '''
     Compute the ALiBi slopes as described in https://arxiv.org/abs/2211.05100.
 
@@ -4815,10 +4816,14 @@ def generate_alibi_slopes(num_heads: int,
             The tensor parallelism size
         tp_rank : int
             The tensor parallelism rank
+        alibi_num_heads : int
+            The effective number of heads in case of padded num_heads
 
     Returns:
         A constant tensor that contains the ALiBi slopes.
     '''
+    if alibi_num_heads == 0:
+        alibi_num_heads = num_heads
     start_head_id = 0
     end_head_id = num_heads
 
@@ -4827,25 +4832,12 @@ def generate_alibi_slopes(num_heads: int,
         start_head_id = rank_heads * tp_rank
         end_head_id = start_head_id + rank_heads
 
-    closest_power_of_2 = 2**np.floor(np.log2(num_heads))
-    # FT's implementation
-    # https://github.com/NVIDIA/FasterTransformer/blob/main/src/fastertransformer/kernels/gen_relative_pos_bias.cu#L248
-    slopes_ft = []
-    for h_id in range(start_head_id, end_head_id):
-        if h_id < closest_power_of_2:
-            slopes_ft.append(
-                np.power(
-                    2**(-(2**-(np.log2(closest_power_of_2) -
-                               np.log2(alibi_bias_max)))), h_id + 1))
-        else:
-            slopes_ft.append(
-                np.power(
-                    2**(-(2**-(np.log2(closest_power_of_2 * 2) -
-                               np.log2(alibi_bias_max)))),
-                    (h_id - closest_power_of_2) * 2 + 1))
-    slopes = np.asarray(slopes_ft, dtype=np.float32)
-
-    slopes = alibi_scale * slopes
+    base = 2 ** (-alibi_bias_max / alibi_num_heads)
+    powers = np.arange(1, num_heads + 1)
+    slopes = np.power(base, powers, dtype=np.float32)
+    slopes[alibi_num_heads:num_heads] = 0
+    slopes = slopes[start_head_id:end_head_id]
+    slopes *= alibi_scale
     slopes = slopes.reshape(1, (end_head_id - start_head_id), 1, 1)
     return slopes
 
