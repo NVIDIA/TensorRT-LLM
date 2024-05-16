@@ -16,7 +16,7 @@ def weight_only_quantize(model,
                          current_key_name=None):
     assert quant_config.quant_mode.is_weight_only()
 
-    exclude_modules = quant_config.exclude_modules or ['lm_head', 'router']
+    exclude_modules = quant_config.exclude_modules or ['lm_head', 'router', 'medusa_heads']
 
     for name, module in model.named_children():
         if current_key_name is None:

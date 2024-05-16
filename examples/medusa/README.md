@@ -47,6 +47,21 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_medusa \
              --speculative_decoding_mode medusa \
              --max_batch_size 8
 
+# Convert and Build Medusa decoding support for vicuna-7b-v1.3 using INT8 weight-only quantization.
+python convert_checkpoint.py --model_dir ./vicuna-7b-v1.3 \
+                            --medusa_model_dir medusa-vicuna-7b-v1.3 \
+                            --output_dir ./tllm_checkpoint_1gpu_medusa_fp16_wq \
+                            --dtype float16 \
+                            --use_weight_only \
+                            --weight_only_precision int8 \
+                            --fixed_num_medusa_heads 4
+
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_medusa_fp16_wq \
+             --output_dir ./tmp/medusa/7B/trt_engines/weight-only/1-gpu/ \
+             --gemm_plugin float16 \
+             --speculative_decoding_mode medusa \
+             --max_batch_size 8
+
 # Convert and Build Medusa decoding support for vicuna-13b-v1.3 with 4-way tensor parallelism.
 python convert_checkpoint.py --model_dir ./vicuna-7b-v1.3 \
                             --medusa_model_dir medusa-vicuna-7b-v1.3 \
