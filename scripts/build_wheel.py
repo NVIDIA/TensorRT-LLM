@@ -123,8 +123,8 @@ def main(build_type: str = "Release",
                 filter(lambda x: Path(x).exists(), trt_lib_dir_candidates))
         except StopIteration:
             trt_lib_dir = trt_lib_dir_candidates[0]
-        cmake_def_args.append(f"-DTRT_LIB_DIR={trt_lib_dir}")
-        cmake_def_args.append(f"-DTRT_INCLUDE_DIR={trt_root}/include")
+        cmake_def_args.append(f'-DTRT_LIB_DIR="{trt_lib_dir}"')
+        cmake_def_args.append(f'-DTRT_INCLUDE_DIR="{trt_root}/include"')
 
     if nccl_root is not None:
         cmake_def_args.append(f"-DNCCL_LIB_DIR={nccl_root}/lib")
