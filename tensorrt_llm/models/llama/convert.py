@@ -807,7 +807,7 @@ def convert_hf_llama(hf_model,
                 rank_experts = mapping.ep_experts(moe_config.num_experts)
             for suffix in ["w1", "w2", "w3"]:
                 model_params[f'model.layers.{l}.block_sparse_moe.experts.{suffix}.weight'] = \
-                            torch.stack([model_params[f'model.layers.{l}.block_sparse_moe.experts.{expert}.{suffix}.weight'].detach()
+                            torch.stack([model_params[f'model.layers.{l}.block_sparse_moe.experts.{expert}.{suffix}.weight'].detach().cpu()
                                         for expert in rank_experts])
             w3 = model_params[
                 f'model.layers.{l}.block_sparse_moe.experts.w3.weight']
