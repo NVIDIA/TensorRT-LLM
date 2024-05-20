@@ -590,16 +590,16 @@ The `--max_attention_window_size` parameter is set to the `sliding_window` value
 python convert_checkpoint.py --model_dir ./mistral-7b-v0.1 \
                              --output_dir ./tllm_checkpoint_1gpu_mistral \
                              --dtype float16
-trtllm-build --checkpoint_dir ./tllm_checkpoint_2gpu_gptq \
-            --output_dir ./tmp/mistral/7B/trt_engines/fp16/1-gpu/ \
-            --gemm_plugin float16 \
-            --max_input_len 32256
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_mistral \
+             --output_dir ./tmp/mistral/7B/trt_engines/fp16/1-gpu/ \
+             --gemm_plugin float16 \
+             --max_input_len 32256
 
 # Run Mistral 7B fp16 inference with sliding window/cache size 4096
-python3 run.py --max_output_len=50 \
-               --tokenizer_dir ./tmp/llama/7B/ \
-               --engine_dir=./tmp/llama/7B/trt_engines/fp16/1-gpu/ \
-               --max_attention_window_size=4096
+python ../run.py --max_output_len=50 \
+                 --tokenizer_dir ./mistral-7b-v0.1 \
+                 --engine_dir=./tmp/llama/7B/trt_engines/fp16/1-gpu/ \
+                 --max_attention_window_size=4096
 ```
 
 Note that if you are comparing TRT-LLM with Huggingface,
