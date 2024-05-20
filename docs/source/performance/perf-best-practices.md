@@ -7,12 +7,12 @@ This document provides some best practices for tuning the performance of TensorR
 ## How To Measure Performance?
 
 TensorRT-LLM can be benchmarked using the included
-[C++](../../benchmarks/cpp/README.md)
+[C++](../../../benchmarks/cpp/README.md)
 and
-[Python](../../benchmarks/python/README.md) tools. However, it is *strongly*
+[Python](../../../benchmarks/python/README.md) tools. However, it is *strongly*
 recommended to use the C++ benchmarking tool. For detailed performance data and
 the steps to reproduce those results, see
-this [Document](performance.md).
+this [Document](perf-overview.md).
 The [TensorRT-LLM backend](https://github.com/triton-inference-server/tensorrtllm_backend)
 can also be used to measure the performance of TensorRT-LLM for online serving.
 
@@ -36,7 +36,7 @@ implementation that uses the `concat` operator to update the KV cache).
 
 Enabling the fused multi-head attention, during the context phase, will trigger
 a kernel that performs the MHA/MQA/GQA block using a single kernel, for more
-details, see this [Document](gpt_attention.md#context-phase).
+details, see this [Document](../advanced/gpt-attention.md#context-phase).
 
 ### Remove Input Padding
 
@@ -45,7 +45,7 @@ argument in `trtllm-build` is used to control it.
 
 When input padding is removed, the different tokens are packed together. It
 reduces both the amount of computations and memory consumption. For more details, see
-this [Document](gpt_attention.md#padded-and-packed-tensors).
+this [Document](../advanced/gpt-attention.md#padded-and-packed-tensors).
 
 ### Maximum Number of Tokens
 
@@ -90,7 +90,7 @@ Paged KV cache is enabled by default, the `--paged_kv_cache` argument in
 `trtllm-build` is used to control it.
 
 The paged KV cache helps manage memory for the KV cache more efficiently (see
-this [Document](gpt_attention.md#paged-kv-cache)). It usually leads to an
+this [Document](../advanced/gpt-attention.md#paged-kv-cache)). It usually leads to an
 increase in the batch size and an improved efficiency.
 
 ### In-flight Sequence Batching
@@ -101,7 +101,7 @@ cache are all enabled together.
 
 In-flight sequence batching schedules sequences in context phase together with
 sequences in generation phase to increase efficiency and reduce latency, see
-this [Document](gpt_attention.md#inflight-batching) for more details.
+this [Document](../advanced/gpt-attention.md#inflight-batching) for more details.
 
 ### Multi-Block Mode
 
@@ -153,7 +153,7 @@ To enable the features, use the `--use_parallel_embedding`,
 `--use_embedding_sharing`, `--use_lookup_plugin`, `--use_gemm_plugin`
 arguments, and set correct dimension to `--embedding_sharding_dim` argument
 with `trtllm-build`. See those
-[Examples](../../examples/gpt/README.md#tensor-parallelism-for-embedding-lookup-table)
+[Examples](../../../examples/gpt#embedding-parallelism-and-sharing)
 for details.
 
 ### Horizontal Fusion in Gated-MLP
@@ -199,7 +199,7 @@ recommended for the BERT model. They are enabled by default using the
 This part summarizes the runtime configuration knobs that can be tweaked to
 enhance the performance of already built engines. Note that currently the
 configurations can be modified using the
-[Batch Manager API](batch_manager.md#the-batch-manager-api)
+[Batch Manager API](../advanced/batch_manager.md#the-batch-manager-api)
 as well as the
 [TensorRT-LLM backend](https://github.com/triton-inference-server/tensorrtllm_backend).
 
@@ -246,7 +246,7 @@ inputs and outputs.
 There currently are two batch scheduler policies: `MAX_UTILIZATION` and
 `GUARANTEED_NO_EVICT`.
 
-As explained in the [GPT Manager Design](batch_manager.md#gptmanager-design)
+As explained in the [GPT Manager Design](../advanced/batch_manager.md#gptmanager-design)
 section, the scheduling policy can be set to `MAX_UTILIZATION` to pack as many
 requests as possible at each iteration of the forward loop, when in-flight
 sequence batching is enabled. It maximizes the utilization of the GPUs by
@@ -278,7 +278,7 @@ latency.
 The `max_attention_window_size` flag sets the maximum number of tokens that are
 attended to in order to generate one token when using techniques like sliding window
 attention. See this
-[Document](gpt_attention.md#sliding-window-attention-cyclic-rolling-buffer-kv-cache)
+[Document](../advanced/gpt-attention.md#sliding-window-attention-cyclic-rolling-buffer-kv-cache)
 for more details. It defaults to the maximum sequence length
 (`max_input_length + max_output_length` when building the engine), which means
 that the feature is disabled by default.
