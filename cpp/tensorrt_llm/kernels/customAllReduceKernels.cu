@@ -118,7 +118,7 @@ __inline__ __device__ void multi_gpu_barrier(uint32_t** signals, uint32_t const 
     if (tidx < world_size)
     {
         // we can think of signals having the shape [world_size, world_size]
-        // Dimension 0 is the "listening" dimension, dimension 2 is "emitting" dimension
+        // Dimension 0 is the "listening" dimension, dimension 1 is "emitting" dimension
 
         // Block 0 broadcasts its flag (local_rank on emitting dimension) to all receivers
         if (bidx == 0)
