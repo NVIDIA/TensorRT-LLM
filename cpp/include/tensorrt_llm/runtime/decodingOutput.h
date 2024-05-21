@@ -35,14 +35,14 @@ public:
     class BeamHypotheses
     {
     public:
-        // The same as cpp/tensorrt_llm/kernels/beamSearchKernels.h
+        // Keep same as cpp/tensorrt_llm/kernels/beamSearchKernels.h
         TensorPtr outputIdsCBA;       // [BS, BM*2, MSL]
-        TensorPtr sequenceLengthsCBA; // [BS, BM]
+        TensorPtr logProbsCBA;        // [BS, BM*2, MSL]
+        TensorPtr sequenceLengthsCBA; // [BS, BM*2]
         TensorPtr cumLogProbsCBA;     // [BS, BM*2]
         TensorPtr normedScoresCBA;    // [BS, BM*2]
-        TensorPtr logProbsCBA;        // [BS, BM*2, MSL]
-        TensorPtr minNormedScoresCBA; // [BS]
         TensorPtr numBeamsCBA;        // [BS]
+        TensorPtr minNormedScoresCBA; // [BS]
         TensorPtr batchDones;         // [BS]
 
         void empty(BufferManager& manager);

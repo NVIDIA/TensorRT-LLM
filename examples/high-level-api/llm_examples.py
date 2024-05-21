@@ -169,7 +169,10 @@ def run_llm_with_quantization(prompt: str, model_dir: str, quant_type: str):
     else:
         config.quant_config.quant_algo = QuantAlgo.FP8
         config.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
-        config.quant_config.exclude_modules = ["lm_head"]
+        config.quant_config.exclude_modules = [
+            'lm_head', 'router', 'vocab_embedding', 'position_embedding',
+            'block_embedding'
+        ]
 
     llm = LLM(config)
     prompts = parse_prompts(prompt, False)

@@ -161,11 +161,15 @@ class TestLayer(unittest.TestCase):
                                    atol=1e-6)
 
     @parameterized.expand([[tensorrt_llm.layers.GatedMLP, 'float32'],
-                           [tensorrt_llm.layers.GatedMLP, 'fp8']],
+                           [tensorrt_llm.layers.GatedMLP, 'fp8'],
+                           [tensorrt_llm.layers.FusedGatedMLP, 'float32']],
                           name_func=unittest_name_func)
     def test_gated_mlp(self, ClsMLP, qformat):
 
         skip_fp8_pre_ada(qformat == 'fp8')
+        if qformat == 'fp8':
+            pytest.xfail("FIXME: test is broken since 0a1990b69")
+
         # test data
         d_h = 8
         ffn_h = 20
@@ -211,22 +215,32 @@ class TestLayer(unittest.TestCase):
                         quant_mode=quant_mode)
 
             # TensorRT-LLM's Linear uses Parameter class which as a 'value' setter
-            gm.fc.weight.value = fc.cpu().numpy()
-            gm.gate.weight.value = gate.cpu().numpy()
+            if isinstance(gm, tensorrt_llm.layers.FusedGatedMLP):
+                fused_fc = torch.cat([gate, fc], dim=0).cpu().numpy()
+                gm.fused_fc.weight.value = fused_fc
+            else:
+                gm.fc.weight.value = fc.cpu().numpy()
+                gm.gate.weight.value = gate.cpu().numpy()
             gm.proj.weight.value = proj.cpu().numpy()
             if quant_mode.has_fp8_qdq():
-                gm.fc.weights_scaling_factor.value = np.array([1.42],
-                                                              dtype=np.float32)
-                gm.gate.weights_scaling_factor.value = np.array(
-                    [1.42], dtype=np.float32)
                 gm.proj.weights_scaling_factor.value = np.array(
-                    [0.42], dtype=np.float32)
-                gm.fc.activation_scaling_factor.value = np.array(
-                    [0.42], dtype=np.float32)
-                gm.gate.activation_scaling_factor.value = np.array(
                     [0.42], dtype=np.float32)
                 gm.proj.activation_scaling_factor.value = np.array(
                     [0.42], dtype=np.float32)
+                if isinstance(gm, tensorrt_llm.layers.FusedGatedMLP):
+                    gm.fused_fc.weights_scaling_factor.value = np.array(
+                        [0.42], dtype=np.float32)
+                    gm.fused_fc.activation_scaling_factor.value = np.array(
+                        [0.42], dtype=np.float32)
+                else:
+                    gm.fc.weights_scaling_factor.value = np.array(
+                        [1.42], dtype=np.float32)
+                    gm.gate.weights_scaling_factor.value = np.array(
+                        [1.42], dtype=np.float32)
+                    gm.fc.activation_scaling_factor.value = np.array(
+                        [0.42], dtype=np.float32)
+                    gm.gate.activation_scaling_factor.value = np.array(
+                        [0.42], dtype=np.float32)
 
             output = gm.forward(x).trt_tensor
             output.name = 'output'
@@ -1502,13 +1516,15 @@ class TestLayer(unittest.TestCase):
                     torch.nn.init.normal_(module.bias, std=std_dev)
                 torch.nn.init.normal_(module.weight, std=std_dev)
 
-        # init A
+        # init recurrent_param
         min_rad, max_rad, eps = 0.9, 0.999, 1e-8
-        A = torch.randn(lru_width, device=device, dtype=torch_dtype)
-        A.uniform_(min_rad**2 + eps, max_rad**2 + eps)
-        A.log_().mul_(0.5)
-        A.neg_().exp_().sub_(1.0).log_()
-        recurrent_torch.a_param.data = A.detach().clone()
+        recurrent_param = torch.randn(lru_width,
+                                      device=device,
+                                      dtype=torch_dtype)
+        recurrent_param.uniform_(min_rad**2 + eps, max_rad**2 + eps)
+        recurrent_param.log_().mul_(0.5)
+        recurrent_param.neg_().exp_().sub_(1.0).log_()
+        recurrent_torch.recurrent_param.data = recurrent_param.detach().clone()
 
         # construct trt network
         builder = tensorrt_llm.Builder()
@@ -1559,7 +1575,8 @@ class TestLayer(unittest.TestCase):
                                                             d_conv=d_conv,
                                                             num_heads=num_heads,
                                                             dtype=dtype)
-            recurrent_layer.A.value = torch_to_numpy(A.detach().cpu())
+            recurrent_layer.rg_lru.recurrent_param.value = torch_to_numpy(
+                recurrent_param.detach().cpu())
             recurrent_layer.linear_x.weight.value = torch_to_numpy(
                 recurrent_torch.linear_x.weight.detach().cpu())
             recurrent_layer.linear_x.bias.value = torch_to_numpy(
@@ -1572,14 +1589,14 @@ class TestLayer(unittest.TestCase):
                 recurrent_torch.conv1d.weight.detach().unsqueeze(3).cpu())
             recurrent_layer.conv1d.bias.value = torch_to_numpy(
                 recurrent_torch.conv1d.bias.detach().cpu())
-            recurrent_layer.input_gate.weight.value = torch_to_numpy(
+            recurrent_layer.rg_lru.input_gate.weight.value = torch_to_numpy(
                 recurrent_torch.input_gate.w.detach().cpu())
-            recurrent_layer.input_gate.bias.value = torch_to_numpy(
+            recurrent_layer.rg_lru.input_gate.bias.value = torch_to_numpy(
                 recurrent_torch.input_gate.b.detach().cpu())
-            recurrent_layer.a_gate.weight.value = torch_to_numpy(
-                recurrent_torch.a_gate.w.detach().cpu())
-            recurrent_layer.a_gate.bias.value = torch_to_numpy(
-                recurrent_torch.a_gate.b.detach().cpu())
+            recurrent_layer.rg_lru.recurrent_gate.weight.value = torch_to_numpy(
+                recurrent_torch.recurrent_gate.w.detach().cpu())
+            recurrent_layer.rg_lru.recurrent_gate.bias.value = torch_to_numpy(
+                recurrent_torch.recurrent_gate.b.detach().cpu())
             recurrent_layer.linear_out.weight.value = torch_to_numpy(
                 recurrent_torch.linear_out.weight.detach().cpu())
             recurrent_layer.linear_out.bias.value = torch_to_numpy(

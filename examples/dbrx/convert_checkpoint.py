@@ -673,9 +673,14 @@ if __name__ == '__main__':
         'rotary_base': args.rotary_base,
         'rotary_scaling': args.rotary_scaling,
         'quantization': {
-            'quant_algo': quant_algo,
-            'kv_cache_quant_algo': kv_cache_quant_algo,
-            'exclude_modules': ['lm_head'],
+            'quant_algo':
+            quant_algo,
+            'kv_cache_quant_algo':
+            kv_cache_quant_algo,
+            'exclude_modules': [
+                'lm_head', 'vocab_embedding', 'position_embedding',
+                'block_embedding'
+            ],
         },
         'moe_config': {
             "num_experts": args.moe_num_experts,

@@ -1,6 +1,12 @@
 import argparse
 import csv
 import datetime
+from pathlib import Path
+
+import tensorrt_llm
+
+trtllm_package_dir = Path(tensorrt_llm.__file__).parent
+executor_worker_path = trtllm_package_dir / 'bin' / 'executorWorker'
 
 import tensorrt_llm.bindings.executor as trtllm
 
@@ -108,6 +114,12 @@ if __name__ == "__main__":
                         default=False,
                         action="store_true",
                         help="Operate in streaming mode")
+
+    parser.add_argument("--use_orchestrator_mode",
+                        default=False,
+                        action="store_true",
+                        help="Operate in orchestrator mode for multi-GPU runs")
+
     parser.add_argument(
         "--exclude_input_from_output",
         default=False,
@@ -128,10 +140,18 @@ if __name__ == "__main__":
         help="The maximum time to wait for all responses, in milliseconds")
 
     args = parser.parse_args()
+    executor_config = trtllm.ExecutorConfig(args.beam_width)
+
+    if args.use_orchestrator_mode:
+        orchestrator_config = trtllm.OrchestratorConfig(
+            True, str(executor_worker_path))
+        executor_config.parallel_config = trtllm.ParallelConfig(
+            trtllm.CommunicationType.MPI, trtllm.CommunicationMode.ORCHESTRATOR,
+            None, None, orchestrator_config)
 
     # Create the executor.
     executor = trtllm.Executor(args.model_path, trtllm.ModelType.DECODER_ONLY,
-                               trtllm.ExecutorConfig(args.beam_width))
+                               executor_config)
 
     if executor.can_enqueue_requests():
         # Enqueue the requests

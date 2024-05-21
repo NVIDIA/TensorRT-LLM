@@ -344,7 +344,7 @@ class ModelRunnerMixin:
                 torch.Tensor), "Prompt table should be str or torch.Tensor"
             prompt_table_data = prompt_table.to(dtype=self.dtype)
 
-        return prompt_table_data.cuda()
+        return prompt_table_data
 
     def _prepare_ptuning(self, prompt_table: Union[str, torch.Tensor],
                          tasks: str, batch_size: int):
@@ -352,14 +352,7 @@ class ModelRunnerMixin:
             return {}
 
         if prompt_table is not None:
-            if isinstance(prompt_table, str):
-                prompt_table_data = numpy_to_torch(
-                    np.load(prompt_table)).to(dtype=self.dtype)
-            else:
-                assert isinstance(
-                    prompt_table,
-                    torch.Tensor), "Prompt table should be str or torch.Tensor"
-                prompt_table_data = prompt_table.to(dtype=self.dtype)
+            prompt_table_data = self._prepare_embedding_table(prompt_table)
             _, task_vocab_size, hidden_size = prompt_table_data.size()
             task_vocab_size = torch.tensor([task_vocab_size], dtype=torch.int32)
             prompt_table_data = prompt_table_data.view(-1, hidden_size)

@@ -236,7 +236,7 @@ tl::DynamicDecodeOutputParams::MedusaOutputs prepareMedusaOutputs(DecodingOutput
 
 template <typename T>
 std::shared_ptr<tl::DynamicDecodeOutputParams> prepareOutputs(
-    DecodingOutput& output, DecodingInput::TensorPtr const& inputLengths, DecodingOutput::TensorPtr& logProbsTiled)
+    DecodingOutput& output, DecodingOutput::TensorPtr& logProbsTiled)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto outputParams = std::make_shared<tl::DynamicDecodeOutputParams>(tcc::toTllmTensor(*output.ids));
@@ -280,21 +280,21 @@ std::shared_ptr<tl::DynamicDecodeOutputParams> prepareOutputs(
     }
 
     outputParams->beamHypotheses = std::make_unique<tensorrt_llm::kernels::BeamHypotheses>();
-    if (output.beamHypotheses.batchDones)
+    if (output.beamHypotheses.outputIdsCBA)
     {
-        outputParams->beamHypotheses->batchDones = bufferCast<bool>(*output.beamHypotheses.batchDones);
-    }
-    if (output.beamHypotheses.cumLogProbsCBA)
-    {
-        outputParams->beamHypotheses->cumLogProbsCBA = bufferCast<float>(*output.beamHypotheses.cumLogProbsCBA);
+        outputParams->beamHypotheses->outputIdsCBA = bufferCast<int>(*output.beamHypotheses.outputIdsCBA);
     }
     if (output.beamHypotheses.logProbsCBA)
     {
         outputParams->beamHypotheses->logProbsCBA = bufferCast<float>(*output.beamHypotheses.logProbsCBA);
     }
-    if (output.beamHypotheses.minNormedScoresCBA)
+    if (output.beamHypotheses.sequenceLengthsCBA)
     {
-        outputParams->beamHypotheses->minNormedScoresCBA = bufferCast<float>(*output.beamHypotheses.minNormedScoresCBA);
+        outputParams->beamHypotheses->sequenceLengthsCBA = bufferCast<int>(*output.beamHypotheses.sequenceLengthsCBA);
+    }
+    if (output.beamHypotheses.cumLogProbsCBA)
+    {
+        outputParams->beamHypotheses->cumLogProbsCBA = bufferCast<float>(*output.beamHypotheses.cumLogProbsCBA);
     }
     if (output.beamHypotheses.normedScoresCBA)
     {
@@ -304,17 +304,13 @@ std::shared_ptr<tl::DynamicDecodeOutputParams> prepareOutputs(
     {
         outputParams->beamHypotheses->numBeamsCBA = bufferCast<int>(*output.beamHypotheses.numBeamsCBA);
     }
-    if (output.beamHypotheses.outputIdsCBA)
+    if (output.beamHypotheses.minNormedScoresCBA)
     {
-        outputParams->beamHypotheses->outputIdsCBA = bufferCast<int>(*output.beamHypotheses.outputIdsCBA);
+        outputParams->beamHypotheses->minNormedScoresCBA = bufferCast<float>(*output.beamHypotheses.minNormedScoresCBA);
     }
-    if (output.beamHypotheses.sequenceLengthsCBA)
+    if (output.beamHypotheses.batchDones)
     {
-        outputParams->beamHypotheses->sequenceLengthsCBA = bufferCast<int>(*output.beamHypotheses.sequenceLengthsCBA);
-    }
-    if (inputLengths)
-    {
-        outputParams->beamHypotheses->inputLengths = bufferCast<int32_t>(*inputLengths);
+        outputParams->beamHypotheses->batchDones = bufferCast<bool>(*output.beamHypotheses.batchDones);
     }
 
     // Medusa
@@ -334,7 +330,7 @@ bool GptDecoder<T>::forward(DecodingOutput& output, DecodingInput const& input)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto forwardParams = prepareInputs<T>(input, mMaxBatchSize);
-    auto outputParams = prepareOutputs<T>(output, input.lengths, mLogProbsTiled);
+    auto outputParams = prepareOutputs<T>(output, mLogProbsTiled);
     auto const maxBatchSize = input.maxBatchSize;
 
     BufferManager::ITensorPtr finishedSum;
@@ -382,7 +378,7 @@ void GptDecoder<T>::forwardAsync(DecodingOutput& output, DecodingInput const& in
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto forwardParams = prepareInputs<T>(input, mMaxBatchSize);
-    auto outputParams = prepareOutputs<T>(output, input.lengths, mLogProbsTiled);
+    auto outputParams = prepareOutputs<T>(output, mLogProbsTiled);
 
     mDynamicDecodeLayer->forward(outputParams, forwardParams);
 
@@ -419,15 +415,39 @@ void GptDecoder<T>::gatherTree(ITensor& finalOutputIds, DecodingOutput const& de
         bufferCast<TokenIdType>(*decodingInput.endIds), batchSize * beamWidth, maxSeqLength, stream);
     sync_check_cuda_error();
 
+    // Prepare length penalty, use the value from mSamplingConfig or 1.0f by default
+    std::vector<float> lengthPenaltyVec;
+    TensorPtr lengthPenaltyPtr
+        = std::shared_ptr(manager.gpu(ITensor::makeShape({batchSize}), TRTDataType<float>::value));
+    if (!mSamplingConfig.lengthPenalty.has_value() || mSamplingConfig.lengthPenalty.value().size() == 0)
+    {
+        lengthPenaltyVec = std::vector<float>(batchSize, 1.0f);
+    }
+    else if (long int const size = mSamplingConfig.lengthPenalty.value().size(); size == 1)
+    {
+        lengthPenaltyVec = std::vector<float>(batchSize, mSamplingConfig.lengthPenalty.value()[0]);
+    }
+    else
+    {
+        TLLM_CHECK_WITH_INFO(size == batchSize,
+            common::fmtstr("Size of lengthPenalty in SimplingConfig (" FMT_DIM ") is different from batchSize (" FMT_DIM
+                           ")",
+                size, batchSize));
+        lengthPenaltyVec = mSamplingConfig.lengthPenalty.value();
+    }
+
+    lengthPenaltyPtr = manager.copyFrom(lengthPenaltyVec, ITensor::makeShape({batchSize}), runtime::MemoryType::kGPU);
+
     tensorrt_llm::kernels::BeamHypotheses bh;
+    bh.nMaxBatchSize = batchSize;
     bh.nBatchSize = batchSize;
     bh.nBeamWidth = beamWidth;
     bh.nMaxSeqLen = maxSeqLength;
-    bh.lengthPenalties = nullptr; // TODO (bhsueh): A gpu tensor used in invokeInsertUnfinishedPath
-                                  // default value (1.0f) will be used when it is nullptr
+    bh.lengthPenalties = bufferCast<float>(*lengthPenaltyPtr);
     bh.inputLengths = bufferCast<SizeType32>(*decodingInput.lengths);
     bh.outputIds = bufferCast<TokenIdType>(finalOutputIds);
-    bh.logProbs = bufferCast<float>(*mLogProbsTiled);
+    bh.logProbs = (decodingOutput.logProbs == nullptr) ? nullptr : bufferCast<float>(*decodingOutput.logProbs);
+    bh.logProbsTiled = bufferCast<float>(*mLogProbsTiled);
     bh.sequenceLengths = bufferCast<SizeType32>(*decodingOutput.lengths);
     bh.cumLogProbs = bufferCast<float>(*decodingOutput.cumLogProbs);
     bh.outputIdsCBA = bufferCast<TokenIdType>(*decodingOutput.beamHypotheses.outputIdsCBA);

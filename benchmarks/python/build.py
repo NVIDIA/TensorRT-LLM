@@ -220,6 +220,8 @@ def get_quant_config(quantization: str):
     elif quantization == "int8_sq_per_token_channel":
         return QuantConfig(
             quant_algo=QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN)
+    elif quantization == "int8_sq_per_channel_ootb":
+        return QuantConfig(quant_algo=QuantAlgo.W8A8_SQ_PER_CHANNEL)
     elif quantization == "int8_weight_only":
         return QuantConfig(quant_algo=QuantAlgo.W8A16)
     elif quantization == "int4_weight_only":

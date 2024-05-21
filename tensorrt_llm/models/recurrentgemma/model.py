@@ -21,10 +21,11 @@ from ..._common import default_net
 from ..._utils import str_dtype_to_trt
 from ...functional import (Tensor, arange, concat, expand,
                            gather_last_token_logits, shape, tanh, unsqueeze)
-from ...layers import (Attention, AttentionMaskType, AttentionParams, Embedding,
-                       GatedMLP, KeyValueCacheParams, Linear,
+from ...layers import (Attention, AttentionMaskType, AttentionParams,
+                       ColumnLinear, Embedding, GatedMLP, KeyValueCacheParams,
                        PositionEmbeddingType, Recurrent, RmsNorm)
 from ...module import Module, ModuleList
+from ...plugin import current_all_reduce_helper
 from ..generation_mixin import GenerationMixin
 from ..modeling_utils import PretrainedConfig, PretrainedModel
 
@@ -42,31 +43,29 @@ class ResidualLayer(Module):
                                        dtype=config.dtype)
 
         if self.temporal_block_type == 'recurrent':
-            self.temporal_block = Recurrent(
-                width=config.hidden_size,
-                lru_width=config.rnn_hidden_size,
-                d_conv=config.conv_kernel,
-                num_heads=config.num_attention_heads,
-                dtype=config.dtype,
-                tp_group=config.mapping.tp_group,
-                tp_size=config.mapping.tp_size,
-                tp_rank=config.mapping.tp_rank)
+            self.recurrent = Recurrent(width=config.hidden_size,
+                                       lru_width=config.rnn_hidden_size,
+                                       d_conv=config.conv_kernel,
+                                       num_heads=config.num_attention_heads,
+                                       dtype=config.dtype,
+                                       tp_group=config.mapping.tp_group,
+                                       tp_size=config.mapping.tp_size,
+                                       tp_rank=config.mapping.tp_rank)
         elif self.temporal_block_type == 'attention':
             layer_types = config.layer_types * (
                 (layer_idx + 1) // layer_type_len)
             layer_types = layer_types + config.layer_types[0:(
                 (layer_idx + 1) % layer_type_len)]
             attention_layer_idx = layer_types.count('attention') - 1
-            self.temporal_block = Attention(
+            self.attention = Attention(
                 local_layer_idx=attention_layer_idx,
                 hidden_size=config.hidden_size,
                 num_attention_heads=config.num_attention_heads,
                 num_kv_heads=config.num_key_value_heads,
-                max_position_embeddings=config.max_position_embeddings,
                 dtype=config.dtype,
                 attention_mask_type=AttentionMaskType.causal,
                 position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
-                rotary_embedding_percentage=config.rotary_percentage,
+                rotary_embedding_percentage=config.rotary_pct,
                 tp_group=config.mapping.tp_group,
                 tp_size=config.mapping.tp_size,
                 tp_rank=config.mapping.tp_rank,
@@ -109,7 +108,7 @@ class ResidualLayer(Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         if self.temporal_block_type == 'recurrent':
-            temporal_output, present_conv, present_lru = self.temporal_block(
+            temporal_output, present_conv, present_lru = self.recurrent(
                 hidden_states,
                 conv_state=conv_state,
                 lru_state=lru_state,
@@ -123,7 +122,7 @@ class ResidualLayer(Module):
             present_conv, present_lru = None, None
 
         if self.temporal_block_type == 'attention':
-            temporal_output, present_kv = self.temporal_block(
+            temporal_output, present_kv = self.attention(
                 hidden_states,
                 attention_mask=attention_mask,
                 use_cache=use_cache,
@@ -156,9 +155,9 @@ class RecurrentGemmaModel(Module):
         self.layers = ModuleList(
             [ResidualLayer(config, layer_idx=i) for i in range(n_layer)])
 
-        self.norm_f = RmsNorm(normalized_shape=config.hidden_size,
-                              eps=config.norm_epsilon,
-                              dtype=config.dtype)
+        self.ln_f = RmsNorm(normalized_shape=config.hidden_size,
+                            eps=config.norm_epsilon,
+                            dtype=config.dtype)
 
     def forward(self,
                 input_ids,
@@ -223,7 +222,7 @@ class RecurrentGemmaModel(Module):
             present_convs.append(present_conv)
             present_lrus.append(present_lru)
 
-        hidden_states = self.norm_f(hidden_states)
+        hidden_states = self.ln_f(hidden_states)
         return hidden_states, tuple(present_kvs), tuple(present_convs), tuple(
             present_lrus)
 
@@ -258,15 +257,14 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
             assert isinstance(logits_dtype, trt.DataType)
             self._logits_dtype = logits_dtype
 
-        self.backbone = RecurrentGemmaModel(config)
-        self.lm_head = Linear(config.hidden_size,
-                              config.vocab_size,
-                              bias=False,
-                              dtype=dtype,
-                              gather_output=False)
-
-    def __post_init__(self):
-        return
+        self.transformer = RecurrentGemmaModel(config)
+        self.lm_head = ColumnLinear(config.hidden_size,
+                                    config.vocab_size,
+                                    bias=False,
+                                    dtype=dtype,
+                                    tp_group=config.mapping.tp_group,
+                                    tp_size=config.mapping.tp_size,
+                                    gather_output=True)
 
     def forward(self,
                 input_ids,
@@ -282,7 +280,7 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
                 last_token_ids_for_logits=None,
                 host_context_lengths=None,
                 slot_mapping=None):
-        hidden_states, present_kvs, present_convs, present_rnns = self.backbone(
+        hidden_states, present_kvs, present_convs, present_rnns = self.transformer(
             input_ids, use_cache, attention_mask, kv_cache_params,
             attention_params, conv_states, rnn_states, host_request_types,
             last_token_ids, host_context_lengths, slot_mapping)
@@ -431,6 +429,8 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
         streamingllm = default_net().plugin_config.streamingllm
         use_mamba_conv1d_plugin = default_net(
         ).plugin_config.mamba_conv1d_plugin
+        use_custom_all_reduce = default_net(
+        ).plugin_config.use_custom_all_reduce
 
         self.gather_context_logits = gather_context_logits
         mapping = self.config.mapping
@@ -512,6 +512,9 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
                                       ('position_ids_inlen_range',
                                        position_ids_inlen_range),
                                   ]))
+        if use_custom_all_reduce and mapping.tp_size > 1:
+            current_all_reduce_helper().set_workspace_tensor(
+                mapping, num_profiles)
 
         # attention inputs
         num_attention_layers = self.layer_types.count('attention')

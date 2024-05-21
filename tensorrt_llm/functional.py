@@ -2321,7 +2321,8 @@ def softmax(input: Tensor, dim: Optional[int] = None) -> Tensor:
     return _create_tensor(layer.get_output(0), layer)
 
 
-def _lookup_plugin(input: Tensor, weight: Tensor, rank: int) -> Tensor:
+def _lookup_plugin(input: Tensor, weight: Tensor, rank: int,
+                   per_token_scale: Tensor) -> Tensor:
     '''
     Add an operation to perform lookup in a tensor.
 
@@ -2360,6 +2361,9 @@ def _lookup_plugin(input: Tensor, weight: Tensor, rank: int) -> Tensor:
     pfc = trt.PluginFieldCollection([pf_type, rank])
     lookup_plug = plg_creator.create_plugin("lookup", pfc)
     plug_inputs = [input.trt_tensor, weight.trt_tensor]
+    if per_token_scale is not None:
+        plug_inputs.append(per_token_scale.trt_tensor)
+        weight.trt_tensor.set_dynamic_range(-127, 127)
     layer = default_trtnet().add_plugin_v2(plug_inputs, lookup_plug)
     _add_plugin_info(layer, plg_creator, "lookup", pfc)
     return _create_tensor(layer.get_output(0), layer)
@@ -2370,7 +2374,8 @@ def embedding(input: Tensor,
               tp_size=1,
               tp_group=None,
               sharding_dim=0,
-              tp_rank=None) -> Tensor:
+              tp_rank=None,
+              per_token_scale=None) -> Tensor:
     '''
     Add an operation to perform embedding lookup.
 
@@ -2433,7 +2438,7 @@ def embedding(input: Tensor,
                     "Rank cannot be none for tensor parallelism on vocab dim")
 
             if default_net().plugin_config.lookup_plugin:
-                x = _lookup_plugin(input, weight, tp_rank)
+                x = _lookup_plugin(input, weight, tp_rank, per_token_scale)
                 x = allreduce(x, tp_group)
             else:
                 shape_weight = shape(weight)
@@ -2477,7 +2482,10 @@ def embedding(input: Tensor,
     # Store embedding lookup table as a whole
     else:
         if default_net().plugin_config.lookup_plugin:
-            x = _lookup_plugin(input, weight, rank=0)
+            x = _lookup_plugin(input,
+                               weight,
+                               rank=0,
+                               per_token_scale=per_token_scale)
         else:
             layer = default_trtnet().add_gather(weight.trt_tensor,
                                                 input.trt_tensor, 0)

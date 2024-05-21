@@ -508,6 +508,7 @@ class PipelineGraph:
         if prefix is not None:
             layer_name = prefix + layer_name
         new_layer.name = layer_name
+        new_layer.metadata = new_layer.name
         if layer.precision_is_set:
             new_layer.precision = layer.precision
         for i in range(layer.num_outputs):

@@ -229,6 +229,8 @@ class FusedGatedMLP(Module):
 
         if self.hidden_act == 'silu':
             inter = ACT2FN['swiglu'](inter)
+        elif self.hidden_act == 'gelu':
+            inter = ACT2FN['geglu'](inter)
         else:
             raise NotImplementedError(
                 f"Activation {self.hidden_act} not yet implemented for FusedGatedMLP"

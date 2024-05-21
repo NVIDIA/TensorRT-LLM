@@ -720,19 +720,22 @@ class LoraManager(object):
                 lora_ranks_ = []
                 lora_ptrs_ = []
                 for lora_uid in lora_uids:
-                    if (lora_uid != "-1"
-                            and layer_idx in self.uid_to_low_ranks(lora_uid)
-                            and self.uid_to_low_ranks(
-                                lora_uid)[layer_idx][lora_module] != 0):
-                        lora_ranks_.append(
-                            self.uid_to_low_ranks(lora_uid)[layer_idx]
-                            [lora_module])
-                        lora_ptrs_.append(
-                            self.lora_weights_pointers_list[lora_uid][layer_idx]
-                            [lora_module])
-                    else:
-                        lora_ranks_.append(0)
-                        lora_ptrs_.append([0, 0])
+                    lora_rank = 0
+                    lora_ptrs = [0, 0]
+
+                    if lora_uid != "-1":
+                        low_ranks = self.uid_to_low_ranks(lora_uid)
+
+                        if (layer_idx in low_ranks
+                                and lora_module in low_ranks[layer_idx].keys()
+                                and low_ranks[layer_idx][lora_module] != 0):
+
+                            lora_rank = low_ranks[layer_idx][lora_module]
+                            lora_ptrs = self.lora_weights_pointers_list[
+                                lora_uid][layer_idx][lora_module]
+
+                    lora_ranks_.append(lora_rank)
+                    lora_ptrs_.append(lora_ptrs)
 
                 inputs[
                     f'{lora_module}_lora_ranks_{layer_idx}'] = torch.IntTensor(

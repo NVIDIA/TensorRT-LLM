@@ -20,6 +20,7 @@
 #include "tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm_configs.h"
 #include <cuda_runtime_api.h>
 #include <optional>
+#include <vector>
 
 #include <cutlass/gemm/group_array_problem_shape.hpp>
 
@@ -167,8 +168,9 @@ public:
         cudaStream_t stream);
 
     std::vector<cutlass_extensions::CutlassGemmConfig> getConfigs() const;
-    std::vector<cutlass_extensions::CutlassGemmConfig> getHopperConfigs() const;
-    std::vector<cutlass_extensions::CutlassGemmConfig> getAmpereConfigs() const;
+    static std::vector<cutlass_extensions::CutlassGemmConfig> getConfigs(int sm);
+    static std::vector<cutlass_extensions::CutlassGemmConfig> getHopperConfigs(int sm);
+    static std::vector<cutlass_extensions::CutlassGemmConfig> getAmpereConfigs(int sm);
 
     bool isHopperSpecialised() const;
     bool supportsHopperSpecialisation() const;

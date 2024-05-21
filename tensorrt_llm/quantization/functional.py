@@ -70,17 +70,21 @@ def weight_only_quant_matmul(input: Tensor,
                              weights: Tensor,
                              scales: Tensor,
                              weightTypeId: int,
-                             dtype: str = 'float16') -> Tensor:
+                             dtype: str = 'float16',
+                             transa: bool = False,
+                             transb: bool = False) -> Tensor:
 
-    if not default_net().plugin_config.weight_only_quant_matmul_plugin:
+    if not default_net(
+    ).plugin_config.weight_only_quant_matmul_plugin or transa or transb:
+        scale_axis = 0 if transb else 1
         if weights.dtype != trt.int8:
             # Q->DQ
             weights = quantize(weights, scales, dtype='int8', axis=1)
-            weights = dequantize(weights, scales, 1, input.dtype)
+            weights = dequantize(weights, scales, scale_axis, input.dtype)
         else:
-            weights = dequantize(weights, scales, 1, input.dtype)
+            weights = dequantize(weights, scales, scale_axis, input.dtype)
 
-        res = matmul(input, weights)
+        res = matmul(input, weights, transa=transa, transb=transb)
         return cast(res, dtype)
     else:
         plg_creator = trt.get_plugin_registry().get_plugin_creator(

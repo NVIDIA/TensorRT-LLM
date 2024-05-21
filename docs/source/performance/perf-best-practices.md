@@ -153,7 +153,7 @@ To enable the features, use the `--use_parallel_embedding`,
 `--use_embedding_sharing`, `--use_lookup_plugin`, `--use_gemm_plugin`
 arguments, and set correct dimension to `--embedding_sharding_dim` argument
 with `trtllm-build`. See those
-[Examples](../../../examples/gpt#embedding-parallelism-and-sharing)
+[Examples](../../../examples/gpt/README.md#embedding-parallelism-and-sharing)
 for details.
 
 ### Horizontal Fusion in Gated-MLP
@@ -199,7 +199,7 @@ recommended for the BERT model. They are enabled by default using the
 This part summarizes the runtime configuration knobs that can be tweaked to
 enhance the performance of already built engines. Note that currently the
 configurations can be modified using the
-[Batch Manager API](../advanced/batch_manager.md#the-batch-manager-api)
+[Batch Manager API](../advanced/batch-manager.md#the-batch-manager-api)
 as well as the
 [TensorRT-LLM backend](https://github.com/triton-inference-server/tensorrtllm_backend).
 
@@ -246,7 +246,7 @@ inputs and outputs.
 There currently are two batch scheduler policies: `MAX_UTILIZATION` and
 `GUARANTEED_NO_EVICT`.
 
-As explained in the [GPT Manager Design](../advanced/batch_manager.md#gptmanager-design)
+As explained in the [GPT Manager Design](../advanced/batch-manager.md#gptmanager-design)
 section, the scheduling policy can be set to `MAX_UTILIZATION` to pack as many
 requests as possible at each iteration of the forward loop, when in-flight
 sequence batching is enabled. It maximizes the utilization of the GPUs by

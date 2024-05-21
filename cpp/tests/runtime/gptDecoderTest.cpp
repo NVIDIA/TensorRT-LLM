@@ -77,6 +77,10 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
         = std::shared_ptr(manager.copyFrom(endIdsVec, ITensor::makeShape({batchSize, beamWidth}), MemoryType::kGPU));
 
     DecodingInput inputs{maxInputLength, maxSeqLength, sinkTokenLength, batchSize, logits, endIds};
+
+    std::vector<std::int32_t> inputLengthsVec(batchSize * beamWidth, 0);
+    inputs.lengths = manager.copyFrom(inputLengthsVec, ITensor::makeShape({batchSize * beamWidth}), MemoryType::kGPU);
+
     std::vector<std::int32_t> sequenceLimitLengthsVec(batchSize, maxSeqLength);
     inputs.sequenceLimitLength
         = manager.copyFrom(sequenceLimitLengthsVec, ITensor::makeShape({batchSize}), MemoryType::kGPU);

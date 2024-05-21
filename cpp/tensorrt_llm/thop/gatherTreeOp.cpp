@@ -34,6 +34,8 @@ th::Tensor gatherTree(                                    // BS: batch_size, BM:
     th::Tensor& end_ids,                                  // [BS*BM], int
     th::Tensor& tiled_input_lengths,                      // [BS*BM], int
     th::optional<th::Tensor> cum_log_probs_opt,           // [BS, BM], float
+    th::optional<th::Tensor> log_probs_opt,               // [BS, BM, MSL], float
+    th::optional<th::Tensor> log_probs_tiled_opt,         // [MSL, BS, BM], float, transpose of output_log_probs_opt
     th::optional<th::Tensor> beam_hyps_output_ids_cba,    // [BS, BM*2, MSL], int
     th::optional<th::Tensor> beam_hyps_seq_len_cba,       // [BS, BM*2], int
     th::optional<th::Tensor> beam_hyps_cum_log_probs_cba, // [BS, BM*2], float
@@ -66,7 +68,8 @@ th::Tensor gatherTree(                                    // BS: batch_size, BM:
         bh.lengthPenalties = get_ptr<float>(length_penalty);
         bh.inputLengths = get_ptr<int32_t>(tiled_input_lengths);
         bh.outputIds = final_output_ids_ptr;
-        bh.logProbs = nullptr; //  TODO (wili): add this output?
+        bh.logProbs = log_probs_opt.has_value() ? get_ptr<float>(log_probs_opt.value()) : nullptr;
+        bh.logProbsTiled = log_probs_tiled_opt.has_value() ? get_ptr<float>(log_probs_tiled_opt.value()) : nullptr;
         bh.sequenceLengths = get_ptr<int32_t>(sequence_lengths);
         bh.cumLogProbs = cum_log_probs_opt.has_value() ? get_ptr<float>(cum_log_probs_opt.value()) : nullptr;
         bh.outputIdsCBA = get_ptr<int32_t>(beam_hyps_output_ids_cba.value());

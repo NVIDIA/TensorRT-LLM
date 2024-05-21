@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/executor/executor.h"
@@ -45,6 +46,11 @@ int main(int argc, char* argv[])
         TLLM_LOG_ERROR("Parent size is %d, must be 1", size);
         return -1;
     }
+
+    // TRT-LLM event synchronization sometimes takes extra time to complete
+    // after the kernel has finished. Using a yield in the wait helps improve
+    // performance.
+    TLLM_CUDA_CHECK(::cudaSetDeviceFlags(cudaDeviceScheduleYield));
 
     // Since parentComm is an intercommunicator, input root
     // is the rank of the parent process in his group

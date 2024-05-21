@@ -241,7 +241,7 @@ void DecodingLayer<T>::forward(
                 = outputs->finished->slice({dynamic_decode_batch_size * beamWidth}, dynamic_id_offset);
             outputParams->cum_log_probs
                 = outputs->cum_log_probs->slice({dynamic_decode_batch_size * beamWidth}, dynamic_id_offset);
-            outputParams->output_log_probs = outputs->output_log_probs_tiled;
+            outputParams->output_log_probs = outputs->output_log_probs_tiled; // notice: use tiled tensor
             outputParams->beamHypotheses = std::move(outputs->beamHypotheses);
 
             // beam_search_diversity_rate is only supported when using BeamHypotheses

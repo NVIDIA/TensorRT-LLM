@@ -1233,6 +1233,7 @@ class GraphGroupBase(GraphGroup):
                 set_plugin_info(network, layer_name, plugin_info)
                 delete_plugin_info(network, layer.name)
         layer.name = layer_name
+        layer.metadata = layer.name
         if not keep_tensor_name:
             for i in range(layer.num_outputs):
                 output_tensor = layer.get_output(i)

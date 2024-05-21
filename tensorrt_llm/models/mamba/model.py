@@ -105,13 +105,13 @@ class MambaModel(Module):
             for i in range(n_layer)
         ])
         if config.rms_norm:
-            self.norm_f = RmsNorm(normalized_shape=config.hidden_size,
+            self.ln_f = RmsNorm(normalized_shape=config.hidden_size,
+                                eps=config.norm_epsilon,
+                                dtype=config.dtype)
+        else:
+            self.ln_f = LayerNorm(normalized_shape=config.hidden_size,
                                   eps=config.norm_epsilon,
                                   dtype=config.dtype)
-        else:
-            self.norm_f = LayerNorm(normalized_shape=config.hidden_size,
-                                    eps=config.norm_epsilon,
-                                    dtype=config.dtype)
 
     def forward(self,
                 input_ids,
@@ -148,7 +148,7 @@ class MambaModel(Module):
             present_convs.append(hidden_values[2])
             present_ssms.append(hidden_values[3])
         hidden_states = hidden_values[0]
-        hidden_states = self.norm_f(hidden_states)
+        hidden_states = self.ln_f(hidden_states)
         return hidden_states, tuple(present_convs), tuple(present_ssms)
 
 

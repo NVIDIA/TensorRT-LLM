@@ -410,14 +410,16 @@ class PretrainedModel(Module,
 
     def load(self, weights, from_pruned=False):
         expected_names = set()
+        required_names = set()
         for name, param in self.named_parameters():
+            expected_names.add(name)
             if not param.is_inited():
-                expected_names.add(name)
+                required_names.add(name)
 
         provided_names = set(weights.keys())
-        if not expected_names.issubset(provided_names):
+        if not required_names.issubset(provided_names):
             raise RuntimeError(
-                f"Expected but not provided tensors:{expected_names.difference(provided_names)}"
+                f"Required but not provided tensors:{required_names.difference(provided_names)}"
             )
         if not provided_names.issubset(expected_names):
             logger.warning(
@@ -427,13 +429,19 @@ class PretrainedModel(Module,
         if self.config.architecture in WEIGHT_LOADER_MODELS:
             mapping = self.config.mapping
             for name, param in self.named_parameters():
-                if name in expected_names:
+                if name in provided_names:
                     weight_loader = getattr(param, "weight_loader",
                                             default_weight_loader)
-                    weight_loader(mapping, param, weights[name])
+                    if from_pruned and param._shape != weights[name].shape:
+                        dummy_weight = torch.empty(param._shape,
+                                                   dtype=trt_dtype_to_torch(
+                                                       param._dtype))
+                        weight_loader(mapping, param, dummy_weight)
+                    else:
+                        weight_loader(mapping, param, weights[name])
         else:
             for name, param in self.named_parameters():
-                if name in expected_names:
+                if name in provided_names:
                     if not from_pruned:
                         try:
                             param.value = weights[name]
@@ -937,6 +945,10 @@ def parallelize_embedding(model: DecoderModelForCausalLM):
 
 def share_embedding(model: DecoderModelForCausalLM):
     model.lm_head.weight = model.transformer.vocab_embedding.weight
+    if hasattr(
+            model.transformer.vocab_embedding, "per_token_scale"
+    ) and model.transformer.vocab_embedding.per_token_scale is not None:
+        model.lm_head.per_channel_scale = model.transformer.vocab_embedding.per_token_scale
     return model
 
 
@@ -978,9 +990,9 @@ def optimize_model(model: DecoderModelForCausalLM,
     return model
 
 
-def preprocess_weights(
-        weights: Dict[str, torch.Tensor],
-        model_config: PretrainedConfig) -> Dict[str, torch.Tensor]:
+def preprocess_weights(weights: Dict[str, torch.Tensor],
+                       model_config: PretrainedConfig,
+                       from_pruned=False) -> Dict[str, torch.Tensor]:
     quant_algo = model_config.quantization.quant_algo
     kv_cache_quant_algo = model_config.quantization.kv_cache_quant_algo
 
@@ -992,6 +1004,8 @@ def preprocess_weights(
         elif quant_algo == QuantAlgo.W4A16_AWQ:
             activation_type = torch.float16
         for name, param in weights.items():
+            if from_pruned and param.numel() == 0:
+                continue
             if name.endswith('weight') and param.dtype == torch.int8:
                 dtype = torch.float16
                 if model_config.dtype == "bfloat16":
@@ -1116,7 +1130,7 @@ def load_model(
             logger.warning(
                 f"Cannot find {model_path}. Use dummy model weights.")
 
-    if model_config.share_embedding_table:
+    if model_config.share_embedding_table and weights:
         if "lm_head.weight" in weights and "transformer.vocab_embedding.weight" in weights:
             assert not (
                 weights["lm_head.weight"] -
@@ -1133,7 +1147,9 @@ def load_model(
     )
     is_checkpoint_pruned = getattr(model_config, 'is_pruned', False)
     if weights is not None:
-        preprocess_weights(weights, model_config)
+        preprocess_weights(weights,
+                           model_config,
+                           from_pruned=is_checkpoint_pruned)
         model.load(weights, from_pruned=is_checkpoint_pruned)
 
     return model

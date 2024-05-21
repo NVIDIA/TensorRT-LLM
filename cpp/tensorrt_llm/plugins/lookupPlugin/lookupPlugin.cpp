@@ -65,7 +65,7 @@ nvinfer1::DimsExprs LookupPlugin::getOutputDimensions(
 {
     try
     {
-        TLLM_CHECK(nbInputs == 2);
+        TLLM_CHECK(nbInputs == 2 || nbInputs == 3);
         TLLM_CHECK(outputIndex == 0);
         DimsExprs ret;
         int const nbDimsInput = inputs[0].nbDims;
@@ -91,21 +91,39 @@ bool LookupPlugin::supportsFormatCombination(
     int pos, nvinfer1::PluginTensorDesc const* inOut, int nbInputs, int nbOutputs) noexcept
 {
     bool res = false;
-    switch (pos)
+    if (nbInputs == 2)
     {
-    case 0: res = ((inOut[0].type == DataType::kINT32) && (inOut[0].format == TensorFormat::kLINEAR)); break;
-    case 1: res = ((inOut[1].type == mType) && (inOut[1].format == TensorFormat::kLINEAR)); break;
-    case 2: res = ((inOut[2].type == mType) && (inOut[2].format == TensorFormat::kLINEAR)); break;
-    default: // should NOT be here!
-        res = false;
+        switch (pos)
+        {
+        case 0: res = ((inOut[0].type == DataType::kINT32) && (inOut[0].format == TensorFormat::kLINEAR)); break;
+        case 1: res = ((inOut[1].type == mType) && (inOut[1].format == TensorFormat::kLINEAR)); break;
+        case 2: res = ((inOut[2].type == mType) && (inOut[2].format == TensorFormat::kLINEAR)); break;
+        default: // should NOT be here!
+            res = false;
+        }
     }
-
+    else
+    {
+        switch (pos)
+        {
+        case 0: res = ((inOut[0].type == DataType::kINT32) && (inOut[0].format == TensorFormat::kLINEAR)); break;
+        case 1:
+            res = ((inOut[1].type == DataType::kINT8 || inOut[1].type == mType)
+                && (inOut[1].format == TensorFormat::kLINEAR));
+            break;
+        case 2: res = ((inOut[2].type == mType) && (inOut[2].format == TensorFormat::kLINEAR)); break;
+        case 3: res = ((inOut[3].type == mType) && (inOut[3].format == TensorFormat::kLINEAR)); break;
+        default: // should NOT be here!
+            res = false;
+        }
+    }
     return res;
 }
 
 void LookupPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int nbInputs,
     nvinfer1::DynamicPluginTensorDesc const* out, int nbOutputs) noexcept
 {
+    mNbInputs = nbInputs;
 }
 
 size_t LookupPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* inputs, int nbInputs,
@@ -120,6 +138,7 @@ int LookupPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1:
     // inputs
     //     input  [tokenNum]
     //     weight [localVocabSize, hidden]
+    //     per_token_scales [localVocabSize], optional
     // outputs
     //     embedding [tokenNum, hidden]
 
@@ -135,24 +154,56 @@ int LookupPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1:
 
     int offset = mRank * localVocabSize;
 
-    if (mType == DataType::kHALF)
+    if (mNbInputs == 3)
     {
-        half const* weight = reinterpret_cast<half const*>(inputs[1]);
-        half* output = reinterpret_cast<half*>(outputs[0]);
-        invokeLookUp<half, int>(output, input, weight, tokenNum, offset, localVocabSize, hidden, stream);
+        int8_t const* weight = reinterpret_cast<int8_t const*>(inputs[1]);
+        if (mType == DataType::kHALF)
+        {
+            half const* per_token_scales = reinterpret_cast<half const*>(inputs[2]);
+            half* output = reinterpret_cast<half*>(outputs[0]);
+            invokeLookUp<half, int8_t, int>(
+                output, input, weight, tokenNum, offset, localVocabSize, hidden, per_token_scales, stream);
+        }
+        else if (mType == DataType::kFLOAT)
+        {
+            float const* per_token_scales = reinterpret_cast<float const*>(inputs[2]);
+            float* output = reinterpret_cast<float*>(outputs[0]);
+            invokeLookUp<float, int8_t, int>(
+                output, input, weight, tokenNum, offset, localVocabSize, hidden, per_token_scales, stream);
+        }
+        else if (mType == DataType::kBF16)
+        {
+            __nv_bfloat16 const* per_token_scales = reinterpret_cast<__nv_bfloat16 const*>(inputs[2]);
+            __nv_bfloat16* output = reinterpret_cast<__nv_bfloat16*>(outputs[0]);
+            invokeLookUp<__nv_bfloat16, int8_t, int>(
+                output, input, weight, tokenNum, offset, localVocabSize, hidden, per_token_scales, stream);
+        }
     }
-    else if (mType == DataType::kFLOAT)
+    else
     {
-        float const* weight = reinterpret_cast<float const*>(inputs[1]);
-        float* output = reinterpret_cast<float*>(outputs[0]);
-        invokeLookUp<float, int>(output, input, weight, tokenNum, offset, localVocabSize, hidden, stream);
+        if (mType == DataType::kHALF)
+        {
+            half const* weight = reinterpret_cast<half const*>(inputs[1]);
+            half* output = reinterpret_cast<half*>(outputs[0]);
+            invokeLookUp<half, half, int>(
+                output, input, weight, tokenNum, offset, localVocabSize, hidden, nullptr, stream);
+        }
+        else if (mType == DataType::kFLOAT)
+        {
+            float const* weight = reinterpret_cast<float const*>(inputs[1]);
+            float* output = reinterpret_cast<float*>(outputs[0]);
+            invokeLookUp<float, float, int>(
+                output, input, weight, tokenNum, offset, localVocabSize, hidden, nullptr, stream);
+        }
+        else if (mType == DataType::kBF16)
+        {
+            __nv_bfloat16 const* weight = reinterpret_cast<__nv_bfloat16 const*>(inputs[1]);
+            __nv_bfloat16* output = reinterpret_cast<__nv_bfloat16*>(outputs[0]);
+            invokeLookUp<__nv_bfloat16, __nv_bfloat16, int>(
+                output, input, weight, tokenNum, offset, localVocabSize, hidden, nullptr, stream);
+        }
     }
-    else if (mType == DataType::kBF16)
-    {
-        __nv_bfloat16 const* weight = reinterpret_cast<__nv_bfloat16 const*>(inputs[1]);
-        __nv_bfloat16* output = reinterpret_cast<__nv_bfloat16*>(outputs[0]);
-        invokeLookUp<__nv_bfloat16, int>(output, input, weight, tokenNum, offset, localVocabSize, hidden, stream);
-    }
+    sync_check_cuda_error();
 
     return 0;
 }
@@ -162,7 +213,7 @@ nvinfer1::DataType LookupPlugin::getOutputDataType(
     int index, nvinfer1::DataType const* inputTypes, int nbInputs) const noexcept
 {
     TLLM_CHECK(index == 0);
-    return inputTypes[1];
+    return mType;
 }
 
 // IPluginV2 Methods

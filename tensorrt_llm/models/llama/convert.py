@@ -1097,7 +1097,7 @@ def convert_hf_llama(hf_model,
                 vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
                 pad_width = vocab_size_padded - vocab_size
 
-                v = torch.nn.functional.pad(v, (0, pad_width, 0, 0), 'constant',
+                v = torch.nn.functional.pad(v, (0, 0, 0, pad_width), 'constant',
                                             0)
             weights['lm_head.weight'] = split(v, mapping.tp_size,
                                               mapping.tp_rank)
@@ -1127,7 +1127,7 @@ def convert_hf_llama(hf_model,
             pad_width = vocab_size_padded - vocab_size
 
             lm_head_weights = torch.nn.functional.pad(lm_head_weights,
-                                                      (0, pad_width, 0, 0),
+                                                      (0, 0, 0, pad_width),
                                                       'constant',
                                                       value=0)
         weights['lm_head.weight'] = split_matrix_tp(lm_head_weights,
