@@ -9,7 +9,6 @@ This document shows how to build and run a LLaMA model in TensorRT-LLM on both s
     - [Build TensorRT engine(s)](#build-tensorrt-engines)
       - [LLaMA v2 Updates](#llama-v2-updates)
       - [LLaMA v3 Updates](#llama-v3-updates)
-    - [Using RoPE Scaling](#using-rope-scaling)
     - [Long context length](#long-context-length)
       - [INT8 KV cache](#int8-kv-cache)
       - [SmoothQuant](#smoothquant)
@@ -252,15 +251,6 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_8gpu_tp8 \
 ```
 
 Same instructions can be applied to fine-tuned versions of the LLaMA v2 models (e.g. 7Bf or llama-2-7b-chat).
-
-
-### Using RoPE Scaling
-RoPE scaling is supported through GPT Attention Plugin. You can add `--rotary_scaling <type> <factor>` during the build command to enable it.
-- The value of `type` can be either `linear` and `dynamic`.
-- The value of `factor` can be any value larger than `1.0`.
-
-The implementation is identical to Huggingface's.
-Please refer to https://huggingface.co/docs/transformers/model_doc/llama2#transformers.LlamaConfig.rope_scaling for more details.
 
 ### Long context length
 To use the model with Long context lengths, it is necessary to add `--multi_block_mode` in the build command to enable faster decoding in multi-head attention.
@@ -598,7 +588,7 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_mistral \
 # Run Mistral 7B fp16 inference with sliding window/cache size 4096
 python ../run.py --max_output_len=50 \
                  --tokenizer_dir ./mistral-7b-v0.1 \
-                 --engine_dir=./tmp/llama/7B/trt_engines/fp16/1-gpu/ \
+                 --engine_dir=./tmp/mistral/7B/trt_engines/fp16/1-gpu/ \
                  --max_attention_window_size=4096
 ```
 

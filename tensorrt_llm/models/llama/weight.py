@@ -1114,7 +1114,7 @@ def load_from_hf_safetensors(model_dir: str, config: PretrainedConfig, mapping):
                                                             1)  # lm_head
         if pad_vocab:
             v = torch.nn.functional.pad(
-                v, (0, vocab_size_padded - vocab_size, 0, 0), 'constant', 0)
+                v, (0, 0, 0, vocab_size_padded - vocab_size), 'constant', 0)
             v = split(v, mapping.tp_size, mapping.tp_rank)
         weights['lm_head.weight'] = v
         weights['transformer.ln_f.weight'] = load(key_list[2])  # ln_f

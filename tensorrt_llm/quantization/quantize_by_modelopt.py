@@ -356,7 +356,8 @@ def quantize_and_export(*, model_dir, calib_dataset, dtype, qformat,
             if "exclude_modules" not in tensorrt_llm_config["quantization"]:
                 # Append router and lm_head because we need both excluded
                 tensorrt_llm_config["quantization"]["exclude_modules"] = [
-                    "router", "lm_head"
+                    'lm_head', 'router', 'vocab_embedding',
+                    'position_embedding', 'block_embedding'
                 ]
             else:
                 tensorrt_llm_config["quantization"]["exclude_modules"].append(

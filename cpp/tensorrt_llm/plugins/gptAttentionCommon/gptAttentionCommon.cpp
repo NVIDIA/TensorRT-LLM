@@ -589,7 +589,7 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForContext(nvinfer1::DataType t
     size_t const fp8_qkv_buffer_size = mFP8ContextFMHA && mEnableContextFMHA && !chunked_context_support
         ? batch_size * input_seq_length * size_t(local_hidden_units_qo + 2 * local_hidden_units_kv)
         : 0;
-    size_t const padding_offset_size = sizeof(int) * batch_size * input_seq_length;
+    size_t const padding_offset_size = mEnableContextFMHA ? 0 : sizeof(int) * batch_size * input_seq_length;
     const size_t fmha_scheduler_counter = mEnableContextFMHA ? sizeof(uint32_t) : 0;
 
     int const NUM_BUFFERS = 14;
@@ -631,18 +631,16 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForGeneration(
     size_t const partial_out_size = size * batch_beam * mNumHeads * mHeadSize * maxSeqLenTile;
     size_t const partial_sum_size = sizeof(float) * batch_beam * mNumHeads * maxSeqLenTile;
     size_t const partial_max_size = sizeof(float) * batch_beam * mNumHeads * maxSeqLenTile;
-    size_t const block_counter_size = sizeof(int) * batch_beam * mNumHeads;
     size_t const shift_k_cache_size = (!mPosShiftEnabled || isCrossAttention())
         ? 0
         : size * batch_beam * mNumHeads * mHeadSize * max_attention_window;
 
-    int const NUM_BUFFERS = 5;
+    int const NUM_BUFFERS = 4;
     size_t workspaces[NUM_BUFFERS];
     workspaces[0] = partial_out_size;
     workspaces[1] = partial_sum_size;
     workspaces[2] = partial_max_size;
-    workspaces[3] = block_counter_size;
-    workspaces[4] = shift_k_cache_size;
+    workspaces[3] = shift_k_cache_size;
     generation_workspace_size = tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
 
     size_t mqa_workspace_size = 0;
@@ -766,8 +764,9 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
     size_t const fp8_qkv_buffer_size = mEnableContextFMHA && mFP8ContextFMHA && !chunked_context_support
         ? params.batch_size * params.input_seq_length * (local_hidden_units_qo + 2 * local_hidden_units_kv)
         : 0;
-    size_t const padding_offset_size
-        = sizeof(int) * params.batch_size * (isCrossAttention() ? params.cross_qkv_length : params.input_seq_length);
+    size_t const padding_offset_size = mEnableContextFMHA
+        ? 0
+        : sizeof(int) * params.batch_size * (isCrossAttention() ? params.cross_qkv_length : params.input_seq_length);
     const size_t fmha_scheduler_counter = mEnableContextFMHA ? sizeof(uint32_t) : 0;
 
     bool const is_qk_buf_float_ = true;
@@ -789,7 +788,9 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
     float* qk_buf_float_ = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, qk_buf_float_size));
     __nv_fp8_e4m3* fp8_qkv_buffer
         = reinterpret_cast<__nv_fp8_e4m3*>(nextWorkspacePtr(workspace_byte_ptr, offset, fp8_qkv_buffer_size));
-    int* padding_offset = reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, padding_offset_size));
+    int* padding_offset = mEnableContextFMHA
+        ? nullptr
+        : reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, padding_offset_size));
     uint32_t* fmha_tile_counter_ptr
         = reinterpret_cast<uint32_t*>(nextWorkspacePtr(workspace_byte_ptr, offset, fmha_scheduler_counter));
 
@@ -881,16 +882,47 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
             !(mKVCacheQuantMode.hasFp8KvCache() && !mKVCacheQuantMode.hasFp8Qdq() && enablePagedKVContextFMHA),
             "FP8 Paged Context FMHA only works with fp8 quantization workflow currently.");
 
-        QKVPreprocessingParams<T, KVCacheBuffer> preprocessingParms{const_cast<T*>(params.attention_input),
-            fp8_qkv_buffer, q_buf_2_, kv_cache_buffer, params.qkv_bias, params.q_seq_lengths, params.kv_seq_lengths,
-            cu_q_seqlens, rotary_inv_freq_buf, params.rotary_cos_sin, params.kv_scale_orig_quant, (int*) nullptr,
-            params.batch_size, params.input_seq_length, params.max_past_kv_len, params.cyclic_attention_window_size,
-            params.sink_token_length, params.num_tokens, mNumHeads, mNumKVHeads, mNumHeads / mNumKVHeads, getHeadSize(),
-            mRotaryEmbeddingDim, mRotaryEmbeddingBase, mRotaryEmbeddingScaleType, mRotaryEmbeddingScale,
-            mRotaryEmbeddingMaxPositions, position_embedding_type, mPosShiftEnabled, cache_type,
-            enablePagedKVContextFMHA, mFP8ContextFMHA, mMultiProcessorCount, mVisionStart, mVisionLength};
+        QKVPreprocessingParams<T, KVCacheBuffer> preprocessingParams;
 
-        invokeQKVPreprocessing(preprocessingParms, stream);
+        preprocessingParams.QKV = const_cast<T*>(params.attention_input);
+        preprocessingParams.QuantizedQKV = fp8_qkv_buffer;
+        preprocessingParams.Q = q_buf_2_;
+        preprocessingParams.kv_cache_buffer = kv_cache_buffer;
+        preprocessingParams.qkv_bias = params.qkv_bias;
+        preprocessingParams.seq_lens = params.q_seq_lengths;
+        preprocessingParams.cache_seq_lens = params.kv_seq_lengths;
+        preprocessingParams.cu_seq_lens = cu_q_seqlens;
+        preprocessingParams.rotary_embedding_inv_freq = rotary_inv_freq_buf;
+        preprocessingParams.rotary_coef_cache_buffer = params.rotary_cos_sin;
+        preprocessingParams.kvScaleOrigQuant = params.kv_scale_orig_quant;
+        preprocessingParams.spec_decoding_position_offsets = nullptr;
+
+        // Scalars
+        preprocessingParams.batch_size = params.batch_size;
+        preprocessingParams.max_input_seq_len = params.input_seq_length;
+        preprocessingParams.max_kv_seq_len = params.max_past_kv_len;
+        preprocessingParams.cyclic_kv_cache_len = params.cyclic_attention_window_size;
+        preprocessingParams.sink_token_len = params.sink_token_length;
+        preprocessingParams.token_num = params.num_tokens;
+        preprocessingParams.head_num = mNumHeads;
+        preprocessingParams.kv_head_num = mNumKVHeads;
+        preprocessingParams.qheads_per_kv_head = mNumHeads / mNumKVHeads;
+        preprocessingParams.size_per_head = getHeadSize();
+        preprocessingParams.rotary_embedding_dim = mRotaryEmbeddingDim;
+        preprocessingParams.rotary_embedding_base = mRotaryEmbeddingBase;
+        preprocessingParams.rotary_scale_type = mRotaryEmbeddingScaleType;
+        preprocessingParams.rotary_embedding_scale = mRotaryEmbeddingScale;
+        preprocessingParams.rotary_embedding_max_positions = mRotaryEmbeddingMaxPositions;
+        preprocessingParams.position_embedding_type = position_embedding_type;
+        preprocessingParams.position_shift_enabled = mPosShiftEnabled;
+        preprocessingParams.cache_type = cache_type;
+        preprocessingParams.enable_paged_kv_fmha = enablePagedKVContextFMHA;
+        preprocessingParams.quantized_fp8_output = mFP8ContextFMHA;
+        preprocessingParams.multi_processor_count = mMultiProcessorCount;
+
+        preprocessingParams.rotary_vision_start = mVisionStart;
+        preprocessingParams.rotary_vision_length = mVisionLength;
+        invokeQKVPreprocessing(preprocessingParams, stream);
 
         sync_check_cuda_error();
 
@@ -1309,7 +1341,6 @@ int GPTAttentionPluginCommon::enqueueGeneration(
         = enable_multi_block ? sizeof(float) * batch_beam * mNumHeads * max_num_seq_len_tiles : 0;
     size_t const partial_max_size
         = enable_multi_block ? sizeof(float) * batch_beam * mNumHeads * max_num_seq_len_tiles : 0;
-    size_t const block_counter_size = enable_multi_block ? sizeof(int) * batch_beam * mNumHeads : 0;
     size_t const shift_k_cache_size = (!mPosShiftEnabled || isCrossAttention())
         ? 0
         : sizeof(T) * batch_beam * mNumHeads * mHeadSize * params.max_attention_window;
@@ -1318,13 +1349,7 @@ int GPTAttentionPluginCommon::enqueueGeneration(
     T* partial_out = reinterpret_cast<T*>(nextWorkspacePtr(workspace_byte_ptr, offset, partial_out_size));
     float* partial_sum = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, partial_sum_size));
     float* partial_max = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, partial_max_size));
-    int* block_counter = reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, block_counter_size));
     T* shift_k_cache = reinterpret_cast<T*>(nextWorkspacePtr(workspace_byte_ptr, offset, shift_k_cache_size));
-
-    if (enable_multi_block)
-    {
-        TLLM_CUDA_CHECK(cudaMemsetAsync(block_counter, 0, block_counter_size, stream));
-    }
 
     // Apply position embedding to the keys in the K cache
     KVLinearBuffer shift_k_cache_buffer;
@@ -1385,7 +1410,7 @@ int GPTAttentionPluginCommon::enqueueGeneration(
     dispatch_params.partial_out = partial_out;
     dispatch_params.partial_sum = partial_sum;
     dispatch_params.partial_max = partial_max;
-    dispatch_params.block_counter = block_counter;
+    dispatch_params.block_counter = mMultiBlockSemaphores.get();
     dispatch_params.kv_cache_quant_mode = mKVCacheQuantMode;
     dispatch_params.kv_scale_orig_quant = params.kv_scale_orig_quant;
     dispatch_params.kv_scale_quant_orig = params.kv_scale_quant_orig;

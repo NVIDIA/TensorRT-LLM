@@ -307,17 +307,23 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
     // For q and k, also apply the rotary embedding.
 
     // NOTE:
-    // head_num == kv_head_num
-    //   QKV src shape (batch_size, seq_len, 3, head_num, size_per_head)
-    //                  ^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^
-    //                           m                        n
-    //   QKV dst shape (3, batch_size, head_num, seq_len, size_per_head)
-    // head_num != kv_head_num
-    //   QKV src shape: (batch_size, seq_len, head_num * size_per_head + 2 * kv_head_num * size_per_head)
-    //                   ^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    //                             m                               n
+    // In the case of in-place modifications:
+    //      head_num == kv_head_num
+    //      QKV src shape (batch_size, seq_len, 3, head_num, size_per_head)
+    //                      ^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^
+    //                              m                        n
+    //      head_num != kv_head_num
+    //      QKV src shape: (batch_size, seq_len, head_num * size_per_head + 2 * kv_head_num * size_per_head)
+    //                      ^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    //                                 m                               n
+    // Additionally, if there is no padding:
+    //      QKV src shape (num_tokens, 3, head_num, size_per_head)
+    //
+    //  In these above cases, output shape stays the same
+    //
     //   Q dst shape: (batch_size, head_num, seq_len, size_per_head)
     //   KV dst shape: (batch_size, kv_head_num, seq_len, size_per_head)
+    // See QKVPreprocessingParams for further details
 
     // There are two kinds of output:
     //  1. Contiguous QKV output.
@@ -622,8 +628,12 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
     //   QKV src shape: (batch_size, seq_len, head_num * size_per_head + 2 * kv_head_num * size_per_head)
     //                   ^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
     //                             m                               n
+    // Additionally, if there is no padding:
+    //   QKV src shape (num_tokens, 3, head_num, size_per_head)
+    //
     //   Q dst shape: (batch_size, head_num, seq_len, size_per_head)
     //   KV dst shape: (batch_size, kv_head_num, seq_len, size_per_head)
+    // See QKVPreprocessingParams for further details
 
     // There are two kinds of output:
     //  1. Contiguous QKV output.

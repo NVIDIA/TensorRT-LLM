@@ -110,6 +110,62 @@ class GroupedLinear(Module):
         param.value = loaded_weight
 
 
+class RgLru(Module):
+
+    def __init__(self,
+                 lru_width,
+                 num_heads=1,
+                 dtype=None,
+                 tp_group=None,
+                 tp_size=1,
+                 tp_rank=0):
+        super().__init__()
+        self.lru_width = lru_width
+        self.tp_size = tp_size
+        self.dtype = dtype
+
+        self.recurrent_param = Parameter(shape=(self.lru_width // tp_size, ),
+                                         dtype=dtype)
+        self.input_gate = GroupedLinear(self.lru_width,
+                                        self.lru_width,
+                                        num_heads,
+                                        dtype=dtype,
+                                        tp_group=tp_group,
+                                        tp_size=tp_size,
+                                        gather_output=False)
+        self.recurrent_gate = GroupedLinear(self.lru_width,
+                                            self.lru_width,
+                                            num_heads,
+                                            dtype=dtype,
+                                            tp_group=tp_group,
+                                            tp_size=tp_size,
+                                            gather_output=False)
+
+    def forward(self,
+                x: Tensor,
+                y: Tensor,
+                y_bias: Tensor,
+                lru_state: Tensor,
+                host_request_types: Tensor,
+                last_token_ids: Tensor,
+                slot_mapping: Optional[Tensor] = None):
+        gate_x = self.input_gate(x)
+        gate_a = self.recurrent_gate(x)
+        out, lru_state = rg_lru(input=x,
+                                gate_x=gate_x,
+                                gate_a=gate_a,
+                                y=y,
+                                y_bias=y_bias,
+                                state_or_ptr=lru_state,
+                                A=self.recurrent_param.value,
+                                host_request_types=host_request_types,
+                                last_token_ids=last_token_ids,
+                                dim=self.lru_width // self.tp_size,
+                                dtype=self.dtype,
+                                slot_mapping=slot_mapping)
+        return out, lru_state
+
+
 class Recurrent(Module):
 
     def __init__(
@@ -129,8 +185,6 @@ class Recurrent(Module):
         self.d_conv = d_conv
         self.dtype = dtype
 
-        self.A = Parameter(shape=(self.lru_width // tp_size, ), dtype=dtype)
-
         self.linear_x = ColumnLinear(self.width,
                                      self.lru_width,
                                      dtype=dtype,
@@ -144,27 +198,20 @@ class Recurrent(Module):
                                      tp_group=tp_group,
                                      tp_size=tp_size,
                                      gather_output=False)
-        self.y_bias = Parameter(shape=(self.lru_width, ), dtype=dtype)
+        self.y_bias = Parameter(shape=(self.lru_width // tp_size, ),
+                                dtype=dtype)
 
         self.conv1d = MambaConv1d(self.lru_width // tp_size,
                                   self.d_conv,
                                   self.dtype,
                                   apply_silu=False)
 
-        self.input_gate = GroupedLinear(self.lru_width,
-                                        self.lru_width,
-                                        num_heads,
-                                        dtype=dtype,
-                                        tp_group=tp_group,
-                                        tp_size=tp_size,
-                                        gather_output=False)
-        self.a_gate = GroupedLinear(self.lru_width,
-                                    self.lru_width,
-                                    num_heads,
-                                    dtype=dtype,
-                                    tp_group=tp_group,
-                                    tp_size=tp_size,
-                                    gather_output=False)
+        self.rg_lru = RgLru(self.lru_width,
+                            num_heads=num_heads,
+                            dtype=dtype,
+                            tp_group=tp_group,
+                            tp_size=tp_size,
+                            tp_rank=tp_rank)
 
         self.linear_out = RowLinear(self.lru_width,
                                     self.width,
@@ -202,20 +249,9 @@ class Recurrent(Module):
                                          slot_mapping, conv_indices)
 
         # rg-lru
-        gate_x = self.input_gate(x_conv)
-        gate_a = self.a_gate(x_conv)
-        out, lru_state = rg_lru(input=x_conv,
-                                gate_x=gate_x,
-                                gate_a=gate_a,
-                                y=y,
-                                y_bias=self.y_bias.value,
-                                state_or_ptr=lru_state,
-                                A=self.A.value,
-                                host_request_types=host_request_types,
-                                last_token_ids=last_token_ids,
-                                dim=self.lru_width,
-                                dtype=self.dtype,
-                                slot_mapping=slot_mapping)
+        out, lru_state = self.rg_lru(x_conv, y, self.y_bias.value, lru_state,
+                                     host_request_types, last_token_ids,
+                                     slot_mapping)
 
         # linear out
         out = self.linear_out(out)

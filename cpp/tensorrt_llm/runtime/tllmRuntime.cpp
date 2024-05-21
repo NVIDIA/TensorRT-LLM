@@ -111,10 +111,11 @@ nvinfer1::IExecutionContext& TllmRuntime::addContext(std::int32_t profileIndex)
     auto& context = *mContexts.back();
     context.setDeviceMemory(mEngineBuffer->data());
     context.setOptimizationProfileAsync(profileIndex, mStream->get());
-    // If nvtx verbosity is DETAILED, change it to LAYER_NAMES_ONLY for inference performance
+    // If nvtx verbosity is DETAILED, print an info about potential perf overhead.
     if (context.getNvtxVerbosity() == nvinfer1::ProfilingVerbosity::kDETAILED)
     {
-        context.setNvtxVerbosity(nvinfer1::ProfilingVerbosity::kLAYER_NAMES_ONLY);
+        TLLM_LOG_INFO(
+            "The engine was built with kDETAILED profiling verbosity, which may result in small overheads at runtime.");
     }
     return context;
 }

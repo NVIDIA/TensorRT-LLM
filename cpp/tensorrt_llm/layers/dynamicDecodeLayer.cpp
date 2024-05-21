@@ -271,7 +271,7 @@ void DynamicDecodeLayer<T>::prepareOutputData(std::shared_ptr<DynamicDecodeOutpu
         outputs->sequence_length->template getPtr<SizeType32>(), numNewTokens, batchSlots, batchSize, maxBatchSize,
         beamWidth, maxSeqLen, maxTokensPerStep, stream);
 
-    // Transpose the output log probs from [maxSeqLen, bs, beamWidth] to [batchSize, beamWidth, maxSeqLen]
+    // Transpose output log probs from [maxSeqLen, batchSize, beamWidth] to [batchSize, beamWidth, maxSeqLen]
     if (outputs->output_log_probs_tiled)
     {
         auto logProbsMaxSeqLen = outputs->output_log_probs_tiled.value().shape[0];

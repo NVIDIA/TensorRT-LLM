@@ -378,12 +378,12 @@ class TestMamba(unittest.TestCase):
                                    atol=1e-3)
         # norm
         np.testing.assert_allclose(
-            tensorrt_llm_mamba.backbone.norm_f.weight.raw_value,
+            tensorrt_llm_mamba.backbone.ln_f.weight.raw_value,
             hf_mamba.backbone.norm_f.weight.cpu().detach(),
             atol=1e-3)
         if has_bias(hf_mamba.backbone.norm_f):
             np.testing.assert_allclose(
-                tensorrt_llm_mamba.backbone.norm_f.bias.raw_value,
+                tensorrt_llm_mamba.backbone.ln_f.bias.raw_value,
                 hf_mamba.backbone.norm_f.bias.cpu().detach(),
                 atol=1e-3)
         # Checking all of the layers takes too much time, just check one random layer

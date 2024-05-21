@@ -2352,8 +2352,9 @@ class GenerationSession(object):
             final_output_ids = self.gather_tree(
                 self.sequence_length_buffer, self.output_ids, self.parent_ids,
                 self.end_ids, context_lengths, self.cum_log_probs,
-                *beam_hyps_args, self.finished, self.length_penalty, batch_size,
-                beam_width, self.max_seq_length, scfg.use_beam_hyps)
+                self.log_probs, self.log_probs_tiled, *beam_hyps_args,
+                self.finished, self.length_penalty, batch_size, beam_width,
+                self.max_seq_length, scfg.use_beam_hyps)
 
         # Communicate ranks in Pipeline Parallelism
         if self.mapping.has_pp():

@@ -15,9 +15,11 @@
  */
 #pragma once
 
+#include "tensorrt_llm/runtime/iTensor.h"
 #include <cstdint>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <sstream>
 
 namespace tensorrt_llm
 {
@@ -106,6 +108,44 @@ struct BuildDecoderInfoParams
     float2* rotaryEmbeddingCoeffCache;
     // Dynamic scaling;
     int rotaryEmbeddingMaxPositions;
+
+    std::string toString() const
+    {
+        std::stringstream ss;
+        ss << "BuildDecoderInfoParams ====================" << std::endl;
+        ss << "seqQOffsets: "
+           << *(runtime::ITensor::wrap(
+                  (void*) seqQOffsets, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batchSize})))
+           << std::endl;
+        ss << "seqKVOffsets: "
+           << *(runtime::ITensor::wrap(
+                  (void*) seqKVOffsets, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batchSize})))
+           << std::endl;
+        ss << "paddingOffsets: "
+           << *(runtime::ITensor::wrap(
+                  (void*) paddingOffsets, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batchSize})))
+           << std::endl;
+        ss << "attentionMask: " << static_cast<void*>(attentionMask) << std::endl;
+        ss << "seqQLengths: " << seqQLengths << std::endl;
+        ss << "seqKVLengths: " << seqKVLengths << std::endl;
+        ss << "fmhaTileCounter: " << fmhaTileCounter << std::endl;
+        ss << "batchSize: " << batchSize << std::endl;
+        ss << "maxQSeqLength: " << maxQSeqLength << std::endl;
+        ss << "removePadding: " << std::boolalpha << removePadding << std::endl;
+        ss << "attentionWindowSize: " << attentionWindowSize << std::endl;
+        ss << "sinkTokenLength: " << sinkTokenLength << std::endl;
+        ss << "numTokens: " << numTokens << std::endl;
+        ss << "attentionMaskType: " << static_cast<int>(attentionMaskType) << std::endl;
+        ss << "rotaryEmbeddingScale: " << rotaryEmbeddingScale << std::endl;
+        ss << "rotaryEmbeddingBase: " << rotaryEmbeddingBase << std::endl;
+        ss << "rotaryEmbeddingDim: " << rotaryEmbeddingDim << std::endl;
+        ss << "rotaryScalingType: " << static_cast<int>(rotaryScalingType) << std::endl;
+        ss << "rotaryEmbeddingInvFreq: " << rotaryEmbeddingInvFreq << std::endl;
+        ss << "rotaryEmbeddingCoeffCache: " << rotaryEmbeddingCoeffCache << std::endl;
+        ss << "rotaryEmbeddingMaxPositions: " << rotaryEmbeddingMaxPositions << std::endl;
+
+        return ss.str();
+    }
 };
 
 template <typename T>

@@ -67,7 +67,11 @@ def test_fp8_quantization():
     tokenizer_dir = hf_model_dir
 
     checkpoint_dir = tempfile.TemporaryDirectory("llama-checkpoint").name
-    quant_config = QuantConfig(QuantAlgo.FP8, exclude_modules=["lm_head"])
+    quant_config = QuantConfig(QuantAlgo.FP8,
+                               exclude_modules=[
+                                   'lm_head', 'vocab_embedding',
+                                   'position_embedding', 'block_embedding'
+                               ])
     LLaMAForCausalLM.quantize(hf_model_dir,
                               checkpoint_dir,
                               quant_config=quant_config,

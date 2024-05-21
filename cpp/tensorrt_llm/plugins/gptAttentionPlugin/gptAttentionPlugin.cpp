@@ -307,13 +307,12 @@ void GPTAttentionPlugin::configurePluginImpl(nvinfer1::DynamicPluginTensorDesc c
 
     prepareEnqueueGeneration(enqueueParams);
 
-    if (mMultiBlockMode)
-    {
-        auto const& ctxLenTensor = in[getIdx(IdxEntry::CONTEXT_LENGTHS)];
-        TLLM_CHECK_DEBUG(ctxLenTensor.max.nbDims == 1);
-        int32_t const max_batch_beam = in[getIdx(IdxEntry::CONTEXT_LENGTHS)].max.d[0];
-        reserveSemaphoreArray(mNumHeads * max_batch_beam);
-    }
+    // Always reserve SemaphoreArray (for multi-block mode) as MMHA may enable multi-block mode when shared memory is
+    // not enough.
+    auto const& ctxLenTensor = in[getIdx(IdxEntry::CONTEXT_LENGTHS)];
+    TLLM_CHECK_DEBUG(ctxLenTensor.max.nbDims == 1);
+    int32_t const max_batch_beam = in[getIdx(IdxEntry::CONTEXT_LENGTHS)].max.d[0];
+    reserveSemaphoreArray(mNumHeads * max_batch_beam);
 }
 
 template <typename T>

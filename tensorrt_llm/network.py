@@ -266,6 +266,9 @@ class Network(object):
                     set_plugin_info(self.trt_network, layer.name, plugin_info)
                     delete_plugin_info(self.trt_network, original_layer_name)
 
+        # Set layer metadata to the same as the layer name so that it can show up in NVTX.
+        layer.metadata = layer.name
+
     def register_ndarray(self, ndarray: np.ndarray) -> None:
         ''' When the functional APIs need to create local numpy array and use as weights for constant or other layers,
             they need to register the ndarray objects to the TRT-LLM Network to prolong the lifetime of the ndarray, such that weights are

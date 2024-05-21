@@ -299,24 +299,8 @@ class ModelRunnerCppExecutor(ModelRunnerMixin):
             return_log_probs=output_log_probs,
         )
 
-        prompt_tuning_configs = len(batch_input_ids_list) * [None]
-        if prompt_table is not None:
-            prompt_table_data = self._prepare_embedding_table(prompt_table)
-            if prompt_tasks is not None:
-                task_indices = [int(t) for t in prompt_tasks.split(',')]
-                assert len(task_indices) == len(batch_input_ids_list), \
-                    f"Number of supplied tasks ({len(task_indices)}) must match input batch size ({len(batch_input_ids_list)})"
-                prompt_tuning_configs = [
-                    trtllm.PromptTuningConfig(
-                        embedding_table=prompt_table_data[task_indices[i]])
-                    for i in range(len(batch_input_ids_list))
-                ]
-            else:
-                prompt_tuning_configs = [
-                    trtllm.PromptTuningConfig(
-                        embedding_table=prompt_table_data[0])
-                    for _ in range(len(batch_input_ids_list))
-                ]
+        prompt_tuning_configs = self._prepare_ptuning_executor(
+            batch_input_ids_list, prompt_table, prompt_tasks)
 
         requests = [
             trtllm.Request(input_token_ids=input_ids,
@@ -333,80 +317,110 @@ class ModelRunnerCppExecutor(ModelRunnerMixin):
         ]
 
         request_ids = self.session.enqueue_requests(requests)
-        multi_responses = self.session.await_responses(request_ids)
-
-        output_ids = [[] for _ in range(len(multi_responses))]
-        for responses in multi_responses:
-            for response in responses:
-                if not response.has_error():
-                    reqid_pos = request_ids.index(response.request_id)
-                    if not streaming:
-                        output_ids[reqid_pos] = [[] for _ in range(
-                            len(response.result.output_token_ids))]
-                    else:
-                        output_ids[reqid_pos] = [
-                            copy.deepcopy(batch_input_ids_list[reqid_pos]) for _
-                            in range(len(response.result.output_token_ids))
-                        ]
 
         if not streaming:
-            output_ids = self._process_response(multi_responses, output_ids,
-                                                request_ids)
-            return self._fill_output(multi_responses, output_ids, end_id,
-                                     return_dict, output_sequence_lengths,
-                                     output_log_probs, output_cum_log_probs,
-                                     batch_input_ids, streaming)
+            return self._initialize_and_fill_output(request_ids, end_id,
+                                                    return_dict,
+                                                    output_sequence_lengths,
+                                                    output_log_probs,
+                                                    output_cum_log_probs,
+                                                    batch_input_ids, streaming)
         else:
-            return self._stream(request_ids, output_ids, multi_responses,
-                                end_id, return_dict, output_sequence_lengths,
-                                output_log_probs, output_cum_log_probs,
-                                batch_input_ids, streaming)
+            return self._stream(request_ids, end_id, return_dict,
+                                output_sequence_lengths, output_log_probs,
+                                output_cum_log_probs, batch_input_ids,
+                                streaming, batch_input_ids_list)
 
-    def _stream(self, request_ids, output_ids, multi_responses, end_id,
-                return_dict, output_sequence_lengths, output_log_probs,
-                output_cum_log_probs, batch_input_ids, streaming):
-        active_reqids = copy.deepcopy(request_ids)
-        while active_reqids:
-            for req_id, response in zip(active_reqids, multi_responses):
-                for r in response:
-                    if r.result.is_final:
-                        active_reqids.remove(req_id)
+    def _prepare_ptuning_executor(self, batch_input_ids_list, prompt_table,
+                                  prompt_tasks):
+        prompt_tuning_configs = len(batch_input_ids_list) * [None]
+        if prompt_table is not None:
+            prompt_table_data = self._prepare_embedding_table(
+                prompt_table).cuda()
+            if prompt_tasks is not None:
+                task_indices = [int(t) for t in prompt_tasks.split(',')]
+                assert len(task_indices) == len(batch_input_ids_list), \
+                    f"Number of supplied tasks ({len(task_indices)}) must match input batch size ({len(batch_input_ids_list)})"
+                prompt_tuning_configs = [
+                    trtllm.PromptTuningConfig(
+                        embedding_table=prompt_table_data[task_indices[i]])
+                    for i in range(len(batch_input_ids_list))
+                ]
+            else:
+                prompt_tuning_configs = [
+                    trtllm.PromptTuningConfig(
+                        embedding_table=prompt_table_data[0])
+                    for _ in range(len(batch_input_ids_list))
+                ]
+        return prompt_tuning_configs
 
-                output_ids = self._process_response(multi_responses, output_ids,
-                                                    request_ids)
-                yield self._fill_output(multi_responses, output_ids, end_id,
-                                        return_dict, output_sequence_lengths,
-                                        output_log_probs, output_cum_log_probs,
-                                        batch_input_ids, streaming)
+    def _initialize_and_fill_output(self, request_ids, end_id, return_dict,
+                                    output_sequence_lengths, output_log_probs,
+                                    output_cum_log_probs, batch_input_ids,
+                                    streaming):
+        output_ids = [[] for _ in range(len(request_ids))]
+        for reqid_pos in range(len(request_ids)):
+            output_ids[reqid_pos] = [[] for _ in range(self.max_beam_width)]
 
-            if active_reqids:
-                multi_responses = self.session.await_responses(active_reqids)
+        multi_responses = self.session.await_responses(request_ids)
+        responses = [
+            response for responses in multi_responses for response in responses
+        ]
 
-    def _process_response(self, multi_responses, output_ids, request_ids):
-        for responses in multi_responses:
+        return self._fill_output(responses, output_ids, end_id, return_dict,
+                                 output_sequence_lengths, output_log_probs,
+                                 output_cum_log_probs, batch_input_ids,
+                                 streaming, request_ids)
+
+    def _stream(self, request_ids, end_id, return_dict, output_sequence_lengths,
+                output_log_probs, output_cum_log_probs, batch_input_ids,
+                streaming, batch_input_ids_list):
+        output_ids = [[] for _ in range(len(request_ids))]
+        for reqid_pos in range(len(request_ids)):
+            output_ids[reqid_pos] = [
+                copy.deepcopy(batch_input_ids_list[reqid_pos])
+                for _ in range(self.max_beam_width)
+            ]
+
+        finished_reqs = 0
+        while finished_reqs < len(request_ids):
+            responses = self.session.await_responses()
+
             for response in responses:
-                if not response.has_error():
-                    reqid_pos = request_ids.index(response.request_id)
-                    for beam, output_tokens in enumerate(
-                            response.result.output_token_ids):
-                        output_ids[reqid_pos][beam] += output_tokens
-                else:
-                    raise RuntimeError(response.error_msg)
-        return output_ids
+                if response.result.is_final:
+                    finished_reqs += 1
+
+            yield self._fill_output(responses, output_ids, end_id, return_dict,
+                                    output_sequence_lengths, output_log_probs,
+                                    output_cum_log_probs, batch_input_ids,
+                                    streaming, request_ids)
 
     def _fill_output(self, responses, output_ids, end_id, return_dict,
                      output_sequence_lengths, output_log_probs,
-                     output_cum_log_probs, batch_input_ids, streaming):
+                     output_cum_log_probs, batch_input_ids, streaming,
+                     request_ids):
         cuda_device = torch.device("cuda")
+
+        for response in responses:
+            if response.has_error():
+                raise RuntimeError(response.error_msg)
+
+            reqid_pos = request_ids.index(response.request_id)
+            for beam, output_tokens in enumerate(
+                    response.result.output_token_ids):
+                output_ids[reqid_pos][beam] += output_tokens
 
         sequence_lengths = []
         for output in output_ids:
             sequence_lengths.append([len(a) for a in output])
-        if not streaming:
-            for beam in output_ids:
-                for output_tokens in beam:
-                    output_tokens += (self.max_seq_len -
-                                      len(output_tokens)) * [end_id]
+
+        if streaming:
+            output_ids = copy.deepcopy(output_ids)
+
+        for beam in output_ids:
+            for output_tokens in beam:
+                output_tokens += (self.max_seq_len -
+                                  len(output_tokens)) * [end_id]
 
         output_ids = torch.tensor(output_ids,
                                   dtype=torch.int32,
@@ -419,39 +433,46 @@ class ModelRunnerCppExecutor(ModelRunnerMixin):
                                                            dtype=torch.int32,
                                                            device=cuda_device)
             if self.gather_context_logits:
-                outputs['context_logits'] = []
-                for response in responses:
-                    outputs['context_logits'] += [
-                        a.result.context_logits.cuda() for a in response
-                        if a.result.context_logits is not None
-                    ]
+                outputs['context_logits'] = [
+                    a.result.context_logits.cuda() for a in responses
+                    if a.result.context_logits is not None
+                ]
+                # Pad context_logits into a rectangle
+                max_input_length = max(a.shape[0]
+                                       for a in outputs['context_logits'])
+                for i, a in enumerate(outputs['context_logits']):
+                    pad_length = max_input_length - a.shape[0]
+                    outputs['context_logits'][i] = torch.nn.functional.pad(
+                        a, [0, 0, 0, pad_length])
                 outputs['context_logits'] = torch.stack(
                     outputs['context_logits'])
             if self.gather_generation_logits:
-                outputs['generation_logits'] = []
-                for response in responses:
-                    outputs['generation_logits'] += [
-                        a.result.generation_logits.cuda() for a in response
-                        if a.result.generation_logits is not None
-                    ]
+                outputs['generation_logits'] = [
+                    a.result.generation_logits.cuda() for a in responses
+                    if a.result.generation_logits is not None
+                ]
                 outputs['generation_logits'] = torch.stack(
                     outputs['generation_logits'])
             if output_log_probs:
-                outputs['log_probs'] = []
-                for response in responses:
-                    outputs['log_probs'] += [
-                        a.result.log_probs for a in response
-                        if a.result.log_probs is not None
-                    ]
+                outputs['log_probs'] = [
+                    a.result.log_probs for a in responses
+                    if a.result.log_probs is not None
+                ]
+                # Pad log_probs into a rectangle
+                max_seq_len = max(
+                    len(a) for beam_list in outputs['log_probs']
+                    for a in beam_list)
+                for i, a in enumerate(outputs['log_probs']):
+                    for j, b in enumerate(a):
+                        pad_length = max_seq_len - len(b)
+                        outputs['log_probs'][i][j] = b + [0.0] * pad_length
                 outputs['log_probs'] = torch.tensor(outputs['log_probs'],
                                                     device=cuda_device)
             if output_cum_log_probs:
-                outputs['cum_log_probs'] = []
-                for response in responses:
-                    outputs['cum_log_probs'] += [
-                        a.result.cum_log_probs for a in response
-                        if a.result.cum_log_probs is not None
-                    ]
+                outputs['cum_log_probs'] = [
+                    a.result.cum_log_probs for a in responses
+                    if a.result.cum_log_probs is not None
+                ]
                 outputs['cum_log_probs'] = torch.tensor(
                     outputs['cum_log_probs'], device=cuda_device)
             input_lengths = torch.tensor([x.size(0) for x in batch_input_ids],

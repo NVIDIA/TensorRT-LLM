@@ -338,15 +338,21 @@ void dispatchMoeGemmToCutlass(T const* A, WeightType const* B, T const* weight_s
 template <typename T, typename WeightType>
 std::vector<cutlass_extensions::CutlassGemmConfig> MoeGemmRunner<T, WeightType>::getConfigs() const
 {
-    std::vector<cutlass_extensions::CutlassGemmConfig> candidate_configs = getAmpereConfigs();
-    std::vector<cutlass_extensions::CutlassGemmConfig> hopper_configs = getHopperConfigs();
-    std::copy(hopper_configs.begin(), hopper_configs.end(), std::back_inserter(candidate_configs));
+    return getConfigs(sm_);
+}
+
+template <typename T, typename WeightType>
+std::vector<cutlass_extensions::CutlassGemmConfig> MoeGemmRunner<T, WeightType>::getConfigs(int sm)
+{
+    std::vector<cutlass_extensions::CutlassGemmConfig> candidate_configs = getHopperConfigs(sm);
+    std::vector<cutlass_extensions::CutlassGemmConfig> ampere_configs = getAmpereConfigs(sm);
+    std::copy(ampere_configs.begin(), ampere_configs.end(), std::back_inserter(candidate_configs));
 
     return candidate_configs;
 }
 
 template <typename T, typename WeightType>
-std::vector<cutlass_extensions::CutlassGemmConfig> MoeGemmRunner<T, WeightType>::getAmpereConfigs() const
+std::vector<cutlass_extensions::CutlassGemmConfig> MoeGemmRunner<T, WeightType>::getAmpereConfigs(int sm)
 {
     using tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
     static constexpr auto weight_only_flag
@@ -366,12 +372,12 @@ std::vector<cutlass_extensions::CutlassGemmConfig> MoeGemmRunner<T, WeightType>:
     }
 
     std::vector<cutlass_extensions::CutlassGemmConfig> ampere_configs
-        = kernels::cutlass_kernels::get_candidate_configs(sm_, max_split_k, config_type_param);
+        = kernels::cutlass_kernels::get_candidate_configs(sm, max_split_k, config_type_param);
     return ampere_configs;
 }
 
 template <typename T, typename WeightType>
-std::vector<cutlass_extensions::CutlassGemmConfig> MoeGemmRunner<T, WeightType>::getHopperConfigs() const
+std::vector<cutlass_extensions::CutlassGemmConfig> MoeGemmRunner<T, WeightType>::getHopperConfigs(int sm)
 {
     using tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
     static constexpr auto weight_only_flag
@@ -391,7 +397,7 @@ std::vector<cutlass_extensions::CutlassGemmConfig> MoeGemmRunner<T, WeightType>:
     }
 
     std::vector<cutlass_extensions::CutlassGemmConfig> hopper_configs
-        = kernels::cutlass_kernels::get_candidate_configs(sm_, max_split_k, config_type_param);
+        = kernels::cutlass_kernels::get_candidate_configs(sm, max_split_k, config_type_param);
     return hopper_configs;
 }
 
@@ -503,7 +509,7 @@ size_t MoeGemmRunner<T, WeightType>::calcMaxWorkspaceSize(int num_experts) const
     }
     if constexpr (kernels::cutlass_kernels::isValidHopperMOESpecialisation<T, WeightType>())
     {
-        auto configs = getHopperConfigs();
+        auto configs = getHopperConfigs(sm_);
         size_t max_size = 0;
         bool has_config = false;
         for (auto conf : configs)

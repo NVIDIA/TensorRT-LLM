@@ -111,6 +111,7 @@ def convert_hf_mamba(hf_mamba, rank=0, dtype='float32'):
     for layer in ['backbone.embeddings', 'backbone.norm_f']:
         weight, bias = get_weight_and_bias(model_params, layer, dtype, dtype)
         layer = layer.replace('embeddings', 'vocab_embedding')
+        layer = layer.replace('norm_f', 'ln_f')
         weights[layer + '.weight'] = weight
         if bias is not None:
             weights[layer + '.bias'] = bias
@@ -126,12 +127,15 @@ def convert_hf_mamba(hf_mamba, rank=0, dtype='float32'):
 
 def rename_hf_to_tllm(name: str):
     """ Rename a HF parameter name by the corresponding TRT-LLM style name. """
+    # change layer name
     if 'embeddings.' in name:
         name = name.replace('embeddings', 'vocab_embedding')
     if 'mixer.' in name:
         name = name.replace('mixer.', 'ssm.')
     elif 'norm.' in name:
         name = name.replace('norm.', 'input_layernorm.')
+    elif 'norm_f.' in name:
+        name = name.replace('norm_f.', 'ln_f.')
 
     # Parameter names in ssm layers
     if 'A_log' in name:

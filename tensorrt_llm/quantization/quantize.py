@@ -1,5 +1,5 @@
-from ..layers import (MLP, Attention, ColumnLinear, GatedMLP, LayerNorm,
-                      RmsNorm, RowLinear)
+from ..layers import (MLP, Attention, ColumnLinear, Embedding, GatedMLP,
+                      LayerNorm, RmsNorm, RowLinear)
 from ..models.modeling_utils import QuantConfig
 from ..parameter import Parameter
 from .layers import (FP8Linear, FP8RowLinear, Int8SmoothQuantLinear,
@@ -7,7 +7,8 @@ from .layers import (FP8Linear, FP8RowLinear, Int8SmoothQuantLinear,
                      SmoothQuantGatedMLP, SmoothQuantLayerNorm, SmoothQuantMLP,
                      SmoothQuantRmsNorm, WeightOnlyGroupwiseQuantColumnLinear,
                      WeightOnlyGroupwiseQuantRowLinear,
-                     WeightOnlyQuantColumnLinear, WeightOnlyQuantRowLinear)
+                     WeightOnlyQuantColumnLinear, WeightOnlyQuantEmbedding,
+                     WeightOnlyQuantRowLinear)
 from .mode import W8A8_SQ_PLUGIN_LIST, QuantAlgo
 
 
@@ -16,7 +17,13 @@ def weight_only_quantize(model,
                          current_key_name=None):
     assert quant_config.quant_mode.is_weight_only()
 
-    exclude_modules = quant_config.exclude_modules or ['lm_head', 'router']
+    exclude_modules = quant_config.exclude_modules or [
+        'lm_head',
+        'router',
+        'vocab_embedding',
+        'position_embedding',
+        'block_embedding',
+    ]
 
     for name, module in model.named_children():
         if current_key_name is None:
@@ -29,6 +36,7 @@ def weight_only_quantize(model,
         if isinstance(module, ColumnLinear) and name not in exclude_modules:
             if not any(key in '.'.join(current_key_name)
                        for key in exclude_modules):
+                transb = True if name == "lm_head" else False
                 model._modules[name] = WeightOnlyQuantColumnLinear(
                     in_features=module.in_features,
                     out_features=module.out_features * module.tp_size,
@@ -37,7 +45,8 @@ def weight_only_quantize(model,
                     tp_group=module.tp_group,
                     tp_size=module.tp_size,
                     gather_output=module.gather_output,
-                    quant_mode=quant_config.quant_mode)
+                    quant_mode=quant_config.quant_mode,
+                    transb=transb)
         elif isinstance(module, RowLinear) and name not in exclude_modules:
             if not any(key in '.'.join(current_key_name)
                        for key in exclude_modules):
@@ -48,6 +57,18 @@ def weight_only_quantize(model,
                     dtype=module.dtype,
                     tp_group=module.tp_group,
                     tp_size=module.tp_size,
+                    quant_mode=quant_config.quant_mode)
+        elif isinstance(module, Embedding) and name not in exclude_modules:
+            if not any(key in '.'.join(current_key_name)
+                       for key in exclude_modules):
+                model._modules[name] = WeightOnlyQuantEmbedding(
+                    num_embeddings=module.num_embeddings,
+                    embedding_dim=module.embedding_dim,
+                    dtype=module.dtype,
+                    tp_size=module.tp_size,
+                    tp_group=module.tp_group,
+                    sharding_dim=module.sharding_dim,
+                    tp_rank=module.tp_rank,
                     quant_mode=quant_config.quant_mode)
 
         current_key_name.pop(-1)
