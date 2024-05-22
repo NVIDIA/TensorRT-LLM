@@ -610,8 +610,8 @@ def get_tllm_linear_sq_weight(vals,
             cur_per_channel_value
         ).to(torch.float32).reshape(col_shape).contiguous().cuda()
         results[prefix + 'act_scale'] = torch.Tensor(
-            vals['scale_y_quant_orig']).to(torch.float32).contiguous().cuda()
-        results[last_prefix] = torch.Tensor(vals['scale_x_orig_quant']).to(
+            [[vals['scale_y_quant_orig']]]).to(torch.float32).contiguous().cuda()
+        results[last_prefix] = torch.Tensor([vals['scale_x_orig_quant']]).to(
             torch.float32).contiguous().cuda()
 
     if smoother_value is not None:
