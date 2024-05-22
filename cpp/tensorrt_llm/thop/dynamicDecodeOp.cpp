@@ -201,8 +201,6 @@ void FtDynamicDecode<T>::forward(th::Tensor const& logits, int const step, int c
         safeUpdatePtr<int>(beam_hyps_num_beams_opt, outputParams->beamHypotheses->numBeamsCBA);
         safeUpdatePtr<int>(beam_hyps_output_ids_cba_opt, outputParams->beamHypotheses->outputIdsCBA);
         safeUpdatePtr<int>(beam_hyps_seq_len_cba_opt, outputParams->beamHypotheses->sequenceLengthsCBA);
-        // TODO: move the assignment below into beamSearchLayer.cu
-        safeUpdatePtr<int32_t const>(input_lengths_opt, outputParams->beamHypotheses->inputLengths);
     }
 
     dynamic_decode_layer_->forward(outputParams, forwardParams);

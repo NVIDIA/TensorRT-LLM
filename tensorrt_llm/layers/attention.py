@@ -334,19 +334,6 @@ class Attention(Module):
         if self.position_embedding_type.is_rope():
             self.rotary_embedding_dim = int(self.attention_head_size *
                                             rotary_embedding_percentage)
-            embed_positions = RopeEmbeddingUtils.create_sinusoidal_positions(
-                self.max_position_embeddings,
-                self.rotary_embedding_dim,
-            )
-            self.register_parameter('embed_positions',
-                                    Parameter(embed_positions))
-            embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
-                self.max_position_embeddings, self.rotary_embedding_dim,
-                self.rotary_embedding_base, self.rotary_embedding_scale,
-                self.rotary_embedding_scale_type)
-            self.register_parameter(
-                'embed_positions_for_gpt_attention',
-                Parameter(embed_positions_for_gpt_attention))
 
             if self.position_embedding_type == PositionEmbeddingType.long_rope:
                 embed_positions_short_factors, embed_positions_long_factors, \
@@ -365,22 +352,43 @@ class Attention(Module):
 
                 self.register_parameter(
                     'embed_positions_short_factors',
-                    Parameter(embed_positions_short_factors))
-                self.register_parameter('embed_positions_long_factors',
-                                        Parameter(embed_positions_long_factors))
+                    Parameter(embed_positions_short_factors, dtype='float32'))
+                self.register_parameter(
+                    'embed_positions_long_factors',
+                    Parameter(embed_positions_long_factors, dtype='float32'))
                 self.register_parameter(
                     'embed_positions_short_factors_for_attention_plugin',
                     Parameter(
-                        embed_positions_short_factors_for_attention_plugin))
+                        embed_positions_short_factors_for_attention_plugin,
+                        dtype='float32'))
                 self.register_parameter(
                     'embed_positions_long_factors_for_attention_plugin',
-                    Parameter(
-                        embed_positions_long_factors_for_attention_plugin))
+                    Parameter(embed_positions_long_factors_for_attention_plugin,
+                              dtype='float32'))
                 self.mscale = mscale
-                self.register_parameter('rope_scaling_short_factors',
-                                        Parameter(rope_scaling_short_factors))
-                self.register_parameter('rope_scaling_long_factors',
-                                        Parameter(rope_scaling_long_factors))
+                self.register_parameter(
+                    'rope_scaling_short_factors',
+                    Parameter(rope_scaling_short_factors, dtype='float32'))
+                self.register_parameter(
+                    'rope_scaling_long_factors',
+                    Parameter(rope_scaling_long_factors, dtype='float32'))
+            else:
+                # Rotary cos/sin cache.
+                embed_positions = RopeEmbeddingUtils.create_sinusoidal_positions(
+                    self.max_position_embeddings,
+                    self.rotary_embedding_dim,
+                )
+                self.register_parameter(
+                    'embed_positions',
+                    Parameter(embed_positions, dtype='float32'))
+                embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
+                    self.max_position_embeddings, self.rotary_embedding_dim,
+                    self.rotary_embedding_base, self.rotary_embedding_scale,
+                    self.rotary_embedding_scale_type)
+                self.register_parameter(
+                    'embed_positions_for_gpt_attention',
+                    Parameter(embed_positions_for_gpt_attention,
+                              dtype='float32'))
 
         elif self.position_embedding_type.is_alibi():
             alibi_scale = 1. / self.norm_factor if self.scale_alibi_bias else 1.
@@ -390,7 +398,8 @@ class Attention(Module):
                 tp_rank=self.tp_rank,
                 alibi_scale=alibi_scale,
                 alibi_bias_max=self.alibi_bias_max)
-            self.register_parameter('alibi_slopes', Parameter(alibi_slopes))
+            self.register_parameter('alibi_slopes',
+                                    Parameter(alibi_slopes, dtype='float32'))
 
         self.quant_mode = quant_mode
         self.register_parameter('kv_cache_scaling_factor', None)
@@ -824,10 +833,10 @@ class Attention(Module):
                     select = where(
                         sequence_length <=
                         self.original_max_position_embeddings, 0, 1)
-                    self.embed_positions = slice(embed_positions,
-                                                 concat([select, 0, 0]),
-                                                 sizes=shape(short))
-                    embed_positions = cast(self.embed_positions, self.dtype)
+                    embed_positions = slice(embed_positions,
+                                            concat([select, 0, 0]),
+                                            sizes=shape(short))
+                    embed_positions = cast(embed_positions, self.dtype)
                 elif is_same_dtype(self.dtype, trt.bfloat16):
                     embed_positions = cast(self.embed_positions.value,
                                            trt.bfloat16)
@@ -1374,8 +1383,9 @@ class CogVLMAttention(Attention):
             self.rotary_embedding_base, self.rotary_embedding_scale,
             self.rotary_embedding_scale_type, self.vision_start,
             self.vision_length)
-        self.register_parameter('embed_positions_for_gpt_attention',
-                                Parameter(embed_positions_for_gpt_attention))
+        self.register_parameter(
+            'embed_positions_for_gpt_attention',
+            Parameter(embed_positions_for_gpt_attention, dtype='float32'))
 
     def forward(self,
                 hidden_states: Tensor,

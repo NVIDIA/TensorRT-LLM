@@ -48,3 +48,9 @@ For example, the basic example can be run as follows:
 ```
 mpirun -n 4 --allow-run-as-root python3 example_basic.py --model_path=../llama/tmp/7B/trt_engines/fp16/4gpu_tp4_pp1/
 ```
+
+The advanced example can also be run using the ORCHESTRATOR mode, where the additional processes needed for multi-GPU runs will automatically be spawned.
+This can be done by running:
+```
+python3 example_advanced.py --model_path=../llama/tmp/7B/trt_engines/fp16/4gpu_tp4_pp1/ --use_orchestrator_mode
+```

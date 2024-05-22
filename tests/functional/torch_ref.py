@@ -629,7 +629,8 @@ class recurrent_ref(nn.Module):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.d_conv = d_conv
-        self.a_param = nn.Parameter(torch.randn([lru_width], device=device))
+        self.recurrent_param = nn.Parameter(
+            torch.randn([lru_width], device=device))
 
         self.linear_x = nn.Linear(width, lru_width, **factory_kwargs)
         self.linear_y = nn.Linear(width,
@@ -654,7 +655,7 @@ class recurrent_ref(nn.Module):
             width=lru_width,
             **factory_kwargs,
         )
-        self.a_gate = BlockDiagonalLinear(
+        self.recurrent_gate = BlockDiagonalLinear(
             num_blocks=num_heads,
             width=lru_width,
             **factory_kwargs,
@@ -738,10 +739,10 @@ class recurrent_ref(nn.Module):
 
         # rg lru
         gate_x = self.input_gate(x)
-        gate_a = self.a_gate(x)
+        gate_a = self.recurrent_gate(x)
 
         x, lru_state = rg_lru_ref(x, gate_x, gate_a, y, self.y_bias,
-                                  segment_pos, lru_state, self.a_param)
+                                  segment_pos, lru_state, self.recurrent_param)
 
         # Join branches.
         x = self.linear_out(x)

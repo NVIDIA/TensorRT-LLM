@@ -52,6 +52,11 @@ def run_command(command: _tp.Sequence[str],
                 env=None,
                 timeout=None) -> None:
     _log.info("Running: cd %s && %s", str(cwd), " ".join(command))
+    override_timeout = int(_os.environ.get("CPP_TEST_TIMEOUT_OVERRIDDEN", "-1"))
+    if override_timeout > 0 and (timeout is None or override_timeout > timeout):
+        _log.info("Overriding the command timeout: %s (before) and %s (after)",
+                  timeout, override_timeout)
+        timeout = override_timeout
     _sp.check_call(command, cwd=cwd, shell=shell, env=env, timeout=timeout)
 
 
@@ -84,7 +89,7 @@ def build_trt_llm(python_exe: str,
     if job_count is not None:
         build_wheel += ["-j", str(job_count)]
 
-    run_command(build_wheel, cwd=root_dir, env=_os.environ, timeout=3600)
+    run_command(build_wheel, cwd=root_dir, env=_os.environ, timeout=5400)
 
 
 def run_tests(cuda_architectures: _tp.Optional[str] = None,

@@ -46,25 +46,25 @@ BeamSearchLayer<T>::~BeamSearchLayer()
 }
 
 template <typename T>
-void BeamSearchLayer<T>::setup(runtime::SizeType32 const batch_size, runtime::SizeType32 const beam_width,
+void BeamSearchLayer<T>::setup(runtime::SizeType32 const batchSize, runtime::SizeType32 const beamWidth,
     runtime::SizeType32 const* batchSlots, std::shared_ptr<BaseSetupParams> baseSetupParams)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK_WITH_INFO(
-        beam_width <= nMaxBeamWidth, std::string("Beam width is larger than the maximum supported (64)."));
+        beamWidth <= nMaxBeamWidth, std::string("Beam width is larger than the maximum supported (64)."));
 
     auto setupParams = std::dynamic_pointer_cast<BeamSearchSetupParams>(baseSetupParams);
 
-    mDiversityRateHost.resize(batch_size);
-    mLengthPenaltyHost.resize(batch_size);
-    mEarlyStoppingHost.resize(batch_size);
-    allocateBuffer(batch_size, beam_width);
+    mDiversityRateHost.resize(batchSize);
+    mLengthPenaltyHost.resize(batchSize);
+    mEarlyStoppingHost.resize(batchSize);
+    allocateBuffer(batchSize, beamWidth);
 
     auto constexpr fltMax = std::numeric_limits<float>::max();
     auto constexpr fltMin = std::numeric_limits<float>::lowest();
     auto constexpr fltEpsilon = std::numeric_limits<float>::epsilon();
 
-    FillBuffers const fillBuffers{batch_size, batch_size, mStream};
+    FillBuffers const fillBuffers{batchSize, batchSize, mStream};
     fillBuffers(setupParams->beam_search_diversity_rate, DefaultDecodingParams::getBeamSearchDiversity(),
         mDiversityRateHost, mDiversityRateDevice, (int*) nullptr, std::make_pair(-fltEpsilon, fltMax),
         "diveristy rate");
@@ -75,50 +75,36 @@ void BeamSearchLayer<T>::setup(runtime::SizeType32 const batch_size, runtime::Si
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-__global__ void updateIndirCacheKernel(int* tgt_indir_cache, int const* src_indir_cache, BeamHypotheses bh,
-    int const* inputLengths, int max_attention_window, int sink_token_length)
+__global__ void updateCacheIndirectionKernel(
+    int* tgtCI, int const* srcCI, BeamHypotheses bh, int const nMaxAttentionWindow, int const nSinkTokenLength)
 {
-    // Update indirections from steps `nInputLength[nBBId]` to step `sequence_lengths[nBBId]`
-    int const time_step = threadIdx.x + blockIdx.x * blockDim.x;
-    int const nBBId = blockIdx.y;
+    // Update indirections from steps `bh.inputLength[indexBatchBeam]` to step `sequence_lengths[indexBatchBeam]`
+    int const step = threadIdx.x + blockIdx.x * blockDim.x;
+    int const indexBatchBeam = blockIdx.y;
+    int const nBS{bh.nBatchSize};
     int const nBM{bh.nBeamWidth};
-    int const batch_id = nBBId / nBM;
-    int const beam_id = nBBId % nBM;
-    int const current_step{bh.sequenceLengths[nBBId] - 1}; // the sequence_lengths is updated, need to minus 1
-    int const nInputLength{inputLengths == nullptr ? 0 : inputLengths[nBBId]};
+    int const nMSL{bh.nMaxSeqLen};
+    int const indexBatch = indexBatchBeam / nBM;
+    int const indexBeam = indexBatchBeam % nBM;
+    int const lastStep{bh.sequenceLengths[indexBatchBeam] - 1}; // the sequence_lengths is updated, need to minus 1
 
-    // Return early when the nBBId or timestep is out of the bound
-    // No update for the indices of context part since KV Cache is shared and fixed for context part
-    if (nBBId >= nBM * bh.nBatchSizeLocal || time_step >= bh.nMaxSeqLen || time_step < nInputLength
-        || time_step < (bh.nMaxSeqLen - max_attention_window) || bh.finished[nBBId].isFinished())
+    // Return early when the indexBatchBeam or step is out of the bound
+    // No update for the indices of context part since KV Cache is shared
+    if (indexBatchBeam >= nBM * nBS || step >= nMSL || step < bh.inputLengths[indexBatchBeam]
+        || step < (nMSL - nMaxAttentionWindow) || bh.finished[indexBatchBeam].isFinished())
     {
         return;
     }
-    int time_step_circ = time_step;
-    if (time_step_circ >= sink_token_length)
-    {
-        time_step_circ
-            = sink_token_length + (time_step - sink_token_length) % (max_attention_window - sink_token_length);
-    }
 
-    // for the parent_ids, we will still keep it for all past tokens (i.e. bh.nMaxSeqLen)
-    int const src_beam = bh.parentIdsPtr[batch_id][beam_id * bh.nMaxSeqLen + current_step];
-
-    // for the indir tables, we have the cyclic kv cache.
-    uint32_t const tgt_offset = batch_id * nBM * max_attention_window + beam_id * max_attention_window + time_step_circ;
-    uint32_t const src_offset
-        = batch_id * nBM * max_attention_window + src_beam * max_attention_window + time_step_circ;
-
-    tgt_indir_cache[tgt_offset] = (time_step == current_step) ? beam_id : src_indir_cache[src_offset];
-}
-
-void updateIndirCacheKernelLauncher(int* tgt_cache_indirection, int const* src_cache_indirection, BeamHypotheses& bh,
-    int const* inputLengths, int max_attention_window, int sink_token_length, cudaStream_t stream)
-{
-    int const max_seq_len_aligned = (bh.nMaxSeqLen + 31) / 32;
-    dim3 const grid(max_seq_len_aligned, bh.nBatchSizeLocal * bh.nBeamWidth);
-    updateIndirCacheKernel<<<grid, 32, 0, stream>>>(
-        tgt_cache_indirection, src_cache_indirection, bh, inputLengths, max_attention_window, sink_token_length);
+    // Keep all past tokens by parentIdsPtr
+    int const indexBeamSrc = bh.parentIdsPtr[indexBatch][indexBeam * nMSL + lastStep];
+    int const stepCirc = (step >= nSinkTokenLength)
+        ? nSinkTokenLength + (step - nSinkTokenLength) % (nMaxAttentionWindow - nSinkTokenLength)
+        : step;
+    // Consider cyclic kv cache for the indir tables
+    uint32_t const tgtOffset = indexBatch * nBM * nMaxAttentionWindow + indexBeam * nMaxAttentionWindow + stepCirc;
+    uint32_t const srcOffset = indexBatch * nBM * nMaxAttentionWindow + indexBeamSrc * nMaxAttentionWindow + stepCirc;
+    tgtCI[tgtOffset] = (step == lastStep) ? indexBeam : srcCI[srcOffset];
 }
 
 template <typename T>
@@ -127,42 +113,38 @@ void BeamSearchLayer<T>::forward(
 {
     TLLM_LOG_TRACE("%s", __PRETTY_FUNCTION__);
 
-    auto fp = std::dynamic_pointer_cast<BeamSearchInputParams>(baseInputs);
+    auto ip = std::dynamic_pointer_cast<BeamSearchInputParams>(baseInputs);
     auto op = std::dynamic_pointer_cast<BeamSearchOutputParams>(baseOutputs);
 
     TLLM_CHECK_WITH_INFO(op->beamHypotheses, std::string("Output BeamHypotheses is not set."));
     TLLM_CHECK_WITH_INFO(op->sequence_length->template getPtr<int>() != nullptr || mLengthPenaltyDevice == nullptr,
         std::string("Current sequence lengths must be set for length penalty computation."));
-    TLLM_CHECK_WITH_INFO(fp->ite == 0, "Pipeline Parallelism is not supported yet !");
+    TLLM_CHECK_WITH_INFO(ip->ite == 0, "Pipeline Parallelism is not supported yet !");
 
     BeamHypotheses& bh{*op->beamHypotheses};
-    bh.nBatchSize = static_cast<std::int32_t>(op->output_ids_ptr.shape[0]);
+    // bh's members already initialized in op: *CBA, batchDones
+    // bh's members not used in function: outputIds, logProbs, outputIdsUnfinish, parentIdsUnfinish
+    bh.nMaxBatchSize = static_cast<std::int32_t>(op->output_ids_ptr.shape[0]);
+    bh.nBatchSize = ip->logits.shape[0];
     bh.nBeamWidth = static_cast<std::int32_t>(op->output_ids_ptr.shape[1]);
-    bh.nIte = fp->ite;
-    bh.nBatchSizeLocal = fp->logits.shape[0];
+    bh.nIte = ip->ite;
     bh.nMaxSeqLen = static_cast<std::int32_t>(op->output_ids_ptr.shape[2]);
     bh.nVocabSize = mVocabSizePadded;
     bh.diversityRates = mDiversityRateDevice;
     bh.lengthPenalties = mLengthPenaltyDevice;
     bh.earlyStoppings = mEarlyStoppingDevice;
-    // bh.inputLengths = (fp->input_lengths) ? fp->input_lengths->template getPtr<int const>() : nullptr;
-    // TODO: unify the assignment of inputLengths
-    bh.endIds = fp->end_ids.template getPtr<int const>();
-    bh.logProbs = (op->output_log_probs) ? op->output_log_probs->template getPtr<float>() : nullptr;
-    // TODO (wili): here is a error in C++ workflow
-    // In Python workflow, `op.output_log_probs` here is assigned by `outputs.output_log_probs_tiled` [MSL, BS, BM]
-    // (function layersForward in file cpp/tensorrt_llm/layers/dynamicDecodeLayer.cpp)
-    // But in C++ workflow, `op.output_log_probs` here is assigned by `output.logProbs` [BS, BM, MSL]
-    // (function prepareOutputs in file cpp/tensorrt_llm/runtime/gptDecoder.cpp)
+    bh.inputLengths = ip->input_lengths->template getPtr<int const>();
+    bh.endIds = ip->end_ids.template getPtr<int const>();
+    bh.logProbsTiled = (op->output_log_probs) ? op->output_log_probs->template getPtr<float>() : nullptr;
     bh.sequenceLengths = op->sequence_length->template getPtr<int>();
     bh.cumLogProbs = op->cum_log_probs->template getPtr<float>();
     bh.finished = reinterpret_cast<FinishedState*>(op->finished->template getPtr<FinishedState::UnderlyingType>());
     bh.outputIdsPtr = op->output_ids_ptr.template getPtr<int*>();
     bh.parentIdsPtr = op->parent_ids_ptr.template getPtr<int*>();
 
-    T const* logits = fp->logits.template getPtr<T>();
+    T const* logits = ip->logits.template getPtr<T>();
     T const* bias = static_cast<T const*>(nullptr);
-    TLLM_CHECK_WITH_INFO(mWorkspaceSize >= 2 * bh.nBatchSize * bh.nBeamWidth * bh.nBeamWidth * 2,
+    TLLM_CHECK_WITH_INFO(mWorkspaceSize >= 2 * bh.nMaxBatchSize * bh.nBeamWidth * bh.nBeamWidth * 2,
         std::string("Workspace size is not enough for topk softmax."));
 
     invokeTopkSoftMax(logits, bias, mWorkspace, bh, mStream);
@@ -170,29 +152,28 @@ void BeamSearchLayer<T>::forward(
 
     if (bh.nBeamWidth > 1)
     {
-        auto* const inputLengths = fp->input_lengths ? fp->input_lengths->template getPtr<int const>() : nullptr;
-        auto tgt_ci = op->tgt_cache_indirection.template getPtr<int>();
-        auto src_ci = fp->src_cache_indirection.template getPtr<int const>();
-
-        updateIndirCacheKernelLauncher(
-            tgt_ci, src_ci, bh, inputLengths, fp->max_attention_window, fp->sink_token_length, mStream);
+        auto tgtCI = op->tgt_cache_indirection.template getPtr<int>();
+        auto srcCI = ip->src_cache_indirection.template getPtr<int const>();
+        dim3 const grid(roundUp(bh.nMaxSeqLen, 32), bh.nBatchSize * bh.nBeamWidth);
+        updateCacheIndirectionKernel<<<grid, 32, 0, mStream>>>(
+            tgtCI, srcCI, bh, ip->max_attention_window, ip->sink_token_length);
         sync_check_cuda_error();
     }
 }
 
 template <typename T>
-void BeamSearchLayer<T>::allocateBuffer(runtime::SizeType32 const batch_size, runtime::SizeType32 const beam_width)
+void BeamSearchLayer<T>::allocateBuffer(runtime::SizeType32 const batchSize, runtime::SizeType32 const beamWidth)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    int const nPadBeamWidth = padToNextPowerOfTwo(beam_width);
+    int const nPadBeamWidth = padToNextPowerOfTwo(beamWidth);
     // Unit of mWorkspaceSize is number of elements (not Byte), align to 4 for further optimization
-    size_t nTopK = batch_size * nPadBeamWidth * nPadBeamWidth * 2;
-    size_t nTempBuffer = batch_size * nPadBeamWidth * nMaxVocabPartForStage1FastKernel * (2 * (nPadBeamWidth * 2) + 2);
+    size_t nTopK = batchSize * nPadBeamWidth * nPadBeamWidth * 2;
+    size_t nTempBuffer = batchSize * nPadBeamWidth * nMaxVocabPartForStage1FastKernel * (2 * (nPadBeamWidth * 2) + 2);
     mWorkspaceSize = roundUp(nTopK, 4) * 2 + roundUp(nTempBuffer, 4);
     mWorkspace = mAllocator->reMalloc(mWorkspace, sizeof(float) * mWorkspaceSize, true);
-    mDiversityRateDevice = mAllocator->reMalloc(mDiversityRateDevice, sizeof(float) * batch_size, false);
-    mLengthPenaltyDevice = mAllocator->reMalloc(mLengthPenaltyDevice, sizeof(float) * batch_size, false);
-    mEarlyStoppingDevice = mAllocator->reMalloc(mEarlyStoppingDevice, sizeof(int) * batch_size, false);
+    mDiversityRateDevice = mAllocator->reMalloc(mDiversityRateDevice, sizeof(float) * batchSize, false);
+    mLengthPenaltyDevice = mAllocator->reMalloc(mLengthPenaltyDevice, sizeof(float) * batchSize, false);
+    mEarlyStoppingDevice = mAllocator->reMalloc(mEarlyStoppingDevice, sizeof(int) * batchSize, false);
     mIsAllocateBuffer = true;
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

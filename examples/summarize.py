@@ -85,9 +85,15 @@ def main(args):
         dataset_input_key = 'input'
         dataset_output_key = 'output'
         dataset_split = 'validation'  # only this split contains reference strings
+    if args.dataset_dir is not None and isinstance(args.dataset_dir, str):
+        args.dataset_dir = args.dataset_dir.rstrip('/')
+        if args.dataset_dir.endswith(dataset_name):
+            dataset_name = args.dataset_dir
+        else:
+            dataset_name = f"{args.dataset_dir}/{dataset_name}"
     dataset = load_dataset(dataset_name,
                            dataset_revision,
-                           cache_dir=args.dataset_path,
+                           cache_dir=args.dataset_cache_dir,
                            split=dataset_split)
 
     max_batch_size = args.batch_size
@@ -456,7 +462,8 @@ def main(args):
             'fp16': 'float16',
             'bf16': 'bfloat16'
         }
-        args.data_type = dtype_alias_mapping.get(args.data_type, args.data_type)
+        args.hf_data_type = dtype_alias_mapping.get(args.hf_data_type,
+                                                    args.hf_data_type)
         if model_name == 'ChatGLMForCausalLM' and model_version == 'glm':
             auto_model_cls = AutoModelForSeq2SeqLM
         elif model_name == 'ChatGLMForCausalLM' and model_version == 'chatglm':
@@ -466,7 +473,7 @@ def main(args):
         model = auto_model_cls.from_pretrained(
             args.hf_model_dir,
             trust_remote_code=True,
-            torch_dtype=str_dtype_to_torch(args.data_type),
+            torch_dtype=str_dtype_to_torch(args.hf_data_type),
             device_map='auto' if args.hf_device_map_auto else None)
         try:
             model.to_bettertransformer()
@@ -609,10 +616,12 @@ if __name__ == '__main__':
     parser.add_argument('--test_hf', action='store_true')
     parser.add_argument('--test_trt_llm', action='store_true')
     parser.add_argument(
+        '--hf_data_type',
         '--data_type',
         type=str,
         choices=['fp32', 'fp16', 'bf16', 'float32', 'float16', 'bfloat16'],
-        default='fp16')
+        default='fp16',
+        help="The data type for hf model.")
     parser.add_argument('--engine_dir', type=str, default='engine_outputs')
     parser.add_argument('--use_py_session',
                         default=False,
@@ -631,7 +640,18 @@ if __name__ == '__main__':
     parser.add_argument('--tensorrt_llm_ppl_threshold',
                         type=float,
                         default=15.0)
-    parser.add_argument('--dataset_path', type=str, default='')
+    parser.add_argument(
+        '--dataset_dir',
+        type=str,
+        default=None,
+        help="The local directory of the dataset for evaluation; "
+        "will download the dataset from huggingface hub if not specified.")
+    parser.add_argument(
+        '--dataset_cache_dir',
+        type=str,
+        default=None,
+        help="The local cache directory for dataset; "
+        "will use `~/.cache/huggingface/datasets` if not specified.")
     parser.add_argument('--log_level', type=str, default='info')
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--max_ite', type=int, default=20)

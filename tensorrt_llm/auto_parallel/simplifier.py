@@ -554,6 +554,7 @@ class Simplifier:
                         p2p_layer = new_graph.as_trt().add_identity(
                             output_tensor.as_trt())
                         p2p_layer.name = f"p2p_block{block.block_id}_{from_name}"
+                        p2p_layer.metadata = p2p_layer.name
                         p2p_tensor = p2p_layer.get_output(0)
                         p2p_tensor.name = f"{p2p_layer.name}_output"
                         wrapped_layer = new_graph.register_layer(p2p_layer)
@@ -591,6 +592,7 @@ class Simplifier:
                         same_spec_layer = new_graph.as_trt().add_identity(
                             output_tensor.as_trt())
                         same_spec_layer.name = f"{tensor_name}_same_spec"
+                        same_spec_layer.metadata = same_spec_layer.name
                         same_spec_tensor = same_spec_layer.get_output(0)
                         same_spec_tensor.name = f"{same_spec_layer.name}_output"
                         wrapped_layer = new_graph.register_layer(

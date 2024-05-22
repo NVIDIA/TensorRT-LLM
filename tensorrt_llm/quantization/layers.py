@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
+from typing import Optional
 
 import numpy as np
 import tensorrt as trt
@@ -22,9 +23,10 @@ from .._utils import fp32_array, is_same_dtype
 from ..functional import (ACT2FN, AttentionMaskType, PositionEmbeddingType,
                           RopeEmbeddingUtils, RotaryScalingType, Tensor,
                           allgather, allreduce, cast, concat, constant,
-                          generate_alibi_slopes, gpt_attention, matmul, mul,
-                          shape, slice, softmax, split, where)
+                          embedding, generate_alibi_slopes, gpt_attention,
+                          matmul, mul, shape, slice, softmax, split, where)
 from ..layers import SpecDecodingParams
+from ..layers.embedding import Embedding
 from ..layers.linear import Linear, RowLinear
 from ..module import Module
 from ..parameter import Parameter
@@ -78,7 +80,7 @@ class Dequantize(Module):
 
     def __init__(self, axis: int = -1) -> None:
         super().__init__()
-        self.scaling_factor = Parameter(shape=())
+        self.scaling_factor = Parameter(shape=(), dtype='float32')
         self.axis = axis
 
     def forward(self, input):
@@ -331,6 +333,8 @@ class WeightOnlyQuantLinear(Module):
             tp_size=1,
             gather_output=True,
             quant_mode=QuantMode.use_weight_only(),
+            transa=False,
+            transb=False,
     ):
         super().__init__()
         if quant_mode.is_int8_weight_only():
@@ -360,6 +364,9 @@ class WeightOnlyQuantLinear(Module):
         else:
             self.register_parameter('bias', None)
 
+        self.transa = transa
+        self.transb = transb
+
     def forward(self, x, lora_runtime_params=None):
         assert lora_runtime_params is None, "lora is not supported on WeightOnlyQuantLinear now"
         # ootb has not supported int4 yet.
@@ -370,7 +377,8 @@ class WeightOnlyQuantLinear(Module):
 
         x = weight_only_quant_matmul(x, self.weight.value,
                                      self.per_channel_scale.value,
-                                     self.weight_only_quant_mode, self.dtype)
+                                     self.weight_only_quant_mode, self.dtype,
+                                     self.transa, self.transb)
 
         if self.bias is not None:
             x = x + self.bias.value
@@ -434,6 +442,54 @@ class WeightOnlyQuantRowLinear(Module):
             x = x + self.bias.value
 
         return x
+
+
+class WeightOnlyQuantEmbedding(Embedding):
+
+    def __init__(
+            self,
+            num_embeddings: int,
+            embedding_dim: int,
+            dtype: Optional[str] = None,
+            tp_size: int = 1,
+            tp_group: Optional[list] = None,
+            sharding_dim: int = 0,
+            tp_rank: Optional[int] = None,
+            quant_mode=QuantMode.use_weight_only(),
+    ):
+        super().__init__(
+            num_embeddings,
+            embedding_dim,
+            dtype,  # dtype,
+            tp_size,
+            tp_group,
+            sharding_dim,
+            tp_rank)
+        # only support int8 wo now
+        # TODO support int4 wo
+        self.quant_mode = quant_mode
+        self.per_token_scale = Parameter(shape=(self.num_embeddings, ),
+                                         dtype=dtype)
+
+        if sharding_dim == 1:
+            self.weight = Parameter(shape=(self.num_embeddings,
+                                           self.embedding_dim // self.tp_size),
+                                    dtype="int8")
+        elif sharding_dim == 0:
+            self.weight = Parameter(shape=(math.ceil(
+                self.num_embeddings / self.tp_size), self.embedding_dim),
+                                    dtype="int8")
+
+    def forward(self, x):
+        result = embedding(x,
+                           self.weight.value,
+                           tp_size=self.tp_size,
+                           tp_group=self.tp_group,
+                           sharding_dim=self.sharding_dim,
+                           tp_rank=self.tp_rank,
+                           per_token_scale=self.per_token_scale.value)
+
+        return result
 
 
 class WeightOnlyGroupwiseQuantLinear(Module):
@@ -1019,7 +1075,7 @@ class SmoothQuantAttention(Module):
                 self.rotary_embedding_scale_type)
             self.register_parameter(
                 'embed_positions_for_gpt_attention',
-                Parameter(embed_positions_for_gpt_attention))
+                Parameter(embed_positions_for_gpt_attention, dtype='float32'))
         elif self.position_embedding_type.is_alibi():
             alibi_scale = 1. / self.norm_factor if self.scale_alibi_bias else 1.
             alibi_slopes = generate_alibi_slopes(self.num_attention_heads *
@@ -1027,7 +1083,8 @@ class SmoothQuantAttention(Module):
                                                  tp_size=self.tp_size,
                                                  tp_rank=self.tp_rank,
                                                  alibi_scale=alibi_scale)
-            self.register_parameter('alibi_slopes', Parameter(alibi_slopes))
+            self.register_parameter('alibi_slopes',
+                                    Parameter(alibi_slopes, dtype='float32'))
 
         self.quant_mode = quant_mode
         self.dtype = dtype

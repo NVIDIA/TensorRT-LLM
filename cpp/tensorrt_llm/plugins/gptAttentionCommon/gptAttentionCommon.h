@@ -127,6 +127,51 @@ protected:
         int32_t cross_qkv_length = 0;
         int32_t const* encoder_input_lengths = nullptr;
         int32_t num_encoder_tokens = 0;
+
+        std::string enqueueContextParamsToString() const
+        {
+            // variables from the params coming from the runtime
+            std::stringstream ss;
+            ss << "EnqueueContextParams ====================" << std::endl;
+
+            ss << "attention_input: " << attention_input << std::endl;
+            ss << "qkv_bias: " << qkv_bias << std::endl;
+            ss << "rotary_cos_sin: " << rotary_cos_sin << std::endl;
+            ss << "input_seq_length: " << input_seq_length << std::endl;
+            ss << "max_past_kv_len: " << max_past_kv_len << std::endl;
+            ss << "max_attention_window: " << max_attention_window << std::endl;
+            ss << "cyclic_attention_window_size: " << cyclic_attention_window_size << std::endl;
+            ss << "sink_token_length: " << sink_token_length << std::endl;
+            ss << "q_seq_lengths: "
+               << *(runtime::ITensor::wrap(
+                      (void*) q_seq_lengths, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batch_size})))
+               << std::endl;
+            ss << "kv_seq_lengths: "
+               << *(runtime::ITensor::wrap(
+                      (void*) kv_seq_lengths, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batch_size})))
+               << std::endl;
+            ss << "kv_scale_orig_quant: " << kv_scale_orig_quant << std::endl;
+            ss << "kv_scale_quant_orig: " << kv_scale_quant_orig << std::endl;
+            ss << "attention_output_orig_quant: " << attention_output_orig_quant << std::endl;
+            ss << "alibi_slopes: " << alibi_slopes << std::endl;
+            ss << "context_buf: " << context_buf << std::endl;
+            ss << "key_value_cache: " << (half*) key_value_cache << std::endl;
+            ss << "block_offsets: " << block_offsets << std::endl;
+            ss << "host_block_offsets: " << host_block_offsets << std::endl;
+            ss << "host_primary_pool_pointer: " << host_primary_pool_pointer << std::endl;
+            ss << "host_secondary_pool_pointer: " << host_secondary_pool_pointer << std::endl;
+            ss << "batch_size: " << batch_size << std::endl;
+            ss << "num_tokens: " << num_tokens << std::endl;
+            ss << "max_blocks_per_sequence: " << max_blocks_per_sequence << std::endl;
+            ss << "workspace: " << workspace << std::endl;
+            ss << "relative_attention_bias: " << relative_attention_bias << std::endl;
+            ss << "relative_attention_bias_stride: " << relative_attention_bias_stride << std::endl;
+            ss << "cross_qkv: " << cross_qkv << std::endl;
+            ss << "cross_qkv_length: " << cross_qkv_length << std::endl;
+            ss << "encoder_input_lengths: " << encoder_input_lengths << std::endl;
+            ss << "num_encoder_tokens: " << num_encoder_tokens << std::endl;
+            return ss.str();
+        }
     };
 
     template <typename T, typename KVCacheBuffer>
@@ -310,6 +355,53 @@ protected:
     };
 
     UniqPtrWNullCopy<int32_t[], Deleter> mMultiBlockSemaphores = {};
+
+    std::string toString() const
+    {
+        // member variables
+        std::stringstream ss;
+        ss << "gptAttentionCommon members ====================" << std::endl;
+        ss << "mNumHeads: " << mNumHeads << std::endl;
+        ss << "mNumKVHeads: " << mNumKVHeads << std::endl;
+        ss << "mHeadSize: " << mHeadSize << std::endl;
+        ss << "mUnidirectional: " << mUnidirectional << std::endl;
+        ss << "mQScaling: " << mQScaling << std::endl;
+        ss << "mRotaryEmbeddingDim: " << mRotaryEmbeddingDim << std::endl;
+        ss << "mRotaryEmbeddingBase: " << mRotaryEmbeddingBase << std::endl;
+        ss << "mRotaryEmbeddingScaleType: " << static_cast<int>(mRotaryEmbeddingScaleType) << std::endl;
+        ss << "mRotaryEmbeddingScale: " << mRotaryEmbeddingScale << std::endl;
+        ss << "mRotaryEmbeddingMaxPositions: " << mRotaryEmbeddingMaxPositions << std::endl;
+        ss << "mPositionEmbeddingType: " << static_cast<int>(mPositionEmbeddingType) << std::endl;
+        ss << "mRemovePadding: " << std::boolalpha << mRemovePadding << std::endl;
+        ss << "mMaskType: " << static_cast<int>(mMaskType) << std::endl;
+        ss << "mPagedKVCache: " << std::boolalpha << mPagedKVCache << std::endl;
+        ss << "mTokensPerBlock: " << mTokensPerBlock << std::endl;
+        ss << "mKVCacheQuantMode: " << static_cast<int>(mKVCacheQuantMode.value()) << std::endl;
+        ss << "mTpSize: " << mTpSize << std::endl;
+        ss << "mTpRank: " << mTpRank << std::endl;
+        ss << "mUnfuseQkvGemm: " << std::boolalpha << mUnfuseQkvGemm << std::endl;
+        ss << "mType: " << static_cast<int>(mType) << std::endl;
+        ss << "mMaxContextLength: " << mMaxContextLength << std::endl;
+        ss << "mQKVBiasEnabled: " << std::boolalpha << mQKVBiasEnabled << std::endl;
+        ss << "mCrossAttention: " << std::boolalpha << mCrossAttention << std::endl;
+        ss << "mMaxDistance: " << mMaxDistance << std::endl;
+        ss << "mPosShiftEnabled: " << std::boolalpha << mPosShiftEnabled << std::endl;
+        ss << "mPagedContextFMHA: " << std::boolalpha << mPagedContextFMHA << std::endl;
+        ss << "mFP8ContextFMHA: " << std::boolalpha << mFP8ContextFMHA << std::endl;
+        ss << "mDenseContextFMHA: " << std::boolalpha << mDenseContextFMHA << std::endl;
+        ss << "mEnableContextFMHA: " << std::boolalpha << mEnableContextFMHA << std::endl;
+        ss << "mFMHAForceFP32Acc: " << std::boolalpha << mFMHAForceFP32Acc << std::endl;
+        ss << "mSM: " << mSM << std::endl;
+        ss << "mMultiProcessorCount: " << mMultiProcessorCount << std::endl;
+        ss << "mMaxSharedMemoryPerBlockOptin: " << mMaxSharedMemoryPerBlockOptin << std::endl;
+        ss << "mMultiBlockMode: " << std::boolalpha << mMultiBlockMode << std::endl;
+        ss << "mEnableXQA: " << std::boolalpha << mEnableXQA << std::endl;
+        ss << "mDeviceId: " << mDeviceId << std::endl;
+        ss << "mUseKVCache: " << std::boolalpha << mUseKVCache << std::endl;
+        ss << "mForceMultiBlockWarned: " << mForceMultiBlockWarned << std::endl;
+
+        return ss.str();
+    }
 };
 
 class GPTAttentionPluginCreatorCommon : public BaseCreator

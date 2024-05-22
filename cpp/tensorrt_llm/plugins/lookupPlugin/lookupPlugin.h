@@ -68,6 +68,7 @@ private:
 
     nvinfer1::DataType mType;
     int mRank;
+    int mNbInputs = 0;
 };
 
 class LookupPluginCreator : public BaseCreator

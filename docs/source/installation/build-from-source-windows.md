@@ -181,7 +181,7 @@ Building from source produces the following library files.
 The locations of the DLLs, in addition to some `torch` DLLs, must be added to the Windows `Path` in order to use the TensorRT-LLM C++ runtime. Append the locations of these libraries to your `Path`. When complete, your `Path` should include lines similar to these:
 
 ```bash
-%USERPROFILE%\inference\TensorRT-LLM\cpp\build\tensorrt_llm\Release
+%USERPROFILE%\inference\TensorRT-LLM\cpp\build\tensorrt_llm
 %USERPROFILE%\AppData\Local\Programs\Python\Python310\Lib\site-packages\tensorrt_llm\libs
 %USERPROFILE%\AppData\Local\Programs\Python\Python310\Lib\site-packages\torch\lib
 ```

@@ -7,6 +7,8 @@ Different from other models, Medusa decoding need a base model and Medusa heads.
 
 The TensorRT-LLM Medusa Decoding implementation can be found in [tensorrt_llm/models/medusa/model.py](../../tensorrt_llm/models/medusa/model.py), which actually adds MedusaHeads to a base model.
 
+For more info about Medusa visit [speculative decoding documentation](../../docs/source/speculative_decoding.md).
+
 ## Support Matrix
   * GPU Compute Capability >= 8.0 (Ampere or newer)
   * FP16
@@ -67,7 +69,8 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_medusa \
 To run a TensorRT-LLM model with Medusa decoding support, we can use `../run.py` script, with an additional argument `--medusa_choices`.
 The `--medusa_choices` is of type list[list[int]], And also the built engine with Medusa decoding support.
 
-Note: Medusa decoding is only supported by Python runtime now. So need `--use_py_session`.
+Medusa decoding is supported by Python runtime and C++ runtime with inflight-batching. C++ runtime is recommended for performance.
+For Python runtime use `--use_py_session` flag to `run.py`.
 
 Note: Medusa decoding only supporting greedy decoding `temperature=1.0` now. So also need `--temperature 1.0`.
 
@@ -77,7 +80,6 @@ python ../run.py --engine_dir ./tmp/medusa/7B/trt_engines/fp16/1-gpu/ \
                  --tokenizer_dir ./vicuna-7b-v1.3/ \
                  --max_output_len=100 \
                  --medusa_choices="[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], [0, 0, 0, 0], [0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [0, 0, 0, 1], [1, 6], [0, 7, 0]]" \
-                 --use_py_session \
                  --temperature 1.0 \
                  --input_text "Once upon"
 
@@ -87,7 +89,6 @@ mpirun -np 4 --allow-run-as-root --oversubscribe \
                      --tokenizer_dir ./vicuna-13b-v1.3/ \
                      --max_output_len=100 \
                      --medusa_choices="[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], [0, 0, 0, 0], [0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [0, 0, 0, 1], [1, 6], [0, 7, 0]]" \
-                     --use_py_session \
                      --temperature 1.0 \
                      --input_text "Once upon"
 ```

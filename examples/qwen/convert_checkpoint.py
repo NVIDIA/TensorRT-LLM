@@ -173,7 +173,10 @@ def args_to_quantization(args: argparse.Namespace) -> QuantConfig:
     '''return config dict with quantization info based on the command line args
     '''
     quant_config = QuantConfig()
-    quant_config.exclude_modules = ['lm_head']
+    quant_config.exclude_modules = [
+        'lm_head', 'router', 'vocab_embedding', 'position_embedding',
+        'block_embedding'
+    ]
     if args.use_weight_only:
         if args.weight_only_precision == 'int8':
             quant_config.quant_algo = QuantAlgo.W8A16
