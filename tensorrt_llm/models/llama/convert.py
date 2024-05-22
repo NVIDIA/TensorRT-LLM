@@ -606,9 +606,9 @@ def get_tllm_linear_sq_weight(vals,
                         tensor_parallel,
                         dim=cat_dim)[rank]
 
-        results[prefix + 'per_channel_scale'] = torch.Tensor([
+        results[prefix + 'per_channel_scale'] = torch.Tensor(
             cur_per_channel_value
-        ]).to(torch.float32).reshape(col_shape).contiguous().cuda()
+        ).to(torch.float32).reshape(col_shape).contiguous().cuda()
         results[prefix + 'act_scale'] = torch.Tensor(
             vals['scale_y_quant_orig']).to(torch.float32).contiguous().cuda()
         results[last_prefix] = torch.Tensor(vals['scale_x_orig_quant']).to(
