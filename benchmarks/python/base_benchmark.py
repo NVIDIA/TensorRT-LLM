@@ -17,7 +17,7 @@ import os
 import subprocess
 import time
 from collections import OrderedDict
-
+import csv
 import torch
 
 import tensorrt_llm
@@ -40,6 +40,15 @@ def get_csv_filename(model, dtype, tp_size, mode, **kwargs):
         kw_pairs = "_" + "_".join([str(k) + str(v) for k, v in kwargs.items()])
     return f'{model}_{dtype}_tp{tp_size}_{mode}{kw_pairs}_sm{sm}.csv'
 
+def check_is_csv_empty(file_name: str) -> bool:
+    # Check if already has rows
+    empty = True
+    if os.path.exists(file_name):
+        with open(file_name, 'r', encoding='utf8') as f:
+            content = csv.reader(f)
+            if len(list(content)) > 0:
+                empty = False
+    return empty
 
 def get_engine_name(model, dtype, tp_size, rank):
     return '{}_{}_tp{}_rank{}.engine'.format(model, dtype, tp_size, rank)
@@ -62,12 +71,14 @@ class BaseBenchmark(object):
     def __init__(self,
                  engine_dir,
                  model_name,
+                 mode,
                  dtype,
                  rank,
                  world_size,
                  serial_build: bool = False):
         self.engine_dir = engine_dir
         self.model_name = model_name
+        self.mode = mode
         self.dtype = dtype
         self.runtime_rank = rank
         self.world_size = world_size
@@ -152,7 +163,15 @@ class BaseBenchmark(object):
             torch.cuda.set_device(self.runtime_rank %
                                   self.runtime_mapping.gpus_per_node)
 
-        self.csv_filename = ""  # lazy init
+        self.csv_filename = self.get_csv_filename()
+
+    def get_csv_filename(self) -> str:
+        return get_csv_filename(self.model_name,
+                                                 self.dtype,
+                                                 self.world_size,
+                                                 self.mode,
+                                                 fp8linear=int(self.enable_fp8))
+
 
     def get_report_dict(self, benchmark_profiler=None):
         report_fields = [
@@ -184,22 +203,23 @@ class BaseBenchmark(object):
         report_dict["compute_cap"] = "sm" + get_compute_cap()
         return report_dict
 
-    def get_csv_filename(self):
-        if len(self.csv_filename) == 0:
-            self.csv_filename = get_csv_filename(self.model_name,
-                                                 self.dtype,
-                                                 self.world_size,
-                                                 self.mode,
-                                                 fp8linear=int(self.enable_fp8))
-        return self.csv_filename
+    def print_report_dict(self, report_dict: dict, to_csv: bool=False):
+        if not isinstance(report_dict, dict):
+            print('Invalid `report_dict`, expect dict')
+        elif self.runtime_rank == 0:
+            kv_pairs = [f"{k}: {v}" for k, v in report_dict.items()]
+            formatted_text = '[BENCHMARK] ' + ", ".join(kv_pairs) + '\n'
+            print(formatted_text)
 
-    def print_report_header(self, csv=False, benchmark_profiler=None):
-        if csv and self.runtime_rank == 0:
-            report_dict = self.get_report_dict(benchmark_profiler)
-            line = ",".join(report_dict.keys())
-            print(line)
-            with open(self.get_csv_filename(), "a") as file:
-                file.write(line + "\n")
+            if to_csv and self.csv_filename is not None:
+                is_empty = check_is_csv_empty(self.csv_filename)
+                keys = ",".join([str(v) for v in report_dict.keys()])
+                values = ",".join([str(v) for v in report_dict.values()])
+
+                with open(self.csv_filename, "a") as file:
+                    if is_empty: # only write header if file is empty
+                        file.write(keys + "\n")   
+                    file.write(values + "\n")
 
     def get_config(self):
         raise NotImplementedError
