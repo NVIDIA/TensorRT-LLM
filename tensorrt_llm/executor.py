@@ -1140,13 +1140,13 @@ class ExecutorBindingsProxy(GenerationExecutor):
             req_id = res[0]
             self._results[req_id].queue.put(res)
 
-    def start(self):
+    def start(self, timeout: int = 60):
         self.mpi_futures = self.mpi_session.submit(
             ExecutorBindingsProxy.workers_main, **self.workers_kwargs)
         self.workers_started = True
         ack = Thread(target=lambda: self.result_queue.get())
         ack.start()
-        ack.join(timeout=60)
+        ack.join(timeout=timeout)
         if ack.is_alive():
             raise RuntimeError("Executor seems to have crashed")
         self.dispatcher.start()
