@@ -529,7 +529,8 @@ def main(args):
                     prompt_tasks=args.prompt_tasks,
                     streaming=args.streaming,
                     output_sequence_lengths=True,
-                    return_dict=True)
+                    return_dict=True,
+                    medusa_choices=args.medusa_choices)
                 torch.cuda.synchronize()
 
         tensorrt_llm.profiler.start("tmp")
@@ -557,7 +558,8 @@ def main(args):
                     prompt_tasks=args.prompt_tasks,
                     streaming=args.streaming,
                     output_sequence_lengths=True,
-                    return_dict=True)
+                    return_dict=True,
+                    medusa_choices=args.medusa_choices)
                 torch.cuda.synchronize()
         tensorrt_llm.profiler.stop("tmp")
 
