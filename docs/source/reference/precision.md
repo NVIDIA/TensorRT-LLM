@@ -134,6 +134,7 @@ This release of TensorRT-LLM contains the following examples:
 | GPT-NeMo       |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | GPT-NeoX       |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     Y      |
 | InternLM       |   Y   |   Y   |   Y   |   .   |    Y    |   Y   |   Y   |     .     |     .      |
+| InternLM2      |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | LLaMA          |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     Y      |
 | LLaMA-v2       |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     Y      |
 | Mamba          |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |

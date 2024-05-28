@@ -30,6 +30,7 @@ DEFAULT_HF_MODEL_DIRS = {
     'GPTJForCausalLM': 'EleutherAI/gpt-j-6b',
     'GPTNeoXForCausalLM': 'EleutherAI/gpt-neox-20b',
     'InternLMForCausalLM': 'internlm/internlm-chat-7b',
+    'InternLM2ForCausalLM': 'internlm/internlm2-chat-7b',
     'LlamaForCausalLM': 'meta-llama/Llama-2-7b-hf',
     'MPTForCausalLM': 'mosaicml/mpt-7b',
     'PhiForCausalLM': 'microsoft/phi-2',
@@ -37,9 +38,17 @@ DEFAULT_HF_MODEL_DIRS = {
     'QWenForCausalLM': 'Qwen/Qwen-7B',
 }
 
+INTERNLM_META_INSTRUCTION = """You are an AI assistant whose name is InternLM (书生·浦语).
+- InternLM (书生·浦语) is a conversational language model that is developed by Shanghai AI Laboratory (上海人工智能实验室). It is designed to be helpful, honest, and harmless.
+- InternLM (书生·浦语) can understand and communicate fluently in the language chosen by the user such as English and 中文.
+"""
+
 DEFAULT_PROMPT_TEMPLATES = {
     'InternLMForCausalLM':
     "<|User|>:{input_text}<eoh>\n<|Bot|>:",
+    'InternLM2ForCausalLM':
+    "<|im_start|>system\n" + INTERNLM_META_INSTRUCTION +
+    "<|im_end|>\n<|im_start|>user\n{input_text}<|im_end|>\n<|im_start|>assistant\n",
     'QWenForCausalLM':
     "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{input_text}<|im_end|>\n<|im_start|>assistant\n",
 }
