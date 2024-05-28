@@ -964,8 +964,14 @@ using Types = ::testing::Types<
 
     >;
 TYPED_TEST_SUITE(MixtureOfExpertsTest, Types);
-// Have a separate test with only one data type because this test is long
-TYPED_TEST_SUITE(LargeMixtureOfExpertsTest, ::testing::Types<WeightParams<half>>);
+
+// Have a separate test with only FP8 and half data type because this test is long
+using LargeTestTypes = ::testing::Types<
+#ifdef ENABLE_FP8
+    WeightParams<SafeFP8, SafeFP8, half>,
+#endif
+    WeightParams<half>>;
+TYPED_TEST_SUITE(LargeMixtureOfExpertsTest, LargeTestTypes);
 
 template <class TypeParam_>
 BufferManager::CudaStreamPtr MixtureOfExpertsTest<TypeParam_>::mStream{};
@@ -1382,6 +1388,7 @@ TYPED_TEST(LargeMixtureOfExpertsTest, PermuteVeryLongSequence)
     int64_t num_experts = 4;
     int64_t k = 1;
     int64_t num_tokens = 1024ll * 1024ll + 1ll;
+    int64_t tokens_to_test = 10;
     ASSERT_GT(hidden_size * num_tokens, (uint64_t) std::numeric_limits<int>::max() + 1ull);
 
     if (!this->checkSufficientTestMemory(num_tokens, hidden_size, num_experts, k))
@@ -1392,7 +1399,7 @@ TYPED_TEST(LargeMixtureOfExpertsTest, PermuteVeryLongSequence)
     std::vector<DataType> hidden_states(hidden_size * num_tokens);
     this->mMaxInput = 1.f; // Any arbitrary non-zero value
 
-    // All tokens to expert 0
+    // All tokens to expert 0, so we catch the case where an expert has more than 2^32 tokens
     float const token_probs[] = {1.f, 0.5f, 0.f, 0.f};
     std::vector<float> probs;
     probs.reserve(num_tokens * num_experts);
@@ -1400,20 +1407,27 @@ TYPED_TEST(LargeMixtureOfExpertsTest, PermuteVeryLongSequence)
     {
         probs.insert(probs.cend(), std::begin(token_probs), std::end(token_probs));
     }
+    // Override the first few tokens to go to different experts.
+    // This covers the regression case where an overflow only impacts one of the last experts
+    // In particular the case when there are more than 2^32 elements before the last expert
+    for (int i = 1; i < tokens_to_test; i++)
+    {
+        probs[i * num_experts + i % num_experts] = 2.f;
+    }
 
     this->runMoEPermute({hidden_states}, {probs}, hidden_size, num_experts, k);
 
     // Just look at the first few tokens
-    this->mTotalTokens = 10;
+    this->mTotalTokens = tokens_to_test;
 
     probs.resize(num_experts * this->mTotalTokens);
     hidden_states.resize(hidden_size * this->mTotalTokens);
 
     auto selected_expert = this->getDataFromDevice(this->mSelectedExpert, k * this->mTotalTokens);
-    // All tokens should go to expert 0
-    for (auto& item : selected_expert)
+    // We set the first few tokens to go to the corresponding i-th expert
+    for (int i = 0; i < tokens_to_test; i++)
     {
-        ASSERT_EQ(item, 0);
+        ASSERT_EQ(selected_expert[i], i % num_experts);
     }
 
     this->compareSoftmax(selected_expert, probs);

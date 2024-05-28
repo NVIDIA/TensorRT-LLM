@@ -111,11 +111,11 @@ class TestFunctional(unittest.TestCase):
         builder = tensorrt_llm.Builder()
         net = builder.create_network()
         if use_mamba_conv1d_plugin:
-            net.plugin_config.set_mamba_conv1d_plugin(dtype)
+            net.plugin_config.mamba_conv1d_plugin = dtype
         else:
-            net.plugin_config.set_mamba_conv1d_plugin(None)
+            net.plugin_config.mamba_conv1d_plugin = None
         if remove_padding:
-            net.plugin_config.enable_remove_input_padding()
+            net.plugin_config.remove_input_padding = True
         else:
             net.plugin_config.remove_input_padding = False
         net.plugin_config.paged_state = False

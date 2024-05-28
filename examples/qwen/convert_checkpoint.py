@@ -69,6 +69,13 @@ def parse_arguments():
         'You must also use --use_weight_only for that argument to have an impact.'
     )
     parser.add_argument(
+        '--calib_dataset',
+        type=str,
+        default='ccdv/cnn_dailymail',
+        help=
+        "The huggingface dataset name or the local directory of the dataset for calibration."
+    )
+    parser.add_argument(
         "--smoothquant",
         "-sq",
         type=float,
@@ -292,6 +299,7 @@ def convert_and_save_hf(args):
                  args.output_dir,
                  mapping=mapping,
                  quantization=quantization,
+                 calib_dataset=args.calib_dataset,
                  override_fields=override_fields,
                  dataset_cache_dir=args.dataset_cache_dir,
                  smoothquant_val=args.smoothquant,

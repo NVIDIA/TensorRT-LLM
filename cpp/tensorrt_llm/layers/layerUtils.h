@@ -26,6 +26,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
+#include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/runtime/common.h"
 
 namespace tensorrt_llm
@@ -88,8 +89,35 @@ inline bool allOfBatchSlots(
 {
     return std::all_of(
         batchSlotsHost, batchSlotsHost + batchSize, [&](runtime::SizeType32 b) { return data[b] == value; });
-};
+}
+
+inline DecoderDomain getLocalDecoderDomain(std::shared_ptr<BaseInputParams> baseInputs)
+{
+    auto inputs = std::dynamic_pointer_cast<DynamicDecodeInputParams>(baseInputs);
+    runtime::SizeType32 batchSize{0};
+    runtime::SizeType32 beamWidth{0};
+    runtime::SizeType32 vocabSize{0};
+    if (inputs->logits)
+    {
+        auto const& logitsShape = inputs->logits->shape;
+        TLLM_CHECK(logitsShape.size() == 3 || logitsShape.size() == 4);
+        batchSize = logitsShape[0];
+        auto const idxOffset = logitsShape.size() - 3;
+        beamWidth = logitsShape[idxOffset + 1];
+        vocabSize = logitsShape[idxOffset + 2];
+    }
+    else
+    {
+        TLLM_CHECK(inputs->logits_vec->size());
+        auto const& logitsShape = inputs->logits_vec.value()[0].shape;
+        TLLM_CHECK(logitsShape.size() == 3 || logitsShape.size() == 4);
+        auto const idxOffset = logitsShape.size() - 3;
+        batchSize = inputs->logits_vec->size();
+        beamWidth = logitsShape[idxOffset + 1];
+        vocabSize = logitsShape[idxOffset + 2];
+    }
+    return DecoderDomain(batchSize, beamWidth, vocabSize);
+}
 
 } // namespace layers
-
 } // namespace tensorrt_llm

@@ -11,13 +11,13 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import safetensors
 import torch
-from datasets import load_dataset
 from tqdm import tqdm
 from transformers import AutoConfig, AutoModel, AutoTokenizer
 
 import tensorrt_llm
 from tensorrt_llm._utils import pad_vocab_size
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.convert_utils import load_calib_dataset
 from tensorrt_llm.quantization import QuantAlgo
 
 
@@ -89,6 +89,13 @@ def parse_arguments():
         help=
         'Define the precision for the weights when using weight-only quantization.'
         'You must also use --use_weight_only for that argument to have an impact.'
+    )
+    parser.add_argument(
+        '--calib_dataset',
+        type=str,
+        default='cnn_dailymail',
+        help=
+        "The huggingface dataset name or the local directory of the dataset for calibration."
     )
     parser.add_argument(
         "--smoothquant",
@@ -405,7 +412,7 @@ def capture_activation_range(
 
     for i in tqdm(range(num_samples), desc="Calibration"):
         input_ids = tokenizer(
-            dataset[i]["article"],
+            dataset[i],
             return_tensors="pt",
             max_length=seq_len,
             truncation=True,
@@ -1115,12 +1122,7 @@ if __name__ == '__main__':
             args.model_dir,
             trust_remote_code=True,
         )
-        dataset = load_dataset(
-            "cnn_dailymail",
-            '3.0.0',
-            split="validation",
-        )
-
+        dataset = load_calib_dataset(args.calib_dataset)
         act_range = capture_activation_range(hf_model,
                                              tokenizer,
                                              dataset,

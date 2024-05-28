@@ -85,6 +85,17 @@ def main(args):
         dataset_input_key = 'input'
         dataset_output_key = 'output'
         dataset_split = 'validation'  # only this split contains reference strings
+    elif args.eval_task == "eval_context_ppl":
+        dataset_name = "SlimPajama-6B"
+        dataset_revision = None
+        dataset_input_key = 'text'
+        dataset_output_key = 'text'
+        dataset_split = 'test'
+        args.output_len = 1  # Only want to compute the ppl of context
+        args.eval_ppl = True
+        logger.warning(
+            f"Run task '{args.eval_task}', setting 'output_len' to 1, and enable 'eval_ppl'."
+        )
     if args.dataset_dir is not None and isinstance(args.dataset_dir, str):
         args.dataset_dir = args.dataset_dir.rstrip('/')
         if args.dataset_dir.endswith(dataset_name):
@@ -212,6 +223,7 @@ def main(args):
                 repetition_penalty=repetition_penalty,
                 presence_penalty=presence_penalty,
                 frequency_penalty=frequency_penalty,
+                lora_uids=args.lora_task_uids,
                 output_sequence_lengths=True,
                 return_dict=True,
                 medusa_choices=args.medusa_choices)
@@ -331,7 +343,14 @@ def main(args):
                 output_ids != pad_id).sum(dim=-1)
             context_logits = context_outputs['logits']
             # Remove the first generation logits which are same to last context logits
-            generation_logits = torch.stack(outputs['scores'][1:], dim=1)
+            generation_logits = outputs['scores'][1:]
+            # When output_len is 1, generation_logits would be () and lead to error if we do torch.stack
+            if len(generation_logits) == 0:
+                generation_logits = torch.empty(
+                    [context_logits.shape[0], 0, context_logits.shape[-1]],
+                    device=context_logits.device)
+            else:
+                generation_logits = torch.stack(generation_logits, dim=1)
             _, max_gen_len, voc_size = generation_logits.size()
             generation_logits = generation_logits.view(batch_size, num_beams,
                                                        max_gen_len, voc_size)
@@ -379,7 +398,13 @@ def main(args):
                 max_output_len=output_len,
                 max_beam_width=num_beams,
                 max_attention_window_size=max_attention_window_size,
-                sink_token_length=sink_token_length)
+                sink_token_length=sink_token_length,
+                max_tokens_in_paged_kv_cache=args.max_tokens_in_paged_kv_cache,
+                kv_cache_enable_block_reuse=args.kv_cache_enable_block_reuse,
+                kv_cache_free_gpu_memory_fraction=args.
+                kv_cache_free_gpu_memory_fraction,
+                enable_chunked_context=args.enable_chunked_context,
+            )
         runner = runner_cls.from_dir(**runner_kwargs)
         assert not (args.eval_ppl and not (runner.gather_context_logits and runner.gather_generation_logits)), \
             "PPL evaluation requires engine built with gather_all_token_logits enabled"
@@ -389,7 +414,7 @@ def main(args):
                                   eval_task=args.eval_task,
                                   eval_ppl=args.eval_ppl,
                                   add_special_tokens=args.add_special_tokens)
-        if runtime_rank == 0:
+        if runtime_rank == 0 and args.eval_task != "eval_context_ppl":
             logger.info(
                 "---------------------------------------------------------")
             logger.info("TensorRT-LLM Generated : ")
@@ -496,12 +521,15 @@ def main(args):
                              eval_task=args.eval_task,
                              eval_ppl=args.eval_ppl,
                              add_special_tokens=args.add_special_tokens)
-        logger.info("---------------------------------------------------------")
-        logger.info("HF Generated : ")
-        logger.info(f" Input : {datapoint[dataset_input_key]}")
-        logger.info(f"\n Reference : {datapoint[dataset_output_key]}")
-        logger.info(f"\n Output : {output}")
-        logger.info("---------------------------------------------------------")
+        if runtime_rank == 0 and args.eval_task != "eval_context_ppl":
+            logger.info(
+                "---------------------------------------------------------")
+            logger.info("HF Generated : ")
+            logger.info(f" Input : {datapoint[dataset_input_key]}")
+            logger.info(f"\n Reference : {datapoint[dataset_output_key]}")
+            logger.info(f"\n Output : {output}")
+            logger.info(
+                "---------------------------------------------------------")
 
         ite_count = 0
         data_point_idx = 0
@@ -569,11 +597,13 @@ def main(args):
                 logger.info(f"TensorRT-LLM beam {beam_idx} result")
                 computed_metrics_tensorrt_llm = metric_tensorrt_llm[
                     beam_idx].compute()
-                for key in computed_metrics_tensorrt_llm.keys():
-                    logger.info(
-                        f'  {key} : {computed_metrics_tensorrt_llm[key]*100}')
+                if args.eval_task != "eval_context_ppl":
+                    for key in computed_metrics_tensorrt_llm.keys():
+                        logger.info(
+                            f'  {key} : {computed_metrics_tensorrt_llm[key]*100}'
+                        )
 
-                if args.check_accuracy and beam_idx == 0:
+                if args.check_accuracy and beam_idx == 0 and args.eval_task != "eval_context_ppl":
                     assert computed_metrics_tensorrt_llm[
                         'rouge1'] * 100 > args.tensorrt_llm_rouge1_threshold
                 if args.eval_ppl:
@@ -598,8 +628,9 @@ def main(args):
             for beam_idx in range(num_beams):
                 logger.info(f"HF beam {beam_idx} result")
                 computed_metrics_hf = metric_hf[beam_idx].compute()
-                for key in computed_metrics_hf.keys():
-                    logger.info(f'  {key} : {computed_metrics_hf[key]*100}')
+                if args.eval_task != "eval_context_ppl":
+                    for key in computed_metrics_hf.keys():
+                        logger.info(f'  {key} : {computed_metrics_hf[key]*100}')
                 if args.eval_ppl and args.batch_size == 1:
                     logger.info(
                         f"  Per-token perplexity: {np.mean(ppls_hf[beam_idx])}")
@@ -627,11 +658,13 @@ if __name__ == '__main__':
                         default=False,
                         action='store_true',
                         help="Whether or not to use Python runtime session")
-    parser.add_argument(
-        '--eval_task',
-        type=str,
-        default='summarize',
-        choices=['summarize', 'summarize_long', 'code_completion'])
+    parser.add_argument('--eval_task',
+                        type=str,
+                        default='summarize',
+                        choices=[
+                            'summarize', 'summarize_long', 'code_completion',
+                            'eval_context_ppl'
+                        ])
     parser.add_argument('--check_accuracy', action='store_true')
     parser.add_argument('--tensorrt_llm_rouge1_threshold',
                         type=float,
@@ -717,6 +750,36 @@ if __name__ == '__main__':
         help=
         'Specify the percentage of weights that reside on GPU instead of CPU and streaming load during runtime.',
     )
+    parser.add_argument(
+        '--max_tokens_in_paged_kv_cache',
+        default=None,
+        type=int,
+        help=
+        'Specify the maximum number of tokens in a kv cache page (only available with cpp session).',
+    )
+    parser.add_argument(
+        '--kv_cache_enable_block_reuse',
+        action='store_true',
+        help=
+        'Enables block reuse in kv cache (only available with cpp session).',
+    )
+    parser.add_argument(
+        '--kv_cache_free_gpu_memory_fraction',
+        default=None,
+        type=float,
+        help='Specify the free gpu memory fraction.',
+    )
+    parser.add_argument(
+        '--enable_chunked_context',
+        action='store_true',
+        help='Enables chunked context (only available with cpp session).',
+    )
+    parser.add_argument(
+        '--lora_task_uids',
+        type=str,
+        default=None,
+        nargs="+",
+        help="The list of LoRA task uids; use -1 to disable the LoRA module")
     args = parser.parse_args()
 
     main(args)

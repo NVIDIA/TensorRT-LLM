@@ -63,7 +63,7 @@ class TestSmoothQuantGemm(unittest.TestCase):
         # Create empty network
         network = builder.create_network()
         # Allow SQ plugin of dtype type
-        network.plugin_config.set_smooth_quant_gemm_plugin(dtype)
+        network.plugin_config.smooth_quant_gemm_plugin = dtype
         with tensorrt_llm.net_guard(network):
             # Init TensorRT-LLM tensor for mat1
             x = Tensor(name='x',

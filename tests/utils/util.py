@@ -1,5 +1,6 @@
 import os
 import unittest
+from difflib import SequenceMatcher
 
 import pytest
 import tensorrt as trt
@@ -209,3 +210,13 @@ def run_session(session, inputs):
     stream.synchronize()
 
     return outputs
+
+
+def similarity_score(a, b):
+    "similar compare a and b "
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def similar(a, b, threshold=0.8):
+    "similar compare a and b "
+    return similarity_score(a, b) >= threshold

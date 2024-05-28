@@ -112,6 +112,9 @@ void initialize(MpiThreadSupport threadMode)
 
         auto previousHandler = std::signal(SIGABRT, [](int signal) { MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE); });
         TLLM_CHECK_WITH_INFO(previousHandler != SIG_ERR, "Signal handler setup failed");
+
+        // ensure local MPI communicator is initialized
+        MpiComm::localSession();
     }
 #endif // ENABLE_MULTI_DEVICE
     mpiInitialized = true;
@@ -269,6 +272,24 @@ MpiComm& MpiComm::session()
 {
     static MpiComm commSession{world(), false};
     return commSession;
+}
+
+MpiComm getLocalSession()
+{
+#if ENABLE_MULTI_DEVICE
+    MPI_Comm localComm;
+    MPI_Comm_split_type(MPI_COMM_WORLD, OMPI_COMM_TYPE_HOST, 0, MPI_INFO_NULL, &localComm);
+    MpiComm localSession{localComm, false};
+#else
+    MpiComm localSession{MPI_COMM_WORLD, false};
+#endif // ENABLE_MULTI_DEVICE
+    return localSession;
+}
+
+MpiComm& MpiComm::localSession()
+{
+    static MpiComm localSession = getLocalSession();
+    return localSession;
 }
 
 MpiComm::MpiComm(MPI_Comm g, bool freeComm)

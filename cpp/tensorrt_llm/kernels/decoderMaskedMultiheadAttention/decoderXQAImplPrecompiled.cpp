@@ -22,6 +22,7 @@
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAConstants.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplCommon.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunner.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/tensorMapUtils.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 #include <cassert>
@@ -275,7 +276,7 @@ public:
             CUtensorMap tensorMap{};
             if (isGmmaKernel)
             {
-                tensorMap = makeTensorMapForKVCache(xqaParams, kv_cache_buffer);
+                tensorMap = makeTensorMapForKVCache(mDriver, xqaParams, kv_cache_buffer);
                 appendParam(&tensorMap);
             }
             appendParam(&launchParams.semaphores);
@@ -314,82 +315,6 @@ private:
         case CU_TENSOR_MAP_DATA_TYPE_TFLOAT32_FTZ: return 4;
         }
         throw std::runtime_error("unsupported data type");
-    }
-
-    CUtensorMap makeTensorMapForContiguousKVCache(void const* addr, CUtensorMapDataType_enum dataType,
-        uint32_t headElems, uint32_t nbKHeads, uint32_t maxCacheLen, uint32_t beamWidth, uint32_t batchSize,
-        uint32_t nbTokensPerTile = 64) const
-    {
-        CUtensorMap tensorMap{};
-        uint64_t const globalDims[] = {headElems, maxCacheLen, nbKHeads, 2 * beamWidth * batchSize};
-        uint32_t elemBytes = getElemBytes(dataType);
-        uint32_t const headBytes = elemBytes * headElems;
-        uint64_t const globalStrides[] = {headBytes, headBytes * maxCacheLen, headBytes * maxCacheLen * nbKHeads};
-        uint32_t const partElems = std::min(headBytes, 128U) / elemBytes;
-        uint32_t const boxDims[] = {partElems, nbTokensPerTile, 1, 1};
-        uint32_t const elemStrides[] = {1, 1, 1, 1};
-
-        auto const swizzle = [&]
-        {
-            switch (partElems)
-            {
-            case 128: return CU_TENSOR_MAP_SWIZZLE_128B;
-            case 64: return CU_TENSOR_MAP_SWIZZLE_64B;
-            default: throw std::runtime_error("unsupported cache head size");
-            }
-        }();
-
-        cuErrCheck(mDriver->cuTensorMapEncodeTiled(&tensorMap, dataType, 4, const_cast<void*>(addr), globalDims,
-                       globalStrides, boxDims, elemStrides, CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle,
-                       CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
-            mDriver);
-        return tensorMap;
-    }
-
-    CUtensorMap makeTensorMapForPagedKVCache(void const* addr, CUtensorMapDataType_enum dataType, uint32_t headElems,
-        uint32_t nbKHeads, uint32_t tokensPerPage, uint32_t nbTokensPerTile = 64) const
-    {
-        CUtensorMap tensorMap{};
-        uint32_t elemBytes = getElemBytes(dataType);
-        uint64_t const globalDims[] = {headElems, tokensPerPage, nbKHeads, 1U << 31};
-        uint32_t const headBytes = elemBytes * headElems;
-        uint64_t const globalStrides[] = {headBytes, headBytes * tokensPerPage, headBytes * tokensPerPage * nbKHeads};
-        uint32_t const partElems = std::min(headBytes, 128U) / elemBytes;
-        uint32_t const boxDims[] = {partElems, std::min(tokensPerPage, nbTokensPerTile), 1, 1};
-        uint32_t const elemStrides[] = {1, 1, 1, 1};
-
-        auto const swizzle = [&]
-        {
-            switch (partElems)
-            {
-            case 128: return CU_TENSOR_MAP_SWIZZLE_128B;
-            case 64: return CU_TENSOR_MAP_SWIZZLE_64B;
-            default: throw std::runtime_error("unsupported cache head size");
-            }
-        }();
-
-        cuErrCheck(mDriver->cuTensorMapEncodeTiled(&tensorMap, dataType, 4, const_cast<void*>(addr), globalDims,
-                       globalStrides, boxDims, elemStrides, CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle,
-                       CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
-            mDriver);
-        return tensorMap;
-    }
-
-    template <typename KVCacheBuffer>
-    CUtensorMap makeTensorMapForKVCache(XQAParams const& xqaParams, KVCacheBuffer const& kv_cache_buffer) const
-    {
-        if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
-        {
-            return makeTensorMapForPagedKVCache(kv_cache_buffer.mPrimaryPoolPtr, CU_TENSOR_MAP_DATA_TYPE_UINT8,
-                xqaParams.head_size, xqaParams.num_kv_heads, xqaParams.tokens_per_block);
-        }
-        else
-        {
-            static_assert(std::is_same_v<KVCacheBuffer, KVLinearBuffer>);
-            return makeTensorMapForContiguousKVCache(kv_cache_buffer.data, CU_TENSOR_MAP_DATA_TYPE_UINT8,
-                xqaParams.head_size, xqaParams.num_kv_heads, xqaParams.max_attention_window_size, xqaParams.beam_width,
-                xqaParams.batch_size);
-        }
     }
 
 protected:

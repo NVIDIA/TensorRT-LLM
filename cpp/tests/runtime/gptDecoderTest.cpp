@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 
 #include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/gptDecoder.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
@@ -25,9 +26,47 @@
 using namespace tensorrt_llm::runtime;
 
 namespace tc = tensorrt_llm::common;
+namespace tle = tensorrt_llm::executor;
 
 namespace
 {
+
+bool forwardAndSync(std::unique_ptr<IGptDecoder> const& decoder, DecodingOutput& output, DecodingInput const& input,
+    std::shared_ptr<CudaStream> stream)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    auto const maxBatchSize = input.maxBatchSize;
+
+    BufferManager::ITensorPtr finishedSum;
+    std::int32_t* finishedSumHost = nullptr;
+    if (input.sequenceLimitLength && output.finished)
+    {
+        finishedSumHost = bufferCast<std::int32_t>(*output.finishedSum);
+        for (SizeType32 bi = 0; bi < maxBatchSize; ++bi)
+        {
+            finishedSumHost[bi] = 0;
+        }
+    }
+
+    decoder->forwardAsync(output, input);
+
+    if (finishedSumHost)
+    {
+        auto const numToFinish = output.finished->getSize();
+        TLLM_CUDA_CHECK(::cudaStreamSynchronize(stream->get()));
+
+        SizeType32 finishedSum = 0;
+        for (SizeType32 bi = 0; bi < maxBatchSize; ++bi)
+        {
+            finishedSum += finishedSumHost[bi];
+        }
+        return numToFinish == static_cast<std::size_t>(finishedSum);
+    }
+    else
+    {
+        return false;
+    }
+}
 
 void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingConfig)
 {
@@ -56,7 +95,7 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
     // setup decoder
     auto const beamWidth = samplingConfig.beamWidth;
 
-    auto const decodingMode = beamWidth == 1 ? DecodingMode::TopKTopP() : DecodingMode::BeamSearch();
+    auto const decodingMode = beamWidth == 1 ? tle::DecodingMode::TopKTopP() : tle::DecodingMode::BeamSearch();
 
     // create decoder
     auto const vocabSizePadded = modelConfig.getVocabSizePadded(worldConfig.getSize());
@@ -64,7 +103,7 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
         vocabSizePadded, maxSeqLength, streamPtr);
     ASSERT_TRUE(static_cast<bool>(decoder));
 
-    decoder->setup(samplingConfig, batchSize, maxSeqLength);
+    decoder->setup(samplingConfig, batchSize);
 
     // set up inputs
     auto logits = std::shared_ptr(
@@ -135,7 +174,7 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
     }
 
     // run decoder
-    EXPECT_FALSE(decoder->forward(outputs, inputs));
+    EXPECT_FALSE(forwardAndSync(decoder, outputs, inputs, streamPtr));
     inputs.step += 1;
 
     {
@@ -176,7 +215,7 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
     }
 
     // run decoder again
-    EXPECT_TRUE(decoder->forward(outputs, inputs));
+    EXPECT_TRUE(forwardAndSync(decoder, outputs, inputs, streamPtr));
     {
         SizeType32 finishedSum = 0;
         for (SizeType32 bi = 0; bi < batchSize; ++bi)

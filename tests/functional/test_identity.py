@@ -46,7 +46,7 @@ class TestFunctional(unittest.TestCase):
         builder = tensorrt_llm.Builder()
         net = builder.create_network()
         if use_plugin:
-            net.plugin_config.set_identity_plugin(dtype)
+            net.plugin_config.identity_plugin = dtype
         with tensorrt_llm.net_guard(net):
             network = tensorrt_llm.default_trtnet()
             x = Tensor(name='x',

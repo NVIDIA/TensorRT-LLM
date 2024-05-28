@@ -60,10 +60,6 @@ def parse_arguments():
     parser.add_argument('--accuracy_check',
                         action='store_true',
                         help="only for CI test")
-    parser.add_argument('--tokenizer_name',
-                        type=str,
-                        default="multilingual",
-                        choices=['multilingual', 'gpt2'])
     return parser.parse_args()
 
 
@@ -71,27 +67,17 @@ class WhisperEncoding:
 
     def __init__(self, engine_dir):
         self.session = self.get_session(engine_dir)
-
-    def get_session(self, engine_dir):
-        config_path = engine_dir / 'encoder_config.json'
+        config_path = engine_dir / 'encoder' / 'config.json'
         with open(config_path, 'r') as f:
             config = json.load(f)
+        self.n_mels = config['pretrained_config']['n_mels']
+        self.dtype = config['pretrained_config']['dtype']
+        self.num_languages = config['pretrained_config']['num_languages']
 
-        use_gpt_attention_plugin = config['plugin_config'][
-            'gpt_attention_plugin']
-        dtype = config['builder_config']['precision']
-        n_mels = config['builder_config']['n_mels']
-        num_languages = config['builder_config']['num_languages']
-
-        self.dtype = dtype
-        self.n_mels = n_mels
-        self.num_languages = num_languages
-
-        serialize_path = engine_dir / f'whisper_encoder_{self.dtype}_tp1_rank0.engine'
-
+    def get_session(self, engine_dir):
+        serialize_path = engine_dir / 'encoder' / 'rank0.engine'
         with open(serialize_path, 'rb') as f:
             session = Session.from_serialized_engine(f.read())
-
         return session
 
     def get_audio_features(self, mel):
@@ -139,35 +125,35 @@ class WhisperDecoding:
             engine_dir, runtime_mapping, debug_mode)
 
     def get_config(self, engine_dir):
-        config_path = engine_dir / 'decoder_config.json'
+        config_path = engine_dir / 'decoder' / 'config.json'
         with open(config_path, 'r') as f:
             config = json.load(f)
         decoder_config = OrderedDict()
-        decoder_config.update(config['plugin_config'])
-        decoder_config.update(config['builder_config'])
+        decoder_config.update(config['pretrained_config'])
+        decoder_config.update(config['build_config'])
         return decoder_config
 
     def get_session(self, engine_dir, runtime_mapping, debug_mode=False):
-        dtype = self.decoder_config['precision']
-        serialize_path = engine_dir / f'whisper_decoder_{dtype}_tp1_rank0.engine'
+        serialize_path = engine_dir / 'decoder' / 'rank0.engine'
         with open(serialize_path, "rb") as f:
             decoder_engine_buffer = f.read()
 
         decoder_model_config = ModelConfig(
             max_batch_size=self.decoder_config['max_batch_size'],
             max_beam_width=self.decoder_config['max_beam_width'],
-            num_heads=self.decoder_config['num_heads'],
-            num_kv_heads=self.decoder_config['num_heads'],
+            num_heads=self.decoder_config['num_attention_heads'],
+            num_kv_heads=self.decoder_config['num_attention_heads'],
             hidden_size=self.decoder_config['hidden_size'],
             vocab_size=self.decoder_config['vocab_size'],
-            num_layers=self.decoder_config['num_layers'],
-            gpt_attention_plugin=self.decoder_config['gpt_attention_plugin'],
-            remove_input_padding=self.decoder_config['remove_input_padding'],
-            cross_attention=self.decoder_config['cross_attention'],
+            cross_attention=True,
+            num_layers=self.decoder_config['num_hidden_layers'],
+            gpt_attention_plugin=self.decoder_config['plugin_config']
+            ['gpt_attention_plugin'],
+            remove_input_padding=self.decoder_config['plugin_config']
+            ['remove_input_padding'],
             has_position_embedding=self.
             decoder_config['has_position_embedding'],
-            has_token_type_embedding=self.
-            decoder_config['has_token_type_embedding'],
+            has_token_type_embedding=False,
         )
         decoder_generation_session = tensorrt_llm.runtime.GenerationSession(
             decoder_model_config,
@@ -187,7 +173,6 @@ class WhisperDecoding:
             [encoder_outputs.shape[1] for x in range(encoder_outputs.shape[0])],
             dtype=torch.int32,
             device='cuda')
-
         decoder_input_lengths = torch.tensor([
             decoder_input_ids.shape[-1]
             for _ in range(decoder_input_ids.shape[0])
@@ -231,11 +216,7 @@ class WhisperDecoding:
 
 class WhisperTRTLLM(object):
 
-    def __init__(self,
-                 engine_dir,
-                 tokenizer_name="multilingual",
-                 debug_mode=False,
-                 assets_dir=None):
+    def __init__(self, engine_dir, debug_mode=False, assets_dir=None):
         world_size = 1
         runtime_rank = tensorrt_llm.mpi_rank()
         runtime_mapping = tensorrt_llm.Mapping(world_size, runtime_rank)
@@ -246,7 +227,15 @@ class WhisperTRTLLM(object):
         self.decoder = WhisperDecoding(engine_dir,
                                        runtime_mapping,
                                        debug_mode=False)
-        self.n_mels = self.encoder.n_mels
+        is_multilingual = (self.decoder.decoder_config['vocab_size'] >= 51865)
+        if is_multilingual:
+            tokenizer_name = "multilingual"
+            assert (Path(assets_dir) / "multilingual.tiktoken").exists(
+            ), "multilingual.tiktoken file is not existed in assets_dir"
+        else:
+            tokenizer_name == "gpt2"
+            assert (Path(assets_dir) / "gpt2.tiktoken").exists(
+            ), "gpt2.tiktoken file is not existed in assets_dir"
         self.tokenizer = get_tokenizer(name=tokenizer_name,
                                        num_languages=self.encoder.num_languages,
                                        tokenizer_dir=assets_dir)
@@ -288,7 +277,7 @@ def decode_wav_file(
         normalizer=None,
         mel_filters_dir=None):
     mel, total_duration = log_mel_spectrogram(input_file_path,
-                                              model.n_mels,
+                                              model.encoder.n_mels,
                                               device='cuda',
                                               return_duration=True,
                                               mel_filters_dir=mel_filters_dir)
@@ -351,7 +340,7 @@ def decode_dataset(
 
         features = [
             log_mel_spectrogram(wave,
-                                model.n_mels,
+                                model.encoder.n_mels,
                                 device='cuda',
                                 mel_filters_dir=mel_filters_dir).unsqueeze(0)
             for wave in waveforms
@@ -371,16 +360,15 @@ def decode_dataset(
 if __name__ == '__main__':
     args = parse_arguments()
     tensorrt_llm.logger.set_level(args.log_level)
-    model = WhisperTRTLLM(args.engine_dir, args.tokenizer_name, args.debug,
-                          args.assets_dir)
-    normallizer = EnglishTextNormalizer()
+    model = WhisperTRTLLM(args.engine_dir, args.debug, args.assets_dir)
+    normalizer = EnglishTextNormalizer()
     if args.enable_warmup:
         results, total_duration = decode_dataset(
             model,
             "hf-internal-testing/librispeech_asr_dummy",
             batch_size=args.batch_size,
             num_beams=args.num_beams,
-            normalizer=normallizer,
+            normalizer=normalizer,
             mel_filters_dir=args.assets_dir)
     start_time = time.time()
     if args.input_file:
@@ -398,7 +386,7 @@ if __name__ == '__main__':
             dtype=args.dtype,
             batch_size=args.batch_size,
             num_beams=args.num_beams,
-            normalizer=normallizer,
+            normalizer=normalizer,
             mel_filters_dir=args.assets_dir)
     elapsed = time.time() - start_time
     results = sorted(results)

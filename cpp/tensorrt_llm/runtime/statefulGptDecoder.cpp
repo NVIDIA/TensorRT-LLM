@@ -70,7 +70,7 @@ StatefulGptDecoder::StatefulGptDecoder(std::size_t vocabSize, std::size_t vocabS
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void StatefulGptDecoder::setup(DecodingMode const& mode, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
+void StatefulGptDecoder::setup(executor::DecodingMode const& mode, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
     SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength,
     SizeType32 maxTokensPerStep, bool fusedDecoder, nvinfer1::DataType dtype, ModelConfig const& modelConfig)
 {
@@ -154,7 +154,7 @@ void StatefulGptDecoder::newBatch(
     auto const beamWidth = samplingConfig.beamWidth;
 
     reshapeBuffers(batchSize, beamWidth, mMaxAttentionWindow, mSinkTokenLength, mMaxSequenceLength);
-    mDecoder->setup(samplingConfig, batchSize, mMaxSequenceLength);
+    mDecoder->setup(samplingConfig, batchSize);
 
     // sanity checks, should always be true after reshape
     auto const& outputIdsShape = mDecodingOutput->ids->getShape();

@@ -167,5 +167,54 @@ void invokeLengthCriterion(FinishedState* finished, SizeType32* finishedSum, Siz
     sync_check_cuda_error();
 }
 
+__global__ void explicitEOSCriterion(TokenIdType const** outputIds, TokenIdType const* endIds, FinishedState* finished,
+    SizeType32* sequenceLengths, SizeType32 const* tokensPerStep, SizeType32 const* batchSlots, SizeType32 batchSize,
+    SizeType32 maxTokensPerStep)
+{
+    auto const batchIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (batchIdx >= batchSize)
+    {
+        return;
+    }
+
+    auto const batchSlot = batchSlots != nullptr ? batchSlots[batchIdx] : batchIdx;
+    if (finished[batchSlot].isFinished())
+    {
+        return;
+    }
+
+    auto const numTokens = tokensPerStep != nullptr ? tokensPerStep[batchSlot] : maxTokensPerStep;
+    auto const endId = endIds[batchSlot];
+    auto const sequenceLength = sequenceLengths[batchSlot];
+
+    auto const posStart = max(0, sequenceLength - numTokens);
+    auto const posEnd = sequenceLength;
+    for (SizeType32 pos = posStart; pos < posEnd; ++pos)
+    {
+        auto const token = outputIds[batchSlot][pos];
+        if (token == endId)
+        {
+            finished[batchSlot].setFinishedEOS();
+            sequenceLengths[batchSlot] = max(0, pos);
+        }
+    }
+}
+
+void invokeExplicitEOSCriterion(TokenIdType const** outputIds, TokenIdType const* endIds, FinishedState* finished,
+    SizeType32* sequenceLengths, SizeType32 const* tokensPerStep, SizeType32 const* batchSlots, SizeType32 batchSize,
+    SizeType32 beamWidth, SizeType32 maxTokensPerStep, cudaStream_t stream)
+{
+    TLLM_CHECK_WITH_INFO(beamWidth == 1, "Explicit EOS criterion does not support beam search");
+    // Check if we have sampled an end id token. If so, stop the sequence.
+    SizeType32 constexpr blockSize{256};
+
+    dim3 grid;
+    grid.x = divUp(batchSize, blockSize);
+
+    explicitEOSCriterion<<<grid, blockSize, 0, stream>>>(
+        outputIds, endIds, finished, sequenceLengths, tokensPerStep, batchSlots, batchSize, maxTokensPerStep);
+    sync_check_cuda_error();
+}
+
 } // namespace kernels
 } // namespace tensorrt_llm

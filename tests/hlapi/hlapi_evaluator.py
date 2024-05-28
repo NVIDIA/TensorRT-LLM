@@ -80,12 +80,11 @@ def benchmark_main(model_path: str,
         print_colored(f"Running HLAPI benchmark ...\n", "bold_green")
 
         config = ModelConfig(model_path)
-        config._set_additional_options(
-            max_num_tokens=max_num_tokens,
-            max_input_len=max_input_length,
-            max_output_len=max_output_length,
-            max_batch_size=max_batch_size,
-        )
+        build_config = config.build_config
+        build_config.max_num_tokens = max_num_tokens
+        build_config.max_input_len = max_input_length
+        build_config.max_output_len = max_output_length
+        build_config.max_batch_size = max_batch_size
         config.parallel_config.tp_size = tp_size
 
         evaluator = LLMPerfEvaluator.create(

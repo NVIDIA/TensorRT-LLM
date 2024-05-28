@@ -34,7 +34,7 @@ TEST(samplingConfigTest, validInputs)
     }
     {
         texec::SamplingConfig execSamplingCfg(1);
-        texec::SpeculativeDecodingConfig specCfg({1}, std::nullopt, 0.5);
+        texec::ExternalDraftTokensConfig specCfg({1}, std::nullopt, 0.5);
         tr::SamplingConfig samplingCfg(execSamplingCfg, specCfg);
         EXPECT_EQ(samplingCfg.beamWidth, execSamplingCfg.getBeamWidth());
         EXPECT_TRUE(samplingCfg.draftAcceptanceThreshold.has_value());
@@ -59,7 +59,7 @@ TEST(samplingConfigTest, validInputs)
         texec::SamplingConfig execSamplingCfg(1, topK, topP, topPMin, topPResetIds, topPDecay, randomSeed, temperature,
             minLength, beamSearchDiversityRate, repetitionPenalty, presencePenalty, frequencyPenalty, lengthPenalty,
             earlyStopping);
-        texec::SpeculativeDecodingConfig specCfg({1}, std::nullopt, 0.5);
+        texec::ExternalDraftTokensConfig specCfg({1}, std::nullopt, 0.5);
         tr::SamplingConfig samplingCfg(execSamplingCfg, specCfg);
         EXPECT_EQ(samplingCfg.beamWidth, execSamplingCfg.getBeamWidth());
         EXPECT_THAT(samplingCfg.draftAcceptanceThreshold.value(), testing::ElementsAre(0.5f));

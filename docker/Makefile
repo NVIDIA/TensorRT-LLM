@@ -145,12 +145,14 @@ jenkins-aarch64_%: STAGE = devel
 centos7_%: IMAGE_WITH_TAG = $(shell grep 'LLM_CENTOS7_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
 centos7_%: STAGE = devel
 centos7_%: BASE_IMAGE = nvidia/cuda
+# Latest NGC centos7 CUDA image tag is 12.4.0. It also looks like no further update.
+# We need to reinstall the new CUDA toolkit when using this base image.
 centos7_%: BASE_TAG = 12.4.0-devel-centos7
 
 # For x86_64 and aarch64
 ubuntu22_%: STAGE = devel
 ubuntu22_%: BASE_IMAGE = nvidia/cuda
-ubuntu22_%: BASE_TAG = 12.4.0-devel-ubuntu22.04
+ubuntu22_%: BASE_TAG = 12.4.1-devel-ubuntu22.04
 
 trtllm_%: STAGE = release
 trtllm_%: PUSH_TO_STAGING := 0

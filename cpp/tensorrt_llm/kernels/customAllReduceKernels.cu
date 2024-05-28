@@ -123,13 +123,23 @@ __inline__ __device__ void multi_gpu_barrier(uint32_t** signals, uint32_t const 
         // Block 0 broadcasts its flag (local_rank on emitting dimension) to all receivers
         if (bidx == 0)
         {
-            signals[tidx][local_rank] = flag;
+            st_flag_release(flag, signals[tidx] + local_rank);
         }
 
         // All blocks check that corresponding block 0 on other GPUs have set the flag
         // No deadlock because block #0 is always the first block started
-        uint32_t volatile* my_signals = signals[local_rank];
-        while (my_signals[tidx] != flag)
+        uint32_t* peer_barrier_d = signals[local_rank] + tidx;
+        while (ld_flag_acquire(peer_barrier_d) != flag)
+        {
+        }
+
+        if (bidx == 0)
+        {
+            st_flag_release(flag, signals[tidx] + world_size + local_rank);
+        }
+
+        peer_barrier_d = signals[local_rank] + world_size + tidx;
+        while (ld_flag_acquire(peer_barrier_d) != flag)
         {
         }
     }
@@ -138,14 +148,14 @@ __inline__ __device__ void multi_gpu_barrier(uint32_t** signals, uint32_t const 
 }
 
 __inline__ __device__ void block_barrier(uint32_t** signals, uint32_t const flag, size_t const local_rank,
-    size_t const world_size, int const tidx, int const bidx)
+    size_t const world_size, int const tidx, int const bidx, int const grid_size)
 {
     // After this function, the block of id == bidx of each GPU has reached the barrier
     if (tidx < world_size)
     {
-        // we can think of signals having the shape [world_size, num_blocks, world_size]
-        // (+ an offset on dim 1 to account for flags used in multi_gpu_barrier)
-        // Dimension 0 is the "listening" dimension, dimension 2 is "emitting" dimension
+        // we can think of signals having the shape [world_size, 2, num_blocks, world_size]
+        // (+ an offset on dim 2 to account for flags used in multi_gpu_barrier)
+        // Dimension 0 is the "listening" dimension, dimension 3 is "emitting" dimension
 
         // Block broadcast its flag (local_rank on emitting dimension) to all receivers
         uint32_t flag_block_offset = world_size + bidx * world_size;
@@ -153,6 +163,17 @@ __inline__ __device__ void block_barrier(uint32_t** signals, uint32_t const flag
 
         // Blocks check that corresponding blocks on other GPUs have also set the flag
         uint32_t* peer_barrier_d = signals[local_rank] + flag_block_offset + tidx;
+
+        while (ld_flag_acquire(peer_barrier_d) != flag)
+        {
+        }
+
+        flag_block_offset += (grid_size + 1) * world_size;
+        st_flag_release(flag, signals[tidx] + flag_block_offset + local_rank);
+
+        // Blocks check that corresponding blocks on other GPUs have also set the flag
+        peer_barrier_d = signals[local_rank] + flag_block_offset + tidx;
+
         while (ld_flag_acquire(peer_barrier_d) != flag)
         {
         }
@@ -190,6 +211,7 @@ static __global__ void oneShotAllReduceKernel(AllReduceParams params)
 
     int const bidx = blockIdx.x;
     int const tidx = threadIdx.x;
+    int const grid_size = gridDim.x;
 
     // The number of elements packed into one for comms
     static constexpr int PACKED_ELTS = 16 / sizeof(T);
@@ -234,7 +256,8 @@ static __global__ void oneShotAllReduceKernel(AllReduceParams params)
         }
 
         // wait for equivalent blocks of other GPUs to have copied data to their shareable buffer
-        block_barrier(params.peer_barrier_ptrs_in, params.barrier_flag, params.local_rank, RANKS_PER_NODE, tidx, bidx);
+        block_barrier(
+            params.peer_barrier_ptrs_in, params.barrier_flag, params.local_rank, RANKS_PER_NODE, tidx, bidx, grid_size);
     }
     else
     {
@@ -321,6 +344,7 @@ static __global__ void twoShotAllReduceKernel(AllReduceParams params)
 
     int const bidx = blockIdx.x;
     int const tidx = threadIdx.x;
+    int const grid_size = gridDim.x;
 
     // The number of elements packed into one for comms
     static constexpr int PACKED_ELTS = 16 / sizeof(T);
@@ -370,7 +394,8 @@ static __global__ void twoShotAllReduceKernel(AllReduceParams params)
                 }
             }
         }
-        block_barrier(params.peer_barrier_ptrs_in, params.barrier_flag, params.local_rank, RANKS_PER_NODE, tidx, bidx);
+        block_barrier(
+            params.peer_barrier_ptrs_in, params.barrier_flag, params.local_rank, RANKS_PER_NODE, tidx, bidx, grid_size);
     }
     else
     {
@@ -422,7 +447,8 @@ static __global__ void twoShotAllReduceKernel(AllReduceParams params)
         }
     }
 
-    block_barrier(params.peer_barrier_ptrs_out, params.barrier_flag, params.local_rank, RANKS_PER_NODE, tidx, bidx);
+    block_barrier(
+        params.peer_barrier_ptrs_out, params.barrier_flag, params.local_rank, RANKS_PER_NODE, tidx, bidx, grid_size);
 
     // Gather all needed elts from other intra-node ranks
     for (size_t local_offset = chunk_start; local_offset < chunk_end; local_offset += blockDim.x * PACKED_ELTS)

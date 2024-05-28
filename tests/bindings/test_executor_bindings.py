@@ -1,9 +1,9 @@
 import datetime
 import json
-import os
+import os as _os
 import pickle
 import random
-import sys
+import sys as _sys
 import time
 import typing as tp
 from pathlib import Path
@@ -15,43 +15,19 @@ from binding_test_utils import *
 
 import tensorrt_llm.bindings.executor as trtllm
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+_sys.path.append(_os.path.join(_os.path.dirname(__file__), '..'))
+from utils.cpp_paths import *
+from utils.llm_data import llm_models_root
 from utils.util import skip_pre_ampere
 
 
 @pytest.fixture
-def model_path(engine_path):
-    return engine_path / "gpt2/fp16-plugin-packed-paged/tp1-pp1-gpu"
-
-
-@pytest.fixture
-def model_path_return_logits(engine_path):
-    return engine_path / "gpt2/fp16-plugin-packed-paged-gather/tp1-pp1-gpu"
-
-
-@pytest.fixture
-def input_data_path(data_path):
-    return data_path / "input_tokens.npy"
-
-
-@pytest.fixture(scope="module")
-def results_data_path(data_path: Path) -> Path:
-    return data_path / "gpt2/sampling/output_tokens_fp16_plugin_packed_paged_tp1_pp1.npy"
-
-
-@pytest.fixture(scope="module")
-def results_data_path_beam_width_2(data_path: Path) -> Path:
-    return data_path / "gpt2/beam_search_2/output_tokens_fp16_plugin_packed_paged_tp1_pp1.npy"
-
-
-@pytest.fixture
-def model_files(llm_root: Path, resource_path: Path, llm_model_root,
-                results_data_path):
+def model_files(llm_root: Path, resource_path: Path, results_data_path):
     # Model engines and expected outputs need to be generated.
     if not results_data_path.exists():
-        model_cache_arg = ["--model_cache",
-                           str(llm_model_root)
-                           ] if llm_model_root is not None else []
+        model_cache = llm_models_root()
+        model_cache_arg = ["--model_cache", str(model_cache)
+                           ] if model_cache is not None else []
         prepare_model_tests(llm_root, resource_path, "gpt", model_cache_arg)
 
 
@@ -87,6 +63,41 @@ def test_executor_invalid_ctor():
         assert False, "Expected an error"
     except Exception as e:
         assert "File does not exist" in str(e)
+
+
+@skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
+def test_shutdown(model_files, model_path):
+
+    beam_width = 1
+    executor_config = trtllm.ExecutorConfig(beam_width)
+    executor = trtllm.Executor(model_path, trtllm.ModelType.DECODER_ONLY,
+                               executor_config)
+
+    # Create the request
+    max_new_tokens = 5
+    input_tokens = [1, 2, 3, 4]
+    request = trtllm.Request(input_tokens, max_new_tokens, False,
+                             trtllm.SamplingConfig())
+
+    # Enqueue the request
+    assert executor.can_enqueue_requests() == True
+    req_id = executor.enqueue_request(request)
+
+    executor.shutdown()
+    assert executor.can_enqueue_requests() == False
+
+    with pytest.raises(Exception):
+        executor.enqueue_request(request)
+    with pytest.raises(Exception):
+        executor.await_responses()
+    with pytest.raises(Exception):
+        executor.get_latest_iteration_stats()()
+    with pytest.raises(Exception):
+        executor.get_latest_request_stats()()
+    with pytest.raises(Exception):
+        executor.cancel_request(req_id)()
+    with pytest.raises(Exception):
+        executor.get_num_responses_ready(req_id)()
 
 
 @skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
@@ -626,9 +637,9 @@ def test_output_config():
     assert config.exclude_input_from_output == False
 
 
-def test_speculative_decoding_config():
+def test_external_draft_tokens_config():
     tokens = [1, 2, 3]
-    config = trtllm.SpeculativeDecodingConfig(tokens)
+    config = trtllm.ExternalDraftTokensConfig(tokens)
     assert config.tokens == tokens
     assert config.logits is None
     assert config.acceptance_threshold is None
@@ -636,7 +647,7 @@ def test_speculative_decoding_config():
 
     logits = torch.ones(3, 1)
     acceptance_threshold = 1.0
-    config = trtllm.SpeculativeDecodingConfig(tokens, logits,
+    config = trtllm.ExternalDraftTokensConfig(tokens, logits,
                                               acceptance_threshold)
     assert config.tokens == tokens
     assert (config.logits == logits).all()
@@ -706,8 +717,8 @@ def test_request():
         "bad_words": [[4, 5, 6]],
         "stop_words": [[7, 8, 9]],
         "embedding_bias": torch.ones(1),
-        "speculative_decoding_config":
-        trtllm.SpeculativeDecodingConfig([1, 2, 3]),
+        "external_draft_tokens_config":
+        trtllm.ExternalDraftTokensConfig([1, 2, 3]),
         "prompt_tuning_config": trtllm.PromptTuningConfig(torch.ones(100, 64)),
         "lora_config": trtllm.LoraConfig(1)
     }
@@ -717,9 +728,9 @@ def test_request():
             assert getattr(request, k) == v
     assert isinstance(request.sampling_config, trtllm.SamplingConfig)
     assert isinstance(request.output_config, trtllm.OutputConfig)
-    assert isinstance(request.speculative_decoding_config,
-                      trtllm.SpeculativeDecodingConfig)
-    assert request.speculative_decoding_config.tokens == [1, 2, 3]
+    assert isinstance(request.external_draft_tokens_config,
+                      trtllm.ExternalDraftTokensConfig)
+    assert request.external_draft_tokens_config.tokens == [1, 2, 3]
     assert isinstance(request.prompt_tuning_config, trtllm.PromptTuningConfig)
     assert (request.prompt_tuning_config.embedding_table == torch.ones(
         100, 64)).all()
@@ -795,6 +806,84 @@ def test_kv_cache_config():
         assert getattr(config, k) == v
 
 
+def test_lookahead_decoding_config():
+    config = trtllm.LookaheadDecodingConfig(3, 5, 7)
+    assert config.max_ngram_size == 3
+    assert config.max_window_size == 5
+    assert config.max_verification_set_size == 7
+
+    config.max_ngram_size = 5
+    config.max_window_size = 10
+    config.max_verification_set_size = 3
+
+    assert config.max_ngram_size == 5
+    assert config.max_window_size == 10
+    assert config.max_verification_set_size == 3
+
+    kwargs = {
+        "max_ngram_size": 3,
+        "max_window_size": 5,
+        "max_verification_set_size": 7,
+    }
+
+    config = trtllm.LookaheadDecodingConfig(**kwargs)
+    for k, v in kwargs.items():
+        assert getattr(config, k) == v
+
+
+def test_decoding_mode():
+    mode = trtllm.DecodingMode.Auto()
+    assert mode.isAuto()
+
+    mode = trtllm.DecodingMode.TopK()
+    assert mode.isTopK()
+
+    mode = trtllm.DecodingMode.TopP()
+    assert mode.isTopP()
+
+    mode = trtllm.DecodingMode.TopKTopP()
+    assert mode.isTopKandTopP()
+
+    mode = trtllm.DecodingMode.BeamSearch()
+    assert mode.isBeamSearch()
+
+    mode = trtllm.DecodingMode.Medusa()
+    assert mode.isMedusa()
+
+    mode = trtllm.DecodingMode.Lookahead()
+    assert mode.isLookahead()
+
+
+def test_speculative_decoding_config():
+    config = trtllm.DecodingConfig()
+    assert config.decoding_mode is None
+    assert config.lookahead_decoding_config is None
+    assert config.medusa_choices is None
+
+    config = trtllm.DecodingConfig()
+    config.decoding_mode = trtllm.DecodingMode.TopKTopP()
+    assert config.decoding_mode.isTopKandTopP()
+    assert config.lookahead_decoding_config == None
+    assert config.medusa_choices == None
+
+    config = trtllm.DecodingConfig()
+    la_decoding_config = trtllm.LookaheadDecodingConfig(3, 5, 7)
+    config.lookahead_decoding_config = la_decoding_config
+
+    assert config.decoding_mode.isLookahead()
+    assert config.lookahead_decoding_config.max_ngram_size == la_decoding_config.max_ngram_size
+    assert config.lookahead_decoding_config.max_window_size == la_decoding_config.max_window_size
+    assert config.lookahead_decoding_config.max_verification_set_size == la_decoding_config.max_verification_set_size
+    assert config.medusa_choices == None
+
+    config = trtllm.DecodingConfig()
+    config.medusa_choices = [[0, 0], [0, 1]]
+
+    assert config.decoding_mode.isMedusa()
+    assert config.lookahead_decoding_config == None
+    assert config.medusa_choices == [[0, 0], [0, 1]]
+
+
 def test_executor_config():
     config = trtllm.ExecutorConfig()
     assert config.max_beam_width == 1
@@ -807,8 +896,7 @@ def test_executor_config():
     assert config.parallel_config is None
     assert isinstance(config.peft_cache_config, trtllm.PeftCacheConfig)
     assert config.logits_post_processor_map is None
-    assert config.medusa_choices is None
-    assert config.decoding_mode is None
+    assert config.decoding_config is None
 
     kwargs = {
         "max_beam_width":
@@ -830,9 +918,8 @@ def test_executor_config():
         "peft_cache_config":
         trtllm.PeftCacheConfig(10),
         "logits_post_processor_map": {},
-        "medusa_choices": [[1, 2, 3]],
-        "decoding_mode":
-        trtllm.DecodingMode.TOP_K_TOP_P,
+        "decoding_config":
+        trtllm.DecodingConfig(trtllm.DecodingMode.TopKTopP()),
     }
     config = trtllm.ExecutorConfig(**kwargs)
     for k, v in kwargs.items():
@@ -859,7 +946,7 @@ def test_parallel_config():
 
     comm_mode = trtllm.CommunicationMode.ORCHESTRATOR
     #Dummy path to worker executable
-    worker_path = os.path.abspath(__file__)
+    worker_path = _os.path.abspath(__file__)
     orchestrator_config = trtllm.OrchestratorConfig(True, str(worker_path))
     parallel_config = trtllm.ParallelConfig(comm_type, comm_mode, device_ids,
                                             participant_ids,
@@ -984,6 +1071,7 @@ def test_request_stats():
     stats.stage = trtllm.RequestStage.CONTEXT_IN_PROGRESS
     stats.context_prefill_position = 2
     stats.num_generated_tokens = 3
+    stats.avg_num_decoded_tokens_per_iter = 2.5
     stats.scheduled = True
     stats.paused = False
     stats_json = json.loads(stats.to_json_str())
@@ -992,6 +1080,8 @@ def test_request_stats():
     assert stats_json[
         "contextPrefillPosition"] == stats.context_prefill_position
     assert stats_json["numGeneratedTokens"] == stats.num_generated_tokens
+    assert stats_json[
+        "avgNumDecodedTokensPerIter"] == stats.avg_num_decoded_tokens_per_iter
     assert stats_json["scheduled"] == stats.scheduled
     assert stats_json["paused"] == stats.paused
 

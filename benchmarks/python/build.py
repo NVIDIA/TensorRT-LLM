@@ -883,6 +883,9 @@ def build_gpt(args):
         config = PretrainedConfig.from_dict(config)
         tensorrt_llm_model = tensorrt_llm.models.RecurrentGemmaForCausalLM(
             config)
+        tensorrt_llm_model = optimize_model(tensorrt_llm_model,
+                                            use_fused_mlp=True,
+                                            use_fused_rg_lru=True)
 
     else:
         raise Exception(f'Unexpected model: {args.model}')
@@ -894,15 +897,15 @@ def build_gpt(args):
 
     # Plugins
     if args.mode in ['plugin', 'plugin-ifb']:
-        network.plugin_config.set_gpt_attention_plugin(dtype=args.dtype)
+        network.plugin_config.gpt_attention_plugin = args.dtype
         network.plugin_config.set_context_fmha(ContextFMHAType.enabled)
-        network.plugin_config.enable_remove_input_padding()
-        network.plugin_config.set_lookup_plugin(dtype=args.dtype)
-        network.plugin_config.set_moe_plugin(dtype=args.dtype)
-        network.plugin_config.set_mamba_conv1d_plugin(dtype=args.dtype)
+        network.plugin_config.remove_input_padding = True
+        network.plugin_config.lookup_plugin = args.dtype
+        network.plugin_config.moe_plugin = args.dtype
+        network.plugin_config.mamba_conv1d_plugin = args.dtype
 
         if args.quantization is None or "fp8" not in args.quantization:
-            network.plugin_config.set_gemm_plugin(dtype=args.dtype)
+            network.plugin_config.gemm_plugin = args.dtype
 
         # Quantization plugins.
         use_smooth_quant = quant_mode.has_act_and_weight_quant()
@@ -910,21 +913,19 @@ def build_gpt(args):
         if use_smooth_quant:
             network.plugin_config.set_smooth_quant_plugins(dtype=args.dtype)
         elif use_weight_only:
-            network.plugin_config.set_weight_only_quant_matmul_plugin(
-                dtype=args.dtype)
+            network.plugin_config.weight_only_quant_matmul_plugin = args.dtype
         elif family == "llama" and quant_mode.has_act_and_weight_quant():
             # RMS norm plugin for SmoothQuant
-            network.plugin_config.set_rmsnorm_quantization_plugin(
-                dtype=args.dtype)
+            network.plugin_config.rmsnorm_quantization_plugin = args.dtype
 
         # Inflight batching
         if args.mode == 'plugin-ifb':
             network.plugin_config.enable_paged_kv_cache()
-            network.plugin_config.enable_paged_state()
+            network.plugin_config.paged_state = True
     elif args.mode == 'ootb-except-mha':
-        network.plugin_config.set_gpt_attention_plugin(dtype=args.dtype)
+        network.plugin_config.gpt_attention_plugin = args.dtype
         network.plugin_config.set_context_fmha(ContextFMHAType.enabled)
-        network.plugin_config.enable_remove_input_padding()
+        network.plugin_config.remove_input_padding = True
 
     if world_size > 1:
         network.plugin_config.set_nccl_plugin(
@@ -1056,12 +1057,12 @@ def build_bert(args):
 
     # Plugins
     if args.mode == 'plugin':
-        network.plugin_config.set_bert_attention_plugin(dtype=args.dtype)
-        network.plugin_config.set_gemm_plugin(dtype=args.dtype)
-        network.plugin_config.enable_qk_half_accum()
+        network.plugin_config.bert_attention_plugin = args.dtype
+        network.plugin_config.gemm_plugin = args.dtype
+        network.plugin_config.attention_qk_half_accumulation = True
         network.plugin_config.set_context_fmha(ContextFMHAType.enabled)
     elif args.mode == 'ootb-except-mha':
-        network.plugin_config.set_bert_attention_plugin(dtype=args.dtype)
+        network.plugin_config.bert_attention_plugin = args.dtype
         network.plugin_config.set_context_fmha(ContextFMHAType.enabled)
 
     if world_size > 1:
@@ -1226,13 +1227,29 @@ def enc_dec_build_helper(component, config, args):
 
     if component == 'encoder':
         if family == 'whisper':
-            tllm_model = tensorrt_llm.models.WhisperEncoder(
-                n_mels=config['n_mels'],
-                n_ctx=1500,  # n_audio_ctx
-                n_state=config['hidden_size'],
-                n_head=config['num_heads'],
-                n_layer=config['num_layers'],
-                dtype=dtype)
+            pretrained_config = PretrainedConfig.from_dict({
+                'architecture':
+                "WhisperEncoder",
+                'dtype':
+                dtype,
+                'num_hidden_layers':
+                config['num_layers'],
+                'num_attention_heads':
+                config['num_heads'],
+                'hidden_size':
+                config['hidden_size'],
+                'n_mels':
+                config['n_mels'],
+                'n_audio_ctx':
+                1500,
+                'vocab_size':
+                config['vocab_size'],
+                'hidden_act':
+                "gelu",
+                'num_languages':
+                100,
+            })
+            tllm_model = tensorrt_llm.models.WhisperEncoder(pretrained_config)
             if use_weight_only:
                 tllm_model = quantize(tllm_model, quant_config)
         else:
@@ -1387,15 +1404,14 @@ def enc_dec_build_helper(component, config, args):
 
     # Plugins
     if args.mode == 'plugin':
-        network.plugin_config.set_bert_attention_plugin(dtype=args.dtype)
-        network.plugin_config.set_gemm_plugin(dtype=args.dtype)
-        network.plugin_config.set_gpt_attention_plugin(dtype=args.dtype)
+        network.plugin_config.bert_attention_plugin = args.dtype
+        network.plugin_config.gemm_plugin = args.dtype
+        network.plugin_config.gpt_attention_plugin = args.dtype
         if use_weight_only:
-            network.plugin_config.set_weight_only_quant_matmul_plugin(
-                dtype=args.dtype)
+            network.plugin_config.weight_only_quant_matmul_plugin = args.dtype
     elif args.mode == 'ootb-except-mha':
-        network.plugin_config.set_bert_attention_plugin(dtype=args.dtype)
-        network.plugin_config.set_gpt_attention_plugin(dtype=args.dtype)
+        network.plugin_config.bert_attention_plugin = args.dtype
+        network.plugin_config.gpt_attention_plugin = args.dtype
 
     if world_size > 1:
         network.plugin_config.set_nccl_plugin(

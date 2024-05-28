@@ -64,7 +64,7 @@ inline DimType64 computeNDimension(bool transB, nvinfer1::Dims const& dims)
 }
 
 #define TLLM_INT32_CAST(value)                                                                                         \
-    ((value > 0x7FFFFFFFL || value < -0x80000000L)                                                                     \
+    ((value > 0x7FFFFFFFLL || value < -0x80000000LL)                                                                   \
             ? (TLLM_LOG_ERROR("Value of " #value " is out of range for int32_t"), 0)                                   \
             : static_cast<int32_t>(value))
 

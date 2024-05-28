@@ -59,9 +59,17 @@ namespace tensorrt_llm::plugins
 //     8.2 host_pool_pointers [2] if paged kv cache (optional)
 //     9.  kv_cache_quantization_scale [1] (optional)
 //     10. kv_cache_dequantization_scale [1] (optional)
-//     11. alibi_slopes [num_heads] (optional for ALiBi position embedding)
-//     12. host_context_lengths [batch_size] int32. (optional, required when remove_input_padding is true)
-//     13. qkv_bias (optional) [local_hidden_size * 3]
+//     11. attention_output_quantization_scale [1] (on device, optional)
+//     12. rotary_cos_sin [max_num_embedding_positions, 2] (float) (on device, optional)
+//     13. alibi_slopes [num_heads] (optional for ALiBi position embedding)
+//     14. relative_attention_bias [num_heads] (optional for ALiBi position embedding)
+//     15. host_context_lengths [batch_size] int32. (optional, required when remove_input_padding is true)
+//     16. qkv_bias (optional) [local_hidden_size * 3]
+//     17. spec_decoding_generation_lengths (optional, required when medusa is enabled) (int32_t) [batch_size]
+//     18. spec_decoding_packed_mask (optional, required when medusa is enabled) (int32_t) [num_tokens, packed_mask_dim]
+//                                    packed_mask_dim = divUp(max_num_spec_decoding_tokens + 1, 32)
+//     19. spec_decoding_position_offsets (optional, required when medusa is enabled) (int32_t) [batch_size,
+//     max_num_spec_decoding_tokens + 1]
 //
 // outputs
 //     output_tensor [batch_size, seq_len, local_hidden_size]
@@ -72,7 +80,7 @@ class GPTAttentionPlugin : public GPTAttentionPluginCommon
 {
 public:
     GPTAttentionPlugin(int layer_idx, int num_heads, int vision_start, int vision_length, int num_kv_heads,
-        int head_size, int unidirectional, float q_scaling,
+        int head_size, int unidirectional, float q_scaling, float qk_tanh_scale,
         tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
         int rotary_embedding_dim, // for RoPE. 0 for non-RoPE
         float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,

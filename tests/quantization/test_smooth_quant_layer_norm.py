@@ -69,7 +69,7 @@ class TestSmoothQuantLayerNorm(unittest.TestCase):
         # construct trt network
         builder = tensorrt_llm.Builder()
         network = builder.create_network()
-        network.plugin_config.set_layernorm_quantization_plugin(dtype)
+        network.plugin_config.layernorm_quantization_plugin = dtype
         with tensorrt_llm.net_guard(network):
             x = Tensor(name='x',
                        shape=x_data.shape,

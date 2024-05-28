@@ -75,8 +75,8 @@ class TopModelMixin:
         self.max_prompt_embedding_table_size = max_prompt_embedding_table_size
         raise NotImplementedError  # Fill more details later
 
-    def default_plugin_config(self, **kwargs) -> 'PluginConfig':
+    def default_plugin_config(self, **kwargs) -> PluginConfig:
         '''Return the default plugin config for this model, when the plugin_config value is not given in to_trt() call.
            If users need to set different plugin configs, they can start from the return object and change it.
         '''
-        return PluginConfig(**kwargs)
+        return PluginConfig.from_dict(kwargs)

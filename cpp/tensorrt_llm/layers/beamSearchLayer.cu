@@ -72,6 +72,8 @@ void BeamSearchLayer<T>::setup(runtime::SizeType32 const batchSize, runtime::Siz
         mLengthPenaltyDevice, (int*) nullptr, std::make_pair(fltMin, fltMax), "length penalty");
     fillBuffers(setupParams->early_stopping, DefaultDecodingParams::getEarlyStopping(), mEarlyStoppingHost,
         mEarlyStoppingDevice, (int*) nullptr, std::make_pair(fltMin, fltMax), "early stopping");
+    mHasDiffRuntimeArgs = setupParams->hasDiffRuntimeArgs;
+
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -108,10 +110,10 @@ __global__ void updateCacheIndirectionKernel(
 }
 
 template <typename T>
-void BeamSearchLayer<T>::forward(
+void BeamSearchLayer<T>::forwardAsyncSingleRequest(
     std::shared_ptr<BaseOutputParams> baseOutputs, std::shared_ptr<BaseInputParams> baseInputs)
 {
-    TLLM_LOG_TRACE("%s", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto ip = std::dynamic_pointer_cast<BeamSearchInputParams>(baseInputs);
     auto op = std::dynamic_pointer_cast<BeamSearchOutputParams>(baseOutputs);
@@ -159,6 +161,82 @@ void BeamSearchLayer<T>::forward(
             tgtCI, srcCI, bh, ip->max_attention_window, ip->sink_token_length);
         sync_check_cuda_error();
     }
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+template <typename T>
+void BeamSearchLayer<T>::forwardAsync(
+    std::shared_ptr<BaseOutputParams> baseOutputs, std::shared_ptr<BaseInputParams> baseInputs)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    auto outputs = std::dynamic_pointer_cast<DynamicDecodeOutputParams>(baseOutputs);
+    auto params = std::dynamic_pointer_cast<DynamicDecodeInputParams>(baseInputs);
+
+    auto const localDecoderDomain = getLocalDecoderDomain(params);
+
+    auto batchSlots = params->batch_slots ? params->batch_slots->template getPtr<SizeType32 const>() : nullptr;
+    auto const maxSeqLen = outputs->output_ids.shape[outputs->output_ids.shape.size() - 1];
+    auto const ite = params->ite;
+    auto const step = params->step;
+
+    // common inputs
+    auto const& endIds = params->end_ids;
+    auto const localBatchSize = static_cast<std::size_t>(params->local_batch_size);
+
+    TLLM_CHECK_WITH_INFO(localDecoderDomain.getBeamWidth() > 1,
+        "Decoding mode is beam search, but beamWidth <= 1 (%d <= 1)", localDecoderDomain.getBeamWidth());
+    TLLM_CHECK_WITH_INFO(
+        params->src_cache_indirection.has_value(), "src_cache_indirection is mandatory in beam search.");
+    TLLM_CHECK_WITH_INFO(
+        outputs->tgt_cache_indirection.has_value(), "tgt_cache_indirection is mandatory in beam search.");
+    TLLM_CHECK_WITH_INFO(outputs->parent_ids.has_value(), "parent_ids tensor is mandatory in beam search.");
+    TLLM_CHECK_WITH_INFO(outputs->finished.has_value(), "finished tensor is mandatory in beam search.");
+    TLLM_CHECK_WITH_INFO(outputs->cum_log_probs.has_value(), "cum_log_probs tensor is mandatory in beam search.");
+
+    // Compute one by one if there are different runtime arguments
+    //     due to Batch-Beam-Search is not supported yet, so we need to compute
+    size_t const dynamic_decode_batch_size = mHasDiffRuntimeArgs ? 1 : localBatchSize;
+    auto const dynamic_decode_total_iteration = mHasDiffRuntimeArgs ? localBatchSize : 1;
+
+    for (uint32_t dynamic_ite = 0; dynamic_ite < dynamic_decode_total_iteration; ++dynamic_ite)
+    {
+        auto const dynamic_id_offset = dynamic_ite * dynamic_decode_batch_size * localDecoderDomain.getBeamWidth();
+        auto const dynamic_decode_vocab_size_units_offset = dynamic_id_offset * mDecoderDomain.getVocabSizePadded();
+
+        auto const logits_offset
+            = params->logits->slice({dynamic_decode_batch_size, params->logits->shape[1], params->logits->shape[2]},
+                dynamic_decode_vocab_size_units_offset);
+        auto const end_id_offset = endIds.slice({dynamic_decode_batch_size}, dynamic_ite * dynamic_decode_batch_size);
+
+        auto forwardParams = std::make_shared<BeamSearchInputParams>(step, ite, logits_offset, end_id_offset,
+            *params->src_cache_indirection, static_cast<std::int32_t>(params->max_attention_window),
+            static_cast<std::int32_t>(params->sink_token_length), static_cast<std::int32_t>(maxSeqLen));
+
+        if (params->input_lengths)
+        {
+            forwardParams->input_lengths = params->input_lengths->slice(
+                {dynamic_decode_batch_size * localDecoderDomain.getBeamWidth()}, dynamic_id_offset);
+        }
+
+        auto outputParams = std::make_shared<BeamSearchOutputParams>(
+            outputs->output_ids, outputs->parent_ids.value(), outputs->tgt_cache_indirection.value());
+
+        outputParams->output_ids_ptr = std::move(outputs->output_ids_ptr);
+        outputParams->parent_ids_ptr = std::move(outputs->parent_ids_ptr);
+        outputParams->sequence_length = outputs->sequence_length->slice(
+            {dynamic_decode_batch_size * localDecoderDomain.getBeamWidth()}, dynamic_id_offset);
+        outputParams->finished = outputs->finished->slice(
+            {dynamic_decode_batch_size * localDecoderDomain.getBeamWidth()}, dynamic_id_offset);
+        outputParams->cum_log_probs = outputs->cum_log_probs->slice(
+            {dynamic_decode_batch_size * localDecoderDomain.getBeamWidth()}, dynamic_id_offset);
+        outputParams->output_log_probs = outputs->output_log_probs_tiled; // notice: use tiled tensor
+        outputParams->beamHypotheses = std::move(outputs->beamHypotheses);
+
+        // beam_search_diversity_rate is only supported when using BeamHypotheses
+        forwardAsyncSingleRequest(outputParams, forwardParams);
+    } // end of dynamic_ite
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>

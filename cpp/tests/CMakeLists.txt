@@ -11,7 +11,9 @@
 # distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations under
-# the License. GoogleTest Preparation - Code block copied from
+# the License.
+
+# GoogleTest Preparation - Code block copied from
 # https://google.github.io/googletest/quickstart-cmake.html
 include(FetchContent)
 FetchContent_Declare(
@@ -114,6 +116,9 @@ add_gtest(lookaheadPoolManagerTest layers/lookaheadPoolManagerTest.cpp)
 set(LOOKAHEAD_ALGORITHM_TEST_SRC layers/randomLlm.cpp
                                  layers/lookaheadAlgorithmTest.cpp)
 add_gtest(lookaheadAlgorithmTest "${LOOKAHEAD_ALGORITHM_TEST_SRC}")
+set(LOOKAHEAD_RANDOMLLM_TEST_SRC layers/randomLlm.cpp
+                                 layers/lookaheadRandomLlmTest.cpp)
+add_gtest(lookaheadRandomLlmTest "${LOOKAHEAD_RANDOMLLM_TEST_SRC}")
 
 if(BUILD_BATCH_MANAGER)
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/batch_manager)

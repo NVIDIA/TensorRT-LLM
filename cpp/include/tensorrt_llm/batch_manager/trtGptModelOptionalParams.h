@@ -21,8 +21,6 @@
 #include "tensorrt_llm/batch_manager/peftCacheManagerConfig.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/common.h"
-#include "tensorrt_llm/runtime/decodingMode.h"
-#include "tensorrt_llm/runtime/medusaModule.h"
 
 #include <optional>
 #include <vector>
@@ -40,18 +38,15 @@ public:
     explicit TrtGptModelOptionalParams(KvCacheConfig const& kvCacheConfig = KvCacheConfig{},
         bool enableTrtOverlap = false, std::optional<std::vector<SizeType32>> const& deviceIds = std::nullopt,
         bool normalizeLogProbs = true, bool enableChunkedContext = false,
-        std::optional<runtime::DecodingMode> const& decodingMode = std::nullopt,
         PeftCacheManagerConfig const& peftCacheManagerConfig = PeftCacheManagerConfig{},
-        std::optional<runtime::MedusaModule::MedusaChoices> const& medusaChoices = std::nullopt,
-        float gpuWeightsPercent = 1)
+        executor::DecodingConfig const& decodingConfig = executor::DecodingConfig{}, float gpuWeightsPercent = 1)
         : kvCacheConfig{kvCacheConfig}
         , enableTrtOverlap{enableTrtOverlap}
         , deviceIds(deviceIds)
         , normalizeLogProbs{normalizeLogProbs}
         , enableChunkedContext{enableChunkedContext}
-        , decodingMode{decodingMode}
         , peftCacheManagerConfig(peftCacheManagerConfig)
-        , medusaChoices(medusaChoices)
+        , decodingConfig(decodingConfig)
         , gpuWeightsPercent(gpuWeightsPercent)
     {
     }
@@ -60,10 +55,9 @@ public:
         : TrtGptModelOptionalParams(KvCacheConfig(executorConfig.getKvCacheConfig()), false,
             executorConfig.getParallelConfig().value_or(executor::ParallelConfig()).getDeviceIds(),
             executorConfig.getNormalizeLogProbs(), executorConfig.getEnableChunkedContext(),
-            runtime::DecodingMode::fromExecutor(
-                executorConfig.getDecodingMode().value_or(executor::DecodingMode::kNONE)),
             PeftCacheManagerConfig(executorConfig.getPeftCacheConfig().value_or(executor::PeftCacheConfig())),
-            executorConfig.getMedusaChoices(), executorConfig.getGpuWeightsPercent())
+            executorConfig.getDecodingConfig().value_or(executor::DecodingConfig{}),
+            executorConfig.getGpuWeightsPercent())
     {
     }
 
@@ -71,7 +65,7 @@ public:
     {
         return kvCacheConfig == other.kvCacheConfig && enableTrtOverlap == other.enableTrtOverlap
             && deviceIds == other.deviceIds && normalizeLogProbs == other.normalizeLogProbs
-            && enableChunkedContext == other.enableChunkedContext && decodingMode == other.decodingMode;
+            && enableChunkedContext == other.enableChunkedContext && decodingConfig == other.decodingConfig;
     }
 
     friend std::ostream& operator<<(std::ostream& os, TrtGptModelOptionalParams const& self);
@@ -82,9 +76,8 @@ public:
     std::optional<std::vector<SizeType32>> deviceIds;
     bool normalizeLogProbs;
     bool enableChunkedContext;
-    std::optional<runtime::DecodingMode> decodingMode;
     PeftCacheManagerConfig peftCacheManagerConfig;
-    std::optional<runtime::MedusaModule::MedusaChoices> medusaChoices;
+    executor::DecodingConfig decodingConfig;
     // Percentage of weights on the gpu at runtime
     float gpuWeightsPercent;
 };

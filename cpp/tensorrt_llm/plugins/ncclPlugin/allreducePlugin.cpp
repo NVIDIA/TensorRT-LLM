@@ -142,10 +142,9 @@ AllReduceStrategyType AllreducePlugin::selectImplementation(
     {
         if (!isAuto)
         {
-            return mStrategy;
+            strat = mStrategy;
         }
-
-        if (worldSize <= 2)
+        else if (worldSize <= 2)
         {
             strat = AllReduceStrategyType::ONESHOT;
         }
@@ -315,22 +314,91 @@ public:
     }
 };
 
+std::set<int> getLocalGroup(std::set<int> const& group)
+{
+    auto const myRank = COMM_SESSION.getRank();
+    auto const myLocalRank = LOCAL_COMM_SESSION.getRank();
+    auto const localSize = LOCAL_COMM_SESSION.getSize();
+
+    std::vector<int32_t> ranks(localSize, 0);
+    std::vector<int32_t> localRanks(localSize, 0);
+    if (group.size() >= localSize)
+    {
+        LOCAL_COMM_SESSION.allgather(&myRank, ranks.data(), 1, tensorrt_llm::mpi::MpiType::kINT32);
+        LOCAL_COMM_SESSION.allgather(&myLocalRank, localRanks.data(), 1, tensorrt_llm::mpi::MpiType::kINT32);
+    }
+    else
+    {
+        if (myRank == *group.begin())
+        {
+            ranks.clear();
+            int rank;
+            ranks.push_back(myRank);
+            for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it)
+            {
+                LOCAL_COMM_SESSION.recvValue(rank, *it, 0);
+                ranks.push_back(rank);
+            }
+            for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it)
+            {
+                LOCAL_COMM_SESSION.send(ranks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32, *it, 0);
+            }
+
+            localRanks.clear();
+            localRanks.push_back(myLocalRank);
+            for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it)
+            {
+                LOCAL_COMM_SESSION.recvValue(rank, *it, 0);
+                localRanks.push_back(rank);
+            }
+            for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it)
+            {
+                LOCAL_COMM_SESSION.send(localRanks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32, *it, 0);
+            }
+        }
+        else
+        {
+            LOCAL_COMM_SESSION.sendValue(myRank, *group.begin(), 0);
+            LOCAL_COMM_SESSION.recv(ranks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32, *group.begin(), 0);
+
+            LOCAL_COMM_SESSION.sendValue(myLocalRank, *group.begin(), 0);
+            LOCAL_COMM_SESSION.recv(
+                localRanks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32, *group.begin(), 0);
+        }
+    }
+
+    std::set<int> localGroup;
+    for (size_t i = 0; i < ranks.size(); ++i)
+    {
+        auto rank = ranks[i];
+        if (group.find(rank) != group.end())
+        {
+            localGroup.insert(localRanks[i]);
+        }
+    }
+    return localGroup;
+}
+
 void AllreducePlugin::initGroupTopology() noexcept
 {
+    std::set<int> localGroup = getLocalGroup(mGroup);
+    if (mGroup.size() != localGroup.size())
+    {
+        mIsP2PSupported = false;
+        mIsNVLINKSupported = false;
+        return;
+    }
+
     NvmlManager nvmlManager;
-
-    nvmlReturn_t result;
-
+    std::unordered_set<int> visitedDevice;
     mIsP2PSupported = true;
     mIsNVLINKSupported = true;
 
-    std::unordered_set<int> visitedDevice;
-
     // Use cudaDeviceCanAccessPeer to determine whether p2p is supported,
     // and use nvml to determine whether there are nvlink links between ranks.
-    for (int firstDeviceId : mGroup)
+    for (int firstDeviceId : localGroup)
     {
-        for (int secondDeviceId : mGroup)
+        for (int secondDeviceId : localGroup)
         {
             if (firstDeviceId == secondDeviceId || visitedDevice.find(secondDeviceId) != visitedDevice.end())
             {
@@ -362,7 +430,7 @@ void AllreducePlugin::initGroupTopology() noexcept
                 }
 
                 nvmlDevice_t remoteDevice;
-                result = nvmlDeviceGetHandleByPciBusId_v2(remotePciInfo.busId, &remoteDevice);
+                auto const result = nvmlDeviceGetHandleByPciBusId_v2(remotePciInfo.busId, &remoteDevice);
 
                 if (result == NVML_SUCCESS)
                 {
@@ -423,14 +491,9 @@ int AllreducePlugin::initialize() noexcept
         return 0;
     }
 
+    initCommMap(mGroup);
     initGroupTopology();
 
-    if (mStrategy == AllReduceStrategyType::ONESHOT || mStrategy == AllReduceStrategyType::TWOSHOT)
-    {
-        return 0;
-    }
-
-    initCommMap(mGroup);
     return 0;
 }
 

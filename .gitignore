@@ -8,7 +8,6 @@ __pycache__/
 build*/
 *.egg-info/
 .coverage
-*.csv
 *.onnx
 tmp/
 venv/

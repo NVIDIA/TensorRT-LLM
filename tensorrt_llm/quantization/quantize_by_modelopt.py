@@ -148,6 +148,18 @@ def get_tokenizer(ckpt_path, max_seq_length=2048, model_type=None):
     return tokenizer
 
 
+def _get_vila_model(model_dir):
+    sys.path.append(model_dir + "/../VILA")
+    from llava.model import LlavaLlamaConfig, LlavaLlamaModel  # noqa
+    from transformers import AutoModel
+    model = AutoModel.from_pretrained(
+        model_dir,
+        device_map='auto',
+        trust_remote_code=True,
+    )
+    return model.llm
+
+
 def get_model(ckpt_path, dtype="fp16", device="cuda"):
     print(f"Initializing model from {ckpt_path}")
     if dtype == "bf16" or dtype == "bfloat16":
@@ -161,17 +173,14 @@ def get_model(ckpt_path, dtype="fp16", device="cuda"):
 
     # Note: VILA model is not in public HF model zoo yet. We need to explicitly import from the git repo
     if "vila" in ckpt_path:
-        sys.path.append(args.model_dir + "/../VILA")
-        from llava.model import LlavaConfig, LlavaLlamaForCausalLM
-        AutoConfig.register("llava_llama", LlavaConfig)
-        AutoModelForCausalLM.register(LlavaConfig, LlavaLlamaForCausalLM)
-
-    model_kwargs = {"torch_dtype": "auto"}
-    model = AutoModelForCausalLM.from_pretrained(
-        ckpt_path,
-        device_map="auto" if device != "cpu" else "cpu",
-        torch_dtype="auto",
-        trust_remote_code=True)
+        model = _get_vila_model(ckpt_path)
+    else:
+        model_kwargs = {"torch_dtype": "auto"}
+        model = AutoModelForCausalLM.from_pretrained(
+            ckpt_path,
+            device_map="auto" if device != "cpu" else "cpu",
+            torch_dtype="auto",
+            trust_remote_code=True)
     model.eval()
 
     model_dtype = next(model.parameters()).dtype
@@ -190,20 +199,20 @@ def get_model_type(model):
     return None
 
 
-def get_calib_dataloader(data="cnn_dailymail",
+def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
                          tokenizer=None,
                          batch_size=1,
                          calib_size=512,
                          block_size=512):
     print("Loading calibration dataset")
-    if data == "pileval":
+    if dataset_name_or_dir == "pileval":
         dataset = load_dataset(
             "json",
             data_files="https://the-eye.eu/public/AI/pile/val.jsonl.zst",
             split="train")
         dataset = dataset["text"][:calib_size]
-    elif data == "cnn_dailymail":
-        dataset = load_dataset("cnn_dailymail", name="3.0.0", split="train")
+    elif "cnn_dailymail" in dataset_name_or_dir:
+        dataset = load_dataset(dataset_name_or_dir, name="3.0.0", split="train")
         dataset = dataset["article"][:calib_size]
     else:
         raise NotImplementedError
@@ -271,9 +280,14 @@ def quantize_and_export(*, model_dir, calib_dataset, dtype, qformat,
 
     model = get_model(model_dir, dtype)
     model_type = get_model_type(model)
-    tokenizer = get_tokenizer(model_dir,
-                              max_seq_length=tokenizer_max_seq_length,
-                              model_type=model_type)
+    if "vila" in model_dir:
+        tokenizer = get_tokenizer(model_dir + "/llm",
+                                  max_seq_length=tokenizer_max_seq_length,
+                                  model_type=model_type)
+    else:
+        tokenizer = get_tokenizer(model_dir,
+                                  max_seq_length=tokenizer_max_seq_length,
+                                  model_type=model_type)
 
     if qformat in ["full_prec", "int8_wo", "int4_wo"
                    ] and kv_cache_dtype is None:
@@ -292,7 +306,7 @@ def quantize_and_export(*, model_dir, calib_dataset, dtype, qformat,
             )
 
         calib_dataloader = get_calib_dataloader(
-            data=calib_dataset,
+            dataset_name_or_dir=calib_dataset,
             tokenizer=tokenizer,
             batch_size=batch_size,
             calib_size=calib_size,
@@ -502,21 +516,23 @@ def unwrap_model(model, module_instances=None):
     return unwrapped_model
 
 
-def get_nemo_calib_dataloader(data="cnn_dailymail",
+def get_nemo_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
                               batch_size=64,
                               calib_size=512,
                               max_sequence_length=512):
-    if data == "pileval":
+    if dataset_name_or_dir == "pileval":
         dataset = load_dataset(
             "json",
             data_files="https://the-eye.eu/public/AI/pile/val.jsonl.zst",
             split="train")
         text_column = "text"
-    elif data == "wikitext":
-        dataset = load_dataset("wikitext", "wikitext-103-v1", split="train")
+    elif "wikitext" in dataset_name_or_dir:
+        dataset = load_dataset(dataset_name_or_dir,
+                               "wikitext-103-v1",
+                               split="train")
         text_column = "text"
-    elif data == "cnn_dailymail":
-        dataset = load_dataset("cnn_dailymail", name="3.0.0", split="train")
+    elif "cnn_dailymail" in dataset_name_or_dir:
+        dataset = load_dataset(dataset_name_or_dir, name="3.0.0", split="train")
         text_column = "article"
     calib_size = max(min(len(dataset), calib_size), batch_size)
     for i in range(calib_size // batch_size):
@@ -645,7 +661,7 @@ def quantize_nemo_and_export(*, nemo_ckpt_path, decoder_type, calib_dataset,
                 " line.\n")
 
         dataloader = get_nemo_calib_dataloader(
-            data=calib_dataset,
+            dataset_name_or_dir=calib_dataset,
             batch_size=batch_size,
             calib_size=calib_size,
             max_sequence_length=calib_max_seq_length,

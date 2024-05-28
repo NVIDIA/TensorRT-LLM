@@ -1284,6 +1284,8 @@ template <
     bool POS_SHIFT = false,
     // Whether compute implicit relative attention bias on the fly.
     bool IMPLICIT_REL_ATTN_BIAS = false,
+    // Whether apply tanh scale to the qk product.
+    bool QK_TANH_SCALE = false,
     // The number of threads per key.
     unsigned THREADS_PER_KEY = threads_per_key<T, dh_max(Dh)>(),
     // The number of threads per value.
@@ -1419,7 +1421,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     // This could be one of the reasons to have a separate kernel for cross attention
     constexpr auto bias_smem_size = DO_CROSS_ATTENTION ? Dh_MAX : 1u;
     __shared__ __align__(mmha::const_max(mmha::const_max(sizeof(Qk_vec_k), sizeof(K_vec_k)), sizeof(V_vec_k)))
-        Tk bias_smem[bias_smem_size];
+        [[maybe_unused]] Tk bias_smem[bias_smem_size];
 
     // The number of elements per vector.
     constexpr unsigned QK_VEC_SIZE{sizeof(Qk_vec_m) / sizeof(T)};
@@ -1473,7 +1475,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     // this is a common optimization for both self attention and cross attention
     int relative_attention_bias_stride
         = params.relative_attention_bias_stride; // num_buckets might be modified below, save it beforehand
-    int max_distance = params.max_distance;
+    [[maybe_unused]] int max_distance = params.max_distance;
 
     // The actual sequence length excluding the paddings.
     // minus 1 because it includes the current timestep while tlength denotes the kv cache length.
@@ -1776,7 +1778,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
 
     // Pre-compute the pointer for the relative attention bias.
     T const* relative_attention_bias_ptr = nullptr;
-    T const* relative_attention_bias_ptr_fixed = nullptr; // record the base for offset
+    [[maybe_unused]] T const* relative_attention_bias_ptr_fixed = nullptr; // record the base for offset
     if (has_relative_attention_bias)
     {
         // "hi" is unsigned, subtracting int from unsigned int causes underflow. Cast to int
@@ -1800,6 +1802,12 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     {
         // Normalize qk.
         qk = qk * params.inv_sqrt_dh + relative_attention_bias;
+
+        // Grok tanh scale for qk product.
+        if constexpr (QK_TANH_SCALE)
+        {
+            qk = params.qk_tanh_scale * tanhf(qk * params.qk_tanh_inverse_scale);
+        }
 
         // We don't need to apply the linear position bias here since qi - ki = 0 yields the position bias 0.
         qk_max = qk;
@@ -2013,6 +2021,12 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
                 }
             }
 
+            // Grok tanh scale for qk product.
+            if constexpr (QK_TANH_SCALE)
+            {
+                qk_ = params.qk_tanh_scale * tanhf(qk_ * params.qk_tanh_inverse_scale);
+            }
+
             // For multi-block mode, we need to make sure it will not be OOB.
             if (MULTI_BLOCK_FLAG && local_ti >= timesteps_per_block)
             {
@@ -2144,6 +2158,13 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
                     qk_ = Qk_dot<T, THREADS_PER_KEY>::dot(q_vec, k_vec) * params.inv_sqrt_dh;
                 }
             }
+
+            // Grok tanh scale for qk product.
+            if constexpr (QK_TANH_SCALE)
+            {
+                qk_ = params.qk_tanh_scale * tanhf(qk_ * params.qk_tanh_inverse_scale);
+            }
+
             // Add the ALiBi bias. (ki - qi) * slope[hi].
             //
             // The padding tokens are located between the input context and the generated tokens.
@@ -2220,7 +2241,11 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     // the end of the kernel. There's plenty of time for the transactions to complete.
 
     // For MQA/GQA mode, write only with the first Q head of each group per KV head.
-    if (HANDLE_KV && hi == (hi_kv * qhead_per_kv) && qk_vec_idx < Dh)
+
+    // Get the c_tile_id that handles the current timestep.
+    int current_step_ctile_idx = kv_loop_length / timesteps_per_block;
+    if (HANDLE_KV && hi == (hi_kv * qhead_per_kv) && qk_vec_idx < Dh
+        && (!MULTI_BLOCK_FLAG || c_tile == current_step_ctile_idx))
     {
         // Trigger the stores to global memory.
         Qk_vec_k k_vec = *reinterpret_cast<Qk_vec_k*>(&k_smem[qk_vec_idx]);
@@ -2476,11 +2501,8 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     // Make sure we can overwrite the v cache if using cyclic kv cache.
     __syncthreads();
 
-    // Get the c_tile_id that handles the current timestep.
-    int const ctile_idx = tlength / timesteps_per_block;
-
     // One group of threads computes the product(s) for the current timestep.
-    if (vo == kv_loop_length % V_PER_ITER && is_valid_vi && (!MULTI_BLOCK_FLAG || (c_tile == ctile_idx)))
+    if (vo == kv_loop_length % V_PER_ITER && is_valid_vi && (!MULTI_BLOCK_FLAG || (c_tile == current_step_ctile_idx)))
     {
         int const inBlockIdx = kvCacheBuffer.getKVLocalIdx(cyclic_tlength, hi_kv, Dh, vi);
         // The base pointer for the value in the cache buffer.

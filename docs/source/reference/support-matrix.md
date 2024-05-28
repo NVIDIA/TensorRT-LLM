@@ -52,7 +52,7 @@ The following table shows the supported software for TensorRT-LLM.
         - Hopper (SM90) - FP32, FP16, BF16, FP8, INT8, INT4
         - Ada Lovelace (SM89) - FP32, FP16, BF16, FP8, INT8, INT4
         - Ampere (SM80, SM86) - FP32, FP16, BF16, INT8, INT4(3)
-        - Turing (SM75) - FP32, FP16, INT8(1), INT4(2)
+        - Turing (SM75) - FP32, FP16, INT8(1), INT4
         - Volta (SM70) - FP32, FP16, INT8(1), INT4(2)
     * - Models
       -
@@ -84,6 +84,7 @@ The following table shows the supported software for TensorRT-LLM.
         - [Phi-1.5/Phi-2/Phi-3](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/phi)
         - [Qwen](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/qwen)
         - [Qwen-VL](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/qwenvl)
+        - [RecurrentGemma](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/recurrentgemma)
         - [Replit Code](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mpt)
         - [RoBERTa](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/bert)
         - [SantaCoder](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt)
@@ -102,12 +103,13 @@ The following table shows the supported software for TensorRT-LLM.
         - [Kosmos-2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
         - [LLaVA-v1.5-7B](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
         - [NeVA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
+        - [Video NeVA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
         - [Nougat family](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal) Nougat-small, Nougat-base
         - [VILA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
 ```
 
 (1) INT8 SmoothQuant is not supported on SM70 and SM75.<br>
-(2) INT4 AWQ and GPTQ are not supported on SM < 80.<br>
+(2) INT4 AWQ and GPTQ are not supported on SM < 75.<br>
 (3) INT4 AWQ and GPTQ with FP8 activations require SM >= 89.<br>
 (4) [Encoder-Decoder](https://github.com/NVIDIA/TensorRT-LLM/tree/main/main/examples/enc_dec) provides general encoder-decoder functionality that supports many encoder-decoder models such as T5 family, BART family, Whisper family, NMT family, and so on.
 (5) Multi-modal provides general multi-modal functionality that supports many multi-modal architectures such as BLIP family, LLaVA family, and so on.

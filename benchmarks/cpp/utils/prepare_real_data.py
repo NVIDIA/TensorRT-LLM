@@ -6,7 +6,7 @@ from typing import Optional
 import click
 from datasets import load_dataset
 from pydantic import BaseModel, model_validator
-from utils.utils import dataset_dump, get_norm_dist_tokens
+from utils.utils import dataset_dump, get_norm_dist_tokens, print_dataset
 
 
 def validate_output_len_dist(ctx, param, value):
@@ -220,11 +220,19 @@ def dataset(root_args, **kwargs):
     logging.debug(f"Input lengths: {[len(i) for i in input_ids]}")
     logging.debug(f"Output lengths: {output_lens}")
 
-    dataset_dump(
-        input_lens, input_ids, output_lens, task_ids, {
-            "workload_type": "dataset",
-            "tokenizer": root_args.tokenizer.__class__.__name__,
-            "num_requests": len(input_ids),
-            "max_input_len": max(input_lens),
-            "max_output_len": max(output_lens)
-        }, root_args.output)
+    if not root_args.std_out:
+        dataset_dump(
+            input_lens, input_ids, output_lens, task_ids, {
+                "workload_type": "dataset",
+                "tokenizer": root_args.tokenizer.__class__.__name__,
+                "num_requests": len(input_ids),
+                "max_input_len": max(input_lens),
+                "max_output_len": max(output_lens)
+            }, root_args.output)
+    else:
+        print_dataset(
+            task_ids,
+            input_ids,
+            output_lens,
+            tokenizer=None,
+        )

@@ -23,8 +23,13 @@ list(FILTER SRC_CPP EXCLUDE REGEX ".*nvrtcWrapper/src.*")
 
 # skip mmha 48, 80, 96, 112, 144, 160, 192 and 224 for fast build
 if(FAST_BUILD)
-  list(FILTER SRC_CU EXCLUDE REGEX
-       "decoderMaskedMultiheadAttention(48|80|96|112|144|160|192|224).*cu$")
+  list(
+    FILTER
+    SRC_CU
+    EXCLUDE
+    REGEX
+    "instantiation/decoderMaskedMultiheadAttention(48|80|96|112|144|160|192|224).*cu$"
+  )
 endif()
 
 add_library(decoder_attention_src OBJECT ${SRC_CPP} ${SRC_CU})

@@ -41,8 +41,8 @@ namespace kernels
 class MHARunner
 {
 public:
-    MHARunner(
-        Data_type const dataType, bool const pagedKVFMHA, int const numHeads, int const headSize, float const qScaling);
+    MHARunner(Data_type const dataType, bool const pagedKVFMHA, int const numHeads, int const headSize,
+        float const qScaling, float const qkTanhScale = 0.f);
 
     MHARunner() = default;
 
@@ -89,8 +89,8 @@ public:
 class FusedMHARunnerV2 : public MHARunner
 {
 public:
-    FusedMHARunnerV2(
-        Data_type const dataType, bool const pagedKVFMHA, int const numHeads, int const headSize, float const qScaling);
+    FusedMHARunnerV2(Data_type const dataType, bool const pagedKVFMHA, int const numHeads, int const headSize,
+        float const qScaling, float const qkTanhScale = 0.f);
 
     ~FusedMHARunnerV2(); // for pimpl
 

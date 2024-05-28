@@ -103,27 +103,30 @@ python3 convert_checkpoint.py --model_dir gpt2 \
 ### 3. Build TensorRT engine(s)
 The `trtllm-build` command builds TensorRT-LLM engines from TensorRT-LLM checkpoints. The checkpoint directory provides the model's weights and architecture configuration. The number of engine files is also same to the number of GPUs used to run inference.
 
+`trtllm-build` command has a variety of options. In particular, the plugin-related options have two categories:
+* Plugin options that requires a data type (e.g., `gpt_attention_plugin`), you can
+    * explicitly specify `float16`/`bfloat16`/`float32`, so that the plugins are enabled with the specified precision;
+    * implicitly specify `auto`, so that the plugins are enabled with the precision automatically inferred from model dtype (i.e., the dtype specified in weight conversion); or
+    * disable the plugin by `disable`.
+* Other features that requires a boolean (e.g., `context_fmha`, `paged_kv_cache`, `remove_input_padding`), you can
+    * enable/disable the feature by specifying `enable`/`disable`.
+
+The defaults have been carefully tuned for better performance. For example, `gpt_attention_plugin`, `context_fmha`, `paged_kv_cache` and `remove_input_padding` are enabled by default. See more details by `trtllm-build --help`.
+
 Normally, the `trtllm-build` command only requires a single GPU, but you can enable parallel building by passing the number of GPUs to the `--workers` argument.
 
 ```bash
 # Build a single-GPU float16 engine from TensorRT-LLM checkpoint.
-# Enable the special TensorRT-LLM GPT Attention plugin (--gpt_attention_plugin) to increase runtime performance.
-# It is recommend to use --remove_input_padding along with --gpt_attention_plugin for better performance
+# gpt_attention_plugin (the special TensorRT-LLM GPT Attention plugin) and remove_input_padding are enabled by default for runtime performance.
 trtllm-build --checkpoint_dir gpt2/trt_ckpt/fp16/1-gpu \
-        --gpt_attention_plugin float16 \
-        --remove_input_padding enable \
         --output_dir gpt2/trt_engines/fp16/1-gpu
 
 # Build 2-way tensor parallelism engines from TensorRT-LLM checkpoint.
 trtllm-build --checkpoint_dir gpt2/trt_ckpt/fp16/2-gpu \
-        --gpt_attention_plugin float16 \
-        --remove_input_padding enable \
         --output_dir gpt2/trt_engines/fp16/2-gpu
 
 # Build 2-way tensor parallelism and 2-way pipeline parallelism engines from TensorRT-LLM checkpoint.
 trtllm-build --checkpoint_dir gpt2/trt_ckpt/fp16/4-gpu \
-        --gpt_attention_plugin float16 \
-        --remove_input_padding enable \
         --output_dir gpt2/trt_engines/fp16/4-gpu
 ```
 
@@ -142,15 +145,15 @@ If the engines are built successfully, you will see output like:
 
 #### Fused MultiHead Attention (FMHA)
 
-You can enable the FMHA kernels by adding `--context_fmha enable` to the invocation of `trtllm-build`.
+`trtllm-build` enables FMHA kernels by default. You may disable it by adding `--context_fmha disable`.
 
-If you find that the default fp16 accumulation (`--context_fmha enable`) cannot meet the requirement, you can try to enable fp32 accumulation by adding `--context_fmha_fp32_acc enable`. However, it is expected to see performance drop.
+If you find that the default fp16 accumulation cannot meet the requirement, you can try to enable fp32 accumulation by adding `--context_fmha_fp32_acc enable`. However, it is expected to see performance drop.
 
-Note that the FMHA kernels have to be used together with `--gpt_attention_plugin float16`.
+Note that the FMHA kernels have to be used together with `gpt_attention_plugin` enabled.
 
 #### In-flight batching and paged KV cache
 
-If one wants to use [in-flight batching in C++ runtime](../../docs/in_flight_batching.md), the engine must be built accordingly. In-flight batching in C++ runtime works only with attention plugin, paged KV cache and with packed data. Hence, the `trtllm-build` should be called with `--gpt_attention_plugin float16`, `--paged_kv_cache enable`, `--remove_input_padding enable`. It is possible to choose a different precision for `--gpt_attention_plugin` if the flag is provided separately. One can additionally control the size of the block in paged KV cache using `--tokens_per_block=N`.
+If one wants to use [in-flight batching in C++ runtime](../../docs/in_flight_batching.md), the engine(s) must be built accordingly. In-flight batching in C++ runtime works only with attention plugin, paged KV cache and with packed data. Currently, the `trtllm-build` by default enables `gpt_attention_plugin`, `paged_kv_cache` and `remove_input_padding`, so the built engine(s) can support in-flight batching (unless you explicitly disable one of these options). One can additionally control the size of the block in paged KV cache using `--tokens_per_block=N`.
 
 ### 4. Build TensorRT engine(s) with Random Weights
 You can build engine(s) using random weights, which is useful for benchmarking. First, the [`../generate_checkpoint_config.py`](../generate_checkpoint_config.py) script can be used to generate a TensorRT-LLM checkpoint config file:
@@ -184,10 +187,7 @@ Then, use `trtllm-build` command to build engine(s) with random weights and the 
 # Build 8-GPU GPT-175B float16 engines using dummy weights, useful for performance tests.
 # Enable several TensorRT-LLM plugins to increase runtime performance. It also helps with build time.
 trtllm-build --model_config gpt_175b/trt_ckpt/fp16/8-gpu/config.json \
-        --gpt_attention_plugin float16 \
-        --remove_input_padding enable \
-        --context_fmha enable \
-        --gemm_plugin float16 \
+        --gemm_plugin auto \
         --max_batch_size 256 \
         --output_dir gpt_175b/trt_engines/fp16/8-gpu \
         --workers 8
@@ -195,10 +195,7 @@ trtllm-build --model_config gpt_175b/trt_ckpt/fp16/8-gpu/config.json \
 # Build 16-GPU GPT-530B float16 engines using dummy weights, useful for performance tests.
 # Enable several TensorRT-LLM plugins to increase runtime performance. It also helps with build time.
 trtllm-build --model_config gpt_530b/trt_ckpt/fp16/16-gpu/config.json \
-        --gpt_attention_plugin float16 \
-        --remove_input_padding enable \
-        --context_fmha enable \
-        --gemm_plugin float16 \
+        --gemm_plugin auto \
         --max_batch_size 128 \
         --max_input_len 128 \
         --max_output_len 20 \
@@ -407,14 +404,10 @@ Then, use `trtllm-build` to build engine(s).
 ```bash
 # Per-tensor SmoothQuant
 trtllm-build --checkpoint_dir gpt2/trt_ckpt/int8-sq/1-gpu \
-        --gpt_attention_plugin float16 \
-        --remove_input_padding enable \
         --output_dir gpt2/trt_engines/int8-sq/1-gpu
 
 # Per-token per-channel SmoothQuant
 trtllm-build --checkpoint_dir gpt2/trt_ckpt/int8-sq-ptpc/1-gpu \
-        --gpt_attention_plugin float16 \
-        --remove_input_padding enable \
         --output_dir gpt2/trt_engines/int8-sq-ptpc/1-gpu
 ```
 
@@ -435,8 +428,6 @@ python3 convert_checkpoint.py --model_dir gpt2 \
         --output_dir gpt2/trt_ckpt/int8kv/1-gpu
 
 trtllm-build --checkpoint_dir gpt2/trt_ckpt/int8kv/1-gpu \
-        --gpt_attention_plugin float16 \
-        --remove_input_padding enable \
         --strongly_typed \
         --output_dir gpt2/trt_engines/int8kv/1-gpu
 ```
@@ -468,14 +459,10 @@ Then, use `trtllm-build` to build engine(s).
 ```bash
 # Int8 weight-only quantization
 trtllm-build --checkpoint_dir gpt2/trt_ckpt/int8-wo/1-gpu \
-        --gpt_attention_plugin float16 \
-        --remove_input_padding enable \
         --output_dir gpt2/trt_engines/int8-wo/1-gpu
 
 # Int4 weight-only quantization
 trtllm-build --checkpoint_dir gpt2/trt_ckpt/int4-wo/1-gpu \
-        --gpt_attention_plugin float16 \
-        --remove_input_padding enable \
         --output_dir gpt2/trt_engines/int4-wo/1-gpu
 ```
 
@@ -492,9 +479,6 @@ python3 ../quantization/quantize.py --model_dir gpt2 \
         --output_dir gpt2/trt_ckpt/fp8/1-gpu
 
 trtllm-build --checkpoint_dir gpt2/trt_ckpt/fp8/1-gpu \
-        --gpt_attention_plugin float16 \
-        --remove_input_padding enable \
-        --strongly_typed \
         --output_dir gpt2/trt_engines/fp8/1-gpu
 ```
 
@@ -520,8 +504,6 @@ python3 convert_checkpoint.py --model_dir gpt2 \
         --output_dir gpt2/trt_ckpt/fp16/2-gpu
 
 trtllm-build --checkpoint_dir gpt2/trt_ckpt/fp16/2-gpu \
-        --gpt_attention_plugin float16 \
-        --remove_input_padding enable \
         --output_dir gpt2/trt_engines/fp16/2-gpu
 ```
 
@@ -538,9 +520,7 @@ python3 convert_checkpoint.py --model_dir gpt2 \
 
 # It is optional to add --lookup_plugin
 trtllm-build --checkpoint_dir gpt2/trt_ckpt/fp16/2-gpu \
-        --gpt_attention_plugin float16 \
-        --remove_input_padding enable \
-        --lookup_plugin float16 \
+        --lookup_plugin auto \
         --output_dir gpt2/trt_engines/fp16/2-gpu
 ```
 
@@ -568,10 +548,8 @@ python3 convert_checkpoint.py --model_dir gpt2 \
 
 # It is recommended to add --lookup_plugin and --gemm_plugin
 trtllm-build --checkpoint_dir gpt2/trt_ckpt/fp16/2-gpu \
-        --gpt_attention_plugin float16 \
-        --remove_input_padding enable \
-        --lookup_plugin float16 \
-        --gemm_plugin float16 \
+        --lookup_plugin auto \
+        --gemm_plugin auto \
         --output_dir gpt2/trt_engines/fp16/2-gpu
 ```
 
@@ -592,10 +570,7 @@ python3 convert_checkpoint.py --model_dir santacoder \
 
 # Build TensorRT-LLM engines
 trtllm-build --checkpoint_dir santacoder/trt_ckpt/fp16/4-gpu \
-        --gpt_attention_plugin float16 \
-        --remove_input_padding enable \
-        --context_fmha enable \
-        --gemm_plugin float16 \
+        --gemm_plugin auto \
         --output_dir santacoder/trt_engines/fp16/4-gpu
 
 # Run inference
@@ -623,10 +598,7 @@ python3 convert_checkpoint.py --model_dir starcoder \
 
 # Build TensorRT-LLM engines
 trtllm-build --checkpoint_dir starcoder/trt_ckpt/fp16/4-gpu \
-        --gpt_attention_plugin float16 \
-        --remove_input_padding enable \
-        --context_fmha enable \
-        --gemm_plugin float16 \
+        --gemm_plugin auto \
         --output_dir starcoder/trt_engines/fp16/4-gpu
 
 # Run inference
@@ -662,8 +634,6 @@ python3 convert_checkpoint.py --nemo_ckpt_path GPT-2B-001_bf16_tp1.nemo \
 # Build TensorRT-LLM engines
 # --gpt_attention_plugin must be set for GPT-Next since Rotary positional embeddings (RoPE) is only supported by the gpt attention plugin at this time.
 trtllm-build --checkpoint_dir gpt-next-2B/trt_ckpt/bf16/1-gpu \
-        --gpt_attention_plugin bfloat16 \
-        --remove_input_padding enable \
         --output_dir gpt-next-2B/trt_engines/bf16/1-gpu
 
 # Run inference
@@ -688,8 +658,6 @@ python3 convert_checkpoint.py --nemo_ckpt_path megatron_converted_8b_tp4_pp1.nem
 
 # Build TensorRT-LLM engines with prompt-tuning enabled
 trtllm-build --checkpoint_dir gpt-next-8B/trt_ckpt/fp16/1-gpu \
-        --gpt_attention_plugin float16 \
-        --remove_input_padding enable \
         --max_prompt_embedding_table_size 100 \
         --output_dir gpt-next-8B/trt_engines/fp16/1-gpu
 ```
@@ -724,9 +692,7 @@ python3 convert_checkpoint.py --nemo_ckpt_path GPT-2B-001_bf16_tp1.nemo \
 
 # Build TensorRT-LLM engines
 trtllm-build --checkpoint_dir gpt-next-2B/trt_ckpt/fp16/1-gpu \
-        --gpt_attention_plugin float16 \
-        --remove_input_padding enable \
-        --lora_plugin float16 \
+        --lora_plugin auto \
         --lora_dir gpt2b_lora-900.nemo gpt2b_lora-stories.nemo \
         --lora_ckpt_source "nemo" \
         --lora_target_modules attn_qkv \

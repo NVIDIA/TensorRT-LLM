@@ -90,7 +90,7 @@ class TestFunctional(unittest.TestCase):
 
         net = builder.create_network()
         if use_lookup_plugin:
-            net.plugin_config.set_lookup_plugin(dtype)
+            net.plugin_config.lookup_plugin = dtype
 
         with tensorrt_llm.net_guard(net):
             network = tensorrt_llm.default_trtnet()

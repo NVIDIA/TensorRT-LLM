@@ -465,14 +465,8 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
             if opt_num_tokens is None:
                 opt_num_tokens = max_bs_x_max_bw
             if multiple_profiles:
-                if max_num_tokens > max_bs_x_max_bw:
-                    num_tokens_range = [[1, max_bs_x_max_bw, max_bs_x_max_bw],
-                                        [
-                                            max_bs_x_max_bw, max_num_tokens,
-                                            max_num_tokens
-                                        ]]
-                else:
-                    num_tokens_range = [[1, max_num_tokens, max_num_tokens]]
+                num_tokens_range = GenerationMixin.split_num_tokens_range(
+                    max_num_tokens)
             else:
                 num_tokens_range = [[1, opt_num_tokens, max_num_tokens]]
             num_profiles = len(num_tokens_range)

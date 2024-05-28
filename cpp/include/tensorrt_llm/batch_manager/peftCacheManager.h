@@ -24,6 +24,7 @@
 
 #include <future>
 #include <memory>
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -32,6 +33,13 @@ namespace tensorrt_llm::batch_manager
 {
 
 using runtime::SizeType32;
+
+class PeftTaskNotCachedException : public std::runtime_error
+{
+public:
+    explicit PeftTaskNotCachedException(std::string const& msg);
+    ~PeftTaskNotCachedException() noexcept override;
+};
 
 /**
  * BasePeftCacheManager

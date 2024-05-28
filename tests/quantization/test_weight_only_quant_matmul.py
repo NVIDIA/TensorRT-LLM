@@ -58,7 +58,7 @@ class TestWeightOnlyQuantMatmul(unittest.TestCase):
         network = builder.create_network()
         # Allow WoQ plugin of dtype type
         if use_plugin:
-            network.plugin_config.set_weight_only_quant_matmul_plugin(dtype)
+            network.plugin_config.weight_only_quant_matmul_plugin = dtype
         with tensorrt_llm.net_guard(network):
             # Init TensorRT-LLM tensor for mat1
             x = Tensor(name='x',

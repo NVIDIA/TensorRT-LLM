@@ -1090,7 +1090,7 @@ __global__ void airTopPSampling(Counter<T, IdxT, AccT>* counters, HisT* histogra
                 if (count != 0)
                 {
                     uint32_t startBit = calcStartBit<T, BitsPerPass>(pass);
-                    float bucketValueFloat;
+                    [[maybe_unused]] float bucketValueFloat;
                     if constexpr (std::is_same_v<T, half>)
                     {
                         // To acquire the summation in single-precision format, we need to get the original exponent
@@ -1199,7 +1199,8 @@ __global__ void airTopPSampling(Counter<T, IdxT, AccT>* counters, HisT* histogra
             // In the last pass (pass==2 for single-precision and pass==1 for half-precision),
             // we reuse the buffer didn't store the candidates (idxBuf1 for single-precision and idxBuf2 for
             // half-precision) to help find the correct index of the result.
-            IdxT* lastIdxBuf = (pass % 2 == 0) ? idxBuf1 + bufLen * batchId : idxBuf2 + bufLen * batchId;
+            [[maybe_unused]] IdxT* lastIdxBuf
+                = (pass % 2 == 0) ? idxBuf1 + bufLen * batchId : idxBuf2 + bufLen * batchId;
             if constexpr (isFusedFilter)
             {
                 lastFilter<T, IdxT, AccT, BitsPerPass, BlockSize, isDeterministic>(outBuf ? outBuf : inBuf,

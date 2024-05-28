@@ -216,15 +216,6 @@ Finally, you can submit the task with `sbatch <your-slurm-script>.sh`.
 
 Considering the Slurm or other cluster management systems may be highly customized and the task-submit command may be variant, the forementioned example is just a naive example. The key point is to submit the Python script with the MPI runtime, and the HLAPI will take care of the rest.
 
-## Fine grain control (Danger Zone)
-The high-level API is designed to be easy to use with hiding and auto-configuring most of the details, ideally, you don't need to touch the low-level details. However, if you want to fine-tune the underlying details, it is still possible to do so with two temporary APIs:
-
-1. `ModelConfig._set_additional_options` to set additional options for the model, such as some TensorRT shape range.
-2. `LLM(..., **_additional_options)` to set extra options for the LLM pipeline, such as some runtime optimization knobs.
-
-Note that, both APIs are not stable and we aim to gradually remove them, please use them with caution.
-
-
 ## Generation
 ### `asyncio`-based generation
 With the high-level API, you can also perform asynchronous generation with the `generate_async` method. For example:

@@ -373,6 +373,78 @@ python3 ../run.py --input_text "What's new between ChatGLM3-6B and ChatGLM2-6B?"
         --engine_dir trt_engines/chatglm3_6b/fp8/1-gpu
 ```
 
+### Long context evaluation
+
+* SlimPajama-6B with PPL evaluation
+
+SlimPajama-6B is a dataset which contains long context inputs. We use this dataset to run PPL evaluation.
+
+```bash
+git-lfs clone https://huggingface.co/datasets/DKYoon/SlimPajama-6B
+```
+
+```bash
+git-lfs clone https://huggingface.co/THUDM/chatglm3-6b-128k
+
+
+python examples/chatglm/convert_checkpoint.py --model_dir chatglm3-6b-128k \
+                              --output_dir /tmp/chatglm3-6b-128k/trt_ckpts \
+                              --dtype float16
+
+python -m tensorrt_llm.commands.build --checkpoint_dir /tmp/chatglm3-6b-128k/trt_ckpts \
+            --output_dir /tmp/chatglm3-6b-128k/trt_engines \
+            --gemm_plugin float16 \
+            --strongly_typed \
+            --gather_all_token_logits \
+            --max_batch_size 8 \
+            --max_input_len 25600
+
+python examples/summarize.py --engine_dir /tmp/chatglm3-6b-128k/trt_engines \
+                             --tokenizer_dir chatglm3-6b-128k \
+                             --dataset_dir ./ \
+                             --eval_task eval_context_ppl \
+                             --test_trt_llm \
+                             --hf_model_dir chatglm3-6b-128k  \
+                             --max_input_len 25600 \
+                             --batch_size 1 \
+                             --max_ite 1600 \
+                             --check_accuracy \
+                             --tensorrt_llm_ppl_threshold 14 \
+                             --use_py_session
+
+[05/14/2024-08:01:49] [TRT-LLM] [I] TensorRT-LLM (total latency: 71.61979579925537 sec)
+[05/14/2024-08:01:49] [TRT-LLM] [I] TensorRT-LLM (total output tokens: 1599)
+[05/14/2024-08:01:49] [TRT-LLM] [I] TensorRT-LLM (tokens per second: 22.32622953131381)
+[05/14/2024-08:01:49] [TRT-LLM] [I] TensorRT-LLM beam 0 result
+[05/14/2024-08:01:53] [TRT-LLM] [I]   Per-token perplexity: 13.595022946447134
+```
+
+* needle in haystack (passkey) evaluation
+
+```bash
+python3 examples/infinitebench/construct_synthetic_dataset.py --test_case build_passkey
+
+python examples/chatglm/convert_checkpoint.py --model_dir chatglm3-6b-128k \
+                              --output_dir /tmp/chatglm3-6b-128k/trt_ckpts \
+                              --dtype float16
+
+python -m tensorrt_llm.commands.build --checkpoint_dir /tmp/chatglm3-6b-128k/trt_ckpts \
+            --output_dir /tmp/chatglm3-6b-128k/trt_engines \
+            --gemm_plugin float16 \
+            --strongly_typed \
+            --gather_all_token_logits \
+            --max_batch_size 1 \
+            --max_input_len 12800
+
+python examples/eval_long_context.py  --task passkey \
+                                      --engine_dir /tmp/chatglm3-6b-128k/trt_engines \
+                                      --tokenizer_dir chatglm3-6b-128k \
+                                      --stop_idx 20 \
+                                      --max_input_length 12800 \
+                                      --use_py_session
+
+```
+
 ## Benchmark
 
 * The TensorRT-LLM ChatGLM benchmark is located in [benchmarks/](../../benchmarks/README.md)

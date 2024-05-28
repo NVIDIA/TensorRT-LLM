@@ -2,7 +2,6 @@ import copy
 import functools
 import json
 import os
-import sys
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -11,7 +10,6 @@ from typing import Optional
 import safetensors
 import torch
 import torch.nn as nn
-from datasets import load_dataset
 from tqdm import tqdm
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
@@ -22,6 +20,7 @@ from ...layers import MoeConfig
 from ...logger import logger
 from ...mapping import Mapping
 from ...quantization import QuantAlgo
+from ..convert_utils import load_calib_dataset
 from ..modeling_utils import PretrainedConfig, QuantConfig, optimize_model
 from .weight import load_from_hf_checkpoint, load_from_hf_safetensors
 
@@ -373,8 +372,8 @@ def capture_activation_range(model,
                     functools.partial(stat_input_hook, name=name)))
 
     for i in tqdm(range(num_samples), desc="calibrating model"):
-        datapoint = dataset['train'][i:i + 1]
-        line = copy.copy(datapoint['article'])
+        datapoint = dataset[i:i + 1]
+        line = copy.copy(datapoint)
         line[0] = line[0] + ' TL;DR: '
         line[0] = line[0].strip()
         line[0] = line[0].replace(" n't", "n't")
@@ -606,9 +605,9 @@ def get_tllm_linear_sq_weight(vals,
                         tensor_parallel,
                         dim=cat_dim)[rank]
 
-        results[prefix + 'per_channel_scale'] = torch.Tensor([
-            cur_per_channel_value
-        ]).to(torch.float32).reshape(col_shape).contiguous().cuda()
+        results[prefix +
+                'per_channel_scale'] = torch.Tensor(cur_per_channel_value).to(
+                    torch.float32).reshape(col_shape).contiguous().cuda()
         results[prefix + 'act_scale'] = torch.Tensor(
             vals['scale_y_quant_orig']).to(torch.float32).contiguous().cuda()
         results[last_prefix] = torch.Tensor(vals['scale_x_orig_quant']).to(
@@ -1145,6 +1144,7 @@ def convert_hf_llama(hf_model,
 
 def smooth_quant(model,
                  model_dir,
+                 calib_dataset,
                  dataset_cache_dir,
                  smoothquant: Optional[float] = None):
     assert model is not None
@@ -1155,16 +1155,13 @@ def smooth_quant(model,
 
     os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get(
         "TOKENIZERS_PARALLELISM", "false")
-    dataset = load_dataset("ccdv/cnn_dailymail",
-                           '3.0.0',
-                           cache_dir=dataset_cache_dir)
+    tokenizer = AutoTokenizer.from_pretrained(model_dir,
+                                              trust_remote_code=True,
+                                              use_fast=False,
+                                              padding_side='left')
+    dataset = load_calib_dataset(calib_dataset, cache_dir=dataset_cache_dir)
 
-    act_range = capture_activation_range(
-        model,
-        AutoTokenizer.from_pretrained(model_dir,
-                                      trust_remote_code=True,
-                                      use_fast=False,
-                                      padding_side='left'), dataset)
+    act_range = capture_activation_range(model, tokenizer, dataset)
     if smoothquant is not None:
         smooth_llama_model(model, act_range, smoothquant, llama_qkv_para,
                            llama_smoother)
@@ -1182,6 +1179,10 @@ def create_config_from_hugging_face(hf_model,
         # LLaVA = Vision model + Llama LLM
         # We load a llava config and use its' text config as llama config
         hf_config = LlavaConfig.from_pretrained(hf_model).text_config
+    if hf_config.model_type == "llava_llama":
+        hf_config.llm_cfg["architecture"] = hf_config.llm_cfg["architectures"]
+        hf_config.llm_cfg["dtype"] = hf_config.llm_cfg["torch_dtype"]
+        hf_config = PretrainedConfig.from_dict(hf_config.llm_cfg)
     # TODO: directly assign the hf_config fields to the config dict w/o creating these local vars
     # same for from_meta and from_cli_args
     n_head = hf_config.num_attention_heads
@@ -1272,13 +1273,6 @@ def from_hugging_face(cls,
     if isinstance(model_dir, Path):  # some code relies on this as string
         model_dir = str(model_dir)
 
-    # register VILA model
-    if "vila" in model_dir:
-        sys.path.append(model_dir + "/../VILA")
-        from llava.model import LlavaConfig, LlavaLlamaForCausalLM
-        AutoConfig.register("llava_llama", LlavaConfig)
-        AutoModelForCausalLM.register(LlavaConfig, LlavaLlamaForCausalLM)
-
     if override_fields.get('share_embedding_table', False):
         logger.warning(
             "Llama model does not support share_embedding_table; setting share_embedding_table=False"
@@ -1315,7 +1309,9 @@ def from_hugging_face(cls,
                 model_dir, torch_dtype="auto")
             model = hf_llava.language_model
         else:
-            if not have_safetensors:
+            # TODO: Remove WAR after `load_from_hf_safetensors` supports weight-only quantization
+            if not have_safetensors or config['quantization'][
+                    'quant_algo'] is not None:
                 model = AutoModelForCausalLM.from_pretrained(
                     model_dir,
                     device_map='auto' if not load_model_on_cpu else 'cpu',
@@ -1344,7 +1340,8 @@ def quantize(dtype,
              mapping,
              quantization: QuantConfig,
              *,
-             override_fields,
+             calib_dataset='cnn_dailymail',
+             override_fields={},
              dataset_cache_dir: Optional[str] = None):
     '''
         Quantize the save the model as TRT-LLM checkpoint to output_dir
@@ -1383,7 +1380,8 @@ def quantize(dtype,
         torch_dtype='auto' if not use_smooth_quant else torch.float16,
         trust_remote_code=True)
     act_range, llama_qkv_para, llama_smoother = smooth_quant(
-        model, model_dir, dataset_cache_dir, quantization.smoothquant_val)
+        model, model_dir, calib_dataset, dataset_cache_dir,
+        quantization.smoothquant_val)
 
     for rank in range(mapping.world_size):
         # To avoid changing the mapping arg in-place, also the given mapping from caller is rank agnostic, since quantize is called from only one rank

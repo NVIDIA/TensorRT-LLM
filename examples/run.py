@@ -186,6 +186,30 @@ def parse_arguments(args=None):
         help=
         'Specify the percentage of weights that reside on GPU instead of CPU and streaming load during runtime.',
     )
+    parser.add_argument(
+        '--max_tokens_in_paged_kv_cache',
+        default=None,
+        type=int,
+        help=
+        'Specify the maximum number of tokens in a kv cache page (only available with cpp session).',
+    )
+    parser.add_argument(
+        '--kv_cache_enable_block_reuse',
+        action='store_true',
+        help=
+        'Enables block reuse in kv cache (only available with cpp session).',
+    )
+    parser.add_argument(
+        '--kv_cache_free_gpu_memory_fraction',
+        default=None,
+        type=float,
+        help='Specify the free gpu memory fraction.',
+    )
+    parser.add_argument(
+        '--enable_chunked_context',
+        action='store_true',
+        help='Enables chunked context (only available with cpp session).',
+    )
 
     return parser.parse_args(args=args)
 
@@ -397,12 +421,14 @@ def main(args):
         )
         args.use_py_session = True
     runner_cls = ModelRunner if args.use_py_session else ModelRunnerCpp
-    runner_kwargs = dict(engine_dir=args.engine_dir,
-                         lora_dir=args.lora_dir,
-                         rank=runtime_rank,
-                         debug_mode=args.debug_mode,
-                         lora_ckpt_source=args.lora_ckpt_source,
-                         gpu_weights_percent=args.gpu_weights_percent)
+    runner_kwargs = dict(
+        engine_dir=args.engine_dir,
+        lora_dir=args.lora_dir,
+        rank=runtime_rank,
+        debug_mode=args.debug_mode,
+        lora_ckpt_source=args.lora_ckpt_source,
+        gpu_weights_percent=args.gpu_weights_percent,
+    )
     if args.medusa_choices is not None:
         args.medusa_choices = ast.literal_eval(args.medusa_choices)
         assert args.temperature == 1.0, "Medusa should use temperature == 1.0"
@@ -416,6 +442,11 @@ def main(args):
             max_beam_width=args.num_beams,
             max_attention_window_size=args.max_attention_window_size,
             sink_token_length=args.sink_token_length,
+            max_tokens_in_paged_kv_cache=args.max_tokens_in_paged_kv_cache,
+            kv_cache_enable_block_reuse=args.kv_cache_enable_block_reuse,
+            kv_cache_free_gpu_memory_fraction=args.
+            kv_cache_free_gpu_memory_fraction,
+            enable_chunked_context=args.enable_chunked_context,
         )
     runner = runner_cls.from_dir(**runner_kwargs)
 

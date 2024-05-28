@@ -38,7 +38,8 @@ from ..quantization import QuantAlgo
 
 
 def parse_arguments():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('--checkpoint_dir', type=str, default=None)
     parser.add_argument('--model_config', type=str, default=None)
     parser.add_argument('--build_config', type=str, default=None)
@@ -224,6 +225,7 @@ def parse_arguments():
                         default=None,
                         choices=[
                             "draft_tokens_external",
+                            "lookahead_decoding",
                             "medusa",
                         ],
                         help='Mode of speculative decoding.')
@@ -442,7 +444,8 @@ def main():
             max_beam_width=args.max_beam_width,
             remove_input_padding=(args.remove_input_padding == "enable"),
             enable_context_fmha=(args.context_fmha == "enable"),
-            tokens_per_block=args.tokens_per_block)
+            tokens_per_block=args.tokens_per_block,
+            multiple_profiles=args.multiple_profiles)
         if args.cluster_key is not None:
             cluster_config = dict(cluster_key=args.cluster_key)
         else:

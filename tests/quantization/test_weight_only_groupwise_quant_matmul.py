@@ -55,8 +55,7 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
         # Create builder
         builder = tensorrt_llm.Builder()
         network = builder.create_network()
-        network.plugin_config.set_weight_only_groupwise_quant_matmul_plugin(
-            dtype)
+        network.plugin_config.weight_only_groupwise_quant_matmul_plugin = dtype
         with tensorrt_llm.net_guard(network):
             # Init TensorRT-LLM tensor for activation
             activation = Tensor(

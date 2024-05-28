@@ -331,7 +331,7 @@ def parse_nmt_config(args, model):
     config["decoder"]["q_scaling"] = '1'
     config["decoder"]["rescale_before_lm_head"] = 'false'
     config['decoder']['has_model_final_layernorm'] = 'false'
-    config['decoder']['vocab_size'] = str(len(model.src_dict))  # fairseq naming
+    config['decoder']['vocab_size'] = str(len(model.tgt_dict))  # fairseq naming
 
     config["structure"] = dict()
     config["structure"]["t5_with_bias"] = "true"

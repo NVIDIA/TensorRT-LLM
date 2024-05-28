@@ -41,6 +41,7 @@ public:
     std::optional<std::vector<float>> beam_search_diversity_rate; // [BS] on cpu
     std::optional<std::vector<float>> length_penalty;             // [BS] on cpu
     std::optional<std::vector<int>> early_stopping;               // [BS] on cpu
+    bool hasDiffRuntimeArgs{false};
 };
 
 class BeamSearchInputParams : public BaseInputParams
@@ -96,7 +97,13 @@ public:
     void setup(runtime::SizeType32 const batch_size, runtime::SizeType32 const beamWidth,
         runtime::SizeType32 const* batchSlots, std::shared_ptr<BaseSetupParams> setupParams) override;
 
-    void forward(std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs) override;
+    void forwardAsync(std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs) override;
+
+private:
+    void forwardAsyncSingleRequest(std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs);
+
+    void allocateBuffer(runtime::SizeType32 const batch_size, runtime::SizeType32 const beam_width);
+    void freeBuffer();
 
 private:
     using Base::mAllocator;
@@ -114,9 +121,7 @@ private:
     std::vector<float> mDiversityRateHost;
     std::vector<float> mLengthPenaltyHost;
     std::vector<int> mEarlyStoppingHost;
-
-    void allocateBuffer(runtime::SizeType32 const batch_size, runtime::SizeType32 const beam_width);
-    void freeBuffer();
+    bool mHasDiffRuntimeArgs{false};
 };
 
 } // namespace layers

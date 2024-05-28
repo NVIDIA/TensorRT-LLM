@@ -190,10 +190,9 @@ class TestFunctional(unittest.TestCase):
 
         # test cases for StreamingLLM
         test_cases += list(
-            product(['llama_attention'], [ContextFMHAType.disabled],
-                    ['float16'], [None], [2], [128], [4], [64], [0], [False],
-                    [False], [1, 4], [True, False], [False], [10000.0], [None],
-                    [4]))
+            product(['llama_attention'], [ContextFMHAType.enabled], ['float16'],
+                    [None], [2], [128], [4], [64], [0], [False], [False],
+                    [1, 4], [True, False], [False], [10000.0], [None], [4]))
 
         # add gpu_arch_lists for testing (help reducing workload if there are duplicates).
         test_cases = [("all", ) + case for case in test_cases]
@@ -418,6 +417,7 @@ class TestFunctional(unittest.TestCase):
             torch.manual_seed(42)
 
         tokens_per_block = 128 if paged_kv_cache else -1
+        streamingllm = sink_token_len > 0
 
         def _construct_execution(
             session,
@@ -453,22 +453,24 @@ class TestFunctional(unittest.TestCase):
             # construct trt network
             builder = tensorrt_llm.Builder()
             net = builder.create_network()
-            net.plugin_config.set_gpt_attention_plugin(dtype)
+            net.plugin_config.gpt_attention_plugin = dtype
             net.plugin_config.set_context_fmha(context_fmha_type)
+            if streamingllm:
+                net.plugin_config.streamingllm = True
             if enable_remove_input_padding:
-                net.plugin_config.enable_remove_input_padding()
+                net.plugin_config.remove_input_padding = True
             else:
-                net.plugin_config.set_plugin("remove_input_padding", False)
+                net.plugin_config.remove_input_padding = False
             if paged_kv_cache:
                 net.plugin_config.enable_paged_kv_cache(tokens_per_block)
             else:
-                net.plugin_config.set_plugin("paged_kv_cache", False)
+                net.plugin_config.paged_kv_cache = False
             if enable_multi_block_mmha:
-                net.plugin_config.enable_mmha_multi_block_mode()
+                net.plugin_config.multi_block_mode = True
             else:
-                net.plugin_config.set_plugin("multi_block_mode", False)
+                net.plugin_config.multi_block_mode = False
             # always enable xqa kernels for test.
-            net.plugin_config.set_plugin("enable_xqa", True)
+            net.plugin_config.enable_xqa = True
 
             with tensorrt_llm.net_guard(net):
                 x_tensor = Tensor(name='input',
@@ -1009,6 +1011,10 @@ class TestFunctional(unittest.TestCase):
             return kv_dequant_scale, kv_quant_scale
 
         def verify_kv_cache(torch_present):
+            # If enable streamingllm, kv_cache stores keys and values that with no positional embedding applied
+            if streamingllm:
+                return
+
             if not use_int8_kv_cache and not use_fp8_kv_cache and num_kv_heads == num_heads and beam_width == 1:
                 if paged_kv_cache:
                     kv_cache_cont = kv_cache_manager.blocks_manager.get_continuous_caches(
@@ -1092,7 +1098,8 @@ class TestFunctional(unittest.TestCase):
                                                            dtype=torch.int32)
                 host_max_attention_window_sizes = torch.tensor(
                     [max_seq_len], dtype=torch.int32)
-                host_sink_token_length = torch.tensor([0], dtype=torch.int32)
+                host_sink_token_length = torch.tensor([sink_token_len],
+                                                      dtype=torch.int32)
 
                 input_tensor = torch.randn(shape_dict['input'],
                                            dtype=str_dtype_to_torch(dtype),
@@ -1209,7 +1216,8 @@ class TestFunctional(unittest.TestCase):
                 host_past_key_value_lengths = sequence_length.cpu() - 1
                 host_max_attention_window_sizes = torch.tensor(
                     [max_seq_len], dtype=torch.int32)
-                host_sink_token_length = torch.tensor([0], dtype=torch.int32)
+                host_sink_token_length = torch.tensor([sink_token_len],
+                                                      dtype=torch.int32)
                 input_tensor = torch.randn(shape_dict['input'],
                                            dtype=str_dtype_to_torch(dtype),
                                            device='cuda') * 1e-3

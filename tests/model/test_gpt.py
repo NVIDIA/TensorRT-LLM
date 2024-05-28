@@ -155,12 +155,12 @@ class TestGPT(unittest.TestCase):
             network = builder.create_network()
             network.plugin_config.to_legacy_setting()
             if use_plugin:
-                network.plugin_config.set_gpt_attention_plugin(dtype)
+                network.plugin_config.gpt_attention_plugin = dtype
             if fast_building:
-                network.plugin_config.set_gemm_plugin(dtype)
+                network.plugin_config.gemm_plugin = dtype
             network.plugin_config.set_context_fmha(context_fmha_type)
             if enable_remove_input_padding:
-                network.plugin_config.enable_remove_input_padding()
+                network.plugin_config.remove_input_padding = True
             if enable_paged_kv_cache:
                 network.plugin_config.enable_paged_kv_cache(tokens_per_block)
 

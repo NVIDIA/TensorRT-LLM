@@ -23,12 +23,10 @@ import numpy as np
 import tensorrt as trt
 import torch
 
-from tensorrt_llm._utils import numpy_to_torch
-from tensorrt_llm.bindings.executor import Executor
-
 from .. import profiler
-from .._utils import mpi_comm, mpi_world_size
-from ..bindings import GptSession
+from .._utils import mpi_comm, mpi_world_size, numpy_to_torch, trt_gte_10
+from ..bindings import MpiComm
+from ..bindings.executor import Executor
 from ..builder import Engine, get_engine_version
 from ..logger import logger
 from ..mapping import Mapping
@@ -255,8 +253,7 @@ class ModelRunnerMixin:
 
                 context_logits_output = []
                 if self.remove_input_padding:
-                    if (isinstance(self.session, GptSession) or isinstance(
-                            self.session, Executor)) and batch_size > 1:
+                    if isinstance(self.session, Executor) and batch_size > 1:
                         # The starting position of the context logits buffer of each micro batch is separated
                         num_batches = self.mapping.pp_size
                         micro_batch_size = math.ceil(batch_size /
@@ -507,13 +504,15 @@ class ModelRunner(ModelRunnerMixin):
             assert model_config.max_medusa_tokens > 0, \
                 "medusa_chioce is specified but model_config.max_medusa_tokens is 0."
 
+        if MpiComm.size() > runtime_mapping.gpus_per_node:
+            assert MpiComm.local_size() == runtime_mapping.gpus_per_node
         torch.cuda.set_device(rank % runtime_mapping.gpus_per_node)
         session = session_cls(model_config,
                               engine_buffer,
                               runtime_mapping,
                               debug_mode=debug_mode,
                               stream=stream)
-        if gpu_weights_percent != 1:
+        if trt_gte_10() and session.runtime.engine.streamable_weights_size:
             session.runtime._set_weight_streaming(gpu_weights_percent)
 
         if session.use_lora_plugin:
@@ -615,7 +614,8 @@ class ModelRunner(ModelRunnerMixin):
                                                 ckpt_source=lora_ckpt_source)
             else:
                 lora_manager = None
-            if gpu_weights_percent != 1:
+
+            if trt_gte_10() and session.runtime.engine.streamable_weights_size:
                 session.runtime._set_weight_streaming(gpu_weights_percent)
 
             profiler.stop('load tensorrt_llm engine')
@@ -754,6 +754,17 @@ class ModelRunner(ModelRunnerMixin):
         else:
             sampling_config = copy.deepcopy(sampling_config)
         sampling_config.update(**kwargs)
+
+        # To prevent numerical overflow when the temperature is set to 0.0
+        # Modify generation.SamplingConfig
+        if isinstance(sampling_config.temperature,
+                      float) and sampling_config.temperature == 0.0:
+            logger.warning(
+                "Convert `temperature=0.0` to `temperature=1.0` and `top_k=1` to prevent overflow."
+            )
+            sampling_config.temperature = 1.0
+            sampling_config.top_k = 1
+
         self._check_inputs(batch_input_ids, sampling_config)
 
         batch_size = len(batch_input_ids)

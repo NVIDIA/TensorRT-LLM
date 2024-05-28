@@ -33,8 +33,8 @@ namespace layers
 {
 
 template <typename T>
-PenaltyLayer<T>::PenaltyLayer(DecodingMode const& mode, DecoderDomain const& decoderDomain, cudaStream_t stream,
-    std::shared_ptr<IAllocator> allocator)
+PenaltyLayer<T>::PenaltyLayer(executor::DecodingMode const& mode, DecoderDomain const& decoderDomain,
+    cudaStream_t stream, std::shared_ptr<IAllocator> allocator)
     : BaseLayer(decoderDomain, stream, std::move(allocator))
     , mDecodingMode(mode)
 {
@@ -68,15 +68,15 @@ void PenaltyLayer<T>::initialize()
     mRuntimeMaxSeqLen = 0;
     mConfiguredBeamWidth = -1;
 
-    mTemperature.resize(mDecoderDomain.getMaxBatchSize());
-    mRepetitionPenalty.resize(mDecoderDomain.getMaxBatchSize());
-    mPresencePenalty.resize(mDecoderDomain.getMaxBatchSize());
-    mFrequencyPenalty.resize(mDecoderDomain.getMaxBatchSize());
-    mMinLength.resize(mDecoderDomain.getMaxBatchSize());
+    mTemperature.resize(mDecoderDomain.getBatchSize());
+    mRepetitionPenalty.resize(mDecoderDomain.getBatchSize());
+    mPresencePenalty.resize(mDecoderDomain.getBatchSize());
+    mFrequencyPenalty.resize(mDecoderDomain.getBatchSize());
+    mMinLength.resize(mDecoderDomain.getBatchSize());
 
-    if (!mDecodingMode.isNone())
+    if (!mDecodingMode.isAuto())
     {
-        mConfiguredBeamWidth = mDecoderDomain.getMaxBeamWidth();
+        mConfiguredBeamWidth = mDecoderDomain.getBeamWidth();
 
         allocateWorkspace();
     }
@@ -89,13 +89,16 @@ void PenaltyLayer<T>::allocateWorkspace()
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto const workspaceSize = sizeof(SizeType32) * mDecoderDomain.getMaxBatchSize()
-        * mDecoderDomain.getMaxTokensPerStep() * mConfiguredBeamWidth * mDecoderDomain.getVocabSize();
-    mPenaltyWorkspaceDevice = mAllocator->reMalloc(mPenaltyWorkspaceDevice, workspaceSize, false);
-
-    if (mDecodingMode.isBeamSearch())
+    if (mDecodingMode.isUseOccurrencePenalty())
     {
-        mPenaltyWorkspacePrevDevice = mAllocator->reMalloc(mPenaltyWorkspacePrevDevice, workspaceSize, false);
+        auto const workspaceSize = sizeof(SizeType32) * mDecoderDomain.getBatchSize()
+            * mDecoderDomain.getMaxTokensPerStep() * mConfiguredBeamWidth * mDecoderDomain.getVocabSize();
+        mPenaltyWorkspaceDevice = mAllocator->reMalloc(mPenaltyWorkspaceDevice, workspaceSize, false);
+
+        if (mDecodingMode.isBeamSearch())
+        {
+            mPenaltyWorkspacePrevDevice = mAllocator->reMalloc(mPenaltyWorkspacePrevDevice, workspaceSize, false);
+        }
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -106,20 +109,35 @@ void PenaltyLayer<T>::allocateBuffer()
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    mTemperatureDevice
-        = mAllocator->reMalloc(mTemperatureDevice, sizeof(float) * mDecoderDomain.getMaxBatchSize(), false);
-    mRepetitionPenaltyDevice
-        = mAllocator->reMalloc(mRepetitionPenaltyDevice, sizeof(float) * mDecoderDomain.getMaxBatchSize(), false);
-    mPresencePenaltyDevice
-        = mAllocator->reMalloc(mPresencePenaltyDevice, sizeof(float) * mDecoderDomain.getMaxBatchSize(), false);
-    mFrequencyPenaltyDevice
-        = mAllocator->reMalloc(mFrequencyPenaltyDevice, sizeof(float) * mDecoderDomain.getMaxBatchSize(), false);
-    mMinLengthDevice
-        = mAllocator->reMalloc(mMinLengthDevice, sizeof(SizeType32) * mDecoderDomain.getMaxBatchSize(), false);
+    if (mDecodingMode.isUseTemperature())
+    {
+        mTemperatureDevice
+            = mAllocator->reMalloc(mTemperatureDevice, sizeof(float) * mDecoderDomain.getBatchSize(), false);
+    }
+    if (mDecodingMode.isUseRepetitionPenalty())
+    {
+        mRepetitionPenaltyDevice
+            = mAllocator->reMalloc(mRepetitionPenaltyDevice, sizeof(float) * mDecoderDomain.getBatchSize(), false);
+    }
+    if (mDecodingMode.isUsePresencePenalty())
+    {
+        mPresencePenaltyDevice
+            = mAllocator->reMalloc(mPresencePenaltyDevice, sizeof(float) * mDecoderDomain.getBatchSize(), false);
+    }
+    if (mDecodingMode.isUseFrequencyPenalty())
+    {
+        mFrequencyPenaltyDevice
+            = mAllocator->reMalloc(mFrequencyPenaltyDevice, sizeof(float) * mDecoderDomain.getBatchSize(), false);
+    }
+    if (mDecodingMode.isUseMinLength())
+    {
+        mMinLengthDevice
+            = mAllocator->reMalloc(mMinLengthDevice, sizeof(SizeType32) * mDecoderDomain.getBatchSize(), false);
+    }
 
     mRuntimeLogitsDevice = mAllocator->reMalloc(mRuntimeLogitsDevice,
-        sizeof(T) * mDecoderDomain.getMaxBatchSize() * mDecoderDomain.getMaxTokensPerStep()
-            * mDecoderDomain.getMaxBeamWidth() * mDecoderDomain.getVocabSizePadded(),
+        sizeof(T) * mDecoderDomain.getBatchSize() * mDecoderDomain.getMaxTokensPerStep() * mDecoderDomain.getBeamWidth()
+            * mDecoderDomain.getVocabSizePadded(),
         false);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -138,11 +156,26 @@ void PenaltyLayer<T>::freeBuffer()
     {
         mAllocator->free((void**) &mPenaltyWorkspacePrevDevice);
     }
-    mAllocator->free((void**) (&mTemperatureDevice));
-    mAllocator->free((void**) (&mRepetitionPenaltyDevice));
-    mAllocator->free((void**) (&mPresencePenaltyDevice));
-    mAllocator->free((void**) (&mFrequencyPenaltyDevice));
-    mAllocator->free((void**) (&mMinLengthDevice));
+    if (mDecodingMode.isUseTemperature())
+    {
+        mAllocator->free((void**) (&mTemperatureDevice));
+    }
+    if (mDecodingMode.isUseRepetitionPenalty())
+    {
+        mAllocator->free((void**) (&mRepetitionPenaltyDevice));
+    }
+    if (mDecodingMode.isUsePresencePenalty())
+    {
+        mAllocator->free((void**) (&mPresencePenaltyDevice));
+    }
+    if (mDecodingMode.isUseFrequencyPenalty())
+    {
+        mAllocator->free((void**) (&mFrequencyPenaltyDevice));
+    }
+    if (mDecodingMode.isUseMinLength())
+    {
+        mAllocator->free((void**) (&mMinLengthDevice));
+    }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -159,9 +192,10 @@ void PenaltyLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, SizeType
     {
         // This code is left only for Python runtime
         // In C++ runtime given maxBeamWidth should always be equal to the runtime beamWidth
-        TLLM_CHECK(mDecodingMode.isNone());
+        TLLM_CHECK(mDecodingMode.isAuto());
         mConfiguredBeamWidth = beamWidth;
-        mDecodingMode = mConfiguredBeamWidth == 1 ? DecodingMode::TopKTopP() : DecodingMode::BeamSearch();
+        mDecodingMode
+            = mConfiguredBeamWidth == 1 ? executor::DecodingMode::TopKTopP() : executor::DecodingMode::BeamSearch();
         allocateWorkspace();
     }
 
@@ -170,15 +204,17 @@ void PenaltyLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, SizeType
     auto batchSlotsHost = batchSlots ? batchSlots : batchSlotsVec.data();
 
     // Setup penalties.
-    FillBuffers const fillBuffers{batchSize, mDecoderDomain.getMaxBatchSize(), mStream};
+    FillBuffers const fillBuffers{batchSize, mDecoderDomain.getBatchSize(), mStream};
 
     auto const& penaltyParams = setupParams->penaltyParams;
 
-    bool const useTemperature = penaltyParams.temperature.has_value();
-    bool const useRepetitionPenalty = penaltyParams.repetitionPenalty.has_value();
-    bool const usePresencePenalty = penaltyParams.presencePenalty.has_value();
-    bool const useFrequencyPenalty = penaltyParams.frequencyPenalty.has_value();
-    bool const useMinLength = penaltyParams.minLength.has_value();
+    bool const useTemperature = mDecodingMode.isUseTemperature() && penaltyParams.temperature.has_value();
+    bool const useRepetitionPenalty
+        = mDecodingMode.isUseRepetitionPenalty() && penaltyParams.repetitionPenalty.has_value();
+    bool const usePresencePenalty = mDecodingMode.isUsePresencePenalty() && penaltyParams.presencePenalty.has_value();
+    bool const useFrequencyPenalty
+        = mDecodingMode.isUseFrequencyPenalty() && penaltyParams.frequencyPenalty.has_value();
+    bool const useMinLength = mDecodingMode.isUseMinLength() && penaltyParams.minLength.has_value();
     if (useTemperature)
     {
         fillBuffers(penaltyParams.temperature, DefaultDecodingParams::getTemperature(), mTemperature,
@@ -221,7 +257,7 @@ void PenaltyLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, SizeType
 }
 
 template <typename T>
-void PenaltyLayer<T>::forward(
+void PenaltyLayer<T>::forwardAsync(
     std::shared_ptr<BaseOutputParams> baseOutputs, std::shared_ptr<BaseInputParams> baseInputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -229,31 +265,11 @@ void PenaltyLayer<T>::forward(
     auto outputs = std::dynamic_pointer_cast<DynamicDecodeOutputParams>(baseOutputs);
     auto params = std::dynamic_pointer_cast<DynamicDecodeInputParams>(baseInputs);
 
-    SizeType32 batchSize{0};
-    SizeType32 beamWidth{0};
-    SizeType32 vocabSize{0};
-    if (params->logits)
-    {
-        auto const& logitsShape = params->logits->shape;
-        TLLM_CHECK(logitsShape.size() == 3 || logitsShape.size() == 4);
-        batchSize = logitsShape[0];
-        auto const idxOffset = logitsShape.size() - 3;
-        beamWidth = logitsShape[idxOffset + 1];
-        vocabSize = logitsShape[idxOffset + 2];
-    }
-    else
-    {
-        TLLM_CHECK(params->logits_vec->size());
-        auto const& logitsShape = params->logits_vec.value()[0].shape;
-        TLLM_CHECK(logitsShape.size() == 3 || logitsShape.size() == 4);
-        auto const idxOffset = logitsShape.size() - 3;
-        batchSize = params->logits_vec->size();
-        beamWidth = logitsShape[idxOffset + 1];
-        vocabSize = logitsShape[idxOffset + 2];
-    }
+    auto const localDecoderDomain = getLocalDecoderDomain(params);
     auto const maxSeqLen = outputs->output_ids.shape[outputs->output_ids.shape.size() - 1];
     auto batchSlots = params->batch_slots ? params->batch_slots->template getPtr<SizeType32 const>() : nullptr;
-    std::vector<SizeType32> batchSlotsVec(batchSize);
+
+    std::vector<SizeType32> batchSlotsVec(localDecoderDomain.getBatchSize());
     std::iota(batchSlotsVec.begin(), batchSlotsVec.end(), 0);
     auto batchSlotsHost
         = params->batch_slots ? params->batch_slots->template getPtr<SizeType32 const>() : batchSlotsVec.data();
@@ -261,8 +277,7 @@ void PenaltyLayer<T>::forward(
     if (!mLogitsPtrsHost->data())
     {
         mLogitsPtrsHost = runtime::BufferManager::pinnedPool(
-            ITensor::makeShape(
-                {static_cast<int32_t>(maxSeqLen), static_cast<int32_t>(mDecoderDomain.getMaxBatchSize())}),
+            ITensor::makeShape({static_cast<int32_t>(maxSeqLen), static_cast<int32_t>(mDecoderDomain.getBatchSize())}),
             runtime::TRTDataType<T*>::value);
         mRuntimeMaxSeqLen = maxSeqLen;
     }
@@ -271,18 +286,19 @@ void PenaltyLayer<T>::forward(
 
     auto logitsPtrsHost = ITensor::slice(mLogitsPtrsHost, mCyclicStep, 1);
     auto logitsPtrsHostData = reinterpret_cast<T const**>(runtime::bufferCast<int64_t>(*logitsPtrsHost));
-    for (SizeType32 bi = 0; bi < batchSize; bi++)
+    for (SizeType32 bi = 0; bi < localDecoderDomain.getBatchSize(); bi++)
     {
         if (params->logits_vec)
         {
-            TLLM_CHECK_WITH_INFO(params->logits_vec->size() == batchSize,
-                "Logits vector size (%lu) is not equal to the batchSize (%d)", params->logits_vec->size(), batchSize);
+            TLLM_CHECK_WITH_INFO(params->logits_vec->size() == localDecoderDomain.getBatchSize(),
+                "Logits vector size (%lu) is not equal to the batchSize (%d)", params->logits_vec->size(),
+                localDecoderDomain.getBatchSize());
             logitsPtrsHostData[bi] = params->logits_vec.value()[bi].template getPtr<T>();
         }
         else
         {
-            logitsPtrsHostData[bi]
-                = params->logits->template getPtrWithOffset<T>(bi * beamWidth * mDecoderDomain.getVocabSizePadded());
+            logitsPtrsHostData[bi] = params->logits->template getPtrWithOffset<T>(
+                bi * localDecoderDomain.getBeamWidth() * mDecoderDomain.getVocabSizePadded());
         }
     }
 
@@ -295,8 +311,8 @@ void PenaltyLayer<T>::forward(
     auto* embeddingBias = params->embedding_bias ? params->embedding_bias->template getPtr<T const>() : nullptr;
 #define GET_PENALTIES(capital_name, type)                                                                              \
     (mUse##capital_name                                                                                                \
-        && !allOfBatchSlots(                                                                                           \
-            batchSlotsHost, m##capital_name.data(), batchSize, DefaultDecodingParams::get##capital_name()))            \
+        && !allOfBatchSlots(batchSlotsHost, m##capital_name.data(), localDecoderDomain.getBatchSize(),                 \
+            DefaultDecodingParams::get##capital_name()))                                                               \
         ? m##capital_name##Device                                                                                      \
         : nullptr;
 
@@ -311,24 +327,42 @@ void PenaltyLayer<T>::forward(
     auto const tokensPerStep = params->medusaInputs
         ? params->medusaInputs->medusaCurTokensPerStep.template getPtr<SizeType32 const>()
         : nullptr;
-    InvokeBatchApplyPenaltyParams<T> penaltyParams{reinterpret_cast<T const* const*>(logitsPtrsHostData),
-        mRuntimeLogitsDevice, embeddingBias, mPenaltyWorkspaceDevice, mPenaltyWorkspacePrevDevice, temperatures,
-        repetitionPenalties, presencePenalties, frequencyPenalties,
-        (mUseRepetitionPenalty || mUsePresencePenalty || mUseFrequencyPenalty), batchSize,
-        static_cast<SizeType32>(beamWidth), static_cast<SizeType32>(maxSeqLen), mDecoderDomain.getVocabSize(),
-        mDecoderDomain.getVocabSizePadded(), outputs->output_ids_ptr.template getPtr<TokenIdType const*>(),
-        outputs->parent_ids_ptr.template getPtr<SizeType32 const*>(), inputLengths,
-        outputs->sequence_length->template getPtr<SizeType32 const>(), minLengths,
-        params->end_ids.template getPtr<TokenIdType const>(), batchSlots, mDecoderDomain.getMaxTokensPerStep(),
-        tokensPerStep, mStream};
+
+    InvokeBatchApplyPenaltyParams<T> penaltyParams;
+    penaltyParams.inputLogits = reinterpret_cast<T const* const*>(logitsPtrsHostData);
+    penaltyParams.outputLogits = mRuntimeLogitsDevice;
+    penaltyParams.biases = embeddingBias;
+    penaltyParams.penaltyWorkspace = mPenaltyWorkspaceDevice;
+    penaltyParams.penaltyWorkspacePrev = mPenaltyWorkspacePrevDevice;
+    penaltyParams.temperatures = temperatures;
+    penaltyParams.repetitionPenalties = repetitionPenalties;
+    penaltyParams.presencePenalties = presencePenalties;
+    penaltyParams.frequencyPenalties = frequencyPenalties;
+    penaltyParams.batchSize = localDecoderDomain.getBatchSize();
+    penaltyParams.beamWidth = localDecoderDomain.getBeamWidth();
+    penaltyParams.maxSeqLen = maxSeqLen;
+    penaltyParams.vocabSize = mDecoderDomain.getVocabSize();
+    penaltyParams.vocabSizePadded = mDecoderDomain.getVocabSizePadded();
+    penaltyParams.outputIdsPtr = outputs->output_ids_ptr.template getPtr<TokenIdType const*>();
+    penaltyParams.parentIdsPtr = outputs->parent_ids_ptr.template getPtr<SizeType32 const*>();
+    penaltyParams.inputLengths = inputLengths;
+    penaltyParams.sequenceLengths = outputs->sequence_length->template getPtr<SizeType32 const>();
+    penaltyParams.minLengths = minLengths;
+    penaltyParams.endIds = params->end_ids.template getPtr<TokenIdType const>();
+    penaltyParams.batchSlots = batchSlots;
+    penaltyParams.maxTokensPerStep = mDecoderDomain.getMaxTokensPerStep();
+    penaltyParams.tokensPerStep = tokensPerStep;
+    penaltyParams.stream = mStream;
     invokeBatchApplyPenalty(penaltyParams);
     sync_check_cuda_error();
 
     mCyclicStep += 1;
 
     params->logits = Tensor(MEMORY_GPU, std::is_same_v<T, float> ? DataType::TYPE_FP32 : DataType::TYPE_FP16,
-        {static_cast<size_t>(batchSize), static_cast<size_t>(mDecoderDomain.getMaxTokensPerStep()),
-            static_cast<size_t>(beamWidth), static_cast<size_t>(mDecoderDomain.getVocabSizePadded())},
+        {static_cast<size_t>(localDecoderDomain.getBatchSize()),
+            static_cast<size_t>(mDecoderDomain.getMaxTokensPerStep()),
+            static_cast<size_t>(localDecoderDomain.getBeamWidth()),
+            static_cast<size_t>(mDecoderDomain.getVocabSizePadded())},
         mRuntimeLogitsDevice);
 
     if (mDecodingMode.isBeamSearch())

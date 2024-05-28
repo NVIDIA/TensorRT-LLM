@@ -102,7 +102,7 @@ __device__ __forceinline__ void apply_scale(void* act, void* act_scale)
 {
     using Type2 = typename MathWrapper<typename Details::TypeDetailsA>::Type2;
     static_assert(K % 2 == 0);
-    static constexpr int VecK = K / 2;
+    [[maybe_unused]] static constexpr int VecK = K / 2;
     if constexpr (Enable)
     {
         Type2* pa = reinterpret_cast<Type2*>(act);

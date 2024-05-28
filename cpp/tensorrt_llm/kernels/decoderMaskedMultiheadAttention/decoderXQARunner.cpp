@@ -101,9 +101,9 @@ size_t DecoderXQARunner::getWorkspaceSize(int max_batch_beam_size)
 
 DecoderXQAImpl* DecoderXQARunner::getImplFromXQAParams(XQAParams const& xqaParams)
 {
-    if (tensorrt_llm::common::getEnvDisableXQAJIT())
+    if (tensorrt_llm::common::getSMVersion() == kSM_90)
     {
-        // Always use Precompiled impl if TRTLLM_DISABLE_XQA_JIT is ON.
+        // Always use Precompiled impl for sm90 until Hopper XQA source gets integrated to JIT codepath.
         return mPrecompiledImpl.get();
     }
     if (xqaParams.multi_query_tokens)
@@ -112,9 +112,14 @@ DecoderXQAImpl* DecoderXQARunner::getImplFromXQAParams(XQAParams const& xqaParam
         // non-medusa.
         return mPrecompiledImpl.get();
     }
-    else
+
+    if (tensorrt_llm::common::getEnvEnableXQAJIT())
     {
         return mJITImpl.get();
+    }
+    else
+    {
+        return mPrecompiledImpl.get();
     }
 }
 

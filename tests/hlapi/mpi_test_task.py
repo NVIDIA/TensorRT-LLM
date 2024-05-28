@@ -1,8 +1,7 @@
 #!/usr/bin/env python
-from mpi4py import MPI
 from mpi4py.futures import MPICommExecutor
 
-from tensorrt_llm._utils import mpi_rank, mpi_world_size
+from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
 from tensorrt_llm.hlapi.mpi_session import MpiCommSession, MPINodeState
 
 
@@ -34,7 +33,7 @@ def main():
         the_task.run()
 
     else:  # The worker node
-        with MPICommExecutor(MPI.COMM_WORLD) as executor:
+        with MPICommExecutor(mpi_comm()) as executor:
             pass
 
 

@@ -1,14 +1,17 @@
-import os
+import os as _os
 import pathlib as _pl
-import sys
+import sys as _sys
 
 import numpy as _np
+import pytest
 import torch as _tor
 from binding_test_utils import *
 
 import tensorrt_llm.bindings as _tb
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+_sys.path.append(_os.path.join(_os.path.dirname(__file__), '..'))
+from utils.cpp_paths import *
+from utils.llm_data import llm_models_root
 from utils.util import skip_pre_ampere
 
 
@@ -25,7 +28,7 @@ from utils.util import skip_pre_ampere
 @skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
 def test_gpt_session(variant, results_file, load_bytearray, llm_root: _pl.Path,
                      resource_path: _pl.Path, engine_path: _pl.Path,
-                     data_path: _pl.Path, llm_model_root):
+                     data_path: _pl.Path):
     model_dir = "gpt2"
     tp_size = 1
     pp_size = 1
@@ -53,9 +56,9 @@ def test_gpt_session(variant, results_file, load_bytearray, llm_root: _pl.Path,
         if beam_width == 1 else f"beam_search_{beam_width}") / results_file
 
     if not results_path.exists():
-        model_cache_arg = ["--model_cache",
-                           str(llm_model_root)
-                           ] if llm_model_root is not None else []
+        model_cache = llm_models_root()
+        model_cache_arg = ["--model_cache", str(model_cache)
+                           ] if model_cache is not None else []
         prepare_model_tests(llm_root, resource_path, "gpt", model_cache_arg)
 
     assert results_path.is_file()

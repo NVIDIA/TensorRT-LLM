@@ -545,7 +545,12 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
         ]
         for k, v in prompt_ds_args.items():
             prepare_dataset += [k, v]
-        run_command(prepare_dataset, cwd=root_dir, timeout=300)
+        # https://nvbugs/4658787
+        # WAR before the prepare dataset can use offline cached dataset
+        run_command(prepare_dataset,
+                    cwd=root_dir,
+                    timeout=300,
+                    env={'HF_DATASETS_OFFLINE': '0'})
 
         batching_types = ["IFB", "V1"]
         api_types = ["gptManager", "executor"]

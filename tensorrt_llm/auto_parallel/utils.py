@@ -202,6 +202,7 @@ def get_cache_key(layer, shapes, values, dtypes=None, updated_attrs=None):
     else:
         network = get_trt_network(layer)
         plugin_info = get_plugin_info(network, layer.name)
+        assert plugin_info is not None, f"layer {layer.name} does not register plugin info"
         attr_key = tuple(
             (name, tuple(updated_attrs.get(name) or data))
             for name, data in sorted(plugin_info.pfc_as_list.items()))

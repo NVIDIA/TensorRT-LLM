@@ -154,7 +154,7 @@ void GptSession::createBuffers(SizeType32 numMicroBatches)
 
 void GptSession::createDecoders(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 maxAttentionWindow,
     SizeType32 sinkTokenLength, SizeType32 maxSequenceLength, nvinfer1::DataType logitsType, bool decoderPerRequest,
-    SizeType32 numMicroBatches, DecodingMode const& decodingMode)
+    SizeType32 numMicroBatches, executor::DecodingMode const& decodingMode)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto const vocabSize = mModelConfig.getVocabSize();
@@ -304,8 +304,8 @@ void GptSession::setup(Config const& sessionConfig)
     if (mWorldConfig.isLastPipelineParallelRank())
     {
         auto const logitsType = mRuntime->getEngine().getTensorDataType("logits");
-        DecodingMode decodingMode = sessionConfig.decodingMode.value_or(
-            maxBeamWidth == 1 ? DecodingMode::TopKTopP() : DecodingMode::BeamSearch());
+        executor::DecodingMode decodingMode = sessionConfig.decodingMode.value_or(
+            maxBeamWidth == 1 ? executor::DecodingMode::TopKTopP() : executor::DecodingMode::BeamSearch());
         createDecoders(mMicroBatchConfig.genBatchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength,
             maxSequenceLength, logitsType, sessionConfig.decoderPerRequest, mMicroBatchConfig.numGenBatches,
             decodingMode);

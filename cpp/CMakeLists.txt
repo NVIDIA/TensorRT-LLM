@@ -32,6 +32,7 @@ option(BUILD_PYBIND "Build Python bindings for C++ runtime and batch manager"
        ON)
 option(BUILD_TESTS "Build Google tests" ON)
 option(BUILD_BENCHMARKS "Build benchmarks" ON)
+option(BUILD_MICRO_BENCHMARKS "Build C++ micro benchmarks" OFF)
 option(NVTX_DISABLE "Disable all NVTX features" ON)
 option(WARNING_IS_ERROR "Treat all warnings as errors" OFF)
 option(FAST_BUILD "Skip compiling some kernels to accelerate compiling" OFF)
@@ -109,6 +110,12 @@ if(BUILD_BENCHMARKS)
   message(STATUS "Building benchmarks")
 else()
   message(STATUS "Not building benchmarks")
+endif()
+
+if(BUILD_MICRO_BENCHMARKS)
+  message(STATUS "Building C++ micro benchmarks")
+else()
+  message(STATUS "Not building C++ micro benchmarks")
 endif()
 
 if(FAST_BUILD)
@@ -504,6 +511,11 @@ endif()
 if(BUILD_BENCHMARKS)
   add_subdirectory(${TRT_LLM_ROOT_DIR}/benchmarks/cpp
                    ${CMAKE_BINARY_DIR}/benchmarks)
+endif()
+
+if(BUILD_MICRO_BENCHMARKS)
+  add_subdirectory(${TRT_LLM_ROOT_DIR}/cpp/micro_benchmarks
+                   ${CMAKE_BINARY_DIR}/micro_benchmarks)
 endif()
 
 # Measure the compile time

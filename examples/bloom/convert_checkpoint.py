@@ -20,7 +20,7 @@ from transformers.pytorch_utils import Conv1D
 import tensorrt_llm
 from tensorrt_llm import logger
 from tensorrt_llm.quantization import QuantAlgo, QuantMode
-from tensorrt_llm.models.convert_utils import iterate_shard_files, load_state_dict
+from tensorrt_llm.models.convert_utils import iterate_shard_files, load_state_dict, load_calib_dataset
 # isort: on
 
 
@@ -116,7 +116,7 @@ def capture_activation_range(model,
                     functools.partial(stat_input_hook, name=name)))
 
     for i in tqdm(range(num_samples), desc="calibrating model"):
-        input_ids = tokenizer(dataset[i]["text"],
+        input_ids = tokenizer(dataset[i],
                               return_tensors="pt",
                               max_length=seq_len,
                               truncation=True).input_ids.to(device)
@@ -215,6 +215,13 @@ def parse_arguments():
                         type=Path,
                         default='tllm_checkpoint',
                         help='The path to save the TensorRT-LLM checkpoint')
+    parser.add_argument(
+        '--calib_dataset',
+        type=str,
+        default='lambada',
+        help=
+        "The huggingface dataset name or the local directory of the dataset for calibration."
+    )
     parser.add_argument(
         "--smoothquant",
         "-sq",
@@ -1114,11 +1121,10 @@ def main():
     if args.smoothquant is not None or args.int8_kv_cache:
         os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get(
             "TOKENIZERS_PARALLELISM", "false")
-        from datasets import load_dataset
-        dataset = load_dataset("lambada", split="validation", cache_dir=None)
-        act_range = capture_activation_range(
-            hf_bloom, BloomTokenizerFast.from_pretrained(args.model_dir),
-            dataset)
+        tokenizer = BloomTokenizerFast.from_pretrained(args.model_dir)
+        dataset = load_calib_dataset(args.calib_dataset)
+
+        act_range = capture_activation_range(hf_bloom, tokenizer, dataset)
         if args.smoothquant is not None:
             smooth_bloom_model(hf_bloom, act_range, args.smoothquant,
                                bloom_qkv_param, bloom_smoother)

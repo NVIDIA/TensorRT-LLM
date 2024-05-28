@@ -55,6 +55,7 @@ def main(build_type: str = "Release",
          skip_building_wheel: bool = False,
          python_bindings: bool = True,
          benchmarks: bool = False,
+         micro_benchmarks: bool = False,
          nvtx: bool = False):
     project_dir = Path(__file__).parent.resolve().parent
     os.chdir(project_dir)
@@ -153,6 +154,8 @@ def main(build_type: str = "Release",
     build_pybind = "OFF" if cpp_only else "ON"
     bindings_lib = "" if cpp_only else "bindings"
     benchmarks_lib = "benchmarks" if benchmarks else ""
+    build_micro_benchmarks = "ON" if micro_benchmarks else "OFF"
+    micro_benchmarks_lib = "micro_benchmarks" if micro_benchmarks else ""
     disable_nvtx = "OFF" if nvtx else "ON"
     executor_worker = "" if on_windows else "executorWorker "
 
@@ -160,13 +163,15 @@ def main(build_type: str = "Release",
         cmake_def_args = " ".join(cmake_def_args)
         if clean or first_build:
             build_run(
-                f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBUILD_PYBIND="{build_pybind}" -DNVTX_DISABLE="{disable_nvtx}"'
+                f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBUILD_PYBIND="{build_pybind}"'
+                f' -DNVTX_DISABLE="{disable_nvtx}" -DBUILD_MICRO_BENCHMARKS={build_micro_benchmarks}'
                 f' {cmake_cuda_architectures} {cmake_def_args} {cmake_generator} -S "{source_dir}"'
             )
         build_run(
             f'cmake --build . --config {build_type} --parallel {job_count} '
-            f'--target tensorrt_llm nvinfer_plugin_tensorrt_llm {th_common_lib} {bindings_lib} {benchmarks_lib} {executor_worker}'
-            f'{" ".join(extra_make_targets)}')
+            f'--target tensorrt_llm nvinfer_plugin_tensorrt_llm {th_common_lib} {bindings_lib} {benchmarks_lib} '
+            f'{micro_benchmarks_lib} {executor_worker} {" ".join(extra_make_targets)}'
+        )
 
     if cpp_only:
         assert not install, "Installing is not supported for cpp_only builds"
@@ -345,6 +350,9 @@ if __name__ == "__main__":
     parser.add_argument("--benchmarks",
                         action="store_true",
                         help="Build the benchmarks for the C++ runtime.")
+    parser.add_argument("--micro_benchmarks",
+                        action="store_true",
+                        help="Build the micro benchmarks for C++ components.")
     parser.add_argument("--nvtx",
                         action="store_true",
                         help="Enable NVTX features.")

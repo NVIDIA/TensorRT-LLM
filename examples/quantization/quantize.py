@@ -21,7 +21,13 @@ if __name__ == "__main__":
         default='gptnext',
         choices=['gptnext', 'llama'],
         help="Decoder type; effective for NeMo checkpoint only.")
-    parser.add_argument('--calib_dataset', type=str, default='cnn_dailymail')
+    parser.add_argument(
+        '--calib_dataset',
+        type=str,
+        default='cnn_dailymail',
+        help=
+        "The huggingface dataset name or the local directory of the dataset for calibration."
+    )
     parser.add_argument(
         '--calib_tp_size',
         type=int,

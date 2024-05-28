@@ -25,8 +25,8 @@ from typing import Dict, Optional, Union
 import tensorrt as trt
 
 from ._common import _is_building, serialize_engine
-from ._utils import (str_dtype_to_trt, support_strongly_type, to_dict,
-                     to_json_file, trt_gte_10)
+from ._utils import (str_dtype_to_trt, support_strongly_type, to_json_file,
+                     trt_gte_10)
 from .auto_parallel import auto_parallel
 from .auto_parallel.config import AutoParallelConfig
 from .graph_rewriting import optimize
@@ -83,7 +83,7 @@ class BuilderConfig(object):
         if hasattr(self, 'plugin_config'):
             assert isinstance(self.plugin_config, PluginConfig), \
                 f"Found unexpected plugin_config object with type: {type(self.plugin_config)}"
-            config['plugin_config'] = to_dict(self.plugin_config)
+            config['plugin_config'] = self.plugin_config.to_dict()
         return config
 
 
@@ -377,7 +377,7 @@ class Builder():
             for name, param in network.named_parameters:
                 if param._get_weights() is None:
                     logger.info(
-                        f"Parameter {name} {param.raw_value.shape} {param.raw_value.dtype} was not materialized to TRT network"
+                        f"Parameter {name} {param.raw_value.shape} {param.raw_value.dtype} was created but unused in forward method, so not materialized to TRT network"
                     )
                     continue
                 if not network.trt_network.set_weights_name(
@@ -537,9 +537,7 @@ class BuildConfig:
 
     def to_dict(self):
         output = copy.deepcopy(self.__dict__)
-        plugin_config = output.pop('plugin_config')
-        plugin_config_dict = copy.deepcopy(plugin_config.__dict__)
-        output['plugin_config'] = plugin_config_dict
+        output['plugin_config'] = output['plugin_config'].to_dict()
         output['lora_config'] = output['lora_config'].to_dict()
         output['auto_parallel_config'] = output['auto_parallel_config'].to_dict(
         )
@@ -670,6 +668,9 @@ def optimize_model_with_config(model: PretrainedModel,
             use_prompt_tuning=(build_config.max_prompt_embedding_table_size >
                                0))
 
+    if model.config.architecture in ["RecurrentGemmaForCausalLM"]:
+        model = optimize_model(model, use_fused_rg_lru=True)
+
     if build_config.plugin_config.lora_plugin is not None:
         model.use_lora(build_config.lora_config)
         model = optimize_model(
@@ -692,19 +693,58 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
        Create a new fresh model object if you need to build with different options.
 
     '''
-    build_config = copy.deepcopy(
-        build_config)  # avoid changing the input config
+    # avoid changing the input config
+    build_config = copy.deepcopy(build_config)
+    build_config.plugin_config.dtype = model.config.dtype
+
     if model.config.quantization.quant_algo == QuantAlgo.FP8 or \
             model.config.quantization.kv_cache_quant_algo == QuantAlgo.FP8:
         build_config.strongly_typed = True
 
-    if hasattr(model.config, 'max_medusa_token_len'):
-        build_config.max_draft_len = model.config.max_medusa_token_len
+    if hasattr(model.config, 'max_draft_len'):
+        build_config.max_draft_len = model.config.max_draft_len
         if build_config.speculative_decoding_mode != SpeculativeDecodingMode.MEDUSA:
             logger.warning(
                 'speculative_decoding_mode is not Medusa for Medusa model. Overwriting speculative_decoding_mode'
             )
         build_config.speculative_decoding_mode = SpeculativeDecodingMode.MEDUSA
+
+    if build_config.speculative_decoding_mode != SpeculativeDecodingMode.NONE:
+        logger.info(
+            f'Increasing max_output_len ({build_config.max_output_len}) '
+            f'by max_draft_len ({build_config.max_draft_len}) '
+            'to account for speculative decoding implementation specifics. '
+            'Maximum number of generated tokens remains the same. '
+            f'New max_output_len is set to {build_config.max_output_len + build_config.max_draft_len}'
+        )
+        build_config.max_output_len += build_config.max_draft_len
+
+    if build_config.speculative_decoding_mode != SpeculativeDecodingMode.NONE:
+        num_tokens = build_config.max_batch_size * (build_config.max_draft_len +
+                                                    1)
+        if build_config.max_num_tokens < num_tokens:
+            logger.info(
+                f'max_num_tokens ({build_config.max_num_tokens}) is smaller than '
+                'max_batch_size * (max_draft_len + 1) = '
+                f'({build_config.max_batch_size} * ({build_config.max_draft_len} + 1)). '
+                f'New max_num_tokens is set to {num_tokens}.')
+            build_config.max_num_tokens = num_tokens
+
+    if build_config.plugin_config.use_paged_context_fmha:
+        if (model.config.quant_mode.has_fp8_kv_cache()
+                and not model.config.quant_mode.has_fp8_qdq()):
+            raise RuntimeError(
+                "FP8 Paged Context FMHA only works with fp8 quantization workflow currently."
+            )
+        if (model.config.quant_mode.has_fp8_kv_cache()
+                and not build_config.plugin_config.use_fp8_context_fmha):
+            build_config.plugin_config.use_fp8_context_fmha = True
+            logger.warning(
+                "FP8 Context FMHA is enabled by default to support FP8 Paged Context FMHA."
+            )
+        if model.config.quant_mode.has_int8_kv_cache():
+            raise RuntimeError(
+                "Paged Context FMHA doesn't work with int8 kv cache currently.")
 
     model = optimize_model_with_config(model, build_config)
 
@@ -736,31 +776,14 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
 
     if use_weight_only and not disable_weight_only_quant_plugin:
         if per_group:
-            network.plugin_config.set_plugin(
-                "weight_only_groupwise_quant_matmul_plugin", model.config.dtype)
+            network.plugin_config.weight_only_groupwise_quant_matmul_plugin = model.config.dtype
         else:
-            network.plugin_config.set_plugin("weight_only_quant_matmul_plugin",
-                                             model.config.dtype)
+            network.plugin_config.weight_only_quant_matmul_plugin = model.config.dtype
     if use_smooth_quant and model.config.quantization.use_plugin_sq:
         network.plugin_config.set_smooth_quant_plugins()
-    if network.plugin_config.use_paged_context_fmha:
-        if (model.config.quant_mode.has_fp8_kv_cache()
-                and not model.config.quant_mode.has_fp8_qdq()):
-            raise RuntimeError(
-                "FP8 Paged Context FMHA only works with fp8 quantization workflow currently."
-            )
-        if (model.config.quant_mode.has_fp8_kv_cache()
-                and not network.plugin_config.use_fp8_context_fmha):
-            network.plugin_config.set_plugin("use_fp8_context_fmha", True)
-            logger.warning(
-                "FP8 Context FMHA is enabled by default to support FP8 Paged Context FMHA."
-            )
-        if model.config.quant_mode.has_int8_kv_cache():
-            raise RuntimeError(
-                "Paged Context FMHA doesn't work with int8 kv cache currently.")
     # we will remove this later when XQA supports quantized fp8 output.
     if network.plugin_config.use_fp8_context_fmha:
-        network.plugin_config.set_plugin("enable_xqa", False)
+        network.plugin_config.enable_xqa = False
         logger.warning(
             "The XQA kernel is disabled by default as it doesn't support fp8 attention plugin output currently."
         )
@@ -811,6 +834,12 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
                 "max_decoder_input_len"] = build_config.max_input_len
             prepare_input_args[
                 "max_encoder_input_len"] = build_config.max_encoder_input_len
+
+        if model.config.architecture == "WhisperEncoder":
+
+            prepare_input_args = {
+                "max_batch_size": build_config.max_batch_size,
+            }
 
         inputs = model.prepare_inputs(**prepare_input_args)
         model(**inputs)
