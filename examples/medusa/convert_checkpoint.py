@@ -979,7 +979,7 @@ def convert_hf_llama(hf_model,
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
-    print(f'Weights loaded. Total time: {t}')
+    logger.info(f'Weights loaded. Total time: {t}')
     return weights
 
 
@@ -989,7 +989,7 @@ if __name__ == '__main__':
     # which is included in tensorrt_llm Python package. Otherwise, the convert
     # script does not need to import tensorrt_llm. Will remove it after reimplementing
     # the op with PyTorch.
-    print(tensorrt_llm.__version__)
+    logger.info(tensorrt_llm.__version__)
     args = parse_arguments()
     world_size = args.tp_size * args.pp_size
 
@@ -1196,7 +1196,7 @@ if __name__ == '__main__':
                         is_ckpt_safetensors = True
                     
                     if is_ckpt_safetensors:
-                        print("Safetensors Found ...")
+                        logger.info("Safetensors Found ...")
                         from safetensors.torch import load_file
                         state_dict = load_file(ckpt_file)
                     else:
@@ -1281,4 +1281,4 @@ if __name__ == '__main__':
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
-    print(f'Total time of converting checkpoints: {t}')
+    logger.info(f'Total time of converting checkpoints: {t}')
