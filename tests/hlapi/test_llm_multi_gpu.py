@@ -7,7 +7,8 @@ import pytest
 import torch
 from parameterized import parameterized
 
-from tensorrt_llm.hlapi.llm import LLM, KvCacheConfig, ModelConfig
+from tensorrt_llm.hlapi.llm import (LLM, KvCacheConfig, ModelConfig,
+                                    SamplingConfig)
 from tensorrt_llm.hlapi.tokenizer import TransformersTokenizer
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -98,8 +99,10 @@ def test_llm_generate_tp2(engine_from_checkpoint):
                          ids=["enable_auto_parallel", "disable_auto_parallel"])
 def test_llm_generate_async_tp2(
         use_auto_parallel, engine_from_checkpoint: tempfile.TemporaryDirectory):
-    model_dir = engine_from_checkpoint.name if not use_auto_parallel else default_model_name
-    tokenizer = TransformersTokenizer.from_pretrained(llama_model_path)
+    model_dir = engine_from_checkpoint.name if not use_auto_parallel else get_model_path(
+        llama_model_path)
+    tokenizer_dir = get_model_path(llama_model_path)
+    tokenizer = TransformersTokenizer.from_pretrained(tokenizer_dir)
     _test_llm_generate_async(
         model_dir,
         tp_size=2,
@@ -143,8 +146,9 @@ def test_llm_pp2():
         config,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
     )
-    sampling_config = llm.get_default_sampling_config()
+    sampling_config = SamplingConfig()
     sampling_config.max_new_tokens = 8
+    sampling_config.beam_width = 1
     for output in llm.generate(prompts, sampling_config=sampling_config):
         print(output)
         assert output.text == "D E F G H I J K"

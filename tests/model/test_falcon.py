@@ -169,11 +169,11 @@ class TestFalcon(unittest.TestCase):
         network = builder.create_network()
         network.plugin_config.to_legacy_setting()
         if use_gpt_attengion_plugin:
-            network.plugin_config.set_gpt_attention_plugin(dtype)
+            network.plugin_config.gpt_attention_plugin = dtype
         if use_gemm_plugin:
-            network.plugin_config.set_gemm_plugin(dtype)
+            network.plugin_config.gemm_plugin = dtype
         if enable_remove_input_padding:
-            network.plugin_config.enable_remove_input_padding()
+            network.plugin_config.remove_input_padding = True
         if world_size > 1:
             network.plugin_config.set_nccl_plugin(dtype)
         network.plugin_config.set_context_fmha(context_fmha_type)

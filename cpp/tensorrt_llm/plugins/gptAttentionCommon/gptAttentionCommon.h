@@ -38,7 +38,7 @@ public:
     GPTAttentionPluginCommon() = delete;
 
     GPTAttentionPluginCommon(int layer_idx, int num_heads, int vision_start, int vision_length, int num_kv_heads,
-        int head_size, int unidirectional, float q_scaling,
+        int head_size, int unidirectional, float q_scaling, float qk_tanh_scale,
         tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
         int rotary_embedding_dim, // for RoPE. Use 0 for non-RoPE
         float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
@@ -77,7 +77,7 @@ public:
 
     size_t getCommonSerializationSize() const noexcept;
     void serializeCommon(void* buffer) const noexcept;
-    int const getHeadSize(bool checkInit = true) const;
+    int getHeadSize(bool checkInit = true) const;
 
 protected:
     int getMaxNumSeqLenTile(int batch_beam_size = 1) const;
@@ -290,6 +290,7 @@ protected:
     int mHeadSize;
     int mUnidirectional;
     float mQScaling;
+    float mQKTanhScale;
     int mRotaryEmbeddingDim;
     float mRotaryEmbeddingBase;
     tensorrt_llm::kernels::RotaryScalingType mRotaryEmbeddingScaleType;

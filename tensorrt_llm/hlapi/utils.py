@@ -1,3 +1,5 @@
+import os
+import signal
 import sys
 import traceback
 from dataclasses import dataclass, field
@@ -7,63 +9,109 @@ from typing import List, Optional, Union
 
 import torch
 
-import tensorrt_llm.bindings as tllm
+from tensorrt_llm.bindings import executor as tllme
+
+from ..bindings.executor import OutputConfig
 
 
-class SamplingConfig(tllm.SamplingConfig):
-    ''' The sampling config for the generation. '''
+def print_traceback_on_error(func):
 
-    # TODO[chunweiy]: switch to the cpp executor's once ready
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            traceback.print_exc()
+            raise e
+
+    return wrapper
+
+
+class SamplingConfig(tllme.SamplingConfig):
+
     def __init__(self,
                  end_id: Optional[int] = None,
                  pad_id: Optional[int] = None,
-                 beam_width: int = 1,
-                 max_new_tokens: Optional[int] = None) -> None:
-        super().__init__(beam_width)
+                 max_new_tokens: Optional[int] = None,
+                 *args,
+                 **kwargs):
+        super().__init__(*args, **kwargs)
+        # Patch some configs from cpp Request here, since they are attached to each prompt while
+        # it we won't introduce the Request concept in the generate() API.
         self.end_id = end_id
         self.pad_id = pad_id if pad_id is not None else end_id
         self.max_new_tokens = max_new_tokens
 
-    def __setstate__(self, arg0: tuple) -> None:
-        self.end_id = arg0[0]
-        self.pad_id = arg0[1]
-        self.max_new_tokens = arg0[2]
-        super().__setstate__(arg0[3:])
+    def _get_member_names(self):
+        return ("beam_width", "top_k", "top_p", "top_p_min", "top_p_reset_ids",
+                "top_p_decay", "random_seed", "temperature", "min_length",
+                "beam_search_diversity_rate", "repetition_penalty",
+                "presence_penalty", "frequency_penalty", "length_penalty",
+                "early_stopping")
 
+    def __eq__(self, other):
+        return all(getattr(self, name) == getattr(other, name) for name in self._get_member_names()) and \
+               self.end_id == other.end_id and self.pad_id == other.pad_id and self.max_new_tokens == other.max_new_tokens
+
+    @print_traceback_on_error
+    def __setstate__(self, args: tuple) -> None:
+        assert len(args) == 3 + len(self._get_member_names())
+        kwargs = {
+            'end_id': args[0],
+            'pad_id': args[1],
+            'max_new_tokens': args[2]
+        }
+        kwargs.update({
+            key: value
+            for key, value in zip(self._get_member_names(), args[3:])
+            if value is not None
+        })
+        # The C++ class's constructor is not properly called by pickle, so we need to call it manually.
+        self.__init__(**kwargs)
+
+    @print_traceback_on_error
     def __getstate__(self) -> tuple:
-        return (self.end_id, self.pad_id,
-                self.max_new_tokens) + super().__getstate__()
-
-    def get_attr_names(self):
-        return list(self.__dict__.keys()) + [
-            "beam_search_diversity_rate",
-            "beam_width",
-            "early_stopping",
-            "frequency_penalty",
-            "length_penalty",
-            "min_length",
-            "presence_penalty",
-            "random_seed",
-            "repetition_penalty",
-            "temperature",
-            "top_k",
-            "top_p",
-            "top_p_decay",
-            "top_p_min",
-            "top_p_reset_ids",
-        ]
+        args = (self.end_id, self.pad_id, self.max_new_tokens) + tuple(
+            getattr(self, name) for name in self._get_member_names())
+        return args
 
     def __repr__(self):
-        return f"SamplingConfig(" + ", ".join(
-            f"{k}={getattr(self, k)}" for k in self.get_attr_names()
-            if getattr(self, k) is not None) + ")"
+        return f"SamplingConfig({', '.join(f'{name}={getattr(self, name)}' for name in self._get_member_names())})"
+
+
+class OutputConfig(OutputConfig):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Alter several default values for HLAPI usage.
+        if "exclude_input_from_output" not in kwargs:
+            self.exclude_input_from_output = True
+
+    def __eq__(self, other: "OutputConfig") -> bool:
+        return self.__getstate__() == other.__getstate__()
+
+    def __getstate__(self):
+        return {
+            "exclude_input_from_output": self.exclude_input_from_output,
+            "return_log_probs": self.return_log_probs,
+            "return_context_logits": self.return_context_logits,
+            "return_generation_logits": self.return_generation_logits,
+        }
+
+    def __setstate__(self, state):
+        self.exclude_input_from_output = state["exclude_input_from_output"]
+        self.return_log_probs = state["return_log_probs"]
+        self.return_context_logits = state["return_context_logits"]
+        self.return_generation_logits = state["return_generation_logits"]
 
 
 @dataclass
 class GenerationOutput:
     text: str = ""
     token_ids: Union[List[int], List[List[int]]] = field(default_factory=list)
-    logprobs: List[float] = field(default_factory=list)
+    log_probs: Optional[List[float]] = None
+    context_logits: Optional[torch.Tensor] = None
+    generation_logits: Optional[torch.Tensor] = None
 
 
 def print_colored(message, color: str = None):
@@ -93,19 +141,6 @@ def file_with_glob_exists(directory, glob) -> bool:
 
 def file_with_suffix_exists(directory, suffix) -> bool:
     return file_with_glob_exists(directory, f'*{suffix}')
-
-
-def print_traceback_on_error(func):
-
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        try:
-            return func(*args, **kwargs)
-        except Exception as e:
-            traceback.print_exc()
-            raise e
-
-    return wrapper
 
 
 def get_device_count() -> int:
@@ -150,3 +185,22 @@ class ContextManager:
 
 def is_directory_empty(directory: Path) -> bool:
     return not any(directory.iterdir())
+
+
+def suppress_runtime_log():
+    ''' Suppress the runtime log if the environment variable is not set.  '''
+
+    if "TLLM_LOG_LEVEL" not in os.environ:
+        os.environ["TLLM_LOG_LEVEL"] = "ERROR"
+    if "TLLM_LOG_FIRST_RANK_ONLY" not in os.environ:
+        os.environ["TLLM_LOG_FIRST_RANK_ONLY"] = "ON"
+
+
+def sigint_handler(signal, frame):
+    sys.stderr.write("\nSIGINT received, quit LLM!\n")
+    sys.exit(1)
+
+
+# Register the signal handler to handle SIGINT
+# This helps to deal with user's Ctrl+C
+signal.signal(signal.SIGINT, sigint_handler)

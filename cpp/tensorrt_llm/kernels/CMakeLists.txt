@@ -18,12 +18,9 @@
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
 
-# Exclude files in the cutlass_kernels, contextFusedMultiHeadAttention and
-# unfusedAttentionKernels folder
+# Exclude files in the cutlass_kernels and unfusedAttentionKernels folder
 list(FILTER SRC_CPP EXCLUDE REGEX "cutlass_kernels/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "cutlass_kernels/.*")
-list(FILTER SRC_CPP EXCLUDE REGEX "contextFusedMultiHeadAttention/.*")
-list(FILTER SRC_CU EXCLUDE REGEX "contextFusedMultiHeadAttention/.*")
 list(FILTER SRC_CPP EXCLUDE REGEX "decoderMaskedMultiheadAttention/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "decoderMaskedMultiheadAttention/.*")
 
@@ -37,4 +34,3 @@ set_property(TARGET kernels_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
 add_subdirectory(cutlass_kernels)
 add_subdirectory(decoderMaskedMultiheadAttention)
-add_subdirectory(contextFusedMultiHeadAttention)

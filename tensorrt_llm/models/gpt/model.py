@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
-
 from ..._utils import pad_vocab_size
 from ...functional import (Tensor, is_gated_activation, non_gated_version, recv,
                            send)
@@ -93,6 +91,7 @@ class GPTDecoderLayer(Module):
             num_kv_heads=config.num_key_value_heads,
             max_position_embeddings=config.max_position_embeddings,
             num_layers=config.num_hidden_layers,
+            q_scaling=config.q_scaling,
             apply_query_key_layer_scaling=config.apply_query_key_layer_scaling,
             dtype=config.dtype,
             attention_mask_type=AttentionMaskType.causal,
@@ -143,7 +142,8 @@ class GPTDecoderLayer(Module):
                 use_cache=False,
                 kv_cache_params=None,
                 attention_params=None,
-                lora_layer_params=None):
+                lora_layer_params=None,
+                spec_decoding_params=None):
 
         assert isinstance(hidden_states, Tensor)
 
@@ -183,12 +183,12 @@ class GPTModel(Module):
         super().__init__()
         self.mapping = config.mapping
         self.position_embedding_type = config.position_embedding_type
-        self.embed_scale = math.sqrt(config.hidden_size) if hasattr(
-            config, "scale_embedding") and config.scale_embedding else 1.0
         if config.mapping.is_first_pp_rank():
             self.vocab_embedding = Embedding(config.vocab_size,
                                              config.hidden_size,
                                              dtype=config.dtype)
+
+            self.embedding_scale = config.embedding_scale
 
             if config.position_embedding_type == PositionEmbeddingType.learned_absolute:
                 self.position_embedding = Embedding(
@@ -214,13 +214,15 @@ class GPTModel(Module):
                 prompt_embedding_table=None,
                 prompt_tasks=None,
                 prompt_vocab_size=None,
-                lora_params=None):
+                lora_params=None,
+                spec_decoding_params=None):
         if self.mapping.is_first_pp_rank():
             ptuning_args = [
                 prompt_embedding_table, prompt_tasks, prompt_vocab_size
             ] if prompt_embedding_table is not None else []
             hidden_states = self.vocab_embedding(input_ids, *ptuning_args)
-            hidden_states = hidden_states * self.embed_scale
+            if self.embedding_scale is not None:
+                hidden_states *= self.embedding_scale
             if self.position_embedding_type == PositionEmbeddingType.learned_absolute:
                 hidden_states = hidden_states + self.position_embedding(
                     position_ids)
@@ -232,7 +234,8 @@ class GPTModel(Module):
                                     attention_mask=attention_mask,
                                     kv_cache_params=kv_cache_params,
                                     attention_params=attention_params,
-                                    lora_params=lora_params)
+                                    lora_params=lora_params,
+                                    spec_decoding_params=spec_decoding_params)
         if use_cache:
             hidden_states, presents = hidden_states
 
@@ -268,6 +271,8 @@ class GPTForCausalLM(DecoderModelForCausalLM):
 
     def check_config(self, config: PretrainedConfig):
         config.set_if_not_exist('bias', True)
+        config.set_if_not_exist('q_scaling', 1)
+        config.set_if_not_exist('embedding_scale', None)
         config.set_if_not_exist('apply_query_key_layer_scaling', False)
         config.set_if_not_exist('rotary_pct', 1.0)
         config.set_if_not_exist('rotary_base', 10000.0)

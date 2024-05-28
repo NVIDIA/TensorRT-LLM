@@ -1149,7 +1149,9 @@ class GenerationSession(object):
                 self.presence_penalty, self.frequency_penalty, self.min_length,
                 self.host_length_penalty, self.host_early_stopping,
                 self.beam_search_diversity_rate, self.random_seed,
-                self.top_p_decay, self.top_p_min, self.top_p_reset_ids)
+                self.top_p_decay, self.top_p_min, self.top_p_reset_ids,
+                scfg.output_log_probs, scfg.num_beams > 1
+                or scfg.output_cum_log_probs)
 
         assert scfg.end_id is not None, "end_id cannot be none"
         assert scfg.pad_id is not None, 'pad_id cannot be none'
@@ -3072,6 +3074,10 @@ class GenerationSession(object):
                 if self.is_medusa_mode:
                     # just hack away for now
                     final_output_ids = self.output_ids.clone().unsqueeze(1)
+                    final_output_ids = final_output_ids[:, :, :self.
+                                                        max_seq_length -
+                                                        self._model_config.
+                                                        max_medusa_tokens]
                 else:
                     final_output_ids = self.finalize_decoder(
                         context_lengths, batch_size, beam_width, scfg)
@@ -3396,7 +3402,8 @@ class GenerationSession(object):
             stop_words_list_ptrs = torch.zeros((batch_size), dtype=torch.int64)
             for bi in range(batch_size):
                 stop_words_list_ptrs[bi] = stop_words_list.data_ptr(
-                ) + bi * 2 * max_stop_words_len
+                ) + bi * 2 * max_stop_words_len * stop_words_list.element_size(
+                )
             stop_words_list_ptrs = stop_words_list_ptrs.to('cuda')
         stop_words_data = (stop_words_list_ptrs, stop_words_lens,
                            max_stop_words_len)
@@ -3412,7 +3419,7 @@ class GenerationSession(object):
             bad_words_list_ptrs = torch.zeros((batch_size), dtype=torch.int64)
             for bi in range(batch_size):
                 bad_words_list_ptrs[bi] = bad_words_list.data_ptr(
-                ) + bi * 2 * max_bad_words_len
+                ) + bi * 2 * max_bad_words_len * bad_words_list.element_size()
             bad_words_list_ptrs = bad_words_list_ptrs.to('cuda')
         bad_words_data = (bad_words_list_ptrs, bad_words_lens,
                           max_bad_words_len)

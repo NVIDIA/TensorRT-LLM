@@ -207,8 +207,9 @@ __device__ __nv_bfloat16 atomicMaxExtd(__nv_bfloat16* address, __nv_bfloat16 val
 
     return __ushort_as_bfloat16(old);
 #else
-    asm volatile("  brkpt;\n");
-    return 0;
+    assert(0);
+    asm volatile("brkpt;\n" ::);
+    return __nv_bfloat16(0);
 #endif
 }
 

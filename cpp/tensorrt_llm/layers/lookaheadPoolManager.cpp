@@ -7,6 +7,11 @@ namespace tensorrt_llm::layers
 
 using namespace tensorrt_llm::runtime;
 
+void LookaheadPoolManager::clear(void)
+{
+    mTokenMap.clear();
+}
+
 void LookaheadPoolManager::insertOne(Key key, TensorPtr ngram)
 {
     auto search = mTokenMap.find(key);

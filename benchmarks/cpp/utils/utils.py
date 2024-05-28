@@ -43,7 +43,17 @@ def dataset_dump(input_lens, input_ids, output_lens, task_ids, metadata,
                    task_id=task_ids[i]))
     workload = Workload(metadata=metadata, samples=samples)
     with open(output_file, 'w') as f:
-        json.dump(workload.dict(), f)
+        json.dump(workload.model_dump(), f)
+
+
+def print_dataset(input_ids, output_lens):
+    for i, input_tokens in enumerate(input_ids):
+        d = {
+            "task_id": i,
+            "logits": input_tokens,
+            "output_tokens": output_lens[i]
+        }
+        print(json.dumps(d, separators=(',', ':'), ensure_ascii=False))
 
 
 def get_list_of_delays(delay_dist, mean_time_bet_reqs, num_reqs, random_seed):

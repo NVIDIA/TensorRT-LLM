@@ -53,8 +53,8 @@ protected:
         std::cout << medusaHeads << " " << maxMedusaTokens << std::endl;
 
         MedusaModule medusaModule(medusaHeads, maxMedusaTokens);
-        auto const numPackedMasks = medusaModule.numPackedMasks();
-        auto const tokensPerStep = medusaModule.tokensPerStep();
+        auto const numPackedMasks = medusaModule.getNumPackedMasks();
+        auto const tokensPerStep = medusaModule.getMaxDraftTokens() + 1;
 
         // batch size = 1 here.
         TensorPtr medusaGenerationLengthsHost = mManager->pinned(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);

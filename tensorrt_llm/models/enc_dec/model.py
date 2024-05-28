@@ -1582,6 +1582,13 @@ class DecoderModel(PretrainedModel):
                         # use encoder_output directly, no need to save cross_past_key_value
                         past_key_value.append((kv, ))
 
+                # TODO: Remove this when TRT fix the named dimension
+                if not remove_input_padding:
+                    assertion(
+                        shape(
+                            input_ids if self.mapping.is_first_pp_rank() else
+                            hidden_states, 0) == shape(kv, 0), 'batch size')
+
             else:  # paged_kv_cache == True
                 # PagedKV setup for KV cache of self-attention
                 max_blocks_per_seq_range = [[
@@ -1661,13 +1668,6 @@ class DecoderModel(PretrainedModel):
 
                 for i in layers_range:
                     past_key_value.append(None)
-
-            # TODO: Remove this when TRT fix the named dimension
-            if not remove_input_padding:
-                assertion(
-                    shape(
-                        input_ids if self.mapping.is_first_pp_rank() else
-                        hidden_states, 0) == shape(kv, 0), 'batch size')
 
             kv_cache_params = KeyValueCacheParams(
                 past_key_value=past_key_value,
@@ -1751,36 +1751,44 @@ class DecoderModel(PretrainedModel):
         use_lora(self, lora_config, self.trtllm_modules_to_hf_modules)
 
 
-class WhisperEncoder(Module):
+class WhisperEncoder(PretrainedModel):
 
-    def __init__(self, n_mels: int, n_ctx: int, n_state: int, n_head: int,
-                 n_layer: int, dtype):
-        super().__init__()
-        self.n_mels = n_mels
-        self.conv1 = Conv1d(n_mels, n_state, kernel_size=3, padding=1)
-        self.conv2 = Conv1d(n_state,
-                            n_state,
+    def __init__(self, config: PretrainedConfig):
+        super().__init__(config)
+        self.conv1 = Conv1d(config.n_mels,
+                            config.hidden_size,
+                            kernel_size=3,
+                            padding=1)
+        self.conv2 = Conv1d(config.hidden_size,
+                            config.hidden_size,
                             kernel_size=3,
                             stride=2,
                             padding=1)
-        self.positional_embedding = Parameter(shape=(n_ctx, n_state),
-                                              dtype=dtype)
+
+        if isinstance(self.config.dtype, str):
+            self._dtype = str_dtype_to_trt(self.config.dtype)
+        else:
+            assert isinstance(self.config.dtype, trt.DataType)
+            self._dtype = self.config.dtype
+        self.positional_embedding = Parameter(shape=(config.n_audio_ctx,
+                                                     config.hidden_size),
+                                              dtype=self._dtype)
         self.encoder_layers = ModuleList([
-            EncoderLayer(hidden_size=n_state,
-                         ffn_hidden_size=n_state * 4,
-                         num_attention_heads=n_head,
-                         num_kv_heads=n_head,
-                         head_size=n_state // n_head,
-                         max_position_embeddings=3000,
-                         q_scaling=1.0,
-                         has_attention_qkvo_bias=True,
-                         has_mlp_bias=True,
-                         hidden_act='gelu',
-                         dtype=dtype) for _ in range(n_layer)
+            EncoderLayer(
+                hidden_size=config.hidden_size,
+                ffn_hidden_size=config.hidden_size * 4,
+                num_attention_heads=config.num_attention_heads,
+                num_kv_heads=config.num_attention_heads,
+                head_size=config.hidden_size // config.num_attention_heads,
+                max_position_embeddings=3000,
+                q_scaling=1.0,
+                has_attention_qkvo_bias=True,
+                has_mlp_bias=True,
+                hidden_act='gelu',
+                dtype=self._dtype) for _ in range(config.num_hidden_layers)
         ])
 
-        self.ln_post = LayerNorm(n_state)
-        self._dtype = dtype
+        self.ln_post = LayerNorm(config.hidden_size)
 
     def forward(self, x: Tensor, input_lengths=None):
 
@@ -1807,10 +1815,10 @@ class WhisperEncoder(Module):
 
         x = Tensor(name="x",
                    dtype=self._dtype,
-                   shape=[-1, self.n_mels, 3000],
+                   shape=[-1, self.config.n_mels, 3000],
                    dim_range=OrderedDict([
                        ("batch_size", [bs_range]),
-                       ("feature_dim", [self.n_mels]),
+                       ("feature_dim", [self.config.n_mels]),
                        ("feature_len_range", [3000]),
                    ]))
         input_lengths = Tensor(
@@ -1819,4 +1827,5 @@ class WhisperEncoder(Module):
             shape=[-1],
             dim_range=OrderedDict([("batch_size", [bs_range])]),
         )
-        return (x, input_lengths)
+
+        return {'x': x, 'input_lengths': input_lengths}

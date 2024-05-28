@@ -293,7 +293,7 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
     def default_plugin_config(self, **kwargs):
         plugin_config = super().default_plugin_config(**kwargs)
         if self.quant_mode.is_int4_weight_only_per_group():
-            plugin_config.set_weight_only_groupwise_quant_matmul_plugin()
+            plugin_config.weight_only_groupwise_quant_matmul_plugin = 'auto'
         return plugin_config
 
     @classmethod
@@ -369,6 +369,7 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
         *,
         dtype='float16',
         mapping: Optional[Mapping] = None,
+        calib_dataset='cnn_dailymail',
         calib_batches=512,
         calib_batch_size=1,
         random_seed=1234,
@@ -386,6 +387,7 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
                              quant_config,
                              dtype=dtype,
                              mapping=mapping,
+                             calib_dataset=calib_dataset,
                              calib_batches=calib_batches,
                              calib_batch_size=calib_batch_size,
                              random_seed=random_seed,
@@ -408,6 +410,7 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
                 output_dir,
                 mapping,
                 quant_config,
+                calib_dataset=calib_dataset,
                 override_fields=kwargs.get('override_fields', {}),
                 dataset_cache_dir=kwargs.get('dataset_cache_dir', None),
             )

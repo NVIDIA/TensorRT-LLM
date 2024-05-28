@@ -216,7 +216,7 @@ void BaseSamplingLayerTest<T>::runTest(
             // Reset by the test value since the sampling layer internally updates the logit buffer.
             batchCopy(step);
             inputTensors->step = step;
-            mSamplingLayer->forward(outputTensors, inputTensors);
+            mSamplingLayer->forwardAsync(outputTensors, inputTensors);
             mStream->synchronize();
         }
 

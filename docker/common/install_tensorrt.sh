@@ -4,15 +4,16 @@ set -ex
 
 TRT_VER="10.0.1.6"
 # Align with the pre-installed cuDNN / cuBLAS / NCCL versions from
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-03.html#rel-24-03
-CUDA_VER="12.4" # 12.4.0
-# cuDNN v8 is still needed by PyTorch v2.2.2
-CUDNN_VER="8.9.7.29-1+cuda12.2"
-NCCL_VER="2.20.5-1+cuda12.4"
-CUBLAS_VER="12.4.2.65-1"
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-04.html#rel-24-04
+CUDA_VER="12.4" # 12.4.1
+# Keep the installation for cuDNN if users want to install PyTorch with source codes.
+# PyTorch 2.3.0 can compile with cuDNN v9.
+CUDNN_VER="9.1.0.70-1"
+NCCL_VER="2.21.5-1+cuda12.4"
+CUBLAS_VER="12.4.5.8-1"
 # Align with the pre-installed CUDA / NVCC / NVRTC versions from
-# https://docs.nvidia.com/cuda/archive/12.4.0/cuda-toolkit-release-notes/index.html
-NVRTC_VER="12.4.99-1"
+# https://docs.nvidia.com/cuda/archive/12.4.1/cuda-toolkit-release-notes/index.html
+NVRTC_VER="12.4.127-1"
 
 for i in "$@"; do
     case $i in
@@ -41,8 +42,8 @@ install_ubuntu_requirements() {
     dpkg -i cuda-keyring_1.0-1_all.deb
 
     apt-get update
-    if [[ $(apt list --installed | grep libcudnn8) ]]; then
-      apt-get remove --purge -y libcudnn8*
+    if [[ $(apt list --installed | grep libcudnn9) ]]; then
+      apt-get remove --purge -y libcudnn9*
     fi
     if [[ $(apt list --installed | grep libnccl) ]]; then
       apt-get remove --purge -y --allow-change-held-packages libnccl*
@@ -54,7 +55,7 @@ install_ubuntu_requirements() {
       apt-get remove --purge -y --allow-change-held-packages cuda-nvrtc-dev*
     fi
     CUBLAS_CUDA_VERSION=$(echo $CUDA_VER | sed 's/\./-/g')
-    apt-get install -y --no-install-recommends libcudnn8=${CUDNN_VER} libcudnn8-dev=${CUDNN_VER}
+    apt-get install -y --no-install-recommends libcudnn9-cuda-12=${CUDNN_VER} libcudnn9-dev-cuda-12=${CUDNN_VER}
     apt-get install -y --no-install-recommends libnccl2=${NCCL_VER} libnccl-dev=${NCCL_VER}
     apt-get install -y --no-install-recommends libcublas-${CUBLAS_CUDA_VERSION}=${CUBLAS_VER} libcublas-dev-${CUBLAS_CUDA_VERSION}=${CUBLAS_VER}
     # NVRTC static library doesn't exist in NGC PyTorch container.
@@ -65,11 +66,9 @@ install_ubuntu_requirements() {
 }
 
 install_centos_requirements() {
-    CUDNN_VER=$(echo $CUDNN_VER | sed 's/+/./g')
     CUBLAS_CUDA_VERSION=$(echo $CUDA_VER | sed 's/\./-/g')
     yum -y update
     yum -y install epel-release
-    yum remove -y libcudnn* && yum -y install libcudnn8-${CUDNN_VER} libcudnn8-devel-${CUDNN_VER}
     yum remove -y libnccl* && yum -y install libnccl-${NCCL_VER} libnccl-devel-${NCCL_VER}
     yum remove -y libcublas* && yum -y install libcublas-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER} libcublas-devel-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}
     yum clean all

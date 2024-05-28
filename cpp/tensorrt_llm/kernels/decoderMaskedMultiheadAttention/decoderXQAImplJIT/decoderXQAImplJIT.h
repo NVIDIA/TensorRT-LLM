@@ -41,6 +41,8 @@ protected:
         XQAParams const& xqaParams, KVBlockArray const& kv_block_array, cudaStream_t const& stream) override;
 
 private:
+    std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> mDriver;
+
     void initSupportedConfigs();
     //! Whether DecoderXQAImplJIT supports xqaParams.
     bool supportConfig(XQAParams const& xqaParams) const;

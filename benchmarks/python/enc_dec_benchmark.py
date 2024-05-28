@@ -103,6 +103,7 @@ class EncDecBenchmark(BaseBenchmark):
                     remove_input_padding=config["plugin_config"]
                     ["remove_input_padding"],
                     cross_attention=config["builder_config"]["cross_attention"],
+                    skip_cross_qkv=config["builder_config"]["skip_cross_qkv"],
                     has_position_embedding=config["builder_config"]
                     ["has_position_embedding"],
                     has_token_type_embedding=config["builder_config"]

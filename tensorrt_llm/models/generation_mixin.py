@@ -315,6 +315,7 @@ class GenerationMixin:
             max_beam_width,
             max_input_len,
             max_seq_len,
+            hidden_size,
             num_kv_heads,
             head_size,
             num_layers,
@@ -387,13 +388,12 @@ class GenerationMixin:
                 max_batch_size * max(tokens_per_engine_step, max_beam_width))
             num_tokens_range = [num_tokens_range_ctx, num_tokens_range_gen]
         else:
-            max_bs_x_max_bw = max_batch_size * max_beam_width
-            if opt_num_tokens is None:
-                opt_num_tokens = max_bs_x_max_bw
             if multiple_profiles:
                 num_tokens_range = GenerationMixin.split_num_tokens_range(
                     max_num_tokens)
             else:
+                if opt_num_tokens is None:
+                    opt_num_tokens = max_batch_size * max_beam_width
                 num_tokens_range = [[1, opt_num_tokens, max_num_tokens]]
             num_profiles = len(num_tokens_range)
             bb_range = [bb_range_gen] * num_profiles
@@ -442,11 +442,12 @@ class GenerationMixin:
                 hidden_states = Tensor(
                     name='hidden_states_input',
                     dtype=dtype,
-                    shape=[-1, head_size * num_heads],
+                    shape=[-1, hidden_size],
                     dim_range=OrderedDict([
                         ('num_tokens', num_tokens_range),
-                        ('hidden_size', [head_size * num_heads] * num_profiles),
-                    ]))
+                        ('hidden_size', [hidden_size] * num_profiles),
+                    ]),
+                )
 
         else:
             if mapping.is_first_pp_rank():
@@ -486,12 +487,13 @@ class GenerationMixin:
                 hidden_states = Tensor(
                     name='hidden_states_input',
                     dtype=dtype,
-                    shape=[-1, -1, head_size * num_heads],
+                    shape=[-1, -1, hidden_size],
                     dim_range=OrderedDict([
                         ('batch_size_beam_width', bb_range),
                         ('input_len', inlen_range),
-                        ('hidden_size', [head_size * num_heads] * num_profiles),
-                    ]))
+                        ('hidden_size', [hidden_size] * num_profiles),
+                    ]),
+                )
 
         if use_custom_all_reduce and mapping.tp_size > 1:
             current_all_reduce_helper().set_workspace_tensor(
@@ -501,8 +503,6 @@ class GenerationMixin:
         tasks = None
         prompt_vocab_size = None
         if prompt_embedding_table_size > 0:
-            assert num_heads is not None
-            hidden_size = num_heads * head_size
             _p_embedding_range = [
                 1, prompt_embedding_table_size // 2, prompt_embedding_table_size
             ]

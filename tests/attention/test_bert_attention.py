@@ -59,7 +59,7 @@ class TestFunctional(unittest.TestCase):
             builder = tensorrt_llm.Builder()
             net = builder.create_network()
             net.plugin_config.to_legacy_setting()
-            net.plugin_config.set_bert_attention_plugin(dtype)
+            net.plugin_config.bert_attention_plugin = dtype
             net.plugin_config.set_context_fmha(context_fmha_type)
             with tensorrt_llm.net_guard(net):
                 network = tensorrt_llm.default_trtnet()

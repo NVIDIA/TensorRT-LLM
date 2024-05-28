@@ -68,6 +68,13 @@ def parse_arguments():
         'You must also use --use_weight_only for that argument to have an impact.'
     )
     parser.add_argument(
+        '--calib_dataset',
+        type=str,
+        default='ccdv/cnn_dailymail',
+        help=
+        "The huggingface dataset name or the local directory of the dataset for calibration."
+    )
+    parser.add_argument(
         "--smoothquant",
         "-sq",
         type=float,
@@ -307,9 +314,14 @@ def preload_model(model_dir, load_model_on_cpu):
     if "vila" in model_dir:
         use_safetensors = False
         sys.path.append(model_dir + "/../VILA")
-        from llava.model import LlavaConfig, LlavaLlamaForCausalLM
-        AutoConfig.register("llava_llama", LlavaConfig)
-        AutoModelForCausalLM.register(LlavaConfig, LlavaLlamaForCausalLM)
+        from llava.model import LlavaLlamaConfig, LlavaLlamaModel  # noqa
+        from transformers import AutoModel
+        model = AutoModel.from_pretrained(
+            model_dir,
+            device_map='auto',
+            trust_remote_code=True,
+        )
+        return model.llm
 
     hf_config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
     model_cls = AutoModelForCausalLM
@@ -358,6 +370,7 @@ def convert_and_save_hf(args):
                                   quantization,
                                   dtype=args.dtype,
                                   mapping=mapping,
+                                  calib_dataset=args.calib_dataset,
                                   override_fields=override_fields,
                                   dataset_cache_dir=args.dataset_cache_dir)
     else:

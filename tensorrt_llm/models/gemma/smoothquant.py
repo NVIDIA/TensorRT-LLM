@@ -217,8 +217,8 @@ def capture_activation_range(model,
                     functools.partial(stat_input_hook, name=name)))
 
     for i in tqdm(range(num_samples), desc="calibrating model"):
-        datapoint = dataset['train'][i:i + 1]
-        line = copy.copy(datapoint['article'])
+        datapoint = dataset[i:i + 1]
+        line = copy.copy(datapoint)
         line[0] = line[0] + ' TL;DR: '
         line[0] = line[0].strip()
         line[0] = line[0].replace(" n't", "n't")

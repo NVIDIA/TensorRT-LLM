@@ -49,7 +49,7 @@ class TestQuantizationFunctional(unittest.TestCase):
         builder = tensorrt_llm.Builder()
         network = builder.create_network()
         if use_plugin:
-            network.plugin_config.set_quantize_tensor_plugin()
+            network.plugin_config.quantize_tensor_plugin = True
 
         with tensorrt_llm.net_guard(network):
             x = Tensor(name='x',
@@ -139,7 +139,7 @@ class TestQuantizationFunctional(unittest.TestCase):
         builder = tensorrt_llm.Builder()
         network = builder.create_network()
         if use_plugin:
-            network.plugin_config.set_quantize_per_token_plugin()
+            network.plugin_config.quantize_per_token_plugin = True
 
         with tensorrt_llm.net_guard(network):
             x = Tensor(name='x',

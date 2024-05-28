@@ -24,9 +24,9 @@ from tensorrt_llm._utils import str_dtype_to_trt
 from tensorrt_llm.layers.lora import LoraParams
 
 from .._common import default_net, default_trtnet
-from ..functional import (_create_tensor, allreduce, cast, div,
-                          is_gated_activation, non_gated_version, softmax, sum,
-                          topk)
+from ..functional import (_add_plugin_info, _create_tensor, allreduce, cast,
+                          div, is_gated_activation, non_gated_version, softmax,
+                          sum, topk)
 from ..layers import MLP, GatedMLP
 from ..module import Module, ModuleList
 from ..parameter import Parameter
@@ -210,6 +210,7 @@ def _moe_plugin(moe_config,
 
     plugin_inputs = [i.trt_tensor for i in plugin_inputs]
     layer = default_trtnet().add_plugin_v2(plugin_inputs, moe_plugin)
+    _add_plugin_info(layer, plugin_creator, "mixture_of_experts", pfc)
     if not default_net().strongly_typed:
         for ii in range(layer.num_inputs):
             if layer.get_input(ii).dtype == str_dtype_to_trt("int8"):

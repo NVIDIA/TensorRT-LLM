@@ -42,6 +42,9 @@ struct MaskedSoftmaxParam
     int k_length = 0;
     int num_heads = 0;
     T qk_scale = T(0.0f);
+    // always float compute data type.
+    float qk_tanh_scale = 0.f;
+    float qk_tanh_inverse_scale = 0.f;
 
     // Optional parameters that depend on the type of attention.
     // The slopes of the linear position bias of ALiBi.

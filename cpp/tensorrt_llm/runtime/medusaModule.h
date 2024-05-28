@@ -19,51 +19,26 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/speculativeDecodingModule.h"
 #include <vector>
 
 namespace tensorrt_llm::runtime
 {
 
-class MedusaModule
+class MedusaModule : public SpeculativeDecodingModule
 {
 public:
     using TensorPtr = ITensor::SharedPtr;
     using MedusaChoices = std::vector<std::vector<SizeType32>>;
 
-    explicit MedusaModule(SizeType32 medusaHeads, SizeType32 maxMedusaTokens) noexcept
-        : mMedusaHeads(medusaHeads)
-        , mMaxMedusaTokens(maxMedusaTokens)
-        , mTokensPerStep(mMaxMedusaTokens + 1)
+    explicit MedusaModule(SizeType32 maxAcceptedTokens, SizeType32 maxDraftTokens) noexcept
+        : SpeculativeDecodingModule(maxAcceptedTokens, maxDraftTokens)
     {
-        mNumPackedMasks = tensorrt_llm::common::divUp(mTokensPerStep, 32);
     }
 
     explicit MedusaModule() noexcept
         : MedusaModule(0, 0)
     {
-    }
-
-    MedusaModule(MedusaModule const& o) = default;
-    MedusaModule& operator=(MedusaModule const& o) = default;
-
-    [[nodiscard]] SizeType32 medusaHeads() const noexcept
-    {
-        return mMedusaHeads;
-    }
-
-    [[nodiscard]] SizeType32 maxMedusaTokens() const noexcept
-    {
-        return mMaxMedusaTokens;
-    }
-
-    [[nodiscard]] SizeType32 tokensPerStep() const noexcept
-    {
-        return mTokensPerStep;
-    }
-
-    [[nodiscard]] SizeType32 numPackedMasks() const noexcept
-    {
-        return mNumPackedMasks;
     }
 
     [[nodiscard]] MedusaChoices const& getMedusaChoices() const noexcept
@@ -99,10 +74,6 @@ private:
     void dumpChoices(MedusaChoices const& choices, std::vector<SizeType32> const& indices) const;
 
 private:
-    SizeType32 mMedusaHeads;
-    SizeType32 mMaxMedusaTokens;
-    SizeType32 mTokensPerStep;
-    SizeType32 mNumPackedMasks;
     // FIXME(nkorobov): this should come from outside to setup or per request
     // mc_sim_7b_63
     MedusaChoices mDefaultMedusaChoices = {{0}, {0, 0}, {1}, {0, 1}, {2}, {0, 0, 0}, {1, 0}, {0, 2}, {3}, {0, 3}, {4},

@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 #include <list>
 
+#include "tensorrt_llm/layers/lookaheadDecodingUtils.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 
 namespace tensorrt_llm::tests::layers
@@ -13,14 +14,57 @@ using TensorPtr = runtime::ITensor::SharedPtr;
 //! Initialize a tensor with data from string @param str. Shape {str.size} by default.
 TensorPtr initTensor(std::string str, std::optional<ITensor::Shape> shape = std::nullopt);
 
+template <typename T>
+class BufferLocation : BufferRange<T>
+{
+public:
+    using BufferRange<T>::begin;
+
+    BufferLocation(ITensor& t)
+        : BufferRange<T>(t)
+        , volumes(t.getShape().nbDims)
+    {
+        auto shape = t.getShape();
+        for (SizeType32 i = 0; i < shape.nbDims; i++)
+        {
+            SizeType32 volume = 1;
+            for (SizeType32 j = i + 1; j < shape.nbDims; j++)
+            {
+                volume *= shape.d[j];
+            }
+            volumes[i] = volume;
+        }
+    }
+
+    T& operator()(std::initializer_list<SizeType32> const& dims)
+    {
+        TLLM_CHECK(volumes.size() == dims.size());
+        SizeType32 offset = 0;
+        auto itd = dims.begin();
+        auto itv = volumes.begin();
+        for (; itd != dims.end() && itv != volumes.end(); itd++, itv++)
+        {
+            offset += (*itd) * (*itv);
+        }
+        return *(begin() + offset);
+    }
+
+private:
+    std::vector<SizeType32> volumes;
+};
+
 //! Convert tokens to logits and vice versa according to a vocabulary.
 class RandomTokenLogits
 {
 public:
-    RandomTokenLogits(std::string vocabulary)
-        : mVocabulary(initTensor(vocabulary))
+    RandomTokenLogits(TensorPtr vocab)
+        : mVocabulary(vocab)
     {
-        TLLM_CHECK(vocabulary.size() > 2);
+    }
+
+    RandomTokenLogits(std::string vocab)
+        : mVocabulary(initTensor(vocab))
+    {
     }
 
     TensorPtr tokenToLogits(TokenIdType token) const;
@@ -38,12 +82,40 @@ public:
 
     SizeType32 getVocabSize() const;
     //! @return the last token in mVocabulary as invalid token;
-    TokenIdType getInvalidToken() const;
+    virtual TokenIdType getInvalidToken() const;
     //! @return the second-to-last token in mVocabulary as end token;
-    TokenIdType getEndToken() const;
+    virtual TokenIdType getEndToken() const;
 
 private:
     TensorPtr const mVocabulary;
+};
+
+//! vocabulary is ascii table from 0 to 127. tokenId == token.
+class AsciiRandomTokenLogits : public RandomTokenLogits
+{
+public:
+    AsciiRandomTokenLogits()
+        : RandomTokenLogits(
+            []()
+            {
+                auto vocab = BufferManager::cpu(ITensor::makeShape({128}), nvinfer1::DataType::kINT32);
+                auto vocabRange = BufferRange<TokenIdType>(*vocab);
+                TokenIdType token{0};
+                std::for_each(vocabRange.begin(), vocabRange.end(), [&token](auto& v) { v = token++; });
+                return vocab;
+            }())
+    {
+    }
+
+    virtual TokenIdType getInvalidToken() const
+    {
+        return static_cast<TokenIdType>('#');
+    }
+
+    virtual TokenIdType getEndToken() const
+    {
+        return static_cast<TokenIdType>('&');
+    }
 };
 
 //! random LLM to simulate functions of a real LLM.

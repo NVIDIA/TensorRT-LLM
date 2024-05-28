@@ -30,9 +30,9 @@ public:
         return SpeculativeDecodingMode{kNone};
     }
 
-    static auto constexpr DraftModel()
+    static auto constexpr DraftTokensExternal()
     {
-        return SpeculativeDecodingMode{kDraftModel};
+        return SpeculativeDecodingMode{kDraftTokensExternal};
     }
 
     static auto constexpr Medusa()
@@ -50,9 +50,9 @@ public:
         return anyBitSet(kNone);
     }
 
-    bool constexpr isDraftModel() const
+    bool constexpr isDraftTokensExternal() const
     {
-        return anyBitSet(kDraftModel);
+        return anyBitSet(kDraftTokensExternal);
     }
 
     bool constexpr isMedusa() const
@@ -100,7 +100,7 @@ public:
 private:
     // No speculative decoding is used.
     static UnderlyingType constexpr kNone{1u << 0};
-    static UnderlyingType constexpr kDraftModel{1u << 1};
+    static UnderlyingType constexpr kDraftTokensExternal{1u << 1};
     static UnderlyingType constexpr kMedusa{1u << 2};
     static UnderlyingType constexpr kLookaheadDecoding{1u << 3};
 
@@ -118,23 +118,23 @@ private:
 };
 
 static_assert(SpeculativeDecodingMode::None().isNone());
-static_assert(!SpeculativeDecodingMode::None().isDraftModel());
+static_assert(!SpeculativeDecodingMode::None().isDraftTokensExternal());
 static_assert(!SpeculativeDecodingMode::None().isMedusa());
 static_assert(!SpeculativeDecodingMode::None().isLookaheadDecoding());
 
-static_assert(SpeculativeDecodingMode::DraftModel().isDraftModel());
-static_assert(!SpeculativeDecodingMode::DraftModel().isNone());
-static_assert(!SpeculativeDecodingMode::DraftModel().isMedusa());
-static_assert(!SpeculativeDecodingMode::DraftModel().isLookaheadDecoding());
+static_assert(SpeculativeDecodingMode::DraftTokensExternal().isDraftTokensExternal());
+static_assert(!SpeculativeDecodingMode::DraftTokensExternal().isNone());
+static_assert(!SpeculativeDecodingMode::DraftTokensExternal().isMedusa());
+static_assert(!SpeculativeDecodingMode::DraftTokensExternal().isLookaheadDecoding());
 
 static_assert(SpeculativeDecodingMode::Medusa().isMedusa());
 static_assert(!SpeculativeDecodingMode::Medusa().isNone());
-static_assert(!SpeculativeDecodingMode::Medusa().isDraftModel());
+static_assert(!SpeculativeDecodingMode::Medusa().isDraftTokensExternal());
 static_assert(!SpeculativeDecodingMode::Medusa().isLookaheadDecoding());
 
 static_assert(SpeculativeDecodingMode::LookaheadDecoding().isLookaheadDecoding());
 static_assert(!SpeculativeDecodingMode::LookaheadDecoding().isNone());
-static_assert(!SpeculativeDecodingMode::LookaheadDecoding().isDraftModel());
+static_assert(!SpeculativeDecodingMode::LookaheadDecoding().isDraftTokensExternal());
 static_assert(!SpeculativeDecodingMode::LookaheadDecoding().isMedusa());
 
 } // namespace runtime

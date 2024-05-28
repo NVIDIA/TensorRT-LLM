@@ -411,7 +411,7 @@ class Attention(Module):
         # which matches the desired output size (h/tp + 2*kvh/tp) * d after splitting
 
         # out dim is not necessarily hidden_size + kv specific size (in MQA/GQA), but num_heads * heads_size
-        # example: d_model != num_heads * head_size in Flan-T5
+        # example: d_model != num_heads * head_size in Flan-T5/ByT5/Gemma
         self.qkv = QKVColumnLinear(
             hidden_size,
             tp_size * self.num_attention_heads * self.attention_head_size +

@@ -55,6 +55,7 @@ private:
     SizeType32 mTpRank;
     std::vector<void*> mCommPtrs;
     BufferPtr mBuffer;
+    bool mOpenIpc;
 };
 
 class AllReduceBuffers

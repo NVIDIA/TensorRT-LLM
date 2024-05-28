@@ -151,50 +151,6 @@ def test_quant_mode():
     assert _tb.QuantMode.none() == _tb.QuantMode.none()
 
 
-def test_decoding_mode():
-    assert _tb.DecodingMode.none().is_none
-    assert not _tb.DecodingMode.none().is_top_k
-    assert not _tb.DecodingMode.none().is_top_p
-    assert not _tb.DecodingMode.none().is_beam_search
-    assert not _tb.DecodingMode.none().is_medusa
-
-    assert _tb.DecodingMode.top_k().is_top_k
-    assert _tb.DecodingMode.top_k().is_top_k_or_top_p
-    assert not _tb.DecodingMode.top_k().is_top_p
-    assert not _tb.DecodingMode.top_k().is_top_k_and_top_p
-    assert not _tb.DecodingMode.top_k().is_none
-    assert not _tb.DecodingMode.top_k().is_beam_search
-    assert not _tb.DecodingMode.none().is_medusa
-
-    assert _tb.DecodingMode.top_p().is_top_p
-    assert _tb.DecodingMode.top_p().is_top_k_or_top_p
-    assert not _tb.DecodingMode.top_p().is_top_k
-    assert not _tb.DecodingMode.top_p().is_top_k_and_top_p
-    assert not _tb.DecodingMode.top_p().is_none
-    assert not _tb.DecodingMode.top_p().is_beam_search
-    assert not _tb.DecodingMode.none().is_medusa
-
-    assert _tb.DecodingMode.top_k_top_p().is_top_p
-    assert _tb.DecodingMode.top_k_top_p().is_top_k
-    assert _tb.DecodingMode.top_k_top_p().is_top_k_or_top_p
-    assert _tb.DecodingMode.top_k_top_p().is_top_k_and_top_p
-    assert not _tb.DecodingMode.top_k_top_p().is_none
-    assert not _tb.DecodingMode.top_k_top_p().is_beam_search
-    assert not _tb.DecodingMode.none().is_medusa
-
-    assert _tb.DecodingMode.beam_search().is_beam_search
-    assert not _tb.DecodingMode.beam_search().is_none
-    assert not _tb.DecodingMode.beam_search().is_top_k
-    assert not _tb.DecodingMode.beam_search().is_top_p
-    assert not _tb.DecodingMode.none().is_medusa
-
-    assert _tb.DecodingMode.medusa().is_medusa
-    assert not _tb.DecodingMode.beam_search().is_none
-    assert not _tb.DecodingMode.beam_search().is_top_k
-    assert not _tb.DecodingMode.beam_search().is_top_p
-    assert not _tb.DecodingMode.top_k_top_p().is_beam_search
-
-
 def test_model_config():
     vocab_size = 10000
     num_attention_layers = 12
@@ -649,6 +605,27 @@ def test_trt_gpt_model_optional_params():
     assert opt_params.device_ids == [0, 1]
 
 
+def test_trt_gpt_model_optional_params_ctor():
+    kv_cache_config = _tb.KvCacheConfig(10, 10, 0, 0.5, False)
+    enable_trt_overlap = True
+    device_ids = [0, 1]
+    normalize_log_probs = False
+    enable_chunked_context = True
+    peft_cache_manager_config = _tb.PeftCacheManagerConfig()
+
+    opt_params = _tb.TrtGptModelOptionalParams(kv_cache_config,
+                                               enable_trt_overlap, device_ids,
+                                               normalize_log_probs,
+                                               enable_chunked_context,
+                                               peft_cache_manager_config)
+    assert opt_params.kv_cache_config.free_gpu_memory_fraction == kv_cache_config.free_gpu_memory_fraction
+    assert opt_params.enable_trt_overlap
+    assert opt_params.device_ids == device_ids
+    assert opt_params.normalize_log_probs == normalize_log_probs
+    assert opt_params.enable_chunked_context == enable_chunked_context
+    assert opt_params.gpu_weights_percent == 1
+
+
 def test_KvCacheConfig_pickle():
     cache = _tb.KvCacheConfig(free_gpu_memory_fraction=0.4)
     cache1 = pickle.dumps(cache)
@@ -675,16 +652,16 @@ def test_TrtGptModelOptionalParams_pickle():
 
 
 def test_Mpicomm():
-    size1 = _tb.MpiComm.getSize()
-    rank1 = _tb.MpiComm.getRank()
+    size1 = _tb.MpiComm.size()
+    rank1 = _tb.MpiComm.rank()
 
     session_size = (size1 + 1) // 2
     session_color = rank1 // session_size
     session_rank = rank1 % session_size
     _tb.MpiComm.split(session_color, session_rank)
 
-    rank2 = _tb.MpiComm.getRank()
-    size2 = _tb.MpiComm.getSize()
+    rank2 = _tb.MpiComm.rank()
+    size2 = _tb.MpiComm.size()
 
     assert rank2 == session_rank
     assert size2 == session_size

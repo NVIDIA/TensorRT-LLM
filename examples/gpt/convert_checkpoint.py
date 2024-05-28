@@ -17,7 +17,6 @@ import safetensors
 import torch
 import torch.nn as nn
 import yaml
-from datasets import load_dataset
 from tqdm import tqdm
 from transformers import (AutoConfig, AutoModelForCausalLM,
                           AutoModelForVision2Seq, AutoTokenizer, GPT2Config)
@@ -27,7 +26,8 @@ from transformers.pytorch_utils import Conv1D
 import tensorrt_llm
 from tensorrt_llm._utils import pad_vocab_size, str_dtype_to_torch
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.convert_utils import retrieved_layer_index_from_name
+from tensorrt_llm.models.convert_utils import (load_calib_dataset,
+                                               retrieved_layer_index_from_name)
 from tensorrt_llm.quantization import QuantAlgo
 
 LOGGER = logging.getLogger(__name__)
@@ -107,6 +107,13 @@ def parse_arguments():
     )
 
     parser.add_argument(
+        '--calib_dataset',
+        type=str,
+        default='lambada',
+        help=
+        "The huggingface dataset name or the local directory of the dataset for calibration."
+    )
+    parser.add_argument(
         '--int8_kv_cache',
         default=False,
         action="store_true",
@@ -181,6 +188,7 @@ def rename_keys(model_state, layer_rename_config: Dict[str, str]):
 
 
 def load_gpt_config(model_dir: str,
+                    tp_size: int,
                     gpt_variant: Optional[str] = None) -> GPT2Config:
     config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
 
@@ -188,14 +196,15 @@ def load_gpt_config(model_dir: str,
         print("Inferring gpt variant from path...")
         for v in [
                 'starcoder2', 'starcoder', 'santacoder', 'gpt2', 'persimmon',
-                'kosmos-2'
+                'kosmos-2', 'jais'
         ]:
             if v in config._name_or_path or ('fuyu' in config._name_or_path
                                              and v == 'persimmon'):
                 gpt_variant = v
                 break
     assert gpt_variant in [
-        'gpt2', 'santacoder', 'starcoder', 'starcoder2', 'persimmon', 'kosmos-2'
+        'gpt2', 'santacoder', 'starcoder', 'starcoder2', 'persimmon',
+        'kosmos-2', 'jais'
     ]
     print(f"Gpt variant: {gpt_variant}")
 
@@ -231,7 +240,35 @@ def load_gpt_config(model_dir: str,
             config.n_kv_head = 1
         else:
             config.n_kv_head = config.n_head
+    if gpt_variant == 'jais':
+        config.q_scaling = (config.n_embd // config.n_head)**0.5
+        if hasattr(config, 'width_scale'):
+            config.logits_scale = config.width_scale
+        else:
+            config.logits_scale = config.mup_output_alpha * config.mup_width_scale
+
+        if hasattr(config, 'mup_embeddings_scale'):
+            config.embeddings_scale = config.mup_embeddings_scale
+        else:
+            assert hasattr(config, 'embeddings_scale')
+
+        config.n_inner += get_needed_padding(config.n_inner, tp_size)
+
+    if gpt_variant == 'kosmos-2':
+        if config.text_config.scale_embedding:
+            config.embeddings_scale = config.n_embd**0.5
+
     return config, gpt_variant
+
+
+def get_needed_padding(value: int, multiple: int) -> int:
+    return (multiple - value % multiple) % multiple
+
+
+def pad_array_up_to(v: torch.Tensor, axis: int, multiple: int) -> torch.Tensor:
+    a = [0 for i in range(len(v.shape) * 2)]
+    a[axis * 2 - 1] = get_needed_padding(v.shape[axis], multiple)
+    return torch.nn.functional.pad(v, a)
 
 
 def split(param: torch.Tensor,
@@ -419,7 +456,7 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
         else:
             qkv_w, qkv_b = get_weight_and_bias(model_params,
                                                f'{prefix}.attn.c_attn', dtype)
-        if gpt_variant in ['gpt2', 'santacoder']:
+        if gpt_variant in ['gpt2', 'santacoder', 'jais']:
             qkv_w = qkv_w.t().contiguous()  # transpose for Conv1D
 
         if gpt_variant == 'persimmon':
@@ -455,7 +492,7 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
         else:
             attn_dense_w, attn_dense_b = get_weight_and_bias(
                 model_params, f'{prefix}.attn.c_proj', dtype)
-        if gpt_variant in ['gpt2', 'santacoder']:
+        if gpt_variant in ['gpt2', 'santacoder', 'jais']:
             attn_dense_w = attn_dense_w.t().contiguous()  # transpose for Conv1D
         attn_dense_w = split(attn_dense_w,
                              mapping.tp_rank,
@@ -476,8 +513,11 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
             mlp_fc_w, mlp_fc_b = get_weight_and_bias(model_params,
                                                      f'{prefix}.mlp.c_fc',
                                                      dtype)
-        if gpt_variant in ['gpt2', 'santacoder']:
+        if gpt_variant in ['gpt2', 'santacoder', 'jais']:
             mlp_fc_w = mlp_fc_w.t().contiguous()  # transpose for Conv1D
+        if gpt_variant in ['jais']:
+            mlp_fc_w = pad_array_up_to(mlp_fc_w, 0, mapping.tp_size)
+            mlp_fc_b = pad_array_up_to(mlp_fc_b, 0, mapping.tp_size)
         mlp_fc_w = split(mlp_fc_w,
                          mapping.tp_rank,
                          mapping.tp_size,
@@ -486,10 +526,35 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
                          mapping.tp_rank,
                          mapping.tp_size,
                          is_column=True)
-        weights.update(
-            get_tllm_linear_weight(mlp_fc_w, f'{tllm_prex}.mlp.fc', mlp_fc_b,
-                                   use_weight_only,
-                                   plugin_weight_only_quant_type))
+        if gpt_variant in ['jais']:
+            weights.update(
+                get_tllm_linear_weight(mlp_fc_w, f'{tllm_prex}.mlp.gate',
+                                       mlp_fc_b, use_weight_only,
+                                       plugin_weight_only_quant_type))
+        else:
+            weights.update(
+                get_tllm_linear_weight(mlp_fc_w, f'{tllm_prex}.mlp.fc',
+                                       mlp_fc_b, use_weight_only,
+                                       plugin_weight_only_quant_type))
+        if gpt_variant in ['jais']:
+            mlp_fc2_w, mlp_fc2_b = get_weight_and_bias(model_params,
+                                                       f'{prefix}.mlp.c_fc2',
+                                                       dtype)
+            mlp_fc2_w = mlp_fc2_w.t().contiguous()
+            mlp_fc2_w = pad_array_up_to(mlp_fc2_w, 0, mapping.tp_size)
+            mlp_fc2_b = pad_array_up_to(mlp_fc2_b, 0, mapping.tp_size)
+            mlp_fc2_w = split(mlp_fc2_w,
+                              mapping.tp_rank,
+                              mapping.tp_size,
+                              is_column=True)
+            mlp_fc2_b = split(mlp_fc2_b,
+                              mapping.tp_rank,
+                              mapping.tp_size,
+                              is_column=True)
+            weights.update(
+                get_tllm_linear_weight(mlp_fc2_w, f'{tllm_prex}.mlp.fc',
+                                       mlp_fc2_b, use_weight_only,
+                                       plugin_weight_only_quant_type))
 
         if gpt_variant == 'persimmon':
             mlp_proj_w, mlp_proj_b = get_weight_and_bias(
@@ -500,8 +565,10 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
         else:
             mlp_proj_w, mlp_proj_b = get_weight_and_bias(
                 model_params, f'{prefix}.mlp.c_proj', dtype)
-        if gpt_variant in ['gpt2', 'santacoder']:
+        if gpt_variant in ['gpt2', 'santacoder', 'jais']:
             mlp_proj_w = mlp_proj_w.t().contiguous()  # transpose for Conv1D
+        if gpt_variant in ['jais']:
+            mlp_proj_w = pad_array_up_to(mlp_proj_w, 1, mapping.tp_size)
         mlp_proj_w = split(mlp_proj_w,
                            mapping.tp_rank,
                            mapping.tp_size,
@@ -621,6 +688,8 @@ def convert_hf_gpt(hf_model: AutoModelForCausalLM,
                 pad_width = vocab_size_padded - vocab_size
                 embed_w = torch.nn.functional.pad(embed_w, (0, 0, 0, pad_width),
                                                   value=0)
+            if hasattr(hf_config, 'logits_scale'):
+                embed_w *= hf_config.logits_scale
             weights['lm_head.weight'] = split(embed_w.clone(),
                                               mapping.tp_rank,
                                               mapping.tp_size,
@@ -807,7 +876,7 @@ def capture_activation_range(model,
                     functools.partial(stat_input_hook, name=name)))
 
     for i in tqdm(range(num_samples), desc="calibrating model"):
-        input_ids = tokenizer(dataset[i]["text"],
+        input_ids = tokenizer(dataset[i],
                               return_tensors="pt",
                               max_length=seq_len,
                               truncation=True).input_ids.to(device)
@@ -1863,7 +1932,7 @@ if __name__ == '__main__':
         kv_cache_quant_algo = QuantAlgo.INT8
 
     if args.model_dir is not None:
-        hf_config, gpt_variant = load_gpt_config(args.model_dir,
+        hf_config, gpt_variant = load_gpt_config(args.model_dir, args.tp_size,
                                                  args.gpt_variant)
     elif args.nemo_ckpt_path is not None:
         nemo_dir = Path(args.output_dir) / "unpacked"
@@ -1938,9 +2007,10 @@ if __name__ == '__main__':
         args.model_dir is not None and gpt_variant == 'kosmos-2',
         'norm_before_bmm1':
         args.model_dir is not None and gpt_variant == 'kosmos-2',
-        'scale_embedding':
-        args.model_dir is not None and gpt_variant == 'kosmos-2'
-        and hf_config.text_config.scale_embedding,
+        'q_scaling':
+        getattr(hf_config, 'q_scaling', 1),
+        'embedding_scale':
+        getattr(hf_config, 'embeddings_scale', None),
     }
 
     with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
@@ -1959,10 +2029,9 @@ if __name__ == '__main__':
         if args.smoothquant is not None or args.int8_kv_cache:
             os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get(
                 "TOKENIZERS_PARALLELISM", "false")
-            dataset = load_dataset("lambada",
-                                   split="validation",
-                                   cache_dir=args.dataset_cache_dir)
             tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
+            dataset = load_calib_dataset(args.calib_dataset,
+                                         cache_dir=args.dataset_cache_dir)
             act_range = capture_activation_range(hf_model, tokenizer, dataset)
             if args.smoothquant is not None:
                 smooth_gpt_model(hf_model, act_range, args.smoothquant)

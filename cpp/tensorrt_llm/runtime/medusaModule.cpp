@@ -50,14 +50,14 @@ void MedusaModule::initMedusaTensorsFromChoices(MedusaChoices const& choices, st
 
     dumpChoices(choices, sortedIndices);
 
-    topKs.resize(medusaHeads(), 0);
+    topKs.resize(getMaxAcceptedDraftTokensPerStep(), 0);
     auto generationInputLengthsPtr = bufferCast<SizeType32>(*generationInputLengths);
     auto positionOffsetsPtr = bufferCast<SizeType32>(*positionOffsets);
     auto treeIdsPtr = bufferCast<SizeType32>(*treeIds);
 
     // Fixed sequence length currently.
-    std::fill(
-        generationInputLengthsPtr, generationInputLengthsPtr + generationInputLengths->getSize(), tokensPerStep());
+    std::fill(generationInputLengthsPtr, generationInputLengthsPtr + generationInputLengths->getSize(),
+        getMaxDraftTokens() + 1);
     std::fill(positionOffsetsPtr, positionOffsetsPtr + positionOffsets->getSize(), -1);
     std::fill(treeIdsPtr, treeIdsPtr + treeIds->getSize(), -1);
 
@@ -83,7 +83,7 @@ void MedusaModule::initMedusaTensorsFromChoices(MedusaChoices const& choices, st
     prevPrefixToLinearIdxMap[0] = 0;
     positionOffsetsPtr[0] = 0;
 
-    TLLM_CHECK(numChoices <= maxMedusaTokens());
+    TLLM_CHECK(numChoices <= getMaxDraftTokens());
 
     for (SizeType32 ci = 0; ci < numChoices; ++ci)
     {
@@ -210,12 +210,16 @@ SizeType32 MedusaModule::computePathsAndMask(
             while (tree[nodeIdx].nodeId != -1)
             {
                 auto const& curNode = tree[nodeIdx];
-                pathsPtr[(numPaths - 1 - pathIdx) * (medusaHeads() + 1) + curNode.depth] = curNode.linearIdx;
+                pathsPtr[(numPaths - 1 - pathIdx) * (getMaxAcceptedDraftTokensPerStep() + 1) + curNode.depth]
+                    = curNode.linearIdx;
                 // Go from top to the bottom
                 nodeIdx = curNode.parentLinearIdx;
             }
             // Fill data for root
-            pathsPtr[(numPaths - 1 - pathIdx) * (medusaHeads() + 1) + 0] = 0;
+            // +0 is for root of the paths
+            // getMaxAcceptedDraftTokensPerStep() + 1 is because paths includes max accepted tokens and root
+            // numPaths - 1 is because numPaths is the size of the paths tensor, but we need an index of the last path.
+            pathsPtr[(numPaths - 1 - pathIdx) * (getMaxAcceptedDraftTokensPerStep() + 1) + 0] = 0;
             // Fill next path
             pathIdx++;
         }
@@ -234,7 +238,7 @@ void MedusaModule::copyPackedMask(TensorPtr& mask, SizeType32 srcIdx, SizeType32
     auto srcRow = ITensor::slice(mask, srcIdx, 1);
     auto dstRow = ITensor::slice(mask, dstIdx, 1);
     std::memcpy(
-        bufferCast<SizeType32>(*dstRow), bufferCast<SizeType32>(*srcRow), numPackedMasks() * sizeof(SizeType32));
+        bufferCast<SizeType32>(*dstRow), bufferCast<SizeType32>(*srcRow), getNumPackedMasks() * sizeof(SizeType32));
 }
 
 void MedusaModule::setOnePackedMask(TensorPtr& mask, SizeType32 row, SizeType32 col) const
@@ -242,7 +246,7 @@ void MedusaModule::setOnePackedMask(TensorPtr& mask, SizeType32 row, SizeType32 
     auto const maskIdx = static_cast<SizeType32>(col / 32);
     auto const bitIdx = col % 32;
     auto setMask = 1 << bitIdx;
-    bufferCast<SizeType32>(*mask)[row * numPackedMasks() + maskIdx] |= setMask;
+    bufferCast<SizeType32>(*mask)[row * getNumPackedMasks() + maskIdx] |= setMask;
 }
 
 MedusaModule::Prefix MedusaModule::computePrefix(std::vector<SizeType32> const& vec, SizeType32 len) const

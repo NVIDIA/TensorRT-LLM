@@ -408,6 +408,12 @@ class Tensor(object):
         '''
         return view(self, shape, zero_is_placeholder)
 
+    def flatten(self, start_dim=0, end_dim=-1):
+        '''
+        See functional.flatten.
+        '''
+        return flatten(self, start_dim, end_dim)
+
     def permute(self, dims):
         '''
         See functional.permute.
@@ -486,6 +492,12 @@ class Tensor(object):
         '''
         return split(self, split_size_or_sections, dim)
 
+    def unbind(self, dim=0):
+        '''
+        See functional.unbind.
+        '''
+        return unbind(self, dim)
+
     def is_dynamic(self, dim=None):
         '''
         If the argument 'dim' is None, that function returns a boolean that
@@ -554,8 +566,7 @@ class Tensor(object):
         return f"TensorRT-LLM Tensor: {self.name=} {self.dtype=} {self.shape=}"
 
 
-def _create_tensor(trt_tensor: trt.ITensor,
-                   producer: trt.ILayer = None) -> Tensor:
+def _create_tensor(trt_tensor: trt.ITensor, producer: trt.ILayer) -> Tensor:
     '''
     A helper function to create a TensorRT-LLM Tensor object that encapsulates
     the connection between the TensorRT tensor (trt.ITensor) and the layer
@@ -575,7 +586,7 @@ def _create_tensor(trt_tensor: trt.ITensor,
         trt_tensor : trt.ITensor
             The TensorRT tensor to connect to its producer (the layer).
 
-        producer : trt.ILayer = None
+        producer : trt.ILayer
             The producer.
 
     Returns:
@@ -585,6 +596,15 @@ def _create_tensor(trt_tensor: trt.ITensor,
         attribute 'producer'.
     '''
     assert trt_tensor is not None
+    assert producer is not None
+
+    # Set the layer name since this is the only
+    # centralized location to pass the name from
+    # module space to the TRT IR
+    default_net()._set_layer_name(producer)
+
+    assert trt_tensor.shape.__len__(
+    ) >= 0, f"tensor {trt_tensor.name} has an invalid shape"
     tensor = Tensor(name=trt_tensor.name,
                     dtype=trt_tensor.dtype,
                     shape=trt_tensor.shape,
@@ -592,10 +612,6 @@ def _create_tensor(trt_tensor: trt.ITensor,
     tensor.trt_tensor = trt_tensor
     tensor.producer = producer
 
-    # Set the layer name since this is the only
-    # centralized location to pass the name from
-    # module space to the TRT IR
-    default_net()._set_layer_name(producer)
     # tb.print_stack(limit=10) # FOR DEBUGGING: filter producer.name if needed
     if default_net().dtype is not None and not default_net().strongly_typed:
         if producer.type not in [
@@ -1520,6 +1536,44 @@ def view(input: Tensor,
     else:
         raise TypeError("%s is not supported" % type(shape))
     return _create_tensor(layer.get_output(0), layer)
+
+
+def flatten(input: Tensor, start_dim: int = 0, end_dim: int = -1):
+    '''
+    Flattens input by reshaping it into a one-dimensional tensor.
+
+    If start_dim or end_dim are passed, only dimensions starting with start_dim and
+    ending with end_dim are flattened. The order of elements in input is unchanged.
+
+    Parameters:
+        input : Tensor
+            The input tensor to flatten.
+
+        start_dim : int
+            The first dim to flatten.
+
+        end_dim : int
+            The last dim to flatten.
+
+    Returns:
+        The tensor produced by the flatten layer.
+
+    '''
+    shape = input.shape
+    ndim = input.ndim()
+    if start_dim < 0: start_dim += ndim
+    if end_dim < 0: end_dim += ndim
+    new_shape = list()
+    for i in range(start_dim):
+        new_shape.append(shape[i])
+    if end_dim - start_dim >= 0:
+        flat_dim = 1
+        for i in range(start_dim, end_dim + 1):
+            flat_dim *= shape[i]
+        new_shape.append(flat_dim)
+    for i in range(end_dim + 1, ndim):
+        new_shape.append(shape[i])
+    return view(input, new_shape)
 
 
 def expand_dims(input: Tensor, dim: Union[int, Sequence[int]]) -> Tensor:
@@ -2999,22 +3053,8 @@ def gelu(x: Tensor) -> Tensor:
     Returns:
         The tensor produced by the activation layer.
     '''
-    if not default_net().strongly_typed:
-        return 0.5 * x * (
-            tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * pow(x, 3.0))) + 1.0)
-
-    array_fn = {
-        trt.float32: fp32_array,
-        trt.float16: fp16_array,
-        trt.bfloat16: bf16_array,
-    }[x.dtype]
-
-    v1 = constant(array_fn([0.5]))
-    v2 = constant(array_fn([math.sqrt(2.0 / math.pi)]))
-    v3 = constant(array_fn([0.044715]))
-    v4 = constant(array_fn([3.0]))
-    v5 = constant(array_fn([1.0]))
-    return v1 * x * (tanh(v2 * (x + v3 * pow(x, v4))) + v5)
+    return 0.5 * x * (
+        tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * pow(x, 3.0))) + 1.0)
 
 
 def geglu(x: Tensor) -> Tensor:
@@ -3427,6 +3467,18 @@ def chunk(tensor: Tensor, chunks: int, dim: int = 0) -> Tensor:
     assert dim_value % chunks == 0
 
     return split(tensor, dim_value // chunks, dim)
+
+
+def unbind(input: Tensor, dim: int = 0):
+    '''
+    Removes a tensor dimension.
+
+    Returns a tuple of all slices along a given dimension, already without it.
+    '''
+    ndim = input.ndim()
+    outputs = split(input, 1, dim)
+    output_shape = [input.shape[i] for i in range(ndim) if i != dim]
+    return [output.view(output_shape) for output in outputs]
 
 
 class AllReduceStrategy(IntEnum):
@@ -4149,6 +4201,7 @@ def gpt_attention(
     num_kv_heads: int,
     hidden_size_per_head: int,
     q_scaling: float,
+    qk_tanh_scale: float = 0.0,
     rotary_embedding_dim: int = 0,
     rotary_embedding_base: float = 10000.0,
     rotary_embedding_scale_type: RotaryScalingType = RotaryScalingType.none,
@@ -4251,6 +4304,10 @@ def gpt_attention(
         q_scaling: float
             The value used to compute the scaling factor applied to the output
             of the Q*K^T product. See Scaling Factors in docs/gpt_attention.md,
+
+        qk_tanh_scale: float
+            The scale * tanh(value / scale) used to compute the scaling factor applied to the output
+            of the Q*K^T product. Note this is only used by grok models.
 
         rotary_embedding_dim: int
             The dimension to compute RoPE. Use 0 when position_embedding_type is not RoPE.
@@ -4426,6 +4483,9 @@ def gpt_attention(
     q_scaling = trt.PluginField("q_scaling",
                                 np.array(q_scaling, dtype=np.float32),
                                 trt.PluginFieldType.FLOAT32)
+    qk_tanh_scale = trt.PluginField("qk_tanh_scale",
+                                    np.array(qk_tanh_scale, dtype=np.float32),
+                                    trt.PluginFieldType.FLOAT32)
     rotary_embedding_dim = trt.PluginField(
         "rotary_embedding_dim", np.array(rotary_embedding_dim, dtype=np.int32),
         trt.PluginFieldType.INT32)
@@ -4535,7 +4595,7 @@ def gpt_attention(
 
     pfc = trt.PluginFieldCollection([
         layer_idx, nheads, vision_start, vision_length, num_kv_heads, head_size,
-        unidirectional, q_scaling, position_embedding_type,
+        unidirectional, q_scaling, qk_tanh_scale, position_embedding_type,
         rotary_embedding_dim, rotary_embedding_base,
         rotary_embedding_scale_type, rotary_embedding_scale,
         rotary_embedding_m_scale, rotary_embedding_max_positions, tp_size,
@@ -4755,7 +4815,7 @@ def rms_norm(input: Tensor,
 
     dim = tuple([-i - 1 for i in range(len(normalized_shape))])
 
-    if default_net().strongly_typed:
+    with precision("float32"):
         input_dtype = input.dtype
         fp32_input = cast(input, "float32")
         varx = pow(fp32_input, 2.0)
@@ -4765,13 +4825,6 @@ def rms_norm(input: Tensor,
         denom = denom.sqrt()
         fp32_y = fp32_input / denom
         y = cast(fp32_y, input_dtype)
-    else:
-        with precision("float32"):
-            varx = pow(input, 2.0)
-            varx = varx.mean(dim=dim, keepdim=True)
-            denom = varx + eps
-            denom = denom.sqrt()
-            y = input / denom
 
     if weight is not None:
         y = y * weight
@@ -5431,27 +5484,26 @@ def selective_scan(input: Tensor,
 
 
 def rg_lru(input: Tensor,
-           gate_x: Tensor,
-           gate_a: Tensor,
            A: Tensor,
            state_or_ptr: Tensor,
            host_request_types: Tensor,
            last_token_ids: Tensor,
            dim: int,
            dtype: str,
+           block_size: int = 0,
            y: Optional[Tensor] = None,
            y_bias: Optional[Tensor] = None,
+           gate: Optional[Tensor] = None,
+           gate_bias: Optional[Tensor] = None,
+           gate_x: Optional[Tensor] = None,
+           gate_x_bias: Optional[Tensor] = None,
+           gate_a: Optional[Tensor] = None,
+           gate_a_bias: Optional[Tensor] = None,
            slot_mapping: Optional[Tensor] = None):
     '''
     Parameters:
         input : Tensor (On GPU)
             The input tensor. Its shape is [batch_size, seq_len, dim]
-
-        gate_x : Tensor (On GPU)
-            The gate_x tensor. Its shape is [batch_size, seq_len, dim]
-
-        gate_a : Tensor (On GPU)
-            The gate_a tensor. Its shape is [batch_size, seq_len, dim]
 
         A : Tensor (On GPU)
             A matrix. Its shape is [dim]
@@ -5472,6 +5524,10 @@ def rg_lru(input: Tensor,
         dim : int
             The inner dimension of RG_LRU block
 
+        block_size : int
+            The block size of the block diagonal linear layer. It is used to
+            support the cases that enable fused gate.
+
         dtype: str
             data type
 
@@ -5482,6 +5538,29 @@ def rg_lru(input: Tensor,
             The y_bias tensor. Its shape is [dim]. If y_bias is not None, we
             will fuse GELU(y + y_bias) in this function.
 
+        gate : Tensor (On GPU) (Optional)
+            The gate tensor. Its shape is [batch_size, seq_len, 2 * dim].
+            If gate is not None, we will fuse the gate_x and gate_a, otherwise
+            use those two tensors.
+
+        gate_bias : Tensor (On GPU) (Optional)
+            The gate_bias tensor. Its shape is [2 * block_num, dim // block_num].
+            If gate_bias is not None, we will fuse the bias add in this function.
+
+        gate_x : Tensor (On GPU) (Optional)
+            The gate_x tensor. Its shape is [batch_size, seq_len, dim]
+
+        gate_x_bias : Tensor (On GPU) (Optional)
+            The gate_x_bias tensor. Its shape is [block_num, dim // block_num].
+            If gate_x_bias is not None, we will fuse the bias add in this function.
+
+        gate_a : Tensor (On GPU) (Optional)
+            The gate_a tensor. Its shape is [batch_size, seq_len, dim]
+
+        gate_a_bias : Tensor (On GPU) (Optional)
+            The gate_a_bias tensor. Its shape is [block_num, dim // block_num].
+            If gate_a_bias is not None, we will fuse the bias add in this function.
+
         slot_mapping: Tensor (On GPU) (Optional)
             Real page index in state. Its shape is [dim], used for paged state, each page shape is [dstate, dim]
     '''
@@ -5489,9 +5568,24 @@ def rg_lru(input: Tensor,
     lru_plg_creator = trt.get_plugin_registry().get_plugin_creator(
         'LRU', '1', TRT_LLM_PLUGIN_NAMESPACE)
     assert lru_plg_creator is not None
+    assert (gate_x_bias is None) == (gate_a_bias is None)
+    enable_fuse_gate = gate is not None
+    has_gate_bias = (gate_bias is not None) or (gate_x_bias is not None)
+    if enable_fuse_gate:
+        assert gate is not None
+        assert block_size > 0
+        if has_gate_bias:
+            assert gate_bias is not None
+    else:
+        assert gate_x is not None and gate_a is not None
+        if has_gate_bias:
+            assert gate_x_bias is not None and gate_a_bias is not None
 
     dim = trt.PluginField("dim", np.array(dim, dtype=np.int32),
                           trt.PluginFieldType.INT32)
+    block_size = trt.PluginField("block_size",
+                                 np.array(block_size, dtype=np.int32),
+                                 trt.PluginFieldType.INT32)
     pf_type = trt.PluginField(
         "type_id", np.array([int(str_dtype_to_trt(dtype))], np.int32),
         trt.PluginFieldType.INT32)
@@ -5520,15 +5614,36 @@ def rg_lru(input: Tensor,
                                          np.array(1, dtype=np.int8),
                                          trt.PluginFieldType.INT8)
 
+    if enable_fuse_gate:
+        fuse_gate_enabled = trt.PluginField("fuse_gate_enabled",
+                                            np.array(1, dtype=np.int8),
+                                            trt.PluginFieldType.INT8)
+    else:
+        fuse_gate_enabled = trt.PluginField("fuse_gate_enabled",
+                                            np.array(0, dtype=np.int8),
+                                            trt.PluginFieldType.INT8)
+
+    if has_gate_bias:
+        gate_bias_enabled = trt.PluginField("gate_bias_enabled",
+                                            np.array(1, dtype=np.int8),
+                                            trt.PluginFieldType.INT8)
+    else:
+        gate_bias_enabled = trt.PluginField("gate_bias_enabled",
+                                            np.array(0, dtype=np.int8),
+                                            trt.PluginFieldType.INT8)
+
     pfc = trt.PluginFieldCollection([
-        dim, pf_type, remove_input_padding, paged_state, y_enabled,
-        y_bias_enabled
+        dim, block_size, pf_type, remove_input_padding, paged_state, y_enabled,
+        y_bias_enabled, fuse_gate_enabled, gate_bias_enabled
     ])
     lru_plug = lru_plg_creator.create_plugin("rg_lru", pfc)
 
     plug_inputs = [
-        input, gate_x, gate_a, A, state_or_ptr, host_request_types,
-        last_token_ids
+        input,
+        A,
+        state_or_ptr,
+        host_request_types,
+        last_token_ids,
     ]
     if default_net().plugin_config.paged_state:
         plug_inputs += [slot_mapping]
@@ -5536,6 +5651,14 @@ def rg_lru(input: Tensor,
         plug_inputs += [y]
         if y_bias is not None:
             plug_inputs += [y_bias]
+    if enable_fuse_gate:
+        plug_inputs += [gate]
+        if has_gate_bias:
+            plug_inputs += [gate_bias]
+    else:
+        plug_inputs += [gate_x, gate_a]
+        if has_gate_bias:
+            plug_inputs += [gate_x_bias, gate_a_bias]
     plug_inputs = [i.trt_tensor for i in plug_inputs]
 
     layer = default_trtnet().add_plugin_v2(plug_inputs, lru_plug)

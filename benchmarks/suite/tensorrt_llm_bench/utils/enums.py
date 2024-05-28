@@ -4,7 +4,33 @@ from typing import List
 
 from aenum import MultiValueEnum
 
+from tensorrt_llm.bindings.executor import CapacitySchedulerPolicy
 from tensorrt_llm.quantization.mode import QuantAlgo
+
+NO_EVICT = "Guaranteed No Evict"
+MAX_UTIL = "Max Utilization"
+
+
+class ModelArchitecture(MultiValueEnum):
+    LLAMA = "LlamaForCausalLM"
+    GPTJ = "GPTJForCausalLM"
+    GEMMA = "GemmaForCausalLM"
+    BLOOM = "BloomForCausalLM"
+    OPT = "OPTForCausalLM"
+    MIXTRAL = "MixtralForCausalLM"
+    FALCON = "FalconForCausalLM"
+
+
+class ResultsSchedulingPolicy(MultiValueEnum):
+    MAX_UTILIZTION = MAX_UTIL, CapacitySchedulerPolicy.MAX_UTILIZATION
+    NO_EVICT = NO_EVICT, CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
+    STATIC = "Static"
+
+
+class IFBSchedulingPolicy(MultiValueEnum):
+    MAX_UTILIZTION = CapacitySchedulerPolicy.MAX_UTILIZATION, MAX_UTIL, "max_utilization"
+    NO_EVICT = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT, NO_EVICT, "guaranteed_no_evict"
+    STATIC = "Static", "static"
 
 
 class KVCacheDtypeEnum(MultiValueEnum):
@@ -13,11 +39,11 @@ class KVCacheDtypeEnum(MultiValueEnum):
     FP16 = None, "FP16", "fp16", "float16"
     INT8 = "INT8", "int8"
 
-    def get_build_options(self, dtype: ComputeDtypeEnum) -> List[str]:
+    def get_build_options(self, dtype: str) -> List[str]:
         """Get the build options for TRT-LLM based on KV Cache precision.
 
         Args:
-            dtype (ComputeDtypeEnum): The activation dtype for the model. This
+            dtype (str): The activation dtype for the model. This
             parameter maps the activation dtype for GEMM plugins for certain
             KV cache precisions.
 
@@ -28,7 +54,7 @@ class KVCacheDtypeEnum(MultiValueEnum):
         if self.value == self.FP8:
             return ["--strongly_typed"]
         else:
-            return ["--gemm_plugin", dtype.value]
+            return ["--gemm_plugin", dtype]
 
 
 class ComputeDtypeEnum(MultiValueEnum):

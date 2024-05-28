@@ -78,7 +78,34 @@ public:
     [[nodiscard]] std::optional<FloatType> getLengthPenalty() const;
     [[nodiscard]] std::optional<SizeType32> getEarlyStopping() const;
 
+    void setBeamWidth(SizeType32 beamWidth);
+    void setTopK(std::optional<SizeType32> const& topK);
+    void setTopP(std::optional<FloatType> const& topP);
+    void setTopPMin(std::optional<FloatType> const& topPMin);
+    void setTopPResetIds(std::optional<TokenIdType> const& topPResetIds);
+    void setTopPDecay(std::optional<FloatType> const& topPDecay);
+    void setRandomSeed(std::optional<RandomSeedType> const& randomSeed);
+    void setTemperature(std::optional<FloatType> const& temperature);
+    void setMinLength(std::optional<SizeType32> const& minLength);
+    void setBeamSearchDiversityRate(std::optional<FloatType> const& beamSearchDiversityRate);
+    void setRepetitionPenalty(std::optional<FloatType> const& repetitionPenalty);
+    void setPresencePenalty(std::optional<FloatType> const& presencePenalty);
+    void setFrequencyPenalty(std::optional<FloatType> const& frequencyPenalty);
+    void setLengthPenalty(std::optional<FloatType> const& lengthPenalty);
+    void setEarlyStopping(std::optional<SizeType32> const& earlyStopping);
+
 private:
+    static SizeType32 checkBeamWidth(SizeType32 beamWidth);
+    static std::optional<FloatType> const& checkTopK(std::optional<FloatType> const& topK);
+    static std::optional<FloatType> const& checkTopP(std::optional<FloatType> const& topP);
+    static std::optional<FloatType> const& checkTopPMin(std::optional<FloatType> const& topPMin);
+    static std::optional<TokenIdType> const& checkTopPResetIds(std::optional<TokenIdType> const& topPResetIds);
+    static std::optional<FloatType> const& checkTopPDecay(std::optional<FloatType> const& topPDecay);
+    static std::optional<FloatType> const& checkTemperature(std::optional<FloatType> const& temperature);
+    static std::optional<SizeType32> const& checkMinLength(std::optional<SizeType32> const& minLength);
+    static std::optional<FloatType> const& checkBeamSearchDiversityRate(
+        std::optional<FloatType> const& beamSearchDiversityRate);
+
     friend class Serialization;
 
     /// @brief The beam width. Default is 1 which disables beam search.
@@ -134,12 +161,12 @@ public:
     bool excludeInputFromOutput;
 };
 
-/// @brief Configuration for speculative decoding. Allows to include draft tokens, draft logits and specify acceptance
-/// threshold
-class SpeculativeDecodingConfig
+/// @brief Configuration for speculative decoding with external draft tokens.
+/// Allows to include draft tokens, draft logits and specify acceptance threshold.
+class ExternalDraftTokensConfig
 {
 public:
-    explicit SpeculativeDecodingConfig(VecTokens tokens, std::optional<Tensor> logits = std::nullopt,
+    explicit ExternalDraftTokensConfig(VecTokens tokens, std::optional<Tensor> logits = std::nullopt,
         std::optional<FloatType> const& acceptanceThreshold = std::nullopt);
 
     [[nodiscard]] VecTokens getTokens() const;
@@ -209,7 +236,7 @@ public:
     /// @param badWords A list of bad words tokens. Each "word" can be composed of multiple tokens
     /// @param stopWords A list of stop words tokens. Each "word" can be composed of multiple tokens
     /// @param embeddingBias The embedding bias tensor. Expected type is kFP32 and shape is [vocab_size]
-    /// @param speculativeDecodingConfig The speculative decoding configuration
+    /// @param externalDraftTokensConfig The speculative decoding configuration
     /// @param pTuningConfig The prompt tuning configuration
     /// @param loraConfig The LoRA configuration
     /// @param logitsPostProcessorName The logits postprocessor name. Must correspond to one of the logits postprocessor
@@ -220,7 +247,7 @@ public:
         std::optional<std::list<VecTokens>> badWords = std::nullopt,
         std::optional<std::list<VecTokens>> stopWords = std::nullopt,
         std::optional<Tensor> embeddingBias = std::nullopt,
-        std::optional<SpeculativeDecodingConfig> speculativeDecodingConfig = std::nullopt,
+        std::optional<ExternalDraftTokensConfig> externalDraftTokensConfig = std::nullopt,
         std::optional<PromptTuningConfig> pTuningConfig = std::nullopt,
         std::optional<LoraConfig> loraConfig = std::nullopt,
         std::optional<std::string> logitsPostProcessorName = std::nullopt);
@@ -241,7 +268,7 @@ public:
     [[nodiscard]] std::optional<std::list<VecTokens>> getBadWords() const;
     [[nodiscard]] std::optional<std::list<VecTokens>> getStopWords() const;
     [[nodiscard]] std::optional<Tensor> getEmbeddingBias() const;
-    [[nodiscard]] std::optional<SpeculativeDecodingConfig> getSpeculativeDecodingConfig() const;
+    [[nodiscard]] std::optional<ExternalDraftTokensConfig> getExternalDraftTokensConfig() const;
     [[nodiscard]] std::optional<PromptTuningConfig> getPromptTuningConfig() const;
     [[nodiscard]] std::optional<LoraConfig> getLoraConfig() const;
     [[nodiscard]] std::optional<std::string> getLogitsPostProcessorName() const;
@@ -254,7 +281,7 @@ public:
     void setBadWords(std::list<VecTokens> const& badWords);
     void setStopWords(std::list<VecTokens> const& stopWords);
     void setEmbeddingBias(Tensor const& embeddingBias);
-    void setSpeculativeDecodingConfig(SpeculativeDecodingConfig const& specDecodingConfig);
+    void setExternalDraftTokensConfig(ExternalDraftTokensConfig const& externalDraftTokensConfig);
     void setPromptTuningConfig(PromptTuningConfig const& pTuningConfig);
     void setLoraConfig(LoraConfig const& loraConfig);
     void setLogitsPostProcessorName(std::string const& logitsPostProcessorName);
@@ -514,6 +541,70 @@ private:
     std::optional<size_t> mHostCacheSize;
 };
 
+/// @brief Configuration class for Lookahead decoding.
+class LookaheadDecodingConfig
+{
+public:
+    explicit LookaheadDecodingConfig(
+        SizeType32 maxNgramSize, SizeType32 maxWindowSize, SizeType32 maxVerificationSetSize);
+
+    bool operator==(LookaheadDecodingConfig const& other) const;
+
+    // Lookahead decoding methods.
+    void setMaxNgramSize(SizeType32);
+    void setMaxWindowSize(SizeType32);
+    void setMaxVerificationSetSize(SizeType32);
+    [[nodiscard]] SizeType32 getMaxNgramSize() const;
+    [[nodiscard]] SizeType32 getMaxWindowSize() const;
+    [[nodiscard]] SizeType32 getMaxVerificationSetSize() const;
+
+private:
+    friend class Serialization;
+
+    // Number of tokens per NGram.
+    SizeType32 mMaxNgramSize;
+    // Number of NGrams in lookahead branch per step.
+    SizeType32 mMaxWindowSize;
+    // Number of NGrams in verification branch per step.
+    SizeType32 mMaxVerificationSetSize;
+};
+
+/// @brief Configuration class for the speculative decoding.
+class DecodingConfig
+{
+public:
+    explicit DecodingConfig(std::optional<DecodingMode> decodingMode = std::nullopt,
+        std::optional<LookaheadDecodingConfig> lookaheadDecodingConfig = std::nullopt,
+        std::optional<MedusaChoices> medusaChoices = std::nullopt);
+
+    bool operator==(DecodingConfig const& other) const;
+
+    // Decoding mode.
+    /// @brief Setsdecoding mode. Can't set lookahead and medusa mode.
+    void setDecodingMode(DecodingMode const&);
+    [[nodiscard]] std::optional<DecodingMode> getDecodingMode() const;
+
+    // Lookahead methods.
+    /// @brief Sets lookahead decoding mode and lookahead decoding config.
+    void setLookaheadDecoding(LookaheadDecodingConfig const&);
+    [[nodiscard]] std::optional<LookaheadDecodingConfig> getLookaheadDecodingConfig() const;
+
+    // Medusa methods.
+    /// @brief Sets medusa mode and medusa config.
+    void setMedusaChoices(MedusaChoices const&);
+    [[nodiscard]] std::optional<MedusaChoices> getMedusaChoices() const;
+
+private:
+    friend class Serialization;
+
+    // Decoding mode.
+    std::optional<DecodingMode> mDecodingMode;
+    // Lookahead params.
+    std::optional<LookaheadDecodingConfig> mLookaheadDecodingConfig;
+    // Medusa params.
+    std::optional<MedusaChoices> mMedusaChoices;
+};
+
 /// @brief Configuration class for the model executor
 class ExecutorConfig
 {
@@ -526,8 +617,7 @@ public:
         std::optional<ParallelConfig> parallelConfig = std::nullopt,
         std::optional<PeftCacheConfig> const& peftCacheConfig = std::nullopt,
         std::optional<LogitsPostProcessorMap> logitsPostProcessorMap = std::nullopt,
-        std::optional<MedusaChoices> medusaChoices = std::nullopt,
-        std::optional<DecodingMode> decodingMode = std::nullopt, float gpuWeightsPercent = 1);
+        std::optional<DecodingConfig> decodingConfig = std::nullopt, float gpuWeightsPercent = 1);
 
     [[nodiscard]] SizeType32 getMaxBeamWidth() const;
     [[nodiscard]] SchedulerConfig getSchedulerConfig() const;
@@ -540,8 +630,7 @@ public:
     [[nodiscard]] std::optional<ParallelConfig> getParallelConfig() const;
     [[nodiscard]] std::optional<PeftCacheConfig> getPeftCacheConfig() const;
     [[nodiscard]] std::optional<LogitsPostProcessorMap> getLogitsPostProcessorMap() const;
-    [[nodiscard]] std::optional<MedusaChoices> getMedusaChoices() const;
-    [[nodiscard]] std::optional<DecodingMode> getDecodingMode() const;
+    [[nodiscard]] std::optional<DecodingConfig> getDecodingConfig() const;
     [[nodiscard]] float getGpuWeightsPercent() const;
 
     void setMaxBeamWidth(SizeType32 maxBeamWidth);
@@ -555,8 +644,7 @@ public:
     void setParallelConfig(ParallelConfig const& parallelConfig);
     void setPeftCacheConfig(PeftCacheConfig const& peftCacheConfig);
     void setLogitsPostProcessorMap(LogitsPostProcessorMap const& logitsPostProcessorMap);
-    void setMedusaChoices(MedusaChoices const& medusaChoices);
-    void setDecodingMode(DecodingMode decodingMode);
+    void setDecodingConfig(DecodingConfig const& decodingConfig);
     void setGpuWeightsPercent(float const& gpuWeightsPercent);
 
 private:
@@ -590,8 +678,8 @@ private:
     std::optional<ParallelConfig> mParallelConfig;
     std::optional<PeftCacheConfig> mPeftCacheConfig;
     std::optional<LogitsPostProcessorMap> mLogitsPostProcessorMap;
-    std::optional<MedusaChoices> mMedusaChoices;
-    std::optional<DecodingMode> mDecodingMode;
+    /// @brief Decoding configuration.
+    std::optional<DecodingConfig> mDecodingConfig;
     float mGpuWeightsPercent;
 };
 

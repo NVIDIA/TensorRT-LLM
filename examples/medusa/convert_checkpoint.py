@@ -13,7 +13,6 @@ import numpy as np
 import safetensors
 import torch
 import torch.nn as nn
-from datasets import load_dataset
 from tqdm import tqdm
 from transformers import LlamaConfig, LlamaForCausalLM, LlamaTokenizer
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
@@ -23,6 +22,7 @@ import tensorrt_llm
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.convert_utils import load_calib_dataset
 from tensorrt_llm.models.llama.weight import load_from_hf_checkpoint
 from tensorrt_llm.models.modeling_utils import PretrainedConfig
 from tensorrt_llm.quantization import QuantAlgo
@@ -69,6 +69,13 @@ def parse_arguments():
         help=
         'Define the precision for the weights when using weight-only quantization.'
         'You must also use --use_weight_only for that argument to have an impact.'
+    )
+    parser.add_argument(
+        '--calib_dataset',
+        type=str,
+        default='ccdv/cnn_dailymail',
+        help=
+        "The huggingface dataset name or the local directory of the dataset for calibration."
     )
     parser.add_argument(
         "--smoothquant",
@@ -498,8 +505,8 @@ def capture_activation_range(model,
                     functools.partial(stat_input_hook, name=name)))
 
     for i in tqdm(range(num_samples), desc="calibrating model"):
-        datapoint = dataset['train'][i:i + 1]
-        line = copy.copy(datapoint['article'])
+        datapoint = dataset[i:i + 1]
+        line = copy.copy(datapoint)
         line[0] = line[0] + ' TL;DR: '
         line[0] = line[0].strip()
         line[0] = line[0].replace(" n't", "n't")
@@ -1134,14 +1141,12 @@ if __name__ == '__main__':
                 logger.warning(
                     "Note that running capture_activation_range on cpu would be very small."
                 )
-            dataset = load_dataset("ccdv/cnn_dailymail",
-                                   '3.0.0',
-                                   cache_dir=args.dataset_cache_dir)
+            tokenizer = LlamaTokenizer.from_pretrained(args.model_dir,
+                                                       padding_side='left')
+            dataset = load_calib_dataset(args.calib_dataset,
+                                         cache_dir=args.dataset_cache_dir)
 
-            act_range = capture_activation_range(
-                model,
-                LlamaTokenizer.from_pretrained(args.model_dir,
-                                               padding_side='left'), dataset)
+            act_range = capture_activation_range(model, tokenizer, dataset)
             if args.smoothquant is not None:
                 smooth_llama_model(model, act_range, args.smoothquant,
                                    llama_qkv_para, llama_smoother)

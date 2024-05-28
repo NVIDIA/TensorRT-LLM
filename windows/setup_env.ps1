@@ -197,6 +197,7 @@ if (-not ($skipTRT)) {
         $TRTEnvVar = $trtSubPaths.Values -join ";"
 
         [Environment]::SetEnvironmentVariable("TRT", "$TRTEnvVar", [EnvironmentVariableTarget]::Machine)
+        Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog.txt -Value "0"
     } else {
         Write-Output "TensorRT already present"
         Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog.txt -Value "1"

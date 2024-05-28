@@ -20,9 +20,9 @@
 #include <curand_kernel.h>
 
 #include "tensorrt_llm/common/tensor.h"
+#include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/layers/baseLayer.h"
 #include "tensorrt_llm/layers/decodingParams.h"
-#include "tensorrt_llm/runtime/decodingMode.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
 namespace tensorrt_llm
@@ -37,7 +37,7 @@ template <typename T>
 class StopCriteriaLayer : public BaseLayer
 {
 public:
-    StopCriteriaLayer(runtime::DecodingMode const& mode, DecoderDomain const& /* decoderDomain */, cudaStream_t stream,
+    StopCriteriaLayer(executor::DecodingMode const& mode, DecoderDomain const& /* decoderDomain */, cudaStream_t stream,
         std::shared_ptr<tensorrt_llm::common::IAllocator> allocator);
 
     ~StopCriteriaLayer() override = default;
@@ -45,17 +45,18 @@ public:
     void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 const* batchSlots,
         std::shared_ptr<BaseSetupParams> setupParams) override;
 
-    void forward(std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs) override;
+    void forwardAsync(std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs) override;
 
 private:
     static void checkMaxLengthStopCriteria(std::shared_ptr<DynamicDecodeOutputParams>& outputs,
         std::shared_ptr<DynamicDecodeInputParams> const& inputs, runtime::SizeType32 const* batchSlots,
-        runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 maxSeqLen,
-        cudaStream_t stream);
+        DecoderDomain const& decoderDomain, runtime::SizeType32 maxSeqLen, cudaStream_t stream);
     static void checkStopWordsStopCriteria(std::shared_ptr<DynamicDecodeOutputParams>& outputs,
         std::shared_ptr<DynamicDecodeInputParams> const& inputs, runtime::SizeType32 const* batchSlots,
-        runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 maxSeqLen,
-        cudaStream_t stream);
+        DecoderDomain const& decoderDomain, runtime::SizeType32 maxSeqLen, cudaStream_t stream);
+    static void checkEosToken(std::shared_ptr<DynamicDecodeOutputParams>& outputs,
+        std::shared_ptr<DynamicDecodeInputParams> const& inputs, runtime::SizeType32 const* batchSlots,
+        DecoderDomain const& decoderDomain, runtime::SizeType32 maxSeqLen, cudaStream_t stream);
 
 private:
     using BaseLayer::mWorkspaceSize;
@@ -64,7 +65,7 @@ private:
     using BaseLayer::mStream;
     using BaseLayer::mAllocator;
 
-    runtime::DecodingMode mDecodingMode;
+    executor::DecodingMode mDecodingMode;
 };
 
 } // namespace layers

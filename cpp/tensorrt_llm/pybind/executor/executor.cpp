@@ -53,6 +53,7 @@ void Executor::exit(
     [[maybe_unused]] py::handle type, [[maybe_unused]] py::handle value, [[maybe_unused]] py::handle traceback)
 {
     shutdown();
+    mExecutor = nullptr;
 }
 
 void Executor::shutdown()
@@ -63,8 +64,7 @@ void Executor::shutdown()
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     py::gil_scoped_release release;
     mExecutor->shutdown();
-    mExecutor = nullptr;
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 void Executor::initBindings(py::module_& m)

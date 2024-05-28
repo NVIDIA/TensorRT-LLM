@@ -15,8 +15,9 @@ from .._common import default_net
 from .._utils import (numpy_to_torch, release_gc, str_dtype_to_torch,
                       str_dtype_to_trt, trt_dtype_to_torch)
 from ..functional import PositionEmbeddingType, Tensor, gather_last_token_logits
-from ..layers import (AttentionParams, Embedding, FusedGatedMLP, GatedMLP,
-                      KeyValueCacheParams, LoraParams, PromptTuningEmbedding)
+from ..layers import (AttentionParams, Embedding, FusedGatedMLP, FusedRgLru,
+                      GatedMLP, KeyValueCacheParams, LoraParams,
+                      PromptTuningEmbedding, RgLru)
 from ..layers.attention import Attention, BertAttention
 from ..layers.linear import ColumnLinear, Linear, RowLinear
 from ..layers.lora import Lora
@@ -196,11 +197,11 @@ class PretrainedConfig:
         )  # many config.pop calls inside, make one local copy of the config dict such that the function has no side effects
         architecture = config.pop('architecture')
         dtype = config.pop('dtype')
-        vocab_size = config.pop('vocab_size')
+        vocab_size = config.pop('vocab_size', None)
         hidden_size = config.pop('hidden_size')
         num_hidden_layers = config.pop('num_hidden_layers')
         num_attention_heads = config.pop('num_attention_heads')
-        hidden_act = config.pop('hidden_act')
+        hidden_act = config.pop('hidden_act', None)
         norm_epsilon = config.pop('norm_epsilon', 1e-5)
         position_embedding_type = config.pop('position_embedding_type',
                                              'learned_absolute')
@@ -517,6 +518,7 @@ class PretrainedModel(Module,
             max_beam_width=max_beam_width,
             max_input_len=max_input_len,
             max_seq_len=max_seq_len,
+            hidden_size=self.config.hidden_size,
             num_kv_heads=self.config.num_key_value_heads,
             head_size=self.config.head_size,
             num_layers=self.config.num_hidden_layers,
@@ -848,6 +850,35 @@ def unfuse_qkv_gemm(model: PretrainedModel) -> PretrainedModel:
     return model
 
 
+def fuse_rg_lru(model: PretrainedModel) -> PretrainedModel:
+    for layer in model.transformer.layers:
+        if not hasattr(layer, 'recurrent'):
+            continue
+
+        if isinstance(layer.recurrent.rg_lru, RgLru):
+            rg_lru = layer.recurrent.rg_lru
+            fused_layer = FusedRgLru(lru_width=rg_lru.lru_width,
+                                     num_heads=rg_lru.num_heads,
+                                     dtype=rg_lru.dtype,
+                                     tp_group=rg_lru.tp_group,
+                                     tp_size=rg_lru.tp_size,
+                                     tp_rank=rg_lru.tp_rank)
+
+            fused_layer.gate.weight.value = np.concatenate([
+                rg_lru.input_gate.weight.raw_value,
+                rg_lru.recurrent_gate.weight.raw_value
+            ],
+                                                           axis=-1)
+            fused_layer.gate.bias.value = np.concatenate([
+                rg_lru.input_gate.bias.raw_value,
+                rg_lru.recurrent_gate.bias.raw_value
+            ],
+                                                         axis=-1)
+            fused_layer.recurrent_param.value = rg_lru.recurrent_param.raw_value
+            layer.recurrent.rg_lru = fused_layer
+    return model
+
+
 def set_prompt_tuning(
         model: DecoderModelForCausalLM) -> DecoderModelForCausalLM:
     '''Replace the given models embedding layer with a PromptTuningEmbedding layer in-place, return the changed model
@@ -970,7 +1001,8 @@ def optimize_model(model: DecoderModelForCausalLM,
                    use_prompt_tuning: bool = False,
                    use_lora: bool = False,
                    max_lora_rank: Optional[int] = None,
-                   use_fp8_context_fmha: bool = False):
+                   use_fp8_context_fmha: bool = False,
+                   use_fused_rg_lru: bool = False):
     if use_parallel_embedding:
         model = parallelize_embedding(model)
     if share_embedding_table:
@@ -987,6 +1019,8 @@ def optimize_model(model: DecoderModelForCausalLM,
         model = add_lora(model, max_lora_rank)
     if use_fp8_context_fmha:
         model = set_fp8_context_fhma(model)
+    if use_fused_rg_lru:
+        model = fuse_rg_lru(model)
     return model
 
 

@@ -310,22 +310,22 @@ std::shared_ptr<MedusaInputParams> MedusaDecodingLayerTest<T>::createInputTensor
 }
 
 template <typename T>
-std::shared_ptr<MedusaOutputParams> MedusaDecodingLayerTest<T>::createOutputTensors()
+std::shared_ptr<DynamicDecodeOutputParams> MedusaDecodingLayerTest<T>::createOutputTensors()
 {
-    auto outputParams = std::make_shared<MedusaOutputParams>(tcc::toTllmTensor(*mOutputIdsDevice));
+    auto outputParams = std::make_shared<DynamicDecodeOutputParams>(tcc::toTllmTensor(*mOutputIdsDevice));
 
     outputParams->sequence_length = tcc::toTllmTensor(*mSeqLengthsDevice);
 
     outputParams->finished = tcc::toTllmTensor(*mFinishedDevice);
 
-    outputParams->medusaOutputs = MedusaOutputParams::MedusaOutputs();
-    outputParams->medusaOutputs->nextDraftTokens = tcc::toTllmTensor(*mNextDraftTokensDevice);
+    outputParams->speculativeDecodingOutputs = DynamicDecodeOutputParams::SpeculativeDecodingOutputs();
+    outputParams->speculativeDecodingOutputs->nextDraftTokens = tcc::toTllmTensor(*mNextDraftTokensDevice);
 
-    outputParams->medusaOutputs->acceptedLengths = tcc::toTllmTensor(*mAcceptedLengths);
+    outputParams->speculativeDecodingOutputs->acceptedLengths = tcc::toTllmTensor(*mAcceptedLengths);
 
-    outputParams->medusaOutputs->acceptedLengthsCumSum = tcc::toTllmTensor(*mAcceptedLengthCumSumDevice);
+    outputParams->speculativeDecodingOutputs->acceptedLengthsCumSum = tcc::toTllmTensor(*mAcceptedLengthCumSumDevice);
 
-    outputParams->medusaOutputs->pathsOffsets = tcc::toTllmTensor(*mPackedPathsDevice);
+    outputParams->speculativeDecodingOutputs->pathsOffsets = tcc::toTllmTensor(*mPackedPathsDevice);
 
     return outputParams;
 }
@@ -406,7 +406,7 @@ void MedusaDecodingLayerTest<T>::runTest(std::vector<std::vector<std::set<TokenI
     auto inputTensors = createInputTensors();
     auto outputTensors = createOutputTensors();
 
-    mMedusaDecodingLayer->forward(outputTensors, inputTensors);
+    mMedusaDecodingLayer->forwardAsync(outputTensors, inputTensors);
 
     mStream->synchronize();
 

@@ -20,6 +20,7 @@ from typing import List, Tuple
 from cuda import cudart
 from cuda.cudart import cudaError_t
 
+from ._utils import mpi_comm
 from .mapping import Mapping
 
 
@@ -38,9 +39,11 @@ def peer_access(mapping: Mapping):
 
 
 def set_peer_access(mapping: Mapping, enabled: bool = True):
-    src_node = mapping.rank
-    for dest_node in mapping.tp_group:
-        if dest_node == src_node:
+    src_node = mapping.local_rank
+    for rank in mapping.tp_group:
+        dest_node = mapping.get_local_rank(rank)
+        if mapping.get_node_rank(
+                rank) != mapping.node_rank or dest_node == src_node:
             continue
 
         error, result = cudart.cudaDeviceCanAccessPeer(src_node, dest_node)
@@ -69,13 +72,19 @@ class IpcMemory():
     # (Max all reduce blocks + 1) * sizeof(int)
     IPC_BARRIERS_SIZE_PER_GPU = (24 + 1) * 4
 
-    def __init__(self, mapping, size):
+    def __init__(self, mapping: Mapping, size: int):
         self.mapping = mapping
-        self.peer_ptrs, self.local_ptr = IpcMemory.open_ipc_memory(
-            self.mapping, size, True)
+        self.open_ipc = mapping.tp_size <= mapping.gpus_per_node
+        if self.open_ipc:
+            self.peer_ptrs, self.local_ptr = IpcMemory.open_ipc_memory(
+                self.mapping, size, True)
+        else:
+            self.peer_ptrs = [0] * mapping.tp_size
+            self.local_ptr = 0
 
     def __del__(self):
-        IpcMemory.close_ipc_memory(self.mapping, self.peer_ptrs)
+        if self.open_ipc:
+            IpcMemory.close_ipc_memory(self.mapping, self.peer_ptrs)
 
     def serialize(self) -> List[int]:
         buffer = bytes(0)
@@ -92,8 +101,7 @@ class IpcMemory():
         Returns a list of buffer pointers, buffers[i] is a handle to the corresponding buffer residing on GPU #i.
         Call close_ipc_handle with the *buffer*.
         """
-        from mpi4py import MPI
-        comm = MPI.COMM_WORLD.Split(mapping.pp_rank, mapping.tp_rank)
+        comm = mpi_comm().Split(mapping.pp_rank, mapping.tp_rank)
 
         error, local_ptr = cudart.cudaMalloc(size)
         _raise_if_error(error)

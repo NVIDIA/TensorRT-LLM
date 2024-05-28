@@ -78,7 +78,7 @@ TopKSamplingLayer<T>::TopKSamplingLayer(
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    allocateBuffer(mDecoderDomain.getMaxBatchSize());
+    allocateBuffer(mDecoderDomain.getBatchSize());
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -113,7 +113,7 @@ void TopKSamplingLayer<T>::allocateBuffer(SizeType32 const batchSize)
 
     mSkipDecodeHost = static_cast<bool*>(std::realloc(mSkipDecodeHost, sizeof(bool) * batchSize));
 
-    mAllocatedSize = std::accumulate(deviceBufferSizes.begin(), deviceBufferSizes.end(), 0);
+    mAllocatedSize = std::accumulate(deviceBufferSizes.begin(), deviceBufferSizes.end(), size_t{0});
     TLLM_LOG_DEBUG("topKSamplingLayer allocated %lu bytes on GPU", mAllocatedSize);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -196,9 +196,9 @@ void TopKSamplingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, Siz
             runtimeTopKSize, topP, mRuntimeTopPDevice, runtimeTopPSize, mSkipDecodeDevice, batchSlots);
     }
 
-    cudaAutoCpy(mSkipDecodeHost, mSkipDecodeDevice, mDecoderDomain.getMaxBatchSize(), mStream);
-    std::vector<SizeType32> runtimeTopKs(mDecoderDomain.getMaxBatchSize());
-    cudaAutoCpy(runtimeTopKs.data(), mRuntimeTopKDevice, mDecoderDomain.getMaxBatchSize(), mStream);
+    cudaAutoCpy(mSkipDecodeHost, mSkipDecodeDevice, mDecoderDomain.getBatchSize(), mStream);
+    std::vector<SizeType32> runtimeTopKs(mDecoderDomain.getBatchSize());
+    cudaAutoCpy(runtimeTopKs.data(), mRuntimeTopKDevice, mDecoderDomain.getBatchSize(), mStream);
     {
         runtime::SizeType32 maxTopK = 0;
         for (SizeType32 bi = 0; bi < batchSize; ++bi)
@@ -217,7 +217,7 @@ void TopKSamplingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, Siz
 }
 
 template <typename T>
-void TopKSamplingLayer<T>::forward(
+void TopKSamplingLayer<T>::forwardAsync(
     std::shared_ptr<BaseOutputParams> baseOutputs, std::shared_ptr<BaseInputParams> baseInputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -277,7 +277,7 @@ void TopKSamplingLayer<T>::forward(
     params.outputLogProbs = outputLogProbs;
     params.curandState = curandStatesDevice;
     params.batchSize = batchSize;
-    params.maxBatchSize = mDecoderDomain.getMaxBatchSize();
+    params.maxBatchSize = mDecoderDomain.getBatchSize();
     params.maxTokensPerStep = 1;
     params.vocabSizePadded = mDecoderDomain.getVocabSizePadded();
     params.normalizeLogProbs = mNormalizeLogProbs;

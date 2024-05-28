@@ -50,19 +50,46 @@ __launch_bounds__(256, 1) __global__ void rg_lru_kernel(lruParams params)
 {
     T* output = reinterpret_cast<T*>(params.out_ptr);
     float* state = reinterpret_cast<float*>(params.state_ptr);
-    T* gate_x = reinterpret_cast<T*>(params.gate_x_ptr);
-    T* gate_a = reinterpret_cast<T*>(params.gate_a_ptr);
     T* x = reinterpret_cast<T*>(params.x_ptr);
     T* y = reinterpret_cast<T*>(params.y_ptr);
     T* y_bias = reinterpret_cast<T*>(params.y_bias_ptr);
     T* A = reinterpret_cast<T*>(params.A_ptr);
     int num_channels = params.width;
+    int block_size = params.block_size;
+
+    bool enable_fuse_gate = (params.gate_ptr != nullptr);
+    bool enable_gate_bias;
+    T *gate_x, *gate_a, *gate_x_bias, *gate_a_bias;
+    if (enable_fuse_gate)
+    {
+        enable_gate_bias = (params.gate_bias_ptr != nullptr);
+        gate_x = reinterpret_cast<T*>(params.gate_ptr);
+        gate_a = reinterpret_cast<T*>(params.gate_ptr);
+        if (enable_gate_bias)
+        {
+            gate_x_bias = reinterpret_cast<T*>(params.gate_bias_ptr);
+            gate_a_bias = reinterpret_cast<T*>(params.gate_bias_ptr);
+        }
+    }
+    else
+    {
+        enable_gate_bias = (params.gate_x_bias_ptr != nullptr);
+        gate_x = reinterpret_cast<T*>(params.gate_x_ptr);
+        gate_a = reinterpret_cast<T*>(params.gate_a_ptr);
+        if (enable_gate_bias)
+        {
+            gate_x_bias = reinterpret_cast<T*>(params.gate_x_bias_ptr);
+            gate_a_bias = reinterpret_cast<T*>(params.gate_a_bias_ptr);
+        }
+    }
 
     __shared__ cuda::pipeline_shared_state<cuda::thread_scope::thread_scope_block, STAGES / SEQ_UNROLL> pipeline_state;
     auto block = cooperative_groups::this_thread_block();
 
     __shared__ __align__(128) T sh_gx[STAGES][CHANNELS_PER_BLOCK];
+    __shared__ __align__(128) T sh_gate_x_bias[CHANNELS_PER_BLOCK];
     __shared__ __align__(128) T sh_ga[STAGES][CHANNELS_PER_BLOCK];
+    __shared__ __align__(128) T sh_gate_a_bias[CHANNELS_PER_BLOCK];
     __shared__ __align__(128) T sh_x[STAGES][CHANNELS_PER_BLOCK];
     __shared__ __align__(128) T sh_y[STAGES][CHANNELS_PER_BLOCK];
     __shared__ __align__(128) T sh_y_bias[CHANNELS_PER_BLOCK];
@@ -89,6 +116,14 @@ __launch_bounds__(256, 1) __global__ void rg_lru_kernel(lruParams params)
 
     int const seq_loops = (num_tokens + SEQ_UNROLL - 1) / SEQ_UNROLL;
     int const block_channel_base = start_token_idx * num_channels + blockIdx.x * blockDim.x;
+    int const gate_num_channels = enable_fuse_gate ? num_channels * 2 : num_channels;
+    int const gate_block_channel_base = start_token_idx * gate_num_channels;
+    int const tid_offset = tid < 64 ? 32 : 64;
+    int const gchannel = sizeof(T) == 4 ? channel : blockIdx.x * blockDim.x + (threadIdx.x - tid_offset) * 4;
+    int const gx_dim_idx = enable_fuse_gate ? gchannel / block_size * block_size * 2 + gchannel % block_size : gchannel;
+    int const ga_dim_idx = enable_fuse_gate ? gx_dim_idx + block_size : gchannel;
+    int const gx_bias_idx = enable_fuse_gate ? channel / block_size * block_size * 2 + channel % block_size : channel;
+    int const ga_bias_idx = enable_fuse_gate ? gx_bias_idx + block_size : channel;
 
     if (threadIdx.y == 1)
     {
@@ -97,6 +132,11 @@ __launch_bounds__(256, 1) __global__ void rg_lru_kernel(lruParams params)
         // Bias and param A are independent of token
         if (y_bias)
             sh_y_bias[tid] = y_bias[channel];
+        if (enable_gate_bias)
+        {
+            sh_gate_x_bias[tid] = gate_x_bias[gx_bias_idx];
+            sh_gate_a_bias[tid] = gate_a_bias[ga_bias_idx];
+        }
         float param_a = cuda_cast<float>(A[channel]);
         sh_a[tid] = param_a <= 20.f ? -8.0f * __logf(1.0f + __expf(param_a)) : -8.0f * param_a;
 
@@ -110,10 +150,13 @@ __launch_bounds__(256, 1) __global__ void rg_lru_kernel(lruParams params)
             for (int token_id = si * SEQ_UNROLL; token_id < num_tokens && token_id < (si + 1) * SEQ_UNROLL; token_id++)
             {
                 int block_channel = block_channel_base + token_id * num_channels;
+                int gate_block_channel = gate_block_channel_base + token_id * gate_num_channels;
                 if (sizeof(T) == 4)
                 {
-                    cuda::memcpy_async(&sh_gx[stage][tid], &gate_x[block_channel + tid], sizeof(T), pipeline);
-                    cuda::memcpy_async(&sh_ga[stage][tid], &gate_a[block_channel + tid], sizeof(T), pipeline);
+                    cuda::memcpy_async(
+                        &sh_gx[stage][tid], &gate_x[gate_block_channel + gx_dim_idx], sizeof(T), pipeline);
+                    cuda::memcpy_async(
+                        &sh_ga[stage][tid], &gate_a[gate_block_channel + ga_dim_idx], sizeof(T), pipeline);
                     cuda::memcpy_async(&sh_x[stage][tid], &x[block_channel + tid], sizeof(T), pipeline);
                     if (y)
                         cuda::memcpy_async(&sh_y[stage][tid], &y[block_channel + tid], sizeof(T), pipeline);
@@ -128,16 +171,16 @@ __launch_bounds__(256, 1) __global__ void rg_lru_kernel(lruParams params)
                     else if (tid < 64)
                     {
                         int tid_tmp = tid - 32;
-                        float2* block_gx = (float2*) &gate_x[block_channel];
+                        float2* block_gx = (float2*) &gate_x[gate_block_channel];
                         cuda::memcpy_async(
-                            (float2*) &sh_gx[stage][tid_tmp * 4], &block_gx[tid_tmp], sizeof(float2), pipeline);
+                            (float2*) &sh_gx[stage][tid_tmp * 4], &block_gx[gx_dim_idx >> 2], sizeof(float2), pipeline);
                     }
                     else if (tid < 96)
                     {
                         int tid_tmp = tid - 64;
-                        float2* block_ga = (float2*) &gate_a[block_channel];
+                        float2* block_ga = (float2*) &gate_a[gate_block_channel];
                         cuda::memcpy_async(
-                            (float2*) &sh_ga[stage][tid_tmp * 4], &block_ga[tid_tmp], sizeof(float2), pipeline);
+                            (float2*) &sh_ga[stage][tid_tmp * 4], &block_ga[ga_dim_idx >> 2], sizeof(float2), pipeline);
                     }
                     else if (tid < 128)
                     {
@@ -176,7 +219,7 @@ __launch_bounds__(256, 1) __global__ void rg_lru_kernel(lruParams params)
                 float y_reg;
                 if (y_bias)
                 {
-                    y_reg = cuda_cast<float>(sh_y[stage][tid]) + cuda_cast<float>(sh_y_bias[tid]);
+                    y_reg = cuda_cast<float>(sh_y[stage][tid] + sh_y_bias[tid]);
                     // GELU
                     float k0 = float(0.7978845608028654);
                     float k1 = float(0.044715);
@@ -193,10 +236,22 @@ __launch_bounds__(256, 1) __global__ void rg_lru_kernel(lruParams params)
                 {
                     y_reg = 1.f;
                 }
+                // Read gate_x
+                float gate_x_reg, gate_a_reg;
+                if (enable_gate_bias)
+                {
+                    gate_x_reg = cuda_cast<float>(-sh_gx[stage][tid] - sh_gate_x_bias[tid]);
+                    gate_a_reg = cuda_cast<float>(-sh_ga[stage][tid] - sh_gate_a_bias[tid]);
+                }
+                else
+                {
+                    gate_x_reg = cuda_cast<float>(-sh_gx[stage][tid]);
+                    gate_a_reg = cuda_cast<float>(-sh_ga[stage][tid]);
+                }
                 // Get gated inputs
                 float x_reg = cuda_cast<float>(sh_x[stage][tid]);
-                float sigmoid_x = __fdividef(1.0f, (1.0f + __expf(cuda_cast<float>(-sh_gx[stage][tid]))));
-                float sigmoid_a = __fdividef(1.0f, (1.0f + __expf(cuda_cast<float>(-sh_ga[stage][tid]))));
+                float sigmoid_x = __fdividef(1.0f, (1.0f + __expf(gate_x_reg)));
+                float sigmoid_a = __fdividef(1.0f, (1.0f + __expf(gate_a_reg)));
                 float log_a = sigmoid_a * sh_a[tid];
                 float a = __expf(log_a);
                 float a_square = __expf(2.0 * log_a);
@@ -235,6 +290,7 @@ void invokeRGLRU(lruParams& params, cudaStream_t stream)
     dim3 block(threads, 2);
     dim3 grid(blocks, samples);
     TLLM_CHECK((channels % block.x) == 0);
+    TLLM_CHECK(!(params.block_size % 4 != 0 && sizeof(T) == 2));
 
     rg_lru_kernel<T><<<grid, block, 0, stream>>>(params);
 }
@@ -255,13 +311,38 @@ __launch_bounds__(128, 2) __global__ void rg_lru_update_kernel(lruParams params)
 {
     T* output = reinterpret_cast<T*>(params.out_ptr);
     float* state = reinterpret_cast<float*>(params.state_ptr);
-    T* gate_x = reinterpret_cast<T*>(params.gate_x_ptr);
-    T* gate_a = reinterpret_cast<T*>(params.gate_a_ptr);
     T* x = reinterpret_cast<T*>(params.x_ptr);
     T* y = reinterpret_cast<T*>(params.y_ptr);
     T* y_bias = reinterpret_cast<T*>(params.y_bias_ptr);
     T* A = reinterpret_cast<T*>(params.A_ptr);
     int num_channels = params.width;
+    int block_size = params.block_size;
+
+    bool enable_fuse_gate = (params.gate_ptr != nullptr);
+    bool enable_gate_bias;
+    T *gate_x, *gate_a, *gate_x_bias, *gate_a_bias;
+    if (enable_fuse_gate)
+    {
+        enable_gate_bias = (params.gate_bias_ptr != nullptr);
+        gate_x = reinterpret_cast<T*>(params.gate_ptr);
+        gate_a = reinterpret_cast<T*>(params.gate_ptr);
+        if (enable_gate_bias)
+        {
+            gate_x_bias = reinterpret_cast<T*>(params.gate_bias_ptr);
+            gate_a_bias = reinterpret_cast<T*>(params.gate_bias_ptr);
+        }
+    }
+    else
+    {
+        enable_gate_bias = (params.gate_x_bias_ptr != nullptr);
+        gate_x = reinterpret_cast<T*>(params.gate_x_ptr);
+        gate_a = reinterpret_cast<T*>(params.gate_a_ptr);
+        if (enable_gate_bias)
+        {
+            gate_x_bias = reinterpret_cast<T*>(params.gate_x_bias_ptr);
+            gate_a_bias = reinterpret_cast<T*>(params.gate_a_bias_ptr);
+        }
+    }
 
     int const channel = blockIdx.x * blockDim.x + threadIdx.x;
     if (channel >= num_channels)
@@ -269,6 +350,10 @@ __launch_bounds__(128, 2) __global__ void rg_lru_update_kernel(lruParams params)
     int const sample = blockIdx.y; // batch id
     int const slot_idx = params.slot_mapping_ptr == nullptr ? sample : params.slot_mapping_ptr[sample];
     int const idx = sample * num_channels + channel;
+    int const gate_num_channels = enable_fuse_gate ? num_channels * 2 : num_channels;
+    int const gate_base_idx = sample * gate_num_channels;
+    int const gx_dim_idx = enable_fuse_gate ? channel / block_size * block_size * 2 + channel % block_size : channel;
+    int const ga_dim_idx = enable_fuse_gate ? gx_dim_idx + block_size : channel;
 
     float state_reg = state[slot_idx * num_channels + channel];
 
@@ -280,7 +365,7 @@ __launch_bounds__(128, 2) __global__ void rg_lru_update_kernel(lruParams params)
     float y_reg;
     if (y_bias)
     {
-        y_reg = cuda_cast<float>(y[idx]) + cuda_cast<float>(y_bias[channel]);
+        y_reg = cuda_cast<float>(y[idx] + y_bias[channel]);
         // GELU
         float k0 = float(0.7978845608028654);
         float k1 = float(0.044715);
@@ -297,10 +382,21 @@ __launch_bounds__(128, 2) __global__ void rg_lru_update_kernel(lruParams params)
     {
         y_reg = 1.f;
     }
-
+    // Read gate_x
+    float gate_x_reg, gate_a_reg;
+    if (enable_gate_bias)
+    {
+        gate_x_reg = cuda_cast<float>(-gate_x[gate_base_idx + gx_dim_idx] - gate_x_bias[gx_dim_idx]);
+        gate_a_reg = cuda_cast<float>(-gate_a[gate_base_idx + ga_dim_idx] - gate_a_bias[ga_dim_idx]);
+    }
+    else
+    {
+        gate_x_reg = cuda_cast<float>(-gate_x[gate_base_idx + gx_dim_idx]);
+        gate_a_reg = cuda_cast<float>(-gate_a[gate_base_idx + ga_dim_idx]);
+    }
     // Get gated inputs
-    float sigmoid_x = __fdividef(1.0f, (1.0f + __expf(cuda_cast<float>(-gate_x[idx]))));
-    float sigmoid_a = __fdividef(1.0f, (1.0f + __expf(cuda_cast<float>(-gate_a[idx]))));
+    float sigmoid_x = __fdividef(1.0f, (1.0f + __expf(gate_x_reg)));
+    float sigmoid_a = __fdividef(1.0f, (1.0f + __expf(gate_a_reg)));
     float log_a = sigmoid_a * c;
     float a = __expf(log_a);
     float a_square = __expf(2.0 * log_a);

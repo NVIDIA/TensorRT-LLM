@@ -82,6 +82,11 @@ public:
         return mDeviceIds[mRank % getGpusPerGroup()];
     }
 
+    [[nodiscard]] SizeType32 getDeviceOf(SizeType32 rank) const noexcept
+    {
+        return mDeviceIds[rank % getGpusPerGroup()];
+    }
+
     [[nodiscard]] SizeType32 constexpr getPipelineParallelRank() const noexcept
     {
         return mRank / mTensorParallelism;
@@ -90,6 +95,21 @@ public:
     [[nodiscard]] SizeType32 constexpr getTensorParallelRank() const noexcept
     {
         return mRank % mTensorParallelism;
+    }
+
+    [[nodiscard]] SizeType32 constexpr getLocalRank() const noexcept
+    {
+        return mRank % mGpusPerNode;
+    }
+
+    [[nodiscard]] SizeType32 constexpr getNodeRank() const noexcept
+    {
+        return mRank / mGpusPerNode;
+    }
+
+    [[nodiscard]] SizeType32 constexpr getNodeRankOf(SizeType32 rank) const noexcept
+    {
+        return rank / mGpusPerNode;
     }
 
     [[nodiscard]] bool constexpr isFirstPipelineParallelRank() const noexcept
@@ -109,6 +129,7 @@ public:
     }
 
     [[nodiscard]] std::vector<SizeType32> getPipelineParallelGroup() const;
+    [[nodiscard]] std::vector<SizeType32> getTensorParallelGroup() const;
 
     static WorldConfig mpi(SizeType32 gpusPerNode = kDefaultGpusPerNode,
         std::optional<SizeType32> tensorParallelism = std::nullopt,

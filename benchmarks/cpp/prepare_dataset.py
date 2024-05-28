@@ -18,6 +18,8 @@ from typing import Optional, Tuple
 import click
 from pydantic import BaseModel, field_validator
 from transformers import AutoTokenizer
+from transformers.tokenization_utils import PreTrainedTokenizer
+from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
 from utils.prepare_real_data import dataset
 from utils.prepare_synthetic_data import token_norm_dist
 
@@ -27,10 +29,12 @@ class RootArgs(BaseModel):
     output: str
     random_seed: int
     task_id: int
+    std_out: bool
     rand_task_id: Optional[Tuple[int, int]]
 
     @field_validator('tokenizer')
-    def get_tokenizer(cls, v: str):
+    def get_tokenizer(cls,
+                      v: str) -> PreTrainedTokenizer | PreTrainedTokenizerFast:
         try:
             tokenizer = AutoTokenizer.from_pretrained(v, padding_side='left')
         except EnvironmentError as e:
@@ -53,6 +57,11 @@ class RootArgs(BaseModel):
               type=str,
               help="Output json filename.",
               default="preprocessed_dataset.json")
+@click.option(
+    "--stdout",
+    is_flag=True,
+    help="Print output to stdout with a JSON dataset entry on each line.",
+    default=False)
 @click.option("--random-seed",
               required=False,
               type=int,
@@ -80,6 +89,7 @@ def cli(ctx, **kwargs):
 
     ctx.obj = RootArgs(tokenizer=kwargs['tokenizer'],
                        output=kwargs['output'],
+                       std_out=kwargs['stdout'],
                        random_seed=kwargs['random_seed'],
                        task_id=kwargs['task_id'],
                        rand_task_id=kwargs['rand_task_id'])

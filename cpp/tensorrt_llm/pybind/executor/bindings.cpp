@@ -50,13 +50,22 @@ void InitBindings(pybind11::module_& m)
         .value("STATIC", tle::BatchingType::kSTATIC)
         .value("INFLIGHT", tle::BatchingType::kINFLIGHT);
 
-    py::enum_<tle::DecodingMode>(m, "DecodingMode")
-        .value("NONE", tle::DecodingMode::kNONE)
-        .value("TOP_K", tle::DecodingMode::kTOP_K)
-        .value("TOP_P", tle::DecodingMode::kTOP_P)
-        .value("BEAM_SEARCH", tle::DecodingMode::kBEAM_SEARCH)
-        .value("MEDUSA", tle::DecodingMode::kMEDUSA)
-        .value("TOP_K_TOP_P", tle::DecodingMode::kTOP_K_TOP_P);
+    py::class_<tle::DecodingMode>(m, "DecodingMode")
+        .def("Auto", &tle::DecodingMode::Auto)
+        .def("TopK", &tle::DecodingMode::TopK)
+        .def("TopP", &tle::DecodingMode::TopP)
+        .def("TopKTopP", &tle::DecodingMode::TopKTopP)
+        .def("BeamSearch", &tle::DecodingMode::BeamSearch)
+        .def("Medusa", &tle::DecodingMode::Medusa)
+        .def("Lookahead", &tle::DecodingMode::Lookahead)
+        .def("isAuto", &tle::DecodingMode::isAuto)
+        .def("isTopK", &tle::DecodingMode::isTopK)
+        .def("isTopP", &tle::DecodingMode::isTopP)
+        .def("isTopKorTopP", &tle::DecodingMode::isTopKorTopP)
+        .def("isTopKandTopP", &tle::DecodingMode::isTopKandTopP)
+        .def("isBeamSearch", &tle::DecodingMode::isBeamSearch)
+        .def("isMedusa", &tle::DecodingMode::isMedusa)
+        .def("isLookahead", &tle::DecodingMode::isLookahead);
 
     py::enum_<tle::CapacitySchedulerPolicy>(m, "CapacitySchedulerPolicy")
         .value("MAX_UTILIZATION", tle::CapacitySchedulerPolicy::kMAX_UTILIZATION)
@@ -94,7 +103,8 @@ void InitBindings(pybind11::module_& m)
         .def_readwrite("num_gen_requests", &tle::InflightBatchingStats::numGenRequests)
         .def_readwrite("num_paused_requests", &tle::InflightBatchingStats::numPausedRequests)
         .def_readwrite("num_ctx_tokens", &tle::InflightBatchingStats::numCtxTokens)
-        .def_readwrite("micro_batch_id", &tle::InflightBatchingStats::microBatchId);
+        .def_readwrite("micro_batch_id", &tle::InflightBatchingStats::microBatchId)
+        .def_readwrite("avg_num_decoded_tokens_per_iter", &tle::InflightBatchingStats::avgNumDecodedTokensPerIter);
 
     py::class_<tle::IterationStats>(m, "IterationStats")
         .def(py::init<>())
@@ -124,6 +134,7 @@ void InitBindings(pybind11::module_& m)
         .def_readwrite("stage", &tle::RequestStats::stage)
         .def_readwrite("context_prefill_position", &tle::RequestStats::contextPrefillPosition)
         .def_readwrite("num_generated_tokens", &tle::RequestStats::numGeneratedTokens)
+        .def_readwrite("avg_num_decoded_tokens_per_iter", &tle::RequestStats::avgNumDecodedTokensPerIter)
         .def_readwrite("scheduled", &tle::RequestStats::scheduled)
         .def_readwrite("paused", &tle::RequestStats::paused)
         .def("to_json_str",
@@ -151,21 +162,25 @@ void InitBindings(pybind11::module_& m)
             py::arg("beam_search_diversity_rate") = py::none(), py::arg("repetition_penalty") = py::none(),
             py::arg("presence_penalty") = py::none(), py::arg("frequency_penalty") = py::none(),
             py::arg("length_penalty") = py::none(), py::arg("early_stopping") = py::none())
-        .def_property_readonly("beam_width", &tle::SamplingConfig::getBeamWidth)
-        .def_property_readonly("top_k", &tle::SamplingConfig::getTopK)
-        .def_property_readonly("top_p", &tle::SamplingConfig::getTopP)
-        .def_property_readonly("top_p_min", &tle::SamplingConfig::getTopPMin)
-        .def_property_readonly("top_p_reset_ids", &tle::SamplingConfig::getTopPResetIds)
-        .def_property_readonly("top_p_decay", &tle::SamplingConfig::getTopPDecay)
-        .def_property_readonly("random_seed", &tle::SamplingConfig::getRandomSeed)
-        .def_property_readonly("temperature", &tle::SamplingConfig::getTemperature)
-        .def_property_readonly("min_length", &tle::SamplingConfig::getMinLength)
-        .def_property_readonly("beam_search_diversity_rate", &tle::SamplingConfig::getBeamSearchDiversityRate)
-        .def_property_readonly("repetition_penalty", &tle::SamplingConfig::getRepetitionPenalty)
-        .def_property_readonly("presence_penalty", &tle::SamplingConfig::getPresencePenalty)
-        .def_property_readonly("frequency_penalty", &tle::SamplingConfig::getFrequencyPenalty)
-        .def_property_readonly("length_penalty", &tle::SamplingConfig::getLengthPenalty)
-        .def_property_readonly("early_stopping", &tle::SamplingConfig::getEarlyStopping);
+        .def_property("beam_width", &tle::SamplingConfig::getBeamWidth, &tle::SamplingConfig::setBeamWidth)
+        .def_property("top_k", &tle::SamplingConfig::getTopK, &tle::SamplingConfig::setTopK)
+        .def_property("top_p", &tle::SamplingConfig::getTopP, &tle::SamplingConfig::setTopP)
+        .def_property("top_p_min", &tle::SamplingConfig::getTopPMin, &tle::SamplingConfig::setTopPMin)
+        .def_property("top_p_reset_ids", &tle::SamplingConfig::getTopPResetIds, &tle::SamplingConfig::setTopPResetIds)
+        .def_property("top_p_decay", &tle::SamplingConfig::getTopPDecay, &tle::SamplingConfig::setTopPDecay)
+        .def_property("random_seed", &tle::SamplingConfig::getRandomSeed, &tle::SamplingConfig::setRandomSeed)
+        .def_property("temperature", &tle::SamplingConfig::getTemperature, &tle::SamplingConfig::setTemperature)
+        .def_property("min_length", &tle::SamplingConfig::getMinLength, &tle::SamplingConfig::setMinLength)
+        .def_property("beam_search_diversity_rate", &tle::SamplingConfig::getBeamSearchDiversityRate,
+            &tle::SamplingConfig::setBeamSearchDiversityRate)
+        .def_property("repetition_penalty", &tle::SamplingConfig::getRepetitionPenalty,
+            &tle::SamplingConfig::setRepetitionPenalty)
+        .def_property("presence_penalty", &tle::SamplingConfig::getPresencePenalty,
+            [](tle::SamplingConfig& self, std::optional<FloatType> v) { return self.setPresencePenalty(v); })
+        .def_property(
+            "frequency_penalty", &tle::SamplingConfig::getFrequencyPenalty, &tle::SamplingConfig::setFrequencyPenalty)
+        .def_property("length_penalty", &tle::SamplingConfig::getLengthPenalty, &tle::SamplingConfig::setLengthPenalty)
+        .def_property("early_stopping", &tle::SamplingConfig::getEarlyStopping, &tle::SamplingConfig::setEarlyStopping);
 
     py::class_<tle::OutputConfig>(m, "OutputConfig")
         .def(py::init<bool, bool, bool, bool>(), py::arg("return_log_probs") = false,
@@ -176,12 +191,12 @@ void InitBindings(pybind11::module_& m)
         .def_readwrite("return_generation_logits", &tle::OutputConfig::returnGenerationLogits)
         .def_readwrite("exclude_input_from_output", &tle::OutputConfig::excludeInputFromOutput);
 
-    py::class_<tle::SpeculativeDecodingConfig>(m, "SpeculativeDecodingConfig")
+    py::class_<tle::ExternalDraftTokensConfig>(m, "ExternalDraftTokensConfig")
         .def(py::init<VecTokens, std::optional<Tensor>, std::optional<FloatType> const&>(), py::arg("tokens"),
             py::arg("logits") = py::none(), py::arg("acceptance_threshold") = py::none())
-        .def_property_readonly("tokens", &tle::SpeculativeDecodingConfig::getTokens)
-        .def_property_readonly("logits", &tle::SpeculativeDecodingConfig::getLogits)
-        .def_property_readonly("acceptance_threshold", &tle::SpeculativeDecodingConfig::getAcceptanceThreshold);
+        .def_property_readonly("tokens", &tle::ExternalDraftTokensConfig::getTokens)
+        .def_property_readonly("logits", &tle::ExternalDraftTokensConfig::getLogits)
+        .def_property_readonly("acceptance_threshold", &tle::ExternalDraftTokensConfig::getAcceptanceThreshold);
 
     py::class_<tle::PromptTuningConfig>(m, "PromptTuningConfig")
         .def(py::init<Tensor>(), py::arg("embedding_table"))
@@ -198,13 +213,13 @@ void InitBindings(pybind11::module_& m)
         .def(py::init<VecTokens, SizeType32, bool, tle::SamplingConfig const&, tle::OutputConfig const&,
                  std::optional<SizeType32> const&, std::optional<SizeType32> const&,
                  std::optional<std::list<VecTokens>>, std::optional<std::list<VecTokens>>, std::optional<Tensor>,
-                 std::optional<tle::SpeculativeDecodingConfig>, std::optional<tle::PromptTuningConfig>,
+                 std::optional<tle::ExternalDraftTokensConfig>, std::optional<tle::PromptTuningConfig>,
                  std::optional<tle::LoraConfig>, std::optional<std::string>>(),
             py::arg("input_token_ids"), py::arg("max_new_tokens"), py::arg("streaming") = false,
             py::arg_v("sampling_config", tle::SamplingConfig(), "SamplingConfig()"),
             py::arg_v("output_config", tle::OutputConfig(), "OutputConfig()"), py::arg("end_id") = py::none(),
             py::arg("pad_id") = py::none(), py::arg("bad_words") = py::none(), py::arg("stop_words") = py::none(),
-            py::arg("embedding_bias") = py::none(), py::arg("speculative_decoding_config") = py::none(),
+            py::arg("embedding_bias") = py::none(), py::arg("external_draft_tokens_config") = py::none(),
             py::arg("prompt_tuning_config") = py::none(), py::arg("lora_config") = py::none(),
             py::arg("logits_post_processor_name") = py::none())
         .def_property_readonly("input_token_ids", &tle::Request::getInputTokenIds)
@@ -217,8 +232,8 @@ void InitBindings(pybind11::module_& m)
         .def_property("bad_words", &tle::Request::getBadWords, &tle::Request::setBadWords)
         .def_property("stop_words", &tle::Request::getStopWords, &tle::Request::setStopWords)
         .def_property("embedding_bias", &tle::Request::getEmbeddingBias, &tle::Request::setEmbeddingBias)
-        .def_property("speculative_decoding_config", &tle::Request::getSpeculativeDecodingConfig,
-            &tle::Request::setSpeculativeDecodingConfig)
+        .def_property("external_draft_tokens_config", &tle::Request::getExternalDraftTokensConfig,
+            &tle::Request::setExternalDraftTokensConfig)
         .def_property(
             "prompt_tuning_config", &tle::Request::getPromptTuningConfig, &tle::Request::setPromptTuningConfig)
         .def_property("lora_config", &tle::Request::getLoraConfig, &tle::Request::setLoraConfig)
@@ -324,11 +339,30 @@ void InitBindings(pybind11::module_& m)
         .def_property_readonly("device_cache_percent", &tle::PeftCacheConfig::getDeviceCachePercent)
         .def_property_readonly("host_cache_size", &tle::PeftCacheConfig::getHostCacheSize);
 
+    py::class_<tle::LookaheadDecodingConfig>(m, "LookaheadDecodingConfig")
+        .def(py::init<SizeType32, SizeType32, SizeType32>(), py::arg("max_ngram_size"), py::arg("max_window_size"),
+            py::arg("max_verification_set_size"))
+        .def_property("max_ngram_size", &tle::LookaheadDecodingConfig::getMaxNgramSize,
+            &tle::LookaheadDecodingConfig::setMaxNgramSize)
+        .def_property("max_window_size", &tle::LookaheadDecodingConfig::getMaxWindowSize,
+            &tle::LookaheadDecodingConfig::setMaxWindowSize)
+        .def_property("max_verification_set_size", &tle::LookaheadDecodingConfig::getMaxVerificationSetSize,
+            &tle::LookaheadDecodingConfig::setMaxVerificationSetSize);
+
+    py::class_<tle::DecodingConfig>(m, "DecodingConfig")
+        .def(py::init<std::optional<tle::DecodingMode>, std::optional<tle::LookaheadDecodingConfig>,
+                 std::optional<tle::MedusaChoices>>(),
+            py::arg("decoding_mode") = py::none(), py::arg("lookahead_decoding_config") = py::none(),
+            py::arg("medusa_choices") = py::none())
+        .def_property("decoding_mode", &tle::DecodingConfig::getDecodingMode, &tle::DecodingConfig::setDecodingMode)
+        .def_property("lookahead_decoding_config", &tle::DecodingConfig::getLookaheadDecodingConfig,
+            &tle::DecodingConfig::setLookaheadDecoding)
+        .def_property("medusa_choices", &tle::DecodingConfig::getMedusaChoices, &tle::DecodingConfig::setMedusaChoices);
+
     py::class_<tle::ExecutorConfig>(m, "ExecutorConfig")
         .def(py::init<SizeType32, tle::SchedulerConfig const&, tle::KvCacheConfig const&, bool, bool, SizeType32,
                  SizeType32, tle::BatchingType, std::optional<tle::ParallelConfig>, tle::PeftCacheConfig const&,
-                 std::optional<tle::LogitsPostProcessorMap>, std::optional<tle::MedusaChoices>,
-                 std::optional<tle::DecodingMode>>(),
+                 std::optional<tle::LogitsPostProcessorMap>, std::optional<tle::DecodingConfig>>(),
             py::arg("max_beam_width") = 1, py::arg_v("scheduler_config", tle::SchedulerConfig(), "SchedulerConfig()"),
             py::arg_v("kv_cache_config", tle::KvCacheConfig(), "KvCacheConfig()"),
             py::arg("enable_chunked_context") = false, py::arg("normalize_log_probs") = true,
@@ -337,8 +371,7 @@ void InitBindings(pybind11::module_& m)
             py::arg_v("batching_type", tle::BatchingType::kINFLIGHT, "BatchingType.INFLIGHT"),
             py::arg("parallel_config") = py::none(),
             py::arg_v("peft_cache_config", tle::PeftCacheConfig(), "PeftCacheConfig()"),
-            py::arg("logits_post_processor_map") = py::none(), py::arg("medusa_choices") = py::none(),
-            py::arg("decoding_mode") = py::none())
+            py::arg("logits_post_processor_map") = py::none(), py::arg("decoding_config") = py::none())
         .def_property("max_beam_width", &tle::ExecutorConfig::getMaxBeamWidth, &tle::ExecutorConfig::setMaxBeamWidth)
         .def_property(
             "scheduler_config", &tle::ExecutorConfig::getSchedulerConfig, &tle::ExecutorConfig::setSchedulerConfig)
@@ -358,8 +391,8 @@ void InitBindings(pybind11::module_& m)
             "peft_cache_config", &tle::ExecutorConfig::getPeftCacheConfig, &tle::ExecutorConfig::setPeftCacheConfig)
         .def_property("logits_post_processor_map", &tle::ExecutorConfig::getLogitsPostProcessorMap,
             &tle::ExecutorConfig::setLogitsPostProcessorMap)
-        .def_property("medusa_choices", &tle::ExecutorConfig::getMedusaChoices, &tle::ExecutorConfig::setMedusaChoices)
-        .def_property("decoding_mode", &tle::ExecutorConfig::getDecodingMode, &tle::ExecutorConfig::setDecodingMode);
+        .def_property(
+            "decoding_config", &tle::ExecutorConfig::getDecodingConfig, &tle::ExecutorConfig::setDecodingConfig);
 
     tensorrt_llm::pybind::executor::Executor::initBindings(m);
 }

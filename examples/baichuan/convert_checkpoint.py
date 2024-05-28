@@ -33,7 +33,8 @@ from transformers.pytorch_utils import Conv1D
 
 import tensorrt_llm
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.convert_utils import weight_only_quantize_dict
+from tensorrt_llm.models.convert_utils import (load_calib_dataset,
+                                               weight_only_quantize_dict)
 from tensorrt_llm.quantization import QuantAlgo
 
 
@@ -64,6 +65,13 @@ def parse_arguments():
         type=int,
         default=1,
         help='The number of workers for converting checkpoint in parallel')
+    parser.add_argument(
+        '--calib_dataset',
+        type=str,
+        default='ccdv/cnn_dailymail',
+        help=
+        "The huggingface dataset name or the local directory of the dataset for calibration."
+    )
     parser.add_argument(
         '--per_channel',
         default=False,
@@ -317,7 +325,11 @@ def smooth_gemm_fc1_gate(fc1_weights,
 
 
 @torch.no_grad()
-def capture_activation_range(model, tokenizer, num_samples=512, seq_len=512):
+def capture_activation_range(model,
+                             tokenizer,
+                             dataset,
+                             num_samples=512,
+                             seq_len=512):
     model.eval()
     next(model.parameters()).device
     act_scales = defaultdict(lambda: {"x": None, "y": None, "w": None})
@@ -353,12 +365,9 @@ def capture_activation_range(model, tokenizer, num_samples=512, seq_len=512):
                 m.register_forward_hook(
                     functools.partial(stat_input_hook, name=name)))
 
-    from datasets import load_dataset
-    dataset_cnn = load_dataset("ccdv/cnn_dailymail", '3.0.0')
-
     for i in tqdm(range(num_samples), desc="calibrating model"):
-        datapoint = dataset_cnn['train'][i:i + 1]
-        line = copy.copy(datapoint['article'])
+        datapoint = dataset[i:i + 1]
+        line = copy.copy(datapoint)
         line[0] = line[0] + ' TL;DR: '
         line[0] = line[0].strip()
         line[0] = line[0].replace(" n't", "n't")
@@ -1175,11 +1184,12 @@ if __name__ == '__main__':
     if args.smoothquant is not None or args.int8_kv_cache:
         act_range = {}
         baichuan_smoother = {}
-        act_range = capture_activation_range(
-            hf_model.cuda(),
-            AutoTokenizer.from_pretrained(args.model_dir,
-                                          use_fast=False,
-                                          trust_remote_code=True))
+        tokenizer = AutoTokenizer.from_pretrained(args.model_dir,
+                                                  use_fast=False,
+                                                  trust_remote_code=True)
+        dataset = load_calib_dataset(args.calib_dataset)
+        act_range = capture_activation_range(hf_model.cuda(), tokenizer,
+                                             dataset)
         if args.smoothquant is not None:
             smooth_baichuan_model(hf_model, act_range, args.smoothquant,
                                   baichuan_smoother)

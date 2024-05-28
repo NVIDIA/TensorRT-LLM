@@ -2,12 +2,14 @@ import argparse
 import json
 import os
 import sys
+from io import BytesIO
 from pathlib import Path
 
 import requests
 
 # isort: off
 import torch
+import numpy as np
 import tensorrt as trt
 # isort: on
 
@@ -15,7 +17,8 @@ from huggingface_hub import hf_hub_download
 from PIL import Image
 from torchvision import transforms
 from transformers import (AutoConfig, AutoProcessor, AutoTokenizer,
-                          Blip2Processor, NougatProcessor, NougatTokenizerFast)
+                          Blip2Processor, CLIPImageProcessor, NougatProcessor,
+                          NougatTokenizerFast)
 
 import tensorrt_llm
 import tensorrt_llm.profiler as profiler
@@ -62,6 +65,18 @@ def parse_arguments():
     parser.add_argument('--check_accuracy',
                         action='store_true',
                         help='Check correctness of text output')
+    parser.add_argument('--video_path',
+                        type=str,
+                        default=None,
+                        help='Path to your local video file')
+    parser.add_argument("--image_path",
+                        type=str,
+                        default=None,
+                        help='List of input image paths, separated by symbol')
+    parser.add_argument("--path_sep",
+                        type=str,
+                        default=",",
+                        help='Path separator symbol')
 
     return parser.parse_args()
 
@@ -105,6 +120,9 @@ class MultimodalModelRunner:
             or self.model_type in ['nougat', 'pix2struct']
         )  # BLIP2-T5, pix2struct and Nougat are using encoder-decoder models as LLMs
 
+        if self.model_type == 'video-neva':
+            self.num_frames = config['builder_config'].get('num_frames', None)
+
         self.profiling_iterations = 20
 
         self.init_image_encoder()
@@ -115,7 +133,7 @@ class MultimodalModelRunner:
         if self.model_type == 'nougat':
             self.tokenizer = NougatTokenizerFast.from_pretrained(
                 self.args.hf_model_dir)
-        elif self.model_type == 'neva':
+        elif self.model_type == 'neva' or self.model_type == 'video-neva':
             from sentencepiece import SentencePieceProcessor
 
             sp = SentencePieceProcessor(
@@ -155,6 +173,11 @@ class MultimodalModelRunner:
             self.tokenizer.eos_token_id = sp.eos_id()
             self.tokenizer.bos_token_id = sp.bos_id()
             self.tokenizer.pad_token_id = sp.pad_id()
+        elif self.model_type == 'vila':
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.args.hf_model_dir + "/llm",
+                use_fast=False,
+                use_legacy=False)
         else:
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.args.hf_model_dir, use_fast=False, use_legacy=False)
@@ -193,6 +216,41 @@ class MultimodalModelRunner:
                 self.model_config = self.model.encoder_model_config
                 self.runtime_mapping = self.model.encoder_runtime_mapping
 
+    def video_preprocess(self, video_path):
+        from decord import VideoReader
+        if isinstance(video_path, str):
+            vr = VideoReader(video_path)
+            num_frames = self.num_frames
+            if num_frames == -1:
+                frames = [
+                    Image.fromarray(frame.asnumpy()[:, :, ::-1]).convert('RGB')
+                    for frame in vr
+                ]
+            else:
+                # equally sliced frames into self.num_frames frames
+                # if self.num_frames is greater than the number of frames in the video, we will repeat the last frame
+                num_frames = min(num_frames, len(vr))
+                indices = np.linspace(0, len(vr) - 1, num=num_frames, dtype=int)
+                frames = [
+                    Image.fromarray(
+                        vr[idx].asnumpy()[:, :, ::-1]).convert('RGB')
+                    for idx in indices
+                ]
+                if len(frames) < num_frames:
+                    frames += [frames[-1]] * (num_frames - len(frames))
+        else:
+            frames = self.video_path
+
+        processor = CLIPImageProcessor.from_pretrained(
+            "openai/clip-vit-large-patch14", torch_dtype=torch.bfloat16)
+        frames = processor.preprocess(frames,
+                                      return_tensors="pt")['pixel_values']
+        # make dtype consistent with vision encoder
+        media_tensors = frames.to(
+            tensorrt_llm._utils.str_dtype_to_torch(
+                self.vision_precision))  # [num_frames, 3, H, W]
+        return media_tensors.unsqueeze(0)  #[1, num_frames, 3, H, W]
+
     def preprocess(self, warmup, pre_prompt, post_prompt, image,
                    attention_mask):
         if self.model_type == 'kosmos-2':
@@ -229,8 +287,29 @@ class MultimodalModelRunner:
                                                 image_patches_indices)
             input_ids = torch.stack(input_ids, dim=0).to('cpu')
             length = input_ids.shape[1]
+
         elif self.model_type == 'kosmos-2':
             visual_features = visual_features.squeeze()
+        elif self.model_type == 'vila':
+            input_ids = self.tokenizer_image_token(
+                args.batch_size, pre_prompt[0] + post_prompt[0], self.tokenizer)
+            batch_split_prompts = self.split_prompt_by_images(input_ids)
+            first_batch_split_prompts = batch_split_prompts[0]
+            # compute prompt length + visual length
+            length = sum([ids.shape[1] for ids in first_batch_split_prompts])
+            if args.batch_size == 1 and len(image) > 1:
+                # mode 1: multiple image as a whole, flatten visual dims
+                length += visual_atts.shape[0] * visual_atts.shape[1]
+            else:
+                # mode 2: multiple images individually (replicate prompt for each image)
+                length += visual_atts.shape[1]
+
+            input_lengths = torch.IntTensor([length] * args.batch_size).to(
+                torch.int32)
+            input_ids, ptuning_args = self.setup_fake_prompts_vila(
+                args.batch_size, visual_features, first_batch_split_prompts,
+                input_lengths)
+            return input_ids, input_lengths, ptuning_args, visual_features
         else:
             pre_input_ids = self.tokenizer(pre_prompt,
                                            return_tensors="pt",
@@ -239,8 +318,12 @@ class MultimodalModelRunner:
                 post_input_ids = self.tokenizer(post_prompt,
                                                 return_tensors="pt",
                                                 padding=True).input_ids
-                length = pre_input_ids.shape[1] + post_input_ids.shape[
-                    1] + visual_atts.shape[1]
+                if self.model_type == 'video-neva':
+                    length = pre_input_ids.shape[1] + post_input_ids.shape[
+                        1] + visual_atts.shape[2] * visual_atts.shape[1]
+                else:
+                    length = pre_input_ids.shape[1] + post_input_ids.shape[
+                        1] + visual_atts.shape[1]
             else:
                 post_input_ids = None
                 length = pre_input_ids.shape[1] + visual_atts.shape[1]
@@ -256,6 +339,57 @@ class MultimodalModelRunner:
 
         return input_ids, input_lengths, ptuning_args, visual_features
 
+    @staticmethod
+    def tokenizer_image_token(batch_size,
+                              prompt,
+                              tokenizer,
+                              image_token_index=-200):
+        prompt_chunks = [
+            tokenizer(chunk).input_ids for chunk in prompt.split("<image>")
+        ]
+
+        def insert_separator(X, sep):
+            return [
+                ele for sublist in zip(X, [sep] * len(X)) for ele in sublist
+            ][:-1]
+
+        input_ids = []
+        offset = 0
+        if (len(prompt_chunks) > 0 and len(prompt_chunks[0]) > 0
+                and prompt_chunks[0][0] == tokenizer.bos_token_id):
+            offset = 1
+            input_ids.append(prompt_chunks[0][0])
+
+        for x in insert_separator(prompt_chunks,
+                                  [image_token_index] * (offset + 1)):
+            input_ids.extend(x[offset:])
+
+        input_ids = torch.tensor(input_ids, dtype=torch.long)
+        input_ids[input_ids == image_token_index] = 0
+        input_ids = input_ids.unsqueeze(0).expand(batch_size, -1)
+        return input_ids
+
+    def split_prompt_by_images(self, tensor):
+        batch_splits = []
+        for batch in tensor:
+            # Find indices where value is zero (<image>)
+            zero_indices = (batch == 0).nonzero(as_tuple=False).squeeze(0)
+            # Add starting point for slicing
+            start_idx = 0
+            splits = []
+            for idx in zero_indices:
+                if start_idx != idx:  # Ensure not slicing zero-length tensors
+                    splits.append(batch[start_idx:idx].unsqueeze(0))
+                start_idx = idx + 1  # Move start index past the zero
+            if start_idx < len(
+                    batch):  # Handle last segment if it's not zero-ending
+                splits.append(batch[start_idx:].unsqueeze(0))
+            # Remove empty tensors resulting from consecutive zeros
+            splits = [split for split in splits if split.numel() > 0]
+            batch_splits.append(splits)
+
+        return batch_splits
+
     def generate(self, pre_prompt, post_prompt, image, decoder_input_ids,
                  max_new_tokens, attention_mask, warmup):
         if not warmup:
@@ -263,7 +397,6 @@ class MultimodalModelRunner:
 
         input_ids, input_lengths, ptuning_args, visual_features = self.preprocess(
             warmup, pre_prompt, post_prompt, image, attention_mask)
-
         if warmup: return None
 
         profiler.start("LLM")
@@ -355,8 +488,10 @@ class MultimodalModelRunner:
             tensor_info.append(
                 TensorInfo('attention_mask', trt.DataType.INT32,
                            attention_mask.shape))
+
         visual_output_info = self.visual_encoder_session.infer_shapes(
             tensor_info)
+
         visual_outputs = {
             t.name: torch.empty(tuple(t.shape),
                                 dtype=trt_dtype_to_torch(t.dtype),
@@ -375,9 +510,64 @@ class MultimodalModelRunner:
 
         return image_embeds, image_atts
 
+    def setup_fake_prompts_vila(self, batch_size, visual_features,
+                                split_input_ids, input_lengths):
+        # visual_features (num_images, feature_len, token_embed)
+        # Assemble fake prompts which points to image embedding actually
+        fake_prompt_counter = self.model_config.vocab_size
+        if batch_size == 1:
+            # only check for multi-image inference (mode 1)
+            assert len(visual_features) <= len(
+                split_input_ids
+            ), "Unexpected number of visual features. Please check #<image> in prompt and the #image files."
+
+        input_ids = []
+        if batch_size == 1:
+            # mode 1: multiple image as a whole, concat all prompts together, <pre><image1><inter><image2>...<post>
+            input_ids = [split_input_ids[0]]
+            for idx, visual_feature in enumerate(visual_features):
+                fake_prompt_id = torch.arange(
+                    fake_prompt_counter,
+                    fake_prompt_counter + visual_feature.shape[0])
+                fake_prompt_counter += visual_feature.shape[0]
+                fake_prompt_id = fake_prompt_id.unsqueeze(0)
+                input_ids.append(fake_prompt_id)
+                # in case no post prompt
+                if len(split_input_ids) > idx + 1:
+                    input_ids.append(split_input_ids[idx + 1])
+
+        elif batch_size > 1:
+            # mode 2: each image have individual prompt, <pre><image><post>
+            for idx, visual_feature in enumerate(visual_features):
+                input_ids.append(split_input_ids[0])
+                fake_prompt_id = torch.arange(
+                    fake_prompt_counter,
+                    fake_prompt_counter + visual_feature.shape[0])
+                fake_prompt_counter += visual_feature.shape[0]
+                fake_prompt_id = fake_prompt_id.unsqueeze(0)
+                input_ids.append(fake_prompt_id)
+                if len(split_input_ids) > 1:
+                    input_ids.append(split_input_ids[1])
+
+        input_ids = torch.cat(input_ids, dim=1).contiguous().to(torch.int32)
+        input_ids = input_ids.reshape(batch_size, -1)
+
+        if self.decoder_llm or self.runtime_mapping.is_first_pp_rank():
+            ptuning_args = self.ptuning_setup(visual_features, input_ids,
+                                              input_lengths)
+        else:
+            ptuning_args = [None, None, None]
+
+        return input_ids, ptuning_args
+
     def setup_fake_prompts(self, visual_features, pre_input_ids, post_input_ids,
                            input_lengths):
         # Assemble fake prompts which points to image embedding actually
+        if hasattr(self, 'num_frames') and (visual_features.shape[1]
+                                            == self.num_frames):
+            visual_features = visual_features.view(visual_features.shape[0], -1,
+                                                   visual_features.shape[-1])
+
         fake_prompt_id = torch.arange(
             self.model_config.vocab_size, self.model_config.vocab_size +
             visual_features.shape[0] * visual_features.shape[1])
@@ -453,9 +643,31 @@ class MultimodalModelRunner:
 
     def load_test_image(self):
         if "vila" in self.model_type:
-            img_url = 'https://github.com/Efficient-Large-Model/VILA/raw/main/demo_images/av.png'
-            image = Image.open(requests.get(img_url,
-                                            stream=True).raw).convert('RGB')
+            if self.args.image_path is None:
+                img_url = 'https://github.com/Efficient-Large-Model/VILA/raw/main/demo_images/av.png'
+                self.args.image_path = img_url
+                image = Image.open(requests.get(img_url,
+                                                stream=True).raw).convert('RGB')
+                return [image] * self.args.batch_size
+            else:
+
+                def load_image(image_path):
+                    if image_path.startswith("http") or image_path.startswith(
+                            "https"):
+                        logger.info(f"downloading image from url {image_path}")
+                        response = requests.get(image_path)
+                        image = Image.open(BytesIO(
+                            response.content)).convert("RGB")
+                    else:
+                        image = Image.open(image_path).convert("RGB")
+                    return image
+
+                out = []
+                image_paths = self.args.image_path.split(self.args.path_sep)
+                for image_path in image_paths:
+                    image = load_image(image_path)
+                    out.append(image)
+                return out
         elif "nougat" in self.model_type:
             filepath = hf_hub_download(
                 repo_id="hf-internal-testing/fixtures_docvqa",
@@ -475,6 +687,8 @@ class MultimodalModelRunner:
             img_url = 'https://raw.githubusercontent.com/vis-nlp/ChartQA/main/ChartQA%20Dataset/val/png/multi_col_40963.png'
             image = Image.open(requests.get(img_url,
                                             stream=True).raw).convert('RGB')
+        elif "video-neva" in self.model_type:
+            image = args.video_path
         else:
             img_url = 'https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png'
             image = Image.open(requests.get(img_url,
@@ -538,7 +752,7 @@ class MultimodalModelRunner:
                                                    -1).contiguous()
             pre_prompt = ""
             post_prompt = None
-        elif 'neva' in self.model_type:
+        elif self.model_type == "neva":
             image_size = 384
             dtype = torch.float32
             transform = transforms.Compose([
@@ -555,6 +769,19 @@ class MultimodalModelRunner:
 
             pre_prompt = "<extra_id_0>System\n\n<extra_id_1>User\n"
             post_prompt = f"\n{input_text}\n<extra_id_1>Assistant\n"
+
+        elif self.model_type == "video-neva":
+
+            image = self.video_preprocess(
+                raw_image)  # shape (1, num_frames, 3, H, W)
+
+            if input_text is None:
+                input_text = "Hi! What is in this video?"
+
+            # SteerLM prompt template
+            pre_prompt = """<extra_id_0>System\nA chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions.\n\n<extra_id_1>User"""
+            post_prompt = f"\n{input_text}\n<extra_id_1>Assistant\n<extra_id_2>quality:4,toxicity:0,humor:0,creativity:0,helpfulness:4,correctness:4,coherence:4,complexity:4,verbosity:4\n" ""
+
         elif self.model_type in ['llava', 'vila', 'fuyu', 'kosmos-2']:
             # LLaVA and VILA
             if self.model_type == "llava":
@@ -564,7 +791,7 @@ class MultimodalModelRunner:
             elif self.model_type == "vila":
                 pre_prompt = "A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. USER: "
                 if input_text is None:
-                    input_text = "Please describe the traffic condition."
+                    input_text = "<image>\n Please elaborate what you see in the images?"
             elif self.model_type == 'fuyu':
                 pre_prompt = "Describe this image:"
                 if input_text is None:
@@ -581,13 +808,19 @@ class MultimodalModelRunner:
 
             if self.model_type == "vila":
                 sys.path.append(self.args.hf_model_dir + "/../VILA")
-                from llava.model import LlavaLlamaForCausalLM
-                model = LlavaLlamaForCausalLM.from_pretrained(
-                    self.args.hf_model_dir, torch_dtype=torch.float16)
+                from llava.model import LlavaLlamaConfig  # noqa
+                from transformers import AutoModel
+                model = AutoModel.from_pretrained(
+                    self.args.hf_model_dir,
+                    device_map='auto',
+                    trust_remote_code=True,
+                )
                 vision_tower = model.get_vision_tower()
                 image_processor = vision_tower.image_processor
-                image = image_processor(images=raw_image,
-                                        return_tensors="pt")['pixel_values']
+                from llava.mm_utils import process_images
+                image = process_images(raw_image, image_processor,
+                                       model.config).to(model.device,
+                                                        dtype=torch.float16)
             else:
                 processor = AutoProcessor.from_pretrained(
                     self.args.hf_model_dir)
@@ -603,8 +836,12 @@ class MultimodalModelRunner:
         # Repeat inputs to match batch size
         pre_prompt = [pre_prompt] * self.args.batch_size
         post_prompt = [post_prompt] * self.args.batch_size
-        if self.model_type not in ['fuyu', 'pix2struct', 'kosmos-2']:
-            image = image.expand(args.batch_size, -1, -1, -1).contiguous()
+        if self.model_type not in ['fuyu', 'pix2struct', 'kosmos-2', 'vila']:
+            if image.dim() == 5:
+                image = image.expand(args.batch_size, -1, -1, -1,
+                                     -1).contiguous()
+            else:
+                image = image.expand(args.batch_size, -1, -1, -1).contiguous()
         image = image.to(self.device)
 
         # Generate decoder_input_ids for enc-dec models
@@ -651,7 +888,8 @@ class MultimodalModelRunner:
         logger.info("---------------------------------------------------------")
         if self.model_type != 'nougat':
             logger.info(f"\n[Q] {input_text}")
-        logger.info(f"\n[A] {output_text[0]}")
+        for i in range(len(output_text)):
+            logger.info(f"\n[A]: {output_text[i]}")
 
         if args.num_beams == 1:
             output_ids = self.tokenizer(output_text[0][0],
@@ -659,14 +897,11 @@ class MultimodalModelRunner:
             logger.info(f"Generated {len(output_ids)} tokens")
 
         if self.args.check_accuracy:
-            for i in range(self.args.batch_size - 1):
-                if not (output_text[i] == output_text[i + 1]):
-                    logger.info(f"Output {i} and {i + 1} do not match")
-                    assert False
             if self.model_type != 'nougat':
                 if self.model_type == "vila":
-                    assert output_text[0][0].lower(
-                    ) == 'the traffic condition in the image is quite busy, with multiple cars and bicycles sharing the road. there are also pedestrians walking on'
+                    if len(self.args.image_path.split(self.args.path_sep)) == 1:
+                        assert output_text[0][0].lower(
+                        ) == "the image captures a bustling city intersection teeming with life. from the perspective of a car's dashboard camera, we see"
                 elif self.model_type == 'fuyu':
                     assert output_text[0][0].lower() == '4'
                 elif self.model_type == "pix2struct":
@@ -674,6 +909,8 @@ class MultimodalModelRunner:
                         0][0].lower()
                 elif self.model_type == 'neva':
                     assert 'singapore' in output_text[0][0].lower()
+                elif self.model_type == 'video-neva':
+                    assert 'robot' in output_text[0][0].lower()
                 elif self.model_type == 'kosmos-2':
                     assert 'snowman' in output_text[0][0].lower()
                 else:
@@ -697,6 +934,5 @@ if __name__ == '__main__':
     tensorrt_llm.logger.set_level(args.log_level)
 
     model = MultimodalModelRunner(args)
-
     raw_image = model.load_test_image()
     text_output = model.run(args.input_text, raw_image, args.max_new_tokens)

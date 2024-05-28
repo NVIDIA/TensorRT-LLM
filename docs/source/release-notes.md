@@ -5,37 +5,109 @@
 All published functionality in the Release Notes has been fully tested and verified with known limitations documented. To share feedback about this release, access our [NVIDIA Developer Forum](https://forums.developer.nvidia.com/).
 
 
-
 ## TensorRT-LLM Release Next
+
+### Announcements
+- TBD
+
+### Key Features and Enhancements
+- TBD
+
+### API Changes
+- TBD
+
+### Model Updates
+- TBD
+
+### Fixed Issues
+- TBD
+
+### Infrastructure changes
+  - Base Docker image for TensorRT-LLM is updated to `nvcr.io/nvidia/pytorch:24.04-py3`.
+  - Base Docker image for TensorRT-LLM backend is updated to `nvcr.io/nvidia/tritonserver:24.04-py3`.
+  - The dependent CUDA version is updated to 12.4.1.
+  - The dependent PyTorch version is updated to 2.3.0.
+
+
+## TensorRT-LLM Release 0.10.0
 
 ### Announcements
 - TensorRT-LLM supports TensorRT 10.0.1 and NVIDIA NGC 24.03 containers.
 
 ### Key Features and Enhancements
+- The Python high level API
+  - Added embedding parallel, embedding sharing, and fused MLP support.
+  - Enabled the usage of the `executor` API.
+- Added a weight-stripping feature with a new `trtllm-refit` command. For more information, refer to `examples/sample_weight_stripping/README.md`.
+- Added a weight-streaming feature. For more information, refer to `docs/source/advanced/weight-streaming.md`.
+- Enhanced the multiple profiles feature; `--multiple_profiles` argument in `trtllm-build` command builds more optimization profiles now for better performance.
+- Added FP8 quantization support for Mixtral.
+- Added support for pipeline parallelism for GPT.
+- Optimized `applyBiasRopeUpdateKVCache` kernel by avoiding re-computation.
+- Reduced overheads between `enqueue` calls of TensorRT engines.
+- Added support for paged KV cache for enc-dec models. The support is limited to beam width 1.
+- Added W4A(fp)8 CUTLASS kernels for the NVIDIA Ada Lovelace architecture.
+- Added debug options (`--visualize_network` and `--dry_run`) to the `trtllm-build` command to visualize the TensorRT network before engine build.
+- Integrated the new NVIDIA Hopper XQA kernels for LLaMA 2 70B model.
+- Improved the performance of pipeline parallelism when enabling in-flight batching.
+- Supported quantization for Nemotron models.
+- Added LoRA support for Mixtral and Qwen.
+- Added in-flight batching support for ChatGLM models.
+- Added support to `ModelRunnerCpp` so that it runs with the `executor` API for IFB-compatible models.
+- Enhanced the custom `AllReduce` by adding a heuristic; fall back to use native NCCL kernel when hardware requirements are not satisfied to get the best performance.
+- Optimized the performance of checkpoint conversion process for LLaMA.
+- Benchmark
+  - [BREAKING CHANGE] Moved the request rate generation arguments and logic from prepare dataset script to `gptManagerBenchmark`.
+  - Enabled streaming and support `Time To the First Token (TTFT)` latency and `Inter-Token Latency (ITL)` metrics for `gptManagerBenchmark`.
+  - Added the `--max_attention_window` option to `gptManagerBenchmark`.
 
-- Infrastructure features
+### API Changes
+- [BREAKING CHANGE] Set the default `tokens_per_block` argument of the `trtllm-build` command to 64 for better performance.
+- [BREAKING CHANGE] Migrated enc-dec models to the unified workflow.
+- [BREAKING CHANGE] Renamed `GptModelConfig` to `ModelConfig`.
+- [BREAKING CHANGE] Added speculative decoding mode to the builder API.
+- [BREAKING CHANGE] Refactor scheduling configurations
+  - Unified the `SchedulerPolicy` with the same name in `batch_scheduler` and `executor`, and renamed it to `CapacitySchedulerPolicy`.
+  - Expanded the existing configuration scheduling strategy from `SchedulerPolicy` to `SchedulerConfig` to enhance extensibility. The latter also introduces a chunk-based configuration called `ContextChunkingPolicy`.
+- [BREAKING CHANGE] The input prompt was removed from the generation output in the `generate()` and `generate_async()` APIs. For example, when given a prompt as `A B`, the original generation result could be `<s>A B C D E` where only `C D E` is the actual output, and now the result is `C D E`.
+- [BREAKING CHANGE] Switched default `add_special_token` in the TensorRT-LLM backend to `True`.
+- Deprecated `GptSession` and `TrtGptModelV1`.
+
+### Model Updates
+- Support DBRX
+- Support Qwen2
+- Support CogVLM
+- Support ByT5
+- Support LLaMA 3
+- Support Arctic (w/ FP8)
+- Support Fuyu
+- Support Persimmon
+- Support Deplot
+- Support Phi-3-Mini with long Rope
+- Support Neva
+- Support Kosmos-2
+- Support RecurrentGemma
+
+### Fixed Issues
+- - Fixed some unexpected behaviors in beam search and early stopping, so that the outputs are more accurate.
+- Fixed segmentation fault with pipeline parallelism and `gather_all_token_logits`. (#1284)
+- Removed the unnecessary check in XQA to fix code Llama 70b Triton crashes. (#1256)
+- Fixed an unsupported ScalarType issue for BF16 LoRA. (https://github.com/triton-inference-server/tensorrtllm_backend/issues/403)
+- Eliminated the load and save of prompt table in multimodal. (https://github.com/NVIDIA/TensorRT-LLM/discussions/1436)
+- Fixed an error when converting the models weights of Qwen 72B INT4-GPTQ. (#1344)
+- Fixed early stopping and failures on in-flight batching cases of Medusa. (#1449)
+- Added support for more NVLink versions for auto parallelism. (#1467)
+- Fixed the assert failure caused by default values of sampling config. (#1447)
+- Fixed a requirement specification on Windows for nvidia-cudnn-cu12. (#1446)
+- Fixed MMHA relative position calculation error in `gpt_attention_plugin` for enc-dec models. (#1343)
+
+
+### Infrastructure changes
   - Base Docker image for TensorRT-LLM is updated to `nvcr.io/nvidia/pytorch:24.03-py3`.
   - Base Docker image for TensorRT-LLM backend is updated to `nvcr.io/nvidia/tritonserver:24.03-py3`.
   - The dependent TensorRT version is updated to 10.0.1.
   - The dependent CUDA version is updated to 12.4.0.
   - The dependent PyTorch version is updated to 2.2.2.
-
-### API Changes
-
-- TBD
-
-### Model Updates
-
-- TBD
-
-### Limitations
-
-- TBD
-
-### Fixed Issues
-
-- TBD
-
 
 
 ## TensorRT-LLM Release 0.9.0

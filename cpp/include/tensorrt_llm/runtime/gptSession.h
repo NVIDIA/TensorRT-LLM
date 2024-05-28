@@ -24,10 +24,10 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/kvCacheConfig.h"
+#include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
-#include "tensorrt_llm/runtime/decodingMode.h"
 #include "tensorrt_llm/runtime/generationInput.h"
 #include "tensorrt_llm/runtime/generationOutput.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -112,7 +112,7 @@ public:
         // The micro batch size to be used in generation phase.
         // Batches entered in `GptSession::generation` will be split into smaller micro batches of this size.
         std::optional<SizeType32> genMicroBatchSize = std::nullopt;
-        std::optional<DecodingMode> decodingMode = std::nullopt;
+        std::optional<executor::DecodingMode> decodingMode = std::nullopt;
         bool normalizeLogProbs = true;
     };
 
@@ -255,7 +255,7 @@ private:
     void createBuffers(SizeType32 numMicroBatches);
     void createDecoders(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 maxAttentionWindow,
         SizeType32 sinkTokenLength, SizeType32 maxSequenceLength, nvinfer1::DataType logitsType, bool decoderPerRequest,
-        SizeType32 numMicroBatches, DecodingMode const& decodingMode);
+        SizeType32 numMicroBatches, executor::DecodingMode const& decodingMode);
     void createKvCacheManager(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 maxAttentionWindow,
         SizeType32 sinkTokenLength, SizeType32 maxSequenceLength, KvCacheConfig const& config);
     void createCustomAllReduceWorkspace(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 maxSequenceLength);

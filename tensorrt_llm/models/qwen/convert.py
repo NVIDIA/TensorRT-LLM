@@ -9,7 +9,6 @@ import numpy as np
 import safetensors
 import torch
 import torch.nn as nn
-from datasets import load_dataset
 from tqdm import tqdm
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
@@ -19,6 +18,7 @@ from tensorrt_llm._utils import pad_vocab_size, release_gc
 
 from ...logger import logger
 from ...mapping import Mapping
+from ..convert_utils import load_calib_dataset
 from ..modeling_utils import PretrainedConfig
 from .utils import get_qwen_key_list, make_context
 from .weight import load_from_gptq_qwen
@@ -391,7 +391,7 @@ def capture_activation_range(model,
                     functools.partial(stat_input_hook, name=name)))
 
     for i in tqdm(range(num_samples), desc="calibrating model"):
-        line = dataset['train'][i]["article"]
+        line = dataset[i]
         line = line + ' TL;DR: '
         line = line.strip()
         line = line.replace(" n't", "n't")
@@ -500,6 +500,16 @@ def get_tllm_linear_weight(weight,
         results[prefix + 'bias'] = bias
 
     return results
+
+
+def dup_kv_weight(v, num_head, tp_size):
+    assert tp_size % num_head == 0
+    reps = tp_size // num_head
+    head_size = v.shape[0] // num_head
+    v = v.reshape(num_head, head_size,
+                  -1)[:, None, :, :].expand(num_head, reps, head_size,
+                                            v.shape[1])
+    return v.reshape(num_head * reps * head_size, -1).clone().detach()
 
 
 def get_tllm_linear_sq_weight(vals,
@@ -678,6 +688,7 @@ def convert_hf_qwen(hf_model,
     dtype = getattr(torch, dtype)
     num_attention_heads = hf_model.config.num_attention_heads
     hidden_size = hf_model.config.hidden_size
+    head_size = hidden_size // num_attention_heads
     if qwen_type == 'qwen':
         intermediate_size = hf_model.config.intermediate_size // 2  # Qwen version 1 has actual intermediate_size one half of what's in hf_config
     else:
@@ -685,7 +696,6 @@ def convert_hf_qwen(hf_model,
     num_key_value_heads = hf_model.config.num_key_value_heads if hasattr(
         hf_model.config, "num_key_value_heads") else num_attention_heads
     mha_mode = (num_key_value_heads == num_attention_heads)
-    assert mha_mode == True, "QWen uses MHA."
     layers_range = mapping.pp_layers(hf_model.config.num_hidden_layers)
 
     layer_prefix = "transformer.h." if qwen_type == 'qwen' else "model.layers."
@@ -698,6 +708,11 @@ def convert_hf_qwen(hf_model,
             qkv_weight, qkv_bias = get_weight_and_bias(model_params,
                                                        prefix + key_list[0],
                                                        dtype)
+            qkv_w = split_qkv_tp(qkv_weight, num_attention_heads, hidden_size,
+                                 tensor_parallel, mapping.tp_rank)
+            qkv_b = split_qkv_bias_tp(qkv_bias, num_attention_heads,
+                                      hidden_size, tensor_parallel,
+                                      mapping.tp_rank)
         else:
             q_weight, q_bias = get_weight_and_bias(
                 model_params, prefix + key_list[0] + 'q_proj', dtype)
@@ -705,13 +720,42 @@ def convert_hf_qwen(hf_model,
                 model_params, prefix + key_list[0] + 'k_proj', dtype)
             v_weight, v_bias = get_weight_and_bias(
                 model_params, prefix + key_list[0] + 'v_proj', dtype)
-            qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
-            qkv_bias = torch.cat([q_bias, k_bias, v_bias], dim=0)
+            if not mha_mode:
+                if num_key_value_heads < tensor_parallel:
+                    # duplicate the KV heads up to tensor_parallel
+                    k_weight = dup_kv_weight(k_weight, num_key_value_heads,
+                                             tensor_parallel)
+                    v_weight = dup_kv_weight(v_weight, num_key_value_heads,
+                                             tensor_parallel)
+                    k_bias = dup_kv_weight(k_bias, num_key_value_heads,
+                                           tensor_parallel)
+                    v_bias = dup_kv_weight(v_bias, num_key_value_heads,
+                                           tensor_parallel)
+                assert (k_weight.shape[0] % (mapping.tp_size * head_size)) == 0
+                assert (v_weight.shape[0] % (mapping.tp_size * head_size)) == 0
+                assert (k_bias.shape[0] % (mapping.tp_size * head_size)) == 0
+                assert (v_bias.shape[0] % (mapping.tp_size * head_size)) == 0
 
-        qkv_w = split_qkv_tp(qkv_weight, num_attention_heads, hidden_size,
-                             tensor_parallel, mapping.tp_rank)
-        qkv_b = split_qkv_bias_tp(qkv_bias, num_attention_heads, hidden_size,
-                                  tensor_parallel, mapping.tp_rank)
+                wq = split(q_weight, mapping.tp_size, mapping.tp_rank)
+                wk = split(k_weight, mapping.tp_size, mapping.tp_rank)
+                wv = split(v_weight, mapping.tp_size, mapping.tp_rank)
+
+                bq = split(q_bias, mapping.tp_size, mapping.tp_rank)
+                bk = split(k_bias, mapping.tp_size, mapping.tp_rank)
+                bv = split(v_bias, mapping.tp_size, mapping.tp_rank)
+
+                qkv_w = torch.concat((wq, wk, wv))
+                qkv_b = torch.concat((bq, bk, bv))
+            else:
+                qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
+                qkv_bias = torch.cat([q_bias, k_bias, v_bias], dim=0)
+
+                qkv_w = split_qkv_tp(qkv_weight, num_attention_heads,
+                                     hidden_size, tensor_parallel,
+                                     mapping.tp_rank)
+                qkv_b = split_qkv_bias_tp(qkv_bias, num_attention_heads,
+                                          hidden_size, tensor_parallel,
+                                          mapping.tp_rank)
 
         if use_smooth_quant:
             qkv_proj_key = key_list[
@@ -719,7 +763,13 @@ def convert_hf_qwen(hf_model,
             qkv_weight = qkv_para[prefix + qkv_proj_key]
             qkv_out_dim = qkv_weight.shape[1]
 
-            qkv_weight = qkv_weight.reshape(hidden_size, 3, hidden_size)
+            if not mha_mode:
+                local_dim = qkv_weight.shape[0]
+                kv_hidden_size = (qkv_weight.shape[-1] - local_dim) // 2
+                qkv_weight = qkv_weight.reshape(local_dim,
+                                                local_dim + 2 * kv_hidden_size)
+            else:
+                qkv_weight = qkv_weight.reshape(hidden_size, 3, hidden_size)
 
             int8_weights = generate_int8(qkv_weight,
                                          act_range.get(prefix + qkv_proj_key),
@@ -957,7 +1007,8 @@ def convert_hf_qwen(hf_model,
 def smooth_quant(model,
                  qwen_type,
                  model_dir,
-                 dataset_cache_dir,
+                 calib_dataset='cnn_dailymail',
+                 dataset_cache_dir=None,
                  smoothquant: Optional[float] = None):
     assert model is not None
     act_range = {}
@@ -967,21 +1018,18 @@ def smooth_quant(model,
 
     os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get(
         "TOKENIZERS_PARALLELISM", "false")
-    dataset = load_dataset("ccdv/cnn_dailymail",
-                           '3.0.0',
-                           cache_dir=dataset_cache_dir)
+    tokenizer = AutoTokenizer.from_pretrained(model_dir,
+                                              trust_remote_code=True,
+                                              use_fast=False,
+                                              padding_side='left')
+    dataset = load_calib_dataset(calib_dataset, cache_dir=dataset_cache_dir)
     system_prompt = "You are a useful assistant, please directly output the corresponding summary according to the article entered by the user."
     gen_config_path = os.path.join(model_dir, 'generation_config.json')
     with open(gen_config_path, 'r') as f:
         gen_config = json.load(f)
     chat_format = getattr(gen_config, 'chat_format', 'chatml')
-    act_range = capture_activation_range(
-        model, qwen_type,
-        AutoTokenizer.from_pretrained(model_dir,
-                                      trust_remote_code=True,
-                                      use_fast=False,
-                                      padding_side='left'), dataset,
-        system_prompt, chat_format)
+    act_range = capture_activation_range(model, qwen_type, tokenizer, dataset,
+                                         system_prompt, chat_format)
     if smoothquant is not None:
         if qwen_type == 'qwen':
             smooth_qwen_model(model, act_range, smoothquant, qwen_qkv_para,
@@ -1097,7 +1145,8 @@ def quantize(dtype,
              mapping,
              quantization: 'QuantConfig',
              *,
-             override_fields,
+             calib_dataset='cnn_dailymail',
+             override_fields={},
              dataset_cache_dir: Optional[str] = None,
              smoothquant_val: Optional[float] = None,
              int8_kv_cache=False):
@@ -1143,7 +1192,8 @@ def quantize(dtype,
         torch_dtype='auto' if not use_smooth_quant else torch.float16,
         trust_remote_code=True).half()
     act_range, qwen_qkv_para, qwen_smoother = smooth_quant(
-        model, qwen_type, model_dir, dataset_cache_dir, smoothquant_val)
+        model, qwen_type, model_dir, calib_dataset, dataset_cache_dir,
+        smoothquant_val)
 
     for rank in range(mapping.world_size):
         # To avoid changing the mapping arg in-place, also the given mapping from caller is rank agnostic, since quantize is called from only one rank

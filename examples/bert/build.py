@@ -232,12 +232,11 @@ if __name__ == '__main__':
     network = builder.create_network()
     network.plugin_config.to_legacy_setting()
     if args.use_bert_attention_plugin:
-        network.plugin_config.set_bert_attention_plugin(
-            dtype=args.use_bert_attention_plugin)
+        network.plugin_config.bert_attention_plugin = args.use_bert_attention_plugin
     if args.use_gemm_plugin:
-        network.plugin_config.set_gemm_plugin(dtype=args.use_gemm_plugin)
+        network.plugin_config.gemm_plugin = args.use_gemm_plugin
     if args.enable_qk_half_accum:
-        network.plugin_config.enable_qk_half_accum()
+        network.plugin_config.attention_qk_half_accumulation = True
     assert not (args.enable_context_fmha and args.enable_context_fmha_fp32_acc)
     if args.enable_context_fmha:
         network.plugin_config.set_context_fmha(ContextFMHAType.enabled)

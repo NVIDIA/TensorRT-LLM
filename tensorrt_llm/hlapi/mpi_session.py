@@ -8,10 +8,9 @@ from typing import Any, List, Optional
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 
 if ENABLE_MULTI_DEVICE:
-    from mpi4py import MPI
     from mpi4py.futures import MPICommExecutor, MPIPoolExecutor
 
-    from tensorrt_llm._utils import mpi_rank, mpi_world_size
+    from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
 
 
 class MPINodeState:
@@ -45,12 +44,18 @@ def external_mpi_comm_available(model_world_size: int) -> bool:
     ''' Check if the current process is launched by mpirun and does not use MPIPoolExecutor to spawn processes.
     e.g. mpirun -np 4 python script.py
     '''
-    return mpi_world_size() == model_world_size and model_world_size > 1
+    if ENABLE_MULTI_DEVICE:
+        return mpi_world_size() == model_world_size and model_world_size > 1
+    else:
+        return False
 
 
 def need_spawn_mpi_workers(model_world_size: int) -> bool:
     ''' Check if the current process needs to spawn MPI workers. '''
-    return mpi_world_size() == 1 and model_world_size > 1
+    if ENABLE_MULTI_DEVICE:
+        return mpi_world_size() == 1 and model_world_size > 1
+    else:
+        return False
 
 
 class MpiSession(abc.ABC):
@@ -156,7 +161,7 @@ class MpiCommSession(MpiSession):
         assert not self.mpi_pool, 'MPI session already started'
 
         self.thread_pool = ThreadPoolExecutor(max_workers=2)
-        comm_executor = MPICommExecutor(MPI.COMM_WORLD)
+        comm_executor = MPICommExecutor(mpi_comm())
         self.mpi_pool = comm_executor.__enter__()
 
     def __del__(self):

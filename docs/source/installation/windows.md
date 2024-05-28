@@ -3,7 +3,8 @@
 # Installing on Windows
 
 ```{note}
-The Windows release of TensorRT-LLM is currently in beta. We recommend using the `rel` branch for the most stable experience.
+The Windows release of TensorRT-LLM is currently in beta.
+We recommend checking out the [v0.10.0 tag](https://github.com/NVIDIA/TensorRT-LLM/releases/tag/v0.10.0) for the most stable experience.
 ```
 
 **Prerequisites**
@@ -34,8 +35,17 @@ The Windows release of TensorRT-LLM is currently in beta. We recommend using the
 
 1. Install TensorRT-LLM.
 
+  If you have an existing TensorRT installation (from older versions of `tensorrt_llm`), please execute
+
   ```bash
-  pip install tensorrt_llm --extra-index-url https://pypi.nvidia.com
+  pip uninstall -y tensorrt tensorrt_libs tensorrt_bindings
+  pip uninstall -y nvidia-cublas-cu12 nvidia-cuda-nvrtc-cu12 nvidia-cuda-runtime-cu12 nvidia-cudnn-cu12
+  ```
+
+  before installing TensorRT-LLM with the following command.
+
+  ```bash
+  pip install tensorrt_llm==0.10.0 --extra-index-url https://pypi.nvidia.com
   ```
 
   Run the following command to verify that your TensorRT-LLM installation is working properly.

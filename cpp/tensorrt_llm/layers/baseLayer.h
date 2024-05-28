@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/allocator.h"
 #include "tensorrt_llm/common/tensor.h"
+#include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/runtime/common.h"
 
@@ -82,12 +83,23 @@ public:
         = 0;
 
     // clang-format off
-    //! \brief Virtual function to execute layer.
+    //! \brief Virtual function to execute layer async on GPU.
+    //! There must be no stream synchronization inside this function.
     //!
     //! \param outputs shared pointer to params inherited from BaseOutputParams
     //! \param inputs shared pointer to params inherited from BaseForwardParams
     // clang-format on
-    virtual void forward(std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs) = 0;
+    virtual void forwardAsync(std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs) = 0;
+
+    // clang-format off
+    //! \brief Virtual function to execute layer synchronously on CPU / GPU.
+    //! It is allowed (but not necassary) to synchronize on stream inside this function.
+    //! It is targeted mainly for prototyping.
+    //!
+    //! \param outputs shared pointer to params inherited from BaseOutputParams
+    //! \param inputs shared pointer to params inherited from BaseForwardParams
+    // clang-format on
+    virtual void forwardSync(std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs) {}
 
 protected:
     // Cuda stream

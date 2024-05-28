@@ -36,6 +36,8 @@
 #include "tensorrt_llm/common/tensorConversion.h"
 #include "tensorrt_llm/common/tllmException.h"
 
+#include "tensorrt_llm/executor/types.h"
+
 namespace tensorrt_llm::tests::layers::sampling
 {
 
@@ -54,6 +56,8 @@ struct TestSamplingParams
     std::vector<std::vector<std::vector<runtime::TokenIdType>>> badWords;
     std::vector<std::vector<std::vector<runtime::TokenIdType>>> stopWords;
     bool useBias{false};
+
+    std::optional<executor::DecodingMode> decodingMode;
 
     // Medusa setup
     bool useMedusa{false};
@@ -172,7 +176,7 @@ private:
         std::vector<std::set<runtime::TokenIdType>> const& expectedOutputIds, runtime::SizeType32 step);
 
     tensorrt_llm::layers::DynamicDecodeInputParams::MedusaInputs createMedusaInputs();
-    tensorrt_llm::layers::DynamicDecodeOutputParams::MedusaOutputs createMedusaOutputs();
+    tensorrt_llm::layers::DynamicDecodeOutputParams::SpeculativeDecodingOutputs createMedusaOutputs();
 
 public:
     void runTest(std::vector<std::set<runtime::TokenIdType>> const& expectedOutputIds, TestSamplingParams const& params,

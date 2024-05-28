@@ -116,45 +116,46 @@ GPT-J and LLaMA. Those examples can be found in
 
 This release of TensorRT-LLM contains the following examples:
 
-| Model      | FP32  | FP16  | BF16  |  FP8  | W8A8 SQ | W8A16 | W4A16 | W4A16 AWQ | W4A16 GPTQ |
-| :--------- | :---: | :---: | :---: | :---: | :-----: | :---: | :---: | :-------: | :--------: |
-| Baichuan   |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     Y      |
-| BERT       |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
-| BLIP-2     |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
-| BLOOM      |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     .     |     .      |
-| ChatGLM    |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
-| ChatGLM-v2 |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
-| ChatGLM-v3 |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
-| DBRX       |   Y   |   Y   |   Y   |   .   |    .    |   Y   |   Y   |     .     |     .      |
-| Falcon     |   Y   |   Y   |   Y   |   Y   |    .    |   Y   |   Y   |     Y     |     .      |
-| Flan-T5    |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
-| Gemma      |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     .      |
-| GPT        |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     .     |     .      |
-| GPT-J      |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     .      |
-| GPT-NeMo   |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
-| GPT-NeoX   |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     Y      |
-| InternLM   |   Y   |   Y   |   Y   |   .   |    Y    |   Y   |   Y   |     .     |     .      |
-| LLaMA      |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     Y      |
-| LLaMA-v2   |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     Y      |
-| Mamba      |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
-| Mistral    |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     .      |
-| Mixtral    |   Y   |   Y   |   Y   |   Y   |    .    |   Y   |   Y   |     .     |     .      |
-| MPT        |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     .      |
-| OPT        |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
-| Phi        |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
-| Qwen       |   Y   |   Y   |   Y   |   .   |    Y    |   Y   |   Y   |     Y     |     Y      |
-| Replit Code|   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
-| SantaCoder |   Y   |   Y   |   Y   |   .   |    .    |   Y   |   Y   |     .     |     .      |
-| Skywork    |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
-| StarCoder1 |   Y   |   Y   |   Y   |   .   |    .    |   Y   |   Y   |     .     |     .      |
-| StarCoder2 |   Y   |   Y   |   Y   |   .   |    .    |   Y   |   Y   |     .     |     .      |
-| T5         |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
-| Whisper    |   Y   |   Y   |   Y   |   .   |    .    |   Y   |   Y   |     .     |     .      |
-| BLIP2-OPT  |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
-| BLIP2-T5   |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
-| LLaVA      |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     Y      |
-| VILA       |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     Y      |
-| Nougat     |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
+| Model          | FP32  | FP16  | BF16  |  FP8  | W8A8 SQ | W8A16 | W4A16 | W4A16 AWQ | W4A16 GPTQ |
+| :------------- | :---: | :---: | :---: | :---: | :-----: | :---: | :---: | :-------: | :--------: |
+| Baichuan       |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     Y      |
+| BERT           |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
+| BLIP-2         |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
+| BLOOM          |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     .     |     .      |
+| ChatGLM        |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
+| ChatGLM-v2     |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
+| ChatGLM-v3     |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
+| DBRX           |   Y   |   Y   |   Y   |   .   |    .    |   Y   |   Y   |     .     |     .      |
+| Falcon         |   Y   |   Y   |   Y   |   Y   |    .    |   Y   |   Y   |     Y     |     .      |
+| Flan-T5        |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
+| Gemma          |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     .      |
+| GPT            |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     .     |     .      |
+| GPT-J          |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     .      |
+| GPT-NeMo       |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
+| GPT-NeoX       |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     Y      |
+| InternLM       |   Y   |   Y   |   Y   |   .   |    Y    |   Y   |   Y   |     .     |     .      |
+| LLaMA          |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     Y      |
+| LLaMA-v2       |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     Y      |
+| Mamba          |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
+| Mistral        |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     .      |
+| Mixtral        |   Y   |   Y   |   Y   |   Y   |    .    |   Y   |   Y   |     .     |     .      |
+| MPT            |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     .      |
+| OPT            |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
+| Phi            |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
+| Qwen           |   Y   |   Y   |   Y   |   .   |    Y    |   Y   |   Y   |     Y     |     Y      |
+| RecurrentGemma |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
+| Replit Code    |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
+| SantaCoder     |   Y   |   Y   |   Y   |   .   |    .    |   Y   |   Y   |     .     |     .      |
+| Skywork        |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
+| StarCoder1     |   Y   |   Y   |   Y   |   .   |    .    |   Y   |   Y   |     .     |     .      |
+| StarCoder2     |   Y   |   Y   |   Y   |   .   |    .    |   Y   |   Y   |     .     |     .      |
+| T5             |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
+| Whisper        |   Y   |   Y   |   Y   |   .   |    .    |   Y   |   Y   |     .     |     .      |
+| BLIP2-OPT      |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
+| BLIP2-T5       |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
+| LLaVA          |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     Y      |
+| VILA           |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     Y      |
+| Nougat         |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 
 Note: The vision component of multi-modal models(BLIP2-OPT/BLIP2-T5/LLaVA/VILA/Nougat) uses FP16 by default.
 The language component decides which quantization methods are supported by a given multi-modal model.

@@ -16,6 +16,10 @@
 
 #pragma once
 
+#include <cassert>
+#include <sstream>
+#include <string>
+
 namespace tensorrt_llm
 {
 namespace cutlass_extensions
@@ -152,6 +156,32 @@ struct CutlassGemmConfig
         , cluster_shape(cluster_shape)
         , is_sm90(true)
     {
+    }
+
+    std::string toString()
+    {
+        std::stringstream tactic;
+        tactic << "Cutlass GEMM Tactic";
+        if (tile_config_sm90 != tensorrt_llm::cutlass_extensions::CutlassTileConfigSM90::ChooseWithHeuristic)
+        {
+            assert(is_sm90 && "Invalid cutlass GEMM config");
+            tactic << "\n\tstyle=TMA"
+                   << "\n\ttile shape ID: " << (int) tile_config_sm90 << "\n\tcluster shape ID: " << (int) cluster_shape
+                   << "\n\tmainloop sched: " << (int) mainloop_schedule << "\n\tepi sched: " << (int) epilogue_schedule;
+        }
+        else if (tile_config != tensorrt_llm::cutlass_extensions::CutlassTileConfig::ChooseWithHeuristic)
+        {
+            assert(!is_sm90 && "Invalid cutlass GEMM config");
+            tactic << "\n\tstyle=compatible"
+                   << "\n\ttile shape ID: " << (int) tile_config << "\n\tstages: " << (int) stages
+                   << "\n\tsplit k: " << (int) split_k_factor;
+        }
+        else
+        {
+            tactic << "\n\tundefined";
+        }
+        tactic << "\n";
+        return tactic.str();
     }
 };
 

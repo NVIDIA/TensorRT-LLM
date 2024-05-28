@@ -88,17 +88,17 @@ public:
 
     BeamHypotheses beamHypotheses;
 
-    // Medusa
-    class MedusaOutputs
+    // Speculative decoding
+    class SpeculativeDecodingOutputs
     {
     public:
-        TensorPtr medusaNextDraftTokens;       // [maxBatchSize, maxTokensPerStep]
-        TensorPtr medusaAcceptedTokensLen;     // [maxBatchSize]
-        TensorPtr medusaAcceptedLengthsCumSum; // [maxBatchSize + 1]
-        TensorPtr medusaPathsOffsets;          // [maxBatchSize * maxNumHeads]
+        TensorPtr nextDraftTokens;       // [maxBatchSize, maxDraftTokens]
+        TensorPtr acceptedTokensLen;     // [maxBatchSize]
+        TensorPtr acceptedLengthsCumSum; // [maxBatchSize + 1]
+        TensorPtr pathsOffsets;          // [maxBatchSize, maxAcceptedDraftTokensPerStep]
     };
 
-    std::optional<MedusaOutputs> medusaOutputs;
+    std::optional<SpeculativeDecodingOutputs> speculativeDecodingOutputs;
 };
 
 } // namespace tensorrt_llm::runtime

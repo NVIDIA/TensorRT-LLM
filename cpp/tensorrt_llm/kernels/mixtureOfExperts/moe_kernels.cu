@@ -1111,6 +1111,10 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, Enable>::runMoe(void const* i
     TLLM_CHECK(num_experts % parallelism_config.ep_size == 0);
     TLLM_CHECK_WITH_INFO(hidden_size >= 128 / cutlass::sizeof_bits<WeightType>::value,
         "Hidden size is too small to meet alignment requirements for MOE GEMM");
+    TLLM_CHECK_WITH_INFO(hidden_size % (128 / cutlass::sizeof_bits<WeightType>::value) == 0,
+        "Hidden size does not meet minimum alignment requirements for MOE GEMM");
+    TLLM_CHECK_WITH_INFO(inter_size % (128 / cutlass::sizeof_bits<WeightType>::value) == 0,
+        "Inter size does not meet minimum alignment requirements for MOE GEMM");
 
     // These values must fit into an int for building the source maps
     TLLM_CHECK_WITH_INFO(num_rows <= std::numeric_limits<int>::max(), "Number of rows is too large");

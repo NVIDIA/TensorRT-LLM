@@ -21,6 +21,7 @@
 
 #include "tensorrt_llm/common/cudaAllocator.h"
 #include "tensorrt_llm/common/tensor.h"
+#include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/layers/dynamicDecodeLayer.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
@@ -31,6 +32,7 @@ using namespace tensorrt_llm::runtime;
 namespace tc = tensorrt_llm::common;
 namespace tk = tensorrt_llm::kernels;
 namespace tl = tensorrt_llm::layers;
+namespace tle = tensorrt_llm::executor;
 
 class SamplingTest : public ::testing::Test // NOLINT(cppcoreguidelines-pro-type-member-init)
 {
@@ -96,7 +98,7 @@ std::shared_ptr<tl::DynamicDecodeOutputParams> dynamicDecodeTest(BufferManager& 
     tc::Tensor noRepeatNgramSize{tc::MEMORY_GPU, tc::TYPE_INT32, {batchSize}, gpuNoRepeatNgramSize};
     tc::Tensor finished{tc::MEMORY_GPU, tc::TYPE_INT8, {batchSize, beamWidth}, gpuFinished};
 
-    auto const decodingMode = beamWidth == 1 ? DecodingMode::TopKTopP() : DecodingMode::BeamSearch();
+    auto const decodingMode = beamWidth == 1 ? tle::DecodingMode::TopKTopP() : tle::DecodingMode::BeamSearch();
     auto const decodingDomain = tensorrt_llm::layers::DecoderDomain(batchSize, beamWidth, vocabSize, vocabSizePadded);
     auto ddLayer = tl::DynamicDecodeLayer<float>(decodingMode, decodingDomain, manager.getStream().get(), allocator);
 
@@ -114,7 +116,7 @@ std::shared_ptr<tl::DynamicDecodeOutputParams> dynamicDecodeTest(BufferManager& 
     outputParams->newTokens = newTokens;
     outputParams->finished = finished;
 
-    ddLayer.forward(outputParams, forwardParams);
+    ddLayer.forwardAsync(outputParams, forwardParams);
 
     return outputParams;
 }

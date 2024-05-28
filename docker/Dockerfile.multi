@@ -1,6 +1,6 @@
 # Multi-stage Dockerfile
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
-ARG BASE_TAG=24.03-py3
+ARG BASE_TAG=24.04-py3
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE}:${BASE_TAG} as base
@@ -21,6 +21,10 @@ RUN bash ./install_cmake.sh && rm install_cmake.sh
 
 COPY docker/common/install_ccache.sh install_ccache.sh
 RUN bash ./install_ccache.sh && rm install_ccache.sh
+
+# Only take effect when the base image is 12.4.0-devel-centos7.
+COPY docker/common/install_cuda_toolkit.sh install_cuda_toolkit.sh
+RUN bash ./install_cuda_toolkit.sh && rm install_cuda_toolkit.sh
 
 # Download & install internal TRT release
 ARG TRT_VER
@@ -48,9 +52,7 @@ RUN bash ./install_mpi4py.sh && rm install_mpi4py.sh
 # Install PyTorch
 ARG TORCH_INSTALL_TYPE="skip"
 COPY docker/common/install_pytorch.sh install_pytorch.sh
-# Apply PyTorch patch for supporting compiling with CUDA 12.4 from source codes
-COPY docker/common/pytorch_pr_116072.patch /tmp/pytorch_pr_116072.patch
-RUN bash ./install_pytorch.sh $TORCH_INSTALL_TYPE && rm install_pytorch.sh /tmp/pytorch_pr_116072.patch
+RUN bash ./install_pytorch.sh $TORCH_INSTALL_TYPE && rm install_pytorch.sh
 
 FROM ${DEVEL_IMAGE} as wheel
 WORKDIR /src/tensorrt_llm

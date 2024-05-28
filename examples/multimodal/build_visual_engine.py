@@ -31,7 +31,7 @@ def parse_arguments():
                         choices=[
                             'opt-2.7b', 'opt-6.7b', 'flan-t5-xl', 'flan-t5-xxl',
                             'llava', 'vila', 'nougat', 'cogvlm', 'fuyu',
-                            'pix2struct', 'neva', 'kosmos-2'
+                            'pix2struct', 'neva', 'kosmos-2', 'video-neva'
                         ],
                         help="Model type")
     parser.add_argument(
@@ -63,7 +63,8 @@ class VisionEngineBuilder:
             "cuda") if torch.cuda.is_available() else "cpu"
         if args.output_dir is None:
             args.output_dir = 'visual_engines/%s' % (
-                args.model_path.split('/')[-1].split('.')[0])
+                args.model_path.split('/')[-1] if args.vila_path is not None
+                else args.model_path.split('/')[-1])
         if not os.path.exists(args.output_dir):
             os.makedirs(args.output_dir)
 
@@ -88,6 +89,8 @@ class VisionEngineBuilder:
             build_fuyu_engine(args)
         elif args.model_type == 'neva':
             build_neva_engine(args)
+        elif args.model_type == 'video-neva':
+            build_video_neva_engine(args)
         elif args.model_type == 'kosmos-2':
             build_kosmos_engine(args)
         else:
@@ -116,7 +119,8 @@ def build_trt_engine(model_type,
                      input_sizes,
                      output_dir,
                      max_batch_size,
-                     dtype=torch.float16):
+                     dtype=torch.float16,
+                     num_frames=None):
     part_name = 'visual_encoder'
     onnx_file = '%s/onnx/%s.onnx' % (output_dir, part_name)
     engine_file = '%s/%s.engine' % (output_dir, part_name)
@@ -127,8 +131,15 @@ def build_trt_engine(model_type,
     network = builder.create_network(
         1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
     profile = builder.create_optimization_profile()
-    config_wrapper = Builder().create_builder_config(
-        precision=str(dtype).split('.')[-1], model_type=model_type)
+
+    config_args = {
+        "precision": str(dtype).split('.')[-1],
+        "model_type": model_type
+    }
+    if num_frames is not None:
+        config_args["num_frames"] = num_frames
+
+    config_wrapper = Builder().create_builder_config(**config_args)
     config = config_wrapper.trt_builder_config
 
     parser = trt.OnnxParser(network, logger)
@@ -317,16 +328,21 @@ def build_llava_engine(args):
 def build_vila_engine(args):
     # Note: VILA model is not in public HF model zoo yet. We need to explicitly import from the git repo
     sys.path.append(args.vila_path)
-    from llava.model import LlavaLlamaForCausalLM
+    from llava.model import LlavaLlamaConfig, LlavaLlamaModel  # noqa
+    from transformers import AutoModel
+    model = AutoModel.from_pretrained(
+        args.model_path,
+        device_map='auto',
+    )
 
-    model = LlavaLlamaForCausalLM.from_pretrained(args.model_path,
-                                                  torch_dtype=torch.float16)
     vision_tower = model.get_vision_tower()
     image_processor = vision_tower.image_processor
     raw_image = Image.new('RGB', [10, 10])  # dummy image
     image = image_processor(images=raw_image,
-                            return_tensors="pt")['pixel_values'].to(
-                                args.device, torch.float16)
+                            return_tensors="pt")['pixel_values']
+    if isinstance(image, list):
+        image = image[0].unsqueeze(0)
+    image = image.to(args.device, torch.float16)
 
     class VilaVisionWrapper(torch.nn.Module):
 
@@ -339,12 +355,12 @@ def build_vila_engine(args):
             features = self.tower(image)
             return self.projector(features)
 
-    model = LlavaLlamaForCausalLM.from_pretrained(args.model_path,
-                                                  torch_dtype=torch.float16)
-    wrapper = VilaVisionWrapper(
-        model.get_model().get_vision_tower().to(args.device),
-        model.get_model().mm_projector.to(args.device))
-
+    model = AutoModel.from_pretrained(
+        args.model_path,
+        device_map='auto',
+    )
+    wrapper = VilaVisionWrapper(model.get_vision_tower().to(args.device),
+                                model.mm_projector.to(args.device))
     export_visual_wrapper_onnx(wrapper, image, args.output_dir)
     build_trt_engine(
         args.model_type,
@@ -518,12 +534,9 @@ def build_neva_engine(args):
     wrapper = VisionEncoderWrapper(vision_encoder,
                                    vision_connector).to(args.device, dtype)
     image_size = hf_config.vision_config.image_size
-    dummy_image = torch.empty(1,
-                              3,
-                              image_size,
-                              image_size,
-                              dtype=dtype,
-                              device=args.device)  # dummy image
+    dummy_image = torch.empty(
+        1, 3, image_size, image_size, dtype=dtype,
+        device=args.device)  # dummy image shape [B, C, H, W]
     export_visual_wrapper_onnx(wrapper, dummy_image, args.output_dir)
     build_trt_engine(
         args.model_type,
@@ -531,6 +544,87 @@ def build_neva_engine(args):
         args.output_dir,
         args.max_batch_size,
         dtype)
+
+
+def build_video_neva_engine(args):
+    # extract NeMo checkpoint
+    with tarfile.open(args.model_path) as tar:
+        nemo_config = yaml.safe_load(tar.extractfile("./model_config.yaml"))
+        try:
+            # trained without TP
+            mp0_weights = torch.load(tar.extractfile("./model_weights.ckpt"),
+                                     map_location=args.device)
+        except KeyError:
+            # trained with TP
+            mp0_weights = torch.load(
+                tar.extractfile("./mp_rank_00/model_weights.ckpt"),
+                map_location=args.device)
+
+    vision_config = nemo_config["mm_cfg"]["vision_encoder"]
+
+    class VisionEncoderWrapper(torch.nn.Module):
+
+        def __init__(self, encoder, connector):
+            super().__init__()
+            self.encoder = encoder
+            self.connector = connector
+
+        def forward(self, images):
+            b, num_frames, c, h, w = images.shape
+            images = images.view(b * num_frames, c, h, w)
+            vision_x = self.encoder(
+                pixel_values=images,  #[(B num_frames), C, H, W]
+                output_hidden_states=True)
+            vision_x = vision_x.hidden_states[-2]
+            vision_x = vision_x[:, 1:]
+
+            # reshape back to [B, num_frames, img_size, hidden_size]
+            vision_x = vision_x.view(b, num_frames, -1, vision_x.shape[-1])
+
+            vision_x = self.connector(vision_x)
+            return vision_x
+
+    encoder = AutoModel.from_pretrained(vision_config["from_pretrained"],
+                                        torch_dtype=torch.bfloat16,
+                                        trust_remote_code=True)
+    vision_encoder = encoder.vision_model
+    hf_config = encoder.config
+    dtype = hf_config.torch_dtype
+
+    # connector
+    assert nemo_config["mm_cfg"]["mm_mlp_adapter_type"] == "linear"
+    vision_connector = torch.nn.Linear(vision_config["hidden_size"],
+                                       nemo_config["hidden_size"],
+                                       bias=True)
+
+    key_prefix = "model.embedding.word_embeddings.adapter_layer.mm_projector_adapter.mm_projector"
+    vision_connector.load_state_dict({
+        'weight':
+        mp0_weights[f"{key_prefix}.weight"].to(dtype),
+        'bias':
+        mp0_weights[f"{key_prefix}.bias"].to(dtype),
+    })
+
+    # export the whole wrapper
+    wrapper = VisionEncoderWrapper(vision_encoder,
+                                   vision_connector).to(args.device, dtype)
+    image_size = hf_config.vision_config.image_size
+    num_frames = nemo_config['data']['num_frames']
+    dummy_video = torch.empty(1,
+                              num_frames,
+                              3,
+                              image_size,
+                              image_size,
+                              dtype=dtype,
+                              device=args.device)  # dummy image
+    export_visual_wrapper_onnx(wrapper, dummy_video, args.output_dir)
+    build_trt_engine(
+        args.model_type,
+        [num_frames, 3, image_size, image_size],  # [num_frames, 3, H, W]
+        args.output_dir,
+        args.max_batch_size,
+        dtype,
+        num_frames=num_frames)
 
 
 def build_kosmos_engine(args):

@@ -186,6 +186,12 @@ public:
         return moe_gemm_runner_.getConfigs();
     }
 
+    static std::vector<cutlass_extensions::CutlassGemmConfig> getTactics(int sm)
+    {
+        using RunnerType = decltype(moe_gemm_runner_);
+        return RunnerType::getConfigs(sm);
+    }
+
     void runMoe(void const* input_activations, float const* gating_output, void const* fc1_expert_weights,
         void const* fc1_expert_biases, ActivationType fc1_activation_type, void const* fc2_expert_weights,
         void const* fc2_expert_biases, QuantParams quant_params, int64_t const num_rows, int64_t const hidden_size,

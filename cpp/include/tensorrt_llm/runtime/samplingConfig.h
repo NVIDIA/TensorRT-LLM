@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/layers/defaultDecodingParams.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -75,6 +76,35 @@ private:
     template <typename T>
     using Vec = std::vector<T>;
 
+    template <typename T>
+    bool validateVec(std::string name, OptVec<T> const& vec, T min, std::optional<T> max = std::nullopt)
+    {
+        bool valid{true};
+        if (vec)
+        {
+            valid = std::all_of(vec->begin(), vec->end(),
+                [min, max](T elem)
+                { return min < elem && ((max.has_value() && elem <= max.value()) || (!max.has_value())); });
+            if (!valid)
+            {
+                std::stringstream ss;
+                ss << "Incorrect sampling param. " << name << " is out of range (";
+                ss << min << ", ";
+                if (max.has_value())
+                {
+                    ss << max.value();
+                }
+                else
+                {
+                    ss << "inf";
+                }
+                ss << "]";
+                TLLM_LOG_WARNING(valid, ss.str());
+            }
+        }
+        return valid;
+    }
+
 public:
     explicit SamplingConfig(SizeType32 beamWidth = 1)
         : beamWidth{beamWidth}
@@ -129,19 +159,24 @@ public:
         topKMedusaHeads = fuseValues<std::vector<SizeType32>>(
             configs, [&configs](size_t ci) { return configs[ci].topKMedusaHeads; },
             layers::DefaultDecodingParams::getTopKMedusaHeads());
+        outputLogProbs = fuseValues<bool>(
+            configs, [&configs](size_t ci) { return configs[ci].outputLogProbs; }, false);
+        cumLogProbs = fuseValues<bool>(
+            configs, [&configs](size_t ci) { return configs[ci].cumLogProbs; }, false);
         // Only used for tests.
         draftAcceptanceThreshold = fuseValues<FloatType>(
             configs, [&configs](size_t ci) { return configs[ci].draftAcceptanceThreshold; }, 0);
     }
 
     explicit SamplingConfig(executor::SamplingConfig const& samplingConfig,
-        std::optional<executor::SpeculativeDecodingConfig> const& specDecodingConfig)
+        std::optional<executor::ExternalDraftTokensConfig> const& externalDraftTokensConfig)
         : beamWidth{samplingConfig.getBeamWidth()}
     {
 
-        if (specDecodingConfig && specDecodingConfig.value().getAcceptanceThreshold())
+        if (externalDraftTokensConfig && externalDraftTokensConfig.value().getAcceptanceThreshold())
         {
-            draftAcceptanceThreshold = Vec<FloatType>{specDecodingConfig.value().getAcceptanceThreshold().value()};
+            draftAcceptanceThreshold
+                = Vec<FloatType>{externalDraftTokensConfig.value().getAcceptanceThreshold().value()};
         }
 
 #define SET_FROM_OPTIONAL(varName, VarName, VarType)                                                                   \
@@ -168,14 +203,68 @@ public:
 #undef SET_FROM_OPTIONAL
     }
 
+    bool validate()
+    {
+        auto constexpr fltEpsilon = std::numeric_limits<float>::epsilon();
+
+        bool valid{true};
+
+        valid &= (beamWidth > 0);
+        if (!valid)
+        {
+            TLLM_LOG_WARNING(
+                "Requested beam width %d is incorrect. Must be > 0. To de-activate beam searching set beamWidth to 1.",
+                beamWidth);
+        }
+        valid &= validateVec("topK", topK, -1);
+        valid &= validateVec("topP", topP, -fltEpsilon, {1.f});
+        valid &= validateVec("topPMin", topPMin, 0.f, {1.f});
+        valid &= validateVec("topPDecay", topPDecay, 0.f, {1.f});
+        valid &= validateVec("topPResetIds", topPResetIds, -1);
+
+        valid &= validateVec("temperature", temperature, -fltEpsilon);
+        valid &= validateVec("repetitionPenalty", repetitionPenalty, 0.f);
+        valid &= validateVec("minLength", minLength, -1);
+
+        valid &= validateVec("beamSearchDiversityRate", beamSearchDiversityRate, -fltEpsilon);
+
+        // Detect greedy sampling and overwrite params.
+        if (temperature)
+        {
+            for (size_t ti = 0; ti < temperature->size(); ++ti)
+            {
+                if (temperature->at(ti) == 0.f)
+                {
+                    temperature->at(ti) = 1.0f;
+
+                    if (topK)
+                    {
+                        topK->at(ti) = 1;
+                    }
+                    if (topP)
+                    {
+                        topP->at(ti) = 1.f;
+                    }
+                }
+            }
+        }
+
+        return valid;
+    }
+
 public:
     SizeType32 beamWidth;
 
+    // penalties
     OptVec<FloatType> temperature;       // [1] or [batch_size] on cpu
     OptVec<SizeType32> minLength;        // [1] or [batch_size] on cpu
     OptVec<FloatType> repetitionPenalty; // [1] or [batch_size] on cpu
     OptVec<FloatType> presencePenalty;   // [1] or [batch_size] on cpu
     OptVec<FloatType> frequencyPenalty;  // [1] or [batch_size] on cpu
+
+    // probs
+    OptVec<bool> outputLogProbs;
+    OptVec<bool> cumLogProbs;
 
     // sampling layers
     OptVec<SizeType32> topK;          // [1] or [batch_size] on cpu
@@ -207,7 +296,8 @@ public:
             && topPResetIds == other.topPResetIds && beamSearchDiversityRate == other.beamSearchDiversityRate
             && lengthPenalty == other.lengthPenalty && earlyStopping == other.earlyStopping
             && draftAcceptanceThreshold == other.draftAcceptanceThreshold && topKMedusaHeads == other.topKMedusaHeads
-            && normalizeLogProbs == other.normalizeLogProbs;
+            && normalizeLogProbs == other.normalizeLogProbs && outputLogProbs == other.outputLogProbs
+            && cumLogProbs == other.cumLogProbs;
     }
 };
 

@@ -30,77 +30,77 @@ namespace layers
 class DefaultDecodingParams
 {
 public:
-    [[nodiscard]] static constexpr float getTemperature()
+    [[nodiscard]] __host__ __device__ static constexpr float getTemperature()
     {
         return 1.0f;
     }
 
-    [[nodiscard]] static constexpr float getRepetitionPenalty()
+    [[nodiscard]] __host__ __device__ static constexpr float getRepetitionPenalty()
     {
         return 1.0f;
     }
 
-    [[nodiscard]] static constexpr float getPresencePenalty()
+    [[nodiscard]] __host__ __device__ static constexpr float getPresencePenalty()
     {
         return 0.0f;
     }
 
-    [[nodiscard]] static constexpr float getFrequencyPenalty()
+    [[nodiscard]] __host__ __device__ static constexpr float getFrequencyPenalty()
     {
         return 0.0f;
     }
 
-    [[nodiscard]] static constexpr runtime::SizeType32 getMinLength()
+    [[nodiscard]] __host__ __device__ static constexpr runtime::SizeType32 getMinLength()
     {
         return 1;
     }
 
-    [[nodiscard]] static constexpr uint64_t getSeed()
+    [[nodiscard]] __host__ __device__ static constexpr uint64_t getSeed()
     {
         return 0;
     }
 
-    [[nodiscard]] static constexpr runtime::SizeType32 getTopK()
+    [[nodiscard]] __host__ __device__ static constexpr runtime::SizeType32 getTopK()
     {
         return 0;
     }
 
-    [[nodiscard]] static constexpr float getTopP()
+    [[nodiscard]] __host__ __device__ static constexpr float getTopP()
     {
         return 0.0f;
     }
 
-    [[nodiscard]] static constexpr float getTopPDecay()
+    [[nodiscard]] __host__ __device__ static constexpr float getTopPDecay()
     {
         return 1.0f;
     }
 
-    [[nodiscard]] static constexpr float getTopPMin()
+    [[nodiscard]] __host__ __device__ static constexpr float getTopPMin()
     {
         return 1.0e-6f;
     }
 
-    [[nodiscard]] static constexpr runtime::TokenIdType getTopPResetId()
+    [[nodiscard]] __host__ __device__ static constexpr runtime::TokenIdType getTopPResetId()
     {
         return -1;
     }
 
-    [[nodiscard]] static constexpr float getBeamSearchDiversity()
+    [[nodiscard]] __host__ __device__ static constexpr float getBeamSearchDiversity()
     {
         return 0.f;
     }
 
-    [[nodiscard]] static constexpr float getLengthPenalty()
+    [[nodiscard]] __host__ __device__ static constexpr float getLengthPenalty()
     {
         return 0.f;
     }
 
-    [[nodiscard]] static constexpr runtime::SizeType32 getEarlyStopping()
+    [[nodiscard]] __host__ __device__ static constexpr runtime::SizeType32 getEarlyStopping()
     {
         return 1;
     }
 
-    [[nodiscard]] static constexpr bool getNormalizeLogProbs()
+    [[nodiscard]] __host__ __device__ static constexpr bool getNormalizeLogProbs()
     {
         return false;
     }
