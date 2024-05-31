@@ -797,6 +797,7 @@ class ModelRunner(ModelRunnerMixin):
             streaming=streaming,
             stopping_criteria=stopping_criteria,
             logits_processor=logits_processor,
+            **kwargs,
             **ptuning_kwargs)
         if sampling_config.return_dict:
             if streaming:
