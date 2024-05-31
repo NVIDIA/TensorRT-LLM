@@ -276,7 +276,7 @@ class CogVLMForCausalLM(DecoderModelForCausalLM, TopModelMixin):
     def default_plugin_config(self, **kwargs):
         plugin_config = super().default_plugin_config(**kwargs)
         if self.quant_mode.is_int4_weight_only_per_group():
-            plugin_config.set_weight_only_groupwise_quant_matmul_plugin()
+            plugin_config.weight_only_groupwise_quant_matmul_plugin = 'auto'
         return plugin_config
 
     @classmethod

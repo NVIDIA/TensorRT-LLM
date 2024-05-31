@@ -25,9 +25,11 @@ import numpy as np
 # isort: off
 import torch
 import tensorrt as trt
+
 # isort: on
 
 from ._utils import str_dtype_to_trt
+from .bindings import MpiComm
 from .logger import logger
 from .plugin import _load_plugin_lib
 
@@ -63,6 +65,8 @@ def _init(log_level: object = None) -> None:
     except Exception as e:
         msg = '\nFATAL: Decoding operators failed to load. This may be caused by the incompatibility between PyTorch and TensorRT-LLM. Please rebuild and install TensorRT-LLM.'
         raise ImportError(str(e) + msg)
+
+    MpiComm.local_init()
 
     logger.info('TensorRT-LLM inited.')
 
@@ -196,13 +200,15 @@ def _is_building(f):
 
 def check_max_num_tokens(max_num_tokens, opt_num_tokens, max_batch_size,
                          max_input_len, max_beam_width, remove_input_padding,
-                         enable_context_fmha, tokens_per_block):
+                         enable_context_fmha, tokens_per_block,
+                         multiple_profiles):
     if not remove_input_padding:
         if max_num_tokens is not None or opt_num_tokens is not None:
+            max_num_tokens = max_batch_size * max_input_len
             logger.warning("remove_input_padding is not enabled, the specified "
                            "max_num_tokens/opt_num_tokens will be ignored.")
         return max_num_tokens, opt_num_tokens
-    elif remove_input_padding:
+    else:
         if max_num_tokens is None:
             max_num_tokens = max_input_len * max_batch_size
             logger.warning(
@@ -213,11 +219,18 @@ def check_max_num_tokens(max_num_tokens, opt_num_tokens, max_batch_size,
                 "of packed input tokens are very likely to be smaller, "
                 "we strongly recommend to set max_num_tokens according "
                 "to your workloads.")
-        if opt_num_tokens is None:
+        if opt_num_tokens is None and not multiple_profiles:
             opt_num_tokens = max_batch_size * max_beam_width
             logger.warning(
                 "remove_input_padding is enabled, while opt_num_tokens "
                 "is not set, setting to max_batch_size*max_beam_width. \n")
+        if max_num_tokens > 16384:
+            logger.warning(
+                "Specifying a `max_num_tokens` larger than 16384 is usually "
+                "not recommended, we do not expect perf gain with that and too "
+                "large `max_num_tokens` could possibly exceed the TensorRT "
+                "tensor volume, causing runtime errors. "
+                f"Got `max_num_tokens` = {max_num_tokens}")
     if max_num_tokens > max_input_len * max_batch_size:
         max_num_tokens = max_input_len * max_batch_size
         logger.warning(
@@ -239,7 +252,7 @@ def check_max_num_tokens(max_num_tokens, opt_num_tokens, max_batch_size,
             f"context chunking at runtime, otherwise you may encounter errors.")
         max_num_tokens = tokens_per_block
 
-    if opt_num_tokens > max_num_tokens:
+    if opt_num_tokens is not None and opt_num_tokens > max_num_tokens:
         logger.warning(
             f"opt_num_tokens ({opt_num_tokens}) shouldn't be greater than "
             f"max_num_tokens ({max_num_tokens}), "

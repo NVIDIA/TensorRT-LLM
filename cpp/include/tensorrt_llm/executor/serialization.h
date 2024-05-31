@@ -38,10 +38,10 @@ public:
     static void serialize(OutputConfig const& config, std::ostream& os);
     [[nodiscard]] static size_t serializedSize(OutputConfig const& config);
 
-    // SpeculativeDecodingConfig
-    [[nodiscard]] static SpeculativeDecodingConfig deserializeSpeculativeDecodingConfig(std::istream& is);
-    static void serialize(SpeculativeDecodingConfig const& config, std::ostream& os);
-    [[nodiscard]] static size_t serializedSize(SpeculativeDecodingConfig const& config);
+    // ExternalDraftTokensConfig
+    [[nodiscard]] static ExternalDraftTokensConfig deserializeExternalDraftTokensConfig(std::istream& is);
+    static void serialize(ExternalDraftTokensConfig const& config, std::ostream& os);
+    [[nodiscard]] static size_t serializedSize(ExternalDraftTokensConfig const& config);
 
     // PromptTuningConfig
     [[nodiscard]] static PromptTuningConfig deserializePromptTuningConfig(std::istream& is);
@@ -101,6 +101,21 @@ public:
     static OrchestratorConfig deserializeOrchestratorConfig(std::istream& is);
     static void serialize(OrchestratorConfig const& orchestratorConfig, std::ostream& os);
     static size_t serializedSize(OrchestratorConfig const& orchestratorConfig);
+
+    // DecodingMode
+    static DecodingMode deserializeDecodingMode(std::istream& is);
+    static void serialize(DecodingMode const& decodingMode, std::ostream& os);
+    static size_t serializedSize(DecodingMode const& decodingMode);
+
+    // LookaheadDecodingConfig
+    static LookaheadDecodingConfig deserializeLookaheadDecodingConfig(std::istream& is);
+    static void serialize(LookaheadDecodingConfig const& lookaheadDecodingConfig, std::ostream& os);
+    static size_t serializedSize(LookaheadDecodingConfig const& lookaheadDecodingConfig);
+
+    // DecodingConfig
+    static DecodingConfig deserializeDecodingConfig(std::istream& is);
+    static void serialize(DecodingConfig const& decodingConfig, std::ostream& os);
+    static size_t serializedSize(DecodingConfig const& decodingConfig);
 
     // ExecutorConfig
     static ExecutorConfig deserializeExecutorConfig(std::istream& is);

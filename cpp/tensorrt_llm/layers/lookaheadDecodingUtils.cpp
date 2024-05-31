@@ -10,66 +10,40 @@ namespace tensorrt_llm::layers
 using namespace tensorrt_llm::runtime;
 using TensorPtr = ITensor::SharedPtr;
 
-void printTokens2d(char const* name, TensorPtr const& tensor)
+ITensor::UniquePtr slice(
+    ITensor::SharedPtr tensor, std::initializer_list<SizeType32> const& offsetDims, size_t const sizeDim)
 {
-    auto M = tensor->getShape().d[0];
-    auto N = tensor->getShape().d[1];
-    auto tensorRange = BufferRange<TokenIdType>(*tensor);
-    std::ostringstream buf;
-    buf << name << ": " << tensor->getShape() << "(\n";
-    for (SizeType32 mi = 0; mi < M; mi++)
-    {
-        for (SizeType32 ni = 0; ni < N; ni++)
-        {
-            auto token = tensorRange[mi * N + ni];
-            if (token >= 0 && token <= 255)
-            {
-                buf << "'" << static_cast<char>(token) << "'";
-            }
-            else
-            {
-                buf << token;
-            }
-            buf << (ni == (N - 1) ? ';' : ',');
-        }
-        if (mi != M - 1)
-        {
-            buf << std::endl;
-        }
-    }
-    buf << ")" << std::endl;
-    TLLM_LOG_DEBUG(buf.str());
-}
+    auto shape = tensor->getShape();
+    TLLM_CHECK(offsetDims.size() > 0);
+    TLLM_CHECK(shape.nbDims >= offsetDims.size());
+    std::vector<size_t> volumes(shape.nbDims);
 
-void printTokens(char const* name, TensorPtr const& tensor)
-{
-    std::ostringstream buf;
-    buf << name << ": " << tensor->getShape() << "(";
-    for (auto const& token : BufferRange<TokenIdType>(*tensor))
+    int i;
+    volumes[shape.nbDims - 1] = 1;
+    for (i = shape.nbDims - 2; i >= 0; i--)
     {
-        if (token >= 0 && token <= 255)
-        {
-            buf << "'" << static_cast<char>(token) << "',";
-        }
-        else
-        {
-            buf << token << ",";
-        }
+        volumes[i] = shape.d[i + 1] * volumes[i + 1];
     }
-    buf << ")" << std::endl << std::flush;
-    TLLM_LOG_DEBUG(buf.str());
-}
 
-void printTensor(char const* name, TensorPtr const& tensor)
-{
-    std::ostringstream buf;
-    buf << name << ": " << tensor->getShape() << "(";
-    for (auto const& token : BufferRange<TokenIdType>(*tensor))
+    size_t offset = 0;
+    i = 0;
+    for (auto itd = offsetDims.begin(); itd != offsetDims.end(); itd++)
     {
-        buf << token << ",";
+        TLLM_CHECK(0 <= (*itd) && (*itd) < shape.d[i]);
+        offset += (*itd) * volumes[i++];
     }
-    buf << ")" << std::endl << std::flush;
-    TLLM_LOG_DEBUG(buf.str());
+
+    ITensor::Shape dims;
+    dims.nbDims = shape.nbDims - offsetDims.size() + 1;
+    dims.d[0] = sizeDim;
+    for (i = 1; i < dims.nbDims; i++)
+    {
+        dims.d[i] = shape.d[i - 1 + offsetDims.size()];
+    }
+
+    size_t size = ITensor::volume(dims);
+
+    return std::make_unique<TensorView>(std::move(tensor), offset, size, dims);
 }
 
 } // namespace tensorrt_llm::layers

@@ -80,7 +80,7 @@ TopPSamplingLayer<T>::TopPSamplingLayer(DecoderDomain const& decoderDomain, cuda
     tc::check_cuda_error(cudaGetDevice(&deviceId)); // Get the correct device id
     tc::check_cuda_error(cudaGetDeviceProperties(&mDeviceProp, deviceId));
 
-    allocateBuffer(mDecoderDomain.getMaxBatchSize());
+    allocateBuffer(mDecoderDomain.getBatchSize());
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -186,7 +186,7 @@ void TopPSamplingLayer<T>::setup(SizeType32 const batchSize, SizeType32 const be
             }
             mSkipDecodeHost[bid] = true;
         }
-        cudaAutoCpy(mSkipDecodeDevice, mSkipDecodeHost, mDecoderDomain.getMaxBatchSize(), mStream);
+        cudaAutoCpy(mSkipDecodeDevice, mSkipDecodeHost, mDecoderDomain.getBatchSize(), mStream);
         return;
     }
 
@@ -263,9 +263,9 @@ void TopPSamplingLayer<T>::setup(SizeType32 const batchSize, SizeType32 const be
         sync_check_cuda_error();
     }
 
-    cudaAutoCpy(mSkipDecodeHost, mSkipDecodeDevice, mDecoderDomain.getMaxBatchSize(), mStream);
-    std::vector<float> runtimeTopPs(mDecoderDomain.getMaxBatchSize());
-    cudaAutoCpy(runtimeTopPs.data(), mRuntimeTopPDevice, mDecoderDomain.getMaxBatchSize(), mStream);
+    cudaAutoCpy(mSkipDecodeHost, mSkipDecodeDevice, mDecoderDomain.getBatchSize(), mStream);
+    std::vector<float> runtimeTopPs(mDecoderDomain.getBatchSize());
+    cudaAutoCpy(runtimeTopPs.data(), mRuntimeTopPDevice, mDecoderDomain.getBatchSize(), mStream);
     {
         auto maxTopP = 0.f;
         for (SizeType32 bi = 0; bi < batchSize; ++bi)
@@ -295,7 +295,7 @@ void TopPSamplingLayer<T>::setup(SizeType32 const batchSize, SizeType32 const be
 }
 
 template <typename T>
-void TopPSamplingLayer<T>::forward(
+void TopPSamplingLayer<T>::forwardAsync(
     std::shared_ptr<BaseOutputParams> baseOutputs, std::shared_ptr<BaseInputParams> baseInputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -352,7 +352,7 @@ void TopPSamplingLayer<T>::forward(
     params.outputLogProbs = outputLogProbs;
     params.curandState = curandStatesDevice;
     params.batchSize = batchSize;
-    params.maxBatchSize = mDecoderDomain.getMaxBatchSize();
+    params.maxBatchSize = mDecoderDomain.getBatchSize();
     params.vocabSizePadded = mDecoderDomain.getVocabSizePadded();
 
     if (mIsAirTopP == false)

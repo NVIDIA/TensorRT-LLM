@@ -275,7 +275,7 @@ class TestSmoothQuant(unittest.TestCase):
         builder = tensorrt_llm.Builder()
         network = builder.create_network()
         # Allow SQ plugin of dtype type
-        network.plugin_config.set_smooth_quant_gemm_plugin(dtype)
+        network.plugin_config.smooth_quant_gemm_plugin = dtype
         with tensorrt_llm.net_guard(network):
 
             x = Tensor(name='x',
@@ -430,7 +430,7 @@ class TestSmoothQuant(unittest.TestCase):
         builder = tensorrt_llm.Builder()
         network = builder.create_network()
         # Allow SQ plugin of dtype type
-        network.plugin_config.set_smooth_quant_gemm_plugin(dtype)
+        network.plugin_config.smooth_quant_gemm_plugin = dtype
         with tensorrt_llm.net_guard(network):
 
             x = Tensor(name='x',
@@ -556,7 +556,7 @@ class TestSmoothQuant(unittest.TestCase):
         # construct trt network
         builder = tensorrt_llm.Builder()
         network = builder.create_network()
-        network.plugin_config.set_layernorm_quantization_plugin(dtype)
+        network.plugin_config.layernorm_quantization_plugin = dtype
         with tensorrt_llm.net_guard(network):
             x = Tensor(name='x',
                        shape=x_data.shape,
@@ -663,7 +663,7 @@ class TestSmoothQuant(unittest.TestCase):
         # construct trt network
         builder = tensorrt_llm.Builder()
         network = builder.create_network()
-        network.plugin_config.set_weight_only_quant_matmul_plugin(dtype)
+        network.plugin_config.weight_only_quant_matmul_plugin = dtype
         with tensorrt_llm.net_guard(network):
 
             x = Tensor(name='x',
@@ -720,8 +720,8 @@ class TestSmoothQuant(unittest.TestCase):
         def _construct_execution():
             builder = tensorrt_llm.Builder()
             network = builder.create_network()
-            network.plugin_config.set_smooth_quant_gemm_plugin(dtype)
-            network.plugin_config.set_gpt_attention_plugin(dtype)
+            network.plugin_config.smooth_quant_gemm_plugin = dtype
+            network.plugin_config.gpt_attention_plugin = dtype
             with tensorrt_llm.net_guard(network):
                 hidden_states_tensor = Tensor(
                     name='hidden_states',

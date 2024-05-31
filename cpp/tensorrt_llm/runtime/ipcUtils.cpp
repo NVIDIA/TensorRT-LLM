@@ -22,6 +22,7 @@
 
 #include <NvInferRuntimeBase.h>
 #include <cstddef>
+#include <unordered_set>
 
 namespace tensorrt_llm::runtime
 {
@@ -31,25 +32,26 @@ namespace
 void setPeerAccess(WorldConfig const& worldConfig, bool enable)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto const srcNode = worldConfig.getTensorParallelRank();
+    auto const srcDevice = worldConfig.getDevice();
 
-    for (SizeType32 destNode = 0; destNode < worldConfig.getTensorParallelism(); destNode++)
+    for (SizeType32 rank : worldConfig.getTensorParallelGroup())
     {
-        if (destNode == srcNode)
+        SizeType32 destDevice = worldConfig.getDeviceOf(rank);
+        if (worldConfig.getNodeRankOf(rank) != worldConfig.getNodeRank() || destDevice == srcDevice)
         {
             continue;
         }
 
         int canAccessPeer{0};
-        TLLM_CUDA_CHECK(cudaDeviceCanAccessPeer(&canAccessPeer, srcNode, destNode));
+        TLLM_CUDA_CHECK(cudaDeviceCanAccessPeer(&canAccessPeer, srcDevice, destDevice));
 
         if (enable)
         {
-            cudaDeviceEnablePeerAccess(destNode, 0);
+            cudaDeviceEnablePeerAccess(destDevice, 0);
         }
         else
         {
-            cudaDeviceDisablePeerAccess(destNode);
+            cudaDeviceDisablePeerAccess(destDevice);
         }
         auto const error = cudaGetLastError();
         if (error != cudaErrorPeerAccessAlreadyEnabled && error != cudaErrorPeerAccessNotEnabled)
@@ -65,7 +67,11 @@ IpcMemory::IpcMemory(std::size_t bufferSize, BufferManager const& manager, World
     : mTpRank(worldConfig.getTensorParallelRank())
     , mCommPtrs(worldConfig.getTensorParallelism())
 {
-    allocateIpcMemory(bufferSize, manager, worldConfig);
+    mOpenIpc = worldConfig.getTensorParallelism() <= worldConfig.getGpusPerNode();
+    if (mOpenIpc)
+    {
+        allocateIpcMemory(bufferSize, manager, worldConfig);
+    }
 }
 
 void IpcMemory::allocateIpcMemory(std::size_t bufferSize, BufferManager const& manager, WorldConfig const& worldConfig)
@@ -110,7 +116,10 @@ void IpcMemory::allocateIpcMemory(std::size_t bufferSize, BufferManager const& m
 
 IpcMemory::~IpcMemory()
 {
-    destroyIpcMemory();
+    if (mOpenIpc)
+    {
+        destroyIpcMemory();
+    }
 }
 
 void IpcMemory::destroyIpcMemory()
@@ -134,12 +143,11 @@ AllReduceBuffers::AllReduceBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWi
     setPeerAccess(worldConfig, true);
 
     auto const tpSize = worldConfig.getTensorParallelism();
-
     auto const bufferSize = tpSize
         * std::min(
             static_cast<std::size_t>(maxBatchSize) * maxBeamWidth * maxSequenceLength * hiddenSize * sizeof(float),
             utils::customAllReduceUtils::getMaxRequiredWorkspaceSize(tpSize));
-    auto const flagsSize = IpcMemory::FLAGS_SIZE * tpSize;
+    auto const flagsSize = IpcMemory::FLAGS_SIZE * tpSize * 2;
 
     for (auto size : {bufferSize, bufferSize, flagsSize, flagsSize})
     {

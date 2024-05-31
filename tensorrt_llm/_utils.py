@@ -333,6 +333,10 @@ def dim_resolve_negative(dim, ndim):
     return tuple(pos)
 
 
+# mpi4py only exports MPI_COMM_TYPE_SHARED, so we define OMPI_COMM_TYPE_HOST here
+OMPI_COMM_TYPE_HOST = 9
+
+
 def mpi_comm():
     from mpi4py import MPI
     return MPI.COMM_WORLD

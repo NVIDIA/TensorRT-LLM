@@ -1,5 +1,4 @@
 --extra-index-url https://pypi.nvidia.com
---extra-index-url https://gitlab-master.nvidia.com/api/v4/projects/95421/packages/pypi/simple
 accelerate>=0.25.0
 build
 colored
@@ -18,10 +17,10 @@ h5py==3.10.0
 StrEnum
 sentencepiece>=0.1.99
 tensorrt==10.0.1
-# https://github.com/pytorch/pytorch/blob/v2.2.2/version.txt still uses 2.2.0a0.
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-03.html#rel-24-03 uses 2.3.0a0.
-torch>=2.2.0a,<=2.3.0a
-nvidia-modelopt~=0.11
+# https://github.com/pytorch/pytorch/blob/v2.3.0/version.txt uses 2.3.0a0.
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-04.html#rel-24-04 uses 2.3.0a0.
+torch>=2.3.0a,<=2.3.0
+nvidia-modelopt~=0.11,<0.12
 transformers>=4.38.2
 wheel
 optimum

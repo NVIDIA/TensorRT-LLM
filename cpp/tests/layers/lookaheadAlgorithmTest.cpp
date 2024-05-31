@@ -10,70 +10,22 @@ using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::layers;
 using TensorPtr = runtime::ITensor::SharedPtr;
 
-TEST(LookaheadRandomllm, forward)
-{
-    // '&' is the end token ID, and '#' is the invalid token ID.
-    std::string asciiVocab("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ -+_,:;.!?()[]{}'\"&#");
-    auto ascii = std::make_shared<RandomTokenLogits>(asciiVocab);
-    EXPECT_EQ(ascii->getVocabSize(), asciiVocab.size());
-    {
-        auto tensor = ascii->tokenToLogits(static_cast<TokenIdType>('a'));
-        auto token = ascii->logitsToToken(tensor);
-        EXPECT_EQ(static_cast<char>(token), 'a');
-    }
-    {
-        auto tensor = ascii->tokenToLogits(static_cast<TokenIdType>('W'));
-        auto token = ascii->logitsToToken(tensor);
-        EXPECT_EQ(static_cast<char>(token), 'W');
-    }
-    {
-        auto tensor = ascii->tokenToLogits(-1);
-        auto token = ascii->logitsToToken(tensor);
-        EXPECT_EQ(static_cast<char>(token), '#');
-    }
-    {
-        std::string str("hello world!");
-        TensorPtr logits
-            = BufferManager::cpu(ITensor::makeShape({static_cast<SizeType32>(str.size()), ascii->getVocabSize()}),
-                nvinfer1::DataType::kFLOAT);
-        ascii->stringToLogits(logits, str);
-        auto result = ascii->logitsToString(logits);
-        EXPECT_EQ(result, str);
-    }
-
-    std::string oracle(
-        "The following example uses a lambda-expression to increment all of the elements of a vector and "
-        "then uses an overloaded operator() in a function object (a.k.a., \"functor\") to compute their sum. Note that "
-        "to compute the sum, it is recommended to use the dedicated algorithm std::accumulate.");
-    LookaheadRandomLlm llm(ascii, oracle);
-    {
-        TLLM_LOG_DEBUG("oracle[22]='%c'", oracle[22]);
-        std::string input("ubcs23eess a la");
-        auto len = static_cast<SizeType32>(input.size());
-        TensorPtr inputTokens = initTensor(input);
-        std::vector<TokenIdType> positionIdVec({22, 23, 24, 23, 24, 25, 24, 25, 26, 25, 26, 27, 26, 27, 28});
-        TensorPtr positionIds = ITensor::wrap(positionIdVec, ITensor::makeShape({len}));
-        TensorPtr outputLogits
-            = BufferManager::cpu(ITensor::makeShape({len, ascii->getVocabSize()}), nvinfer1::DataType::kFLOAT);
-
-        llm.forward(outputLogits, inputTokens, positionIds);
-
-        auto result = ascii->logitsToString(outputLogits);
-        auto invalid = ascii->getInvalidToken();
-        TLLM_LOG_DEBUG("result=%s", result.c_str());
-        for (SizeType32 i = 0; i < len; i++)
-        {
-            if (result[i] != invalid)
-            {
-                EXPECT_EQ(result[i], oracle[positionIdVec[i] + 1]);
-            }
-        }
-    }
-}
-
 class LookaheadAlgorithmTest : public ::testing::TestWithParam<std::tuple<int, int, int>>
 {
 };
+
+bool verifyAcceptOffsets(TensorPtr output, TensorPtr accepted, TensorPtr acceptedOffsets)
+{
+    BufferRange<TokenIdType> outputRange(*output);
+    BufferRange<TokenIdType> acceptedRange(*accepted);
+    BufferRange<SizeType32> offsetsRange(*acceptedOffsets);
+    bool result = true;
+    for (SizeType32 i = 0; i < acceptedRange.size(); i++)
+    {
+        result &= outputRange[offsetsRange[i]] == acceptedRange[i];
+    }
+    return result;
+}
 
 TEST_P(LookaheadAlgorithmTest, predict)
 {
@@ -81,9 +33,7 @@ TEST_P(LookaheadAlgorithmTest, predict)
     auto mStream = std::make_shared<CudaStream>();
     auto mBufferManager = std::make_shared<BufferManager>(mStream);
 
-    // '&' is the end token ID, and '#' is the invalid token ID.
-    std::string asciiVocab("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ -+_,:;.!?()[]{}'\"&#");
-    auto ascii = std::make_shared<RandomTokenLogits>(asciiVocab);
+    auto ascii = std::make_shared<AsciiRandomTokenLogits>();
 
     std::string oracle(
         "The following example uses the following lambda-expression to increment all of the elements of a vector and "
@@ -92,52 +42,98 @@ TEST_P(LookaheadAlgorithmTest, predict)
     LookaheadRandomLlm llm(ascii, oracle);
 
     auto prompt = initTensor(std::string(oracle.substr(0, 20)));
+    BufferRange<TokenIdType> promptRange(*prompt);
     auto promptLen = ITensor::volume(prompt->getShape());
-    std::string result(oracle.substr(0, 20));
 
-    SizeType32 lastPosid = promptLen;
-    TokenIdType lastToken = oracle[lastPosid]; // from context phase.
-    result.push_back(static_cast<char>(lastToken));
+    auto maxSeqLen = 1024;
+    auto maxDraftLen = (W + G) * (N - 1) - 1;
+    auto shape = ITensor::makeShape({1 + maxDraftLen});
+    auto shapeSingle = ITensor::makeShape({1});
+    TensorPtr posidMax = BufferManager::cpu(shape, nvinfer1::DataType::kINT32);
+    TensorPtr smaskMax = BufferManager::cpu(shape, nvinfer1::DataType::kBOOL);
+    TensorPtr inputLengthPtr = BufferManager::cpu(shapeSingle, nvinfer1::DataType::kINT32);
+    auto& inputLength(*BufferRange<SizeType32>(*inputLengthPtr).begin());
 
-    tensorrt_llm::layers::LookaheadAlgorithm algo(W, N, G, ascii->getEndToken(), mBufferManager);
-    algo.setup(prompt);
+    TensorPtr outputMax = BufferManager::cpu(shape, nvinfer1::DataType::kINT32);
+    TensorPtr endIdPtr = BufferManager::cpu(shapeSingle, nvinfer1::DataType::kINT32);
+    auto& endId(*BufferRange<TokenIdType>(*endIdPtr).begin());
+    endId = ascii->getEndToken();
+
+    TensorPtr acceptedMax = BufferManager::cpu(shape, nvinfer1::DataType::kINT32);
+    TensorPtr acceptedOffsetsMax = BufferManager::cpu(shape, nvinfer1::DataType::kINT32);
+    TensorPtr acceptedLengthPtr = BufferManager::cpu(shapeSingle, nvinfer1::DataType::kINT32);
+    auto& acceptedLength(*BufferRange<SizeType32>(*acceptedLengthPtr).begin());
+
+    TensorPtr sequence = BufferManager::cpu(ITensor::makeShape({maxSeqLen + maxDraftLen}), nvinfer1::DataType::kINT32);
+    BufferRange<TokenIdType> sequenceRange(*sequence);
+    TensorPtr sequenceLengthPtr = BufferManager::cpu(shapeSingle, nvinfer1::DataType::kINT32);
+    auto& sequenceLength(*bufferCast<SizeType32>(*sequenceLengthPtr));
+
+    std::copy(promptRange.begin(), promptRange.end(), sequenceRange.begin());
+    sequenceLength = promptLen;
+
+    sequenceRange[sequenceLength] = oracle[promptLen]; // from context phase.
+    sequenceLength += 1;
+
+    PRINT_TOKENS(sequence);
+
+    tensorrt_llm::layers::LookaheadAlgorithm algo(W, N, G, mBufferManager);
+    algo.setup(ITensor::slice(sequence, 0, sequenceLength));
 
     SizeType32 seqLen = oracle.size();
-    std::vector<int> histogram(N - 1, 0);
-    for (; lastPosid < seqLen - 1;)
+    std::vector<SizeType32> histogram(N + 1);
+
+    for (; sequenceLength < seqLen;)
     {
-        TLLM_LOG_DEBUG("oracle[%d] = '%c'", lastPosid, static_cast<char>(lastToken));
-        auto [input, posid, smask] = algo.prepare(lastPosid, lastToken);
+        TLLM_LOG_DEBUG("\noracle[%d] = '%c'", sequenceLength - 1, static_cast<char>(sequenceRange[sequenceLength - 1]));
+        bufferCast<SizeType32>(*posidMax)[0] = sequenceLength - 1;
+        bufferCast<bool>(*smaskMax)[0] = true;
+        algo.prepare(ITensor::slice(sequence, sequenceLength, maxDraftLen), ITensor::slice(posidMax, 1, maxDraftLen),
+            ITensor::slice(smaskMax, 1, maxDraftLen), inputLengthPtr, sequenceLengthPtr,
+            ITensor::slice(sequence, sequenceLength - 1, 1));
+
+        TensorPtr input = ITensor::slice(sequence, sequenceLength - 1, inputLength + 1);
+        TensorPtr posid = ITensor::slice(posidMax, 0, inputLength + 1);
+        TensorPtr smask = ITensor::slice(smaskMax, 0, inputLength + 1);
 
         PRINT_TOKENS(input);
         PRINT_TENSOR(posid);
         PRINT_TENSOR(smask);
-        TensorPtr output = BufferManager::cpu(input->getShape(), nvinfer1::DataType::kINT32);
+
+        TensorPtr output = ITensor::slice(outputMax, 0, inputLength + 1);
         llm.foretell(output, input, posid);
         llm.sampleByMask(output, smask);
         PRINT_TOKENS(output);
 
-        auto accepted = algo.update(output);
-        EXPECT_TRUE(llm.verify(lastPosid + 1, accepted));
+        // algo.update(acceptedMax, acceptedOffsetsMax, acceptedLengthPtr, output, endIdPtr);
+        algo.update(
+            ITensor::slice(sequence, sequenceLength, N), acceptedOffsetsMax, acceptedLengthPtr, output, endIdPtr);
 
-        auto acceptedLen = ITensor::volume(accepted->getShape());
-        auto acceptedRange = BufferRange<TokenIdType>(*accepted);
-        histogram[acceptedLen] += 1;
-        lastPosid += acceptedLen;
-        lastToken = acceptedRange[acceptedLen - 1];
-        std::for_each(
-            acceptedRange.begin(), acceptedRange.end(), [&result](auto t) { result.push_back(static_cast<char>(t)); });
-        TLLM_LOG_DEBUG("seqLen=%d, lastPosid=%d, RESULT: %s", seqLen, lastPosid, result.c_str());
+        TensorPtr accepted = ITensor::slice(sequence, sequenceLength, acceptedLength);
+        TensorPtr acceptedOffsets = ITensor::slice(acceptedOffsetsMax, 0, acceptedLength);
+
+        TLLM_CHECK(acceptedLength <= N);
+        histogram[acceptedLength] += 1;
+        PRINT_TOKENS(accepted);
+        PRINT_VALUES(acceptedOffsets);
+
+        EXPECT_TRUE(verifyAcceptOffsets(output, accepted, acceptedOffsets));
+        EXPECT_TRUE(llm.verify(sequenceLength, accepted));
+
+        sequenceLength += acceptedLength;
+
+        TLLM_LOG_DEBUG("result: '%s'", D(ITensor::slice(sequence, 0, sequenceLength)).string().c_str());
     }
-    EXPECT_EQ(lastPosid, seqLen - 1);
+    EXPECT_EQ(sequenceLength, seqLen);
 
-    std::ostringstream buf;
-    buf << "Lookahead acceptance histogram: ";
-    std::for_each(histogram.begin(), histogram.end(), [&buf](auto& v) { buf << v << ", "; });
-    TLLM_LOG_DEBUG(buf.str());
+    TensorPtr hist = ITensor::wrap(histogram, ITensor::makeShape({N + 1}));
+    TLLM_LOG_DEBUG("Lookahead acceptance histogram: %s", D(hist).values<SizeType32>().c_str());
 }
 
 INSTANTIATE_TEST_CASE_P(CombineLookaheadAlgorithmTest, LookaheadAlgorithmTest,
-    testing::Combine(testing::Values(1, 3, 5), testing::Values(3, 5), testing::Values(3, 5)));
+    testing::Combine(testing::Values(1, 3, 5, 7), testing::Values(3, 5, 7), testing::Values(3, 5, 7)));
+
+INSTANTIATE_TEST_CASE_P(CombineLookaheadAlgorithmTestSingle, LookaheadAlgorithmTest,
+    testing::Combine(testing::Values(5), testing::Values(5), testing::Values(5)));
 
 } // namespace tensorrt_llm::tests::layers

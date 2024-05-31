@@ -19,6 +19,7 @@ from .bloom.model import BloomForCausalLM, BloomModel
 from .chatglm.model import ChatGLMForCausalLM, ChatGLMModel
 from .cogvlm.model import CogVLMForCausalLM
 from .dbrx.model import DbrxForCausalLM
+from .dit.model import DiT
 from .enc_dec.model import DecoderModel, EncoderModel, WhisperEncoder
 from .falcon.model import FalconForCausalLM, FalconModel
 from .gemma.model import GemmaForCausalLM
@@ -43,6 +44,7 @@ __all__ = [
     'BertForSequenceClassification',
     'BloomModel',
     'BloomForCausalLM',
+    'DiT',
     'FalconForCausalLM',
     'FalconModel',
     'GPTModel',
@@ -102,9 +104,11 @@ MODEL_MAP = {
     'SkyworkForCausalLM': LLaMAForCausalLM,
     'GemmaForCausalLM': GemmaForCausalLM,
     'QWenForCausalLM': QWenForCausalLM,
+    'WhisperEncoder': WhisperEncoder,
     'EncoderModel': EncoderModel,
     'DecoderModel': DecoderModel,
     'DbrxForCausalLM': DbrxForCausalLM,
     'RecurrentGemmaForCausalLM': RecurrentGemmaForCausalLM,
     'CogVLMForCausalLM': CogVLMForCausalLM,
+    'DiT': DiT,
 }

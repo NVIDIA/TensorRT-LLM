@@ -29,14 +29,17 @@ static char const* LRU_PLUGIN_NAME{"LRU"};
 PluginFieldCollection lruPluginCreator::mFC{};
 std::vector<nvinfer1::PluginField> lruPluginCreator::mPluginAttributes;
 
-lruPlugin::lruPlugin(
-    int dim, nvinfer1::DataType type, bool removePadding, bool pagedState, bool yEnabled, bool yBiasEnabled)
+lruPlugin::lruPlugin(int dim, int block_size, nvinfer1::DataType type, bool removePadding, bool pagedState,
+    bool yEnabled, bool yBiasEnabled, bool fuseGateEnabled, bool gateBiasEnabled)
     : mDim(dim)
+    , mBlockSize(block_size)
     , mType(type)
     , mRemovePadding(removePadding)
     , mPagedState(pagedState)
     , mYEnabled(yEnabled)
     , mYBiasEnabled(yBiasEnabled)
+    , mFuseGateEnabled(fuseGateEnabled)
+    , mGateBiasEnabled(gateBiasEnabled)
 {
     TLLM_CHECK_WITH_INFO((getSMVersion() >= 80) || (mType != DataType::kBF16),
         "Unsupported data type, pre SM 80 GPUs do not support bfloat16");
@@ -49,11 +52,14 @@ lruPlugin::lruPlugin(void const* data, size_t length)
 {
     char const *d = reinterpret_cast<char const*>(data), *a = d;
     read(d, mDim);
+    read(d, mBlockSize);
     read(d, mType);
     read(d, mRemovePadding);
     read(d, mPagedState);
     read(d, mYEnabled);
     read(d, mYBiasEnabled);
+    read(d, mFuseGateEnabled);
+    read(d, mGateBiasEnabled);
     TLLM_CHECK(d == a + length);
     TLLM_CHECK_WITH_INFO((getSMVersion() >= 80) || (mType != DataType::kBF16), "Unsupported data type");
     TLLM_CHECK_WITH_INFO((mType == DataType::kBF16) || (mType == DataType::kFLOAT) || (mType == DataType::kHALF),
@@ -63,7 +69,8 @@ lruPlugin::lruPlugin(void const* data, size_t length)
 // IPluginV2DynamicExt Methods
 nvinfer1::IPluginV2DynamicExt* lruPlugin::clone() const noexcept
 {
-    auto* plugin = new lruPlugin(mDim, mType, mRemovePadding, mPagedState, mYEnabled, mYBiasEnabled);
+    auto* plugin = new lruPlugin(mDim, mBlockSize, mType, mRemovePadding, mPagedState, mYEnabled, mYBiasEnabled,
+        mFuseGateEnabled, mGateBiasEnabled);
     plugin->setPluginNamespace(mNamespace.c_str());
     return plugin;
 }
@@ -114,8 +121,9 @@ size_t lruPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* inputs, int
     return 0;
 }
 
-void lruPlugin::setLruParams(lruParams& params, const size_t batch, const size_t dim, const size_t maxSeqLen,
-    void* statePtr, void const* x, void const* gate_x, void const* gate_a, void const* y, void const* y_bias,
+void lruPlugin::setLruParams(lruParams& params, const size_t batch, const size_t dim, const size_t block_size,
+    const size_t maxSeqLen, void* statePtr, void const* x, void const* gate, void const* gate_bias, void const* gate_x,
+    void const* gate_x_bias, void const* gate_a, void const* gate_a_bias, void const* y, void const* y_bias,
     void const* A, int const* lastTokenIds, int const* slotMapping, void* out, bool removePadding)
 {
     // Reset the parameters
@@ -123,6 +131,7 @@ void lruPlugin::setLruParams(lruParams& params, const size_t batch, const size_t
 
     params.batch = batch;
     params.width = dim;
+    params.block_size = block_size;
     params.max_seqlen = maxSeqLen;
     params.remove_padding = removePadding;
 
@@ -131,8 +140,12 @@ void lruPlugin::setLruParams(lruParams& params, const size_t batch, const size_t
     params.x_ptr = const_cast<void*>(x);
     params.y_ptr = const_cast<void*>(y);
     params.y_bias_ptr = const_cast<void*>(y_bias);
+    params.gate_ptr = const_cast<void*>(gate);
+    params.gate_bias_ptr = const_cast<void*>(gate_bias);
     params.gate_x_ptr = const_cast<void*>(gate_x);
+    params.gate_x_bias_ptr = const_cast<void*>(gate_x_bias);
     params.gate_a_ptr = const_cast<void*>(gate_a);
+    params.gate_a_bias_ptr = const_cast<void*>(gate_a_bias);
     params.state_ptr = statePtr;
     params.out_ptr = out;
     params.last_token_ids_ptr = lastTokenIds;
@@ -145,15 +158,19 @@ int lruPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1
 {
     // inputs
     //     0.  x [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
-    //     1.  gate_x [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
-    //     2.  gate_a [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
-    //     3.  y [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
-    //     4.  y_bias [dim]
-    //     5.  A [dim]
-    //     6.  state [batch_size, dim] or host [1] containing only pointer for paged_state
-    //     7.  host_request_types [batch_size] int32. 0: context; 1: generation; 2: none.
-    //     8.  last_token_ids [batch_size] int32
-    //     9.  state_slot_mapping [batch_size] int32, optional for paged state
+    //     1.  A [dim]
+    //     2.  state [batch_size, dim] or host [1] containing only pointer for paged_state
+    //     3.  host_request_types [batch_size] int32. 0: context; 1: generation; 2: none.
+    //     4.  last_token_ids [batch_size] int32
+    //     5.  state_slot_mapping [batch_size] int32, optional for paged state
+    //     6.  y [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
+    //     7.  y_bias [dim]
+    //     8.  gate [batch_size, seq_len, 2 * dim] or [num_tokens, 2 * dim] for remove_input_padding
+    //     9.  gate_bias [2 * dim]
+    //    10.  gate_x [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
+    //    11.  gate_a [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
+    //    12.  gate_x_bias [2 * dim]
+    //    13.  gate_a_bias [2 * dim]
     // outputs
     //     0. output_tensor [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
     //     1. state [batch_size, dim]
@@ -176,12 +193,18 @@ int lruPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1
     int const* slotMapping = mPagedState ? static_cast<int const*>(inputs[getSlotMappingIdx()]) : nullptr;
     void const* y = mYEnabled ? inputs[getYIdx()] : nullptr;
     void const* y_bias = mYBiasEnabled ? inputs[getYBiasIdx()] : nullptr;
+    void const* gate = mFuseGateEnabled ? inputs[getGateIdx()] : nullptr;
+    void const* gate_bias = (mFuseGateEnabled && mGateBiasEnabled) ? inputs[getGateBiasIdx()] : nullptr;
+    void const* gate_x = mFuseGateEnabled ? nullptr : inputs[getGateXIdx()];
+    void const* gate_a = mFuseGateEnabled ? nullptr : inputs[getGateAIdx()];
+    void const* gate_x_bias = (!mFuseGateEnabled && mGateBiasEnabled) ? inputs[getGateXBiasIdx()] : nullptr;
+    void const* gate_a_bias = (!mFuseGateEnabled && mGateBiasEnabled) ? inputs[getGateABiasIdx()] : nullptr;
 
     void* statePtr = mPagedState ? *reinterpret_cast<void**>(const_cast<void*>(inputs[getStateIdx()])) : outputs[1];
 
-    setLruParams(lru_params, batch_size, mDim, max_seq_len, statePtr, inputs[getXIdx()], inputs[getGateXIdx()],
-        inputs[getGateAIdx()], y, y_bias, inputs[getAIdx()], static_cast<int const*>(inputs[getLastTokenIdsIdx()]),
-        slotMapping, outputs[0], mRemovePadding);
+    setLruParams(lru_params, batch_size, mDim, mBlockSize, max_seq_len, statePtr, inputs[getXIdx()], gate, gate_bias,
+        gate_x, gate_x_bias, gate_a, gate_a_bias, y, y_bias, inputs[getAIdx()],
+        static_cast<int const*>(inputs[getLastTokenIdsIdx()]), slotMapping, outputs[0], mRemovePadding);
 
     if (reqTypes[0] == RequestType::kCONTEXT)
     {
@@ -197,6 +220,10 @@ int lruPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1
 int lruPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
     void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
 {
+    if (isBuilding())
+    {
+        return 0;
+    }
     if (mType == DataType::kHALF)
     {
         return enqueueImpl<half>(inputDesc, outputDesc, inputs, outputs, workspace, stream);
@@ -254,19 +281,22 @@ void lruPlugin::terminate() noexcept {}
 
 size_t lruPlugin::getSerializationSize() const noexcept
 {
-    return sizeof(mDim) + sizeof(mType) + sizeof(mRemovePadding) + sizeof(mPagedState) + sizeof(mYEnabled)
-        + sizeof(mYBiasEnabled);
+    return sizeof(mDim) + sizeof(mBlockSize) + sizeof(mType) + sizeof(mRemovePadding) + sizeof(mPagedState)
+        + sizeof(mYEnabled) + sizeof(mYBiasEnabled) + sizeof(mFuseGateEnabled) + sizeof(mGateBiasEnabled);
 }
 
 void lruPlugin::serialize(void* buffer) const noexcept
 {
     char *d = static_cast<char*>(buffer), *a = d;
     write(d, mDim);
+    write(d, mBlockSize);
     write(d, mType);
     write(d, mRemovePadding);
     write(d, mPagedState);
     write(d, mYEnabled);
     write(d, mYBiasEnabled);
+    write(d, mFuseGateEnabled);
+    write(d, mGateBiasEnabled);
     assert(d == a + getSerializationSize());
 }
 
@@ -282,9 +312,14 @@ lruPluginCreator::lruPluginCreator()
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
     mPluginAttributes.emplace_back(PluginField("dim", nullptr, PluginFieldType::kINT32, 16));
+    mPluginAttributes.emplace_back(PluginField("block_size", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("remove_input_padding", nullptr, PluginFieldType::kINT8, 0));
     mPluginAttributes.emplace_back(PluginField("paged_state", nullptr, PluginFieldType::kINT8, 0));
+    mPluginAttributes.emplace_back(PluginField("y_enabled", nullptr, PluginFieldType::kINT8, 0));
+    mPluginAttributes.emplace_back(PluginField("y_bias_enabled", nullptr, PluginFieldType::kINT8, 0));
+    mPluginAttributes.emplace_back(PluginField("fuse_gate_enabled", nullptr, PluginFieldType::kINT8, 0));
+    mPluginAttributes.emplace_back(PluginField("gate_bias_enabled", nullptr, PluginFieldType::kINT8, 0));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }
@@ -307,8 +342,8 @@ PluginFieldCollection const* lruPluginCreator::getFieldNames() noexcept
 IPluginV2* lruPluginCreator::createPlugin(char const* name, PluginFieldCollection const* fc) noexcept
 {
     PluginField const* fields = fc->fields;
-    int dim;
-    bool removePadding, pagedState, yEnabled, yBiasEnabled;
+    int dim, block_size;
+    bool removePadding, pagedState, yEnabled, yBiasEnabled, fuseGateEnabled, gateBiasEnabled;
     nvinfer1::DataType type;
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
@@ -318,6 +353,11 @@ IPluginV2* lruPluginCreator::createPlugin(char const* name, PluginFieldCollectio
         {
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             dim = static_cast<int>(*(static_cast<int const*>(fields[i].data)));
+        }
+        if (!strcmp(attrName, "block_size"))
+        {
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
+            block_size = static_cast<int>(*(static_cast<int const*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "type_id"))
         {
@@ -344,10 +384,21 @@ IPluginV2* lruPluginCreator::createPlugin(char const* name, PluginFieldCollectio
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT8);
             yBiasEnabled = static_cast<bool>(*(static_cast<bool const*>(fields[i].data)));
         }
+        else if (!strcmp(attrName, "fuse_gate_enabled"))
+        {
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT8);
+            fuseGateEnabled = static_cast<bool>(*(static_cast<bool const*>(fields[i].data)));
+        }
+        else if (!strcmp(attrName, "gate_bias_enabled"))
+        {
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT8);
+            gateBiasEnabled = static_cast<bool>(*(static_cast<bool const*>(fields[i].data)));
+        }
     }
     try
     {
-        auto* obj = new lruPlugin(dim, type, removePadding, pagedState, yEnabled, yBiasEnabled);
+        auto* obj = new lruPlugin(
+            dim, block_size, type, removePadding, pagedState, yEnabled, yBiasEnabled, fuseGateEnabled, gateBiasEnabled);
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }

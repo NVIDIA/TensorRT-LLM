@@ -30,7 +30,8 @@ from polygraphy.backend.trt import (CreateConfig, EngineFromNetwork, Profile,
 
 import tensorrt_llm
 from tensorrt_llm import Tensor
-from tensorrt_llm._utils import torch_to_numpy, trt_dtype_to_torch
+from tensorrt_llm._utils import (torch_to_numpy, trt_dtype_to_str,
+                                 trt_dtype_to_torch)
 from tensorrt_llm.layers.moe import MoeConfig
 from tensorrt_llm.quantization import QuantMode
 
@@ -631,7 +632,8 @@ class TestFunctional(unittest.TestCase):
         builder = tensorrt_llm.Builder()
         builder.strongly_typed = weight_dtype == trt.fp8
         net = builder.create_network()
-        net.plugin_config.set_moe_plugin(dtype if use_plugin else None)
+        net.plugin_config.moe_plugin = (trt_dtype_to_str(dtype)
+                                        if use_plugin else None)
         with tensorrt_llm.net_guard(net):
             network = tensorrt_llm.default_trtnet()
             trt_key = Tensor(name='input_hidden_states',

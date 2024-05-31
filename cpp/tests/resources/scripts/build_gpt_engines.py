@@ -207,17 +207,26 @@ def build_engines(model_cache: Optional[str] = None, world_size: int = 1):
         str(engine_dir / 'fp16-plugin-packed-paged-gather' / tp_pp_dir),
         '--gather_all_token_logits', *ifb_args)
 
+    build_engine(
+        str(fp16_ckpt_dir),
+        str(engine_dir / 'fp16-plugin-packed-paged-la-decoding' / tp_pp_dir),
+        '--max_draft_len=64', '--speculative_decoding_mode=lookahead_decoding',
+        *ifb_args)
+
     # build engine with lora enabled
     build_engine(str(fp16_ckpt_dir),
                  str(engine_dir / "fp16-plugin-packed-paged-lora" / tp_pp_dir),
                  "--lora_target_modules=attn_qkv", '--lora_plugin=float16',
                  *ifb_args)
 
+    llm_datasets_root = Path(model_cache) / "datasets"
+    calib_dataset = llm_datasets_root / "cimec/lambada/"
     print("\nConverting to fp16 SQ")
     fp16_sq_ckpt_dir = ckpt_dir / 'fp16-sq' / tp_dir
     convert_ckpt(str(hf_dir),
                  str(fp16_sq_ckpt_dir),
                  "--smoothquant=0.5",
+                 f"--calib_dataset={calib_dataset}",
                  world_size=tp_size,
                  dtype='float16')
 

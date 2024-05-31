@@ -65,39 +65,40 @@ void MedusaDecodingLayer<T>::allocateBuffer()
 
     // Get sampling workspace size
     {
-        auto samplingSizePrimarySampling = getTopKWorkspaceSize<T>(mDecoderDomain.getMaxBatchSize(),
+        auto samplingSizePrimarySampling = getTopKWorkspaceSize<T>(mDecoderDomain.getBatchSize(),
             mDecoderDomain.getMaxTokensPerStep(), TOP_K_MAX, mDecoderDomain.getVocabSizePadded());
 
-        auto const maxBatchSizeHeadNums = mDecoderDomain.getMaxBatchSize() * mDecoderDomain.getMaxNumMedusaHeads();
+        auto const maxBatchSizeHeadNums
+            = mDecoderDomain.getBatchSize() * mDecoderDomain.getMaxAcceptedDraftTokensPerStep();
         auto samplingSizeMedusaHeadsSampling
             = getTopKWorkspaceSize<T>(maxBatchSizeHeadNums, 1, TOP_K_MAX, mDecoderDomain.getVocabSizePadded());
 
         mWorkspaceSize = std::max(samplingSizePrimarySampling, samplingSizeMedusaHeadsSampling);
     }
 
-    mDraftIdsPtrHost = runtime::BufferManager::pinned(
-        ITensor::makeShape(
-            {static_cast<SizeType32>(mDecoderDomain.getMaxBatchSize()), mDecoderDomain.getMaxNumMedusaHeads()}),
-        runtime::TRTDataType<TokenIdType*>::value);
-    mCummulativeTopK.resize(mDecoderDomain.getMaxBatchSize() * mDecoderDomain.getMaxNumMedusaHeads());
+    mDraftIdsPtrHost
+        = runtime::BufferManager::pinned(ITensor::makeShape({static_cast<SizeType32>(mDecoderDomain.getBatchSize()),
+                                             mDecoderDomain.getMaxAcceptedDraftTokensPerStep()}),
+            runtime::TRTDataType<TokenIdType*>::value);
+    mCummulativeTopK.resize(mDecoderDomain.getBatchSize() * mDecoderDomain.getMaxAcceptedDraftTokensPerStep());
 
     std::array<size_t, 11> deviceBufferSizes;
-    deviceBufferSizes[0] = mDecoderDomain.getMaxBatchSize() * sizeof(curandState_t);
+    deviceBufferSizes[0] = mDecoderDomain.getBatchSize() * sizeof(curandState_t);
     deviceBufferSizes[1]
-        = mDecoderDomain.getMaxBatchSize() * mDecoderDomain.getMaxNumMedusaHeads() * sizeof(SizeType32);
+        = mDecoderDomain.getBatchSize() * mDecoderDomain.getMaxAcceptedDraftTokensPerStep() * sizeof(SizeType32);
     deviceBufferSizes[2] = mWorkspaceSize;
-    deviceBufferSizes[3] = mDecoderDomain.getMaxBatchSize() * sizeof(SizeType32);
-    deviceBufferSizes[4]
-        = mDecoderDomain.getMaxBatchSize() * mDecoderDomain.getMaxTokensPerStep() * sizeof(TokenIdType);
-    deviceBufferSizes[5] = mDecoderDomain.getMaxBatchSize() * mDecoderDomain.getMaxNumMedusaHeads() * sizeof(uint64_t);
-    deviceBufferSizes[6] = mDecoderDomain.getMaxBatchSize() * mDecoderDomain.getMaxNumMedusaHeads() * sizeof(T*);
+    deviceBufferSizes[3] = mDecoderDomain.getBatchSize() * sizeof(SizeType32);
+    deviceBufferSizes[4] = mDecoderDomain.getBatchSize() * mDecoderDomain.getMaxTokensPerStep() * sizeof(TokenIdType);
+    deviceBufferSizes[5]
+        = mDecoderDomain.getBatchSize() * mDecoderDomain.getMaxAcceptedDraftTokensPerStep() * sizeof(uint64_t);
+    deviceBufferSizes[6]
+        = mDecoderDomain.getBatchSize() * mDecoderDomain.getMaxAcceptedDraftTokensPerStep() * sizeof(T*);
     deviceBufferSizes[7]
-        = mDecoderDomain.getMaxBatchSize() * mDecoderDomain.getMaxNumMedusaHeads() * sizeof(curandState_t);
+        = mDecoderDomain.getBatchSize() * mDecoderDomain.getMaxAcceptedDraftTokensPerStep() * sizeof(curandState_t);
     deviceBufferSizes[8]
-        = mDecoderDomain.getMaxBatchSize() * mDecoderDomain.getMaxNumMedusaHeads() * sizeof(SizeType32);
-    deviceBufferSizes[9]
-        = mDecoderDomain.getMaxBatchSize() * mDecoderDomain.getMaxTokensPerStep() * sizeof(TokenIdType);
-    deviceBufferSizes[10] = mDecoderDomain.getMaxBatchSize() * sizeof(SizeType32);
+        = mDecoderDomain.getBatchSize() * mDecoderDomain.getMaxAcceptedDraftTokensPerStep() * sizeof(SizeType32);
+    deviceBufferSizes[9] = mDecoderDomain.getBatchSize() * mDecoderDomain.getMaxTokensPerStep() * sizeof(TokenIdType);
+    deviceBufferSizes[10] = mDecoderDomain.getBatchSize() * sizeof(SizeType32);
 
     mCurandStatesDevice = mAllocator->reMalloc(mCurandStatesDevice, deviceBufferSizes[0], false);
     mSetupWorkspaceDevice = mAllocator->reMalloc(mSetupWorkspaceDevice, deviceBufferSizes[1], false);
@@ -114,18 +115,18 @@ void MedusaDecodingLayer<T>::allocateBuffer()
     mNewDraftTokensDevice = mAllocator->reMalloc(mNewDraftTokensDevice, deviceBufferSizes[9], false);
     mBestPathIdsDevice = mAllocator->reMalloc(mBestPathIdsDevice, deviceBufferSizes[10], false);
 
-    mTiledBatchSlotsSetup = BufferManager::pinnedPool(
-        ITensor::makeShape(
-            {static_cast<SizeType32>(mDecoderDomain.getMaxBatchSize() * mDecoderDomain.getMaxNumMedusaHeads())}),
-        nvinfer1::DataType::kINT32);
-    mTiledBatchSlotsForward = BufferManager::pinnedPool(
-        ITensor::makeShape(
-            {static_cast<SizeType32>(mDecoderDomain.getMaxBatchSize() * mDecoderDomain.getMaxNumMedusaHeads())}),
-        nvinfer1::DataType::kINT32);
-    mMedusaInputLogitsPtrs = BufferManager::pinnedPool(
-        ITensor::makeShape(
-            {static_cast<SizeType32>(mDecoderDomain.getMaxBatchSize() * mDecoderDomain.getMaxNumMedusaHeads())}),
-        TRTDataType<T*>::value);
+    mTiledBatchSlotsSetup
+        = BufferManager::pinnedPool(ITensor::makeShape({static_cast<SizeType32>(mDecoderDomain.getBatchSize()
+                                        * mDecoderDomain.getMaxAcceptedDraftTokensPerStep())}),
+            nvinfer1::DataType::kINT32);
+    mTiledBatchSlotsForward
+        = BufferManager::pinnedPool(ITensor::makeShape({static_cast<SizeType32>(mDecoderDomain.getBatchSize()
+                                        * mDecoderDomain.getMaxAcceptedDraftTokensPerStep())}),
+            nvinfer1::DataType::kINT32);
+    mMedusaInputLogitsPtrs
+        = BufferManager::pinnedPool(ITensor::makeShape({static_cast<SizeType32>(mDecoderDomain.getBatchSize()
+                                        * mDecoderDomain.getMaxAcceptedDraftTokensPerStep())}),
+            TRTDataType<T*>::value);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -188,25 +189,25 @@ void MedusaDecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, S
 
     initCurandStates(setupParams->randomSeed, batchSize, batchSlots, mCurandStatesDevice);
 
-    auto batchSizeMaxNumHeads = batchSize * mDecoderDomain.getMaxNumMedusaHeads();
+    auto batchSizeMaxNumHeads = batchSize * mDecoderDomain.getMaxAcceptedDraftTokensPerStep();
     auto randomSeed = setupParams->randomSeed.value_or(std::vector<uint64_t>(batchSize, uint64_t{0}));
     std::vector<uint64_t> tiledRandomSeed(batchSizeMaxNumHeads);
     if (randomSeed.size() > 1)
     {
         for (SizeType32 bi = 0; bi < batchSize; ++bi)
         {
-            for (SizeType32 hi = 0; hi < mDecoderDomain.getMaxNumMedusaHeads(); ++hi)
+            for (SizeType32 hi = 0; hi < mDecoderDomain.getMaxAcceptedDraftTokensPerStep(); ++hi)
             {
-                tiledRandomSeed[bi * mDecoderDomain.getMaxNumMedusaHeads() + hi] = randomSeed[bi];
+                tiledRandomSeed[bi * mDecoderDomain.getMaxAcceptedDraftTokensPerStep() + hi] = randomSeed[bi];
             }
         }
     }
     auto tiledBatchSlots = bufferCast<SizeType32>(*mTiledBatchSlotsSetup);
     for (SizeType32 bi = 0; bi < batchSize; ++bi)
     {
-        for (SizeType32 hi = 0; hi < mDecoderDomain.getMaxNumMedusaHeads(); ++hi)
+        for (SizeType32 hi = 0; hi < mDecoderDomain.getMaxAcceptedDraftTokensPerStep(); ++hi)
         {
-            tiledBatchSlots[bi * mDecoderDomain.getMaxNumMedusaHeads() + hi] = batchSlots[bi] + hi;
+            tiledBatchSlots[bi * mDecoderDomain.getMaxAcceptedDraftTokensPerStep() + hi] = batchSlots[bi] + hi;
         }
     }
     initCurandStates({tiledRandomSeed}, batchSizeMaxNumHeads, tiledBatchSlots, mCurandStatesMedusaLogitsDevice);
@@ -253,20 +254,20 @@ void MedusaDecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, S
         {
             auto const slot = batchSlots[bi];
             SizeType32 cummulativeTopK = 0;
-            for (SizeType32 hi = 0; hi < mDecoderDomain.getMaxNumMedusaHeads(); ++hi)
+            for (SizeType32 hi = 0; hi < mDecoderDomain.getMaxAcceptedDraftTokensPerStep(); ++hi)
             {
-                mCummulativeTopK[slot * mDecoderDomain.getMaxNumMedusaHeads() + hi] = cummulativeTopK;
-                cummulativeTopK += runtimeHeadsTopKFlatten[bi * mDecoderDomain.getMaxNumMedusaHeads() + hi];
+                mCummulativeTopK[slot * mDecoderDomain.getMaxAcceptedDraftTokensPerStep() + hi] = cummulativeTopK;
+                cummulativeTopK += runtimeHeadsTopKFlatten[bi * mDecoderDomain.getMaxAcceptedDraftTokensPerStep() + hi];
             }
         }
 
         auto tiledBatchSlots = bufferCast<SizeType32>(*mTiledBatchSlotsSetup);
         for (SizeType32 bi = 0; bi < batchSize; ++bi)
         {
-            for (SizeType32 hi = 0; hi < mDecoderDomain.getMaxNumMedusaHeads(); ++hi)
+            for (SizeType32 hi = 0; hi < mDecoderDomain.getMaxAcceptedDraftTokensPerStep(); ++hi)
             {
-                tiledBatchSlots[bi * mDecoderDomain.getMaxNumMedusaHeads() + hi]
-                    = mDecoderDomain.getMaxNumMedusaHeads() * batchSlots[bi] + hi;
+                tiledBatchSlots[bi * mDecoderDomain.getMaxAcceptedDraftTokensPerStep() + hi]
+                    = mDecoderDomain.getMaxAcceptedDraftTokensPerStep() * batchSlots[bi] + hi;
             }
         }
 
@@ -279,13 +280,13 @@ void MedusaDecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, S
 }
 
 template <typename T>
-void MedusaDecodingLayer<T>::forward(
+void MedusaDecodingLayer<T>::forwardAsync(
     std::shared_ptr<BaseOutputParams> baseOutputs, std::shared_ptr<BaseInputParams> baseInputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto inputs = std::dynamic_pointer_cast<MedusaInputParams>(baseInputs);
-    auto outputs = std::dynamic_pointer_cast<MedusaOutputParams>(baseOutputs);
+    auto outputs = std::dynamic_pointer_cast<DynamicDecodeOutputParams>(baseOutputs);
 
     samplePrimeHeadTokens(outputs, inputs);
 
@@ -302,7 +303,7 @@ void MedusaDecodingLayer<T>::forward(
 
 template <typename T>
 void MedusaDecodingLayer<T>::samplePrimeHeadTokens(
-    std::shared_ptr<MedusaOutputParams> const& outputs, std::shared_ptr<MedusaInputParams> const& inputs)
+    std::shared_ptr<DynamicDecodeOutputParams> const& outputs, std::shared_ptr<MedusaInputParams> const& inputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -325,7 +326,7 @@ void MedusaDecodingLayer<T>::samplePrimeHeadTokens(
     params.batchSlots = batchSlots;
     params.curandState = mCurandStatesDevice;
     params.batchSize = batchSize;
-    params.maxBatchSize = mDecoderDomain.getMaxBatchSize();
+    params.maxBatchSize = mDecoderDomain.getBatchSize();
     params.tokensPerStep = tokensPerStepDevice;
     params.maxTokensPerStep = mDecoderDomain.getMaxTokensPerStep();
     params.maxSeqLen = mDecoderDomain.getMaxTokensPerStep();
@@ -341,7 +342,7 @@ void MedusaDecodingLayer<T>::samplePrimeHeadTokens(
 
 template <typename T>
 void MedusaDecodingLayer<T>::acceptDraftTokens(
-    std::shared_ptr<MedusaOutputParams> const& outputs, std::shared_ptr<MedusaInputParams> const& inputs)
+    std::shared_ptr<DynamicDecodeOutputParams> const& outputs, std::shared_ptr<MedusaInputParams> const& inputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -354,7 +355,7 @@ void MedusaDecodingLayer<T>::acceptDraftTokens(
 
     auto batchSlots = inputs->batch_slots ? inputs->batch_slots->template getPtr<SizeType32 const>() : nullptr;
     auto sequenceLengths = outputs->sequence_length ? outputs->sequence_length->template getPtr<SizeType32>() : nullptr;
-    auto acceptedLengths = outputs->medusaOutputs->acceptedLengths.template getPtr<SizeType32>();
+    auto acceptedLengths = outputs->speculativeDecodingOutputs->acceptedLengths.template getPtr<SizeType32>();
     auto curTokensPerStepDevice = inputs->medusaCurTokensPerStep.template getPtr<SizeType32>();
     auto targetTokensPerStepDevice = inputs->medusaTargetTokensPerStep.template getPtr<SizeType32>();
 
@@ -362,14 +363,14 @@ void MedusaDecodingLayer<T>::acceptDraftTokens(
     for (SizeType32 bi = 0; bi < batchSize; ++bi)
     {
         auto const slot = batchSlots[bi];
-        for (SizeType32 hi = 0; hi < mDecoderDomain.getMaxNumMedusaHeads(); ++hi)
+        for (SizeType32 hi = 0; hi < mDecoderDomain.getMaxAcceptedDraftTokensPerStep(); ++hi)
         {
-            medusaInputLogitsPtrs[slot * mDecoderDomain.getMaxNumMedusaHeads() + hi]
+            medusaInputLogitsPtrs[slot * mDecoderDomain.getMaxAcceptedDraftTokensPerStep() + hi]
                 = inputs->medusaLogits[slot][hi].template getPtr<T>();
         }
     }
 
-    auto draftIds = outputs->medusaOutputs->nextDraftTokens.template getPtr<TokenIdType>();
+    auto draftIds = outputs->speculativeDecodingOutputs->nextDraftTokens.template getPtr<TokenIdType>();
 
     TLLM_CHECK_WITH_INFO(draftIds != nullptr, "Draft ids must be provided for MedusaDecoding");
     TLLM_CHECK_WITH_INFO(batchSlots != nullptr, "Batch slots must be provided for MedusaDecoding");
@@ -390,8 +391,8 @@ void MedusaDecodingLayer<T>::acceptDraftTokens(
         finishedStates, batchSlots, paths, endIds,
         reinterpret_cast<T const**>(bufferCast<int64_t>(*mMedusaInputLogitsPtrs)),
         const_cast<T const**>(mMedusaSelectedLogitsPtrsDevice), curTokensPerStepDevice, targetTokensPerStepDevice,
-        mBestPathIdsDevice, batchSize, mDecoderDomain.getVocabSize(), mDecoderDomain.getMaxBatchSize(),
-        mDecoderDomain.getMaxTokensPerStep(), maxSeqLen, mDecoderDomain.getMaxNumMedusaHeads(),
+        mBestPathIdsDevice, batchSize, mDecoderDomain.getVocabSize(), mDecoderDomain.getBatchSize(),
+        mDecoderDomain.getMaxTokensPerStep(), maxSeqLen, mDecoderDomain.getMaxAcceptedDraftTokensPerStep(),
         mDecoderDomain.getMaxTokensPerStep(), mStream);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -399,7 +400,7 @@ void MedusaDecodingLayer<T>::acceptDraftTokens(
 
 template <typename T>
 void MedusaDecodingLayer<T>::sampleNewDraftTokens(
-    std::shared_ptr<MedusaOutputParams> const& outputs, std::shared_ptr<MedusaInputParams> const& inputs)
+    std::shared_ptr<DynamicDecodeOutputParams> const& outputs, std::shared_ptr<MedusaInputParams> const& inputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -412,16 +413,16 @@ void MedusaDecodingLayer<T>::sampleNewDraftTokens(
     TLLM_CHECK_WITH_INFO(sequenceLengths != nullptr, "Sequence lengths must be provided for MedusaDecoding");
 
     // For each request we sample Head Num times for topK[hi] tokens
-    auto const batchSizeHeadNums = batchSize * mDecoderDomain.getMaxNumMedusaHeads();
-    auto const maxBatchSizeHeadNums = mDecoderDomain.getMaxBatchSize() * mDecoderDomain.getMaxNumMedusaHeads();
+    auto const batchSizeHeadNums = batchSize * mDecoderDomain.getMaxAcceptedDraftTokensPerStep();
+    auto const maxBatchSizeHeadNums = mDecoderDomain.getBatchSize() * mDecoderDomain.getMaxAcceptedDraftTokensPerStep();
 
     auto tiledBatchSlots = bufferCast<SizeType32>(*mTiledBatchSlotsForward);
     for (SizeType32 bi = 0; bi < batchSize; ++bi)
     {
-        for (SizeType32 hi = 0; hi < mDecoderDomain.getMaxNumMedusaHeads(); ++hi)
+        for (SizeType32 hi = 0; hi < mDecoderDomain.getMaxAcceptedDraftTokensPerStep(); ++hi)
         {
-            tiledBatchSlots[bi * mDecoderDomain.getMaxNumMedusaHeads() + hi]
-                = mDecoderDomain.getMaxNumMedusaHeads() * batchSlots[bi] + hi;
+            tiledBatchSlots[bi * mDecoderDomain.getMaxAcceptedDraftTokensPerStep() + hi]
+                = mDecoderDomain.getMaxAcceptedDraftTokensPerStep() * batchSlots[bi] + hi;
         }
     }
 
@@ -430,11 +431,11 @@ void MedusaDecodingLayer<T>::sampleNewDraftTokens(
     for (SizeType32 bi = 0; bi < batchSize; ++bi)
     {
         auto slot = batchSlots[bi];
-        for (SizeType32 hi = 0; hi < mDecoderDomain.getMaxNumMedusaHeads(); ++hi)
+        for (SizeType32 hi = 0; hi < mDecoderDomain.getMaxAcceptedDraftTokensPerStep(); ++hi)
         {
-            draftIdsPtrs[slot * mDecoderDomain.getMaxNumMedusaHeads() + hi] = mNewDraftTokensDevice
+            draftIdsPtrs[slot * mDecoderDomain.getMaxAcceptedDraftTokensPerStep() + hi] = mNewDraftTokensDevice
                 + slot * mDecoderDomain.getMaxTokensPerStep()
-                + mCummulativeTopK[slot * mDecoderDomain.getMaxNumMedusaHeads() + hi];
+                + mCummulativeTopK[slot * mDecoderDomain.getMaxAcceptedDraftTokensPerStep() + hi];
         }
     }
 
@@ -459,7 +460,7 @@ void MedusaDecodingLayer<T>::sampleNewDraftTokens(
 
 template <typename T>
 void MedusaDecodingLayer<T>::scatterNewDraftTokens(
-    std::shared_ptr<MedusaOutputParams> const& outputs, std::shared_ptr<MedusaInputParams> const& inputs)
+    std::shared_ptr<DynamicDecodeOutputParams> const& outputs, std::shared_ptr<MedusaInputParams> const& inputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -469,7 +470,7 @@ void MedusaDecodingLayer<T>::scatterNewDraftTokens(
 
     TLLM_CHECK_WITH_INFO(batchSlots != nullptr, "Batch slots must be provided for MedusaDecoding");
 
-    auto draftIds = outputs->medusaOutputs->nextDraftTokens.template getPtr<TokenIdType>();
+    auto draftIds = outputs->speculativeDecodingOutputs->nextDraftTokens.template getPtr<TokenIdType>();
     auto tokensPerStepDevice = inputs->medusaCurTokensPerStep.template getPtr<SizeType32>();
     auto treeIds = inputs->treeIds.template getPtr<SizeType32>();
     TLLM_CHECK_WITH_INFO(draftIds != nullptr, "Draft ids must be provided for MedusaDecoding");
@@ -484,23 +485,25 @@ void MedusaDecodingLayer<T>::scatterNewDraftTokens(
 
 template <typename T>
 void MedusaDecodingLayer<T>::packAcceptedPaths(
-    std::shared_ptr<MedusaOutputParams> const& outputs, std::shared_ptr<MedusaInputParams> const& inputs)
+    std::shared_ptr<DynamicDecodeOutputParams> const& outputs, std::shared_ptr<MedusaInputParams> const& inputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto const batchSize = inputs->logits.shape[0];
     auto paths = inputs->paths.template getPtr<SizeType32 const>();
     auto batchSlots = inputs->batch_slots ? inputs->batch_slots->template getPtr<SizeType32 const>() : nullptr;
-    auto acceptedLengths = outputs->medusaOutputs->acceptedLengths.template getPtr<SizeType32>();
-    auto acceptedLengthsCumSum = outputs->medusaOutputs->acceptedLengthsCumSum.template getPtr<SizeType32>();
-    auto pathsOffsets = outputs->medusaOutputs->pathsOffsets.template getPtr<SizeType32>();
+    auto acceptedLengths = outputs->speculativeDecodingOutputs->acceptedLengths.template getPtr<SizeType32>();
+    auto acceptedLengthsCumSum
+        = outputs->speculativeDecodingOutputs->acceptedLengthsCumSum.template getPtr<SizeType32>();
+    auto pathsOffsets = outputs->speculativeDecodingOutputs->pathsOffsets.template getPtr<SizeType32>();
 
     TLLM_CHECK_WITH_INFO(batchSlots != nullptr, "Batch slots must be provided for MedusaDecoding");
     TLLM_CHECK_WITH_INFO(acceptedLengths != nullptr, "Accepted lengths must be provided for MedusaDecoding");
     TLLM_CHECK_WITH_INFO(acceptedLengthsCumSum != nullptr, "acceptedLengthsCumSum must be provided for MedusaDecoding");
     TLLM_CHECK_WITH_INFO(pathsOffsets != nullptr, "pathsOffsets must be provided for MedusaDecoding");
     invokePackAcceptedPaths(acceptedLengthsCumSum, pathsOffsets, acceptedLengths, mBestPathIdsDevice, paths, batchSlots,
-        batchSize, mDecoderDomain.getMaxTokensPerStep(), mDecoderDomain.getMaxNumMedusaHeads() + 1, mStream);
+        batchSize, mDecoderDomain.getMaxTokensPerStep(), mDecoderDomain.getMaxAcceptedDraftTokensPerStep() + 1,
+        mStream);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

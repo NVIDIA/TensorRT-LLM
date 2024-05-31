@@ -18,6 +18,7 @@
 #include <gtest/gtest.h>
 
 #include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/gptDecoderBatch.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
@@ -28,14 +29,15 @@
 
 using namespace tensorrt_llm::runtime;
 
+namespace tle = tensorrt_llm::executor;
 namespace tc = tensorrt_llm::common;
 
 namespace
 {
 
 decoder_batch::Input prepareDecoderInputs(SizeType32 batchSize, SizeType32 maxBeamWidth, SizeType32 maxSeqLength,
-    SizeType32 vocabSizePadded, nvinfer1::DataType dataType, std::vector<SamplingConfig> const& samplingConfigs,
-    std::vector<SizeType32> const& generatedTokensPerSteps, BufferManager& manager)
+    SizeType32 vocabSizePadded, nvinfer1::DataType dataType, std::vector<SamplingConfig>& samplingConfigs,
+    std::vector<SizeType32> const& generatedTokensPerSteps, bool computeLogProbs, BufferManager& manager)
 {
     std::vector<decoder_batch::Input::TensorPtr> logits;
     logits.reserve(batchSize);
@@ -43,6 +45,8 @@ decoder_batch::Input prepareDecoderInputs(SizeType32 batchSize, SizeType32 maxBe
     for (auto batchIdx = 0; batchIdx < batchSize; ++batchIdx)
     {
         auto const beamWidth = samplingConfigs[batchIdx].beamWidth;
+        samplingConfigs[batchIdx].outputLogProbs = {{computeLogProbs}};
+        samplingConfigs[batchIdx].cumLogProbs = {{computeLogProbs}};
         logits.emplace_back(
             manager.gpu(ITensor::makeShape({generatedTokensPerSteps[batchIdx], beamWidth, vocabSizePadded}), dataType));
         manager.setZero(*logits.back());
@@ -84,7 +88,7 @@ decoder_batch::Output prepareDecoderOutputs(SizeType32 batchSize, SizeType32 max
 std::vector<decoder_batch::Request> prepareRequests(SizeType32 batchSize, SizeType32 maxNewTokens,
     std::vector<SizeType32> const& inputLengths, std::vector<SizeType32> const& generatedTokensPerSteps,
     std::vector<SizeType32> const& acceptedTokensPerStep, TokenIdType tokenId, TokenIdType endId, TokenIdType padId,
-    bool computeLogProbs, BufferManager& manager)
+    BufferManager& manager)
 {
     auto& stream = manager.getStream();
 
@@ -104,8 +108,6 @@ std::vector<decoder_batch::Request> prepareRequests(SizeType32 batchSize, SizeTy
             requests.back().draftTokens = manager.copyFrom(draftTokens, MemoryType::kGPU);
             requests.back().generatedTokensPerEngineStep = generatedTokensPerSteps[batchIdx];
         }
-        requests.back().computeCumLogProbs = computeLogProbs;
-        requests.back().computeLogProbs = computeLogProbs;
     }
 
     return requests;
@@ -179,8 +181,8 @@ void verifyResults(BufferManager& manager, GptDecoderBatch const& decoder,
     }
 }
 
-void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig> const& samplingConfigs,
-    SizeType32 maxBeamWidth, bool computeLogProbs, bool normalizeLogProbs)
+void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& samplingConfigs, SizeType32 maxBeamWidth,
+    bool computeLogProbs, bool normalizeLogProbs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     SizeType32 constexpr tensorParallelism{1};
@@ -233,18 +235,18 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig> con
 
     auto constexpr tokenId = 1;
     auto requests = prepareRequests(batchSize, maxNewTokens, inputLengths, generatedTokensPerSteps,
-        acceptedTokensPerStep, tokenId, endId, padId, computeLogProbs, manager);
+        acceptedTokensPerStep, tokenId, endId, padId, manager);
 
     // set up inputs and outputs
     auto inputs = prepareDecoderInputs(batchSize, maxBeamWidth, maxSeqLength, vocabSizePadded, dataType,
-        samplingConfigs, generatedTokensPerSteps, manager);
+        samplingConfigs, generatedTokensPerSteps, computeLogProbs, manager);
     auto outputs = prepareDecoderOutputs(batchSize, maxBeamWidth, maxSeqLength, tiledInputLengths, manager);
 
     // We set maxAttentionWindow = maxSeqLength, but it can be smaller than maxSeqLength (cyclic kv cache).
     auto const maxAttentionWindow = maxSeqLength;
     SizeType32 const sinkTokenLength{0};
 
-    auto const decodingMode = maxBeamWidth == 1 ? DecodingMode::TopKTopP() : DecodingMode::BeamSearch();
+    auto const decodingMode = maxBeamWidth == 1 ? tle::DecodingMode::TopKTopP() : tle::DecodingMode::BeamSearch();
 
     // set up decoder
     auto decoder = GptDecoderBatch(vocabSize, vocabSizePadded, streamPtr);
@@ -293,11 +295,12 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig> con
     EXPECT_NO_THROW(decoder.forward(outputs, inputs));
     checkSequenceLengths(*outputs.sequenceLengths, expectedLengths, manager);
 
-    decoder.newRequests({0}, {requests[0]}, {samplingConfigs[0]});
+    std::vector<SamplingConfig> singleConfig = {samplingConfigs[0]};
+    decoder.newRequests({0}, {requests[0]}, singleConfig);
     EXPECT_FALSE(decoder.getFinished()[0]);
 }
 
-void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingConfig> const& samplingConfigs,
+void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& samplingConfigs,
     SizeType32 maxBeamWidth, bool computeLogProbs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -351,18 +354,18 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
 
     auto constexpr tokenId = 1;
     auto requests = prepareRequests(batchSize, maxNewTokens, inputLengths, generatedTokensPerSteps,
-        acceptedTokensPerStep, tokenId, endId, padId, computeLogProbs, manager);
+        acceptedTokensPerStep, tokenId, endId, padId, manager);
 
     // set up inputs and outputs
     auto inputs = prepareDecoderInputs(batchSize, maxBeamWidth, maxSeqLength, vocabSizePadded, dataType,
-        samplingConfigs, generatedTokensPerSteps, manager);
+        samplingConfigs, generatedTokensPerSteps, computeLogProbs, manager);
     auto outputs = prepareDecoderOutputs(batchSize, maxBeamWidth, maxSeqLength, tiledInputLengths, manager);
 
     // We set maxAttentionWindow = maxSeqLength, but it can be smaller than maxSeqLength (cyclic kv cache).
     auto const maxAttentionWindow = maxSeqLength;
     SizeType32 const sinkTokenLength{0};
 
-    auto const decodingMode = maxBeamWidth == 1 ? DecodingMode::TopKTopP() : DecodingMode::BeamSearch();
+    auto const decodingMode = maxBeamWidth == 1 ? tle::DecodingMode::TopKTopP() : tle::DecodingMode::BeamSearch();
 
     // set up decoder
     auto decoder = GptDecoderBatch(vocabSize, vocabSizePadded, streamPtr);
@@ -378,7 +381,8 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
 
     for (auto batchIdx = 0; batchIdx < batchSize; ++batchIdx)
     {
-        decoder.newRequests({batchIdx}, {requests[batchIdx]}, {samplingConfigs[batchIdx]});
+        std::vector<SamplingConfig> singleConfig = {samplingConfigs[batchIdx]};
+        decoder.newRequests({batchIdx}, {requests[batchIdx]}, singleConfig);
 
         decoder.forward(outputs, inputs);
 
@@ -416,7 +420,7 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
         maxSeqLength, tokenId, padId);
 }
 
-void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig> const& samplingConfigs,
+void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& samplingConfigs,
     SizeType32 maxBeamWidth, std::vector<SizeType32> const& generatedTokensPerSteps,
     std::vector<SizeType32> const& acceptedTokensPerStep, SizeType32 maxGeneratedTokensPerStep)
 {
@@ -436,6 +440,7 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
     SizeType32 constexpr hiddenSize{1024};
     ModelConfig modelConfig{vocabSize, nbAttentionLayers, nbRnnLayers, nbHeads, hiddenSize, dtype};
     modelConfig.useGptAttentionPlugin(false);
+    modelConfig.setSpeculativeDecodingMode(SpeculativeDecodingMode::DraftTokensExternal());
 
     auto streamPtr = std::make_shared<CudaStream>();
     BufferManager manager(streamPtr);
@@ -468,18 +473,18 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
 
     auto constexpr tokenId = 1;
     auto requests = prepareRequests(batchSize, maxNewTokens, inputLengths, generatedTokensPerSteps,
-        acceptedTokensPerStep, tokenId, endId, padId, false, manager);
+        acceptedTokensPerStep, tokenId, endId, padId, manager);
 
     // set up inputs and outputs
     auto inputs = prepareDecoderInputs(batchSize, maxBeamWidth, maxSeqLength, vocabSizePadded, dataType,
-        samplingConfigs, generatedTokensPerSteps, manager);
+        samplingConfigs, generatedTokensPerSteps, false, manager);
     auto outputs = prepareDecoderOutputs(batchSize, maxBeamWidth, maxSeqLength, tiledInputLengths, manager);
 
     // We set maxAttentionWindow = maxSeqLength, but it can be smaller than maxSeqLength (cyclic kv cache).
     auto const maxAttentionWindow = maxSeqLength;
     SizeType32 const sinkTokenLength{0};
 
-    auto const decodingMode = maxBeamWidth == 1 ? DecodingMode::TopKTopP() : DecodingMode::BeamSearch();
+    auto const decodingMode = maxBeamWidth == 1 ? tle::DecodingMode::TopKTopP() : tle::DecodingMode::BeamSearch();
 
     // set up decoder
     auto decoder = GptDecoderBatch(vocabSize, vocabSizePadded, streamPtr);

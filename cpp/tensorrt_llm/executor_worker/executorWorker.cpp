@@ -80,6 +80,8 @@ int main(int argc, char* argv[])
     // In orchestrator mode, the spawned threads will wait for termination signal from orchestrator
     auto executor = tle::Executor(modelPath, modelType, executorConfig);
 
+    // Wait for all workers to have created their instances
+    MPI_Barrier(parentComm);
     TLLM_LOG_INFO("Executor instance created by worker");
 
 #endif // ENABLE_MULTI_DEVICE

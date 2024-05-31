@@ -17,12 +17,14 @@
 #include "tensorrt_llm/thop/dynamicDecodeOp.h"
 
 #include "tensorrt_llm/common/tensorConversion.h"
+#include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include "tensorrt_llm/thop/torchAllocator.h"
 
 namespace th = torch;
 
+namespace tle = tensorrt_llm::executor;
 namespace tr = tensorrt_llm::runtime;
 namespace tcc = tensorrt_llm::common::conversion;
 
@@ -46,7 +48,7 @@ FtDynamicDecode<T>::FtDynamicDecode(size_t const max_batch_size, size_t const ma
         = tensorrt_llm::layers::DecoderDomain(max_batch_size, max_beam_width, vocab_size, vocab_size_padded);
 
     dynamic_decode_layer_ = std::make_shared<tensorrt_llm::layers::DynamicDecodeLayer<T>>(
-        tr::DecodingMode::None(), decodingDomain, stream, std::move(allocator));
+        tle::DecodingMode::Auto(), decodingDomain, stream, std::move(allocator));
 }
 
 namespace
@@ -104,7 +106,8 @@ void FtDynamicDecode<T>::setup(size_t const batch_size, size_t const beam_width,
     th::optional<th::Tensor> min_length_opt, th::optional<th::Tensor> length_penalty_opt,
     th::optional<th::Tensor> early_stopping_opt, th::optional<th::Tensor> beam_search_diversity_rate_opt,
     th::optional<th::Tensor> random_seed_opt, th::optional<th::Tensor> top_p_decay_opt,
-    th::optional<th::Tensor> top_p_min_opt, th::optional<th::Tensor> top_p_reset_ids_opt)
+    th::optional<th::Tensor> top_p_min_opt, th::optional<th::Tensor> top_p_reset_ids_opt, bool output_log_probs,
+    bool cum_log_probs)
 {
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     dynamic_decode_layer_->setStream(stream);
@@ -124,6 +127,8 @@ void FtDynamicDecode<T>::setup(size_t const batch_size, size_t const beam_width,
     safeInsert(beam_search_diversity_rate_opt, setupParams->beamSearchParams.beam_search_diversity_rate);
     safeInsert(length_penalty_opt, setupParams->beamSearchParams.length_penalty);
     safeInsert(early_stopping_opt, setupParams->beamSearchParams.early_stopping);
+    setupParams->samplingParams.outputLogProbs = std::vector<bool>({output_log_probs});
+    setupParams->samplingParams.cumLogProbs = std::vector<bool>({cum_log_probs});
     // TODO: insert "normalize_log_probs" and "topKMedusaHeads"
 
     dynamic_decode_layer_->setup(batch_size, beam_width, nullptr, setupParams);
@@ -203,7 +208,7 @@ void FtDynamicDecode<T>::forward(th::Tensor const& logits, int const step, int c
         safeUpdatePtr<int>(beam_hyps_seq_len_cba_opt, outputParams->beamHypotheses->sequenceLengthsCBA);
     }
 
-    dynamic_decode_layer_->forward(outputParams, forwardParams);
+    dynamic_decode_layer_->forwardAsync(outputParams, forwardParams);
 
     if (finished_sum_host)
     {
@@ -258,7 +263,8 @@ void DynamicDecodeOp::setup(int64_t const batch_size, int64_t const beam_width,
     th::optional<th::Tensor> min_length_opt, th::optional<th::Tensor> length_penalty_opt,
     th::optional<th::Tensor> early_stopping_opt, th::optional<th::Tensor> beam_search_diversity_rate_opt,
     th::optional<th::Tensor> random_seed_opt, th::optional<th::Tensor> top_p_decay_opt,
-    th::optional<th::Tensor> top_p_min_opt, th::optional<th::Tensor> top_p_reset_ids_opt)
+    th::optional<th::Tensor> top_p_min_opt, th::optional<th::Tensor> top_p_reset_ids_opt, bool output_log_probs,
+    bool cum_log_probs)
 {
     // TODO: Revise DynamicDecodeLayer and make the decode arguments consistent.
     // TODO: add parameters "normalize_log_probs" and "topKMedusaHeads"
@@ -280,7 +286,7 @@ void DynamicDecodeOp::setup(int64_t const batch_size, int64_t const beam_width,
     dynamic_decode_->setup(static_cast<size_t>(batch_size), static_cast<size_t>(beam_width), runtime_top_k_opt,
         runtime_top_p_opt, temperature_opt, repetition_penalty_opt, presence_penalty_opt, frequency_penalty_opt,
         min_length_opt, length_penalty_opt, early_stopping_opt, beam_search_diversity_rate_opt, random_seed_opt,
-        top_p_decay_opt, top_p_min_opt, top_p_reset_ids_opt);
+        top_p_decay_opt, top_p_min_opt, top_p_reset_ids_opt, output_log_probs, cum_log_probs);
 }
 
 th::Tensor DynamicDecodeOp::forward(

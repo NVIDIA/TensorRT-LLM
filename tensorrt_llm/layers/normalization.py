@@ -39,8 +39,8 @@ class LayerNorm(Module):
         self.eps = eps
 
     def forward(self, x):
-        weight = None if self.weight is None else self.weight.value
-        bias = None if self.bias is None else self.bias.value
+        weight = 1. if self.weight is None else self.weight.value
+        bias = 0. if self.bias is None else self.bias.value
         return layer_norm(x, self.normalized_shape, weight, bias, self.eps)
 
 

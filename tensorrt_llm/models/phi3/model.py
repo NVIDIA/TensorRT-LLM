@@ -23,10 +23,10 @@ class Phi3DecoderLayer(Module):
         tp_size = config.mapping.tp_size
 
         self.input_layernorm = RmsNorm(normalized_shape=config.hidden_size,
-                                       eps=config.layer_norm_eps,
+                                       eps=config.norm_epsilon,
                                        dtype=config.dtype)
         self.post_layernorm = RmsNorm(normalized_shape=config.hidden_size,
-                                      eps=config.layer_norm_eps,
+                                      eps=config.norm_epsilon,
                                       dtype=config.dtype)
 
         layers_range = config.mapping.pp_layers(config.num_hidden_layers)
@@ -112,7 +112,7 @@ class Phi3Model(Module):
 
         self.layers = DecoderLayerList(Phi3DecoderLayer, config)
         self.ln_f = RmsNorm(normalized_shape=config.hidden_size,
-                            eps=config.layer_norm_eps,
+                            eps=config.norm_epsilon,
                             dtype=config.dtype)
 
     def forward(

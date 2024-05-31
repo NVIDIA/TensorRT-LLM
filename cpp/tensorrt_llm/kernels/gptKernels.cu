@@ -84,7 +84,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
 
     // Allocate storage in shared memory to do the scan.
     __shared__ typename BlockScan::TempStorage tempQStorage;
-    __shared__ typename BlockScan::TempStorage tempKVStorage;
+    [[maybe_unused]] __shared__ typename BlockScan::TempStorage tempKVStorage;
 
     // This prefixOp operator keeps a running sum for when we need multiple iterations of the loop.
     BlockPrefixCallbackOp prefixQOp(0);
@@ -105,7 +105,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
 
         // Threads that correspond to valid sequences read the length.
         int seqQLength = 0;
-        int seqKVLength = 0;
+        [[maybe_unused]] int seqKVLength = 0;
         if (batchIdx < batchSizeBound)
         {
             seqQLength = fixed_q_seqlen ? maxQSeqLength : seqQLengths[batchIdx];
@@ -116,7 +116,8 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
         }
 
         // Do the prefix-scan (it calls syncthreads internally).
-        int seqQOffset, seqKVOffset;
+        int seqQOffset;
+        [[maybe_unused]] int seqKVOffset;
         BlockScan(tempQStorage).ExclusiveSum(seqQLength, seqQOffset, prefixQOp);
         if constexpr (COMPUTE_KV_OFFSETS)
         {

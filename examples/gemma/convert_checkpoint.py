@@ -18,13 +18,13 @@ import sentencepiece as sp
 import torch
 import utils.params
 import utils.transformer
-from datasets import load_dataset
 from easydict import EasyDict
 from transformers import AutoConfig, AutoModelForCausalLM
 
 import tensorrt_llm
 from tensorrt_llm._utils import (np_bfloat16, numpy_to_torch,
                                  str_dtype_to_torch, torch_to_numpy)
+from tensorrt_llm.models.convert_utils import load_calib_dataset
 from tensorrt_llm.models.gemma.smoothquant import *
 from tensorrt_llm.models.gemma.weight import (dummy_weights_awq,
                                               load_from_fp8_gemma,
@@ -70,6 +70,13 @@ def parse_arguments():
         help=
         "Path of a directory to quantized model checkpoints in .safetensors format or \
               path of a quantized model checkpoint in .npz format")
+    parser.add_argument(
+        '--calib_dataset',
+        type=str,
+        default='ccdv/cnn_dailymail',
+        help=
+        "The huggingface dataset name or the local directory of the dataset for calibration."
+    )
     parser.add_argument('--use_smooth_quant',
                         default=False,
                         action="store_true",
@@ -878,7 +885,7 @@ def convert(worker_rank, args, convert_kwargs):
         if args.use_smooth_quant_plugin is not None or args.calibrate_kv_cache:
             qkv_para = {}
             smoother = {}
-            dataset = load_dataset("ccdv/cnn_dailymail", '3.0.0')
+            dataset = load_calib_dataset(args.calib_dataset)
             assert args.tokenizer_dir is not None, "Must set tokenizer_dir to do calibration"
             tokenizer = sp.SentencePieceProcessor(model_file=args.tokenizer_dir)
             if "transformer.vocab_embedding.weight" in weights:

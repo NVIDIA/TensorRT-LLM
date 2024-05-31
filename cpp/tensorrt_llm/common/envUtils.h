@@ -33,8 +33,8 @@ int32_t xqaMaxNbCtaPerKVHeadFactor();
 
 std::optional<int32_t> envXqaNbCtaPerKVHead();
 
-// Whether XQA JIT is disabled.
-bool getEnvDisableXQAJIT();
+// Whether XQA JIT is enabled.
+bool getEnvEnableXQAJIT();
 
 // Tune the number of blocks per sequence for accuracy/performance purpose.
 bool getEnvMmhaMultiblockDebug();

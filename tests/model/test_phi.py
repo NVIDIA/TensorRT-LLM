@@ -143,11 +143,11 @@ class TestPhi(unittest.TestCase):
             network = builder.create_network()
             network.plugin_config.to_legacy_setting()
             if use_attention_plugin:
-                network.plugin_config.set_gpt_attention_plugin(dtype)
+                network.plugin_config.gpt_attention_plugin = dtype
             if use_ln_gemm_plugin:
-                network.plugin_config.set_gemm_plugin(dtype)
+                network.plugin_config.gemm_plugin = dtype
             if enable_remove_input_padding:
-                network.plugin_config.enable_remove_input_padding()
+                network.plugin_config.remove_input_padding = True
             network.plugin_config.set_context_fmha(context_fmha_flag)
 
             self.initialize_network(network, hf_model, hf_config, dtype,

@@ -41,6 +41,17 @@ def parse_requirements(filename: os.PathLike):
     return deps, extra_URLs
 
 
+def sanity_check():
+    bindings_path = Path(
+        __file__).resolve().parent / "tensorrt_llm" / "bindings"
+    if not bindings_path.exists():
+        raise ImportError(
+            'The `bindings` module does not exist. Please check the package integrity. '
+            'If you are attempting to use the pip development mode (editable installation), '
+            'please execute `build_wheels.py` first, and then run `pip install -e .`.'
+        )
+
+
 def get_version():
     version_file = Path(
         __file__).resolve().parent / "tensorrt_llm" / "version.py"
@@ -70,6 +81,7 @@ required_deps, extra_URLs = parse_requirements(
 devel_deps, _ = parse_requirements(
     Path("requirements-dev-windows.txt"
          if on_windows else "requirements-dev.txt"))
+sanity_check()
 
 # https://setuptools.pypa.io/en/latest/references/keywords.html
 setup(

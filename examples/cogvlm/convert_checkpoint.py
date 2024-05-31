@@ -9,7 +9,6 @@ from pathlib import Path
 
 import safetensors
 import torch
-from datasets import load_dataset
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 import tensorrt_llm
@@ -17,6 +16,7 @@ from tensorrt_llm.layers import MoeConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.cogvlm.convert import convert_hf_cogvlm
+from tensorrt_llm.models.convert_utils import load_calib_dataset
 from tensorrt_llm.models.llama.convert import (capture_activation_range,
                                                smooth_llama_model)
 from tensorrt_llm.models.llama.weight import (load_from_gptq_llama,
@@ -80,6 +80,13 @@ def parse_arguments():
         help=
         'Define the precision for the weights when using weight-only quantization.'
         'You must also use --use_weight_only for that argument to have an impact.'
+    )
+    parser.add_argument(
+        '--calib_dataset',
+        type=str,
+        default='ccdv/cnn_dailymail',
+        help=
+        "The huggingface dataset name or the local directory of the dataset for calibration."
     )
     parser.add_argument(
         "--smoothquant",
@@ -341,16 +348,14 @@ def smooth_quant(model, args):
         logger.warning(
             "Note that running capture_activation_range on cpu would be very small."
         )
-    dataset = load_dataset("ccdv/cnn_dailymail",
-                           '3.0.0',
-                           cache_dir=args.dataset_cache_dir)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_dir,
+                                              trust_remote_code=True,
+                                              use_fast=False,
+                                              padding_side='left')
+    dataset = load_calib_dataset(args.calib_dataset,
+                                 cache_dir=args.dataset_cache_dir)
 
-    act_range = capture_activation_range(
-        model,
-        AutoTokenizer.from_pretrained(args.model_dir,
-                                      trust_remote_code=True,
-                                      use_fast=False,
-                                      padding_side='left'), dataset)
+    act_range = capture_activation_range(model, tokenizer, dataset)
     if args.smoothquant is not None:
         smooth_llama_model(model, act_range, args.smoothquant, llama_qkv_para,
                            llama_smoother)

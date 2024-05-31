@@ -28,7 +28,8 @@ namespace mmha
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Forward declaration of the kernel launcher to avoid including decoderMaskedMultiheadAttentionLaunch.h
-template <typename T, typename KVCacheBuffer, typename T_PARAMS, int Dh, bool IMPLICIT_REL_ATTN_BIAS>
+template <typename T, typename KVCacheBuffer, typename T_PARAMS, int Dh, bool IMPLICIT_REL_ATTN_BIAS,
+    bool QK_TANH_SCALE>
 void mmha_launch_kernel(const T_PARAMS& params, KVCacheBuffer const& kv_cache_buffer,
     KVLinearBuffer const& shift_k_cache, cudaStream_t const& stream);
 
@@ -38,19 +39,37 @@ namespace
 {
 
 #define MMHA_LAUNCH_KERNEL(Dh)                                                                                         \
-    mmha::mmha_launch_kernel<T, KVCacheBuffer, KERNEL_PARAMS_TYPE, Dh, false>(                                         \
+    mmha::mmha_launch_kernel<T, KVCacheBuffer, KERNEL_PARAMS_TYPE, Dh, false, false>(                                  \
         params, kv_cache_buffer, shift_k_cache, stream);                                                               \
     break;
 
-#define MMHA_LAUNCH_KERNE_WITH_IMPLICIT_RELATIVE_ATTN(Dh)                                                              \
+#define MMHA_LAUNCH_KERNE_EX1(Dh)                                                                                      \
     if (has_implicit_rel_attn_bias)                                                                                    \
     {                                                                                                                  \
-        mmha::mmha_launch_kernel<T, KVCacheBuffer, KERNEL_PARAMS_TYPE, Dh, true>(                                      \
+        mmha::mmha_launch_kernel<T, KVCacheBuffer, KERNEL_PARAMS_TYPE, Dh, true, false>(                               \
             params, kv_cache_buffer, shift_k_cache, stream);                                                           \
     }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
-        mmha::mmha_launch_kernel<T, KVCacheBuffer, KERNEL_PARAMS_TYPE, Dh, false>(                                     \
+        mmha::mmha_launch_kernel<T, KVCacheBuffer, KERNEL_PARAMS_TYPE, Dh, false, false>(                              \
+            params, kv_cache_buffer, shift_k_cache, stream);                                                           \
+    }                                                                                                                  \
+    break;
+
+#define MMHA_LAUNCH_KERNE_EX2(Dh)                                                                                      \
+    if (has_implicit_rel_attn_bias)                                                                                    \
+    {                                                                                                                  \
+        mmha::mmha_launch_kernel<T, KVCacheBuffer, KERNEL_PARAMS_TYPE, Dh, true, false>(                               \
+            params, kv_cache_buffer, shift_k_cache, stream);                                                           \
+    }                                                                                                                  \
+    else if (has_qk_tanh_scale)                                                                                        \
+    {                                                                                                                  \
+        mmha::mmha_launch_kernel<T, KVCacheBuffer, KERNEL_PARAMS_TYPE, Dh, false, true>(                               \
+            params, kv_cache_buffer, shift_k_cache, stream);                                                           \
+    }                                                                                                                  \
+    else                                                                                                               \
+    {                                                                                                                  \
+        mmha::mmha_launch_kernel<T, KVCacheBuffer, KERNEL_PARAMS_TYPE, Dh, false, false>(                              \
             params, kv_cache_buffer, shift_k_cache, stream);                                                           \
     }                                                                                                                  \
     break;
@@ -60,14 +79,20 @@ void multihead_attention_(const KERNEL_PARAMS_TYPE& params, KVCacheBuffer const&
     KVLinearBuffer const& shift_k_cache, cudaStream_t const& stream)
 {
     bool const has_implicit_rel_attn_bias = params.max_distance > 0 && params.relative_attention_bias != nullptr;
+    bool const has_qk_tanh_scale = params.qk_tanh_scale > 0.f;
     int const head_size = params.hidden_size_per_head;
     TLLM_CHECK_WITH_INFO(!has_implicit_rel_attn_bias || head_size == 32 || head_size == 64 || head_size == 128,
         "MMHA kernels haven't instantiate implicit_relative_attention_bias paths for head size %d.", head_size);
+    TLLM_CHECK_WITH_INFO(!has_qk_tanh_scale || head_size == 128,
+        "MMHA kernels haven't instantiate qk_tanh_scale paths for head size %d.", head_size);
+    TLLM_CHECK_WITH_INFO(!(has_qk_tanh_scale && has_implicit_rel_attn_bias),
+        "MMHA kernels haven't instantiate implicit_relative_attention_bias + qk_tanh_scale paths for head size %d.",
+        head_size);
     switch (params.hidden_size_per_head)
     {
-    case 32: MMHA_LAUNCH_KERNE_WITH_IMPLICIT_RELATIVE_ATTN(32);
-    case 64: MMHA_LAUNCH_KERNE_WITH_IMPLICIT_RELATIVE_ATTN(64);
-    case 128: MMHA_LAUNCH_KERNE_WITH_IMPLICIT_RELATIVE_ATTN(128);
+    case 32: MMHA_LAUNCH_KERNE_EX1(32);
+    case 64: MMHA_LAUNCH_KERNE_EX1(64);
+    case 128: MMHA_LAUNCH_KERNE_EX2(128);
     case 256: MMHA_LAUNCH_KERNEL(256);
 #ifndef FAST_BUILD // skip mmha 48, 80, 96, 104, 112, 144, 160, 192 and 224 for fast build
     case 48: MMHA_LAUNCH_KERNEL(48);

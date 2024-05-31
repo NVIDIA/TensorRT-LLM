@@ -36,6 +36,8 @@ public:
     std::optional<std::vector<float>> top_p_decay;                    // [batchSize], must between [0, 1]
     std::optional<std::vector<float>> top_p_min;                      // [batchSize], must between [0, 1]
     std::optional<std::vector<runtime::TokenIdType>> top_p_reset_ids; // [batchSize]
+    std::optional<std::vector<bool>> outputLogProbs;                  // [batchSize]
+    std::optional<std::vector<bool>> cumLogProbs;                     // [batchSize]
     std::optional<bool> normalize_log_probs;
 };
 

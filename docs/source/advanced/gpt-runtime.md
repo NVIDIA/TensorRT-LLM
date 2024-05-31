@@ -122,7 +122,7 @@ value for a given parameter, the vector can be limited to a single element
 ***General***
 
  * `temperature`, a vector of floating-point numbers to control the
-   modulation of logits when sampling new tokens. It can have any value `> 0.0f`. The default value is `1.0f`(no modulation).
+   modulation of logits when sampling new tokens. It can have any value `> 0.0f`. The default value is `1.0f`(no modulation). Note: the recommended way to enable greedy sampling is to set `temperature` to `1.0f` and `topK` to `1`.
  * `minLength`, a vector of integers to set a lower-bound on the number of tokens
    generated. It can have any value `>= 0`. Value `0` has no effect, the first generated token can be EOS. The default value is `1` (at least one non-EOS token is generated).
  * `repetitionPenalty`, a vector of float-point numbers to penalize tokens

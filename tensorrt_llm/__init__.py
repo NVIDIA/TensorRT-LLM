@@ -35,15 +35,6 @@ import tensorrt_llm.quantization as quantization
 import tensorrt_llm.runtime as runtime
 import tensorrt_llm.tools as tools
 
-try:
-    import tensorrt_llm.bindings  # NOQA
-except ImportError:
-    raise ImportError(
-        'Import of the `bindings` module failed. Please check the package integrity. '
-        'If you are attempting to use the pip development mode (editable installation), '
-        'please execute `build_wheels.py` first, and then run `pip install -e .`'
-    )
-
 from ._common import _init, default_net, default_trtnet, precision
 # Disable flake8 on the line below because mpi_barrier is not used in tensorrt_llm project
 # but may be called in dependencies (such as examples)

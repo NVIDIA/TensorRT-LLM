@@ -242,14 +242,7 @@ void filter_and_run_mixed_gemm(ActivationType const* A, WeightType const* B, Sca
 {
 
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-    if constexpr (cutlass::isFinegrained(QuantOp) && arch::kMinComputeCapability < 80)
-    {
-        // Finegrained only supported on Ampere
-        std::string err_msg = "Cutlass fpA_intB gemm not implemented for arch "
-            + std::to_string(arch::kMinComputeCapability) + " with finegraind weight-only quantization.";
-        throw std::runtime_error("[TensorRT-LLm Error][filter_and_run_mixed_gemm] " + err_msg);
-    }
-    else if constexpr (Stages > 2 && arch::kMinComputeCapability < 80)
+    if constexpr (Stages > 2 && arch::kMinComputeCapability < 80)
     {
         // Multistage only supported on Ampere
         std::string err_msg = "Cutlass fpA_intB gemm not supported for arch "

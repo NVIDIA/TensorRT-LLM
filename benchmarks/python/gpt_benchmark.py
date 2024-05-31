@@ -111,6 +111,7 @@ class GPTBenchmark(BaseBenchmark):
                 self.use_mamba_conv1d_plugin = True
             elif args.mode == 'ootb-except-mha':
                 self.use_gpt_attention_plugin = True
+                self.remove_input_padding = True
 
             engine_buffer, build_time = build_gpt(args)
             self.weights_size_approx = engine_buffer.nbytes
@@ -122,6 +123,15 @@ class GPTBenchmark(BaseBenchmark):
 
         if not hasattr(self, 'num_kv_heads') or self.num_kv_heads is None:
             self.num_kv_heads = self.num_heads
+
+        rnn_config_items = [
+            'conv_kernel', 'layer_types', 'rnn_hidden_size', 'state_size',
+            'state_dtype'
+        ]
+        rnn_configs_kwargs = {}
+        for item in rnn_config_items:
+            if hasattr(self, item):
+                rnn_configs_kwargs[item] = getattr(self, item)
 
         model_config = tensorrt_llm.runtime.ModelConfig(
             max_batch_size=self.max_batch_size,
@@ -143,13 +153,8 @@ class GPTBenchmark(BaseBenchmark):
             tokens_per_block=self.tokens_per_block if hasattr(
                 self, 'tokens_per_block') else 64,
             mamba_conv1d_plugin=self.use_mamba_conv1d_plugin,
-            conv_kernel=self.conv_kernel if hasattr(self, 'conv_kernel') else 0,
-            state_size=self.state_size if hasattr(self, 'state_size') else 0,
-            layer_types=self.layer_types
-            if hasattr(self, 'layer_types') else [],
-            rnn_hidden_size=self.rnn_hidden_size if hasattr(
-                self, 'rnn_hidden_size') else 0,
             gpu_weights_percent=list(sorted(gpu_weights_percents))[0],
+            **rnn_configs_kwargs,
         )
         if args.model == 'chatglm_6b':
             self.sampling_config = tensorrt_llm.runtime.SamplingConfig(

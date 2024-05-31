@@ -38,6 +38,8 @@ public:
     //! @param ngramTokens the new shifted lookahead window, as the ngrams, [window, ngramLen] on cpu
     void update(TensorPtr keyTokens, TensorPtr ngramTokens);
 
+    void clear(void);
+
     std::unordered_map<Key, std::list<TensorPtr>> const& getMap() const
     {
         return mTokenMap;

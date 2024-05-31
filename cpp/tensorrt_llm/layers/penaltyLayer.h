@@ -20,11 +20,11 @@
 #include <curand_kernel.h>
 
 #include "tensorrt_llm/common/tensor.h"
+#include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/layers/baseLayer.h"
 #include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/layers/layerUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
-#include "tensorrt_llm/runtime/decodingMode.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
 namespace tensorrt_llm
@@ -42,7 +42,7 @@ template <typename T>
 class PenaltyLayer : public BaseLayer
 {
 public:
-    PenaltyLayer(runtime::DecodingMode const& mode, DecoderDomain const& decoderDomain, cudaStream_t stream,
+    PenaltyLayer(executor::DecodingMode const& mode, DecoderDomain const& decoderDomain, cudaStream_t stream,
         std::shared_ptr<tensorrt_llm::common::IAllocator> allocator);
 
     ~PenaltyLayer() override;
@@ -51,7 +51,7 @@ public:
         std::shared_ptr<BaseSetupParams> setupParams) override;
 
     //! \brief Modifies 'outputs->logits' in-place with -INF for banned words
-    void forward(std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs) override;
+    void forwardAsync(std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs) override;
 
     T* getRuntimeLogitsDevice()
     {
@@ -73,7 +73,7 @@ private:
 
     using BaseLayer::mDecoderDomain;
 
-    runtime::DecodingMode mDecodingMode;
+    executor::DecodingMode mDecodingMode;
 
     float* mTemperatureDevice{nullptr};
     float* mRepetitionPenaltyDevice{nullptr};

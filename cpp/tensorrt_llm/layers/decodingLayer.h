@@ -20,12 +20,13 @@
 #include <curand_kernel.h>
 
 #include "tensorrt_llm/common/tensor.h"
+#include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/layers/baseLayer.h"
 #include "tensorrt_llm/layers/beamSearchLayer.h"
 #include "tensorrt_llm/layers/decodingParams.h"
+#include "tensorrt_llm/layers/explicitDraftTokensLayer.h"
 #include "tensorrt_llm/layers/medusaDecodingLayer.h"
 #include "tensorrt_llm/layers/samplingLayer.h"
-#include "tensorrt_llm/runtime/decodingMode.h"
 
 namespace tc = tensorrt_llm::common;
 
@@ -39,7 +40,7 @@ template <typename T>
 class DecodingLayer : public BaseLayer
 {
 public:
-    DecodingLayer(runtime::DecodingMode const& mode, DecoderDomain const& decoderDomain, cudaStream_t stream,
+    DecodingLayer(executor::DecodingMode const& mode, DecoderDomain const& decoderDomain, cudaStream_t stream,
         std::shared_ptr<tensorrt_llm::common::IAllocator> allocator);
 
     ~DecodingLayer() override = default;
@@ -47,10 +48,17 @@ public:
     void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 const* batchSlots,
         std::shared_ptr<BaseSetupParams> setupParams) override;
 
-    //! \brief Calls single SamplingLayer::forward in batched mode
-    //! or runs BeamSearchLayer::forward in the loop for each request.
+    //! \brief Calls single SamplingLayer::forwardAsync or MedusaDecodingLayer::forwardAsync in batched mode
+    //! or runs BeamSearchLayer::forwardAsync in the loop for each request.
     //! Modifies outputs->logits in-place.
-    void forward(std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs) override;
+    void forwardAsync(std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs) override;
+
+    //! \brief Calls forwardSync of configired decoding layer.
+    void forwardSync(std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs) override;
+
+private:
+    std::tuple<std::shared_ptr<BaseOutputParams>, std::shared_ptr<BaseInputParams>> prepareParams(
+        std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs) const;
 
 private:
     using BaseLayer::mWorkspaceSize;
@@ -59,11 +67,9 @@ private:
     using BaseLayer::mStream;
     using BaseLayer::mAllocator;
 
-    runtime::DecodingMode mDecodingMode;
+    executor::DecodingMode mDecodingMode;
 
     std::unique_ptr<BaseLayer> mDecodingLayer;
-
-    bool mHasDiffRuntimeArgs{false};
 };
 
 } // namespace layers

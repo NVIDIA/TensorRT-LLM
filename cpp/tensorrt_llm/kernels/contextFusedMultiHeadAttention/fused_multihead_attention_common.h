@@ -345,6 +345,8 @@ struct Launch_params
     bool useBase2ExpTrick = false;
     // use paged_kv_fmha kernels.
     bool paged_kv_input = false;
+    // enable scale + tanh for qk products.
+    bool enableQKTanhScale = false;
     // harward properties to determine how to launch blocks
     int multi_processor_count = 0;
     int device_l2_cache_size = 0;
@@ -368,6 +370,7 @@ struct Launch_params
         useKernelWithoutAlibi = false;
         useBase2ExpTrick = false;
         paged_kv_input = false;
+        enableQKTanhScale = false;
     }
 };
 

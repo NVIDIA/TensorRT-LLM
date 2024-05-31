@@ -3,10 +3,10 @@ import os
 from argparse import ArgumentParser
 from typing import Literal, Optional
 
-from pydantic import AliasChoices, AliasPath, BaseModel, Field, model_validator
+from pydantic import (AliasChoices, AliasPath, BaseModel, Field, computed_field,
+                      model_validator)
 from transformers import AutoConfig
 from utils import VALID_QUANT_ALGOS
-from utils.enums import ComputeDtypeEnum, KVCacheDtypeEnum
 
 PET_dict = {
     "tiiuae/falcon-7b": "rope_gpt_neox",
@@ -15,18 +15,37 @@ PET_dict = {
     "meta-llama/Llama-2-7b-hf": "rope_gpt_neox",
     "meta-llama/Llama-2-13b-hf": "rope_gpt_neox",
     "meta-llama/Llama-2-70b-hf": "rope_gpt_neox",
+    "meta-llama/Meta-Llama-3-8B": "rope_gpt_neox",
+    "meta-llama/Meta-Llama-3-70B": "rope_gpt_neox",
     "EleutherAI/gpt-j-6b": "rope_gptj",
     "bigscience/bloom-560m": "alibi",
     "mistralai/Mistral-7B-v0.1": "rope_gpt_neox",
+    "mistralai/Mixtral-8x7B-v0.1": "rope_gpt_neox",
+    "mistralai/Mixtral-8x22B-v0.1": "rope_gpt_neox",
     "01-ai/Yi-6B": "rope_gpt_neox",
     "01-ai/Yi-34B": "rope_gpt_neox",
+    "codellama/CodeLlama-7b-hf": "rope_gpt_neox",
+    "codellama/CodeLlama-13b-hf": "rope_gpt_neox",
+    "codellama/CodeLlama-34b-hf": "rope_gpt_neox",
+    "codellama/CodeLlama-70b-hf": "rope_gpt_neox",
+    "facebook/opt-125m": "learned_absolute",
+    "facebook/opt-350m": "learned_absolute",
+    "facebook/opt-1.3b": "learned_absolute",
+    "facebook/opt-2.7b": "learned_absolute",
+    "facebook/opt-13b": "learned_absolute",
+    "facebook/opt-30b": "learned_absolute",
+    "facebook/opt-66b": "learned_absolute",
+    "google/gemma-7b": "rope_gpt_neox",
+    "google/gemma-2b": "rope_gpt_neox",
 }
 HA_dict = {
     "tiiuae/falcon-7b": "gelu",
     "tiiuae/falcon-40b": "gelu",
     "tiiuae/falcon-180B": "gelu",
     "bigscience/bloom-560m": "gelu",
+    "mistralai/Mixtral-8x7B-v0.1": "swiglu",
 }
+ALLOWED_MODELS = list(PET_dict.keys())
 
 
 class TRTLLM_Mapping(BaseModel):
@@ -42,23 +61,20 @@ class TRTLLM_Mapping(BaseModel):
 
 class TRTLLM_Quantization(BaseModel):
     quant_algo: Optional[VALID_QUANT_ALGOS] = None
-
     kv_cache_quant_algo: Optional[Literal[None, "FP8", "INT8"]] = None
-
     group_size: int = 128
     has_zero_point: bool = False
     pre_quant_scale: bool = False
     exclude_modules: Optional[list] = None
 
 
-class TRTLLM_CheckpointConfig(BaseModel):
-    """Dataclass for building TRT-LLM model configurations."""
-
+class TRTLLMConfig(BaseModel):
     _VALID_EMBED_TYPE = Literal["learned_absolute", "rope_gptj",
                                 "rope_gpt_neox", "alibi", "alibi_with_scale",
                                 "relative", "chatglm", ]
 
-    architecture: str = Field(validation_alias=AliasPath("architectures", 0))
+    architecture: str = Field(validation_alias=AliasChoices(
+        'architecture', AliasPath("architectures", 0)))
     num_hidden_layers: int = Field(validation_alias=AliasChoices(
         "num_hidden_layers", "n_layer", "n_layers"))
     num_attention_heads: int = Field(validation_alias=AliasChoices(
@@ -72,13 +88,15 @@ class TRTLLM_CheckpointConfig(BaseModel):
         validation_alias=AliasChoices("hidden_size", "n_embd", "d_model"))
     norm_epsilon: float = Field(
         default=1e-5,
-        validation_alias=AliasChoices("norm_epsilon", "layer_norm_epsilon"),
+        validation_alias=AliasChoices("norm_epsilon", "layer_norm_epsilon",
+                                      "rms_norm_eps"),
     )
     vocab_size: int
     max_position_embeddings: Optional[int] = Field(
         default=None,
         validation_alias=AliasChoices("max_position_embeddings", "n_positions"),
     )
+    head_size: Optional[int] = None
     hidden_act: str = Field(
         validation_alias=AliasChoices("hidden_act", "activation_function"))
     # falcon options
@@ -102,33 +120,46 @@ class TRTLLM_CheckpointConfig(BaseModel):
     intermediate_size: int = None
     use_prompt_tuning: bool = False
 
+    sliding_window: Optional[int] = None
+
+    moe_num_experts: Optional[int] = Field(
+        default=0, validation_alias=AliasChoices("num_local_experts"))
+    moe_top_k: Optional[int] = Field(
+        default=0, validation_alias=AliasChoices("num_experts_per_tok"))
+    rotary_base: Optional[float] = Field(
+        default=None, validation_alias=AliasChoices("rope_theta"))
+
     mapping: TRTLLM_Mapping
     quantization: TRTLLM_Quantization
 
+    @computed_field
+    def kv_dtype(self) -> str:
+        if self.quantization.kv_cache_quant_algo == "FP8":
+            return "fp8"
+        elif self.quantization.kv_cache_quant_algo == "INT8":
+            return "int8"
+        else:
+            return self.dtype
+
     @model_validator(mode="after")
-    def set_kv_head_default_value(self) -> "TRTLLM_CheckpointConfig":
+    def set_values_if_none(self) -> "TRTLLM_CheckpointConfig":
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
+        if self.head_size is None:
+            self.head_size = self.hidden_size // self.num_attention_heads
         return self
 
-
-class TRTLLMConfig:
-
-    def __init__(self, trtllm_config, hf_config=None) -> None:
-        self.trtllm_config = trtllm_config
-        self.hf_config = hf_config
-        # self.nemo_config = nemo_config
-
     @classmethod
-    def from_hf(
-        cls,
-        hf_model_name,
-        tp,
-        pp,
-        dtype=None,
-        quant_dtype=None,
-        kv_cache_quant_dtype=None,
-    ):
+    def populate_build_config(cls,
+                              model_name,
+                              tp,
+                              pp,
+                              dtype=None,
+                              quant_dtype=None,
+                              kv_cache_quant_dtype=None):
+        """
+        Common function to populate build parameters, regardless of network
+        """
         build_config = {
             "mapping": {
                 "tp_size": tp,
@@ -137,27 +168,96 @@ class TRTLLMConfig:
             "quantization": {},
         }
         if dtype:
-            build_config["dtype"] = ComputeDtypeEnum(dtype).value
+            build_config["dtype"] = dtype
         if quant_dtype:
             if not kv_cache_quant_dtype:
                 # will throw errors during validation if the type is invalid
-                kv_cache_quant_dtype = KVCacheDtypeEnum(quant_dtype).value
+                kv_cache_quant_dtype = quant_dtype
             build_config["quantization"] = {
                 "quant_algo": quant_dtype,
-                "kv_cache_quant_algo":
-                KVCacheDtypeEnum(kv_cache_quant_dtype).value,
+                "kv_cache_quant_algo": kv_cache_quant_dtype,
             }
-        build_config["position_embedding_type"] = PET_dict[hf_model_name]
-        if hf_model_name in HA_dict:
-            build_config["hidden_act"] = HA_dict[hf_model_name]
+        if model_name in PET_dict:
+            build_config["position_embedding_type"] = PET_dict.get(model_name)
+        return build_config
+
+    @classmethod
+    def from_hf(cls,
+                hf_model_name,
+                tp,
+                pp,
+                dtype=None,
+                quant_dtype=None,
+                kv_cache_quant_dtype=None):
+        """
+        Use transformers.AutoConfig to load a model's config from a HF name
+        """
+        build_config = cls.populate_build_config(hf_model_name, tp, pp, dtype,
+                                                 quant_dtype,
+                                                 kv_cache_quant_dtype)
         hf_config = AutoConfig.from_pretrained(hf_model_name).to_dict()
-        trtllm_config = TRTLLM_CheckpointConfig(**hf_config,
-                                                **build_config).model_dump()
-        return cls(trtllm_config, hf_config)
+        if hf_model_name in HA_dict:
+            hf_config["hidden_act"] = HA_dict[hf_model_name]
+        return cls(**hf_config, **build_config)
+
+    @classmethod
+    def from_json(cls,
+                  model_name,
+                  tp,
+                  pp,
+                  dtype=None,
+                  quant_dtype=None,
+                  kv_cache_quant_dtype=None):
+        """
+        Load model parameters from a custom json file
+        A full path can be specified. Otherwise, look for ./trtllm_configs/(model_name).json
+        """
+        build_config = cls.populate_build_config(model_name, tp, pp, dtype,
+                                                 quant_dtype,
+                                                 kv_cache_quant_dtype)
+        if os.path.exists(model_name):
+            path_to_json = model_name
+        else:
+            path_to_json = os.path.join(os.path.dirname(__file__),
+                                        f"trtllm_configs/{model_name}.json")
+            if not os.path.exists(path_to_json):
+                raise FileNotFoundError(f"{path_to_json} not found")
+        json_config = json.load(open(path_to_json))
+        return cls(**json_config, **build_config)
+
+    @classmethod
+    def from_name(cls,
+                  model,
+                  tp,
+                  pp,
+                  dtype=None,
+                  quant_dtype=None,
+                  kv_cache_quant_dtype=None):
+        """
+        Attempts to create a config based on model name. Performs the following steps:
+        1. Tries to load the HF config using AutoConfig. This will only work if the network name exists on HF.
+        2. If this fails, try to load a custom config stored on $HF_HOME/custom/*.json
+        """
+        try:
+            trtllm_config = cls.from_hf(model, tp, pp, dtype, quant_dtype,
+                                        kv_cache_quant_dtype)
+        except EnvironmentError:
+            try:
+                trtllm_config = cls.from_json(model, tp, pp, dtype, quant_dtype,
+                                              kv_cache_quant_dtype)
+            except FileNotFoundError as e:
+                raise NameError(
+                    f"Unable to create PretrainedConfig from {model} due to {e}"
+                )
+
+        return trtllm_config
+
+    # future possibilities
+    # def from_nemo_config (self, nemo_model_name)
 
     def to_json(self, output_dir):
         with open(os.path.join(output_dir, "generated_config.json"), "w") as f:
-            json.dump(self.trtllm_config, f, indent=4)
+            json.dump(self.model_dump(), f, indent=4)
 
 
 if __name__ == "__main__":
@@ -205,14 +305,19 @@ if __name__ == "__main__":
         type=str,
         help="TRT-LLM argument",
     )
+    parser.add_argument(
+        "--populate_hf_cache",
+        action='store_true',
+        help="Populate the HF cache with all the supported networks",
+    )
     args = parser.parse_args()
 
-    trtllm_config = TRTLLMConfig.from_hf(
-        args.model,
-        args.tp_size,
-        args.pp_size,
-        args.dtype,
-        args.quant_dtype,
-        args.kv_cache_quant_dtype,
-    )
-    trtllm_config.to_json(os.getcwd())
+    if args.populate_hf_cache:
+        for net in PET_dict.keys():
+            _ = AutoConfig.from_pretrained(net)
+    else:
+        trtllm_config = TRTLLMConfig.from_name(args.model, args.tp_size,
+                                               args.pp_size, args.dtype,
+                                               args.quant_dtype,
+                                               args.kv_cache_quant_dtype)
+        trtllm_config.to_json(os.getcwd())

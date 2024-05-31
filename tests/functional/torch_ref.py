@@ -511,8 +511,16 @@ def rnn_scan(x: torch.Tensor, a: torch.Tensor, reset: torch.Tensor,
     return y, h_last
 
 
-def rg_lru_ref(x, input_gate_x, a_gate_x, y, y_bias, segment_pos, prev_h,
-               a_param):
+def rg_lru_ref(x,
+               input_gate_x,
+               a_gate_x,
+               y,
+               y_bias,
+               segment_pos,
+               prev_h,
+               a_param,
+               gate_x_bias=None,
+               gate_a_bias=None):
 
     bs, l, d = x.shape
     assert segment_pos.shape == (bs, l)
@@ -520,6 +528,10 @@ def rg_lru_ref(x, input_gate_x, a_gate_x, y, y_bias, segment_pos, prev_h,
     prev_h = torch.zeros(size=(bs, d)) if prev_h is None else prev_h
 
     # Gates for x and a.
+    if gate_x_bias is not None:
+        input_gate_x += gate_x_bias.reshape(1, 1, d)
+    if gate_a_bias is not None:
+        a_gate_x += gate_a_bias.reshape(1, 1, d)
     gate_x = torch.sigmoid(input_gate_x.float())
     gate_a = torch.sigmoid(a_gate_x.float())
 
@@ -554,8 +566,19 @@ def rg_lru_ref(x, input_gate_x, a_gate_x, y, y_bias, segment_pos, prev_h,
     return out.type(x.dtype), last_h
 
 
-def rg_lru_batch_ref(x, input_gate_x, a_gate_x, y, y_bias, segment_pos, prev_h,
-                     a_param, batch_size, remove_padding, last_token_ids):
+def rg_lru_batch_ref(x,
+                     input_gate_x,
+                     a_gate_x,
+                     y,
+                     y_bias,
+                     segment_pos,
+                     prev_h,
+                     a_param,
+                     batch_size,
+                     remove_padding,
+                     last_token_ids,
+                     gate_x_bias=None,
+                     gate_a_bias=None):
     outputs, lru_states = [], []
     for i in range(batch_size):
         start_id = 0 if (i == 0 or not remove_padding) else last_token_ids[i -
@@ -576,7 +599,7 @@ def rg_lru_batch_ref(x, input_gate_x, a_gate_x, y, y_bias, segment_pos, prev_h,
 
         out_i, lru_state_i = rg_lru_ref(x_i, input_gate_x_i, a_gate_x_i, y_i,
                                         y_bias, segment_pos_i, prev_h_i,
-                                        a_param)
+                                        a_param, gate_x_bias, gate_a_bias)
         if remove_padding:
             out_i = out_i.squeeze(0)
         else:
@@ -592,11 +615,17 @@ def rg_lru_batch_ref(x, input_gate_x, a_gate_x, y, y_bias, segment_pos, prev_h,
 class BlockDiagonalLinear(nn.Module):
     """Block-diagonal linear layer."""
 
-    def __init__(self, num_blocks: int, width: int, device=None, dtype=None):
+    def __init__(self,
+                 num_blocks: int,
+                 width: int,
+                 fuse_bias=False,
+                 device=None,
+                 dtype=None):
         factory_kwargs = {'device': device, 'dtype': dtype}
         super().__init__()
         self.num_blocks = num_blocks
         self.width = width
+        self.fuse_bias = fuse_bias
         block_width = self.width // self.num_blocks
 
         # Parameters
@@ -611,7 +640,9 @@ class BlockDiagonalLinear(nn.Module):
         x = rearrange(x, "... (h i) -> ... h i", h=self.num_blocks)
 
         # Linear layer over each block + bias
-        y = torch.einsum("... h i, h i j -> ... h j", x, self.w) + self.b
+        y = torch.einsum("... h i, h i j -> ... h j", x, self.w)
+        if not self.fuse_bias:
+            y += self.b
 
         # Flatten the output
         return rearrange(y, "... h j -> ... (h j)", h=self.num_blocks)
@@ -653,11 +684,13 @@ class recurrent_ref(nn.Module):
         self.input_gate = BlockDiagonalLinear(
             num_blocks=num_heads,
             width=lru_width,
+            fuse_bias=True,
             **factory_kwargs,
         )
         self.recurrent_gate = BlockDiagonalLinear(
             num_blocks=num_heads,
             width=lru_width,
+            fuse_bias=True,
             **factory_kwargs,
         )
 
@@ -742,7 +775,8 @@ class recurrent_ref(nn.Module):
         gate_a = self.recurrent_gate(x)
 
         x, lru_state = rg_lru_ref(x, gate_x, gate_a, y, self.y_bias,
-                                  segment_pos, lru_state, self.recurrent_param)
+                                  segment_pos, lru_state, self.recurrent_param,
+                                  self.input_gate.b, self.recurrent_gate.b)
 
         # Join branches.
         x = self.linear_out(x)

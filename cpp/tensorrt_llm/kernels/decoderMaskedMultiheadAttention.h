@@ -137,6 +137,10 @@ struct Multihead_attention_params_base
     // The 1.f / sqrt(Dh). Computed on the host.
     float inv_sqrt_dh = 0.0f;
 
+    // The tanh scale factor. (only used by Grok).
+    float qk_tanh_scale = 0.0f;
+    float qk_tanh_inverse_scale = 0.0f;
+
     // If relative position embedding is used
     T const* relative_attention_bias = nullptr;
     int relative_attention_bias_stride = 0;
@@ -166,11 +170,11 @@ struct Multihead_attention_params_base
     // Tune block size to maximum occupancy.
     int multi_processor_count = 1;
 
-    mutable int timesteps_per_block = -1;
-    mutable int seq_len_tile = -1;
+    mutable int timesteps_per_block = 1;
+    mutable int seq_len_tile = 1;
 
-    mutable int min_seq_len_tile = -1;
-    mutable int max_seq_len_tile = -1;
+    mutable int min_seq_len_tile = 1;
+    mutable int max_seq_len_tile = 1;
     // The partial output buffer. Dimensions max_seq_len_tile x B x D. (for each timestep only seq_len_tile x B x D is
     // needed)
     T* partial_out = nullptr;

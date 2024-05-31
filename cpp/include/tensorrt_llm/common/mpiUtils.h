@@ -260,6 +260,9 @@ public:
     //! \brief Corresponds to `world()` by default, but can be overridden per process.
     static MpiComm& session();
 
+    //! \brief Returns the MPI local communicator.
+    static MpiComm& localSession();
+
     [[nodiscard]] MpiComm split(int color, int key) const;
 
     std::shared_ptr<MpiRequest> bcastAsync(void* buffer, size_t size, MpiType dtype, int root) const;
@@ -370,3 +373,4 @@ void initialize(MpiThreadSupport threadMode = MpiThreadSupport::THREAD_FUNNELED)
 } // namespace tensorrt_llm::mpi
 
 #define COMM_SESSION tensorrt_llm::mpi::MpiComm::session()
+#define LOCAL_COMM_SESSION tensorrt_llm::mpi::MpiComm::localSession()

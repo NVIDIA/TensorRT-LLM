@@ -89,7 +89,6 @@ public:
         , mLoraTaskId(loraTaskId)
         , mLoraWeights(std::move(loraWeights))
         , mLoraConfig(std::move(loraConfig))
-        , mReturnLogProbs(returnLogProbs)
         , mContextChunkSize(std::nullopt)
         , mContextCurrentPosition(0)
         , mLogProbs(samplingConfig.beamWidth)
@@ -101,15 +100,16 @@ public:
         , mReturnGenerationLogits(returnGenerationLogits)
         , mExcludeInputFromOutput(excludeInputFromOutput)
         , mEncoderInputTokens(encoderInputTokens)
+        , mDecodingIter(0)
     {
-        initialize(*inputTokens);
+        initialize(*inputTokens, returnLogProbs);
     }
 
     GenericLlmRequest(RequestIdType requestId, executor::Request const& req)
         : mRequestId(requestId)
         , mPromptLen(req.getInputTokenIds().size())
         , mMaxNewTokens(req.getMaxNewTokens())
-        , mSamplingConfig(req.getSamplingConfig(), req.getSpeculativeDecodingConfig())
+        , mSamplingConfig(req.getSamplingConfig(), req.getExternalDraftTokensConfig())
         , mState(REQUEST_STATE_CONTEXT_INIT)
         , mIsStreaming(req.getStreaming())
         , mEndId(req.getEndId())
@@ -124,7 +124,6 @@ public:
         , mLoraTaskId(std::nullopt)
         , mLoraWeights(std::nullopt)
         , mLoraConfig(std::nullopt)
-        , mReturnLogProbs(req.getOutputConfig().returnLogProbs)
         , mContextChunkSize(std::nullopt)
         , mContextCurrentPosition(0)
         , mLogProbs(mSamplingConfig.beamWidth)
@@ -135,6 +134,7 @@ public:
         , mReturnContextLogits(req.getOutputConfig().returnContextLogits)
         , mReturnGenerationLogits(req.getOutputConfig().returnGenerationLogits)
         , mExcludeInputFromOutput(req.getOutputConfig().excludeInputFromOutput)
+        , mDecodingIter(0)
     {
         if (req.getEmbeddingBias())
         {
@@ -178,20 +178,20 @@ public:
             }
         }
 
-        auto speculativeDecodingConfig = req.getSpeculativeDecodingConfig();
-        if (speculativeDecodingConfig)
+        auto externalDraftTokensConfig = req.getExternalDraftTokensConfig();
+        if (externalDraftTokensConfig)
         {
-            mDraftTokens = std::make_shared<VecTokens>(speculativeDecodingConfig.value().getTokens());
+            mDraftTokens = std::make_shared<VecTokens>(externalDraftTokensConfig.value().getTokens());
 
-            if (speculativeDecodingConfig.value().getLogits())
+            if (externalDraftTokensConfig.value().getLogits())
             {
-                mDraftLogits = executor::detail::toITensor(speculativeDecodingConfig.value().getLogits().value());
+                mDraftLogits = executor::detail::toITensor(externalDraftTokensConfig.value().getLogits().value());
             }
 
             // NOTE: Draft acceptance threshold is stored in mSamplingConfig
         }
 
-        initialize(req.getInputTokenIds());
+        initialize(req.getInputTokenIds(), req.getOutputConfig().returnLogProbs);
     }
 
     void validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen)
@@ -233,13 +233,7 @@ public:
             mMaxNewTokens = maxNewTokens;
         }
 
-        if (mSamplingConfig.beamWidth <= 0)
-        {
-            TLLM_THROW(
-                "Requested value: %d for beamWidth is invalid. To de-activate beam searching "
-                "set beamWidth to 1 instead.",
-                mSamplingConfig.beamWidth);
-        }
+        TLLM_CHECK_WITH_INFO(mSamplingConfig.validate(), "Incorrect sampling config");
     }
 
     void setExcludeInputFromOutput(bool exclude)
@@ -379,7 +373,7 @@ public:
             {
                 auto& beamTokens = mTokens.at(beam);
                 beamTokens.resize(mPromptLen);
-                if (mReturnLogProbs)
+                if (returnLogProbs())
                 {
                     mLogProbs.at(beam).clear();
                 }
@@ -393,7 +387,7 @@ public:
                 auto& beamTokens = mTokens.at(beam);
                 beamTokens.resize(newPromptLen);
 
-                if (mReturnLogProbs)
+                if (returnLogProbs())
                 {
                     auto& logProb = mLogProbs.at(beam);
                     logProb.resize(newPromptLen - mPromptLen);
@@ -491,12 +485,13 @@ public:
 
     [[nodiscard]] bool returnLogProbs() const
     {
-        return mReturnLogProbs;
+        return mSamplingConfig.outputLogProbs.has_value() ? mSamplingConfig.outputLogProbs->at(0) : false;
     }
 
     void setReturnLogProbs(bool returnLogProbs)
     {
-        mReturnLogProbs = returnLogProbs;
+        mSamplingConfig.outputLogProbs = {{returnLogProbs}};
+        mSamplingConfig.cumLogProbs = {{returnLogProbs}};
     }
 
     [[nodiscard]] std::vector<VecLogProbs> const& getLogProbs() const
@@ -728,6 +723,23 @@ public:
         }
     }
 
+    /// Increment the counter of decoding iterations.
+    void advanceDecodingIter()
+    {
+        mDecodingIter++;
+    }
+
+    /// @brief  Return the average number of decoded tokens per iteration. For standard model it is 1.
+    /// For speculative decoding model >= 1 -- number of draft tokens accepted per step + 1.
+    [[nodiscard]] float getAvgDecodedTokensPerIter() const noexcept
+    {
+        if (mDecodingIter == 0)
+        {
+            return 0.f;
+        }
+        return static_cast<float>(getMaxNumGeneratedTokens()) / mDecodingIter;
+    }
+
     /// @brief  Create a Response from the current state of the request
     /// @return An optional Response
     std::optional<executor::Response> createResponse()
@@ -841,8 +853,6 @@ protected:
     // encoder output, saved for computing cross attention KV Cache
     TensorPtr mEncoderOutput;
 
-    bool mReturnLogProbs;
-
     // To enable chunked context, the FHMA paged kv-cache also needs to be enabled. Except for the last one,
     // the size of the context chunk needs to be an integer multiple of the kv-cache block size. The meaning
     // of null value is that the context is not chunked.
@@ -868,8 +878,10 @@ protected:
     std::shared_ptr<VecTokens>
         mEncoderInputTokens; // Input tokens to the encoder for enc only models and enc-dec models
 
+    SizeType32 mDecodingIter;
+
 private:
-    void initialize(VecTokens const& inputTokens)
+    void initialize(VecTokens const& inputTokens, bool outputLogProbs)
     {
         // Scatter the input tokens to other beam
         mTokens = BeamTokens(mSamplingConfig.beamWidth, inputTokens);
@@ -888,6 +900,8 @@ private:
         {
             TLLM_THROW("Draft tokens must be specified when draft logits are given.");
         }
+
+        setReturnLogProbs(outputLogProbs);
     }
 
     TensorPtr createListTensor(std::list<VecTokens> const& wordsList)

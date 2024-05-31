@@ -217,12 +217,12 @@ class TestFunctional(unittest.TestCase):
             # construct trt network
             builder = tensorrt_llm.Builder()
             net = builder.create_network()
-            net.plugin_config.set_gpt_attention_plugin(dtype)
+            net.plugin_config.gpt_attention_plugin = dtype
             net.plugin_config.set_context_fmha(context_fmha_type)
-            net.plugin_config.enable_remove_input_padding()
+            net.plugin_config.remove_input_padding = True
             net.plugin_config.enable_paged_kv_cache(tokens_per_block)
             if enable_multi_block_mmha:
-                net.plugin_config.enable_mmha_multi_block_mode()
+                net.plugin_config.multi_block_mode = True
 
             with tensorrt_llm.net_guard(net):
                 x_tensor = Tensor(name='input',

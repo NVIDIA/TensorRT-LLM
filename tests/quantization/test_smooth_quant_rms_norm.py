@@ -71,7 +71,7 @@ class TestSmoothQuantRmsNorm(unittest.TestCase):
         # construct trt network
         builder = tensorrt_llm.Builder()
         network = builder.create_network()
-        network.plugin_config.set_rmsnorm_quantization_plugin(dtype)
+        network.plugin_config.rmsnorm_quantization_plugin = dtype
         with tensorrt_llm.net_guard(network):
             x = Tensor(name='x',
                        shape=x_data.shape,

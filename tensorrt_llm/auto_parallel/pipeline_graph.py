@@ -7,12 +7,12 @@ import torch
 
 from tensorrt_llm._utils import trt_dtype_to_str, trt_dtype_to_torch
 from tensorrt_llm.logger import logger
-from tensorrt_llm.network import get_plugin_info, set_plugin_info
+from tensorrt_llm.network import Network, get_plugin_info, set_plugin_info
 from tensorrt_llm.runtime.session import Session
 
-from .utils import (get_builder_flags, get_sorted_layer_ids, get_strongly_typed,
-                    get_trt_network, set_trt_network, to_base_class_layer,
-                    to_subclass_layer)
+from .utils import (current_flags, get_builder_flags, get_sorted_layer_ids,
+                    get_strongly_typed, get_trt_network, set_trt_network,
+                    to_base_class_layer, to_subclass_layer)
 
 
 class Tensor:
@@ -683,6 +683,14 @@ class PipelineGraph:
             graph._outputs[tensor_name] = output_tensor
 
         return graph
+
+    @staticmethod
+    def from_network(network: Network, builder_config):
+        builder_flags = builder_config.trt_builder_config.flags
+        with current_flags(builder_flags, network.strongly_typed):
+            graph = PipelineGraph.from_trt(network.trt_network)
+            graph.infer_shapes(network._generate_optimization_profiles()[-1])
+            return graph
 
     def assign_shapes(self, shape_info=None, is_partial=False):
         if shape_info is None:

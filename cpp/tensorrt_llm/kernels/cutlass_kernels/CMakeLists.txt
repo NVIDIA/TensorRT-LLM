@@ -89,6 +89,7 @@ set_property(TARGET cutlass_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
 add_library(fpA_intB_gemm_src STATIC ${MIXED_SRC_CPP} ${MIXED_SRC_CU}
                                      ${MIXED_CU_INSTANTIATIONS})
+# WARNING: Building with `-G` flag may generate invalid results for this target
 add_library(moe_gemm_src STATIC ${GROUPED_SRC_CU} ${GROUPED_SRC_CPP}
                                 ${GROUPED_CU_INSTANTIATIONS})
 foreach(target_name fpA_intB_gemm_src;moe_gemm_src)

@@ -81,10 +81,10 @@ public:
     class MedusaInputs
     {
     public:
-        TensorPtr medusaPaths;               // [maxBatchSize, maxTokensPerStep, maxMedusaHeads + 1], on gpu
-        TensorPtr medusaTreeIds;             // [maxBatchSize, maxTokensPerStep], on gpu
+        TensorPtr medusaPaths;   // [maxBatchSize, maxTokensPerStep, maxMedusaHeads + 1], on gpu
+        TensorPtr medusaTreeIds; // [maxBatchSize, maxTokensPerStep], on gpu
         std::vector<std::vector<TensorPtr>>
-            medusaLogits;                    // [maxBatchSize][maxMedusaHeads][tokensPerStep, vocabSizePadded], on gpu
+            medusaLogits; // [maxBatchSize][maxAcceptedDraftTokensPerStep][maxDraftTokens + 1, vocabSizePadded], on gpu
         TensorPtr medusaCurTokensPerStep;    // [maxBatchSize], on gpu
         TensorPtr medusaTargetTokensPerStep; // [maxBatchSize], on gpu
     };

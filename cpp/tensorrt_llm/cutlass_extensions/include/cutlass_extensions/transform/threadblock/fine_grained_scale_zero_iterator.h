@@ -89,6 +89,8 @@ public:
 
     using AccessType = AlignedArray<Element, kAlignment>;
 
+    using Fragment = cutlass::Array<Element, kAlignment>;
+
     // For compatibility with existing iterator interface
     struct Params
     {

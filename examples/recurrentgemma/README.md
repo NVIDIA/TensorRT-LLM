@@ -15,8 +15,7 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 
 ## Support Matrix
   * FP16/BF16
-  * Checkpoint type: Jax, Torch, Keras, Huggingface (HF)
-  * python runtime
+  * Checkpoint type: Jax, Huggingface (HF)
 
 ## Usage
 

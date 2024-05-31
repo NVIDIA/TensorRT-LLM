@@ -26,7 +26,6 @@
 #include "tensorrt_llm/layers/topKSamplingLayer.h"
 #include "tensorrt_llm/layers/topPSamplingLayer.h"
 #include "tensorrt_llm/runtime/common.h"
-#include "tensorrt_llm/runtime/decodingMode.h"
 
 namespace tc = tensorrt_llm::common;
 
@@ -43,7 +42,7 @@ class SamplingLayer : public BaseLayer
 public:
     using Base = BaseLayer;
 
-    SamplingLayer(runtime::DecodingMode const& mode, DecoderDomain const& decoderDomain, cudaStream_t stream,
+    SamplingLayer(executor::DecodingMode const& mode, DecoderDomain const& decoderDomain, cudaStream_t stream,
         std::shared_ptr<tensorrt_llm::common::IAllocator> allocator);
 
     ~SamplingLayer() override = default;
@@ -51,7 +50,7 @@ public:
     void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 const* batchSlots,
         std::shared_ptr<BaseSetupParams> setupParams) override;
 
-    void forward(std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs) override;
+    void forwardAsync(std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs) override;
 
 private:
     using Base::mWorkspaceSize;
@@ -62,7 +61,7 @@ private:
 
     using Base::mDecoderDomain;
 
-    runtime::DecodingMode mDecodingMode;
+    executor::DecodingMode mDecodingMode;
 
     void* mSamplingWorkspaceDevice{nullptr};
     curandState_t* mCurandStatesDevice{nullptr};
@@ -72,6 +71,9 @@ private:
 
     bool* mSkipDecodeHost{nullptr};
     bool mSkipAny{false};
+
+    bool mOutputLogProbs{false};
+    bool mCumLogProbs{false};
 
     std::vector<std::unique_ptr<BaseLayer>> mSamplingLayers;
 

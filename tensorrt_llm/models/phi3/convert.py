@@ -72,7 +72,7 @@ def convert_hf_config(hf_config, dtype, **kwargs):
         'max_position_embeddings': hf_config.max_position_embeddings,
         'hidden_act': hf_config.hidden_act,
         'share_embedding_table': False,
-        'layer_norm_eps': hf_config.rms_norm_eps,
+        'norm_epsilon': hf_config.rms_norm_eps,
     }
     if hf_config.max_position_embeddings >= 128000:
         config.update({

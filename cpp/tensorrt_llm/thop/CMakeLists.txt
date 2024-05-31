@@ -20,8 +20,13 @@ target_link_libraries(th_utils PUBLIC ${TORCH_LIBRARIES} ${CUBLAS_LIB}
 
 add_library(
   th_common SHARED
-  dynamicDecodeOp.cpp weightOnlyQuantOp.cpp gatherTreeOp.cpp fp8Op.cpp
-  ncclCommunicatorOp.cpp parallelDecodeKVCacheUpdateOp.cpp)
+  dynamicDecodeOp.cpp
+  weightOnlyQuantOp.cpp
+  gatherTreeOp.cpp
+  fp8Op.cpp
+  ncclCommunicatorOp.cpp
+  parallelDecodeKVCacheUpdateOp.cpp
+  convertSpecDecodingMaskToPackedMaskOp.cpp)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(th_common PRIVATE ${TORCH_LIBRARIES} th_utils
                                         ${Python3_LIBRARIES} ${SHARED_TARGET})

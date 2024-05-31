@@ -13,15 +13,16 @@ This document shows how to build and run a [whisper model](https://github.com/op
 
 ## Overview
 
-The TensorRT-LLM Whisper example code is located in [`examples/whisper`](./). There are three main files in that folder:
+The TensorRT-LLM Whisper example code is located in [`examples/whisper`](./).
 
- * [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the Whisper model.
+ * [`convert_checkpoint.py`](./convert_checkpoint.py) to convert weights from OpenAI Whisper format to TRT-LLM format.
+ * `trtllm-build` to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the Whisper model.
  * [`run.py`](./run.py) to run the inference on a single wav file, or [a HuggingFace dataset](https://huggingface.co/datasets/librispeech_asr) [\(Librispeech test clean\)](https://www.openslr.org/12).
- * [`run_faster_whisper.py`](./run_faster_whisper.py) to do benchmark comparison with [Faster Whisper](https://github.com/SYSTRAN/faster-whisper/tree/master).
 
 ## Support Matrix
   * FP16
   * INT8 (Weight Only Quant)
+  * INT4 (Weight Only Quant)
 
 ## Usage
 
@@ -46,24 +47,59 @@ TensorRT-LLM Whisper builds TensorRT engine(s) from the pytorch checkpoint.
 # install requirements first
 pip install -r requirements.txt
 
-# Build the large-v3 model using a single GPU with plugins.
-python3 build.py --output_dir whisper_large_v3 --use_gpt_attention_plugin --use_gemm_plugin  --use_bert_attention_plugin --enable_context_fmha
+INFERENCE_PRECISION=float16
+WEIGHT_ONLY_PRECISION=int8
+MAX_BEAM_WIDTH=4
+MAX_BATCH_SIZE=8
+checkpoint_dir=whisper_large_v3_weights_${WEIGHT_ONLY_PRECISION}
+output_dir=whisper_large_v3_${WEIGHT_ONLY_PRECISION}
 
-# Build the large-v3 model using a single GPU with plugins and int8 weight-only quantization.
-python3 build.py --output_dir whisper_large_v3_weight_only --use_gpt_attention_plugin --use_gemm_plugin  --use_bert_attention_plugin --enable_context_fmha --use_weight_only
+# Convert the large-v3 model weights into TensorRT-LLM format.
+python3 convert_checkpoint.py \
+                --use_weight_only \
+                --weight_only_precision $WEIGHT_ONLY_PRECISION \
+                --output_dir $checkpoint_dir
+
+# Build the large-v3 model using trtllm-build
+trtllm-build  --checkpoint_dir ${checkpoint_dir}/encoder \
+              --output_dir ${output_dir}/encoder \
+              --paged_kv_cache disable \
+              --moe_plugin disable \
+              --enable_xqa disable \
+              --use_custom_all_reduce disable \
+              --max_batch_size ${MAX_BATCH_SIZE} \
+              --gemm_plugin disable \
+              --bert_attention_plugin ${INFERENCE_PRECISION} \
+              --remove_input_padding disable
+
+trtllm-build  --checkpoint_dir ${checkpoint_dir}/decoder \
+              --output_dir ${output_dir}/decoder \
+              --paged_kv_cache disable \
+              --moe_plugin disable \
+              --enable_xqa disable \
+              --use_custom_all_reduce disable \
+              --max_beam_width ${MAX_BEAM_WIDTH} \
+              --max_batch_size ${MAX_BATCH_SIZE} \
+              --max_output_len 100 \
+              --max_input_len 14 \
+              --max_encoder_input_len 1500 \
+              --gemm_plugin ${INFERENCE_PRECISION} \
+              --bert_attention_plugin ${INFERENCE_PRECISION} \
+              --gpt_attention_plugin ${INFERENCE_PRECISION} \
+              --remove_input_padding disable
 ```
 
 ### Run
 
 ```bash
-# choose the engine you build [./whisper_large_v3, ./whisper_large_weight_only]
-output_dir=./whisper_large_v3
+# choose the engine you build [./whisper_large_v3, ./whisper_large_v3_int8]
+output_dir=./whisper_large_v3_int8
 # decode a single audio file
 # If the input file does not have a .wav extension, ffmpeg needs to be installed with the following command:
 # apt-get update && apt-get install -y ffmpeg
 python3 run.py --name single_wav_test --engine_dir $output_dir --input_file assets/1221-135766-0002.wav
 # decode a whole dataset
-python3 run.py --engine_dir $output_dir --dataset hf-internal-testing/librispeech_asr_dummy --enable_warmup --name librispeech_dummy_large_v3_plugin
+python3 run.py --engine_dir $output_dir --dataset hf-internal-testing/librispeech_asr_dummy --enable_warmup --name librispeech_dummy_large_v3
 ```
 ### Distil-Whisper
 TensorRT-LLM also supports using [distil-whisper's](https://github.com/huggingface/distil-whisper) different models by first converting their params and weights from huggingface's naming format to [openai whisper](https://github.com/openai/whisper) naming format.
@@ -78,12 +114,55 @@ wget --directory-prefix=assets https://raw.githubusercontent.com/openai/whisper/
 # model is saved to ./assets/ by default
 python3 distil_whisper/convert_from_distil_whisper.py --model_name distil-whisper/distil-medium.en --output_name distil-medium.en
 
-# now we can build and run the model like before:
-output_dir=distil_whisper_medium_en
-python3 build.py --model_name distil-medium.en --output_dir $output_dir --use_gpt_attention_plugin --use_gemm_plugin --use_bert_attention_plugin --enable_context_fmha
+# convert whisper model weights into TensorRT-LLM
+INFERENCE_PRECISION=float16
+WEIGHT_ONLY_PRECISION=int8
+MAX_BEAM_WIDTH=4
+MAX_BATCH_SIZE=8
+checkpoint_dir=distil_whisper_medium_en_weights_${WEIGHT_ONLY_PRECISION}
+output_dir=distil_whisper_medium_en${WEIGHT_ONLY_PRECISION}
 
-python3 run.py --engine_dir $output_dir --dataset hf-internal-testing/librispeech_asr_dummy --name librispeech_dummy_${output_dir} --tokenizer_name gpt2
+python3 convert_checkpoint.py \
+                --use_weight_only \
+                --weight_only_precision $WEIGHT_ONLY_PRECISION \
+                --output_dir $checkpoint_dir \
+                --model_name distil-medium.en
 ```
+
+<details><summary> Now, we can build and run the model like before: </summary><p>
+
+```
+
+trtllm-build  --checkpoint_dir ${checkpoint_dir}/encoder \
+              --output_dir ${output_dir}/encoder \
+              --paged_kv_cache disable \
+              --moe_plugin disable \
+              --enable_xqa disable \
+              --use_custom_all_reduce disable \
+              --max_batch_size ${MAX_BATCH_SIZE} \
+              --gemm_plugin disable \
+              --bert_attention_plugin ${INFERENCE_PRECISION} \
+              --remove_input_padding disable
+
+trtllm-build  --checkpoint_dir ${checkpoint_dir}/decoder \
+              --output_dir ${output_dir}/decoder \
+              --paged_kv_cache disable \
+              --moe_plugin disable \
+              --enable_xqa disable \
+              --use_custom_all_reduce disable \
+              --max_beam_width ${MAX_BEAM_WIDTH} \
+              --max_batch_size ${MAX_BATCH_SIZE} \
+              --max_output_len 100 \
+              --max_input_len 14 \
+              --max_encoder_input_len 1500 \
+              --gemm_plugin ${INFERENCE_PRECISION} \
+              --bert_attention_plugin ${INFERENCE_PRECISION} \
+              --gpt_attention_plugin ${INFERENCE_PRECISION} \
+              --remove_input_padding disable
+
+python3 run.py --engine_dir $output_dir --dataset hf-internal-testing/librispeech_asr_dummy --name librispeech_dummy_${output_dir}
+```
+</details>
 
 ### Acknowledgment
 

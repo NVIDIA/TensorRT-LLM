@@ -44,8 +44,8 @@ FieldType parseJsonFieldOr(Json const& json, std::string_view name, FieldType de
     }
     catch (nlohmann::json::out_of_range& e)
     {
-        TLLM_LOG_WARNING("Parameter %s cannot be read from json:", std::string(name).c_str());
-        TLLM_LOG_WARNING(e.what());
+        TLLM_LOG_INFO("Parameter %s cannot be read from json:", std::string(name).c_str());
+        TLLM_LOG_INFO(e.what());
     }
     return value;
 }
@@ -60,13 +60,13 @@ std::optional<FieldType> parseJsonFieldOptional(Json const& json, std::string_vi
     }
     catch (nlohmann::json::out_of_range const& e)
     {
-        TLLM_LOG_WARNING(e.what());
-        TLLM_LOG_WARNING("Optional value for parameter %s will not be set.", std::string(name).c_str());
+        TLLM_LOG_INFO(e.what());
+        TLLM_LOG_INFO("Optional value for parameter %s will not be set.", std::string(name).c_str());
     }
     catch (nlohmann::json::type_error const& e)
     {
-        TLLM_LOG_WARNING(e.what());
-        TLLM_LOG_WARNING("Optional value for parameter %s will not be set.", std::string(name).c_str());
+        TLLM_LOG_INFO(e.what());
+        TLLM_LOG_INFO("Optional value for parameter %s will not be set.", std::string(name).c_str());
     }
     return value;
 }
@@ -170,6 +170,8 @@ void parseBuilderConfig(ModelConfig& modelConfig, Json const& builderConfig)
         = parseJsonFieldOr<SizeType32>(builderConfig, "max_prompt_embedding_table_size", 0);
     auto const computeContextLogits = parseJsonFieldOr(builderConfig, "gather_context_logits", false);
     auto const computeGenerationLogits = parseJsonFieldOr(builderConfig, "gather_generation_logits", false);
+    auto const speculativeDecodingModeOpt
+        = parseJsonFieldOptional<SpeculativeDecodingMode::UnderlyingType>(builderConfig, "speculative_decoding_mode");
 
     modelConfig.setMaxBatchSize(maxBatchSize);
     modelConfig.setMaxBeamWidth(maxBeamWidth);
@@ -180,6 +182,9 @@ void parseBuilderConfig(ModelConfig& modelConfig, Json const& builderConfig)
     modelConfig.setMaxPromptEmbeddingTableSize(maxPromptEmbeddingTableSize);
     modelConfig.computeContextLogits(computeContextLogits);
     modelConfig.computeGenerationLogits(computeGenerationLogits);
+    modelConfig.setSpeculativeDecodingMode(speculativeDecodingModeOpt.has_value()
+            ? SpeculativeDecodingMode(speculativeDecodingModeOpt.value())
+            : SpeculativeDecodingMode::None());
 }
 
 void parsePluginConfig(ModelConfig& modelConfig, Json const& pluginConfig)
@@ -333,19 +338,38 @@ GptJsonConfig parseJson(InputType&& input)
         }
     }
 
+    // Speculative decoding module
     if (!engineVersionNone)
     {
-        auto const& pretrainedConfig = json.at("pretrained_config");
-        auto const medusaHeads = parseJsonFieldOptional<SizeType32>(pretrainedConfig, "num_medusa_heads");
-        auto const maxDraftLen = parseJsonFieldOptional<SizeType32>(pretrainedConfig, "max_draft_len");
-        TLLM_CHECK_WITH_INFO((medusaHeads.has_value() ^ maxDraftLen.has_value()) == 0,
-            "Either both num_medusa_heads and max_draft_len or none have to be provided");
-        if (medusaHeads.has_value() && medusaHeads.value() > 0)
+        SizeType32 maxDraftLen{0};
+        if (modelConfig.getSpeculativeDecodingMode().isMedusa())
         {
-            modelConfig.setMaxDraftLen(maxDraftLen.value());
-            auto medusaModule = MedusaModule(medusaHeads.value(), maxDraftLen.value());
-            modelConfig.setMedusaModule(medusaModule);
+            auto const& pretrainedConfig = json.at("pretrained_config");
+            maxDraftLen = parseJsonFieldOr(pretrainedConfig, "max_draft_len", 0);
+            auto const medusaHeads = parseJsonFieldOptional<SizeType32>(pretrainedConfig, "num_medusa_heads");
+            TLLM_CHECK_WITH_INFO(medusaHeads.has_value() && maxDraftLen > 0,
+                "Both num_medusa_heads and max_draft_len have to be provided for Medusa model");
+
+            auto medusaModule = std::make_shared<MedusaModule>(medusaHeads.value(), maxDraftLen);
+            modelConfig.setSpeculativeDecodingModule(medusaModule);
         }
+        else
+        {
+            maxDraftLen = parseJsonFieldOr(builderConfig, "max_draft_len", 0);
+            if (modelConfig.getSpeculativeDecodingMode().isLookaheadDecoding())
+            {
+                TLLM_CHECK_WITH_INFO(
+                    maxDraftLen > 0, "max_draft_len has to be larger than 0 for Lookahead decoding model");
+                auto lookaheadDecodingModule = std::make_shared<LookaheadModule>(maxDraftLen, maxDraftLen);
+                modelConfig.setSpeculativeDecodingModule(lookaheadDecodingModule);
+            }
+            else if (modelConfig.getSpeculativeDecodingMode().isDraftTokensExternal())
+            {
+                TLLM_CHECK_WITH_INFO(
+                    maxDraftLen, "max_draft_len has to be larger than 0 for decoding with external draft tokens");
+            }
+        }
+        modelConfig.setMaxDraftLen(maxDraftLen);
     }
 
     // RNN config

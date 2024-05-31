@@ -15,6 +15,7 @@ We first describe how to run each model on a single GPU. We then provide general
 - [Kosmos-2](#kosmos-2)
 - [LLaVA and VILA](#llava-and-vila)
 - [Neva](#neva)
+- [Video NeVA](#video-neva)
 - [Nougat](#nougat)
 - [Enabling tensor parallelism for multi-GPU](#enabling-tensor-parallelism-for-multi-gpu)
 
@@ -137,7 +138,7 @@ OPT pipeline needs few minor changes from T5 pipeline
         --input_text "Question: which city is this? Answer:" \
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
         --visual_engine_dir visual_engines/${MODEL_NAME} \
-        --llm_engine_dir trt_engines/${MODEL_NAME}/fp16/1-gpu \
+        --llm_engine_dir trt_engines/${MODEL_NAME}/fp16/1-gpu
     ```
 
 4. INT8/INT4 weight-only quantization for OPT can be enabled using commands as follows (take `INT4` as an example, while `INT8` is the default precision for weight-only quantization):
@@ -385,19 +386,16 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
     For VILA, we need a few more steps until it is added to HF model zoo
 
     ```bash
+        # install the following dependency
+        pip install -r requirements-vila.txt
+
         # clone original VILA repo
         export VILA_PATH="tmp/hf_models/VILA"
         git clone https://github.com/Efficient-Large-Model/VILA.git ${VILA_PATH}
 
         # download VILA checkpoints
-        export MODEL_NAME="vila-7B" # also vila-2.7B, vila-13B
+        export MODEL_NAME="vila1.5-3b"
         git clone https://huggingface.co/Efficient-Large-Model/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
-
-        # turn off delay_load to allow model component access
-        sed -i 's/delay_load=True/delay_load=False/g' ${VILA_PATH}/llava/model/llava_arch.py
-        # line manipulation to enable AWQ. otherwise need to replace HF's llama implementation
-        sed -i '/vision_tower = self.get_vision_tower()/a \        attention_mask = torch.ones_like(input_ids, dtype=torch.bool)' ${VILA_PATH}/llava/model/llava_arch.py
-        sed -i 's/seqlens_in_batch=sorted_seqlens_in_batch/#seqlens_in_batch=sorted_seqlens_in_batch/g' ${VILA_PATH}/llava/model/language_model/llava_llama.py
     ```
 
 2. Generate TRT-LLM engine for LLaMA following example in `examples/llama/README.md`
@@ -416,7 +414,17 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
         --max_batch_size 1 \
         --max_input_len 2048 \
         --max_output_len 512 \
-        --max_multimodal_len 576 # 1 (max_batch_size) * 576 (num_visual_features)
+        --max_multimodal_len 576 # 1 (max_batch_size) * 576 (num_visual_features) for LLaVA
+
+    trtllm-build \
+        --checkpoint_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu \
+        --output_dir trt_engines/${MODEL_NAME}/fp16/1-gpu \
+        --gemm_plugin float16 \
+        --use_fused_mlp \
+        --max_batch_size 1 \
+        --max_input_len 2048 \
+        --max_output_len 512 \
+        --max_multimodal_len 4096 # 1 (max_batch_size) * 4096 (num_visual_features) for VILA
     ```
 
     Note: do not use `--use_fused_mlp` flag in quantization mode.
@@ -425,6 +433,7 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
 
     ```bash
     python build_visual_engine.py --model_path tmp/hf_models/${MODEL_NAME} --model_type llava # for LLaVA
+
     python build_visual_engine.py --model_path tmp/hf_models/${MODEL_NAME} --model_type vila --vila_path ${VILA_PATH} # for VILA
     ```
 
@@ -434,8 +443,36 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
         --visual_engine_dir visual_engines/${MODEL_NAME} \
         --llm_engine_dir trt_engines/${MODEL_NAME}/fp16/1-gpu \
-        --input_text "Question: which city is this? Answer:" # or "Please describe the traffic condition." for VILA
+        --input_text "Question: which city is this? Answer:" # for LLaVA
     ```
+
+    For VILA, you can use either local file or web url as input images.
+    Suppose you have a local image `av.png` downloaded from `https://github.com/Efficient-Large-Model/VILA/blob/main/demo_trt_llm/av.png` and the url of `merlion.png`
+    ```bash
+    wget -O av.png https://raw.githubusercontent.com/Efficient-Large-Model/VILA/main/demo_trt_llm/av.png
+
+    python run.py  \
+        --max_new_tokens 100 \
+        --hf_model_dir tmp/hf_models/${MODEL_NAME} \
+        --visual_engine_dir visual_engines/${MODEL_NAME} \
+        --llm_engine_dir trt_engines/${MODEL_NAME}/fp16/1-gpu \
+        --image_path=av.png,https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png \
+        --input_text="<image>\n<image>\n Please elaborate what you see in the images?" \
+        --batch_size=1 # for VILA mode 1
+
+    python run.py  \
+        --max_new_tokens 100 \
+        --hf_model_dir tmp/hf_models/${MODEL_NAME} \
+        --visual_engine_dir visual_engines/${MODEL_NAME} \
+        --llm_engine_dir trt_engines/${MODEL_NAME}/fp16/1-gpu \
+        --image_path=av.png,https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png \
+        --input_text="<image>\n Please elaborate what you see in the images?" \
+        --batch_size=2 # for VILA mode 2
+    ```
+
+    Note that VILA can support different modes in terms of batching:
+    - Mode 1: if you want to query N images as a whole using a prompt, `--batch_size=1` should be used (which is the default value). Example is given above.
+    - Mode 2: if you want to query N images individually using the same prompt (replicated), `--batch_size=N` should be used. Don't forget to set the `--max_batch_size` and `--max_multimodal_len` during engine building.
 
     Note: use `--run_profiling` for performance measurement, use `--check_accuracy` for accuracy check.
 
@@ -455,7 +492,17 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
         --max_batch_size 1 \
         --max_input_len 1024 \
         --max_output_len 100 \
-        --max_multimodal_len 576
+        --max_multimodal_len 576 # for LLaVA
+
+    trtllm-build \
+        --checkpoint_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu \
+        --output_dir trt_engines/${MODEL_NAME}/fp16/1-gpu \
+        --gemm_plugin float16 \
+        --use_fused_mlp \
+        --max_batch_size 1 \
+        --max_input_len 1024 \
+        --max_output_len 100 \
+        --max_multimodal_len 4096 # for VILA
     ```
 
     The built engines lie in `trt_engines/${MODEL_NAME}/int4_weightonly/1-gpu`.
@@ -482,7 +529,16 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
         --max_batch_size 1 \
         --max_input_len 1024 \
         --max_output_len 100 \
-        --max_multimodal_len 576
+        --max_multimodal_len 576 # for LLaVA
+
+    trtllm-build \
+        --checkpoint_dir tmp/trt_models/${MODEL_NAME}/int4_awq/1-gpu \
+        --output_dir trt_engines/${MODEL_NAME}/int4_awq/1-gpu \
+        --gemm_plugin float16 \
+        --max_batch_size 1 \
+        --max_input_len 2048 \
+        --max_output_len 512 \
+        --max_multimodal_len 4096 # for VILA
    ```
 
 ## NeVA
@@ -536,7 +592,51 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
 
     Note: use `--run_profiling` for performance measurement, use `--check_accuracy` for accuracy check.
 
+## Video NeVA
 
+[Video NeVA](https://github.com/NVIDIA/NeMo/blob/main/docs/source/multimodal/mllm/video_neva.rst) is a groundbreaking addition to the NeMo Multimodal ecosystem that could work with video modality. This model seamlessly integrates large language-centric models with a vision encoder, that can be deployed in TensorRT-LLM.
+
+1. Generate TRT-LLM engine for Nemotron model following example in `examples/nemotron/README.md`. To adhere to the NVGPT conventions of the conversion script. This will be used as our base LM for inference.
+
+    ```bash
+    pip install decord # used for loading video
+
+    python3 ../quantization/quantize.py \
+        --nemo_ckpt_path /path/to/nemotron/model.nemo \
+        --dtype bfloat16 \
+        --batch_size 64 \
+        --qformat full_prec \
+        --output_dir nemotron-3/trt_ckpt/bf16/1-gpu
+
+
+    trtllm-build \
+        --checkpoint_dir nemotron-3/trt_ckpt/bf16/1-gpu \
+        --output_dir trt_engines/nemotron-3/bf16/1-gpu \
+        --gpt_attention_plugin bfloat16 \
+        --gemm_plugin bfloat16 \
+        --max_batch_size 1 \
+        --max_input_len 4096 \
+        --max_output_len 256 \
+        --max_multimodal_len 3072 # 1 (max_batch_size) * (12 num_frames) * (256 image_token_len)
+    ```
+
+2. Build TensorRT engines for visual components
+
+    ```bash
+    python build_visual_engine.py --model_path /path/to/video/neva/projector.nemo --model_type video-neva
+    ```
+
+    ```bash
+    python run.py \
+        --max_new_tokens 30 \
+        --hf_model_dir nemotron-3/trt_ckpt/bf16/1-gpu \
+        --visual_engine_dir visual_engines/video_neva_engine \
+        --llm_engine_dir trt_engines/nemotron-3/bf16/1-gpu \
+        --input_text "Question: what is in the video? Answer:" \
+        --video_path /path/to/your/local/video/file
+    ```
+
+    Note: use `--run_profiling` for performance measurement, use `--check_accuracy` for accuracy check.
 
 ## Nougat
 

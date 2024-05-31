@@ -55,23 +55,23 @@ std::optional<int32_t> envXqaNbCtaPerKVHead()
     return ret;
 }
 
-bool getEnvDisableXQAJIT()
+bool getEnvEnableXQAJIT()
 {
     static bool init = false;
-    static bool disableXQAJIT = false;
+    static bool enableXQAJIT = false;
     if (!init)
     {
         init = true;
-        char const* disable_xqa_jit_var = std::getenv("TRTLLM_DISABLE_XQA_JIT");
-        if (disable_xqa_jit_var)
+        char const* enable_xqa_jit_var = std::getenv("TRTLLM_ENABLE_XQA_JIT");
+        if (enable_xqa_jit_var)
         {
-            if (disable_xqa_jit_var[0] == '1' && disable_xqa_jit_var[1] == '\0')
+            if (enable_xqa_jit_var[0] == '1' && enable_xqa_jit_var[1] == '\0')
             {
-                disableXQAJIT = true;
+                enableXQAJIT = true;
             }
         }
     }
-    return disableXQAJIT;
+    return enableXQAJIT;
 }
 
 // Tune the number of blocks per sequence for accuracy/performance purpose.

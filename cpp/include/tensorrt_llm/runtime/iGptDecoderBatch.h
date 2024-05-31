@@ -44,8 +44,6 @@ public:
         , inputLen(inputLen)
         , maxNewTokens{maxNewTokens}
         , endId{endId}
-        , computeCumLogProbs(false)
-        , computeLogProbs(false)
         , generatedTokensPerEngineStep(1)
     {
     }
@@ -64,11 +62,9 @@ public:
     TensorPtr badWordsList;  // [2, badWordsLength], on gpu
     TensorPtr stopWordsList; // [2, stopWordsLength], on gpu
 
-    bool computeCumLogProbs; // boolean that controls if cumLogProbs should be computed for that request
-    bool computeLogProbs;    // boolean that controls if cumLogProbs should be computed for that request
     SizeType32 generatedTokensPerEngineStep;
-    TensorPtr medusaPaths;   // [tokensPerStep, medusaHeads + 1], on gpu
-    TensorPtr medusaTreeIds; // [tokensPerStep], on gpu
+    TensorPtr medusaPaths;   // [maxDraftTokens + 1, maxAcceptedDraftTokensPerStep + 1], on gpu
+    TensorPtr medusaTreeIds; // [maxDraftTokens + 1], on gpu
 };
 
 class Input
@@ -112,7 +108,7 @@ public:
     TensorConstPtr cacheIndirection; // [batchSize, maxBeamWidth, maxSeqLen] - indices into KV cache of different rays
                                      // within one beam for beam search, on gpu
     std::vector<std::vector<TensorConstPtr>>
-        medusaLogits;                // [maxBatchSize][maxNumHeads][tokensPerStep, vocabSizePadded]
+        predictedDraftLogits; // [maxBatchSize][maxAcceptedDraftTokensPerStep][maxDraftTokens + 1, vocabSizePadded]
 };
 
 using Output = decoder::Output;
@@ -141,6 +137,11 @@ public:
 
     //! @brief Run one step for all requests without blocking the host process and return the token for synchronization.
     virtual TokenPtr forwardAsync(decoder_batch::Output& output, decoder_batch::Input const& input) = 0;
+
+    //! @brief Call decoder forwardSync and wait for the call to `forwardAsync` associated with a token to complete.
+    virtual void forwardSync(
+        decoder_batch::Token const& token, decoder_batch::Output& output, decoder_batch::Input const& input)
+        = 0;
 
     //! @brief Wait for the call to `forwardAsync` associated with a token to complete.
     virtual void forwardSync(decoder_batch::Token const& token) = 0;
@@ -188,10 +189,10 @@ public:
     virtual TensorPtr getNextDraftTokens() const = 0;
 
     //! @returns [batchSize + 1], exclusive sum of accepted draft token lengths, on gpu
-    virtual TensorPtr getMedusaAcceptedLengthsCumSum() const = 0;
+    virtual TensorPtr getSpecDecodingAcceptedLengthsCumSum() const = 0;
 
-    //! @returns [batchSize * maxMedusaHeads], accepted paths packed into continuous tensor, on gpu
-    virtual TensorPtr getMedusaAcceptedPackedPaths() const = 0;
+    //! @returns [batchSize, maxAcceptedDraftTokensPerStep], accepted paths packed into continuous tensor, on gpu
+    virtual TensorPtr getSpecDecodingAcceptedPackedPaths() const = 0;
 
 protected:
     IGptDecoderBatch() = default;

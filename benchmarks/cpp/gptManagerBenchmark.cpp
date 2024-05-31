@@ -906,7 +906,7 @@ public:
             [this](uint64_t requestId, std::list<NamedTensor> const& response_tensors, bool final_response,
                 std::string const& errMsg)
             { return sendResponse(requestId, response_tensors, final_response, errMsg); },
-            nullptr, iterationDataCallback, optionalParams, terminateReqId, std::nullopt, excludeInputInOutput);
+            nullptr, iterationDataCallback, optionalParams, terminateReqId, excludeInputInOutput);
     }
 
     ~GptServer()
