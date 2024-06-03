@@ -216,7 +216,7 @@ def smooth_quantize_plugin(model, quant_mode):
         elif isinstance(layer.mlp, MLP):
             mlp_norm_cls = SmoothQuantMLP
 
-        mlp_hidden_size = config.hidden_size * 4 if config.intermediate_size is None else config.intermediate_size
+        mlp_hidden_size = layer.mlp.ffn_hidden_size
         layer.mlp = mlp_norm_cls(hidden_size=config.hidden_size,
                                  ffn_hidden_size=mlp_hidden_size,
                                  hidden_act=config.hidden_act,
