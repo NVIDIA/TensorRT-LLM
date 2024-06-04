@@ -16,6 +16,7 @@
  */
 
 #pragma once
+#include "tensorrt_llm/common/cudaFp8Utils.h"
 #include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm_configs.h"
 #include <cuda_runtime_api.h>
@@ -161,11 +162,11 @@ public:
 
     void moeGemmBiasAct(T const* A, WeightType const* B, T const* weight_scales, T const* biases, T* C,
         int64_t* total_rows_before_expert, HopperGroupedGemmInput layout_info, int64_t total_rows, int64_t gemm_n,
-        int64_t gemm_k, int num_experts, ActivationType activation_type, cudaStream_t stream);
+        int64_t gemm_k, int num_experts, ActivationType activation_type, bool use_fused_moe, cudaStream_t stream);
 
     void moeGemm(T const* A, WeightType const* B, T const* weight_scales, T* C, int64_t* total_rows_before_expert,
         HopperGroupedGemmInput layout_info, int64_t total_rows, int64_t gemm_n, int64_t gemm_k, int num_experts,
-        cudaStream_t stream);
+        bool use_fused_moe, cudaStream_t stream);
 
     std::vector<cutlass_extensions::CutlassGemmConfig> getConfigs() const;
     static std::vector<cutlass_extensions::CutlassGemmConfig> getConfigs(int sm);
@@ -174,20 +175,23 @@ public:
 
     bool isHopperSpecialised() const;
     bool supportsHopperSpecialisation() const;
+    [[nodiscard]] bool isFusedGatedActivation(bool is_gated_activation, int gemm_n, int gemm_k) const;
 
     size_t calcMaxWorkspaceSize(int num_experts) const;
+
+    [[nodiscard]] int getSM() const;
 
 private:
     template <typename EpilogueTag>
     void dispatchToArch(T const* A, WeightType const* B, T const* weight_scales, T const* biases, T* C,
         int64_t* total_rows_before_expert, HopperGroupedGemmInput layout_info, int64_t total_rows, int64_t gemm_n,
-        int64_t gemm_k, int num_experts, cutlass_extensions::CutlassGemmConfig gemm_config, cudaStream_t stream,
-        int* occupancy = nullptr);
+        int64_t gemm_k, int num_experts, cutlass_extensions::CutlassGemmConfig gemm_config, bool use_fused_moe,
+        cudaStream_t stream, int* occupancy = nullptr);
 
     template <typename EpilogueTag>
     void runGemm(T const* A, WeightType const* B, T const* weight_scales, T const* biases, T* C,
         int64_t* total_rows_before_expert, HopperGroupedGemmInput layout_info, int64_t total_rows, int64_t gemm_n,
-        int64_t gemm_k, int num_experts, cudaStream_t stream);
+        int64_t gemm_k, int num_experts, bool use_fused_moe, cudaStream_t stream);
 
 private:
     int sm_;

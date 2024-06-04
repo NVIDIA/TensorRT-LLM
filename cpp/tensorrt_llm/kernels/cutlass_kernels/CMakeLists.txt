@@ -73,6 +73,8 @@ file(GLOB_RECURSE SRC_CU *.cu)
 set(ALL_SRCS ${SRC_CPP};${SRC_CU})
 list(FILTER ALL_SRCS EXCLUDE REGEX "fpA_intB_gemm/.*")
 list(FILTER ALL_SRCS EXCLUDE REGEX "moe_gemm/.*")
+list(REMOVE_ITEM ALL_SRCS
+     "${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/gemm_swiglu_e4m3.cu")
 
 message(
   STATUS
@@ -92,7 +94,11 @@ add_library(fpA_intB_gemm_src STATIC ${MIXED_SRC_CPP} ${MIXED_SRC_CU}
 # WARNING: Building with `-G` flag may generate invalid results for this target
 add_library(moe_gemm_src STATIC ${GROUPED_SRC_CU} ${GROUPED_SRC_CPP}
                                 ${GROUPED_CU_INSTANTIATIONS})
-foreach(target_name fpA_intB_gemm_src;moe_gemm_src)
+
+set(GEMM_SWIGLU_SM90_SRC_CU
+    ${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/gemm_swiglu_e4m3.cu)
+add_library(gemm_swiglu_sm90_src STATIC ${GEMM_SWIGLU_SM90_SRC_CU})
+foreach(target_name fpA_intB_gemm_src;moe_gemm_src;gemm_swiglu_sm90_src)
   set_property(TARGET ${target_name} PROPERTY POSITION_INDEPENDENT_CODE ON)
   set_property(TARGET ${target_name} PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
@@ -100,8 +106,8 @@ foreach(target_name fpA_intB_gemm_src;moe_gemm_src)
   # specified). This is because sm_90a has arch conditional instructions that
   # are not forward compatible. As a result, it does not make sense to embed PTX
   # into the binary anyway.
-  if("9.0" IN_LIST TORCH_CUDA_ARCH_LIST
-     OR "9.0+PTX" IN_LIST TORCH_CUDA_ARCH_LIST
+  if("90" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
+     OR "90-real" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
      OR "90-real" IN_LIST CMAKE_CUDA_ARCHITECTURES_NATIVE)
 
     message(STATUS "MANUALLY APPENDING FLAG TO COMPILE FOR SM_90a.")

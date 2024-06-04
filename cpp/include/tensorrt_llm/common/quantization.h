@@ -16,8 +16,9 @@
 
 #pragma once
 
-#include "stdlib.h"
-#include "tensor.h"
+#include <cstdint>
+#include <optional>
+#include <string>
 
 namespace tensorrt_llm
 {

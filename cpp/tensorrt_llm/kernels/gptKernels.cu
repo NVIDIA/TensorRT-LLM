@@ -189,7 +189,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
 
 template <typename AttentionMaskDataType>
 __global__ void computeAttentionMask(AttentionMaskDataType* attentionMask, int const* seqLengths, int maxQSeqLength,
-    int attentionWindowSize, AttentionMaskType attentionMaskType)
+    int attentionWindowSize, AttentionMaskType attentionMaskType, BlockSparseParams blockSparseParams)
 {
     // The index of the sequence in the batch.
     int batchIdx = blockIdx.y;
@@ -264,6 +264,9 @@ __global__ void computeAttentionMask(AttentionMaskDataType* attentionMask, int c
             // 1 1 1 1 0
             // 1 1 1 1 1
             break;
+        case AttentionMaskType::BLOCKSPARSE:
+            isValid = blockSparseParams.computeMask(rowIdx, colIdx, seqLength, 1 /*num_heads*/, 0 /*head_id*/);
+            break;
         }
 
         // Store the mask.
@@ -313,7 +316,7 @@ void invokeBuildDecoderInfo(BuildDecoderInfoParams<T> const& params, cudaStream_
         }
         dim3 grid(blocksPerSeq, params.batchSize);
         computeAttentionMask<<<grid, THREADS_PER_BLOCK, 0, stream>>>(params.attentionMask, params.seqQLengths,
-            params.maxQSeqLength, params.attentionWindowSize, params.attentionMaskType);
+            params.maxQSeqLength, params.attentionWindowSize, params.attentionMaskType, params.blockSparseParams);
     }
 }
 

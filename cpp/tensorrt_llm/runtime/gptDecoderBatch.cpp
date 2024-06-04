@@ -54,6 +54,7 @@ SamplingConfig extractSamplingConfig(SamplingConfig const& batchSamplingConfig, 
     extractOptional(samplingConfig.repetitionPenalty, batchSamplingConfig.repetitionPenalty);
     extractOptional(samplingConfig.presencePenalty, batchSamplingConfig.presencePenalty);
     extractOptional(samplingConfig.frequencyPenalty, batchSamplingConfig.frequencyPenalty);
+    extractOptional(samplingConfig.noRepeatNgramSize, batchSamplingConfig.noRepeatNgramSize);
     // sampling layers
     extractOptional(samplingConfig.topK, batchSamplingConfig.topK);
     extractOptional(samplingConfig.topP, batchSamplingConfig.topP);

@@ -31,7 +31,14 @@ public:
     Executor(
         std::filesystem::path const& modelPath, tle::ModelType modelType, tle::ExecutorConfig const& executorConfig);
 
+    Executor(std::filesystem::path const& encoderModelPath, std::filesystem::path const& decoderModelPath,
+        tle::ModelType modelType, tle::ExecutorConfig const& executorConfig);
+
     Executor(std::string const& engineBuffer, std::string const& jsonConfigStr, tle::ModelType modelType,
+        tle::ExecutorConfig const& executorConfig);
+
+    Executor(std::string const& encoderEngineBuffer, std::string const& encoderJsonConfigStr,
+        std::string const& decoderEngineBuffer, std::string const& decoderJsonConfigStr, tle::ModelType modelType,
         tle::ExecutorConfig const& executorConfig);
 
     pybind11::object enter();

@@ -202,6 +202,10 @@ def iterate_shard_files(model_dir: Union[Path, str],
         yield shard_file
 
 
+def has_safetensors(model_dir: str):
+    return len(list(Path(model_dir).glob('*.safetensors'))) > 0
+
+
 DEFAULT_HF_DATASET_META = {
     'ccdv/cnn_dailymail': ('3.0.0', 'train', 'article'),
     'cnn_dailymail': ('3.0.0', 'train', 'article'),

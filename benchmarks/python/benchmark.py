@@ -198,10 +198,6 @@ def parse_arguments():
         help=
         'Quick sanity check with num_layer=1; will be silently ignored if --engine_dir is specified.'
     )
-    parser.add_argument('--strongly_typed',
-                        default=False,
-                        action='store_true',
-                        help='This option will reduce the building time.')
     parser.add_argument(
         '--gpu_weights_percent',
         type=str,

@@ -58,7 +58,10 @@ from transformers import (AutoModel, AutoModelForCausalLM,
 from utils import load_tokenizer, read_model_name
 
 import tensorrt_llm
-from tensorrt_llm.runtime import ModelRunner
+from tensorrt_llm.runtime import PYTHON_BINDINGS, ModelRunner
+
+if PYTHON_BINDINGS:
+    from tensorrt_llm.runtime import ModelRunnerCpp
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -281,7 +284,8 @@ class Pipeline:
                                                   top_k=top_k)
                     output_ids = outputs[0, input_lengths[0]:]
 
-            elif isinstance(self.model, ModelRunner):
+            elif isinstance(self.model, ModelRunnerCpp) or isinstance(
+                    self.model, ModelRunner):
                 outputs = self.model.generate(
                     batch_input_ids,
                     max_new_tokens=output_len,
@@ -389,9 +393,11 @@ def main():
 
     if args.test_trt_llm:
         assert not args.test_hf, "Cannot test both TRT-LLM and HF"
-        model = ModelRunner.from_dir(args.engine_dir,
-                                     rank=runtime_rank,
-                                     debug_mode=args.debug_mode)
+        runner_cls = ModelRunner if (args.debug_mode
+                                     or not PYTHON_BINDINGS) else ModelRunnerCpp
+        model = runner_cls.from_dir(args.engine_dir,
+                                    rank=runtime_rank,
+                                    debug_mode=args.debug_mode)
     else:
         assert args.test_hf, "Must test either TRT-LLM or HF"
         if model_name == 'ChatGLMForCausalLM' and model_version == 'glm':

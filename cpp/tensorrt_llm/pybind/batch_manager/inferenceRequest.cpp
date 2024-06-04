@@ -146,6 +146,8 @@ void InferenceRequest::initBindings(py::module_& m)
         .def_property("lora_weights", &InferenceRequest::getLoraWeightsUnchecked, &InferenceRequest::setLoraWeights)
         .def_property("lora_config", &InferenceRequest::getLoraConfigUnchecked, &InferenceRequest::setLoraConfig)
         .def_property("is_streaming", &InferenceRequest::isStreaming, &InferenceRequest::setIsStreaming)
+        .def_property("no_repeat_ngram_size", &InferenceRequest::getNoRepeatNgramSizeUnchecked,
+            &InferenceRequest::setNoRepeatNgramSize)
         .def_property_readonly("request_id", &InferenceRequest::getRequestId)
         .def(py::pickle(
             [](InferenceRequest const& p) { // __getstate__

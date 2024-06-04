@@ -24,6 +24,7 @@ Optional tensors that can be supplied to `InferenceRequest` are shown below. Def
 | `min_length` | [1] | `int32_t` | Sampling Config param: `minLength` |
 | `presence_penalty` | [1] | `float` | Sampling Config param: `presencePenalty` |
 | `frequency_penalty` | [1] | `float` | Sampling Config param: `frequencyPenalty` |
+| `no_repeat_ngram_size` | [1] | `int32_t` | Sampling Config param: `noRepeatNgramSize` |
 | `random_seed` | [1] | `uint64_t` | Sampling Config param: `randomSeed` |
 | `end_id` | [1] | `int32_t` | End token Id. If not specified, defaults to -1 |
 | `pad_id` | [1] | `int32_t` | Pad token Id |

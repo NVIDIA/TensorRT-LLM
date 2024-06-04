@@ -211,7 +211,6 @@ python ../quantization/quantize.py --model_dir /llm-models/llama-models-v2/llama
 trtllm-build --checkpoint_dir ./llama2-70b-hf-fp8-tp2 \
                 --output_dir engines/llama2-70b-hf-fp8-tp2 \
                 --gemm_plugin float16 \
-                --strongly_typed \
                 --workers 2
 ```
 

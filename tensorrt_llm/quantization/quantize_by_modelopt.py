@@ -122,6 +122,7 @@ MODEL_NAME_PATTERN_MAP = {
     "Gemma": "gemma",
     "MixtralForCausalLM": "llama",
     "ArcticForCausalLM": "llama",
+    "Phi3SmallForCausalLM": "phi",
 }
 
 
@@ -408,8 +409,27 @@ def quantize_and_export(*, model_dir, calib_dataset, dtype, qformat,
             qwen_config = AutoConfig.from_pretrained(model_dir,
                                                      trust_remote_code=True)
             tensorrt_llm_config["qwen_type"] = qwen_config.model_type
+            if qwen_config.model_type == "qwen2":
+                tensorrt_llm_config["norm_epsilon"] = qwen_config.rms_norm_eps
+                tensorrt_llm_config["rotary_base"] = qwen_config.rope_theta
             tensorrt_llm_config[
                 "intermediate_size"] = qwen_config.intermediate_size
+            with open(f"{export_path}/config.json", "w") as f:
+                json.dump(tensorrt_llm_config, f, indent=4)
+
+        if model_type == 'phi':
+            with open(f"{export_path}/config.json", "r") as f:
+                tensorrt_llm_config = json.load(f)
+            phi_config = AutoConfig.from_pretrained(model_dir,
+                                                    trust_remote_code=True)
+
+            from ..models.phi3.phi3small.convert import \
+                convert_hf_config as phi_config_converter
+            phi_config = phi_config_converter(phi_config, dtype, None)
+
+            for key, value in phi_config.items():
+                tensorrt_llm_config[key] = value
+
             with open(f"{export_path}/config.json", "w") as f:
                 json.dump(tensorrt_llm_config, f, indent=4)
 

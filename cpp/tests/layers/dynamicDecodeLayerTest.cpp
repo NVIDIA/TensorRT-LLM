@@ -26,7 +26,6 @@ namespace tensorrt_llm::tests::layers::sampling
 // - finished states
 // - finished sum
 // - max length
-// - repeat n grams
 // - padded vocab
 // - beam search
 
@@ -117,9 +116,13 @@ void DynamicDecodeLayerTest<T>::SetUp()
 }
 
 template <typename T>
-void DynamicDecodeLayerTest<T>::allocateData(TestSamplingParams const& params)
+void DynamicDecodeLayerTest<T>::allocateData(TestSamplingParams const& params, TokenIdType endId)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    mEndId = endId == -1 ? mVocabSize - 1 : endId;
+    mUseMedusa = params.useMedusa;
+    mMaxTokensPerStep = mUseMedusa ? mMaxOutputLen - mMaxInputLen : 1;
 
     auto const decodingMode = params.decodingMode.value_or(
         [this]()
@@ -357,6 +360,9 @@ void DynamicDecodeLayerTest<T>::setup(uint64_t seed, TestSamplingParams const& p
     setupParams->samplingParams.normalize_log_probs = {false};
     setupParams->samplingParams.outputLogProbs = {true};
     setupParams->samplingParams.cumLogProbs = {true};
+    setupParams->penaltyParams.noRepeatNgramSize = params.repeatNGramSizes.size()
+        ? std::make_optional<std::vector<SizeType32>>(params.repeatNGramSizes)
+        : std::nullopt;
 
     setupParams->medusaParams.topKMedusaHeads = params.topKMedusaHeads;
 
@@ -500,7 +506,7 @@ std::shared_ptr<DynamicDecodeInputParams> DynamicDecodeLayerTest<T>::createInput
     // std::optional<tc::Tensor> src_cache_indirection;
     // std::optional<tc::Tensor> sequence_limit_length;
     // std::optional<tc::Tensor> input_lengths;
-    // std::optional<tc::Tensor> no_repeat_ngram_size;
+    // std::optional<tc::Tensor> no_repeat_ngram_size; has move to sampling config
     // std::optional<std::vector<tc::Tensor>> logits_vec;
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -645,12 +651,6 @@ void DynamicDecodeLayerTest<T>::runTestImpl(
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    mEndId = endId == -1 ? mVocabSize - 1 : endId;
-    mUseMedusa = params.useMedusa;
-    mMaxTokensPerStep = mUseMedusa ? mMaxOutputLen - mMaxInputLen : 1;
-
-    allocateData(params);
-
     bool greedySearch
         = std::all_of(expectedOutputIds.begin(), expectedOutputIds.end(), [](auto v) { return v.size() == 1; });
     for (uint64_t seed = 0; seed < mMaxSeed; ++seed)
@@ -746,6 +746,8 @@ template <typename T>
 void DynamicDecodeLayerTest<T>::runTest(
     std::vector<std::set<TokenIdType>> const& expectedOutputIds, TestSamplingParams const& params, TokenIdType endId)
 {
+    allocateData(params, endId);
+
     if (!params.useMedusa)
     {
         TLLM_LOG_DEBUG("Run test with linear logits");
@@ -1056,6 +1058,50 @@ TYPED_TEST(DynamicDecodeLayerTest, TopPTemperatureBatch)
     this->runTest(expectedOutputIds, params);
 }
 
+TYPED_TEST(DynamicDecodeLayerTest, TopPTemperatureMultipleRequests)
+{
+    this->allocateData(TestSamplingParams{});
+    {
+        std::vector<float> temperatures = {0.01f, 1e3f, 1.0f, 1.0f, 0.01f, 1.0f};
+        TestSamplingParams params;
+        params.temperatures = temperatures;
+        params.topPs = {0.5f};
+        std::vector<std::set<TokenIdType>> expectedOutputIds{
+            // batch
+            {4}, {4, 5, 6, 7}, {4, 5}, {4, 5}, {4}, {4, 5}, // step 0
+            {0}, {0, 1, 2, 3}, {0, 1}, {0, 1}, {0}, {0, 1}, // step 1
+            {2}, {2, 3, 4, 5}, {2, 3}, {2, 3}, {2}, {2, 3}, // step 2
+            {0}, {0, 1, 2, 3}, {0, 1}, {0, 1}, {0}, {0, 1}  // step 3
+        };
+        this->runTestImpl(expectedOutputIds, params);
+    }
+    {
+        TestSamplingParams params;
+        params.topPs = {0.3f};
+        std::vector<std::set<TokenIdType>> expectedOutputIds{
+            // batch
+            {4}, {4}, {4}, {4}, {4}, {4}, // step 0
+            {0}, {0}, {0}, {0}, {0}, {0}, // step 1
+            {2}, {2}, {2}, {2}, {2}, {2}, // step 2
+            {0}, {0}, {0}, {0}, {0}, {0}  // step 3
+        };
+        this->runTestImpl(expectedOutputIds, params);
+    }
+    {
+        float temperature = 1.0f;
+        TestSamplingParams params;
+        params.temperatures = {temperature};
+        params.topPs = {0.5f};
+        std::vector<std::set<TokenIdType>> expectedOutputIds{
+            {4, 5}, {4, 5}, {4, 5}, {4, 5}, {4, 5}, {4, 5}, // step 0
+            {0, 1}, {0, 1}, {0, 1}, {0, 1}, {0, 1}, {0, 1}, // step 1
+            {2, 3}, {2, 3}, {2, 3}, {2, 3}, {2, 3}, {2, 3}, // step 2
+            {0, 1}, {0, 1}, {0, 1}, {0, 1}, {0, 1}, {0, 1}  // step 3
+        };
+        this->runTestImpl(expectedOutputIds, params);
+    }
+}
+
 TYPED_TEST(DynamicDecodeLayerTest, TopPRepetitionPenalty)
 {
     SizeType32 topK = 1;
@@ -1107,6 +1153,51 @@ TYPED_TEST(DynamicDecodeLayerTest, TopPRepetitionPenaltiesBatch)
     this->runTest(expectedOutputIds, params);
 }
 
+TYPED_TEST(DynamicDecodeLayerTest, TopPRepetitionPenaltyMultipleRequests)
+{
+    this->allocateData(TestSamplingParams{});
+    {
+        float repetitionPenalty = 1e9f;
+        TestSamplingParams params;
+        params.repetitionPenalties = {repetitionPenalty};
+        params.topPs = {0.3f};
+        std::vector<std::set<TokenIdType>> expectedOutputIds{
+            // batch
+            {4}, {4}, {4}, {4}, {4}, {4}, // step 0
+            {0}, {0}, {0}, {0}, {0}, {0}, // step 1
+            {2}, {2}, {2}, {2}, {2}, {2}, // step 2
+            {1}, {1}, {1}, {1}, {1}, {1}  // step 3
+        };
+        this->runTestImpl(expectedOutputIds, params);
+    }
+    {
+        TestSamplingParams params;
+        params.topPs = {0.3f};
+        std::vector<std::set<TokenIdType>> expectedOutputIds{
+            // batch
+            {4}, {4}, {4}, {4}, {4}, {4}, // step 0
+            {0}, {0}, {0}, {0}, {0}, {0}, // step 1
+            {2}, {2}, {2}, {2}, {2}, {2}, // step 2
+            {0}, {0}, {0}, {0}, {0}, {0}  // step 3
+        };
+        this->runTestImpl(expectedOutputIds, params);
+    }
+    {
+        std::vector<float> repetitionPenalties = {1e9f, 1e9f, 1.0f, 1.0f, 1.0f, 1e9f};
+        TestSamplingParams params;
+        params.repetitionPenalties = repetitionPenalties;
+        params.topPs = {0.3f};
+        std::vector<std::set<TokenIdType>> expectedOutputIds{
+            // batch
+            {4}, {4}, {4}, {4}, {4}, {4}, // step 0
+            {0}, {0}, {0}, {0}, {0}, {0}, // step 1
+            {2}, {2}, {2}, {2}, {2}, {2}, // step 2
+            {1}, {1}, {0}, {0}, {0}, {1}  // step 3
+        };
+        this->runTestImpl(expectedOutputIds, params);
+    }
+}
+
 TYPED_TEST(DynamicDecodeLayerTest, TopPPresencePenalty)
 {
     float presencePenalty = 1e9f;
@@ -1156,6 +1247,51 @@ TYPED_TEST(DynamicDecodeLayerTest, TopPPresencePenaltiesBatch)
     this->runTest(expectedOutputIds, params);
 }
 
+TYPED_TEST(DynamicDecodeLayerTest, TopPPresencePenaltyMultipleRequests)
+{
+    this->allocateData(TestSamplingParams{});
+    {
+        float presencePenalty = 1e9f;
+        TestSamplingParams params;
+        params.presencePenalties = {presencePenalty};
+        params.topPs = {0.3f};
+        std::vector<std::set<TokenIdType>> expectedOutputIds{
+            // batch
+            {4}, {4}, {4}, {4}, {4}, {4}, // step 0
+            {0}, {0}, {0}, {0}, {0}, {0}, // step 1
+            {2}, {2}, {2}, {2}, {2}, {2}, // step 2
+            {1}, {1}, {1}, {1}, {1}, {1}  // step 3
+        };
+        this->runTestImpl(expectedOutputIds, params);
+    }
+    {
+        TestSamplingParams params;
+        params.topPs = {0.3f};
+        std::vector<std::set<TokenIdType>> expectedOutputIds{
+            // batch
+            {4}, {4}, {4}, {4}, {4}, {4}, // step 0
+            {0}, {0}, {0}, {0}, {0}, {0}, // step 1
+            {2}, {2}, {2}, {2}, {2}, {2}, // step 2
+            {0}, {0}, {0}, {0}, {0}, {0}  // step 3
+        };
+        this->runTestImpl(expectedOutputIds, params);
+    }
+    {
+        std::vector<float> presencePenalties = {1e9f, 1e9f, 0.0f, 0.0f, 0.0f, 1e9f};
+        TestSamplingParams params;
+        params.presencePenalties = presencePenalties;
+        params.topPs = {0.3f};
+        std::vector<std::set<TokenIdType>> expectedOutputIds{
+            // batch
+            {4}, {4}, {4}, {4}, {4}, {4}, // step 0
+            {0}, {0}, {0}, {0}, {0}, {0}, // step 1
+            {2}, {2}, {2}, {2}, {2}, {2}, // step 2
+            {1}, {1}, {0}, {0}, {0}, {1}  // step 3
+        };
+        this->runTestImpl(expectedOutputIds, params);
+    }
+}
+
 TYPED_TEST(DynamicDecodeLayerTest, TopPFrequencyPenalty)
 {
     float frequencyPenalty = 1e9f;
@@ -1203,6 +1339,51 @@ TYPED_TEST(DynamicDecodeLayerTest, TopPFrequencyPenaltiesBatch)
         {1}, {1}, {0}, {0}, {0}, {1}  // step 3
     };
     this->runTest(expectedOutputIds, params);
+}
+
+TYPED_TEST(DynamicDecodeLayerTest, TopPFrequencyPenaltyMultipleRequests)
+{
+    this->allocateData(TestSamplingParams{});
+    {
+        float frequencyPenalty = 1e9f;
+        TestSamplingParams params;
+        params.frequencyPenalties = {frequencyPenalty};
+        params.topPs = {0.3f};
+        std::vector<std::set<TokenIdType>> expectedOutputIds{
+            // batch
+            {4}, {4}, {4}, {4}, {4}, {4}, // step 0
+            {0}, {0}, {0}, {0}, {0}, {0}, // step 1
+            {2}, {2}, {2}, {2}, {2}, {2}, // step 2
+            {1}, {1}, {1}, {1}, {1}, {1}  // step 3
+        };
+        this->runTestImpl(expectedOutputIds, params);
+    }
+    {
+        TestSamplingParams params;
+        params.topPs = {0.3f};
+        std::vector<std::set<TokenIdType>> expectedOutputIds{
+            // batch
+            {4}, {4}, {4}, {4}, {4}, {4}, // step 0
+            {0}, {0}, {0}, {0}, {0}, {0}, // step 1
+            {2}, {2}, {2}, {2}, {2}, {2}, // step 2
+            {0}, {0}, {0}, {0}, {0}, {0}  // step 3
+        };
+        this->runTestImpl(expectedOutputIds, params);
+    }
+    {
+        std::vector<float> frequencyPenalties = {1e9f, 1e9f, 0.0f, 0.0f, 0.0f, 1e9f};
+        TestSamplingParams params;
+        params.frequencyPenalties = frequencyPenalties;
+        params.topPs = {0.3f};
+        std::vector<std::set<TokenIdType>> expectedOutputIds{
+            // batch
+            {4}, {4}, {4}, {4}, {4}, {4}, // step 0
+            {0}, {0}, {0}, {0}, {0}, {0}, // step 1
+            {2}, {2}, {2}, {2}, {2}, {2}, // step 2
+            {1}, {1}, {0}, {0}, {0}, {1}  // step 3
+        };
+        this->runTestImpl(expectedOutputIds, params);
+    }
 }
 
 TYPED_TEST(DynamicDecodeLayerTest, TopPRepetitionPresencePenalty)
@@ -1778,6 +1959,111 @@ TYPED_TEST(DynamicDecodeLayerTest, BadWordsNoBadWordsMode)
         {0}, {0}, {0}, {0}, {0}, {0}  // step 3
     };
     this->runTest(expectedOutputIds, params);
+}
+
+TYPED_TEST(DynamicDecodeLayerTest, NoRepeatNgramSize)
+{
+    SizeType32 topK = 1;
+    TestSamplingParams params;
+    params.topKs = {topK};
+    params.topPs = {1.0f};
+    params.badWords = {{{0}}, {{2}}, {{0}, {3}, {4, 1, 2}}, {{5}}, {{0}}, {{1}}};
+    params.repeatNGramSizes = {1, 1, 2, 1, 1, 3};
+    std::vector<std::set<TokenIdType>> expectedOutputIds{
+        // batch
+        {4}, {4}, {4}, {4}, {4}, {4}, // step 0
+        {1}, {0}, {1}, {0}, {1}, {0}, // step 1
+        {2}, {3}, {4}, {2}, {2}, {2}, // step 2
+        {3}, {1}, {2}, {1}, {3}, {0}  // step 3
+    };
+    this->runTest(expectedOutputIds, params);
+}
+
+TYPED_TEST(DynamicDecodeLayerTest, NoRepeatNgramSizeNoNgramMode)
+{
+    SizeType32 topK = 1;
+    TestSamplingParams params;
+    params.topKs = {topK};
+    params.topPs = {1.0f};
+    params.badWords = {{{0}}, {{2}}, {{0}, {3}, {4, 1, 2}}, {{5}}, {{0}}, {{1}}};
+    params.repeatNGramSizes = {1, 1, 2, 1, 1, 3};
+    params.decodingMode = tle::DecodingMode::TopK().useNoRepeatNgramSize(false);
+    std::vector<std::set<TokenIdType>> expectedOutputIds{
+        // batch
+        {4}, {4}, {4}, {4}, {4}, {4}, // step 0
+        {1}, {0}, {1}, {0}, {1}, {0}, // step 1
+        {2}, {3}, {4}, {2}, {2}, {2}, // step 2
+        {1}, {0}, {1}, {0}, {1}, {0}  // step 3
+    };
+    this->runTest(expectedOutputIds, params);
+}
+
+TYPED_TEST(DynamicDecodeLayerTest, NoRepeatNgramSizeNoBanTokensMode)
+{
+    SizeType32 topK = 1;
+    TestSamplingParams params;
+    params.topKs = {topK};
+    params.topPs = {1.0f};
+    params.badWords = {{{0}}, {{2}}, {{0}, {3}, {4, 1, 2}}, {{5}}, {{0}}, {{1}}};
+    params.repeatNGramSizes = {1, 1, 2, 1, 1, 3};
+    params.decodingMode = tle::DecodingMode::TopK().useBanTokens(false);
+    std::vector<std::set<TokenIdType>> expectedOutputIds{
+        // batch
+        {4}, {4}, {4}, {4}, {4}, {4}, // step 0
+        {0}, {0}, {0}, {0}, {0}, {0}, // step 1
+        {2}, {2}, {2}, {2}, {2}, {2}, // step 2
+        {0}, {0}, {0}, {0}, {0}, {0}, // step 3
+    };
+    this->runTest(expectedOutputIds, params);
+}
+
+TYPED_TEST(DynamicDecodeLayerTest, NoRepeatNgramSizeMultipleRequests)
+{
+    this->allocateData(TestSamplingParams{});
+    {
+        SizeType32 topK = 1;
+        TestSamplingParams params;
+        params.topKs = {topK};
+        params.topPs = {1.0f};
+        params.repeatNGramSizes = {1, 1, 2, 1, 1, 3};
+        std::vector<std::set<TokenIdType>> expectedOutputIds{
+            // batch
+            {4}, {4}, {4}, {4}, {4}, {4}, // step 0
+            {0}, {0}, {0}, {0}, {0}, {0}, // step 1
+            {2}, {2}, {2}, {2}, {2}, {2}, // step 2
+            {1}, {1}, {0}, {1}, {1}, {0}  // step 3
+        };
+        this->runTestImpl(expectedOutputIds, params);
+    }
+    {
+        SizeType32 topK = 1;
+        TestSamplingParams params;
+        params.topKs = {topK};
+        params.topPs = {1.0f};
+        std::vector<std::set<TokenIdType>> expectedOutputIds{
+            // batch
+            {4}, {4}, {4}, {4}, {4}, {4}, // step 0
+            {0}, {0}, {0}, {0}, {0}, {0}, // step 1
+            {2}, {2}, {2}, {2}, {2}, {2}, // step 2
+            {0}, {0}, {0}, {0}, {0}, {0}  // step 3
+        };
+        this->runTestImpl(expectedOutputIds, params);
+    }
+    {
+        SizeType32 topK = 1;
+        TestSamplingParams params;
+        params.topKs = {topK};
+        params.topPs = {1.0f};
+        params.repeatNGramSizes = {1, 1, 2, 1, 1, 3};
+        std::vector<std::set<TokenIdType>> expectedOutputIds{
+            // batch
+            {4}, {4}, {4}, {4}, {4}, {4}, // step 0
+            {0}, {0}, {0}, {0}, {0}, {0}, // step 1
+            {2}, {2}, {2}, {2}, {2}, {2}, // step 2
+            {1}, {1}, {0}, {1}, {1}, {0}  // step 3
+        };
+        this->runTestImpl(expectedOutputIds, params);
+    }
 }
 
 TYPED_TEST(DynamicDecodeLayerTest, StopWords)

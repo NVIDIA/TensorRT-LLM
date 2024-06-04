@@ -12,18 +12,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
+import sys
 import unittest
 
-import numpy as np
 import torch
 from parameterized import parameterized
-from polygraphy.backend.trt import EngineFromNetwork, TrtRunner
 
 import tensorrt_llm
 from tensorrt_llm import Tensor
 
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.util import create_session, run_session, unittest_name_func
 
-class TestFunctional(unittest.TestCase):
+
+class TestWhere(unittest.TestCase):
 
     def setUp(self):
         tensorrt_llm.logger.set_level('warning')
@@ -31,50 +34,42 @@ class TestFunctional(unittest.TestCase):
     @parameterized.expand([
         (True, ),
         (False, ),
-    ])
-    def test_where_from_bool(self, condition=True):
+    ], name_func=unittest_name_func)
+    def test_where_from_bool(self, condition):
         dtype = 'float32'
-        t_data = torch.randn(2, 3)
-        f_data = torch.randn(2, 3)
+        t_data = torch.randn(2, 3, device="cuda")
+        f_data = torch.randn(2, 3, device="cuda")
 
+        # construct trt network
         builder = tensorrt_llm.Builder()
-        net = builder.create_network()
-        with tensorrt_llm.net_guard(net):
-            network = tensorrt_llm.default_trtnet()
+        network = builder.create_network()
+        with tensorrt_llm.net_guard(network):
             t = Tensor(name='t',
                        shape=t_data.shape,
                        dtype=tensorrt_llm.str_dtype_to_trt(dtype))
             f = Tensor(name='f',
                        shape=f_data.shape,
                        dtype=tensorrt_llm.str_dtype_to_trt(dtype))
-            output = tensorrt_llm.functional.where(condition, t, f).trt_tensor
-            output.name = 'output'
-            network.mark_output(output)
+            output = tensorrt_llm.functional.where(condition, t, f)
+            output.mark_output('output')
 
-        build_engine = EngineFromNetwork((builder.trt_builder, net.trt_network))
-        with TrtRunner(build_engine) as runner:
-            outputs = runner.infer(feed_dict={
-                't': t_data.numpy(),
-                'f': f_data.numpy(),
-            })
+        session = create_session(builder, network, precision=dtype)
+        inputs = {'t': t_data, 'f': f_data}
+        outputs = run_session(session, inputs)
 
-        ref = torch.where(torch.tensor(condition), t_data, f_data)
-        np.testing.assert_allclose(ref.cpu().numpy(),
-                                   outputs['output'],
-                                   atol=1e-5)
+        ref = torch.where(torch.tensor(condition).cuda(), t_data, f_data)
+        torch.testing.assert_close(ref, outputs['output'])
 
     def test_where_from_tensor(self):
         dtype = 'float32'
-        t_data = torch.randn(3, 4)
-        f_data = torch.randn(3, 4)
-        c_data = torch.randint(2, size=(3, 1), dtype=torch.bool)
-        ref = torch.where(c_data, t_data, f_data)
-        print(ref)
+        t_data = torch.randn(3, 4, device="cuda")
+        f_data = torch.randn(3, 4, device="cuda")
+        c_data = torch.randint(2, size=(3, 1), dtype=torch.bool, device="cuda")
 
+        # construct trt network
         builder = tensorrt_llm.Builder()
-        net = builder.create_network()
-        with tensorrt_llm.net_guard(net):
-            network = tensorrt_llm.default_trtnet()
+        network = builder.create_network()
+        with tensorrt_llm.net_guard(network):
             t = Tensor(name='t',
                        shape=t_data.shape,
                        dtype=tensorrt_llm.str_dtype_to_trt(dtype))
@@ -84,23 +79,16 @@ class TestFunctional(unittest.TestCase):
             c = Tensor(name='c',
                        shape=c_data.shape,
                        dtype=tensorrt_llm.str_dtype_to_trt('bool'))
-            output = tensorrt_llm.functional.where(c, t, f).trt_tensor
-            output.name = 'output'
-            network.mark_output(output)
+            output = tensorrt_llm.functional.where(c, t, f)
+            output.mark_output('output')
 
-        build_engine = EngineFromNetwork((builder.trt_builder, net.trt_network))
-        with TrtRunner(build_engine) as runner:
-            outputs = runner.infer(feed_dict={
-                't': t_data.numpy(),
-                'f': f_data.numpy(),
-                'c': c_data.numpy(),
-            })
+        # trt run
+        session = create_session(builder, network, precision=dtype)
+        inputs = {'t': t_data, 'f': f_data, 'c': c_data}
+        outputs = run_session(session, inputs)
 
-        np.testing.assert_allclose(ref.cpu().numpy(),
-                                   outputs['output'],
-                                   atol=1e-5)
-        print(t_data)
-        print(f_data)
-        print(c_data)
-        print(outputs['output'])
-        # assert False, "FORCED"
+        # pytorch run
+        ref = torch.where(c_data, t_data, f_data)
+
+        # compare diff
+        torch.testing.assert_close(ref, outputs['output'])

@@ -37,6 +37,7 @@ class LayerNorm(Module):
             self.register_parameter('bias', None)
 
         self.eps = eps
+        self.dtype = dtype
 
     def forward(self, x):
         weight = 1. if self.weight is None else self.weight.value
@@ -62,6 +63,7 @@ class RmsNorm(Module):
             self.register_parameter('weight', None)
 
         self.eps = eps
+        self.dtype = dtype
 
     def forward(self, x):
         weight = None if self.weight is None else self.weight.value

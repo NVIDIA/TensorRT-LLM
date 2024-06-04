@@ -390,7 +390,6 @@ trtllm-build --model_config /tmp/engines/gptj/ckpt_config.json \
 	--max_batch_size 64 \
 	--max_input_len 2048 \
 	--max_output_len 2048 \
-	--strongly_typed
 ```
 
 #### Throughput Benchmark
@@ -460,7 +459,6 @@ trtllm-build --model_config /tmp/engines/llama/7b/ckpt_config.json \
 	--max_batch_size 64 \
 	--max_input_len 2048 \
 	--max_output_len 2048 \
-	--strongly_typed
 ```
 
 #### Throughput Benchmark
@@ -534,7 +532,6 @@ trtllm-build --model_config /tmp/engines/llama/70b/ckpt_config.json \
 	--max_batch_size 64 \
 	--max_input_len 2048 \
 	--max_output_len 2048 \
-	--strongly_typed
 ```
 
 #### Throughput Benchmark
@@ -631,7 +628,6 @@ do
 		--max_batch_size $batch_size \
 		--max_input_len $isl \
 		--max_output_len $osl \
-		--strongly_typed
 
 	# Throughput benchmark
 	mpirun -n 8 --allow-run-as-root --oversubscribe ./cpp/build/benchmarks/gptSessionBenchmark --engine_dir $engine_path --warm_up 1 --batch_size $batch_size --duration 0 --num_runs 5 --input_output_len "${isl},${osl}"

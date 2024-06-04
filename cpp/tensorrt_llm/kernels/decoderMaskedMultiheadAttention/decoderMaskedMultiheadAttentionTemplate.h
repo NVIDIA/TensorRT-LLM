@@ -1282,6 +1282,8 @@ template <
     bool DO_MULTI_BLOCK = false,
     // Whether enable position shift for streamingllm
     bool POS_SHIFT = false,
+    // Whether to compute and apply block sparse attention mask
+    bool BLOCK_SPARSE_ATTN = false,
     // Whether compute implicit relative attention bias on the fly.
     bool IMPLICIT_REL_ATTN_BIAS = false,
     // Whether apply tanh scale to the qk product.
@@ -1680,13 +1682,16 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         constexpr int tidx_factor = (QK_VEC_SIZE > 1) ? QK_VEC_SIZE / 2 : 1;
         if (do_rotary)
         {
+            float rotary_embedding_m_scale = tlength <= params.rotary_embedding_original_max_positions
+                ? params.rotary_embedding_short_m_scale
+                : params.rotary_embedding_long_m_scale;
             mmha::vec_from_smem_transpose(q, q_smem_, transpose_idx, smem_pitch);
             if (HANDLE_KV)
             {
                 mmha::vec_from_smem_transpose(k, k_smem_, transpose_idx, smem_pitch);
 
                 mmha::apply_rotary_embedding(q, k, transpose_idx / tidx_factor, params.rotary_embedding_dim,
-                    rotary_embedding_base, rotary_embedding_scale, params.rotary_embedding_m_scale,
+                    rotary_embedding_base, rotary_embedding_scale, rotary_embedding_m_scale,
                     params.rotary_embedding_scaling_factors, current_pos_idx, params.rotary_cogvlm_vision_start,
                     params.rotary_cogvlm_vision_length);
 
@@ -1695,7 +1700,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
             else
             {
                 mmha::apply_rotary_embedding(q, transpose_idx / tidx_factor, params.rotary_embedding_dim,
-                    rotary_embedding_base, rotary_embedding_scale, params.rotary_embedding_m_scale,
+                    rotary_embedding_base, rotary_embedding_scale, rotary_embedding_m_scale,
                     params.rotary_embedding_scaling_factors, current_pos_idx, params.rotary_cogvlm_vision_start,
                     params.rotary_cogvlm_vision_length);
             }
@@ -2045,6 +2050,14 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
             // All the threads do the work even if it's not relevant to avoid divergence.
             qk_ += linear_bias_slope * (local_time_now - tlength) + relative_attention_bias;
 
+            if constexpr (BLOCK_SPARSE_ATTN)
+            {
+                float mask_val
+                    = params.block_sparse_params.computeMask(tlength, local_time_now, tlength + 1, num_heads, hi) ? 1.f
+                                                                                                                  : 0.f;
+                qk_ += (1.0f - mask_val) * -10000.0f;
+            }
+
             // There's one qk value per timestep.
             // Make sure only leader threads stores qk value within the bound.
             if (is_active && is_leader)
@@ -2176,6 +2189,13 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
             //
             // All the threads perform that step to avoid divergence.
             qk_ += linear_bias_slope * (time_now - tlength) + relative_attention_bias;
+
+            if constexpr (BLOCK_SPARSE_ATTN)
+            {
+                float mask_val
+                    = params.block_sparse_params.computeMask(tlength, time_now, tlength + 1, num_heads, hi) ? 1.f : 0.f;
+                qk_ += (1.0f - mask_val) * -10000.0f;
+            }
 
             // There's one qk value per timestep.
             // Make sure only leader threads stores qk value within the bound.

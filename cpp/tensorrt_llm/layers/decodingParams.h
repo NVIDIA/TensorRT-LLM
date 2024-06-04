@@ -112,11 +112,12 @@ public:
     // Penalty layer
     struct PenaltyParams
     {
-        std::optional<std::vector<float>> temperature;             // [1] or [setupBatchSize] on cpu
-        std::optional<std::vector<runtime::SizeType32>> minLength; // [1] or [setupBatchSize] on cpu
-        std::optional<std::vector<float>> repetitionPenalty;       // [1] or [setupBatchSize] on cpu
-        std::optional<std::vector<float>> presencePenalty;         // [1] or [setupBatchSize] on cpu
-        std::optional<std::vector<float>> frequencyPenalty;        // [1] or [setupBatchSize] on cpu
+        std::optional<std::vector<float>> temperature;                     // [1] or [setupBatchSize] on cpu
+        std::optional<std::vector<runtime::SizeType32>> minLength;         // [1] or [setupBatchSize] on cpu
+        std::optional<std::vector<float>> repetitionPenalty;               // [1] or [setupBatchSize] on cpu
+        std::optional<std::vector<float>> presencePenalty;                 // [1] or [setupBatchSize] on cpu
+        std::optional<std::vector<float>> frequencyPenalty;                // [1] or [setupBatchSize] on cpu
+        std::optional<std::vector<runtime::SizeType32>> noRepeatNgramSize; // [1] or [setupBatchSize] on cpu
     };
 
     struct SamplingParams
@@ -220,7 +221,6 @@ public:
     std::optional<tc::Tensor> bad_words_lengths;     // [maxBatchSize], on gpu
     std::optional<tc::Tensor> stop_words_ptr;        // [maxBatchSize][2, stop_words_length], on gpu
     std::optional<tc::Tensor> stop_words_lengths;    // [maxBatchSize], on gpu
-    std::optional<tc::Tensor> no_repeat_ngram_size;  // [maxBatchSize], on gpu
 
     // Medusa inputs
     class MedusaInputs

@@ -55,6 +55,7 @@ struct TestSamplingParams
     std::vector<runtime::TokenIdType> topPResetIds;
     std::vector<std::vector<std::vector<runtime::TokenIdType>>> badWords;
     std::vector<std::vector<std::vector<runtime::TokenIdType>>> stopWords;
+    std::vector<runtime::SizeType32> repeatNGramSizes;
     bool useBias{false};
 
     std::optional<executor::DecodingMode> decodingMode;
@@ -150,7 +151,6 @@ private:
     bool mUseMedusa{false};
 
 private:
-    void allocateData(TestSamplingParams const& params);
     void allocateMedusaData(TestSamplingParams const& params);
 
     void setup(uint64_t seed, TestSamplingParams const& params);
@@ -169,9 +169,6 @@ private:
         runtime::SizeType32* seqLens, runtime::SizeType32 leadingDim, runtime::SizeType32 stride,
         runtime::SizeType32 step, bool outputIdsTransposed = false, runtime::SizeType32 strideTransposed = 0);
 
-    void runTestImpl(std::vector<std::set<runtime::TokenIdType>> const& expectedOutputIds,
-        TestSamplingParams const& params, runtime::TokenIdType endId = -1);
-
     void fillRefLogits(runtime::SizeType32 const* seqLenHost,
         std::vector<std::set<runtime::TokenIdType>> const& expectedOutputIds, runtime::SizeType32 step);
 
@@ -181,6 +178,11 @@ private:
 public:
     void runTest(std::vector<std::set<runtime::TokenIdType>> const& expectedOutputIds, TestSamplingParams const& params,
         runtime::TokenIdType endId = -1);
+
+    void allocateData(TestSamplingParams const& params, runtime::TokenIdType endId = -1);
+
+    void runTestImpl(std::vector<std::set<runtime::TokenIdType>> const& expectedOutputIds,
+        TestSamplingParams const& params, runtime::TokenIdType endId = -1);
 };
 
 typedef testing::Types<float, half> FloatAndHalfTypes;

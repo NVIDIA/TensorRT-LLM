@@ -131,6 +131,9 @@ public:
         frequencyPenalty = fuseValues<FloatType>(
             configs, [&configs](size_t ci) { return configs[ci].frequencyPenalty; },
             layers::DefaultDecodingParams::getFrequencyPenalty());
+        noRepeatNgramSize = fuseValues<SizeType32>(
+            configs, [&configs](size_t ci) { return configs[ci].noRepeatNgramSize; },
+            layers::DefaultDecodingParams::getNoRepeatNgramSize());
         topK = fuseValues<SizeType32>(
             configs, [&configs](size_t ci) { return configs[ci].topK; }, layers::DefaultDecodingParams::getTopK());
         topP = fuseValues<FloatType>(
@@ -200,6 +203,7 @@ public:
         SET_FROM_OPTIONAL(frequencyPenalty, FrequencyPenalty, FloatType)
         SET_FROM_OPTIONAL(lengthPenalty, LengthPenalty, FloatType)
         SET_FROM_OPTIONAL(earlyStopping, EarlyStopping, SizeType32)
+        SET_FROM_OPTIONAL(noRepeatNgramSize, NoRepeatNgramSize, SizeType32)
 #undef SET_FROM_OPTIONAL
     }
 
@@ -225,6 +229,7 @@ public:
         valid &= validateVec("temperature", temperature, -fltEpsilon);
         valid &= validateVec("repetitionPenalty", repetitionPenalty, 0.f);
         valid &= validateVec("minLength", minLength, -1);
+        valid &= validateVec("noRepeatNgramSize", noRepeatNgramSize, 0);
 
         valid &= validateVec("beamSearchDiversityRate", beamSearchDiversityRate, -fltEpsilon);
 
@@ -256,11 +261,12 @@ public:
     SizeType32 beamWidth;
 
     // penalties
-    OptVec<FloatType> temperature;       // [1] or [batch_size] on cpu
-    OptVec<SizeType32> minLength;        // [1] or [batch_size] on cpu
-    OptVec<FloatType> repetitionPenalty; // [1] or [batch_size] on cpu
-    OptVec<FloatType> presencePenalty;   // [1] or [batch_size] on cpu
-    OptVec<FloatType> frequencyPenalty;  // [1] or [batch_size] on cpu
+    OptVec<FloatType> temperature;        // [1] or [batch_size] on cpu
+    OptVec<SizeType32> minLength;         // [1] or [batch_size] on cpu
+    OptVec<FloatType> repetitionPenalty;  // [1] or [batch_size] on cpu
+    OptVec<FloatType> presencePenalty;    // [1] or [batch_size] on cpu
+    OptVec<FloatType> frequencyPenalty;   // [1] or [batch_size] on cpu
+    OptVec<SizeType32> noRepeatNgramSize; // [1] or [batch_size] on cpu
 
     // probs
     OptVec<bool> outputLogProbs;
@@ -291,13 +297,13 @@ public:
     {
         return beamWidth == other.beamWidth && temperature == other.temperature && minLength == other.minLength
             && repetitionPenalty == other.repetitionPenalty && presencePenalty == other.presencePenalty
-            && frequencyPenalty == other.frequencyPenalty && topK == other.topK && topP == other.topP
-            && randomSeed == other.randomSeed && topPDecay == other.topPDecay && topPMin == other.topPMin
-            && topPResetIds == other.topPResetIds && beamSearchDiversityRate == other.beamSearchDiversityRate
-            && lengthPenalty == other.lengthPenalty && earlyStopping == other.earlyStopping
-            && draftAcceptanceThreshold == other.draftAcceptanceThreshold && topKMedusaHeads == other.topKMedusaHeads
-            && normalizeLogProbs == other.normalizeLogProbs && outputLogProbs == other.outputLogProbs
-            && cumLogProbs == other.cumLogProbs;
+            && frequencyPenalty == other.frequencyPenalty && noRepeatNgramSize == other.noRepeatNgramSize
+            && topK == other.topK && topP == other.topP && randomSeed == other.randomSeed
+            && topPDecay == other.topPDecay && topPMin == other.topPMin && topPResetIds == other.topPResetIds
+            && beamSearchDiversityRate == other.beamSearchDiversityRate && lengthPenalty == other.lengthPenalty
+            && earlyStopping == other.earlyStopping && draftAcceptanceThreshold == other.draftAcceptanceThreshold
+            && topKMedusaHeads == other.topKMedusaHeads && normalizeLogProbs == other.normalizeLogProbs
+            && outputLogProbs == other.outputLogProbs && cumLogProbs == other.cumLogProbs;
     }
 };
 

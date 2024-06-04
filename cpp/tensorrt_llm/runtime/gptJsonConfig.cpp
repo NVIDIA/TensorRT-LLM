@@ -113,12 +113,13 @@ ModelConfig createModelConfig(
 {
     auto const& config = engineVersionNone ? json.at("builder_config") : json.at("pretrained_config");
 
-    auto const useCrossAttention = parseJsonFieldOptional<bool>(config, "cross_attention");
+    auto const* const archField = "architecture";
     auto const* const numLayersField = engineVersionNone ? "num_layers" : "num_hidden_layers";
     auto const* const numHeadsField = engineVersionNone ? "num_heads" : "num_attention_heads";
     auto const* const numKvHeadsField = engineVersionNone ? "num_kv_heads" : "num_key_value_heads";
     auto const* const mlpHiddenSizeField = engineVersionNone ? "mlp_hidden_size" : "intermediate_size";
 
+    auto const arch = engineVersionNone ? std::string("none") : config.at(archField).template get<std::string>();
     auto const numLayers = config.at(numLayersField).template get<SizeType32>();
     auto const numHeads = config.at(numHeadsField).template get<SizeType32>() / tensorParallelism;
     auto const layerStringTypes
@@ -145,10 +146,14 @@ ModelConfig createModelConfig(
     modelConfig.setNbKvHeads(numKvHeads);
     modelConfig.setLayerTypes(layerTypes);
 
-    if (useCrossAttention.has_value())
-    {
-        modelConfig.useCrossAttention(useCrossAttention.value());
-    }
+    // only enable cross attention for the decoder in encoder-decoder model
+    // TODO: add cross_attention and has_token_type_embedding as fields in pretrained config
+    auto const useCrossAttention = arch == std::string("DecoderModel") ? true : false;
+    auto const usePositionEmbedding = parseJsonFieldOr<bool>(config, "has_position_embedding", false);
+    auto const useTokenTypeEmbedding = parseJsonFieldOr<bool>(config, "has_token_type_embedding", false);
+    modelConfig.setUseCrossAttention(useCrossAttention);
+    modelConfig.setUsePositionEmbedding(usePositionEmbedding);
+    modelConfig.setUseTokenTypeEmbedding(useTokenTypeEmbedding);
 
     if (mlpHiddenSize.has_value())
     {

@@ -479,9 +479,11 @@ def main():
         intermediate_size=ckpt_config["intermediate_size"],
         norm_epsilon=1e-6,
         position_embedding_type="rope_gpt_neox",
-        world_size=args.world_size,
-        tp_size=args.world_size,
-        pp_size=1,
+        mapping={
+            'world_size': args.world_size,
+            'tp_size': args.world_size,
+            'pp_size': 1
+        },
         gpus_per_node=8,
         quantization=quant_config,
         conv_kernel=4,

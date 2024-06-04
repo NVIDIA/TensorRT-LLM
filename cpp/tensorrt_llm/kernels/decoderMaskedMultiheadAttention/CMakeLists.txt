@@ -32,6 +32,12 @@ if(FAST_BUILD)
   )
 endif()
 
+filter_cuda_archs("70" SRC_CPP)
+filter_cuda_archs("80" SRC_CPP)
+filter_cuda_archs("86" SRC_CPP)
+filter_cuda_archs("89" SRC_CPP)
+filter_cuda_archs("90" SRC_CPP)
+
 add_library(decoder_attention_src OBJECT ${SRC_CPP} ${SRC_CU})
 set_property(TARGET decoder_attention_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET decoder_attention_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS

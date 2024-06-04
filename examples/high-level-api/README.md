@@ -203,10 +203,12 @@ Thirdly, you need to prepare a Slurm script to submit the task, the script conta
 ```sh
 #SBATCH -N 2                                 # number of nodes
 #SBATCH --ntasks-per-node=4
+#SBATCH -p <partition>
+# more sbatch options here...
 
 srun --container-image="<docker-image>" \
      --mpi=pmix \
-     ... \ # much details here
+     ... \ # more srun options here
      trtllm-hlapi-launch python3 <your-python-script>.py
 ```
 

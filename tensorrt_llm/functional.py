@@ -30,7 +30,8 @@ from ._common import default_net, default_trtnet, precision
 from ._utils import (bf16_array, bool_array, dim_resolve_negative,
                      dim_to_trt_axes, dims_array, fp16_array, fp32_array,
                      int32_array, int64_array, np_dtype_to_trt,
-                     str_dtype_to_trt, trt_dtype_to_np, trt_gte_10)
+                     str_dtype_to_trt, trt_dtype_to_np, trt_dtype_to_str,
+                     trt_gte_10)
 from .network import PluginInfo, set_np_weight, set_plugin_info
 from .plugin import TRT_LLM_PLUGIN_NAMESPACE, current_all_reduce_helper
 from .quantization import QuantMode
@@ -675,6 +676,7 @@ class AttentionMaskType(IntEnum):
     causal = 1
     bidirectional = 2
     bidirectionalglm = 3  # TODO: merge this mask into bidirectional
+    blocksparse = 4
 
 
 class LayerNormType(IntEnum):
@@ -1034,6 +1036,80 @@ def matmul(input: Tensor,
     return output
 
 
+def gemm_swiglu(input: Tensor,
+                weight: Tensor,
+                bias: Optional[Tensor] = None,
+                scale_d0: float = 1.0,
+                scale_d1: float = 1.0,
+                scale_output: float = 1.0) -> Tensor:
+    '''
+    Add a matrix multiplication, followed by SwiGLU (`x * SiLU(gate)`) operation.
+
+    The second SwiGLU operation takes the preceding tensor, splits it into two halves
+    along the last dimension, applies SiLU to the second half and multiply the results. The
+    behaviour is undefined if the last dimension is not even.
+
+        Parameters:
+        input : Tensor
+            The first tensor (often called A).
+
+        weight : Tensor
+            The second tensor (often called B).
+
+        bias : Optional[Tensor]
+            The per-channel bias. The plugin with fp8 dtype does not support bias yet.
+
+        scale_d0 : float
+            The scale for dequantizing x, used for fp8
+
+        scale_d1 : float
+            The scale for dequantizing gate, used for fp8
+
+        scale_output : float
+            The scale for quantizing output, used for fp8
+
+                Returns:
+        The tensor produced by the inserted layer.
+    '''
+    plg_creator = trt.get_plugin_registry().get_plugin_creator(
+        'GemmSwiglu', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert plg_creator is not None
+
+    p_dtype = default_net().plugin_config.gemm_swiglu_plugin
+    if p_dtype == "fp8":
+        assert bias == None, "fp8 gemm_swiglu does not support bias yet"
+
+    pf_type = trt.PluginField(
+        "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
+        trt.PluginFieldType.INT32)
+    pf_has_bias = trt.PluginField(
+        "has_bias", np.array(np.int8(0 if bias is None else 1), np.int8),
+        trt.PluginFieldType.INT8)
+    pf_scale_d0 = trt.PluginField("scale_d0",
+                                  np.array(scale_d0, dtype=np.float32),
+                                  trt.PluginFieldType.FLOAT32)
+    pf_scale_d1 = trt.PluginField("scale_d1",
+                                  np.array(scale_d1, dtype=np.float32),
+                                  trt.PluginFieldType.FLOAT32)
+    pf_scale_output = trt.PluginField("scale_output",
+                                      np.array(scale_output, dtype=np.float32),
+                                      trt.PluginFieldType.FLOAT32)
+
+    pfc = trt.PluginFieldCollection(
+        [pf_type, pf_has_bias, pf_scale_d0, pf_scale_d1, pf_scale_output])
+    gemm_swiglu_plug = plg_creator.create_plugin("gemm_swiglu", pfc)
+
+    # TODO(anchengc) pass nullptr when no bias
+    if bias is None:
+        bias = constant(
+            np.zeros([weight.shape[0]], dtype=trt_dtype_to_np(input.dtype)))
+    plug_inputs = [input.trt_tensor, weight.trt_tensor, bias.trt_tensor]
+
+    layer = default_trtnet().add_plugin_v2(plug_inputs, gemm_swiglu_plug)
+
+    return _create_tensor(layer.get_output(0), layer)
+
+
 def constant(ndarray: np.ndarray) -> Tensor:
     '''
     Add a constant layer.
@@ -1230,32 +1306,33 @@ def categorical_sample(probs: Tensor, rand_data: Tensor = None) -> Tensor:
     return samples
 
 
-def conditional(condition: Tensor, true_input: Tensor,
-                false_input: Tensor) -> Tensor:
+class Conditional:
     '''
     Add an operation to conditionally execute two code paths/subgraphs.
 
-    Parameters:
-        condition : Tensor
-            The condition tensor. If the condition is true, the operation will
-            return the true_input tensor, otherwise the false_input tensor.
-
-        true_input : Tensor
-            The tensor to return if the condition is true.
-
-        false_input : Tensor
-            The tensor to return if the condition is false.
+    Usage:
+        1. conditional = Conditional(condition)
+        2. input_1_ = conditional.add_input(input_1)
+           ...
+           input_n_ = conditional.add_input(input_n)
+        3. Construct the graph to get true_output_value and false_output_value using input_1_, ..., input_n_
+        4. output = conditional.add_output(true_output_value, false_output_value)
     '''
-    if condition.ndim() > 0:
-        condition = view(condition, [])
-    cond_trt_ = condition.trt_tensor
-    layer = default_trtnet().add_if_conditional()
-    layer.set_condition(cond_trt_)
-    true_subgraph = layer.add_input(true_input.trt_tensor)
-    false_subgraph = layer.add_input(false_input.trt_tensor)
-    output = layer.add_output(true_subgraph.get_output(0),
-                              false_subgraph.get_output(0))
-    return _create_tensor(output.get_output(0), output)
+
+    def __init__(self, condition: Tensor):
+        self.layer = default_trtnet().add_if_conditional()
+        if condition.ndim() > 0:
+            condition = view(condition, [])
+        self.layer.set_condition(condition.trt_tensor)
+
+    def add_input(self, input: Tensor) -> Tensor:
+        in_node = self.layer.add_input(input.trt_tensor)
+        return _create_tensor(in_node.get_output(0), in_node)
+
+    def add_output(self, true_value: Tensor, false_value: Tensor) -> Tensor:
+        out_node = self.layer.add_output(true_value.trt_tensor,
+                                         false_value.trt_tensor)
+        return _create_tensor(out_node.get_output(0), out_node)
 
 
 # TODO: support step.
@@ -2143,7 +2220,7 @@ def masked_select(input: Tensor, mask: Tensor) -> Tensor:
     return _create_tensor(gather_layer.get_output(0), gather_layer)
 
 
-def cumsum(input: Tensor, dim: int) -> Tensor:
+def cumsum(input: Tensor, dim: int, prefer_plugin: bool = True) -> Tensor:
     '''
     Add an operation to calculate inclusive cumulative sum of elements of
     a tensor in a given dimension.
@@ -2176,6 +2253,9 @@ def cumsum(input: Tensor, dim: int) -> Tensor:
             The dimension to calculate the inclusive cumulative sum. Negative
             value is supported.
 
+        prefer_plugin : bool
+            Whether to use the cumsumLastDim plugin if dim is last dim.
+
     Returns:
         The tensor containing the inclusive cumulative sum of input.
     '''
@@ -2185,33 +2265,52 @@ def cumsum(input: Tensor, dim: int) -> Tensor:
 
     dim = dim_resolve_negative(dim, input.ndim())[0]
 
-    if (dim == input.ndim() - 1) and input.size(-1) > 0:
-        old_shape = shape(input)
-        if input.ndim() != 2:
-            input_2d = input.view([-1, input.size(-1)])
+    if (dim == input.ndim() - 1):
+        if prefer_plugin:
+            last_dim = input.size(-1)
+            if last_dim == -1:  # dynamic?
+                last_dim = shape(input, -1)
+            old_shape = shape(input)
+            if input.ndim() == 1:
+                input_2d = unsqueeze(
+                    input, 0)  # special handling of rank-1 dynamic tensor
+            elif input.ndim() != 2:
+                input_2d = input.view(concat([-1, last_dim]),
+                                      zero_is_placeholder=False)
+            else:
+                input_2d = input
+            cumsum_last_dim_plg_creator = trt.get_plugin_registry(
+            ).get_plugin_creator('CumsumLastDim', '1', TRT_LLM_PLUGIN_NAMESPACE)
+            assert cumsum_last_dim_plg_creator is not None
+            input_length = trt.PluginField(
+                "input_length", np.array(input_2d.size(-1), dtype=np.int32),
+                trt.PluginFieldType.INT32)
+            pf_type = trt.PluginField("type_id",
+                                      np.array([int(input_2d.dtype)], np.int32),
+                                      trt.PluginFieldType.INT32)
+            pfc = trt.PluginFieldCollection([input_length, pf_type])
+            cumsum_last_dim_plug = cumsum_last_dim_plg_creator.create_plugin(
+                "cumsum_last_dim", pfc)
+            plug_inputs = [input_2d]
+            plug_inputs = [i.trt_tensor for i in plug_inputs]
+            layer = default_trtnet().add_plugin_v2(plug_inputs,
+                                                   cumsum_last_dim_plug)
+            _add_plugin_info(layer, cumsum_last_dim_plg_creator,
+                             "cumsum_last_dim", pfc)
+            output = _create_tensor(layer.get_output(0), layer)
+            output = output.view(old_shape, zero_is_placeholder=False)
+            return output
         else:
-            input_2d = input
-        cumsum_last_dim_plg_creator = trt.get_plugin_registry(
-        ).get_plugin_creator('CumsumLastDim', '1', TRT_LLM_PLUGIN_NAMESPACE)
-        assert cumsum_last_dim_plg_creator is not None
-        input_length = trt.PluginField(
-            "input_length", np.array(input_2d.size(-1), dtype=np.int32),
-            trt.PluginFieldType.INT32)
-        pf_type = trt.PluginField("type_id",
-                                  np.array([int(input_2d.dtype)], np.int32),
-                                  trt.PluginFieldType.INT32)
-        pfc = trt.PluginFieldCollection([input_length, pf_type])
-        cumsum_last_dim_plug = cumsum_last_dim_plg_creator.create_plugin(
-            "cumsum_last_dim", pfc)
-        plug_inputs = [input_2d]
-        plug_inputs = [i.trt_tensor for i in plug_inputs]
-        layer = default_trtnet().add_plugin_v2(plug_inputs,
-                                               cumsum_last_dim_plug)
-        _add_plugin_info(layer, cumsum_last_dim_plg_creator, "cumsum_last_dim",
-                         pfc)
-        output = _create_tensor(layer.get_output(0), layer)
-        output = output.view(old_shape)
-        return output
+            # credit to Apple
+            reduction_length = shape(input, -1)
+            reduction_range = arange(constant_to_tensor_(0, to_array=False),
+                                     reduction_length,
+                                     dtype='int32')
+            lower_triangle = cast(
+                unsqueeze(reduction_range, 0) <= unsqueeze(reduction_range, 1),
+                dtype=input.dtype)
+            output = sum(unsqueeze(input, -2) * lower_triangle, dim=-1)
+            return output
     else:
         slice_shape = []
         for i in range(input.ndim()):
@@ -3074,6 +3173,39 @@ def geglu(x: Tensor) -> Tensor:
     '''
     a, b = chunk(x, 2, dim=-1)
     return a * gelu(b)
+
+
+def quick_gelu(x: Tensor) -> Tensor:
+    return x * sigmoid(1.702 * x)
+
+
+def gegelu(x: Tensor, limit: Optional[float] = None) -> Tensor:
+    # a, b = x[..., ::2], x[..., 1::2]
+    ndim = x.ndim()
+    a_starts = [0 for i in range(ndim)]
+    b_starts = [1 if i == (ndim - 1) else 0 for i in range(ndim)]
+    shapes = concat([
+        shape(x, i) / 2 if i == (ndim - 1) else shape(x, i) for i in range(ndim)
+    ])
+    strides = [2 if i == (ndim - 1) else 1 for i in range(ndim)]
+
+    a = slice(x, a_starts, shapes, strides)
+    b = slice(x, b_starts, shapes, strides)
+
+    if limit is not None:
+        a = clip(a, alpha=float(-1e20), beta=limit)
+        b = clip(b, alpha=-limit, beta=limit)
+
+    # C = B + 1
+    const1 = arange(constant(int32_array(1)), constant(int32_array(2)),
+                    trt_dtype_to_str(b.dtype))
+    for _ in range(ndim - 1):
+        const1 = expand_dims(const1, 0)
+
+    b_shape = concat([shape(b, i) for i in range(ndim)])
+    const1_arr = expand(const1, b_shape)
+
+    return quick_gelu(a) * (b + const1_arr)
 
 
 def group_norm(input: Tensor,
@@ -3964,6 +4096,8 @@ class RopeEmbeddingUtils:
             theta: float = 10000.0,
             scaling_short_factors: Tensor = 1.0,
             scaling_long_factors: Tensor = 1.0,
+            short_mscale=None,
+            long_mscale=None,
             dtype=np.float32):
 
         def _calc_mscale(scale):
@@ -3971,16 +4105,19 @@ class RopeEmbeddingUtils:
                 return 1.0
             return math.sqrt(1 + math.log(scale) / math.log(num_orig_pos))
 
-        mscale = _calc_mscale(num_pos / num_orig_pos)
+        if short_mscale is None:
+            short_mscale = _calc_mscale(num_pos / num_orig_pos)
+            long_mscale = short_mscale
 
-        def _compute_sinusoidal_positions(scale_factors,
-                                          for_attention_plugin=True):
+        def _compute_sinusoidal_positions(scale_factors, is_short,
+                                          for_attention_plugin):
             inv_freq = 1 / (scale_factors *
                             (theta**(np.arange(0, dim, 2) / dim)).astype(dtype))
             sinusoid_inp = np.einsum("i , j -> i j",
                                      np.arange(num_pos, dtype=dtype),
                                      inv_freq,
                                      dtype=dtype)
+
             if for_attention_plugin:
                 sinusoid_inp = np.expand_dims(sinusoid_inp, axis=-1)
                 concat = np.concatenate(
@@ -3989,13 +4126,17 @@ class RopeEmbeddingUtils:
                 concat = np.concatenate(
                     (np.sin(sinusoid_inp), np.cos(sinusoid_inp)), axis=1)
                 concat = np.expand_dims(concat, axis=0)
+
+            mscale = short_mscale if is_short else long_mscale
             return concat.astype(dtype) * mscale
 
         return _compute_sinusoidal_positions(
-            scaling_short_factors, False), _compute_sinusoidal_positions(
-                scaling_long_factors, False), _compute_sinusoidal_positions(
-                    scaling_short_factors, True), _compute_sinusoidal_positions(
-                        scaling_long_factors, True), mscale
+            scaling_short_factors, True, False), _compute_sinusoidal_positions(
+                scaling_long_factors,
+                False, False), _compute_sinusoidal_positions(
+                    scaling_short_factors, True,
+                    True), _compute_sinusoidal_positions(
+                        scaling_long_factors, False, True), short_mscale
 
     @staticmethod
     def rotate_every_two(tensor: Tensor) -> Tensor:
@@ -4206,9 +4347,11 @@ def gpt_attention(
     rotary_embedding_base: float = 10000.0,
     rotary_embedding_scale_type: RotaryScalingType = RotaryScalingType.none,
     rotary_embedding_scaling_factors: Optional[Tensor] = None,
-    rotary_embedding_m_scale: Optional[float] = None,
+    rotary_embedding_short_m_scale: Optional[float] = None,
+    rotary_embedding_long_m_scale: Optional[float] = None,
     rotary_embedding_scale: float = 1.0,
     rotary_embedding_max_positions: int = 1024,
+    rotary_embedding_original_max_positions: int = 1024,
     position_embedding_type: PositionEmbeddingType = PositionEmbeddingType.
     learned_absolute,
     rotary_cos_sin: Optional[Tensor] = None,
@@ -4218,6 +4361,10 @@ def gpt_attention(
     kv_cache_quant_mode: QuantMode = QuantMode(0),
     max_context_length: Optional[int] = None,
     mask_type: AttentionMaskType = AttentionMaskType.causal,
+    block_sparse_block_size: int = 64,
+    block_sparse_homo_head_pattern: bool = False,
+    block_sparse_num_local_blocks: int = 16,
+    block_sparse_vertical_stride: int = 8,
     alibi_slopes: Optional[Tensor] = None,
     tp_size: int = 1,
     tp_rank: int = 0,
@@ -4370,6 +4517,19 @@ def gpt_attention(
                 * tensorrt_llm.layers.AttentionMaskType.causal for GPT,
                 * tensorrt_llm.layers.AttentionMaskType.bidirectional for ChatGLM-6B,
                 * tensorrt_llm.layers.AttentionMaskType.bidirectionalglm for GLM-10B,
+                * tensorrt_llm.layers.AttentionMaskType.blocksparse for Phi-3-small,
+
+        block_sparse_block_size: int
+            Block size in block sparse attention
+
+        block_sparse_homo_head_pattern: bool
+            Do all attention heads share same vertical stride pattern?
+
+        block_sparse_num_local_blocks: int
+            Number of active blocks near diagonal
+
+        block_sparse_vertical_stride: int
+            Stride of active blocks in vertical dimension
 
         alibi_slopes: Tensor
             The ALiBi slopes. The ALiBi bias is computed on-the-fly in the kernel
@@ -4501,13 +4661,21 @@ def gpt_attention(
         "rotary_embedding_scale",
         np.array(rotary_embedding_scale, dtype=np.float32),
         trt.PluginFieldType.FLOAT32)
-    rotary_embedding_m_scale = trt.PluginField(
-        "rotary_embedding_m_scale",
-        np.array(rotary_embedding_m_scale, dtype=np.float32),
+    rotary_embedding_short_m_scale = trt.PluginField(
+        "rotary_embedding_short_m_scale",
+        np.array(rotary_embedding_short_m_scale, dtype=np.float32),
+        trt.PluginFieldType.FLOAT32)
+    rotary_embedding_long_m_scale = trt.PluginField(
+        "rotary_embedding_long_m_scale",
+        np.array(rotary_embedding_long_m_scale, dtype=np.float32),
         trt.PluginFieldType.FLOAT32)
     rotary_embedding_max_positions = trt.PluginField(
         "rotary_embedding_max_positions",
         np.array(rotary_embedding_max_positions, dtype=np.int32),
+        trt.PluginFieldType.INT32)
+    rotary_embedding_original_max_positions = trt.PluginField(
+        "rotary_embedding_original_max_positions",
+        np.array(rotary_embedding_original_max_positions, dtype=np.int32),
         trt.PluginFieldType.INT32)
     position_embedding_type = trt.PluginField(
         "position_embedding_type",
@@ -4532,6 +4700,22 @@ def gpt_attention(
     mask_type = trt.PluginField("mask_type", np.array([int(mask_type)],
                                                       np.int32),
                                 trt.PluginFieldType.INT32)
+    block_sparse_block_size = trt.PluginField(
+        "block_sparse_block_size", np.array([block_sparse_block_size],
+                                            np.int32),
+        trt.PluginFieldType.INT32)
+    block_sparse_homo_head_pattern = trt.PluginField(
+        "block_sparse_homo_head_pattern",
+        np.array(np.int8(block_sparse_homo_head_pattern), np.int8),
+        trt.PluginFieldType.INT8)
+    block_sparse_num_local_blocks = trt.PluginField(
+        "block_sparse_num_local_blocks",
+        np.array([block_sparse_num_local_blocks], np.int32),
+        trt.PluginFieldType.INT32)
+    block_sparse_vertical_stride = trt.PluginField(
+        "block_sparse_vertical_stride",
+        np.array([block_sparse_vertical_stride], np.int32),
+        trt.PluginFieldType.INT32)
     multi_block_mode = trt.PluginField(
         "multi_block_mode",
         np.array(np.int8(default_net().plugin_config.multi_block_mode),
@@ -4598,9 +4782,12 @@ def gpt_attention(
         unidirectional, q_scaling, qk_tanh_scale, position_embedding_type,
         rotary_embedding_dim, rotary_embedding_base,
         rotary_embedding_scale_type, rotary_embedding_scale,
-        rotary_embedding_m_scale, rotary_embedding_max_positions, tp_size,
-        tp_rank, unfuse_qkv_gemm, context_fmha_type, multi_block_mode,
+        rotary_embedding_short_m_scale, rotary_embedding_long_m_scale,
+        rotary_embedding_max_positions, rotary_embedding_original_max_positions,
+        tp_size, tp_rank, unfuse_qkv_gemm, context_fmha_type, multi_block_mode,
         enable_xqa, kv_cache_quant_mode_field, remove_input_padding, mask_type,
+        block_sparse_block_size, block_sparse_homo_head_pattern,
+        block_sparse_num_local_blocks, block_sparse_vertical_stride,
         paged_kv_cache, tokens_per_block, pf_type, max_context_length,
         qkv_bias_enabled, do_cross_attention_field, max_distance,
         pos_shift_enabled, dense_context_fmha, use_paged_context_fmha_field,
@@ -5063,6 +5250,7 @@ ACT2FN = {
     'gelu_new': gelu,
     'gelu_fast': gelu,
     'geglu': geglu,
+    'gegelu': gegelu,
     'identity': identity,
     'silu': silu,
     'softplus': softplus,

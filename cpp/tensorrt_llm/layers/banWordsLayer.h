@@ -42,21 +42,25 @@ public:
     BanWordsLayer(executor::DecodingMode const& mode, DecoderDomain const& decoderDomain, cudaStream_t stream,
         std::shared_ptr<tensorrt_llm::common::IAllocator> allocator);
 
-    ~BanWordsLayer() override = default;
+    ~BanWordsLayer() override;
 
     void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 const* batchSlots,
-        std::shared_ptr<BaseSetupParams> setupParams) override;
+        std::shared_ptr<BaseSetupParams> baseSetupParams) override;
 
     //! \brief Modifies 'outputs->logits' in-place with -INF for banned words
     void forwardAsync(std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs) override;
 
 private:
-    static void banRepeatNGrams(tc::Tensor& logits, std::shared_ptr<DynamicDecodeOutputParams> const& outputs,
-        std::shared_ptr<DynamicDecodeInputParams> const& params, runtime::SizeType32 const* batchSlots,
-        DecoderDomain const& decoderDomain, runtime::SizeType32 maxSeqLen, cudaStream_t stream);
+    void initialize();
+    void allocateBuffer();
+    void freeBuffer();
     static void banBadWords(tc::Tensor& logits, std::shared_ptr<DynamicDecodeOutputParams> const& outputs,
         std::shared_ptr<DynamicDecodeInputParams> const& params, runtime::SizeType32 const* batchSlots,
         DecoderDomain const& decoderDomain, runtime::SizeType32 maxSeqLen, cudaStream_t stream);
+    static void banRepeatNGrams(tc::Tensor& logits, std::shared_ptr<DynamicDecodeOutputParams> const& outputs,
+        std::shared_ptr<DynamicDecodeInputParams> const& inputs, runtime::SizeType32 const* batchSlots,
+        runtime::SizeType32 const* noRepeatNgramSizeDevice, DecoderDomain const& decoderDomain,
+        runtime::SizeType32 maxSeqLen, bool useNoRepeatNgramSize, cudaStream_t stream);
 
 private:
     using BaseLayer::mWorkspaceSize;
@@ -66,6 +70,10 @@ private:
     using BaseLayer::mAllocator;
 
     executor::DecodingMode mDecodingMode;
+
+    runtime::SizeType32* mNoRepeatNgramSizeDevice{nullptr};
+    std::vector<SizeType32> mNoRepeatNgramSize;
+    bool mUseNoRepeatNgramSize{false};
 };
 
 } // namespace layers

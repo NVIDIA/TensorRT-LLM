@@ -64,19 +64,30 @@ COPY tensorrt_llm tensorrt_llm
 COPY 3rdparty 3rdparty
 COPY setup.py requirements.txt requirements-dev.txt ./
 
+# Create cache directories for pip and ccache
+RUN mkdir -p /root/.cache/pip /root/.cache/ccache
+ENV CCACHE_DIR=/root/.cache/ccache
+# Build the TRT-LLM wheel
 ARG BUILD_WHEEL_ARGS="--clean --trt_root /usr/local/tensorrt --python_bindings --benchmarks"
-RUN python3 scripts/build_wheel.py ${BUILD_WHEEL_ARGS}
+RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=/root/.cache/ccache \
+    python3 scripts/build_wheel.py ${BUILD_WHEEL_ARGS}
 
 FROM ${DEVEL_IMAGE} as release
 
+# Create a cache directory for pip
+RUN mkdir -p /root/.cache/pip
+
 WORKDIR /app/tensorrt_llm
 COPY --from=wheel /src/tensorrt_llm/build/tensorrt_llm*.whl .
-RUN pip install tensorrt_llm*.whl --extra-index-url https://pypi.nvidia.com && \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install tensorrt_llm*.whl --extra-index-url https://pypi.nvidia.com && \
     rm tensorrt_llm*.whl
 COPY README.md ./
 COPY docs docs
 COPY cpp/include include
-RUN ln -sv $(python3 -c 'import site; print(f"{site.getsitepackages()[0]}/tensorrt_llm/libs")') lib && \
+RUN ln -sv $(python3 -c 'import site; print(f"{site.getsitepackages()[0]}/tensorrt_llm/bin")') bin && \
+    test -f bin/executorWorker && \
+    ln -sv $(python3 -c 'import site; print(f"{site.getsitepackages()[0]}/tensorrt_llm/libs")') lib && \
     test -f lib/libnvinfer_plugin_tensorrt_llm.so && \
     ln -sv lib/libnvinfer_plugin_tensorrt_llm.so lib/libnvinfer_plugin_tensorrt_llm.so.9 && \
     echo "/app/tensorrt_llm/lib" > /etc/ld.so.conf.d/tensorrt_llm.conf && \

@@ -1,15 +1,21 @@
+import hashlib
 import os
 import signal
 import sys
+import tempfile
 import traceback
 from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
 from typing import List, Optional, Union
 
+import filelock
+import huggingface_hub
 import torch
+from huggingface_hub import snapshot_download
 
 from tensorrt_llm.bindings import executor as tllme
+from tensorrt_llm.logger import set_level
 
 from ..bindings.executor import OutputConfig
 
@@ -187,13 +193,11 @@ def is_directory_empty(directory: Path) -> bool:
     return not any(directory.iterdir())
 
 
-def suppress_runtime_log():
-    ''' Suppress the runtime log if the environment variable is not set.  '''
-
+def init_log_level():
+    ''' Set the log level if the environment variable is not set.  '''
     if "TLLM_LOG_LEVEL" not in os.environ:
-        os.environ["TLLM_LOG_LEVEL"] = "ERROR"
-    if "TLLM_LOG_FIRST_RANK_ONLY" not in os.environ:
-        os.environ["TLLM_LOG_FIRST_RANK_ONLY"] = "ON"
+        set_level("warning")
+        os.environ["TLLM_LOG_LEVEL"] = "WARNING"
 
 
 def sigint_handler(signal, frame):
@@ -204,3 +208,26 @@ def sigint_handler(signal, frame):
 # Register the signal handler to handle SIGINT
 # This helps to deal with user's Ctrl+C
 signal.signal(signal.SIGINT, sigint_handler)
+# Use the system temporary directory to share the cache
+temp_dir = tempfile.gettempdir()
+
+
+def get_file_lock(model_name: str,
+                  cache_dir: Optional[str] = None) -> filelock.FileLock:
+    # Hash the model name to avoid invalid characters in the lock file path
+    hashed_model_name = hashlib.sha256(model_name.encode()).hexdigest()
+
+    cache_dir = cache_dir or temp_dir
+    os.makedirs(cache_dir, exist_ok=True)
+
+    lock_file_path = os.path.join(cache_dir, f"{hashed_model_name}.lock")
+
+    return filelock.FileLock(lock_file_path)
+
+
+def download_hf_model(model_name: str) -> Path:
+    with get_file_lock(model_name):
+        hf_folder = snapshot_download(
+            model_name,
+            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE)
+    return Path(hf_folder)

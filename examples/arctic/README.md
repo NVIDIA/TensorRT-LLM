@@ -70,7 +70,6 @@ trtllm-build --checkpoint_dir ./tmp/tllm_checkpoints/${ENGINE} \
              --output_dir ./tmp/trt_engines/${ENGINE} \
              --gpt_attention_plugin ${PREC_RAW} \
              --gemm_plugin ${PREC_RAW} \
-             --strongly_typed \
              --workers ${TP} |& tee tmp/trt_engines/${ENGINE}_build.log
 ```
 

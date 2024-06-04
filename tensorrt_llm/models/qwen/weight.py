@@ -167,18 +167,19 @@ def load_from_gptq_qwen(
         if qwen_type == 'qwen':
             qkv_bias = model_params[prefix + key_list[0] +
                                     suf].to(torch_dtype).cpu().contiguous()
+            q_emb = qkv_bias.shape[0] // 3
+            qkv_bias = qkv_bias.reshape(3, q_emb)
+            split_v = split(qkv_bias, mapping.tp_size, mapping.rank, dim=1)
+            qkv_bias = split_v.reshape(3 * (q_emb // mapping.tp_size))
         else:
             qkv_bias_list = []
             for comp in ["q_proj", "k_proj", "v_proj"]:
                 comp_part = model_params[prefix + key_list[0] + comp + suf].to(
                     torch_dtype).cpu().contiguous()
+                comp_part = torch_split(comp_part, dim=0)
                 qkv_bias_list.append(comp_part)
             qkv_bias = torch.cat(qkv_bias_list, dim=0)
-        q_emb = qkv_bias.shape[0] // 3
-        qkv_bias = qkv_bias.reshape(3, q_emb)
-        split_v = split(qkv_bias, mapping.tp_size, mapping.rank, dim=1)
-        split_v = split_v.reshape(3 * (q_emb // mapping.tp_size))
-        weights[tllm_prex + ".attention.qkv.bias"] = split_v
+        weights[tllm_prex + ".attention.qkv.bias"] = qkv_bias
         # 4.3 attention.dense
         qkv_dense_list = []
         for suf in suffixs:

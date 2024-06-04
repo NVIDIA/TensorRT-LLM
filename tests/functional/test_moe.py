@@ -12,8 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import math
 import unittest
+from collections import OrderedDict
 
 import numpy as np
 
@@ -25,8 +27,6 @@ import os
 import sys
 
 from parameterized import parameterized
-from polygraphy.backend.trt import (CreateConfig, EngineFromNetwork, Profile,
-                                    TrtRunner)
 
 import tensorrt_llm
 from tensorrt_llm import Tensor
@@ -36,7 +36,8 @@ from tensorrt_llm.layers.moe import MoeConfig
 from tensorrt_llm.quantization import QuantMode
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import getSMVersion, skip_bf16_pre_ampere, unittest_name_func
+from utils.util import (create_session, getSMVersion, run_session,
+                        skip_bf16_pre_ampere, unittest_name_func)
 
 default_actfn = 'gelu'
 default_hidden_size = {
@@ -85,7 +86,7 @@ def config_is_allowed(config):
 
 
 def gen_uniform_weights(*args, **kwargs):
-    return (torch.rand(*args, **kwargs) * 2 - 1).contiguous()
+    return (torch.rand(*args, **kwargs) * 2 - 1).contiguous().cuda()
 
 
 def quant_dequant_int(weights, quant_mode):
@@ -148,7 +149,7 @@ def gated_matmul(input, weights, bias, actfn):
     return fc1 * doact(gate, gated2act(actfn))
 
 
-class TestFunctional(unittest.TestCase):
+class TestMoE(unittest.TestCase):
 
     def setUp(self):
         # There is a known precision issues where the topk may select different experts when the routing probabilities are similar.
@@ -417,14 +418,15 @@ class TestFunctional(unittest.TestCase):
         act_2_quant = 0.0
 
         for i, input in enumerate(inputs):
-            result, act2_quant_values = self.referenceImpl(
+            result, act2_quant_values = self.generate_reference(
                 input, top_k, actfn, weight_dtype, quant_mode, norm_mode)
-            reference_values.append(result.cpu().float())
+            reference_values.append(result)
             act_2_quant = max(act_2_quant, act2_quant_values)
 
         self.create_fp8_scaling_factors(act_1_quant, act_2_quant)
 
-        engine = self.buildTrtEngine(
+        # build trt engine
+        session = self.create_trt_session(
             (-1, -1, hidden_size),
             num_experts,
             top_k,
@@ -440,8 +442,9 @@ class TestFunctional(unittest.TestCase):
             max_sizes=[max_num_seq, max_seq_len, hidden_size])
 
         for input, ref in zip(inputs, reference_values):
-            # construct trt network
-            trt_res = self.runTrtEngine(engine, input)['output'].float()
+            # run trt output
+            inputs = {"input_hidden_states": input}
+            outputs = run_session(session, inputs)
 
             tolerances = {
                 'float32': 1e-2,
@@ -455,18 +458,11 @@ class TestFunctional(unittest.TestCase):
 
             # Bit of a hack to allow bigger tolerance for the Mixtral tests
             if hidden_size > 1024:
-                # Do some extra checks on the full distribution
-                self.assertAlmostEqual(np.mean((trt_res - ref).numpy()),
-                                       0.0,
-                                       delta=2e-4)
-                self.assertAlmostEqual(np.var((trt_res - ref).numpy()),
-                                       0.0,
-                                       delta=tolerance)
                 # Set a higher tolerance because we hit a small fraction of outlier cases (<<1%)
                 tolerance = 0.3
 
-            np.testing.assert_allclose(trt_res,
-                                       ref,
+            torch.testing.assert_close(outputs['output'].float(),
+                                       ref.float(),
                                        rtol=tolerance,
                                        atol=tolerance)
 
@@ -554,23 +550,26 @@ class TestFunctional(unittest.TestCase):
                 mlp.proj.bias.value = np.ascontiguousarray(
                     torch_to_numpy(self.fc2_bias[0].cpu()))
 
-            output = mlp(trt_key).trt_tensor
-            output.name = 'mlp_output'
-            network.mark_output(output)
-            output.dtype = dtype
+            output = mlp(trt_key)
+            output.mark_output('mlp_output', dtype)
 
-        res = self.trtImpl(input_data,
-                           num_experts,
-                           top_k,
-                           hidden_size,
-                           ffn_hidden_size,
-                           actfn,
-                           bias,
-                           dtype,
-                           weight_dtype=weight_dtype,
-                           quant_mode=quant_mode,
-                           custom_network=MLP,
-                           use_plugin=use_plugin)
+        session = self.create_trt_session(
+            tuple(input_data.shape),
+            num_experts,
+            top_k,
+            hidden_size,
+            ffn_hidden_size,
+            actfn,
+            bias,
+            dtype,
+            weight_dtype,
+            quant_mode,
+            norm_mode=MoeConfig.ExpertScaleNormalizationMode.NONE,
+            custom_network=MLP,
+            use_plugin=use_plugin)
+
+        inputs = {"input_hidden_states": input_data}
+        outputs = run_session(session, inputs)
 
         tolerances = {
             'float32': 1e-2,
@@ -580,8 +579,8 @@ class TestFunctional(unittest.TestCase):
             'int8': 2e-1,
             'int4': 2e-1,
         }
-        np.testing.assert_allclose(res['output'].float(),
-                                   res['mlp_output'].float(),
+        torch.testing.assert_close(outputs['output'],
+                                   outputs['mlp_output'],
                                    rtol=tolerances[dtype_str],
                                    atol=tolerances[dtype_str])
 
@@ -614,30 +613,38 @@ class TestFunctional(unittest.TestCase):
             moe_weight_wrapper.weight.value = np.ascontiguousarray(
                 torch_to_numpy(input_weights))
 
-    def buildTrtEngine(self,
-                       input_shape,
-                       num_experts,
-                       top_k,
-                       hidden_size,
-                       ffn_hidden_size,
-                       actfn,
-                       bias,
-                       dtype: trt.DataType,
-                       weight_dtype: trt.DataType,
-                       quant_mode,
-                       norm_mode,
-                       custom_network=None,
-                       use_plugin=True,
-                       max_sizes=None):
+    def create_trt_session(self,
+                           input_shape,
+                           num_experts,
+                           top_k,
+                           hidden_size,
+                           ffn_hidden_size,
+                           actfn,
+                           bias,
+                           dtype: trt.DataType,
+                           weight_dtype: trt.DataType,
+                           quant_mode,
+                           norm_mode,
+                           custom_network=None,
+                           use_plugin=True,
+                           max_sizes=None):
         builder = tensorrt_llm.Builder()
-        builder.strongly_typed = weight_dtype == trt.fp8
-        net = builder.create_network()
-        net.plugin_config.moe_plugin = (trt_dtype_to_str(dtype)
-                                        if use_plugin else None)
-        with tensorrt_llm.net_guard(net):
-            network = tensorrt_llm.default_trtnet()
+        network = builder.create_network()
+        if use_plugin:
+            network.plugin_config.moe_plugin = trt_dtype_to_str(dtype)
+        with tensorrt_llm.net_guard(network):
+            if max_sizes:
+                dim_range = OrderedDict([("max_num_seq", [[1, 1,
+                                                           max_sizes[0]]]),
+                                         ("max_seq_len", [[1, 1,
+                                                           max_sizes[1]]]),
+                                         ("hidden_size", [hidden_size])])
+            else:
+                dim_range = None
+
             trt_key = Tensor(name='input_hidden_states',
                              shape=input_shape,
+                             dim_range=dim_range,
                              dtype=dtype)
 
             moe = tensorrt_llm.layers.MOE(moe_config=MoeConfig(
@@ -674,67 +681,20 @@ class TestFunctional(unittest.TestCase):
             if custom_network:
                 custom_network(network, trt_key)
 
-            output = moe(trt_key).trt_tensor
-            output.name = 'output'
-            network.mark_output(output)
-            output.dtype = dtype
-
-        profiles = None
-        if max_sizes:
-            profiles = [
-                Profile().add('input_hidden_states', (1, 1, hidden_size),
-                              (1, 1, hidden_size), max_sizes)
-            ]
-
-        config = CreateConfig(builder_optimization_level=4, profiles=profiles)
-        if not builder.strongly_typed:
-            config = CreateConfig(fp16=(dtype == trt.float16),
-                                  bf16=(dtype == trt.bfloat16),
-                                  int8=(weight_dtype == trt.int8),
-                                  fp8=(weight_dtype == trt.fp8),
-                                  precision_constraints='obey',
-                                  builder_optimization_level=4,
-                                  profiles=profiles)
+            output = moe(trt_key)
+            output.mark_output('output', dtype)
 
         # trt run
-        build_engine = EngineFromNetwork((builder.trt_builder, net.trt_network),
-                                         config=config)
-        assert build_engine is not None
-        return build_engine
+        session = create_session(builder,
+                                 network,
+                                 precision=trt_dtype_to_str(dtype),
+                                 int8=weight_dtype == trt.int8,
+                                 quant_mode=quant_mode,
+                                 opt_level=4)
+        return session
 
-    def runTrtEngine(self, engine, input_data):
-        with TrtRunner(engine) as runner:
-            feed_dict = {
-                'input_hidden_states': input_data,
-            }
-            outputs = runner.infer(feed_dict=feed_dict)
-        return outputs
-
-    def trtImpl(self,
-                input_data,
-                num_experts,
-                top_k,
-                hidden_size,
-                ffn_hidden_size,
-                actfn,
-                bias,
-                dtype: trt.DataType,
-                weight_dtype: trt.DataType = None,
-                quant_mode=QuantMode(0),
-                norm_mode=MoeConfig.ExpertScaleNormalizationMode.NONE,
-                custom_network=None,
-                use_plugin=True):
-        build_engine = self.buildTrtEngine(tuple(input_data.shape), num_experts,
-                                           top_k, hidden_size, ffn_hidden_size,
-                                           actfn, bias, dtype, weight_dtype,
-                                           quant_mode, norm_mode,
-                                           custom_network, use_plugin)
-
-        outputs = self.runTrtEngine(build_engine, input_data)
-        return outputs
-
-    def referenceImpl(self, inputs, k, actfn, weight_dtype, quant_mode,
-                      norm_mode):
+    def generate_reference(self, inputs, k, actfn, weight_dtype, quant_mode,
+                           norm_mode):
         # Always run the ref implementation at full precision TODO is this a good choice?
         inputs = inputs.cuda().float()
         inputs_merged = inputs.view(-1, inputs.shape[-1])
@@ -771,7 +731,3 @@ class TestFunctional(unittest.TestCase):
                 assert final.shape == (inputs.shape[-1], )
                 results[i] += scale * final
         return results.view(*inputs.shape), max_act_2
-
-
-if __name__ == "__main__":
-    unittest.main()

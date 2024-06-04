@@ -7,7 +7,7 @@ from tensorrt_llm import logger
 from tensorrt_llm._utils import str_dtype_to_torch, torch_to_numpy
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import MedusaLM
-from tensorrt_llm.models.llama.weight import split
+from tensorrt_llm.models.convert_utils import split
 
 
 def load_medusa_hf(medusa_path: str,

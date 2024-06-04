@@ -565,6 +565,7 @@ class LoraManager(object):
             all_weights = get_all_hf_lora_weights(lora_model, hf_modules,
                                                   component)
             rank = int(hf_config["r"])
+            rs_lora = bool(hf_config.get("use_rslora", False))
 
             self._lora_uid_to_low_ranks[uid] = {}
             self._lora_weights_pointers_list[uid] = {}
@@ -629,7 +630,10 @@ class LoraManager(object):
 
                     t_in = t_in.cuda().contiguous()
                     t_out = t_out.cuda().contiguous()
-                    scale = float(hf_config["lora_alpha"]) / rank
+                    if rs_lora:
+                        scale = float(hf_config["lora_alpha"]) / np.sqrt(rank)
+                    else:
+                        scale = float(hf_config["lora_alpha"]) / rank
                     t_out = t_out * scale
                     t_in = t_in.to(str_dtype_to_torch(dtype))
                     t_out = t_out.to(str_dtype_to_torch(dtype))

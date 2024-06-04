@@ -18,11 +18,43 @@
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
 
-# Exclude files in the cutlass_kernels and unfusedAttentionKernels folder
+# Exclude files in the cutlass_kernels and decoderMaskedMultiheadAttention
+# folder
 list(FILTER SRC_CPP EXCLUDE REGEX "cutlass_kernels/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "cutlass_kernels/.*")
 list(FILTER SRC_CPP EXCLUDE REGEX "decoderMaskedMultiheadAttention/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "decoderMaskedMultiheadAttention/.*")
+
+function(filter_cuda_archs ARCH SOURCES_VAR)
+  if(NOT "${ARCH}" IN_LIST CMAKE_CUDA_ARCHITECTURES
+     AND NOT "${ARCH}-real" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
+    set(FILTER_REGEX ".*_sm(_)?${ARCH}[.]cubin[.]cpp")
+    list(APPEND SOURCES ${${SOURCES_VAR}})
+    list(APPEND SOURCES_FILTERED ${SOURCES})
+    list(FILTER SOURCES_FILTERED INCLUDE REGEX "${FILTER_REGEX}")
+    list(LENGTH SOURCES_FILTERED SOURCES_FILTERED_LEN)
+    message(
+      STATUS
+        "Excluding ${SOURCES_FILTERED_LEN} cubins for SM ${ARCH} from ${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    foreach(filtered_item ${SOURCES_FILTERED})
+      message(VERBOSE "- ${filtered_item}")
+    endforeach()
+    list(FILTER SOURCES EXCLUDE REGEX "${FILTER_REGEX}")
+    set(${SOURCES_VAR}
+        "${SOURCES}"
+        PARENT_SCOPE)
+    if(SOURCES_FILTERED_LEN GREATER 0)
+      add_compile_definitions("EXCLUDE_SM_${ARCH}")
+    endif()
+  endif()
+endfunction()
+
+filter_cuda_archs("70" SRC_CPP)
+filter_cuda_archs("80" SRC_CPP)
+filter_cuda_archs("86" SRC_CPP)
+filter_cuda_archs("89" SRC_CPP)
+filter_cuda_archs("90" SRC_CPP)
 
 if(ENABLE_MULTI_DEVICE EQUAL 0)
   list(FILTER SRC_CU EXCLUDE REGEX "customAllReduceKernels*.*cu$")

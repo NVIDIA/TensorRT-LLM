@@ -73,9 +73,11 @@ constexpr inline T roundUp(T a, T b)
 
 } // namespace
 
-size_t DecoderXQARunner::getWorkspaceSize(int max_batch_beam_size)
+size_t DecoderXQARunner::getWorkspaceSize(int max_batch_beam_size, int max_num_tokens)
 {
-    size_t workspace_size = 0;
+    // buffer for RoPE / output quantization.
+    constexpr size_t kXQA_OUT_ELEM_SIZE = 2; // fp16 or bf16.
+    size_t workspace_size = kXQA_OUT_ELEM_SIZE * mHeadSize * mNumHeads * max_num_tokens;
     if (mMultiBlockMode)
     {
         int workspaces[4];
@@ -90,7 +92,8 @@ size_t DecoderXQARunner::getWorkspaceSize(int max_batch_beam_size)
             = roundUp<int32_t>(sizeof(__half) * kMaxBeamWidth * group_size * mHeadSize, 128);
         workspaces[3] = multi_block_workspace_alignment * xqaMaxNbCtaPerKVHeadFactor() * mNumKVHeads
             * divUp(max_batch_beam_size, kMaxBeamWidth);
-        workspace_size = roundUp(workspaces[0], multi_block_workspace_alignment)
+        workspace_size = roundUp<size_t>(workspace_size, multi_block_workspace_alignment)
+            + roundUp(workspaces[0], multi_block_workspace_alignment)
             + roundUp(workspaces[1], multi_block_workspace_alignment)
             + roundUp(workspaces[2], multi_block_workspace_alignment)
             + roundUp(workspaces[3], multi_block_workspace_alignment)

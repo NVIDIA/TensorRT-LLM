@@ -14,7 +14,7 @@ We first describe how to run each model on a single GPU. We then provide general
 - [Fuyu](#fuyu)
 - [Kosmos-2](#kosmos-2)
 - [LLaVA and VILA](#llava-and-vila)
-- [Neva](#neva)
+- [NeVA](#neva)
 - [Video NeVA](#video-neva)
 - [Nougat](#nougat)
 - [Enabling tensor parallelism for multi-GPU](#enabling-tensor-parallelism-for-multi-gpu)
@@ -33,7 +33,6 @@ We first describe how to run each model on a single GPU. We then provide general
         --output_dir tmp/trt_models/${MODEL_NAME}/bfloat16 \
         --tp_size 1 \
         --pp_size 1 \
-        --weight_data_type float32 \
         --dtype bfloat16 \
         --max_multimodal_len 256 # 8 (max_batch_size) * 32 (num_visual_features)
     ```
@@ -41,8 +40,8 @@ We first describe how to run each model on a single GPU. We then provide general
 2. Build TRT-LLM engine from TRT-LLM checkpoint
 
     ```bash
-    trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/bfloat16/tp1/pp1/encoder \
-        --output_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/bfloat16/tp1/encoder \
+    trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/bfloat16/encoder \
+        --output_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/bfloat16/encoder \
         --paged_kv_cache disable \
         --moe_plugin disable \
         --enable_xqa disable \
@@ -59,8 +58,8 @@ We first describe how to run each model on a single GPU. We then provide general
         --max_multimodal_len 256 # 8 (max_batch_size) * 32 (num_visual_features)
 
     # Same command for decoder but don't set --max_multimodal_len
-    trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/bfloat16/tp1/pp1/decoder \
-        --output_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/bfloat16/tp1/decoder \
+    trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/bfloat16/decoder \
+        --output_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/bfloat16/decoder \
         --paged_kv_cache disable \
         --moe_plugin disable \
         --enable_xqa disable \
@@ -79,7 +78,7 @@ We first describe how to run each model on a single GPU. We then provide general
 
     **NOTE**: `max_multimodal_len = max_batch_size * num_visual_features`, so if you change max_batch_size, max multimodal length **MUST** be changed accordingly.
 
-    The built T5 engines are located in `./tmp/trt_engines/${MODEL_NAME}/1-gpu/bfloat16/tp1`.
+    The built T5 engines are located in `./tmp/trt_engines/${MODEL_NAME}/1-gpu/bfloat16`.
 
 3. Build TensorRT engines for visual components
 
@@ -99,7 +98,7 @@ We first describe how to run each model on a single GPU. We then provide general
         --input_text "Question: which city is this? Answer:" \
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
         --visual_engine_dir visual_engines/${MODEL_NAME} \
-        --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/bfloat16/tp1
+        --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/bfloat16
     ```
 
 ## BLIP2-OPT
@@ -242,15 +241,14 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
         --output_dir tmp/trt_models/${MODEL_NAME}/float16 \
         --tp_size 1 \
         --pp_size 1 \
-        --weight_data_type float32 \
         --dtype float16
     ```
 
 2. Build TRT-LLM engine from TRT-LLM checkpoint
 
     ```bash
-    trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/float16/tp1/pp1/decoder \
-        --output_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/float16/tp1/decoder \
+    trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/float16/decoder \
+        --output_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/float16/decoder \
         --paged_kv_cache disable \
         --moe_plugin disable \
         --enable_xqa disable \
@@ -267,7 +265,7 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
         --max_input_len 1
     ```
 
-    The built deplot engines are located in `./tmp/trt_engines/${MODEL_NAME}/1-gpu/float16/tp1`.
+    The built deplot engines are located in `./tmp/trt_engines/${MODEL_NAME}/1-gpu/float16`.
 
 3. Build TensorRT engines for visual components
 
@@ -287,7 +285,7 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
         --input_text "" \
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
         --visual_engine_dir visual_engines/${MODEL_NAME} \
-        --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/float16/tp1
+        --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/float16
     ```
 
 ## Fuyu
@@ -327,7 +325,7 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
     python run.py \
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
         --visual_engine_dir visual_engines/${MODEL_NAME} \
-        --llm_engine_dir trt_engines/${MODEL_NAME}/1-gpu/bfloat16/tp1
+        --llm_engine_dir trt_engines/${MODEL_NAME}/1-gpu/bfloat16
     ```
 
 ## Kosmos-2
@@ -366,7 +364,7 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
     python run.py \
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
         --visual_engine_dir visual_engines/${MODEL_NAME} \
-        --llm_engine_dir trt_engines/${MODEL_NAME}/1-gpu/bfloat16/tp1
+        --llm_engine_dir trt_engines/${MODEL_NAME}/1-gpu/bfloat16
     ```
 
 ## LLaVA and VILA
@@ -659,12 +657,11 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
         --output_dir tmp/trt_models/${MODEL_NAME}/bfloat16 \
         --tp_size 1 \
         --pp_size 1 \
-        --weight_data_type float32 \
         --dtype bfloat16 \
         --nougat
 
-    trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/bfloat16/tp1/pp1/decoder \
-        --output_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/bfloat16/tp1/decoder \
+    trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/bfloat16/decoder \
+        --output_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/bfloat16/decoder \
         --paged_kv_cache disable \
         --moe_plugin disable \
         --enable_xqa disable \
@@ -688,7 +685,7 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
     python run.py \
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
         --visual_engine_dir visual_engines/${MODEL_NAME} \
-        --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/bfloat16/tp1 \
+        --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/bfloat16 \
     ```
 
     Note: Nougat models usually do not need a text prompt.

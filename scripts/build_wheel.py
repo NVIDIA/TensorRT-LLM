@@ -39,7 +39,8 @@ def working_directory(path):
         os.chdir(prev_cwd)
 
 
-def main(build_type: str = "Release",
+def main(*,
+         build_type: str = "Release",
          build_dir: Path = None,
          dist_dir: Path = None,
          cuda_architectures: str = None,
@@ -50,6 +51,7 @@ def main(build_type: str = "Release",
          nccl_root: str = None,
          clean: bool = False,
          use_ccache: bool = False,
+         fast_build: bool = False,
          cpp_only: bool = False,
          install: bool = False,
          skip_building_wheel: bool = False,
@@ -148,6 +150,9 @@ def main(build_type: str = "Release",
         cmake_def_args.append(
             f"-DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache"
         )
+
+    if fast_build:
+        cmake_def_args.append(f"-DFAST_BUILD=ON")
 
     build_pyt = "OFF" if cpp_only else "ON"
     th_common_lib = "" if cpp_only else "th_common"
@@ -304,6 +309,14 @@ if __name__ == "__main__":
                         default=False,
                         action="store_true",
                         help="Use ccache compiler driver")
+    parser.add_argument(
+        "--fast_build",
+        "-f",
+        default=False,
+        action="store_true",
+        help=
+        "Skip compiling some kernels to accelerate compilation -- for development only"
+    )
     parser.add_argument("--job_count",
                         "-j",
                         const=cpu_count(),

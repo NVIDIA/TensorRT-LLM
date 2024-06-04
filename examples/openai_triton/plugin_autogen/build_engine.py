@@ -2,6 +2,7 @@ import argparse
 import math
 # include plugins
 # yapf: disable
+import os
 import sys
 import time
 from pathlib import Path
@@ -17,7 +18,7 @@ from tensorrt_llm.functional import Tensor
 from tensorrt_llm.logger import logger
 from tensorrt_llm.network import net_guard
 
-sys.path.append('./tmp')
+sys.path.append(os.environ.get('PLUGIN_GEN_WORKSPACE', './tmp'))
 from functional import fused_attention_kernel # isort:skip
 # yapf: enable
 
@@ -113,8 +114,8 @@ def build_engine(builder: Builder, builder_config: BuilderConfig,
         print('dot:')
         print(network.to_dot())
 
-        layer = network.get_layer_by_name(
-            "FmhaLayer/PLUGIN_V2_fused_attention_kernelPlugin_2").as_layer()
+        layer = network.get_layer_by_name(next(
+            network.get_layers()).name).as_layer()
         print('layer', layer.plugin.plugin_type)
         print('layer', layer.plugin.plugin_version)
         print('layer', layer.plugin.plugin_namespace)

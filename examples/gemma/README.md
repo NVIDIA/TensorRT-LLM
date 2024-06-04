@@ -399,7 +399,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_input_len 3000 \
              --max_output_len 100 \
              --enable_xqa enable \
-             --strongly_type \
              --lookup_plugin bfloat16 \
              --output_dir ${ENGINE_PATH}
 
@@ -669,7 +668,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_input_len 3000 \
              --max_output_len 100 \
              --enable_xqa enable \
-             --strongly_type \
              --lookup_plugin bfloat16 \
              --output_dir ${ENGINE_PATH}
 

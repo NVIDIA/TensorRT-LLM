@@ -49,8 +49,7 @@ class ResidualLayer(Module):
                                        num_heads=config.num_attention_heads,
                                        dtype=config.dtype,
                                        tp_group=config.mapping.tp_group,
-                                       tp_size=config.mapping.tp_size,
-                                       tp_rank=config.mapping.tp_rank)
+                                       tp_size=config.mapping.tp_size)
         elif self.temporal_block_type == 'attention':
             layer_types = config.layer_types * (
                 (layer_idx + 1) // layer_type_len)

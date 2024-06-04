@@ -239,6 +239,7 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
     samplingConfig.topP = std::vector{0.0f};
     samplingConfig.lengthPenalty = std::vector{1.0f};
     samplingConfig.earlyStopping = std::vector{1};
+    samplingConfig.noRepeatNgramSize = std::vector{1 << 30};
 
     auto const padId = modelIds.padId;
     auto endId = modelIds.endId;

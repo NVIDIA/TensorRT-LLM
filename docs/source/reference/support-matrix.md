@@ -73,6 +73,7 @@ The following table shows the supported software for TensorRT-LLM.
         - [GPT-Nemo](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt)
         - [GPT-NeoX](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gptneox)
         - [InternLM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/internlm)
+        - [InternLM2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/internlm2)
         - [LLaMA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama)
         - [LLaMA-v2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama)
         - [Mamba](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mamba)

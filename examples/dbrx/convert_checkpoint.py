@@ -689,7 +689,7 @@ if __name__ == '__main__':
                 'block_embedding'
             ],
         },
-        'moe_config': {
+        'moe': {
             "num_experts": args.moe_num_experts,
             "top_k": args.moe_top_k,
             "tp_mode": args.moe_tp_mode,
@@ -701,10 +701,6 @@ if __name__ == '__main__':
             'pp_size': args.pp_size,
         },
         'clip_qkv': args.clip_qkv,
-        'moe_num_experts': args.moe_num_experts,
-        'moe_top_k': args.moe_top_k,
-        'moe_tp_mode': args.moe_tp_mode,
-        'moe_normalization_mode': args.moe_renorm_mode,
         'dense_context_fmha': args.dense_context_fmha,
     }
 

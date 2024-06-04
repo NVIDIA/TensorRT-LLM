@@ -68,7 +68,7 @@ class TestGPTNeoX(unittest.TestCase):
 
     def _gen_tensorrt_llm_network(self, network, builder, hf_gpt, gpt_config,
                                   batch_size, beam_width, input_len, output_len,
-                                  fp16, gpt_attention_plugin, rank,
+                                  dtype, gpt_attention_plugin, rank,
                                   tensor_parallel,
                                   apply_query_key_layer_scaling):
         num_layers = gpt_config.num_hidden_layers
@@ -80,7 +80,6 @@ class TestGPTNeoX(unittest.TestCase):
 
         list(range(tensor_parallel))
 
-        dtype = 'float16' if fp16 else 'float32'
         config = {
             'architecture': 'GPTNeoXForCausalLM',
             'dtype': dtype,
@@ -147,7 +146,6 @@ class TestGPTNeoX(unittest.TestCase):
 
         runtime = None
         builder = Builder()
-        fp16 = (dtype == 'float16')
 
         with tempfile.TemporaryDirectory() as tmpdirname:
             builder_config = builder.create_builder_config(
@@ -156,7 +154,7 @@ class TestGPTNeoX(unittest.TestCase):
                 timing_cache='model.cache',
                 tensor_parallel=world_size,  # TP only
                 use_refit=use_refit,
-                strongly_typed=fp16,
+                strongly_typed=True,
             )
             network = builder.create_network()
             network.plugin_config.to_legacy_setting()
@@ -170,7 +168,7 @@ class TestGPTNeoX(unittest.TestCase):
 
             self._gen_tensorrt_llm_network(network, builder, hf_gpt, gpt_config,
                                            batch_size, beam_width, input_len,
-                                           output_len, fp16,
+                                           output_len, dtype,
                                            use_attention_plugin, rank,
                                            world_size,
                                            apply_query_key_layer_scaling)

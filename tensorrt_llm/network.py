@@ -15,6 +15,7 @@
 import collections
 import contextlib
 import hashlib
+import inspect
 import weakref
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -241,6 +242,16 @@ class Network(object):
         original_layer_name = layer.name
         layer_name = str(layer.type).split('.')[-1]
         current_module = self._module_call_stack.get_current_module()
+
+        func_stack = []
+        frame = inspect.currentframe().f_back.f_back
+        while frame:
+            func_name = frame.f_code.co_name
+            if func_name == "forward":
+                break
+            func_stack.insert(0, func_name)
+            frame = frame.f_back
+        current_module = f"{current_module}.{'.'.join(func_stack)}"
 
         if layer.type == trt.LayerType.PLUGIN_V2:
             layer_name = '_'.join(

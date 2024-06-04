@@ -43,7 +43,7 @@ from utils import (DEFAULT_HF_MODEL_DIRS, DEFAULT_PROMPT_TEMPLATES,
                    load_tokenizer, read_model_name)
 
 import tensorrt_llm
-import tensorrt_llm.profiler
+import tensorrt_llm.profiler as profiler
 from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime import PYTHON_BINDINGS, ModelRunner
 
@@ -173,8 +173,7 @@ def parse_arguments(args=None):
     parser.add_argument(
         "--task",
         type=str,
-        # choices=list(DATA_NAME_TO_MAX_NEW_TOKENS.keys()) + ["all"],
-        choices=['passkey'],
+        choices=['passkey', 'kv_retrieval'],
         required=True,
         help=
         "Which task to use. Note that \"all\" can only be used in `compute_scores.py`.",  # noqa
@@ -351,29 +350,32 @@ def main(args):
         args.stop_idx = len(examples)
 
     output_path = None
-    if args.output_dir is not None:
-        result_dir = Path(args.output_dir, model_name)
-        result_dir.mkdir(exist_ok=True, parents=True)
+    if runtime_rank == 0:
+        if args.output_dir is not None:
+            result_dir = Path(args.output_dir, model_name)
+            result_dir.mkdir(exist_ok=True, parents=True)
 
-        if args.stop_idx is None:
-            output_path = (result_dir / f"preds_{data_name}.jsonl")
-        else:
-            output_path = (
-                result_dir /
-                f"preds_{data_name}_{args.start_idx}-{args.stop_idx}.jsonl"  # noqa
-            )
+            if args.stop_idx is None:
+                output_path = (result_dir / f"preds_{data_name}.jsonl")
+            else:
+                output_path = (
+                    result_dir /
+                    f"preds_{data_name}_{args.start_idx}-{args.stop_idx}.jsonl"  # noqa
+                )
 
     prompt_template = None
     if args.use_prompt_template and model_name in DEFAULT_PROMPT_TEMPLATES:
         prompt_template = DEFAULT_PROMPT_TEMPLATES[model_name]
 
-    preds = []
-    logger.info("==== Evaluation ====")
-    logger.info(f"# examples: {len(examples)}")
-    logger.info(f"Start index: {args.start_idx}")
-    logger.info(f"Stop index: {args.stop_idx}")
-    logger.info(f"Max tokens: {max_tokens}")
+    if runtime_rank == 0:
+        preds = []
+        logger.info("==== Evaluation ====")
+        logger.info(f"# examples: {len(examples)}")
+        logger.info(f"Start index: {args.start_idx}")
+        logger.info(f"Stop index: {args.stop_idx}")
+        logger.info(f"Max tokens: {max_tokens}")
     assert args.batch_size == 1
+    profiler.start('Evaluation')
     for i in range(args.start_idx, args.stop_idx):
         eg = examples[i]
         input_text = [create_prompt(eg, data_name, args.data_dir)]
@@ -389,9 +391,10 @@ def main(args):
             model_version=model_version)
         input_lengths = [x.size(0) for x in batch_input_ids]
 
-        logger.debug(f"====== Example {i} ======")
-        logger.debug(f"input_text: {input_text}")
-        logger.debug(f"answer: {get_answer(eg, data_name)}")
+        if runtime_rank == 0:
+            logger.debug(f"====== Example {i} ======")
+            logger.debug(f"input_text: {input_text}")
+            logger.debug(f"answer: {get_answer(eg, data_name)}")
         outputs = runner.generate(
             batch_input_ids,
             max_new_tokens=max_tokens,
@@ -420,28 +423,34 @@ def main(args):
             return_dict=True,
             medusa_choices=args.medusa_choices)
         torch.cuda.synchronize()
-        output_ids = outputs['output_ids']
-        output_beams_list = [
-            tokenizer.batch_decode(output_ids[batch_idx, :,
-                                              input_lengths[batch_idx]:],
-                                   skip_special_tokens=True)
-            for batch_idx in range(args.batch_size)
-        ]
+        if runtime_rank == 0:
+            output_ids = outputs['output_ids']
+            output_beams_list = [
+                tokenizer.batch_decode(output_ids[batch_idx, :,
+                                                  input_lengths[batch_idx]:],
+                                       skip_special_tokens=True)
+                for batch_idx in range(args.batch_size)
+            ]
 
-        logger.debug(f"preds: {output_beams_list[0]}")
-        preds.append({
-            "id": i,
-            "prediction": output_beams_list[0][0],
-            "ground_truth": get_answer(eg, data_name),
-        })
-        if output_path is not None:
-            dump_jsonl(preds, output_path)
+            logger.debug(f"preds: {output_beams_list[0]}")
+            preds.append({
+                "id": i,
+                "prediction": output_beams_list[0][0],
+                "ground_truth": get_answer(eg, data_name),
+            })
+            if output_path is not None:
+                dump_jsonl(preds, output_path)
+    profiler.stop('Evaluation')
 
-    logger.info("Compute the score")
-    acc = compute_scores(preds, args.task)
-    logger.info(f"accuracy of {len(preds)} examples: {acc}")
-    if args.tensorrt_llm_accuracy_threshold is not None:
-        assert acc >= args.tensorrt_llm_accuracy_threshold, f"acc ({acc}) < tensorrt_llm_accuracy_threshold ({args.tensorrt_llm_accuracy_threshold})"
+    if runtime_rank == 0:
+        logger.info("Compute the score")
+        acc = compute_scores(preds, args.task)
+        logger.info(
+            f'Evaluation takes: {profiler.elapsed_time_in_sec("Evaluation")} sec.'
+        )
+        logger.info(f"accuracy of {len(preds)} examples: {acc}")
+        if args.tensorrt_llm_accuracy_threshold is not None:
+            assert acc >= args.tensorrt_llm_accuracy_threshold, f"acc ({acc}) < tensorrt_llm_accuracy_threshold ({args.tensorrt_llm_accuracy_threshold})"
 
 
 if __name__ == "__main__":

@@ -215,43 +215,43 @@ void PenaltyLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, SizeType
     bool const useFrequencyPenalty
         = mDecodingMode.isUseFrequencyPenalty() && penaltyParams.frequencyPenalty.has_value();
     bool const useMinLength = mDecodingMode.isUseMinLength() && penaltyParams.minLength.has_value();
-    if (useTemperature)
-    {
-        fillBuffers(penaltyParams.temperature, DefaultDecodingParams::getTemperature(), mTemperature,
-            mTemperatureDevice, batchSlotsHost, getLimitsPenalty(DecodingPenaltyType::Temperature),
-            "temperature penalty");
-    }
-    if (useRepetitionPenalty)
-    {
-        fillBuffers(penaltyParams.repetitionPenalty, DefaultDecodingParams::getRepetitionPenalty(), mRepetitionPenalty,
-            mRepetitionPenaltyDevice, batchSlotsHost, getLimitsPenalty(DecodingPenaltyType::Repetition),
-            "repetition penalty");
-    }
-    if (usePresencePenalty)
-    {
-        fillBuffers(penaltyParams.presencePenalty, DefaultDecodingParams::getPresencePenalty(), mPresencePenalty,
-            mPresencePenaltyDevice, batchSlotsHost, getLimitsPenalty(DecodingPenaltyType::Presence),
-            "presence penalty");
-    }
-    if (useFrequencyPenalty)
-    {
-        fillBuffers(penaltyParams.frequencyPenalty, DefaultDecodingParams::getFrequencyPenalty(), mFrequencyPenalty,
-            mFrequencyPenaltyDevice, batchSlotsHost, getLimitsPenalty(DecodingPenaltyType::Frequency),
-            "frequency penalty");
-    }
-    if (useMinLength)
-    {
-        fillBuffers(penaltyParams.minLength, DefaultDecodingParams::getMinLength(), mMinLength, mMinLengthDevice,
-            batchSlotsHost, getLimitsPenalty(DecodingPenaltyType::MinLength), "min length");
-    }
-
-    // FIXME(nkorobov): once of the requests has some penalty, we will always have to compute it.
-    // To avoid that need scan through all active requests for each iteration.
+    // FIXME(nkorobov): once one of the requests has some penalty, we will always have to compute it.
+    // To avoid that we need to scan through all active requests at each iteration.
     mUseTemperature |= useTemperature;
     mUseRepetitionPenalty |= useRepetitionPenalty;
     mUsePresencePenalty |= usePresencePenalty;
     mUseFrequencyPenalty |= useFrequencyPenalty;
     mUseMinLength |= useMinLength;
+
+    if (mUseTemperature)
+    {
+        fillBuffers(penaltyParams.temperature, DefaultDecodingParams::getTemperature(), mTemperature,
+            mTemperatureDevice, batchSlotsHost, getLimitsPenalty(DecodingPenaltyType::Temperature),
+            "temperature penalty");
+    }
+    if (mUseRepetitionPenalty)
+    {
+        fillBuffers(penaltyParams.repetitionPenalty, DefaultDecodingParams::getRepetitionPenalty(), mRepetitionPenalty,
+            mRepetitionPenaltyDevice, batchSlotsHost, getLimitsPenalty(DecodingPenaltyType::Repetition),
+            "repetition penalty");
+    }
+    if (mUsePresencePenalty)
+    {
+        fillBuffers(penaltyParams.presencePenalty, DefaultDecodingParams::getPresencePenalty(), mPresencePenalty,
+            mPresencePenaltyDevice, batchSlotsHost, getLimitsPenalty(DecodingPenaltyType::Presence),
+            "presence penalty");
+    }
+    if (mUseFrequencyPenalty)
+    {
+        fillBuffers(penaltyParams.frequencyPenalty, DefaultDecodingParams::getFrequencyPenalty(), mFrequencyPenalty,
+            mFrequencyPenaltyDevice, batchSlotsHost, getLimitsPenalty(DecodingPenaltyType::Frequency),
+            "frequency penalty");
+    }
+    if (mUseMinLength)
+    {
+        fillBuffers(penaltyParams.minLength, DefaultDecodingParams::getMinLength(), mMinLength, mMinLengthDevice,
+            batchSlotsHost, getLimitsPenalty(DecodingPenaltyType::MinLength), "min length");
+    }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

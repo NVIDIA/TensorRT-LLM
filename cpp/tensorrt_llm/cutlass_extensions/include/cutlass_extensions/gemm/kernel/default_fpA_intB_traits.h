@@ -140,9 +140,9 @@ struct MixedGemmArchTraits<TypeA, TypeB, cutlass::arch::Sm89,
     typename cutlass::platform::enable_if<cutlass::platform::is_same<TypeA, cutlass::half_t>::value
         || cutlass::platform::is_same<TypeA, cutlass::bfloat16_t>::value
 #ifdef ENABLE_FP8
-        || cutlass::platform::is_same<TypeA, cutlass::float_e4m3_t>::value>::type
+        || cutlass::platform::is_same<TypeA, cutlass::float_e4m3_t>::value
 #endif
-    >
+        >::type>
 {
 private:
     using LayoutDetails = LayoutDetailsB<TypeA, TypeB, cutlass::arch::Sm89>;

@@ -22,8 +22,8 @@ from tensorrt_llm._common import default_net
 from tensorrt_llm._utils import str_dtype_to_trt
 from tensorrt_llm.functional import (LayerNormPositionType, LayerNormType,
                                      MLPType, PositionEmbeddingType, Tensor,
-                                     assertion, gather_last_token_logits, gelu,
-                                     maximum, minimum, recv, send, shape,
+                                     assertion, cast, gather_last_token_logits,
+                                     gelu, maximum, minimum, recv, send, shape,
                                      transpose)
 from tensorrt_llm.layers import (MLP, Attention, AttentionMaskType,
                                  AttentionParams, BertAttention, ColumnLinear,
@@ -1211,7 +1211,7 @@ class DecoderModel(PretrainedModel):
         max_output_len_range = [0, (max_output_len + 1) // 2, max_output_len]
 
         encoder_num_tokens_range = [
-            1,
+            0,  # 0 for generation phase, >0 for context phase
             (max_encoder_input_len * max_batch_size + 1) // 2,
             max_encoder_input_len * max_batch_size,
         ]
@@ -1225,7 +1225,9 @@ class DecoderModel(PretrainedModel):
         # No enable_two_optimization_profiles support yet
 
         encoder_input_len_range = [
-            1, (max_encoder_input_len + 1) // 2, max_encoder_input_len
+            0,  # 0 for generation phase, >0 for context phase
+            (max_encoder_input_len + 1) // 2,
+            max_encoder_input_len
         ]
         past_key_value = []
         sequence_length = None
@@ -1797,7 +1799,7 @@ class WhisperEncoder(PretrainedModel):
         x = self.conv2(x)
         x = gelu(x)
         x = transpose(x, 2, 1)
-        x = x + self.positional_embedding.value
+        x = x + cast(self.positional_embedding.value, x.dtype)
 
         hidden_states = x
         for encoder_layer in self.encoder_layers:

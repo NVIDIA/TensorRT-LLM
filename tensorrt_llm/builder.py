@@ -89,7 +89,10 @@ class BuilderConfig(object):
 
 class Builder():
 
-    _ALLOWED_PRECISIONS = ['float32', 'float16', 'bfloat16']
+    _ALLOWED_PRECISIONS = [
+        'float32', 'float16', 'bfloat16', trt.DataType.HALF, trt.DataType.FLOAT,
+        trt.DataType.BF16
+    ]
 
     def __init__(self):
         super().__init__()
@@ -246,6 +249,9 @@ class Builder():
         assert isinstance(builder_config, BuilderConfig)
         assert isinstance(network, Network)
         input_tensors = network._inputs
+        if len(input_tensors) == 0:
+            logger.warning("There are no inputs in the network!")
+            return
         num_profiles = len(list(input_tensors.values())[0].profiles)
         for i in range(num_profiles):
             logger.debug(f'Adding optimization profile {i+1}/{num_profiles}')
@@ -653,39 +659,6 @@ def get_engine_version(engine_dir: str) -> Union[None, str]:
     return config['version']
 
 
-def optimize_model_with_config(model: PretrainedModel,
-                               build_config: BuildConfig):
-    use_auto_parallel = build_config.auto_parallel_config.enabled
-
-    if build_config.plugin_config.moe_plugin is None:
-        model = optimize_model(model, use_ootb_moe=True)
-
-    if model.config.architecture not in ["EncoderModel", "DecoderModel"]:
-        model = optimize_model(
-            model,
-            use_fused_mlp=(build_config.use_fused_mlp
-                           and not use_auto_parallel),
-            use_prompt_tuning=(build_config.max_prompt_embedding_table_size >
-                               0))
-
-    if model.config.architecture in ["RecurrentGemmaForCausalLM"]:
-        model = optimize_model(model, use_fused_rg_lru=True)
-
-    if build_config.plugin_config.lora_plugin is not None:
-        model.use_lora(build_config.lora_config)
-        model = optimize_model(
-            model,
-            use_lora=True,
-            max_lora_rank=build_config.lora_config.max_lora_rank,
-        )
-
-    if model.config.quantization.quant_algo == QuantAlgo.FP8 and build_config.plugin_config.use_fp8_context_fmha:
-        model = optimize_model(model, use_fp8_context_fmha=True)
-
-    model = optimize_model(model, use_unfused_qkv_gemm=use_auto_parallel)
-    return model
-
-
 def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
     '''Build engine from given model and optimization options specified in the build_config
        WARNING: this function may change the given \p model object state in some optimization passes
@@ -746,7 +719,38 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
             raise RuntimeError(
                 "Paged Context FMHA doesn't work with int8 kv cache currently.")
 
-    model = optimize_model_with_config(model, build_config)
+    use_auto_parallel = build_config.auto_parallel_config.enabled
+    gemm_swiglu_plugin = build_config.plugin_config.gemm_swiglu_plugin
+    if gemm_swiglu_plugin:
+        if not build_config.use_fused_mlp:
+            raise RuntimeError(
+                "GemmSwiGLU plugin requires --use_fused_mlp flag")
+        if gemm_swiglu_plugin not in ["fp8"]:
+            raise RuntimeError(
+                f"GemmSwiGLU plugin currently has limited support: fp8 only, "
+                f"got: {gemm_swiglu_plugin}")
+
+    if build_config.plugin_config.lora_plugin is not None:
+        model.use_lora(build_config.lora_config)
+
+    is_enc_dec = model.config.architecture in ["EncoderModel", "DecoderModel"]
+    model = optimize_model(
+        model,
+        use_ootb_moe=build_config.plugin_config.moe_plugin is None,
+        use_fused_mlp=(build_config.use_fused_mlp and not is_enc_dec
+                       and not use_auto_parallel),
+        gemm_swiglu_plugin_dtype=gemm_swiglu_plugin,
+        use_fused_rg_lru=model.config.architecture
+        in ["RecurrentGemmaForCausalLM"],
+        use_unfused_qkv_gemm=use_auto_parallel,
+        use_prompt_tuning=(build_config.max_prompt_embedding_table_size > 0
+                           and not is_enc_dec),
+        use_lora=build_config.plugin_config.lora_plugin is not None,
+        max_lora_rank=build_config.lora_config.max_lora_rank,
+        use_fp8_context_fmha=(
+            model.config.quantization.quant_algo == QuantAlgo.FP8
+            and build_config.plugin_config.use_fp8_context_fmha),
+    )
 
     builder = Builder()
     builder_config = builder.create_builder_config(
@@ -781,17 +785,9 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
             network.plugin_config.weight_only_quant_matmul_plugin = model.config.dtype
     if use_smooth_quant and model.config.quantization.use_plugin_sq:
         network.plugin_config.set_smooth_quant_plugins()
-    # we will remove this later when XQA supports quantized fp8 output.
-    if network.plugin_config.use_fp8_context_fmha:
-        network.plugin_config.enable_xqa = False
-        logger.warning(
-            "The XQA kernel is disabled by default as it doesn't support fp8 attention plugin output currently."
-        )
     nccl_plugin = model.config.dtype if model.config.mapping.world_size > 1 else None
     network.plugin_config.set_nccl_plugin(
         nccl_plugin, network.plugin_config.use_custom_all_reduce)
-
-    use_auto_parallel = build_config.auto_parallel_config.enabled
 
     with net_guard(network):
         # Prepare

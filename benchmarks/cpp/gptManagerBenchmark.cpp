@@ -458,10 +458,6 @@ public:
     {
         this->recordEnd(requestId, hasError);
 
-        if (mRespJsonFile.empty())
-            return;
-        int32_t outputSeqLen;
-
         for (auto& tensor : responseTensors)
         {
             if (tensor.name == inference_request::kOutputIdsTensorName)
@@ -471,7 +467,7 @@ public:
             else if (tensor.name == inference_request::kSequenceLengthTensorName)
             {
                 // Tensor of shape nBeams, and we only need the first one
-                outputSeqLen = *(bufferCast<int32_t>(*(tensor.tensor)));
+                int32_t outputSeqLen = *(bufferCast<int32_t>(*(tensor.tensor)));
                 if (mOutputHasInput)
                 {
                     int inputSeqLen = mRequestBenchInfos[requestId].inputLength;
@@ -479,6 +475,30 @@ public:
                 }
                 mRequestBenchInfos[requestId].outputLength = outputSeqLen;
             }
+        }
+    }
+
+    void recordEnd(uint64_t requestId, texec::Response const& response)
+    {
+
+        this->recordEnd(requestId, response.hasError());
+
+        // Get the actual output length
+        if (!response.hasError())
+        {
+            auto outputTokenIds = response.getResult().outputTokenIds;
+
+            int32_t outSeqLen = 0;
+            for (auto const& beam : outputTokenIds)
+            {
+                outSeqLen = std::max(static_cast<int32_t>(beam.size()), outSeqLen);
+            }
+            if (mOutputHasInput)
+            {
+                int inputSeqLen = mRequestBenchInfos[requestId].inputLength;
+                outSeqLen -= inputSeqLen;
+            }
+            mRequestBenchInfos[requestId].outputLength = outSeqLen;
         }
     }
 
@@ -827,7 +847,7 @@ public:
                     numFinished++;
                     if (!warmup)
                     {
-                        mRecorder->recordEnd(reqId, response.hasError());
+                        mRecorder->recordEnd(reqId, response);
                     }
                 }
             }

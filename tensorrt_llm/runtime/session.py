@@ -167,7 +167,7 @@ class Session(object):
                 if not ok:
                     raise ValueError(
                         f"Couldn't assign {name} with shape {tensor_dict[name].shape}, "
-                        f"engine supports [min, opt, max] = {self.engine.get_profile_shape(context.active_optimization_profile, name)}"
+                        f"engine supports [min, opt, max] = {self.engine.get_tensor_profile_shape(name, context.active_optimization_profile)}"
                     )
 
     def infer_shapes(

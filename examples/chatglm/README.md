@@ -363,7 +363,6 @@ python ../quantization/quantize.py --model_dir chatglm3_6b \
 # ChatGLM3-6B: single-gpu engine with fp8 quantization, GPT Attention plugin, Gemm plugin
 trtllm-build --checkpoint_dir trt_ckpt/chatglm3_6b/fp8/1-gpu \
         --gemm_plugin float16 \
-        --strongly_typed \
         --output_dir trt_engines/chatglm3_6b/fp8/1-gpu
 
 # Run inference.
@@ -394,7 +393,6 @@ python examples/chatglm/convert_checkpoint.py --model_dir chatglm3-6b-128k \
 python -m tensorrt_llm.commands.build --checkpoint_dir /tmp/chatglm3-6b-128k/trt_ckpts \
             --output_dir /tmp/chatglm3-6b-128k/trt_engines \
             --gemm_plugin float16 \
-            --strongly_typed \
             --gather_all_token_logits \
             --max_batch_size 8 \
             --max_input_len 25600
@@ -431,7 +429,6 @@ python examples/chatglm/convert_checkpoint.py --model_dir chatglm3-6b-128k \
 python -m tensorrt_llm.commands.build --checkpoint_dir /tmp/chatglm3-6b-128k/trt_ckpts \
             --output_dir /tmp/chatglm3-6b-128k/trt_engines \
             --gemm_plugin float16 \
-            --strongly_typed \
             --gather_all_token_logits \
             --max_batch_size 1 \
             --max_input_len 12800

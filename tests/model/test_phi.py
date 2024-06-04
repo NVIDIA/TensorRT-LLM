@@ -21,7 +21,7 @@ from itertools import product
 import numpy as np
 import torch
 from parameterized import parameterized
-from transformers import AutoConfig, AutoModelForCausalLM
+from transformers import PhiConfig, PhiForCausalLM
 
 import tensorrt_llm
 from tensorrt_llm import Builder
@@ -34,9 +34,6 @@ from tensorrt_llm.models.phi.convert import convert_hf_weights
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.util import skip_fp32_accum_pre_ampere, unittest_name_func
-
-# Fixed code revision or updated config can break the tests.
-HF_CODE_REVISION = "cb2f4533604d8b67de604e7df03bfe6f3ca22869"
 
 
 def compare_max_abs_error(ref, res, str):
@@ -55,22 +52,17 @@ class TestPhi(unittest.TestCase):
         torch.random.manual_seed(1773)
 
     def generate_hf_model(self, dtype: str):
-        # Need to use the latest remote code for config and model class.
-        gpt_config = AutoConfig.from_pretrained("microsoft/phi-2",
-                                                code_revision=HF_CODE_REVISION,
-                                                trust_remote_code=True)
-        gpt_config.num_hidden_layers = 2
-        model = AutoModelForCausalLM.from_config(
-            gpt_config, trust_remote_code=True).cuda().to(
-                tensorrt_llm._utils.str_dtype_to_torch(dtype)).eval()
-        return gpt_config, model
+        phi_config = PhiConfig(num_hidden_layers=2)
+        model = PhiForCausalLM(phi_config).cuda().to(
+            tensorrt_llm._utils.str_dtype_to_torch(dtype)).eval()
+        return phi_config, model
 
     def initialize_network(self, network: tensorrt_llm.Network, hf_model,
                            hf_config, dtype: str, batch_size: int,
                            beam_width: int, input_len: int, output_len: int,
                            tensor_parallel: int, rank: int):
         config = {
-            'architecture': hf_config.architectures[0],
+            'architecture': 'PhiForCausalLM',
             'dtype': dtype,
             'num_hidden_layers': hf_config.num_hidden_layers,
             'num_attention_heads': hf_config.num_key_value_heads,
@@ -129,7 +121,6 @@ class TestPhi(unittest.TestCase):
 
         runtime = None
         builder = Builder()
-        fp16 = (dtype == 'float16')
 
         with tempfile.TemporaryDirectory() as tmpdirname:
             builder_config = builder.create_builder_config(
@@ -138,7 +129,7 @@ class TestPhi(unittest.TestCase):
                 timing_cache='model.cache',
                 tensor_parallel=world_size,  # TP only
                 use_refit=use_refit,
-                strongly_typed=fp16,
+                strongly_typed=True,
             )
             network = builder.create_network()
             network.plugin_config.to_legacy_setting()

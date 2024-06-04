@@ -109,6 +109,11 @@ public:
     {
         return {};
     }
+
+    [[nodiscard]] __host__ __device__ static constexpr runtime::SizeType32 getNoRepeatNgramSize()
+    {
+        return 1 << 30;
+    }
 };
 } // namespace layers
 } // namespace tensorrt_llm

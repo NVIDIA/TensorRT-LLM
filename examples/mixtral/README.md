@@ -133,7 +133,6 @@ python ../quantization/quantize.py --model_dir ./Mixtral-8x7B-v0.1 \
 trtllm-build --checkpoint_dir ./tllm_checkpoint_mixtral_2gpu \
              --output_dir ./engine_outputs \
              --gemm_plugin float16 \
-             --strongly_typed \
              --workers 2
 ```
 
