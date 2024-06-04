@@ -320,8 +320,8 @@ def parse_nmt_config(args, model):
         config["encoder"][key] = f"{val}"
     config["encoder"]["weight_data_type"] = args.weight_data_type
     config["encoder"]["q_scaling"] = '1'
-    # NMT doesn't have final layernorm
-    config['encoder']['has_model_final_layernorm'] = 'false'
+    # NMT has final layernorm for pre-norm model architecture.
+    config['encoder']['has_model_final_layernorm'] = config['encoder']['encoder_normalize_before']
     config['encoder']['vocab_size'] = str(len(model.src_dict))  # fairseq naming
 
     config['decoder'] = dict()
@@ -330,7 +330,7 @@ def parse_nmt_config(args, model):
     config["decoder"]["weight_data_type"] = args.weight_data_type
     config["decoder"]["q_scaling"] = '1'
     config["decoder"]["rescale_before_lm_head"] = 'false'
-    config['decoder']['has_model_final_layernorm'] = 'false'
+    config['decoder']['has_model_final_layernorm'] = config['decoder']['decoder_normalize_before'] and not config['decoder'].getboolean('no_decoder_final_norm', False)
     config['decoder']['vocab_size'] = str(len(model.tgt_dict))  # fairseq naming
 
     config["structure"] = dict()
@@ -578,6 +578,12 @@ def convert_nmt_weights_to_tllm_safetensors(config, component, params,
                   mapping.tp_size,
                   mapping.tp_rank,
                   dim=0), (config.vocab_size // mapping.tp_size, hidden_size))
+
+    if config.has_model_final_layernorm:
+        weights['final_layernorm.weight'] = params[
+            f'{hf_param_prefix}.layer_norm.weight'].clone()
+        weights['final_layernorm.bias'] = params[
+            f'{hf_param_prefix}.layer_norm.bias'].clone()
 
     return weights
 
