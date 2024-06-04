@@ -16,6 +16,7 @@
 import argparse
 import ast
 import csv
+import os
 from pathlib import Path
 
 import numpy as np
@@ -210,6 +211,7 @@ def parse_arguments(args=None):
         action='store_true',
         help='Enables chunked context (only available with cpp session).',
     )
+    parser.add_argument('--no_repeat_ngram_size', type=int, default=None)
 
     return parser.parse_args(args=args)
 
@@ -368,7 +370,19 @@ def main(args):
     runtime_rank = tensorrt_llm.mpi_rank()
     logger.set_level(args.log_level)
 
-    model_name, model_version = read_model_name(args.engine_dir)
+    # different handling if encoder-decoder models
+    is_enc_dec = {
+        name
+        for name in os.listdir(args.engine_dir)
+        if os.path.isdir(os.path.join(args.engine_dir, name))
+    } == {'encoder', 'decoder'}
+    if is_enc_dec:
+        logger.warning(
+            "This path is an encoder-decoder model. Using different handling.")
+        assert not args.use_py_session, "Encoder-decoder models don't have a unified python runtime, please use its own examples/enc_dec/run.py instead."
+
+    model_name, model_version = read_model_name(
+        args.engine_dir) if not is_enc_dec else ("", "")
     if args.tokenizer_dir is None:
         logger.warning(
             "tokenizer_dir is not specified. Try to infer from model_name, but this may be incorrect."
@@ -408,7 +422,17 @@ def main(args):
                                   num_prepend_vtokens=args.num_prepend_vtokens,
                                   model_name=model_name,
                                   model_version=model_version)
-    input_lengths = [x.size(0) for x in batch_input_ids]
+
+    if is_enc_dec:
+        encoder_input_ids = batch_input_ids
+        decoder_input_ids = [
+            torch.tensor([pad_id], dtype=torch.int32) for _ in batch_input_ids
+        ]  # by default decoder_start_token_id for T5
+
+    input_lengths = [x.size(0) for x in decoder_input_ids
+                     ] if is_enc_dec else [x.size(0) for x in batch_input_ids]
+    encoder_input_lengths = [x.size(0)
+                             for x in encoder_input_ids] if is_enc_dec else None
 
     if not PYTHON_BINDINGS and not args.use_py_session:
         logger.warning(
@@ -429,6 +453,8 @@ def main(args):
         lora_ckpt_source=args.lora_ckpt_source,
         gpu_weights_percent=args.gpu_weights_percent,
     )
+    if not args.use_py_session:
+        runner_kwargs.update(is_enc_dec=is_enc_dec)
     if args.medusa_choices is not None:
         args.medusa_choices = ast.literal_eval(args.medusa_choices)
         assert args.temperature == 1.0, "Medusa should use temperature == 1.0"
@@ -437,7 +463,8 @@ def main(args):
     if not args.use_py_session:
         runner_kwargs.update(
             max_batch_size=len(batch_input_ids),
-            max_input_len=max(input_lengths),
+            max_input_len=max(
+                encoder_input_lengths if is_enc_dec else input_lengths),
             max_output_len=args.max_output_len,
             max_beam_width=args.num_beams,
             max_attention_window_size=args.max_attention_window_size,
@@ -452,7 +479,9 @@ def main(args):
 
     with torch.no_grad():
         outputs = runner.generate(
-            batch_input_ids,
+            batch_input_ids=decoder_input_ids
+            if is_enc_dec else batch_input_ids,
+            encoder_input_ids=encoder_input_ids if is_enc_dec else None,
             max_new_tokens=args.max_output_len,
             max_attention_window_size=args.max_attention_window_size,
             sink_token_length=args.sink_token_length,
@@ -476,6 +505,7 @@ def main(args):
             prompt_tasks=args.prompt_tasks,
             streaming=args.streaming,
             output_sequence_lengths=True,
+            no_repeat_ngram_size=args.no_repeat_ngram_size,
             return_dict=True,
             medusa_choices=args.medusa_choices)
         torch.cuda.synchronize()

@@ -163,7 +163,7 @@ class TestFalcon(unittest.TestCase):
             use_alibi=hf_config.alibi,
             parallel_attention=hf_config.parallel_attn,
             use_refit=use_refit,
-            strongly_typed=(dtype == "float16"),
+            strongly_typed=True,
         )
 
         network = builder.create_network()

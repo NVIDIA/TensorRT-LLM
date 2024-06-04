@@ -286,10 +286,11 @@ class BlockManager
 {
 public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
+    using CacheType = tensorrt_llm::batch_manager::kv_cache_manager::CacheType;
 
     explicit BlockManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead,
         SizeType32 tokensPerBlock, SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool,
-        std::shared_ptr<runtime::CudaStream> stream, bool onboardBlocks);
+        std::shared_ptr<runtime::CudaStream> stream, bool onboardBlocks, CacheType cacheType = CacheType::kSELF);
 
     ~BlockManager();
 
@@ -453,6 +454,8 @@ private:
     BlockPtr mCachedBlocksRoot;
     // Statistics for block allocations/reuse
     std::size_t mAllocTotalBlocks, mAllocNewBlocks, mReusedBlocks;
+    // KV cache type (self or cross)
+    CacheType mCacheType;
 };
 
 class KVCacheManager
@@ -461,11 +464,13 @@ public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
     using SequencesPtr = GenerationRequest::SharedPtr;
     using CudaStreamPtr = std::shared_ptr<runtime::CudaStream>;
+    using CacheType = tensorrt_llm::batch_manager::kv_cache_manager::CacheType;
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool, SizeType32 maxNumSequences,
         SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, bool useOneMoreBlock,
-        CudaStreamPtr stream, bool enableBlockReuse = false, bool onboardBlocks = true);
+        CudaStreamPtr stream, bool enableBlockReuse = false, bool onboardBlocks = true,
+        CacheType cacheType = CacheType::kSELF);
 
     void allocatePools(nvinfer1::DataType dtype, bool useUvm = false);
 
@@ -576,6 +581,11 @@ public:
     void removeToken(SizeType32 seqSlotIdx);
     void rewindKVCache(SizeType32 seqSlotIdx, SizeType32 rewindLengths);
 
+    [[nodiscard]] bool isCrossKv() const
+    {
+        return mCacheType == CacheType::kCROSS;
+    }
+
 private:
     void setOffsets(kernels::KVCacheIndex* offsetsPtr, nvinfer1::Dims const& offsetsShape, SizeType32 seqSlotIdx,
         SizeType32 beamIdx, SizeType32 blockIdx, KVCacheBlock::IdType blockId) const;
@@ -610,5 +620,7 @@ private:
     runtime::ITensor::SharedPtr mSequenceBlockIndices;
     // Whether to cache KV pages for reuse
     bool mEnableBlockReuse;
+    // KV cache type (self or cross)
+    CacheType mCacheType;
 };
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

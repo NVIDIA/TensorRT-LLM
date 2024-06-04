@@ -22,8 +22,8 @@ from ...layers import (MLP, MOE, Attention, AttentionMaskType, ColumnLinear,
 from ...lora_manager import LoraConfig, use_lora
 from ...module import Module
 from ...quantization import QuantMode
-from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
-                              PretrainedConfig)
+from ..modeling_utils import DecoderLayerList, DecoderModelForCausalLM
+from .config import GPTConfig
 
 
 def MLPFactory(hidden_size,
@@ -67,7 +67,7 @@ def MLPFactory(hidden_size,
 
 class GPTDecoderLayer(Module):
 
-    def __init__(self, config: PretrainedConfig, layer_idx: int):
+    def __init__(self, config: GPTConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
         self.config = config
@@ -111,20 +111,13 @@ class GPTDecoderLayer(Module):
         mlp_hidden_size = config.hidden_size * 4 if config.intermediate_size is None else config.intermediate_size
         self.norm_before_bmm1 = config.norm_before_bmm1 if hasattr(
             config, "norm_before_bmm1") else False
-        moe_config = MoeConfig()
-        if config.moe_num_experts > 1:
-            moe_config = MoeConfig(
-                config.moe_num_experts,
-                config.moe_top_k,
-                config.moe_tp_mode,
-                config.moe_normalization_mode,
-            )
+
         self.mlp = MLPFactory(hidden_size=config.hidden_size,
                               ffn_hidden_size=mlp_hidden_size,
                               hidden_act=config.hidden_act,
                               dtype=config.dtype,
                               bias=config.bias,
-                              moe_config=moe_config,
+                              moe_config=config.moe,
                               tp_group=tp_group,
                               tp_size=tp_size,
                               tp_rank=tp_rank,
@@ -155,6 +148,7 @@ class GPTDecoderLayer(Module):
             hidden_states,
             attention_mask=attention_mask,
             use_cache=use_cache,
+            spec_decoding_params=spec_decoding_params,
             kv_cache_params=kv_cache_params,
             attention_params=attention_params,
             lora_layer_params=lora_layer_params,
@@ -179,7 +173,7 @@ class GPTDecoderLayer(Module):
 
 class GPTModel(Module):
 
-    def __init__(self, config: PretrainedConfig):
+    def __init__(self, config: GPTConfig):
         super().__init__()
         self.mapping = config.mapping
         self.position_embedding_type = config.position_embedding_type
@@ -250,9 +244,9 @@ class GPTModel(Module):
 
 
 class GPTForCausalLM(DecoderModelForCausalLM):
+    config_class = GPTConfig
 
-    def __init__(self, config: PretrainedConfig):
-        self.check_config(config)
+    def __init__(self, config: GPTConfig):
         transformer = GPTModel(config)
 
         if config.mapping.is_last_pp_rank():
@@ -268,22 +262,6 @@ class GPTForCausalLM(DecoderModelForCausalLM):
         else:
             lm_head = None
         super().__init__(config, transformer, lm_head)
-
-    def check_config(self, config: PretrainedConfig):
-        config.set_if_not_exist('bias', True)
-        config.set_if_not_exist('q_scaling', 1)
-        config.set_if_not_exist('embedding_scale', None)
-        config.set_if_not_exist('apply_query_key_layer_scaling', False)
-        config.set_if_not_exist('rotary_pct', 1.0)
-        config.set_if_not_exist('rotary_base', 10000.0)
-        config.set_if_not_exist('rotary_scaling', None)
-        config.set_if_not_exist('moe_num_experts', 0)
-        config.set_if_not_exist('moe_top_k', 0)
-        config.set_if_not_exist('moe_tp_mode',
-                                MoeConfig.ParallelismMode.TENSOR_PARALLEL)
-        config.set_if_not_exist(
-            'moe_normalization_mode',
-            MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE)
 
     def use_lora(self, lora_config: LoraConfig):
         use_lora(self, lora_config)

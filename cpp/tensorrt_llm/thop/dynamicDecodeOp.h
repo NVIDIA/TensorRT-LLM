@@ -34,7 +34,8 @@ public:
         th::optional<th::Tensor> length_penalty_opt, th::optional<th::Tensor> early_stopping_opt,
         th::optional<th::Tensor> beam_search_diversity_rate_opt, th::optional<th::Tensor> random_seed_opt,
         th::optional<th::Tensor> top_p_decay_opt, th::optional<th::Tensor> top_p_min_opt,
-        th::optional<th::Tensor> top_p_reset_ids_opt, bool output_log_probs, bool cum_log_probs)
+        th::optional<th::Tensor> top_p_reset_ids_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,
+        bool output_log_probs, bool cum_log_probs)
         = 0;
 
     virtual void forward(th::Tensor const& logits, int const step, int const max_input_length,
@@ -43,9 +44,9 @@ public:
         th::optional<th::Tensor> sequence_limit_length_opt, th::optional<th::Tensor> stop_words_list_ptrs_opt,
         th::optional<th::Tensor> stop_words_lens_opt, int32_t const max_stop_words_len,
         th::optional<th::Tensor> bad_words_list_ptrs_opt, th::optional<th::Tensor> bad_words_lens_opt,
-        int32_t const max_bad_words_len, th::optional<th::Tensor> no_repeat_ngram_size_opt,
-        th::optional<th::Tensor> src_cache_indirection_opt, th::Tensor& output_token_ids, th::Tensor& newTokens,
-        th::Tensor& should_stop, th::optional<th::Tensor> finished_input, th::optional<th::Tensor> finished_output,
+        int32_t const max_bad_words_len, th::optional<th::Tensor> src_cache_indirection_opt,
+        th::Tensor& output_token_ids, th::Tensor& newTokens, th::Tensor& should_stop,
+        th::optional<th::Tensor> finished_input, th::optional<th::Tensor> finished_output,
         th::optional<th::Tensor> sequence_lengths_opt, th::optional<th::Tensor> cum_log_probs_opt,
         th::optional<th::Tensor> output_log_probs_opt, th::optional<th::Tensor> output_log_probs_tiled_opt,
         th::optional<th::Tensor> parent_ids_opt, th::optional<th::Tensor> tgt_cache_indirection_opt,
@@ -71,7 +72,8 @@ public:
         th::optional<th::Tensor> length_penalty_opt, th::optional<th::Tensor> early_stopping_opt,
         th::optional<th::Tensor> beam_search_diversity_rate_opt, th::optional<th::Tensor> random_seed_opt,
         th::optional<th::Tensor> top_p_decay_opt, th::optional<th::Tensor> top_p_min_opt,
-        th::optional<th::Tensor> top_p_reset_ids_opt, bool output_log_probs, bool cum_log_probs) override;
+        th::optional<th::Tensor> top_p_reset_ids_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,
+        bool output_log_probs, bool cum_log_probs) override;
 
     void forward(th::Tensor const& logits, int const step, int const max_input_length, int const max_attention_window,
         int const sink_token_length, uint64_t const ite, int const local_batch_size, th::Tensor end_id,
@@ -79,9 +81,9 @@ public:
         th::optional<th::Tensor> sequence_limit_length_opt, th::optional<th::Tensor> stop_words_list_ptrs_opt,
         th::optional<th::Tensor> stop_words_lens_opt, int32_t const max_stop_words_len,
         th::optional<th::Tensor> bad_words_list_ptrs_opt, th::optional<th::Tensor> bad_words_lens_opt,
-        int32_t const max_bad_words_len, th::optional<th::Tensor> no_repeat_ngram_size_opt,
-        th::optional<th::Tensor> src_cache_indirection_opt, th::Tensor& output_token_ids, th::Tensor& newTokens,
-        th::Tensor& should_stop, th::optional<th::Tensor> finished_input, th::optional<th::Tensor> finished_output,
+        int32_t const max_bad_words_len, th::optional<th::Tensor> src_cache_indirection_opt,
+        th::Tensor& output_token_ids, th::Tensor& newTokens, th::Tensor& should_stop,
+        th::optional<th::Tensor> finished_input, th::optional<th::Tensor> finished_output,
         th::optional<th::Tensor> sequence_lengths_opt, th::optional<th::Tensor> cum_log_probs_opt,
         th::optional<th::Tensor> output_log_probs_opt, th::optional<th::Tensor> output_log_probs_tiled_opt,
         th::optional<th::Tensor> parent_ids_opt, th::optional<th::Tensor> tgt_cache_indirection_opt,
@@ -110,7 +112,8 @@ public:
         th::optional<th::Tensor> length_penalty_opt, th::optional<th::Tensor> early_stopping_opt,
         th::optional<th::Tensor> beam_search_diversity_rate_opt, th::optional<th::Tensor> random_seed_opt,
         th::optional<th::Tensor> top_p_decay_opt, th::optional<th::Tensor> top_p_min_opt,
-        th::optional<th::Tensor> top_p_reset_ids_opt, bool output_log_probs, bool cum_log_probs);
+        th::optional<th::Tensor> top_p_reset_ids_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,
+        bool output_log_probs, bool cum_log_probs);
 
     th::Tensor forward(th::Tensor const& logits, int64_t const step, int64_t const max_input_length,
         int64_t const max_attention_window, int64_t const sink_token_length, int64_t const ite,
@@ -119,13 +122,13 @@ public:
         th::optional<th::Tensor> stop_words_list_ptrs_opt, th::optional<th::Tensor> stop_words_lens_opt,
         int64_t const max_stop_words_len, th::optional<th::Tensor> bad_words_list_ptrs_opt,
         th::optional<th::Tensor> bad_words_lens_opt, int64_t const max_bad_words_len,
-        th::optional<th::Tensor> no_repeat_ngram_size_opt, th::optional<th::Tensor> src_cache_indirection_opt,
-        th::Tensor output_token_ids, th::Tensor newTokens, th::optional<th::Tensor> finished_input,
-        th::optional<th::Tensor> finished_output, th::optional<th::Tensor> sequence_lengths_opt,
-        th::optional<th::Tensor> cum_log_probs_opt, th::optional<th::Tensor> output_log_probs_opt,
-        th::optional<th::Tensor> output_log_probs_tiled_opt, th::optional<th::Tensor> parent_ids_opt,
-        th::optional<th::Tensor> tgt_cache_indirection_opt, th::optional<th::Tensor> beam_hyps_output_ids_cba_opt,
-        th::optional<th::Tensor> beam_hyps_seq_len_cba_opt, th::optional<th::Tensor> beam_hyps_cum_log_probs_cba_opt,
+        th::optional<th::Tensor> src_cache_indirection_opt, th::Tensor output_token_ids, th::Tensor newTokens,
+        th::optional<th::Tensor> finished_input, th::optional<th::Tensor> finished_output,
+        th::optional<th::Tensor> sequence_lengths_opt, th::optional<th::Tensor> cum_log_probs_opt,
+        th::optional<th::Tensor> output_log_probs_opt, th::optional<th::Tensor> output_log_probs_tiled_opt,
+        th::optional<th::Tensor> parent_ids_opt, th::optional<th::Tensor> tgt_cache_indirection_opt,
+        th::optional<th::Tensor> beam_hyps_output_ids_cba_opt, th::optional<th::Tensor> beam_hyps_seq_len_cba_opt,
+        th::optional<th::Tensor> beam_hyps_cum_log_probs_cba_opt,
         th::optional<th::Tensor> beam_hyps_normed_scores_cba_opt, th::optional<th::Tensor> beam_hyps_log_probs_cba_opt,
         th::optional<th::Tensor> beam_hyps_min_normed_scores_opt, th::optional<th::Tensor> beam_hyps_num_beams_opt,
         th::optional<th::Tensor> beam_hyps_is_done_opt, bool const use_beam_hyps);

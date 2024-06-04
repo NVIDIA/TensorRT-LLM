@@ -106,8 +106,8 @@ void FtDynamicDecode<T>::setup(size_t const batch_size, size_t const beam_width,
     th::optional<th::Tensor> min_length_opt, th::optional<th::Tensor> length_penalty_opt,
     th::optional<th::Tensor> early_stopping_opt, th::optional<th::Tensor> beam_search_diversity_rate_opt,
     th::optional<th::Tensor> random_seed_opt, th::optional<th::Tensor> top_p_decay_opt,
-    th::optional<th::Tensor> top_p_min_opt, th::optional<th::Tensor> top_p_reset_ids_opt, bool output_log_probs,
-    bool cum_log_probs)
+    th::optional<th::Tensor> top_p_min_opt, th::optional<th::Tensor> top_p_reset_ids_opt,
+    th::optional<th::Tensor> no_repeat_ngram_size_opt, bool output_log_probs, bool cum_log_probs)
 {
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     dynamic_decode_layer_->setStream(stream);
@@ -118,6 +118,7 @@ void FtDynamicDecode<T>::setup(size_t const batch_size, size_t const beam_width,
     safeInsert(presence_penalty_opt, setupParams->penaltyParams.presencePenalty);
     safeInsert(frequency_penalty_opt, setupParams->penaltyParams.frequencyPenalty);
     safeInsert(min_length_opt, setupParams->penaltyParams.minLength);
+    safeInsert(no_repeat_ngram_size_opt, setupParams->penaltyParams.noRepeatNgramSize);
     safeInsert(runtime_top_k_opt, setupParams->samplingParams.runtime_top_k);
     safeInsert(runtime_top_p_opt, setupParams->samplingParams.runtime_top_p);
     safeInsert(random_seed_opt, setupParams->randomSeed);
@@ -141,17 +142,16 @@ void FtDynamicDecode<T>::forward(th::Tensor const& logits, int const step, int c
     th::optional<th::Tensor> sequence_limit_length_opt, th::optional<th::Tensor> stop_words_list_ptrs_opt,
     th::optional<th::Tensor> stop_words_lens_opt, int32_t const max_stop_words_len,
     th::optional<th::Tensor> bad_words_list_ptrs_opt, th::optional<th::Tensor> bad_words_lens_opt,
-    int32_t const max_bad_words_len, th::optional<th::Tensor> no_repeat_ngram_size_opt,
-    th::optional<th::Tensor> src_cache_indirection_opt, th::Tensor& output_token_ids, th::Tensor& newTokens,
-    th::Tensor& should_stop, th::optional<th::Tensor> finished_input, th::optional<th::Tensor> finished_output,
-    th::optional<th::Tensor> sequence_lengths_opt, th::optional<th::Tensor> cum_log_probs_opt,
-    th::optional<th::Tensor> output_log_probs_opt, th::optional<th::Tensor> output_log_probs_tiled_opt,
-    th::optional<th::Tensor> parent_ids_opt, th::optional<th::Tensor> tgt_cache_indirection_opt,
-    th::optional<th::Tensor> beam_hyps_output_ids_cba_opt, th::optional<th::Tensor> beam_hyps_seq_len_cba_opt,
-    th::optional<th::Tensor> beam_hyps_cum_log_probs_cba_opt, th::optional<th::Tensor> beam_hyps_normed_scores_cba_opt,
-    th::optional<th::Tensor> beam_hyps_log_probs_cba_opt, th::optional<th::Tensor> beam_hyps_min_normed_scores_opt,
-    th::optional<th::Tensor> beam_hyps_num_beams_opt, th::optional<th::Tensor> beam_hyps_is_done_opt,
-    bool const use_beam_hyps)
+    int32_t const max_bad_words_len, th::optional<th::Tensor> src_cache_indirection_opt, th::Tensor& output_token_ids,
+    th::Tensor& newTokens, th::Tensor& should_stop, th::optional<th::Tensor> finished_input,
+    th::optional<th::Tensor> finished_output, th::optional<th::Tensor> sequence_lengths_opt,
+    th::optional<th::Tensor> cum_log_probs_opt, th::optional<th::Tensor> output_log_probs_opt,
+    th::optional<th::Tensor> output_log_probs_tiled_opt, th::optional<th::Tensor> parent_ids_opt,
+    th::optional<th::Tensor> tgt_cache_indirection_opt, th::optional<th::Tensor> beam_hyps_output_ids_cba_opt,
+    th::optional<th::Tensor> beam_hyps_seq_len_cba_opt, th::optional<th::Tensor> beam_hyps_cum_log_probs_cba_opt,
+    th::optional<th::Tensor> beam_hyps_normed_scores_cba_opt, th::optional<th::Tensor> beam_hyps_log_probs_cba_opt,
+    th::optional<th::Tensor> beam_hyps_min_normed_scores_opt, th::optional<th::Tensor> beam_hyps_num_beams_opt,
+    th::optional<th::Tensor> beam_hyps_is_done_opt, bool const use_beam_hyps)
 {
     auto forwardParams = std::make_shared<tensorrt_llm::layers::DynamicDecodeInputParams>(step, static_cast<int>(ite),
         max_input_length, max_attention_window, sink_token_length, local_batch_size, convert_tensor<int>(end_id));
@@ -167,7 +167,6 @@ void FtDynamicDecode<T>::forward(th::Tensor const& logits, int const step, int c
     safeUpdate<uint64_t>(bad_words_list_ptrs_opt, forwardParams->bad_words_ptr);
     safeUpdate<int>(bad_words_lens_opt, forwardParams->bad_words_lengths);
     forwardParams->max_bad_words_len = max_bad_words_len;
-    safeUpdate<int>(no_repeat_ngram_size_opt, forwardParams->no_repeat_ngram_size);
     safeUpdate<int>(src_cache_indirection_opt, forwardParams->src_cache_indirection);
 
     auto const& output_ids_converted = convert_tensor<int>(output_token_ids);
@@ -263,8 +262,8 @@ void DynamicDecodeOp::setup(int64_t const batch_size, int64_t const beam_width,
     th::optional<th::Tensor> min_length_opt, th::optional<th::Tensor> length_penalty_opt,
     th::optional<th::Tensor> early_stopping_opt, th::optional<th::Tensor> beam_search_diversity_rate_opt,
     th::optional<th::Tensor> random_seed_opt, th::optional<th::Tensor> top_p_decay_opt,
-    th::optional<th::Tensor> top_p_min_opt, th::optional<th::Tensor> top_p_reset_ids_opt, bool output_log_probs,
-    bool cum_log_probs)
+    th::optional<th::Tensor> top_p_min_opt, th::optional<th::Tensor> top_p_reset_ids_opt,
+    th::optional<th::Tensor> no_repeat_ngram_size_opt, bool output_log_probs, bool cum_log_probs)
 {
     // TODO: Revise DynamicDecodeLayer and make the decode arguments consistent.
     // TODO: add parameters "normalize_log_probs" and "topKMedusaHeads"
@@ -277,6 +276,7 @@ void DynamicDecodeOp::setup(int64_t const batch_size, int64_t const beam_width,
     CHECK_OPTIONAL_CPU_INPUT(min_length_opt, torch::kInt32);
     CHECK_OPTIONAL_CPU_INPUT(length_penalty_opt, torch::kFloat);
     CHECK_OPTIONAL_CPU_INPUT(early_stopping_opt, torch::kInt32);
+    CHECK_OPTIONAL_CPU_INPUT(no_repeat_ngram_size_opt, torch::kInt32);
     CHECK_OPTIONAL_CPU_INPUT(beam_search_diversity_rate_opt, torch::kFloat);
     CHECK_OPTIONAL_CPU_INPUT(random_seed_opt, torch::kInt64);
     CHECK_OPTIONAL_INPUT(top_p_decay_opt, torch::kFloat);
@@ -286,7 +286,7 @@ void DynamicDecodeOp::setup(int64_t const batch_size, int64_t const beam_width,
     dynamic_decode_->setup(static_cast<size_t>(batch_size), static_cast<size_t>(beam_width), runtime_top_k_opt,
         runtime_top_p_opt, temperature_opt, repetition_penalty_opt, presence_penalty_opt, frequency_penalty_opt,
         min_length_opt, length_penalty_opt, early_stopping_opt, beam_search_diversity_rate_opt, random_seed_opt,
-        top_p_decay_opt, top_p_min_opt, top_p_reset_ids_opt, output_log_probs, cum_log_probs);
+        top_p_decay_opt, top_p_min_opt, top_p_reset_ids_opt, no_repeat_ngram_size_opt, output_log_probs, cum_log_probs);
 }
 
 th::Tensor DynamicDecodeOp::forward(
@@ -308,7 +308,6 @@ th::Tensor DynamicDecodeOp::forward(
     th::optional<th::Tensor> bad_words_list_ptrs_opt,   // [BS][2, bad_words_length], int64
     th::optional<th::Tensor> bad_words_lens_opt,        // [BS], int
     int64_t const max_bad_words_len,                    //
-    th::optional<th::Tensor> no_repeat_ngram_size_opt,  // [BS], int
     th::optional<th::Tensor> src_cache_indirection_opt, // [local_BS, BM, MSL], int
     // Outputs
     th::Tensor output_token_ids,                              // [BS, BM, MSL], variables for output
@@ -347,7 +346,6 @@ th::Tensor DynamicDecodeOp::forward(
     CHECK_OPTIONAL_INPUT(stop_words_lens_opt, torch::kInt32);
     CHECK_OPTIONAL_INPUT(bad_words_list_ptrs_opt, torch::kInt64);
     CHECK_OPTIONAL_INPUT(bad_words_lens_opt, torch::kInt32);
-    CHECK_OPTIONAL_INPUT(no_repeat_ngram_size_opt, torch::kInt32);
     CHECK_OPTIONAL_INPUT(src_cache_indirection_opt, torch::kInt32);
     CHECK_INPUT(output_token_ids, torch::kInt32);
     CHECK_INPUT(newTokens, torch::kInt32);
@@ -368,7 +366,7 @@ th::Tensor DynamicDecodeOp::forward(
         static_cast<int>(sink_token_length), static_cast<uint32_t>(ite), static_cast<int>(local_batch_size), end_id,
         embedding_bias_opt, input_lengths_opt, sequence_limit_length_opt, stop_words_list_ptrs_opt, stop_words_lens_opt,
         static_cast<int32_t>(max_stop_words_len), bad_words_list_ptrs_opt, bad_words_lens_opt,
-        static_cast<int32_t>(max_bad_words_len), no_repeat_ngram_size_opt, src_cache_indirection_opt,
+        static_cast<int32_t>(max_bad_words_len), src_cache_indirection_opt,
         // Outputs
         output_token_ids, newTokens, should_stop, finished_input, finished_output, sequence_lengths_opt,
         cum_log_probs_opt, output_log_probs_opt, output_log_probs_tiled_opt, parent_ids_opt, tgt_cache_indirection_opt,

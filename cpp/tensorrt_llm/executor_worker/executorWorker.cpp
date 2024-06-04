@@ -20,6 +20,7 @@
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/serialization.h"
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
+#include <csignal>
 
 namespace tle = tensorrt_llm::executor;
 
@@ -29,7 +30,7 @@ int main(int argc, char* argv[])
     // Register the TRT-LLM plugins
     initTrtLlmPlugins();
 
-    tensorrt_llm::mpi::initialize(tensorrt_llm::mpi::MpiThreadSupport::THREAD_MULTIPLE);
+    tensorrt_llm::mpi::initialize(tensorrt_llm::mpi::MpiThreadSupport::THREAD_MULTIPLE, true);
 
     MPI_Comm parentComm;
     MPI_Comm_get_parent(&parentComm);

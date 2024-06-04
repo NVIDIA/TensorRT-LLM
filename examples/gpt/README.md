@@ -428,7 +428,6 @@ python3 convert_checkpoint.py --model_dir gpt2 \
         --output_dir gpt2/trt_ckpt/int8kv/1-gpu
 
 trtllm-build --checkpoint_dir gpt2/trt_ckpt/int8kv/1-gpu \
-        --strongly_typed \
         --output_dir gpt2/trt_engines/int8kv/1-gpu
 ```
 

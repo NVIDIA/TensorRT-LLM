@@ -186,7 +186,6 @@ trtllm-build --checkpoint_dir dbrx/trt_ckpt/int8kv/tp4 \
         --gpt_attention_plugin float16 \
         --gemm_plugin float16 \
         --moe_plugin float16 \
-        --strongly_typed \
         --workers 4 \
         --output_dir dbrx/trt_engines/int8kv/tp4
 ```

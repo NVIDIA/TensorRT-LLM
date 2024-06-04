@@ -35,6 +35,20 @@
 namespace tensorrt_llm::runtime
 {
 
+LoraExpectedException::LoraExpectedException(std::string const& msg)
+    : std::runtime_error(msg)
+{
+}
+
+LoraExpectedException::~LoraExpectedException() noexcept = default;
+
+LoraCacheFullException::LoraCacheFullException(std::string const& msg)
+    : LoraExpectedException(msg)
+{
+}
+
+LoraCacheFullException::~LoraCacheFullException() noexcept = default;
+
 LoraCachePageManager::LoraCachePageManager(LoraCachePageManagerConfig const& config, BufferManager const& bufferManager)
     : mConfig(config)
 {
@@ -305,7 +319,7 @@ std::vector<std::size_t> LoraCache::claimPagesWithEvict(SizeType32 numPages)
     }
     if (it == mDoneTasks.rend())
     {
-        TLLM_THROW("Cache is full. There are no done tasks to evict");
+        throw LoraCacheFullException("Cache is full. There are no done tasks to evict");
     }
 
     TLLM_LOG_DEBUG("evicting " + std::to_string(taskIdsToEvict.size()));

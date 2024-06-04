@@ -17,6 +17,7 @@
  */
 #pragma once
 #include "decoderXQAConstants.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
@@ -210,10 +211,10 @@ struct XQALaunchParam
     void* scratch = nullptr;
 };
 
-// Setup launch params.
+// Setup launch params and ioScratch. ioScratch is for RoPE and output type conversion.
 template <typename KVCacheBuffer>
-void buildXQALaunchParams(
-    XQALaunchParam<KVCacheBuffer>& launchParams, XQAParams const& params, KVCacheBuffer kv_cache_buffer)
+void buildXQALaunchParams(XQALaunchParam<KVCacheBuffer>& launchParams, void*& ioScratch, XQAParams const& params,
+    KVCacheBuffer kv_cache_buffer)
 {
     TLLM_CHECK_WITH_INFO(
         params.data_type == DATA_TYPE_FP16 || params.data_type == DATA_TYPE_BF16, "Only fp16 or bf16 supported now.");
@@ -228,6 +229,9 @@ void buildXQALaunchParams(
     // Workspace.
     size_t offset = 0;
     int8_t* workspace = reinterpret_cast<int8_t*>(params.workspaces);
+    ioScratch = workspace;
+    workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(
+        workspace, 2 * params.head_size * params.num_q_heads * params.total_num_input_tokens);
     unsigned int batch_beam_size = params.batch_size * params.beam_width;
     const size_t cu_seqlens_size = sizeof(int) * (batch_beam_size + 1);
     const size_t rotary_inv_freq_size = sizeof(float) * batch_beam_size * params.rotary_embedding_dim / 2;

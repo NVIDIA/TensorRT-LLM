@@ -67,8 +67,7 @@ def wait_for_responses(args: argparse.Namespace, request_ids: list[int],
                     output_tokens[req_id][beam].extend(outTokens)
             else:
                 raise RuntimeError(
-                    str(req_id) + " encountered error:" +
-                    response.get_error_msg())
+                    str(req_id) + " encountered error:" + response.error_msg)
 
     return output_tokens
 

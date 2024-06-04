@@ -179,6 +179,19 @@ by using the `--use_fused_mlp` argument with `trtllm-build`. When the workload
 is very small, or if you're using FP8 PTQ and the accuracy after enabling it
 does not satisfy your requirement, it is not recommended to enable that feature.
 
+### GEMM + SwiGLU Fusion in Gated-MLP
+
+GEMM + SwiGLU fusion in Gated-MLP combines two Matmul operations and one SwiGLU
+operation into a single kernel. It only supports FP8 on Hopper now. For FP8 PTQ,
+the downside is slight reduction of accuracy because one of the quantization
+scaling factors are discarded.
+
+If model is large and you are running it on Hopper with FP8 precision, it is
+recommended to enable the feature by using the `--use_fused_mlp --gemm_swiglu_plugin fp8`
+argument with `trtllm-build`. When the workload is very small, or the accuracy
+after enabling it does not satisfy your requirement, it is not recommended to
+enable that feature.
+
 ### GEMM Plugin
 
 The GEMM plugin utilizes NVIDIA cuBLASLt to perform GEMM operations. On FP16 and

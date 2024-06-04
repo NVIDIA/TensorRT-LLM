@@ -122,7 +122,7 @@ value for a given parameter, the vector can be limited to a single element
 ***General***
 
  * `temperature`, a vector of floating-point numbers to control the
-   modulation of logits when sampling new tokens. It can have any value `> 0.0f`. The default value is `1.0f`(no modulation). Note: the recommended way to enable greedy sampling is to set `temperature` to `1.0f` and `topK` to `1`.
+   modulation of logits when sampling new tokens. It can have any value `>= 0.0f`. The default value is `1.0f`(no modulation).
  * `minLength`, a vector of integers to set a lower-bound on the number of tokens
    generated. It can have any value `>= 0`. Value `0` has no effect, the first generated token can be EOS. The default value is `1` (at least one non-EOS token is generated).
  * `repetitionPenalty`, a vector of float-point numbers to penalize tokens
@@ -133,6 +133,7 @@ value for a given parameter, the vector can be limited to a single element
  * `frequencyPenalty`, a vector of float-point numbers to penalize tokens
    already present in the sequence (dependent on the number of appearances). It is additive penalty. It can have any value, values `< 0.0f` encourage repetition, `> 0.0f` discourage it.
    The default value is `0.0f`(no effect).
+ * `noRepeatNgramSize`, a vector of integers. If set to int > 0, all ngrams of that size can only occur once.
 
 The parameters `repetitionPenalty`, `presencePenalty`, and `frequencyPenalty` are not mutually
 exclusive.

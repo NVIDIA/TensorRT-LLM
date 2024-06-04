@@ -279,14 +279,10 @@ class GPTBenchmark(BaseBenchmark):
             self.kv_cache_elem_per_token(self.build_config, self.runtime_mapping.tp_size, self.runtime_mapping.pp_size) * element_size(self.kv_dtype)
         # when MHA is OOTB, it requires extra KV cache size, because OOTB don't support inplace updating KV cache.
         if not self.use_gpt_attention_plugin:
-            if os.getenv('TRTLLM_DISABLE_OOTB_KVCACHE_REUSE') != 'ON':
-                local_n_layer = ceil(self.build_config.num_layers /
-                                     self.runtime_mapping.pp_size)
-                kv_cache_size_in_bytes = kv_cache_size_in_bytes / local_n_layer * (
-                    local_n_layer + 1)
-            else:
-                # without reusing, we need one for past as engine inputs, one for present as engine outputs.
-                kv_cache_size_in_bytes *= 2
+            local_n_layer = ceil(self.build_config.num_layers /
+                                 self.runtime_mapping.pp_size)
+            kv_cache_size_in_bytes = kv_cache_size_in_bytes / local_n_layer * (
+                local_n_layer + 1)
 
         kv_cache_size_in_mb = bytes_to_target_unit(kv_cache_size_in_bytes,
                                                    "MiB")

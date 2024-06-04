@@ -153,6 +153,8 @@ enum class MemoryType
 enum class ModelType
 {
     kDECODER_ONLY = 0,
+    kENCODER_ONLY = 1,
+    kENCODER_DECODER = 2,
 };
 
 /// @brief The batching type
@@ -276,6 +278,8 @@ struct IterationStats
     size_t pinnedMemUsage;
     /// @brief Stats specific to KV caches
     std::optional<KvCacheStats> kvCacheStats;
+    /// @brief Stats specific to cross KV caches
+    std::optional<KvCacheStats> crossKvCacheStats;
     /// @brief Stats specific to static batching
     std::optional<StaticBatchingStats> staticBatchingStats;
     /// @brief Stats specific to inflight batching
@@ -288,13 +292,14 @@ enum class RequestStage
     /// @brief Request that have been received but not yet included in the active requests (due to constraints such as
     /// maximum batch size for example).
     kQUEUED,
+    /// @brief Active request in encoder phase
+    kENCODER_IN_PROGRESS,
     /// @brief Active request in context phase
     kCONTEXT_IN_PROGRESS,
     /// @brief Active request in generation phase
     kGENERATION_IN_PROGRESS,
     /// @brief Active request for which generation has completed
     kGENERATION_COMPLETE,
-
 };
 
 /// @brief Struct that holds the stats of a single request
@@ -339,22 +344,22 @@ public:
 
     static auto constexpr TopK()
     {
-        return DecodingMode{kTopK | kUsePenalties | kUseBanWords | kStandardStopCriteria};
+        return DecodingMode{kTopK | kUsePenalties | kUseBanTokens | kStandardStopCriteria};
     }
 
     static auto constexpr TopP()
     {
-        return DecodingMode{kTopP | kUsePenalties | kUseBanWords | kStandardStopCriteria};
+        return DecodingMode{kTopP | kUsePenalties | kUseBanTokens | kStandardStopCriteria};
     }
 
     static auto constexpr TopKTopP()
     {
-        return DecodingMode{kTopKTopP | kUsePenalties | kUseBanWords | kStandardStopCriteria};
+        return DecodingMode{kTopKTopP | kUsePenalties | kUseBanTokens | kStandardStopCriteria};
     }
 
     static auto constexpr BeamSearch()
     {
-        return DecodingMode{kBeamSearch | kUsePenalties | kUseBanWords | kStandardStopCriteria};
+        return DecodingMode{kBeamSearch | kUsePenalties | kUseBanTokens | kStandardStopCriteria};
     }
 
     static auto constexpr Medusa()
@@ -408,9 +413,21 @@ public:
         return *this;
     }
 
+    auto constexpr useBanTokens(bool banTokens)
+    {
+        mState = setBitTo(kUseBanTokens, banTokens);
+        return *this;
+    }
+
     auto constexpr useBanWords(bool banWords)
     {
         mState = setBitTo(kUseBanWords, banWords);
+        return *this;
+    }
+
+    auto constexpr useNoRepeatNgramSize(bool noRepeatNgramSize)
+    {
+        mState = setBitTo(kUseNoRepeatNgramSize, noRepeatNgramSize);
         return *this;
     }
 
@@ -517,6 +534,16 @@ public:
         return anyBitSet(kUseBanWords);
     }
 
+    bool constexpr isUseNoRepeatNgramSize() const
+    {
+        return anyBitSet(kUseNoRepeatNgramSize);
+    }
+
+    bool constexpr isUseBanTokens() const
+    {
+        return anyBitSet(kUseBanTokens);
+    }
+
     bool constexpr isUseStopWords() const
     {
         return anyBitSet(kUseStopWords);
@@ -566,11 +593,13 @@ private:
     static UnderlyingType constexpr kUseStopWords{1u << 6};
     static UnderlyingType constexpr kUseMaxLengthStop{1u << 7};
     static UnderlyingType constexpr kUseExplicitEosStop{1u << 8};
+    static UnderlyingType constexpr kUseNoRepeatNgramSize{1u << 9};
     static UnderlyingType constexpr kStandardStopCriteria{kUseStopWords | kUseMaxLengthStop};
     static UnderlyingType constexpr kUseOccurrencePenalties{
         kUseRepetitionPenalties | kUseFrequencyPenalties | kUsePresencePenalties};
     static UnderlyingType constexpr kUsePenalties{kUseOccurrencePenalties | kUseTemperature | kUseMinLength};
-    static SizeType32 constexpr kNumFlags{9};
+    static UnderlyingType constexpr kUseBanTokens{kUseNoRepeatNgramSize | kUseBanWords};
+    static SizeType32 constexpr kNumFlags{10};
     static UnderlyingType constexpr kAuto{1u << (kNumFlags + 0)};
     static UnderlyingType constexpr kTopK{1u << (kNumFlags + 1)};
     static UnderlyingType constexpr kTopP{1u << (kNumFlags + 2)};

@@ -46,10 +46,10 @@ def build_passkey(args):
     question = "What is the pass key?"
 
     # target_length = [
-    #     1024 * 8, 1024 * 16, 1024 * 32, 1024 * 64, 1024 * 128, 1024 * 256
+    #     1024 * 8, 1024 * 16, 1024 * 32, 1024 * 64, 1024 * 128, 1024 * 256, 1024 * 512, 1024 * 1024
     # ]
-    num_noise = [326, 652, 1305, 2610, 5220, 10440]
-    step = [6, 12, 22, 45, 90, 180]
+    num_noise = [326, 652, 1305, 2610, 5220, 10440, 20880, 41760]
+    step = [6, 12, 22, 45, 90, 180, 360, 720]
     repeat_time = 5
     step_i = step[args.test_level]
     num_noise_i = num_noise[args.test_level]
@@ -85,7 +85,6 @@ def build_kv_retrieval():
 
         with jsonlines.open("kv-retrieval-3000_keys.jsonl") as fin:
             for line in fin:
-                print(len(line["ordered_kv_records"]))
                 # return 0
                 cnt += 1
                 if cnt == nsample[ii]:
@@ -126,7 +125,7 @@ if __name__ == "__main__":
         type=int,
         default=0,
         help=
-        "Test level between [0, 5] for task build_passkey and [0, 1] for task build_kv_retrieval. The larger number, the longer context"
+        "Test level between [0, 7] for task build_passkey and [0, 1] for task build_kv_retrieval. The larger number, the longer context"
     )
     parser.add_argument(
         '--test_case',
@@ -140,5 +139,10 @@ if __name__ == "__main__":
     # os.system("git clone https://github.com/nelson-liu/lost-in-the-middle.git")
     # os.system("python3.10 -u lost-in-the-middle/scripts/make_kv_retrieval_data.py --num-keys 3000 --num-examples 500 --output-path kv-retrieval-3000_keys.jsonl.gz")
     # os.system("gzip -d kv-retrieval-3000_keys.jsonl.gz")
-    # build_kv_retrieval()
-    build_passkey(args)
+
+    if args.test_case == "build_passkey":
+        build_passkey(args)
+    elif args.test_case == "build_kv_retrieval":
+        build_kv_retrieval()
+    else:
+        assert False

@@ -153,11 +153,10 @@ def parse_arguments():
                         action='store_true')
     parser.add_argument('--lora_dir', type=str, default=None, nargs="+")
     parser.add_argument('--lora_task_uids', type=str, default=None, nargs="+")
-    parser.add_argument(
-        "--output_encoder_npy",
-        help=
-        "Store tensors like encoder outputs used for testing enc-dec C++ runtime.",
-        action="store_true")
+    parser.add_argument("--output_npy",
+                        type=str,
+                        default=None,
+                        help="Store input/output tensors C++ runtime testing")
     return parser.parse_args()
 
 
@@ -222,11 +221,13 @@ class TRTLLMEncDecModel:
             self.encoder_model_config, self.encoder_runtime_mapping, encoder_engine_buffer = engine_setup(
                 component='encoder')
 
-            # for Pipeline Parallelism in encoder
-            self.nccl_comm = torch.classes.trtllm.NcclCommunicatorOp(
-                self.encoder_runtime_mapping.tp_size,
-                self.encoder_runtime_mapping.pp_size,
-                self.encoder_runtime_mapping.rank)
+            self.nccl_comm = None
+            if self.encoder_runtime_mapping.has_pp():
+                # for Pipeline Parallelism in encoder
+                self.nccl_comm = torch.classes.trtllm.NcclCommunicatorOp(
+                    self.encoder_runtime_mapping.tp_size,
+                    self.encoder_runtime_mapping.pp_size,
+                    self.encoder_runtime_mapping.rank)
 
             # session setup
             self.encoder_session = tensorrt_llm.runtime.Session.from_serialized_engine(
@@ -579,8 +580,10 @@ class TRTLLMEncDecModel:
             encoder_input_lengths=encoder_input_lengths,
             return_dict=return_dict,
             cross_attention_mask=cross_attention_mask)
-        if return_encoder_output:
-            return output, encoder_output
+
+        if return_dict and return_encoder_output:
+            output['encoder_output'] = encoder_output
+
         return output
 
 
@@ -643,8 +646,8 @@ def test_fairseq_models(args):
         eos_token_id=eos_token_id,
         debug_mode=args.debug_mode,
     )
-    tok = time.time()
     torch.cuda.synchronize()
+    tok = time.time()
 
     if return_dict:
         tllm_output_ids = tllm_output['output_ids']
@@ -722,21 +725,7 @@ if __name__ == "__main__":
         'cuda')  # [batch_size, padded_length]
     # by default int64, must cast to int32! otherwise C++ kernel will interpret as [a, 0, b, 0, c, 0, ...]
 
-    CPP_RESULTS_SAVED_DIR = 'cpp/tests/resources/data/enc_dec'
     if tensorrt_llm.mpi_rank() == 0:
-        if args.output_encoder_npy:
-            if not os.path.isdir(CPP_RESULTS_SAVED_DIR):
-                os.mkdir(os.path.join(CPP_RESULTS_SAVED_DIR))
-            np_input_ids = tokenized_inputs.input_ids.type(torch.IntTensor)
-            np_input_ids = np_input_ids.numpy()
-            np.save(os.path.join(CPP_RESULTS_SAVED_DIR, 'enc_input_ids.npy'),
-                    np_input_ids)
-            input_lengths = tokenized_inputs.attention_mask.sum(dim=1).type(
-                torch.IntTensor).numpy()
-            np.save(
-                os.path.join(CPP_RESULTS_SAVED_DIR, 'enc_input_lengths.npy'),
-                input_lengths)
-
         print("--------------------------------------")
         print(
             f"BOS={tokenizer.bos_token_id}, PAD={tokenizer.pad_token_id}, EOS={tokenizer.eos_token_id}"
@@ -811,7 +800,7 @@ if __name__ == "__main__":
             print(f"HF E2E time {(tok-tik)*1000}ms")
             print("--------------------------------------")
 
-    return_dict = False  # when set return_dict=True, get outputs by key
+    return_dict = True  # when set return_dict=True, get outputs by key
     tik = time.time()
     tllm_output = tllm_model.generate(
         encoder_input_ids=input_ids,
@@ -825,21 +814,16 @@ if __name__ == "__main__":
         return_dict=return_dict,
         attention_mask=tokenized_inputs.attention_mask,
         time_encoder=True,
-        return_encoder_output=args.output_encoder_npy
-        and tensorrt_llm.mpi_rank() == 0)
+        return_encoder_output=args.output_npy and tensorrt_llm.mpi_rank() == 0)
+    torch.cuda.synchronize()
     tok = time.time()
-    if args.output_encoder_npy and tensorrt_llm.mpi_rank() == 0:
-        tllm_output, encoder_output = tllm_output
-        encoder_output = encoder_output.cpu().numpy()
-        np.save(os.path.join(CPP_RESULTS_SAVED_DIR, 'encoder_output.npy'),
-                encoder_output)
-
-    if return_dict:
-        tllm_output_ids = tllm_output['output_ids']
-    else:
-        tllm_output_ids = tllm_output
 
     if tensorrt_llm.mpi_rank() == 0:
+        if return_dict:
+            tllm_output_ids = tllm_output['output_ids']
+        else:
+            tllm_output_ids = tllm_output
+
         output_ids = tllm_output_ids[:, 0, :]
         output_text = tokenizer.batch_decode(output_ids,
                                              skip_special_tokens=True)
@@ -847,6 +831,7 @@ if __name__ == "__main__":
                                  tokenizer.pad_token_id).sum(dim=1)
         output_gen_lengths = (output_ids != tokenizer.eos_token_id).sum(
             dim=1) - decoder_input_lengths
+
         print("--------------------------------------")
         print("TRT-LLM output_ids: ", output_ids)
         print("TRT-LLM output text: ", output_text)
@@ -854,6 +839,34 @@ if __name__ == "__main__":
         print(f"TRT-LLM E2E time {(tok-tik)*1000}ms")
         print("Precision:", inference_dtype)
         print("--------------------------------------")
+
+        # save input/output tensors for C++ runtime testing
+        if args.output_npy:
+            os.makedirs(args.output_npy, exist_ok=True)
+
+            input_lengths = tokenized_inputs.attention_mask.sum(dim=1).type(
+                torch.IntTensor)
+            input_ids = tokenized_inputs.input_ids.type(torch.IntTensor)
+            input_ids_flatten = torch.cat([
+                input_ids[i][:input_lengths[i]]
+                for i in range(len(input_lengths))
+            ])
+            encoder_output = tllm_output['encoder_output'].type(torch.float16)
+
+            def save_npy(tensor, name):
+                np.save(os.path.join(args.output_npy, f'{name}.npy'),
+                        tensor.cpu().numpy())
+
+            print(
+                f"Saving input/output tensors to {args.output_npy} for C++ runtime testing"
+            )
+            save_npy(input_ids_flatten, 'input_ids')  # [num_tokens]
+            save_npy(input_lengths, 'input_lengths')  # [batch_size]
+            save_npy(encoder_output,
+                     'encoder_output')  # [num_tokens, hidden_size]
+            save_npy(
+                output_ids, 'output_ids'
+            )  # [batch_size, max_output_tokens], max_output_tokens = decoder_input_tokens + max_new_tokens
 
         # simple accuracy check
         if args.compare_hf_fp32:

@@ -10,13 +10,16 @@ This document shows how to build and run a LLaMA model in TensorRT-LLM on both s
       - [LLaMA v2 Updates](#llama-v2-updates)
       - [LLaMA v3 Updates](#llama-v3-updates)
     - [Long context length](#long-context-length)
-      - [INT8 KV cache](#int8-kv-cache)
-      - [SmoothQuant](#smoothquant)
-      - [FP8 Post-Training Quantization](#fp8-post-training-quantization)
-      - [Groupwise quantization (AWQ/GPTQ)](#groupwise-quantization-awqgptq)
-        - [AWQ](#awq)
-        - [GPTQ](#gptq)
+      - [Long context evaluation](#long-context-evaluation)
+      - [1M long context test case](#1m-long-context-test-case)
+    - [INT8 KV cache](#int8-kv-cache)
+    - [SmoothQuant](#smoothquant)
+    - [FP8 Post-Training Quantization](#fp8-post-training-quantization)
+    - [Groupwise quantization (AWQ/GPTQ)](#groupwise-quantization-awqgptq)
+      - [AWQ](#awq)
+      - [GPTQ](#gptq)
     - [Run](#run)
+    - [Multi-GPU multi-node (MGMN) support](#multi-gpu-multi-node-mgmn-support)
     - [Summarization using the LLaMA model](#summarization-using-the-llama-model)
       - [Mistral v0.1](#mistral-v01)
   - [Running CodeLlama](#running-codellama)
@@ -24,6 +27,7 @@ This document shows how to build and run a LLaMA model in TensorRT-LLM on both s
     - [Run](#run-1)
   - [Run LLaMa with LoRA](#run-llama-with-lora)
     - [Run LLaMa with several lora checkpoints](#run-llama-with-several-lora-checkpoints)
+    - [Run FP8 LLaMa with FP16 lora checkpoints](#run-fp8-llama-with-fp16-lora-checkpoints)
   - [Run LLaMa with StreamingLLM](#run-llama-with-streamingllm)
 
 ## Overview
@@ -77,6 +81,8 @@ The defaults have been carefully tuned for better performance. For example, `gpt
 Normally `trtllm-build` only requires single GPU, but if you've already got all the GPUs needed for inference, you could enable parallel building to make the engine building process faster by adding `--workers` argument. Please note that currently `workers` feature only supports single node.
 
 `--use_fused_mlp` enables GEMM horizontal fusion in gated MLP layer, which reduces input traffic and potentially improves performance. For FP8 PTQ, the downside is slight reduction of accuracy because one of the quantization scaling factors are discarded (accuracy 0.45734 vs 0.45755 for LLaMA-v2 7B using modelopt/examples/hf/instruct_eval/mmlu.py).
+
+`--use_fused_mlp --use_gemm_swiglu_plugin <dtype>` fuses 2 GEMMs without biases and SwiGLU into one kernel. This is a preview feature and is only supported for dtype `fp8`. The supported architecture is SM90.
 
 Here're some examples:
 
@@ -270,7 +276,7 @@ A few LLaMA models are fine-tuned for long context length that TRT-LLM can suppo
 
 ```bash
 # Build 8-GPU engine with long context LLaMA model
-python convert_checkpoint.py --meta_ckpt_dir ./tmp/LongAlpaca-70B/ \
+python convert_checkpoint.py --model_dir ./tmp/LongAlpaca-70B/ \
                             --output_dir ./tllm_checkpoint_8gpu_tp8 \
                             --dtype float16 \
                             --tp_size 8 \
@@ -326,6 +332,8 @@ git-lfs clone https://huggingface.co/gradientai/Llama-3-8B-Instruct-Gradient-104
 
 * Run examples with max_input_len 16384
 
+To evaluate the PPL of very long context, we need to enable `use_paged_context_fmha` and setup `max_num_tokens` to enable the chunked context inference, reducing the activation memory requirement. Also, we need to enable `gather_all_token_logits` to return the logits to compute the PPL.
+
 ```bash
 python examples/llama/convert_checkpoint.py --model_dir ./Llama-3-8B-Instruct-Gradient-1048k/ \
                               --output_dir /tmp/llama-3-8B-1048k/trt_ckpts \
@@ -334,10 +342,11 @@ python examples/llama/convert_checkpoint.py --model_dir ./Llama-3-8B-Instruct-Gr
 python -m tensorrt_llm.commands.build --checkpoint_dir /tmp/llama-3-8B-1048k/trt_ckpts \
             --output_dir /tmp/llama-3-8B-1048k/trt_engines \
             --gemm_plugin float16 \
-            --strongly_typed \
             --gather_all_token_logits \
+            --max_num_tokens 4096 \
             --max_input_len 16384 \
-            --max_output_len 10
+            --max_output_len 10 \
+            --use_paged_context_fmha enable
 
 python ./examples/summarize.py --test_trt_llm \
                        --tokenizer_dir ./Llama-3-8B-Instruct-Gradient-1048k/ \
@@ -351,15 +360,119 @@ python ./examples/summarize.py --test_trt_llm \
 
 * Run evaluation on passkey task
 
+To evaluate the accuracy of very long context on `needle in haystack`, we need to enable `use_paged_context_fmha` and setup `max_num_tokens` to enable the chunked context inference, reducing the activation memory requirement. To save memory, we don't enable the `gather_all_token_logits` here because we don't need logits.
+
 ```bash
-python3 examples/infinitebench/construct_synthetic_dataset.py --test_case build_passkey
+python3 examples/infinitebench/construct_synthetic_dataset.py --test_case build_passkey --test_level 4
+
+python -m tensorrt_llm.commands.build --checkpoint_dir /tmp/llama-3-8B-1048k/trt_ckpts \
+            --output_dir /tmp/llama-3-8B-1048k/trt_engines \
+            --gemm_plugin float16 \
+            --max_num_tokens 4096 \
+            --max_input_len 131072 \
+            --max_output_len 10 \
+            --use_paged_context_fmha enable
 
 python examples/eval_long_context.py  --task passkey \
                                       --engine_dir /tmp/llama-3-8B-1048k/trt_engines \
                                       --tokenizer_dir ./Llama-3-8B-Instruct-Gradient-1048k/ \
-                                      --stop_idx 20 \
-                                      --max_input_length 12800 \
-                                      --use_py_session
+                                      --stop_idx 10 \
+                                      --max_input_length 131072 \
+                                      --enable_chunked_context \
+                                      --max_tokens_in_paged_kv_cache 131136
+```
+
+* Run evaluation on kv_retrieval
+
+`kv_retrieval` is harder than `passkey` and is helpful to distinguish the model capability.
+
+To run the kv_retrieval, we need a third-party repo to prepare the keys.
+
+```bash
+git clone git@github.com:nelson-liu/lost-in-the-middle.git
+pip install -r lost-in-the-middle/requirements.txt
+python -u lost-in-the-middle/scripts/make_kv_retrieval_data.py --num-keys 3000 --num-examples 500 --output-path kv-retrieval-3000_keys.jsonl.gz
+gzip -d kv-retrieval-3000_keys.jsonl.gz
+```
+
+Prepare input data and run evaluation.
+
+```bash
+python examples/infinitebench/construct_synthetic_dataset.py --test_case build_kv_retrieval --test_level 0
+
+python examples/llama/convert_checkpoint.py --model_dir ./Llama-3-8B-Instruct-Gradient-1048k/ \
+                              --output_dir /tmp/llama-3-8B-1048k/trt_ckpts \
+                              --dtype float16 \
+                              --tp_size 1
+
+python -m tensorrt_llm.commands.build --checkpoint_dir /tmp/llama-3-8B-1048k/trt_ckpts \
+            --output_dir /tmp/llama-3-8B-1048k/trt_engines \
+            --gemm_plugin float16 \
+            --max_num_tokens 4096 \
+            --max_input_len 131072 \
+            --max_output_len 10 \
+            --use_paged_context_fmha enable
+
+python examples/eval_long_context.py  --task kv_retrieval \
+                                      --engine_dir /tmp/llama-3-8B-1048k/trt_engines \
+                                      --tokenizer_dir ./Llama-3-8B-Instruct-Gradient-1048k/ \
+                                      --stop_idx 10 \
+                                      --max_input_length 131072 \
+                                      --enable_chunked_context \
+                                      --max_tokens_in_paged_kv_cache 131136 \
+                                      --tensorrt_llm_accuracy_threshold 0.6
+```
+
+expected results:
+
+```bash
+[05/28/2024-03:31:43] [TRT-LLM] [I] ==== Evaluation ====
+[05/28/2024-03:31:43] [TRT-LLM] [I] # examples: 500
+[05/28/2024-03:31:43] [TRT-LLM] [I] Start index: 0
+[05/28/2024-03:31:43] [TRT-LLM] [I] Stop index: 10
+[05/28/2024-03:31:43] [TRT-LLM] [I] Max tokens: 50
+[05/28/2024-03:34:50] [TRT-LLM] [I] Compute the score
+10it [00:00, 131072.00it/s]
+[05/28/2024-03:34:51] [TRT-LLM] [I] Evaluation takes: 187.19733428955078 sec.
+[05/28/2024-03:34:51] [TRT-LLM] [I] accuracy of 10 examples: 0.6
+```
+
+#### 1M long context test case
+
+```bash
+git-lfs clone https://huggingface.co/gradientai/Llama-3-8B-Instruct-Gradient-1048k/
+
+python examples/infinitebench/construct_synthetic_dataset.py --test_case build_passkey --test_level 7
+
+python examples/llama/convert_checkpoint.py --model_dir ./Llama-3-8B-Instruct-Gradient-1048k/ \
+                              --output_dir /tmp/llama-3-8B-1048k/trt_ckpts \
+                              --dtype float16 \
+                              --tp_size 4
+
+python -m tensorrt_llm.commands.build --checkpoint_dir /tmp/llama-3-8B-1048k/trt_ckpts \
+            --output_dir /tmp/llama-3-8B-1048k/trt_engines \
+            --gemm_plugin float16 \
+            --max_num_tokens 4096 \
+            --max_input_len 1048576 \
+            --max_output_len 10 \
+            --use_paged_context_fmha enable \
+            --workers 4
+
+mpirun -n 4 --allow-run-as-root python examples/eval_long_context.py  --task passkey \
+                                      --engine_dir /tmp/llama-3-8B-1048k/trt_engines \
+                                      --tokenizer_dir ./Llama-3-8B-Instruct-Gradient-1048k/ \
+                                      --stop_idx 1 \
+                                      --max_input_length 1048576 \
+                                      --enable_chunked_context \
+                                      --max_tokens_in_paged_kv_cache 1100000
+```
+
+expected result:
+
+```bash
+[05/27/2024-10:30:45] [TRT-LLM] [I] Compute the score
+1it [00:00, 4215.38it/s]
+[05/27/2024-10:30:45] [TRT-LLM] [I] accuracy of 1 examples: 1.0
 ```
 
 ### INT8 KV cache
@@ -400,7 +513,6 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_int8_kv_wq \
             --output_dir ./tmp/llama/7B/trt_engines/int8_kv_cache_weight_only/1-gpu \
             --gemm_plugin auto \
             --multi_block_mode enable \
-            --strongly_typed
 ```
 
 Test with `../summarize.py`:
@@ -429,7 +541,6 @@ python ../quantization/quantize.py --model_dir /tmp/llama-7b-hf \
 trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_awq_int8_kv_cache \
             --output_dir ./tmp/llama/7B/trt_engines/int8_kv_cache_int4_AWQ/1-gpu/ \
             --gemm_plugin auto \
-            --strongly_typed
 ```
 
 Test with `../summarize.py`:
@@ -499,7 +610,6 @@ python ../quantization/quantize.py --model_dir ./tmp/llama/70B \
 trtllm-build --checkpoint_dir ./tllm_checkpoint_2gpu_fp8 \
              --output_dir ./engine_outputs \
              --gemm_plugin auto \
-             --strongly_typed \
              --workers 2
 ```
 
@@ -595,6 +705,47 @@ python3 ../run.py --max_output_len=50 \
                   --tokenizer_dir ./tmp/llama/7B/ \
                   --engine_dir=./tmp/llama/7B/trt_engines/bf16/1-gpu/
 ```
+
+### Multi-GPU multi-node (MGMN) support
+
+In MGMN case, you can still convert and build engines on a single node and then run the model on a multi-node environment, such as [Slurm](https://slurm.schedmd.com/documentation.html).
+
+For example, to build LLaMA 70B for 2 nodes with 8 GPUs per node, we can use 8-way tensor parallelism and 2-way pipeline parallelism:
+
+```bash
+python convert_checkpoint.py --model_dir ./tmp/llama/70B/hf/ \
+                            --output_dir ./tllm_checkpoint_16gpu_tp8_pp2 \
+                            --dtype float16 \
+                            --tp_size 8 \
+                            --pp_size 2
+
+trtllm-build --checkpoint_dir ./tllm_checkpoint_16gpu_tp8_pp2 \
+            --output_dir ./tmp/llama/70B/trt_engines/fp16/16-gpu/ \
+            --workers 8 \
+            --gemm_plugin auto
+```
+
+Note that `–-workers` is still set to 8 to build all engines within a single node.
+
+To run the LLaMA 70B model on 2 nodes via Slurm, you need to prepare a Slurm script to submit the task, the script contains the following lines:
+
+```bash
+#SBATCH -N 2
+#SBATCH --ntasks-per-node=8
+#SBATCH -p <partition>
+# more sbatch options here...
+
+srun --container-image=<docker-image> \
+     --mpi=pmix \
+     ... \ # more srun options here
+     python3 ../run.py --max_output_len=50 \
+                       --tokenizer_dir ./tmp/llama/70B/hf/ \
+                       --engine_dir=./tmp/llama/70B/trt_engines/fp16/16-gpu/
+```
+
+Finally, you can submit the task with `sbatch <your-slurm-script>.sh`.
+
+Considering the Slurm or other cluster management systems may be highly customized and the task-submit command may be variant, the forementioned example is for reference only. The key point is to submit the Python script with the MPI runtime, and TensorRT-LLM will take care of the rest.
 
 ### Summarization using the LLaMA model
 
@@ -846,6 +997,71 @@ Output [Text 5 Beam 0]: "ワシントン D.C."
 ```
 
 We can observe that `luotuo-lora-7b-0.1` produces correct answers on the first sentence and the fifth sentence (in Chinese), `Japanese-Alpaca-LoRA-7b-v0` produces correct answers on the sixth sentence (in Japanese).
+
+### Run FP8 LLaMa with FP16 lora checkpoints
+
+In this section, we show how to run an FP8 llama model with multiple FP16 LoRA modules.
+
+* Quantize the llama model to fp8 from HF
+```bash
+BASE_LLAMA_MODEL=llama-7b-hf/
+python ../quantization/quantize.py --model_dir ${BASE_LLAMA_MODEL} \
+                                   --dtype float16 \
+                                   --qformat fp8 \
+                                   --kv_cache_dtype fp8 \
+                                   --output_dir ./tllm_checkpoint_1gpu_fp8 \
+                                   --calib_size 512
+```
+
+* Download the lora model, build engine, and run inference.
+```bash
+git-lfs clone https://huggingface.co/qychen/luotuo-lora-7b-0.1
+git-lfs clone https://huggingface.co/kunishou/Japanese-Alpaca-LoRA-7b-v0
+
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_fp8 \
+            --output_dir /tmp/llama_7b_with_lora_qkv/trt_engines/fp8/1-gpu/ \
+            --gemm_plugin auto \
+            --lora_plugin auto \
+            --max_batch_size 8 \
+            --max_input_len 512 \
+            --max_output_len 50 \
+            --lora_dir  "luotuo-lora-7b-0.1/" "Japanese-Alpaca-LoRA-7b-v0/" \
+            --max_lora_rank 8 \
+            --lora_target_modules attn_q attn_k attn_v
+
+python ../run.py --engine_dir "/tmp/llama_7b_with_lora_qkv/trt_engines/fp8/1-gpu/" \
+              --max_output_len 10 \
+              --tokenizer_dir ${BASE_LLAMA_MODEL} \
+              --input_text "美国的首都在哪里? \n答案:" "美国的首都在哪里? \n答案:" "美国的首都在哪里? \n答案:" "アメリカ合衆国の首都はどこですか? \n答え:" "アメリカ合衆国の首都はどこですか? \n答え:" "アメリカ合衆国の首都はどこですか? \n答え:" \
+              --lora_task_uids -1 0 1 -1 0 1 \
+              --use_py_session --top_p 0.5 --top_k 0
+```
+
+The results would be like
+
+```bash
+Input [Text 0]: "<s> 美国的首都在哪里? \n答案:"
+Output [Text 0 Beam 0]: "Washington, D.C.
+What is the"
+
+Input [Text 1]: "<s> 美国的首都在哪里? \n答案:"
+Output [Text 1 Beam 0]: "华盛顿。
+"
+
+Input [Text 2]: "<s> 美国的首都在哪里? \n答案:"
+Output [Text 2 Beam 0]: "沃尔沛。\n"
+
+Input [Text 3]: "<s> アメリカ合衆国の首都はどこですか? \n答え:"
+Output [Text 3 Beam 0]: "Washington, D.C.
+Copyright "
+
+Input [Text 4]: "<s> アメリカ合衆国の首都はどこですか? \n答え:"
+Output [Text 4 Beam 0]: "华盛顿。
+"
+
+Input [Text 5]: "<s> アメリカ合衆国の首都はどこですか? \n答え:"
+Output [Text 5 Beam 0]: "ワシントン D.C."
+```
 
 ## Run LLaMa with StreamingLLM
 

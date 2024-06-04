@@ -15,6 +15,7 @@
 
 import argparse
 import ast
+import os
 from pathlib import Path
 
 import evaluate
@@ -139,8 +140,10 @@ def main(args):
                 f.write(f'Tokenizer path: {args.tokenizer_dir}\n')
 
     # TODO: Add random_seed flag in gptj
-    metric_tensorrt_llm = [evaluate.load("rouge") for _ in range(num_beams)]
-    metric_hf = [evaluate.load("rouge") for _ in range(num_beams)]
+    rouge_dir = args.rouge_dir if args.rouge_dir and os.path.exists(
+        args.rouge_dir) else "rouge"
+    metric_tensorrt_llm = [evaluate.load(rouge_dir) for _ in range(num_beams)]
+    metric_hf = [evaluate.load(rouge_dir) for _ in range(num_beams)]
     for i in range(num_beams):
         metric_tensorrt_llm[i].seed = 0
         metric_hf[i].seed = 0
@@ -149,7 +152,8 @@ def main(args):
 
     def _prepare_inputs(batch_input_texts,
                         eval_task='summarize',
-                        add_special_tokens=True):
+                        add_special_tokens=True,
+                        min_input_length=0):
         batch_size = len(batch_input_texts)
         append_str = ' TL;DR: ' if eval_task == 'summarize' else ''
         batch_input_ids = []
@@ -193,17 +197,23 @@ def main(args):
                     truncation=True,
                     max_length=test_token_num).squeeze(0)
 
-            batch_input_ids.append(input_ids)
+            if input_ids.numel() > min_input_length:
+                batch_input_ids.append(input_ids)
         return batch_input_ids
 
     def eval_trt_llm(datapoint,
                      eval_task='summarize',
                      eval_ppl=False,
-                     add_special_tokens=True):
+                     add_special_tokens=True,
+                     min_input_length=0):
         batch_size = len(datapoint[dataset_input_key])
         batch_input_ids = _prepare_inputs(datapoint[dataset_input_key],
                                           eval_task=eval_task,
-                                          add_special_tokens=add_special_tokens)
+                                          add_special_tokens=add_special_tokens,
+                                          min_input_length=min_input_length)
+        batch_size = len(batch_input_ids)
+        if batch_size == 0:
+            return [], [], [], {}
         input_lengths = [x.size(0) for x in batch_input_ids]
 
         with torch.no_grad():
@@ -280,7 +290,8 @@ def main(args):
     def eval_hf(datapoint,
                 eval_task='summarize',
                 eval_ppl=False,
-                add_special_tokens=True):
+                add_special_tokens=True,
+                min_input_length=0):
         batch_size = len(datapoint[dataset_input_key])
         if batch_size > 1:
             logger.warning(
@@ -288,7 +299,11 @@ def main(args):
             )
         batch_input_ids = _prepare_inputs(datapoint[dataset_input_key],
                                           eval_task=eval_task,
-                                          add_special_tokens=add_special_tokens)
+                                          add_special_tokens=add_special_tokens,
+                                          min_input_length=min_input_length)
+        batch_size = len(batch_input_ids)
+        if batch_size == 0:
+            return [], [], [], [[] for _ in range(batch_size)]
         input_lengths = [x.size(0) for x in batch_input_ids]
         # Left padding for HF
         max_length = max(input_lengths)
@@ -413,7 +428,8 @@ def main(args):
         output, *_ = eval_trt_llm(datapoint,
                                   eval_task=args.eval_task,
                                   eval_ppl=args.eval_ppl,
-                                  add_special_tokens=args.add_special_tokens)
+                                  add_special_tokens=args.add_special_tokens,
+                                  min_input_length=args.min_input_length)
         if runtime_rank == 0 and args.eval_task != "eval_context_ppl":
             logger.info(
                 "---------------------------------------------------------")
@@ -440,7 +456,11 @@ def main(args):
                 datapoint,
                 eval_task=args.eval_task,
                 eval_ppl=args.eval_ppl,
-                add_special_tokens=args.add_special_tokens)
+                add_special_tokens=args.add_special_tokens,
+                min_input_length=args.min_input_length)
+            if output_tensorrt_llm == []:
+                data_point_idx += max_batch_size
+                continue
             profiler.stop('tensorrt_llm')
             if runtime_rank == 0:
                 input_lengths = lengths_info['input_lengths']
@@ -520,7 +540,8 @@ def main(args):
         output, *_ = eval_hf(datapoint,
                              eval_task=args.eval_task,
                              eval_ppl=args.eval_ppl,
-                             add_special_tokens=args.add_special_tokens)
+                             add_special_tokens=args.add_special_tokens,
+                             min_input_length=args.min_input_length)
         if runtime_rank == 0 and args.eval_task != "eval_context_ppl":
             logger.info(
                 "---------------------------------------------------------")
@@ -547,9 +568,12 @@ def main(args):
                 datapoint,
                 eval_task=args.eval_task,
                 eval_ppl=args.eval_ppl,
-                add_special_tokens=args.add_special_tokens)
+                add_special_tokens=args.add_special_tokens,
+                min_input_length=args.min_input_length)
             profiler.stop('hf')
-
+            if output_hf == []:
+                data_point_idx += max_batch_size
+                continue
             if runtime_rank == 0:
                 seq_lengths = [len(tokens) for tokens in token_list]
                 total_output_token_count_hf += sum(seq_lengths)
@@ -611,8 +635,8 @@ def main(args):
                         f"  Per-token perplexity: {np.mean(ppls_trt_llm[beam_idx])}"
                     )
                     if args.check_accuracy and beam_idx == 0:
-                        assert np.mean(ppls_trt_llm[beam_idx]
-                                       ) < args.tensorrt_llm_ppl_threshold
+                        avg_ppl = np.mean(ppls_trt_llm[beam_idx])
+                        assert avg_ppl < args.tensorrt_llm_ppl_threshold, f"[FAILED] average PPL ({avg_ppl}) is larger than threshold ({args.tensorrt_llm_ppl_threshold})"
         if test_hf:
             np.random.seed(0)  # rouge score use sampling to compute the score
             logger.info(
@@ -690,6 +714,11 @@ if __name__ == '__main__':
     parser.add_argument('--max_ite', type=int, default=20)
     parser.add_argument('--output_len', type=int, default=100)
     parser.add_argument('--max_input_length', type=int, default=923)
+    parser.add_argument(
+        '--min_input_length',
+        type=int,
+        default=0,
+        help='skip the sentences which are shorter than min_input_length.')
     parser.add_argument(
         '--max_attention_window_size',
         type=int,
@@ -780,6 +809,15 @@ if __name__ == '__main__':
         default=None,
         nargs="+",
         help="The list of LoRA task uids; use -1 to disable the LoRA module")
+
+    parser.add_argument(
+        '--rouge_dir',
+        default=None,
+        type=str,
+        help=
+        "evaluate.load('rouge') will attempt to pull rouge package from HF. Use cached rouge can avoid network outage of host or HF."
+    )
+
     args = parser.parse_args()
 
     main(args)

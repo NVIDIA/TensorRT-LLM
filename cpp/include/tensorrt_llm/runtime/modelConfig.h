@@ -36,6 +36,7 @@ public:
         kGlm = 1,            // https://github.com/THUDM/GLM and https://github.com/THUDM/ChatGLM-6B
         kMamba = 2,          // https://github.com/state-spaces/mamba
         kRecurrentGemma = 3, // https://github.com/google-deepmind/recurrentgemma
+        kEncDec = 4,
     };
 
     struct RnnConfig
@@ -84,7 +85,7 @@ public:
         , mUseLoraPlugin(false)
         , mMlpHiddenSize(0)
         , mUseCrossAttention(false)
-        , mUsePositionEmbedding(true) // TODO: remove these two properties?
+        , mUsePositionEmbedding(false)
         , mUseTokenTypeEmbedding(false)
         , mSpeculativeDecodingMode(SpeculativeDecodingMode::None())
     {
@@ -130,6 +131,16 @@ public:
     [[nodiscard]] SizeType32 constexpr getHiddenSize() const noexcept
     {
         return mHiddenSize;
+    }
+
+    [[nodiscard]] SizeType32 constexpr getEncoderHiddenSize() const noexcept
+    {
+        return mEncoderHiddenSize;
+    }
+
+    void constexpr setEncoderHiddenSize(SizeType32 encoderHiddenSize) noexcept
+    {
+        mEncoderHiddenSize = encoderHiddenSize;
     }
 
     [[nodiscard]] SizeType32 constexpr getSizePerHead() const noexcept
@@ -273,6 +284,16 @@ public:
         mMaxNumTokens = maxNumTokens;
     }
 
+    [[nodiscard]] SizeType32 constexpr getMaxEncoderLen() const noexcept
+    {
+        return mMaxEncoderLen;
+    }
+
+    void constexpr setMaxEncoderLen(SizeType32 maxEncoderLen) noexcept
+    {
+        mMaxEncoderLen = maxEncoderLen;
+    }
+
     [[nodiscard]] bool constexpr usePromptTuning() const noexcept
     {
         return mMaxPromptEmbeddingTableSize > 0;
@@ -398,9 +419,9 @@ public:
         return mUseCrossAttention;
     }
 
-    void constexpr useCrossAttention(bool newCrossAttention) noexcept
+    void constexpr setUseCrossAttention(bool useCrossAttention) noexcept
     {
-        mUseCrossAttention = newCrossAttention;
+        mUseCrossAttention = useCrossAttention;
     }
 
     [[nodiscard]] bool constexpr usePositionEmbedding() const noexcept
@@ -408,9 +429,9 @@ public:
         return mUsePositionEmbedding;
     }
 
-    void constexpr usePositionEmbedding(bool newPositionEmbedding) noexcept
+    void constexpr setUsePositionEmbedding(bool usePositionEmbedding) noexcept
     {
-        mUsePositionEmbedding = newPositionEmbedding;
+        mUsePositionEmbedding = usePositionEmbedding;
     }
 
     [[nodiscard]] bool constexpr useTokenTypeEmbedding() const noexcept
@@ -418,19 +439,9 @@ public:
         return mUseTokenTypeEmbedding;
     }
 
-    void constexpr useTokenTypeEmbedding(bool newTokenTypeEmbedding) noexcept
+    void constexpr setUseTokenTypeEmbedding(bool useTokenTypeEmbedding) noexcept
     {
-        mUseTokenTypeEmbedding = newTokenTypeEmbedding;
-    }
-
-    [[nodiscard]] SizeType32 constexpr getFfnHiddenSize() const noexcept
-    {
-        return mFfnHiddenSize;
-    }
-
-    void constexpr setFfnHiddenSize(SizeType32 ffnHiddenSize) noexcept
-    {
-        mFfnHiddenSize = ffnHiddenSize;
+        mUseTokenTypeEmbedding = useTokenTypeEmbedding;
     }
 
     [[nodiscard]] SizeType32 constexpr getMaxLoraRank() const noexcept
@@ -575,10 +586,11 @@ private:
     std::optional<RnnConfig> mRnnConfig;
 
     // Configs related to encoder / enc-dec models
+    SizeType32 mMaxEncoderLen{};
+    SizeType32 mEncoderHiddenSize{};
     bool mUseCrossAttention;
     bool mUsePositionEmbedding;
     bool mUseTokenTypeEmbedding;
-    SizeType32 mFfnHiddenSize; // indicates encoder output hidden size
 
     std::vector<LayerType> mLayerTypes;
     // Speculative decoding members

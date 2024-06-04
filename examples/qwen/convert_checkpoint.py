@@ -251,7 +251,7 @@ def from_cli_args(args):
             'tp_size': args.tp_size,
             'pp_size': args.pp_size
         },
-        'quantization': args_to_quantization(args).asdict()
+        'quantization': args_to_quantization(args).to_dict()
     }
     config.update(args_to_build_options(args))
     return config

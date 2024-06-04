@@ -51,6 +51,8 @@ def _init(log_level: object = None) -> None:
         logger.info('Skipping TensorRT-LLM init.')
         return
 
+    logger.info('Starting TensorRT-LLM init.')
+
     # load plugin lib
     _load_plugin_lib()
 

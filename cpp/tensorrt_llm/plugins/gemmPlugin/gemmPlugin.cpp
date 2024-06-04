@@ -20,6 +20,7 @@
 #include "gemmPluginProfiler.h"
 #include "plugin.h"
 #include "pluginUtils.h"
+#include "tensorrt_llm/runtime/utils/debugUtils.h"
 
 #include <NvInferRuntime.h>
 
@@ -348,8 +349,26 @@ int GemmPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::P
         mTransA ? inputDesc[0].dims.d[0] - padK : inputDesc[0].dims.d[nbDimsA - 1] - padK);
 
     auto bestTactic = mPluginProfiler->getBestConfig(M, mGemmId);
-    runGemm(M, N, K, mTransA, mTransB, mPadLda, mPadLdb, mType, mCublasWrapper, inputs[0], inputs[1], outputs[0],
-        bestTactic, workspace, stream);
+
+    std::string mnkStr = "MNK={" + std::to_string(M) + ", " + std::to_string(N) + ", " + std::to_string(K) + "}";
+    {
+        std::string const activationStr = "GEMM layer's activation before GEMM with " + mnkStr;
+        TLLM_CHECK_DEBUG_WITH_INFO(
+            tensorrt_llm::runtime::utils::tensorHasNan(M, K, mType, inputs[0], stream, activationStr) == false,
+            "Found NaN in " + activationStr);
+    }
+
+    {
+        runGemm(M, N, K, mTransA, mTransB, mPadLda, mPadLdb, mType, mCublasWrapper, inputs[0], inputs[1], outputs[0],
+            bestTactic, workspace, stream);
+    }
+
+    {
+        std::string const outputStr = "GEMM layer's output after GEMM with " + mnkStr;
+        TLLM_CHECK_DEBUG_WITH_INFO(
+            tensorrt_llm::runtime::utils::tensorHasNan(M, N, mType, outputs[0], stream, outputStr) == false,
+            "Found NaN in " + outputStr);
+    }
     return 0;
 }
 

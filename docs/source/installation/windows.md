@@ -21,9 +21,11 @@ We recommend checking out the [v0.10.0 tag](https://github.com/NVIDIA/TensorRT-L
        ./setup_env.ps1 [-skipCUDA] [-skipPython]
        ```
 
+       2. Close and re-open any existing PowerShell or Git Bash windows so they pick up the new `Path` modified by the `setup_env.ps1` script above.
+
     2. Install the dependencies one at a time.
 
-        1. Install [Python 3.10](https://www.python.org/downloads/windows/).
+        1. Install [Python 3.10](https://www.python.org/ftp/python/3.10.11/python-3.10.11-amd64.exe).
 
             1. Select **Add python.exe to PATH** at the start of the installation. The installation may only add the `python` command, but not the `python3` command.
             2. Navigate to the installation path `%USERPROFILE%\AppData\Local\Programs\Python\Python310` (`AppData` is a hidden folder) and copy `python.exe` to `python3.exe`.

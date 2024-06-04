@@ -45,6 +45,9 @@ struct MaskedSoftmaxParam
     // always float compute data type.
     float qk_tanh_scale = 0.f;
     float qk_tanh_inverse_scale = 0.f;
+    bool block_sparse_attn = false;
+    BlockSparseParams block_sparse_params;
+    int const* q_seq_lengths = nullptr; // (batch_size)
 
     // Optional parameters that depend on the type of attention.
     // The slopes of the linear position bias of ALiBi.
@@ -272,5 +275,9 @@ void invokeShiftKCache(KVCacheBuffer const& kvCacheBuffer, KVLinearBuffer const&
     float const* kScaleQuantOrig, int const* sequence_lengths, int const* input_lengths, int const rotary_embedding_dim,
     float rotary_embedding_base, RotaryScalingType const rotary_scale_type, float rotary_embedding_scale,
     int const rotary_embedding_max_positions, PositionEmbeddingType const position_embedding_type, cudaStream_t stream);
+
+// compute src[x] * scale[0] and write into dst[x]
+template <typename Dst, typename Src>
+void invokeConversion(Dst* dst, Src const* src, int64_t size, float const* __restrict__ scale, cudaStream_t stream);
 } // namespace kernels
 } // namespace tensorrt_llm

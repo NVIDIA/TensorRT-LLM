@@ -975,7 +975,8 @@ std::vector<size_t> CutlassMoeFCRunner<T, WeightType, OutputType, Enable>::getWo
     size_t const permuted_elems = num_moe_inputs * hidden_size;
     size_t const interbuf_elems = num_moe_inputs * inter_size;
     size_t glu_inter_elems = 0;
-    if (isGatedActivation(activation_type))
+    bool is_gated_activation = isGatedActivation(activation_type);
+    if (is_gated_activation)
     {
         glu_inter_elems = interbuf_elems * 2;
     }
@@ -1180,7 +1181,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, Enable>::runMoe(void const* i
     sync_check_cuda_error();
 
     bool const is_gated_activation = isGatedActivation(fc1_activation_type);
-    size_t const fc1_out_size = is_gated_activation ? inter_size * 2 : inter_size;
+    bool const use_fused_moe = moe_gemm_runner_.isFusedGatedActivation(is_gated_activation, inter_size, hidden_size);
+    size_t const fc1_out_size = ((!use_fused_moe) && is_gated_activation) ? inter_size * 2 : inter_size;
 
     // Upper bound on number of expanded rows
     int64_t const expanded_active_expert_rows = k * active_rows;
@@ -1209,7 +1211,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, Enable>::runMoe(void const* i
         sync_check_cuda_error();
 
         moe_gemm_runner_.moeGemm(permuted_data_, nullptr, nullptr, nullptr, total_rows_before_expert_, hopper_input,
-            expanded_active_expert_rows, fc1_out_size, hidden_size, num_experts_per_node, stream);
+            expanded_active_expert_rows, fc1_out_size, hidden_size, num_experts_per_node, false, stream);
 
         sync_check_cuda_error();
 
@@ -1223,24 +1225,27 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, Enable>::runMoe(void const* i
     {
         moe_gemm_runner_.moeGemmBiasAct(permuted_data_, fc1_expert_weights, fc1_int_scales, fc1_expert_biases,
             fc1_result_, total_rows_before_expert_, HopperGroupedGemmInput{}, expanded_active_expert_rows, fc1_out_size,
-            hidden_size, num_experts_per_node, fc1_activation_type, stream);
+            hidden_size, num_experts_per_node, fc1_activation_type, use_fused_moe, stream);
 
         sync_check_cuda_error();
     }
     else
     {
         // Run the GEMM with activation function overridden with `Identity`, we do the activation separately
+        ActivationType activation_type = (use_fused_moe) ? fc1_activation_type : ActivationType::Identity;
+        T* gemm_result = (use_fused_moe) ? fc1_result_ : static_cast<T*>(glu_inter_result_);
         moe_gemm_runner_.moeGemmBiasAct(permuted_data_, fc1_expert_weights, fc1_int_scales, fc1_expert_biases,
-            static_cast<T*>(glu_inter_result_), total_rows_before_expert_, HopperGroupedGemmInput{},
-            expanded_active_expert_rows, fc1_out_size, hidden_size, num_experts_per_node, ActivationType::Identity,
-            stream);
+            gemm_result, total_rows_before_expert_, HopperGroupedGemmInput{}, expanded_active_expert_rows, fc1_out_size,
+            hidden_size, num_experts_per_node, activation_type, use_fused_moe, stream);
 
         sync_check_cuda_error();
+        if (!use_fused_moe)
+        {
+            doGatedActivation<T>(fc1_result_, static_cast<T const*>(glu_inter_result_), num_valid_tokens_ptr,
+                inter_size, num_rows * k, fc1_activation_type, stream);
 
-        doGatedActivation<T>(fc1_result_, static_cast<T const*>(glu_inter_result_), num_valid_tokens_ptr, inter_size,
-            num_rows * k, fc1_activation_type, stream);
-
-        sync_check_cuda_error();
+            sync_check_cuda_error();
+        }
     }
 
     sync_check_cuda_error();
@@ -1255,7 +1260,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, Enable>::runMoe(void const* i
 
     moe_gemm_runner_.moeGemm(fc1_result_, fc2_expert_weights, fc2_int_scales, static_cast<T*>(fc2_result_),
         total_rows_before_expert_, hopper_input, expanded_active_expert_rows, hidden_size, inter_size,
-        num_experts_per_node, stream);
+        num_experts_per_node, false, stream);
 
     sync_check_cuda_error();
 

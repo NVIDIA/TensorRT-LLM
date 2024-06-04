@@ -287,7 +287,7 @@ int AllreducePlugin::getNbOutputs() const noexcept
     return 1;
 }
 
-bool AllreducePlugin::isCustomAllReduceSuported(int ranks_per_node) const noexcept
+bool AllreducePlugin::isCustomAllReduceSupported(int ranks_per_node) const noexcept
 {
     constexpr bool isCudaVersionSupported =
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 11020
@@ -381,13 +381,31 @@ std::set<int> getLocalGroup(std::set<int> const& group)
 
 void AllreducePlugin::initGroupTopology() noexcept
 {
+    static std::map<std::set<int>, std::tuple<bool, bool>> cache;
+    if (cache.find(mGroup) != cache.end())
+    {
+        auto [isNVLINKSupported, isP2PSupported] = cache[mGroup];
+        mIsNVLINKSupported = isNVLINKSupported;
+        mIsP2PSupported = isP2PSupported;
+        return;
+    }
+    setGroupTopology();
+    cache[mGroup] = {mIsNVLINKSupported, mIsP2PSupported};
+}
+
+void AllreducePlugin::setGroupTopology() noexcept
+{
+    auto const rank = COMM_SESSION.getRank();
+    TLLM_LOG_INFO("Detecting local TP group for rank %d", rank);
     std::set<int> localGroup = getLocalGroup(mGroup);
     if (mGroup.size() != localGroup.size())
     {
         mIsP2PSupported = false;
         mIsNVLINKSupported = false;
+        TLLM_LOG_INFO("Found inter-node TP group for rank %d", rank);
         return;
     }
+    TLLM_LOG_INFO("TP group is intra-node for rank %d", rank);
 
     NvmlManager nvmlManager;
     std::unordered_set<int> visitedDevice;
@@ -492,7 +510,10 @@ int AllreducePlugin::initialize() noexcept
     }
 
     initCommMap(mGroup);
-    initGroupTopology();
+    if (mStrategy != AllReduceStrategyType::NCCL)
+    {
+        initGroupTopology();
+    }
 
     return 0;
 }

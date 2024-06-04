@@ -19,6 +19,7 @@
 #include "cutlass_extensions/gemm_configs.h"
 #include "tensorrt_llm/common/quantization.h"
 #include <cuda_runtime_api.h>
+#include <vector>
 
 namespace tk = tensorrt_llm::common;
 namespace tkc = tensorrt_llm::cutlass_extensions;

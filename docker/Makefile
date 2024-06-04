@@ -17,6 +17,9 @@ ifeq ($(LOCAL_USER),1)
 IMAGE_TAG_SUFFIX   ?= -$(USER_NAME)
 endif
 
+# Set this to 1 to use the image from Jenkins as the image for the `devel` stage in the build phase
+JENKINS_DEVEL      ?= 0
+
 # Default stage of the docker multi-stage build
 STAGE              ?=
 # Set this to define a custom image name and tag
@@ -26,20 +29,19 @@ DOCKER_BUILD_OPTS  ?= --pull
 DOCKER_BUILD_ARGS  ?=
 DOCKER_PROGRESS    ?= auto
 CUDA_ARCHS         ?=
-BUILD_WHEEL_ARGS   ?= $(shell grep 'ARG BUILD_WHEEL_ARGS=' Dockerfile.multi | grep -o '=.*' | tr -d '="')$(if $(CUDA_ARCHS), --cuda_architectures $(CUDA_ARCHS))
+BUILD_WHEEL_OPTS   ?=
+BUILD_WHEEL_ARGS   ?= $(shell grep 'ARG BUILD_WHEEL_ARGS=' Dockerfile.multi | grep -o '=.*' | tr -d '="')$(if $(CUDA_ARCHS), --cuda_architectures $(CUDA_ARCHS))$(if $(BUILD_WHEEL_OPTS), $(BUILD_WHEEL_OPTS))
 TORCH_INSTALL_TYPE ?= skip
 CUDA_VERSION       ?=
 CUDNN_VERSION      ?=
 NCCL_VERSION       ?=
 CUBLAS_VERSION     ?=
 TRT_VERSION        ?=
-DEVEL_IMAGE        ?=
 GIT_COMMIT         ?= $(shell git rev-parse HEAD)
 TRT_LLM_VERSION    ?= $(shell grep '^__version__' ../tensorrt_llm/version.py | grep -o '=.*' | tr -d '= "')
 
 define add_local_user
 	docker build \
-		--progress $(DOCKER_BUILD_OPTS) $(DOCKER_BUILD_ARGS) \
 		--progress $(DOCKER_PROGRESS) \
 		--build-arg BASE_IMAGE_WITH_TAG=$(1) \
 		--build-arg USER_ID=$(USER_ID) \
@@ -56,6 +58,7 @@ define rewrite_tag
 $(shell echo $(IMAGE_WITH_TAG) | sed "s/\/tensorrt-llm:/\/tensorrt-llm-staging:/g")
 endef
 
+%_build: DEVEL_IMAGE = $(if $(findstring 1,$(JENKINS_DEVEL)),$(shell grep 'LLM_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"'))
 %_build:
 	@echo "Building docker image: $(IMAGE_WITH_TAG)"
 	DOCKER_BUILDKIT=1 docker build $(DOCKER_BUILD_OPTS) $(DOCKER_BUILD_ARGS) \

@@ -146,8 +146,9 @@ void BeamSearchLayer<T>::forwardAsyncSingleRequest(
 
     T const* logits = ip->logits.template getPtr<T>();
     T const* bias = static_cast<T const*>(nullptr);
-    TLLM_CHECK_WITH_INFO(mWorkspaceSize >= 2 * bh.nMaxBatchSize * bh.nBeamWidth * bh.nBeamWidth * 2,
-        std::string("Workspace size is not enough for topk softmax."));
+    TLLM_CHECK_WITH_INFO(mWorkspaceSize >= 2 * bh.nBatchSize * bh.nBeamWidth * bh.nBeamWidth * 2,
+        fmtstr("Workspace size (%lu) is not enough for topk softmax required (%lu).", (uint64_t) mWorkspaceSize,
+            (uint64_t) (2 * bh.nMaxBatchSize * bh.nBeamWidth * bh.nBeamWidth * 2)));
 
     invokeTopkSoftMax(logits, bias, mWorkspace, bh, mStream);
     sync_check_cuda_error();

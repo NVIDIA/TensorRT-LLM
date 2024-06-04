@@ -103,6 +103,25 @@ class Module(object):
                                               remove_duplicate):
                     yield m
 
+    def named_modules_with_parent(self,
+                                  memo=None,
+                                  prefix='',
+                                  parent=None,
+                                  remove_duplicate=True):
+        if memo is None:
+            memo = set()
+        if self not in memo:
+            if remove_duplicate:
+                memo.add(self)
+            yield prefix, self, parent
+            for name, module in self._modules.items():
+                if module is None:
+                    continue
+                submodule_prefix = prefix + ('.' if prefix else '') + name
+                for m in module.named_modules_with_parent(
+                        memo, submodule_prefix, self, remove_duplicate):
+                    yield m
+
     def named_children(self):
         memo = set()
         for name, module in self._modules.items():

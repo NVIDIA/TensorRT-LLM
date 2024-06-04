@@ -953,33 +953,12 @@ def convert_hf_qwen(hf_model,
 
     v = get_weight(model_params, key_list[7], dtype)
 
-    if hf_model.config.tie_word_embeddings:
-        # lm_head.weight has the same weights as embedding
-        if mapping.is_last_pp_rank():
-            if vocab_size % mapping.tp_size != 0:
-                # padding
-                vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
-                pad_width = vocab_size_padded - vocab_size
-
-                v = torch.from_numpy(
-                    np.pad(v.detach().cpu().numpy(), ((0, pad_width), (0, 0)),
-                           'constant',
-                           constant_values=0))
-            weights['lm_head.weight'] = split(v, mapping.tp_size,
-                                              mapping.tp_rank)
-
-    if use_parallel_embedding:
-        v = split_matrix_tp(v,
-                            mapping.tp_size,
-                            mapping.tp_rank,
-                            dim=sharding_dim)
-
-    if mapping.is_first_pp_rank():
-        weights['transformer.vocab_embedding.weight'] = v
-
-    lm_head_weights = get_weight(model_params, 'lm_head', dtype)
-
     if mapping.is_last_pp_rank():
+        if hf_model.config.tie_word_embeddings:
+            # lm_head.weight has the same weights as embedding
+            lm_head_weights = v
+        else:
+            lm_head_weights = get_weight(model_params, 'lm_head', dtype)
 
         if vocab_size % mapping.tp_size != 0:
             # padding
@@ -995,6 +974,17 @@ def convert_hf_qwen(hf_model,
                                                     tensor_parallel,
                                                     mapping.tp_rank,
                                                     dim=0)
+
+    if use_parallel_embedding:
+        v = split_matrix_tp(v,
+                            mapping.tp_size,
+                            mapping.tp_rank,
+                            dim=sharding_dim)
+
+    if mapping.is_first_pp_rank():
+        weights['transformer.vocab_embedding.weight'] = v
+
+    if mapping.is_last_pp_rank():
         ln_f_w = get_weight(model_params, key_list[8], dtype)
         weights['transformer.ln_f.weight'] = ln_f_w
 
@@ -1092,7 +1082,7 @@ def create_config_from_hugging_face(hf_model,
             'pp_size': mapping.pp_size
         }
     })
-    config['quantization'] = quantization.asdict()
+    config['quantization'] = quantization.to_dict()
     config.update(override_fields)
     return config
 

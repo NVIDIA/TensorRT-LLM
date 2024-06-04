@@ -12,15 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import inspect
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from enum import IntEnum
 from typing import List, Type, Union
 
 import numpy as np
 import tensorrt as trt
 
-from tensorrt_llm._utils import str_dtype_to_trt
+from tensorrt_llm._utils import get_init_params, str_dtype_to_trt
 from tensorrt_llm.layers.lora import LoraParams
 
 from .._common import default_net, default_trtnet
@@ -73,6 +72,13 @@ class MoeConfig:
 
     def has_moe(self) -> bool:
         return self.num_experts > 1
+
+    @classmethod
+    def from_dict(cls, config: dict):
+        return cls(**config)
+
+    def to_dict(self):
+        return asdict(self)
 
 
 def _moe_plugin(moe_config,
@@ -449,13 +455,7 @@ class MixtureOfExperts(Module):
            config=None) -> "MixtureOfExperts":
         from ..quantization.quantize import quantize
 
-        # initialize subclass with all parameters in __init__ of base class
-        new_moe = moe_cls(
-            **{
-                name: getattr(self, name)
-                for name in list(
-                    inspect.signature(MixtureOfExperts.__init__).parameters)[1:]
-            })
+        new_moe = moe_cls(**get_init_params(self))
         if config is not None:
             quantize(new_moe, config.quantization)
         new_moe.load_weights(self)

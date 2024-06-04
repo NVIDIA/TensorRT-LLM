@@ -36,7 +36,9 @@ enum class AttentionMaskType
     BIDIRECTIONAL = 2,
     // See GLM-10B mask.
     // TODO: merge this mask into BIDIRECTIONAL
-    BIDIRECTIONALGLM = 3
+    BIDIRECTIONALGLM = 3,
+    // For Phi-3-small model
+    BLOCKSPARSE = 4,
 };
 
 enum class PositionEmbeddingType : int8_t
@@ -57,6 +59,31 @@ enum class RotaryScalingType : int8_t
     kNONE = 0,
     kLINEAR = 1,
     kDYNAMIC = 2,
+};
+
+struct BlockSparseParams
+{
+    int block_size;
+    int homo_head_pattern;
+    int num_local_blocks; // Sliding window blocks
+    int vertical_stride;
+
+    __device__ bool computeMask(int row_idx, int col_idx, int seq_length, int num_heads, int head_idx) const
+    {
+        bool causal_mask = row_idx < seq_length && col_idx < seq_length && col_idx <= row_idx;
+
+        // Mask 1/0 decision is made at block_size granularity
+        int block_row_idx = row_idx / block_size;
+        int block_col_idx = col_idx / block_size;
+
+        bool block_local_mask = (block_row_idx - block_col_idx) < num_local_blocks;
+
+        int head_sliding_step = homo_head_pattern ? 0 : std::max(1, int(vertical_stride / num_heads));
+        bool block_vertical_stride_mask = ((block_col_idx + head_idx * head_sliding_step + 1) % vertical_stride) == 0;
+
+        bool is_valid = causal_mask && (block_local_mask || block_vertical_stride_mask);
+        return is_valid;
+    }
 };
 
 template <typename AttentionMaskDataType>
@@ -97,6 +124,8 @@ struct BuildDecoderInfoParams
     int numTokens;
     // The type of attention.
     AttentionMaskType attentionMaskType;
+    // Params for block sparse pattern
+    BlockSparseParams blockSparseParams;
 
     // Rotary Embedding inv_freq.
     // [batch_size, halfRotaryDim] variable across different requests due to dynamic scaling.

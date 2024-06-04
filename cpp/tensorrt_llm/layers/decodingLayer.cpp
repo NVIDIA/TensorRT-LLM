@@ -61,7 +61,7 @@ bool hasDiffRuntimeArgs(std::shared_ptr<tensorrt_llm::layers::DynamicDecodeSetup
 {
     return !allSame(params->penaltyParams.frequencyPenalty) || !allSame(params->penaltyParams.presencePenalty)
         || !allSame(params->penaltyParams.repetitionPenalty) || !allSame(params->penaltyParams.temperature)
-        || !allSame(params->penaltyParams.minLength);
+        || !allSame(params->penaltyParams.minLength) || !allSame(params->penaltyParams.noRepeatNgramSize);
 }
 } // namespace
 

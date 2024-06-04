@@ -61,12 +61,11 @@ class TestGPT(unittest.TestCase):
         return gpt_config, hf_gpt
 
     def _gen_tensorrt_llm_network(self, network, builder, hf_gpt, gpt_config,
-                                  batch_size, input_len, output_len, fp16,
+                                  batch_size, input_len, output_len, dtype,
                                   gpt_attention_plugin, tensor_parallel,
                                   apply_query_key_layer_scaling,
                                   gather_context_logits,
                                   gather_generation_logits):
-        dtype = 'float16' if fp16 else 'float32'
         config = {
             'architecture': 'GPTForCausalLM',
             'dtype': dtype,
@@ -138,7 +137,6 @@ class TestGPT(unittest.TestCase):
 
         runtime = None
         builder = Builder()
-        fp16 = (dtype == 'float16')
 
         with tempfile.TemporaryDirectory() as tmpdirname:
 
@@ -150,7 +148,7 @@ class TestGPT(unittest.TestCase):
                 use_refit=use_refit,
                 gather_context_logits=gather_context_logits,
                 gather_generation_logits=gather_generation_logits,
-                strongly_typed=fp16,
+                strongly_typed=True,
             )
             network = builder.create_network()
             network.plugin_config.to_legacy_setting()
@@ -166,7 +164,7 @@ class TestGPT(unittest.TestCase):
 
             self._gen_tensorrt_llm_network(network, builder, hf_gpt, gpt_config,
                                            batch_size, input_len, output_len,
-                                           fp16, use_plugin, world_size,
+                                           dtype, use_plugin, world_size,
                                            apply_query_key_layer_scaling,
                                            gather_context_logits,
                                            gather_generation_logits)

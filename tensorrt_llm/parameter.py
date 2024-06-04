@@ -123,6 +123,11 @@ class Parameter:
     @value.setter
     def value(self, v: Union[np.ndarray, torch.Tensor]):
         v = self._regularize_value(v)
+
+        if v.shape != self.shape and v.ndim == 0 and max(self.shape) == 1:
+            # convert the scalar into a tensor which each dim is 1.
+            v = v.reshape(self.shape)
+
         assert v.shape == self.shape, \
             f'The value updated is not the same shape as the original. ' \
             f'Updated: {v.shape}, original: {self.shape}'

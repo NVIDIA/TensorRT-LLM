@@ -151,10 +151,6 @@ def parse_arguments():
                         default=False,
                         action='store_true',
                         help="Build engines serially")
-    parser.add_argument('--strongly_typed',
-                        default=False,
-                        action='store_true',
-                        help='This option will reduce the building time.')
     parser.add_argument(
         '--multiple_profiles',
         default=False,
@@ -251,9 +247,6 @@ def build_gpt(args):
     if not args.serial_build:
         torch.cuda.set_device(runtime_rank)
 
-    strongly_typed = args.strongly_typed
-    if args.quantization is not None and "fp8" in args.quantization:
-        strongly_typed = True
     num_kv_heads = build_config['num_heads'] \
         if build_config['num_kv_heads'] is None else build_config['num_kv_heads']
     apply_query_key_layer_scaling = False
@@ -321,7 +314,7 @@ def build_gpt(args):
         quant_mode=quant_mode,
         use_refit=False,
         opt_level=build_config['builder_opt'],
-        strongly_typed=strongly_typed,
+        strongly_typed=True,
         weight_streaming=is_weight_streaming,
         **builder_config_extra_kwargs)
     engine_name = get_engine_name(args.model, args.dtype, world_size,
@@ -363,8 +356,10 @@ def build_gpt(args):
             'apply_query_key_layer_scaling':
             builder_config.apply_query_key_layer_scaling,
             'rotary_pct': build_config['rotary_pct'],
-            'moe_num_experts': build_config["moe_num_experts"],
-            'moe_top_k': build_config["moe_top_k"],
+            'moe': {
+                'num_experts': build_config["moe_num_experts"],
+                'top_k': build_config["moe_top_k"],
+            },
         }
         config = PretrainedConfig.from_dict(config)
         tensorrt_llm_model = tensorrt_llm.models.GPTForCausalLM(config)
@@ -399,7 +394,7 @@ def build_gpt(args):
     elif family == "llama":
         config = {
             'architecture':
-            'LLaMAForCausalLM',
+            'LlamaForCausalLM',
             'dtype':
             args.dtype,
             'num_hidden_layers':
@@ -430,10 +425,10 @@ def build_gpt(args):
                 'world_size': world_size,
                 'tp_size': world_size
             },
-            'moe_num_experts':
-            build_config["moe_num_experts"],
-            'moe_top_k':
-            build_config["moe_top_k"],
+            'moe': {
+                'num_experts': build_config["moe_num_experts"],
+                'top_k': build_config["moe_top_k"],
+            }
         }
         config = PretrainedConfig.from_dict(config)
         tensorrt_llm_model = tensorrt_llm.models.LLaMAForCausalLM(config)
@@ -602,9 +597,6 @@ def build_gpt(args):
         }
         config = PretrainedConfig.from_dict(config)
         tensorrt_llm_model = tensorrt_llm.models.BloomForCausalLM(config)
-        tensorrt_llm_model = optimize_model(
-            tensorrt_llm_model,
-            use_parallel_embedding=config.use_parallel_embedding)
     elif family == "falcon":
         config = {
             'architecture':
@@ -696,7 +688,7 @@ def build_gpt(args):
     elif family == "internlm":
         config = {
             'architecture':
-            'LLaMAForCausalLM',
+            'LlamaForCausalLM',
             'dtype':
             args.dtype,
             'num_hidden_layers':
@@ -778,10 +770,10 @@ def build_gpt(args):
                 'world_size': world_size,
                 'tp_size': world_size
             },
-            'moe_num_experts':
-            build_config["moe_num_experts"],
-            'moe_top_k':
-            build_config["moe_top_k"],
+            'moe': {
+                'num_experts': build_config["moe_num_experts"],
+                'top_k': build_config["moe_top_k"],
+            },
             'qwen_type':
             'qwen',
         }
@@ -821,10 +813,10 @@ def build_gpt(args):
                 'world_size': world_size,
                 'tp_size': world_size
             },
-            'moe_num_experts':
-            build_config["moe_num_experts"],
-            'moe_top_k':
-            build_config["moe_top_k"],
+            'moe': {
+                'num_experts': build_config["moe_num_experts"],
+                'top_k': build_config["moe_top_k"],
+            },
             'qwen_type':
             'qwen2',
         }
@@ -1029,7 +1021,7 @@ def build_bert(args):
         max_batch_size=max_batch_size,
         max_input_len=max_input_len,
         opt_level=build_config['builder_opt'],
-        strongly_typed=args.strongly_typed,
+        strongly_typed=True,
         weight_streaming=is_weight_streaming,
     )
     engine_name = get_engine_name(args.model, args.dtype, world_size,
@@ -1207,7 +1199,7 @@ def enc_dec_build_helper(component, config, args):
         cross_attention=(component == 'decoder'),
         has_position_embedding=has_position_embedding,
         has_token_type_embedding=False,  # by default
-        strongly_typed=False,  # by default
+        strongly_typed=True,
         gather_all_token_logits=False,  # by default
         int8=(quant_mode.has_act_and_weight_quant()
               or quant_mode.is_int8_weight_only()),

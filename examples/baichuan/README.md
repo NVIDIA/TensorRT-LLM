@@ -219,7 +219,6 @@ python ../quantization/quantize.py --model_dir baichuan-inc/Baichuan-13B-Chat \
                                    --kv_cache_dtype int8 \
                                    --output_dir ./trt_ckpt/baichuan_int4wo_int8kv_tp1 \
                                    --calib_size 512 \
-                                   --strongly_typed
 ```
 
 **INT8 KV cache + AWQ**

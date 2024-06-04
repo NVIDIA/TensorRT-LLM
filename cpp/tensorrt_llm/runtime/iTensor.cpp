@@ -34,6 +34,32 @@ ITensor::UniquePtr ITensor::slice(SharedPtr tensor, std::size_t offset, std::siz
     return std::make_unique<TensorView>(std::move(tensor), offset, size);
 }
 
+ITensor::UniquePtr ITensor::slice(SharedPtr tensor, Shape const& offsetDims, ITensor::DimType64 size)
+{
+    auto shape = tensor->getShape();
+    TLLM_CHECK(offsetDims.nbDims > 0);
+    TLLM_CHECK(shape.nbDims >= offsetDims.nbDims);
+
+    Shape strides = ITensor::strides(shape);
+    DimType64 offset{0};
+    for (SizeType32 di = 0; di < offsetDims.nbDims; di++)
+    {
+        TLLM_CHECK(0 <= offsetDims.d[di] && offsetDims.d[di] < shape.d[di]);
+        offset += offsetDims.d[di] * strides.d[di];
+    }
+    TLLM_CHECK(offsetDims.d[offsetDims.nbDims - 1] + size <= shape.d[offsetDims.nbDims - 1]);
+
+    Shape dims;
+    dims.nbDims = shape.nbDims - offsetDims.nbDims + 1;
+    dims.d[0] = size;
+    for (SizeType32 di = 1; di < dims.nbDims; di++)
+    {
+        dims.d[di] = shape.d[di - 1 + offsetDims.nbDims];
+    }
+
+    return std::make_unique<TensorView>(std::move(tensor), offset, volume(dims), dims);
+}
+
 ITensor::UniquePtr ITensor::view(IBuffer::SharedPtr buffer, nvinfer1::Dims const& dims)
 {
     auto const size = buffer->getSize();

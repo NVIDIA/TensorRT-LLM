@@ -22,9 +22,9 @@ import tensorrt_llm
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models import PretrainedConfig
 from tensorrt_llm.models.convert_utils import load_calib_dataset
-from tensorrt_llm.models.llama.weight import load_from_hf_checkpoint
-from tensorrt_llm.models.modeling_utils import PretrainedConfig
+from tensorrt_llm.models.llama.convert import load_weights_from_hf_by_shard
 from tensorrt_llm.quantization import QuantAlgo
 
 try:
@@ -578,9 +578,9 @@ def get_tllm_linear_weight(weight,
                            postfix='weight'):
     results = {}
     if use_weight_only:
-        v = weight.t().contiguous()
+        v = weight.t().contiguous().cpu()
         processed_torch_weights, torch_weight_scales = \
-            torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+            torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                 v, plugin_weight_only_quant_type)
         results[prefix + postfix] = processed_torch_weights
         results[prefix + 'per_channel_scale'] = torch_weight_scales
@@ -1167,8 +1167,8 @@ if __name__ == '__main__':
             assert False, "Never supported"
         else:
             if args.load_by_shard:
-                weights = load_from_hf_checkpoint(
-                    args.model_dir, mapping, PretrainedConfig.from_dict(config))
+                weights = load_weights_from_hf_by_shard(
+                    args.model_dir, PretrainedConfig.from_dict(config))
 
             else:
                 weights = convert_hf_llama(
@@ -1193,8 +1193,21 @@ if __name__ == '__main__':
                                    mapping=Mapping(),
                                    dtype='float32'):
                     logger.info("Loading Medusa heads' weights ...")
+                    is_ckpt_safetensors = False
+
                     ckpt_file = Path(medusa_path) / "medusa_lm_head.pt"
-                    state_dict = torch.load(ckpt_file, map_location="cpu")
+                    if not ckpt_file.exists():
+                        ckpt_file = Path(
+                            medusa_path) / "medusa_lm_head.safetensors"
+                        is_ckpt_safetensors = True
+
+                    if is_ckpt_safetensors:
+                        logger.info("Safetensors Found ...")
+                        from safetensors.torch import load_file
+                        state_dict = load_file(ckpt_file)
+                    else:
+                        state_dict = torch.load(ckpt_file, map_location="cpu")
+
                     torch_dtype = str_dtype_to_torch(dtype)
                     weights = {}
 
@@ -1203,10 +1216,13 @@ if __name__ == '__main__':
                             w = state_dict[f"{h}.{l}.linear.weight"].clone().to(
                                 torch_dtype)
 
-                            weights[
-                                'medusa_heads.{}.medusa_layers.{}.linear.weight'
-                                .format(h, l)] = split(w, mapping.tp_size,
-                                                       mapping.tp_rank)
+                            split_v = split(w, mapping.tp_size, mapping.tp_rank)
+                            weights.update(
+                                get_tllm_linear_weight(
+                                    split_v,
+                                    f'medusa_heads.{h}.medusa_layers.{l}.linear.',
+                                    None, args.use_weight_only,
+                                    plugin_weight_only_quant_type))
 
                             b = state_dict[f"{h}.{l}.linear.bias"].clone().to(
                                 torch_dtype)

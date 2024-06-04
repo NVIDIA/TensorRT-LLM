@@ -15,7 +15,6 @@ from transformers import (AutoModelForSeq2SeqLM, MBartForConditionalGeneration,
                           Pix2StructForConditionalGeneration,
                           T5ForConditionalGeneration, VisionEncoderDecoderModel)
 
-from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.functional import (LayerNormPositionType, LayerNormType,
                                      MLPType)
 from tensorrt_llm.models import PretrainedConfig
@@ -40,7 +39,6 @@ def parse_t5_config(args, hf_model):
     config["encoder"] = {}
     for key, val in hf_model.encoder.config.to_dict().items():
         config["encoder"][key] = f"{val}"
-    config["encoder"]["weight_data_type"] = args.weight_data_type
 
     # manually set q_scaling to offset attention scaling's effect.
     # TODO: modify kernels to control whether to disable attention scaling
@@ -51,7 +49,6 @@ def parse_t5_config(args, hf_model):
     config["decoder"] = {}
     for key, val in hf_model.decoder.config.to_dict().items():
         config["decoder"][key] = f"{val}"
-    config["decoder"]["weight_data_type"] = args.weight_data_type
 
     config["structure"] = dict()
     config["structure"]["t5_with_bias"] = "false"
@@ -111,17 +108,12 @@ def parse_t5_config(args, hf_model):
         component_config.logits_dtype = config.get(component,
                                                    'logits_dtype',
                                                    fallback='float32')
-        component_config.ckpt_weight_dtype = config.get(component,
-                                                        'weight_data_type')
 
         if component == 'encoder':
             component_config.n_layer = config.getint(component, 'num_layers')
 
             component_config.relative_attention = config.get(
                 'structure', 'position_embedding_type') == 'relative'
-
-            component_config.ckpt_weight_dtype = config.get(
-                component, 'weight_data_type')
 
         elif component == 'decoder':
             component_config.n_layer = config.getint(component,
@@ -318,7 +310,6 @@ def parse_nmt_config(args, model):
     config['encoder'] = dict()
     for key, val in fairseq_config.items():
         config["encoder"][key] = f"{val}"
-    config["encoder"]["weight_data_type"] = args.weight_data_type
     config["encoder"]["q_scaling"] = '1'
     # NMT doesn't have final layernorm
     config['encoder']['has_model_final_layernorm'] = 'false'
@@ -327,7 +318,6 @@ def parse_nmt_config(args, model):
     config['decoder'] = dict()
     for key, val in fairseq_config.items():
         config["decoder"][key] = f"{val}"
-    config["decoder"]["weight_data_type"] = args.weight_data_type
     config["decoder"]["q_scaling"] = '1'
     config["decoder"]["rescale_before_lm_head"] = 'false'
     config['decoder']['has_model_final_layernorm'] = 'false'
@@ -402,8 +392,6 @@ def parse_nmt_config(args, model):
             component, 'relative_attention_num_buckets', fallback=0)
         component_config.max_distance = config.getint(
             component, 'relative_attention_max_distance', fallback=0)
-        component_config.ckpt_weight_dtype = config.get(component,
-                                                        'weight_data_type')
         component_config.position_embedding_type = config.get(
             'structure', 'position_embedding_type')
         component_config.logits_dtype = config.get(component,
@@ -589,7 +577,6 @@ def parse_bart_config(args, hf_model):
     config['decoder'] = dict()
     for key, val in hf_model.model.decoder.config.to_dict().items():
         config["decoder"][key] = f"{val}"
-    config["decoder"]["weight_data_type"] = args.weight_data_type
     config["decoder"]["q_scaling"] = '1'
     config["decoder"]["rescale_before_lm_head"] = str(False)
     config['decoder']['has_model_final_layernorm'] = str(
@@ -612,7 +599,6 @@ def parse_bart_config(args, hf_model):
         config['encoder'] = dict()
         for key, val in hf_model.model.encoder.config.to_dict().items():
             config["encoder"][key] = f"{val}"
-        config["encoder"]["weight_data_type"] = args.weight_data_type
         config["encoder"]["q_scaling"] = '1'
 
         # mBART has final layernorm, BART does not
@@ -686,8 +672,6 @@ def parse_bart_config(args, hf_model):
             component, 'relative_attention_num_buckets', fallback=0)
         component_config.max_distance = config.getint(
             component, 'relative_attention_max_distance', fallback=0)
-        component_config.ckpt_weight_dtype = config.get(component,
-                                                        'weight_data_type')
         component_config.max_lora_rank = config.getint(component,
                                                        'max_lora_rank',
                                                        fallback=0)
@@ -934,7 +918,6 @@ def parse_pix2struct_config(args, hf_model):
     config["decoder"] = {}
     for key, val in hf_model.decoder.config.to_dict().items():
         config["decoder"][key] = f"{val}"
-    config["decoder"]["weight_data_type"] = args.weight_data_type
 
     config["decoder"]["q_scaling"] = get_offset_q_scaling(
         hf_model.decoder.config)
@@ -1007,7 +990,6 @@ def parse_pix2struct_config(args, hf_model):
             args.encoder_hidden_size = config.getint('decoder', 'hidden_size')
             args.encoder_num_heads = config.getint('decoder', 'num_heads')
             args.encoder_head_size = config.getint('decoder', 'd_kv')
-            args.ckpt_weight_dtype = config.get(component, 'weight_data_type')
             args.position_embedding_type = config.get(
                 'structure', 'position_embedding_type')
 
@@ -1181,10 +1163,8 @@ def get_model(args):
 def convert_checkpoint(args):
 
     model = get_model(args)
-    model = model.to(str_dtype_to_torch(args.weight_data_type))
 
-    saved_dir = Path(
-        args.output_dir) / f"tp{args.tp_size}" / f"pp{args.pp_size}"
+    saved_dir = Path(args.output_dir)
     saved_dir.mkdir(parents=True, exist_ok=True)
 
     encoder_saved_dir = saved_dir / "encoder"
@@ -1404,11 +1384,6 @@ if __name__ == "__main__":
         type=int,
         help="How many workers to spawn for conversion (default: 4)",
         default=4)
-    parser.add_argument("--weight_data_type",
-                        type=str,
-                        default="float32",
-                        choices=["float32", "float16",
-                                 "bfloat16"])  # TODO: test support for bf16?
     parser.add_argument("--nougat",
                         action="store_true",
                         help="Model which uses vision encoder + mbart decoder")

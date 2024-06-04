@@ -180,7 +180,8 @@ INSTANTIATE_ADDQKVBIASIA3_TRANSPOSE(__nv_bfloat16);
 template <typename T, typename T_IN, int ITEMS_PER_THREAD>
 __global__ void softmax_kernel(T* attn_score, const T_IN* qk, T const* attn_mask, T const* linear_bias_slopes,
     const int64_t batch_size, const int64_t head_num, const int64_t q_length, const int64_t k_length,
-    float const qk_scale, float const qk_tanh_scale, float const qk_tanh_inverse_scale)
+    float const qk_scale, float const qk_tanh_scale, float const qk_tanh_inverse_scale, bool const block_sparse_attn,
+    BlockSparseParams const block_sparse_params, int const* q_seq_lengths)
 {
     // attn_score, [batch_size, num_heads, q_length, k_length]
     // qk, [batch_size, num_heads, q_length, k_length]
@@ -217,8 +218,17 @@ __global__ void softmax_kernel(T* attn_score, const T_IN* qk, T const* attn_mask
                 qk_bias += static_cast<float>(linear_bias_slope * (ki - qi));
             }
 
-            int64_t mask_offset = ((int64_t) bi * q_length + qi) * k_length + ki;
-            float mask_val = static_cast<float>(ldg(&attn_mask[mask_offset]));
+            float mask_val;
+            if (block_sparse_attn && block_sparse_params.homo_head_pattern == false)
+            {
+                // We cannot share attention mask across heads. Instead, we compute mask on the fly here.
+                mask_val = block_sparse_params.computeMask(qi, ki, q_seq_lengths[bi], head_num, hi) ? 1.f : 0.f;
+            }
+            else
+            {
+                int64_t mask_offset = ((int64_t) bi * q_length + qi) * k_length + ki;
+                mask_val = static_cast<float>(ldg(&attn_mask[mask_offset]));
+            }
             qk_bias += (1.0f - mask_val) * -10000.0f;
 
             data[i] = qk_scale * qk_val + qk_bias;
@@ -264,7 +274,8 @@ __global__ void softmax_kernel(T* attn_score, const T_IN* qk, T const* attn_mask
 template <typename T, int ITEMS_PER_THREAD>
 __global__ void softmax_kernel_h2(T* attn_score, T const* qk_buf, T const* attn_mask, T const* linear_bias_slopes,
     const int64_t batch_size, const int64_t head_num, const int64_t q_length, const int64_t k_length, const T qk_scale,
-    float const qk_tanh_scale, float const qk_tanh_inverse_scale)
+    float const qk_tanh_scale, float const qk_tanh_inverse_scale, bool const block_sparse_attn,
+    BlockSparseParams const block_sparse_params, int const* q_seq_lengths)
 {
     // attn_score, [batch_size, num_heads, q_length, k_length]
     // qk, [batch_size, num_heads, q_length, k_length]
@@ -324,7 +335,15 @@ __global__ void softmax_kernel_h2(T* attn_score, T const* qk_buf, T const* attn_
                 qk_bias = hadd2<T2>(qk_bias, hmul2<T2>(linear_bias_slope, dist));
             }
 
-            T2 mask_val = ldg(&attn_mask_h2[mask_offset]);
+            T2 mask_val;
+            if (block_sparse_attn && block_sparse_params.homo_head_pattern == false)
+            {
+                mask_val = block_sparse_params.computeMask(qi, ki, q_seq_lengths[bi], head_num, hi) ? ONE : ZERO;
+            }
+            else
+            {
+                mask_val = ldg(&attn_mask_h2[mask_offset]);
+            }
             qk_bias = hadd2<T2>(qk_bias, hmul2<T2>(hsub2<T2>(ONE, mask_val), NEG_INFTY));
 
             data[i] = hadd2<T2>(hmul2<T2>(qk, qk_scale_h2), qk_bias);
@@ -374,7 +393,8 @@ __global__ void softmax_kernel_h2(T* attn_score, T const* qk_buf, T const* attn_
 template <typename T, int K_ITEMS_PER_THREAD, int Q_ITEMS_PER_THREAD>
 __global__ void softmax_kernel_h2_v2(T* attn_score, T const* qk_buf, T const* attn_mask, T const* linear_bias_slopes,
     const int64_t batch_size, const int64_t head_num, const int64_t q_length, const int64_t k_length, const T scalar,
-    float const qk_tanh_scale, float const qk_tanh_inverse_scale)
+    float const qk_tanh_scale, float const qk_tanh_inverse_scale, bool const block_sparse_attn,
+    BlockSparseParams const block_sparse_params, int const* q_seq_lengths)
 {
     // attn_score, [batch_size, num_heads, q_length, k_length]
     // qk, [batch_size, num_heads, q_length, k_length]
@@ -436,7 +456,14 @@ __global__ void softmax_kernel_h2_v2(T* attn_score, T const* qk_buf, T const* at
             T2 mask_val[Q_ITEMS_PER_THREAD];
             for (int j = 0; j < q_items; j++)
             {
-                mask_val[j] = ldg(&attn_mask_h2[mask_offset[j]]);
+                if (block_sparse_attn && block_sparse_params.homo_head_pattern == false)
+                {
+                    mask_val[j] = block_sparse_params.computeMask(qi, ki, q_seq_lengths[bi], head_num, hi) ? ONE : ZERO;
+                }
+                else
+                {
+                    mask_val[j] = ldg(&attn_mask_h2[mask_offset[j]]);
+                }
             }
 
             T2 qk[Q_ITEMS_PER_THREAD];
@@ -573,21 +600,24 @@ __global__ void softmax_kernel_h2_v2(T* attn_score, T const* qk_buf, T const* at
             softmax_kernel_h2_v2<T_, ITEMS_PER_THREAD, 4><<<grid, block, 0, stream>>>((T_*) param.attention_score,     \
                 (const T_*) param.qk, (const T_*) param.attention_mask, (const T_*) param.linear_bias_slopes,          \
                 param.batch_size, param.num_heads, param.q_length, param.k_length, (const T_) param.qk_scale,          \
-                param.qk_tanh_scale, param.qk_tanh_inverse_scale);                                                     \
+                param.qk_tanh_scale, param.qk_tanh_inverse_scale, param.block_sparse_attn, param.block_sparse_params,  \
+                param.q_seq_lengths);                                                                                  \
         }                                                                                                              \
         else                                                                                                           \
         {                                                                                                              \
             softmax_kernel_h2<T_, ITEMS_PER_THREAD><<<grid, block, 0, stream>>>((T_*) param.attention_score,           \
                 (const T_*) param.qk, (const T_*) param.attention_mask, (const T_*) param.linear_bias_slopes,          \
                 param.batch_size, param.num_heads, param.q_length, param.k_length, (const T_) param.qk_scale,          \
-                param.qk_tanh_scale, param.qk_tanh_inverse_scale);                                                     \
+                param.qk_tanh_scale, param.qk_tanh_inverse_scale, param.block_sparse_attn, param.block_sparse_params,  \
+                param.q_seq_lengths);                                                                                  \
         }                                                                                                              \
     }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
         softmax_kernel<T, T_IN, ITEMS_PER_THREAD><<<grid, block, 0, stream>>>(param.attention_score, param.qk,         \
             param.attention_mask, param.linear_bias_slopes, param.batch_size, param.num_heads, param.q_length,         \
-            param.k_length, param.qk_scale, param.qk_tanh_scale, param.qk_tanh_inverse_scale);                         \
+            param.k_length, param.qk_scale, param.qk_tanh_scale, param.qk_tanh_inverse_scale, param.block_sparse_attn, \
+            param.block_sparse_params, param.q_seq_lengths);                                                           \
     }
 
 #define LAUNCH_MASKED_SOFTMAX(ITEMS_PER_THREAD) LAUNCH_MASKED_SOFTMAX_(half, ITEMS_PER_THREAD)
@@ -1995,6 +2025,109 @@ INSTANTIATE_SHIFT_K_CACHE(__nv_bfloat16);
 
 #undef INSTANTIATE_SHIFT_K_CACHE_CACHE_TYPE
 #undef INSTANTIATE_SHIFT_K_CACHE
+
+namespace
+{
+template <typename T, uint32_t size_>
+struct alignas(std::max<uint32_t>(alignof(T), std::min<uint32_t>(sizeof(T) * size_, 16))) Vec
+{
+    using Elem = T;
+    static constexpr uint32_t size = size_;
+    Elem data[size];
+
+    __device__ inline void fill(T val)
+    {
+#pragma unroll
+        for (uint32_t i = 0; i < size; i++)
+        {
+            data[i] = val;
+        }
+    }
+
+    static __device__ inline Vec<T, size> filled(T val)
+    {
+        Vec<T, size> ret;
+        ret.fill(val);
+        return ret;
+    }
+
+    __device__ inline Elem const& operator[](uint32_t i) const
+    {
+        assert(i < size);
+        return data[i];
+    }
+
+    __device__ inline Elem& operator[](uint32_t i)
+    {
+        assert(i < size);
+        return data[i];
+    }
+};
+
+template <typename Dst, typename Src>
+__global__ void convertData(Dst* dst, Src const* src, int64_t size, float const* __restrict__ pScale)
+{
+    constexpr uint32_t srcElemSize = sizeof(Src);
+    constexpr uint32_t dstElemSize = sizeof(Dst);
+    static_assert((srcElemSize & (srcElemSize - 1)) == 0 && (dstElemSize & (dstElemSize - 1)) == 0);
+    assert(reinterpret_cast<std::uintptr_t>(dst) % 16 == 0 && reinterpret_cast<std::uintptr_t>(src) % 16 == 0);
+    constexpr uint32_t packSize = 16 / std::max(srcElemSize, dstElemSize);
+    auto const tid = blockDim.x * blockIdx.x + threadIdx.x;
+    auto const nbThrds = blockDim.x * gridDim.x;
+    if (nbThrds * packSize + packSize - 1 >= size)
+    {
+        return;
+    }
+    float const scale = (pScale == nullptr ? 1.F : pScale[0]);
+    using SrcPack = Vec<Src, packSize>;
+    using DstPack = Vec<Dst, packSize>;
+    int64_t const stride = packSize * nbThrds;
+    for (int64_t i = tid * packSize; i < size; i += stride)
+    {
+        if (i + packSize < size)
+        {
+            auto const srcPack = reinterpret_cast<SrcPack const&>(src[i]);
+            DstPack dstPack;
+#pragma unroll
+            for (int32_t j = 0; j < packSize; j++)
+            {
+                dstPack[j] = Dst{float{srcPack[j]} * scale};
+            }
+            reinterpret_cast<DstPack&>(dst[i]) = dstPack;
+        }
+        else
+        {
+#pragma unroll
+            for (int64_t j = 0; j < packSize; j++)
+            {
+                if (i + j >= size)
+                {
+                    break;
+                }
+                dst[i + j] = Dst{float{src[i + j]} * scale};
+            }
+        }
+    }
+}
+} // unnamed namespace
+
+template <typename Dst, typename Src>
+void invokeConversion(Dst* dst, Src const* src, int64_t size, float const* __restrict__ scale, cudaStream_t stream)
+{
+    auto const packSize = 16 / std::max(sizeof(Dst), sizeof(Src));
+    auto const nbPack = divUp(size, packSize);
+    uint32_t const ctaSize = 256;
+    auto const nbCta = std::min<size_t>(divUp(nbPack, ctaSize), 4096);
+
+    convertData<Dst, Src><<<nbCta, ctaSize, 0, stream>>>(dst, src, size, scale);
+}
+
+#define INSTANTIATE_invokeConversion(Dst, Src)                                                                         \
+    template void invokeConversion<Dst, Src>(                                                                          \
+        Dst * dst, Src const* src, int64_t size, float const* __restrict__ scale, cudaStream_t stream)
+INSTANTIATE_invokeConversion(__nv_fp8_e4m3, half);
+INSTANTIATE_invokeConversion(__nv_fp8_e4m3, __nv_bfloat16);
+#undef INSTANTIATE_invokeConversion
 
 } // namespace kernels
 } // namespace tensorrt_llm

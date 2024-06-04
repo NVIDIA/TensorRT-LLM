@@ -17,9 +17,8 @@ from typing import Optional
 from ..._utils import pad_vocab_size
 from ...functional import (Tensor, concat, maximum, minimum, recv, send, shape,
                            slice)
-from ...layers import (MOE, AttentionMaskType, CogVLMAttention, ColumnLinear,
-                       Embedding, GatedMLP, MoeConfig, PromptTuningEmbedding,
-                       RmsNorm)
+from ...layers import (AttentionMaskType, CogVLMAttention, ColumnLinear,
+                       Embedding, GatedMLP, PromptTuningEmbedding, RmsNorm)
 from ...mapping import Mapping
 from ...module import Module
 from ...plugin import init_all_reduce_helper
@@ -27,12 +26,13 @@ from ...plugin import init_all_reduce_helper
 from ...quantization import QuantMode
 from ...top_model_mixin import TopModelMixin
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
-                              PretrainedConfig, QuantConfig)
+                              QuantConfig)
+from .config import CogVLMConfig
 
 
 class CogvlmDecoderLayer(Module):
 
-    def __init__(self, config: PretrainedConfig, layer_idx: int):
+    def __init__(self, config: CogVLMConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
         self.config = config
@@ -63,42 +63,25 @@ class CogvlmDecoderLayer(Module):
 
         mlp_hidden_size = config.hidden_size * 4 if config.intermediate_size is None else config.intermediate_size
 
-        ClsMLP = GatedMLP
-        mlp_kwargs = {}
-        if config.moe_num_experts > 1:
-            ClsMLP = MOE
-            mlp_kwargs = {
-                "moe_config":
-                MoeConfig(
-                    config.moe_num_experts,
-                    config.moe_top_k,
-                    config.moe_tp_mode,
-                    config.moe_normalization_mode,
-                ),
-                "tp_rank":
-                config.mapping.tp_rank,
-            }
         self.vision_start = config.vision_start
         self.vision_length = config.vision_length
         self.hidden_size = config.hidden_size
-        self.mlp = ClsMLP(hidden_size=config.hidden_size,
-                          ffn_hidden_size=mlp_hidden_size,
-                          hidden_act=config.hidden_act,
-                          dtype=config.dtype,
-                          bias=config.mlp_bias,
-                          tp_group=config.mapping.tp_group,
-                          tp_size=config.mapping.tp_size,
-                          quant_mode=config.quant_mode,
-                          **mlp_kwargs)
-        self.vis_mlp = ClsMLP(hidden_size=config.hidden_size,
-                              ffn_hidden_size=mlp_hidden_size,
-                              hidden_act=config.hidden_act,
-                              dtype=config.dtype,
-                              bias=config.mlp_bias,
-                              tp_group=config.mapping.tp_group,
-                              tp_size=config.mapping.tp_size,
-                              quant_mode=config.quant_mode,
-                              **mlp_kwargs)
+        self.mlp = GatedMLP(hidden_size=config.hidden_size,
+                            ffn_hidden_size=mlp_hidden_size,
+                            hidden_act=config.hidden_act,
+                            dtype=config.dtype,
+                            bias=config.mlp_bias,
+                            tp_group=config.mapping.tp_group,
+                            tp_size=config.mapping.tp_size,
+                            quant_mode=config.quant_mode)
+        self.vis_mlp = GatedMLP(hidden_size=config.hidden_size,
+                                ffn_hidden_size=mlp_hidden_size,
+                                hidden_act=config.hidden_act,
+                                dtype=config.dtype,
+                                bias=config.mlp_bias,
+                                tp_group=config.mapping.tp_group,
+                                tp_size=config.mapping.tp_size,
+                                quant_mode=config.quant_mode)
         self.post_layernorm = RmsNorm(normalized_shape=config.hidden_size,
                                       eps=config.norm_epsilon,
                                       dtype=config.dtype)
@@ -156,7 +139,7 @@ class CogvlmDecoderLayer(Module):
 
 class CogvlmModel(Module):
 
-    def __init__(self, config: PretrainedConfig) -> None:
+    def __init__(self, config: CogVLMConfig) -> None:
         super().__init__()
         init_all_reduce_helper()
 
@@ -231,9 +214,9 @@ class CogvlmModel(Module):
 
 
 class CogVLMForCausalLM(DecoderModelForCausalLM, TopModelMixin):
+    config_class = CogVLMConfig
 
-    def __init__(self, config: PretrainedConfig):
-        self.check_config(config)
+    def __init__(self, config: CogVLMConfig):
         transformer = CogvlmModel(config)
         vocab_size_padded = pad_vocab_size(config.vocab_size,
                                            config.mapping.tp_size)
@@ -250,19 +233,6 @@ class CogVLMForCausalLM(DecoderModelForCausalLM, TopModelMixin):
         self.quant_mode = config.quant_mode
         self.mapping = config.mapping
         super().__init__(config, transformer, lm_head)
-
-    def check_config(self, config):
-        config.set_if_not_exist('mlp_bias', False)
-        config.set_if_not_exist('attn_bias', False)
-        config.set_if_not_exist('rotary_base', 10000.0)
-        config.set_if_not_exist('rotary_scaling', None)
-        config.set_if_not_exist('moe_num_experts', 0)
-        config.set_if_not_exist('moe_top_k', 0)
-        config.set_if_not_exist('moe_tp_mode',
-                                MoeConfig.ParallelismMode.TENSOR_PARALLEL)
-        config.set_if_not_exist(
-            'moe_normalization_mode',
-            MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE)
 
     @classmethod
     def from_hugging_face(cls,

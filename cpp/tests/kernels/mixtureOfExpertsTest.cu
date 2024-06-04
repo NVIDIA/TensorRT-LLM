@@ -159,11 +159,11 @@ protected:
 
     void SetUp() override
     {
-        assert(mBufferManager);
         if (shouldSkip())
         {
             GTEST_SKIP() << "Skipping due to no/unsupported GPU";
         }
+        assert(mBufferManager);
     }
 
     void TearDown()
@@ -767,6 +767,10 @@ protected:
             return std::max(in, T(0.0f));
         if (mActType == tensorrt_llm::ActivationType::Gelu || mActType == tensorrt_llm::ActivationType::Geglu)
             return (std::erf(float(in) * float(sqrt(0.5))) + 1) * 0.5f * float(in);
+        if (mActType == tensorrt_llm::ActivationType::Silu || mActType == tensorrt_llm::ActivationType::Swiglu)
+        {
+            return (float(in) / (1.f + std::exp(-(in))));
+        }
         assert(false);
         return in;
     }
@@ -1068,6 +1072,14 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteGeglu)
     this->BasicPermuteTest(3);
 }
 
+TYPED_TEST(MixtureOfExpertsTest, PermuteSwiglu)
+{
+    this->mActType = tensorrt_llm::ActivationType::Swiglu;
+    this->BasicPermuteTest();
+    this->BasicPermuteTest(2);
+    this->BasicPermuteTest(3);
+}
+
 TYPED_TEST(MixtureOfExpertsTest, Finished)
 {
     if (this->FP8)
@@ -1227,6 +1239,13 @@ TYPED_TEST(MixtureOfExpertsTest, ExpertParallelGeglu)
     this->ExpertParallelTest(2);
 }
 
+TYPED_TEST(MixtureOfExpertsTest, ExpertParallelSwiglu)
+{
+    this->mActType = tensorrt_llm::ActivationType::Swiglu;
+    this->ExpertParallelTest();
+    this->ExpertParallelTest(2);
+}
+
 template <class TypeParam_>
 void MixtureOfExpertsTest<TypeParam_>::TensorParallelTest(int k)
 {
@@ -1328,36 +1347,51 @@ TYPED_TEST(MixtureOfExpertsTest, TensorParallelGeglu)
     this->TensorParallelTest(3);
 }
 
+TYPED_TEST(MixtureOfExpertsTest, TensorParallelSwiglu)
+{
+    this->mActType = tensorrt_llm::ActivationType::Swiglu;
+    this->TensorParallelTest();
+    this->TensorParallelTest(2);
+    this->TensorParallelTest(3);
+}
+
 TYPED_TEST(MixtureOfExpertsTest, ConfigSweep)
 {
+    std::vector<tensorrt_llm::ActivationType> actiavtion_pool = {
+        tensorrt_llm::ActivationType::Relu, tensorrt_llm::ActivationType::Swiglu, tensorrt_llm::ActivationType::Geglu};
     auto configs = this->mMoERunner.getTactics();
-    for (auto conf : configs)
+    for (auto const activation_type : actiavtion_pool)
     {
-        using namespace tensorrt_llm::cutlass_extensions;
-        std::stringstream tactic;
-        tactic << "Failed " << (conf.is_sm90 ? "SM90+" : "<SM90") << " tactic with tile shape ";
-        if (conf.tile_config_sm90 != CutlassTileConfigSM90::ChooseWithHeuristic)
+        for (auto conf : configs)
         {
-            tactic << (int) conf.tile_config_sm90 << " and cluster shape " << (int) conf.cluster_shape
-                   << " mainloop sched " << (int) conf.mainloop_schedule << " epi sched "
-                   << (int) conf.epilogue_schedule;
-        }
-        else if (conf.tile_config != CutlassTileConfig::ChooseWithHeuristic)
-        {
-            tactic << (int) conf.tile_config << " and stages " << (int) conf.stages << " split k "
-                   << (int) conf.split_k_factor;
-        }
-        else
-        {
-            FAIL() << "Uninitialised tactic encountered";
-        }
+            using namespace tensorrt_llm::cutlass_extensions;
+            std::stringstream tactic;
+            tactic << "Failed " << (conf.is_sm90 ? "SM90+" : "<SM90") << " tactic with tile shape ";
+            if (conf.tile_config_sm90 != CutlassTileConfigSM90::ChooseWithHeuristic)
+            {
+                tactic << (int) conf.tile_config_sm90 << " and cluster shape " << (int) conf.cluster_shape
+                       << " mainloop sched " << (int) conf.mainloop_schedule << " epi sched "
+                       << (int) conf.epilogue_schedule;
+            }
+            else if (conf.tile_config != CutlassTileConfig::ChooseWithHeuristic)
+            {
+                tactic << (int) conf.tile_config << " and stages " << (int) conf.stages << " split k "
+                       << (int) conf.split_k_factor;
+            }
+            else
+            {
+                FAIL() << "Uninitialised tactic encountered";
+            }
+            tactic << " and activation type: " << static_cast<int>(activation_type);
 
-        EXPECT_NO_THROW({
-            this->mSelectedConfig = conf;
-            this->BasicPermuteTest();
-            if (::testing::Test::HasFailure())
-                throw std::runtime_error("Test Failed");
-        }) << tactic.str();
+            EXPECT_NO_THROW({
+                this->mActType = activation_type;
+                this->mSelectedConfig = conf;
+                this->BasicPermuteTest();
+                if (::testing::Test::HasFailure())
+                    throw std::runtime_error("Test Failed");
+            }) << tactic.str();
+        }
     }
 }
 

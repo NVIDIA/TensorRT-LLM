@@ -28,8 +28,8 @@ namespace mmha
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Forward declaration of the kernel launcher to avoid including decoderMaskedMultiheadAttentionLaunch.h
-template <typename T, typename KVCacheBuffer, typename T_PARAMS, int Dh, bool IMPLICIT_REL_ATTN_BIAS,
-    bool QK_TANH_SCALE>
+template <typename T, typename KVCacheBuffer, typename T_PARAMS, int Dh, bool BLOCK_SPARSE_ATTN,
+    bool IMPLICIT_REL_ATTN_BIAS, bool QK_TANH_SCALE>
 void mmha_launch_kernel(const T_PARAMS& params, KVCacheBuffer const& kv_cache_buffer,
     KVLinearBuffer const& shift_k_cache, cudaStream_t const& stream);
 
@@ -39,19 +39,19 @@ namespace
 {
 
 #define MMHA_LAUNCH_KERNEL(Dh)                                                                                         \
-    mmha::mmha_launch_kernel<T, KVCacheBuffer, KERNEL_PARAMS_TYPE, Dh, false, false>(                                  \
+    mmha::mmha_launch_kernel<T, KVCacheBuffer, KERNEL_PARAMS_TYPE, Dh, false, false, false>(                           \
         params, kv_cache_buffer, shift_k_cache, stream);                                                               \
     break;
 
 #define MMHA_LAUNCH_KERNE_EX1(Dh)                                                                                      \
     if (has_implicit_rel_attn_bias)                                                                                    \
     {                                                                                                                  \
-        mmha::mmha_launch_kernel<T, KVCacheBuffer, KERNEL_PARAMS_TYPE, Dh, true, false>(                               \
+        mmha::mmha_launch_kernel<T, KVCacheBuffer, KERNEL_PARAMS_TYPE, Dh, false, true, false>(                        \
             params, kv_cache_buffer, shift_k_cache, stream);                                                           \
     }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
-        mmha::mmha_launch_kernel<T, KVCacheBuffer, KERNEL_PARAMS_TYPE, Dh, false, false>(                              \
+        mmha::mmha_launch_kernel<T, KVCacheBuffer, KERNEL_PARAMS_TYPE, Dh, false, false, false>(                       \
             params, kv_cache_buffer, shift_k_cache, stream);                                                           \
     }                                                                                                                  \
     break;
@@ -59,17 +59,22 @@ namespace
 #define MMHA_LAUNCH_KERNE_EX2(Dh)                                                                                      \
     if (has_implicit_rel_attn_bias)                                                                                    \
     {                                                                                                                  \
-        mmha::mmha_launch_kernel<T, KVCacheBuffer, KERNEL_PARAMS_TYPE, Dh, true, false>(                               \
+        mmha::mmha_launch_kernel<T, KVCacheBuffer, KERNEL_PARAMS_TYPE, Dh, false, true, false>(                        \
             params, kv_cache_buffer, shift_k_cache, stream);                                                           \
     }                                                                                                                  \
     else if (has_qk_tanh_scale)                                                                                        \
     {                                                                                                                  \
-        mmha::mmha_launch_kernel<T, KVCacheBuffer, KERNEL_PARAMS_TYPE, Dh, false, true>(                               \
+        mmha::mmha_launch_kernel<T, KVCacheBuffer, KERNEL_PARAMS_TYPE, Dh, false, false, true>(                        \
+            params, kv_cache_buffer, shift_k_cache, stream);                                                           \
+    }                                                                                                                  \
+    else if (has_block_sparse_attn)                                                                                    \
+    {                                                                                                                  \
+        mmha::mmha_launch_kernel<T, KVCacheBuffer, KERNEL_PARAMS_TYPE, Dh, false, false, false>(                       \
             params, kv_cache_buffer, shift_k_cache, stream);                                                           \
     }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
-        mmha::mmha_launch_kernel<T, KVCacheBuffer, KERNEL_PARAMS_TYPE, Dh, false, false>(                              \
+        mmha::mmha_launch_kernel<T, KVCacheBuffer, KERNEL_PARAMS_TYPE, Dh, false, false, false>(                       \
             params, kv_cache_buffer, shift_k_cache, stream);                                                           \
     }                                                                                                                  \
     break;
@@ -88,6 +93,13 @@ void multihead_attention_(const KERNEL_PARAMS_TYPE& params, KVCacheBuffer const&
     TLLM_CHECK_WITH_INFO(!(has_qk_tanh_scale && has_implicit_rel_attn_bias),
         "MMHA kernels haven't instantiate implicit_relative_attention_bias + qk_tanh_scale paths for head size %d.",
         head_size);
+
+    bool const has_block_sparse_attn = params.block_sparse_attention;
+    TLLM_CHECK_WITH_INFO(!has_block_sparse_attn || head_size == 128,
+        "MMHA kernels were not instantiated for block_sparse_attention for head size %d.", head_size);
+    TLLM_CHECK_WITH_INFO(!(has_implicit_rel_attn_bias && has_block_sparse_attn),
+        "MMHA kernels do not support combining implicit_relative_attention_bias and block_sparse_attention");
+
     switch (params.hidden_size_per_head)
     {
     case 32: MMHA_LAUNCH_KERNE_EX1(32);

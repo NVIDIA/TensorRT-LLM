@@ -249,6 +249,7 @@ class SmoothQuantLayerNorm(Module):
             self.register_parameter('bias', None)
 
         self.eps = eps
+        self.dtype = dtype
         self.quant_mode = quant_mode
 
         if self.quant_mode.has_act_and_weight_quant():
@@ -300,6 +301,7 @@ class SmoothQuantRmsNorm(Module):
             self.register_parameter('bias', None)
 
         self.eps = eps
+        self.dtype = dtype
         self.quant_mode = quant_mode
 
         if self.quant_mode.has_act_and_weight_quant():
@@ -855,7 +857,10 @@ class FP8Linear(Linear):
         self.weights_scaling_factor = Parameter(shape=(1, ), dtype=trt.float32)
 
     def forward(self, x, lora_runtime_params=None):
-        assert lora_runtime_params is None, "lora is not supported on FP8Linear now"
+        assert lora_runtime_params is None or default_net(
+        ).plugin_config.lora_plugin == self.dtype
+
+        lora_hidden_state = x if lora_runtime_params is not None else None
         if default_net().strongly_typed:
             assert is_same_dtype(
                 x.dtype,
@@ -881,7 +886,9 @@ class FP8Linear(Linear):
         return self.multiply_gather(dequantized_out,
                                     w_deq_out,
                                     gemm_plugin=None,
-                                    use_fp8=True)
+                                    use_fp8=True,
+                                    lora_runtime_params=lora_runtime_params,
+                                    lora_hidden_state=lora_hidden_state)
 
 
 class FP8RowLinear(RowLinear):
@@ -908,8 +915,10 @@ class FP8RowLinear(RowLinear):
         self.weights_scaling_factor = Parameter(shape=(1, ), dtype=trt.float32)
 
     def forward(self, x, lora_runtime_params=None):
-        assert lora_runtime_params is None, "lora is not supported on FP8RowLinear now"
+        assert lora_runtime_params is None or default_net(
+        ).plugin_config.lora_plugin == self.dtype
 
+        lora_hidden_state = x if lora_runtime_params is not None else None
         activation_scaling_factor = cast(self.activation_scaling_factor.value,
                                          self.dtype)
         if x.dtype != trt.fp8:
@@ -933,7 +942,9 @@ class FP8RowLinear(RowLinear):
         return self.multiply_reduce(dequantized_out,
                                     w_deq_out,
                                     gemm_plugin=None,
-                                    use_fp8=True)
+                                    use_fp8=True,
+                                    lora_runtime_params=lora_runtime_params,
+                                    lora_hidden_state=lora_hidden_state)
 
 
 class SmoothQuantGatedMLP(SmoothQuantMLP):
@@ -1002,7 +1013,7 @@ class SmoothQuantAttention(Module):
     def __init__(
             self,
             *,
-            layer_idx,
+            local_layer_idx,
             hidden_size,
             num_attention_heads,
             num_kv_heads=None,
@@ -1012,7 +1023,7 @@ class SmoothQuantAttention(Module):
             attention_head_size=None,
             attention_mask_type=AttentionMaskType.padding,
             bias=True,
-            qkv_bias_only=False,
+            dense_bias=None,
             dtype=None,
             position_embedding_type=PositionEmbeddingType.learned_absolute,
             rotary_embedding_base=10000.0,
@@ -1026,7 +1037,7 @@ class SmoothQuantAttention(Module):
             quant_mode=QuantMode(0),
     ):
         super().__init__()
-        self.layer_idx = layer_idx
+        self.local_layer_idx = local_layer_idx
         self.attention_mask_type = attention_mask_type
         self.attention_head_size = hidden_size // num_attention_heads if attention_head_size is None else attention_head_size
         self.num_attention_heads = num_attention_heads // tp_size
@@ -1037,6 +1048,9 @@ class SmoothQuantAttention(Module):
         self.max_position_embeddings = 0 if max_position_embeddings is None else max_position_embeddings
         self.tp_size = tp_size
         self.tp_rank = tp_rank
+        self.dense_bias = dense_bias
+        if dense_bias is None:
+            self.dense_bias = bias
 
         self.num_layers = num_layers
         self.apply_query_key_layer_scaling = apply_query_key_layer_scaling
@@ -1108,7 +1122,7 @@ class SmoothQuantAttention(Module):
             tp_size * self.num_attention_heads * self.attention_head_size +
             (2 * tp_size * self.num_attention_kv_heads *
              self.attention_head_size),
-            bias=(bias or qkv_bias_only),
+            bias=bias,
             dtype=dtype,
             tp_group=tp_group,
             tp_size=tp_size,
@@ -1118,7 +1132,7 @@ class SmoothQuantAttention(Module):
         self.dense = SmoothQuantRowLinear(tp_size * self.num_attention_heads *
                                           self.attention_head_size,
                                           hidden_size,
-                                          bias=bias,
+                                          bias=self.dense_bias,
                                           dtype=dtype,
                                           tp_group=tp_group,
                                           tp_size=tp_size,
@@ -1190,7 +1204,7 @@ class SmoothQuantAttention(Module):
                 context_lengths=attention_params.context_lengths,
                 cache_indirection=kv_cache_params.cache_indirection,
                 host_request_types=attention_params.host_request_types,
-                layer_idx=self.layer_idx,
+                layer_idx=self.local_layer_idx,
                 num_heads=self.num_attention_heads,
                 num_kv_heads=self.num_attention_kv_heads,
                 hidden_size_per_head=self.attention_head_size,

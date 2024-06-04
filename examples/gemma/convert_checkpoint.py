@@ -825,7 +825,7 @@ def convert_from_checkpoint(
                         tp_rank,
                         dim=trt_llm_config.embedding_sharding_dim,
                     )
-                if trt_llm_config.quant_mode.is_weight_only() and not trt_llm_config.quant_mode.has_per_group_scaling() and \
+                if trt_llm_config.quant_mode.is_int8_weight_only() and not trt_llm_config.quant_mode.has_per_group_scaling() and \
                     not trt_llm_config.quant_mode.has_int8_kv_cache():
 
                     # shape of embedding table: [V, K], V: vocab size, K: embedding dim
@@ -1000,7 +1000,8 @@ def main():
     quant_kwargs.update(quant_algo=quant_algo,
                         kv_cache_quant_algo=kv_cache_quant_algo)
     if args.use_weight_only_with_precision:
-        if args.use_weight_only_with_precision.endswith("awq"):
+        if args.use_weight_only_with_precision.endswith(
+                "awq") or args.use_weight_only_with_precision.endswith("int4"):
             quant_kwargs.update(has_zero_point=False,
                                 pre_quant_scale=True,
                                 exclude_modules=[

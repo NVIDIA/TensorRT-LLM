@@ -181,6 +181,8 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
 endif()
 
 message(STATUS "GPU architectures: ${CMAKE_CUDA_ARCHITECTURES}")
+# Store CMAKE_CUDA_ARCHITECTURES for later use since torch sets this to "OFF"
+set(CMAKE_CUDA_ARCHITECTURES_ORIG "${CMAKE_CUDA_ARCHITECTURES}")
 
 enable_language(C CXX CUDA)
 

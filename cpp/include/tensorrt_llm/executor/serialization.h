@@ -122,6 +122,28 @@ public:
     static void serialize(ExecutorConfig const& executorConfig, std::ostream& os);
     static size_t serializedSize(ExecutorConfig const& executorConfig);
 
+    // KvCacheStats
+    static KvCacheStats deserializeKvCacheStats(std::istream& is);
+    static void serialize(KvCacheStats const& kvCacheStats, std::ostream& os);
+    static size_t serializedSize(KvCacheStats const& kvCacheStats);
+
+    // StaticBatchingStats
+    static StaticBatchingStats deserializeStaticBatchingStats(std::istream& is);
+    static void serialize(StaticBatchingStats const& staticBatchingStats, std::ostream& os);
+    static size_t serializedSize(StaticBatchingStats const& staticBatchingStats);
+
+    // InflightBatchingStats
+    static InflightBatchingStats deserializeInflightBatchingStats(std::istream& is);
+    static void serialize(InflightBatchingStats const& inflightBatchingStats, std::ostream& os);
+    static size_t serializedSize(InflightBatchingStats const& inflightBatchingStats);
+
+    // IterationStats
+    static IterationStats deserializeIterationStats(std::vector<char>& buffer);
+    static IterationStats deserializeIterationStats(std::istream& is);
+    static void serialize(IterationStats const& iterStats, std::ostream& os);
+    static std::vector<char> serialize(IterationStats const& iterStats);
+    static size_t serializedSize(IterationStats const& iterStats);
+
     // String
     static std::string deserializeString(std::istream& is);
 

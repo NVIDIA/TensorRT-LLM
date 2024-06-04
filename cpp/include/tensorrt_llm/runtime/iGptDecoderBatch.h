@@ -113,6 +113,7 @@ public:
 
 using Output = decoder::Output;
 
+// TODO: is this a bad name to mix up with token concept in LLM? Would 'Event' be better? And should move to common.h
 class Token
 {
 public:

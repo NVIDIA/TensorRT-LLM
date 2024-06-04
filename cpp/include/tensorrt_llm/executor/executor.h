@@ -58,7 +58,8 @@ public:
         std::optional<FloatType> const& presencePenalty = std::nullopt,
         std::optional<FloatType> const& frequencyPenalty = std::nullopt,
         std::optional<FloatType> const& lengthPenalty = std::nullopt,
-        std::optional<SizeType32> const& earlyStopping = std::nullopt);
+        std::optional<SizeType32> const& earlyStopping = std::nullopt,
+        std::optional<SizeType32> const& noRepeatNgramSize = std::nullopt);
 
     bool operator==(SamplingConfig const& other) const;
 
@@ -77,6 +78,7 @@ public:
     [[nodiscard]] std::optional<FloatType> getFrequencyPenalty() const;
     [[nodiscard]] std::optional<FloatType> getLengthPenalty() const;
     [[nodiscard]] std::optional<SizeType32> getEarlyStopping() const;
+    [[nodiscard]] std::optional<SizeType32> getNoRepeatNgramSize() const;
 
     void setBeamWidth(SizeType32 beamWidth);
     void setTopK(std::optional<SizeType32> const& topK);
@@ -93,6 +95,7 @@ public:
     void setFrequencyPenalty(std::optional<FloatType> const& frequencyPenalty);
     void setLengthPenalty(std::optional<FloatType> const& lengthPenalty);
     void setEarlyStopping(std::optional<SizeType32> const& earlyStopping);
+    void setNoRepeatNgramSize(std::optional<SizeType32> const& noRepeatNgramSize);
 
 private:
     static SizeType32 checkBeamWidth(SizeType32 beamWidth);
@@ -103,6 +106,7 @@ private:
     static std::optional<FloatType> const& checkTopPDecay(std::optional<FloatType> const& topPDecay);
     static std::optional<FloatType> const& checkTemperature(std::optional<FloatType> const& temperature);
     static std::optional<SizeType32> const& checkMinLength(std::optional<SizeType32> const& minLength);
+    static std::optional<SizeType32> const& checkNoRepeatNgramSize(std::optional<SizeType32> const& noRepeatNgramSize);
     static std::optional<FloatType> const& checkBeamSearchDiversityRate(
         std::optional<FloatType> const& beamSearchDiversityRate);
 
@@ -142,6 +146,8 @@ private:
     /// @brief Controls whether the generation process finishes once beamWidth sentences are generated (ends with
     /// end_token)
     std::optional<SizeType32> mEarlyStopping;
+    /// @brief Controls how many repeat ngram size are acceptable. Default is 1 << 30.
+    std::optional<SizeType32> mNoRepeatNgramSize;
 };
 
 /// @brief Configuration that controls the outputs of a Result
@@ -149,7 +155,7 @@ class OutputConfig
 {
 public:
     explicit OutputConfig(bool returnLogProbs = false, bool returnContextLogits = false,
-        bool returnGenerationLogits = false, bool excludeInputFromOutput = false);
+        bool returnGenerationLogits = false, bool excludeInputFromOutput = false, bool returnEncoderOutput = false);
 
     /// @brief Controls if Result should contain log probabilities. Default is false.
     bool returnLogProbs;
@@ -159,6 +165,9 @@ public:
     bool returnGenerationLogits;
     /// @brief Controls if output tokens in Result should include the input tokens. Default is false.
     bool excludeInputFromOutput;
+    /// @brief Controls if Result should contain encoder output hidden states (for encoder-only and encoder-decoder
+    /// models). Default is false.
+    bool returnEncoderOutput;
 };
 
 /// @brief Configuration for speculative decoding with external draft tokens.
@@ -241,6 +250,7 @@ public:
     /// @param loraConfig The LoRA configuration
     /// @param logitsPostProcessorName The logits postprocessor name. Must correspond to one of the logits postprocessor
     /// name provided to the ExecutorConfig.
+    /// @param encoderInputTokenIds The encoder input token ids for encoder-decoder models, or encoder-only models
     Request(VecTokens inputTokenIds, SizeType32 maxNewTokens, bool streaming = false,
         SamplingConfig const& samplingConfig = SamplingConfig(), OutputConfig const& outputConfig = OutputConfig(),
         std::optional<SizeType32> const& endId = std::nullopt, std::optional<SizeType32> const& padId = std::nullopt,
@@ -250,7 +260,8 @@ public:
         std::optional<ExternalDraftTokensConfig> externalDraftTokensConfig = std::nullopt,
         std::optional<PromptTuningConfig> pTuningConfig = std::nullopt,
         std::optional<LoraConfig> loraConfig = std::nullopt,
-        std::optional<std::string> logitsPostProcessorName = std::nullopt);
+        std::optional<std::string> logitsPostProcessorName = std::nullopt,
+        std::optional<VecTokens> encoderInputTokenIds = std::nullopt);
 
     Request(Request const& other);
     Request(Request&& other) noexcept;
@@ -272,6 +283,7 @@ public:
     [[nodiscard]] std::optional<PromptTuningConfig> getPromptTuningConfig() const;
     [[nodiscard]] std::optional<LoraConfig> getLoraConfig() const;
     [[nodiscard]] std::optional<std::string> getLogitsPostProcessorName() const;
+    [[nodiscard]] std::optional<VecTokens> getEncoderInputTokenIds() const;
 
     void setStreaming(bool streaming);
     void setSamplingConfig(SamplingConfig const& config);
@@ -285,6 +297,7 @@ public:
     void setPromptTuningConfig(PromptTuningConfig const& pTuningConfig);
     void setLoraConfig(LoraConfig const& loraConfig);
     void setLogitsPostProcessorName(std::string const& logitsPostProcessorName);
+    void setEncoderInputTokenIds(VecTokens const& encoderInputTokenIds);
 
 private:
     friend class Serialization;
@@ -312,6 +325,9 @@ struct Result
 
     /// @brief The context logits. Size [beamSize, maxNewTokens, vocabSizePadded]
     std::optional<Tensor> generationLogits;
+
+    /// @brief The encoder output. Size [encoderLen, hiddenSize]
+    std::optional<Tensor> encoderOutput;
 };
 
 /// @brief Class that holds either an error or a result
@@ -695,10 +711,20 @@ public:
     /// @param comm An optional inter-process communicator configuration
     Executor(std::filesystem::path const& modelPath, ModelType modelType, ExecutorConfig const& executorConfig);
 
+    Executor(std::filesystem::path const& encoderModelPath, std::filesystem::path const& decoderModelPath,
+        ModelType modelType, ExecutorConfig const& executorConfig);
+
     Executor(std::vector<uint8_t> const& engineBuffer, std::string const& jsonConfigStr, ModelType modelType,
         ExecutorConfig const& executorConfig);
 
+    Executor(std::vector<uint8_t> const& encoderEngineBuffer, std::string const& encoderJsonConfigStr,
+        std::vector<uint8_t> const& decoderEngineBuffer, std::string const& decoderJsonConfigStr, ModelType modelType,
+        ExecutorConfig const& executorConfig);
+
     Executor(std::shared_ptr<Model> model, ExecutorConfig const& executorConfig);
+
+    Executor(
+        std::shared_ptr<Model> encoderModel, std::shared_ptr<Model> decoderModel, ExecutorConfig const& executorConfig);
 
     ~Executor();
 

@@ -130,6 +130,7 @@ class Linear(Module):
         self.dtype = dtype
         self.pad_lda = pad_lda
 
+        self.share_weight = share_weight
         if not share_weight:
             self.weight = Parameter(shape=(self.out_features, self.in_features),
                                     dtype=dtype)
@@ -152,16 +153,16 @@ class Linear(Module):
         else:
             self.register_parameter('bias', None)
 
-        # see add_lora in tensorrt_llm/models/modeling_utils.py for LoRA initialization
+        # see optimize_model's add_lora for LoRA initialization
         self.lora = None
 
-    def multiply_gather(
-            self,
-            x,
-            weight,
-            gemm_plugin: Optional[str] = None,
-            use_fp8: bool = False,
-            lora_runtime_params: Optional[LoraRuntimeParams] = None):
+    def multiply_gather(self,
+                        x,
+                        weight,
+                        gemm_plugin: Optional[str] = None,
+                        use_fp8: bool = False,
+                        lora_runtime_params: Optional[LoraRuntimeParams] = None,
+                        lora_hidden_state: Optional[Tensor] = None):
         hidden_state = x
         if gemm_plugin:
             x = _gemm_plugin(x,
@@ -175,7 +176,8 @@ class Linear(Module):
 
         if default_net(
         ).plugin_config.lora_plugin and lora_runtime_params is not None:
-            x = x + self.lora(hidden_state,
+            x = x + self.lora(hidden_state if lora_hidden_state is None else
+                              lora_hidden_state,
                               lora_runtime_params=lora_runtime_params)
 
         if self.bias is not None:
@@ -190,12 +192,14 @@ class Linear(Module):
 
     def forward(self,
                 x,
-                lora_runtime_params: Optional[LoraRuntimeParams] = None):
+                lora_runtime_params: Optional[LoraRuntimeParams] = None,
+                lora_hidden_state: Optional[Tensor] = None):
         return self.multiply_gather(
             x,
             self.weight.value,
             gemm_plugin=default_net().plugin_config.gemm_plugin,
-            lora_runtime_params=lora_runtime_params)
+            lora_runtime_params=lora_runtime_params,
+            lora_hidden_state=lora_hidden_state)
 
     def weight_loader(self, mapping: Mapping, param: Parameter,
                       loaded_weight: torch.Tensor):
@@ -280,20 +284,20 @@ class RowLinear(Module):
         else:
             self.register_parameter('bias', None)
 
-        # see add_lora in tensorrt_llm/models/modeling_utils.py for LoRA initialization
+        # see optimize_model's add_lora for LoRA initialization
         self.lora = None
 
         self.tp_group = tp_group
         self.tp_size = tp_size
         self.strict_dtype = self.dtype if strict_dtype else None
 
-    def multiply_reduce(
-            self,
-            x,
-            weight,
-            gemm_plugin: Optional[str] = None,
-            use_fp8: bool = False,
-            lora_runtime_params: Optional[LoraRuntimeParams] = None):
+    def multiply_reduce(self,
+                        x,
+                        weight,
+                        gemm_plugin: Optional[str] = None,
+                        use_fp8: bool = False,
+                        lora_runtime_params: Optional[LoraRuntimeParams] = None,
+                        lora_hidden_state: Optional[Tensor] = None):
         hidden_state = x
         if gemm_plugin:
             x = _gemm_plugin(x,
@@ -307,7 +311,8 @@ class RowLinear(Module):
 
         if default_net(
         ).plugin_config.lora_plugin and lora_runtime_params is not None:
-            x = x + self.lora(hidden_state,
+            x = x + self.lora(hidden_state if lora_hidden_state is None else
+                              lora_hidden_state,
                               lora_runtime_params=lora_runtime_params)
 
         if self.tp_size > 1 and self.tp_group is not None:
@@ -321,12 +326,14 @@ class RowLinear(Module):
 
     def forward(self,
                 x,
-                lora_runtime_params: Optional[LoraRuntimeParams] = None):
+                lora_runtime_params: Optional[LoraRuntimeParams] = None,
+                lora_hidden_state: Optional[Tensor] = None):
         return self.multiply_reduce(
             x,
             self.weight.value,
             gemm_plugin=default_net().plugin_config.gemm_plugin,
-            lora_runtime_params=lora_runtime_params)
+            lora_runtime_params=lora_runtime_params,
+            lora_hidden_state=lora_hidden_state)
 
     def weight_loader(self, mapping: Mapping, param: Parameter,
                       loaded_weight: torch.Tensor):

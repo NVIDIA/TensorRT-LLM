@@ -579,8 +579,15 @@ public:
     {
     }
 
+    template <typename U = T, std::enable_if_t<!std::is_const_v<U>, bool> = true>
     explicit BufferRange(IBuffer& buffer)
-        : BufferRange(bufferCast<T>(buffer), buffer.getSize())
+        : BufferRange(bufferCast<U>(buffer), buffer.getSize())
+    {
+    }
+
+    template <typename U = T, std::enable_if_t<std::is_const_v<U>, bool> = true>
+    explicit BufferRange(IBuffer const& buffer)
+        : BufferRange(bufferCast<U>(buffer), buffer.getSize())
     {
     }
 };

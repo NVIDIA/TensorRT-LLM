@@ -1,7 +1,6 @@
 import argparse
 import json
 import os
-import sys
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -10,8 +9,10 @@ import tensorrt_llm
 from tensorrt_llm._utils import release_gc
 from tensorrt_llm.layers import MoeConfig
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models import LLaMAForCausalLM
-from tensorrt_llm.models.llama.weight import load_from_gptq_llama
+from tensorrt_llm.models import LLaMAConfig, LLaMAForCausalLM
+from tensorrt_llm.models.convert_utils import has_safetensors
+from tensorrt_llm.models.llama.convert import (load_hf_llama,
+                                               load_weights_from_gptq)
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -106,10 +107,10 @@ def parse_arguments():
         'By default, we use dtype for KV cache. int8_kv_cache chooses int8 quantization for KV'
     )
     parser.add_argument(
-        '--modelopt_quant_ckpt_path',
+        '--quant_ckpt_path',
         type=str,
         default=None,
-        help='Path of a quantized model checkpoint in .npz format')
+        help='Path of a quantized model checkpoint in .safetensors format')
 
     parser.add_argument(
         '--per_group',
@@ -133,10 +134,6 @@ def parse_arguments():
                         help='Group size used in GPTQ quantization.'
                         )  # AWQ is only supported by quantize.py script
 
-    parser.add_argument("--dataset-cache-dir",
-                        type=str,
-                        default=None,
-                        help="cache dir to load the hugging face dataset")
     parser.add_argument("--load_model_on_cpu", action="store_true")
     parser.add_argument(
         '--use_parallel_embedding',
@@ -212,7 +209,7 @@ def parse_arguments():
     return args
 
 
-def args_to_quantization(args: argparse.Namespace) -> QuantConfig:
+def args_to_quant_config(args: argparse.Namespace) -> QuantConfig:
     '''return config dict with quantization info based on the command line args
     '''
     quant_config = QuantConfig()
@@ -255,12 +252,12 @@ def convert_and_save_meta(args, rank):
                       tp_size=args.tp_size,
                       pp_size=args.pp_size,
                       rank=rank)
-    assert not args_to_quantization(args).quant_mode.has_any_quant(), \
+    assert not args_to_quant_config(args).quant_mode.has_any_quant(), \
         "quantization from meta checkpoint or empty model were never supported"
     llama = LLaMAForCausalLM.from_meta_ckpt(
         args.meta_ckpt_dir,
         args.dtype,
-        mapping,
+        mapping=mapping,
         use_parallel_embedding=args.use_parallel_embedding,
         embedding_sharding_dim=args.embedding_sharding_dim)
     llama.save_checkpoint(args.output_dir, save_config=(rank == 0))
@@ -293,56 +290,21 @@ def from_cli_args(args):
         'hidden_act': args.hidden_act,
         'rotary_base': args.rotary_base,
         'norm_epsilon': args.rms_norm_eps,
-        'moe_num_experts': args.moe_num_experts,
-        'moe_top_k': args.moe_top_k,
-        'moe_tp_mode': args.moe_tp_mode,
-        'moe_normalization_mode': args.moe_renorm_mode,
+        'moe': {
+            'num_experts': args.moe_num_experts,
+            'top_k': args.moe_top_k,
+            'tp_mode': args.moe_tp_mode,
+            'normalization_mode': args.moe_renorm_mode,
+        },
         'mapping': {
             'world_size': args.tp_size * args.pp_size,
             'tp_size': args.tp_size,
             'pp_size': args.pp_size
         },
-        'quantization': args_to_quantization(args).asdict()
+        'quantization': args_to_quant_config(args).to_dict()
     }
     config.update(args_to_build_options(args))
     return config
-
-
-def preload_model(model_dir, load_model_on_cpu):
-    use_safetensors = True
-    from transformers import AutoConfig, AutoModelForCausalLM
-    if "vila" in model_dir:
-        use_safetensors = False
-        sys.path.append(model_dir + "/../VILA")
-        from llava.model import LlavaLlamaConfig, LlavaLlamaModel  # noqa
-        from transformers import AutoModel
-        model = AutoModel.from_pretrained(
-            model_dir,
-            device_map='auto',
-            trust_remote_code=True,
-        )
-        return model.llm
-
-    hf_config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
-    model_cls = AutoModelForCausalLM
-    if hf_config.model_type == "llava":
-        use_safetensors = False
-        from transformers import LlavaForConditionalGeneration
-        model_cls = LlavaForConditionalGeneration
-    use_safetensors = any(
-        [f.endswith(".safetensors")
-         for f in os.listdir(model_dir)]) and use_safetensors
-    if use_safetensors:
-        return None
-    model = model_cls.from_pretrained(
-        model_dir,
-        device_map='auto' if not load_model_on_cpu else 'cpu',
-        torch_dtype='auto',
-        trust_remote_code=True,
-    )
-    if hf_config.model_type == "llava":
-        model = model.language_model
-    return model
 
 
 def convert_and_save_hf(args):
@@ -354,8 +316,9 @@ def convert_and_save_hf(args):
     # Ideally these fields will be moved out of the config and pass them into build API, keep them here for compatibility purpose for now,
     # before the refactor is done.
     override_fields = {'moe_tp_mode': args.moe_tp_mode}
-    quantization = args_to_quantization(args)
     override_fields.update(args_to_build_options(args))
+
+    quant_config = args_to_quant_config(args)
 
     if args.smoothquant is not None or args.int8_kv_cache:
         assert not args.load_by_shard, "When using quantization, TRT-LLM needs to load the whole HF model, thus load by shard not supported"
@@ -367,17 +330,22 @@ def convert_and_save_hf(args):
             pp_size=args.pp_size)
         LLaMAForCausalLM.quantize(args.model_dir,
                                   args.output_dir,
-                                  quantization,
                                   dtype=args.dtype,
                                   mapping=mapping,
+                                  quant_config=quant_config,
                                   calib_dataset=args.calib_dataset,
-                                  override_fields=override_fields,
-                                  dataset_cache_dir=args.dataset_cache_dir)
+                                  **override_fields)
     else:
         # When not loading by shard, preload one complete model and then slice per rank weights from this
         # this saves the disk reloading time
-        hf_model = preload_model(
-            model_dir, load_model_on_cpu) if not args.load_by_shard else None
+
+        hf_model = None
+        if "vila" in model_dir or "llava" in model_dir:
+            hf_model = load_hf_llama(model_dir, load_model_on_cpu)
+        elif not (args.load_by_shard or
+                  (has_safetensors(model_dir)
+                   and not quant_config.quant_mode.has_any_quant())):
+            hf_model = load_hf_llama(model_dir, load_model_on_cpu)
 
         def convert_and_save_rank(args, rank):
             mapping = Mapping(world_size=world_size,
@@ -385,14 +353,12 @@ def convert_and_save_hf(args):
                               tp_size=args.tp_size,
                               pp_size=args.pp_size)
             llama = LLaMAForCausalLM.from_hugging_face(
-                model_dir,
+                model_dir if hf_model is None else hf_model,
                 args.dtype,
                 mapping=mapping,
-                quantization=quantization,
+                quant_config=quant_config,
                 load_by_shard=load_by_shard,
-                load_model_on_cpu=load_model_on_cpu,
-                override_fields=override_fields,
-                preloaded_model=hf_model,
+                **override_fields,
             )
             llama.save_checkpoint(args.output_dir, save_config=(rank == 0))
             del llama
@@ -406,15 +372,16 @@ def convert_and_save_gptq(args, rank):
                       tp_size=args.tp_size,
                       rank=rank,
                       pp_size=args.pp_size)
-    llama = LLaMAForCausalLM.from_hugging_face(
+    config = LLaMAConfig.from_hugging_face(
         args.model_dir,
         args.dtype,
         mapping=mapping,
-        quantization=args_to_quantization(args),
-        skip_loading_weights=True)
-    weights = load_from_gptq_llama(llama.config, args.modelopt_quant_ckpt_path)
-    llama.load(weights)
-    llama.save_checkpoint(args.output_dir, rank == 0)
+        quant_config=args_to_quant_config(args),
+    )
+    model = LLaMAForCausalLM(config)
+    weights = load_weights_from_gptq(args.quant_ckpt_path, config)
+    model.load(weights)
+    model.save_checkpoint(args.output_dir, rank == 0)
 
 
 def execute(workers, func, args):
@@ -456,11 +423,11 @@ def main():
         execute(args.workers, [convert_and_save_meta] * world_size, args)
     elif args.weight_only_precision == 'int4_gptq':
         assert args.model_dir is not None
-        assert args.modelopt_quant_ckpt_path is not None
+        assert args.quant_ckpt_path is not None
         execute(args.workers, [convert_and_save_gptq] * world_size, args)
     else:  # all other non-gptq paths from hf model
         assert args.model_dir is not None
-        assert args.modelopt_quant_ckpt_path is None, "only gptq weights only needs this option"
+        assert args.quant_ckpt_path is None, "only gptq weights only needs this option"
         convert_and_save_hf(args)
 
     tok = time.time()

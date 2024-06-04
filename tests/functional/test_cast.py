@@ -12,43 +12,52 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
+import sys
 import unittest
 
-import numpy as np
 import torch
-from polygraphy.backend.trt import EngineFromNetwork, TrtRunner
 
 import tensorrt_llm
 from tensorrt_llm import Tensor
 
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.util import create_session, run_session
 
-class TestFunctional(unittest.TestCase):
+
+class TestCast(unittest.TestCase):
 
     def setUp(self):
         tensorrt_llm.logger.set_level('error')
 
-    def test_cast(self):
+    def test_cast_fp16_to_fp32(self):
         dtype = 'float16'
         x_data = torch.randn(
-            (2, 3, 4, 5), dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype))
+            (2, 3, 4, 5),
+            dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
+            device="cuda")
 
+        # construct trt network
         builder = tensorrt_llm.Builder()
-        net = builder.create_network()
-        with tensorrt_llm.net_guard(net):
-            network = tensorrt_llm.default_trtnet()
+        network = builder.create_network()
+        with tensorrt_llm.net_guard(network):
             x = Tensor(name='x',
                        shape=x_data.shape,
                        dtype=tensorrt_llm.str_dtype_to_trt(dtype))
-            output = tensorrt_llm.functional.cast(x, 'float32').trt_tensor
-            output.name = 'output'
-            network.mark_output(output)
+            output = tensorrt_llm.functional.cast(x, 'float32')
+            output.mark_output('output', 'float32')
 
-        build_engine = EngineFromNetwork((builder.trt_builder, net.trt_network))
-        with TrtRunner(build_engine) as runner:
-            outputs = runner.infer(feed_dict={
-                'x': x_data.numpy(),
-            })
+        # trt run
+        session = create_session(builder, network, precision=dtype)
+        inputs = {
+            'x': x_data,
+        }
+        outputs = run_session(session, inputs)
 
+        # pytorch run
         ref = x_data.to(torch.float32)
-        self.assertEqual(ref.cpu().numpy().dtype, outputs['output'].dtype)
-        np.testing.assert_allclose(ref.cpu().numpy(), outputs['output'])
+
+        # compare diff
+        assert ref.dtype == outputs[
+            'output'].dtype, "data type after cast is not the same"
+        torch.testing.assert_close(ref, outputs['output'])

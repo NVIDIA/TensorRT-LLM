@@ -83,6 +83,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
         max_tokens_in_paged_kv_cache: int | None = None,
         kv_cache_enable_block_reuse: bool = False,
         enable_chunked_context: bool = False,
+        is_enc_dec: bool = False,
     ) -> 'ModelRunnerCpp':
         """
         Create a ModelRunnerCpp instance from an engine directory.
@@ -128,13 +129,67 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 Enables block reuse in kv cache.
             enable_chunked_context (bool):
                 Enables chunked context.
+            is_enc_dec (bool):
+                Whether the model is encoder-decoder architecture.
         Returns:
             ModelRunnerCpp: An instance of ModelRunnerCpp.
         """
 
+        if is_enc_dec:
+            encoder_config_path = Path(engine_dir) / "encoder" / "config.json"
+            encoder_json_config = GptJsonConfig.parse_file(encoder_config_path)
+            encoder_json_config.model_config
+            decoder_config_path = Path(engine_dir) / "decoder" / "config.json"
+            decoder_json_config = GptJsonConfig.parse_file(decoder_config_path)
+            decoder_model_config = decoder_json_config.model_config
+
+            tp_size = decoder_json_config.tensor_parallelism
+            pp_size = decoder_json_config.pipeline_parallelism
+            gpus_per_node = decoder_json_config.gpus_per_node
+            world_config = WorldConfig.mpi(tensor_parallelism=tp_size,
+                                           pipeline_parallelism=pp_size,
+                                           gpus_per_node=gpus_per_node)
+            assert rank == world_config.rank
+
+            profiler.start('load tensorrt_llm engine')
+
+            kv_cache_config = trtllm.KvCacheConfig(
+                free_gpu_memory_fraction=0.45,  # hardcode for now
+                max_attention_window=max_attention_window_size,
+                sink_token_length=sink_token_length)
+
+            executor = trtllm.Executor(
+                Path(engine_dir) / "encoder",
+                Path(engine_dir) / "decoder", trtllm.ModelType.ENCODER_DECODER,
+                trtllm.ExecutorConfig(max_beam_width=max_beam_width,
+                                      kv_cache_config=kv_cache_config))
+
+            profiler.stop('load tensorrt_llm engine')
+
+            loading_time = profiler.elapsed_time_in_sec(
+                "load tensorrt_llm engine")
+            logger.info(f'Load engine takes: {loading_time} sec')
+
+            return cls(executor,
+                       max_batch_size=max_batch_size,
+                       max_input_len=max_input_len,
+                       max_seq_len=max_input_len + max_output_len,
+                       max_beam_width=max_beam_width,
+                       model_config=decoder_model_config,
+                       world_config=world_config)
+
         config_path = Path(engine_dir) / "config.json"
         json_config = GptJsonConfig.parse_file(config_path)
         model_config = json_config.model_config
+
+        if max_batch_size is None:
+            max_batch_size = model_config.max_batch_size
+        if max_input_len is None:
+            max_input_len = model_config.max_input_len
+        if max_output_len is None:
+            max_output_len = model_config.max_seq_len - model_config.max_input_len
+        if max_beam_width is None:
+            max_beam_width = model_config.max_beam_width
 
         # Note: Parallel configuration will be fetched automatically from trtllm.Executor constructor
         # by inspecting the json file. These lines serve the purpose of serving vocab_size_padded and
@@ -160,11 +215,12 @@ class ModelRunnerCpp(ModelRunnerMixin):
         if medusa_choices is not None:
             decoding_config.medusa_choices = medusa_choices
 
-        executor = trtllm.Executor(
-            engine_dir, trtllm.ModelType.DECODER_ONLY,
-            trtllm.ExecutorConfig(max_beam_width=max_beam_width,
-                                  kv_cache_config=kv_cache_config,
-                                  decoding_config=decoding_config))
+        trtllm_config = trtllm.ExecutorConfig(max_beam_width=max_beam_width,
+                                              kv_cache_config=kv_cache_config,
+                                              decoding_config=decoding_config)
+        trtllm_config.enable_chunked_context = enable_chunked_context
+        executor = trtllm.Executor(engine_dir, trtllm.ModelType.DECODER_ONLY,
+                                   trtllm_config)
 
         profiler.stop('load tensorrt_llm engine')
 
@@ -250,6 +306,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
     def generate(self,
                  batch_input_ids: List[torch.Tensor],
                  *,
+                 encoder_input_ids: List[torch.Tensor] = None,
                  sampling_config: Optional[SamplingConfig] = None,
                  lora_uids: Optional[list] = None,
                  streaming: bool = False,
@@ -318,6 +375,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
 
         # Convert tensor input to plain lists
         batch_input_ids_list = [a.tolist() for a in batch_input_ids]
+        encoder_input_ids_list = [a.tolist() for a in encoder_input_ids
+                                  ] if encoder_input_ids else None
 
         if sampling_config is None:
             # Convert from old API of SamplingConfig
@@ -327,7 +386,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 "top_p_decay", "random_seed", "temperature", "min_length",
                 "beam_search_diversity_rate", "repetition_penalty",
                 "presence_penalty", "frequency_penalty", "length_penalty",
-                "early_stopping"
+                "early_stopping", "no_repeat_ngram_size"
             ]
             rename_params = {"num_beams": "beam_width"}
             sampling_params = {
@@ -344,8 +403,9 @@ class ModelRunnerCpp(ModelRunnerMixin):
         else:
             sampling_config = copy.deepcopy(sampling_config)
 
-        self._check_inputs(batch_input_ids_list, sampling_config,
-                           max_new_tokens)
+        self._check_inputs(
+            encoder_input_ids_list if encoder_input_ids else
+            batch_input_ids_list, sampling_config, max_new_tokens)
 
         output_config = trtllm.OutputConfig(
             return_context_logits=self.gather_context_logits,
@@ -363,6 +423,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
 
         requests = [
             trtllm.Request(input_token_ids=input_ids,
+                           encoder_input_token_ids=encoder_input_ids_list[i]
+                           if encoder_input_ids is not None else None,
                            max_new_tokens=max_new_tokens,
                            pad_id=pad_id,
                            end_id=end_id,
@@ -372,9 +434,10 @@ class ModelRunnerCpp(ModelRunnerMixin):
                            streaming=streaming,
                            output_config=output_config,
                            prompt_tuning_config=prompt_tuning_config)
-            for input_ids, stop_words, bad_words, prompt_tuning_config in zip(
-                batch_input_ids_list, stop_words_list, bad_words_list,
-                prompt_tuning_configs)
+            for i, (input_ids, stop_words, bad_words,
+                    prompt_tuning_config) in enumerate(
+                        zip(batch_input_ids_list, stop_words_list,
+                            bad_words_list, prompt_tuning_configs))
         ]
 
         request_ids = self.session.enqueue_requests(requests)

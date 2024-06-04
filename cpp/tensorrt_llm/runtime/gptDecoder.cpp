@@ -67,6 +67,7 @@ void GptDecoder<T>::setup(
     setupParams->penaltyParams.frequencyPenalty = mSamplingConfig.frequencyPenalty;
     setupParams->penaltyParams.temperature = mSamplingConfig.temperature;
     setupParams->penaltyParams.minLength = mSamplingConfig.minLength;
+    setupParams->penaltyParams.noRepeatNgramSize = mSamplingConfig.noRepeatNgramSize;
 
     setupParams->randomSeed = mSamplingConfig.randomSeed;
 

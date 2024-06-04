@@ -132,7 +132,7 @@ inline std::unique_ptr<IGptDecoder> IGptDecoder::create(executor::DecodingMode c
     case nvinfer1::DataType::kHALF:
         return std::make_unique<GptDecoder<half>>(mode, maxBatchSize, maxBeamWidth, vocabSize, vocabSizePadded,
             maxSequenceLength, stream, maxTokensPerStep, maxAcceptedDraftTokensPerStep);
-    default: return nullptr;
+    default: TLLM_THROW("Unsupported decoder data type. Use either kFLOAT or kHALF."); return nullptr;
     }
 }
 } // namespace runtime

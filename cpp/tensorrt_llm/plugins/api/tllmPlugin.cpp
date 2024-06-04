@@ -21,6 +21,7 @@
 
 #include "tensorrt_llm/plugins/bertAttentionPlugin/bertAttentionPlugin.h"
 #include "tensorrt_llm/plugins/gemmPlugin/gemmPlugin.h"
+#include "tensorrt_llm/plugins/gemmSwigluPlugin/gemmSwigluPlugin.h"
 #include "tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.h"
 #include "tensorrt_llm/plugins/identityPlugin/identityPlugin.h"
 #include "tensorrt_llm/plugins/layernormQuantizationPlugin/layernormQuantizationPlugin.h"
@@ -173,6 +174,7 @@ extern "C"
         static tensorrt_llm::plugins::BertAttentionPluginCreator bertAttentionPluginCreator;
         static tensorrt_llm::plugins::GPTAttentionPluginCreator gptAttentionPluginCreator;
         static tensorrt_llm::plugins::GemmPluginCreator gemmPluginCreator;
+        static tensorrt_llm::plugins::GemmSwigluPluginCreator gemmSwigluPluginCreator;
         static tensorrt_llm::plugins::MixtureOfExpertsPluginCreator moePluginCreator;
 #if ENABLE_MULTI_DEVICE
         static tensorrt_llm::plugins::SendPluginCreator sendPluginCreator;
@@ -201,6 +203,7 @@ extern "C"
                   creatorPtr(bertAttentionPluginCreator),
                   creatorPtr(gptAttentionPluginCreator),
                   creatorPtr(gemmPluginCreator),
+                  creatorPtr(gemmSwigluPluginCreator),
                   creatorPtr(moePluginCreator),
 #if ENABLE_MULTI_DEVICE
                   creatorPtr(sendPluginCreator),

@@ -49,7 +49,12 @@ public:
 
     static GptJsonConfig parse(std::filesystem::path const& path);
 
-    [[nodiscard]] ModelConfig getModelConfig() const
+    [[nodiscard]] ModelConfig const& getModelConfig() const
+    {
+        return mModelConfig;
+    }
+
+    [[nodiscard]] ModelConfig& getModelConfigMutable()
     {
         return mModelConfig;
     }
@@ -103,7 +108,7 @@ private:
     SizeType32 const mTensorParallelism;
     SizeType32 const mPipelineParallelism;
     SizeType32 const mGpusPerNode;
-    ModelConfig const mModelConfig;
+    ModelConfig mModelConfig; // remove const qualifier because config has to mutable after json parsing
 };
 
 } // namespace tensorrt_llm::runtime

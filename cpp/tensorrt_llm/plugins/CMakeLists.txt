@@ -35,6 +35,7 @@ set(PLUGIN_LISTS
     gptAttentionPlugin
     identityPlugin
     gemmPlugin
+    gemmSwigluPlugin
     smoothQuantGemmPlugin
     quantizePerTokenPlugin
     quantizeTensorPlugin

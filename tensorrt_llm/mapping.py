@@ -111,3 +111,16 @@ class Mapping(object):
         experts_range = range(self.tp_rank * experts_per_rank,
                               (self.tp_rank + 1) * experts_per_rank)
         return list(experts_range)
+
+    @classmethod
+    def from_dict(cls, mapping: dict):
+        return cls(**mapping)
+
+    def to_dict(self):
+        return {
+            'world_size': self.world_size,
+            'rank': self.rank,
+            'gpus_per_node': self.gpus_per_node,
+            'tp_size': self.tp_size,
+            'pp_size': self.pp_size
+        }

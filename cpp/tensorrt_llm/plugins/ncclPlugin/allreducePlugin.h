@@ -67,8 +67,9 @@ public:
     void destroy() noexcept override;
 
 private:
-    bool isCustomAllReduceSuported(int ranks_per_node) const noexcept;
+    bool isCustomAllReduceSupported(int ranks_per_node) const noexcept;
     void initGroupTopology() noexcept;
+    void setGroupTopology() noexcept;
     kernels::AllReduceStrategyType selectImplementation(
         size_t messageSize, int worldSize, nvinfer1::DataType type) noexcept;
 

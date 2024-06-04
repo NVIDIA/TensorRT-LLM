@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -31,10 +32,25 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <unordered_map>
 
 namespace tensorrt_llm::runtime
 {
+
+class LoraExpectedException : public std::runtime_error
+{
+public:
+    explicit LoraExpectedException(std::string const& msg);
+    ~LoraExpectedException() noexcept override;
+};
+
+class LoraCacheFullException : public LoraExpectedException
+{
+public:
+    explicit LoraCacheFullException(std::string const& msg);
+    ~LoraCacheFullException() noexcept override;
+};
 
 /**
  * Holds memory of lora cache pages, and manages allocation and freeing of whole pages.

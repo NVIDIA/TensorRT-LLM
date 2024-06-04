@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,13 +13,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#pragma once
 
-#include "tensorrt_llm/runtime/bufferManager.h"
+#include "fused_gated_gemm_template.h"
 
-namespace tensorrt_llm::runtime::utils
+namespace tensorrt_llm
 {
-
-bool tensorHasNan(IBuffer const& tensor, BufferManager const& manager);
-
-}
+namespace kernels
+{
+namespace cutlass_kernels
+{
+template class CutlassFusedGatedGemmRunner<__nv_fp8_e4m3>;
+} // namespace cutlass_kernels
+} // namespace kernels
+} // namespace tensorrt_llm

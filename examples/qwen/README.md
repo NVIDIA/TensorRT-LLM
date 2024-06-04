@@ -10,6 +10,7 @@ This document shows how to build and run a [Qwen](https://huggingface.co/Qwen) m
     - [Build TensorRT engine(s)](#build-tensorrt-engines)
       - [INT8 KV cache](#int8-kv-cache)
       - [SmoothQuant](#smoothquant)
+      - [FP8 PTQ](#fp8-post-training-quantization)
       - [INT4-GPTQ](#int4-gptq)
       - [INT4-AWQ](#int4-awq)
     - [Run](#run)
@@ -28,19 +29,20 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 * [`../summarize.py`](../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
 
 ## Support Matrix
-|   Model Name       | FP16/BF16  |  WO   |  AWQ  | GPTQ  |  SQ   |  TP   |  PP   |  Arch   |
-| :-------------:    |   :---:    | :---: | :---: | :---: | :---: | :---: | :---: | :-----: |
-| Qwen-1_8B(-Chat)   |     Y      |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen-7B(-Chat)     |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen-14B(-Chat)    |     Y      |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen-72B(-Chat)    |     Y      |   Y   |   -   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-0.5B(-Chat)|     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-1.8B(-Chat)|     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-4B(-Chat)  |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-7B(-Chat)  |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-14B(-Chat) |     Y      |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-32B(-Chat) |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-72B(-Chat) |     Y      |   Y   |   -   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+|   Model Name       | FP16/BF16  |  FP8  |  WO   |  AWQ  | GPTQ  |  SQ   |  TP   |  PP   |  Arch   |
+| :-------------:    |   :---:    | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :-----: |
+| Qwen-1_8B(-Chat)   |     Y      |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen-7B(-Chat)     |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen-14B(-Chat)    |     Y      |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen-72B(-Chat)    |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen1.5-0.5B(-Chat)|     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen1.5-1.8B(-Chat)|     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen1.5-4B(-Chat)  |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen1.5-7B(-Chat)  |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen1.5-14B(-Chat) |     Y      |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen1.5-32B(-Chat) |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen1.5-72B(-Chat) |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen1.5-110B(-Chat)|     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
 
 *Please note that these models supports AWQ only with single GPU.
 
@@ -187,7 +189,7 @@ INT8 KV cache could be enabled to reduce memory footprint. It will bring more pe
 
 For INT8 KV cache, [`convert_checkpoint.py`](./convert_checkpoint.py) features a
 `--int8_kv_cache` option. Setting `--int8_kv_cache` will calibrate the model,
-and then export the scaling factors needed for INT8 KV cache inference. Remember to set `--strongly_typed` when building the engine if you are not using INT8 weight only quantization at the same time.
+and then export the scaling factors needed for INT8 KV cache inference.
 
 Example:
 
@@ -199,7 +201,6 @@ python convert_checkpoint.py --model_dir ./tmp/Qwen/7B/   \
 
 trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_sq \
              --output_dir ./engine_outputs \
-             --strongly_typed \
              --gemm_plugin float16
 ```
 
@@ -239,6 +240,29 @@ python3 convert_checkpoint.py --model_dir ./tmp/Qwen/7B/ \
 trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_sq \
              --output_dir ./engine_outputs \
              --gemm_plugin float16
+```
+
+#### FP8 Post-Training Quantization
+
+The examples below uses the NVIDIA Modelopt (AlgorithMic Model Optimization) toolkit for the model quantization process.
+
+First make sure Modelopt toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
+
+
+```bash
+# Quantize model into FP8 and export trtllm checkpoint
+python ../quantization/quantize.py --model_dir ./tmp/Qwen/7B/ \
+                                   --dtype float16 \
+                                   --qformat fp8 \
+                                   --kv_cache_dtype fp8 \
+                                   --output_dir ./tllm_checkpoint_1gpu_fp8 \
+                                   --calib_size 512
+
+# Build trtllm engines from the trtllm checkpoint
+# Enable fp8 context fmha to get further acceleration by setting `--use_fp8_context_fmha enable`
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_fp8 \
+             --output_dir ./engine_outputs \
+             --gemm_plugin float16 \
 ```
 
 #### INT4-GPTQ

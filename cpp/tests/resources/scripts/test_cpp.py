@@ -105,6 +105,8 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
               run_mamba=False,
               run_recurrentgemma=False,
               run_encoder=False,
+              run_bart=False,
+              run_t5=False,
               run_fp8=False,
               only_multi_gpu=False,
               trt_root: _tp.Optional[str] = None,
@@ -196,6 +198,8 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
                                 run_mamba=run_mamba,
                                 run_recurrentgemma=run_recurrentgemma,
                                 run_encoder=run_encoder,
+                                run_bart=run_bart,
+                                run_t5=run_t5,
                                 run_fp8=run_fp8)
 
         if build_only:
@@ -210,6 +214,8 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
                              run_mamba=run_mamba,
                              run_recurrentgemma=run_recurrentgemma,
                              run_encoder=run_encoder,
+                             run_bart=run_bart,
+                             run_t5=run_t5,
                              run_fp8=run_fp8,
                              timeout=test_timeout)
 
@@ -245,6 +251,8 @@ def prepare_all_model_tests(python_exe: str,
                             run_mamba=False,
                             run_recurrentgemma=False,
                             run_encoder=False,
+                            run_bart=False,
+                            run_t5=False,
                             run_fp8=False):
     model_cache_arg = ["--model_cache", model_cache] if model_cache else []
 
@@ -328,6 +336,24 @@ def prepare_all_model_tests(python_exe: str,
     else:
         _log.info("Skipping encoder tests")
 
+    if run_bart:
+        prepare_model_tests(model_name="bart",
+                            python_exe=python_exe,
+                            root_dir=root_dir,
+                            resources_dir=resources_dir,
+                            model_cache_arg=model_cache_arg)
+    else:
+        _log.info("Skipping BART tests")
+
+    if run_t5:
+        prepare_model_tests(model_name="t5",
+                            python_exe=python_exe,
+                            root_dir=root_dir,
+                            resources_dir=resources_dir,
+                            model_cache_arg=model_cache_arg)
+    else:
+        _log.info("Skipping T5 tests")
+
 
 def prepare_multi_gpu_model_tests(python_exe: str,
                                   root_dir: _pl.Path,
@@ -354,17 +380,25 @@ def prepare_model_tests(model_name: str,
     scripts_dir = resources_dir / "scripts"
 
     model_env = {**_os.environ, "PYTHONPATH": f"examples/{model_name}"}
+    enc_dec_model_name_arg = []
+    if model_name in ('bart', 't5'):
+        enc_dec_model_name_arg = [
+            '--hf_repo_name',
+            'facebook/bart-large-cnn' if model_name == 'bart' else 't5-small'
+        ]
+        model_name = 'enc_dec'
+
     build_engines = [
         python_exe,
         str(scripts_dir / f"build_{model_name}_engines.py")
-    ] + model_cache_arg + only_fp8_arg + only_multi_gpu_arg
+    ] + model_cache_arg + only_fp8_arg + only_multi_gpu_arg + enc_dec_model_name_arg
     run_command(build_engines, cwd=root_dir, env=model_env, timeout=1800)
 
     model_env["PYTHONPATH"] = "examples"
     generate_expected_output = [
         python_exe,
         str(scripts_dir / f"generate_expected_{model_name}_output.py")
-    ] + only_fp8_arg + only_multi_gpu_arg
+    ] + only_fp8_arg + only_multi_gpu_arg + enc_dec_model_name_arg
     if "enc_dec" in model_name:
         generate_expected_output += model_cache_arg
     if only_multi_gpu_arg:
@@ -402,6 +436,7 @@ def run_unit_tests(build_dir: _pl.Path, timeout=1800):
     excluded_tests.append("Mamba")
     excluded_tests.append("RecurrentGemma")
     excluded_tests.append("Encoder")
+    excluded_tests.append("EncDec")
     ctest.extend(["-E", "|".join(excluded_tests)])
     run_command(ctest, cwd=build_dir, env=cpp_env, timeout=timeout)
 
@@ -415,6 +450,8 @@ def run_single_gpu_tests(build_dir: _pl.Path,
                          run_mamba,
                          run_recurrentgemma,
                          run_encoder,
+                         run_bart,
+                         run_t5,
                          run_fp8,
                          timeout=3600):
     build_tests(build_dir=build_dir)
@@ -453,40 +490,55 @@ def run_single_gpu_tests(build_dir: _pl.Path,
             ctest.extend(["-E", "|".join(excluded_tests)])
         run_command(ctest, cwd=build_dir, env=cpp_env, timeout=timeout)
 
+    def run_enc_dec_test_with_env(model: str):
+        enc_dec_test_command = [
+            "tests/executor/executorTest",
+            "--gtest_filter=EncDecBasicTest/EncDecParamsTest.Forward*",
+            f"--gtest_output=xml:{str(build_dir)}/results-single-gpu-enc-dec.xml"
+        ]
+        run_command(enc_dec_test_command,
+                    cwd=build_dir,
+                    env={
+                        **cpp_env, 'ENC_DEC_MODEL': model
+                    })
+
+    if run_bart:
+        run_enc_dec_test_with_env('bart')
+    if run_t5:
+        run_enc_dec_test_with_env('t5')
+
 
 def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
     build_tests(build_dir=build_dir)
 
     tests_dir = build_dir / "tests"
+    xml_output_file = build_dir / "results-multi-gpu-real-decoder.xml"
     cpp_env = {**_os.environ}
-    # TP2+PP2 tests fail for beam search
-    session_test = [
-        "mpirun", "-n", "4", "--allow-run-as-root", "gptSessionTest",
-        "--gtest_filter=*TP4*:*PP4*"
-    ]
-    run_command(session_test, cwd=tests_dir, env=cpp_env,
-                timeout=300)  # expecting ~250s
-
     trt_model_test = [
         "mpirun", "-n", "4", "--allow-run-as-root",
-        "batch_manager/trtGptModelRealDecoderTest", "--gtest_filter=*TP*:*PP*"
+        "batch_manager/trtGptModelRealDecoderTest", "--gtest_filter=*TP*:*PP*",
+        f"--gtest_output=xml:{xml_output_file}"
     ]
     run_command(trt_model_test, cwd=tests_dir, env=cpp_env,
                 timeout=timeout)  # expecting ~ 1200s
 
     #Executor test in leader mode
     new_env = cpp_env
+    xml_output_file = build_dir / "results-multi-gpu-llama-exec-leader-mode.xml"
     new_env["RUN_LLAMA_MULTI_GPU"] = "true"
     trt_model_test = [
         "mpirun", "-n", "4", "--allow-run-as-root", "executor/executorTest",
-        "--gtest_filter=*LlamaExecutorTest*LeaderMode*"
+        "--gtest_filter=*LlamaExecutorTest*LeaderMode*",
+        f"--gtest_output=xml:{xml_output_file}"
     ]
     run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
 
     #Executor test in orchestrator mode
+    xml_output_file = build_dir / "results-multi-gpu-llama-exec-orch-mode.xml"
     trt_model_test = [
         "mpirun", "-n", "1", "--allow-run-as-root", "executor/executorTest",
-        "--gtest_filter=*LlamaExecutorTest*OrchMode*"
+        "--gtest_filter=*LlamaExecutorTest*OrchMode*",
+        f"--gtest_output=xml:{xml_output_file}"
     ]
     run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
 
@@ -652,6 +704,12 @@ if __name__ == "__main__":
     parser.add_argument("--run_encoder",
                         action="store_true",
                         help="Run the tests for BART encoder")
+    parser.add_argument("--run_bart",
+                        action="store_true",
+                        help="Run the tests for BART")
+    parser.add_argument("--run_t5",
+                        action="store_true",
+                        help="Run the tests for T5")
     parser.add_argument(
         "--run_fp8",
         action="store_true",
@@ -675,6 +733,8 @@ if __name__ == "__main__":
         args.run_mamba = True
         args.run_recurrentgemma = True
         args.run_encoder = True
+        args.run_bart = True
+        args.run_t5 = True
 
     del args.run_all_models
 
