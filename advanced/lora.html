@@ -75,6 +75,7 @@
 <li class="toctree-l1"><a class="reference internal" href="graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="inference-request.html">Inference Request</a></li>
+<li class="toctree-l1"><a class="reference internal" href="inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1 current"><a class="current reference internal" href="#">Run gpt-2b + LoRA using GptManager / cpp runtime</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="#lora-tensor-format-details">LoRA tensor format details</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="#example-lora-tensors">Example LoRA tensors</a></li>
@@ -284,6 +285,22 @@ The following tensors are for a LoRA which has a <code class="docutils literal n
 <td><p>12</p></td>
 <td><p>adapter for the dense layer in cross attention</p></td>
 </tr>
+<tr class="row-odd"><td><p>moe_h_to_4h</p></td>
+<td><p>13</p></td>
+<td><p>for mixtral adapter for expert mlp layer: up projection</p></td>
+</tr>
+<tr class="row-even"><td><p>moe_4h_to_h</p></td>
+<td><p>14</p></td>
+<td><p>for mixtral adapter for expert mlp layer: down projection</p></td>
+</tr>
+<tr class="row-odd"><td><p>moe_gate</p></td>
+<td><p>15</p></td>
+<td><p>for mixtral adapter for expert mlp layer: gate</p></td>
+</tr>
+<tr class="row-even"><td><p>moe_router</p></td>
+<td><p>16</p></td>
+<td><p>for mixtral adapter for expert router layer</p></td>
+</tr>
 </tbody>
 </table>
 </section>
@@ -307,12 +324,35 @@ The following tensors are for a LoRA which has a <code class="docutils literal n
   <hr/>
 
   <div role="contentinfo">
-    <p>&#169; Copyright 2023, NVidia.</p>
+<jinja2.runtime.BlockReference object at 0x7f27020c4d90>
+
+<div class="footer">
+    <p>
+        Copyright © 2024 NVIDIA Corporation
+    </p>
+    <p>
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/" target="_blank" rel="noopener"
+            data-cms-ai="0">Privacy Policy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/" target="_blank" rel="noopener"
+            data-cms-ai="0">Manage My Privacy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/preferences/start/" target="_blank" rel="noopener"
+            data-cms-ai="0">Do Not Sell or Share My Data</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/" target="_blank"
+            rel="noopener" data-cms-ai="0">Terms of Service</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/" target="_blank" rel="noopener"
+            data-cms-ai="0">Accessibility</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/" target="_blank"
+            rel="noopener" data-cms-ai="0">Corporate Policies</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/product-security/" target="_blank" rel="noopener"
+            data-cms-ai="0">Product Security</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/contact/" target="_blank" rel="noopener"
+            data-cms-ai="0">Contact</a>
+    </p>
+</div>
+
+
   </div>
 
-  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
-    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
-    provided by <a href="https://readthedocs.org">Read the Docs</a>.
    
 
 </footer>

@@ -40,6 +40,12 @@ ________________
 .. doxygenfile:: decodingOutput.h
    :project: TensorRT-LLM
 
+gptDecoder.h
+____________
+
+.. doxygenfile:: gptDecoder.h
+   :project: TensorRT-LLM
+
 generationInput.h
 _________________
 
@@ -52,12 +58,6 @@ __________________
 .. doxygenfile:: generationOutput.h
    :project: TensorRT-LLM
 
-gptDecoder.h
-____________
-
-.. doxygenfile:: gptDecoder.h
-   :project: TensorRT-LLM
-
 gptDecoderBatch.h
 _________________
 
@@ -68,12 +68,6 @@ gptJsonConfig.h
 _______________
 
 .. doxygenfile:: gptJsonConfig.h
-   :project: TensorRT-LLM
-
-gptModelConfig.h
-________________
-
-.. doxygenfile:: gptModelConfig.h
    :project: TensorRT-LLM
 
 gptSession.h
@@ -112,6 +106,18 @@ __________
 .. doxygenfile:: ipcUtils.h
    :project: TensorRT-LLM
 
+decodingMode.h
+______________
+
+.. doxygenfile:: decodingMode.h
+   :project: TensorRT-LLM
+
+loraCache.h
+___________
+
+.. doxygenfile:: loraCache.h
+   :project: TensorRT-LLM
+
 memoryCounters.h
 ________________
 
@@ -142,18 +148,6 @@ _____________
 .. doxygenfile:: worldConfig.h
    :project: TensorRT-LLM
 
-decodingMode.h
-______________
-
-.. doxygenfile:: decodingMode.h
-   :project: TensorRT-LLM
-
-loraCache.h
-___________
-
-.. doxygenfile:: loraCache.h
-   :project: TensorRT-LLM
-
 loraCachePageManagerConfig.h
 ____________________________
 
@@ -164,5 +158,17 @@ loraModule.h
 ____________
 
 .. doxygenfile:: loraModule.h
+   :project: TensorRT-LLM
+
+modelConfig.h
+_____________
+
+.. doxygenfile:: modelConfig.h
+   :project: TensorRT-LLM
+
+speculativeDecodingMode.h
+_________________________
+
+.. doxygenfile:: speculativeDecodingMode.h
    :project: TensorRT-LLM
 

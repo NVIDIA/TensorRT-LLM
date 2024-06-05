@@ -22,3 +22,9 @@ _______
 .. doxygenfile:: types.h
    :project: TensorRT-LLM
 
+serialization.h
+_______________
+
+.. doxygenfile:: serialization.h
+   :project: TensorRT-LLM
+

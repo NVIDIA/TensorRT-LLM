@@ -4,7 +4,7 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Expert Parallelism in TensorRT-LLM &mdash; tensorrt_llm  documentation</title>
+  <title>Running With Weight Streaming to Reduce GPU Memory Consumption &mdash; tensorrt_llm  documentation</title>
       <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=19f00094" />
 
@@ -20,9 +20,7 @@
         <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
-    <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="Overview" href="../performance/perf-overview.html" />
-    <link rel="prev" title="Run gpt-2b + LoRA using GptManager / cpp runtime" href="lora.html" /> 
+    <link rel="search" title="Search" href="../search.html" /> 
 </head>
 
 <body class="wy-body-for-nav"> 
@@ -69,7 +67,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../architecture/add-model.html">Adding a Model</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Advanced</span></p>
-<ul class="current">
+<ul>
 <li class="toctree-l1"><a class="reference internal" href="gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="gpt-runtime.html">C++ GPT Runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="graph-rewriting.html">Graph Rewriting Module</a></li>
@@ -77,12 +75,7 @@
 <li class="toctree-l1"><a class="reference internal" href="inference-request.html">Inference Request</a></li>
 <li class="toctree-l1"><a class="reference internal" href="inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
-<li class="toctree-l1 current"><a class="current reference internal" href="#">Expert Parallelism in TensorRT-LLM</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="#mixture-of-experts-moe">Mixture of Experts (MoE)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#tensor-parallel-vs-expert-parallel">Tensor Parallel vs Expert Parallel</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#how-to-enable">How to Enable</a></li>
-</ul>
-</li>
+<li class="toctree-l1"><a class="reference internal" href="expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul>
@@ -133,9 +126,9 @@
           <div role="navigation" aria-label="Page navigation">
   <ul class="wy-breadcrumbs">
       <li><a href="../index.html" class="icon icon-home" aria-label="Home"></a></li>
-      <li class="breadcrumb-item active">Expert Parallelism in TensorRT-LLM</li>
+      <li class="breadcrumb-item active">Running With Weight Streaming to Reduce GPU Memory Consumption</li>
       <li class="wy-breadcrumbs-aside">
-            <a href="../_sources/advanced/expert-parallelism.md.txt" rel="nofollow"> View page source</a>
+            <a href="../_sources/advanced/weight-streaming.md.txt" rel="nofollow"> View page source</a>
       </li>
   </ul>
   <hr/>
@@ -143,39 +136,87 @@
           <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
            <div itemprop="articleBody">
              
-  <section id="expert-parallelism-in-tensorrt-llm">
-<span id="expert-parallelism"></span><h1>Expert Parallelism in TensorRT-LLM<a class="headerlink" href="#expert-parallelism-in-tensorrt-llm" title="Link to this heading"></a></h1>
-<section id="mixture-of-experts-moe">
-<h2>Mixture of Experts (MoE)<a class="headerlink" href="#mixture-of-experts-moe" title="Link to this heading"></a></h2>
-<p>Mixture of Experts (MoE) architectures have been used widely recently, such as <a class="reference external" href="https://huggingface.co/mistralai/Mixtral-8x7B-v0.1/blob/main/config.json">Mistral Mixtral 8x7B</a>. Specifically, MOE’s structure supports multiple parallel Feedforward Neural Network (FFN) layers (called experts) to replace the single FFN layer in the dense model. When tokens arrive, the router layer selects the TopK experts for each token. The corresponding hidden state of the token is then dispatched to the selected TopK experts, respectively. As a result, there are multiple tokens’ hidden states that are dispatched to each expert.</p>
-<img src="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/media/moe_structure.png?raw=true" alt="moe_structure" width="500" height="auto">
-<p><sub>the MOE structure in Switch Transformer: <a class="reference external" href="https://arxiv.org/pdf/2101.03961.pdf">https://arxiv.org/pdf/2101.03961.pdf</a> </sub></p>
-</section>
-<section id="tensor-parallel-vs-expert-parallel">
-<h2>Tensor Parallel vs Expert Parallel<a class="headerlink" href="#tensor-parallel-vs-expert-parallel" title="Link to this heading"></a></h2>
-<p>Parallelism on multi-GPUs is necessary if the MoE model can not be accommodated by a single GPU’s memory.  We have supported two kinds of parallel patterns for MoE structure, Tensor Parallel (default pattern) and Expert Parallel.</p>
-<img src="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/media/tp_ep.png?raw=true" alt="tensor parallel vs expert parallel" width="500" height="auto">
-<p>Tensor Parallel evenly splits each expert’s weight and distributes them to different GPUs, which means each GPU holds partial weight of all experts, While Expert Parallel evenly distributes some of the experts’ full weight to different GPUs, which means each GPU holds part of the experts’ full weight. As a result, each GPU rank in the Tensor Parallel group receives all tokens’ hidden states for all experts, then computes using the partial weights, while for Expert Parallel, each GPU rank only receives part of tokens’ hidden states for experts on this rank, then computes using the full weights.</p>
-</section>
-<section id="how-to-enable">
-<h2>How to Enable<a class="headerlink" href="#how-to-enable" title="Link to this heading"></a></h2>
-<p>The default parallel pattern is Tensor Parallel. You can enable Expert Parallel by setting <code class="docutils literal notranslate"><span class="pre">--moe_tp_mode</span> <span class="pre">1</span></code> when calling <code class="docutils literal notranslate"><span class="pre">convert_coneckpoint.py</span></code>, and <code class="docutils literal notranslate"><span class="pre">--tp_size</span></code> is used to set the Expert Parallel size.</p>
-<p>The other parameters related to MoE structure, such as <code class="docutils literal notranslate"><span class="pre">num_experts_per_tok</span></code> (TopK in previous context), and <code class="docutils literal notranslate"><span class="pre">num_local_experts</span></code>, can be find in the model’s configuration file, such as the one for <a class="reference external" href="https://huggingface.co/mistralai/Mixtral-8x7B-v0.1/blob/main/config.json">Mixtral 8x7B model</a>.</p>
+  <section id="running-with-weight-streaming-to-reduce-gpu-memory-consumption">
+<span id="weight-streaming"></span><h1>Running With Weight Streaming to Reduce GPU Memory Consumption<a class="headerlink" href="#running-with-weight-streaming-to-reduce-gpu-memory-consumption" title="Link to this heading"></a></h1>
+<p>TensorRT Weight Streaming can offload some weights to the CPU memory and stream them to the GPU memory during runtime.
+This can reduce the weights size in GPU memory, therefore, we can run larger models or larger batch sizes in the same GPU memory budget.</p>
+<p>During build time, build the engine with <code class="docutils literal notranslate"><span class="pre">--weight-streaming</span> <span class="pre">--strongly_typed</span> <span class="pre">--gemm_plugin</span> <span class="pre">disable</span></code> since Weight Streaming only supports strongly typed models and non-plugin weights. During runtime, run with <code class="docutils literal notranslate"><span class="pre">--gpu_weights_percent</span> <span class="pre">x</span></code> to config the percent of weights that remained on the GPU. <code class="docutils literal notranslate"><span class="pre">x</span></code> can be a value from <code class="docutils literal notranslate"><span class="pre">0.0</span></code> to <code class="docutils literal notranslate"><span class="pre">1.0</span></code>.</p>
+<p>Here is an example to run llama-7b with Weight Streaming:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Convert model as normal. Assume hugging face model is in llama-7b-hf/</span>
+python3<span class="w"> </span>examples/llama/convert_checkpoint.py<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--model_dir<span class="w"> </span>llama-7b-hf/<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--output_dir<span class="w"> </span>/tmp/llama_7b/trt_ckpt/fp16/1-gpu/<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--dtype<span class="w"> </span>float16
+
+<span class="c1"># Build engine that enabled Weight Streaming.</span>
+trtllm-build<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--checkpoint_dir<span class="w"> </span>/tmp/llama_7b/trt_ckpt/fp16/1-gpu/<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--output_dir<span class="w"> </span>/tmp/llama_7b/trt_engines/fp16/1-gpu/<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--weight_streaming<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--strongly_typed<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--gemm_plugin<span class="w"> </span>disable<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_batch_size<span class="w"> </span><span class="m">128</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_input_len<span class="w"> </span><span class="m">512</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_output_len<span class="w"> </span><span class="m">50</span>
+
+<span class="c1"># Run the engine with 20% weights in GPU memory.</span>
+python3<span class="w"> </span>examples/summarize.py<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--engine_dir<span class="w"> </span>/tmp/llama_7b/trt_engines/fp16/1-gpu/<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--batch_size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--test_trt_llm<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--hf_model_dir<span class="w"> </span>llama-7b-hf/<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--data_type<span class="w"> </span>fp16<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--gpu_weights_percent<span class="w"> </span><span class="m">0</span>.2
+</pre></div>
+</div>
+<p>We can also benchmark the efficiency of Weight Streaming. Here is an example:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>benchmarks/python/benchmark.py<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-m<span class="w"> </span>opt_30b<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--mode<span class="w"> </span>ootb<span class="w">  </span><span class="se">\</span>
+<span class="w">    </span>--batch_size<span class="w"> </span><span class="s2">&quot;1;32&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_batch_size<span class="w"> </span><span class="s2">&quot;32&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--input_output_len<span class="w"> </span><span class="s2">&quot;256,32&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_input_len<span class="w"> </span><span class="m">256</span><span class="se">\</span>
+<span class="w">    </span>--max_output_len<span class="w"> </span><span class="m">32</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--gpu_weights_percent<span class="w"> </span><span class="s2">&quot;0.0;0.3;0.6;1.0&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--dtype<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--strongly_typed<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--csv<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--log_level<span class="w"> </span>verbose
+</pre></div>
+</div>
+<p>Here we use <code class="docutils literal notranslate"><span class="pre">ootb</span></code> mode so that the GEMM operators won’t use plugins. <code class="docutils literal notranslate"><span class="pre">ootb-except-mha</span></code> mode is also valid.</p>
+<section id="api-changes">
+<h2>API Changes<a class="headerlink" href="#api-changes" title="Link to this heading"></a></h2>
+<p>To build engines with Weight Streaming enabled, some API changes are needed for the builder:</p>
+<ul class="simple">
+<li><p>Added a new bool member <code class="docutils literal notranslate"><span class="pre">weight_streaming</span></code> to class <code class="docutils literal notranslate"><span class="pre">BuildConfig</span></code>.</p></li>
+<li><p>Added a new bool parameter <code class="docutils literal notranslate"><span class="pre">weight_streaming</span></code> to method <code class="docutils literal notranslate"><span class="pre">create_builder_config</span></code> of class <code class="docutils literal notranslate"><span class="pre">Builder</span></code>.</p></li>
+</ul>
+<p>To run with Weight Streaming with <code class="docutils literal notranslate"><span class="pre">Executor</span></code>, there are some API change to its config <code class="docutils literal notranslate"><span class="pre">ExecutorConfig</span></code>:</p>
+<ul class="simple">
+<li><p>Added a new float parameter <code class="docutils literal notranslate"><span class="pre">gpuWeightsPercent</span></code> to the constructor of <code class="docutils literal notranslate"><span class="pre">ExecutorConfig</span></code>.</p></li>
+<li><p>Added two member functions <code class="docutils literal notranslate"><span class="pre">setGpuWeightsPercent</span></code> and <code class="docutils literal notranslate"><span class="pre">getGpuWeightsPercent</span></code> to set and get the GPU weights percentage.</p></li>
+</ul>
+<p>Here is an example to create an <code class="docutils literal notranslate"><span class="pre">Executor</span></code> with Weight Streaming:</p>
+<div class="highlight-c++ notranslate"><div class="highlight"><pre><span></span><span class="p">...</span>
+<span class="k">auto</span><span class="w"> </span><span class="n">executorConfig</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">tle</span><span class="o">::</span><span class="n">ExecutorConfig</span><span class="p">(</span><span class="n">gpuWeightsPercent</span><span class="o">=</span><span class="mf">0.5</span><span class="p">);</span>
+<span class="k">auto</span><span class="w"> </span><span class="n">executor</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">tle</span><span class="o">::</span><span class="n">Executor</span><span class="p">(</span><span class="s">&quot;model_path&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">tensorrt_llm</span><span class="o">::</span><span class="n">executor</span><span class="o">::</span><span class="n">ModelType</span><span class="o">::</span><span class="n">kDECODER_ONLY</span><span class="p">,</span><span class="w"> </span><span class="n">executorConfig</span><span class="p">);</span>
+<span class="p">...</span>
+</pre></div>
+</div>
 </section>
 </section>
 
 
            </div>
           </div>
-          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
-        <a href="lora.html" class="btn btn-neutral float-left" title="Run gpt-2b + LoRA using GptManager / cpp runtime" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
-        <a href="../performance/perf-overview.html" class="btn btn-neutral float-right" title="Overview" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
-    </div>
+          <footer>
 
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f270211dba0>
+<jinja2.runtime.BlockReference object at 0x7f27020c4790>
 
 <div class="footer">
     <p>

@@ -75,6 +75,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html">Inference Request</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 </ul>
@@ -153,7 +154,7 @@
 <p>In this blog, we provide an overview of the quantization features in TensorRT-LLM, share benchmark, and offer best practices of selecting the appropriate quantization methods tailored to your specific use case.</p>
 <section id="quantization-in-tensorrt-llm">
 <h2>Quantization in TensorRT-LLM<a class="headerlink" href="#quantization-in-tensorrt-llm" title="Link to this heading"></a></h2>
-<p>TensorRT-LLM offers a best-in-class unified quantization toolkit to significantly speedup DL/GenAI deployment on NVIDIA hardware, while maintaining model accuracy. This toolkit is designed with easy-of-use in mind. You can follow <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/quantization">this user guide</a> to quantize <a class="reference internal" href="../reference/support-matrix.html"><span class="std std-doc">supported LLMs</span></a> with a few lines of codes. We currently focus on providing SOTA <strong>Post-Training Quantization (PTQ)</strong> and will soon expand to more model optimization techniques in the near future.</p>
+<p>TensorRT-LLM offers a best-in-class unified quantization toolkit to significantly speedup DL/GenAI deployment on NVIDIA hardware, while maintaining model accuracy. This toolkit is designed with easy-of-use in mind. You can follow <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/quantization">this user guide</a> to quantize <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/precision.html#support-matrix">supported LLMs</a> with a few lines of codes. We currently focus on providing SOTA <strong>Post-Training Quantization (PTQ)</strong> and will soon expand to more model optimization techniques in the near future.</p>
 </section>
 <section id="benchmark">
 <h2>Benchmark<a class="headerlink" href="#benchmark" title="Link to this heading"></a></h2>
@@ -290,7 +291,7 @@
 <li><p>Calibration algorithms</p></li>
 </ol>
 <p>Typically, in the context of small-batch inference scenarios (batch size ≤ 4), the key consideration is memory bandwidth, making weight-only quantization methods the preferred choice. Conversely, for large-batch inference scenarios, such as serving scenarios (batch size ≥ 16), both memory bandwidth and computation density become crucial factors. Consequently, it’s recommended to opt for a quantization method that has both weight and activation quantized. For batch size ≥ 16, the choice of quantization method can be model speicfic. We suggest to prioritize using FP8 first, as we typically see it offers the best performance and accuracy. If the results do not meet your specific use case, you can further experiment with Int8 SmoothQuant (Int8 SQ) followed by AWQ and/or GPTQ.</p>
-<p>Based on specific use cases, users might have different tolerances on accuracy impact and calibration time. The table below summarizes the tradeoffs* to consider when choosing a quantization method. You can also learn more about precision formats in our <a class="reference internal" href="../reference/precision.html"><span class="std std-doc">documentation</span></a>.</p>
+<p>Based on specific use cases, users might have different tolerances on accuracy impact and calibration time. The table below summarizes the tradeoffs* to consider when choosing a quantization method. You can also learn more about precision formats in our <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/precision.html">documentation</a>.</p>
 <table class="docutils align-default">
 <thead>
 <tr class="row-odd"><th class="head text-left"><p>Quantization Methods</p></th>
@@ -366,12 +367,35 @@
   <hr/>
 
   <div role="contentinfo">
-    <p>&#169; Copyright 2023, NVidia.</p>
+<jinja2.runtime.BlockReference object at 0x7f2702219b70>
+
+<div class="footer">
+    <p>
+        Copyright © 2024 NVIDIA Corporation
+    </p>
+    <p>
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/" target="_blank" rel="noopener"
+            data-cms-ai="0">Privacy Policy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/" target="_blank" rel="noopener"
+            data-cms-ai="0">Manage My Privacy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/preferences/start/" target="_blank" rel="noopener"
+            data-cms-ai="0">Do Not Sell or Share My Data</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/" target="_blank"
+            rel="noopener" data-cms-ai="0">Terms of Service</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/" target="_blank" rel="noopener"
+            data-cms-ai="0">Accessibility</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/" target="_blank"
+            rel="noopener" data-cms-ai="0">Corporate Policies</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/product-security/" target="_blank" rel="noopener"
+            data-cms-ai="0">Product Security</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/contact/" target="_blank" rel="noopener"
+            data-cms-ai="0">Contact</a>
+    </p>
+</div>
+
+
   </div>
 
-  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
-    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
-    provided by <a href="https://readthedocs.org">Read the Docs</a>.
    
 
 </footer>

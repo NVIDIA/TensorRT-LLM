@@ -75,6 +75,7 @@
 <li class="toctree-l1"><a class="reference internal" href="graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1 current"><a class="current reference internal" href="#">Inference Request</a></li>
+<li class="toctree-l1"><a class="reference internal" href="#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 </ul>
@@ -140,7 +141,7 @@
   <section id="inference-request">
 <span id="id1"></span><h1>Inference Request<a class="headerlink" href="#inference-request" title="Link to this heading"></a></h1>
 <p>The main class to describe requests to <code class="docutils literal notranslate"><span class="pre">GptManager</span></code> is <code class="docutils literal notranslate"><span class="pre">InferenceRequest</span></code>. This is structured as a map of tensors and a <code class="docutils literal notranslate"><span class="pre">uint64_t</span> <span class="pre">requestId</span></code>.
-The mandatory tensors to create a valid <code class="docutils literal notranslate"><span class="pre">InferenceRequest</span></code> object are described below. Sampling config params are documented in the <a class="reference internal" href="gpt-runtime.html#gpt-runtime"><span class="std std-ref">C++ GPT Runtime</span></a> section. Descriptions have been omitted in the table.</p>
+The mandatory input tensors to create a valid <code class="docutils literal notranslate"><span class="pre">InferenceRequest</span></code> object are described below. Sampling config params are documented in the <a class="reference internal" href="gpt-runtime.html#gpt-runtime"><span class="std std-ref">C++ GPT Runtime</span></a> section. Descriptions have been omitted in the table.</p>
 <table class="docutils align-default">
 <thead>
 <tr class="row-odd"><th class="head text-center"><p>Name</p></th>
@@ -243,9 +244,9 @@ The mandatory tensors to create a valid <code class="docutils literal notranslat
 <td class="text-center"><p>Pad token Id</p></td>
 </tr>
 <tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">embedding_bias</span></code></p></td>
-<td class="text-center"><p>[1]</p></td>
+<td class="text-center"><p>[1, vocab_size]</p></td>
 <td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">float</span></code></p></td>
-<td class="text-center"><p>Embedding bias</p></td>
+<td class="text-center"><p>The bias is added to the logits for each token in the vocabulary before decoding occurs. Positive values in the bias encourage the sampling of tokens, while negative values discourage it. A value of <code class="docutils literal notranslate"><span class="pre">0.f</span></code> leaves the logit value unchanged.</p></td>
 </tr>
 <tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">bad_words_list</span></code></p></td>
 <td class="text-center"><p>[2, num_bad_words]</p></td>
@@ -310,6 +311,51 @@ The mandatory tensors to create a valid <code class="docutils literal notranslat
 </tbody>
 </table>
 </section>
+<section id="responses">
+<h1>Responses<a class="headerlink" href="#responses" title="Link to this heading"></a></h1>
+<p>Responses from GptManager are formatted as a list of tensors. The table below shows the set of output tensors returned by <code class="docutils literal notranslate"><span class="pre">GptManager</span></code> (via the <code class="docutils literal notranslate"><span class="pre">SendResponseCallback</span></code>):</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>Name</p></th>
+<th class="head text-center"><p>Shape</p></th>
+<th class="head text-center"><p>Type</p></th>
+<th class="head text-center"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">output_ids</span></code></p></td>
+<td class="text-center"><p>[beam_width, num_output_tokens]</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">int32_t</span></code></p></td>
+<td class="text-center"><p>Tensor of output tokens. When <code class="docutils literal notranslate"><span class="pre">streaming</span></code> is enabled, this is a single token.</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">sequence_length</span></code></p></td>
+<td class="text-center"><p>[beam_width]</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">int32_t</span></code></p></td>
+<td class="text-center"><p>Number of output tokens. When <code class="docutils literal notranslate"><span class="pre">streaming</span></code> is set, this will be 1.</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">output_log_probs</span></code></p></td>
+<td class="text-center"><p>[1, beam_width, num_output_tokens]</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">float</span></code></p></td>
+<td class="text-center"><p>Only if <code class="docutils literal notranslate"><span class="pre">return_log_probs</span></code> is set on input. Tensor of log probabilities of output token logits.</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">cum_log_probs</span></code></p></td>
+<td class="text-center"><p>[1, beam_width]</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">float</span></code></p></td>
+<td class="text-center"><p>Only if <code class="docutils literal notranslate"><span class="pre">return_log_probs</span></code> is set on input. Cumulative log probability of the sequence generated.</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">context_logits</span></code></p></td>
+<td class="text-center"><p>[1, num_input_tokens, vocab_size]</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">float</span></code></p></td>
+<td class="text-center"><p>Only if <code class="docutils literal notranslate"><span class="pre">return_context_logits</span></code> is set on input. Tensor of input token logits.</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">generation_logits</span></code></p></td>
+<td class="text-center"><p>[1, beam_width, num_output_tokens, vocab_size]</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">float</span></code></p></td>
+<td class="text-center"><p>Only if <code class="docutils literal notranslate"><span class="pre">return_generation_logits</span></code> is set on input. Tensor of output token logits.</p></td>
+</tr>
+</tbody>
+</table>
+</section>
 
 
            </div>
@@ -322,12 +368,35 @@ The mandatory tensors to create a valid <code class="docutils literal notranslat
   <hr/>
 
   <div role="contentinfo">
-    <p>&#169; Copyright 2023, NVidia.</p>
+<jinja2.runtime.BlockReference object at 0x7f27020fa5f0>
+
+<div class="footer">
+    <p>
+        Copyright © 2024 NVIDIA Corporation
+    </p>
+    <p>
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/" target="_blank" rel="noopener"
+            data-cms-ai="0">Privacy Policy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/" target="_blank" rel="noopener"
+            data-cms-ai="0">Manage My Privacy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/preferences/start/" target="_blank" rel="noopener"
+            data-cms-ai="0">Do Not Sell or Share My Data</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/" target="_blank"
+            rel="noopener" data-cms-ai="0">Terms of Service</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/" target="_blank" rel="noopener"
+            data-cms-ai="0">Accessibility</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/" target="_blank"
+            rel="noopener" data-cms-ai="0">Corporate Policies</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/product-security/" target="_blank" rel="noopener"
+            data-cms-ai="0">Product Security</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/contact/" target="_blank" rel="noopener"
+            data-cms-ai="0">Contact</a>
+    </p>
+</div>
+
+
   </div>
 
-  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
-    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
-    provided by <a href="https://readthedocs.org">Read the Docs</a>.
    
 
 </footer>

@@ -91,14 +91,14 @@ Though there are some limitations and pitfalls of doing these custom weights loa
 
 ## Quantization APIs
 
-TensorRT-LLM relies on NVIDIA AMMO toolkit to support some of the quantization like: FP8, W4A16_AWQ, W4A8_AWQ, while it also has some its own quantization implementation for Smooth Quant, INT8 KV cache, and INT4/INT8 weight only.
+TensorRT-LLM relies on NVIDIA Modelopt toolkit to support some of the quantization like: FP8, W4A16_AWQ, W4A8_AWQ, while it also has some its own quantization implementation for Smooth Quant, INT8 KV cache, and INT4/INT8 weight only.
 
 
 In TensorRT-LLM 0.8 version:
 
-* For AMMO-supported quantization algorithms, a standalone script in the example folder [quantize.py](../../examples/quantization/quantize.py) shall be executed to export TensorRT-LLM checkpoints, and the trtllm-build command needs to be executed to build the checkpoints to engines.
+* For Modelopt-supported quantization algorithms, a standalone script in the example folder [quantize.py](../../examples/quantization/quantize.py) shall be executed to export TensorRT-LLM checkpoints, and the trtllm-build command needs to be executed to build the checkpoints to engines.
 
-* For the non-AMMO quantization algorithms, users need to use the per-model convert_checkpoint.py scripts to export TensorRT-LLM checkpoints.
+* For the non-Modelopt quantization algorithms, users need to use the per-model convert_checkpoint.py scripts to export TensorRT-LLM checkpoints.
 
 Use the `quantize()` interface to unify the different quantization flows. The default implementation is added in the `PretrainedModel` class.
 
@@ -112,14 +112,14 @@ class PretrainedModel:
         output_dir,
         quant_config: QuantConfig,
         mapping: Optional[Mapping] = None): #some args are omitted here
-        # Internally quantize the given hugging face models using AMMO
+        # Internally quantize the given hugging face models using Modelopt
         # and save the checkpoint to output_dir
 ```
 
 ```{note}
 
-* The default implementation only handles the AMMO supported quantization. The LLaMA class then inherits this `PretrainedModel` and dispatches the AMMO quantization to the super class's default implementation.
-* The model developer raises errors in the sub-class implementation if the new model is not supported by AMMO yet.
+* The default implementation only handles the Modelopt supported quantization. The LLaMA class then inherits this `PretrainedModel` and dispatches the Modelopt quantization to the super class's default implementation.
+* The model developer raises errors in the sub-class implementation if the new model is not supported by Modelopt yet.
 
 
 ```python
@@ -131,8 +131,8 @@ class LLaMAForCausalLM:
         output_dir,
         quant_config: QuantiConfig,
         mapping: Optional[Mapping] = None): #some args are omitted here
-        use_ammo_quantization = ... # determine if to use AMMO or use native
-        if use_ammo_quantization:
+        use_modelopt_quantization = ... # determine if to use Modelopt or use native
+        if use_modelopt_quantization:
             super().quantize(hf_model_dir,
                              output_dir,
                              quant_config)
