@@ -163,9 +163,6 @@ class FalconModel(Module):
                 kv_cache_params=None,
                 attention_params=None,
                 hidden_states=None):
-        if use_cache:
-            presents = []
-
         if self.config.mapping.is_first_pp_rank():
             hidden_states = self.vocab_embedding(input_ids)
         else:
@@ -197,9 +194,10 @@ class FalconForCausalLM(DecoderModelForCausalLM):
     def __init__(self, config: PretrainedConfig):
         self.check_config(config)
         transformer = FalconModel(config)
-        vocab_size_padded = pad_vocab_size(config.vocab_size,
-                                           config.mapping.tp_size)
+
         if config.mapping.is_last_pp_rank():
+            vocab_size_padded = pad_vocab_size(config.vocab_size,
+                                               config.mapping.tp_size)
             lm_head = ColumnLinear(config.hidden_size,
                                    vocab_size_padded,
                                    bias=False,

@@ -112,9 +112,9 @@ Building command is identical to the common one above.
 
 #### FP8 Post-Training Quantization
 
-The examples below uses the NVIDIA AMMO (AlgorithMic Model Optimization) toolkit for the model quantization process.
+The examples below uses the NVIDIA Modelopt (AlgorithMic Model Optimization) toolkit for the model quantization process.
 
-First make sure AMMO toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
+First make sure Modelopt toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
 
 One can quantize HF GPT-J weights in FP8 as follows.
 
@@ -180,7 +180,7 @@ Note `--context_fmha` / `--context_fmha_fp32_acc` has to be used together with `
 #### INT8 KV cache
 INT8 KV cache could be enabled to reduce memory footprint. It will bring more performance gains when batch size gets larger.
 
-You can get the INT8 scale of KV cache through AMMO:
+You can get the INT8 scale of KV cache through Modelopt:
 
 ```bash
 # INT8 calibration

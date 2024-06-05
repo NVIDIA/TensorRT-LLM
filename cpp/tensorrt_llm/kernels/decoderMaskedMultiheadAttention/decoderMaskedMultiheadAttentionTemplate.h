@@ -1639,15 +1639,16 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         if (HANDLE_KV)
         {
             apply_rotary_embedding(q, k, tidx, params.rotary_embedding_dim, rotary_embedding_base,
-                rotary_embedding_scale, current_pos_idx);
+                rotary_embedding_scale, 0, nullptr, current_pos_idx);
         }
         else
         {
-            apply_rotary_embedding(
-                q, tidx, params.rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale, current_pos_idx);
+            apply_rotary_embedding(q, tidx, params.rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale,
+                0, nullptr, current_pos_idx);
         }
         break;
     }
+    case PositionEmbeddingType::kLONG_ROPE:
     case PositionEmbeddingType::kROPE_GPT_NEOX:
     {
         bool const do_rotary = is_valid_qk_vec && QK_VEC_SIZE * tidx < params.rotary_embedding_dim;
@@ -1683,14 +1684,18 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
                 mmha::vec_from_smem_transpose(k, k_smem_, transpose_idx, smem_pitch);
 
                 mmha::apply_rotary_embedding(q, k, transpose_idx / tidx_factor, params.rotary_embedding_dim,
-                    rotary_embedding_base, rotary_embedding_scale, current_pos_idx);
+                    rotary_embedding_base, rotary_embedding_scale, params.rotary_embedding_m_scale,
+                    params.rotary_embedding_scaling_factors, current_pos_idx, params.rotary_cogvlm_vision_start,
+                    params.rotary_cogvlm_vision_length);
 
                 mmha::write_smem_transpose(k, k_smem_, transpose_idx, smem_pitch);
             }
             else
             {
                 mmha::apply_rotary_embedding(q, transpose_idx / tidx_factor, params.rotary_embedding_dim,
-                    rotary_embedding_base, rotary_embedding_scale, current_pos_idx);
+                    rotary_embedding_base, rotary_embedding_scale, params.rotary_embedding_m_scale,
+                    params.rotary_embedding_scaling_factors, current_pos_idx, params.rotary_cogvlm_vision_start,
+                    params.rotary_cogvlm_vision_length);
             }
             mmha::write_smem_transpose(q, q_smem_, transpose_idx, smem_pitch);
         }
@@ -1963,9 +1968,10 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
                 int num_buckets = relative_attention_bias_stride;
                 // Special logic in T5 relative attention, both encoder & decoder use this, because
                 // relative_attention_bias is pre-computed once and passed around.
-                num_buckets /= 2;
-                relative_buckets += relative_position > 0 ? num_buckets : 0;
-                relative_position = abs(relative_position);
+                // T5 decoder attention now only uses bidirectional=False relative position logic
+                // (ref: tensorrt_llm/layers/attention.py compute_relative_bias())
+                relative_position = relative_position >= 0 ? 0 : -relative_position;
+
                 int max_exact = num_buckets / 2;
                 bool is_small = relative_position < max_exact;
                 int relative_position_if_large = max_exact
@@ -2092,9 +2098,10 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
                 int num_buckets = relative_attention_bias_stride;
                 // Special logic in T5 relative attention, both encoder & decoder use this, because
                 // relative_attention_bias is pre-computed once and passed around.
-                num_buckets /= 2;
-                relative_buckets += relative_position > 0 ? num_buckets : 0;
-                relative_position = abs(relative_position);
+                // T5 decoder attention now only uses bidirectional=False relative position logic
+                // (ref: tensorrt_llm/layers/attention.py compute_relative_bias())
+                relative_position = relative_position >= 0 ? 0 : -relative_position;
+
                 int max_exact = num_buckets / 2;
                 bool is_small = relative_position < max_exact;
                 int relative_position_if_large = max_exact

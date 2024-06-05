@@ -30,23 +30,23 @@ embedding() (i.e.add_gather() operation in TensorRT). As only a portion of embed
 add_gather() operation in TensorRT cannot get the correct results. So, we need to write a plugin to add an offset to
 input IDs and get the correct results.
 
- * Input: Input IDs (input[batch_size])
+ * Input: Input IDs (input[token_num])
    Input: Embedding Lookup Table (weight[ceil(vocab_size/world_size), hidden])
    Output: weight[input[idx]-offset,hidden]
 
- * The total thread number equals to batch_size*hidden
+ * The total thread number equals to token_num*hidden
  *
  * If the input ids is out of range it writes zero, otherwise it writes the correct embedding result.
  */
 template <typename T, typename Idx>
-__global__ void lookup_kernel(T* output, Idx const* input, T const* weight, const Idx batch_size, const Idx offset,
-    const Idx size, int const n_embed)
+__global__ void lookup_kernel(T* output, Idx const* input, T const* weight, int64_t const token_num, Idx const offset,
+    Idx const size, Idx const n_embed)
 {
-    for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < batch_size * n_embed;
+    for (int64_t index = blockIdx.x * blockDim.x + threadIdx.x; index < token_num * n_embed;
          index += blockDim.x * gridDim.x)
     {
-        int const word_index = input[index / n_embed] - offset;
-        int const col_index = index % n_embed;
+        int64_t const word_index = input[index / n_embed] - offset;
+        Idx const col_index = index % n_embed;
         T embedding;
         if (word_index < 0 || word_index >= size)
         {
@@ -61,17 +61,19 @@ __global__ void lookup_kernel(T* output, Idx const* input, T const* weight, cons
 }
 
 template <typename T, typename Idx>
-void invokeLookUp(T* out, Idx const* input, T const* weight, const Idx batch_size, const Idx offset, const Idx size,
-    int const n_embed, cudaStream_t stream)
+void invokeLookUp(T* out, Idx const* input, T const* weight, int64_t const token_num, Idx const offset, Idx const size,
+    Idx const n_embed, cudaStream_t stream)
 {
-    dim3 grid(min(batch_size, 65536));
-    dim3 block(min(n_embed, 512));
-    lookup_kernel<T, Idx><<<grid, block, 0, stream>>>(out, input, weight, batch_size, offset, size, n_embed);
+    int64_t constexpr max_block_num = 65536;
+    Idx constexpr max_block_size = 512;
+    dim3 grid(min(token_num, max_block_num));
+    dim3 block(min(n_embed, max_block_size));
+    lookup_kernel<T, Idx><<<grid, block, 0, stream>>>(out, input, weight, token_num, offset, size, n_embed);
 }
 
 #define INSTANTIATE_LOOK_UP(T, Idx)                                                                                    \
-    template void invokeLookUp<T, Idx>(T * out, const Idx* input, const T* weight, const Idx batch_size,               \
-        const Idx offset, const Idx size, const int n_embed, cudaStream_t stream)
+    template void invokeLookUp<T, Idx>(T * out, Idx const* input, T const* weight, int64_t const token_num,            \
+        Idx const offset, Idx const size, Idx const n_embed, cudaStream_t stream)
 
 INSTANTIATE_LOOK_UP(float, int);
 INSTANTIATE_LOOK_UP(half, int);

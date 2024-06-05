@@ -24,7 +24,7 @@ namespace cutlass_kernels
 {
 #ifdef ENABLE_FP8
 template class CutlassFpAIntBGemmRunner<__nv_fp8_e4m3,        /*Activation Type*/
-    cutlass::int4b_t,                                         /*Weight Type*/
+    cutlass::uint4b_t,                                        /*Weight Type*/
     cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY, half, /*Scale and Zero Type*/
     half,                                                     /*Bias type Type*/
     half                                                      /*Output type Type*/

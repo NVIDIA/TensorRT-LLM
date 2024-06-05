@@ -90,7 +90,7 @@ protected:
 TEST_F(TllmRuntimeTest, SinglePass)
 {
     EXPECT_TRUE(mSerializedEngine);
-    TllmRuntime rt{*mSerializedEngine, mLogger};
+    TllmRuntime rt{*mSerializedEngine, 1.0F, mLogger};
     auto& engine = rt.getEngine();
     EXPECT_FALSE(engine.hasImplicitBatchDimension());
     EXPECT_EQ(rt.getNbProfiles(), engine.getNbOptimizationProfiles());

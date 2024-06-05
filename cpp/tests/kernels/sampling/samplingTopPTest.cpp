@@ -51,29 +51,28 @@ private:
     {
         auto const maxBatchSize = 2 * params.batchSize;
 
-        // Perform batched TopP sampling
-        tk::invokeTopPInitialize(bufferCast<int32_t>(*this->mTopPIdValsDevice),
-            bufferCast<int32_t>(*this->mEndOffsetsDevice), bufferCast<int32_t>(*this->mBeginOffsetsDevice),
-            params.batchSize, params.vocabSize, this->mStream->get());
+        tk::TopPSamplingKernelParams<T> kernelParams;
+        kernelParams.probs = bufferCast<T>(*this->mProbsDevice);
+        kernelParams.outputIds = bufferCast<int*>(*this->mIdsPtrHost);
+        kernelParams.workspace = workspaceDevice->data();
+        kernelParams.topPs = bufferCast<float>(*this->mTopPsDevice);
+        kernelParams.sequenceLength = bufferCast<int32_t>(*this->mSeqLengthsDevice);
+        kernelParams.endIds = bufferCast<int32_t>(*this->mEndIdsDevice);
+        kernelParams.batchSlots = bufferCast<int32_t>(*this->mBatchSlots);
+        kernelParams.finishedInput = reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
+            bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(*this->mFinishedDevice));
+        kernelParams.finishedOutput = reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
+            bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(*this->mFinishedDevice));
+        kernelParams.skipDecode = bufferCast<bool>(*this->mSkipDecodeDevice);
+        kernelParams.cumLogProbs = bufferCast<float>(*this->mCumLogProbsDevice);
+        kernelParams.outputLogProbs = bufferCast<float>(*this->mOutputLogProbsDevice);
+        kernelParams.curandState = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*this->mCurandStatesDevice));
+        kernelParams.batchSize = params.batchSize;
+        kernelParams.maxBatchSize = maxBatchSize;
+        kernelParams.vocabSizePadded = params.vocabSize;
 
         // Perform batched TopP sampling
-        tk::invokeBatchTopPSampling<T>(workspaceDevice->data(), bufferCast<int*>(*this->mIdsPtrHost),
-            bufferCast<int32_t>(*this->mSeqLengthsDevice),
-            reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
-                bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(*this->mFinishedDevice)),
-            reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
-                bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(*this->mFinishedDevice)),
-            bufferCast<float>(*this->mCumLogProbsDevice), bufferCast<float>(*this->mOutputLogProbsDevice),
-            // Note that the kernel needs vocab probs instead of
-            // log-prob if cum_log_probs or output_log_probs are
-            // provided. It's because the sampling layer already
-            // preprocesses log_prob_buf when those are provided.
-            bufferCast<T>(*this->mProbsDevice), bufferCast<int32_t>(*this->mTopPIdValsDevice),
-            bufferCast<int32_t>(*this->mEndOffsetsDevice), bufferCast<int32_t>(*this->mBeginOffsetsDevice),
-            reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*this->mCurandStatesDevice)), params.batchSize,
-            maxBatchSize, params.vocabSize, bufferCast<int32_t>(*this->mEndIdsDevice), this->mMaxTopP,
-            bufferCast<float>(*this->mTopPsDevice), this->mStream->get(), bufferCast<bool>(*this->mSkipDecodeDevice),
-            bufferCast<int32_t>(*this->mBatchSlots));
+        tk::invokeBatchTopPSampling<T>(kernelParams, this->mStream->get());
     }
 };
 
@@ -103,48 +102,4 @@ TYPED_TEST(TopPSamplingKernelTest, CorrectnessLargeVocabLargeP)
 {
     this->runTest(SamplingKernelTestParam().setBatchSize(32).setVocabSize(51200).setTopP(0.9f));
 };
-
-class TopPSamplingKernelUtilsTest : public SamplingKernelTest<float>
-{
-};
-
-TEST_F(TopPSamplingKernelUtilsTest, invokeTopPInitialize)
-{
-    const int32_t batchSize = 8;
-    const int32_t vocabSize = 256;
-
-    auto const topPIdValsDevice
-        = this->mBufferManager->gpu(ITensor::makeShape({batchSize, vocabSize}), nvinfer1::DataType::kINT32);
-    auto const beginOffsetsDevice
-        = this->mBufferManager->gpu(ITensor::makeShape({batchSize + 1}), nvinfer1::DataType::kINT32);
-    auto const endOffsetsDevice
-        = this->mBufferManager->gpu(ITensor::makeShape({batchSize + 1}), nvinfer1::DataType::kINT32);
-
-    tk::invokeTopPInitialize(bufferCast<int32_t>(*topPIdValsDevice), bufferCast<int32_t>(*endOffsetsDevice),
-        bufferCast<int32_t>(*beginOffsetsDevice), batchSize, vocabSize, this->mStream->get());
-
-    auto const topPIdValsHost = this->mBufferManager->copyFrom(*topPIdValsDevice, MemoryType::kCPU);
-    auto const endOffsetsHost = this->mBufferManager->copyFrom(*endOffsetsDevice, MemoryType::kCPU);
-    auto const beginOffsetsHost = this->mBufferManager->copyFrom(*beginOffsetsDevice, MemoryType::kCPU);
-
-    this->mStream->synchronize();
-
-    auto const topPIdValsHostPtr = bufferCast<int32_t>(*topPIdValsHost);
-    auto const endOffsetsHostPtr = bufferCast<int32_t>(*endOffsetsHost);
-    auto const beginOffsetsHostPtr = bufferCast<int32_t>(*beginOffsetsHost);
-
-    for (int32_t bi = 0; bi < batchSize + 1; ++bi)
-    {
-        EXPECT_EQ(endOffsetsHostPtr[bi], bi * vocabSize);
-        EXPECT_EQ(beginOffsetsHostPtr[bi], bi * vocabSize);
-    }
-    for (int32_t bi = 0; bi < batchSize; ++bi)
-    {
-        for (int32_t vi = 0; vi < vocabSize; ++vi)
-        {
-            EXPECT_EQ(topPIdValsHostPtr[bi * vocabSize + vi], vi);
-        }
-    }
-};
-
 } // end of namespace

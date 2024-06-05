@@ -24,10 +24,12 @@ from tensorrt_llm import str_dtype_to_torch, str_dtype_to_trt
 from tensorrt_llm.builder import Builder
 from tensorrt_llm.functional import LayerNormPositionType, LayerNormType
 from tensorrt_llm.logger import logger
-from tensorrt_llm.models import quantize_model
+from tensorrt_llm.models import PretrainedConfig
+from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
-from tensorrt_llm.quantization import QuantMode
+from tensorrt_llm.quantization import QuantAlgo
+from tensorrt_llm.quantization.quantize import quantize
 
 MODEL_ENCODER_NAME = "whisper_encoder"
 MODEL_DECODER_NAME = "whisper_decoder"
@@ -164,16 +166,17 @@ def parse_arguments():
             )
             setattr(args, plugin_arg, args.dtype)
 
+    quant_algo = None
+    kv_cache_quant_algo = None
     if args.use_weight_only:
-        args.quant_mode = QuantMode.from_description(
-            quantize_weights=True,
-            quantize_activations=False,
-            use_int4_weights="int4" in args.weight_only_precision)
-    else:
-        args.quant_mode = QuantMode(0)
-
+        if "int4" in args.weight_only_precision:
+            quant_algo = QuantAlgo.W4A16
+        else:
+            quant_algo = QuantAlgo.W8A16
     if args.int8_kv_cache:
-        args.quant_mode = args.quant_mode.set_int8_kv_cache()
+        kv_cache_quant_algo = QuantAlgo.INT8
+    args.quant_config = QuantConfig(quant_algo=quant_algo,
+                                    kv_cache_quant_algo=kv_cache_quant_algo)
 
     return args
 
@@ -204,7 +207,7 @@ def build_encoder(model, args):
         hidden_size=hidden_states,
         max_batch_size=max_batch_size,
         max_beam_width=args.max_beam_width,
-        int8=args.quant_mode.has_act_or_weight_quant(),
+        int8=args.quant_config.quant_mode.has_act_or_weight_quant(),
         n_mels=model_metadata['n_mels'],
         num_languages=model_metadata['n_vocab'] - 51765 -
         int(model_is_multilingual),
@@ -216,8 +219,8 @@ def build_encoder(model, args):
         model_metadata['n_audio_layer'], str_dtype_to_trt(args.dtype))
 
     if args.use_weight_only:
-        tensorrt_llm_whisper_encoder = quantize_model(
-            tensorrt_llm_whisper_encoder, args.quant_mode)
+        tensorrt_llm_whisper_encoder = quantize(tensorrt_llm_whisper_encoder,
+                                                args.quant_config)
     use_gemm_woq_plugin = args.use_gemm_plugin and args.use_weight_only
 
     load_encoder_weight(tensorrt_llm_whisper_encoder, model_metadata,
@@ -294,41 +297,82 @@ def build_decoder(model, args):
         cross_attention=True,
         has_position_embedding=True,
         has_token_type_embedding=False,
-        int8=args.quant_mode.has_act_or_weight_quant(),
+        int8=args.quant_config.quant_mode.has_act_or_weight_quant(),
     )
-
-    tensorrt_llm_whisper_decoder = tensorrt_llm.models.DecoderModel(
-        num_layers=model_metadata['n_text_layer'],
-        num_heads=model_metadata['n_text_head'],
-        hidden_size=model_metadata['n_text_state'],
-        ffn_hidden_size=4 * model_metadata['n_text_state'],
-        encoder_hidden_size=model_metadata['n_text_state'],
-        encoder_num_heads=model_metadata['n_text_head'],
-        vocab_size=model_metadata['n_vocab'],
-        head_size=model_metadata['n_text_state'] //
+    pretrained_config = PretrainedConfig.from_dict({
+        'architecture':
+        "DecoderModel",
+        'dtype':
+        args.dtype,
+        'logits_dtype':
+        args.dtype,
+        'num_hidden_layers':
+        model_metadata['n_text_layer'],
+        'num_attention_heads':
         model_metadata['n_text_head'],
-        max_position_embeddings=model_metadata['n_text_ctx'],
-        has_position_embedding=True,
-        relative_attention=False,
-        max_distance=0,
-        num_buckets=0,
-        has_embedding_layernorm=False,
-        has_embedding_scale=False,
-        q_scaling=1.0,
-        has_attention_qkvo_bias=True,
-        has_mlp_bias=True,
-        has_model_final_layernorm=True,
-        layernorm_eps=1e-5,
-        layernorm_position=LayerNormPositionType.pre_layernorm,
-        layernorm_type=LayerNormType.LayerNorm,
-        hidden_act="gelu",
-        rescale_before_lm_head=False,
-        dtype=str_dtype_to_trt(args.dtype),
-        logits_dtype=str_dtype_to_trt(args.dtype))
+        'hidden_size':
+        model_metadata['n_text_state'],
+        'norm_epsilon':
+        1e-5,
+        'vocab_size':
+        model_metadata['n_vocab'],
+        'hidden_act':
+        "gelu",
+        'use_parallel_embedding':
+        False,
+        'embedding_sharding_dim':
+        0,
+        'max_position_embeddings':
+        model_metadata['n_text_ctx'],
+        'use_prompt_tuning':
+        False,
+        'head_size':
+        model_metadata['n_text_state'] // model_metadata['n_text_head'],
+        'has_position_embedding':
+        True,
+        'layernorm_type':
+        LayerNormType.LayerNorm,
+        'has_attention_qkvo_bias':
+        True,
+        'has_mlp_bias':
+        True,
+        'has_model_final_layernorm':
+        True,
+        'has_embedding_layernorm':
+        False,
+        'has_embedding_scale':
+        False,
+        'ffn_hidden_size':
+        4 * model_metadata['n_text_state'],
+        'q_scaling':
+        1.0,
+        'layernorm_position':
+        LayerNormPositionType.pre_layernorm,
+        'relative_attention':
+        False,
+        'max_distance':
+        0,
+        'num_buckets':
+        0,
+        'model_type':
+        'whisper',
+        'rescale_before_lm_head':
+        False,
+        'encoder_hidden_size':
+        model_metadata['n_text_state'],
+        'encoder_num_heads':
+        model_metadata['n_text_head'],
+        'encoder_head_size':
+        None,
+        'skip_cross_qkv':
+        False,
+    })
+    tensorrt_llm_whisper_decoder = tensorrt_llm.models.DecoderModel(
+        pretrained_config)
 
     if args.use_weight_only:
-        tensorrt_llm_whisper_decoder = quantize_model(
-            tensorrt_llm_whisper_decoder, args.quant_mode)
+        tensorrt_llm_whisper_decoder = quantize(tensorrt_llm_whisper_decoder,
+                                                args.quant_config)
     use_gemm_woq_plugin = args.use_gemm_plugin and args.use_weight_only
 
     load_decoder_weight(tensorrt_llm_whisper_decoder, model_params,
@@ -359,7 +403,7 @@ def build_decoder(model, args):
             model_metadata['n_audio_ctx'],
         )
 
-        tensorrt_llm_whisper_decoder(*inputs)
+        tensorrt_llm_whisper_decoder(**inputs)
 
         if args.debug_mode:
             for k, v in tensorrt_llm_whisper_decoder.named_network_outputs():

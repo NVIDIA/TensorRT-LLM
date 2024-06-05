@@ -66,7 +66,7 @@ void sm90_generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType 
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
 
-#ifdef COMPILE_HOPPER_MIXED_INPUT_GEMMS
+#ifdef COMPILE_HOPPER_TMA_GEMMS
     using CutlassActivationType = typename TllmToCutlassTypeAdapter<ActivationType>::type;
 
 // For FAST_BUILD, only instantiate kernels with 128x128x128B with 1x1x1 cluster shape.
@@ -286,11 +286,11 @@ void sm90_generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType 
     }
 #endif // FAST_BUILD
 
-#else  // COMPILE_HOPPER_MIXED_INPUT_GEMMS
+#else  // COMPILE_HOPPER_TMA_GEMMS
     throw std::runtime_error(
         "[TensorRT-LLm Error][fpA_intB Runner] Please recompile with support for hopper by passing 90-real as an arch "
         "to build_wheel.py.");
-#endif // COMPILE_HOPPER_MIXED_INPUT_GEMMS
+#endif // COMPILE_HOPPER_TMA_GEMMS
 }
 
 } // namespace cutlass_kernels

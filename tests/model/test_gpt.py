@@ -178,6 +178,8 @@ class TestGPT(unittest.TestCase):
 
     @parameterized.expand([("other", False)], name_func=unittest_name_func)
     def test_gpt_float32(self, test_partition, use_refit):
+        torch.manual_seed(42)
+
         model = 'gpt'
         log_level = 'error'
         dtype = 'float32'
@@ -453,29 +455,37 @@ class TestGPT(unittest.TestCase):
         value_cache_buffers = []
         head_size = gpt_config.n_embd // gpt_config.n_head
 
-        for i in range(gpt_config.n_layer):
-            if enable_paged_kv_cache:
-                blocks = batch_size * beam_width * math.ceil(
-                    total_length / tokens_per_block)
-                cache_shape = (
-                    blocks,
-                    2,
-                    gpt_config.n_head,
-                    tokens_per_block,
-                    head_size,
-                )
-            else:
-                cache_shape = (
-                    batch_size,
-                    2,
-                    gpt_config.n_head,
-                    total_length,
-                    head_size,
-                )
+        if enable_paged_kv_cache:
+            num_blocks = batch_size * beam_width * math.ceil(
+                total_length / tokens_per_block)
+            cache_shape = (
+                num_blocks,
+                gpt_config.n_layer,
+                2,
+                gpt_config.n_head,
+                tokens_per_block,
+                head_size,
+            )
             key_value_cache_buffers.append(
                 torch.zeros(cache_shape,
                             dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
                             device='cuda'))
+        else:
+            cache_shape = (
+                batch_size,
+                2,
+                gpt_config.n_head,
+                total_length,
+                head_size,
+            )
+            for _ in range(gpt_config.n_layer):
+                key_value_cache_buffers.append(
+                    torch.zeros(
+                        cache_shape,
+                        dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
+                        device='cuda'))
+
+        for _ in range(gpt_config.n_layer):
             value_cache_buffers.append(
                 torch.zeros((
                     batch_size,
@@ -507,11 +517,19 @@ class TestGPT(unittest.TestCase):
 
         if enable_paged_kv_cache:
             max_blocks_per_seq = math.ceil(total_length / tokens_per_block)
-            blocks = batch_size * beam_width * max_blocks_per_seq
-            kv_cache_manager = KVCacheManager(key_value_cache_buffers, blocks,
-                                              tokens_per_block,
-                                              max_blocks_per_seq, total_length,
-                                              0, beam_width)
+            num_blocks = batch_size * beam_width * max_blocks_per_seq
+            block_size = gpt_config.n_head * tokens_per_block * head_size
+            kv_cache_manager = KVCacheManager(
+                num_layers=gpt_config.n_layer,
+                num_blocks=num_blocks,
+                block_size=block_size,
+                tokens_per_block=tokens_per_block,
+                max_blocks_per_seq=max_blocks_per_seq,
+                max_attention_window_size=total_length,
+                sink_token_len=0,
+                beam_width=beam_width)
+            host_kv_cache_pool_pointers = torch.tensor(
+                [key_value_cache_buffers[0].data_ptr(), 0], dtype=torch.int64)
 
             # Add sequences to the manager
             for bi in range(batch_size):
@@ -555,19 +573,21 @@ class TestGPT(unittest.TestCase):
             if enable_paged_kv_cache:
                 assert beam_width == 1
                 # for beam_width > 1 the argument must be '1' in ctx phase and 'beam_width' in gen phase
-                host_kv_cache_block_pointers = kv_cache_manager.get_block_pointers(
-                    1)
-                kv_cache_block_pointers = host_kv_cache_block_pointers.to(
-                    'cuda')
+                host_kv_cache_block_offsets = kv_cache_manager.get_block_offsets(
+                    beam_width=1)
+                kv_cache_block_offsets = host_kv_cache_block_offsets.to('cuda')
 
-                shape = kv_cache_block_pointers.shape
+                shape = kv_cache_block_offsets.shape
                 shape = [shape[0], shape[1] * shape[2], *shape[3:]]
                 ctx_buffer[
-                    f'kv_cache_block_pointers'] = kv_cache_block_pointers.reshape(
+                    f'kv_cache_block_offsets'] = kv_cache_block_offsets.reshape(
                         shape).contiguous()
                 ctx_buffer[
-                    f'host_kv_cache_block_pointers'] = host_kv_cache_block_pointers.reshape(
+                    f'host_kv_cache_block_offsets'] = host_kv_cache_block_offsets.reshape(
                         shape).contiguous()
+                ctx_buffer[
+                    f'host_kv_cache_pool_pointers'] = host_kv_cache_pool_pointers.contiguous(
+                    )
                 ctx_buffer[
                     f'host_max_attention_window_sizes'] = host_max_attention_window_sizes
             else:
@@ -829,6 +849,8 @@ class TestGPT(unittest.TestCase):
     @parameterized.expand([("other", False, False), ("other", False, True)],
                           name_func=unittest_name_func)
     def test_greedy_search_float32(self, test_partition, use_refit, streaming):
+        torch.manual_seed(42)
+
         model = 'gpt'
         log_level = 'error'
         dtype = 'float32'

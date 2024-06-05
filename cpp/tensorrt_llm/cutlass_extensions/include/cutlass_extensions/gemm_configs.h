@@ -111,6 +111,16 @@ enum class ClusterShape
 
 struct CutlassGemmConfig
 {
+    enum CandidateConfigTypeParam : int
+    {
+        NONE = 0,
+        WEIGHT_ONLY = 1u << 0,
+        SIMT_ONLY = 1u << 1,
+        INT8_ONLY = 1u << 2,
+        HOPPER = 1u << 3,
+        GROUPED_GEMM = 1u << 4,
+    };
+
     CutlassTileConfig tile_config = CutlassTileConfig::ChooseWithHeuristic;
     SplitKStyle split_k_style = SplitKStyle::NO_SPLIT_K;
     int split_k_factor = -1;
@@ -121,6 +131,7 @@ struct CutlassGemmConfig
     MainloopScheduleType mainloop_schedule = MainloopScheduleType::AUTO;
     EpilogueScheduleType epilogue_schedule = EpilogueScheduleType::AUTO;
     ClusterShape cluster_shape = ClusterShape::ClusterShape_1x1x1;
+    bool is_sm90 = false;
 
     CutlassGemmConfig() {}
 
@@ -129,6 +140,7 @@ struct CutlassGemmConfig
         , split_k_style(split_k_style)
         , split_k_factor(split_k_factor)
         , stages(stages)
+        , is_sm90(false)
     {
     }
 
@@ -138,6 +150,7 @@ struct CutlassGemmConfig
         , mainloop_schedule(mainloop_schedule)
         , epilogue_schedule(epilogue_schedule)
         , cluster_shape(cluster_shape)
+        , is_sm90(true)
     {
     }
 };

@@ -118,15 +118,15 @@ int LookupPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1:
     void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
 {
     // inputs
-    //     input  [batchSize]
+    //     input  [tokenNum]
     //     weight [localVocabSize, hidden]
     // outputs
-    //     embedding [batchSize, hidden]
+    //     embedding [tokenNum, hidden]
 
-    int batchSize = 1;
+    int64_t tokenNum = 1;
     for (int i = 0; i < inputDesc[0].dims.nbDims; ++i)
     {
-        batchSize *= inputDesc[0].dims.d[i];
+        tokenNum *= inputDesc[0].dims.d[i];
     }
 
     int const localVocabSize = inputDesc[1].dims.d[0];
@@ -139,19 +139,19 @@ int LookupPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1:
     {
         half const* weight = reinterpret_cast<half const*>(inputs[1]);
         half* output = reinterpret_cast<half*>(outputs[0]);
-        invokeLookUp<half, int>(output, input, weight, batchSize, offset, localVocabSize, hidden, stream);
+        invokeLookUp<half, int>(output, input, weight, tokenNum, offset, localVocabSize, hidden, stream);
     }
     else if (mType == DataType::kFLOAT)
     {
         float const* weight = reinterpret_cast<float const*>(inputs[1]);
         float* output = reinterpret_cast<float*>(outputs[0]);
-        invokeLookUp<float, int>(output, input, weight, batchSize, offset, localVocabSize, hidden, stream);
+        invokeLookUp<float, int>(output, input, weight, tokenNum, offset, localVocabSize, hidden, stream);
     }
     else if (mType == DataType::kBF16)
     {
         __nv_bfloat16 const* weight = reinterpret_cast<__nv_bfloat16 const*>(inputs[1]);
         __nv_bfloat16* output = reinterpret_cast<__nv_bfloat16*>(outputs[0]);
-        invokeLookUp<__nv_bfloat16, int>(output, input, weight, batchSize, offset, localVocabSize, hidden, stream);
+        invokeLookUp<__nv_bfloat16, int>(output, input, weight, tokenNum, offset, localVocabSize, hidden, stream);
     }
 
     return 0;

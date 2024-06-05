@@ -52,6 +52,7 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
   * PAGED_KV_CACHE
   * FP8 KV CACHE
   * Tensor Parallel
+  * Pipeline Parallel
   * STRONGLY TYPED
   * INT8 SmoothQuant
   * INT8 weight only
@@ -90,6 +91,13 @@ python3 convert_checkpoint.py --model_dir gpt2 \
         --dtype float16 \
         --tp_size 2 \
         --output_dir gpt2/trt_ckpt/fp16/2-gpu
+
+# 2-way tensor parallelism and 2-way pipeline parallelism
+python3 convert_checkpoint.py --model_dir gpt2 \
+        --dtype float16 \
+        --tp_size 2 \
+        --pp_size 2 \
+        --output_dir gpt2/trt_ckpt/fp16/4-gpu
 ```
 
 ### 3. Build TensorRT engine(s)
@@ -111,6 +119,12 @@ trtllm-build --checkpoint_dir gpt2/trt_ckpt/fp16/2-gpu \
         --gpt_attention_plugin float16 \
         --remove_input_padding enable \
         --output_dir gpt2/trt_engines/fp16/2-gpu
+
+# Build 2-way tensor parallelism and 2-way pipeline parallelism engines from TensorRT-LLM checkpoint.
+trtllm-build --checkpoint_dir gpt2/trt_ckpt/fp16/4-gpu \
+        --gpt_attention_plugin float16 \
+        --remove_input_padding enable \
+        --output_dir gpt2/trt_engines/fp16/4-gpu
 ```
 
 If the engines are built successfully, you will see output like:

@@ -16,11 +16,11 @@
  */
 #ifndef TRT_GEMM_PLUGIN_H
 #define TRT_GEMM_PLUGIN_H
+
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/plugins/common/gemmPluginProfiler.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
-#include <cassert>
-#include <set>
+
 #include <string>
 #include <vector>
 

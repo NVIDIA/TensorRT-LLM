@@ -28,7 +28,7 @@ class LoraModule
 public:
     using TensorPtr = ITensor::SharedPtr;
 
-    enum class ModuleType : SizeType
+    enum class ModuleType : SizeType32
     {
         kINVALID = -1,
         kATTN_QKV = 0,
@@ -44,10 +44,14 @@ public:
         kCROSS_ATTN_K = 10,
         kCROSS_ATTN_V = 11,
         kCROSS_ATTN_DENSE = 12,
+        kMOE_H_TO_4H = 13,
+        kMOE_4H_TO_H = 14,
+        kMOE_GATE = 15,
+        kMOE_ROUTER = 16,
     };
 
-    explicit constexpr LoraModule(ModuleType const& t, SizeType inDim, SizeType outDim, bool inDimFirst,
-        bool outDimFirst, SizeType inTpSplitDim, SizeType outTpSplitDim) noexcept
+    explicit constexpr LoraModule(ModuleType const& t, SizeType32 inDim, SizeType32 outDim, bool inDimFirst,
+        bool outDimFirst, SizeType32 inTpSplitDim, SizeType32 outTpSplitDim) noexcept
         : mType(t)
         , mInDim(inDim)
         , mOutDim(outDim)
@@ -66,32 +70,32 @@ public:
     explicit constexpr LoraModule(LoraModule const& o) = default;
     constexpr LoraModule& operator=(LoraModule const& o) = default;
 
-    [[nodiscard]] SizeType constexpr flattenedInOutSize(SizeType adapterSize) const noexcept
+    [[nodiscard]] SizeType32 constexpr flattenedInOutSize(SizeType32 adapterSize) const noexcept
     {
         return adapterSize * (mInDim + mOutDim);
     }
 
-    [[nodiscard]] SizeType constexpr inSize(SizeType adapterSize) const noexcept
+    [[nodiscard]] SizeType32 constexpr inSize(SizeType32 adapterSize) const noexcept
     {
         return adapterSize * mInDim;
     }
 
-    [[nodiscard]] SizeType constexpr outSize(SizeType adapterSize) const noexcept
+    [[nodiscard]] SizeType32 constexpr outSize(SizeType32 adapterSize) const noexcept
     {
         return adapterSize * mOutDim;
     }
 
-    [[nodiscard]] SizeType constexpr localInSize(SizeType adapterSize, SizeType tpSize) const noexcept
+    [[nodiscard]] SizeType32 constexpr localInSize(SizeType32 adapterSize, SizeType32 tpSize) const noexcept
     {
         return localInAdapterSize(adapterSize, tpSize) * localInDim(tpSize);
     }
 
-    [[nodiscard]] SizeType constexpr localOutSize(SizeType adapterSize, SizeType tpSize) const noexcept
+    [[nodiscard]] SizeType32 constexpr localOutSize(SizeType32 adapterSize, SizeType32 tpSize) const noexcept
     {
         return localOutAdapterSize(adapterSize, tpSize) * localOutDim(tpSize);
     }
 
-    [[nodiscard]] SizeType constexpr localInDim(SizeType tpSize) const noexcept
+    [[nodiscard]] SizeType32 constexpr localInDim(SizeType32 tpSize) const noexcept
     {
         if (inTpSplitDim() == 1)
         {
@@ -100,7 +104,7 @@ public:
         return inDim();
     }
 
-    [[nodiscard]] SizeType constexpr localOutDim(SizeType tpSize) const noexcept
+    [[nodiscard]] SizeType32 constexpr localOutDim(SizeType32 tpSize) const noexcept
     {
         if (outTpSplitDim() == 0)
         {
@@ -109,7 +113,7 @@ public:
         return outDim();
     }
 
-    [[nodiscard]] SizeType constexpr localInAdapterSize(SizeType adapterSize, SizeType tpSize) const noexcept
+    [[nodiscard]] SizeType32 constexpr localInAdapterSize(SizeType32 adapterSize, SizeType32 tpSize) const noexcept
     {
         if (inTpSplitDim() == 0)
         {
@@ -118,7 +122,7 @@ public:
         return adapterSize;
     }
 
-    [[nodiscard]] SizeType constexpr localOutAdapterSize(SizeType adapterSize, SizeType tpSize) const noexcept
+    [[nodiscard]] SizeType32 constexpr localOutAdapterSize(SizeType32 adapterSize, SizeType32 tpSize) const noexcept
     {
         if (outTpSplitDim() == 1)
         {
@@ -127,14 +131,14 @@ public:
         return adapterSize;
     }
 
-    [[nodiscard]] SizeType constexpr localInOutSize(SizeType adapterSize, SizeType tpSize) const noexcept
+    [[nodiscard]] SizeType32 constexpr localInOutSize(SizeType32 adapterSize, SizeType32 tpSize) const noexcept
     {
         return localInSize(adapterSize, tpSize) + localOutSize(adapterSize, tpSize);
     }
 
-    [[nodiscard]] SizeType constexpr value() const noexcept
+    [[nodiscard]] SizeType32 constexpr value() const noexcept
     {
-        return static_cast<SizeType>(mType);
+        return static_cast<SizeType32>(mType);
     }
 
     [[nodiscard]] std::string_view constexpr name() const noexcept
@@ -142,12 +146,12 @@ public:
         return toModuleName(mType);
     }
 
-    [[nodiscard]] SizeType constexpr inDim() const noexcept
+    [[nodiscard]] SizeType32 constexpr inDim() const noexcept
     {
         return mInDim;
     }
 
-    [[nodiscard]] SizeType constexpr outDim() const noexcept
+    [[nodiscard]] SizeType32 constexpr outDim() const noexcept
     {
         return mOutDim;
     }
@@ -162,19 +166,19 @@ public:
         return mOutDimFirst;
     }
 
-    [[nodiscard]] SizeType constexpr inTpSplitDim() const noexcept
+    [[nodiscard]] SizeType32 constexpr inTpSplitDim() const noexcept
     {
         return mInTpSplitDim;
     }
 
-    [[nodiscard]] SizeType constexpr outTpSplitDim() const noexcept
+    [[nodiscard]] SizeType32 constexpr outTpSplitDim() const noexcept
     {
         return mOutTpSplitDim;
     }
 
     static std::vector<LoraModule> createLoraModules(std::vector<std::string> const& loraModuleNames,
-        SizeType hiddenSize, SizeType mlpHiddenSize, SizeType numAttentionHeads, SizeType numKvAttentionHeads,
-        SizeType attentionHeadSize, SizeType tpSize);
+        SizeType32 hiddenSize, SizeType32 mlpHiddenSize, SizeType32 numAttentionHeads, SizeType32 numKvAttentionHeads,
+        SizeType32 attentionHeadSize, SizeType32 tpSize);
 
     static ModuleType constexpr toModuleType(std::string_view const& name)
     {
@@ -204,6 +208,14 @@ public:
             return ModuleType::kCROSS_ATTN_V;
         else if (name == "cross_attn_dense")
             return ModuleType::kCROSS_ATTN_DENSE;
+        else if (name == "moe_h_to_4h")
+            return ModuleType::kMOE_H_TO_4H;
+        else if (name == "moe_4h_to_h")
+            return ModuleType::kMOE_4H_TO_H;
+        else if (name == "moe_gate")
+            return ModuleType::kMOE_GATE;
+        else if (name == "moe_router")
+            return ModuleType::kMOE_ROUTER;
         else
             return ModuleType::kINVALID;
     }
@@ -225,12 +237,16 @@ public:
         case ModuleType::kCROSS_ATTN_K: return "cross_attn_k";
         case ModuleType::kCROSS_ATTN_V: return "cross_attn_v";
         case ModuleType::kCROSS_ATTN_DENSE: return "cross_attn_dense";
+        case ModuleType::kMOE_H_TO_4H: return "moe_h_to_4h";
+        case ModuleType::kMOE_4H_TO_H: return "moe_4h_to_h";
+        case ModuleType::kMOE_GATE: return "moe_gate";
+        case ModuleType::kMOE_ROUTER: return "moe_router";
         case ModuleType::kINVALID: return "INVALID";
         }
         return "INVALID";
     }
 
-    static std::string_view constexpr toModuleName(SizeType id)
+    static std::string_view constexpr toModuleName(SizeType32 id)
     {
         auto t = LoraModule::ModuleType(id);
         return toModuleName(t);
@@ -238,12 +254,12 @@ public:
 
 private:
     ModuleType mType;
-    SizeType mInDim;
-    SizeType mOutDim;
+    SizeType32 mInDim;
+    SizeType32 mOutDim;
     bool mInDimFirst;
     bool mOutDimFirst;
-    SizeType mInTpSplitDim;
-    SizeType mOutTpSplitDim;
+    SizeType32 mInTpSplitDim;
+    SizeType32 mOutTpSplitDim;
 };
 
 inline std::ostream& operator<<(std::ostream& output, LoraModule const& module)

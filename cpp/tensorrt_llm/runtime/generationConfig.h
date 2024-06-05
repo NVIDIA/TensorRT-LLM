@@ -27,9 +27,9 @@ class GenerationConfig
 public:
     GenerationConfig() = default;
 
-    explicit GenerationConfig(SizeType batchSize, SizeType beamWidth, SizeType maxInputLength,
-        SizeType maxAttentionWindow, SizeType sinkTokenLength, SizeType maxSeqLength,
-        SizeType inputLengthSum = SizeType(0))
+    explicit GenerationConfig(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 maxInputLength,
+        SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSeqLength,
+        SizeType32 inputLengthSum = SizeType32(0))
         : batchSize{batchSize}
         , beamWidth{beamWidth}
         , maxInputLength{maxInputLength}
@@ -40,16 +40,16 @@ public:
     {
     }
 
-    SizeType batchSize{};
-    SizeType beamWidth{};
-    SizeType maxInputLength{};
-    SizeType maxAttentionWindow{};
-    SizeType sinkTokenLength{};
-    SizeType maxSeqLength{};
-    SizeType inputLengthSum{}; // Initialized only if inputPacked is set to true in fromInput.
+    SizeType32 batchSize{};
+    SizeType32 beamWidth{};
+    SizeType32 maxInputLength{};
+    SizeType32 maxAttentionWindow{};
+    SizeType32 sinkTokenLength{};
+    SizeType32 maxSeqLength{};
+    SizeType32 inputLengthSum{}; // Initialized only if inputPacked is set to true in fromInput.
 
     static GenerationConfig fromInput(ITensor const& inputIds, ITensor& inputLengths, bool inputPacked,
-        SizeType beamWidth, SizeType maxAttentionWindow, SizeType sinkTokenLength, SizeType maxSequenceLength);
+        SizeType32 beamWidth, SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength);
 };
 
 } // namespace tensorrt_llm::runtime

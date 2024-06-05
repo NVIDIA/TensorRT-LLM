@@ -107,7 +107,7 @@ TEST_F(SamplingUtilsKernelTest, CurandBatchInitialize)
     auto batchSlots = mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
 
     auto batchSlotsPtr = bufferCast<int32_t>(*batchSlots);
-    for (SizeType bi = 0; bi < batchSize; ++bi)
+    for (SizeType32 bi = 0; bi < batchSize; ++bi)
     {
         batchSlotsPtr[batchSize - bi - 1] = bi;
     }
@@ -141,50 +141,11 @@ TEST_F(SamplingUtilsKernelTest, CurandBatchInitialize)
     sync_check_cuda_error();
 }
 
-TEST_F(SamplingUtilsKernelTest, invokeTopPInitialize)
-{
-    int32_t const batchSize = 8;
-    int32_t const vocabSize = 256;
-
-    auto const topPIdValsDevice
-        = this->mBufferManager->gpu(ITensor::makeShape({batchSize, vocabSize}), nvinfer1::DataType::kINT32);
-    auto const beginOffsetsDevice
-        = this->mBufferManager->gpu(ITensor::makeShape({batchSize + 1}), nvinfer1::DataType::kINT32);
-    auto const endOffsetsDevice
-        = this->mBufferManager->gpu(ITensor::makeShape({batchSize + 1}), nvinfer1::DataType::kINT32);
-
-    tk::invokeTopPInitialize(bufferCast<int32_t>(*topPIdValsDevice), bufferCast<int32_t>(*endOffsetsDevice),
-        bufferCast<int32_t>(*beginOffsetsDevice), batchSize, vocabSize, this->mStream->get());
-
-    auto const topPIdValsHost = this->mBufferManager->copyFrom(*topPIdValsDevice, MemoryType::kCPU);
-    auto const endOffsetsHost = this->mBufferManager->copyFrom(*endOffsetsDevice, MemoryType::kCPU);
-    auto const beginOffsetsHost = this->mBufferManager->copyFrom(*beginOffsetsDevice, MemoryType::kCPU);
-
-    this->mStream->synchronize();
-
-    auto const topPIdValsHostPtr = bufferCast<int32_t>(*topPIdValsHost);
-    auto const endOffsetsHostPtr = bufferCast<int32_t>(*endOffsetsHost);
-    auto const beginOffsetsHostPtr = bufferCast<int32_t>(*beginOffsetsHost);
-
-    for (int32_t bi = 0; bi < batchSize + 1; ++bi)
-    {
-        EXPECT_EQ(endOffsetsHostPtr[bi], bi * vocabSize);
-        EXPECT_EQ(beginOffsetsHostPtr[bi], bi * vocabSize);
-    }
-    for (int32_t bi = 0; bi < batchSize; ++bi)
-    {
-        for (int32_t vi = 0; vi < vocabSize; ++vi)
-        {
-            EXPECT_EQ(topPIdValsHostPtr[bi * vocabSize + vi], vi);
-        }
-    }
-};
-
 template <typename T>
 class SamplingUtilsTypedKernelTest : public SamplingKernelTest<T>
 {
 public:
-    void testAddBiasEndMaskSoftmax(bool hasBias, bool computeSoftmax, bool useLogitsPtrs, SizeType beamWidth)
+    void testAddBiasEndMaskSoftmax(bool hasBias, bool computeSoftmax, bool useLogitsPtrs, SizeType32 beamWidth)
     {
         auto const dataType = TRTDataType<T>::value;
         auto const ptrType = TRTDataType<T*>::value;
@@ -206,7 +167,7 @@ public:
         auto batchSlots = BufferManager::pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
 
         auto batchSlotsPtr = bufferCast<int32_t>(*batchSlots);
-        for (SizeType bi = 0; bi < batchSize; ++bi)
+        for (SizeType32 bi = 0; bi < batchSize; ++bi)
         {
             batchSlotsPtr[bi] = 2 * bi;
         }
@@ -218,7 +179,7 @@ public:
         initRandom(biasHostPtr, vocabSize, -3.0f, 3.0f);
 
         auto logitsHostPtrsData = reinterpret_cast<T**>(bufferCast<int64_t>(*logitsHostPtrs));
-        for (SizeType bi = 0; bi < batchSize; ++bi)
+        for (SizeType32 bi = 0; bi < batchSize; ++bi)
         {
             logitsHostPtrsData[bi] = logitsHostPtr + bi * beamWidth * vocabSizePadded;
         }
@@ -235,10 +196,10 @@ public:
             0, vocabSize - 1); // -1 because uniform_int_distribution generates closed interval
         std::uniform_real_distribution<> finishedDist(0, 1); // uniform distribution between 0 and 1
 
-        for (SizeType bi = 0; bi < maxBatchSize; ++bi)
+        for (SizeType32 bi = 0; bi < maxBatchSize; ++bi)
         {
             endIdsHostPtr[bi] = endIdsDistr(gen);
-            for (SizeType bwi = 0; bwi < beamWidth; ++bwi)
+            for (SizeType32 bwi = 0; bwi < beamWidth; ++bwi)
             {
                 finishedHostPtr[bwi * maxBatchSize + bi]
                     = finishedDist(gen) < 0.3 ? tk::FinishedState::finished() : tk::FinishedState::empty();
@@ -264,13 +225,13 @@ public:
 
         bool const IS_FP16 = std::is_same<T, half>::value;
         T const MAX_T_VAL = (IS_FP16) ? HALF_FLT_MAX : FLT_MAX;
-        for (SizeType bi = 0; bi < batchSize; ++bi)
+        for (SizeType32 bi = 0; bi < batchSize; ++bi)
         {
             auto const batchSlot = batchSlotsPtr[bi];
-            for (SizeType bwi = 0; bwi < beamWidth; ++bwi)
+            for (SizeType32 bwi = 0; bwi < beamWidth; ++bwi)
             {
                 float maxLogit = -1 * FLT_MAX;
-                for (SizeType vi = 0; vi < vocabSizePadded; ++vi)
+                for (SizeType32 vi = 0; vi < vocabSizePadded; ++vi)
                 {
                     auto const idx = (bi * beamWidth + bwi) * vocabSizePadded + vi;
                     auto refLogit = logitsHostPtr[idx];
@@ -292,14 +253,14 @@ public:
                 if (computeSoftmax)
                 {
                     float sumExp = 0.f;
-                    for (SizeType vi = 0; vi < vocabSizePadded; ++vi)
+                    for (SizeType32 vi = 0; vi < vocabSizePadded; ++vi)
                     {
                         auto const idx = (bi * beamWidth + bwi) * vocabSizePadded + vi;
                         float refLogit = refLogitsHostPtr[idx];
                         refLogitsHostPtr[idx] = std::exp(refLogit - maxLogit);
                         sumExp += static_cast<float>(refLogitsHostPtr[idx]);
                     }
-                    for (SizeType vi = 0; vi < vocabSizePadded; ++vi)
+                    for (SizeType32 vi = 0; vi < vocabSizePadded; ++vi)
                     {
                         auto const idx = (bi * beamWidth + bwi) * vocabSizePadded + vi;
                         float refLogit = refLogitsHostPtr[idx];
@@ -308,11 +269,11 @@ public:
                 }
             }
         }
-        for (SizeType bi = 0; bi < batchSize; ++bi)
+        for (SizeType32 bi = 0; bi < batchSize; ++bi)
         {
-            for (SizeType bwi = 0; bwi < beamWidth; ++bwi)
+            for (SizeType32 bwi = 0; bwi < beamWidth; ++bwi)
             {
-                for (SizeType vi = 0; vi < vocabSizePadded; ++vi)
+                for (SizeType32 vi = 0; vi < vocabSizePadded; ++vi)
                 {
                     auto const idx = (bi * beamWidth + bwi) * vocabSizePadded + vi;
                     auto refLogit = refLogitsHostPtr[idx];

@@ -89,11 +89,14 @@ def test_gpt_session_config():
     max_batch_size = 1000
     max_beam_width = 64
     max_sequence_length = 1 << 20
+    gpu_weights_percent = 0.5
     gpt_session_config = _tb.GptSessionConfig(max_batch_size, max_beam_width,
-                                              max_sequence_length)
+                                              max_sequence_length,
+                                              gpu_weights_percent)
     assert gpt_session_config.max_batch_size == max_batch_size
     assert gpt_session_config.max_beam_width == max_beam_width
     assert gpt_session_config.max_sequence_length == max_sequence_length
+    assert gpt_session_config.gpu_weights_percent == gpu_weights_percent
 
     assert gpt_session_config.kv_cache_config is not None
     assert gpt_session_config.kv_cache_config.max_tokens is None
@@ -153,6 +156,7 @@ def test_decoding_mode():
     assert not _tb.DecodingMode.none().is_top_k
     assert not _tb.DecodingMode.none().is_top_p
     assert not _tb.DecodingMode.none().is_beam_search
+    assert not _tb.DecodingMode.none().is_medusa
 
     assert _tb.DecodingMode.top_k().is_top_k
     assert _tb.DecodingMode.top_k().is_top_k_or_top_p
@@ -160,6 +164,7 @@ def test_decoding_mode():
     assert not _tb.DecodingMode.top_k().is_top_k_and_top_p
     assert not _tb.DecodingMode.top_k().is_none
     assert not _tb.DecodingMode.top_k().is_beam_search
+    assert not _tb.DecodingMode.none().is_medusa
 
     assert _tb.DecodingMode.top_p().is_top_p
     assert _tb.DecodingMode.top_p().is_top_k_or_top_p
@@ -167,6 +172,7 @@ def test_decoding_mode():
     assert not _tb.DecodingMode.top_p().is_top_k_and_top_p
     assert not _tb.DecodingMode.top_p().is_none
     assert not _tb.DecodingMode.top_p().is_beam_search
+    assert not _tb.DecodingMode.none().is_medusa
 
     assert _tb.DecodingMode.top_k_top_p().is_top_p
     assert _tb.DecodingMode.top_k_top_p().is_top_k
@@ -174,89 +180,100 @@ def test_decoding_mode():
     assert _tb.DecodingMode.top_k_top_p().is_top_k_and_top_p
     assert not _tb.DecodingMode.top_k_top_p().is_none
     assert not _tb.DecodingMode.top_k_top_p().is_beam_search
+    assert not _tb.DecodingMode.none().is_medusa
 
     assert _tb.DecodingMode.beam_search().is_beam_search
     assert not _tb.DecodingMode.beam_search().is_none
     assert not _tb.DecodingMode.beam_search().is_top_k
     assert not _tb.DecodingMode.beam_search().is_top_p
+    assert not _tb.DecodingMode.none().is_medusa
+
+    assert _tb.DecodingMode.medusa().is_medusa
+    assert not _tb.DecodingMode.beam_search().is_none
+    assert not _tb.DecodingMode.beam_search().is_top_k
+    assert not _tb.DecodingMode.beam_search().is_top_p
+    assert not _tb.DecodingMode.top_k_top_p().is_beam_search
 
 
-def test_gpt_model_config():
+def test_model_config():
     vocab_size = 10000
-    num_layers = 12
+    num_attention_layers = 12
+    num_rnn_layers = 2
     num_heads = 16
     hidden_size = 768
     data_type = _tb.DataType.FLOAT
-    gpt_model_config = _tb.GptModelConfig(vocab_size, num_layers, num_heads,
-                                          hidden_size, data_type)
-    assert gpt_model_config.vocab_size == vocab_size
-    assert gpt_model_config.num_layers() == num_layers
-    assert gpt_model_config.num_heads == num_heads
-    assert gpt_model_config.hidden_size == hidden_size
-    assert gpt_model_config.data_type == data_type
+    model_config = _tb.ModelConfig(vocab_size, num_attention_layers,
+                                   num_rnn_layers, num_heads, hidden_size,
+                                   data_type)
+    assert model_config.vocab_size == vocab_size
+    assert model_config.num_attention_layers() == num_attention_layers
+    assert model_config.num_rnn_layers() == num_rnn_layers
+    assert model_config.num_heads == num_heads
+    assert model_config.hidden_size == hidden_size
+    assert model_config.data_type == data_type
 
-    assert gpt_model_config.vocab_size_padded(1) is not None
-    assert gpt_model_config.size_per_head == hidden_size // num_heads
+    assert model_config.vocab_size_padded(1) is not None
+    assert model_config.size_per_head == hidden_size // num_heads
 
-    assert gpt_model_config.num_kv_heads == num_heads
+    assert model_config.num_kv_heads == num_heads
     num_kv_heads = 1
-    gpt_model_config.num_kv_heads = num_kv_heads
-    assert gpt_model_config.num_kv_heads == num_kv_heads
+    model_config.num_kv_heads = num_kv_heads
+    assert model_config.num_kv_heads == num_kv_heads
 
-    assert not gpt_model_config.use_gpt_attention_plugin
-    gpt_model_config.use_gpt_attention_plugin = True
-    assert gpt_model_config.use_gpt_attention_plugin
+    assert not model_config.use_gpt_attention_plugin
+    model_config.use_gpt_attention_plugin = True
+    assert model_config.use_gpt_attention_plugin
 
-    assert not gpt_model_config.use_packed_input
-    gpt_model_config.use_packed_input = True
-    assert gpt_model_config.use_packed_input
+    assert not model_config.use_packed_input
+    model_config.use_packed_input = True
+    assert model_config.use_packed_input
 
-    assert not gpt_model_config.use_paged_kv_cache
-    gpt_model_config.use_paged_kv_cache = True
-    assert gpt_model_config.use_paged_kv_cache
+    assert not model_config.use_paged_kv_cache
+    model_config.use_paged_kv_cache = True
+    assert model_config.use_paged_kv_cache
 
-    assert gpt_model_config.tokens_per_block == 64
+    assert model_config.tokens_per_block == 64
     tokens_per_block = 1024
-    gpt_model_config.tokens_per_block = tokens_per_block
-    assert gpt_model_config.tokens_per_block == tokens_per_block
+    model_config.tokens_per_block = tokens_per_block
+    assert model_config.tokens_per_block == tokens_per_block
 
-    assert gpt_model_config.quant_mode == _tb.QuantMode.none()
-    gpt_model_config.quant_mode = _tb.QuantMode.int4_weights()
-    assert gpt_model_config.quant_mode.has_int4_weights
+    assert model_config.quant_mode == _tb.QuantMode.none()
+    model_config.quant_mode = _tb.QuantMode.int4_weights()
+    assert model_config.quant_mode.has_int4_weights
 
-    assert gpt_model_config.supports_inflight_batching
+    assert model_config.supports_inflight_batching
 
-    assert gpt_model_config.max_batch_size == 0
+    assert model_config.max_batch_size == 0
     max_batch_size = 1000
-    gpt_model_config.max_batch_size = max_batch_size
-    assert gpt_model_config.max_batch_size == max_batch_size
+    model_config.max_batch_size = max_batch_size
+    assert model_config.max_batch_size == max_batch_size
 
-    assert gpt_model_config.max_input_len == 0
+    assert model_config.max_input_len == 0
     max_input_len = 2048
-    gpt_model_config.max_input_len = max_input_len
-    assert gpt_model_config.max_input_len == max_input_len
+    model_config.max_input_len = max_input_len
+    assert model_config.max_input_len == max_input_len
 
-    assert gpt_model_config.max_num_tokens is None
+    assert model_config.max_num_tokens is None
     max_num_tokens = 10000
-    gpt_model_config.max_num_tokens = max_num_tokens
-    assert gpt_model_config.max_num_tokens == max_num_tokens
+    model_config.max_num_tokens = max_num_tokens
+    assert model_config.max_num_tokens == max_num_tokens
 
-    assert not gpt_model_config.compute_context_logits
-    gpt_model_config.compute_context_logits = True
-    assert gpt_model_config.compute_context_logits
+    assert not model_config.compute_context_logits
+    model_config.compute_context_logits = True
+    assert model_config.compute_context_logits
 
-    assert not gpt_model_config.compute_generation_logits
-    gpt_model_config.compute_generation_logits = True
-    assert gpt_model_config.compute_generation_logits
+    assert not model_config.compute_generation_logits
+    model_config.compute_generation_logits = True
+    assert model_config.compute_generation_logits
 
-    assert gpt_model_config.model_variant == _tb.GptModelVariant.GPT
+    assert model_config.model_variant == _tb.GptModelVariant.GPT
     model_variant = _tb.GptModelVariant.GLM
-    gpt_model_config.model_variant = model_variant
-    assert gpt_model_config.model_variant == model_variant
+    model_config.model_variant = model_variant
+    assert model_config.model_variant == model_variant
 
-    assert not gpt_model_config.use_custom_all_reduce
-    gpt_model_config.use_custom_all_reduce = True
-    assert gpt_model_config.use_custom_all_reduce
+    assert not model_config.use_custom_all_reduce
+    model_config.use_custom_all_reduce = True
+    assert model_config.use_custom_all_reduce
 
 
 def test_world_config():
@@ -327,26 +344,28 @@ def test_sampling_config():
 def test_gpt_json_config():
     model_config = {
         "vocab_size": 1000,
-        "num_layers": 12,
+        "num_attention_layers": 12,
+        "num_rnn_layers": 2,
         "num_heads": 4,
         "hidden_size": 512,
         "data_type": _tb.DataType.FLOAT,
     }
-    gpt_model_config = _tb.GptModelConfig(**model_config)
+    trt_model_config = _tb.ModelConfig(**model_config)
     json_config = {
         "name": "gpt",
         "version": "none",
         "precision": "float32",
         "tensor_parallelism": 1,
         "pipeline_parallelism": 1,
-        "model_config": gpt_model_config
+        "gpus_per_node": 8,
+        "model_config": trt_model_config
     }
 
     gpt_json_config = _tb.GptJsonConfig(**json_config)
 
     def check_properties(the_object, properties, model_config):
         for property, value in properties.items():
-            if isinstance(value, _tb.GptModelConfig):
+            if isinstance(value, _tb.ModelConfig):
                 object_config = getattr(the_object, property)
                 for subproperty, subvalue in model_config.items():
                     member = getattr(object_config, subproperty)
@@ -362,7 +381,7 @@ def test_gpt_json_config():
         "builder_config": {
             "name": json_config["name"],
             "vocab_size": model_config["vocab_size"],
-            "num_layers": model_config["num_layers"],
+            "num_layers": model_config["num_attention_layers"],
             "num_heads": model_config["num_heads"],
             "hidden_size": model_config["hidden_size"],
             "precision": json_config["precision"],
@@ -631,6 +650,28 @@ def test_trt_gpt_model_optional_params():
     assert opt_params.device_ids == [0, 1]
 
 
+def test_trt_gpt_model_optional_params_ctor():
+    kv_cache_config = _tb.KvCacheConfig(10, 10, 0, 0.5, False)
+    enable_trt_overlap = True
+    device_ids = [0, 1]
+    normalize_log_probs = False
+    enable_chunked_context = True
+    decoding_mode = _tb.DecodingMode.top_k()
+    peft_cache_manager_config = _tb.PeftCacheManagerConfig()
+
+    opt_params = _tb.TrtGptModelOptionalParams(
+        kv_cache_config, enable_trt_overlap, device_ids, normalize_log_probs,
+        enable_chunked_context, decoding_mode, peft_cache_manager_config)
+    assert opt_params.kv_cache_config.free_gpu_memory_fraction == kv_cache_config.free_gpu_memory_fraction
+    assert opt_params.enable_trt_overlap
+    assert opt_params.device_ids == device_ids
+    assert opt_params.normalize_log_probs == normalize_log_probs
+    assert opt_params.enable_chunked_context == enable_chunked_context
+    assert opt_params.decoding_mode.is_top_k
+    assert opt_params.medusa_choices == None
+    assert opt_params.gpu_weights_percent == 1
+
+
 def test_KvCacheConfig_pickle():
     cache = _tb.KvCacheConfig(free_gpu_memory_fraction=0.4)
     cache1 = pickle.dumps(cache)
@@ -657,16 +698,16 @@ def test_TrtGptModelOptionalParams_pickle():
 
 
 def test_Mpicomm():
-    size1 = _tb.MpiComm.getSize()
-    rank1 = _tb.MpiComm.getRank()
+    size1 = _tb.MpiComm.size()
+    rank1 = _tb.MpiComm.rank()
 
     session_size = (size1 + 1) // 2
     session_color = rank1 // session_size
     session_rank = rank1 % session_size
     _tb.MpiComm.split(session_color, session_rank)
 
-    rank2 = _tb.MpiComm.getRank()
-    size2 = _tb.MpiComm.getSize()
+    rank2 = _tb.MpiComm.rank()
+    size2 = _tb.MpiComm.size()
 
     assert rank2 == session_rank
     assert size2 == session_size

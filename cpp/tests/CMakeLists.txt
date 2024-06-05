@@ -21,8 +21,14 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(googletest)
 include(GoogleTest)
 
-find_library_create_target(nvonnxparser nvonnxparser SHARED ${TRT_OUT_DIR}
-                           ${TRT_LIB_DIR})
+# On Windows major version is appended to nvinfer libs.
+if(WIN32)
+  set(ONNX_PARSER_LIB_NAME nvonnxparser_10)
+else()
+  set(ONNX_PARSER_LIB_NAME nvonnxparser)
+endif()
+find_library_create_target(nvonnxparser ${ONNX_PARSER_LIB_NAME} SHARED
+                           ${TRT_OUT_DIR} ${TRT_LIB_DIR})
 
 include_directories(
   ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/include
@@ -55,13 +61,15 @@ add_gtest(loraManagerTest runtime/loraManagerTest.cpp)
 add_gtest(loraUtilsTest runtime/loraUtilsTest.cpp)
 add_gtest(loraCacheTest runtime/loraCacheTest.cpp)
 add_gtest(workerPoolTest runtime/workerPoolTest.cpp)
-add_gtest(attentionKernelTest runtime/transposeKVKernelTest.cpp)
+add_gtest(transposeKVKernelTest runtime/transposeKVKernelTest.cpp)
 add_gtest(gptDecoderTest runtime/gptDecoderTest.cpp)
 add_gtest(gptDecoderBatchTest runtime/gptDecoderBatchTest.cpp)
 add_gtest(gptSessionTest runtime/gptSessionTest.cpp)
 add_gtest(allocatorTest common/allocatorTest.cpp)
 add_gtest(memoryUtilsTest common/memoryUtilsTest.cu)
-add_gtest(mpiUtilsTest common/mpiUtilsTest.cpp)
+if(ENABLE_MULTI_DEVICE EQUAL 1)
+  add_gtest(mpiUtilsTest common/mpiUtilsTest.cpp)
+endif()
 add_gtest(quantizationTest common/quantizationTest.cpp)
 add_gtest(stringUtilsTest common/stringUtilsTest.cpp)
 add_gtest(tllmExceptionTest common/tllmExceptionTest.cpp)
@@ -101,6 +109,7 @@ set(SAMPLING_LAYER_TEST_SRC
 add_gtest(samplingLayerTest "${SAMPLING_LAYER_TEST_SRC}")
 add_gtest(dynamicDecodeLayerTest layers/dynamicDecodeLayerTest.cpp)
 add_gtest(medusaDecodeLayerTest layers/medusaDecodeLayerTest.cpp)
+add_gtest(lookaheadPoolManagerTest layers/lookaheadPoolManagerTest.cpp)
 
 if(BUILD_BATCH_MANAGER)
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/batch_manager)
@@ -109,5 +118,7 @@ if(BUILD_BATCH_MANAGER)
 endif()
 
 if(BUILD_EXECUTOR)
-  add_subdirectory(executor)
+  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/executor)
+    add_subdirectory(executor)
+  endif()
 endif()

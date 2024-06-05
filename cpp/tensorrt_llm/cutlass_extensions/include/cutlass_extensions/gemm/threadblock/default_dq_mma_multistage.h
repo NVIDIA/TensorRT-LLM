@@ -38,11 +38,12 @@ namespace threadblock
 
 template <typename MmaShape, typename Element, typename Layout, WeightOnlyQuantOp QuantOp, int Alignment,
     typename Enable = void>
-struct DefaultScaleIterators;
+struct DefaultScaleIteratorsMultistage;
 
 // Fine grained iterators
 template <typename MmaShape, typename Element, typename Layout, WeightOnlyQuantOp QuantOp, int Alignment>
-struct DefaultScaleIterators<MmaShape, Element, Layout, QuantOp, Alignment, std::enable_if_t<isFinegrained(QuantOp)>>
+struct DefaultScaleIteratorsMultistage<MmaShape, Element, Layout, QuantOp, Alignment,
+    std::enable_if_t<isFinegrained(QuantOp)>>
 {
     using IteratorScale
         = cutlass::transform::threadblock::FineGrainedScaleZeroIterator<cutlass::MatrixShape<1, MmaShape::kN>, Element,
@@ -53,7 +54,8 @@ struct DefaultScaleIterators<MmaShape, Element, Layout, QuantOp, Alignment, std:
 
 // Per column iterators
 template <typename MmaShape, typename Element, typename Layout, WeightOnlyQuantOp QuantOp, int Alignment>
-struct DefaultScaleIterators<MmaShape, Element, Layout, QuantOp, Alignment, std::enable_if_t<!isFinegrained(QuantOp)>>
+struct DefaultScaleIteratorsMultistage<MmaShape, Element, Layout, QuantOp, Alignment,
+    std::enable_if_t<!isFinegrained(QuantOp)>>
 {
     // ThreadMap for scale iterator
     static_assert((MmaShape::kN % Alignment) == 0, "");
@@ -73,7 +75,7 @@ public:
 ////////////////////////////////////////////////////////////////////////////////
 
 template <
-    /// Type for elementA
+    /// Type for element A
     typename ElementA,
     /// Layout type for A matrix operand
     typename LayoutA,
@@ -105,9 +107,9 @@ template <
     typename InstructionShape,
     /// Stages in GEMM
     int kStages,
-    ///
+    /// Operator performed by GEMM
     typename Operator_,
-    ///
+    /// Use zfill or predicate for out-of-bound cp.async
     SharedMemoryClearOption SharedMemoryClear>
 struct DqMma<ElementA, LayoutA, kAlignmentA, ElementB, LayoutB, kAlignmentB, ElementScale, LayoutScale, kAlignmentScale,
     ElementAccumulator, layout::RowMajor, OperatorClass, ArchTag, ThreadblockShape, WarpShape, InstructionShape,
@@ -116,8 +118,9 @@ struct DqMma<ElementA, LayoutA, kAlignmentA, ElementB, LayoutB, kAlignmentB, Ele
         ArchTag::kMinComputeCapability >= 80 && !layout::IsColumnMajorTileInterleave<LayoutB>::value)>::type>
 {
 
-    static_assert(platform::is_same<ElementA, half_t>::value || platform::is_same<ElementA, bfloat16_t>::value,
-        "Element A must be fp16 or bf16");
+    static_assert(platform::is_same<ElementA, half_t>::value || platform::is_same<ElementA, bfloat16_t>::value
+            || platform::is_same<ElementA, float_e4m3_t>::value,
+        "Element A must be fp16, fp8 or bf16");
 
     using OperatorInfo = arch::DetagOperator<Operator_>;
     using Operator = typename OperatorInfo::Operator;
@@ -155,7 +158,7 @@ struct DqMma<ElementA, LayoutA, kAlignmentA, ElementB, LayoutB, kAlignmentB, Ele
         cutlass::MatrixShape<ThreadblockShape::kK, ThreadblockShape::kN>, ElementB, LayoutB, 0, ThreadMapB,
         AccessTypeB>;
 
-    using ScaleIterators = DefaultScaleIterators<typename MmaCore::Shape, ElementScale, LayoutScale,
+    using ScaleIterators = DefaultScaleIteratorsMultistage<typename MmaCore::Shape, ElementScale, LayoutScale,
         OperatorInfo::QuantOp, kAlignmentScale>;
 
     // Define iterators over tiles from the scale operand
@@ -163,7 +166,7 @@ struct DqMma<ElementA, LayoutA, kAlignmentA, ElementB, LayoutB, kAlignmentB, Ele
 
     using SmemIteratorScale = typename ScaleIterators::SmemIteratorScale;
 
-    using Converter = FastInterleavedAndBiasedNumericArrayConverter<ElementA, ElementB,
+    using Converter = FastInterleavedAndBiasedNumericArrayConverter<ElementScale, ElementB,
         MmaCore::MmaPolicy::Operator::FragmentB::kElements>;
 
     // Define the threadblock-scoped pipelined matrix multiply
@@ -173,6 +176,7 @@ struct DqMma<ElementA, LayoutA, kAlignmentA, ElementB, LayoutB, kAlignmentB, Ele
         typename MmaCore::MmaPolicy, kStages, Converter, OperatorInfo::QuantOp, SharedMemoryClear>;
 };
 
+// Specialization to handle column major interleave B
 template <
     /// Type for element A
     typename ElementA,
@@ -206,9 +210,9 @@ template <
     typename InstructionShape,
     /// Stages in GEMM
     int kStages,
-    ///
+    /// Operator performed by GEMM
     typename Operator_,
-    ///
+    /// Use zfill or predicate for out-of-bound cp.async
     SharedMemoryClearOption SharedMemoryClear>
 struct DqMma<ElementA, LayoutA, kAlignmentA, ElementB, LayoutB, kAlignmentB, ElementScale, LayoutScale, kAlignmentScale,
     ElementAccumulator, layout::RowMajor, OperatorClass, ArchTag, ThreadblockShape, WarpShape, InstructionShape,
@@ -217,8 +221,9 @@ struct DqMma<ElementA, LayoutA, kAlignmentA, ElementB, LayoutB, kAlignmentB, Ele
         ArchTag::kMinComputeCapability >= 80 && layout::IsColumnMajorTileInterleave<LayoutB>::value)>::type>
 {
 
-    static_assert(platform::is_same<ElementA, half_t>::value || platform::is_same<ElementA, bfloat16_t>::value,
-        "Element A must be fp16 or bf16");
+    static_assert(platform::is_same<ElementA, half_t>::value || platform::is_same<ElementA, bfloat16_t>::value
+            || platform::is_same<ElementA, float_e4m3_t>::value,
+        "Element A must be fp16, fp8 or bf16");
 
     using OperatorInfo = arch::DetagOperator<Operator_>;
     using Operator = typename OperatorInfo::Operator;
@@ -274,7 +279,7 @@ public:
     using IteratorB = cutlass::transform::threadblock::PredicatedTileAccessIterator<GmemIteratorShape, ElementB,
         layout::ColumnMajor, 0, GmemThreadMapB, AccessTypeB>;
 
-    using ScaleIterators = DefaultScaleIterators<typename MmaCore::Shape, ElementScale, LayoutScale,
+    using ScaleIterators = DefaultScaleIteratorsMultistage<typename MmaCore::Shape, ElementScale, LayoutScale,
         OperatorInfo::QuantOp, kAlignmentScale>;
 
     // Define iterators over tiles from the scale operand
@@ -282,7 +287,7 @@ public:
 
     using SmemIteratorScale = typename ScaleIterators::SmemIteratorScale;
 
-    using Converter = FastInterleavedAndBiasedNumericArrayConverter<ElementA, ElementB,
+    using Converter = FastInterleavedAndBiasedNumericArrayConverter<ElementScale, ElementB,
         MmaCore::MmaPolicy::Operator::FragmentB::kElements>;
 
     // Define the threadblock-scoped pipelined matrix multiply

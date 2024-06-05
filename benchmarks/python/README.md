@@ -48,3 +48,11 @@ mpirun -n 8 python benchmark.py \
     --batch_size "1;8;64" \
     --input_output_len "60,20;128,20"
 ```
+
+Note: Building multi-GPU engines in parallel could be a heavy workload for the CPU system. Tuning `mpirun --map-by <XXX>` option on your system may achieve significant boost in build time, for example:
+```
+mpirun --map-by socket -n 8 python build.py \
+    --model gpt_175b \
+    --mode ootb \
+    --quantization fp8
+```

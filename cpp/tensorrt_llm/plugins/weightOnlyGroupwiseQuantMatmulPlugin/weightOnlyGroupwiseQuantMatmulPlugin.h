@@ -19,7 +19,7 @@
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fpA_intB_gemm/fpA_intB_gemm.h"
 #include "tensorrt_llm/kernels/preQuantScaleKernel.h"
-#include "tensorrt_llm/kernels/weightOnlyBatchedGemv/kernelLauncher.h"
+#include "tensorrt_llm/kernels/weightOnlyBatchedGemv//kernelLauncher.h"
 #include "tensorrt_llm/plugins/common/gemmPluginProfiler.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include "tensorrt_llm/plugins/weightOnlyQuantMatmulPlugin/weightOnlyQuantMatmulPlugin.h"

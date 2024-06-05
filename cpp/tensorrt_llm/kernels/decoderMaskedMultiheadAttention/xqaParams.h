@@ -36,6 +36,7 @@ struct XQAParams
     float const* kv_scale_quant_orig = nullptr;
     int32_t const* host_past_key_value_lengths = nullptr;
     int32_t const* host_context_lengths = nullptr;
+    int32_t* semaphores = nullptr;
     void* workspaces = nullptr;
     uint32_t batch_size = 0;
     int32_t beam_width = 0;
@@ -44,11 +45,11 @@ struct XQAParams
     int32_t sink_token_length = 0;
     int timestep = 0;
     void const* qkv_bias;
-    int32_t const* sequence_lengths;    //
-    int32_t const* context_lengths;     // maybe not used now
-    void const* alibi_slopes;           // maybe not used now
-    int32_t const* medusa_packed_mask;
-    int const* medusa_position_offsets; // rotary embedding.
+    int32_t const* sequence_lengths;           //
+    int32_t const* context_lengths;            // maybe not used now
+    void const* alibi_slopes;                  // maybe not used now
+    int32_t const* spec_decoding_packed_mask;
+    int const* spec_decoding_position_offsets; // rotary embedding.
 
     // almost copy from GPTAttentionPluginCommon.
     // maybe use one struct for parameters in GPTAttentionPluginCommon and share the same here.
@@ -80,6 +81,10 @@ struct XQAParams
     int max_distance = 0;
     bool multi_block_mode;
     bool multi_query_tokens = false;
+
+    int32_t total_num_input_tokens;       // total number of input tokens. may differ from batch_size due to medusa.
+    float const* fp8_out_scale = nullptr; // fp8 output scale in case we need post-processing to convert output to fp8.
+                                          // nullptr means no conversion.
 };
 
 } // namespace kernels

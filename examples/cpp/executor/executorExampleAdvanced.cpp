@@ -39,9 +39,12 @@ struct RuntimeOptions
 
     bool streaming;
     bool excludeInputFromOutput;
-    tle::SizeType maxNewTokens;
-    tle::SizeType beamWidth;
-    tle::SizeType timeoutMs;
+    tle::SizeType32 maxNewTokens;
+    tle::SizeType32 beamWidth;
+    tle::SizeType32 timeoutMs;
+
+    bool useOrchestratorMode;
+    std::string workerExecutablePath;
 };
 
 // Utility function to parse input arguments
@@ -59,7 +62,7 @@ std::vector<tle::VecTokens> readInputTokens(std::string const& path);
 
 // Utility function to write output tokens from csv file
 void writeOutputTokens(std::string const& path, std::vector<tle::IdType>& requestIds,
-    std::unordered_map<tle::IdType, tle::BeamTokens> const& outputTokens, tle::SizeType beamWidth);
+    std::unordered_map<tle::IdType, tle::BeamTokens> const& outputTokens, tle::SizeType32 beamWidth);
 
 // Main
 int main(int argc, char* argv[])
@@ -71,6 +74,15 @@ int main(int argc, char* argv[])
 
     // Create the executor for this engine
     auto executorConfig = tle::ExecutorConfig(runtimeOpts.beamWidth);
+
+    if (runtimeOpts.useOrchestratorMode)
+    {
+        auto orchestratorConfig = tle::OrchestratorConfig(true, runtimeOpts.workerExecutablePath);
+        auto parallelConfig = tle::ParallelConfig(tle::CommunicationType::kMPI, tle::CommunicationMode::kORCHESTRATOR,
+            std::nullopt, std::nullopt, orchestratorConfig);
+        executorConfig.setParallelConfig(parallelConfig);
+    }
+
     auto executor = tle::Executor(runtimeOpts.trtEnginePath, tle::ModelType::kDECODER_ONLY, executorConfig);
 
     if (executor.canEnqueueRequests())
@@ -110,6 +122,10 @@ RuntimeOptions parseArgs(int argc, char* argv[])
         cxxopts::value<std::string>()->default_value("outputTokens.csv"));
     options.add_options()("timeout_ms", "The maximum time to wait for all responses, in milliseconds.",
         cxxopts::value<int>()->default_value("10000"));
+    options.add_options()("use_orchestrator_mode", "Use orchestrator communication mode.",
+        cxxopts::value<bool>()->default_value("false"));
+    options.add_options()("worker_executable_path", "The location of the worker executable.",
+        cxxopts::value<std::string>()->default_value(""));
 
     auto parsedOptions = options.parse(argc, argv);
 
@@ -149,6 +165,9 @@ RuntimeOptions parseArgs(int argc, char* argv[])
     runtimeOpts.timeoutMs = parsedOptions["timeout_ms"].as<int>();
     runtimeOpts.outputTokensCsvFile = parsedOptions["output_tokens_csv_file"].as<std::string>();
 
+    runtimeOpts.useOrchestratorMode = parsedOptions["use_orchestrator_mode"].as<bool>();
+    runtimeOpts.workerExecutablePath = parsedOptions["worker_executable_path"].as<std::string>();
+
     return runtimeOpts;
 }
 
@@ -186,15 +205,15 @@ std::unordered_map<tle::IdType, tle::BeamTokens> waitForResponses(
         outputTokens[requestId] = tle::BeamTokens(runtimeOpts.beamWidth);
     }
 
-    tle::SizeType numFinished{0};
-    tle::SizeType iter{0};
+    tle::SizeType32 numFinished{0};
+    tle::SizeType32 iter{0};
 
     // Get the new tokens for each request
-    while (numFinished < static_cast<tle::SizeType>(requestIds.size()) && iter < runtimeOpts.timeoutMs)
+    while (numFinished < static_cast<tle::SizeType32>(requestIds.size()) && iter < runtimeOpts.timeoutMs)
     {
         std::chrono::milliseconds waitTime(1);
         // Wait for any response
-        auto responses = executor.awaitResponses(std::nullopt, waitTime);
+        auto responses = executor.awaitResponses(waitTime);
         // Loop over the responses
         for (auto const& response : responses)
         {
@@ -204,7 +223,7 @@ std::unordered_map<tle::IdType, tle::BeamTokens> waitForResponses(
                 auto result = response.getResult();
                 numFinished += result.isFinal;
 
-                for (tle::SizeType beam = 0; beam < runtimeOpts.beamWidth; ++beam)
+                for (tle::SizeType32 beam = 0; beam < runtimeOpts.beamWidth; ++beam)
                 {
                     auto& respTokens = result.outputTokenIds.at(beam);
 
@@ -222,7 +241,13 @@ std::unordered_map<tle::IdType, tle::BeamTokens> waitForResponses(
             }
             else
             {
-                TLLM_THROW("Request id %lu encountered error: %s", requestId, response.getErrorMsg().c_str());
+                // Allow response with error only if awaitResponse processed a terminated request id
+                std::string err = "ReqId " + std::to_string(response.getRequestId())
+                    + " has already been processed and was terminated.";
+                if (response.getErrorMsg() != err)
+                {
+                    TLLM_THROW("Request id %lu encountered error: %s", requestId, response.getErrorMsg().c_str());
+                }
             }
         }
         ++iter;
@@ -278,7 +303,7 @@ std::vector<tle::VecTokens> readInputTokens(std::string const& path)
 }
 
 void writeOutputTokens(std::string const& path, std::vector<tle::IdType>& requestIds,
-    std::unordered_map<tle::IdType, tle::BeamTokens> const& outputTokens, tle::SizeType beamWidth)
+    std::unordered_map<tle::IdType, tle::BeamTokens> const& outputTokens, tle::SizeType32 beamWidth)
 {
     std::ofstream file(path);
 
@@ -291,7 +316,7 @@ void writeOutputTokens(std::string const& path, std::vector<tle::IdType>& reques
     for (auto requestId : requestIds)
     {
         auto const& outTokens = outputTokens.at(requestId);
-        for (tle::SizeType beam = 0; beam < beamWidth; ++beam)
+        for (tle::SizeType32 beam = 0; beam < beamWidth; ++beam)
         {
             auto const& beamTokens = outTokens.at(beam);
             for (size_t i = 0; i < beamTokens.size(); ++i)

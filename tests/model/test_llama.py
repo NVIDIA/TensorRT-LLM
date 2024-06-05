@@ -48,7 +48,7 @@ class TestLLaMA(unittest.TestCase):
     def _gen_tensorrt_llm_network(self, network, hf_llama,
                                   llama_config: LlamaConfig, batch_size,
                                   beam_width, input_len, output_len, dtype,
-                                  rank, tensor_parallel):
+                                  rank, tensor_parallel, **opt_flags):
         list(range(tensor_parallel))
 
         with net_guard(network):
@@ -86,7 +86,6 @@ class TestLLaMA(unittest.TestCase):
                 'moe_top_k': 0,
                 'moe_tp_mode': 2,
                 'moe_normalization_mode': 1,
-                'use_fused_mlp': False,
             }
 
             # Initialize model
@@ -100,6 +99,8 @@ class TestLLaMA(unittest.TestCase):
                                              rank=rank,
                                              tp_size=tensor_parallel))
             tensorrt_llm_llama.load(weights)
+            optimize_model(tensorrt_llm_llama, **opt_flags)
+
             # Prepare
             network.set_named_parameters(tensorrt_llm_llama.named_parameters())
             inputs = tensorrt_llm_llama.prepare_inputs(
@@ -128,7 +129,8 @@ class TestLLaMA(unittest.TestCase):
                                  use_refit,
                                  fast_building=False,
                                  context_fmha_flag=ContextFMHAType.disabled,
-                                 enable_remove_input_padding=False):
+                                 enable_remove_input_padding=False,
+                                 **opt_flags):
 
         builder = Builder()
 
@@ -153,7 +155,8 @@ class TestLLaMA(unittest.TestCase):
 
             self._gen_tensorrt_llm_network(network, hf_llama, llama_config,
                                            batch_size, beam_width, input_len,
-                                           output_len, dtype, rank, world_size)
+                                           output_len, dtype, rank, world_size,
+                                           **opt_flags)
 
             engine_buffer = builder.build_engine(network, builder_config)
             return engine_buffer
@@ -174,14 +177,15 @@ class TestLLaMA(unittest.TestCase):
                                   use_refit,
                                   fast_building=False,
                                   context_fmha_flag=ContextFMHAType.disabled,
-                                  enable_remove_input_padding=False):
+                                  enable_remove_input_padding=False,
+                                  **opt_flags):
         tensorrt_llm.logger.set_level(log_level)
         mapping = tensorrt_llm.Mapping(world_size, rank, tp_size=world_size)
         engine_buffer = self._gen_tensorrt_llm_engine(
             dtype, rank, world_size, llama_config, hf_llama, model_name,
             use_plugin, batch_size, beam_width, input_len, output_len,
             use_refit, fast_building, context_fmha_flag,
-            enable_remove_input_padding)
+            enable_remove_input_padding, **opt_flags)
         runtime = tensorrt_llm.runtime.generation._Runtime(
             engine_buffer, mapping)
         return runtime, engine_buffer
@@ -191,24 +195,41 @@ class TestLLaMA(unittest.TestCase):
             product([False], [False, True], [
                 ContextFMHAType.disabled, ContextFMHAType.enabled,
                 ContextFMHAType.enabled_with_fp32_acc
-            ], [False, True], ['float16'], [0]))
-        test_cases.append(
-            (False, True, ContextFMHAType.disabled, False, 'bfloat16', 0))
-        test_cases.append(
-            (False, True, ContextFMHAType.enabled, False, 'float16', 1))  # MQA
-        test_cases.append(
-            (False, True, ContextFMHAType.disabled, False, 'float32', 0))
+            ], [False, True], ['float16'], [0], ['silu'],
+                    [{
+                        "use_fused_mlp": True
+                    }, {
+                        "use_fused_mlp": False
+                    }]))
         test_cases.append((False, True, ContextFMHAType.disabled, False,
-                           'bfloat16', 2))  # GQA
+                           'bfloat16', 0, 'silu', dict()))
         test_cases.append(
-            (False, True, ContextFMHAType.enabled, False, 'float16', 2))  # GQA
+            (False, True, ContextFMHAType.enabled, False, 'float16', 1, 'silu',
+             dict()))  # MQA
+        test_cases.append(
+            (False, True, ContextFMHAType.disabled, False, 'float32', 0, 'silu',
+             dict()))
+        test_cases.append((False, True, ContextFMHAType.disabled, False,
+                           'bfloat16', 2, 'silu', dict()))  # GQA
+        test_cases.append(
+            (False, True, ContextFMHAType.enabled, False, 'float16', 2, 'silu',
+             dict()))  # GQA
         test_cases.append((False, True, ContextFMHAType.enabled_with_fp32_acc,
-                           False, 'float16', 4))  # GQA
+                           False, 'float16', 4, 'silu', dict()))  # GQA
+        test_cases.append((False, True, ContextFMHAType.disabled, False,
+                           'float16', 2, 'gelu', {
+                               "use_fused_mlp": True
+                           }))  # GQA
+        test_cases.append((False, True, ContextFMHAType.disabled, False,
+                           'float16', 2, 'silu', {
+                               "use_fused_mlp": True
+                           }))  # GQA
         return test_cases
 
     @parameterized.expand(load_test_cases, name_func=unittest_name_func)
     def test_llama(self, use_refit, fast_building, context_fmha_flag,
-                   enable_remove_input_padding, dtype, num_kv_heads):
+                   enable_remove_input_padding, dtype, num_kv_heads, hidden_act,
+                   opt_flags):
 
         # Skip tests that are not supported in pre-ampere architecture
         skip_bf16_pre_ampere(dtype)
@@ -227,7 +248,7 @@ class TestLLaMA(unittest.TestCase):
         head_size = 32
         rank = 0
         llama_config = LlamaConfig()
-        llama_config.hidden_act = 'silu'
+        llama_config.hidden_act = hidden_act
         llama_config.num_hidden_layers = 2
         llama_config.max_position_embeddings = 64
         llama_config.vocab_size = 128
@@ -250,7 +271,7 @@ class TestLLaMA(unittest.TestCase):
             log_level, dtype, world_size, rank, llama_config, hf_llama, model,
             use_plugin, batch_size, beam_width, input_len, output_len,
             use_refit, fast_building, context_fmha_flag,
-            enable_remove_input_padding)
+            enable_remove_input_padding, **opt_flags)
         key_value_cache_buffers = []
         head_size = llama_config.hidden_size // llama_config.num_attention_heads
         for i in range(llama_config.num_hidden_layers):

@@ -54,7 +54,7 @@ def lora_convert(out_dir, lora_config, lora_weights, customization_id,
     num_layers = int(lora_config["num_layers"])
     config = {"lora_config": {"lora_kqv_adapter": {}}}
     config['lora_config']['precision'] = precision
-    layer_weights = get_all_nemo_lora_weights(num_layers, lora_weights)
+    layer_weights = get_all_nemo_lora_weights(lora_weights)
     for layer_idx in range(num_layers):
         linear_in_weight = layer_weights[layer_idx]['in']
         linear_out_weight = layer_weights[layer_idx]['out']
@@ -91,7 +91,7 @@ def lora_convert_cpp_runtime(out_dir,
     num_layers = int(lora_config["num_layers"])
     weights = []
     weight_config = []
-    layer_weights = get_all_nemo_lora_weights(num_layers, lora_weights)
+    layer_weights = get_all_nemo_lora_weights(lora_weights)
     for layer_idx in range(num_layers):
         in_weights = layer_weights[layer_idx]['in']
         out_weights = layer_weights[layer_idx]['out']

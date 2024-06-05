@@ -1,7 +1,9 @@
 import datetime
-import os
+import json
+import os as _os
+import pickle
 import random
-import sys
+import sys as _sys
 import time
 import typing as tp
 from pathlib import Path
@@ -13,43 +15,19 @@ from binding_test_utils import *
 
 import tensorrt_llm.bindings.executor as trtllm
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+_sys.path.append(_os.path.join(_os.path.dirname(__file__), '..'))
+from utils.cpp_paths import *
+from utils.llm_data import llm_models_root
 from utils.util import skip_pre_ampere
 
 
 @pytest.fixture
-def model_path(engine_path):
-    return engine_path / "gpt2/fp16-plugin-packed-paged/tp1-pp1-gpu"
-
-
-@pytest.fixture
-def model_path_return_logits(engine_path):
-    return engine_path / "gpt2/fp16-plugin-packed-paged-gather/tp1-pp1-gpu"
-
-
-@pytest.fixture
-def input_data_path(data_path):
-    return data_path / "input_tokens.npy"
-
-
-@pytest.fixture(scope="module")
-def results_data_path(data_path: Path) -> Path:
-    return data_path / "gpt2/sampling/output_tokens_fp16_plugin_packed_paged_tp1_pp1.npy"
-
-
-@pytest.fixture(scope="module")
-def results_data_path_beam_width_2(data_path: Path) -> Path:
-    return data_path / "gpt2/beam_search_2/output_tokens_fp16_plugin_packed_paged_tp1_pp1.npy"
-
-
-@pytest.fixture
-def model_files(llm_root: Path, resource_path: Path, llm_model_root,
-                results_data_path):
+def model_files(llm_root: Path, resource_path: Path, results_data_path):
     # Model engines and expected outputs need to be generated.
     if not results_data_path.exists():
-        model_cache_arg = ["--model_cache",
-                           str(llm_model_root)
-                           ] if llm_model_root is not None else []
+        model_cache = llm_models_root()
+        model_cache_arg = ["--model_cache", str(model_cache)
+                           ] if model_cache is not None else []
         prepare_model_tests(llm_root, resource_path, "gpt", model_cache_arg)
 
 
@@ -85,6 +63,41 @@ def test_executor_invalid_ctor():
         assert False, "Expected an error"
     except Exception as e:
         assert "File does not exist" in str(e)
+
+
+@skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
+def test_shutdown(model_files, model_path):
+
+    beam_width = 1
+    executor_config = trtllm.ExecutorConfig(beam_width)
+    executor = trtllm.Executor(model_path, trtllm.ModelType.DECODER_ONLY,
+                               executor_config)
+
+    # Create the request
+    max_new_tokens = 5
+    input_tokens = [1, 2, 3, 4]
+    request = trtllm.Request(input_tokens, max_new_tokens, False,
+                             trtllm.SamplingConfig())
+
+    # Enqueue the request
+    assert executor.can_enqueue_requests() == True
+    req_id = executor.enqueue_request(request)
+
+    executor.shutdown()
+    assert executor.can_enqueue_requests() == False
+
+    with pytest.raises(Exception):
+        executor.enqueue_request(request)
+    with pytest.raises(Exception):
+        executor.await_responses()
+    with pytest.raises(Exception):
+        executor.get_latest_iteration_stats()()
+    with pytest.raises(Exception):
+        executor.get_latest_request_stats()()
+    with pytest.raises(Exception):
+        executor.cancel_request(req_id)()
+    with pytest.raises(Exception):
+        executor.get_num_responses_ready(req_id)()
 
 
 @skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
@@ -230,7 +243,7 @@ def test_multi_request(streaming: bool, exclude_input_from_output: bool,
     max_wait_ms = 10000
     while num_finished < num_requests and i < max_wait_ms:
         wait_time = datetime.timedelta(milliseconds=1)
-        responses = executor.await_responses(None, wait_time)
+        responses = executor.await_responses(wait_time)
         for response in responses:
             num_responses += 1
             assert not response.has_error(
@@ -240,6 +253,70 @@ def test_multi_request(streaming: bool, exclude_input_from_output: bool,
             new_tokens = result.output_token_ids[beam_width - 1]
             tokens[response.request_id].extend(new_tokens)
         i += 1
+    assert i < max_wait_ms
+
+    for request_id in expected_num_tokens:
+        assert len(tokens[request_id]) == expected_num_tokens[request_id]
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("exclude_input_from_output", [False])
+@skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
+def test_multi_request_with_ids(streaming: bool,
+                                exclude_input_from_output: bool, model_files,
+                                model_path):
+    output_config = trtllm.OutputConfig()
+    output_config.exclude_input_from_output = exclude_input_from_output
+
+    # Create executor
+    beam_width = 1
+    executor_config = trtllm.ExecutorConfig(beam_width)
+    executor = trtllm.Executor(model_path, trtllm.ModelType.DECODER_ONLY,
+                               executor_config)
+
+    num_requests = 20
+    max_prompt_len = 20
+    max_max_new_tokens = 20
+    end_id = -1
+
+    # Enqueue the requests
+    tokens = {}
+    expected_num_tokens = {}
+    for i in range(num_requests):
+        prompt_len = random.randint(1, max_prompt_len)
+        max_new_tokens = random.randint(1, max_max_new_tokens)
+        input_tokens = [1] * prompt_len
+        request = trtllm.Request(input_tokens, max_new_tokens, streaming,
+                                 trtllm.SamplingConfig(), output_config, end_id)
+        request_id = executor.enqueue_request(request)
+        tokens[request_id] = []
+        expected_num_tokens[request_id] = get_expected_num_tokens(
+            prompt_len, max_new_tokens, streaming, exclude_input_from_output)
+
+    # Get the new tokens for each request
+    num_finished = 0
+    i = 0
+    num_responses = 0
+    max_wait_ms = 10000
+    while num_finished < num_requests and i < max_wait_ms:
+        wait_time = datetime.timedelta(milliseconds=1)
+        id_responses = executor.await_responses(list(tokens.keys()), wait_time)
+        for responses in id_responses:
+            for response in responses:
+                num_responses += 1
+
+                # Allow response with error only if await_response processed a terminated request id
+                if response.has_error():
+                    terminated_request_error = "ReqId " + str(
+                        response.request_id
+                    ) + " has already been processed and was terminated."
+                    assert response.error_msg == terminated_request_error, f"Request id {response.request_id} failed with err {response.error_msg}"
+                else:
+                    result = response.result
+                    num_finished += result.is_final
+                    new_tokens = result.output_token_ids[beam_width - 1]
+                    tokens[response.request_id].extend(new_tokens)
+            i += 1
     assert i < max_wait_ms
 
     for request_id in expected_num_tokens:
@@ -448,7 +525,7 @@ def test_token_comparison(batching_type: trtllm.BatchingType, streaming: bool,
     max_wait_ms = 10000
     while num_finished < num_requests and i < max_wait_ms:
         wait_time = datetime.timedelta(milliseconds=1)
-        responses = executor.await_responses(None, wait_time)
+        responses = executor.await_responses(wait_time)
         for response in responses:
             num_responses += 1
             assert not response.has_error(
@@ -481,7 +558,7 @@ def test_gpt_executor_timed_out(model_files, model_path):
     assert num_responses_ready == 0
 
     wait_time = datetime.timedelta(milliseconds=10)
-    responses = executor.await_responses(None, wait_time)
+    responses = executor.await_responses(wait_time)
     assert len(responses) == 0
 
 
@@ -599,6 +676,35 @@ def test_lora_config():
     assert (lora_config.config == config).all()
 
 
+@skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
+def test_wakeup(model_files, model_path):
+    import threading
+
+    def resp_thread(stop_signal: threading.Event, executor: trtllm.Executor):
+        while not stop_signal.is_set():
+            timeout = None
+            responses = executor.await_responses(timeout=timeout)
+            if stop_signal.is_set():
+                return
+            for response in responses:
+                response.result.output_token_ids
+
+    executor = trtllm.Executor(model_path, trtllm.ModelType.DECODER_ONLY,
+                               trtllm.ExecutorConfig())
+    stop_signal = threading.Event()
+    thread = threading.Thread(target=resp_thread, args=(stop_signal, executor))
+    thread.start()
+    request = trtllm.Request(input_token_ids=[1, 2, 3, 4],
+                             max_new_tokens=5,
+                             streaming=True)
+    executor.enqueue_request(request)
+    time.sleep(2)
+    stop_signal.set()
+    executor.shutdown()
+    thread.join()
+    assert not thread.is_alive()
+
+
 def test_request():
     kwargs = {
         "input_token_ids": [1, 2, 3],
@@ -667,13 +773,13 @@ def test_response():
 
 
 def test_scheduler_config():
-    policy = trtllm.SchedulerPolicy.MAX_UTILIZATION
+    policy = trtllm.CapacitySchedulerPolicy.MAX_UTILIZATION
     config = trtllm.SchedulerConfig(policy)
-    assert config.policy == policy
+    assert config.capacity_scheduler_policy == policy
 
-    policy = trtllm.SchedulerPolicy.GUARANTEED_NO_EVICT
+    policy = trtllm.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
     config = trtllm.SchedulerConfig(policy)
-    assert config.policy == policy
+    assert config.capacity_scheduler_policy == policy
 
 
 def test_kv_cache_config():
@@ -713,12 +819,13 @@ def test_executor_config():
     assert isinstance(config.peft_cache_config, trtllm.PeftCacheConfig)
     assert config.logits_post_processor_map is None
     assert config.medusa_choices is None
+    assert config.decoding_mode is None
 
     kwargs = {
         "max_beam_width":
         2,
         "scheduler_config":
-        trtllm.SchedulerConfig(trtllm.SchedulerPolicy.MAX_UTILIZATION),
+        trtllm.SchedulerConfig(trtllm.CapacitySchedulerPolicy.MAX_UTILIZATION),
         "kv_cache_config":
         trtllm.KvCacheConfig(),
         "enable_chunked_context":
@@ -735,13 +842,15 @@ def test_executor_config():
         trtllm.PeftCacheConfig(10),
         "logits_post_processor_map": {},
         "medusa_choices": [[1, 2, 3]],
+        "decoding_mode":
+        trtllm.DecodingMode.TOP_K_TOP_P,
     }
     config = trtllm.ExecutorConfig(**kwargs)
     for k, v in kwargs.items():
         if "config" not in k:
             assert getattr(config, k) == v
     assert isinstance(config.scheduler_config, trtllm.SchedulerConfig)
-    assert config.scheduler_config.policy == trtllm.SchedulerPolicy.MAX_UTILIZATION
+    assert config.scheduler_config.capacity_scheduler_policy == trtllm.CapacitySchedulerPolicy.MAX_UTILIZATION
     assert isinstance(config.kv_cache_config, trtllm.KvCacheConfig)
     assert isinstance(config.parallel_config, trtllm.ParallelConfig)
     assert isinstance(config.peft_cache_config, trtllm.PeftCacheConfig)
@@ -758,6 +867,18 @@ def test_parallel_config():
     assert parallel_config.communication_mode == comm_mode
     assert parallel_config.device_ids == device_ids
     assert parallel_config.participant_ids == participant_ids
+
+    comm_mode = trtllm.CommunicationMode.ORCHESTRATOR
+    #Dummy path to worker executable
+    worker_path = _os.path.abspath(__file__)
+    orchestrator_config = trtllm.OrchestratorConfig(True, str(worker_path))
+    parallel_config = trtllm.ParallelConfig(comm_type, comm_mode, device_ids,
+                                            participant_ids,
+                                            orchestrator_config)
+    assert parallel_config.communication_mode == comm_mode
+    assert parallel_config.orchestrator_config.is_orchestrator == True
+    assert parallel_config.orchestrator_config.worker_executable_path == str(
+        worker_path)
 
 
 def test_peft_cache_config():
@@ -844,3 +965,62 @@ def test_logits_post_processor(model_files, model_path):
     # check that all output tokens are 42
     print(tokens)
     assert tokens[-max_new_tokens:] == [42] * max_new_tokens
+
+
+def test_iteration_stats():
+    stats = trtllm.IterationStats()
+    stats.timestamp = "01:23:56"
+    stats.iter = 1
+    stats.num_active_requests = 2
+    stats.max_num_active_requests = 3
+    stats.gpu_mem_usage = 1024
+    stats.cpu_mem_usage = 2048
+    stats.pinned_mem_usage = 4096
+    stats_json = json.loads(stats.to_json_str())
+    assert stats_json["timestamp"] == stats.timestamp
+    assert stats_json["iter"] == stats.iter
+    assert stats_json["numActiveRequests"] == stats.num_active_requests
+    assert stats_json["maxNumActiveRequests"] == stats.max_num_active_requests
+    assert stats_json["gpuMemUsage"] == stats.gpu_mem_usage
+    assert stats_json["cpuMemUsage"] == stats.cpu_mem_usage
+    assert stats_json["pinnedMemUsage"] == stats.pinned_mem_usage
+    assert stats_json["kvCacheStats"] is None
+    assert stats_json["staticBatchingStats"] is None
+    assert stats_json["inflightBatchingStats"] is None
+
+
+def test_request_stats():
+    stats = trtllm.RequestStats()
+    stats.id = 1
+    stats.stage = trtllm.RequestStage.CONTEXT_IN_PROGRESS
+    stats.context_prefill_position = 2
+    stats.num_generated_tokens = 3
+    stats.scheduled = True
+    stats.paused = False
+    stats_json = json.loads(stats.to_json_str())
+    assert stats_json["id"] == stats.id
+    assert stats_json["stage"] == "CONTEXT_IN_PROGRESS"
+    assert stats_json[
+        "contextPrefillPosition"] == stats.context_prefill_position
+    assert stats_json["numGeneratedTokens"] == stats.num_generated_tokens
+    assert stats_json["scheduled"] == stats.scheduled
+    assert stats_json["paused"] == stats.paused
+
+
+def test_request_stats_per_iteration():
+    stats = trtllm.RequestStatsPerIteration()
+    stats.iter = 1
+    req_stat = trtllm.RequestStats()
+    req_stat.id = 1
+    stats.request_stats = [req_stat]
+    stats_json = json.loads(stats.to_json_str())
+    assert stats_json["iter"] == 1
+    assert stats_json["requestStats"][0]["id"] == 1
+
+
+def test_scheduler_config_pickle():
+    policy = trtllm.CapacitySchedulerPolicy.MAX_UTILIZATION
+    config = trtllm.SchedulerConfig(policy)
+    config_str = pickle.dumps(config)
+    config_copy = pickle.loads(config_str)
+    assert config.capacity_scheduler_policy == config_copy.capacity_scheduler_policy

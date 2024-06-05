@@ -230,6 +230,7 @@ bool benchmark_and_verify(int m, int n, int k, tensorrt_llm::common::QuantMode c
 {
     std::srand(20240123);
     simple_assert(m <= 4);
+    static constexpr int WSizeInBits = 8;
     bool per_token = quant_mode.hasPerTokenScaling();
     bool per_channel = quant_mode.hasPerChannelScaling();
     printf("mnk (%d, %d, %d), per token: %d, per channel: %d\n", m, n, k, per_token ? 1 : 0, per_channel ? 1 : 0);
@@ -268,7 +269,8 @@ bool benchmark_and_verify(int m, int n, int k, tensorrt_llm::common::QuantMode c
     d_out.copy_to(h_out1.data());
     time2 = run_cutlass_kernel<T>(params, warmup, iter);
     d_out.copy_to(h_out2.data());
-    bool pass = compare<T>(h_out1.data(), h_out2.data(), m * n, 1.f);
+    float quant_scale = 1.f / (1 << (WSizeInBits - 1));
+    bool pass = compare<T>(h_out1.data(), h_out2.data(), m * n, quant_scale);
     printf(
         "cuda kernel cost time %.6f, cutlass kernel cost time %.6f, cuda speedup %.3f\n", time1, time2, time2 / time1);
     return pass;

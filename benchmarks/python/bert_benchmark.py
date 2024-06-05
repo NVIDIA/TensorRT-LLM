@@ -29,13 +29,15 @@ from tensorrt_llm.runtime import TensorInfo
 
 class BERTBenchmark(BaseBenchmark):
 
-    def __init__(self, args, batch_sizes, in_lens, rank, world_size):
+    def __init__(self, args, batch_sizes, in_lens, gpu_weights_percents, rank,
+                 world_size):
         super().__init__(args.engine_dir, args.model, args.dtype, rank,
                          world_size, args.serial_build)
         self.batch_sizes = batch_sizes
         self.in_lens = in_lens
         self.build_time = 0
         self.mode = args.mode
+        self.gpu_weights_percents = gpu_weights_percents
 
         if args.engine_dir is not None:
             # Deserialize engine from engine directory
@@ -64,6 +66,12 @@ class BERTBenchmark(BaseBenchmark):
         self.session = tensorrt_llm.runtime.Session.from_serialized_engine(
             engine_buffer)
 
+        # Print context memory size for CI/CD to track.
+        context_mem_size = self.session.context_mem_size
+        print(
+            f"Allocated {context_mem_size / 1048576.0:.2f} MiB for execution context memory."
+        )
+
     def get_config(self):
         for inlen in self.in_lens:
             if inlen > self.max_input_len:
@@ -71,7 +79,12 @@ class BERTBenchmark(BaseBenchmark):
             for batch_size in self.batch_sizes:
                 if batch_size > self.max_batch_size:
                     continue
-                yield (batch_size, inlen)
+                for gpu_weights_percent in self.gpu_weights_percents:
+                    yield (batch_size, inlen, gpu_weights_percent)
+
+    def set_weight_streaming(self, config):
+        gpu_weights_percent = config[2]
+        self.session._set_weight_streaming(gpu_weights_percent)
 
     def prepare_inputs(self, config):
         batch_size, inlen = config[0], config[1]
@@ -125,6 +138,7 @@ class BERTBenchmark(BaseBenchmark):
         report_dict["batch_size"] = batch_size
         report_dict["input_length"] = inlen
         report_dict["output_length"] = "n/a"
+        report_dict["gpu_weights_percent"] = config[2]
         report_dict["latency(ms)"] = latency
         report_dict["build_time(s)"] = self.build_time
         report_dict["tokens_per_sec"] = "n/a"

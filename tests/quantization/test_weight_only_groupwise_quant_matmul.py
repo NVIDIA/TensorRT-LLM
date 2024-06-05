@@ -32,7 +32,8 @@ from tensorrt_llm.quantization.functional import \
     weight_only_groupwise_quant_matmul
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import skip_pre_ampere, skip_pre_hopper, unittest_name_func
+from utils.util import (skip_pre_ada_unittest, skip_pre_ampere_unittest,
+                        skip_pre_hopper_unittest, unittest_name_func)
 
 
 class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
@@ -177,8 +178,12 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
         unprocessed_weight = unprocessed_int_weight.view(torch.int8)
 
         ref_q_weight = unpacker(unprocessed_weight)
-        cuda_q_weight = preprocessor(
-            unprocessed_weight, quantized_weight_dtype).view(activation_dtype)
+        if use_w4a8_awq:
+            activation_type = torch.float8_e4m3fn
+        else:
+            activation_type = torch.float16
+        cuda_q_weight = preprocessor(unprocessed_weight, quantized_weight_dtype,
+                                     activation_type).view(activation_dtype)
 
         # Flags for indicating whether the corresponding inputs are applied in quant_algo
         BIAS = 1
@@ -220,7 +225,7 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
          (48, 2048, 384, 'float16', False, False, True, 128),
          (96, 2048, 1024, 'float16', False, False, False, 128)],
         name_func=unittest_name_func)
-    @skip_pre_ampere
+    @skip_pre_ampere_unittest
     def test_matmul_int4_input(self,
                                m,
                                n,
@@ -244,7 +249,7 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
          (48, 2048, 384, 'bfloat16', False, False, True, 128),
          (96, 2048, 1024, 'bfloat16', False, False, False, 128)],
         name_func=unittest_name_func)
-    @skip_pre_ampere
+    @skip_pre_ampere_unittest
     def test_matmul_bf16_int4_input(self,
                                     m,
                                     n,
@@ -266,7 +271,7 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
                            (64, 1024, 256, 'float16', True, False, 128),
                            (384, 2048, 384, 'float16', False, True, 128),
                            (512, 2048, 1024, 'float16', False, False, 128)])
-    @skip_pre_ampere
+    @skip_pre_ampere_unittest
     def test_prequant_matmul_fp16_int4_input(self,
                                              m,
                                              n,
@@ -289,7 +294,7 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
                            (384, 2048, 384, 'bfloat16', False, True, 128),
                            (512, 2048, 1024, 'bfloat16', False, False, 128)],
                           name_func=unittest_name_func)
-    @skip_pre_ampere
+    @skip_pre_ampere_unittest
     def test_prequant_matmul_bf16_int4_input(self,
                                              m,
                                              n,
@@ -313,11 +318,10 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
          (128, 2048, 384, 'float16', True, False, True, 128, False),
          (256, 2048, 1024, 'float16', True, False, False, 128, True)],
         name_func=unittest_name_func)
-    @skip_pre_hopper
-    def test_prequant_matmul_fp8_int4_input_hopper(self, m, n, k, dtype,
-                                                   has_pre_quant, has_zero,
-                                                   has_bias, group_size,
-                                                   use_w4a8_awq):
+    @skip_pre_ada_unittest
+    def test_prequant_matmul_fp8_int4_input(self, m, n, k, dtype, has_pre_quant,
+                                            has_zero, has_bias, group_size,
+                                            use_w4a8_awq):
         self._woq_groupwise_matmul(m,
                                    n,
                                    k,
@@ -340,7 +344,7 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
          (64, 2048, 1024, 'float16', True, False, False, 320)],
         name_func=unittest_name_func,
     )
-    @skip_pre_hopper
+    @skip_pre_hopper_unittest
     def test_hopper_flexible_groups(self, m, n, k, act_dtype, has_pre_quant,
                                     has_zero, has_bias, group_size):
         self._woq_groupwise_matmul(m, n, k, act_dtype, torch.quint4x2,
@@ -357,7 +361,7 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
          (32, 2048, 1024, 'float16', True, False, True, 512),
          (64, 2048, 2048, 'float16', True, False, False, 640)],
         name_func=unittest_name_func)
-    @skip_pre_hopper
+    @skip_pre_hopper_unittest
     def test_hopper_fp8_int4_flexible_groups(self, m, n, k, dtype,
                                              has_pre_quant, has_zero, has_bias,
                                              group_size):

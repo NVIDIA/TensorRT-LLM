@@ -22,6 +22,8 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/cubinObjRegistry.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/decoderXQAImplJIT.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplPrecompiled.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/xqaParams.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
@@ -75,8 +77,10 @@ struct XQADispatchHelper<__nv_bfloat16, KVBlockArray>
 class DecoderXQARunner
 {
 public:
-    DecoderXQARunner(
-        const XQADataType data_type, int num_heads, int num_kv_heads, int head_size, bool multi_block_mode);
+    // Resources for constructing a DecoderXQARunner object.
+    class Resource;
+    DecoderXQARunner(Resource* resource, const XQADataType data_type, int num_heads, int num_kv_heads, int head_size,
+        bool multi_block_mode);
     ~DecoderXQARunner();
 
     /**
@@ -155,45 +159,33 @@ public:
                 SUPPORT_RETURN_FALSE("nbHeads");
             }
         }
-        return shouldUseImpl(xqaParams);
+        return shouldUseImpl(xqaParams, forConfigurePlugin);
     }
 
-    size_t getWorkspaceSize(int max_batch_beam_size);
+    size_t getWorkspaceSize(int max_batch_beam_size, int max_num_tokens);
 
     void prepare(XQAParams const& xqa_params)
     {
-        if (!mPrepareCalled)
-        {
-            this->prepareForRun(xqa_params);
-            mPrepareCalled = true;
-        }
+        this->prepareForRun(xqa_params);
     }
 
     template <typename KVCacheBuffer>
-    void dispatch(XQAParams const& xqa_params, KVCacheBuffer& kv_cache_buffer, cudaStream_t const& stream)
+    void dispatch(XQAParams const& xqa_params, KVCacheBuffer const& kv_cache_buffer, cudaStream_t const& stream)
     {
-        if (!mPrepareCalled)
-        {
-            TLLM_THROW("DecoderXQARunner::prepare() hasn't been called before DecoderXQARunner::dispatch().");
-        }
         sync_check_cuda_error();
         this->run(xqa_params, kv_cache_buffer, stream);
     }
 
 private:
-    bool shouldUseImpl(XQAParams const& xqa_params);
+    bool shouldUseImpl(XQAParams const& xqa_params, bool for_configure_plugin);
     void prepareForRun(XQAParams const& xqa_params);
 
     template <typename KVCacheBuffer>
-    void run(XQAParams const& xqa_params, KVCacheBuffer& kv_cache_buffer, cudaStream_t const& stream);
+    void run(XQAParams const& xqa_params, KVCacheBuffer const& kv_cache_buffer, cudaStream_t const& stream);
 
     static constexpr int kMaxBeamWidth = 4;
 
-    // Cache the grid_size and block_size that gives the highest occupancy for
-    //  invokeApplyBiasRopeUpdateKVCache.
-    int2 mLaunchGridBlockCache = make_int2(0, 0);
-
-    bool mPrepareCalled;
+    Resource* mResource;
 
     XQADataType mDataType;
     int mNumHeads;
@@ -202,9 +194,35 @@ private:
     bool mMultiBlockMode;
     int mMultiProcessorCount;
 
-    std::unique_ptr<DecoderXQAImpl> mImpl;
+    std::unique_ptr<DecoderXQAImpl> mJITImpl, mPrecompiledImpl;
+    DecoderXQAImpl* getImplFromXQAParams(XQAParams const& params);
 
     friend DecoderXQAImplPrecompiled;
+    friend DecoderXQAImplJIT;
+};
+
+class DecoderXQARunner::Resource
+{
+public:
+    Resource();
+    Resource(Resource const& other);
+    Resource& operator=(Resource const& other);
+    Resource(Resource&& other) = default;
+    Resource& operator=(Resource&& other) = default;
+    // Construct from a serialized buffer.
+    Resource(void const* buffer, size_t buffer_size);
+    ~Resource() = default;
+
+    jit::CubinObjRegistry* getCubinObjRegistry()
+    {
+        return mCubinObjRegistry.get();
+    }
+
+    size_t getSerializationSize() const noexcept;
+    void serialize(void* buffer, size_t buffer_size) const noexcept;
+
+private:
+    std::unique_ptr<jit::CubinObjRegistry> mCubinObjRegistry;
 };
 
 } // namespace kernels

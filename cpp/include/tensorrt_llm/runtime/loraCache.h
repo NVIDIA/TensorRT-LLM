@@ -16,23 +16,41 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
-#include "tensorrt_llm/runtime/gptModelConfig.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/loraCachePageManagerConfig.h"
 #include "tensorrt_llm/runtime/loraModule.h"
+#include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
-#include <NvInferRuntimeBase.h>
+
+#include <NvInferRuntime.h>
+
 #include <deque>
 #include <list>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <unordered_map>
 
 namespace tensorrt_llm::runtime
 {
+
+class LoraExpectedException : public std::runtime_error
+{
+public:
+    explicit LoraExpectedException(std::string const& msg);
+    ~LoraExpectedException() noexcept override;
+};
+
+class LoraCacheFullException : public LoraExpectedException
+{
+public:
+    explicit LoraCacheFullException(std::string const& msg);
+    ~LoraCacheFullException() noexcept override;
+};
 
 /**
  * Holds memory of lora cache pages, and manages allocation and freeing of whole pages.
@@ -58,14 +76,14 @@ public:
      * \returns a tuple, where the first values is a boolean indicating whether pages were claimed.  If the first value
      * is true the second value will have a list of pageIds
      */
-    [[nodiscard]] std::optional<std::vector<std::size_t>> claimPages(SizeType numPages);
+    [[nodiscard]] std::optional<std::vector<std::size_t>> claimPages(SizeType32 numPages);
 
     /**
      * \brief get number of available (free) pages in manager
      *
      * \returns number of free pages in manager
      */
-    [[nodiscard]] SizeType numAvailablePages() const;
+    [[nodiscard]] SizeType32 numAvailablePages() const;
 
     /**
      * \brief release given pages
@@ -80,7 +98,7 @@ public:
      * \param[in] blockIdx;
      * \returns -- pointer to page block
      */
-    [[nodiscard]] ITensor::SharedConstPtr blockPtr(SizeType blockIdx) const;
+    [[nodiscard]] ITensor::SharedConstPtr blockPtr(SizeType32 blockIdx) const;
 
     /**
      * \brief return pointer to given page
@@ -137,13 +155,13 @@ public:
     struct TaskLayerModuleConfig
     {
         std::size_t pageId;
-        SizeType slotIdx;
-        SizeType inSize;  // adapterSize * inDim
-        SizeType outSize; // outDim * adapterSize
-        SizeType moduleId;
-        SizeType layerId;
-        SizeType adapterSize;
-        SizeType numSlots; // number of slots used by this layer / module. Used to avoid copying extra data from page.
+        SizeType32 slotIdx;
+        SizeType32 inSize;  // adapterSize * inDim
+        SizeType32 outSize; // outDim * adapterSize
+        SizeType32 moduleId;
+        SizeType32 layerId;
+        SizeType32 adapterSize;
+        SizeType32 numSlots; // number of slots used by this layer / module. Used to avoid copying extra data from page.
 
         // pointer to inWeights cast to an int64_t
         std::int64_t weightsInPointer;
@@ -159,11 +177,11 @@ public:
 
     /**
      * param[in] pageManagerConfig: a LoraCachePageManagerConfig
-     * param[in] modelConfig: a GptModelConfig
+     * param[in] modelConfig: a ModelConfig
      * param[in] worldConfig: a WorldConfig
      * param[in] bufferManager: a BufferManager only used to allocate page blocks
      */
-    LoraCache(LoraCachePageManagerConfig const& pageManagerConfig, GptModelConfig const& modelConfig,
+    LoraCache(LoraCachePageManagerConfig const& pageManagerConfig, ModelConfig const& modelConfig,
         WorldConfig const& worldConfig, BufferManager const& bufferManager);
 
     /**
@@ -240,13 +258,13 @@ public:
      * \param[in] taskId: the taskid
      * \returns -- number of pages needed to store the given task
      */
-    [[nodiscard]] SizeType determineNumPages(TaskIdType taskId) const;
+    [[nodiscard]] SizeType32 determineNumPages(TaskIdType taskId) const;
 
     /**
      * \param[in] config: lora config tensor
      * \returns -- number of pages needed to store the task configured with config tensor
      */
-    [[nodiscard]] SizeType determineNumPages(TensorPtr config) const;
+    [[nodiscard]] SizeType32 determineNumPages(TensorPtr config) const;
 
     /**
      * \param[in] config: a lora config tensor
@@ -265,7 +283,7 @@ public:
     /**
      * \returns -- total number of pages allocated to cache (used or not)
      */
-    [[nodiscard]] SizeType getNumPages() const;
+    [[nodiscard]] SizeType32 getNumPages() const;
 
     /**
      * \param[in] pageId: the page id
@@ -277,7 +295,7 @@ public:
      * \brief Copy task weights to cache pages.
      * \param[in] weights: task weights
      * \param[in] config: task config tensor
-     * \param[in] modelConfig: a GptModelConfig
+     * \param[in] modelConfig: a ModelConfig
      * \param[in] worldConfig: a WorldConfig
      * \param[in] modelIdToModel: map from lora module id to LoraModule
      * \param[in] manager: a BufferManager the manager to use to perform the copies
@@ -286,8 +304,8 @@ public:
      * \returns -- list of cache Values objects
      */
     static std::vector<LoraCache::TaskLayerModuleConfig> copyToPages(TensorPtr weights, TensorPtr config,
-        GptModelConfig const& modelConfig, WorldConfig const& worldConfig,
-        std::unordered_map<SizeType, LoraModule> moduleIdToModel, BufferManager const& manager,
+        ModelConfig const& modelConfig, WorldConfig const& worldConfig,
+        std::unordered_map<SizeType32, LoraModule> moduleIdToModel, BufferManager const& manager,
         std::vector<TensorPtr> const& pages, std::vector<std::size_t> const& pageIds);
 
     /**
@@ -297,7 +315,7 @@ public:
      * \param[in] tpSize: number of splits
      * \param[in] tpRank: the split to write to output
      */
-    static void splitTransposeCpu(ITensor& output, ITensor const& input, SizeType tpSize, SizeType tpRank);
+    static void splitTransposeCpu(ITensor& output, ITensor const& input, SizeType32 tpSize, SizeType32 tpRank);
 
 private:
     /**
@@ -385,7 +403,7 @@ private:
     };
 
     LoraCachePageManagerConfig mPageManagerConfig;
-    GptModelConfig mModelConfig;
+    ModelConfig mModelConfig;
     WorldConfig mWorldConfig;
 
     // Protects mCachePageManager
@@ -405,10 +423,10 @@ private:
     std::vector<std::unique_ptr<BufferManager>> mDeviceBufferManagers;
     std::unique_ptr<BufferManager> mBufferManager;
 
-    std::unordered_map<SizeType, LoraModule> mModuleIdToModule;
+    std::unordered_map<SizeType32, LoraModule> mModuleIdToModule;
 
     template <typename T>
-    static void splitTransposeCpuInner(ITensor& output, ITensor const& input, SizeType tpSize, SizeType tpRank);
+    static void splitTransposeCpuInner(ITensor& output, ITensor const& input, SizeType32 tpSize, SizeType32 tpRank);
 
     void loadWeights(TaskValue& cacheValue, TensorPtr weights, TensorPtr config);
     void bumpTaskInProgress(TaskIdType taskId);
@@ -420,12 +438,12 @@ private:
      * \returns -- list of page ids
      * \throws std::runtime_error if all pages cannot be claimed
      */
-    [[nodiscard]] std::vector<std::size_t> claimPagesWithEvict(SizeType numPages);
+    [[nodiscard]] std::vector<std::size_t> claimPagesWithEvict(SizeType32 numPages);
 
     /**
      * Internal helper method used inside copyTask.  Not thread safe on its own
      */
-    std::map<size_t, std::pair<size_t, SizeType>> copyTaskMapPages(TaskValue& targetTaskValue,
+    std::map<size_t, std::pair<size_t, SizeType32>> copyTaskMapPages(TaskValue& targetTaskValue,
         TaskValue const& sourceTaskValue, std::vector<size_t> const& targetPageIds, LoraCache const& targetCache);
 };
 

@@ -23,9 +23,8 @@ from typing import List, Optional, Tuple, Union
 
 import tensorrt as trt
 
-from tensorrt_llm.logger import logger
-
 from .._ipc_utils import IpcMemory
+from ..logger import logger
 from ..mapping import Mapping
 
 TRT_LLM_PLUGIN_NAMESPACE = 'tensorrt_llm'
@@ -86,12 +85,11 @@ class PluginConfig:
     context_fmha_fp32_acc: bool = False  # will use fp16 if disabled
     paged_kv_cache: bool = True
     remove_input_padding: bool = True
-    # TODO[kevin]: smart strategy to choose all reduce plugin
     use_custom_all_reduce: bool = True
     multi_block_mode: bool = False
     enable_xqa: bool = True
     attention_qk_half_accumulation: bool = False
-    tokens_per_block: int = 128
+    tokens_per_block: int = 64
     use_paged_context_fmha: bool = False
     use_fp8_context_fmha: bool = False
     use_context_fmha_for_generation: bool = False
@@ -103,7 +101,7 @@ class PluginConfig:
         assert hasattr(self, name), f"Plugin name doesn't exist: {name}"
         if value is not None and getattr(self, name) is not None:
             target_type = type(getattr(self, name))
-            assert type(value) == target_type, \
+            assert isinstance(value, target_type), \
                 f"Plugin {name} expects {target_type}, got {type(value)}"
         setattr(self, name, value)
         logger.info(f"Set {name} to {value}.")
@@ -112,7 +110,7 @@ class PluginConfig:
         for name in config.keys():
             if hasattr(self, name):
                 value_to_be_update = config[name]
-                if type(getattr(self, name)) == bool:
+                if isinstance(getattr(self, name), bool):
                     if value_to_be_update is True or \
                             value_to_be_update == "enable":
                         value_to_be_update = True
@@ -191,9 +189,13 @@ class PluginConfig:
         self.set_plugin("remove_input_padding", True)
         return self
 
-    def enable_paged_kv_cache(self, tokens_per_block=128):
+    def enable_paged_kv_cache(self, tokens_per_block=64):
         self.set_plugin("paged_kv_cache", True)
         self.set_plugin("tokens_per_block", tokens_per_block)
+        return self
+
+    def enable_paged_state(self):
+        self.set_plugin("paged_state", True)
         return self
 
     def set_gpt_attention_plugin(self, dtype='float16'):
@@ -204,8 +206,8 @@ class PluginConfig:
         self.set_plugin("multi_block_mode", True)
         return self
 
-    def enable_xqa_optimization(self):
-        self.set_plugin("enable_xqa", True)
+    def disable_xqa_optimization(self):
+        self.set_plugin("enable_xqa", False)
         return self
 
     def set_bert_attention_plugin(self, dtype='float16'):
@@ -250,7 +252,11 @@ class PluginConfig:
 
     def set_nccl_plugin(self,
                         dtype='float16',
-                        use_custom_all_reduce: bool = False):
+                        use_custom_all_reduce: bool = True):
+        if not use_custom_all_reduce:
+            logger.warning(
+                "allreduce algorithm is selected automatically during execution now. "
+                "use_custom_all_reduce will be deprecated in future releases. ")
         self.set_plugin("nccl_plugin", dtype)
         self.set_plugin("use_custom_all_reduce", use_custom_all_reduce)
         if use_custom_all_reduce:
@@ -277,6 +283,11 @@ class PluginConfig:
         self.set_plugin("use_paged_context_fmha", True)
         return self
 
+    def set_fp8_context_fmha(self):
+        self.set_plugin("use_fp8_context_fmha", True)
+        self.set_context_fmha()
+        return self
+
     def set_context_fmha_for_generation(self):
         self.set_plugin("use_context_fmha_for_generation", True)
         return self
@@ -295,6 +306,7 @@ cli_plugin_args = [
     "lora_plugin",
     "moe_plugin",
     "mamba_conv1d_plugin",
+    "nccl_plugin",
 
     # Features
     "context_fmha",
@@ -402,12 +414,12 @@ class CustomAllReduceHelper:
     def allocate_workspace(mapping: Mapping,
                            size: int) -> Tuple[List[IpcMemory], "torch.tensor"]:
         import torch
-        ipc_buffers_ping = IpcMemory(mapping, size * mapping.world_size)
-        ipc_buffers_pong = IpcMemory(mapping, size * mapping.world_size)
+        ipc_buffers_ping = IpcMemory(mapping, size * mapping.tp_size)
+        ipc_buffers_pong = IpcMemory(mapping, size * mapping.tp_size)
         ipc_barriers_in = IpcMemory(
-            mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size)
+            mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size * 2)
         ipc_barriers_out = IpcMemory(
-            mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size)
+            mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size * 2)
         buffers = [
             ipc_buffers_ping,
             ipc_buffers_pong,

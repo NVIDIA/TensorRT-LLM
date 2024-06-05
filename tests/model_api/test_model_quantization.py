@@ -12,13 +12,13 @@ from tensorrt_llm.quantization import QuantAlgo
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root
-from utils.util import force_ampere, skip_no_ammo, skip_pre_ada
+from utils.util import force_ampere, skip_no_modelopt, skip_pre_ada
 
 tensorrt_llm.logger.set_level('info')
 
 
 @force_ampere
-@skip_no_ammo
+@skip_no_modelopt
 def test_int4_awq_quantization():
     input_text = [
         'Born in north-east France, Soyer trained as a',
@@ -56,7 +56,7 @@ def test_int4_awq_quantization():
 
 
 @skip_pre_ada
-@skip_no_ammo
+@skip_no_modelopt
 def test_fp8_quantization():
     input_text = [
         'Born in north-east France, Soyer trained as a',

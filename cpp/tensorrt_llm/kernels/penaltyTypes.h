@@ -16,6 +16,9 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/assert.h"
+
+#include <limits>
 #include <string>
 #include <unordered_map>
 
@@ -33,19 +36,22 @@ enum class DecodingPenaltyType
     MinLength,   // the min length penalty
 };
 
-inline float getDefaultPenaltyValue(DecodingPenaltyType penalty_type)
+inline std::pair<float, float> getLimitsPenalty(DecodingPenaltyType penaltyType)
 {
-    switch (penalty_type)
-    {
-    case DecodingPenaltyType::Temperature: return 1.0f;
-    case DecodingPenaltyType::Repetition: return 1.0f;
-    case DecodingPenaltyType::Presence: return 0.0f;
-    case DecodingPenaltyType::Frequency: return 0.0f;
-    case DecodingPenaltyType::MinLength: return 1.0f;
-    default: break;
-    }
-    return 0.0f;
-}
+    auto constexpr fltMax = std::numeric_limits<float>::max();
+    auto constexpr fltMin = std::numeric_limits<float>::lowest();
+    auto constexpr fltEpsilon = std::numeric_limits<float>::epsilon();
 
+    switch (penaltyType)
+    {
+    case DecodingPenaltyType::Temperature: return std::make_pair(0.f, fltMax);
+    case DecodingPenaltyType::Repetition: return std::make_pair(0.f, fltMax);
+    case DecodingPenaltyType::Presence: return std::make_pair(fltMin, fltMax);
+    case DecodingPenaltyType::Frequency: return std::make_pair(fltMin, fltMax);
+    case DecodingPenaltyType::MinLength: return std::make_pair(-fltEpsilon, fltMax);
+    }
+    TLLM_CHECK_WITH_INFO(false, "Unknown penalty type %d", static_cast<int32_t>(penaltyType));
+    return std::make_pair(fltMin, fltMax);
+}
 } // namespace kernels
 } // namespace tensorrt_llm

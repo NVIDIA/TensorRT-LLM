@@ -230,9 +230,9 @@ If the engines are run successfully, you will see output like (falcon-rw-1b as t
 
 ### FP8 Post-Training Quantization
 
-The examples below use the NVIDIA AMMO (AlgorithMic Model Optimization) toolkit for the model quantization process.
+The examples below use the NVIDIA Modelopt (AlgorithMic Model Optimization) toolkit for the model quantization process.
 
-First make sure AMMO toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
+First make sure Modelopt toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
 
 Now quantize HF Falcon weights and export trtllm checkpoint.
 
@@ -263,9 +263,9 @@ Note that you can enable fp8 context fmha to get further acceleration by setting
 
 ### Groupwise quantization (AWQ)
 
-The examples below use the NVIDIA AMMO (AlgorithMic Model Optimization) toolkit for the model quantization process.
+The examples below use the NVIDIA Modelopt (AlgorithMic Model Optimization) toolkit for the model quantization process.
 
-First make sure AMMO toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
+First make sure Modelopt toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
 
 Now quantize HF Falcon weights and export trtllm checkpoint.
 
@@ -291,7 +291,7 @@ mpirun -n 2 --allow-run-as-root --oversubscribe \
 ```
 
 #### W4A16 AWQ with FP8 GEMM (W4A8 AWQ)
-For Hopper GPUs, TRT-LLM also supports employing FP8 GEMM for accelerating linear layers. This mode is noted with `w4a8_awq` for AMMO and TRT-LLM, in which both weights and activations are converted from W4A16 to FP8 for GEMM calculation.
+For Hopper GPUs, TRT-LLM also supports employing FP8 GEMM for accelerating linear layers. This mode is noted with `w4a8_awq` for Modelopt and TRT-LLM, in which both weights and activations are converted from W4A16 to FP8 for GEMM calculation.
 
 Please make sure your system contains a Hopper GPU before trying the commands below.
 

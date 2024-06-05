@@ -68,6 +68,13 @@ def parse_arguments():
         'You must also use --use_weight_only for that argument to have an impact.'
     )
     parser.add_argument(
+        '--calib_dataset',
+        type=str,
+        default='ccdv/cnn_dailymail',
+        help=
+        "The huggingface dataset name or the local directory of the dataset for calibration."
+    )
+    parser.add_argument(
         "--smoothquant",
         "-sq",
         type=float,
@@ -99,7 +106,7 @@ def parse_arguments():
         'By default, we use dtype for KV cache. int8_kv_cache chooses int8 quantization for KV'
     )
     parser.add_argument(
-        '--ammo_quant_ckpt_path',
+        '--modelopt_quant_ckpt_path',
         type=str,
         default=None,
         help='Path of a quantized model checkpoint in .npz format')
@@ -298,27 +305,35 @@ def from_cli_args(args):
     return config
 
 
-def preload_model(model_dir):
+def preload_model(model_dir, load_model_on_cpu):
+    use_safetensors = True
     from transformers import AutoConfig, AutoModelForCausalLM
     if "vila" in model_dir:
+        use_safetensors = False
         sys.path.append(model_dir + "/../VILA")
         from llava.model import LlavaConfig, LlavaLlamaForCausalLM
         AutoConfig.register("llava_llama", LlavaConfig)
         AutoModelForCausalLM.register(LlavaConfig, LlavaLlamaForCausalLM)
 
     hf_config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+    model_cls = AutoModelForCausalLM
     if hf_config.model_type == "llava":
+        use_safetensors = False
         from transformers import LlavaForConditionalGeneration
-        hf_llava = LlavaForConditionalGeneration.from_pretrained(
-            model_dir, torch_dtype="auto")
-        model = hf_llava.language_model
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_dir,
-            device_map='auto',
-            torch_dtype='auto',
-            trust_remote_code=True,
-        )
+        model_cls = LlavaForConditionalGeneration
+    use_safetensors = any(
+        [f.endswith(".safetensors")
+         for f in os.listdir(model_dir)]) and use_safetensors
+    if use_safetensors:
+        return None
+    model = model_cls.from_pretrained(
+        model_dir,
+        device_map='auto' if not load_model_on_cpu else 'cpu',
+        torch_dtype='auto',
+        trust_remote_code=True,
+    )
+    if hf_config.model_type == "llava":
+        model = model.language_model
     return model
 
 
@@ -347,12 +362,14 @@ def convert_and_save_hf(args):
                                   quantization,
                                   dtype=args.dtype,
                                   mapping=mapping,
+                                  calib_dataset=args.calib_dataset,
                                   override_fields=override_fields,
                                   dataset_cache_dir=args.dataset_cache_dir)
     else:
         # When not loading by shard, preload one complete model and then slice per rank weights from this
         # this saves the disk reloading time
-        hf_model = preload_model(model_dir) if not args.load_by_shard else None
+        hf_model = preload_model(
+            model_dir, load_model_on_cpu) if not args.load_by_shard else None
 
         def convert_and_save_rank(args, rank):
             mapping = Mapping(world_size=world_size,
@@ -367,12 +384,13 @@ def convert_and_save_hf(args):
                 load_by_shard=load_by_shard,
                 load_model_on_cpu=load_model_on_cpu,
                 override_fields=override_fields,
-                preloaded_model=hf_model)
+                preloaded_model=hf_model,
+            )
             llama.save_checkpoint(args.output_dir, save_config=(rank == 0))
             del llama
-            release_gc()
 
         execute(args.workers, [convert_and_save_rank] * world_size, args)
+        release_gc()
 
 
 def convert_and_save_gptq(args, rank):
@@ -386,7 +404,7 @@ def convert_and_save_gptq(args, rank):
         mapping=mapping,
         quantization=args_to_quantization(args),
         skip_loading_weights=True)
-    weights = load_from_gptq_llama(llama.config, args.ammo_quant_ckpt_path)
+    weights = load_from_gptq_llama(llama.config, args.modelopt_quant_ckpt_path)
     llama.load(weights)
     llama.save_checkpoint(args.output_dir, rank == 0)
 
@@ -430,11 +448,11 @@ def main():
         execute(args.workers, [convert_and_save_meta] * world_size, args)
     elif args.weight_only_precision == 'int4_gptq':
         assert args.model_dir is not None
-        assert args.ammo_quant_ckpt_path is not None
+        assert args.modelopt_quant_ckpt_path is not None
         execute(args.workers, [convert_and_save_gptq] * world_size, args)
     else:  # all other non-gptq paths from hf model
         assert args.model_dir is not None
-        assert args.ammo_quant_ckpt_path is None, "only gptq weights only needs this option"
+        assert args.modelopt_quant_ckpt_path is None, "only gptq weights only needs this option"
         convert_and_save_hf(args)
 
     tok = time.time()

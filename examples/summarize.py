@@ -85,9 +85,15 @@ def main(args):
         dataset_input_key = 'input'
         dataset_output_key = 'output'
         dataset_split = 'validation'  # only this split contains reference strings
+    if args.dataset_dir is not None and isinstance(args.dataset_dir, str):
+        args.dataset_dir = args.dataset_dir.rstrip('/')
+        if args.dataset_dir.endswith(dataset_name):
+            dataset_name = args.dataset_dir
+        else:
+            dataset_name = f"{args.dataset_dir}/{dataset_name}"
     dataset = load_dataset(dataset_name,
                            dataset_revision,
-                           cache_dir=args.dataset_path,
+                           cache_dir=args.dataset_cache_dir,
                            split=dataset_split)
 
     max_batch_size = args.batch_size
@@ -147,7 +153,7 @@ def main(args):
                 input_ids = tokenizer.encode(curr_text,
                                              return_tensors='pt').squeeze(0)
                 input_ids = input_ids[:test_token_num]
-            elif model_name == 'QWenForCausalLM':
+            elif model_name == 'QWenForCausalLM' and model_version == 'qwen':
                 # use make_content to generate prompt
                 system_prompt = "You are a useful assistant, please directly output the corresponding summary according to the article entered by the user."
                 _, input_id_list = make_context(
@@ -159,6 +165,16 @@ def main(args):
                 )
                 input_ids = torch.tensor(input_id_list)
             else:
+                if model_name == 'QWenForCausalLM' and model_version == 'qwen2':
+                    messages = [{
+                        "role": "system",
+                        "content": "You are a helpful assistant."
+                    }, {
+                        "role": "user",
+                        "content": curr_text
+                    }]
+                    curr_text = tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True)
                 input_ids = tokenizer.encode(
                     curr_text,
                     return_tensors='pt',
@@ -349,11 +365,11 @@ def main(args):
         runner_cls = ModelRunner if args.use_py_session else ModelRunnerCpp
         runner_kwargs = dict(engine_dir=args.engine_dir,
                              rank=runtime_rank,
-                             debug_mode=args.debug_mode)
+                             debug_mode=args.debug_mode,
+                             gpu_weights_percent=args.gpu_weights_percent)
         if args.medusa_choices is not None:
             args.medusa_choices = ast.literal_eval(args.medusa_choices)
-            assert args.use_py_session, "Medusa is only supported by py_session"
-            assert args.temperature == 0, "Medusa should use temperature == 0"
+            assert args.temperature == 1.0, "Medusa should use temperature == 1.0"
             assert args.num_beams == 1, "Medusa should use num_beams == 1"
             runner_kwargs.update(medusa_choices=args.medusa_choices)
         if not args.use_py_session:
@@ -405,11 +421,11 @@ def main(args):
                 input_lengths = lengths_info['input_lengths']
                 seq_lengths = lengths_info['seq_lengths']
                 output_token_count_trt_llm = sum(
-                    seq_lengths[idx][0] - input_lengths[idx]
-                    for idx in range(len(input_lengths)))
+                    seq_lengths[bs][bm] - input_lengths[bs]
+                    for bm in range(len(output_tensorrt_llm[0]))
+                    for bs in range(len(output_tensorrt_llm)))
                 total_output_token_count_trt_llm += output_token_count_trt_llm
 
-            if runtime_rank == 0:
                 for batch_idx in range(len(output_tensorrt_llm)):
                     for beam_idx in range(num_beams):
                         metric_tensorrt_llm[beam_idx].add_batch(
@@ -446,7 +462,8 @@ def main(args):
             'fp16': 'float16',
             'bf16': 'bfloat16'
         }
-        args.data_type = dtype_alias_mapping.get(args.data_type, args.data_type)
+        args.hf_data_type = dtype_alias_mapping.get(args.hf_data_type,
+                                                    args.hf_data_type)
         if model_name == 'ChatGLMForCausalLM' and model_version == 'glm':
             auto_model_cls = AutoModelForSeq2SeqLM
         elif model_name == 'ChatGLMForCausalLM' and model_version == 'chatglm':
@@ -456,7 +473,7 @@ def main(args):
         model = auto_model_cls.from_pretrained(
             args.hf_model_dir,
             trust_remote_code=True,
-            torch_dtype=str_dtype_to_torch(args.data_type),
+            torch_dtype=str_dtype_to_torch(args.hf_data_type),
             device_map='auto' if args.hf_device_map_auto else None)
         try:
             model.to_bettertransformer()
@@ -488,7 +505,7 @@ def main(args):
 
         ite_count = 0
         data_point_idx = 0
-        total_output_token_count_trt_llm = 0  # only valid for runtime_rank == 0
+        total_output_token_count_hf = 0  # only valid for runtime_rank == 0
         while (data_point_idx < len(dataset)) and (ite_count < args.max_ite):
             if runtime_rank == 0:
                 logger.debug(
@@ -498,7 +515,7 @@ def main(args):
                                                 max_batch_size)]
 
             profiler.start('hf')
-            output_hf, _, curr_ppls_hf = eval_hf(
+            output_hf, token_list, curr_ppls_hf = eval_hf(
                 datapoint,
                 eval_task=args.eval_task,
                 eval_ppl=args.eval_ppl,
@@ -506,6 +523,9 @@ def main(args):
             profiler.stop('hf')
 
             if runtime_rank == 0:
+                seq_lengths = [len(tokens) for tokens in token_list]
+                total_output_token_count_hf += sum(seq_lengths)
+
                 for beam_idx in range(num_beams):
                     for batch_idx in range(len(output_hf[beam_idx])):
                         metric_hf[beam_idx].add_batch(
@@ -568,6 +588,13 @@ def main(args):
             logger.info(
                 f'Hugging Face (total latency: {profiler.elapsed_time_in_sec("hf")} sec)'
             )
+            logger.info(
+                f'Hugging Face (total output tokens: {total_output_token_count_hf})'
+            )
+            logger.info(
+                f'Hugging Face (tokens per second: {total_output_token_count_hf / profiler.elapsed_time_in_sec("hf")})'
+            )
+
             for beam_idx in range(num_beams):
                 logger.info(f"HF beam {beam_idx} result")
                 computed_metrics_hf = metric_hf[beam_idx].compute()
@@ -589,10 +616,12 @@ if __name__ == '__main__':
     parser.add_argument('--test_hf', action='store_true')
     parser.add_argument('--test_trt_llm', action='store_true')
     parser.add_argument(
+        '--hf_data_type',
         '--data_type',
         type=str,
         choices=['fp32', 'fp16', 'bf16', 'float32', 'float16', 'bfloat16'],
-        default='fp16')
+        default='fp16',
+        help="The data type for hf model.")
     parser.add_argument('--engine_dir', type=str, default='engine_outputs')
     parser.add_argument('--use_py_session',
                         default=False,
@@ -611,7 +640,18 @@ if __name__ == '__main__':
     parser.add_argument('--tensorrt_llm_ppl_threshold',
                         type=float,
                         default=15.0)
-    parser.add_argument('--dataset_path', type=str, default='')
+    parser.add_argument(
+        '--dataset_dir',
+        type=str,
+        default=None,
+        help="The local directory of the dataset for evaluation; "
+        "will download the dataset from huggingface hub if not specified.")
+    parser.add_argument(
+        '--dataset_cache_dir',
+        type=str,
+        default=None,
+        help="The local cache directory for dataset; "
+        "will use `~/.cache/huggingface/datasets` if not specified.")
     parser.add_argument('--log_level', type=str, default='info')
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--max_ite', type=int, default=20)
@@ -670,7 +710,13 @@ if __name__ == '__main__':
         help="Medusa choice to use, if not none, will use Medusa decoding."
         "   E.g.: [[0, 0, 0, 0], [0, 1, 0], [1, 0], [1, 1]] for 9 medusa tokens."
     )
-
+    parser.add_argument(
+        '--gpu_weights_percent',
+        default=1,
+        type=float,
+        help=
+        'Specify the percentage of weights that reside on GPU instead of CPU and streaming load during runtime.',
+    )
     args = parser.parse_args()
 
     main(args)
