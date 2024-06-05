@@ -16,21 +16,17 @@
  * This file contains constants that decoderXQA*.{h,cpp} need.
  */
 #pragma once
+#include <cstdint>
+#include <optional>
 
 namespace tensorrt_llm
 {
 namespace kernels
 {
+inline constexpr int kMinHistoryTokensPerBlock = 128;
 
-// max number of CTAs for each KV head, multiple CTAs for one KV head is multi-block mode.
-// this number defines the maximum number when reaches both max_batch_size and max_beam_width.
-// If batch_size or beam_width doesn't reach maximum value, it is possible to have more CTAs per KV head than this
-// value.
-static constexpr int kMaxNbCtaPerKVHeadFactor = 8;
-static constexpr int kMinHistoryTokensPerBlock = 512;
-
-static constexpr float kEnableMinBlockFactor = 4.0;
-static constexpr int kTargetWaveFactor = 8;
+inline constexpr float kEnableMinBlockFactor = 4.0;
+inline constexpr int kTargetWaveFactor = 8;
 
 } // namespace kernels
 } // namespace tensorrt_llm

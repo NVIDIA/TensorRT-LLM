@@ -22,6 +22,7 @@
 #include "tensorrt_llm/common/tensor.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include <nccl.h>
+#include <unordered_set>
 
 using namespace nvinfer1;
 using tensorrt_llm::plugins::AllreducePluginCreator;
@@ -42,6 +43,10 @@ AllreducePlugin::AllreducePlugin(std::set<int> group, nvinfer1::DataType type, A
     , mConfig(config)
     , mCounter(counter)
 {
+    if (std::getenv("FORCE_NCCL_ALL_REDUCE_STRATEGY") != nullptr)
+    {
+        mStrategy = AllReduceStrategyType::NCCL;
+    }
 }
 
 // Parameterized constructor
@@ -50,6 +55,10 @@ AllreducePlugin::AllreducePlugin(void const* data, size_t length)
     char const *d = reinterpret_cast<char const*>(data), *a = d;
     read(d, mType);
     read(d, mStrategy);
+    if (std::getenv("FORCE_NCCL_ALL_REDUCE_STRATEGY") != nullptr)
+    {
+        mStrategy = AllReduceStrategyType::NCCL;
+    }
     read(d, mConfig);
     read(d, mCounter);
     mGroup.clear();
@@ -116,6 +125,22 @@ size_t AllreducePlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* input
 AllReduceStrategyType AllreducePlugin::selectImplementation(
     size_t messageSize, int worldSize, nvinfer1::DataType type) noexcept
 {
+    bool const isAuto = (mStrategy == AllReduceStrategyType::AUTO);
+
+    if (!mIsP2PSupported)
+    {
+        if (!isAuto)
+        {
+            TLLM_LOG_WARNING("Since Peer to Peer not supported, fallback to AllReduceStrategy: NCCL");
+        }
+        return AllReduceStrategyType::NCCL;
+    }
+
+    if (isAuto && !mIsNVLINKSupported)
+    {
+        return AllReduceStrategyType::NCCL;
+    }
+
     auto const maxWorkspaceSize = utils::customAllReduceUtils::getMaxRequiredWorkspaceSize(worldSize);
 
     AllReduceStrategyType strat = AllReduceStrategyType::NCCL;
@@ -123,8 +148,11 @@ AllReduceStrategyType AllreducePlugin::selectImplementation(
 
     if (messageSizeBytes <= maxWorkspaceSize)
     {
-
-        if (worldSize <= 2)
+        if (!isAuto)
+        {
+            strat = mStrategy;
+        }
+        else if (worldSize <= 2)
         {
             strat = AllReduceStrategyType::ONESHOT;
         }
@@ -150,10 +178,22 @@ AllReduceStrategyType AllreducePlugin::selectImplementation(
                 strat = AllReduceStrategyType::TWOSHOT;
             }
         }
-    }
 
-    if (!kernels::configurationSupported(strat, messageSize, worldSize, type))
+        if (!kernels::configurationSupported(strat, messageSize, worldSize, type))
+        {
+            if (!isAuto)
+            {
+                TLLM_LOG_WARNING("Since not alignment, fallback to AllReduceStrategy: NCCL");
+            }
+            strat = AllReduceStrategyType::NCCL;
+        }
+    }
+    else
     {
+        if (!isAuto)
+        {
+            TLLM_LOG_WARNING("Since messageSize > maxWorkspace, fallback to AllReduceStrategy: NCCL");
+        }
         strat = AllReduceStrategyType::NCCL;
     }
 
@@ -167,17 +207,43 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
     {
         return 0;
     }
-    int size = 1;
+    size_t size = 1;
     for (int i = 0; i < inputDesc[0].dims.nbDims; ++i)
     {
         size *= inputDesc[0].dims.d[i];
     }
     auto const sizePerElem = common::getDTypeSize(mType);
 
-    auto runtimeStrategy = mStrategy;
-    if (runtimeStrategy == AllReduceStrategyType::AUTO)
+    kernels::AllReduceStrategyType runtimeStrategy;
+
+    if (mStrategy == AllReduceStrategyType::NCCL)
+    {
+        runtimeStrategy = AllReduceStrategyType::NCCL;
+    }
+    else
     {
         runtimeStrategy = selectImplementation(size, mGroup.size(), mType);
+    }
+
+    // Log runtime strategy
+    switch (runtimeStrategy)
+    {
+    case AllReduceStrategyType::NCCL:
+    {
+        TLLM_LOG_DEBUG("AllReducePlugin strategy: AllReduceStrategyType::NCCL");
+        break;
+    }
+    case AllReduceStrategyType::ONESHOT:
+    {
+        TLLM_LOG_DEBUG("AllReducePlugin strategy: AllReduceStrategyType::ONESHOT");
+        break;
+    }
+    case AllReduceStrategyType::TWOSHOT:
+    {
+        TLLM_LOG_DEBUG("AllReducePlugin strategy: AllReduceStrategyType::TWOSHOT");
+        break;
+    }
+    default: break;
     }
 
     if (runtimeStrategy == AllReduceStrategyType::NCCL)
@@ -229,7 +295,7 @@ int AllreducePlugin::getNbOutputs() const noexcept
     return 1;
 }
 
-bool AllreducePlugin::isCustomAllReduceSuported(int ranks_per_node) const noexcept
+bool AllreducePlugin::isCustomAllReduceSupported(int ranks_per_node) const noexcept
 {
     constexpr bool isCudaVersionSupported =
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 11020
@@ -242,14 +308,221 @@ bool AllreducePlugin::isCustomAllReduceSuported(int ranks_per_node) const noexce
         && (ranks_per_node > 0);
 }
 
+class NvmlManager
+{
+public:
+    NvmlManager()
+    {
+        NVML_CHECK(nvmlInit());
+    }
+
+    ~NvmlManager()
+    {
+        NVML_CHECK(nvmlShutdown());
+    }
+};
+
+std::set<int> getLocalGroup(std::set<int> const& group)
+{
+    auto const myRank = COMM_SESSION.getRank();
+    auto const myLocalRank = LOCAL_COMM_SESSION.getRank();
+    auto const localSize = LOCAL_COMM_SESSION.getSize();
+
+    std::vector<int32_t> ranks(localSize, 0);
+    std::vector<int32_t> localRanks(localSize, 0);
+    if (group.size() >= localSize)
+    {
+        LOCAL_COMM_SESSION.allgather(&myRank, ranks.data(), 1, tensorrt_llm::mpi::MpiType::kINT32);
+        LOCAL_COMM_SESSION.allgather(&myLocalRank, localRanks.data(), 1, tensorrt_llm::mpi::MpiType::kINT32);
+    }
+    else
+    {
+        if (myRank == *group.begin())
+        {
+            ranks.clear();
+            int rank;
+            ranks.push_back(myRank);
+            for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it)
+            {
+                LOCAL_COMM_SESSION.recvValue(rank, *it, 0);
+                ranks.push_back(rank);
+            }
+            for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it)
+            {
+                LOCAL_COMM_SESSION.send(ranks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32, *it, 0);
+            }
+
+            localRanks.clear();
+            localRanks.push_back(myLocalRank);
+            for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it)
+            {
+                LOCAL_COMM_SESSION.recvValue(rank, *it, 0);
+                localRanks.push_back(rank);
+            }
+            for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it)
+            {
+                LOCAL_COMM_SESSION.send(localRanks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32, *it, 0);
+            }
+        }
+        else
+        {
+            LOCAL_COMM_SESSION.sendValue(myRank, *group.begin(), 0);
+            LOCAL_COMM_SESSION.recv(ranks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32, *group.begin(), 0);
+
+            LOCAL_COMM_SESSION.sendValue(myLocalRank, *group.begin(), 0);
+            LOCAL_COMM_SESSION.recv(
+                localRanks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32, *group.begin(), 0);
+        }
+    }
+
+    std::set<int> localGroup;
+    for (size_t i = 0; i < ranks.size(); ++i)
+    {
+        auto rank = ranks[i];
+        if (group.find(rank) != group.end())
+        {
+            localGroup.insert(localRanks[i]);
+        }
+    }
+    return localGroup;
+}
+
+void AllreducePlugin::initGroupTopology() noexcept
+{
+    static std::map<std::set<int>, std::tuple<bool, bool>> cache;
+    if (cache.find(mGroup) != cache.end())
+    {
+        auto [isNVLINKSupported, isP2PSupported] = cache[mGroup];
+        mIsNVLINKSupported = isNVLINKSupported;
+        mIsP2PSupported = isP2PSupported;
+        return;
+    }
+    setGroupTopology();
+    cache[mGroup] = {mIsNVLINKSupported, mIsP2PSupported};
+}
+
+void AllreducePlugin::setGroupTopology() noexcept
+{
+    auto const rank = COMM_SESSION.getRank();
+    TLLM_LOG_INFO("Detecting local TP group for rank %d", rank);
+    std::set<int> localGroup = getLocalGroup(mGroup);
+    if (mGroup.size() != localGroup.size())
+    {
+        mIsP2PSupported = false;
+        mIsNVLINKSupported = false;
+        TLLM_LOG_INFO("Found inter-node TP group for rank %d", rank);
+        return;
+    }
+    TLLM_LOG_INFO("TP group is intra-node for rank %d", rank);
+
+    NvmlManager nvmlManager;
+    std::unordered_set<int> visitedDevice;
+    mIsP2PSupported = true;
+    mIsNVLINKSupported = true;
+
+    // Use cudaDeviceCanAccessPeer to determine whether p2p is supported,
+    // and use nvml to determine whether there are nvlink links between ranks.
+    for (int firstDeviceId : localGroup)
+    {
+        for (int secondDeviceId : localGroup)
+        {
+            if (firstDeviceId == secondDeviceId || visitedDevice.find(secondDeviceId) != visitedDevice.end())
+            {
+                continue;
+            }
+
+            int canAccessPeer = 0;
+            TLLM_CUDA_CHECK(cudaDeviceCanAccessPeer(&canAccessPeer, firstDeviceId, secondDeviceId));
+
+            if (!canAccessPeer)
+            {
+                mIsP2PSupported = false;
+                mIsNVLINKSupported = false;
+
+                return;
+            }
+
+            nvmlDevice_t firstDevice;
+            NVML_CHECK(nvmlDeviceGetHandleByIndex(firstDeviceId, &firstDevice));
+
+            bool isNVLINK = false;
+
+            for (unsigned int link = 0; link < NVML_NVLINK_MAX_LINKS; link++)
+            {
+                nvmlPciInfo_t remotePciInfo;
+                if (nvmlDeviceGetNvLinkRemotePciInfo_v2(firstDevice, link, &remotePciInfo) != NVML_SUCCESS)
+                {
+                    continue;
+                }
+
+                nvmlDevice_t remoteDevice;
+                auto const result = nvmlDeviceGetHandleByPciBusId_v2(remotePciInfo.busId, &remoteDevice);
+
+                if (result == NVML_SUCCESS)
+                {
+                    // Two GPUs are connected directly through nvlink
+                    unsigned int remoteDeviceId;
+                    NVML_CHECK(nvmlDeviceGetIndex(remoteDevice, &remoteDeviceId));
+
+                    if (remoteDeviceId == secondDeviceId)
+                    {
+                        isNVLINK = true;
+                    }
+                }
+                else if (result == NVML_ERROR_NOT_FOUND)
+                {
+                    // Maybe Two GPUs are connected via nvswitch,
+                    // now remotePciInfo represents the pci information of nvswitch,
+                    // determine whether nvlink is supported by whether two GPUs are connected to the same nvswitch.
+                    nvmlDevice_t secondDevice;
+                    NVML_CHECK(nvmlDeviceGetHandleByIndex(secondDeviceId, &secondDevice));
+
+                    for (unsigned int secondLink = 0; secondLink < NVML_NVLINK_MAX_LINKS; secondLink++)
+                    {
+                        nvmlPciInfo_t secondRemotePciInfo;
+                        if (nvmlDeviceGetNvLinkRemotePciInfo_v2(secondDevice, secondLink, &secondRemotePciInfo)
+                            != NVML_SUCCESS)
+                        {
+                            continue;
+                        }
+
+                        if (strcmp(remotePciInfo.busId, secondRemotePciInfo.busId) == 0)
+                        {
+                            isNVLINK = true;
+                            break;
+                        }
+                    }
+                }
+                else
+                {
+                    NVML_CHECK(result);
+                }
+
+                if (isNVLINK)
+                {
+                    break;
+                }
+            }
+
+            mIsNVLINKSupported &= isNVLINK;
+        }
+        visitedDevice.insert(firstDeviceId);
+    }
+}
+
 int AllreducePlugin::initialize() noexcept
 {
-    if (isBuilding() || mStrategy == AllReduceStrategyType::ONESHOT || mStrategy == AllReduceStrategyType::TWOSHOT)
+    if (isBuilding())
     {
         return 0;
     }
 
     initCommMap(mGroup);
+    if (mStrategy != AllReduceStrategyType::NCCL)
+    {
+        initGroupTopology();
+    }
+
     return 0;
 }
 
@@ -302,6 +575,7 @@ AllreducePluginCreator::AllreducePluginCreator()
     mPluginAttributes.emplace_back(PluginField("group", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("strategy", nullptr, PluginFieldType::kINT8, 1));
+    mPluginAttributes.emplace_back(PluginField("config", nullptr, PluginFieldType::kINT8, 1));
     mPluginAttributes.emplace_back(PluginField("counter", nullptr, PluginFieldType::kINT32, 1));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();

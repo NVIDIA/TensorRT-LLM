@@ -21,7 +21,6 @@ from ...functional import PositionEmbeddingType, Tensor
 from ...layers import (MLP, Attention, AttentionMaskType, Embedding, LayerNorm,
                        ParallelLMHead)
 from ...module import Module
-from ...top_model_mixin import TopModelMixin
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
                               PretrainedConfig, save_checkpoint)
 from .convert import convert_hf_config, convert_hf_weights
@@ -140,7 +139,7 @@ class PhiModel(Module):
         return hidden_states
 
 
-class PhiForCausalLM(DecoderModelForCausalLM, TopModelMixin):
+class PhiForCausalLM(DecoderModelForCausalLM):
 
     def __init__(self, config: PretrainedConfig):
         self.check_config(config)

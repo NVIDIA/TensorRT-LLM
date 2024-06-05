@@ -24,7 +24,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
-#include "tensorrt_llm/kernels/samplingAirTopPKernels.h"
+#include "tensorrt_llm/kernels/samplingTopPKernels.h"
 #include <cuda/atomic>
 
 #include <cuda/std/limits>
@@ -1217,8 +1217,8 @@ __global__ void airTopPSampling(Counter<T, IdxT, AccT>* counters, HisT* histogra
  */
 template <typename T, typename IdxT, typename AccT, typename HisT, int BitsPerPass, int BlockSize>
 __global__ void airTopPInitialize(Counter<T, IdxT, AccT>* counters, int const batchSize, int const len, T const* in,
-    IdxT const* inIdx, float const topP, float const* topPs, curandState_t* curandstate, HisT* histograms,
-    IdxT* countHistograms, int32_t const* batchSlots)
+    IdxT const* inIdx, float const* topPs, curandState_t* curandstate, HisT* histograms, IdxT* countHistograms,
+    int32_t const* batchSlots)
 {
     auto const batchIdx = blockIdx.x;
     auto const batchSlot = batchSlots == nullptr ? batchIdx : batchSlots[batchIdx];
@@ -1238,7 +1238,7 @@ __global__ void airTopPInitialize(Counter<T, IdxT, AccT>* counters, int const ba
         counter->oriLen = len;
         counter->previousLen = len;
 
-        float const probThreshold = (topPs != nullptr) ? topPs[batchSlot] : topP;
+        float const probThreshold = topPs[batchSlot];
         float const randP = curand_uniform(curandstate + batchSlot) * probThreshold;
         counter->p = randP;
         counter->sum = 0;
@@ -1355,23 +1355,20 @@ template std::vector<size_t> getAirTopPWorkspaceSizes<half, true>(int32_t batchS
 template std::vector<size_t> getAirTopPWorkspaceSizes<half, false>(int32_t batchSize, int32_t vocabSize);
 
 template <typename T, bool isDeterministic = false>
-void invokeAirTopPSamplingWithDeterministicPara(void* workspace, int** outputIds, int* sequenceLength,
-    FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
-    T const* logProbs, curandState_t* curandstate, int const batchSize, int maxBatchSize, size_t const vocabSizePadded,
-    int const* endIds, float const maxTopP, float const* topPs, cudaStream_t stream, int blockNum,
-    bool const* skipDecode, int32_t const* batchSlots)
+void invokeAirTopPSamplingWithDeterministicPara(TopPSamplingKernelParams<T> const& params, cudaStream_t stream)
 {
     using HisT
         = std::conditional_t<isDeterministic, std::conditional_t<std::is_same_v<T, float>, uint64_t, uint32_t>, float>;
 
     static_assert(std::is_same_v<T, half> | std::is_same_v<T, float>, "T needs to be either half or float");
     static_assert(std::is_same_v<AccT, float>, "AccT needs to be float");
-    TLLM_CHECK_WITH_INFO(((std::is_same_v<T, half>) &&(vocabSizePadded < pow(2, 22)) && isDeterministic)
-            || ((std::is_same_v<T, float>) &&(vocabSizePadded < pow(2, 41)) && isDeterministic) || (~isDeterministic),
+    TLLM_CHECK_WITH_INFO(((std::is_same_v<T, half>) &&(params.vocabSizePadded < pow(2, 22)) && isDeterministic)
+            || ((std::is_same_v<T, float>) &&(params.vocabSizePadded < pow(2, 41)) && isDeterministic)
+            || (~isDeterministic),
         "For Deterministic AIR Top-P, the maximum vocab_size we support is pow(2,22) for half-precision and pow(2,41) "
         "for single-precision");
 
-    IdxT const vocabSize = vocabSizePadded;
+    IdxT const vocabSize = params.vocabSizePadded;
     int constexpr BitsPerPass = 11;
 
     int constexpr SAMPLING_BLOCK_SIZE = 512;
@@ -1385,10 +1382,10 @@ void invokeAirTopPSamplingWithDeterministicPara(void* workspace, int** outputIds
     T* buf2 = nullptr;
     IdxT* idxBuf2 = nullptr;
 
-    auto const workspaceSizes = getAirTopPWorkspaceSizes<T, isDeterministic>(batchSize, vocabSize);
+    auto const workspaceSizes = getAirTopPWorkspaceSizes<T, isDeterministic>(params.batchSize, vocabSize);
 
     std::vector<void*> alignedPointers;
-    calcAlignedPointers(alignedPointers, workspace, workspaceSizes);
+    calcAlignedPointers(alignedPointers, params.workspace, workspaceSizes);
     counters = static_cast<decltype(counters)>(alignedPointers[0]);
     histograms = static_cast<decltype(histograms)>(alignedPointers[1]);
     countHistograms = static_cast<decltype(countHistograms)>(alignedPointers[2]);
@@ -1398,10 +1395,10 @@ void invokeAirTopPSamplingWithDeterministicPara(void* workspace, int** outputIds
     idxBuf2 = static_cast<decltype(idxBuf2)>(alignedPointers[6]);
 
     airTopPInitialize<T, IdxT, AccT, HisT, BitsPerPass, THREADS_PER_CTA_TOP_P_INIT>
-        <<<batchSize, THREADS_PER_CTA_TOP_P_INIT, 0, stream>>>(counters, batchSize, vocabSize, logProbs, nullptr,
-            maxTopP, topPs, curandstate, histograms, countHistograms, batchSlots);
+        <<<params.batchSize, THREADS_PER_CTA_TOP_P_INIT, 0, stream>>>(counters, params.batchSize, vocabSize,
+            params.probs, nullptr, params.topPs, params.curandState, histograms, countHistograms, params.batchSlots);
 
-    dim3 grid(blockNum, batchSize);
+    dim3 grid(params.blockNum, params.batchSize);
     // Sample with Top P given sorted tokens
     int constexpr numPasses = calcNumPasses<T, BitsPerPass>();
     auto kernel = airTopPSampling<T, IdxT, AccT, HisT, BitsPerPass, SAMPLING_BLOCK_SIZE, false, isDeterministic>;
@@ -1413,68 +1410,29 @@ void invokeAirTopPSamplingWithDeterministicPara(void* workspace, int** outputIds
             kernel = airTopPSampling<T, IdxT, AccT, HisT, BitsPerPass, SAMPLING_BLOCK_SIZE, true, isDeterministic>;
         }
 
-        kernel<<<grid, SAMPLING_BLOCK_SIZE, 0, stream>>>(counters, histograms, countHistograms, outputIds,
-            sequenceLength, finishedInput, finishedOutput, cumLogProbs, outputLogProbs, endIds, maxBatchSize,
-            skipDecode, pass, buf1, idxBuf1, buf2, idxBuf2, batchSlots);
+        kernel<<<grid, SAMPLING_BLOCK_SIZE, 0, stream>>>(counters, histograms, countHistograms, params.outputIds,
+            params.sequenceLength, params.finishedInput, params.finishedOutput, params.cumLogProbs,
+            params.outputLogProbs, params.endIds, params.maxBatchSize, params.skipDecode, pass, buf1, idxBuf1, buf2,
+            idxBuf2, params.batchSlots);
     }
 }
 
 template <typename T>
-void invokeBatchAirTopPSampling(void* workspace, int** outputIds, int* sequenceLength,
-    FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
-    T const* logProbs, curandState_t* curandstate, int const batchSize, int maxBatchSize, size_t const vocabSizePadded,
-    int const* endIds, float const maxTopP, float const* topPs, cudaStream_t stream, int blockNum,
-    bool const* skipDecode, int32_t const* batchSlots, bool isDeterministic)
+void invokeBatchAirTopPSampling(TopPSamplingKernelParams<T> const& params, cudaStream_t stream)
 {
-    if (isDeterministic)
+    if (params.isDeterministic)
     {
-        invokeAirTopPSamplingWithDeterministicPara<T, true>(workspace, outputIds, sequenceLength, finishedInput,
-            finishedOutput, cumLogProbs, outputLogProbs, logProbs, curandstate, batchSize, maxBatchSize,
-            vocabSizePadded, endIds, maxTopP, topPs, stream, blockNum, skipDecode, batchSlots);
+        invokeAirTopPSamplingWithDeterministicPara<T, true>(params, stream);
     }
     else
     {
-        invokeAirTopPSamplingWithDeterministicPara<T, false>(workspace, outputIds, sequenceLength, finishedInput,
-            finishedOutput, cumLogProbs, outputLogProbs, logProbs, curandstate, batchSize, maxBatchSize,
-            vocabSizePadded, endIds, maxTopP, topPs, stream, blockNum, skipDecode, batchSlots);
+        invokeAirTopPSamplingWithDeterministicPara<T, false>(params, stream);
     }
 }
 
-template void invokeBatchAirTopPSampling(void* workspace, int** outputIds, int* sequenceLength,
-    FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
-    float const* logProbs, curandState_t* curandstate, int const batchSize, int maxBatchSize,
-    size_t const vocabSizePadded, int const* endIds, float const maxTopP, float const* topPs, cudaStream_t stream,
-    int blockNum, bool const* skipDecode, int32_t const* batchSlots, bool isDeterministic);
+template void invokeBatchAirTopPSampling(TopPSamplingKernelParams<float> const& params, cudaStream_t stream);
 
-template void invokeBatchAirTopPSampling(void* workspace, int** outputIds, int* sequenceLength,
-    FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
-    half const* logProbs, curandState_t* curandstate, int const batchSize, int maxBatchSize,
-    size_t const vocabSizePadded, int const* endIds, float const maxTopP, float const* topPs, cudaStream_t stream,
-    int blockNum, bool const* skipDecode, int32_t const* batchSlots, bool isDeterministic);
-
-template <typename T>
-void invokeAirTopPSampling(void* workspace, int** outputIds, int* sequenceLength, FinishedState const* finishedInput,
-    FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs, T const* logProbs,
-    curandState_t* curandstate, int const batchSize, int maxBatchSize, size_t const vocabSizePadded, int const* endIds,
-    float const topP, cudaStream_t stream, int blockNum, bool const* skipDecode, int32_t const* batchSlots,
-    bool isDeterministic)
-{
-    invokeBatchAirTopPSampling(workspace, outputIds, sequenceLength, finishedInput, finishedOutput, cumLogProbs,
-        outputLogProbs, logProbs, curandstate, batchSize, maxBatchSize, vocabSizePadded, endIds, topP, nullptr, stream,
-        blockNum, skipDecode, batchSlots, isDeterministic);
-}
-
-template void invokeAirTopPSampling(void* workspace, int** outputIds, int* sequenceLength,
-    FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
-    float const* logProbs, curandState_t* curandstate, int const batchSize, int maxBatchSize,
-    size_t const vocabSizePadded, int const* endIds, float const topP, cudaStream_t stream, int blockNum,
-    bool const* skipDecode, int32_t const* batchSlots, bool isDeterministic);
-
-template void invokeAirTopPSampling(void* workspace, int** outputIds, int* sequenceLength,
-    FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
-    half const* logProbs, curandState_t* curandstate, int const batchSize, int maxBatchSize,
-    size_t const vocabSizePadded, int const* endIds, float const topP, cudaStream_t stream, int blockNum,
-    bool const* skipDecode, int32_t const* batchSlots, bool isDeterministic);
+template void invokeBatchAirTopPSampling(TopPSamplingKernelParams<half> const& params, cudaStream_t stream);
 
 template <typename T>
 size_t getAirTopPWorkspaceSize(int32_t batchSize, int32_t vocabSizePadded, bool isDeterministic)

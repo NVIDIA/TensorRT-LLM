@@ -29,14 +29,14 @@
 namespace tensorrt_llm::pybind::runtime
 {
 
-using SizeType = tensorrt_llm::runtime::SizeType;
+using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
 class PromptTuningParams : public tensorrt_llm::runtime::GenericPromptTuningParams<std::optional<at::Tensor>>
 {
 public:
     using Base = tensorrt_llm::runtime::GenericPromptTuningParams<std::optional<at::Tensor>>;
     using TensorPtr = Base::TensorPtr;
-    using SizeType = Base::SizeType;
+    using SizeType32 = Base::SizeType32;
 
     explicit PromptTuningParams(
         TensorPtr embeddingTable = TensorPtr(), TensorPtr tasks = TensorPtr(), TensorPtr vocabSize = TensorPtr())
@@ -56,7 +56,7 @@ public:
     using TensorPtr = Base::TensorPtr;
 
     explicit GenerationInput(
-        SizeType const endId, SizeType const padId, TensorPtr ids, TensorPtr lengths, bool packed = false)
+        SizeType32 const endId, SizeType32 const padId, TensorPtr ids, TensorPtr lengths, bool packed = false)
         : GenericGenerationInput(endId, padId, std::move(ids), std::move(lengths), packed)
     {
     }

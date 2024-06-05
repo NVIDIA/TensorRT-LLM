@@ -82,15 +82,16 @@ public:
     }
 
 private:
+    static constexpr size_t kMaxNumWorkers = 128;
     std::size_t mNumWorkers;
 
-    std::queue<std::function<void()>> mTasks;
+    std::queue<std::function<void()>> mTasks{};
     mutable std::mutex mTasksMutex;
     std::condition_variable mTasksCv;
 
     std::atomic<bool> mShutdown = false;
 
-    std::vector<std::shared_ptr<std::thread>> mThreads;
+    std::thread mThreads[kMaxNumWorkers];
 
     int mDevice{-1};
 
@@ -102,17 +103,22 @@ private:
         }
         mShutdown = true;
         mTasksCv.notify_all();
-        for (std::size_t i = 0; i < mThreads.size(); ++i)
+        for (std::size_t i = 0; i < mNumWorkers; ++i)
         {
-            mThreads.at(i)->join();
+            mThreads[i].join();
         }
     }
 
     void initThreads()
     {
+        if (mNumWorkers > kMaxNumWorkers)
+        {
+            throw std::runtime_error(
+                "numWorker > maxNumWorkers " + std::to_string(mNumWorkers) + " > " + std::to_string(kMaxNumWorkers));
+        }
         for (std::size_t i = 0; i < mNumWorkers; ++i)
         {
-            mThreads.push_back(std::make_shared<std::thread>(std::thread(&WorkerPool::doWork, this)));
+            mThreads[i] = std::thread(&WorkerPool::doWork, this);
         }
     }
 

@@ -80,7 +80,7 @@ test_gptq() {
     python convert_checkpoint.py --model_dir ${MODEL} \
                                  --output_dir ./tllm_checkpoint/2gpu_gptq \
                                  --dtype float16 \
-                                 --ammo_quant_ckpt_path /home/scratch.trt_llm_data/llm-models/int4-quantized-gptq-awq/llama-7b-4bit-gs128.safetensors \
+                                 --modelopt_quant_ckpt_path /home/scratch.trt_llm_data/llm-models/int4-quantized-gptq-awq/llama-7b-4bit-gs128.safetensors \
                                  --use_weight_only \
                                  --weight_only_precision int4_gptq \
                                  --per_group \
@@ -150,7 +150,7 @@ test_long_alpaca_rope_scaling() {
     python ../run.py \
         --max_output_len 128 \
         --max_input_length 32768 \
-        --input_file ../../tests/llm-test-defs/turtle/test_input_files/pg64317.txt \
+        --input_file ../../tests/llm-test-defs/turtle/test_input_files/pg64317_sanitized.txt \
         --engine_dir ./trt_engines/long_alpaca_tp2  \
         --tokenizer_dir /home/scratch.trt_llm_data/llm-models/LongAlpaca-7B/
 }

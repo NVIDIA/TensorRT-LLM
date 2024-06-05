@@ -95,7 +95,7 @@ int ReduceScatterPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     {
         return 0;
     }
-    int size = 1;
+    size_t size = 1;
     for (int i = 0; i < outputDesc[0].dims.nbDims; ++i)
     {
         size *= outputDesc[0].dims.d[i];

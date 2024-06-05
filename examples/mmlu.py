@@ -194,6 +194,8 @@ def evaluate(args, subject, pipeline, dev_df, test_df):
     cors = []
     all_probs = []
     for i in range(test_df.shape[0]):
+        if i >= args.max_ite:
+            break
         # get prompt and make sure it fits
         k = args.ntrain
         prompt_end = format_example(test_df, i, include_answer=False)
@@ -347,6 +349,7 @@ def parse_args():
     parser.add_argument("--test_hf", action="store_true")
     parser.add_argument('--check_accuracy', action='store_true')
     parser.add_argument('--accuracy_threshold', type=float, default=0.3)
+    parser.add_argument('--max_ite', type=int, default=10000000)
 
     args = parser.parse_args()
     return args
@@ -440,7 +443,7 @@ def main():
     weighted_acc = np.mean(np.concatenate(all_cors))
     print("Average accuracy: {:.3f}".format(weighted_acc))
     if args.check_accuracy:
-        assert weighted_acc > args.accuracy_threshold, f"Expected accuracy > {args.accuracy_threshold} while got {weighted_acc}"
+        assert weighted_acc >= args.accuracy_threshold, f"Expected accuracy >= {args.accuracy_threshold} while got {weighted_acc}"
     return weighted_acc
 
 

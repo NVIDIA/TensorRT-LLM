@@ -19,8 +19,8 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/generationConfig.h"
-#include "tensorrt_llm/runtime/gptModelConfig.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/tllmRuntime.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
@@ -43,37 +43,42 @@ public:
 
     TransformerBuffers();
 
-    TransformerBuffers(TllmRuntime const& runtime, runtime::GptModelConfig const& modelConfig,
-        runtime::WorldConfig const& worldConfig);
+    TransformerBuffers(
+        TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig);
 
-    void reshape(GenerationConfig const& generationConfig, KvCacheManager const* kvCacheManager,
-        GptModelConfig const& modelConfig, WorldConfig const& worldConfig);
+    void reshape(
+        GenerationConfig const& generationConfig, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
-    void reset(BufferManager& manager);
+    void reshapeKvTensors(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxBlocksPerSeq,
+        runtime::TllmRuntime const& runtime);
 
-    TransformerBuffers sliceTo(GenerationConfig const& generationConfig, GptModelConfig const& modelConfig,
-        SizeType offset, SizeType batchSize);
+    void setKvPoolPointers(KvCacheManager const* kvCacheManager);
 
-    void prepareContextStep(RuntimeBuffers* runtimeBuffers, TensorPtr const& inputIds, TokenIdType const padId,
-        BufferManager& manager, KvCacheManager const* kvCacheManager, SizeType firstBatchSlotIdx,
-        GptModelConfig const& modelConfig, WorldConfig const& worldConfig);
+    void reset(BufferManager& manager){};
+
+    TransformerBuffers sliceTo(GenerationConfig const& generationConfig, ModelConfig const& modelConfig,
+        SizeType32 offset, SizeType32 batchSize);
+
+    void prepareContextStep(RuntimeBuffers* runtimeBuffers, TensorPtr const& inputIds, TokenIdType padId,
+        BufferManager& manager, KvCacheManager const* kvCacheManager, SizeType32 firstBatchSlotIdx,
+        ModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
     void postContextStep(RuntimeBuffers* runtimeBuffers, std::vector<RuntimeBuffers> const& contextBuffers,
-        BufferManager& manager, GptModelConfig const& modelConfig, WorldConfig const& worldConfig);
+        BufferManager& manager, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
-    void prepareNextStep(RuntimeBuffers* runtimeBuffers, SizeType const step, BufferManager& manager,
-        KvCacheManager* kvCacheManager, SizeType firstBatchSlotIdx, GptModelConfig const& modelConfig,
+    void prepareNextStep(RuntimeBuffers* runtimeBuffers, SizeType32 step, BufferManager& manager,
+        KvCacheManager* kvCacheManager, SizeType32 firstBatchSlotIdx, ModelConfig const& modelConfig,
         WorldConfig const& worldConfig);
 
     void getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers, TensorMap& inputBuffers, TensorMap& outputBuffers,
-        SizeType const step, TensorPtr const& inputIds, TensorPtr const& commPtrs, GptModelConfig const& modelConfig,
+        SizeType32 step, TensorPtr const& inputIds, ModelConfig const& modelConfig,
         WorldConfig const& worldConfig) const;
 
 protected:
     void copyAttentionMasks(
         RuntimeBuffers* runtimeBuffers, std::vector<RuntimeBuffers> const& contextBatches, BufferManager& manager);
 
-    void tile(RuntimeBuffers* runtimeBuffers, BufferManager& manager, GptModelConfig const& modelConfig,
+    void tile(RuntimeBuffers* runtimeBuffers, BufferManager& manager, ModelConfig const& modelConfig,
         WorldConfig const& worldConfig);
 
 public:
@@ -86,8 +91,9 @@ public:
     std::vector<TensorPtr> presentKeysValsAlt; // without attention plugin
     TensorPtr maxAttentionWindows;             // with attention plugin, host tensor
     TensorPtr sinkTokenLengths;                // with attention plugin, host tensor
-    TensorPtr kvCacheBlockPointersHost;        // [numLayers, batchSize * beamWidth, 2, maxBlocksPerSeq * 2]
-    TensorPtr kvCacheBlockPointersDevice;      // [numLayers, batchSize * beamWidth, 2, maxBlocksPerSeq * 2]
+    TensorPtr kvCacheBlockPoolPointers;
+    TensorPtr kvCacheBlockOffsetsHost;         // [batchSize * beamWidth, 2, maxBlocksPerSeq * 2]
+    TensorPtr kvCacheBlockOffsetsDevice;       // [batchSize * beamWidth, 2, maxBlocksPerSeq * 2]
 };
 
 } // namespace tensorrt_llm::runtime

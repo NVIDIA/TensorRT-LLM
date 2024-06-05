@@ -12,15 +12,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 from typing import Optional
 
 from ..._utils import pad_vocab_size
-from ...functional import Tensor, recv, send
-from ...layers import (Attention, AttentionMaskType, ColumnLinear, Embedding,
-                       GatedMLP, PositionEmbeddingType, RmsNorm)
+from ...functional import Tensor, cast, recv, send
+from ...layers import (Attention, AttentionMaskType, AttentionParams,
+                       ColumnLinear, Embedding, GatedMLP, KeyValueCacheParams,
+                       LoraParams, PositionEmbeddingType, RmsNorm)
 from ...mapping import Mapping
 from ...module import Module
-from ...top_model_mixin import TopModelMixin
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
                               PretrainedConfig, QuantConfig)
 from .weight import load_from_hf_gemma
@@ -71,24 +72,24 @@ class GemmaDecoderLayer(Module):
                                       eps=config.norm_epsilon,
                                       dtype=config.dtype)
 
-    def forward(
-            self,
-            hidden_states,
-            attention_mask=None,
-            medusa_packed_mask=None,  # For Medusa support
-            medusa_position_offsets=None,
-            use_cache=False,
-            kv_cache_params=None,
-            attention_params=None,
-            lora_layer_params=None):
+    def forward(self,
+                hidden_states: Tensor,
+                attention_mask: Optional[Tensor] = None,
+                spec_decoding_packed_mask: Optional[Tensor] = None,
+                spec_decoding_position_offsets: Optional[Tensor] = None,
+                use_cache: bool = False,
+                kv_cache_params: Optional[KeyValueCacheParams] = None,
+                attention_params: Optional[AttentionParams] = None,
+                lora_layer_params: Optional[LoraParams] = None):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
         attention_output = self.attention(
             hidden_states,
             attention_mask=attention_mask,
-            medusa_packed_mask=medusa_packed_mask,  # For Medusa support
-            medusa_position_offsets=medusa_position_offsets,
+            spec_decoding_packed_mask=
+            spec_decoding_packed_mask,  # For Medusa support
+            spec_decoding_position_offsets=spec_decoding_position_offsets,
             use_cache=use_cache,
             kv_cache_params=kv_cache_params,
             attention_params=attention_params,
@@ -128,6 +129,7 @@ class GemmaModel(Module):
             self.ln_f = RmsNorm(normalized_shape=config.hidden_size,
                                 eps=config.norm_epsilon,
                                 dtype=config.dtype)
+        self.hidden_size = config.hidden_size
 
     def forward(self,
                 input_ids,
@@ -148,6 +150,8 @@ class GemmaModel(Module):
 
         if self.mapping.is_first_pp_rank():
             hidden_states = self.vocab_embedding(input_ids, *ptuning_args)
+            hidden_states = cast(hidden_states * math.sqrt(self.hidden_size),
+                                 hidden_states.dtype)
         else:
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
 
@@ -173,7 +177,7 @@ class GemmaModel(Module):
         return hidden_states
 
 
-class GemmaForCausalLM(DecoderModelForCausalLM, TopModelMixin):
+class GemmaForCausalLM(DecoderModelForCausalLM):
 
     def __init__(self, config: PretrainedConfig):
 
@@ -182,6 +186,23 @@ class GemmaForCausalLM(DecoderModelForCausalLM, TopModelMixin):
 
         vocab_size_padded = pad_vocab_size(config.vocab_size,
                                            config.mapping.tp_size)
+
+        try:
+            import modelopt
+            major, minor, patch = modelopt.__version__.split(".")
+            major = int(major)
+            minor = int(minor)
+            patch = int(patch)
+            if major == 0 and minor == 11 and patch < 1:
+                # modelopt=0.11.0 won't force this field to True, this is a hot fix
+                # TODO: can remove after modelop=0.11.1 is out
+                # TRT LLM forces the embedding table to be shared for gemma.
+                config.share_embedding_table = True
+            assert config.share_embedding_table, "Gemma only supports share_embedding_table"
+        except:
+            # Not find modelopt, assume not use modelopt quantized model
+            assert config.share_embedding_table, "Gemma only supports share_embedding_table"
+
         if config.mapping.is_last_pp_rank():
             lm_head = ColumnLinear(config.hidden_size,
                                    vocab_size_padded,

@@ -69,7 +69,13 @@ improve the overall performance.
 When FP8 quantization is activated, the attention can be further accelerated by
 enabling FP8 Context FMHA (`use_fp8_context_fmha = enable`).
 
-This is an experimental feature only supported on Hopper. If you notice a significant decrease in accuracy, it is recommended to disable it.
+FP8 Paged Context FMHA is also supported with the fp8 quantization workflow.
+You need to specify `use_fp8_context_fmha = enable` and
+`use_paged_context_fmha = enable` at the same time.
+
+Please be aware that this is an experimental feature only supported on Hopper.
+If you notice a significant decrease in accuracy, it is recommended to disable
+it.
 
 ### Generation Phase
 

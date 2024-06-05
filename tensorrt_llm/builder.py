@@ -25,15 +25,15 @@ from typing import Dict, Optional, Union
 import tensorrt as trt
 
 from ._common import _is_building, serialize_engine
-from ._utils import (str_dtype_to_trt, support_strongly_type, to_dict,
-                     to_json_file)
+from ._utils import (preview_trt_version, str_dtype_to_trt,
+                     support_strongly_type, to_dict, to_json_file)
 from .auto_parallel import auto_parallel
 from .auto_parallel.config import AutoParallelConfig
 from .graph_rewriting import optimize
 from .logger import logger
-from .lora_manager import LoraBuildConfig
+from .lora_manager import LoraConfig
 from .models import PretrainedConfig, PretrainedModel
-from .models.modeling_utils import optimize_model
+from .models.modeling_utils import SpeculativeDecodingMode, optimize_model
 from .network import Network, net_guard
 from .plugin import PluginConfig
 from .quantization import QuantAlgo, QuantMode
@@ -129,6 +129,8 @@ class Builder():
                               strongly_typed: bool = False,
                               opt_level: Optional[int] = None,
                               profiling_verbosity: str = "layer_names_only",
+                              use_strip_plan: bool = False,
+                              weight_streaming: bool = False,
                               **kwargs) -> BuilderConfig:
         ''' @brief Create a builder config with given precisions and timing cache
             @param precision: one of allowed precisions, defined in Builder._ALLOWED_PRECISIONS
@@ -153,12 +155,23 @@ class Builder():
             logger.error(
                 f"precision should be one of {self._ALLOWED_PRECISIONS}")
 
-        if use_refit and int8:
+        is_trt_at_least_10 = preview_trt_version()
+        if use_strip_plan and not is_trt_at_least_10:
+            logger.error(
+                f"cannot use --strip_plan with tensorrt version 9.x or below")
+
+        if (use_refit or use_strip_plan) and int8 and not is_trt_at_least_10:
             # TRT folds weights into Myelin graph because network contains int8 tensor or Q/DQ nodes
             # These folded weights can not be refitted
-            logger.error("can't use refit and int8 mode at the same time")
+            logger.error(
+                f"can't use refit/strip_plan and int8 mode at the same time before tensorrt 10.0"
+            )
 
         config = self.trt_builder.create_builder_config()
+        if weight_streaming:
+            assert preview_trt_version(), \
+                  "Weight streaming is only supported by TensorRT 10.0 or later."
+            config.set_flag(trt.BuilderFlag.WEIGHT_STREAMING)
         if not self.strongly_typed:
             fp8 = quant_mode.has_fp8_qdq() or quant_mode.has_fp8_kv_cache()
             if precision == 'float16' or precision == trt.DataType.HALF:
@@ -179,6 +192,9 @@ class Builder():
 
         if use_refit:
             config.set_flag(trt.BuilderFlag.REFIT)
+
+        if use_strip_plan:
+            config.set_flag(trt.BuilderFlag.STRIP_PLAN)
 
         if opt_level is not None:
             config.builder_optimization_level = opt_level
@@ -223,6 +239,7 @@ class Builder():
                                      use_refit=use_refit,
                                      int8=int8,
                                      strongly_typed=self.strongly_typed,
+                                     use_strip_plan=use_strip_plan,
                                      **kwargs)
 
     def _add_optimization_profile(self, network: Network,
@@ -414,6 +431,7 @@ class Builder():
 class BuildConfig:
     max_input_len: int = 256
     max_output_len: int = 256
+    opt_batch_size: int = 8
     max_batch_size: int = 8
     max_beam_width: int = 1
     max_num_tokens: Optional[int] = None
@@ -426,14 +444,20 @@ class BuildConfig:
     profiling_verbosity: str = 'layer_names_only'
     enable_debug_output: bool = False
     max_draft_len: int = 0
+    speculative_decoding_mode: SpeculativeDecodingMode = SpeculativeDecodingMode.NONE
     use_refit: bool = False
     input_timing_cache: str = None
     output_timing_cache: str = None
-    lora_config: LoraBuildConfig = LoraBuildConfig()
+    lora_config: LoraConfig = LoraConfig()
     auto_parallel_config: AutoParallelConfig = AutoParallelConfig()
     weight_sparsity: bool = False
+    weight_streaming: bool = False
     plugin_config: PluginConfig = PluginConfig()
+    use_strip_plan: bool = False
+    max_encoder_input_len: int = 1  # for enc-dec DecoderModel
     use_fused_mlp: bool = False
+    dry_run: bool = False
+    visualize_network: bool = False
 
     @classmethod
     def from_dict(cls, config, plugin_config=None):
@@ -443,6 +467,7 @@ class BuildConfig:
         max_beam_width = config.pop('max_beam_width')
         max_num_tokens = config.pop('max_num_tokens')
         opt_num_tokens = config.pop('opt_num_tokens')
+        opt_batch_size = config.pop('opt_batch_size', None)
         max_prompt_embedding_table_size = config.pop(
             'max_prompt_embedding_table_size', 0)
         gather_context_logits = config.pop('gather_context_logits', False)
@@ -454,17 +479,27 @@ class BuildConfig:
                                          'layer_names_only')
         enable_debug_output = config.pop('enable_debug_output', False)
         max_draft_len = config.pop('max_draft_len', 0)
+        speculative_decoding_mode = config.pop('speculative_decoding_mode',
+                                               SpeculativeDecodingMode.NONE)
         use_refit = config.pop('use_refit', False)
         input_timing_cache = config.pop('input_timing_cache', None)
         output_timing_cache = config.pop('output_timing_cache', None)
-        lora_config = LoraBuildConfig.from_dict(config.get('lora_config', {}))
+        lora_config = LoraConfig.from_dict(config.get('lora_config', {}))
         auto_parallel_config = AutoParallelConfig.from_dict(
             config.get('auto_parallel_config', {}))
+        max_encoder_input_len = config.pop('max_encoder_input_len', 1024)
+        weight_streaming = config.pop('weight_streaming', False)
+
+        use_strip_plan = config.pop('use_strip_plan', False)
 
         if plugin_config is None:
             plugin_config = PluginConfig()
         if "plugin_config" in config.keys():
             plugin_config.update_from_dict(config["plugin_config"])
+
+        dry_run = config.pop('dry_run', False)
+        visualize_network = config.pop('visualize_network', False)
+
         return cls(
             max_input_len=max_input_len,
             max_output_len=max_output_len,
@@ -472,6 +507,7 @@ class BuildConfig:
             max_beam_width=max_beam_width,
             max_num_tokens=max_num_tokens,
             opt_num_tokens=opt_num_tokens,
+            opt_batch_size=opt_batch_size,
             max_prompt_embedding_table_size=max_prompt_embedding_table_size,
             gather_context_logits=gather_context_logits,
             gather_generation_logits=gather_generation_logits,
@@ -480,13 +516,19 @@ class BuildConfig:
             profiling_verbosity=profiling_verbosity,
             enable_debug_output=enable_debug_output,
             max_draft_len=max_draft_len,
+            speculative_decoding_mode=speculative_decoding_mode,
             use_refit=use_refit,
             input_timing_cache=input_timing_cache,
             output_timing_cache=output_timing_cache,
             lora_config=lora_config,
             auto_parallel_config=auto_parallel_config,
+            use_strip_plan=use_strip_plan,
+            max_encoder_input_len=max_encoder_input_len,
             weight_sparsity=weight_sparsity,
-            plugin_config=plugin_config)
+            weight_streaming=weight_streaming,
+            plugin_config=plugin_config,
+            dry_run=dry_run,
+            visualize_network=visualize_network)
 
     @classmethod
     def from_json_file(cls, config_file, plugin_config=None):
@@ -503,6 +545,16 @@ class BuildConfig:
         output['auto_parallel_config'] = output['auto_parallel_config'].to_dict(
         )
         return output
+
+    def update_from_dict(self, config: dict):
+        for name, value in config.items():
+            if not hasattr(self, name):
+                raise AttributeError(
+                    f"{self.__class__} object has no attribute {name}")
+            setattr(self, name, value)
+
+    def update(self, **kwargs):
+        self.update_from_dict(kwargs)
 
 
 class EngineConfig:
@@ -522,16 +574,21 @@ class EngineConfig:
                        config['version'])
 
     def to_dict(self):
+        build_config = self.build_config.to_dict()
+        build_config.pop('dry_run', None)  # Not an Engine Characteristic
+        build_config.pop('visualize_network',
+                         None)  # Not an Engine Characteristic
         return {
             'version': self.version,
             'pretrained_config': self.pretrained_config.to_dict(),
-            'build_config': self.build_config.to_dict(),
+            'build_config': build_config,
         }
 
 
 class Engine:
 
-    def __init__(self, config: EngineConfig, engine: trt.IHostMemory):
+    def __init__(self, config: EngineConfig, engine: Union[trt.IHostMemory,
+                                                           None]):
         self.config = config
         self.engine = engine
 
@@ -548,8 +605,13 @@ class Engine:
                     os.makedirs(target_lora_dir, exist_ok=True)
                     shutil.copy2(os.path.join(lora_dir, 'adapter_config.json'),
                                  target_lora_dir)
-                    shutil.copy2(os.path.join(lora_dir, 'adapter_model.bin'),
-                                 target_lora_dir)
+                    weight_file = os.path.join(lora_dir, 'adapter_model.bin')
+                    if os.path.exists(weight_file):
+                        shutil.copy2(weight_file, target_lora_dir)
+                    weight_file = os.path.join(lora_dir,
+                                               'adapter_model.safetensors')
+                    if os.path.exists(weight_file):
+                        shutil.copy2(weight_file, target_lora_dir)
                     lora_config.lora_dir[index] = f"lora/{index}"
                 elif lora_config.lora_ckpt_source == 'nemo':
                     target_lora_file = f"{root_lora_dir}/{index}.nemo"
@@ -563,11 +625,12 @@ class Engine:
                       "w",
                       encoding="utf-8") as f:
                 json.dump(self.config.to_dict(), f, indent=4)
-        serialize_engine(
-            self.engine,
-            os.path.join(
-                engine_dir,
-                f'rank{self.config.pretrained_config.mapping.rank}.engine'))
+        if self.engine is not None:
+            serialize_engine(
+                self.engine,
+                os.path.join(
+                    engine_dir,
+                    f'rank{self.config.pretrained_config.mapping.rank}.engine'))
 
     @classmethod
     def from_dir(cls, engine_dir: str, rank: int = 0):
@@ -593,6 +656,36 @@ def get_engine_version(engine_dir: str) -> Union[None, str]:
     return config['version']
 
 
+def optimize_model_with_config(model: PretrainedModel,
+                               build_config: BuildConfig):
+    use_auto_parallel = build_config.auto_parallel_config.enabled
+
+    if build_config.plugin_config.moe_plugin is None:
+        model = optimize_model(model, use_ootb_moe=True)
+
+    if model.config.architecture not in ["EncoderModel", "DecoderModel"]:
+        model = optimize_model(
+            model,
+            use_fused_mlp=(build_config.use_fused_mlp
+                           and not use_auto_parallel),
+            use_prompt_tuning=(build_config.max_prompt_embedding_table_size >
+                               0))
+
+    if build_config.plugin_config.lora_plugin is not None:
+        model.use_lora(build_config.lora_config)
+        model = optimize_model(
+            model,
+            use_lora=True,
+            max_lora_rank=build_config.lora_config.max_lora_rank,
+        )
+
+    if model.config.quantization.quant_algo == QuantAlgo.FP8 and build_config.plugin_config.use_fp8_context_fmha:
+        model = optimize_model(model, use_fp8_context_fmha=True)
+
+    model = optimize_model(model, use_unfused_qkv_gemm=use_auto_parallel)
+    return model
+
+
 def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
     '''Build engine from given model and optimization options specified in the build_config
        WARNING: this function may change the given \p model object state in some optimization passes
@@ -603,25 +696,34 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
     build_config = copy.deepcopy(
         build_config)  # avoid changing the input config
     if model.config.quantization.quant_algo == QuantAlgo.FP8 or \
-        model.config.quantization.kv_cache_quant_algo == QuantAlgo.FP8:
+            model.config.quantization.kv_cache_quant_algo == QuantAlgo.FP8:
         build_config.strongly_typed = True
 
     if hasattr(model.config, 'max_medusa_token_len'):
         build_config.max_draft_len = model.config.max_medusa_token_len
+        if build_config.speculative_decoding_mode != SpeculativeDecodingMode.MEDUSA:
+            logger.warning(
+                'speculative_decoding_mode is not Medusa for Medusa model. Overwriting speculative_decoding_mode'
+            )
+        build_config.speculative_decoding_mode = SpeculativeDecodingMode.MEDUSA
 
-    use_auto_parallel = build_config.auto_parallel_config.enabled
-    model = optimize_model(
-        model,
-        use_fused_mlp=(build_config.use_fused_mlp and not use_auto_parallel),
-        use_prompt_tuning=(build_config.max_prompt_embedding_table_size > 0))
+    if build_config.plugin_config.use_paged_context_fmha:
+        if (model.config.quant_mode.has_fp8_kv_cache()
+                and not model.config.quant_mode.has_fp8_qdq()):
+            raise RuntimeError(
+                "FP8 Paged Context FMHA only works with fp8 quantization workflow currently."
+            )
+        if (model.config.quant_mode.has_fp8_kv_cache()
+                and not build_config.plugin_config.use_fp8_context_fmha):
+            build_config.plugin_config.set_plugin("use_fp8_context_fmha", True)
+            logger.warning(
+                "FP8 Context FMHA is enabled by default to support FP8 Paged Context FMHA."
+            )
+        if model.config.quant_mode.has_int8_kv_cache():
+            raise RuntimeError(
+                "Paged Context FMHA doesn't work with int8 kv cache currently.")
 
-    if build_config.plugin_config.lora_plugin is not None:
-        model.use_lora(build_config.lora_config)
-        model = optimize_model(
-            model,
-            use_lora=True,
-            max_lora_rank=build_config.lora_config.max_lora_rank,
-        )
+    model = optimize_model_with_config(model, build_config)
 
     builder = Builder()
     builder_config = builder.create_builder_config(
@@ -635,7 +737,9 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
         opt_level=build_config.builder_opt,
         profiling_verbosity=build_config.profiling_verbosity,
         quant_mode=model.config.quant_mode,
+        use_strip_plan=build_config.use_strip_plan,
         weight_sparsity=build_config.weight_sparsity,
+        weight_streaming=build_config.weight_streaming,
     )
 
     network = builder.create_network()
@@ -656,45 +760,63 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
                                              model.config.dtype)
     if use_smooth_quant and model.config.quantization.use_plugin_sq:
         network.plugin_config.set_smooth_quant_plugins()
-    if (model.config.quant_mode.has_fp8_kv_cache()
-            or model.config.quant_mode.has_int8_kv_cache()
-        ) and network.plugin_config.use_paged_context_fmha:
-        raise RuntimeError(
-            "Paged Context FMHA doesn't work with fp8/int8 kv cache currently.")
     nccl_plugin = model.config.dtype if model.config.mapping.world_size > 1 else None
     network.plugin_config.set_nccl_plugin(
         nccl_plugin, network.plugin_config.use_custom_all_reduce)
 
     use_auto_parallel = build_config.auto_parallel_config.enabled
-    model = optimize_model(model, use_unfused_qkv_gemm=use_auto_parallel)
 
     with net_guard(network):
         # Prepare
         network.set_named_parameters(model.named_parameters())
 
         # Forward
-        inputs = model.prepare_inputs(
-            max_batch_size=build_config.max_batch_size,
-            max_input_len=build_config.max_input_len,
-            max_seq_len=build_config.max_input_len +
-            build_config.max_output_len,
-            use_cache=True,
-            max_beam_width=build_config.max_beam_width,
-            max_num_tokens=build_config.max_num_tokens,
-            opt_num_tokens=build_config.opt_num_tokens,
-            prompt_embedding_table_size=build_config.
-            max_prompt_embedding_table_size,
-            max_draft_len=build_config.max_draft_len,
-            gather_context_logits=build_config.gather_context_logits,
-            gather_generation_logits=build_config.gather_generation_logits,
-            lora_target_modules=build_config.lora_config.lora_target_modules)
+        prepare_input_args = {
+            "max_batch_size":
+            build_config.max_batch_size,
+            "max_input_len":
+            build_config.max_input_len,
+            "max_seq_len":
+            build_config.max_input_len + build_config.max_output_len,
+            "use_cache":
+            True,
+            "max_beam_width":
+            build_config.max_beam_width,
+            "max_num_tokens":
+            build_config.max_num_tokens,
+            "opt_num_tokens":
+            build_config.opt_num_tokens,
+            "prompt_embedding_table_size":
+            build_config.max_prompt_embedding_table_size,
+            "max_draft_len":
+            build_config.max_draft_len,
+            "speculative_decoding_draft_tokens_external":
+            build_config.speculative_decoding_mode ==
+            SpeculativeDecodingMode.DRAFT_TOKENS_EXTERNAL,
+            "gather_context_logits":
+            build_config.gather_context_logits,
+            "gather_generation_logits":
+            build_config.gather_generation_logits,
+            "lora_target_modules":
+            build_config.lora_config.lora_target_modules
+        }
+
+        if model.config.architecture == "DecoderModel":
+            prepare_input_args["max_seq_len"] = build_config.max_output_len
+            prepare_input_args[
+                "max_decoder_input_len"] = build_config.max_input_len
+            prepare_input_args[
+                "max_encoder_input_len"] = build_config.max_encoder_input_len
+
+        inputs = model.prepare_inputs(**prepare_input_args)
         model(**inputs)
 
         if build_config.enable_debug_output:
             for k, v in model.named_network_outputs():
                 network._mark_output(v, k, str_dtype_to_trt(model.config.dtype))
 
-    optimize(network)
+    if model.config.architecture != "DecoderModel":
+        optimize(network)
 
     if use_auto_parallel:
         config = build_config.auto_parallel_config
@@ -705,8 +827,12 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
             mapping = network.auto_parallel_config["mapping"]
             model.config.mapping = mapping
 
+    if build_config.visualize_network:
+        network.to_dot(f'rank{model.config.mapping.rank}.dot')
+
     # Network -> Engine
-    engine = builder.build_engine(network, builder_config)
+    engine = None if build_config.dry_run else builder.build_engine(
+        network, builder_config)
     engine_config = EngineConfig(model.config, build_config, __version__)
 
     if build_config.output_timing_cache is not None and model.config.mapping.rank == 0:

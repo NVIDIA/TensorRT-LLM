@@ -15,7 +15,7 @@
 
 from typing import Optional
 
-from .lora_manager import LoraBuildConfig
+from .lora_manager import LoraConfig
 from .mapping import Mapping
 from .plugin.plugin import PluginConfig
 
@@ -56,7 +56,7 @@ class TopModelMixin:
         '''
         raise NotImplementedError("Subclass shall override this")
 
-    def use_lora(self, lora_config: LoraBuildConfig):
+    def use_lora(self, lora_config: LoraConfig):
         '''
         Load lora weights from the give config to the module
         Parameters:

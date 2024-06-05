@@ -37,6 +37,7 @@ option(WARNING_IS_ERROR "Treat all warnings as errors" OFF)
 option(FAST_BUILD "Skip compiling some kernels to accelerate compiling" OFF)
 option(FAST_MATH "Compiling in fast math mode" OFF)
 option(INDEX_RANGE_CHECK "Compiling with index range checks" OFF)
+option(USE_SHARED_NVRTC "Use shared NVRTC library instead of static" OFF)
 
 if(NVTX_DISABLE)
   add_compile_definitions("NVTX_DISABLE")
@@ -73,6 +74,23 @@ if(BUILD_EXECUTOR)
   message(STATUS "Building executor")
 else()
   message(STATUS "Importing executor")
+endif()
+
+if(EXISTS
+   "${CMAKE_CURRENT_SOURCE_DIR}/tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/CMakeLists.txt"
+)
+  set(BUILD_NVRTC_WRAPPER_DEFAULT ON)
+else()
+  set(BUILD_NVRTC_WRAPPER_DEFAULT OFF)
+endif()
+
+option(BUILD_NVRTC_WRAPPER "Build nvrtc wrapper from source"
+       ${BUILD_NVRTC_WRAPPER_DEFAULT})
+
+if(BUILD_NVRTC_WRAPPER)
+  message(STATUS "Building nvrtc wrapper")
+else()
+  message(STATUS "Importing nvrtc wrapper")
 endif()
 
 if(BUILD_PYT)
@@ -168,9 +186,49 @@ message(STATUS "    version: ${CUDAToolkit_VERSION}")
 message(STATUS "    libraries: ${CUDAToolkit_LIBRARY_DIR}")
 message(STATUS "    include path: ${CUDAToolkit_INCLUDE_DIRS}")
 
+# Prevent CMake from creating a response file for CUDA compiler, so clangd can
+# pick up on the includes
+set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES 0)
+
+if(USE_SHARED_NVRTC)
+  if(WIN32)
+    message(FATAL_ERROR "Cannot use NVRTC shared library on Windows.")
+  else()
+    find_library(
+      NVRTC_LIB nvrtc
+      HINTS ${CUDAToolkit_LIBRARY_DIR}
+      PATH_SUFFIXES lib64 lib lib/x64)
+    find_library(
+      NVRTC_BUILTINS_LIB nvrtc-builtins
+      HINTS ${CUDAToolkit_LIBRARY_DIR}
+      PATH_SUFFIXES lib64 lib lib/x64)
+  endif()
+else()
+  if(WIN32)
+    find_library(
+      NVRTC_LIB nvrtc
+      HINTS ${CUDAToolkit_LIBRARY_DIR}
+      PATH_SUFFIXES lib64 lib lib/x64)
+  else()
+    find_library(
+      NVRTC_LIB nvrtc_static
+      HINTS ${CUDAToolkit_LIBRARY_DIR}
+      PATH_SUFFIXES lib64 lib lib/x64)
+    find_library(
+      NVRTC_BUILTINS_LIB nvrtc-builtins_static
+      HINTS ${CUDAToolkit_LIBRARY_DIR}
+      PATH_SUFFIXES lib64 lib lib/x64)
+    find_library(
+      NVPTXCOMPILER_LIB nvptxcompiler_static
+      HINTS ${CUDAToolkit_LIBRARY_DIR}
+      PATH_SUFFIXES lib64 lib lib/x64)
+  endif()
+endif()
+
 set(CUBLAS_LIB CUDA::cublas)
 set(CUBLASLT_LIB CUDA::cublasLt)
 set(CUDA_DRV_LIB CUDA::cuda_driver)
+set(CUDA_NVML_LIB CUDA::nvml)
 set(CUDA_RT_LIB CUDA::cudart_static)
 set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
 
@@ -200,7 +258,15 @@ include_directories(
 set_ifndef(TRT_LIB_DIR ${CMAKE_BINARY_DIR})
 set_ifndef(TRT_INCLUDE_DIR /usr/include/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu)
 set(TRT_LIB nvinfer)
-find_library_create_target(${TRT_LIB} nvinfer SHARED ${TRT_LIB_DIR})
+
+# On Windows major version is appended to nvinfer libs.
+if(WIN32)
+  set(TRT_LIB_NAME nvinfer_10)
+else()
+  set(TRT_LIB_NAME nvinfer)
+endif()
+
+find_library_create_target(${TRT_LIB} ${TRT_LIB_NAME} SHARED ${TRT_LIB_DIR})
 
 if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "11")
   add_definitions("-DENABLE_BF16")
@@ -218,20 +284,41 @@ if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "11.8")
   )
 endif()
 
-# MPI MPI isn't used until tensorrt_llm/CMakeLists.txt is invoked. However, if
-# it's not called before "CMAKE_CXX_FLAGS" is set, it breaks on Windows for some
-# reason, so we just call it here as a workaround.
-find_package(MPI REQUIRED)
-add_definitions("-DOMPI_SKIP_MPICXX")
+if(ENABLE_MULTI_DEVICE)
+  # MPI MPI isn't used until tensorrt_llm/CMakeLists.txt is invoked. However, if
+  # it's not called before "CMAKE_CXX_FLAGS" is set, it breaks on Windows for
+  # some reason, so we just call it here as a workaround.
+  find_package(MPI REQUIRED)
+  add_definitions("-DOMPI_SKIP_MPICXX")
+endif()
 
 # C++17
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_CUDA_STANDARD ${CMAKE_CXX_STANDARD})
+
+if(UNIX)
+  set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -Og")
+endif()
+
+# Note: The following are desirable settings that should be enabled if we
+# decrease shared library size. See e.g.
+# https://github.com/rapidsai/cudf/pull/6134 for a similar issue in another
+# project. set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO
+# "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO} --generate-line-info")
+# set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -G")
 
 set(CMAKE_CXX_FLAGS
     "${CMAKE_CXX_FLAGS} -DBUILD_SYSTEM=cmake_oss -DENABLE_MULTI_DEVICE=${ENABLE_MULTI_DEVICE}"
 )
+
+# Fix linking issue with TRT 10, the detailed description about `--mcmodel` can
+# be found in
+# https://gcc.gnu.org/onlinedocs/gcc/x86-Options.html#index-mcmodel_003dmedium-1
+if(CMAKE_SYSTEM_PROCESSOR STREQUAL x86_64)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mcmodel=medium  -Wl,--no-relax")
+endif()
 
 # Disable deprecated declarations warnings
 if(NOT WIN32)
@@ -239,7 +326,17 @@ if(NOT WIN32)
 else()
   # /wd4996 is the Windows equivalent to turn off warnings for deprecated
   # declarations
-  set(CMAKE_CXX_FLAGS "/wd4996 ${CMAKE_CXX_FLAGS}")
+
+  # /wd4505
+  # https://learn.microsoft.com/en-us/cpp/overview/cpp-conformance-improvements-2019?view=msvc-170#warning-for-unused-internal-linkage-functions
+  # "warning C4505: <>: unreferenced function with internal linkage has been
+  # removed"
+
+  # /wd4100
+  # https://learn.microsoft.com/en-us/cpp/error-messages/compiler-warnings/compiler-warning-level-4-c4100?view=msvc-170
+  # warning C4100: 'c': unreferenced formal parameter
+
+  set(CMAKE_CXX_FLAGS "/wd4996 /wd4505 /wd4100 ${CMAKE_CXX_FLAGS}")
 endif()
 
 # A Windows header file defines max() and min() macros, which break our macro
@@ -388,6 +485,10 @@ message(
   STATUS
     "Building for TensorRT version: ${TRT_VERSION}, library version: ${TRT_SOVERSION}"
 )
+
+if(${TRT_MAJOR} LESS 10)
+  message(FATAL_ERROR "TensorRT version must be at least 10.0")
+endif()
 
 list(APPEND COMMON_HEADER_DIRS)
 include_directories(${COMMON_HEADER_DIRS})

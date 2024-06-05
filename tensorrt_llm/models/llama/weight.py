@@ -15,7 +15,7 @@
 import configparser
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import List, Union
 
 import numpy as np
 import torch
@@ -27,100 +27,9 @@ from ...layers import MoeConfig
 from ...logger import logger
 from ...mapping import Mapping
 from ...quantization import QuantMode
+from ..convert_utils import (iterate_shard_files, load_state_dict,
+                             retrieved_layer_index_from_name)
 from ..modeling_utils import PretrainedConfig
-from ..quantized.quant import get_dummy_quant_scales
-from .utils import (iterate_shard_files, load_state_dict,
-                    retrieved_layer_index_from_name)
-
-
-def get_scaling_factors(
-    model_path: Union[str, Path],
-    num_layers: int,
-    quant_mode: Optional[QuantMode] = None,
-) -> Optional[Dict[str, List[int]]]:
-    """ Get the scaling factors for LLaMA model
-
-    Returns a dictionary of scaling factors for the selected layers of the
-    LLaMA model.
-
-    Args:
-        model_path (str): Path to the quantized LLaMA model
-        layers (list): List of layers to get the scaling factors for. If None,
-            all layers are selected.
-
-    Returns:
-        dict: Dictionary of scaling factors for the selected layers of the
-        LLaMA model.
-
-        example:
-
-        {
-            'qkv_act': qkv_act_scale,
-            'qkv_weights': qkv_weights_scale,
-            'qkv_output' : qkv_outputs_scale,
-            'dense_act': dense_act_scale,
-            'dense_weights': dense_weights_scale,
-            'fc_act': fc_act_scale,
-            'fc_weights': fc_weights_scale,
-            'gate_act': gate_act_scale,
-            'gate_weights': gate_weights_scale,
-            'proj_act': proj_act_scale,
-            'proj_weights': proj_weights_scale,
-        }
-    """
-
-    if model_path is None:
-        logger.warning(f"--quantized_fp8_model_path not specified. "
-                       f"Initialize quantization scales automatically.")
-        return get_dummy_quant_scales(num_layers)
-    weight_dict = np.load(model_path)
-    # yapf: disable
-    scaling_factor = {
-        'qkv_act': [],
-        'qkv_weights': [],
-        'dense_act': [],
-        'dense_weights': [],
-        'fc_act': [],
-        'fc_weights': [],
-        'gate_act': [],
-        'gate_weights': [],
-        'proj_act': [],
-        'proj_weights': [],
-    }
-
-    if quant_mode is not None and quant_mode.has_fp8_kv_cache():
-        scaling_factor['qkv_output'] = []
-
-    for layer in range(num_layers):
-        scaling_factor['qkv_act'].append(max(
-            weight_dict[f'_np:layers:{layer}:attention:qkv:q:activation_scaling_factor'].item(),
-            weight_dict[f'_np:layers:{layer}:attention:qkv:k:activation_scaling_factor'].item(),
-            weight_dict[f'_np:layers:{layer}:attention:qkv:v:activation_scaling_factor'].item()
-        ))
-        scaling_factor['qkv_weights'].append(max(
-            weight_dict[f'_np:layers:{layer}:attention:qkv:q:weights_scaling_factor'].item(),
-            weight_dict[f'_np:layers:{layer}:attention:qkv:k:weights_scaling_factor'].item(),
-            weight_dict[f'_np:layers:{layer}:attention:qkv:v:weights_scaling_factor'].item()
-        ))
-        if quant_mode is not None and quant_mode.has_fp8_kv_cache():
-            # Not calibrating KV cache.
-            scaling_factor['qkv_output'].append(1.0)
-        scaling_factor['dense_act'].append(
-            weight_dict[f'_np:layers:{layer}:attention:dense:activation_scaling_factor'].item())
-        scaling_factor['dense_weights'].append(
-            weight_dict[f'_np:layers:{layer}:attention:dense:weights_scaling_factor'].item())
-        scaling_factor['fc_act'].append(weight_dict[f'_np:layers:{layer}:mlp:fc:activation_scaling_factor'].item())
-        scaling_factor['fc_weights'].append(weight_dict[f'_np:layers:{layer}:mlp:fc:weights_scaling_factor'].item())
-        scaling_factor['gate_act'].append(weight_dict[f'_np:layers:{layer}:mlp:gate:activation_scaling_factor'].item())
-        scaling_factor['gate_weights'].append(weight_dict[f'_np:layers:{layer}:mlp:gate:weights_scaling_factor'].item())
-        scaling_factor['proj_act'].append(weight_dict[f'_np:layers:{layer}:mlp:proj:activation_scaling_factor'].item())
-        scaling_factor['proj_weights'].append(weight_dict[f'_np:layers:{layer}:mlp:proj:weights_scaling_factor'].item())
-    # yapf: enable
-    for k, v in scaling_factor.items():
-        assert len(v) == num_layers, \
-            f'Expect scaling factor {k} of length {num_layers}, got {len(v)}'
-
-    return scaling_factor
 
 
 def gen_suffix(rank, use_smooth_quant, quant_per_channel):
@@ -679,13 +588,13 @@ def load_from_hf_llama(tensorrt_llm_llama: 'LLaMAForCausalLM',
                     processed_torch_weights, torch_weight_scales = \
                         torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                             numpy_to_torch(v), plugin_weight_only_quant_type)
-                    weights['transformer.layers.{}.mlp.experts_weight_2'.format(
+                    weights['transformer.layers.{}.mlp.proj.weight'.format(
                         idx)] = processed_torch_weights
-                    weights['transformer.layers.{}.mlp.experts_scale_2'.format(
-                        idx)] = torch_weight_scales
+                    weights['transformer.layers.{}.mlp.proj.per_channel_scale'.
+                            format(idx)] = torch_weight_scales
 
                 else:
-                    weights['transformer.layers.{}.mlp.experts_weight_2'.format(
+                    weights['transformer.layers.{}.mlp.proj.weight'.format(
                         idx)] = v
             elif 'experts.w3w1.weight' in k:
                 # Note: no need for splitting, it's already been done above
@@ -696,13 +605,13 @@ def load_from_hf_llama(tensorrt_llm_llama: 'LLaMAForCausalLM',
                     processed_torch_weights, torch_weight_scales = \
                         torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                             numpy_to_torch(v), plugin_weight_only_quant_type)
-                    weights['transformer.layers.{}.mlp.experts_weight_1'.format(
+                    weights['transformer.layers.{}.mlp.fc.weight'.format(
                         idx)] = processed_torch_weights
-                    weights['transformer.layers.{}.mlp.experts_scale_1'.format(
-                        idx)] = torch_weight_scales
+                    weights['transformer.layers.{}.mlp.fc.per_channel_scale'.
+                            format(idx)] = torch_weight_scales
 
                 else:
-                    weights['transformer.layers.{}.mlp.experts_weight_1'.format(
+                    weights['transformer.layers.{}.mlp.fc.weight'.format(
                         idx)] = v
 
             elif 'block_sparse_moe.gate' in k:
@@ -791,7 +700,8 @@ def load_from_gptq_llama(config: PretrainedConfig, quant_ckpt_path):
         qweight_unpacked_int8 = unpack_int32_into_int8(
             qweight_int32.T).T.contiguous() - 8
         qweight_interleaved = preprocessor(packer(qweight_unpacked_int8),
-                                           torch.quint4x2).view(torch.float16)
+                                           torch.quint4x2,
+                                           torch.float16).view(torch.float16)
         # zeros = zeros * scales
         qzeros_unpacked_int32 = unpack_int32_into_int8(qzeros_int32)
         if not USE_UINT4_INPUT:
@@ -985,6 +895,22 @@ def load_from_meta_llama(meta_ckpt_dir, mapping, config):
     if not hasattr(load_from_meta_llama, "saved_embed"):
         load_from_meta_llama.saved_embed = None
 
+    def combine_embeddings(embeds, num_ckpts):
+        if len(embeds) == 1:
+            return embeds[0]
+        assert [
+            embeds[i].shape == embeds[i + 1].shape
+            for i in range(len(embeds) - 1)
+        ]
+        if embeds[0].shape[0] == config.vocab_size // num_ckpts:
+            merge_dim = 0
+        elif embeds[0].shape[1] == config.hidden_size // num_ckpts:
+            merge_dim = 1
+        else:
+            logger.error("Unable to infer embedding split dimension")
+            assert False, "Unable to infer embedding split dimension"
+        return torch.cat(embeds, dim=merge_dim)
+
     def gather_embedding(cur_embed, name: str, num_ckpts):
         if mapping.tp_size == 1:
             # even if num_ckpts > 1, get_current_weights will already have it gathered
@@ -996,7 +922,7 @@ def load_from_meta_llama(meta_ckpt_dir, mapping, config):
                                        f"consolidated.{i:02d}.pth"),
                                   map_location="cpu")
                 embeds[i] = ckpt[name]
-            embed = torch.cat(embeds, dim=1).to(torch_dtype)
+            embed = combine_embeddings(embeds, num_ckpts).to(torch_dtype)
             load_from_meta_llama.saved_embed = embed
 
         return load_from_meta_llama.saved_embed
@@ -1094,4 +1020,164 @@ def load_from_meta_llama(meta_ckpt_dir, mapping, config):
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     logger.info(f'Weights loaded. Total time: {t}')
+    return weights
+
+
+def load_from_hf_safetensors(model_dir: str, config: PretrainedConfig, mapping):
+    logger.info('Loading weights from Huggingface LLaMA safetensors...')
+    tik = time.time()
+    import json
+    import os
+
+    import safetensors
+    weights = {}
+
+    model_dir = model_dir if model_dir.endswith("/") else model_dir + "/"
+    safetensors_map = {}
+    try:
+        with open(model_dir + "model.safetensors.index.json", 'r') as fr:
+            sharding_map = json.load(fr)
+        for k, v in sharding_map['weight_map'].items():
+            safetensors_map[k] = int(v[6:11]) - 1
+    except FileNotFoundError:
+        pass
+    shard_files = []
+    for name in os.listdir(model_dir):
+        if name.endswith(".safetensors"):
+            shard_files.append(name)
+    shard_files.sort()
+    safetensors_ptrs = [
+        safetensors.safe_open(model_dir + shard_file,
+                              framework="pt",
+                              device="cpu") for shard_file in shard_files
+    ]
+
+    num_hidden_layers = config.num_hidden_layers
+    vocab_size = config.vocab_size
+    pad_vocab = vocab_size % mapping.tp_size != 0
+    vocab_size_padded = pad_vocab_size(config.vocab_size, mapping.tp_size)
+    dtype = config.dtype
+
+    moe_config = MoeConfig(config.moe_num_experts, config.moe_top_k,
+                           config.moe_tp_mode, config.moe_normalization_mode)
+
+    model_prefix = "model."
+    key_list = [
+        "embed_tokens.weight",  # vocab_embedding
+        "lm_head.weight",  # lm_head
+        "norm.weight",  # ln_f
+        "self_attn.",  # attention.qkv
+        "_proj.weight",  # qkv suffix
+        "self_attn.o_proj.weight",  # attention.dense
+        "mlp.up_proj.weight",  # mlp.gate
+        "mlp.down_proj.weight",  # mlp.proj
+        "mlp.gate_proj.weight",  # mlp.fc
+        "input_layernorm.weight",  # input_layernorm
+        "post_attention_layernorm.weight",  # post_layernorm
+    ]
+
+    torch_dtype = str_dtype_to_torch(dtype)
+
+    def load(key, tp_dim=-1, no_prefix=0):
+        if not no_prefix:
+            key = model_prefix + key
+        ptr_idx = safetensors_map[key] if key in safetensors_map else 0
+        if tp_dim == -1:
+            res = safetensors_ptrs[ptr_idx].get_tensor(key)
+        else:
+            tensor_slice = safetensors_ptrs[ptr_idx].get_slice(key)
+            tensor_shape = tensor_slice.get_shape()
+            if tensor_shape[tp_dim] % mapping.tp_size != 0:
+                logger.error(
+                    "Current weight shape is invalid for mapping.tp_size=" +
+                    str(mapping.tp_size))
+            slice_width = tensor_shape[tp_dim] // mapping.tp_size
+            if tp_dim == 0:
+                res = tensor_slice[slice_width * mapping.tp_rank:slice_width *
+                                   (mapping.tp_rank + 1), :]
+            elif tp_dim == 1:
+                res = tensor_slice[:,
+                                   slice_width * mapping.tp_rank:slice_width *
+                                   (mapping.tp_rank + 1)]
+            else:
+                assert False, "Invalid TP dim"
+        return res.to(torch_dtype).contiguous(
+        ) if "block_sparse_moe.gate" not in key else res.to(torch.float32)
+
+    if mapping.is_first_pp_rank():
+        weights['transformer.vocab_embedding.weight'] = load(
+            key_list[0], config.embedding_sharding_dim
+            if config.use_parallel_embedding else -1)  # vocab_embedding
+
+    if mapping.is_last_pp_rank():
+        v = load(key_list[1], -1, 1) if pad_vocab else load(key_list[1], 0,
+                                                            1)  # lm_head
+        if pad_vocab:
+            v = torch.nn.functional.pad(
+                v, (0, 0, 0, vocab_size_padded - vocab_size), 'constant', 0)
+            v = split(v, mapping.tp_size, mapping.tp_rank)
+        weights['lm_head.weight'] = v
+        weights['transformer.ln_f.weight'] = load(key_list[2])  # ln_f
+
+    layers_range = mapping.pp_layers(num_hidden_layers)
+    for l in layers_range:
+        layer_idx = l - layers_range[0]
+        prefix = f'layers.{l}.'
+        tllm_prex = f'transformer.layers.{layer_idx}'
+
+        # Attention
+        qkv_list = []
+        for comp in ["q", "k", "v"]:
+            comp_part = load(prefix + key_list[3] + comp + key_list[4], 0)
+            qkv_list.append(comp_part)
+        weights[f'{tllm_prex}.attention.qkv.weight'] = torch.cat(qkv_list, 0)
+        weights[f'{tllm_prex}.attention.dense.weight'] = load(
+            prefix + key_list[5], 1)  # attention.dense
+
+        # MLP
+        if not moe_config.has_moe():
+            weights[f'{tllm_prex}.mlp.gate.weight'] = load(
+                prefix + key_list[6], 0)  # mlp.gate
+            weights[f'{tllm_prex}.mlp.proj.weight'] = load(
+                prefix + key_list[7], 1)  # mlp.proj
+            weights[f'{tllm_prex}.mlp.fc.weight'] = load(
+                prefix + key_list[8], 0)  # mlp.fc
+
+        else:
+            weights[f'{tllm_prex}.mlp.router.weight'] = load(
+                prefix + 'block_sparse_moe.gate.weight')
+            rank_experts = list(range(moe_config.num_experts))
+            if moe_config.tp_mode == moe_config.ParallelismMode.EXPERT_PARALLEL:
+                rank_experts = mapping.ep_experts(moe_config.num_experts)
+
+            expert_weight_list = []
+            for suffix in range(3):
+                tp_dim = -1
+                if moe_config.tp_mode == moe_config.ParallelismMode.TENSOR_PARALLEL:
+                    tp_dim = 1 if suffix == 1 else 0
+                expert_weight_list.append(
+                    torch.stack(
+                        list(
+                            load(
+                                prefix +
+                                f'block_sparse_moe.experts.{expert}.w{suffix + 1}.weight',
+                                tp_dim=tp_dim) for expert in rank_experts)))
+
+            w1 = expert_weight_list[0]
+            w2 = expert_weight_list[1]
+            w3 = expert_weight_list[2]
+
+            weights[f'{tllm_prex}.mlp.fc.weight'] = \
+                torch.concat([w3, w1], dim=-2).contiguous()
+            weights[f'{tllm_prex}.mlp.proj.weight'] = w2.contiguous()
+
+        weights[f'{tllm_prex}.input_layernorm.weight'] = load(
+            prefix + key_list[9])  # input_layernorm
+        weights[f'{tllm_prex}.post_layernorm.weight'] = load(
+            prefix + key_list[10])  # post_layernorm
+
+    tok = time.time()
+    t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
+    logger.info(f'Weights loaded. Total time: {t}')
+
     return weights

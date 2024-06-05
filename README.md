@@ -6,9 +6,9 @@ TensorRT-LLM
 
 [![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](https://nvidia.github.io/TensorRT-LLM/)
 [![python](https://img.shields.io/badge/python-3.10.12-green)](https://www.python.org/downloads/release/python-31012/)
-[![cuda](https://img.shields.io/badge/cuda-12.3-green)](https://developer.nvidia.com/cuda-downloads)
-[![trt](https://img.shields.io/badge/TRT-9.3-green)](https://developer.nvidia.com/tensorrt)
-[![version](https://img.shields.io/badge/release-0.9.0-green)](./setup.py)
+[![cuda](https://img.shields.io/badge/cuda-12.4.0-green)](https://developer.nvidia.com/cuda-downloads)
+[![trt](https://img.shields.io/badge/TRT-10.0.1-green)](https://developer.nvidia.com/tensorrt)
+[![version](https://img.shields.io/badge/release-0.10.0.dev-green)](./setup.py)
 [![license](https://img.shields.io/badge/license-Apache%202-blue)](./LICENSE)
 
 [Architecture](./docs/source/architecture/overview.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Results](./docs/source/performance/perf-overview.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Examples](./examples/)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Documentation](./docs/source/)
@@ -57,11 +57,11 @@ like `GPTAttention` or `BertAttention`, can be found in the
 [models](./tensorrt_llm/models) module.
 
 TensorRT-LLM comes with several popular models pre-defined. They can easily be
-modified and extended to fit custom needs. Refer to the [Support Matrix](docs/source/reference/support-matrix.md) for a list of supported models.
+modified and extended to fit custom needs. Refer to the [Support Matrix](https://nvidia.github.io/TensorRT-LLM/reference/support-matrix.html) for a list of supported models.
 
 To maximize performance and reduce memory footprint, TensorRT-LLM allows the
 models to be executed using different quantization modes (refer to
-[`support matrix`](docs/source/reference/support-matrix.md#software)).  TensorRT-LLM supports
+[`support matrix`](https://nvidia.github.io/TensorRT-LLM/reference/support-matrix.html#software)).  TensorRT-LLM supports
 INT4 or INT8 weights (and FP16 activations; a.k.a.  INT4/INT8 weight-only) as
 well as a complete implementation of the
 [SmoothQuant](https://arxiv.org/abs/2211.10438) technique.
@@ -70,8 +70,8 @@ well as a complete implementation of the
 
 To get started with TensorRT-LLM, visit our documentation:
 
-- [Quick Start Guide](docs/source/quick-start-guide.md)
-- [Release Notes](docs/source/release-notes.md)
-- [Installation Guide for Linux](docs/source/installation/linux.md)
-- [Installation Guide for Windows](docs/source/installation/windows.md)
-- [Supported Hardware, Models, and other Software](docs/source/reference/support-matrix.md)
+- [Quick Start Guide](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
+- [Release Notes](https://nvidia.github.io/TensorRT-LLM/release-notes.html)
+- [Installation Guide for Linux](https://nvidia.github.io/TensorRT-LLM/installation/linux.html)
+- [Installation Guide for Windows](https://nvidia.github.io/TensorRT-LLM/installation/windows.html)
+- [Supported Hardware, Models, and other Software](https://nvidia.github.io/TensorRT-LLM/reference/support-matrix.html)

@@ -15,7 +15,7 @@ NeMo -------------
                   |
 HuggingFace ------
                   |   convert                             build                    load
-AMMO -------------  ----------> TensorRT-LLM Checkpoint --------> TensorRT Engine ------> TensorRT-LLM ModelRunner
+Modelopt ---------  ----------> TensorRT-LLM Checkpoint --------> TensorRT Engine ------> TensorRT-LLM ModelRunner
                   |
 JAX --------------
                   |
@@ -27,7 +27,7 @@ DeepSpeed --------
 TensorRT-LLM aims at supporting different sources:
 
 1. Trained models from NVIDIA NeMo, Microsoft DeepSpeed, and JAX
-2. Quantized models from NVIDIA AMMO
+2. Quantized models from NVIDIA Modelopt
 3. Popular models from HuggingFace
 
 TensorRT-LLM defines its own checkpoint format. A checkpoint directory includes:

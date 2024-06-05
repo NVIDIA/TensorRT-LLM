@@ -90,6 +90,17 @@ def parse_arguments():
                         default="0",
                         help=('Specify Top-P value of decoding.'))
     parser.add_argument(
+        '--input_timing_cache',
+        type=str,
+        default=None,
+        help=
+        'The path to read timing cache, will be ignored if the file does not exist'
+    )
+    parser.add_argument('--output_timing_cache',
+                        type=str,
+                        default='model.cache',
+                        help='The path to write timing cache')
+    parser.add_argument(
         '--profiling_verbosity',
         type=str,
         default='layer_names_only',
@@ -191,6 +202,20 @@ def parse_arguments():
                         default=False,
                         action='store_true',
                         help='This option will reduce the building time.')
+    parser.add_argument(
+        '--gpu_weights_percent',
+        type=str,
+        default="1.0",
+        help='Specify the percentage of weights that reside on GPU (from 0 to 1).'
+        'Multiple percentages can be separated by \";\", '
+        'example: \"0;0.5;1\".')
+    parser.add_argument(
+        '--multiple_profiles',
+        default=False,
+        action='store_true',
+        help=
+        'This option will benefit performance, but will increase the engine build time.'
+    )
 
     parser.add_argument('--csv',
                         default=False,
@@ -244,6 +269,38 @@ def parse_arguments():
         help=
         "Check the estimated memory usage against the total GPU memory. Raise error if the estimated memory requirement is bigger than the total GPU memory"
         "Warning: only GPT model family is supported for now")
+    parser.add_argument(
+        '--dump_profile',
+        default=False,
+        action='store_true',
+        help="Print profile information per layer (default = disabled)")
+
+    parser.add_argument(
+        '--dump_layer_info',
+        default=False,
+        action='store_true',
+        help=
+        "Print layer information of the engine to console (default = disabled)")
+
+    parser.add_argument(
+        '--opt_batch_size',
+        type=int,
+        default=None,
+        help=
+        "If opt_batch_size option is specified, it will override the opt batch size."
+        "This flag only takes effect when `--mode=ootb` is added. For other modes, please use --opt_num_tokens to replace it."
+    )
+
+    parser.add_argument(
+        '--opt_num_tokens',
+        type=int,
+        default=None,
+        help="It equals to max_batch_size*max_beam_width by default, set this "
+        "value as close as possible to the actual number of tokens on your workload. "
+        "Note that this argument might be removed in the future."
+        "This flag only takes effect when `--mode` is not `ootb`. For ootb mode, please use --opt_batch_size to replace it."
+    )
+
     return parser.parse_args()
 
 
@@ -274,6 +331,17 @@ def main(args):
     in_out_len_options = [[int(i) for i in io.split(',')]
                           for io in in_out_len_options]
 
+    # GPU weights percentage ratios
+    gpu_weights_percents = [
+        float(r) for r in args.gpu_weights_percent.split(";")
+    ]
+    for percent in gpu_weights_percents:
+        if percent < 0 or percent > 1:
+            raise Exception(
+                f"--gpu_weights_percent only accepts values between 0.0 and 1.0."
+            )
+    args.weight_streaming = any([p != 1 for p in gpu_weights_percents])
+
     if args.serial_build and not args.build_only:
         raise Exception(
             f"--serial_build must be used with --build_only, always need to parallel build to do inference in the same process"
@@ -297,13 +365,14 @@ def main(args):
     if args.model in get_allowed_models(benchmark_type="gpt"):
         benchmark_profiler = BenchmarkProfiler()
         benchmarker = GPTBenchmark(args, batch_size_options, in_out_len_options,
-                                   rank, world_size)
+                                   gpu_weights_percents, rank, world_size)
     elif args.model in get_allowed_models(benchmark_type="bert"):
         benchmarker = BERTBenchmark(args, batch_size_options, input_len_options,
-                                    rank, world_size)
+                                    gpu_weights_percents, rank, world_size)
     elif args.model in get_allowed_models(benchmark_type="enc_dec"):
         benchmarker = EncDecBenchmark(args, batch_size_options,
-                                      in_out_len_options, rank, world_size)
+                                      in_out_len_options, gpu_weights_percents,
+                                      rank, world_size)
     else:
         raise Exception(f'Unexpected model: {args.model}')
 
@@ -318,6 +387,10 @@ def main(args):
         if isinstance(benchmarker, GPTBenchmark):
             benchmarker.check_memory(config, raise_exception=args.debug_memory)
         try:
+            if args.weight_streaming:
+                # We pass in config instead of the gpu_weights_percent here to keep this benchmark script
+                # agnostic to the length and contents of the config.
+                benchmarker.set_weight_streaming(config)
             inputs = benchmarker.prepare_inputs(config)
         except torch.cuda.OutOfMemoryError as e:
             logger.error(
@@ -404,6 +477,39 @@ def main(args):
                            peak_gpu_used,
                            csv=args.csv,
                            benchmark_profiler=benchmark_profiler)
+
+        # Rerun for dumping profile per layer.
+        if args.dump_profile and benchmark_profiler is not None:
+            benchmark_profiler.set_recording_perf_profile(True)
+            logger.info(f'Dump profile information per layer')
+            iter_idx = 0
+            try:
+                # Warm up
+                for _ in range(args.warm_up):
+                    benchmarker.run(inputs, config)
+                if benchmark_profiler is not None:
+                    benchmark_profiler.clean()
+                    benchmark_profiler.start()
+                cur_duration = 0
+                start_time = time()
+                while iter_idx < args.num_runs or cur_duration < args.duration:
+                    start.record()
+                    benchmarker.run(inputs,
+                                    config,
+                                    benchmark_profiler=benchmark_profiler)
+                    end.record()
+                    torch.cuda.synchronize()
+                    latencies.append(start.elapsed_time(end))
+                    iter_idx += 1
+                    cur_duration = round(time() - start_time, 3)
+                benchmarker.report_profiler(
+                    benchmark_profiler=benchmark_profiler)
+            except Exception as e:
+                logger.error("Found exception during benchmarking",
+                             e.with_traceback())
+                if not disable_mem_monitor:
+                    memory_monitor.kill()
+                raise e
 
 
 if __name__ == '__main__':

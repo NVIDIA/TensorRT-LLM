@@ -89,11 +89,7 @@ class BaseBenchmark(object):
                     (f'Engine world size ({world_size}) != Runtime world size ({self.world_size})')
                 # Load config into self
                 for key, value in self.config['pretrained_config'].items():
-                    if key == "ssm_cfg":
-                        for ssm_key, ssm_value in value.items():
-                            setattr(self, "mamba_" + ssm_key, ssm_value)
-                    else:
-                        setattr(self, key, value)
+                    setattr(self, key, value)
 
                 self.quant_mode = QuantMode.from_quant_algo(
                     quant_algo=self.quantization['quant_algo'],
@@ -160,11 +156,25 @@ class BaseBenchmark(object):
 
     def get_report_dict(self, benchmark_profiler=None):
         report_fields = [
-            "model_name", "world_size", "num_heads", "num_kv_heads",
-            "num_layers", "hidden_size", "vocab_size", "precision",
-            "batch_size", "input_length", "output_length", "gpu_peak_mem(gb)",
-            "build_time(s)", "tokens_per_sec", "percentile95(ms)",
-            "percentile99(ms)", "latency(ms)", "compute_cap"
+            "model_name",
+            "world_size",
+            "num_heads",
+            "num_kv_heads",
+            "num_layers",
+            "hidden_size",
+            "vocab_size",
+            "precision",
+            "batch_size",
+            "gpu_weights_percent",
+            "input_length",
+            "output_length",
+            "gpu_peak_mem(gb)",
+            "build_time(s)",
+            "tokens_per_sec",
+            "percentile95(ms)",
+            "percentile99(ms)",
+            "latency(ms)",
+            "compute_cap",
         ]
         report_dict = OrderedDict.fromkeys(report_fields)
         report_dict["model_name"] = self.model_name
@@ -201,4 +211,7 @@ class BaseBenchmark(object):
         raise NotImplementedError
 
     def report(self, config, latency):
+        raise NotImplementedError
+
+    def set_weight_streaming(self, config):
         raise NotImplementedError

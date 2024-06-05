@@ -70,3 +70,10 @@ To run the `executorExampleAdvanced` on models that require multiple GPUs, you c
 mpirun -n <num_ranks> --allow-run-as-root ./executorExampleAdvanced --engine_dir <path_to_engine_dir>  --input_tokens_csv_file ../inputTokens.csv
 ```
 where `<num_ranks>` must equal to `tp*pp` for the TensorRT engine. By default GPU device IDs `[0...(num_ranks-1)]` will be used.
+
+Alternatively, it's also possible to run multi-GPU model by using the so-called `Orchestrator` communication mode, where the `Executor` instance will automatically spawn additional processes to run the model on multiple GPUs. To use the `Orchestrator` communication mode, you can run the example with:
+
+```
+./executorExampleAdvanced --engine_dir <path_to_engine_dir>  --input_tokens_csv_file ../inputTokens.csv --use_orchestrator_mode --worker_executable_path <path_to_executor_worker>
+```
+where `<path_to_executor_worker>` is the absolute path to the stand-alone executor worker executable, located at`cpp/build/tensorrt_llm/executor_worker/executorWorker` by default.

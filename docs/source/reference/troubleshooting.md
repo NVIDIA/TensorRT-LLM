@@ -8,6 +8,24 @@ Usually, we want to print the intermediate tensor values when debugging a Tensor
 TensorRT-LLM obeys define-and-run paradigm, we should mark the interested intermediate tensors as the network outputs.
 Then, we print the values at runtime.
 
+## Build Errors
+
+Many build errors can be resolved by simply deleting the build tree. Try running the build script with `--clean` or running `rm -r cpp/build`.
+
+## cuDNN Linking Errors
+
+If you encounter errors such as "Entry Point Not Found" (see for example [#1062](https://github.com/NVIDIA/TensorRT-LLM/issues/1062)) the issue might be a mismatch in the `cuDNN` libraries shipped from `torch` and `tensorrt`. To rectify this, please try the following steps
+
+```
+python -m pip uninstall -y tensorrt_llm
+python -m pip install --upgrade pip
+python -m pip install nvidia-cudnn-cu11==8.9.4.25 --no-cache-dir
+python -m pip install --pre --extra-index-url https://pypi.nvidia.com/ tensorrt==9.2.0.post12.dev5 --no-cache-dir
+python -m pip uninstall -y nvidia-cudnn-cu11
+python -m pip install tensorrt_llm  --extra-index-url https://pypi.nvidia.com/ --extra-index-url https://pypi.nvidia.com/ --extra-index-url https://download.pytorch.org/whl/cu121
+```
+
+
 ## Debug on Unit Tests
 
 1. Register the intermediate tensors as the network outputs with `register_network_output` API.

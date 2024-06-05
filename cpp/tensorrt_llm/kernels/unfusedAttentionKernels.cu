@@ -1347,10 +1347,11 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
     {
     case PositionEmbeddingType::kROPE_GPTJ:
     {
-        mmha::apply_rotary_embedding(
-            q, k, tidx, rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale, dst_kv_seq_idx);
+        mmha::apply_rotary_embedding(q, k, tidx, rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale, 0,
+            nullptr, dst_kv_seq_idx);
         break;
     }
+    case PositionEmbeddingType::kLONG_ROPE:
     case PositionEmbeddingType::kROPE_GPT_NEOX:
     {
         bool const do_rotary = !is_masked && vec_size * tidx < rotary_embedding_dim;
@@ -1379,7 +1380,7 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
             mmha::vec_from_smem_transpose(k, k_smem, transpose_idx, smem_pitch);
 
             mmha::apply_rotary_embedding(q, k, transpose_idx / tidx_factor, rotary_embedding_dim, rotary_embedding_base,
-                rotary_embedding_scale, dst_kv_seq_idx);
+                rotary_embedding_scale, 0, nullptr, dst_kv_seq_idx);
 
             mmha::write_smem_transpose(q, q_smem, transpose_idx, smem_pitch);
             mmha::write_smem_transpose(k, k_smem, transpose_idx, smem_pitch);
@@ -1469,9 +1470,10 @@ void invokeAddFusedQKVBiasTranspose(T* q_buf, T* k_buf, T* v_buf, T* QKV, T cons
         // To implement rotary embeddings, each thread processes two QKV elems:
         dim3 block((size_per_head / Vec_t<T>::size + 31) / 32 * 32);
         dim3 grid(token_num, head_num);
-        size_t smem_size
-            = (position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX ? 2 * rotary_embedding_dim * sizeof(T)
-                                                                                : 0);
+        size_t smem_size = (position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX
+                    || position_embedding_type == PositionEmbeddingType::kLONG_ROPE
+                ? 2 * rotary_embedding_dim * sizeof(T)
+                : 0);
         // NOTE: add offset for rotary embedding
         if (qkv_bias != nullptr)
         {
@@ -1858,9 +1860,10 @@ __global__ void shiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCa
     case PositionEmbeddingType::kROPE_GPTJ:
     {
         mmha::apply_rotary_embedding(
-            k, tidx, rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale, token_pos_idx);
+            k, tidx, rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale, 0, nullptr, token_pos_idx);
         break;
     }
+    case PositionEmbeddingType::kLONG_ROPE:
     case PositionEmbeddingType::kROPE_GPT_NEOX:
     {
         bool const do_rotary = vec_size * tidx < rotary_embedding_dim;
@@ -1885,7 +1888,7 @@ __global__ void shiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCa
         {
             mmha::vec_from_smem_transpose(k, k_smem, transpose_idx, smem_pitch);
             mmha::apply_rotary_embedding(k, transpose_idx / tidx_factor, rotary_embedding_dim, rotary_embedding_base,
-                rotary_embedding_scale, token_pos_idx);
+                rotary_embedding_scale, 0, nullptr, token_pos_idx);
             mmha::write_smem_transpose(k, k_smem, transpose_idx, smem_pitch);
         }
 
@@ -1907,20 +1910,22 @@ __global__ void shiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCa
 }
 
 template <typename T, typename KVCacheBuffer>
-void invokeShiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCacheBuffer, const KvCacheDataType cache_type,
-    int const sizePerHead, int const timestep, int const batch_beam, int const kv_head_num, int const beam_width,
-    int const maxKCacheLen, int const sinkTokenLen, float const* kScaleQuantOrig, int const* sequence_lengths,
-    int const* input_lengths, int const rotary_embedding_dim, float rotary_embedding_base,
-    RotaryScalingType const rotary_scale_type, float rotary_embedding_scale, int const rotary_embedding_max_positions,
-    PositionEmbeddingType const position_embedding_type, cudaStream_t stream)
+void invokeShiftKCache(KVCacheBuffer const& kvCacheBuffer, KVLinearBuffer const& shiftKCacheBuffer,
+    const KvCacheDataType cache_type, int const sizePerHead, int const timestep, int const batch_beam,
+    int const kv_head_num, int const beam_width, int const maxKCacheLen, int const sinkTokenLen,
+    float const* kScaleQuantOrig, int const* sequence_lengths, int const* input_lengths, int const rotary_embedding_dim,
+    float rotary_embedding_base, RotaryScalingType const rotary_scale_type, float rotary_embedding_scale,
+    int const rotary_embedding_max_positions, PositionEmbeddingType const position_embedding_type, cudaStream_t stream)
 {
     // Block handles K tile.
     int const token_num_in_k = (timestep <= maxKCacheLen) ? timestep : maxKCacheLen;
     int const vec_size = 16u / sizeof(T);
     dim3 block((sizePerHead / vec_size + 31) / 32 * 32);
     dim3 grid(token_num_in_k, kv_head_num, batch_beam);
-    size_t smem_size
-        = (position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX ? 2 * rotary_embedding_dim * sizeof(T) : 0);
+    size_t smem_size = (position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX
+                || position_embedding_type == PositionEmbeddingType::kLONG_ROPE
+            ? 2 * rotary_embedding_dim * sizeof(T)
+            : 0);
 
     if (cache_type == KvCacheDataType::INT8)
     {
@@ -1948,10 +1953,10 @@ void invokeShiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCacheBu
 }
 
 #define INSTANTIATE_SHIFT_K_CACHE_CACHE_TYPE(T, KVCacheBuffer)                                                         \
-    template void invokeShiftKCache<T, KVCacheBuffer>(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCacheBuffer,   \
-        const KvCacheDataType cache_type, const int sizePerHead, const int timestep, const int batch_beam,             \
-        const int kv_head_num, const int beam_width, const int maxKCacheLen, const int sinkTokenLen,                   \
-        const float* kScaleQuantOrig, const int* sequence_lengths, const int* input_lengths,                           \
+    template void invokeShiftKCache<T, KVCacheBuffer>(KVCacheBuffer const& kvCacheBuffer,                              \
+        KVLinearBuffer const& shiftKCacheBuffer, const KvCacheDataType cache_type, const int sizePerHead,              \
+        const int timestep, const int batch_beam, const int kv_head_num, const int beam_width, const int maxKCacheLen, \
+        const int sinkTokenLen, const float* kScaleQuantOrig, const int* sequence_lengths, const int* input_lengths,   \
         const int rotary_embedding_dim, float rotary_embedding_base, RotaryScalingType const rotary_scale_type,        \
         float rotary_embedding_scale, const int rotary_embedding_max_positions,                                        \
         PositionEmbeddingType const position_embedding_type, cudaStream_t stream)
@@ -1968,6 +1973,109 @@ INSTANTIATE_SHIFT_K_CACHE(__nv_bfloat16);
 
 #undef INSTANTIATE_SHIFT_K_CACHE_CACHE_TYPE
 #undef INSTANTIATE_SHIFT_K_CACHE
+
+namespace
+{
+template <typename T, uint32_t size_>
+struct alignas(std::max<uint32_t>(alignof(T), std::min<uint32_t>(sizeof(T) * size_, 16))) Vec
+{
+    using Elem = T;
+    static constexpr uint32_t size = size_;
+    Elem data[size];
+
+    __device__ inline void fill(T val)
+    {
+#pragma unroll
+        for (uint32_t i = 0; i < size; i++)
+        {
+            data[i] = val;
+        }
+    }
+
+    static __device__ inline Vec<T, size> filled(T val)
+    {
+        Vec<T, size> ret;
+        ret.fill(val);
+        return ret;
+    }
+
+    __device__ inline Elem const& operator[](uint32_t i) const
+    {
+        assert(i < size);
+        return data[i];
+    }
+
+    __device__ inline Elem& operator[](uint32_t i)
+    {
+        assert(i < size);
+        return data[i];
+    }
+};
+
+template <typename Dst, typename Src>
+__global__ void convertData(Dst* dst, Src const* src, int64_t size, float const* __restrict__ pScale)
+{
+    constexpr uint32_t srcElemSize = sizeof(Src);
+    constexpr uint32_t dstElemSize = sizeof(Dst);
+    static_assert((srcElemSize & (srcElemSize - 1)) == 0 && (dstElemSize & (dstElemSize - 1)) == 0);
+    assert(reinterpret_cast<std::uintptr_t>(dst) % 16 == 0 && reinterpret_cast<std::uintptr_t>(src) % 16 == 0);
+    constexpr uint32_t packSize = 16 / std::max(srcElemSize, dstElemSize);
+    auto const tid = blockDim.x * blockIdx.x + threadIdx.x;
+    auto const nbThrds = blockDim.x * gridDim.x;
+    if (nbThrds * packSize + packSize - 1 >= size)
+    {
+        return;
+    }
+    float const scale = (pScale == nullptr ? 1.F : pScale[0]);
+    using SrcPack = Vec<Src, packSize>;
+    using DstPack = Vec<Dst, packSize>;
+    int64_t const stride = packSize * nbThrds;
+    for (int64_t i = tid * packSize; i < size; i += stride)
+    {
+        if (i + packSize < size)
+        {
+            auto const srcPack = reinterpret_cast<SrcPack const&>(src[i]);
+            DstPack dstPack;
+#pragma unroll
+            for (int32_t j = 0; j < packSize; j++)
+            {
+                dstPack[j] = Dst{float{srcPack[j]} * scale};
+            }
+            reinterpret_cast<DstPack&>(dst[i]) = dstPack;
+        }
+        else
+        {
+#pragma unroll
+            for (int64_t j = 0; j < packSize; j++)
+            {
+                if (i + j >= size)
+                {
+                    break;
+                }
+                dst[i + j] = Dst{float{src[i + j]} * scale};
+            }
+        }
+    }
+}
+} // unnamed namespace
+
+template <typename Dst, typename Src>
+void invokeConversion(Dst* dst, Src const* src, int64_t size, float const* __restrict__ scale, cudaStream_t stream)
+{
+    auto const packSize = 16 / std::max(sizeof(Dst), sizeof(Src));
+    auto const nbPack = divUp(size, packSize);
+    uint32_t const ctaSize = 256;
+    auto const nbCta = std::min<size_t>(divUp(nbPack, ctaSize), 4096);
+
+    convertData<Dst, Src><<<nbCta, ctaSize, 0, stream>>>(dst, src, size, scale);
+}
+
+#define INSTANTIATE_invokeConversion(Dst, Src)                                                                         \
+    template void invokeConversion<Dst, Src>(                                                                          \
+        Dst * dst, Src const* src, int64_t size, float const* __restrict__ scale, cudaStream_t stream)
+INSTANTIATE_invokeConversion(__nv_fp8_e4m3, half);
+INSTANTIATE_invokeConversion(__nv_fp8_e4m3, __nv_bfloat16);
+#undef INSTANTIATE_invokeConversion
 
 } // namespace kernels
 } // namespace tensorrt_llm

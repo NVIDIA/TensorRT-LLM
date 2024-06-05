@@ -13,8 +13,8 @@
 #include "tensorrt_llm/runtime/loraUtils.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/runtime/common.h"
-#include "tensorrt_llm/runtime/gptModelConfig.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 #include <string>
 
@@ -27,9 +27,9 @@ void loraValidateRequestTensorDims(std::optional<ITensor::SharedPtr> const& optR
     TLLM_CHECK_WITH_INFO(optReqLoraWeights.has_value() && optReqLoraConfig.has_value(),
         "Request for LoRA inference must have both lora_weights and lora_keys");
 
-    SizeType constexpr expectedBatchSize = 1;
-    SizeType constexpr expectedWeightsDims = 3;
-    SizeType constexpr expectedKeysDims = 3;
+    SizeType32 constexpr expectedBatchSize = 1;
+    SizeType32 constexpr expectedWeightsDims = 3;
+    SizeType32 constexpr expectedKeysDims = 3;
 
     auto weights = optReqLoraWeights.value();
     auto keys = optReqLoraConfig.value();
@@ -52,7 +52,7 @@ void loraValidateRequestTensorDims(std::optional<ITensor::SharedPtr> const& optR
 
 void loraValidateRequestTensors(std::optional<std::uint64_t> const& optTaskId,
     std::optional<ITensor::SharedPtr> const& optReqLoraWeights,
-    std::optional<ITensor::SharedPtr> const& optReqLoraConfig, runtime::GptModelConfig const& modelConfig,
+    std::optional<ITensor::SharedPtr> const& optReqLoraConfig, runtime::ModelConfig const& modelConfig,
     runtime::WorldConfig const& worldConfig)
 {
     TLLM_CHECK_WITH_INFO(optTaskId.has_value(), "lora_task_id must be set for LoRA inference");
@@ -62,13 +62,13 @@ void loraValidateRequestTensors(std::optional<std::uint64_t> const& optTaskId,
 
         auto weights = optReqLoraWeights.value();
         auto config = optReqLoraConfig.value();
-        SizeType nbModelLayers = modelConfig.getNbLayers();
+        SizeType32 nbModelLayers = modelConfig.getNbAttentionLayers();
         TLLM_CHECK_WITH_INFO(weights->getDataType() == modelConfig.getDataType(),
             "Expected lora weights to be the same data type as base model");
 
         auto loraModules = modelConfig.getLoraModules();
-        auto configPtr = bufferCast<SizeType>(*config);
-        for (SizeType row = 0; row < config->getShape().d[1]; ++row)
+        auto configPtr = bufferCast<SizeType32>(*config);
+        for (SizeType32 row = 0; row < config->getShape().d[1]; ++row)
         {
             auto modId = configPtr[row * kLORA_CONFIG_ROW_SIZE + kLORA_CONFIG_MODULE_OFF];
             auto layerId = configPtr[row * kLORA_CONFIG_ROW_SIZE + kLORA_CONFIG_LAYER_OFF];

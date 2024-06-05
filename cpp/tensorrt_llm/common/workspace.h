@@ -63,7 +63,7 @@ int8_t* nextWorkspacePtrWithAlignment(
     return nextWorkspacePtrCommon(ptr, previousWorkspaceSize, alignment);
 }
 
-size_t calculateTotalWorkspaceSize(size_t* workspaces, int count, const uintptr_t alignment = kCudaMemAlign)
+size_t calculateTotalWorkspaceSize(size_t const* workspaces, int count, const uintptr_t alignment = kCudaMemAlign)
 {
     size_t total = 0;
     for (int i = 0; i < count; i++)

@@ -41,21 +41,20 @@ namespace kernels
 class MHARunner
 {
 public:
-    MHARunner(const Data_type dataType, int const numHeads, int const headSize, float const qScaling);
+    MHARunner(
+        Data_type const dataType, bool const pagedKVFMHA, int const numHeads, int const headSize, float const qScaling);
 
     MHARunner() = default;
 
     virtual ~MHARunner() = default;
 
-    virtual void setup(int const b, int const s, int const sliding_window_size, int const total_seqlen,
-        float const* scale_bmm2_d = nullptr, bool const has_alibi = false, bool const scale_alibi = false,
-        int const tp_size = 1, int const tp_rank = 0)
-        = 0;
-
-    virtual void setup_paged_kv(int const b, int const s_q, int const s_kv, int const blocks_per_context_sequence,
+    virtual void setup(int const b, int const s_q, int const s_kv, int const blocks_per_context_sequence,
         int const tokens_per_kv_block, int const sliding_window_size, int const total_seqlen,
         bool const has_alibi = false, bool const scale_alibi = false, int const tp_size = 1, int const tp_rank = 0)
         = 0;
+
+    // Keep this for bert attention plugin.
+    virtual void setup(int const b, int const s, int const sliding_window_size, int const total_seqlen) = 0;
 
     static bool fmha_supported(int const headSize, int const sm);
 
@@ -65,11 +64,14 @@ public:
         int const num_kv_heads /* MQA or GQA */)
         = 0;
 
-    virtual void run(void const* input, void const* cu_seqlens, void* output, cudaStream_t stream) = 0;
+    virtual void run(void const* qPtr, void const* pagedKVBlockOffsetsOnHost, KVBlockArray const& pagedKVCache,
+        void const* cuQSeqlenPtr, void const* cuKVSeqlenPtr, uint32_t* tileCounterPtr, float const* scaleBmm2Ptr,
+        void* outputPtr, cudaStream_t stream)
+        = 0;
 
-    virtual void run_paged_kv(void const* q_input, void* paged_kv_tma_desc, void const* paged_kv_block_ptrs_on_host,
-        const KVBlockArray paged_kv_cache, void const* cu_q_seqlens, void const* cu_kv_seqlens, void* output,
-        cudaStream_t stream)
+    // Keep this for bert attention plugin.
+    virtual void run(void const* inputPtr, void const* cuQSeqlenPtr, uint32_t* tileCounterPtr,
+        float const* scaleBmm2Ptr, void* outputPtr, cudaStream_t stream)
         = 0;
 
     virtual bool isValid(int s) const = 0;
@@ -87,25 +89,35 @@ public:
 class FusedMHARunnerV2 : public MHARunner
 {
 public:
-    FusedMHARunnerV2(const Data_type dataType, int const numHeads, int const headSize, float const qScaling);
+    FusedMHARunnerV2(
+        Data_type const dataType, bool const pagedKVFMHA, int const numHeads, int const headSize, float const qScaling);
 
     ~FusedMHARunnerV2(); // for pimpl
 
-    void setup(int const b, int const s, int const sliding_window_size, int const total_seqlen,
-        float const* scale_bmm2_d = nullptr, bool const has_alibi = false, bool const scale_alibi = false,
-        int const tp_size = 1, int const tp_rank = 0) override;
-
-    void setup_paged_kv(int const b, int const s_q, int const s_kv, int const blocks_per_context_sequence,
+    void setup(int const b, int const s_q, int const s_kv, int const blocks_per_context_sequence,
         int const tokens_per_kv_block, int const sliding_window_size, int const total_seqlen,
         bool const has_alibi = false, bool const scale_alibi = false, int const tp_size = 1,
         int const tp_rank = 0) override;
 
+    // Keep this for bert attention plugin.
+    void setup(int const b, int const s, int const sliding_window_size, int const total_seqlen)
+    {
+        setup(b, s, s, 0, 0, sliding_window_size, total_seqlen);
+    }
+
     bool fmha_supported() override;
 
-    void run(void const* input, void const* cu_seqlens, void* output, cudaStream_t stream) override;
-    void run_paged_kv(void const* q_input, void* paged_kv_tma_desc, void const* paged_kv_block_ptrs_on_host,
-        const KVBlockArray paged_kv_cache, void const* cu_q_seqlens, void const* cu_kv_seqlens, void* output,
-        cudaStream_t stream) override;
+    void run(void const* qPtr, void const* pagedKVBlockOffsetsOnHost, KVBlockArray const& pagedKVCache,
+        void const* cuQSeqlenPtr, void const* cuKVSeqlenPtr, uint32_t* tileCounterPtr, float const* scaleBmm2Ptr,
+        void* outputPtr, cudaStream_t stream) override;
+
+    // Keep this for bert attention plugin.
+    void run(void const* inputPtr, void const* cuQSeqlenPtr, uint32_t* tileCounterPtr, float const* scaleBmm2Ptr,
+        void* outputPtr, cudaStream_t stream)
+    {
+        run(inputPtr, nullptr, KVBlockArray(), cuQSeqlenPtr, cuQSeqlenPtr, tileCounterPtr, scaleBmm2Ptr, outputPtr,
+            stream);
+    }
 
     void setup_flags(bool const force_fp32_acc, bool const is_s_padded, bool const causal_mask,
         int const num_kv_heads /* MQA or GQA */) override;

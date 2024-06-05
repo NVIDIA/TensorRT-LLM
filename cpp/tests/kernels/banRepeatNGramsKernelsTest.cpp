@@ -49,10 +49,10 @@ public:
 
     void TearDown() override {}
 
-    void initData(std::vector<std::vector<SizeType>> const& outputIds, std::vector<SizeType> const& nGramSizes)
+    void initData(std::vector<std::vector<SizeType32>> const& outputIds, std::vector<SizeType32> const& nGramSizes)
     {
         auto const ptrType = TRTDataType<void*>::value;
-        SizeType const batchSize = outputIds.size();
+        SizeType32 const batchSize = outputIds.size();
         auto const maxBatchSize = 2 * batchSize;
 
         mLogits = BufferManager::pinned(ITensor::makeShape({batchSize, mVocabSizePadded}), nvinfer1::DataType::kFLOAT);
@@ -75,20 +75,20 @@ public:
         mBatchSlots = BufferManager::pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
 
         auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
-        for (SizeType bi = 0; bi < batchSize; ++bi)
+        for (SizeType32 bi = 0; bi < batchSize; ++bi)
         {
             batchSlotsPtr[bi] = 2 * bi;
         }
 
         auto logitsPtr = bufferCast<float>(*mLogits);
-        auto sequenceLengthsPtr = bufferCast<SizeType>(*mSequenceLengths);
+        auto sequenceLengthsPtr = bufferCast<SizeType32>(*mSequenceLengths);
         auto finishedPtr
             = reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*mFinished));
 
-        for (SizeType bi = 0; bi < batchSize; ++bi)
+        for (SizeType32 bi = 0; bi < batchSize; ++bi)
         {
             auto const batchSlot = batchSlotsPtr[bi];
-            for (SizeType ri = 0; ri < mBeamWidth; ri++)
+            for (SizeType32 ri = 0; ri < mBeamWidth; ri++)
             {
                 sequenceLengthsPtr[batchSlot * mBeamWidth + ri] = outputIds[bi].size() - 1;
                 finishedPtr[batchSlot * mBeamWidth + ri] = tk::FinishedState::empty();
@@ -99,7 +99,7 @@ public:
         trk::invokeFill(*mNGramSizes, int32_t{0}, *mStream);
         mStream->synchronize();
 
-        for (SizeType bi = 0; bi < batchSize; ++bi)
+        for (SizeType32 bi = 0; bi < batchSize; ++bi)
         {
             auto const lastId = outputIds[bi].back();
             logitsPtr[bi * mVocabSizePadded + lastId] = 1.f;
@@ -110,12 +110,12 @@ public:
         auto outputIdsData = bufferCast<int32_t>(*mOutputIds);
         auto parentIdsData = bufferCast<int32_t>(*mParentIds);
 
-        for (SizeType bi = 0; bi < batchSize; bi++)
+        for (SizeType32 bi = 0; bi < batchSize; bi++)
         {
             auto const batchSlot = batchSlotsPtr[bi];
-            for (SizeType ri = 0; ri < mBeamWidth; ri++)
+            for (SizeType32 ri = 0; ri < mBeamWidth; ri++)
             {
-                for (SizeType si = 0; si < outputIds[bi].size(); si++)
+                for (SizeType32 si = 0; si < outputIds[bi].size(); si++)
                 {
                     auto const idx = tc::flat_index3(batchSlot, ri, si, mBeamWidth, mMaxSeqLen);
                     outputIdsData[idx] = outputIds[bi][si];
@@ -124,14 +124,14 @@ public:
             }
         }
 
-        for (SizeType bi = 0; bi < maxBatchSize; bi++)
+        for (SizeType32 bi = 0; bi < maxBatchSize; bi++)
         {
             outputIdsPtrsData[bi] = outputIdsData + bi * mBeamWidth * mMaxSeqLen;
             parentIdsPtrsData[bi] = parentIdsData + bi * mBeamWidth * mMaxSeqLen;
         }
 
         auto nGramSizesPtr = bufferCast<int32_t>(*mNGramSizes);
-        for (SizeType bi = 0; bi < batchSize; ++bi)
+        for (SizeType32 bi = 0; bi < batchSize; ++bi)
         {
             auto const batchSlot = batchSlotsPtr[bi];
             nGramSizesPtr[batchSlot] = nGramSizes[bi];
@@ -139,7 +139,7 @@ public:
     }
 
     void verifyBanRepeatNGramResults(
-        std::vector<SizeType> const& nGramSizes, std::vector<SizeType> const& expectedLastId)
+        std::vector<SizeType32> const& nGramSizes, std::vector<SizeType32> const& expectedLastId)
     {
 
         auto const batchSize = expectedLastId.size();
@@ -148,7 +148,7 @@ public:
         auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
         auto logitsPtr = bufferCast<float>(*mLogits);
 
-        for (SizeType bi = 0; bi < batchSize; bi++)
+        for (SizeType32 bi = 0; bi < batchSize; bi++)
         {
             auto const batchSlot = batchSlotsPtr[bi];
             auto const lastId = expectedLastId[bi];
@@ -161,8 +161,8 @@ public:
         }
     }
 
-    void runBanRepeatNGramTest(std::vector<std::vector<SizeType>> const& outputIds,
-        std::vector<SizeType> const& nGramSizes, std::vector<SizeType> const& expectedLastId)
+    void runBanRepeatNGramTest(std::vector<std::vector<SizeType32>> const& outputIds,
+        std::vector<SizeType32> const& nGramSizes, std::vector<SizeType32> const& expectedLastId)
     {
         auto const batchSize = expectedLastId.size();
         int32_t maxStep = 0;
@@ -200,20 +200,20 @@ protected:
     TensorPtr mNGramSizes;
     TensorPtr mBatchSlots;
 
-    static constexpr SizeType mMaxSeqLen{16};
-    static constexpr SizeType mVocabSizePadded{32};
+    static constexpr SizeType32 mMaxSeqLen{16};
+    static constexpr SizeType32 mVocabSizePadded{32};
     // TODO(nkorobov): add beam width
-    static constexpr SizeType mBeamWidth{1};
+    static constexpr SizeType32 mBeamWidth{1};
 };
 
 TEST_F(BanRepeatNgramKernelsTest, noRepeatNGramsBS1BW1Test)
 {
-    std::vector<std::vector<std::vector<SizeType>>> outputIds
+    std::vector<std::vector<std::vector<SizeType32>>> outputIds
         = {{{1, 2, 3, 4, 5, 6, 2, 3}}, {{1, 2, 3, 4, 5, 6, 2, 3}}};
-    std::vector<std::vector<SizeType>> nGramSizes = {{2}, {3}};
+    std::vector<std::vector<SizeType32>> nGramSizes = {{2}, {3}};
     // Positive value shows expected id of the last token. Negative value shows not-expected id of the last token
-    std::vector<std::vector<SizeType>> expectedOutputIds = {{-3}, {3}};
-    for (SizeType ti = 0; ti < nGramSizes.size(); ++ti)
+    std::vector<std::vector<SizeType32>> expectedOutputIds = {{-3}, {3}};
+    for (SizeType32 ti = 0; ti < nGramSizes.size(); ++ti)
     {
         this->runBanRepeatNGramTest(outputIds[ti], nGramSizes[ti], expectedOutputIds[ti]);
     }
@@ -221,12 +221,12 @@ TEST_F(BanRepeatNgramKernelsTest, noRepeatNGramsBS1BW1Test)
 
 TEST_F(BanRepeatNgramKernelsTest, noRepeatNGramsBS2BW1Test)
 {
-    std::vector<std::vector<std::vector<SizeType>>> outputIds
+    std::vector<std::vector<std::vector<SizeType32>>> outputIds
         = {{{1, 2, 3, 6, 2, 3}, {1, 3, 3, 4, 5, 6, 2, 3}}, {{1, 2, 3, 2, 3}, {1, 2, 3, 4, 5, 6, 2, 3}}};
-    std::vector<std::vector<SizeType>> nGramSizes = {{2, 2}, {3, 2}};
+    std::vector<std::vector<SizeType32>> nGramSizes = {{2, 2}, {3, 2}};
     // Positive value shows expected id of the last token. Negative value shows not-expected id of the last token
-    std::vector<std::vector<SizeType>> expectedOutputIds = {{-3, 3}, {3, -3}};
-    for (SizeType ti = 0; ti < nGramSizes.size(); ++ti)
+    std::vector<std::vector<SizeType32>> expectedOutputIds = {{-3, 3}, {3, -3}};
+    for (SizeType32 ti = 0; ti < nGramSizes.size(); ++ti)
     {
         this->runBanRepeatNGramTest(outputIds[ti], nGramSizes[ti], expectedOutputIds[ti]);
     }

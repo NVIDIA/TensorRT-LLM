@@ -51,30 +51,30 @@ def build_engine(weight_dir: _pl.Path, ckpt_dir: _pl.Path, engine_dir: _pl.Path,
 def build_engines(model_cache: _tp.Optional[str] = None):
     resources_dir = _pl.Path(__file__).parent.resolve().parent
     models_dir = resources_dir / 'models'
-    model_name = 'mamba-2.8b'
+    model_name = 'mamba-2.8b-hf'
 
-    # Clone or update the model directory without lfs
-    hf_dir = models_dir / model_name
-    if hf_dir.exists():
-        assert hf_dir.is_dir()
-        run_command(["git", "pull"], cwd=hf_dir)
-    else:
+    if model_cache:
+        print("Copy model from model_cache")
+        model_cache_dir = _pl.Path(model_cache) / 'mamba' / model_name
         if _pf.system() == "Windows":
-            url_prefix = ""
+            wincopy(source=str(model_cache_dir),
+                    dest=model_name,
+                    isdir=True,
+                    cwd=models_dir)
         else:
-            url_prefix = "file://"
-        model_url = url_prefix + str(
-            _pl.Path(model_cache) / model_name
-        ) if model_cache else "https://huggingface.co/state-spaces/mamba-2.8b"
-        run_command([
-            "git", "clone", model_url, "--single-branch", "--no-local",
-            model_name
-        ],
-                    cwd=hf_dir.parent,
-                    env={
-                        **_os.environ, "GIT_LFS_SKIP_SMUDGE": "1"
-                    })
-
+            run_command(
+                ["rsync", "-av", str(model_cache_dir), "."], cwd=models_dir)
+    else:
+        print("Clone model from HF")
+        hf_dir = _pl.Path(models_dir) / model_name
+        run_command(
+            [
+                "git", "clone",
+                "https://huggingface.co/state-spaces/mamba-2.8b-hf", model_name
+            ],
+            cwd=models_dir,
+        )
+    hf_dir = models_dir / model_name
     assert (hf_dir.is_dir())
 
     # Clone or update the tokenizer directory without lfs
@@ -99,27 +99,6 @@ def build_engines(model_cache: _tp.Optional[str] = None):
                     env={
                         **_os.environ, "GIT_LFS_SKIP_SMUDGE": "1"
                     })
-
-    # Download the model file
-    model_file_name = "pytorch_model.bin"
-    if model_cache:
-        if _pf.system() == "Windows":
-            wincopy(source=str(
-                _pl.Path(model_cache) / model_name / model_file_name),
-                    dest=model_file_name,
-                    isdir=False,
-                    cwd=hf_dir)
-        else:
-            run_command([
-                "rsync", "-av",
-                str(_pl.Path(model_cache) / model_name / model_file_name), "."
-            ],
-                        cwd=hf_dir)
-    else:
-        run_command(["git", "lfs", "pull", "--include", model_file_name],
-                    cwd=hf_dir)
-
-    assert ((hf_dir / model_file_name).is_file())
 
     tp_size = 1
     pp_size = 1

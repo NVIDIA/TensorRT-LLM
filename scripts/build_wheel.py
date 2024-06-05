@@ -62,7 +62,6 @@ def main(build_type: str = "Release",
 
     if not (project_dir / "3rdparty/cutlass/.git").exists():
         build_run('git submodule update --init --recursive')
-
     on_windows = platform.system() == "Windows"
     requirements_filename = "requirements-dev-windows.txt" if on_windows else "requirements-dev.txt"
     build_run(
@@ -155,6 +154,7 @@ def main(build_type: str = "Release",
     bindings_lib = "" if cpp_only else "bindings"
     benchmarks_lib = "benchmarks" if benchmarks else ""
     disable_nvtx = "OFF" if nvtx else "ON"
+    executor_worker = "" if on_windows else "executorWorker "
 
     with working_directory(build_dir):
         cmake_def_args = " ".join(cmake_def_args)
@@ -165,7 +165,7 @@ def main(build_type: str = "Release",
             )
         build_run(
             f'cmake --build . --config {build_type} --parallel {job_count} '
-            f'--target tensorrt_llm nvinfer_plugin_tensorrt_llm {th_common_lib} {bindings_lib} {benchmarks_lib}'
+            f'--target tensorrt_llm nvinfer_plugin_tensorrt_llm {th_common_lib} {bindings_lib} {benchmarks_lib} {executor_worker}'
             f'{" ".join(extra_make_targets)}')
 
     if cpp_only:
@@ -186,6 +186,10 @@ def main(build_type: str = "Release",
         copy(
             build_dir / f"tensorrt_llm/plugins/nvinfer_plugin_tensorrt_llm.dll",
             lib_dir / "nvinfer_plugin_tensorrt_llm.dll")
+        copy(
+            build_dir /
+            "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/tensorrt_llm_nvrtc_wrapper.dll",
+            lib_dir / "tensorrt_llm_nvrtc_wrapper.dll")
     else:
         copy(build_dir / "tensorrt_llm/libtensorrt_llm.so",
              lib_dir / "libtensorrt_llm.so")
@@ -195,6 +199,19 @@ def main(build_type: str = "Release",
             build_dir /
             "tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so",
             lib_dir / "libnvinfer_plugin_tensorrt_llm.so")
+        copy(
+            build_dir /
+            "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/libtensorrt_llm_nvrtc_wrapper.so",
+            lib_dir / "libtensorrt_llm_nvrtc_wrapper.so")
+
+    bin_dir = pkg_dir / "bin"
+    if bin_dir.exists():
+        rmtree(bin_dir)
+    bin_dir.mkdir(parents=True)
+
+    if not on_windows:
+        copy(build_dir / "tensorrt_llm/executor_worker/executorWorker",
+             bin_dir / "executorWorker")
 
     if not cpp_only:
 
@@ -239,8 +256,11 @@ def main(build_type: str = "Release",
                 (pkg_dir / stubgen).unlink()
             else:
                 env_ld = os.environ.copy()
-                env_ld[
-                    "LD_LIBRARY_PATH"] = f"/usr/local/cuda/compat/lib.real:{env_ld['LD_LIBRARY_PATH']}"
+
+                new_library_path = "/usr/local/cuda/compat/lib.real"
+                if 'LD_LIBRARY_PATH' in env_ld:
+                    new_library_path += f":{env_ld['LD_LIBRARY_PATH']}"
+                env_ld["LD_LIBRARY_PATH"] = new_library_path
                 try:
                     build_run(
                         f"\"{sys.executable}\" -m pybind11_stubgen -o . bindings",
@@ -258,7 +278,7 @@ def main(build_type: str = "Release",
         dist_dir.mkdir(parents=True)
     if not skip_building_wheel:
         build_run(
-            f'python3 -m build {project_dir} --skip-dependency-check --no-isolation --wheel --outdir "{dist_dir}"'
+            f'\"{sys.executable}\" -m build {project_dir} --skip-dependency-check --no-isolation --wheel --outdir "{dist_dir}"'
         )
 
     if install:

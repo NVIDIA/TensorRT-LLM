@@ -19,10 +19,12 @@
 
 #include <cstdio>
 #include <cuda.h>
+#include <memory>
+#include <mutex>
 
 #define cuErrCheck(stat, wrap)                                                                                         \
     {                                                                                                                  \
-        cuErrCheck_((stat), wrap, __FILE__, __LINE__);                                                                 \
+        cuErrCheck_((stat), wrap.get(), __FILE__, __LINE__);                                                           \
     }
 
 namespace tensorrt_llm
@@ -32,8 +34,11 @@ namespace common
 
 class CUDADriverWrapper
 {
-public:
+    // Use getInstance() instead.
     CUDADriverWrapper();
+
+public:
+    static std::shared_ptr<CUDADriverWrapper> getInstance();
 
     ~CUDADriverWrapper();
 
@@ -70,6 +75,13 @@ public:
         unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ, unsigned int sharedMemBytes,
         CUstream hStream, void** kernelParams, void** extra) const;
 
+    CUresult cuTensorMapEncodeTiled(CUtensorMap* tensorMap, CUtensorMapDataType tensorDataType, cuuint32_t tensorRank,
+        void* globalAddress, cuuint64_t const* globalDim, cuuint64_t const* globalStrides, cuuint32_t const* boxDim,
+        cuuint32_t const* elementStrides, CUtensorMapInterleave interleave, CUtensorMapSwizzle swizzle,
+        CUtensorMapL2promotion l2Promotion, CUtensorMapFloatOOBfill oobFill) const;
+
+    CUresult cuMemcpyDtoH(void* dstHost, CUdeviceptr srcDevice, size_t ByteCount) const;
+
 private:
     void* handle;
     CUresult (*_cuGetErrorName)(CUresult, char const**);
@@ -89,14 +101,19 @@ private:
     CUresult (*_cuLaunchKernel)(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
         unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ, unsigned int sharedMemBytes,
         CUstream hStream, void** kernelParams, void** extra);
+    CUresult (*_cuTensorMapEncodeTiled)(CUtensorMap* tensorMap, CUtensorMapDataType tensorDataType,
+        cuuint32_t tensorRank, void* globalAddress, cuuint64_t const* globalDim, cuuint64_t const* globalStrides,
+        cuuint32_t const* boxDim, cuuint32_t const* elementStrides, CUtensorMapInterleave interleave,
+        CUtensorMapSwizzle swizzle, CUtensorMapL2promotion l2Promotion, CUtensorMapFloatOOBfill oobFill);
+    CUresult (*_cuMemcpyDtoH)(void* dstHost, CUdeviceptr srcDevice, size_t ByteCount);
 };
 
-inline void cuErrCheck_(CUresult stat, CUDADriverWrapper const& wrap, char const* file, int line)
+inline void cuErrCheck_(CUresult stat, CUDADriverWrapper const* wrap, char const* file, int line)
 {
     if (stat != CUDA_SUCCESS)
     {
         char const* msg = nullptr;
-        wrap.cuGetErrorName(stat, &msg);
+        wrap->cuGetErrorName(stat, &msg);
         fprintf(stderr, "CUDA Error: %s %s %d\n", msg, file, line);
     }
 }

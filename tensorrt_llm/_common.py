@@ -25,9 +25,11 @@ import numpy as np
 # isort: off
 import torch
 import tensorrt as trt
+
 # isort: on
 
 from ._utils import str_dtype_to_trt
+from .bindings import MpiComm
 from .logger import logger
 from .plugin import _load_plugin_lib
 
@@ -49,6 +51,8 @@ def _init(log_level: object = None) -> None:
         logger.info('Skipping TensorRT-LLM init.')
         return
 
+    logger.info('Starting TensorRT-LLM init.')
+
     # load plugin lib
     _load_plugin_lib()
 
@@ -63,6 +67,8 @@ def _init(log_level: object = None) -> None:
     except Exception as e:
         msg = '\nFATAL: Decoding operators failed to load. This may be caused by the incompatibility between PyTorch and TensorRT-LLM. Please rebuild and install TensorRT-LLM.'
         raise ImportError(str(e) + msg)
+
+    MpiComm.local_init()
 
     logger.info('TensorRT-LLM inited.')
 

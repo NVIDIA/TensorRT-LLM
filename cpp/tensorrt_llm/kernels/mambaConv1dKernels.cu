@@ -198,7 +198,7 @@ __global__
 #endif
         >
     mambaConv1dContextKernel(int B_, int L_, int D_, T_* g_mxYa_, T_* g_mxYs_, T_ const* g_mxXa_, T_ const* g_mxXs_,
-        T_ const* g_mxW_, T_ const* g_mxB_, bool removePadding_, int const* lastTokenIdsPtr_,
+        T_ const* g_mxW_, T_ const* g_mxB_, bool removePadding_, bool applySilu_, int const* lastTokenIdsPtr_,
         int const* stateSlotMappingPtr_ = nullptr)
 {
     using namespace tensorrt_llm::common;
@@ -389,18 +389,34 @@ __global__
                 }
             }
 
-            if (std::is_same_v<T_, half>)
+            if (applySilu_)
+            {
+                if (std::is_same_v<T_, half>)
 #pragma unroll
-                for (int i = 0; i < 8; i += 2)
-                    *(half2*) &tmp[i]
-                        = __floats2half2_rn(sum[i] / (1 + exp(-sum[i])), sum[i + 1] / (1 + exp(-sum[i + 1])));
+                    for (int i = 0; i < 8; i += 2)
+                        *(half2*) &tmp[i]
+                            = __floats2half2_rn(sum[i] / (1 + exp(-sum[i])), sum[i + 1] / (1 + exp(-sum[i + 1])));
 #ifdef ENABLE_BF16
-            else
+                else
 #pragma unroll
-                for (int i = 0; i < 8; i += 2)
-                    *(__nv_bfloat162*) &tmp[i]
-                        = __floats2bfloat162_rn(sum[i] / (1 + exp(-sum[i])), sum[i + 1] / (1 + exp(-sum[i + 1])));
+                    for (int i = 0; i < 8; i += 2)
+                        *(__nv_bfloat162*) &tmp[i]
+                            = __floats2bfloat162_rn(sum[i] / (1 + exp(-sum[i])), sum[i + 1] / (1 + exp(-sum[i + 1])));
 #endif
+            }
+            else
+            {
+                if (std::is_same_v<T_, half>)
+#pragma unroll
+                    for (int i = 0; i < 8; i += 2)
+                        *(half2*) &tmp[i] = __floats2half2_rn(sum[i], sum[i + 1]);
+#ifdef ENABLE_BF16
+                else
+#pragma unroll
+                    for (int i = 0; i < 8; i += 2)
+                        *(__nv_bfloat162*) &tmp[i] = __floats2bfloat162_rn(sum[i], sum[i + 1]);
+#endif
+            }
 
             *(int4*) &s_mxO[swizzle<tileD_ * 2, tileD_, T_>((threadIdx.z * laneL + threadIdx.x / laneD_) * tileD_
                 + iD * warpD_ * laneD_ * 8 + threadIdx.y * laneD_ * 8 + threadIdx.x % laneD_ * 8)]
@@ -487,7 +503,7 @@ __global__
 template <int K_, int tileL_, int tileD_, int warpL_, int warpD_, int laneD_, int pipe_, typename T_>
 __global__ std::enable_if_t<std::is_same_v<T_, float>> mambaConv1dContextKernel(int B_, int L_, int D_, T_* g_mxYa_,
     T_* g_mxYs_, T_ const* g_mxXa_, T_ const* g_mxXs_, T_ const* g_mxW_, T_ const* g_mxB_, bool removePadding_,
-    int const* lastTokenIdsPtr_, int const* stateSlotMappingPtr_ = nullptr)
+    bool applySilu_, int const* lastTokenIdsPtr_, int const* stateSlotMappingPtr_ = nullptr)
 {
     static_assert(laneD_ >= 1 && laneD_ <= 32 && (laneD_ & (laneD_ - 1)) == 0);
 
@@ -643,9 +659,12 @@ __global__ std::enable_if_t<std::is_same_v<T_, float>> mambaConv1dContextKernel(
                     sum[i] += tmp[i] * weight[iK][iD][i];
             }
 
+            if (applySilu_)
+            {
 #pragma unroll
-            for (int i = 0; i < 4; i++)
-                sum[i] = sum[i] / (1 + exp(-sum[i]));
+                for (int i = 0; i < 4; i++)
+                    sum[i] = sum[i] / (1 + exp(-sum[i]));
+            }
 
             *(int4*) &s_mxO[swizzle<tileD_ * 4, tileD_, T_>((threadIdx.z * laneL + threadIdx.x / laneD_) * tileD_
                 + iD * warpD_ * laneD_ * 4 + threadIdx.y * laneD_ * 4 + threadIdx.x % laneD_ * 4)]
@@ -745,7 +764,7 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
     int pipe = 4;
 
     void (*f)(int B_, int L_, int D_, input_t* g_mxYa_, input_t* g_mxYs_, input_t const* g_mxXa_,
-        input_t const* g_mxXs_, input_t const* g_mxW_, input_t const* g_mxB_, bool removePadding_,
+        input_t const* g_mxXs_, input_t const* g_mxW_, input_t const* g_mxB_, bool removePadding_, bool applySilu_,
         int const* lastTokenIdsPtr_, int const* stateSlotMappingPtr_);
 
     if (std::is_same_v<input_t, float>)
@@ -1043,6 +1062,7 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
     input_t const* w = (input_t const*) params.weight_ptr;
     input_t const* b = (input_t const*) params.bias_ptr;
     bool rmpd = params.remove_padding;
+    bool silu = params.apply_silu;
     int const* ltip = params.last_token_ids_ptr;
     int const* ssmp = params.state_slot_mapping_ptr;
 
@@ -1051,7 +1071,7 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
 
     cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);
 
-    f<<<blks, thds, shmem, stream>>>(B, L, D, ya, ys, xa, xs, w, b, rmpd, ltip, ssmp);
+    f<<<blks, thds, shmem, stream>>>(B, L, D, ya, ys, xa, xs, w, b, rmpd, silu, ltip, ssmp);
 }
 
 template <typename input_t, int DCONV = 4, int CHANNELS_PER_THREAD = 4>
@@ -1132,11 +1152,14 @@ __launch_bounds__(64, 8) __global__
             reg_result[c] += reg_bias[c];
         }
         // Silu
-#pragma unroll
-        for (int c = 0; c < CHANNELS_PER_THREAD; ++c)
+        if (params.apply_silu)
         {
-            float sigmoid = reg_result[c] < -20.0 ? 0.0f : 1.0f / (1.0f + __expf(-reg_result[c]));
-            reg_result[c] *= sigmoid;
+#pragma unroll
+            for (int c = 0; c < CHANNELS_PER_THREAD; ++c)
+            {
+                float sigmoid = reg_result[c] < -20.0 ? 0.0f : 1.0f / (1.0f + __expf(-reg_result[c]));
+                reg_result[c] *= sigmoid;
+            }
         }
         packed_store_float_to<input_t, CHANNELS_PER_THREAD>(&reg_result[0], token_output);
 

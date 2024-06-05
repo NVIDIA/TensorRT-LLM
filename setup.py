@@ -41,6 +41,17 @@ def parse_requirements(filename: os.PathLike):
     return deps, extra_URLs
 
 
+def sanity_check():
+    bindings_path = Path(
+        __file__).resolve().parent / "tensorrt_llm" / "bindings"
+    if not bindings_path.exists():
+        raise ImportError(
+            'The `bindings` module does not exist. Please check the package integrity. '
+            'If you are attempting to use the pip development mode (editable installation), '
+            'please execute `build_wheels.py` first, and then run `pip install -e .`.'
+        )
+
+
 def get_version():
     version_file = Path(
         __file__).resolve().parent / "tensorrt_llm" / "version.py"
@@ -70,6 +81,7 @@ required_deps, extra_URLs = parse_requirements(
 devel_deps, _ = parse_requirements(
     Path("requirements-dev-windows.txt"
          if on_windows else "requirements-dev.txt"))
+sanity_check()
 
 # https://setuptools.pypa.io/en/latest/references/keywords.html
 setup(
@@ -94,17 +106,25 @@ setup(
     package_data={
         'tensorrt_llm': ([
             'libs/th_common.dll', 'libs/tensorrt_llm.dll',
-            'libs/nvinfer_plugin_tensorrt_llm.dll', 'bindings.*.pyd'
+            'libs/nvinfer_plugin_tensorrt_llm.dll',
+            'libs/tensorrt_llm_nvrtc_wrapper.dll', 'bindings.*.pyd'
         ] if on_windows else [
+            'bin/executorWorker',
             'libs/libtensorrt_llm.so',
             'libs/libth_common.so',
             'libs/libnvinfer_plugin_tensorrt_llm.so',
+            'libs/libtensorrt_llm_nvrtc_wrapper.so',
             'bindings.*.so',
         ]) + ['bindings/*.pyi', 'tools/plugin_gen/templates/*'],
     },
     entry_points={
-        'console_scripts': ['trtllm-build=tensorrt_llm.commands.build:main'],
+        'console_scripts': [
+            'trtllm-build=tensorrt_llm.commands.build:main',
+            'trtllm-prune=tensorrt_llm.commands.prune:main',
+            'trtllm-refit=tensorrt_llm.commands.refit:main',
+        ],
     },
+    scripts=['tensorrt_llm/hlapi/trtllm-hlapi-launch'],
     extras_require={
         "devel": devel_deps,
         "benchmarking": [

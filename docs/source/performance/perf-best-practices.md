@@ -121,6 +121,12 @@ the generation phase. However, it requires the context length to be long enough
 for the work performed by each CUDA thread block to remain sufficient for
 efficiency.
 
+Note that, the `--multi_block_mode` argument works more like a suggestion to the
+runtime, hence it's possible that multi-block is not used even when
+`--multi_block_mode` argument is specified due to no performance gain, and it's
+also possible that multi-block is automatically used even when `--multi_block_mode`
+argument is disabled.
+
 ### Custom AllReduce Plugin
 
 On NVLink-based nodes, it is recommended to enable the custom AllReduce plugin
@@ -130,6 +136,11 @@ nodes, it is not recommended to enabled that plugin.
 The custom AllReduce plugin activates a latency-optimized algorithm for
 the AllReduce operation instead of the native NCCL operator. However, the
 performance benefits may not be seen on PCIE-based systems.
+
+Note that, the `--use_custom_all_reduce` argument works more like a suggestion
+to the runtime, and will possibly be removed in the future releases. We have supported
+an auto fallback mechanism so that native NCCL kernel is used when hardware requirements
+are not satisfied to get the best performance.
 
 ### Embedding Parallelism, Embedding Sharing, and Look-Up Plugin
 
@@ -174,6 +185,19 @@ The GEMM plugin utilizes NVIDIA cuBLASLt to perform GEMM operations. On FP16 and
 BF16, it's recommended to be enabled for better performance and smaller GPU
 memory usage. On FP8, it's recommended to be disabled.
 
+### Multiple profiles
+
+`--multiple_profiles` enables multiple TensorRT optimization profiles in the
+built engines, it will benefits the performance especially when GEMM plugin is
+disabled, because more optimization profiles help TensorRT have more chances to
+select better kernels. However, it'll increase the engine build time.
+
+### FP8 Context Fused Multi-Head Attention
+
+`--use_fp8_context_fmha` enables FP8 Context fused multi-head attention, which
+is recommended to be enabled when fp8 quantization is used to improve the
+performance. Note that only NVIDIA Hopper architecture is supported.
+
 ### BERT Attention Plugin and Context Fused Multi-Head Attention
 
 BERT attention plugin and context fused multi-head attention are both
@@ -184,7 +208,7 @@ recommended for the BERT model. They are enabled by default using the
 ## Runtime Options to Optimize the Performance of TensorRT-LLM Models?
 
 This part summarizes the runtime configuration knobs that can be tweaked to
-enhance the performance of already built engines.  Note that currently the
+enhance the performance of already built engines. Note that currently the
 configurations can be modified using the
 [Batch Manager API](batch_manager.md#the-batch-manager-api)
 as well as the
@@ -241,7 +265,7 @@ aggressively scheduling requests at the risk of having to pause requests if the
 KV cache size limit is reached.
 
 For a more conservative approach with respect to the KV cache limitations in
-terms of memory allocation, `schedulerPolicy` should be set to
+terms of memory allocation, `CapacitySchedulerPolicy` should be set to
 `GUARANTEED_NO_EVICT` to guarantee that a started request is never paused.
 
 If the goal is to maximizes the throughput, users should try `MAX_UTILIZATION`.
@@ -250,15 +274,14 @@ latency if requests have to be paused.
 
 ### TensorRT Overlap
 
-When TensorRT overlap is enabled, available requests are partitioned into 2
-micro-batches that can be run concurrently. It allows TensorRT-LLM to hide
-exposed CPU runtime. However, it may not give performance benefits when the
-size of the model is not big enough to overlap the host overhead, or when the
-number of requests is too small.
+***Note that this option is now deprecated and only available with the GptManager API.***
 
-If the goal is to increase throughput, it is recommended to try setting that
-argument to `True`. However, it must be noted that it may actually hurt
-latency.
+This option allowed to partition available requests into 2
+micro-batches that could be run concurrently and thereby allowed TensorRT-LLM to hide
+some exposed CPU runtime. However, optimization work has been done to reduce this
+exposed CPU runtime and it has been found that the concurrent execution
+of micro-batches did not provide additional benefits in terms of throughput,
+and in most cases, was hurting latency.
 
 ### Maximum Attention Window Size
 

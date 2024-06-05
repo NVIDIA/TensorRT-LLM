@@ -22,21 +22,19 @@
 #include "tensorrt_llm/plugins/common/checkMacrosPlugin.h"
 
 #include <NvInferRuntime.h>
-
-#include <NvInferRuntimeBase.h>
-#include <cstring>
 #include <cublasLt.h>
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
-#include <iostream>
-#include <map>
-#include <memory>
 #if ENABLE_MULTI_DEVICE
 #include <nccl.h>
 #endif // ENABLE_MULTI_DEVICE
+
+#include <cstring>
+#include <map>
+#include <memory>
+#include <nvml.h>
 #include <optional>
 #include <set>
-#include <sstream>
 #include <string>
 #include <unordered_map>
 
@@ -302,3 +300,14 @@ private:
 
     std::unordered_map<std::string_view, Record> mMap;
 };
+
+#define NVML_CHECK(cmd)                                                                                                \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        nvmlReturn_t r = cmd;                                                                                          \
+        if (r != NVML_SUCCESS)                                                                                         \
+        {                                                                                                              \
+            printf("Failed, NVML error %s:%d '%s'\n", __FILE__, __LINE__, nvmlErrorString(r));                         \
+            exit(EXIT_FAILURE);                                                                                        \
+        }                                                                                                              \
+    } while (0)

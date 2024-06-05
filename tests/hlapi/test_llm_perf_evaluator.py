@@ -104,4 +104,4 @@ def test_grid_search_tester(sample_length: int = 16,
 
 if __name__ == '__main__':
     test_perf_evaluator()
-    #test_grid_search_tester()
+    test_grid_search_tester()

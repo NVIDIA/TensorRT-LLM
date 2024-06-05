@@ -123,7 +123,7 @@ class Module(object):
                 name = module_prefix + ('.' if module_prefix else '') + k
                 yield name, v
 
-    def parameter(self, recurse=True):
+    def parameters(self, recurse=True):
         for name, param in self.named_parameters():
             yield param
 
