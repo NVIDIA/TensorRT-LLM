@@ -75,6 +75,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html">Inference Request</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 </ul>
@@ -140,13 +141,16 @@
   <section id="installing-on-linux">
 <span id="linux"></span><h1>Installing on Linux<a class="headerlink" href="#installing-on-linux" title="Link to this heading"></a></h1>
 <ol class="arabic">
-<li><p>Install the <a class="reference external" href="https://docs.nvidia.com/datacenter/cloud-native/container-toolkit">NVIDIA Container Toolkit</a>.</p></li>
-<li><p>Install TensorRT-LLM.</p>
+<li><p>Retrieve and launch the docker container (optional).</p>
+<p>You can pre-install the environment using the <a class="reference external" href="https://docs.nvidia.com/datacenter/cloud-native/container-toolkit">NVIDIA Container Toolkit</a> to avoid manual environment configuration.</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Obtain and start the basic docker image environment (optional).</span>
-docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>--runtime<span class="o">=</span>nvidia<span class="w"> </span>--gpus<span class="w"> </span>all<span class="w"> </span>--entrypoint<span class="w"> </span>/bin/bash<span class="w"> </span>-it<span class="w"> </span>nvidia/cuda:12.1.0-devel-ubuntu22.04
-
-<span class="c1"># Install dependencies, TensorRT-LLM requires Python 3.10</span>
-apt-get<span class="w"> </span>update<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>apt-get<span class="w"> </span>-y<span class="w"> </span>install<span class="w"> </span>python3.10<span class="w"> </span>python3-pip<span class="w"> </span>openmpi-bin<span class="w"> </span>libopenmpi-dev<span class="w"> </span>git
+docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>--runtime<span class="o">=</span>nvidia<span class="w"> </span>--gpus<span class="w"> </span>all<span class="w"> </span>--entrypoint<span class="w"> </span>/bin/bash<span class="w"> </span>-it<span class="w"> </span>nvidia/cuda:12.4.0-devel-ubuntu22.04
+</pre></div>
+</div>
+</li>
+<li><p>Install TensorRT-LLM.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Install dependencies, TensorRT-LLM requires Python 3.10</span>
+apt-get<span class="w"> </span>update<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>apt-get<span class="w"> </span>-y<span class="w"> </span>install<span class="w"> </span>python3.10<span class="w"> </span>python3-pip<span class="w"> </span>openmpi-bin<span class="w"> </span>libopenmpi-dev<span class="w"> </span>git<span class="w"> </span>git-lfs
 
 <span class="c1"># Install the latest preview version (corresponding to the main branch) of TensorRT-LLM.</span>
 <span class="c1"># If you want to install the stable version (corresponding to the release branch), please</span>
@@ -157,16 +161,12 @@ pip3<span class="w"> </span>install<span class="w"> </span>tensorrt_llm<span cla
 python3<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;import tensorrt_llm&quot;</span>
 </pre></div>
 </div>
-</li>
-<li><p>Install the requirements inside the Docker container.</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>git<span class="w"> </span>clone<span class="w"> </span>https://github.com/NVIDIA/TensorRT-LLM.git
-<span class="nb">cd</span><span class="w"> </span>TensorRT-LLM
-pip<span class="w"> </span>install<span class="w"> </span>-r<span class="w"> </span>examples/bloom/requirements.txt
-git<span class="w"> </span>lfs<span class="w"> </span>install
-</pre></div>
-</div>
+<p>Please note that TensorRT-LLM depends on TensorRT. In earlier versions that include TensorRT 8,
+overwriting an upgraded to a new version may require explicitly running <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">uninstall</span> <span class="pre">tensorrt</span></code>
+to uninstall the old version.</p>
 </li>
 </ol>
+<p>Please refer to the <a class="reference internal" href="../quick-start-guide.html"><span class="std std-doc">Quick Start Guide</span></a> for more information.</p>
 <p>Beyond the local execution, you can also use the NVIDIA Triton Inference Server to create a production-ready deployment of your LLM as described in this <a class="reference external" href="https://developer.nvidia.com/blog/optimizing-inference-on-llms-with-tensorrt-llm-now-publicly-available/">Optimizing Inference on Large Language Models with NVIDIA TensorRT-LLM</a> blog.</p>
 </section>
 
@@ -181,12 +181,35 @@ git<span class="w"> </span>lfs<span class="w"> </span>install
   <hr/>
 
   <div role="contentinfo">
-    <p>&#169; Copyright 2023, NVidia.</p>
+<jinja2.runtime.BlockReference object at 0x7f270214cdc0>
+
+<div class="footer">
+    <p>
+        Copyright © 2024 NVIDIA Corporation
+    </p>
+    <p>
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/" target="_blank" rel="noopener"
+            data-cms-ai="0">Privacy Policy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/" target="_blank" rel="noopener"
+            data-cms-ai="0">Manage My Privacy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/preferences/start/" target="_blank" rel="noopener"
+            data-cms-ai="0">Do Not Sell or Share My Data</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/" target="_blank"
+            rel="noopener" data-cms-ai="0">Terms of Service</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/" target="_blank" rel="noopener"
+            data-cms-ai="0">Accessibility</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/" target="_blank"
+            rel="noopener" data-cms-ai="0">Corporate Policies</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/product-security/" target="_blank" rel="noopener"
+            data-cms-ai="0">Product Security</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/contact/" target="_blank" rel="noopener"
+            data-cms-ai="0">Contact</a>
+    </p>
+</div>
+
+
   </div>
 
-  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
-    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
-    provided by <a href="https://readthedocs.org">Read the Docs</a>.
    
 
 </footer>

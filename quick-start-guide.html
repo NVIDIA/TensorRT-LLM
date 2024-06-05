@@ -85,6 +85,7 @@
 <li class="toctree-l1"><a class="reference internal" href="advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="advanced/inference-request.html">Inference Request</a></li>
+<li class="toctree-l1"><a class="reference internal" href="advanced/inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 </ul>
@@ -168,15 +169,18 @@
 <section id="compile-the-model-into-a-tensorrt-engine">
 <span id="quick-start-guide-compile"></span><h2>Compile the Model into a TensorRT Engine<a class="headerlink" href="#compile-the-model-into-a-tensorrt-engine" title="Link to this heading"></a></h2>
 <p>Use the included <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/_modules/tensorrt_llm/models/llama/model.html#LLaMAModel">Llama model definition</a>. This is a minimal example that includes some of the optimizations available in TensorRT-LLM.</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Launch the Tensorrt-LLM container</span>
-make<span class="w"> </span>-C<span class="w"> </span>docker<span class="w"> </span>release_run<span class="w"> </span><span class="nv">LOCAL_USER</span><span class="o">=</span><span class="m">1</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Get the source code required for running the example</span>
+git<span class="w"> </span>clone<span class="w"> </span>https://github.com/NVIDIA/TensorRT-LLM.git
+<span class="nb">cd</span><span class="w"> </span>TensorRT-LLM
+git<span class="w"> </span>lfs<span class="w"> </span>install
 
 <span class="c1"># Log in to huggingface-cli</span>
 <span class="c1"># You can get your token from huggingface.co/settings/token</span>
 huggingface-cli<span class="w"> </span>login<span class="w"> </span>--token<span class="w"> </span>*****
 
-<span class="c1"># Convert the model into TensorrtLLM checkpoint format</span>
-<span class="nb">cd</span><span class="w"> </span>exammples/llama
+<span class="c1"># Convert the model into TensorRT-LLM checkpoint format</span>
+<span class="nb">cd</span><span class="w"> </span>examples/llama
+pip<span class="w"> </span>install<span class="w"> </span>-r<span class="w"> </span>requirements.txt
 python3<span class="w"> </span>convert_checkpoint.py<span class="w"> </span>--model_dir<span class="w"> </span>meta-llama/Llama-2-7b-chat-hf<span class="w"> </span>--output_dir<span class="w"> </span>llama-2-7b-ckpt
 
 <span class="c1"># Compile model</span>
@@ -289,12 +293,35 @@ python<span class="w"> </span>/opt/scripts/launch_triton_server.py<span class="w
   <hr/>
 
   <div role="contentinfo">
-    <p>&#169; Copyright 2023, NVidia.</p>
+<jinja2.runtime.BlockReference object at 0x7f27027e05e0>
+
+<div class="footer">
+    <p>
+        Copyright © 2024 NVIDIA Corporation
+    </p>
+    <p>
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/" target="_blank" rel="noopener"
+            data-cms-ai="0">Privacy Policy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/" target="_blank" rel="noopener"
+            data-cms-ai="0">Manage My Privacy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/preferences/start/" target="_blank" rel="noopener"
+            data-cms-ai="0">Do Not Sell or Share My Data</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/" target="_blank"
+            rel="noopener" data-cms-ai="0">Terms of Service</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/" target="_blank" rel="noopener"
+            data-cms-ai="0">Accessibility</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/" target="_blank"
+            rel="noopener" data-cms-ai="0">Corporate Policies</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/product-security/" target="_blank" rel="noopener"
+            data-cms-ai="0">Product Security</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/contact/" target="_blank" rel="noopener"
+            data-cms-ai="0">Contact</a>
+    </p>
+</div>
+
+
   </div>
 
-  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
-    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
-    provided by <a href="https://readthedocs.org">Read the Docs</a>.
    
 
 </footer>

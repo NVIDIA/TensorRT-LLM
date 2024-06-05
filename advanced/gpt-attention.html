@@ -109,6 +109,7 @@
 <li class="toctree-l1"><a class="reference internal" href="graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="inference-request.html">Inference Request</a></li>
+<li class="toctree-l1"><a class="reference internal" href="inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 </ul>
@@ -232,7 +233,12 @@ improve the overall performance.</p>
 <h4>FP8 Context FMHA<a class="headerlink" href="#fp8-context-fmha" title="Link to this heading"></a></h4>
 <p>When FP8 quantization is activated, the attention can be further accelerated by
 enabling FP8 Context FMHA (<code class="docutils literal notranslate"><span class="pre">use_fp8_context_fmha</span> <span class="pre">=</span> <span class="pre">enable</span></code>).</p>
-<p>This is an experimental feature only supported on Hopper. If you notice a significant decrease in accuracy, it is recommended to disable it.</p>
+<p>FP8 Paged Context FMHA is also supported with the fp8 quantization workflow.
+You need to specify <code class="docutils literal notranslate"><span class="pre">use_fp8_context_fmha</span> <span class="pre">=</span> <span class="pre">enable</span></code> and
+<code class="docutils literal notranslate"><span class="pre">use_paged_context_fmha</span> <span class="pre">=</span> <span class="pre">enable</span></code> at the same time.</p>
+<p>Please be aware that this is an experimental feature only supported on Hopper.
+If you notice a significant decrease in accuracy, it is recommended to disable
+it.</p>
 </section>
 </section>
 <section id="generation-phase">
@@ -488,12 +494,35 @@ is computed as:</p>
   <hr/>
 
   <div role="contentinfo">
-    <p>&#169; Copyright 2023, NVidia.</p>
+<jinja2.runtime.BlockReference object at 0x7f27020fb850>
+
+<div class="footer">
+    <p>
+        Copyright © 2024 NVIDIA Corporation
+    </p>
+    <p>
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/" target="_blank" rel="noopener"
+            data-cms-ai="0">Privacy Policy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/" target="_blank" rel="noopener"
+            data-cms-ai="0">Manage My Privacy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/preferences/start/" target="_blank" rel="noopener"
+            data-cms-ai="0">Do Not Sell or Share My Data</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/" target="_blank"
+            rel="noopener" data-cms-ai="0">Terms of Service</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/" target="_blank" rel="noopener"
+            data-cms-ai="0">Accessibility</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/" target="_blank"
+            rel="noopener" data-cms-ai="0">Corporate Policies</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/product-security/" target="_blank" rel="noopener"
+            data-cms-ai="0">Product Security</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/contact/" target="_blank" rel="noopener"
+            data-cms-ai="0">Contact</a>
+    </p>
+</div>
+
+
   </div>
 
-  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
-    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
-    provided by <a href="https://readthedocs.org">Read the Docs</a>.
    
 
 </footer>

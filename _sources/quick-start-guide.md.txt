@@ -26,15 +26,18 @@ git clone https://huggingface.co/meta-llama/Llama-2-7b-chat-hf
 Use the included [Llama model definition](https://nvidia.github.io/TensorRT-LLM/_modules/tensorrt_llm/models/llama/model.html#LLaMAModel). This is a minimal example that includes some of the optimizations available in TensorRT-LLM.
 
 ```bash
-# Launch the Tensorrt-LLM container
-make -C docker release_run LOCAL_USER=1
+# Get the source code required for running the example
+git clone https://github.com/NVIDIA/TensorRT-LLM.git
+cd TensorRT-LLM
+git lfs install
 
 # Log in to huggingface-cli
 # You can get your token from huggingface.co/settings/token
 huggingface-cli login --token *****
 
-# Convert the model into TensorrtLLM checkpoint format
-cd exammples/llama
+# Convert the model into TensorRT-LLM checkpoint format
+cd examples/llama
+pip install -r requirements.txt
 python3 convert_checkpoint.py --model_dir meta-llama/Llama-2-7b-chat-hf --output_dir llama-2-7b-ckpt
 
 # Compile model

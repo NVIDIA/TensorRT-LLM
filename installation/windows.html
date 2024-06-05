@@ -75,6 +75,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html">Inference Request</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 </ul>
@@ -141,49 +142,34 @@
 <span id="windows"></span><h1>Installing on Windows<a class="headerlink" href="#installing-on-windows" title="Link to this heading"></a></h1>
 <div class="admonition note">
 <p class="admonition-title">Note</p>
-<p>The Windows release of TensorRT-LLM is currently in beta. We recommend using the <code class="docutils literal notranslate"><span class="pre">rel</span></code> branch for the most stable experience.</p>
+<p>The Windows release of TensorRT-LLM is currently in beta.
+We recommend checking out the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases/tag/v0.10.0">v0.10.0 tag</a> for the most stable experience.</p>
 </div>
 <p><strong>Prerequisites</strong></p>
 <ol class="arabic">
 <li><p>Clone this repository using <a class="reference external" href="https://git-scm.com/download/win">Git for Windows</a>.</p></li>
 <li><p>Install the dependencies one of two ways:</p>
+<ol class="arabic">
+<li><p>Install all dependencies together.</p>
 <ol class="arabic simple">
-<li><p>Run the provided PowerShell script; <code class="docutils literal notranslate"><span class="pre">setup_env.ps1</span></code>, which installs Python, CUDA 12.2, and Microsoft MPI automatically with default settings. Run PowerShell as Administrator to use the script.</p></li>
+<li><p>Run the provided PowerShell script <code class="docutils literal notranslate"><span class="pre">setup_env.ps1</span></code> located under the <code class="docutils literal notranslate"><span class="pre">/windows/</span></code> folder which installs Python and CUDA 12.4 automatically with default settings. Run PowerShell as Administrator to use the script.</p></li>
 </ol>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>./setup_env.ps1<span class="w"> </span><span class="o">[</span>-skipCUDA<span class="o">]</span><span class="w"> </span><span class="o">[</span>-skipPython<span class="o">]</span><span class="w"> </span><span class="o">[</span>-skipMPI<span class="o">]</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>./setup_env.ps1<span class="w"> </span><span class="o">[</span>-skipCUDA<span class="o">]</span><span class="w"> </span><span class="o">[</span>-skipPython<span class="o">]</span>
 </pre></div>
 </div>
 <ol class="arabic simple" start="2">
+<li><p>Close and re-open any existing PowerShell or Git Bash windows so they pick up the new <code class="docutils literal notranslate"><span class="pre">Path</span></code> modified by the <code class="docutils literal notranslate"><span class="pre">setup_env.ps1</span></code> script above.</p></li>
+</ol>
+</li>
 <li><p>Install the dependencies one at a time.</p>
 <ol class="arabic simple">
-<li><p>Install <a class="reference external" href="https://www.python.org/downloads/windows/">Python 3.10</a>.</p>
+<li><p>Install <a class="reference external" href="https://www.python.org/ftp/python/3.10.11/python-3.10.11-amd64.exe">Python 3.10</a>.</p>
 <ol class="arabic simple">
 <li><p>Select <strong>Add python.exe to PATH</strong> at the start of the installation. The installation may only add the <code class="docutils literal notranslate"><span class="pre">python</span></code> command, but not the <code class="docutils literal notranslate"><span class="pre">python3</span></code> command.</p></li>
 <li><p>Navigate to the installation path <code class="docutils literal notranslate"><span class="pre">%USERPROFILE%\AppData\Local\Programs\Python\Python310</span></code> (<code class="docutils literal notranslate"><span class="pre">AppData</span></code> is a hidden folder) and copy <code class="docutils literal notranslate"><span class="pre">python.exe</span></code> to <code class="docutils literal notranslate"><span class="pre">python3.exe</span></code>.</p></li>
 </ol>
 </li>
-</ol>
-</li>
-<li><p>Install <a class="reference external" href="https://developer.nvidia.com/cuda-12-2-2-download-archive?target_os=Windows&amp;amp;target_arch=x86_64">CUDA 12.2 Toolkit</a>. Use the Express Installation option. Installation may require a restart.</p></li>
-<li><p>Download and install <a class="reference external" href="https://www.microsoft.com/en-us/download/details.aspx?id=57467">Microsoft MPI</a>. You will be prompted to choose between an <code class="docutils literal notranslate"><span class="pre">exe</span></code>, which installs the MPI executable, and an <code class="docutils literal notranslate"><span class="pre">msi</span></code>, which installs the MPI SDK. Download and install both.</p></li>
-</ol>
-</li>
-<li><p>Download and unzip <a class="reference external" href="https://developer.nvidia.com/cudnn">cuDNN</a>.</p>
-<ol class="arabic">
-<li><p>Move the folder to a location you can reference later, such as <code class="docutils literal notranslate"><span class="pre">%USERPROFILE%\inference\cuDNN</span></code>.</p></li>
-<li><p>Add the libraries and binaries for cuDNN to your system’s <code class="docutils literal notranslate"><span class="pre">Path</span></code> environment variable.</p>
-<ol class="arabic simple">
-<li><p>Click the Windows button and search for <em>environment variables</em>.</p></li>
-<li><p>Click <strong>Edit the system environment variables</strong> &gt; <strong>Environment Variables</strong>.</p></li>
-<li><p>In the new window under <em>System variables</em>, click <strong>Path</strong> &gt; <strong>Edit</strong>. Add <strong>New</strong> lines for the <code class="docutils literal notranslate"><span class="pre">bin</span></code> and <code class="docutils literal notranslate"><span class="pre">lib</span></code> directories of cuDNN. Your <code class="docutils literal notranslate"><span class="pre">Path</span></code> should include lines like this:</p></li>
-</ol>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>%USERPROFILE%<span class="se">\i</span>nference<span class="se">\c</span>uDNN<span class="se">\b</span>in
-%SERPROFILE%<span class="se">\i</span>nference<span class="se">\c</span>uDNN<span class="se">\l</span>ib
-</pre></div>
-</div>
-<ol class="arabic simple" start="4">
-<li><p>Click <strong>OK</strong> on all the open dialog windows.</p></li>
-<li><p>Close and re-open any existing PowerShell or Git Bash windows so they pick up the new <code class="docutils literal notranslate"><span class="pre">Path</span></code>.</p></li>
+<li><p>Install <a class="reference external" href="https://developer.nvidia.com/cuda-12-4-0-download-archive?target_os=Windows&amp;amp;target_arch=x86_64">CUDA 12.4 Toolkit</a>. Use the Express Installation option. Installation may require a restart.</p></li>
 </ol>
 </li>
 </ol>
@@ -193,7 +179,13 @@
 <ol class="arabic simple">
 <li><p>Install TensorRT-LLM.</p></li>
 </ol>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span>tensorrt_llm<span class="w"> </span>--extra-index-url<span class="w"> </span>https://pypi.nvidia.com<span class="w"> </span>--extra-index-url<span class="w"> </span>https://download.pytorch.org/whl/cu121
+<p>If you have an existing TensorRT installation (from older versions of <code class="docutils literal notranslate"><span class="pre">tensorrt_llm</span></code>), please execute</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>uninstall<span class="w"> </span>-y<span class="w"> </span>tensorrt<span class="w"> </span>tensorrt_libs<span class="w"> </span>tensorrt_bindings
+pip<span class="w"> </span>uninstall<span class="w"> </span>-y<span class="w"> </span>nvidia-cublas-cu12<span class="w"> </span>nvidia-cuda-nvrtc-cu12<span class="w"> </span>nvidia-cuda-runtime-cu12<span class="w"> </span>nvidia-cudnn-cu12
+</pre></div>
+</div>
+<p>before installing TensorRT-LLM with the following command.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span><span class="nv">tensorrt_llm</span><span class="o">==</span><span class="m">0</span>.10.0<span class="w"> </span>--extra-index-url<span class="w"> </span>https://pypi.nvidia.com
 </pre></div>
 </div>
 <p>Run the following command to verify that your TensorRT-LLM installation is working properly.</p>
@@ -217,12 +209,35 @@
   <hr/>
 
   <div role="contentinfo">
-    <p>&#169; Copyright 2023, NVidia.</p>
+<jinja2.runtime.BlockReference object at 0x7f27026014b0>
+
+<div class="footer">
+    <p>
+        Copyright © 2024 NVIDIA Corporation
+    </p>
+    <p>
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/" target="_blank" rel="noopener"
+            data-cms-ai="0">Privacy Policy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/" target="_blank" rel="noopener"
+            data-cms-ai="0">Manage My Privacy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/preferences/start/" target="_blank" rel="noopener"
+            data-cms-ai="0">Do Not Sell or Share My Data</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/" target="_blank"
+            rel="noopener" data-cms-ai="0">Terms of Service</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/" target="_blank" rel="noopener"
+            data-cms-ai="0">Accessibility</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/" target="_blank"
+            rel="noopener" data-cms-ai="0">Corporate Policies</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/product-security/" target="_blank" rel="noopener"
+            data-cms-ai="0">Product Security</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/contact/" target="_blank" rel="noopener"
+            data-cms-ai="0">Contact</a>
+    </p>
+</div>
+
+
   </div>
 
-  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
-    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
-    provided by <a href="https://readthedocs.org">Read the Docs</a>.
    
 
 </footer>

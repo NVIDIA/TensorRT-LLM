@@ -82,6 +82,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html">Inference Request</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 </ul>
@@ -214,11 +215,11 @@
 </section>
 <section id="quantization-apis">
 <h2>Quantization APIs<a class="headerlink" href="#quantization-apis" title="Link to this heading"></a></h2>
-<p>TensorRT-LLM relies on NVIDIA AMMO toolkit to support some of the quantization like: FP8, W4A16_AWQ, W4A8_AWQ, while it also has some its own quantization implementation for Smooth Quant, INT8 KV cache, and INT4/INT8 weight only.</p>
+<p>TensorRT-LLM relies on NVIDIA Modelopt toolkit to support some of the quantization like: FP8, W4A16_AWQ, W4A8_AWQ, while it also has some its own quantization implementation for Smooth Quant, INT8 KV cache, and INT4/INT8 weight only.</p>
 <p>In TensorRT-LLM 0.8 version:</p>
 <ul class="simple">
-<li><p>For AMMO-supported quantization algorithms, a standalone script in the example folder <a class="reference internal" href="#../../examples/quantization/quantize.py"><span class="xref myst">quantize.py</span></a> shall be executed to export TensorRT-LLM checkpoints, and the trtllm-build command needs to be executed to build the checkpoints to engines.</p></li>
-<li><p>For the non-AMMO quantization algorithms, users need to use the per-model convert_checkpoint.py scripts to export TensorRT-LLM checkpoints.</p></li>
+<li><p>For Modelopt-supported quantization algorithms, a standalone script in the example folder <a class="reference internal" href="#../../examples/quantization/quantize.py"><span class="xref myst">quantize.py</span></a> shall be executed to export TensorRT-LLM checkpoints, and the trtllm-build command needs to be executed to build the checkpoints to engines.</p></li>
+<li><p>For the non-Modelopt quantization algorithms, users need to use the per-model convert_checkpoint.py scripts to export TensorRT-LLM checkpoints.</p></li>
 </ul>
 <p>Use the <code class="docutils literal notranslate"><span class="pre">quantize()</span></code> interface to unify the different quantization flows. The default implementation is added in the <code class="docutils literal notranslate"><span class="pre">PretrainedModel</span></code> class.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span> <span class="nc">PretrainedModel</span><span class="p">:</span>
@@ -229,15 +230,15 @@
         <span class="n">output_dir</span><span class="p">,</span>
         <span class="n">quant_config</span><span class="p">:</span> <span class="n">QuantConfig</span><span class="p">,</span>
         <span class="n">mapping</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Mapping</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span> <span class="c1">#some args are omitted here</span>
-        <span class="c1"># Internally quantize the given hugging face models using AMMO</span>
+        <span class="c1"># Internally quantize the given hugging face models using Modelopt</span>
         <span class="c1"># and save the checkpoint to output_dir</span>
 </pre></div>
 </div>
 <div class="admonition note">
 <p class="admonition-title">Note</p>
 <ul class="simple">
-<li><p>The default implementation only handles the AMMO supported quantization. The LLaMA class then inherits this <code class="docutils literal notranslate"><span class="pre">PretrainedModel</span></code> and dispatches the AMMO quantization to the super class’s default implementation.</p></li>
-<li><p>The model developer raises errors in the sub-class implementation if the new model is not supported by AMMO yet.</p></li>
+<li><p>The default implementation only handles the Modelopt supported quantization. The LLaMA class then inherits this <code class="docutils literal notranslate"><span class="pre">PretrainedModel</span></code> and dispatches the Modelopt quantization to the super class’s default implementation.</p></li>
+<li><p>The model developer raises errors in the sub-class implementation if the new model is not supported by Modelopt yet.</p></li>
 </ul>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span> <span class="nc">LLaMAForCausalLM</span><span class="p">:</span>
     <span class="nd">@classmethod</span>
@@ -247,8 +248,8 @@
         <span class="n">output_dir</span><span class="p">,</span>
         <span class="n">quant_config</span><span class="p">:</span> <span class="n">QuantiConfig</span><span class="p">,</span>
         <span class="n">mapping</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Mapping</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span> <span class="c1">#some args are omitted here</span>
-        <span class="n">use_ammo_quantization</span> <span class="o">=</span> <span class="o">...</span> <span class="c1"># determine if to use AMMO or use native</span>
-        <span class="k">if</span> <span class="n">use_ammo_quantization</span><span class="p">:</span>
+        <span class="n">use_modelopt_quantization</span> <span class="o">=</span> <span class="o">...</span> <span class="c1"># determine if to use Modelopt or use native</span>
+        <span class="k">if</span> <span class="n">use_modelopt_quantization</span><span class="p">:</span>
             <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">quantize</span><span class="p">(</span><span class="n">hf_model_dir</span><span class="p">,</span>
                              <span class="n">output_dir</span><span class="p">,</span>
                              <span class="n">quant_config</span><span class="p">)</span>
@@ -343,12 +344,35 @@ The usage of this API looks like this:</p>
   <hr/>
 
   <div role="contentinfo">
-    <p>&#169; Copyright 2023, NVidia.</p>
+<jinja2.runtime.BlockReference object at 0x7f270225fa30>
+
+<div class="footer">
+    <p>
+        Copyright © 2024 NVIDIA Corporation
+    </p>
+    <p>
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/" target="_blank" rel="noopener"
+            data-cms-ai="0">Privacy Policy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/" target="_blank" rel="noopener"
+            data-cms-ai="0">Manage My Privacy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/preferences/start/" target="_blank" rel="noopener"
+            data-cms-ai="0">Do Not Sell or Share My Data</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/" target="_blank"
+            rel="noopener" data-cms-ai="0">Terms of Service</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/" target="_blank" rel="noopener"
+            data-cms-ai="0">Accessibility</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/" target="_blank"
+            rel="noopener" data-cms-ai="0">Corporate Policies</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/product-security/" target="_blank" rel="noopener"
+            data-cms-ai="0">Product Security</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/contact/" target="_blank" rel="noopener"
+            data-cms-ai="0">Contact</a>
+    </p>
+</div>
+
+
   </div>
 
-  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
-    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
-    provided by <a href="https://readthedocs.org">Read the Docs</a>.
    
 
 </footer>

@@ -73,6 +73,7 @@
 <li class="toctree-l1"><a class="reference internal" href="advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="advanced/inference-request.html">Inference Request</a></li>
+<li class="toctree-l1"><a class="reference internal" href="advanced/inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 </ul>
@@ -179,7 +180,7 @@ An example of this orchestration process can be found in the <a class="reference
 <p>Configuring and executing the Draft model within the Inflight Fused Batching (IFB) framework
 follows the same procedure as for any other model within IFB.
 The <code class="docutils literal notranslate"><span class="pre">maxNewTokens</span></code> parameter should be set to the number of draft tokens in the <code class="docutils literal notranslate"><span class="pre">LlmRequest</span></code> for the Draft model query.</p>
-<p>When building the Target model, it is necessary to specify the <code class="docutils literal notranslate"><span class="pre">--max_draft_len</span> <span class="pre">&lt;K&gt;</span></code> option to the <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> command.
+<p>When building the Target model, it is necessary to specify the <code class="docutils literal notranslate"><span class="pre">--max_draft_len</span> <span class="pre">&lt;K&gt;</span> <span class="pre">--speculative_decoding_mode</span> <span class="pre">draft_tokens_external</span></code> option to the <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> command.
 During the Target model’s inference phase in IFB, <code class="docutils literal notranslate"><span class="pre">maxNewTokens</span></code> should be set to <code class="docutils literal notranslate"><span class="pre">1</span></code>,
 and the draft tokens must be set in the <code class="docutils literal notranslate"><span class="pre">draftTokens</span></code> field of the <code class="docutils literal notranslate"><span class="pre">LlmRequest</span></code> for the Target model query.</p>
 <p><strong>NOTE:</strong> To enhance performance, especially due to the repetitive querying of Draft and Target models with requests that share a common prefix,
@@ -276,12 +277,35 @@ However, similar to any new model, you can follow the same approach to define yo
   <hr/>
 
   <div role="contentinfo">
-    <p>&#169; Copyright 2023, NVidia.</p>
+<jinja2.runtime.BlockReference object at 0x7f27027e0100>
+
+<div class="footer">
+    <p>
+        Copyright © 2024 NVIDIA Corporation
+    </p>
+    <p>
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/" target="_blank" rel="noopener"
+            data-cms-ai="0">Privacy Policy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/" target="_blank" rel="noopener"
+            data-cms-ai="0">Manage My Privacy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/preferences/start/" target="_blank" rel="noopener"
+            data-cms-ai="0">Do Not Sell or Share My Data</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/" target="_blank"
+            rel="noopener" data-cms-ai="0">Terms of Service</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/" target="_blank" rel="noopener"
+            data-cms-ai="0">Accessibility</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/" target="_blank"
+            rel="noopener" data-cms-ai="0">Corporate Policies</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/product-security/" target="_blank" rel="noopener"
+            data-cms-ai="0">Product Security</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/contact/" target="_blank" rel="noopener"
+            data-cms-ai="0">Contact</a>
+    </p>
+</div>
+
+
   </div>
 
-  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
-    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
-    provided by <a href="https://readthedocs.org">Read the Docs</a>.
    
 
 </footer>

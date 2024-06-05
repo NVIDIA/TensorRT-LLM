@@ -89,6 +89,7 @@
 <li class="toctree-l1"><a class="reference internal" href="graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="inference-request.html">Inference Request</a></li>
+<li class="toctree-l1"><a class="reference internal" href="inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 </ul>
@@ -169,7 +170,7 @@ now, can be found in the <a class="reference external" href="https://github.com/
 <section id="overview">
 <h2>Overview<a class="headerlink" href="#overview" title="Link to this heading"></a></h2>
 <p>Runtime models are described by an instance of the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/runtime/gptModelConfig.h"><code class="docutils literal notranslate"><span class="pre">GptModelConfig</span></code></a>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/runtime//modelConfig.h"><code class="docutils literal notranslate"><span class="pre">ModelConfig</span></code></a>
 class and a pointer to the TensorRT engine that must be
 executed to perform the inference.
 The environment is configured through the
@@ -183,7 +184,7 @@ class encapsulates parameters that control the
 <section id="model-configuration">
 <h3>Model Configuration<a class="headerlink" href="#model-configuration" title="Link to this heading"></a></h3>
 <p>The model configuration is an instance of the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/runtime/gptModelConfig.h"><code class="docutils literal notranslate"><span class="pre">GptModelConfig</span></code></a> class.
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/runtime//modelConfig.h"><code class="docutils literal notranslate"><span class="pre">ModelConfig</span></code></a> class.
 That class encapsulates the following parameters (they are declared as private
 member variables and exposed through getters and setters):</p>
 <ul class="simple">
@@ -270,16 +271,16 @@ value for a given parameter, the vector can be limited to a single element
 <p><em><strong>General</strong></em></p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">temperature</span></code>, a vector of floating-point numbers to control the
-modulation of logits when sampling new tokens. It can have any value <code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">0.0f</span></code>. The default value is <code class="docutils literal notranslate"><span class="pre">1.0f</span></code>(no modulation).</p></li>
+modulation of logits when sampling new tokens. It can have any value <code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">0.0f</span></code>. The default value is <code class="docutils literal notranslate"><span class="pre">1.0f</span></code>(no modulation). Note: the recommended way to enable greedy sampling is to set <code class="docutils literal notranslate"><span class="pre">temperature</span></code> to <code class="docutils literal notranslate"><span class="pre">1.0f</span></code> and <code class="docutils literal notranslate"><span class="pre">topK</span></code> to <code class="docutils literal notranslate"><span class="pre">1</span></code>.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">minLength</span></code>, a vector of integers to set a lower-bound on the number of tokens
-generated. It can have any value. Values <code class="docutils literal notranslate"><span class="pre">&lt;</span> <span class="pre">1</span></code> have no effect, the first generated token can be EOS. The default value is <code class="docutils literal notranslate"><span class="pre">1</span></code> (at least one non-EOS token is generated).</p></li>
+generated. It can have any value <code class="docutils literal notranslate"><span class="pre">&gt;=</span> <span class="pre">0</span></code>. Value <code class="docutils literal notranslate"><span class="pre">0</span></code> has no effect, the first generated token can be EOS. The default value is <code class="docutils literal notranslate"><span class="pre">1</span></code> (at least one non-EOS token is generated).</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">repetitionPenalty</span></code>, a vector of float-point numbers to penalize tokens
-based on how often they appear in the sequence. It can have any value <code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">0.0f</span></code>. Repetition penalty <code class="docutils literal notranslate"><span class="pre">&lt;</span> <span class="pre">1.0f</span></code> encourages repetition, <code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">1.0f</span></code> discourages it. The default value is <code class="docutils literal notranslate"><span class="pre">1.0f</span></code> (no effect).</p></li>
+(irrespective of the number of appearances). It is multiplicative penalty. It can have any value <code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">0.0f</span></code>. Repetition penalty <code class="docutils literal notranslate"><span class="pre">&lt;</span> <span class="pre">1.0f</span></code> encourages repetition, <code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">1.0f</span></code> discourages it. The default value is <code class="docutils literal notranslate"><span class="pre">1.0f</span></code> (no effect).</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">presencePenalty</span></code>, a vector of float-point numbers to penalize tokens
-already present in the sequence (irrespective of the number of appearances).
+already present in the sequence (irrespective of the number of appearances). It is additive penalty.
 It can have any value, values <code class="docutils literal notranslate"><span class="pre">&lt;</span> <span class="pre">0.0f</span></code> encourage repetition, <code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">0.f</span></code> discourage it. The default value is <code class="docutils literal notranslate"><span class="pre">0.0f</span></code> (no effect).</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">frequencyPenalty</span></code>, a vector of float-point numbers to penalize tokens
-already present in the sequence (dependent on the number of appearances). It can have any value, values <code class="docutils literal notranslate"><span class="pre">&lt;</span> <span class="pre">0.0f</span></code> encourage repetition, <code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">0.0f</span></code> discourage it.
+already present in the sequence (dependent on the number of appearances). It is additive penalty. It can have any value, values <code class="docutils literal notranslate"><span class="pre">&lt;</span> <span class="pre">0.0f</span></code> encourage repetition, <code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">0.0f</span></code> discourage it.
 The default value is <code class="docutils literal notranslate"><span class="pre">0.0f</span></code>(no effect).</p></li>
 </ul>
 <p>The parameters <code class="docutils literal notranslate"><span class="pre">repetitionPenalty</span></code>, <code class="docutils literal notranslate"><span class="pre">presencePenalty</span></code>, and <code class="docutils literal notranslate"><span class="pre">frequencyPenalty</span></code> are not mutually
@@ -289,18 +290,21 @@ exclusive.</p>
 <li><p><code class="docutils literal notranslate"><span class="pre">randomSeed</span></code>, a vector of 64-bit integers to control the random seed used by
 the random number generator in sampling. Its default value is <code class="docutils literal notranslate"><span class="pre">0</span></code>,</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">topK</span></code>, a vector of integers to control the number of logits to sample from.
-Its default value is <code class="docutils literal notranslate"><span class="pre">0</span></code>. If different values are provided for the
+Must be in range of <code class="docutils literal notranslate"><span class="pre">[0,</span> <span class="pre">1024]</span></code>. Its default value is <code class="docutils literal notranslate"><span class="pre">0</span></code>.
+Note that if different values are provided for the
 different sequences in the batch, the performance of the implementation will
 depend on the largest value. For efficiency reasons, we recommend to batch
 requests with similar <code class="docutils literal notranslate"><span class="pre">topK</span></code> values together,</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">topP</span></code>, a vector of floating-point values to control the top-P probability
-to sample from. Its default value is <code class="docutils literal notranslate"><span class="pre">0.f</span></code>,</p></li>
+to sample from. Must be in range of <code class="docutils literal notranslate"><span class="pre">[0.f,</span> <span class="pre">1.f]</span></code>. Its default value is <code class="docutils literal notranslate"><span class="pre">0.f</span></code>,</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">topPDecay</span></code>, <code class="docutils literal notranslate"><span class="pre">topPMin</span></code> and <code class="docutils literal notranslate"><span class="pre">topPResetIds</span></code>, vectors to control the decay in
 the <code class="docutils literal notranslate"><span class="pre">topP</span></code> algorithm. The <code class="docutils literal notranslate"><span class="pre">topP</span></code> values are modulated by
 a decay that exponentially depends on the length of the sequence as explained in
 <a class="reference external" href="https://arxiv.org/abs/2206.04624"><em>Factuality Enhanced Language Models for Open-Ended Text Generation</em></a>.
 <code class="docutils literal notranslate"><span class="pre">topPDecay</span></code> is the decay, <code class="docutils literal notranslate"><span class="pre">topPMin</span></code> is the lower-bound and <code class="docutils literal notranslate"><span class="pre">topPResetIds</span></code>
-indicates where to reset the decay. Defaults are <code class="docutils literal notranslate"><span class="pre">1.f</span></code>, <code class="docutils literal notranslate"><span class="pre">1.0e-6,f</span></code>, and <code class="docutils literal notranslate"><span class="pre">-1</span></code>,</p></li>
+indicates where to reset the decay.
+<code class="docutils literal notranslate"><span class="pre">topPDecay</span></code>, <code class="docutils literal notranslate"><span class="pre">topPMin</span></code> must be in ranges of <code class="docutils literal notranslate"><span class="pre">(0.f,</span> <span class="pre">1.f]</span></code> and <code class="docutils literal notranslate"><span class="pre">(0.f,</span> <span class="pre">1.f]</span></code> respectively.
+Defaults are <code class="docutils literal notranslate"><span class="pre">1.f</span></code>, <code class="docutils literal notranslate"><span class="pre">1.0e-6,f</span></code> and <code class="docutils literal notranslate"><span class="pre">-1</span></code>,</p></li>
 </ul>
 <p>If both <code class="docutils literal notranslate"><span class="pre">topK</span></code> and <code class="docutils literal notranslate"><span class="pre">topP</span></code> fields are set, the <code class="docutils literal notranslate"><span class="pre">topK</span></code> method will be run for
 sequences with a <code class="docutils literal notranslate"><span class="pre">topK</span></code> value greater than <code class="docutils literal notranslate"><span class="pre">0.f</span></code>. In that case, the <code class="docutils literal notranslate"><span class="pre">topP</span></code>
@@ -314,7 +318,7 @@ search</a> sampling algorithm. There
 is no explicit upper-bound on the beam width but increasing the beam width
 will likely increase the latency. Use <code class="docutils literal notranslate"><span class="pre">1</span></code> to disable beam-search,</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">beamSearchDiversityRate</span></code>, a floating-point value that controls the
-diversity in beam-search. Its default value is <code class="docutils literal notranslate"><span class="pre">0.f</span></code>,</p></li>
+diversity in beam-search. It can have any value  <code class="docutils literal notranslate"><span class="pre">&gt;=</span> <span class="pre">0.0f</span></code>. The default value is <code class="docutils literal notranslate"><span class="pre">0.f</span></code>,</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">lengthPenalty</span></code>, a floating-point value that controls how to penalize the
 longer sequences in beam-search (the log-probability of a sequence will be
 penalized by a factor that depends on <code class="docutils literal notranslate"><span class="pre">1.f</span> <span class="pre">/</span> <span class="pre">(length</span> <span class="pre">^</span> <span class="pre">lengthPenalty)</span></code>). The
@@ -381,12 +385,35 @@ one.</p></li>
   <hr/>
 
   <div role="contentinfo">
-    <p>&#169; Copyright 2023, NVidia.</p>
+<jinja2.runtime.BlockReference object at 0x7f270214e410>
+
+<div class="footer">
+    <p>
+        Copyright © 2024 NVIDIA Corporation
+    </p>
+    <p>
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/" target="_blank" rel="noopener"
+            data-cms-ai="0">Privacy Policy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/" target="_blank" rel="noopener"
+            data-cms-ai="0">Manage My Privacy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/preferences/start/" target="_blank" rel="noopener"
+            data-cms-ai="0">Do Not Sell or Share My Data</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/" target="_blank"
+            rel="noopener" data-cms-ai="0">Terms of Service</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/" target="_blank" rel="noopener"
+            data-cms-ai="0">Accessibility</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/" target="_blank"
+            rel="noopener" data-cms-ai="0">Corporate Policies</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/product-security/" target="_blank" rel="noopener"
+            data-cms-ai="0">Product Security</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/contact/" target="_blank" rel="noopener"
+            data-cms-ai="0">Contact</a>
+    </p>
+</div>
+
+
   </div>
 
-  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
-    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
-    provided by <a href="https://readthedocs.org">Read the Docs</a>.
    
 
 </footer>

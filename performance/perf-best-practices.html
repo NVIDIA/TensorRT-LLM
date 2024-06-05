@@ -75,6 +75,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html">Inference Request</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 </ul>
@@ -94,6 +95,8 @@
 <li class="toctree-l3"><a class="reference internal" href="#embedding-parallelism-embedding-sharing-and-look-up-plugin">Embedding Parallelism, Embedding Sharing, and Look-Up Plugin</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#horizontal-fusion-in-gated-mlp">Horizontal Fusion in Gated-MLP</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#gemm-plugin">GEMM Plugin</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#multiple-profiles">Multiple profiles</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#fp8-context-fused-multi-head-attention">FP8 Context Fused Multi-Head Attention</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#bert-attention-plugin-and-context-fused-multi-head-attention">BERT Attention Plugin and Context Fused Multi-Head Attention</a></li>
 </ul>
 </li>
@@ -270,6 +273,11 @@ mode is expected to reduce the latency of the multi-head attention kernel in
 the generation phase. However, it requires the context length to be long enough
 for the work performed by each CUDA thread block to remain sufficient for
 efficiency.</p>
+<p>Note that, the <code class="docutils literal notranslate"><span class="pre">--multi_block_mode</span></code> argument works more like a suggestion to the
+runtime, hence it’s possible that multi-block is not used even when
+<code class="docutils literal notranslate"><span class="pre">--multi_block_mode</span></code> argument is specified due to no performance gain, and it’s
+also possible that multi-block is automatically used even when <code class="docutils literal notranslate"><span class="pre">--multi_block_mode</span></code>
+argument is disabled.</p>
 </section>
 <section id="custom-allreduce-plugin">
 <h3>Custom AllReduce Plugin<a class="headerlink" href="#custom-allreduce-plugin" title="Link to this heading"></a></h3>
@@ -279,6 +287,10 @@ nodes, it is not recommended to enabled that plugin.</p>
 <p>The custom AllReduce plugin activates a latency-optimized algorithm for
 the AllReduce operation instead of the native NCCL operator. However, the
 performance benefits may not be seen on PCIE-based systems.</p>
+<p>Note that, the <code class="docutils literal notranslate"><span class="pre">--use_custom_all_reduce</span></code> argument works more like a suggestion
+to the runtime, and will possibly be removed in the future releases. We have supported
+an auto fallback mechanism so that native NCCL kernel is used when hardware requirements
+are not satisfied to get the best performance.</p>
 </section>
 <section id="embedding-parallelism-embedding-sharing-and-look-up-plugin">
 <h3>Embedding Parallelism, Embedding Sharing, and Look-Up Plugin<a class="headerlink" href="#embedding-parallelism-embedding-sharing-and-look-up-plugin" title="Link to this heading"></a></h3>
@@ -320,6 +332,19 @@ does not satisfy your requirement, it is not recommended to enable that feature.
 BF16, it’s recommended to be enabled for better performance and smaller GPU
 memory usage. On FP8, it’s recommended to be disabled.</p>
 </section>
+<section id="multiple-profiles">
+<h3>Multiple profiles<a class="headerlink" href="#multiple-profiles" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">--multiple_profiles</span></code> enables multiple TensorRT optimization profiles in the
+built engines, it will benefits the performance especially when GEMM plugin is
+disabled, because more optimization profiles help TensorRT have more chances to
+select better kernels. However, it’ll increase the engine build time.</p>
+</section>
+<section id="fp8-context-fused-multi-head-attention">
+<h3>FP8 Context Fused Multi-Head Attention<a class="headerlink" href="#fp8-context-fused-multi-head-attention" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">--use_fp8_context_fmha</span></code> enables FP8 Context fused multi-head attention, which
+is recommended to be enabled when fp8 quantization is used to improve the
+performance. Note that only NVIDIA Hopper architecture is supported.</p>
+</section>
 <section id="bert-attention-plugin-and-context-fused-multi-head-attention">
 <h3>BERT Attention Plugin and Context Fused Multi-Head Attention<a class="headerlink" href="#bert-attention-plugin-and-context-fused-multi-head-attention" title="Link to this heading"></a></h3>
 <p>BERT attention plugin and context fused multi-head attention are both
@@ -331,7 +356,7 @@ recommended for the BERT model. They are enabled by default using the
 <section id="runtime-options-to-optimize-the-performance-of-tensorrt-llm-models">
 <h2>Runtime Options to Optimize the Performance of TensorRT-LLM Models?<a class="headerlink" href="#runtime-options-to-optimize-the-performance-of-tensorrt-llm-models" title="Link to this heading"></a></h2>
 <p>This part summarizes the runtime configuration knobs that can be tweaked to
-enhance the performance of already built engines.  Note that currently the
+enhance the performance of already built engines. Note that currently the
 configurations can be modified using the
 <a class="reference internal" href="#batch_manager.md#the-batch-manager-api"><span class="xref myst">Batch Manager API</span></a>
 as well as the
@@ -381,7 +406,7 @@ sequence batching is enabled. It maximizes the utilization of the GPUs by
 aggressively scheduling requests at the risk of having to pause requests if the
 KV cache size limit is reached.</p>
 <p>For a more conservative approach with respect to the KV cache limitations in
-terms of memory allocation, <code class="docutils literal notranslate"><span class="pre">schedulerPolicy</span></code> should be set to
+terms of memory allocation, <code class="docutils literal notranslate"><span class="pre">CapacitySchedulerPolicy</span></code> should be set to
 <code class="docutils literal notranslate"><span class="pre">GUARANTEED_NO_EVICT</span></code> to guarantee that a started request is never paused.</p>
 <p>If the goal is to maximizes the throughput, users should try <code class="docutils literal notranslate"><span class="pre">MAX_UTILIZATION</span></code>.
 However, they need to keep in mind that it may have a negative impact on
@@ -389,14 +414,13 @@ latency if requests have to be paused.</p>
 </section>
 <section id="tensorrt-overlap">
 <h3>TensorRT Overlap<a class="headerlink" href="#tensorrt-overlap" title="Link to this heading"></a></h3>
-<p>When TensorRT overlap is enabled, available requests are partitioned into 2
-micro-batches that can be run concurrently. It allows TensorRT-LLM to hide
-exposed CPU runtime. However, it may not give performance benefits when the
-size of the model is not big enough to overlap the host overhead, or when the
-number of requests is too small.</p>
-<p>If the goal is to increase throughput, it is recommended to try setting that
-argument to <code class="docutils literal notranslate"><span class="pre">True</span></code>. However, it must be noted that it may actually hurt
-latency.</p>
+<p><em><strong>Note that this option is now deprecated and only available with the GptManager API.</strong></em></p>
+<p>This option allowed to partition available requests into 2
+micro-batches that could be run concurrently and thereby allowed TensorRT-LLM to hide
+some exposed CPU runtime. However, optimization work has been done to reduce this
+exposed CPU runtime and it has been found that the concurrent execution
+of micro-batches did not provide additional benefits in terms of throughput,
+and in most cases, was hurting latency.</p>
 </section>
 <section id="maximum-attention-window-size">
 <h3>Maximum Attention Window Size<a class="headerlink" href="#maximum-attention-window-size" title="Link to this heading"></a></h3>
@@ -439,12 +463,35 @@ recommended to start from <code class="docutils literal notranslate"><span class
   <hr/>
 
   <div role="contentinfo">
-    <p>&#169; Copyright 2023, NVidia.</p>
+<jinja2.runtime.BlockReference object at 0x7f270278fbe0>
+
+<div class="footer">
+    <p>
+        Copyright © 2024 NVIDIA Corporation
+    </p>
+    <p>
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/" target="_blank" rel="noopener"
+            data-cms-ai="0">Privacy Policy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/" target="_blank" rel="noopener"
+            data-cms-ai="0">Manage My Privacy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/preferences/start/" target="_blank" rel="noopener"
+            data-cms-ai="0">Do Not Sell or Share My Data</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/" target="_blank"
+            rel="noopener" data-cms-ai="0">Terms of Service</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/" target="_blank" rel="noopener"
+            data-cms-ai="0">Accessibility</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/" target="_blank"
+            rel="noopener" data-cms-ai="0">Corporate Policies</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/product-security/" target="_blank" rel="noopener"
+            data-cms-ai="0">Product Security</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/contact/" target="_blank" rel="noopener"
+            data-cms-ai="0">Contact</a>
+    </p>
+</div>
+
+
   </div>
 
-  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
-    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
-    provided by <a href="https://readthedocs.org">Read the Docs</a>.
    
 
 </footer>

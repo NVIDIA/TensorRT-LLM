@@ -90,6 +90,7 @@
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="inference-request.html">Inference Request</a></li>
+<li class="toctree-l1"><a class="reference internal" href="inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 </ul>
@@ -282,7 +283,7 @@ Alternatively, users may call <code class="docutils literal notranslate"><span c
 </ul>
 </li>
 <li><p><code class="docutils literal notranslate"><span class="pre">maxBeamWidth</span></code>, the maximum beam width GptManager will allow for any request.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">schedulerPolicy</span></code>, policy used to select the subset available requests in each iteration of the InflightBatching generation loop.</p>
+<li><p><code class="docutils literal notranslate"><span class="pre">capacitySchedulerPolicy</span></code>, policy used to select the subset available requests in each iteration of the InflightBatching generation loop.</p>
 <ul>
 <li><p><code class="docutils literal notranslate"><span class="pre">MAX_UTILIZATION</span></code> packs as many requests as the underlying TRT engine can support in any iteration of the InflightBatching generation loop. While this is expected to maximize GPU throughput, it might require that some requests be paused and restarted depending on peak KV cache memory availability.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">GUARANTEED_NO_EVICT</span></code> uses KV cache more conservatively guaranteeing that a request, once started, will run to completion without eviction.</p></li>
@@ -303,7 +304,7 @@ Alternatively, users may call <code class="docutils literal notranslate"><span c
 <li><p><code class="docutils literal notranslate"><span class="pre">enableBlockReuse</span></code> (default: <code class="docutils literal notranslate"><span class="pre">false</span></code>) allow reuse of previously computed KV cache blocks across requests. This is expected to optimize memory use and computation.</p></li>
 </ul>
 </li>
-<li><p><code class="docutils literal notranslate"><span class="pre">enableTrtOverlap</span></code> (default: <code class="docutils literal notranslate"><span class="pre">false</span></code>) when <code class="docutils literal notranslate"><span class="pre">true</span></code>, GptManager partitions available requests into 2 ‘microbatches’ that can be run concurrently to hide exposed CPU runtime. However, it may not give performance benefits when the size of the model is not big enough to overlap the host overhead, or when the number of requests is too small.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">enableTrtOverlap</span></code> (default: <code class="docutils literal notranslate"><span class="pre">false</span></code>) when <code class="docutils literal notranslate"><span class="pre">true</span></code>, GptManager partitions available requests into 2 ‘microbatches’ that can be run concurrently to hide exposed CPU runtime. Note however that thanks to recent optimization work, the exposed CPU runtime has been reduced significantly and therefore, we do not recommend setting <code class="docutils literal notranslate"><span class="pre">enableTrtOverlap</span></code> to <code class="docutils literal notranslate"><span class="pre">true</span></code>, as it does not give noticeable throughput improvements and may hurt latency.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">enableChunkedContext</span></code> (default: <code class="docutils literal notranslate"><span class="pre">false</span></code>) Whether to enable context chunking. Context chunking increases the possibility of batching the context and generation phases, which in turn improves performance. When set to <code class="docutils literal notranslate"><span class="pre">false</span></code>, it indicates that the context chunk is disabled.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">peftCacheManagerConfig</span></code> (currently only supports LoRA, and requires <code class="docutils literal notranslate"><span class="pre">--use_lora_plugin</span></code> during engine build)</p>
 <ul>
@@ -364,7 +365,7 @@ auto-regressive model like GPT can be created as follows:</p>
 <span class="n">GptManager</span><span class="w"> </span><span class="n">batchManager</span><span class="p">(</span><span class="n">pathToTrtEngine</span><span class="p">,</span><span class="w">                   </span><span class="c1">// Path to the TensorRT engine of the model,</span>
 <span class="w">                        </span><span class="n">TrtGptModelType</span><span class="o">::</span><span class="n">InflightFusedBatching</span><span class="p">,</span><span class="w"> </span><span class="c1">// Use in-flight batching,</span>
 <span class="w">                        </span><span class="n">maxBeamWidth</span><span class="p">,</span><span class="w">                      </span><span class="c1">// Maximum beam width (must be &gt;= 1),</span>
-<span class="w">                        </span><span class="n">schedulerPolicy</span><span class="p">,</span><span class="w">                   </span><span class="c1">// Scheduling policy (see below),</span>
+<span class="w">                        </span><span class="n">schedulerConfig</span><span class="p">,</span><span class="w">                   </span><span class="c1">// Scheduler configuration (see below),</span>
 <span class="w">                        </span><span class="n">getInferenceRequestsCb</span><span class="p">,</span><span class="w">            </span><span class="c1">// The Get callback (see above),</span>
 <span class="w">                        </span><span class="n">sendResponseCb</span><span class="p">,</span><span class="w">                    </span><span class="c1">// The Send callback (see above),</span>
 <span class="w">                        </span><span class="n">pollStopSignalCb</span><span class="p">,</span><span class="w">                  </span><span class="c1">// The Stop signals callback (see above),</span>
@@ -373,14 +374,14 @@ auto-regressive model like GPT can be created as follows:</p>
 </div>
 <p>The scheduler policy helps the batch manager adjust how requests are scheduled
 for execution. The batch manager can try to maximize the utilization of the
-GPUs by aggressively scheduling requests (<code class="docutils literal notranslate"><span class="pre">schedulerPolicy</span></code> set to
-<code class="docutils literal notranslate"><span class="pre">MAX_UTILIZATION</span></code>) at the risk of having to pause requests if it runs short on
-memory for KV caches. Note that any paused request will be automatically resumed
+GPUs by aggressively scheduling requests (<code class="docutils literal notranslate"><span class="pre">SchedulerConfig::capacitySchedulerPolicy</span></code>
+set to <code class="docutils literal notranslate"><span class="pre">kMAX_UTILIZATION</span></code>) at the risk of having to pause requests if it runs short
+on memory for KV caches. Note that any paused request will be automatically resumed
 and the only user-visible effect may be increased latency.
 It can also adopt a more conservative approach and schedule requests only when it
 knows that the memory allocation will be sufficient to process all active requests
 even in the worst case of KV cache consumption. That mode corresponds to a
-<code class="docutils literal notranslate"><span class="pre">schedulerPolicy</span></code> set to <code class="docutils literal notranslate"><span class="pre">GUARANTEED_NO_EVICT</span></code>.</p>
+<code class="docutils literal notranslate"><span class="pre">SchedulerConfig::capacitySchedulerPolicy</span></code> set to <code class="docutils literal notranslate"><span class="pre">kGUARANTEED_NO_EVICT</span></code>.</p>
 <p>The <code class="docutils literal notranslate"><span class="pre">GptManager</span></code>’s worker thread terminates when the <code class="docutils literal notranslate"><span class="pre">GptManager</span></code> destructor is
 called and there are no more active requests.</p>
 </section>
@@ -418,12 +419,35 @@ the TensorRT-LLM batch manager.</p>
   <hr/>
 
   <div role="contentinfo">
-    <p>&#169; Copyright 2023, NVidia.</p>
+<jinja2.runtime.BlockReference object at 0x7f270214cb80>
+
+<div class="footer">
+    <p>
+        Copyright © 2024 NVIDIA Corporation
+    </p>
+    <p>
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/" target="_blank" rel="noopener"
+            data-cms-ai="0">Privacy Policy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/" target="_blank" rel="noopener"
+            data-cms-ai="0">Manage My Privacy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/preferences/start/" target="_blank" rel="noopener"
+            data-cms-ai="0">Do Not Sell or Share My Data</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/" target="_blank"
+            rel="noopener" data-cms-ai="0">Terms of Service</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/" target="_blank" rel="noopener"
+            data-cms-ai="0">Accessibility</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/" target="_blank"
+            rel="noopener" data-cms-ai="0">Corporate Policies</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/product-security/" target="_blank" rel="noopener"
+            data-cms-ai="0">Product Security</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/contact/" target="_blank" rel="noopener"
+            data-cms-ai="0">Contact</a>
+    </p>
+</div>
+
+
   </div>
 
-  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
-    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
-    provided by <a href="https://readthedocs.org">Read the Docs</a>.
    
 
 </footer>
