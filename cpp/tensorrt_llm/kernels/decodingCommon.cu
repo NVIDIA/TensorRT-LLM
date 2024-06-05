@@ -51,7 +51,7 @@ __global__ void curandBatchInitialize(
     if (idx < size)
     {
         auto const batchSlot = batchSlots != nullptr ? batchSlots[idx] : idx;
-        curand_init(randomSeeds[batchSlot], 0, 0, &states[batchSlot]);
+        curand_init(randomSeeds[idx], 0, 0, &states[batchSlot]);
     }
 }
 
