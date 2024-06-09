@@ -64,20 +64,27 @@ class LLaMADecoderLayer(Module):
             tp_rank=config.mapping.tp_rank,
             quant_mode=config.quant_mode)
 
-        mlp_hidden_size = config.hidden_size * 4 if config.intermediate_size is None else config.intermediate_size
-
         ClsMLP = GatedMLP
         mlp_kwargs = {}
-        if config.moe.has_moe():
-            ClsMLP = MOE
-            mlp_kwargs = {
-                "moe_config": config.moe,
-                "tp_rank": config.mapping.tp_rank,
-            }
+
+        if config.dense_replace.has_replace() and layer_idx < config.dense_replace.first_k_moe_replace_by_dense:
+            # replace first layers by dense
+            assert config.moe.has_moe(), "DenseReplaceConfig can be used with moe only"
+            mlp_hidden_size = config.dense_replace.dense_intermediate_size
+            hidden_act = non_gated_version(config.hidden_act) # back to non gated for dense layers
+        else:
+            mlp_hidden_size = config.hidden_size * 4 if config.intermediate_size is None else config.intermediate_size
+            hidden_act = config.hidden_act
+            if config.moe.has_moe():
+                ClsMLP = MOE
+                mlp_kwargs = {
+                    "moe_config": config.moe,
+                    "tp_rank": config.mapping.tp_rank,
+                }
 
         self.mlp = ClsMLP(hidden_size=config.hidden_size,
                           ffn_hidden_size=mlp_hidden_size,
-                          hidden_act=config.hidden_act,
+                          hidden_act=hidden_act,
                           dtype=config.dtype,
                           bias=config.mlp_bias,
                           tp_group=config.mapping.tp_group,
@@ -93,6 +100,7 @@ class LLaMADecoderLayer(Module):
         self.has_residual_mlp = False
         if hasattr(self.config,
                    "residual_mlp") and self.config.residual_mlp is True:
+            assert not config.dense_replace.has_replace(), "Residual mlp unsupports DenseReplaceConfig"
             self.has_residual_mlp = True
 
         if self.has_residual_mlp:
@@ -288,7 +296,7 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
         elif load_by_shard:
             weights = load_weights_from_hf_by_shard(hf_model_dir, config)
         elif has_safetensors(
-                hf_model_dir) and not config.quant_mode.has_any_quant():
+                hf_model_dir) and not config.quant_mode.has_any_quant() and not config.dense_replace.has_replace():
             weights = load_weights_from_hf_safetensors(hf_model_dir, config)
         else:
             hf_model = load_hf_llama(hf_model_dir, load_model_on_cpu)

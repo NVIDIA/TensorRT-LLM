@@ -128,4 +128,5 @@ MODEL_MAP = {
     'RecurrentGemmaForCausalLM': RecurrentGemmaForCausalLM,
     'CogVLMForCausalLM': CogVLMForCausalLM,
     'DiT': DiT,
+    'DeepseekForCausalLM': LLaMAForCausalLM,
 }

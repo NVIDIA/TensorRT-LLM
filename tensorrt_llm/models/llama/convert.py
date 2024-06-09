@@ -665,6 +665,7 @@ def load_weights_from_hf_model(hf_model,
                                act_range: Optional[dict] = None,
                                qkv_para: Optional[dict] = None,
                                smoother: Optional[dict] = None):
+    model_type = hf_model.config.model_type
     quant_algo = config.quantization.quant_algo
     use_weight_only = quant_algo in [QuantAlgo.W8A16, QuantAlgo.W4A16]
     if quant_algo == QuantAlgo.W8A16:
@@ -691,6 +692,8 @@ def load_weights_from_hf_model(hf_model,
 
     mapping = config.mapping
     moe_config = config.moe
+    dense_replace_config = config.dense_replace
+
     mha_mode = (config.num_key_value_heads == config.num_attention_heads)
     layers_range = config.mapping.pp_layers(config.num_hidden_layers)
 
@@ -838,14 +841,21 @@ def load_weights_from_hf_model(hf_model,
                                        plugin_weight_only_quant_type, dtype,
                                        use_gemm_woq_plugin))
 
-        if moe_config.has_moe():
+        if moe_config.has_moe() and not (dense_replace_config.has_replace() and l < dense_replace_config.first_k_moe_replace_by_dense):
             rank_experts = list(range(moe_config.num_experts))
             if moe_config.tp_mode == moe_config.ParallelismMode.EXPERT_PARALLEL:
                 rank_experts = mapping.ep_experts(moe_config.num_experts)
-            for suffix in ["w1", "w2", "w3"]:
-                model_params[f'model.layers.{l}.block_sparse_moe.experts.{suffix}.weight'] = \
-                            torch.stack([model_params[f'model.layers.{l}.block_sparse_moe.experts.{expert}.{suffix}.weight'].detach()
-                                        for expert in rank_experts])
+            if model_type == "deepseek":
+                # deepseek names different for expert weigths
+                for suffix, deepseek_suffix in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
+                    model_params[f'model.layers.{l}.block_sparse_moe.experts.{suffix}.weight'] = \
+                                torch.stack([model_params[f'model.layers.{l}.mlp.experts.{expert}.{deepseek_suffix}.weight'].detach()
+                                            for expert in rank_experts])
+            else:
+                for suffix in ["w1", "w2", "w3"]:
+                    model_params[f'model.layers.{l}.block_sparse_moe.experts.{suffix}.weight'] = \
+                                torch.stack([model_params[f'model.layers.{l}.block_sparse_moe.experts.{expert}.{suffix}.weight'].detach()
+                                            for expert in rank_experts])
             w3 = model_params[
                 f'model.layers.{l}.block_sparse_moe.experts.w3.weight']
             w2 = model_params[
@@ -991,8 +1001,13 @@ def load_weights_from_hf_model(hf_model,
                                                plugin_weight_only_quant_type,
                                                dtype, use_gemm_woq_plugin))
 
-            moe_experts_gate_weights = get_weight(
-                model_params, prefix + 'block_sparse_moe.gate', torch.float32)
+            if model_type == "deepseek":
+                # deepseek names different for router
+                moe_experts_gate_weights = get_weight(
+                    model_params, prefix + 'mlp.gate', torch.float32)
+            else:
+                moe_experts_gate_weights = get_weight(
+                    model_params, prefix + 'block_sparse_moe.gate', torch.float32)
             weights.update(
                 get_tllm_linear_weight(
                     moe_experts_gate_weights,
@@ -1002,6 +1017,56 @@ def load_weights_from_hf_model(hf_model,
                     plugin_weight_only_quant_type,
                     dtype,
                     use_gemm_woq_plugin))
+
+            if model_type == "deepseek" and moe_config.num_shared_experts > 0:
+                # deepseek shared experts
+
+                mlp_gate_weight = get_weight(model_params, prefix + 'mlp.shared_experts.up_proj',
+                                            dtype)
+                split_v = split_matrix_tp(mlp_gate_weight,
+                                        mapping.tp_size,
+                                        mapping.tp_rank,
+                                        dim=0)
+                if use_smooth_quant:
+                    assert False, "Unsupports use_smooth_quant for deepseek"
+                else:
+                    weights.update(
+                        get_tllm_linear_weight(split_v, tllm_prex + 'mlp.shared_experts.gate.',
+                                            None, use_weight_only,
+                                            plugin_weight_only_quant_type, dtype,
+                                            use_gemm_woq_plugin))
+
+                mlp_fc_weight = get_weight(model_params, prefix + 'mlp.shared_experts.gate_proj',
+                                        dtype)
+                split_v = split_matrix_tp(mlp_fc_weight,
+                                        mapping.tp_size,
+                                        mapping.tp_rank,
+                                        dim=0)
+
+                if use_smooth_quant:
+                    assert False, "Unsupports use_smooth_quant for deepseek"
+                else:
+                    weights.update(
+                        get_tllm_linear_weight(split_v, tllm_prex + 'mlp.shared_experts.fc.', None,
+                                            use_weight_only,
+                                            plugin_weight_only_quant_type, dtype,
+                                            use_gemm_woq_plugin))
+
+                mlp_proj_weight = get_weight(model_params, prefix + 'mlp.shared_experts.down_proj',
+                                            dtype)
+                split_v = split_matrix_tp(mlp_proj_weight,
+                                        mapping.tp_size,
+                                        mapping.tp_rank,
+                                        dim=1)
+
+                if use_smooth_quant:
+                    assert False, "Unsupports use_smooth_quant for deepseek"
+                else:
+                    weights.update(
+                        get_tllm_linear_weight(split_v, tllm_prex + 'mlp.shared_experts.proj.',
+                                            None, use_weight_only,
+                                            plugin_weight_only_quant_type, dtype,
+                                            use_gemm_woq_plugin))
         else:
             mlp_gate_weight = get_weight(model_params, prefix + 'mlp.up_proj',
                                          dtype)

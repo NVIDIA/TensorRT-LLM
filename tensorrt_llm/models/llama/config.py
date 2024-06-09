@@ -19,11 +19,38 @@ from typing import Optional, Union
 
 import torch
 
+from dataclasses import asdict, dataclass
 from ..._utils import torch_dtype_to_str
 from ...layers import MoeConfig
 from ...logger import logger
 from ...mapping import Mapping
 from ..modeling_utils import PretrainedConfig, QuantConfig
+
+
+"""
+Configures replacing of the first k MoE MLPs with dense MLPs with the specified intermidiate size.
+"""
+@dataclass
+class DenseReplaceConfig:
+    first_k_moe_replace_by_dense: int = 0
+    dense_intermediate_size: int = 0
+
+    def validate(self) -> "DenseReplaceConfig":
+        if (self.first_k_moe_replace_by_dense == 0) != (self.dense_intermediate_size == 0):
+            raise ValueError(
+                "Both or neither DenseReplaceConfig's first_k_moe_replace_by_dense and dense_intermediate_size must be set to 0"
+            )
+        return self
+    
+    def has_replace(self) -> bool:
+        return self.first_k_moe_replace_by_dense > 0
+
+    @classmethod
+    def from_dict(cls, config: dict):
+        return cls(**config)
+
+    def to_dict(self):
+        return asdict(self)
 
 
 class LLaMAConfig(PretrainedConfig):
@@ -37,6 +64,7 @@ class LLaMAConfig(PretrainedConfig):
                  residual_mlp: bool = False,
                  disable_weight_only_quant_plugin: bool = False,
                  moe: Optional[Union[MoeConfig, dict]] = None,
+                 dense_replace: Optional[Union[DenseReplaceConfig, dict]] = None,
                  **kwargs):
         self.mlp_bias = mlp_bias
         self.attn_bias = attn_bias
@@ -53,11 +81,25 @@ class LLaMAConfig(PretrainedConfig):
                                    MoeConfig.ParallelismMode.TENSOR_PARALLEL),
                 normalization_mode=kwargs.pop(
                     'moe_normalization_mode',
-                    MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE))
+                    MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE),
+                num_shared_experts=kwargs.pop(
+                    'num_shared_experts',
+                    0))
         elif isinstance(moe, dict):
             moe = MoeConfig.from_dict(moe)
         assert isinstance(moe, MoeConfig)
         self.moe = moe.validate()
+
+        if dense_replace is None:
+            dense_replace = DenseReplaceConfig(
+                first_k_moe_replace_by_dense=0,
+                dense_intermediate_size=0)
+        elif isinstance(dense_replace, dict):
+            dense_replace = DenseReplaceConfig.from_dict(dense_replace)
+        assert isinstance(dense_replace, DenseReplaceConfig)
+        self.dense_replace = dense_replace.validate()
+
+        assert not self.dense_replace.has_replace() or self.moe.has_moe(), "DenseReplaceConfig can be used with moe only"
 
         super().__init__(**kwargs)
 
@@ -72,6 +114,7 @@ class LLaMAConfig(PretrainedConfig):
         output[
             'disable_weight_only_quant_plugin'] = self.disable_weight_only_quant_plugin
         output['moe'] = self.moe.to_dict()
+        output['dense_replace'] = self.dense_replace.to_dict()
         return output
 
     @classmethod
@@ -119,22 +162,46 @@ class LLaMAConfig(PretrainedConfig):
         disable_weight_only_quant_plugin = kwargs.pop(
             'disable_weight_only_quant_plugin', False)
 
-        if hf_config.model_type == "mixtral" or hf_config.model_type == "arctic":
+        if hf_config.model_type in ["mixtral", "arctic", "deepseek"]:
             # HF LLaMA-type models are implicitly using gated activation.
             # With our MoE implementation, we must make it explicit
             hidden_act = "swiglu"
-            moe_normalization_mode = MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE
+            moe_normalization_mode = MoeConfig.ExpertScaleNormalizationMode.NONE if hf_config.model_type == "deepseek" and not hf_config.norm_topk_prob else MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE
         else:
             moe_normalization_mode = None
-        moe_num_experts = getattr(hf_config, "num_local_experts", 0)
+
+        if hf_config.model_type == "deepseek":
+            # deepseek has two intermediate sizes in config: for dense and for moe layers
+            intermediate_size = hf_config.moe_intermediate_size
+        else:
+            intermediate_size = hf_config.intermediate_size
+
+        if hf_config.model_type == "deepseek":
+            # deepseek has two nums for experts in config: for routed and for shared experts
+            moe_num_experts = hf_config.n_routed_experts
+            moe_num_shared_experts = hf_config.n_shared_experts
+        else:
+            moe_num_experts = getattr(hf_config, "num_local_experts", 0)
+            moe_num_shared_experts = 0
         moe_top_k = getattr(hf_config, "num_experts_per_tok", 0)
         moe_tp_mode = kwargs.pop('moe_tp_mode',
                                  MoeConfig.ParallelismMode.TENSOR_PARALLEL)
         moe_config = MoeConfig(num_experts=moe_num_experts,
                                top_k=moe_top_k,
                                tp_mode=moe_tp_mode,
-                               normalization_mode=moe_normalization_mode)
+                               normalization_mode=moe_normalization_mode,
+                               num_shared_experts=moe_num_shared_experts)
         moe_config.validate()
+
+        if hf_config.model_type == "deepseek":
+            dense_replace = DenseReplaceConfig(
+                first_k_moe_replace_by_dense=hf_config.first_k_dense_replace,
+                dense_intermediate_size=hf_config.intermediate_size
+            )
+        else:
+            dense_replace = DenseReplaceConfig(
+                first_k_moe_replace_by_dense=0,
+                dense_intermediate_size=0)
 
         if dtype == 'auto':
             dtype = getattr(hf_config, 'torch_dtype', None)
@@ -156,7 +223,7 @@ class LLaMAConfig(PretrainedConfig):
             num_hidden_layers=hf_config.num_hidden_layers,
             num_attention_heads=hf_config.num_attention_heads,
             hidden_size=hf_config.hidden_size,
-            intermediate_size=hf_config.intermediate_size,
+            intermediate_size=intermediate_size,
             num_key_value_heads=num_key_value_heads,
             vocab_size=hf_config.vocab_size,
             position_embedding_type='rope_gpt_neox',
@@ -171,6 +238,7 @@ class LLaMAConfig(PretrainedConfig):
             moe=moe_config,
             mapping=mapping,
             quantization=quant_config,
+            dense_replace=dense_replace,
             **kwargs)
 
     @classmethod
