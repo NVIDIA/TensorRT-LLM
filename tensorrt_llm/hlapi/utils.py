@@ -17,8 +17,6 @@ from huggingface_hub import snapshot_download
 from tensorrt_llm.bindings import executor as tllme
 from tensorrt_llm.logger import set_level
 
-from ..bindings.executor import OutputConfig
-
 
 def print_traceback_on_error(func):
 
@@ -33,82 +31,122 @@ def print_traceback_on_error(func):
     return wrapper
 
 
-class SamplingConfig(tllme.SamplingConfig):
+@dataclass(slots=True)
+class SamplingParams:
+    """
+    Sampling parameters for text generation.
 
-    def __init__(self,
-                 end_id: Optional[int] = None,
-                 pad_id: Optional[int] = None,
-                 max_new_tokens: Optional[int] = None,
-                 *args,
-                 **kwargs):
-        super().__init__(*args, **kwargs)
-        # Patch some configs from cpp Request here, since they are attached to each prompt while
-        # it we won't introduce the Request concept in the generate() API.
-        self.end_id = end_id
-        self.pad_id = pad_id if pad_id is not None else end_id
-        self.max_new_tokens = max_new_tokens
+    Args:
+        end_id (int): The end token id.
+        pad_id (int): The pad token id.
+        max_new_tokens (int): The maximum number of tokens to generate.
+        bad_words: List[List[int]]: A list of bad words tokens. Each "word" can be composed of multiple tokens.
+        stop_words: List[List[int]]: A list of stop words tokens. Each "word" can be composed of multiple tokens.
 
-    def _get_member_names(self):
-        return ("beam_width", "top_k", "top_p", "top_p_min", "top_p_reset_ids",
-                "top_p_decay", "random_seed", "temperature", "min_length",
-                "beam_search_diversity_rate", "repetition_penalty",
-                "presence_penalty", "frequency_penalty", "length_penalty",
-                "early_stopping")
+        beam_width (int): The beam width. Default is 1 which disables beam search.
+        top_k (int): Controls number of logits to sample from. Default is 0 (all logits).
+        top_p (float): Controls the top-P probability to sample from. Default is 0.f
+        top_p_min (float): Controls decay in the top-P algorithm. topPMin is lower-bound. Default is 1.e-6.
+        top_p_reset_ids (int): Controls decay in the top-P algorithm. Indicates where to reset the decay. Default is 1.
+        top_p_decay (float): Controls decay in the top-P algorithm. The decay value. Default is 1.f
+        random_seed (int): Controls the random seed used by the random number generator in sampling
+        temperature (float): Controls the modulation of logits when sampling new tokens. It can have values > 0.f. Default is 1.0f
+        min_length (int): Lower bound on the number of tokens to generate. Values < 1 have no effect. Default is 1.
+        beam_search_diversity_rate (float): Controls the diversity in beam search.
+        repetition_penalty (float): Used to penalize tokens based on how often they appear in the sequence. It can have any value > 0.f. Values < 1.f encourages repetition, values > 1.f discourages it. Default is 1.f
+        presence_penalty (float): Used to penalize tokens already present in the sequence (irrespective of the number of appearances). It can have any values. Values < 0.f encourage repetition, values > 0.f discourage it. Default is 0.f
+        frequency_penalty (float): Used to penalize tokens already present in the sequence (dependent on the number of appearances). It can have any values. Values < 0.f encourage repetition, values > 0.f discourage it. Default is 0.f
+        length_penalty (float): Controls how to penalize longer sequences in beam search. Default is 0.f
+        early_stopping (int): Controls whether the generation process finishes once beamWidth sentences are generated (ends with end_token)
+        no_repeat_ngram_size (int): Controls how many repeat ngram size are acceptable. Default is 1 << 30.
 
-    def __eq__(self, other):
-        return all(getattr(self, name) == getattr(other, name) for name in self._get_member_names()) and \
-               self.end_id == other.end_id and self.pad_id == other.pad_id and self.max_new_tokens == other.max_new_tokens
+        return_log_probs (bool): Controls if Result should contain log probabilities. Default is false.
+        return_context_logits (bool): Controls if Result should contain the context logits. Default is false.
+        return_generation_logits (bool): Controls if Result should contain the generation logits. Default is false.
+        exclude_input_from_output (bool): Controls if output tokens in Result should include the input tokens. Default is true.
+        return_encoder_output (bool): Controls if Result should contain encoder output hidden states (for encoder-only and encoder-decoder models). Default is false.
+    """
+    # [TO DEVELOPER] This class provides an interface to HLAPI users.
+    # Internally, it manages and dispatches fields to Python bindings of C++ objects, currently including:
+    # (1) all fields of tllme.SamplingConfig;
+    # (2) all fields of tllme.OutputConfig;
+    # (3) some fields of tllme.Request.
+    # If you changed the implementation of C++ objects and corresponding Python bindings, please update:
+    # (1) the fields and corresponding docstring of this class, and
+    # (2) the expected_fields defined in _get_xxx_config methods.
 
-    @print_traceback_on_error
-    def __setstate__(self, args: tuple) -> None:
-        assert len(args) == 3 + len(self._get_member_names())
-        kwargs = {
-            'end_id': args[0],
-            'pad_id': args[1],
-            'max_new_tokens': args[2]
-        }
-        kwargs.update({
-            key: value
-            for key, value in zip(self._get_member_names(), args[3:])
-            if value is not None
-        })
-        # The C++ class's constructor is not properly called by pickle, so we need to call it manually.
-        self.__init__(**kwargs)
+    end_id: Optional[int] = None
+    pad_id: Optional[int] = None
+    max_new_tokens: int = 32
+    bad_words: Optional[List[List[int]]] = None
+    stop_words: Optional[List[List[int]]] = None
 
-    @print_traceback_on_error
-    def __getstate__(self) -> tuple:
-        args = (self.end_id, self.pad_id, self.max_new_tokens) + tuple(
-            getattr(self, name) for name in self._get_member_names())
-        return args
+    # Keep the below fields in sync with tllme.SamplingConfig
+    beam_width: int = 1
+    top_k: Optional[int] = None
+    top_p: Optional[float] = None
+    top_p_min: Optional[float] = None
+    top_p_reset_ids: Optional[int] = None
+    top_p_decay: Optional[float] = None
+    random_seed: Optional[int] = None
+    temperature: Optional[float] = None
+    min_length: Optional[int] = None
+    beam_search_diversity_rate: Optional[float] = None
+    repetition_penalty: Optional[float] = None
+    presence_penalty: Optional[float] = None
+    frequency_penalty: Optional[float] = None
+    length_penalty: Optional[float] = None
+    early_stopping: Optional[int] = None
+    no_repeat_ngram_size: Optional[int] = None
 
-    def __repr__(self):
-        return f"SamplingConfig({', '.join(f'{name}={getattr(self, name)}' for name in self._get_member_names())})"
+    # Keep the below fields in sync with tllme.OutputConfig
+    return_log_probs: bool = False
+    return_context_logits: bool = False
+    return_generation_logits: bool = False
+    exclude_input_from_output: bool = True
+    return_encoder_output: bool = False
 
+    def __post_init__(self):
+        if self.pad_id is None:
+            self.pad_id = self.end_id
 
-class OutputConfig(OutputConfig):
+    def _get_sampling_config(self):
+        expected_fields = [
+            "beam_width", "top_k", "top_p", "top_p_min", "top_p_reset_ids",
+            "top_p_decay", "random_seed", "temperature", "min_length",
+            "beam_search_diversity_rate", "repetition_penalty",
+            "presence_penalty", "frequency_penalty", "length_penalty",
+            "early_stopping", "no_repeat_ngram_size"
+        ]
+        found_fields = [
+            f for f in dir(tllme.SamplingConfig) if not f.startswith('__')
+        ]
+        if set(found_fields) != set(expected_fields):
+            raise RuntimeError(
+                "Found fields in `tllme.SamplingConfig` different than expected; "
+                f"if `tllme.SamplingConfig` is changed, please update {self.__class__.__name__} accordingly. "
+                "See [TO DEVELOPER] comments for detailed instructions.")
+        return tllme.SamplingConfig(
+            **{f: getattr(self, f)
+               for f in expected_fields})
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # Alter several default values for HLAPI usage.
-        if "exclude_input_from_output" not in kwargs:
-            self.exclude_input_from_output = True
-
-    def __eq__(self, other: "OutputConfig") -> bool:
-        return self.__getstate__() == other.__getstate__()
-
-    def __getstate__(self):
-        return {
-            "exclude_input_from_output": self.exclude_input_from_output,
-            "return_log_probs": self.return_log_probs,
-            "return_context_logits": self.return_context_logits,
-            "return_generation_logits": self.return_generation_logits,
-        }
-
-    def __setstate__(self, state):
-        self.exclude_input_from_output = state["exclude_input_from_output"]
-        self.return_log_probs = state["return_log_probs"]
-        self.return_context_logits = state["return_context_logits"]
-        self.return_generation_logits = state["return_generation_logits"]
+    def _get_output_config(self):
+        expected_fields = [
+            "return_log_probs", "return_context_logits",
+            "return_generation_logits", "exclude_input_from_output",
+            "return_encoder_output"
+        ]
+        found_fields = [
+            f for f in dir(tllme.OutputConfig) if not f.startswith('__')
+        ]
+        if set(found_fields) != set(expected_fields):
+            raise RuntimeError(
+                "Found fields in `tllme.OutputConfig` different than expected; "
+                f"if `tllme.OutputConfig` is changed, please update {self.__class__.__name__} accordingly. "
+                "See [TO DEVELOPER] comments for detailed instructions.")
+        return tllme.OutputConfig(
+            **{f: getattr(self, f)
+               for f in expected_fields})
 
 
 @dataclass

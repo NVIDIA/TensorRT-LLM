@@ -22,7 +22,14 @@ import platform
 import subprocess as _sp
 import sys as _sys
 import typing as _tp
-from multiprocessing import cpu_count
+
+build_script_dir = _pl.Path(
+    __file__).parent.resolve().parent.parent.parent.parent / 'scripts'
+assert build_script_dir.is_dir()
+_sys.path.append(str(build_script_dir))
+from build_wheel import add_arguments as add_build_arguments
+from build_wheel import get_build_dir
+from build_wheel import main as build_trt_llm
 
 
 def find_dir_containing(files: _tp.Sequence[str],
@@ -60,41 +67,7 @@ def run_command(command: _tp.Sequence[str],
     _sp.check_call(command, cwd=cwd, shell=shell, env=env, timeout=timeout)
 
 
-def build_trt_llm(python_exe: str,
-                  root_dir: _pl.Path,
-                  build_dir: _pl.Path,
-                  cuda_architectures: _tp.Optional[str] = None,
-                  use_ccache: _tp.Optional[bool] = False,
-                  dist_dir: _tp.Optional[str] = None,
-                  trt_root: _tp.Optional[str] = None,
-                  job_count: _tp.Optional[int] = None):
-    # Build wheel again to WAR issue that the "google-tests" target needs the cmake generated files
-    # which were not packaged when running the build job
-    # eventually it should be packaged in build job, and run test only on test node
-    cuda_architectures = cuda_architectures if cuda_architectures is not None else "80"
-    dist_dir = _pl.Path(dist_dir) if dist_dir is not None else _pl.Path("build")
-    build_wheel = [
-        python_exe, "scripts/build_wheel.py", "--cuda_architectures",
-        cuda_architectures, "--build_dir",
-        str(build_dir), "--dist_dir",
-        str(dist_dir), "-s", "-i"
-    ]
-
-    if use_ccache:
-        build_wheel.append("--use_ccache")
-
-    if trt_root is not None:
-        build_wheel += ["--trt_root", str(trt_root)]
-
-    if job_count is not None:
-        build_wheel += ["-j", str(job_count)]
-
-    run_command(build_wheel, cwd=root_dir, env=_os.environ, timeout=5400)
-
-
-def run_tests(cuda_architectures: _tp.Optional[str] = None,
-              build_dir: _tp.Optional[str] = None,
-              dist_dir: _tp.Optional[str] = None,
+def run_tests(build_dir: _pl.Path,
               model_cache: _tp.Optional[str] = None,
               skip_unit_tests=False,
               run_gpt=False,
@@ -109,26 +82,12 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
               run_t5=False,
               run_fp8=False,
               only_multi_gpu=False,
-              trt_root: _tp.Optional[str] = None,
               build_only=False,
-              use_ccache=False,
-              job_count: _tp.Optional[int] = None,
               test_timeout=3600) -> None:
     root_dir = find_root_dir()
     _log.info("Using root directory: %s", str(root_dir))
 
     python_exe = _sys.executable
-    build_dir = _pl.Path(
-        build_dir) if build_dir is not None else _pl.Path("cpp") / "build"
-
-    build_trt_llm(python_exe=python_exe,
-                  root_dir=root_dir,
-                  build_dir=build_dir,
-                  cuda_architectures=cuda_architectures,
-                  use_ccache=use_ccache,
-                  dist_dir=dist_dir,
-                  trt_root=trt_root,
-                  job_count=job_count)
 
     if run_mamba:
         run_command(
@@ -514,6 +473,16 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
     tests_dir = build_dir / "tests"
     xml_output_file = build_dir / "results-multi-gpu-real-decoder.xml"
     cpp_env = {**_os.environ}
+    # Utils tests
+    mpi_utils_test = [
+        "mpirun",
+        "-n",
+        "4",
+        "--allow-run-as-root",
+        "mpiUtilsTest",
+    ]
+    run_command(mpi_utils_test, cwd=tests_dir, env=cpp_env, timeout=300)
+
     trt_model_test = [
         "mpirun", "-n", "4", "--allow-run-as-root",
         "batch_manager/trtGptModelRealDecoderTest", "--gtest_filter=*TP*:*PP*",
@@ -533,11 +502,12 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
     ]
     run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
 
-    #Executor test in orchestrator mode
+    # Executor test in orchestrator mode
+    # https://nvbugs/4690328 - Disabled BW2 tests because of spurious failure
     xml_output_file = build_dir / "results-multi-gpu-llama-exec-orch-mode.xml"
     trt_model_test = [
         "mpirun", "-n", "1", "--allow-run-as-root", "executor/executorTest",
-        "--gtest_filter=*LlamaExecutorTest*OrchMode*",
+        "--gtest_filter=*LlamaExecutorTest*OrchMode*:-*BW2*",
         f"--gtest_output=xml:{xml_output_file}"
     ]
     run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
@@ -652,90 +622,101 @@ if __name__ == "__main__":
     _log.basicConfig(level=_log.INFO)
     parser = _arg.ArgumentParser()
 
-    parser.add_argument("--cuda_architectures", "-a")
-    parser.add_argument("--use_ccache",
-                        action="store_true",
-                        help="Use ccache in cmake building stage")
-    parser.add_argument("--job_count",
-                        "-j",
-                        type=int,
-                        const=cpu_count(),
-                        nargs="?",
-                        help="Parallel job count for compiling TensorRT-LLM")
-    parser.add_argument("--build_dir",
-                        type=str,
-                        help="Directory where cpp sources are built")
-    parser.add_argument("--trt_root",
-                        type=str,
-                        help="Directory of the TensorRT install")
-    parser.add_argument("--dist_dir",
-                        type=str,
-                        help="Directory where python wheels are built")
-    parser.add_argument("--model_cache",
-                        type=str,
-                        help="Directory where models are stored")
-    parser.add_argument("--skip_unit_tests",
-                        action="store_true",
-                        help="Skip unit tests. Only run model tests.")
-    parser.add_argument("--run_all_models",
-                        action="store_true",
-                        help="Run the tests for all models")
-    parser.add_argument("--run_gpt",
-                        action="store_true",
-                        help="Run the tests for GPT")
-    parser.add_argument("--run_gptj",
-                        action="store_true",
-                        help="Run the tests for GPT-J")
-    parser.add_argument("--run_llama",
-                        action="store_true",
-                        help="Run the tests for Llama")
-    parser.add_argument("--run_chatglm",
-                        action="store_true",
-                        help="Run the tests for ChatGLM")
-    parser.add_argument("--run_medusa",
-                        action="store_true",
-                        help="Run the tests for Medusa")
-    parser.add_argument("--run_mamba",
-                        action="store_true",
-                        help="Run the tests for Mamba")
-    parser.add_argument("--run_recurrentgemma",
-                        action="store_true",
-                        help="Run the tests for RecurrentGemma")
-    parser.add_argument("--run_encoder",
-                        action="store_true",
-                        help="Run the tests for BART encoder")
-    parser.add_argument("--run_bart",
-                        action="store_true",
-                        help="Run the tests for BART")
-    parser.add_argument("--run_t5",
-                        action="store_true",
-                        help="Run the tests for T5")
-    parser.add_argument(
+    build_config_group = "Build config"
+    build_config_parser = parser.add_argument_group(
+        build_config_group, "Configure TensorRT-LLM build")
+    add_build_arguments(build_config_parser)
+    build_config_parser.set_defaults(install=True, skip_building_wheel=True)
+
+    test_config_group = "Tests config"
+    tests_config_parser = parser.add_argument_group(test_config_group,
+                                                    "Configure tests")
+
+    tests_config_parser.add_argument("--model_cache",
+                                     type=str,
+                                     help="Directory where models are stored")
+    tests_config_parser.add_argument(
+        "--build_only",
+        action="store_true",
+        help=
+        "Only build engines and generate expected outputs, do not run tests.")
+    tests_config_parser.add_argument(
+        "--skip_unit_tests",
+        action="store_true",
+        help="Skip unit tests. Only run model tests.")
+    tests_config_parser.add_argument("--run_all_models",
+                                     action="store_true",
+                                     help="Run the tests for all models")
+    tests_config_parser.add_argument("--run_gpt",
+                                     action="store_true",
+                                     help="Run the tests for GPT")
+    tests_config_parser.add_argument("--run_gptj",
+                                     action="store_true",
+                                     help="Run the tests for GPT-J")
+    tests_config_parser.add_argument("--run_llama",
+                                     action="store_true",
+                                     help="Run the tests for Llama")
+    tests_config_parser.add_argument("--run_chatglm",
+                                     action="store_true",
+                                     help="Run the tests for ChatGLM")
+    tests_config_parser.add_argument("--run_medusa",
+                                     action="store_true",
+                                     help="Run the tests for Medusa")
+    tests_config_parser.add_argument("--run_mamba",
+                                     action="store_true",
+                                     help="Run the tests for Mamba")
+    tests_config_parser.add_argument("--run_recurrentgemma",
+                                     action="store_true",
+                                     help="Run the tests for RecurrentGemma")
+    tests_config_parser.add_argument("--run_encoder",
+                                     action="store_true",
+                                     help="Run the tests for BART encoder")
+    tests_config_parser.add_argument("--run_bart",
+                                     action="store_true",
+                                     help="Run the tests for BART")
+    tests_config_parser.add_argument("--run_t5",
+                                     action="store_true",
+                                     help="Run the tests for T5")
+    tests_config_parser.add_argument(
         "--run_fp8",
         action="store_true",
         help="Additionally run FP8 tests. Implemented for H100 runners.")
-    parser.add_argument(
+    tests_config_parser.add_argument(
         "--only_multi_gpu",
         action="store_true",
         help="Run only mulit-GPU tests. Implemented for 4 GPUs.")
-    parser.add_argument("--build_only",
-                        action="store_true",
-                        help="Build only, do not run tests.")
-    parser.add_argument("--test_timeout", type=int, help="Timeout for tests.")
+    tests_config_parser.add_argument("--test_timeout",
+                                     type=int,
+                                     help="Timeout for tests.")
 
     args = parser.parse_args()
 
-    if args.run_all_models:
-        args.run_gpt = True
-        args.run_gptj = True
-        args.run_llama = True
-        args.run_chatglm = True
-        args.run_mamba = True
-        args.run_recurrentgemma = True
-        args.run_encoder = True
-        args.run_bart = True
-        args.run_t5 = True
+    arg_groups = {}
+    for group in parser._action_groups:
+        group_dict = {
+            a.dest: getattr(args, a.dest, None)
+            for a in group._group_actions
+        }
+        arg_groups[group.title] = _arg.Namespace(**group_dict)
 
-    del args.run_all_models
+    build_args = arg_groups[build_config_group]
+    build_trt_llm(**vars(build_args))
 
-    run_tests(**vars(args))
+    test_args = arg_groups[test_config_group]
+    test_args.build_dir = get_build_dir(build_args.build_dir,
+                                        build_args.build_type)
+
+    if test_args.run_all_models:
+        test_args.run_gpt = True
+        test_args.run_gptj = True
+        test_args.run_llama = True
+        test_args.run_chatglm = True
+        test_args.run_mamba = True
+        test_args.run_recurrentgemma = True
+        test_args.run_encoder = True
+        test_args.run_bart = True
+        test_args.run_t5 = True
+
+    del test_args.run_all_models
+
+    run_tests(**vars(test_args))

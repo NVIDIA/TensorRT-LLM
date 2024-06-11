@@ -24,7 +24,7 @@ from typing import Dict, Optional, Union
 
 import tensorrt as trt
 
-from ._common import _is_building, serialize_engine
+from ._common import _is_building, check_max_num_tokens, serialize_engine
 from ._utils import (str_dtype_to_trt, support_strongly_type, to_json_file,
                      trt_gte_10)
 from .auto_parallel import auto_parallel
@@ -160,13 +160,13 @@ class Builder():
 
         if use_strip_plan and not trt_gte_10():
             logger.error(
-                f"cannot use --strip_plan with tensorrt version 9.x or below")
+                "cannot use --strip_plan with tensorrt version 9.x or below")
 
-        if (use_refit or use_strip_plan) and int8 and not is_trt_at_least_10:
+        if (use_refit or use_strip_plan) and int8 and not trt_gte_10():
             # TRT folds weights into Myelin graph because network contains int8 tensor or Q/DQ nodes
             # These folded weights can not be refitted
             logger.error(
-                f"can't use refit/strip_plan and int8 mode at the same time before tensorrt 10.0"
+                "can't use refit/strip_plan and int8 mode at the same time before tensorrt 10.0"
             )
 
         config = self.trt_builder.create_builder_config()
@@ -313,7 +313,7 @@ class Builder():
                         f"Found illegal dimension setting for profile {profile_idx}, dimension name is: {dim}"
                     )
                     logger.error(
-                        f"Offensive tensors which have this dimension are:\n" +
+                        "Offensive tensors which have this dimension are:\n" +
                         "\n".join([f"{r[1]} {dim} {r[0]}" for r in ranges]))
                     valid = False
         return valid
@@ -382,9 +382,11 @@ class Builder():
         if network.named_parameters is not None:
             for name, param in network.named_parameters:
                 if param._get_weights() is None:
-                    logger.info(
-                        f"Parameter {name} {param.raw_value.shape} {param.raw_value.dtype} was created but unused in forward method, so not materialized to TRT network"
-                    )
+                    if not param.is_buffer:
+                        logger.info(
+                            f"Parameter {name} {param.raw_value.shape} {param.raw_value.dtype} was created"
+                            " but unused in forward method, so not materialized to TRT network"
+                        )
                     continue
                 if not network.trt_network.set_weights_name(
                         param._get_weights(), name):
@@ -463,6 +465,23 @@ class BuildConfig:
     use_fused_mlp: bool = False
     dry_run: bool = False
     visualize_network: bool = False
+
+    def __post_init__(self):
+        """
+        Check and may modify max_num_tokens and opt_num_tokens after instantiation
+        """
+        max_num_tokens, opt_num_tokens = check_max_num_tokens(
+            max_num_tokens=self.max_num_tokens,
+            opt_num_tokens=self.opt_num_tokens,
+            max_batch_size=self.max_batch_size,
+            max_input_len=self.max_input_len,
+            max_beam_width=self.max_beam_width,
+            remove_input_padding=self.plugin_config.remove_input_padding,
+            enable_context_fmha=self.plugin_config.context_fmha,
+            tokens_per_block=self.plugin_config.tokens_per_block,
+            multiple_profiles=self.plugin_config.multiple_profiles,
+        )
+        self.max_num_tokens, self.opt_num_tokens = max_num_tokens, opt_num_tokens
 
     @classmethod
     def from_dict(cls, config, plugin_config=None):
@@ -743,14 +762,16 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
         use_fused_rg_lru=model.config.architecture
         in ["RecurrentGemmaForCausalLM"],
         use_unfused_qkv_gemm=use_auto_parallel,
-        use_prompt_tuning=(build_config.max_prompt_embedding_table_size > 0
-                           and not is_enc_dec),
+        use_prompt_tuning=(build_config.max_prompt_embedding_table_size > 0),
         use_lora=build_config.plugin_config.lora_plugin is not None,
         max_lora_rank=build_config.lora_config.max_lora_rank,
         use_fp8_context_fmha=(
             model.config.quantization.quant_algo == QuantAlgo.FP8
             and build_config.plugin_config.use_fp8_context_fmha),
     )
+
+    if is_enc_dec:
+        model.precompute_relative_attention_bias(build_config)
 
     builder = Builder()
     builder_config = builder.create_builder_config(
@@ -784,7 +805,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
         else:
             network.plugin_config.weight_only_quant_matmul_plugin = model.config.dtype
     if use_smooth_quant and model.config.quantization.use_plugin_sq:
-        network.plugin_config.set_smooth_quant_plugins()
+        network.plugin_config.set_smooth_quant_plugins(model.config.dtype)
     nccl_plugin = model.config.dtype if model.config.mapping.world_size > 1 else None
     network.plugin_config.set_nccl_plugin(
         nccl_plugin, network.plugin_config.use_custom_all_reduce)

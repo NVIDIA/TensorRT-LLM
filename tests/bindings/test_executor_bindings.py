@@ -773,13 +773,26 @@ def test_response():
 
 
 def test_scheduler_config():
-    policy = trtllm.CapacitySchedulerPolicy.MAX_UTILIZATION
-    config = trtllm.SchedulerConfig(policy)
-    assert config.capacity_scheduler_policy == policy
+    capacity_scheduler_policy = trtllm.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
+    config = trtllm.SchedulerConfig()
+    assert config.capacity_scheduler_policy == capacity_scheduler_policy
+    assert config.context_chunking_policy == None
 
-    policy = trtllm.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
-    config = trtllm.SchedulerConfig(policy)
-    assert config.capacity_scheduler_policy == policy
+    capacity_scheduler_policy = trtllm.CapacitySchedulerPolicy.MAX_UTILIZATION
+    config = trtllm.SchedulerConfig(capacity_scheduler_policy)
+    assert config.capacity_scheduler_policy == capacity_scheduler_policy
+    assert config.context_chunking_policy == None
+
+    capacity_scheduler_policy = trtllm.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
+    config = trtllm.SchedulerConfig(capacity_scheduler_policy)
+    assert config.capacity_scheduler_policy == capacity_scheduler_policy
+    assert config.context_chunking_policy == None
+
+    context_chunking_policy = trtllm.ContextChunkingPolicy.FIRST_COME_FIRST_SERVED
+    config = trtllm.SchedulerConfig(capacity_scheduler_policy,
+                                    context_chunking_policy)
+    assert config.capacity_scheduler_policy == capacity_scheduler_policy
+    assert config.context_chunking_policy == context_chunking_policy
 
 
 def test_kv_cache_config():

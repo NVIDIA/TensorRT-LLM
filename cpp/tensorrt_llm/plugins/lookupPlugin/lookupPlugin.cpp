@@ -36,11 +36,13 @@ LookupPlugin::LookupPlugin(nvinfer1::DataType type, int rank)
     : mType(type)
     , mRank(rank)
 {
+    mArch = tensorrt_llm::common::getSMVersion();
 }
 
 // Parameterized constructor
 LookupPlugin::LookupPlugin(void const* data, size_t length)
 {
+    mArch = tensorrt_llm::common::getSMVersion();
     char const *d = reinterpret_cast<char const*>(data), *a = d;
     read(d, mType);
     read(d, mRank);
@@ -104,6 +106,7 @@ bool LookupPlugin::supportsFormatCombination(
     }
     else
     {
+        TLLM_CHECK_WITH_INFO(mArch == 90, "int8 weight only lookupPlugin is only supported in SM 90 now.");
         switch (pos)
         {
         case 0: res = ((inOut[0].type == DataType::kINT32) && (inOut[0].format == TensorFormat::kLINEAR)); break;

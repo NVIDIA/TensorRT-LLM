@@ -12,10 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from typing import Optional
+
 import tensorrt as trt
 
 from .._common import default_net
-from ..functional import ACT2FN, cast, concat, gemm_swiglu
+from ..functional import (ACT2FN, AllReduceFusionParams, cast, concat,
+                          gemm_swiglu)
 from ..module import Module
 from ..quantization import QuantMode
 from ..quantization.functional import quantize
@@ -135,7 +138,10 @@ class GatedMLP(MLP):
                                  tp_size=tp_size,
                                  gather_output=False)
 
-    def forward(self, hidden_states, lora_layer_params=None):
+    def forward(self,
+                hidden_states,
+                lora_layer_params=None,
+                reduce_fusion_params: Optional[AllReduceFusionParams] = None):
 
         mlp_fc_lora_params = None
         if lora_layer_params is not None:
@@ -159,7 +165,8 @@ class GatedMLP(MLP):
         if self.inner_layernorm is not None:
             intermediate = self.inner_layernorm(intermediate)
         output = self.proj(intermediate,
-                           lora_runtime_params=mlp_proj_lora_params)
+                           lora_runtime_params=mlp_proj_lora_params,
+                           reduce_fusion_params=reduce_fusion_params)
         return output
 
 
@@ -316,7 +323,10 @@ class FusedGatedMLP(Module):
             )
         return inter
 
-    def forward(self, hidden_states, lora_layer_params=None):
+    def forward(self,
+                hidden_states,
+                lora_layer_params=None,
+                reduce_fusion_params: Optional[AllReduceFusionParams] = None):
         if default_net().plugin_config.gemm_swiglu_plugin:
             assert self.dtype == 'float16', f"Currently limited support, got {self.dtype}"
             inter = self.fc_gate_plugin(hidden_states, lora_layer_params)
@@ -330,5 +340,7 @@ class FusedGatedMLP(Module):
         if lora_layer_params is not None:
             mlp_proj_lora_params = lora_layer_params.get_runtime_params(
                 0, "mlp_4h_to_h")
-        output = self.proj(inter, lora_runtime_params=mlp_proj_lora_params)
+        output = self.proj(inter,
+                           lora_runtime_params=mlp_proj_lora_params,
+                           reduce_fusion_params=reduce_fusion_params)
         return output

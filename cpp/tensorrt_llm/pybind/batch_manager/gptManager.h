@@ -16,15 +16,16 @@
  */
 
 #pragma once
+
 #include "inferenceRequest.h"
 #include "namedTensor.h"
 #include "tensorrt_llm/batch_manager/GptManager.h"
 #include "tensorrt_llm/batch_manager/callbacks.h"
-#include <pybind11/functional.h>
 
 #include <ATen/ops/tensor.h>
 #include <functional>
 #include <memory>
+#include <pybind11/functional.h>
 
 namespace tensorrt_llm::pybind::batch_manager
 {
@@ -39,7 +40,6 @@ class GptManager
 {
 public:
     GptManager(std::filesystem::path const& trtEnginePath, tensorrt_llm::batch_manager::TrtGptModelType modelType,
-        int32_t maxBeamWidth, tensorrt_llm::executor::SchedulerConfig const& SchedulerConfig,
         GetInferenceRequestsCallback const& getInferenceRequestsCb, SendResponseCallback const& sendResponseCb,
         tensorrt_llm::batch_manager::PollStopSignalCallback const& pollStopSignalCb = nullptr,
         tensorrt_llm::batch_manager::ReturnBatchManagerStatsCallback const& returnBatchManagerStatsCb = nullptr,

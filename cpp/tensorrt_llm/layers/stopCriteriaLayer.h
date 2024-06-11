@@ -65,6 +65,8 @@ private:
     using BaseLayer::mStream;
     using BaseLayer::mAllocator;
 
+    using BaseLayer::mDecoderDomain;
+
     executor::DecodingMode mDecodingMode;
 };
 

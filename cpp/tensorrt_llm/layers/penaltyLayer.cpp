@@ -92,7 +92,7 @@ void PenaltyLayer<T>::allocateWorkspace()
     if (mDecodingMode.isUseOccurrencePenalty())
     {
         auto const workspaceSize = sizeof(SizeType32) * mDecoderDomain.getBatchSize()
-            * mDecoderDomain.getMaxTokensPerStep() * mConfiguredBeamWidth * mDecoderDomain.getVocabSize();
+            * mDecoderDomain.getMaxDecodingTokens() * mConfiguredBeamWidth * mDecoderDomain.getVocabSize();
         mPenaltyWorkspaceDevice = mAllocator->reMalloc(mPenaltyWorkspaceDevice, workspaceSize, false);
 
         if (mDecodingMode.isBeamSearch())
@@ -136,8 +136,8 @@ void PenaltyLayer<T>::allocateBuffer()
     }
 
     mRuntimeLogitsDevice = mAllocator->reMalloc(mRuntimeLogitsDevice,
-        sizeof(T) * mDecoderDomain.getBatchSize() * mDecoderDomain.getMaxTokensPerStep() * mDecoderDomain.getBeamWidth()
-            * mDecoderDomain.getVocabSizePadded(),
+        sizeof(T) * mDecoderDomain.getBatchSize() * mDecoderDomain.getMaxDecodingTokens()
+            * mDecoderDomain.getBeamWidth() * mDecoderDomain.getVocabSizePadded(),
         false);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -265,7 +265,7 @@ void PenaltyLayer<T>::forwardAsync(
     auto outputs = std::dynamic_pointer_cast<DynamicDecodeOutputParams>(baseOutputs);
     auto params = std::dynamic_pointer_cast<DynamicDecodeInputParams>(baseInputs);
 
-    auto const localDecoderDomain = getLocalDecoderDomain(params);
+    auto const localDecoderDomain = getLocalDecoderDomain(params, mDecoderDomain);
     auto const maxSeqLen = outputs->output_ids.shape[outputs->output_ids.shape.size() - 1];
     auto batchSlots = params->batch_slots ? params->batch_slots->template getPtr<SizeType32 const>() : nullptr;
 
@@ -350,7 +350,7 @@ void PenaltyLayer<T>::forwardAsync(
     penaltyParams.minLengths = minLengths;
     penaltyParams.endIds = params->end_ids.template getPtr<TokenIdType const>();
     penaltyParams.batchSlots = batchSlots;
-    penaltyParams.maxTokensPerStep = mDecoderDomain.getMaxTokensPerStep();
+    penaltyParams.maxTokensPerStep = mDecoderDomain.getMaxDecodingTokens();
     penaltyParams.tokensPerStep = tokensPerStep;
     penaltyParams.stream = mStream;
     invokeBatchApplyPenalty(penaltyParams);
@@ -360,7 +360,7 @@ void PenaltyLayer<T>::forwardAsync(
 
     params->logits = Tensor(MEMORY_GPU, std::is_same_v<T, float> ? DataType::TYPE_FP32 : DataType::TYPE_FP16,
         {static_cast<size_t>(localDecoderDomain.getBatchSize()),
-            static_cast<size_t>(mDecoderDomain.getMaxTokensPerStep()),
+            static_cast<size_t>(mDecoderDomain.getMaxDecodingTokens()),
             static_cast<size_t>(localDecoderDomain.getBeamWidth()),
             static_cast<size_t>(mDecoderDomain.getVocabSizePadded())},
         mRuntimeLogitsDevice);

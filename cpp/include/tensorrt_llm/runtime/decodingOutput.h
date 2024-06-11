@@ -93,6 +93,7 @@ public:
     {
     public:
         TensorPtr nextDraftTokens;       // [maxBatchSize, maxDraftTokens]
+        TensorPtr nextDraftTokensLen;    // [maxBatchSize]
         TensorPtr acceptedTokensLen;     // [maxBatchSize]
         TensorPtr acceptedLengthsCumSum; // [maxBatchSize + 1]
         TensorPtr pathsOffsets;          // [maxBatchSize, maxAcceptedDraftTokensPerStep]

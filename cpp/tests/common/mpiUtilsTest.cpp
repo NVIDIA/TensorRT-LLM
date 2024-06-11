@@ -229,3 +229,69 @@ TEST(MPIUtils, SessionCommunicator)
     EXPECT_EQ(session.getRank(), 0);
     EXPECT_EQ(session.getSize(), 1);
 }
+
+TEST(MPIUtils, VectorBcastEmpty)
+{
+    auto& session = mpi::MpiComm::session();
+    auto myRank = session.getRank();
+    size_t vecSize = 0;
+    std::vector<char> vec;
+    session.bcast(vec, 0);
+
+    ASSERT_EQ(vec.size(), vecSize);
+}
+
+// Not fundamental
+struct NotFundamental
+{
+    int a = 1;
+    int b = 2;
+};
+
+bool operator==(NotFundamental const& lhs, NotFundamental const& rhs)
+{
+    return (lhs.a == rhs.a) && (lhs.b == rhs.b);
+};
+
+TEST(MPIUtils, VectorBcastOverflow)
+{
+    auto& comm = mpi::MpiComm::world();
+    auto myRank = comm.getRank();
+    auto intLimit = static_cast<size_t>(std::numeric_limits<int32_t>::max());
+    auto vecSizes = std::vector<size_t>{100000, static_cast<size_t>(1.5 * intLimit)};
+
+    for (auto vecSize : vecSizes)
+    {
+        std::cout << myRank << " testing with size : " << vecSize << std::endl;
+        // Fundamental type
+        {
+            std::vector<char> vec;
+            char expected = 42;
+            if (myRank == 0)
+            {
+                vec.assign(vecSize, expected);
+            }
+            comm.bcast(vec, 0);
+            EXPECT_EQ(vec.size(), vecSize);
+            for (auto const& val : vec)
+            {
+                EXPECT_EQ(val, expected);
+            }
+        }
+        // Not fundamental type
+        {
+            std::vector<NotFundamental> vec;
+            auto expected = NotFundamental{45, 66};
+            if (myRank == 0)
+            {
+                vec.assign(vecSize, expected);
+            }
+            comm.bcast(vec, 0);
+            EXPECT_EQ(vec.size(), vecSize);
+            for (auto const& val : vec)
+            {
+                EXPECT_EQ(val, expected);
+            }
+        }
+    }
+}

@@ -24,7 +24,6 @@ from typing import Union
 
 import torch
 
-from .._common import check_max_num_tokens
 from ..auto_parallel import infer_cluster_config
 from ..auto_parallel.cluster_info import cluster_infos
 from ..builder import BuildConfig, Engine, build
@@ -77,11 +76,11 @@ def parse_arguments():
                         type=int,
                         default='1',
                         help='The number of workers for building in parallel')
-    parser.add_argument('--max_batch_size', type=int, default=1)
+    parser.add_argument('--max_batch_size', type=int, default=256)
     parser.add_argument('--max_input_len', type=int, default=1024)
     parser.add_argument('--max_output_len', type=int, default=1024)
     parser.add_argument('--max_beam_width', type=int, default=1)
-    parser.add_argument('--max_num_tokens', type=int, default=None)
+    parser.add_argument('--max_num_tokens', type=int, default=8192)
     parser.add_argument(
         '--opt_num_tokens',
         type=int,
@@ -277,6 +276,9 @@ def build_model(build_config: BuildConfig,
         "StreamingLLM is only supported in the llama model."
     real_rank = rank
 
+    if build_config.plugin_config.reduce_fusion and model_config.mapping.tp_size == 1:
+        build_config.plugin_config.reduce_fusion = False
+
     model_config.mapping.gpus_per_node = build_config.auto_parallel_config.gpus_per_node
     if build_config.auto_parallel_config.enabled:
         assert rank < build_config.auto_parallel_config.world_size
@@ -425,16 +427,6 @@ def main():
             raise RuntimeError(
                 "multiple_profiles is enabled, while opt_num_tokens is set. "
                 "They are not supposed to be working in the same time for now.")
-        args.max_num_tokens, args.opt_num_tokens = check_max_num_tokens(
-            max_num_tokens=args.max_num_tokens,
-            opt_num_tokens=args.opt_num_tokens,
-            max_batch_size=args.max_batch_size,
-            max_input_len=args.max_input_len,
-            max_beam_width=args.max_beam_width,
-            remove_input_padding=(args.remove_input_padding == "enable"),
-            enable_context_fmha=(args.context_fmha == "enable"),
-            tokens_per_block=args.tokens_per_block,
-            multiple_profiles=args.multiple_profiles)
         if args.cluster_key is not None:
             cluster_config = dict(cluster_key=args.cluster_key)
         else:

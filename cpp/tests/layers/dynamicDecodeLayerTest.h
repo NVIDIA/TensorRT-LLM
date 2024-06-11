@@ -61,7 +61,6 @@ struct TestSamplingParams
     std::optional<executor::DecodingMode> decodingMode;
 
     // Medusa setup
-    bool useMedusa{false};
     std::optional<runtime::SizeType32> maxNumMedusaHeads{std::nullopt};
     std::optional<std::vector<std::vector<runtime::SizeType32>>> topKMedusaHeads{std::nullopt};
     std::optional<std::vector<runtime::SizeType32>> tokensPerStep{std::nullopt};
@@ -148,7 +147,7 @@ private:
     runtime::SizeType32 mMaxBadWordsLen{0};
     runtime::SizeType32 mMaxStopWordsLen{0};
 
-    bool mUseMedusa{false};
+    executor::DecodingMode mDecodingMode = executor::DecodingMode::Auto();
 
 private:
     void allocateMedusaData(TestSamplingParams const& params);

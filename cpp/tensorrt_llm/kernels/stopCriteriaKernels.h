@@ -35,19 +35,23 @@ namespace kernels
 //! \param finished input/output buffer [maxBatchSize, beamWidth].
 //! Finished states. Set to FinishedState::FINISHED_STOP_WORDS if any
 //! sequence of the stop words is met
-//! \param sequenceLengths input buffer [maxBatchSize, beamWidth]. Current sequence
+//! \param sequenceLengths input/output buffer [maxBatchSize, beamWidth]. Current sequence
 //! lengths of the request tokens.
+//! When numNewTokens is not nullptr, it is updated to the first entrance of the found stop words.
 //! \param batchSlots input buffer[batchSize], optional. Indices of rows of data in memory pool
 //! \param stopWordsLen input buffer [maxBatchSize], cumulative length of all stop words per request
+//! \param numNewTokens input/output buffer [maxBatchSize], optional, number of tokens predicted per step.
+//! If nullptr, 1 is used.
 //! \param maxStopWordsLen maximum stopWordsLen over all requests in the batch
 //! \param batchSize batch size
 //! \param beamWidth beam width
 //! \param maxSeqLen maximum length of the sequence
 //! \param stream stream
 void invokeStopWordsCriterion(runtime::TokenIdType const** outputIds, runtime::SizeType32 const** parentIds,
-    runtime::TokenIdType const** stopWords, FinishedState* finished, runtime::SizeType32 const* sequenceLengths,
-    runtime::SizeType32 const* batchSlots, runtime::SizeType32 const* stopWordsLen, runtime::SizeType32 maxStopWordsLen,
-    runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 maxSeqLen, cudaStream_t stream);
+    runtime::TokenIdType const** stopWords, FinishedState* finished, runtime::SizeType32* sequenceLengths,
+    runtime::SizeType32 const* batchSlots, runtime::SizeType32 const* stopWordsLen, runtime::SizeType32* numNewTokens,
+    runtime::SizeType32 maxStopWordsLen, runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth,
+    runtime::SizeType32 maxSeqLen, cudaStream_t stream);
 
 //! \brief Sets finished states based on the sequenceLimitLength and computes number of finished sequences in the batch.
 //!

@@ -1,3 +1,18 @@
+/*
+ * Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 #include <gtest/gtest.h>
 
 #include "tensorrt_llm/layers/lookaheadAlgorithm.h"
@@ -10,7 +25,8 @@ using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::layers;
 using TensorPtr = runtime::ITensor::SharedPtr;
 
-class LookaheadAlgorithmTest : public ::testing::TestWithParam<std::tuple<int, int, int>>
+class LookaheadAlgorithmTest
+    : public ::testing::TestWithParam<std::tuple<std::tuple<int, int>, std::tuple<int, int>, std::tuple<int, int>>>
 {
 };
 
@@ -29,9 +45,10 @@ bool verifyAcceptOffsets(TensorPtr output, TensorPtr accepted, TensorPtr accepte
 
 TEST_P(LookaheadAlgorithmTest, predict)
 {
-    auto [W, N, G] = GetParam();
-    auto mStream = std::make_shared<CudaStream>();
-    auto mBufferManager = std::make_shared<BufferManager>(mStream);
+    auto [Ww, Nn, Gg] = GetParam();
+    auto [W, w] = Ww;
+    auto [N, n] = Nn;
+    auto [G, g] = Gg;
 
     auto ascii = std::make_shared<AsciiRandomTokenLogits>();
 
@@ -77,8 +94,8 @@ TEST_P(LookaheadAlgorithmTest, predict)
 
     PRINT_TOKENS(sequence);
 
-    tensorrt_llm::layers::LookaheadAlgorithm algo(W, N, G, mBufferManager);
-    algo.setup(ITensor::slice(sequence, 0, sequenceLength));
+    tensorrt_llm::layers::LookaheadAlgorithm algo(W, N, G);
+    algo.setup(ITensor::slice(sequence, 0, sequenceLength), w, n, g);
 
     SizeType32 seqLen = oracle.size();
     std::vector<SizeType32> histogram(N + 1);
@@ -88,8 +105,12 @@ TEST_P(LookaheadAlgorithmTest, predict)
         TLLM_LOG_DEBUG("\noracle[%d] = '%c'", sequenceLength - 1, static_cast<char>(sequenceRange[sequenceLength - 1]));
         bufferCast<SizeType32>(*posidMax)[0] = sequenceLength - 1;
         bufferCast<bool>(*smaskMax)[0] = true;
-        algo.prepare(ITensor::slice(sequence, sequenceLength, maxDraftLen), ITensor::slice(posidMax, 1, maxDraftLen),
-            ITensor::slice(smaskMax, 1, maxDraftLen), inputLengthPtr, sequenceLengthPtr,
+        algo.prepare(                                              //
+            ITensor::slice(sequence, sequenceLength, maxDraftLen), //
+            ITensor::slice(posidMax, 1, maxDraftLen),              //
+            ITensor::slice(smaskMax, 1, maxDraftLen),              //
+            inputLengthPtr,                                        //
+            sequenceLengthPtr,                                     //
             ITensor::slice(sequence, sequenceLength - 1, 1));
 
         TensorPtr input = ITensor::slice(sequence, sequenceLength - 1, inputLength + 1);
@@ -97,8 +118,8 @@ TEST_P(LookaheadAlgorithmTest, predict)
         TensorPtr smask = ITensor::slice(smaskMax, 0, inputLength + 1);
 
         PRINT_TOKENS(input);
-        PRINT_TENSOR(posid);
-        PRINT_TENSOR(smask);
+        PRINT_VALUES(posid);
+        PRINT_VALUES(smask);
 
         TensorPtr output = ITensor::slice(outputMax, 0, inputLength + 1);
         llm.foretell(output, input, posid);
@@ -131,9 +152,20 @@ TEST_P(LookaheadAlgorithmTest, predict)
 }
 
 INSTANTIATE_TEST_CASE_P(CombineLookaheadAlgorithmTest, LookaheadAlgorithmTest,
-    testing::Combine(testing::Values(1, 3, 5, 7), testing::Values(3, 5, 7), testing::Values(3, 5, 7)));
+    testing::Combine( //
+        testing::Values(std::make_tuple(1, 1), std::make_tuple(3, 3), std::make_tuple(5, 5), std::make_tuple(7, 7),
+            std::make_tuple(3, 2), std::make_tuple(5, 3), std::make_tuple(7, 4)),
+        testing::Values(std::make_tuple(3, 3), std::make_tuple(5, 5), std::make_tuple(7, 7), std::make_tuple(3, 2),
+            std::make_tuple(5, 3), std::make_tuple(7, 4)),
+        testing::Values(std::make_tuple(3, 3), std::make_tuple(5, 5), std::make_tuple(7, 7), std::make_tuple(3, 2),
+            std::make_tuple(5, 3), std::make_tuple(7, 4))));
 
-INSTANTIATE_TEST_CASE_P(CombineLookaheadAlgorithmTestSingle, LookaheadAlgorithmTest,
-    testing::Combine(testing::Values(5), testing::Values(5), testing::Values(5)));
+INSTANTIATE_TEST_CASE_P(CombineLookaheadAlgorithmTestSingleMax, LookaheadAlgorithmTest,
+    testing::Combine(testing::Values(std::make_tuple(5, 5)), testing::Values(std::make_tuple(5, 5)),
+        testing::Values(std::make_tuple(5, 5))));
+
+INSTANTIATE_TEST_CASE_P(CombineLookaheadAlgorithmTestSingleDynamic, LookaheadAlgorithmTest,
+    testing::Combine(testing::Values(std::make_tuple(3, 2)), testing::Values(std::make_tuple(3, 2)),
+        testing::Values(std::make_tuple(3, 2))));
 
 } // namespace tensorrt_llm::tests::layers

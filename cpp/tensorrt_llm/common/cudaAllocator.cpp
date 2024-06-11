@@ -31,7 +31,7 @@ ReallocType CudaAllocator::reallocType(void const* ptr, size_t size) const
 {
     TLLM_CHECK(contains(ptr));
     auto const currentSize = mPointerMapping.at(ptr)->getSize();
-    TLLM_LOG_DEBUG("current_buffer_size: %d, original buffer: %p, new buffer: %d", currentSize, ptr, size);
+    TLLM_LOG_TRACE("current_buffer_size: %d, original buffer: %p, new buffer: %d", currentSize, ptr, size);
     if (currentSize < size)
     {
         return ReallocType::INCREASE;
@@ -55,7 +55,7 @@ void* CudaAllocator::malloc(std::size_t size, bool const setZero)
         mBufferManager.setZero(*bufferPtr);
     }
     void* ptr{bufferPtr->data()};
-    TLLM_LOG_DEBUG("malloc buffer %p with size %ld", ptr, size);
+    TLLM_LOG_TRACE("malloc buffer %p with size %ld", ptr, size);
     mPointerMapping.insert({ptr, std::move(bufferPtr)});
     return ptr;
 }

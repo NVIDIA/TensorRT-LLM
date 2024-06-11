@@ -1,27 +1,44 @@
-
+/*
+ * Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 #include "tensorrt_llm/layers/lookaheadPoolManager.h"
+#include "tensorrt_llm/layers/lookaheadDecodingUtils.h"
 
 namespace tensorrt_llm::layers
 {
 
 using namespace tensorrt_llm::runtime;
 
-void LookaheadPoolManager::clear(void)
+void LookaheadPoolManager::setup(SizeType32 guessSetSize)
 {
+    TLLM_CHECK(guessSetSize > 0 && guessSetSize <= mGuessSetSizeMax);
+    mGuessSetSize = guessSetSize;
     mTokenMap.clear();
 }
 
-void LookaheadPoolManager::insertOne(Key key, TensorPtr ngram)
+void LookaheadPoolManager::insertOne(Key key, TensorConstPtr const& ngram)
 {
     auto search = mTokenMap.find(key);
     if (search != mTokenMap.end())
     {
         search->second.remove_if(
-            [&ngram](TensorPtr const& item)
+            [&ngram](TensorConstPtr const& item)
             {
-                auto ngramRange = BufferRange<TokenIdType>(*ngram);
-                auto itemRange = BufferRange<TokenIdType>(*item);
+                BufferRange<TokenIdType const> ngramRange(*ngram);
+                BufferRange<TokenIdType const> itemRange(*item);
                 return std::equal(ngramRange.begin(), ngramRange.end(), itemRange.begin());
             });
         if (mGuessSetSize >= 0 && search->second.size() >= mGuessSetSize)
@@ -32,24 +49,27 @@ void LookaheadPoolManager::insertOne(Key key, TensorPtr ngram)
     }
     else
     {
-        mTokenMap.insert({key, std::list<TensorPtr>({ngram})});
+        mTokenMap.insert({key, std::list<TensorConstPtr>({ngram})});
     }
 }
 
-void LookaheadPoolManager::fillWithPrompt(TensorPtr prompt, SizeType32 level)
+void LookaheadPoolManager::accept(TensorConstPtr const& prompt, SizeType32 level)
 {
     SizeType32 length = prompt->getShape().d[0];
-    auto promptRange = BufferRange<Key>(*prompt);
+    BufferRange<Key const> promptRange(*prompt);
     for (SizeType32 ti = 0; ti + level - 1 < length; ti++)
     {
         auto key = promptRange[ti];
-        TensorPtr ngram
-            = mBufferManager->copyFrom(*ITensor::slice(prompt, ti + 1, level - 1), runtime::MemoryType::kCPU);
+        TensorPtr ngram = BufferManager::cpu(ITensor::makeShape({level - 1}), nvinfer1::DataType::kINT32);
+        BufferRange<TokenIdType const> sourceRange(*ITensor::slice(prompt, ti + 1, level - 1));
+        BufferRange<TokenIdType> ngramRange(*ngram);
+        std::copy(sourceRange.begin(), sourceRange.end(), ngramRange.begin());
+
         insertOne(key, ngram);
     }
 }
 
-std::list<LookaheadPoolManager::TensorPtr> LookaheadPoolManager::guess(Key lastToken, SizeType32 guessSize) const
+std::list<LookaheadPoolManager::TensorConstPtr> LookaheadPoolManager::guess(Key lastToken, SizeType32 guessSize) const
 {
     auto search = mTokenMap.find(lastToken);
     if (search != mTokenMap.end())
@@ -58,7 +78,7 @@ std::list<LookaheadPoolManager::TensorPtr> LookaheadPoolManager::guess(Key lastT
         if (ngrams.size() > guessSize)
         {
             auto it = std::prev(ngrams.end(), guessSize);
-            return std::list<TensorPtr>(it, ngrams.end());
+            return std::list<TensorConstPtr>(it, ngrams.end());
         }
         else
         {
@@ -67,20 +87,24 @@ std::list<LookaheadPoolManager::TensorPtr> LookaheadPoolManager::guess(Key lastT
     }
     else
     {
-        return std::list<TensorPtr>();
+        return std::list<TensorConstPtr>();
     }
 }
 
-void LookaheadPoolManager::update(TensorPtr keyTokens, TensorPtr ngramTokens)
+void LookaheadPoolManager::update(TensorConstPtr const& keyTokens, TensorConstPtr const& ngramTokens)
 {
     TLLM_CHECK(keyTokens->getShape().d[0] == ngramTokens->getShape().d[0]);
-    auto keyRange = BufferRange<Key>(*keyTokens);
+    BufferRange<Key const> keyRange(*keyTokens);
     auto window = ngramTokens->getShape().d[0];
 
     for (SizeType32 wi = 0; wi < window; wi++)
     {
-        TensorPtr ngram = mBufferManager->copyFrom(*ITensor::slice(ngramTokens, wi, 1), runtime::MemoryType::kCPU);
-        ngram->squeeze(0);
+        TensorConstPtr source = ITensor::at(ngramTokens, {wi});
+        TensorPtr ngram = BufferManager::cpu(source->getShape(), nvinfer1::DataType::kINT32);
+        BufferRange<TokenIdType const> sourceRange(*source);
+        BufferRange<TokenIdType> ngramRange(*ngram);
+        std::copy(sourceRange.begin(), sourceRange.end(), ngramRange.begin());
+
         insertOne(keyRange[wi], ngram);
     }
 }

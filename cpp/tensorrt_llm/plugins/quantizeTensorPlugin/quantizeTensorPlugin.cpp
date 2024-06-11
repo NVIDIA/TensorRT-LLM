@@ -70,7 +70,11 @@ bool QuantizeTensorPlugin::supportsFormatCombination(
     {
     case 0:
         // activation
-        return (inOut[pos].type == nvinfer1::DataType::kFLOAT || inOut[pos].type == nvinfer1::DataType::kHALF)
+        return (inOut[pos].type == nvinfer1::DataType::kFLOAT || inOut[pos].type == nvinfer1::DataType::kHALF
+#ifdef ENABLE_BF16
+                   || inOut[pos].type == nvinfer1::DataType::kBF16
+#endif
+                   )
             && inOut[pos].format == TensorFormat::kLINEAR;
     case 1:
         // scales
@@ -117,11 +121,19 @@ int QuantizeTensorPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         invokeQuantization<float>(reinterpret_cast<int8_t*>(outputs[0]), reinterpret_cast<float const*>(inputs[0]),
             numElts, reinterpret_cast<float const*>(inputs[1]), stream, mProp.maxGridSize[0]);
     }
-    else
+    else if (inputDesc[0].type == DataType::kHALF)
     {
         invokeQuantization<half>(reinterpret_cast<int8_t*>(outputs[0]), reinterpret_cast<half const*>(inputs[0]),
             numElts, reinterpret_cast<float const*>(inputs[1]), stream, mProp.maxGridSize[0]);
     }
+#ifdef ENABLE_BF16
+    else if (inputDesc[0].type == DataType::kBF16)
+    {
+        invokeQuantization<__nv_bfloat16>(reinterpret_cast<int8_t*>(outputs[0]),
+            reinterpret_cast<__nv_bfloat16 const*>(inputs[0]), numElts, reinterpret_cast<float const*>(inputs[1]),
+            stream, mProp.maxGridSize[0]);
+    }
+#endif
 
     return 0;
 }

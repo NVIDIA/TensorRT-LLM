@@ -121,22 +121,13 @@ void DynamicDecodeLayerTest<T>::allocateData(TestSamplingParams const& params, T
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     mEndId = endId == -1 ? mVocabSize - 1 : endId;
-    mUseMedusa = params.useMedusa;
-    mMaxTokensPerStep = mUseMedusa ? mMaxOutputLen - mMaxInputLen : 1;
 
-    auto const decodingMode = params.decodingMode.value_or(
+    mDecodingMode = params.decodingMode.value_or(
         [this]()
         {
             if (this->mBeamWidth == 1)
             {
-                if (this->mUseMedusa)
-                {
-                    return tle::DecodingMode::Medusa();
-                }
-                else
-                {
-                    return tle::DecodingMode::TopKTopP();
-                }
+                return tle::DecodingMode::TopKTopP();
             }
             else
             {
@@ -144,11 +135,15 @@ void DynamicDecodeLayerTest<T>::allocateData(TestSamplingParams const& params, T
             }
         }());
 
+    mMaxTokensPerStep = mDecodingMode.isMedusa() ? mMaxOutputLen - mMaxInputLen : 1;
+
+    auto speculativeDecodingModule = std::make_shared<SpeculativeDecodingModule>(
+        params.maxNumMedusaHeads.value_or(0), mMaxTokensPerStep - 1, mMaxTokensPerStep);
     auto const decodingDomain = tensorrt_llm::layers::DecoderDomain(
-        mMaxBatchSize, mBeamWidth, mVocabSize, mVocabSizePadded, mMaxTokensPerStep, params.maxNumMedusaHeads);
+        mMaxBatchSize, mBeamWidth, mVocabSize, mVocabSizePadded, speculativeDecodingModule);
 
     mDecodeLayer = std::make_unique<tensorrt_llm::layers::DynamicDecodeLayer<T>>(
-        decodingMode, decodingDomain, mStream->get(), mAllocator);
+        mDecodingMode, decodingDomain, mStream->get(), mAllocator);
 
     auto const dataType = TRTDataType<T>::value;
 
@@ -195,7 +190,7 @@ void DynamicDecodeLayerTest<T>::allocateData(TestSamplingParams const& params, T
 
     mBatchSlots = BufferManager::pinned(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT32);
 
-    if (mUseMedusa)
+    if (mDecodingMode.isMedusa())
     {
         allocateMedusaData(params);
     }
@@ -280,7 +275,7 @@ void DynamicDecodeLayerTest<T>::setup(uint64_t seed, TestSamplingParams const& p
         mLogitsVec[bi] = tcc::toTllmTensor(*logitsSlice);
     }
 
-    if (mUseMedusa)
+    if (mDecodingMode.isMedusa())
     {
         auto const maxMedusaHeads = params.maxNumMedusaHeads.value();
 
@@ -497,7 +492,7 @@ std::shared_ptr<DynamicDecodeInputParams> DynamicDecodeLayerTest<T>::createInput
     forwardParams->stop_words_lengths = tcc::toTllmTensor(*mStopWordsLens);
     forwardParams->max_stop_words_len = mMaxStopWordsLen;
 
-    if (mUseMedusa)
+    if (mDecodingMode.isMedusa())
     {
         forwardParams->medusaInputs = createMedusaInputs();
     }
@@ -543,7 +538,7 @@ std::shared_ptr<DynamicDecodeOutputParams> DynamicDecodeLayerTest<T>::createOutp
 
     outputParams->newTokens = tcc::toTllmTensor(*mNewTokens);
 
-    if (!mUseMedusa)
+    if (!mDecodingMode.isMedusa())
     {
         // Output log probs are not supported in Medusa
         outputParams->cum_log_probs = tcc::toTllmTensor(*mCumLogProbsDevice);
@@ -553,7 +548,7 @@ std::shared_ptr<DynamicDecodeOutputParams> DynamicDecodeLayerTest<T>::createOutp
         outputParams->output_log_probs_tiled = tcc::toTllmTensor(*mOutputLogProbsTiledDevice);
     }
 
-    if (mUseMedusa)
+    if (mDecodingMode.isMedusa())
     {
         outputParams->speculativeDecodingOutputs = createMedusaOutputs();
     }
@@ -686,7 +681,7 @@ void DynamicDecodeLayerTest<T>::runTestImpl(
                 mDecodeLayer->getRuntimeLogitsDevice(), *mRuntimeLogitsHost, tensorrt_llm::runtime::MemoryType::kGPU);
             mStream->synchronize();
 
-            if (greedySearch && !mUseMedusa)
+            if (greedySearch && !mDecodingMode.isMedusa())
             {
                 fillRefLogits(bufferCast<SizeType32>(*seqLenHost), expectedOutputIds, step);
             }
@@ -731,7 +726,7 @@ void DynamicDecodeLayerTest<T>::runTestImpl(
             }
         }
 
-        if (greedySearch && !mUseMedusa)
+        if (greedySearch && !mDecodingMode.isMedusa())
         {
             auto const passed = compareValues(
                 bufferCast<float>(*logProbsHost), bufferCast<float>(*mRefLogProbsHost), mMaxSeqLen * mMaxBatchSize);
@@ -748,7 +743,7 @@ void DynamicDecodeLayerTest<T>::runTest(
 {
     allocateData(params, endId);
 
-    if (!params.useMedusa)
+    if (!params.decodingMode.has_value() || !params.decodingMode->isMedusa())
     {
         TLLM_LOG_DEBUG("Run test with linear logits");
         mUseLogitsVec = false;
@@ -2119,13 +2114,44 @@ TYPED_TEST(DynamicDecodeLayerTest, MedusaSimpleTest)
                     {0, 3, -1}};
     // clang-format on
     params.outputIds = {{4, 0, 2}, {4, 0, 2}, {4, 0, 0}, {4, 4, 2}, {4, 0, 2}, {4, 0, 2}};
-    params.useMedusa = true;
+    params.decodingMode = tle::DecodingMode::Medusa();
     std::vector<std::set<TokenIdType>> expectedOutputIds{
         // batch
         {4}, {4}, {4}, {4}, {4}, {4}, // step 0
         {0}, {0}, {0}, {2}, {4}, {4}, // step 1
         {2}, {0}, {0}, {0}, {0}, {0}, // step 2
         {2}, {2}, {0}, {2}, {2}, {2}  // step 3
+    };
+    this->runTest(expectedOutputIds, params);
+}
+
+TYPED_TEST(DynamicDecodeLayerTest, MedusaStopWordsTest)
+{
+    TestSamplingParams params;
+    params.topKs = {1, 1, 1, 1, 1, 1};
+    params.topKMedusaHeads = {{3, 1}, {1, 3}, {3, 1}, {2, 2}, {2, 2}, {1, 3}};
+    params.tokensPerStep = {4, 4, 4, 4, 4, 4};
+    params.maxNumMedusaHeads = 2;
+    // clang-format off
+    params.paths = {{0, 1, 2,
+                     0, 3, -1},
+                    {0, 1, -1,
+                     0, -1, -1},
+                    {0, 1, 3},
+                    {0, 2, 3},
+                    {0, 2, -1},
+                    {0, 3, -1}};
+    // clang-format on
+    params.outputIds = {{4, 0, 2}, {4, 0, 2}, {4, 0, 0}, {4, 4, 2}, {4, 0, 2}, {4, 0, 2}};
+    params.stopWords = {{{4, 0}}, {{0, 0}}, {{0, 2}}, {{4}, {4, 2, 0}}, {{3}}, {{4, 4, 0, 2}}};
+    params.decodingMode = tle::DecodingMode::Medusa();
+
+    std::vector<std::set<TokenIdType>> expectedOutputIds{
+        // batch
+        {4}, {4}, {4}, {4}, {4}, {4},      // step 0
+        {0}, {0}, {0}, {-1}, {-1}, {-1},   // step 1
+        {-1}, {-1}, {0}, {-1}, {-1}, {-1}, // step 2
+        {-1}, {-1}, {-1}, {-1}, {-1}, {-1} // step 3
     };
     this->runTest(expectedOutputIds, params);
 }

@@ -179,6 +179,8 @@ class Tensor(object):
 
         # So from the dim_range arg to self.profiles conversion, there is a layout transpose
         # dim_range arg is: {M dimension x N profiles}, while self.profiles layout is {N profiles x M dimensions}
+        if isinstance(dtype, str):
+            dtype = str_dtype_to_trt(dtype)
 
         self.profiles = []
 
@@ -3633,12 +3635,43 @@ class AllReduceConfig(IntFlag):
     PUSH_MODE = auto()
 
 
+class AllReduceFusionOp(IntFlag):
+    """
+    Warning: actual definition is in cpp/tensorrt_llm/kernels/customAllReduceKernels.h
+             they must be kept in sync
+    """
+    NONE = 0
+    RESIDUAL_RMS_NORM = 1
+
+
+class AllReduceFusionParams():
+
+    def __init__(self,
+                 fusion_op: AllReduceFusionOp = AllReduceFusionOp.NONE,
+                 bias: Optional[Tensor] = None,
+                 residual: Optional[Tensor] = None,
+                 norm_weight: Optional[Tensor] = None,
+                 eps: float = 1e-06):
+        self.fusion_op = fusion_op
+        self.bias = bias
+        self.residual = residual
+        self.norm_weight = norm_weight
+        self.eps = eps
+        assert fusion_op == AllReduceFusionOp.NONE or (residual is not None)
+
+    def has_affine(self):
+        return 1 if self.norm_weight is not None else 0
+
+    def has_bias(self):
+        return 1 if self.bias is not None else 0
+
+
 def allreduce(
-    tensor: Tensor,
-    group: List[int],
-    strategy: Optional[AllReduceStrategy] = None,
-    config: AllReduceConfig = AllReduceConfig(0)
-) -> Tensor:
+        tensor: Tensor,
+        group: List[int],
+        strategy: Optional[AllReduceStrategy] = None,
+        config: AllReduceConfig = AllReduceConfig(0),
+        reduce_fusion_params: Optional[AllReduceFusionParams] = None) -> Tensor:
     '''
     Add an operation that performs a collective all-reduce.
 
@@ -3681,6 +3714,8 @@ def allreduce(
             strategy = AllReduceStrategy.AUTO
         else:
             strategy = AllReduceStrategy.NCCL
+    if reduce_fusion_params is None:
+        reduce_fusion_params = AllReduceFusionParams()
 
     counter = 0
     workspace = None
@@ -3705,19 +3740,48 @@ def allreduce(
     p_config = trt.PluginField("config", np.array([int(config)], np.int8),
                                trt.PluginFieldType.INT8)
     pfc.append(p_config)
+    p_fusion_op = trt.PluginField(
+        "fusion_op", np.array([int(reduce_fusion_params.fusion_op)], np.int8),
+        trt.PluginFieldType.INT8)
+    pfc.append(p_fusion_op)
     p_counter = trt.PluginField("counter", np.array([counter], np.int32),
                                 trt.PluginFieldType.INT32)
     pfc.append(p_counter)
+    p_eps = trt.PluginField(
+        "eps", np.array([float(reduce_fusion_params.eps)], np.float32),
+        trt.PluginFieldType.FLOAT32)
+    pfc.append(p_eps)
+    p_affine = trt.PluginField(
+        "affine", np.array([int(reduce_fusion_params.has_affine())], np.int8),
+        trt.PluginFieldType.INT8)
+    pfc.append(p_affine)
+    p_bias = trt.PluginField(
+        "bias", np.array([int(reduce_fusion_params.has_bias())], np.int8),
+        trt.PluginFieldType.INT8)
+    pfc.append(p_bias)
 
     pfc = trt.PluginFieldCollection(pfc)
     ar_plug = allreduce_plg_creator.create_plugin("allreduce", pfc)
     plug_inputs = [tensor.cast(p_dtype).trt_tensor]
     if strategy != AllReduceStrategy.NCCL:
         plug_inputs.append(workspace.trt_tensor)
+    if reduce_fusion_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
+        if reduce_fusion_params.has_bias() == 1:
+            plug_inputs.append(reduce_fusion_params.bias.trt_tensor)
+        plug_inputs.append(reduce_fusion_params.residual.trt_tensor)
+        if reduce_fusion_params.has_affine() == 1:
+            plug_inputs.append(reduce_fusion_params.norm_weight.trt_tensor)
 
     layer = default_trtnet().add_plugin_v2(plug_inputs, ar_plug)
     _add_plugin_info(layer, allreduce_plg_creator, "allreduce", pfc)
-    return _create_tensor(layer.get_output(0), layer).cast(tensor.dtype)
+    if reduce_fusion_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
+        final_output = _create_tensor(layer.get_output(0),
+                                      layer).cast(tensor.dtype)
+        inter_output = _create_tensor(layer.get_output(1),
+                                      layer).cast(tensor.dtype)
+        return final_output, inter_output
+    else:
+        return _create_tensor(layer.get_output(0), layer).cast(tensor.dtype)
 
 
 def allgather(tensor: Tensor, group: List[int], gather_dim: int = 0) -> Tensor:

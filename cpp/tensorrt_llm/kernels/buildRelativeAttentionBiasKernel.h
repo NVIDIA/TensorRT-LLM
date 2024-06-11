@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,24 +14,20 @@
  * limitations under the License.
  */
 
-#include "../decoderMaskedMultiheadAttentionLaunch.h"
+#pragma once
+
+#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 
 namespace tensorrt_llm
 {
 namespace kernels
 {
 
-namespace
-{
-auto constexpr kSizePerHead = 32;
-} // namespace
-
-namespace mmha
-{
-
-INSTANTIATE_MMHA_LAUNCHERS_WITH_QK_TANH_SCALE(uint16_t, kSizePerHead)
-
-} // namespace mmha
+template <typename T>
+void invokeBuildRelativeAttentionBias(T* relative_attention_bias, T const* relative_attention_bias_table,
+    int const head_num, int const seq_len, int const num_bucket, bool const is_bidirectional, int const max_distance,
+    cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm

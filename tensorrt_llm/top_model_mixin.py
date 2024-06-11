@@ -68,12 +68,7 @@ class TopModelMixin:
                           prompt_table_path: str):
         '''Enable p tuning when build the TRT engine, call this before to_trt
         '''
-        # TODO: this is build time API, so pack the p-tuning table data together as engine,
-        #  otherwise, if the build and runtime path has different p tuning table path, it will fail.
-        self.prompt_table_path = prompt_table_path
-        # TODO: change the embedding layer member after this.
-        self.max_prompt_embedding_table_size = max_prompt_embedding_table_size
-        raise NotImplementedError  # Fill more details later
+        raise NotImplementedError
 
     def default_plugin_config(self, **kwargs) -> PluginConfig:
         '''Return the default plugin config for this model, when the plugin_config value is not given in to_trt() call.

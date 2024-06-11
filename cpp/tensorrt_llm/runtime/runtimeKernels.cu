@@ -18,7 +18,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
-#include "tensorrt_llm/kernels/parallelDecoding/kvCacheUpdateKernels.h"
+#include "tensorrt_llm/kernels/speculativeDecoding/kvCacheUpdateKernels.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 
 #include <cub/cub.cuh>
@@ -1225,7 +1225,7 @@ void invokeUpdateKVBlockArrayDraftTokenLocation(ITensor const& seqAcceptedDraftT
     int* rewindDraftTokenSeparateAdjustments, ITensor const& seqSlotRemapping, SizeType32 maxKVCacheLen,
     SizeType32 maxBlocksPerSeq, SizeType32 tokensPerBlock, cudaStream_t stream)
 {
-    tensorrt_llm::kernels::parallel_decoding::updateKVBlockArrayDraftTokenLocation(
+    tensorrt_llm::kernels::speculative_decoding::updateKVBlockArrayDraftTokenLocation(
         bufferCast<SizeType32>(seqAcceptedDraftTokenOffsets), bufferCast<SizeType32>(packedAcceptedDraftTokensIndices),
         bufferCast<SizeType32>(pastKeyValueLengths), pointerArray, offsetArray, layerCount, seqCount, numKVHeads,
         sizeInBytesPerKVHead, rewindDraftTokenCommonCount, rewindDraftTokenSeparateAdjustments,

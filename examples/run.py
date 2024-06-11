@@ -22,7 +22,8 @@ from pathlib import Path
 import numpy as np
 import torch
 from utils import (DEFAULT_HF_MODEL_DIRS, DEFAULT_PROMPT_TEMPLATES,
-                   load_tokenizer, read_model_name, throttle_generator)
+                   add_common_args, load_tokenizer, read_model_name,
+                   throttle_generator)
 
 import tensorrt_llm
 import tensorrt_llm.profiler
@@ -35,43 +36,19 @@ if PYTHON_BINDINGS:
 
 def parse_arguments(args=None):
     parser = argparse.ArgumentParser()
+    parser.add_argument('--max_input_length', type=int, default=923)
     parser.add_argument('--max_output_len', type=int, required=True)
-    parser.add_argument(
-        '--max_attention_window_size',
-        type=int,
-        default=None,
-        help=
-        'The attention window size that controls the sliding window attention / cyclic kv cache behavior'
-    )
-    parser.add_argument('--sink_token_length',
-                        type=int,
-                        default=None,
-                        help='The sink token length.')
-    parser.add_argument('--log_level', type=str, default='warning')
-    parser.add_argument('--engine_dir', type=str, default='engine_outputs')
-    parser.add_argument('--use_py_session',
-                        default=False,
-                        action='store_true',
-                        help="Whether or not to use Python runtime session")
     parser.add_argument(
         '--input_text',
         type=str,
         nargs='+',
         default=["Born in north-east France, Soyer trained as a"])
     parser.add_argument(
-        '--no_prompt_template',
-        dest='use_prompt_template',
-        default=True,
-        action='store_false',
-        help=
-        "Whether or not to use default prompt template to wrap the input text.")
-    parser.add_argument(
         '--input_file',
         type=str,
         help=
         'CSV or Numpy file containing tokenized input. Alternative to text input.',
         default=None)
-    parser.add_argument('--max_input_length', type=int, default=923)
     parser.add_argument('--output_csv',
                         type=str,
                         help='CSV file where the tokenized output is stored.',
@@ -86,132 +63,20 @@ def parse_arguments(args=None):
         help=
         'Numpy file where the generation logits are stored. Use only when num_beams==1',
         default=None)
-
     parser.add_argument('--output_log_probs_npy',
                         type=str,
                         help='Numpy file where the log_probs are stored',
                         default=None)
-
     parser.add_argument('--output_cum_log_probs_npy',
                         type=str,
                         help='Numpy file where the cum_log_probs are stored',
                         default=None)
-
-    parser.add_argument('--tokenizer_dir',
-                        help="HF tokenizer config path",
-                        default='gpt2')
-    parser.add_argument(
-        '--tokenizer_type',
-        help=
-        'Specify that argument when providing a .model file as the tokenizer_dir. '
-        'It allows AutoTokenizer to instantiate the correct tokenizer type.')
-    parser.add_argument('--vocab_file',
-                        help="Used for sentencepiece tokenizers")
-    parser.add_argument('--num_beams',
-                        type=int,
-                        help="Use beam search if num_beams > 1",
-                        default=1)
-    parser.add_argument('--temperature', type=float, default=1.0)
-    parser.add_argument('--top_k', type=int, default=1)
-    parser.add_argument('--top_p', type=float, default=0.0)
-    parser.add_argument('--length_penalty', type=float, default=1.0)
-    parser.add_argument('--repetition_penalty', type=float, default=1.0)
-    parser.add_argument('--presence_penalty', type=float, default=0.0)
-    parser.add_argument('--frequency_penalty', type=float, default=0.0)
-    parser.add_argument('--early_stopping',
-                        type=int,
-                        help='Use early stopping if num_beams > 1'
-                        '1 for early-stopping, 0 for non-early-stopping'
-                        'other values for stopping by length',
-                        default=1)
-    parser.add_argument('--debug_mode',
-                        default=False,
-                        action='store_true',
-                        help="Whether or not to turn on the debug mode")
-    parser.add_argument('--no_add_special_tokens',
-                        dest='add_special_tokens',
-                        default=True,
-                        action='store_false',
-                        help="Whether or not to add special tokens")
-    parser.add_argument('--streaming', default=False, action='store_true')
-    parser.add_argument('--streaming_interval',
-                        type=int,
-                        help="How often to return tokens when streaming.",
-                        default=5)
-    parser.add_argument(
-        '--prompt_table_path',
-        type=str,
-        help="Path to .npy file, exported by nemo_prompt_convert.py")
-    parser.add_argument(
-        '--prompt_tasks',
-        help="Comma-separated list of tasks for prompt tuning, e.g., 0,3,1,0")
-    parser.add_argument('--lora_dir',
-                        type=str,
-                        default=None,
-                        nargs="+",
-                        help="The directory of LoRA weights")
-    parser.add_argument(
-        '--lora_task_uids',
-        type=str,
-        default=None,
-        nargs="+",
-        help="The list of LoRA task uids; use -1 to disable the LoRA module")
-    parser.add_argument('--lora_ckpt_source',
-                        type=str,
-                        default="hf",
-                        choices=["hf", "nemo"],
-                        help="The source of lora checkpoint.")
-    parser.add_argument(
-        '--num_prepend_vtokens',
-        nargs="+",
-        type=int,
-        help="Number of (default) virtual tokens to prepend to each sentence."
-        " For example, '--num_prepend_vtokens=10' will prepend the tokens"
-        " [vocab_size, vocab_size + 1, ..., vocab_size + 9] to the sentence.")
     parser.add_argument(
         '--run_profiling',
         default=False,
         action='store_true',
         help="Run several 10 iterations to profile the inference latencies.")
-    parser.add_argument(
-        '--medusa_choices',
-        type=str,
-        default=None,
-        help="Medusa choice to use, if not none, will use Medusa decoding."
-        "   E.g.: [[0, 0, 0, 0], [0, 1, 0], [1, 0], [1, 1]] for 9 medusa tokens."
-    )
-    parser.add_argument(
-        '--gpu_weights_percent',
-        default=1,
-        type=float,
-        help=
-        'Specify the percentage of weights that reside on GPU instead of CPU and streaming load during runtime.',
-    )
-    parser.add_argument(
-        '--max_tokens_in_paged_kv_cache',
-        default=None,
-        type=int,
-        help=
-        'Specify the maximum number of tokens in a kv cache page (only available with cpp session).',
-    )
-    parser.add_argument(
-        '--kv_cache_enable_block_reuse',
-        action='store_true',
-        help=
-        'Enables block reuse in kv cache (only available with cpp session).',
-    )
-    parser.add_argument(
-        '--kv_cache_free_gpu_memory_fraction',
-        default=None,
-        type=float,
-        help='Specify the free gpu memory fraction.',
-    )
-    parser.add_argument(
-        '--enable_chunked_context',
-        action='store_true',
-        help='Enables chunked context (only available with cpp session).',
-    )
-    parser.add_argument('--no_repeat_ngram_size', type=int, default=None)
+    parser = add_common_args(parser)
 
     return parser.parse_args(args=args)
 
@@ -397,17 +262,15 @@ def main(args):
         tokenizer_type=args.tokenizer_type,
     )
 
-    # # An example to stop generation when the model generate " London" on first sentence, " eventually became" on second sentence
-    # stop_words_list = [[" London"], ["eventually became"]]
-    # stop_words_list = tensorrt_llm.runtime.to_word_list_format(stop_words_list, tokenizer)
-    # stop_words_list = torch.Tensor(stop_words_list).to(torch.int32).to("cuda").contiguous()
     stop_words_list = None
+    if args.stop_words:
+        stop_words_list = tensorrt_llm.runtime.decode_words_list(
+            args.stop_words, tokenizer)
 
-    # # An example to prevent generating " chef" on first sentence, " eventually" and " chef before" on second sentence
-    # bad_words_list = [[" chef"], [" eventually, chef before"]]
-    # bad_words_list = tensorrt_llm.runtime.to_word_list_format(bad_words_list, tokenizer)
-    # bad_words_list = torch.Tensor(bad_words_list).to(torch.int32).to("cuda").contiguous()
     bad_words_list = None
+    if args.bad_words:
+        bad_words_list = tensorrt_llm.runtime.decode_words_list(
+            args.bad_words, tokenizer)
 
     prompt_template = None
     if args.use_prompt_template and model_name in DEFAULT_PROMPT_TEMPLATES:
@@ -500,6 +363,7 @@ def main(args):
             bad_words_list=bad_words_list,
             output_cum_log_probs=(args.output_cum_log_probs_npy != None),
             output_log_probs=(args.output_log_probs_npy != None),
+            random_seed=args.random_seed,
             lora_uids=args.lora_task_uids,
             prompt_table=args.prompt_table_path,
             prompt_tasks=args.prompt_tasks,
@@ -585,6 +449,10 @@ def main(args):
                     frequency_penalty=args.frequency_penalty,
                     stop_words_list=stop_words_list,
                     bad_words_list=bad_words_list,
+                    output_cum_log_probs=(args.output_cum_log_probs_npy !=
+                                          None),
+                    output_log_probs=(args.output_log_probs_npy != None),
+                    random_seed=args.random_seed,
                     lora_uids=args.lora_task_uids,
                     prompt_table=args.prompt_table_path,
                     prompt_tasks=args.prompt_tasks,
@@ -613,6 +481,10 @@ def main(args):
                     frequency_penalty=args.frequency_penalty,
                     stop_words_list=stop_words_list,
                     bad_words_list=bad_words_list,
+                    output_cum_log_probs=(args.output_cum_log_probs_npy !=
+                                          None),
+                    output_log_probs=(args.output_log_probs_npy != None),
+                    random_seed=args.random_seed,
                     lora_uids=args.lora_task_uids,
                     prompt_table=args.prompt_table_path,
                     prompt_tasks=args.prompt_tasks,

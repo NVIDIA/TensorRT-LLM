@@ -69,7 +69,7 @@ namespace
     }                                                                                                                  \
     else if (has_block_sparse_attn)                                                                                    \
     {                                                                                                                  \
-        mmha::mmha_launch_kernel<T, KVCacheBuffer, KERNEL_PARAMS_TYPE, Dh, false, false, false>(                       \
+        mmha::mmha_launch_kernel<T, KVCacheBuffer, KERNEL_PARAMS_TYPE, Dh, true, false, false>(                        \
             params, kv_cache_buffer, shift_k_cache, stream);                                                           \
     }                                                                                                                  \
     else                                                                                                               \

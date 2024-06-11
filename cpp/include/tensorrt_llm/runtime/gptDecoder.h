@@ -76,8 +76,8 @@ public:
 
     static std::unique_ptr<IGptDecoder> create(executor::DecodingMode const& mode, nvinfer1::DataType dtype,
         size_t maxBatchSize, size_t maxBeamWidth, size_t vocabSize, size_t vocabSizePadded, size_t maxSequenceLength,
-        BufferManager::CudaStreamPtr const& stream, std::optional<runtime::SizeType32> maxTokensPerStep = std::nullopt,
-        std::optional<runtime::SizeType32> maxAcceptedDraftTokensPerStep = std::nullopt);
+        BufferManager::CudaStreamPtr const& stream,
+        std::shared_ptr<SpeculativeDecodingModule const> speculativeDecodingModule = nullptr);
 };
 
 template <typename T>
@@ -90,8 +90,7 @@ public:
 
     GptDecoder(executor::DecodingMode const& mode, size_t maxBatchSize, size_t maxBeamWidth, size_t vocabSize,
         size_t vocabSizePadded, size_t maxSequenceLength, CudaStreamPtr const& stream,
-        std::optional<runtime::SizeType32> maxTokensPerStep = std::nullopt,
-        std::optional<runtime::SizeType32> maxAcceptedDraftTokensPerStep = std::nullopt);
+        std::shared_ptr<SpeculativeDecodingModule const> speculativeDecodingModule = nullptr);
 
     void setup(SamplingConfig const& samplingConfig, size_t batchSize,
         std::optional<TensorPtr> const& batchSlots = std::nullopt) override;
@@ -117,21 +116,23 @@ private:
     SamplingConfig mSamplingConfig;
 
     size_t mMaxBatchSize;
+
+    executor::DecodingMode mDecodingMode;
 };
 
 inline std::unique_ptr<IGptDecoder> IGptDecoder::create(executor::DecodingMode const& mode, nvinfer1::DataType dtype,
     size_t maxBatchSize, size_t maxBeamWidth, size_t vocabSize, size_t vocabSizePadded, size_t maxSequenceLength,
-    BufferManager::CudaStreamPtr const& stream, std::optional<runtime::SizeType32> maxTokensPerStep,
-    std::optional<runtime::SizeType32> maxAcceptedDraftTokensPerStep)
+    BufferManager::CudaStreamPtr const& stream,
+    std::shared_ptr<SpeculativeDecodingModule const> speculativeDecodingModule)
 {
     switch (dtype)
     {
     case nvinfer1::DataType::kFLOAT:
         return std::make_unique<GptDecoder<float>>(mode, maxBatchSize, maxBeamWidth, vocabSize, vocabSizePadded,
-            maxSequenceLength, stream, maxTokensPerStep, maxAcceptedDraftTokensPerStep);
+            maxSequenceLength, stream, speculativeDecodingModule);
     case nvinfer1::DataType::kHALF:
         return std::make_unique<GptDecoder<half>>(mode, maxBatchSize, maxBeamWidth, vocabSize, vocabSizePadded,
-            maxSequenceLength, stream, maxTokensPerStep, maxAcceptedDraftTokensPerStep);
+            maxSequenceLength, stream, speculativeDecodingModule);
     default: TLLM_THROW("Unsupported decoder data type. Use either kFLOAT or kHALF."); return nullptr;
     }
 }

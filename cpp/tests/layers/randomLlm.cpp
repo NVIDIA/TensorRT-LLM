@@ -1,3 +1,18 @@
+/*
+ * Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 #include "tests/layers/randomLlm.h"
 #include "tensorrt_llm/layers/lookaheadDecodingUtils.h"
 
@@ -18,13 +33,6 @@ TensorPtr initTensor(std::string str, std::optional<ITensor::Shape> shape)
     std::copy(str.begin(), str.end(), tensorRange.begin());
     return tensor;
 }
-
-// TensorPtr squeezed(TensorPtr tensor, SizeType32 dim)
-//{
-//     TLLM_CHECK(tensor->getShape().d[dim] == 1);
-//     tensor->squeeze(dim);
-//     return tensor;
-// }
 
 TensorPtr RandomTokenLogits::tokenToLogits(TokenIdType token) const
 {
@@ -87,7 +95,7 @@ void RandomTokenLogits::stringToLogits(TensorPtr logits, std::string tokens) con
     auto i = 0;
     for (auto& token : tokens)
     {
-        tokenToLogits(squeezed(ITensor::slice(logits, i++, 1)), static_cast<TokenIdType>(token));
+        tokenToLogits(ITensor::at(logits, {i++}), static_cast<TokenIdType>(token));
     }
 }
 
@@ -99,7 +107,7 @@ void RandomTokenLogits::tensorToLogits(TensorPtr logits, TensorPtr tokens) const
     auto i = 0;
     for (auto it = tokensRange.begin(); it != tokensRange.end(); it++)
     {
-        tokenToLogits(squeezed(ITensor::slice(logits, i++, 1)), *it);
+        tokenToLogits(ITensor::at(logits, {i++}), *it);
     }
 }
 
@@ -119,7 +127,7 @@ std::string RandomTokenLogits::logitsToString(TensorPtr logits) const
     std::string result;
     for (auto i = 0; i < len; i++)
     {
-        result.push_back(logitsToToken(squeezed(ITensor::slice(logits, i, 1))));
+        result.push_back(logitsToToken(ITensor::at(logits, {i})));
     }
     return result;
 }
@@ -131,7 +139,7 @@ TensorPtr RandomTokenLogits::logitsToTensor(TensorPtr logits) const
     auto resultRange = BufferRange<TokenIdType>(*result);
     for (auto i = 0; i < len; i++)
     {
-        resultRange[i] = logitsToToken(ITensor::slice(logits, i, 1));
+        resultRange[i] = logitsToToken(ITensor::at(logits, {i}));
     }
     return result;
 }
@@ -192,6 +200,13 @@ void RandomLlm::forward(TensorPtr output, TensorPtr const input, TensorPtr const
 
     TensorPtr tokens = BufferManager::cpu(input->getShape(), nvinfer1::DataType::kINT32);
     foretell(tokens, input, position);
+    if (mId == 4)
+    {
+        TLLM_LOG_DEBUG("batch[%d] DEBUG", mId);
+        PRINT_TOKENS(tokens);
+        PRINT_TOKENS(input);
+        PRINT_TOKENS(position);
+    }
     mTable->tensorToLogits(output, tokens);
 }
 
@@ -235,6 +250,7 @@ void LookaheadRandomLlm::foretell(TensorPtr output, TensorPtr const input, Tenso
     }
 
     auto invalid = mTable->getInvalidToken();
+    TLLM_CHECK(positionRange[0] + 1 < olen);
     for (auto i = 0; i < len; i++)
     {
         bool legal = positionRange[i] + 1 < olen;

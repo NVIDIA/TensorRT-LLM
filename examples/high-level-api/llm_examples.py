@@ -7,7 +7,7 @@ import click
 import torch
 
 from tensorrt_llm import LLM, ModelConfig
-from tensorrt_llm.hlapi.llm import KvCacheConfig, SamplingConfig
+from tensorrt_llm.hlapi.llm import KvCacheConfig, SamplingParams
 from tensorrt_llm.hlapi.utils import get_device_count
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -83,10 +83,10 @@ def run_llm_generate(
 
     prompts = parse_prompts(prompt, prompt_is_digit)
 
-    sampling_config = SamplingConfig(end_id=end_id,
+    sampling_params = SamplingParams(end_id=end_id,
                                      pad_id=end_id) if prompt_is_digit else None
 
-    for output in llm.generate(prompts, sampling_config=sampling_config):
+    for output in llm.generate(prompts, sampling_params=sampling_params):
         print("OUTPUT:", output)
 
 

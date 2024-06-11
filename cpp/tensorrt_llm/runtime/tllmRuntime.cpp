@@ -85,7 +85,8 @@ TllmRuntime::TllmRuntime(
     mEngineBuffer = mBufferManager.gpu(devMemorySize);
 
     // Print context memory size for CI/CD to track.
-    TLLM_LOG_INFO("Allocated %.2f MiB for execution context memory.", static_cast<double>(devMemorySize) / 1048576.0);
+    TLLM_LOG_INFO("[MemUsageChange] Allocated %.2f MiB for execution context memory.",
+        static_cast<double>(devMemorySize) / 1048576.0);
 }
 
 TllmRuntime::TllmRuntime(void const* engineData, std::size_t engineSize, float const gpuWeightsPercent = 1.0F)

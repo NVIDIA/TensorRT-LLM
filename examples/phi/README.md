@@ -1,7 +1,7 @@
 # Phi
 
 This document explains how to build the [phi-2](https://huggingface.co/microsoft/phi-2), [Phi-3-mini-4k-instruct](https://huggingface.co/microsoft/Phi-3-mini-4k-instruct),
-[Phi-3-mini-128k-instruct](https://huggingface.co/microsoft/Phi-3-mini-128k-instruct), [Phi-3-small-8k-instruct](https://huggingface.co/microsoft/Phi-3-small-8k-instruct), and [Phi-3-small-128k-instruct](https://huggingface.co/microsoft/Phi-3-small-128k-instruct)
+[Phi-3-mini-128k-instruct](https://huggingface.co/microsoft/Phi-3-mini-128k-instruct), [Phi-3-small-8k-instruct](https://huggingface.co/microsoft/Phi-3-small-8k-instruct), [Phi-3-small-128k-instruct](https://huggingface.co/microsoft/Phi-3-small-128k-instruct), [Phi-3-medium-4k-instruct](https://huggingface.co/microsoft/Phi-3-medium-4k-instruct/) and [Phi-3-medium-128k-instruct](https://huggingface.co/microsoft/Phi-3-medium-128k-instruct/)
 models using TensorRT-LLM and run on a single GPU.
 
 - [Phi](#phi)
@@ -39,6 +39,8 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 | Phi-3-mini-128k-instruct  |   Y   |   Y   |  |  |
 | Phi-3-small-8k-instruct   |   Y   |   Y   | Y   | Y  |
 | Phi-3-small-128k-instruct |   Y   |   Y   | Y   | Y  |
+| Phi-3-medium-8k-instruct   |   Y   |   Y   | |   | Y  |
+| Phi-3-medium-128k-instruct   |   Y   |   Y   | |   | Y  |
 
 * Model Name: the name of the model, the same as the name on HuggingFace
 * TP: Tensor Parallel
@@ -54,9 +56,8 @@ pip install -r requirements.txt
 ```
 
 ```bash
-export MODEL_TYPE="phi-2" # or Phi-3-mini-4k-instruct, Phi-3-mini-128k-instruct, Phi-3-small-8k-instruct, Phi-3-small-128k-instruct
-python ./convert_checkpoint.py --model_type ${MODEL_TYPE} \
-                    --model_dir "microsoft/${MODEL_TYPE}" \
+python ./convert_checkpoint.py \
+                    --model_dir /path/to/phi-model \
                     --output_dir ./phi-checkpoint \
                     --dtype float16
 ```
@@ -106,7 +107,7 @@ The summarization can be done using the [`../summarize.py`](../summarize.py) scr
 ```bash
 # Run the summarization task using a TensorRT-LLM model and a single GPU.
 python3 ../summarize.py --engine_dir ./phi-engine \
-                        --hf_model_dir "microsoft/$(MODEL_TYPE)" \
+                        --hf_model_dir /path/to/phi-model \
                         --batch_size 1 \
                         --test_trt_llm \
                         --test_hf \
@@ -117,7 +118,7 @@ python3 ../summarize.py --engine_dir ./phi-engine \
 # Run the summarization task using a TensorRT-LLM model and 2-way tensor parallelism.
 mpirun -n 2 --allow-run-as-root                             \
 python3 ../summarize.py --engine_dir ./phi-engine-tp2  \
-                        --hf_model_dir "microsoft/$(MODEL_TYPE)"    \
+                        --hf_model_dir /path/to/phi-model    \
                         --batch_size 1                      \
                         --test_hf                           \
                         --test_trt_llm                      \

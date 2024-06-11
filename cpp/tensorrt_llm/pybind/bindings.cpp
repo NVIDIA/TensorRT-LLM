@@ -429,8 +429,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         return tb::TrtGptModelOptionalParams(kvCacheConfig, t[1].cast<bool>(),
             t[2].cast<std::optional<std::vector<SizeType32>>>(), t[3].cast<bool>(), t[4].cast<bool>(),
             tb::PeftCacheManagerConfig{},
-            tensorrt_llm::executor::DecodingConfig(
-                t[5].cast<std::optional<tensorrt_llm::executor::DecodingMode::UnderlyingType>>()));
+            tensorrt_llm::executor::DecodingConfig(t[5].cast<std::optional<tensorrt_llm::executor::DecodingMode>>()));
     };
 
     py::class_<tb::TrtGptModelOptionalParams>(m, "TrtGptModelOptionalParams")
@@ -447,6 +446,8 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_readwrite("normalize_log_probs", &tb::TrtGptModelOptionalParams::normalizeLogProbs)
         .def_readwrite("decoding_config", &tb::TrtGptModelOptionalParams::decodingConfig)
         .def_readwrite("gpu_weights_percent", &tb::TrtGptModelOptionalParams::gpuWeightsPercent)
+        .def_readwrite("max_beam_width", &tb::TrtGptModelOptionalParams::maxBeamWidth)
+        .def_readwrite("scheduler_config", &tb::TrtGptModelOptionalParams::schedulerConfig)
         .def(py::pickle(gptModelParamsGetState, gptModelParamsSetState))
         .def("__eq__", &tb::TrtGptModelOptionalParams::operator==);
 

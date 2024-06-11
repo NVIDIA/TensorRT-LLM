@@ -41,6 +41,7 @@ class SpeculativeDecodingMode(IntFlag):
     DRAFT_TOKENS_EXTERNAL = auto()
     MEDUSA = auto()
     LOOKAHEAD_DECODING = auto()
+    EXPLICIT_DRAFT_TOKENS = auto()
 
     @staticmethod
     def from_arguments(args: argparse.Namespace):
@@ -52,6 +53,8 @@ class SpeculativeDecodingMode(IntFlag):
             return SpeculativeDecodingMode.MEDUSA
         elif args.speculative_decoding_mode == "lookahead_decoding":
             return SpeculativeDecodingMode.LOOKAHEAD_DECODING
+        elif args.speculative_decoding_mode == "explicit_draft_tokens":
+            return SpeculativeDecodingMode.EXPLICIT_DRAFT_TOKENS
         else:
             assert False, "Unknown speculative_decoding_mode " + args.speculative_decoding_mode
 
@@ -275,6 +278,7 @@ class PretrainedConfig:
 class DecoderLayerList(ModuleList):
 
     def __init__(self, cls, config):
+        self.num_hidden_layers = config.num_hidden_layers
         self.layer_list = config.mapping.pp_layers(config.num_hidden_layers)
         super().__init__([cls(config, idx) for idx in self.layer_list])
 
@@ -306,6 +310,14 @@ class DecoderLayerList(ModuleList):
                 kwargs['lora_layer_params'] = lora_layer_params
             if spec_decoding_params is not None:
                 kwargs['spec_decoding_params'] = spec_decoding_params
+            if default_net().plugin_config.reduce_fusion:
+                if layer_idx < self.layer_list[-1]:
+                    kwargs['next_layer_input_layernorm_args'] = (
+                        self[layer_idx + 1].input_layernorm.weight.value,
+                        self[layer_idx + 1].input_layernorm.eps)
+                else:
+                    kwargs['next_layer_input_layernorm_args'] = None
+
             hidden_states = layer(
                 hidden_states,
                 use_cache=use_cache,
@@ -485,9 +497,9 @@ class PretrainedModel(Module,
                        max_batch_size,
                        max_input_len,
                        max_seq_len,
+                       max_num_tokens,
                        use_cache,
                        max_beam_width: int = 1,
-                       max_num_tokens: int = None,
                        opt_num_tokens: int = None,
                        prompt_embedding_table_size: int = 0,
                        position_encoding_2d: bool = False,
@@ -1128,24 +1140,6 @@ def preprocess_weights(weights: Dict[str, torch.Tensor],
         for name, param in weights.items():
             if name.endswith('kv_cache_scaling_factor'):
                 weights[name] = torch.tensor([1.0], dtype=torch.float32)
-
-    # If layer_norm bias is None. (For MPT and DBRX)
-    if model_config.architecture in ['MPTForCausalLM', 'DbrxForCausalLM']:
-        update_dict = {}
-        for name, param in weights.items():
-            if 'input_layernorm.weight' in name and name.replace(
-                    'weight', 'bias') not in weights:
-                update_dict[name.replace('weight',
-                                         'bias')] = torch.zeros_like(param)
-            if 'post_layernorm.weight' in name and name.replace(
-                    'weight', 'bias') not in weights:
-                update_dict[name.replace('weight',
-                                         'bias')] = torch.zeros_like(param)
-            if 'ln_f.weight' in name and name.replace('weight',
-                                                      'bias') not in weights:
-                update_dict[name.replace('weight',
-                                         'bias')] = torch.zeros_like(param)
-        weights.update(update_dict)
 
     # Parallel block rowlinear should not have duplicate bias.
     elif model_config.architecture == 'GPTJForCausalLM':

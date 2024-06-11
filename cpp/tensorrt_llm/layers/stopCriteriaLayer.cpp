@@ -59,7 +59,7 @@ void StopCriteriaLayer<T>::forwardAsync(
     auto inputs = std::dynamic_pointer_cast<DynamicDecodeInputParams>(baseInputs);
     auto outputs = std::dynamic_pointer_cast<DynamicDecodeOutputParams>(baseOutputs);
 
-    auto const localDecoderDomain = getLocalDecoderDomain(inputs);
+    auto const localDecoderDomain = getLocalDecoderDomain(inputs, mDecoderDomain);
     auto const maxSeqLen = outputs->output_ids.shape[outputs->output_ids.shape.size() - 1];
     auto batchSlots = inputs->batch_slots ? inputs->batch_slots->template getPtr<SizeType32 const>() : nullptr;
 
@@ -88,12 +88,15 @@ void StopCriteriaLayer<T>::checkStopWordsStopCriteria(std::shared_ptr<DynamicDec
     auto const maxStopWordsLength = inputs->max_stop_words_len;
     if (maxStopWordsLength)
     {
+        auto numNewTokens = outputs->speculativeDecodingOutputs
+            ? outputs->speculativeDecodingOutputs->acceptedLengths.template getPtr<SizeType32>()
+            : nullptr;
         invokeStopWordsCriterion(outputs->output_ids_ptr.template getPtr<TokenIdType const*>(),
             outputs->parent_ids_ptr.template getPtr<SizeType32 const*>(),
             inputs->stop_words_ptr->template getPtr<TokenIdType const*>(),
             reinterpret_cast<FinishedState*>(outputs->finished->template getPtr<FinishedState::UnderlyingType>()),
             outputs->sequence_length->template getPtr<SizeType32>(), batchSlots,
-            inputs->stop_words_lengths->template getPtr<SizeType32 const>(), maxStopWordsLength,
+            inputs->stop_words_lengths->template getPtr<SizeType32 const>(), numNewTokens, maxStopWordsLength,
             decoderDomain.getBatchSize(), decoderDomain.getBeamWidth(), maxSeqLen, stream);
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -130,7 +133,7 @@ void StopCriteriaLayer<T>::checkEosToken(std::shared_ptr<DynamicDecodeOutputPara
         outputs->sequence_length->template getPtr<SizeType32>(),
         // FIXME(nkorobov): add tokens per step tensor when necessary
         /* tokensPerStep */ nullptr, batchSlots, decoderDomain.getBatchSize(), decoderDomain.getBeamWidth(),
-        decoderDomain.getMaxTokensPerStep(), stream);
+        decoderDomain.getMaxDecodingTokens(), stream);
     sync_check_cuda_error();
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

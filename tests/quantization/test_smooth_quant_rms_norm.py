@@ -25,7 +25,8 @@ from tensorrt_llm import Parameter, Tensor
 from tensorrt_llm.quantization.functional import smooth_quant_rms_norm
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import create_session, run_session, unittest_name_func
+from utils.util import (create_session, run_session, skip_bf16_pre_ampere,
+                        unittest_name_func)
 
 
 class TestSmoothQuantRmsNorm(unittest.TestCase):
@@ -34,9 +35,13 @@ class TestSmoothQuantRmsNorm(unittest.TestCase):
         tensorrt_llm.logger.set_level('error')
 
     @parameterized.expand([('float16', False), ('float16', True),
+                           ('bfloat16', False), ('bfloat16', True),
                            ('float32', False), ('float32', True)],
                           name_func=unittest_name_func)
     def test_smooth_quant_rms_norm_plugin(self, dtype, dynamic_act_scaling):
+        # Skip tests that are not supported in pre-ampere architecture
+        skip_bf16_pre_ampere(dtype)
+
         test_shape = [2, 5, 10, 10]
 
         x_data = torch.randn(

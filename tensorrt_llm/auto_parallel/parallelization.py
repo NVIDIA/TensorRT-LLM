@@ -13,7 +13,8 @@ import torch
 from filelock import FileLock
 
 from tensorrt_llm._utils import trt_dtype_to_np, trt_dtype_to_torch, trt_gte_10
-from tensorrt_llm.functional import AllReduceConfig, AllReduceStrategy
+from tensorrt_llm.functional import (AllReduceConfig, AllReduceFusionParams,
+                                     AllReduceStrategy)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.network import (PluginInfo, delete_plugin_info, get_np_weight,
@@ -1576,6 +1577,7 @@ class DistributedGraphGroup(GraphGroupBase):
                 strategy = AllReduceStrategy.AUTO
             else:
                 strategy = AllReduceStrategy.NCCL
+            reduce_fusion_params = AllReduceFusionParams()
             allreduce_plg_creator = trt.get_plugin_registry(
             ).get_plugin_creator('AllReduce', '1', TRT_LLM_PLUGIN_NAMESPACE)
             assert allreduce_plg_creator is not None
@@ -1595,13 +1597,30 @@ class DistributedGraphGroup(GraphGroupBase):
                                         np.array([int(config)], np.int8),
                                         trt.PluginFieldType.INT8)
             pfc = [group, pf_type, pf_strategy, pf_config]
-            if self.use_custom_all_reduce:
-                pf_counter = trt.PluginField(
-                    "counter",
-                    np.array([all_reduce_instance_id], np.int32),
-                    trt.PluginFieldType.INT32,
-                )
-                pfc.append(pf_counter)
+            p_fusion_op = trt.PluginField(
+                "fusion_op",
+                np.array([int(reduce_fusion_params.fusion_op)], np.int8),
+                trt.PluginFieldType.INT8)
+            pfc.append(p_fusion_op)
+            pf_counter = trt.PluginField(
+                "counter",
+                np.array([all_reduce_instance_id], np.int32),
+                trt.PluginFieldType.INT32,
+            )
+            pfc.append(pf_counter)
+            p_eps = trt.PluginField(
+                "eps", np.array([float(reduce_fusion_params.eps)], np.float32),
+                trt.PluginFieldType.FLOAT32)
+            pfc.append(p_eps)
+            p_affine = trt.PluginField(
+                "affine",
+                np.array([int(reduce_fusion_params.has_affine())], np.int8),
+                trt.PluginFieldType.INT8)
+            pfc.append(p_affine)
+            p_bias = trt.PluginField(
+                "bias", np.array([int(reduce_fusion_params.has_bias())],
+                                 np.int8), trt.PluginFieldType.INT8)
+            pfc.append(p_bias)
 
             pfc = trt.PluginFieldCollection(pfc)
             ar_plug = allreduce_plg_creator.create_plugin("allreduce", pfc)

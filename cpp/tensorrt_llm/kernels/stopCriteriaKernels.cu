@@ -25,9 +25,12 @@ namespace tensorrt_llm
 {
 namespace kernels
 {
+
+namespace
+{
 __global__ void stopWordsCriterion(TokenIdType const** outputIds, SizeType32 const** parentIds,
-    TokenIdType const** stopWords, FinishedState* finished, SizeType32 const* sequenceLengths,
-    SizeType32 const* batchSlots, SizeType32 const* stopWordsLens, SizeType32 batchSize, SizeType32 beamWidth,
+    TokenIdType const** stopWords, FinishedState* finished, SizeType32* sequenceLengths, SizeType32 const* batchSlots,
+    SizeType32 const* stopWordsLens, SizeType32* numNewTokens, SizeType32 batchSize, SizeType32 beamWidth,
     SizeType32 maxSeqLen)
 {
     auto const id = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
@@ -35,6 +38,7 @@ __global__ void stopWordsCriterion(TokenIdType const** outputIds, SizeType32 con
     auto const beamIdx = blockIdx.y % beamWidth;
     auto const batchSlot = batchSlots != nullptr ? batchSlots[batchIdx] : batchIdx;
     auto const batchBeamIdx = batchSlot * beamWidth + beamIdx;
+    auto const newTokens = numNewTokens ? numNewTokens[batchSlot] : 1;
 
     auto const* baseStopWords = stopWords[batchSlot];
     auto const stopWordsLen = stopWordsLens[batchSlot];
@@ -51,49 +55,66 @@ __global__ void stopWordsCriterion(TokenIdType const** outputIds, SizeType32 con
 
     // The single-token case unconditionally bans the token
     bool shouldStop = false;
+    SizeType32 stopLen = INT_MAX;
+    SizeType32 step = 0;
 
-    // Need to minus 1 because the sequenceLengths is updated in this step
-    auto const currentStep = sequenceLengths[batchBeamIdx] - 1;
-    // Enough previously generated tokens to look for a match
-    if (currentStep + 1 >= itemSize)
+    for (; step < newTokens; ++step)
     {
-        shouldStop = true;
-        auto parentId = static_cast<SizeType32>(beamIdx);
-        bool const gatherBeam = beamWidth > 1;
-
-        for (auto tokenIdx = itemSize - 1; tokenIdx >= 0; tokenIdx--)
+        // Need to minus newTokens because the sequenceLengths is already updated in this point
+        auto const currentStep = sequenceLengths[batchBeamIdx] - newTokens + step;
+        // Is sequence larger than stop word to look for a match?
+        if (currentStep + 1 >= itemSize)
         {
-            auto const previousToken
-                = outputIds[batchSlot][parentId * maxSeqLen + currentStep - (itemSize - 1) + tokenIdx];
-            if (previousToken != baseStopWords[itemStart + tokenIdx])
-            {
-                shouldStop = false;
-                break;
-            }
-            if (gatherBeam)
-            {
-                parentId = parentIds == nullptr
-                    ? SizeType32{0}
-                    : parentIds[batchSlot][parentId * maxSeqLen + currentStep - (itemSize - 1) + tokenIdx];
+            shouldStop = true;
+            stopLen = currentStep + 1;
+            auto parentId = static_cast<SizeType32>(beamIdx);
+            bool const gatherBeam = beamWidth > 1;
 
-                if (parentId < 0 || parentId >= beamWidth)
+            // Start from the last token
+            for (auto tokenIdx = itemSize - 1; tokenIdx >= 0; tokenIdx--)
+            {
+                auto const previousToken
+                    = outputIds[batchSlot][parentId * maxSeqLen + currentStep - (itemSize - 1) + tokenIdx];
+                // If token does not match already, stop comparison
+                if (previousToken != baseStopWords[itemStart + tokenIdx])
                 {
                     shouldStop = false;
                     break;
                 }
+                if (gatherBeam)
+                {
+                    parentId = parentIds == nullptr
+                        ? SizeType32{0}
+                        : parentIds[batchSlot][parentId * maxSeqLen + currentStep - (itemSize - 1) + tokenIdx];
+
+                    if (parentId < 0 || parentId >= beamWidth)
+                    {
+                        shouldStop = false;
+                        break;
+                    }
+                }
             }
         }
-    }
-
-    if (shouldStop)
-    {
-        finished[batchSlot * beamWidth + beamIdx].setFinishedStopWords();
+        if (shouldStop)
+        {
+            finished[batchSlot * beamWidth + beamIdx].setFinishedStopWords();
+            // When more than 1 token is predicted per step, find the first match with the stop word
+            if (newTokens > 1)
+            {
+                // Update num of new tokens up to stopped word (including).
+                atomicMin(numNewTokens + batchSlot, step + 1);
+                // Update seq lengths up to stopped word (including).
+                atomicMin(sequenceLengths + batchBeamIdx, stopLen);
+            }
+            break;
+        }
     }
 }
+} // namespace
 
 void invokeStopWordsCriterion(TokenIdType const** outputIds, SizeType32 const** parentIds,
-    TokenIdType const** stopWords, FinishedState* finished, SizeType32 const* sequenceLengths,
-    SizeType32 const* batchSlots, SizeType32 const* stopWordsLen, SizeType32 maxStopWordsLen, SizeType32 batchSize,
+    TokenIdType const** stopWords, FinishedState* finished, SizeType32* sequenceLengths, SizeType32 const* batchSlots,
+    SizeType32 const* stopWordsLen, SizeType32* numNewTokens, SizeType32 maxStopWordsLen, SizeType32 batchSize,
     SizeType32 beamWidth, SizeType32 maxSeqLen, cudaStream_t stream)
 {
     // Check if we have sampled a word from the stopWords list. If so, stop the sequence.
@@ -105,7 +126,7 @@ void invokeStopWordsCriterion(TokenIdType const** outputIds, SizeType32 const** 
     grid.y = batchSize * beamWidth;
 
     stopWordsCriterion<<<grid, block, 0, stream>>>(outputIds, parentIds, stopWords, finished, sequenceLengths,
-        batchSlots, stopWordsLen, batchSize, beamWidth, maxSeqLen);
+        batchSlots, stopWordsLen, numNewTokens, batchSize, beamWidth, maxSeqLen);
     sync_check_cuda_error();
 }
 

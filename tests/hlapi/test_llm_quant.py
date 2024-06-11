@@ -1,7 +1,7 @@
 import os
 import sys
 
-from tensorrt_llm.hlapi.llm import LLM, ModelConfig
+from tensorrt_llm.hlapi.llm import LLM, ModelConfig, SamplingParams
 from tensorrt_llm.quantization import QuantAlgo
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -21,9 +21,8 @@ def test_llm_int4_awq_quantization():
 
     llm = LLM(config)
 
-    sampling_config = llm.get_default_sampling_config()
-    sampling_config.max_new_tokens = 6
-    for output in llm.generate(["A B C"], sampling_config=sampling_config):
+    sampling_params = SamplingParams(max_new_tokens=6)
+    for output in llm.generate(["A B C"], sampling_params=sampling_params):
         print(output)
         assert output.text == "D E F G H I"
 
@@ -41,9 +40,8 @@ def test_llm_fp8_quantization():
     assert config.quant_config.quant_mode.has_any_quant()
 
     llm = LLM(config)
-    sampling_config = llm.get_default_sampling_config()
-    sampling_config.max_new_tokens = 6
-    for output in llm.generate(["A B C"], sampling_config=sampling_config):
+    sampling_params = SamplingParams(max_new_tokens=6)
+    for output in llm.generate(["A B C"], sampling_params=sampling_params):
         print(output)
         assert output.text == "D E F G H I"
 

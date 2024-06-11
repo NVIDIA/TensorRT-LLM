@@ -34,7 +34,7 @@ from ..quantization import QuantMode
 from .generation import (ChatGLMGenerationSession, GenerationSession,
                          LogitsProcessor, LoraManager, ModelConfig,
                          QWenForCausalLMGenerationSession, SamplingConfig,
-                         StoppingCriteria)
+                         StoppingCriteria, to_word_list_format)
 
 
 def get_engine_name(model: str, dtype: str, tp_size: int, pp_size: int,
@@ -770,6 +770,13 @@ class ModelRunner(ModelRunnerMixin):
         batch_size = len(batch_input_ids)
         batch_input_ids, input_lengths = self._prepare_inputs(
             batch_input_ids, sampling_config.pad_id)
+
+        if sampling_config.bad_words_list is not None:
+            sampling_config.bad_words_list = to_word_list_format(
+                sampling_config.bad_words_list)
+        if sampling_config.stop_words_list is not None:
+            sampling_config.stop_words_list = to_word_list_format(
+                sampling_config.stop_words_list)
 
         self.session.setup(
             batch_size=batch_size,

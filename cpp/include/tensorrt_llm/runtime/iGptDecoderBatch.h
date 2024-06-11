@@ -189,6 +189,9 @@ public:
     //! @returns [batchSize, maxTokensPerStep-1], predicted draft tokens for next step, on gpu
     virtual TensorPtr getNextDraftTokens() const = 0;
 
+    //! @returns [batchSize], predicted draft tokens lengths for next step, on gpu
+    virtual TensorPtr getNextDraftTokensLengths() const = 0;
+
     //! @returns [batchSize + 1], exclusive sum of accepted draft token lengths, on gpu
     virtual TensorPtr getSpecDecodingAcceptedLengthsCumSum() const = 0;
 

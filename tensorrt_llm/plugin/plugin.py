@@ -62,7 +62,11 @@ class ContextFMHAType(IntEnum):
 DEFAULT_PLUGIN_DTYPE_OPTIONS = [
     "auto", "float16", "float32", "bfloat16", "int32", None
 ]
-PLUGIN_DTYPE_OPTIONS_MAP = {"gemm_swiglu_plugin": ["fp8", None]}
+PLUGIN_DTYPE_OPTIONS_MAP = {
+    "gemm_swiglu_plugin": ["fp8", None],
+    "gemm_plugin":
+    ["auto", "float16", "float32", "bfloat16", "int32", "fp8", None]
+}
 
 
 def _make_plugin_property(field_name: str, field_type: type):
@@ -158,6 +162,7 @@ class PluginConfig(metaclass=PluginConfigMeta):
     _paged_kv_cache: bool = field(default=True, init=False)
     _remove_input_padding: bool = field(default=True, init=False)
     _use_custom_all_reduce: bool = field(default=True, init=False)
+    _reduce_fusion: bool = field(default=False, init=False)
     _multi_block_mode: bool = field(default=False, init=False)
     _enable_xqa: bool = field(default=True, init=False)
     _attention_qk_half_accumulation: bool = field(default=False, init=False)
@@ -294,6 +299,7 @@ cli_plugin_args = [
     "multiple_profiles",
     "paged_state",
     "streamingllm",
+    "reduce_fusion"
 ]
 
 

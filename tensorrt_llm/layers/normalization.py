@@ -23,6 +23,7 @@ class LayerNorm(Module):
                  normalized_shape,
                  eps=1e-05,
                  elementwise_affine=True,
+                 bias=True,
                  dtype=None):
         super().__init__()
         if isinstance(normalized_shape, int):
@@ -31,7 +32,10 @@ class LayerNorm(Module):
         self.elementwise_affine = elementwise_affine
         if self.elementwise_affine:
             self.weight = Parameter(shape=self.normalized_shape, dtype=dtype)
-            self.bias = Parameter(shape=self.normalized_shape, dtype=dtype)
+            if bias:
+                self.bias = Parameter(shape=self.normalized_shape, dtype=dtype)
+            else:
+                self.register_parameter('bias', None)
         else:
             self.register_parameter('weight', None)
             self.register_parameter('bias', None)

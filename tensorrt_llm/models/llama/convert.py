@@ -1551,27 +1551,49 @@ def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
         if not no_prefix:
             key = model_prefix + key
         ptr_idx = safetensors_map[key] if key in safetensors_map else 0
+
+        if key not in safetensors_ptrs[ptr_idx].keys():
+            return None
+
         if tp_dim == -1:
             res = safetensors_ptrs[ptr_idx].get_tensor(key)
         else:
             tensor_slice = safetensors_ptrs[ptr_idx].get_slice(key)
             tensor_shape = tensor_slice.get_shape()
-            if tensor_shape[tp_dim] % mapping.tp_size != 0:
-                logger.error(
-                    "Current weight shape is invalid for mapping.tp_size=" +
-                    str(mapping.tp_size))
-            slice_width = tensor_shape[tp_dim] // mapping.tp_size
-            if tp_dim == 0:
-                res = tensor_slice[slice_width * mapping.tp_rank:slice_width *
-                                   (mapping.tp_rank + 1), :]
-            elif tp_dim == 1:
-                res = tensor_slice[:,
-                                   slice_width * mapping.tp_rank:slice_width *
-                                   (mapping.tp_rank + 1)]
+            if len(tensor_shape) == 1:
+                if tp_dim == 0:
+                    slice_width = tensor_shape[0] // mapping.tp_size
+                    res = tensor_slice[slice_width *
+                                       mapping.tp_rank:slice_width *
+                                       (mapping.tp_rank + 1)]
+                else:
+                    res = tensor_slice[:]
             else:
-                assert False, "Invalid TP dim"
+                if tensor_shape[tp_dim] % mapping.tp_size != 0:
+                    logger.error(
+                        "Current weight shape is invalid for mapping.tp_size=" +
+                        str(mapping.tp_size))
+                slice_width = tensor_shape[tp_dim] // mapping.tp_size
+                if tp_dim == 0:
+                    res = tensor_slice[slice_width *
+                                       mapping.tp_rank:slice_width *
+                                       (mapping.tp_rank + 1), :]
+                elif tp_dim == 1:
+                    res = tensor_slice[:, slice_width *
+                                       mapping.tp_rank:slice_width *
+                                       (mapping.tp_rank + 1)]
+                else:
+                    assert False, "Invalid TP dim"
         return res.to(torch_dtype).contiguous(
         ) if "block_sparse_moe.gate" not in key else res.to(torch.float32)
+
+    def load_and_set(target, key, tp_dim=-1, no_prefix=0):
+        res = load(key, tp_dim, no_prefix)
+        weights[target] = res
+        if "weight" in key:
+            bias = load(key.replace("weight", "bias"), tp_dim, no_prefix)
+            if bias is not None:
+                weights[target.replace("weight", "bias")] = bias
 
     if mapping.is_first_pp_rank():
         weights['transformer.vocab_embedding.weight'] = load(
@@ -1597,20 +1619,33 @@ def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
         # Attention
         qkv_list = []
         for comp in ["q", "k", "v"]:
-            comp_part = load(prefix + key_list[3] + comp + key_list[4], 0)
-            qkv_list.append(comp_part)
-        weights[f'{tllm_prex}.attention.qkv.weight'] = torch.cat(qkv_list, 0)
-        weights[f'{tllm_prex}.attention.dense.weight'] = load(
-            prefix + key_list[5], 1)  # attention.dense
+            weight_part = load(prefix + key_list[3] + comp + key_list[4], 0)
+            qkv_list.append(weight_part)
+            bias_part = load(
+                (prefix + key_list[3] + comp + key_list[4]).replace(
+                    "weight", "bias"), 0)
+            if bias_part is not None:
+                qkv_list.append(bias_part)
+        if len(qkv_list) == 3:
+            # No bias
+            weights[f'{tllm_prex}.attention.qkv.weight'] = torch.cat(
+                qkv_list, 0)
+        else:
+            weights[f'{tllm_prex}.attention.qkv.weight'] = torch.cat(
+                qkv_list[::2], 0)
+            weights[f'{tllm_prex}.attention.qkv.bias'] = torch.cat(
+                qkv_list[1::2], 0)
+        load_and_set(f'{tllm_prex}.attention.dense.weight',
+                     prefix + key_list[5], 1)  # attention.dense
 
         # MLP
         if not moe_config.has_moe():
-            weights[f'{tllm_prex}.mlp.gate.weight'] = load(
-                prefix + key_list[6], 0)  # mlp.gate
-            weights[f'{tllm_prex}.mlp.proj.weight'] = load(
-                prefix + key_list[7], 1)  # mlp.proj
-            weights[f'{tllm_prex}.mlp.fc.weight'] = load(
-                prefix + key_list[8], 0)  # mlp.fc
+            load_and_set(f'{tllm_prex}.mlp.gate.weight', prefix + key_list[6],
+                         0)  # mlp.gate
+            load_and_set(f'{tllm_prex}.mlp.proj.weight', prefix + key_list[7],
+                         1)  # mlp.proj
+            load_and_set(f'{tllm_prex}.mlp.fc.weight', prefix + key_list[8],
+                         0)  # mlp.fc
 
         else:
             weights[f'{tllm_prex}.mlp.router.weight'] = load(
@@ -1640,10 +1675,10 @@ def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
                 torch.concat([w3, w1], dim=-2).contiguous()
             weights[f'{tllm_prex}.mlp.proj.weight'] = w2.contiguous()
 
-        weights[f'{tllm_prex}.input_layernorm.weight'] = load(
-            prefix + key_list[9])  # input_layernorm
-        weights[f'{tllm_prex}.post_layernorm.weight'] = load(
-            prefix + key_list[10])  # post_layernorm
+        load_and_set(f'{tllm_prex}.input_layernorm.weight',
+                     prefix + key_list[9])  # input_layernorm
+        load_and_set(f'{tllm_prex}.post_layernorm.weight',
+                     prefix + key_list[10])  # post_layernorm
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))

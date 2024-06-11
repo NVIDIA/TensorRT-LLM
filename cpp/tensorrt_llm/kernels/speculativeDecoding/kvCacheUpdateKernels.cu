@@ -1,12 +1,11 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2023-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -23,11 +22,13 @@
 #include <array>
 #include <vector>
 
-namespace tensorrt_llm::kernels::parallel_decoding
+namespace tensorrt_llm::kernels::speculative_decoding
 {
 
 static constexpr int kUpdateKVCacheKernelShmSize = 16384;
 
+namespace
+{
 template <typename KVCacheBuffer, int MaxLayerCount, typename MoveEltType>
 __global__ void updateKVCacheDraftTokenLocationBatchedKernel(std::array<KVCacheBuffer, MaxLayerCount> kvCacheBuffers,
     int const* seqAcceptedDraftTokenOffsets, IndexType const* packedAcceptedDraftTokensIndices,
@@ -123,6 +124,7 @@ __global__ void updateKVCacheDraftTokenLocationBatchedKernel(std::array<KVCacheB
         __syncthreads();
     }
 }
+} // namespace
 
 template <typename KVCacheBuffer, int MaxLayerCount>
 void updateKVCacheDraftTokenLocationBatched(KVCacheBuffer const* kvCacheBuffers,
@@ -312,4 +314,4 @@ void updateKVBlockArrayDraftTokenLocationSeparateRewind(int const* seqAcceptedDr
         rewindDraftTokenCounts, seqSlotRemapping, maxKVCacheLen, maxBlocksPerSeq, tokensPerBlock, stream);
 }
 
-} // namespace tensorrt_llm::kernels::parallel_decoding
+} // namespace tensorrt_llm::kernels::speculative_decoding

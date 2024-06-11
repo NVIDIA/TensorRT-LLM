@@ -19,7 +19,6 @@ from tensorrt_llm.hlapi.mpi_session import (MpiPoolSession, MpiSession,
                                             need_spawn_mpi_workers)
 from tensorrt_llm.hlapi.tokenizer import TokenizerBase, tokenizer_factory
 from tensorrt_llm.hlapi.utils import (ContextManager, GenerationOutput,
-                                      OutputConfig, SamplingConfig,
                                       print_traceback_on_error)
 
 from . import bindings as tllm
@@ -29,7 +28,7 @@ from .hlapi.mpi_session import (MpiPoolSession, MpiSession,
                                 external_mpi_comm_available, find_free_port,
                                 need_spawn_mpi_workers)
 from .hlapi.tokenizer import TokenizerBase, tokenizer_factory
-from .hlapi.utils import (ContextManager, GenerationOutput, SamplingConfig,
+from .hlapi.utils import (ContextManager, GenerationOutput, SamplingParams,
                           print_traceback_on_error)
 
 
@@ -48,10 +47,8 @@ class GenerationRequest:
         ids_or_prompt: Union[torch.Tensor, np.ndarray, list, str],
         streaming: bool = True,
         tokenizer: Optional[TokenizerBase] = None,
-        sampling_config: Optional[SamplingConfig] = None,
-        output_config: Optional[tllme.OutputConfig] = None,
-        bad_words: Optional[List[List[int]]] = None,
-        stop_words: Optional[List[List[int]]] = None,
+        sampling_params: Optional[Union[SamplingParams,
+                                        List[SamplingParams]]] = None,
     ):
         if isinstance(ids_or_prompt, str):
             assert tokenizer is not None, "GenerationRequest constructor with str prompt requires a tokenizer argument"
@@ -73,10 +70,7 @@ class GenerationRequest:
 
         self.tokenizer = tokenizer
         self.streaming = streaming
-        self.sampling_config = sampling_config or SamplingConfig()
-        self.output_config = output_config or OutputConfig()
-        self.stop_words = stop_words if stop_words is not None else []
-        self.bad_words = bad_words if bad_words is not None else []
+        self.sampling_params = sampling_params or SamplingParams()
 
         self.id = -1
 
@@ -86,24 +80,25 @@ class GenerationRequest:
 
     def as_executor_request(self) -> tllme.Request:
         # Request
+        # TODO: Should we unify the pad_id/end_id logic?
         end_id = self.tokenizer.eos_token_id if self.tokenizer is not None else None
         pad_id = self.tokenizer.pad_token_id if self.tokenizer is not None else None
         if end_id is None:
-            end_id = self.sampling_config.end_id
+            end_id = self.sampling_params.end_id
         pad_id = end_id if pad_id is None else pad_id
 
         request_kwargs = {
             "input_token_ids": self.input_ids.squeeze().tolist(),
-            "max_new_tokens": self.sampling_config.max_new_tokens or 32,
+            "max_new_tokens": self.sampling_params.max_new_tokens or 32,
             "streaming": self.streaming,
-            "sampling_config": self.sampling_config,
+            "sampling_config": self.sampling_params._get_sampling_config(),
             "end_id": end_id,
             "pad_id": pad_id,
-            "output_config": self.output_config,
+            "output_config": self.sampling_params._get_output_config(),
             # The following options in the Executor API are not yet exposed by the HLAPI:
             # https://jirasw.nvidia.com/browse/TRTLLM-489
-            "bad_words": self.bad_words,
-            "stop_words": self.stop_words,
+            "bad_words": self.sampling_params.bad_words or [],
+            "stop_words": self.sampling_params.stop_words or [],
             "embedding_bias": None,  #TODO
             "external_draft_tokens_config": None,  #TODO
             "prompt_tuning_config": None,  #TODO
@@ -133,7 +128,7 @@ class GenerationResult(GenerationOutput):
             self.queue = Queue()
             self.aqueue = None
 
-        beam_width = generation_request.sampling_config.beam_width
+        beam_width = generation_request.sampling_params.beam_width
 
         self.beam_search_enabled = beam_width > 1
         self._token_ids = [[] for _ in range(beam_width)]
@@ -264,10 +259,8 @@ class GenerationExecutor(ABC):
         self,
         prompt: Union[str, List[int], List[str], List[List[int]]],
         streaming: bool,
-        sampling_config: Union[SamplingConfig, List[SamplingConfig]],
-        output_config: Optional[tllme.OutputConfig] = None,
-        bad_words: Optional[List[List[int]]] = None,
-        stop_words: Optional[List[List[int]]] = None,
+        sampling_params: Optional[Union[SamplingParams,
+                                        List[SamplingParams]]] = None,
     ) -> Union[GenerationResult, List[GenerationResult]]:
         unbatched = isinstance(prompt, str) or (isinstance(prompt, list)
                                                 and isinstance(prompt[0], int))
@@ -275,50 +268,36 @@ class GenerationExecutor(ABC):
             prompt, str) or (not unbatched and isinstance(prompt[0], str))
         tokenizer = self.tokenizer if string_input else None
 
-        stop_words = stop_words if stop_words is not None else []
-        bad_words = bad_words if bad_words is not None else []
-
         if unbatched:
             results = self.submit(
                 GenerationRequest(prompt,
                                   streaming,
                                   tokenizer,
-                                  sampling_config=sampling_config,
-                                  output_config=output_config,
-                                  stop_words=stop_words,
-                                  bad_words=bad_words))
+                                  sampling_params=sampling_params))
         else:
-            sampling_config = [sampling_config] * len(prompt) if not isinstance(
-                sampling_config, list) else sampling_config
+            sampling_params = [sampling_params] * len(prompt) if not isinstance(
+                sampling_params, list) else sampling_params
             results = []
             for idx, p in enumerate(prompt):
                 results.append(
                     self.submit(
-                        GenerationRequest(p,
-                                          streaming,
-                                          tokenizer,
-                                          sampling_config=sampling_config[idx],
-                                          output_config=output_config,
-                                          stop_words=stop_words,
-                                          bad_words=bad_words)))
+                        GenerationRequest(
+                            p,
+                            streaming,
+                            tokenizer,
+                            sampling_params=sampling_params[idx])))
         return results
 
     def generate(
         self,
         prompt: Union[str, List[int], List[str], List[List[int]]],
         streaming: bool = False,
-        sampling_config: Optional[Union[SamplingConfig,
-                                        List[SamplingConfig]]] = None,
-        output_config: Optional[tllme.OutputConfig] = None,
-        bad_words: Optional[List[List[int]]] = None,
-        stop_words: Optional[List[List[int]]] = None,
+        sampling_params: Optional[Union[SamplingParams,
+                                        List[SamplingParams]]] = None,
     ) -> Union[GenerationResult, List[GenerationResult]]:
         futures = self.generate_async(prompt,
                                       streaming=streaming,
-                                      sampling_config=sampling_config,
-                                      output_config=output_config,
-                                      bad_words=bad_words,
-                                      stop_words=stop_words)
+                                      sampling_params=sampling_params)
         if isinstance(futures, GenerationRequest):
             futures.result()
         else:
@@ -342,7 +321,6 @@ class GenerationExecutor(ABC):
     def create(
         engine_dir: Path,
         tokenizer: Union[str, Path, TokenizerBase],
-        max_beam_width: int = 1,
         executor_type: tllm.TrtGptModelType = tllm.TrtGptModelType.
         InflightFusedBatching,
         scheduler_config: tllme.SchedulerConfig = tllme.SchedulerConfig(
@@ -367,7 +345,6 @@ class GenerationExecutor(ABC):
         worker_kwargs = {
             "engine_dir": engine_dir,
             "tokenizer": tokenizer,
-            "max_beam_width": max_beam_width,
             "executor_type": executor_type,
             "scheduler_config": scheduler_config,
             "executor_config": executor_config,
@@ -396,7 +373,6 @@ class ExecutorBindingsWorker(GenerationExecutor):
         self,
         engine_dir: Path,
         tokenizer: Union[str, Path, TokenizerBase, None],
-        max_beam_width: int = 1,
         executor_type: tllm.TrtGptModelType = tllm.TrtGptModelType.
         InflightFusedBatching,
         scheduler_config: tllme.SchedulerConfig = tllme.SchedulerConfig(
@@ -416,7 +392,8 @@ class ExecutorBindingsWorker(GenerationExecutor):
 
         # Convert config to Executor config.
         config = tllme.ExecutorConfig(
-            max_beam_width,
+            max_beam_width=executor_config.max_beam_width
+            if executor_config.max_beam_width else 1,
             batching_type=self.convert_executor_type(executor_type),
             scheduler_config=scheduler_config)
         # Translate additional options from TrtGptModelOptionalParams
@@ -657,7 +634,6 @@ class ExecutorBindingsProxy(GenerationExecutor):
         request_queue_addr: Tuple[str, int, bytes],
         request_id_queue_addr: Tuple[str, int, bytes],
         result_queue_addr: Tuple[str, int, bytes],
-        max_beam_width: int = 1,
         executor_type: tllm.TrtGptModelType = tllm.TrtGptModelType.
         InflightFusedBatching,
         scheduler_config: tllme.SchedulerConfig = tllme.SchedulerConfig(
@@ -679,8 +655,8 @@ class ExecutorBindingsProxy(GenerationExecutor):
         init_ok = True
         try:
             executor = ExecutorBindingsWorker(engine_dir, tokenizer,
-                                              max_beam_width, executor_type,
-                                              scheduler_config, executor_config)
+                                              executor_type, scheduler_config,
+                                              executor_config)
         except Exception as e:
             init_ok = False
             raise e

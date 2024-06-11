@@ -53,8 +53,11 @@ struct HopperGroupedGemmInput
 
     template <class T>
     constexpr static bool IsFP8_v = std::is_same_v<T, __nv_fp8_e4m3> || std::is_same_v<T, __nv_fp8_e5m2>;
+
+    // Although the user may be using half or bfloat for the unquantized FP8 type,
+    // we just pick one so we don't need to double our template count to distinguish the cases
     template <class T>
-    using OutputTypeAdaptor_t = std::conditional_t<IsFP8_v<T>, float, T>;
+    using OutputTypeAdaptor_t = std::conditional_t<IsFP8_v<T>, nv_bfloat16, T>;
 
     using ProblemShape = cutlass::gemm::GroupProblemShape<cute::Shape<int64_t, int64_t, int64_t>>;
 

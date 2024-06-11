@@ -63,6 +63,30 @@ __global__ void quantizedKernel(char4* dst, half2 const* src, const int64_t size
     }
 }
 
+#ifdef ENABLE_BF16
+__global__ void quantizedKernel(char4* dst, __nv_bfloat162 const* src, const int64_t sizeDiv4, float const* scalePtr)
+{
+    for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < sizeDiv4; idx += blockDim.x * gridDim.x)
+    {
+        float const scale = __ldg(scalePtr);
+        char4 tmp;
+        int srcId = idx << 1;
+
+        const uint2 h2 = __ldg(reinterpret_cast<uint2 const*>(src + srcId));
+
+        const __nv_bfloat162 bfloat162Tmp = reinterpret_cast<__nv_bfloat162 const&>(h2.x);
+        const __nv_bfloat162 bfloat162Tmp2 = reinterpret_cast<__nv_bfloat162 const&>(h2.y);
+
+        tmp.x = cuda_cast<int8_t>(cuda_cast<float>(bfloat162Tmp.x) * scale);
+        tmp.y = cuda_cast<int8_t>(cuda_cast<float>(bfloat162Tmp.y) * scale);
+        tmp.z = cuda_cast<int8_t>(cuda_cast<float>(bfloat162Tmp2.x) * scale);
+        tmp.w = cuda_cast<int8_t>(cuda_cast<float>(bfloat162Tmp2.y) * scale);
+
+        dst[idx] = tmp;
+    }
+}
+#endif
+
 template <typename T>
 void invokeQuantization(
     int8_t* dst, T const* src, const int64_t size, float const* scalePtr, cudaStream_t stream, int maxGridSize)
@@ -81,6 +105,12 @@ void invokeQuantization(
     {
         quantizedKernel<<<grid, block, 0, stream>>>((char4*) dst, (half2 const*) src, size / 4, scalePtr);
     }
+#ifdef ENABLE_BF16
+    else if (std::is_same_v<T, __nv_bfloat16>)
+    {
+        quantizedKernel<<<grid, block, 0, stream>>>((char4*) dst, (__nv_bfloat162 const*) src, size / 4, scalePtr);
+    }
+#endif
 }
 
 template void invokeQuantization<float>(
@@ -88,6 +118,11 @@ template void invokeQuantization<float>(
 
 template void invokeQuantization<half>(
     int8_t* dst, half const* src, const int64_t size, float const* scalePtr, cudaStream_t stream, int maxGridSize);
+
+#ifdef ENABLE_BF16
+template void invokeQuantization<__nv_bfloat16>(int8_t* dst, __nv_bfloat16 const* src, const int64_t size,
+    float const* scalePtr, cudaStream_t stream, int maxGridSize);
+#endif
 
 template <typename T>
 __global__ void perTokenQuantization(

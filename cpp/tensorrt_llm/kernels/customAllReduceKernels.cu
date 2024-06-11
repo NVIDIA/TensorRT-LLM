@@ -182,6 +182,304 @@ __inline__ __device__ void block_barrier(uint32_t** signals, uint32_t const flag
     __syncthreads();
 }
 
+namespace reduce_fusion
+{
+namespace details
+{
+static constexpr int kBytesPerAccess = 16;
+static constexpr int kWarpSize = 32;
+static constexpr int kMaxCtaSize = 1024;
+}; // namespace details
+
+inline __device__ float warp_reduce_sum(float val)
+{
+    val += __shfl_xor_sync(~0, val, 16);
+    val += __shfl_xor_sync(~0, val, 8);
+    val += __shfl_xor_sync(~0, val, 4);
+    val += __shfl_xor_sync(~0, val, 2);
+    val += __shfl_xor_sync(~0, val, 1);
+    return val;
+}
+
+inline __device__ float block_reduce_sum(float val)
+{
+    __shared__ float smem[details::kWarpSize];
+    int lane_id = threadIdx.x % details::kWarpSize, warp_id = threadIdx.x / details::kWarpSize,
+        warp_num = blockDim.x / details::kWarpSize;
+    val = warp_reduce_sum(val);
+    if (lane_id == 0)
+    {
+        smem[warp_id] = val;
+    }
+    __syncthreads();
+    val = lane_id < warp_num ? smem[lane_id] : 0.f;
+    val = warp_reduce_sum(val);
+    return val;
+}
+
+template <typename T, typename PackedStruct>
+inline __device__ float accumulate(float acc, PackedStruct& vec)
+{
+    static constexpr int kLoopNum = sizeof(PackedStruct) / sizeof(T);
+#pragma unroll
+    for (int i = 0; i < kLoopNum; ++i)
+    {
+        float v = static_cast<float>(reinterpret_cast<T*>(vec.unpacked)[i]);
+        acc += v * v;
+    }
+    return acc;
+}
+
+template <typename T, bool Affine, typename PackedStruct>
+inline __device__ int4 rms_norm(float denom, PackedStruct& vec, PackedStruct& weight)
+{
+    static constexpr int kLoopNum = sizeof(PackedStruct) / sizeof(T);
+    PackedStruct ret;
+#pragma unroll
+    for (int i = 0; i < kLoopNum; ++i)
+    {
+        float v1 = static_cast<float>(reinterpret_cast<T*>(vec.unpacked)[i]);
+        if constexpr (Affine)
+        {
+            float v2 = static_cast<float>(reinterpret_cast<T*>(weight.unpacked)[i]);
+            reinterpret_cast<T*>(ret.unpacked)[i] = static_cast<T>(__fdividef(v1, denom) * v2);
+        }
+        else
+        {
+            reinterpret_cast<T*>(ret.unpacked)[i] = static_cast<T>(__fdividef(v1, denom));
+        }
+    }
+    return ret.packed;
+}
+
+template <typename T, bool Bias = false, bool Residual = false, bool Affine = false, bool UseSmem = false>
+__global__ void rms_norm_kernel(AllReduceParams params)
+{
+    static constexpr int kPackedSize = details::kBytesPerAccess / sizeof(T);
+    using PackedStruct = typename PackedOn16Bytes<T>::Type;
+
+    extern __shared__ uint8_t smem_ptr[];
+    T* smem = reinterpret_cast<T*>(smem_ptr);
+
+    int bid = blockIdx.x, tid = threadIdx.x;
+
+    T const* bias_buffer = reinterpret_cast<T const*>(params.fusion_params.bias_buffer);
+    T const* residual_buffer = reinterpret_cast<T const*>(params.fusion_params.residual_buffer);
+    T const* weight_buffer = reinterpret_cast<T const*>(params.fusion_params.weight_buffer);
+    T* local_final_output_buffer = reinterpret_cast<T*>(params.local_output_buffer_ptr);
+    T* intermediate_buffer = reinterpret_cast<T*>(params.fusion_params.intermediate_buffer);
+
+    int block_offset = bid * params.fusion_params.hidden_size;
+    int thread_offset = tid * kPackedSize;
+
+    if constexpr (Residual)
+    {
+        residual_buffer += block_offset;
+    }
+    local_final_output_buffer += block_offset;
+    intermediate_buffer += block_offset;
+
+    PackedStruct inter_vec, weight_vec;
+    float acc = 0.f;
+    for (int offset = thread_offset; offset < params.fusion_params.hidden_size; offset += blockDim.x * kPackedSize)
+    {
+        inter_vec.packed = *reinterpret_cast<int4 const*>(intermediate_buffer + offset);
+        if constexpr (Bias)
+        {
+            PackedStruct bias_vec;
+            bias_vec.packed = *reinterpret_cast<int4 const*>(bias_buffer + offset);
+            inter_vec.packed = add128b(inter_vec, bias_vec);
+        }
+        if constexpr (Residual)
+        {
+            PackedStruct residual_vec;
+            residual_vec.packed = *reinterpret_cast<int4 const*>(residual_buffer + offset);
+            inter_vec.packed = add128b(inter_vec, residual_vec);
+            *reinterpret_cast<int4*>(intermediate_buffer + offset) = inter_vec.packed;
+        }
+        acc = accumulate<T>(acc, inter_vec);
+        if constexpr (UseSmem)
+        {
+            *reinterpret_cast<int4*>(&smem[offset]) = inter_vec.packed;
+        }
+    }
+    acc = block_reduce_sum(acc);
+    float denom = __fsqrt_rn(__fdividef(acc, params.fusion_params.hidden_size) + params.fusion_params.eps);
+    for (int offset = thread_offset; offset < params.fusion_params.hidden_size; offset += blockDim.x * kPackedSize)
+    {
+        if constexpr (UseSmem)
+        {
+            inter_vec.packed = *reinterpret_cast<int4 const*>(&smem[offset]);
+        }
+        if constexpr (Affine)
+        {
+            weight_vec.packed = *reinterpret_cast<int4 const*>(weight_buffer + offset);
+        }
+        inter_vec.packed = rms_norm<T, Affine>(denom, inter_vec, weight_vec);
+        *reinterpret_cast<int4*>(&local_final_output_buffer[offset]) = inter_vec.packed;
+    }
+}
+
+template <typename T, bool Bias = false, bool Residual = false, bool Affine = false>
+void rms_norm_kernel_launcher(AllReduceParams params, cudaStream_t stream)
+{
+    static constexpr int kPackedSize = details::kBytesPerAccess / sizeof(T);
+    TLLM_CHECK(params.fusion_params.hidden_size % kPackedSize == 0);
+    int need_threads = params.fusion_params.hidden_size / kPackedSize;
+    int cta_size;
+    if (need_threads <= details::kMaxCtaSize)
+    {
+        cta_size = (need_threads + details::kWarpSize - 1) / details::kWarpSize * details::kWarpSize;
+    }
+    else
+    {
+        cta_size = details::kMaxCtaSize;
+    }
+    int cta_num = params.elts_total / params.fusion_params.hidden_size;
+    int smem_size = 0;
+    if (cta_size * details::kBytesPerAccess / sizeof(T) < params.fusion_params.hidden_size)
+    {
+        smem_size = params.fusion_params.hidden_size * sizeof(T);
+        rms_norm_kernel<T, Bias, Residual, Affine, true><<<cta_num, cta_size, smem_size, stream>>>(params);
+    }
+    else
+    {
+        rms_norm_kernel<T, Bias, Residual, Affine, false><<<cta_num, cta_size, smem_size, stream>>>(params);
+    }
+}
+
+template <typename T, int RanksPerNode, bool Bias = false, bool Affine = false, bool UseSmem = false>
+static __global__ void __launch_bounds__(1024, 1) one_shot_all_reduce_norm_kernel(AllReduceParams params)
+{
+    static constexpr int kPackedSize = details::kBytesPerAccess / sizeof(T);
+    using PackedStruct = typename PackedOn16Bytes<T>::Type;
+
+    extern __shared__ uint8_t smem_ptr[];
+    T* smem = reinterpret_cast<T*>(smem_ptr);
+
+    int bid = blockIdx.x, tid = threadIdx.x;
+    int norm_num = params.elts_total / params.fusion_params.hidden_size;
+    int norm_per_block = (norm_num + gridDim.x - 1) / gridDim.x;
+    int norm_this_block = std::min(norm_per_block, norm_num - bid * norm_per_block);
+
+    T const* local_input_buffer = reinterpret_cast<T const*>(params.local_input_buffer_ptr);
+    T const* bias_buffer = reinterpret_cast<T const*>(params.fusion_params.bias_buffer);
+    T const* residual_buffer = reinterpret_cast<T const*>(params.fusion_params.residual_buffer);
+    T const* weight_buffer = reinterpret_cast<T const*>(params.fusion_params.weight_buffer);
+    T* local_shared_buffer = reinterpret_cast<T*>(params.peer_comm_buffer_ptrs[params.local_rank]);
+    T* local_final_output_buffer = reinterpret_cast<T*>(params.local_output_buffer_ptr);
+    T* intermediate_buffer = reinterpret_cast<T*>(params.fusion_params.intermediate_buffer);
+
+    int block_offset = bid * norm_per_block * params.fusion_params.hidden_size;
+    int thread_offset = tid * kPackedSize;
+
+    local_input_buffer += block_offset;
+    residual_buffer += block_offset;
+    local_shared_buffer += block_offset;
+    local_final_output_buffer += block_offset;
+    intermediate_buffer += block_offset;
+
+    T* buffers[RanksPerNode];
+#pragma unroll
+    for (int ii = 0; ii < RanksPerNode; ++ii)
+    {
+        int rank = (params.local_rank + ii) % RanksPerNode;
+        buffers[ii] = reinterpret_cast<T*>(params.peer_comm_buffer_ptrs[rank]);
+    }
+    for (int offset = thread_offset; offset < norm_this_block * params.fusion_params.hidden_size;
+         offset += blockDim.x * kPackedSize)
+    {
+        *reinterpret_cast<int4*>(&local_shared_buffer[offset])
+            = *reinterpret_cast<int4 const*>(&local_input_buffer[offset]);
+    }
+    block_barrier(
+        params.peer_barrier_ptrs_in, params.barrier_flag, params.local_rank, RanksPerNode, tid, bid, gridDim.x);
+    for (int norm_idx = 0; norm_idx < norm_this_block; ++norm_idx)
+    {
+        int norm_offset = norm_idx * params.fusion_params.hidden_size;
+        float acc = 0.f;
+        PackedStruct sum_vec, weight_vec, bias_vec, residual_vec;
+        for (int offset = thread_offset; offset < params.fusion_params.hidden_size; offset += blockDim.x * kPackedSize)
+        {
+            PackedStruct vals[RanksPerNode];
+            sum_vec.packed = {0, 0, 0, 0};
+            if constexpr (Bias)
+            {
+                bias_vec.packed = *reinterpret_cast<int4 const*>(&bias_buffer[offset]);
+            }
+            residual_vec.packed = *reinterpret_cast<int4 const*>(&residual_buffer[norm_offset + offset]);
+#pragma unroll
+            for (int ii = 0; ii < RanksPerNode; ++ii)
+            {
+                vals[ii].packed = *reinterpret_cast<int4 const*>(&buffers[ii][block_offset + norm_offset + offset]);
+            }
+#pragma unroll
+            for (int ii = 0; ii < RanksPerNode; ++ii)
+            {
+                sum_vec.packed = add128b(sum_vec, vals[ii]);
+            }
+            if constexpr (Bias)
+            {
+                sum_vec.packed = add128b(sum_vec, bias_vec);
+            }
+            sum_vec.packed = add128b(sum_vec, residual_vec);
+            *reinterpret_cast<int4*>(&intermediate_buffer[norm_offset + offset]) = sum_vec.packed;
+            acc = accumulate<T>(acc, sum_vec);
+            if constexpr (UseSmem)
+            {
+                *reinterpret_cast<int4*>(&smem[offset]) = sum_vec.packed;
+            }
+        }
+        acc = block_reduce_sum(acc);
+        float denom = __fsqrt_rn(__fdividef(acc, params.fusion_params.hidden_size) + params.fusion_params.eps);
+        for (int offset = thread_offset; offset < params.fusion_params.hidden_size; offset += blockDim.x * kPackedSize)
+        {
+            if constexpr (UseSmem)
+            {
+                sum_vec.packed = *reinterpret_cast<int4 const*>(&smem[offset]);
+            }
+            if constexpr (Affine)
+            {
+                weight_vec.packed = *reinterpret_cast<int4 const*>(weight_buffer + offset);
+            }
+            sum_vec.packed = rms_norm<T, Affine>(denom, sum_vec, weight_vec);
+            *reinterpret_cast<int4*>(&local_final_output_buffer[norm_offset + offset]) = sum_vec.packed;
+        }
+    }
+}
+
+template <typename T, int RanksPerNode, bool Bias, bool Affine>
+void one_shot_all_reduce_norm_kernel_launcher(AllReduceParams params, cudaStream_t stream)
+{
+    static constexpr int kPackedSize = details::kBytesPerAccess / sizeof(T);
+    TLLM_CHECK(params.fusion_params.hidden_size % kPackedSize == 0);
+    int need_threads = params.fusion_params.hidden_size / kPackedSize;
+    int cta_size;
+    if (need_threads <= details::kMaxCtaSize)
+    {
+        cta_size = (need_threads + details::kWarpSize - 1) / details::kWarpSize * details::kWarpSize;
+    }
+    else
+    {
+        cta_size = details::kMaxCtaSize;
+    }
+    int norm_num = params.elts_total / params.fusion_params.hidden_size;
+    int cta_num = std::min(norm_num, static_cast<int>(MAX_ALL_REDUCE_BLOCKS));
+    int smem_size = 0;
+    if (cta_size * kPackedSize < params.fusion_params.hidden_size)
+    {
+        smem_size = params.fusion_params.hidden_size * sizeof(T);
+        one_shot_all_reduce_norm_kernel<T, RanksPerNode, Bias, Affine, true>
+            <<<cta_num, cta_size, smem_size, stream>>>(params);
+    }
+    else
+    {
+        one_shot_all_reduce_norm_kernel<T, RanksPerNode, Bias, Affine, false>
+            <<<cta_num, cta_size, smem_size, stream>>>(params);
+    }
+}
+}; // namespace reduce_fusion
+
 template <typename T, int RANKS_PER_NODE, bool COPY_INPUT = true, bool PUSH_MODE = false>
 static __global__ void oneShotAllReduceKernel(AllReduceParams params)
 {
@@ -295,13 +593,13 @@ static __global__ void oneShotAllReduceKernel(AllReduceParams params)
             int ii = (rank + RANKS_PER_NODE - params.local_rank) % RANKS_PER_NODE;
             sums.packed = add128b(sums, vals[ii]);
         }
-
         // Store to the destination buffer.
         *reinterpret_cast<int4*>(&local_output_buffer[iter_offset]) = sums.packed;
     }
 }
 
-template <typename T, int RANKS_PER_NODE, bool COPY_INPUT = true, bool PUSH_MODE = false>
+template <typename T, int RANKS_PER_NODE, bool COPY_INPUT = true, bool PUSH_MODE = false, bool Bias = false,
+    bool Residual = false>
 static __global__ void twoShotAllReduceKernel(AllReduceParams params)
 {
     // Suppose that two GPUs participate in the AR exchange, and we start two blocks.
@@ -462,17 +760,39 @@ static __global__ void twoShotAllReduceKernel(AllReduceParams params)
             {
                 continue;
             }
-
+            PackedType sums, residual_vec, bias_vec;
+            if constexpr (Bias)
+            {
+                bias_vec.packed
+                    = *reinterpret_cast<int4 const*>(reinterpret_cast<T const*>(params.fusion_params.bias_buffer)
+                        + offset_rank % params.fusion_params.hidden_size);
+            }
+            if constexpr (Residual)
+            {
+                residual_vec.packed = *reinterpret_cast<int4 const*>(
+                    reinterpret_cast<T const*>(params.fusion_params.residual_buffer) + offset_rank);
+            }
             if constexpr (PUSH_MODE)
             {
                 *reinterpret_cast<int4*>(&local_output_buffer[offset_rank])
                     = *reinterpret_cast<int4*>(&buffers[ii][local_offset]);
+                sums.packed = *reinterpret_cast<int4*>(&buffers[ii][local_offset]);
             }
             else
             {
                 *reinterpret_cast<int4*>(&local_output_buffer[offset_rank])
                     = *reinterpret_cast<int4*>(&buffers[ii][offset_rank]);
+                sums.packed = *reinterpret_cast<int4*>(&buffers[ii][offset_rank]);
             }
+            if constexpr (Bias)
+            {
+                sums.packed = add128b(sums, bias_vec);
+            }
+            if constexpr (Residual)
+            {
+                sums.packed = add128b(sums, residual_vec);
+            }
+            *reinterpret_cast<int4*>(&local_output_buffer[offset_rank]) = sums.packed;
         }
     }
 }
@@ -485,7 +805,7 @@ bool configurationSupported(AllReduceStrategyType algo, size_t msg_size, size_t 
     return supported_algo && (msg_size % msg_align == 0);
 }
 
-std::tuple<int, int> kernelLaunchConfig(AllReduceStrategyType algo, AllReduceParams& param, size_t elts_per_thread)
+std::tuple<int, int> kernelLaunchConfig(AllReduceStrategyType algo, AllReduceParams& params, size_t elts_per_thread)
 {
     int blocks_per_grid = 1, threads_per_block = DEFAULT_BLOCK_SIZE;
 
@@ -493,17 +813,17 @@ std::tuple<int, int> kernelLaunchConfig(AllReduceStrategyType algo, AllReducePar
     {
     case AllReduceStrategyType::ONESHOT:
     {
-        TLLM_CHECK(param.elts_total % elts_per_thread == 0);
-        size_t const total_threads = roundUp(param.elts_total / elts_per_thread, WARP_SIZE);
+        TLLM_CHECK(params.elts_total % elts_per_thread == 0);
+        size_t const total_threads = roundUp(params.elts_total / elts_per_thread, WARP_SIZE);
         threads_per_block = std::min(DEFAULT_BLOCK_SIZE, total_threads);
         blocks_per_grid = std::min(static_cast<size_t>(MAX_ALL_REDUCE_BLOCKS), divUp(total_threads, threads_per_block));
-        param.elts_per_block = roundUp(divUp(param.elts_total, blocks_per_grid), elts_per_thread);
+        params.elts_per_block = roundUp(divUp(params.elts_total, blocks_per_grid), elts_per_thread);
         break;
     }
     case AllReduceStrategyType::TWOSHOT:
     {
-        TLLM_CHECK(param.elts_total % (elts_per_thread * param.ranks_per_node) == 0);
-        size_t const total_threads = roundUp(param.elts_total / (elts_per_thread * param.ranks_per_node), WARP_SIZE);
+        TLLM_CHECK(params.elts_total % (elts_per_thread * params.ranks_per_node) == 0);
+        size_t const total_threads = roundUp(params.elts_total / (elts_per_thread * params.ranks_per_node), WARP_SIZE);
 
         /*
         threads_per_block = std::min(DEFAULT_BLOCK_SIZE, total_threads);
@@ -527,9 +847,9 @@ std::tuple<int, int> kernelLaunchConfig(AllReduceStrategyType algo, AllReducePar
             }
             blocks_per_grid /= iter_factor;
         }
-        param.elts_per_rank = param.elts_total / param.ranks_per_node;
-        param.rank_offset = param.local_rank * param.elts_per_rank;
-        param.elts_per_block = roundUp(divUp(param.elts_per_rank, blocks_per_grid), elts_per_thread);
+        params.elts_per_rank = params.elts_total / params.ranks_per_node;
+        params.rank_offset = params.local_rank * params.elts_per_rank;
+        params.elts_per_block = roundUp(divUp(params.elts_per_rank, blocks_per_grid), elts_per_thread);
         break;
     }
     default: TLLM_THROW("Algorithm not supported here.");
@@ -538,72 +858,140 @@ std::tuple<int, int> kernelLaunchConfig(AllReduceStrategyType algo, AllReducePar
     return std::make_tuple(blocks_per_grid, threads_per_block);
 }
 
-template <typename T, int RANKS_PER_NODE, bool PUSH_MODE = false, bool USE_MEMCPY = false>
-void AllReduceDispatchMemcpy(
-    AllReduceStrategyType algo, AllReduceStrategyConfig config, AllReduceParams& param, cudaStream_t stream)
+template <typename T, int RANKS_PER_NODE, bool PUSH_MODE = false, bool USE_MEMCPY = false, bool Bias = false,
+    bool Affine = false>
+void AllReduceNormKernelLaunch(AllReduceStrategyType algo, AllReduceStrategyConfig config, AllReduceFusionOp fusionOp,
+    AllReduceParams& params, cudaStream_t stream)
 {
+    TLLM_CHECK(fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM);
+    if (algo == AllReduceStrategyType::ONESHOT)
+    {
+        reduce_fusion::one_shot_all_reduce_norm_kernel_launcher<T, RANKS_PER_NODE, Bias, Affine>(params, stream);
+    }
+    else
+    {
+        TLLM_CHECK_WITH_INFO(!(USE_MEMCPY && PUSH_MODE), "Memcpy cannot be used with PUSH_MODE.");
+        size_t elts_per_thread = 16 / sizeof(T);
+        auto [blocks_per_grid, threads_per_block] = kernelLaunchConfig(algo, params, elts_per_thread);
+        if (USE_MEMCPY)
+        {
+            cudaMemcpyAsync(params.peer_comm_buffer_ptrs[params.local_rank], params.local_input_buffer_ptr,
+                params.elts_total * sizeof(T), cudaMemcpyDeviceToDevice, stream);
+        }
+        auto output_ptr = params.local_output_buffer_ptr;
+        params.local_output_buffer_ptr = params.fusion_params.intermediate_buffer;
+        twoShotAllReduceKernel<T, RANKS_PER_NODE, !USE_MEMCPY, PUSH_MODE, Bias, true>
+            <<<blocks_per_grid, threads_per_block, 0, stream>>>(params);
+        params.local_output_buffer_ptr = output_ptr;
+        reduce_fusion::rms_norm_kernel_launcher<T, false, false, Affine>(params, stream);
+    }
+}
+
+template <typename T, int RANKS_PER_NODE, bool PUSH_MODE = false, bool USE_MEMCPY = false>
+void AllReduceNormDispatch(AllReduceStrategyType algo, AllReduceStrategyConfig config, AllReduceFusionOp fusionOp,
+    AllReduceParams& params, cudaStream_t stream)
+{
+    if (params.fusion_params.bias_buffer && params.fusion_params.weight_buffer)
+    {
+        AllReduceNormKernelLaunch<T, RANKS_PER_NODE, PUSH_MODE, USE_MEMCPY, true, true>(
+            algo, config, fusionOp, params, stream);
+    }
+    else if (params.fusion_params.bias_buffer && !params.fusion_params.weight_buffer)
+    {
+        AllReduceNormKernelLaunch<T, RANKS_PER_NODE, PUSH_MODE, USE_MEMCPY, true, false>(
+            algo, config, fusionOp, params, stream);
+    }
+    else if (!params.fusion_params.bias_buffer && params.fusion_params.weight_buffer)
+    {
+        AllReduceNormKernelLaunch<T, RANKS_PER_NODE, PUSH_MODE, USE_MEMCPY, false, true>(
+            algo, config, fusionOp, params, stream);
+    }
+    else
+    {
+        AllReduceNormKernelLaunch<T, RANKS_PER_NODE, PUSH_MODE, USE_MEMCPY, false, false>(
+            algo, config, fusionOp, params, stream);
+    }
+}
+
+template <typename T, int RANKS_PER_NODE, bool PUSH_MODE = false, bool USE_MEMCPY = false>
+void AllReduceDispatch(AllReduceStrategyType algo, AllReduceStrategyConfig config, AllReduceFusionOp fusionOp,
+    AllReduceParams& params, cudaStream_t stream)
+{
+    TLLM_CHECK(fusionOp == AllReduceFusionOp::NONE);
     TLLM_CHECK_WITH_INFO(!(USE_MEMCPY && PUSH_MODE), "Memcpy cannot be used with PUSH_MODE.");
     size_t elts_per_thread = 16 / sizeof(T);
-    auto [blocks_per_grid, threads_per_block] = kernelLaunchConfig(algo, param, elts_per_thread);
-
+    auto [blocks_per_grid, threads_per_block] = kernelLaunchConfig(algo, params, elts_per_thread);
     if (USE_MEMCPY)
     {
-        cudaMemcpyAsync(param.peer_comm_buffer_ptrs[param.local_rank], param.local_input_buffer_ptr,
-            param.elts_total * sizeof(T), cudaMemcpyDeviceToDevice, stream);
+        cudaMemcpyAsync(params.peer_comm_buffer_ptrs[params.local_rank], params.local_input_buffer_ptr,
+            params.elts_total * sizeof(T), cudaMemcpyDeviceToDevice, stream);
     }
-
     if (algo == AllReduceStrategyType::ONESHOT)
     {
         oneShotAllReduceKernel<T, RANKS_PER_NODE, !USE_MEMCPY, PUSH_MODE>
-            <<<blocks_per_grid, threads_per_block, 0, stream>>>(param);
+            <<<blocks_per_grid, threads_per_block, 0, stream>>>(params);
     }
     else
     {
         twoShotAllReduceKernel<T, RANKS_PER_NODE, !USE_MEMCPY, PUSH_MODE>
-            <<<blocks_per_grid, threads_per_block, 0, stream>>>(param);
+            <<<blocks_per_grid, threads_per_block, 0, stream>>>(params);
+    }
+}
+
+template <typename T, int RANKS_PER_NODE, bool PUSH_MODE = false, bool USE_MEMCPY = false>
+void AllReduceDispatchMemcpy(AllReduceStrategyType algo, AllReduceStrategyConfig config, AllReduceFusionOp fusionOp,
+    AllReduceParams& params, cudaStream_t stream)
+{
+    if (fusionOp == AllReduceFusionOp::NONE)
+    {
+        AllReduceDispatch<T, RANKS_PER_NODE, PUSH_MODE, USE_MEMCPY>(algo, config, fusionOp, params, stream);
+    }
+    else
+    {
+        AllReduceNormDispatch<T, RANKS_PER_NODE, PUSH_MODE, USE_MEMCPY>(algo, config, fusionOp, params, stream);
     }
 }
 
 template <typename T, int RANKS_PER_NODE, bool PUSH_MODE = false>
-void AllReduceDispatchPushMode(
-    AllReduceStrategyType algo, AllReduceStrategyConfig config, AllReduceParams& param, cudaStream_t stream)
+void AllReduceDispatchPushMode(AllReduceStrategyType algo, AllReduceStrategyConfig config, AllReduceFusionOp fusionOp,
+    AllReduceParams& params, cudaStream_t stream)
 {
     if (static_cast<std::underlying_type_t<AllReduceStrategyConfig>>(config)
         & static_cast<std::underlying_type_t<AllReduceStrategyConfig>>(AllReduceStrategyConfig::USE_MEMCPY))
     {
-        AllReduceDispatchMemcpy<T, RANKS_PER_NODE, PUSH_MODE, true>(algo, config, param, stream);
+        AllReduceDispatchMemcpy<T, RANKS_PER_NODE, PUSH_MODE, true>(algo, config, fusionOp, params, stream);
     }
     else
     {
-        AllReduceDispatchMemcpy<T, RANKS_PER_NODE, PUSH_MODE, false>(algo, config, param, stream);
+        AllReduceDispatchMemcpy<T, RANKS_PER_NODE, PUSH_MODE, false>(algo, config, fusionOp, params, stream);
     }
 }
 
 template <typename T, int RANKS_PER_NODE> //, bool USE_MEMCPY = false, bool PUSH_MODE = false>
-void AllReduceDispatchRanksPerNode(
-    AllReduceStrategyType algo, AllReduceStrategyConfig config, AllReduceParams& param, cudaStream_t stream)
+void AllReduceDispatchRanksPerNode(AllReduceStrategyType algo, AllReduceStrategyConfig config,
+    AllReduceFusionOp fusionOp, AllReduceParams& params, cudaStream_t stream)
 {
     if (static_cast<std::underlying_type_t<AllReduceStrategyConfig>>(config)
         & static_cast<std::underlying_type_t<AllReduceStrategyConfig>>(AllReduceStrategyConfig::PUSH_MODE))
     {
-        AllReduceDispatchPushMode<T, RANKS_PER_NODE, true>(algo, config, param, stream);
+        AllReduceDispatchPushMode<T, RANKS_PER_NODE, true>(algo, config, fusionOp, params, stream);
     }
     else
     {
-        AllReduceDispatchPushMode<T, RANKS_PER_NODE, false>(algo, config, param, stream);
+        AllReduceDispatchPushMode<T, RANKS_PER_NODE, false>(algo, config, fusionOp, params, stream);
     }
 }
 
 template <typename T>
-void AllReduceDispatchType(
-    AllReduceParams& param, AllReduceStrategyType strat, AllReduceStrategyConfig config, cudaStream_t stream)
+void AllReduceDispatchType(AllReduceParams& params, AllReduceStrategyType strat, AllReduceStrategyConfig config,
+    AllReduceFusionOp fusionOp, cudaStream_t stream)
 {
-    switch (param.ranks_per_node)
+    switch (params.ranks_per_node)
     {
-    case 2: AllReduceDispatchRanksPerNode<T, 2>(strat, config, param, stream); break;
-    case 4: AllReduceDispatchRanksPerNode<T, 4>(strat, config, param, stream); break;
-    case 6: AllReduceDispatchRanksPerNode<T, 6>(strat, config, param, stream); break;
-    case 8: AllReduceDispatchRanksPerNode<T, 8>(strat, config, param, stream); break;
+    case 2: AllReduceDispatchRanksPerNode<T, 2>(strat, config, fusionOp, params, stream); break;
+    case 4: AllReduceDispatchRanksPerNode<T, 4>(strat, config, fusionOp, params, stream); break;
+    case 6: AllReduceDispatchRanksPerNode<T, 6>(strat, config, fusionOp, params, stream); break;
+    case 8: AllReduceDispatchRanksPerNode<T, 8>(strat, config, fusionOp, params, stream); break;
     default: TLLM_THROW("Custom all reduce only supported on {2, 4, 6, 8} GPUs per node.");
     }
 }
@@ -638,7 +1026,7 @@ AllReduceParams AllReduceParams::deserialize(int32_t const* buffer, size_t tpSiz
 }
 
 void customAllReduce(kernels::AllReduceParams& params, nvinfer1::DataType dataType, AllReduceStrategyType strat,
-    AllReduceStrategyConfig config, cudaStream_t stream)
+    AllReduceStrategyConfig config, AllReduceFusionOp fusionOp, cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(configurationSupported(strat, params.elts_total, params.ranks_per_node, dataType),
         "Custom all-reduce configuration unsupported");
@@ -647,14 +1035,51 @@ void customAllReduce(kernels::AllReduceParams& params, nvinfer1::DataType dataTy
 
     switch (dataType)
     {
-    case nvinfer1::DataType::kFLOAT: AllReduceDispatchType<float>(params, strat, config, stream); break;
-    case nvinfer1::DataType::kHALF: AllReduceDispatchType<half>(params, strat, config, stream); break;
+    case nvinfer1::DataType::kFLOAT: AllReduceDispatchType<float>(params, strat, config, fusionOp, stream); break;
+    case nvinfer1::DataType::kHALF: AllReduceDispatchType<half>(params, strat, config, fusionOp, stream); break;
 #ifdef ENABLE_BF16
-    case nvinfer1::DataType::kBF16: AllReduceDispatchType<__nv_bfloat16>(params, strat, config, stream); break;
+    case nvinfer1::DataType::kBF16:
+        AllReduceDispatchType<__nv_bfloat16>(params, strat, config, fusionOp, stream);
+        break;
 #endif
     default: TLLM_THROW("Unsupported dataType for customAllReduce");
     }
+    sync_check_cuda_error();
+}
 
+template <typename T>
+void launchResidualRmsNormKernel(kernels::AllReduceParams& params, cudaStream_t stream)
+{
+    if (params.fusion_params.bias_buffer && params.fusion_params.weight_buffer)
+    {
+        reduce_fusion::rms_norm_kernel_launcher<T, true, true, true>(params, stream);
+    }
+    else if (params.fusion_params.bias_buffer && !params.fusion_params.weight_buffer)
+    {
+        reduce_fusion::rms_norm_kernel_launcher<T, true, true, false>(params, stream);
+    }
+    else if (!params.fusion_params.bias_buffer && params.fusion_params.weight_buffer)
+    {
+        reduce_fusion::rms_norm_kernel_launcher<T, false, true, true>(params, stream);
+    }
+    else
+    {
+        reduce_fusion::rms_norm_kernel_launcher<T, false, true, false>(params, stream);
+    }
+}
+
+void residualRmsNorm(kernels::AllReduceParams& params, nvinfer1::DataType dataType, cudaStream_t stream)
+{
+    sync_check_cuda_error();
+    switch (dataType)
+    {
+    case nvinfer1::DataType::kFLOAT: launchResidualRmsNormKernel<float>(params, stream); break;
+    case nvinfer1::DataType::kHALF: launchResidualRmsNormKernel<half>(params, stream); break;
+#ifdef ENABLE_BF16
+    case nvinfer1::DataType::kBF16: launchResidualRmsNormKernel<__nv_bfloat16>(params, stream); break;
+#endif
+    default: TLLM_THROW("Unsupported dataType for customAllReduce");
+    }
     sync_check_cuda_error();
 }
 

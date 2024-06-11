@@ -35,7 +35,8 @@ class Parameter:
     def __init__(self,
                  value: Optional[Union[np.ndarray, torch.Tensor]] = None,
                  shape: Sequence[int] = None,
-                 dtype: Union[str, trt.DataType] = None):
+                 dtype: Union[str, trt.DataType] = None,
+                 is_buffer: bool = False):
         if dtype is None:
             logger.warning(
                 f'Parameter dtype is None, using default dtype: {self._DEFAULT_DTYPE}, it is recommended to always specify dtype explicitly'
@@ -51,6 +52,7 @@ class Parameter:
         else:
             self._shape = value.shape
             self._value = self._regularize_value(value)
+        self.is_buffer = is_buffer
 
     @property
     def shape(self):

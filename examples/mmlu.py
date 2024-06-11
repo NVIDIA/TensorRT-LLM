@@ -55,7 +55,7 @@ from tqdm import tqdm
 from transformers import (AutoModel, AutoModelForCausalLM,
                           AutoModelForSeq2SeqLM, AutoTokenizer,
                           GenerationConfig)
-from utils import load_tokenizer, read_model_name
+from utils import add_common_args, load_tokenizer, read_model_name
 
 import tensorrt_llm
 from tensorrt_llm.runtime import PYTHON_BINDINGS, ModelRunner
@@ -308,8 +308,6 @@ class Pipeline:
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--hf_model_dir", type=str, default=None)
-    parser.add_argument("--engine_dir", type=str, default=None)
     parser.add_argument(
         "--data_dir",
         type=str,
@@ -318,44 +316,16 @@ def parse_args():
               "download https://people.eecs.berkeley.edu/~hendrycks/data.tar"),
     )
     parser.add_argument("--ntrain", type=int, default=5)
-    parser.add_argument(
-        "--data_type",
-        type=str,
-        choices=["fp32", "fp16", "bf16", "float32", "float16", "bfloat16"],
-        default="fp16",
-    )
-    parser.add_argument(
-        "--debug_mode",
-        default=False,
-        action="store_true",
-        help="Whether or not to turn on the debug mode",
-    )
-    parser.add_argument(
-        "--hf_device_map_auto",
-        action="store_true",
-        help=("Use device map 'auto' to load a pretrained HF model. This may "
-              "help to test a large model that cannot fit into a singlue GPU."),
-    )
     parser.add_argument("--max_input_length", type=int, default=2048)
-    parser.add_argument(
-        '--max_attention_window_size',
-        type=int,
-        default=None,
-        help=
-        'The attention window size that controls the sliding window attention / cyclic kv cache behavior'
-    )
-    parser.add_argument(
-        '--tokenizer_dir',
-        default=None,
-        help='tokenizer path; defaults to hf_model_dir if left unspecified')
-    parser.add_argument('--vocab_file')
     parser.add_argument("--test_trt_llm", action="store_true")
     parser.add_argument("--test_hf", action="store_true")
     parser.add_argument('--check_accuracy', action='store_true')
     parser.add_argument('--accuracy_threshold', type=float, default=0.3)
     parser.add_argument('--max_ite', type=int, default=10000000)
+    parser = add_common_args(parser)
 
     args = parser.parse_args()
+
     return args
 
 

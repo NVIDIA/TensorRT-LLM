@@ -48,6 +48,34 @@ enum class AllReduceStrategyConfig : int8_t
     PUSH_MODE = 1 << 1,
 };
 
+enum class AllReduceFusionOp : int8_t
+{
+    NONE = 0,
+    RESIDUAL_RMS_NORM = 1,
+};
+
+struct AllReduceFusionParams
+{
+    AllReduceFusionParams()
+        : bias_buffer(nullptr)
+        , residual_buffer(nullptr)
+        , weight_buffer(nullptr)
+        , intermediate_buffer(nullptr)
+    {
+    }
+
+    // gemm bias
+    void const* bias_buffer;
+    // residuial add
+    void const* residual_buffer;
+    // rms norm
+    int hidden_size;           // equal to normalized_shape
+    void const* weight_buffer; // norm elem-wise affine gamma
+    float eps;
+    // new residual
+    void* intermediate_buffer;
+};
+
 struct AllReduceParams
 {
     size_t elts_total;
@@ -62,12 +90,16 @@ struct AllReduceParams
     void* local_output_buffer_ptr;
     void const* local_input_buffer_ptr;
 
+    AllReduceFusionParams fusion_params;
+
     static AllReduceParams deserialize(int32_t const* buffer, size_t tpSize, size_t tpRank, uint32_t flag_value);
 };
 
 bool configurationSupported(AllReduceStrategyType algo, size_t msg_size, size_t n_ranks, nvinfer1::DataType type);
 
 void customAllReduce(kernels::AllReduceParams& params, nvinfer1::DataType dataType, AllReduceStrategyType strat,
-    AllReduceStrategyConfig config, cudaStream_t stream);
+    AllReduceStrategyConfig config, AllReduceFusionOp fusionOp, cudaStream_t stream);
+
+void residualRmsNorm(kernels::AllReduceParams& params, nvinfer1::DataType dataType, cudaStream_t stream);
 
 } // namespace tensorrt_llm::kernels

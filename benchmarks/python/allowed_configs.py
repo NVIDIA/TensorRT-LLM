@@ -93,6 +93,7 @@ class EncDecBuildConfig:
     builder_opt: Optional[int] = None
     n_mels: Optional[int] = None
     skip_cross_qkv: bool = False
+    use_implicit_relative_attention: Optional[bool] = False
 
     def __post_init__(self) -> None:
         assert self.head_size is not None
@@ -581,6 +582,25 @@ _allowed_configs = {
                     max_batch_size=256,
                     max_input_len=512,
                     max_output_len=200,
+                    builder_opt=None,
+                    remove_input_padding=False,
+                )),
+    "glm_10b":
+    ModelConfig(name="glm_10b",
+                family="glm",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=48,
+                    num_heads=64,
+                    num_kv_heads=64,
+                    hidden_size=4096,
+                    inter_size=16384,
+                    vocab_size=50304,
+                    hidden_act='gelu',
+                    n_positions=1024,
+                    max_batch_size=128,
+                    max_input_len=1024,
+                    max_output_len=256,
                     builder_opt=None,
                     remove_input_padding=False,
                 )),

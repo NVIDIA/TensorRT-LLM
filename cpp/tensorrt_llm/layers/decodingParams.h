@@ -19,6 +19,7 @@
 #include "tensorrt_llm/kernels/beamSearchKernels.h"
 #include <tensorrt_llm/common/tensor.h>
 #include <tensorrt_llm/runtime/common.h>
+#include <tensorrt_llm/runtime/speculativeDecodingModule.h>
 
 #include <optional>
 #include <vector>
@@ -50,14 +51,12 @@ class DecoderDomain
 public:
     DecoderDomain(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 vocabSize,
         std::optional<runtime::SizeType32> vocabSizePadded = std::nullopt,
-        std::optional<runtime::SizeType32> maxTokensPerStep = std::nullopt,
-        std::optional<runtime::SizeType32> maxAcceptedDraftTokensPerStep = std::nullopt)
+        std::shared_ptr<runtime::SpeculativeDecodingModule const> speculativeDecodingModule = nullptr)
         : mBatchSize(batchSize)
         , mBeamWidth(beamWidth)
         , mVocabSize(vocabSize)
         , mVocabSizePadded(vocabSizePadded.value_or(vocabSize))
-        , mMaxTokensPerStep(maxTokensPerStep.value_or(1))
-        , mMaxAcceptedDraftTokensPerStep(maxAcceptedDraftTokensPerStep.value_or(0))
+        , mSpeculativeDecodingModule(speculativeDecodingModule)
     {
     }
 
@@ -81,14 +80,15 @@ public:
         return mVocabSizePadded;
     }
 
-    [[nodiscard]] runtime::SizeType32 getMaxTokensPerStep() const
+    [[nodiscard]] runtime::SizeType32 getMaxDecodingTokens() const
     {
-        return mMaxTokensPerStep;
+        return mSpeculativeDecodingModule ? mSpeculativeDecodingModule->getMaxDecodingTokens() : 1;
     }
 
-    [[nodiscard]] runtime::SizeType32 getMaxAcceptedDraftTokensPerStep() const
+    [[nodiscard]] std::shared_ptr<runtime::SpeculativeDecodingModule const> getSpeculativeDecodingModule() const
     {
-        return mMaxAcceptedDraftTokensPerStep;
+        TLLM_CHECK_WITH_INFO(mSpeculativeDecodingModule, "Speculative decoding module is not set to decoder domain");
+        return mSpeculativeDecodingModule;
     }
 
 private:
@@ -96,8 +96,7 @@ private:
     runtime::SizeType32 mBeamWidth;
     runtime::SizeType32 mVocabSize;
     runtime::SizeType32 mVocabSizePadded;
-    runtime::SizeType32 mMaxTokensPerStep;
-    runtime::SizeType32 mMaxAcceptedDraftTokensPerStep;
+    std::shared_ptr<runtime::SpeculativeDecodingModule const> mSpeculativeDecodingModule;
 };
 
 class BaseSetupParams
@@ -226,16 +225,25 @@ public:
     class MedusaInputs
     {
     public:
-        tc::Tensor medusaCurTokensPerStep;    // [maxBatchSize], optional, on gpu
-        tc::Tensor medusaTargetTokensPerStep; // [maxBatchSize], optional, on gpu
-        tc::Tensor medusaPaths;               // [maxBatchSize, maxDraftTokens + 1, maxAcceptedDraftTokensPerStep + 1]
-                                              // optional, on gpu
-        tc::Tensor medusaTreeIds;             // [maxBatchSize, maxDraftTokens + 1], optional, on gpu
-        std::vector<std::vector<tc::Tensor>> medusaLogits; // [maxBatchSize][maxAcceptedDraftTokensPerStep]
-                                                           // [maxDraftTokens + 1, vocabSizePadded], optional, on gpu
+        tc::Tensor medusaCurTokensPerStep;                 // [maxBatchSize], optional, on gpu
+        tc::Tensor medusaTargetTokensPerStep;              // [maxBatchSize], optional, on gpu
+        tc::Tensor medusaPaths;                            // [maxBatchSize, maxPathLen, maxPathLen]
+                                                           // optional, on gpu
+        tc::Tensor medusaTreeIds;                          // [maxBatchSize, maxDecodingTokens], optional, on gpu
+        std::vector<std::vector<tc::Tensor>> medusaLogits; // [maxBatchSize][maxDraftPathLen]
+                                                           // [maxDecodingTokens, vocabSizePadded], optional, on gpu
+    };
+
+    // Explicit draft tokens inputs
+    // FIXME(nkorobov): this should be ExplicitDraftTokensBuffers?
+    class ExplicitDraftTokensInputs
+    {
+    public:
     };
 
     std::optional<MedusaInputs> medusaInputs;
+
+    std::optional<ExplicitDraftTokensInputs> explicitDraftTokensInputs;
 };
 
 class BaseOutputParams
@@ -280,15 +288,39 @@ public:
     class SpeculativeDecodingOutputs
     {
     public:
-        tc::Tensor nextDraftTokens;       // [maxBatchSize, maxDraftTokens], draft tokens for the next step
-        tc::Tensor nextDraftPosIds;       // [maxBatchSize, maxDraftTokens], draft token position IDs
-        tc::Tensor nextDraftLengths;      // [maxBatchSize], next step draft tokens length, same as position ids
+        tc::Tensor nextDraftTokens;       // [maxBatchSize, maxDecodingDraftTokens], draft tokens for the next step
+        tc::Tensor nextDraftPosIds;       // [maxBatchSize, maxDecodingDraftTokens], draft token position IDs
+        tc::Tensor nextDraftLengths;      // [maxBatchSize], next step draft tokens lengths
         tc::Tensor acceptedLengths;       // [maxBatchSize], lengths of the accepted draft tokens + 1.
         tc::Tensor acceptedLengthsCumSum; // [maxBatchSize + 1] accumulative sum along batchSlots.
-        tc::Tensor pathsOffsets;          // [maxBatchSize, maxAcceptedDraftTokensPerStep + 1]
+        tc::Tensor pathsOffsets;          // [maxBatchSize, maxPathLen]
+        tc::Tensor packedMasks;           // [maxBatchSize, maxDecodingTokens, divUp(maxDecodingTokens, 32)]
+    };
+
+    class ExplicitDraftTokensOutputs : public SpeculativeDecodingOutputs
+    {
+    public:
+        //! Draft tokens for the next iteration. The first token in each path is the last accepted token at current
+        //! iteration. E.g. if batchSize == 1, maxNumPaths == 2, maxPathLen== 3, [[[0, 1, 2], [0, 1, 10]]]
+        tc::Tensor unpackedNextDraftTokens; // [maxBatchSize, maxNumPaths, maxPathLen] on gpu
+        //! Indices of draft tokens in the compressed `nextFlatTokens` for the next iteration.
+        //! Using example above, [[[0, 1, 2], [0, 1, 3]]]
+        tc::Tensor unpackedNextDraftIndices; // [maxBatchSize, maxNumPaths, maxPathLen] on gpu
+        //! Probabilities of the next draft tokens.
+        tc::Tensor nextDraftProbs; // [maxBatchSize, maxNumPaths, maxPathDraftLen, vocabSize] on gpu
+        //! Baseline for the position ids.
+        tc::Tensor positionIdsBase; // [maxBatchSize] on gpu
+        //! Randomly sampled data (between 0.f and 1.f)
+        tc::Tensor randomDataSample; // [maxBatchSize] on gpu
+        //! Randomly sampled data (between 0.f and 1.f)
+        tc::Tensor randomDataValidation; // [maxBatchSize, maxNumPaths, maxDraftPathLen] on gpu
+        //! Sampling temperature.
+        tc::Tensor temperatures; // [maxBatchSize] on gpu
     };
 
     std::optional<SpeculativeDecodingOutputs> speculativeDecodingOutputs;
+
+    std::optional<ExplicitDraftTokensOutputs> explicitDraftTokensOutputs;
 };
 
 class DynamicDecodeOutputParams : public BaseOutputParams

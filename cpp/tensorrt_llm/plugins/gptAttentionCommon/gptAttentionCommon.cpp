@@ -577,9 +577,8 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(void const* data, size_t leng
         "Unsupported data type, pre SM 80 GPUs do not support bfloat16");
 }
 
-size_t GPTAttentionPluginCommon::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t nbReq,
-    int32_t input_seq_length, int32_t max_attention_window, int32_t cross_qkv_length,
-    int32_t max_num_tokens) const noexcept
+size_t GPTAttentionPluginCommon::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t max_num_seq,
+    int32_t input_seq_length, int32_t cross_qkv_length, int32_t max_num_tokens) const noexcept
 {
     int const local_hidden_units_qo = mNumHeads * getHeadSize();
     int const local_hidden_units_kv = mNumKVHeads * getHeadSize();
@@ -589,15 +588,14 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForContext(nvinfer1::DataType t
 
     size_t context_workspace_size = 0;
 
-    auto const batch_size = static_cast<size_t>(nbReq);
-    size_t const attention_mask_size = mEnableContextFMHA
-        ? 0
-        : size * batch_size * input_seq_length * (isCrossAttention() ? cross_qkv_length : input_seq_length);
+    auto const batch_size = static_cast<size_t>(max_num_seq);
+    size_t const attention_mask_size
+        = mEnableContextFMHA ? 0 : size * max_num_tokens * (isCrossAttention() ? cross_qkv_length : input_seq_length);
     size_t const cu_seqlens_size = sizeof(int) * (batch_size + 1);
     size_t const rotary_inv_freq_size = sizeof(float) * batch_size * mRotaryEmbeddingDim / 2;
     size_t const q_buf_2_size = chunked_context_support
         ? size * max_num_tokens * local_hidden_units_qo
-        : (!mEnableContextFMHA ? size * batch_size * input_seq_length * local_hidden_units_qo : 0);
+        : (!mEnableContextFMHA ? size * max_num_tokens * local_hidden_units_qo : 0);
     size_t const k_buf_2_size = mEnableContextFMHA
         ? 0
         : size * batch_size * (isCrossAttention() ? cross_qkv_length : input_seq_length) * local_hidden_units_kv;
@@ -607,14 +605,14 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForContext(nvinfer1::DataType t
     size_t const qk_buf_size = mEnableContextFMHA
         ? 0
         : size * batch_size * mNumHeads * input_seq_length * (isCrossAttention() ? cross_qkv_length : input_seq_length);
-    size_t const qkv_buf_2_size = mEnableContextFMHA ? 0 : size * batch_size * input_seq_length * local_hidden_units_qo;
+    size_t const qkv_buf_2_size = mEnableContextFMHA ? 0 : size * max_num_tokens * local_hidden_units_qo;
     size_t const qk_buf_float_size = mEnableContextFMHA ? 0
                                                         : sizeof(float) * batch_size * mNumHeads * input_seq_length
             * (isCrossAttention() ? cross_qkv_length : input_seq_length);
     size_t const fp8_qkv_buffer_size = mFP8ContextFMHA && mEnableContextFMHA && !chunked_context_support
-        ? batch_size * input_seq_length * size_t(local_hidden_units_qo + 2 * local_hidden_units_kv)
+        ? max_num_tokens * size_t(local_hidden_units_qo + 2 * local_hidden_units_kv)
         : 0;
-    size_t const padding_offset_size = mEnableContextFMHA ? 0 : sizeof(int) * batch_size * input_seq_length;
+    size_t const padding_offset_size = mEnableContextFMHA ? 0 : sizeof(int) * max_num_tokens;
     size_t const fmha_scheduler_counter = mEnableContextFMHA ? sizeof(uint32_t) : 0;
 
     int const NUM_BUFFERS = 14;
@@ -639,7 +637,7 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForContext(nvinfer1::DataType t
 }
 
 size_t GPTAttentionPluginCommon::getWorkspaceSizeForGeneration(
-    nvinfer1::DataType type, int32_t total_num_seq, int32_t max_attention_window, int32_t max_num_tokens) const noexcept
+    nvinfer1::DataType type, int32_t max_num_seq, int32_t max_attention_window, int32_t max_num_tokens) const noexcept
 {
     int const local_hidden_units_qo = mNumHeads * getHeadSize();
     int const local_hidden_units_kv = mNumKVHeads * getHeadSize();
@@ -649,7 +647,7 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForGeneration(
     size_t context_workspace_size = 0;
     size_t generation_workspace_size = 0;
 
-    int const batch_beam = total_num_seq;
+    int const batch_beam = max_num_seq;
     int32_t const maxSeqLenTile
         = std::max(getMaxNumSeqLenTile(batch_beam), (int) tc::divUp(mMultiProcessorCount, mNumHeads));
 

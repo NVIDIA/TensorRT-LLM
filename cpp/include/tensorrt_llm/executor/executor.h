@@ -566,7 +566,6 @@ public:
 
     bool operator==(LookaheadDecodingConfig const& other) const;
 
-    // Lookahead decoding methods.
     void setMaxNgramSize(SizeType32);
     void setMaxWindowSize(SizeType32);
     void setMaxVerificationSetSize(SizeType32);
@@ -585,30 +584,54 @@ private:
     SizeType32 mMaxVerificationSetSize;
 };
 
+/// @brief Configuration class for explicit draft tokens decoding.
+class ExplicitDraftTokensConfig
+{
+public:
+    explicit ExplicitDraftTokensConfig(float temperature);
+
+    bool operator==(ExplicitDraftTokensConfig const& other) const;
+
+    void setTemperature(float);
+    [[nodiscard]] float getTemperature() const;
+
+private:
+    friend class Serialization;
+
+    // Sampling temperature.
+    float mTemperature;
+};
+
 /// @brief Configuration class for the speculative decoding.
 class DecodingConfig
 {
 public:
     explicit DecodingConfig(std::optional<DecodingMode> decodingMode = std::nullopt,
         std::optional<LookaheadDecodingConfig> lookaheadDecodingConfig = std::nullopt,
-        std::optional<MedusaChoices> medusaChoices = std::nullopt);
+        std::optional<MedusaChoices> medusaChoices = std::nullopt,
+        std::optional<ExplicitDraftTokensConfig> explicitDraftTokensConfig = std::nullopt);
 
     bool operator==(DecodingConfig const& other) const;
 
     // Decoding mode.
-    /// @brief Setsdecoding mode. Can't set lookahead and medusa mode.
+    /// @brief Sets decoding mode. Some modes require the use of their own setters.
     void setDecodingMode(DecodingMode const&);
     [[nodiscard]] std::optional<DecodingMode> getDecodingMode() const;
 
     // Lookahead methods.
-    /// @brief Sets lookahead decoding mode and lookahead decoding config.
+    /// @brief Sets lookahead decoding mode and config.
     void setLookaheadDecoding(LookaheadDecodingConfig const&);
     [[nodiscard]] std::optional<LookaheadDecodingConfig> getLookaheadDecodingConfig() const;
 
     // Medusa methods.
-    /// @brief Sets medusa mode and medusa config.
+    /// @brief Sets medusa mode and config.
     void setMedusaChoices(MedusaChoices const&);
     [[nodiscard]] std::optional<MedusaChoices> getMedusaChoices() const;
+
+    // ExplicitDraftTokens decoding methods.
+    /// @brief Sets explicit draft tokens decoding mode and config.
+    void setExplicitDraftTokens(ExplicitDraftTokensConfig const&);
+    [[nodiscard]] std::optional<ExplicitDraftTokensConfig> getExplicitDraftTokensConfig() const;
 
 private:
     friend class Serialization;
@@ -619,6 +642,8 @@ private:
     std::optional<LookaheadDecodingConfig> mLookaheadDecodingConfig;
     // Medusa params.
     std::optional<MedusaChoices> mMedusaChoices;
+    // Explicit draft tokens params.
+    std::optional<ExplicitDraftTokensConfig> mExplicitDraftTokensConfig;
 };
 
 /// @brief Configuration class for the model executor

@@ -39,6 +39,23 @@ def working_directory(path):
         os.chdir(prev_cwd)
 
 
+def get_project_dir():
+    return Path(__file__).parent.resolve().parent
+
+
+def get_source_dir():
+    return get_project_dir() / "cpp"
+
+
+def get_build_dir(build_dir, build_type):
+    if build_dir is None:
+        build_dir = get_source_dir() / ("build" if build_type == "Release" else
+                                        f"build_{build_type}")
+    else:
+        build_dir = Path(build_dir)
+    return build_dir
+
+
 def main(*,
          build_type: str = "Release",
          build_dir: Path = None,
@@ -59,7 +76,7 @@ def main(*,
          benchmarks: bool = False,
          micro_benchmarks: bool = False,
          nvtx: bool = False):
-    project_dir = Path(__file__).parent.resolve().parent
+    project_dir = get_project_dir()
     os.chdir(project_dir)
     build_run = partial(run, shell=True, check=True)
 
@@ -133,13 +150,7 @@ def main(*,
         cmake_def_args.append(f"-DNCCL_LIB_DIR={nccl_root}/lib")
         cmake_def_args.append(f"-DNCCL_INCLUDE_DIR={nccl_root}/include")
 
-    source_dir = project_dir / "cpp"
-
-    if build_dir is None:
-        build_dir = source_dir / ("build" if build_type == "Release" else
-                                  f"build_{build_type}")
-    else:
-        build_dir = Path(build_dir)
+    build_dir = get_build_dir(build_dir, build_type)
     first_build = not build_dir.exists()
 
     if clean and build_dir.exists():
@@ -164,6 +175,7 @@ def main(*,
     disable_nvtx = "OFF" if nvtx else "ON"
     executor_worker = "" if on_windows else "executorWorker "
 
+    source_dir = get_source_dir()
     with working_directory(build_dir):
         cmake_def_args = " ".join(cmake_def_args)
         if clean or first_build:
@@ -295,8 +307,7 @@ def main(*,
         build_run(f"\"{sys.executable}\" -m pip install -e .[devel]")
 
 
-if __name__ == "__main__":
-    parser = ArgumentParser()
+def add_arguments(parser: ArgumentParser):
     parser.add_argument("--build_type",
                         "-b",
                         default="Release",
@@ -369,5 +380,10 @@ if __name__ == "__main__":
     parser.add_argument("--nvtx",
                         action="store_true",
                         help="Enable NVTX features.")
+
+
+if __name__ == "__main__":
+    parser = ArgumentParser()
+    add_arguments(parser)
     args = parser.parse_args()
     main(**vars(args))
