@@ -21,10 +21,12 @@ from parameterized import parameterized
 
 import tensorrt_llm
 from tensorrt_llm import Parameter, Tensor
+from tensorrt_llm._utils import torch_to_numpy
 from tensorrt_llm.quantization.functional import smooth_quant_layer_norm
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import create_session, run_session, unittest_name_func
+from utils.util import (create_session, run_session, skip_bf16_pre_ampere,
+                        unittest_name_func)
 
 
 class TestSmoothQuantLayerNorm(unittest.TestCase):
@@ -35,6 +37,7 @@ class TestSmoothQuantLayerNorm(unittest.TestCase):
 
     def load_test_cases():
         test_cases = [('float16', False, True), ('float16', True, True),
+                      ('bfloat16', False, True), ('bfloat16', True, True),
                       ('float32', False, True), ('float32', True, True),
                       ('float16', True, False)]
         return [i + (True, )
@@ -44,6 +47,9 @@ class TestSmoothQuantLayerNorm(unittest.TestCase):
     def test_smooth_quant_layer_norm_plugin(self, dtype, dynamic_act_scaling,
                                             elementwise_affine,
                                             remove_batch_dim):
+        # Skip tests that are not supported in pre-ampere architecture
+        skip_bf16_pre_ampere(dtype)
+
         # test data
         hidden_size = 1024
         x_data = torch.randn(
@@ -80,9 +86,9 @@ class TestSmoothQuantLayerNorm(unittest.TestCase):
             if elementwise_affine:
                 gamma_data = m.weight.detach().cpu()
                 beta_data = m.bias.detach().cpu()
-                weight = Parameter(gamma_data.cpu().numpy()).value
-                bias = Parameter(beta_data.cpu().numpy()).value
-            scale = Parameter(scale_data.cpu().numpy()).value
+                weight = Parameter(torch_to_numpy(gamma_data)).value
+                bias = Parameter(torch_to_numpy(beta_data)).value
+            scale = Parameter(torch_to_numpy(scale_data)).value
 
             output = smooth_quant_layer_norm(
                 x,

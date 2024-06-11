@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import copy
-import csv
 import math
 import platform
 from dataclasses import dataclass, field
@@ -44,41 +43,58 @@ from .kv_cache_manager import GenerationSequence, KVCacheManager, KVCacheUpdater
 from .session import _scoped_stream
 
 
-def to_word_list_format(word_dict: List[List[str]],
-                        tokenizer=None,
-                        add_special_tokens=False):
+def decode_words_list(word_dict: List[List[str]],
+                      tokenizer=None,
+                      add_special_tokens=False):
     '''
     format of word_dict
         len(word_dict) should be same to batch_size
         word_dict[i] means the words for batch i
-        len(word_dict[i]) must be 1, which means it only contains 1 string
-        This string can contains several sentences and split by ",".
-        For example, if word_dict[2] = " I am happy, I am sad", then this function will return
-        the ids for two short sentences " I am happy" and " I am sad".
+        len(word_dict[i]) >= 1, which means it must contain at least 1 string
+        For example, word_dict[2] = [" I am happy", " I am sad"].
     '''
     assert tokenizer != None, "need to set tokenizer"
 
-    flat_ids = []
-    offsets = []
+    decoded_words_batch = []
     for word_dict_item in word_dict:
-        item_flat_ids = []
-        item_offsets = []
+        decoded_words_request = []
 
-        if isinstance(word_dict_item[0], bytes):
-            word_dict_item = [word_dict_item[0].decode()]
+        for item in word_dict_item:
+            if isinstance(item, bytes):
+                item = [item.decode()]
 
-        words = list(csv.reader(word_dict_item))[0]
-        for word in words:
-            ids = tokenizer.encode(word, add_special_tokens=add_special_tokens)
+            ids = tokenizer.encode(item, add_special_tokens=add_special_tokens)
 
             if len(ids) == 0:
                 continue
 
-            item_flat_ids += ids
-            item_offsets.append(len(ids))
+            decoded_words_request.append(ids)
+        decoded_words_batch.append(decoded_words_request)
 
-        flat_ids.append(np.array(item_flat_ids))
-        offsets.append(np.cumsum(np.array(item_offsets)))
+    return decoded_words_batch
+
+
+def to_word_list_format(word_dict: List[List[List[int]]]):
+    '''
+    format of word_dict
+        len(word_dict) should be same to batch_size
+        word_dict[i] means the words for batch i
+        len(word_dict[i]) >= 1, which means it must contain at least 1 word
+        For example, word_dict[2] = [[1, 267], [534]] has two words.
+    '''
+
+    flat_ids = []
+    offsets = []
+    for word_dict_item in word_dict:
+        items_flat_ids = []
+        items_offsets = []
+
+        for ids in word_dict_item:
+            items_flat_ids += ids
+            items_offsets.append(len(ids))
+
+        flat_ids.append(np.array(items_flat_ids))
+        offsets.append(np.cumsum(np.array(items_offsets)))
 
     pad_to = max(1, max(len(ids) for ids in flat_ids))
 
@@ -2685,11 +2701,7 @@ class GenerationSession(object):
                 host_cross_kv_cache_block_offsets, hidden_states,
                 prompt_embedding_table, tasks, prompt_vocab_size,
                 encoder_output, encoder_input_lengths)
-            # print(f"=============step {step} Before ctx phase")
-            # for name, tensor in ctx_tensors.items():
-            #     print(name, ":", tensor.shape)
-            #     if "key_value" not in name:
-            #         print(tensor.to_torch())
+
             context = self.runtime.ctx_context
             self.runtime._set_tensors(context, ctx_tensors)
             if self.debug_mode:
@@ -2749,9 +2761,6 @@ class GenerationSession(object):
                         dim=1,
                         index=last_token_ids.to(dtype=torch.int64)).view(
                             batch_size, self.vocab_size_padded)
-        # print(f"=============step {step} After context phase")
-        # print("logits", self.buffer['logits'].shape)
-        # print(self.buffer['logits'])
 
         if step == 0 and beam_width > 1:
             assert not self.is_medusa_mode
@@ -2856,11 +2865,7 @@ class GenerationSession(object):
                 host_cross_kv_cache_block_offsets, hidden_states,
                 prompt_embedding_table, tasks, prompt_vocab_size,
                 encoder_output, encoder_input_lengths)
-            # print(f"=============step {step} Before gen phase")
-            # for name, tensor in next_step_tensors.items():
-            #     print(name, ":", tensor.shape)
-            #     if "key_value" not in name:
-            #         print(tensor.to_torch())
+
             # there are some tensors created inside the _get_next_step_shape_buffer, not owned by any object
             # needs to pro-long the life time of the tensors inside the next_step_tensors array
             # otherwise, it maybe released before the next step actually enqueued
@@ -3412,6 +3417,7 @@ class GenerationSession(object):
         stop_words_list_ptrs = None
         max_stop_words_len = 0
         if stop_words_list is not None:
+            stop_words_list = torch.from_numpy(stop_words_list).to('cuda')
             max_stop_words_len = stop_words_list.shape[2]
             stop_words_lens = torch.full((batch_size, ),
                                          max_stop_words_len,
@@ -3429,6 +3435,7 @@ class GenerationSession(object):
         bad_words_list_ptrs = None
         max_bad_words_len = 0
         if bad_words_list is not None:
+            bad_words_list = torch.from_numpy(bad_words_list).to('cuda')
             max_bad_words_len = bad_words_list.shape[2]
             bad_words_lens = torch.full((batch_size, ),
                                         max_bad_words_len,
@@ -3512,6 +3519,34 @@ class ChatGLMGenerationSession(GenerationSession):
                 position_ids[1, input_lengths_acc[i + 1] - 1] = 1
             position_ids = position_ids.int().cuda()
             last_token_ids = torch.cumsum(last_token_ids, dim=0).int().cuda()
+
+            # specialization for GLM series models
+            if kwargs["pad_id"] in [50256, 50259]:
+                if kwargs["pad_id"] == 50256:  # glm_2b / glm_10b
+                    mask_ids = [50260, 50264, 50263]
+                else:  # glm_10b_chinese / glm_large_chinese
+                    mask_ids = [50003, 50008, 50009]
+
+                self.mask_index_tensor = \
+                    torch.zeros([batch_size], dtype=torch.int32)
+                position_ids = position_ids.cpu()
+                for i in range(batch_size):
+                    length = context_lengths[i]
+                    input_ids = kwargs["input_ids"][
+                        0:context_lengths[i]] if i == 0 else kwargs[
+                            "input_ids"][sum(context_lengths[0:i]
+                                             ):sum(context_lengths[0:i]) +
+                                         length]
+                    mask_index = [
+                        torch.where(input_ids == id)[0].int() for id in mask_ids
+                    ]
+                    tail_index = torch.Tensor([max_context_length]).int().cuda()
+                    mask_index.append(tail_index)
+                    mask_index = torch.cat(mask_index, dim=0).min()
+                    self.mask_index_tensor[i] = int(mask_index)
+                    position_ids[0][sum(context_lengths[0:i + 1]) -
+                                    1] = int(mask_index)
+                position_ids = position_ids.cuda()
         else:
             position_ids = torch.zeros([batch_size, 2, max_context_length],
                                        dtype=torch.int32)
@@ -3582,6 +3617,12 @@ class ChatGLMGenerationSession(GenerationSession):
             position_ids = _tile_beam_width_chatglm(position_ids, num_beams)
             position_ids = position_ids.int().cuda()
             last_token_ids = torch.cumsum(last_token_ids, dim=0).int().cuda()
+
+            if self.mask_index_tensor is not None:  # specialization for GLM series models
+                position_ids = position_ids.cpu()
+                for i in range(batch_size):
+                    position_ids[0][i] = self.mask_index_tensor[i]
+            position_ids = position_ids.cuda()
         else:
             data = []
             if self.mask_index_tensor is not None:  # specialization for GLM series models

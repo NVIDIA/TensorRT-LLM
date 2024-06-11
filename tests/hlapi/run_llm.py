@@ -3,7 +3,7 @@ import os
 
 import click
 
-from tensorrt_llm.hlapi import LLM, ModelConfig, SamplingConfig
+from tensorrt_llm.hlapi import LLM, ModelConfig, SamplingParams
 
 
 @click.command()
@@ -21,8 +21,8 @@ def main(model_dir: str, tp_size: int, engine_dir: str):
         llm.save(engine_dir)
 
     prompt = [45, 12, 13]
-    sampling_config = SamplingConfig(max_new_tokens=10, end_id=-1)
-    for output in llm.generate([prompt], sampling_config=sampling_config):
+    sampling_params = SamplingParams(max_new_tokens=10, end_id=-1)
+    for output in llm.generate([prompt], sampling_params=sampling_params):
         print(output)
 
 

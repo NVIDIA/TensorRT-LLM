@@ -215,6 +215,24 @@ class ModelRunnerCpp(ModelRunnerMixin):
         if medusa_choices is not None:
             decoding_config.medusa_choices = medusa_choices
 
+        if max_batch_size is None:
+            max_batch_size = model_config.max_batch_size
+        else:
+            assert max_batch_size <= model_config.max_batch_size
+        if max_input_len is None:
+            max_input_len = model_config.max_input_len
+        else:
+            assert max_input_len <= model_config.max_input_len
+        if max_output_len is None:
+            max_seq_len = model_config.max_seq_len
+        else:
+            max_seq_len = max_input_len + max_output_len
+            assert max_seq_len <= model_config.max_seq_len
+        if max_beam_width is None:
+            max_beam_width = model_config.max_beam_width
+        else:
+            assert max_beam_width <= model_config.max_beam_width
+
         trtllm_config = trtllm.ExecutorConfig(max_beam_width=max_beam_width,
                                               kv_cache_config=kv_cache_config,
                                               decoding_config=decoding_config)
@@ -230,7 +248,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
         return cls(executor,
                    max_batch_size=max_batch_size,
                    max_input_len=max_input_len,
-                   max_seq_len=max_input_len + max_output_len,
+                   max_seq_len=max_seq_len,
                    max_beam_width=max_beam_width,
                    model_config=model_config,
                    world_config=world_config)
@@ -455,15 +473,10 @@ class ModelRunnerCpp(ModelRunnerMixin):
                                 output_cum_log_probs, batch_input_ids,
                                 streaming, batch_input_ids_list)
 
-    def _prepare_words_list(self, words_list: torch.Tensor, batch_size: int):
+    def _prepare_words_list(self, words_list: List[List[List[int]]],
+                            batch_size: int):
         if words_list is None:
             return [None] * batch_size
-        words_list = words_list.tolist()
-        assert len(words_list) == batch_size
-        for words in words_list:
-            while len(words[0]) > 0 and words[0][-1] == 0:
-                words[0].pop()
-                words[1].pop()
         return words_list
 
     def _prepare_ptuning_executor(self, batch_input_ids_list, prompt_table,

@@ -92,12 +92,13 @@ class TestGPTJ(unittest.TestCase):
         with net_guard(network):
             # Initialize model
             network.set_named_parameters(trtllm_model.named_parameters())
-            inputs = trtllm_model.prepare_inputs(max_batch_size=batch_size,
-                                                 max_input_len=input_len,
-                                                 max_seq_len=input_len +
-                                                 output_len,
-                                                 use_cache=True,
-                                                 max_beam_width=beam_width)
+            inputs = trtllm_model.prepare_inputs(
+                max_batch_size=batch_size,
+                max_input_len=input_len,
+                max_seq_len=input_len + output_len,
+                max_num_tokens=batch_size * input_len,
+                use_cache=True,
+                max_beam_width=beam_width)
             # Prepare
             trtllm_model(**inputs)
 

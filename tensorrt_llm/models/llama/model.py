@@ -14,8 +14,10 @@
 # limitations under the License.
 from typing import Optional, Union
 
+from ..._common import default_net
 from ..._utils import pad_vocab_size
-from ...functional import Tensor, non_gated_version, recv, send
+from ...functional import (AllReduceFusionOp, AllReduceFusionParams, Tensor,
+                           non_gated_version, recv, send)
 from ...layers import (MOE, Attention, AttentionMaskType, ColumnLinear,
                        Embedding, GatedMLP, PositionEmbeddingType, RmsNorm)
 from ...lora_manager import LoraConfig, use_lora
@@ -45,9 +47,9 @@ class LLaMADecoderLayer(Module):
                                        dtype=config.dtype)
 
         layers_range = config.mapping.pp_layers(config.num_hidden_layers)
-        local_layer_idx = layer_idx - layers_range[0]
+        self.local_layer_idx = layer_idx - layers_range[0]
         self.attention = Attention(
-            local_layer_idx=local_layer_idx,
+            local_layer_idx=self.local_layer_idx,
             hidden_size=config.hidden_size,
             attention_head_size=config.head_size,
             num_attention_heads=config.num_attention_heads,
@@ -120,9 +122,17 @@ class LLaMADecoderLayer(Module):
                 spec_decoding_params=None,
                 kv_cache_params=None,
                 attention_params=None,
-                lora_layer_params=None):
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+                lora_layer_params=None,
+                next_layer_input_layernorm_args=None):
+        assert not (
+            default_net().plugin_config.reduce_fusion and self.has_residual_mlp
+        ), "Custom all reduce and residual mlp can't be enabled at the same time."
+        if default_net(
+        ).plugin_config.reduce_fusion and self.local_layer_idx > 0:
+            hidden_states, residual = hidden_states
+        else:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
 
         attention_output = self.attention(
             hidden_states,
@@ -131,16 +141,21 @@ class LLaMADecoderLayer(Module):
             spec_decoding_params=spec_decoding_params,
             kv_cache_params=kv_cache_params,
             attention_params=attention_params,
-            lora_layer_params=lora_layer_params)
+            lora_layer_params=lora_layer_params,
+            reduce_fusion_params=AllReduceFusionParams(
+                fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM
+                if default_net().plugin_config.reduce_fusion else
+                AllReduceFusionOp.NONE,
+                residual=residual,
+                norm_weight=self.post_layernorm.weight.value,
+                eps=self.post_layernorm.eps))
 
         if use_cache:
             attention_output, presents = attention_output
 
-        hidden_states = residual + attention_output
-
-        residual_attn = hidden_states
-
         if self.has_residual_mlp:
+            hidden_states = residual + attention_output
+            residual_attn = hidden_states
             # arctic layer w/ residual mlp
 
             # residual mlp
@@ -155,12 +170,27 @@ class LLaMADecoderLayer(Module):
                                      lora_layer_params=lora_layer_params)
             hidden_states = residual_mlp + hidden_states
         else:
-            # regular llama/mixtral layers
-            hidden_states = self.post_layernorm(hidden_states)
-            hidden_states = self.mlp(hidden_states,
-                                     lora_layer_params=lora_layer_params)
-            hidden_states = residual_attn + hidden_states
-
+            if default_net().plugin_config.reduce_fusion:
+                hidden_states, residual = attention_output
+            else:
+                hidden_states = residual + attention_output
+                residual = hidden_states
+                hidden_states = self.post_layernorm(hidden_states)
+            if next_layer_input_layernorm_args is not None:
+                hidden_states = self.mlp(
+                    hidden_states,
+                    lora_layer_params=lora_layer_params,
+                    reduce_fusion_params=AllReduceFusionParams(
+                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM
+                        if default_net().plugin_config.reduce_fusion else
+                        AllReduceFusionOp.NONE,
+                        residual=residual,
+                        norm_weight=next_layer_input_layernorm_args[0],
+                        eps=next_layer_input_layernorm_args[1]))
+            else:
+                hidden_states = self.mlp(hidden_states,
+                                         lora_layer_params=lora_layer_params)
+                hidden_states = residual + hidden_states
         if use_cache:
             return (hidden_states, presents)
         return hidden_states

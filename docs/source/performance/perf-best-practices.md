@@ -142,6 +142,14 @@ to the runtime, and will possibly be removed in the future releases. We have sup
 an auto fallback mechanism so that native NCCL kernel is used when hardware requirements
 are not satisfied to get the best performance.
 
+In addition, there is an experimental feature called "Reduce Norm Fusion"
+available to extend the custom AllReduce functionality. It can be enabled by
+using the `--reduce_fusion enable` argument with `trtllm-build` when the
+custom AllReduce is already enabled. This feature aims to fuse the ResidualAdd
+and LayerNorm kernels after AllReduce into a single kernel, resulting in
+improved end-to-end performance. Please note that currently, this feature is
+only supported for the llama model. It is recommended to enable this feature when the batch size is small and the generation phase time is the dominant factor.
+
 ### Embedding Parallelism, Embedding Sharing, and Look-Up Plugin
 
 The embedding parallelism feature enables the sharding of the embedding table
@@ -217,6 +225,15 @@ BERT attention plugin and context fused multi-head attention are both
 recommended for the BERT model. They are enabled by default using the
 `--bert_attention_plugin` and `--context_fmha` arguments with
 `trtllm-build`.
+
+### FP8 GEMM Plugin for Small Batch Size Performance Optimization
+
+FP8 gemm plugin is an experimental feature aimed to improve performance in
+small-batch-size cases(e.g. BS<=4) and can be enabled by `--gemm_plugin fp8`
+when building FP8 models. Although inputs with larger batch size can be correctly
+inferenced, the performance may decrease as batch size grows. Therefore, this
+feature is only recommended for latency reduction in small-batch-size scenarios
+currently.
 
 ## Runtime Options to Optimize the Performance of TensorRT-LLM Models?
 

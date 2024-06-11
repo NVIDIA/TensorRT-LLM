@@ -161,9 +161,10 @@ void DecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, SizeTyp
     }
     else if (mDecodingMode.isExplicitDraftTokens())
     {
-        // TODO(nkorobov) add explicit draft tokens layer setup
-        // Simply forward setup params for now.
-        mDecodingLayer->setup(batchSize, /* beamWidth */ 1, batchSlots, baseSetupParams);
+        auto explicitDraftTokensSetupParams = std::make_shared<ExplicitDraftTokensSetupParams>();
+        explicitDraftTokensSetupParams->temperature = setupParams->penaltyParams.temperature;
+        explicitDraftTokensSetupParams->randomSeed = setupParams->randomSeed;
+        mDecodingLayer->setup(batchSize, /* beamWidth */ 1, batchSlots, explicitDraftTokensSetupParams);
     }
     else
     {
@@ -203,7 +204,7 @@ std::tuple<std::shared_ptr<BaseOutputParams>, std::shared_ptr<BaseInputParams>> 
     auto outputs = std::dynamic_pointer_cast<DynamicDecodeOutputParams>(baseOutputs);
     auto params = std::dynamic_pointer_cast<DynamicDecodeInputParams>(baseInputs);
 
-    auto const localDecoderDomain = getLocalDecoderDomain(params);
+    auto const localDecoderDomain = getLocalDecoderDomain(params, mDecoderDomain);
     auto const maxSeqLen = outputs->output_ids.shape[outputs->output_ids.shape.size() - 1];
     auto const& endIds = params->end_ids;
 

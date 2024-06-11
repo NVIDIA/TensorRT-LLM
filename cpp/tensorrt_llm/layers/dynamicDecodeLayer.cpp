@@ -160,11 +160,12 @@ void DynamicDecodeLayer<T>::forwardAsync(
     auto params = std::dynamic_pointer_cast<DynamicDecodeInputParams>(baseInputs);
     auto outputs = std::dynamic_pointer_cast<DynamicDecodeOutputParams>(baseOutputs);
 
-    TLLM_CHECK_WITH_INFO(params->logits || params->logits_vec, "Either logits or logits_vec have to be specified.");
+    TLLM_CHECK_WITH_INFO(mDecodingMode.isExplicitDraftTokens() || params->logits || params->logits_vec,
+        "If not explicit Draft Tokens mode, either logits or logits_vec have to be specified.");
     TLLM_CHECK_WITH_INFO(
-        outputs->sequence_length.has_value(), "sequence_length tensor is mandatory in DynamicDecoderLayer.");
+        outputs->sequence_length.has_value(), "sequence_length tensor is required in DynamicDecoderLayer.");
 
-    auto const localDecoderDomain = getLocalDecoderDomain(params);
+    auto const localDecoderDomain = getLocalDecoderDomain(params, mDecoderDomain);
     auto const maxSeqLen = outputs->output_ids.shape[outputs->output_ids.shape.size() - 1];
 
     TLLM_CHECK_WITH_INFO((mConfiguredBeamWidth == 1 && localDecoderDomain.getBeamWidth() == 1)
@@ -199,7 +200,7 @@ void DynamicDecodeLayer<T>::forwardAsync(
     // Copy nextIds and transpose logits when needed
     prepareOutputData(outputs, params, mIdsPtrHost, batchSlots, localDecoderDomain.getBatchSize(),
         mDecoderDomain.getBatchSize(), localDecoderDomain.getBeamWidth(), maxSeqLen,
-        mDecoderDomain.getMaxTokensPerStep(), mCyclicStep, mOutputLogProbs, mStream);
+        mDecoderDomain.getMaxDecodingTokens(), mCyclicStep, mOutputLogProbs, mStream);
 
     mCyclicStep += 1;
 

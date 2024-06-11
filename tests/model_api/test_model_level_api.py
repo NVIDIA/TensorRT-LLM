@@ -8,7 +8,7 @@ from profile_utils import profile
 
 import tensorrt_llm
 from tensorrt_llm.builder import BuildConfig, build
-from tensorrt_llm.executor import GenerationExecutor, SamplingConfig
+from tensorrt_llm.executor import GenerationExecutor, SamplingParams
 from tensorrt_llm.models import LLaMAForCausalLM
 from tensorrt_llm.models.llama.config import LLaMAConfig
 
@@ -69,7 +69,7 @@ def test_save_load():
             for idx, output in enumerate(
                     executor.generate(
                         input_text,
-                        sampling_config=SamplingConfig(max_new_tokens=10))):
+                        sampling_params=SamplingParams(max_new_tokens=10))):
                 tensorrt_llm.logger.info(f"Input: {input_text[idx]}")
                 tensorrt_llm.logger.info(f'Output: {output.text}')
                 # note the output.text contains everything from the input, so only compare the suffix here.
@@ -127,7 +127,7 @@ def test_inflight_batching():
                 result = async_engine.generate_async(
                     inp,
                     streaming=False,
-                    sampling_config=SamplingConfig(max_new_tokens=10))
+                    sampling_params=SamplingParams(max_new_tokens=10))
                 await result.aresult()
                 tensorrt_llm.logger.info(result.text)
                 assert result.text.endswith(expected_output[idx])
@@ -136,7 +136,7 @@ def test_inflight_batching():
                 async for stream in async_engine.generate_async(
                         inp,
                         streaming=True,
-                        sampling_config=SamplingConfig(max_new_tokens=10)):
+                        sampling_params=SamplingParams(max_new_tokens=10)):
                     output += stream.text + ' '
                     tensorrt_llm.logger.info(
                         f"prompt: '{inp}', generation: '{output}'")

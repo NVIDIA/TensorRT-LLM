@@ -10,7 +10,7 @@ This document shows how to build and run a [Qwen](https://huggingface.co/Qwen) m
     - [Build TensorRT engine(s)](#build-tensorrt-engines)
       - [INT8 KV cache](#int8-kv-cache)
       - [SmoothQuant](#smoothquant)
-      - [FP8 PTQ](#fp8-post-training-quantization)
+      - [FP8 Post-Training Quantization](#fp8-post-training-quantization)
       - [INT4-GPTQ](#int4-gptq)
       - [INT4-AWQ](#int4-awq)
     - [Run](#run)
@@ -78,14 +78,6 @@ Download one or more Qwen models that you would like to build to TensorRT-LLM en
 git clone https://huggingface.co/Qwen/Qwen-7B-Chat   ./tmp/Qwen/7B
 git clone https://huggingface.co/Qwen/Qwen-14B-Chat  ./tmp/Qwen/14B
 git clone https://huggingface.co/Qwen/Qwen-72B-Chat  ./tmp/Qwen/72B
-```
-
-Or download from the [ModelScope](https://www.modelscope.cn) hub:
-
-```bash
-git clone https://www.modelscope.cn/qwen/Qwen-7B-Chat.git   ./tmp/Qwen/7B
-git clone https://www.modelscope.cn/qwen/Qwen-14B-Chat.git  ./tmp/Qwen/14B
-git clone https://www.modelscope.cn/qwen/Qwen-72B-Chat.git  ./tmp/Qwen/72B
 ```
 
 ### Build TensorRT engine(s)

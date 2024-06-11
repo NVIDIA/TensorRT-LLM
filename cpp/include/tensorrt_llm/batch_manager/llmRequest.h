@@ -699,6 +699,12 @@ public:
             runtime::ITensor::makeShape({mSamplingConfig.beamWidth, mMaxNewTokens, vocabSizePadded}), logitsDataType);
     }
 
+    void allocTargetModelAcceptedTokenLogitsHost(SizeType32 vocabSizePadded, nvinfer1::DataType logitsDataType)
+    {
+        mGenerationLogitsHost = runtime::BufferManager::pinned(
+            runtime::ITensor::makeShape({getNumDraftTokens() + 1, vocabSizePadded}), logitsDataType);
+    }
+
     [[nodiscard]] std::vector<TensorPtr> const& getGenerationLogitsFragments() const
     {
         return mGenerationLogitsFragments;
@@ -901,6 +907,18 @@ public:
                     result.generationLogits = executor::detail::ofITensor(getGenerationLogitsHost());
                 }
 
+                if (getReturnTargetModelAcceptedLogits())
+                {
+                    auto targetModelAcceptedTokenLogitsShape = getGenerationLogitsHost()->getShape();
+                    TLLM_CHECK(targetModelAcceptedTokenLogitsShape.nbDims == 2);
+                    auto numAcceptedToken = targetModelAcceptedTokenLogitsShape.d[0];
+                    auto vocabSizePadded = targetModelAcceptedTokenLogitsShape.d[1];
+                    // Align the shape of accepted token logits and generation logits
+                    TensorPtr targetModelAcceptedTokenLogitsHostView = runtime::ITensor::view(
+                        getGenerationLogitsHost(), runtime::ITensor::makeShape({1, numAcceptedToken, vocabSizePadded}));
+                    result.generationLogits = executor::detail::ofITensor(targetModelAcceptedTokenLogitsHostView);
+                }
+
                 if (getReturnEncoderOutput())
                 {
                     result.encoderOutput = executor::detail::ofITensor(getEncoderOutputHost());
@@ -1023,6 +1041,7 @@ private:
         auto data = runtime::bufferCast<int32_t>(*tensor);
         std::memcpy(data, words.data(), numWords * sizeof(int32_t));
         std::memcpy(data + numWords, offsets.data(), numWords * sizeof(int32_t));
+
         // Add leading dim of 1
         tensor->unsqueeze(0);
 

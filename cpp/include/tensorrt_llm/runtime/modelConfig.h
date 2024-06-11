@@ -18,10 +18,9 @@
 
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/runtime/common.h"
-#include "tensorrt_llm/runtime/lookaheadModule.h"
 #include "tensorrt_llm/runtime/loraModule.h"
-#include "tensorrt_llm/runtime/medusaModule.h"
 #include "tensorrt_llm/runtime/speculativeDecodingMode.h"
+#include "tensorrt_llm/runtime/speculativeDecodingModule.h"
 #include <NvInferRuntime.h>
 
 namespace tensorrt_llm::runtime
@@ -80,6 +79,7 @@ public:
         , mUseCustomAllReduce(false)
         , mMaxPromptEmbeddingTableSize(0)
         , mMaxDraftLen(0)
+        , mContextFMHA(false)
         , mPagedContextFMHA(false)
         , mUseXQA{false}
         , mUseLoraPlugin(false)
@@ -364,6 +364,16 @@ public:
         return mMaxDraftLen + 1;
     }
 
+    void constexpr setContextFMHA(bool contextFMHA) noexcept
+    {
+        mContextFMHA = contextFMHA;
+    }
+
+    [[nodiscard]] bool constexpr getContextFMHA() const noexcept
+    {
+        return mContextFMHA;
+    }
+
     void constexpr setPagedContextFMHA(bool pagedContextFMHA) noexcept
     {
         mPagedContextFMHA = pagedContextFMHA;
@@ -573,8 +583,10 @@ private:
     bool mUseCustomAllReduce;
 
     SizeType32 mMaxPromptEmbeddingTableSize;
+    // TODO(rkobus): remove this from ModelConfig and use mSpeculativeDecodingModule
     SizeType32 mMaxDraftLen;
 
+    bool mContextFMHA;
     bool mPagedContextFMHA;
     bool mUseXQA;
 

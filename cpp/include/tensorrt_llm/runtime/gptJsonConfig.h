@@ -32,14 +32,14 @@ class GptJsonConfig
 {
 public:
     GptJsonConfig(std::string name, std::string version, std::string precision, SizeType32 tensorParallelism,
-        SizeType32 pipelineParallelism, SizeType32 gpusPerNode, ModelConfig const& modelConfig)
+        SizeType32 pipelineParallelism, SizeType32 gpusPerNode, ModelConfig modelConfig)
         : mName(std::move(name))
         , mVersion(std::move(version))
         , mPrecision(std::move(precision))
         , mTensorParallelism{tensorParallelism}
         , mPipelineParallelism{pipelineParallelism}
         , mGpusPerNode{gpusPerNode}
-        , mModelConfig(modelConfig)
+        , mModelConfig(std::move(modelConfig))
     {
     }
 

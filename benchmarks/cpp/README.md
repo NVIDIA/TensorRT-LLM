@@ -159,7 +159,7 @@ mpirun -n 2 ./benchmarks/gptManagerBenchmark \
     --max_num_samples 500
 ```
 
-`gptManagerBenchmark` can also be used with the high-level C++ API defined by the `executor::Executor` class (see `cpp/include/tensorrt_llm/executor/executor.h`). This can be done by passing the argument `--api executor`. Note that the Executor class is still under development and currently does not support models with tp or pp > 1.
+`gptManagerBenchmark` by default uses the high-level C++ API defined by the `executor::Executor` class (see `cpp/include/tensorrt_llm/executor/executor.h`).
 
 #### Emulated static batching
 

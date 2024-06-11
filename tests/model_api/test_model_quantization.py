@@ -5,7 +5,7 @@ from pathlib import Path
 
 import tensorrt_llm
 from tensorrt_llm.builder import BuildConfig, build
-from tensorrt_llm.executor import GenerationExecutor, SamplingConfig
+from tensorrt_llm.executor import GenerationExecutor, SamplingParams
 from tensorrt_llm.models import LLaMAForCausalLM
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
@@ -37,9 +37,12 @@ def test_int4_awq_quantization():
     llama = LLaMAForCausalLM.from_checkpoint(checkpoint_dir)
     engine = build(
         llama,
-        BuildConfig(max_batch_size=max_batch_size,
-                    max_input_len=max_isl,
-                    max_output_len=max_osl))
+        BuildConfig(
+            max_batch_size=max_batch_size,
+            max_input_len=max_isl,
+            max_output_len=max_osl,
+            max_num_tokens=max_batch_size * max_isl,
+        ))
 
     engine_dir = "llama-awq-quantized"
     engine_temp = tempfile.TemporaryDirectory(engine_dir)
@@ -49,7 +52,7 @@ def test_int4_awq_quantization():
         for idx, output in enumerate(
                 executor.generate(
                     input_text,
-                    sampling_config=SamplingConfig(max_new_tokens=10))):
+                    sampling_params=SamplingParams(max_new_tokens=10))):
             print(f"Input: {input_text[idx]}")
             print(f'Output: {output.text}')
             # TODO: TRTLLM-185, check the score when the test infra is ready, hard coded value is not stable, cause flaky tests in L0
@@ -83,6 +86,7 @@ def test_fp8_quantization():
         BuildConfig(max_batch_size=max_batch_size,
                     max_input_len=max_isl,
                     max_output_len=max_osl,
+                    max_num_tokens=max_batch_size * max_isl,
                     strongly_typed=True))
     engine_dir = "llama-fp8-quantized"
     engine_temp = tempfile.TemporaryDirectory(engine_dir)
@@ -92,7 +96,7 @@ def test_fp8_quantization():
         for idx, output in enumerate(
                 executor.generate(
                     input_text,
-                    sampling_config=SamplingConfig(max_new_tokens=10))):
+                    sampling_params=SamplingParams(max_new_tokens=10))):
             print(f"Input: {input_text[idx]}")
             print(f'Output: {output.text}')
             # TODO: TRTLLM-185, check the score when the test infra is ready, hard coded value is not stable, cause flaky tests in L0

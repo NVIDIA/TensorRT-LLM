@@ -49,11 +49,6 @@ Let's elaborate on the preparation of the three kinds of model formats.
 Given its popularity, the TRT-LLM HLAPI chooses to support HuggingFace format as one of the start points, to use the HLAPI on LLaMA models, you need to run the following conversion script provided in [transformers/llama](https://huggingface.co/docs/transformers/main/model_doc/llama) or [transformers/llama2](https://huggingface.co/docs/transformers/main/model_doc/llama2) to convert the Meta checkpoint to HuggingFace format.
 
 For instance, when targeting the LLaMA2 7B model, the official way to retrieve the model is to visit the [LLaMA2 7B model page](https://huggingface.co/transformers/llama2-7B), normally you need to submit a request for the model file.
-For a quick start, you can also download the model checkpoint files directly from [modelscope.cn](https://www.modelscope.cn/models/shakechen/Llama-2-7b/files), the command is as follows:
-
-``` sh
-git clone https://www.modelscope.cn/shakechen/Llama-2-7b.git
-```
 
 To convert the checkpoint files, a script from transformers is required, thus please also clone the transformers repo with the following code:
 
@@ -257,28 +252,31 @@ generation = llm.generate_async(<prompt>)
 output = await generation.aresult()
 ```
 
-### Customizing sampling with `SamplingConfig`
-With SamplingConfig, you can customize the sampling strategy, such as beam search, temperature, and so on.
+### Customizing sampling with `SamplingParams`
+With SamplingParams, you can customize the sampling strategy, such as beam search, temperature, and so on.
 
-To enable beam search with a beam size of 4, set the `sampling_config` as follows:
+To enable beam search with a beam size of 4, set the `sampling_params` as follows:
 
 ```python
 from tensorrt_llm import ModelConfig, LLM
-from tensorrt_llm.hlapi import SamplingConfig
+from tensorrt_llm.hlapi import SamplingParams
 
 config = ModelConfig(model_dir=<llama_model_path>, max_beam_width=4)
 
 llm = LLM(config)
 # Let the LLM object generate text with the default sampling strategy, or
-# you can create a SamplingConfig object as well with several fields set manually
-sampling_config = llm.get_default_sampling_config()
-sampling_config.beam_width = 4 # current limitation: beam_width should be equal to max_beam_width
+# you can create a SamplingParams object as well with several fields set manually
+sampling_params = SamplingParams(beam_width=4) # current limitation: beam_width should be equal to max_beam_width
 
-for output in llm.generate(<prompt>, sampling_config=sampling_config):
+for output in llm.generate(<prompt>, sampling_params=sampling_params):
     print(output)
 ```
 
-You can set other fields in the `SamplingConfig` object to customize the sampling strategy, please refer to the [SamplingConfig](https://nvidia.github.io/TensorRT-LLM/_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14SamplingConfigE) class for more details.
+`SamplingParams` manages and dispatches fields to C++ classes including:
+* [SamplingConfig](https://nvidia.github.io/TensorRT-LLM/_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14SamplingConfigE)
+* [OutputConfig](https://nvidia.github.io/TensorRT-LLM/_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor12OutputConfigE)
+
+Please refer to these classes for more details.
 
 ## LLM pipeline configuration
 

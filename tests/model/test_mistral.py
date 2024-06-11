@@ -100,6 +100,7 @@ class TestMistral(unittest.TestCase):
                 max_batch_size=batch_size,
                 max_input_len=input_len,
                 max_seq_len=input_len + output_len,
+                max_num_tokens=batch_size * input_len,
                 use_cache=True,
                 max_beam_width=beam_width)
             # Forward

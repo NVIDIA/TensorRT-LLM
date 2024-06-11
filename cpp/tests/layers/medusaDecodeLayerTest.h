@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2023-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -66,10 +66,10 @@ private:
     SizeType32 mMaxBatchSize{2 * mBatchSize};
     SizeType32 const mVocabSize{9};
     SizeType32 const mVocabSizePadded{mVocabSize};
-    SizeType32 const mMaxTokensPerStep{12};
-    SizeType32 const mMaxNumHeads{4};
+    SizeType32 const mMaxDecodingTokens{12};
+    SizeType32 const mMaxDraftPathLen{4};
 
-    SizeType32 const mMaxSeqLen{mMaxTokensPerStep};
+    SizeType32 const mMaxSeqLen{mMaxDecodingTokens};
     TokenIdType mEndId{mVocabSize};
 
     bool mUseLogitsVec{false};

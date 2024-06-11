@@ -43,6 +43,7 @@ def create_optimize_network():
         inputs = model.prepare_inputs(max_batch_size=1,
                                       max_input_len=1024,
                                       max_seq_len=1024 + 32,
+                                      max_num_tokens=1024,
                                       use_cache=True,
                                       max_beam_width=1)
         model(**inputs)

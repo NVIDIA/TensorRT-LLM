@@ -315,6 +315,7 @@ class GenerationMixin:
             max_beam_width,
             max_input_len,
             max_seq_len,
+            max_num_tokens,
             hidden_size,
             num_kv_heads,
             head_size,
@@ -331,7 +332,6 @@ class GenerationMixin:
             dtype=None,
             num_heads=None,
             mapping=Mapping(),
-            max_num_tokens=None,
             opt_num_tokens=None,
             prompt_embedding_table_size: int = 0,
             position_encoding_2d=False,
@@ -371,11 +371,6 @@ class GenerationMixin:
         enable_ctx_gen_opt_profiles = GenerationMixin.has_ctx_gen_opt_profiles(
             use_gpt_attention_plugin, use_gemm_plugin, remove_input_padding,
             paged_kv_cache)
-        if max_num_tokens is None:
-            # Draft tokens cannot be combined with beam search
-            max_num_tokens = max(
-                max_batch_size * max_input_len,
-                max_batch_size * max(tokens_per_engine_step, max_beam_width))
         if enable_ctx_gen_opt_profiles:
             num_profiles = 2
             bb_range = [bb_range_cxt, bb_range_gen]
@@ -393,7 +388,8 @@ class GenerationMixin:
                     max_num_tokens)
             else:
                 if opt_num_tokens is None:
-                    opt_num_tokens = max_batch_size * max_beam_width
+                    opt_num_tokens = min(max_num_tokens,
+                                         max_batch_size * max_beam_width)
                 num_tokens_range = [[1, opt_num_tokens, max_num_tokens]]
             num_profiles = len(num_tokens_range)
             bb_range = [bb_range_gen] * num_profiles

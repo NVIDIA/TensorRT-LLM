@@ -15,7 +15,7 @@ from tensorrt_llm import logger
 
 from .._utils import release_gc
 from ..profiler import device_memory_info, host_memory_info
-from .llm import LLM, ModelConfig, SamplingConfig
+from .llm import LLM, ModelConfig, SamplingParams
 from .utils import is_directory_empty, print_colored
 
 
@@ -236,28 +236,28 @@ class LLMPerfEvaluator:
         self.perf_items = []
         sample_offset = 0
 
-        sampling_config = SamplingConfig(
+        sampling_params = SamplingParams(
             end_id=end_id,
             pad_id=end_id,
             beam_width=beam_width,
         )
 
         async def lane(num_tasks: int,
-                       sampling_config: SamplingConfig,
+                       sampling_params: SamplingParams,
                        warmup=False):
             nonlocal sample_offset
 
             for i in range(num_tasks):
                 sample = self.samples[sample_offset]
                 sample_offset += 1
-                sampling_config.max_new_tokens = sample.output_len
-                sampling_config.end_id = -2
-                sampling_config.pad_id = -2
+                sampling_params.max_new_tokens = sample.output_len
+                sampling_params.end_id = -2
+                sampling_params.pad_id = -2
 
                 start = time.time()
                 output = self.llm.generate_async(
                     sample.input_ids,
-                    sampling_config=SamplingConfig(
+                    sampling_params=SamplingParams(
                         max_new_tokens=sample.output_len))
                 output = await output.aresult()
                 end = time.time()
@@ -274,7 +274,7 @@ class LLMPerfEvaluator:
             for i in range(math.ceil(self.warmup / len(self.samples))):
                 asyncio.run(
                     lane(min(self.warmup, len(self.samples)),
-                         sampling_config,
+                         sampling_params,
                          warmup=True))
             sample_offset = 0
 
@@ -284,7 +284,7 @@ class LLMPerfEvaluator:
         async def run_lanes():
             num_tasks = len(self.samples) // self.batch_size
             lanes = [
-                lane(num_tasks, sampling_config) for _ in range(self.batch_size)
+                lane(num_tasks, sampling_params) for _ in range(self.batch_size)
             ]
             await asyncio.gather(*lanes)
 

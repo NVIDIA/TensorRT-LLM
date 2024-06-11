@@ -350,6 +350,7 @@ def test_gpt_json_config():
             "gpt_attention_plugin": False,
             "remove_input_padding": False,
             "use_custom_all_reduce": False,
+            "context_fmha": False,
             "use_paged_context_fmha": False,
             "lora_plugin": False,
         }
@@ -597,12 +598,38 @@ def test_trt_gpt_model_optional_params():
     opt_params.kv_cache_config = kv_cache_config
     assert opt_params.kv_cache_config.free_gpu_memory_fraction == kv_cache_config.free_gpu_memory_fraction
 
+    assert not opt_params.enable_trt_overlap
     opt_params.enable_trt_overlap = True
     assert opt_params.enable_trt_overlap
 
     assert opt_params.device_ids is None
     opt_params.device_ids = [0, 1]
     assert opt_params.device_ids == [0, 1]
+
+    assert not opt_params.enable_chunked_context
+    opt_params.enable_chunked_context = True
+    assert opt_params.enable_chunked_context
+
+    assert opt_params.normalize_log_probs
+    opt_params.normalize_log_probs = False
+    assert not opt_params.normalize_log_probs
+
+    assert not opt_params.decoding_config.decoding_mode
+    opt_params.decoding_config.decoding_mode = _tb.executor.DecodingMode.TopKTopP(
+    )
+    assert opt_params.decoding_config.decoding_mode.isTopKandTopP()
+
+    assert not opt_params.max_beam_width
+    opt_params.max_beam_width = 4
+    assert opt_params.max_beam_width == 4
+
+    assert opt_params.scheduler_config.capacity_scheduler_policy == _tb.executor.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
+    assert opt_params.scheduler_config.context_chunking_policy == None
+    opt_params.scheduler_config = _tb.executor.SchedulerConfig(
+        _tb.executor.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
+        _tb.executor.ContextChunkingPolicy.FIRST_COME_FIRST_SERVED)
+    assert opt_params.scheduler_config.capacity_scheduler_policy == _tb.executor.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
+    assert opt_params.scheduler_config.context_chunking_policy == _tb.executor.ContextChunkingPolicy.FIRST_COME_FIRST_SERVED
 
 
 def test_trt_gpt_model_optional_params_ctor():

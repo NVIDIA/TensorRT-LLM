@@ -16,6 +16,8 @@ import argparse
 import os
 import time
 
+from transformers import AutoConfig
+
 import tensorrt_llm
 from tensorrt_llm.models import (Phi3ForCausalLM, Phi3SmallForCausalLM,
                                  PhiForCausalLM)
@@ -57,16 +59,7 @@ def parse_arguments():
                         type=str,
                         default='tllm_checkpoint',
                         help='The path to save the TensorRT-LLM checkpoint')
-    parser.add_argument('--model_type',
-                        type=str,
-                        default='phi-2',
-                        choices=[
-                            'phi-2', 'Phi-3-mini-4k-instruct',
-                            'Phi-3-mini-128k-instruct',
-                            'Phi-3-small-8k-instruct',
-                            'Phi-3-small-128k-instruct'
-                        ],
-                        help='Model to be converted.')
+
     parser.add_argument(
         '--workers',
         type=int,
@@ -86,19 +79,18 @@ if __name__ == '__main__':
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
 
+    model_config = AutoConfig.from_pretrained(args.model_dir,
+                                              trust_remote_code=True)
+    model_type = model_config.architectures[0]
+    supported_model = {
+        'PhiForCausalLM': PhiForCausalLM,
+        'Phi3ForCausalLM': Phi3ForCausalLM,
+        'Phi3SmallForCausalLM': Phi3SmallForCausalLM
+    }
     modelForCausalLM = None
-    if args.model_type == 'phi-2':
-        modelForCausalLM = PhiForCausalLM
-    elif args.model_type in [
-            'Phi-3-mini-4k-instruct', 'Phi-3-mini-128k-instruct'
-    ]:
-        modelForCausalLM = Phi3ForCausalLM
-    elif args.model_type in [
-            'Phi-3-small-8k-instruct', 'Phi-3-small-128k-instruct'
-    ]:
-        modelForCausalLM = Phi3SmallForCausalLM
-    else:
+    if model_type not in supported_model:
         assert False, "Invalid model type"
+    modelForCausalLM = supported_model[model_type]
 
     modelForCausalLM.convert_hf_checkpoint(args.model_dir,
                                            dtype=args.dtype,

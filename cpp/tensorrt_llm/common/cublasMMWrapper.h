@@ -76,6 +76,10 @@ public:
         std::optional<cublasLtMatmulHeuristicResult_t> const& algo);
 
     void Gemm(cublasOperation_t transa, cublasOperation_t transb, int const m, int const n, int const k, void const* A,
+        int const lda, void const* B, int const ldb, void* C, int const ldc, float f_alpha, float f_beta,
+        std::optional<cublasLtMatmulHeuristicResult_t> const& algo);
+
+    void Gemm(cublasOperation_t transa, cublasOperation_t transb, int const m, int const n, int const k, void const* A,
         int const lda, void const* B, int const ldb, void* C, int const ldc, float f_alpha, float f_beta);
 
     void Gemm(cublasOperation_t transa, cublasOperation_t transb, int const m, int const n, int const k, void const* A,

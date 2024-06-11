@@ -50,14 +50,14 @@ void MedusaModule::initMedusaTensorsFromChoices(MedusaChoices const& choices, st
 
     dumpChoices(choices, sortedIndices);
 
-    topKs.resize(getMaxAcceptedDraftTokensPerStep(), 0);
+    topKs.resize(getMaxDraftPathLen(), 0);
     auto generationInputLengthsPtr = bufferCast<SizeType32>(*generationInputLengths);
     auto positionOffsetsPtr = bufferCast<SizeType32>(*positionOffsets);
     auto treeIdsPtr = bufferCast<SizeType32>(*treeIds);
 
     // Fixed sequence length currently.
     std::fill(generationInputLengthsPtr, generationInputLengthsPtr + generationInputLengths->getSize(),
-        getMaxDraftTokens() + 1);
+        getMaxDecodingTokens());
     std::fill(positionOffsetsPtr, positionOffsetsPtr + positionOffsets->getSize(), -1);
     std::fill(treeIdsPtr, treeIdsPtr + treeIds->getSize(), -1);
 
@@ -83,7 +83,7 @@ void MedusaModule::initMedusaTensorsFromChoices(MedusaChoices const& choices, st
     prevPrefixToLinearIdxMap[0] = 0;
     positionOffsetsPtr[0] = 0;
 
-    TLLM_CHECK(numChoices <= getMaxDraftTokens());
+    TLLM_CHECK(numChoices <= getMaxDecodingDraftTokens());
 
     for (SizeType32 ci = 0; ci < numChoices; ++ci)
     {
@@ -210,16 +210,15 @@ SizeType32 MedusaModule::computePathsAndMask(
             while (tree[nodeIdx].nodeId != -1)
             {
                 auto const& curNode = tree[nodeIdx];
-                pathsPtr[(numPaths - 1 - pathIdx) * (getMaxAcceptedDraftTokensPerStep() + 1) + curNode.depth]
-                    = curNode.linearIdx;
+                pathsPtr[(numPaths - 1 - pathIdx) * getMaxPathLen() + curNode.depth] = curNode.linearIdx;
                 // Go from top to the bottom
                 nodeIdx = curNode.parentLinearIdx;
             }
             // Fill data for root
             // +0 is for root of the paths
-            // getMaxAcceptedDraftTokensPerStep() + 1 is because paths includes max accepted tokens and root
+            // getMaxPathLen() is because paths includes max accepted tokens and root
             // numPaths - 1 is because numPaths is the size of the paths tensor, but we need an index of the last path.
-            pathsPtr[(numPaths - 1 - pathIdx) * (getMaxAcceptedDraftTokensPerStep() + 1) + 0] = 0;
+            pathsPtr[(numPaths - 1 - pathIdx) * getMaxPathLen() + 0] = 0;
             // Fill next path
             pathIdx++;
         }

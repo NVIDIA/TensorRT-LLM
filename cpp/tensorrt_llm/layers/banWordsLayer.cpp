@@ -171,7 +171,7 @@ void BanWordsLayer<T>::forwardAsync(
     auto inputs = std::dynamic_pointer_cast<DynamicDecodeInputParams>(baseInputs);
     auto outputs = std::dynamic_pointer_cast<DynamicDecodeOutputParams>(baseOutputs);
 
-    auto const localDecoderDomain = getLocalDecoderDomain(inputs);
+    auto const localDecoderDomain = getLocalDecoderDomain(inputs, mDecoderDomain);
     auto const maxSeqLen = outputs->output_ids.shape[outputs->output_ids.shape.size() - 1];
     auto batchSlots = inputs->batch_slots ? inputs->batch_slots->template getPtr<SizeType32 const>() : nullptr;
 

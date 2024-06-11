@@ -21,12 +21,13 @@ import tensorrt as trt
 from .._common import default_net, precision
 from .._utils import (fp32_array, int32_array, is_same_dtype, trt_dtype_to_np,
                       trt_dtype_to_str, trt_gte_10)
-from ..functional import (ACT2FN, AttentionMaskType, Conditional,
-                          PositionEmbeddingType, RopeEmbeddingUtils,
-                          RotaryScalingType, Tensor, arange, bert_attention,
-                          cast, clip, concat, constant, embedding, expand,
-                          expand_dims, expand_mask, generate_alibi_biases,
-                          generate_alibi_slopes, gpt_attention, matmul)
+from ..functional import (ACT2FN, AllReduceFusionParams, AttentionMaskType,
+                          Conditional, PositionEmbeddingType,
+                          RopeEmbeddingUtils, RotaryScalingType, Tensor, arange,
+                          bert_attention, cast, clip, concat, constant,
+                          embedding, expand, expand_dims, expand_mask,
+                          generate_alibi_biases, generate_alibi_slopes,
+                          gpt_attention, matmul)
 from ..functional import max as fmax
 from ..functional import (minimum, repeat_interleave, shape, slice, softmax,
                           split, unsqueeze, where)
@@ -290,7 +291,8 @@ class Attention(Module):
                  alibi_bias_max=8,
                  skip_cross_qkv=False,
                  max_attn_value=0.0,
-                 block_sparse_params=None):
+                 block_sparse_params=None,
+                 use_implicit_relative_attention=False):
         super().__init__()
 
         self.local_layer_idx = local_layer_idx
@@ -340,6 +342,7 @@ class Attention(Module):
         self.rotary_embedding_scale_type = RotaryScalingType.none
         self.rotary_embedding_scale = 1.0
         self.rotary_embedding_percentage = rotary_embedding_percentage
+        self.use_implicit_relative_attention = self.relative_attention and use_implicit_relative_attention
         if rotary_embedding_scaling is not None:
             assert rotary_embedding_scaling["type"] in ["linear", "dynamic"]
             self.rotary_embedding_scale_type = RotaryScalingType.linear if rotary_embedding_scaling[
@@ -376,27 +379,37 @@ class Attention(Module):
 
                 self.register_parameter(
                     'embed_positions_short_factors',
-                    Parameter(embed_positions_short_factors, dtype='float32'))
+                    Parameter(embed_positions_short_factors,
+                              dtype='float32',
+                              is_buffer=True))
                 self.register_parameter(
                     'embed_positions_long_factors',
-                    Parameter(embed_positions_long_factors, dtype='float32'))
+                    Parameter(embed_positions_long_factors,
+                              dtype='float32',
+                              is_buffer=True))
                 self.register_parameter(
                     'embed_positions_short_factors_for_attention_plugin',
                     Parameter(
                         embed_positions_short_factors_for_attention_plugin,
-                        dtype='float32'))
+                        dtype='float32',
+                        is_buffer=True))
                 self.register_parameter(
                     'embed_positions_long_factors_for_attention_plugin',
                     Parameter(embed_positions_long_factors_for_attention_plugin,
-                              dtype='float32'))
+                              dtype='float32',
+                              is_buffer=True))
                 self.short_mscale = short_mscale
                 self.long_mscale = long_mscale
                 self.register_parameter(
                     'rope_scaling_short_factors',
-                    Parameter(rope_scaling_short_factors, dtype='float32'))
+                    Parameter(rope_scaling_short_factors,
+                              dtype='float32',
+                              is_buffer=True))
                 self.register_parameter(
                     'rope_scaling_long_factors',
-                    Parameter(rope_scaling_long_factors, dtype='float32'))
+                    Parameter(rope_scaling_long_factors,
+                              dtype='float32',
+                              is_buffer=True))
             else:
                 # Rotary cos/sin cache.
                 embed_positions = RopeEmbeddingUtils.create_sinusoidal_positions(
@@ -405,7 +418,7 @@ class Attention(Module):
                 )
                 self.register_parameter(
                     'embed_positions',
-                    Parameter(embed_positions, dtype='float32'))
+                    Parameter(embed_positions, dtype='float32', is_buffer=True))
                 embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
                     self.max_position_embeddings, self.rotary_embedding_dim,
                     self.rotary_embedding_base, self.rotary_embedding_scale,
@@ -413,7 +426,8 @@ class Attention(Module):
                 self.register_parameter(
                     'embed_positions_for_gpt_attention',
                     Parameter(embed_positions_for_gpt_attention,
-                              dtype='float32'))
+                              dtype='float32',
+                              is_buffer=True))
 
         elif self.position_embedding_type.is_alibi():
             alibi_scale = 1. / self.norm_factor if self.scale_alibi_bias else 1.
@@ -423,8 +437,9 @@ class Attention(Module):
                 tp_rank=self.tp_rank,
                 alibi_scale=alibi_scale,
                 alibi_bias_max=self.alibi_bias_max)
-            self.register_parameter('alibi_slopes',
-                                    Parameter(alibi_slopes, dtype='float32'))
+            self.register_parameter(
+                'alibi_slopes',
+                Parameter(alibi_slopes, dtype='float32', is_buffer=True))
 
         self.quant_mode = quant_mode
         self.max_attn_value = max_attn_value
@@ -463,7 +478,7 @@ class Attention(Module):
         self.qkv_lora = None
 
         # per-layer relative attention table
-        if relative_attention:
+        if self.use_implicit_relative_attention:
             self.rel_attn_table = Parameter(shape=(num_attention_heads //
                                                    tp_size, num_buckets),
                                             dtype=dtype)
@@ -492,7 +507,8 @@ class Attention(Module):
                 norm_before_bmm1=False,
                 lora_layer_params=None,
                 cross_kv_cache_gen: Optional[Tensor] = None,
-                cross_qkv_reuse: Optional[Tensor] = None):
+                cross_qkv_reuse: Optional[Tensor] = None,
+                reduce_fusion_params: Optional[AllReduceFusionParams] = None):
 
         assert isinstance(hidden_states, Tensor)
 
@@ -642,42 +658,40 @@ class Attention(Module):
         if self.cross_attention and encoder_output:
             assert isinstance(encoder_output, Tensor)
 
-            encoder_output_tensor = None
-            cross_qkv_reuse_tensor = None
+            def compute_cross_qkv(encoder_output):
+                cross_qkv = self.qkv(encoder_output, qkv_lora_params)
+
+                if default_net(
+                ).plugin_config.lora_plugin and qkv_lora_params is None and lora_layer_params is not None:
+                    cross_q_lora, cross_k_lora, cross_v_lora = self.qkv_lora(
+                        encoder_output,
+                        qkv_lora_runtime_params,
+                        is_cross_attention=True)
+                    cross_qkv_lora = concat(
+                        [cross_q_lora, cross_k_lora, cross_v_lora],
+                        dim=cross_q_lora.rank() - 1)
+                    cross_qkv = cross_qkv + cross_qkv_lora
+
+                return cross_qkv
+
             if self.skip_cross_qkv:
                 conditional = Conditional(cross_kv_cache_gen)
-                encoder_output_tensor = conditional.add_input(encoder_output)
-                cross_qkv_reuse_tensor = conditional.add_input(cross_qkv_reuse)
-            else:
-                encoder_output_tensor = encoder_output
+                cond_in1 = conditional.add_input(encoder_output)
+                cond_in2 = conditional.add_input(cross_qkv_reuse)
 
-            ## True branch: context phase, compute cross qkv
-            cross_qkv_true = self.qkv(encoder_output_tensor, qkv_lora_params)
+                ## True branch: context phase, compute cross qkv
+                cross_qkv_true = compute_cross_qkv(cond_in1)
 
-            if default_net(
-            ).plugin_config.lora_plugin and qkv_lora_params is None and lora_layer_params is not None:
-                cross_q_lora, cross_k_lora, cross_v_lora = self.qkv_lora(
-                    encoder_output_tensor,
-                    qkv_lora_runtime_params,
-                    is_cross_attention=True)
-                cross_qkv_lora = concat(
-                    [cross_q_lora, cross_k_lora, cross_v_lora],
-                    dim=cross_q_lora.rank() - 1)
-                cross_qkv_true = cross_qkv_true + cross_qkv_lora
-            ## End True branch
-
-            ## False branch: generation phase, no compute but need to obey shape constraints
-            # because TRT's IfConditional requires the output shape of two subgraphs to be identical
-            # our 1st attempt was to stack encoder_output [B, S, H] or [N, H] --> cross qkv [B, S, 3*H] or [N, 3*H], but it still introduces unnecessary concat. A better solution is to create a dummy torch tensor `cross_qkv_resue` with the correct shape and reuse it in every generation step
-            cross_qkv_false = cross_qkv_reuse_tensor
-            ## End False branch
-
-            # IfConditional layer
-            if self.skip_cross_qkv:
+                ## False branch: generation phase, no compute but need to obey shape constraints
+                # because TRT's IfConditional requires the output shape of two subgraphs to be identical
+                # our 1st attempt was to stack encoder_output [B, S, H] or [N, H] --> cross qkv [B, S, 3*H] or [N, 3*H],
+                # but it still introduces unnecessary concat. A better solution is to create a dummy torch tensor `cross_qkv_resue`
+                # with the correct shape and reuse it in every generation step
+                cross_qkv_false = cond_in2
                 cross_qkv = conditional.add_output(cross_qkv_true,
                                                    cross_qkv_false)
             else:
-                cross_qkv = cross_qkv_true
+                cross_qkv = compute_cross_qkv(encoder_output)
 
         if default_net().plugin_config.gpt_attention_plugin:
             if self.cross_attention and (past_key_value is not None):
@@ -1090,21 +1104,23 @@ class Attention(Module):
 
             if self.relative_attention:
                 query_length = shape(query, 2)
-                relative_bias = compute_relative_bias(
-                    query_length + key_length - 1,
-                    key_length,
-                    self.num_buckets,
-                    self.max_distance,
-                    False,  # bidirectional
-                    self.rel_attn_table.value.transpose(1, 0),
-                    tp_size=self.tp_size,
-                    tp_group=self.tp_group,
-                    tp_rank=self.tp_rank)
+                if self.use_implicit_relative_attention:
+                    relative_bias = compute_relative_bias(
+                        query_length + key_length - 1,
+                        key_length,
+                        self.num_buckets,
+                        self.max_distance,
+                        False,  # bidirectional
+                        self.rel_attn_table.value.transpose(1, 0),
+                        tp_size=self.tp_size,
+                        tp_group=self.tp_group,
+                        tp_rank=self.tp_rank)
+                else:
+                    relative_bias = unsqueeze(self.rel_attn_table.value, 0)
                 start = concat([0, 0, query_length + key_length - 2, 0])
                 size = concat([
                     shape(relative_bias, 0),
-                    shape(relative_bias, 1), 1,
-                    shape(relative_bias, 3)
+                    shape(relative_bias, 1), 1, key_length
                 ])
                 relative_bias = slice(relative_bias, start, size)
 
@@ -1173,12 +1189,21 @@ class Attention(Module):
 
         if self.inner_layernorm is not None:
             context = self.inner_layernorm(context)
-        context = self.dense(context, lora_runtime_params=dense_lora_params)
+        context = self.dense(context,
+                             lora_runtime_params=dense_lora_params,
+                             reduce_fusion_params=reduce_fusion_params)
 
         if use_cache:
             return (context, past_key_value)
         else:
             return context
+
+    def set_rel_attn_table(self, max_seq_len, precomputed_relative_attention):
+        self.rel_attn_table = Parameter(shape=(self.num_attention_heads,
+                                               max_seq_len + 1,
+                                               max_seq_len + 1),
+                                        dtype=self.dtype)
+        self.rel_attn_table.value = precomputed_relative_attention
 
 
 class BertAttention(Module):

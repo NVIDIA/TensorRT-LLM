@@ -27,7 +27,7 @@ from ..module import Module
 from .mpi_session import (MpiCommSession, MPINodeState, MpiPoolSession,
                           MpiSession, external_mpi_comm_available)
 from .tokenizer import TokenizerBase, TransformersTokenizer
-from .utils import (GenerationOutput, GpuArch, OutputConfig, SamplingConfig,
+from .utils import (GenerationOutput, GpuArch, SamplingParams,
                     download_hf_model, file_with_glob_exists,
                     file_with_suffix_exists, get_device_count, init_log_level,
                     print_colored, print_traceback_on_error)
@@ -100,9 +100,8 @@ class ModelConfig:
     # Either HF model, TensorRT-LLM checkpoints or TensorRT-LLM engine format is supported.
     model_dir: Optional[str] = None
 
-    # ``model`` could either the model directory or a in-memory model.
-    # If ``model`` specifies the model kind like "llama-7B", etc.  The model will be download automatically from third-party
-    # model hub like www.modelscope.cn or huggingface
+    # ``model`` could either be the model directory or a in-memory model.
+    # ``model`` specifies the model kind like "llama-7B", etc.
     model: Optional[Union[str, Module]] = None
 
     # ``parallel_config`` is used to specify the parallelism of the model.
@@ -433,110 +432,96 @@ class LLM:
     def generate(
         self,
         prompts: Union[Iterable[str], Iterable[List[int]]],
-        sampling_config: Optional[Union[SamplingConfig,
-                                        List[SamplingConfig]]] = None,
-        output_config: Optional[OutputConfig] = None,
-        bad_words: Optional[List[List[int]]] = None,
-        stop_words: Optional[List[List[int]]] = None,
+        sampling_params: Optional[Union[SamplingParams,
+                                        List[SamplingParams]]] = None,
     ) -> Iterable[GenerationOutput]:
         ''' Generate the output for the given inputs.
 
         Args:
             prompts: The raw text or token ids to the model.
-            sampling_config: The sampling config for the generation, a default one will be used if not provided.
+            sampling_params: The sampling params for the generation, a default one will be used if not provided.
         '''
         prompts = list(prompts)
 
-        if sampling_config is None:
-            sampling_config = self.get_default_sampling_config()
-        else:
-            _sampling_config = sampling_config if isinstance(
-                sampling_config, list) else [sampling_config]
-            for sc in _sampling_config:
-                if sc.end_id is None:
-                    if self.tokenizer is None:
-                        raise ValueError(
-                            f"end_id is required in the sampling_config if tokenizer is not provided."
-                        )
-                    sc.end_id = self.tokenizer.eos_token_id
-                    sc.pad_id = self.tokenizer.eos_token_id
-
-        output_config = output_config or OutputConfig()
-
-        results = self._executor.generate(
-            prompts,
-            sampling_config=sampling_config,
-            output_config=output_config,
-            bad_words=bad_words,
-            stop_words=stop_words,
-        )
+        sampling_params = self._prepare_sampling_params(sampling_params)
+        self._generate_check_arguments(prompts, sampling_params)
+        results = self._executor.generate(prompts,
+                                          sampling_params=sampling_params)
 
         return results
 
-    def generate_async(
-            self,
-            prompt: Union[str, List[int]],
-            sampling_config: Optional[SamplingConfig] = None,
-            output_config: Optional[OutputConfig] = None,
-            streaming: bool = False,
-            bad_words: Optional[List[int]] = None,
-            stop_words: Optional[List[int]] = None) -> GenerationResult:
+    def generate_async(self,
+                       prompt: Union[str, List[int]],
+                       sampling_params: Optional[SamplingParams] = None,
+                       streaming: bool = False) -> GenerationResult:
         ''' Generate in asynchronuous mode.
 
         Args:
             prompt: The raw text or token ids to the model.
-            sampling_config: The sampling config for the generation, a default one will be used if not provided.
+            sampling_params: The sampling params for the generation, a default one will be used if not provided.
             streaming: Whether to use the streaming mode for the generation.
         '''
-        if sampling_config is None:
-            sampling_config = self.get_default_sampling_config()
-        self._generate_check_arguments([prompt], sampling_config)
-
-        output_config = output_config or OutputConfig()
+        sampling_params = self._prepare_sampling_params(sampling_params)
+        self._generate_check_arguments([prompt], sampling_params)
 
         results = self._executor.generate_async(
             prompt,
             streaming=streaming,
-            sampling_config=sampling_config,
-            output_config=output_config,
-            stop_words=[stop_words] if stop_words is not None else None,
-            bad_words=[bad_words] if bad_words is not None else None,
+            sampling_params=sampling_params,
         )
         return results
 
+    def _prepare_sampling_params(
+        self,
+        sampling_params: Optional[Union[SamplingParams,
+                                        List[SamplingParams]]] = None):
+        if sampling_params is None:
+            if self.tokenizer is None:
+                raise ValueError(
+                    "tokenizer is required to initialize a default sampling_params, or you can explicitly specify a sampling_params"
+                )
+            return SamplingParams(end_id=self.tokenizer.eos_token_id,
+                                  pad_id=self.tokenizer.pad_token_id)
+        if isinstance(sampling_params, SamplingParams):
+            sampling_params = [sampling_params]
+        for sp in sampling_params:
+            if sp.end_id is None:
+                if self.tokenizer is None:
+                    raise ValueError(
+                        "tokenizer is required to reset end_id if it is None, or you can explicitly specify the end_id for sampling_params"
+                    )
+                sp.end_id = self.tokenizer.eos_token_id
+                sp.pad_id = self.tokenizer.pad_token_id
+        if len(sampling_params) == 1:
+            sampling_params = sampling_params[0]
+        return sampling_params
+
     def _generate_check_arguments(self, prompts,
-                                  sampling_config: SamplingConfig):
-        if sampling_config is None:
-            raise ValueError("The sampling_config should to be provided.")
-        if sampling_config.top_k is not None or sampling_config.top_p is not None:
-            raise ValueError("The top_k and top_p are not supported yet.")
+                                  sampling_params: SamplingParams):
+        if sampling_params is None:
+            raise ValueError("The sampling_params should be provided.")
 
         build_config = self.config.build_config
 
-        sampling_configs = [sampling_config] if isinstance(
-            sampling_config, SamplingConfig) else sampling_config
-        max_num_beams = max([sc.beam_width for sc in sampling_configs])
-        if max_num_beams > build_config.max_beam_width:
-            raise ValueError(
-                f"num_beams is larger than the maximum in the built engine {max_num_beams} > {build_config.max_beam_width}"
-            )
-        if len(prompts) > build_config.max_batch_size:
-            raise ValueError(
-                f"Batch size {len(prompts)} is larger than the maximum in the built engine {build_config.max_batch_size}"
-            )
+        for i, prompt in enumerate(prompts):
+            if isinstance(sampling_params, list):
+                sp = sampling_params[i]
+            else:
+                sp = sampling_params
+            if isinstance(prompt, list):
+                prompt_len = len(prompt)
+            else:
+                # TODO(enweiz): move tokenizer from GenerationExecutor to LLM and validate on token ids here
+                prompt_len = len(prompt.split())
 
-        input_digits = False
-        if isinstance(prompts[0], list):
-            input_digits = True
-        if input_digits and sum(
-                len(prompt)
-                for prompt in prompts) > build_config.max_num_tokens:
-            raise ValueError(f"The total input length is too large")
-        if not input_digits:
-            if max(len(prompt.split())
-                   for prompt in prompts) > build_config.max_input_len:
+            if prompt_len + sp.max_new_tokens > build_config.max_input_len + build_config.max_output_len:
                 raise ValueError(
-                    f"Input length is larger than the maximum in the built engine"
+                    f"The sum of prompt length ({prompt_len}) and max_new_tokens ({sp.max_new_tokens}) should not exceed "
+                    f"the sum of max_input_len ({build_config.max_input_len}) and max_output_len ({build_config.max_output_len})"
+                )
+            if sp.beam_width > build_config.max_beam_width:
+                raise ValueError(
+                    f"sampling_params's beam_width ({sp.beam_width}) should not exceed max_beam_width ({build_config.max_beam_width})"
                 )
 
     @property
@@ -594,23 +579,6 @@ class LLM:
                              self.config.model_dir,
                              engine_dir=engine_dir,
                              model_info=self.runtime_context.model_info)
-
-    def get_default_sampling_config(self) -> Optional[SamplingConfig]:
-        ''' Get the default sampling config for the model.
-        You can override the options.
-        '''
-        tokenizer = self.tokenizer
-        if tokenizer is None:
-            try:
-                tokenizer = ModelLoader.load_hf_tokenizer(self.config.model_dir)
-            except:
-                return None
-
-        return SamplingConfig(
-            end_id=tokenizer.eos_token_id,
-            pad_id=tokenizer.eos_token_id
-            if tokenizer.pad_token_id is None else tokenizer.pad_token_id,
-        )
 
     def _build_model(self):
         model_format = self.config.model_format
@@ -678,10 +646,11 @@ class LLM:
             executor_config.kv_cache_config = self.kv_cache_config
         executor_config.normalize_log_probs = self.normalize_log_probs
         executor_config.enable_chunked_context = self.enable_chunked_context
+        executor_config.max_beam_width = self.config.build_config.max_beam_width
+
         self._executor = GenerationExecutor.create(
             get_engine_dir(),
             tokenizer,
-            max_beam_width=self.config.build_config.max_beam_width,
             executor_config=executor_config,
             scheduler_config=tllm.executor.SchedulerConfig(
                 self.capacity_scheduling_policy, self.context_chunking_policy),
@@ -1000,7 +969,7 @@ class ModelLoader:
         raise ValueError(f"Unknown model format for {model_dir}")
 
     def _download_hf_model(self):
-        ''' Download HF model from third-party model hub like www.modelscope.cn or huggingface.  '''
+        ''' Download HF model. '''
         assert self.workspace is not None
         assert isinstance(self.config.model, str)
         self._model_dir = download_hf_model(self.config.model)

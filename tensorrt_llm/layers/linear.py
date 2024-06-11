@@ -21,7 +21,8 @@ import torch.nn.functional as F
 
 from .._common import default_net, default_trtnet
 from .._utils import pad_vocab_size, set_obj_attrs, str_dtype_to_trt
-from ..functional import (Tensor, _add_plugin_info, _create_tensor, allgather,
+from ..functional import (AllReduceFusionOp, AllReduceFusionParams, Tensor,
+                          _add_plugin_info, _create_tensor, allgather,
                           allreduce, cast, matmul)
 from ..mapping import Mapping
 from ..module import Module
@@ -37,6 +38,7 @@ def _gemm_plugin(input: Tensor,
                  pad_lda: int = 0,
                  pad_ldb: int = 0,
                  use_fp8: bool = False,
+                 alpha: Optional[np.ndarray] = None,
                  strict_dtype: Optional[trt.DataType] = None) -> Tensor:
     '''
     output = op(mat2)op(input)
@@ -73,6 +75,9 @@ def _gemm_plugin(input: Tensor,
         use_fp8: bool
             Do we use fp8 GEMM.
 
+        alpha: float
+            Alpha for fp8 GEMM.
+
         strict_dtype: trt.DataType
             Set the data type for the GEMM plugin. If it is None, the data
             type is the gemm_plugin type set in the plugin_config.
@@ -80,6 +85,15 @@ def _gemm_plugin(input: Tensor,
     plg_creator = trt.get_plugin_registry().get_plugin_creator(
         'Gemm', '1', TRT_LLM_PLUGIN_NAMESPACE)
     assert plg_creator is not None
+
+    if use_fp8:
+        assert (
+            isinstance(alpha, np.ndarray) and alpha.dtype == np.float32
+            and alpha.size == 1,
+            "`alpha` must be passed as a float32 ndarray if `use_fp8` is enabled for _gemm_plugin"
+        )
+        assert input.dtype == trt.fp8
+        assert mat2.dtype == trt.fp8
 
     transa = 1 if transa else 0
     transa = trt.PluginField("transa", np.array(transa, dtype=np.int32),
@@ -94,18 +108,23 @@ def _gemm_plugin(input: Tensor,
     use_fp8 = 1 if use_fp8 else 0
     use_fp8 = trt.PluginField("use_fp8", np.array(use_fp8, dtype=np.int32),
                               trt.PluginFieldType.INT32)
+    alpha = alpha if alpha else np.array(1.0, dtype=np.float32)
+    alpha = trt.PluginField("alpha", alpha.flatten(),
+                            trt.PluginFieldType.FLOAT32)
 
     if strict_dtype is not None:
         assert isinstance(strict_dtype, trt.DataType)
         p_dtype = strict_dtype
     else:
         p_dtype = str_dtype_to_trt(default_net().plugin_config.gemm_plugin)
+        assert p_dtype != trt.fp8, "need to use strict dtype in gemm plugin fp8"
     pf_type = trt.PluginField("type_id", np.array([int(p_dtype)], np.int32),
                               trt.PluginFieldType.INT32)
     pfc = trt.PluginFieldCollection(
-        [transa, transb, pad_lda, pad_ldb, pf_type, use_fp8])
+        [transa, transb, pad_lda, pad_ldb, pf_type, use_fp8, alpha])
     gemm_plug = plg_creator.create_plugin("gemm", pfc)
     plug_inputs = [input.trt_tensor, mat2.trt_tensor]
+
     layer = default_trtnet().add_plugin_v2(plug_inputs, gemm_plug)
     _add_plugin_info(layer, plg_creator, "gemm", pfc)
     return _create_tensor(layer.get_output(0), layer)
@@ -161,16 +180,23 @@ class Linear(Module):
                         weight,
                         gemm_plugin: Optional[str] = None,
                         use_fp8: bool = False,
+                        alpha: Optional[np.ndarray] = None,
                         lora_runtime_params: Optional[LoraRuntimeParams] = None,
                         lora_hidden_state: Optional[Tensor] = None):
         hidden_state = x
         if gemm_plugin:
+            if gemm_plugin == 'fp8':
+                strict_dtype = str_dtype_to_trt(self.dtype) if isinstance(
+                    self.dtype, str) else self.dtype
+            else:
+                strict_dtype = self.strict_dtype
             x = _gemm_plugin(x,
                              weight,
                              transb=True,
                              pad_lda=self.pad_lda,
                              use_fp8=use_fp8,
-                             strict_dtype=self.strict_dtype)
+                             alpha=alpha,
+                             strict_dtype=strict_dtype)
         else:
             x = matmul(x, weight, transb=True)
 
@@ -291,21 +317,30 @@ class RowLinear(Module):
         self.tp_size = tp_size
         self.strict_dtype = self.dtype if strict_dtype else None
 
-    def multiply_reduce(self,
-                        x,
-                        weight,
-                        gemm_plugin: Optional[str] = None,
-                        use_fp8: bool = False,
-                        lora_runtime_params: Optional[LoraRuntimeParams] = None,
-                        lora_hidden_state: Optional[Tensor] = None):
+    def multiply_reduce(
+            self,
+            x,
+            weight,
+            gemm_plugin: Optional[str] = None,
+            use_fp8: bool = False,
+            alpha: Optional[np.ndarray] = None,
+            lora_runtime_params: Optional[LoraRuntimeParams] = None,
+            lora_hidden_state: Optional[Tensor] = None,
+            reduce_fusion_params: Optional[AllReduceFusionParams] = None):
         hidden_state = x
         if gemm_plugin:
+            if gemm_plugin == 'fp8':
+                strict_dtype = str_dtype_to_trt(self.dtype) if isinstance(
+                    self.dtype, str) else self.dtype
+            else:
+                strict_dtype = self.strict_dtype
             x = _gemm_plugin(x,
                              weight,
                              transb=True,
                              pad_lda=self.pad_lda,
                              use_fp8=use_fp8,
-                             strict_dtype=self.strict_dtype)
+                             alpha=alpha,
+                             strict_dtype=strict_dtype)
         else:
             x = matmul(x, weight, transb=True)
 
@@ -316,7 +351,20 @@ class RowLinear(Module):
                               lora_runtime_params=lora_runtime_params)
 
         if self.tp_size > 1 and self.tp_group is not None:
-            x = allreduce(x, self.tp_group)
+            need_bias = self.bias is not None
+            fuse_bias_into_all_reduce = need_bias and (
+                reduce_fusion_params
+                is not None) and (reduce_fusion_params.fusion_op
+                                  == AllReduceFusionOp.RESIDUAL_RMS_NORM)
+            if fuse_bias_into_all_reduce:
+                reduce_fusion_params.bias = self.bias.value
+            x = allreduce(x,
+                          self.tp_group,
+                          reduce_fusion_params=reduce_fusion_params)
+            if need_bias and not fuse_bias_into_all_reduce:
+                bias = cast(self.bias.value, x.dtype)
+                x = x + bias
+            return x
 
         if self.bias is not None:
             bias = cast(self.bias.value, x.dtype)
@@ -327,13 +375,15 @@ class RowLinear(Module):
     def forward(self,
                 x,
                 lora_runtime_params: Optional[LoraRuntimeParams] = None,
-                lora_hidden_state: Optional[Tensor] = None):
+                lora_hidden_state: Optional[Tensor] = None,
+                reduce_fusion_params: Optional[AllReduceFusionParams] = None):
         return self.multiply_reduce(
             x,
             self.weight.value,
             gemm_plugin=default_net().plugin_config.gemm_plugin,
             lora_runtime_params=lora_runtime_params,
-            lora_hidden_state=lora_hidden_state)
+            lora_hidden_state=lora_hidden_state,
+            reduce_fusion_params=reduce_fusion_params)
 
     def weight_loader(self, mapping: Mapping, param: Parameter,
                       loaded_weight: torch.Tensor):

@@ -8,8 +8,9 @@ import torch
 from transformers import AutoTokenizer
 
 from tensorrt_llm._utils import mpi_world_size
+from tensorrt_llm.bindings import TrtGptModelOptionalParams
 from tensorrt_llm.executor import (GenerationExecutor, GenerationRequest,
-                                   SamplingConfig)
+                                   SamplingParams)
 from tensorrt_llm.hlapi.llm import LLM, ModelConfig
 
 _sys.path.append(_os.path.join(_os.path.dirname(__file__), '..'))
@@ -67,12 +68,14 @@ def test_generation_bs2(llama_7b_bs2_path: Path):
     tokenizer = llama_7b_bs2_path
     prompt = "A B C D"
     max_new_tokens = 8
+    executor_config = TrtGptModelOptionalParams()
+    executor_config.max_beam_width = 2
 
     with GenerationExecutor.create(llama_7b_bs2_path,
                                    tokenizer,
-                                   max_beam_width=2) as executor:
+                                   executor_config=executor_config) as executor:
         result = executor.generate(prompt,
-                                   sampling_config=SamplingConfig(
+                                   sampling_params=SamplingParams(
                                        max_new_tokens=max_new_tokens,
                                        beam_width=2))
         assert similar(result.text[0], 'E F G H I J K L')
@@ -86,16 +89,16 @@ def test_sync_generation(llama_7b_path: Path):
     expected_output = "E F G H"
     expected_long_output = "E F G H I J K L"
     split_output = ["E", " F", " G", " H", " I", " J", " K", " L"]
-    sampling_config0 = SamplingConfig(max_new_tokens=4)
-    sampling_config1 = SamplingConfig(max_new_tokens=8)
+    sampling_params0 = SamplingParams(max_new_tokens=4)
+    sampling_params1 = SamplingParams(max_new_tokens=8)
     with GenerationExecutor.create(llama_7b_path, tokenizer) as executor:
         # Simple generations (synchronous)
-        result = executor.generate(prompt, sampling_config=sampling_config0)
+        result = executor.generate(prompt, sampling_params=sampling_params0)
         assert result.text == expected_output
 
         results = executor.generate(
             [prompt, prompt],
-            sampling_config=[sampling_config0, sampling_config1])
+            sampling_params=[sampling_params0, sampling_params1])
         for result, expected in zip(results,
                                     (expected_output, expected_long_output)):
             assert result.text == expected
@@ -105,7 +108,7 @@ def test_sync_generation(llama_7b_path: Path):
         # Iterate the partial results when streaming
         future = executor.generate_async(prompt,
                                          streaming=True,
-                                         sampling_config=sampling_config0)
+                                         sampling_params=sampling_params0)
         for idx, partial_result in enumerate(future):
             assert partial_result.text_diff == split_output[idx]
 
@@ -114,7 +117,7 @@ def test_sync_generation(llama_7b_path: Path):
         futures = executor.generate_async(
             [prompt, prompt],
             streaming=True,
-            sampling_config=[sampling_config0, sampling_config1])
+            sampling_params=[sampling_params0, sampling_params1])
         for future in futures:
             for idx, partial_result in enumerate(future):
                 assert partial_result.text_diff == split_output[idx]
@@ -129,7 +132,7 @@ def test_sync_generation(llama_7b_path: Path):
                     GenerationRequest(
                         prompt,
                         tokenizer=AutoTokenizer.from_pretrained(llama_7b_path),
-                        sampling_config=sampling_config0)))
+                        sampling_params=sampling_params0)))
 
         for future in executor.wait_first_completed(futures):
             assert future.done
@@ -140,7 +143,7 @@ def test_sync_generation(llama_7b_path: Path):
                     reason="Must run on 2 MPI ranks with at least 2 GPUs")
 def test_sync_generation_tp_main_node_only(llama_7b_tp2_path: Path):
     prompt = "deep learning"
-    sampling_config = SamplingConfig(max_new_tokens=4)
+    sampling_params = SamplingParams(max_new_tokens=4)
 
     with GenerationExecutor.create(llama_7b_tp2_path,
                                    llama_7b_tp2_path) as executor:
@@ -149,7 +152,7 @@ def test_sync_generation_tp_main_node_only(llama_7b_tp2_path: Path):
         # from now on, only rank0 lives in the with statement
         # other nodes wait at the "end" of the with statement
 
-        result = executor.generate(prompt, sampling_config=sampling_config)
+        result = executor.generate(prompt, sampling_params=sampling_params)
         assert result.text == "<s> deep learning, neural network,"
 
 
@@ -158,12 +161,12 @@ def test_sync_generation_tp_main_node_only(llama_7b_tp2_path: Path):
 def test_sync_generation_tp_inner(llama_7b_tp2_path: Path):
     prompt = "deep learning"
     tp_size = 2
-    sampling_config = SamplingConfig(max_new_tokens=4)
+    sampling_params = SamplingParams(max_new_tokens=4)
 
     executor = GenerationExecutor.create(llama_7b_tp2_path,
                                          llama_7b_tp2_path,
                                          model_world_size=tp_size)
-    result = executor.generate(prompt, sampling_config=sampling_config)
+    result = executor.generate(prompt, sampling_params=sampling_params)
     assert result.text == ", neural network,"
     executor.shutdown()
 

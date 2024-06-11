@@ -5,7 +5,7 @@ from pathlib import Path
 import tensorrt_llm
 from tensorrt_llm import BuildConfig, build
 from tensorrt_llm.executor import GenerationExecutor
-from tensorrt_llm.hlapi import SamplingConfig
+from tensorrt_llm.hlapi import SamplingParams
 from tensorrt_llm.models import LLaMAForCausalLM
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
@@ -71,9 +71,9 @@ def main():
 
     executor = GenerationExecutor.create(engine_dir, tokenizer_dir)
 
-    sampling_config = SamplingConfig(max_new_tokens=20)
+    sampling_params = SamplingParams(max_new_tokens=20)
     for inp in read_input():
-        output = executor.generate(inp, sampling_config=sampling_config)
+        output = executor.generate(inp, sampling_params=sampling_params)
         print(f">{output.text}")
 
 

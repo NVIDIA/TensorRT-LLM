@@ -54,7 +54,7 @@ protected:
 
         MedusaModule medusaModule(medusaHeads, maxMedusaTokens);
         auto const numPackedMasks = medusaModule.getNumPackedMasks();
-        auto const tokensPerStep = medusaModule.getMaxDraftTokens() + 1;
+        auto const tokensPerStep = medusaModule.getMaxDecodingTokens();
 
         // batch size = 1 here.
         TensorPtr medusaGenerationLengthsHost = mManager->pinned(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);

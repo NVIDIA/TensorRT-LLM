@@ -16,11 +16,7 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/speculativeDecodingModule.h"
-#include <vector>
 
 namespace tensorrt_llm::runtime
 {
@@ -29,7 +25,7 @@ class LookaheadModule : public SpeculativeDecodingModule
 {
 public:
     explicit LookaheadModule(SizeType32 maxAcceptedTokens, SizeType32 maxDraftTokens) noexcept
-        : SpeculativeDecodingModule(maxAcceptedTokens, maxDraftTokens)
+        : SpeculativeDecodingModule(maxAcceptedTokens, maxDraftTokens, maxDraftTokens)
     {
     }
 

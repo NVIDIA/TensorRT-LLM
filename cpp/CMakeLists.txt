@@ -180,9 +180,31 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   endif()
 endif()
 
-message(STATUS "GPU architectures: ${CMAKE_CUDA_ARCHITECTURES}")
-# Store CMAKE_CUDA_ARCHITECTURES for later use since torch sets this to "OFF"
-set(CMAKE_CUDA_ARCHITECTURES_ORIG "${CMAKE_CUDA_ARCHITECTURES}")
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "native")
+  # Detect highest available compute capability
+  set(OUTPUTFILE ${PROJECT_BINARY_DIR}/detect_cuda_arch)
+  set(CUDAFILE ${CMAKE_SOURCE_DIR}/cmake/utils/detect_cuda_arch.cu)
+  execute_process(COMMAND ${CMAKE_CUDA_COMPILER} -lcuda ${CUDAFILE} -o
+                          ${OUTPUTFILE})
+  message(VERBOSE "Detecting native CUDA compute capability")
+  execute_process(
+    COMMAND ${OUTPUTFILE}
+    RESULT_VARIABLE CUDA_RETURN_CODE
+    OUTPUT_VARIABLE CUDA_ARCH_OUTPUT)
+  if(NOT ${CUDA_RETURN_CODE} EQUAL 0)
+    message(WARNING "Detecting native CUDA compute capability - fail")
+    message(
+      WARNING "CUDA compute capability detection failed, compiling for 'all'")
+    set(CMAKE_CUDA_ARCHITECTURES_ORIG "all")
+  else()
+    message(STATUS "Detecting native CUDA compute capability - done")
+    set(CMAKE_CUDA_ARCHITECTURES_ORIG "${CUDA_ARCH_OUTPUT}")
+  endif()
+else()
+  # Store CMAKE_CUDA_ARCHITECTURES for later use since torch sets this to "OFF"
+  set(CMAKE_CUDA_ARCHITECTURES_ORIG "${CMAKE_CUDA_ARCHITECTURES}")
+endif()
+message(STATUS "GPU architectures: ${CMAKE_CUDA_ARCHITECTURES_ORIG}")
 
 enable_language(C CXX CUDA)
 

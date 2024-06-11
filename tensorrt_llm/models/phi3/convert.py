@@ -7,7 +7,6 @@ def convert_hf_weights(hf_model, dtype, **kwargs):
     torch_dtype = str_dtype_to_torch(dtype)
     hf_state_dict = hf_model.state_dict()
     weights = {}
-
     # replace key name
     for key, value in hf_state_dict.items():
         # Decoder Layers
@@ -64,7 +63,8 @@ def convert_hf_config(hf_config, dtype, **kwargs):
         'architecture': "Phi3ForCausalLM",
         'dtype': dtype,
         'num_hidden_layers': hf_config.num_hidden_layers,
-        'num_attention_heads': hf_config.num_key_value_heads,
+        'num_attention_heads': hf_config.num_attention_heads,
+        'num_key_value_heads': hf_config.num_key_value_heads,
         'rope_theta': hf_config.rope_theta,
         'hidden_size': hf_config.hidden_size,
         'intermediate_size': hf_config.intermediate_size,

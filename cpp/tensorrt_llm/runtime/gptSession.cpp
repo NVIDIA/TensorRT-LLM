@@ -167,7 +167,8 @@ void GptSession::createDecoders(SizeType32 batchSize, SizeType32 beamWidth, Size
     {
         if (decoderPerRequest)
         {
-            mDecoders.emplace_back(std::make_shared<GptDecoderBatch>(vocabSize, vocabSizePadded, stream));
+            mDecoders.emplace_back(std::make_shared<GptDecoderBatch>(
+                vocabSize, vocabSizePadded, stream, mModelConfig.getSpeculativeDecodingMode()));
         }
         else
         {
@@ -402,7 +403,8 @@ ITensor::SharedPtr GptSession::initDecoder(ITensor& outputIds, GenerationInput c
 namespace
 {
 std::tuple<std::vector<ITensor::SharedPtr>, std::vector<ITensor::SharedPtr>, std::vector<SizeType32>> splitInputIds(
-    GenerationInput const& inputs, SizeType32 microBatchSize, BufferManager& manager)
+    GenerationInput const& inputs, SizeType32 microBatchSize, BufferManager& manager,
+    std::optional<SizeType32> maxNumTokens)
 {
     auto const numRequests = static_cast<SizeType32>(inputs.lengths->getShape().d[0]);
 
@@ -426,7 +428,11 @@ std::tuple<std::vector<ITensor::SharedPtr>, std::vector<ITensor::SharedPtr>, std
             auto const batchSize = std::min(microBatchSize, numRequests - offset);
             auto const numTokens = std::accumulate(
                 contextLengthsRange.begin() + offset, contextLengthsRange.begin() + offset + batchSize, 0);
-
+            if (maxNumTokens)
+                TLLM_CHECK_WITH_INFO(numTokens <= maxNumTokens.value(),
+                    "Micro-batch %d with %d token exceeds max_num_tokens=%d, consider to use larger value when "
+                    "building engine",
+                    offset / microBatchSize, numTokens, maxNumTokens.value());
             ITensor::SharedPtr batchInputs = ITensor::slice(inputIdsView, tokensBegin, numTokens);
             TLLM_CHECK(batchInputs->getShape().nbDims == 1);
             TLLM_CHECK(batchInputs->getShape().d[0] == numTokens);
@@ -453,11 +459,11 @@ std::tuple<std::vector<ITensor::SharedPtr>, std::vector<ITensor::SharedPtr>, std
     return {inputIds, inputLengths, microBatchOffsets};
 }
 
-std::vector<GenerationInput> splitInputs(
-    GenerationInput const& inputs, SizeType32 microBatchSize, BufferManager& manager)
+std::vector<GenerationInput> splitInputs(GenerationInput const& inputs, SizeType32 microBatchSize,
+    BufferManager& manager, std::optional<SizeType32> maxNumTokens)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto [inputIds, inputLengths, microBatchOffsets] = splitInputIds(inputs, microBatchSize, manager);
+    auto [inputIds, inputLengths, microBatchOffsets] = splitInputIds(inputs, microBatchSize, manager, maxNumTokens);
 
     std::vector<GenerationInput> inputBatches;
     for (std::size_t batchId = 0; batchId < inputIds.size(); ++batchId)
@@ -647,7 +653,6 @@ void GptSession::generate(GenerationOutput& outputs, GenerationInput const& inpu
 
     // callbacks
     auto const onTokenGenerated = createOnTokenGeneratedCallback(outputs);
-
     if (batchSize <= mMicroBatchConfig.genBatchSize)
     {
         std::vector<GenerationInput> microBatchesInputs{inputs};
@@ -656,7 +661,8 @@ void GptSession::generate(GenerationOutput& outputs, GenerationInput const& inpu
     }
     else
     {
-        auto const microBatchesInputs = splitInputs(inputs, mMicroBatchConfig.genBatchSize, manager);
+        auto const microBatchesInputs
+            = splitInputs(inputs, mMicroBatchConfig.genBatchSize, manager, mModelConfig.getMaxNumTokens());
         auto microBatchesOutputs = splitOutputs(outputs, mMicroBatchConfig.genBatchSize, mWorldConfig);
         generateBatched(microBatchesOutputs, microBatchesInputs, samplingConfig, onTokenGenerated, generationProfiler);
     }
@@ -871,7 +877,7 @@ void GptSession::executeContextStep(std::vector<GenerationInput> const& generati
 
         auto const contextBatchSize = mMicroBatchConfig.ctxBatchSize;
         auto [inputIds, inputLengths, contextBatchOffsets]
-            = splitInputIds(generationBatchInputs, contextBatchSize, manager);
+            = splitInputIds(generationBatchInputs, contextBatchSize, manager, mModelConfig.getMaxNumTokens());
         auto contextBuffers = generationBuffers.split(contextBatchSize, mModelConfig, mWorldConfig);
         TLLM_CHECK(inputIds.size() == contextBuffers.size());
         auto const numContextBatches = static_cast<SizeType32>(contextBuffers.size());

@@ -37,7 +37,7 @@ class MedusaSetupParams : public BaseSetupParams
 {
 public:
     std::optional<std::vector<int32_t>> runtimeTopK;                   // [1] or [setupBatchSize] on cpu
-    std::optional<std::vector<std::vector<int32_t>>> runtimeHeadsTopK; // [setupBatchSize, maxMedusaHeads] on cpu
+    std::optional<std::vector<std::vector<int32_t>>> runtimeHeadsTopK; // [setupBatchSize, maxDraftPathLen] on cpu
     std::optional<std::vector<uint64_t>> randomSeed;                   // [1] or [setupBatchSize] on cpu
 };
 
@@ -50,13 +50,14 @@ public:
     {
     }
 
-    tc::Tensor logits;                                 // [maxBatchSize, beamWidth, vocabSizePadded]
+    tc::Tensor logits;                    // [maxBatchSize, beamWidth, vocabSizePadded]
 
-    tc::Tensor paths;                                  // [maxBatchSize, maxTokensPerStep, maxNumHeads + 1] on gpu
-    std::vector<std::vector<tc::Tensor>> medusaLogits; // [maxBatchSize][maxNumHeads][tokensPerStep, vocabSize] on gpu
-    tc::Tensor medusaCurTokensPerStep;                 // [maxBatchSize] on gpu
-    tc::Tensor medusaTargetTokensPerStep;              // [maxBatchSize] on gpu
-    tc::Tensor treeIds;                                // [maxBatchSize, maxTokensPerStep] on gpu
+    tc::Tensor paths;                     // [maxBatchSize, maxDecodingTokens, maxPathLen] on gpu
+    std::vector<std::vector<tc::Tensor>>
+        medusaLogits;                     // [maxBatchSize][maxDraftPathLen][maxDecodingTokens, vocabSize] on gpu
+    tc::Tensor medusaCurTokensPerStep;    // [maxBatchSize] on gpu
+    tc::Tensor medusaTargetTokensPerStep; // [maxBatchSize] on gpu
+    tc::Tensor treeIds;                   // [maxBatchSize, maxDecodingTokens] on gpu
 };
 
 //! \brief
@@ -81,16 +82,11 @@ private:
     void allocateBuffer();
     void freeBuffer();
 
-    void samplePrimeHeadTokens(
-        std::shared_ptr<DynamicDecodeOutputParams> const& outputs, std::shared_ptr<MedusaInputParams> const& inputs);
-    void acceptDraftTokens(
-        std::shared_ptr<DynamicDecodeOutputParams> const& outputs, std::shared_ptr<MedusaInputParams> const& inputs);
-    void sampleNewDraftTokens(
-        std::shared_ptr<DynamicDecodeOutputParams> const& outputs, std::shared_ptr<MedusaInputParams> const& inputs);
-    void scatterNewDraftTokens(
-        std::shared_ptr<DynamicDecodeOutputParams> const& outputs, std::shared_ptr<MedusaInputParams> const& inputs);
-    void packAcceptedPaths(
-        std::shared_ptr<DynamicDecodeOutputParams> const& outputs, std::shared_ptr<MedusaInputParams> const& inputs);
+    void samplePrimeHeadTokens(DynamicDecodeOutputParams const& outputs, MedusaInputParams const& inputs);
+    void acceptDraftTokens(DynamicDecodeOutputParams const& outputs, MedusaInputParams const& inputs);
+    void sampleNewDraftTokens(DynamicDecodeOutputParams const& outputs, MedusaInputParams const& inputs);
+    void scatterNewDraftTokens(DynamicDecodeOutputParams const& outputs, MedusaInputParams const& inputs);
+    void packAcceptedPaths(DynamicDecodeOutputParams const& outputs, MedusaInputParams const& inputs);
 
 private:
     using Base::mStream;

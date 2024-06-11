@@ -93,6 +93,8 @@ class TestPhi(unittest.TestCase):
             inputs = trtllm_model.prepare_inputs(batch_size,
                                                  input_len,
                                                  input_len + output_len,
+                                                 max_num_tokens=batch_size *
+                                                 input_len,
                                                  use_cache=True,
                                                  max_beam_width=beam_width)
             # Prepare

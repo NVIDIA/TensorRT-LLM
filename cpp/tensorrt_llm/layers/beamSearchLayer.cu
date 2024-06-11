@@ -174,7 +174,7 @@ void BeamSearchLayer<T>::forwardAsync(
     auto outputs = std::dynamic_pointer_cast<DynamicDecodeOutputParams>(baseOutputs);
     auto params = std::dynamic_pointer_cast<DynamicDecodeInputParams>(baseInputs);
 
-    auto const localDecoderDomain = getLocalDecoderDomain(params);
+    auto const localDecoderDomain = getLocalDecoderDomain(params, mDecoderDomain);
 
     auto batchSlots = params->batch_slots ? params->batch_slots->template getPtr<SizeType32 const>() : nullptr;
     auto const maxSeqLen = outputs->output_ids.shape[outputs->output_ids.shape.size() - 1];

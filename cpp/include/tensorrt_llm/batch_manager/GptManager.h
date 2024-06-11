@@ -48,9 +48,9 @@ public:
     using RequestList = std::list<std::shared_ptr<LlmRequest>>;
     using TensorPtr = runtime::ITensor::SharedPtr;
 
-    GptManager(std::filesystem::path const& trtEnginePath, TrtGptModelType modelType, SizeType32 maxBeamWidth,
-        executor::SchedulerConfig const& schedulerConfig, GetInferenceRequestsCallback getInferenceRequestsCb,
-        SendResponseCallback sendResponseCb, PollStopSignalCallback pollStopSignalCb = nullptr,
+    GptManager(std::filesystem::path const& trtEnginePath, TrtGptModelType modelType,
+        GetInferenceRequestsCallback getInferenceRequestsCb, SendResponseCallback sendResponseCb,
+        PollStopSignalCallback pollStopSignalCb = nullptr,
         ReturnBatchManagerStatsCallback returnBatchManagerStatsCb = nullptr,
         TrtGptModelOptionalParams const& optionalParams = TrtGptModelOptionalParams(),
         std::optional<uint64_t> terminateReqId = std::nullopt, bool excludeInputInOutput = false);

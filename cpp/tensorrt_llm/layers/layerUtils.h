@@ -91,7 +91,8 @@ inline bool allOfBatchSlots(
         batchSlotsHost, batchSlotsHost + batchSize, [&](runtime::SizeType32 b) { return data[b] == value; });
 }
 
-inline DecoderDomain getLocalDecoderDomain(std::shared_ptr<BaseInputParams> baseInputs)
+inline DecoderDomain getLocalDecoderDomain(
+    std::shared_ptr<BaseInputParams> baseInputs, DecoderDomain const& globalDecoderDomain)
 {
     auto inputs = std::dynamic_pointer_cast<DynamicDecodeInputParams>(baseInputs);
     runtime::SizeType32 batchSize{0};
@@ -106,7 +107,7 @@ inline DecoderDomain getLocalDecoderDomain(std::shared_ptr<BaseInputParams> base
         beamWidth = logitsShape[idxOffset + 1];
         vocabSize = logitsShape[idxOffset + 2];
     }
-    else
+    else if (inputs->logits_vec)
     {
         TLLM_CHECK(inputs->logits_vec->size());
         auto const& logitsShape = inputs->logits_vec.value()[0].shape;
@@ -115,6 +116,17 @@ inline DecoderDomain getLocalDecoderDomain(std::shared_ptr<BaseInputParams> base
         batchSize = inputs->logits_vec->size();
         beamWidth = logitsShape[idxOffset + 1];
         vocabSize = logitsShape[idxOffset + 2];
+    }
+    else if (inputs->batch_slots)
+    {
+        auto const& batchSlotsShape = inputs->batch_slots->shape;
+        batchSize = batchSlotsShape[0];
+        beamWidth = globalDecoderDomain.getBeamWidth();
+        vocabSize = globalDecoderDomain.getVocabSize();
+    }
+    else
+    {
+        TLLM_THROW("Can't get local Decoder domain");
     }
     return DecoderDomain(batchSize, beamWidth, vocabSize);
 }

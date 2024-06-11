@@ -77,13 +77,13 @@ list(REMOVE_ITEM ALL_SRCS
      "${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/gemm_swiglu_e4m3.cu")
 
 message(
-  STATUS
-    "Mixed srcs ${MIXED_SRC_CPP} ${MIXED_SRC_CU} ${MIXED_CU_INSTANTIATIONS}")
+  VERBOSE
+  "Mixed srcs ${MIXED_SRC_CPP} ${MIXED_SRC_CU} ${MIXED_CU_INSTANTIATIONS}")
 message(
-  STATUS
-    "Group srcs ${GROUPED_SRC_CU} ${GROUPED_SRC_CPP} ${GROUPED_CU_INSTANTIATIONS}"
+  VERBOSE
+  "Group srcs ${GROUPED_SRC_CU} ${GROUPED_SRC_CPP} ${GROUPED_CU_INSTANTIATIONS}"
 )
-message(STATUS "All srcs ${ALL_SRCS}")
+message(VERBOSE "All srcs ${ALL_SRCS}")
 
 add_library(cutlass_src STATIC ${ALL_SRCS})
 set_property(TARGET cutlass_src PROPERTY POSITION_INDEPENDENT_CODE ON)

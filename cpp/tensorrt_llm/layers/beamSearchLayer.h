@@ -109,6 +109,8 @@ private:
     using Base::mAllocator;
     using Base::mStream;
 
+    using Base::mDecoderDomain;
+
     bool mIsAllocateBuffer;
     runtime::SizeType32 mVocabSize{0};
     runtime::SizeType32 mVocabSizePadded{0};

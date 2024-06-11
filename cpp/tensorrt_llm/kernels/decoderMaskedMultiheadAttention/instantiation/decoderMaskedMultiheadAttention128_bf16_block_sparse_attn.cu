@@ -23,14 +23,14 @@ namespace kernels
 
 namespace
 {
-auto constexpr kSizePerHead = 32;
+auto constexpr kSizePerHead = 128;
 } // namespace
 
 namespace mmha
 {
 
 #ifdef ENABLE_BF16
-INSTANTIATE_MMHA_LAUNCHERS_WITH_QK_TANH_SCALE(__nv_bfloat16, kSizePerHead)
+INSTANTIATE_MMHA_LAUNCHERS_WITH_BLOCK_SPARSE_ATTN(__nv_bfloat16, kSizePerHead)
 #endif
 
 } // namespace mmha

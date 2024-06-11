@@ -359,22 +359,21 @@ size_t GPTAttentionPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* in
 {
     int const max_context_length = mMaxContextLength;
     int const cross_qkv_length = isCrossAttention() ? inputs[getIdx(IdxEntry::CROSS_QKV_LENGTH)].dims.d[0] : 0;
-    int const nbReq = inputs[getIdx(IdxEntry::CONTEXT_LENGTHS)].dims.d[0];
+    int const max_num_seq = inputs[getIdx(IdxEntry::CONTEXT_LENGTHS)].dims.d[0];
     auto const type = inputs[getIdx(IdxEntry::QKV_TENSOR)].type;
     int const max_kv_cache_length
         = isCrossAttention() ? cross_qkv_length : (useKVCache() ? inputs[getIdx(IdxEntry::CACHE_INDIR)].dims.d[2] : 0);
-    int const max_num_tokens = inputs[getIdx(IdxEntry::QKV_TENSOR)].dims.d[0];
-    size_t const context_workspace_size = getWorkspaceSizeForContext(
-        type, nbReq, max_context_length, max_kv_cache_length, cross_qkv_length, max_num_tokens);
-
-    int const total_num_seq = inputs[getIdx(IdxEntry::CONTEXT_LENGTHS)].dims.d[0];
+    int const max_num_tokens
+        = mRemovePadding ? inputs[getIdx(IdxEntry::QKV_TENSOR)].dims.d[0] : max_num_seq * max_context_length;
+    size_t const context_workspace_size
+        = getWorkspaceSizeForContext(type, max_num_seq, max_context_length, cross_qkv_length, max_num_tokens);
 
     int32_t const num_spec_dec_tokens
         = mIsSpecDecodingEnabled ? inputs[getIdx(IdxEntry::SPEC_DECODING_POSITION_OFFSETS)].dims.d[1] : 1;
     int32_t const max_batch_beam = inputs[getIdx(IdxEntry::CONTEXT_LENGTHS)].dims.d[0];
     int32_t const max_num_gen_tokens = std::min(max_num_tokens, num_spec_dec_tokens * max_batch_beam);
     size_t const generation_workspace_size
-        = getWorkspaceSizeForGeneration(type, total_num_seq, max_kv_cache_length, max_num_tokens);
+        = getWorkspaceSizeForGeneration(type, max_num_seq, max_kv_cache_length, max_num_tokens);
 
     size_t attention_input_workspace_size = 0;
     if (mUnfuseQkvGemm)
@@ -384,8 +383,7 @@ size_t GPTAttentionPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* in
         int const local_hidden_units_kv
             = inputs[getIdx(IdxEntry::K_TENSOR)].dims.d[getPackedTensorHiddenDimIndex(mRemovePadding)];
         size_t const size = tensorrt_llm::runtime::BufferDataType(type).getSize();
-        size_t const attention_input_size
-            = size * nbReq * max_context_length * (local_hidden_units_q + 2 * local_hidden_units_kv);
+        size_t const attention_input_size = size * max_num_tokens * (local_hidden_units_q + 2 * local_hidden_units_kv);
         size_t workspaces[1];
         workspaces[0] = attention_input_size;
         attention_input_workspace_size = tensorrt_llm::common::calculateTotalWorkspaceSize(workspaces, 1);
@@ -679,8 +677,6 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
 
     if (is_context) // context stage
     {
-        TLLM_CHECK(max_context_q_len <= mMaxContextLength);
-
         int const batch_size = localNbSeq;
         int const request_batch_size = batch_size;
         // num of total tokens (without paddings when remove paddings).

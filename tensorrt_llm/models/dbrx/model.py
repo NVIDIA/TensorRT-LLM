@@ -31,6 +31,7 @@ class DbrxDecoderLayer(Module):
 
         self.input_layernorm = LayerNorm(normalized_shape=config.hidden_size,
                                          eps=config.norm_epsilon,
+                                         bias=False,
                                          dtype=config.dtype)
 
         layers_range = config.mapping.pp_layers(config.num_hidden_layers)
@@ -72,6 +73,7 @@ class DbrxDecoderLayer(Module):
                           **mlp_kwargs)
         self.post_layernorm = LayerNorm(normalized_shape=config.hidden_size,
                                         eps=config.norm_epsilon,
+                                        bias=False,
                                         dtype=config.dtype)
 
     def forward(self,
@@ -126,6 +128,7 @@ class DbrxModel(Module):
         if config.mapping.is_last_pp_rank():
             self.ln_f = LayerNorm(normalized_shape=config.hidden_size,
                                   eps=config.norm_epsilon,
+                                  bias=False,
                                   dtype=config.dtype)
 
     def forward(self,

@@ -25,9 +25,10 @@ This document shows how to build and run a LLaMA model in TensorRT-LLM on both s
   - [Running CodeLlama](#running-codellama)
     - [Build](#build)
     - [Run](#run-1)
-  - [Run LLaMa with LoRA](#run-llama-with-lora)
+  - [Run models with LoRA](#run-models-with-lora)
     - [Run LLaMa with several lora checkpoints](#run-llama-with-several-lora-checkpoints)
-    - [Run FP8 LLaMa with FP16 lora checkpoints](#run-fp8-llama-with-fp16-lora-checkpoints)
+    - [Run FP8 Mistral v0.1 with FP16 lora checkpoint](#run-fp8-mistral-v01-with-fp16-lora-checkpoint)
+    - [Run INT4-AWQ LLaMa with several FP16 lora checkpoints](#run-int4-awq-llama-with-several-fp16-lora-checkpoints)
   - [Run LLaMa with StreamingLLM](#run-llama-with-streamingllm)
 
 ## Overview
@@ -82,7 +83,7 @@ Normally `trtllm-build` only requires single GPU, but if you've already got all 
 
 `--use_fused_mlp` enables GEMM horizontal fusion in gated MLP layer, which reduces input traffic and potentially improves performance. For FP8 PTQ, the downside is slight reduction of accuracy because one of the quantization scaling factors are discarded (accuracy 0.45734 vs 0.45755 for LLaMA-v2 7B using modelopt/examples/hf/instruct_eval/mmlu.py).
 
-`--use_fused_mlp --use_gemm_swiglu_plugin <dtype>` fuses 2 GEMMs without biases and SwiGLU into one kernel. This is a preview feature and is only supported for dtype `fp8`. The supported architecture is SM90.
+`--use_fused_mlp --gemm_swiglu_plugin <dtype>` fuses 2 GEMMs without biases and SwiGLU into one kernel. This is a preview feature and is only supported for dtype `fp8`. The supported architecture is SM90.
 
 Here're some examples:
 
@@ -617,6 +618,26 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_2gpu_fp8 \
 The peak GPU memory consumption when doing FP8 quantizaton is more than 210GB (there is also some activation memory occupation when doing calibration).
 So you need a node with at least 4 H100(A100) to run the quantization command. After quantization, 2 GPUs are okay to for building and run.
 
+Experimental: use FP8 GEMV to optimize performance in FP8 small-batch-size cases.
+
+```bash
+# Quantize HF LLaMA 7B into FP8 and export trtllm checkpoint
+python ../quantization/quantize.py --model_dir /tmp/llama-7b-hf \
+                                   --dtype float16 \
+                                   --qformat fp8 \
+                                   --kv_cache_dtype fp8 \
+                                   --output_dir ./tllm_checkpoint_1gpu_fp8 \
+                                   --calib_size 512
+
+# Build trtllm engines from the trtllm checkpoint
+# Enable fp8 gemm plugin to get acceleration in small-batch-size cases
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_fp8 \
+             --output_dir ./engine_outputs \
+             --gemm_plugin fp8
+```
+
+**Note**: FP8 gemm plugin is an experimental feature aimed to improve performance in small-batch-size cases(e.g. BS<=4). Although inputs with batch size larger than 4 can be correctly inferenced, the performance may decrease as batch size grows.
+
 ### Groupwise quantization (AWQ/GPTQ)
 One can enable AWQ/GPTQ INT4 weight only quantization with these options when building engine with `trtllm-build`:
 
@@ -865,7 +886,7 @@ mpirun -n 8 --allow-run-as-root \
     --engine_dir codellama_34b --input_text "In python, write a function for binary searching an element in an integer array."
 ```
 
-## Run LLaMa with LoRA
+## Run models with LoRA
 
 * download the base model and lora model from HF
 
@@ -998,14 +1019,21 @@ Output [Text 5 Beam 0]: "ワシントン D.C."
 
 We can observe that `luotuo-lora-7b-0.1` produces correct answers on the first sentence and the fifth sentence (in Chinese), `Japanese-Alpaca-LoRA-7b-v0` produces correct answers on the sixth sentence (in Japanese).
 
-### Run FP8 LLaMa with FP16 lora checkpoints
+### Run FP8 Mistral v0.1 with FP16 lora checkpoint
 
-In this section, we show how to run an FP8 llama model with multiple FP16 LoRA modules.
+In this section, we use Mistral v0.1 as an example show how to run an FP8 base model with FP16 LoRA module.
 
-* Quantize the llama model to fp8 from HF
+* download the base model and lora model from HF
+
 ```bash
-BASE_LLAMA_MODEL=llama-7b-hf/
-python ../quantization/quantize.py --model_dir ${BASE_LLAMA_MODEL} \
+git-lfs clone https://huggingface.co/davidkim205/komt-mistral-7b-v1
+git-lfs clone https://huggingface.co/davidkim205/komt-mistral-7b-v1-lora
+```
+
+* Quantize the Mistral v0.1 model to fp8 from HF
+```bash
+BASE_MISTRAL_MODEL=komt-mistral-7b-v1/
+python ../quantization/quantize.py --model_dir ${BASE_MISTRAL_MODEL} \
                                    --dtype float16 \
                                    --qformat fp8 \
                                    --kv_cache_dtype fp8 \
@@ -1013,13 +1041,59 @@ python ../quantization/quantize.py --model_dir ${BASE_LLAMA_MODEL} \
                                    --calib_size 512
 ```
 
+* Build engine and run inference with sliding window/cache size 4096.
+```bash
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_fp8 \
+            --output_dir /tmp/mistral_komt_lora/7B/trt_engines/fp8/1-gpu/ \
+            --gemm_plugin auto \
+            --lora_plugin auto \
+            --max_batch_size 8 \
+            --max_input_len 32256 \
+            --max_output_len 1024 \
+            --lora_dir ./komt-mistral-7b-v1-lora
+
+python ../run.py --max_output_len=1024 \
+                 --tokenizer_dir ./komt-mistral-7b-v1 \
+                 --engine_dir=/tmp/mistral_komt_lora/7B/trt_engines/fp8/1-gpu/ \
+                 --input_text "[INST]오늘은 날씨가 아주 좋다 내가 공원에 갔을 때 [/INST]" \
+                 --max_attention_window_size=4096 \
+                 --lora_task_uids 0 \
+                 --use_py_session \
+                 --temperature 0.8 \
+                 --top_p 0.8 \
+                 --top_k 100
+```
+
+The results would be like
+
+```bash
+Input [Text 0]: "<s> [INST]오늘은 날씨가 아주 좋다 내가 공원에 갔을 때 [/INST]"
+Output [Text 0 Beam 0]: "날씨가 아주 좋은 날에 공원에 갔을 때는 산책이나 운동을 즐기는 것이 좋습니다. 공원에서 걷거나 조깅을 하면서 신선한 공기를 마시고 자연 속에서 휴식을 취할 수 있습니다. 또한, 공원에서 가족이나 친구와 함께 피크닉을 즐기거나 야외 스포츠를 즐길 수도 있습니다. 날씨가 좋을 때 공원에 가는 것은 건강과 웰빙에 좋은 방법입니다."
+```
+
+
+### Run INT4-AWQ LLaMa with several FP16 lora checkpoints
+
+TensorRT-LLM can also support Quantized base model + FP16/BF16 LoRA. We can first quantize the base model and build engine with the quantized checkpoint and different LoRA adapters. In this section, we show how to run an INT4-AWQ llama model with multiple FP16 LoRA modules.
+
+* Quantize the llama model to INT4-AWQ from HF
+```bash
+BASE_LLAMA_MODEL=llama-7b-hf/
+python ../quantization/quantize.py --model_dir ${BASE_LLAMA_MODEL} \
+                                   --output_dir ./tllm_checkpoint_1gpu_awq \
+                                   --dtype float16 \
+                                   --qformat int4_awq \
+                                   --awq_block_size 128 \
+                                   --calib_size 32
+```
+
 * Download the lora model, build engine, and run inference.
 ```bash
 git-lfs clone https://huggingface.co/qychen/luotuo-lora-7b-0.1
 git-lfs clone https://huggingface.co/kunishou/Japanese-Alpaca-LoRA-7b-v0
 
-trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_fp8 \
-            --output_dir /tmp/llama_7b_with_lora_qkv/trt_engines/fp8/1-gpu/ \
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_awq \
+            --output_dir /tmp/llama_7b_with_lora_qkv/trt_engines/int4_AWQ/1-gpu/ \
             --gemm_plugin auto \
             --lora_plugin auto \
             --max_batch_size 8 \
@@ -1029,7 +1103,7 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_fp8 \
             --max_lora_rank 8 \
             --lora_target_modules attn_q attn_k attn_v
 
-python ../run.py --engine_dir "/tmp/llama_7b_with_lora_qkv/trt_engines/fp8/1-gpu/" \
+python ../run.py --engine_dir "/tmp/llama_7b_with_lora_qkv/trt_engines/int4_AWQ/1-gpu/" \
               --max_output_len 10 \
               --tokenizer_dir ${BASE_LLAMA_MODEL} \
               --input_text "美国的首都在哪里? \n答案:" "美国的首都在哪里? \n答案:" "美国的首都在哪里? \n答案:" "アメリカ合衆国の首都はどこですか? \n答え:" "アメリカ合衆国の首都はどこですか? \n答え:" "アメリカ合衆国の首都はどこですか? \n答え:" \
@@ -1049,7 +1123,7 @@ Output [Text 1 Beam 0]: "华盛顿。
 "
 
 Input [Text 2]: "<s> 美国的首都在哪里? \n答案:"
-Output [Text 2 Beam 0]: "沃尔沛。\n"
+Output [Text 2 Beam 0]: "洛爱睿"
 
 Input [Text 3]: "<s> アメリカ合衆国の首都はどこですか? \n答え:"
 Output [Text 3 Beam 0]: "Washington, D.C.
@@ -1060,7 +1134,7 @@ Output [Text 4 Beam 0]: "华盛顿。
 "
 
 Input [Text 5]: "<s> アメリカ合衆国の首都はどこですか? \n答え:"
-Output [Text 5 Beam 0]: "ワシントン D.C."
+Output [Text 5 Beam 0]: "ワシントン、D.C"
 ```
 
 ## Run LLaMa with StreamingLLM

@@ -31,7 +31,7 @@ ReallocType TorchAllocator::reallocType(void const* ptr, size_t size) const
     {
         currentSize *= tensor.size(i);
     }
-    TLLM_LOG_DEBUG("current_buffer_size: %d, original buffer: %p, new buffer: %d", currentSize, ptr, size);
+    TLLM_LOG_TRACE("current_buffer_size: %d, original buffer: %p, new buffer: %d", currentSize, ptr, size);
     if (currentSize < size)
     {
         return ReallocType::INCREASE;
@@ -48,7 +48,7 @@ ReallocType TorchAllocator::reallocType(void const* ptr, size_t size) const
 
 void* TorchAllocator::malloc(size_t size, bool const setZero)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     auto const bufSize = static_cast<int64_t>(size);
     torch::Tensor buf = torch::empty({bufSize}, torch::dtype(torch::kUInt8).device(torch::kCUDA));
     void* ptr{buf.data_ptr()};
@@ -56,14 +56,14 @@ void* TorchAllocator::malloc(size_t size, bool const setZero)
     {
         memSet(ptr, 0, size);
     }
-    TLLM_LOG_DEBUG("malloc buffer %p with size %ld", ptr, size);
+    TLLM_LOG_TRACE("malloc buffer %p with size %ld", ptr, size);
     mPointerMapping.insert({ptr, buf});
     return ptr;
 }
 
 void TorchAllocator::free(void** ptr)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     mPointerMapping.erase(*ptr);
     *ptr = nullptr;
 }

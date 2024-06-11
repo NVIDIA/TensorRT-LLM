@@ -176,17 +176,18 @@ def test_gpt_manager(variant, results_file, llm_root: _pl.Path,
         assert _json.loads(stats_json)
 
     opt_params = _tb.TrtGptModelOptionalParams()
+    opt_params.max_beam_width = 1
+    opt_params.scheduler_config = _tb.executor.SchedulerConfig(
+        _tb.executor.CapacitySchedulerPolicy.MAX_UTILIZATION)
+
     memory_counters = _tb.MemoryCounters.instance()
     init_gpu_mem = memory_counters.gpu
 
     for _ in range(3):
         remaining_requests = len(inference_request_list)
-        with _tb.GptManager(
-                model_path, _tb.TrtGptModelType.InflightBatching, 1,
-                _tb.executor.SchedulerConfig(
-                    _tb.executor.CapacitySchedulerPolicy.MAX_UTILIZATION),
-                fetch_requests, response_cb, should_stop, stats_cb, opt_params,
-                10000) as manager:
+        with _tb.GptManager(model_path, _tb.TrtGptModelType.InflightBatching,
+                            fetch_requests, response_cb, should_stop, stats_cb,
+                            opt_params, 10000) as manager:
             while remaining_requests > 0:
                 _time.sleep(0.1)
             assert manager is not None
@@ -318,8 +319,9 @@ def test_gpt_manager_constrained_generation(variant, results_file,
 
     remaining_requests = len(inference_request_list)
     opt_params = _tb.TrtGptModelOptionalParams()
+    opt_params.max_beam_width = 1
     with _tb.GptManager(
-            model_path, _tb.TrtGptModelType.InflightBatching, 1,
+            model_path, _tb.TrtGptModelType.InflightBatching,
             _tb.executor.SchedulerConfig(
                 _tb.executor.CapacitySchedulerPolicy.MAX_UTILIZATION),
             fetch_requests, response_cb, should_stop, stats_cb, opt_params,

@@ -27,6 +27,12 @@ namespace tle = tensorrt_llm::executor;
 int main(int argc, char* argv[])
 {
 #if ENABLE_MULTI_DEVICE
+
+    if (std::getenv("FORCE_NCCL_ALL_REDUCE_STRATEGY") != nullptr)
+    {
+        TLLM_LOG_INFO("FORCE_NCCL_ALL_REDUCE_STRATEGY env variable detected in worker");
+    }
+
     // Register the TRT-LLM plugins
     initTrtLlmPlugins();
 

@@ -33,7 +33,8 @@ class AllreducePlugin : public BasePlugin
 {
 public:
     AllreducePlugin(std::set<int> group, nvinfer1::DataType type, kernels::AllReduceStrategyType strategy,
-        kernels::AllReduceStrategyConfig config, int32_t counter);
+        kernels::AllReduceStrategyConfig config, kernels::AllReduceFusionOp op, int32_t counter, float eps,
+        int8_t affine, int8_t bias);
 
     AllreducePlugin(void const* data, size_t length);
 
@@ -81,7 +82,11 @@ private:
     nvinfer1::DataType mType;
     kernels::AllReduceStrategyType mStrategy;
     kernels::AllReduceStrategyConfig mConfig;
+    kernels::AllReduceFusionOp mOp;
+    float mEps;
     int32_t mCounter;
+    int8_t mAffine;
+    int8_t mBias;
 };
 
 class AllreducePluginCreator : public BaseCreator

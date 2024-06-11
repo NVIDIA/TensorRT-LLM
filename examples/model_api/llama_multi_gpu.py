@@ -7,7 +7,7 @@ from mpi4py.futures import MPIPoolExecutor
 
 import tensorrt_llm
 from tensorrt_llm import BuildConfig, Mapping, build, mpi_barrier
-from tensorrt_llm.executor import GenerationExecutorWorker, SamplingConfig
+from tensorrt_llm.executor import GenerationExecutorWorker, SamplingParams
 from tensorrt_llm.models import LLaMAForCausalLM
 
 
@@ -41,11 +41,11 @@ def build_and_run_llama(hf_model_dir, engine_dir, tp_size, rank):
     generate_len = 20  # change on your needs, hard code for simplicity here
     executor = GenerationExecutorWorker(Path(engine_dir), tokenizer_dir)
 
-    sampling_config = SamplingConfig(max_new_tokens=generate_len)
+    sampling_params = SamplingParams(max_new_tokens=generate_len)
 
     output_streams = executor.generate_async(dataset(),
                                              True,
-                                             sampling_config=sampling_config)
+                                             sampling_params=sampling_params)
     if rank == 0:
         for stream in output_streams:
             for state in stream:

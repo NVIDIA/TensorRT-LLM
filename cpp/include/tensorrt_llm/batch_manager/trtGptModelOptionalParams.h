@@ -23,6 +23,7 @@
 #include "tensorrt_llm/runtime/common.h"
 
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager
@@ -39,15 +40,19 @@ public:
         bool enableTrtOverlap = false, std::optional<std::vector<SizeType32>> const& deviceIds = std::nullopt,
         bool normalizeLogProbs = true, bool enableChunkedContext = false,
         PeftCacheManagerConfig const& peftCacheManagerConfig = PeftCacheManagerConfig{},
-        executor::DecodingConfig const& decodingConfig = executor::DecodingConfig{}, float gpuWeightsPercent = 1)
+        executor::DecodingConfig decodingConfig = executor::DecodingConfig{}, float gpuWeightsPercent = 1,
+        std::optional<SizeType32> maxBeamWidth = std::nullopt,
+        executor::SchedulerConfig const& schedulerConfig = executor::SchedulerConfig{})
         : kvCacheConfig{kvCacheConfig}
         , enableTrtOverlap{enableTrtOverlap}
         , deviceIds(deviceIds)
         , normalizeLogProbs{normalizeLogProbs}
         , enableChunkedContext{enableChunkedContext}
         , peftCacheManagerConfig(peftCacheManagerConfig)
-        , decodingConfig(decodingConfig)
+        , decodingConfig(std::move(decodingConfig))
         , gpuWeightsPercent(gpuWeightsPercent)
+        , maxBeamWidth(maxBeamWidth)
+        , schedulerConfig{schedulerConfig}
     {
     }
 
@@ -57,7 +62,8 @@ public:
             executorConfig.getNormalizeLogProbs(), executorConfig.getEnableChunkedContext(),
             PeftCacheManagerConfig(executorConfig.getPeftCacheConfig().value_or(executor::PeftCacheConfig())),
             executorConfig.getDecodingConfig().value_or(executor::DecodingConfig{}),
-            executorConfig.getGpuWeightsPercent())
+            executorConfig.getGpuWeightsPercent(), executorConfig.getMaxBeamWidth(),
+            executorConfig.getSchedulerConfig())
     {
     }
 
@@ -80,6 +86,8 @@ public:
     executor::DecodingConfig decodingConfig;
     // Percentage of weights on the gpu at runtime
     float gpuWeightsPercent;
+    std::optional<SizeType32> maxBeamWidth;
+    executor::SchedulerConfig schedulerConfig;
 };
 
 } // namespace tensorrt_llm::batch_manager
