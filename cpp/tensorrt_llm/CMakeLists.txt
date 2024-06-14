@@ -263,3 +263,7 @@ if(BUILD_PYBIND)
 endif()
 
 add_subdirectory(plugins)
+
+if(BUILD_CORTEX_TENSORRT-LLM)
+  add_subdirectory(cortex.tensorrt-llm)
+endif()
