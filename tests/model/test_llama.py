@@ -78,8 +78,6 @@ class TestLLaMA(unittest.TestCase):
                 },
                 "moe": {
                     "num_experts": 0,
-                    "top_k": 0,
-                    "tp_mode": 2,
                     "normalization_mode": 1
                 },
                 'use_parallel_embedding': False,
@@ -537,7 +535,6 @@ class TestLLaMA(unittest.TestCase):
             "moe": {
                 "num_experts": 0,
                 "top_k": 0,
-                "tp_mode": 1,
                 "normalization_mode": 1,
             },
             'use_parallel_embedding': use_parallel_embedding,

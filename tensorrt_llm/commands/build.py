@@ -78,7 +78,14 @@ def parse_arguments():
                         help='The number of workers for building in parallel')
     parser.add_argument('--max_batch_size', type=int, default=256)
     parser.add_argument('--max_input_len', type=int, default=1024)
-    parser.add_argument('--max_output_len', type=int, default=1024)
+    parser.add_argument(
+        '--max_seq_len',
+        '--max_decoder_seq_len',
+        dest='max_seq_len',
+        type=int,
+        default=2048,
+        help="Max total length of context and generated sequence")
+    parser.add_argument('--max_output_len', type=int, default=None)
     parser.add_argument('--max_beam_width', type=int, default=1)
     parser.add_argument('--max_num_tokens', type=int, default=8192)
     parser.add_argument(
@@ -292,9 +299,10 @@ def build_model(build_config: BuildConfig,
     rank_config = copy.deepcopy(model_config)
     rank_config.set_rank(rank)
 
-    assert architecture in MODEL_MAP, \
-        f"Unsupported model architecture: {architecture}"
-    model_cls = MODEL_MAP[architecture]
+    if model_cls is None:
+        assert architecture in MODEL_MAP, \
+            f"Unsupported model architecture: {architecture}"
+        model_cls = MODEL_MAP[architecture]
     if ckpt_dir is None:
         model = model_cls(rank_config)
     else:
@@ -408,6 +416,7 @@ def main():
     workers = min(torch.cuda.device_count(), args.workers)
 
     plugin_config = PluginConfig.from_arguments(args)
+
     kwargs = {
         'logits_dtype': args.logits_dtype,
         'use_fused_mlp': args.use_fused_mlp,
@@ -432,10 +441,26 @@ def main():
         else:
             cluster_config = infer_cluster_config()
 
+        if args.max_output_len:
+            logger.warning(
+                '--max_output_len has been deprecated in favor of --max_seq_len'
+            )
+            if args.max_input_len:
+                if args.max_seq_len:
+                    logger.warning(
+                        '--max_seq_len has been overwritten due to --max_output_len being specified'
+                    )
+                args.max_seq_len = args.max_input_len + args.max_output_len
+            else:
+                raise Exception(
+                    f"--max_output_len is specified but not --max_input_len")
+
+            del args.max_output_len
+
         build_config = BuildConfig.from_dict(
             {
                 'max_input_len': args.max_input_len,
-                'max_output_len': args.max_output_len,
+                'max_seq_len': args.max_seq_len,
                 'max_batch_size': args.max_batch_size,
                 'max_beam_width': args.max_beam_width,
                 'max_num_tokens': args.max_num_tokens,

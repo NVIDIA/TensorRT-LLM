@@ -1812,8 +1812,7 @@ class DecoderModel(PretrainedModel):
             relative_attention_bias_builder = torch.ops.tensorrt_llm.relative_attention_bias
             rel_attn_precomputed = torch.zeros(
                 (self.config.num_attention_heads // self.mapping.tp_size,
-                 build_config.max_output_len + 1,
-                 build_config.max_output_len + 1),
+                 build_config.max_seq_len + 1, build_config.max_seq_len + 1),
                 dtype=str_dtype_to_torch(self.config.dtype),
                 device='cuda')
             rel_attn_table = numpy_to_torch(
@@ -1822,7 +1821,7 @@ class DecoderModel(PretrainedModel):
                 rel_attn_precomputed,
                 rel_attn_table,
                 self.config.num_attention_heads // self.mapping.tp_size,
-                build_config.max_output_len,
+                build_config.max_seq_len,
                 self.config.num_buckets,
                 False,
                 self.config.max_distance,
@@ -1830,7 +1829,7 @@ class DecoderModel(PretrainedModel):
             for layer_idx in range(self.num_layers):
                 self.decoder_layers[
                     layer_idx].self_attention.set_rel_attn_table(
-                        build_config.max_output_len, rel_attn_precomputed)
+                        build_config.max_seq_len, rel_attn_precomputed)
 
 
 class WhisperEncoder(PretrainedModel):

@@ -131,7 +131,8 @@ void invokeStopWordsCriterion(TokenIdType const** outputIds, SizeType32 const** 
 }
 
 __global__ void lengthCriterion(FinishedState* finished, SizeType32* finishedSum, SizeType32 const* sequenceLimitLength,
-    SizeType32* sequenceLengths, SizeType32 const* batchSlots, SizeType32 batchSize, SizeType32 beamWidth)
+    SizeType32* sequenceLengths, SizeType32* numNewTokens, SizeType32 const* batchSlots, SizeType32 batchSize,
+    SizeType32 beamWidth)
 {
     SizeType32 threadFinishedCount = 0;
     auto const batchIdx = blockIdx.x;
@@ -144,10 +145,15 @@ __global__ void lengthCriterion(FinishedState* finished, SizeType32* finishedSum
 
         auto finishState = finished[batchSlotBeamWidthIdx];
 
-        if (sequenceLengths[batchSlotBeamWidthIdx] >= sequenceLimitLength[batchSlot])
+        auto const numTokensToLimit = sequenceLimitLength[batchSlot] - sequenceLengths[batchSlotBeamWidthIdx];
+        if (numTokensToLimit <= 0)
         {
             finishState.setFinishedMaxLength();
             sequenceLengths[batchSlotBeamWidthIdx] = sequenceLimitLength[batchSlot];
+            if (numNewTokens)
+            {
+                numNewTokens[batchSlot] = numNewTokens[batchSlot] + numTokensToLimit;
+            }
         }
         threadFinishedCount += finishState.isFinished() ? 1 : 0;
         finished[batchSlotBeamWidthIdx] = finishState;
@@ -174,8 +180,8 @@ __global__ void lengthCriterion(FinishedState* finished, SizeType32* finishedSum
 }
 
 void invokeLengthCriterion(FinishedState* finished, SizeType32* finishedSum, SizeType32 const* sequenceLimitLength,
-    SizeType32* sequenceLengths, SizeType32 const* batchSlots, SizeType32 batchSize, SizeType32 beamWidth,
-    cudaStream_t stream)
+    SizeType32* sequenceLengths, SizeType32* numNewTokens, SizeType32 const* batchSlots, SizeType32 batchSize,
+    SizeType32 beamWidth, cudaStream_t stream)
 {
     // Check if we have attained the sequence length limit. If so, stop the
     // sequence. In addition, check if all sequences are stopped and return the
@@ -184,12 +190,12 @@ void invokeLengthCriterion(FinishedState* finished, SizeType32* finishedSum, Siz
     dim3 grid{static_cast<uint32_t>(batchSize)};
 
     lengthCriterion<<<grid, block, 0, stream>>>(
-        finished, finishedSum, sequenceLimitLength, sequenceLengths, batchSlots, batchSize, beamWidth);
+        finished, finishedSum, sequenceLimitLength, sequenceLengths, numNewTokens, batchSlots, batchSize, beamWidth);
     sync_check_cuda_error();
 }
 
 __global__ void explicitEOSCriterion(TokenIdType const** outputIds, TokenIdType const* endIds, FinishedState* finished,
-    SizeType32* sequenceLengths, SizeType32 const* tokensPerStep, SizeType32 const* batchSlots, SizeType32 batchSize,
+    SizeType32* sequenceLengths, SizeType32* numNewTokens, SizeType32 const* batchSlots, SizeType32 batchSize,
     SizeType32 maxTokensPerStep)
 {
     auto const batchIdx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -204,7 +210,7 @@ __global__ void explicitEOSCriterion(TokenIdType const** outputIds, TokenIdType 
         return;
     }
 
-    auto const numTokens = tokensPerStep != nullptr ? tokensPerStep[batchSlot] : maxTokensPerStep;
+    auto const numTokens = numNewTokens != nullptr ? numNewTokens[batchSlot] : maxTokensPerStep;
     auto const endId = endIds[batchSlot];
     auto const sequenceLength = sequenceLengths[batchSlot];
 
@@ -217,12 +223,17 @@ __global__ void explicitEOSCriterion(TokenIdType const** outputIds, TokenIdType 
         {
             finished[batchSlot].setFinishedEOS();
             sequenceLengths[batchSlot] = max(0, pos);
+            if (numNewTokens)
+            {
+                numNewTokens[batchSlot] = pos - posStart;
+            }
+            return;
         }
     }
 }
 
 void invokeExplicitEOSCriterion(TokenIdType const** outputIds, TokenIdType const* endIds, FinishedState* finished,
-    SizeType32* sequenceLengths, SizeType32 const* tokensPerStep, SizeType32 const* batchSlots, SizeType32 batchSize,
+    SizeType32* sequenceLengths, SizeType32* numNewTokens, SizeType32 const* batchSlots, SizeType32 batchSize,
     SizeType32 beamWidth, SizeType32 maxTokensPerStep, cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(beamWidth == 1, "Explicit EOS criterion does not support beam search");
@@ -233,7 +244,7 @@ void invokeExplicitEOSCriterion(TokenIdType const** outputIds, TokenIdType const
     grid.x = divUp(batchSize, blockSize);
 
     explicitEOSCriterion<<<grid, blockSize, 0, stream>>>(
-        outputIds, endIds, finished, sequenceLengths, tokensPerStep, batchSlots, batchSize, maxTokensPerStep);
+        outputIds, endIds, finished, sequenceLengths, numNewTokens, batchSlots, batchSize, maxTokensPerStep);
     sync_check_cuda_error();
 }
 

@@ -240,10 +240,18 @@ public:
                 {
                     buf << token;
                 }
-                buf << (i == size - 1 ? ']' : ',');
+                if (i != size - 1)
+                {
+                    buf << ',';
+                }
             }
+            buf << ']';
         };
-        if (shape.nbDims == 1)
+        if (shape.nbDims == 0)
+        {
+            buf << "[]";
+        }
+        else if (shape.nbDims == 1)
         {
             line(tensorRange.begin(), shape.d[0]);
         }
@@ -277,10 +285,19 @@ public:
             buf << '[';
             for (SizeType32 i = 0; i < size; i++)
             {
-                buf << array[i] << (i == size - 1 ? ']' : ',');
+                buf << array[i];
+                if (i != size - 1)
+                {
+                    buf << ',';
+                }
             }
+            buf << ']';
         };
-        if (shape.nbDims == 1)
+        if (shape.nbDims == 0)
+        {
+            buf << "[]";
+        }
+        else if (shape.nbDims == 1)
         {
             line(tensorRange.begin(), shape.d[0]);
         }
@@ -305,13 +322,22 @@ public:
     {
         switch (mTensor.getDataType())
         {
+        case nvinfer1::DataType::kBOOL: return values<bool>();
         case nvinfer1::DataType::kFLOAT: return values<float>();
         case nvinfer1::DataType::kINT8: return values<std::int8_t>();
         case nvinfer1::DataType::kINT32: return values<std::int32_t>();
         case nvinfer1::DataType::kINT64: return values<std::int64_t>();
         case nvinfer1::DataType::kUINT8: return values<std::uint8_t>();
-        default: return std::string("Unsupported data type");
+        default: return std::string(mName + ": Unsupported data type");
         }
+    }
+
+    std::string shape(void)
+    {
+        using namespace tensorrt_llm::runtime;
+        std::ostringstream buf;
+        buf << mName << ": " << mTensor.getShape();
+        return buf.str();
     }
 
     void print_tokens(void)
@@ -324,6 +350,11 @@ public:
         TLLM_LOG_DEBUG(values());
     }
 
+    void print_shape(void)
+    {
+        TLLM_LOG_DEBUG(shape());
+    }
+
 private:
     runtime::ITensor const& mTensor;
     std::string mName;
@@ -332,5 +363,6 @@ private:
 #define D(x) tensorrt_llm::layers::DebugTensor(x, #x)
 #define PRINT_TOKENS(x) D(x).print_tokens()
 #define PRINT_VALUES(x) D(x).print_values()
+#define PRINT_SHAPE(x) D(x).print_shape()
 
 } // namespace tensorrt_llm::layers

@@ -17,9 +17,7 @@
 
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
-#include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/decodingCommon.h"
-#include "tensorrt_llm/kernels/samplingTopKKernels.h"
 #include "tensorrt_llm/kernels/samplingTopPKernels.h"
 #include "tensorrt_llm/layers/defaultDecodingParams.h"
 #include "tensorrt_llm/layers/layerUtils.h"
@@ -32,9 +30,7 @@ using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::runtime;
 
-namespace tensorrt_llm
-{
-namespace layers
+namespace tensorrt_llm::layers
 {
 
 static __global__ void setTopPRuntimeArgs(SizeType32 batchSize, SizeType32 topK, SizeType32* topKs,
@@ -152,28 +148,27 @@ void TopPSamplingLayer<T>::freeBuffer()
 
 template <typename T>
 void TopPSamplingLayer<T>::setup(SizeType32 const batchSize, SizeType32 const beamWidth, SizeType32 const* batchSlots,
-    std::shared_ptr<BaseSetupParams> baseSetupParams)
+    std::shared_ptr<BaseSetupParams> const& baseSetupParams)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto setupParams = std::dynamic_pointer_cast<SamplingSetupParams>(baseSetupParams);
 
     auto const defaultTopK = DefaultDecodingParams::getTopK();
-    auto runtimeTopK = setupParams->runtime_top_k.value_or(std::vector<SizeType32>(batchSize, defaultTopK));
-    auto runtimeTopP = setupParams->runtime_top_p.value_or(std::vector<float>{});
+    auto runtimeTopK = setupParams->runtimeTopK.value_or(std::vector<SizeType32>(batchSize, defaultTopK));
+    auto runtimeTopP = setupParams->runtimeTopP.value_or(std::vector<float>{});
 
     auto const runtimeTopKSize = runtimeTopK.size();
     auto const runtimeTopPSize = runtimeTopP.size();
 
     auto const defaultTopPDecay = DefaultDecodingParams::getTopPDecay();
-    auto decayVec = setupParams->top_p_decay.value_or(std::vector<float>(batchSize, defaultTopPDecay));
+    auto decayVec = setupParams->topPDecay.value_or(std::vector<float>(batchSize, defaultTopPDecay));
 
     auto const defaultTopPMin = DefaultDecodingParams::getTopPMin(); // prevent TopP becoming 0.0
-    auto topPMinVec = setupParams->top_p_min.value_or(std::vector<float>(batchSize, defaultTopPMin));
+    auto topPMinVec = setupParams->topPMin.value_or(std::vector<float>(batchSize, defaultTopPMin));
 
     auto const defaultTopPResetId = DefaultDecodingParams::getTopPResetId();
-    auto topPResetIdsVec
-        = setupParams->top_p_reset_ids.value_or(std::vector<TokenIdType>(batchSize, defaultTopPResetId));
+    auto topPResetIdsVec = setupParams->topPResetIds.value_or(std::vector<TokenIdType>(batchSize, defaultTopPResetId));
 
     if (runtimeTopPSize == 0)
     {
@@ -233,7 +228,7 @@ void TopPSamplingLayer<T>::setup(SizeType32 const batchSize, SizeType32 const be
     if (runtimeTopPSize > 1)
     {
         TLLM_CHECK_WITH_INFO(static_cast<SizeType32>(runtimeTopP.size()) == batchSize,
-            fmtstr("runtime_top_p.size() (%lu) == batchSize (%d) is not satisfied!", runtimeTopP.size(), batchSize));
+            fmtstr("runtimeTopP.size() (%lu) == batchSize (%d) is not satisfied!", runtimeTopP.size(), batchSize));
         cudaAutoCpy(reinterpret_cast<float*>(mSetupWorkspaceDevice), runtimeTopP.data(), batchSize, mStream);
         invokeScatterDecodingParams(
             reinterpret_cast<float*>(mSetupWorkspaceDevice), mRuntimeTopPDevice, batchSlots, batchSize, mStream);
@@ -248,12 +243,12 @@ void TopPSamplingLayer<T>::setup(SizeType32 const batchSize, SizeType32 const be
         invokeScatterDecodingParams(deviceTmpBuffer, deviceBuffer, batchSlots, batchSize, mStream);
     };
 
-    fillBuffers("top_p_decay", decayVec, reinterpret_cast<float*>(mSetupWorkspaceDevice), mTopPDecayDevice);
+    fillBuffers("topPDecay", decayVec, reinterpret_cast<float*>(mSetupWorkspaceDevice), mTopPDecayDevice);
 
-    fillBuffers("top_p_min", topPMinVec, reinterpret_cast<float*>(mSetupWorkspaceDevice), mTopPMinDevice);
+    fillBuffers("topPMin", topPMinVec, reinterpret_cast<float*>(mSetupWorkspaceDevice), mTopPMinDevice);
 
     fillBuffers(
-        "top_p_reset_ids", topPResetIdsVec, reinterpret_cast<TokenIdType*>(mSetupWorkspaceDevice), mTopPResetIdsDevice);
+        "topPResetIds", topPResetIdsVec, reinterpret_cast<TokenIdType*>(mSetupWorkspaceDevice), mTopPResetIdsDevice);
 
     {
         dim3 block(std::min(static_cast<uint32_t>(batchSize), 256u));
@@ -296,19 +291,17 @@ void TopPSamplingLayer<T>::setup(SizeType32 const batchSize, SizeType32 const be
 
 template <typename T>
 void TopPSamplingLayer<T>::forwardAsync(
-    std::shared_ptr<BaseOutputParams> baseOutputs, std::shared_ptr<BaseInputParams> baseInputs)
+    std::shared_ptr<BaseDecodingOutputs> const& outputs, std::shared_ptr<BaseDecodingInputs> const& baseInputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    std::shared_ptr<SamplingInputParams> inputs = std::dynamic_pointer_cast<SamplingInputParams>(baseInputs);
-    std::shared_ptr<SamplingOutputParams> outputs = std::dynamic_pointer_cast<SamplingOutputParams>(baseOutputs);
+    auto inputs = std::dynamic_pointer_cast<SamplingInputs>(baseInputs);
 
-    auto const batchSize = inputs->logits.shape[0];
+    auto const batchSize = inputs->logits->shape[0];
 
     std::vector<int32_t> batchSlotsVec(batchSize);
     std::iota(batchSlotsVec.begin(), batchSlotsVec.end(), 0);
-    auto batchSlotsHost
-        = inputs->batch_slots ? inputs->batch_slots->template getPtr<int const>() : batchSlotsVec.data();
+    auto batchSlotsHost = inputs->batchSlots ? inputs->batchSlots->template getPtr<int const>() : batchSlotsVec.data();
     auto const skip = allOfBatchSlots(batchSlotsHost, mSkipDecodeHost, batchSize, true);
     if (skip)
     {
@@ -316,11 +309,11 @@ void TopPSamplingLayer<T>::forwardAsync(
     }
 
     // Probabilities must be already computed instead of logits
-    auto probs = inputs->logits.template getPtr<T>();
-    auto endIds = inputs->end_ids.template getPtr<TokenIdType const>();
-    auto batchSlots = inputs->batch_slots ? inputs->batch_slots->template getPtr<SizeType32 const>() : nullptr;
-    auto curandStatesDevice = inputs->curand_states;
-    auto samplingWorkspaceDevice = inputs->sampling_workspace;
+    auto probs = inputs->logits->template getPtr<T>();
+    auto endIds = inputs->endIds.template getPtr<TokenIdType const>();
+    auto batchSlots = inputs->batchSlots ? inputs->batchSlots->template getPtr<SizeType32 const>() : nullptr;
+    auto curandStatesDevice = inputs->curandStates;
+    auto samplingWorkspaceDevice = inputs->samplingWorkspace;
 
     TLLM_CHECK_WITH_INFO(curandStatesDevice, "No curand states provided");
     TLLM_CHECK_WITH_INFO(samplingWorkspaceDevice, "No sampling workspace provided");
@@ -332,14 +325,14 @@ void TopPSamplingLayer<T>::forwardAsync(
         ? reinterpret_cast<FinishedState*>(outputs->finished->template getPtr<FinishedState::UnderlyingType>())
         : nullptr;
 
-    auto cumLogProbs = (outputs->cum_log_probs) ? outputs->cum_log_probs->template getPtr<float>() : nullptr;
-    auto outputLogProbs = (outputs->output_log_probs) ? outputs->output_log_probs->template getPtr<float>() : nullptr;
-    auto sequenceLength
-        = (outputs->sequence_length) ? outputs->sequence_length->template getPtr<SizeType32>() : nullptr;
+    auto cumLogProbs = (outputs->cumLogProbs) ? outputs->cumLogProbs->template getPtr<float>() : nullptr;
+    auto outputLogProbs
+        = (outputs->outputLogProbsTiled) ? outputs->outputLogProbsTiled->template getPtr<float>() : nullptr;
+    auto sequenceLength = (outputs->sequenceLength) ? outputs->sequenceLength->template getPtr<SizeType32>() : nullptr;
 
     TopPSamplingKernelParams<T> params;
     params.probs = probs;
-    params.outputIds = outputs->output_ids_ptr.template getPtr<TokenIdType*>();
+    params.outputIds = outputs->outputIdsPtr.template getPtr<TokenIdType*>();
     params.workspace = samplingWorkspaceDevice;
     params.topPs = mRuntimeTopPDevice;
     params.sequenceLength = sequenceLength;
@@ -370,7 +363,7 @@ void TopPSamplingLayer<T>::forwardAsync(
 
     sync_check_cuda_error();
     invokeComputeToppDecay(mRuntimeTopPDevice, mInitialTopPDevice,
-        outputs->output_ids_ptr.template getPtr<TokenIdType const*>(), mTopPDecayDevice, mTopPMinDevice,
+        outputs->outputIdsPtr.template getPtr<TokenIdType const*>(), mTopPDecayDevice, mTopPMinDevice,
         mTopPResetIdsDevice, sequenceLength, batchSlots, batchSize, mStream);
     sync_check_cuda_error();
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -379,5 +372,4 @@ void TopPSamplingLayer<T>::forwardAsync(
 template class TopPSamplingLayer<float>;
 template class TopPSamplingLayer<half>;
 
-} // namespace layers
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::layers

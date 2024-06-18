@@ -201,28 +201,29 @@ def _is_building(f):
 
 
 def check_max_num_tokens(max_num_tokens, opt_num_tokens, max_batch_size,
-                         max_input_len, max_beam_width, remove_input_padding,
-                         enable_context_fmha, tokens_per_block,
-                         multiple_profiles):
+                         max_input_len, max_seq_len, max_beam_width,
+                         remove_input_padding, enable_context_fmha,
+                         tokens_per_block, multiple_profiles):
     if not remove_input_padding:
         if max_num_tokens is not None or opt_num_tokens is not None:
-            max_num_tokens = max_batch_size * max_input_len
+            max_num_tokens = max_batch_size * max_seq_len
             logger.warning("remove_input_padding is not enabled, the specified "
                            "max_num_tokens/opt_num_tokens will be ignored.")
         return max_num_tokens, opt_num_tokens
     else:
         if max_num_tokens is None:
-            max_num_tokens = max_input_len * max_batch_size
+            max_num_tokens = max_seq_len * max_batch_size
             logger.warning(
                 "remove_input_padding is enabled, while max_num_tokens "
-                "is not set, setting to max_batch_size*max_input_len. \n"
-                "It may not be optimal to set max_num_tokens=max_batch_size*max_input_len "
+                "is not set, setting to max_batch_size*max_seq_len. \n"
+                "It may not be optimal to set max_num_tokens=max_batch_size*max_seq_len "
                 "when remove_input_padding is enabled, because the number "
                 "of packed input tokens are very likely to be smaller, "
                 "we strongly recommend to set max_num_tokens according "
                 "to your workloads.")
         if opt_num_tokens is None and not multiple_profiles:
-            opt_num_tokens = max_batch_size * max_beam_width
+            opt_num_tokens = min(max_batch_size * max_beam_width,
+                                 max_num_tokens)
             logger.warning(
                 "remove_input_padding is enabled, while opt_num_tokens "
                 "is not set, setting to max_batch_size*max_beam_width. \n")
@@ -233,12 +234,12 @@ def check_max_num_tokens(max_num_tokens, opt_num_tokens, max_batch_size,
                 "large `max_num_tokens` could possibly exceed the TensorRT "
                 "tensor volume, causing runtime errors. "
                 f"Got `max_num_tokens` = {max_num_tokens}")
-    if max_num_tokens > max_input_len * max_batch_size:
-        max_num_tokens = max_input_len * max_batch_size
+    if max_num_tokens > max_seq_len * max_batch_size:
+        max_num_tokens = max_seq_len * max_batch_size
         logger.warning(
             f"max_num_tokens ({max_num_tokens}) shouldn't be greater than "
-            f"max_input_len * max_batch_size ({max_input_len * max_batch_size}), "
-            f"specifying to max_input_len * max_batch_size ({max_input_len * max_batch_size})."
+            f"max_seq_len * max_batch_size ({max_seq_len * max_batch_size}), "
+            f"specifying to max_seq_len * max_batch_size ({max_seq_len * max_batch_size})."
         )
     if max_num_tokens < max_input_len and not enable_context_fmha:
         logger.warning(

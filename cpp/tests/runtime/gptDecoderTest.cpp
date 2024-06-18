@@ -35,7 +35,7 @@ bool forwardAndSync(std::unique_ptr<IGptDecoder> const& decoder, DecodingOutput&
     std::shared_ptr<CudaStream> stream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto const maxBatchSize = input.maxBatchSize;
+    auto const maxBatchSize = input.batchSize;
 
     BufferManager::ITensorPtr finishedSum;
     std::int32_t* finishedSumHost = nullptr;

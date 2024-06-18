@@ -18,8 +18,10 @@
 
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
+#include "tensorrt_llm/runtime/explicitDraftTokensBuffers.h"
 #include "tensorrt_llm/runtime/iStatefulGptDecoder.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/request.h"
 #include "tensorrt_llm/runtime/utils/sessionUtils.h"
 
 #include <memory>
@@ -31,41 +33,6 @@ namespace tensorrt_llm::runtime
 
 namespace decoder_batch
 {
-class Request
-{
-public:
-    using ConstTensorPtr = ITensor::SharedConstPtr;
-    using TensorPtr = ITensor::SharedPtr;
-    using BufferPtr = IBuffer::SharedPtr;
-
-    explicit Request(ConstTensorPtr ids, SizeType32 inputLen, std::optional<SizeType32> maxNewTokens = std::nullopt,
-        std::optional<SizeType32> endId = std::nullopt)
-        : ids{std::move(ids)}
-        , inputLen(inputLen)
-        , maxNewTokens{maxNewTokens}
-        , endId{endId}
-        , generatedTokensPerEngineStep(1)
-    {
-    }
-
-    // mandatory parameters
-    ConstTensorPtr ids;  // [inputSeqLen], the input sequence of token ids, on gpu
-    SizeType32 inputLen; // the input length without draft tokens
-
-    // optional parameters
-    std::optional<SizeType32> maxNewTokens; // maximum number of tokens to generate for this request
-    std::optional<SizeType32> endId;        // end token id
-    BufferPtr draftTokens;   // [generatedTokensPerStep - 1], on gpu, draft tokens from speculative decoding
-    std::optional<TensorPtr>
-        draftLogits;         // [generatedTokensPerStep - 1, vocabSize], on gpu, draft tokens from speculative decoding
-    TensorPtr embeddingBias; // [vocabSizePadded], on gpu
-    TensorPtr badWordsList;  // [2, badWordsLength], on gpu
-    TensorPtr stopWordsList; // [2, stopWordsLength], on gpu
-
-    SizeType32 generatedTokensPerEngineStep;
-    TensorPtr medusaPaths;   // [maxDraftTokens + 1, maxAcceptedDraftTokensPerStep + 1], on gpu
-    TensorPtr medusaTreeIds; // [maxDraftTokens + 1], on gpu
-};
 
 class Input
 {
@@ -109,6 +76,11 @@ public:
                                      // within one beam for beam search, on gpu
     std::vector<std::vector<TensorConstPtr>>
         predictedDraftLogits; // [maxBatchSize][maxAcceptedDraftTokensPerStep][maxDraftTokens + 1, vocabSizePadded]
+    TensorConstPtr seqSlots;  // [batchSize]
+
+    // explicit draft tokens data.
+    std::optional<ExplicitDraftTokensBuffers::EngineOutputs> explicitDraftTokensInputs;
+    std::optional<ExplicitDraftTokensBuffers::EngineInputs> explicitDraftTokensLastInputs;
 };
 
 using Output = decoder::Output;
@@ -135,6 +107,9 @@ public:
     using CudaStreamPtr = std::shared_ptr<CudaStream>;
     using TensorPtr = std::shared_ptr<ITensor>;
     using TokenPtr = std::unique_ptr<decoder_batch::Token const>;
+
+    //! @brief Setup buffers for ExplicitDraftTokens decoding.
+    virtual void setupExplicitDraftTokens(ExplicitDraftTokensBuffers::Inputs explicitDraftTokensBuffers) = 0;
 
     //! @brief Run one step for all requests without blocking the host process and return the token for synchronization.
     virtual TokenPtr forwardAsync(decoder_batch::Output& output, decoder_batch::Input const& input) = 0;
@@ -189,14 +164,17 @@ public:
     //! @returns [batchSize, maxTokensPerStep-1], predicted draft tokens for next step, on gpu
     virtual TensorPtr getNextDraftTokens() const = 0;
 
+    //! @returns [batchSize], predicted draft tokens lengths for previous step, on gpu
+    virtual TensorPtr getPrevDraftTokensLengths() const = 0;
+
     //! @returns [batchSize], predicted draft tokens lengths for next step, on gpu
     virtual TensorPtr getNextDraftTokensLengths() const = 0;
 
     //! @returns [batchSize + 1], exclusive sum of accepted draft token lengths, on gpu
-    virtual TensorPtr getSpecDecodingAcceptedLengthsCumSum() const = 0;
+    virtual TensorPtr getAcceptedLengthsCumSum() const = 0;
 
     //! @returns [batchSize, maxAcceptedDraftTokensPerStep], accepted paths packed into continuous tensor, on gpu
-    virtual TensorPtr getSpecDecodingAcceptedPackedPaths() const = 0;
+    virtual TensorPtr getAcceptedPackedPaths() const = 0;
 
 protected:
     IGptDecoderBatch() = default;

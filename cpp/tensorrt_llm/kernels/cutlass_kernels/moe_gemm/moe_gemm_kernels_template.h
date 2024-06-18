@@ -48,6 +48,8 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/logger.h"
+
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 
@@ -531,6 +533,18 @@ void MoeGemmRunner<T, WeightType>::dispatchToArch<EpilogueTag>(T const* A, Weigh
     {
         TLLM_THROW("Arch unsupported for MoE GEMM");
     }
+}
+
+template <typename T, typename WeightType>
+size_t MoeGemmRunner<T, WeightType>::getMaxWorkspaceSize(int num_experts) const
+{
+    if (num_experts != num_experts_)
+    {
+        TLLM_LOG_TRACE("Calling getMaxWorkspaceSize() with a new expert count %d vs %d", num_experts, num_experts_);
+        num_experts_ = num_experts;
+        gemm_workspace_size_ = calcMaxWorkspaceSize(num_experts);
+    }
+    return gemm_workspace_size_;
 }
 
 template <typename T, typename WeightType>

@@ -16,8 +16,10 @@ from transformers.pytorch_utils import Conv1D
 
 from tensorrt_llm._utils import pad_vocab_size, release_gc
 
+from ...layers import MoeConfig
 from ...logger import logger
 from ...mapping import Mapping
+from ...quantization import QuantAlgo
 from ..convert_utils import load_calib_dataset
 from ..modeling_utils import PretrainedConfig
 from .utils import get_qwen_key_list, make_context
@@ -665,7 +667,7 @@ def get_tllm_linear_sq_weight(vals,
 
 def convert_hf_qwen(hf_model,
                     qwen_type,
-                    mapping,
+                    mapping: Mapping,
                     vocab_size=32000,
                     dtype='float32',
                     use_parallel_embedding=False,
@@ -680,7 +682,8 @@ def convert_hf_qwen(hf_model,
                     int8_kv_cache=False,
                     act_range=[],
                     qkv_para=[],
-                    smoother=[]):
+                    smoother=[],
+                    moe_config=None):
     weights = {}
     tik = time.time()
     tensor_parallel = mapping.tp_size
@@ -852,97 +855,217 @@ def convert_hf_qwen(hf_model,
                                        plugin_weight_only_quant_type, dtype,
                                        use_gemm_woq_plugin))
 
-        mlp_gate_weight = get_weight(model_params, prefix + key_list[2], dtype)
-        split_v = split_matrix_tp(mlp_gate_weight,
-                                  tensor_parallel,
-                                  mapping.tp_rank,
-                                  dim=0)
-        if use_smooth_quant:
-            mlp_gate_weight = mlp_gate_weight.t()
-            int8_weights = generate_int8(mlp_gate_weight,
-                                         act_range.get(prefix + key_list[2]))
+        if qwen_type == "qwen2_moe" and moe_config and moe_config.has_moe():
 
+            # shared_expert for qwen2_moe
+            shared_expert_up_proj = model_params[
+                f'model.layers.{l}.mlp.shared_expert.up_proj.weight']
+            shared_expert_down_proj = model_params[
+                f'model.layers.{l}.mlp.shared_expert.down_proj.weight']
+            shared_expert_gate = model_params[
+                f'model.layers.{l}.mlp.shared_expert.gate_proj.weight']
+            shared_expert_up_proj = split(shared_expert_up_proj,
+                                          mapping.tp_size,
+                                          mapping.tp_rank,
+                                          dim=0)
+            shared_expert_down_proj = split(shared_expert_down_proj,
+                                            mapping.tp_size,
+                                            mapping.tp_rank,
+                                            dim=1)
+            shared_expert_gate = split(shared_expert_gate,
+                                       mapping.tp_size,
+                                       mapping.tp_rank,
+                                       dim=0)
+            model_params[
+                f'model.layers.{l}.mlp.shared_expert.gate_up_proj.weight'] = torch.concat(
+                    [shared_expert_up_proj, shared_expert_gate], dim=-2)
+
+            model_params[
+                f'model.layers.{l}.mlp.shared_expert.down_proj.weight'] = shared_expert_down_proj
+
+            shared_expert_gate_up_proj = get_weight(
+                model_params, prefix + 'mlp.shared_expert.gate_up_proj', dtype)
+            ## mlp.shared_expert.gate_up_proj.weight
             weights.update(
-                get_tllm_linear_sq_weight(
-                    int8_weights,
-                    tllm_prex + 'mlp.gate.',
-                    [1, intermediate_size // tensor_parallel],
-                    tensor_parallel,
-                    is_qkv=False,
-                    per_token=per_token,
-                    per_channel=per_channel,
-                    last_prefix=tllm_prex + 'post_layernorm.scale_to_int',
-                    smoother_value=None,
-                    smoother_shape=None,
-                    rank=mapping.tp_rank,
-                    cat_dim=-1))
-        else:
-            weights.update(
-                get_tllm_linear_weight(split_v, tllm_prex + 'mlp.gate.', None,
+                get_tllm_linear_weight(shared_expert_gate_up_proj,
+                                       tllm_prex + 'shared_expert.fc.', None,
                                        use_weight_only,
                                        plugin_weight_only_quant_type, dtype,
                                        use_gemm_woq_plugin))
 
-        mlp_fc_weight = get_weight(model_params, prefix + key_list[3], dtype)
-        split_v = split_matrix_tp(mlp_fc_weight,
-                                  tensor_parallel,
-                                  mapping.tp_rank,
-                                  dim=0)
-
-        if use_smooth_quant:
-            mlp_fc_weight = mlp_fc_weight.t()  #verified
-            int8_weights = generate_int8(mlp_fc_weight,
-                                         act_range.get(prefix + key_list[3]))
+            shared_expert_down_proj = get_weight(
+                model_params, prefix + 'mlp.shared_expert.down_proj', dtype)
+            ## mlp.shared_expert.down_proj.weight
             weights.update(
-                get_tllm_linear_sq_weight(
-                    int8_weights,
-                    tllm_prex + 'mlp.fc.',
-                    [1, intermediate_size // tensor_parallel],
-                    tensor_parallel,
-                    is_qkv=False,
-                    per_token=per_token,
-                    per_channel=per_channel,
-                    last_prefix=tllm_prex + 'post_layernorm.scale_to_int',
-                    smoother_value=None,
-                    smoother_shape=None,
-                    rank=mapping.tp_rank,
-                    cat_dim=-1))
-        else:
-            weights.update(
-                get_tllm_linear_weight(split_v, tllm_prex + 'mlp.fc.', None,
+                get_tllm_linear_weight(shared_expert_down_proj,
+                                       tllm_prex + 'shared_expert.proj.', None,
                                        use_weight_only,
                                        plugin_weight_only_quant_type, dtype,
                                        use_gemm_woq_plugin))
 
-        mlp_proj_weight = get_weight(model_params, prefix + key_list[4], dtype)
-        split_v = split_matrix_tp(mlp_proj_weight,
-                                  tensor_parallel,
-                                  mapping.tp_rank,
-                                  dim=1)
+            moe_shared_expert_gate_weights = get_weight(
+                model_params, prefix + 'mlp.shared_expert_gate', dtype)
+            weights.update(
+                get_tllm_linear_weight(
+                    moe_shared_expert_gate_weights,
+                    tllm_prex + 'shared_expert_gate.',
+                    None,
+                    False,  # Router should never be quantized
+                    plugin_weight_only_quant_type,
+                    dtype,
+                    use_gemm_woq_plugin))
 
-        if use_smooth_quant:
-            mlp_proj_weight = mlp_proj_weight.t()
-            int8_weights = generate_int8(mlp_proj_weight,
-                                         act_range.get(prefix + key_list[4]))
+            ## fine-grained experts
+            rank_experts = list(range(moe_config.num_experts))
+            if mapping.has_moe_ep():
+                rank_experts = mapping.ep_experts(moe_config.num_experts)
+            for suffix in ["gate_proj", "down_proj", "up_proj"]:
+                model_params[f'model.layers.{l}.mlp.experts.{suffix}.weight'] = \
+                            torch.stack([model_params[f'model.layers.{l}.mlp.experts.{expert}.{suffix}.weight'].detach()
+                                        for expert in rank_experts])
+            w3 = model_params[f'model.layers.{l}.mlp.experts.up_proj.weight']
+            w2 = model_params[f'model.layers.{l}.mlp.experts.down_proj.weight']
+            w1 = model_params[f'model.layers.{l}.mlp.experts.gate_proj.weight']
+            if mapping.has_moe_tp():
+                w3 = split(w3, mapping.moe_tp_size, mapping.moe_tp_rank, dim=1)
+                w2 = split(w2, mapping.moe_tp_size, mapping.moe_tp_rank, dim=2)
+                w1 = split(w1, mapping.moe_tp_size, mapping.moe_tp_rank, dim=1)
+
+            model_params[
+                f'model.layers.{l}.mlp.experts.gate_up_proj.weight'] = torch.concat(
+                    [w3, w1], dim=-2)
+
+            model_params[f'model.layers.{l}.mlp.experts.down_proj.weight'] = w2
+
+            ## mlp.experts.w2.weight
+            moe_experts_w2_weights = get_weight(
+                model_params, prefix + 'mlp.experts.down_proj', dtype)
             weights.update(
-                get_tllm_linear_sq_weight(
-                    int8_weights,
-                    tllm_prex + 'mlp.proj.', [1, hidden_size],
-                    tensor_parallel,
-                    is_qkv=False,
-                    per_token=per_token,
-                    per_channel=per_channel,
-                    last_prefix=tllm_prex + 'mlp.quantization_scaling_factor',
-                    smoother_value=smoother[prefix + key_list[4]],
-                    smoother_shape=[1, intermediate_size // tensor_parallel],
-                    rank=mapping.tp_rank,
-                    cat_dim=0))
-        else:
-            weights.update(
-                get_tllm_linear_weight(split_v, tllm_prex + 'mlp.proj.', None,
+                get_tllm_linear_weight(moe_experts_w2_weights,
+                                       tllm_prex + 'mlp.proj.', None,
                                        use_weight_only,
                                        plugin_weight_only_quant_type, dtype,
                                        use_gemm_woq_plugin))
+            ## mlp.experts.w3w1.weight
+            moe_experts_w3w1_weights = get_weight(
+                model_params, prefix + 'mlp.experts.gate_up_proj', dtype)
+            weights.update(
+                get_tllm_linear_weight(moe_experts_w3w1_weights,
+                                       tllm_prex + 'mlp.fc.', None,
+                                       use_weight_only,
+                                       plugin_weight_only_quant_type, dtype,
+                                       use_gemm_woq_plugin))
+
+            moe_experts_gate_weights = get_weight(model_params,
+                                                  prefix + 'mlp.gate',
+                                                  torch.float32)
+            weights.update(
+                get_tllm_linear_weight(
+                    moe_experts_gate_weights,
+                    tllm_prex + 'mlp.router.',
+                    None,
+                    False,  # Router should never be quantized
+                    plugin_weight_only_quant_type,
+                    dtype,
+                    use_gemm_woq_plugin))
+        else:
+            mlp_gate_weight = get_weight(model_params, prefix + key_list[2],
+                                         dtype)
+            split_v = split_matrix_tp(mlp_gate_weight,
+                                      tensor_parallel,
+                                      mapping.tp_rank,
+                                      dim=0)
+            if use_smooth_quant:
+                mlp_gate_weight = mlp_gate_weight.t()
+                int8_weights = generate_int8(
+                    mlp_gate_weight, act_range.get(prefix + key_list[2]))
+
+                weights.update(
+                    get_tllm_linear_sq_weight(
+                        int8_weights,
+                        tllm_prex + 'mlp.gate.',
+                        [1, intermediate_size // tensor_parallel],
+                        tensor_parallel,
+                        is_qkv=False,
+                        per_token=per_token,
+                        per_channel=per_channel,
+                        last_prefix=tllm_prex + 'post_layernorm.scale_to_int',
+                        smoother_value=None,
+                        smoother_shape=None,
+                        rank=mapping.tp_rank,
+                        cat_dim=-1))
+            else:
+                weights.update(
+                    get_tllm_linear_weight(split_v, tllm_prex + 'mlp.gate.',
+                                           None, use_weight_only,
+                                           plugin_weight_only_quant_type, dtype,
+                                           use_gemm_woq_plugin))
+
+            mlp_fc_weight = get_weight(model_params, prefix + key_list[3],
+                                       dtype)
+            split_v = split_matrix_tp(mlp_fc_weight,
+                                      tensor_parallel,
+                                      mapping.tp_rank,
+                                      dim=0)
+
+            if use_smooth_quant:
+                mlp_fc_weight = mlp_fc_weight.t()  #verified
+                int8_weights = generate_int8(
+                    mlp_fc_weight, act_range.get(prefix + key_list[3]))
+                weights.update(
+                    get_tllm_linear_sq_weight(
+                        int8_weights,
+                        tllm_prex + 'mlp.fc.',
+                        [1, intermediate_size // tensor_parallel],
+                        tensor_parallel,
+                        is_qkv=False,
+                        per_token=per_token,
+                        per_channel=per_channel,
+                        last_prefix=tllm_prex + 'post_layernorm.scale_to_int',
+                        smoother_value=None,
+                        smoother_shape=None,
+                        rank=mapping.tp_rank,
+                        cat_dim=-1))
+            else:
+                weights.update(
+                    get_tllm_linear_weight(split_v, tllm_prex + 'mlp.fc.', None,
+                                           use_weight_only,
+                                           plugin_weight_only_quant_type, dtype,
+                                           use_gemm_woq_plugin))
+
+            mlp_proj_weight = get_weight(model_params, prefix + key_list[4],
+                                         dtype)
+            split_v = split_matrix_tp(mlp_proj_weight,
+                                      tensor_parallel,
+                                      mapping.tp_rank,
+                                      dim=1)
+
+            if use_smooth_quant:
+                mlp_proj_weight = mlp_proj_weight.t()
+                int8_weights = generate_int8(
+                    mlp_proj_weight, act_range.get(prefix + key_list[4]))
+                weights.update(
+                    get_tllm_linear_sq_weight(
+                        int8_weights,
+                        tllm_prex + 'mlp.proj.', [1, hidden_size],
+                        tensor_parallel,
+                        is_qkv=False,
+                        per_token=per_token,
+                        per_channel=per_channel,
+                        last_prefix=tllm_prex +
+                        'mlp.quantization_scaling_factor',
+                        smoother_value=smoother[prefix + key_list[4]],
+                        smoother_shape=[
+                            1, intermediate_size // tensor_parallel
+                        ],
+                        rank=mapping.tp_rank,
+                        cat_dim=0))
+            else:
+                weights.update(
+                    get_tllm_linear_weight(split_v, tllm_prex + 'mlp.proj.',
+                                           None, use_weight_only,
+                                           plugin_weight_only_quant_type, dtype,
+                                           use_gemm_woq_plugin))
 
         # Layer norms do not use tensor parallelism
         input_ln_weight = get_weight(model_params, prefix + key_list[5], dtype)
@@ -1047,17 +1170,29 @@ def create_config_from_hugging_face(hf_model,
     n_kv_head = getattr(hf_config, "num_key_value_heads", n_head)
     vocab_size = hf_config.vocab_size
     n_positions = hf_config.max_position_embeddings
+    hidden_act = getattr(hf_config, "hidden_act", "silu")
     config['rotary_scaling'] = getattr(hf_config, "rope_scaling", None)
     qwen_type = hf_config.model_type
     if qwen_type == "qwen":
         rms_norm_eps = hf_config.layer_norm_epsilon
         rotary_base = getattr(hf_config, "rotary_emb_base", 10000.0)
-    elif qwen_type == "qwen2":
+    elif qwen_type == "qwen2" or qwen_type == "qwen2_moe":
         rms_norm_eps = hf_config.rms_norm_eps
         rotary_base = getattr(hf_config, "rope_theta", 100000.0)
     else:
         logger.error("Unknown Qwen Architecture: " + qwen_type)
         assert False
+
+    moe_num_experts = getattr(hf_config, "num_experts", 0)
+    moe_top_k = getattr(hf_config, "num_experts_per_tok", 0)
+    moe_intermediate_size = getattr(hf_config, "moe_intermediate_size", 0)
+    moe_shared_expert_intermediate_size = getattr(
+        hf_config, "shared_expert_intermediate_size", 0)
+    config[
+        'moe_normalization_mode'] = MoeConfig.ExpertScaleNormalizationMode.NONE
+
+    if qwen_type == "qwen2_moe":
+        hidden_act = "swiglu"
 
     config.update({
         'architecture': "QWenForCausalLM",
@@ -1071,19 +1206,36 @@ def create_config_from_hugging_face(hf_model,
         'vocab_size': vocab_size,
         'position_embedding_type': 'rope_gpt_neox',
         'max_position_embeddings': n_positions,
-        'hidden_act': 'silu',
+        'hidden_act': hidden_act,
         'rotary_base': rotary_base,
         'norm_epsilon': rms_norm_eps,
         'qwen_type': qwen_type,
+        'moe_num_experts': moe_num_experts,
+        'moe_top_k': moe_top_k,
+        'moe_intermediate_size': moe_intermediate_size,
+        'moe_shared_expert_intermediate_size':
+        moe_shared_expert_intermediate_size,
         #TODO: should have directly map from the Mapping object to the TRT-LLM checkpoint fields
         'mapping': {
             'world_size': mapping.tp_size * mapping.pp_size,
             'tp_size': mapping.tp_size,
-            'pp_size': mapping.pp_size
+            'pp_size': mapping.pp_size,
+            'moe_tp_size': mapping.moe_tp_size,
+            'moe_ep_size': mapping.moe_ep_size,
         }
     })
     config['quantization'] = quantization.to_dict()
     config.update(override_fields)
+
+    moe_config = MoeConfig(config['moe_num_experts'], config['moe_top_k'],
+                           config['moe_normalization_mode']).validate()
+    use_weight_only = config['quantization']['quant_algo'] in [
+        QuantAlgo.W8A16, QuantAlgo.W4A16, QuantAlgo.FP8
+    ]
+    if use_weight_only and moe_config.has_moe():
+        config['quantization']['exclude_modules'].append('router')
+        config['quantization']['exclude_modules'].append('shared_expert_gate')
+
     return config
 
 
@@ -1109,9 +1261,7 @@ def from_hugging_face(cls,
     pretrained_config = PretrainedConfig.from_dict(config)
     pretrained_config.set_rank(mapping.rank)  #TODO: remove this hack
     qwen_type = pretrained_config.qwen_type
-    assert qwen_type in [
-        'qwen', 'qwen2'
-    ], "Unsupported Qwen type. Must be either 'qwen' or 'qwen2'"
+    assert qwen_type in ['qwen', 'qwen2', 'qwen2_moe'], "Unsupported Qwen type."
     qwen = cls.from_config(pretrained_config)
 
     if from_hf_gptq:
@@ -1151,9 +1301,7 @@ def quantize(dtype,
                                              override_fields=override_fields)
 
     qwen_type = config['qwen_type']
-    assert qwen_type in [
-        'qwen', 'qwen2'
-    ], "Unsupported Qwen type. Must be either 'qwen' or 'qwen2'"
+    assert qwen_type in ['qwen', 'qwen2', 'qwen2_moe'], "Unsupported Qwen type."
 
     with open(os.path.join(output_dir, 'config.json'), 'w') as f:
         json.dump(config, f, indent=4)
@@ -1190,7 +1338,9 @@ def quantize(dtype,
         ranked_mapping = Mapping(world_size=mapping.world_size,
                                  rank=rank,
                                  tp_size=mapping.tp_size,
-                                 pp_size=mapping.pp_size)
+                                 pp_size=mapping.pp_size,
+                                 moe_tp_size=mapping.moe_tp_size,
+                                 moe_ep_size=mapping.moe_ep_size)
         weights = load_weights_from_hf(
             config=config,
             mapping=ranked_mapping,
@@ -1222,6 +1372,9 @@ def load_weights_from_hf(*,
     elif quant_algo == 'W4A16':
         plugin_weight_only_quant_type = torch.quint4x2
 
+    moe_config = MoeConfig(config['moe_num_experts'], config['moe_top_k'],
+                           config['moe_normalization_mode']).validate()
+
     use_weight_only = quant_algo in ['W8A16', 'W4A16']
     use_smooth_quant = quant_algo is not None and quant_algo.startswith(
         'W8A8_SQ')
@@ -1247,5 +1400,6 @@ def load_weights_from_hf(*,
         int8_kv_cache=use_int8_kv_cache,
         act_range=act_range,
         qkv_para=qwen_qkv_para,
-        smoother=qwen_smoother)
+        smoother=qwen_smoother,
+        moe_config=moe_config)
     return weights

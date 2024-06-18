@@ -94,8 +94,9 @@ public:
         th::optional<th::Tensor> beam_hyps_is_done_opt, bool const use_beam_hyps) override;
 
 private:
-    tensorrt_llm::runtime::ITensor::SharedPtr finished_sum_; // [batch_size] pinned
-    std::shared_ptr<tensorrt_llm::layers::DynamicDecodeLayer<T>> dynamic_decode_layer_;
+    tensorrt_llm::runtime::ITensor::SharedPtr mFinishedSum; // [batch_size] pinned
+    std::shared_ptr<tensorrt_llm::layers::DynamicDecodeLayer<T>> mDynamicDecodeLayer;
+    std::optional<size_t> mBeamWidth;
 };
 
 class DynamicDecodeOp : public th::jit::CustomClassHolder
@@ -135,14 +136,14 @@ public:
 
 private:
     // Members initialized in constructor and used in call of createInstance()
-    size_t const max_batch_size_;
-    size_t const max_beam_width_;
-    size_t const vocab_size_;
-    size_t const vocab_size_padded_;
-    int const tensor_para_size_;
-    int const pipeline_para_size_;
-    at::ScalarType const scalar_type_;                 // Data type of expected input logits
-    std::unique_ptr<IFtDynamicDecode> dynamic_decode_; // FT Dynamic decode layer wrapper instance
+    size_t const maxBatchSize_;
+    size_t const maxBeamWidth_;
+    size_t const vocabSize_;
+    size_t const vocabSizePadded_;
+    int const tensorParaSize_;
+    int const pipelineParaSize_;
+    at::ScalarType const scalarType_;                 // Data type of expected input logits
+    std::unique_ptr<IFtDynamicDecode> dynamicDecode_; // FT Dynamic decode layer wrapper instance
 
     void createInstance();
 };

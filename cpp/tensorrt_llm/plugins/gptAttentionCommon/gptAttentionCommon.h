@@ -339,7 +339,6 @@ protected:
     // The default copy constructor will leave it as nullptr. clone() shall initialize it.
     std::shared_ptr<CUDADriverWrapper> mDriver;
     UniqPtrWNullCopy<tensorrt_llm::kernels::MHARunner> mFMHARunner;
-    tensorrt_llm::kernels::DecoderXQARunner::Resource mDecoderXQARunnerResource;
     UniqPtrWNullCopy<tensorrt_llm::kernels::DecoderXQARunner> mDecoderXQARunner;
 
     bool mMultiBlockMode;

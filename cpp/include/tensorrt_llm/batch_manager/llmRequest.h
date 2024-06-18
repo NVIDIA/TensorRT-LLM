@@ -62,7 +62,7 @@ public:
     using VecLogProbs = std::vector<float>;
     using BeamTokens = std::vector<VecTokens>;
     using TensorPtr = TTensor;
-    using LogitsPostProcessor = std::function<void(RequestIdType, TensorPtr&, BeamTokens const&, TStream)>;
+    using LogitsPostProcessor = std::function<void(RequestIdType, TensorPtr&, BeamTokens const&, TStream const&)>;
 
     GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::shared_ptr<VecTokens> inputTokens,
         runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
@@ -76,6 +76,7 @@ public:
         std::optional<std::shared_ptr<VecTokens>> draftTokens = std::nullopt,
         std::optional<TensorPtr> draftLogits = std::nullopt, bool excludeInputFromOutput = false,
         std::optional<LogitsPostProcessor> logitsPostProcessor = std::nullopt,
+        bool applyLogitsPostProcessorBatched = false,
         std::optional<std::shared_ptr<VecTokens>> encoderInputTokens = std::nullopt, bool returnEncoderOutput = false)
         : mRequestId(requestId)
         , mPromptLen(inputTokens->size())
@@ -86,6 +87,7 @@ public:
         , mEndId(endId)
         , mPadId(padId)
         , mLogitsPostProcessor(logitsPostProcessor)
+        , mApplyLogitsPostProcessorBatched(applyLogitsPostProcessorBatched)
         , mOrigPromptLen(mPromptLen)
         , mMaxSentTokenPos(mPromptLen - 1)
         , mEmbeddingBias(std::move(embeddingBias))
@@ -679,7 +681,7 @@ public:
 
     void allocContextLogitsHost(SizeType32 vocabSizePadded, nvinfer1::DataType logitsDataType)
     {
-        mContextLogitsHost = runtime::BufferManager::pinned(
+        mContextLogitsHost = runtime::BufferManager::pinnedPool(
             runtime::ITensor::makeShape({mPromptLen, vocabSizePadded}), logitsDataType);
     }
 
@@ -695,13 +697,13 @@ public:
 
     void allocGenerationLogitsHost(SizeType32 vocabSizePadded, nvinfer1::DataType logitsDataType)
     {
-        mGenerationLogitsHost = runtime::BufferManager::pinned(
+        mGenerationLogitsHost = runtime::BufferManager::pinnedPool(
             runtime::ITensor::makeShape({mSamplingConfig.beamWidth, mMaxNewTokens, vocabSizePadded}), logitsDataType);
     }
 
     void allocTargetModelAcceptedTokenLogitsHost(SizeType32 vocabSizePadded, nvinfer1::DataType logitsDataType)
     {
-        mGenerationLogitsHost = runtime::BufferManager::pinned(
+        mGenerationLogitsHost = runtime::BufferManager::pinnedPool(
             runtime::ITensor::makeShape({getNumDraftTokens() + 1, vocabSizePadded}), logitsDataType);
     }
 
@@ -948,6 +950,7 @@ public:
     std::optional<TokenIdType> mPadId;
     std::optional<SizeType32> mSeqSlot;
     std::optional<LogitsPostProcessor> mLogitsPostProcessor;
+    bool mApplyLogitsPostProcessorBatched;
 
 protected:
     BeamTokens mTokens;
@@ -1073,20 +1076,24 @@ public:
         std::optional<std::shared_ptr<VecTokens>> draftTokens = std::nullopt,
         std::optional<TensorPtr> draftLogits = std::nullopt, bool excludeInputFromOutput = false,
         std::optional<LogitsPostProcessor> logitsPostProcessor = std::nullopt,
+        bool applyLogitsPostProcessorBatched = false,
         std::optional<std::shared_ptr<VecTokens>> encoderInputTokens = std::nullopt, bool returnEncoderOutput = false)
         : Base(requestId, maxNewTokens, std::move(inputTokens), samplingConfig, isStreaming, endId, padId,
             std::move(embeddingBias), std::move(badWordsList), std::move(stopWordsList),
             std::move(promptEmbeddingTable), promptVocabSize, loraTaskId, std::move(loraWeights), std::move(loraConfig),
             returnLogProbs, returnContextLogits, returnGenerationLogits, std::move(draftTokens), std::move(draftLogits),
-            excludeInputFromOutput, std::move(logitsPostProcessor), std::move(encoderInputTokens), returnEncoderOutput)
+            excludeInputFromOutput, std::move(logitsPostProcessor), applyLogitsPostProcessorBatched,
+            std::move(encoderInputTokens), returnEncoderOutput)
     {
     }
 
     LlmRequest(RequestIdType requestId, executor::Request const& Request,
-        std::optional<Base::LogitsPostProcessor> logitsPostProcessor = std::nullopt)
+        std::optional<Base::LogitsPostProcessor> logitsPostProcessor = std::nullopt,
+        bool applyLogitsPostProcessorBatched = false)
         : Base(requestId, Request)
     {
         mLogitsPostProcessor = std::move(logitsPostProcessor);
+        mApplyLogitsPostProcessorBatched = applyLogitsPostProcessorBatched;
     }
 
     void movePromptEmbeddingTableToGpu(runtime::BufferManager const& manager)

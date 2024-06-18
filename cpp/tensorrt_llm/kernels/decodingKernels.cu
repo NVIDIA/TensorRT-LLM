@@ -339,7 +339,7 @@ __global__ void insertUnfinishedPathKernel(BeamHypotheses bh)
         // Other parameters
         bh.sequenceLengthsCBA[dstBeam] = bh.sequenceLengths[srcBeam];
         bh.normedScoresCBA[dstBeam]
-            = applyLengthPenalty(bh.cumLogProbs[srcBeam], step - bh.inputLengths[srcBeam], bh.lengthPenalties[bid]);
+            = applyLengthPenalty(bh.cumLogProbs[srcBeam], step - bh.inputLengths[srcBeam] + 1, bh.lengthPenalties[bid]);
         bh.cumLogProbsCBA[dstBeam] = bh.cumLogProbs[srcBeam];
         bh.numBeamsCBA[bid]++;
     }

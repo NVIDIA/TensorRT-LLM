@@ -44,7 +44,8 @@ public:
         , mId(id)
         , mGoldenTokensMax(
               runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxN * 2 - 1}), nvinfer1::DataType::kINT32))
-        , mPrefillsMax(runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxN - 2}), nvinfer1::DataType::kINT32))
+        , mPrefillsMax(runtime::BufferManager::cpu(
+              runtime::ITensor::makeShape({(maxN <= 1 ? 0 : maxN - 2)}), nvinfer1::DataType::kINT32))
         , mKeyTokensMax(runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxW}), nvinfer1::DataType::kINT32))
         , mPastTokensMax(
               runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxW * (maxN - 1)}), nvinfer1::DataType::kINT32))
@@ -125,6 +126,7 @@ private:
     runtime::SizeType32 mW{0};
     runtime::SizeType32 mN{0};
     runtime::SizeType32 mG{0};
+    runtime::SizeType32 mRuntimeMaxDraftLen{0};
     //! in prefilling mode when mFilling < mN-1.
     runtime::SizeType32 mFilling;
 

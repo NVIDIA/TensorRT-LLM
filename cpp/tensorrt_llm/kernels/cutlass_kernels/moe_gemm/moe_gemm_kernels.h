@@ -30,7 +30,6 @@ namespace tensorrt_llm
 
 struct HopperGroupedGemmInput
 {
-
     template <class Tag>
     using TransposeLayoutTag = std::conditional_t<std::is_same_v<Tag, cutlass::layout::RowMajor>,
         cutlass::layout::ColumnMajor, cutlass::layout::RowMajor>;
@@ -180,7 +179,7 @@ public:
     bool supportsHopperSpecialisation() const;
     [[nodiscard]] bool isFusedGatedActivation(bool is_gated_activation, int gemm_n, int gemm_k) const;
 
-    size_t calcMaxWorkspaceSize(int num_experts) const;
+    size_t getMaxWorkspaceSize(int num_experts) const;
 
     [[nodiscard]] int getSM() const;
 
@@ -197,9 +196,12 @@ private:
         int64_t gemm_k, int num_experts, bool use_fused_moe, cudaStream_t stream);
 
 private:
-    int sm_;
-    int multi_processor_count_;
+    int sm_{};
+    int multi_processor_count_{};
+    mutable int num_experts_ = 0;
+    mutable size_t gemm_workspace_size_ = 0;
     std::optional<cutlass_extensions::CutlassGemmConfig> best_config_{};
+    size_t calcMaxWorkspaceSize(int num_experts) const;
 };
 
 } // namespace tensorrt_llm

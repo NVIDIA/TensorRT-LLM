@@ -14,16 +14,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging as _log
+import os as _os
 import pathlib as _pl
 import subprocess as _sp
 import typing as _tp
 
 
-def run_command(command: _tp.Sequence[str], *, cwd=None, **kwargs) -> None:
-    print(f"Running: cd %s && %s" %
-          (str(cwd or _pl.Path.cwd()), " ".join(command)),
-          flush=True)
-    _sp.check_call(command, cwd=cwd, **kwargs)
+def run_command(command: _tp.Sequence[str],
+                *,
+                cwd=None,
+                timeout=None,
+                **kwargs) -> None:
+    _log.info("Running: cd %s && %s", str(cwd), " ".join(command))
+    override_timeout = int(_os.environ.get("CPP_TEST_TIMEOUT_OVERRIDDEN", "-1"))
+    if override_timeout > 0 and (timeout is None or override_timeout > timeout):
+        _log.info("Overriding the command timeout: %s (before) and %s (after)",
+                  timeout, override_timeout)
+        timeout = override_timeout
+    _sp.check_call(command, cwd=cwd, timeout=timeout, **kwargs)
 
 
 # We can't use run_command() because robocopy (Robust Copy, rsync equivalent on Windows)

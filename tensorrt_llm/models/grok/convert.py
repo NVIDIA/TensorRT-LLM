@@ -52,7 +52,7 @@ def get_jax_weight(config, prefix, dtype, postfix='.weight', key_name='scale'):
                            dtype=dtype).T
 
 
-def get_jax_weight_scale(params, key, rank):
+def get_jax_weight_scale(params, key):
     jax_obj = params[key]['w']
     jax_scales = jax.device_put(jax_obj.scales, device=jax.devices('cpu')[0])
     # jax_scales = jax.device_put(jax_obj.scales, device=jax.devices('gpu')[rank])
@@ -111,13 +111,11 @@ def convert_grok(hf_model,
         tllm_prex = f'transformer.layers.{l - layers_range[0]}.'
 
         q_weight, q_scale = get_jax_weight_scale(
-            model_params, prefix + 'multi_head_attention/query',
-            mapping.tp_rank)
+            model_params, prefix + 'multi_head_attention/query')
         k_weight, k_scale = get_jax_weight_scale(
-            model_params, prefix + 'multi_head_attention/key', mapping.tp_rank)
+            model_params, prefix + 'multi_head_attention/key')
         v_weight, v_scale = get_jax_weight_scale(
-            model_params, prefix + 'multi_head_attention/value',
-            mapping.tp_rank)
+            model_params, prefix + 'multi_head_attention/value')
 
         wq = split(q_weight, mapping.tp_size, mapping.tp_rank, dim=1)
         wk = split(k_weight, mapping.tp_size, mapping.tp_rank, dim=1)
@@ -134,8 +132,7 @@ def convert_grok(hf_model,
                                    plugin_weight_only_quant_type))
 
         attn_dense_weight, attn_dense_scales = get_jax_weight_scale(
-            model_params, prefix + 'multi_head_attention/linear',
-            mapping.tp_rank)
+            model_params, prefix + 'multi_head_attention/linear')
 
         split_v = split_matrix_tp(attn_dense_weight,
                                   tensor_parallel,
@@ -151,30 +148,49 @@ def convert_grok(hf_model,
                                    tllm_prex + 'attention.dense.',
                                    plugin_weight_only_quant_type))
 
-        if moe_config.tp_mode == moe_config.ParallelismMode.EXPERT_PARALLEL:
-            mapping.ep_experts(moe_config.num_experts)
-
         w3, s3 = get_jax_weight_scale(
-            model_params, f'transformer/decoder_layer_{l}/moe/linear_v',
-            mapping.tp_rank)
+            model_params, f'transformer/decoder_layer_{l}/moe/linear_v')
 
         w2, s2 = get_jax_weight_scale(
-            model_params, f'transformer/decoder_layer_{l}/moe/linear_1',
-            mapping.tp_rank)
+            model_params, f'transformer/decoder_layer_{l}/moe/linear_1')
 
         w1, s1 = get_jax_weight_scale(
-            model_params, f'transformer/decoder_layer_{l}/moe/linear',
-            mapping.tp_rank)
+            model_params, f'transformer/decoder_layer_{l}/moe/linear')
 
-        if moe_config.tp_mode == moe_config.ParallelismMode.TENSOR_PARALLEL:
+        # moe expert parallel
+        w3_split = split(w3, mapping.moe_ep_size, mapping.moe_ep_rank, dim=0)
+        w2_split = split(w2, mapping.moe_ep_size, mapping.moe_ep_rank, dim=0)
+        w1_split = split(w1, mapping.moe_ep_size, mapping.moe_ep_rank, dim=0)
 
-            w3_split = split(w3, mapping.tp_size, mapping.tp_rank, dim=2)
-            w2_split = split(w2, mapping.tp_size, mapping.tp_rank, dim=1)
-            w1_split = split(w1, mapping.tp_size, mapping.tp_rank, dim=2)
+        s3_split = split(s3, mapping.moe_ep_size, mapping.moe_ep_rank, dim=0)
+        s2_split = split(s2, mapping.moe_ep_size, mapping.moe_ep_rank, dim=0)
+        s1_split = split(s1, mapping.moe_ep_size, mapping.moe_ep_rank, dim=0)
+        # moe tensor parallel
+        w3_split = split(w3_split,
+                         mapping.moe_tp_size,
+                         mapping.moe_tp_rank,
+                         dim=2)
+        w2_split = split(w2_split,
+                         mapping.moe_tp_size,
+                         mapping.moe_tp_rank,
+                         dim=1)
+        w1_split = split(w1_split,
+                         mapping.moe_tp_size,
+                         mapping.moe_tp_rank,
+                         dim=2)
 
-            s3_split = split(s3, mapping.tp_size, mapping.tp_rank, dim=2)
-            s2_split = split(s2, mapping.tp_size, mapping.tp_rank, dim=1)
-            s1_split = split(s1, mapping.tp_size, mapping.tp_rank, dim=2)
+        s3_split = split(s3_split,
+                         mapping.moe_tp_size,
+                         mapping.moe_tp_rank,
+                         dim=2)
+        s2_split = split(s2_split,
+                         mapping.moe_tp_size,
+                         mapping.moe_tp_rank,
+                         dim=1)
+        s1_split = split(s1_split,
+                         mapping.moe_tp_size,
+                         mapping.moe_tp_rank,
+                         dim=2)
 
         weights.update(
             get_tllm_linear_weight(w2_split,
@@ -319,7 +335,6 @@ def create_config_from_xai(dtype,
     moe_num_experts = hf_config['num_experts']
 
     moe_top_k = hf_config['num_experts_per_tok']
-    moe_tp_mode = MoeConfig.ParallelismMode.TENSOR_PARALLEL
 
     attn_output_multiplier = hf_config['attn_output_multiplier']
     embedding_multiplier_scale = hf_config['embedding_multiplier_scale']
@@ -364,15 +379,15 @@ def create_config_from_xai(dtype,
         moe_num_experts,
         'moe_top_k':
         moe_top_k,
-        'moe_tp_mode':
-        moe_tp_mode,
         'moe_normalization_mode':
         MoeConfig.ExpertScaleNormalizationMode.NONE,
         #TODO: should have directly map from the Mapping object to the TRT-LLM checkpoint fields
         'mapping': {
             'world_size': mapping.tp_size * mapping.pp_size,
             'tp_size': mapping.tp_size,
-            'pp_size': mapping.pp_size
+            'pp_size': mapping.pp_size,
+            'moe_tp_size': mapping.moe_tp_size,
+            'moe_ep_size': mapping.moe_ep_size,
         },
         'attn_bias':
         attn_bias,
@@ -390,15 +405,6 @@ def create_config_from_xai(dtype,
 
     config['quantization'] = quantization.to_dict()
     config.update(override_fields)
-
-    moe_config = MoeConfig(config['moe_num_experts'], config['moe_top_k'],
-                           config['moe_tp_mode'],
-                           config['moe_normalization_mode']).validate()
-    use_weight_only = config['quantization']['quant_algo'] in [
-        QuantAlgo.W8A16, QuantAlgo.W4A16, QuantAlgo.FP8
-    ]
-    if use_weight_only and moe_config.has_moe():
-        config['quantization']['exclude_modules'].append('router')
 
     return config
 
@@ -472,7 +478,6 @@ def load_weights_from_xai(*, config, mapping, model):
     plugin_weight_only_quant_type = torch.int8
 
     moe_config = MoeConfig(config['moe_num_experts'], config['moe_top_k'],
-                           config['moe_tp_mode'],
                            config['moe_normalization_mode']).validate()
 
     use_weight_only = quant_algo in [QuantAlgo.W8A16]

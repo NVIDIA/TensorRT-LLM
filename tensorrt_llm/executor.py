@@ -1,11 +1,13 @@
 import asyncio
+import atexit
 import datetime
 import secrets
+import threading
+import time
 from abc import ABC, abstractmethod
 from multiprocessing.connection import Client, Listener
 from pathlib import Path
 from queue import Queue
-from threading import Thread
 from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 
 import numpy as np
@@ -21,15 +23,14 @@ from tensorrt_llm.hlapi.tokenizer import TokenizerBase, tokenizer_factory
 from tensorrt_llm.hlapi.utils import (ContextManager, GenerationOutput,
                                       print_traceback_on_error)
 
-from . import bindings as tllm
 from ._utils import mpi_rank, mpi_world_size
-from .bindings import executor as tllme
+from .bindings import executor as tllm
 from .hlapi.mpi_session import (MpiPoolSession, MpiSession,
                                 external_mpi_comm_available, find_free_port,
                                 need_spawn_mpi_workers)
 from .hlapi.tokenizer import TokenizerBase, tokenizer_factory
 from .hlapi.utils import (ContextManager, GenerationOutput, SamplingParams,
-                          print_traceback_on_error)
+                          exception_handler, print_traceback_on_error)
 
 
 def has_event_loop() -> bool:
@@ -78,7 +79,7 @@ class GenerationRequest:
         self.id = id
         return self
 
-    def as_executor_request(self) -> tllme.Request:
+    def as_executor_request(self) -> tllm.Request:
         # Request
         # TODO: Should we unify the pad_id/end_id logic?
         end_id = self.tokenizer.eos_token_id if self.tokenizer is not None else None
@@ -88,24 +89,38 @@ class GenerationRequest:
         pad_id = end_id if pad_id is None else pad_id
 
         request_kwargs = {
-            "input_token_ids": self.input_ids.squeeze().tolist(),
-            "max_new_tokens": self.sampling_params.max_new_tokens or 32,
-            "streaming": self.streaming,
-            "sampling_config": self.sampling_params._get_sampling_config(),
-            "end_id": end_id,
-            "pad_id": pad_id,
-            "output_config": self.sampling_params._get_output_config(),
+            "input_token_ids":
+            self.input_ids.squeeze().tolist(),
+            "max_new_tokens":
+            self.sampling_params.max_new_tokens or 32,
+            "streaming":
+            self.streaming,
+            "sampling_config":
+            self.sampling_params._get_sampling_config(),
+            "end_id":
+            end_id,
+            "pad_id":
+            pad_id,
+            "output_config":
+            self.sampling_params._get_output_config(),
             # The following options in the Executor API are not yet exposed by the HLAPI:
             # https://jirasw.nvidia.com/browse/TRTLLM-489
-            "bad_words": self.sampling_params.bad_words or [],
-            "stop_words": self.sampling_params.stop_words or [],
-            "embedding_bias": None,  #TODO
-            "external_draft_tokens_config": None,  #TODO
-            "prompt_tuning_config": None,  #TODO
-            "lora_config": None,  #TODO
-            "logits_post_processor_name": None,  #TODO
+            "bad_words":
+            self.sampling_params.bad_words or [],
+            "stop_words":
+            self.sampling_params.stop_words or [],
+            "embedding_bias":
+            self.sampling_params.embedding_bias,
+            "external_draft_tokens_config":
+            self.sampling_params.external_draft_tokens_config,
+            "prompt_tuning_config":
+            self.sampling_params.prompt_tuning_config,
+            "lora_config":
+            self.sampling_params.lora_config,
+            "logits_post_processor_name":
+            self.sampling_params.logits_post_processor_name,
         }
-        request = tllme.Request(**request_kwargs)
+        request = tllm.Request(**request_kwargs)
         return request
 
 
@@ -160,7 +175,7 @@ class GenerationResult(GenerationOutput):
         self.handle_generation_msg(tensors, error)
 
     async def aresult_step(self):
-        assert self.aqueue is not None
+        assert self.aqueue is not None, "The asyncio event loop was not present during initialization, so async operations are not available."
         _, tensors, self._done, error = await self.aqueue.get()
         self.handle_generation_msg(tensors, error)
 
@@ -238,6 +253,11 @@ class GenerationExecutor(ABC):
     def __init__(self):
         self.id_counter = GenerationExecutor.TERMINATE_REQUEST_ID + 1
         self.tokenizer = None
+        self._stats = None
+        self.stats_queue = None
+
+        exception_handler.register(self)
+        atexit.register(self.shutdown)
 
     def generate_id(self) -> int:
         gen_id = self.id_counter
@@ -309,24 +329,30 @@ class GenerationExecutor(ABC):
     def shutdown(self):
         pass
 
-    @abstractmethod
-    def get_stats(self):
-        pass
+    def create_stats_queue(self):
+        # Stats queue is created during first submission to ensure event loop exists if it is needed.
+        if not self._stats:
+            if has_event_loop():
+                self._stats = AsyncQueue()
+                self.stats_queue = self._stats.sync_q
+                self.stats_aqueue = self._stats.async_q
+            else:
+                self._stats = Queue()
+                self.stats_queue = self._stats
+                self.stats_aqueue = None
 
-    @abstractmethod
+    def get_stats(self):
+        return self.stats_queue.get()
+
     async def aget_stats(self):
-        pass
+        assert self.stats_aqueue is not None, "The asyncio event loop was not present during initialization, so async operations are not available."
+        return await self.stats_aqueue.get()
 
     @staticmethod
     def create(
         engine_dir: Path,
         tokenizer: Union[str, Path, TokenizerBase],
-        executor_type: tllm.TrtGptModelType = tllm.TrtGptModelType.
-        InflightFusedBatching,
-        scheduler_config: tllme.SchedulerConfig = tllme.SchedulerConfig(
-            tllme.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT),
-        executor_config: tllm.TrtGptModelOptionalParams = tllm.
-        TrtGptModelOptionalParams(),
+        executor_config: tllm.ExecutorConfig = tllm.ExecutorConfig(1),
         model_world_size: int = 1,
         world_size: int = 0,
         mpi_session: Optional[MpiSession] = None,
@@ -345,8 +371,6 @@ class GenerationExecutor(ABC):
         worker_kwargs = {
             "engine_dir": engine_dir,
             "tokenizer": tokenizer,
-            "executor_type": executor_type,
-            "scheduler_config": scheduler_config,
             "executor_config": executor_config,
         }
 
@@ -373,60 +397,25 @@ class ExecutorBindingsWorker(GenerationExecutor):
         self,
         engine_dir: Path,
         tokenizer: Union[str, Path, TokenizerBase, None],
-        executor_type: tllm.TrtGptModelType = tllm.TrtGptModelType.
-        InflightFusedBatching,
-        scheduler_config: tllme.SchedulerConfig = tllme.SchedulerConfig(
-            tllme.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT),
-        executor_config: tllm.TrtGptModelOptionalParams = tllm.
-        TrtGptModelOptionalParams(),
+        executor_config: tllm.ExecutorConfig = tllm.ExecutorConfig(1),
     ) -> None:
         super().__init__()
 
         self.engine = None
         self.tokenizer = tokenizer_factory(tokenizer)
-        self._stats = None
         self._results: Dict[int, GenerationResult] = {}
         self._pending: set = set()
         self.result_queue = None
         self.rank = mpi_rank()
 
-        # Convert config to Executor config.
-        config = tllme.ExecutorConfig(
-            max_beam_width=executor_config.max_beam_width
-            if executor_config.max_beam_width else 1,
-            batching_type=self.convert_executor_type(executor_type),
-            scheduler_config=scheduler_config)
-        # Translate additional options from TrtGptModelOptionalParams
-        config.kv_cache_config = tllme.KvCacheConfig(
-            enable_block_reuse=executor_config.kv_cache_config.
-            enable_block_reuse,
-            max_tokens=executor_config.kv_cache_config.max_tokens,
-            max_attention_window=executor_config.kv_cache_config.
-            max_attention_window,
-            sink_token_length=executor_config.kv_cache_config.sink_token_length,
-            free_gpu_memory_fraction=executor_config.kv_cache_config.
-            free_gpu_memory_fraction)
-        if executor_config.device_ids:
-            config.parallel_config = tllme.ParallelConfig(
-                device_ids=executor_config.device_ids)
-        config.enable_chunked_context = executor_config.enable_chunked_context
-        config.normalize_log_probs = executor_config.normalize_log_probs
-        config.decoding_config = executor_config.decoding_config
-        assert not executor_config.enable_trt_overlap, "enable_trt_overlap is not supported."
-        self.engine = tllme.Executor(engine_dir,
-                                     tllme.ModelType.DECODER_ONLY,
-                                     executor_config=config)
-        self.awaiter_thread = Thread(target=self.awaiter_loop)
-        self.running = True
-
-    def convert_executor_type(self, executor_type):
-        batching_type_map = {
-            tllm.TrtGptModelType.V1: tllme.BatchingType.STATIC,
-            tllm.TrtGptModelType.InflightFusedBatching:
-            tllme.BatchingType.INFLIGHT,
-        }
-        assert executor_type in batching_type_map, f"executor_type={executor_type} is not supported."
-        return batching_type_map[executor_type]
+        self.engine = tllm.Executor(engine_dir,
+                                    tllm.ModelType.DECODER_ONLY,
+                                    executor_config=executor_config)
+        self.awaiter_stop_event = threading.Event()
+        self.awaiter_thread = threading.Thread(target=self.awaiter_loop,
+                                               daemon=True)
+        self.stats_thread = threading.Thread(target=self.stats_loop,
+                                             daemon=True)
 
     def create_stats_queue(self):
         # Stats queue is created during first submission to ensure event loop exists if it is needed.
@@ -441,7 +430,14 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 self.stats_aqueue = None
 
     def set_result_queue(self, queue):
+        """In multi-gpu mode, result_queue will be set here to communicate between the proxy and the worker 0 process."""
         self.result_queue = queue
+
+    def set_stats_queue(self, queue):
+        """In multi-gpu mode, stats_queue will be set here to communicate between the proxy and the worker 0 process."""
+        self._stats = queue
+        self.stats_queue = self._stats
+        self.stats_aqueue = None
 
     def return_queue(self, req_id: int):
         """ If a centralized result queue is registered (used for communication with the proxy)
@@ -458,9 +454,14 @@ class ExecutorBindingsWorker(GenerationExecutor):
         ) and not self.awaiter_thread.is_alive():
             self.awaiter_thread.start()
 
+    def start_stats_thread(self):
+        if self.engine.can_enqueue_requests(
+        ) and not self.stats_thread.is_alive():
+            self.stats_thread.start()
+
     def awaiter_loop(self):
         """ Gets responses from executor and places in the return queue."""
-        while self.running:
+        while not self.awaiter_stop_event.is_set():
             # Get responses and place in queue.
             for response in self.engine.await_responses(
                     timeout=datetime.timedelta(milliseconds=100)):
@@ -480,9 +481,14 @@ class ExecutorBindingsWorker(GenerationExecutor):
                          None))
                     if response.result.is_final:
                         self._pending.remove(req_id)
+
+    def stats_loop(self):
+        while not self.awaiter_stop_event.is_set():
+            time.sleep(0.1)
             # Get stats and place in queue.
             for stats in self.engine.get_latest_iteration_stats():
-                while self.stats_queue.full():
+                while hasattr(self.stats_queue,
+                              "full") and self.stats_queue.full():
                     self.stats_queue.get()
                 self.stats_queue.put(stats.to_json_str())
 
@@ -494,6 +500,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
             raise NotImplementedError("Only rank 0 can submit requests.")
         self.create_stats_queue()
         self.start_awaiter_thread()
+        self.start_stats_thread()
         req_id = self.engine.enqueue_request(request.as_executor_request())
         request.set_id(req_id)
 
@@ -502,19 +509,14 @@ class ExecutorBindingsWorker(GenerationExecutor):
         self._pending.add(req_id)
         return result
 
-    def get_stats(self):
-        return self.stats_queue.get()
-
-    async def aget_stats(self):
-        assert self.stats_aqueue is not None
-        return await self.stats_aqueue.get()
-
     def shutdown(self):
         if self.engine is not None:
-            self.running = False
+            self.awaiter_stop_event.set()
             if self.engine.can_enqueue_requests():
                 if self.awaiter_thread.is_alive():
                     self.awaiter_thread.join()
+                if self.stats_thread.is_alive():
+                    self.stats_thread.join()
             self.engine.shutdown()
             self.engine = None
 
@@ -610,7 +612,12 @@ class ExecutorBindingsProxy(GenerationExecutor):
                              secrets.token_bytes(512))
         self.result_queue = Fifo(result_queue_addr, is_server=True)
 
+        stats_queue_addr = ("127.0.0.1", find_free_port(),
+                            secrets.token_bytes(512))
+        self.mp_stats_queue = Fifo(stats_queue_addr, is_server=True)
+
         self._results: Dict[int, GenerationResult] = {}
+        self._request_id_dispatcher_queue = Queue(maxsize=100)
 
         if mpi_session is None:
             self.mpi_session = MpiPoolSession(n_workers=model_world_size)
@@ -623,8 +630,13 @@ class ExecutorBindingsProxy(GenerationExecutor):
             "request_queue_addr": request_queue_addr,
             "request_id_queue_addr": request_id_queue_addr,
             "result_queue_addr": result_queue_addr,
+            "stats_queue_addr": stats_queue_addr,
         })
-        self.dispatcher = Thread(target=self.dispatcher_thread)
+        self.workers_init_ok = False
+        self.dispatcher = threading.Thread(target=self.dispatcher_thread,
+                                           daemon=True)
+        self.stats_thread = threading.Thread(target=self.stats_main,
+                                             daemon=True)
 
     @print_traceback_on_error
     @staticmethod
@@ -634,12 +646,8 @@ class ExecutorBindingsProxy(GenerationExecutor):
         request_queue_addr: Tuple[str, int, bytes],
         request_id_queue_addr: Tuple[str, int, bytes],
         result_queue_addr: Tuple[str, int, bytes],
-        executor_type: tllm.TrtGptModelType = tllm.TrtGptModelType.
-        InflightFusedBatching,
-        scheduler_config: tllme.SchedulerConfig = tllme.SchedulerConfig(
-            tllme.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT),
-        executor_config: tllm.TrtGptModelOptionalParams = tllm.
-        TrtGptModelOptionalParams()
+        stats_queue_addr: Tuple[str, int, bytes],
+        executor_config: tllm.ExecutorConfig = tllm.ExecutorConfig(1)
     ) -> None:
         result_queue = None
 
@@ -647,6 +655,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
             request_queue = Fifo(request_queue_addr, is_server=False)
             request_id_queue = Fifo(request_id_queue_addr, is_server=False)
             result_queue = Fifo(result_queue_addr, is_server=False)
+            mp_stats_queue = Fifo(stats_queue_addr, is_server=False)
 
         # Only the failure on rank0 can be captured here. All the non-rank0 process will hang once the executor runtime
         # is successfully initialized, that is controlled within cpp runtime.
@@ -655,12 +664,10 @@ class ExecutorBindingsProxy(GenerationExecutor):
         init_ok = True
         try:
             executor = ExecutorBindingsWorker(engine_dir, tokenizer,
-                                              executor_type, scheduler_config,
                                               executor_config)
         except Exception as e:
             init_ok = False
             raise e
-
         finally:
             if mpi_rank() == 0:
                 result_queue.put(init_ok)
@@ -668,11 +675,13 @@ class ExecutorBindingsProxy(GenerationExecutor):
         with ContextManager(executor) as executor:
             if mpi_rank() == 0:
                 executor.set_result_queue(result_queue)
+                executor.set_stats_queue(mp_stats_queue)
                 while (req := request_queue.get()) is not None:
                     result = executor.submit(req)
                     request_id_queue.put(result.generation_request.id)
 
                 result_queue.put(None)
+                mp_stats_queue.put(None)
             else:
                 executor.block_subordinates()
 
@@ -681,26 +690,44 @@ class ExecutorBindingsProxy(GenerationExecutor):
             correct GenerationResult queues. """
 
         while (res := self.result_queue.get()) is not None:
-            req_id = res[0]
+            req_id, *_ = res
+            # Wait for this result ready in self._results
+            while req_id not in self._results or self._request_id_dispatcher_queue.full(
+            ):
+                self._request_id_dispatcher_queue.get()
             self._results[req_id].queue.put(res)
+
+    def stats_main(self):
+        while (stats := self.mp_stats_queue.get()) is not None:
+            time.sleep(0.1)
+            while self.stats_queue.full():
+                self.stats_queue.get()
+            self.stats_queue.put(stats)
 
     def start(self):
         self.mpi_futures = self.mpi_session.submit(
             ExecutorBindingsProxy.workers_main, **self.workers_kwargs)
         self.workers_started = True
-        ack = self.result_queue.get()
-        if not ack:
+        self.workers_init_ok = self.result_queue.get()
+        if not self.workers_init_ok:
             raise RuntimeError("worker initialization failed")
         self.dispatcher.start()
+        self.create_stats_queue()
+        self.stats_thread.start()
 
     def shutdown(self):
         if not self.workers_started:
             return
-        self.request_queue.put(None)
+        if self.workers_init_ok:
+            self.request_queue.put(None)
         for f in self.mpi_futures:
             f.result()
         if self.dispatcher.is_alive():
+            self.result_queue.put(None)
             self.dispatcher.join()
+        if self.stats_thread.is_alive():
+            self.mp_stats_queue.put(None)
+            self.stats_thread.join()
         self.workers_started = False
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
@@ -725,16 +752,9 @@ class ExecutorBindingsProxy(GenerationExecutor):
         result = GenerationResult(request, tokenizer)
         self._results[req_id] = result
         request.tokenizer = tokenizer
+        self._request_id_dispatcher_queue.put(req_id)
 
         return result
-
-    def get_stats(self):
-        # TODO: https://jirasw.nvidia.com/browse/TRTLLM-514
-        pass
-
-    async def aget_stats(self):
-        # TODO: https://jirasw.nvidia.com/browse/TRTLLM-514
-        pass
 
     def __del__(self):
         self.shutdown()

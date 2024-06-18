@@ -30,7 +30,7 @@ namespace tensorrt_llm::kernels
 constexpr size_t WARP_SIZE = 32;
 constexpr size_t MAX_ALL_REDUCE_BLOCKS = 24;
 constexpr size_t MAX_RANKS_PER_NODE = 8;
-constexpr size_t DEFAULT_BLOCK_SIZE = 1024;
+constexpr size_t DEFAULT_BLOCK_SIZE = 512;
 
 // Warning: python definition is in tensorrt_llm/functional.py
 // they must be kept in sync
@@ -82,7 +82,7 @@ struct AllReduceParams
     size_t elts_per_rank;
     size_t elts_per_block;
     size_t rank_offset;
-    size_t ranks_per_node, rank, local_rank;
+    size_t ranks_per_node, local_rank;
     uint32_t barrier_flag;
     uint32_t* peer_barrier_ptrs_in[MAX_RANKS_PER_NODE];
     uint32_t* peer_barrier_ptrs_out[MAX_RANKS_PER_NODE];

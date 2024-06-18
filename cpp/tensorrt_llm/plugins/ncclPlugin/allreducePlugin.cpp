@@ -249,21 +249,22 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
     }
 
     // Log runtime strategy
+    auto const rank = COMM_SESSION.getRank();
     switch (runtimeStrategy)
     {
     case AllReduceStrategyType::NCCL:
     {
-        TLLM_LOG_DEBUG("AllReducePlugin strategy: AllReduceStrategyType::NCCL");
+        TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d layer %d: NCCL", rank, mCounter);
         break;
     }
     case AllReduceStrategyType::ONESHOT:
     {
-        TLLM_LOG_DEBUG("AllReducePlugin strategy: AllReduceStrategyType::ONESHOT");
+        TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d layer %d: ONESHOT", rank, mCounter);
         break;
     }
     case AllReduceStrategyType::TWOSHOT:
     {
-        TLLM_LOG_DEBUG("AllReducePlugin strategy: AllReduceStrategyType::TWOSHOT");
+        TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d layer %d: TWOSHOT", rank, mCounter);
         break;
     }
     default: break;
@@ -273,8 +274,7 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
     {
         if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
         {
-            NCCLCHECK(ncclAllReduce(
-                inputs[0], outputs[1], size, (*getDtypeMap())[mType], ncclSum, (*getCommMap())[mGroup], stream));
+            NCCLCHECK(ncclAllReduce(inputs[0], outputs[1], size, (*getDtypeMap())[mType], ncclSum, *mNcclComm, stream));
             tensorrt_llm::kernels::AllReduceParams params;
             int fusion_ptr_idx = 0;
             if (mStrategy == AllReduceStrategyType::NCCL)
@@ -297,19 +297,16 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
         }
         else
         {
-            NCCLCHECK(ncclAllReduce(
-                inputs[0], outputs[0], size, (*getDtypeMap())[mType], ncclSum, (*getCommMap())[mGroup], stream));
+            NCCLCHECK(ncclAllReduce(inputs[0], outputs[0], size, (*getDtypeMap())[mType], ncclSum, *mNcclComm, stream));
         }
     }
     else
     {
-        auto myRank = COMM_SESSION.getRank();
-        int nRanks = inputDesc[1].dims.d[0] / utils::customAllReduceUtils::NUM_POINTERS_PER_RANK;
-        // FIXME: pass world config here
-        myRank = myRank % nRanks;
+        auto const tpSize = mGroup.size();
+        auto const tpRank = rank % tpSize;
 
         auto params = tensorrt_llm::kernels::AllReduceParams::deserialize(
-            reinterpret_cast<int32_t const*>(inputs[1]), nRanks, myRank, mCounter);
+            reinterpret_cast<int32_t const*>(inputs[1]), tpSize, tpRank, mCounter);
 
         params.local_output_buffer_ptr = outputs[0];
         params.local_input_buffer_ptr = inputs[0];
@@ -578,7 +575,7 @@ int AllreducePlugin::initialize() noexcept
         return 0;
     }
 
-    initCommMap(mGroup);
+    mNcclComm = getComm(mGroup);
     if (mStrategy != AllReduceStrategyType::NCCL)
     {
         initGroupTopology();
@@ -587,20 +584,7 @@ int AllreducePlugin::initialize() noexcept
     return 0;
 }
 
-void AllreducePlugin::terminate() noexcept
-{
-    if (mStrategy == AllReduceStrategyType::NCCL || mStrategy == AllReduceStrategyType::AUTO)
-    {
-        auto* commMap = getCommMap();
-        // [] operator inserts T() if it does not exist
-        if (isBuilding() || (*commMap)[mGroup] == nullptr)
-        {
-            return;
-        }
-        NCCLCHECK(ncclCommDestroy((*commMap)[mGroup]));
-        (*commMap)[mGroup] = nullptr;
-    }
-}
+void AllreducePlugin::terminate() noexcept {}
 
 size_t AllreducePlugin::getSerializationSize() const noexcept
 {

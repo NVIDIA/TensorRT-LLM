@@ -89,9 +89,8 @@ def _gemm_plugin(input: Tensor,
     if use_fp8:
         assert (
             isinstance(alpha, np.ndarray) and alpha.dtype == np.float32
-            and alpha.size == 1,
-            "`alpha` must be passed as a float32 ndarray if `use_fp8` is enabled for _gemm_plugin"
-        )
+            and alpha.size == 1
+        ), "`alpha` must be passed as a float32 ndarray if `use_fp8` is enabled for _gemm_plugin"
         assert input.dtype == trt.fp8
         assert mat2.dtype == trt.fp8
 

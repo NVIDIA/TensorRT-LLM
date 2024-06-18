@@ -1,7 +1,8 @@
 # Mixtral
 
 This document shows how to build and run a Mixtral model in TensorRT-LLM on both single GPU, single node multi-GPU and
-multi-node multi-GPU.
+multi-node multi-GPU.  Mixtral 8x22B is also supported and can be replace Mixtral 8x7B below as long as GPU memory is
+sufficient.
 
 ## Overview
 
@@ -11,12 +12,22 @@ See the LLaMA example [`examples/llama`](../llama) for details.
 
 ### Build TensorRT engine(s)
 
+#### Download Mixtral 8x7b weights
 Get the weights by downloading from HF https://huggingface.co/mistralai/Mixtral-8x7B-v0.1.
 See also https://huggingface.co/docs/transformers/main/en/model_doc/mixtral
 
 ```bash
 git lfs install
 git clone https://huggingface.co/mistralai/Mixtral-8x7B-v0.1
+```
+
+#### Download Mixtral 8x22b weights
+Get the weights by downloading from HF https://huggingface.co/mistralai/Mixtral-8x22B-v0.1.
+See also https://huggingface.co/docs/transformers/main/en/model_doc/mixtral
+
+```bash
+git lfs install
+git clone https://huggingface.co/mistralai/Mixtral-8x22B-v0.1
 ```
 
 We use the LLaMA `convert_checkpoint.py` script to convert and build the model. TensorRT-LLM LLaMA builds TensorRT engine(s) from HF checkpoint provided by `--model_dir`.
@@ -44,9 +55,22 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_mixtral_2gpu \
 python ../llama/convert_checkpoint.py --model_dir ./Mixtral-8x7B-v0.1 \
                              --output_dir ./tllm_checkpoint_mixtral_2gpu \
                              --dtype float16 \
-                             --tp_size 2
+                             --tp_size 2 \
+                             --moe_tp_size 2
 trtllm-build --checkpoint_dir ./tllm_checkpoint_mixtral_2gpu \
                  --output_dir ./trt_engines/mixtral/tp2 \
+                 --gemm_plugin float16
+
+
+# Build Mixtral8x22B with tensor parallelism and expert parallelism
+python ../llama/convert_checkpoint.py --model_dir ./Mixtral-8x22B-v0.1 \
+                             --output_dir ./tllm_checkpoint_mixtral_8gpu \
+                             --dtype float16 \
+                             --tp_size 8 \
+                             --moe_tp_size 2 \
+                             --moe_ep_size 4
+trtllm-build --checkpoint_dir ./tllm_checkpoint_mixtral_8gpu \
+                 --output_dir ./trt_engines/mixtral/tp2ep4 \
                  --gemm_plugin float16
 ```
 
@@ -60,26 +84,38 @@ For more examples see [`examples/llama/README.md`](../llama/README.md)
 
 ### Parallelism Modes
 
-Mixture of Experts supports two parallelism modes, these are Expert Parallelism (EP) and Tensor Parallelism (TP).
+Mixture of Experts supports 3 parallelism modes, these are Expert Parallelism (EP), Tensor Parallelism (TP), and the hybrid of the two (TP+EP).
 
-In TP mode (default) expert weight matrices are sliced evenly between all GPUs, so that all GPUs work together to
-calculate the result for each expert.
+In TP mode (default) expert weight matrices are sliced evenly between all GPUs, so that all GPUs work together to calculate the result for each expert.
 
-In EP mode each GPU is assigned a subset of the expert weights matrices, so each GPU works independently to calculate
-the result for its assigned experts. This may cause load balancing issues where some GPUs have more work than others,
-thus increasing latency.
+In EP mode each GPU is assigned a subset of the expert weights matrices, so each GPU works independently to calculate the result for its assigned experts. This may cause load balancing issues where some GPUs have more work than others, thus increasing latency.
 
-Enable expert parallelism by providing `--moe_tp_mode 1` to `convert_checkpoint.py`, see [tensorrt_llm/layers/moe.py](../../tensorrt_llm/layers/moe.py#L51) for available values
+In TP+EP mode, both strategies are used simultaneously. This means each GPU handles a portion of the expert weights matrices (as in EP mode) and these weights are further sliced across multiple GPUs (as in TP mode). This hybrid approach aims to balance the workload more evenly across GPUs, enhancing efficiency and reducing the likelihood of bottlenecks associated with EP mode alone.
+
+You can enable Expert Parallel or hybrid parallel by setting `--moe_tp_size` and `--moe_ep_size` when calling `convert_coneckpoint.py`. If only `--moe_tp_size` is provided, TRT-LLM will use Tensor Parallel for the MoE model; if only `--moe_ep_size` is provided, TRT-LLM will use Expert Parallel; if both are provided, the hybrid parallel will be used.
+
+Be sure that the product of `moe_tp_size` and `moe_ep_size` should equal to `tp_size`, since the total number of MoE paralleism across all GPUs must match the total number of parallelism in other parts of the model.
 
 ```bash
-# Build Mixtral8x7B with Expert Parallelism Mode
+# Build Mixtral8x7B with Expert Parallelism
 python ../llama/convert_checkpoint.py --model_dir ./Mixtral-8x7B-v0.1 \
                              --output_dir ./tllm_checkpoint_mixtral_2gpu \
                              --dtype float16 \
                              --tp_size 2 \
-                             --moe_tp_mode 1 # 1 is expert parallel, 2 is tensor parallel (default 2)
+                             --moe_ep_size 2
 trtllm-build --checkpoint_dir ./tllm_checkpoint_mixtral_2gpu \
-                 --output_dir ./trt_engines/mixtral/tp2 \
+                 --output_dir ./trt_engines/mixtral/ep2 \
+                 --gemm_plugin float16
+
+# Build Mixtral8x7B with Expert Parallelism and Tensor Parallelism
+python ../llama/convert_checkpoint.py --model_dir ./Mixtral-8x7B-v0.1 \
+                             --output_dir ./tllm_checkpoint_mixtral_4gpu \
+                             --dtype float16 \
+                             --tp_size 4 \
+                             --moe_tp_size 2 \
+                             --moe_ep_size 2
+trtllm-build --checkpoint_dir ./tllm_checkpoint_mixtral_4gpu \
+                 --output_dir ./trt_engines/mixtral/tp2ep2 \
                  --gemm_plugin float16
 ```
 
@@ -132,7 +168,6 @@ python ../quantization/quantize.py --model_dir ./Mixtral-8x7B-v0.1 \
 # Enable fp8 context fmha to get further acceleration by setting `--use_fp8_context_fmha enable`
 trtllm-build --checkpoint_dir ./tllm_checkpoint_mixtral_2gpu \
              --output_dir ./engine_outputs \
-             --gemm_plugin float16 \
              --workers 2
 ```
 

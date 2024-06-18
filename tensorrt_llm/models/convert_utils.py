@@ -68,10 +68,13 @@ def weight_only_quantize_dict(weights: Dict[str, torch.Tensor],
                                   'qkv.weight', 'dense.weight', 'fc.weight',
                                   'proj.weight', 'gate.weight'
                               ],
+                              exclude_weights=['shared_expert_gate.weight'],
                               plugin: bool = True):
     if quant_algo not in [QuantAlgo.W4A16, QuantAlgo.W8A16]:
         return weights
     for name in list(weights):
+        if any([_name in name for _name in exclude_weights]):
+            continue
         if any([_name in name for _name in quant_weights
                 ]) and weights[name].dtype != torch.int8:
             quant_weight, quant_scale = weight_only_quantize(

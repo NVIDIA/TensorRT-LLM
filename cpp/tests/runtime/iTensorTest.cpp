@@ -280,6 +280,87 @@ TEST(ITensorTest, TensorDimsSliceAtManual)
     EXPECT_TRUE(theConstOne->shapeEquals({1}));
 }
 
+TEST(ITensorTest, TensorDimsSliceAtExtrame)
+{
+    auto constexpr dataType = nvinfer1::DataType::kFLOAT;
+    {
+        auto shape = ITensor::makeShape({5, 5, 5, 5, 5});
+        ITensor::SharedPtr tensor(BufferManager::cpu(shape, dataType));
+
+        EXPECT_TRUE(ITensor::slice(tensor, {}, 0)->shapeEquals(ITensor::makeShape({0, 5, 5, 5, 5, 5})));
+        EXPECT_TRUE(ITensor::slice(tensor, {}, 1)->shapeEquals(ITensor::makeShape({1, 5, 5, 5, 5, 5})));
+        EXPECT_TRUE(ITensor::slice(tensor, {5}, 0)->shapeEquals(ITensor::makeShape({0, 5, 5, 5, 5})));
+        EXPECT_TRUE(ITensor::slice(tensor, {4, 5}, 0)->shapeEquals(ITensor::makeShape({0, 5, 5, 5})));
+        EXPECT_TRUE(ITensor::slice(tensor, {4, 4, 5}, 0)->shapeEquals(ITensor::makeShape({0, 5, 5})));
+        EXPECT_TRUE(ITensor::slice(tensor, {4, 4, 4, 5}, 0)->shapeEquals(ITensor::makeShape({0, 5})));
+        EXPECT_TRUE(ITensor::slice(tensor, {4, 4, 4, 4, 5}, 0)->shapeEquals(ITensor::makeShape({0})));
+        EXPECT_TRUE(ITensor::slice(tensor, {4, 4, 4, 4, 4}, 0)->shapeEquals(ITensor::makeShape({0})));
+        EXPECT_TRUE(ITensor::slice(tensor, {4, 4, 4, 4, 4}, 1)->shapeEquals(ITensor::makeShape({1})));
+        EXPECT_THROW(ITensor::slice(tensor, {}, 2), std::runtime_error);
+
+        EXPECT_TRUE(ITensor::at(tensor, {})->shapeEquals(ITensor::makeShape({5, 5, 5, 5, 5})));
+        EXPECT_TRUE(ITensor::at(tensor, {4})->shapeEquals(ITensor::makeShape({5, 5, 5, 5})));
+        EXPECT_TRUE(ITensor::at(tensor, {4, 4})->shapeEquals(ITensor::makeShape({5, 5, 5})));
+        EXPECT_TRUE(ITensor::at(tensor, {4, 4, 4})->shapeEquals(ITensor::makeShape({5, 5})));
+        EXPECT_TRUE(ITensor::at(tensor, {4, 4, 4, 4})->shapeEquals(ITensor::makeShape({5})));
+        EXPECT_TRUE(ITensor::at(tensor, {4, 4, 4, 4, 4})->shapeEquals(ITensor::makeShape({1})));
+    }
+
+    {
+        ITensor::SharedPtr tensor(BufferManager::cpu(ITensor::makeShape({}), dataType));
+
+        EXPECT_TRUE(ITensor::slice(tensor, 0, 0)->shapeEquals(ITensor::makeShape({})));
+        EXPECT_TRUE(ITensor::slice(tensor, {}, 0)->shapeEquals(ITensor::makeShape({0}))); // {0,{}} ==> {0}
+        EXPECT_THROW(ITensor::slice(tensor, {}, 1), std::runtime_error);                  // (1,{}} /=> {1}
+        EXPECT_THROW(ITensor::slice(tensor, {}, 2), std::runtime_error);
+        EXPECT_THROW(ITensor::slice(tensor, {0}, 0), std::runtime_error);
+
+        EXPECT_THROW(ITensor::at(tensor, {}), std::runtime_error); // due illegal slice(tensor, {}, 1)
+        EXPECT_THROW(ITensor::at(tensor, {0}), std::runtime_error);
+    }
+    {
+        ITensor::SharedPtr tensor(BufferManager::cpu(ITensor::makeShape({0}), dataType));
+
+        EXPECT_TRUE(ITensor::slice(tensor, 0, 0)->shapeEquals(ITensor::makeShape({0})));
+        EXPECT_TRUE(ITensor::slice(tensor, {}, 0)->shapeEquals(ITensor::makeShape({0, 0})));
+        EXPECT_TRUE(ITensor::slice(tensor, {}, 1)->shapeEquals(ITensor::makeShape({1, 0})));
+        EXPECT_TRUE(ITensor::slice(tensor, {0}, 0)->shapeEquals(ITensor::makeShape({0})));
+        EXPECT_THROW(ITensor::slice(tensor, {}, 2), std::runtime_error);
+
+        EXPECT_TRUE(ITensor::at(tensor, {})->shapeEquals(ITensor::makeShape({0})));
+        EXPECT_THROW(ITensor::at(tensor, {0}), std::runtime_error);
+    }
+    {
+        ITensor::SharedPtr tensor(BufferManager::cpu(ITensor::makeShape({0, 0}), dataType));
+
+        EXPECT_TRUE(ITensor::slice(tensor, 0, 0)->shapeEquals(ITensor::makeShape({0, 0})));
+        EXPECT_TRUE(ITensor::slice(tensor, {}, 0)->shapeEquals(ITensor::makeShape({0, 0, 0})));
+        EXPECT_TRUE(ITensor::slice(tensor, {}, 1)->shapeEquals(ITensor::makeShape({1, 0, 0})));
+        EXPECT_TRUE(ITensor::slice(tensor, {0}, 0)->shapeEquals(ITensor::makeShape({0, 0})));
+        EXPECT_THROW(ITensor::slice(tensor, {}, 2), std::runtime_error);
+        EXPECT_THROW(ITensor::slice(tensor, {0, 0}, 0), std::runtime_error);
+
+        EXPECT_TRUE(ITensor::at(tensor, {})->shapeEquals(ITensor::makeShape({0, 0})));
+        EXPECT_THROW(ITensor::at(tensor, {0}), std::runtime_error);
+        EXPECT_THROW(ITensor::at(tensor, {0, 0}), std::runtime_error);
+    }
+    {
+        ITensor::SharedPtr tensor(BufferManager::cpu(ITensor::makeShape({5, 0, 5}), dataType));
+
+        EXPECT_TRUE(ITensor::slice(tensor, 0, 0)->shapeEquals(ITensor::makeShape({0, 0, 5})));
+        EXPECT_TRUE(ITensor::slice(tensor, {}, 0)->shapeEquals(ITensor::makeShape({0, 5, 0, 5})));
+        EXPECT_TRUE(ITensor::slice(tensor, {}, 1)->shapeEquals(ITensor::makeShape({1, 5, 0, 5})));
+        EXPECT_TRUE(ITensor::slice(tensor, {0}, 0)->shapeEquals(ITensor::makeShape({0, 0, 5})));
+        EXPECT_TRUE(ITensor::slice(tensor, {0, 0}, 0)->shapeEquals(ITensor::makeShape({0, 5})));
+        EXPECT_THROW(ITensor::slice(tensor, {}, 2), std::runtime_error);
+        EXPECT_THROW(ITensor::slice(tensor, {0, 0, 0}, 0), std::runtime_error);
+
+        EXPECT_TRUE(ITensor::at(tensor, {})->shapeEquals(ITensor::makeShape({5, 0, 5})));
+        EXPECT_TRUE(ITensor::at(tensor, {0})->shapeEquals(ITensor::makeShape({0, 5})));
+        EXPECT_THROW(ITensor::at(tensor, {0, 0}), std::runtime_error);
+    }
+}
+
 //! \brief Range shape in [begin, end).
 class ShapeRange
 {
@@ -466,6 +547,7 @@ TEST(ITensorTest, TensorDimsSliceAt)
     {
         auto blockAt = ITensor::at(tensor, index);
         auto blockSliceRest = ITensor::slice(tensor, index);
+        auto blockSliceZero = ITensor::slice(tensor, index, 0);
         auto blockSliceOne = ITensor::slice(tensor, index, 1);
         auto blockSliceTwo = (shape.d[index.nbDims - 1] - index.d[index.nbDims - 1] >= 2)
             ? std::make_optional(ITensor::slice(tensor, index, 2))
@@ -517,6 +599,17 @@ TEST(ITensorTest, TensorDimsSliceAt)
             EXPECT_TRUE(ITensor::shapeEquals(blockShape, goldenShape));
         }
         {
+            auto blockShape = blockSliceZero->getShape();
+            ITensor::Shape goldenShape;
+            goldenShape.nbDims = shape.nbDims - index.nbDims + 1;
+            goldenShape.d[0] = 0;
+            for (SizeType32 i = 1; i < goldenShape.nbDims; i++)
+            {
+                goldenShape.d[i] = shape.d[i + index.nbDims - 1];
+            }
+            EXPECT_TRUE(ITensor::shapeEquals(blockShape, goldenShape));
+        }
+        {
             auto blockShape = blockSliceOne->getShape();
             ITensor::Shape goldenShape;
             goldenShape.nbDims = shape.nbDims - index.nbDims + 1;
@@ -556,7 +649,6 @@ TEST(ITensorTest, TensorDimsSliceAt)
         for (it++; it != range.end(); ++it)
         {
             EXPECT_THROW(ITensor::at(tensor, *it), std::runtime_error);
-            EXPECT_THROW(ITensor::slice(tensor, *it), std::runtime_error);
             EXPECT_THROW(ITensor::slice(tensor, *it, 1), std::runtime_error);
         }
     }

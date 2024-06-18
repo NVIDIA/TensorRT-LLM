@@ -75,6 +75,11 @@ public:
         return anyBitSet(kExplicitDraftTokens);
     }
 
+    [[nodiscard]] bool constexpr updatesPositionIds() const
+    {
+        return anyBitSet(kLookaheadDecoding | kExplicitDraftTokens);
+    }
+
     [[nodiscard]] bool constexpr requiresAttentionMask() const
     {
         return anyBitSet(kLookaheadDecoding | kMedusa | kExplicitDraftTokens);
@@ -99,6 +104,12 @@ public:
     [[nodiscard]] bool constexpr hasDraftLogits() const
     {
         return anyBitSet(kMedusa);
+    }
+
+    [[nodiscard]] bool constexpr needsDecoderPrologue() const
+    {
+        // Potentially lookahead should require it too.
+        return anyBitSet(kExplicitDraftTokens);
     }
 
     using UnderlyingType = std::uint8_t;

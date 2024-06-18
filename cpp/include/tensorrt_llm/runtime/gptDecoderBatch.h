@@ -38,6 +38,12 @@ public:
     using TensorPtr = ITensor::SharedPtr;
     using SharedConstPtr = ITensor::SharedConstPtr;
 
+    enum class ForwardType
+    {
+        kASYNC,
+        kSYNC
+    };
+
     GptDecoderBatch(std::size_t vocabSize, std::size_t vocabSizePadded, CudaStreamPtr stream,
         SpeculativeDecodingMode const& speculativeDecodingMode);
 
@@ -46,6 +52,8 @@ public:
         SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength,
         SizeType32 maxTokensPerStep, bool fusedDecoder, nvinfer1::DataType dtype,
         ModelConfig const& modelConfig) override;
+
+    void setupExplicitDraftTokens(ExplicitDraftTokensBuffers::Inputs explicitDraftTokensBuffers) override;
 
     void newBatch(
         GenerationInput const& inputs, GenerationOutput const& outputs, SamplingConfig const& samplingConfig) override;
@@ -164,6 +172,12 @@ public:
         return mJointDecodingOutput->speculativeDecodingOutputs->nextDraftTokens;
     }
 
+    //! @returns [batchSize], predicted draft tokens lengths for previous step, on gpu
+    [[nodiscard]] TensorPtr getPrevDraftTokensLengths() const override
+    {
+        return mJointDecodingOutput->speculativeDecodingOutputs->prevDraftTokensLen;
+    }
+
     //! @returns [batchSize], predicted draft tokens lengths for next step, on gpu
     [[nodiscard]] TensorPtr getNextDraftTokensLengths() const override
     {
@@ -171,13 +185,13 @@ public:
     }
 
     //! @returns [batchSize + 1], exclusive sum of accepted draft token lengths, on gpu
-    [[nodiscard]] TensorPtr getSpecDecodingAcceptedLengthsCumSum() const override
+    [[nodiscard]] TensorPtr getAcceptedLengthsCumSum() const override
     {
         return mJointDecodingOutput->speculativeDecodingOutputs->acceptedLengthsCumSum;
     }
 
     //! @returns [batchSize, maxAcceptedDraftTokensPerStep], accepted paths packed into continuous tensor, on gpu
-    [[nodiscard]] TensorPtr getSpecDecodingAcceptedPackedPaths() const override
+    [[nodiscard]] TensorPtr getAcceptedPackedPaths() const override
     {
         return mJointDecodingOutput->speculativeDecodingOutputs->pathsOffsets;
     }
@@ -215,17 +229,19 @@ private:
     //! @brief Updates finished state on host for all active requests
     void updateFinished(decoder_batch::Token const& token);
 
+    //! @brief Sets inputs for explicit draft tokens.
+    void setExplicitDraftTokensInputs(decoder_batch::Input const& input);
+
     //! @brief Calls unfused or fused decoders for tokens per engine step
-    void forwardDispatch(
-        decoder_batch::Output& output, decoder_batch::Input const& input, std::optional<CudaEvent> const& eventStart);
+    void forwardDispatch(decoder_batch::Output& output, decoder_batch::Input const& input, ForwardType forwardType);
 
     //! @brief Calls unfused decoder for whole batch in loop
-    void forwardUnfusedDecoder(SizeType32 step, decoder_batch::Output& output, decoder_batch::Input const& input,
-        std::optional<CudaEvent> const& eventStart);
+    void forwardUnfusedDecoder(
+        SizeType32 step, decoder_batch::Output& output, decoder_batch::Input const& input, ForwardType forwardType);
 
     //! @brief Calls fused decoder for whole batch
-    void forwardFusedDecoder(SizeType32 step, decoder_batch::Output& output, decoder_batch::Input const& input,
-        std::optional<CudaEvent> const& eventStart);
+    void forwardFusedDecoder(
+        SizeType32 step, decoder_batch::Output& output, decoder_batch::Input const& input, ForwardType forwardType);
 
 private:
     std::size_t const mVocabSize;

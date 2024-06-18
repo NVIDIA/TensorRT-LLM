@@ -129,7 +129,7 @@ template <typename T>
 bool tensorHasNan(ITensor const& tensor, BufferManager const& manager, std::string const& infoStr)
 {
     printLogitsKeyInfo<T>(tensor, infoStr);
-    auto foundNan = BufferManager::pinned(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
+    auto foundNan = BufferManager::pinnedPool(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
     auto foundNanPtr = bufferCast<int32_t>(*foundNan);
     foundNanPtr[0] = 0;
     auto const size = tensor.getSize();

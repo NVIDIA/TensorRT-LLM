@@ -82,6 +82,9 @@ struct KvCacheStats
     SizeType32 freeNumBlocks;
     SizeType32 usedNumBlocks;
     SizeType32 toksPerBlock;
+    SizeType32 allocTotalBlocks;
+    SizeType32 allocNewBlocks;
+    SizeType32 reusedBlocks;
 };
 
 // Basic building block of a paged KV cache - a single
@@ -329,6 +332,16 @@ public:
         return mFreePrimaryBlocks.size();
     }
 
+    [[nodiscard]] SizeType32 getNumAllocTotalBlocks() const
+    {
+        return mAllocTotalBlocks;
+    }
+
+    [[nodiscard]] SizeType32 getNumAllocNewBlocks() const
+    {
+        return mAllocNewBlocks;
+    }
+
     [[nodiscard]] SizeType32 getNumReusedBlocks() const noexcept
     {
         return mReusedBlocks;
@@ -496,6 +509,21 @@ public:
         return mBlockManager.getNumFreeBlocks();
     }
 
+    [[nodiscard]] SizeType32 getNumAllocTotalBlocks() const
+    {
+        return mBlockManager.getNumAllocTotalBlocks();
+    }
+
+    [[nodiscard]] SizeType32 getNumAllocNewBlocks() const
+    {
+        return mBlockManager.getNumAllocNewBlocks();
+    }
+
+    [[nodiscard]] SizeType32 getNumReusedBlocks() const noexcept
+    {
+        return mBlockManager.getNumReusedBlocks();
+    }
+
     [[nodiscard]] KvCacheStats getKvCacheStats() const
     {
         KvCacheStats kvCacheStats;
@@ -503,6 +531,9 @@ public:
         kvCacheStats.freeNumBlocks = getNumFreeBlocks();
         kvCacheStats.usedNumBlocks = getUsedNumBlocks();
         kvCacheStats.toksPerBlock = getTokensPerBlock();
+        kvCacheStats.allocTotalBlocks = getNumAllocTotalBlocks();
+        kvCacheStats.allocNewBlocks = getNumAllocNewBlocks();
+        kvCacheStats.reusedBlocks = getNumReusedBlocks();
 
         return kvCacheStats;
     }

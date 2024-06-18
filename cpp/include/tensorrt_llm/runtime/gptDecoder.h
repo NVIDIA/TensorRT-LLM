@@ -18,17 +18,14 @@
 
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
-#include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/decodingInput.h"
 #include "tensorrt_llm/runtime/decodingOutput.h"
-#include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
-#include "tensorrt_llm/runtime/worldConfig.h"
+
+#include <NvInferRuntime.h>
 #include <curand_kernel.h>
 
 #include <memory>
-
-#include <NvInferRuntime.h>
 
 namespace tensorrt_llm
 {
@@ -43,6 +40,8 @@ class DynamicDecodeLayer;
 namespace runtime
 {
 
+class SpeculativeDecodingModule;
+
 class IGptDecoder
 {
 public:
@@ -51,7 +50,8 @@ public:
     virtual ~IGptDecoder() = default;
 
     virtual void setup(SamplingConfig const& samplingConfig, size_t batchSize,
-        std::optional<TensorPtr> const& batchSlots = std::nullopt)
+        std::optional<TensorPtr> const& batchSlots = std::nullopt,
+        std::optional<DecodingOutput> const& output = std::nullopt)
         = 0;
 
     virtual void forwardAsync(DecodingOutput& output, DecodingInput const& input) = 0;
@@ -93,7 +93,8 @@ public:
         std::shared_ptr<SpeculativeDecodingModule const> speculativeDecodingModule = nullptr);
 
     void setup(SamplingConfig const& samplingConfig, size_t batchSize,
-        std::optional<TensorPtr> const& batchSlots = std::nullopt) override;
+        std::optional<TensorPtr> const& batchSlots = std::nullopt,
+        std::optional<DecodingOutput> const& output = std::nullopt) override;
 
     void forwardAsync(DecodingOutput& output, DecodingInput const& input) override;
 
@@ -133,7 +134,9 @@ inline std::unique_ptr<IGptDecoder> IGptDecoder::create(executor::DecodingMode c
     case nvinfer1::DataType::kHALF:
         return std::make_unique<GptDecoder<half>>(mode, maxBatchSize, maxBeamWidth, vocabSize, vocabSizePadded,
             maxSequenceLength, stream, speculativeDecodingModule);
-    default: TLLM_THROW("Unsupported decoder data type. Use either kFLOAT or kHALF."); return nullptr;
+    default:
+        TLLM_THROW("Unsupported decoder data type: %d. Use either kFLOAT or kHALF.", static_cast<int>(dtype));
+        return nullptr;
     }
 }
 } // namespace runtime

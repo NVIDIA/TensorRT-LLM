@@ -16,7 +16,12 @@
 
 #pragma once
 
+#include "tensorrt_llm/executor/executor.h"
+#include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/modelConfig.h"
+#include "tensorrt_llm/runtime/request.h"
 #include "tensorrt_llm/runtime/speculativeDecodingModule.h"
+#include <memory>
 
 namespace tensorrt_llm::runtime
 {
@@ -24,8 +29,9 @@ namespace tensorrt_llm::runtime
 class LookaheadModule : public SpeculativeDecodingModule
 {
 public:
-    explicit LookaheadModule(SizeType32 maxAcceptedTokens, SizeType32 maxDraftTokens) noexcept
-        : SpeculativeDecodingModule(maxAcceptedTokens, maxDraftTokens, maxDraftTokens)
+    explicit LookaheadModule(SizeType32 maxDraftPathLen, SizeType32 maxDecodingDraftTokens) noexcept
+        : SpeculativeDecodingModule(maxDraftPathLen, maxDecodingDraftTokens, maxDecodingDraftTokens)
+        , mExecutionConfig()
     {
     }
 
@@ -33,5 +39,19 @@ public:
         : LookaheadModule(0, 0)
     {
     }
+
+    void setExecutionConfig(executor::LookaheadDecodingConfig const& config)
+    {
+        mExecutionConfig = config;
+    }
+
+    executor::LookaheadDecodingConfig const getExecutionConfig() const
+    {
+        return mExecutionConfig;
+    }
+
+private:
+    executor::LookaheadDecodingConfig mExecutionConfig;
 };
+
 } // namespace tensorrt_llm::runtime

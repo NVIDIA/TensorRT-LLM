@@ -88,8 +88,8 @@ class GPTBenchmark(BaseBenchmark):
                 self.max_batch_size = args.max_batch_size
             if args.max_input_len is not None:
                 self.max_input_len = args.max_input_len
-            if args.max_output_len is not None:
-                self.max_output_len = args.max_output_len
+            if args.max_seq_len is not None:
+                self.max_seq_len = args.max_seq_len
 
             self.quant_config = get_quant_config(args.quantization)
             self.quant_mode = self.quant_config.quant_mode
@@ -209,10 +209,10 @@ class GPTBenchmark(BaseBenchmark):
 
     def get_config(self):
         for inlen, outlen in self.in_out_lens:
-            if inlen > self.max_input_len or outlen > self.max_output_len:
+            if inlen > self.max_input_len or inlen + outlen > self.max_seq_len:
                 print(
-                    f'[WARNING] check inlen({inlen}) <= max_inlen({self.max_input_len}) and '
-                    f'outlen({outlen}) <= max_outlen({self.max_output_len}) failed, skipping.'
+                    f'[WARNING] check inlen({inlen}) <= max_inlen({self.max_input_len}) or '
+                    f'seqlen({inlen + outlen}) <= max_seq_len({self.max_seq_len}) failed, skipping.'
                 )
                 continue
             for batch_size in self.batch_sizes:
@@ -314,7 +314,7 @@ class GPTBenchmark(BaseBenchmark):
                           output_length=outlen,
                           max_batch_size=self.build_config.max_batch_size,
                           max_input_len=self.build_config.max_input_len,
-                          max_output_len=self.build_config.max_output_len,
+                          max_seq_len=self.build_config.max_seq_len,
                           max_beam_width=self.build_config.max_beam_width)
         for k, v in build_args.items():
             tensorrt_llm.logger.info(f"{prefix} {k}:{v}")

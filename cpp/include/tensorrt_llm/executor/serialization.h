@@ -112,11 +112,6 @@ public:
     static void serialize(LookaheadDecodingConfig const& lookaheadDecodingConfig, std::ostream& os);
     static size_t serializedSize(LookaheadDecodingConfig const& lookaheadDecodingConfig);
 
-    // ExplicitDraftTokensConfig
-    static ExplicitDraftTokensConfig deserializeExplicitDraftTokensConfig(std::istream& is);
-    static void serialize(ExplicitDraftTokensConfig const& ExplicitDraftTokensConfig, std::ostream& os);
-    static size_t serializedSize(ExplicitDraftTokensConfig const& ExplicitDraftTokensConfig);
-
     // DecodingConfig
     static DecodingConfig deserializeDecodingConfig(std::istream& is);
     static void serialize(DecodingConfig const& decodingConfig, std::ostream& os);

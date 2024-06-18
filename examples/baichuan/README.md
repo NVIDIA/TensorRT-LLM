@@ -72,7 +72,7 @@ trtllm-build --checkpoint_dir ./tmp/baichuan_v1_13b/trt_ckpts/fp16/1-gpu/ \
              --gemm_plugin float16 \
              --max_batch_size=32 \
              --max_input_len=1024 \
-             --max_output_len=512
+             --max_seq_len=1536
 ```
 
 

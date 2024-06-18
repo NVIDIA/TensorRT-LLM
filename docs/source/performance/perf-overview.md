@@ -166,7 +166,7 @@ The following tables are references for commands that are used as part of the be
 
 | Stage | Description | Command |
 | :- | - | - |
-| [Build](#engine-building) | Build a TensorRT-LLM engine | `trtllm-build --model_config $model_cfg --strongly_typed --output_dir $engine_dir --max_batch_size 2048 --max_input_len 2048 --max_output_len 4096 --workers $tp_size --max_num_tokens 2048 --use_paged_context_fmha enable --multiple_profiles enable` |
+| [Build](#engine-building) | Build a TensorRT-LLM engine | `trtllm-build --model_config $model_cfg --strongly_typed --output_dir $engine_dir --max_batch_size 2048 --max_input_len 2048 --max_seq_len 6144 --workers $tp_size --max_num_tokens 2048 --use_paged_context_fmha enable --multiple_profiles enable` |
 | [Dataset](#preparing-a-dataset) | Create a synthetic dataset | `benchmarks/cpp/prepare_dataset.py --output=$dataset_file --tokenizer=$model_name token-norm-dist --num-requests=2000 --input-mean=$isl --output-mean=$osl --input-stdev=0 --output-stdev=0` |
 | [Run](#running-the-benchmark) | Run a benchmark with a dataset | `mpirun -n $tp_size --allow-run-as-root --oversubscribe cpp/build/benchmarks/gptManagerBenchmark --engine_dir $engine_dir --type IFB --dataset $dataset_file --scheduler_policy max_utilization --kv_cache_free_gpu_mem_fraction 0.9 --output_csv $results_csv --request_rate -1.0 --enable_chunked_context --streaming --warm_up 0` |
 
@@ -197,13 +197,13 @@ for the model that you would like to build (see [below](#network-configuration-f
 command is as follows:
 
 ```shell
-trtllm-build --model_config $model_cfg --strongly_typed --output_dir $engine_dir --max_batch_size 2048 --max_input_len 2048 --max_output_len 4096 --workers $tp_size --max_num_tokens 2048 --use_paged_context_fmha enable --multiple_profiles enable
+trtllm-build --model_config $model_cfg --strongly_typed --output_dir $engine_dir --max_batch_size 2048 --max_input_len 2048 --max_seq_len 6144 --workers $tp_size --max_num_tokens 2048 --use_paged_context_fmha enable --multiple_profiles enable
 ```
 
 Some notes about the command:
 - `--workers` affects the number of threads that build the engine file and does not necessarily need to match
 the TP size. Make sure to set the tensor parallelism in the `$model_cfg` JSON file. See [below](#network-configuration-files)
-- You can run benchmarks for datasets that fit within the bounds of the `max_input_len` and `max_output_len` parameters.
+- You can run benchmarks for datasets that fit within the bounds of the `max_input_len` and `max_seq_len` parameters.
 
 ### Engine Configuration Files
 

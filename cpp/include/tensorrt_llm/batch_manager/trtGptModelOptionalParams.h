@@ -41,7 +41,7 @@ public:
         bool normalizeLogProbs = true, bool enableChunkedContext = false,
         PeftCacheManagerConfig const& peftCacheManagerConfig = PeftCacheManagerConfig{},
         executor::DecodingConfig decodingConfig = executor::DecodingConfig{}, float gpuWeightsPercent = 1,
-        std::optional<SizeType32> maxBeamWidth = std::nullopt,
+        std::optional<SizeType32> maxBeamWidth = std::nullopt, std::optional<SizeType32> maxBatchSize = std::nullopt,
         executor::SchedulerConfig const& schedulerConfig = executor::SchedulerConfig{})
         : kvCacheConfig{kvCacheConfig}
         , enableTrtOverlap{enableTrtOverlap}
@@ -52,6 +52,7 @@ public:
         , decodingConfig(std::move(decodingConfig))
         , gpuWeightsPercent(gpuWeightsPercent)
         , maxBeamWidth(maxBeamWidth)
+        , maxBatchSize(maxBatchSize)
         , schedulerConfig{schedulerConfig}
     {
     }
@@ -62,7 +63,7 @@ public:
             executorConfig.getNormalizeLogProbs(), executorConfig.getEnableChunkedContext(),
             PeftCacheManagerConfig(executorConfig.getPeftCacheConfig().value_or(executor::PeftCacheConfig())),
             executorConfig.getDecodingConfig().value_or(executor::DecodingConfig{}),
-            executorConfig.getGpuWeightsPercent(), executorConfig.getMaxBeamWidth(),
+            executorConfig.getGpuWeightsPercent(), executorConfig.getMaxBeamWidth(), executorConfig.getMaxBatchSize(),
             executorConfig.getSchedulerConfig())
     {
     }
@@ -87,6 +88,7 @@ public:
     // Percentage of weights on the gpu at runtime
     float gpuWeightsPercent;
     std::optional<SizeType32> maxBeamWidth;
+    std::optional<SizeType32> maxBatchSize;
     executor::SchedulerConfig schedulerConfig;
 };
 

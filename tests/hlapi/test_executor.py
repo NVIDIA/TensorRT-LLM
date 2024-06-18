@@ -1,3 +1,5 @@
+import asyncio
+import json
 import os as _os
 import sys as _sys
 import unittest
@@ -8,7 +10,7 @@ import torch
 from transformers import AutoTokenizer
 
 from tensorrt_llm._utils import mpi_world_size
-from tensorrt_llm.bindings import TrtGptModelOptionalParams
+from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.executor import (GenerationExecutor, GenerationRequest,
                                    SamplingParams)
 from tensorrt_llm.hlapi.llm import LLM, ModelConfig
@@ -68,12 +70,11 @@ def test_generation_bs2(llama_7b_bs2_path: Path):
     tokenizer = llama_7b_bs2_path
     prompt = "A B C D"
     max_new_tokens = 8
-    executor_config = TrtGptModelOptionalParams()
-    executor_config.max_beam_width = 2
 
-    with GenerationExecutor.create(llama_7b_bs2_path,
-                                   tokenizer,
-                                   executor_config=executor_config) as executor:
+    with GenerationExecutor.create(
+            llama_7b_bs2_path,
+            tokenizer,
+            executor_config=tllm.ExecutorConfig(max_beam_width=2)) as executor:
         result = executor.generate(prompt,
                                    sampling_params=SamplingParams(
                                        max_new_tokens=max_new_tokens,
@@ -166,8 +167,26 @@ def test_sync_generation_tp_inner(llama_7b_tp2_path: Path):
     executor = GenerationExecutor.create(llama_7b_tp2_path,
                                          llama_7b_tp2_path,
                                          model_world_size=tp_size)
-    result = executor.generate(prompt, sampling_params=sampling_params)
-    assert result.text == ", neural network,"
+
+    async def async_stats_task():
+        # asyncio event loop must be created before first generation in order to
+        # use async APIs.
+        result = executor.generate(prompt, sampling_params=sampling_params)
+        assert result.text == ", neural network,"
+
+        stats = await executor.aget_stats()
+        stats = json.loads(stats)
+        assert stats["iter"] == 0
+        assert stats["cpuMemUsage"] > 0
+        assert stats["gpuMemUsage"] > 0
+        assert stats["inflightBatchingStats"]["numCtxTokens"] == 3
+        assert stats["inflightBatchingStats"]["numGenRequests"] == 0
+        assert stats["kvCacheStats"]["usedNumBlocks"] == 1
+
+    asyncio.run(async_stats_task())
+
+    stats = executor.get_stats()
+    assert json.loads(stats)["iter"] == 1
     executor.shutdown()
 
 

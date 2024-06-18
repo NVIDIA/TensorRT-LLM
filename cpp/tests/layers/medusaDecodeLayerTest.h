@@ -104,9 +104,9 @@ private:
 
     void setup(SamplingParams& params);
 
-    std::shared_ptr<tensorrt_llm::layers::MedusaInputParams> createInputTensors();
+    std::shared_ptr<tensorrt_llm::layers::MedusaDecodingInputs> createInputTensors();
 
-    std::shared_ptr<tensorrt_llm::layers::DynamicDecodeOutputParams> createOutputTensors();
+    std::shared_ptr<tensorrt_llm::layers::SpeculativeDecodingOutputs> createOutputTensors();
 
     void checkResult(std::vector<std::vector<std::set<TokenIdType>>> const& expectedOutTokens,
         std::vector<std::vector<TokenIdType>> const& expectedDraftTokens, std::vector<bool> const& finished,

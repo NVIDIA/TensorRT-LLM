@@ -62,14 +62,16 @@ void invokeStopWordsCriterion(runtime::TokenIdType const** outputIds, runtime::S
 //! \param sequenceLimitLength input buffer [maxBatchSize]. Maximum sequence length.
 //! \param sequenceLengths input/output buffer [maxBatchSize, beamWidth].
 //! Current sequence lengths of the request tokens.
+//! \param numNewTokens output buffer [maxBatchSize], optional. Number of tokens per step for each request.
+//! It is assumed that all requests have maxTokensPerStep tokens per step if nullptr.
 //! \param batchSlots input buffer[batchSize], optional. Indices of rows of data in memory pool
 //! \param batchSize batch size
 //! \param beamWidth beam width
 //! \param stream stream
 void invokeLengthCriterion(FinishedState* finished, runtime::SizeType32* finishedSum,
     runtime::SizeType32 const* sequenceLimitLength, runtime::SizeType32* sequenceLengths,
-    runtime::SizeType32 const* batchSlots, runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth,
-    cudaStream_t stream);
+    runtime::SizeType32* numNewTokens, runtime::SizeType32 const* batchSlots, runtime::SizeType32 batchSize,
+    runtime::SizeType32 beamWidth, cudaStream_t stream);
 
 //! \brief Sets finished states based on the endIds and ajusts sequence length to length before the first EOS token.
 //! Does not support beamWidth > 1 for now.
@@ -81,7 +83,7 @@ void invokeLengthCriterion(FinishedState* finished, runtime::SizeType32* finishe
 //! [maxBatchSize, beamWidth]. Finished states. Set to FinishedState::FINISHED_EOS if any new tokens contain EOS.
 //! \param sequenceLengths input/output buffer [maxBatchSize, beamWidth].
 //! Current sequence lengths of the request tokens.
-//! \param tokensPerStep input buffer [maxBatchSize], optional. Number of tokens per step for each request.
+//! \param numNewTokens input/output buffer [maxBatchSize], optional. Number of tokens per step for each request.
 //! It is assumed that all requests have maxTokensPerStep tokens per step if nullptr.
 //! \param batchSlots input buffer[batchSize], optional. Indices of rows of data in memory pool
 //! \param batchSize batch size
@@ -89,7 +91,7 @@ void invokeLengthCriterion(FinishedState* finished, runtime::SizeType32* finishe
 //! \param maxTokensPerStep maximum number of tokens decoded per step
 //! \param stream stream
 void invokeExplicitEOSCriterion(runtime::TokenIdType const** outputIds, runtime::TokenIdType const* endIds,
-    FinishedState* finished, runtime::SizeType32* sequenceLengths, runtime::SizeType32 const* tokensPerStep,
+    FinishedState* finished, runtime::SizeType32* sequenceLengths, runtime::SizeType32* numNewTokens,
     runtime::SizeType32 const* batchSlots, runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth,
     runtime::SizeType32 maxTokensPerStep, cudaStream_t stream);
 } // namespace kernels

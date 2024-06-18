@@ -168,7 +168,7 @@ class TestGatherND(unittest.TestCase):
 
     def test_gatherND_selectH(self):
         dtype = "float32"
-        # This usecase is used to gather in ReDrafter for validated end-tokens (diff stopping point for diff seqs)
+        # This usecase is used to gather for validated end-tokens (diff stopping point for diff seqs)
         data = torch.rand((2, 9, 4), dtype=torch.float32, device="cuda")
         indices = torch.randint(9, size=(2, ), dtype=torch.int32, device="cuda")
         indices = torch.stack(

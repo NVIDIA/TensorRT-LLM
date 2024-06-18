@@ -197,14 +197,7 @@ void sm90_generic_moe_gemm_kernelLauncher(HopperGroupedGemmInput hopper_input, i
 {
 #ifdef COMPILE_HOPPER_TMA_GEMMS
     using namespace cute;
-    // For FAST_BUILD, only instantiate kernels with 128x128x128B with 1x1x1 cluster shape.
-#ifdef FAST_BUILD
-    constexpr int TILE_K = 128 * 8 / cutlass::sizeof_bits<WeightType>::value;
-    using SupportedCtaShape = Shape<_128, _128, cute::Int<TILE_K>>;
-    using SupportedCgaShape = Shape<_1, _1, _1>;
-
-    if constexpr (cute::is_same_v<SupportedCtaShape, TileShape> && cute::is_same_v<SupportedCgaShape, ClusterShape>)
-#endif // FAST_BUILD
+    if constexpr (!should_filter_sm90_gemm_problem_shape_v<TileShape, ClusterShape, T>)
     {
         using GemmInfo = HopperGroupedGemmInfo<T, WeightType, EpilogueTag, TileShape, ClusterShape, BIAS>;
 
@@ -287,12 +280,10 @@ void sm90_generic_moe_gemm_kernelLauncher(HopperGroupedGemmInput hopper_input, i
             "Failed to run cutlass variable batched gemm. Error: " + std::string(cutlassGetStatusString(run_status)));
         sync_check_cuda_error();
     }
-#ifdef FAST_BUILD
     else
     {
         TLLM_THROW("Configuration was disabled by FAST_BUILD");
     }
-#endif
 
 #else  // COMPILE_HOPPER_TMA_GEMMS
     TLLM_THROW("Please recompile with support for hopper by passing 90-real as an arch to build_wheel.py.");

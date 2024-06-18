@@ -211,10 +211,10 @@ class TestFalcon(unittest.TestCase):
              ContextFMHAType.disabled, 'float16'),
             ('MQA', False, True, False, False, True, True, False,
              ContextFMHAType.disabled, 'float32'),
-            # TC for Falcon-40B arch: GQA + RoPE + new_decoder_architecture
-            ('GQA', False, False, True, False, True, True, False,
+            # TC for Falcon-40B arch: GQA + RoPE + parallel_attention + new_decoder_architecture
+            ('GQA', False, True, True, False, True, True, False,
              ContextFMHAType.disabled, 'float16'),
-            ('GQA', False, False, True, False, True, True, False,
+            ('GQA', False, True, True, False, True, True, False,
              ContextFMHAType.disabled, 'float32'),
         ]
         return test_cases

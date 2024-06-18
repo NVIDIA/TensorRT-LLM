@@ -58,7 +58,7 @@ def test_save_load():
         llama = LLaMAForCausalLM.from_hugging_face(hf_model_dir, 'float16')
         build_config = BuildConfig(max_batch_size=max_batch_size,
                                    max_input_len=max_isl,
-                                   max_output_len=max_osl,
+                                   max_seq_len=max_osl + max_isl,
                                    plugin_config=llama.default_plugin_config())
         build_config.plugin_config.gemm_plugin = 'float16'  # faster build
         engine = build(llama, build_config)
@@ -95,7 +95,7 @@ def test_high_level_fake_weights():
     llama = LLaMAForCausalLM(config)
     build_config = BuildConfig(max_batch_size=max_batch_size,
                                max_input_len=max_isl,
-                               max_output_len=max_osl,
+                               max_seq_len=max_osl + max_isl,
                                plugin_config=llama.default_plugin_config())
     build_config.plugin_config.gemm_plugin = 'float16'  # faster build
     build(llama, build_config)
@@ -110,7 +110,7 @@ def test_inflight_batching():
     llama = LLaMAForCausalLM.from_hugging_face(hf_model_dir, 'float16')
     build_config = BuildConfig(max_batch_size=max_batch_size,
                                max_input_len=max_isl,
-                               max_output_len=max_osl)
+                               max_seq_len=max_osl + max_isl)
     build_config.plugin_config.gemm_plugin = 'float16'  # faster build
     engine = build(llama, build_config)
 

@@ -30,26 +30,90 @@ class Mapping(object):
     - [1, 5]
     - [2, 6]
     - [3, 7]
+
+    A node with 8 GPUs, moe_tp_size = 2, moe_ep_size = 4
+
+    4 moe_tp groups:
+
+    - [0, 4]
+    - [1, 5]
+    - [2, 6]
+    - [3, 7]
+
+    2 moe_ep groups:
+
+    - [0, 1, 2, 3]
+    - [4, 5, 6, 7]
+
+    2 nodes with 16 GPUs, moe_tp_size = 2, moe_ep_size = 4, pp_size = 2
+
+    8 moe_tp groups:
+
+    - [0 4]
+    - [1 5]
+    - [2 6]
+    - [3 7]
+    - [8 12]
+    - [9 13]
+    - [10 14]
+    - [11 15]
+
+    4 moe_ep groups:
+
+    - [0, 1, 2, 3]
+    - [4, 5, 6, 7]
+    - [8, 9, 10, 11]
+    - [12, 13, 14, 15]
+
+    8 pp groups:
+
+    - [0 8]
+    - [1 9]
+    - [2 10]
+    - [3 11]
+    - [4 12]
+    - [5 13]
+    - [6 14]
+    - [7 15]
     '''
 
-    def __init__(self,
-                 world_size=1,
-                 rank=0,
-                 gpus_per_node=8,
-                 tp_size=1,
-                 pp_size=1):
-        self.tp_size = tp_size
-        self.pp_size = pp_size
-        self.world_size = world_size
-        self.rank = rank
-        self.gpus_per_node = gpus_per_node
+    def __init__(
+            self,
+            world_size=1,
+            rank=0,
+            gpus_per_node=8,
+            tp_size=1,
+            pp_size=1,
+            moe_tp_size=-1,  # -1 means no moe
+            moe_ep_size=-1):  # -1 means no moe
+        # set default values for non-moe cases
+        if moe_tp_size == -1:
+            moe_tp_size = tp_size
+            moe_ep_size = 1
 
         if pp_size * tp_size != world_size:
             raise ValueError(
                 f"world_size must equal to pp_size * tp_size, but got {world_size} != {pp_size} * {tp_size}"
             )
+
+        moe_tp_ep_size = moe_tp_size * moe_ep_size
+        if moe_tp_ep_size != tp_size:
+            raise ValueError(
+                f"tp_size must equal to moe_tp_size * moe_ep_size, but got {tp_size} != {moe_tp_size} * {moe_ep_size}"
+            )
+
+        self.tp_size = tp_size
+        self.pp_size = pp_size
+        self.moe_tp_size = moe_tp_size
+        self.moe_ep_size = moe_ep_size
+        self.world_size = world_size
+        self.rank = rank
+        self.gpus_per_node = gpus_per_node
+
         self.pp_groups = []
         self.tp_groups = []
+        self.moe_tp_groups = []
+        self.moe_ep_groups = []
 
         # init pp group
         for i in range(tp_size):
@@ -61,11 +125,31 @@ class Mapping(object):
             ranks = range(i * tp_size, (i + 1) * tp_size)
             self.tp_groups.append(list(ranks))
 
+        # init moe tp group
+        for i in range(pp_size):
+            for j in range(moe_ep_size):
+                ranks = range(i * moe_tp_ep_size + j, (i + 1) * moe_tp_ep_size,
+                              moe_ep_size)
+                self.moe_tp_groups.append(list(ranks))
+
+        # init moe ep group
+        for i in range(pp_size):
+            for j in range(moe_tp_size):
+                ranks = range(i * moe_tp_ep_size + j * moe_ep_size,
+                              i * moe_tp_ep_size + (j + 1) * moe_ep_size)
+                self.moe_ep_groups.append(list(ranks))
+
         self.pp_rank = self.rank // self.tp_size
         self.tp_rank = self.rank % self.tp_size
+        self.moe_tp_rank = self.tp_rank // self.moe_ep_size
+        self.moe_ep_rank = self.tp_rank % self.moe_ep_size
 
         self.tp_group = self.tp_groups[self.pp_rank]
         self.pp_group = self.pp_groups[self.tp_rank]
+        self.moe_tp_group = self.moe_tp_groups[self.pp_rank * moe_ep_size +
+                                               self.moe_ep_rank]
+        self.moe_ep_group = self.moe_ep_groups[self.pp_rank * moe_tp_size +
+                                               self.moe_tp_rank]
 
         self.node_rank = self.rank // self.gpus_per_node
         self.local_rank = self.rank % self.gpus_per_node
@@ -100,6 +184,12 @@ class Mapping(object):
             p = p - self.world_size
         return p
 
+    def has_moe_tp(self):
+        return self.moe_tp_size > 1
+
+    def has_moe_ep(self):
+        return self.moe_ep_size > 1
+
     def pp_layers(self, num_layers: int) -> List[int]:
         layers_per_pipeline_stage = num_layers // self.pp_size
         layers_range = range(self.pp_rank * layers_per_pipeline_stage,
@@ -107,9 +197,9 @@ class Mapping(object):
         return list(layers_range)
 
     def ep_experts(self, num_experts: int) -> List[int]:
-        experts_per_rank = num_experts // self.tp_size
-        experts_range = range(self.tp_rank * experts_per_rank,
-                              (self.tp_rank + 1) * experts_per_rank)
+        experts_per_rank = num_experts // self.moe_ep_size
+        experts_range = range(self.moe_ep_rank * experts_per_rank,
+                              (self.moe_ep_rank + 1) * experts_per_rank)
         return list(experts_range)
 
     @classmethod
@@ -122,5 +212,7 @@ class Mapping(object):
             'rank': self.rank,
             'gpus_per_node': self.gpus_per_node,
             'tp_size': self.tp_size,
-            'pp_size': self.pp_size
+            'pp_size': self.pp_size,
+            'moe_tp_size': self.moe_tp_size,
+            'moe_ep_size': self.moe_ep_size
         }

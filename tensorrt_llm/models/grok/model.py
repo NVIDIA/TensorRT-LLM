@@ -70,15 +70,8 @@ class GrokDecoderLayer(Module):
         assert config.moe_num_experts > 1, "Grok model is a MoE model."
         ClsMLP = MOE
         mlp_kwargs = {
-            "moe_config":
-            MoeConfig(
-                config.moe_num_experts,
-                config.moe_top_k,
-                config.moe_tp_mode,
-                config.moe_normalization_mode,
-            ),
-            "tp_rank":
-            config.mapping.tp_rank,
+            "moe_config": config.moe,
+            "mapping": config.mapping,
         }
         self.mlp = ClsMLP(hidden_size=config.hidden_size,
                           ffn_hidden_size=mlp_hidden_size,
@@ -228,8 +221,6 @@ class GrokForCausalLM(DecoderModelForCausalLM):
         config.set_if_not_exist('rotary_scaling', None)
         config.set_if_not_exist('moe_num_experts', 0)
         config.set_if_not_exist('moe_top_k', 0)
-        config.set_if_not_exist('moe_tp_mode',
-                                MoeConfig.ParallelismMode.TENSOR_PARALLEL)
         config.set_if_not_exist('moe_normalization_mode',
                                 MoeConfig.ExpertScaleNormalizationMode.NONE)
 

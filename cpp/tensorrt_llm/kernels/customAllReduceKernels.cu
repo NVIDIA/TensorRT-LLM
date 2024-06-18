@@ -97,6 +97,7 @@ struct PackedOn16Bytes<__nv_bfloat16>
 {
     using Type = PackedBFloat16;
 };
+
 #endif
 
 // add two 128b data
@@ -600,7 +601,7 @@ static __global__ void oneShotAllReduceKernel(AllReduceParams params)
 
 template <typename T, int RANKS_PER_NODE, bool COPY_INPUT = true, bool PUSH_MODE = false, bool Bias = false,
     bool Residual = false>
-static __global__ void twoShotAllReduceKernel(AllReduceParams params)
+static __global__ void __launch_bounds__(512, 1) twoShotAllReduceKernel(AllReduceParams params)
 {
     // Suppose that two GPUs participate in the AR exchange, and we start two blocks.
     // The message is partitioned into chunks as detailed below:
@@ -674,7 +675,7 @@ static __global__ void twoShotAllReduceKernel(AllReduceParams params)
 #pragma unroll
             for (int ii = 0; ii < RANKS_PER_NODE; ++ii)
             {
-                size_t offset_rank = ii * params.elts_per_rank + local_offset;
+                size_t offset_rank = ranks[ii] * params.elts_per_rank + local_offset;
                 if (offset_rank >= params.elts_total)
                 {
                     continue;
@@ -829,7 +830,6 @@ std::tuple<int, int> kernelLaunchConfig(AllReduceStrategyType algo, AllReducePar
         threads_per_block = std::min(DEFAULT_BLOCK_SIZE, total_threads);
         blocks_per_grid = std::min(static_cast<size_t>(MAX_ALL_REDUCE_BLOCKS), divUp(total_threads, threads_per_block));
         */
-
         while (total_threads % blocks_per_grid != 0 || total_threads / blocks_per_grid > DEFAULT_BLOCK_SIZE)
         {
             blocks_per_grid += 1;
@@ -863,7 +863,8 @@ template <typename T, int RANKS_PER_NODE, bool PUSH_MODE = false, bool USE_MEMCP
 void AllReduceNormKernelLaunch(AllReduceStrategyType algo, AllReduceStrategyConfig config, AllReduceFusionOp fusionOp,
     AllReduceParams& params, cudaStream_t stream)
 {
-    TLLM_CHECK(fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM);
+    TLLM_CHECK_WITH_INFO(fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM, "Unsupported AllReduceFusionOp: %d",
+        static_cast<int>(fusionOp));
     if (algo == AllReduceStrategyType::ONESHOT)
     {
         reduce_fusion::one_shot_all_reduce_norm_kernel_launcher<T, RANKS_PER_NODE, Bias, Affine>(params, stream);
@@ -1019,7 +1020,6 @@ AllReduceParams AllReduceParams::deserialize(int32_t const* buffer, size_t tpSiz
     }
     params.barrier_flag = flag_value;
     params.ranks_per_node = tpSize;
-    params.rank = tpRank;
     params.local_rank = tpRank;
 
     return params;

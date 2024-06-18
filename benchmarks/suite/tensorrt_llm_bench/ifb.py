@@ -140,8 +140,8 @@ def get_trtllm_build_command(benchmark_cfg: BenchmarkConfig) -> List[str]:
         benchmark_cfg.world_size,
         "--max_input_len",
         max_isl,
-        "--max_output_len",
-        max_osl,
+        "--max_seq_len",
+        max_osl + max_isl,
         "--context_fmha",
         "enable",
         # Set the attention plugin data type.

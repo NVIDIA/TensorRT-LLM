@@ -136,6 +136,9 @@ ModelConfig createModelConfig(
     auto const hiddenSize = config.at("hidden_size").template get<SizeType32>() / tensorParallelism;
     auto const sizePerHead = parseJsonFieldOr(config, "head_size", hiddenSize / numHeads);
 
+    // Logits datatype
+    auto const logitsDtypeStr = parseJsonFieldOr(config, "logits_dtype", std::string("float32"));
+
     // TODO:
     // Code crashes when numKvHeads <= 0. Clamping downwards to 1 prevents that, make sure this is best fix.
     auto const numKvHeads
@@ -147,6 +150,16 @@ ModelConfig createModelConfig(
     modelConfig.setSizePerHead(sizePerHead);
     modelConfig.setNbKvHeads(numKvHeads);
     modelConfig.setLayerTypes(layerTypes);
+
+    // Set logits datatype
+    auto logitsDtype = nvinfer1::DataType::kFLOAT;
+    if (logitsDtypeStr == "float32")
+        logitsDtype = nvinfer1::DataType::kFLOAT;
+    else if (logitsDtypeStr == "float16")
+        logitsDtype = nvinfer1::DataType::kHALF;
+    else
+        TLLM_THROW("Unsupported logits data type");
+    modelConfig.setLogitsDtype(logitsDtype);
 
     // only enable cross attention for the decoder in encoder-decoder model
     // TODO: add cross_attention and has_token_type_embedding as fields in pretrained config
@@ -170,7 +183,7 @@ void parseBuilderConfig(ModelConfig& modelConfig, Json const& builderConfig)
     auto const maxBatchSize = parseJsonFieldOr(builderConfig, "max_batch_size", 0);
     auto const maxBeamWidth = parseJsonFieldOr(builderConfig, "max_beam_width", 0);
     auto const maxInputLen = parseJsonFieldOr(builderConfig, "max_input_len", 0);
-    auto const maxSequenceLen = maxInputLen + parseJsonFieldOr(builderConfig, "max_output_len", 0);
+    auto const maxSequenceLen = parseJsonFieldOr(builderConfig, "max_seq_len", 0);
     auto const maxDraftLen = parseJsonFieldOr(builderConfig, "max_draft_len", 0);
     auto const maxNumTokens = parseJsonFieldOptional<SizeType32>(builderConfig, "max_num_tokens");
     auto const maxPromptEmbeddingTableSize
@@ -366,6 +379,7 @@ GptJsonConfig parseJson(InputType&& input)
             auto explicitDraftTokensModule
                 = std::make_shared<ExplicitDraftTokensModule>(maxDraftPathLen, maxDraftLen, maxNumPaths);
             modelConfig.setSpeculativeDecodingModule(explicitDraftTokensModule);
+            modelConfig.setUseShapeInference(false);
         }
         else if (modelConfig.getSpeculativeDecodingMode().isMedusa())
         {

@@ -53,8 +53,10 @@ using IterationType = std::uint64_t;
 using RandomSeedType = std::uint64_t;
 using VecLogProbs = std::vector<FloatType>;
 using StreamPtr = std::shared_ptr<tensorrt_llm::runtime::CudaStream>;
-using LogitsPostProcessor = std::function<void(IdType, Tensor&, BeamTokens const&, StreamPtr&)>;
+using LogitsPostProcessor = std::function<void(IdType, Tensor&, BeamTokens const&, StreamPtr const&)>;
 using LogitsPostProcessorMap = std::unordered_map<std::string, LogitsPostProcessor>;
+using LogitsPostProcessorBatched = std::function<void(std::vector<IdType> const&, std::vector<Tensor>&,
+    std::vector<std::reference_wrapper<BeamTokens const>> const&, StreamPtr const&)>;
 using MedusaChoices = std::vector<std::vector<SizeType32>>;
 
 enum class DataType
@@ -224,6 +226,12 @@ struct KvCacheStats
     SizeType32 usedNumBlocks;
     /// @brief Number of tokens per block
     SizeType32 tokensPerBlock;
+    /// @brief Number of total allocated block
+    SizeType32 allocTotalBlocks;
+    /// @brief Number of newly allocated block
+    SizeType32 allocNewBlocks;
+    /// @brief Number of reused block
+    SizeType32 reusedBlocks;
 };
 
 /// @brief Struct that holds the stats of static batching models for a single iteration
@@ -267,6 +275,8 @@ struct IterationStats
     std::string timestamp;
     /// @brief Iteration id
     IterationType iter;
+    /// @brief Iteration latency (ms)
+    double iterLatencyMS;
     /// @brief Number of active requests
     SizeType32 numActiveRequests;
     /// @brief Number of max active requests
@@ -717,6 +727,8 @@ static_assert(!DecodingMode::Lookahead().isBeamSearch());
 static_assert(!DecodingMode::Lookahead().isMedusa());
 static_assert(!DecodingMode::Lookahead().isExplicitDraftTokens());
 static_assert(DecodingMode::Lookahead().isUseStopCriteria());
+static_assert(DecodingMode::Lookahead().isUseStopWords());
+static_assert(DecodingMode::Lookahead().isUseExplicitEosStop());
 static_assert(DecodingMode::Lookahead().isLookahead());
 
 static_assert(!DecodingMode::ExplicitDraftTokens().isAuto());

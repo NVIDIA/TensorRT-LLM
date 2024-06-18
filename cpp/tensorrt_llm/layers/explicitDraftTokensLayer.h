@@ -16,68 +16,14 @@
 
 #pragma once
 
-#include <curand_kernel.h>
-
-#include "tensorrt_llm/common/tensor.h"
-#include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/layers/baseLayer.h"
 #include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/runtime/common.h"
-#include "tensorrt_llm/runtime/iTensor.h"
 
-namespace tc = tensorrt_llm::common;
+#include <curand_kernel.h>
 
-namespace tensorrt_llm
+namespace tensorrt_llm::layers
 {
-namespace layers
-{
-
-class ExplicitDraftTokensSetupParams : public BaseSetupParams
-{
-public:
-    std::optional<std::vector<float>> temperature;   // [setupBatchSize] on cpu
-    std::optional<std::vector<uint64_t>> randomSeed; // [1] or [setupBatchSize] on cpu
-};
-
-class ExplicitDraftTokensInputParams : public BaseInputParams
-{
-public:
-    explicit ExplicitDraftTokensInputParams()
-        : BaseInputParams{0, 0, tc::Tensor()}
-    {
-    }
-
-    //! Draft tokens for the next iteration. The first token in each path is the last accepted token at current
-    //! iteration. E.g. if forwardBatchSize == 1, maxNumPaths == 2, maxPathLen== 3, [[[0, 1, 2], [0, 1, 10]]]
-    tc::Tensor nextDraftTokens; // [forwardBatchSize, maxNumPaths, maxPathLen], gpu
-    //! Compressed form of `nextDraftTokens`, where common prefixes and collapsed.
-    //! Using example above [0, 1, 2, 10]
-    tc::Tensor nextFlatTokens; // [forwardBatchSize * maxDecodingTokens], gpu
-    //! Indices of draft tokens in the compressed `nextFlatTokens` for the next iteration.
-    //! Using example above, [[[0, 1, 2], [0, 1, 3]]]
-    tc::Tensor nextDraftIndices; // [forwardBatchSize, maxNumPaths, maxPathLen], gpu
-    //! Probabilities of the next draft tokens.
-    tc::Tensor nextDraftProbs; // [forwardBatchSize, maxNumPaths, maxDraftPathLen, vocabSize], gpu
-    //! Same as `nextDraftTokens`, but for current iteration.
-    //! Current accepted tokens obtained as `lastDraftTokens[bi][bestPathIndices[bi]][1:bestPathLengths[bi]]`.
-    tc::Tensor lastDraftTokens; // [forwardBatchSize, maxNumPaths, maxPathLen], gpu
-    //! Same as `nextDraftIndices`, but for current iteration.
-    tc::Tensor lastDraftIndices; // [forwardBatchSize, maxNumPaths, maxPathLen], gpu
-    //! Boolean attention masks.
-    //! maxDecodingTokens' = specDecodingGenerationLengths.max()
-    tc::Tensor masks; // [forwardBatchSize, maxDecodingTokens', maxDecodingTokens'], gpu
-    //! Relative to `positionIdsBase` position ids. Same as `nextFlatTokens` for next draft indices.
-    //! Using example above, [0, 1, 2, 3]
-    tc::Tensor packedPosIds; // [forwardBatchSize * maxDecodingTokens], gpu
-    //! Lengths of the accepted paths for each request. It is 1 for context phase (Only 1 primary tokens is accepted).
-    tc::Tensor bestPathLengths; // [forwardBatchSize], gpu
-    //! Indices of the accepted paths for each request. It is 0 for context phase.
-    tc::Tensor bestPathIndices; // [forwardBatchSize], gpu
-    //! Number of the draft tokens for the next iteration.
-    tc::Tensor specDecodingGenerationLengths; // [forwardBatchSize], gpu
-    //! Baseline for the position ids.
-    tc::Tensor positionIdsBase; // [forwardBatchSize], gpu
-};
 
 //! \brief Decoding layer for speculative decoding technique, when all tokens are generated, decoded and accepted in the
 //! engine.
@@ -94,20 +40,23 @@ public:
     ~ExplicitDraftTokensLayer() override;
 
     void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 const* batchSlots,
-        std::shared_ptr<BaseSetupParams> setupParams) override;
+        std::shared_ptr<BaseSetupParams> const& setupParams) override;
 
-    void forwardAsync(std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs) override;
+    void forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& outputs,
+        std::shared_ptr<BaseDecodingInputs> const& inputs) override;
 
 private:
     void allocateBuffer();
     void freeBuffer();
 
-    void convertPackedMask(DynamicDecodeOutputParams const& outputs, ExplicitDraftTokensInputParams const& inputs);
+    void fillContextBuffers(
+        SizeType32 batchSize, SizeType32 const* batchSlots, ExplicitDraftTokensSetupParams const& params);
 
-    void splitInputDataToBatchSlots(
-        DynamicDecodeOutputParams const& outputs, ExplicitDraftTokensInputParams const& inputs);
+    void convertPackedMask(ExplicitDraftTokensOutputs const& outputs, ExplicitDraftTokensInputs const& inputs);
 
-    void packAcceptedPaths(DynamicDecodeOutputParams const& outputs, ExplicitDraftTokensInputParams const& inputs);
+    void splitInputDataToBatchSlots(ExplicitDraftTokensOutputs const& outputs, ExplicitDraftTokensInputs const& inputs);
+
+    void packAcceptedPaths(ExplicitDraftTokensOutputs const& outputs, ExplicitDraftTokensInputs const& inputs);
 
 private:
     using Base::mStream;
@@ -129,9 +78,10 @@ private:
     SizeType32* mGenerationLengthInclusiveSum{nullptr};
     SizeType32* mMaxGenerationLength{nullptr};
     float* mTemperatureDevice{nullptr};
+    SizeType32* mBestPathIndicesSlots{nullptr};
+    SizeType32* mLastDraftIndicesSlots{nullptr};
 
     std::vector<float> mTemperature;
 };
 
-} // namespace layers
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::layers

@@ -44,8 +44,6 @@ class GPTConfig(PretrainedConfig):
             moe = MoeConfig(
                 num_experts=kwargs.pop('moe_num_experts', 0),
                 top_k=kwargs.pop('moe_top_k', 0),
-                tp_mode=kwargs.pop('moe_tp_mode',
-                                   MoeConfig.ParallelismMode.TENSOR_PARALLEL),
                 normalization_mode=kwargs.pop(
                     'moe_normalization_mode',
                     MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE))

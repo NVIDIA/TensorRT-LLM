@@ -11,7 +11,6 @@
         "moe": {
             "num_experts": 0,
             "top_k": 0,
-            "tp_mode": 2,
             "normalization_mode": 1
         },
         "architecture": "GPTForCausalLM",
@@ -53,7 +52,7 @@
     },
     "build_config": {
         "max_input_len": 512,
-        "max_output_len": 50,
+        "max_seq_len": 562,
         "opt_batch_size": null,
         "max_batch_size": 4,
         "max_beam_width": 2,

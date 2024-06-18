@@ -38,8 +38,8 @@ class GenerationMixin:
         return res
 
     @staticmethod
-    def default_range(max_range, offset=0):
-        result = [1, (max_range + 1) // 2, max_range]
+    def default_range(max_range, offset=0, min_range=1):
+        result = [min_range, (max_range + min_range) // 2, max_range]
         return [elem + offset for elem in result]
 
     @staticmethod
@@ -603,15 +603,18 @@ class GenerationMixin:
             # total number of spec decoding tokens for all sequences (sequence length can be variable).
             num_gen_tokens_range = [
                 default_range(
-                    max_batch_size * max_beam_width * tokens_per_engine_step)
+                    max_batch_size * max_beam_width * tokens_per_engine_step,
+                    min_range=0)
             ] * num_profiles
+            bb_range_0 = [[0] + bbr[1:] for bbr in bb_range]
 
             # support variable sequence lengths for medusa.
             spec_decoding_generation_lengths = Tensor(
                 name='spec_decoding_generation_lengths',
                 dtype=trt.int32,
                 shape=[-1],
-                dim_range=OrderedDict([('batch_size_beam_width', bb_range)]),
+                dim_range=OrderedDict([('batch_size_beam_width_0', bb_range_0)
+                                       ]),
             )
 
             # position offsets that are fixed during the whole session.
@@ -621,7 +624,7 @@ class GenerationMixin:
                 dtype=trt.int32,
                 shape=[-1, -1],
                 dim_range=OrderedDict([
-                    ('batch_size_beam_width', bb_range),
+                    ('batch_size_beam_width_0', bb_range_0),
                     ('spec_decoding_position_ids_dim0',
                      tokens_per_engine_step_range),
                 ]),

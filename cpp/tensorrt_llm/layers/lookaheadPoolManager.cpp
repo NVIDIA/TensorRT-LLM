@@ -15,6 +15,7 @@
  */
 
 #include "tensorrt_llm/layers/lookaheadPoolManager.h"
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/layers/lookaheadDecodingUtils.h"
 
 namespace tensorrt_llm::layers
@@ -24,13 +25,18 @@ using namespace tensorrt_llm::runtime;
 
 void LookaheadPoolManager::setup(SizeType32 guessSetSize)
 {
-    TLLM_CHECK(guessSetSize > 0 && guessSetSize <= mGuessSetSizeMax);
+    TLLM_CHECK(guessSetSize >= 0 && guessSetSize <= mGuessSetSizeMax);
     mGuessSetSize = guessSetSize;
     mTokenMap.clear();
 }
 
 void LookaheadPoolManager::insertOne(Key key, TensorConstPtr const& ngram)
 {
+    if (TLLM_UNLIKELY(ITensor::volume(ngram->getShape()) == 0 || mGuessSetSize == 0))
+    {
+        return;
+    }
+
     auto search = mTokenMap.find(key);
     if (search != mTokenMap.end())
     {
@@ -41,7 +47,7 @@ void LookaheadPoolManager::insertOne(Key key, TensorConstPtr const& ngram)
                 BufferRange<TokenIdType const> itemRange(*item);
                 return std::equal(ngramRange.begin(), ngramRange.end(), itemRange.begin());
             });
-        if (mGuessSetSize >= 0 && search->second.size() >= mGuessSetSize)
+        if (mGuessSetSize > 0 && search->second.size() >= mGuessSetSize)
         {
             search->second.pop_front();
         }
@@ -104,7 +110,6 @@ void LookaheadPoolManager::update(TensorConstPtr const& keyTokens, TensorConstPt
         BufferRange<TokenIdType const> sourceRange(*source);
         BufferRange<TokenIdType> ngramRange(*ngram);
         std::copy(sourceRange.begin(), sourceRange.end(), ngramRange.begin());
-
         insertOne(keyRange[wi], ngram);
     }
 }

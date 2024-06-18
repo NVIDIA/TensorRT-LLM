@@ -263,6 +263,9 @@ public:
         std::optional<std::string> logitsPostProcessorName = std::nullopt,
         std::optional<VecTokens> encoderInputTokenIds = std::nullopt);
 
+    /// @brief This logits postprocessor name will dispatch to the batched logits postprocessor
+    static auto constexpr kBatchedPostProcessorName = "batched";
+
     Request(Request const& other);
     Request(Request&& other) noexcept;
     Request& operator=(Request const& other);
@@ -402,6 +405,14 @@ public:
     [[nodiscard]] std::optional<FloatType> getFreeGpuMemoryFraction() const;
     [[nodiscard]] std::optional<size_t> getHostCacheSize() const;
     [[nodiscard]] bool getOnboardBlocks() const;
+
+    void setEnableBlockReuse(bool enableBlockReuse);
+    void setMaxTokens(SizeType32 maxTokens);
+    void setMaxAttentionWindow(SizeType32 maxAttentionWindow);
+    void setSinkTokenLength(SizeType32 sinkTokenLength);
+    void setFreeGpuMemoryFraction(FloatType freeGpuMemoryFraction);
+    void setHostCacheSize(size_t hostCacheSize);
+    void setOnboardBlocks(bool onboardBlocks);
 
 private:
     friend class Serialization;
@@ -557,49 +568,39 @@ private:
     std::optional<size_t> mHostCacheSize;
 };
 
-/// @brief Configuration class for Lookahead decoding.
-class LookaheadDecodingConfig
+struct LookaheadDecodingConfig
 {
-public:
-    explicit LookaheadDecodingConfig(
-        SizeType32 maxNgramSize, SizeType32 maxWindowSize, SizeType32 maxVerificationSetSize);
+    LookaheadDecodingConfig(SizeType32 windowSize, SizeType32 ngramSize, SizeType32 verificationSetSize);
+
+    explicit LookaheadDecodingConfig()
+        : LookaheadDecodingConfig(1, 1, 0)
+    {
+    }
 
     bool operator==(LookaheadDecodingConfig const& other) const;
+    [[nodiscard]] std::tuple<SizeType32 const, SizeType32 const, SizeType32 const> get() const;
+    [[nodiscard]] SizeType32 getWindowSize() const;
+    [[nodiscard]] SizeType32 getNgramSize() const;
+    [[nodiscard]] SizeType32 getVerificationSetSize() const;
 
-    void setMaxNgramSize(SizeType32);
-    void setMaxWindowSize(SizeType32);
-    void setMaxVerificationSetSize(SizeType32);
-    [[nodiscard]] SizeType32 getMaxNgramSize() const;
-    [[nodiscard]] SizeType32 getMaxWindowSize() const;
-    [[nodiscard]] SizeType32 getMaxVerificationSetSize() const;
+    /// @brief return <maxDecodingTokens, maxPathLen, maxDraftTokens, maxDraftPathLen>
+    std::tuple<SizeType32, SizeType32, SizeType32, SizeType32> calculateSpeculativeResource() const;
+
+    /// @brief return true when `this` can be executed on resources defined by `that`
+    bool isLE(LookaheadDecodingConfig const& that) const;
+
+    /// @brief return true when the parameter combination is valid.
+    static bool isLegal(SizeType32 windowSize, SizeType32 ngramSize, SizeType32 verificationSetSize) noexcept;
 
 private:
     friend class Serialization;
 
-    // Number of tokens per NGram.
-    SizeType32 mMaxNgramSize;
     // Number of NGrams in lookahead branch per step.
-    SizeType32 mMaxWindowSize;
+    SizeType32 mWindowSize;
+    // Number of tokens per NGram.
+    SizeType32 mNgramSize;
     // Number of NGrams in verification branch per step.
-    SizeType32 mMaxVerificationSetSize;
-};
-
-/// @brief Configuration class for explicit draft tokens decoding.
-class ExplicitDraftTokensConfig
-{
-public:
-    explicit ExplicitDraftTokensConfig(float temperature);
-
-    bool operator==(ExplicitDraftTokensConfig const& other) const;
-
-    void setTemperature(float);
-    [[nodiscard]] float getTemperature() const;
-
-private:
-    friend class Serialization;
-
-    // Sampling temperature.
-    float mTemperature;
+    SizeType32 mVerificationSetSize;
 };
 
 /// @brief Configuration class for the speculative decoding.
@@ -608,8 +609,7 @@ class DecodingConfig
 public:
     explicit DecodingConfig(std::optional<DecodingMode> decodingMode = std::nullopt,
         std::optional<LookaheadDecodingConfig> lookaheadDecodingConfig = std::nullopt,
-        std::optional<MedusaChoices> medusaChoices = std::nullopt,
-        std::optional<ExplicitDraftTokensConfig> explicitDraftTokensConfig = std::nullopt);
+        std::optional<MedusaChoices> medusaChoices = std::nullopt);
 
     bool operator==(DecodingConfig const& other) const;
 
@@ -620,18 +620,13 @@ public:
 
     // Lookahead methods.
     /// @brief Sets lookahead decoding mode and config.
-    void setLookaheadDecoding(LookaheadDecodingConfig const&);
+    void setLookaheadDecoding(LookaheadDecodingConfig const& lookaheadDecodingConfig);
     [[nodiscard]] std::optional<LookaheadDecodingConfig> getLookaheadDecodingConfig() const;
 
     // Medusa methods.
     /// @brief Sets medusa mode and config.
     void setMedusaChoices(MedusaChoices const&);
     [[nodiscard]] std::optional<MedusaChoices> getMedusaChoices() const;
-
-    // ExplicitDraftTokens decoding methods.
-    /// @brief Sets explicit draft tokens decoding mode and config.
-    void setExplicitDraftTokens(ExplicitDraftTokensConfig const&);
-    [[nodiscard]] std::optional<ExplicitDraftTokensConfig> getExplicitDraftTokensConfig() const;
 
 private:
     friend class Serialization;
@@ -642,8 +637,6 @@ private:
     std::optional<LookaheadDecodingConfig> mLookaheadDecodingConfig;
     // Medusa params.
     std::optional<MedusaChoices> mMedusaChoices;
-    // Explicit draft tokens params.
-    std::optional<ExplicitDraftTokensConfig> mExplicitDraftTokensConfig;
 };
 
 /// @brief Configuration class for the model executor
@@ -654,10 +647,11 @@ public:
         KvCacheConfig const& kvCacheConfig = KvCacheConfig(), bool enableChunkedContext = false,
         bool normalizeLogProbs = true, SizeType32 iterStatsMaxIterations = kDefaultIterStatsMaxIterations,
         SizeType32 requestStatsMaxIterations = kDefaultRequestStatsMaxIterations,
-        BatchingType batchingType = BatchingType::kINFLIGHT,
+        BatchingType batchingType = BatchingType::kINFLIGHT, std::optional<SizeType32> maxBatchSize = std::nullopt,
         std::optional<ParallelConfig> parallelConfig = std::nullopt,
         std::optional<PeftCacheConfig> const& peftCacheConfig = std::nullopt,
         std::optional<LogitsPostProcessorMap> logitsPostProcessorMap = std::nullopt,
+        std::optional<LogitsPostProcessorBatched> logitsPostProcessorBatched = std::nullopt,
         std::optional<DecodingConfig> decodingConfig = std::nullopt, float gpuWeightsPercent = 1);
 
     [[nodiscard]] SizeType32 getMaxBeamWidth() const;
@@ -668,13 +662,16 @@ public:
     [[nodiscard]] SizeType32 getIterStatsMaxIterations() const;
     [[nodiscard]] SizeType32 getRequestStatsMaxIterations() const;
     [[nodiscard]] BatchingType getBatchingType() const;
+    [[nodiscard]] std::optional<SizeType32> getMaxBatchSize() const;
     [[nodiscard]] std::optional<ParallelConfig> getParallelConfig() const;
     [[nodiscard]] std::optional<PeftCacheConfig> getPeftCacheConfig() const;
     [[nodiscard]] std::optional<LogitsPostProcessorMap> getLogitsPostProcessorMap() const;
+    [[nodiscard]] std::optional<LogitsPostProcessorBatched> getLogitsPostProcessorBatched() const;
     [[nodiscard]] std::optional<DecodingConfig> getDecodingConfig() const;
     [[nodiscard]] float getGpuWeightsPercent() const;
 
     void setMaxBeamWidth(SizeType32 maxBeamWidth);
+    void setMaxBatchSize(SizeType32 maxBatchSize);
     void setSchedulerConfig(SchedulerConfig const& schedulerConfig);
     void setKvCacheConfig(KvCacheConfig const& kvCacheConfig);
     void setEnableChunkedContext(bool enableChunkedContext);
@@ -685,6 +682,7 @@ public:
     void setParallelConfig(ParallelConfig const& parallelConfig);
     void setPeftCacheConfig(PeftCacheConfig const& peftCacheConfig);
     void setLogitsPostProcessorMap(LogitsPostProcessorMap const& logitsPostProcessorMap);
+    void setLogitsPostProcessorBatched(LogitsPostProcessorBatched const& logitsPostProcessorBatched);
     void setDecodingConfig(DecodingConfig const& decodingConfig);
     void setGpuWeightsPercent(float const& gpuWeightsPercent);
 
@@ -715,10 +713,14 @@ private:
     /// @brief The type of batching strategy to use. See BatchingType.
     BatchingType mBatchingType;
 
+    /// @brief The max batch size of requests
+    std::optional<SizeType32> mMaxBatchSize;
+
     /// @brief The parallel execution configuration.
     std::optional<ParallelConfig> mParallelConfig;
     std::optional<PeftCacheConfig> mPeftCacheConfig;
     std::optional<LogitsPostProcessorMap> mLogitsPostProcessorMap;
+    std::optional<LogitsPostProcessorBatched> mLogitsPostProcessorBatched;
     /// @brief Decoding configuration.
     std::optional<DecodingConfig> mDecodingConfig;
     float mGpuWeightsPercent;

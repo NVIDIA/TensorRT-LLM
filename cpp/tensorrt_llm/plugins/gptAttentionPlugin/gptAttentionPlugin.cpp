@@ -621,8 +621,10 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         host_secondary_pool_pointer = reinterpret_cast<void*>(typed_host_pool_pointers[1] + layerOffset);
     }
 
-    T* context_buf_
-        = (T*) (outputs[0]) + outputDesc[0].dims.d[getPackedTensorHiddenDimIndex(mRemovePadding)] * tokenIdxBeg;
+    // FP8 output when fp8_context_fmha is enabled.
+    auto const outputElemSize = (mFP8ContextFMHA ? 1 : sizeof(T));
+    T* context_buf_ = reinterpret_cast<T*>(static_cast<char*>(outputs[0])
+        + outputDesc[0].dims.d[getPackedTensorHiddenDimIndex(mRemovePadding)] * tokenIdxBeg * outputElemSize);
     void* key_value_cache = nullptr;
     if (useKVCache() && !mPagedKVCache)
     {
@@ -643,28 +645,30 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
     int const* spec_decoding_packed_mask = nullptr;
     int const* spec_decoding_position_offsets = nullptr;
     int const* spec_decoding_generation_lengths = nullptr;
-    int num_spec_decoding_tokens = 0;
+    int num_decoding_draft_tokens = 0;
     if (mIsSpecDecodingEnabled)
     {
-        // Second dimension of spec_decoding_position_offsets is num_spec_decoding_tokens + 1.
-        // [batch_size, num_spec_decoding_tokens + 1]
-        num_spec_decoding_tokens = inputDesc[getIdx(IdxEntry::SPEC_DECODING_POSITION_OFFSETS)].dims.d[1] - 1;
-        if (num_spec_decoding_tokens > 0)
+        // Second dimension of spec_decoding_position_offsets is num_decoding_draft_tokens + 1.
+        // [batch_size, num_decoding_draft_tokens + 1]
+        num_decoding_draft_tokens = inputDesc[getIdx(IdxEntry::SPEC_DECODING_POSITION_OFFSETS)].dims.d[1] - 1;
+        if (num_decoding_draft_tokens > 0)
         {
+            // spec_decoding_* tensors are not filled for context requests. Hence, always strting from 0th index
+            int32_t constexpr genSeqIdx = 0;
             spec_decoding_packed_mask = static_cast<int const*>(inputs[getIdx(IdxEntry::SPEC_DECODING_PACKED_MASK)])
-                + seqIdxBeg * getStride(inputDesc[getIdx(IdxEntry::SPEC_DECODING_PACKED_MASK)].dims, 0);
+                + genSeqIdx * getStride(inputDesc[getIdx(IdxEntry::SPEC_DECODING_PACKED_MASK)].dims, 0);
             // Packed as [num_tokens, packed_mask_size]
-            // Use seqIdxBeg * (num_spec_decoding_tokens + 1) here as only generation tokens have the packed_mask
+            // Use seqIdxBeg * (num_decoding_draft_tokens + 1) here as only generation tokens have the packed_mask
             // buffer.
             // TODO: support variable sequence length based on generationTokenIdxBeg.
             spec_decoding_packed_mask = static_cast<int const*>(inputs[getIdx(IdxEntry::SPEC_DECODING_PACKED_MASK)])
-                + seqIdxBeg * (num_spec_decoding_tokens + 1)
+                + genSeqIdx * (num_decoding_draft_tokens + 1)
                     * getStride(inputDesc[getIdx(IdxEntry::SPEC_DECODING_PACKED_MASK)].dims, 0);
             spec_decoding_position_offsets
                 = static_cast<int const*>(inputs[getIdx(IdxEntry::SPEC_DECODING_POSITION_OFFSETS)])
-                + seqIdxBeg * getStride(inputDesc[getIdx(IdxEntry::SPEC_DECODING_POSITION_OFFSETS)].dims, 0);
+                + genSeqIdx * getStride(inputDesc[getIdx(IdxEntry::SPEC_DECODING_POSITION_OFFSETS)].dims, 0);
             spec_decoding_generation_lengths
-                = static_cast<int const*>(inputs[getIdx(IdxEntry::SPEC_DECODING_GENERATION_LENGTHS)]) + seqIdxBeg;
+                = static_cast<int const*>(inputs[getIdx(IdxEntry::SPEC_DECODING_GENERATION_LENGTHS)]) + genSeqIdx;
         }
     }
 
@@ -747,7 +751,7 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
             input_seq_length, mIsSpecDecodingEnabled ? "true" : "false", qkvDims.nbDims, qkvDims.d[0], qkvDims.d[1],
             qkvDims.d[2]);
         TLLM_CHECK_WITH_INFO(
-            input_seq_length == num_spec_decoding_tokens + 1, "The generation input length is not expected.");
+            input_seq_length == num_decoding_draft_tokens + 1, "The generation input length is not expected.");
         EnqueueGenerationParams<T, KVCacheBuffer> enqueue_params{attention_input, qkv_bias, input_seq_length,
             sequence_kv_length, max_context_kv_len, beamWidth, context_q_lengths, kv_scale_orig_quant,
             kv_scale_quant_orig, attention_output_orig_quant, rotary_embedding_scaling_factors, alibi_slopes,

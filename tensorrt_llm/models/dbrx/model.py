@@ -59,7 +59,7 @@ class DbrxDecoderLayer(Module):
             ClsMLP = MOE
             mlp_kwargs = {
                 "moe_config": config.moe,
-                "tp_rank": config.mapping.tp_rank,
+                "mapping": config.mapping,
             }
 
         self.mlp = ClsMLP(hidden_size=config.hidden_size,

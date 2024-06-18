@@ -58,7 +58,9 @@ class JAXParser:
 
     def get_config(self, checkpoint_path, ckpt_params):
         config = recurrentgemma_jax.GriffinConfig.from_flax_params_or_variables(
-            ckpt_params)._asdict()
+            ckpt_params,
+            preset=recurrentgemma_jax.Preset.RECURRENT_GEMMA_2B_V1,
+        )._asdict()
         if config["lru_width"] is None:
             config["lru_width"] = config["width"]
         layer_types = []

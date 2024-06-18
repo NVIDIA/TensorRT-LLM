@@ -146,9 +146,9 @@ protected:
 
     virtual void initLayer(TestSamplingParams const& params) = 0;
 
-    std::shared_ptr<tensorrt_llm::layers::SamplingInputParams> createInputTensors(int32_t step);
+    std::shared_ptr<tensorrt_llm::layers::SamplingInputs> createInputTensors(int32_t step);
 
-    std::shared_ptr<tensorrt_llm::layers::SamplingOutputParams> createOutputTensors();
+    std::shared_ptr<tensorrt_llm::layers::BaseDecodingOutputs> createOutputTensors();
 
     void batchCopy(int32_t step);
     bool checkResult(int32_t* outputIds, std::vector<std::set<int32_t>>& expectedIds);

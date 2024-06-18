@@ -870,7 +870,7 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_4gpu_codellama \
             --output_dir ./tmp/codellama/trt_engines/fp16/4-gpu/ \
             --gemm_plugin auto \
             --max_input_len 15360 \
-            --max_output_len 1024 \
+            --max_seq_len 16384 \
             --max_batch_size 4
 ```
 
@@ -909,7 +909,7 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_2gpu \
             --lora_plugin auto \
             --max_batch_size 1 \
             --max_input_len 512 \
-            --max_output_len 50 \
+            --max_seq_len 562 \
             --lora_dir chinese-llama-2-lora-13b
 ```
 
@@ -978,7 +978,7 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu \
             --lora_plugin auto \
             --max_batch_size 8 \
             --max_input_len 512 \
-            --max_output_len 50 \
+            --max_seq_len 562 \
             --lora_dir  "luotuo-lora-7b-0.1/" "Japanese-Alpaca-LoRA-7b-v0/" \
             --max_lora_rank 8 \
             --lora_target_modules attn_q attn_k attn_v

@@ -1,7 +1,7 @@
 import argparse
-import json
 import os
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import tensorrt_llm
@@ -15,13 +15,7 @@ from tensorrt_llm.quantization import QuantAlgo
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_dir', type=str, default=None)
-    parser.add_argument(
-        '--qwen_type',
-        default='qwen',
-        choices=['qwen', 'qwen2'],
-        help="Used only if model_dir is not provided."
-        "In this case users should explicitly passing the version.")
+    parser.add_argument('--model_dir', type=str, default=None, required=True)
     parser.add_argument('--tp_size',
                         type=int,
                         default=1,
@@ -34,15 +28,6 @@ def parse_arguments():
                         type=str,
                         default='float16',
                         choices=['float32', 'bfloat16', 'float16'])
-    parser.add_argument('--vocab_size', type=int, default=32000)
-    parser.add_argument('--n_positions', type=int, default=2048)
-    parser.add_argument('--n_layer', type=int, default=32)
-    parser.add_argument('--n_head', type=int, default=32)
-    parser.add_argument('--n_kv_head', type=int, default=None)
-    parser.add_argument('--n_embd', type=int, default=4096)
-    parser.add_argument('--inter_size', type=int, default=22016)
-    parser.add_argument('--rms_norm_eps', type=float, default=1e-06)
-
     parser.add_argument(
         '--use_weight_only',
         default=False,
@@ -115,11 +100,6 @@ def parse_arguments():
         'per_group chooses at run time, and for each group, a custom scaling factor. '
         'The flag is built for GPTQ/AWQ quantization.')
 
-    parser.add_argument('--hidden_act', type=str, default='silu')
-
-    parser.add_argument('--rotary_base', type=float, default=10000.0)
-    parser.add_argument('--rotary_scaling', nargs=2, type=str, default=None)
-
     parser.add_argument('--group_size',
                         type=int,
                         default=128,
@@ -165,13 +145,19 @@ def parse_arguments():
         default=1,
         help='The number of workers for converting checkpoint in parallel')
     parser.add_argument(
-        '--save_config_only',
-        action="store_true",
-        default=False,
+        '--moe_tp_size',
+        type=int,
+        default=-1,
         help=
-        'Only save the model config w/o read and converting weights, be careful, this is for debug only'
+        'N-way tensor parallelism size for MOE, default is tp_size, which will do tp-only for MoE'
     )
-
+    parser.add_argument(
+        '--moe_ep_size',
+        type=int,
+        default=-1,
+        help=
+        'N-way expert parallelism size for MOE, default is 1, which will do tp-only for MoE'
+    )
     args = parser.parse_args()
     return args
 
@@ -180,10 +166,6 @@ def args_to_quantization(args: argparse.Namespace) -> QuantConfig:
     '''return config dict with quantization info based on the command line args
     '''
     quant_config = QuantConfig()
-    quant_config.exclude_modules = [
-        'lm_head', 'router', 'vocab_embedding', 'position_embedding',
-        'block_embedding'
-    ]
     if args.use_weight_only:
         if args.weight_only_precision == 'int8':
             quant_config.quant_algo = QuantAlgo.W8A16
@@ -228,35 +210,6 @@ def args_to_build_options(args):
     }
 
 
-def from_cli_args(args):
-    n_kv_head = args.n_kv_head if args.n_kv_head is not None else args.n_head  # default to MHA
-    config = {
-        'architecture': "QWenForCausalLM",
-        'dtype': args.dtype,
-        'logits_dtype': 'float32',
-        'num_hidden_layers': args.n_layer,
-        'num_attention_heads': args.n_head,
-        'hidden_size': args.n_embd,
-        'intermediate_size': args.inter_size,
-        'num_key_value_heads': n_kv_head,
-        'vocab_size': args.vocab_size,
-        'position_embedding_type': 'rope_gpt_neox',
-        'max_position_embeddings': args.n_positions,
-        'hidden_act': args.hidden_act,
-        'rotary_base': args.rotary_base,
-        'norm_epsilon': args.rms_norm_eps,
-        'qwen_type': args.qwen_type,
-        'mapping': {
-            'world_size': args.tp_size * args.pp_size,
-            'tp_size': args.tp_size,
-            'pp_size': args.pp_size
-        },
-        'quantization': args_to_quantization(args).to_dict()
-    }
-    config.update(args_to_build_options(args))
-    return config
-
-
 def preload_model(args, model_dir, load_model_on_cpu):
     from transformers import AutoModelForCausalLM
     if args.use_weight_only and args.weight_only_precision == 'int4_gptq':
@@ -292,7 +245,10 @@ def convert_and_save_hf(args):
             world_size=world_size,
             rank=-1,  #intentinoally make -1 to avoid mistake
             tp_size=args.tp_size,
-            pp_size=args.pp_size)
+            pp_size=args.pp_size,
+            moe_tp_size=args.moe_tp_size,
+            moe_ep_size=args.moe_ep_size,
+        )
         #TODO: change to QWenForCausalLM.quantize later
         quantize(args.dtype,
                  args.model_dir,
@@ -311,7 +267,9 @@ def convert_and_save_hf(args):
             mapping = Mapping(world_size=world_size,
                               rank=rank,
                               tp_size=args.tp_size,
-                              pp_size=args.pp_size)
+                              pp_size=args.pp_size,
+                              moe_tp_size=args.moe_tp_size,
+                              moe_ep_size=args.moe_ep_size)
             #TODO: change to QWenForCausalLM.from_hugging_face later
             qwen = from_hugging_face(
                 QWenForCausalLM,
@@ -325,9 +283,9 @@ def convert_and_save_hf(args):
                 override_fields=override_fields)
             qwen.save_checkpoint(args.output_dir, save_config=(rank == 0))
             del qwen
-            release_gc()
 
         execute(args.workers, [convert_and_save_rank] * world_size, args)
+        release_gc()
 
 
 def execute(workers, func, args):
@@ -353,19 +311,24 @@ def main():
     print(tensorrt_llm.__version__)
     args = parse_arguments()
 
-    args.tp_size * args.pp_size
+    if (args.moe_tp_size == -1 and args.moe_ep_size == -1):
+        # moe default to tp-only
+        args.moe_tp_size = args.tp_size
+        args.moe_ep_size = 1
+    elif (args.moe_tp_size == -1):
+        args.moe_tp_size = args.tp_size // args.moe_ep_size
+    elif (args.moe_ep_size == -1):
+        args.moe_ep_size = args.tp_size // args.moe_tp_size
+    assert (args.moe_tp_size * args.moe_ep_size == args.tp_size
+            ), "moe_tp_size * moe_ep_size must equal to tp_size"
+
     tik = time.time()
 
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
 
-    if args.model_dir is None:
-        config = from_cli_args(args)
-        with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
-            json.dump(config, f, indent=4)
-    else:
-        assert args.model_dir is not None
-        convert_and_save_hf(args)
+    assert args.model_dir is not None
+    convert_and_save_hf(args)
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))

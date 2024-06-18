@@ -320,12 +320,9 @@ def test_gpt_manager_constrained_generation(variant, results_file,
     remaining_requests = len(inference_request_list)
     opt_params = _tb.TrtGptModelOptionalParams()
     opt_params.max_beam_width = 1
-    with _tb.GptManager(
-            model_path, _tb.TrtGptModelType.InflightBatching,
-            _tb.executor.SchedulerConfig(
-                _tb.executor.CapacitySchedulerPolicy.MAX_UTILIZATION),
-            fetch_requests, response_cb, should_stop, stats_cb, opt_params,
-            10000):
+    with _tb.GptManager(model_path, _tb.TrtGptModelType.InflightBatching,
+                        fetch_requests, response_cb, should_stop, stats_cb,
+                        opt_params, 10000):
         while remaining_requests > 0:
             _time.sleep(0.1)
 

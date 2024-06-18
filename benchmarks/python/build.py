@@ -137,6 +137,15 @@ def parse_arguments():
         ('If this option is specified, it will override the max output len of '
          'TRT engines to the specified value instead of using pre-defined one'))
     parser.add_argument(
+        '--max_seq_len',
+        '--max_decoder_seq_len',
+        dest='max_seq_len',
+        type=int,
+        default=None,
+        help=
+        ('If this option is specified, it will override the max sequence len of '
+         'TRT engines to the specified value instead of using pre-defined one'))
+    parser.add_argument(
         '--max_batch_size',
         type=int,
         default=None,
@@ -254,8 +263,24 @@ def build_gpt(args):
         if args.max_batch_size is None else args.max_batch_size
     max_input_len = build_config['max_input_len'] \
         if args.max_input_len is None else args.max_input_len
-    max_output_len = build_config['max_output_len'] \
-        if args.max_output_len is None else args.max_output_len
+
+    if args.max_output_len:
+        logger.warning(
+            '--max_output_len has been deprecated in favor of --max_seq_len')
+        if args.max_input_len:
+            if args.max_seq_len:
+                logger.warning(
+                    '--max_seq_len has been overwritten due to --max_output_len being specified'
+                )
+            args.max_seq_len = args.max_input_len + args.max_output_len
+        else:
+            raise Exception(
+                f"max_output_len is specified but not max_input_len")
+
+        del args.max_output_len
+
+    max_seq_len = build_config['max_seq_len'] \
+        if args.max_seq_len is None else args.max_seq_len
     max_beam_width = build_config['max_beam_width'] \
         if args.max_beam_width is None else args.max_beam_width
 
@@ -308,7 +333,7 @@ def build_gpt(args):
         max_batch_size=max_batch_size,
         max_beam_width=max_beam_width,
         max_input_len=max_input_len,
-        max_output_len=max_output_len,
+        max_seq_len=max_seq_len,
         max_num_tokens=max_num_tokens,
         int8=(quant_mode.has_act_and_weight_quant()
               or quant_mode.is_int8_weight_only()),
@@ -675,7 +700,6 @@ def build_gpt(args):
             config['quantization'].update({
                 'has_zero_point': False,
                 'pre_quant_scale': True,
-                'exclude_modules': [],
             })
         config = PretrainedConfig.from_dict(config)
         tensorrt_llm_model = tensorrt_llm.models.FalconForCausalLM(config)
@@ -759,7 +783,6 @@ def build_gpt(args):
                     "group_size": 128,
                     "has_zero_point": False,
                     "pre_quant_scale": True,
-                    "exclude_modules": [],
                 })
             elif 'gptq' in args.quantization:
                 config['quantization'].update({
@@ -968,14 +991,14 @@ def build_gpt(args):
 
         # Forward
         print(
-            f"max_batch_size: {max_batch_size}, max_input_len: {max_input_len}, max_output_len: {max_output_len}, max_beam_width: {max_beam_width}"
+            f"max_batch_size: {max_batch_size}, max_input_len: {max_input_len}, max_seq_len: {max_seq_len}, max_beam_width: {max_beam_width}"
         )
         # NOTE: all other models use PretrainedModel.prepare_inputs(...)
         # except RecurrentGemmaForCausalLM and MambaForCausalLM
         inputs = tensorrt_llm_model.prepare_inputs(
             max_batch_size=max_batch_size,
             max_input_len=max_input_len,
-            max_seq_len=max_input_len + max_output_len,
+            max_seq_len=max_seq_len,
             max_num_tokens=max_num_tokens,
             use_cache=True,
             max_beam_width=max_beam_width,
@@ -1231,7 +1254,7 @@ def enc_dec_build_helper(component, config, args):
         max_batch_size=config['max_batch_size'],
         max_beam_width=config['max_beam_width'],
         max_decoder_input_len=config['max_decoder_input_len'],
-        max_output_len=config['max_output_len'],
+        max_seq_len=config['max_seq_len'],
         max_encoder_input_len=config['max_encoder_input_len'],
         opt_level=config['builder_opt'],
         cross_attention=(component == 'decoder'),
@@ -1473,7 +1496,7 @@ def enc_dec_build_helper(component, config, args):
                     max_batch_size=config['max_batch_size'],
                     max_beam_width=config['max_beam_width'],
                     max_decoder_input_len=config['max_decoder_input_len'],
-                    max_seq_len=config['max_output_len'],
+                    max_seq_len=config['max_seq_len'],
                     max_encoder_input_len=1500,  # n_audio_ctx
                 )
                 tllm_model(**inputs)
@@ -1482,7 +1505,7 @@ def enc_dec_build_helper(component, config, args):
                     max_batch_size=config['max_batch_size'],
                     max_beam_width=config['max_beam_width'],
                     max_decoder_input_len=config['max_decoder_input_len'],
-                    max_seq_len=config['max_output_len'],
+                    max_seq_len=config['max_seq_len'],
                     max_encoder_input_len=config['max_encoder_input_len'],
                 )
 
@@ -1548,8 +1571,24 @@ def build_enc_dec(args):
     build_config['max_encoder_input_len'] = build_config['max_encoder_input_len'] \
         if args.max_input_len is None else args.max_input_len
     build_config['max_decoder_input_len'] = 1
-    build_config['max_output_len'] = build_config['max_output_len'] \
-        if args.max_output_len is None else args.max_output_len
+
+    if args.max_output_len:
+        logger.warning(
+            '--max_output_len has been deprecated in favor of --max_seq_len')
+        if args.max_input_len:
+            if args.max_seq_len:
+                logger.warning(
+                    '--max_seq_len has been overwritten due to --max_output_len being specified'
+                )
+            args.max_seq_len = args.max_input_len + args.max_output_len
+        else:
+            raise Exception(
+                f"max_output_len is specified but not max_input_len")
+
+        del args.max_output_len
+
+    build_config['max_seq_len'] = build_config['max_seq_len'] \
+        if args.max_seq_len is None else args.max_seq_len
     build_config[
         'max_beam_width'] = 1 if args.max_beam_width is None else args.max_beam_width
 

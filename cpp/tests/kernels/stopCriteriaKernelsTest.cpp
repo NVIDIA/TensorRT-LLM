@@ -35,6 +35,8 @@ using namespace tensorrt_llm::runtime;
 namespace
 {
 
+// TODO(nkorobov): add tests for numNewTokens for EOS and seqLenLimit
+
 class StopCriteriaKernelsTest : public testing::Test
 {
 public:
@@ -410,8 +412,8 @@ public:
             reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*mFinished)),
             bufferCast<SizeType32>(*mFinishedSum),
             reinterpret_cast<SizeType32 const*>(bufferCast<SizeType32>(*mSequenceLengthLimits)),
-            bufferCast<SizeType32>(*mSequenceLengths), bufferCast<SizeType32>(*mBatchSlots), batchSize, beamWidth,
-            mStream->get());
+            bufferCast<SizeType32>(*mSequenceLengths), /* numNewTokens */ nullptr, bufferCast<SizeType32>(*mBatchSlots),
+            batchSize, beamWidth, mStream->get());
 
         verifyMaxSeqLenStopCriteriaResults(seed, batchSize, beamWidth);
     }

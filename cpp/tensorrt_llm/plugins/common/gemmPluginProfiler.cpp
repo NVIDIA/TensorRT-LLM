@@ -232,7 +232,12 @@ std::optional<Config> GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHa
         catch (std::exception const& e)
         {
             std::ostringstream msg;
-            msg << "Cannot profile configuration " << ii << " (for"
+            msg << "Cannot profile configuration " << ii;
+            if constexpr (std::is_same_v<Config, tensorrt_llm::cutlass_extensions::CutlassGemmConfig>)
+            {
+                msg << ": " << candidateConfig.toString();
+            }
+            msg << "\n (for"
                 << " m=" << m << ", n=" << n << ", k=" << k << ")"
                 << ", reason: \"" << e.what() << "\". Skipped";
             TLLM_LOG_TRACE(msg.str());

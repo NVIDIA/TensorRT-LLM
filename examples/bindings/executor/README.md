@@ -54,3 +54,13 @@ This can be done by running:
 ```
 python3 example_advanced.py --model_path=../llama/tmp/7B/trt_engines/fp16/4gpu_tp4_pp1/ --use_orchestrator_mode
 ```
+
+### Logits post processor example
+
+This example shows how to generate JSON structured output using LogitsPostProcessor API.
+
+```
+python3 example_logits_processor.py -t <tokenizer_path> -e <engine_path> --batch_size 8
+```
+
+LogitsPostProcessorBatched, which fuses logits processing for all samples in a batch into a single callback, is enabled by `--lpp_batched`

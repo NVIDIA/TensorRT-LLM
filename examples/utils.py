@@ -35,6 +35,7 @@ DEFAULT_HF_MODEL_DIRS = {
     'PhiForCausalLM': 'microsoft/phi-2',
     'OPTForCausalLM': 'facebook/opt-350m',
     'QWenForCausalLM': 'Qwen/Qwen-7B',
+    'RecurrentGemmaForCausalLM': 'google/recurrentgemma-2b',
 }
 
 INTERNLM_META_INSTRUCTION = """You are an AI assistant whose name is InternLM (书生·浦语).
@@ -291,7 +292,7 @@ def add_common_args(parser):
     )
     parser.add_argument(
         '--kv_cache_free_gpu_memory_fraction',
-        default=None,
+        default=0.9,
         type=float,
         help='Specify the free gpu memory fraction.',
     )

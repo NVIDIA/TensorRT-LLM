@@ -162,7 +162,7 @@ struct CutlassGemmConfig
     {
     }
 
-    std::string toString()
+    std::string toString() const
     {
         std::stringstream tactic;
         tactic << "Cutlass GEMM Tactic";

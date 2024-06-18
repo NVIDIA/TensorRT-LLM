@@ -1070,7 +1070,7 @@ std::vector<size_t> CutlassMoeFCRunner<T, WeightType, OutputType, Enable>::getWo
     size_t const sorter_size = CubKeyValueSorter::getWorkspaceSize(num_rows, num_experts);
     size_t const fc2_result_size = permuted_elems * gemm_output_dtype; // May be an intermediate type for quantization
     size_t const hopper_size = using_hopper ? HopperGroupedGemmInput::workspaceSize(num_experts_per_node) : 0;
-    size_t const gemm_workspace_size = moe_gemm_runner_.calcMaxWorkspaceSize(num_experts_per_node);
+    size_t const gemm_workspace_size = moe_gemm_runner_.getMaxWorkspaceSize(num_experts_per_node);
 
     std::vector<size_t> workspace{source_rows_size, permuted_rows_size, permuted_experts_size, permuted_data_size,
         total_rows_before_expert_size, softmax_out_size, glu_inter_size,
@@ -1085,7 +1085,7 @@ size_t CutlassMoeFCRunner<T, WeightType, OutputType, Enable>::getWorkspaceSize(i
     ActivationType activation_type, MOEParallelismConfig parallelism_config) const
 {
     int const ep_size = parallelism_config.ep_size;
-    TLLM_CHECK_WITH_INFO(num_experts % ep_size == 0, "Number of experts must be a multiple of tp size");
+    TLLM_CHECK_WITH_INFO(num_experts % ep_size == 0, "Number of experts must be a multiple of ep size");
     auto workspace = getWorkspaceBufferSizes(
         num_rows, hidden_size, inter_size, num_experts, num_experts / ep_size, k, activation_type);
     return tensorrt_llm::common::calculateTotalWorkspaceSize(workspace.data(), workspace.size());

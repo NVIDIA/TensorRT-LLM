@@ -46,7 +46,7 @@ mkdir -p tmp/trt_engines
 ### Apply FP8 PTQ
 
 Notes:
-- currently quantize.py does not support for Expert Parallelism (EP) mode yet. User should use `../llama/convert_checkpoint.py` and specify `--moe_tp_mode 1` (1 for EP, 2 for TP) instead, if needed.
+- currently quantize.py does not support for Expert Parallelism (EP) mode yet. User should use `../llama/convert_checkpoint.py` and specify `--moe_ep_size 1` instead, if needed.
 - TensorRT-LLM uses static quantization methods, which is expected to be faster at runtime as compared to dynamic quantization methods. This comes at a cost of an offline calibration step during quantization. `batch_size` and `calib_size` can be adjusted to shorten the calibration time. Please refer to ../quantization/README.md for explanation.
 - **due to the large model size and the calibration step (which has to load the HuggingFace model and run forward passes), it is likely that you will need more number of GPUs during quantization step than the number of GPUs for engine building and final deployment. For example, using 16xH100 or 8xH200 for quantization & 8xH100 for deployment.**
 

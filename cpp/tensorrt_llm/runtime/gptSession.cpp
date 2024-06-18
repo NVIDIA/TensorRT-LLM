@@ -74,12 +74,12 @@ auto const kProfileMbIdxs = populateMicrobatchIndexes();
 } // namespace
 
 GptSession::GptSession(Config const& sessionConfig, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
-    void const* engineBuffer, std::size_t engineSize, LoggerPtr logger)
+    RawEngine const& rawEngine, LoggerPtr logger)
     : mModelConfig{modelConfig}
     , mWorldConfig{worldConfig}
     , mDevice{utils::initDevice(worldConfig)}
     , mLogger{logger ? std::move(logger) : std::make_shared<TllmLogger>()}
-    , mRuntime{std::make_shared<TllmRuntime>(engineBuffer, engineSize, sessionConfig.gpuWeightsPercent, *mLogger)}
+    , mRuntime{std::make_shared<TllmRuntime>(rawEngine, mLogger.get(), sessionConfig.gpuWeightsPercent)}
 {
     TLLM_LOG_WARNING(
         "GptSession is deprecated and will be removed in a future release."
@@ -107,6 +107,11 @@ nvinfer1::ILogger& GptSession::getLogger() const
 BufferManager const& GptSession::getBufferManager() const
 {
     return mRuntime->getBufferManager();
+}
+
+BufferManager::CudaStreamPtr GptSession::getRuntimeStreamPtr() const
+{
+    return mRuntime->getStreamPtr();
 }
 
 nvinfer1::DataType GptSession::getLogitDataType() const

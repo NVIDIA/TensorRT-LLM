@@ -21,7 +21,9 @@
 #include "tensorrt_llm/runtime/loraModule.h"
 #include "tensorrt_llm/runtime/speculativeDecodingMode.h"
 #include "tensorrt_llm/runtime/speculativeDecodingModule.h"
+
 #include <NvInferRuntime.h>
+#include <array>
 
 namespace tensorrt_llm::runtime
 {
@@ -29,6 +31,12 @@ namespace tensorrt_llm::runtime
 class ModelConfig
 {
 public:
+    // See `split_point` defined in `tensorrt_llm/models/generation_mixin.py`.
+    // The split points are tuned to get better perf, if we need to let
+    // users tune that, we can support that by writing and reading the
+    // points in `config.json`.
+    static constexpr std::array kOPT_PROFILES_SPLIT_POINTS{64, 128, 256, 512, 1024};
+
     enum class ModelVariant : std::int32_t
     {
         kGpt = 0,
@@ -88,7 +96,14 @@ public:
         , mUsePositionEmbedding(false)
         , mUseTokenTypeEmbedding(false)
         , mSpeculativeDecodingMode(SpeculativeDecodingMode::None())
+        , mLogitsDtype(nvinfer1::DataType::kFLOAT)
+        , mUseShapeInference(true)
     {
+    }
+
+    [[nodiscard]] static std::vector<SizeType32> getOptProfilesSplitPoints() noexcept
+    {
+        return {kOPT_PROFILES_SPLIT_POINTS.begin(), kOPT_PROFILES_SPLIT_POINTS.end()};
     }
 
     [[nodiscard]] SizeType32 constexpr getVocabSize() const noexcept
@@ -555,6 +570,26 @@ public:
         return mSpeculativeDecodingMode;
     }
 
+    void setLogitsDtype(nvinfer1::DataType inputDtype) noexcept
+    {
+        mLogitsDtype = inputDtype;
+    }
+
+    [[nodiscard]] nvinfer1::DataType constexpr getLogitsDtype() const noexcept
+    {
+        return mLogitsDtype;
+    }
+
+    void setUseShapeInference(bool useShapeInference) noexcept
+    {
+        mUseShapeInference = useShapeInference;
+    }
+
+    [[nodiscard]] bool useShapeInference() const noexcept
+    {
+        return mUseShapeInference;
+    }
+
 private:
     SizeType32 mVocabSize;
     SizeType32 mNbAttentionLayers;
@@ -608,6 +643,10 @@ private:
     // Speculative decoding members
     std::shared_ptr<SpeculativeDecodingModule> mSpeculativeDecodingModule;
     SpeculativeDecodingMode mSpeculativeDecodingMode;
+
+    // Logits datatype
+    nvinfer1::DataType mLogitsDtype;
+    bool mUseShapeInference;
 };
 
 } // namespace tensorrt_llm::runtime

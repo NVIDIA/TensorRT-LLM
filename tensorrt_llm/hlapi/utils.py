@@ -4,10 +4,11 @@ import signal
 import sys
 import tempfile
 import traceback
+import weakref
 from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Any, Callable, List, Optional, Union
 
 import filelock
 import huggingface_hub
@@ -15,7 +16,7 @@ import torch
 from huggingface_hub import snapshot_download
 
 from tensorrt_llm.bindings import executor as tllme
-from tensorrt_llm.logger import set_level
+from tensorrt_llm.logger import Singleton, set_level
 
 
 def print_traceback_on_error(func):
@@ -40,8 +41,13 @@ class SamplingParams:
         end_id (int): The end token id.
         pad_id (int): The pad token id.
         max_new_tokens (int): The maximum number of tokens to generate.
-        bad_words: List[List[int]]: A list of bad words tokens. Each "word" can be composed of multiple tokens.
-        stop_words: List[List[int]]: A list of stop words tokens. Each "word" can be composed of multiple tokens.
+        bad_words (List[List[int]]): A list of bad words tokens. Each "word" can be composed of multiple tokens.
+        stop_words (List[List[int]]): A list of stop words tokens. Each "word" can be composed of multiple tokens.
+        embedding_bias (torch.Tensor): The embedding bias tensor. Expected type is kFP32 and shape is [vocab_size].
+        external_draft_tokens_config (ExternalDraftTokensConfig): The speculative decoding configuration.
+        prompt_tuning_config (PromptTuningConfig): The prompt tuning configuration.
+        lora_config (LoraConfig): The LoRA configuration.
+        logits_post_processor_name (str): The logits postprocessor name. Must correspond to one of the logits postprocessor name provided to the ExecutorConfig.
 
         beam_width (int): The beam width. Default is 1 which disables beam search.
         top_k (int): Controls number of logits to sample from. Default is 0 (all logits).
@@ -80,6 +86,12 @@ class SamplingParams:
     max_new_tokens: int = 32
     bad_words: Optional[List[List[int]]] = None
     stop_words: Optional[List[List[int]]] = None
+    embedding_bias: Optional[torch.Tensor] = None
+    external_draft_tokens_config: Optional[
+        tllme.ExternalDraftTokensConfig] = None
+    prompt_tuning_config: Optional[tllme.PromptTuningConfig] = None
+    lora_config: Optional[tllme.LoraConfig] = None
+    logits_post_processor_name: Optional[str] = None
 
     # Keep the below fields in sync with tllme.SamplingConfig
     beam_width: int = 1
@@ -236,6 +248,27 @@ def init_log_level():
     if "TLLM_LOG_LEVEL" not in os.environ:
         set_level("warning")
         os.environ["TLLM_LOG_LEVEL"] = "WARNING"
+
+
+class ExceptionHandler(metaclass=Singleton):
+
+    def __init__(self):
+        self._sys_excepthook: Callable = sys.excepthook
+        self._obj_refs_to_shutdown: List[weakref.ReferenceType] = []
+
+    def __call__(self, exc_type, exc_value, traceback):
+        self._sys_excepthook(exc_type, exc_value, traceback)
+
+        for obj_ref in self._obj_refs_to_shutdown:
+            if (obj := obj_ref()) is not None:
+                obj.shutdown()
+
+    def register(self, obj: Any):
+        self._obj_refs_to_shutdown.append(weakref.ref(obj))
+
+
+exception_handler = ExceptionHandler()
+sys.excepthook = exception_handler
 
 
 def sigint_handler(signal, frame):

@@ -7,16 +7,16 @@ from argparse import Namespace
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterable, List, Optional, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Union
 
 import tensorrt as trt
 import torch
 
-from .. import bindings as tllm
 from .._utils import mpi_barrier, mpi_rank, release_gc
 from ..auto_parallel import AutoParallelConfig, infer_cluster_config
-from ..bindings import KvCacheConfig
-from ..bindings.executor import CapacitySchedulerPolicy
+from ..bindings import executor as tllm
+from ..bindings.executor import (CapacitySchedulerPolicy, DecodingConfig,
+                                 KvCacheConfig)
 from ..builder import BuildConfig, Engine, EngineConfig, build
 from ..executor import GenerationExecutor, GenerationResult
 from ..logger import logger
@@ -28,14 +28,13 @@ from .mpi_session import (MpiCommSession, MPINodeState, MpiPoolSession,
                           MpiSession, external_mpi_comm_available)
 from .tokenizer import TokenizerBase, TransformersTokenizer
 from .utils import (GenerationOutput, GpuArch, SamplingParams,
-                    download_hf_model, file_with_glob_exists,
+                    download_hf_model, exception_handler, file_with_glob_exists,
                     file_with_suffix_exists, get_device_count, init_log_level,
                     print_colored, print_traceback_on_error)
 
 init_log_level(
 )  # This should be called before importing the following cpp-runtime modules
 
-from ..bindings.executor import CapacitySchedulerPolicy
 from ..builder import BuildConfig, Engine, EngineConfig, build
 from ..executor import GenerationExecutor, GenerationResult
 
@@ -252,6 +251,9 @@ class LLM:
                  tokenizer: Optional[TokenizerBase] = None,
                  dtype: str = 'auto',
                  kv_cache_config: Optional[KvCacheConfig] = None,
+                 logits_post_processor_map: Optional[Dict[str, Callable[
+                     [int, torch.Tensor, List[List[int]], int], None]]] = None,
+                 decoding_config: Optional[DecodingConfig] = None,
                  streaming_llm: Union[bool, StreamingLLMParam] = False,
                  async_engine_tmp_dir: Optional[str] = None,
                  **_additional_options: Any):
@@ -267,6 +269,10 @@ class LLM:
                 (2) implicitly specify `auto` (default), then `dtype` will be automatically inferred from the source model. However, if the source `dtype` is `float32`, will use `float16` instead.
             kv_cache_config (KvCacheConfig):
                 The config for the paged KV cache.
+            logits_post_processor_map (Dict[str, Callable[[int, torch.Tensor, List[List[int]], int], None]]):
+                Optional, a map of logits post processor functions.
+            decoding_config (DecodingConfig):
+                Optional, the config for speculative decoding.
             streaming_llm (bool, StreamingLLMParam):
                 Whether to enable the streaming LLM mode.
             async_engine_tmp_dir (str):
@@ -289,6 +295,8 @@ class LLM:
                 'SHARDING_ALONG_HIDDEN' means parallelism enabled with lookup table weight sharded along the hidden dimension.
             share_embedding_table (bool):
                 Whether to share the weight between token embedding lookup table and lm_head.
+            peft_cache_config (PeftCacheConfig)
+                The configuration for the peft cache.
         '''
 
         self.config = config
@@ -297,6 +305,8 @@ class LLM:
         self.dtype = dtype
         self.async_engine_tmp_dir = async_engine_tmp_dir
         self.kv_cache_config = kv_cache_config
+        self.logits_post_processor_map = logits_post_processor_map
+        self.decoding_config = decoding_config
         # TODO[chunweiy]: add doc for enable_streaming_llm
         self.enable_streaming_llm = streaming_llm
         if self.enable_streaming_llm is True:
@@ -317,6 +327,8 @@ class LLM:
             CapacitySchedulerPolicy.GUARANTEED_NO_EVICT)
         self.context_chunking_policy = _additional_options.pop(
             'context_chunking_policy', None)
+        self.peft_cache_config = _additional_options.pop(
+            'peft_cache_config', None)
 
         self._convert_checkpoint_options = {}
         # TODO: Move these options to ParallelConfig
@@ -428,6 +440,7 @@ class LLM:
                                                       True)
 
         self._build_model()
+        exception_handler.register(self)
 
     def generate(
         self,
@@ -514,11 +527,10 @@ class LLM:
                 # TODO(enweiz): move tokenizer from GenerationExecutor to LLM and validate on token ids here
                 prompt_len = len(prompt.split())
 
-            if prompt_len + sp.max_new_tokens > build_config.max_input_len + build_config.max_output_len:
+            if prompt_len + sp.max_new_tokens > build_config.max_seq_len:
                 raise ValueError(
                     f"The sum of prompt length ({prompt_len}) and max_new_tokens ({sp.max_new_tokens}) should not exceed "
-                    f"the sum of max_input_len ({build_config.max_input_len}) and max_output_len ({build_config.max_output_len})"
-                )
+                    f"max_seq_len ({build_config.max_seq_len})")
             if sp.beam_width > build_config.max_beam_width:
                 raise ValueError(
                     f"sampling_params's beam_width ({sp.beam_width}) should not exceed max_beam_width ({build_config.max_beam_width})"
@@ -641,9 +653,19 @@ class LLM:
         if not isinstance(tokenizer, TokenizerBase):
             tokenizer = ModelLoader.load_hf_tokenizer(self.config.model_dir)
 
-        executor_config = tllm.TrtGptModelOptionalParams()
+        executor_config = tllm.ExecutorConfig(
+            max_beam_width=self.config.build_config.max_beam_width,
+            scheduler_config=tllm.SchedulerConfig(
+                self.capacity_scheduling_policy, self.context_chunking_policy),
+            batching_type=tllm.BatchingType.INFLIGHT)
         if self.kv_cache_config is not None:
             executor_config.kv_cache_config = self.kv_cache_config
+        if self.peft_cache_config is not None:
+            executor_config.peft_cache_config = self.peft_cache_config
+        if self.decoding_config is not None:
+            executor_config.decoding_config = self.decoding_config
+        if self.logits_post_processor_map is not None:
+            executor_config.logits_post_processor_map = self.logits_post_processor_map
         executor_config.normalize_log_probs = self.normalize_log_probs
         executor_config.enable_chunked_context = self.enable_chunked_context
         executor_config.max_beam_width = self.config.build_config.max_beam_width
@@ -652,11 +674,8 @@ class LLM:
             get_engine_dir(),
             tokenizer,
             executor_config=executor_config,
-            scheduler_config=tllm.executor.SchedulerConfig(
-                self.capacity_scheduling_policy, self.context_chunking_policy),
             model_world_size=self.config.parallel_config.world_size,
             mpi_session=self.mpi_session,
-            executor_type=tllm.TrtGptModelType.InflightFusedBatching,
             reuse_mpi_comm=external_mpi_comm_available(
                 self.config.parallel_config.world_size))
 

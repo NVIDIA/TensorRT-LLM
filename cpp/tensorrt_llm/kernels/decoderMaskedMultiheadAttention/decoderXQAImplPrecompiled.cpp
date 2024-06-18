@@ -213,14 +213,7 @@ public:
         // Use mTileSize = 16 kernels when qSeqLen <= 16.
         unsigned int qSeqLen = static_cast<unsigned int>(xqaParams.generation_input_length);
         unsigned int mTileSize = qSeqLen <= 16 ? 16 : 32;
-        // MultiQueryToken kernels can support any num_q_heads_over_kv that is power of 2.
-        unsigned int kernel_num_q_heads_over_kv = xqaParams.multi_query_tokens ? 0 : num_q_heads_over_kv;
-        // MultiQueryToken kernels can handle either 16/32 for M direction per CTA.
-        unsigned int kernel_m_tilesize = xqaParams.multi_query_tokens ? mTileSize : num_q_heads_over_kv;
-        XQAKernelRuntimeHashKey hash_key{xqaParams.kv_cache_data_type, head_size, beam_width,
-            kernel_num_q_heads_over_kv, kernel_m_tilesize,
-            xqaParams.paged_kv_cache ? static_cast<unsigned int>(xqaParams.tokens_per_block) : 0,
-            xqaParams.paged_kv_cache, xqaParams.multi_query_tokens};
+        XQAKernelRuntimeHashKey hash_key = getRuntimeHashKeyFromXQAParams(xqaParams);
         auto const findIter = mFunctions.find(hash_key);
 
         TLLM_CHECK_WITH_INFO(findIter != mFunctions.end(), "XQAKernelFunc not found.");
@@ -308,28 +301,6 @@ public:
                 stream);
             sync_check_cuda_error();
         }
-    }
-
-private:
-    static uint32_t getElemBytes(CUtensorMapDataType_enum dataType)
-    {
-        switch (dataType)
-        {
-        case CU_TENSOR_MAP_DATA_TYPE_UINT8: return 1;
-        case CU_TENSOR_MAP_DATA_TYPE_UINT16: return 2;
-        case CU_TENSOR_MAP_DATA_TYPE_UINT32: return 4;
-        case CU_TENSOR_MAP_DATA_TYPE_INT32: return 4;
-        case CU_TENSOR_MAP_DATA_TYPE_UINT64: return 8;
-        case CU_TENSOR_MAP_DATA_TYPE_INT64: return 8;
-        case CU_TENSOR_MAP_DATA_TYPE_FLOAT16: return 2;
-        case CU_TENSOR_MAP_DATA_TYPE_FLOAT32: return 4;
-        case CU_TENSOR_MAP_DATA_TYPE_FLOAT64: return 8;
-        case CU_TENSOR_MAP_DATA_TYPE_BFLOAT16: return 2;
-        case CU_TENSOR_MAP_DATA_TYPE_FLOAT32_FTZ: return 4;
-        case CU_TENSOR_MAP_DATA_TYPE_TFLOAT32: return 4;
-        case CU_TENSOR_MAP_DATA_TYPE_TFLOAT32_FTZ: return 4;
-        }
-        throw std::runtime_error("unsupported data type");
     }
 
 protected:

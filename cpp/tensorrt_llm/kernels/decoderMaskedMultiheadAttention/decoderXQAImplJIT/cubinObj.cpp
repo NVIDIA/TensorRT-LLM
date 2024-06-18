@@ -29,7 +29,7 @@ namespace jit
 {
 
 CubinObj::CubinObj(void const* buffer_, size_t buffer_size)
-    : mDriver(tensorrt_llm::common::CUDADriverWrapper::getInstance())
+    : mInitialized(false)
 {
     uint8_t const* buffer = static_cast<uint8_t const*>(buffer_);
     size_t remaining_buffer_size = buffer_size;
@@ -37,8 +37,37 @@ CubinObj::CubinObj(void const* buffer_, size_t buffer_size)
     mContent.resize(len);
     TLLM_CHECK(len <= remaining_buffer_size);
     memcpy(mContent.data(), buffer, len);
+}
 
-    initialize(mContent.c_str(), "kernel_mha");
+CubinObj::CubinObj(std::string const& content)
+    : mContent(content)
+    , mInitialized(false)
+{
+}
+
+CubinObj::CubinObj(CubinObj const& other)
+{
+    // Only uninitialized CubinObj can be copy-constructed.
+    TLLM_CHECK(!other.mInitialized);
+
+    this->mContent = other.mContent;
+    this->mInitialized = false;
+}
+
+CubinObj& CubinObj::operator=(CubinObj const& other)
+{
+    if (this == &other)
+    {
+        return *this;
+    }
+
+    // Only uninitialized CubinObj can be copy-assigned.
+    TLLM_CHECK(!other.mInitialized);
+
+    this->mContent = other.mContent;
+    this->mInitialized = false;
+
+    return *this;
 }
 
 size_t CubinObj::getSerializationSize() const noexcept
@@ -59,47 +88,45 @@ void CubinObj::serialize(void* buffer_, size_t buffer_size) const noexcept
     memcpy(buffer, mContent.c_str(), len);
 }
 
-CubinObj::CubinObj(std::string const& content)
-    : mDriver(tensorrt_llm::common::CUDADriverWrapper::getInstance())
-    , mContent(content)
-    , mModule(nullptr)
-    , mFunction(nullptr)
-    , mSharedMemBytes(0)
-{
-    initialize(mContent.c_str(), "kernel_mha");
-}
-
 void CubinObj::launch(dim3 gridDim, dim3 blockDim, CUstream hStream, void** kernelParams)
 {
+    TLLM_CHECK(mInitialized);
     cuErrCheck(mDriver->cuLaunchKernel(mFunction, gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z,
                    mSharedMemBytes, hStream, kernelParams, /*extra=*/nullptr),
         mDriver);
 }
 
-void CubinObj::initialize(char const* content, char const* funcName)
+void CubinObj::initialize()
 {
-    cuErrCheck(mDriver->cuModuleLoadData(&mModule, content), mDriver);
-    TLLM_CHECK(mModule != nullptr);
-    cuErrCheck(mDriver->cuModuleGetFunction(&mFunction, mModule, funcName), mDriver);
-    TLLM_CHECK(mFunction != nullptr);
-
-    // Populate mSharedMemBytes.
-    CUdeviceptr shmem_dev_ptr = 0;
-    cuErrCheck(mDriver->cuModuleGetGlobal(&shmem_dev_ptr, nullptr, mModule, "smemSize"), mDriver);
-    TLLM_CHECK(shmem_dev_ptr != 0);
-    cuErrCheck(mDriver->cuMemcpyDtoH(&mSharedMemBytes, shmem_dev_ptr, sizeof(unsigned int)), mDriver);
-
-    TLLM_CHECK(mSharedMemBytes > 0);
-
-    /* Set 46KB threshold here because we have to take static/driver shared memory into consideration. */
-    if (mSharedMemBytes >= 46 * 1024)
+    if (!mInitialized)
     {
-        cuErrCheck(
-            mDriver->cuFuncSetAttribute(mFunction, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, mSharedMemBytes),
-            mDriver);
-    }
+        mDriver = tensorrt_llm::common::CUDADriverWrapper::getInstance();
+        mModule = nullptr;
+        cuErrCheck(mDriver->cuModuleLoadData(&mModule, mContent.c_str()), mDriver);
+        TLLM_CHECK(mModule != nullptr);
+        mFunction = nullptr;
+        cuErrCheck(mDriver->cuModuleGetFunction(&mFunction, mModule, kFuncName), mDriver);
+        TLLM_CHECK(mFunction != nullptr);
 
-    sync_check_cuda_error();
+        // Populate mSharedMemBytes.
+        CUdeviceptr shmem_dev_ptr = 0;
+        cuErrCheck(mDriver->cuModuleGetGlobal(&shmem_dev_ptr, nullptr, mModule, kSmemName), mDriver);
+        TLLM_CHECK(shmem_dev_ptr != 0);
+        cuErrCheck(mDriver->cuMemcpyDtoH(&mSharedMemBytes, shmem_dev_ptr, sizeof(unsigned int)), mDriver);
+
+        TLLM_CHECK(mSharedMemBytes > 0);
+
+        /* Set 46KB threshold here because we have to take static/driver shared memory into consideration. */
+        if (mSharedMemBytes >= 46 * 1024)
+        {
+            cuErrCheck(mDriver->cuFuncSetAttribute(
+                           mFunction, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, mSharedMemBytes),
+                mDriver);
+        }
+
+        sync_check_cuda_error();
+        mInitialized = true;
+    }
 }
 
 } // namespace jit

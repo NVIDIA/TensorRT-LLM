@@ -59,7 +59,6 @@ def parse_arguments():
                         type=str,
                         default='tllm_checkpoint',
                         help='The path to save the TensorRT-LLM checkpoint')
-
     parser.add_argument(
         '--workers',
         type=int,
@@ -85,6 +84,7 @@ if __name__ == '__main__':
     supported_model = {
         'PhiForCausalLM': PhiForCausalLM,
         'Phi3ForCausalLM': Phi3ForCausalLM,
+        'Phi3VForCausalLM': Phi3ForCausalLM,
         'Phi3SmallForCausalLM': Phi3SmallForCausalLM
     }
     modelForCausalLM = None

@@ -32,10 +32,6 @@ def test_llm_fp8_quantization():
     config = ModelConfig(llama_model_path)
     config.quant_config.quant_algo = QuantAlgo.FP8
     config.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
-    config.quant_config.exclude_modules = [
-        'lm_head', 'router', 'vocab_embedding', 'position_embedding',
-        'block_embedding'
-    ]
 
     assert config.quant_config.quant_mode.has_any_quant()
 

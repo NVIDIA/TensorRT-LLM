@@ -17,16 +17,10 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/tensor.h"
-#include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/layers/baseLayer.h"
-#include "tensorrt_llm/layers/samplingParams.h"
 #include "tensorrt_llm/runtime/common.h"
-namespace tc = tensorrt_llm::common;
 
-namespace tensorrt_llm
-{
-namespace layers
+namespace tensorrt_llm::layers
 {
 
 //! \brief Layer to randomly sample tokens from TopP logits.
@@ -43,10 +37,11 @@ public:
     ~TopPSamplingLayer();
 
     void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 const* batchSlots,
-        std::shared_ptr<BaseSetupParams> setupParams) override;
-    void forwardAsync(std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs) override;
+        std::shared_ptr<BaseSetupParams> const& setupParams) override;
+    void forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& outputs,
+        std::shared_ptr<BaseDecodingInputs> const& inputs) override;
 
-    bool const* getSkipDecodeHost() const
+    [[nodiscard]] bool const* getSkipDecodeHost() const
     {
         return mSkipDecodeHost;
     }
@@ -82,5 +77,4 @@ private:
     void freeBuffer();
 };
 
-} // namespace layers
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::layers

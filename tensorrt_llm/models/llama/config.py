@@ -49,8 +49,6 @@ class LLaMAConfig(PretrainedConfig):
             moe = MoeConfig(
                 num_experts=kwargs.pop('moe_num_experts', 0),
                 top_k=kwargs.pop('moe_top_k', 0),
-                tp_mode=kwargs.pop('moe_tp_mode',
-                                   MoeConfig.ParallelismMode.TENSOR_PARALLEL),
                 normalization_mode=kwargs.pop(
                     'moe_normalization_mode',
                     MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE))
@@ -128,11 +126,8 @@ class LLaMAConfig(PretrainedConfig):
             moe_normalization_mode = None
         moe_num_experts = getattr(hf_config, "num_local_experts", 0)
         moe_top_k = getattr(hf_config, "num_experts_per_tok", 0)
-        moe_tp_mode = kwargs.pop('moe_tp_mode',
-                                 MoeConfig.ParallelismMode.TENSOR_PARALLEL)
         moe_config = MoeConfig(num_experts=moe_num_experts,
                                top_k=moe_top_k,
-                               tp_mode=moe_tp_mode,
                                normalization_mode=moe_normalization_mode)
         moe_config.validate()
 

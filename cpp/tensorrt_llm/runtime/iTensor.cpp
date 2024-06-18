@@ -37,17 +37,28 @@ ITensor::UniquePtr ITensor::slice(SharedPtr tensor, std::size_t offset, std::siz
 ITensor::UniquePtr ITensor::slice(SharedPtr tensor, Shape const& offsetDims, ITensor::DimType64 size)
 {
     auto shape = tensor->getShape();
-    TLLM_CHECK(offsetDims.nbDims > 0);
+    TLLM_CHECK(offsetDims.nbDims >= 0);
     TLLM_CHECK(shape.nbDims >= offsetDims.nbDims);
+    TLLM_CHECK(size >= 0);
 
     Shape strides = ITensor::strides(shape);
     DimType64 offset{0};
-    for (SizeType32 di = 0; di < offsetDims.nbDims; di++)
+    for (SizeType32 di = 0; di < offsetDims.nbDims - 1; di++)
     {
         TLLM_CHECK(0 <= offsetDims.d[di] && offsetDims.d[di] < shape.d[di]);
         offset += offsetDims.d[di] * strides.d[di];
     }
-    TLLM_CHECK(offsetDims.d[offsetDims.nbDims - 1] + size <= shape.d[offsetDims.nbDims - 1]);
+
+    if (TLLM_LIKELY(offsetDims.nbDims > 0))
+    {
+        TLLM_CHECK(offsetDims.d[offsetDims.nbDims - 1] + size <= shape.d[offsetDims.nbDims - 1]);
+        offset += offsetDims.d[offsetDims.nbDims - 1] * strides.d[offsetDims.nbDims - 1];
+    }
+    else
+    {
+        TLLM_CHECK(size >= 0 && size <= 1);
+        TLLM_CHECK(shape.nbDims == 0 ? size == 0 : true);
+    }
 
     Shape dims;
     dims.nbDims = shape.nbDims - offsetDims.nbDims + 1;

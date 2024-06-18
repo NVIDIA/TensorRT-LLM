@@ -185,6 +185,15 @@ def parse_arguments():
         ('If this option is specified, it will override the max output len of '
          'TRT engines to the specified value instead of using pre-defined one'))
     parser.add_argument(
+        '--max_seq_len',
+        '--max_decoder_seq_len',
+        dest='max_seq_len',
+        type=int,
+        default=None,
+        help=
+        ('If this option is specified, it will override the max sequence len of '
+         'TRT engines to the specified value instead of using pre-defined one'))
+    parser.add_argument(
         '--max_batch_size',
         type=int,
         default=None,
@@ -350,6 +359,21 @@ def main(args):
     else:
         rank = tensorrt_llm.mpi_rank()
         world_size = tensorrt_llm.mpi_world_size()
+
+    if args.max_output_len:
+        logger.warning(
+            '--max_output_len has been deprecated in favor of --max_seq_len')
+        if args.max_input_len:
+            if args.max_seq_len:
+                logger.warning(
+                    '--max_seq_len has been overwritten due to --max_output_len being specified'
+                )
+            args.max_seq_len = args.max_input_len + args.max_output_len
+        else:
+            raise Exception(
+                f"--max_output_len is specified but not --max_input_len")
+
+        del args.max_output_len
 
     # TODO: Re-enable memory monitor for multi-gpu benchmarks.
     # Current Mem Monitor will cause benchmark script hang

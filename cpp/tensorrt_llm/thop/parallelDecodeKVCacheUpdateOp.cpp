@@ -87,7 +87,7 @@ void updateKVCacheDraftTokenLocation(torch::Tensor seqAcceptedDraftTokenOffsetsT
             reinterpret_cast<tensorrt_llm::kernels::KVCacheIndex*>(
                 offsetArray.data_ptr<tensorrt_llm::kernels::KVCacheIndex::UnderlyingType>()),
             layerCount, seqCount, numKVHeads, headSizeInBytes, rewindDraftTokenCount, rewindDraftTokenTensorPtr,
-            nullptr, maxKVCacheLen, maxBlocksPerSeqOpt.value(), tokensPerBlockOpt.value(), stream);
+            nullptr, nullptr, maxKVCacheLen, maxBlocksPerSeqOpt.value(), tokensPerBlockOpt.value(), stream);
     }
     else
     {

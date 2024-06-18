@@ -82,7 +82,6 @@ class TestMistral(unittest.TestCase):
                 "moe": {
                     "num_experts": 0,
                     "top_k": 0,
-                    "tp_mode": 1,
                     "normalization_mode": 1,
                 },
                 'use_fused_mlp': False,
@@ -493,7 +492,6 @@ class TestMistral(unittest.TestCase):
             "moe": {
                 "num_experts": 0,
                 "top_k": 0,
-                "tp_mode": 1,
                 "normalization_mode": 1
             },
             'use_parallel_embedding': use_parallel_embedding,

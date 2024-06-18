@@ -20,7 +20,7 @@ The `Executor` class is responsible for receiving requests from the client, and 
 Users can alter the logits produced the network, by providing a map of named callbacks of the form:
 
 ```
-std::unordered_map<std::string, function<Tensor(IdType, Tensor&, BeamTokens const&, StreamPtr&)>>
+std::unordered_map<std::string, function<Tensor(IdType, Tensor&, BeamTokens const&, StreamPtr const&)>>
 ```
 to the `ExecutorConfig`. The map key is the name associated with that logits post-processing callback. Each request can then specify the name of the logits post-processor to use for that particular request, if any.
 
@@ -29,7 +29,16 @@ The first argument to the callback is the request id, second is the logits tenso
 Users *must* use the stream to access the logits tensor. For example, performing a addition with a bias tensor should be enqueued on that stream.
 Alternatively, users may call `stream->synchronize()`, however, that will slow down the entire execution pipeline.
 
-Note: this feature isn't supported with the `STATIC` batching type for the moment.
+We also provide a batched version that allows altering logits of multiple requests in a batch. This allows further optimizations and reduces callback overheads.
+
+```
+std::function<void(std::vector<IdType> const&, std::vector<Tensor>&, std::vector<std::reference_wrapper<BeamTokens const>> const&, StreamPtr const&)>
+```
+
+A single batched callback can be specified in `ExecutorConfig`. Each request can opt to apply this callback by specifying the name of the logits
+post-processor as `Request::kBatchedPostProcessorName`.
+
+Note: Both callback variants are not supported with the `STATIC` batching type for the moment.
 
 ### The Request Class
 
