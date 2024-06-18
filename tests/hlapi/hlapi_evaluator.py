@@ -49,7 +49,7 @@ def benchmark_main(model_path: str,
                    warmup: int = 100,
                    max_num_tokens=2048,
                    max_input_length: int = 200,
-                   max_output_length: int = 200,
+                   max_seq_length: int = 400,
                    max_batch_size: int = 128,
                    engine_output_dir: str = "",
                    cpp_executable: str = None,
@@ -83,7 +83,7 @@ def benchmark_main(model_path: str,
         build_config = config.build_config
         build_config.max_num_tokens = max_num_tokens
         build_config.max_input_len = max_input_length
-        build_config.max_output_len = max_output_length
+        build_config.max_seq_len = max_seq_length
         build_config.max_batch_size = max_batch_size
         config.parallel_config.tp_size = tp_size
 
@@ -149,7 +149,7 @@ def benchmark_main(model_path: str,
               default=1e8,
               help="Specify the first N cases to test")
 @click.option("--max-input-len", type=int, default=1024)
-@click.option("--max-output-len", type=int, default=1024)
+@click.option("--max-seq-len", type=int, default=2048)
 @click.option("--max-num-tokens", type=int, default=4096)
 @click.option("--tp-size", type=int, default=1)
 @click.option("--num-samples", type=int, default=200)
@@ -158,7 +158,7 @@ def grid_searcher_main(model_path,
                        reports_root,
                        prune_space_for_debug: int,
                        max_input_len: int,
-                       max_output_len: int,
+                       max_seq_len: int,
                        max_num_tokens: int,
                        tp_size: int = 1,
                        num_samples: int = 200):
@@ -169,8 +169,8 @@ def grid_searcher_main(model_path,
     model_config = ModelConfig(model_path)
     model_config.parallel_config.tp_size = tp_size
 
-    model_config._set_additional_options(max_output_len=max_input_len,
-                                         max_input_len=max_output_len,
+    model_config._set_additional_options(max_seq_len=max_seq_len,
+                                         max_input_len=max_input_len,
                                          max_num_tokens=max_num_tokens)
 
     grid_searcher.evaluate(

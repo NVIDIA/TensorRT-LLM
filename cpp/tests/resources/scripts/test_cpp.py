@@ -328,6 +328,13 @@ def prepare_multi_gpu_model_tests(python_exe: str,
                         model_cache_arg=model_cache_arg,
                         only_multi_gpu_arg=only_multi_gpu_arg)
 
+    prepare_model_tests(model_name="t5",
+                        python_exe=python_exe,
+                        root_dir=root_dir,
+                        resources_dir=resources_dir,
+                        model_cache_arg=model_cache_arg,
+                        only_multi_gpu_arg=['--tp', '4', '--pp', '1'])
+
 
 def prepare_model_tests(model_name: str,
                         python_exe: str,
@@ -360,7 +367,7 @@ def prepare_model_tests(model_name: str,
     ] + only_fp8_arg + only_multi_gpu_arg + enc_dec_model_name_arg
     if "enc_dec" in model_name:
         generate_expected_output += model_cache_arg
-    if only_multi_gpu_arg:
+    if only_multi_gpu_arg and model_name != 'enc_dec':
         generate_expected_output = [
             "mpirun", "-n", "4", "--allow-run-as-root", "--timeout", "600"
         ] + generate_expected_output
@@ -438,6 +445,10 @@ def run_single_gpu_tests(build_dir: _pl.Path,
         included_tests.append("RecurrentGemma")
     if run_encoder:
         included_tests.append("EncoderModelTestSingleGPU")
+    if run_bart:
+        included_tests.append("BartBasicTest/EncDecParamsTest.Forward*")
+    if run_t5:
+        included_tests.append("T5BasicTest/EncDecParamsTest.Forward*")
 
     excluded_tests = []
     if not run_fp8:
@@ -448,23 +459,6 @@ def run_single_gpu_tests(build_dir: _pl.Path,
         if excluded_tests:
             ctest.extend(["-E", "|".join(excluded_tests)])
         run_command(ctest, cwd=build_dir, env=cpp_env, timeout=timeout)
-
-    def run_enc_dec_test_with_env(model: str):
-        enc_dec_test_command = [
-            "tests/executor/executorTest",
-            "--gtest_filter=EncDecBasicTest/EncDecParamsTest.Forward*",
-            f"--gtest_output=xml:{str(build_dir)}/results-single-gpu-enc-dec.xml"
-        ]
-        run_command(enc_dec_test_command,
-                    cwd=build_dir,
-                    env={
-                        **cpp_env, 'ENC_DEC_MODEL': model
-                    })
-
-    if run_bart:
-        run_enc_dec_test_with_env('bart')
-    if run_t5:
-        run_enc_dec_test_with_env('t5')
 
 
 def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
@@ -508,6 +502,16 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
     trt_model_test = [
         "mpirun", "-n", "1", "--allow-run-as-root", "executor/executorTest",
         "--gtest_filter=*LlamaExecutorTest*OrchMode*:-*BW2*",
+        f"--gtest_output=xml:{xml_output_file}"
+    ]
+    run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
+
+    #EncDec test in leader mode
+    new_env = cpp_env
+    xml_output_file = build_dir / "results-multi-gpu-t5-exec-leader-mode.xml"
+    trt_model_test = [
+        "mpirun", "-n", "4", "--allow-run-as-root", "executor/executorTest",
+        "--gtest_filter=T5MultiGPUTest/EncDecParamsTest.Forward*",
         f"--gtest_output=xml:{xml_output_file}"
     ]
     run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)

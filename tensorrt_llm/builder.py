@@ -374,6 +374,8 @@ class Builder():
             mapping = builder_config.auto_parallel_config["mapping"]
             builder_config.tensor_parallel = mapping.tp_size
             builder_config.pipeline_parallel = mapping.pp_size
+            builder_config.moe_tensor_parallel = mapping.moe_tp_size
+            builder_config.moe_expert_parallel = mapping.moe_ep_size
         if builder_config.trt_builder_config.num_optimization_profiles == 0:
             self._add_optimization_profile(network, builder_config)
         engine = None
@@ -437,7 +439,7 @@ class Builder():
 @dataclass
 class BuildConfig:
     max_input_len: int = 256
-    max_output_len: int = 256
+    max_seq_len: int = 512
     opt_batch_size: int = 8
     max_batch_size: int = 8
     max_beam_width: int = 1
@@ -475,6 +477,7 @@ class BuildConfig:
             opt_num_tokens=self.opt_num_tokens,
             max_batch_size=self.max_batch_size,
             max_input_len=self.max_input_len,
+            max_seq_len=self.max_seq_len,
             max_beam_width=self.max_beam_width,
             remove_input_padding=self.plugin_config.remove_input_padding,
             enable_context_fmha=self.plugin_config.context_fmha,
@@ -486,7 +489,7 @@ class BuildConfig:
     @classmethod
     def from_dict(cls, config, plugin_config=None):
         max_input_len = config.pop('max_input_len')
-        max_output_len = config.pop('max_output_len')
+        max_seq_len = config.pop('max_seq_len')
         max_batch_size = config.pop('max_batch_size')
         max_beam_width = config.pop('max_beam_width')
         max_num_tokens = config.pop('max_num_tokens')
@@ -526,7 +529,7 @@ class BuildConfig:
 
         return cls(
             max_input_len=max_input_len,
-            max_output_len=max_output_len,
+            max_seq_len=max_seq_len,
             max_batch_size=max_batch_size,
             max_beam_width=max_beam_width,
             max_num_tokens=max_num_tokens,
@@ -678,66 +681,8 @@ def get_engine_version(engine_dir: str) -> Union[None, str]:
     return config['version']
 
 
-def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
-    '''Build engine from given model and optimization options specified in the build_config
-       WARNING: this function may change the given \p model object state in some optimization passes
-       to avoid cloning a model since normally the LLM models consumes large memory.
-       Create a new fresh model object if you need to build with different options.
-
-    '''
-    # avoid changing the input config
-    build_config = copy.deepcopy(build_config)
-    build_config.plugin_config.dtype = model.config.dtype
-
-    if model.config.quantization.quant_algo == QuantAlgo.FP8 or \
-            model.config.quantization.kv_cache_quant_algo == QuantAlgo.FP8:
-        build_config.strongly_typed = True
-
-    if hasattr(model.config, 'max_draft_len'):
-        build_config.max_draft_len = model.config.max_draft_len
-        if build_config.speculative_decoding_mode != SpeculativeDecodingMode.MEDUSA:
-            logger.warning(
-                'speculative_decoding_mode is not Medusa for Medusa model. Overwriting speculative_decoding_mode'
-            )
-        build_config.speculative_decoding_mode = SpeculativeDecodingMode.MEDUSA
-
-    if build_config.speculative_decoding_mode != SpeculativeDecodingMode.NONE:
-        logger.info(
-            f'Increasing max_output_len ({build_config.max_output_len}) '
-            f'by max_draft_len ({build_config.max_draft_len}) '
-            'to account for speculative decoding implementation specifics. '
-            'Maximum number of generated tokens remains the same. '
-            f'New max_output_len is set to {build_config.max_output_len + build_config.max_draft_len}'
-        )
-        build_config.max_output_len += build_config.max_draft_len
-
-    if build_config.speculative_decoding_mode != SpeculativeDecodingMode.NONE:
-        num_tokens = build_config.max_batch_size * (build_config.max_draft_len +
-                                                    1)
-        if build_config.max_num_tokens < num_tokens:
-            logger.info(
-                f'max_num_tokens ({build_config.max_num_tokens}) is smaller than '
-                'max_batch_size * (max_draft_len + 1) = '
-                f'({build_config.max_batch_size} * ({build_config.max_draft_len} + 1)). '
-                f'New max_num_tokens is set to {num_tokens}.')
-            build_config.max_num_tokens = num_tokens
-
-    if build_config.plugin_config.use_paged_context_fmha:
-        if (model.config.quant_mode.has_fp8_kv_cache()
-                and not model.config.quant_mode.has_fp8_qdq()):
-            raise RuntimeError(
-                "FP8 Paged Context FMHA only works with fp8 quantization workflow currently."
-            )
-        if (model.config.quant_mode.has_fp8_kv_cache()
-                and not build_config.plugin_config.use_fp8_context_fmha):
-            build_config.plugin_config.use_fp8_context_fmha = True
-            logger.warning(
-                "FP8 Context FMHA is enabled by default to support FP8 Paged Context FMHA."
-            )
-        if model.config.quant_mode.has_int8_kv_cache():
-            raise RuntimeError(
-                "Paged Context FMHA doesn't work with int8 kv cache currently.")
-
+def optimize_model_with_config(model: PretrainedModel,
+                               build_config: BuildConfig):
     use_auto_parallel = build_config.auto_parallel_config.enabled
     gemm_swiglu_plugin = build_config.plugin_config.gemm_swiglu_plugin
     if gemm_swiglu_plugin:
@@ -772,6 +717,70 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
 
     if is_enc_dec:
         model.precompute_relative_attention_bias(build_config)
+    return model
+
+
+def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
+    '''Build engine from given model and optimization options specified in the build_config
+       WARNING: this function may change the given \p model object state in some optimization passes
+       to avoid cloning a model since normally the LLM models consumes large memory.
+       Create a new fresh model object if you need to build with different options.
+
+    '''
+    # avoid changing the input config
+    build_config = copy.deepcopy(build_config)
+    build_config.plugin_config.dtype = model.config.dtype
+
+    if model.config.quantization.quant_algo == QuantAlgo.FP8 or \
+            model.config.quantization.kv_cache_quant_algo == QuantAlgo.FP8:
+        build_config.strongly_typed = True
+
+    if hasattr(model.config, 'max_draft_len'):
+        build_config.max_draft_len = model.config.max_draft_len
+        if build_config.speculative_decoding_mode != SpeculativeDecodingMode.MEDUSA:
+            logger.warning(
+                'speculative_decoding_mode is not Medusa for Medusa model. Overwriting speculative_decoding_mode'
+            )
+        build_config.speculative_decoding_mode = SpeculativeDecodingMode.MEDUSA
+
+    if build_config.speculative_decoding_mode != SpeculativeDecodingMode.NONE:
+        logger.info(
+            f'Increasing max_seq_len ({build_config.max_seq_len}) '
+            f'by max_draft_len ({build_config.max_draft_len}) '
+            'to account for speculative decoding implementation specifics. '
+            'Maximum number of generated tokens remains the same. '
+            f'New max_seq_len is set to {build_config.max_seq_len + build_config.max_draft_len}'
+        )
+        build_config.max_seq_len += build_config.max_draft_len
+
+    if build_config.speculative_decoding_mode != SpeculativeDecodingMode.NONE:
+        num_tokens = build_config.max_batch_size * (build_config.max_draft_len +
+                                                    1)
+        if build_config.max_num_tokens < num_tokens:
+            logger.info(
+                f'max_num_tokens ({build_config.max_num_tokens}) is smaller than '
+                'max_batch_size * (max_draft_len + 1) = '
+                f'({build_config.max_batch_size} * ({build_config.max_draft_len} + 1)). '
+                f'New max_num_tokens is set to {num_tokens}.')
+            build_config.max_num_tokens = num_tokens
+
+    if build_config.plugin_config.use_paged_context_fmha:
+        if (model.config.quant_mode.has_fp8_kv_cache()
+                and not model.config.quant_mode.has_fp8_qdq()):
+            raise RuntimeError(
+                "FP8 Paged Context FMHA only works with fp8 quantization workflow currently."
+            )
+        if (model.config.quant_mode.has_fp8_kv_cache()
+                and not build_config.plugin_config.use_fp8_context_fmha):
+            build_config.plugin_config.use_fp8_context_fmha = True
+            logger.warning(
+                "FP8 Context FMHA is enabled by default to support FP8 Paged Context FMHA."
+            )
+        if model.config.quant_mode.has_int8_kv_cache():
+            raise RuntimeError(
+                "Paged Context FMHA doesn't work with int8 kv cache currently.")
+
+    model = optimize_model_with_config(model, build_config)
 
     builder = Builder()
     builder_config = builder.create_builder_config(
@@ -793,6 +802,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
     network = builder.create_network()
     network.plugin_config = build_config.plugin_config
 
+    use_auto_parallel = build_config.auto_parallel_config.enabled
     use_weight_only = model.config.quant_mode.is_weight_only()
     per_group = model.config.quant_mode.has_per_group_scaling()
     use_smooth_quant = model.config.quant_mode.has_act_and_weight_quant()
@@ -821,7 +831,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
             "max_input_len":
             build_config.max_input_len,
             "max_seq_len":
-            build_config.max_input_len + build_config.max_output_len,
+            build_config.max_seq_len,
             "use_cache":
             True,
             "max_beam_width":
@@ -846,7 +856,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
         }
 
         if model.config.architecture == "DecoderModel":
-            prepare_input_args["max_seq_len"] = build_config.max_output_len
+            prepare_input_args["max_seq_len"] = build_config.max_seq_len
             prepare_input_args[
                 "max_decoder_input_len"] = build_config.max_input_len
             prepare_input_args[

@@ -28,8 +28,6 @@
 #include "tensorrt_llm/pybind/batch_manager/llmRequest.h"
 #include "tensorrt_llm/pybind/batch_manager/namedTensor.h"
 #include "tensorrt_llm/pybind/executor/bindings.h"
-#include "tensorrt_llm/pybind/runtime/generationInput.h"
-#include "tensorrt_llm/pybind/runtime/generationOutput.h"
 #include "tensorrt_llm/pybind/utils/pathCaster.h"
 
 #include "tensorrt_llm/batch_manager/BatchManager.h"
@@ -39,7 +37,6 @@
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
-#include "tensorrt_llm/runtime/gptSession.h"
 #include "tensorrt_llm/runtime/memoryCounters.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
 
@@ -49,8 +46,6 @@ namespace tbk = tensorrt_llm::batch_manager::kv_cache_manager;
 namespace tpb = tensorrt_llm::pybind::batch_manager;
 namespace tc = tensorrt_llm::common;
 namespace tr = tensorrt_llm::runtime;
-namespace texec = tensorrt_llm::executor;
-namespace tpr = tensorrt_llm::pybind::runtime;
 using SizeType32 = tr::SizeType32;
 using TokenIdType = tr::TokenIdType;
 template <typename T>
@@ -67,10 +62,6 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
     // Create submodule for executor bindings.
     py::module_ executor_submodule = m.def_submodule("executor", "Executor bindings");
     tensorrt_llm::pybind::executor::InitBindings(executor_submodule);
-
-    tpr::PromptTuningParams::initBindings(m);
-    tpr::GenerationInput::initBindings(m);
-    tpr::GenerationOutput::initBindings(m);
 
     auto buildInfo = m.def_submodule("BuildInfo");
     buildInfo.attr("ENABLE_MULTI_DEVICE") = py::int_(ENABLE_MULTI_DEVICE);
@@ -119,19 +110,6 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_readwrite("max_pages_per_block_device", &tb::PeftCacheManagerConfig::maxPagesPerBlockDevice)
         .def_readwrite("device_cache_percent", &tb::PeftCacheManagerConfig::deviceCachePercent)
         .def_readwrite("host_cache_size", &tb::PeftCacheManagerConfig::hostCacheSize);
-
-    py::class_<tr::GptSession::Config>(m, "GptSessionConfig")
-        .def(py::init<SizeType32, SizeType32, SizeType32, float>(), py::arg("max_batch_size"),
-            py::arg("max_beam_width"), py::arg("max_sequence_length"), py::arg("gpu_weights_percent") = 1.0)
-        .def_readwrite("max_batch_size", &tr::GptSession::Config::maxBatchSize)
-        .def_readwrite("max_beam_width", &tr::GptSession::Config::maxBeamWidth)
-        .def_readwrite("max_sequence_length", &tr::GptSession::Config::maxSequenceLength)
-        .def_readwrite("gpu_weights_percent", &tr::GptSession::Config::gpuWeightsPercent)
-        .def_readwrite("decoder_per_request", &tr::GptSession::Config::decoderPerRequest)
-        .def_readwrite("cuda_graph_mode", &tr::GptSession::Config::cudaGraphMode)
-        .def_readwrite("ctx_micro_batch_size", &tr::GptSession::Config::ctxMicroBatchSize)
-        .def_readwrite("gen_micro_batch_size", &tr::GptSession::Config::genMicroBatchSize)
-        .def_readwrite("kv_cache_config", &tr::GptSession::Config::kvCacheConfig);
 
     py::enum_<nvinfer1::DataType>(m, "DataType")
         .value("FLOAT", nvinfer1::DataType::kFLOAT)
@@ -331,38 +309,6 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def("engine_filename",
             py::overload_cast<tr::WorldConfig const&>(&tr::GptJsonConfig::engineFilename, py::const_),
             py::arg("world_config"));
-
-    py::class_<tr::GptSession>(m, "GptSession")
-        .def(py::init(
-                 [](tr::GptSession::Config const& config, tr::ModelConfig const& modelConfig,
-                     tr::WorldConfig const& worldConfig, py::bytearray const& bytes)
-                 {
-                     PyErr_WarnEx(
-                         PyExc_DeprecationWarning, "GptSession is deprecated use the executor API instead.", 1);
-
-                     auto buf = static_cast<std::string>(bytes);
-                     return tr::GptSession{config, modelConfig, worldConfig, buf.data(), buf.size()};
-                 }),
-            py::arg("config"), py::arg("model_config"), py::arg("world_config"), py::arg("engine_buffer"))
-        .def(py::init(
-                 [](tr::GptSession::Config const& config, tr::ModelConfig const& modelConfig,
-                     tr::WorldConfig const& worldConfig, std::string const& engineFile)
-                 {
-                     PyErr_WarnEx(
-                         PyExc_DeprecationWarning, "GptSession is deprecated use the executor API instead.", 1);
-
-                     return tr::GptSession{config, modelConfig, worldConfig, engineFile};
-                 }),
-            py::arg("config"), py::arg("model_config"), py::arg("world_config"), py::arg("engine_file"))
-        .def_property_readonly("model_config", &tr::GptSession::getModelConfig)
-        .def_property_readonly("world_config", &tr::GptSession::getWorldConfig)
-        .def_property_readonly("device", &tr::GptSession::getDevice)
-        .def(
-            "generate",
-            [](tr::GptSession& self, tpr::GenerationOutput& outputs, tpr::GenerationInput const& inputs,
-                tr::SamplingConfig const& samplingConfig)
-            { self.generate(*outputs.toTrtLlm(), *inputs.toTrtLlm(), samplingConfig); },
-            py::arg("outputs"), py::arg("inputs"), py::arg("sampling_config"));
 
     py::enum_<tb::LlmRequestState_t>(m, "LlmRequestState")
         .value("REQUEST_STATE_UNKNOWN", tb::LlmRequestState_t::REQUEST_STATE_UNKNOWN)

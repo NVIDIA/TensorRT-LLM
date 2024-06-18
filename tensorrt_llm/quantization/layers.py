@@ -20,12 +20,12 @@ import tensorrt as trt
 
 from .._common import default_net, precision
 from .._utils import fp32_array, is_same_dtype
-from ..functional import (ACT2FN, AllReduceFusionOp, AttentionMaskType,
-                          PositionEmbeddingType, RopeEmbeddingUtils,
-                          RotaryScalingType, Tensor, allgather, allreduce, cast,
-                          concat, constant, embedding, generate_alibi_slopes,
-                          gpt_attention, matmul, mul, shape, slice, softmax,
-                          split, where)
+from ..functional import (ACT2FN, AllReduceFusionOp, AllReduceFusionParams,
+                          AttentionMaskType, PositionEmbeddingType,
+                          RopeEmbeddingUtils, RotaryScalingType, Tensor,
+                          allgather, allreduce, cast, concat, constant,
+                          embedding, generate_alibi_slopes, gpt_attention,
+                          matmul, mul, shape, slice, softmax, split, where)
 from ..layers import SpecDecodingParams
 from ..layers.embedding import Embedding
 from ..layers.linear import Linear, RowLinear
@@ -1211,7 +1211,7 @@ class SmoothQuantAttention(Module):
         position_embedding=None,
         norm_before_bmm1=False,
         lora_layer_params=None,
-        reduce_fusion_params=None,
+        reduce_fusion_params: Optional[AllReduceFusionParams] = None,
     ):
         assert lora_layer_params is None, "lora is not supported on SmoothQuantAttention now"
         if default_net().plugin_config.smooth_quant_gemm_plugin:
@@ -1400,7 +1400,10 @@ class SmoothQuantAttention(Module):
                 # quantized tensor and scaling factors per token
                 context = quantize_per_token(context)
 
-        context = self.dense(context, reduce_fusion_params=reduce_fusion_params)
+        context = self.dense(
+            context,
+            reduce_fusion_params=reduce_fusion_params,
+        )
 
         if use_cache:
             return (context, past_key_value)

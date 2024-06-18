@@ -77,10 +77,8 @@ struct XQADispatchHelper<__nv_bfloat16, KVBlockArray>
 class DecoderXQARunner
 {
 public:
-    // Resources for constructing a DecoderXQARunner object.
-    class Resource;
-    DecoderXQARunner(Resource* resource, const XQADataType data_type, int num_heads, int num_kv_heads, int head_size,
-        bool multi_block_mode);
+    DecoderXQARunner(
+        const XQADataType data_type, int num_heads, int num_kv_heads, int head_size, bool multi_block_mode);
     ~DecoderXQARunner();
 
     /**
@@ -169,6 +167,9 @@ public:
         this->run(xqa_params, kv_cache_buffer, stream);
     }
 
+    class Resource;
+    static Resource* getResourceGlobal();
+
 private:
     bool shouldUseImpl(XQAParams const& xqa_params, bool for_configure_plugin);
     void prepareForRun(XQAParams const& xqa_params);
@@ -177,8 +178,6 @@ private:
     void run(XQAParams const& xqa_params, KVCacheBuffer const& kv_cache_buffer, cudaStream_t const& stream);
 
     static constexpr int kMaxBeamWidth = 4;
-
-    Resource* mResource;
 
     XQADataType mDataType;
     int mNumHeads;
@@ -206,7 +205,17 @@ public:
     Resource(void const* buffer, size_t buffer_size);
     ~Resource() = default;
 
+    void merge(Resource const& other)
+    {
+        getCubinObjRegistry()->merge(*other.getCubinObjRegistry());
+    }
+
     jit::CubinObjRegistry* getCubinObjRegistry()
+    {
+        return mCubinObjRegistry.get();
+    }
+
+    jit::CubinObjRegistry const* getCubinObjRegistry() const
     {
         return mCubinObjRegistry.get();
     }

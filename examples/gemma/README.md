@@ -66,11 +66,10 @@ After getting checkpoint, we can use `trtllm-build` command to build TensorRT-LL
 ```bash
 ENGINE_PATH=/tmp/gemma/2B/bf16/1-gpu/
 trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
-             --gemm_plugin bfloat16 \
-             --gpt_attention_plugin bfloat16 \
+             --gemm_plugin auto \
              --max_batch_size 8 \
              --max_input_len 3000 \
-             --max_output_len 100 \
+             --max_seq_len 3100 \
              --lookup_plugin bfloat16 \
              --output_dir ${ENGINE_PATH}
 ```
@@ -162,11 +161,10 @@ python3 ./examples/gemma/convert_checkpoint.py \
     --output-model-dir ${UNIFIED_CKPT_PATH}
 
 trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
-             --gemm_plugin bfloat16 \
-             --gpt_attention_plugin bfloat16 \
+             --gemm_plugin auto \
              --max_batch_size 8 \
              --max_input_len 3000 \
-             --max_output_len 100 \
+             --max_seq_len 3100 \
              --output_dir ${ENGINE_PATH}
 
 python3 ../summarize.py --test_trt_llm \
@@ -212,11 +210,9 @@ python3 ./convert_checkpoint.py \
     --output-model-dir ${UNIFIED_CKPT_PATH}
 
 trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
-             --gemm_plugin bfloat16 \
-             --gpt_attention_plugin bfloat16 \
              --max_batch_size 8 \
              --max_input_len 3000 \
-             --max_output_len 100 \
+             --max_seq_len 3100 \
              --output_dir ${ENGINE_PATH}
 
 python3 ../summarize.py --test_trt_llm \
@@ -261,11 +257,10 @@ python3 ./convert_checkpoint.py \
     --output-model-dir ${UNIFIED_CKPT_PATH}
 
 trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
-             --gemm_plugin float16 \
-             --gpt_attention_plugin float16 \
+             --gemm_plugin auto \
              --max_batch_size 8 \
              --max_input_len 3000 \
-             --max_output_len 100 \
+             --max_seq_len 3100 \
              --enable_xqa enable \
              --lookup_plugin float16 \
              --output_dir ${ENGINE_PATH}
@@ -307,11 +302,10 @@ python3 ./convert_checkpoint.py \
     --output-model-dir ${UNIFIED_CKPT_PATH}
 
 trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
-                 --gemm_plugin bfloat16 \
-                 --gpt_attention_plugin bfloat16 \
+                 --gemm_plugin auto \
                  --max_batch_size 32 \
                  --max_input_len 3000 \
-                 --max_output_len 100 \
+                 --max_seq_len 3100 \
                  --enable_xqa enable \
                  --lookup_plugin bfloat16 \
                  --output_dir ${ENGINE_PATH}
@@ -349,11 +343,10 @@ python3 ./convert_checkpoint.py \
     --output-model-dir ${UNIFIED_CKPT_PATH}
 
 trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
-                 --gemm_plugin bfloat16 \
-                 --gpt_attention_plugin bfloat16 \
+                 --gemm_plugin auto \
                  --max_batch_size 32 \
                  --max_input_len 3000 \
-                 --max_output_len 100 \
+                 --max_seq_len 3100 \
                  --enable_xqa enable \
                  --lookup_plugin bfloat16 \
                  --output_dir ${ENGINE_PATH}
@@ -393,11 +386,10 @@ python3 ./convert_checkpoint.py \
              --output-model-dir ${UNIFIED_CKPT_PATH}
 
 trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
-             --gemm_plugin bfloat16 \
-             --gpt_attention_plugin bfloat16 \
+             --gemm_plugin auto \
              --max_batch_size 32 \
              --max_input_len 3000 \
-             --max_output_len 100 \
+             --max_seq_len 3100 \
              --enable_xqa enable \
              --lookup_plugin bfloat16 \
              --output_dir ${ENGINE_PATH}
@@ -440,11 +432,10 @@ python3 ./examples/gemma/convert_checkpoint.py \
     --output-model-dir ${UNIFIED_CKPT_PATH}
 
 trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
-             --gemm_plugin bfloat16 \
-             --gpt_attention_plugin bfloat16 \
+             --gemm_plugin auto \
              --max_batch_size 8 \
              --max_input_len 3000 \
-             --max_output_len 100 \
+             --max_seq_len 3100 \
              --lookup_plugin bfloat16 \
              --output_dir ${ENGINE_PATH}
 
@@ -485,11 +476,10 @@ python3 ./convert_checkpoint.py \
     --output-model-dir ${UNIFIED_CKPT_PATH}
 
 trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
-             --gemm_plugin bfloat16 \
-             --gpt_attention_plugin bfloat16 \
+             --gemm_plugin auto \
              --max_batch_size 8 \
              --max_input_len 3000 \
-             --max_output_len 100 \
+             --max_seq_len 3100 \
              --lookup_plugin bfloat16 \
              --output_dir ${ENGINE_PATH}
 
@@ -527,11 +517,10 @@ python3 ./convert_checkpoint.py \
     --output-model-dir ${UNIFIED_CKPT_PATH}
 
 trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
-             --gemm_plugin float16 \
-             --gpt_attention_plugin float16 \
+             --gemm_plugin auto \
              --max_batch_size 8 \
              --max_input_len 3000 \
-             --max_output_len 100 \
+             --max_seq_len 3100 \
              --enable_xqa enable \
              --lookup_plugin float16 \
              --output_dir ${ENGINE_PATH}
@@ -578,11 +567,10 @@ python3 ./convert_checkpoint.py \
     --output-model-dir ${UNIFIED_CKPT_PATH}
 
 trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
-                 --gemm_plugin bfloat16 \
-                 --gpt_attention_plugin bfloat16 \
+                 --gemm_plugin auto \
                  --max_batch_size 32 \
                  --max_input_len 3000 \
-                 --max_output_len 100 \
+                 --max_seq_len 3100 \
                  --enable_xqa enable \
                  --lookup_plugin bfloat16 \
                  --output_dir ${ENGINE_PATH}
@@ -619,11 +607,10 @@ python3 ./convert_checkpoint.py \
     --output-model-dir ${UNIFIED_CKPT_PATH}
 
 trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
-                 --gemm_plugin bfloat16 \
-                 --gpt_attention_plugin bfloat16 \
+                 --gemm_plugin auto \
                  --max_batch_size 32 \
                  --max_input_len 3000 \
-                 --max_output_len 100 \
+                 --max_seq_len 3100 \
                  --enable_xqa enable \
                  --lookup_plugin bfloat16 \
                  --output_dir ${ENGINE_PATH}
@@ -662,11 +649,10 @@ python3 ./convert_checkpoint.py \
              --output-model-dir ${UNIFIED_CKPT_PATH}
 
 trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
-             --gemm_plugin bfloat16 \
-             --gpt_attention_plugin bfloat16  \
+             --gemm_plugin auto \
              --max_batch_size 32 \
              --max_input_len 3000 \
-             --max_output_len 100 \
+             --max_seq_len 3100 \
              --enable_xqa enable \
              --lookup_plugin bfloat16 \
              --output_dir ${ENGINE_PATH}
@@ -709,11 +695,9 @@ HF_GEMMA_PATH can either be HF model card name or the downloaded model path. QUA
 For fp8, build engines with:
 ```
 trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
-             --gemm_plugin float16 \
-             --gpt_attention_plugin float16 \
              --max_batch_size 8 \
              --max_input_len 3000 \
-             --max_output_len 100 \
+             --max_seq_len 3100 \
              --lookup_plugin float16 \
              --output_dir ${ENGINE_PATH}
 ```
@@ -722,11 +706,10 @@ For int4_awq and int8_sq, build engines with:
 
 ```
 trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
-             --gemm_plugin float16 \
-             --gpt_attention_plugin float16 \
+             --gemm_plugin auto \
              --max_batch_size 8 \
              --max_input_len 3000 \
-             --max_output_len 100 \
+             --max_seq_len 3100 \
              --enable_xqa enable \
              --lookup_plugin float16 \
              --output_dir ${ENGINE_PATH}

@@ -276,14 +276,8 @@ def create_config_from_args(args: argparse.Namespace):
         'vision_start': args.vision_start,
         'vision_length': args.vision_length,
         'quantization': {
-            'quant_algo':
-            None,
-            'kv_cache_quant_algo':
-            None,
-            'exclude_modules': [
-                'lm_head', 'vocab_embedding', 'position_embedding',
-                'block_embedding'
-            ],
+            'quant_algo': None,
+            'kv_cache_quant_algo': None,
         },
         'mapping': {
             'world_size': args.tp_size * args.pp_size,

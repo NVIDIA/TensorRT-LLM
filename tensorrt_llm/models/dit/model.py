@@ -28,7 +28,6 @@ from ...mapping import Mapping
 from ...module import Module, ModuleList
 from ...parameter import Parameter
 from ...plugin import current_all_reduce_helper
-from ..generation_mixin import GenerationMixin
 from ..modeling_utils import PretrainedConfig, PretrainedModel
 
 
@@ -333,7 +332,10 @@ class DiT(PretrainedModel):
         if use_custom_all_reduce and mapping.tp_size > 1:
             current_all_reduce_helper().set_workspace_tensor(mapping, 1)
 
-        default_range = GenerationMixin.default_range
+        def dit_default_range(max_batch_size):
+            return [2, (max_batch_size + 1) // 2, max_batch_size]
+
+        default_range = dit_default_range
         if self.cfg_scale is not None:
             max_batch_size *= 2
 

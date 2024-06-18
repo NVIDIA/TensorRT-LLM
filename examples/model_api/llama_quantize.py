@@ -50,7 +50,7 @@ def main():
     tokenizer_dir = args.hf_model_dir
     max_batch_size, max_isl, max_osl = 1, 256, 20
     build_config = BuildConfig(max_input_len=max_isl,
-                               max_output_len=max_osl,
+                               max_seq_len=max_osl + max_isl,
                                max_batch_size=max_batch_size)
     cache_dir = Path(args.cache_dir)
     checkpoint_dir = cache_dir / "trtllm_checkpoint"

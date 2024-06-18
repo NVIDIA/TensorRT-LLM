@@ -124,11 +124,18 @@ def parse_arguments():
         'Specify the top_k value to use for MOE layers. Default to 1 if --moe_num_experts is set'
     )
     parser.add_argument(
-        '--moe_tp_mode',
-        default=MoeConfig.ParallelismMode.TENSOR_PARALLEL,
+        '--moe_tp_size',
         type=int,
+        default=-1,
         help=
-        'Controls how to distribute experts in TP. Check layers/moe.py for accepted values',
+        'N-way tensor parallelism size for MOE, default is tp_size, which will do tp-only for MoE'
+    )
+    parser.add_argument(
+        '--moe_ep_size',
+        type=int,
+        default=-1,
+        help=
+        'N-way expert parallelism size for MOE, default is 1, which will do tp-only for MoE'
     )
     parser.add_argument(
         '--moe_renorm_mode',
@@ -516,31 +523,32 @@ def convert_hf_dbrx(model_params: dict,
                                          f'{prefix}.ffn.experts.mlp.w1', dtype)
             mlp_gate_weight = mlp_gate_weight.reshape(-1, mlp_hidden_size,
                                                       num_hidden)
-            if moe_config.tp_mode == MoeConfig.ParallelismMode.TENSOR_PARALLEL:
-                mlp_gate_w = split_matrix(mlp_gate_weight,
-                                          mapping.tp_size,
-                                          mapping.tp_rank,
-                                          dim=1)
-            else:
-                mlp_gate_w = split_matrix(mlp_gate_weight,
-                                          mapping.tp_size,
-                                          mapping.tp_rank,
-                                          dim=0)
+            # moe expert parallel
+            mlp_gate_weight = split_matrix(mlp_gate_weight,
+                                           mapping.moe_ep_size,
+                                           mapping.moe_ep_rank,
+                                           dim=0)
+            # moe tensor parallel
+            mlp_gate_w = split_matrix(mlp_gate_weight,
+                                      mapping.moe_tp_size,
+                                      mapping.moe_tp_rank,
+                                      dim=1)
+
             # experts mlp v1 -> mlp fc
             mlp_fc_weight = get_weight(model_params,
                                        f'{prefix}.ffn.experts.mlp.v1', dtype)
             mlp_fc_weight = mlp_fc_weight.reshape(-1, mlp_hidden_size,
                                                   num_hidden)
-            if moe_config.tp_mode == MoeConfig.ParallelismMode.TENSOR_PARALLEL:
-                mlp_fc_w = split_matrix(mlp_fc_weight,
-                                        mapping.tp_size,
-                                        mapping.tp_rank,
-                                        dim=1)
-            else:
-                mlp_fc_w = split_matrix(mlp_fc_weight,
-                                        mapping.tp_size,
-                                        mapping.tp_rank,
-                                        dim=0)
+            # moe expert parallel
+            mlp_fc_weight = split_matrix(mlp_fc_weight,
+                                         mapping.moe_ep_size,
+                                         mapping.moe_ep_rank,
+                                         dim=0)
+            # moe tensor parallel
+            mlp_fc_w = split_matrix(mlp_fc_weight,
+                                    mapping.moe_tp_size,
+                                    mapping.moe_tp_rank,
+                                    dim=1)
             mlp_fc_w = torch.concat([mlp_fc_w, mlp_gate_w], dim=-2)
             weights.update(
                 get_tllm_linear_weight(mlp_fc_w, f'{tllm_prex}.mlp.fc.', None,
@@ -553,16 +561,16 @@ def convert_hf_dbrx(model_params: dict,
             mlp_proj_weight = mlp_proj_weight.reshape(-1, mlp_hidden_size,
                                                       num_hidden).transpose(
                                                           1, 2)
-            if moe_config.tp_mode == MoeConfig.ParallelismMode.TENSOR_PARALLEL:
-                mlp_proj_w = split_matrix(mlp_proj_weight,
-                                          mapping.tp_size,
-                                          mapping.tp_rank,
-                                          dim=2)
-            else:
-                mlp_proj_w = split_matrix(mlp_proj_weight,
-                                          mapping.tp_size,
-                                          mapping.tp_rank,
-                                          dim=0)
+            # moe expert parallel
+            mlp_proj_weight = split_matrix(mlp_proj_weight,
+                                           mapping.moe_ep_size,
+                                           mapping.moe_ep_rank,
+                                           dim=0)
+            # moe tensor parallel
+            mlp_proj_w = split_matrix(mlp_proj_weight,
+                                      mapping.moe_tp_size,
+                                      mapping.moe_tp_rank,
+                                      dim=2)
             weights.update(
                 get_tllm_linear_weight(mlp_proj_w, f'{tllm_prex}.mlp.proj.',
                                        None, use_weight_only,
@@ -621,6 +629,16 @@ if __name__ == '__main__':
     print(tensorrt_llm.__version__)
     args = parse_arguments()
     world_size = args.tp_size * args.pp_size
+    if (args.moe_tp_size == -1 and args.moe_ep_size == -1):
+        # moe default to tp-only
+        args.moe_tp_size = args.tp_size
+        args.moe_ep_size = 1
+    elif (args.moe_tp_size == -1):
+        args.moe_tp_size = args.tp_size // args.moe_ep_size
+    elif (args.moe_ep_size == -1):
+        args.moe_ep_size = args.tp_size // args.moe_tp_size
+    assert (args.moe_tp_size * args.moe_ep_size == args.tp_size
+            ), "moe_tp_size * moe_ep_size must equal to tp_size"
 
     tik = time.time()
 
@@ -661,7 +679,6 @@ if __name__ == '__main__':
         args.hidden_act = 'swiglu'
         args.rotary_base = hf_config.attn_config.rope_theta
     args.moe_config = MoeConfig(args.moe_num_experts, args.moe_top_k,
-                                args.moe_tp_mode,
                                 args.moe_renorm_mode).validate()
     config = {
         'architecture': 'DbrxForCausalLM',
@@ -680,32 +697,24 @@ if __name__ == '__main__':
         'rotary_base': args.rotary_base,
         'rotary_scaling': args.rotary_scaling,
         'quantization': {
-            'quant_algo':
-            quant_algo,
-            'kv_cache_quant_algo':
-            kv_cache_quant_algo,
-            'exclude_modules': [
-                'lm_head', 'vocab_embedding', 'position_embedding',
-                'block_embedding'
-            ],
+            'quant_algo': quant_algo,
+            'kv_cache_quant_algo': kv_cache_quant_algo,
         },
         'moe': {
             "num_experts": args.moe_num_experts,
             "top_k": args.moe_top_k,
-            "tp_mode": args.moe_tp_mode,
             "normalization_mode": args.moe_renorm_mode
         },
         'mapping': {
             'world_size': world_size,
             'tp_size': args.tp_size,
             'pp_size': args.pp_size,
+            'moe_tp_size': args.moe_tp_size,
+            'moe_ep_size': args.moe_ep_size,
         },
         'clip_qkv': args.clip_qkv,
         'dense_context_fmha': args.dense_context_fmha,
     }
-
-    if args.use_weight_only and args.moe_config.has_moe():
-        config['quantization']['exclude_modules'].append('router')
 
     config.update(args_to_build_options(args))
 
@@ -725,7 +734,9 @@ if __name__ == '__main__':
         mapping = Mapping(world_size=world_size,
                           rank=rank,
                           tp_size=args.tp_size,
-                          pp_size=args.pp_size)
+                          pp_size=args.pp_size,
+                          moe_tp_size=args.moe_tp_size,
+                          moe_ep_size=args.moe_ep_size)
         act_range = {}
         if args.int8_kv_cache:
             tokenizer = AutoTokenizer.from_pretrained(args.model_dir,

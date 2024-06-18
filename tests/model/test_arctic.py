@@ -71,6 +71,8 @@ class TestArctic(unittest.TestCase):
                 'mapping': {
                     'world_size': tensor_parallel,
                     'tp_size': tensor_parallel,
+                    'moe_tp_size': 1,
+                    'moe_ep_size': tensor_parallel,
                     'rank': rank,
                 },
                 'use_parallel_embedding': False,
@@ -78,7 +80,6 @@ class TestArctic(unittest.TestCase):
                 'moe': {
                     'num_experts': 0,
                     'top_k': 0,
-                    'tp_mode': 1,
                     'normalization_mode': 1,
                 },
                 'use_fused_mlp': False,

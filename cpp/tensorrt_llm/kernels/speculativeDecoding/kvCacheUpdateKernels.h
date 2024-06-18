@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
+#include "tensorrt_llm/runtime/common.h"
 #include <cstdint>
 #include <cuda_runtime_api.h>
 
@@ -44,11 +45,11 @@ using IndexType = int;
  * @param maxKVCacheLen : Maximum length of each KV cache
  * @param stream : CUDA stream to use.
  */
-void updateLinearKVCacheDraftTokenLocationCommonRewind(int const* seqAcceptedDraftTokenOffsets,
-    IndexType const* packedAcceptedDraftTokensIndices, int32_t const* pastKeyValueLengths,
-    KVLinearBuffer::DataType* const* pastKeyValueList, int layerCount, int seqCount, int numKVHeads,
-    int sizeInBytesPerKVHead, int rewindDraftTokenCount, int const* seqSlotRemapping, int maxKVCacheLen,
-    cudaStream_t stream);
+void updateLinearKVCacheDraftTokenLocationCommonRewind(runtime::SizeType32 const* seqAcceptedDraftTokenOffsets,
+    IndexType const* packedAcceptedDraftTokensIndices, runtime::SizeType32 const* pastKeyValueLengths,
+    KVLinearBuffer::DataType* const* pastKeyValueList, runtime::SizeType32 layerCount, runtime::SizeType32 seqCount,
+    runtime::SizeType32 numKVHeads, runtime::SizeType32 sizeInBytesPerKVHead, runtime::SizeType32 rewindDraftTokenCount,
+    runtime::SizeType32 const* seqSlotRemapping, runtime::SizeType32 maxKVCacheLen, cudaStream_t stream);
 
 /*!
  * Update Block KV cache using common rewind count.
@@ -72,10 +73,12 @@ void updateLinearKVCacheDraftTokenLocationCommonRewind(int const* seqAcceptedDra
  * @param tokensPerBlock : Tokens per block of Block KV cache
  * @param stream : CUDA stream to use.
  */
-void updateKVBlockArrayDraftTokenLocationCommonRewind(int const* seqAcceptedDraftTokenOffsets,
-    IndexType const* packedAcceptedDraftTokensIndices, int32_t const* pastKeyValueLengths, void* const* pointerArray,
-    KVBlockArray::DataType* offsetArray, int layerCount, int seqCount, int numKVHeads, int sizeInBytesPerKVHead,
-    int rewindDraftTokenCount, int const* seqSlotRemapping, int maxKVCacheLen, int maxBlocksPerSeq, int tokensPerBlock,
+void updateKVBlockArrayDraftTokenLocationCommonRewind(runtime::SizeType32 const* seqAcceptedDraftTokenOffsets,
+    IndexType const* packedAcceptedDraftTokensIndices, runtime::SizeType32 const* pastKeyValueLengths,
+    void* const* pointerArray, KVBlockArray::DataType* offsetArray, runtime::SizeType32 layerCount,
+    runtime::SizeType32 seqCount, runtime::SizeType32 numKVHeads, runtime::SizeType32 sizeInBytesPerKVHead,
+    runtime::SizeType32 rewindDraftTokenCount, runtime::SizeType32 const* seqSlotRemapping,
+    runtime::SizeType32 maxKVCacheLen, runtime::SizeType32 maxBlocksPerSeq, runtime::SizeType32 tokensPerBlock,
     cudaStream_t stream);
 
 /*!
@@ -98,11 +101,12 @@ void updateKVBlockArrayDraftTokenLocationCommonRewind(int const* seqAcceptedDraf
  * @param maxKVCacheLen : Maximum length of each KV cache
  * @param stream : CUDA stream to use.
  */
-void updateLinearKVCacheDraftTokenLocationSeparateRewind(int const* seqAcceptedDraftTokenOffsets,
-    IndexType const* packedAcceptedDraftTokensIndices, int32_t const* pastKeyValueLengths,
-    KVLinearBuffer::DataType* const* pastKeyValueList, int layerCount, int seqCount, int numKVHeads,
-    int sizeInBytesPerKVHead, int* rewindDraftTokenCounts, int const* seqSlotRemapping, int maxKVCacheLen,
-    cudaStream_t stream);
+void updateLinearKVCacheDraftTokenLocationSeparateRewind(runtime::SizeType32 const* seqAcceptedDraftTokenOffsets,
+    IndexType const* packedAcceptedDraftTokensIndices, runtime::SizeType32 const* pastKeyValueLengths,
+    KVLinearBuffer::DataType* const* pastKeyValueList, runtime::SizeType32 layerCount, runtime::SizeType32 seqCount,
+    runtime::SizeType32 numKVHeads, runtime::SizeType32 sizeInBytesPerKVHead,
+    runtime::SizeType32* rewindDraftTokenCounts, runtime::SizeType32 const* seqSlotRemapping,
+    runtime::SizeType32 maxKVCacheLen, cudaStream_t stream);
 
 /*!
  * Update Block KV cache using separate rewind count for each sequence.
@@ -127,11 +131,13 @@ void updateLinearKVCacheDraftTokenLocationSeparateRewind(int const* seqAcceptedD
  * @param tokensPerBlock : Tokens per block of Block KV cache
  * @param stream : CUDA stream to use.
  */
-void updateKVBlockArrayDraftTokenLocationSeparateRewind(int const* seqAcceptedDraftTokenOffsets,
-    IndexType const* packedAcceptedDraftTokensIndices, int32_t const* pastKeyValueLengths, void* const* pointerArray,
-    KVBlockArray::DataType* offsetArray, int layerCount, int seqCount, int numKVHeads, int sizeInBytesPerKVHead,
-    int* rewindDraftTokenCounts, int const* seqSlotRemapping, int maxKVCacheLen, int maxBlocksPerSeq,
-    int tokensPerBlock, cudaStream_t stream);
+void updateKVBlockArrayDraftTokenLocationSeparateRewind(runtime::SizeType32 const* seqAcceptedDraftTokenOffsets,
+    IndexType const* packedAcceptedDraftTokensIndices, runtime::SizeType32 const* pastKeyValueLengths,
+    void* const* pointerArray, KVBlockArray::DataType* offsetArray, runtime::SizeType32 layerCount,
+    runtime::SizeType32 seqCount, runtime::SizeType32 numKVHeads, runtime::SizeType32 sizeInBytesPerKVHead,
+    runtime::SizeType32* rewindDraftTokenCounts, runtime::SizeType32 const* seqSlotRemapping,
+    runtime::SizeType32 maxKVCacheLen, runtime::SizeType32 maxBlocksPerSeq, runtime::SizeType32 tokensPerBlock,
+    cudaStream_t stream);
 
 /*!
  * Update Linear KV cache using both common rewind and separate rewind count for each sequence. The common
@@ -156,11 +162,12 @@ void updateKVBlockArrayDraftTokenLocationSeparateRewind(int const* seqAcceptedDr
  * @param maxKVCacheLen : Maximum length of each KV cache
  * @param stream : CUDA stream to use.
  */
-void updateLinearKVCacheDraftTokenLocation(int const* seqAcceptedDraftTokenOffsets,
-    IndexType const* packedAcceptedDraftTokensIndices, int32_t const* pastKeyValueLengths,
-    KVLinearBuffer::DataType* const* pastKeyValueList, int layerCount, int seqCount, int numKVHeads,
-    int sizeInBytesPerKVHead, int rewindDraftTokenCommonCount, int* rewindDraftTokenSeparateAdjustments,
-    int const* seqSlotRemapping, int maxKVCacheLen, cudaStream_t stream);
+void updateLinearKVCacheDraftTokenLocation(runtime::SizeType32 const* seqAcceptedDraftTokenOffsets,
+    IndexType const* packedAcceptedDraftTokensIndices, runtime::SizeType32 const* pastKeyValueLengths,
+    KVLinearBuffer::DataType* const* pastKeyValueList, runtime::SizeType32 layerCount, runtime::SizeType32 seqCount,
+    runtime::SizeType32 numKVHeads, runtime::SizeType32 sizeInBytesPerKVHead,
+    runtime::SizeType32 rewindDraftTokenCommonCount, runtime::SizeType32 const* rewindDraftTokenSeparateAdjustments,
+    runtime::SizeType32 const* seqSlotRemapping, runtime::SizeType32 maxKVCacheLen, cudaStream_t stream);
 
 /*!
  * Update Block KV cache using both common rewind and separate rewind count for each sequence. The common
@@ -178,20 +185,24 @@ void updateLinearKVCacheDraftTokenLocation(int const* seqAcceptedDraftTokenOffse
  * @param sizeInBytesPerKVHead : Size of each KV head
  * @param rewindDraftTokenCommonCount : Common token count to rewind
  * @param rewindDraftTokenSeparateAdjustments : Pointer to an array of length seqCount, each element indicated the
- * rewind adjustment for one sequence.
+ * rewind adjustment for one sequence, indexed through batchSlots.
  * @param seqSlotRemapping mapping from batch index to index of the seqSlot in the sorted seqSlot buffer
  * e.g. for requests [0, 1, 2] with seqSlots [5, 3, 4], seqSlotRemapping is [1, 2, 0]
  * Required to match seqAcceptedDraftTokenOffsets and packedAcceptedDraftTokensIndices from gptDecoderBatch
  * and pointerArray and pastKeyValueLengths from runtimeBuffers.
+ * @param batchSlots : [seqCount] indices of sequences in the seq slots.
  * @param maxKVCacheLen : Maximum length of each KV cache
  * @param maxBlocksPerSeq : Maximum blocks per sequence of Block KV cache.
  * @param tokensPerBlock : Tokens per block of Block KV cache
  * @param stream : CUDA stream to use.
  */
-void updateKVBlockArrayDraftTokenLocation(int const* seqAcceptedDraftTokenOffsets,
-    IndexType const* packedAcceptedDraftTokensIndices, int32_t const* pastKeyValueLengths, void* const* pointerArray,
-    KVBlockArray::DataType* offsetArray, int layerCount, int seqCount, int numKVHeads, int sizeInBytesPerKVHead,
-    int rewindDraftTokenCommonCount, int* rewindDraftTokenSeparateAdjustments, int const* seqSlotRemapping,
-    int maxKVCacheLen, int maxBlocksPerSeq, int tokensPerBlock, cudaStream_t stream);
+void updateKVBlockArrayDraftTokenLocation(runtime::SizeType32 const* seqAcceptedDraftTokenOffsets,
+    IndexType const* packedAcceptedDraftTokensIndices, runtime::SizeType32 const* pastKeyValueLengths,
+    void* const* pointerArray, KVBlockArray::DataType* offsetArray, runtime::SizeType32 layerCount,
+    runtime::SizeType32 seqCount, runtime::SizeType32 numKVHeads, runtime::SizeType32 sizeInBytesPerKVHead,
+    runtime::SizeType32 rewindDraftTokenCommonCount, runtime::SizeType32 const* rewindDraftTokenSeparateAdjustments,
+    runtime::SizeType32 const* seqSlotRemapping, runtime::SizeType32 const* batchSlots,
+    runtime::SizeType32 maxKVCacheLen, runtime::SizeType32 maxBlocksPerSeq, runtime::SizeType32 tokensPerBlock,
+    cudaStream_t stream);
 
 } // namespace tensorrt_llm::kernels::speculative_decoding

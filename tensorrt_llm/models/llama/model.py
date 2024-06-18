@@ -74,9 +74,8 @@ class LLaMADecoderLayer(Module):
             ClsMLP = MOE
             mlp_kwargs = {
                 "moe_config": config.moe,
-                "tp_rank": config.mapping.tp_rank,
+                "mapping": config.mapping,
             }
-
         self.mlp = ClsMLP(hidden_size=config.hidden_size,
                           ffn_hidden_size=mlp_hidden_size,
                           hidden_act=config.hidden_act,
@@ -86,6 +85,7 @@ class LLaMADecoderLayer(Module):
                           tp_size=config.mapping.tp_size,
                           quant_mode=config.quant_mode,
                           **mlp_kwargs)
+
         self.post_layernorm = RmsNorm(normalized_shape=config.hidden_size,
                                       eps=config.norm_epsilon,
                                       dtype=config.dtype)

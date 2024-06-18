@@ -565,7 +565,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(void const* data, size_t leng
 
     uint32_t decoderXQARunnerResourceSerializedSize;
     read(d, decoderXQARunnerResourceSerializedSize);
-    mDecoderXQARunnerResource = DecoderXQARunner::Resource(d, decoderXQARunnerResourceSerializedSize);
+    DecoderXQARunner::getResourceGlobal()->merge(DecoderXQARunner::Resource(d, decoderXQARunnerResourceSerializedSize));
     d += decoderXQARunnerResourceSerializedSize;
 
     TLLM_CHECK_WITH_INFO(d == a + length,
@@ -1620,8 +1620,8 @@ int GPTAttentionPluginCommon::initialize() noexcept
             TLLM_CHECK_WITH_INFO(!mMultiBlockMode, "Medusa doesn't support multi-block mode.");
         }
 
-        mDecoderXQARunner.reset(new DecoderXQARunner(
-            &mDecoderXQARunnerResource, xqa_runner_data_type, mNumHeads, mNumKVHeads, mHeadSize, mMultiBlockMode));
+        mDecoderXQARunner.reset(
+            new DecoderXQARunner(xqa_runner_data_type, mNumHeads, mNumKVHeads, mHeadSize, mMultiBlockMode));
     }
     else if (mIsSpecDecodingEnabled)
     {
@@ -1656,8 +1656,8 @@ size_t GPTAttentionPluginCommon::getCommonSerializationSize() const noexcept
         + sizeof(mCrossAttention) + sizeof(mMaxDistance) + sizeof(mPosShiftEnabled) + sizeof(mDenseContextFMHA)
         + sizeof(mPagedContextFMHA) + sizeof(mFP8ContextFMHA) + sizeof(mUseKVCache) + sizeof(mUnfuseQkvGemm)
         + sizeof(mIsSpecDecodingEnabled) + sizeof(mNbMultiBlockSemaphores)
-        + sizeof(uint32_t) // size of mDecoderXQARunnerResource buffer.
-        + mDecoderXQARunnerResource.getSerializationSize();
+        + sizeof(uint32_t) // size of DecoderXQARunnerResource buffer.
+        + DecoderXQARunner::getResourceGlobal()->getSerializationSize();
 }
 
 void GPTAttentionPluginCommon::serializeCommon(void* buffer) const noexcept
@@ -1708,9 +1708,9 @@ void GPTAttentionPluginCommon::serializeCommon(void* buffer) const noexcept
     write(d, mNbMultiBlockSemaphores);
 
     // An uint32_t that specifies the size of the serialized buffer, followed by the actual content.
-    uint32_t decoderXQARunnerResourceSerializedSize = mDecoderXQARunnerResource.getSerializationSize();
+    uint32_t decoderXQARunnerResourceSerializedSize = DecoderXQARunner::getResourceGlobal()->getSerializationSize();
     write(d, decoderXQARunnerResourceSerializedSize);
-    mDecoderXQARunnerResource.serialize(d, decoderXQARunnerResourceSerializedSize);
+    DecoderXQARunner::getResourceGlobal()->serialize(d, decoderXQARunnerResourceSerializedSize);
     d += decoderXQARunnerResourceSerializedSize;
 
     assert(d == a + getCommonSerializationSize());

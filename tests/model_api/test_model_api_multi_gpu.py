@@ -93,7 +93,7 @@ def build_and_run_tp2(rank, model_name, engine_dir, use_auto_parallel):
         llama,
         BuildConfig(max_batch_size=max_batch_size,
                     max_input_len=max_isl,
-                    max_output_len=max_osl,
+                    max_seq_len=max_osl + max_isl,
                     strongly_typed=True,
                     auto_parallel_config=auto_parallel_config))
     engine.save(engine_dir)

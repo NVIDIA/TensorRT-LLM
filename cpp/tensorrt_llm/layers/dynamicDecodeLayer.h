@@ -16,35 +16,14 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/tensor.h"
 #include "tensorrt_llm/executor/types.h"
-#include "tensorrt_llm/layers/banWordsLayer.h"
 #include "tensorrt_llm/layers/baseLayer.h"
-#include "tensorrt_llm/layers/beamSearchLayer.h"
-#include "tensorrt_llm/layers/decodingLayer.h"
-#include "tensorrt_llm/layers/layerUtils.h"
-#include "tensorrt_llm/layers/medusaDecodingLayer.h"
 #include "tensorrt_llm/layers/penaltyLayer.h"
-#include "tensorrt_llm/layers/samplingLayer.h"
-#include "tensorrt_llm/layers/stopCriteriaLayer.h"
-#include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/iTensor.h"
-
-#include <optional>
-#include <string>
-#include <unordered_map>
-#include <utility>
 
 namespace tc = tensorrt_llm::common;
 
-namespace tensorrt_llm
-{
-namespace kernels
-{
-struct BeamHypotheses;
-}
-
-namespace layers
+namespace tensorrt_llm::layers
 {
 
 template <typename T>
@@ -59,11 +38,13 @@ public:
     ~DynamicDecodeLayer() override;
 
     void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 const* batchSlots,
-        std::shared_ptr<BaseSetupParams> setupParams) override;
+        std::shared_ptr<BaseSetupParams> const& setupParams) override;
 
-    void forwardAsync(std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs) override;
+    void forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& outputs,
+        std::shared_ptr<BaseDecodingInputs> const& inputs) override;
 
-    void forwardSync(std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs) override;
+    void forwardSync(std::shared_ptr<BaseDecodingOutputs> const& outputs,
+        std::shared_ptr<BaseDecodingInputs> const& inputs) override;
 
     // Function is only used by test.
     // It is guaranteed by LayersFactory that the first layer is the Penalty layer.
@@ -79,11 +60,10 @@ private:
     void initialize();
     void initializeLayers();
 
-    void prepareIdsPtrs(std::shared_ptr<DynamicDecodeOutputParams> const& outputs,
-        runtime::SizeType32 const* batchSlots, runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth,
-        runtime::SizeType32 maxSeqLen);
-    static void prepareOutputData(std::shared_ptr<DynamicDecodeOutputParams> const& outputs,
-        std::shared_ptr<DynamicDecodeInputParams> const& params, runtime::ITensor::SharedPtr const& idsPtrsHost,
+    void prepareIdsPtrs(std::shared_ptr<BaseDecodingOutputs> const& outputs, runtime::SizeType32 const* batchSlots,
+        runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 maxSeqLen);
+    static void prepareOutputData(std::shared_ptr<BaseDecodingOutputs> const& outputs,
+        std::shared_ptr<DecodingInputs> const& params, runtime::ITensor::SharedPtr const& idsPtrsHost,
         runtime::SizeType32 const* batchSlots, runtime::SizeType32 batchSize, runtime::SizeType32 maxBatchSize,
         runtime::SizeType32 beamWidth, runtime::SizeType32 maxSeqLen, runtime::SizeType32 maxTokensPerStep,
         runtime::SizeType32 cyclicStep, bool outputLogProbs, cudaStream_t stream);
@@ -109,5 +89,4 @@ private:
     runtime::SizeType32 mConfiguredBeamWidth{-1};
 };
 
-} // namespace layers
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::layers

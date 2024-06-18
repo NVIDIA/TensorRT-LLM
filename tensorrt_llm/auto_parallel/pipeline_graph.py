@@ -8,6 +8,7 @@ import torch
 from tensorrt_llm._utils import trt_dtype_to_str, trt_dtype_to_torch
 from tensorrt_llm.logger import logger
 from tensorrt_llm.network import Network, get_plugin_info, set_plugin_info
+from tensorrt_llm.plugin.plugin import PluginConfig
 from tensorrt_llm.runtime.session import Session
 
 from .utils import (current_flags, get_builder_flags, get_sorted_layer_ids,
@@ -263,6 +264,7 @@ class PipelineGraph:
         self._io_buffer_mapping = {}
         self._unfilled_weights = {}
         self._auto_parallel_config = None
+        self._plugin_config: PluginConfig = None
 
     @staticmethod
     def create_graph():

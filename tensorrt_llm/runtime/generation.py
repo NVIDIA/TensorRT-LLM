@@ -33,7 +33,6 @@ from cuda import cudart
 from .._ipc_utils import set_peer_access
 from .._utils import (pad_vocab_size, str_dtype_to_torch, torch_to_numpy,
                       trt_dtype_to_torch, trt_gte_10)
-from ..layers.moe import MoeConfig
 from ..logger import logger
 from ..lora_manager import LoraManager
 from ..mapping import Mapping
@@ -448,7 +447,6 @@ class ModelConfig:
     max_medusa_tokens: int = 0
     paged_state: bool = True
     mamba_conv1d_plugin: bool = True
-    moe_tp_mode: MoeConfig.ParallelismMode = MoeConfig.ParallelismMode.TENSOR_PARALLEL
     conv_kernel: int = 0
     layer_types: List[str] = field(default_factory=list)
     rnn_hidden_size: int = 0
@@ -1593,9 +1591,8 @@ class GenerationSession(object):
             # Because we don't support inplace update, so we need separate buffer for inputs and outputs.
             # We can do reuse between different layers' inputs and outputs, i.e. current layer's output can
             # reuse previous layer's input memory. But this need one extra buffer as the guard.
-            i = self.first_layer
-            if self.layer_types[
-                    i] == 'attention':  # Not applicable to cross KV buffers as it's constant
+            if self.has_attn_layers:  # Not applicable to cross KV buffers as it's constant
+                i = self.attn_to_general_idx[0]
                 trt_dtype = self.runtime.engine.get_tensor_dtype(
                     f'present_key_value_{i}')
 

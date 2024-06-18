@@ -14,9 +14,14 @@
  * limitations under the License.
  */
 #include <gtest/gtest.h>
+#include <tuple>
 
+#include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/layers/lookaheadAlgorithm.h"
 #include "tensorrt_llm/layers/lookaheadDecodingUtils.h"
+#include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/lookaheadModule.h"
 #include "tests/layers/randomLlm.h"
 
 namespace tensorrt_llm::tests::layers
@@ -45,10 +50,19 @@ bool verifyAcceptOffsets(TensorPtr output, TensorPtr accepted, TensorPtr accepte
 
 TEST_P(LookaheadAlgorithmTest, predict)
 {
+    srand(42);
     auto [Ww, Nn, Gg] = GetParam();
     auto [W, w] = Ww;
     auto [N, n] = Nn;
     auto [G, g] = Gg;
+
+    if (!executor::LookaheadDecodingConfig::isLegal(W, N, G) || !executor::LookaheadDecodingConfig::isLegal(w, n, g))
+    {
+        TLLM_LOG_DEBUG("Just Pass for illegal parameter combination");
+        GTEST_SKIP() << "Algorithm does not support these parameters WNG=(" << W << ", " << N << ", " << G << "), wng=("
+                     << w << ", " << n << ", " << g;
+    }
+    TLLM_LOG_DEBUG("Test Parameters: WNG=(%d, %d, %d), wng=(%d, %d, %d)", W, N, G, w, n, g);
 
     auto ascii = std::make_shared<AsciiRandomTokenLogits>();
 
@@ -63,8 +77,13 @@ TEST_P(LookaheadAlgorithmTest, predict)
     auto promptLen = ITensor::volume(prompt->getShape());
 
     auto maxSeqLen = 1024;
-    auto maxDraftLen = (W + G) * (N - 1) - 1;
-    auto shape = ITensor::makeShape({1 + maxDraftLen});
+    SizeType32 maxTokensPerStep, maxDraftLen;
+    SizeType32 maxDraftLenRuntime;
+    std::tie(maxTokensPerStep, std::ignore, maxDraftLen, std::ignore)
+        = executor::LookaheadDecodingConfig(W, N, G).calculateSpeculativeResource();
+    std::tie(std::ignore, std::ignore, maxDraftLenRuntime, std::ignore)
+        = executor::LookaheadDecodingConfig(w, n, g).calculateSpeculativeResource();
+    auto shape = ITensor::makeShape({maxTokensPerStep});
     auto shapeSingle = ITensor::makeShape({1});
     TensorPtr posidMax = BufferManager::cpu(shape, nvinfer1::DataType::kINT32);
     TensorPtr smaskMax = BufferManager::cpu(shape, nvinfer1::DataType::kBOOL);
@@ -105,12 +124,12 @@ TEST_P(LookaheadAlgorithmTest, predict)
         TLLM_LOG_DEBUG("\noracle[%d] = '%c'", sequenceLength - 1, static_cast<char>(sequenceRange[sequenceLength - 1]));
         bufferCast<SizeType32>(*posidMax)[0] = sequenceLength - 1;
         bufferCast<bool>(*smaskMax)[0] = true;
-        algo.prepare(                                              //
-            ITensor::slice(sequence, sequenceLength, maxDraftLen), //
-            ITensor::slice(posidMax, 1, maxDraftLen),              //
-            ITensor::slice(smaskMax, 1, maxDraftLen),              //
-            inputLengthPtr,                                        //
-            sequenceLengthPtr,                                     //
+        algo.prepare(                                                     //
+            ITensor::slice(sequence, sequenceLength, maxDraftLenRuntime), //
+            ITensor::slice(posidMax, 1, maxDraftLenRuntime),              //
+            ITensor::slice(smaskMax, 1, maxDraftLenRuntime),              //
+            inputLengthPtr,                                               //
+            sequenceLengthPtr,                                            //
             ITensor::slice(sequence, sequenceLength - 1, 1));
 
         TensorPtr input = ITensor::slice(sequence, sequenceLength - 1, inputLength + 1);
@@ -128,7 +147,7 @@ TEST_P(LookaheadAlgorithmTest, predict)
 
         // algo.update(acceptedMax, acceptedOffsetsMax, acceptedLengthPtr, output, endIdPtr);
         algo.update(
-            ITensor::slice(sequence, sequenceLength, N), acceptedOffsetsMax, acceptedLengthPtr, output, endIdPtr);
+            ITensor::slice(sequence, sequenceLength, n), acceptedOffsetsMax, acceptedLengthPtr, output, endIdPtr);
 
         TensorPtr accepted = ITensor::slice(sequence, sequenceLength, acceptedLength);
         TensorPtr acceptedOffsets = ITensor::slice(acceptedOffsetsMax, 0, acceptedLength);
@@ -154,18 +173,38 @@ TEST_P(LookaheadAlgorithmTest, predict)
 INSTANTIATE_TEST_CASE_P(CombineLookaheadAlgorithmTest, LookaheadAlgorithmTest,
     testing::Combine( //
         testing::Values(std::make_tuple(1, 1), std::make_tuple(3, 3), std::make_tuple(5, 5), std::make_tuple(7, 7),
-            std::make_tuple(3, 2), std::make_tuple(5, 3), std::make_tuple(7, 4)),
-        testing::Values(std::make_tuple(3, 3), std::make_tuple(5, 5), std::make_tuple(7, 7), std::make_tuple(3, 2),
-            std::make_tuple(5, 3), std::make_tuple(7, 4)),
-        testing::Values(std::make_tuple(3, 3), std::make_tuple(5, 5), std::make_tuple(7, 7), std::make_tuple(3, 2),
-            std::make_tuple(5, 3), std::make_tuple(7, 4))));
+            std::make_tuple(2, 1), std::make_tuple(3, 2), std::make_tuple(5, 3), std::make_tuple(7, 4)),
+        testing::Values(std::make_tuple(1, 1), std::make_tuple(3, 3), std::make_tuple(5, 5), std::make_tuple(7, 7),
+            std::make_tuple(2, 1), std::make_tuple(3, 2), std::make_tuple(5, 3), std::make_tuple(7, 4)),
+        testing::Values(std::make_tuple(0, 0), std::make_tuple(3, 3), std::make_tuple(5, 5), std::make_tuple(7, 7),
+            std::make_tuple(1, 0), std::make_tuple(3, 2), std::make_tuple(5, 3), std::make_tuple(7, 4))));
 
 INSTANTIATE_TEST_CASE_P(CombineLookaheadAlgorithmTestSingleMax, LookaheadAlgorithmTest,
     testing::Combine(testing::Values(std::make_tuple(5, 5)), testing::Values(std::make_tuple(5, 5)),
         testing::Values(std::make_tuple(5, 5))));
 
 INSTANTIATE_TEST_CASE_P(CombineLookaheadAlgorithmTestSingleDynamic, LookaheadAlgorithmTest,
-    testing::Combine(testing::Values(std::make_tuple(3, 2)), testing::Values(std::make_tuple(3, 2)),
-        testing::Values(std::make_tuple(3, 2))));
+    testing::Combine(testing::Values(std::make_tuple(1, 1)), testing::Values(std::make_tuple(2, 1)),
+        testing::Values(std::make_tuple(1, 0))));
+
+INSTANTIATE_TEST_CASE_P(CombineLookaheadAlgorithmTestSmallest_110, LookaheadAlgorithmTest,
+    testing::Combine(testing::Values(std::make_tuple(1, 1)), testing::Values(std::make_tuple(1, 1)),
+        testing::Values(std::make_tuple(0, 0))));
+
+INSTANTIATE_TEST_CASE_P(CombineLookaheadAlgorithmTestSmall_120, LookaheadAlgorithmTest,
+    testing::Combine(testing::Values(std::make_tuple(1, 1)), testing::Values(std::make_tuple(2, 2)),
+        testing::Values(std::make_tuple(0, 0))));
+
+INSTANTIATE_TEST_CASE_P(CombineLookaheadAlgorithmTestSmall_220, LookaheadAlgorithmTest,
+    testing::Combine(testing::Values(std::make_tuple(2, 2)), testing::Values(std::make_tuple(2, 2)),
+        testing::Values(std::make_tuple(0, 0))));
+
+INSTANTIATE_TEST_CASE_P(CombineLookaheadAlgorithmTestSmall_121, LookaheadAlgorithmTest,
+    testing::Combine(testing::Values(std::make_tuple(1, 1)), testing::Values(std::make_tuple(2, 2)),
+        testing::Values(std::make_tuple(1, 1))));
+
+INSTANTIATE_TEST_CASE_P(CombineLookaheadAlgorithmTestSmall_222, LookaheadAlgorithmTest,
+    testing::Combine(testing::Values(std::make_tuple(2, 2)), testing::Values(std::make_tuple(2, 2)),
+        testing::Values(std::make_tuple(2, 2))));
 
 } // namespace tensorrt_llm::tests::layers

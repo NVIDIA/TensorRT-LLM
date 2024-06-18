@@ -25,7 +25,7 @@ trtllm-build \
     --gemm_plugin disable \
     --max_batch_size 128 \
     --max_input_len 512 \
-    --max_output_len 50
+    --max_seq_len 562
 
 # Run the engine with 20% weights in GPU memory.
 python3 examples/summarize.py \
@@ -47,7 +47,7 @@ python3 benchmarks/python/benchmark.py \
     --max_batch_size "32" \
     --input_output_len "256,32" \
     --max_input_len 256\
-    --max_output_len 32 \
+    --max_seq_len 288 \
     --gpu_weights_percent "0.0;0.3;0.6;1.0" \
     --dtype float16 \
     --csv \

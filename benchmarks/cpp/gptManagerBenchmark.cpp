@@ -150,6 +150,7 @@ struct BenchmarkParams
     bool streaming{false};
     bool enableExpDelays{false};
     std::optional<float> requestRate{std::nullopt};
+    std::optional<SizeType32> maxBatchSize{std::nullopt};
     int randomSeed = 430;
     std::optional<int> maxAttentionWindow{std::nullopt};
 
@@ -785,6 +786,10 @@ public:
         executorConfig.setPeftCacheConfig(peftCacheConfig);
         executorConfig.setBatchingType(
             modelType == TrtGptModelType::V1 ? texec::BatchingType::kSTATIC : texec::BatchingType::kINFLIGHT);
+        if (benchmarkParams.maxBatchSize)
+        {
+            executorConfig.setMaxBatchSize(benchmarkParams.maxBatchSize.value());
+        }
 
         mExecutor = std::make_unique<texec::Executor>(trtEnginePath, texec::ModelType::kDECODER_ONLY, executorConfig);
 
@@ -1339,6 +1344,7 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
     optionalParams.kvCacheConfig.onboardBlocks = benchmarkParams.kvOnboardBlocks;
     optionalParams.gpuWeightsPercent = benchmarkParams.gpuWeightsPercent;
     optionalParams.maxBeamWidth = beamWidth;
+    optionalParams.maxBatchSize = benchmarkParams.maxBatchSize;
     optionalParams.schedulerConfig = texec::SchedulerConfig{capacitySchedulerPolicy};
 
     auto const jsonConfig = GptJsonConfig::parse(engineDir / "config.json");
@@ -1628,6 +1634,7 @@ int main(int argc, char* argv[])
     options.add_options()("request_rate",
         "request rate in reqs/sec. Skipping this arg or negative value will trigger offline/0-delay.",
         cxxopts::value<float>());
+    options.add_options()("max_batch_size", "The max runtime batch size when benchmarking", cxxopts::value<int>());
     options.add_options()("enable_trt_overlap", "Overlap TRT context preparation and execution",
         cxxopts::value<bool>()->default_value("false"));
     options.add_options()("enable_exp_delays", "Enables exponential delay distr to mimic real world request arrival",
@@ -1775,6 +1782,12 @@ int main(int argc, char* argv[])
     if (result.count("request_rate"))
     {
         benchmarkParams.requestRate = result["request_rate"].as<float>();
+    }
+
+    // Argument: request rate
+    if (result.count("max_batch_size"))
+    {
+        benchmarkParams.maxBatchSize = result["max_batch_size"].as<int>();
     }
 
     benchmarkParams.enableExpDelays = result["enable_exp_delays"].as<bool>();

@@ -63,6 +63,7 @@ python convert_checkpoint.py --model_dir ./tmp/grok-1/ \
                               --output_dir ./tllm_checkpoint_8gpus_bf16 \
                               --dtype bfloat16 \
                               --use_weight_only \
+                              --tp_size 8 \
                               --workers 8
 
 trtllm-build --checkpoint_dir ./tllm_checkpoint_8gpus_bf16 \

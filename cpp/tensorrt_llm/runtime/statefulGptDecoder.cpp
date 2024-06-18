@@ -185,7 +185,7 @@ void StatefulGptDecoder::newBatch(
     dInput.maxLength = maxInputLength;
     dInput.maxAttentionWindow = mMaxAttentionWindow;
     dInput.sinkTokenLength = mSinkTokenLength;
-    dInput.maxBatchSize = batchSize;
+    dInput.batchSize = batchSize;
     kernels::invokeFill(const_cast<ITensor&>(*dInput.endIds), endId, *stream);
     dInput.embeddingBias = inputs.embeddingBias;
 

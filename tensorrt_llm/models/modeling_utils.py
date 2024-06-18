@@ -272,6 +272,8 @@ class PretrainedConfig:
                                rank=rank,
                                tp_size=self.mapping.tp_size,
                                pp_size=self.mapping.pp_size,
+                               moe_tp_size=self.mapping.moe_tp_size,
+                               moe_ep_size=self.mapping.moe_ep_size,
                                gpus_per_node=self.mapping.gpus_per_node)
 
 
@@ -635,6 +637,9 @@ class PretrainedModel(Module,
     ):
         if mapping is None:  # single gpu
             mapping = Mapping()
+        if mapping.moe_ep_size > 1:
+            raise NotImplementedError(
+                "Quantization for expert parallelism is not supported")
         modelopt_qformat = quant_config.quant_algo_to_modelopt_qformat()
         kv_cache_dtype = quant_config.kv_cache_quant_algo
         assert modelopt_qformat is not None
@@ -643,6 +648,7 @@ class PretrainedModel(Module,
             hf_model_dir)  # quantize_and_export has some code can not take Path
         quantize_and_export(
             model_dir=hf_model_dir,
+            device='cuda',
             calib_dataset=calib_dataset,
             dtype=dtype,
             qformat=modelopt_qformat,
@@ -665,8 +671,8 @@ class DecoderModelForCausalLM(PretrainedModel):
         super().__init__(config)
         self.transformer = transformer
         self.lm_head = lm_head
-        config.set_if_not_exist('mup_width_multiplier', 1.0)
-        self.mup_width_multiplier = config.mup_width_multiplier
+        self.mup_width_multiplier = getattr(config, 'mup_width_multiplier',
+                                            None)
 
     def forward(self,
                 input_ids: Tensor,

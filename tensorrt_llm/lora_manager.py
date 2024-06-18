@@ -13,7 +13,6 @@ import yaml
 from ._utils import (DictConversion, pad_vocab_size, release_gc,
                      str_dtype_to_torch, torch_to_numpy)
 from .layers.linear import ColumnLinear
-from .layers.moe import MoeConfig
 from .logger import logger
 from .mapping import Mapping
 from .models.convert_utils import (get_model_path, load_state_dict,
@@ -546,7 +545,6 @@ class LoraManager(object):
 
         lora_target_modules = model_config.lora_target_modules
         dtype = model_config.dtype
-        moe_tp_mode = model_config.moe_tp_mode
         hf_modules_to_trtllm_modules = invert_module_mapping(
             model_config.trtllm_modules_to_hf_modules)
         hf_modules = set(hf_modules_to_trtllm_modules.keys())
@@ -606,7 +604,7 @@ class LoraManager(object):
                         t_out = module_weights["out"]
                     if lora_module in ["moe_router"]:
                         pass
-                    elif "moe" in lora_module and moe_tp_mode == MoeConfig.ParallelismMode.EXPERT_PARALLEL:
+                    elif "moe" in lora_module and runtime_mapping.has_moe_ep():
                         pass
                     elif lora_module in [
                             "attn_dense",

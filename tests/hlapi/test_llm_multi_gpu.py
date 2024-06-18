@@ -92,13 +92,17 @@ def test_llm_generate_tp2(engine_from_checkpoint):
         print(output)
 
 
-# TODO[yuxianq]: Enable auto_parallel after fixing the issue
-#@pytest.mark.parametrize("use_auto_parallel", [True, False], ids=[ "enable_auto_parallel", "disable_auto_parallel"])
+@pytest.mark.parametrize("use_auto_parallel", [True, False],
+                         ids=["enable_auto_parallel", "disable_auto_parallel"])
+@pytest.mark.parametrize("from_ckpt", [True, False],
+                         ids=["from_ckpt", "from_hf"])
 @skip_single_gpu
 def test_llm_generate_async_tp2(
         engine_from_checkpoint: tempfile.TemporaryDirectory,
-        use_auto_parallel=False):
-    model_dir = engine_from_checkpoint.name if not use_auto_parallel else get_model_path(
+        use_auto_parallel: bool, from_ckpt: bool):
+    if use_auto_parallel and from_ckpt:
+        pytest.skip("Skip auto parallel for TP2 checkpoint")
+    model_dir = engine_from_checkpoint.name if from_ckpt else get_model_path(
         llama_model_path)
     tokenizer_dir = get_model_path(llama_model_path)
     tokenizer = TransformersTokenizer.from_pretrained(tokenizer_dir)

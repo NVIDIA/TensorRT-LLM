@@ -52,7 +52,7 @@ def test_ModelConfig_build_config():
     config.build_config.builder_opt = 3
     config.build_config.max_num_tokens = 888
     config.build_config.strongly_typed = True
-    config.build_config.max_output_len = 333
+    config.build_config.max_seq_len = 1024
 
     llm = LLM(config,
               kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4))
@@ -74,7 +74,7 @@ def test_ModelConfig_build_config():
         assert build_config.builder_opt == config.build_config.builder_opt
         assert build_config.max_num_tokens == config.build_config.max_num_tokens
         assert build_config.strongly_typed == config.build_config.strongly_typed
-        assert build_config.max_output_len == config.build_config.max_output_len
+        assert build_config.max_seq_len == config.build_config.max_seq_len
 
 
 def test_llm_loading_from_hf():
@@ -474,6 +474,55 @@ def test_generate_with_bad_words():
     for output in llm.generate(prompts, sampling_params=sampling_params):
         print(output)
         assert output.text == "D E F G H J"
+
+
+@force_ampere
+def test_generate_with_embedding_bias():
+    config = ModelConfig(llama_model_path)
+    llm = LLM(
+        config,
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+    )
+
+    sampling_params = SamplingParams(max_new_tokens=6)
+
+    tokenizer = AutoTokenizer.from_pretrained(llama_model_path,
+                                              add_prefix_space=False)
+    biased_word_id = tokenizer(["Z"]).input_ids[0][1]
+
+    vocab_size_padded = 32000
+    embedding_bias = torch.zeros(vocab_size_padded)
+    embedding_bias[biased_word_id] = torch.finfo(torch.float32).max
+    sampling_params.embedding_bias = embedding_bias
+
+    for output in llm.generate(prompts, sampling_params=sampling_params):
+        print(output)
+        assert output.text == "Z Z Z Z Z Z"
+
+
+@force_ampere
+def test_generate_with_logits_post_processor():
+    tokenizer = AutoTokenizer.from_pretrained(llama_model_path,
+                                              add_prefix_space=False)
+    biased_word_id = tokenizer(["Z"]).input_ids[0][1]
+
+    def logits_post_processor(req_id: int, logits: torch.Tensor,
+                              ids: List[List[int]], stream_ptr: int):
+        with torch.cuda.stream(torch.cuda.ExternalStream(stream_ptr)):
+            logits[:] = float("-inf")
+            logits[..., biased_word_id] = 0
+
+    config = ModelConfig(llama_model_path)
+    llm = LLM(config,
+              kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+              logits_post_processor_map={"my_logits_pp": logits_post_processor})
+
+    sampling_params = SamplingParams(max_new_tokens=6)
+    sampling_params.logits_post_processor_name = "my_logits_pp"
+
+    for output in llm.generate(prompts, sampling_params=sampling_params):
+        print(output)
+        assert output.text == "Z Z Z Z Z Z"
 
 
 @force_ampere

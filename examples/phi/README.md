@@ -78,7 +78,7 @@ trtllm-build \
     --gemm_plugin float16 \
     --max_batch_size 8 \
     --max_input_len 1024 \
-    --max_output_len 1024 \
+    --max_seq_len 2048 \
     --tp_size 1 \
     --pp_size 1
 ```

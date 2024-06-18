@@ -267,10 +267,13 @@ private:
     TensorPtr mPathsOffsets;
     TensorPtr mNextPosIds;
     TensorPtr mNextDraftLengths;
+    TensorPtr mPrevDraftLengths;
     TensorPtr mOutputUnpackedNextDraftTokens;
     TensorPtr mOutputUnpackedNextDraftIndices;
     TensorPtr mOutputDraftProbs;
     TensorPtr mOutputTemperatures;
+    TensorPtr mOutputGenerationLengths;
+    TensorPtr mMaxGenLengthHost;
 
     // inputs
     TensorPtr mBatchSlots;
@@ -287,6 +290,8 @@ private:
     TensorPtr mTokensPerStep;
     TensorPtr mNextFlatTokens;
     TensorPtr mInputPositionIdsBase;
+    TensorPtr mEndIds;
+    TensorPtr mMaxGenLengthDevice;
 
     // Packed inputs
     TensorPtr mMaxGenerationLength;
@@ -301,6 +306,7 @@ private:
     TensorPtr mPackedNextDraftIndices;
     TensorPtr mPackedPackedMasks;
     TensorPtr mPackedPositionOffsets;
+    TensorPtr mPackedPackedPosIds;
     TensorPtr mPackedDraftProbs;
     TensorPtr mPackedTemperatures;
 
@@ -320,9 +326,9 @@ private:
 
     void setup();
 
-    std::shared_ptr<tensorrt_llm::layers::ExplicitDraftTokensInputParams> createInputTensors();
+    std::shared_ptr<tensorrt_llm::layers::ExplicitDraftTokensInputs> createInputTensors();
 
-    std::shared_ptr<tensorrt_llm::layers::DynamicDecodeOutputParams> createOutputTensors();
+    std::shared_ptr<tensorrt_llm::layers::ExplicitDraftTokensOutputs> createOutputTensors();
 
     void checkLayerResult();
 

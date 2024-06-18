@@ -12,17 +12,17 @@ import tensorrt as trt
 import torch
 from filelock import FileLock
 
-from tensorrt_llm._utils import trt_dtype_to_np, trt_dtype_to_torch, trt_gte_10
+from tensorrt_llm._utils import (str_dtype_to_trt, trt_dtype_to_np,
+                                 trt_dtype_to_torch, trt_gte_10)
 from tensorrt_llm.functional import (AllReduceConfig, AllReduceFusionParams,
-                                     AllReduceStrategy)
+                                     AllReduceStrategy, create_allreduce_plugin)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.network import (PluginInfo, delete_plugin_info, get_np_weight,
                                   get_plugin_info, set_plugin_info)
-from tensorrt_llm.plugin import (TRT_LLM_PLUGIN_NAMESPACE,
-                                 current_all_reduce_helper,
-                                 init_all_reduce_helper)
-from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
+from tensorrt_llm.plugin import TRT_LLM_PLUGIN_NAMESPACE, init_all_reduce_helper
+from tensorrt_llm.plugin.plugin import (CustomAllReduceHelper,
+                                        current_all_reduce_helper)
 from tensorrt_llm.version import __version__
 
 from .config import AutoParallelConfig
@@ -36,8 +36,8 @@ from .tensor_parallel.plugin_nodes.gpt_attention_node import (
     GPTAttentionPlugin, IdxEntry, IdxEntryParser)
 from .tensor_parallel.sharding_spec import ShardingSpec, get_sharding_sequence
 from .tensor_parallel.sharding_strategy import ShardingStrategy
-from .utils import (get_builder_flags, get_updated_plugin, to_base_class_layer,
-                    to_subclass_layer, to_trt_weights)
+from .utils import (get_updated_plugin, to_base_class_layer, to_subclass_layer,
+                    to_trt_weights)
 
 default_int_dtype = trt.int64 if trt_gte_10() else trt.int32
 
@@ -508,6 +508,10 @@ class GraphGroup(ABC):
                   commspec,
                   output_name=None,
                   is_singleton=False):
+        input_tensors = [
+            self.get_tensor(context, input_name, device_id.item())
+            for device_id in np.nditer(device_ids)
+        ]
         comm_pattern = commspec.comm_pattern
         if comm_pattern == "split":
             self.add_split(context, input_name, output_name, device_ids,
@@ -528,20 +532,21 @@ class GraphGroup(ABC):
                                 commspec.logical_process_axis)
         else:
             raise NotImplementedError
+        output_tensors = [
+            self.get_tensor(context, input_name, device_id.item())
+            for device_id in np.nditer(device_ids)
+        ]
+        for input_tensor, output_tensor in zip(input_tensors, output_tensors):
+            if input_tensor.dtype != output_tensor.dtype:
+                raise ValueError(
+                    f"Input tensor and output tensor should have the same dtype for communication layers, "
+                    f"input dtype is {input_tensor.dtype} for {input_tensor.name}, "
+                    f"but output dtype is {output_tensor.dtype} for {output_tensor.name}"
+                )
 
     def add_all_reduce(self, context: GraphContext, input_name, output_name,
                        device_ids):
-        builder_flags = get_builder_flags()
-        if builder_flags & (1 << int(trt.BuilderFlag.FP16)) != 0:
-            dtype = trt.DataType.HALF
-        elif builder_flags & (1 << int(trt.BuilderFlag.BF16)) != 0:
-            dtype = trt.DataType.BF16
-        else:
-            dtype = trt.DataType.FLOAT
-        fast_reduce = self.auto_parallel_config.fast_reduce
-        if fast_reduce:
-            logger.debug(f"all_reduce with {dtype} after {input_name}")
-
+        dtype = str_dtype_to_trt(self.full_graph._plugin_config.dtype)
         to_reduce_tensors = []
         for device_id in np.nditer(device_ids):
             device_id = device_id.item()
@@ -550,7 +555,7 @@ class GraphGroup(ABC):
             input_tensor = self.get_tensor(context, input_name,
                                            device_id).as_trt()
             input_dtype = input_tensor.dtype
-            if fast_reduce:
+            if input_dtype != dtype:
                 to_reduce_tensor = self.cast(
                     network,
                     input_tensor,
@@ -562,7 +567,7 @@ class GraphGroup(ABC):
             to_reduce_tensors.append(to_reduce_tensor)
         self.add_all_reduce_layer(context, input_name, output_name, device_ids,
                                   to_reduce_tensors)
-        if fast_reduce and input_dtype != dtype:
+        if input_dtype != dtype:
             for device_id in np.nditer(device_ids):
                 device_id = device_id.item()
                 layer_info = (input_name, output_name, device_id)
@@ -1313,6 +1318,11 @@ class GraphGroupBase(GraphGroup):
                 input_name = layer.get_input(i).name
                 local_context.update_name_mapping(input_name, device_id,
                                                   updated_input.name)
+                if layer.get_input(i).dtype != updated_input.dtype:
+                    raise ValueError(
+                        f"Input dtype mismatch for {layer.name}, "
+                        f"expect {layer.get_input(i).dtype} for {input_name}, "
+                        f"get {updated_input.dtype} for {updated_input.name}")
 
             prefix = self.get_prefix(device_id)
             new_wrapped_layer = self.get_graph(device_id).add_layer(
@@ -1431,17 +1441,7 @@ class DistributedGraphGroup(GraphGroupBase):
 
     def add_reduce_scatter(self, context: GraphContext, input_name, output_name,
                            device_ids, shard_dims, device_dims):
-        builder_flags = get_builder_flags()
-        if builder_flags & (1 << int(trt.BuilderFlag.FP16)) != 0:
-            dtype = trt.DataType.HALF
-        elif builder_flags & (1 << int(trt.BuilderFlag.BF16)) != 0:
-            dtype = trt.DataType.BF16
-        else:
-            dtype = trt.DataType.FLOAT
-        fast_reduce = self.auto_parallel_config.fast_reduce
-        if fast_reduce:
-            logger.debug(f"reduce_scatter with {dtype} after {input_name}")
-
+        dtype = str_dtype_to_trt(self.full_graph._plugin_config.dtype)
         it = np.nditer(device_ids, flags=['multi_index'])
         for device_id in it:
             device_id = device_id.item()
@@ -1464,7 +1464,7 @@ class DistributedGraphGroup(GraphGroupBase):
                 input_tensor = transpose_layer.get_output(0)
             flatten_tensor = self.flatten(network, input_tensor, layer_info)
             input_dtype = flatten_tensor.dtype
-            if fast_reduce:
+            if input_dtype != dtype:
                 to_reduce_tensor = self.cast(
                     network,
                     flatten_tensor,
@@ -1509,7 +1509,7 @@ class DistributedGraphGroup(GraphGroupBase):
                 self.shapes_by_device[device_id][
                     reduce_scatter_tensor.name] = output_shape
                 wrapped_tensor.shape = output_shape
-            if fast_reduce:
+            if input_dtype != dtype:
                 reduce_scatter_tensor = self.cast(
                     network,
                     reduce_scatter_tensor,
@@ -1565,8 +1565,9 @@ class DistributedGraphGroup(GraphGroupBase):
 
     def add_all_reduce_layer(self, context: GraphContext, input_name,
                              output_name, device_ids, to_reduce_tensors):
+        counter = 0
         if self.use_custom_all_reduce:
-            all_reduce_instance_id = current_all_reduce_helper().gen_id()
+            counter = current_all_reduce_helper().gen_id()
         for device_id, to_reduce_tensor in zip(np.nditer(device_ids),
                                                to_reduce_tensors):
             device_id = device_id.item()
@@ -1575,61 +1576,23 @@ class DistributedGraphGroup(GraphGroupBase):
             graph = self.get_graph(device_id)
             if self.use_custom_all_reduce:
                 strategy = AllReduceStrategy.AUTO
+                workspace = graph.get_input("all_reduce_workspace").as_trt()
             else:
                 strategy = AllReduceStrategy.NCCL
-            reduce_fusion_params = AllReduceFusionParams()
-            allreduce_plg_creator = trt.get_plugin_registry(
-            ).get_plugin_creator('AllReduce', '1', TRT_LLM_PLUGIN_NAMESPACE)
-            assert allreduce_plg_creator is not None
+                workspace = None
 
-            group = trt.PluginField(
-                "group",
-                np.ascontiguousarray(device_ids.reshape(-1).astype(np.int32)),
-                trt.PluginFieldType.INT32)
-            pf_type = trt.PluginField(
-                "type_id", np.array([int(to_reduce_tensor.dtype)], np.int32),
-                trt.PluginFieldType.INT32)
-            pf_strategy = trt.PluginField("strategy",
-                                          np.array([int(strategy)], np.int8),
-                                          trt.PluginFieldType.INT8)
-            config = AllReduceConfig(0)
-            pf_config = trt.PluginField("config",
-                                        np.array([int(config)], np.int8),
-                                        trt.PluginFieldType.INT8)
-            pfc = [group, pf_type, pf_strategy, pf_config]
-            p_fusion_op = trt.PluginField(
-                "fusion_op",
-                np.array([int(reduce_fusion_params.fusion_op)], np.int8),
-                trt.PluginFieldType.INT8)
-            pfc.append(p_fusion_op)
-            pf_counter = trt.PluginField(
-                "counter",
-                np.array([all_reduce_instance_id], np.int32),
-                trt.PluginFieldType.INT32,
+            all_reduce_layer, allreduce_plg_creator, pfc = create_allreduce_plugin(
+                network=network,
+                tensor=to_reduce_tensor,
+                workspace=workspace,
+                group=np.ascontiguousarray(
+                    device_ids.reshape(-1).astype(np.int32)),
+                strategy=strategy,
+                dtype=to_reduce_tensor.dtype,
+                config=AllReduceConfig(0),
+                counter=counter,
+                reduce_fusion_params=AllReduceFusionParams(),
             )
-            pfc.append(pf_counter)
-            p_eps = trt.PluginField(
-                "eps", np.array([float(reduce_fusion_params.eps)], np.float32),
-                trt.PluginFieldType.FLOAT32)
-            pfc.append(p_eps)
-            p_affine = trt.PluginField(
-                "affine",
-                np.array([int(reduce_fusion_params.has_affine())], np.int8),
-                trt.PluginFieldType.INT8)
-            pfc.append(p_affine)
-            p_bias = trt.PluginField(
-                "bias", np.array([int(reduce_fusion_params.has_bias())],
-                                 np.int8), trt.PluginFieldType.INT8)
-            pfc.append(p_bias)
-
-            pfc = trt.PluginFieldCollection(pfc)
-            ar_plug = allreduce_plg_creator.create_plugin("allreduce", pfc)
-
-            inputs = [to_reduce_tensor]
-            if self.use_custom_all_reduce:
-                workspace = graph.get_input("all_reduce_workspace").as_trt()
-                inputs.append(workspace)
-            all_reduce_layer = network.add_plugin_v2(inputs, ar_plug)
             plugin_info = PluginInfo(allreduce_plg_creator, "allreduce", pfc)
             set_plugin_info(network, all_reduce_layer.name, plugin_info)
             with self.disable_infer_shape():
@@ -1761,6 +1724,12 @@ class DistributedGraphGroup(GraphGroupBase):
                 graph.add_output_shape(trt_output)
             else:
                 graph.add_output(trt_output)
+            trt_output.dtype = tensor.dtype
+            if tensor.dtype != output_tensor.dtype:
+                raise ValueError(
+                    f"Output dtype mismatch, "
+                    f"expect {tensor.dtype} for {tensor.name}, "
+                    f"get {output_tensor.dtype} for {output_tensor.name}")
 
         shard_dims = strategy.sharding_specs["input0"].dim_partition_dict
         for dim, device_dim in shard_dims.items():
@@ -2187,6 +2156,7 @@ class PrefixedGraphGroup(GraphGroupBase):
             output = self.prefixed_graph.add_output_shape(trt_output)
         else:
             output = self.prefixed_graph.add_output(trt_output)
+        trt_output.dtype = tensor.dtype
         output.attrs["strategy"] = strategy.name
 
     def assign_shapes(self, shape_info: ShapeInfo):
@@ -2229,9 +2199,10 @@ def parallelize(
         graph_strategy,
         config.graph_config.graph_mapping,
     )
+    graph._plugin_config = simplifier.llm_network.plugin_config
     graph_group = GraphGroup.from_graph(graph, config, auto_parallel_config)
 
-    use_custom_all_reduce = simplifier.llm_network.plugin_config.use_custom_all_reduce
+    use_custom_all_reduce = graph._plugin_config.use_custom_all_reduce
     if use_custom_all_reduce and not debug_mode:
         graph_group.use_custom_all_reduce = True
         init_all_reduce_helper()

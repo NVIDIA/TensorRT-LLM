@@ -100,8 +100,8 @@ int AllgatherPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
         size *= inputDesc[0].dims.d[i];
     }
 
-    NCCLCHECK(ncclAllGather(
-        inputs[0], outputs[0], size, (*getDtypeMap())[inputDesc[0].type], (*getCommMap())[mGroup], stream));
+    TLLM_CHECK_WITH_INFO(mNcclComm.get() != nullptr, "mNcclComm should be initialized before used");
+    NCCLCHECK(ncclAllGather(inputs[0], outputs[0], size, (*getDtypeMap())[inputDesc[0].type], *mNcclComm, stream));
 
     return 0;
 }
@@ -133,21 +133,15 @@ int AllgatherPlugin::getNbOutputs() const noexcept
 
 int AllgatherPlugin::initialize() noexcept
 {
-    initCommMap(mGroup);
+    if (isBuilding())
+    {
+        return 0;
+    }
+    mNcclComm = getComm(mGroup);
     return 0;
 }
 
-void AllgatherPlugin::terminate() noexcept
-{
-    auto* commMap = getCommMap();
-    // [] operator inserts T() if it does not exist
-    if (isBuilding() || (*commMap)[mGroup] == nullptr)
-    {
-        return;
-    }
-    NCCLCHECK(ncclCommDestroy((*commMap)[mGroup]));
-    (*commMap)[mGroup] = nullptr;
-}
+void AllgatherPlugin::terminate() noexcept {}
 
 size_t AllgatherPlugin::getSerializationSize() const noexcept
 {

@@ -262,16 +262,17 @@ void MedusaDecodingLayerTest<T>::setup(SamplingParams& params)
 }
 
 template <typename T>
-std::shared_ptr<MedusaInputParams> MedusaDecodingLayerTest<T>::createInputTensors()
+std::shared_ptr<MedusaDecodingInputs> MedusaDecodingLayerTest<T>::createInputTensors()
 {
-    auto forwardParams = std::make_shared<MedusaInputParams>(
-        tcc::toTllmTensor(*mTargetLogitsDevice), tcc::toTllmTensor(*mEndIdsDevice));
+    auto forwardParams = std::make_shared<MedusaDecodingInputs>(tcc::toTllmTensor(*mEndIdsDevice), mBatchSize);
 
     auto batchSlots = BufferRange<SizeType32>(*mBatchSlots);
 
+    forwardParams->logits = tcc::toTllmTensor(*mTargetLogitsDevice);
+
     forwardParams->finished = tcc::toTllmTensor(*mFinishedDevice);
 
-    forwardParams->batch_slots = tcc::toTllmTensor(*mBatchSlots);
+    forwardParams->batchSlots = tcc::toTllmTensor(*mBatchSlots);
 
     forwardParams->paths = tcc::toTllmTensor(*mPathsDevice);
 
@@ -295,30 +296,29 @@ std::shared_ptr<MedusaInputParams> MedusaDecodingLayerTest<T>::createInputTensor
     }
     forwardParams->medusaLogits = medusaLogits;
 
-    forwardParams->medusaCurTokensPerStep = tcc::toTllmTensor(*mTokensPerStepDevice);
+    forwardParams->curTokensPerStep = tcc::toTllmTensor(*mTokensPerStepDevice);
 
-    forwardParams->medusaTargetTokensPerStep = tcc::toTllmTensor(*mTokensPerStepDevice);
+    forwardParams->targetTokensPerStep = tcc::toTllmTensor(*mTokensPerStepDevice);
 
     return forwardParams;
 }
 
 template <typename T>
-std::shared_ptr<DynamicDecodeOutputParams> MedusaDecodingLayerTest<T>::createOutputTensors()
+std::shared_ptr<SpeculativeDecodingOutputs> MedusaDecodingLayerTest<T>::createOutputTensors()
 {
-    auto outputParams = std::make_shared<DynamicDecodeOutputParams>(tcc::toTllmTensor(*mOutputIdsDevice));
+    auto outputParams = std::make_shared<SpeculativeDecodingOutputs>(tcc::toTllmTensor(*mOutputIdsDevice));
 
-    outputParams->sequence_length = tcc::toTllmTensor(*mSeqLengthsDevice);
+    outputParams->sequenceLength = tcc::toTllmTensor(*mSeqLengthsDevice);
 
     outputParams->finished = tcc::toTllmTensor(*mFinishedDevice);
 
-    outputParams->speculativeDecodingOutputs = DynamicDecodeOutputParams::SpeculativeDecodingOutputs();
-    outputParams->speculativeDecodingOutputs->nextDraftTokens = tcc::toTllmTensor(*mNextDraftTokensDevice);
+    outputParams->nextDraftTokens = tcc::toTllmTensor(*mNextDraftTokensDevice);
 
-    outputParams->speculativeDecodingOutputs->acceptedLengths = tcc::toTllmTensor(*mAcceptedLengths);
+    outputParams->numNewTokens = tcc::toTllmTensor(*mAcceptedLengths);
 
-    outputParams->speculativeDecodingOutputs->acceptedLengthsCumSum = tcc::toTllmTensor(*mAcceptedLengthCumSumDevice);
+    outputParams->numNewTokensCumSum = tcc::toTllmTensor(*mAcceptedLengthCumSumDevice);
 
-    outputParams->speculativeDecodingOutputs->pathsOffsets = tcc::toTllmTensor(*mPackedPathsDevice);
+    outputParams->pathsOffsets = tcc::toTllmTensor(*mPackedPathsDevice);
 
     return outputParams;
 }

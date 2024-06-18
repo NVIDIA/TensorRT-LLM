@@ -23,10 +23,11 @@ from tensorrt_llm._utils import get_init_params, str_dtype_to_trt
 from tensorrt_llm.layers.lora import LoraParams
 
 from .._common import default_net, default_trtnet
-from ..functional import (_add_plugin_info, _create_tensor, allreduce, cast,
-                          div, is_gated_activation, non_gated_version, softmax,
-                          sum, topk)
+from ..functional import (AllReduceStrategy, _add_plugin_info, _create_tensor,
+                          allreduce, cast, div, is_gated_activation,
+                          non_gated_version, softmax, sum, topk)
 from ..layers import MLP, GatedMLP
+from ..mapping import Mapping
 from ..module import Module, ModuleList
 from ..parameter import Parameter
 from ..plugin import TRT_LLM_PLUGIN_NAMESPACE
@@ -48,11 +49,6 @@ activation_str_to_int_map = {
 
 @dataclass
 class MoeConfig:
-    # [WARNING] Keep the below in sync with cpp/tensorrt_llm/kernels/mixtureOfExperts/moe_kernels.h
-    class ParallelismMode(IntEnum):
-        NONE = 0
-        EXPERT_PARALLEL = 1
-        TENSOR_PARALLEL = 2
 
     class ExpertScaleNormalizationMode(IntEnum):
         NONE = 0
@@ -60,7 +56,6 @@ class MoeConfig:
 
     num_experts: int = 0
     top_k: int = 0
-    tp_mode: ParallelismMode = ParallelismMode.TENSOR_PARALLEL
     normalization_mode: ExpertScaleNormalizationMode = ExpertScaleNormalizationMode.RENORMALIZE
 
     def validate(self) -> "MoeConfig":
@@ -101,7 +96,9 @@ def _moe_plugin(moe_config,
                 output_dtype,
                 quant_mode=QuantMode(0),
                 tp_size=1,
-                tp_rank=0):
+                ep_size=1,
+                tp_rank=0,
+                ep_rank=0):
     if isinstance(dtype, str):
         dtype = str_dtype_to_trt(dtype)
 
@@ -127,7 +124,7 @@ def _moe_plugin(moe_config,
 
     # Create the plugin with our required state
     num_experts = moe_config.num_experts
-    # We pass the full number of experts (not divided by tp_size) even for EP mode
+    # We pass the full number of experts (not divided by ep_size) even for EP mode
     p_num_experts = trt.PluginField("number_of_experts",
                                     np.array(num_experts, dtype=np.int32),
                                     trt.PluginFieldType.INT32)
@@ -167,9 +164,10 @@ def _moe_plugin(moe_config,
                                 trt.PluginFieldType.INT32)
     p_tp_rank = trt.PluginField("tp_rank", np.array(tp_rank, dtype=np.int32),
                                 trt.PluginFieldType.INT32)
-    p_parallelism_mode = trt.PluginField(
-        "parallelism_mode", np.array(moe_config.tp_mode, dtype=np.int32),
-        trt.PluginFieldType.INT32)
+    p_ep_size = trt.PluginField("ep_size", np.array(ep_size, dtype=np.int32),
+                                trt.PluginFieldType.INT32)
+    p_ep_rank = trt.PluginField("ep_rank", np.array(ep_rank, dtype=np.int32),
+                                trt.PluginFieldType.INT32)
     p_normalization_mode = trt.PluginField(
         "normalization_mode",
         np.array(moe_config.normalization_mode, dtype=np.int32),
@@ -179,7 +177,7 @@ def _moe_plugin(moe_config,
         p_num_experts, p_top_k, p_expert_hidden_size, p_expert_inter_size,
         p_activation_type, p_type_id, p_weight_type_id, p_output_type_id,
         p_quant_mode, p_use_finished, p_use_bias, p_tp_size, p_tp_rank,
-        p_parallelism_mode, p_normalization_mode
+        p_ep_size, p_ep_rank, p_normalization_mode
     ])
 
     # Create the plugin with our constant inputs to the constructor
@@ -275,11 +273,11 @@ class MixtureOfExperts(Module):
                  hidden_size: int,
                  ffn_hidden_size: int,
                  hidden_act: str,
+                 mapping: Mapping = Mapping(),
                  bias: bool = True,
                  dtype=None,
                  tp_group: List[int] = None,
                  tp_size: int = 1,
-                 tp_rank: int = 0,
                  quant_mode=QuantMode(0)):
         super().__init__()
 
@@ -295,25 +293,24 @@ class MixtureOfExperts(Module):
         self.weight_dtype = dtype
         self.tp_group = tp_group
         self.tp_size = tp_size
-        self.tp_rank = tp_rank
+        self.mapping = mapping
         self.quant_mode = quant_mode
         self.bias = bias
 
         self.experts_per_node = self.num_experts
-        self.tp_mode = moe_config.tp_mode
-        if moe_config.tp_mode == MoeConfig.ParallelismMode.EXPERT_PARALLEL:
-            if self.num_experts % self.tp_size != 0:
+        if self.mapping.has_moe_ep():
+            if self.num_experts % self.mapping.moe_ep_size != 0:
                 raise ValueError(
-                    f"MixtureOfExperts - Number of experts {self.num_experts} is not a multiple of EP size {self.tp_size}"
+                    f"MixtureOfExperts - Number of experts {self.num_experts} is not a multiple of EP size {self.mapping.moe_ep_size}"
                 )
-            self.experts_per_node = self.experts_per_node // tp_size
+            self.experts_per_node = self.experts_per_node // self.mapping.moe_ep_size
 
-        elif moe_config.tp_mode == MoeConfig.ParallelismMode.TENSOR_PARALLEL:
-            if self.ffn_hidden_size % self.tp_size != 0:
+        if self.mapping.has_moe_tp():
+            if self.ffn_hidden_size % self.mapping.moe_tp_size != 0:
                 raise ValueError(
-                    f"MixtureOfExperts - FFN Hidden Size {self.ffn_hidden_size} is not a multiple of TP size {self.tp_size}"
+                    f"MixtureOfExperts - FFN Hidden Size {self.ffn_hidden_size} is not a multiple of TP size {self.mapping.moe_tp_size}"
                 )
-            self.expert_inter_size = self.ffn_hidden_size // tp_size
+            self.expert_inter_size = self.ffn_hidden_size // self.mapping.moe_tp_size
 
         if quant_mode.has_fp8_qdq() and self.bias:
             # TODO (dastokes) We will need to revisit this if we have a use case for it
@@ -436,10 +433,12 @@ class MixtureOfExperts(Module):
                              weight_dtype=weight_dtype_quant,
                              output_dtype=output_dtype_quant,
                              quant_mode=self.quant_mode,
-                             tp_size=self.tp_size,
-                             tp_rank=self.tp_rank)
+                             tp_size=self.mapping.moe_tp_size,
+                             tp_rank=self.mapping.moe_tp_rank,
+                             ep_size=self.mapping.moe_ep_size,
+                             ep_rank=self.mapping.moe_ep_rank)
 
-        if self.tp_size > 1 and self.tp_group is not None and self.moe_config.tp_mode != MoeConfig.ParallelismMode.NONE:
+        if self.tp_size > 1 and self.tp_group is not None:
             output = allreduce(output, self.tp_group)
 
         return output
@@ -475,11 +474,11 @@ class MoeOOTB(MOE):
             )
         ClsMLP = GatedMLP if is_gated_activation(self.hidden_act) else MLP
 
-        # In OOTB mode, when ParallelismMode mode is TENSOR_PARALLEL, using MLP class to do TP settings
+        # In OOTB mode, when TP is enabled, using MLP class to do TP settings
         # pass self.ffn_hidden_size to original size,
-        if self.moe_config.tp_mode == MoeConfig.ParallelismMode.TENSOR_PARALLEL:
-            tp_size = self.tp_size
-            tp_group = self.tp_group
+        if self.mapping.has_moe_tp():
+            tp_size = self.mapping.moe_tp_size
+            tp_group = self.mapping.moe_tp_group
         else:
             tp_size = 1
             tp_group = None
@@ -543,8 +542,8 @@ class MoeOOTB(MOE):
         output = hidden_states * 0.0  # Create output space
         # Experts inference
         for i, expert in enumerate(self.experts):
-            if self.tp_mode == MoeConfig.ParallelismMode.EXPERT_PARALLEL:
-                index = i + self.experts_per_node * self.tp_rank
+            if self.mapping.has_moe_ep():
+                index = i + self.experts_per_node * self.mapping.moe_ep_rank
             else:
                 index = i
             # inference expert
@@ -559,8 +558,10 @@ class MoeOOTB(MOE):
                     keepdim=True), self.dtype)
 
             output += out * expert_weights
-        if self.tp_size > 1 and self.tp_group is not None and self.moe_config.tp_mode == MoeConfig.ParallelismMode.EXPERT_PARALLEL:
-            output = allreduce(output, self.tp_group)
+        if self.mapping.has_moe_ep() and self.mapping.moe_ep_group is not None:
+            output = allreduce(output,
+                               self.mapping.moe_ep_group,
+                               strategy=AllReduceStrategy.NCCL)
 
         return output
 

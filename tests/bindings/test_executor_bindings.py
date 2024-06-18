@@ -805,6 +805,21 @@ def test_kv_cache_config():
     assert config.host_cache_size is None
     assert config.onboard_blocks == True
 
+    config.enable_block_reuse = True
+    config.max_tokens = 1
+    config.max_attention_window = 2
+    config.sink_token_length = 3
+    config.free_gpu_memory_fraction = 0.5
+    config.host_cache_size = 4
+    config.onboard_blocks = False
+    assert config.enable_block_reuse == True
+    assert config.max_tokens == 1
+    assert config.max_attention_window == 2
+    assert config.sink_token_length == 3
+    assert config.free_gpu_memory_fraction == 0.5
+    assert config.host_cache_size == 4
+    assert config.onboard_blocks == False
+
     kwargs = {
         "enable_block_reuse": True,
         "max_tokens": 3,
@@ -821,21 +836,18 @@ def test_kv_cache_config():
 
 def test_lookahead_decoding_config():
     config = trtllm.LookaheadDecodingConfig(3, 5, 7)
-    assert config.max_ngram_size == 3
-    assert config.max_window_size == 5
+    assert config.max_window_size == 3
+    assert config.max_ngram_size == 5
     assert config.max_verification_set_size == 7
 
-    config.max_ngram_size = 5
-    config.max_window_size = 10
-    config.max_verification_set_size = 3
-
-    assert config.max_ngram_size == 5
-    assert config.max_window_size == 10
+    config = trtllm.LookaheadDecodingConfig(5, 10, 3)
+    assert config.max_window_size == 5
+    assert config.max_ngram_size == 10
     assert config.max_verification_set_size == 3
 
     kwargs = {
-        "max_ngram_size": 3,
         "max_window_size": 5,
+        "max_ngram_size": 3,
         "max_verification_set_size": 7,
     }
 
@@ -909,6 +921,7 @@ def test_executor_config():
     assert config.parallel_config is None
     assert isinstance(config.peft_cache_config, trtllm.PeftCacheConfig)
     assert config.logits_post_processor_map is None
+    assert config.logits_post_processor_batched is None
     assert config.decoding_config is None
 
     kwargs = {
@@ -1056,10 +1069,67 @@ def test_logits_post_processor(model_files, model_path):
     assert tokens[-max_new_tokens:] == [42] * max_new_tokens
 
 
+@skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
+def test_logits_post_processor_batched(model_files, model_path):
+
+    # Define the logits post-processor callback
+    def logits_post_processor_batched(req_id_batch: tp.List[int],
+                                      logits_batch: tp.List[torch.Tensor],
+                                      ids_batch: tp.List[tp.List[tp.List[int]]],
+                                      stream_ptr: int):
+        with torch.cuda.stream(torch.cuda.ExternalStream(stream_ptr)):
+            for logits in logits_batch:
+                logits[:] = float("-inf")
+                logits[..., 42] = 0
+
+    # Create executor
+    beam_width = 1
+    executor_config = trtllm.ExecutorConfig(beam_width)
+    executor_config.logits_post_processor_batched = logits_post_processor_batched
+    executor = trtllm.Executor(model_path, trtllm.ModelType.DECODER_ONLY,
+                               executor_config)
+
+    # Create the request
+    max_new_tokens = 5
+    input_tokens = [1, 2, 3, 4]
+    request = trtllm.Request(input_tokens, max_new_tokens, False)
+    request.logits_post_processor_name = request.BATCHED_POST_PROCESSOR_NAME
+
+    batch_size = 4
+    # Enqueue the requests
+    request_ids = []
+    for _ in range(batch_size):
+        request_id = executor.enqueue_request(request)
+        request_ids.append(request_id)
+
+    # Get the new tokens
+    tokens = {req_id: [] for req_id in request_ids}
+    num_finished = 0
+    i = 0
+    max_wait_ms = 10000
+    while num_finished < len(request_ids) and i < max_wait_ms:
+        responses = executor.await_responses(datetime.timedelta(milliseconds=1))
+        for response in responses:
+            req_id = response.request_id
+            assert not response.has_error(
+            ), f"Request id {req_id} failed with err {response.error_msg}"
+            result = response.result
+            num_finished += 1 if result.is_final else 0
+            new_tokens = result.output_token_ids[beam_width - 1]
+            tokens[req_id].extend(new_tokens)
+    assert i < max_wait_ms
+
+    expected_num_tokens = get_expected_num_tokens(len(input_tokens),
+                                                  max_new_tokens, False, False)
+    for req_id in request_ids:
+        assert len(tokens[req_id]) == expected_num_tokens, f"{req_id}"
+
+
 def test_iteration_stats():
     stats = trtllm.IterationStats()
     stats.timestamp = "01:23:56"
     stats.iter = 1
+    stats.iter_latency_ms = 100
     stats.num_active_requests = 2
     stats.max_num_active_requests = 3
     stats.gpu_mem_usage = 1024
@@ -1068,6 +1138,7 @@ def test_iteration_stats():
     stats_json = json.loads(stats.to_json_str())
     assert stats_json["timestamp"] == stats.timestamp
     assert stats_json["iter"] == stats.iter
+    assert stats_json["iterLatencyMS"] == stats.iter_latency_ms
     assert stats_json["numActiveRequests"] == stats.num_active_requests
     assert stats_json["maxNumActiveRequests"] == stats.max_num_active_requests
     assert stats_json["gpuMemUsage"] == stats.gpu_mem_usage
@@ -1116,3 +1187,47 @@ def test_scheduler_config_pickle():
     config_str = pickle.dumps(config)
     config_copy = pickle.loads(config_str)
     assert config.capacity_scheduler_policy == config_copy.capacity_scheduler_policy
+
+
+def test_kv_cache_config_pickle():
+    config = trtllm.KvCacheConfig()
+    config.enable_block_reuse = True
+    config.free_gpu_memory_fraction = 0.3
+    config_copy = pickle.loads(pickle.dumps(config))
+    assert config.enable_block_reuse == config_copy.enable_block_reuse
+    assert config.max_tokens == config_copy.max_tokens
+    assert config.max_attention_window == config_copy.max_attention_window
+    assert config.sink_token_length == config_copy.sink_token_length
+    assert config.free_gpu_memory_fraction == config_copy.free_gpu_memory_fraction
+    assert config.host_cache_size == config_copy.host_cache_size
+    assert config.onboard_blocks == config_copy.onboard_blocks
+
+
+def test_peft_cache_config_pickle():
+    config = trtllm.PeftCacheConfig(1, 2, 3, 4, 5, 6, 7, 8, 9, 0.9, 1024)
+    config_copy = pickle.loads(pickle.dumps(config))
+    assert config.num_host_module_layer == config_copy.num_host_module_layer
+    assert config.num_device_module_layer == config_copy.num_device_module_layer
+    assert config.optimal_adapter_size == config_copy.optimal_adapter_size
+    assert config.max_adapter_size == config_copy.max_adapter_size
+    assert config.num_put_workers == config_copy.num_put_workers
+    assert config.num_ensure_workers == config_copy.num_ensure_workers
+    assert config.num_copy_streams == config_copy.num_copy_streams
+    assert config.max_pages_per_block_host == config_copy.max_pages_per_block_host
+    assert config.max_pages_per_block_device == config_copy.max_pages_per_block_device
+    assert config.device_cache_percent == config_copy.device_cache_percent
+    assert config.host_cache_size == config_copy.host_cache_size
+
+
+def test_executor_config_pickle():
+    beam_width = 2
+    config = trtllm.ExecutorConfig(beam_width)
+    config.scheduler_config = trtllm.SchedulerConfig()
+    config.kv_cache_config = trtllm.KvCacheConfig()
+    config.parallel_config = trtllm.ParallelConfig()
+    config.peft_cache_config = trtllm.PeftCacheConfig(1)
+    pickle.dumps(config)
+    config_copy = pickle.loads(pickle.dumps(config))
+    assert config.max_beam_width == config_copy.max_beam_width
+    assert config.scheduler_config.capacity_scheduler_policy == config_copy.scheduler_config.capacity_scheduler_policy
+    assert config.kv_cache_config.enable_block_reuse == config_copy.kv_cache_config.enable_block_reuse

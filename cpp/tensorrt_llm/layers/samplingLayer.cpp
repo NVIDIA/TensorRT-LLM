@@ -19,7 +19,8 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
-#include "tensorrt_llm/kernels/samplingTopKKernels.h"
+#include "tensorrt_llm/layers/topKSamplingLayer.h"
+#include "tensorrt_llm/layers/topPSamplingLayer.h"
 
 #include <algorithm>
 
@@ -27,9 +28,7 @@ using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::runtime;
 
-namespace tensorrt_llm
-{
-namespace layers
+namespace tensorrt_llm::layers
 {
 template <typename T>
 SamplingLayer<T>::SamplingLayer(executor::DecodingMode const& mode, DecoderDomain const& decoderDomain,
@@ -111,7 +110,7 @@ void SamplingLayer<T>::freeBuffer()
 
 template <typename T>
 void SamplingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 const* batchSlots,
-    std::shared_ptr<BaseSetupParams> baseSetupParams)
+    std::shared_ptr<BaseSetupParams> const& baseSetupParams)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -168,20 +167,17 @@ void SamplingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, SizeTyp
 
 template <typename T>
 void SamplingLayer<T>::forwardAsync(
-    std::shared_ptr<BaseOutputParams> baseOutputs, std::shared_ptr<BaseInputParams> baseInputs)
+    std::shared_ptr<BaseDecodingOutputs> const& outputs, std::shared_ptr<BaseDecodingInputs> const& baseInputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto inputs = std::dynamic_pointer_cast<SamplingInputParams>(baseInputs);
-    auto outputs = std::dynamic_pointer_cast<SamplingOutputParams>(baseOutputs);
+    auto inputs = std::dynamic_pointer_cast<SamplingInputs>(baseInputs);
 
-    auto const batchSize = inputs->logits.shape[0];
+    auto const batchSize = inputs->logits->shape[0];
 
-    auto logits = inputs->logits.template getPtr<T>();
-    auto endIds = inputs->end_ids.template getPtr<int const>();
-    auto batchSlots = inputs->batch_slots ? inputs->batch_slots->template getPtr<int const>() : nullptr;
-    float* cumLogProbs = (outputs->cum_log_probs) ? outputs->cum_log_probs->template getPtr<float>() : nullptr;
-    float* outputLogProbs = (outputs->output_log_probs) ? outputs->output_log_probs->template getPtr<float>() : nullptr;
+    auto logits = inputs->logits->template getPtr<T>();
+    auto endIds = inputs->endIds.template getPtr<int const>();
+    auto batchSlots = inputs->batchSlots ? inputs->batchSlots->template getPtr<int const>() : nullptr;
 
     FinishedState* finishedInput = (inputs->finished)
         ? reinterpret_cast<FinishedState*>(inputs->finished->template getPtr<FinishedState::UnderlyingType>())
@@ -192,9 +188,9 @@ void SamplingLayer<T>::forwardAsync(
     // Compute probabilities either for TopP or if cumLogProbs or outputLogProbs are specified
     bool const skipSoftMax = skipTopP && !mOutputLogProbs && !mCumLogProbs;
 
-    inputs->curand_states = mCurandStatesDevice;
-    inputs->sampling_workspace = mSamplingWorkspaceDevice;
-    inputs->probs_computed = !skipSoftMax;
+    inputs->curandStates = mCurandStatesDevice;
+    inputs->samplingWorkspace = mSamplingWorkspaceDevice;
+    inputs->probsComputed = !skipSoftMax;
     if (!skipSoftMax)
     {
         invokeAddBiasSoftMax(logits, (T**) nullptr, logits, (T*) (nullptr), endIds, finishedInput, batchSlots,
@@ -205,7 +201,7 @@ void SamplingLayer<T>::forwardAsync(
 
     for (auto&& layer : mSamplingLayers)
     {
-        layer->forwardAsync(baseOutputs, baseInputs);
+        layer->forwardAsync(outputs, baseInputs);
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -214,5 +210,4 @@ void SamplingLayer<T>::forwardAsync(
 template class SamplingLayer<float>;
 template class SamplingLayer<half>;
 
-} // namespace layers
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::layers

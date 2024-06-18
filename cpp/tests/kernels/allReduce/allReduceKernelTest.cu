@@ -231,7 +231,6 @@ bool test(int token_num, int hidden_size, bool has_bias, bool has_affine, int wa
     }
     params.barrier_flag = 0;
     params.ranks_per_node = world_size;
-    params.rank = rank;
     params.local_rank = rank;
     params.local_output_buffer_ptr = out.data();
     params.local_input_buffer_ptr = in.data();

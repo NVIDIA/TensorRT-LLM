@@ -150,7 +150,7 @@ The `trtllm-build` command builds TensorRT-LLM engines from TensorRT-LLM checkpo
 
 Normally, the `trtllm-build` command only requires a single GPU, but you can enable parallel building by passing the number of GPUs to the `--workers` argument.
 
-Using ChatGLM2-6B-32K / ChatGLM3-6B-32K models, we need to guarantee `max_batch_size * max_beam_width * (max_input_len + max_output_len) <= 78398 = 2^31 / (13696 * 2)` due to constrain of TensorRT. For example, we will fail to build engine while using default max_batch_size (8) and adding arguments `--max_beam_width=4 --max_input_len=20000 --max_output_len=100`.
+Using ChatGLM2-6B-32K / ChatGLM3-6B-32K models, we need to guarantee `max_batch_size * max_beam_width * max_seq_len <= 78398 = 2^31 / (13696 * 2)` due to constrain of TensorRT. For example, we will fail to build engine while using default max_batch_size (8) and adding arguments `--max_beam_width=4 --max_input_len=20000 --max_seq_len=20100`.
 
 ```bash
 # ChatGLM3-6B: single-gpu engine

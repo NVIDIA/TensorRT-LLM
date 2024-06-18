@@ -40,7 +40,7 @@ def test_int4_awq_quantization():
         BuildConfig(
             max_batch_size=max_batch_size,
             max_input_len=max_isl,
-            max_output_len=max_osl,
+            max_seq_len=max_osl + max_isl,
             max_num_tokens=max_batch_size * max_isl,
         ))
 
@@ -70,11 +70,7 @@ def test_fp8_quantization():
     tokenizer_dir = hf_model_dir
 
     checkpoint_dir = tempfile.TemporaryDirectory("llama-checkpoint").name
-    quant_config = QuantConfig(QuantAlgo.FP8,
-                               exclude_modules=[
-                                   'lm_head', 'vocab_embedding',
-                                   'position_embedding', 'block_embedding'
-                               ])
+    quant_config = QuantConfig(QuantAlgo.FP8)
     LLaMAForCausalLM.quantize(hf_model_dir,
                               checkpoint_dir,
                               quant_config=quant_config,
@@ -85,7 +81,7 @@ def test_fp8_quantization():
         llama,
         BuildConfig(max_batch_size=max_batch_size,
                     max_input_len=max_isl,
-                    max_output_len=max_osl,
+                    max_seq_len=max_osl + max_isl,
                     max_num_tokens=max_batch_size * max_isl,
                     strongly_typed=True))
     engine_dir = "llama-fp8-quantized"

@@ -35,7 +35,7 @@
     ```bash
     trtllm-build --checkpoint_dir=./tllm_checkpoint_1gpu \
                  --gemm_plugin=float16 --gpt_attention_plugin=float16 \
-                 --lookup_plugin=float16 --max_input_len=2048 --max_output_len=1024 \
+                 --lookup_plugin=float16 --max_input_len=2048 --max_seq_len=3072 \
                  --max_batch_size=8 --max_prompt_embedding_table_size=2048 \
                  --remove_input_padding=enable \
                  --output_dir=./trt_engines/Qwen-VL-7B-Chat

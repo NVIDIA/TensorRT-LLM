@@ -15,6 +15,7 @@ import tensorrt as trt
 
 from huggingface_hub import hf_hub_download
 from PIL import Image
+from safetensors import safe_open
 from torchvision import transforms
 from transformers import (AutoConfig, AutoProcessor, AutoTokenizer,
                           Blip2Processor, CLIPImageProcessor, NougatProcessor,
@@ -179,8 +180,9 @@ class MultimodalModelRunner:
                 use_fast=False,
                 use_legacy=False)
         else:
+            use_fast = False if self.model_type != "phi-3-vision" else True
             self.tokenizer = AutoTokenizer.from_pretrained(
-                self.args.hf_model_dir, use_fast=False, use_legacy=False)
+                self.args.hf_model_dir, use_fast=use_fast, use_legacy=False)
 
         self.tokenizer.padding_side = "right"
 
@@ -193,6 +195,14 @@ class MultimodalModelRunner:
         logger.info(f'Creating session from engine {vision_encoder_path}')
         self.visual_encoder_session = Session.from_serialized_engine(
             engine_buffer)
+        if self.model_type == "phi-3-vision":
+            self.image_newlines = {}
+            image_newlines_path = os.path.join(self.args.visual_engine_dir,
+                                               'image_newlines.safetensors')
+            with safe_open(image_newlines_path, framework="pt",
+                           device="cuda") as f:
+                for k in f.keys():
+                    self.image_newlines[k] = f.get_tensor(k)
 
     def init_llm(self):
         if self.decoder_llm:
@@ -261,6 +271,11 @@ class MultimodalModelRunner:
             input_ids = input_ids.expand(self.args.batch_size,
                                          *input_ids.shape[1:])
             length = input_ids.shape[1]
+        elif self.model_type == 'phi-3-vision':
+            input = image
+            image = input['pixel_values']
+            bs = image.shape[0]
+            image = image.flatten(0, 1)
 
         if not warmup:
             profiler.start("Vision")
@@ -310,6 +325,47 @@ class MultimodalModelRunner:
                 args.batch_size, visual_features, first_batch_split_prompts,
                 input_lengths)
             return input_ids, input_lengths, ptuning_args, visual_features
+        elif self.model_type == 'phi-3-vision':
+            input_ids = input["input_ids"].clone()
+            glb_GN = torch.squeeze(self.image_newlines["glb_GN"].clone(), dim=0)
+            sub_GN = self.image_newlines["sub_GN"].clone()
+
+            H = visual_features.shape[1]
+            C = visual_features.shape[-1]
+            #bs*17*12*12*3072
+            visual_features = visual_features.view(bs, -1, H, H, C)
+            global_img_feature = visual_features[:, 0]  #bs*12*12*3072
+            temp_glb_GN = sub_GN.repeat(bs, H, 1, 1)  #bs*12*1*3072
+            global_img_feature = torch.cat([global_img_feature, temp_glb_GN],
+                                           dim=2).reshape(bs, -1, C)
+
+            crop_visual_features = visual_features[:, 1:]
+            patch_sizes = [
+                image_size // image.shape[-1]
+                for image_size in input["image_sizes"]
+            ]
+            visual_features = []
+            for global_img_feature, crop_visual_feature, patch_size in zip(
+                    global_img_feature, crop_visual_features, patch_sizes):
+                crop_visual_feature = \
+                    crop_visual_feature[:patch_size[0]*patch_size[1]].view(patch_size[0], patch_size[1], H, H, C).permute(0, 2, 1, 3, 4).reshape(patch_size[0]*H, patch_size[1]*H, C)
+                temp_sub_GN = torch.squeeze(sub_GN.repeat(
+                    1, patch_size[0] * H, 1, 1),
+                                            dim=0)
+                crop_visual_feature = torch.cat(
+                    [crop_visual_feature, temp_sub_GN], dim=1).reshape(-1, C)
+                visual_features.append(
+                    torch.cat([crop_visual_feature, glb_GN, global_img_feature],
+                              dim=0))
+
+            num_img_tokens = [elem.size(0) for elem in visual_features]
+
+            visual_features = torch.cat(visual_features, dim=0)
+            input_ids = input_ids.expand(self.args.batch_size,
+                                         *input_ids.shape[1:])
+            input_ids = self.ptuning_setup_phi3(visual_features, input_ids,
+                                                num_img_tokens)
+            length = input_ids.shape[1]
         else:
             pre_input_ids = self.tokenizer(pre_prompt,
                                            return_tensors="pt",
@@ -331,7 +387,7 @@ class MultimodalModelRunner:
         input_lengths = torch.IntTensor([length] * args.batch_size).to(
             torch.int32)
 
-        if self.model_type in ['fuyu', 'kosmos-2']:
+        if self.model_type in ['fuyu', 'kosmos-2', 'phi-3-vision']:
             return input_ids, input_lengths, [visual_features], visual_features
 
         input_ids, ptuning_args = self.setup_fake_prompts(
@@ -611,6 +667,20 @@ class MultimodalModelRunner:
             res_input_ids.append(cur_input_ids)
         return res_input_ids
 
+    def ptuning_setup_phi3(self, visual_features, input_ids, num_img_tokens):
+        fake_prompt_id = torch.arange(
+            self.model_config.vocab_size,
+            self.model_config.vocab_size + visual_features.shape[0])
+        MAX_INPUT_ID = int(1e9)
+        positions = torch.nonzero((input_ids < 0) & (input_ids > -MAX_INPUT_ID),
+                                  as_tuple=False)
+        idx = 0
+        for i, cnt in enumerate(num_img_tokens):
+            input_ids[positions[idx, 0], positions[idx, 1]:positions[idx, 1] +
+                      cnt] = fake_prompt_id[idx:idx + cnt]
+            idx += cnt
+        return input_ids
+
     def ptuning_setup(self, prompt_table, input_ids, input_lengths):
         hidden_size = self.model_config.hidden_size * self.runtime_mapping.tp_size
         if prompt_table is not None:
@@ -735,6 +805,17 @@ class MultimodalModelRunner:
                 input_text = " [INST] which city is this? [/INST] "
             pre_prompt = input_text
             post_prompt = None
+        elif 'phi-3-vision' in self.model_type:
+            pre_prompt = "<|user|>\n<|image_1|>\n"
+            if input_text is None:
+                input_text = "Which city is this?"
+            post_prompt = input_text + "<|end|>\n<|assistant|>\n"
+            prompt = pre_prompt + post_prompt
+            processor = AutoProcessor.from_pretrained(args.hf_model_dir,
+                                                      trust_remote_code=True)
+            image = processor(text=prompt,
+                              images=raw_image,
+                              return_tensors="pt")
         elif self.model_type == "pix2struct":
             image_processor = AutoProcessor.from_pretrained(args.hf_model_dir)
             if input_text is None:
@@ -836,7 +917,9 @@ class MultimodalModelRunner:
         # Repeat inputs to match batch size
         pre_prompt = [pre_prompt] * self.args.batch_size
         post_prompt = [post_prompt] * self.args.batch_size
-        if self.model_type not in ['fuyu', 'pix2struct', 'kosmos-2', 'vila']:
+        if self.model_type not in [
+                'fuyu', 'pix2struct', 'kosmos-2', 'vila', 'phi-3-vision'
+        ]:
             if image.dim() == 5:
                 image = image.expand(args.batch_size, -1, -1, -1,
                                      -1).contiguous()
@@ -907,7 +990,7 @@ class MultimodalModelRunner:
                 elif self.model_type == "pix2struct":
                     assert "characteristic | cat food, day | cat food, wet | cat treats" in output_text[
                         0][0].lower()
-                elif self.model_type == 'neva':
+                elif self.model_type in ['neva', 'phi-3-vision']:
                     assert 'singapore' in output_text[0][0].lower()
                 elif self.model_type == 'video-neva':
                     assert 'robot' in output_text[0][0].lower()

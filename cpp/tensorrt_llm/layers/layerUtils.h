@@ -92,35 +92,32 @@ inline bool allOfBatchSlots(
 }
 
 inline DecoderDomain getLocalDecoderDomain(
-    std::shared_ptr<BaseInputParams> baseInputs, DecoderDomain const& globalDecoderDomain)
+    std::shared_ptr<BaseDecodingInputs> baseInputs, DecoderDomain const& globalDecoderDomain)
 {
-    auto inputs = std::dynamic_pointer_cast<DynamicDecodeInputParams>(baseInputs);
-    runtime::SizeType32 batchSize{0};
+    auto inputs = std::dynamic_pointer_cast<DecodingInputs>(baseInputs);
+    runtime::SizeType32 batchSize{baseInputs->localBatchSize};
     runtime::SizeType32 beamWidth{0};
     runtime::SizeType32 vocabSize{0};
     if (inputs->logits)
     {
         auto const& logitsShape = inputs->logits->shape;
         TLLM_CHECK(logitsShape.size() == 3 || logitsShape.size() == 4);
-        batchSize = logitsShape[0];
         auto const idxOffset = logitsShape.size() - 3;
         beamWidth = logitsShape[idxOffset + 1];
         vocabSize = logitsShape[idxOffset + 2];
     }
-    else if (inputs->logits_vec)
+    else if (inputs->logitsVec)
     {
-        TLLM_CHECK(inputs->logits_vec->size());
-        auto const& logitsShape = inputs->logits_vec.value()[0].shape;
+        TLLM_CHECK(inputs->logitsVec->size());
+        auto const& logitsShape = inputs->logitsVec.value()[0].shape;
         TLLM_CHECK(logitsShape.size() == 3 || logitsShape.size() == 4);
         auto const idxOffset = logitsShape.size() - 3;
-        batchSize = inputs->logits_vec->size();
         beamWidth = logitsShape[idxOffset + 1];
         vocabSize = logitsShape[idxOffset + 2];
     }
-    else if (inputs->batch_slots)
+    else if (inputs->batchSlots)
     {
-        auto const& batchSlotsShape = inputs->batch_slots->shape;
-        batchSize = batchSlotsShape[0];
+        auto const& batchSlotsShape = inputs->batchSlots->shape;
         beamWidth = globalDecoderDomain.getBeamWidth();
         vocabSize = globalDecoderDomain.getVocabSize();
     }

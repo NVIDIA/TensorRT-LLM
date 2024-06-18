@@ -115,7 +115,7 @@ class EncDecBenchmark(BaseBenchmark):
                 self.max_batch_size = config["builder_config"]["max_batch_size"]
                 self.max_input_len = config["builder_config"][
                     "max_encoder_input_len"]
-                self.max_output_len = config["builder_config"]["max_output_len"]
+                self.max_seq_len = config["builder_config"]["max_seq_len"]
                 self.n_mels = config["builder_config"][
                     'n_mels'] if 'whisper' in self.model_name else 0
 
@@ -180,8 +180,8 @@ class EncDecBenchmark(BaseBenchmark):
                 if args.max_batch_size is None else args.max_batch_size
             self.max_input_len = build_config['max_encoder_input_len'] \
                 if args.max_input_len is None else args.max_input_len
-            self.max_output_len = build_config['max_output_len'] \
-                if args.max_output_len is None else args.max_output_len
+            self.max_seq_len = build_config['max_seq_len'] \
+                if args.max_seq_len is None else args.max_seq_len
             self.n_mels = build_config[
                 'n_mels'] if 'whisper' in self.model_name else 0
             # Build engine
@@ -218,10 +218,11 @@ class EncDecBenchmark(BaseBenchmark):
                 f"[WARNING] whisper benchmark is input_len=1500, no text prompt, output_len=arbitrary"
             )
         for inlen, outlen in self.in_out_lens:
-            if (inlen > self.max_input_len or outlen > self.max_output_len):
+            if (inlen > self.max_input_len
+                    or inlen + outlen > self.max_seq_len):
                 print(
                     f"[WARNING] check inlen({inlen}) <= max_inlen({self.max_input_len}) and "
-                    f"outlen({outlen}) <= max_outlen({self.max_output_len}) failed, skipping."
+                    f"inlen({inlen}) + outlen({outlen}) <= max_seqlen({self.max_seq_len}) failed, skipping."
                 )
                 continue
             for batch_size in self.batch_sizes:

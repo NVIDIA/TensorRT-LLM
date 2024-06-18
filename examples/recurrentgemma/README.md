@@ -25,11 +25,6 @@ Please install required packages first and setup `git-lfs`:
 
 ```bash
 pip install -r requirements.txt
-git clone https://github.com/google-deepmind/recurrentgemma.git
-pip install ./recurrentgemma/[full]
-pip install "transformers>=4.40.0"
-
-# Setup git-lfs
 git lfs install
 ```
 
@@ -93,45 +88,37 @@ After getting checkpoint, we can use `trtllm-build` command to build TensorRT-LL
 # recurrentgemma-2b
 ENGINE_2B_PATH=./recurrentgemma_model/recurrentgemma-2b/trt_engines/fp16/1-gpu/
 trtllm-build --checkpoint_dir ${UNIFIED_CKPT_2B_PATH} \
-             --gpt_attention_plugin float16 \
-             --gemm_plugin float16 \
-             --mamba_conv1d_plugin float16 \
+             --gemm_plugin auto \
              --max_batch_size 8 \
              --max_input_len 3000 \
-             --max_output_len 100 \
+             --max_seq_len 3100 \
              --output_dir ${ENGINE_2B_PATH}
 
 # recurrentgemma-2b-it
 ENGINE_2B_IT_PATH=./recurrentgemma_model/recurrentgemma-2b-it/trt_engines/bf16/1-gpu/
 trtllm-build --checkpoint_dir ${UNIFIED_CKPT_2B_IT_PATH} \
-             --gpt_attention_plugin bfloat16 \
-             --gemm_plugin bfloat16 \
-             --mamba_conv1d_plugin bfloat16 \
+             --gemm_plugin auto \
              --max_batch_size 8 \
              --max_input_len 3000 \
-             --max_output_len 100 \
+             --max_seq_len 3100 \
              --output_dir ${ENGINE_2B_IT_PATH}
 
 # recurrentgemma-2b-flax
 ENGINE_2B_FLAX_PATH=./recurrentgemma_model/recurrentgemma-2b-flax/trt_engines/fp16/1-gpu/
 trtllm-build --checkpoint_dir ${UNIFIED_CKPT_2B_FLAX_PATH} \
-             --gpt_attention_plugin float16 \
-             --gemm_plugin float16 \
-             --mamba_conv1d_plugin float16 \
+             --gemm_plugin auto \
              --max_batch_size 8 \
              --max_input_len 3000 \
-             --max_output_len 100 \
+             --max_seq_len 3100 \
              --output_dir ${ENGINE_2B_FLAX_PATH}
 
 # recurrentgemma-2b-it-flax
 ENGINE_2B_IT_FLAX_PATH=./recurrentgemma_model/recurrentgemma-2b-it-flax/trt_engines/bf16/1-gpu/
 trtllm-build --checkpoint_dir ${UNIFIED_CKPT_2B_IT_FLAX_PATH} \
-             --gpt_attention_plugin bfloat16 \
-             --gemm_plugin bfloat16 \
-             --mamba_conv1d_plugin bfloat16 \
+             --gemm_plugin auto \
              --max_batch_size 8 \
              --max_input_len 3000 \
-             --max_output_len 100 \
+             --max_seq_len 3100 \
              --output_dir ${ENGINE_2B_IT_FLAX_PATH}
 ```
 

@@ -44,9 +44,9 @@ The following table shows the supported software for TensorRT-LLM.
     * -
       - Software Compatibility
     * - Container
-      - [23.10](https://docs.nvidia.com/deeplearning/frameworks/support-matrix/index.html#framework-matrix-2023)
+      - [24.04](https://docs.nvidia.com/deeplearning/frameworks/support-matrix/index.html)
     * - TensorRT
-      - [9.2](https://docs.nvidia.com/deeplearning/tensorrt/release-notes/index.html)
+      - [10.0](https://docs.nvidia.com/deeplearning/tensorrt/release-notes/index.html)
     * - Precision
       -
         - Hopper (SM90) - FP32, FP16, BF16, FP8, INT8, INT4
@@ -96,16 +96,17 @@ The following table shows the supported software for TensorRT-LLM.
         - [Whisper](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/whisper)
     * - Multi-Modal Models (5)
       -
-        - [BLIP2 w/ OPT-2.7B](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
-        - [BLIP2 w/ T5-XL](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
+        - [BLIP2 w/ OPT](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
+        - [BLIP2 w/ T5](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
         - [CogVLM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)(6)
         - [Deplot](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
         - [Fuyu](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
-        - [Kosmos-2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
-        - [LLaVA-v1.5-7B](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
+        - [Kosmos](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
+        - [LLaVA-v1.5](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
         - [NeVA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
+        - [Nougat](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal) Nougat-small, Nougat-base
+        - [Phi-3-vision](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
         - [Video NeVA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
-        - [Nougat family](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal) Nougat-small, Nougat-base
         - [VILA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
 ```
 

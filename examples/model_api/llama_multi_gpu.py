@@ -26,7 +26,7 @@ def build_and_run_llama(hf_model_dir, engine_dir, tp_size, rank):
 
     ## Build engine
     build_config = BuildConfig(max_input_len=256,
-                               max_output_len=256,
+                               max_seq_len=512,
                                max_batch_size=8)
     build_config.builder_opt = 0  # fast build for demo, pls avoid using this in production, since inference might be slower
     build_config.plugin_config.gemm_plugin = 'float16'  # for fast build, tune inference perf based on your needs

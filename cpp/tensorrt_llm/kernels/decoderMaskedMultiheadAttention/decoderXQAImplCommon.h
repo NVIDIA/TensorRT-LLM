@@ -17,6 +17,7 @@
  */
 #pragma once
 #include "decoderXQAConstants.h"
+#include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/workspace.h"
@@ -72,6 +73,8 @@ struct XQAKernelRuntimeHashKey
             && tokens_per_page == other.tokens_per_page && paged_kv_cache == other.paged_kv_cache;
     }
 };
+
+XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParams(XQAParams const& xqaParams);
 
 struct XQAKernelRuntimeHasher
 {

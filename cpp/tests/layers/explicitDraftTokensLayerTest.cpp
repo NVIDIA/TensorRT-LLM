@@ -25,6 +25,7 @@
 
 namespace tensorrt_llm::tests::layers
 {
+// TODO(nkorobov) verify context + gen mix
 
 using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::layers;
@@ -660,6 +661,9 @@ void ExplicitDraftTokensLayerTest<T>::allocateBuffers()
     mNextDraftLengths
         = BufferManager::pinned(ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), nvinfer1::DataType::kINT32);
 
+    mPrevDraftLengths
+        = BufferManager::pinned(ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), nvinfer1::DataType::kINT32);
+
     mAcceptedLengthCumSum = BufferManager::pinned(
         ITensor::makeShape({mSamplingParams.getMaxBatchSize() + 1}), nvinfer1::DataType::kINT32);
 
@@ -703,6 +707,11 @@ void ExplicitDraftTokensLayerTest<T>::allocateBuffers()
 
     mOutputTemperatures = BufferManager::pinned(ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), dataType);
 
+    mOutputGenerationLengths
+        = BufferManager::pinned(ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), nvinfer1::DataType::kINT32);
+
+    mMaxGenLengthHost = BufferManager::pinned(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
+
     // inputs
     mBatchSlots
         = BufferManager::pinned(ITensor::makeShape({mSamplingParams.getBatchSize()}), nvinfer1::DataType::kINT32);
@@ -723,7 +732,7 @@ void ExplicitDraftTokensLayerTest<T>::allocateBuffers()
             {mSamplingParams.getMaxBatchSize(), mSamplingParams.getMaxNumPaths(), mSamplingParams.getMaxPathLen()}),
         nvinfer1::DataType::kINT32);
 
-    mLastDraftTokens = BufferManager::pinned(ITensor::makeShape({mSamplingParams.getMaxBatchSize(),
+    mLastDraftTokens = BufferManager::pinned(ITensor::makeShape({mSamplingParams.getBatchSize(),
                                                  mSamplingParams.getMaxNumPaths(), mSamplingParams.getMaxPathLen()}),
         nvinfer1::DataType::kINT32);
 
@@ -760,6 +769,11 @@ void ExplicitDraftTokensLayerTest<T>::allocateBuffers()
                                     mSamplingParams.getMaxDraftPathLen(), mSamplingParams.getVocabSize()}),
             dataType);
 
+    mEndIds
+        = BufferManager::pinned(ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), nvinfer1::DataType::kINT32);
+
+    mMaxGenLengthDevice = BufferManager::pinned(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
+
     // Packed inputs
     mMaxGenerationLength = BufferManager::pinned(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
     mCumSumGenerationLengths
@@ -790,6 +804,9 @@ void ExplicitDraftTokensLayerTest<T>::allocateBuffers()
     mPackedPositionOffsets = BufferManager::pinned(
         ITensor::makeShape({mSamplingParams.getBatchSize(), mSamplingParams.getMaxDecodingTokens()}),
         nvinfer1::DataType::kINT32);
+    mPackedPackedPosIds = BufferManager::pinned(
+        ITensor::makeShape({mSamplingParams.getBatchSize(), mSamplingParams.getMaxDecodingTokens()}),
+        nvinfer1::DataType::kINT32);
     mPackedDraftProbs
         = BufferManager::pinned(ITensor::makeShape({mSamplingParams.getBatchSize(), mSamplingParams.getMaxNumPaths(),
                                     mSamplingParams.getMaxDraftPathLen(), mSamplingParams.getVocabSize()}),
@@ -813,6 +830,7 @@ void ExplicitDraftTokensLayerTest<T>::setup()
     trk::invokeFill(*mNextPosIds, SizeType32{0}, *mStream);
     trk::invokeFill(*mOutputUnpackedNextDraftTokens, TokenIdType{-1}, *mStream);
     trk::invokeFill(*mOutputUnpackedNextDraftIndices, SizeType32{0}, *mStream);
+    trk::invokeFill(*mEndIds, TokenIdType{-1}, *mStream);
 
     auto inDraftProbs = BufferRange<T>(*mNextDraftProbs);
 
@@ -839,6 +857,8 @@ void ExplicitDraftTokensLayerTest<T>::setup()
         [&generator, &temperatureDistr]() { return temperatureDistr(generator); });
     setupParams->randomSeed = mRandomSeeds;
     setupParams->temperature = mTemperatures;
+    setupParams->randomDataSample = tcc::toTllmTensor(*mRandomDataSample);
+    setupParams->temperatures = tcc::toTllmTensor(*mOutputTemperatures);
 
     mExplicitDraftTokensLayer->setup(mSamplingParams.getBatchSize(), 1, batchSlotsPtr, setupParams);
 
@@ -913,11 +933,14 @@ void ExplicitDraftTokensLayerTest<T>::setup()
 }
 
 template <typename T>
-std::shared_ptr<ExplicitDraftTokensInputParams> ExplicitDraftTokensLayerTest<T>::createInputTensors()
+std::shared_ptr<ExplicitDraftTokensInputs> ExplicitDraftTokensLayerTest<T>::createInputTensors()
 {
-    auto forwardParams = std::make_shared<ExplicitDraftTokensInputParams>();
+    auto forwardParams
+        = std::make_shared<ExplicitDraftTokensInputs>(tcc::toTllmTensor(*mEndIds), mSamplingParams.getBatchSize());
 
-    forwardParams->batch_slots = tcc::toTllmTensor(*mBatchSlots);
+    forwardParams->batchSlots = tcc::toTllmTensor(*mBatchSlots);
+
+    forwardParams->seqSlots = tcc::toTllmTensor(*mBatchSlots);
 
     forwardParams->masks = tcc::toTllmTensor(*mMasks);
 
@@ -935,7 +958,7 @@ std::shared_ptr<ExplicitDraftTokensInputParams> ExplicitDraftTokensLayerTest<T>:
 
     forwardParams->bestPathIndices = tcc::toTllmTensor(*mBestPathIndices);
 
-    forwardParams->specDecodingGenerationLengths = tcc::toTllmTensor(*mSpecDecodingGenerationLengths);
+    forwardParams->generationLengths = tcc::toTllmTensor(*mSpecDecodingGenerationLengths);
 
     forwardParams->nextFlatTokens = tcc::toTllmTensor(*mNextFlatTokens);
 
@@ -943,49 +966,53 @@ std::shared_ptr<ExplicitDraftTokensInputParams> ExplicitDraftTokensLayerTest<T>:
 
     forwardParams->nextDraftProbs = tcc::toTllmTensor(*mNextDraftProbs);
 
+    forwardParams->maxGenLengthDevice = tcc::toTllmTensor(*mMaxGenLengthDevice);
+
     return forwardParams;
 }
 
 template <typename T>
-std::shared_ptr<DynamicDecodeOutputParams> ExplicitDraftTokensLayerTest<T>::createOutputTensors()
+std::shared_ptr<ExplicitDraftTokensOutputs> ExplicitDraftTokensLayerTest<T>::createOutputTensors()
 {
-    auto outputParams = std::make_shared<DynamicDecodeOutputParams>(tcc::toTllmTensor(*mOutputIds));
+    auto outputParams = std::make_shared<ExplicitDraftTokensOutputs>(tcc::toTllmTensor(*mOutputIds));
 
-    outputParams->sequence_length = tcc::toTllmTensor(*mSeqLengths);
+    outputParams->sequenceLength = tcc::toTllmTensor(*mSeqLengths);
 
-    outputParams->explicitDraftTokensOutputs = BaseOutputParams::ExplicitDraftTokensOutputs();
+    outputParams->nextDraftTokens = tcc::toTllmTensor(*mOutputNextDraftTokens);
 
-    outputParams->explicitDraftTokensOutputs->nextDraftTokens = tcc::toTllmTensor(*mOutputNextDraftTokens);
+    outputParams->numNewTokens = tcc::toTllmTensor(*mAcceptedLengths);
 
-    outputParams->explicitDraftTokensOutputs->acceptedLengths = tcc::toTllmTensor(*mAcceptedLengths);
+    outputParams->nextDraftLengths = tcc::toTllmTensor(*mNextDraftLengths);
 
-    outputParams->explicitDraftTokensOutputs->nextDraftLengths = tcc::toTllmTensor(*mNextDraftLengths);
+    outputParams->prevDraftLengths = tcc::toTllmTensor(*mPrevDraftLengths);
 
-    outputParams->explicitDraftTokensOutputs->acceptedLengthsCumSum = tcc::toTllmTensor(*mAcceptedLengthCumSum);
+    outputParams->numNewTokensCumSum = tcc::toTllmTensor(*mAcceptedLengthCumSum);
 
-    outputParams->explicitDraftTokensOutputs->pathsOffsets = tcc::toTllmTensor(*mPathsOffsets);
+    outputParams->pathsOffsets = tcc::toTllmTensor(*mPathsOffsets);
 
-    outputParams->explicitDraftTokensOutputs->nextDraftPosIds = tcc::toTllmTensor(*mNextPosIds);
+    outputParams->nextDraftPosIds = tcc::toTllmTensor(*mNextPosIds);
 
-    outputParams->explicitDraftTokensOutputs->positionIdsBase = tcc::toTllmTensor(*mOutputPositionIdsBase);
+    outputParams->positionIdsBase = tcc::toTllmTensor(*mOutputPositionIdsBase);
 
-    outputParams->explicitDraftTokensOutputs->randomDataSample = tcc::toTllmTensor(*mRandomDataSample);
+    outputParams->randomDataSample = tcc::toTllmTensor(*mRandomDataSample);
 
-    outputParams->explicitDraftTokensOutputs->randomDataValidation = tcc::toTllmTensor(*mRandomDataValidation);
+    outputParams->randomDataValidation = tcc::toTllmTensor(*mRandomDataValidation);
 
-    outputParams->explicitDraftTokensOutputs->packedMasks = tcc::toTllmTensor(*mPackedMasks);
+    outputParams->packedMasks = tcc::toTllmTensor(*mPackedMasks);
 
-    outputParams->explicitDraftTokensOutputs->packedMasks = tcc::toTllmTensor(*mPackedMasks);
+    outputParams->packedMasks = tcc::toTllmTensor(*mPackedMasks);
 
-    outputParams->explicitDraftTokensOutputs->unpackedNextDraftTokens
-        = tcc::toTllmTensor(*mOutputUnpackedNextDraftTokens);
+    outputParams->unpackedNextDraftTokens = tcc::toTllmTensor(*mOutputUnpackedNextDraftTokens);
 
-    outputParams->explicitDraftTokensOutputs->unpackedNextDraftIndices
-        = tcc::toTllmTensor(*mOutputUnpackedNextDraftIndices);
+    outputParams->unpackedNextDraftIndices = tcc::toTllmTensor(*mOutputUnpackedNextDraftIndices);
 
-    outputParams->explicitDraftTokensOutputs->nextDraftProbs = tcc::toTllmTensor(*mOutputDraftProbs);
+    outputParams->nextDraftProbs = tcc::toTllmTensor(*mOutputDraftProbs);
 
-    outputParams->explicitDraftTokensOutputs->temperatures = tcc::toTllmTensor(*mOutputTemperatures);
+    outputParams->temperatures = tcc::toTllmTensor(*mOutputTemperatures);
+
+    outputParams->generationLengths = tcc::toTllmTensor(*mOutputGenerationLengths);
+
+    outputParams->maxGenLengthHost = tcc::toTllmTensor(*mMaxGenLengthHost);
 
     return outputParams;
 }
@@ -1117,7 +1144,8 @@ void ExplicitDraftTokensLayerTest<T>::checkLayerResult()
             for (SizeType32 ti = 0; ti < generatedLength; ++ti)
             {
                 auto const idx = tc::flat_index2(batchSlot, ti, mSamplingParams.getMaxDecodingTokens());
-                EXPECT_EQ(nextPosIds[idx], packedPosIds[compressedIdx + ti]) << " bi: " << bi << " ti: " << ti;
+                // Minus -1 to account for context phase correction of pos ids
+                EXPECT_EQ(nextPosIds[idx], packedPosIds[compressedIdx + ti] - 1) << " bi: " << bi << " ti: " << ti;
             }
             compressedIdx += generatedLength;
         }
@@ -1200,7 +1228,7 @@ void ExplicitDraftTokensLayerTest<T>::checkLayerResult()
         for (SizeType32 bi = 0; bi < mSamplingParams.getBatchSize(); ++bi)
         {
             auto const batchSlot = batchSlots[bi];
-            EXPECT_EQ(BufferRange<T>(*mOutputTemperatures)[batchSlot], static_cast<T>(mTemperatures[bi]))
+            EXPECT_EQ(BufferRange<T>(*mOutputTemperatures)[batchSlot], static_cast<T>(1.f / mTemperatures[bi]))
                 << " bi: " << bi;
         }
     }
@@ -1213,24 +1241,35 @@ void ExplicitDraftTokensLayerTest<T>::packData()
     params.batchSlots = bufferCast<SizeType32>(*mBatchSlots);
     params.cumSumGenerationLengths = bufferCast<SizeType32>(*mCumSumGenerationLengths);
     params.maxGenerationLength = bufferCast<SizeType32>(*mMaxGenerationLength);
+
     params.outputPositionIdsBase = bufferCast<SizeType32>(*mPackedPositionIdsBase);
     params.inputPositionIdsBase = bufferCast<SizeType32>(*mOutputPositionIdsBase);
+
     params.outputGenerationLengths = bufferCast<SizeType32>(*mPackedGenerationLengths);
     params.inputGenerationLengths = bufferCast<SizeType32>(*mSpecDecodingGenerationLengths);
+
     params.outputRandomDataSample = bufferCast<T>(*mPackedRandomDataSample);
     params.inputRandomDataSample = bufferCast<T>(*mRandomDataSample);
+
     params.outputRandomDataValidation = bufferCast<T>(*mPackedRandomDataVerification);
     params.inputRandomDataValidation = bufferCast<T>(*mRandomDataValidation);
+
     params.outputNextDraftTokens = bufferCast<TokenIdType>(*mPackedNextDraftTokens);
     params.inputNextDraftTokens = bufferCast<TokenIdType>(*mOutputUnpackedNextDraftTokens);
+
     params.outputNextDraftIndices = bufferCast<SizeType32>(*mPackedNextDraftIndices);
     params.inputNextDraftIndices = bufferCast<SizeType32>(*mOutputUnpackedNextDraftIndices);
+
     params.outputPackedMask = bufferCast<int32_t>(*mPackedPackedMasks);
     params.inputPackedMask = bufferCast<int32_t>(*mPackedMasks);
+
+    params.inputPositionIds = bufferCast<SizeType32>(*mNextPosIds);
     params.outputPositionOffsets = bufferCast<SizeType32>(*mPackedPositionOffsets);
-    params.inputPositionOffsets = bufferCast<SizeType32>(*mNextPosIds);
+    params.outputPositionIds = bufferCast<SizeType32>(*mPackedPackedPosIds);
+
     params.outputDraftProbs = bufferCast<T>(*mPackedDraftProbs);
     params.inputDraftProbs = bufferCast<T>(*mOutputDraftProbs);
+
     params.outputTemperatures = bufferCast<T>(*mPackedTemperatures);
     params.inputTemperatures = bufferCast<T>(*mOutputTemperatures);
 
@@ -1238,12 +1277,18 @@ void ExplicitDraftTokensLayerTest<T>::packData()
     params.numPaths = mSamplingParams.getMaxNumPaths();
     params.maxPathLength = mSamplingParams.getMaxPathLen();
     params.vocabSize = mSamplingParams.getVocabSize();
+    params.numGenerationRequests = mSamplingParams.getBatchSize();
+    params.numContextTokens = 0;
+
+    params.checkParams();
+
+    tksd::invokePackGenerationLengths(params, mStream->get());
 
     // Compute inclusive sum
-    auto reduceTempStorageBytes = tksd::invokeScanSpecDecodingGenerationLengths(
+    auto reduceTempStorageBytes = tksd::invokeScanGenerationLengths(
         nullptr, 0, nullptr, nullptr, mSamplingParams.getBatchSize(), mStream->get());
     auto reduceMaxTempStorage = mBufferManager->gpu(reduceTempStorageBytes);
-    tksd::invokeScanSpecDecodingGenerationLengths(bufferCast<uint8_t>(*reduceMaxTempStorage), reduceTempStorageBytes,
+    tksd::invokeScanGenerationLengths(bufferCast<uint8_t>(*reduceMaxTempStorage), reduceTempStorageBytes,
         bufferCast<SizeType32>(*mSpecDecodingGenerationLengths), bufferCast<SizeType32>(*mCumSumGenerationLengths),
         mSamplingParams.getBatchSize(), mStream->get());
 
@@ -1298,12 +1343,13 @@ void ExplicitDraftTokensLayerTest<T>::checkPackResult()
                     << "bi: " << bi << " pi: " << pi << " ti: " << ti;
             }
         }
+        auto const basePosId = BufferRange<SizeType32>(*mPackedPositionIdsBase)[bi];
         for (SizeType32 ti = 0; ti < maxGenLength; ++ti)
         {
             auto const outPosOffsetIdx = tc::flat_index2(bi, ti, maxGenLength);
             auto const inPosOffsetIdx = tc::flat_index2(batchSlot, ti, mSamplingParams.getMaxDecodingTokens());
             EXPECT_EQ(BufferRange<SizeType32>(*mPackedPositionOffsets)[outPosOffsetIdx],
-                BufferRange<SizeType32>(*mNextPosIds)[inPosOffsetIdx])
+                BufferRange<SizeType32>(*mNextPosIds)[inPosOffsetIdx] - basePosId + 1)
                 << "bi: " << bi << " ti: " << ti;
         }
         auto const outputMaskStartId = (bi == 0) ? 0 : BufferRange<SizeType32>(*mCumSumGenerationLengths)[bi - 1];

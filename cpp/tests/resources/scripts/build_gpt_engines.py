@@ -42,14 +42,18 @@ def build_engine(
     engine_dir: str,
     *args,
     max_input_len: int = 256,
-    max_output_len: int = 128,
+    max_seq_len: int = 384,
 ):
     build_cmd = [
-        "trtllm-build", '--log_level=error',
-        f'--checkpoint_dir={checkpoint_dir}', f'--output_dir={engine_dir}',
-        '--max_batch_size=64', f'--max_input_len={max_input_len}',
-        f'--max_output_len={max_output_len}', '--max_beam_width=2',
-        '--builder_opt=0'
+        "trtllm-build",
+        '--log_level=error',
+        f'--checkpoint_dir={checkpoint_dir}',
+        f'--output_dir={engine_dir}',
+        '--max_batch_size=64',
+        f'--max_input_len={max_input_len}',
+        f'--max_seq_len={max_seq_len}',
+        '--max_beam_width=2',
+        '--builder_opt=0',
     ]
     legacy_args = [
         "--gpt_attention_plugin=disable",
@@ -219,8 +223,11 @@ def build_engines(model_cache: Optional[str] = None, world_size: int = 1):
                  "--lora_target_modules=attn_qkv", '--lora_plugin=float16',
                  *ifb_args)
 
-    llm_datasets_root = Path(model_cache) / "datasets"
-    calib_dataset = llm_datasets_root / "cimec/lambada/"
+    if model_cache:
+        llm_datasets_root = Path(model_cache) / "datasets"
+        calib_dataset = llm_datasets_root / "cimec/lambada/"
+    else:
+        calib_dataset = "lambada"
     print("\nConverting to fp16 SQ")
     fp16_sq_ckpt_dir = ckpt_dir / 'fp16-sq' / tp_dir
     convert_ckpt(str(hf_dir),

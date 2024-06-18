@@ -19,11 +19,9 @@
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
-#include "tensorrt_llm/kernels/samplingTopPKernels.h"
 #include "tensorrt_llm/layers/defaultDecodingParams.h"
 #include "tensorrt_llm/layers/layerUtils.h"
 #include "tensorrt_llm/layers/topKSamplingLayer.h"
-#include "tensorrt_llm/runtime/iTensor.h"
 
 #include <algorithm>
 #include <float.h>
@@ -32,9 +30,7 @@ using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::runtime;
 
-namespace tensorrt_llm
-{
-namespace layers
+namespace tensorrt_llm::layers
 {
 
 template <int32_t TOP_K_MAX>
@@ -135,19 +131,19 @@ void TopKSamplingLayer<T>::freeBuffer()
 
 template <typename T>
 void TopKSamplingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 const* batchSlots,
-    std::shared_ptr<BaseSetupParams> baseSetupParams)
+    std::shared_ptr<BaseSetupParams> const& baseSetupParams)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto setupParams = std::dynamic_pointer_cast<SamplingSetupParams>(baseSetupParams);
 
     auto const defaultTopK = DefaultDecodingParams::getTopK();
-    auto runtimeTopK = setupParams->runtime_top_k.value_or(std::vector<SizeType32>(batchSize, defaultTopK));
-    auto runtimeTopP = setupParams->runtime_top_p.value_or(std::vector<float>{});
+    auto runtimeTopK = setupParams->runtimeTopK.value_or(std::vector<SizeType32>(batchSize, defaultTopK));
+    auto runtimeTopP = setupParams->runtimeTopP.value_or(std::vector<float>{});
 
     auto const runtimeTopKSize = runtimeTopK.size();
     auto const runtimeTopPSize = runtimeTopP.size();
-    mNormalizeLogProbs = setupParams->normalize_log_probs.has_value() && setupParams->normalize_log_probs.value();
+    mNormalizeLogProbs = setupParams->normalizeLogProbs.has_value() && setupParams->normalizeLogProbs.value();
 
     for (auto& topP : runtimeTopP)
     {
@@ -218,26 +214,24 @@ void TopKSamplingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, Siz
 
 template <typename T>
 void TopKSamplingLayer<T>::forwardAsync(
-    std::shared_ptr<BaseOutputParams> baseOutputs, std::shared_ptr<BaseInputParams> baseInputs)
+    std::shared_ptr<BaseDecodingOutputs> const& outputs, std::shared_ptr<BaseDecodingInputs> const& baseInputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    std::shared_ptr<SamplingInputParams> inputs = std::dynamic_pointer_cast<SamplingInputParams>(baseInputs);
-    std::shared_ptr<SamplingOutputParams> outputs = std::dynamic_pointer_cast<SamplingOutputParams>(baseOutputs);
+    auto inputs = std::dynamic_pointer_cast<SamplingInputs>(baseInputs);
 
-    auto const batchSize = inputs->logits.shape[0];
+    auto const batchSize = inputs->logits->shape[0];
 
-    auto logits = inputs->logits.template getPtr<T>();
-    auto endIds = inputs->end_ids.template getPtr<TokenIdType const>();
-    auto batchSlots = inputs->batch_slots ? inputs->batch_slots->template getPtr<SizeType32 const>() : nullptr;
-    auto curandStatesDevice = inputs->curand_states;
-    auto samplingWorkspaceDevice = inputs->sampling_workspace;
-    auto const probsComputed = inputs->probs_computed;
+    auto logits = inputs->logits->template getPtr<T>();
+    auto endIds = inputs->endIds.template getPtr<TokenIdType const>();
+    auto batchSlots = inputs->batchSlots ? inputs->batchSlots->template getPtr<SizeType32 const>() : nullptr;
+    auto curandStatesDevice = inputs->curandStates;
+    auto samplingWorkspaceDevice = inputs->samplingWorkspace;
+    auto const probsComputed = inputs->probsComputed;
 
     std::vector<int32_t> batchSlotsVec(batchSize);
     std::iota(batchSlotsVec.begin(), batchSlotsVec.end(), 0);
-    auto batchSlotsHost
-        = inputs->batch_slots ? inputs->batch_slots->template getPtr<int const>() : batchSlotsVec.data();
+    auto batchSlotsHost = inputs->batchSlots ? inputs->batchSlots->template getPtr<int const>() : batchSlotsVec.data();
     auto const skip = allOfBatchSlots(batchSlotsHost, mSkipDecodeHost, batchSize, true);
     if (skip)
     {
@@ -254,14 +248,14 @@ void TopKSamplingLayer<T>::forwardAsync(
         ? reinterpret_cast<FinishedState*>(outputs->finished->template getPtr<FinishedState::UnderlyingType>())
         : nullptr;
 
-    auto cumLogProbs = (outputs->cum_log_probs) ? outputs->cum_log_probs->template getPtr<float>() : nullptr;
-    auto outputLogProbs = (outputs->output_log_probs) ? outputs->output_log_probs->template getPtr<float>() : nullptr;
-    auto sequenceLengths
-        = (outputs->sequence_length) ? outputs->sequence_length->template getPtr<SizeType32>() : nullptr;
+    auto cumLogProbs = (outputs->cumLogProbs) ? outputs->cumLogProbs->template getPtr<float>() : nullptr;
+    auto outputLogProbs
+        = (outputs->outputLogProbsTiled) ? outputs->outputLogProbsTiled->template getPtr<float>() : nullptr;
+    auto sequenceLengths = (outputs->sequenceLength) ? outputs->sequenceLength->template getPtr<SizeType32>() : nullptr;
 
     TopKSamplingKernelParams<T> params;
     params.logProbs = logits;
-    params.outputIdsPtrs = outputs->output_ids_ptr.template getPtr<TokenIdType*>();
+    params.outputIdsPtrs = outputs->outputIdsPtr.template getPtr<TokenIdType*>();
     params.workspace = samplingWorkspaceDevice;
     params.maxTopP = 1.0f;
     params.topPs = mRuntimeTopPDevice;
@@ -292,5 +286,4 @@ void TopKSamplingLayer<T>::forwardAsync(
 template class TopKSamplingLayer<float>;
 template class TopKSamplingLayer<half>;
 
-} // namespace layers
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::layers

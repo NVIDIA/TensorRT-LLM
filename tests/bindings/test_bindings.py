@@ -1,4 +1,3 @@
-import inspect
 import json
 import pickle
 import tempfile
@@ -9,123 +8,6 @@ import numpy as np
 import torch
 
 import tensorrt_llm.bindings as _tb
-
-
-def test_generation_output():
-    ids = torch.ones(1)
-    lengths = torch.ones(2)
-    gen_output = _tb.GenerationOutput(ids, lengths)
-    assert torch.equal(gen_output.ids, ids)
-    assert torch.equal(gen_output.lengths, lengths)
-
-    assert gen_output.log_probs is None
-    log_probs = torch.ones(1)
-    gen_output.log_probs = log_probs
-    assert gen_output.log_probs == log_probs
-
-    assert gen_output.context_logits is None
-    torch.ones(1)
-    gen_output.context_logits = log_probs
-    assert gen_output.context_logits == log_probs
-
-
-def test_generation_input():
-    end_id = 42
-    pad_id = 13
-    ids = torch.ones(1)
-    lengths = torch.ones(2)
-    packed = True
-    gen_input = _tb.GenerationInput(end_id, pad_id, ids, lengths, packed)
-    assert gen_input.end_id == end_id
-    assert gen_input.pad_id == pad_id
-    assert torch.equal(gen_input.ids, ids)
-    assert torch.equal(gen_input.lengths, lengths)
-    assert gen_input.packed == packed
-
-    assert gen_input.max_new_tokens is None
-    max_new_tokens = 100
-    gen_input.max_new_tokens = max_new_tokens
-    assert gen_input.max_new_tokens == max_new_tokens
-
-    assert gen_input.embedding_bias is None
-    embedding_bias = torch.ones(3)
-    gen_input.embedding_bias = embedding_bias
-    assert torch.equal(gen_input.embedding_bias, embedding_bias)
-
-    assert gen_input.prompt_tuning_params.embedding_table is None
-    assert gen_input.prompt_tuning_params.tasks is None
-    assert gen_input.prompt_tuning_params.vocab_size is None
-
-    embedding_table = torch.ones(3)
-    tasks = torch.ones(2)
-    vocab_size = torch.ones(1)
-    prompt_tuning_params = _tb.PromptTuningParams(
-        embedding_table=embedding_table, tasks=tasks, vocab_size=vocab_size)
-    assert len(prompt_tuning_params.prompt_tuning_enabled) == 0
-    prompt_tuning_enabled = [True, False]
-    prompt_tuning_params.prompt_tuning_enabled = prompt_tuning_enabled
-    assert len(prompt_tuning_params.prompt_tuning_enabled) == 2
-    assert prompt_tuning_params.prompt_tuning_enabled == prompt_tuning_enabled
-    gen_input.prompt_tuning_params = prompt_tuning_params
-    assert gen_input.prompt_tuning_params is not None
-    assert torch.equal(gen_input.prompt_tuning_params.embedding_table,
-                       embedding_table)
-    assert torch.equal(gen_input.prompt_tuning_params.tasks, tasks)
-    assert torch.equal(gen_input.prompt_tuning_params.vocab_size, vocab_size)
-    assert gen_input.prompt_tuning_params.prompt_tuning_enabled == prompt_tuning_enabled
-
-
-def test_gpt_session_config():
-    kv_cache_config = _tb.KvCacheConfig()
-    assert kv_cache_config.max_tokens is None
-    max_tokens = 13
-    kv_cache_config.max_tokens = max_tokens
-    assert kv_cache_config.max_tokens == max_tokens
-    assert kv_cache_config.free_gpu_memory_fraction is None
-    free_gpu_memory_fraction = 0.5
-    kv_cache_config.free_gpu_memory_fraction = free_gpu_memory_fraction
-    assert kv_cache_config.free_gpu_memory_fraction == free_gpu_memory_fraction
-
-    max_batch_size = 1000
-    max_beam_width = 64
-    max_sequence_length = 1 << 20
-    gpu_weights_percent = 0.5
-    gpt_session_config = _tb.GptSessionConfig(max_batch_size, max_beam_width,
-                                              max_sequence_length,
-                                              gpu_weights_percent)
-    assert gpt_session_config.max_batch_size == max_batch_size
-    assert gpt_session_config.max_beam_width == max_beam_width
-    assert gpt_session_config.max_sequence_length == max_sequence_length
-    assert gpt_session_config.gpu_weights_percent == gpu_weights_percent
-
-    assert gpt_session_config.kv_cache_config is not None
-    assert gpt_session_config.kv_cache_config.max_tokens is None
-    assert gpt_session_config.kv_cache_config.free_gpu_memory_fraction is None
-    gpt_session_config.kv_cache_config = kv_cache_config
-    assert gpt_session_config.kv_cache_config.max_tokens == max_tokens
-    assert gpt_session_config.kv_cache_config.free_gpu_memory_fraction == free_gpu_memory_fraction
-    gpt_session_config.kv_cache_config.max_tokens = None
-    assert gpt_session_config.kv_cache_config.max_tokens is None
-    gpt_session_config.kv_cache_config.free_gpu_memory_fraction = None
-    assert gpt_session_config.kv_cache_config.free_gpu_memory_fraction is None
-
-    assert not gpt_session_config.decoder_per_request
-    gpt_session_config.decoder_per_request = True
-    assert gpt_session_config.decoder_per_request
-
-    assert not gpt_session_config.cuda_graph_mode
-    gpt_session_config.cuda_graph_mode = True
-    assert gpt_session_config.cuda_graph_mode
-
-    assert gpt_session_config.ctx_micro_batch_size is None
-    ctx_micro_batch_size = 10
-    gpt_session_config.ctx_micro_batch_size = ctx_micro_batch_size
-    assert gpt_session_config.ctx_micro_batch_size == ctx_micro_batch_size
-
-    assert gpt_session_config.gen_micro_batch_size is None
-    gen_micro_batch_size = 20
-    gpt_session_config.gen_micro_batch_size = gen_micro_batch_size
-    assert gpt_session_config.gen_micro_batch_size == gen_micro_batch_size
 
 
 def test_quant_mode():
@@ -375,14 +257,6 @@ def test_gpt_json_config():
         world_config) == json_config["name"] + "_float32_tp1_rank3.engine"
     assert gpt_json_config.engine_filename(
         world_config, "llama") == "llama_float32_tp1_rank3.engine"
-
-
-def test_gpt_session():
-    members = {name: tpe for (name, tpe) in inspect.getmembers(_tb.GptSession)}
-    assert isinstance(members["model_config"], property)
-    assert isinstance(members["world_config"], property)
-    assert isinstance(members["device"], property)
-    assert "generate" in members
 
 
 def test_llm_request():

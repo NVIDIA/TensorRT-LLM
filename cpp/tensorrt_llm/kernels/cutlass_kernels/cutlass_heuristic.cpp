@@ -173,6 +173,10 @@ std::vector<CutlassTileConfig> get_candidate_tiles(
 std::vector<CutlassTileConfigSM90> get_candidate_tiles_sm90(
     int const sm, CutlassGemmConfig::CandidateConfigTypeParam const config)
 {
+#ifdef FAST_BUILD
+    // Fast build disables all configs except this one for SM90
+    return {CutlassTileConfigSM90::CtaShape128x128x128B};
+#else
     if (config & CutlassGemmConfig::GROUPED_GEMM)
     {
         return {CutlassTileConfigSM90::CtaShape128x16x128B, CutlassTileConfigSM90::CtaShape128x32x128B,
@@ -187,26 +191,35 @@ std::vector<CutlassTileConfigSM90> get_candidate_tiles_sm90(
             CutlassTileConfigSM90::CtaShape128x32x128B, CutlassTileConfigSM90::CtaShape128x64x128B,
             CutlassTileConfigSM90::CtaShape128x128x128B, CutlassTileConfigSM90::CtaShape128x256x128B};
     }
+#endif
 }
 
 // We only compile CUTLASS kernels with multi-cast along M if the M tile is >= 128. This is purely to improve
 // compilation speed.
 bool supports_mcast_along_m(const CutlassTileConfigSM90 tile)
 {
+#ifdef FAST_BUILD
+    return false;
+#else
     std::set<CutlassTileConfigSM90> valid_tiles{CutlassTileConfigSM90::CtaShape128x16x128B,
         CutlassTileConfigSM90::CtaShape128x32x128B, CutlassTileConfigSM90::CtaShape128x64x128B,
         CutlassTileConfigSM90::CtaShape128x128x128B, CutlassTileConfigSM90::CtaShape128x256x128B};
     return valid_tiles.count(tile) == 1;
+#endif
 }
 
 // We only compile CUTLASS kernels with multi-cast along N if the N tile is >= 128. This is purely to improve
 // compilation speed.
 bool supports_mcast_along_n(const CutlassTileConfigSM90 tile)
 {
+#ifdef FAST_BUILD
+    return false;
+#else
     std::set<CutlassTileConfigSM90> valid_tiles{CutlassTileConfigSM90::CtaShape64x128x128B,
         CutlassTileConfigSM90::CtaShape64x256x128B, CutlassTileConfigSM90::CtaShape128x128x128B,
         CutlassTileConfigSM90::CtaShape128x256x128B};
     return valid_tiles.count(tile) == 1;
+#endif
 }
 
 std::vector<CutlassGemmConfig> get_candidate_configs(

@@ -30,6 +30,20 @@ def parse_arguments():
                         type=int,
                         default=1,
                         help='N-way pipeline parallelism size')
+    parser.add_argument(
+        '--moe_tp_size',
+        type=int,
+        default=-1,
+        help=
+        'N-way tensor parallelism size for MOE, default is tp_size, which will do tp-only for MoE'
+    )
+    parser.add_argument(
+        '--moe_ep_size',
+        type=int,
+        default=-1,
+        help=
+        'N-way expert parallelism size for MOE, default is 1, which will do tp-only for MoE'
+    )
     parser.add_argument('--dtype',
                         type=str,
                         default='float16',
@@ -181,13 +195,6 @@ def parse_arguments():
         'Specify the top_k value to use for MOE layers. Default to 1 if --moe_num_experts is set'
     )
     parser.add_argument(
-        '--moe_tp_mode',
-        default=MoeConfig.ParallelismMode.TENSOR_PARALLEL,
-        type=int,
-        help=
-        'Controls how to distribute experts in TP. Check layers/moe.py for accepted values',
-    )
-    parser.add_argument(
         '--moe_renorm_mode',
         default=MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE,
         type=int,
@@ -213,10 +220,6 @@ def args_to_quant_config(args: argparse.Namespace) -> QuantConfig:
     '''return config dict with quantization info based on the command line args
     '''
     quant_config = QuantConfig()
-    quant_config.exclude_modules = [
-        'lm_head', 'router', 'vocab_embedding', 'position_embedding',
-        'block_embedding'
-    ]
     if args.use_weight_only:
         if args.weight_only_precision == 'int8':
             quant_config.quant_algo = QuantAlgo.W8A16
@@ -251,6 +254,8 @@ def convert_and_save_meta(args, rank):
     mapping = Mapping(world_size=args.tp_size * args.pp_size,
                       tp_size=args.tp_size,
                       pp_size=args.pp_size,
+                      moe_tp_size=args.moe_tp_size,
+                      moe_ep_size=args.moe_ep_size,
                       rank=rank)
     assert not args_to_quant_config(args).quant_mode.has_any_quant(), \
         "quantization from meta checkpoint or empty model were never supported"
@@ -293,13 +298,14 @@ def from_cli_args(args):
         'moe': {
             'num_experts': args.moe_num_experts,
             'top_k': args.moe_top_k,
-            'tp_mode': args.moe_tp_mode,
             'normalization_mode': args.moe_renorm_mode,
         },
         'mapping': {
             'world_size': args.tp_size * args.pp_size,
             'tp_size': args.tp_size,
-            'pp_size': args.pp_size
+            'pp_size': args.pp_size,
+            'moe_tp_size': args.moe_tp_size,
+            'moe_ep_size': args.moe_ep_size,
         },
         'quantization': args_to_quant_config(args).to_dict()
     }
@@ -315,7 +321,7 @@ def convert_and_save_hf(args):
     # Need to convert the cli args to the kay-value pairs and override them in the generate config dict.
     # Ideally these fields will be moved out of the config and pass them into build API, keep them here for compatibility purpose for now,
     # before the refactor is done.
-    override_fields = {'moe_tp_mode': args.moe_tp_mode}
+    override_fields = {}
     override_fields.update(args_to_build_options(args))
 
     quant_config = args_to_quant_config(args)
@@ -327,7 +333,10 @@ def convert_and_save_hf(args):
             world_size=world_size,
             rank=-1,  #intentinoally make -1 to avoid mistake
             tp_size=args.tp_size,
-            pp_size=args.pp_size)
+            pp_size=args.pp_size,
+            moe_tp_size=args.moe_tp_size,
+            moe_ep_size=args.moe_ep_size)
+        # TODO: support moe quantization for tp + ep
         LLaMAForCausalLM.quantize(args.model_dir,
                                   args.output_dir,
                                   dtype=args.dtype,
@@ -351,7 +360,9 @@ def convert_and_save_hf(args):
             mapping = Mapping(world_size=world_size,
                               rank=rank,
                               tp_size=args.tp_size,
-                              pp_size=args.pp_size)
+                              pp_size=args.pp_size,
+                              moe_tp_size=args.moe_tp_size,
+                              moe_ep_size=args.moe_ep_size)
             llama = LLaMAForCausalLM.from_hugging_face(
                 model_dir if hf_model is None else hf_model,
                 args.dtype,
@@ -408,6 +419,16 @@ def main():
     args = parse_arguments()
 
     world_size = args.tp_size * args.pp_size
+    if (args.moe_tp_size == -1 and args.moe_ep_size == -1):
+        # moe default to tp-only
+        args.moe_tp_size = args.tp_size
+        args.moe_ep_size = 1
+    elif (args.moe_tp_size == -1):
+        args.moe_tp_size = args.tp_size // args.moe_ep_size
+    elif (args.moe_ep_size == -1):
+        args.moe_ep_size = args.tp_size // args.moe_tp_size
+    assert (args.moe_tp_size * args.moe_ep_size == args.tp_size
+            ), "moe_tp_size * moe_ep_size must equal to tp_size"
     tik = time.time()
 
     if not os.path.exists(args.output_dir):

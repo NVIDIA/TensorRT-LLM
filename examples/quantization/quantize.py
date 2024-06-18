@@ -22,6 +22,12 @@ if __name__ == "__main__":
         choices=['gptnext', 'llama'],
         help="Decoder type; effective for NeMo checkpoint only.")
     parser.add_argument(
+        '--device',
+        help=
+        "The device to run calibration; effective for HuggingFace model only.",
+        default='cuda',
+        choices=['cuda', 'cpu'])
+    parser.add_argument(
         '--calib_dataset',
         type=str,
         default='cnn_dailymail',
@@ -89,6 +95,7 @@ if __name__ == "__main__":
     if args.model_dir is not None:
         quantize_and_export(
             model_dir=args.model_dir,
+            device=args.device,
             calib_dataset=args.calib_dataset,
             dtype=args.dtype,
             qformat=args.qformat,

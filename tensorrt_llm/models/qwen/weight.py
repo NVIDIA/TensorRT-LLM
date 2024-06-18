@@ -47,7 +47,9 @@ def load_from_gptq_qwen(
 
     model_params = {k: v for k, v in model.state_dict().items()}
     torch.cuda.empty_cache()
-
+    assert qwen_type in [
+        'qwen', 'qwen2'
+    ], "Currently, only qwen and qwen2 support gptq. qwen2_moe is not supported yet."
     layer_prefix = "transformer.h." if qwen_type == 'qwen' else "model.layers."
     key_list = get_qwen_key_list(qwen_type)
 

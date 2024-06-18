@@ -17,9 +17,11 @@
 
 #include "tensorrt_llm/layers/penaltyLayer.h"
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/common/tensor.h"
 #include "tensorrt_llm/kernels/penaltyKernels.h"
 #include "tensorrt_llm/layers/defaultDecodingParams.h"
+#include "tensorrt_llm/layers/layerUtils.h"
+#include "tensorrt_llm/runtime/bufferManager.h"
 
 #include <algorithm>
 
@@ -27,9 +29,7 @@ using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::runtime;
 
-namespace tensorrt_llm
-{
-namespace layers
+namespace tensorrt_llm::layers
 {
 
 template <typename T>
@@ -182,7 +182,7 @@ void PenaltyLayer<T>::freeBuffer()
 
 template <typename T>
 void PenaltyLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 const* batchSlots,
-    std::shared_ptr<BaseSetupParams> baseSetupParams)
+    std::shared_ptr<BaseSetupParams> const& baseSetupParams)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -207,14 +207,15 @@ void PenaltyLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, SizeType
     FillBuffers const fillBuffers{batchSize, mDecoderDomain.getBatchSize(), mStream};
 
     auto const& penaltyParams = setupParams->penaltyParams;
+    TLLM_CHECK_WITH_INFO(penaltyParams, "penaltyParams for setup is not set");
 
-    bool const useTemperature = mDecodingMode.isUseTemperature() && penaltyParams.temperature.has_value();
+    bool const useTemperature = mDecodingMode.isUseTemperature() && penaltyParams->temperature.has_value();
     bool const useRepetitionPenalty
-        = mDecodingMode.isUseRepetitionPenalty() && penaltyParams.repetitionPenalty.has_value();
-    bool const usePresencePenalty = mDecodingMode.isUsePresencePenalty() && penaltyParams.presencePenalty.has_value();
+        = mDecodingMode.isUseRepetitionPenalty() && penaltyParams->repetitionPenalty.has_value();
+    bool const usePresencePenalty = mDecodingMode.isUsePresencePenalty() && penaltyParams->presencePenalty.has_value();
     bool const useFrequencyPenalty
-        = mDecodingMode.isUseFrequencyPenalty() && penaltyParams.frequencyPenalty.has_value();
-    bool const useMinLength = mDecodingMode.isUseMinLength() && penaltyParams.minLength.has_value();
+        = mDecodingMode.isUseFrequencyPenalty() && penaltyParams->frequencyPenalty.has_value();
+    bool const useMinLength = mDecodingMode.isUseMinLength() && penaltyParams->minLength.has_value();
     // FIXME(nkorobov): once one of the requests has some penalty, we will always have to compute it.
     // To avoid that we need to scan through all active requests at each iteration.
     mUseTemperature |= useTemperature;
@@ -225,31 +226,31 @@ void PenaltyLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, SizeType
 
     if (mUseTemperature)
     {
-        fillBuffers(penaltyParams.temperature, DefaultDecodingParams::getTemperature(), mTemperature,
+        fillBuffers(penaltyParams->temperature, DefaultDecodingParams::getTemperature(), mTemperature,
             mTemperatureDevice, batchSlotsHost, getLimitsPenalty(DecodingPenaltyType::Temperature),
             "temperature penalty");
     }
     if (mUseRepetitionPenalty)
     {
-        fillBuffers(penaltyParams.repetitionPenalty, DefaultDecodingParams::getRepetitionPenalty(), mRepetitionPenalty,
+        fillBuffers(penaltyParams->repetitionPenalty, DefaultDecodingParams::getRepetitionPenalty(), mRepetitionPenalty,
             mRepetitionPenaltyDevice, batchSlotsHost, getLimitsPenalty(DecodingPenaltyType::Repetition),
             "repetition penalty");
     }
     if (mUsePresencePenalty)
     {
-        fillBuffers(penaltyParams.presencePenalty, DefaultDecodingParams::getPresencePenalty(), mPresencePenalty,
+        fillBuffers(penaltyParams->presencePenalty, DefaultDecodingParams::getPresencePenalty(), mPresencePenalty,
             mPresencePenaltyDevice, batchSlotsHost, getLimitsPenalty(DecodingPenaltyType::Presence),
             "presence penalty");
     }
     if (mUseFrequencyPenalty)
     {
-        fillBuffers(penaltyParams.frequencyPenalty, DefaultDecodingParams::getFrequencyPenalty(), mFrequencyPenalty,
+        fillBuffers(penaltyParams->frequencyPenalty, DefaultDecodingParams::getFrequencyPenalty(), mFrequencyPenalty,
             mFrequencyPenaltyDevice, batchSlotsHost, getLimitsPenalty(DecodingPenaltyType::Frequency),
             "frequency penalty");
     }
     if (mUseMinLength)
     {
-        fillBuffers(penaltyParams.minLength, DefaultDecodingParams::getMinLength(), mMinLength, mMinLengthDevice,
+        fillBuffers(penaltyParams->minLength, DefaultDecodingParams::getMinLength(), mMinLength, mMinLengthDevice,
             batchSlotsHost, getLimitsPenalty(DecodingPenaltyType::MinLength), "min length");
     }
 
@@ -258,21 +259,21 @@ void PenaltyLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, SizeType
 
 template <typename T>
 void PenaltyLayer<T>::forwardAsync(
-    std::shared_ptr<BaseOutputParams> baseOutputs, std::shared_ptr<BaseInputParams> baseInputs)
+    std::shared_ptr<BaseDecodingOutputs> const& baseOutputs, std::shared_ptr<BaseDecodingInputs> const& baseInputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto outputs = std::dynamic_pointer_cast<DynamicDecodeOutputParams>(baseOutputs);
-    auto params = std::dynamic_pointer_cast<DynamicDecodeInputParams>(baseInputs);
+    auto outputs = std::dynamic_pointer_cast<BaseDecodingOutputs>(baseOutputs);
+    auto params = std::dynamic_pointer_cast<DecodingInputs>(baseInputs);
 
     auto const localDecoderDomain = getLocalDecoderDomain(params, mDecoderDomain);
-    auto const maxSeqLen = outputs->output_ids.shape[outputs->output_ids.shape.size() - 1];
-    auto batchSlots = params->batch_slots ? params->batch_slots->template getPtr<SizeType32 const>() : nullptr;
+    auto const maxSeqLen = outputs->outputIds.shape[outputs->outputIds.shape.size() - 1];
+    auto batchSlots = params->batchSlots ? params->batchSlots->template getPtr<SizeType32 const>() : nullptr;
 
     std::vector<SizeType32> batchSlotsVec(localDecoderDomain.getBatchSize());
     std::iota(batchSlotsVec.begin(), batchSlotsVec.end(), 0);
     auto batchSlotsHost
-        = params->batch_slots ? params->batch_slots->template getPtr<SizeType32 const>() : batchSlotsVec.data();
+        = params->batchSlots ? params->batchSlots->template getPtr<SizeType32 const>() : batchSlotsVec.data();
 
     if (!mLogitsPtrsHost->data())
     {
@@ -288,12 +289,12 @@ void PenaltyLayer<T>::forwardAsync(
     auto logitsPtrsHostData = reinterpret_cast<T const**>(runtime::bufferCast<int64_t>(*logitsPtrsHost));
     for (SizeType32 bi = 0; bi < localDecoderDomain.getBatchSize(); bi++)
     {
-        if (params->logits_vec)
+        if (params->logitsVec)
         {
-            TLLM_CHECK_WITH_INFO(params->logits_vec->size() == localDecoderDomain.getBatchSize(),
-                "Logits vector size (%lu) is not equal to the batchSize (%d)", params->logits_vec->size(),
+            TLLM_CHECK_WITH_INFO(params->logitsVec->size() == localDecoderDomain.getBatchSize(),
+                "Logits vector size (%lu) is not equal to the batchSize (%d)", params->logitsVec->size(),
                 localDecoderDomain.getBatchSize());
-            logitsPtrsHostData[bi] = params->logits_vec.value()[bi].template getPtr<T>();
+            logitsPtrsHostData[bi] = params->logitsVec.value()[bi].template getPtr<T>();
         }
         else
         {
@@ -303,12 +304,11 @@ void PenaltyLayer<T>::forwardAsync(
     }
 
     SizeType32 const* inputLengths = nullptr;
-    if (params->input_lengths)
+    if (params->inputLengths)
     {
-        auto& input_lengths = params->input_lengths.value();
-        inputLengths = input_lengths.template getPtr<SizeType32 const>();
+        inputLengths = params->inputLengths->template getPtr<SizeType32 const>();
     }
-    auto* embeddingBias = params->embedding_bias ? params->embedding_bias->template getPtr<T const>() : nullptr;
+    auto* embeddingBias = params->embeddingBias ? params->embeddingBias->template getPtr<T const>() : nullptr;
 #define GET_PENALTIES(capital_name, type)                                                                              \
     (mUse##capital_name                                                                                                \
         && !allOfBatchSlots(batchSlotsHost, m##capital_name.data(), localDecoderDomain.getBatchSize(),                 \
@@ -324,9 +324,8 @@ void PenaltyLayer<T>::forwardAsync(
 
 #undef GET_PENALTIES
 
-    auto const tokensPerStep = params->medusaInputs
-        ? params->medusaInputs->medusaCurTokensPerStep.template getPtr<SizeType32 const>()
-        : nullptr;
+    auto const tokensPerStep
+        = params->curTokensPerStep ? params->curTokensPerStep->template getPtr<SizeType32 const>() : nullptr;
 
     InvokeBatchApplyPenaltyParams<T> penaltyParams;
     penaltyParams.inputLogits = reinterpret_cast<T const* const*>(logitsPtrsHostData);
@@ -343,12 +342,12 @@ void PenaltyLayer<T>::forwardAsync(
     penaltyParams.maxSeqLen = maxSeqLen;
     penaltyParams.vocabSize = mDecoderDomain.getVocabSize();
     penaltyParams.vocabSizePadded = mDecoderDomain.getVocabSizePadded();
-    penaltyParams.outputIdsPtr = outputs->output_ids_ptr.template getPtr<TokenIdType const*>();
-    penaltyParams.parentIdsPtr = outputs->parent_ids_ptr.template getPtr<SizeType32 const*>();
+    penaltyParams.outputIdsPtr = outputs->outputIdsPtr.template getPtr<TokenIdType const*>();
+    penaltyParams.parentIdsPtr = outputs->parentIdsPtr.template getPtr<SizeType32 const*>();
     penaltyParams.inputLengths = inputLengths;
-    penaltyParams.sequenceLengths = outputs->sequence_length->template getPtr<SizeType32 const>();
+    penaltyParams.sequenceLengths = outputs->sequenceLength->template getPtr<SizeType32 const>();
     penaltyParams.minLengths = minLengths;
-    penaltyParams.endIds = params->end_ids.template getPtr<TokenIdType const>();
+    penaltyParams.endIds = params->endIds.template getPtr<TokenIdType const>();
     penaltyParams.batchSlots = batchSlots;
     penaltyParams.maxTokensPerStep = mDecoderDomain.getMaxDecodingTokens();
     penaltyParams.tokensPerStep = tokensPerStep;
@@ -376,5 +375,4 @@ void PenaltyLayer<T>::forwardAsync(
 template class PenaltyLayer<float>;
 template class PenaltyLayer<half>;
 
-} // namespace layers
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::layers

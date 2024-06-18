@@ -154,7 +154,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
             profiler.start('load tensorrt_llm engine')
 
             kv_cache_config = trtllm.KvCacheConfig(
-                free_gpu_memory_fraction=0.45,  # hardcode for now
+                free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction /
+                2,  # hardcoded as half self kv & half cross kv for now
                 max_attention_window=max_attention_window_size,
                 sink_token_length=sink_token_length)
 
@@ -162,7 +163,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 Path(engine_dir) / "encoder",
                 Path(engine_dir) / "decoder", trtllm.ModelType.ENCODER_DECODER,
                 trtllm.ExecutorConfig(max_beam_width=max_beam_width,
-                                      kv_cache_config=kv_cache_config))
+                                      kv_cache_config=kv_cache_config,
+                                      gpu_weights_percent=gpu_weights_percent))
 
             profiler.stop('load tensorrt_llm engine')
 

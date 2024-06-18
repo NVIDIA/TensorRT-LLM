@@ -178,7 +178,6 @@ def print_output(tokenizer,
                     f'Output [Text {batch_idx} Beam {beam}]: \"{output_text}\"')
 
     output_ids = output_ids.reshape((-1, output_ids.size(2)))
-
     if output_csv is not None:
         output_file = Path(output_csv)
         output_file.parent.mkdir(exist_ok=True, parents=True)

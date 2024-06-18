@@ -308,12 +308,10 @@ class Tensor(object):
         if name is None:
             name = self.name
 
-        if dtype is None:
-            dtype = self.dtype
-        elif isinstance(dtype, str):
+        if isinstance(dtype, str):
             dtype = str_dtype_to_trt(dtype)
 
-        assert isinstance(dtype, trt.DataType)
+        assert dtype is None or isinstance(dtype, trt.DataType)
         default_net()._mark_output(self, name, dtype)
 
     def __add__(self, b):
@@ -1371,27 +1369,43 @@ def arange(start: Union[Tensor, int], end: Union[Tensor, int],
         The tensor produced by the fill layer. It is a 1D tensor containing
         `end-start` elements of type `dtype`.
     '''
+    res_dtype = str_dtype_to_trt(dtype)
     if isinstance(start, int):
         assert isinstance(end, int)
-        start = constant(int32_array(start))
-        end = constant(int32_array(end))
+        array_func = int32_array if res_dtype == trt.int32 else int64_array
+        start = constant(array_func(start))
+        end = constant(array_func(end))
     elif isinstance(start, Tensor):
         assert isinstance(end, Tensor)
+        assert start.dtype == trt.int32 or start.dtype == trt.int64
+        assert end.dtype == trt.int32 or end.dtype == trt.int64
+        if start.dtype != end.dtype:
+            if start.dtype == trt.int32:  # end == trt.int64
+                if res_dtype == trt.int32:
+                    end = cast(end, "int32")
+                else:
+                    start = cast(start, "int64")
+            else:  # start == trt.int64 and end == trt.int32
+                if res_dtype == trt.int32:
+                    start = cast(start, "int32")
+                else:
+                    end = cast(end, "int64")
     else:
         raise TypeError("%s is not supported" % type(start))
 
-    step = constant(int32_array([1]))
+    assert start.dtype == end.dtype, f"start type ({start.dtype}) != end type ({end.dtype})"
+    step = constant_to_tensor_(1, dtype=start.dtype, to_array=True)
 
     num = end - start
     num = num.view([1])
 
     layer = default_trtnet().add_fill([0], trt.FillOperation.LINSPACE,
-                                      trt.int32)
+                                      start.dtype)
     layer.set_input(0, num.trt_tensor)  # rank = 1
     layer.set_input(1, start.trt_tensor)  # rank = 0
     layer.set_input(2, step.trt_tensor)  # rank = 1
     tensor = _create_tensor(layer.get_output(0), layer)
-    if tensor.dtype != str_dtype_to_trt(dtype):
+    if tensor.dtype != res_dtype:
         tensor = tensor.cast(dtype)
     return tensor
 
@@ -2305,9 +2319,11 @@ def cumsum(input: Tensor, dim: int, prefer_plugin: bool = True) -> Tensor:
         else:
             # credit to Apple
             reduction_length = shape(input, -1)
-            reduction_range = arange(constant_to_tensor_(0, to_array=False),
+            reduction_range = arange(constant_to_tensor_(0,
+                                                         dtype='int64',
+                                                         to_array=False),
                                      reduction_length,
-                                     dtype='int32')
+                                     dtype='int64')
             lower_triangle = cast(
                 unsqueeze(reduction_range, 0) <= unsqueeze(reduction_range, 1),
                 dtype=input.dtype)
@@ -3666,6 +3682,67 @@ class AllReduceFusionParams():
         return 1 if self.bias is not None else 0
 
 
+def create_allreduce_plugin(
+    network: trt.INetworkDefinition,
+    tensor: trt.ITensor,
+    workspace: Optional[trt.ITensor],
+    group: np.array,
+    strategy: AllReduceStrategy,
+    dtype: trt.DataType,
+    config: AllReduceConfig,
+    counter: int,
+    reduce_fusion_params: AllReduceFusionParams,
+):
+    allreduce_plg_creator = trt.get_plugin_registry().get_plugin_creator(
+        'AllReduce', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert allreduce_plg_creator is not None
+
+    pf_group = trt.PluginField("group", group, trt.PluginFieldType.INT32)
+    pf_dtype = trt.PluginField("type_id", np.array([int(dtype)], np.int32),
+                               trt.PluginFieldType.INT32)
+    pfc = [pf_group, pf_dtype]
+    p_strategy = trt.PluginField("strategy", np.array([int(strategy)], np.int8),
+                                 trt.PluginFieldType.INT8)
+    pfc.append(p_strategy)
+    p_config = trt.PluginField("config", np.array([int(config)], np.int8),
+                               trt.PluginFieldType.INT8)
+    pfc.append(p_config)
+    p_fusion_op = trt.PluginField(
+        "fusion_op", np.array([int(reduce_fusion_params.fusion_op)], np.int8),
+        trt.PluginFieldType.INT8)
+    pfc.append(p_fusion_op)
+    p_counter = trt.PluginField("counter", np.array([counter], np.int32),
+                                trt.PluginFieldType.INT32)
+    pfc.append(p_counter)
+    p_eps = trt.PluginField(
+        "eps", np.array([float(reduce_fusion_params.eps)], np.float32),
+        trt.PluginFieldType.FLOAT32)
+    pfc.append(p_eps)
+    p_affine = trt.PluginField(
+        "affine", np.array([int(reduce_fusion_params.has_affine())], np.int8),
+        trt.PluginFieldType.INT8)
+    pfc.append(p_affine)
+    p_bias = trt.PluginField(
+        "bias", np.array([int(reduce_fusion_params.has_bias())], np.int8),
+        trt.PluginFieldType.INT8)
+    pfc.append(p_bias)
+
+    pfc = trt.PluginFieldCollection(pfc)
+    ar_plug = allreduce_plg_creator.create_plugin("allreduce", pfc)
+    plug_inputs = [tensor]
+    if strategy != AllReduceStrategy.NCCL:
+        plug_inputs.append(workspace)
+    if reduce_fusion_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
+        if reduce_fusion_params.has_bias() == 1:
+            plug_inputs.append(reduce_fusion_params.bias.trt_tensor)
+        plug_inputs.append(reduce_fusion_params.residual.trt_tensor)
+        if reduce_fusion_params.has_affine() == 1:
+            plug_inputs.append(reduce_fusion_params.norm_weight.trt_tensor)
+
+    layer = network.add_plugin_v2(plug_inputs, ar_plug)
+    return layer, allreduce_plg_creator, pfc
+
+
 def allreduce(
         tensor: Tensor,
         group: List[int],
@@ -3706,73 +3783,33 @@ def allreduce(
         The tensor produced by that layer.
     '''
 
-    allreduce_plg_creator = trt.get_plugin_registry().get_plugin_creator(
-        'AllReduce', '1', TRT_LLM_PLUGIN_NAMESPACE)
-
     if strategy is None:
         if default_net().plugin_config.use_custom_all_reduce:
             strategy = AllReduceStrategy.AUTO
         else:
             strategy = AllReduceStrategy.NCCL
+
+    workspace = None
+    counter = 0
+    if strategy != AllReduceStrategy.NCCL:
+        workspace = current_all_reduce_helper().workspace.trt_tensor
+        counter = current_all_reduce_helper().gen_id()
+
     if reduce_fusion_params is None:
         reduce_fusion_params = AllReduceFusionParams()
 
-    counter = 0
-    workspace = None
-
-    if strategy != AllReduceStrategy.NCCL:
-        counter = current_all_reduce_helper().gen_id()
-        workspace = current_all_reduce_helper().workspace
-
-    assert allreduce_plg_creator is not None
-
-    group = trt.PluginField("group", np.array(group, dtype=np.int32),
-                            trt.PluginFieldType.INT32)
-
-    p_dtype = default_net().plugin_config.nccl_plugin
-    pf_dtype = trt.PluginField(
-        "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
-        trt.PluginFieldType.INT32)
-    pfc = [group, pf_dtype]
-    p_strategy = trt.PluginField("strategy", np.array([int(strategy)], np.int8),
-                                 trt.PluginFieldType.INT8)
-    pfc.append(p_strategy)
-    p_config = trt.PluginField("config", np.array([int(config)], np.int8),
-                               trt.PluginFieldType.INT8)
-    pfc.append(p_config)
-    p_fusion_op = trt.PluginField(
-        "fusion_op", np.array([int(reduce_fusion_params.fusion_op)], np.int8),
-        trt.PluginFieldType.INT8)
-    pfc.append(p_fusion_op)
-    p_counter = trt.PluginField("counter", np.array([counter], np.int32),
-                                trt.PluginFieldType.INT32)
-    pfc.append(p_counter)
-    p_eps = trt.PluginField(
-        "eps", np.array([float(reduce_fusion_params.eps)], np.float32),
-        trt.PluginFieldType.FLOAT32)
-    pfc.append(p_eps)
-    p_affine = trt.PluginField(
-        "affine", np.array([int(reduce_fusion_params.has_affine())], np.int8),
-        trt.PluginFieldType.INT8)
-    pfc.append(p_affine)
-    p_bias = trt.PluginField(
-        "bias", np.array([int(reduce_fusion_params.has_bias())], np.int8),
-        trt.PluginFieldType.INT8)
-    pfc.append(p_bias)
-
-    pfc = trt.PluginFieldCollection(pfc)
-    ar_plug = allreduce_plg_creator.create_plugin("allreduce", pfc)
-    plug_inputs = [tensor.cast(p_dtype).trt_tensor]
-    if strategy != AllReduceStrategy.NCCL:
-        plug_inputs.append(workspace.trt_tensor)
-    if reduce_fusion_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
-        if reduce_fusion_params.has_bias() == 1:
-            plug_inputs.append(reduce_fusion_params.bias.trt_tensor)
-        plug_inputs.append(reduce_fusion_params.residual.trt_tensor)
-        if reduce_fusion_params.has_affine() == 1:
-            plug_inputs.append(reduce_fusion_params.norm_weight.trt_tensor)
-
-    layer = default_trtnet().add_plugin_v2(plug_inputs, ar_plug)
+    dtype = default_net().plugin_config.nccl_plugin
+    layer, allreduce_plg_creator, pfc = create_allreduce_plugin(
+        network=default_trtnet(),
+        tensor=tensor.cast(dtype).trt_tensor,
+        workspace=workspace,
+        group=np.array(group, dtype=np.int32),
+        strategy=strategy,
+        dtype=str_dtype_to_trt(dtype),
+        config=config,
+        counter=counter,
+        reduce_fusion_params=reduce_fusion_params,
+    )
     _add_plugin_info(layer, allreduce_plg_creator, "allreduce", pfc)
     if reduce_fusion_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
         final_output = _create_tensor(layer.get_output(0),
@@ -4920,7 +4957,7 @@ def gpt_attention(
     if spec_decoding_packed_mask is not None:
         # add position_ids as well only if speculative decoding mode
         assert spec_decoding_position_offsets is not None
-        assert spec_decoding_position_offsets is not None
+        assert spec_decoding_generation_lengths is not None
         plug_inputs += [
             spec_decoding_generation_lengths, spec_decoding_packed_mask,
             spec_decoding_position_offsets

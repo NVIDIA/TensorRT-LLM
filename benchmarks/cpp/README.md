@@ -232,7 +232,7 @@ ${HOME}/.local/bin/trtllm-build \
     --output_dir ${LORA_ENGINE} \
     --max_batch_size ${MAX_BATCH} \
     --max_input_len $MAX_LEN \
-    --max_output_len $MAX_LEN \
+    --max_seq_len $((2*${MAX_LEN})) \
     --gemm_plugin float16 \
     --lora_plugin float16 \
     --use_paged_context_fmha enable \

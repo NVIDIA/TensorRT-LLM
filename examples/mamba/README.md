@@ -102,7 +102,7 @@ trtllm-build --checkpoint_dir ./mamba_model/mamba-2.8b/trt_ckpt/bf16/1-gpu/ \
              --mamba_conv1d_plugin bfloat16 \
              --max_batch_size 8 \
              --max_input_len 924 \
-             --max_output_len 100 \
+             --max_seq_len 1024 \
              --output_dir ./mamba_model/mamba-2.8b/trt_engines/bf16/1-gpu/
 
 # mamba-1.4b
@@ -112,7 +112,7 @@ trtllm-build --checkpoint_dir ./mamba_model/mamba-1.4b/trt_ckpt/fp16/1-gpu/ \
              --mamba_conv1d_plugin float16 \
              --max_batch_size 8 \
              --max_input_len 924 \
-             --max_output_len 100 \
+             --max_seq_len 1024 \
              --output_dir ./mamba_model/mamba-1.4b/trt_engines/fp16/1-gpu/
 
 # mamba-790m
@@ -122,7 +122,7 @@ trtllm-build --checkpoint_dir ./mamba_model/mamba-790m/trt_ckpt/fp16/1-gpu/ \
              --mamba_conv1d_plugin float16 \
              --max_batch_size 8 \
              --max_input_len 924 \
-             --max_output_len 100 \
+             --max_seq_len 1024 \
              --output_dir ./mamba_model/mamba-790m/trt_engines/fp16/1-gpu/
 
 # mamba-370m
@@ -132,7 +132,7 @@ trtllm-build --checkpoint_dir ./mamba_model/mamba-370m/trt_ckpt/fp16/1-gpu/ \
              --mamba_conv1d_plugin float16 \
              --max_batch_size 8 \
              --max_input_len 924 \
-             --max_output_len 100 \
+             --max_seq_len 1024 \
              --output_dir ./mamba_model/mamba-370m/trt_engines/fp16/1-gpu/
 
 # mamba-130m
@@ -142,7 +142,7 @@ trtllm-build --checkpoint_dir ./mamba_model/mamba-130m/trt_ckpt/fp16/1-gpu/ \
              --mamba_conv1d_plugin float16 \
              --max_batch_size 8 \
              --max_input_len 924 \
-             --max_output_len 100 \
+             --max_seq_len 1024 \
              --output_dir ./mamba_model/mamba-130m/trt_engines/fp16/1-gpu/
 ```
 

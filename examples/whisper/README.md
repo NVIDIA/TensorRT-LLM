@@ -80,7 +80,7 @@ trtllm-build  --checkpoint_dir ${checkpoint_dir}/decoder \
               --use_custom_all_reduce disable \
               --max_beam_width ${MAX_BEAM_WIDTH} \
               --max_batch_size ${MAX_BATCH_SIZE} \
-              --max_output_len 100 \
+              --max_seq_len 114 \
               --max_input_len 14 \
               --max_encoder_input_len 1500 \
               --gemm_plugin ${INFERENCE_PRECISION} \

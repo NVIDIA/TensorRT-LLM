@@ -480,14 +480,12 @@ class ModelRunner(ModelRunnerMixin):
                 pretrained_config, 'num_medusa_heads') else 0,
             use_custom_all_reduce=build_config.plugin_config.
             use_custom_all_reduce,
-            moe_tp_mode=pretrained_config.moe_tp_mode if hasattr(
-                pretrained_config, 'moe_tp_mode') else 0,
             **rnn_configs_kwargs,
             gpu_weights_percent=gpu_weights_percent,
         )
         max_batch_size = build_config.max_batch_size
         max_input_len = build_config.max_input_len
-        max_output_len = build_config.max_output_len
+        max_seq_len = build_config.max_seq_len
         max_beam_width = build_config.max_beam_width
         if pretrained_config.architecture == 'ChatGLMForCausalLM' and pretrained_config.chatglm_version in [
                 'glm', 'chatglm'
@@ -528,7 +526,7 @@ class ModelRunner(ModelRunnerMixin):
         return cls(session=session,
                    max_batch_size=max_batch_size,
                    max_input_len=max_input_len,
-                   max_seq_len=max_input_len + max_output_len,
+                   max_seq_len=max_seq_len,
                    max_beam_width=max_beam_width,
                    lora_manager=lora_manager)
 

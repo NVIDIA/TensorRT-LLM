@@ -15,9 +15,11 @@
 import os
 import sys
 import unittest
+from itertools import product
 
 import numpy as np
 import torch
+from parameterized import parameterized
 
 import tensorrt_llm
 
@@ -53,36 +55,47 @@ class TestArange(unittest.TestCase):
         ref = torch.arange(start, end).int().cuda()
         torch.testing.assert_close(outputs['output'], ref)
 
-    def test_arange_tensor(self):
+    @parameterized.expand(
+        list(
+            product(['int32', 'int64'], ['int32', 'int64'],
+                    ['int32', 'int64', 'float32', 'float16'])))
+    def test_arange_tensor(self,
+                           s_dtype='int32',
+                           e_dtype='int32',
+                           r_dtype='int32'):
         # test data
         s = 0
         e = 128
-        dtype = 'int32'
+        s_np_dtype = tensorrt_llm._utils.str_dtype_to_np(s_dtype)
+        e_np_dtype = tensorrt_llm._utils.str_dtype_to_np(e_dtype)
 
         # construct trt network
         builder = tensorrt_llm.Builder()
         network = builder.create_network()
         with tensorrt_llm.net_guard(network):
 
-            start = tensorrt_llm.functional.constant(np.array(s,
-                                                              dtype=np.int32))
-            end_tensor = tensorrt_llm.functional.constant(
-                np.array([0] * e, dtype=np.int32))
+            start = tensorrt_llm.functional.constant(
+                np.array(s, dtype=s_np_dtype))
+            end = tensorrt_llm.functional.constant(
+                np.array([e], dtype=e_np_dtype))
 
-            output = tensorrt_llm.functional.arange(
-                start=start,
-                end=tensorrt_llm.functional.shape(end_tensor, 0),
-                dtype=dtype)
+            output = tensorrt_llm.functional.arange(start=start,
+                                                    end=end,
+                                                    dtype=r_dtype)
 
-            output.mark_output('output', dtype)
+            output.mark_output('output', r_dtype)
 
         # trt run
         inputs = {}
-        session = create_session(builder, network, precision="float32")
+        session = create_session(
+            builder,
+            network,
+            precision="float32" if r_dtype != 'float16' else 'float16')
         outputs = run_session(session, inputs)
 
         # pytorch run
-        ref = torch.arange(s, e).int().cuda()
+        ref = torch.arange(
+            s, e, dtype=tensorrt_llm.str_dtype_to_torch(r_dtype)).cuda()
 
         # compare diff
         torch.testing.assert_close(outputs['output'], ref)

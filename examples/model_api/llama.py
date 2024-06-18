@@ -47,7 +47,7 @@ def main():
     args = parse_args()
 
     build_config = BuildConfig(max_input_len=256,
-                               max_output_len=20,
+                               max_seq_len=276,
                                max_batch_size=1)
     # just for fast build, not best for production
     build_config.builder_opt = 0

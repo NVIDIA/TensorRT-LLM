@@ -223,12 +223,12 @@ class Network(object):
         from .functional import cast
 
         # In strongly_typed, if tensor output is not the same, add a cast
-        if self.strongly_typed:
+        if dtype is not None and self.strongly_typed:
             tensor = cast(tensor, dtype)
         self.trt_network.mark_output(tensor.trt_tensor)
         tensor.trt_tensor.name = name
         if not self.strongly_typed:
-            tensor.trt_tensor.dtype = dtype
+            tensor.trt_tensor.dtype = dtype or tensor.trt_tensor.dtype
         logger.debug(f'Mark output: {name}, dtype: {dtype}')
 
     def set_named_parameters(self, named_parameters):

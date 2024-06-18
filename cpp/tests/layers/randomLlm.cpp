@@ -14,7 +14,13 @@
  * limitations under the License.
  */
 #include "tests/layers/randomLlm.h"
+#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/layers/lookaheadDecodingUtils.h"
+#include "tensorrt_llm/runtime/bufferManager.h"
+#include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/iBuffer.h"
+#include "tensorrt_llm/runtime/iTensor.h"
 
 namespace tensorrt_llm::tests::layers
 {
@@ -34,20 +40,20 @@ TensorPtr initTensor(std::string str, std::optional<ITensor::Shape> shape)
     return tensor;
 }
 
-TensorPtr RandomTokenLogits::tokenToLogits(TokenIdType token) const
+TensorConstPtr RandomTokenLogits::tokenToLogits(TokenIdType token) const
 {
     TensorPtr logits = BufferManager::cpu(mVocabulary->getShape(), nvinfer1::DataType::kFLOAT);
     tokenToLogits(logits, token);
     return logits;
 }
 
-void RandomTokenLogits::tokenToLogits(TensorPtr logits, TokenIdType token) const
+void RandomTokenLogits::tokenToLogits(TensorPtr const& logits, TokenIdType token) const
 {
     TLLM_CHECK_WITH_INFO(logits->shapeEquals({getVocabSize()}), "%s != {%d}",
         ITensor::toString(logits->getShape()).c_str(), getVocabSize());
 
     auto logitsRange = BufferRange<float>(*logits);
-    auto vocabRange = BufferRange<TokenIdType>(*mVocabulary);
+    auto vocabRange = BufferRange<TokenIdType const>(*mVocabulary);
     auto itl = logitsRange.begin();
     auto itv = vocabRange.begin();
     for (; itl != logitsRange.end() && itv != vocabRange.end(); itl++, itv++)
@@ -57,11 +63,11 @@ void RandomTokenLogits::tokenToLogits(TensorPtr logits, TokenIdType token) const
     }
 }
 
-TokenIdType RandomTokenLogits::logitsToToken(TensorPtr logits) const
+TokenIdType RandomTokenLogits::logitsToToken(TensorConstPtr const& logits) const
 {
     TLLM_CHECK(logits->shapeEquals({getVocabSize()}));
-    auto logitsRange = BufferRange<float>(*logits);
-    auto vocabRange = BufferRange<TokenIdType>(*mVocabulary);
+    auto logitsRange = BufferRange<float const>(*logits);
+    auto vocabRange = BufferRange<TokenIdType const>(*mVocabulary);
     float max = -FLT_MAX;
     TokenIdType result;
     auto itl = logitsRange.begin();
@@ -78,9 +84,9 @@ TokenIdType RandomTokenLogits::logitsToToken(TensorPtr logits) const
     return result;
 }
 
-std::list<TensorPtr> RandomTokenLogits::stringToLogits(std::string tokens) const
+std::list<TensorConstPtr> RandomTokenLogits::stringToLogits(std::string tokens) const
 {
-    std::list<TensorPtr> result;
+    std::list<TensorConstPtr> result;
     for (auto& token : tokens)
     {
         result.push_back(tokenToLogits(static_cast<TokenIdType>(token)));
@@ -88,7 +94,7 @@ std::list<TensorPtr> RandomTokenLogits::stringToLogits(std::string tokens) const
     return result;
 }
 
-void RandomTokenLogits::stringToLogits(TensorPtr logits, std::string tokens) const
+void RandomTokenLogits::stringToLogits(TensorPtr const& logits, std::string tokens) const
 {
     TLLM_CHECK(logits->shapeEquals({static_cast<SizeType32>(tokens.size()), getVocabSize()}));
 
@@ -99,11 +105,11 @@ void RandomTokenLogits::stringToLogits(TensorPtr logits, std::string tokens) con
     }
 }
 
-void RandomTokenLogits::tensorToLogits(TensorPtr logits, TensorPtr tokens) const
+void RandomTokenLogits::tensorToLogits(TensorPtr const& logits, TensorConstPtr const& tokens) const
 {
     TLLM_CHECK(ITensor::volume(logits->getShape()) == ITensor::volume(tokens->getShape()) * getVocabSize());
     // TLLM_CHECK(logits->shapeEquals({static_cast<SizeType32>(tokens.size()), getVocabSize()}));
-    auto tokensRange = BufferRange<TokenIdType>(*tokens);
+    auto tokensRange = BufferRange<TokenIdType const>(*tokens);
     auto i = 0;
     for (auto it = tokensRange.begin(); it != tokensRange.end(); it++)
     {
@@ -111,7 +117,7 @@ void RandomTokenLogits::tensorToLogits(TensorPtr logits, TensorPtr tokens) const
     }
 }
 
-std::string RandomTokenLogits::logitsToString(std::list<TensorPtr> logits) const
+std::string RandomTokenLogits::logitsToString(std::list<TensorConstPtr> logits) const
 {
     std::string result;
     for (auto& token : logits)
@@ -121,7 +127,7 @@ std::string RandomTokenLogits::logitsToString(std::list<TensorPtr> logits) const
     return result;
 }
 
-std::string RandomTokenLogits::logitsToString(TensorPtr logits) const
+std::string RandomTokenLogits::logitsToString(TensorConstPtr const& logits) const
 {
     auto len = logits->getShape().d[0];
     std::string result;
@@ -132,15 +138,22 @@ std::string RandomTokenLogits::logitsToString(TensorPtr logits) const
     return result;
 }
 
-TensorPtr RandomTokenLogits::logitsToTensor(TensorPtr logits) const
+void RandomTokenLogits::logitsToTensor(TensorPtr const& tokens, TensorConstPtr const& logits) const
+{
+    auto len = logits->getShape().d[0];
+    TLLM_CHECK(tokens->getShape().d[0] >= len);
+    auto tokensRange = BufferRange<TokenIdType>(*tokens);
+    for (auto i = 0; i < len; i++)
+    {
+        tokensRange[i] = logitsToToken(ITensor::at(logits, {i}));
+    }
+}
+
+TensorConstPtr RandomTokenLogits::logitsToTensor(TensorConstPtr const& logits) const
 {
     auto len = logits->getShape().d[0];
     TensorPtr result = BufferManager::cpu(ITensor::makeShape({len}), nvinfer1::DataType::kINT32);
-    auto resultRange = BufferRange<TokenIdType>(*result);
-    for (auto i = 0; i < len; i++)
-    {
-        resultRange[i] = logitsToToken(ITensor::at(logits, {i}));
-    }
+    logitsToTensor(result, logits);
     return result;
 }
 
@@ -149,22 +162,22 @@ SizeType32 RandomTokenLogits::getVocabSize() const
     return ITensor::volume(mVocabulary->getShape());
 }
 
-TokenIdType RandomTokenLogits::getInvalidToken() const
+TokenIdType const RandomTokenLogits::getInvalidToken() const
 {
-    return *(BufferRange<TokenIdType>(*mVocabulary).end() - 1);
+    return *(BufferRange<TokenIdType const>(*mVocabulary).end() - 1);
 }
 
-TokenIdType RandomTokenLogits::getEndToken() const
+TokenIdType const RandomTokenLogits::getEndToken() const
 {
-    return *(BufferRange<TokenIdType>(*mVocabulary).end() - 2);
+    return *(BufferRange<TokenIdType const>(*mVocabulary).end() - 2);
 }
 
-void RandomLlm::sampleByMask(TensorPtr inout, TensorPtr mask) const
+void RandomLlm::sampleByMask(TensorPtr const& inout, TensorConstPtr const& mask) const
 {
     auto len = ITensor::volume(mask->getShape());
     TLLM_CHECK(len == ITensor::volume(mask->getShape()));
     auto inoutRange = BufferRange<TokenIdType>(*inout);
-    auto maskRange = BufferRange<bool>(*mask);
+    auto maskRange = BufferRange<bool const>(*mask);
     auto invalid = mTable->getInvalidToken();
 
     for (SizeType32 i = 0; i < len; i++)
@@ -176,10 +189,10 @@ void RandomLlm::sampleByMask(TensorPtr inout, TensorPtr mask) const
     }
 }
 
-bool RandomLlm::verify(SizeType32 const offset, TensorPtr const script) const
+bool RandomLlm::verify(SizeType32 const offset, TensorConstPtr const& script) const
 {
-    auto oracleRange = BufferRange<TokenIdType>(*mOracle);
-    auto scriptRange = BufferRange<TokenIdType>(*script);
+    auto oracleRange = BufferRange<TokenIdType const>(*mOracle);
+    auto scriptRange = BufferRange<TokenIdType const>(*script);
     auto len = ITensor::volume(script->getShape());
     auto result = std::equal(oracleRange.begin() + offset, oracleRange.begin() + offset + len, scriptRange.begin());
     if (!result)
@@ -193,53 +206,44 @@ bool RandomLlm::verify(SizeType32 const offset, TensorPtr const script) const
     return result;
 }
 
-void RandomLlm::forward(TensorPtr output, TensorPtr const input, TensorPtr const position) const
+void RandomLlm::forward(TensorPtr const& output, TensorConstPtr const& input, TensorConstPtr const& position,
+    TensorConstPtr const mask) const
 {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK(ITensor::volume(input->getShape()) == ITensor::volume(position->getShape()));
     TLLM_CHECK(ITensor::volume(output->getShape()) == ITensor::volume(input->getShape()) * mTable->getVocabSize());
 
     TensorPtr tokens = BufferManager::cpu(input->getShape(), nvinfer1::DataType::kINT32);
-    foretell(tokens, input, position);
-    if (mId == 4)
-    {
-        TLLM_LOG_DEBUG("batch[%d] DEBUG", mId);
-        PRINT_TOKENS(tokens);
-        PRINT_TOKENS(input);
-        PRINT_TOKENS(position);
-    }
+    foretell(tokens, input, position, mask);
+    // foretellOld(tokens, input, position);
     mTable->tensorToLogits(output, tokens);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void LookaheadRandomLlm::foretell(TensorPtr output, TensorPtr const input, TensorPtr const position) const
+void LookaheadRandomLlm::foretell(TensorPtr const& output, TensorConstPtr const& input, TensorConstPtr const& position,
+    TensorConstPtr const mask) const
 {
-    TLLM_CHECK(ITensor::volume(input->getShape()) == ITensor::volume(position->getShape()));
-    TLLM_CHECK(ITensor::volume(output->getShape()) >= ITensor::volume(input->getShape()));
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    auto len = ITensor::volume(input->getShape());
+    TLLM_CHECK(ITensor::volume(position->getShape()) == len);
+    TLLM_CHECK(ITensor::volume(output->getShape()) >= len);
+    if (mask)
+    {
+        TLLM_CHECK(ITensor::volume(mask->getShape()) >= len * len);
+        TLLM_CHECK(mask->getShape().d[0] >= len);
+        TLLM_CHECK(mask->getShape().d[1] >= len);
+    }
+
+    TensorPtr maskRebuilt = BufferManager::cpu(ITensor::makeShape({len, len}), nvinfer1::DataType::kBOOL);
+    posIdsToMask(maskRebuilt, position);
 
     auto outputRange = BufferRange<TokenIdType>(*output);
-    auto inputRange = BufferRange<TokenIdType>(*input);
-    auto positionRange = BufferRange<TokenIdType>(*position);
-    auto oracleRange = BufferRange<TokenIdType>(*mOracle);
-    auto len = ITensor::volume(input->getShape());
+    auto inputRange = BufferRange<TokenIdType const>(*input);
+    auto positionRange = BufferRange<SizeType32 const>(*position);
+    auto maskLocation = mask ? BufferLocation<bool const>(*mask) : BufferLocation<bool const>(*maskRebuilt);
+    auto oracleRange = BufferRange<SizeType32 const>(*mOracle);
     auto olen = ITensor::volume(mOracle->getShape());
 
-    std::vector<std::vector<bool>> mask(len, std::vector<bool>(len, false));
-    std::vector<std::pair<SizeType32, SizeType32>> stack;
-    stack.push_back(std::make_pair(0, positionRange[0]));
-    mask[0][0] = true;
-    for (auto i = 1; i < len; i++)
-    {
-        auto cur = positionRange[i];
-        while (stack.size() > 0 && cur <= stack.back().second)
-        {
-            stack.pop_back();
-        }
-        TLLM_CHECK(stack.size() > 0 ? cur == stack.back().second + 1 : true);
-        stack.push_back(std::make_pair(i, cur));
-        for (auto prev : stack)
-        {
-            mask[i][prev.first] = true;
-        }
-    }
     auto verifyStart = 2;
     for (; verifyStart < len - 1; verifyStart++)
     {
@@ -257,7 +261,7 @@ void LookaheadRandomLlm::foretell(TensorPtr output, TensorPtr const input, Tenso
         bool right = true;
         for (auto j = 0; j < i; j++)
         {
-            right &= mask[i][j] ? oracleRange[positionRange[j]] == inputRange[j] : true;
+            right &= maskLocation.at(i, j) ? oracleRange[positionRange[j]] == inputRange[j] : true;
         }
         if (i < verifyStart)
         { // lookahead might be right
@@ -266,6 +270,53 @@ void LookaheadRandomLlm::foretell(TensorPtr output, TensorPtr const input, Tenso
         else
         { // verify should be wrong.
             outputRange[i] = (right && legal) ? oracleRange[positionRange[i] + 1] : invalid;
+        }
+    }
+}
+
+void LookaheadRandomLlm::posIdsToMask(TensorPtr const& mask, TensorConstPtr const& posIds) const
+{
+    auto len = ITensor::volume(posIds->getShape());
+    TLLM_CHECK(ITensor::volume(mask->getShape()) >= len * len);
+    auto posIdsRange = BufferRange<SizeType32 const>(*posIds);
+    auto maskRange = BufferRange<bool>(*mask);
+
+    for (auto i = 0; i < maskRange.size(); i++)
+    {
+        maskRange[i] = false;
+    }
+
+    std::vector<std::pair<SizeType32, SizeType32>> stack;
+    stack.push_back(std::make_pair(0, posIdsRange[0]));
+    maskRange[0 * len + 0] = true;
+    for (auto i = 1; i < len; i++)
+    {
+        auto cur = posIdsRange[i];
+        while (stack.size() > 0 && cur <= stack.back().second)
+        {
+            stack.pop_back();
+        }
+        TLLM_CHECK(stack.size() > 0 ? cur == stack.back().second + 1 : true);
+        stack.push_back(std::make_pair(i, cur));
+        for (auto prev : stack)
+        {
+            maskRange[i * len + prev.first] = true;
+        }
+    }
+}
+
+void LookaheadRandomLlm::maskToPosIds(TensorPtr const& posIds, TensorConstPtr const& mask, SizeType32 start) const
+{
+    auto len = ITensor::volume(posIds->getShape());
+    TLLM_CHECK(ITensor::volume(mask->getShape()) >= len * len);
+    auto posIdsRange = BufferRange<SizeType32>(*posIds);
+    auto maskLocation = BufferLocation<bool const>(*mask);
+    for (auto i = 0; i < len; i++)
+    {
+        posIdsRange[i] = start;
+        for (auto j = 0; j < i; j++)
+        {
+            posIdsRange[i] += maskLocation.at(i, j);
         }
     }
 }

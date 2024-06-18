@@ -29,7 +29,7 @@ namespace kernels
 namespace jit
 {
 
-// A collection of CubinObjs, with caching functionality.
+// A thread-safe collection of CubinObjs, with caching functionality.
 template <typename Key, class Hash = std::hash<Key>>
 class CubinObjRegistryTemplate
 {
@@ -64,6 +64,7 @@ public:
 
     std::unique_ptr<CubinObjRegistryTemplate<Key, Hash>> clone() const noexcept
     {
+        std::lock_guard<std::mutex> lock(mMutex);
         auto result = std::make_unique<CubinObjRegistryTemplate<Key, Hash>>();
         for (auto const& p : mMap)
         {
@@ -74,6 +75,7 @@ public:
 
     size_t getSerializationSize() const noexcept
     {
+        std::lock_guard<std::mutex> lock(mMutex);
         size_t result = sizeof(uint32_t);
         for (auto&& p : mMap)
         {
@@ -85,6 +87,7 @@ public:
 
     void serialize(void* buffer_, size_t buffer_size) const noexcept
     {
+        std::lock_guard<std::mutex> lock(mMutex);
         size_t remaining_buffer_size = buffer_size;
         uint8_t* buffer = static_cast<uint8_t*>(buffer_);
         uint32_t n = mMap.size();
@@ -108,31 +111,61 @@ public:
         TLLM_CHECK(remaining_buffer_size == 0);
     }
 
-    // Returns directly if the Cubin already exists in the registry, otherwise call compileEngine to compile it.
-    //
-    // compileEngine may be nullptr.
-    CubinObj* getCubin(Key const& key, CompileEngine* compileEngine)
+    // Compiles and inserts the cubin if not found in mMap. Does nothing otherwise.
+    void insertCubinIfNotExists(Key const& key, CompileEngine* compileEngine)
     {
+        TLLM_CHECK(compileEngine != nullptr);
+
+        std::lock_guard<std::mutex> lock(mMutex);
+
         auto iter = mMap.find(key);
         if (iter != mMap.end())
         {
-            return &(iter->second);
+            return;
         }
 
-        TLLM_CHECK_WITH_INFO(compileEngine != nullptr, "Key not found; compileEngine shouldn't be nullptr.");
-
         CubinObj obj = compileEngine->compile();
-        auto insertResultIter = mMap.insert({key, std::move(obj)}).first;
-        return &(insertResultIter->second);
+        mMap.insert({key, std::move(obj)});
+        return;
+    }
+
+    void insertCubin(Key const& key, CubinObj&& obj)
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        mMap.insert({key, std::forward<CubinObj>(obj)});
+    }
+
+    CubinObj* getCubin(Key const& key)
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        auto iter = mMap.find(key);
+        if (iter != mMap.end())
+        {
+            return &iter->second;
+        }
+        else
+        {
+            return nullptr;
+        }
+    }
+
+    void merge(CubinObjRegistryTemplate<Key, Hash> const& other)
+    {
+        for (auto&& p : other.mMap)
+        {
+            mMap.insert(p);
+        }
     }
 
     void clear()
     {
+        std::lock_guard<std::mutex> lock(mMutex);
         mMap.clear();
     }
 
 private:
     std::unordered_map<Key, CubinObj, Hash> mMap;
+    mutable std::mutex mMutex;
 };
 
 using CubinObjKey = XQAKernelFullHashKey;

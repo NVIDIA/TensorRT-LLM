@@ -32,6 +32,7 @@
 #include "tensorrt_llm/runtime/generationOutput.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
+#include "tensorrt_llm/runtime/rawEngine.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
@@ -158,28 +159,34 @@ public:
     //! @param sessionConfig Configuration of the session,
     //! @param modelConfig   Description of the model,
     //! @param worldConfig   Description of the environment,
-    //! @param engineBuffer  The compiled TensorRT engine (const void*),
-    //! @param engineSize    The size in bytes of the TensorRT engine (size_t),
+    //! @param rawEngine     The compiled TensorRT engine,
     //! @param logger        The optional logger.
     GptSession(Config const& sessionConfig, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
-        void const* engineBuffer, std::size_t engineSize, LoggerPtr logger = nullptr);
+        RawEngine const& rawEngine, LoggerPtr logger = nullptr);
+
+    GptSession(Config const& sessionConfig, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
+        void const* engineBuffer, std::size_t engineSize, LoggerPtr logger = nullptr)
+        : GptSession(sessionConfig, modelConfig, worldConfig, RawEngine(engineBuffer, engineSize), std::move(logger))
+    {
+    }
 
     GptSession(Config const& sessionConfig, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
         std::vector<uint8_t> const& engineBuffer, LoggerPtr logger = nullptr)
-        : GptSession(
-            sessionConfig, modelConfig, worldConfig, engineBuffer.data(), engineBuffer.size(), std::move(logger))
+        : GptSession(sessionConfig, modelConfig, worldConfig, RawEngine(engineBuffer.data(), engineBuffer.size()),
+            std::move(logger))
     {
     }
 
     GptSession(Config const& sessionConfig, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
         std::string const& engineFile, LoggerPtr logger = nullptr)
-        : GptSession(sessionConfig, modelConfig, worldConfig, utils::loadEngine(engineFile), std::move(logger))
+        : GptSession(sessionConfig, modelConfig, worldConfig, RawEngine(engineFile), std::move(logger))
     {
     }
 
     [[nodiscard]] nvinfer1::ILogger& getLogger() const;
 
     [[nodiscard]] BufferManager const& getBufferManager() const;
+    [[nodiscard]] BufferManager::CudaStreamPtr getRuntimeStreamPtr() const;
 
     [[nodiscard]] ModelConfig const& getModelConfig() const
     {

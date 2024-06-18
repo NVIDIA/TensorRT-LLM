@@ -43,7 +43,7 @@ def generate_output(
         output_dir = resources_dir / "data" / model_name / f"beam_search_{num_beams}"
     output_dir.mkdir(exist_ok=True, parents=True)
 
-    for engine_kind in ["fp32-plugin", "fp32-plugin-packed-paged"]:
+    for engine_kind in ["fp16-plugin", "fp16-plugin-packed-paged"]:
         engine_dir = model_path / 'rt_engine' / model_name / engine_kind / tp_pp_dir
         output_npy_file_name = output_dir / f"output_tokens_{engine_kind.replace('-', '_')}_tp{tp_size}_pp{pp_size}.npy"
         output_csv_file_name = output_dir / f"output_tokens_{engine_kind.replace('-', '_')}_tp{tp_size}_pp{pp_size}.csv"

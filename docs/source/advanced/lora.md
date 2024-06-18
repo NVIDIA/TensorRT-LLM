@@ -23,7 +23,7 @@ trtllm-build --checkpoint_dir /tmp/llama_7b/trt_ckpt/fp16/1-gpu/ \
     --lora_plugin float16 \
     --max_batch_size 128 \
     --max_input_len 512 \
-    --max_output_len 50 \
+    --max_seq_len 562 \
     --lora_dir Japanese-Alpaca-LoRA-7b-v0 \
     --max_lora_rank 8 \
     --lora_target_modules "attn_q" "attn_k" "attn_v"
