@@ -3,24 +3,6 @@ name: CI
 on:
   push:
     tags: ["v[0-9]+.[0-9]+.[0-9]+"]
-    paths:
-      [
-        ".github/scripts/**",
-        ".github/workflows/build.yml",
-        "**/CMakeLists.txt",
-        "**/Makefile",
-        "**/*.h",
-        "**/*.hpp",
-        "**/*.c",
-        "**/*.cpp",
-        "**/*.cu",
-        "**/*.cc",
-        "**/*.cxx",
-        "llama.cpp",
-        "!docs/**",
-        "!.gitignore",
-        "!README.md",
-      ]
   workflow_dispatch:
 
 jobs:
@@ -123,13 +105,6 @@ jobs:
           AWS_ACCESS_KEY_ID: "${{ secrets.MINIO_ACCESS_KEY_ID }}"
           AWS_SECRET_ACCESS_KEY: "${{ secrets.MINIO_SECRET_ACCESS_KEY }}"
           SCCACHE_IDLE_TIMEOUT: "0"
-
-      # - name: start sccache server for windows
-      #   if: runner.os == 'Windows'
-      #   run: |
-      #     sccache --start-server
-      #   env:
-      #     SCCACHE_IDLE_TIMEOUT: "0"
 
       - name: Build Dependencies
         working-directory: cpp
