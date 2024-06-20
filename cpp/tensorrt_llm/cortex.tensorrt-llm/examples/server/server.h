@@ -1,6 +1,6 @@
 #pragma once
 
-#include "cortex-common/cortextensorrtllmi.h"
+#include "cortex-common/enginei.h"
 #include "dylib.h"
 
 #include <condition_variable>
@@ -11,7 +11,7 @@ class Server {
  public:
   Server() {
     dylib_ = std::make_unique<dylib>("./engines/cortex.tensorrt-llm", "engine");
-    auto func = dylib_->get_function<CortexTensorrtLlmEngineI*()>("get_engine");
+    auto func = dylib_->get_function<EngineI*()>("get_engine");
     engine_ = func();
   }
 
@@ -23,7 +23,7 @@ class Server {
 
  public:
   std::unique_ptr<dylib> dylib_;
-  CortexTensorrtLlmEngineI* engine_;
+  EngineI* engine_;
 
   struct SyncQueue {
     void push(std::pair<Json::Value, Json::Value>&& p) {

@@ -26,28 +26,11 @@ constexpr const int k400BadRequest = 400;
 constexpr const int k409Conflict = 409;
 constexpr const int k500InternalServerError = 500;
 
+TensorrtllmEngine::~TensorrtllmEngine() {}
+
 void RemoveId(std::vector<int>& vec, int id) {
   vec.erase(std::remove(vec.begin(), vec.end(), id), vec.end());
 }
-
-TensorrtllmEngine::~TensorrtllmEngine() {}
-
-void TensorrtllmEngine::LoadModel(
-    std::shared_ptr<Json::Value> json_body,
-    std::function<void(Json::Value&&, Json::Value&&)>&& callback) {
-  
-  LoadModelImpl(model::fromJson(json_body), std::move(callback));
-}
-void TensorrtllmEngine::HandleChatCompletion(
-    std::shared_ptr<Json::Value> json_body,
-    std::function<void(Json::Value&&, Json::Value&&)>&& callback) {
-
-  HandleChatCompletionImpl(inferences::fromJson(json_body), std::move(callback));
-}
-
-// #######################
-// ### IMPLEMENTATION ####
-// #######################
 
 bool HandleMatch(std::string const& rew_text, std::shared_ptr<InferenceState> infer_state) {
   if (infer_state->IsComplete()) {
@@ -97,13 +80,17 @@ GenerationInput TensorrtllmEngine::CreateGenerationInput(std::vector<int32_t> in
       input_ids_host, ITensor::makeShape({batchSize, input_len}), MemoryType::kGPU);
   GenerationInput generation_input{0, 0, input_ids, input_lengths, model_config->usePackedInput()};
   generation_input.stopWordsList = GetTensorChatMLStopWordList();
+
+  LOG_INFO << "Create generation input successfully";
   return generation_input;
 }
 
 GenerationOutput TensorrtllmEngine::CreateGenerationOutput() {
   GenerationOutput generation_output {
-      gpt_session->getBufferManager().emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32),
-      gpt_session->getBufferManager().emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32)};
+    gpt_session->getBufferManager().emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32),
+    gpt_session->getBufferManager().emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32)
+  };
+  LOG_INFO << "Create generation input successfully";
   return generation_output;
 }
 
@@ -117,12 +104,14 @@ void InferenceThread(
     int outputLen) {
 
   // Input preparation
+  LOG_INFO << "Inference thread started";
   GenerationInput generation_input = self->CreateGenerationInput(input_ids_host);
   GenerationOutput generation_output = self->CreateGenerationOutput();
 
   // Define the callback to stream each generated token
   generation_output.onTokenGenerated = [&infer_state, input_len, outputLen, self, &generation_output](
                                           GenerationOutput::TensorPtr const& output_ids, SizeType step, bool finished) {
+    LOG_INFO << "Generating tokenizer in thread";                                            
     // Assuming the shape of output_ids tensor is (1, 1, 160), where 160 is the number of tokens
     int output_length = output_ids->getShape().d[2]; // Get the length of output IDs based on the tensor shape
     // Copy output IDs from GPU to host for printing
@@ -159,7 +148,49 @@ void InferenceThread(
   self->gpt_session->generate(generation_output, generation_input, sampling_config);
 }
 
-void TensorrtllmEngine::HandleChatCompletionImpl(inferences::ChatCompletionRequest&& request, std::function<void(Json::Value&&, Json::Value&&)>&& callback) {
+inline std::string GetModelId(const Json::Value& json_body) {
+  // First check if model exists in request
+  if (!json_body["model"].isNull()) {
+    return json_body["model"].asString();
+  } else if (!json_body["model_alias"].isNull()) {
+    return json_body["model_alias"].asString();
+  }
+
+  // We check model_path for loadmodel request
+  auto input = json_body["model_path"];
+  if (!input.isNull()) {
+    auto s = input.asString();
+    std::replace(s.begin(), s.end(), '\\', '/');
+    auto const pos = s.find_last_of('/');
+    return s.substr(pos + 1);
+  }
+  return {};
+}
+
+bool TensorrtllmEngine::CheckModelLoaded(std::function<void(Json::Value&&, Json::Value&&)>& callback) {
+  if (!model_loaded_) {
+    LOG_WARN << "Model is not loaded yet";
+    Json::Value json_resp;
+    json_resp["message"] =
+        "Model has not been loaded, please load model into cortex.tensorrt-llm";
+    Json::Value status;
+    status["is_done"] = false;
+    status["has_error"] = true;
+    status["is_stream"] = false;
+    status["status_code"] = k409Conflict;
+    callback(std::move(status), std::move(json_resp));
+    return false;
+  }
+  return true;
+}
+
+//#########################
+//### ENGINE END POINTS ###
+//#########################
+
+
+void TensorrtllmEngine::HandleChatCompletion(std::shared_ptr<Json::Value> json_body, std::function<void(Json::Value&&, Json::Value&&)>&& callback) {
+  inferences::ChatCompletionRequest request = inferences::fromJson(json_body);
   std::string formatted_input = pre_prompt;
   nlohmann::json data;
   // data["stream"] = completion.stream;
@@ -214,8 +245,8 @@ void TensorrtllmEngine::HandleChatCompletionImpl(inferences::ChatCompletionReque
   std::thread inference_thread(InferenceThread, infer_state, input_ids_host, callback, this, sampling_config, input_len, outputLen);
   inference_thread.detach(); // Detach the thread to allow it to run independently
 
-  this->q = std::make_unique<trantor::ConcurrentTaskQueue>(1, request.model_id);
-  this->q->runTaskInQueue([cb = std::move(callback), infer_state]() {
+  q_->runTaskInQueue([cb = std::move(callback), infer_state]() {
+    LOG_INFO << "Preparing to run inference task queue...";
     while (true) { // Continuously check if the queue is not empty
       std::unique_lock<std::mutex> lock(infer_state->queue_mutex); // Lock the queue for exclusive access
       if (!infer_state->texts_to_stream.empty()) {
@@ -256,9 +287,7 @@ void TensorrtllmEngine::HandleChatCompletionImpl(inferences::ChatCompletionReque
         status["is_stream"] = true;
         status["status_code"] = k200OK;
         cb(std::move(status), std::move(resp_data));
-        continue;;
-      }
-      else {
+      } else {
         // If the queue is empty, release the lock and wait before trying again
         lock.unlock();
       }
@@ -269,33 +298,31 @@ void TensorrtllmEngine::HandleChatCompletionImpl(inferences::ChatCompletionReque
   return;
 };
 
-void TensorrtllmEngine::LoadModelImpl(model::LoadModelRequest&& request, std::function<void(Json::Value&&, Json::Value&&)>&& callback) {
-    std::filesystem::path const engine_dir = request.engine_path;
+void TensorrtllmEngine::LoadModel(std::shared_ptr<Json::Value> json_body, std::function<void(Json::Value&&, Json::Value&&)>&& callback) {
+    model::LoadModelRequest request = model::fromJson(json_body);
+    std::filesystem::path model_dir = request.model_path;
 
     int ctx_len = request.ctx_len;
     this->user_prompt = request.user_prompt;
     this->ai_prompt = request.ai_prompt;
     this->system_prompt = request.system_prompt;
+    this->model_id_ = GetModelId(*json_body);
 
     logger = std::make_shared<TllmLogger>();
     logger->setLevel(nvinfer1::ILogger::Severity::kINFO);
-    // Fixed settings
-    std::string const model_name = "mistral";
     initTrtLlmPlugins(logger.get());
-    // Load model configuration
-    std::filesystem::path json_file_name = engine_dir / "config.json";
-    std::filesystem::path tokenizerModelName = engine_dir / "tokenizer.json";
 
-    cortex_tokenizer = std::make_unique<Tokenizer>(tokenizerModelName.string());
-    LOG_INFO << "Loaded tokenizer";
+    std::filesystem::path tokenizer_model_name = model_dir / "tokenizer.model";
+    cortex_tokenizer = std::make_unique<Tokenizer>(tokenizer_model_name.string());
+    LOG_INFO << "Loaded tokenizer from " << tokenizer_model_name.string();
 
-    auto const json = GptJsonConfig::parse(json_file_name);
+    std::filesystem::path json_file_name = model_dir / "config.json";
+    auto json = GptJsonConfig::parse(json_file_name);
     auto config = json.getModelConfig();
     model_config = std::make_unique<GptModelConfig>(config);
-    auto const worldConfig = WorldConfig::mpi(1, json.getTensorParallelism(), json.getPipelineParallelism());
-    auto const enginePath = engine_dir / json.engineFilename(worldConfig, model_name);
-    LOG_INFO << "Engine Path : " << enginePath.string();
-    auto const dtype = model_config->getDataType();
+    auto world_config = WorldConfig::mpi(1, json.getTensorParallelism(), json.getPipelineParallelism());
+    LOG_INFO << "Loaded config from " << json_file_name.string();
+    // auto dtype = model_config->getDataType();
 
     // Currently doing fixed session config
     session_config.maxBatchSize = batchSize;
@@ -304,25 +331,102 @@ void TensorrtllmEngine::LoadModelImpl(model::LoadModelRequest&& request, std::fu
     session_config.cudaGraphMode = true; // Fixed for simplicity
 
     // Init gpt_session
-    gpt_session = std::make_unique<GptSession>(session_config, *model_config, worldConfig, enginePath.string(), logger);
+    auto model_path = model_dir / json.engineFilename(world_config, model_id_);
+    gpt_session = std::make_unique<GptSession>(session_config, *model_config, world_config, model_path.string(), logger);
+
+    model_loaded_ = true;
+    if (q_ == nullptr) {
+     q_ = std::make_unique<trantor::ConcurrentTaskQueue>(1, model_id_);
+    }
+
     // Model loaded successfully
+    LOG_INFO << "Model " << model_id_ << " loaded successfully from path " << model_path.string();
     Json::Value json_resp;
     json_resp["message"] = "Model loaded successfully";
     Json::Value status_resp;
     status_resp["status_code"] = k200OK;
     callback(std::move(status_resp), std::move(json_resp));
-    LOG_INFO << "Model loaded successfully: " << model_name;
     return;
 };
 
-void TensorrtllmEngine::Destroy(std::shared_ptr<Json::Value> json_body, std::function<void(Json::Value&&, Json::Value&&)>&& callback) {
-  LOG_INFO << "Program is exitting, goodbye!";
-  exit(0);
-  return;
-};
+void TensorrtllmEngine::UnloadModel(std::shared_ptr<Json::Value> json_body, std::function<void(Json::Value&&, Json::Value&&)>&& callback) {
+  if (!CheckModelLoaded(callback)) {
+    LOG_WARN << "Model was not loaded";
+    Json::Value json_resp;
+    json_resp["message"] = "Model was not loaded";
+    Json::Value status;
+    status["status_code"] = k400BadRequest;
+    callback(std::move(status), std::move(json_resp));
+    return;
+  }
+    
+  gpt_session.reset();
+  cortex_tokenizer.reset();
+  q_.reset();
+  model_config.reset();
+  logger.reset();
+  model_loaded_ = false;
+
+  Json::Value json_resp;
+  json_resp["message"] = "Model unloaded successfully";
+  Json::Value status;
+  status["is_done"] = true;
+  status["has_error"] = false;
+  status["is_stream"] = false;
+  status["status_code"] = k200OK;
+  callback(std::move(status), std::move(json_resp));
+  LOG_INFO << "Model unloaded sucessfully";
+}
+
+void TensorrtllmEngine::HandleEmbedding( std::shared_ptr<Json::Value> json_body, std::function<void(Json::Value&&, Json::Value&&)>&& callback) {
+  LOG_WARN << "Engine does not support embedding yet";
+  Json::Value json_resp;
+  json_resp["message"] = "Engine does not support embedding yet";
+  Json::Value status;
+  status["status_code"] = k409Conflict;
+  callback(std::move(status), std::move(json_resp));
+}
+
+void TensorrtllmEngine::GetModelStatus(std::shared_ptr<Json::Value> json_body, std::function<void(Json::Value&&, Json::Value&&)>&& callback) {
+  LOG_WARN << "Engine does not support get model status method yet";
+  Json::Value json_resp;
+  json_resp["message"] = "Engine does not support get model status method yet";
+  Json::Value status;
+  status["status_code"] = k409Conflict;
+  callback(std::move(status), std::move(json_resp));
+}
+
+void TensorrtllmEngine::GetModels(
+    std::shared_ptr<Json::Value> json_body,
+    std::function<void(Json::Value&&, Json::Value&&)>&& callback) {
+  Json::Value json_resp;
+  Json::Value model_array = Json::arrayValue;
+
+  if (model_loaded_) {
+    Json::Value val;
+    val["id"] = model_id_;
+    val["engine"] = "cortex.tensorrt-llm";
+    val["start_time"] = start_time_;
+    val["vram"] = "-";
+    val["ram"] = "-";
+    val["object"] = "model";
+    model_array.append(val);
+  }
+
+  json_resp["object"] = "list";
+  json_resp["data"] = model_array;
+
+  Json::Value status;
+  status["is_done"] = true;
+  status["has_error"] = false;
+  status["is_stream"] = false;
+  status["status_code"] = k200OK;
+  callback(std::move(status), std::move(json_resp));
+  LOG_INFO << "Running models responded";
+}
 
 extern "C" {
-CortexTensorrtLlmEngineI* get_engine() {
+EngineI* get_engine() {
   return new TensorrtllmEngine();
 }
 }

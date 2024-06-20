@@ -34,21 +34,34 @@ endif
 
 package:
 ifeq ($(OS),Windows_NT)
+	@powershell -Command "mkdir -p cortex.tensorrt-llm; cp ..\..\build\tensorrt_llm\cortex.tensorrt-llm\engine.dll cortex.tensorrt-llm\;"
+	@powershell -Command "cp -Force C:\workspace\TensorRT-9.3.0.1\lib\nvinfer.dll cortex.tensorrt-llm\;"
+	@powershell -Command "cp -Force C:\workspace\cuDNN\bin\cudnn64_8.dll cortex.tensorrt-llm\;"
+	@powershell -Command "cp -Force C:\workspace\cuDNN\bin\cudnn_ops_infer64_8.dll cortex.tensorrt-llm\;"
+	@powershell -Command "cp -Force ..\..\build\tensorrt_llm\plugins\nvinfer_plugin_tensorrt_llm.dll cortex.tensorrt-llm\;"
+	@powershell -Command "cp -Force ..\..\build\tensorrt_llm\tensorrt_llm.dll cortex.tensorrt-llm\;"
+	@powershell -Command "cp -Force C:\Windows\System32\msmpi.dll cortex.tensorrt-llm\;"
+	@powershell -Command "cp -Force .\build_deps\_install\bin\zlib.dll cortex.tensorrt-llm\;"
+	@powershell -Command "7z a -ttar temp.tar cortex.tensorrt-llm\*; 7z a -tgzip cortex.tensorrt-llm.tar.gz temp.tar;"
 else
 	@mkdir -p cortex.tensorrt-llm && \
 	cp ../../build/tensorrt_llm/cortex.tensorrt-llm/libengine.$(shell uname | tr '[:upper:]' '[:lower:]' | sed 's/darwin/dylib/;s/linux/so/') cortex.tensorrt-llm && \
-	cp /usr/local/cuda-12.4/targets/x86_64-linux/lib/libcublas.so.12 cortex.tensorrt-llm && \
-	cp /usr/local/cuda-12.4/targets/x86_64-linux/lib/libcublas.so.12.4.2.65 cortex.tensorrt-llm && \
-	cp /usr/local/cuda-12.4/targets/x86_64-linux/lib/libcublasLt.so.12 cortex.tensorrt-llm && \
-	cp /usr/local/cuda-12.4/targets/x86_64-linux/lib/libcublasLt.so.12.4.2.65 cortex.tensorrt-llm && \
-	cp /usr/local/tensorrt/targets/x86_64-linux-gnu/lib/libnvinfer.so.10 cortex.tensorrt-llm && \
-	cp /usr/local/tensorrt/targets/x86_64-linux-gnu/lib/libnvinfer.so.10.0.1 cortex.tensorrt-llm && \
-	cp /usr/local/lib/python3.10/dist-packages/tensorrt_llm/libs/libnvinfer_plugin_tensorrt_llm.so cortex.tensorrt-llm && \
-	cp /usr/local/lib/python3.10/dist-packages/tensorrt_llm/libs/libnvinfer_plugin_tensorrt_llm.so.10 cortex.tensorrt-llm && \
-	cp /usr/local/lib/python3.10/dist-packages/tensorrt_llm/libs/libtensorrt_llm.so cortex.tensorrt-llm && \
-	cp /usr/local/lib/python3.10/dist-packages/tensorrt_llm/libs/libtensorrt_llm_nvrtc_wrapper.so cortex.tensorrt-llm && \
+	cp /usr/local/tensorrt/targets/x86_64-linux-gnu/lib/libnvinfer.so.9 cortex.tensorrt-llm && \
+	cp /usr/local/tensorrt/targets/x86_64-linux-gnu/lib/libnvinfer.so.9.3.0 cortex.tensorrt-llm && \
+	cp /usr/lib/x86_64-linux-gnu/libcudnn.so.8 cortex.tensorrt-llm && \
+	cp /usr/lib/x86_64-linux-gnu/libcudnn.so.8.9.7 cortex.tensorrt-llm && \
+	cp /usr/lib/x86_64-linux-gnu/libcudnn_ops_infer.so.8 cortex.tensorrt-llm && \
+	cp /usr/lib/x86_64-linux-gnu/libcudnn_ops_infer.so.8.9.7 cortex.tensorrt-llm && \
+	cp /home/runner/actions-runner/_work/cortex.tensorrt-llm/cortex.tensorrt-llm/cpp/build/tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so cortex.tensorrt-llm && \
+	cp /home/runner/actions-runner/_work/cortex.tensorrt-llm/cortex.tensorrt-llm/cpp/build/tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so.9 cortex.tensorrt-llm && \
+	cp /home/runner/actions-runner/_work/cortex.tensorrt-llm/cortex.tensorrt-llm/cpp/build/tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so.9.3.0 cortex.tensorrt-llm && \
+	cp /home/runner/actions-runner/_work/cortex.tensorrt-llm/cortex.tensorrt-llm/cpp/build/tensorrt_llm/libtensorrt_llm.so cortex.tensorrt-llm && \
+	cp /opt/hpcx/ompi/lib/libmpi.so cortex.tensorrt-llm && \
+	cp /opt/hpcx/ompi/lib/libmpi.so.40 cortex.tensorrt-llm && \
+	cp /opt/hpcx/ompi/lib/libmpi.so.40.30.5 cortex.tensorrt-llm && \
+	cp /usr/lib/x86_64-linux-gnu/libnccl.so cortex.tensorrt-llm && \
 	cp /usr/lib/x86_64-linux-gnu/libnccl.so.2 cortex.tensorrt-llm && \
-	cp /usr/lib/x86_64-linux-gnu/libnccl.so.2.20.5 cortex.tensorrt-llm && \
+	cp /usr/lib/x86_64-linux-gnu/libnccl.so.2.19.3 cortex.tensorrt-llm && \
 	tar -czvf cortex.tensorrt-llm.tar.gz cortex.tensorrt-llm
 endif
 

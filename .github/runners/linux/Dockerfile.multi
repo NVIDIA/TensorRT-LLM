@@ -1,0 +1,142 @@
+# Multi-stage Dockerfile
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
+ARG BASE_TAG=24.02-py3
+ARG DEVEL_IMAGE=devel
+
+FROM ${BASE_IMAGE}:${BASE_TAG} as base
+
+# https://www.gnu.org/software/bash/manual/html_node/Bash-Startup-Files.html
+# The default values come from `nvcr.io/nvidia/pytorch`
+ENV BASH_ENV=${BASH_ENV:-/etc/bash.bashrc}
+ENV ENV=${ENV:-/etc/shinit_v2}
+SHELL ["/bin/bash", "-c"]
+
+FROM base as devel
+
+COPY docker/common/install_base.sh install_base.sh
+RUN bash ./install_base.sh && rm install_base.sh
+
+COPY docker/common/install_cmake.sh install_cmake.sh
+RUN bash ./install_cmake.sh && rm install_cmake.sh
+
+COPY docker/common/install_ccache.sh install_ccache.sh
+RUN bash ./install_ccache.sh && rm install_ccache.sh
+
+# Download & install internal TRT release
+ARG TRT_VER
+ARG CUDA_VER
+ARG CUDNN_VER
+ARG NCCL_VER
+ARG CUBLAS_VER
+COPY docker/common/install_tensorrt.sh install_tensorrt.sh
+RUN bash ./install_tensorrt.sh \
+    --TRT_VER=${TRT_VER} \
+    --CUDA_VER=${CUDA_VER} \
+    --CUDNN_VER=${CUDNN_VER} \
+    --NCCL_VER=${NCCL_VER} \
+    --CUBLAS_VER=${CUBLAS_VER} && \
+    rm install_tensorrt.sh
+
+# Install latest Polygraphy
+COPY docker/common/install_polygraphy.sh install_polygraphy.sh
+RUN bash ./install_polygraphy.sh && rm install_polygraphy.sh
+
+# Install mpi4py
+COPY docker/common/install_mpi4py.sh install_mpi4py.sh
+RUN bash ./install_mpi4py.sh && rm install_mpi4py.sh
+
+# Install PyTorch
+ARG TORCH_INSTALL_TYPE="skip"
+COPY docker/common/install_pytorch.sh install_pytorch.sh
+RUN bash ./install_pytorch.sh $TORCH_INSTALL_TYPE && rm install_pytorch.sh
+COPY setup.py requirements.txt requirements-dev.txt ./
+
+RUN pip install --no-cache-dir -r requirements-dev.txt
+
+RUN apt update && echo Y | apt install sudo cargo -y
+
+RUN cargo install sccache --locked
+
+ARG RUNNER_VERSION=2.317.0
+
+ARG USER_ID=1000
+ARG USER_NAME=runner
+ARG GROUP_ID=1000
+ARG GROUP_NAME=runner
+
+RUN (getent group ${GROUP_ID} || groupadd --gid ${GROUP_ID} ${GROUP_NAME}) && \
+    (getent passwd ${USER_ID} || useradd --gid ${GROUP_ID} --uid ${USER_ID} --create-home --no-log-init --shell /bin/bash ${USER_NAME})
+
+
+RUN usermod -aG sudo ${USER_NAME} \
+    && echo "%sudo   ALL=(ALL:ALL) NOPASSWD:ALL" > /etc/sudoers \
+    && echo "Defaults env_keep += \"DEBIAN_FRONTEND\"" >> /etc/sudoers
+
+ENV HOME=/home/runner
+
+# cd into the user directory, download and unzip the github actions runner
+RUN cd /home/runner && mkdir actions-runner && cd actions-runner \
+    && curl -O -L https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz \
+    && tar xzf ./actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz
+
+RUN chown -R runner:runner /home/runner && /home/runner/actions-runner/bin/installdependencies.sh
+
+ADD docker/common/start.sh start.sh
+
+RUN chmod +x start.sh
+
+RUN sudo chmod +x /root/.cargo/bin/sccache
+
+USER runner
+
+ENV PATH=/root/.cargo/bin${PATH:+:${PATH}}
+
+ENTRYPOINT ["./start.sh"]
+
+FROM ${DEVEL_IMAGE} as wheel
+WORKDIR /src/tensorrt_llm
+COPY benchmarks benchmarks
+COPY cpp cpp
+COPY benchmarks benchmarks
+COPY scripts scripts
+COPY tensorrt_llm tensorrt_llm
+COPY 3rdparty 3rdparty
+COPY setup.py requirements.txt requirements-dev.txt ./
+
+ARG BUILD_WHEEL_ARGS="--clean --trt_root /usr/local/tensorrt --python_bindings --benchmarks"
+RUN python3 scripts/build_wheel.py ${BUILD_WHEEL_ARGS}
+
+FROM ${DEVEL_IMAGE} as release
+
+WORKDIR /app/tensorrt_llm
+COPY --from=wheel /src/tensorrt_llm/build/tensorrt_llm*.whl .
+RUN pip install tensorrt_llm*.whl --extra-index-url https://pypi.nvidia.com && \
+    rm tensorrt_llm*.whl
+COPY README.md ./
+COPY docs docs
+COPY cpp/include include
+RUN ln -sv $(python3 -c 'import site; print(f"{site.getsitepackages()[0]}/tensorrt_llm/libs")') lib && \
+    test -f lib/libnvinfer_plugin_tensorrt_llm.so && \
+    ln -sv lib/libnvinfer_plugin_tensorrt_llm.so lib/libnvinfer_plugin_tensorrt_llm.so.9 && \
+    echo "/app/tensorrt_llm/lib" > /etc/ld.so.conf.d/tensorrt_llm.conf && \
+    ldconfig
+ARG SRC_DIR=/src/tensorrt_llm
+COPY --from=wheel ${SRC_DIR}/benchmarks benchmarks
+ARG CPP_BUILD_DIR=${SRC_DIR}/cpp/build
+COPY --from=wheel \
+     ${CPP_BUILD_DIR}/benchmarks/bertBenchmark \
+     ${CPP_BUILD_DIR}/benchmarks/gptManagerBenchmark \
+     ${CPP_BUILD_DIR}/benchmarks/gptSessionBenchmark \
+     benchmarks/cpp/
+COPY examples examples
+RUN chmod -R a+w examples && \
+    rm -v \
+      benchmarks/cpp/bertBenchmark.cpp \
+      benchmarks/cpp/gptManagerBenchmark.cpp \
+      benchmarks/cpp/gptSessionBenchmark.cpp \
+      benchmarks/cpp/CMakeLists.txt
+ARG GIT_COMMIT
+ARG TRT_LLM_VER
+ENV TRT_LLM_GIT_COMMIT=${GIT_COMMIT} \
+    TRT_LLM_VERSION=${TRT_LLM_VER}
+
